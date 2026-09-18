@@ -1,0 +1,18 @@
+{
+  "contract": "eliot.foundation.protocol.durable-job",
+  "roles": {
+    "REQUESTER": ["SUBMIT", "STATUS", "REQUEST_CANCEL", "RECONCILE"],
+    "WORKER": [
+      "LEASE",
+      "RENEW",
+      "START",
+      "CHECKPOINT",
+      "RESUME",
+      "VERIFY",
+      "PUBLISH",
+      "STATUS",
+      "RECONCILE"
+    ],
+    "CONTROLLER": ["STATUS", "REQUEST_CANCEL", "RECONCILE"]
+  }
+}

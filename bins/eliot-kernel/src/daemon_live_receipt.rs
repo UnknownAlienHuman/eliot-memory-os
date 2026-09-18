@@ -22,6 +22,46 @@ use super::{
 use sha2::{Digest as _, Sha256};
 use std::path::Path;
 
+/// F-LOG-KERNEL-3 (#901): live-receipt boundary observations.
+///
+/// Observation only, via #895's facade: fixed `kernel.live_receipt.*`
+/// event names plus a bounded stable outcome. Never carries receipt roots,
+/// artifact digests, process bindings, evidence material, or owner error
+/// strings (I15.4, I07.20).
+#[cfg(windows)]
+fn observe_live_receipt(event: &'static str, outcome: &'static str) {
+    use super::kernel_diagnostics::{KERNEL_DIAGNOSTICS_TARGET, bound_field};
+    let event_bound = bound_field(event);
+    let outcome_bound = bound_field(outcome);
+    tracing::info!(
+        target: KERNEL_DIAGNOSTICS_TARGET,
+        event = event_bound.text(),
+        outcome = outcome_bound.text(),
+        "daemon live receipt observation"
+    );
+}
+
+/// Maps one live-receipt/readiness failure to its stable diagnostic code.
+///
+/// Only the variant is emitted; any `String` payload or embedded state is
+/// never logged.
+#[cfg(windows)]
+fn live_receipt_terminal_code(error: &KernelServiceError) -> &'static str {
+    match error {
+        KernelServiceError::InvalidField { .. } => "LIVE_INVALID_FIELD",
+        KernelServiceError::IllegalTransition { .. } => "LIVE_ILLEGAL_TRANSITION",
+        KernelServiceError::HandshakeMismatch { .. } => "LIVE_HANDSHAKE_MISMATCH",
+        KernelServiceError::MissingContainmentEvidence => "LIVE_MISSING_CONTAINMENT",
+        KernelServiceError::ReadinessNotProven => "READINESS_NOT_PROVEN",
+        KernelServiceError::AdmissionClosed(_) => "LIVE_ADMISSION_CLOSED",
+        KernelServiceError::GenerationFenced => "LIVE_GENERATION_FENCED",
+        KernelServiceError::RestartBudgetExhausted => "LIVE_RESTART_BUDGET_EXHAUSTED",
+        KernelServiceError::ControlReserveExhausted => "LIVE_CONTROL_RESERVE_EXHAUSTED",
+        KernelServiceError::Platform(_) => "LIVE_PLATFORM",
+        KernelServiceError::Core(_) => "LIVE_CORE",
+    }
+}
+
 impl KernelComposition {
     #[cfg(windows)]
     pub(crate) fn eliotd_live_ready_evidence(
@@ -35,7 +75,7 @@ impl KernelComposition {
                 .map_err(|_| KernelServiceError::ReadinessNotProven)?,
             connection_id: session.connection_id.clone(),
             session_epoch: session.session_epoch,
-            authority_epoch: session.authority_epoch,
+            authority_epoch: session.authority_epoch.sequence.get(),
             generation: session.module_generation.generation.value(),
             launch_nonce_sha256: format!("{:x}", Sha256::digest(session.launch_nonce.as_bytes())),
         })
@@ -44,6 +84,42 @@ impl KernelComposition {
     #[cfg(windows)]
     #[allow(clippy::too_many_lines)]
     pub(crate) fn publish_eliotd_live_receipt(
+        &self,
+        launch: &EliotdLaunchDescriptor,
+        process: &ProcessStartReceipt,
+        ready: &EliotdLiveReadyEvidence,
+        supervision_contour: &DaemonSupervisionContour,
+        supervision_successor: Option<&SupervisionLeaseSnapshot>,
+    ) -> Result<EliotdLiveReceipt, KernelServiceError> {
+        // F-LOG-KERNEL-3 (#901): receipt publication boundary. Requested,
+        // published, and validated stay distinct; an exact replay is read
+        // back, not republished; exactly one terminal is emitted per failed
+        // publication and no receipt material is logged.
+        observe_live_receipt("kernel.live_receipt.publication_requested", "attempt");
+        match self.publish_eliotd_live_receipt_inner(
+            launch,
+            process,
+            ready,
+            supervision_contour,
+            supervision_successor,
+        ) {
+            Ok(receipt) => {
+                observe_live_receipt("kernel.live_receipt.published", "success");
+                Ok(receipt)
+            }
+            Err(error) => {
+                observe_live_receipt("kernel.live_receipt.publication_rejected", "fenced");
+                super::kernel_diagnostics::observe_terminal_error(live_receipt_terminal_code(
+                    &error,
+                ));
+                Err(error)
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[allow(clippy::too_many_lines)]
+    fn publish_eliotd_live_receipt_inner(
         &self,
         launch: &EliotdLaunchDescriptor,
         process: &ProcessStartReceipt,
@@ -103,7 +179,7 @@ impl KernelComposition {
             .current_eliotd_live_projection(
                 &supervision_contour.incarnation.supervision_lease_id,
                 launch.generation.value(),
-                launch.authority_epoch.value(),
+                launch.authority_epoch.sequence.get(),
             )
             .map_err(|_| KernelServiceError::ReadinessNotProven)?;
         let receipt = EliotdLiveReceipt::new(
@@ -114,7 +190,7 @@ impl KernelComposition {
             runtime_binding.installation_id(),
             runtime_binding.approved_generation(),
             launch.generation.value(),
-            launch.authority_epoch.value(),
+            launch.authority_epoch.sequence.get(),
             launch.config_descriptor_sha256.as_str(),
             descriptor_artifact,
             kernel_artifact,
@@ -271,7 +347,7 @@ impl KernelComposition {
             .current_eliotd_live_projection(
                 &supervision_contour.incarnation.supervision_lease_id,
                 launch.generation.value(),
-                launch.authority_epoch.value(),
+                launch.authority_epoch.sequence.get(),
             )
             .map_err(|_| KernelServiceError::ReadinessNotProven)?;
         if post_supervision != supervision || post_issued_at_ms != supervision_issued_at_ms {
@@ -367,6 +443,33 @@ impl KernelComposition {
         launch: &EliotdLaunchDescriptor,
         receipt: &ProcessStartReceipt,
     ) -> Result<(), KernelServiceError> {
+        // F-LOG-KERNEL-3 (#901): readiness boundary. A live OS handle is not
+        // readiness; exactly one terminal is emitted per failed validation.
+        observe_live_receipt("kernel.live_receipt.readiness_requested", "attempt");
+        match self
+            .validate_daemon_process_readiness_inner(launch, receipt)
+            .await
+        {
+            Ok(()) => {
+                observe_live_receipt("kernel.live_receipt.readiness_proven", "success");
+                Ok(())
+            }
+            Err(error) => {
+                observe_live_receipt("kernel.live_receipt.readiness_rejected", "fenced");
+                super::kernel_diagnostics::observe_terminal_error(live_receipt_terminal_code(
+                    &error,
+                ));
+                Err(error)
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    async fn validate_daemon_process_readiness_inner(
+        &self,
+        launch: &EliotdLaunchDescriptor,
+        receipt: &ProcessStartReceipt,
+    ) -> Result<(), KernelServiceError> {
         let Some(gateway) = self.process_gateway.as_ref() else {
             return Err(self.reject_daemon_process_readiness(
                 "eliotd physical process authority is unavailable",
@@ -404,9 +507,15 @@ impl KernelComposition {
                 self.reject_daemon_process_readiness("eliotd launch operation identity is invalid")
             })?;
         let physical = receipt.identity().physical();
+        // INTENDED EpochId shape (B→A→C): fence exact-tuple. Quarantined
+        // EliotdLive* scalar lines below stay untouched (HISTORICAL_SUSPENDED).
         if receipt.operation_id() != &expected_operation
             || receipt.accepted_generation().get() != launch.generation.value()
-            || receipt.binding().state_fence().authority_epoch() != launch.authority_epoch.value()
+            || !receipt
+                .binding()
+                .state_fence()
+                .authority_epoch()
+                .is_same_authority(&launch.authority_epoch)
             || receipt.binding().state_fence().generation() != generation
             || receipt.identity().executable_sha256() != launch.executable_sha256
             || !physical
@@ -535,7 +644,7 @@ impl KernelComposition {
                         r.commit_order == 0
                             && r.requirement_digest == receipt.requirement_digest
                             && r.generation == receipt.generation.value()
-                            && r.authority_epoch == receipt.authority_epoch.value()
+                            && r.authority_epoch == receipt.authority_epoch.sequence.get()
                     })
                     .count();
                 if lineage_zeros > 1 {

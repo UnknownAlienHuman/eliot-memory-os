@@ -10,7 +10,7 @@ use crate::curation::{CurationKind, CurationPayload};
 use crate::draft::{CurationAcceptanceCtx, GroundedDreamDraft, ValidatedCurationItem};
 use crate::encoding::{canonical_bytes, digest_hex};
 use crate::error::{ContractViolation, check_fence, check_text, check_vec_bound};
-use crate::job::{DreamJobInput, JobClass};
+use crate::job::{DreamJobAdmission, JobClass};
 use crate::registry::{CurationFamily, TypedCurationHandlerRequest};
 use crate::screen::{ScreenBinding, ScreenState};
 
@@ -49,7 +49,7 @@ impl Write for BoundedWriter {
 pub struct FailureInput {
     pub schema_version: u32,
     pub operation: FailureOperation,
-    pub job: DreamJobInput,
+    pub job: DreamJobAdmission,
     pub bundle: DreamInputBundle,
     pub grounded: GroundedDreamDraft,
     pub usage: BudgetUsage,
@@ -772,9 +772,9 @@ mod tests {
     use crate::relation::{RelationPreservationDimension, RelationPreservationVerdict};
     use crate::screen::ScreenState;
     use eliot_contracts::{
-        ArtifactId, AuthorityEpoch, ClockReading, ContractId, ContractVersion, OperationId,
-        ProductId, RequestId, ResourceGeneration, SourceId, StateFence, TaskId, TaskRevision,
-        TransactionSequence, sha256_hex,
+        ArtifactId, ClockReading, ContractId, ContractVersion, EpochId, EpochLineageId,
+        OperationId, ProductId, RequestId, ResourceGeneration, SourceId, StateFence, TaskId,
+        TaskRevision, TransactionSequence, sha256_hex,
     };
     use eliot_evidence::{
         Assertability, EpistemicStatus, EvidenceAuthority, EvidenceCoverage, EvidenceEnvelope,
@@ -785,6 +785,7 @@ mod tests {
         ReceiptDisposition, ReceiptEnvelope, ReceiptKind, RequestBinding, TaskBinding,
         VerifierBinding, WorkScopeBinding, WorkScopeId, contract_identity,
     };
+    use std::num::NonZeroU64;
 
     fn preservation() -> crate::relation::RelationPreservation {
         crate::relation::RelationPreservation {
@@ -800,14 +801,19 @@ mod tests {
                 .collect(),
         }
     }
+    fn test_epoch() -> EpochId {
+        EpochId::new(
+            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                .expect("canonical test lineage-A"),
+            NonZeroU64::new(1).expect("non-zero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
     fn fence() -> StateFence {
-        StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+        StateFence::new(test_epoch(), ResourceGeneration::genesis())
     }
     fn distinct_fence(generation: u64) -> StateFence {
-        StateFence::new(
-            AuthorityEpoch::genesis(),
-            ResourceGeneration::new(generation).unwrap(),
-        )
+        StateFence::new(test_epoch(), ResourceGeneration::new(generation).unwrap())
     }
     fn digest(value: &[u8]) -> String {
         sha256_hex(value)
@@ -873,7 +879,7 @@ mod tests {
             authority: AuthorityBinding {
                 authority_id: ContractId::new("authority-1").unwrap(),
                 authority_owner: "owner".into(),
-                authority_epoch: state_fence.authority_epoch,
+                authority_epoch: state_fence.authority_epoch.clone(),
                 state_fence,
                 allowed_effect: EffectClass::Candidate,
                 proof_ceiling: ProofCeiling::CandidateArtifact,

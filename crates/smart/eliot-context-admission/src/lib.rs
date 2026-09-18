@@ -252,6 +252,7 @@ fn assemble_admitted_set(
         omissions: omissions.to_owned(),
         applied_rule: input.rule.rule_id.clone(),
         allocations,
+        recipe_digest: input.recipe.recipe_sha256.clone(),
         receipt_digest: "0".repeat(64),
     };
     let mut admitted_set = AdmittedContextSet {
@@ -261,6 +262,13 @@ fn assemble_admitted_set(
         floor: input.floor.floor.clone(),
         economy,
     };
+    {
+        let mut intermediate = admitted_set.economy.clone();
+        let mut unsigned = intermediate.clone();
+        unsigned.receipt_digest = "0".repeat(64);
+        intermediate.receipt_digest = eliot_context_contracts::canonical_digest(&unsigned)?;
+        admitted_set.economy.receipt_digest = intermediate.receipt_digest;
+    }
     let selection_digest = admitted_set.canonical_payload_digest()?;
     admitted_set
         .economy
@@ -911,12 +919,13 @@ fn validate_representation(
     {
         return Err(ContextError::WholeUnitRequired);
     }
-    if matches!(
-        candidate.representation.kind(),
-        RepresentationKind::Extractive | RepresentationKind::Summary
-    ) {
-        return Err(ContextError::WholeUnitRequired);
-    }
+    // Selection only: every supplied representation kind already passed
+    // `ContextCandidate::validate` (loss-policy compatibility, non-empty
+    // extract manifest, well-formed summary source digest) and the exact
+    // measurement closure. EXTRACTIVE and SUMMARY forms issued by the
+    // producer are therefore selectable here exactly like WHOLE; nothing is
+    // generated, rewritten, or truncated by this gate. A missing, stale, or
+    // incompatible measurement makes the option unavailable at costing time.
     if let eliot_context_contracts::AtomRepresentation::Handle { handle } =
         &candidate.representation
     {

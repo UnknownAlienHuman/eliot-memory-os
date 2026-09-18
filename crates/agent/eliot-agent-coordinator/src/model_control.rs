@@ -85,7 +85,10 @@ pub(crate) fn canonical_digest<T: Serialize>(value: &T) -> Result<String, ModelC
     Ok(format!("sha256:{}", eliot_receipts::sha256_hex(&bytes)))
 }
 
-fn validate_canonical_digest(value: &str, field: &'static str) -> Result<(), ModelControlError> {
+pub(crate) fn validate_canonical_digest(
+    value: &str,
+    field: &'static str,
+) -> Result<(), ModelControlError> {
     let Some(hex) = value.strip_prefix("sha256:") else {
         return Err(ModelControlError::InvalidField(field));
     };

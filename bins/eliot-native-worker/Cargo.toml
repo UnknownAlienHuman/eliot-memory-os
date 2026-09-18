@@ -14,12 +14,19 @@ name = "eliot-native-worker"
 path = "src/main.rs"
 
 [dependencies]
+eliot-agent-claude = { path = "../../crates/agent/eliot-agent-claude" }
+eliot-agent-codex = { path = "../../crates/agent/eliot-agent-codex" }
+eliot-agent-opencode = { path = "../../crates/agent/eliot-agent-opencode" }
 eliot-cli.workspace = true
 eliot-native-worker-core.workspace = true
 eliot-process.workspace = true
+eliot-process-executor.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+eliot-contracts.workspace = true
 
 [lints]
 workspace = true

@@ -1,0 +1,70 @@
+schema_version = 4
+module_id = "smart.dreamer.cycle-wasm"
+crate = "eliot-dreamer-cycle-wasm"
+status = "PROTOTYPE"
+wave = "cognitive-micromodules-wave-01"
+agent_order = 6
+plane = "Smart"
+runtime_layer = "R6"
+delivery_depth = "D3a"
+source_layer = "C1"
+runtime_bundle = "eliot-dreamer"
+state_class = "stateless"
+hot_path = false
+lifecycle_owner = "smart.dreamer.cycle-wasm"
+loc_soft_ceiling = 10000
+loc_policy = "review ceiling only; causal cohesion, proof, owner, build/test closure and replacement boundary decide topology"
+product_objective = "The accepted native pure Dreamer-cycle transition is invocable as a thin typed wasm32-wasip2 guest without a second controller owner."
+causal_property = "thin typed WASM adaptation of the Dreamer-cycle leaf"
+old_failure_or_missing_capability = "Packaging the pure cycle transition then required a speculative private ABI or duplicate native controller logic."
+discriminator = "One valid guest invocation calls native #806 exactly once; rejected ABI/input calls it zero times; every native field, disposition, digest and bound is preserved with no duplicate algorithm."
+primary_responsibility = "Adapt the exact accepted guest.wit `run` export to one exhaustive typed call of the native pure Dreamer-cycle transition."
+owned_mutable_state = []
+allowed_effects = []
+inputs = ["GuestRequest (typed envelope over the native state, observed outcomes, policy and observation time)", "canonical request bytes at the `run` boundary"]
+outputs = ["GuestResponse (native step candidate or exhaustive typed error)", "component descriptor and import gate verdicts"]
+depends_on = ["eliot-agent-contracts", "eliot-contracts", "eliot-dreamer-contracts", "eliot-dreamer-cycle", "eliot-receipts"]
+providers = ["Governor-admitted bundle via the native owner", "bins/eliot-wasm-host guest.wit (read-only)", "rust-toolchain.toml pinned target (read-only)"]
+consumers = ["E-HOST/E-RT local-experimental execution (#758/#760, read-only surfaces)"]
+non_goals = ["typed `dreamer-cycle-step` world definition (owner #756)", "Host/runtime/engine implementation (#758/#760)", "toolchain pinning (#870)", "controller algorithm, daemon loop, scheduler, DurableJob, acquisition, model/provider call, storage, authority mutation, effect, Finish"]
+invariants = ["exactly one native call per valid invocation, zero per rejected invocation", "no wildcard, Other, Value or whole-payload JSON/bytes bridge", "native semantic digests distinct from component/artifact hashes", "no ambient WASI capability in the pure-world import gate"]
+failure_behavior = "Reject wrong subtype/shape/version/descriptor before native execution; retain the actual native or component error; never promote to success."
+proof_surface = ["27-case proof matrix (WORK_UNIT_CASE 644/1..27)", "native/component full-field and semantic-digest parity", "built-artifact import inspection", "standalone ModuleTestCapsule through the real E-HOST facade"]
+proof_ceiling = "Module proof only; real provider/consumer Edge proof and Product Pulse remain separate"
+product_pulse = "D3A_ORIENTATION_PULSE_01"
+replacement_boundary = "implementation behind the declared public contract; package ownership creates no runtime or semantic authority"
+merge_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
+split_trigger = "a second causal responsibility, mutable owner, independent proof surface or independent rollback boundary appears"
+
+[[donor]]
+path = "crates/smart/eliot-dreamer-cycle/src/lib.rs"
+disposition = "reuse the native pure transition behind the guest envelope; no logic copied"
+
+[[donor]]
+path = "bins/eliot-wasm-host/wit/guest.wit"
+disposition = "read-only ABI source compiled into the descriptor at build time; not copied by hand"
+
+[[donor]]
+path = "docs/architecture/I14-19-wasm-components.md"
+disposition = "authoritative component boundary; typed dreamer-cycle-step arm still owned by #756"
+
+[agent_task]
+objective = "Ship one thin exhaustive native-call adapter with zero ambient capability as a component-ready cdylib."
+write_scope = ["crates/smart/eliot-dreamer-cycle-wasm/**"]
+deliverables = ["typed guest envelope and exhaustive conversion", "guest.wit-bound descriptor and pure-world import gate", "27-case parity/capsule proof suite"]
+acceptance = ["one valid invocation calls native exactly once", "rejected calls never reach native", "all native dispositions, receipts, digests and bounds preserved"]
+forbidden = ["canonical writes outside the named Governor transition path", "truth/support/authority/policy/finish/effect promotion", "provider or model SDKs in pure cognitive cores", "vendor or storage types in public contracts", "unbounded synchronous work", "silent truncation", "oracle or verifier weakening in the same work unit", "implicit scope widening", "active-generation self-modification"]
+stop_condition = "Stop and return ContractChallenge if the guest requires a private ABI, duplicate controller logic, or any Host/runtime/toolchain edit."
+challenge_path = "return ContractChallenge to the integration owner when owner, discriminator, proof ceiling or dependency boundary is wrong"
+integration_owner = "cognitive-wave-integrator"
+implementation_language = "Rust 2024"
+required_verification = ["standalone fmt/test/clippy", "all 27 Issue #644 cases discovered and passed", "wasm32-wasip2 release build", "workspace admission remains separate under this issue's controller"]
+writeback = "return implementation artifact, exact proof evidence, donor disposition, unresolved ContractChallenges and merge/remove recommendation"
+workspace_admission = "forbidden until implementation, package proof, affected Edge proof, current-main ancestry and integration-owner review"
+
+[acceptance]
+require_deny_unknown_fields = true
+forbid_unsafe = true
+required_exports = ["GuestRequest", "GuestResponse", "GuestError", "CallLedger", "ComponentDescriptor", "handle_request_typed", "run", "descriptor", "check_wasm_imports"]
+required_tests = ["proof.rs hosts all 27 WORK_UNIT_CASE 644/1..27 cases"]
+forbidden_patterns = ['serde_json::Value', 'unimplemented!', 'todo!', 'std::process', 'std::fs', 'tokio', 'reqwest', 'surrealdb']

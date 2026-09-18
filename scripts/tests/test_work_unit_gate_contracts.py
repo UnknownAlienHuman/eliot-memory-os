@@ -545,7 +545,7 @@ class ContractClosureTests(unittest.TestCase):
     # WORK_UNIT_CASE: 857/44
     def test_version_transition_does_not_mutate_or_promote_historical_contracts(self):
         path = ROOT / "scripts/work_unit_gate/_contracts_v2.py"
-        raw = path.read_bytes()
+        raw = path.read_bytes().replace(b"\r\n", b"\n")
         self.assertEqual("2efc073bc0ea0d63be12852d746ede04ad4ccbe8",
                          hashlib.sha1(b"blob " + str(len(raw)).encode() + b"\0" + raw).hexdigest())
         self.assertEqual("eliot-work-unit-contracts-v4", c.CONTRACT_SCHEMA_REVISION)

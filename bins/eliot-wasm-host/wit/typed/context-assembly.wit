@@ -1,0 +1,155 @@
+package eliot:current@0.1.0;
+
+// ELIOT typed current ABI — context-assembly world.
+// Package: eliot:current@0.1.0. World: context-assembly. Interface: assembly.
+// Native owner: #584/#626 (eliot-context-contracts, eliot-context-assembly).
+// Consumer: #762 (first thin WASM component). Boundary: admitted-only; exposes
+// no admission operation. Assembly formats admitted representations; mismatch is typed failure.
+
+interface assembly {
+  type artifact-id = string;
+  type digest-hex = string;
+
+  enum quality-dimension {
+    accuracy,
+    completeness,
+    relevance,
+    coherence,
+    groundedness,
+    freshness,
+    diversity,
+    conciseness,
+    attribution,
+    calibration,
+    robustness,
+    efficiency,
+  }
+
+  enum dimension-status {
+    pass,
+    fail,
+    unknown,
+  }
+
+  enum proof-ceiling {
+    observation,
+    candidate-only,
+    admission,
+    assembly,
+    activation,
+    screen,
+    cycle,
+    handler,
+  }
+
+  record admitted-atom-ref {
+    atom-id: artifact-id,
+    representation-digest: digest-hex,
+    source-digest: digest-hex,
+  }
+
+  record rendered-atom {
+    atom-id: artifact-id,
+    rendered-digest: digest-hex,
+    source-digest: digest-hex,
+  }
+
+  record selection-proof {
+    admitted-digest: digest-hex,
+    rendered-digest: digest-hex,
+    member-count: u32,
+  }
+
+  record quality-result {
+    dimension: quality-dimension,
+    status: dimension-status,
+    evidence: artifact-id,
+    measurement: artifact-id,
+    failed-invariant: option<string>,
+    proof-ceiling: proof-ceiling,
+  }
+
+  record quality-scorecard {
+    results: list<quality-result>,
+  }
+
+  record serialized-measurement {
+    byte-count: u64,
+    stu-estimate: option<u64>,
+    exact-token-count: option<u64>,
+    serializer: string,
+    schema-revision: string,
+    input-digest: digest-hex,
+    output-digest: digest-hex,
+    proof-ceiling: proof-ceiling,
+  }
+
+  record active-view {
+    operation-id: string,
+    task-id: string,
+    scope-id: string,
+    fence-epoch: string,
+    fence-generation: u64,
+    admitted-digest: digest-hex,
+    members: list<rendered-atom>,
+    selection: selection-proof,
+    quality: quality-scorecard,
+    measurement: serialized-measurement,
+    omission-evidence: list<artifact-id>,
+    frontier: list<artifact-id>,
+    proof-ceiling: proof-ceiling,
+    canonical-digest: digest-hex,
+  }
+
+  record assembly-request {
+    schema-revision: u32,
+    operation-id: string,
+    task-id: string,
+    scope-id: string,
+    fence-epoch: string,
+    fence-generation: u64,
+    admitted: list<admitted-atom-ref>,
+    admitted-digest: digest-hex,
+    recipe-digest: digest-hex,
+    measurement: serialized-measurement,
+    deadline-ms: option<s64>,
+    cancelled: bool,
+    predecessor-digest: option<digest-hex>,
+  }
+
+  variant assembly-result {
+    assembled(active-view),
+  }
+
+  record abi-descriptor {
+    world-name: string,
+    package-id: string,
+    abi-revision: u32,
+    native-contract: string,
+    native-revision: string,
+    abi-digest: string,
+  }
+
+  variant assembly-error {
+    malformed(assembly-malformed),
+    selection-mismatch(assembly-selection),
+    quality-incomplete(assembly-quality),
+    measurement-mismatch(assembly-measurement),
+    unsupported-schema(assembly-schema),
+    internal(assembly-internal),
+  }
+
+  record assembly-malformed { field: string, human-detail: string }
+  record assembly-selection { human-detail: string }
+  record assembly-quality { human-detail: string }
+  record assembly-measurement { human-detail: string }
+  record assembly-schema { want-revision: u32, got-revision: u32, human-detail: string }
+  record assembly-internal { human-detail: string }
+
+  assemble: func(request: assembly-request) -> result<assembly-result, assembly-error>;
+  describe: func() -> abi-descriptor;
+}
+
+world context-assembly {
+  export assembly;
+}

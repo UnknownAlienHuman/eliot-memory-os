@@ -21,7 +21,7 @@ use crate::{
     budget::BudgetUsage,
     bundle::DreamInputBundle,
     encoding,
-    job::{DreamJobInput, Requester},
+    job::{DreamJobAdmission, Requester},
 };
 use crate::{
     registry::{AtomicityMode, TargetDenominator, TypedCurationHandlerRequest, parse_family},
@@ -371,7 +371,7 @@ impl ValidatedDreamDraft {
 
 /// Acceptance context for [`ValidatedCurationItem::accept`]; all refs required.
 pub struct CurationAcceptanceCtx<'a> {
-    pub job: &'a DreamJobInput,
+    pub job: &'a DreamJobAdmission,
     pub bundle: &'a DreamInputBundle,
     pub receipt: &'a ValidationReceipt,
     pub screen: &'a ScreenBinding,
@@ -655,10 +655,29 @@ pub(crate) fn valid_receipt(draft_digest: &str, fence: StateFence) -> Validation
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use eliot_contracts::{AuthorityEpoch, ResourceGeneration};
+    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
+    use std::num::NonZeroU64;
+
+    fn test_epoch() -> EpochId {
+        EpochId::new(
+            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                .expect("canonical test lineage-A"),
+            NonZeroU64::new(1).expect("non-zero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
+
+    fn drift_epoch() -> EpochId {
+        EpochId::new(
+            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440001")
+                .expect("canonical test lineage-B"),
+            NonZeroU64::new(1).expect("non-zero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
 
     fn valid_fence() -> StateFence {
-        StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+        StateFence::new(test_epoch(), ResourceGeneration::genesis())
     }
 
     fn valid_raw() -> RawProviderOutput {
@@ -730,7 +749,7 @@ mod tests {
         }
     }
     fn ctx_of<'a>(
-        job: &'a crate::job::DreamJobInput,
+        job: &'a crate::job::DreamJobAdmission,
         bundle: &'a crate::bundle::DreamInputBundle,
         receipt: &'a ValidationReceipt,
         screen: &'a crate::screen::ScreenBinding,
@@ -756,7 +775,7 @@ mod tests {
     fn assert_budget(r: &Result<(), ContractViolation>, dim: &str) {
         assert!(matches!(r, Err(ContractViolation::Budget { dimension: g, .. }) if *g == dim));
     }
-    fn job_digest_of(job: &crate::job::DreamJobInput) -> String {
+    fn job_digest_of(job: &crate::job::DreamJobAdmission) -> String {
         let bytes = encoding::canonical_bytes(job).expect("job serializes");
         encoding::digest_hex(&bytes)
     }
@@ -1066,7 +1085,7 @@ mod tests {
     }
     fn accept_probes_permuted_evidence(
         item: &ValidatedCurationItem,
-        job: &DreamJobInput,
+        job: &DreamJobAdmission,
         bundle: &DreamInputBundle,
         screen: &ScreenBinding,
         grounded: &GroundedDreamDraft,
@@ -1103,7 +1122,7 @@ mod tests {
     }
     fn accept_probes(
         item: &ValidatedCurationItem,
-        job: &DreamJobInput,
+        job: &DreamJobAdmission,
         bundle: &DreamInputBundle,
         screen: &ScreenBinding,
         grounded: &GroundedDreamDraft,
@@ -1113,7 +1132,7 @@ mod tests {
         let (jb, rc, sc, gr, rq, us) = (job, &item.receipt, screen, grounded, request, usage);
         let run =
             |it: &ValidatedCurationItem,
-             jb: &DreamJobInput,
+             jb: &DreamJobAdmission,
              rc: &ValidationReceipt,
              sc: &ScreenBinding,
              gr: &GroundedDreamDraft,
@@ -1184,7 +1203,7 @@ mod tests {
 
     fn accept_probes_request(
         item: &ValidatedCurationItem,
-        job: &DreamJobInput,
+        job: &DreamJobAdmission,
         bundle: &DreamInputBundle,
         screen: &ScreenBinding,
         grounded: &GroundedDreamDraft,
@@ -1194,7 +1213,7 @@ mod tests {
         let (jb, rc, sc, gr, rq, us) = (job, &item.receipt, screen, grounded, request, usage);
         let run =
             |it: &ValidatedCurationItem,
-             jb: &DreamJobInput,
+             jb: &DreamJobAdmission,
              rc: &ValidationReceipt,
              sc: &ScreenBinding,
              gr: &GroundedDreamDraft,
@@ -1341,7 +1360,7 @@ mod tests {
         assert_malformed(&ctrl_id.validate());
         let next_gen = ResourceGeneration::new(2).expect("non-genesis generation");
         let mut changed_fence = base.clone();
-        changed_fence.state_fence = StateFence::new(AuthorityEpoch::genesis(), next_gen);
+        changed_fence.state_fence = StateFence::new(drift_epoch(), next_gen);
         assert_binding(&changed_fence.validate_binding(&recorded));
         let mut bad_validator = base.clone();
         bad_validator.validator_contract = "   ".to_string();

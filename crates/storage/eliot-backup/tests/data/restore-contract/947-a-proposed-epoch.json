@@ -1,0 +1,1 @@
+{"accepted_as_authority":false,"note":"Worker A fixture: caller-proposed target/UserBroker epochs are planning input only. Only exact owner-issued epoch evidence may support authority; the library never mints epochs.","planning_input_accepted":true}

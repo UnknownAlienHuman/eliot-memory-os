@@ -53,6 +53,8 @@ pub struct ContextEconomyReceipt {
     pub omissions: Vec<OmissionRecord>,
     pub applied_rule: ArtifactId,
     pub allocations: EconomyAllocations,
+    /// Digest of the recipe that admitted this set (`ContextRecipe.recipe_sha256`).
+    pub recipe_digest: String,
     pub receipt_digest: String,
 }
 
@@ -61,6 +63,7 @@ impl ContextEconomyReceipt {
     pub fn validate(&self) -> Result<(), ContextError> {
         self.binding.validate()?;
         self.measurement.validate()?;
+        validate_digest(&self.recipe_digest, "economy.recipe_digest")?;
         validate_digest(&self.receipt_digest, "economy.receipt_digest")?;
         if self.decision_id != self.binding.decision_id {
             return Err(ContextError::IdentityConflict);
@@ -100,6 +103,13 @@ impl ContextEconomyReceipt {
         for omission in &self.omissions {
             omission.validate(&self.binding)?;
         }
-        self.allocations.reconcile()
+        self.allocations.reconcile()?;
+        let mut unsigned = self.clone();
+        unsigned.receipt_digest = "0".repeat(64);
+        let expected = crate::canonical_digest(&unsigned)?;
+        if self.receipt_digest != expected {
+            return Err(ContextError::IdentityConflict);
+        }
+        Ok(())
     }
 }

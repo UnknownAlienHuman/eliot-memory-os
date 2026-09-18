@@ -1,0 +1,136 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
+routing_authority = "owning_issue_and_normative_pair_only"
+status = "READY_FOR_IMPLEMENTATION"
+implementation_support = "PACKAGE_LEVEL_INDEX_PRESENT_TARGET_DESTINATION_AND_HARD_SHARD_CAP_MISSING"
+evidence_execution_status = "GENERATOR_SOURCE_INSPECTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "PACKAGE_READER_AND_SHARD_BOUNDARY_CONFORMANCE_ONLY"
+issue = 690
+registry_consumer_issue = 13
+verification_profile_issue = 750
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "documentation.package-target-handle-fragment-closure"
+causal_property = "Every workspace and explicitly classified nonmember Cargo target resolves through its inherited routing and logical blocks to exact canonical documentation handles and fragment anchors, and every manifest-listed canonical shard is measured once against the hard 48,000-byte limit."
+current_discriminator = "package_docs.py and prototype_docs.py validate only package-level logical handles and render every handle as a generic HANDLE_INDEX.md link; target-level forward/reverse destination closure is absent. prototype_docs.py does not validate target paths. docs_shards_core.py uses 48,000 only as an initial split threshold and may retain 64,000/80,000/120,000-byte fragments rather than enforcing the required hard cap."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/690"
+
+[documentation]
+repository = ["https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/READING_PROTOCOL.md"]
+implementation = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I02-08-package-metadata-source-ownership-and-generated-registry.md#i28-package-metadata-source-ownership-and-generated-registry",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I00-14-documentation-and-evidence-build-integrity.md#i014-documentation-and-evidence-build-integrity",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I02-16-crate-size-and-agent-context-envelope.md#i216-crate-size-and-agent-context-envelope",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I02-17-parallel-agent-development-contract.md#i217-parallel-agent-development-contract",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I02-18-build-test-and-artifact-graph.md#i218-build-test-and-artifact-graph",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I18-21-local-and-ci-parity.md#i1821-local-and-ci-parity",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I18-27-oracle-ownership-and-test-change-governance.md#i1827-oracle-ownership-and-test-change-governance",
+]
+anchors = ["ARCH-MOD-01", "ARCH-MOD-02", "ARCH-GROUND-01", "ARCH-OBS-01"]
+
+[current_source]
+confirmed = [
+  "package_docs.py validates workspace manifest, package roots, target-file existence, inherited family AGENTS and nonempty logical handles/routes.",
+  "Its generated logical-block table links every distinct handle to ../architecture/HANDLE_INDEX.md rather than resolving the exact fragment and anchor.",
+  "Its package table contains manifest/admission/logical blocks but no per-target route, handle, destination or reverse membership.",
+  "prototype_docs.py validates prototype classification and workspace_admission but does not validate/render target files and also links handles only to generic HANDLE_INDEX.md.",
+  "No shared handle_destinations.py owner currently supplies exact handle-to-fragment/anchor resolution to both generators.",
+  "docs_shards_core.py starts splitting at 48,000 bytes but subsequently uses 64,000, 80,000 and 120,000 thresholds, so generation logic itself does not enforce the Issue's hard 48,000-byte canonical-shard ceiling.",
+]
+
+[scope]
+primary_paths = [
+  "scripts/code_navigation_lib/package_docs.py",
+  "scripts/code_navigation_lib/prototype_docs.py",
+  "scripts/code_navigation_lib/handle_destinations.py only if one shared resolver is necessary",
+  "scripts/docs_shards_core.py only hard ceiling validation and existing inline self-test",
+  "scripts/tests/test_package_reader_closure.py",
+  "scripts/testdata/package-reader-closure/**",
+  "docs/code-navigation/PACKAGE_DOCS_INDEX.md generated only",
+  "docs/code-navigation/PROTOTYPE_DOCS_INDEX.md generated only",
+  "scripts/README.md only supported commands, ownership and proof boundary",
+  ".github/temporary/work-unit-690.md only if present",
+]
+forbidden = [
+  "additional reverse-index file or duplicate handle registry",
+  "handle-index.json, logical-block semantic assignments or canonical shard prose",
+  "docs_shards.py wrapper, Cargo, Rust, root/lock, workflow, Justfile or verify.ps1",
+  "unrelated generated indexes, normative meaning or Product/runtime support",
+  "generic HANDLE_INDEX destination, title/number similarity fallback or source mutation to make routes valid",
+  "unbounded context loading of every package/shard body",
+]
+
+[[waves]]
+id = "A"
+what = "Freeze the complete package, manifest and target denominator."
+how = [
+  "Derive root workspace members/default members and every nonmember Cargo package from existing authoritative metadata.",
+  "Require one explicit prototype/workspace-admission disposition for every nonmember package and reject missing/duplicate/aliased root/name/manifest/target identity.",
+  "Validate every declared/inferred target exists, remains within the valid package boundary and retains exact target/cfg distinction.",
+  "Reconcile each target independently with inherited AGENTS route chain, logical blocks, route IDs and governing handles; family evidence cannot replace a target row.",
+]
+
+[[waves]]
+id = "B"
+what = "Resolve each governing handle to one exact canonical destination."
+how = [
+  "Use the existing handle-index owner and exact Markdown/HTML anchor algorithm through one shared resolver consumed by both generators.",
+  "Bind canonical handle, fragment path, anchor, source-schema/manifest identity and current destination digest.",
+  "Validate tracked path case, repository containment, canonical manifest classification and actual anchor existence.",
+  "Reject unknown, duplicate, ambiguous, malformed, empty, external, traversal and percent/separator/case-alias destinations; no generic index or similar-title fallback.",
+]
+
+[[waves]]
+id = "C"
+what = "Render complete forward and reverse closure in the two existing indexes."
+how = [
+  "For every package manifest and target render exact logical block, route, handle and direct fragment#anchor destination plus source/coverage/admission identities.",
+  "For every handle/destination render all package/target reverse memberships and reject missing or extra reverse members.",
+  "Keep workspace and prototype sets disjoint, render shared handles once with all members, and preserve meaningful declared order while canonicalizing semantic sets.",
+  "Regenerate both indexes through the existing command; repeated same-input generation must be byte-identical and check detects absent/stale/tampered/partial/extra output.",
+]
+
+[[waves]]
+id = "D"
+what = "Enforce the exact canonical-shard denominator and 48,000-byte cap."
+how = [
+  "Enumerate each canonical fragment exactly once from the architecture and implementation manifests; exclusion is allowed only by actual manifest class.",
+  "Measure encoded bytes, not characters: 48,000 passes and 48,001 fails with path/count/limit/manifest evidence.",
+  "Missing, unreadable, invalid UTF-8 and duplicate/alias manifest entries fail; an unlisted large file is not silently added to the canonical denominator.",
+  "Largest-shard reporting cannot hide another violation and output-only generated commits cannot self-invalidate the relevant input digest.",
+  "Implement exactly WORK_UNIT_CASE: 690/1..55 plus the existing package/prototype/shard self-tests.",
+]
+
+[acceptance]
+criteria = [
+  "Every workspace member, default member and nonmember Cargo package is accounted exactly once with one explicit disposition.",
+  "Every package has at least one exact target and every target independently closes inherited route, logical block and governing handle obligations.",
+  "Missing manifest/target/block/route/handle or escaping target fails even when sibling targets are valid.",
+  "Every handle resolves to one direct canonical fragment#anchor; generic HANDLE_INDEX links and similarity fallback are absent.",
+  "Unknown, duplicate, ambiguous, malformed, external, traversal and decoding-alias destinations fail closed.",
+  "Forward package/target relations and reverse handle/destination memberships are exact with no missing or extra member.",
+  "Workspace/prototype indexes remain disjoint and repeated generation is byte-identical.",
+  "Stale, hand-edited, absent, partially regenerated and extra index rows are detected with the exact supported regeneration command.",
+  "Every canonical manifest-listed shard is measured exactly once in bytes; 48,000 is accepted and 48,001 rejected.",
+  "Missing/unreadable/invalid-UTF8/duplicate shard entries fail and noncanonical files are excluded only by manifest class.",
+  "README documents only real supported commands and the static navigation/shard proof ceiling.",
+  "Exactly 55 substantive cases execute together with current package/prototype and shard self-tests.",
+  "No normative/Cargo/Rust/workflow/unrelated-index diff or runtime/Product claim exists.",
+]
+
+[verification]
+commands = [
+  "python -m unittest scripts.tests.test_package_reader_closure -v",
+  "python scripts/code_navigation.py package-docs-self-test",
+  "python scripts/code_navigation.py prototype-docs-self-test",
+  "python scripts/code_navigation.py sync-index --root .",
+  "python scripts/code_navigation.py check --root .",
+  "python scripts/docs_shards.py --self-test",
+  "python scripts/docs_shards.py --root . --check",
+  "git diff --check",
+]
+reproduction = "Generate both indexes twice, require no second diff, and attach complete package/target/handle/destination/reverse relations plus the exact shard byte-size denominator."
+product_proof = "This establishes static reader and shard-boundary conformance only; it does not prove documentation understanding, compilation, runtime wiring or Product support."

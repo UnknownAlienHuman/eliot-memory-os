@@ -10,7 +10,7 @@
 
 use std::collections::BTreeMap;
 
-use eliot_contracts::{AuthorityEpoch, ClockReading, StateFence, TaskId};
+use eliot_contracts::{ClockReading, EpochId, StateFence, TaskId};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -165,7 +165,7 @@ pub struct TaskCommandContext {
     pub event_id: String,
     pub actor_ref: String,
     pub state_fence: StateFence,
-    pub authority_epoch: AuthorityEpoch,
+    pub authority_epoch: EpochId,
     pub observed_at: ClockReading,
 }
 
@@ -203,7 +203,7 @@ pub struct TaskLifecycleEvent {
     pub to: TaskState,
     pub command: Option<TaskCommand>,
     pub state_fence: StateFence,
-    pub authority_epoch: AuthorityEpoch,
+    pub authority_epoch: EpochId,
     pub observed_at: ClockReading,
 }
 
@@ -233,7 +233,7 @@ pub struct TaskLifecycleSnapshot {
 /// Deterministic owner of all task lifecycle transitions in one fence.
 #[derive(Clone, Debug)]
 pub struct TaskLifecycleOwner {
-    authority_epoch: AuthorityEpoch,
+    authority_epoch: EpochId,
     state_fence: StateFence,
     next_sequence: u64,
     tasks: BTreeMap<TaskId, TaskRecord>,
@@ -243,14 +243,11 @@ pub struct TaskLifecycleOwner {
 
 impl TaskLifecycleOwner {
     /// Creates an empty owner.  The fence is the owner-wide admission boundary.
-    pub fn new(
-        authority_epoch: AuthorityEpoch,
-        state_fence: StateFence,
-    ) -> Result<Self, TaskError> {
+    pub fn new(authority_epoch: EpochId, state_fence: StateFence) -> Result<Self, TaskError> {
         state_fence
             .validate()
             .map_err(|_| TaskError::FenceMismatch)?;
-        if authority_epoch != state_fence.authority_epoch {
+        if !authority_epoch.is_same_authority(&state_fence.authority_epoch) {
             return Err(TaskError::EpochMismatch);
         }
         Ok(Self {
@@ -265,7 +262,7 @@ impl TaskLifecycleOwner {
 
     /// Rebuilds an owner from its canonical snapshot; malformed ordering is rejected.
     pub fn from_snapshot(
-        authority_epoch: AuthorityEpoch,
+        authority_epoch: EpochId,
         state_fence: StateFence,
         snapshot: TaskLifecycleSnapshot,
     ) -> Result<Self, TaskError> {
@@ -425,7 +422,10 @@ impl TaskLifecycleOwner {
     }
 
     fn check_context(&self, context: &TaskCommandContext) -> Result<(), TaskError> {
-        if context.authority_epoch != self.authority_epoch {
+        if !context
+            .authority_epoch
+            .is_same_authority(&self.authority_epoch)
+        {
             return Err(TaskError::EpochMismatch);
         }
         if !self.state_fence.is_compatible_with(&context.state_fence) {
@@ -452,7 +452,7 @@ impl TaskLifecycleOwner {
             to,
             command,
             state_fence: context.state_fence.clone(),
-            authority_epoch: context.authority_epoch,
+            authority_epoch: context.authority_epoch.clone(),
             observed_at: context.observed_at,
         };
         self.next_sequence += 1;

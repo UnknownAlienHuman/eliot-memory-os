@@ -1,0 +1,17 @@
+{
+  "issue": 686,
+  "description": "Frozen denominator for transitive influence-revocation recovery (issue #686). One four-grant delegation chain sharing authority_root_ref root:alpha plus one unrelated standalone grant. Effects narrow strictly down the chain (ExternalEffect > ReversibleMutation > Candidate > Read) so parent edges validate. Tests build typed grants/closures from these identities with a single test fence; the closure history revision below must equal the evidence source_revision exactly.",
+  "authority_root": "root:alpha",
+  "origin_grant": "grant:origin-alpha",
+  "mid_grant": "grant:mid-beta",
+  "leaf_grant": "grant:leaf-gamma",
+  "tip_grant": "grant:tip-delta",
+  "unrelated_grant": "grant:standalone-epsilon",
+  "unrelated_root": "root:epsilon",
+  "origin_closure_id": "revocation-686-origin-01",
+  "mid_closure_id": "revocation-686-mid-01",
+  "source_revision": 9,
+  "invalidation_reason": "SOURCE_REVOKED",
+  "origin_affected": ["grant:leaf-gamma", "grant:mid-beta", "grant:tip-delta", "root:alpha"],
+  "mid_affected": ["grant:leaf-gamma", "grant:mid-beta"]
+}

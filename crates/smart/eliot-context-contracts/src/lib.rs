@@ -10,6 +10,7 @@
 mod admission;
 mod admission_input;
 mod atom;
+mod canonical_projections;
 mod economy;
 mod error;
 mod identity;
@@ -36,6 +37,11 @@ pub use atom::{
     AdmissionDisposition, AdmittedAtom, AtomAvailability, AtomRepresentation, AuthorityClass,
     CapacityLimits, ContextCandidate, ContextRecipe, LossPolicy, MeasurementRef, PrivacyClass,
     ProviderDisposition, ProviderRoleDenominator, RepresentationKind, RoleLossRule,
+};
+pub use canonical_projections::{
+    AffordanceProjection, CANONICAL_PROJECTIONS_SCHEMA_VERSION, CanonicalProjectionSet,
+    ContinuityProjection, MAX_PROJECTION_ENTRIES, MAX_PROJECTION_TEXT, MAX_SET_OMISSIONS,
+    SafetyProjection, TaskProjection,
 };
 pub use economy::{ContextEconomyReceipt, EconomyAllocations};
 pub use error::{
@@ -100,5 +106,16 @@ pub(crate) fn validate_digest(value: &str, field: &'static str) -> Result<(), Co
 pub fn canonical_digest<T: serde::Serialize>(value: &T) -> Result<String, ContextError> {
     let bytes = eliot_contracts::canonical_json_bytes(value)
         .map_err(|_| ContextError::InvalidField("canonical_value"))?;
+    Ok(sha256_hex(&bytes))
+}
+
+/// Compute the canonical digest bound to one state fence.
+///
+/// This is sha256 over the canonical JSON bytes of `binding.state_fence`;
+/// `StateFence` is canonical by construction via
+/// `StateFence::new(EpochId, ResourceGeneration)`.
+pub fn canonical_fence_digest(fence: &eliot_contracts::StateFence) -> Result<String, ContextError> {
+    let bytes = eliot_contracts::canonical_json_bytes(fence)
+        .map_err(|_| ContextError::InvalidField("canonical_fence"))?;
     Ok(sha256_hex(&bytes))
 }

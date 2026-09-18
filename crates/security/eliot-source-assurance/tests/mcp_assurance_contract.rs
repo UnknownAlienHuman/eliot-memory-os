@@ -1,11 +1,11 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use eliot_source_assurance::{
-    AdmissibleUse, AdmissionExpectation, AdmissionOutcome, AxisStatus, EffectCeiling,
-    GoverningSourceIdentity, GoverningSourceSet, InstructionTaint, OwnerSourceEvidence,
-    PrivacyClass, QuarantineStatus, ScopeBindingProof, SourceAssurance, SourceAssurancePolicy,
-    SourceFrontierBinding, SourceProvenance, SourceSnapshotBinding, SourceTrustProfile,
-    ThreatStatus, TrustAxis,
+    AdmissibleUse, AdmissionExpectation, AdmissionOutcome, AssuranceFinding, AxisStatus,
+    EffectCeiling, GoverningSourceIdentity, GoverningSourceSet, InstructionTaint,
+    OwnerSourceEvidence, PrivacyClass, QuarantineStatus, ScopeBindingProof, SourceAssurance,
+    SourceAssuranceError, SourceAssurancePolicy, SourceFrontierBinding, SourceProvenance,
+    SourceSnapshotBinding, SourceTrustProfile, ThreatStatus, TrustAxis,
 };
 
 fn digest(value: impl AsRef<[u8]>) -> String {
@@ -144,4 +144,116 @@ fn failed_profile_axis_is_independent_and_cannot_be_filled_by_other_evidence() {
             }
         )
     }));
+}
+
+// WORK_UNIT_CASE 692/3: data requested as a procedure candidate claims
+// instruction-like authority, so the taint finding fires on its own while
+// every other field stays verified.
+#[test]
+fn data_requested_as_procedure_is_instruction_tainted() {
+    let mut evidence = owner_evidence();
+    evidence.assurance.requested_use = AdmissibleUse::ProcedureCandidate;
+    evidence.policy.allowed_use = AdmissibleUse::ProcedureCandidate;
+    let outcome = evidence
+        .assurance
+        .admit_with_policy(&evidence.policy)
+        .expect("policy evaluation should return a typed outcome");
+    let AdmissionOutcome::NeedsRevalidation { findings } = outcome else {
+        panic!("tainted procedure request must not be admitted");
+    };
+    assert_eq!(findings, vec![AssuranceFinding::InstructionTainted]);
+}
+
+// WORK_UNIT_CASE 692/5: per-field use/effect/verifier requirements each
+// produce their own typed finding and outcome on a genuine mismatch.
+#[test]
+fn integrity_verifier_and_owner_mismatches_are_typed() {
+    let mut evidence = owner_evidence();
+    evidence.assurance.trust.integrity = AxisStatus::Failed;
+    let outcome = evidence
+        .assurance
+        .admit_with_policy(&evidence.policy)
+        .expect("policy evaluation should return a typed outcome");
+    let AdmissionOutcome::Quarantined { findings } = outcome else {
+        panic!("failed integrity proof must quarantine");
+    };
+    assert_eq!(findings, vec![AssuranceFinding::InvalidIntegrity]);
+
+    let evidence = owner_evidence();
+    assert!(matches!(
+        evidence.admit("principal/local-user"),
+        Ok(AdmissionOutcome::Admitted { .. })
+    ));
+
+    let mut unverified = owner_evidence();
+    unverified.verifier_ref = None;
+    let outcome = unverified
+        .admit("principal/local-user")
+        .expect("owner evaluation should return a typed outcome");
+    let AdmissionOutcome::NeedsRevalidation { findings } = outcome else {
+        panic!("unsatisfied verifier requirement must need revalidation");
+    };
+    assert_eq!(findings, vec![AssuranceFinding::VerifierMismatch]);
+
+    let mut spoofed = owner_evidence();
+    spoofed.owner_principal_ref = "principal/attacker".into();
+    let outcome = spoofed
+        .admit("principal/local-user")
+        .expect("owner evaluation should return a typed outcome");
+    let AdmissionOutcome::Conflicted { findings } = outcome else {
+        panic!("owner principal mismatch must conflict");
+    };
+    assert_eq!(findings, vec![AssuranceFinding::OwnerAuthenticationFailed]);
+}
+
+// WORK_UNIT_CASE 692/13: stale evidence needs owner refresh, an unknown
+// policy revision is an explicit defect, and a missing policy never
+// defaults to a permissive evaluation.
+#[test]
+fn unknown_policy_and_stale_evidence_are_explicit() {
+    let evidence = owner_evidence();
+    let mut unknown = evidence.policy.clone();
+    unknown.policy_version = "source-policy-v2".into();
+    let error = evidence
+        .assurance
+        .admit_with_policy(&unknown)
+        .expect_err("unknown policy revision must not evaluate");
+    assert!(matches!(error, SourceAssuranceError::UnsupportedSchema(_)));
+
+    let mut stale_policy = evidence.policy.clone();
+    stale_policy.expectation.frontier.generation = 2;
+    let outcome = evidence
+        .assurance
+        .admit_with_policy(&stale_policy)
+        .expect("policy evaluation should return a typed outcome");
+    let AdmissionOutcome::NeedsRevalidation { findings } = outcome else {
+        panic!("stale evidence must need revalidation");
+    };
+    assert!(findings.contains(&AssuranceFinding::StaleFrontier));
+
+    let error = SourceAssurance::admit_optional_with_policy(Some(&evidence.assurance), None)
+        .expect_err("missing policy must not default safe");
+    assert!(matches!(
+        error,
+        SourceAssuranceError::MissingField("policy")
+    ));
+}
+
+// WORK_UNIT_CASE 692/10: a transformation receipt extends lineage
+// deterministically; a changed descriptor invalidates the prior receipt.
+#[test]
+fn lineage_receipt_append_is_deterministic() {
+    let previous = digest("lineage");
+    let first = eliot_source_assurance::append_lineage_receipt(&previous, b"transform:normalize")
+        .expect("lineage append should be pure and total on valid input");
+    let second = eliot_source_assurance::append_lineage_receipt(&previous, b"transform:normalize")
+        .expect("lineage append should be deterministic");
+    assert_eq!(first, second);
+    let changed = eliot_source_assurance::append_lineage_receipt(&previous, b"transform:redact")
+        .expect("changed descriptor must produce a receipt");
+    assert_ne!(first, changed);
+    assert!(
+        eliot_source_assurance::append_lineage_receipt("not-a-digest", b"transform:x").is_err()
+    );
+    assert!(eliot_source_assurance::append_lineage_receipt(&previous, b"").is_err());
 }

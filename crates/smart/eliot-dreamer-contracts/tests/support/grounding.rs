@@ -2,25 +2,33 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use eliot_contracts::{EpochId, EpochLineageId};
+use std::num::NonZeroU64;
+
 use eliot_dreamer_contracts::grounding::canonical::{
-    ArtifactId, AuthorityEpoch, EvidenceAuthority, EvidenceFreshness, EvidenceGrade,
-    GradeAssignment, PositionAssertability, PrivacyHandling, ResourceGeneration, StateFence,
-    TaskId, ValidityBounds,
+    ArtifactId, EvidenceAuthority, EvidenceFreshness, EvidenceGrade, GradeAssignment,
+    PositionAssertability, PrivacyHandling, ResourceGeneration, StateFence, TaskId, ValidityBounds,
 };
 use eliot_dreamer_contracts::grounding::{
     AllowedReferenceManifest, AssertionWitness, AttemptIdentity, ClaimGroundingLedger,
     ClaimGroundingRecord, ClaimKind, GroundingDisposition, GroundingPolicy, MaterialClaim,
-    ModelDraft, NonMaterialClaim, PrecisionPayload, RouteIdentity,
+    NonMaterialClaim, PrecisionPayload, RouteIdentity, StructuredModelDraft,
 };
 use eliot_dreamer_contracts::{
-    BudgetLimits, BundleCompleteness, DreamInputBundle, DreamJobInput, JobClass, Requester,
+    BudgetLimits, BundleCompleteness, DreamInputBundle, DreamJobAdmission, JobClass, Requester,
     RequesterOrigin,
 };
 
 pub const DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 pub fn fence() -> StateFence {
-    StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+    let epoch = EpochId::new(
+        EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .expect("canonical test lineage-A"),
+        NonZeroU64::new(1).expect("non-zero test sequence"),
+    )
+    .expect("valid test epoch");
+    StateFence::new(epoch, ResourceGeneration::genesis())
 }
 pub fn task() -> TaskId {
     TaskId::new("task-grounding").expect("task")
@@ -29,8 +37,8 @@ pub fn artifact(value: &str) -> ArtifactId {
     ArtifactId::new(value).expect("artifact")
 }
 
-pub fn job() -> DreamJobInput {
-    DreamJobInput {
+pub fn job() -> DreamJobAdmission {
+    DreamJobAdmission {
         schema_version: 1,
         job_class: JobClass::Curation,
         requester: Requester {
@@ -127,11 +135,11 @@ fn claim_with_handle(id: &str, handle: &str) -> MaterialClaim {
     claim
 }
 
-pub fn draft() -> ModelDraft {
+pub fn draft() -> StructuredModelDraft {
     let mut claims = vec![claim("claim-1"), claim("claim-2")];
     claims[0].subclaim_ids.insert("claim-2".into());
     claims[0].source_preimage_digest = claims[0].computed_digest().expect("claim digest");
-    let mut draft = ModelDraft {
+    let mut draft = StructuredModelDraft {
         schema_version: 2,
         job_id: job().canonical_id(),
         task_id: task(),

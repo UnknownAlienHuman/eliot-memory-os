@@ -33,10 +33,17 @@ attempts, route identity, host observations, effect candidates and worker result
 candidates. It owns no mutable state, provider process, route policy, capability
 registry, task plan, authority decision, canonical write or task finish.
 
-Issue #228 records confirmed contract collisions in the current source. Until its
-Contract/Evidence wave freezes the field-level owners and compatibility plan,
-do not perform a broad source rewrite or let a local type become a convenient
-second owner.
+Issue #228 records confirmed contract collisions. S4 (route triple) / S5
+(candidate-only result + binding) / S6 (closed host-event envelope) have landed
+in source (`RouteSelectionCandidate` / `AdmittedRouteReceipt` /
+`PhysicalRouteObservationReceipt`; `ResultDisposition` without
+`VerifiedComplete`; `NormalizedHostEventEnvelope` alongside the legacy
+quarantine). The narrow #228 slice hardens the effect trio to
+`LowercaseSha256` / `ClockReading` at `CONTRACT_VERSION ==
+"eliot-agent-api/v7"`. Residual cross-lane work (governor `EffectReceipt`
+unification, bridge consumer migration, Finish edge, Product Pulse) remains
+outside this cell. Until that wave freezes the remaining owners, do not perform
+a broad rewrite or let a local type become a convenient second owner.
 
 Read the repository instructions, #228, related route work #224/#187, strict
 finish owner #18, and the applicable Architecture/Implementation fragments
@@ -99,9 +106,25 @@ artifacts, executed verifier evidence, State Fence and reconciled effects.
 
 ## Current ContractChallenges
 
+Status: S4/S5/S6 landed in source; stale as-current defect prose below is
+retained only as history with landed notes. The remaining in-cell hardening is
+the v7 effect trio (`payload_digest: LowercaseSha256`,
+`authorized_at`/`expires_at: ClockReading`); cross-lane unification stays
+residual.
+
 ### Duplicate shared identities
 
-Current source locally declares opaque strings named:
+Landed: `TaskId` / `ArtifactId` / `SessionId` / `WorkLeaseId` are canonical
+imports from `eliot-contracts` (no local wrapper); `AttemptId` is an exact
+alias of `AgentAttemptId`; `EpochId` / `StateFence` / `ResourceGeneration`
+are typed on all route/attempt/admission surfaces. Residual: agent-local
+`LaunchRequestId` / `WorkUnitId` / `RouteFingerprintId` / `EventId` /
+`EventCursor` disposition plus the cross-lane effect-trio duplicate
+(api `ProposedEffect` / `AuthorizedEffect` / `EffectReceipt` vs governor
+`eliot-authority` owner, no unilateral rename in this slice).
+
+Historical inventory note (pre-S4/S5/S6): the source once locally declared
+opaque strings named:
 
 ```text
 TaskId;
@@ -129,15 +152,28 @@ receipt/effect identities must not remain unrelated strings.
 
 ### Weak Authority Epoch and State Fence
 
-`AuthorityEpoch(String)` and `state_fence: String` cannot express epoch lineage,
-sequence, restore fencing or exact dependency revisions. No new contract may
-use these fields as proof of current authority. Migrate through the accepted
-shared typed contracts; do not parse meaning from display strings.
+Landed: typed `EpochId { lineage_id, sequence }` and `StateFence` on all
+route/attempt/admission/binding surfaces; scalar epoch/fence wires are
+rejected. Residual in-cell hardening (v7, Implements #228):
+`AuthorizedEffect.authorized_at` / `expires_at` are now `ClockReading`.
+Historical note: `AuthorityEpoch(String)` and `state_fence: String` could not
+express epoch lineage, sequence, restore fencing or exact dependency
+revisions. No new contract may use these fields as proof of current
+authority. Migrate through the accepted shared typed contracts; do not parse
+meaning from display strings.
 
 ### Multiple route-choice representations
 
-Current source contains `CapabilityRouteDecision` and a public
-`eliot_agent_api::RoutingReceipt`. `eliot-agent-coordinator` contains a second,
+Landed (S4, v6): `RouteSelectionCandidate` (candidate-only) /
+`AdmittedRouteReceipt` (admitted logical decision) /
+`PhysicalRouteObservationReceipt` (observed physical evidence) are the single
+owners; no `pub struct RoutingReceipt` / `ActualRouteReceipt` /
+`PhysicalModelAttemptReceipt` / `CapabilityRouteDecision` remains in source
+(versioned legacy v5 decoder only). Coordinator consumes
+`RouteSelectionCandidate` (no second `RoutingReceipt` struct).
+
+Historical note: the source once contained `CapabilityRouteDecision` and a public
+`eliot_agent_api::RoutingReceipt`, while `eliot-agent-coordinator` contained a second,
 incompatible `RoutingReceipt` used by staffing-plan selection.
 
 Until #228 freezes exact meanings and owners:
@@ -163,9 +199,15 @@ Every field-level type has one owner and one compatibility path.
 
 ### Worker-controlled `VerifiedComplete`
 
-Current `AgentResult` accepts `ResultDisposition::VerifiedComplete` and checks
-only that `evidence_refs` is nonempty. This is not an admissible finish
-boundary.
+Landed (S5): `ResultDisposition` is candidate-only (`CandidateSucceeded`,
+`Partial`, `Blocked`, `FailedVerification`, `DegradedNoProof`, `Unsafe`,
+`CancelledObserved`, `Superseded`, `UnknownOutcome`); no `VerifiedComplete`
+variant exists and legacy `VERIFIED_COMPLETE` wires are rejected, not
+migrated. Only the Governor Finish service may yield `VERIFIED_COMPLETE`.
+
+Historical note: `AgentResult` once accepted `ResultDisposition::VerifiedComplete`
+and checked only that `evidence_refs` was nonempty. This was not an admissible
+finish boundary.
 
 Do not add code, tests or consumers that treat this variant as task completion.
 Do not add a conversion from `AgentResult`, provider `completed`, process exit,
@@ -179,8 +221,13 @@ completion.
 
 ### Requested versus observed route mismatch
 
-Current `ActualRouteReceipt` and `PhysicalModelAttemptReceipt` return a contract
-error whenever observed route differs from requested route. A mismatch is
+Landed (S4/S5): `DIVERGED` / `UNOBSERVED` preserve both fingerprints with a
+capped `ProofCeiling::Observation` ceiling and quarantine/recovery linkage;
+divergence is evidence, never a schema error. `RouteMismatch` remains only for
+candidate-set incoherence.
+
+Historical note: `ActualRouteReceipt` and `PhysicalModelAttemptReceipt` once
+returned a contract error whenever observed route differed from requested route. A mismatch is
 material evidence, not evidence that no attempt occurred.
 
 The corrected contract must preserve both fingerprints and expose a typed
@@ -190,7 +237,14 @@ discard the physical-attempt evidence.
 
 ### Weak digests and timestamps
 
-Current tests use non-digests such as:
+Landed for route/observation (S4): behavior-bearing hashes are
+`LowercaseSha256`; times are `ClockReading`; placeholders such as
+`sha256:runtime` fail at deserialization. Narrow slice (v7, Implements #228):
+`ProposedEffect.payload_digest: LowercaseSha256` and
+`AuthorizedEffect.authorized_at` / `expires_at: ClockReading` with
+`UnknownContractVersion` / deserialization rejection of v6 string wires.
+
+Historical note: tests once used non-digests such as:
 
 ```text
 sha256:runtime;
@@ -208,8 +262,15 @@ proof.
 
 ### Generic normalized payload
 
-`HostEventEnvelope.normalized_payload: serde_json::Value` is not a closed
-policy/control contract. Do not add policy, authority, completion or capability
+Landed (S6): new producers/consumers use the closed, versioned
+`NormalizedHostEventEnvelope` (`host-event-v7`); the generic
+`HostEventEnvelope.normalized_payload: serde_json::Value` wire is a legacy
+quarantine boundary (intentionally untouched so existing consumers keep
+compiling) and must not gain new policy/authority/completion/capability
+consumers.
+
+Historical note: `HostEventEnvelope.normalized_payload: serde_json::Value` was
+not a closed policy/control contract. Do not add policy, authority, completion or capability
 logic that interprets arbitrary keys inside it.
 
 The contract wave must provide typed event payload families or one bounded

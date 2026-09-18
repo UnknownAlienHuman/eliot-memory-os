@@ -1,0 +1,71 @@
+schema_version = 4
+module_id = "smart.memory.applicability"
+crate = "eliot-memory-applicability"
+status = "PROTOTYPE"
+wave = "cognitive-micromodules-wave-01"
+agent_order = 45
+plane = "Smart"
+runtime_layer = "R5"
+delivery_depth = "D3b"
+source_layer = "C1"
+runtime_bundle = "eliotd"
+state_class = "stateless"
+hot_path = false
+lifecycle_owner = "smart.memory.applicability"
+loc_soft_ceiling = 10000
+loc_policy = "review ceiling only; causal cohesion, proof, owner, build/test closure and replacement boundary decide topology"
+product_objective = "Task-local memory use is decided by exact applicability rules, never by cue-hit strength, similarity, or retrieval repetition."
+causal_property = "task-local memory applicability evaluation"
+old_failure_or_missing_capability = "a cue firing while exact task/session/precondition applicability excludes the record is indistinguishable from proof (CC-008)."
+discriminator = "cue-hit-but-not-applicable records are excluded with their substantive rule; activation never promotes, repetition never counts"
+primary_responsibility = "Evaluate one bounded MemoryProjectionBatch into an ApplicableMemorySet with exact per-record reasons."
+owned_mutable_state = []
+allowed_effects = []
+inputs = ["MemoryProjectionBatch", "task key for exact negative-trigger match", "advisory cue-hit handles"]
+outputs = ["ApplicableMemorySet"]
+depends_on = ["eliot-memory-projection-contracts", "eliot-contracts", "eliot-evidence"]
+providers = ["memory projection provider"]
+consumers = ["context candidates memory slot"]
+non_goals = ["store queries", "read-set expansion", "cue scoring", "ranking", "support/influence promotion"]
+invariants = ["cue hits are advisory only", "every exclusion names its substantive rule", "evaluation order is deterministic input order", "no second graph is built"]
+failure_behavior = "Return a typed error on invalid input or missing denominator; per-record failures become explicit exclusions, never silent drops."
+proof_surface = ["stale/conflicted/protected/negative/precondition/missing-denominator cases", "cue-hit-but-not-applicable adversarial", "shared-fence fixtures with the provider"]
+proof_ceiling = "STATIC_CONTRACT_REGISTRATION_ONLY"
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+replacement_boundary = "implementation behind the declared public contract; package ownership creates no runtime or semantic authority"
+merge_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
+split_trigger = "a second causal responsibility, mutable owner, independent proof surface or independent rollback boundary appears"
+
+[[donor]]
+path = "docs/architecture/A14-03-negative-memory-and-extinction.md"
+disposition = "exact deterministic triggers only; similarity is never a block"
+
+[[donor]]
+path = "docs/architecture/A14-04-forgetting-and-memory-ecology.md"
+disposition = "retrieval frequency never promotes; minority roles travel intact"
+
+[agent_task]
+objective = "Decide task-local applicability over the bounded projection with exact reasons."
+write_scope = ["crates/smart/eliot-memory-applicability/**"]
+deliverables = ["pure applicability evaluator", "shared-fence fixtures with the provider", "cue-hit-not-applicable adversarial fixtures"]
+acceptance = ["one declared responsibility only", "bounded deterministic behavior", "visible local degradation"]
+forbidden = ["canonical writes outside the named Governor transition path", "truth/support/authority/policy/finish/effect promotion", "provider or model SDKs in pure cognitive cores", "vendor or storage types in public contracts", "unbounded synchronous work", "silent truncation", "oracle or verifier weakening in the same work unit", "implicit scope widening", "active-generation self-modification"]
+stop_condition = "Stop and return ContractChallenge when the work needs another owner, store access, model work or hidden state."
+challenge_path = "return ContractChallenge to the integration owner when owner, discriminator, proof ceiling or dependency boundary is wrong"
+integration_owner = "cognitive-wave-integrator"
+implementation_language = "Rust 2024"
+required_verification = ["module/package proof at the declared proof ceiling", "real provider/consumer fixture for every changed edge", "the named Product Pulse before promotion", "exact donor reuse/rewrite/reject trace"]
+writeback = "return implementation artifact, exact proof evidence, donor disposition, unresolved ContractChallenges and merge/remove recommendation"
+workspace_admission = "forbidden until implementation, package proof, affected Edge proof, current-main rebase and integration-owner review"
+
+# Acceptance is decided by the owning contract and independent review
+# (I0.10: line/test/type counts are not goals). `scripts/verify-work-unit.py`
+# is a retired legacy diagnostic that always reports completion=NOT_VERIFIED
+# and never accepts a work unit. This table names the concrete contract and
+# the required exports/tests plus small behaviour checks the reviewer verifies.
+[acceptance]
+require_deny_unknown_fields = true
+forbid_unsafe = true
+required_exports = []
+required_tests = []
+forbidden_patterns = ['serde_json::Value', 'unimplemented!', 'todo!']

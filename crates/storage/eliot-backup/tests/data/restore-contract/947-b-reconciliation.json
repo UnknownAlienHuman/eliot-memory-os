@@ -1,0 +1,1 @@
+{"applied":"receipt_bound","not_applied":"replay_exactly_once","note":"Worker B fixture: unknown possible effect is distinct from not-attempted and success.","unknown":"rollback_required"}

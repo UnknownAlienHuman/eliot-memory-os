@@ -1,0 +1,1 @@
+{"note":"Worker B fixture: protected raw-field closure. Duplicate and unknown protected fields are rejected before Value normalization under the exact current payload schema; worker-A typed raw gate names are pinned as a gap, not fabricated here.","reject_before_normalization":["duplicate_protected_field","unknown_protected_field"],"schema":"ECXF/1-current"}

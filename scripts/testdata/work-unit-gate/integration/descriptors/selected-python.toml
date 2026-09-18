@@ -1,0 +1,17 @@
+schema_version = "eliot-work-unit-descriptor-v2"
+identity = {value = "work-unit-837"}
+issue = {repository = {owner = "UnknownAlienHuman", name = "eliot-memory-os"}, number = 837}
+unit = {value = "D-WU-FINAL"}
+mode = "python-unittest"
+source_roots = [{value = "scripts/testdata/work-unit-gate/integration/repos/python-tiny/sample.py"}]
+test_roots = [{value = "scripts/testdata/work-unit-gate/integration/repos/python-tiny/test_sample.py"}]
+matrix_cases = 2
+proof_ceiling = {value = "package-local"}
+revision = 1
+body_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+matrix_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+require_workspace_member = false
+package = {name = "wu837_tiny"}
+module = {value = "integration.python_tiny.test_sample"}
+requirements = {source_floor = 1, public_floor = 1, test_floor = 2, required_guards = [{value = "bounded"}]}
+bounds = {wall_ms = 10000, idle_ms = 5000, output_bytes = 65536, line_bytes = 4096, discovery_tests = 1000, child_processes = 4}

@@ -1,0 +1,9 @@
+[package]
+name = "wu837_tiny"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+
+# Standalone so the fixture resolves offline, zero-dep.
+[workspace]

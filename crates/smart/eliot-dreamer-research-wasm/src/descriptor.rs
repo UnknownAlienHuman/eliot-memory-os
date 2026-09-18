@@ -1,0 +1,234 @@
+//! Guest descriptor and pure-world import gate.
+//!
+//! The WIT bytes and the pinned toolchain file are read at compile time from
+//! their owning paths, so the descriptor cannot drift from the readable
+//! sources by hand-copying. Two WIT sources bind this guest: the accepted
+//! byte-boundary `guest.wit` (`run` export) and the readable-but-unaccepted
+//! `dreamer-handler.wit` `ResearchSynthesis` arm of #756, recorded explicitly
+//! as `READABLE_NOT_ACCEPTED` (`ContractChallenge` path) instead of an
+//! invented ABI. The native synthesis projector of #995 is missing entirely;
+//! its frozen expected identity is recorded as `MISSING_NOT_ACCEPTED`
+//! instead of a fabricated native.
+
+use eliot_contracts::{canonical_json_bytes, sha256_hex};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+/// Accepted guest ABI revision carried inside every typed envelope.
+pub const GUEST_ABI_VERSION: u32 = 1;
+/// Byte-boundary WIT package identity from the accepted `guest.wit`.
+pub const WORLD_PACKAGE: &str = "eliot:wasm@1.0.0";
+/// Byte-boundary WIT world name from the accepted `guest.wit`.
+pub const WORLD_NAME: &str = "guest";
+/// Byte-boundary WIT export name from the accepted `guest.wit`.
+pub const EXPORT_NAME: &str = "run";
+/// Typed WIT package identity from the readable `dreamer-handler.wit`.
+pub const TYPED_WORLD_PACKAGE: &str = "eliot:current@0.1.0";
+/// Typed WIT world name from the readable `dreamer-handler.wit`.
+pub const TYPED_WORLD_NAME: &str = "dreamer-handler";
+/// Typed WIT interface name from the readable `dreamer-handler.wit`.
+pub const TYPED_INTERFACE_NAME: &str = "handler";
+/// `ResearchSynthesis` subtype handled by this guest.
+pub const HANDLER_SUBTYPE: &str = "research-synthesis";
+/// First production component target from I14.19 (also `DEFAULT_GUEST_TARGET`).
+pub const GUEST_TARGET: &str = "wasm32-wasip2";
+/// Pinned toolchain channel read from the owning `rust-toolchain.toml`.
+pub const TOOLCHAIN_CHANNEL: &str = "1.97.1";
+/// Acceptance status of the readable #756 typed world on this base.
+pub const TYPED_WORLD_STATUS: &str = "READABLE_NOT_ACCEPTED";
+/// Owning issue of the typed world.
+pub const TYPED_WORLD_OWNER: &str = "#756";
+/// Expected native synthesis crate identity (missing on this base).
+pub const NATIVE_CONTRACT_ID: &str = "eliot-dreamer-research-synthesis";
+/// Acceptance status of the missing #995 native on this base.
+pub const NATIVE_STATUS: &str = "MISSING_NOT_ACCEPTED";
+/// Owning issue of the missing native synthesis projector.
+pub const NATIVE_OWNER: &str = "#995";
+
+/// Exact bytes of the byte-boundary WIT contract at compile time.
+pub const GUEST_WIT_BYTES: &[u8] = include_bytes!("../../../../bins/eliot-wasm-host/wit/guest.wit");
+/// Exact bytes of the readable typed WIT contract at compile time.
+pub const TYPED_WIT_BYTES: &[u8] =
+    include_bytes!("../../../../bins/eliot-wasm-host/wit/typed/dreamer-handler.wit");
+/// Exact bytes of the pinned toolchain file at compile time.
+pub const TOOLCHAIN_BYTES: &[u8] = include_str!("../../../../rust-toolchain.toml").as_bytes();
+
+/// Capability namespaces the pure world must never inherit.
+pub const FORBIDDEN_IMPORT_SUBSTRINGS: &[&str] = &[
+    "filesystem",
+    "sockets",
+    "network",
+    "http",
+    "dns",
+    "stdio",
+    "stdin",
+    "stdout",
+    "stderr",
+    "terminal",
+    "environment",
+    "environ",
+    "env",
+    "argv",
+    "args",
+    "clocks",
+    "clock",
+    "random",
+    "process",
+    "thread",
+    "credential",
+    "store",
+    "kernel",
+    "governor",
+    "provider",
+    "model",
+    "wasi_snapshot_preview1",
+];
+
+/// One imported `(module, name)` pair observed in a built artifact.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WasmImport {
+    /// Import module namespace (e.g. `wasi:filesystem/types@0.2.10`).
+    pub module: String,
+    /// Imported name within the module.
+    pub name: String,
+}
+
+/// Descriptor failures carry the offending import, never a weakened pass.
+#[derive(Clone, Debug, Eq, PartialEq, Error, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum DescriptorError {
+    /// Input is not a WebAssembly binary.
+    #[error("not a WebAssembly module")]
+    NotWasm,
+    /// Import parsing failed for a stated reason.
+    #[error("import section unreadable: {0}")]
+    Unreadable(String),
+    /// A forbidden capability namespace was imported.
+    #[error("forbidden import {module}::{name}")]
+    ForbiddenImport {
+        /// Offending import module namespace.
+        module: String,
+        /// Offended imported name.
+        name: String,
+    },
+}
+
+/// The frozen component identity this guest claims.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ComponentDescriptor {
+    /// Byte-boundary WIT package identity (must equal [`WORLD_PACKAGE`]).
+    pub world_package: String,
+    /// Byte-boundary WIT world name (must equal [`WORLD_NAME`]).
+    pub world: String,
+    /// Byte-boundary WIT export name (must equal [`EXPORT_NAME`]).
+    pub export_name: String,
+    /// Handler subtype (must equal [`HANDLER_SUBTYPE`]).
+    pub handler_subtype: String,
+    /// Guest ABI revision (must equal [`GUEST_ABI_VERSION`]).
+    pub abi_version: u32,
+    /// Build target (must equal [`GUEST_TARGET`]).
+    pub target: String,
+    /// Pinned toolchain channel (must equal [`TOOLCHAIN_CHANNEL`]).
+    pub toolchain_channel: String,
+    /// SHA-256 of [`GUEST_WIT_BYTES`].
+    pub wit_digest: String,
+    /// Granted capability namespaces; empty for the pure world.
+    pub capability_envelope: Vec<String>,
+    /// Typed WIT package identity (must equal [`TYPED_WORLD_PACKAGE`]).
+    pub typed_world_package: String,
+    /// Typed WIT world name (must equal [`TYPED_WORLD_NAME`]).
+    pub typed_world: String,
+    /// Typed WIT interface name (must equal [`TYPED_INTERFACE_NAME`]).
+    pub typed_interface: String,
+    /// SHA-256 of [`TYPED_WIT_BYTES`].
+    pub typed_wit_digest: String,
+    /// Acceptance status of the readable typed world.
+    pub typed_world_status: String,
+    /// Expected native synthesis crate identity.
+    pub native_contract: String,
+    /// Acceptance status of the missing native.
+    pub native_status: String,
+}
+
+/// Builds the single canonical descriptor for this guest.
+#[must_use]
+pub fn descriptor() -> ComponentDescriptor {
+    ComponentDescriptor {
+        world_package: WORLD_PACKAGE.to_owned(),
+        world: WORLD_NAME.to_owned(),
+        export_name: EXPORT_NAME.to_owned(),
+        handler_subtype: HANDLER_SUBTYPE.to_owned(),
+        abi_version: GUEST_ABI_VERSION,
+        target: GUEST_TARGET.to_owned(),
+        toolchain_channel: TOOLCHAIN_CHANNEL.to_owned(),
+        wit_digest: sha256_hex(GUEST_WIT_BYTES),
+        capability_envelope: Vec::new(),
+        typed_world_package: TYPED_WORLD_PACKAGE.to_owned(),
+        typed_world: TYPED_WORLD_NAME.to_owned(),
+        typed_interface: TYPED_INTERFACE_NAME.to_owned(),
+        typed_wit_digest: sha256_hex(TYPED_WIT_BYTES),
+        typed_world_status: TYPED_WORLD_STATUS.to_owned(),
+        native_contract: NATIVE_CONTRACT_ID.to_owned(),
+        native_status: NATIVE_STATUS.to_owned(),
+    }
+}
+
+/// Canonical digest of the descriptor; stable across repeated computation.
+#[must_use]
+pub fn descriptor_digest() -> String {
+    let bytes = canonical_json_bytes(&descriptor()).unwrap_or_default();
+    sha256_hex(&bytes)
+}
+
+/// Returns `true` when the import pair falls in a forbidden namespace.
+#[must_use]
+pub fn is_forbidden_import(module: &str, name: &str) -> bool {
+    let module = module.to_lowercase();
+    let name = name.to_lowercase();
+    FORBIDDEN_IMPORT_SUBSTRINGS
+        .iter()
+        .any(|forbidden| module.contains(forbidden) || name.contains(forbidden))
+}
+
+/// Lists every import of a WebAssembly binary without executing it.
+pub fn list_wasm_imports(wasm_bytes: &[u8]) -> Result<Vec<WasmImport>, DescriptorError> {
+    if wasm_bytes.len() < 8
+        || wasm_bytes[0..4] != [0x00, 0x61, 0x73, 0x6D]
+        || wasm_bytes[4..8] != [0x01, 0x00, 0x00, 0x00]
+    {
+        return Err(DescriptorError::NotWasm);
+    }
+    let parser = wasmparser::Parser::new(0);
+    let mut imports = Vec::new();
+    for payload in parser.parse_all(wasm_bytes) {
+        let payload = payload.map_err(|error| DescriptorError::Unreadable(error.to_string()))?;
+        if let wasmparser::Payload::ImportSection(reader) = payload {
+            for import in reader.into_imports() {
+                let import =
+                    import.map_err(|error| DescriptorError::Unreadable(error.to_string()))?;
+                imports.push(WasmImport {
+                    module: import.module.to_owned(),
+                    name: import.name.to_owned(),
+                });
+            }
+        }
+    }
+    Ok(imports)
+}
+
+/// Rejects artifacts importing a forbidden capability before execution.
+pub fn check_wasm_imports(wasm_bytes: &[u8]) -> Result<Vec<WasmImport>, DescriptorError> {
+    let imports = list_wasm_imports(wasm_bytes)?;
+    for import in &imports {
+        if is_forbidden_import(&import.module, &import.name) {
+            return Err(DescriptorError::ForbiddenImport {
+                module: import.module.clone(),
+                name: import.name.clone(),
+            });
+        }
+    }
+    Ok(imports)
+}

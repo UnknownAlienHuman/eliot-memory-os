@@ -813,7 +813,7 @@ impl AssemblyResult {
 
     fn validate_accounting(
         &self,
-        job: &crate::job::DreamJobInput,
+        job: &crate::job::DreamJobAdmission,
         input_len: usize,
         output_len: usize,
         audit_len: usize,

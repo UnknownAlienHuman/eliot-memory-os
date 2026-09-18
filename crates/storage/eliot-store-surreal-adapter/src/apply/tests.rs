@@ -4,6 +4,19 @@
 
 use super::*;
 
+use eliot_contracts::{EpochId, EpochLineageId};
+use std::num::NonZeroU64;
+
+const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+fn test_epoch(sequence: u64) -> EpochId {
+    EpochId::new(
+        EpochLineageId::new(TEST_LINEAGE_A).expect("valid test lineage"),
+        NonZeroU64::new(sequence).expect("nonzero test sequence"),
+    )
+    .expect("valid test epoch")
+}
+
 fn v1_migration() -> CompiledMigration {
     CompiledMigration::new(
         schema::MIGRATION_ID_V1,
@@ -30,7 +43,7 @@ fn v1_to_v2_migration() -> CompiledMigration {
 
 fn genesis_fixture() -> (eliot_store_api::RequestMeta, StoreGenesisRequest) {
     let fence = StateFence::new(
-        eliot_contracts::AuthorityEpoch::genesis(),
+        test_epoch(1),
         eliot_contracts::ResourceGeneration::genesis(),
     );
     let payload = b"{\"seed\":true}".to_vec();
@@ -569,7 +582,7 @@ fn transaction_has_no_destructive_statements_and_no_fence_rewrite_for_forward() 
     assert!(forward_sql.contains(schema::RECOVERY_TABLES_DDL.trim()));
     let fence = FenceRecord {
         state_fence: StateFence::new(
-            eliot_contracts::AuthorityEpoch::new(1).expect("epoch"),
+            test_epoch(1),
             eliot_contracts::ResourceGeneration::new(1).expect("gen"),
         ),
         next_commit_sequence: 7,
@@ -616,7 +629,7 @@ fn wrong_state_fence_is_rejected_by_forward_guard() {
     let existing = schema_meta_record(&v1, "1000");
     let fence_ok = FenceRecord {
         state_fence: StateFence::new(
-            eliot_contracts::AuthorityEpoch::new(1).expect("epoch"),
+            test_epoch(1),
             eliot_contracts::ResourceGeneration::new(1).expect("gen"),
         ),
         next_commit_sequence: 1,
@@ -624,7 +637,7 @@ fn wrong_state_fence_is_rejected_by_forward_guard() {
     };
     let fence_bad = FenceRecord {
         state_fence: StateFence::new(
-            eliot_contracts::AuthorityEpoch::new(2).expect("epoch"),
+            test_epoch(2),
             eliot_contracts::ResourceGeneration::new(1).expect("gen"),
         ),
         next_commit_sequence: 1,
@@ -648,7 +661,7 @@ fn changed_sequence_is_rejected_by_forward_guard() {
     let existing = schema_meta_record(&v1, "1000");
     let fence_ok = FenceRecord {
         state_fence: StateFence::new(
-            eliot_contracts::AuthorityEpoch::new(1).expect("epoch"),
+            test_epoch(1),
             eliot_contracts::ResourceGeneration::new(1).expect("gen"),
         ),
         next_commit_sequence: 1,
@@ -718,7 +731,7 @@ fn schema_and_fence_records_round_trip_as_json() {
     let schema = schema_meta_record(&migration, "1000");
     let fence = FenceRecord {
         state_fence: StateFence::new(
-            eliot_contracts::AuthorityEpoch::new(1).expect("epoch"),
+            test_epoch(1),
             eliot_contracts::ResourceGeneration::new(1).expect("generation"),
         ),
         next_commit_sequence: 2,
@@ -740,7 +753,7 @@ fn schema_and_fence_records_round_trip_as_json() {
 fn unknown_fence_record_field_fails_deserialization() {
     let fence = FenceRecord {
         state_fence: StateFence::new(
-            eliot_contracts::AuthorityEpoch::new(1).expect("epoch"),
+            test_epoch(1),
             eliot_contracts::ResourceGeneration::new(1).expect("generation"),
         ),
         next_commit_sequence: 1,
@@ -765,7 +778,7 @@ fn predecessor_cas_binds_every_predecessor_field_and_history_value() {
     let existing = schema_meta_record(&v1, "1000");
     let fence = FenceRecord {
         state_fence: StateFence::new(
-            eliot_contracts::AuthorityEpoch::new(1).expect("epoch"),
+            test_epoch(1),
             eliot_contracts::ResourceGeneration::new(1).expect("generation"),
         ),
         next_commit_sequence: 1,
@@ -878,7 +891,7 @@ fn canonical_fence_record_reads_use_explicit_flat_projection() {
 fn validation_result_indexes_admit_a_fresh_empty_canonical_store() {
     let migration = v2_baseline_migration();
     let fence = StateFence::new(
-        eliot_contracts::AuthorityEpoch::new(1).expect("epoch"),
+        test_epoch(1),
         eliot_contracts::ResourceGeneration::new(1).expect("generation"),
     );
     let snapshot = build_validation_snapshot(
@@ -915,7 +928,7 @@ fn validation_rejects_missing_or_malformed_fence() {
         Some(schema_meta_record(&migration, "1000")),
         Some(FenceRecord {
             state_fence: StateFence::new(
-                eliot_contracts::AuthorityEpoch::new(1).expect("epoch"),
+                test_epoch(1),
                 eliot_contracts::ResourceGeneration::new(1).expect("generation"),
             ),
             next_commit_sequence: 0,
@@ -960,7 +973,7 @@ fn ready_v2_requires_a_valid_canonical_fence() {
 
     let malformed = FenceRecord {
         state_fence: StateFence::new(
-            eliot_contracts::AuthorityEpoch::new(1).expect("epoch"),
+            test_epoch(1),
             eliot_contracts::ResourceGeneration::new(1).expect("generation"),
         ),
         next_commit_sequence: 0,
@@ -969,5 +982,165 @@ fn ready_v2_requires_a_valid_canonical_fence() {
     assert_eq!(
         readiness_with_fence(ready, Some(malformed), &expected),
         Err(AdapterError::PartialOutcome)
+    );
+}
+
+#[test]
+fn evidence_select_is_a_closed_read_without_mutation() {
+    assert!(
+        schema::READ_EVIDENCE_RECORDS.contains("FROM write_receipt"),
+        "evidence comes from the receipt table, never a new family"
+    );
+    assert!(
+        schema::READ_EVIDENCE_RECORDS.starts_with("SELECT VALUE"),
+        "evidence selects values, never raw SurrealDB ids"
+    );
+    let lower = schema::READ_EVIDENCE_RECORDS.to_ascii_lowercase();
+    for forbidden in [
+        "drop ", "delete ", "remove ", "reset", "create ", "update ", "throw ",
+    ] {
+        assert!(
+            !lower.contains(forbidden),
+            "closed evidence SELECT must not contain {forbidden:?}"
+        );
+    }
+}
+
+#[test]
+fn capture_plans_persist_full_recoverable_evidence_without_authority() {
+    use crate::plan::{plan_apply, select_apply_plan};
+    use eliot_store_api::{
+        EffectClass, EventProjectionRelationIntents, ExactJsonBytes, NamedMutationOperation,
+        NamedMutationRequest, OperationIdentity, OperationManifestDigest, OrderingScopeId,
+        PayloadSource, ScopeId, SecurityContext, TransitionClass,
+    };
+    use serde_json::json;
+    use std::collections::BTreeMap;
+
+    let fence = StateFence::new(
+        test_epoch(1),
+        eliot_contracts::ResourceGeneration::genesis(),
+    );
+    let transition = eliot_store_api::PreparedTransition {
+        identity: OperationIdentity {
+            operation_id: OperationId::new("op-evidence-write").expect("operation"),
+            idempotency_key: "idem-evidence-write".to_owned(),
+            canonical_request_hash: "a".repeat(64),
+        },
+        state_fence: fence,
+        scope_id: ScopeId::new("scope-1").expect("scope"),
+        task_id: None,
+        ordering_scopes: vec![OrderingScopeId::new("scope-1").expect("ordering")],
+        transition_class: TransitionClass::CaptureCandidate,
+        requested_effect_ceiling: EffectClass::Candidate,
+        admission_contract_set_digest: "b".repeat(64),
+        operation_manifest_digest: OperationManifestDigest::new("manifest-1").expect("manifest"),
+        named_operations: vec![NamedMutationRequest {
+            operation: NamedMutationOperation::CaptureObservation,
+            parameters: BTreeMap::from([("subject".to_owned(), json!("evidence-alpha"))]),
+        }],
+        event_projection_relation_intents: EventProjectionRelationIntents {
+            event_ids: Vec::new(),
+            projection_kinds: Vec::new(),
+            relation_kinds: Vec::new(),
+        },
+        security: SecurityContext::default(),
+        required_proof_and_approval_refs: Vec::new(),
+    };
+    // Legacy path (no authority): exactly one recoverable record with the
+    // full parameters and canonical bytes that decode back to them.
+    let legacy = plan_apply(&transition, &[], &[], 1, 1).expect("legacy plan applies");
+    assert!(legacy.payload_authority.is_empty());
+    assert_eq!(legacy.evidence_records.len(), 1);
+    let record = &legacy.evidence_records[0];
+    assert_eq!(record.subject, "evidence-alpha");
+    assert_eq!(
+        record.parameters.get("subject").and_then(Value::as_str),
+        Some("evidence-alpha")
+    );
+    assert_eq!(record.operation_index, 0);
+    assert_eq!(record.commit_sequence, 1);
+    assert_eq!(record.named_operation_count, 1);
+    let decoded: BTreeMap<String, Value> =
+        serde_json::from_slice(&record.bytes).expect("evidence bytes parse");
+    assert_eq!(
+        decoded, record.parameters,
+        "legacy canonical bytes recover the exact parameters"
+    );
+    // Routed legacy path agrees byte-for-byte on the outbox digest: evidence
+    // persistence never moves the historical digest.
+    let routed =
+        select_apply_plan(&transition, &[None], &[], &[], 1, 1).expect("routed legacy applies");
+    assert_eq!(routed.evidence_records.len(), 1);
+    assert_eq!(
+        routed.outbox_records, legacy.outbox_records,
+        "evidence never perturbs the bound outbox digest"
+    );
+    // Authority path: the original raw bytes travel verbatim, never
+    // re-serialized from the Value projection.
+    let raw = br#"{"subject":"evidence-alpha"}"#;
+    let authority =
+        ExactJsonBytes::parse(PayloadSource::NamedOperationParameter, raw).expect("parses");
+    let bound =
+        select_apply_plan(&transition, &[Some(authority)], &[], &[], 1, 1).expect("bound applies");
+    assert_eq!(bound.evidence_records.len(), 1);
+    assert_eq!(
+        bound.evidence_records[0].bytes, raw,
+        "original authority bytes reach the evidence record"
+    );
+}
+
+#[test]
+fn non_capture_transitions_persist_no_evidence() {
+    use crate::plan::plan_apply;
+    use eliot_store_api::{
+        EffectClass, EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
+        OperationIdentity, OperationManifestDigest, OrderingScopeId, ScopeId, SecurityContext,
+        TransitionClass,
+    };
+    use serde_json::json;
+    use std::collections::BTreeMap;
+
+    let fence = StateFence::new(
+        test_epoch(1),
+        eliot_contracts::ResourceGeneration::genesis(),
+    );
+    let transition = eliot_store_api::PreparedTransition {
+        identity: OperationIdentity {
+            operation_id: OperationId::new("op-audit-write").expect("operation"),
+            idempotency_key: "idem-audit-write".to_owned(),
+            canonical_request_hash: "a".repeat(64),
+        },
+        state_fence: fence,
+        scope_id: ScopeId::new("scope-1").expect("scope"),
+        task_id: None,
+        ordering_scopes: vec![OrderingScopeId::new("scope-1").expect("ordering")],
+        transition_class: TransitionClass::CaptureCandidate,
+        requested_effect_ceiling: EffectClass::Candidate,
+        admission_contract_set_digest: "b".repeat(64),
+        operation_manifest_digest: OperationManifestDigest::new("manifest-1").expect("manifest"),
+        named_operations: vec![NamedMutationRequest {
+            operation: NamedMutationOperation::AppendAuditEvent,
+            parameters: BTreeMap::from([
+                ("operation_id".to_owned(), json!("op-audit-write")),
+                ("idempotency_key".to_owned(), json!("idem-audit-write")),
+                ("session_id".to_owned(), json!("session-1")),
+                ("access_digest".to_owned(), json!("a".repeat(64))),
+                ("action_digest".to_owned(), json!("b".repeat(64))),
+                ("expected_revision".to_owned(), json!("7")),
+            ]),
+        }],
+        event_projection_relation_intents: EventProjectionRelationIntents {
+            event_ids: Vec::new(),
+            projection_kinds: Vec::new(),
+            relation_kinds: Vec::new(),
+        },
+        security: SecurityContext::default(),
+        required_proof_and_approval_refs: Vec::new(),
+    };
+    let plan = plan_apply(&transition, &[], &[], 1, 1).expect("audit plan applies");
+    assert!(
+        plan.evidence_records.is_empty(),
+        "non-capture operations persist no evidence"
     );
 }

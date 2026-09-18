@@ -9,6 +9,7 @@ description = "Bounded, candidate-only Dreamer generation contracts"
 [dependencies]
 blake3.workspace = true
 eliot-contracts.workspace = true
+eliot-dreamer-contracts = { path = "../eliot-dreamer-contracts" }
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true

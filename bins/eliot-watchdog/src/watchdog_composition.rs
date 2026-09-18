@@ -100,6 +100,12 @@ impl WatchdogComposition {
         host: Arc<dyn HostObservationSource>,
         shutdown_requested: Arc<AtomicBool>,
     ) -> Result<Self, CompositionError> {
+        let _span = tracing::debug_span!("watchdog.composition_start").entered();
+        tracing::debug!(
+            event = "watchdog.composition_requested",
+            observation = "requested",
+            "watchdog composition requested"
+        );
         config.validate()?;
         let runtime = config.runtime()?;
         let task_admission = admission.clone();
@@ -130,6 +136,29 @@ impl WatchdogComposition {
                             Ok(admission) => admission,
                             Err(error) => {
                                 authority_state.publish_no_authority();
+                                // I14.23: intentional and incomplete shutdown
+                                // are distinct observed states, not generic
+                                // gaps. The lease stays fenced either way;
+                                // only the observation vocabulary differs so
+                                // recovery can tell a clean stop from retained
+                                // pending work.
+                                if crate::supervision_lease_load::is_intentional_shutdown_fence(
+                                    &error,
+                                ) {
+                                    tracing::info!(
+                                        event = "watchdog.shutdown.intentional_observed",
+                                        observation = "intentional",
+                                        "watchdog observed intentional shutdown; pre-drain leases fenced"
+                                    );
+                                } else if crate::supervision_lease_load::is_incomplete_shutdown_fence(
+                                    &error,
+                                ) {
+                                    tracing::info!(
+                                        event = "watchdog.shutdown.incomplete_observed",
+                                        observation = "incomplete",
+                                        "watchdog observed incomplete shutdown; pending work retained"
+                                    );
+                                }
                                 if let Some(reason) = host_gap {
                                     report_gap_nonfatal(kernel.as_ref(), reason).await;
                                 }
@@ -161,7 +190,7 @@ impl WatchdogComposition {
                         }
                         match kernel.supervise(admission.lease()).await {
                             Ok(()) => authority_state.publish_admitted(
-                                admission.lease().lease().kernel_epoch.value(),
+                                admission.lease().lease().kernel_epoch.sequence.get(),
                                 admission.watchdog_epoch().value(),
                             ),
                             Err(error) => {
@@ -210,6 +239,12 @@ impl WatchdogComposition {
     /// Returns an error if the supervised watchdog task, shutdown signal, or
     /// externally requested shutdown path fails.
     pub async fn run_until_shutdown(self) -> Result<ShutdownOutcome, TaskFailure> {
+        let _span = tracing::info_span!("watchdog.run_until_shutdown").entered();
+        tracing::info!(
+            event = "watchdog.supervision_running",
+            observation = "admitted",
+            "watchdog supervision running until shutdown"
+        );
         let WatchdogComposition {
             runtime,
             admission,

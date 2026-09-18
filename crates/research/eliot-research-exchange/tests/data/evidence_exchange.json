@@ -1,0 +1,33 @@
+{
+  "record": "evidence_exchange",
+  "work_unit_case": "700/9,700/10,700/12,700/15,700/16,700/17,700/18,700/19,700/20",
+  "issue": 700,
+  "contract": "eliot.research.evidence-handoff",
+  "contract_version": "1.0.0",
+  "note": "Canonical scenario mirror for crates/research/eliot-research-exchange/tests/evidence_exchange.rs. Semantic goldens below are value-pinned by the suite.",
+  "ingest": {
+    "first_delivery": "ACCEPTED",
+    "exact_replay": "REPLAY_DUPLICATE",
+    "changed_same_id_payload": "IDEMPOTENCY_CONFLICT",
+    "timeout_disconnect": "RECONCILE_VIA_ORIGINAL",
+    "unknown_operation": "UNKNOWN_OPERATION"
+  },
+  "handoff": {
+    "reference_outside_manifest": "OUTSIDE_MANIFEST",
+    "summary_without_lineage": "MISSING_SOURCE_LINEAGE",
+    "instruction_content": "INSTRUCTION_DATA_INERT",
+    "disclosure_widened": "DISCLOSURE_WIDENED",
+    "preserved_disclosure": "project_bound",
+    "reordered_sources": "ORDER_STABLE",
+    "expired_seal": "EXPIRED",
+    "revised_manifest": "STALE_MANIFEST"
+  },
+  "terminals": ["FINISHED", "PARTIAL_OPEN", "CANCELLED_CLOSED", "FAILED_CLOSED", "UNKNOWN_OPEN"],
+  "terminal_goldens": {
+    "supported_on_completed": "FINISHED",
+    "complete_absence_on_completed": "FINISHED",
+    "partial_coverage_on_completed": "PARTIAL_OPEN",
+    "supported_on_running": "PARTIAL_OPEN",
+    "cancelled": "CANCELLED_CLOSED"
+  }
+}

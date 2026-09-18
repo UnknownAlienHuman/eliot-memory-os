@@ -1,7 +1,8 @@
 #![allow(clippy::expect_used)]
 
 use eliot_contracts::{
-    ArtifactId, AuthorityEpoch, ReceiptId, ResourceGeneration, SourceId, StateFence, TaskId,
+    ArtifactId, EpochId, EpochLineageId, ReceiptId, ResourceGeneration, SourceId, StateFence,
+    TaskId,
 };
 use eliot_dreamer_contracts::{
     AtomicityMode, BudgetUsage, BundleCompleteness, BundleMaterial, ConceptApplicability,
@@ -10,7 +11,7 @@ use eliot_dreamer_contracts::{
     ConceptEvidence, ConceptInput, ConceptMode, ConceptNeighborhood, ConceptParameter,
     ConceptProposal, ConceptRollback, ConceptSnapshot, ConceptSourceDenominator, ConceptSourceRef,
     ConceptSourceSet, ConceptVerifierRef, CurationFamily, CurationKind, CurationPayload,
-    DreamInputBundle, DreamJobInput, GroundedDreamDraft, JobClass, NamedEvidence,
+    DreamInputBundle, DreamJobAdmission, GroundedDreamDraft, JobClass, NamedEvidence,
     RelationPreservation, RelationPreservationDimension, RelationPreservationVerdict, Requester,
     RequesterOrigin, ScreenBinding, ScreenState, SupportState, TargetDenominator,
     TypedCurationHandlerRequest, TypedCurationHandlerResult, ValidatedCurationItem,
@@ -21,9 +22,16 @@ use eliot_evidence::{
     EvidenceFreshness, Provenance,
 };
 use eliot_receipts::{ProofCeiling, ReceiptIdentity, WorkScopeId};
+use std::num::NonZeroU64;
 
 fn fence() -> StateFence {
-    StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+    let epoch = EpochId::new(
+        EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .expect("canonical test lineage-A"),
+        NonZeroU64::new(1).expect("non-zero test sequence"),
+    )
+    .expect("valid test epoch");
+    StateFence::new(epoch, ResourceGeneration::genesis())
 }
 
 fn digest(byte: u8) -> String {
@@ -45,8 +53,8 @@ fn preservation(passing: bool) -> RelationPreservation {
     }
 }
 
-fn job() -> DreamJobInput {
-    DreamJobInput {
+fn job() -> DreamJobAdmission {
+    DreamJobAdmission {
         schema_version: 1,
         job_class: JobClass::Curation,
         requester: Requester {
@@ -198,7 +206,7 @@ fn proposal(mode: ConceptMode, passing: bool) -> ConceptProposal {
 
 struct Fixture {
     input: ConceptInput,
-    job: DreamJobInput,
+    job: DreamJobAdmission,
     bundle: DreamInputBundle,
     receipt: ValidationReceipt,
     grounded: GroundedDreamDraft,

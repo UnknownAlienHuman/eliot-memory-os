@@ -94,7 +94,6 @@ fn response(tool: &str) -> McpResponse {
         proof_ceiling: ProofCeiling::Observation,
         resource: None,
         job: None,
-        compatibility_correlation_hint: None,
     }
 }
 

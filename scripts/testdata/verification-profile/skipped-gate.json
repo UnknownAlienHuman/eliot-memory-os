@@ -1,0 +1,15 @@
+{
+  "schema": "eliot.review-run-receipt.v1",
+  "note": "WORK_UNIT_CASE: 750/14, 750/15 and 750/30 negative fixture. A skipped mandatory gate and a cancelled gate are distinct nonpassing outcomes; this receipt must never validate as COMPLETE.",
+  "source_sha": "c225b36aeb7c11b4648a6709d7f8b96466d9e31f",
+  "profile": "Review",
+  "invocation": "direct",
+  "gates": [
+    {"name": "cargo-metadata", "status": "pass", "exit_code": 0},
+    {"name": "cargo-fmt", "status": "pass", "exit_code": 0},
+    {"name": "cargo-check-workspace", "status": "skipped", "exit_code": null},
+    {"name": "cargo-clippy-workspace", "status": "cancelled", "exit_code": null},
+    {"name": "cargo-test-workspace", "status": "not_run", "exit_code": null},
+    {"name": "cargo-deny", "status": "not_run", "exit_code": null}
+  ]
+}

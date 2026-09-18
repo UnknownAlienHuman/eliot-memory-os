@@ -521,6 +521,11 @@ impl EpistemicTransition {
         }
         self.check_request_binding(request)?;
         self.check_candidate_binding(candidate, before, after)?;
+        if before.is_empty() && candidate.predecessor.is_some() {
+            return Err(ContractError::MissingReference {
+                field: "transition.before",
+            });
+        }
         self.check_arithmetic(before, after)?;
         self.check_terminality(candidate, before)?;
         Ok(())
@@ -638,7 +643,13 @@ impl EpistemicTransition {
         let before_results: Vec<SupportResult> =
             before.iter().map(|record| record.result).collect();
         let after_results: Vec<SupportResult> = after.iter().map(|record| record.result).collect();
-        if weakest_link(&before_results)? != self.before_support {
+        // Explicit absence has no fabricated predecessor support record.
+        let before_support = if before_results.is_empty() {
+            SupportResult::Unknown
+        } else {
+            weakest_link(&before_results)?
+        };
+        if before_support != self.before_support {
             return Err(ContractError::ArithmeticMismatch {
                 field: "transition.before_support",
             });
@@ -648,7 +659,11 @@ impl EpistemicTransition {
                 field: "transition.after_support",
             });
         }
-        let before_ceiling = PositionAssertability::support_cap(&before_results)?;
+        let before_ceiling = if before_results.is_empty() {
+            PositionAssertability::UnknownWithheldQuarantined
+        } else {
+            PositionAssertability::support_cap(&before_results)?
+        };
         if self.before_assertability.strength_rank() > before_ceiling.strength_rank() {
             let field = "transition.before_assertability";
             return Err(ContractError::CeilingViolation { field });

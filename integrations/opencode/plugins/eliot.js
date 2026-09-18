@@ -1,3 +1,7 @@
+const TOOL_IDENTITY_VERSION = "eliot.opencode.tools.v1"
+// Single source: the exact sets below are pinned by
+// integrations/opencode/plugin-bridge-contract.json `tool_identity`
+// (same version, same members, exact case-sensitive match).
 const MUTATING_TOOLS = new Set(["bash", "edit", "write", "patch"])
 const READ_ONLY_TOOLS = new Set(["read", "grep", "glob", "list", "webfetch", "websearch", "lsp", "codesearch"])
 const USEFUL_EVENTS = new Set([

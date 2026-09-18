@@ -1,0 +1,33 @@
+[package]
+name = "eliot-context-measurement"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "MIT"
+publish = false
+description = "Sole serialized-context measurement owner: exact UTF-8 bytes with normative STU=ceil(bytes/3), immutable observation validation and unit-compatible capacity/error analysis."
+
+[lib]
+path = "src/lib.rs"
+
+[package.metadata.eliot]
+prototype = true
+source_status = "IMPLEMENTED"
+workspace_admission = "pending_agent_implementation_and_proof"
+functional_cell = "smart.context.measurement"
+source_layer = "C1"
+runtime_layer = "R5"
+runtime_bundle = "eliotd"
+agent_order = 20
+
+[dependencies]
+eliot-contracts = { path = "../../foundation/eliot-contracts" }
+eliot-context-contracts = { path = "../eliot-context-contracts" }
+
+[dev-dependencies]
+eliot-agent-contracts = { path = "../../agent/eliot-agent-contracts" }
+eliot-evidence = { path = "../../foundation/eliot-evidence" }
+eliot-receipts = { path = "../../foundation/eliot-receipts" }
+
+[lints]
+workspace = true

@@ -145,7 +145,17 @@ impl ProcessAuthorityHandoffDescriptor {
             .map_err(|_| KernelServiceError::HandshakeMismatch {
                 field: "state_fence",
             })?;
-        let exact_epoch = self.state_fence.authority_epoch.value();
+        // Lineage-aware binding (Implements #64): the `u64` snapshot contour is
+        // retained (donor precedent: no silent widening). The observed sequence
+        // comes from the ORS `EpochLineage` side — never extracted from the
+        // lineage-aware `EpochId` via a `.sequence.get()` adapter — and the
+        // `EpochLineage` edge itself is enforced via existing gates inside
+        // `AuthoritySnapshotBindingWire::validate` (called below). The snapshot
+        // digest binds the exact `StateFence` canonical JSON (now carrying the
+        // `EpochId` object shape); cross-system lineage-identity mapping
+        // (contracts UUID vs ORS opaque label) remains a flagged residual for
+        // the integration owner with Host lineage evidence.
+        let exact_epoch = self.snapshot_binding.authority_epoch.current.epoch;
         let exact_state_fence =
             eliot_ors::StateFenceSnapshot::capture(&self.state_fence, exact_epoch).map_err(
                 |_| KernelServiceError::HandshakeMismatch {
@@ -154,7 +164,6 @@ impl ProcessAuthorityHandoffDescriptor {
             )?;
         if self.state_fence.resource_generation != self.generation
             || self.snapshot_binding.authority_id != self.authority_id
-            || self.snapshot_binding.authority_epoch.current.epoch != exact_epoch
             || self.snapshot_binding.state_fence != exact_state_fence
         {
             return Err(KernelServiceError::HandshakeMismatch {

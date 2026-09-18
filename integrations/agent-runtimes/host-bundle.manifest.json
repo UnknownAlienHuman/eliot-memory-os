@@ -1,7 +1,54 @@
 {
   "schema_version": "eliot.agent-host-bundle-manifest.v1",
+  "bundle_generation": "1217-A.1",
+  "generator": {
+    "script": "scripts/agent_host_bundle.py",
+    "generator_version": "eliot.agent-host-bundle-receipt.v1",
+    "manifest_schema": "eliot.agent-host-bundle-manifest.v1",
+    "note": "Static bundle identity only; materialization performs no user-profile mutation and cannot claim installation or route admission."
+  },
   "canonical_skill_root": "integrations/agent-skills",
   "canonical_skill_manifest": "integrations/agent-skills/skill-pack.manifest.json",
+  "skill_pack": {
+    "manifest": "integrations/agent-skills/skill-pack.manifest.json",
+    "manifest_sha256": "e94c10969d0a13b7d7ae76255b4bb44d587b4afd3c152842357ad8d90490e76b",
+    "pack_hash": "6721836121fc0106670037725d821656179ec562af3514af04adbdac00d24c60",
+    "hash_algorithm": "blake3(name:content_blake3 joined with LF in manifest order)",
+    "order": ["eliot-work", "eliot-remember", "eliot-recover", "eliot-finish"],
+    "derived_packages": [
+      "integrations/opencode/skills",
+      "integrations/claude/eliot/skills",
+      "plugin/eliot-governor/skills",
+      "plugin/eliot-antigravity-official/skills"
+    ]
+  },
+  "host_runtime": {
+    "versions_probed": false,
+    "note": "All host runtime versions are unprobed at generation 1217-A.1; every route profile reports evidence_execution_status NOT_EXECUTED. Exact executable, schema, account, and event-coverage probes are listed in each profile disposition required_probes; registry admission (H3 handoff) must refuse target/PARTIAL/NOT_EXECUTED/unprobed."
+  },
+  "invalidation_set": [
+    "integrations/agent-skills/**",
+    "integrations/agent-skills/skill-pack.manifest.json",
+    "integrations/codex/route-profile.json",
+    "integrations/opencode/route-profile.json",
+    "integrations/claude/route-profile.json",
+    "integrations/antigravity/route-profile.json",
+    "integrations/agent-runtimes/route-profile.schema.json",
+    "plugin/eliot-governor/.codex-plugin/plugin.json",
+    "plugin/eliot-governor/.mcp.json",
+    "plugin/eliot-governor/hooks/hooks.json",
+    "integrations/opencode/opencode.json",
+    "integrations/opencode/plugins/eliot.js",
+    "integrations/opencode/instructions/eliot.md",
+    "integrations/claude/eliot/.claude-plugin/plugin.json",
+    "integrations/claude/eliot/.mcp.json",
+    "integrations/claude/eliot/hooks/hooks.json",
+    "plugin/eliot-antigravity-official/plugin.json",
+    "plugin/eliot-antigravity-official/rules/**",
+    "integrations/opencode/plugin-bridge-contract.json",
+    "integrations/antigravity/runtime-preflight.contract.json",
+    "scripts/agent_host_bundle.py"
+  ],
   "limits": {
     "max_file_bytes": 1048576,
     "max_bundle_bytes": 8388608,
@@ -10,84 +57,147 @@
   "hosts": {
     "codex": {
       "route_profile": "integrations/codex/route-profile.json",
+      "route_profile_sha256": "0b31464506b3e7801645e8bb40acba89898f5e7154163dc06e46b5f6392327ac",
+      "bundle_generation": "1217-A.1",
+      "adapter_contract": null,
+      "adapter_generation": null,
+      "adapter_note": "No versioned adapter contract at generation 1217-A.1; App Server adapter not implemented per integrations/codex/route-profile.json known_gaps.",
+      "host_runtime_version": null,
+      "host_runtime_version_status": "unprobed_requires_live_probe",
       "destination_hint": "CODEX_HOME/plugins/eliot-governor",
       "skill_destination": "skills",
       "payload": [
         {
           "source": "plugin/eliot-governor/.codex-plugin/plugin.json",
           "destination": ".codex-plugin/plugin.json",
-          "kind": "file"
+          "kind": "file",
+          "mode": "verbatim_copy",
+          "sha256": "99beb8277ef6c5dbf7bd5b6be75e25bef7f9aa084b9f9b9fb3612fd05fe99235"
         },
         {
           "source": "plugin/eliot-governor/.mcp.json",
           "destination": ".mcp.json",
-          "kind": "file"
+          "kind": "file",
+          "mode": "verbatim_copy",
+          "sha256": "78810e509d2afbaafbcdf7fee2f5f258edfba42eb820021c57f01395acd6c535"
         },
         {
           "source": "plugin/eliot-governor/hooks/hooks.json",
           "destination": "hooks/hooks.json",
-          "kind": "file"
+          "kind": "file",
+          "mode": "verbatim_copy",
+          "sha256": "da7a811da6d9193365c2a4f8cac382e6b289b0ec59e1dfad0cf29bb143e6441a"
         }
       ]
     },
     "opencode": {
       "route_profile": "integrations/opencode/route-profile.json",
+      "route_profile_sha256": "e521f37e5d20e28e03fc89d5b0394c0ac93ef3163c13c0d84604d2e11b11f9df",
+      "bundle_generation": "1217-A.1",
+      "adapter_contract": "integrations/opencode/plugin-bridge-contract.json",
+      "adapter_contract_sha256": "622b3e3d85b4fa95a6fc5fdfcb9d7b4f97b1a69bf91c8479bc0a26f0106e1c39",
+      "adapter_generation": "eliot.opencode-plugin-bridge.v1",
+      "adapter_note": "compatibility_fallback only_when_loopback_http_is_not_configured; cross_transport_failover_after_http_attempt is false; unprobed and requires live probe; contract presence is not admission.",
+      "host_runtime_version": null,
+      "host_runtime_version_status": "unprobed_requires_live_probe",
       "destination_hint": "OPENCODE_CONFIG_DIR/eliot",
       "skill_destination": "skills",
       "payload": [
         {
           "source": "integrations/opencode/opencode.json",
           "destination": "opencode.json",
-          "kind": "file"
+          "kind": "file",
+          "mode": "verbatim_copy",
+          "sha256": "2eed82bce727368d70ce13079e55abc74f7b438dc91ad5c192decd818f042d45"
         },
         {
           "source": "integrations/opencode/plugins/eliot.js",
           "destination": "plugins/eliot.js",
-          "kind": "file"
+          "kind": "file",
+          "mode": "verbatim_copy",
+          "sha256": "939748bbccc06a10969304105cae81e8979b211145096c57833fecb6dce009e3"
         },
         {
           "source": "integrations/opencode/instructions/eliot.md",
           "destination": "instructions/eliot.md",
-          "kind": "file"
+          "kind": "file",
+          "mode": "verbatim_copy",
+          "sha256": "415bbfda2034d676657bcbf925c67482c457bb1a193f92d4f3c48bdb6bc97ee1"
         }
       ]
     },
     "claude": {
       "route_profile": "integrations/claude/route-profile.json",
+      "route_profile_sha256": "247bdf42ab3044940b617e5d7daa171508de1cc76631e20a0f45f9ad367fbf94",
+      "bundle_generation": "1217-A.1",
+      "adapter_contract": null,
+      "adapter_generation": null,
+      "adapter_note": "No versioned sidecar adapter contract at generation 1217-A.1; local Agent SDK sidecar not implemented per integrations/claude/route-profile.json known_gaps; remote Managed Agents remains a separate deferred route.",
+      "host_runtime_version": null,
+      "host_runtime_version_status": "unprobed_requires_live_probe",
       "destination_hint": "CLAUDE_CODE_PLUGIN_ROOT/eliot",
       "skill_destination": "skills",
       "payload": [
         {
           "source": "integrations/claude/eliot/.claude-plugin/plugin.json",
           "destination": ".claude-plugin/plugin.json",
-          "kind": "file"
+          "kind": "file",
+          "mode": "verbatim_copy",
+          "sha256": "f338afad83a92b3fa3520862f03012c9008eac5a97e7233bf9605cb8bcdaaefc"
         },
         {
           "source": "integrations/claude/eliot/.mcp.json",
           "destination": ".mcp.json",
-          "kind": "file"
+          "kind": "file",
+          "mode": "verbatim_copy",
+          "sha256": "044fb8474f434a8530c56482ca1efe9821cf4ff2746abf318fbb195de05aed25"
         },
         {
           "source": "integrations/claude/eliot/hooks/hooks.json",
           "destination": "hooks/hooks.json",
-          "kind": "file"
+          "kind": "file",
+          "mode": "verbatim_copy",
+          "sha256": "96e31cff33e55b18cd911cfb59424102e23caa7bc4b6461b197611d43f537952"
         }
       ]
     },
     "antigravity": {
       "route_profile": "integrations/antigravity/route-profile.json",
+      "route_profile_sha256": "8bad3925bbdf4194df4c05c0d5ee971456460bd57bb2364cc9b54d92a58f790a",
+      "bundle_generation": "1217-A.1",
+      "adapter_contract": "integrations/antigravity/runtime-preflight.contract.json",
+      "adapter_contract_sha256": "4220c54ab5cdfb687503e1df24db256303272287218163c05acbfc7f7b0cd921",
+      "adapter_generation": "eliot.antigravity-runtime-preflight.v1",
+      "adapter_note": "execution_allowed is false for all candidate runtimes; route_admitted is false; model_calls is 0; preflight fingerprint only, not admission.",
+      "host_runtime_version": null,
+      "host_runtime_version_status": "unprobed_requires_live_probe",
       "destination_hint": "ANTIGRAVITY_PLUGIN_ROOT/eliot",
       "skill_destination": "skills",
       "payload": [
         {
           "source": "plugin/eliot-antigravity-official/plugin.json",
           "destination": "plugin.json",
-          "kind": "file"
+          "kind": "file",
+          "mode": "verbatim_copy",
+          "sha256": "12e9d081c2f2697f1e6e12180b6da1ead2b9897e7f6d9ea2f17ef35b9a2f81a1"
         },
         {
           "source": "plugin/eliot-antigravity-official/rules",
           "destination": "rules",
-          "kind": "tree"
+          "kind": "tree",
+          "mode": "verbatim_tree_copy",
+          "tree_digest_sha256": "79ec42a353207985dbe2820c7ea6796e273567dfc513ec6cbe68ffe427b11dba",
+          "tree_file_count": 2,
+          "tree_files": [
+            {
+              "path": "ELIOT_AUTHORITY_BOUNDARY.md",
+              "sha256": "e3811fe8c27f529e5eec891bc91adea19ca7ff6af82c8be2c3eed82345994f2e"
+            },
+            {
+              "path": "ELIOT_TOOL_USAGE.md",
+              "sha256": "67d15d8fa26d6c01157bd77706a52aa0423da181fc04f1ba3f0ae2ffaac10bf2"
+            }
+          ]
         }
       ]
     }

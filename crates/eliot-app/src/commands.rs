@@ -95,7 +95,7 @@ use eliot_types::{
     ModuleManifest, OperationStatus, PatchRequest, PatchRequestId, PatchRun, PatchRunStatus,
     ProfileVerificationRun, ProjectId, QualitySignal, ReadConsistencyMode, RecallL0Request,
     ReplayCase, ReplayCaseKind, ReplayRun, ReplaySet, RuntimeHealthReport, RuntimeLogReport,
-    RuntimeMode, RuntimeStatusReport, SCHEMA_VERSION, SemanticCommand, ServiceHealthState,
+    RuntimeMode, SCHEMA_VERSION, SemanticCommand, ServiceHealthState,
     ServiceInstallAction, ServiceInstallStatus, ServiceReadinessStatus, ServiceRuntimeStatus,
     SkillCardV2, SkillCurationAction, SkillCurationDecisionKind, SkillCurationGateDecision,
     SkillCurationProposal, SkillCurationReceipt, SkillCuratorRun, SkillExecutionOutcome,

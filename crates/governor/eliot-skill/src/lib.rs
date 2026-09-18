@@ -88,6 +88,8 @@ pub enum SkillError {
     Serialization(String),
     #[error("Skill surface contract failed: {0}")]
     Surface(String),
+    #[error("Skill lifecycle store failure: {0:?}")]
+    Store(eliot_store_api::StoreFailure),
 }
 
 /// Stable identity of a generated Skill revision and its materialized package.
@@ -846,9 +848,10 @@ pub trait SkillLifecycleApi: Send + Sync {
 
     async fn promote(
         &self,
-        ctx: &RequestMetadata,
+        identity: &eliot_protocol::RequestIdentity,
+        operation_id: eliot_contracts::OperationId,
         candidate: SkillCandidate,
         gate: PromotionGate,
         promoted_view: SkillLifecycleView,
-    ) -> Result<SkillPromotionReceipt, SkillError>;
+    ) -> Result<eliot_store_api::WriteReceipt, SkillError>;
 }

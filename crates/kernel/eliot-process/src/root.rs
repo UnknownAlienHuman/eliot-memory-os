@@ -31,5 +31,5 @@ pub use stream_sink::{
     ProcessStreamSinkSessionId, ProcessStreamSinkSessionView, ProcessStreamSinkSourceId,
     ProcessStreamSinkState, ProcessStreamSinkTerminal, ProcessStreamSinkTerminalCommandIdentity,
     ProcessStreamSinkTerminalCommandKind, ProcessStreamSinkTerminalId,
-    ProcessStreamSinkUnknownOutcome,
+    ProcessStreamSinkUnknownOutcome, binding_canonical_authorizes, validate_binding_canonical,
 };

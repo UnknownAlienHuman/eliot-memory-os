@@ -1,0 +1,47 @@
+{
+  "record": "evidence_portfolio",
+  "work_unit_case": "700/1..8,700/11,700/13,700/14",
+  "issue": 700,
+  "contract": "eliot.research.evidence-portfolio",
+  "contract_version": "1.0.0",
+  "note": "Canonical scenario mirror for crates/research/eliot-researcher/tests/evidence_portfolio.rs. Digests are stability-pinned by the suite (order-independent, sensitivity-checked); semantic goldens below are value-pinned.",
+  "grade_order": ["ORIENTING", "GROUNDED", "CORROBORATED", "SCIENCE_GRADE"],
+  "grade_rule": "weakest_link",
+  "grade_goldens": {
+    "weakest_of_all_four": "ORIENTING",
+    "single_science_grade": "SCIENCE_GRADE",
+    "repetition_same_lineage": "no_inflation",
+    "unknown_grade": "poisons_ceiling",
+    "stale_caps": "ORIENTING",
+    "partial_caps_one_rank_below": true,
+    "unverified_transform_caps": "GROUNDED"
+  },
+  "inquiry": {
+    "question": "which valve alloy survives the thermal envelope",
+    "scope": "propulsion thermal envelope",
+    "denominator_size": 4,
+    "denominator_members": ["negative#0", "primary#0", "primary#1", "secondary#0"],
+    "acquisition_plan_requests": 4
+  },
+  "dispositions": ["OBSERVED", "PARTIAL", "UNAVAILABLE", "BLOCKED", "STALE", "MALFORMED", "EXHAUSTED", "UNKNOWN"],
+  "absence": {
+    "complete_authoritative": "PROVEN",
+    "unknown_material": "UNPROVEN",
+    "budget_frontier": "PARTIAL_EXHAUSTION",
+    "incomplete_denominator": "UNPROVEN"
+  },
+  "claim_outcomes": ["SUPPORTED", "PARTIALLY_SUPPORTED", "UNSUPPORTED", "CONTRADICTED", "OUTSIDE_MANIFEST", "STALE_LIMITED", "INCOMPLETE_ACCOUNTING"],
+  "claim_goldens": {
+    "clean_material_claim": "SUPPORTED",
+    "hidden_unknown_reference": "INCOMPLETE_ACCOUNTING",
+    "preserved_counterevidence": "CONTRADICTED",
+    "outside_domain_source": "UNSUPPORTED"
+  },
+  "precision": {
+    "exact_numeric": "holds",
+    "over_precise_numeric": "typed_residue",
+    "date_outside_window": "typed_residue",
+    "version_mismatch": "typed_residue",
+    "uninferred_mechanism": "typed_residue"
+  }
+}

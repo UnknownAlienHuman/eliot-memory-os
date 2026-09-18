@@ -1,0 +1,1 @@
+{"capabilities":["ATOMIC_COMPARE_AND_REPLACE","UNSUPPORTED_ATOMIC_CAS"],"durabilities":["NOT_REQUESTED","REQUESTED","CONFIRMED","UNCONFIRMED"],"namespaces":["STAGE_JOURNAL","TOMBSTONE"],"state_kinds":["DIGEST","MISSING"],"success_kinds":["APPLIED","NO_OP"]}

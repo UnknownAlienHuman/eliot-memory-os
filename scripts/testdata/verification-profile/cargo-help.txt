@@ -1,0 +1,67 @@
+# WORK_UNIT_CASE: 750/17 provenance fixture. Exact captured `--help`
+# outputs of the pinned toolchain (cargo 1.97.1, rustc 1.97.1) proving which
+# locked-mode flags exist. No flag outside this evidence may be asserted.
+# Captured with: cargo metadata --help / cargo fmt --help /
+# cargo check --help / cargo clippy --help / cargo test --help
+#
+# --- cargo metadata --help ---
+# Output the resolved dependencies of a package, the concrete used versions including overrides, in
+# machine-readable format
+#
+# Usage: cargo.exe metadata [OPTIONS]
+#
+# Options:
+#       --filter-platform <TRIPLE>  Only include resolve dependencies matching the given target-triple
+#       --no-deps                   Output information only about the workspace members and don't
+#                                   fetch dependencies
+#       --format-version <VERSION>  Format version [possible values: 1]
+#   -v, --verbose...                Use verbose output (-vv very verbose/build.rs output)
+#   -q, --quiet                     Do not print cargo log messages
+#       --color <WHEN>              Coloring [possible values: auto, always, never]
+#       --config <KEY=VALUE|PATH>   Override a configuration value
+#   -Z <FLAG>                       Unstable (nightly-only) flags to Cargo, see 'cargo -Z help' for
+#                                   details
+#   -h, --help                      Print help
+#
+# Manifest Options:
+#   -m, --manifest-path <PATH>  Path to Cargo.toml
+#       --locked                Assert that `Cargo.lock` will remain unchanged
+#       --offline               Run without accessing the network
+#       --frozen                Equivalent to specifying both --locked and --offline
+#
+# --- cargo fmt --help ---
+# This utility formats all bin and lib files of the current crate using rustfmt.
+#
+# Usage: cargo fmt [OPTIONS] [-- <rustfmt_options>...]
+#
+# Options:
+#       --all
+#           Format all packages, and also their local path-based dependencies
+#       --check
+#           Run rustfmt in check mode
+#
+# --- cargo check --help (Package / Target / Manifest excerpts) ---
+# Package Selection:
+#       --workspace         Check all packages in the workspace
+#       --exclude <SPEC>    Exclude packages from the check
+# Target Selection:
+#       --all-targets       Check all targets
+# Manifest Options:
+#       --locked                Assert that `Cargo.lock` will remain unchanged
+#       --offline               Run without accessing the network
+#       --frozen                Equivalent to specifying both --locked and --offline
+#
+# --- cargo clippy --help (Manifest Options excerpt) ---
+# Manifest Options:
+#     --locked                Require Cargo.lock is up to date
+#     --offline               Run without accessing the network
+#
+# --- cargo test --help (Package Selection excerpt) ---
+# Package Selection:
+#       --workspace         Test all packages in the workspace
+#       --exclude <SPEC>    Exclude packages from the test
+#
+# NOTE: both `cargo metadata --locked --format-version 1` (issue text) and
+# `cargo metadata --locked --no-deps --format-version 1` (base) use only flags
+# proven above. The --no-deps choice is WRITER-A's per #815; it is not decided
+# here (case 750/17 asserts the SUPPORTED-flags contract only).

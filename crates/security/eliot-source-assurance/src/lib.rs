@@ -323,6 +323,14 @@ pub struct OwnerSourceEvidence {
 }
 
 /// Typed source-assurance findings; no generic string authority.
+///
+/// Each variant fires only on its genuine condition in `admit()` or the
+/// owner/policy paths; one satisfied field never fills another missing field.
+/// `UnknownTrust` is intentionally reserved: every one of the eight trust
+/// assessments already reports an unestablishable state through the typed
+/// per-axis `AxisUnknown { axis }` finding (privacy is always a concrete
+/// class), so emitting `UnknownTrust` alongside would flatten the twelve
+/// independent families into one summary.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum AssuranceFinding {
@@ -439,6 +447,12 @@ impl SourceAssurance {
         if self.frontier != expected.frontier {
             findings.push(AssuranceFinding::StaleFrontier);
         }
+        // Generation zero means no frontier was ever established on that
+        // side of the comparison. A missing frontier is reported explicitly
+        // rather than defaulting an unestablished generation to safe.
+        if self.frontier.generation == 0 || expected.frontier.generation == 0 {
+            findings.push(AssuranceFinding::MissingFrontier);
+        }
         let scope_disposition = scope_disposition(&self.scope, &expected.scope);
         match scope_disposition {
             ScopeDisposition::DifferentInstance | ScopeDisposition::Missing => {
@@ -451,7 +465,16 @@ impl SourceAssurance {
         if self.governing_sources.members.is_empty() {
             findings.push(AssuranceFinding::MissingSource);
         }
-        append_axis_finding(&mut findings, TrustAxis::Integrity, &self.trust.integrity);
+        // A failed integrity proof is reported with its dedicated finding so
+        // it can never be mistaken for a generic axis state. The remaining
+        // scalar axes keep the generic per-axis finding.
+        match &self.trust.integrity {
+            AxisStatus::Verified => {}
+            AxisStatus::Failed => findings.push(AssuranceFinding::InvalidIntegrity),
+            AxisStatus::Unknown => findings.push(AssuranceFinding::AxisUnknown {
+                axis: TrustAxis::Integrity,
+            }),
+        }
         append_axis_finding(&mut findings, TrustAxis::Freshness, &self.trust.freshness);
         append_axis_finding(&mut findings, TrustAxis::Competence, &self.trust.competence);
         append_axis_finding(&mut findings, TrustAxis::Incentives, &self.trust.incentives);
@@ -460,10 +483,21 @@ impl SourceAssurance {
             TrustAxis::Independence,
             &self.trust.independence,
         );
-        if matches!(self.trust.instruction_taint, InstructionTaint::Unknown) {
-            findings.push(AssuranceFinding::AxisUnknown {
+        match &self.trust.instruction_taint {
+            InstructionTaint::InstructionChannel => {}
+            // Data remains admissible as evidence (see `admit_with_policy`),
+            // but data requested as a procedure candidate claims
+            // instruction-like authority. Relabelling tool data as
+            // instructions is never permitted; hypothesis use stays epistemic
+            // and does not trigger this finding.
+            InstructionTaint::Data => {
+                if self.requested_use == AdmissibleUse::ProcedureCandidate {
+                    findings.push(AssuranceFinding::InstructionTainted);
+                }
+            }
+            InstructionTaint::Unknown => findings.push(AssuranceFinding::AxisUnknown {
                 axis: TrustAxis::InstructionTaint,
-            });
+            }),
         }
         if matches!(self.trust.threat, ThreatStatus::Unknown) {
             findings.push(AssuranceFinding::AxisUnknown {
@@ -497,33 +531,23 @@ impl SourceAssurance {
     ) -> Result<AdmissionOutcome, SourceAssuranceError> {
         policy.validate()?;
         let outcome = self.admit(&policy.expectation)?;
-        let mut findings = match &outcome {
-            AdmissionOutcome::Admitted { .. } => Vec::new(),
-            AdmissionOutcome::NeedsRevalidation { findings }
-            | AdmissionOutcome::Missing { findings }
-            | AdmissionOutcome::Conflicted { findings }
-            | AdmissionOutcome::WrongScope { findings }
-            | AdmissionOutcome::Quarantined { findings } => findings.clone(),
-        };
+        let mut extra = Vec::new();
         if self.requested_use != policy.allowed_use {
-            findings.push(AssuranceFinding::UseNotAllowed);
+            extra.push(AssuranceFinding::UseNotAllowed);
         }
         if effect_rank(&self.effect_ceiling) > effect_rank(&policy.effect_ceiling) {
-            findings.push(AssuranceFinding::EffectCeilingExceeded);
+            extra.push(AssuranceFinding::EffectCeilingExceeded);
         }
         if self.trust.privacy != policy.privacy_class {
-            findings.push(AssuranceFinding::PrivacyMismatch);
+            extra.push(AssuranceFinding::PrivacyMismatch);
         }
         if self.snapshot.state_fence != policy.expected_source_state_fence {
-            findings.push(AssuranceFinding::SourceFenceMismatch);
+            extra.push(AssuranceFinding::SourceFenceMismatch);
         }
-        findings.sort_by_key(finding_key);
-        findings.dedup();
-        if findings.is_empty() {
-            Ok(outcome)
-        } else {
-            Ok(classify_findings(findings, self.validate()?))
-        }
+        // `self` is immutable and `admit` already validated it, so this
+        // second digest computation cannot newly fail; it only re-materializes
+        // the digest for reclassification.
+        Ok(merge_findings(outcome, extra, self.validate()?))
     }
 
     /// Admit an optional source observation, preserving a typed missing-source
@@ -538,6 +562,24 @@ impl SourceAssurance {
             None => Ok(AdmissionOutcome::Missing {
                 findings: vec![AssuranceFinding::MissingSource],
             }),
+        }
+    }
+
+    /// Admit an optional source observation against an optional policy.
+    ///
+    /// Absent evidence yields the typed missing-source outcome; an absent
+    /// policy is an explicit contract defect and never defaults to a
+    /// permissive evaluation.
+    pub fn admit_optional_with_policy(
+        assurance: Option<&Self>,
+        policy: Option<&SourceAssurancePolicy>,
+    ) -> Result<AdmissionOutcome, SourceAssuranceError> {
+        match (assurance, policy) {
+            (None, _) => Ok(AdmissionOutcome::Missing {
+                findings: vec![AssuranceFinding::MissingSource],
+            }),
+            (Some(_), None) => Err(SourceAssuranceError::MissingField("policy")),
+            (Some(assurance), Some(policy)) => assurance.admit_with_policy(policy),
         }
     }
 
@@ -611,6 +653,38 @@ impl OwnerSourceEvidence {
         }
         self.assurance.validate()?;
         self.policy.validate()
+    }
+
+    /// Admit owner-bound evidence for the exact authenticated owner principal.
+    ///
+    /// Pure evaluation: no I/O. The attached policy evaluation runs exactly
+    /// once and every independent failure is preserved: an owner principal
+    /// that does not match the authenticated binding yields
+    /// `OwnerAuthenticationFailed`, and a policy verifier requirement that the
+    /// evidence does not satisfy yields `VerifierMismatch`. A verifier
+    /// requirement stays a requirement — a missing or different verifier
+    /// attestation never defaults to admitted. `SourceAssurance` itself
+    /// carries no verifier or owner binding, so those checks live here where
+    /// both sides of the comparison exist; one field never fills another.
+    pub fn admit(
+        &self,
+        expected_owner_principal_ref: &str,
+    ) -> Result<AdmissionOutcome, SourceAssuranceError> {
+        self.validate()?;
+        require_field("expected_owner_principal_ref", expected_owner_principal_ref)?;
+        let mut extra = Vec::new();
+        if self.owner_principal_ref != expected_owner_principal_ref {
+            extra.push(AssuranceFinding::OwnerAuthenticationFailed);
+        }
+        if let Some(required) = &self.policy.required_verifier
+            && self.verifier_ref.as_ref() != Some(required)
+        {
+            extra.push(AssuranceFinding::VerifierMismatch);
+        }
+        let base = self.assurance.admit_with_policy(&self.policy)?;
+        // `admit_with_policy` already validated the assurance, so this second
+        // digest computation cannot newly fail on immutable input.
+        Ok(merge_findings(base, extra, self.assurance.validate()?))
     }
 }
 
@@ -735,10 +809,12 @@ fn classify_findings(findings: Vec<AssuranceFinding>, digest: String) -> Admissi
         .any(|finding| matches!(finding, AssuranceFinding::WrongScope))
     {
         AdmissionOutcome::WrongScope { findings }
-    } else if findings
-        .iter()
-        .any(|finding| matches!(finding, AssuranceFinding::ConflictingSources))
-    {
+    } else if findings.iter().any(|finding| {
+        matches!(
+            finding,
+            AssuranceFinding::ConflictingSources | AssuranceFinding::OwnerAuthenticationFailed
+        )
+    }) {
         AdmissionOutcome::Conflicted { findings }
     } else if findings.iter().any(|finding| {
         matches!(
@@ -774,6 +850,57 @@ fn effect_rank(effect: &EffectCeiling) -> u8 {
         EffectCeiling::NoEffect => 0,
         EffectCeiling::ReadOnlyCandidate => 1,
     }
+}
+
+/// Merge extra findings into a base outcome and reclassify.
+///
+/// Findings are only ever added, sorted, and deduplicated; an empty merged
+/// set preserves the base outcome unchanged.
+fn merge_findings(
+    outcome: AdmissionOutcome,
+    extra: Vec<AssuranceFinding>,
+    digest: String,
+) -> AdmissionOutcome {
+    let mut findings = match &outcome {
+        AdmissionOutcome::Admitted { .. } => Vec::new(),
+        AdmissionOutcome::NeedsRevalidation { findings }
+        | AdmissionOutcome::Missing { findings }
+        | AdmissionOutcome::Conflicted { findings }
+        | AdmissionOutcome::WrongScope { findings }
+        | AdmissionOutcome::Quarantined { findings } => findings.clone(),
+    };
+    findings.extend(extra);
+    findings.sort_by_key(finding_key);
+    findings.dedup();
+    if findings.is_empty() {
+        outcome
+    } else {
+        classify_findings(findings, digest)
+    }
+}
+
+/// Append a transformation receipt to a lineage digest, purely.
+///
+/// Inputs are the previous `lineage_digest` and the bytes describing the
+/// exact transformation applied; the output is the new digest computed with
+/// the cell's existing blake3 helper. The original assurance identity is
+/// retained by the caller and the grade is never raised here: a receipt only
+/// extends provenance. No I/O is performed. A malformed previous digest or an
+/// empty descriptor is an explicit error, never a defaulted digest.
+pub fn append_lineage_receipt(
+    previous_lineage_digest: &str,
+    transformation_descriptor: &[u8],
+) -> Result<String, SourceAssuranceError> {
+    require_digest("provenance.lineage_digest", previous_lineage_digest)?;
+    if transformation_descriptor.is_empty() {
+        return Err(SourceAssuranceError::MissingField(
+            "transformation_descriptor",
+        ));
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(previous_lineage_digest.as_bytes());
+    hasher.update(transformation_descriptor);
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 #[cfg(test)]

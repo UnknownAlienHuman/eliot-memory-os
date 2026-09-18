@@ -1,0 +1,12 @@
+{
+  "artifact_id": "artifact-review-1",
+  "artifact_digest": "digest-artifact-r5",
+  "head_revision": 5,
+  "review_revision": 5,
+  "stale_revision": 4,
+  "future_revision": 6,
+  "criteria": ["criterion-novelty", "criterion-evidence"],
+  "proof_refs": ["proof-ref-1"],
+  "anchor_field": "section-3/paragraph-2",
+  "expected_reviews": 3
+}

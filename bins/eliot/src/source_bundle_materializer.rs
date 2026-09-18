@@ -5,9 +5,10 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use eliot_contracts::{EpochId, EpochLineageId};
 use eliot_governor::{GovernorLaunchConfig, KernelGenerationExpectation};
 use eliot_installation::{
-    AgentBridgeSourceMaterializationFactory, AgentBridgeSourceMaterializationPlan, AuthorityEpoch,
+    AgentBridgeSourceMaterializationFactory, AgentBridgeSourceMaterializationPlan,
     GenerationPackagePlanner, InstallationEpoch, InstallationError, InstallationProfile,
     InstallationRecoveryStage, LOCAL_SERVICE_SID, PHASE_B_PENDING_MARKER, PackageArtifactDigest,
     PlatformHandle, RedbInstallationTransactionStore, ResourceGeneration, RuntimeLaunchDescriptor,
@@ -34,18 +35,34 @@ use sha2::{Digest, Sha256};
 
 const MAX_EXECUTABLE_BYTES: usize = 512 * 1024 * 1024;
 const ELIOTD_LAUNCH_DESCRIPTOR_WIRE_ID: &str = "eliot.kernel.eliotd-launch";
+/// Lineage used to bind the materializer-pinned genesis scalar to its canonical
+/// [`EpochId`] tuple. The genesis wire remains sequence one; this binary
+/// performs only the mechanical tuple binding and never mints authority.
+const MATERIALIZER_EPOCH_LINEAGE_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+fn materializer_genesis_epoch() -> Result<EpochId, MaterializeError> {
+    let lineage = EpochLineageId::new(MATERIALIZER_EPOCH_LINEAGE_ID)
+        .map_err(|error| MaterializeError::Contract(error.to_string()))?;
+    let sequence = std::num::NonZeroU64::new(1).ok_or_else(|| {
+        MaterializeError::Contract("materializer genesis epoch must be non-zero".to_owned())
+    })?;
+    EpochId::new(lineage, sequence).map_err(|error| MaterializeError::Contract(error.to_string()))
+}
 
 /// The only source roles admitted to Phase A.
 ///
 /// `authority.json` and `store-bootstrap.json` are intentionally absent. They
 /// are Host-owned Phase-B material and can never be supplied by this command.
-pub const REQUIRED_ROLES: [(&str, bool); 9] = [
+pub const REQUIRED_ROLES: [(&str, bool); 12] = [
     ("eliot-host.exe", true),
     ("eliot-watchdog.exe", true),
     ("eliot-kernel.exe", true),
     ("eliot-store-surreal.exe", true),
     ("surreal.exe", true),
     ("eliotd.exe", true),
+    ("eliot-doctor.exe", true),
+    ("eliot-testd.exe", true),
+    ("eliot-native-worker.exe", true),
     ("generation.json", false),
     ("eliotd-governor.json", false),
     ("eliotd.json", false),
@@ -66,6 +83,12 @@ pub struct CanarySourceBundleMaterializeInput {
     pub surreal_exe: PathBuf,
     /// Release `eliotd.exe` path.
     pub eliotd_exe: PathBuf,
+    /// Release `eliot-doctor.exe` path.
+    pub eliot_doctor_exe: PathBuf,
+    /// Release `eliot-testd.exe` path.
+    pub eliot_testd_exe: PathBuf,
+    /// Release `eliot-native-worker.exe` path.
+    pub eliot_native_worker_exe: PathBuf,
     /// Optional explicit external agent-bridge executable source.
     pub agent_bridge_exe: Option<PathBuf>,
     /// Optional account name resolved by Windows to the approved stable SID.
@@ -144,7 +167,7 @@ pub struct CanarySourceBundleReceipt {
     pub bundle_path: String,
     /// Canonical relative generation identity.
     pub generation: String,
-    /// Full nine-role canonical artifact evidence digest.
+    /// Full twelve-role canonical artifact evidence digest.
     pub evidence_digest: String,
     /// Exact role inventory, identities and byte facts.
     pub files: Vec<MaterializedRoleReceipt>,
@@ -155,7 +178,7 @@ pub struct CanarySourceBundleReceipt {
 }
 
 /// The non-wire proof handed directly to the generation planner.  It carries
-/// only the exact published root identity, ordered nine-role byte facts and
+/// only the exact published root identity, ordered twelve-role byte facts and
 /// full evidence digest; the planner independently reopens and observes the
 /// path before accepting these facts.
 #[derive(Clone, Debug)]
@@ -174,7 +197,7 @@ impl CanarySourceBundleReceipt {
             || self.source_identity != self.directory_publication.destination_identity
         {
             return Err(MaterializeError::Invalid(
-                "published source receipt is not an exact nine-role directory publication"
+                "published source receipt is not an exact twelve-role directory publication"
                     .to_owned(),
             ));
         }
@@ -213,7 +236,7 @@ pub enum CanarySourceBundleReconciliationReason {
     /// The platform move committed but exact directory receipt readback was
     /// unavailable.
     DirectoryPublicationUnknown,
-    /// Directory publication was exact, but the complete nine-role
+    /// Directory publication was exact, but the complete twelve-role
     /// post-commit source-bundle readback was rejected.
     #[allow(
         dead_code,
@@ -230,7 +253,7 @@ pub struct CanarySourceBundleReconciliation {
     pub bundle_path: String,
     /// Canonical relative generation identity.
     pub generation: String,
-    /// Full nine-role canonical artifact evidence digest.
+    /// Full twelve-role canonical artifact evidence digest.
     pub evidence_digest: String,
     /// Complete role facts measured before the atomic commit.
     pub precommit_files: Vec<MaterializedRolePrecommitReceipt>,
@@ -462,13 +485,13 @@ fn validate_executable(
 fn validate_role_inventory(roles: &[(&str, bool)]) -> Result<(), MaterializeError> {
     if roles.len() != REQUIRED_ROLES.len() {
         return Err(MaterializeError::Invalid(
-            "Phase-A source bundle must contain exactly nine roles".to_owned(),
+            "Phase-A source bundle must contain exactly twelve roles".to_owned(),
         ));
     }
     for (actual, expected) in roles.iter().zip(REQUIRED_ROLES) {
         if actual != &expected {
             return Err(MaterializeError::Invalid(format!(
-                "role inventory must be the exact ordered nine-role Phase-A set; got {}",
+                "role inventory must be the exact ordered twelve-role Phase-A set; got {}",
                 actual.0
             )));
         }
@@ -565,8 +588,7 @@ fn governor_bytes(
 ) -> Result<Vec<u8>, MaterializeError> {
     let generation_number = ResourceGeneration::new(1)
         .map_err(|error| MaterializeError::Contract(error.to_string()))?;
-    let authority_epoch =
-        AuthorityEpoch::new(1).map_err(|error| MaterializeError::Contract(error.to_string()))?;
+    let authority_epoch = materializer_genesis_epoch()?;
     let protected = sha256_hex(
         format!(
             "governor-protected:{}:{}:{}",
@@ -697,6 +719,9 @@ fn build_typed_bundle(
     let store_bridge_path = role_path("eliot-store-surreal.exe")?;
     let canonical_store_path = role_path("surreal.exe")?;
     let eliotd_path = role_path("eliotd.exe")?;
+    let doctor_path = role_path("eliot-doctor.exe")?;
+    let testd_path = role_path("eliot-testd.exe")?;
+    let native_worker_path = role_path("eliot-native-worker.exe")?;
     let config_path = role_path("generation.json")?;
     let governor_path = role_path("eliotd-governor.json")?;
     let descriptor_path = role_path("eliotd.json")?;
@@ -715,6 +740,9 @@ fn build_typed_bundle(
     let store_bridge = by_name("eliot-store-surreal.exe")?;
     let canonical_store = by_name("surreal.exe")?;
     let eliotd = by_name("eliotd.exe")?;
+    let doctor = by_name("eliot-doctor.exe")?;
+    let testd = by_name("eliot-testd.exe")?;
+    let native_worker = by_name("eliot-native-worker.exe")?;
     let governor = governor_bytes(&input.generation, &input.installation_epoch, &kernel.sha256)?;
     let protected_snapshot_digest = protected_snapshot_digest_from_governor_bytes(&governor)?;
     bridge_source_plan(input, &kernel.sha256, protected_snapshot_digest.as_str())?;
@@ -730,6 +758,13 @@ fn build_typed_bundle(
         )?,
         package_digest("surreal.exe", canonical_store.size, &canonical_store.sha256)?,
         package_digest("eliotd.exe", eliotd.size, &eliotd.sha256)?,
+        package_digest("eliot-doctor.exe", doctor.size, &doctor.sha256)?,
+        package_digest("eliot-testd.exe", testd.size, &testd.sha256)?,
+        package_digest(
+            "eliot-native-worker.exe",
+            native_worker.size,
+            &native_worker.sha256,
+        )?,
         package_digest(
             "eliotd-governor.json",
             governor.len() as u64,
@@ -765,9 +800,8 @@ fn build_typed_bundle(
     )?;
     let authority_generation = ResourceGeneration::new(1)
         .map_err(|error| MaterializeError::Contract(error.to_string()))?;
-    let authority_epoch =
-        AuthorityEpoch::new(1).map_err(|error| MaterializeError::Contract(error.to_string()))?;
-    let authority_state_fence = StateFence::new(authority_epoch, authority_generation);
+    let authority_epoch = materializer_genesis_epoch()?;
+    let authority_state_fence = StateFence::new(authority_epoch.clone(), authority_generation);
     let kernel_arguments = make_args([
         "--work-root".to_owned(),
         roots.kernel_work_root.as_str().to_owned(),
@@ -781,6 +815,12 @@ fn build_typed_bundle(
         PHASE_B_PENDING_MARKER.to_owned(),
         "--kernel-artifact-sha256".to_owned(),
         kernel.sha256.clone(),
+        "--doctor-artifact-sha256".to_owned(),
+        doctor.sha256.clone(),
+        "--testd-artifact-sha256".to_owned(),
+        testd.sha256.clone(),
+        "--native-worker-artifact-sha256".to_owned(),
+        native_worker.sha256.clone(),
         "--eliotd-descriptor".to_owned(),
         descriptor_path.as_str().to_owned(),
         "--eliotd-descriptor-sha256".to_owned(),
@@ -911,6 +951,15 @@ fn build_typed_bundle(
         host_artifact_digest: make_digest(host.sha256.clone(), "Host digest")?,
         watchdog_executable_path: watchdog_path,
         watchdog_artifact_digest: make_digest(watchdog.sha256.clone(), "Watchdog digest")?,
+        doctor_artifact_digest: make_digest(doctor.sha256.clone(), "Doctor digest")?,
+        testd_artifact_digest: make_digest(testd.sha256.clone(), "Testd digest")?,
+        native_worker_artifact_digest: make_digest(
+            native_worker.sha256.clone(),
+            "Native worker digest",
+        )?,
+        doctor_executable_path: doctor_path,
+        testd_executable_path: testd_path,
+        native_worker_executable_path: native_worker_path,
         descriptor_digest: PlatformHandle::new("0".repeat(64))
             .map_err(|error| MaterializeError::Contract(error.to_string()))?,
     }
@@ -1161,7 +1210,7 @@ fn typed_bundle_from_journal(
 > {
     if journal.precommit_files.len() != REQUIRED_ROLES.len() {
         return Err(MaterializeError::Invalid(
-            "publication journal does not retain the complete nine-role inventory".to_owned(),
+            "publication journal does not retain the complete twelve-role inventory".to_owned(),
         ));
     }
     let mut manifest_files = Vec::with_capacity(REQUIRED_ROLES.len());
@@ -1623,9 +1672,9 @@ fn materialize_with_executables(
         .installation_epoch
         .validate()
         .map_err(|error| MaterializeError::Contract(error.to_string()))?;
-    if executables.len() != 6 {
+    if executables.len() != 9 {
         return Err(MaterializeError::Invalid(
-            "exactly six validated executables are required".to_owned(),
+            "exactly nine validated executables are required".to_owned(),
         ));
     }
 
@@ -1808,7 +1857,7 @@ fn materialize_with_executables(
     }
 }
 
-/// Materialize one exact nine-role Phase-A source bundle.
+/// Materialize one exact twelve-role Phase-A source bundle.
 pub fn materialize_canary_source_bundle(
     input: &CanarySourceBundleMaterializeInput,
 ) -> Result<CanarySourceBundleMaterializeOutcome, InstallationError> {
@@ -1825,6 +1874,12 @@ pub fn materialize_canary_source_bundle(
         ),
         (input.surreal_exe.clone(), "surreal.exe"),
         (input.eliotd_exe.clone(), "eliotd.exe"),
+        (input.eliot_doctor_exe.clone(), "eliot-doctor.exe"),
+        (input.eliot_testd_exe.clone(), "eliot-testd.exe"),
+        (
+            input.eliot_native_worker_exe.clone(),
+            "eliot-native-worker.exe",
+        ),
     ];
     let executables = executable_inputs
         .into_iter()
@@ -1880,6 +1935,9 @@ mod tests {
             "eliot-store-surreal.exe",
             "surreal.exe",
             "eliotd.exe",
+            "eliot-doctor.exe",
+            "eliot-testd.exe",
+            "eliot-native-worker.exe",
         ]
         .into_iter()
         .enumerate()
@@ -1931,6 +1989,9 @@ mod tests {
             eliot_store_surreal_exe: PathBuf::new(),
             surreal_exe: PathBuf::new(),
             eliotd_exe: PathBuf::new(),
+            eliot_doctor_exe: PathBuf::new(),
+            eliot_testd_exe: PathBuf::new(),
+            eliot_native_worker_exe: PathBuf::new(),
             agent_bridge_exe: None,
             agent_bridge_account: None,
             output_bundle: source_parent.path().join("bundle"),
@@ -2087,7 +2148,7 @@ mod tests {
         extra.push(("authority.json", false));
         assert!(validate_role_inventory(&extra).is_err());
         let mut substituted = REQUIRED_ROLES;
-        substituted[6] = ("authority.json", false);
+        substituted[9] = ("authority.json", false);
         assert!(validate_role_inventory(&substituted).is_err());
     }
 
@@ -2102,7 +2163,7 @@ mod tests {
         let CanarySourceBundleMaterializeOutcome::Published(receipt) = outcome else {
             panic!("exact materializer publication unexpectedly requires reconciliation");
         };
-        assert_eq!(receipt.files.len(), 9);
+        assert_eq!(receipt.files.len(), 12);
         assert_eq!(
             receipt.directory_publication.source_identity,
             receipt.directory_publication.destination_identity
@@ -2180,6 +2241,9 @@ mod tests {
             &input.eliot_store_surreal_exe,
             &input.surreal_exe,
             &input.eliotd_exe,
+            &input.eliot_doctor_exe,
+            &input.eliot_testd_exe,
+            &input.eliot_native_worker_exe,
         ] {
             assert!(
                 !source.exists(),

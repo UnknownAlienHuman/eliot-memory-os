@@ -30,6 +30,16 @@ fn mock_observation(child: Option<&MockChild>) -> ReconciliationObservation {
     }
 }
 
+#[cfg(windows)]
+fn test_epoch(sequence: u64) -> eliot_contracts::EpochId {
+    eliot_contracts::EpochId::new(
+        eliot_contracts::EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .unwrap_or_else(|_| unreachable!()),
+        std::num::NonZeroU64::new(sequence).unwrap_or_else(|| unreachable!()),
+    )
+    .unwrap_or_else(|_| unreachable!())
+}
+
 fn launch_environment(
     kernel: Option<&KernelLaunchBinding>,
 ) -> Result<BTreeMap<String, String>, TestError> {
@@ -126,7 +136,7 @@ fn kill_on_close_crash_fence_is_operation_specific_and_never_positive_attach() -
         PlatformHandle::new("store-recovery-crash-fence-query")?,
         PlatformHandle::new("a".repeat(64))?,
     )?;
-    let pending_ref = super::runtime_control_unknown_ref(
+    let pending_ref = eliot_host_service::runtime_control::runtime_control_unknown_ref(
         super::STORE_RECOVERY_CRASH_FENCE_UNKNOWN_REASON,
         &request,
     );
@@ -804,7 +814,7 @@ fn generic_reconcile_rejects_dead_store_without_durable_host_authority() -> Test
 fn scm_store_recovery_request_identity_is_stable_and_contour_bound() -> TestResult {
     let host = fresh_host_epoch(PlatformHandle::new("scm-store-recovery-identity")?, None)?;
     let activation_id = PlatformHandle::new("activation-id")?;
-    let activation_generation = super::root_epoch(PlatformHandle::new("activation")?);
+    let activation_generation = super::root_epoch(super::fresh_lineage_id()?);
     let generation = PlatformHandle::new("generation")?;
     let config = PlatformHandle::new("config")?;
     let first = host_owned_store_recovery_request(
@@ -833,7 +843,8 @@ fn scm_store_recovery_request_identity_is_stable_and_contour_bound() -> TestResu
     )?;
     assert_ne!(first.mutation_digest, changed_config.mutation_digest);
     let mut next_host = host.clone();
-    next_host.epoch = host.epoch.direct_child()?;
+    next_host.epoch = eliot_host_state::EpochTransition::direct_child(&host.epoch.current)
+        .map_err(|error| super::epoch_contract_error(&error))?;
     let changed_epoch = host_owned_store_recovery_request(
         &next_host,
         &activation_id,
@@ -847,9 +858,9 @@ fn scm_store_recovery_request_identity_is_stable_and_contour_bound() -> TestResu
 
 #[test]
 fn pulse4_store_rebind_fence_and_pipe_substitution_fails_closed() -> TestResult {
-    use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence};
+    use eliot_contracts::{ResourceGeneration, StateFence};
     use eliot_kernel_service::{HostStoreBootstrapRequirement, StoreRebindHandoff};
-    let fence = StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis());
+    let fence = StateFence::new(test_epoch(1), ResourceGeneration::genesis());
     let req = HostStoreBootstrapRequirement {
         route_identity: PlatformHandle::new("store_bridge")?,
         canonical_pipe_identity: PlatformHandle::new(r"\\.\pipe\eliot\store")?,
@@ -879,7 +890,7 @@ fn pulse4_store_rebind_fence_and_pipe_substitution_fails_closed() -> TestResult 
         },
         candidate_binding_digest: "f".repeat(64),
         generation: ResourceGeneration::genesis(),
-        authority_epoch: AuthorityEpoch::genesis(),
+        authority_epoch: test_epoch(1),
         store_fence: "a".repeat(64),
     };
     assert!(
@@ -968,7 +979,10 @@ fn store_recovery_response_loss_query_preserves_original_digest() -> TestResult 
         m.insert(req.mutation_digest.as_str().to_owned(), receipt.clone());
         m
     };
-    let pending_ref = super::runtime_control_unknown_ref("store-recovery-pending", &req);
+    let pending_ref = eliot_host_service::runtime_control::runtime_control_unknown_ref(
+        "store-recovery-pending",
+        &req,
+    );
     assert!(pending_ref.as_str().contains(req.request_digest.as_str()));
     let recovered = map
         .get(req.mutation_digest.as_str())
@@ -1004,21 +1018,21 @@ fn store_recovery_response_loss_query_preserves_original_digest() -> TestResult 
 
 #[test]
 fn store_recovery_reconciles_only_canonical_committed_inner_rebind() -> TestResult {
-    use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence};
+    use eliot_contracts::{ResourceGeneration, StateFence};
     use eliot_kernel_service::{
         HostStoreBootstrapRequirement, StoreProcessBinding, StoreRebindHandoff,
     };
 
     let host = super::fresh_host_epoch(PlatformHandle::new("inner-rebind-test")?, None)?;
     let activation_id = super::fresh_identity("inner-rebind-activation")?;
-    let activation_generation = super::root_epoch(super::fresh_identity("inner-rebind-lineage")?);
-    let authority_epoch = AuthorityEpoch::new(7)?;
+    let activation_generation = super::root_epoch(super::fresh_lineage_id()?);
+    let authority_epoch = test_epoch(7);
     let generation = ResourceGeneration::new(3)?;
     let requirement = HostStoreBootstrapRequirement {
         route_identity: PlatformHandle::new("store_bridge")?,
         canonical_pipe_identity: PlatformHandle::new(r"\\.\pipe\eliot\store")?,
         store_generation: generation,
-        state_fence: StateFence::new(authority_epoch, generation),
+        state_fence: StateFence::new(authority_epoch.clone(), generation),
         launch_nonce: PlatformHandle::new("inner-rebind-launch-nonce")?,
         connection_id: PlatformHandle::new("inner-rebind-connection")?,
         expected_peer_sid: PlatformHandle::new("S-1-5-18")?,
@@ -1045,7 +1059,7 @@ fn store_recovery_reconciles_only_canonical_committed_inner_rebind() -> TestResu
         process_binding: process_binding.clone(),
         candidate_binding_digest: candidate_digest.clone(),
         generation,
-        authority_epoch,
+        authority_epoch: authority_epoch.clone(),
         store_fence: store_fence.clone(),
     };
     let inner_digest = handoff.canonical_request_digest()?;
@@ -1067,7 +1081,7 @@ fn store_recovery_reconciles_only_canonical_committed_inner_rebind() -> TestResu
         process_image_path: PlatformHandle::new(process_binding.process.image_path.clone())?,
         job_name: process_binding.job.clone(),
         generation: generation.value(),
-        authority_epoch: authority_epoch.value(),
+        authority_epoch: authority_epoch.sequence.get(),
         receipt_request_digest: Some(PlatformHandle::new(inner_digest.clone())?),
         receipt_store_fence: Some(PlatformHandle::new(store_fence)?),
     };
@@ -1100,8 +1114,7 @@ fn store_recovery_changes_only_store_identity_kernel_fence_invariants_hold() -> 
         eliot_host_state::MemoryBackend::default(),
         host.clone(),
     )?;
-    let activation_generation =
-        super::root_epoch(super::fresh_identity("store-recovery-activation")?);
+    let activation_generation = super::root_epoch(super::fresh_lineage_id()?);
     let activation_id = super::fresh_identity("store-recovery-activation-id")?;
     super::append_reconciled(
         &journal,
@@ -1198,8 +1211,7 @@ fn store_recovery_same_host_response_loss_preserves_commit_and_idempotent_replay
         eliot_host_state::MemoryBackend::default(),
         host.clone(),
     )?;
-    let activation_generation =
-        super::root_epoch(super::fresh_identity("crash-reopen-activation")?);
+    let activation_generation = super::root_epoch(super::fresh_lineage_id()?);
     let activation_id = super::fresh_identity("crash-reopen-activation-id")?;
     super::append_reconciled(
         &journal,

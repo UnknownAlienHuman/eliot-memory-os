@@ -46,6 +46,56 @@ use std::sync::{
 };
 use std::time::Duration;
 
+use crate::kernel_diagnostics::{
+    EntrypointStage, observe_entrypoint, observe_entrypoint_with_detail, observe_terminal_error,
+};
+
+/// Maps one build failure to its stable owner-typed diagnostic code.
+///
+/// The code is the `KernelBuildError` variant name only; any `String`
+/// payload (paths, digests, descriptors,os errors) is never emitted.
+fn kernel_build_error_code(error: &KernelBuildError) -> &'static str {
+    match error {
+        KernelBuildError::Platform(_) => "PLATFORM",
+        KernelBuildError::Transport(_) => "TRANSPORT",
+        KernelBuildError::Runtime(_) => "RUNTIME",
+        KernelBuildError::Ors(_) => "ORS",
+        KernelBuildError::Core(_) => "CORE",
+        KernelBuildError::Service(_) => "SERVICE",
+        KernelBuildError::StoreBootstrapRequired => "STORE_BOOTSTRAP_REQUIRED",
+        KernelBuildError::StoreAlreadyConnected => "STORE_ALREADY_CONNECTED",
+        KernelBuildError::Principal(_) => "PRINCIPAL",
+    }
+}
+
+/// Maps one authority-preparation failure to its stable owner-typed phase
+/// label. The label is fixed vocabulary; no descriptor/credential/ORS
+/// material is emitted.
+fn authority_preparation_phase(error: &AuthorityPreparationError) -> &'static str {
+    match error {
+        AuthorityPreparationError::ProtectedInput => {
+            "kernel.composition.authority_protected_input_rejected"
+        }
+        AuthorityPreparationError::DigestMismatch => "kernel.composition.authority_digest_mismatch",
+        AuthorityPreparationError::DescriptorInvalid => {
+            "kernel.composition.authority_descriptor_invalid"
+        }
+        AuthorityPreparationError::DescriptorNotFresh => {
+            "kernel.composition.authority_descriptor_not_fresh"
+        }
+        AuthorityPreparationError::CredentialUnavailable => {
+            "kernel.composition.authority_credential_unavailable"
+        }
+        AuthorityPreparationError::CredentialInvalid => {
+            "kernel.composition.authority_credential_invalid"
+        }
+        AuthorityPreparationError::Replay => "kernel.composition.authority_replay_rejected",
+        AuthorityPreparationError::PersistenceUnknown => {
+            "kernel.composition.authority_persistence_unknown"
+        }
+    }
+}
+
 impl KernelComposition {
     /// Builds all lower-layer surfaces once and binds them to one runtime.
     ///
@@ -53,15 +103,47 @@ impl KernelComposition {
     /// authenticated handoff. Test-only adapter construction is available
     /// under the test configuration.
     pub fn new(config: KernelConfig) -> Result<Self, KernelBuildError> {
+        // F-LOG-KERNEL-2 (#899): composition-build boundary. One terminal per
+        // failed build; phase observations correlate by stage order.
+        observe_entrypoint_with_detail(
+            EntrypointStage::Composition,
+            "kernel.composition.build_started",
+        );
         let work_root = config.work_root.clone();
-        let platform =
-            Arc::new(WindowsPlatform::new(work_root.clone()).map_err(KernelBuildError::Platform)?);
-        let ors_path = Self::ors_path_for_config(&config)?;
+        let platform = Arc::new(WindowsPlatform::new(work_root.clone()).map_err(|error| {
+            let mapped = KernelBuildError::Platform(error);
+            observe_entrypoint_with_detail(
+                EntrypointStage::Composition,
+                "kernel.composition.build_failed",
+            );
+            observe_terminal_error(kernel_build_error_code(&mapped));
+            mapped
+        })?);
+        let ors_path = Self::ors_path_for_config(&config).inspect_err(|error| {
+            observe_entrypoint_with_detail(
+                EntrypointStage::Composition,
+                "kernel.composition.build_failed",
+            );
+            observe_terminal_error(kernel_build_error_code(error));
+        })?;
         let ors = Arc::new(
             RedbRecoveryStore::open(&ors_path)
-                .map_err(|error| KernelBuildError::Ors(error.to_string()))?,
+                .map_err(|error| KernelBuildError::Ors(error.to_string()))
+                .inspect_err(|error| {
+                    observe_entrypoint_with_detail(
+                        EntrypointStage::Composition,
+                        "kernel.composition.build_failed",
+                    );
+                    observe_terminal_error(kernel_build_error_code(error));
+                })?,
         );
-        Self::assemble(config, ors, None, platform)
+        Self::assemble(config, ors, None, platform).inspect_err(|error| {
+            observe_entrypoint_with_detail(
+                EntrypointStage::Composition,
+                "kernel.composition.build_failed",
+            );
+            observe_terminal_error(kernel_build_error_code(error));
+        })
     }
 
     /// Consumes the Host-approved protected authority descriptor before
@@ -73,13 +155,31 @@ impl KernelComposition {
         expected_sha256: &str,
         contour: AuthorityDescriptorContour,
     ) -> Result<Self, KernelBuildError> {
+        // F-LOG-KERNEL-2 (#899): descriptor-gated build boundary; single
+        // terminal per failed build, phases correlate by stage order.
+        observe_entrypoint_with_detail(
+            EntrypointStage::Composition,
+            "kernel.composition.descriptor_build_started",
+        );
+        let terminal = |error: KernelBuildError| {
+            observe_entrypoint_with_detail(
+                EntrypointStage::Composition,
+                "kernel.composition.build_failed",
+            );
+            observe_terminal_error(kernel_build_error_code(&error));
+            error
+        };
         let work_root = config.work_root.clone();
-        let platform =
-            Arc::new(WindowsPlatform::new(work_root.clone()).map_err(KernelBuildError::Platform)?);
-        let ors_path = Self::ors_path_for_config(&config)?;
+        let platform = Arc::new(
+            WindowsPlatform::new(work_root.clone())
+                .map_err(KernelBuildError::Platform)
+                .map_err(&terminal)?,
+        );
+        let ors_path = Self::ors_path_for_config(&config).map_err(&terminal)?;
         let ors = Arc::new(
             RedbRecoveryStore::open(&ors_path)
-                .map_err(|error| KernelBuildError::Ors(error.to_string()))?,
+                .map_err(|error| KernelBuildError::Ors(error.to_string()))
+                .map_err(&terminal)?,
         );
         let prepared = Self::prepare_authority_descriptor_material(
             &platform,
@@ -88,7 +188,14 @@ impl KernelComposition {
             expected_sha256,
             contour,
         )
-        .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+        .map_err(|error| {
+            observe_entrypoint_with_detail(
+                EntrypointStage::Composition,
+                authority_preparation_phase(&error),
+            );
+            KernelBuildError::Service(error.to_string())
+        })
+        .map_err(&terminal)?;
         #[cfg(windows)]
         if config.require_descriptor_supervision_authority {
             let descriptor_authority = SupervisionLeaseAuthorityConfig {
@@ -96,20 +203,36 @@ impl KernelComposition {
             };
             match &config.supervision_lease_authority {
                 Some(configured) if configured != &descriptor_authority => {
-                    return Err(KernelBuildError::Service(
+                    observe_entrypoint_with_detail(
+                        EntrypointStage::SupervisionAuthority,
+                        "kernel.composition.supervision_authority_mismatch",
+                    );
+                    return Err(terminal(KernelBuildError::Service(
                         "configured supervision authority does not match the protected handoff descriptor"
                             .to_owned(),
-                    ));
+                    )));
                 }
-                Some(_) => {}
-                None => config.supervision_lease_authority = Some(descriptor_authority),
+                Some(_) => {
+                    observe_entrypoint_with_detail(
+                        EntrypointStage::SupervisionAuthority,
+                        "kernel.composition.supervision_authority_matched",
+                    );
+                }
+                None => {
+                    config.supervision_lease_authority = Some(descriptor_authority);
+                    observe_entrypoint_with_detail(
+                        EntrypointStage::SupervisionAuthority,
+                        "kernel.composition.supervision_authority_adopted",
+                    );
+                }
             }
         }
         let snapshot_binding = AuthoritySnapshotBinding::from_wire(
             prepared.descriptor.snapshot_binding.clone(),
             &prepared.descriptor.authority_id,
         )
-        .map_err(|error| KernelBuildError::Core(error.to_string()))?;
+        .map_err(|error| KernelBuildError::Core(error.to_string()))
+        .map_err(&terminal)?;
         let codec: Arc<dyn DispatchSnapshotCodec> = Arc::new(WindowsDispatchSnapshotCodec::new(
             Arc::clone(&platform),
             prepared.descriptor.dispatch_key.clone(),
@@ -125,10 +248,13 @@ impl KernelComposition {
             &prepared.descriptor,
             &handoff,
         )
-        .map_err(|error| KernelBuildError::Core(error.to_string()))?;
+        .map_err(|error| KernelBuildError::Core(error.to_string()))
+        .map_err(&terminal)?;
         Self::consume_authority_handoff(&ors, &handoff)
-            .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+            .map_err(|error| KernelBuildError::Service(error.to_string()))
+            .map_err(&terminal)?;
         Self::assemble_with_process_controller(config, controller, snapshot_binding, ors, platform)
+            .map_err(&terminal)
     }
 
     /// Builds a production composition with an externally supplied process
@@ -138,15 +264,33 @@ impl KernelComposition {
         config: KernelConfig,
         authority_config: ProcessExecutionAuthorityConfig,
     ) -> Result<Self, KernelBuildError> {
+        // F-LOG-KERNEL-2 (#899): process-authority build boundary.
+        observe_entrypoint_with_detail(
+            EntrypointStage::Composition,
+            "kernel.composition.process_authority_build_started",
+        );
+        let terminal = |error: KernelBuildError| {
+            observe_entrypoint_with_detail(
+                EntrypointStage::Composition,
+                "kernel.composition.build_failed",
+            );
+            observe_terminal_error(kernel_build_error_code(&error));
+            error
+        };
         let work_root = config.work_root.clone();
-        let platform =
-            Arc::new(WindowsPlatform::new(work_root.clone()).map_err(KernelBuildError::Platform)?);
-        let ors_path = Self::ors_path_for_config(&config)?;
+        let platform = Arc::new(
+            WindowsPlatform::new(work_root.clone())
+                .map_err(KernelBuildError::Platform)
+                .map_err(&terminal)?,
+        );
+        let ors_path = Self::ors_path_for_config(&config).map_err(&terminal)?;
         let ors = Arc::new(
             RedbRecoveryStore::open(&ors_path)
-                .map_err(|error| KernelBuildError::Ors(error.to_string()))?,
+                .map_err(|error| KernelBuildError::Ors(error.to_string()))
+                .map_err(&terminal)?,
         );
         Self::assemble_with_process_authority(config, authority_config, ors, platform)
+            .map_err(&terminal)
     }
 
     fn assemble_with_process_authority(
@@ -207,21 +351,33 @@ impl KernelComposition {
         descriptor: &ProcessAuthorityHandoffDescriptor,
         handoff: &AuthorityHandoffRecord,
     ) -> eliot_kernel_core::KernelResult<Arc<Mutex<ProcessDispatchAuthorityController>>> {
+        // F-LOG-KERNEL-2 (#899): handoff-state phase observations only; the
+        // controller remains the single owner of activation/recovery.
         match handoff.state {
-            AuthorityHandoffState::Consumed => ProcessDispatchAuthorityController::restore(
-                authority_id,
-                key,
-                store,
-                codec,
-                binding,
-            )
-            .map(|controller| Arc::new(Mutex::new(controller))),
+            AuthorityHandoffState::Consumed => {
+                observe_entrypoint_with_detail(
+                    EntrypointStage::Composition,
+                    "kernel.composition.handoff_consumed_restore",
+                );
+                ProcessDispatchAuthorityController::restore(
+                    authority_id,
+                    key,
+                    store,
+                    codec,
+                    binding,
+                )
+                .map(|controller| Arc::new(Mutex::new(controller)))
+            }
             AuthorityHandoffState::Reserved => {
                 if ProcessDispatchAuthorityController::exact_snapshot_present(
                     &authority_id,
                     store.as_ref(),
                     binding,
                 )? {
+                    observe_entrypoint_with_detail(
+                        EntrypointStage::Composition,
+                        "kernel.composition.handoff_reserved_replay",
+                    );
                     return ProcessDispatchAuthorityController::restore(
                         authority_id,
                         key,
@@ -233,10 +389,18 @@ impl KernelComposition {
                 }
                 let now = i64::try_from(unix_ms()).unwrap_or(i64::MAX);
                 if !Self::authority_descriptor_is_fresh(descriptor, now) {
+                    observe_entrypoint_with_detail(
+                        EntrypointStage::Composition,
+                        "kernel.composition.handoff_reserved_not_fresh",
+                    );
                     return Err(KernelError::RecoveryUnavailable(
                         "fresh authority admission interval is not active".to_owned(),
                     ));
                 }
+                observe_entrypoint_with_detail(
+                    EntrypointStage::Composition,
+                    "kernel.composition.handoff_reserved_activate",
+                );
                 ProcessDispatchAuthorityController::activate_and_persist_initial(
                     authority_id,
                     key,
@@ -246,9 +410,15 @@ impl KernelComposition {
                 )
                 .map(|controller| Arc::new(Mutex::new(controller)))
             }
-            AuthorityHandoffState::Unknown => Err(KernelError::RecoveryUnavailable(
-                "authority handoff outcome is unknown and requires reconciliation".to_owned(),
-            )),
+            AuthorityHandoffState::Unknown => {
+                observe_entrypoint_with_detail(
+                    EntrypointStage::Composition,
+                    "kernel.composition.handoff_unknown_reconcile",
+                );
+                Err(KernelError::RecoveryUnavailable(
+                    "authority handoff outcome is unknown and requires reconciliation".to_owned(),
+                ))
+            }
         }
     }
 
@@ -262,6 +432,8 @@ impl KernelComposition {
         ors: &RedbRecoveryStore,
         handoff: &AuthorityHandoffRecord,
     ) -> Result<(), AuthorityPreparationError> {
+        // F-LOG-KERNEL-2 (#899): handoff-commit phases only; ORS stays the
+        // single owner of the terminal Consumed record.
         let now = i64::try_from(unix_ms()).unwrap_or(i64::MAX);
         let consumed = AuthorityHandoffRecord {
             state: AuthorityHandoffState::Consumed,
@@ -269,6 +441,10 @@ impl KernelComposition {
             ..handoff.clone()
         };
         if ors.persist_authority_handoff(&consumed).is_ok() {
+            observe_entrypoint_with_detail(
+                EntrypointStage::Composition,
+                "kernel.composition.handoff_consumed",
+            );
             return Ok(());
         }
         let observed = ors
@@ -278,11 +454,23 @@ impl KernelComposition {
         if observed.state == AuthorityHandoffState::Consumed
             && Self::same_authority_handoff_identity(&observed, &consumed)
         {
+            observe_entrypoint_with_detail(
+                EntrypointStage::Composition,
+                "kernel.composition.handoff_consumed_replay",
+            );
             return Ok(());
         }
         if observed.state == AuthorityHandoffState::Unknown {
+            observe_entrypoint_with_detail(
+                EntrypointStage::Composition,
+                "kernel.composition.handoff_unknown_replay",
+            );
             return Err(AuthorityPreparationError::Replay);
         }
+        observe_entrypoint_with_detail(
+            EntrypointStage::Composition,
+            "kernel.composition.handoff_persistence_unknown",
+        );
         Err(AuthorityPreparationError::PersistenceUnknown)
     }
 
@@ -331,6 +519,10 @@ impl KernelComposition {
         )
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "descriptor-preparation phases keep exact freshness/credential/replay checks in one audited gateway"
+    )]
     fn prepare_authority_descriptor_material(
         platform: &WindowsPlatform,
         ors: &RedbRecoveryStore,
@@ -338,44 +530,53 @@ impl KernelComposition {
         expected_sha256: &str,
         contour: AuthorityDescriptorContour,
     ) -> Result<PreparedAuthorityMaterial, AuthorityPreparationError> {
+        // F-LOG-KERNEL-2 (#899): descriptor-preparation phases only; no
+        // descriptor/credential/path/digest material is emitted.
+        let reject = |error: AuthorityPreparationError| {
+            observe_entrypoint_with_detail(
+                EntrypointStage::Composition,
+                authority_preparation_phase(&error),
+            );
+            error
+        };
         if !is_lower_sha256(expected_sha256) {
-            return Err(AuthorityPreparationError::DigestMismatch);
+            return Err(reject(AuthorityPreparationError::DigestMismatch));
         }
         let bytes = match contour {
             AuthorityDescriptorContour::PortableCurrentUser { root } => {
                 let root_lease = UserOwnedRootLease::open_existing(&root)
-                    .map_err(|_| AuthorityPreparationError::ProtectedInput)?;
+                    .map_err(|_| reject(AuthorityPreparationError::ProtectedInput))?;
                 let file_lease = UserOwnedPathLease::open_existing(&root_lease, path)
-                    .map_err(|_| AuthorityPreparationError::ProtectedInput)?;
+                    .map_err(|_| reject(AuthorityPreparationError::ProtectedInput))?;
                 file_lease
                     .verify_stable_identity()
                     .and_then(|()| file_lease.verify_path_identity())
-                    .map_err(|_| AuthorityPreparationError::ProtectedInput)?;
+                    .map_err(|_| reject(AuthorityPreparationError::ProtectedInput))?;
                 file_lease
                     .read_bounded(1024 * 1024)
-                    .map_err(|_| AuthorityPreparationError::ProtectedInput)?
+                    .map_err(|_| reject(AuthorityPreparationError::ProtectedInput))?
             }
             AuthorityDescriptorContour::ProgramData => {
                 let file_lease = ProtectedPathLease::open_existing_absolute(path)
-                    .map_err(|_| AuthorityPreparationError::ProtectedInput)?;
+                    .map_err(|_| reject(AuthorityPreparationError::ProtectedInput))?;
                 file_lease
                     .verify_stable_identity()
                     .and_then(|()| file_lease.verify_path_identity())
-                    .map_err(|_| AuthorityPreparationError::ProtectedInput)?;
+                    .map_err(|_| reject(AuthorityPreparationError::ProtectedInput))?;
                 file_lease
                     .read_bounded(1024 * 1024)
-                    .map_err(|_| AuthorityPreparationError::ProtectedInput)?
+                    .map_err(|_| reject(AuthorityPreparationError::ProtectedInput))?
             }
         };
         if sha256_hex(&bytes) != expected_sha256 {
-            return Err(AuthorityPreparationError::DigestMismatch);
+            return Err(reject(AuthorityPreparationError::DigestMismatch));
         }
         let descriptor: ProcessAuthorityHandoffDescriptor = serde_json::from_slice(&bytes)
-            .map_err(|_| AuthorityPreparationError::DescriptorInvalid)?;
+            .map_err(|_| reject(AuthorityPreparationError::DescriptorInvalid))?;
         descriptor
             .validate_structure()
-            .map_err(|_| AuthorityPreparationError::DescriptorInvalid)?;
-        let candidate = Self::authority_handoff_candidate(&descriptor)?;
+            .map_err(|_| reject(AuthorityPreparationError::DescriptorInvalid))?;
+        let candidate = Self::authority_handoff_candidate(&descriptor).map_err(&reject)?;
 
         // Inspect the immutable handoff identity before touching Credential
         // Manager. An exact existing handoff is replay evidence and may be
@@ -383,43 +584,65 @@ impl KernelComposition {
         // required to be fresh before the credential boundary is crossed.
         let existing = ors
             .load_authority_handoff(&candidate.handoff_id)
-            .map_err(|_| AuthorityPreparationError::PersistenceUnknown)?;
+            .map_err(|_| reject(AuthorityPreparationError::PersistenceUnknown))?;
         if let Some(existing) = &existing {
             if !Self::same_authority_handoff_identity(existing, &candidate) {
-                return Err(AuthorityPreparationError::Replay);
+                return Err(reject(AuthorityPreparationError::Replay));
             }
+            observe_entrypoint_with_detail(
+                EntrypointStage::Composition,
+                "kernel.composition.authority_handoff_replay",
+            );
         } else {
             let now = i64::try_from(unix_ms()).unwrap_or(i64::MAX);
             if !Self::authority_descriptor_is_fresh(&descriptor, now) {
-                return Err(AuthorityPreparationError::DescriptorNotFresh);
+                return Err(reject(AuthorityPreparationError::DescriptorNotFresh));
             }
         }
 
         let secret = platform
             .read_credential(descriptor.dispatch_key.key.as_str())
-            .map_err(|_| AuthorityPreparationError::CredentialUnavailable)?;
+            .map_err(|_| reject(AuthorityPreparationError::CredentialUnavailable))?;
         if secret.expose().len() != 32 || secret.expose().iter().all(|byte| *byte == 0) {
-            return Err(AuthorityPreparationError::CredentialInvalid);
+            return Err(reject(AuthorityPreparationError::CredentialInvalid));
         }
         let mut key_bytes = [0_u8; 32];
         key_bytes.copy_from_slice(secret.expose());
         let key = KernelDispatchKey::from_secret_bytes(key_bytes)
-            .map_err(|_| AuthorityPreparationError::CredentialInvalid)?;
+            .map_err(|_| reject(AuthorityPreparationError::CredentialInvalid))?;
 
         let outcome = match ors.begin_authority_handoff_fresh(&candidate) {
             Ok(outcome) => outcome,
             Err(OrsError::AuthorityHandoffNotFresh) => {
-                return Err(AuthorityPreparationError::DescriptorNotFresh);
+                return Err(reject(AuthorityPreparationError::DescriptorNotFresh));
             }
-            Err(_) => return Err(AuthorityPreparationError::PersistenceUnknown),
+            Err(_) => return Err(reject(AuthorityPreparationError::PersistenceUnknown)),
         };
         let handoff = match outcome {
-            AuthorityHandoffBegin::Acquired => candidate,
+            AuthorityHandoffBegin::Acquired => {
+                observe_entrypoint_with_detail(
+                    EntrypointStage::Composition,
+                    "kernel.composition.authority_handoff_acquired",
+                );
+                candidate
+            }
             AuthorityHandoffBegin::Existing(existing) => match existing.state {
-                AuthorityHandoffState::Reserved | AuthorityHandoffState::Consumed => existing,
-                AuthorityHandoffState::Unknown => return Err(AuthorityPreparationError::Replay),
+                AuthorityHandoffState::Reserved | AuthorityHandoffState::Consumed => {
+                    observe_entrypoint_with_detail(
+                        EntrypointStage::Composition,
+                        "kernel.composition.authority_handoff_existing",
+                    );
+                    existing
+                }
+                AuthorityHandoffState::Unknown => {
+                    return Err(reject(AuthorityPreparationError::Replay));
+                }
             },
         };
+        observe_entrypoint_with_detail(
+            EntrypointStage::Composition,
+            "kernel.composition.authority_descriptor_prepared",
+        );
         Ok(PreparedAuthorityMaterial {
             descriptor,
             key,
@@ -441,7 +664,7 @@ impl KernelComposition {
             snapshot_record_id: descriptor.snapshot_binding.record_id.clone(),
             snapshot_binding_digest: sha256_json(&descriptor.snapshot_binding)
                 .map_err(|_| AuthorityPreparationError::DescriptorInvalid)?,
-            authority_epoch: descriptor.state_fence.authority_epoch.value(),
+            authority_epoch: descriptor.state_fence.authority_epoch.sequence.get(),
             generation: descriptor.generation.value(),
             state_fence_digest: sha256_json(&descriptor.state_fence)
                 .map_err(|_| AuthorityPreparationError::DescriptorInvalid)?,
@@ -484,15 +707,36 @@ impl KernelComposition {
         process_gateway: Option<Arc<ProcessExecutionGateway>>,
         platform: Arc<WindowsPlatform>,
     ) -> Result<Self, KernelBuildError> {
+        // F-LOG-KERNEL-2 (#899): assembly phases only; the public
+        // constructors own the single terminal per failed build. Only fixed
+        // phase labels plus numeric epoch/generation are emitted, never raw
+        // roots/pipes/digests/descriptors/credentials.
+        observe_entrypoint_with_detail(
+            EntrypointStage::Composition,
+            "kernel.composition.assemble_started",
+        );
         let work_root = config.work_root.clone();
         let store_bootstrap = config.store_bootstrap.clone();
         let daemon_launch = config.daemon_launch.clone();
         let kernel_artifact_sha256 = config.kernel_artifact_sha256.clone();
         let eliotd_descriptor_artifact_sha256 = config.eliotd_descriptor_artifact_sha256.clone();
+        let doctor_artifact_sha256 = config.doctor_artifact_sha256.clone();
+        let testd_artifact_sha256 = config.testd_artifact_sha256.clone();
+        let native_worker_artifact_sha256 = config.native_worker_artifact_sha256.clone();
         let eliotd_receipt_binding = config.eliotd_receipt_binding.clone();
         if let Some(binding) = &eliotd_receipt_binding {
-            binding.validate().map_err(KernelBuildError::Service)?;
+            binding.validate().map_err(|error| {
+                observe_entrypoint_with_detail(
+                    EntrypointStage::Composition,
+                    "kernel.composition.dependencies_rejected",
+                );
+                KernelBuildError::Service(error)
+            })?;
         }
+        observe_entrypoint_with_detail(
+            EntrypointStage::Composition,
+            "kernel.composition.dependencies_validated",
+        );
         #[cfg(windows)]
         let agent_bridge_admission = config.agent_bridge_admission.clone();
         #[cfg(windows)]
@@ -541,6 +785,19 @@ impl KernelComposition {
                 "eliotd descriptor artifact digest must be lowercase SHA-256".to_owned(),
             ));
         }
+        for (digest, label) in [
+            (&doctor_artifact_sha256, "Doctor"),
+            (&testd_artifact_sha256, "Testd"),
+            (&native_worker_artifact_sha256, "native worker"),
+        ] {
+            if let Some(digest) = digest
+                && !is_lower_sha256(digest)
+            {
+                return Err(KernelBuildError::Service(format!(
+                    "{label} artifact digest must be lowercase SHA-256"
+                )));
+            }
+        }
         if daemon_launch.is_some() && kernel_artifact_sha256.is_none() {
             return Err(KernelBuildError::Service(
                 "integrated eliotd launch requires an independent Kernel artifact digest"
@@ -569,15 +826,34 @@ impl KernelComposition {
         // exact Host-approved bootstrap fence. Falling back to genesis is
         // reserved for the explicitly standalone composition, where no Store
         // authority has been injected.
-        let (authority_epoch, generation) = store_bootstrap.as_ref().map_or(
-            (AuthorityEpoch::genesis(), ResourceGeneration::genesis()),
-            |requirement| {
+        //
+        // Lineage-aware split (Implements #64): the scalar `GenerationRouter`
+        // residual keeps the exact sequence projection, while canonical
+        // `StateFence`/`KernelService` fencing uses the full `EpochId` tuple.
+        // Cross-lineage same-sequence routes never authorize through the
+        // canonical gate.
+        let (authority_epoch, canonical_epoch, generation) = match store_bootstrap.as_ref() {
+            None => (
+                AuthorityEpoch::genesis(),
+                eliot_contracts::EpochId::new(
+                    eliot_contracts::EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                        .map_err(|error| KernelBuildError::Service(error.to_string()))?,
+                    std::num::NonZeroU64::MIN,
+                )
+                .map_err(|error| KernelBuildError::Service(error.to_string()))?,
+                ResourceGeneration::genesis(),
+            ),
+            Some(requirement) => {
+                let canonical = requirement.state_fence.authority_epoch.clone();
+                let scalar = AuthorityEpoch::new(canonical.sequence.get())
+                    .map_err(|error| KernelBuildError::Service(error.to_string()))?;
                 (
-                    requirement.state_fence.authority_epoch,
+                    scalar,
+                    canonical,
                     requirement.state_fence.resource_generation,
                 )
-            },
-        );
+            }
+        };
         let mut generations = GenerationRouter::at_epoch(authority_epoch)
             .map_err(|error| KernelBuildError::Core(error.to_string()))?;
         generations
@@ -605,6 +881,25 @@ impl KernelComposition {
                 .map_err(|error| KernelBuildError::Core(error.to_string()))?,
             )
             .map_err(|error| KernelBuildError::Core(error.to_string()))?;
+        // F-LOG-KERNEL-2 (#899): exact route/generation observation. Only the
+        // fixed route names plus numeric epoch/generation are emitted, never
+        // raw bootstrap/launch/descriptor material.
+        observe_entrypoint_with_detail(
+            EntrypointStage::Composition,
+            &format!(
+                "kernel.composition.route_registered:daemon:epoch={}:generation={}",
+                authority_epoch.value(),
+                generation.value()
+            ),
+        );
+        observe_entrypoint_with_detail(
+            EntrypointStage::StoreBootstrap,
+            &format!(
+                "kernel.composition.route_registered:store_bridge:epoch={}:generation={}",
+                authority_epoch.value(),
+                generation.value()
+            ),
+        );
         let service = KernelService::new(dispatch_key(&work_root), 4, 128)
             .map_err(|error| KernelBuildError::Service(error.to_string()))?;
         let module_id =
@@ -622,7 +917,7 @@ impl KernelComposition {
             artifact_id,
             state: ModuleGenerationState::Starting,
             health: HealthVector::healthy(),
-            state_fence: StateFence::new(authority_epoch, generation),
+            state_fence: StateFence::new(canonical_epoch.clone(), generation),
         };
         #[cfg(windows)]
         let session_principal_binding = observed_session_principal_binding()?;
@@ -680,24 +975,60 @@ impl KernelComposition {
         let generation_gateway = OrsGenerationCoordinator::new(ors.clone());
         let mut service = service;
         service
-            .synchronize_authority_epoch(authority_epoch)
+            .synchronize_authority_epoch(canonical_epoch)
             .map_err(|error| KernelBuildError::Service(error.to_string()))?;
         let mut policy = front_door_policy;
         generation_gateway
             .recover(&mut generations, &mut service, &mut policy)
-            .map_err(KernelBuildError::Ors)?;
+            .map_err(|error| {
+                observe_entrypoint_with_detail(
+                    EntrypointStage::Composition,
+                    "kernel.composition.generation_recovery_rejected",
+                );
+                KernelBuildError::Ors(error)
+            })?;
+        observe_entrypoint_with_detail(
+            EntrypointStage::Composition,
+            "kernel.composition.generation_recovered",
+        );
         #[cfg(windows)]
         let store_handoff_init = {
             let store_bootstrap_for_recovery = store_bootstrap.clone();
-            Self::recover_store_rebind_state(
+            let recovered = Self::recover_store_rebind_state(
                 &ors,
                 &mut service,
                 store_bootstrap_for_recovery.as_ref(),
             )
-            .map_err(KernelBuildError::Ors)?
+            .map_err(|error| {
+                observe_entrypoint_with_detail(
+                    EntrypointStage::StoreBootstrap,
+                    "kernel.composition.store_rebind_recovery_rejected",
+                );
+                KernelBuildError::Ors(error)
+            })?;
+            if recovered.is_some() {
+                observe_entrypoint_with_detail(
+                    EntrypointStage::StoreBootstrap,
+                    "kernel.composition.store_rebind_recovered",
+                );
+            } else {
+                observe_entrypoint_with_detail(
+                    EntrypointStage::StoreBootstrap,
+                    "kernel.composition.store_rebind_absent",
+                );
+            }
+            recovered
         };
         #[cfg(not(windows))]
         let store_handoff_init = None;
+        // F-LOG-KERNEL-2 (#899): constructed composition is not ready. The
+        // service starts Cold, the daemon is NotLaunched, and no Store
+        // gateway is claimed; readiness requires separate Host handoffs.
+        observe_entrypoint_with_detail(
+            EntrypointStage::Composition,
+            "kernel.composition.constructed_not_ready",
+        );
+        observe_entrypoint(EntrypointStage::Composition);
         Ok(Self {
             store_rebind_boundary: KernelStoreRebindProductionBoundary,
             work_root,
@@ -754,6 +1085,26 @@ impl KernelComposition {
             agent_activation_pending: Mutex::new(AgentActivationPendingState::default()),
             #[cfg(windows)]
             agent_activation_changed: tokio::sync::Notify::new(),
+            #[cfg(windows)]
+            agent_activation_results: Mutex::new(BTreeMap::new()),
+            #[cfg(windows)]
+            host_request_connection_index: Mutex::new(BTreeMap::new()),
+            #[cfg(windows)]
+            local_read_claim_boot_nonce: {
+                use std::collections::hash_map::DefaultHasher;
+                use std::hash::{Hash, Hasher};
+                // Boot-unique, not cryptographic: process identity plus wall
+                // time plus a stack address distinguish every composition
+                // incarnation, so attempt IDs never repeat across restarts.
+                let stack_anchor = 0u8;
+                let mut hasher = DefaultHasher::new();
+                std::process::id().hash(&mut hasher);
+                super::unix_ms().hash(&mut hasher);
+                std::ptr::from_ref(&stack_anchor).hash(&mut hasher);
+                let nonce = hasher.finish();
+                // Zero is reserved as "no boot nonce"; remap without biasing.
+                if nonce == 0 { 1 } else { nonce }
+            },
         })
     }
 }

@@ -3,8 +3,8 @@ use eliot_types::{
     AuthorityHeader, CausalityHeader, EliotExchangeEnvelope, EliotLogEvent, ExchangeKind,
     ExchangeParty, LogEventKind, LogLevel, ModuleCapability, ModuleEndpoint, ModuleHealth,
     ModuleKind, ModuleManifest, ModuleRegistryReport, ModuleResourceLimits, ModuleTransport,
-    RedactionInfo, RuntimeHealthReport, RuntimeLogReport, RuntimeMode, RuntimeStatusReport,
-    SchemaRef, ServiceHealthState, ServiceRuntimeStatus, TaintClass,
+    RedactionInfo, RuntimeHealthReport, RuntimeLogReport, RuntimeMode, SchemaRef,
+    ServiceHealthState, ServiceRuntimeStatus, TaintClass,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -122,26 +122,6 @@ impl ServiceSupervisor {
     pub fn shutdown_order(&self) -> &[String] {
         &self.shutdown_order
     }
-
-    pub fn status_report(
-        &self,
-        mode: RuntimeMode,
-        data_root: &Path,
-        single_instance_owned: bool,
-        ipc_enabled: bool,
-    ) -> RuntimeStatusReport {
-        RuntimeStatusReport {
-            component: "runtime_status".to_owned(),
-            mode,
-            pid: std::process::id(),
-            data_root: data_root.display().to_string(),
-            active_profile: mode_name(mode).to_owned(),
-            single_instance_owned,
-            ipc_enabled,
-            services: self.service_statuses(),
-            generated_at: OffsetDateTime::now_utc(),
-        }
-    }
 }
 
 pub struct StaticRuntimeService {
@@ -227,23 +207,18 @@ impl LifecycleService {
         let runtime_dir = self.data_root.join("runtime");
         std::fs::create_dir_all(&runtime_dir)?;
         let lock_path = runtime_dir.join("daemon.lock");
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&lock_path)
-            .map_err(|error| {
-                if error.kind() == std::io::ErrorKind::AlreadyExists {
-                    EngineError::ServiceNotReady {
-                        service: "lifecycle".to_owned(),
-                        reason: format!(
-                            "single-instance lock already exists: {}",
-                            lock_path.display()
-                        ),
-                    }
+        let mut file = match create_single_instance_lock_file(&lock_path) {
+            Ok(file) => file,
+            Err(error) => {
+                if is_single_instance_lock_collision(&error)
+                    && recover_stale_single_instance_lock(&self.data_root)
+                {
+                    create_single_instance_lock_file(&lock_path).map_err(|_| error)?
                 } else {
-                    EngineError::Io(error)
+                    return Err(error);
                 }
-            })?;
+            }
+        };
         let owner_pid = std::process::id().to_string();
         file.write_all(owner_pid.as_bytes())?;
         file.sync_all()?;
@@ -273,6 +248,113 @@ impl LifecycleService {
             "data_root": self.data_root,
         }))
     }
+}
+
+/// Attempts to recover a provably-dead single-instance owner.
+///
+/// `runtime_root` is the data root whose `runtime/` subdirectory holds
+/// `daemon.lock`, `daemon.pid`, `startup.marker`, and
+/// `clean-shutdown.marker`.
+///
+/// Returns `true` only when a stale `daemon.lock` (plus its `daemon.pid`)
+/// was removed because the recorded owner PID is provably dead and the
+/// marker pair reports an unclean prior owner (`startup.marker` present
+/// without `clean-shutdown.marker`, mirroring
+/// `StartupRecoveryService::scan`). Returns `false` — removing nothing —
+/// when no lock file exists, the owner PID is alive, the shutdown was
+/// clean, the recorded PID is missing or unparseable, the liveness probe
+/// errors, or the lock changed under observation.
+pub fn recover_stale_single_instance_lock(runtime_root: &Path) -> bool {
+    let runtime_dir = runtime_root.join("runtime");
+    let lock_path = runtime_dir.join("daemon.lock");
+    let Ok(lock_snapshot) = std::fs::read(&lock_path) else {
+        return false;
+    };
+    let unclean_prior_owner = runtime_dir.join("startup.marker").is_file()
+        && !runtime_dir.join("clean-shutdown.marker").exists();
+    if !unclean_prior_owner {
+        return false;
+    }
+    let pid_path = runtime_dir.join("daemon.pid");
+    let pid_snapshot = std::fs::read(&pid_path).ok();
+    let Some(owner_pid) = parse_single_instance_owner_pid(pid_snapshot.as_deref())
+        .or_else(|| parse_single_instance_owner_pid(Some(lock_snapshot.as_slice())))
+    else {
+        return false;
+    };
+    if single_instance_owner_is_alive(owner_pid) != Some(false) {
+        return false;
+    }
+    if std::fs::read(&lock_path).ok().as_deref() != Some(lock_snapshot.as_slice()) {
+        return false;
+    }
+    match &pid_snapshot {
+        Some(snapshot) if std::fs::read(&pid_path).ok().as_deref() == Some(snapshot.as_slice()) => {
+        }
+        Some(_) => return false,
+        None if pid_path.exists() => return false,
+        None => {}
+    }
+    if single_instance_owner_is_alive(owner_pid) != Some(false) {
+        return false;
+    }
+    if std::fs::remove_file(&lock_path).is_err() {
+        return false;
+    }
+    if std::fs::read(&pid_path).ok().as_deref() == pid_snapshot.as_deref() {
+        match std::fs::remove_file(&pid_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
+fn create_single_instance_lock_file(lock_path: &Path) -> Result<File, EngineError> {
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(lock_path)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                EngineError::ServiceNotReady {
+                    service: "lifecycle".to_owned(),
+                    reason: format!(
+                        "single-instance lock already exists: {}",
+                        lock_path.display()
+                    ),
+                }
+            } else {
+                EngineError::Io(error)
+            }
+        })
+}
+
+fn is_single_instance_lock_collision(error: &EngineError) -> bool {
+    matches!(
+        error,
+        EngineError::ServiceNotReady { service, .. } if service == "lifecycle"
+    )
+}
+
+fn parse_single_instance_owner_pid(bytes: Option<&[u8]>) -> Option<u32> {
+    let text = std::str::from_utf8(bytes?).ok()?;
+    let pid: u32 = text.trim().parse().ok()?;
+    if pid == 0 {
+        return None;
+    }
+    Some(pid)
+}
+
+#[cfg(windows)]
+fn single_instance_owner_is_alive(pid: u32) -> Option<bool> {
+    eliot_windows_ipc::process_is_alive(pid).ok()
+}
+
+#[cfg(not(windows))]
+fn single_instance_owner_is_alive(_pid: u32) -> Option<bool> {
+    None
 }
 
 pub struct RuntimeLock {
@@ -807,16 +889,6 @@ fn module_rejected(reason: &str) -> EngineError {
     EngineError::ServiceNotReady {
         service: "module_registry".to_owned(),
         reason: reason.to_owned(),
-    }
-}
-
-fn mode_name(mode: RuntimeMode) -> &'static str {
-    match mode {
-        RuntimeMode::DevSingleProcess => "dev-single-process",
-        RuntimeMode::Daemon => "daemon",
-        RuntimeMode::StdioShim => "stdio-shim",
-        RuntimeMode::HookCommand => "hook-command",
-        RuntimeMode::AdminCli => "admin-cli",
     }
 }
 

@@ -3,7 +3,7 @@
 use eliot_agent_contracts::AgentAttemptId;
 use eliot_context_contracts::*;
 use eliot_contracts::{
-    ArtifactId, AuthorityEpoch, DecisionId, ResourceGeneration, StateFence, TaskId,
+    ArtifactId, DecisionId, EpochId, EpochLineageId, ResourceGeneration, StateFence, TaskId,
 };
 use eliot_evidence::{Assertability, EpistemicStatus};
 use eliot_receipts::{ProofCeiling, WorkScopeId};
@@ -16,13 +16,21 @@ fn digest() -> String {
     "a".repeat(64)
 }
 
+fn test_epoch() -> EpochId {
+    EpochId::new(
+        EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("lineage"),
+        std::num::NonZeroU64::new(1).expect("sequence"),
+    )
+    .expect("epoch")
+}
+
 fn binding() -> ContextBinding {
     ContextBinding {
         task_id: TaskId::new("task").expect("fixture task"),
         attempt_id: AgentAttemptId::new("attempt").expect("fixture attempt"),
         scope_id: WorkScopeId::new("scope").expect("fixture scope"),
         state_fence: StateFence::new(
-            AuthorityEpoch::new(1).expect("fixture epoch"),
+            test_epoch(),
             ResourceGeneration::new(1).expect("fixture generation"),
         ),
         decision_id: DecisionId::new("decision").expect("fixture decision"),
@@ -210,6 +218,7 @@ fn admitted_set(candidate: ContextCandidate) -> AdmittedContextSet {
             remaining_headroom: 99_989,
             route_capacity: 100_000,
         },
+        recipe_digest: digest(),
         receipt_digest: digest(),
     };
     let mut admitted = AdmittedContextSet {
@@ -243,16 +252,204 @@ fn admitted_set(candidate: ContextCandidate) -> AdmittedContextSet {
         floor,
         economy,
     };
+    {
+        let mut unsigned = admitted.economy.clone();
+        unsigned.receipt_digest = "0".repeat(64);
+        admitted.economy.receipt_digest =
+            canonical_digest(&unsigned).expect("intermediate economy receipt");
+    }
     let payload_bytes = admitted
         .canonical_payload_utf8_bytes()
         .expect("valid admitted payload");
     admitted.economy.allocations.admitted_required = payload_bytes;
     admitted.economy.allocations.admitted_optional = 0;
     admitted.economy.allocations.remaining_headroom = 100_000 - 2 - 3 - 4 - payload_bytes;
+    {
+        let mut unsigned = admitted.economy.clone();
+        unsigned.receipt_digest = "0".repeat(64);
+        admitted.economy.receipt_digest =
+            canonical_digest(&unsigned).expect("pre-measurement economy receipt");
+    }
     admitted.economy.measurement.digest = admitted
         .canonical_payload_digest()
         .expect("valid admitted payload digest");
+    {
+        let mut unsigned = admitted.economy.clone();
+        unsigned.receipt_digest = "0".repeat(64);
+        admitted.economy.receipt_digest =
+            canonical_digest(&unsigned).expect("final economy receipt");
+    }
     admitted
+}
+
+#[test]
+fn loss_policy_wire_names_are_closed_over_all_four_variants() {
+    #[derive(serde::Deserialize)]
+    struct LossPolicyHolder {
+        policy: LossPolicy,
+    }
+    let expected = [
+        (LossPolicy::NonDroppable, "NON_DROPPABLE"),
+        (LossPolicy::HandleOnly, "HANDLE_ONLY"),
+        (LossPolicy::Extractive, "EXTRACTIVE"),
+        (LossPolicy::Summarizable, "SUMMARIZABLE"),
+    ];
+    for (policy, wire) in expected {
+        let encoded = serde_json::to_string(&policy).expect("wire encoding");
+        assert_eq!(encoded, format!("\"{wire}\""));
+        assert_eq!(
+            serde_json::from_str::<LossPolicy>(&encoded).expect("wire round-trip"),
+            policy
+        );
+    }
+    assert!(serde_json::from_str::<LossPolicy>("\"OTHER\"").is_err());
+
+    let holder: LossPolicyHolder =
+        serde_json::from_str(r#"{"policy":"HANDLE_ONLY"}"#).expect("present field");
+    assert_eq!(holder.policy, LossPolicy::HandleOnly);
+    assert!(serde_json::from_str::<LossPolicyHolder>(r"{}").is_err());
+}
+
+#[test]
+fn decision_context_incomplete_wire_code_is_exact() {
+    let encoded =
+        serde_json::to_string(&ContextErrorCode::DecisionContextIncomplete).expect("wire encoding");
+    assert_eq!(encoded, "\"DECISION_CONTEXT_INCOMPLETE\"");
+    assert_eq!(
+        serde_json::from_str::<ContextErrorCode>(&encoded).expect("wire round-trip"),
+        ContextErrorCode::DecisionContextIncomplete
+    );
+    assert!(serde_json::from_str::<ContextErrorCode>("\"OTHER\"").is_err());
+
+    let mut incomplete = DecisionContextIncomplete::new(id("floor-rule"));
+    incomplete.missing.push(id("atom"));
+    incomplete
+        .validate()
+        .expect("explicit gap is incomplete, not failure");
+    let mut wrong_code = incomplete.clone();
+    wrong_code.code = ContextErrorCode::InvalidIdentity;
+    assert_eq!(
+        wrong_code.validate(),
+        Err(ContextError::InvalidField("incomplete.code"))
+    );
+}
+
+#[test]
+fn quality_dimension_wire_spellings_are_closed_over_all_twelve() {
+    let expected = [
+        (
+            QualityDimension::AcceptanceDecisionCoverage,
+            "ACCEPTANCE_DECISION_COVERAGE",
+        ),
+        (
+            QualityDimension::CausalOperationalSufficiency,
+            "CAUSAL_OPERATIONAL_SUFFICIENCY",
+        ),
+        (
+            QualityDimension::ExactAnchorProvenanceCoverage,
+            "EXACT_ANCHOR_PROVENANCE_COVERAGE",
+        ),
+        (
+            QualityDimension::FreshnessStateFenceCoherence,
+            "FRESHNESS_STATE_FENCE_COHERENCE",
+        ),
+        (
+            QualityDimension::RivalsConflictsUnknownsVisibility,
+            "RIVALS_CONFLICTS_UNKNOWNS_VISIBILITY",
+        ),
+        (
+            QualityDimension::NegativeMemoryInvariantCoverage,
+            "NEGATIVE_MEMORY_INVARIANT_COVERAGE",
+        ),
+        (
+            QualityDimension::VerifierActionReadiness,
+            "VERIFIER_ACTION_READINESS",
+        ),
+        (
+            QualityDimension::RouteAccessibilityLayoutRisk,
+            "ROUTE_ACCESSIBILITY_LAYOUT_RISK",
+        ),
+        (
+            QualityDimension::InstructionSufficiency,
+            "INSTRUCTION_SUFFICIENCY",
+        ),
+        (
+            QualityDimension::PayloadHandleReconstructionCost,
+            "PAYLOAD_HANDLE_RECONSTRUCTION_COST",
+        ),
+        (
+            QualityDimension::KnownOmissionsExpansionPaths,
+            "KNOWN_OMISSIONS_EXPANSION_PATHS",
+        ),
+        (
+            QualityDimension::TelemetryMeasurementCostCoverage,
+            "TELEMETRY_MEASUREMENT_COST_COVERAGE",
+        ),
+    ];
+    for (dimension, wire) in expected {
+        let encoded = serde_json::to_string(&dimension).expect("wire encoding");
+        assert_eq!(encoded, format!("\"{wire}\""));
+        assert_eq!(
+            serde_json::from_str::<QualityDimension>(&encoded).expect("wire round-trip"),
+            dimension
+        );
+    }
+    assert!(serde_json::from_str::<QualityDimension>("\"SCALAR_SCORE\"").is_err());
+    assert!(serde_json::from_str::<QualityDimension>("\"OTHER\"").is_err());
+}
+
+#[test]
+fn selection_integrity_proof_rejects_duplicates_and_membership_mismatch() {
+    let proof = SelectionIntegrityProof {
+        binding: binding(),
+        admitted_ids: vec![id("atom-a")],
+        rendered_ids: vec![id("atom-a")],
+        omission_evidence: Vec::new(),
+        output_digest: digest(),
+    };
+    proof.validate().expect("exact membership proves integrity");
+
+    let mut duplicated_admitted = proof.clone();
+    duplicated_admitted.admitted_ids.push(id("atom-a"));
+    assert_eq!(
+        duplicated_admitted.validate(),
+        Err(ContextError::SelectionIntegrityMismatch)
+    );
+
+    let mut duplicated_rendered = proof.clone();
+    duplicated_rendered.rendered_ids.push(id("atom-a"));
+    assert_eq!(
+        duplicated_rendered.validate(),
+        Err(ContextError::SelectionIntegrityMismatch)
+    );
+
+    let mut mismatched = proof.clone();
+    mismatched.rendered_ids = vec![id("atom-b")];
+    assert_eq!(
+        mismatched.validate(),
+        Err(ContextError::SelectionIntegrityMismatch)
+    );
+}
+
+#[test]
+fn digests_reject_uppercase_and_short_forms() {
+    measurement_ref()
+        .validate()
+        .expect("lowercase hex digest is valid");
+
+    let mut uppercase = measurement_ref();
+    uppercase.digest = "A".repeat(64);
+    assert_eq!(
+        uppercase.validate(),
+        Err(ContextError::InvalidDigest("measurement.digest"))
+    );
+
+    let mut short = measurement_ref();
+    short.digest = "abc123".to_owned();
+    assert_eq!(
+        short.validate(),
+        Err(ContextError::InvalidDigest("measurement.digest"))
+    );
 }
 
 #[test]
@@ -416,6 +613,7 @@ fn economy_requires_exact_requested_admitted_displaced_conservation() {
             remaining_headroom: 9,
             route_capacity: 10,
         },
+        recipe_digest: digest(),
         receipt_digest: digest(),
     };
     receipt
@@ -595,4 +793,38 @@ fn admitted_view_preserves_protected_fields_and_rejects_injected_content() {
         view.validate_against(&admitted),
         Err(ContextError::SelectionIntegrityMismatch)
     );
+}
+
+#[test]
+fn blocked_and_unavailable_denominators_require_named_evidence() {
+    denominator(AtomAvailability::PresentCurrent)
+        .validate()
+        .expect("present denominator needs no evidence");
+    denominator(AtomAvailability::Missing)
+        .validate()
+        .expect("missing denominator needs no evidence");
+
+    assert_eq!(
+        denominator(AtomAvailability::Blocked).validate(),
+        Err(ContextError::MissingField(
+            "denominator.dispositions.evidence"
+        ))
+    );
+    assert_eq!(
+        denominator(AtomAvailability::Unavailable).validate(),
+        Err(ContextError::MissingField(
+            "denominator.dispositions.evidence"
+        ))
+    );
+
+    for state in [AtomAvailability::Blocked, AtomAvailability::Unavailable] {
+        let mut evidenced = denominator(state);
+        evidenced.dispositions[0].evidence = Some(ProofBinding {
+            evidence_id: id("named-reason"),
+            ceiling: eliot_receipts::ProofCeiling::Observation,
+        });
+        evidenced
+            .validate()
+            .expect("named blocked/unavailable evidence validates");
+    }
 }

@@ -18,6 +18,7 @@ use super::{
     AgentBridgeAdmissionDescriptor, DEFAULT_PIPE_NAME, EliotdLaunchDescriptor,
     EliotdReceiptRootBinding, HostStoreBootstrapRequirement, PathBuf,
 };
+use crate::kernel_diagnostics::{EntrypointStage, observe_entrypoint_with_detail};
 
 /// Explicit construction input for the Kernel process.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -39,6 +40,19 @@ pub struct KernelConfig {
     /// Digest of the exact retained eliotd descriptor file bytes supplied by
     /// Host. This is distinct from the descriptor's internal unsigned digest.
     pub eliotd_descriptor_artifact_sha256: Option<String>,
+    /// Independent digest of the approved Doctor image injected by Host.
+    /// Missing fails closed once the dispatch contour is required; no
+    /// in-memory or test signer is fabricated by the production composition.
+    pub doctor_artifact_sha256: Option<String>,
+    /// Host-injected absolute Doctor executable path, digest-bound to
+    /// `doctor_artifact_sha256`. Missing fails closed once the doctor role
+    /// is digested; no path is defaulted. Retained for the contour-owned
+    /// trigger call-in; the live image digest is re-proved at spawn.
+    pub doctor_executable_path: Option<PathBuf>,
+    /// Independent digest of the approved Testd image injected by Host.
+    pub testd_artifact_sha256: Option<String>,
+    /// Independent digest of the approved native worker image injected by Host.
+    pub native_worker_artifact_sha256: Option<String>,
     /// Host-owned manifest root where the Kernel must publish the eliotd
     /// receipt. This is intentionally separate from `work_root`: integrated
     /// manifests use distinct Kernel and Host state roots.
@@ -62,6 +76,9 @@ pub struct KernelConfig {
 impl KernelConfig {
     /// Creates the production configuration using the canonical pipe.
     pub fn new(work_root: impl Into<PathBuf>) -> Self {
+        // F-LOG-KERNEL-2 (#899): candidate construction observation only.
+        // No validation, no readiness, no raw work-root/pipe values.
+        observe_entrypoint_with_detail(EntrypointStage::LaunchConfig, "kernel.config.candidate");
         Self {
             work_root: work_root.into(),
             pipe_name: DEFAULT_PIPE_NAME.to_owned(),
@@ -69,6 +86,10 @@ impl KernelConfig {
             daemon_launch: None,
             kernel_artifact_sha256: None,
             eliotd_descriptor_artifact_sha256: None,
+            doctor_artifact_sha256: None,
+            doctor_executable_path: None,
+            testd_artifact_sha256: None,
+            native_worker_artifact_sha256: None,
             eliotd_receipt_binding: None,
             agent_bridge_admission: None,
             #[cfg(windows)]
@@ -81,6 +102,13 @@ impl KernelConfig {
     /// Injects the Host-approved canonical-store bootstrap requirement.
     #[must_use]
     pub fn with_store_bootstrap(mut self, requirement: HostStoreBootstrapRequirement) -> Self {
+        // F-LOG-KERNEL-2 (#899): bootstrap-requirement injection observation.
+        // The requirement itself is retained verbatim; only a fixed phase
+        // label is emitted, never raw pipe/connection/credential material.
+        observe_entrypoint_with_detail(
+            EntrypointStage::StoreBootstrap,
+            "kernel.config.store_bootstrap_injected",
+        );
         self.store_bootstrap = Some(requirement);
         self
     }
@@ -97,6 +125,11 @@ impl KernelConfig {
     /// Injects the exact approved `eliotd` child launch descriptor.
     #[must_use]
     pub fn with_daemon_launch(mut self, launch: EliotdLaunchDescriptor) -> Self {
+        // F-LOG-KERNEL-2 (#899): daemon-launch injection observation only.
+        observe_entrypoint_with_detail(
+            EntrypointStage::Composition,
+            "kernel.config.daemon_launch_injected",
+        );
         self.daemon_launch = Some(launch);
         self
     }
@@ -112,6 +145,35 @@ impl KernelConfig {
     #[must_use]
     pub fn with_eliotd_descriptor_artifact_sha256(mut self, digest: impl Into<String>) -> Self {
         self.eliotd_descriptor_artifact_sha256 = Some(digest.into());
+        self
+    }
+
+    /// Injects the independently approved Doctor executable digest.
+    #[must_use]
+    pub fn with_doctor_artifact_sha256(mut self, digest: impl Into<String>) -> Self {
+        self.doctor_artifact_sha256 = Some(digest.into());
+        self
+    }
+
+    /// Injects the Host-approved absolute Doctor executable path bound to
+    /// the digested doctor role. No default; missing fails closed.
+    #[must_use]
+    pub fn with_doctor_executable_path(mut self, path: PathBuf) -> Self {
+        self.doctor_executable_path = Some(path);
+        self
+    }
+
+    /// Injects the independently approved Testd executable digest.
+    #[must_use]
+    pub fn with_testd_artifact_sha256(mut self, digest: impl Into<String>) -> Self {
+        self.testd_artifact_sha256 = Some(digest.into());
+        self
+    }
+
+    /// Injects the independently approved native worker executable digest.
+    #[must_use]
+    pub fn with_native_worker_artifact_sha256(mut self, digest: impl Into<String>) -> Self {
+        self.native_worker_artifact_sha256 = Some(digest.into());
         self
     }
 
@@ -152,5 +214,46 @@ impl KernelConfig {
     pub fn require_descriptor_supervision_authority(mut self) -> Self {
         self.require_descriptor_supervision_authority = true;
         self
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dispatch_artifact_digests_are_injected_without_defaults() {
+        let config = KernelConfig::new(std::path::PathBuf::from("/tmp/work"));
+        assert!(config.doctor_artifact_sha256.is_none());
+        assert!(config.doctor_executable_path.is_none());
+        assert!(config.testd_artifact_sha256.is_none());
+        assert!(config.native_worker_artifact_sha256.is_none());
+        let doctor_path = std::path::PathBuf::from("/tmp/eliot-doctor.exe");
+        let config = config
+            .with_doctor_artifact_sha256("a".repeat(64))
+            .with_doctor_executable_path(doctor_path.clone())
+            .with_testd_artifact_sha256("b".repeat(64))
+            .with_native_worker_artifact_sha256("c".repeat(64));
+        assert_eq!(
+            config.doctor_artifact_sha256,
+            Some("a".repeat(64)),
+            "doctor digest must be retained exactly"
+        );
+        assert_eq!(
+            config.doctor_executable_path,
+            Some(doctor_path),
+            "digest-bound doctor path must be retained exactly"
+        );
+        assert_eq!(
+            config.testd_artifact_sha256,
+            Some("b".repeat(64)),
+            "testd digest must be retained exactly"
+        );
+        assert_eq!(
+            config.native_worker_artifact_sha256,
+            Some("c".repeat(64)),
+            "native worker digest must be retained exactly"
+        );
     }
 }

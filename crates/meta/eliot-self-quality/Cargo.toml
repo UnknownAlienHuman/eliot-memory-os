@@ -1,0 +1,32 @@
+[package]
+name = "eliot-self-quality"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Bounded candidate-only self-quality diagnosis over a frozen observation snapshot; no planning, authority, or effect."
+
+[lib]
+path = "src/lib.rs"
+
+[package.metadata.eliot]
+prototype = false
+source_status = "IMPLEMENTED"
+workspace_admission = "admitted via #967 (T8-AL1) root workspace membership"
+functional_cell = "meta.self_quality.diagnosis"
+source_layer = "C1"
+runtime_layer = "R7"
+runtime_bundle = "eliotd"
+agent_order = 38
+
+[dependencies]
+eliot-contracts = { path = "../../foundation/eliot-contracts" }
+eliot-conformance-contracts = { path = "../../foundation/eliot-conformance-contracts" }
+serde = { version = "1.0.228", features = ["derive"] }
+thiserror = "2.0.18"
+
+[dev-dependencies]
+serde_json = "1.0.150"
+
+[lints]
+workspace = true

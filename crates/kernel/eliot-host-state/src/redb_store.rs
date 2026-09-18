@@ -1,9 +1,10 @@
 //! Durable redb implementation of the Host-owned operational state port.
 
+use std::num::NonZeroU64;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::{EpochIdentity, EpochTransition, HostInstallationEpoch};
+use crate::{EpochId, EpochLineageId, EpochTransition, HostInstallationEpoch};
 use eliot_platform::{
     HostActivationReceipt, HostActivationTransition, HostBranchKind, HostBranchRecoveryFence,
     HostEpochBinding, HostInstallationState, HostProcessRecoveryBinding, HostRecoveryEvidence,
@@ -661,8 +662,9 @@ fn host_epoch_binding(epoch: &HostInstallationEpoch) -> Result<HostEpochBinding,
         .map_err(|_| HostStateError::InvalidRecord)?;
     let binding = HostEpochBinding {
         installation: epoch.installation.clone(),
-        lineage: epoch.epoch.current.lineage.clone(),
-        sequence: epoch.epoch.current.sequence,
+        lineage: PlatformHandle::new(epoch.epoch.current.lineage_id.as_str())
+            .map_err(|_| HostStateError::InvalidRecord)?,
+        sequence: epoch.epoch.current.sequence.get(),
         nonce: epoch.nonce.clone(),
     };
     binding.validate()?;
@@ -724,24 +726,28 @@ fn next_epoch(
         .map_err(|_| HostStateError::Unavailable)?
         .as_nanos();
     let pid = std::process::id();
-    let (lineage, sequence, parent) = match previous {
+    let (lineage_id, sequence, parent) = match previous {
         Some(previous) => {
-            let sequence = previous
+            let next = previous
                 .epoch
                 .current
                 .sequence
+                .get()
                 .checked_add(1)
                 .ok_or(HostStateError::Unavailable)?;
             (
-                previous.epoch.current.lineage.clone(),
-                sequence,
+                previous.epoch.current.lineage_id.clone(),
+                NonZeroU64::new(next).ok_or(HostStateError::Unavailable)?,
                 Some(previous.epoch.current.clone()),
             )
         }
+        // A fresh install mints a globally distinct lineage. Only this
+        // Host/recovery owner boundary mints lineages; deserializers and
+        // reporters never do.
         None => (
-            PlatformHandle::new(format!("host-lineage-{stamp:x}-{pid:x}"))
+            EpochLineageId::new(uuid::Uuid::new_v4().to_string())
                 .map_err(|_| HostStateError::Unavailable)?,
-            1,
+            NonZeroU64::MIN,
             None,
         ),
     };
@@ -750,7 +756,7 @@ fn next_epoch(
     let epoch = HostInstallationEpoch {
         installation,
         epoch: EpochTransition {
-            current: EpochIdentity { lineage, sequence },
+            current: EpochId::new(lineage_id, sequence).map_err(|_| HostStateError::Unavailable)?,
             parent,
         },
         nonce,
@@ -921,13 +927,10 @@ mod tests {
     fn epoch(installation: &PlatformHandle) -> HostInstallationEpoch {
         HostInstallationEpoch {
             installation: installation.clone(),
-            epoch: EpochTransition {
-                current: EpochIdentity {
-                    lineage: handle("host-test-lineage"),
-                    sequence: 1,
-                },
-                parent: None,
-            },
+            epoch: EpochTransition::genesis(
+                EpochLineageId::new("550e8400-e29b-41d4-a716-446655440010")
+                    .unwrap_or_else(|_| unreachable!()),
+            ),
             nonce: handle("host-test-nonce"),
             recovery: None,
         }

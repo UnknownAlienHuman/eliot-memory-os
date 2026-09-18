@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use eliot_agent_api::RouteFingerprint;
+use eliot_agent_api::{LowercaseSha256, RouteFingerprint};
 use eliot_agent_coordinator::{
     BillingClass, BillingEvidence, HumanModelPreferencePolicy, MODEL_CATALOGUE_SCHEMA_VERSION,
     MODEL_PREFERENCE_SCHEMA_VERSION, MODEL_SELECTION_RECEIPT_VERSION, ModelAvailability,
@@ -9,25 +9,33 @@ use eliot_agent_coordinator::{
     compile_model_selection,
 };
 
+use eliot_contracts::sha256_hex;
+
 const NOW: u64 = 10_000;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 fn route(provider: &str, model: &str, suffix: &str) -> RouteFingerprint {
+    let digest = |seed: &str| {
+        serde_json::from_value::<LowercaseSha256>(serde_json::json!(sha256_hex(
+            format!("preference-fixture-{seed}-{suffix}").as_bytes()
+        )))
+        .expect("valid fixture digest")
+    };
     RouteFingerprint {
         host_family: "opencode".to_owned(),
         adapter: "eliot-agent-opencode".to_owned(),
         protocol_transport: "http+sse".to_owned(),
-        runtime_hash: format!("runtime-{suffix}"),
-        adapter_hash: "adapter-v1".to_owned(),
+        runtime_hash: digest("runtime"),
+        adapter_hash: digest("adapter"),
         provider: provider.to_owned(),
         model: model.to_owned(),
         auth_billing: "account-scope-1".to_owned(),
-        serializer_hash: "serializer-v1".to_owned(),
-        tool_semantics_hash: "tools-v1".to_owned(),
+        serializer_hash: digest("serializer"),
+        tool_semantics_hash: digest("tools"),
         reasoning_mode: "default".to_owned(),
         continuation_behavior: "native-resume".to_owned(),
-        feature_flags_hash: "features-v1".to_owned(),
+        feature_flags_hash: digest("features"),
     }
 }
 

@@ -7,6 +7,15 @@
 //! This module is test-oracle only with no process, authority, Store or daemon ownership and exercises only the Kernel composition boundary via `super::*`.
 
 use super::*;
+use eliot_contracts::{EpochId, EpochLineageId};
+
+fn test_epoch(sequence: u64) -> EpochId {
+    EpochId::new(
+        EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("lineage"),
+        std::num::NonZeroU64::new(sequence).expect("sequence"),
+    )
+    .expect("epoch")
+}
 
 #[derive(Clone)]
 struct GatewayTestPorts {
@@ -65,7 +74,7 @@ impl Drop for GatewayTestGuard {
 
 fn gateway_test_snapshot() -> CanonicalValidationSnapshot {
     let fence = StoreStateFence::new(
-        eliot_contracts::AuthorityEpoch::new(1).expect("epoch"),
+        test_epoch(1),
         eliot_contracts::ResourceGeneration::new(1).expect("generation"),
     );
     CanonicalValidationSnapshot {
@@ -230,7 +239,7 @@ impl ProcessStartPorts for GatewayTestPorts {
         &self,
         clock: ClockObservation,
         store_fence: FencingToken,
-        authority_epoch: u64,
+        authority_epoch: eliot_contracts::EpochId,
         revision_heads: BTreeMap<String, String>,
         validation_revision: u64,
     ) -> Result<DispatchValidationContext, ProcessExecutionError> {
@@ -265,8 +274,12 @@ impl ProcessStartPorts for GatewayTestPorts {
             state.retained_contexts.insert(
                 operation_id.clone(),
                 (
-                    FencingToken::new(1, Generation::new(1).expect("generation"), "pending")
-                        .expect("pending fence"),
+                    FencingToken::new(
+                        test_epoch(1),
+                        Generation::new(1).expect("generation"),
+                        "pending",
+                    )
+                    .expect("pending fence"),
                     BTreeMap::new(),
                     0,
                 ),
@@ -514,7 +527,7 @@ async fn actual_process_start_orchestration_fails_closed_and_releases_reserved()
     malformed.validation_revision = 0;
     let mut stale = gateway_test_snapshot();
     stale.state_fence = StoreStateFence::new(
-        eliot_contracts::AuthorityEpoch::new(2).expect("epoch"),
+        test_epoch(2),
         eliot_contracts::ResourceGeneration::new(1).expect("generation"),
     );
     for head in &mut stale.revision_heads {
@@ -522,7 +535,7 @@ async fn actual_process_start_orchestration_fails_closed_and_releases_reserved()
     }
     let mut substituted = gateway_test_snapshot();
     substituted.revision_heads[0].state_fence = StoreStateFence::new(
-        eliot_contracts::AuthorityEpoch::new(8).expect("epoch"),
+        test_epoch(8),
         eliot_contracts::ResourceGeneration::new(1).expect("generation"),
     );
     for (name, snapshot) in [

@@ -1,3 +1,7 @@
+# RETIREMENT-PENDING — deletion blocked on H2 engine-probe retirement (safety.rs:1905-1909); non-production; do-not-extend; remove with H2.
+# Retained only because crates/eliot-engine/src/safety.rs:1905-1909 probes this file
+# for schema_version = "1" as a blocking schema_contract check (see H2 handoff).
+# Non-production pending fixture. Do not extend with new live keys.
 schema_version = "1"
 
 [service]

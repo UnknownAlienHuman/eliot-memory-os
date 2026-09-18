@@ -9,6 +9,7 @@ license.workspace = true
 base64.workspace = true
 eliot-agent-api.workspace = true
 eliot-agent-coordinator.workspace = true
+eliot-contracts.workspace = true
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true

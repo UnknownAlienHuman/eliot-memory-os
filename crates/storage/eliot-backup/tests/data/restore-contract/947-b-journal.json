@@ -1,0 +1,1 @@
+{"admits_production_durable_recovery":false,"fixture_proof_only":true,"note":"Worker B fixture: an in-memory fixture journal validates structurally but never admits a production durable-recovery claim."}

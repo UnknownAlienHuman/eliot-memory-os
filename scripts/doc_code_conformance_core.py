@@ -378,13 +378,16 @@ def retired_reference_findings(
                     )
                 )
         for match in regex.finditer(value):
+            matched = match.group(0)
+            if (relative, matched) in allow:
+                continue
             findings.append(
                 Finding(
                     "DCC-003",
                     relative,
                     line_no(value, match.start()),
                     "unstable line-number authority reference remains: "
-                    + match.group(0),
+                    + matched,
                 )
             )
     return findings, {"reference_files": scanned}
@@ -683,13 +686,18 @@ def fixture_config() -> dict[str, Any]:
             "tokens": ["docs/normative/"],
             "extensions": [".rs", ".yml"],
             "ignore_globs": [],
-            "unstable_line_reference_regex": r"docs/(?:normative|architecture)/ELIOT_(?:ARCHITECTURE|IMPLEMENTATION)\.md:\d+",
+            "unstable_line_reference_regex": r"(?<![A-Za-z0-9_./-])(?:docs/(?:normative|architecture)/)?ELIOT_(?:ARCHITECTURE|IMPLEMENTATION)\.md:\d+(?:-(?:[A-Za-z0-9_]+)?)?",
             "allow": [
                 {
                     "path": ".github/workflows/policy.yml",
                     "token": "docs/normative/",
                     "reason": "negative fixture",
-                }
+                },
+                {
+                    "path": "crates/x/src/lib.rs",
+                    "token": "ELIOT_ARCHITECTURE.md:999",
+                    "reason": "negative fixture allowance",
+                },
             ],
         },
         "script_inventory": {
@@ -779,8 +787,18 @@ def write_fixture(root: Path) -> None:
     )
     (root / "bins/tool/src/main.rs").write_text("fn main() {}\n", encoding="utf-8")
     (root / "docs/PROJECT_MAP.md").write_text("`tool.exe`\n", encoding="utf-8")
+    (root / "docs/architecture/ELIOT_ARCHITECTURE.md").write_text(
+        "# Architecture\n", encoding="utf-8"
+    )
     (root / "docs/architecture/handle-index.json").write_text(
-        json.dumps({"handles": {"A1.1": {"path": "docs/current.md"}}}),
+        json.dumps(
+            {
+                "handles": {
+                    "A1.1": {"path": "docs/current.md"},
+                    "A2.3": {"path": "docs/architecture/ELIOT_ARCHITECTURE.md"},
+                }
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -830,6 +848,47 @@ def self_test() -> None:
             "//! docs/normative/ELIOT_ARCHITECTURE.md:42\n", encoding="utf-8"
         )
         expect(root, cfg, "DCC-003")
+        source.write_text(
+            "//! docs/architecture/ELIOT_ARCHITECTURE.md:123-130\n", encoding="utf-8"
+        )
+        expect(root, cfg, "DCC-003")
+        source.write_text(
+            "//! ELIOT_ARCHITECTURE.md:123\n", encoding="utf-8"
+        )
+        expect(root, cfg, "DCC-003")
+        source.write_text(
+            "//! ELIOT_IMPLEMENTATION.md:123-130\n", encoding="utf-8"
+        )
+        expect(root, cfg, "DCC-003")
+        source.write_text(
+            "//! ELIOT_ARCHITECTURE.md:123-abc\n", encoding="utf-8"
+        )
+        expect(root, cfg, "DCC-003")
+        source.write_text(
+            "//! src/lib.rs:123\n//! docs/current.md:A1.1\n", encoding="utf-8"
+        )
+        dcc3_findings = [f for f in audit(root, cfg)[0] if f.finding_id == "DCC-003"]
+        if dcc3_findings:
+            raise AuditError(
+                f"ordinary source coordinate triggered DCC-003: {dcc3_findings}"
+            )
+        source.write_text(
+            "//! docs/architecture/ELIOT_ARCHITECTURE.md:A2.3\n", encoding="utf-8"
+        )
+        dcc3_findings = [f for f in audit(root, cfg)[0] if f.finding_id == "DCC-003"]
+        if dcc3_findings:
+            raise AuditError(
+                f"canonical handle A2.3 triggered DCC-003: {dcc3_findings}"
+            )
+        source.write_text(
+            "//! ELIOT_ARCHITECTURE.md:999\n//! docs/current.md:A1.1\n",
+            encoding="utf-8",
+        )
+        dcc3_findings = [f for f in audit(root, cfg)[0] if f.finding_id == "DCC-003"]
+        if dcc3_findings:
+            raise AuditError(
+                f"allowed negative fixture token triggered DCC-003: {dcc3_findings}"
+            )
         source.write_text("//! docs/current.md:A1.1\n", encoding="utf-8")
 
         extra = root / "scripts/new_helper.py"
@@ -856,7 +915,7 @@ def self_test() -> None:
         source.write_text("//! docs/current.md:A9.9\n", encoding="utf-8")
         expect(root, cfg, "DCC-007")
 
-    print("DOC_CODE_CONFORMANCE_SELF_TEST: PASS cases=11")
+    print("DOC_CODE_CONFORMANCE_SELF_TEST: PASS cases=18")
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:

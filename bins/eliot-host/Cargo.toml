@@ -32,6 +32,8 @@ serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 uuid.workspace = true
 windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Services"] }
 
@@ -40,6 +42,7 @@ eliot-host-state = { workspace = true, features = ["test-support"] }
 eliot-installation = { workspace = true, features = ["test-support"] }
 
 [lints.rust]
+# SAFETY-OWNERSHIP: SCM-entry exception, see docs/ADR/0014-unsafe-ownership-and-exceptions.md#row-eliot-host (canonical owner eliot-platform-windows).
 unsafe_code = "allow"
 
 [lints.clippy]

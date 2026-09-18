@@ -5,6 +5,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod evidence_portfolio;
+
 use eliot_contracts::StateFence;
 use eliot_research_exchange::{ExchangeError, ExchangeJob, GovernedExchange, ResearchBridge};
 use eliot_research_exchange_api::{

@@ -5,7 +5,10 @@
 
 use std::{fmt, str::FromStr};
 
-use eliot_contracts::{ContractId, ResourceGeneration, canonical_json_bytes, sha256_hex};
+use eliot_contracts::{
+    ContractError, ContractId, ContractIdentity, ContractVersion, ResourceGeneration,
+    canonical_json_bytes, contract_identity, sha256_hex,
+};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use thiserror::Error;
 
@@ -21,6 +24,16 @@ pub const MAX_PIPE_SEGMENT_BYTES: usize = MAX_PIPE_SUFFIX_BYTES;
 pub const PIPE_NAME_WIRE_REVISION: &str = "v1";
 /// Stable contract name for the typed namespace owner.
 pub const PIPE_NAME_CONTRACT_NAME: &str = "eliot.foundation.pipe-name";
+/// Semantic contract version for the typed pipe-name owner.
+pub const PIPE_NAME_CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);
+/// Versioned Unicode profile pinning the admitted owner-segment alphabet.
+///
+/// Only lowercase ASCII (`[a-z0-9-_.]`) is admitted under this profile.
+/// Non-ASCII input (including confusables such as Cyrillic `е`) is refused
+/// as [`EliotPipeSegmentReason::NonCanonical`] under this exact profile
+/// version; future Unicode admission requires a profile version bump, never
+/// silent aliasing or lowercasing of arbitrary Unicode.
+pub const PIPE_NAME_UNICODE_PROFILE: &str = "ascii-lowercase-v1";
 
 /// A closed family in the current ELIOT namespace.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -125,6 +138,11 @@ enum EliotPipeEndpoint {
     Module {
         /// Canonical module identity owned by the runtime contracts crate.
         module_id: ContractId,
+        /// Validated owner-segment view of the same module identity.
+        ///
+        /// Stored alongside `module_id` so the orphan segment type cannot
+        /// drift from the module path; both spell the same canonical text.
+        module_segment: EliotPipeSegment,
         /// Module generation identity owned by the runtime contracts crate.
         generation: ResourceGeneration,
     },
@@ -161,10 +179,24 @@ impl EliotPipeName {
         module_id: ContractId,
         generation: ResourceGeneration,
     ) -> Result<Self, EliotPipeNameError> {
-        validate_segment(module_id.as_str(), 0, "module_id")?;
+        // Validate through the owner segment type so segment and module
+        // rules (reserved-device refusal, segment bound) cannot drift; remap
+        // the redacted field to the public constructor argument.
+        let module_segment =
+            EliotPipeSegment::new(module_id.as_str()).map_err(|error| match error {
+                EliotPipeNameError::InvalidSegment { reason, .. } => {
+                    EliotPipeNameError::InvalidSegment {
+                        offset: 0,
+                        field: "module_id",
+                        reason,
+                    }
+                }
+                other => other,
+            })?;
         validate_generation(generation, 0)?;
         let name = Self(EliotPipeEndpoint::Module {
             module_id,
+            module_segment,
             generation,
         });
         let actual = name.to_string().len();
@@ -242,6 +274,18 @@ impl EliotPipeName {
         }
     }
 
+    /// Returns the validated owner-segment view of a module endpoint.
+    ///
+    /// The segment spells the same canonical text as [`Self::module_id`];
+    /// it is stored at construction so the segment type stays wired into
+    /// the module path instead of remaining an orphan validator.
+    pub fn module_segment(&self) -> Option<&EliotPipeSegment> {
+        match self {
+            Self(EliotPipeEndpoint::Module { module_segment, .. }) => Some(module_segment),
+            _ => None,
+        }
+    }
+
     /// Parses one exact current canonical name.
     pub fn parse(value: &str) -> Result<Self, EliotPipeNameError> {
         if value.len() > MAX_PIPE_NAME_BYTES {
@@ -315,6 +359,7 @@ impl fmt::Display for EliotPipeName {
             EliotPipeEndpoint::Module {
                 module_id,
                 generation,
+                ..
             } => write!(formatter, "module\\{}\\{}", module_id, generation.value()),
             EliotPipeEndpoint::WatchdogSignals => formatter.write_str("watchdog\\signals"),
         }
@@ -433,6 +478,33 @@ pub enum EliotPipeSegmentReason {
     DotSegment,
     #[error("must be a canonical owner identity")]
     OwnerIdentity,
+    #[error("must not be a reserved device name")]
+    ReservedDevice,
+    #[error("must not exceed the owner-segment byte bound")]
+    TooLong,
+}
+
+/// Returns the deterministic identity of the typed pipe-name contract shape.
+///
+/// The shape pins the namespace prefix, wire revision, Unicode profile, and
+/// closed endpoint catalogue. It never changes the v1 name wire bytes or
+/// digest; valid-name canonical bytes stay byte-identical.
+pub fn pipe_name_contract_identity() -> Result<ContractIdentity, ContractError> {
+    let shape = serde_json::json!({
+        "contract": PIPE_NAME_CONTRACT_NAME,
+        "wire_revision": PIPE_NAME_WIRE_REVISION,
+        "unicode_profile": PIPE_NAME_UNICODE_PROFILE,
+        "prefix": ELIOT_PIPE_PREFIX,
+        "families": ["kernel", "module", "watchdog"],
+        "endpoints": [
+            "kernel/frontdoor",
+            "kernel/store",
+            "kernel/daemon/<generation>",
+            "module/<module_id>/<generation>",
+            "watchdog/signals",
+        ],
+    });
+    contract_identity(PIPE_NAME_CONTRACT_NAME, PIPE_NAME_CONTRACT_VERSION, &shape)
 }
 
 /// Typed, redacted validation failures for current and legacy names.
@@ -484,7 +556,7 @@ fn validate_segment(
         return Err(EliotPipeNameError::InvalidSegment {
             offset,
             field,
-            reason: EliotPipeSegmentReason::NonCanonical,
+            reason: EliotPipeSegmentReason::TooLong,
         });
     }
     if value == "." || value == ".." || value.ends_with('.') {
@@ -522,6 +594,18 @@ fn validate_segment(
             reason: EliotPipeSegmentReason::Delimiter,
         });
     }
+    // Windows device-name policy scoped to this namespace: refuse CON/PRN/
+    // AUX/NUL/COM1-9/LPT1-9 (case-insensitive, stem before `.`) before the
+    // ASCII-case check so `CON` reports ReservedDevice, not NonCanonical.
+    if is_reserved_device_name(value) {
+        return Err(EliotPipeNameError::InvalidSegment {
+            offset,
+            field,
+            reason: EliotPipeSegmentReason::ReservedDevice,
+        });
+    }
+    // Admitted alphabet pinned by PIPE_NAME_UNICODE_PROFILE: lowercase ASCII
+    // only. Non-ASCII (including confusables) falls here as NonCanonical.
     if !value.bytes().all(|byte| {
         byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_' | b'.')
     }) || value.starts_with('-')
@@ -534,6 +618,35 @@ fn validate_segment(
         });
     }
     Ok(())
+}
+
+fn is_reserved_device_name(value: &str) -> bool {
+    let stem = value.split('.').next().unwrap_or(value);
+    matches!(
+        stem.to_ascii_lowercase().as_str(),
+        "con"
+            | "prn"
+            | "aux"
+            | "nul"
+            | "com1"
+            | "com2"
+            | "com3"
+            | "com4"
+            | "com5"
+            | "com6"
+            | "com7"
+            | "com8"
+            | "com9"
+            | "lpt1"
+            | "lpt2"
+            | "lpt3"
+            | "lpt4"
+            | "lpt5"
+            | "lpt6"
+            | "lpt7"
+            | "lpt8"
+            | "lpt9"
+    )
 }
 
 fn validate_generation(

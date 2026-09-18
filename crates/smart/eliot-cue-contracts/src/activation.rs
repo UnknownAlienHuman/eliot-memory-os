@@ -10,7 +10,8 @@
 //! Truncation is a result, not a smaller answer. `Complete`, `Truncated`,
 //! `SourceUnavailable` and `Stale` stay distinct, and an empty-and-complete
 //! result — "searched everything, found nothing" — is not the same as "could
-//! not read the snapshot".
+//! not read the snapshot". A readable snapshot with no direct hit is a third
+//! case, `NoDirectMatch`, not an empty answer and not an unreadable source.
 
 use eliot_contracts::{ClockReading, StateFence};
 use serde::{Deserialize, Serialize};
@@ -248,7 +249,7 @@ impl ActivationRequest {
                 field: "request.relation_edges",
             });
         }
-        if self.schema_revision != crate::CONTRACT_REVISION {
+        if !crate::is_supported_schema_revision(&self.schema_revision) {
             return Err(CueContractError::InvalidText {
                 field: "schema_revision",
             });
@@ -516,6 +517,15 @@ pub enum Completeness {
         /// Why it could not be read.
         reason: String,
     },
+    /// No seed produced a direct hit against a readable snapshot, so no
+    /// derived search was possible. This is not an empty snapshot and not an
+    /// unreadable source: the snapshot was readable and the request was
+    /// evaluated. A result with this completeness carries no direct and no
+    /// derived activations.
+    NoDirectMatch {
+        /// Stable bounded reason class.
+        reason: String,
+    },
     /// The snapshot is older than the fence the request was issued against.
     Stale {
         /// The fence the snapshot was built at.
@@ -663,7 +673,7 @@ impl ActivationResult {
         bounds::collection(&self.direct, MAX_DIRECT, "direct")?;
         bounds::collection(&self.derived, MAX_DERIVED, "derived")?;
         bounds::collection(&self.trace.steps, MAX_TRACE_STEPS, "trace.steps")?;
-        if self.schema_revision != crate::CONTRACT_REVISION {
+        if !crate::is_supported_schema_revision(&self.schema_revision) {
             return Err(CueContractError::InvalidText {
                 field: "schema_revision",
             });
@@ -713,6 +723,15 @@ impl ActivationResult {
             for edge in frontier {
                 bounds::text(edge.as_str(), "completeness.frontier.edge")?;
             }
+        }
+        // No direct hit means no derived search was possible: either list
+        // populated beside this disposition contradicts the result itself.
+        if matches!(self.completeness, Completeness::NoDirectMatch { .. })
+            && (!self.direct.is_empty() || !self.derived.is_empty())
+        {
+            return Err(CueContractError::Foundation {
+                field: "result.no_direct_match",
+            });
         }
         if let Completeness::Stale { snapshot_fence } = &self.completeness {
             snapshot_fence
@@ -928,6 +947,7 @@ fn completeness_reasons(completeness: &Completeness) -> Vec<&str> {
         Completeness::Blocked { reason }
         | Completeness::Unavailable { reason }
         | Completeness::Unknown { reason }
+        | Completeness::NoDirectMatch { reason }
         | Completeness::SourceUnavailable { reason } => vec![reason.as_str()],
         Completeness::Complete
         | Completeness::Truncated { .. }

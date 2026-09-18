@@ -1,8 +1,7 @@
 //! Typed packet-context contract — input, audit, and budget values for the context compiler.
 //!
 //! This module owns the contiguous, source-proven typed packet-context contract
-//! closure extracted from the top of `crates/eliot-engine/src/context.rs`
-//! (canonical parent `121e27d`, `origin/main` `121e27dfd232f18900253e2f06a6b6b4723473c7`):
+//! closure extracted from the top of `crates/eliot-engine/src/context.rs`:
 //! `PacketBudgetPolicy` and its `impl`; `PacketRenderMode`; `PacketBudgetDecision`;
 //! `PacketCompileAudit`; `PacketCompileAuditContext`; `PacketCompileAuditReport`;
 //! `PacketSourceReadAudit`; `PacketCandidateOutcome`; `PacketRenderOutcome`;
@@ -35,15 +34,11 @@
 //!   invocation, Dreamer orchestration, canonical store write, or service
 //!   lifecycle code is moved here.
 //!
-//! # Canonical handles (verified from local authoritative docs)
-//!
-//! Source of truth for architecture/implementation handles is the current
-//! source tree `docs/architecture/ELIOT_ARCHITECTURE.md` (`4.5-draft`) and
-//! `docs/architecture/ELIOT_IMPLEMENTATION.md` (`0.29-draft`), plus
-//! `docs/architecture/INDEX.md` (`E:context-compiler`). The persistent graph
-//! `eliot-memory-os-121e27d-live` (56,502 nodes / 280,736 edges) and docs
-//! project `eliot-architecture-docs-fa941135` are evidence/routing layers
-//! only and were consulted before source inspection per worktree `AGENTS.md`.
+//! Architecture: `docs/architecture/ELIOT_ARCHITECTURE.md` handles `A7.1`,
+//! `A7.4`, `A7.6`, and `A7.9`. Implementation:
+//! `docs/architecture/ELIOT_IMPLEMENTATION.md` handles `I7.11`, `I7.19`,
+//! `I7.26`, and `I12.13`–`I12.17`. Normative precedence remains in
+//! `docs/ARCHITECTURE_CONTRACT.md`.
 //!
 //! - Architecture: `A7.1` Active Understanding View, `A7.4` Context as
 //!   intervention, `A7.6` Compaction & resume, `A7.9` Context economy.

@@ -1,0 +1,1 @@
+{"note":"Worker B fixture: ordering stability. Set members canonicalize deterministically under permutation; semantic event sequences stay visible and are never reordered by normalization.","permutation_stable":["sections","blobs","purge_ledger","artifacts"],"sequence_visible":["canonical_events","receipts"]}

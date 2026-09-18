@@ -13,12 +13,16 @@ use serde::{Deserialize, Serialize};
 
 use eliot_contracts::StateFence;
 #[cfg(test)]
-use eliot_contracts::{AuthorityEpoch, ResourceGeneration};
+use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
+#[cfg(test)]
+use std::num::NonZeroU64;
 
 use crate::budget::BudgetLimits;
-use crate::error::{ContractViolation, check_fence, check_text, closed_wire_enum, is_hex64_lower};
+use crate::error::{
+    ContractViolation, check_fence, check_text, check_vec_bound, closed_wire_enum, is_hex64_lower,
+};
 
-/// Exact wire `schema_version` admitted by [`DreamJobInput`].
+/// Exact wire `schema_version` admitted by [`DreamJobAdmission`].
 pub const DREAM_JOB_SCHEMA_VERSION: u32 = 1;
 
 /// Canonical kind marker owned by the architecture-brief surface.
@@ -120,10 +124,113 @@ impl Requester {
     }
 }
 
-/// Canonical closed intake record for one dream job.
+/// Maximum text length admitted by [`DreamJobInput`], in bytes.
+const MAX_JOB_TEXT: usize = 16384;
+/// Maximum entries admitted in any [`DreamJobInput`] handle list.
+const MAX_JOB_VECS: usize = 256;
+
+/// Canonical semantic dream-job input with a real state fence.
+///
+/// Models the `bins/eliot-dreamer` semantic input surface field-for-field,
+/// except `state_fence` is a real [`StateFence`] instead of opaque text, so a
+/// job can never be admitted without a validated fence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DreamJobInput {
+    /// Owning job identity, non-blank, at most 16384 bytes.
+    pub job_id: String,
+    /// Closed job class selecting the owning brief/handler surface.
+    pub job_class: JobClass,
+    /// Exact question under test, non-blank, at most 16384 bytes.
+    pub exact_question: String,
+    /// Requester identity, non-blank, at most 16384 bytes.
+    pub requester: String,
+    /// Scope binding, non-blank, at most 16384 bytes.
+    pub scope_id: String,
+    /// Optional task binding; when present, non-blank, at most 16384 bytes.
+    pub task_id: Option<String>,
+    /// Dependency-only state fence captured before external work.
+    pub state_fence: StateFence,
+    /// Evidence handles, at most 256 entries of non-blank text.
+    pub evidence_handles: Vec<String>,
+    /// Memory handles, at most 256 entries of non-blank text.
+    pub memory_handles: Vec<String>,
+    /// Architecture handles, at most 256 entries of non-blank text.
+    pub architecture_handles: Vec<String>,
+    /// Implementation handles, at most 256 entries of non-blank text.
+    pub implementation_handles: Vec<String>,
+    /// Conformance handles, at most 256 entries of non-blank text.
+    pub conformance_handles: Vec<String>,
+    /// Conflicts and unknowns, at most 256 entries of non-blank text.
+    pub conflicts_and_unknowns: Vec<String>,
+    /// Privacy profile, non-blank, at most 16384 bytes.
+    pub privacy_profile: String,
+    /// Admitted tool spellings, at most 256 entries of non-blank text.
+    pub allowed_tools: Vec<String>,
+    /// Admitted model routes; must be non-empty, at most 256 entries.
+    pub allowed_model_routes: Vec<String>,
+    /// Budget in abstract units; must be positive.
+    pub budget_units: u64,
+    /// Wall-clock deadline in Unix milliseconds; must be positive.
+    pub deadline_ms: i64,
+    /// Expected output schema, non-blank, at most 16384 bytes.
+    pub output_schema: String,
+    /// Forbidden effect spellings, at most 256 entries of non-blank text.
+    pub forbidden_effects: Vec<String>,
+}
+
+impl DreamJobInput {
+    /// Validates every intrinsic bound, fail-closed.
+    ///
+    /// Mirrors the `bins/eliot-dreamer` semantic validation: blank, control,
+    /// or oversize text is rejected by [`check_text`], over-long handle lists
+    /// by [`check_vec_bound`], a non-positive budget or deadline by a
+    /// `budget` binding mismatch, an empty route list by a missing field, and
+    /// a bad fence by [`check_fence`].
+    pub fn validate(&self) -> Result<(), ContractViolation> {
+        check_text(&self.job_id, "job_id", MAX_JOB_TEXT)?;
+        check_text(&self.exact_question, "exact_question", MAX_JOB_TEXT)?;
+        check_text(&self.requester, "requester", MAX_JOB_TEXT)?;
+        check_text(&self.scope_id, "scope_id", MAX_JOB_TEXT)?;
+        check_text(&self.privacy_profile, "privacy_profile", MAX_JOB_TEXT)?;
+        check_text(&self.output_schema, "output_schema", MAX_JOB_TEXT)?;
+        if let Some(task_id) = &self.task_id {
+            check_text(task_id, "task_id", MAX_JOB_TEXT)?;
+        }
+        for (field, values) in [
+            ("evidence_handles", &self.evidence_handles),
+            ("memory_handles", &self.memory_handles),
+            ("architecture_handles", &self.architecture_handles),
+            ("implementation_handles", &self.implementation_handles),
+            ("conformance_handles", &self.conformance_handles),
+            ("conflicts_and_unknowns", &self.conflicts_and_unknowns),
+            ("allowed_tools", &self.allowed_tools),
+            ("allowed_model_routes", &self.allowed_model_routes),
+            ("forbidden_effects", &self.forbidden_effects),
+        ] {
+            check_vec_bound(values.len(), MAX_JOB_VECS, field)?;
+            for value in values {
+                check_text(value, field, MAX_JOB_TEXT)?;
+            }
+        }
+        if self.budget_units == 0 || self.deadline_ms <= 0 {
+            return Err(ContractViolation::BindingMismatch {
+                field: "budget",
+                reason: "budget_units and deadline_ms must be positive".to_owned(),
+            });
+        }
+        if self.allowed_model_routes.is_empty() {
+            return Err(ContractViolation::MissingField("allowed_model_routes"));
+        }
+        check_fence(&self.state_fence)?;
+        Ok(())
+    }
+}
+
+/// Canonical closed intake record for one dream job.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DreamJobAdmission {
     /// Wire schema version; must be exactly [`DREAM_JOB_SCHEMA_VERSION`].
     pub schema_version: u32,
     /// Closed job class selecting the owning brief/handler surface.
@@ -154,7 +261,7 @@ pub struct DreamJobInput {
     pub frozen_manifest_digest: String,
 }
 
-impl DreamJobInput {
+impl DreamJobAdmission {
     /// Validates every intrinsic bound. Protected identity fields must be
     /// explicit: a defaulted `schema_version` or a missing digest is
     /// rejected rather than repaired.
@@ -233,7 +340,7 @@ impl DreamJobInput {
 
 /// Reports whether an orientation job is self-contained: orientation output
 /// requires no later output, every other class requires downstream work.
-pub fn orientation_is_self_contained(job: &DreamJobInput) -> bool {
+pub fn orientation_is_self_contained(job: &DreamJobAdmission) -> bool {
     matches!(job.job_class, JobClass::Orientation)
 }
 
@@ -264,8 +371,14 @@ pub fn brief_kinds_distinct() -> bool {
 }
 
 #[cfg(test)]
-pub(crate) fn sample_job() -> DreamJobInput {
-    DreamJobInput {
+pub(crate) fn sample_job() -> DreamJobAdmission {
+    let epoch = EpochId::new(
+        EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .expect("canonical test lineage-A"),
+        NonZeroU64::new(1).expect("non-zero test sequence"),
+    )
+    .expect("valid test epoch");
+    DreamJobAdmission {
         schema_version: DREAM_JOB_SCHEMA_VERSION,
         job_class: JobClass::Orientation,
         requester: Requester {
@@ -277,7 +390,7 @@ pub(crate) fn sample_job() -> DreamJobInput {
         idempotency_key: "idem-1".to_owned(),
         task_id: "task-1".to_owned(),
         scope_id: "scope-1".to_owned(),
-        state_fence: StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis()),
+        state_fence: StateFence::new(epoch, ResourceGeneration::genesis()),
         privacy_profile: PRIVACY_LOCAL_ONLY.to_owned(),
         contract_ref: "contract-1".to_owned(),
         policy_ref: "policy-1".to_owned(),
@@ -449,7 +562,7 @@ mod tests {
         let wire = serde_json::to_string(&sample_job()).expect("serialize job");
         let without_class = wire.replace("\"job_class\":\"orientation\",", "");
         assert_ne!(without_class, wire);
-        let err = serde_json::from_str::<DreamJobInput>(&without_class)
+        let err = serde_json::from_str::<DreamJobAdmission>(&without_class)
             .expect_err("missing job_class must fail");
         let msg = err.to_string();
         assert!(msg.contains("job_class"), "unexpected serde error: {err}");
@@ -474,19 +587,23 @@ mod tests {
         let job = sample_job();
         assert!(job.validate().is_ok());
         let wire = serde_json::to_string(&job).expect("serialize job");
-        let back: DreamJobInput = serde_json::from_str(&wire).expect("roundtrip job");
+        let back: DreamJobAdmission = serde_json::from_str(&wire).expect("roundtrip job");
         assert_eq!(back.task_id, "task-1");
         assert_eq!(back.scope_id, "scope-1");
         assert_eq!(back.operation_id, "op-1");
         assert_eq!(back.idempotency_key, "idem-1");
         let back_fence = &back.state_fence;
         let job_fence = &job.state_fence;
-        assert_eq!(back_fence.authority_epoch, job_fence.authority_epoch);
+        assert!(
+            back_fence
+                .authority_epoch
+                .is_same_authority(&job_fence.authority_epoch)
+        );
         assert_eq!(
             back_fence.resource_generation,
             job_fence.resource_generation
         );
-        assert_eq!(back.state_fence.authority_epoch.value(), 1);
+        assert_eq!(back.state_fence.authority_epoch.sequence.get(), 1);
         assert_eq!(back.state_fence.resource_generation.value(), 1);
         assert!(back.validate().is_ok());
         assert_eq!(back.canonical_id(), job.canonical_id());
@@ -510,7 +627,7 @@ mod tests {
             "}"
         );
         let err =
-            serde_json::from_str::<DreamJobInput>(&with_extra).expect_err("extra key must fail");
+            serde_json::from_str::<DreamJobAdmission>(&with_extra).expect_err("extra key must fail");
         let msg = err.to_string();
         assert!(
             msg.contains("unknown field"),
@@ -519,7 +636,7 @@ mod tests {
         let needle = std::format!("\"schema_version\":{DREAM_JOB_SCHEMA_VERSION}");
         let zeroed = wire.replace(&needle, "\"schema_version\":0");
         assert_ne!(zeroed, wire);
-        let decoded: DreamJobInput = serde_json::from_str(&zeroed).expect("decodes");
+        let decoded: DreamJobAdmission = serde_json::from_str(&zeroed).expect("decodes");
         let valid = decoded.validate();
         let err = valid.expect_err("zero version must not validate");
         assert_eq!(err, ContractViolation::ImplicitDefault("schema_version"));

@@ -1,0 +1,27 @@
+name: Manual Integration Workflow Fixture arbitrary inputs (must be rejected)
+# WORK_UNIT_CASE: 915/3 negative fixture. Manual inputs must be closed
+# (none or fixed profile enum); free-form ref/command inputs are forbidden.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Arbitrary ref to check out
+        required: false
+        type: string
+      command:
+        description: Arbitrary command to run
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  integration-manual:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - run: echo "must never validate"

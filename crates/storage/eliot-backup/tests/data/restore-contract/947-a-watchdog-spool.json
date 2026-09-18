@@ -1,0 +1,1 @@
+{"bounded":true,"note":"Worker A fixture: required Watchdog spool evidence is bounded with at least one signal digest; silent absence or known-empty success is forbidden.","unresolved_signal_digests":["9f2c3a4b5d6e7f809f2c3a4b5d6e7f809f2c3a4b5d6e7f809f2c3a4b5d6e7"]}

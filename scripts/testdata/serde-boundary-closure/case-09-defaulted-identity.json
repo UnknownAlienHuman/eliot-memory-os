@@ -1,0 +1,1 @@
+{"case": 9, "description": "defaults cannot invent protected identity/scope/authority/evidence", "expected": "reject", "missing_fields": ["identity", "scope", "authority"], "raw_envelope": {"message_type": "request", "payload": {"kind": "request", "request_id": "req-001"}, "protocol_version": "v1", "schema_version": "v1"}}

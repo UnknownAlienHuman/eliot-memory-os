@@ -1,0 +1,19 @@
+name: Manual Integration Workflow Fixture comment-dispatch (must be rejected)
+# WORK_UNIT_CASE: 915/2 negative fixture. issue_comment/repository_dispatch
+# pseudo-dispatch triggers are forbidden; only workflow_dispatch is allowed.
+on:
+  issue_comment:
+  repository_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  integration-manual:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - run: echo "must never validate"
