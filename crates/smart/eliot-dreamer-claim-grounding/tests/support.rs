@@ -622,7 +622,7 @@ pub fn refresh_claim(claim: &mut MaterialClaim) {
     claim.source_preimage_digest = claim.computed_digest().expect("claim digest");
 }
 
-pub fn refresh_draft(draft: &mut ModelDraft) {
+pub fn refresh_draft(draft: &mut StructuredModelDraft) {
     draft.draft_digest = draft.computed_digest().expect("draft digest");
 }
 
