@@ -608,7 +608,7 @@ impl DurableJobState {
             budget_units: job.budget_units,
             proof_ceiling: ProofCeiling::CandidateArtifact,
             fence: job.state_fence.clone(),
-            deadline_ms,
+            deadline_ms: Some(job.deadline_ms),
             phase: DurablePhase::Admitted,
             revision: 0,
             progress_rank: 0,
@@ -778,10 +778,19 @@ pub fn step_durable_job(
     }?;
     apply_streak(&mut next, streak)?;
     if streak == StreakEffect::NoChange && next.phase == DurablePhase::Blocked {
-        commands = vec![DurableCommand::EscalateBlocked(EscalateCommand {
-            reason: "maximum no-progress streak exceeded".to_owned(),
-        })];
-        disposition = DurableDisposition::Blocked;
+        if let Some(in_flight) = current.current_operation.clone() {
+            next.phase = DurablePhase::Reconciling;
+            commands = vec![DurableCommand::ReconcileOperation(ReconcileCommand {
+                operation_id: in_flight.operation_id,
+                stage: in_flight.stage,
+            })];
+            disposition = DurableDisposition::ReconciliationRequired;
+        } else {
+            commands = vec![DurableCommand::EscalateBlocked(EscalateCommand {
+                reason: "maximum no-progress streak exceeded".to_owned(),
+            })];
+            disposition = DurableDisposition::Blocked;
+        }
     }
     next.last_event_digest = Some(event_digest);
     next.revision = next
@@ -1465,7 +1474,7 @@ fn validate_stage_closure(state: &DurableJobState) -> Result<(), CycleError> {
 fn validate_current(state: &DurableJobState) -> Result<(), CycleError> {
     if let Some(current) = &state.current_operation {
         let coherent = match state.phase {
-            DurablePhase::Reconciling | DurablePhase::Blocked => true,
+            DurablePhase::Reconciling => true,
             phase => {
                 Some(phase) == current.stage.requested_phase()
                     || Some(phase) == current.stage.possible_phase()

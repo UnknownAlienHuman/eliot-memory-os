@@ -2066,3 +2066,30 @@ fn durable_state_rejects_submission_without_dispatch_predecessor() {
     let validation = state.validate();
     assert!(matches!(validation, Err(CycleError::PhaseViolation(_))));
 }
+
+#[test]
+fn no_progress_streak_exhaustion_emits_escalation_or_reconciliation() {
+    let (mut state, _) = durable_admit_orientation();
+    state.no_progress_streak = eliot_dreamer_cycle::MAX_NO_PROGRESS;
+    state.seal().unwrap();
+    let event =
+        eliot_dreamer_cycle::DurableEvent::RestartObserved(eliot_dreamer_cycle::RestartEvidence {
+            fence: state.fence.clone(),
+            revision: state.revision,
+        });
+    let result = step_durable_job(&state, &event).unwrap();
+    assert_eq!(
+        result.disposition,
+        eliot_dreamer_cycle::DurableDisposition::Blocked
+    );
+    assert_eq!(
+        result.next_state.phase,
+        eliot_dreamer_cycle::DurablePhase::Blocked
+    );
+    assert!(
+        result
+            .commands
+            .iter()
+            .any(|c| matches!(c, eliot_dreamer_cycle::DurableCommand::EscalateBlocked(_)))
+    );
+}
