@@ -426,8 +426,8 @@ pub struct ErasureReceipt {
 /// durable tombstone is committed and load-verified, and only then does
 /// erasure fan out under the recorded intent and verified tombstone. An exact
 /// replay of a completed intent returns the original receipt with no second
-/// destructive dispatch after verifying the tombstone still binds the same
-/// digest. Tombstone commit failure or a missing/mismatched tombstone yields
+/// destructive dispatch after verifying the tombstone still binds the exact
+/// request-derived candidate. Tombstone commit failure or a missing/mismatched tombstone yields
 /// [`ErasureError::MissingTombstone`] (or the backend refusal) with zero
 /// destructive calls. Per-surface outcomes aggregate fail-closed — one
 /// incomplete or unknown surface prevents a `Purged` result and no ledger
@@ -455,12 +455,22 @@ pub fn execute<B: ErasureBackend>(
         if prior.request_digest != request_digest {
             return Err(ErasureError::IntentConflict);
         }
+        let candidate = Tombstone {
+            operation_id: intent.operation_id.clone(),
+            request_digest: request_digest.clone(),
+            tombstone_digest: computed_tombstone_digest.clone(),
+            subject_ref: request.subject_ref.clone(),
+            scope: request.scope.clone(),
+            revision,
+            state_fence: request.state_fence.clone(),
+        };
+        candidate.validate()?;
         let stored = backend.load_tombstone(&intent.operation_id)?;
         let Some(stored) = stored else {
             return Err(ErasureError::MissingTombstone);
         };
-        if stored.tombstone_digest != computed_tombstone_digest
-            || stored.tombstone_digest != prior.purge.tombstone_digest
+        if stored != candidate
+            || prior.purge.tombstone_digest != candidate.tombstone_digest
         {
             return Err(ErasureError::MissingTombstone);
         }
@@ -479,18 +489,15 @@ pub fn execute<B: ErasureBackend>(
         state_fence: request.state_fence.clone(),
     };
     candidate.validate()?;
-    let committed = backend.commit_tombstone(candidate)?;
-    if committed.tombstone_digest != computed_tombstone_digest
-        || committed.operation_id != intent.operation_id
-        || committed.request_digest != request_digest
-    {
+    let committed = backend.commit_tombstone(candidate.clone())?;
+    if committed != candidate {
         return Err(ErasureError::MissingTombstone);
     }
     let stored = backend.load_tombstone(&intent.operation_id)?;
     let Some(stored) = stored else {
         return Err(ErasureError::MissingTombstone);
     };
-    if stored != committed {
+    if stored != candidate {
         return Err(ErasureError::MissingTombstone);
     }
 
@@ -503,7 +510,7 @@ pub fn execute<B: ErasureBackend>(
         subject_ref: request.subject_ref.clone(),
         scope: request.scope.clone(),
         purged_locations,
-        tombstone_digest: committed.tombstone_digest.clone(),
+        tombstone_digest: candidate.tombstone_digest.clone(),
         state: PurgeState::Purged,
         state_fence: request.state_fence.clone(),
         revision,
@@ -605,4 +612,207 @@ pub enum ErasureError {
     ScopeMismatch,
     #[error("erasure backend failed: {0}")]
     Backend(#[source] Box<dyn std::error::Error + Send + Sync>),
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::error::Error;
+    use std::fmt;
+
+    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
+
+    use super::*;
+
+    #[derive(Debug)]
+    struct BackendError(String);
+
+    impl fmt::Display for BackendError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str(&self.0)
+        }
+    }
+
+    impl Error for BackendError {}
+
+    fn test_fence() -> StateFence {
+        let lineage = match EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000") {
+            Ok(lineage) => lineage,
+            Err(error) => panic!("valid test lineage: {error:?}"),
+        };
+        let Some(ordinal) = std::num::NonZeroU64::new(7) else {
+            panic!("nonzero test epoch ordinal")
+        };
+        let epoch = match EpochId::new(lineage, ordinal) {
+            Ok(epoch) => epoch,
+            Err(error) => panic!("valid test epoch: {error:?}"),
+        };
+        let generation = match ResourceGeneration::new(3) {
+            Ok(generation) => generation,
+            Err(error) => panic!("valid test generation: {error:?}"),
+        };
+        StateFence::new(epoch, generation)
+    }
+
+    fn test_request(request_id: &str) -> ErasureRequest {
+        ErasureRequest {
+            request_id: request_id.to_string(),
+            subject_ref: "subject:tombstone-closure".to_string(),
+            scope: "scope:tombstone-closure".to_string(),
+            locations: vec![PurgeLocation::CanonicalPayload, PurgeLocation::Blob],
+            expected_revision: 7,
+            approval_digest: "ab".repeat(32),
+            evidence: Vec::new(),
+            state_fence: test_fence(),
+        }
+    }
+
+    /// Corrupt/stale backend simulation: `commit_tombstone` echoes the
+    /// already-durable tombstone instead of the supplied candidate, and
+    /// `load_tombstone` reloads that same durable value. A pre-inserted
+    /// tombstone with the right identity and digests but substituted
+    /// authorization fields is therefore returned and reloaded verbatim,
+    /// exactly the substitution the full candidate binding must refuse.
+    struct StaleEchoBackend {
+        revision: u64,
+        tombstones: BTreeMap<String, Tombstone>,
+        completions: BTreeMap<String, ErasureReceipt>,
+        erase_calls: usize,
+        ledger_appends: usize,
+    }
+
+    impl StaleEchoBackend {
+        fn ready() -> Self {
+            Self {
+                revision: 7,
+                tombstones: BTreeMap::new(),
+                completions: BTreeMap::new(),
+                erase_calls: 0,
+                ledger_appends: 0,
+            }
+        }
+
+        fn erase_calls(&self) -> usize {
+            self.erase_calls
+        }
+
+        fn ledger_appends(&self) -> usize {
+            self.ledger_appends
+        }
+    }
+
+    impl ErasureBackend for StaleEchoBackend {
+        type Error = BackendError;
+
+        fn current_revision(
+            &self,
+            _subject_ref: &str,
+            _scope: &str,
+        ) -> Result<u64, Self::Error> {
+            Ok(self.revision)
+        }
+
+        fn completed_receipt(
+            &self,
+            operation_id: &str,
+        ) -> Result<Option<ErasureReceipt>, ErasureError> {
+            if operation_id.trim().is_empty() {
+                return Err(ErasureError::InvalidField("operation_id"));
+            }
+            Ok(self.completions.get(operation_id).cloned())
+        }
+
+        fn record_intent(&mut self, intent: ErasureIntent) -> Result<IntentReceipt, ErasureError> {
+            intent.validate()?;
+            Ok(IntentReceipt {
+                operation_id: intent.operation_id.clone(),
+                request_digest: intent.request_digest.clone(),
+            })
+        }
+
+        fn commit_tombstone(&mut self, tombstone: Tombstone) -> Result<Tombstone, ErasureError> {
+            tombstone.validate()?;
+            if let Some(existing) = self.tombstones.get(&tombstone.operation_id) {
+                return Ok(existing.clone());
+            }
+            self.tombstones
+                .insert(tombstone.operation_id.clone(), tombstone.clone());
+            Ok(tombstone)
+        }
+
+        fn load_tombstone(
+            &self,
+            operation_id: &str,
+        ) -> Result<Option<Tombstone>, ErasureError> {
+            if operation_id.trim().is_empty() {
+                return Err(ErasureError::InvalidField("operation_id"));
+            }
+            Ok(self.tombstones.get(operation_id).cloned())
+        }
+
+        fn note_completed(&mut self, receipt: ErasureReceipt) -> Result<(), ErasureError> {
+            self.completions
+                .insert(receipt.request_id.clone(), receipt);
+            Ok(())
+        }
+
+        fn erase(
+            &mut self,
+            intent: &ErasureIntent,
+        ) -> Result<Vec<SurfaceOutcome>, Self::Error> {
+            self.erase_calls += 1;
+            if intent.validate().is_err() {
+                return Err(BackendError("invalid intent at dispatch".to_string()));
+            }
+            Ok(intent
+                .locations
+                .iter()
+                .map(|location| SurfaceOutcome::Purged {
+                    location: *location,
+                })
+                .collect())
+        }
+
+        fn append_purge_ledger(&mut self, entry: PurgeLedgerEntry) -> Result<(), Self::Error> {
+            self.ledger_appends += 1;
+            if entry.validate().is_err() {
+                return Err(BackendError("invalid purge ledger entry".to_string()));
+            }
+            Ok(())
+        }
+    }
+
+    // WORK_UNIT_CASE: 1131/mismatched-tombstone-binding
+    #[test]
+    fn mismatched_tombstone_binding_yields_zero_destructive_effects() -> Result<(), ErasureError> {
+        let request = test_request("request-1131-tombstone-binding");
+        let mut backend = StaleEchoBackend::ready();
+
+        let request_digest = request.request_digest()?;
+        let intent = ErasureIntent::new(&request, &request_digest)?;
+        let mut tombstone = Tombstone {
+            operation_id: intent.operation_id.clone(),
+            request_digest: intent.request_digest.clone(),
+            tombstone_digest: tombstone_digest(&request, &intent.request_digest),
+            subject_ref: request.subject_ref.clone(),
+            scope: request.scope.clone(),
+            revision: request.expected_revision,
+            state_fence: request.state_fence.clone(),
+        };
+        tombstone.scope = "scope:substituted".to_string();
+        backend
+            .tombstones
+            .insert(intent.operation_id.clone(), tombstone);
+
+        match execute(&mut backend, &request) {
+            Ok(_) => panic!("mismatched tombstone binding must refuse"),
+            Err(ErasureError::MissingTombstone) => {}
+            Err(other) => panic!("typed tombstone refusal, got: {other:?}"),
+        }
+
+        assert_eq!(backend.erase_calls(), 0);
+        assert_eq!(backend.ledger_appends(), 0);
+        assert!(backend.completions.is_empty());
+        Ok(())
+    }
 }
