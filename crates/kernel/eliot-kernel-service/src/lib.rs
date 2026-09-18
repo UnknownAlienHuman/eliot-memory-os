@@ -23,6 +23,7 @@ pub use commit_recovery::{
     CommitRecoveryClass, CommitRecoveryError, classify_commit_receipt, paused_ordering_scope_view,
     paused_scopes_snapshot, receipt_evidence_digest, recover_commit,
 };
+mod capacity_evidence;
 mod doctor;
 mod doctor_front_door;
 mod host_request_binding;
@@ -34,6 +35,11 @@ mod store_client;
 mod store_gateway;
 mod testd_front_door;
 
+pub use capacity_evidence::{
+    BoundaryOptimizationProposal, CAPACITY_EVIDENCE_SCHEMA_VERSION, CanonicalWriteLatencyProfile,
+    CapacityEnvelope, CapacityEvidenceError, CorpusScaleProfile, EvidenceClass,
+    LatencyDistribution, MIN_PERCENTILE_SAMPLES, OptimizationQualification, UnqualifiedReason,
+};
 pub use doctor::{
     ComposedDoctorFrontDoor, DOCTOR_CONFLICT_MAX_FIELDS, DOCTOR_MAX_ENVELOPE_BYTES,
     DOCTOR_MAX_LEASE_DURATION_NANOS, DOCTOR_RECOVERY_LEASE_OWNER, DOCTOR_REPAIR_ADVERTISED,
