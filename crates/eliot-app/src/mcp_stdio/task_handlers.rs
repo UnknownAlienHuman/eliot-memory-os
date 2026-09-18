@@ -886,7 +886,8 @@ async fn dispatch_experience_recall(state: &McpState, arguments: Value) -> Resul
         need,
         exposure_policy: input.exposure_policy.unwrap_or_default(),
     };
-    serde_json::to_value(ExperienceRetrievalService::recall(&request, &cases)).map_err(Into::into)
+    serde_json::to_value(ExperienceRetrievalService::recall(&request, &cases)?)
+        .map_err(Into::into)
 }
 
 async fn dispatch_experience_reinstate(state: &McpState, arguments: Value) -> Result<Value> {

@@ -584,6 +584,31 @@ impl ApplicabilityService {
     }
 }
 
+/// Fail-closed error for an experience-recall delivery count that does not fit
+/// `u32`.
+///
+/// Delivery counts must be exact (`visible_count` always equals
+/// `experience_priors.len()`, `suppressed_count` always equals the
+/// ranked-but-undelivered remainder). Emitting a saturated `u32::MAX` instead
+/// would silently misreport the count, so the construction path returns this
+/// error and no response is built.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("experience recall count {what}={len} exceeds u32::MAX; response not constructed")]
+pub struct RecallCountOverflow {
+    /// Which delivery count overflowed (`visible_count` or `suppressed_count`).
+    pub what: &'static str,
+    /// The unrepresentable length that failed conversion.
+    pub len: usize,
+}
+
+/// Exact `u32` conversion for a recall delivery count.
+///
+/// Returns [`RecallCountOverflow`] instead of saturating: an unrepresentable
+/// length fails the construction path closed rather than emitting `u32::MAX`.
+fn exact_recall_count(len: usize, what: &'static str) -> Result<u32, RecallCountOverflow> {
+    u32::try_from(len).map_err(|_| RecallCountOverflow { what, len })
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ExperienceRetrievalService;
 
@@ -591,14 +616,14 @@ impl ExperienceRetrievalService {
     pub fn recall(
         request: &ExperienceRecallRequest,
         cases: &[ExperienceCase],
-    ) -> ExperienceRecallResponse {
+    ) -> Result<ExperienceRecallResponse, RecallCountOverflow> {
         if request.need.need == MemoryNeed::None
             || matches!(
                 request.exposure_policy.mode,
                 MemoryExposureMode::CurrentTruthOnly | MemoryExposureMode::MemoryFreeControl
             )
         {
-            return ExperienceRecallResponse {
+            return Ok(ExperienceRecallResponse {
                 project_id: request.project_id,
                 decision: request.need.clone(),
                 fused_rank_traces: Vec::new(),
@@ -610,10 +635,10 @@ impl ExperienceRetrievalService {
                 rank_trace_handle: ExperienceRecallResponse::rank_trace_handle_for(&[]),
                 visible_count: 0,
                 suppressed_count: 0,
-            };
+            });
         }
         if !MemoryKindCompatibilityService::compatible(request.need.need, MemoryKind::CausalCase) {
-            return ExperienceRecallResponse {
+            return Ok(ExperienceRecallResponse {
                 project_id: request.project_id,
                 decision: request.need.clone(),
                 fused_rank_traces: Vec::new(),
@@ -627,7 +652,7 @@ impl ExperienceRetrievalService {
                 rank_trace_handle: ExperienceRecallResponse::rank_trace_handle_for(&[]),
                 visible_count: 0,
                 suppressed_count: 0,
-            };
+            });
         }
         let mut ranked = cases
             .iter()
@@ -663,9 +688,9 @@ impl ExperienceRetrievalService {
         }
         let no_useful_memory = briefs.is_empty();
         let rank_trace_handle = ExperienceRecallResponse::rank_trace_handle_for(&traces);
-        let visible_count = u32::try_from(briefs.len()).unwrap_or(u32::MAX);
-        let suppressed_count = u32::try_from(traces.len() - briefs.len()).unwrap_or(u32::MAX);
-        ExperienceRecallResponse {
+        let visible_count = exact_recall_count(briefs.len(), "visible_count")?;
+        let suppressed_count = exact_recall_count(traces.len() - briefs.len(), "suppressed_count")?;
+        Ok(ExperienceRecallResponse {
             project_id: request.project_id,
             decision: request.need.clone(),
             fused_rank_traces: traces,
@@ -681,7 +706,7 @@ impl ExperienceRetrievalService {
             rank_trace_handle,
             visible_count,
             suppressed_count,
-        }
+        })
     }
 }
 
@@ -1242,7 +1267,7 @@ mod tests {
     }
 
     #[test]
-    fn near_miss_is_rejected_before_brief_rendering() {
+    fn near_miss_is_rejected_before_brief_rendering() -> Result<(), RecallCountOverflow> {
         let case = formed_case();
         let frame = TaskMeaningFrame {
             task_id: "near-miss".to_owned(),
@@ -1265,8 +1290,38 @@ mod tests {
                 ..MemoryExposurePolicy::default()
             },
         };
-        let response = ExperienceRetrievalService::recall(&request, &[case]);
+        let response = ExperienceRetrievalService::recall(&request, &[case])?;
         assert!(response.no_useful_memory);
         assert!(response.experience_priors.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn unrepresentable_recall_count_fails_closed() {
+        // A vector longer than `u32::MAX` is not allocatable, so the
+        // fail-closed path is proven through the checked conversion the
+        // recall construction path uses: an over-limit length must return
+        // `Err`, never a saturated `u32::MAX`.
+        let over_limit = u32::MAX as usize + 1;
+        assert_eq!(
+            exact_recall_count(over_limit, "visible_count"),
+            Err(RecallCountOverflow {
+                what: "visible_count",
+                len: over_limit,
+            })
+        );
+        assert_eq!(
+            exact_recall_count(over_limit, "suppressed_count"),
+            Err(RecallCountOverflow {
+                what: "suppressed_count",
+                len: over_limit,
+            })
+        );
+        assert_eq!(exact_recall_count(0, "visible_count"), Ok(0));
+        assert_eq!(exact_recall_count(2, "suppressed_count"), Ok(2));
+        assert_eq!(
+            exact_recall_count(u32::MAX as usize, "visible_count"),
+            Ok(u32::MAX)
+        );
     }
 }

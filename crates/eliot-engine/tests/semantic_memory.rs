@@ -385,7 +385,8 @@ fn low_lexical_overlap_alias_retrieval_finds_case_but_keeps_it_as_prior() {
             exposure_policy: MemoryExposurePolicy::default(),
         },
         &[case],
-    );
+    )
+    .expect("recall delivery counts are exact");
     assert!(!response.no_useful_memory);
     assert_eq!(response.experience_priors.len(), 1);
     assert!(
@@ -480,7 +481,8 @@ fn exposure_policy_partitions_control_and_candidate_conditions() {
             },
         },
         std::slice::from_ref(&case),
-    );
+    )
+    .expect("recall delivery counts are exact");
     assert!(control.no_useful_memory);
     let candidate = ExperienceRetrievalService::recall(
         &ExperienceRecallRequest {
@@ -493,7 +495,8 @@ fn exposure_policy_partitions_control_and_candidate_conditions() {
             },
         },
         &[case],
-    );
+    )
+    .expect("recall delivery counts are exact");
     assert!(!candidate.fused_rank_traces.is_empty());
 }
 
@@ -538,7 +541,8 @@ fn recall_binds_resolvable_rank_trace_handle_through_delivery() {
             exposure_policy: MemoryExposurePolicy::default(),
         },
         &[admitted.clone(), suppressed.clone()],
-    );
+    )
+    .expect("recall delivery counts are exact");
 
     assert!(!response.no_useful_memory);
     assert_eq!(response.fused_rank_traces.len(), 2);
@@ -621,7 +625,8 @@ fn current_fact_need_cannot_leak_a_causal_case() {
             },
         },
         &[case],
-    );
+    )
+    .expect("recall delivery counts are exact");
 
     assert!(response.no_useful_memory);
     assert!(response.fused_rank_traces.is_empty());
