@@ -1001,29 +1001,65 @@ mod slice_6_validation_tests {
     }
 
     /// A-05 pre-handler proof (b): rejected input runs the real owner
-    /// validation exactly once and invokes zero native handlers,
-    /// fail-closed with no fallback dispatch. Two genuine rejection shapes:
-    /// a Curation carrier the owner directs to its separate typed carrier
-    /// (`UnsupportedJobShape`), and a stale observation at the job deadline.
-    /// In both cases no validated receipt exists, so typestate leaves no
-    /// value the dispatcher could consume — the zero-handler proof is
-    /// structural, and the handler counter pins it.
+    /// validation exactly once and stops at the real dispatcher with no
+    /// handler or fallback effects.
+    ///
+    /// Two genuine rejection shapes through the PRODUCTION validation entry
+    /// ([`validate_admitted_draft`], no injection): a Curation carrier the
+    /// owner directs to its separate typed carrier (`UnsupportedJobShape`),
+    /// and a stale observation at the job deadline (`DeadlineExceeded`) —
+    /// both retained as the static semantic refusal with the
+    /// request-rejected code. Each shape is also driven through the
+    /// injectable seam with a counting wrapper around the REAL owner, so
+    /// the validator-exactly-once count observes the genuine verdict rather
+    /// than a fabricated one.
+    ///
+    /// Dispatch stop: production holds NO receipt on these paths —
+    /// [`run_admitted_pipeline`](crate::run_admitted_pipeline) `?`-returns
+    /// the validation refusal before dispatch (the validated receipt is
+    /// threaded into dispatch only on `Ok`) — so the test drives the REAL
+    /// [`dispatch_admitted`](crate::dispatch_stage::dispatch_admitted)
+    /// entry with `None` and requires the approved receipt-gate refusal
+    /// before any v1 derivation or handler work. The outcome (refusal with
+    /// the exact gate reason versus `Ok`) is what discriminates bypass: a
+    /// gate-free dispatch of the genuine pair would derive v1, validate,
+    /// project, and return a packet.
+    ///
+    /// Handler zero is pinned three ways: the gate refusal textually
+    /// precedes every handler call in the production arm; no packet or
+    /// other result emerges on either reject path; and the accepted
+    /// control through the same dispatch core runs the real projector
+    /// exactly once (proving the counter observes genuine dispatch while
+    /// the gate refuses receipts, not the admission). Fallback zero holds
+    /// by outcome shape: every reject path yields `Err` with a bounded
+    /// static refusal — never `Ok`, never a packet, never an alternate
+    /// disposition. Production defines no fallback continuation anywhere
+    /// on this path (refusal propagates via `?`; the Kernel boundary and
+    /// the curation fan-in both document refusal-never-fallback with no
+    /// alternate handler), so a taken fallback would have to manifest as
+    /// exactly the `Ok`/side effect this test excludes.
     #[test]
-    fn rejected_candidate_zero_handler_invocations() {
-        let handler_calls = Cell::new(0_usize);
+    fn rejected_candidate_stops_dispatch_before_handler_or_fallback() {
+        use crate::dispatch_stage::{
+            CURATION_CARRIER_REFUSAL, VALIDATION_RECEIPT_REFUSAL, dispatch_admitted,
+            dispatch_orientation_with, project_validated_orientation,
+        };
+        use crate::{DreamResult, JobClass};
+        use eliot_dreamer_candidate_validation::{
+            validate_grounded_dream_draft_at, validate_grounding_candidate_at,
+        };
 
-        // Curation takes the separate-carrier gate: a genuine semantic
-        // rejection through the real owner, never a shape error.
+        // Shape 1: Curation takes the separate-carrier gate — a genuine
+        // semantic rejection through the real owner, never a shape error.
         let admission = admission_with_deadline(u64::MAX);
         let mut curation_job = job_of_class(&admission, JobClass::Curation, None);
         curation_job.evidence_handles = vec!["evidence-slice-6".to_owned()];
         let grounded = grounding_for(&admission, &curation_job);
         let input = carrier_for(&admission, &curation_job, grounded, Some(0));
-        let validation_calls = Cell::new(0_usize);
-        let refused = validate_admitted_draft_with(&input, |carrier| {
-            validation_calls.set(validation_calls.get() + 1);
-            validate_grounding_candidate_at(carrier)
-        });
+        // Production entry (no injection): pins the genuine owner verdict.
+        // Short-circuiting production validation past the owner changes
+        // this outcome.
+        let refused = validate_admitted_draft(&input);
         assert!(
             matches!(
                 refused,
@@ -1037,22 +1073,34 @@ mod slice_6_validation_tests {
             refused.map_err(|error| error.code()),
             Err("DREAMER_REQUEST_REJECTED")
         );
+        // Injectable seam: the real owner runs exactly once for the same
+        // genuine rejection.
+        let validation_calls = Cell::new(0_usize);
+        let refused = validate_admitted_draft_with(&input, |carrier| {
+            validation_calls.set(validation_calls.get() + 1);
+            validate_grounding_candidate_at(carrier)
+        });
+        assert!(
+            matches!(
+                refused,
+                Err(DreamerError::InvalidAdmission(
+                    "validation semantic rejection"
+                ))
+            ),
+            "counted curation validation must refuse identically, got {refused:?}"
+        );
         assert_eq!(
             validation_calls.get(),
             1,
             "owner validation must run exactly once even for rejected input"
         );
 
-        // Stale observation at the job deadline: the owner rejects with
-        // `DeadlineExceeded`, retained as the same static semantic refusal.
+        // Shape 2: stale observation at the job deadline — the owner rejects
+        // with `DeadlineExceeded`, retained as the same static refusal.
         let (admission, job) = admitted_orientation_pair();
         let grounded = grounding_for(&admission, &job);
         let stale = carrier_for(&admission, &job, grounded, Some(1));
-        let stale_calls = Cell::new(0_usize);
-        let refused = validate_admitted_draft_with(&stale, |carrier| {
-            stale_calls.set(stale_calls.get() + 1);
-            validate_grounding_candidate_at(carrier)
-        });
+        let refused = validate_admitted_draft(&stale);
         assert!(
             matches!(
                 refused,
@@ -1066,15 +1114,131 @@ mod slice_6_validation_tests {
             refused.map_err(|error| error.code()),
             Err("DREAMER_REQUEST_REJECTED")
         );
-        assert_eq!(stale_calls.get(), 1);
+        let stale_calls = Cell::new(0_usize);
+        let refused = validate_admitted_draft_with(&stale, |carrier| {
+            stale_calls.set(stale_calls.get() + 1);
+            validate_grounding_candidate_at(carrier)
+        });
+        assert!(
+            matches!(
+                refused,
+                Err(DreamerError::InvalidAdmission(
+                    "validation semantic rejection"
+                ))
+            ),
+            "counted stale validation must refuse identically, got {refused:?}"
+        );
+        assert_eq!(
+            stale_calls.get(),
+            1,
+            "owner validation must run exactly once for stale input"
+        );
 
-        // No validated receipt exists on either path, so no dispatch call
-        // site can run: zero handler invocations by construction (no call
-        // site here, and no fallback arm exists in the dispatcher).
+        // The rejected Orientation path stops at the REAL dispatcher: no
+        // receipt exists (production `?`-returns before dispatch), so the
+        // honest dispatch input is `None` and the approved receipt gate
+        // must refuse before any v1 derivation or handler work.
+        let handler_calls = Cell::new(0_usize);
+        let refused = dispatch_admitted(&admission, &job, None, None, JobClass::Orientation, None);
+        assert!(
+            matches!(
+                refused,
+                Err(DreamerError::InvalidAdmission(VALIDATION_RECEIPT_REFUSAL))
+            ),
+            "rejected orientation must stop at the receipt gate, got {refused:?}"
+        );
+        assert_eq!(
+            refused.map_err(|error| error.code()),
+            Err("DREAMER_REQUEST_REJECTED")
+        );
+        // The rejected Curation path stops at the REAL dispatcher likewise:
+        // without the Governor-injected carrier there is nothing to route,
+        // so the carrier check refuses before any screen, registry, or
+        // handler work — never a class refusal, never the Kernel code.
+        let refused = dispatch_admitted(
+            &admission,
+            &curation_job,
+            None,
+            None,
+            JobClass::Curation,
+            None,
+        );
+        assert!(
+            matches!(
+                refused,
+                Err(DreamerError::InvalidAdmission(CURATION_CARRIER_REFUSAL))
+            ),
+            "rejected curation must stop at the carrier check, got {refused:?}"
+        );
+        assert!(
+            !matches!(refused, Err(DreamerError::UnsupportedJobClass(_))),
+            "curation must never refuse with UnsupportedJobClass"
+        );
+        assert!(
+            !matches!(refused, Err(DreamerError::KernelAdmissionRequired(_))),
+            "curation must never borrow the Kernel-admission code"
+        );
+        // No handler ran for either rejected input through the exercised
+        // production entries, and no fallback result emerged: both refusals
+        // above are `Err`, never `Ok`.
         assert_eq!(
             handler_calls.get(),
             0,
             "rejected candidates must invoke zero handlers"
+        );
+
+        // Liveness and gate-precision control: the same admitted pair with
+        // a fresh observation validates, then dispatches through the real
+        // dispatch core with the real v1 owner once and the real projector
+        // once, yielding a packet. This proves the counters observe genuine
+        // dispatch (they fire here) and the gate refuses receipts, not the
+        // admission itself.
+        let grounded = grounding_for(&admission, &job);
+        let fresh = carrier_for(&admission, &job, grounded, Some(0));
+        let validated = match validate_admitted_draft(&fresh) {
+            Ok(validated) => validated,
+            Err(error) => {
+                panic!("fresh carrier must pass pre-handler validation, got {error:?}")
+            }
+        };
+        let v1_calls = Cell::new(0_usize);
+        let result = dispatch_orientation_with(
+            &admission,
+            &job,
+            &validated,
+            |admitted, bundle, model, grounded, policy, usage, preservation| {
+                v1_calls.set(v1_calls.get() + 1);
+                validate_grounded_dream_draft_at(
+                    admitted,
+                    bundle,
+                    model,
+                    grounded,
+                    policy,
+                    usage,
+                    preservation,
+                    Some(0),
+                    false,
+                )
+            },
+            |admitted_job, candidate, bundle, policy| {
+                handler_calls.set(handler_calls.get() + 1);
+                project_validated_orientation(admitted_job, candidate, bundle, policy)
+            },
+        );
+        let Ok(DreamResult::Packet(packet)) = result else {
+            panic!("accepted input must project through the real dispatcher, got {result:?}");
+        };
+        assert_eq!(packet.scope_id, admission.scope_id);
+        assert_eq!(packet.source_coverage.evidence, job.evidence_handles);
+        assert_eq!(
+            v1_calls.get(),
+            1,
+            "v1 owner validation must run exactly once on the accepted path"
+        );
+        assert_eq!(
+            handler_calls.get(),
+            1,
+            "the native handler must run exactly once for accepted input"
         );
     }
 
