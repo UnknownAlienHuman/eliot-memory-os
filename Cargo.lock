@@ -800,6 +800,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "toml",
 ]
 
 [[package]]
@@ -1582,6 +1583,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "toml",
 ]
 
 [[package]]
@@ -2733,6 +2735,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "toml",
 ]
 
 [[package]]
@@ -2797,6 +2800,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "thiserror",
+ "toml",
 ]
 
 [[package]]
