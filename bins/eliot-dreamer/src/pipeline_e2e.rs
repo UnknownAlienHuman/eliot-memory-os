@@ -175,7 +175,14 @@ fn orientation_pipeline_threads_screen_to_packet_receipt() {
             .is_empty(),
         "accepted candidate must bind its output digest"
     );
-    let result = dispatch_admitted(&admission, &job, None, None, JobClass::Orientation);
+    let result = dispatch_admitted(
+        &admission,
+        &job,
+        None,
+        None,
+        JobClass::Orientation,
+        Some(&validated),
+    );
     let Ok(DreamResult::Packet(packet)) = result else {
         panic!("orientation dispatch must project, got {result:?}");
     };
@@ -247,7 +254,14 @@ fn curation_pipeline_routes_a31_without_class_refusal() {
     );
     // A-31 fan-in without an injected carrier: the precise carrier-check
     // refusal, never a class refusal.
-    let refused = dispatch_admitted(&admission, &job, Some(binding), None, JobClass::Curation);
+    let refused = dispatch_admitted(
+        &admission,
+        &job,
+        Some(binding),
+        None,
+        JobClass::Curation,
+        None,
+    );
     assert!(
         !matches!(refused, Err(DreamerError::UnsupportedJobClass(_))),
         "curation must never refuse with UnsupportedJobClass, got {refused:?}"
@@ -449,7 +463,7 @@ fn submit_chain_curation_stops_before_generic_stages_without_carrier() {
     assert_eq!(error.code(), "DREAMER_REQUEST_REJECTED");
     assert_ne!(error.code(), KERNEL_ADMISSION_REQUIRED);
     // Dispatch level: the same missing carrier refuses with the same reason.
-    let refused = dispatch_admitted(&admission, &job, None, None, JobClass::Curation);
+    let refused = dispatch_admitted(&admission, &job, None, None, JobClass::Curation, None);
     let Err(error) = refused else {
         panic!("carrier-less dispatch must refuse at the carrier check");
     };

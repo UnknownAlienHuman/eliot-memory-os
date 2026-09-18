@@ -1,6 +1,6 @@
 //! Pure A-05 pre-handler validation of structured Dreamer drafts.
 //!
-//! This cell checks the exact A-03 job, bundle, model, grounded draft and
+//! This cell checks the exact A-05 job, bundle, model, grounded draft and
 //! preservation contracts once before a semantic handler is called. It has no
 //! model, handler, registry, runtime, storage, provider, or canonical-write
 //! dependency. Rejected inputs remain inert and preserve their supplied

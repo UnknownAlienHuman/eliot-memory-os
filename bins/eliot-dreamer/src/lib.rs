@@ -548,8 +548,18 @@ fn run_admitted_pipeline(
     let _validation = validation_stage::resolve_validation_inputs(admission, job)?;
     let validation_input =
         admitted_material::validation_input_for(admission, job, grounded, Some(0))?;
-    let _validated = validation_stage::validate_admitted_draft(&validation_input)?;
-    dispatch_stage::dispatch_admitted(admission, job, screen_binding, None, job.job_class)
+    // The structured A-05 gate runs exactly once here; the validated receipt
+    // threads into dispatch, which proves its binding before any native
+    // handler runs and never re-runs the owner validation.
+    let validated = validation_stage::validate_admitted_draft(&validation_input)?;
+    dispatch_stage::dispatch_admitted(
+        admission,
+        job,
+        screen_binding,
+        None,
+        job.job_class,
+        Some(&validated),
+    )
 }
 
 impl KernelJobPort for AuthenticatedKernelJobPort<'_> {
