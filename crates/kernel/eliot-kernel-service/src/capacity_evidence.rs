@@ -59,6 +59,19 @@ pub enum CapacityEvidenceError {
         "sample count {0} is an observation, not percentile evidence; leave the distribution unknown"
     )]
     SingleSampleNotPercentile(u64),
+    /// A percentile distribution requires an explicit envelope sample count.
+    #[error("percentile evidence requires an explicit envelope sample count")]
+    MissingSampleCountForDistribution,
+    /// The envelope and its attached distribution must describe the same run count.
+    #[error(
+        "envelope sample count {envelope_sample_count} does not match distribution sample count {distribution_sample_count}"
+    )]
+    InconsistentSampleCount {
+        /// Sample count declared by the enclosing envelope.
+        envelope_sample_count: u64,
+        /// Sample count declared by the attached distribution.
+        distribution_sample_count: u64,
+    },
     /// Canonical JSON for the artifact could not be produced or consumed.
     #[error("capacity-evidence serialization failed: {0}")]
     Serialization(String),
@@ -383,12 +396,16 @@ impl CapacityEnvelope {
     ///
     /// A distribution requires a recorded sample count of at least
     /// [`MIN_PERCENTILE_SAMPLES`]; anything less is an observation and the
-    /// distribution must stay unknown.
+    /// distribution must stay unknown. The recorded count must also equal the
+    /// distribution's own count: the envelope must not assert one measured
+    /// population while the attached distribution asserts another.
     ///
     /// # Errors
     ///
     /// Returns [`CapacityEvidenceError`] for a blank identity, a foreign
-    /// schema version, or percentile evidence without sufficient samples.
+    /// schema version, percentile evidence without sufficient samples, a
+    /// distribution without a recorded envelope count, or a recorded count
+    /// that disagrees with the distribution count.
     pub fn validate(&self) -> Result<(), CapacityEvidenceError> {
         valid_identity(&self.envelope_id, "envelope_id")?;
         check_schema_version(&self.schema_version)?;
@@ -396,12 +413,19 @@ impl CapacityEnvelope {
             match self.sample_count {
                 Some(count)
                     if count >= MIN_PERCENTILE_SAMPLES
-                        && distribution.sample_count >= MIN_PERCENTILE_SAMPLES => {}
-                Some(count) => {
+                        && distribution.sample_count >= MIN_PERCENTILE_SAMPLES
+                        && count == distribution.sample_count => {}
+                Some(count) if count < MIN_PERCENTILE_SAMPLES => {
                     return Err(CapacityEvidenceError::SingleSampleNotPercentile(count));
                 }
+                Some(count) => {
+                    return Err(CapacityEvidenceError::InconsistentSampleCount {
+                        envelope_sample_count: count,
+                        distribution_sample_count: distribution.sample_count,
+                    });
+                }
                 None => {
-                    return Err(CapacityEvidenceError::SingleSampleNotPercentile(0));
+                    return Err(CapacityEvidenceError::MissingSampleCountForDistribution);
                 }
             }
         }
@@ -694,19 +718,22 @@ impl BoundaryOptimizationProposal {
     /// A paper estimate cannot promote the change: without an observed
     /// bottleneck, a linked versioned profile, recovery evidence, and
     /// semantic-equivalence evidence the proposal is unqualified, with every
-    /// missing link enumerated.
+    /// missing link enumerated. Each link must be a valid bounded reference
+    /// (non-blank, free of control characters, within the length bound); a
+    /// structurally invalid string is not evidence and leaves the proposal
+    /// unqualified.
     pub fn qualify(&self) -> OptimizationQualification {
         let mut reasons = Vec::new();
-        if is_blank_or_unset(self.observed_bottleneck.as_deref()) {
+        if is_missing_or_invalid_reference(self.observed_bottleneck.as_deref()) {
             reasons.push(UnqualifiedReason::NoObservedBottleneck);
         }
-        if is_blank_or_unset(self.linked_profile_id.as_deref()) {
+        if is_missing_or_invalid_reference(self.linked_profile_id.as_deref()) {
             reasons.push(UnqualifiedReason::NoLinkedProfile);
         }
-        if is_blank_or_unset(self.recovery_evidence_ref.as_deref()) {
+        if is_missing_or_invalid_reference(self.recovery_evidence_ref.as_deref()) {
             reasons.push(UnqualifiedReason::NoRecoveryEvidence);
         }
-        if is_blank_or_unset(self.semantic_equivalence_evidence_ref.as_deref()) {
+        if is_missing_or_invalid_reference(self.semantic_equivalence_evidence_ref.as_deref()) {
             reasons.push(UnqualifiedReason::NoSemanticEvidence);
         }
         if reasons.is_empty() {
@@ -741,13 +768,14 @@ impl OptimizationQualification {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum UnqualifiedReason {
-    /// No bottleneck was observed; a paper estimate cannot promote the change.
+    /// No valid observed-bottleneck reference exists; a paper estimate cannot
+    /// promote the change.
     NoObservedBottleneck,
-    /// No versioned latency profile or capacity envelope is linked.
+    /// No valid versioned latency profile or capacity envelope is linked.
     NoLinkedProfile,
-    /// No recovery evidence is linked.
+    /// No valid recovery evidence is linked.
     NoRecoveryEvidence,
-    /// No semantic-equivalence evidence is linked.
+    /// No valid semantic-equivalence evidence is linked.
     NoSemanticEvidence,
 }
 
@@ -770,10 +798,17 @@ fn check_schema_version(value: &str) -> Result<(), CapacityEvidenceError> {
     Ok(())
 }
 
-fn is_blank_or_unset(value: Option<&str>) -> bool {
+/// Reports whether an evidence reference is missing or structurally invalid.
+///
+/// A link counts as evidence only when it is a valid bounded identity:
+/// non-blank, free of control characters, and within the length bound.
+/// Reuses [`valid_identity`] so the bound has a single source of truth; the
+/// reported field name is fixed because `qualify` surfaces the missing link,
+/// not the validation error.
+fn is_missing_or_invalid_reference(value: Option<&str>) -> bool {
     match value {
         None => true,
-        Some(text) => text.trim().is_empty() || text.chars().any(char::is_control),
+        Some(text) => valid_identity(text, "evidence_ref").is_err(),
     }
 }
 
@@ -893,6 +928,106 @@ mod tests {
         };
         assert_eq!(qualified.qualify(), OptimizationQualification::Qualified);
         assert!(qualified.qualify().is_qualified());
+    }
+
+    #[test]
+    fn envelope_sample_count_must_match_distribution_sample_count() {
+        // A 2-vs-3 mismatch describes two different evidence populations: the
+        // envelope asserts one measured run count while the attached
+        // distribution asserts another.
+        let mut envelope = CapacityEnvelope::unknown("envelope-count").expect("envelope");
+        envelope.sample_count = Some(2);
+        envelope.distribution =
+            Some(LatencyDistribution::new(3, 10, 12, 14, 20).expect("distribution"));
+        assert_eq!(
+            envelope.validate(),
+            Err(CapacityEvidenceError::InconsistentSampleCount {
+                envelope_sample_count: 2,
+                distribution_sample_count: 3,
+            })
+        );
+
+        // A distribution without a recorded envelope count is unknown
+        // metadata, not a measured zero.
+        let mut missing = CapacityEnvelope::unknown("envelope-nocount").expect("envelope");
+        missing.distribution =
+            Some(LatencyDistribution::new(3, 10, 12, 14, 20).expect("distribution"));
+        assert_eq!(
+            missing.validate(),
+            Err(CapacityEvidenceError::MissingSampleCountForDistribution)
+        );
+
+        // Equal counts at or above the minimum remain percentile evidence.
+        let mut matched = CapacityEnvelope::unknown("envelope-matched").expect("envelope");
+        matched.sample_count = Some(3);
+        matched.distribution =
+            Some(LatencyDistribution::new(3, 10, 12, 14, 20).expect("distribution"));
+        assert!(matched.validate().is_ok());
+        assert_eq!(matched.evidence_class(), EvidenceClass::PercentileEvidence);
+    }
+
+    #[test]
+    fn overlong_evidence_reference_cannot_qualify() {
+        // Every link is load-bearing: an over-length value in any one of the
+        // four fields keeps the proposal unqualified, even when the other
+        // three are valid.
+        let overlong = "x".repeat(1025);
+        let valid = BoundaryOptimizationProposal {
+            proposal_id: "proposal-1848".to_owned(),
+            observed_bottleneck: Some("ors-stage-durability".to_owned()),
+            linked_profile_id: Some("latency-1848".to_owned()),
+            recovery_evidence_ref: Some("recovery-1848".to_owned()),
+            semantic_equivalence_evidence_ref: Some("semantic-1848".to_owned()),
+        };
+        assert_eq!(valid.qualify(), OptimizationQualification::Qualified);
+
+        let mut bottleneck = valid.clone();
+        bottleneck.observed_bottleneck = Some(overlong.clone());
+        match bottleneck.qualify() {
+            OptimizationQualification::Unqualified { reasons } => {
+                assert!(reasons.contains(&UnqualifiedReason::NoObservedBottleneck));
+            }
+            OptimizationQualification::Qualified => {
+                panic!("over-long bottleneck reference must not qualify");
+            }
+        }
+        assert!(!bottleneck.qualify().is_qualified());
+
+        let mut linked = valid.clone();
+        linked.linked_profile_id = Some(overlong.clone());
+        match linked.qualify() {
+            OptimizationQualification::Unqualified { reasons } => {
+                assert!(reasons.contains(&UnqualifiedReason::NoLinkedProfile));
+            }
+            OptimizationQualification::Qualified => {
+                panic!("over-long linked profile reference must not qualify");
+            }
+        }
+        assert!(!linked.qualify().is_qualified());
+
+        let mut recovery = valid.clone();
+        recovery.recovery_evidence_ref = Some(overlong.clone());
+        match recovery.qualify() {
+            OptimizationQualification::Unqualified { reasons } => {
+                assert!(reasons.contains(&UnqualifiedReason::NoRecoveryEvidence));
+            }
+            OptimizationQualification::Qualified => {
+                panic!("over-long recovery evidence reference must not qualify");
+            }
+        }
+        assert!(!recovery.qualify().is_qualified());
+
+        let mut semantic = valid;
+        semantic.semantic_equivalence_evidence_ref = Some(overlong);
+        match semantic.qualify() {
+            OptimizationQualification::Unqualified { reasons } => {
+                assert!(reasons.contains(&UnqualifiedReason::NoSemanticEvidence));
+            }
+            OptimizationQualification::Qualified => {
+                panic!("over-long semantic evidence reference must not qualify");
+            }
+        }
+        assert!(!semantic.qualify().is_qualified());
     }
 
     #[test]
