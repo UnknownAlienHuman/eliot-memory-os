@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 description = "Governed ECXF logical backup and isolated restore contracts"
 
+[package.metadata.eliot]
+workspace_admission = "unreachable pending explicit owner disposition per #1716 (governed export path: #1871; recoverability evidence: #1873); not a selectable production fallback"
+
 [dependencies]
 eliot-blob-api.workspace = true
 eliot-contracts.workspace = true
@@ -18,6 +21,7 @@ blake3.workspace = true
 
 [dev-dependencies]
 eliot-store-memory = { path = "../eliot-store-memory" }
+toml.workspace = true
 
 [lints]
 workspace = true
