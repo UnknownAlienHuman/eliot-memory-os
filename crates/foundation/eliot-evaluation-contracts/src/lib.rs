@@ -1907,7 +1907,9 @@ impl GraphEvidenceRef {
 /// The five domains mirror the current-system evidence model: source, build,
 /// runtime, Store and integration rows are independently observed and can
 /// never be merged into one row.
-#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum PulseEvidenceDomain {
     Source,
@@ -2126,13 +2128,25 @@ impl InstalledProductPulsePlan {
         }
         {
             let mut seen = BTreeSet::new();
+            let mut seen_domains = BTreeSet::new();
             for row in &self.evidence_rows {
                 if !seen.insert(row.row_id.clone()) {
                     return Err(EvaluationContractError::DuplicateIdentity {
                         field: "pulse_plan.evidence_rows",
                     });
                 }
+                if !seen_domains.insert(row.domain) {
+                    return Err(EvaluationContractError::DuplicateIdentity {
+                        field: "pulse_plan.evidence_rows.domain",
+                    });
+                }
                 row.validate()?;
+            }
+            if seen_domains.len() != 5 {
+                return Err(EvaluationContractError::InvalidDependency {
+                    field: "pulse_plan.evidence_rows.domain",
+                    reason: "installed pulse requires exactly one row for every evidence domain",
+                });
             }
         }
         if self.scenarios.is_empty() {
@@ -2689,10 +2703,14 @@ mod tests {
         }
     }
 
-    fn open_row(id: &str, disposition: PulseRowDisposition) -> PulseEvidenceRow {
+    fn open_row(
+        id: &str,
+        domain: PulseEvidenceDomain,
+        disposition: PulseRowDisposition,
+    ) -> PulseEvidenceRow {
         PulseEvidenceRow {
             row_id: valid!(ContractId, id),
-            domain: PulseEvidenceDomain::Runtime,
+            domain,
             subject: format!("{id}-subject"),
             disposition,
             detail: Some("fixture reason".to_owned()),
@@ -2738,7 +2756,11 @@ mod tests {
     #[test]
     fn stale_row_stays_valid_data_but_lowers_aggregate() {
         let mut plan = pulse_plan();
-        plan.evidence_rows[2] = open_row("row-runtime-1", PulseRowDisposition::Stale);
+        plan.evidence_rows[2] = open_row(
+            "row-runtime-1",
+            PulseEvidenceDomain::Runtime,
+            PulseRowDisposition::Stale,
+        );
         assert!(plan.validate().is_ok());
         assert_eq!(plan.aggregate(), PulseRowDisposition::Stale);
     }
@@ -2746,8 +2768,16 @@ mod tests {
     #[test]
     fn failed_row_is_weakest_in_aggregation() {
         let mut plan = pulse_plan();
-        plan.evidence_rows[1] = open_row("row-build-1", PulseRowDisposition::Unknown);
-        plan.evidence_rows[3] = open_row("row-store-1", PulseRowDisposition::Failed);
+        plan.evidence_rows[1] = open_row(
+            "row-build-1",
+            PulseEvidenceDomain::Build,
+            PulseRowDisposition::Unknown,
+        );
+        plan.evidence_rows[3] = open_row(
+            "row-store-1",
+            PulseEvidenceDomain::Store,
+            PulseRowDisposition::Failed,
+        );
         assert!(plan.validate().is_ok());
         assert_eq!(plan.aggregate(), PulseRowDisposition::Failed);
     }
@@ -2761,7 +2791,11 @@ mod tests {
 
     #[test]
     fn non_passed_row_without_visible_reason_is_rejected() {
-        let mut row = open_row("row-1", PulseRowDisposition::Partial);
+        let mut row = open_row(
+            "row-1",
+            PulseEvidenceDomain::Source,
+            PulseRowDisposition::Partial,
+        );
         row.detail = None;
         assert!(matches!(
             row.validate(),
@@ -2786,6 +2820,28 @@ mod tests {
             plan.validate(),
             Err(EvaluationContractError::DuplicateIdentity {
                 field: "pulse_plan.evidence_rows",
+            })
+        );
+    }
+
+    #[test]
+    fn pulse_plan_rejects_missing_or_duplicate_evidence_domains() {
+        let mut plan = pulse_plan();
+        plan.evidence_rows.remove(4);
+        assert!(matches!(
+            plan.validate(),
+            Err(EvaluationContractError::InvalidDependency {
+                field: "pulse_plan.evidence_rows.domain",
+                ..
+            })
+        ));
+
+        plan = pulse_plan();
+        plan.evidence_rows[4].domain = PulseEvidenceDomain::Runtime;
+        assert_eq!(
+            plan.validate(),
+            Err(EvaluationContractError::DuplicateIdentity {
+                field: "pulse_plan.evidence_rows.domain",
             })
         );
     }
