@@ -14,6 +14,8 @@
 //! authority, canonical write, external effect, or task Finish anywhere in
 //! this module.
 
+#![allow(clippy::unnecessary_wraps)]
+
 use std::collections::BTreeSet;
 
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
@@ -561,22 +563,15 @@ impl DurableJobState {
         if !is_digest(bundle_digest) {
             return Err(CycleError::IncompleteOutcome("durable.bundle_digest"));
         }
-        let job_deadline = job
-            .deadline_ms
-            .map(i64::try_from)
-            .transpose()
-            .map_err(|_| CycleError::BindingMismatch {
-                field: "job.deadline_ms",
-                reason: "deadline does not fit the durable time domain",
-            })?;
-        if job_deadline != deadline_ms {
+        let job_deadline = Some(job.deadline_ms);
+        if deadline_ms.is_some() && job_deadline != deadline_ms {
             return Err(CycleError::BindingMismatch {
                 field: "durable.deadline_ms",
                 reason: "admission deadline differs from the frozen job",
             });
         }
         job.state_fence.validate()?;
-        let job_id = job.canonical_id();
+        let job_id = job.job_id.clone();
         validate_text(&job_id, "durable.job_id")?;
         let job_digest = job_digest(job)?;
         let mut state = Self {
@@ -681,9 +676,7 @@ impl DurableJobState {
         if let Some(digest) = &self.predecessor_digest
             && !is_digest(digest)
         {
-            return Err(CycleError::IncompleteOutcome(
-                "durable.predecessor_digest",
-            ));
+            return Err(CycleError::IncompleteOutcome("durable.predecessor_digest"));
         }
         let expected = state_digest(self)?;
         if expected != self.canonical_digest {
@@ -733,11 +726,16 @@ pub fn step_durable_job(
         DurableEvent::Delivered(evidence) => apply_delivered(current, &mut next, evidence),
         DurableEvent::Acknowledged(evidence) => apply_acknowledged(current, &mut next, evidence),
         DurableEvent::RestartObserved(evidence) => apply_restart(current, &mut next, evidence),
-        DurableEvent::StaleFenceObserved(evidence) => apply_stale_fence(current, &mut next, evidence),
+        DurableEvent::StaleFenceObserved(evidence) => {
+            apply_stale_fence(current, &mut next, evidence)
+        }
     }?;
     apply_streak(&mut next, streak)?;
     next.last_event_digest = Some(event_digest);
-    next.revision = next.revision.checked_add(1).ok_or(CycleError::BudgetBlocked)?;
+    next.revision = next
+        .revision
+        .checked_add(1)
+        .ok_or(CycleError::BudgetBlocked)?;
     next.predecessor_digest = Some(current.canonical_digest.clone());
     next.seal()?;
     next.validate()?;
@@ -767,7 +765,11 @@ fn apply_request_stage(
             "delivery is observed, never requested",
         ));
     }
-    if current.settled.iter().any(|settled| settled.stage == request.stage) {
+    if current
+        .settled
+        .iter()
+        .any(|settled| settled.stage == request.stage)
+    {
         return Err(CycleError::PhaseViolation(
             "stage already settled; at-most-once per stage",
         ));
@@ -804,12 +806,14 @@ fn apply_request_stage(
             None,
             DurablePhase::ScreenNotApplicable,
         )?;
-        return Ok((Vec::new(), DurableDisposition::Advanced, StreakEffect::Reset));
+        return Ok((
+            Vec::new(),
+            DurableDisposition::Advanced,
+            StreakEffect::Reset,
+        ));
     }
     let Some(requested) = request.stage.requested_phase() else {
-        return Err(CycleError::PhaseViolation(
-            "stage has no requested phase",
-        ));
+        return Err(CycleError::PhaseViolation("stage has no requested phase"));
     };
     next.current_operation = Some(InFlightOperation {
         operation_id: request.operation_id.clone(),
@@ -817,6 +821,9 @@ fn apply_request_stage(
         stage: request.stage,
     });
     next.phase = requested;
+    if let Some(rank) = requested.rank() {
+        next.progress_rank = next.progress_rank.max(rank);
+    }
     let command = DurableCommand::AdvanceStage(AdvanceStageCommand {
         stage: request.stage,
         operation_id: request.operation_id.clone(),
@@ -841,7 +848,10 @@ fn apply_stage_ready(
             "ready evidence does not match the requested phase",
         ));
     }
-    require_digest(&evidence.cycle_receipt_digest, "durable.cycle_receipt_digest")?;
+    require_digest(
+        &evidence.cycle_receipt_digest,
+        "durable.cycle_receipt_digest",
+    )?;
     let (outcome, ready) = if evidence.stage == DurableStage::Submission {
         (
             OperationOutcome::Committed,
@@ -866,7 +876,11 @@ fn apply_stage_ready(
         ready,
     )?;
     next.current_operation = None;
-    Ok((Vec::new(), DurableDisposition::Advanced, StreakEffect::Reset))
+    Ok((
+        Vec::new(),
+        DurableDisposition::Advanced,
+        StreakEffect::Reset,
+    ))
 }
 
 fn apply_stage_unknown(
@@ -885,11 +899,12 @@ fn apply_stage_unknown(
             "unknown evidence does not match the requested phase",
         ));
     }
-    require_digest(&evidence.cycle_receipt_digest, "durable.cycle_receipt_digest")?;
+    require_digest(
+        &evidence.cycle_receipt_digest,
+        "durable.cycle_receipt_digest",
+    )?;
     next.phase = possible;
-    next.progress_rank = next
-        .progress_rank
-        .max(possible.rank().unwrap_or(0));
+    next.progress_rank = next.progress_rank.max(possible.rank().unwrap_or(0));
     let command = DurableCommand::ReconcileOperation(ReconcileCommand {
         operation_id: in_flight.operation_id.clone(),
         stage: in_flight.stage,
@@ -914,7 +929,10 @@ fn apply_stage_failed(
             "failure evidence does not match the in-flight phase",
         ));
     }
-    require_digest(&evidence.cycle_receipt_digest, "durable.cycle_receipt_digest")?;
+    require_digest(
+        &evidence.cycle_receipt_digest,
+        "durable.cycle_receipt_digest",
+    )?;
     settle(
         next,
         &StageRequest {
@@ -1026,7 +1044,11 @@ fn apply_cancel(
     next: &mut DurableJobState,
 ) -> Result<(Vec<DurableCommand>, DurableDisposition, StreakEffect), CycleError> {
     if current.cancel_requested {
-        return Ok((Vec::new(), DurableDisposition::Blocked, StreakEffect::NoChange));
+        return Ok((
+            Vec::new(),
+            DurableDisposition::Blocked,
+            StreakEffect::NoChange,
+        ));
     }
     next.cancel_requested = true;
     next.cancel_phase = Some(current.phase);
@@ -1084,7 +1106,14 @@ fn apply_delivered(
     }
     require_digest(&evidence.delivery_digest, "durable.delivery_digest")?;
     next.phase = DurablePhase::Delivery;
-    Ok((Vec::new(), DurableDisposition::Advanced, StreakEffect::Reset))
+    if let Some(rank) = DurablePhase::Delivery.rank() {
+        next.progress_rank = next.progress_rank.max(rank);
+    }
+    Ok((
+        Vec::new(),
+        DurableDisposition::Advanced,
+        StreakEffect::Reset,
+    ))
 }
 
 fn apply_acknowledged(
@@ -1099,7 +1128,14 @@ fn apply_acknowledged(
     }
     require_digest(&evidence.ack_digest, "durable.ack_digest")?;
     next.phase = DurablePhase::Acknowledged;
-    Ok((Vec::new(), DurableDisposition::Terminal, StreakEffect::Reset))
+    if let Some(rank) = DurablePhase::Acknowledged.rank() {
+        next.progress_rank = next.progress_rank.max(rank);
+    }
+    Ok((
+        Vec::new(),
+        DurableDisposition::Terminal,
+        StreakEffect::Reset,
+    ))
 }
 
 fn apply_restart(
@@ -1119,7 +1155,11 @@ fn apply_restart(
         });
     }
     if current.phase == DurablePhase::Reconciling {
-        return Ok((Vec::new(), DurableDisposition::Blocked, StreakEffect::NoChange));
+        return Ok((
+            Vec::new(),
+            DurableDisposition::Blocked,
+            StreakEffect::NoChange,
+        ));
     }
     if let Some(in_flight) = current.current_operation.clone() {
         next.phase = DurablePhase::Reconciling;
@@ -1133,7 +1173,11 @@ fn apply_restart(
             StreakEffect::Keep,
         ))
     } else {
-        Ok((Vec::new(), DurableDisposition::Advanced, StreakEffect::NoChange))
+        Ok((
+            Vec::new(),
+            DurableDisposition::Advanced,
+            StreakEffect::NoChange,
+        ))
     }
 }
 
@@ -1350,43 +1394,40 @@ fn validate_stage_closure(state: &DurableJobState) -> Result<(), CycleError> {
 }
 
 fn validate_current(state: &DurableJobState) -> Result<(), CycleError> {
-    match &state.current_operation {
-        Some(current) => {
-            let coherent = match state.phase {
-                DurablePhase::Reconciling | DurablePhase::Blocked => true,
-                phase => {
-                    Some(phase) == current.stage.requested_phase()
-                        || Some(phase) == current.stage.possible_phase()
-                }
-            };
-            if !coherent {
-                return Err(CycleError::PhaseViolation(
-                    "in-flight operation disagrees with the current phase",
-                ));
+    if let Some(current) = &state.current_operation {
+        let coherent = match state.phase {
+            DurablePhase::Reconciling | DurablePhase::Blocked => true,
+            phase => {
+                Some(phase) == current.stage.requested_phase()
+                    || Some(phase) == current.stage.possible_phase()
             }
+        };
+        if !coherent {
+            return Err(CycleError::PhaseViolation(
+                "in-flight operation disagrees with the current phase",
+            ));
         }
-        None => {
-            if matches!(
-                state.phase,
-                DurablePhase::BundleRequested
-                    | DurablePhase::ScreenRequested
-                    | DurablePhase::ModelRequested
-                    | DurablePhase::ModelPossible
-                    | DurablePhase::GroundingRequested
-                    | DurablePhase::ValidationRequested
-                    | DurablePhase::DispatchRequested
-                    | DurablePhase::SubmissionRequested
-                    | DurablePhase::SubmissionPossible
-            ) {
-                return Err(CycleError::IncompleteOutcome(
-                    "durable.current_operation",
-                ));
-            }
-            if matches!(state.phase, DurablePhase::Failed | DurablePhase::Acknowledged)
-                && state.settled.is_empty()
-            {
-                return Err(CycleError::IncompleteOutcome("durable.settled"));
-            }
+    } else {
+        if matches!(
+            state.phase,
+            DurablePhase::BundleRequested
+                | DurablePhase::ScreenRequested
+                | DurablePhase::ModelRequested
+                | DurablePhase::ModelPossible
+                | DurablePhase::GroundingRequested
+                | DurablePhase::ValidationRequested
+                | DurablePhase::DispatchRequested
+                | DurablePhase::SubmissionRequested
+                | DurablePhase::SubmissionPossible
+        ) {
+            return Err(CycleError::IncompleteOutcome("durable.current_operation"));
+        }
+        if matches!(
+            state.phase,
+            DurablePhase::Failed | DurablePhase::Acknowledged
+        ) && state.settled.is_empty()
+        {
+            return Err(CycleError::IncompleteOutcome("durable.settled"));
         }
     }
     if matches!(
@@ -1440,8 +1481,8 @@ fn finish_step(
         disposition,
         transition_digest: String::new(),
     };
-    let bytes =
-        canonical_json_bytes(&candidate).map_err(|error| CycleError::Encoding(error.to_string()))?;
+    let bytes = canonical_json_bytes(&candidate)
+        .map_err(|error| CycleError::Encoding(error.to_string()))?;
     if bytes.len() > crate::contract::MAX_CANONICAL_BYTES {
         return Err(CycleError::Bound {
             field: "durable.canonical_bytes",
@@ -1464,7 +1505,11 @@ fn preflight_state(state: &DurableJobState) -> Result<(), CycleError> {
     bounded_text(&state.job_id, &mut total, "durable.job_id")?;
     bounded_text(&state.job_digest, &mut total, "durable.job_digest")?;
     bounded_text(&state.bundle_digest, &mut total, "durable.bundle_digest")?;
-    bounded_text(&state.canonical_digest, &mut total, "durable.canonical_digest")?;
+    bounded_text(
+        &state.canonical_digest,
+        &mut total,
+        "durable.canonical_digest",
+    )?;
     if let Some(digest) = &state.last_event_digest {
         bounded_text(digest, &mut total, "durable.last_event_digest")?;
     }
@@ -1558,8 +1603,10 @@ fn preflight_event(event: &DurableEvent) -> Result<(), CycleError> {
         DurableEvent::Acknowledged(evidence) => {
             bounded_text(&evidence.ack_digest, &mut total, "durable.ack_digest")?;
         }
-        DurableEvent::CancelRequested | DurableEvent::DeadlineExceeded(_) => {}
-        DurableEvent::RestartObserved(_) | DurableEvent::StaleFenceObserved(_) => {}
+        DurableEvent::CancelRequested
+        | DurableEvent::DeadlineExceeded(_)
+        | DurableEvent::RestartObserved(_)
+        | DurableEvent::StaleFenceObserved(_) => {}
     }
     if total > crate::contract::MAX_CANONICAL_BYTES {
         return Err(CycleError::Bound {
