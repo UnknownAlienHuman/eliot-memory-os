@@ -1,0 +1,224 @@
+# Standalone-workspace crate disposition and owner inventory (issue #1811, slice 1).
+#
+# Scope: checked-in disposition + named owner per standalone-workspace package
+# crate. A standalone-workspace crate carries its own `[workspace]` table and is
+# neither a root workspace member nor listed in root workspace `exclude`, so it
+# is invisible to `cargo check --locked --workspace` and to the root Cargo.lock.
+#
+# Denominator method: `python scripts/verify-standalone-crates.py --root . --list`
+# at the base commit below. That verifier discovers crates from the tree, never
+# from this file, so drift between the tree and this inventory fails the proof
+# test instead of diverging silently.
+#
+# Count reconciliation: the audit premise named 13 excluded packages when root
+# `exclude` still listed capability cells. At the base commit root `exclude` is
+# empty (admission waves moved cells into `members`) and the tree holds 11
+# standalone package crates. Three further `[workspace]` tables exist but are
+# not production supply-chain inputs and are out of #1811 package scope:
+# `mcpls.toml` (tool config, no `[package]`) and the two `scripts/testdata/`
+# fixture workspaces (test-only packages, ignored by the discovery rule below).
+# 11 packages + 3 non-production roots = 14 `[workspace]` tables.
+#
+# REMAINDER (explicitly not this slice): per-crate SBOM, lock/provenance
+# evidence, license/advisory records, and release/build gating that rejects
+# undeclared excluded inputs. No row here confers workspace, runtime, state,
+# authority, or production support admission; `workspace_admission` values are
+# quoted verbatim from each manifest. Generated SBOM/license/advisory artifacts
+# stay out of Git per docs/DEPENDENCY_POLICY.md repository hygiene.
+#
+# Per-row owner sources: `[package.metadata.eliot]` in the crate Cargo.toml and
+# `lifecycle_owner` / `agent_task.integration_owner` in the crate module.toml
+# where present. Production-boundary claim verified at the base commit by
+# scanning every in-tree Cargo manifest (normal/dev/build/target edges,
+# excluding target/ and testdata/) for path references to these packages (zero
+# hits) and by confirming none of the 11 package names occurs in the root
+# Cargo.lock.
+
+schema = "eliot.standalone-crate-dispositions.v1"
+issue = 1811
+base_sha = "f74c20e5652b12beabe60dc19f57ed197646a781"
+discovery = "python scripts/verify-standalone-crates.py --root . --list"
+root_exclude_at_base = []
+standalone_package_count = 11
+
+[[crate]]
+path = "crates/foundation/eliot-memory-projection-contracts"
+package = "eliot-memory-projection-contracts"
+standalone = "own [workspace] table; absent from root members and root exclude"
+prototype = true
+source_status = "IMPLEMENTED_PROTOTYPE"
+workspace_admission = "pending_agent_implementation_and_proof"
+functional_cell = "foundation.memory.projection-contracts"
+agent_order = 44
+lifecycle_owner = "foundation.memory.projection-contracts"
+lifecycle_owner_source = "crates/foundation/eliot-memory-projection-contracts/module.toml"
+integration_owner = "cognitive-wave-integrator"
+integration_owner_source = "crates/foundation/eliot-memory-projection-contracts/module.toml"
+production_boundary = "no in-tree Cargo consumer; absent from root Cargo.lock"
+remainder = "SBOM, per-crate lock/provenance evidence, and release gating are REMAINDER; this row confers no admission"
+
+[[crate]]
+path = "crates/governor/eliot-memory-projection-provider"
+package = "eliot-memory-projection-provider"
+standalone = "own [workspace] table; absent from root members and root exclude"
+prototype = true
+source_status = "IMPLEMENTED_PROTOTYPE"
+workspace_admission = "pending_agent_implementation_and_proof"
+functional_cell = "governor.memory.projection-provider"
+agent_order = 46
+lifecycle_owner = "governor.memory.projection-provider"
+lifecycle_owner_source = "crates/governor/eliot-memory-projection-provider/module.toml"
+integration_owner = "cognitive-wave-integrator"
+integration_owner_source = "crates/governor/eliot-memory-projection-provider/module.toml"
+production_boundary = "no in-tree Cargo consumer; absent from root Cargo.lock"
+remainder = "SBOM, per-crate lock/provenance evidence, and release gating are REMAINDER; this row confers no admission"
+
+[[crate]]
+path = "crates/research/eliot-dreamer-source-assurance"
+package = "eliot-dreamer-source-assurance"
+standalone = "own [workspace] table; absent from root members and root exclude"
+prototype = true
+source_status = "IMPLEMENTED"
+workspace_admission = "pending_agent_implementation_and_proof"
+lifecycle_owner = "research.source-assurance-role-separation (#692 cell)"
+lifecycle_owner_source = "workstreams/research/assignments/692-source-assurance-role-separation.toml"
+integration_owner = "undeclared (promotion-time Governor admission owner per #18)"
+integration_owner_source = "workstreams/research/assignments/692-source-assurance-role-separation.toml"
+production_boundary = "no in-tree Cargo consumer; absent from root Cargo.lock"
+remainder = "SBOM, per-crate lock/provenance evidence, and release gating are REMAINDER; this row confers no admission"
+
+[[crate]]
+path = "crates/smart/eliot-context-compiler-wasm"
+package = "eliot-context-compiler-wasm"
+standalone = "own [workspace] table; absent from root members and root exclude"
+prototype = true
+source_status = "IMPLEMENTED"
+workspace_admission = "pending_package_proof_and_integration_owner_review"
+functional_cell = "smart.context.compiler-wasm"
+agent_order = 17
+runtime_bundle = "eliotd"
+lifecycle_owner = "smart.context.compiler-wasm"
+lifecycle_owner_source = "crates/smart/eliot-context-compiler-wasm/module.toml"
+integration_owner = "cognitive-wave-integrator"
+integration_owner_source = "crates/smart/eliot-context-compiler-wasm/module.toml"
+production_boundary = "no in-tree Cargo consumer; absent from root Cargo.lock"
+remainder = "SBOM, per-crate lock/provenance evidence, and release gating are REMAINDER; this row confers no admission"
+
+[[crate]]
+path = "crates/smart/eliot-cue-activation-wasm"
+package = "eliot-cue-activation-wasm"
+standalone = "own [workspace] table; absent from root members and root exclude"
+prototype = true
+source_status = "IMPLEMENTED"
+workspace_admission = "pending_package_proof_and_integration_owner_review"
+functional_cell = "smart.cue.activation-wasm"
+agent_order = 14
+runtime_bundle = "eliotd"
+lifecycle_owner = "smart.cue.activation-wasm"
+lifecycle_owner_source = "crates/smart/eliot-cue-activation-wasm/module.toml"
+integration_owner = "cognitive-wave-integrator"
+integration_owner_source = "crates/smart/eliot-cue-activation-wasm/module.toml"
+production_boundary = "no in-tree Cargo consumer; absent from root Cargo.lock"
+remainder = "SBOM, per-crate lock/provenance evidence, and release gating are REMAINDER; this row confers no admission"
+
+[[crate]]
+path = "crates/smart/eliot-dreamer-curation-wasm"
+package = "eliot-dreamer-curation-wasm"
+standalone = "own [workspace] table; absent from root members and root exclude"
+prototype = true
+source_status = "IMPLEMENTED"
+workspace_admission = "pending_package_proof_and_integration_owner_review"
+functional_cell = "smart.dreamer.curation-wasm"
+agent_order = 31
+runtime_bundle = "eliot-dreamer"
+lifecycle_owner = "smart.dreamer.curation-wasm"
+lifecycle_owner_source = "crates/smart/eliot-dreamer-curation-wasm/module.toml"
+integration_owner = "cognitive-wave-integrator"
+integration_owner_source = "crates/smart/eliot-dreamer-curation-wasm/module.toml"
+production_boundary = "no in-tree Cargo consumer; absent from root Cargo.lock"
+remainder = "SBOM, per-crate lock/provenance evidence, and release gating are REMAINDER; this row confers no admission"
+
+[[crate]]
+path = "crates/smart/eliot-dreamer-cycle-wasm"
+package = "eliot-dreamer-cycle-wasm"
+standalone = "own [workspace] table; absent from root members and root exclude"
+prototype = true
+source_status = "IMPLEMENTED"
+workspace_admission = "pending_package_proof_and_integration_owner_review"
+functional_cell = "smart.dreamer.cycle-wasm"
+agent_order = 6
+runtime_bundle = "eliot-dreamer"
+lifecycle_owner = "smart.dreamer.cycle-wasm"
+lifecycle_owner_source = "crates/smart/eliot-dreamer-cycle-wasm/module.toml"
+integration_owner = "cognitive-wave-integrator"
+integration_owner_source = "crates/smart/eliot-dreamer-cycle-wasm/module.toml"
+production_boundary = "no in-tree Cargo consumer; absent from root Cargo.lock"
+remainder = "SBOM, per-crate lock/provenance evidence, and release gating are REMAINDER; this row confers no admission"
+
+[[crate]]
+path = "crates/smart/eliot-dreamer-orientation-wasm"
+package = "eliot-dreamer-orientation-wasm"
+standalone = "own [workspace] table; absent from root members and root exclude"
+prototype = true
+source_status = "IMPLEMENTED"
+workspace_admission = "pending_package_proof_and_integration_owner_review"
+functional_cell = "smart.dreamer.orientation-wasm"
+agent_order = 6
+runtime_bundle = "eliot-dreamer"
+lifecycle_owner = "smart.dreamer.orientation-wasm"
+lifecycle_owner_source = "crates/smart/eliot-dreamer-orientation-wasm/module.toml"
+integration_owner = "cognitive-wave-integrator"
+integration_owner_source = "crates/smart/eliot-dreamer-orientation-wasm/module.toml"
+production_boundary = "no in-tree Cargo consumer; absent from root Cargo.lock"
+remainder = "SBOM, per-crate lock/provenance evidence, and release gating are REMAINDER; this row confers no admission"
+
+[[crate]]
+path = "crates/smart/eliot-dreamer-research-wasm"
+package = "eliot-dreamer-research-wasm"
+standalone = "own [workspace] table; absent from root members and root exclude"
+prototype = true
+source_status = "IMPLEMENTED"
+workspace_admission = "pending_package_proof_and_integration_owner_review"
+functional_cell = "smart.dreamer.research-wasm"
+agent_order = 6
+runtime_bundle = "eliot-dreamer"
+lifecycle_owner = "smart.dreamer.research-wasm"
+lifecycle_owner_source = "crates/smart/eliot-dreamer-research-wasm/module.toml"
+integration_owner = "cognitive-wave-integrator"
+integration_owner_source = "crates/smart/eliot-dreamer-research-wasm/module.toml"
+production_boundary = "no in-tree Cargo consumer; absent from root Cargo.lock"
+remainder = "SBOM, per-crate lock/provenance evidence, and release gating are REMAINDER; this row confers no admission"
+
+[[crate]]
+path = "crates/smart/eliot-memory-applicability"
+package = "eliot-memory-applicability"
+standalone = "own [workspace] table; absent from root members and root exclude"
+prototype = true
+source_status = "IMPLEMENTED_PROTOTYPE"
+workspace_admission = "pending_agent_implementation_and_proof"
+functional_cell = "smart.memory.applicability"
+agent_order = 45
+runtime_bundle = "eliotd"
+lifecycle_owner = "smart.memory.applicability"
+lifecycle_owner_source = "crates/smart/eliot-memory-applicability/module.toml"
+integration_owner = "cognitive-wave-integrator"
+integration_owner_source = "crates/smart/eliot-memory-applicability/module.toml"
+production_boundary = "no in-tree Cargo consumer; absent from root Cargo.lock"
+remainder = "SBOM, per-crate lock/provenance evidence, and release gating are REMAINDER; this row confers no admission"
+
+[[crate]]
+path = "crates/smart/eliot-memory-curation-screen-wasm"
+package = "eliot-memory-curation-screen-wasm"
+standalone = "own [workspace] table; absent from root members and root exclude"
+prototype = true
+source_status = "IMPLEMENTED"
+workspace_admission = "pending_package_proof_and_integration_owner_review"
+functional_cell = "smart.memory.curation-screen-wasm"
+agent_order = 20
+runtime_bundle = "eliot-dreamer"
+lifecycle_owner = "smart.memory.curation-screen-wasm"
+lifecycle_owner_source = "crates/smart/eliot-memory-curation-screen-wasm/module.toml"
+integration_owner = "cognitive-wave-integrator"
+integration_owner_source = "crates/smart/eliot-memory-curation-screen-wasm/module.toml"
+production_boundary = "no in-tree Cargo consumer; absent from root Cargo.lock"
+remainder = "SBOM, per-crate lock/provenance evidence, and release gating are REMAINDER; this row confers no admission"
