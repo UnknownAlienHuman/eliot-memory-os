@@ -1,11 +1,19 @@
 //! A-07 durable-job attachment and admitted child-dispatch lineage.
 //!
-//! This module binds the existing swarm coordination surface to one
-//! Governor-owned durable job and derives every child dispatch identity from
+//! This module is an in-crate composition helper: it validates one admitted
+//! plan and delegates the attach-once decision to a Governor canonical owner
+//! supplied by the caller, then derives every child dispatch identity from
 //! that job, the admitted plan revision, the child slot, and the State Fence.
 //! It consumes owner evidence (Governor receipts) and the admitted route grant
 //! through the existing ports; it constructs no provider clients, owns no
 //! second job/task/session/authority record, and performs no process launch.
+//!
+//! This module is NOT the production swarm-consumption attachment path: no
+//! production Governor-vended attachment-owner port exists yet, and no swarm
+//! production caller is wired to this helper as the authoritative consumption
+//! path. Singularity here holds only within the single owner instance the
+//! caller supplies. The production Governor port/store/composition work is
+//! tracked as follow-up issue #2017.
 //!
 //! The cell stays stateless: an attachment is an inert validated value, and a
 //! dispatched launch still requires the owner-side persist-before-launch path
@@ -31,12 +39,14 @@ pub const JOB_ATTACH_OPERATION: &str = "swarm.job.attach";
 /// Durable-job record owner. Only this owner may attach a plan to a job.
 pub const JOB_OWNER: &str = "Governor";
 
-/// One admitted plan bound to one Governor-owned durable job.
+/// One admitted plan bound to one durable job through a caller-supplied owner.
 ///
 /// The job handle is opaque owner lineage: this cell never parses, mints, or
-/// reassigns it. Singularity (one job per plan revision) is enforced by the
-/// Governor canonical attach-once decision inside [`attach_plan_job`]; the
-/// Governor receipt pins the exact binding.
+/// reassigns it. Attach-once within the supplied owner instance is decided by
+/// the Governor canonical decision inside [`attach_plan_job`]; the Governor
+/// receipt pins the exact binding. This value carries no wider singularity
+/// claim: two independently constructed owners can each hold a different
+/// binding for the same plan revision.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DurableJobAttachment {
@@ -118,10 +128,12 @@ pub enum ReplayVerdict {
     ForeignIdentity,
 }
 
-/// Attaches one admitted plan to one Governor-owned durable job.
+/// Validates one admitted plan and delegates attach-once to a caller-supplied
+/// Governor canonical owner.
 ///
-/// Singularity (one job per admitted plan revision) is decided by the Governor
-/// canonical attach-once owner, not by this cell: the canonical
+/// This helper is crate-private and is NOT the production swarm-consumption
+/// attachment path. It performs validation plus attach-once delegation only
+/// against the owner instance the caller supplies: the canonical
 /// [`SwarmPlanAttachmentLedger::attach_plan_once`] decision runs BEFORE the
 /// attachment value is constructed, so two calls for the same plan revision
 /// with different job handles cannot both succeed against the same owner. An
@@ -129,22 +141,34 @@ pub enum ReplayVerdict {
 /// replays idempotently; a key bound to a different job or fence digest is
 /// [`SwarmError::OwnershipConflict`], naming the canonical winner.
 ///
+/// No production Governor-vended attachment-owner port exists yet, and no
+/// swarm production caller is wired to this helper as the authoritative
+/// consumption path; singularity across independently acquired production
+/// consumers is therefore out of scope here and is tracked as follow-up
+/// issue #2017 (production Governor port/store/composition).
+///
 /// Fail-closed: a blank handle never attaches, a missing verifier is
 /// [`SwarmError::PlanGap`], a non-Governor or plan/fence-mismatched receipt is
 /// rejected by the shared receipt validation, and a canon binding that does
 /// not echo the requested job/fence is refused as an internal contract
 /// violation.
 ///
-/// Durable-binding remainder (BLOCKED): the ledger above is the Governor-owned
-/// in-memory canon for this process. Cross-process and restart durability
-/// needs a production `SwarmPlanAttachmentStore` behind
+/// Durable-binding remainder (BLOCKED on #2017): the ledger above is the
+/// Governor-owned in-memory canon for this process. Cross-process and restart
+/// durability needs a production `SwarmPlanAttachmentStore` behind
 /// `attach_plan_once_durable`; no production store implementation exists yet,
 /// and binding the trait to the real Governor canonical-write path is queued
 /// remainder in the canon crate
 /// (`crates/governor/eliot-coordination/src/swarm_plan_attachment.rs`: store
 /// contract plus durable entry point). This function does not fake durability:
 /// it enforces attach-once against the Governor owner it is given.
-pub fn attach_plan_job(
+//
+// NOTE: no non-test caller exists by design (no production consumption path
+// yet; see the module docs and follow-up #2017). The helper is retained as
+// the in-crate composition primitive that #2017 will wire to a vended owner
+// port, and is exercised by the unit tests below.
+#[allow(dead_code)]
+pub(crate) fn attach_plan_job(
     plan: &AdmittedSwarmPlan,
     owner: &SwarmPlanAttachmentLedger,
     job_handle: &str,
@@ -198,10 +222,11 @@ pub fn attach_plan_job(
 /// Defense-in-depth re-check for one job per plan revision.
 ///
 /// Enforcement lives in the Governor canonical attach-once decision consulted
-/// by [`attach_plan_job`]; this helper only re-compares two already-built
-/// attachment values for callers that still hold a prior value (for example,
-/// to notice a stale in-memory copy). It cannot see Governor state, so passing
-/// `None` or omitting the call never establishes singularity on its own.
+/// by [`attach_plan_job`] against the caller-supplied owner; this helper only
+/// re-compares two already-built attachment values for callers that still hold
+/// a prior value (for example, to notice a stale in-memory copy). It cannot
+/// see Governor state, so passing `None` or omitting the call never
+/// establishes singularity on its own.
 /// Re-attaching the same handle is idempotent; a different handle for the
 /// same plan revision is [`SwarmError::OwnershipConflict`]. Attachments for
 /// other plan revisions are out of scope for this check and pass through.
@@ -793,17 +818,29 @@ mod tests {
         assert!(assert_single_attachment(None, &first).is_ok());
         assert!(assert_single_attachment(Some(&first), &same).is_ok());
         // A second job for the same plan revision loses at the canon: without
-        // the Governor call both attaches would succeed.
+        // the Governor call both attaches would succeed. This proof holds
+        // only within the single owner instance supplied above; independent
+        // owners are out of scope (production owner port: follow-up #2017).
         let request = attach_request(plan.provider_binding(), "job-2")?;
         let receipt = receipt_for(JOB_OWNER, &request, None)?;
         assert_eq!(
             attach_plan_job(&plan, &owner, "job-2", receipt, Some(&Trusted)),
             Err(SwarmError::OwnershipConflict)
         );
-        // The defense-in-depth helper still names the conflict when handed two
-        // divergent attachment values (built here against a rival owner).
-        let rival_owner = SwarmPlanAttachmentLedger::new();
-        let second = attached(&plan, &rival_owner, "job-2")?;
+        Ok(())
+    }
+
+    #[test]
+    fn advisory_helper_compares_attachment_values_only() -> TestResult {
+        // Value-comparison defense only: the helper re-compares two
+        // already-built values and cannot see Governor state, so this test
+        // proves nothing about canonical singularity. The divergent pair
+        // below is built against two independently constructed owners, which
+        // is precisely why the helper stays advisory.
+        let plan = admitted_plan()?;
+        let first = attached(&plan, &SwarmPlanAttachmentLedger::new(), "job-1")?;
+        let second = attached(&plan, &SwarmPlanAttachmentLedger::new(), "job-2")?;
+        assert_ne!(first, second);
         assert_eq!(
             assert_single_attachment(Some(&first), &second),
             Err(SwarmError::OwnershipConflict)
