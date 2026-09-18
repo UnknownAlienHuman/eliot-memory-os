@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 mod bounds;
+mod durable;
 mod error;
 mod plan;
 mod policy;
@@ -21,6 +22,14 @@ pub use contract::{
     CYCLE_SCHEMA_VERSION, CyclePhase, CyclePolicy, CycleStep, DreamerCycleState, ExpectedArtifact,
     InertOwnerRequest, ObservedOutcome, OutcomeDisposition, PendingRequest, PhasePolicyRule,
     RequestKind, StepDisposition,
+};
+pub use durable::{
+    DURABLE_SCHEMA_VERSION, AckEvidence, AdvanceStageCommand, DeadlineEvidence, DeliveryEvidence,
+    DurableCommand, DurableDisposition, DurableEvent, DurableJobState, DurablePhase, DurableStage,
+    DurableTransition, EscalateCommand, FenceEvidence, InFlightOperation, MAX_DURABLE_COMMANDS,
+    MAX_NO_PROGRESS, MAX_SETTLED_OPERATIONS, OperationOutcome, ReconcileCommand, RestartEvidence,
+    SettledOperation, StageEvidence, StageReconciled, StageRequest, StageResolution,
+    step_durable_job,
 };
 pub use error::CycleError;
 pub use plan::{CyclePlan, ExperimentCandidate, ExperimentKind, PlanHorizon, plan_cycle};
