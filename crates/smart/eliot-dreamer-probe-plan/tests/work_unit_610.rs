@@ -400,6 +400,6 @@ fn objective_result_affordance_disposition_vocabulary() {
         OmissionKind::AuthorityBlocked,
     ];
     assert_eq!(omission_kinds.len(), 3);
-    assert_ne!(omission_kinds[0], omission_kinds[1]);
-    assert_ne!(omission_kinds[1], omission_kinds[2]);
+    assert!(omission_kinds.windows(2).all(|pair| pair[0] != pair[1]));
+    assert_ne!(omission_kinds[0], omission_kinds[2]);
 }
