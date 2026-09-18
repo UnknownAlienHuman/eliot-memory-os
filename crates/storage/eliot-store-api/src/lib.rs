@@ -2388,6 +2388,22 @@ pub fn aggregate_erasure_outcomes(
 
 /// Canonical store boundary.  Only these store-neutral types cross into an
 /// adapter; SDK/query/credential/table types remain adapter-private.
+///
+/// Slice #990 is projection-only: this trait exposes no reserved-write
+/// operation, so a caller cannot invoke one regardless of payload shape.
+/// The following attempt must fail to compile because the method does not
+/// exist:
+///
+/// ```compile_fail
+/// use eliot_store_api::{CanonicalStoreClient, ReservedWriteRequest};
+///
+/// fn reserved_write_is_not_invocable<C: CanonicalStoreClient>(
+///     client: &C,
+///     request: ReservedWriteRequest,
+/// ) {
+///     let _ = client.apply_reserved_write(request);
+/// }
+/// ```
 #[allow(async_fn_in_trait)]
 pub trait CanonicalStoreClient: Send + Sync {
     /// Atomically applies one prepared transition and its expected heads.

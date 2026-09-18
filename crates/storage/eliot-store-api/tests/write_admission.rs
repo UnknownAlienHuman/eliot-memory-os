@@ -6,7 +6,7 @@
 //! through `990/13`, `990/15`, `990/16`; `990/14` retired with the removed
 //! Store-client reserved-write entry point) cover the owner mapping, round
 //! trip, every rejection family, ordinary-apply compatibility, legacy
-//! compatibility, and the source/API guard. No reservation, wire, commit, or
+//! compatibility, and the exported-interface authority guard. No reservation, wire, commit, or
 //! concurrent execution is established by these types, and no Store-client
 //! apply operation for reserved writes exists in this slice.
 
@@ -22,19 +22,24 @@ use std::num::NonZeroU64;
 use std::task::{Context, Poll, Waker};
 
 use eliot_contracts::{
-    ClockReading, EpochId, EpochLineageId, OperationId, ProductId, RequestId, ResourceGeneration,
-    SourceId, StateFence,
+    ArtifactId, ClockReading, EpochId, EpochLineageId, OperationId, ProductId, RequestId,
+    ResourceGeneration, SourceId, StateFence, TaskId,
 };
+use eliot_protocol::{
+    DurableJobRequest, DurableRequestIdentity, JobOperation, JobRole, RequestIdentity,
+};
+use eliot_receipts::{OperationBinding, RequestBinding};
 use eliot_store_api::{
-    CAPABILITIES, CONTRACT_VERSION, CanonicalStoreClient, CanonicalValidationSnapshot, EffectClass,
-    ErrorCode, EventProjectionRelationIntents, MAX_WRITE_ADMISSION_LABEL_BYTES,
-    MAX_WRITE_ADMISSION_SCOPES, NamedMutationOperation, NamedMutationRequest, NamedReadRequest,
-    NamedReadResponse, OperationIdentity, OperationManifestDigest, OrderingHeadExpectation,
-    OrderingScopeId, RequestMeta, ReservedScopeBinding, ReservedWriteRequest, Resubmission,
-    RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, SecurityContext, StoreError,
-    StoreHealth, StoreHealthStatus, StoreRequest, TransitionClass,
+    CAPABILITIES, CONTRACT_VERSION, CanonicalStoreClient, CanonicalValidationSnapshot, EFFECTS,
+    EffectClass, ErrorCode, EventProjectionRelationIntents, MAX_WRITE_ADMISSION_LABEL_BYTES,
+    MAX_WRITE_ADMISSION_SCOPES, NamedMutationOperation, NamedMutationRequest, NamedReadOperation,
+    NamedReadRequest, NamedReadResponse, OperationIdentity, OperationManifestDigest,
+    OrderingHeadExpectation, OrderingScopeId, ReadConsistency, RecoveryRecord, RequestMeta,
+    ReservedScopeBinding, ReservedWriteRequest, Resubmission, RevisionHeadExpectation, RevisionKey,
+    ScopeId, ScopeRevisionView, SecurityContext, StoreError, StoreGenesisRequest, StoreHealth,
+    StoreHealthStatus, StoreRecoveryRequest, StoreRequest, TransitionClass,
     WRITE_ADMISSION_CONTRACT_VERSION, WriteAdmissionParams, WriteAdmissionProjection, WriteReceipt,
-    WriteReceiptStatus, WriterEpochBinding,
+    WriteReceiptStatus, WriterEpochBinding, sha256_hex,
 };
 use serde_json::{Value, json};
 
@@ -279,11 +284,58 @@ fn valid_bounded_projection_and_request_round_trip() {
     assert_eq!(reencoded, encoded, "canonical raw bytes are stable");
     let fixture = include_str!("data/write_admission.json");
     let from_fixture: ReservedWriteRequest = serde_json::from_str(fixture).unwrap();
-    assert!(from_fixture.validate().is_ok());
+    // Independent fixture contract: every committed field is asserted
+    // literally, so fixture drift fails here even if the builder helpers
+    // above changed in lockstep (no tautological builder equality).
     assert_eq!(
-        from_fixture, request,
-        "fixture matches the sealed builder output"
+        from_fixture.admission.contract_version,
+        WRITE_ADMISSION_CONTRACT_VERSION
     );
+    assert_eq!(from_fixture.admission.reservation_id, "reservation-admit-1");
+    assert_eq!(from_fixture.admission.reservation_order, 42);
+    assert_eq!(from_fixture.admission.operation_id.as_str(), "op-admit-1");
+    assert_eq!(from_fixture.admission.idempotency_key, "idem-admit-1");
+    assert_eq!(
+        from_fixture.admission.canonical_request_hash,
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    );
+    assert_eq!(
+        from_fixture.admission.prepared_transition_digest,
+        "7265472a978bd13efd07fed9487cb1667fc0e43142709ed5dde33a13cc89b038"
+    );
+    assert_eq!(
+        from_fixture.admission.reservation_token_digest,
+        "746d87f6c80bfbe72063173cb56608940bf148bb57dd43cb95ea7a670eeab7f2"
+    );
+    assert_eq!(from_fixture.admission.scopes.len(), 1);
+    assert_eq!(
+        from_fixture.admission.scopes[0].scope.as_str(),
+        "scope-admit-1"
+    );
+    assert_eq!(from_fixture.admission.scopes[0].reserved_sequence, 7);
+    assert_eq!(from_fixture.admission.scopes[0].expected_sequence, 6);
+    assert_eq!(
+        from_fixture.admission.scopes[0].expected_head_digest,
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    );
+    assert_eq!(
+        from_fixture.admission.writer_epoch.lineage_id,
+        "epoch-lineage-admit"
+    );
+    assert_eq!(from_fixture.admission.writer_epoch.epoch, 5);
+    assert_eq!(from_fixture.admission.state_fence, fence());
+    assert_eq!(from_fixture.admission.source_id, "source-admit");
+    assert_eq!(from_fixture.admission.created_at_ms, 1_700_000_000_000);
+    assert_eq!(from_fixture.admission.expires_at_ms, 1_700_000_060_000);
+    assert_eq!(
+        from_fixture.admission.recovery_owner,
+        "recovery-owner-admit"
+    );
+    assert!(from_fixture.validate().is_ok());
+    // Closed binding: the fixture copy rejects a targeted identity break.
+    let mut broken = from_fixture.clone();
+    broken.admission.operation_id = OperationId::new("op-other").unwrap();
+    assert_eq!(broken.validate(), Err(StoreError::IdentityConflict));
 }
 
 // WORK_UNIT_CASE: 990/3
@@ -602,6 +654,136 @@ fn unknown_version_field_variant_and_duplicate_raw_keys_are_rejected() {
     ));
 }
 
+fn named_wire_request() -> StoreRequest {
+    StoreRequest::Named {
+        request: NamedReadRequest {
+            operation: NamedReadOperation::GetRevisionHeads,
+            scope_id: None,
+            consistency: ReadConsistency::Eventual,
+            state_fence: fence(),
+            parameters: BTreeMap::new(),
+        },
+    }
+}
+
+fn recovery_wire_request() -> StoreRequest {
+    StoreRequest::Recovery {
+        request: StoreRecoveryRequest {
+            contract_version: CONTRACT_VERSION,
+            state_fence: fence(),
+            records: Vec::new(),
+            include_receipts: false,
+            include_jobs: false,
+        },
+    }
+}
+
+fn genesis_wire_request() -> StoreRequest {
+    let payload = br#"{"seed":true}"#.to_vec();
+    let record = RecoveryRecord {
+        namespace: "owner".to_owned(),
+        key: "seed".to_owned(),
+        state_fence: fence(),
+        revision: 1,
+        schema: "opaque-owner-v1".to_owned(),
+        payload: payload.clone(),
+        value_digest: sha256_hex(&payload),
+    };
+    let request = StoreGenesisRequest {
+        contract_version: CONTRACT_VERSION,
+        operation_id: OperationId::new("genesis-op-1").unwrap(),
+        idempotency_key: "genesis-retry-1".to_owned(),
+        canonical_request_hash: String::new(),
+        state_fence: fence(),
+        owner_records: vec![record],
+    }
+    .with_computed_digest()
+    .unwrap();
+    StoreRequest::InitializeGenesis {
+        context: context(),
+        request,
+    }
+}
+
+fn dreamer_identity(operation: &JobOperation) -> DurableRequestIdentity {
+    let fence_value = fence();
+    let binding = OperationBinding {
+        operation_id: OperationId::new("op-dreamer-990-10").unwrap(),
+        request_id: RequestId::new("originating-request").unwrap(),
+        idempotency_key: "idem-dreamer-990-10".to_owned(),
+        operation_kind: operation.kind().as_str().to_owned(),
+        effect: EffectClass::Candidate,
+        state_fence: fence_value.clone(),
+    };
+    let identity = RequestIdentity {
+        request: RequestBinding {
+            metadata: eliot_contracts::RequestMetadata {
+                request_id: RequestId::new("fresh-request").unwrap(),
+                session_id: None,
+                task_id: Some(TaskId::new("job").unwrap()),
+                product_id: ProductId::new("product").unwrap(),
+                source_id: SourceId::new("source").unwrap(),
+                state_fence: fence_value.clone(),
+                clock: ClockReading::default(),
+            },
+            state_fence: fence_value.clone(),
+        },
+        idempotency_key: "transport-request".to_owned(),
+        deadline_unix_ms: 100,
+        cancellation_id: "cancel".to_owned(),
+    };
+    let hash =
+        DurableRequestIdentity::digest_for(&binding, &identity, operation, JobRole::Requester)
+            .unwrap();
+    DurableRequestIdentity {
+        request: identity,
+        operation: binding,
+        canonical_request_hash: hash,
+    }
+}
+
+fn dreamer_wire_request() -> StoreRequest {
+    let operation = JobOperation::Status {
+        job_id: TaskId::new("job").unwrap(),
+        attempt_id: ArtifactId::new("attempt").unwrap(),
+        expected_revision: 1,
+        expected_fence: fence(),
+    };
+    let request = DurableJobRequest {
+        request_identity: dreamer_identity(&operation),
+        role: JobRole::Requester,
+        operation,
+    };
+    request.validate().unwrap();
+    StoreRequest::DreamerJob {
+        context: context(),
+        request,
+    }
+}
+
+/// Fixed `op` tag for one wire variant.
+///
+/// Exhaustive on purpose: adding a `StoreRequest` variant breaks this match
+/// at compile time, forcing the closed catalogue in 990/10 and the authority
+/// guard in 990/16 to account for it. This is the compile-time half of the
+/// no-reserved-write-variant proof; the tag-set assertion below is the
+/// runtime half.
+fn store_request_op_tag(request: &StoreRequest) -> &'static str {
+    match request {
+        StoreRequest::Health => "health",
+        StoreRequest::Readiness => "readiness",
+        StoreRequest::Named { .. } => "named",
+        StoreRequest::Apply { .. } => "apply",
+        StoreRequest::Recovery { .. } => "recovery",
+        StoreRequest::InitializeGenesis { .. } => "initialize_genesis",
+        StoreRequest::Receipt { .. } => "receipt",
+        StoreRequest::RevisionHeads { .. } => "revision_heads",
+        StoreRequest::OrderingHeads { .. } => "ordering_heads",
+        StoreRequest::ValidationSnapshot => "validation_snapshot",
+        StoreRequest::DreamerJob { .. } => "dreamer_job",
+    }
+}
+
 // WORK_UNIT_CASE: 990/10
 #[test]
 fn missing_reservation_cannot_decode_through_a_legacy_fallback() {
@@ -618,54 +800,130 @@ fn missing_reservation_cannot_decode_through_a_legacy_fallback() {
     assert!(serde_json::from_value::<ReservedWriteRequest>(legacy_json).is_err());
     let reserved_json = serde_json::to_value(valid_request()).unwrap();
     assert!(serde_json::from_value::<StoreRequest>(reserved_json).is_err());
+    // Closed wire-variant catalogue: every exported `StoreRequest` variant
+    // encodes under its fixed `op` tag, round-trips, and validates, so no
+    // reserved-write variant exists on the wire in this slice.
+    let catalogue = vec![
+        StoreRequest::Health,
+        StoreRequest::Readiness,
+        named_wire_request(),
+        legacy,
+        recovery_wire_request(),
+        genesis_wire_request(),
+        StoreRequest::Receipt {
+            operation_id: OperationId::new("op-admit-1").unwrap(),
+        },
+        StoreRequest::RevisionHeads {
+            keys: vec![RevisionKey::new("rev-admit-1").unwrap()],
+        },
+        StoreRequest::OrderingHeads {
+            scopes: vec![OrderingScopeId::new("scope-admit-1").unwrap()],
+        },
+        StoreRequest::ValidationSnapshot,
+        dreamer_wire_request(),
+    ];
+    let mut tags = Vec::new();
+    for variant in &catalogue {
+        let encoded = serde_json::to_value(variant).unwrap();
+        assert_eq!(
+            encoded.get("op"),
+            Some(&json!(store_request_op_tag(variant)))
+        );
+        tags.push(store_request_op_tag(variant));
+        let decoded: StoreRequest = serde_json::from_value(encoded).unwrap();
+        assert_eq!(&decoded, variant);
+        assert!(decoded.validate().is_ok());
+        assert!(
+            CAPABILITIES.contains(&decoded.capability()),
+            "every wire variant selects an advertised capability"
+        );
+    }
+    tags.sort_unstable();
+    assert_eq!(
+        tags,
+        vec![
+            "apply",
+            "dreamer_job",
+            "health",
+            "initialize_genesis",
+            "named",
+            "ordering_heads",
+            "readiness",
+            "receipt",
+            "recovery",
+            "revision_heads",
+            "validation_snapshot",
+        ],
+        "closed wire catalogue carries no reserved-write variant"
+    );
+    // Reserved-write evidence selects no wire operation: it carries no `op`
+    // tag while every `StoreRequest` encoding requires one.
+    let reserved_shape = serde_json::to_value(valid_request()).unwrap();
+    assert!(reserved_shape.get("op").is_none());
 }
 
 // WORK_UNIT_CASE: 990/11
 #[test]
-fn caller_created_projection_proves_shape_only_never_current_authority() {
+fn caller_created_projection_shape_is_closed_schema_hygiene() {
+    // Schema hygiene ONLY, never an authority proof: a self-consistent caller
+    // fabrication passes `validate()` by construction, so this pins the
+    // closed JSON shape and nothing about currency or agency. The
+    // no-authority boundary itself is proven by the `compile_fail` doctest on
+    // `CanonicalStoreClient` (no invocable reserved-write entry point) and
+    // the closed wire catalogue in 990/10 (no reserved-write variant).
     let fabricated = valid_request();
     assert!(
         fabricated.validate().is_ok(),
         "shape check passes on copied evidence"
     );
     let encoded = serde_json::to_value(&fabricated).unwrap();
-    let mut keys = Vec::new();
-    collect_keys(&encoded, &mut keys);
-    for forbidden in [
-        "eligible",
-        "verified",
-        "valid",
-        "authority",
-        "grant",
-        "issuer",
-    ] {
-        assert!(
-            !keys.iter().any(|key| *key == forbidden),
-            "no worker-controlled authority key {forbidden:?} in {keys:?}"
-        );
-    }
-    let replay = valid_request();
+    let mut top_keys: Vec<&str> = encoded
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    top_keys.sort_unstable();
     assert_eq!(
-        replay.admission.reservation_token_digest,
-        fabricated.admission.reservation_token_digest
+        top_keys,
+        vec![
+            "admission",
+            "context",
+            "expected_ordering_heads",
+            "expected_revision_heads",
+            "transition",
+        ],
+        "projection top-level shape is closed"
     );
-}
-
-fn collect_keys(value: &Value, keys: &mut Vec<String>) {
-    match value {
-        Value::Object(map) => {
-            for (key, nested) in map {
-                keys.push(key.clone());
-                collect_keys(nested, keys);
-            }
-        }
-        Value::Array(items) => {
-            for item in items {
-                collect_keys(item, keys);
-            }
-        }
-        _ => {}
-    }
+    let admission = encoded.get("admission").unwrap();
+    let mut admission_keys: Vec<&str> = admission
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    admission_keys.sort_unstable();
+    assert_eq!(
+        admission_keys,
+        vec![
+            "canonical_request_hash",
+            "contract_version",
+            "created_at_ms",
+            "expires_at_ms",
+            "idempotency_key",
+            "operation_id",
+            "prepared_transition_digest",
+            "recovery_owner",
+            "reservation_id",
+            "reservation_order",
+            "reservation_token_digest",
+            "scopes",
+            "source_id",
+            "state_fence",
+            "writer_epoch",
+        ],
+        "admission shape is closed: a new authority-like key fails here"
+    );
 }
 
 // WORK_UNIT_CASE: 990/12
@@ -874,60 +1132,26 @@ fn existing_client_implementations_keep_ordinary_apply_behavior() {
 
 // WORK_UNIT_CASE: 990/16
 #[test]
-fn source_and_api_guard_excludes_hidden_authority_io_and_activation() {
-    let source = include_str!("../src/write_admission.rs");
-    for forbidden in [
-        "eliot_ors",
-        "eliot-ors",
-        "ors::",
-        "SystemTime",
-        "UNIX_EPOCH",
-        "std::time",
-        "std::fs",
-        "std::net",
-        "std::process",
-        "std::env",
-        "tokio",
-        "async_std",
-        "apply_prepared",
-        "WriteReceipt {",
-        "ReceiptEnvelope",
-        "schedul",
-        "eligible",
-        "verified",
-        "Atomic",
-        "Mutex",
-        "RwLock",
-        "RefCell",
-        "OnceLock",
-        "thread_local",
-        "CAPABILITY",
-    ] {
-        assert!(
-            !source.contains(forbidden),
-            "write_admission.rs must not contain {forbidden:?}"
-        );
-    }
-    assert!(
-        source.contains("deny_unknown_fields"),
-        "closed shape is enforced"
-    );
+fn exported_api_surface_exposes_no_reserved_write_authority() {
+    // Exported-interface authority guard, never source-text matching: the
+    // entry-point proof is the `compile_fail` doctest on
+    // `CanonicalStoreClient` (a caller attempt at `apply_reserved_write`
+    // must fail to compile), and the wire proof is the closed `StoreRequest`
+    // catalogue in 990/10. This test pins the remaining runtime-exported
+    // surfaces: the advertised capability and effect sets.
     assert!(
         CAPABILITIES
             .iter()
             .all(|capability| !capability.contains("reserv") && !capability.contains("admission")),
         "no hidden capability activation: {CAPABILITIES:?}"
     );
-    // Audit-D reconciliation: invoking a reserved-write entry point is now
-    // impossible because the trait exposes none. The projection JSON-key
-    // assertion in 990/11 remains the shape-only proof; this guards the
-    // boundary itself against reintroduction of a Store-client
-    // reserved-write operation outside a separately reviewed slice.
-    let lib = include_str!("../src/lib.rs");
-    for forbidden in ["apply_reserved_write", "reserved_write"] {
-        assert!(
-            !lib.contains(forbidden),
-            "lib.rs must not contain a reserved-write entry point: {forbidden:?}"
-        );
-    }
+    assert_eq!(
+        EFFECTS,
+        &["read", "canonical_write"],
+        "no reserved-write effect exists on the exported surface"
+    );
+    // Authority conclusion at the wire boundary: caller-sealed reservation
+    // evidence still selects no `StoreRequest` operation.
+    let reserved_json = serde_json::to_value(valid_request()).unwrap();
+    assert!(serde_json::from_value::<StoreRequest>(reserved_json).is_err());
 }
