@@ -1,0 +1,167 @@
+schema = "eliot.workspace-admission-sequence.v1"
+authority = "NON_NORMATIVE_SEQUENCING_RECORD"
+routing_authority = "owning_issue_and_normative_pair_only"
+status = "SEQUENCED_AWAITING_OWNING_PACKAGE_PROOF"
+implementation_support = "ALL_SIXTEEN_PACKAGES_ALREADY_WORKSPACE_MEMBERS_ON_MAIN"
+evidence_execution_status = "MANIFEST_STATE_AND_PACKAGE_PROOF_GATES_EXECUTED_ON_BASE_SHA"
+proof_ceiling = "SEQUENCING_AND_PROOF_ATTESTATION_ONLY_NO_ADMISSION_NO_RUNTIME_NO_PRODUCT"
+base_sha = "52c78fab7ee1f8f09979b13b69725ec2d25df125"
+branch = "work/966-workspace-mgr05"
+parent_product_issue = 11
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "dreamer.workspace-admission.966-969-sequence"
+causal_property = "The three Dreamer handler workspace-admission PRs (#1183 Curation, #1184 non-Curation, #1207 memory+Curation serial) form one coherent proof-gated sequence with a single Cargo writer lane each, no batch admission without proof, and no duplicate root-manifest ownership."
+current_discriminator = "The three PR branches each carry only their assignment TOML while all sixteen denominator packages are already root-workspace members on current main; without an explicit sequence the Curation subset overlap (#1207 strictly inside #1183) invites parallel root Cargo.toml/Cargo.lock writers and proof-free batch admission."
+primary_issue_urls = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/966",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/969",
+]
+
+[manifest_state_on_base]
+# Verified with: git show origin/main:Cargo.toml and git ls-tree origin/main crates/smart/.
+# All sixteen denominator packages below are already in root [workspace] members.
+non_curation_admitted_by = "0bc1336c work/969: admit five D2 diagnosis-planning leaves (#1514)"
+curation_tail_admitted_by = "3b831849 work/966: admit six Curation handlers to root workspace (Wave S2) (#1998)"
+curation_head_admitted_by = "7a2b5fd4 T8-AS1: admit S1 Curation six (#1459) and follow-ups"
+issue_966_state = "CLOSED"
+issue_969_state = "OPEN"
+pr_1183_branch = "origin/work/966-curation-workspace-admission (1 file: 966-curation-workspace-admission.toml)"
+pr_1184_branch = "origin/work/969-dreamer-job-workspace-admission (1 file: 969-dreamer-job-workspace-admission.toml)"
+pr_1207_branch = "origin/work/966-dreamer-memory-workspace-admission (1 file: 966-memory-handler-workspace-admission.toml)"
+none_of_the_three_branches_touches = ["root Cargo.toml", "root Cargo.lock", "package source", "package tests"]
+
+[denominators]
+curation_1183 = [
+  "crates/smart/eliot-dreamer-classification",
+  "crates/smart/eliot-dreamer-relation",
+  "crates/smart/eliot-dreamer-episode",
+  "crates/smart/eliot-dreamer-concept",
+  "crates/smart/eliot-dreamer-procedure",
+  "crates/smart/eliot-dreamer-failure",
+  "crates/smart/eliot-dreamer-structure-repair",
+  "crates/smart/eliot-dreamer-reconsolidation",
+  "crates/smart/eliot-dreamer-accessibility",
+  "crates/smart/eliot-dreamer-memory-repair",
+  "crates/smart/eliot-dreamer-curation",
+]
+non_curation_1184 = [
+  "crates/smart/eliot-dreamer-conflict-analysis",
+  "crates/smart/eliot-dreamer-development-diagnosis",
+  "crates/smart/eliot-dreamer-maintenance-plan",
+  "crates/smart/eliot-dreamer-configuration-plan",
+  "crates/smart/eliot-dreamer-orchestration-plan",
+]
+memory_serial_1207 = [
+  "crates/smart/eliot-dreamer-structure-repair",
+  "crates/smart/eliot-dreamer-reconsolidation",
+  "crates/smart/eliot-dreamer-accessibility",
+  "crates/smart/eliot-dreamer-memory-repair",
+  "crates/smart/eliot-dreamer-curation",
+]
+
+[overlap]
+# #1207 denominator is a strict subset of #1183 denominator (5 of 11).
+serial_1207_subset_of_curation_1183 = true
+subset_members = [
+  "eliot-dreamer-structure-repair",
+  "eliot-dreamer-reconsolidation",
+  "eliot-dreamer-accessibility",
+  "eliot-dreamer-memory-repair",
+  "eliot-dreamer-curation",
+]
+curation_only_not_in_1207 = [
+  "eliot-dreamer-classification",
+  "eliot-dreamer-relation",
+  "eliot-dreamer-episode",
+  "eliot-dreamer-concept",
+  "eliot-dreamer-procedure",
+  "eliot-dreamer-failure",
+]
+non_curation_disjoint_from_both = true
+
+[proof_status_on_base]
+# Gates executed on this branch at base SHA (clean tree, no edits):
+#   cargo clippy --locked -p <family> --all-targets --no-deps -- -D warnings
+#   cargo test --locked -p <family>
+# Static scan: no NOT_IMPLEMENTED literal and no #[ignore] in any of the 16 crates.
+# ("placeholder" hits are doc prose stating no placeholders, plus local
+# deterministic digest fixtures in episode/relation tests.)
+non_curation_1184_clippy = "PASS (5/5 crates, exit 0)"
+non_curation_1184_tests = "PASS (8 passed x5 crates, 0 failed, 0 ignored)"
+non_curation_1184_verdict = "PROVED_AT_PACKAGE_LEVEL"
+curation_1183_tests = "PASS (all 11 crates: 59+41+50+9+48+55+6+6+5+45+8 passed, 0 failed, 0 ignored)"
+curation_1183_clippy = "FAIL (2 of 11 crates)"
+curation_1183_clippy_failures = [
+  "eliot-dreamer-procedure lib test: 3x clippy::expect_used (Result/Result/Option .expect in #[cfg(test)] helper)",
+  "eliot-dreamer-memory-repair lib test: 3x clippy::expect_used (crates/smart/eliot-dreamer-memory-repair/src/lib.rs:2456,2457,2459 test_fence)",
+]
+curation_1183_verdict = "NOT_PROVED_UNDER_ALL_TARGETS_MINUS_D_WARNINGS_GATE"
+# The lint failures are test-only and pre-exist on origin/main; repairing them
+# belongs to the owning package issues, never to a workspace-admission lane
+# (issue #966: no implementation repairs inside integration; one writer per file).
+
+[containment]
+# Cartographer verification (FOLLOW-UP directive), executed from
+# C:/Development/Rust/projects/eliot-memory-os on origin/main 52c78fab.
+# PR tips confirmed: 1207=f85a617d, 1183=f582fc74, 1184=3a156f25 (all 2026-09-11).
+# Common merge-base with main for all three: 8ebf8b41.
+# At 8ebf8b41, root Cargo.toml members=[lines 2..140], exclude=[lines 141..186];
+# ALL sixteen denominator packages sit in exclude (e.g. classification:165,
+# failure:170, structure-repair:171, curation:175, conflict-analysis:181).
+# Same-as-squash file test per directive (git diff <squash> <pr-tip> -- <file>):
+# each PR adds exactly one assignment TOML; that path exists in NONE of
+# 3b831849/fe9b17df/b5ede3e9 nor on origin/main, so the literal file additions
+# are novel planning docs with zero manifest/lock/source/test effect.
+# Functional admission intent is WHOLLY contained in merged squashes:
+# - #1183 head 5 (classification/relation/episode/concept/procedure): moved
+#   exclude->members by 7a2b5fd4 (2026-09-14, T8-AS1 S1 Curation six, #1459).
+# - #1183 tail 6 = #1207 denominator 5 + failure (structure-repair,
+#   reconsolidation, accessibility, memory-repair, curation [+failure]): moved
+#   exclude->members by 3b831849 (Wave S2, #1998).
+# - #1184 denominator 5 (conflict-analysis, development-diagnosis,
+#   maintenance-plan, configuration-plan, orchestration-plan): moved
+#   exclude->members by 0bc1336c (five D2 leaves, #1514, 2026-09-15).
+# - #2005 (Wave L1: learning-state-view/delta/overlay, activation-assessment,
+#   self-quality) and #2000 (D1: clarification, architecture-brief,
+#   implementation-brief) denominators are DISJOINT from all three PRs.
+# - Cargo.lock stanzas for all denominators present on origin/main (spot:
+#   conflict-analysis:1347, curation:1389, memory-repair:1474,
+#   orchestration-plan:1485, procedure:1517).
+# Uncovered functional delta: NONE. No re-implementation performed or needed.
+containment_verdict = "ALL_THREE_SUPERSEDED_WITH_EVIDENCE"
+
+[sequence]
+# Serial, proof-gated order. Later lanes start only after the earlier lane's
+# gate evidence is bound to current main.
+order = ["#1184-close", "#1183-close", "#1207-close"]
+step_1_pr_1184 = "SUPERSEDE (containment): denominator wholly admitted by 0bc1336c (#1514); close with evidence comment, no re-implementation."
+step_2_pr_1183 = "SUPERSEDE (containment): head 5 admitted by 7a2b5fd4 (#1459), tail 6 by 3b831849 (#1998); close with evidence comment, no re-implementation. The procedure + memory-repair clippy findings below remain owning-package-issue work, not admission work."
+step_3_pr_1207 = "SUPERSEDE (containment + subset): strict subset of #1183, wholly admitted by 3b831849 (#1998); close with evidence comment, no re-implementation."
+
+[per_pr_strategy]
+pr_1183 = "SUPERSEDE-WITH-EVIDENCE (containment): f582fc74 adds only 966-curation-workspace-admission.toml (novel planning doc, no functional delta); all 11 denominator packages admitted by 7a2b5fd4 (#1459, head 5) + 3b831849 (#1998, tail 6). Do NOT re-implement. Recommend: gh pr close 1183 with evidence comment citing squash SHAs + file list."
+pr_1184 = "SUPERSEDE-WITH-EVIDENCE (containment): 3a156f25 adds only 969-dreamer-job-workspace-admission.toml (novel planning doc, no functional delta); all 5 denominator packages admitted by 0bc1336c (#1514). Do NOT re-implement. Recommend: gh pr close 1184 with evidence comment."
+pr_1207 = "SUPERSEDE-WITH-EVIDENCE (containment + strict subset of #1183): f85a617d adds only 966-memory-handler-workspace-admission.toml (novel planning doc, no functional delta); all 5 denominator packages admitted by 3b831849 (#1998). Do NOT re-implement. Recommend: gh pr close 1207 with evidence comment."
+
+[scope]
+primary_paths = ["workstreams/dreamer/assignments/966-969-workspace-admission-sequence.toml"]
+forbidden = [
+  "editing root Cargo.toml or Cargo.lock in any of the three lanes (membership already admitted; already-admitted exact packages take the verified no-op path)",
+  "repairing package lint/test failures inside a workspace-admission lane",
+  "weakening, deleting, or #[ignore]-ing any package test",
+  "adding runtime routes, providers, authority, effects, or task Finish",
+  "treating workspace membership as implementation, runtime, or Product support",
+  "parallel root-manifest writers across the three lanes",
+]
+
+[reading_evidence]
+route_receipt_cargo = "sha256:54bccb962b14832d2e0616d1e77138d5ede47c7031d5e956333ee0eea8ab219a"
+read_receipt_cargo = "sha256:80f387ca57f80a78441f8ff0d62eaf3b40a3a3dd4e2a37b6dc9702a2291b6e37"
+bundle_cargo = "sha256:b5c06a7988d0aa88735800b8394c2429a3d879f573b52166902a60f0d13e1be9"
+route_receipt_assignments = "sha256:f396ae011a49173fb4adb4951f832f99bf43d3b0421fb5e37ae2c075ad42e7de"
+read_receipt_assignments = "sha256:a92c65582e330230fa6a30360c3d6b3c08d9aa41528ae2c14922a01df6fcfae8"
+bundle_assignments = "sha256:cf69e33a30b6f54f46c9e75ba2d78608e4f7ed67fe5d553876c22403406e4f61"
+matched_routes = ["dreamer", "workspace-governance", "repository-root", "instrument-verification"]
+attestation = "I read the verified bundles for the Cargo.toml and workstreams/dreamer/assignments families (required items incl. AGENTS.md, WORKFLOW.md, ARCHITECTURE_CONTRACT, DEPENDENCY_POLICY, READING_PROTOCOL, ACTIVE.toml, I2.17/I2.22/I2.23 fragments) before creating this sequencing record; this file changes no manifest, lockfile, source, test, or generated index."
