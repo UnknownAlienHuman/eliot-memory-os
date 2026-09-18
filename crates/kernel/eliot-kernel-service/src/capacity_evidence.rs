@@ -487,7 +487,8 @@ impl CapacityEnvelope {
         match (&self.distribution, self.sample_count) {
             (Some(distribution), Some(count))
                 if count >= MIN_PERCENTILE_SAMPLES
-                    && distribution.sample_count >= MIN_PERCENTILE_SAMPLES =>
+                    && distribution.sample_count >= MIN_PERCENTILE_SAMPLES
+                    && count == distribution.sample_count =>
             {
                 EvidenceClass::PercentileEvidence
             }
@@ -946,6 +947,8 @@ mod tests {
                 distribution_sample_count: 3,
             })
         );
+        assert_ne!(envelope.evidence_class(), EvidenceClass::PercentileEvidence);
+        assert_eq!(envelope.evidence_class(), EvidenceClass::Observation);
 
         // A distribution without a recorded envelope count is unknown
         // metadata, not a measured zero.
