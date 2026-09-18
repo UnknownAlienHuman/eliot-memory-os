@@ -29,5 +29,8 @@ time.workspace = true
 [target.'cfg(windows)'.dev-dependencies]
 eliot-windows-ipc = { workspace = true, features = ["test-support"] }
 
+[features]
+live-edge = []
+
 [lints]
 workspace = true

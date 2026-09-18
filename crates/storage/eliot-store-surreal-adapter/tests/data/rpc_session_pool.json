@@ -1,0 +1,18 @@
+{
+  "issue": 987,
+  "denominator": 12,
+  "profiles": {
+    "compatibility": { "read_sessions": 1, "write_sessions": 1, "admin_sessions": 1 },
+    "concurrent_lanes": { "read_sessions": 2, "write_sessions": 2, "admin_sessions": 1 },
+    "maximal": { "read_sessions": 8, "write_sessions": 8, "admin_sessions": 8 }
+  },
+  "invalid": [
+    { "read_sessions": 0, "write_sessions": 1, "admin_sessions": 1 },
+    { "read_sessions": 1, "write_sessions": 0, "admin_sessions": 1 },
+    { "read_sessions": 1, "write_sessions": 1, "admin_sessions": 0 },
+    { "read_sessions": 9, "write_sessions": 1, "admin_sessions": 1 },
+    { "read_sessions": 1, "write_sessions": 1, "admin_sessions": 9 }
+  ],
+  "pool_read_operations": ["read.schema_generation", "read.revision_heads_inner", "recovery.snapshot"],
+  "facade_operations": ["migration.apply", "proof.987.facade", "apply.prepared"]
+}

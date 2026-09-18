@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 description = "Canonical ECXF/1 interchange source for ELIOT storage"
 
+[package.metadata.eliot]
+workspace_admission = "unreachable pending explicit owner disposition per #1716 (governed export path: #1871); not a selectable production fallback"
+
 [dependencies]
 eliot-blob-api.workspace = true
 eliot-contracts.workspace = true
@@ -14,6 +17,9 @@ eliot-store-api.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+toml.workspace = true
 
 [lints]
 workspace = true
