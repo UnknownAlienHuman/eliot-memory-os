@@ -326,6 +326,67 @@ mod tests {
         );
     }
 
+    /// Behavioral ambient-execution guard without environment mutation.
+    ///
+    /// Slice A removed environment-selected provider execution entirely, so
+    /// no ambient configuration value can enable execution: both bridge
+    /// operations must remain the typed non-executing gap. This test
+    /// deliberately performs no process-environment mutation: the crate is
+    /// `#![forbid(unsafe_code)]` and `std::env::set_var` is `unsafe` in the
+    /// crate's edition, so mutating the environment in-process would require
+    /// weakening the crate's unsafe policy. Restoration of the ambient path
+    /// is instead made observable by
+    /// `crate_sources_contain_no_ambient_launch_path` below.
+    #[test]
+    fn no_ambient_research_bridge_configuration_can_enable_execution() {
+        let mut bridge = GovernedResearchBridge::new(test_identity());
+        assert!(
+            matches!(
+                ResearchBridge::submit(&mut bridge, &test_request()),
+                Err(BridgeError::ProviderUnavailable)
+            ),
+            "submit must stay a typed gap regardless of ambient configuration"
+        );
+        assert!(
+            matches!(
+                ResearchBridge::cancel(&mut bridge, "job-24-slice-a"),
+                Err(BridgeError::ProviderUnavailable)
+            ),
+            "cancel must stay a typed gap regardless of ambient configuration"
+        );
+    }
+
+    /// Static ambient-launch guard: the crate must not regain an
+    /// environment-selected execution path.
+    ///
+    /// The forbidden symbols are spelled as fragments joined at runtime so
+    /// this guard never matches its own source text. If the removed ambient
+    /// bridge (environment lookup, ambient constructors/composer, or the
+    /// child-process launch primitive) is restored in either crate source
+    /// file, this test fails before any behavioral assertion runs.
+    #[test]
+    fn crate_sources_contain_no_ambient_launch_path() {
+        // Each pair joins to one removed ambient-bridge symbol. Keep the
+        // halves split so this file never contains a forbidden symbol itself.
+        const FORBIDDEN_FRAGMENTS: [(&str, &str); 5] = [
+            ("Command:", ":new"),
+            ("std::process:", ":Command"),
+            ("ELIOT_RESEARCH_", "BRIDGE"),
+            ("from_", "environment"),
+            ("compose_from_", "environment"),
+        ];
+        const SOURCES: [&str; 2] = [include_str!("lib.rs"), include_str!("main.rs")];
+        for (head, tail) in FORBIDDEN_FRAGMENTS {
+            let symbol = format!("{head}{tail}");
+            for source in SOURCES {
+                assert!(
+                    !source.contains(symbol.as_str()),
+                    "ambient launch symbol must not return to eliot-mod-research"
+                );
+            }
+        }
+    }
+
     #[test]
     fn carried_identity_is_exact_end_to_end() {
         let researcher = compose_with_bridge(test_identity());
