@@ -200,7 +200,7 @@ fn validation_denied(error: &DreamDraftValidationError) -> DreamerError {
 #[cfg(test)]
 mod slice_6_validation_tests {
     use super::*;
-    use std::cell::{Cell, RefCell};
+    use std::cell::Cell;
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -214,8 +214,7 @@ mod slice_6_validation_tests {
     };
     use eliot_dreamer_contracts::{
         BudgetLimits, BudgetUsage, BundleCompleteness, DreamInputBundle, DreamJobAdmission,
-        PreservationReport, Requester, RequesterOrigin, ValidatedDreamDraft, ValidationPolicy,
-        ValidationReceipt,
+        PreservationReport, Requester, RequesterOrigin, ValidationPolicy,
     };
     use eliot_dreamer_orientation::{
         AnchoredEvidence, OrientationPacketCandidate, OrientationResidue,
@@ -862,145 +861,408 @@ mod slice_6_validation_tests {
         ));
     }
 
-    /// Builds a receipt-bound draft preimage for the pre-handler ordering
-    /// proofs below. The value is only carried through the seam (the seam
-    /// returns it untouched on acceptance), so static well-shaped digests
-    /// suffice; no receipt is issued here.
-    fn accepted_draft_preimage() -> ValidatedDreamDraft {
-        let digest = "0".repeat(64);
-        ValidatedDreamDraft {
-            receipt: ValidationReceipt {
-                schema_version: 1,
-                validator_contract: "contract-slice-6".to_owned(),
-                validator_policy: "policy-slice-6".to_owned(),
-                job_id: "job-slice-6".to_owned(),
-                draft_digest: digest.clone(),
-                bundle_digest: digest.clone(),
-                manifest_digest: digest.clone(),
-                task_id: "task-slice-6".to_owned(),
-                scope_id: "scope-slice-6".to_owned(),
-                input_digest: digest.clone(),
-                output_digest: digest.clone(),
-                terminal_disposition: "accepted".to_owned(),
-                proof_ceiling: "ceiling-slice-6".to_owned(),
-                state_fence: fence(),
-                preservation_digest: digest.clone(),
-                budget_digest: digest,
-            },
-            draft_digest: "0".repeat(64),
-            scope_id: "scope-slice-6".to_owned(),
-            task_id: "task-slice-6".to_owned(),
-            state_fence: fence(),
+    /// Builds one admitted Orientation pair bound to evidence the frame source
+    /// and the v1 hypothesis can bind: the same epoch-1 fence on both sides
+    /// so only owner gates (never identity) can refuse.
+    fn admitted_orientation_pair() -> (KernelJobAdmission, DreamJobInput) {
+        let admission = admission_with_deadline(u64::MAX);
+        let mut job = job_of_class(&admission, JobClass::Orientation, Some("task-slice-6"));
+        job.evidence_handles = vec!["evidence-slice-6".to_owned()];
+        (admission, job)
+    }
+
+    /// Runs the genuine admitted chain up to grounding for one fixture pair:
+    /// model derivation, then the real A-14b owner grounding, surfaced
+    /// unmodified.
+    fn grounding_for(admission: &KernelJobAdmission, job: &DreamJobInput) -> GroundedDreamDraft {
+        let model_inputs = match crate::model_stage::resolve_model_inputs(admission, job) {
+            Ok(inputs) => inputs,
+            Err(error) => panic!("fixture model inputs must resolve, got {error:?}"),
+        };
+        let draft = match crate::model_stage::run_admitted_model(model_inputs) {
+            Ok(draft) => draft,
+            Err(error) => panic!("fixture model must prove, got {error:?}"),
+        };
+        let request = match crate::grounding_stage::resolve_grounding_inputs(admission, job, draft)
+        {
+            Ok(request) => request,
+            Err(error) => panic!("fixture grounding must resolve, got {error:?}"),
+        };
+        match crate::grounding_stage::ground_admitted_draft(request) {
+            Ok(grounded) => grounded,
+            Err(error) => panic!("fixture grounding must prove, got {error:?}"),
         }
     }
 
-    /// A-05 pre-handler proof (a): validation runs before any native
-    /// semantic handler. The counting validation closure records
-    /// `validation` first; the stub handler records `handler` only after the
-    /// seam returns the accepted candidate. Order plus both counters prove
-    /// the before-handler shape.
+    /// Builds the genuine A-05 carrier for one grounded fixture pair with an
+    /// explicit observation time.
+    fn carrier_for(
+        admission: &KernelJobAdmission,
+        job: &DreamJobInput,
+        grounded: GroundedDreamDraft,
+        observation_time_ms: Option<u64>,
+    ) -> GroundingValidationInput {
+        match crate::admitted_material::validation_input_for(
+            admission,
+            job,
+            grounded,
+            observation_time_ms,
+        ) {
+            Ok(carrier) => carrier,
+            Err(error) => panic!("fixture carrier must build, got {error:?}"),
+        }
+    }
+
+    /// A-05 pre-handler proof (a): accepted input runs the real owner
+    /// validation exactly once and the real dispatcher projects exactly
+    /// once. The counting wrappers surround the genuine owner functions, so
+    /// the counters prove the once-per-admission call shape on the same code
+    /// production executes; the packet assertions prove the handler genuinely
+    /// ran (identity bindings verbatim, candidate-only ceiling, G4 markers).
     #[test]
     fn prehandler_runs_before_handler() {
-        let input = malformed_carrier();
-        let accepted = ValidatedGroundingCandidate {
-            input: input.clone(),
-            validated: accepted_draft_preimage(),
-        };
+        use crate::DreamResult;
+        use crate::dispatch_stage::{dispatch_orientation_with, project_validated_orientation};
+        use eliot_dreamer_candidate_validation::validate_grounded_dream_draft_at;
+
+        let (admission, job) = admitted_orientation_pair();
+        let grounded = grounding_for(&admission, &job);
+        let input = carrier_for(&admission, &job, grounded, Some(0));
         let validation_calls = Cell::new(0_usize);
-        let handler_calls = Cell::new(0_usize);
-        let order = RefCell::new(Vec::new());
         let validated = validate_admitted_draft_with(&input, |carrier| {
             validation_calls.set(validation_calls.get() + 1);
-            order.borrow_mut().push("validation");
-            assert!(
-                std::ptr::eq(carrier, &input),
-                "seam must pass the admitted carrier by reference"
-            );
-            Ok(StructuredCandidateValidationOutcome::Accepted(Box::new(
-                accepted.clone(),
-            )))
+            validate_grounding_candidate_at(carrier)
         });
-        let Ok(candidate) = validated else {
-            panic!("accepted carrier must pass pre-handler validation");
+        let Ok(validated) = validated else {
+            panic!("admitted carrier must pass pre-handler validation");
         };
-        // Native semantic handler stub: runs only after validation returned.
-        handler_calls.set(handler_calls.get() + 1);
-        order.borrow_mut().push("handler");
-        assert_eq!(candidate.input, input);
-        assert_eq!(validation_calls.get(), 1);
-        assert_eq!(handler_calls.get(), 1);
-        assert_eq!(order.borrow().as_slice(), &["validation", "handler"]);
+        assert_eq!(
+            validation_calls.get(),
+            1,
+            "owner validation must run exactly once per admission"
+        );
+        let v1_calls = Cell::new(0_usize);
+        let handler_calls = Cell::new(0_usize);
+        let result = dispatch_orientation_with(
+            &admission,
+            &job,
+            &validated,
+            |admitted, bundle, model, grounded, policy, usage, preservation| {
+                v1_calls.set(v1_calls.get() + 1);
+                validate_grounded_dream_draft_at(
+                    admitted,
+                    bundle,
+                    model,
+                    grounded,
+                    policy,
+                    usage,
+                    preservation,
+                    Some(0),
+                    false,
+                )
+            },
+            |admitted_job, candidate, bundle, policy| {
+                handler_calls.set(handler_calls.get() + 1);
+                project_validated_orientation(admitted_job, candidate, bundle, policy)
+            },
+        );
+        let Ok(DreamResult::Packet(packet)) = result else {
+            panic!("accepted input must project through the real dispatcher, got {result:?}");
+        };
+        assert_eq!(packet.question, job.exact_question);
+        assert_eq!(packet.scope_id, admission.scope_id);
+        assert_eq!(packet.source_coverage.evidence, job.evidence_handles);
+        assert_eq!(packet.synthesized_interpretations.len(), 1);
+        assert_eq!(
+            packet.synthesized_interpretations[0].epistemic_status, "candidate_only",
+            "projection must not promote the candidate"
+        );
+        assert_eq!(
+            packet.rival_models_and_dissent.len(),
+            2,
+            "both owner residue markers must survive, got {:?}",
+            packet.rival_models_and_dissent
+        );
+        assert_eq!(
+            v1_calls.get(),
+            1,
+            "v1 owner validation must run exactly once"
+        );
+        assert_eq!(
+            handler_calls.get(),
+            1,
+            "the native handler must run exactly once for accepted input"
+        );
+        assert_eq!(
+            validation_calls.get(),
+            1,
+            "dispatch must consume the validated receipt without re-running validation"
+        );
     }
 
-    /// A-05 pre-handler proof (b): a rejected candidate invokes zero native
-    /// semantic handlers. The counting validation closure returns the
-    /// rejected report; the handler stub is gated on `Ok` and must never
-    /// run, so its counter stays at zero while validation ran exactly once.
+    /// A-05 pre-handler proof (b): rejected input runs the real owner
+    /// validation exactly once and invokes zero native handlers,
+    /// fail-closed with no fallback dispatch. Two genuine rejection shapes:
+    /// a Curation carrier the owner directs to its separate typed carrier
+    /// (`UnsupportedJobShape`), and a stale observation at the job deadline.
+    /// In both cases no validated receipt exists, so typestate leaves no
+    /// value the dispatcher could consume — the zero-handler proof is
+    /// structural, and the handler counter pins it.
     #[test]
     fn rejected_candidate_zero_handler_invocations() {
-        let input = malformed_carrier();
-        let report = StructuredCandidateRejectionReport {
-            input: input.clone(),
-            code: RejectionCode::IdentityMismatch,
-            detail: "structured job or policy identity differs".to_owned(),
-            input_digest: "0".repeat(64),
-        };
-        let validation_calls = Cell::new(0_usize);
         let handler_calls = Cell::new(0_usize);
-        let refused = validate_admitted_draft_with(&input, |_| {
+
+        // Curation takes the separate-carrier gate: a genuine semantic
+        // rejection through the real owner, never a shape error.
+        let admission = admission_with_deadline(u64::MAX);
+        let mut curation_job = job_of_class(&admission, JobClass::Curation, None);
+        curation_job.evidence_handles = vec!["evidence-slice-6".to_owned()];
+        let grounded = grounding_for(&admission, &curation_job);
+        let input = carrier_for(&admission, &curation_job, grounded, Some(0));
+        let validation_calls = Cell::new(0_usize);
+        let refused = validate_admitted_draft_with(&input, |carrier| {
             validation_calls.set(validation_calls.get() + 1);
-            Ok(StructuredCandidateValidationOutcome::Rejected(Box::new(
-                report,
-            )))
+            validate_grounding_candidate_at(carrier)
         });
-        match refused {
-            Err(DreamerError::InvalidAdmission("validation semantic rejection")) => {}
-            ref other => panic!("rejected carrier must refuse, got {other:?}"),
-        }
-        // Handler dispatch is gated on validation success: rejection leaves
-        // zero handler invocations by construction (no call site here).
-        assert_eq!(validation_calls.get(), 1);
+        assert!(
+            matches!(
+                refused,
+                Err(DreamerError::InvalidAdmission(
+                    "validation semantic rejection"
+                ))
+            ),
+            "curation carrier must take the separate-carrier gate, got {refused:?}"
+        );
+        assert_eq!(
+            refused.map_err(|error| error.code()),
+            Err("DREAMER_REQUEST_REJECTED")
+        );
+        assert_eq!(
+            validation_calls.get(),
+            1,
+            "owner validation must run exactly once even for rejected input"
+        );
+
+        // Stale observation at the job deadline: the owner rejects with
+        // `DeadlineExceeded`, retained as the same static semantic refusal.
+        let (admission, job) = admitted_orientation_pair();
+        let grounded = grounding_for(&admission, &job);
+        let stale = carrier_for(&admission, &job, grounded, Some(1));
+        let stale_calls = Cell::new(0_usize);
+        let refused = validate_admitted_draft_with(&stale, |carrier| {
+            stale_calls.set(stale_calls.get() + 1);
+            validate_grounding_candidate_at(carrier)
+        });
+        assert!(
+            matches!(
+                refused,
+                Err(DreamerError::InvalidAdmission(
+                    "validation semantic rejection"
+                ))
+            ),
+            "stale observation must refuse fail-closed, got {refused:?}"
+        );
+        assert_eq!(
+            refused.map_err(|error| error.code()),
+            Err("DREAMER_REQUEST_REJECTED")
+        );
+        assert_eq!(stale_calls.get(), 1);
+
+        // No validated receipt exists on either path, so no dispatch call
+        // site can run: zero handler invocations by construction (no call
+        // site here, and no fallback arm exists in the dispatcher).
         assert_eq!(
             handler_calls.get(),
             0,
-            "rejected candidate must invoke zero handlers"
+            "rejected candidates must invoke zero handlers"
         );
     }
 
     /// A-05 pre-handler proof (c): downstream consumes the validation output
-    /// without re-running validation. `validate_once` is `FnOnce`, so the
-    /// counting wrapper cannot run twice for one admission; the downstream
-    /// stub takes only `&ValidatedGroundingCandidate` and runs twice while
-    /// the validation counter stays at one.
+    /// through the real dispatcher without re-running validation.
+    /// `validate_once` is `FnOnce`, so the counting wrapper cannot run twice
+    /// for one admission; two genuine dispatches of the same receipt both
+    /// project while the validation counter stays at one. The binding
+    /// re-proof inside dispatch is receipt arithmetic, not owner validation.
     #[test]
     fn validated_output_consumed_without_revalidation() {
-        let input = malformed_carrier();
-        let accepted = ValidatedGroundingCandidate {
-            input: input.clone(),
-            validated: accepted_draft_preimage(),
-        };
+        use crate::DreamResult;
+        use crate::dispatch_stage::{dispatch_orientation_with, project_validated_orientation};
+        use eliot_dreamer_candidate_validation::validate_grounded_dream_draft_at;
+
+        let (admission, job) = admitted_orientation_pair();
+        let grounded = grounding_for(&admission, &job);
+        let input = carrier_for(&admission, &job, grounded, Some(0));
         let validation_calls = Cell::new(0_usize);
         let validated = validate_admitted_draft_with(&input, |carrier| {
             validation_calls.set(validation_calls.get() + 1);
-            assert!(std::ptr::eq(carrier, &input));
-            Ok(StructuredCandidateValidationOutcome::Accepted(Box::new(
-                accepted.clone(),
-            )))
+            validate_grounding_candidate_at(carrier)
         });
-        let Ok(candidate) = validated else {
-            panic!("accepted carrier must pass pre-handler validation");
+        let Ok(validated) = validated else {
+            panic!("admitted carrier must pass pre-handler validation");
         };
-        // Downstream consumer: borrows the already-validated output only.
-        let consume = |output: &ValidatedGroundingCandidate| {
-            assert_eq!(output.input, input);
-            assert_eq!(output.validated.task_id, "task-slice-6");
-        };
-        consume(&candidate);
-        consume(&candidate);
+        assert_eq!(validation_calls.get(), 1);
+        if let Err(error) = validated.validate_binding() {
+            panic!("accepted receipt must re-prove its binding without owner work, got {error:?}");
+        }
+        assert_eq!(
+            validation_calls.get(),
+            1,
+            "binding re-proof must not re-run validation"
+        );
+
+        let handler_calls = Cell::new(0_usize);
+        for _ in 0..2 {
+            let result = dispatch_orientation_with(
+                &admission,
+                &job,
+                &validated,
+                |admitted, bundle, model, grounded, policy, usage, preservation| {
+                    validate_grounded_dream_draft_at(
+                        admitted,
+                        bundle,
+                        model,
+                        grounded,
+                        policy,
+                        usage,
+                        preservation,
+                        Some(0),
+                        false,
+                    )
+                },
+                |admitted_job, candidate, bundle, policy| {
+                    handler_calls.set(handler_calls.get() + 1);
+                    project_validated_orientation(admitted_job, candidate, bundle, policy)
+                },
+            );
+            let Ok(DreamResult::Packet(packet)) = result else {
+                panic!("validated receipt must dispatch on every consumption, got {result:?}");
+            };
+            assert_eq!(packet.scope_id, admission.scope_id);
+        }
+        assert_eq!(
+            handler_calls.get(),
+            2,
+            "each downstream consumption must reach the native handler"
+        );
         assert_eq!(
             validation_calls.get(),
             1,
             "downstream consumption must not re-run validation"
+        );
+    }
+
+    /// A-05 pre-handler proof (d): a tampered or foreign receipt is refused
+    /// at the dispatch gate before any handler work. Tampering the sealed
+    /// output digest breaks the binding re-proof; presenting a receipt bound
+    /// to another scope breaks the scope pin. Both refuse with bounded
+    /// static fields while the v1 and projection counters stay at zero.
+    #[test]
+    fn tampered_receipt_refused_before_handler() {
+        use crate::DreamResult;
+        use crate::dispatch_stage::{dispatch_orientation_with, project_validated_orientation};
+        use eliot_dreamer_candidate_validation::validate_grounded_dream_draft_at;
+
+        let (admission, job) = admitted_orientation_pair();
+        let grounded = grounding_for(&admission, &job);
+        let input = carrier_for(&admission, &job, grounded, Some(0));
+        let validated = match validate_admitted_draft(&input) {
+            Ok(validated) => validated,
+            Err(error) => {
+                panic!("admitted carrier must pass pre-handler validation, got {error:?}")
+            }
+        };
+
+        let v1_calls = Cell::new(0_usize);
+        let handler_calls = Cell::new(0_usize);
+        let dispatch_counted = |validated: &ValidatedGroundingCandidate| {
+            dispatch_orientation_with(
+                &admission,
+                &job,
+                validated,
+                |admitted, bundle, model, grounded, policy, usage, preservation| {
+                    v1_calls.set(v1_calls.get() + 1);
+                    validate_grounded_dream_draft_at(
+                        admitted,
+                        bundle,
+                        model,
+                        grounded,
+                        policy,
+                        usage,
+                        preservation,
+                        Some(0),
+                        false,
+                    )
+                },
+                |admitted_job, candidate, bundle, policy| {
+                    handler_calls.set(handler_calls.get() + 1);
+                    project_validated_orientation(admitted_job, candidate, bundle, policy)
+                },
+            )
+        };
+
+        // Tampered seal: the output digest no longer matches the preimage.
+        let mut tampered = validated.clone();
+        tampered.validated.receipt.output_digest = "f".repeat(64);
+        let refused = dispatch_counted(&tampered);
+        assert!(
+            matches!(
+                refused,
+                Err(DreamerError::InvalidAdmission(
+                    "validation receipt" | "validation receipt binding"
+                ))
+            ),
+            "tampered receipt must refuse at the gate, got {refused:?}"
+        );
+
+        // Foreign receipt: bound to another scope identity (matching
+        // admission and job, so the chain validates it; dispatch under the
+        // original pair must refuse the scope pin). Note the canonical
+        // identity covers class/operation/scope, so scope is what makes
+        // this receipt observably foreign; the Kernel job-id half is pinned
+        // by the binding check that runs before the gate.
+        let mut foreign_admission = admission_with_deadline(u64::MAX);
+        foreign_admission.job_id = "job-slice-6-foreign".to_owned();
+        foreign_admission.scope_id = "scope-slice-6-foreign".to_owned();
+        foreign_admission.attempt_id = "attempt-slice-6-foreign".to_owned();
+        foreign_admission.idempotency_key = "job-slice-6-foreign:attempt-slice-6".to_owned();
+        foreign_admission.cancellation_id = "cancel-slice-6-foreign".to_owned();
+        let mut foreign_job = job_of_class(
+            &foreign_admission,
+            JobClass::Orientation,
+            Some("task-slice-6"),
+        );
+        foreign_job.job_id = "job-slice-6-foreign".to_owned();
+        foreign_job.scope_id = foreign_admission.scope_id.clone();
+        foreign_job.evidence_handles = vec!["evidence-slice-6".to_owned()];
+        let foreign_grounded = grounding_for(&foreign_admission, &foreign_job);
+        let foreign_input =
+            carrier_for(&foreign_admission, &foreign_job, foreign_grounded, Some(0));
+        let foreign = match validate_admitted_draft(&foreign_input) {
+            Ok(foreign) => foreign,
+            Err(error) => {
+                panic!("foreign carrier must validate under its own identity, got {error:?}")
+            }
+        };
+        let refused = dispatch_counted(&foreign);
+        assert!(
+            matches!(refused, Err(DreamerError::InvalidAdmission(_))),
+            "foreign receipt must refuse at the gate, got {refused:?}"
+        );
+        // Sanity: the untampered receipt still dispatches, so the gate
+        // refuses receipts, not the admission itself.
+        let Ok(DreamResult::Packet(_)) = dispatch_counted(&validated) else {
+            panic!("untampered receipt must still dispatch");
+        };
+        assert_eq!(
+            handler_calls.get(),
+            1,
+            "only the untampered receipt may reach the handler"
+        );
+        assert_eq!(
+            v1_calls.get(),
+            1,
+            "refused receipts must not reach v1 validation or projection"
         );
     }
 }
