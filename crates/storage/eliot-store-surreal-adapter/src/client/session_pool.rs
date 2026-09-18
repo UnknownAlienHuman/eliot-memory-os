@@ -124,6 +124,18 @@ impl RoleState {
 }
 
 struct PoolInner {
+    // Generation pinning note (audit R4-A1a/A1c): the pool pins exactly one
+    // provider generation by holding its owner `Arc`; a generation switch
+    // rebuilds the transport and pool together (`connect_with_limits`),
+    // never swaps the owner inside a live pool. A checkout/dispatch-time
+    // generation comparison is BLOCKED on the owner seam: `ProviderOwner`
+    // exposes identity fields and liveness proofs but no generation/epoch
+    // accessor, and comparing the pinned identity against a clone from the
+    // same `Arc` could never observe a transition. Stale sessions therefore
+    // fail closed through the existing per-request paths (the session's
+    // owner-`Weak` upgrade and socket failure both surface
+    // `AdapterError::ProviderUnavailable`); see
+    // `retired_generation_sessions_fail_closed_and_hold_counters`.
     owner: Arc<ProviderOwner>,
     connect_timeout: Duration,
     slots: Vec<SessionSlot>,
@@ -158,9 +170,9 @@ impl SessionPool {
     #[must_use]
     pub fn new(owner: Arc<ProviderOwner>, limits: ClientSetLimits) -> Self {
         let counts = [
-            limits.read_sessions as usize,
-            limits.write_sessions as usize,
-            limits.admin_sessions as usize,
+            limits.read_sessions() as usize,
+            limits.write_sessions() as usize,
+            limits.admin_sessions() as usize,
         ];
         let connect_timeout = Duration::from_millis(owner.config.connect_timeout_ms.max(1));
         let mut slots = Vec::with_capacity(counts.iter().sum());
@@ -235,7 +247,7 @@ impl SessionPool {
             .get_or_try_init(|| RpcSession::connect(&self.inner.owner, deadline))
             .await
         {
-            self.release_slot(role, index);
+            self.return_unchecked_slot(role, index);
             return Err(error);
         }
         state.checked_out.fetch_add(1, Ordering::SeqCst);
@@ -270,14 +282,26 @@ impl SessionPool {
         })
     }
 
-    /// Returns a slot to its role's free list and releases its checked-out
-    /// count. The semaphore permit releases on guard drop.
-    fn release_slot(&self, role: SessionRole, index: usize) {
+    /// Returns a never-checked-out slot to its role's free list.
+    /// Pre-checkout failure path only (lazy-connect failure): the
+    /// checked-out counter never moved for this slot, so it must not move
+    /// here. The semaphore permit releases on guard drop at the call site.
+    fn return_unchecked_slot(&self, role: SessionRole, index: usize) {
         if let Ok(mut free) = self.inner.roles[role.index()].free.try_lock()
             && !free.contains(&index)
         {
             free.push_back(index);
         }
+    }
+
+    /// Releases a checked-out slot: free-list return plus the matching
+    /// checked-out decrement. Drop path only; the semaphore permit releases
+    /// on guard drop.
+    fn release_slot(&self, role: SessionRole, index: usize) {
+        self.return_unchecked_slot(role, index);
+        self.inner.roles[role.index()]
+            .checked_out
+            .fetch_sub(1, Ordering::SeqCst);
     }
 
     /// Executes one closed named operation on a freshly checked-out session
@@ -386,9 +410,6 @@ impl PooledSession {
 impl Drop for PooledSession {
     fn drop(&mut self) {
         self.pool.release_slot(self.role, self.slot);
-        self.pool.inner.roles[self.role.index()]
-            .checked_out
-            .fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -811,10 +832,14 @@ mod pool_behavior_tests {
         assert!(response.take_errors().is_empty());
         assert_eq!(response.take::<String>(0).expect("value"), "facade");
         // New role dispatch reaches the same provider through pooled lanes.
+        // The operation name must come from the closed pooled-read
+        // allowlist: `query_read` re-validates lane admission at its
+        // boundary and routes unlisted names to the facade session, so a
+        // proof-only label would no longer exercise the pooled lane.
         let mut pooled = h
             .transport()
             .query_read(
-                "proof.987.pooled",
+                "read.schema_generation",
                 "RETURN $value;",
                 Map::from_iter([("value".into(), Value::String("pooled".into()))]),
             )
@@ -825,6 +850,69 @@ mod pool_behavior_tests {
         // Pool diagnostics never carry credentials.
         let rendered = format!("{:?} {:?}", h.transport(), h.transport().session_pool());
         assert!(!rendered.contains(h.config.password.expose_secret()));
+        h.cleanup().await;
+    }
+
+    // WORK_UNIT_CASE: 987/7
+    #[tokio::test]
+    async fn retired_generation_sessions_fail_closed_and_hold_counters() {
+        // Stale-generation behavior (audit R4-A1c): a checked-out or cached
+        // G1 pooled session cannot successfully operate once its provider
+        // generation is retired, and failed checkouts hold the exact
+        // counters. Generation death runs through the real seam — stopping
+        // the exact owned child, the same technique as fixture cleanup and
+        // 986/8 — never a synthetic flag.
+        let mut h = PoolHarness::provision().await;
+        h.start(ClientSetLimits::new(2, 2, 1).expect("valid limits"))
+            .await;
+        let pool = h.transport().session_pool().clone();
+        // Warm exactly one read slot under the live generation (G1).
+        let warmed = pool
+            .checkout(SessionRole::Read)
+            .await
+            .expect("warm G1 slot");
+        drop(warmed);
+        assert_eq!(pool.checked_out(SessionRole::Read), 0);
+        assert_eq!(pool.available(SessionRole::Read), 2);
+        // Retire the generation: stop and reap the exact owned child.
+        {
+            let mut child = h.transport().provider.provider_child.lock().await;
+            child.kill().await.expect("stop exact child");
+            child.wait().await.expect("reap exact child");
+        }
+        // A cold slot cannot connect against the retired generation. The
+        // pre-checkout failure returns its slot without moving the
+        // checked-out counter: no leak, no underflow, no silent success.
+        let retired = pool.checkout(SessionRole::Read).await;
+        assert!(
+            retired.is_err(),
+            "cold slot connected after generation death"
+        );
+        assert_eq!(pool.checked_out(SessionRole::Read), 0);
+        assert_eq!(pool.available(SessionRole::Read), 2);
+        // The warmed G1 slot still checks out from its cached cell, but
+        // using it against the retired generation fails closed with
+        // `ProviderUnavailable` instead of serving the dead socket or
+        // recycling it as a healthy session. (Checkout-time rejection of
+        // warmed slots awaits the owner generation-accessor fence; see the
+        // `PoolInner` generation pinning note.)
+        let stale = pool
+            .checkout(SessionRole::Read)
+            .await
+            .expect("warmed G1 slot");
+        let error = stale
+            .query("proof.987.stale", "RETURN 1;", Map::new())
+            .await
+            .expect_err("stale generation use must fail");
+        assert!(
+            matches!(error, AdapterError::ProviderUnavailable),
+            "stale session did not fail closed: {error:?}"
+        );
+        drop(stale);
+        assert_eq!(pool.checked_out(SessionRole::Read), 0);
+        assert_eq!(pool.available(SessionRole::Read), 2);
+        // Release the owner before teardown (see `cleanup` discipline).
+        drop(pool);
         h.cleanup().await;
     }
 
@@ -872,9 +960,9 @@ mod pool_behavior_tests {
     #[test]
     fn compatibility_profile_separates_all_roles_minimally() {
         let profile = ClientSetLimits::compatibility();
-        assert_eq!(profile.read_sessions, 1);
-        assert_eq!(profile.write_sessions, 1);
-        assert_eq!(profile.admin_sessions, 1);
+        assert_eq!(profile.read_sessions(), 1);
+        assert_eq!(profile.write_sessions(), 1);
+        assert_eq!(profile.admin_sessions(), 1);
         assert_eq!(profile.total_sessions(), 3);
     }
 }

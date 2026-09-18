@@ -283,14 +283,25 @@ pub const MAX_CLIENT_SET_SESSIONS_PER_ROLE: u8 = 8;
 /// the already validated [`SurrealAdapterConfig`] and the single provider
 /// owner the pool is built from, so a pool can never start a second provider
 /// process.
+///
+/// The per-role fields are private so the `1..=8` bound cannot be bypassed
+/// by struct-literal construction: every instance originates from the
+/// validated [`ClientSetLimits::new`] or [`ClientSetLimits::compatibility`]
+/// constructors below.
+///
+/// The shared `_sessions` postfix is deliberate domain vocabulary: it mirrors
+/// the `read_sessions` / `write_sessions` / `admin_sessions` keys of the
+/// reviewed pool-profile fixture (`tests/data/rpc_session_pool.json`), so the
+/// lint below is allowed rather than renamed away.
+#[allow(clippy::struct_field_names)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ClientSetLimits {
     /// Bounded read-lane sessions (`Q0-Q4` named reads).
-    pub read_sessions: u8,
+    read_sessions: u8,
     /// Bounded normal-write sessions (canonical transactions).
-    pub write_sessions: u8,
+    write_sessions: u8,
     /// Bounded isolated health/admin sessions.
-    pub admin_sessions: u8,
+    admin_sessions: u8,
 }
 
 impl ClientSetLimits {
@@ -327,6 +338,24 @@ impl ClientSetLimits {
             write_sessions: 1,
             admin_sessions: 1,
         }
+    }
+
+    /// Validated read-lane session bound.
+    #[must_use]
+    pub const fn read_sessions(self) -> u8 {
+        self.read_sessions
+    }
+
+    /// Validated normal-write session bound.
+    #[must_use]
+    pub const fn write_sessions(self) -> u8 {
+        self.write_sessions
+    }
+
+    /// Validated isolated health/admin session bound.
+    #[must_use]
+    pub const fn admin_sessions(self) -> u8 {
+        self.admin_sessions
     }
 
     /// Total sessions across all roles.

@@ -250,5 +250,22 @@ fn pool_seam_keeps_its_fixed_structural_contract() {
             "facade operation leaks into the read lane: {operation}"
         );
     }
+    // Stale-rejection tripwire (audit R4-A1c): the 987/7 behavioral test
+    // proves retired-generation pooled sessions fail closed; these exact
+    // expressions pin the per-request owner-liveness mechanism it relies
+    // on. This is a tripwire, not the generation-fence test itself: the
+    // checkout/dispatch-time fence comparison stays blocked on a
+    // `ProviderOwner` generation accessor (see `PoolInner`).
+    let session = source("src/client/session.rs");
+    for required in [
+        "owner: Weak<ProviderOwner>",
+        ".upgrade()",
+        "ok_or(AdapterError::ProviderUnavailable)",
+    ] {
+        assert!(
+            session.contains(required),
+            "stale-rejection seam lost: {required}"
+        );
+    }
     assert_eq!(descriptor["denominator"], 12);
 }

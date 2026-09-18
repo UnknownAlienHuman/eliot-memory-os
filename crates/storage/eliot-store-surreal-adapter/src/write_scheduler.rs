@@ -70,6 +70,10 @@ pub enum CompletionOutcome {
     /// Commit outcome unknown: dependent scopes pause (not the whole lane)
     /// until [`WriteScheduler::resolve_uncertain`] runs. The optional
     /// retry delay blocks only the affected scope heads, never the lane.
+    /// During a drain the operation is reported through
+    /// [`WriteScheduler::begin_drain`] / [`WriteScheduler::uncertain_operations`]
+    /// until the caller terminally dispositions it: unknown work never
+    /// drains silently.
     Unknown {
         /// Milliseconds from `now_ms` before the scope heads reopen.
         retry_after_ms: u64,
@@ -458,16 +462,49 @@ impl WriteScheduler {
     }
 
     /// Starts the drain: new submissions refuse with
-    /// [`ScheduleReject::Draining`]; already accepted work still schedules
-    /// to completion. Lane-count change and exclusive migration handoff are
-    /// separate owners; this only models the quiesce half.
-    pub fn begin_drain(&mut self) {
+    /// [`ScheduleReject::Draining`]. Returns the currently uncertain
+    /// operation IDs — the mandatory resolution set the caller must
+    /// terminally disposition through [`WriteScheduler::resolve_uncertain`]
+    /// (after reconciling each outcome against its canonical receipt, as
+    /// for any unknown outcome) before [`WriteScheduler::is_drained`] can
+    /// hold and a new generation may start. Already accepted work with a
+    /// known outcome still schedules to completion; accepted work completed
+    /// as `Unknown` holds its scopes until the caller resolves it, so an
+    /// unresolved drain never reaches quiescence silently. Lane-count
+    /// change and exclusive migration handoff are separate owners; this
+    /// only models the quiesce half.
+    pub fn begin_drain(&mut self) -> Vec<OperationId> {
         self.draining = true;
+        self.uncertain_operations()
+    }
+
+    /// Currently uncertain operation IDs in deterministic
+    /// (`reservation_order`, operation id) order: the drain blockers the
+    /// caller must resolve before a generation switch. Reporting only;
+    /// resolution stays an explicit caller act through
+    /// [`WriteScheduler::resolve_uncertain`].
+    #[must_use]
+    pub fn uncertain_operations(&self) -> Vec<OperationId> {
+        let mut uncertain: Vec<(&OperationId, &ScheduledOperation)> = self
+            .pending
+            .iter()
+            .filter(|(_, operation)| operation.uncertain)
+            .collect();
+        uncertain.sort_by(|left, right| {
+            left.1
+                .order
+                .cmp(&right.1.order)
+                .then_with(|| left.0.as_str().cmp(right.0.as_str()))
+        });
+        uncertain.into_iter().map(|(id, _)| (*id).clone()).collect()
     }
 
     /// Whether a drain (or idle start) reached quiescence: nothing pending
-    /// and nothing in flight. A new generation may start only after this
-    /// holds; the switch itself is the caller's.
+    /// and nothing in flight. Uncertain work keeps its pending entry, so a
+    /// drain with an unresolved outcome cannot observe this; the caller
+    /// first resolves every ID reported by
+    /// [`WriteScheduler::begin_drain`]. A new generation may start only
+    /// after this holds; the switch itself is the caller's.
     #[must_use]
     pub fn is_drained(&self) -> bool {
         self.pending.is_empty()
@@ -631,7 +668,11 @@ mod tests {
             Err(ScheduleReject::QueueFull)
         );
         assert!(!scheduler.is_drained());
-        scheduler.begin_drain();
+        let blockers = scheduler.begin_drain();
+        assert!(
+            blockers.is_empty(),
+            "drain entered over certain work only: {blockers:?}"
+        );
         assert_eq!(
             scheduler.submit(projection("third", 3, &[("u", 1)])),
             Err(ScheduleReject::Draining)
@@ -770,6 +811,55 @@ mod tests {
     }
 
     #[test]
+    fn drain_reports_uncertain_blockers_until_caller_resolves() {
+        let mut scheduler = scheduler();
+        scheduler
+            .submit(projection("uncertain-a", 1, &[("s", 1)]))
+            .expect("a");
+        scheduler
+            .submit(projection("blocked-b", 2, &[("s", 2)]))
+            .expect("b");
+        scheduler
+            .mark_in_flight(&operation("uncertain-a"), 0)
+            .expect("a runs");
+        scheduler
+            .complete(
+                &operation("uncertain-a"),
+                CompletionOutcome::Unknown { retry_after_ms: 0 },
+                0,
+            )
+            .expect("a unknown");
+        // The drain names its mandatory resolution set instead of starving
+        // silently: no quiescence while the uncertain outcome is open, and
+        // the successor never becomes ready behind it.
+        let blockers = scheduler.begin_drain();
+        assert_eq!(blockers, vec![operation("uncertain-a")]);
+        assert_eq!(blockers, scheduler.uncertain_operations());
+        assert!(!scheduler.is_drained());
+        assert!(scheduler.ready(0).is_empty());
+        // New submissions still refuse during the drain.
+        assert_eq!(
+            scheduler.submit(projection("late", 3, &[("t", 1)])),
+            Err(ScheduleReject::Draining)
+        );
+        // The caller resolves through the explicit terminal path (recovery
+        // reconciled first, as for any unknown outcome): the successor then
+        // becomes ready — no silent loss, no automatic retry.
+        scheduler
+            .resolve_uncertain(&operation("uncertain-a"), CompletionOutcome::Committed, 10)
+            .expect("caller resolves a");
+        assert!(scheduler.uncertain_operations().is_empty());
+        assert_eq!(scheduler.ready(10), vec![operation("blocked-b")]);
+        scheduler
+            .mark_in_flight(&operation("blocked-b"), 10)
+            .expect("b runs");
+        scheduler
+            .complete(&operation("blocked-b"), CompletionOutcome::Committed, 10)
+            .expect("b commits");
+        assert!(scheduler.is_drained());
+    }
+
+    #[test]
     fn lanes_cap_concurrent_readiness() {
         let mut scheduler = WriteScheduler::new(
             NonZeroUsize::new(1).expect("lanes"),
@@ -890,20 +980,31 @@ mod tests {
             }
         }
         if step.begin_drain.unwrap_or(false) {
-            scheduler.begin_drain();
+            // The corpus never drains over uncertain work (no sequence
+            // completes as unknown): a future sequence that does must add
+            // an explicit resolution step first, not drain silently.
+            let blockers = scheduler.begin_drain();
+            assert!(
+                blockers.is_empty(),
+                "sequence {sequence} drains over uncertain work: {blockers:?}"
+            );
         }
         if let Some(complete) = step.complete {
-            // Corpus completions name in-flight operations; dispatch marks
-            // them running first when no ready snapshot ran before.
+            // Corpus completions name explicitly dispatched operations
+            // only: every completion target must have left the ready set
+            // through a recorded `expect_ready` snapshot first. Implicit
+            // dispatch here would let a completion exercise progress while
+            // bypassing the corpus's ordered readiness observation.
             let id = operation(&complete.id);
             if scheduler
                 .pending
                 .get(&id)
                 .is_some_and(|operation| !operation.in_flight)
             {
-                scheduler
-                    .mark_in_flight(&id, complete.at_ms)
-                    .expect("corpus completion target runs");
+                panic!(
+                    "sequence {sequence}: completion target {} was not explicitly dispatched",
+                    id.as_str()
+                );
             }
             scheduler
                 .complete(
@@ -935,5 +1036,35 @@ mod tests {
                 sequence.name
             );
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "was not explicitly dispatched")]
+    fn corpus_completion_without_explicit_dispatch_is_refused() {
+        // Tripwire for the replay harness: a completion whose target never
+        // left the ready set through a recorded `expect_ready` snapshot
+        // must fail loudly instead of dispatching implicitly.
+        let mut scheduler = WriteScheduler::new(
+            NonZeroUsize::new(2).expect("lanes"),
+            NonZeroUsize::new(8).expect("queue"),
+        );
+        scheduler
+            .submit(projection("op-lonely", 1, &[("s", 1)]))
+            .expect("submit");
+        replay_step(
+            &mut scheduler,
+            "proof",
+            CorpusStep {
+                submit: None,
+                expect_ready: None,
+                begin_drain: None,
+                complete: Some(CorpusComplete {
+                    id: "op-lonely".to_owned(),
+                    outcome: "committed".to_owned(),
+                    at_ms: 0,
+                }),
+                expect_reject: None,
+            },
+        );
     }
 }

@@ -265,12 +265,21 @@ impl RpcTransport {
     /// Executes one closed named read operation on a pooled read-lane
     /// session instead of the facade session, so independent reads no longer
     /// serialize on one socket.
-    pub(crate) async fn query_read(
+    ///
+    /// Private to this module: the pooled read lane is entered only through
+    /// [`RpcTransport::query`]'s closed allowlist below. The allowlist is
+    /// re-validated here at the lane boundary so a future in-module caller
+    /// cannot place an unlisted operation on the read lane by accident;
+    /// unlisted names fall back to the facade session.
+    async fn query_read(
         &self,
         operation: &'static str,
         statement: &str,
         bindings: serde_json::Map<String, Value>,
     ) -> Result<RpcResults, AdapterError> {
+        if !is_pool_read_operation(operation) {
+            return self.query_facade(operation, statement, bindings).await;
+        }
         self.pool
             .query(SessionRole::Read, operation, statement, bindings)
             .await
@@ -312,14 +321,38 @@ impl RpcTransport {
 /// Reports whether a closed named operation is a pure read admitted to the
 /// pooled read lane.
 ///
-/// Closed mapping (S-CONC-CLIENTS, issue #987): `read.*` covers the
-/// canonical head/schema preflight reads, `recovery.*` covers receipt and
-/// outbox readback. Writes (`migration.apply`, canonical transactions),
-/// health probes, and any unlisted operation stay on the facade session by
-/// default. Extending this mapping is the runtime integration's (#993)
-/// decision, not a silent local widening.
+/// Closed allowlist (S-CONC-CLIENTS, issue #987): exactly the pure-read
+/// operations the adapter's production paths issue today — the canonical
+/// head/schema preflight reads (`read.*`) and the receipt/outbox readback
+/// (`recovery.snapshot`). Writes (`migration.apply`, canonical
+/// transactions), health probes, Dreamer rows (`dreamer.read_row`), test
+/// operations, and any unlisted operation stay on the facade session by
+/// default. A newly introduced or typoed `read.*`/`recovery.*` name is NOT
+/// admitted by naming convention: extending this mapping is the runtime
+/// integration's (#993) explicit decision, recorded here as a new entry, not
+/// a silent local widening.
+const POOL_READ_OPERATIONS: &[&str] = &[
+    "read.all_ordering_heads",
+    "read.all_revision_heads",
+    "read.authority_records",
+    "read.canonical_fence",
+    "read.epistemic_position",
+    "read.erasure_outcome",
+    "read.evidence_records",
+    "read.ordering_heads",
+    "read.ordering_heads_inner",
+    "read.receipt_by_operation",
+    "read.receipt_idempotency",
+    "read.revision_heads",
+    "read.revision_heads_inner",
+    "read.schema_generation",
+    "read.schema_meta",
+    "read.validation_snapshot",
+    "recovery.snapshot",
+];
+
 fn is_pool_read_operation(operation: &str) -> bool {
-    operation.starts_with("read.") || operation.starts_with("recovery.")
+    POOL_READ_OPERATIONS.contains(&operation)
 }
 
 const fn millis(ms: u64) -> Duration {
@@ -555,6 +588,71 @@ mod tests {
             ..before.clone()
         };
         assert!(require_unchanged_identity(&before, &after, "test").is_err());
+    }
+
+    #[test]
+    fn pooled_read_lane_is_a_closed_allowlist() {
+        // The allowlist is exact: every production pure-read operation the
+        // adapter issues is admitted, and the set is pinned here so adding
+        // or dropping an entry is an explicit reviewable decision.
+        let admitted = POOL_READ_OPERATIONS.to_vec();
+        assert_eq!(
+            admitted,
+            [
+                "read.all_ordering_heads",
+                "read.all_revision_heads",
+                "read.authority_records",
+                "read.canonical_fence",
+                "read.epistemic_position",
+                "read.erasure_outcome",
+                "read.evidence_records",
+                "read.ordering_heads",
+                "read.ordering_heads_inner",
+                "read.receipt_by_operation",
+                "read.receipt_idempotency",
+                "read.revision_heads",
+                "read.revision_heads_inner",
+                "read.schema_generation",
+                "read.schema_meta",
+                "read.validation_snapshot",
+                "recovery.snapshot",
+            ]
+        );
+        for operation in admitted {
+            assert!(
+                is_pool_read_operation(operation),
+                "lost pooled read: {operation}"
+            );
+        }
+        // Writes, probes, Dreamer rows, test labels, and any unlisted name
+        // — including typoed or future `read.*`/`recovery.*` names — stay on
+        // the facade session until explicitly admitted above.
+        for refused in [
+            "migration.apply",
+            "transaction.apply",
+            "transaction.erasure",
+            "genesis.preflight",
+            "genesis.initialize",
+            "dreamer.read_row",
+            "dreamer.submit",
+            "dreamer.lease_exact",
+            "test.install_read_fence",
+            "proof.987.pooled",
+            "apply.prepared",
+            "",
+            "read.",
+            "read.refresh_materialized_state",
+            "read.schema_generation_v2",
+            "read.schema-generation",
+            "READ.schema_generation",
+            "recovery.anything_new",
+            "recovery.snapshot_extra",
+        ] {
+            assert!(
+                !is_pool_read_operation(refused),
+                "read lane widened: {refused}"
+            );
+        }
     }
 
     #[test]
