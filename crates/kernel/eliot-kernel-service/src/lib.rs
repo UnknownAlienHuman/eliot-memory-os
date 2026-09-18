@@ -33,6 +33,9 @@ mod protocol;
 mod store_client;
 #[cfg(windows)]
 mod store_gateway;
+mod store_write_reservation;
+#[cfg(test)]
+mod store_write_reservation_tests;
 mod testd_front_door;
 
 pub use capacity_evidence::{
@@ -103,6 +106,14 @@ pub use protocol::{
 pub use store_client::{EbpCanonicalStoreClient, EbpStoreTransport, StoreClientError};
 #[cfg(windows)]
 pub use store_gateway::KernelStoreGateway;
+pub use store_write_reservation::{
+    CompositionReservation, ObservedHead, RESERVATION_KEY_NAME, RESERVATION_KEY_PROVIDER,
+    RESERVATION_VISIBILITY, ReservationSeed, ReservationWriteError, ResolvedSendOutcome,
+    SealedReservation, UNKNOWN_OUTCOME_REASON, begin_execute_after_send, cancel_before_send,
+    ensure_eligible, finalize_reservation, gateway_seed, mark_unknown_outcome,
+    project_reserved_write, reconcile_receipt, recovery_page, reserve_for_transition,
+    unresolved_reservations, writer_epoch_for_fence, writer_epoch_for_fence_from_epoch,
+};
 pub use testd_front_door::{
     AuthenticatedTestdSession, TESTD_ADMISSION_ADVERTISED, TESTD_ADMISSION_WIRE_ID,
     TESTD_ADMISSION_WIRE_VERSION, TESTD_CONFLICT_MAX_FIELDS, TESTD_MAX_ENVELOPE_BYTES,
