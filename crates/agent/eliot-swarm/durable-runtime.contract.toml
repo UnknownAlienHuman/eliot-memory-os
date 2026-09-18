@@ -1,8 +1,8 @@
 schema = "eliot.swarm.durable-runtime.v1"
 authority = "NON_NORMATIVE_IMPLEMENTATION_CONTRACT"
-status = "READY_AFTER_ADAPTER_REGISTRY"
-implementation_support = "COORDINATION_CONTRACT_PRESENT_DURABLE_RUNTIME_EDGE_MISSING"
-evidence_execution_status = "SOURCE_AUDIT_EXECUTED_TESTS_NOT_EXECUTED"
+status = "ACTIVE_IMPLEMENTATION_PLAN_BOUND"
+implementation_support = "PLAN_JOB_ATTACHMENT_AND_DISPATCH_LINEAGE_PRESENT_PROVIDER_EXECUTION_EDGE_REMAINS"
+evidence_execution_status = "ELIOT_SWARM_UNIT_AND_EDGE_TESTS_EXECUTED"
 proof_ceiling = "DURABLE_SWARM_EDGE_CANDIDATE"
 issue = 1126
 adapter_registry_issue = 874
@@ -10,7 +10,7 @@ native_worker_issue = 22
 provider_contract_issue_refs = [361, 368, 369, 370, 371]
 product_pulse_issue = 11
 base_branch = "main"
-base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+base_sha = "b5448c581eda22e446ce33869f2897fb045e348a"
 normative_pair_ref = "docs/normative-pair.toml"
 
 [documentation]
