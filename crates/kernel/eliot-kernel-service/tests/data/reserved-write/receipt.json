@@ -1,0 +1,188 @@
+{
+  "operation_id": "op-991-k1",
+  "idempotency_key": "idem-991-k1",
+  "canonical_request_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "transition_class": "capture_candidate",
+  "status": "committed",
+  "commit_id": "commit-991-k1",
+  "state_fence": {
+    "authority_epoch": {
+      "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+      "sequence": 1
+    },
+    "resource_generation": 1,
+    "task_revision": null,
+    "policy_revision": null,
+    "integration_revision": null
+  },
+  "ordering_sequences": [
+    {
+      "scope": "scope-991-k1",
+      "sequence": 7,
+      "state_fence": {
+        "authority_epoch": {
+          "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+          "sequence": 1
+        },
+        "resource_generation": 1,
+        "task_revision": null,
+        "policy_revision": null,
+        "integration_revision": null
+      }
+    }
+  ],
+  "revision_before_after": [],
+  "applied_command_ids": [
+    "capture-observation"
+  ],
+  "emitted_event_ids": [],
+  "projection_refs": [],
+  "outbox_refs": [],
+  "operation_manifest_digest": "manifest-991-k1",
+  "error_code": null,
+  "resubmission": "none",
+  "committed_at": "commit-sequence-0000000000000001",
+  "envelope": {
+    "identity": {
+      "receipt_id": "receipt-40d6d166b1d2f35db126eab059e6e702e35008d3f5ca70cbf8855d6765cdc748",
+      "canonical_sha256": "40d6d166b1d2f35db126eab059e6e702e35008d3f5ca70cbf8855d6765cdc748"
+    },
+    "core": {
+      "contract": {
+        "name": "eliot.foundation.receipts",
+        "version": {
+          "major": 1,
+          "minor": 0,
+          "patch": 0
+        },
+        "shape_sha256": "3b42a40559f0afb164d7806d7431eb9efb882c16b44276570e9cff38cf66c9c9"
+      },
+      "kind": "OPERATION",
+      "work_scope": {
+        "scope_id": "scope-991-k1",
+        "product_id": "product-991-k",
+        "resource_generation": 1,
+        "state_fence": {
+          "authority_epoch": {
+            "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+            "sequence": 1
+          },
+          "resource_generation": 1,
+          "task_revision": null,
+          "policy_revision": null,
+          "integration_revision": null
+        }
+      },
+      "task": null,
+      "session": null,
+      "causal": {
+        "state_fence": {
+          "authority_epoch": {
+            "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+            "sequence": 1
+          },
+          "resource_generation": 1,
+          "task_revision": null,
+          "policy_revision": null,
+          "integration_revision": null
+        },
+        "transaction_sequence": 1,
+        "parent_receipt_id": null,
+        "predecessor_receipt_ids": []
+      },
+      "request": {
+        "metadata": {
+          "request_id": "request-991-k1",
+          "session_id": null,
+          "task_id": null,
+          "product_id": "product-991-k",
+          "source_id": "source-991-k",
+          "state_fence": {
+            "authority_epoch": {
+              "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+              "sequence": 1
+            },
+            "resource_generation": 1,
+            "task_revision": null,
+            "policy_revision": null,
+            "integration_revision": null
+          },
+          "clock": {
+            "valid_time_ms": null,
+            "known_time_ms": null,
+            "transaction_sequence": null,
+            "monotonic_ns": null
+          }
+        },
+        "state_fence": {
+          "authority_epoch": {
+            "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+            "sequence": 1
+          },
+          "resource_generation": 1,
+          "task_revision": null,
+          "policy_revision": null,
+          "integration_revision": null
+        }
+      },
+      "operation": {
+        "operation_id": "op-991-k1",
+        "request_id": "request-991-k1",
+        "idempotency_key": "idem-991-k1",
+        "operation_kind": "store.apply.capture_candidate",
+        "effect": "CANDIDATE",
+        "state_fence": {
+          "authority_epoch": {
+            "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+            "sequence": 1
+          },
+          "resource_generation": 1,
+          "task_revision": null,
+          "policy_revision": null,
+          "integration_revision": null
+        }
+      },
+      "authority": {
+        "authority_id": "eliot-store-manifest:manifest-991-k1",
+        "authority_owner": "source-991-k",
+        "authority_epoch": {
+          "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+          "sequence": 1
+        },
+        "state_fence": {
+          "authority_epoch": {
+            "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+            "sequence": 1
+          },
+          "resource_generation": 1,
+          "task_revision": null,
+          "policy_revision": null,
+          "integration_revision": null
+        },
+        "allowed_effect": "CANDIDATE",
+        "proof_ceiling": "CANDIDATE_ARTIFACT"
+      },
+      "artifacts": [
+        {
+          "artifact_id": "store-transition:op-991-k1",
+          "sha256": "ab94b2fc85515acb60899a88b2c1aa6c50e7db7c6903e6760495fd27a413eced",
+          "role": "OPERATION",
+          "source_revision": "manifest-991-k1"
+        },
+        {
+          "artifact_id": "store-plan:commit-991-k1",
+          "sha256": "2682efb2880837b5c59dedaabc8625fe9789272a5a33cf4421ec3d893fadc1a0",
+          "role": "ARTIFACT",
+          "source_revision": "commit-sequence-0000000000000001"
+        }
+      ],
+      "verifier": null,
+      "problem": null,
+      "coordination": null,
+      "disposition": {
+        "kind": "SUCCESS",
+        "proof": "CANDIDATE_ARTIFACT"
+      }
+    }
+  }
+}

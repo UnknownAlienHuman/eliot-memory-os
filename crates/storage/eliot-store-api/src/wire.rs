@@ -20,9 +20,9 @@ use crate::{
     CanonicalRequestView, CanonicalValidationSnapshot, ErasureIntentRecord, ErasureSurfaceKind,
     ExactJsonBytes, MAX_STORE_FAILURE_DETAIL_LEN, NamedReadRequest, NamedReadResponse, OperationId,
     OperationIdentity, OrderingHead, OrderingHeadExpectation, OrderingScopeId, PreparedTransition,
-    RequestMeta, RevisionHead, RevisionHeadExpectation, RevisionKey, StoreError,
-    StoreGenesisRequest, StoreHealth, StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt,
-    dreamer_job::map_durable_error, json_shape_name, verify_canonical_request_hash,
+    RequestMeta, ReservedWriteRequest, RevisionHead, RevisionHeadExpectation, RevisionKey,
+    StoreError, StoreGenesisRequest, StoreHealth, StoreRecoveryRequest, StoreRecoverySnapshot,
+    WriteReceipt, dreamer_job::map_durable_error, json_shape_name, verify_canonical_request_hash,
 };
 use schemars::JsonSchema;
 
@@ -33,6 +33,16 @@ pub const CAPABILITY_HEALTH: &str = "store.health";
 pub const CAPABILITY_READINESS: &str = "store.readiness";
 pub const CAPABILITY_NAMED_READ: &str = "store.named_read";
 pub const CAPABILITY_APPLY: &str = "store.apply";
+/// Declared (not advertised) capability for the reserved-write operation
+/// (issue #991).
+///
+/// The wire variant selects this capability through
+/// [`StoreRequest::capability`], but it is deliberately absent from
+/// [`CAPABILITIES`]: API enum presence is not readiness, and the capability
+/// stays unadvertised until the actual scheduler backend is accepted. A
+/// session without this admitted capability rejects the operation before
+/// dispatch.
+pub const CAPABILITY_RESERVED_WRITE: &str = "store.reserved_write";
 pub const CAPABILITY_RECEIPT: &str = "store.receipt";
 pub const CAPABILITY_REVISION_HEADS: &str = "store.revision_heads";
 pub const CAPABILITY_ORDERING_HEADS: &str = "store.ordering_heads";
@@ -207,6 +217,17 @@ pub enum StoreRequest {
         expected_revision_heads: Vec<RevisionHeadExpectation>,
         expected_ordering_heads: Vec<OrderingHeadExpectation>,
     },
+    /// Reserved-write operation carrying #990's sealed admission projection
+    /// through the existing authenticated Store path (issue #991).
+    ///
+    /// One coordinated wire integration: the exact immutable transition,
+    /// sealed reservation evidence, and preserved expected heads travel as one
+    /// closed variant. Legacy `Apply` decoding and compatibility are
+    /// untouched; an unsupported reserved request never falls back to
+    /// ordinary `Apply`.
+    ReservedWrite {
+        request: crate::ReservedWriteRequest,
+    },
     Recovery {
         request: StoreRecoveryRequest,
     },
@@ -278,6 +299,7 @@ impl StoreRequest {
                 }
                 Ok(())
             }
+            Self::ReservedWrite { request } => request.validate(),
             Self::RevisionHeads { keys } => bounded_unique(keys, "revision_keys", Clone::clone),
             Self::OrderingHeads { scopes } => {
                 bounded_unique(scopes, "ordering_scopes", Clone::clone)
@@ -300,6 +322,7 @@ impl StoreRequest {
             Self::Readiness => CAPABILITY_READINESS,
             Self::Named { .. } => CAPABILITY_NAMED_READ,
             Self::Apply { .. } => CAPABILITY_APPLY,
+            Self::ReservedWrite { .. } => CAPABILITY_RESERVED_WRITE,
             Self::Receipt { .. } => CAPABILITY_RECEIPT,
             Self::RevisionHeads { .. } => CAPABILITY_REVISION_HEADS,
             Self::OrderingHeads { .. } => CAPABILITY_ORDERING_HEADS,
@@ -440,8 +463,76 @@ impl StoreRequest {
             Self::DreamerJob { context, request } => {
                 validate_dreamer_identity(context, request, identity)
             }
+            Self::ReservedWrite { request } => {
+                request.validate_for_identity(request_id, identity)?;
+                Ok(())
+            }
             _ => Ok(()),
         }
+    }
+}
+
+/// Binds one decoded reserved-write request to the authenticated EBP
+/// request identity (issue #991).
+///
+/// Inherent impl on [`ReservedWriteRequest`] kept in the wire module with the
+/// other identity bindings. Mirrors the `Apply` binding above: the
+/// transported context must equal the identity metadata, the transition
+/// idempotency key must equal the transport key, and the context, transition,
+/// admission, and every expected-head fence must all equal the authenticated
+/// fence. A claimed issuer, self-consistent token hash, or well-formed
+/// projection never replaces trusted current Kernel/ORS lineage; the
+/// transported context always wins over payload mirrors.
+impl ReservedWriteRequest {
+    pub fn validate_for_identity(
+        &self,
+        request_id: &RequestId,
+        identity: &RequestIdentity,
+    ) -> Result<(), StoreWireError> {
+        self.validate().map_err(StoreWireError::Store)?;
+        identity
+            .validate()
+            .map_err(|error| StoreWireError::Protocol(error.to_string()))?;
+        if request_id != &identity.request.metadata.request_id {
+            return Err(StoreWireError::Identity(
+                "frame request_id does not match request identity metadata".to_owned(),
+            ));
+        }
+        if self.context != identity.request.metadata {
+            return Err(StoreWireError::Identity(
+                "reserved-write context does not match request identity metadata".to_owned(),
+            ));
+        }
+        if self.transition.identity.idempotency_key != identity.idempotency_key {
+            return Err(StoreWireError::Identity(
+                "reserved-write idempotency key does not match request identity".to_owned(),
+            ));
+        }
+        if self.context.state_fence != identity.request.state_fence
+            || self.transition.state_fence != identity.request.state_fence
+            || self.admission.state_fence != identity.request.state_fence
+        {
+            return Err(StoreWireError::Identity(
+                "reserved-write fence does not match request identity".to_owned(),
+            ));
+        }
+        for head in &self.expected_revision_heads {
+            if head.state_fence != identity.request.state_fence {
+                return Err(StoreWireError::Identity(
+                    "reserved-write revision expectation fence does not match request identity"
+                        .to_owned(),
+                ));
+            }
+        }
+        for head in &self.expected_ordering_heads {
+            if head.state_fence != identity.request.state_fence {
+                return Err(StoreWireError::Identity(
+                    "reserved-write ordering expectation fence does not match request identity"
+                        .to_owned(),
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1498,12 +1589,8 @@ mod tests {
         let mut tampered = frame;
         tampered.payload = ProtocolPayload::Json(legacy);
         assert!(
-            decode_response_frame(
-                &tampered,
-                "connection-authority",
-                ProtocolVersion::CURRENT
-            )
-            .is_err(),
+            decode_response_frame(&tampered, "connection-authority", ProtocolVersion::CURRENT)
+                .is_err(),
             "string failure payload must be rejected, not decoded"
         );
     }

@@ -1,0 +1,143 @@
+{
+  "context": {
+    "request_id": "request-991-k1",
+    "session_id": null,
+    "task_id": null,
+    "product_id": "product-991-k",
+    "source_id": "source-991-k",
+    "state_fence": {
+      "authority_epoch": {
+        "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+        "sequence": 1
+      },
+      "resource_generation": 1,
+      "task_revision": null,
+      "policy_revision": null,
+      "integration_revision": null
+    },
+    "clock": {
+      "valid_time_ms": null,
+      "known_time_ms": null,
+      "transaction_sequence": null,
+      "monotonic_ns": null
+    }
+  },
+  "transition": {
+    "identity": {
+      "operation_id": "op-991-k1",
+      "idempotency_key": "idem-991-k1",
+      "canonical_request_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "state_fence": {
+      "authority_epoch": {
+        "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+        "sequence": 1
+      },
+      "resource_generation": 1,
+      "task_revision": null,
+      "policy_revision": null,
+      "integration_revision": null
+    },
+    "scope_id": "scope-991-k1",
+    "task_id": null,
+    "ordering_scopes": [
+      "scope-991-k1"
+    ],
+    "transition_class": "capture_candidate",
+    "requested_effect_ceiling": "CANDIDATE",
+    "admission_contract_set_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "operation_manifest_digest": "manifest-991-k1",
+    "named_operations": [
+      {
+        "operation": "CaptureObservation",
+        "parameters": {
+          "subject": "observation-991-k1"
+        }
+      }
+    ],
+    "event_projection_relation_intents": {
+      "event_ids": [],
+      "projection_kinds": [],
+      "relation_kinds": []
+    },
+    "security": {
+      "source_assurance": [],
+      "disclosure_closure": null,
+      "transformation_lineage": [],
+      "influence_closure": null,
+      "purge_entry": null,
+      "selection_integrity": null
+    },
+    "required_proof_and_approval_refs": []
+  },
+  "admission": {
+    "contract_version": 1,
+    "reservation_id": "reservation-991-k1",
+    "reservation_order": 42,
+    "operation_id": "op-991-k1",
+    "idempotency_key": "idem-991-k1",
+    "canonical_request_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "prepared_transition_digest": "ab94b2fc85515acb60899a88b2c1aa6c50e7db7c6903e6760495fd27a413eced",
+    "reservation_token_digest": "ca8b9e1d1f1b3854fe62b20f66439baf01bd07573147c2efd84efd4e42c275fc",
+    "scopes": [
+      {
+        "scope": "scope-991-k1",
+        "reserved_sequence": 7,
+        "expected_sequence": 6,
+        "expected_head_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      }
+    ],
+    "writer_epoch": {
+      "lineage_id": "epoch-lineage-991-k",
+      "epoch": 5,
+      "predecessor_lineage_id": null,
+      "predecessor_epoch": null
+    },
+    "state_fence": {
+      "authority_epoch": {
+        "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+        "sequence": 1
+      },
+      "resource_generation": 1,
+      "task_revision": null,
+      "policy_revision": null,
+      "integration_revision": null
+    },
+    "source_id": "source-991-k",
+    "created_at_ms": 1700000000000,
+    "expires_at_ms": 1700000060000,
+    "recovery_owner": "recovery-owner-991-k"
+  },
+  "expected_revision_heads": [
+    {
+      "key": "rev-991-k1",
+      "expected_revision": 3,
+      "state_fence": {
+        "authority_epoch": {
+          "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+          "sequence": 1
+        },
+        "resource_generation": 1,
+        "task_revision": null,
+        "policy_revision": null,
+        "integration_revision": null
+      }
+    }
+  ],
+  "expected_ordering_heads": [
+    {
+      "scope": "scope-991-k1",
+      "expected_sequence": 6,
+      "state_fence": {
+        "authority_epoch": {
+          "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+          "sequence": 1
+        },
+        "resource_generation": 1,
+        "task_revision": null,
+        "policy_revision": null,
+        "integration_revision": null
+      }
+    }
+  ]
+}
