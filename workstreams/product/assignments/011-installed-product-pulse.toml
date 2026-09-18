@@ -1,0 +1,164 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_PRODUCT_PROOF_ALLOCATION"
+routing_authority = "owning_issue_and_normative_pair_only"
+status = "READY_AFTER_REQUIRED_RUNTIME_EDGES"
+implementation_support = "SOURCE_AND_PACKAGE_PROOF_FRAGMENTED_INSTALLED_PRODUCT_PROOF_MISSING"
+evidence_execution_status = "CURRENT_ISSUE_PR_AND_SOURCE_PROOF_SURFACES_INSPECTED_PRODUCT_RUN_NOT_EXECUTED"
+proof_ceiling = "INSTALLED_PRODUCT_PULSE_CANDIDATE_ONLY"
+issue = 11
+capability_registry_issue = 13
+host_issue = 14
+kernel_issue = 15
+watchdog_issue = 16
+governor_issue = 18
+store_issue = 19
+testd_issue = 20
+wasm_issue = 21
+native_worker_issue = 22
+user_broker_issue = 1098
+agent_bridge_issue = 77
+operator_issue = 1105
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "product.installed-current-identity-pulse"
+causal_property = "One bounded Product Pulse executes against one exact installed Windows identity and proves the user-visible capture, governed write, readback, restart, recovery and strict-Finish path through independently observed source, build, runtime, Store and integration evidence without substituting package tests, process liveness, cached receipts or self-report for Product support."
+current_discriminator = "Current package, contract and Edge work repeatedly defers installed Product proof to #11. No accepted current run binds one source/build/install identity to the required Host, Kernel, eliotd, Store, Watchdog, User Broker, Agent Bridge and Operator observations plus one D1 capture/write/read/restart/verify/Finish pulse."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/11"
+
+[documentation]
+architecture = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A13-02-kernel-and-failure-domains.md#a132-kernel-and-failure-domains",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A13-08-restart-and-recovery.md#a138-restart-and-recovery",
+]
+implementation = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I00-05-current-system-evidence-and-source-support-model.md#i05-current-system-evidence-and-source-support-model",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I00-10-user-outcome-recovery-invariants-and-anti-proxy-development-contract.md#i010-user-outcome-recovery-invariants-and-anti-proxy-development-contract",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I00-13-current-support-conformance-and-product-status.md#i013-current-support-conformance-and-product-status",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I05-19-write-submission-execution-and-receipts.md#i519-write-submission-execution-and-receipts",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-20-canonical-runtime-lifecycle-vocabulary.md#i1420-canonical-runtime-lifecycle-vocabulary",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-24-local-failure-containment-matrix.md#i1424-local-failure-containment-matrix",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I17-08-delivery-depth-d0-replaceable-runtime-and-process-grounding-skeleton.md#i178-delivery-depth-d0-replaceable-runtime-and-process-grounding-skeleton",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I18-04-test-tiers.md#i184-test-tiers",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I18-21-local-and-ci-parity.md#i1821-local-and-ci-parity",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I18-32-stateful-test-environments.md#i1832-stateful-test-environments",
+]
+anchors = ["ARCH-GROUND-01", "ARCH-FIN-01", "ARCH-OBS-01", "ARCH-RES-01", "ARCH-RES-03", "ARCH-RES-04", "ARCH-SEC-02"]
+
+[current_state]
+confirmed = [
+  "Package and source tests can establish Module Proof but not installed Product support.",
+  "Host, Kernel, Watchdog, Governor, Store, Testd, optional module, broker, bridge and Operator issues retain separate implementation and Edge-proof obligations before Product promotion.",
+  "Current-system evidence must keep source, build, runtime, Store and integration domains independent and cannot promote missing or stale evidence.",
+  "No current open PR was found that owns #11 as one complete installed Product Pulse.",
+  "A Product Pulse must bind one source/build/install identity and cannot combine unrelated successful runs from different revisions, machines or generations.",
+]
+
+[scope]
+primary_paths = [
+  "the existing product-evaluation/current-system-evidence/runtime-status owners selected after dependency review",
+  "one bounded Product Pulse runner and versioned plan/receipt contract",
+  "exact installed-state readers for SCM, process/Job Object, protected files, Kernel/daemon registrations, Store schema/heads and bridge/broker/session identities",
+  "exact D0/D1 scenario fixtures and independent verifier adapters",
+  "directly relevant CLI status/report presentation",
+]
+serialized_dependencies = [
+  "#13 capability registry",
+  "#14 Host",
+  "#15 Kernel",
+  "#16 Watchdog",
+  "#18 Governor and strict Finish",
+  "#19 Store",
+  "#20 Testd",
+  "#21/#22 optional execution contours where claimed",
+  "#1098 User Broker",
+  "#77 Agent Bridge",
+  "#1105 Operator",
+]
+forbidden = [
+  "declaring Product support from cargo check/test/clippy or package metadata",
+  "combining evidence from different source, build, installation, generation, epoch, fence or machine identities",
+  "using process liveness, exit zero, health self-report, cached status or log text as semantic success",
+  "using simulated or fixture evidence as installed execution",
+  "skipping unavailable, stale, conflicted, partial, unknown or cleanup-failed stages",
+  "Product runner creating task semantics, canonical authority, repair policy or Finish",
+  "automatic production mutation, deployment or broad workflow trigger",
+  "publishing credentials, protected payloads or machine-sensitive evidence",
+]
+
+[[waves]]
+id = "A"
+what = "Define one immutable ProductPulsePlan and one current-identity evidence denominator."
+how = [
+  "Bind normative pair, source tree, Cargo lock/toolchain, built artifact digests, installation/lineage/generation, machine/environment class, principal/session, AuthorityEpoch, StateFence, Store namespace/schema/heads, capability registry, scenario set, verifier set, deadlines and cleanup obligations.",
+  "Require exactly one disposition for each applicable source, build, runtime, Store and integration evidence row before execution.",
+  "Reject stale, mixed-identity, expired, blind or incomplete prerequisites before Product promotion; a pulse may still run diagnostically with an explicit incomplete ceiling.",
+  "Make every scenario and expected observation finite, versioned and predeclared rather than inferred after the run.",
+]
+
+[[waves]]
+id = "B"
+what = "Execute the minimal installed D0 and D1 user-visible path under one identity."
+how = [
+  "Independently read back installed Host, Kernel, Watchdog, eliotd, Store bridge/server and applicable User Broker/Agent Bridge/Operator process generations before starting.",
+  "Execute one admitted capture or equivalent user input, one exact canonical write through eliotd -> Kernel -> named Store operation, direct receipt/readback and governed L2/read-model observation.",
+  "Bind request, operation, StateFence, transition, receipt, record/blob, source revision, read-model and user-visible result identities end to end.",
+  "Run the applicable user surface rather than invoking only an internal library shortcut.",
+]
+
+[[waves]]
+id = "C"
+what = "Prove restart, degraded operation, recovery and strict Finish."
+how = [
+  "Restart or replace eliotd and the Store bridge/server at predeclared safe points, then prove exact rehydration and unchanged canonical readback without stale generation adoption.",
+  "Exercise one controlled unknown-commit or lost-acknowledgement path and reconcile the same OperationId before retry.",
+  "Prove Watchdog independently observes the intended failure/recovery interval and preserves any coverage gap.",
+  "Where the scenario uses User Broker, Agent Bridge or Operator, prove attach/reconnect/logout and exact Session/WorkScope/task/fence inheritance.",
+  "Permit VERIFIED_COMPLETE only after the exact current applicable verifier set executes against the exact artifacts/state and every external effect/cleanup is reconciled.",
+]
+
+[[waves]]
+id = "D"
+what = "Publish a bounded current-state receipt and prevent evidence laundering."
+how = [
+  "Emit one immutable ProductPulseReceipt with per-stage start/end identities, raw evidence handles, omissions, conflicts, unknowns, cleanup state, verifier receipts, proof ceilings and invalidation set.",
+  "Keep NOT_EXECUTED, NOT_RUNNING, UNAVAILABLE, PARTIAL, UNKNOWN, STALE, CONFLICTED, FAILED and PASSED distinct; aggregate status is the weakest required stage, never a majority or scalar score.",
+  "Redact secrets and protected payloads while retaining enough digests/owners/timestamps for independent replay and invalidation.",
+  "A later source, lock, toolchain, artifact, install, generation, schema, policy, verifier or environment change invalidates only the dependent claims and prevents reuse as current Product evidence.",
+]
+
+[acceptance]
+criteria = [
+  "One pulse plan binds one exact normative/source/build/toolchain/install/machine/generation/epoch/fence/Store/schema/capability-registry identity.",
+  "Every applicable source, build, runtime, Store and integration row has one explicit disposition; missing rows cannot disappear from the denominator.",
+  "The runner executes a real installed user-surface path and not only package, fixture, in-memory or simulated calls.",
+  "Host, Kernel, Watchdog, eliotd, Store bridge/server and applicable broker/bridge/operator identities are independently read back before and after the scenario.",
+  "One input reaches one governed canonical write and one direct plus governed readback with exact request/operation/transition/receipt/record/revision identities.",
+  "Process liveness, exit zero, logs, self-reported health and cached status cannot satisfy semantic or user-outcome checks.",
+  "Daemon and Store restart/replacement rehydrate exact current state and stale generations cannot reconnect, publish effects or supply current readback.",
+  "Unknown commit or lost acknowledgement reconciles the same operation before retry and cannot produce a duplicate write.",
+  "Watchdog provides independent failure/recovery evidence and preserves all coverage gaps.",
+  "Applicable User Broker, Agent Bridge and Operator attach/reconnect/logout preserve exact principal/Session/WorkScope/task/fence identities and clean owned resources.",
+  "VERIFIED_COMPLETE is impossible without the exact current applicable independent verifier receipts and reconciled external effects/cleanup.",
+  "All unavailable, partial, unknown, stale, conflicted, failed and cleanup-incomplete stages remain visible and lower the aggregate result.",
+  "Evidence from another source/build/install/generation/machine/run cannot be combined to close the pulse.",
+  "ProductPulseReceipt is immutable, bounded, redacted, independently verifiable and carries a complete invalidation set.",
+  "Changing any load-bearing source, artifact, install, runtime, Store, policy, verifier or environment identity invalidates the dependent Product claim.",
+  "The pulse runner creates no task semantics, canonical authority, repair decision, deployment or Finish bypass.",
+  "A real supported-Windows run completes all required D0/D1 stages and attaches nonsecret evidence to #11 before the Issue can close.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked --workspace --all-targets",
+  "cargo test --locked --workspace --all-targets",
+  "cargo clippy --locked --workspace --all-targets -- -D warnings",
+  "python scripts/audit-architecture-boundaries.py",
+  "python scripts/audit-runtime-source-hygiene.py",
+  "git diff --check",
+]
+installed_proof = "Build and install one exact candidate on supported Windows, execute the versioned ProductPulsePlan through the real user surface, inject the declared restart/unknown-outcome cases, verify cleanup and attach the immutable redacted receipt plus independent readback to #11."
+close_rule = "Do not close #11 from source or CI alone. Close only after the required current installed pulse is EXECUTED and every mandatory row is terminal PASSED under one identity."
