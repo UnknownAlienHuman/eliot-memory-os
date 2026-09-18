@@ -42,8 +42,8 @@ pub trait AgentActivationResolver {
     /// v2 (`resolve_agent_activation_v2`) is the single production resolver
     /// spine. Callers on the typed-outcome path must call v2.
     ///
-    /// Removal is owned separately by the #839 follow-up (Slice 2 migrates the
-    /// daemon runtime call site to v2) with final v1 retirement tracked by #66;
+    /// Removal: no production caller remains on this method (the runtime claim
+    /// arm resolves through v2). Final v1 retirement is tracked by #66;
     /// this method is not removed as opportunistic cleanup.
     fn resolve_agent_activation(
         &self,
