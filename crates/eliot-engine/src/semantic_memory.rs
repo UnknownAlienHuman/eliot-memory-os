@@ -607,6 +607,9 @@ impl ExperienceRetrievalService {
                 no_useful_memory: true,
                 reason: "NO_USEFUL_MEMORY: memory not needed or exposure policy excludes it"
                     .to_owned(),
+                rank_trace_handle: ExperienceRecallResponse::rank_trace_handle_for(&[]),
+                visible_count: 0,
+                suppressed_count: 0,
             };
         }
         if !MemoryKindCompatibilityService::compatible(request.need.need, MemoryKind::CausalCase) {
@@ -621,6 +624,9 @@ impl ExperienceRetrievalService {
                     "NO_USEFUL_MEMORY: causal case corpus is incompatible with {:?}",
                     request.need.need
                 ),
+                rank_trace_handle: ExperienceRecallResponse::rank_trace_handle_for(&[]),
+                visible_count: 0,
+                suppressed_count: 0,
             };
         }
         let mut ranked = cases
@@ -656,6 +662,9 @@ impl ExperienceRetrievalService {
             applicability.push(decision);
         }
         let no_useful_memory = briefs.is_empty();
+        let rank_trace_handle = ExperienceRecallResponse::rank_trace_handle_for(&traces);
+        let visible_count = u32::try_from(briefs.len()).unwrap_or(u32::MAX);
+        let suppressed_count = u32::try_from(traces.len() - briefs.len()).unwrap_or(u32::MAX);
         ExperienceRecallResponse {
             project_id: request.project_id,
             decision: request.need.clone(),
@@ -669,6 +678,9 @@ impl ExperienceRetrievalService {
                 "experience priors require local revalidation and grant no truth or authority"
                     .to_owned()
             },
+            rank_trace_handle,
+            visible_count,
+            suppressed_count,
         }
     }
 }
