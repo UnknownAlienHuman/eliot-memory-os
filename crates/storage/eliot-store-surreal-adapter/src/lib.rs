@@ -28,8 +28,8 @@ mod schema;
 use std::fmt;
 
 pub use config::{
-    ADAPTER_NAME, ConfigError, PINNED_SURREALDB_MAJOR, SchemaGeneration, SchemaGenerationError,
-    SurrealAdapterConfig,
+    ADAPTER_NAME, ClientSetLimits, ConfigError, MAX_CLIENT_SET_SESSIONS_PER_ROLE,
+    PINNED_SURREALDB_MAJOR, SchemaGeneration, SchemaGenerationError, SurrealAdapterConfig,
 };
 use eliot_platform::ClockObservation;
 use eliot_platform_windows::RetainedProcessPathLease;
@@ -54,6 +54,11 @@ pub struct SurrealStoreAdapter {
     pub(crate) write_lock: tokio::sync::Mutex<()>,
     /// Immutable closed operation manifest admitted by this adapter instance.
     pub(crate) operation_manifest: NamedOperationManifest,
+    /// Fixed bounded RPC session-set limits (S-CONC-CLIENTS, issue #987).
+    /// The compatibility profile preserves the pre-pool facade; an explicit
+    /// profile enables separate read/write/admin lanes under the same single
+    /// provider generation.
+    pub(crate) client_limits: ClientSetLimits,
 }
 
 impl fmt::Debug for SurrealStoreAdapter {
@@ -65,6 +70,7 @@ impl fmt::Debug for SurrealStoreAdapter {
             .field("connected", &self.client.get().is_some_and(Result::is_ok))
             .field("write_lock", &"private")
             .field("operation_manifest", &self.operation_manifest)
+            .field("client_limits", &self.client_limits)
             .finish()
     }
 }
@@ -110,6 +116,39 @@ impl SurrealStoreAdapter {
             client: tokio::sync::OnceCell::new(),
             write_lock: tokio::sync::Mutex::new(()),
             operation_manifest,
+            client_limits: ClientSetLimits::compatibility(),
+        })
+    }
+
+    /// Builds an adapter with an explicit bounded RPC session-set profile.
+    ///
+    /// The limits are validated closed values (1..=8 sessions per role) that
+    /// select how many read, normal-write and health/admin lanes share this
+    /// adapter's single provider generation. [`SurrealAdapterConfig`] itself
+    /// is untouched, so every existing struct literal keeps compiling: this
+    /// constructor, not a new required config field, carries the profile.
+    pub fn new_with_client_set(
+        config: SurrealAdapterConfig,
+        provider_process_lease: RetainedProcessPathLease,
+        manifest: NamedOperationManifest,
+        limits: ClientSetLimits,
+    ) -> Result<Self, StoreError> {
+        config.validate().map_err(|_| StoreError::Unavailable)?;
+        provider_process_lease
+            .validate(
+                std::path::Path::new(&config.provider_executable_path),
+                std::path::Path::new(&config.store_work_root),
+                &config.provider_artifact_digest,
+            )
+            .map_err(|_| StoreError::Unavailable)?;
+        manifest.validate()?;
+        Ok(Self {
+            config,
+            provider_process_lease: std::sync::Arc::new(provider_process_lease),
+            client: tokio::sync::OnceCell::new(),
+            write_lock: tokio::sync::Mutex::new(()),
+            operation_manifest: manifest,
+            client_limits: limits,
         })
     }
 
@@ -136,12 +175,18 @@ impl SurrealStoreAdapter {
             client: tokio::sync::OnceCell::new(),
             write_lock: tokio::sync::Mutex::new(()),
             operation_manifest: manifest,
+            client_limits: ClientSetLimits::compatibility(),
         })
     }
 
     /// Returns the (redacted) configuration.
     pub fn config(&self) -> &SurrealAdapterConfig {
         &self.config
+    }
+
+    /// Returns the fixed bounded session-set limits bound at construction.
+    pub fn client_set_limits(&self) -> ClientSetLimits {
+        self.client_limits
     }
 
     /// Returns the immutable manifest bound to this adapter.

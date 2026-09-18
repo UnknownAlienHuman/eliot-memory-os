@@ -17,8 +17,10 @@ mod payload_tests;
 mod provider_owner;
 mod rpc_parse;
 mod session;
+pub(crate) mod session_pool;
 use provider_owner::ProviderOwner;
 use session::RpcSession;
+use session_pool::{SessionPool, SessionRole};
 
 pub(crate) const RPC_PROTOCOL_VERSION: &str = "eliot.s03.rpc.v1";
 type RpcSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -26,12 +28,14 @@ type RpcSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 pub(crate) struct RpcTransport {
     session: RpcSession,
     provider: Arc<ProviderOwner>,
+    pool: SessionPool,
 }
 impl fmt::Debug for RpcTransport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RpcTransport")
             .field("provider", &self.provider)
             .field("session", &self.session)
+            .field("pool", &self.pool)
             .finish()
     }
 }
@@ -106,7 +110,7 @@ pub(crate) fn is_absent_table(error: &str) -> bool {
 }
 
 impl RpcResults {
-    fn from_value(value: &Value) -> Result<Self, AdapterError> {
+    pub(super) fn from_value(value: &Value) -> Result<Self, AdapterError> {
         let statements = value.as_array().ok_or_else(|| {
             AdapterError::Serialization("RPC query result was not an array".to_owned())
         })?;
@@ -132,6 +136,18 @@ impl RpcResults {
 
     pub(crate) fn take_errors(&mut self) -> Vec<String> {
         std::mem::take(&mut self.errors)
+    }
+
+    /// Number of decoded statement results. The pool dispatch uses this to
+    /// preserve the binding-prefix contract owned by [`RpcTransport::query`].
+    pub(super) fn values_len(&self) -> usize {
+        self.values.len()
+    }
+
+    /// Drops the leading binding-decode results, preserving the original
+    /// operation's statement indexes for its existing consumer.
+    pub(super) fn drain_prefix(&mut self, prefix_len: usize) {
+        self.values.drain(..prefix_len);
     }
 }
 
@@ -159,13 +175,25 @@ impl RpcTransport {
         self.session.request(operation, method, params).await
     }
 
-    pub(crate) async fn connect(
+    /// Establishes the provider owner, its first authenticated session, and
+    /// the fixed bounded session set for `limits`. The pool shares the same
+    /// single provider generation; it never starts a second process.
+    /// Callers that held no explicit profile pass
+    /// [`ClientSetLimits::compatibility`](crate::config::ClientSetLimits::compatibility),
+    /// which preserves the pre-pool facade exactly.
+    pub(crate) async fn connect_with_limits(
         config: &SurrealAdapterConfig,
         process_lease: &Arc<RetainedProcessPathLease>,
+        limits: crate::config::ClientSetLimits,
     ) -> Result<Self, AdapterError> {
         let (provider, deadline) = ProviderOwner::start(config, Arc::clone(process_lease)).await?;
         let session = RpcSession::connect(&provider, deadline).await?;
-        Ok(Self { session, provider })
+        let pool = SessionPool::new(Arc::clone(&provider), limits);
+        Ok(Self {
+            session,
+            provider,
+            pool,
+        })
     }
     pub(crate) async fn validate_liveness(
         &self,
@@ -177,7 +205,29 @@ impl RpcTransport {
     /// Executes one closed named operation using `SurrealDB`'s parameterized
     /// `query` RPC.  The statement is private schema data; callers provide a
     /// name and bindings rather than a provider client or query result type.
+    ///
+    /// Fixed dispatch (S-CONC-CLIENTS, issue #987): pure-read operations run
+    /// on a pooled read-lane session so independent reads no longer
+    /// serialize on the facade socket. Every other operation keeps the
+    /// facade session: canonical writes stay under the process-global write
+    /// mutex until the separate complete-scope runtime integration (#993)
+    /// replaces it, and migrations keep their explicit entrypoints.
     pub(crate) async fn query(
+        &self,
+        operation: &'static str,
+        statement: &str,
+        bindings: serde_json::Map<String, Value>,
+    ) -> Result<RpcResults, AdapterError> {
+        if is_pool_read_operation(operation) {
+            return self.query_read(operation, statement, bindings).await;
+        }
+        self.query_facade(operation, statement, bindings).await
+    }
+
+    /// Executes one closed named operation on the pre-pool facade session.
+    /// Compatibility path for writes, migrations, and any operation outside
+    /// the closed pooled-read mapping below.
+    async fn query_facade(
         &self,
         operation: &'static str,
         statement: &str,
@@ -203,6 +253,73 @@ impl RpcTransport {
         results.values.drain(..prefix_len);
         Ok(results)
     }
+
+    /// Returns the fixed bounded session set under this transport's provider
+    /// generation. Test/diagnostic evidence until the scheduler (#988) and
+    /// runtime (#993) children consume it for role dispatch.
+    #[cfg(test)]
+    pub(crate) fn session_pool(&self) -> &SessionPool {
+        &self.pool
+    }
+
+    /// Executes one closed named read operation on a pooled read-lane
+    /// session instead of the facade session, so independent reads no longer
+    /// serialize on one socket.
+    pub(crate) async fn query_read(
+        &self,
+        operation: &'static str,
+        statement: &str,
+        bindings: serde_json::Map<String, Value>,
+    ) -> Result<RpcResults, AdapterError> {
+        self.pool
+            .query(SessionRole::Read, operation, statement, bindings)
+            .await
+    }
+
+    /// Executes one closed named normal-write operation on a pooled
+    /// write-lane session. Store transaction semantics are unchanged; the
+    /// process-global write mutex still governs canonical allocation until
+    /// the separate complete-scope runtime integration (#993) replaces it.
+    /// Staged for that child; test-only until it arrives.
+    #[cfg(test)]
+    pub(crate) async fn query_write(
+        &self,
+        operation: &'static str,
+        statement: &str,
+        bindings: serde_json::Map<String, Value>,
+    ) -> Result<RpcResults, AdapterError> {
+        self.pool
+            .query(SessionRole::NormalWrite, operation, statement, bindings)
+            .await
+    }
+
+    /// Executes one protected health/admin operation on the isolated admin
+    /// lane, outside normal read/write admission. Staged for the wire child
+    /// (#991); test-only until it arrives.
+    #[cfg(test)]
+    pub(crate) async fn query_admin(
+        &self,
+        operation: &'static str,
+        statement: &str,
+        bindings: serde_json::Map<String, Value>,
+    ) -> Result<RpcResults, AdapterError> {
+        self.pool
+            .query(SessionRole::HealthAdmin, operation, statement, bindings)
+            .await
+    }
+}
+
+/// Reports whether a closed named operation is a pure read admitted to the
+/// pooled read lane.
+///
+/// Closed mapping (S-CONC-CLIENTS, issue #987): `read.*` covers the
+/// canonical head/schema preflight reads, `recovery.*` covers receipt and
+/// outbox readback. Writes (`migration.apply`, canonical transactions),
+/// health probes, and any unlisted operation stay on the facade session by
+/// default. Extending this mapping is the runtime integration's (#993)
+/// decision, not a silent local widening.
+fn is_pool_read_operation(operation: &str) -> bool {
+    operation.starts_with("read.") || operation.starts_with("recovery.")
 }
 
 const fn millis(ms: u64) -> Duration {
