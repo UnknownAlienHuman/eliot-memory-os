@@ -1,11 +1,12 @@
 //! Client integration tests for the reserved-write operation (issue #991).
 //!
 //! Eight cases (`991/5`, `991/6`, `991/7`, `991/8`, `991/9`, `991/10`,
-//! `991/12`, `991/13`; `991/4` is owned by the dispatch suite) prove the
+//! `991/11`, `991/12`, `991/13`; `991/4` is owned by the dispatch suite) prove the
 //! exact `CanonicalStoreClient` reserved-write implementation: request
 //! serialization, fence/identity/binding validation before any send,
-//! single-dispatch execution, exact receipt binding, and uncertain-send
-//! reconciliation with no retry and no fallback to ordinary `Apply`.
+//! single-dispatch execution, exact receipt binding, and typed post-send
+//! failures with no retry, no second send, and no fallback to ordinary
+//! `Apply`.
 //!
 //! Typed inputs freeze in `data/reserved-write/`: `request.json` is the exact
 //! valid request under test, `receipt.json` its matching enveloped receipt.
@@ -255,7 +256,6 @@ struct FakeTransport {
     pending: Option<Frame>,
     reserved_write_response: Option<StoreResponse>,
     reserved_write_raw: Option<Frame>,
-    reconcile_receipt: Option<WriteReceipt>,
     counters: Counters,
 }
 
@@ -266,7 +266,6 @@ impl FakeTransport {
             pending: None,
             reserved_write_response: None,
             reserved_write_raw: None,
-            reconcile_receipt: None,
             counters,
         }
     }
@@ -278,11 +277,6 @@ impl FakeTransport {
 
     fn with_reserved_write_raw(mut self, frame: Frame) -> Self {
         self.reserved_write_raw = Some(frame);
-        self
-    }
-
-    fn with_reconcile_receipt(mut self, receipt: WriteReceipt) -> Self {
-        self.reconcile_receipt = Some(receipt);
         self
     }
 
@@ -368,12 +362,13 @@ impl EbpStoreTransport for FakeTransport {
                     .lock()
                     .unwrap()
                     .push(operation_id);
+                // The reserved-write client must never issue this query after
+                // its single send: any receipt lookup is answered absent so a
+                // regression surfaces as a typed unknown, never a success.
                 self.pending = Some(Self::answer(
                     &connection,
                     request_id,
-                    StoreResponse::Receipt {
-                        receipt: self.reconcile_receipt.clone(),
-                    },
+                    StoreResponse::Receipt { receipt: None },
                 ));
             }
             StoreRequest::Apply { .. } => {
@@ -602,9 +597,9 @@ async fn one_valid_dispatch_invokes_the_selected_backend_exactly_once() {
 #[tokio::test]
 async fn missing_foreign_or_malformed_receipt_cannot_be_success() {
     // A foreign operation identity is never adopted: the peer sends a fully
-    // valid receipt for another operation, the client refuses the mismatch
-    // and reconciles the exact admitted operation, and an absent receipt
-    // stays unknown.
+    // valid receipt for another operation, the client returns the typed
+    // identity-mismatch validation error with no second send, and an
+    // undecodable answer stays unknown — also with no second send.
     let request = fixture_request();
     let foreign_request = valid_request_with("k2");
     assert!(foreign_request.validate().is_ok());
@@ -620,18 +615,23 @@ async fn missing_foreign_or_malformed_receipt_cannot_be_success() {
     .unwrap();
     assert_eq!(
         client.apply_reserved_write(request.clone()).await,
-        Err(StoreError::MissingReceiptEnvelope)
+        Err(StoreError::IdentityConflict)
     );
     assert_eq!(counters.reserved_write_calls.load(Ordering::SeqCst), 1);
-    assert_eq!(counters.receipt_calls.load(Ordering::SeqCst), 1);
     assert_eq!(
-        counters.receipt_operations.lock().unwrap().as_slice(),
-        std::slice::from_ref(&request.transition.identity.operation_id)
+        counters.receipt_calls.load(Ordering::SeqCst),
+        0,
+        "a misbound receipt returns its typed validation error with no second send"
+    );
+    assert!(
+        counters.receipt_operations.lock().unwrap().is_empty(),
+        "a misbound receipt issues no receipt query at all"
     );
     // A malformed (envelope-less) receipt observation is an unknown outcome
     // for the exact admitted operation, never success: the frame fails
     // response validation, the exchange keeps the admitted identity (not a
-    // contract defect), and the client reconciles to an absent receipt.
+    // contract defect), and the client preserves the typed unknown outcome
+    // with no second send.
     let mut malformed = receipt_for(&request);
     malformed.envelope = None;
     let raw = Frame {
@@ -671,45 +671,88 @@ async fn missing_foreign_or_malformed_receipt_cannot_be_success() {
             .load(Ordering::SeqCst),
         1
     );
-    assert_eq!(malformed_counters.receipt_calls.load(Ordering::SeqCst), 1);
     assert_eq!(
+        malformed_counters.receipt_calls.load(Ordering::SeqCst),
+        0,
+        "an undecodable answer stays unknown with no second send"
+    );
+    assert!(
         malformed_counters
             .receipt_operations
             .lock()
             .unwrap()
-            .as_slice(),
-        std::slice::from_ref(&request.transition.identity.operation_id)
+            .is_empty(),
+        "an undecodable answer issues no receipt query at all"
+    );
+}
+
+// WORK_UNIT_CASE: 991/11
+#[tokio::test]
+async fn wrong_response_kind_is_a_typed_contract_error_with_no_second_send() {
+    // A valid response of the wrong kind observed after the single send is a
+    // typed contract defect, never success and never a second wire operation:
+    // exactly one reserved-write send, zero receipt queries.
+    let request = fixture_request();
+    let counters = Counters::default();
+    let kind_requirement = requirement();
+    let client = EbpCanonicalStoreClient::connect(
+        FakeTransport::new(kind_requirement.clone(), counters.clone())
+            .with_reserved_write_response(StoreResponse::Readiness {
+                receipt: eliot_store_api::ReadinessReceipt::ready("1.0.0".to_owned()),
+            }),
+        kind_requirement,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        client.apply_reserved_write(request.clone()).await,
+        Err(StoreError::InvalidReceipt)
+    );
+    assert_eq!(counters.reserved_write_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        counters.receipt_calls.load(Ordering::SeqCst),
+        0,
+        "a wrong-kind response returns its typed contract error with no second send"
+    );
+    assert!(
+        counters.receipt_operations.lock().unwrap().is_empty(),
+        "a wrong-kind response issues no receipt query at all"
     );
 }
 
 // WORK_UNIT_CASE: 991/12
 #[tokio::test]
-async fn uncertain_send_reconciles_same_operation_with_no_retry() {
-    // Response loss after the send crosses the boundary preserves
-    // same-operation reconciliation: exactly one reserved-write send, one
-    // exact receipt query, no second send, no new identity.
+async fn uncertain_send_preserves_unknown_outcome_with_no_second_send() {
+    // Response loss after the send crosses the boundary preserves the typed
+    // unknown outcome for the admitted operation: exactly one reserved-write
+    // send, no receipt query, no second send, no new identity.
     let request = fixture_request();
-    let receipt = fixture_receipt();
     let counters = Counters::default();
     let requirement = requirement();
     let client = EbpCanonicalStoreClient::connect(
-        FakeTransport::new(requirement.clone(), counters.clone())
-            .with_reserved_write_response(StoreResponse::Unknown {
+        FakeTransport::new(requirement.clone(), counters.clone()).with_reserved_write_response(
+            StoreResponse::Unknown {
                 operation_id: request.transition.identity.operation_id.clone(),
                 reason: "send crossed, answer lost".to_owned(),
-            })
-            .with_reconcile_receipt(receipt.clone()),
+            },
+        ),
         requirement,
     )
     .await
     .unwrap();
-    let observed = client.apply_reserved_write(request.clone()).await.unwrap();
-    assert_eq!(observed, receipt);
-    assert_eq!(counters.reserved_write_calls.load(Ordering::SeqCst), 1);
-    assert_eq!(counters.receipt_calls.load(Ordering::SeqCst), 1);
     assert_eq!(
-        counters.receipt_operations.lock().unwrap().as_slice(),
-        std::slice::from_ref(&request.transition.identity.operation_id)
+        client.apply_reserved_write(request.clone()).await,
+        Err(StoreError::MissingReceiptEnvelope)
+    );
+    assert_eq!(counters.reserved_write_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        counters.receipt_calls.load(Ordering::SeqCst),
+        0,
+        "an unknown outcome preserves the typed unknown error with no second send"
+    );
+    assert!(
+        counters.receipt_operations.lock().unwrap().is_empty(),
+        "an unknown outcome issues no receipt query at all"
     );
 }
 
@@ -717,8 +760,8 @@ async fn uncertain_send_reconciles_same_operation_with_no_retry() {
 #[tokio::test]
 async fn deterministic_conflict_stays_distinct_from_unknown_commit() {
     // A deterministic not-applied/conflict surfaces typed with no
-    // reconciliation query; an unknown-outcome failure reconciles the exact
-    // operation instead.
+    // reconciliation query; an unknown-outcome failure preserves the typed
+    // unknown error with no second send either.
     let request = fixture_request();
     let counters = Counters::default();
     let conflict_requirement = requirement();
@@ -741,23 +784,36 @@ async fn deterministic_conflict_stays_distinct_from_unknown_commit() {
         0,
         "a proven conflict never reconciles"
     );
-    let receipt = fixture_receipt();
     let unknown_counters = Counters::default();
     let unknown_requirement = requirement();
     let unknown_client = EbpCanonicalStoreClient::connect(
         FakeTransport::new(unknown_requirement.clone(), unknown_counters.clone())
             .with_reserved_write_response(StoreResponse::Failure {
                 failure: failure_for(StoreError::MissingReceiptEnvelope, &request),
-            })
-            .with_reconcile_receipt(receipt.clone()),
+            }),
         unknown_requirement,
     )
     .await
     .unwrap();
-    let observed = unknown_client
-        .apply_reserved_write(request.clone())
-        .await
-        .unwrap();
-    assert_eq!(observed, receipt);
-    assert_eq!(unknown_counters.receipt_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        unknown_client.apply_reserved_write(request.clone()).await,
+        Err(StoreError::MissingReceiptEnvelope)
+    );
+    assert_eq!(
+        unknown_counters.reserved_write_calls.load(Ordering::SeqCst),
+        1
+    );
+    assert_eq!(
+        unknown_counters.receipt_calls.load(Ordering::SeqCst),
+        0,
+        "a typed unknown-outcome failure preserves the unknown error with no second send"
+    );
+    assert!(
+        unknown_counters
+            .receipt_operations
+            .lock()
+            .unwrap()
+            .is_empty(),
+        "a typed unknown-outcome failure issues no receipt query at all"
+    );
 }

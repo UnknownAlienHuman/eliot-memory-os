@@ -395,9 +395,11 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
     /// request. Committed, deterministic not-applied/conflict, unsupported,
     /// and possible-commit/reconciliation outcomes are preserved with no
     /// catch-all success, no automatic retry, no second ledger, and no
-    /// fallback to ordinary `Apply`. A response write failure cannot erase a
-    /// known committed receipt: any misbound answer observed after the single
-    /// send reconciles the exact admitted operation via `receipt_exact`.
+    /// fallback to ordinary `Apply`. A misbound or malformed receipt observed
+    /// after the single send returns its typed receipt-validation error, a
+    /// wrong-kind response returns the typed contract error, and an unknown
+    /// outcome returns the typed unknown-outcome error — never success and
+    /// never a second wire operation after `execute_raw`.
     async fn apply_reserved_write(
         &self,
         request: ReservedWriteRequest,
@@ -407,9 +409,7 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
         self.validate_requirement_fence(&request.context.state_fence)?;
         self.validate_requirement_fence(&request.transition.state_fence)?;
         self.validate_requirement_fence(&request.admission.state_fence)?;
-        let operation_id = request.transition.identity.operation_id.clone();
         let idempotency_key = request.transition.identity.idempotency_key.clone();
-        let canonical_request_hash = request.transition.identity.canonical_request_hash.clone();
         let result = self
             .execute_raw(
                 StoreRequest::ReservedWrite {
@@ -421,39 +421,25 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
             .await;
         match result {
             Ok(StoreResponse::Transaction { receipt }) => {
-                match self.validate_reserved_write_receipt(&request, &receipt) {
-                    Ok(()) => Ok(receipt),
-                    Err(_) => {
-                        self.receipt_exact(operation_id, &canonical_request_hash)
-                            .await
-                    }
-                }
+                // A misbound or malformed receipt observed after the single
+                // send is a typed receipt-validation failure for the caller
+                // to reconcile — never success, never an adopted peer
+                // identity, and never a second wire operation.
+                self.validate_reserved_write_receipt(&request, &receipt)?;
+                Ok(receipt)
             }
             // Once the reserved write has crossed the transport boundary, a
-            // valid response with the wrong operation identity or response
-            // kind is itself an uncertain observation. Reconcile only the
-            // operation that this Kernel call admitted; never adopt an
-            // identity from the peer and never retry under a new identity.
-            Ok(_) => {
-                self.receipt_exact(operation_id, &canonical_request_hash)
-                    .await
-            }
-            Err(RequestFailure::Unknown {
-                operation_id: observed,
-                ..
-            }) => {
-                // The peer's identity is evidence of a mismatch only; the
-                // receipt lookup remains bound to our admitted operation.
-                let _ = observed;
-                self.receipt_exact(operation_id, &canonical_request_hash)
-                    .await
-            }
-            // A typed unknown-outcome failure was already bound to the
-            // admitted operation in `execute_raw`; reconcile exactly it.
-            Err(error) if error.is_unknown_outcome_failure() => {
-                self.receipt_exact(operation_id, &canonical_request_hash)
-                    .await
-            }
+            // valid response of the wrong kind is itself a typed contract
+            // defect. It is preserved as an error with no second send, no
+            // retry under a new identity, and no fallback to ordinary
+            // `Apply`.
+            Ok(_) => Err(StoreError::InvalidReceipt),
+            // Unknown outcomes (transport loss, a peer `Unknown`, or a typed
+            // unknown-outcome failure already bound to the admitted operation
+            // by the `ReservedWrite` exchange arm) project to the typed
+            // unknown-outcome error with no second wire operation. Every
+            // other typed failure keeps its `into_store_error` projection
+            // unchanged.
             Err(error) => Err(error.into_store_error()),
         }
     }

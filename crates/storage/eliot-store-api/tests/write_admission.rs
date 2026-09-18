@@ -768,8 +768,7 @@ fn dreamer_wire_request() -> StoreRequest {
 /// Exhaustive on purpose: adding a `StoreRequest` variant breaks this match
 /// at compile time, forcing the closed catalogue in 990/10 and the authority
 /// guard in 990/16 to account for it. This is the compile-time half of the
-/// no-reserved-write-variant proof; the tag-set assertion below is the
-/// runtime half.
+/// closed-catalogue proof; the tag-set assertion below is the runtime half.
 fn store_request_op_tag(request: &StoreRequest) -> &'static str {
     match request {
         StoreRequest::Health => "health",
@@ -803,11 +802,13 @@ fn missing_reservation_cannot_decode_through_a_legacy_fallback() {
     assert!(serde_json::from_value::<ReservedWriteRequest>(legacy_json).is_err());
     let reserved_json = serde_json::to_value(valid_request()).unwrap();
     assert!(serde_json::from_value::<StoreRequest>(reserved_json).is_err());
-    // Closed wire-variant catalogue: every exported legacy `StoreRequest`
-    // variant encodes under its fixed `op` tag, round-trips, and validates.
-    // Slice #991 adds exactly one variant (`reserved_write`, covered
-    // separately below); the legacy eleven keep their exact tags, encodings,
-    // and advertised capabilities unchanged.
+    // Closed wire-variant catalogue: every exported `StoreRequest` variant
+    // encodes under its fixed `op` tag, round-trips, and validates. Slice
+    // #991 adds exactly one variant (`reserved_write`), covered in the
+    // catalogue below; the legacy eleven keep their exact tags, encodings,
+    // and advertised capabilities unchanged, while the reserved-write
+    // capability stays declared-but-unadvertised (proven in the loop and
+    // again explicitly below).
     let catalogue = vec![
         StoreRequest::Health,
         StoreRequest::Readiness,
@@ -826,6 +827,9 @@ fn missing_reservation_cannot_decode_through_a_legacy_fallback() {
         },
         StoreRequest::ValidationSnapshot,
         dreamer_wire_request(),
+        StoreRequest::ReservedWrite {
+            request: valid_request(),
+        },
     ];
     let mut tags = Vec::new();
     for variant in &catalogue {
@@ -838,10 +842,21 @@ fn missing_reservation_cannot_decode_through_a_legacy_fallback() {
         let decoded: StoreRequest = serde_json::from_value(encoded).unwrap();
         assert_eq!(&decoded, variant);
         assert!(decoded.validate().is_ok());
-        assert!(
-            CAPABILITIES.contains(&decoded.capability()),
-            "every wire variant selects an advertised capability"
-        );
+        if store_request_op_tag(variant) == "reserved_write" {
+            assert_eq!(
+                decoded.capability(),
+                eliot_store_api::CAPABILITY_RESERVED_WRITE
+            );
+            assert!(
+                !CAPABILITIES.contains(&decoded.capability()),
+                "the reserved-write capability is declared but stays unadvertised"
+            );
+        } else {
+            assert!(
+                CAPABILITIES.contains(&decoded.capability()),
+                "every legacy wire variant selects an advertised capability"
+            );
+        }
     }
     tags.sort_unstable();
     assert_eq!(
@@ -856,10 +871,11 @@ fn missing_reservation_cannot_decode_through_a_legacy_fallback() {
             "readiness",
             "receipt",
             "recovery",
+            "reserved_write",
             "revision_heads",
             "validation_snapshot",
         ],
-        "closed wire catalogue carries no reserved-write variant"
+        "closed wire catalogue contains the legacy variants plus the single #991 reserved-write variant"
     );
     // Reserved-write evidence selects no wire operation by itself: the bare
     // projection carries no `op` tag while every `StoreRequest` encoding
