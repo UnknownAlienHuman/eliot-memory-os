@@ -55,17 +55,21 @@
 //!
 //! ```text
 //! reserve -> eligible -> [admission lease] -> project -> send once ->
-//!   Ok(Committed)   -> begin_execute -> reconcile -> Finalized
-//!   Ok(not-applied) -> begin_execute -> reconcile -> Released (+gap)
-//!   Err(unknown)    -> begin_execute -> mark_unknown -> Reconciling
+//!   Ok(Committed)   -> begin_execute_after_send -> reconcile -> Finalized
+//!   Ok(not-applied) -> begin_execute_after_send -> reconcile -> Released (+gap)
+//!   Err(unknown)    -> begin_execute_after_send -> mark_unknown -> Reconciling
 //!   Err(refused)    -> release (still Eligible, proved no effect)
 //! ```
 //!
-//! `begin_execute` runs only after the single send resolves, so a refused
-//! backend never strands an `Executing` reservation without receipt evidence.
-//! Cancellation before possible submission releases only `Reserved`/`Eligible`
-//! tokens; once `Executing`/`Reconciling`, release is rejected and identity is
-//! preserved until exact receipt reconciliation.
+//! `begin_execute_after_send` runs only after the single send resolves and
+//! requires the typed [`ResolvedSendOutcome`] evidence binding the exact
+//! reservation operation, so a refused backend never strands an `Executing`
+//! reservation without receipt evidence. The pre-send two-argument call no
+//! longer exists: it fails to compile, and mismatched evidence fails closed
+//! at runtime without touching ORS. Cancellation before possible submission
+//! releases only `Reserved`/`Eligible` tokens; once `Executing`/`Reconciling`,
+//! release is rejected and identity is preserved until exact receipt
+//! reconciliation.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -79,13 +83,13 @@ use eliot_ors::{
     ReservationRequest, ScopeReservationRequest, StateFenceSnapshot, WriterReservationToken,
 };
 use eliot_platform::SecretReference;
+use eliot_receipts::ReceiptDispositionKind;
 use eliot_security_contracts::PrivacyClass;
 use eliot_store_api::{
-    CanonicalRequestView, OrderingHeadExpectation, OrderingScopeId,
-    PreparedTransition, ReceiptEnvelope, ReservedScopeBinding, ReservedWriteRequest,
-    RevisionHeadExpectation, WriteAdmissionParams, WriteAdmissionProjection, WriteReceipt,
-    WriteReceiptStatus, WriterEpochBinding, prepared_transition_digest,
-    verify_canonical_request_hash,
+    CanonicalRequestView, OrderingHeadExpectation, OrderingScopeId, PreparedTransition,
+    ReceiptEnvelope, ReservedScopeBinding, ReservedWriteRequest, RevisionHeadExpectation,
+    WriteAdmissionParams, WriteAdmissionProjection, WriteReceipt, WriteReceiptStatus,
+    WriterEpochBinding, prepared_transition_digest, verify_canonical_request_hash,
 };
 
 /// Composition-owned key reference under which the Kernel stages reservation
@@ -702,15 +706,74 @@ pub fn ensure_eligible(
     Ok(owner.ors.mark_eligible(token)?)
 }
 
-/// Starts execution under the exact immutable writer epoch.
+/// Starts execution only after the single Store send resolved, under the
+/// exact immutable writer epoch.
 ///
-/// A stale executor fails with the owner `StaleWriterEpoch` error and can
-/// neither execute nor finalize another generation's token.
-pub fn begin_execute(
+/// The `send` evidence must bind this token's operation: it proves the caller
+/// observed the single send resolve before `Executing` is entered, so a
+/// refused backend can never strand an `Executing` reservation without
+/// receipt evidence. A mismatched evidence object fails closed here without
+/// touching ORS. A stale executor fails with the owner `StaleWriterEpoch`
+/// error and can neither execute nor finalize another generation's token.
+pub fn begin_execute_after_send(
     owner: &CompositionReservation,
     token: &WriterReservationToken,
+    send: &ResolvedSendOutcome,
 ) -> Result<ReservationRecord, ReservationWriteError> {
+    if send.operation_id() != token.operation_id.as_str() {
+        return Err(ReservationWriteError::Binding {
+            operation_id: token.operation_id.as_str().to_owned(),
+            detail: "post-send evidence operation does not match the reservation operation"
+                .to_owned(),
+        });
+    }
     Ok(owner.ors.begin_execute(token, owner.writer_identity())?)
+}
+
+/// Typed evidence that the single Store send for one reservation resolved.
+///
+/// Minted by the path that observed the send resolve — the gateway's bounded
+/// post-send path in production, the lifecycle harness in proofs — and bound
+/// to the exact reservation operation. [`begin_execute_after_send`] re-checks
+/// the binding and fails closed on mismatch without touching ORS, so a
+/// pre-send caller cannot advance execution: the old evidence-free call no
+/// longer compiles, and a mismatched evidence object is refused at runtime.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedSendOutcome {
+    operation_id: String,
+    kind: ResolvedSendKind,
+}
+
+/// How the single send resolved. Both variants prove dispatch completed; the
+/// deterministically-refused-without-effect path never reaches execution (it
+/// releases the still-`Eligible` token instead), so it has no variant here by
+/// construction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResolvedSendKind {
+    /// The send returned a Store receipt (committed or terminally-not-applied).
+    ReceiptReceived,
+    /// The send resolved to a still-unknown outcome after possible submission.
+    UnknownAfterSubmit,
+}
+
+impl ResolvedSendOutcome {
+    /// Binds post-send evidence to one reservation token's operation.
+    pub fn for_token(token: &WriterReservationToken, kind: ResolvedSendKind) -> Self {
+        Self {
+            operation_id: token.operation_id.as_str().to_owned(),
+            kind,
+        }
+    }
+
+    /// Returns the bound operation identity.
+    pub fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+
+    /// Returns how the send resolved.
+    pub fn kind(&self) -> ResolvedSendKind {
+        self.kind
+    }
 }
 
 /// Releases work that has not executed under the exact writer epoch.
@@ -749,9 +812,15 @@ pub fn mark_unknown_outcome(
 /// same operation: operation identity, fence snapshot, scope/sequence
 /// coverage, and the envelope binding are all re-checked here, and the owner
 /// re-checks them again with its evidence provider at [`finalize_reservation`].
-/// A receipt without a reconciliation envelope (still unknown) fails here and
-/// stays distinct from proved-not-applied. This constructs evidence, never
-/// authority: only [`finalize_reservation`] closes the token.
+/// A terminally-not-applied status (`Rejected`, `Cancelled`, `DeadLetter`)
+/// releases only when the verified reconciliation envelope explicitly proves
+/// the operation was not applied (envelope kind `Failure` or `Cancelled`);
+/// any other envelope kind (including `Success`, `Partial`, or `Unknown`)
+/// yields [`ReservationWriteError::Unknown`] and retains the reservation for
+/// reconciliation instead of releasing it. A receipt without a
+/// reconciliation envelope (still unknown) fails here and stays distinct from
+/// proved-not-applied. This constructs evidence, never authority: only
+/// [`finalize_reservation`] closes the token.
 pub fn reconcile_receipt(
     token: &WriterReservationToken,
     receipt: &WriteReceipt,
@@ -768,12 +837,6 @@ pub fn reconcile_receipt(
             ReservationWriteError::Store(error)
         }
     })?;
-    let disposition = match receipt.status {
-        WriteReceiptStatus::Committed => CanonicalDisposition::Committed,
-        WriteReceiptStatus::Rejected
-        | WriteReceiptStatus::Cancelled
-        | WriteReceiptStatus::DeadLetter => CanonicalDisposition::Rejected,
-    };
     let envelope = receipt.require_reconciliation_envelope().map_err(|error| {
         if error == eliot_store_api::StoreError::MissingReceiptEnvelope {
             ReservationWriteError::Unknown {
@@ -785,6 +848,23 @@ pub fn reconcile_receipt(
             ReservationWriteError::Store(error)
         }
     })?;
+    let disposition = match receipt.status {
+        WriteReceiptStatus::Committed => CanonicalDisposition::Committed,
+        WriteReceiptStatus::Rejected
+        | WriteReceiptStatus::Cancelled
+        | WriteReceiptStatus::DeadLetter => match envelope.core.disposition.kind() {
+            ReceiptDispositionKind::Failure | ReceiptDispositionKind::Cancelled => {
+                CanonicalDisposition::Rejected
+            }
+            _ => {
+                return Err(ReservationWriteError::Unknown {
+                    operation_id: operation_id.clone(),
+                    detail: "Store receipt envelope does not prove the operation was not applied; outcome stays unknown"
+                        .to_owned(),
+                });
+            }
+        },
+    };
     check_receipt_token_binding(token, receipt, envelope, &operation_id)?;
     let receipt_id = OpaqueLabel::new(envelope.identity.receipt_id.as_str())
         .map_err(ReservationWriteError::Ors)?;
@@ -886,8 +966,15 @@ pub fn finalize_reservation(
     Ok(owner.ors.reconcile(reconciliation)?)
 }
 
-/// Lists unresolved (non-terminal) reservations ordered by the ORS recovery
-/// projection, bounded by `limit`.
+/// Lists every unresolved (non-terminal) reservation ordered by the ORS
+/// recovery projection.
+///
+/// Pages the bounded recovery cursor to exhaustion: every continuation is
+/// followed until no truncation signal remains, so a restart/rebind observes
+/// the complete unresolved set before admitting new eligible work. Recovery
+/// pages advance over strictly increasing reservation orders, so the loop
+/// always progresses; the per-page bound only limits one read, never the
+/// reported set.
 ///
 /// Used on restart/rebind to recover every affected token and original
 /// operation before new eligible writes, and by migration drain to account for
@@ -896,18 +983,24 @@ pub fn unresolved_reservations(
     owner: &CompositionReservation,
     limit: u16,
 ) -> Result<Vec<ReservationRecord>, ReservationWriteError> {
-    let cursor = eliot_ors::RecoveryCursor::new(0, limit).map_err(ReservationWriteError::Ors)?;
-    let page = owner.ors.recover_page(cursor)?;
-    Ok(page
-        .records
-        .into_iter()
-        .filter(|record| {
+    let mut unresolved = Vec::new();
+    let mut after_order = 0u64;
+    loop {
+        let cursor = eliot_ors::RecoveryCursor::new(after_order, limit)
+            .map_err(ReservationWriteError::Ors)?;
+        let page = owner.ors.recover_page(cursor)?;
+        unresolved.extend(page.records.into_iter().filter(|record| {
             !matches!(
                 record.state,
                 eliot_ors::ReservationState::Finalized | eliot_ors::ReservationState::Released
             )
-        })
-        .collect())
+        }));
+        match page.next_after_order {
+            Some(next) => after_order = next,
+            None => break,
+        }
+    }
+    Ok(unresolved)
 }
 
 /// Derives the composition writer epoch from the exact live fence tuple.

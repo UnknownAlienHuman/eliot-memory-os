@@ -28,9 +28,10 @@ use eliot_store_api::{
 
 use crate::commit_recovery::recover_commit;
 use crate::store_write_reservation::{
-    CompositionReservation, ReservationSeed, begin_execute, cancel_before_send, ensure_eligible,
-    finalize_reservation, mark_unknown_outcome, project_reserved_write, reconcile_receipt,
-    reserve_for_transition, writer_epoch_for_fence, writer_epoch_for_fence_from_epoch,
+    CompositionReservation, ReservationSeed, ResolvedSendKind, ResolvedSendOutcome,
+    begin_execute_after_send, cancel_before_send, ensure_eligible, finalize_reservation,
+    mark_unknown_outcome, project_reserved_write, reconcile_receipt, reserve_for_transition,
+    writer_epoch_for_fence, writer_epoch_for_fence_from_epoch,
 };
 use crate::{EbpCanonicalStoreClient, EbpStoreTransport, KernelService};
 
@@ -374,9 +375,9 @@ impl KernelStoreGateway {
     /// reserve (no lease held) -> eligible (no lease held) ->
     /// normal admission lease -> revalidate generation/fence ->
     /// project -> single send ->
-    ///   Ok(Committed)   -> begin_execute -> reconcile -> Finalized
-    ///   Ok(not-applied) -> begin_execute -> reconcile -> Released (+gap)
-    ///   Err(unknown)    -> begin_execute -> mark_unknown -> Reconciling
+    ///   Ok(Committed)   -> begin_execute_after_send -> reconcile -> Finalized
+    ///   Ok(not-applied) -> begin_execute_after_send -> reconcile -> Released (+gap)
+    ///   Err(unknown)    -> begin_execute_after_send -> mark_unknown -> Reconciling
     ///   Err(refused)    -> release the still-Eligible token
     /// ```
     ///
@@ -385,7 +386,8 @@ impl KernelStoreGateway {
     /// acquired only for the bounded send window, and the service lock is
     /// never held across ORS or network work. Cancellation after execution
     /// starts is rejected by the owner (see [`Self::cancel_reserved`]);
-    /// `begin_execute` runs only after the single send resolves, so a refused
+    /// `begin_execute_after_send` runs only after the single send resolves
+    /// with the typed [`ResolvedSendOutcome`] evidence, so a refused
     /// backend never strands an `Executing` reservation without receipt
     /// evidence.
     pub async fn apply_reserved(
@@ -453,7 +455,11 @@ impl KernelStoreGateway {
                 // A stale epoch here preserves the committed operation id for
                 // exact-receipt recovery under the current epoch instead of
                 // finalizing under the wrong one.
-                begin_execute(&owner, &sealed.token).map_err(|error| {
+                let post_send = ResolvedSendOutcome::for_token(
+                    &sealed.token,
+                    ResolvedSendKind::ReceiptReceived,
+                );
+                begin_execute_after_send(&owner, &sealed.token, &post_send).map_err(|error| {
                     format!(
                         "reserved write committed for operation {operation_id} but the reservation cannot execute ({error}); reconcile by exact receipt once the writer epoch is current"
                     )
@@ -468,7 +474,12 @@ impl KernelStoreGateway {
                 // Still unknown after possible submission: preserve
                 // `Executing`/`Reconciling` identity until exact Store receipt
                 // reconciliation. Never a blind retry, never a release.
-                begin_execute(&owner, &sealed.token).map_err(|error| error.to_string())?;
+                let post_send = ResolvedSendOutcome::for_token(
+                    &sealed.token,
+                    ResolvedSendKind::UnknownAfterSubmit,
+                );
+                begin_execute_after_send(&owner, &sealed.token, &post_send)
+                    .map_err(|error| error.to_string())?;
                 mark_unknown_outcome(&owner, &sealed.token).map_err(|error| error.to_string())?;
                 drop(lease);
                 Err(format!(
@@ -578,7 +589,10 @@ impl KernelStoreGateway {
         let commit_ors = self.commit_ors.clone().ok_or_else(|| {
             "reserved writes require the composition-bound ORS; nothing to cancel".to_owned()
         })?;
-        let owner = {
+        // The protected lease is acquired inside the lock scope and returned
+        // alongside the owner, so it stays alive across the bounded ORS write
+        // below while the service lock itself is released first.
+        let (owner, _lease) = {
             let service = self
                 .service
                 .lock()
@@ -595,8 +609,8 @@ impl KernelStoreGateway {
                     .map_err(|error| error.to_string())?;
             let owner = CompositionReservation::bind(commit_ors, writer_epoch)
                 .map_err(|error| error.to_string())?;
-            drop(lease);
-            owner
+
+            (owner, lease)
         };
         cancel_before_send(&owner, token).map_err(|error| error.to_string())
     }
@@ -621,11 +635,12 @@ impl KernelStoreGateway {
     /// Drains reserved work before migration exclusivity (issue #992).
     ///
     /// Fences the gateway, waits out in-flight operations, then accounts for
-    /// every unresolved reservation in the composition-bound ORS. A non-zero
-    /// count (or a truncated recovery page) fails with the honest pending
-    /// count: migration must reconcile first, and nothing is force-released
-    /// to make the count zero. Without a bound ORS this degrades to the
-    /// flight fence only, and says so.
+    /// every unresolved reservation in the composition-bound ORS. An exact
+    /// non-zero count fails with the honest pending count; a truncated
+    /// recovery page fails with a distinct truncated-scan report whose shown
+    /// count is explicitly incomplete: migration must reconcile first, and
+    /// nothing is force-released to make the count zero. Without a bound ORS
+    /// this degrades to the flight fence only, and says so.
     pub async fn drain_reserved(&self, timeout: Duration) -> Result<(), String> {
         self.flight.fence_and_drain(timeout).await?;
         let Some(commit_ors) = self.commit_ors.as_ref() else {
@@ -654,7 +669,12 @@ impl KernelStoreGateway {
                 )
             })
             .count();
-        if pending > 0 || page.next_after_order.is_some() {
+        if page.next_after_order.is_some() {
+            return Err(format!(
+                "migration drain blocked: recovery scan truncated after {pending} pending reservations in the first page; full unresolved count unknown; reconcile by exact receipt before exclusivity (no forced release)"
+            ));
+        }
+        if pending > 0 {
             return Err(format!(
                 "migration drain blocked: {pending} unresolved reservations remain; reconcile by exact receipt before exclusivity (no forced release)"
             ));

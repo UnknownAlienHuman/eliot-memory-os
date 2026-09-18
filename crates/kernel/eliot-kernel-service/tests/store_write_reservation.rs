@@ -1,11 +1,13 @@
 //! Kernel reserved-write binding to durable ORS reservations (issue #992).
 //!
-//! Twenty cases (`992/1`..`992/20`) prove the composition-bound ORS adaptation
+//! Twenty-seven cases (`992/1`..`992/27`) prove the composition-bound ORS adaptation
 //! and exact Store-projection conversion: every positive lifecycle step runs
 //! through the real isolated ORS/redb operations (`stage_and_reserve`,
-//! `mark_eligible`, `begin_execute`, `mark_unknown`, `reconcile`, `release`)
+//! `mark_eligible`, `begin_execute_after_send`, `mark_unknown`, `reconcile`, `release`)
 //! and the real #990 projection plus the real #991 client exchange. No test
 //! fabricates a token: the only minted tokens come from `reserve_for_transition`.
+//! Execution starts only on typed post-send evidence (`ResolvedSendOutcome`),
+//! so the pre-send call cannot compile; recovery pages to exhaustion.
 //!
 //! Case map:
 //! - 01 exact two-constructor injection and production gateway→ORS→Store map.
@@ -31,6 +33,17 @@
 //!   a second state/authority owner.
 //! - 20 actual call-chain and bounded fault-sequence proof: no orphaned token,
 //!   partial scope release, hidden retry or semantic transition mutation.
+//! - 21 recovery pagination reports every unresolved token across bounded pages.
+//! - 22 cancel-before-send happy path releases and unblocks the same-scope
+//!   successor with no terminal receipt.
+//! - 23 ordinary committed lifecycle finalizes without ambiguity and unblocks
+//!   the queue at once.
+//! - 24 durable rebind recovers identity/order/state, fences stale writers,
+//!   rejects invalid continuation without loss, then finalizes on exact evidence.
+//! - 25 terminal status without envelope not-applied proof stays unknown;
+//!   proved `Rejected`/`DeadLetter` release.
+//! - 26 non-zero drain fails closed with the exact count and zero force-release.
+//! - 27 truncated drain report fails closed distinctly with zero force-release.
 //!
 //! Frozen domain inputs live in `data/store_write_reservation.json`; every
 //! literal below is asserted against that fixture, never re-declared.
@@ -54,9 +67,10 @@ use eliot_contracts::{
     SourceId, StateFence,
 };
 use eliot_kernel_service::{
-    CompositionReservation, ObservedHead, ReservationSeed, ReservationWriteError,
-    SealedReservation, begin_execute, cancel_before_send, ensure_eligible, finalize_reservation,
-    mark_unknown_outcome, project_reserved_write, reconcile_receipt, reserve_for_transition,
+    CompositionReservation, ObservedHead, ReservationSeed, ReservationWriteError, ResolvedSendKind,
+    ResolvedSendOutcome, SealedReservation, begin_execute_after_send, cancel_before_send,
+    ensure_eligible, finalize_reservation, mark_unknown_outcome, project_reserved_write,
+    reconcile_receipt, reserve_for_transition,
 };
 use eliot_ors::{
     CanonicalEvidenceProvider, EpochIdentity, EpochLineage, OpaqueLabel, OrsError,
@@ -70,31 +84,120 @@ use eliot_store_api::{
     SecurityContext, StoreError, TransitionClass, WriteReceipt, WriteReceiptStatus,
     canonical_request_hash,
 };
+use serde::Deserialize;
 use serde_json::{Value, json};
 
-const LINEAGE_992: &str = "550e8400-e29b-41d4-a716-446655440000";
+/// Typed view of the frozen 992 domain fixture.
+///
+/// Every helper below consumes this fixture through these accessors and
+/// asserts each frozen literal where it becomes a bound request,
+/// reservation, receipt, or reconciliation input. The fixture fails fast:
+/// any missing field or contract change stops the suite before any ORS or
+/// Store work. Per-test tags (`"02a"`, `"11"`, ...) stay parameters, never
+/// domain authority; intentionally-invalid instruments (the 992/3 digest
+/// mismatch, the 992/14 forged sha, the 992/19 malformed digest) are marked
+/// at their use sites and prove failure rather than binding.
+#[derive(Debug, Deserialize)]
+struct ReservationFixture {
+    contract: String,
+    lineage_id: String,
+    authority_sequence: u64,
+    resource_generation: u64,
+    scope_a: String,
+    scope_b: String,
+    scope_c: String,
+    scope_prefix: String,
+    expected_sequence: u64,
+    head_digest_a: String,
+    head_digest_b: String,
+    head_digest_fresh: String,
+    source_id: String,
+    product_id: String,
+    recovery_owner: String,
+    key_provider: String,
+    key_name: String,
+    visibility: String,
+    created_at_ms: i64,
+    known_at_ms: i64,
+    expires_at_ms: i64,
+    transition_class: String,
+    requested_effect_ceiling: String,
+    operation_manifest_digest: String,
+    manifest_prefix: String,
+    revision_key: String,
+    revision_key_prefix: String,
+    expected_revision: u64,
+    operation_id_prefix: String,
+    idempotency_key_prefix: String,
+    request_id_prefix: String,
+    reservation_id_prefix: String,
+    payload_prefix: String,
+    parent_receipt_prefix: String,
+    canonical_request_hash_placeholder: String,
+    admission_contract_set_digest: String,
+    operation_kind: String,
+    observation_subject: String,
+    authority_id: String,
+    authority_owner: String,
+    allowed_effect: String,
+    proof_ceiling: String,
+    commit_id: String,
+    committed_at: String,
+    applied_command_id: String,
+    cancelled_reason: String,
+    conflict_code: String,
+}
 
-fn fixture() -> Value {
-    let text = include_str!("data/store_write_reservation.json");
-    serde_json::from_str(text).expect("992 fixture parses")
+fn fixture_992() -> ReservationFixture {
+    let fixture: ReservationFixture =
+        serde_json::from_str(include_str!("data/store_write_reservation.json"))
+            .expect("992 frozen fixture parses");
+    assert_eq!(
+        fixture.contract, "eliot.kernel.store-write-reservation.fixture.v1",
+        "992 fixture contract is pinned"
+    );
+    fixture
 }
 
 fn epoch(sequence: u64) -> EpochId {
+    let fixture = fixture_992();
+    assert_eq!(
+        fixture.lineage_id, "550e8400-e29b-41d4-a716-446655440000",
+        "992 fixture lineage is canonical lineage-A"
+    );
     EpochId::new(
-        EpochLineageId::new(LINEAGE_992).unwrap(),
+        EpochLineageId::new(fixture.lineage_id).unwrap(),
         NonZeroU64::new(sequence).unwrap(),
     )
     .unwrap()
 }
 
 fn fence() -> StateFence {
+    let fixture = fixture_992();
+    assert_eq!(
+        fixture.authority_sequence, 1,
+        "992 fixture authority sequence is one"
+    );
+    assert_eq!(
+        fixture.resource_generation, 0,
+        "992 fixture generation is genesis"
+    );
     StateFence::new(epoch(1), ResourceGeneration::genesis())
 }
 
 fn writer_epoch() -> EpochLineage {
+    let fixture = fixture_992();
+    assert_eq!(
+        fixture.lineage_id, "550e8400-e29b-41d4-a716-446655440000",
+        "992 fixture writer lineage is canonical lineage-A"
+    );
+    assert_eq!(
+        fixture.authority_sequence, 1,
+        "992 fixture writer sequence is one"
+    );
     EpochLineage {
         current: EpochIdentity {
-            lineage_id: OpaqueLabel::new(LINEAGE_992).unwrap(),
+            lineage_id: OpaqueLabel::new(fixture.lineage_id).unwrap(),
             epoch: 1,
         },
         predecessor: None,
@@ -102,26 +205,87 @@ fn writer_epoch() -> EpochLineage {
 }
 
 fn context_for(tag: &str) -> RequestMeta {
+    let fixture = fixture_992();
+    let request_id = format!("{}{tag}", fixture.request_id_prefix);
+    assert!(
+        request_id.starts_with("request-992-"),
+        "992 request id carries the frozen prefix"
+    );
+    assert_eq!(
+        fixture.source_id, "eliotd",
+        "992 fixture source is the daemon caller"
+    );
+    assert_eq!(
+        fixture.product_id, "product-992-k",
+        "992 fixture product is pinned"
+    );
     RequestMeta {
-        request_id: RequestId::new(format!("request-992-{tag}")).unwrap(),
+        request_id: RequestId::new(request_id).unwrap(),
         session_id: None,
         task_id: None,
-        product_id: ProductId::new("product-992-k").unwrap(),
-        source_id: SourceId::new("eliotd").unwrap(),
+        product_id: ProductId::new(fixture.product_id).unwrap(),
+        source_id: SourceId::new(fixture.source_id).unwrap(),
         state_fence: fence(),
         clock: ClockReading::default(),
     }
 }
 
 fn transition_for(tag: &str, scopes: &[&str]) -> PreparedTransition {
+    let fixture = fixture_992();
+    let operation_id = format!("{}{tag}", fixture.operation_id_prefix);
+    assert!(
+        operation_id.starts_with("op-992-"),
+        "992 operation id carries the frozen prefix"
+    );
+    let idempotency_key = format!("{}{tag}", fixture.idempotency_key_prefix);
+    assert!(
+        idempotency_key.starts_with("idem-992-"),
+        "992 idempotency key carries the frozen prefix"
+    );
+    assert_eq!(
+        fixture.canonical_request_hash_placeholder,
+        "0".repeat(64),
+        "992 fixture pre-seal hash placeholder is pinned"
+    );
+    assert_eq!(
+        fixture.admission_contract_set_digest,
+        "b".repeat(64),
+        "992 fixture admission digest is pinned"
+    );
+    assert_eq!(
+        fixture.transition_class, "CaptureCandidate",
+        "992 fixture transition class is pinned"
+    );
+    assert_eq!(
+        fixture.requested_effect_ceiling, "Candidate",
+        "992 fixture effect ceiling is pinned"
+    );
+    assert_eq!(
+        fixture.operation_manifest_digest, "manifest-992-k1",
+        "992 fixture suite manifest digest is pinned"
+    );
+    let manifest = format!("{}{tag}", fixture.manifest_prefix);
+    assert!(
+        manifest.starts_with("manifest-992-"),
+        "992 manifest digest carries the frozen prefix"
+    );
+    assert_eq!(
+        fixture.observation_subject, "observation-992",
+        "992 fixture observation subject is pinned"
+    );
+    let scope_id = format!("{}{tag}", fixture.scope_prefix);
+    assert!(
+        scope_id.starts_with("scope-992-"),
+        "992 scope identity carries the frozen prefix"
+    );
     PreparedTransition {
         identity: OperationIdentity {
-            operation_id: OperationId::new(format!("op-992-{tag}")).unwrap(),
-            idempotency_key: format!("idem-992-{tag}"),
-            canonical_request_hash: "0".repeat(64),
+            operation_id: OperationId::new(operation_id).unwrap(),
+            idempotency_key,
+            canonical_request_hash: fixture.canonical_request_hash_placeholder.clone(),
         },
         state_fence: fence(),
-        scope_id: ScopeId::new(format!("scope-992-{tag}")).unwrap(),
+        scope_id: ScopeId::new(scope_id).unwrap(),
         task_id: None,
         ordering_scopes: scopes
             .iter()
@@ -129,12 +293,14 @@ fn transition_for(tag: &str, scopes: &[&str]) -> PreparedTransition {
             .collect(),
         transition_class: TransitionClass::CaptureCandidate,
         requested_effect_ceiling: EffectClass::Candidate,
-        admission_contract_set_digest: "b".repeat(64),
-        operation_manifest_digest: OperationManifestDigest::new(format!("manifest-992-{tag}"))
-            .unwrap(),
+        admission_contract_set_digest: fixture.admission_contract_set_digest.clone(),
+        operation_manifest_digest: OperationManifestDigest::new(manifest).unwrap(),
         named_operations: vec![NamedMutationRequest {
             operation: NamedMutationOperation::CaptureObservation,
-            parameters: BTreeMap::from([("subject".to_owned(), json!("observation-992"))]),
+            parameters: BTreeMap::from([(
+                "subject".to_owned(),
+                json!(fixture.observation_subject.clone()),
+            )]),
         }],
         event_projection_relation_intents: EventProjectionRelationIntents {
             event_ids: Vec::new(),
@@ -162,7 +328,12 @@ fn heads_for(
     tag: &str,
     scopes: &[&str],
 ) -> (Vec<RevisionHeadExpectation>, Vec<OrderingHeadExpectation>) {
-    heads_seq(tag, scopes, 6)
+    let fixture = fixture_992();
+    assert_eq!(
+        fixture.expected_sequence, 6,
+        "992 fixture default ordering sequence is six"
+    );
+    heads_seq(tag, scopes, fixture.expected_sequence)
 }
 
 fn heads_seq(
@@ -170,16 +341,34 @@ fn heads_seq(
     scopes: &[&str],
     expected_sequence: u64,
 ) -> (Vec<RevisionHeadExpectation>, Vec<OrderingHeadExpectation>) {
+    let fixture = fixture_992();
+    assert_eq!(
+        expected_sequence, fixture.expected_sequence,
+        "992 admitted ordering sequence comes from the fixture"
+    );
+    assert_eq!(
+        fixture.expected_revision, 3,
+        "992 fixture expected revision is three"
+    );
+    assert_eq!(
+        fixture.revision_key, "rev-992-k",
+        "992 fixture suite revision key is pinned"
+    );
+    let revision_key = format!("{}{tag}", fixture.revision_key_prefix);
+    assert!(
+        revision_key.starts_with("rev-992-"),
+        "992 revision key carries the frozen prefix"
+    );
     let revision = vec![RevisionHeadExpectation {
-        key: RevisionKey::new(format!("rev-992-{tag}")).unwrap(),
-        expected_revision: 3,
+        key: RevisionKey::new(revision_key).unwrap(),
+        expected_revision: fixture.expected_revision,
         state_fence: fence(),
     }];
     let ordering = scopes
         .iter()
         .map(|scope| OrderingHeadExpectation {
             scope: OrderingScopeId::new((*scope).to_owned()).unwrap(),
-            expected_sequence,
+            expected_sequence: fixture.expected_sequence,
             state_fence: fence(),
         })
         .collect();
@@ -187,42 +376,124 @@ fn heads_seq(
 }
 
 fn observed_for(scopes: &[&str]) -> Vec<ObservedHead> {
-    observed_seq(scopes, 6, "")
+    let fixture = fixture_992();
+    assert_eq!(
+        fixture.expected_sequence, 6,
+        "992 fixture default observed sequence is six"
+    );
+    observed_seq(scopes, fixture.expected_sequence, "")
 }
 
 fn observed_seq(scopes: &[&str], expected_sequence: u64, digest: &str) -> Vec<ObservedHead> {
+    let fixture = fixture_992();
+    assert_eq!(
+        expected_sequence, fixture.expected_sequence,
+        "992 observed sequence comes from the fixture"
+    );
+    assert_eq!(
+        fixture.head_digest_a,
+        "c".repeat(64),
+        "992 fixture scope-A head digest is pinned"
+    );
+    assert_eq!(
+        fixture.head_digest_b,
+        "d".repeat(64),
+        "992 fixture scope-B head digest is pinned"
+    );
+    assert_eq!(
+        fixture.head_digest_fresh,
+        "e".repeat(64),
+        "992 fixture fresh-scope head digest is pinned"
+    );
     scopes
         .iter()
-        .map(|scope| ObservedHead {
-            scope: (*scope).to_owned(),
-            expected_sequence,
-            expected_head_digest: if digest.is_empty() {
-                if scope.ends_with("-a") {
-                    "c".repeat(64)
+        .map(|scope| {
+            let expected_head_digest = if digest.is_empty() {
+                if *scope == fixture.scope_a {
+                    fixture.head_digest_a.clone()
+                } else if *scope == fixture.scope_b {
+                    fixture.head_digest_b.clone()
                 } else {
-                    "d".repeat(64)
+                    panic!(
+                        "992 fixture: scope {scope} has no frozen digest; pass the fresh-scope digest explicitly"
+                    );
                 }
             } else {
+                assert_eq!(
+                    digest, fixture.head_digest_fresh,
+                    "992 explicit observed digest is the frozen fresh-scope digest"
+                );
                 digest.to_owned()
-            },
-            revision_head: None,
+            };
+            ObservedHead {
+                scope: (*scope).to_owned(),
+                expected_sequence: fixture.expected_sequence,
+                expected_head_digest,
+                revision_head: None,
+            }
         })
         .collect()
 }
 
 fn seed_for(tag: &str, op: &str, scopes: &[&str]) -> ReservationSeed {
+    seed_with_heads(tag, op, observed_for(scopes))
+}
+
+/// Builds a seed with explicitly supplied observed heads: the instrument for
+/// fresh scopes whose digest is passed explicitly rather than selected from
+/// the frozen scope table.
+fn seed_with_heads(tag: &str, op: &str, heads: Vec<ObservedHead>) -> ReservationSeed {
+    let fixture = fixture_992();
+    let reservation_id = format!("{}{tag}", fixture.reservation_id_prefix);
+    assert!(
+        reservation_id.starts_with("res-992-"),
+        "992 reservation id carries the frozen prefix"
+    );
+    assert_eq!(
+        fixture.recovery_owner, "recovery-owner-992-k",
+        "992 fixture recovery owner is pinned"
+    );
+    let payload = format!("{}{tag}", fixture.payload_prefix);
+    assert!(
+        payload.starts_with("payload-992-"),
+        "992 staged payload carries the frozen prefix"
+    );
+    assert_eq!(
+        fixture.key_provider, "kernel-reservation-key",
+        "992 fixture key provider is pinned"
+    );
+    assert_eq!(
+        fixture.key_name, "store-write-reservation-v1",
+        "992 fixture key name is pinned"
+    );
+    assert_eq!(
+        fixture.visibility, "owner-only",
+        "992 fixture visibility is pinned"
+    );
+    assert_eq!(
+        fixture.created_at_ms, 1_700_000_000_000,
+        "992 fixture creation time is pinned"
+    );
+    assert_eq!(
+        fixture.known_at_ms, 1_700_000_001_000,
+        "992 fixture known time is pinned"
+    );
+    assert_eq!(
+        fixture.expires_at_ms, 1_700_000_060_000,
+        "992 fixture expiry is pinned"
+    );
     ReservationSeed {
-        reservation_id: format!("res-992-{tag}"),
+        reservation_id,
         operation_id: op.to_owned(),
-        recovery_owner: "recovery-owner-992-k".to_owned(),
-        payload_bytes: format!("payload-992-{tag}").into_bytes(),
-        key_provider: "kernel-reservation-key".to_owned(),
-        key_name: "store-write-reservation-v1".to_owned(),
-        visibility: "owner-only".to_owned(),
-        created_at_ms: 1_700_000_000_000,
-        known_at_ms: 1_700_000_001_000,
-        expires_at_ms: 1_700_000_060_000,
-        heads: observed_for(scopes),
+        recovery_owner: fixture.recovery_owner.clone(),
+        payload_bytes: payload.into_bytes(),
+        key_provider: fixture.key_provider.clone(),
+        key_name: fixture.key_name.clone(),
+        visibility: fixture.visibility.clone(),
+        created_at_ms: fixture.created_at_ms,
+        known_at_ms: fixture.known_at_ms,
+        expires_at_ms: fixture.expires_at_ms,
+        heads,
     }
 }
 
@@ -372,15 +643,41 @@ fn envelope_for(
     disposition: Value,
 ) -> eliot_receipts::ReceiptEnvelope {
     use eliot_receipts::{ReceiptCore, ReceiptEnvelope};
+    let fixture = fixture_992();
+    assert_eq!(
+        fixture.operation_kind, "canonical-write",
+        "992 fixture receipt operation kind is pinned"
+    );
+    assert_eq!(
+        fixture.allowed_effect, "REVERSIBLE_MUTATION",
+        "992 fixture allowed effect is pinned"
+    );
+    assert_eq!(
+        fixture.proof_ceiling, "SCOPED_VERIFICATION",
+        "992 fixture proof ceiling is pinned"
+    );
+    assert_eq!(
+        fixture.authority_id, "authority-992-store",
+        "992 fixture receipt authority is pinned"
+    );
+    assert_eq!(
+        fixture.authority_owner, "governor",
+        "992 fixture receipt authority owner is pinned"
+    );
+    let parent = format!(
+        "{}{}",
+        fixture.parent_receipt_prefix,
+        transition.identity.operation_id.as_str()
+    );
+    assert!(
+        parent.starts_with("receipt-992-parent-"),
+        "992 causal parent carries the frozen prefix"
+    );
     let fence = serde_json::to_value(&context.state_fence).expect("992 fence json");
     let epoch = serde_json::to_value(&context.state_fence.authority_epoch).expect("992 epoch json");
     let metadata = serde_json::to_value(context).expect("992 context json");
     let contract = serde_json::to_value(eliot_receipts::contract_identity().expect("992 contract"))
         .expect("992 contract json");
-    let parent = format!(
-        "receipt-992-parent-{}",
-        transition.identity.operation_id.as_str()
-    );
     let scope = transition.ordering_scopes[0].as_str().to_owned();
     let core: ReceiptCore = serde_json::from_value(json!({
         "contract": contract,
@@ -407,17 +704,17 @@ fn envelope_for(
             "operation_id": transition.identity.operation_id.as_str(),
             "request_id": context.request_id.as_str(),
             "idempotency_key": transition.identity.idempotency_key,
-            "operation_kind": "canonical-write",
-            "effect": "REVERSIBLE_MUTATION",
+            "operation_kind": fixture.operation_kind.clone(),
+            "effect": fixture.allowed_effect.clone(),
             "state_fence": fence,
         },
         "authority": {
-            "authority_id": "authority-992-store",
-            "authority_owner": "governor",
+            "authority_id": fixture.authority_id.clone(),
+            "authority_owner": fixture.authority_owner.clone(),
             "authority_epoch": epoch,
             "state_fence": fence,
-            "allowed_effect": "REVERSIBLE_MUTATION",
-            "proof_ceiling": "SCOPED_VERIFICATION",
+            "allowed_effect": fixture.allowed_effect.clone(),
+            "proof_ceiling": fixture.proof_ceiling.clone(),
         },
         "artifacts": [],
         "verifier": null,
@@ -430,21 +727,57 @@ fn envelope_for(
 }
 
 fn success_disposition() -> Value {
-    json!({"kind": "SUCCESS", "proof": "SCOPED_VERIFICATION"})
+    let fixture = fixture_992();
+    assert_eq!(
+        fixture.proof_ceiling, "SCOPED_VERIFICATION",
+        "992 fixture success proof ceiling is pinned"
+    );
+    json!({"kind": "SUCCESS", "proof": fixture.proof_ceiling.clone()})
 }
 
 fn cancelled_disposition() -> Value {
-    json!({"kind": "CANCELLED", "reason": "cancelled-992-before-effect"})
+    let fixture = fixture_992();
+    assert_eq!(
+        fixture.cancelled_reason, "cancelled-992-before-effect",
+        "992 fixture cancelled reason is pinned"
+    );
+    json!({"kind": "CANCELLED", "reason": fixture.cancelled_reason.clone()})
 }
 
 fn failure_disposition() -> Value {
-    json!({"kind": "FAILURE", "code": "CONFLICT", "proof": "SCOPED_VERIFICATION"})
+    let fixture = fixture_992();
+    assert_eq!(
+        fixture.conflict_code, "CONFLICT",
+        "992 fixture conflict code is pinned"
+    );
+    assert_eq!(
+        fixture.proof_ceiling, "SCOPED_VERIFICATION",
+        "992 fixture failure proof ceiling is pinned"
+    );
+    json!({"kind": "FAILURE", "code": fixture.conflict_code.clone(), "proof": fixture.proof_ceiling.clone()})
 }
 
 /// Builds the exact Store receipt answering one projected request: identity,
 /// class, fence, and every reserved scope sequence mirror the admission, and
 /// the envelope binds the same bytes.
 fn receipt_for(request: &ReservedWriteRequest, status: WriteReceiptStatus) -> WriteReceipt {
+    let disposition = match status {
+        WriteReceiptStatus::Committed => success_disposition(),
+        WriteReceiptStatus::Cancelled => cancelled_disposition(),
+        WriteReceiptStatus::Rejected | WriteReceiptStatus::DeadLetter => failure_disposition(),
+    };
+    receipt_with_envelope(request, status, disposition)
+}
+
+/// Builds a receipt for one projected request with an explicitly chosen
+/// envelope disposition: the instrument for proving that a terminal status
+/// without not-applied envelope proof stays unknown instead of releasing.
+fn receipt_with_envelope(
+    request: &ReservedWriteRequest,
+    status: WriteReceiptStatus,
+    disposition: Value,
+) -> WriteReceipt {
+    let fixture = fixture_992();
     let transition = &request.transition;
     let reserved = request.admission.scopes[0].reserved_sequence;
     let ordering_sequences = request
@@ -457,27 +790,41 @@ fn receipt_for(request: &ReservedWriteRequest, status: WriteReceiptStatus) -> Wr
             state_fence: request.context.state_fence.clone(),
         })
         .collect();
-    let (error_code, commit_id, committed_at, applied, disposition) = match status {
-        WriteReceiptStatus::Committed => (
-            None,
-            Some(CommitId::new("commit-992").unwrap()),
-            Some("commit-sequence-0000000000000007".to_owned()),
-            vec!["capture-observation".to_owned()],
-            success_disposition(),
-        ),
+    let (error_code, commit_id, committed_at, applied, envelope_disposition) = match status {
+        WriteReceiptStatus::Committed => {
+            assert_eq!(
+                fixture.commit_id, "commit-992",
+                "992 fixture commit id is pinned"
+            );
+            assert_eq!(
+                fixture.committed_at, "commit-sequence-0000000000000007",
+                "992 fixture commit sequence is pinned"
+            );
+            assert_eq!(
+                fixture.applied_command_id, "capture-observation",
+                "992 fixture applied command is pinned"
+            );
+            (
+                None,
+                Some(CommitId::new(fixture.commit_id.clone()).unwrap()),
+                Some(fixture.committed_at.clone()),
+                vec![fixture.applied_command_id.clone()],
+                disposition,
+            )
+        }
         WriteReceiptStatus::Cancelled => (
             Some(eliot_contracts::ErrorCode::Cancelled),
             None,
             None,
             Vec::new(),
-            cancelled_disposition(),
+            disposition,
         ),
         WriteReceiptStatus::Rejected | WriteReceiptStatus::DeadLetter => (
             Some(eliot_contracts::ErrorCode::Conflict),
             None,
             None,
             Vec::new(),
-            failure_disposition(),
+            disposition,
         ),
     };
     let mut receipt = WriteReceipt {
@@ -504,7 +851,7 @@ fn receipt_for(request: &ReservedWriteRequest, status: WriteReceiptStatus) -> Wr
         &request.context,
         transition,
         reserved,
-        disposition,
+        envelope_disposition,
     ));
     receipt.validate().expect("992 receipt validates");
     receipt
@@ -512,6 +859,17 @@ fn receipt_for(request: &ReservedWriteRequest, status: WriteReceiptStatus) -> Wr
 
 fn unresolved(owner: &CompositionReservation) -> Vec<eliot_ors::ReservationRecord> {
     eliot_kernel_service::unresolved_reservations(owner, 256).expect("992 recovery scans")
+}
+
+/// Post-send evidence for one token: the harness observed the single send
+/// resolve with this outcome class before execution starts. Every lifecycle
+/// proof below passes this evidence, so the pre-send evidence-free call
+/// cannot compile here either.
+fn send_evidence(
+    token: &eliot_ors::WriterReservationToken,
+    kind: ResolvedSendKind,
+) -> ResolvedSendOutcome {
+    ResolvedSendOutcome::for_token(token, kind)
 }
 
 // WORK_UNIT_CASE: 992/2
@@ -566,8 +924,12 @@ fn unbound_or_foreign_verifier_or_owner_is_rejected() {
         ),
         "992/2 foreign owner fails as not-found, got {error:?}"
     );
-    let error = begin_execute(&home_owner, &foreign.token)
-        .expect_err("992 foreign token must not execute here");
+    let error = begin_execute_after_send(
+        &home_owner,
+        &foreign.token,
+        &send_evidence(&foreign.token, ResolvedSendKind::ReceiptReceived),
+    )
+    .expect_err("992 foreign token must not execute here");
     assert!(
         matches!(
             error,
@@ -619,6 +981,8 @@ fn multi_scope_reservation_is_atomic_or_none() {
         transition.identity.operation_id.as_str(),
         &["scope-992-a", "scope-992-b"],
     );
+    // Intentionally-invalid instrument (not a binding): a wrong digest for
+    // scope-B that the owner must refuse with `OrderingHeadMismatch`.
     seed.heads[1].expected_head_digest = "e".repeat(64);
     let error = reserve_for_transition(&owner, &seed, &context, &transition, &revision, &ordering)
         .expect_err("992 mismatched second head must refuse");
@@ -656,10 +1020,9 @@ fn projection_carries_the_exact_operation_admission_scope_head_token_binding() {
     // The #990 projection is byte-exact over the admitted values: every field
     // below is asserted against the frozen fixture, then the sealed request
     // validates and round-trips unchanged.
-    let expected = fixture();
+    let expected = fixture_992();
     assert_eq!(
-        expected["lineage_id"].as_str(),
-        Some(LINEAGE_992),
+        expected.lineage_id, "550e8400-e29b-41d4-a716-446655440000",
         "992/4 fixture lineage is canonical lineage-A"
     );
     let (ors, _dir) = temp_ors("04", Arc::new(BindingEvidence));
@@ -676,6 +1039,12 @@ fn projection_carries_the_exact_operation_admission_scope_head_token_binding() {
     assert_eq!(
         admission.reservation_id, "res-992-04",
         "992/4 reservation id mirrors the ORS token"
+    );
+    assert!(
+        admission
+            .reservation_id
+            .starts_with(&expected.reservation_id_prefix),
+        "992/4 reservation id carries the frozen prefix"
     );
     assert_eq!(
         admission.reservation_order, sealed.token.reservation_order,
@@ -701,7 +1070,7 @@ fn projection_carries_the_exact_operation_admission_scope_head_token_binding() {
     );
     assert_eq!(
         admission.scopes[0].scope.as_str(),
-        expected["scope_a"].as_str().unwrap(),
+        expected.scope_a,
         "992/4 scope text matches the fixture"
     );
     assert_eq!(
@@ -709,17 +1078,15 @@ fn projection_carries_the_exact_operation_admission_scope_head_token_binding() {
         "992/4 reserved sequence follows the observed head"
     );
     assert_eq!(
-        admission.scopes[0].expected_sequence,
-        expected["expected_sequence"].as_u64().unwrap(),
+        admission.scopes[0].expected_sequence, expected.expected_sequence,
         "992/4 expected sequence matches the fixture"
     );
     assert_eq!(
-        admission.scopes[0].expected_head_digest,
-        expected["head_digest_a"].as_str().unwrap(),
+        admission.scopes[0].expected_head_digest, expected.head_digest_a,
         "992/4 head digest restates owner evidence"
     );
     assert_eq!(
-        admission.writer_epoch.lineage_id, LINEAGE_992,
+        admission.writer_epoch.lineage_id, expected.lineage_id,
         "992/4 writer lineage mirrors the fence lineage"
     );
     assert_eq!(admission.writer_epoch.epoch, 1, "992/4 writer epoch is one");
@@ -728,23 +1095,19 @@ fn projection_carries_the_exact_operation_admission_scope_head_token_binding() {
         "992/4 fence equals the admitted fence"
     );
     assert_eq!(
-        admission.source_id,
-        expected["source_id"].as_str().unwrap(),
+        admission.source_id, expected.source_id,
         "992/4 source mirrors the transported context"
     );
     assert_eq!(
-        admission.created_at_ms,
-        expected["created_at_ms"].as_i64().unwrap(),
+        admission.created_at_ms, expected.created_at_ms,
         "992/4 creation time matches the fixture"
     );
     assert_eq!(
-        admission.expires_at_ms,
-        expected["expires_at_ms"].as_i64().unwrap(),
+        admission.expires_at_ms, expected.expires_at_ms,
         "992/4 expiry matches the fixture"
     );
     assert_eq!(
-        admission.recovery_owner,
-        expected["recovery_owner"].as_str().unwrap(),
+        admission.recovery_owner, expected.recovery_owner,
         "992/4 recovery owner matches the fixture"
     );
     request.validate().expect("992/4 sealed request validates");
@@ -823,15 +1186,19 @@ fn stale_epoch_fence_expiry_or_changed_digest_cannot_dispatch() {
 
     let stale_epoch = EpochLineage {
         current: EpochIdentity {
-            lineage_id: OpaqueLabel::new(LINEAGE_992).unwrap(),
+            lineage_id: OpaqueLabel::new(fixture_992().lineage_id).unwrap(),
             epoch: 2,
         },
         predecessor: None,
     };
     let stale_owner =
         CompositionReservation::bind(Arc::clone(&ors), stale_epoch).expect("992 stale binds");
-    let error =
-        begin_execute(&stale_owner, &sealed.token).expect_err("992 stale epoch must not execute");
+    let error = begin_execute_after_send(
+        &stale_owner,
+        &sealed.token,
+        &send_evidence(&sealed.token, ResolvedSendKind::ReceiptReceived),
+    )
+    .expect_err("992 stale epoch must not execute");
     assert!(
         matches!(
             error,
@@ -903,7 +1270,12 @@ fn cancellation_or_timeout_after_possible_submission_retains_reconciliation() {
     let (context, transition, revision, ordering, sealed) =
         reserve_one(&owner, "11", &["scope-992-a"]);
     ensure_eligible(&owner, &sealed.token).expect("992/11 eligible");
-    begin_execute(&owner, &sealed.token).expect("992/11 executing");
+    begin_execute_after_send(
+        &owner,
+        &sealed.token,
+        &send_evidence(&sealed.token, ResolvedSendKind::UnknownAfterSubmit),
+    )
+    .expect("992/11 executing");
     let error = cancel_before_send(&owner, &sealed.token)
         .expect_err("992/11 release after execution starts must fail");
     assert!(
@@ -914,7 +1286,12 @@ fn cancellation_or_timeout_after_possible_submission_retains_reconciliation() {
         "992/11 cancel fails as an invalid transition, got {error:?}"
     );
     // Identity retained: execution is idempotent, not advanced or freed.
-    let retained = begin_execute(&owner, &sealed.token).expect("992/11 identity retained");
+    let retained = begin_execute_after_send(
+        &owner,
+        &sealed.token,
+        &send_evidence(&sealed.token, ResolvedSendKind::UnknownAfterSubmit),
+    )
+    .expect("992/11 identity retained");
     assert_eq!(
         retained.state,
         ReservationState::Executing,
@@ -958,7 +1335,12 @@ fn proved_not_applied_release_stays_distinct_from_still_unknown() {
     let (context, transition, revision, ordering, sealed) =
         reserve_one(&owner, "13a", &["scope-992-a"]);
     ensure_eligible(&owner, &sealed.token).expect("992/13 eligible");
-    begin_execute(&owner, &sealed.token).expect("992/13 executing");
+    begin_execute_after_send(
+        &owner,
+        &sealed.token,
+        &send_evidence(&sealed.token, ResolvedSendKind::UnknownAfterSubmit),
+    )
+    .expect("992/13 executing");
     mark_unknown_outcome(&owner, &sealed.token).expect("992/13 reconciling");
     let request = project_reserved_write(&sealed, &context, &transition, revision, ordering)
         .expect("992/13 projection seals");
@@ -980,7 +1362,12 @@ fn proved_not_applied_release_stays_distinct_from_still_unknown() {
     let (u_context, u_transition, u_revision, u_ordering, u_sealed) =
         reserve_one(&owner, "13b", &["scope-992-b"]);
     ensure_eligible(&owner, &u_sealed.token).expect("992/13b eligible");
-    begin_execute(&owner, &u_sealed.token).expect("992/13b executing");
+    begin_execute_after_send(
+        &owner,
+        &u_sealed.token,
+        &send_evidence(&u_sealed.token, ResolvedSendKind::UnknownAfterSubmit),
+    )
+    .expect("992/13b executing");
     mark_unknown_outcome(&owner, &u_sealed.token).expect("992/13b reconciling");
     let u_request =
         project_reserved_write(&u_sealed, &u_context, &u_transition, u_revision, u_ordering)
@@ -993,7 +1380,12 @@ fn proved_not_applied_release_stays_distinct_from_still_unknown() {
         matches!(error, ReservationWriteError::Unknown { .. }),
         "992/13 still-unknown is typed unknown, got {error:?}"
     );
-    let retained = begin_execute(&owner, &u_sealed.token).expect_err("992/13 stays reconciling");
+    let retained = begin_execute_after_send(
+        &owner,
+        &u_sealed.token,
+        &send_evidence(&u_sealed.token, ResolvedSendKind::UnknownAfterSubmit),
+    )
+    .expect_err("992/13 stays reconciling");
     assert!(
         matches!(
             retained,
@@ -1022,7 +1414,12 @@ fn forged_foreign_partial_or_stale_receipt_cannot_release_or_finalize() {
     let (context, transition, revision, ordering, sealed) =
         reserve_one(&owner, "14a", &["scope-992-a", "scope-992-b"]);
     ensure_eligible(&owner, &sealed.token).expect("992/14 eligible");
-    begin_execute(&owner, &sealed.token).expect("992/14 executing");
+    begin_execute_after_send(
+        &owner,
+        &sealed.token,
+        &send_evidence(&sealed.token, ResolvedSendKind::ReceiptReceived),
+    )
+    .expect("992/14 executing");
     let request = project_reserved_write(
         &sealed,
         &context,
@@ -1092,7 +1489,12 @@ fn forged_foreign_partial_or_stale_receipt_cannot_release_or_finalize() {
     );
 
     // The token never moved: it is still Executing with no terminal.
-    let retained = begin_execute(&owner, &sealed.token).expect("992/14 identity retained");
+    let retained = begin_execute_after_send(
+        &owner,
+        &sealed.token,
+        &send_evidence(&sealed.token, ResolvedSendKind::ReceiptReceived),
+    )
+    .expect("992/14 identity retained");
     assert_eq!(
         retained.state,
         ReservationState::Executing,
@@ -1110,7 +1512,12 @@ fn forged_foreign_partial_or_stale_receipt_cannot_release_or_finalize() {
     let (r_context, r_transition, r_revision, r_ordering, r_sealed) =
         reserve_one(&reject_owner, "14c", &["scope-992-a"]);
     ensure_eligible(&reject_owner, &r_sealed.token).expect("992/14c eligible");
-    begin_execute(&reject_owner, &r_sealed.token).expect("992/14c executing");
+    begin_execute_after_send(
+        &reject_owner,
+        &r_sealed.token,
+        &send_evidence(&r_sealed.token, ResolvedSendKind::ReceiptReceived),
+    )
+    .expect("992/14c executing");
     let r_request =
         project_reserved_write(&r_sealed, &r_context, &r_transition, r_revision, r_ordering)
             .expect("992/14c projection seals");
@@ -1141,15 +1548,19 @@ fn old_executor_cannot_finalize_another_generations_token() {
     ensure_eligible(&owner, &sealed.token).expect("992/15 eligible");
     let next_epoch = EpochLineage {
         current: EpochIdentity {
-            lineage_id: OpaqueLabel::new(LINEAGE_992).unwrap(),
+            lineage_id: OpaqueLabel::new(fixture_992().lineage_id).unwrap(),
             epoch: 2,
         },
         predecessor: None,
     };
     let next_owner =
         CompositionReservation::bind(Arc::clone(&ors), next_epoch).expect("992/15 next binds");
-    let error = begin_execute(&next_owner, &sealed.token)
-        .expect_err("992/15 old executor must not execute");
+    let error = begin_execute_after_send(
+        &next_owner,
+        &sealed.token,
+        &send_evidence(&sealed.token, ResolvedSendKind::ReceiptReceived),
+    )
+    .expect_err("992/15 old executor must not execute");
     assert!(
         matches!(
             error,
@@ -1168,8 +1579,18 @@ fn old_executor_cannot_finalize_another_generations_token() {
     );
     // Its own generation still owns the token: execution proceeds and the
     // close binds the exact receipt.
-    begin_execute(&owner, &sealed.token).expect("992/15 own generation executes");
-    let retained = begin_execute(&owner, &sealed.token).expect("992/15 still executing");
+    begin_execute_after_send(
+        &owner,
+        &sealed.token,
+        &send_evidence(&sealed.token, ResolvedSendKind::ReceiptReceived),
+    )
+    .expect("992/15 own generation executes");
+    let retained = begin_execute_after_send(
+        &owner,
+        &sealed.token,
+        &send_evidence(&sealed.token, ResolvedSendKind::ReceiptReceived),
+    )
+    .expect("992/15 still executing");
     assert_eq!(
         retained.state,
         ReservationState::Executing,
@@ -1218,7 +1639,9 @@ fn exact_replay_returns_the_token_while_changed_content_is_rejected() {
         "992/16 changed content fails as a duplicate conflict, got {error:?}"
     );
     // Changed content is a new operation: a fresh identity reserves anew
-    // with its own canonical order.
+    // with its own canonical order. The failed duplicate-content attempt
+    // consumed no order, so the fresh reservation takes exactly the next one:
+    // no skipped, reallocated, or otherwise non-canonical ordering.
     let mut fresh = changed.clone();
     fresh.identity.operation_id = OperationId::new("op-992-16-fresh").unwrap();
     fresh.identity.idempotency_key = "idem-992-16-fresh".to_owned();
@@ -1231,9 +1654,10 @@ fn exact_replay_returns_the_token_while_changed_content_is_rejected() {
     let fresh_sealed =
         reserve_for_transition(&owner, &fresh_seed, &context, &fresh, &revision, &ordering)
             .expect("992/16 fresh identity reserves");
-    assert!(
-        fresh_sealed.token.reservation_order > first.token.reservation_order,
-        "992/16 new operations take new orders"
+    assert_eq!(
+        fresh_sealed.token.reservation_order,
+        first.token.reservation_order + 1,
+        "992/16 new operations take exactly the next canonical order"
     );
 }
 
@@ -1287,6 +1711,438 @@ fn ors_reopen_recovers_unresolved_reservations_before_new_allocation() {
     ensure_eligible(&recovered_owner, &sealed_b.token).expect("992/17 successor proceeds");
 }
 
+// WORK_UNIT_CASE: 992/21
+#[test]
+fn recovery_pagination_reports_every_unresolved_token() {
+    // `unresolved_reservations` pages the bounded recovery cursor to
+    // exhaustion: five reservations with a page bound of two report all five
+    // in canonical order, not just the first page. Revert check: with the
+    // old single-page read only two tokens return and the length assertion
+    // fails.
+    let (ors, _dir) = temp_ors("21", Arc::new(BindingEvidence));
+    let owner = owner_for(&ors);
+    for index in 0..5 {
+        let tag = format!("21p{index}");
+        reserve_one(&owner, &tag, &["scope-992-a"]);
+    }
+    let all = eliot_kernel_service::unresolved_reservations(&owner, 2)
+        .expect("992/21 paged recovery scans");
+    assert_eq!(all.len(), 5, "992/21 every planted token is reported");
+    let orders: Vec<u64> = all
+        .iter()
+        .map(|record| record.token.reservation_order)
+        .collect();
+    assert_eq!(
+        orders,
+        vec![1, 2, 3, 4, 5],
+        "992/21 canonical order is exact"
+    );
+    for (index, record) in all.iter().enumerate() {
+        assert_eq!(
+            record.token.reservation_id.as_str(),
+            format!("res-992-21p{index}"),
+            "992/21 token identity is exact"
+        );
+    }
+    // The first bounded page alone is truncated: the truncation signal is
+    // real, and exhaustion (not the first page) is the recovery result.
+    let first = eliot_kernel_service::recovery_page(&owner, 2).expect("992/21 first page reads");
+    assert!(
+        first.next_after_order.is_some(),
+        "992/21 first page carries the truncation signal"
+    );
+    assert_eq!(
+        first.records.len(),
+        2,
+        "992/21 first page holds exactly one page"
+    );
+}
+
+// WORK_UNIT_CASE: 992/22
+#[test]
+fn cancel_before_send_releases_and_unblocks_the_same_scope_successor() {
+    // The permitted pre-submission cancellation: the head token releases with
+    // no terminal receipt, leaves the unresolved set, and the same-scope
+    // successor that waited on it becomes eligible. Revert check: without the
+    // release the successor stays `PredecessorPending` and the eligibility
+    // assertion fails.
+    let (ors, _dir) = temp_ors("22", Arc::new(BindingEvidence));
+    let owner = owner_for(&ors);
+    let (_ctx_a, _tr_a, _rev_a, _ord_a, sealed_a) = reserve_one(&owner, "22a", &["scope-992-a"]);
+    let (_ctx_b, _tr_b, _rev_b, _ord_b, sealed_b) = reserve_one(&owner, "22b", &["scope-992-a"]);
+    ensure_eligible(&owner, &sealed_a.token).expect("992/22 head is eligible");
+    let blocked =
+        ensure_eligible(&owner, &sealed_b.token).expect_err("992/22 successor waits first");
+    assert!(
+        matches!(
+            blocked,
+            ReservationWriteError::Ors(OrsError::PredecessorPending)
+        ),
+        "992/22 successor waits on its predecessor, got {blocked:?}"
+    );
+    let released =
+        cancel_before_send(&owner, &sealed_a.token).expect("992/22 pre-send cancel releases");
+    assert_eq!(
+        released.state,
+        ReservationState::Released,
+        "992/22 before-send cancel releases"
+    );
+    assert!(
+        released.terminal_receipt_id.is_none(),
+        "992/22 pre-effect release binds no terminal receipt"
+    );
+    let pending = unresolved(&owner);
+    assert!(
+        !pending
+            .iter()
+            .any(|record| record.token.reservation_id.as_str() == "res-992-22a"),
+        "992/22 released token leaves the unresolved set"
+    );
+    let successor =
+        ensure_eligible(&owner, &sealed_b.token).expect("992/22 successor becomes eligible");
+    assert_eq!(
+        successor.state,
+        ReservationState::Eligible,
+        "992/22 same-scope successor proceeds after the release"
+    );
+}
+
+// WORK_UNIT_CASE: 992/23
+#[test]
+fn ordinary_committed_lifecycle_finalizes_without_ambiguity() {
+    // The normal committed execution path with no unknown outcome: reserve,
+    // eligible, post-send execute, project, exact committed receipt,
+    // finalize. The token finalizes with its terminal bound, leaves the
+    // unresolved set, and the same-scope successor is eligible at once.
+    // Revert check: skipping any step (e.g. executing without post-send
+    // evidence, or finalizing without the receipt) fails to compile or fails
+    // closed, and the `Finalized` assertion fails.
+    let (ors, _dir) = temp_ors("23", Arc::new(BindingEvidence));
+    let owner = owner_for(&ors);
+    let (context, transition, revision, ordering, sealed) =
+        reserve_one(&owner, "23a", &["scope-992-a"]);
+    let eligible = ensure_eligible(&owner, &sealed.token).expect("992/23 eligible");
+    assert_eq!(
+        eligible.state,
+        ReservationState::Eligible,
+        "992/23 reservation is eligible"
+    );
+    let executing = begin_execute_after_send(
+        &owner,
+        &sealed.token,
+        &send_evidence(&sealed.token, ResolvedSendKind::ReceiptReceived),
+    )
+    .expect("992/23 executing");
+    assert_eq!(
+        executing.state,
+        ReservationState::Executing,
+        "992/23 post-send execution starts"
+    );
+    let request = project_reserved_write(&sealed, &context, &transition, revision, ordering)
+        .expect("992/23 projection seals");
+    let receipt = receipt_for(&request, WriteReceiptStatus::Committed);
+    let reconciliation = reconcile_receipt(&sealed.token, &receipt).expect("992/23 evidence binds");
+    let closed =
+        finalize_reservation(&owner, &reconciliation).expect("992/23 exact receipt closes");
+    assert_eq!(
+        closed.state,
+        ReservationState::Finalized,
+        "992/23 exact committed evidence finalizes"
+    );
+    assert!(
+        closed.terminal_receipt_id.is_some(),
+        "992/23 terminal receipt is bound"
+    );
+    let pending = unresolved(&owner);
+    assert!(
+        pending.is_empty(),
+        "992/23 committed token leaves no unresolved work"
+    );
+    // The same-scope successor observes the committed head: the next expected
+    // sequence with the receipt's canonical digest. It reserves and becomes
+    // eligible at once, proving the queue unblocked.
+    let committed_sha = receipt
+        .envelope
+        .as_ref()
+        .expect("992/23 envelope binds")
+        .identity
+        .canonical_sha256
+        .clone();
+    let successor_fixture = fixture_992();
+    let advanced = successor_fixture.expected_sequence + 1;
+    assert_eq!(advanced, 7, "992/23 successor extends the committed head");
+    let context_b = context_for("23b");
+    let mut transition_b = transition_for("23b", &[successor_fixture.scope_a.as_str()]);
+    let revision_b = vec![RevisionHeadExpectation {
+        key: RevisionKey::new(format!("{}23b", successor_fixture.revision_key_prefix)).unwrap(),
+        expected_revision: successor_fixture.expected_revision,
+        state_fence: fence(),
+    }];
+    let ordering_b = vec![OrderingHeadExpectation {
+        scope: OrderingScopeId::new(successor_fixture.scope_a.clone()).unwrap(),
+        expected_sequence: advanced,
+        state_fence: fence(),
+    }];
+    seal(&context_b, &mut transition_b, &revision_b, &ordering_b);
+    let heads_b = vec![ObservedHead {
+        scope: successor_fixture.scope_a.clone(),
+        expected_sequence: advanced,
+        expected_head_digest: committed_sha,
+        revision_head: None,
+    }];
+    let seed_b = seed_with_heads("23b", transition_b.identity.operation_id.as_str(), heads_b);
+    let next = reserve_for_transition(
+        &owner,
+        &seed_b,
+        &context_b,
+        &transition_b,
+        &revision_b,
+        &ordering_b,
+    )
+    .expect("992/23 same-scope successor reserves on the committed head");
+    let next_eligible = ensure_eligible(&owner, &next.token).expect("992/23 successor is eligible");
+    assert_eq!(
+        next_eligible.state,
+        ReservationState::Eligible,
+        "992/23 committed close unblocks the queue at once"
+    );
+}
+
+// WORK_UNIT_CASE: 992/24
+#[test]
+fn durable_rebind_recovers_identity_and_fences_stale_writers() {
+    // Restart recovery: the owner handle is discarded, the same durable path
+    // is reopened under the same epoch lineage, and the re-bound owner
+    // recovers the same reservation id and order with the interrupted
+    // execution converted to `Reconciling`. A stale-epoch writer is fenced
+    // without moving the token, an invalid continuation is rejected without
+    // loss, and the recovered token then continues to exact committed
+    // finalization. Revert check: rebinding under a fresh store loses the
+    // token (length assertion fails), and a stale writer that could execute
+    // would break the fencing assertion.
+    let (ors, dir) = temp_ors("24", Arc::new(BindingEvidence));
+    let owner = owner_for(&ors);
+    let (_context, _transition, _revision, _ordering, sealed) =
+        reserve_one(&owner, "24a", &["scope-992-a"]);
+    ensure_eligible(&owner, &sealed.token).expect("992/24 eligible");
+    begin_execute_after_send(
+        &owner,
+        &sealed.token,
+        &send_evidence(&sealed.token, ResolvedSendKind::ReceiptReceived),
+    )
+    .expect("992/24 executing");
+    let order = sealed.token.reservation_order;
+    drop(owner);
+    drop(ors);
+    let reopened =
+        RedbRecoveryStore::open_with_evidence(dir.join("ors.redb"), Arc::new(BindingEvidence))
+            .expect("992/24 ors reopens");
+    let reopened = Arc::new(reopened);
+    let recovered = owner_for(&reopened);
+    let pending = unresolved(&recovered);
+    assert_eq!(pending.len(), 1, "992/24 one unresolved token recovers");
+    assert_eq!(
+        pending[0].token, sealed.token,
+        "992/24 recovered token is byte-identical"
+    );
+    assert_eq!(
+        pending[0].token.reservation_order, order,
+        "992/24 recovered order is exact"
+    );
+    // Reopening converts interrupted execution to reconciliation: the token
+    // resumes `Reconciling` with the restart-interruption reason, never
+    // `Executing` and never terminal.
+    assert_eq!(
+        pending[0].state,
+        ReservationState::Reconciling,
+        "992/24 recovered state resumes Reconciling after interrupted execution"
+    );
+    assert_eq!(
+        pending[0]
+            .unknown_reason
+            .as_ref()
+            .map(|reason| reason.as_str()),
+        Some("restart interrupted execution"),
+        "992/24 recovered token carries the interruption reason"
+    );
+    // Stale-epoch fencing on rebind: a later-epoch writer cannot touch the
+    // token, and the valid re-bound owner still sees it unchanged.
+    let stale_epoch = EpochLineage {
+        current: EpochIdentity {
+            lineage_id: OpaqueLabel::new(fixture_992().lineage_id).unwrap(),
+            epoch: 2,
+        },
+        predecessor: None,
+    };
+    let stale_owner = CompositionReservation::bind(Arc::clone(&reopened), stale_epoch)
+        .expect("992/24 stale binds");
+    let error = begin_execute_after_send(
+        &stale_owner,
+        &sealed.token,
+        &send_evidence(&sealed.token, ResolvedSendKind::ReceiptReceived),
+    )
+    .expect_err("992/24 stale writer is fenced on rebind");
+    assert!(
+        matches!(
+            error,
+            ReservationWriteError::Ors(OrsError::StaleWriterEpoch)
+        ),
+        "992/24 stale writer fails closed, got {error:?}"
+    );
+    let still = unresolved(&recovered);
+    assert_eq!(still, pending, "992/24 stale attempt moved nothing");
+    // An invalid continuation is rejected without loss: release from
+    // `Reconciling` is refused and the token stays.
+    let error = cancel_before_send(&recovered, &sealed.token)
+        .expect_err("992/24 reconciling token cannot release");
+    assert!(
+        matches!(
+            error,
+            ReservationWriteError::Ors(OrsError::InvalidTransition)
+        ),
+        "992/24 invalid continuation fails closed, got {error:?}"
+    );
+    // The recovered token continues straight to exact committed
+    // finalization: it is already `Reconciling` from the interrupted
+    // execution, so no further unknown marking is needed or valid.
+    let context = context_for("24a");
+    let mut transition = transition_for("24a", &["scope-992-a"]);
+    let (revision, ordering) = heads_for("24a", &["scope-992-a"]);
+    seal(&context, &mut transition, &revision, &ordering);
+    let seed = seed_for(
+        "24a",
+        transition.identity.operation_id.as_str(),
+        &["scope-992-a"],
+    );
+    let replayed = reserve_for_transition(
+        &recovered,
+        &seed,
+        &context,
+        &transition,
+        &revision,
+        &ordering,
+    )
+    .expect("992/24 replay recovers its token");
+    assert_eq!(
+        replayed.token, sealed.token,
+        "992/24 replay returns the identical token"
+    );
+    let request = project_reserved_write(&replayed, &context, &transition, revision, ordering)
+        .expect("992/24 request rebuilds");
+    let receipt = receipt_for(&request, WriteReceiptStatus::Committed);
+    let reconciliation =
+        reconcile_receipt(&replayed.token, &receipt).expect("992/24 evidence binds");
+    let closed =
+        finalize_reservation(&recovered, &reconciliation).expect("992/24 recovery finalizes");
+    assert_eq!(
+        closed.state,
+        ReservationState::Finalized,
+        "992/24 recovered token finalizes on exact evidence"
+    );
+    assert!(
+        unresolved(&recovered).is_empty(),
+        "992/24 no unresolved token remains"
+    );
+}
+
+// WORK_UNIT_CASE: 992/25
+#[test]
+fn terminal_status_without_not_applied_proof_stays_unknown() {
+    // Disposition derivation requires envelope proof of not-applied: a
+    // `Cancelled` status whose envelope proves `Success` is not
+    // proved-not-applied, so reconciliation stays typed `Unknown` and the
+    // reservation is retained. A `Rejected` status with a `Cancelled`-kind
+    // envelope and a `DeadLetter` status with a `Failure`-kind envelope both
+    // prove not-applied and release. Revert check: with the old
+    // label-only mapping the mismatched receipt constructs a release and the
+    // `Unknown` assertion fails.
+    let (ors, _dir) = temp_ors("25", Arc::new(BindingEvidence));
+    let owner = owner_for(&ors);
+    let (context, transition, revision, ordering, sealed) =
+        reserve_one(&owner, "25a", &["scope-992-a"]);
+    ensure_eligible(&owner, &sealed.token).expect("992/25 eligible");
+    begin_execute_after_send(
+        &owner,
+        &sealed.token,
+        &send_evidence(&sealed.token, ResolvedSendKind::UnknownAfterSubmit),
+    )
+    .expect("992/25 executing");
+    mark_unknown_outcome(&owner, &sealed.token).expect("992/25 reconciling");
+    let request = project_reserved_write(&sealed, &context, &transition, revision, ordering)
+        .expect("992/25 projection seals");
+    let mismatched = receipt_with_envelope(
+        &request,
+        WriteReceiptStatus::Cancelled,
+        success_disposition(),
+    );
+    let error = reconcile_receipt(&sealed.token, &mismatched)
+        .expect_err("992/25 unproved terminal stays unknown");
+    assert!(
+        matches!(error, ReservationWriteError::Unknown { .. }),
+        "992/25 unproved terminal is typed unknown, got {error:?}"
+    );
+    let retained = unresolved(&owner);
+    assert_eq!(retained.len(), 1, "992/25 unproved token is retained");
+    assert_eq!(
+        retained[0].state,
+        ReservationState::Reconciling,
+        "992/25 unproved token stays Reconciling"
+    );
+    assert!(
+        retained[0].terminal_receipt_id.is_none(),
+        "992/25 unproved token binds no terminal receipt"
+    );
+    // A `Cancelled`-kind envelope proves not-applied for a `Rejected` status.
+    let cancelled_proof = receipt_with_envelope(
+        &request,
+        WriteReceiptStatus::Rejected,
+        cancelled_disposition(),
+    );
+    let reconciliation =
+        reconcile_receipt(&sealed.token, &cancelled_proof).expect("992/25 proved binds");
+    let released = finalize_reservation(&owner, &reconciliation).expect("992/25 proved releases");
+    assert_eq!(
+        released.state,
+        ReservationState::Released,
+        "992/25 proved-not-applied releases"
+    );
+    assert!(
+        released.terminal_receipt_id.is_some(),
+        "992/25 release binds its terminal receipt"
+    );
+    // A `Failure`-kind envelope proves not-applied for a `DeadLetter` status.
+    let (d_context, d_transition, d_revision, d_ordering, d_sealed) =
+        reserve_one(&owner, "25b", &["scope-992-b"]);
+    ensure_eligible(&owner, &d_sealed.token).expect("992/25b eligible");
+    begin_execute_after_send(
+        &owner,
+        &d_sealed.token,
+        &send_evidence(&d_sealed.token, ResolvedSendKind::UnknownAfterSubmit),
+    )
+    .expect("992/25b executing");
+    mark_unknown_outcome(&owner, &d_sealed.token).expect("992/25b reconciling");
+    let d_request =
+        project_reserved_write(&d_sealed, &d_context, &d_transition, d_revision, d_ordering)
+            .expect("992/25b projection seals");
+    let dead = receipt_with_envelope(
+        &d_request,
+        WriteReceiptStatus::DeadLetter,
+        failure_disposition(),
+    );
+    let d_reconciliation = reconcile_receipt(&d_sealed.token, &dead).expect("992/25b proved binds");
+    let d_released =
+        finalize_reservation(&owner, &d_reconciliation).expect("992/25b proved releases");
+    assert_eq!(
+        d_released.state,
+        ReservationState::Released,
+        "992/25 dead-letter with failure proof releases"
+    );
+    assert!(
+        d_released.terminal_receipt_id.is_some(),
+        "992/25 dead-letter release binds its terminal receipt"
+    );
+}
+
 // WORK_UNIT_CASE: 992/19
 #[test]
 fn errors_preserve_identity_and_redaction_without_a_second_owner() {
@@ -1311,10 +2167,29 @@ fn errors_preserve_identity_and_redaction_without_a_second_owner() {
         &ordering,
     )
     .expect_err("992/19 malformed head must refuse");
+    // Exact identity-preserving refusal: the error is the typed admission
+    // refusal carrying this exact operation id. The offending scope is
+    // sanctioned in the detail text; no reservation identity was minted, so
+    // the refused reservation id must be absent.
+    assert!(
+        matches!(
+            &error,
+            ReservationWriteError::Admission { operation_id, .. } if operation_id == &op
+        ),
+        "992/19 refusal is the typed admission error for this operation, got {error:?}"
+    );
     let text = format!("{error:?}");
     assert!(
-        text.contains(&op) || text.contains("res-992-19") || text.contains("scope-992-a"),
-        "992/19 refusal preserves observable identity, got {text}"
+        text.contains(&op),
+        "992/19 refusal preserves the operation identity, got {text}"
+    );
+    assert!(
+        text.contains("scope-992-a"),
+        "992/19 refusal names the sanctioned offending scope, got {text}"
+    );
+    assert!(
+        !text.contains("res-992-19"),
+        "992/19 refusal minted no reservation identity, got {text}"
     );
     for secret in [
         "observation-992",
@@ -1333,18 +2208,44 @@ fn errors_preserve_identity_and_redaction_without_a_second_owner() {
     );
 
     // Cancellation errors likewise preserve the token identity they refuse.
-    let (_ctx_b, _tr_b, _rev_b, _ord_b, sealed_b) = reserve_one(&owner, "19b", &["scope-992-b"]);
+    let (ctx_b, tr_b, _rev_b, _ord_b, sealed_b) = reserve_one(&owner, "19b", &["scope-992-b"]);
+    let op_b = tr_b.identity.operation_id.as_str().to_owned();
     ensure_eligible(&owner, &sealed_b.token).expect("992/19b eligible");
-    begin_execute(&owner, &sealed_b.token).expect("992/19b executing");
+    begin_execute_after_send(
+        &owner,
+        &sealed_b.token,
+        &send_evidence(&sealed_b.token, ResolvedSendKind::ReceiptReceived),
+    )
+    .expect("992/19b executing");
     let error = cancel_before_send(&owner, &sealed_b.token)
         .expect_err("992/19b cancel after execution must refuse");
-    let text = format!("{error:?}");
+    // Typed, identity-preserving fail-closed refusal: exactly the owner
+    // invalid-transition error, and the refused token is still Executing for
+    // its exact operation with no terminal bound.
     assert!(
-        text.contains("InvalidTransition") || text.contains("invalid"),
-        "992/19 cancellation refusal stays typed, got {text}"
+        matches!(
+            error,
+            ReservationWriteError::Ors(OrsError::InvalidTransition)
+        ),
+        "992/19 cancellation refusal is the typed invalid transition, got {error:?}"
     );
     let pending = unresolved(&owner);
     assert_eq!(pending.len(), 1, "992/19 refused cancel frees nothing");
+    assert_eq!(
+        pending[0].token.operation_id.as_str(),
+        op_b,
+        "992/19 refused token keeps its exact operation identity"
+    );
+    assert_eq!(
+        pending[0].state,
+        ReservationState::Executing,
+        "992/19 refused token keeps its Executing state"
+    );
+    assert!(
+        pending[0].terminal_receipt_id.is_none(),
+        "992/19 refused token binds no terminal receipt"
+    );
+    let _ = (ctx_b,);
 }
 
 // WORK_UNIT_CASE: 992/9
@@ -1377,9 +2278,19 @@ fn queued_normal_work_holds_no_provider_lock_or_protected_resource() {
 
     // A reconciling scope blocks only its own scopes: disjoint work still
     // runs its complete lifecycle while the waiter holds nothing.
-    begin_execute(&owner, &sealed_a.token).expect("992/9a executing");
+    begin_execute_after_send(
+        &owner,
+        &sealed_a.token,
+        &send_evidence(&sealed_a.token, ResolvedSendKind::UnknownAfterSubmit),
+    )
+    .expect("992/9a executing");
     mark_unknown_outcome(&owner, &sealed_a.token).expect("992/9a reconciling");
-    begin_execute(&owner, &sealed_b.token).expect("992/9b executing");
+    begin_execute_after_send(
+        &owner,
+        &sealed_b.token,
+        &send_evidence(&sealed_b.token, ResolvedSendKind::ReceiptReceived),
+    )
+    .expect("992/9b executing");
     let (context_b, transition_b, revision_b, ordering_b) = {
         let context = context_for("09b");
         let mut transition = transition_for("09b", &["scope-992-b"]);
@@ -1853,12 +2764,13 @@ mod gateway_cases {
     ) {
         // A scope never touched before, observed at its own head: proves a
         // later write still dispatches after earlier scopes committed.
+        let fixture = fixture_992();
         let context = context_for(tag);
         let mut transition = transition_for(tag, &[scope]);
         let (revision, ordering) = heads_seq(tag, &[scope], 6);
         seal(&context, &mut transition, &revision, &ordering);
-        let mut seed = seed_for(tag, transition.identity.operation_id.as_str(), &[scope]);
-        seed.heads = observed_seq(&[scope], 6, &"e".repeat(64));
+        let heads = observed_seq(&[scope], 6, &fixture.head_digest_fresh);
+        let seed = seed_with_heads(tag, transition.identity.operation_id.as_str(), heads);
         (context, transition, revision, ordering, seed)
     }
 
@@ -2122,7 +3034,7 @@ mod gateway_cases {
         // The admission lease released deterministically: a later write on an
         // untouched scope dispatches through the same gateway.
         let (c2_context, c2_transition, c2_revision, c2_ordering, c2_seed) =
-            apply_inputs_fresh_scope("12b", "scope-992-c");
+            apply_inputs_fresh_scope("12b", &fixture_992().scope_c);
         let second = setup
             .gateway
             .apply_reserved(
@@ -2157,7 +3069,12 @@ mod gateway_cases {
         let owner = owner_for(&ors);
         let (_ctx_a, tr_a, _rev_a, _ord_a, sealed_a) = reserve_one(&owner, "18a", &["scope-992-a"]);
         ensure_eligible(&owner, &sealed_a.token).expect("992/18a eligible");
-        begin_execute(&owner, &sealed_a.token).expect("992/18a executing");
+        begin_execute_after_send(
+            &owner,
+            &sealed_a.token,
+            &send_evidence(&sealed_a.token, ResolvedSendKind::UnknownAfterSubmit),
+        )
+        .expect("992/18a executing");
         mark_unknown_outcome(&owner, &sealed_a.token).expect("992/18a reconciling");
         let (_ctx_b, _tr_b, _rev_b, _ord_b, sealed_b) =
             reserve_one(&owner, "18b", &["scope-992-b"]);
@@ -2165,16 +3082,34 @@ mod gateway_cases {
         let _ = tr_a;
 
         let setup = loopback(ServerMode::NoSend, "18", Some(Arc::clone(&ors))).await;
+        let before = unresolved(&owner);
+        assert_eq!(
+            before.len(),
+            2,
+            "992/18 setup has exactly two unresolved tokens"
+        );
         let error = setup
             .gateway
             .drain_reserved(Duration::from_secs(5))
             .await
             .expect_err("992/18 drain with an open token must block");
-        assert!(
-            error.contains('1') || error.contains("unresolved"),
-            "992/18 drain reports its honest pending count, got {error}"
+        assert_eq!(
+            error,
+            "migration drain blocked: 2 unresolved reservations remain; reconcile by exact receipt before exclusivity (no forced release)",
+            "992/18 drain reports the exact honest pending count"
         );
-        let pending = unresolved(&owner);
+        let after = unresolved(&owner);
+        assert_eq!(
+            after, before,
+            "992/18 failed drain never force-releases or mutates either reservation"
+        );
+        for record in &after {
+            assert!(
+                record.terminal_receipt_id.is_none(),
+                "992/18 failed drain binds no terminal receipt"
+            );
+        }
+        let pending = after;
         assert_eq!(
             pending.len(),
             2,
@@ -2186,6 +3121,13 @@ mod gateway_cases {
                     && record.state == ReservationState::Reconciling
             ),
             "992/18 drain force-releases nothing"
+        );
+        assert!(
+            pending.iter().any(
+                |record| record.token.reservation_id.as_str() == "res-992-18b"
+                    && record.state == ReservationState::Eligible
+            ),
+            "992/18 drain leaves the unrelated eligible token untouched"
         );
         // Recovery reconciles the token at the durable owner (gateway
         // independent: the drain fence stays put), and a fresh gateway then
@@ -2303,6 +3245,126 @@ mod gateway_cases {
         assert!(
             pending.is_empty(),
             "992/20 no orphaned token remains for {op}"
+        );
+        finish(setup).await;
+    }
+
+    // WORK_UNIT_CASE: 992/26
+    #[tokio::test]
+    async fn nonzero_drain_fails_closed_without_force_release() {
+        // A non-zero drain is an error, never a completion: both reservations
+        // keep their exact pre-drain states, no terminal receipt is bound,
+        // and the unresolved set is identical before and after. Zero records
+        // are force-released. Revert check: a drain that released or mutated
+        // anything breaks the before/after equality.
+        let (ors, _dir) = temp_ors("26", Arc::new(BindingEvidence));
+        let owner = owner_for(&ors);
+        let (_ctx_a, _tr_a, _rev_a, _ord_a, sealed_a) =
+            reserve_one(&owner, "26a", &["scope-992-a"]);
+        ensure_eligible(&owner, &sealed_a.token).expect("992/26a eligible");
+        let (_ctx_b, _tr_b, _rev_b, _ord_b, sealed_b) =
+            reserve_one(&owner, "26b", &["scope-992-b"]);
+        ensure_eligible(&owner, &sealed_b.token).expect("992/26b eligible");
+        let setup = loopback(ServerMode::NoSend, "26", Some(Arc::clone(&ors))).await;
+        let before = unresolved(&owner);
+        assert_eq!(
+            before.len(),
+            2,
+            "992/26 setup has exactly two unresolved tokens"
+        );
+        let error = setup
+            .gateway
+            .drain_reserved(Duration::from_secs(5))
+            .await
+            .expect_err("992/26 non-zero drain must fail");
+        assert_eq!(
+            error,
+            "migration drain blocked: 2 unresolved reservations remain; reconcile by exact receipt before exclusivity (no forced release)",
+            "992/26 drain reports the exact honest pending count"
+        );
+        let after = unresolved(&owner);
+        assert_eq!(
+            after, before,
+            "992/26 failed drain mutates nothing; zero force-releases"
+        );
+        assert!(
+            after
+                .iter()
+                .all(|record| record.terminal_receipt_id.is_none()),
+            "992/26 failed drain binds no terminal receipt"
+        );
+        finish(setup).await;
+    }
+
+    // WORK_UNIT_CASE: 992/27
+    #[tokio::test]
+    async fn truncated_drain_report_fails_closed_without_force_release() {
+        // 260 unresolved reservations overflow the 256-entry recovery page:
+        // the drain must report the truncated scan distinctly (never the
+        // partial first-page count as exact), fail, and leave all 260 tokens
+        // untouched with zero force-releases. The exhaustive recovery below
+        // also proves every planted token is reported. Revert check: a drain
+        // that accepted the partial page would return `Ok` and break the
+        // error assertion.
+        let (ors, _dir) = temp_ors("27", Arc::new(BindingEvidence));
+        let owner = owner_for(&ors);
+        let fixture = fixture_992();
+        for index in 0..260u32 {
+            let tag = format!("27t{index:03}");
+            let scope = format!("{}t{index:03}", fixture.scope_prefix);
+            let context = context_for(&tag);
+            let mut transition = transition_for(&tag, &[scope.as_str()]);
+            let (revision, ordering) =
+                heads_seq(&tag, &[scope.as_str()], fixture.expected_sequence);
+            seal(&context, &mut transition, &revision, &ordering);
+            let seed = ReservationSeed {
+                reservation_id: format!("{}t{index:03}", fixture.reservation_id_prefix),
+                operation_id: transition.identity.operation_id.as_str().to_owned(),
+                recovery_owner: fixture.recovery_owner.clone(),
+                payload_bytes: format!("{}t{index:03}", fixture.payload_prefix).into_bytes(),
+                key_provider: fixture.key_provider.clone(),
+                key_name: fixture.key_name.clone(),
+                visibility: fixture.visibility.clone(),
+                created_at_ms: fixture.created_at_ms,
+                known_at_ms: fixture.known_at_ms,
+                expires_at_ms: fixture.expires_at_ms,
+                heads: vec![ObservedHead {
+                    scope: scope.clone(),
+                    expected_sequence: fixture.expected_sequence,
+                    expected_head_digest: fixture.head_digest_a.clone(),
+                    revision_head: None,
+                }],
+            };
+            reserve_for_transition(&owner, &seed, &context, &transition, &revision, &ordering)
+                .unwrap_or_else(|error| panic!("992/27 reserve {tag} binds: {error:?}"));
+        }
+        let before = unresolved(&owner);
+        assert_eq!(
+            before.len(),
+            260,
+            "992/27 all planted tokens are recovered exhaustively"
+        );
+        let first =
+            eliot_kernel_service::recovery_page(&owner, 256).expect("992/27 first page reads");
+        assert!(
+            first.next_after_order.is_some(),
+            "992/27 first page carries the truncation signal"
+        );
+        let setup = loopback(ServerMode::NoSend, "27", Some(Arc::clone(&ors))).await;
+        let error = setup
+            .gateway
+            .drain_reserved(Duration::from_secs(5))
+            .await
+            .expect_err("992/27 truncated drain must fail");
+        assert_eq!(
+            error,
+            "migration drain blocked: recovery scan truncated after 256 pending reservations in the first page; full unresolved count unknown; reconcile by exact receipt before exclusivity (no forced release)",
+            "992/27 drain reports truncation distinctly from a known count"
+        );
+        let after = unresolved(&owner);
+        assert_eq!(
+            after, before,
+            "992/27 failed drain mutates nothing; zero force-releases"
         );
         finish(setup).await;
     }
