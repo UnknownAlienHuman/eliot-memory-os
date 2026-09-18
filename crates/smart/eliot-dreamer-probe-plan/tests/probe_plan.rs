@@ -305,6 +305,7 @@ fn plan_for(descriptors: Vec<InquiryAffordanceDescriptor>, candidates: Option<u6
 }
 
 // (a) Every probe names its target disagreement or unknown.
+// WORK_UNIT_CASE: 610/1
 #[test]
 fn probe_names_its_discriminator_or_unknown_target() {
     let plan = plan_for(
@@ -408,6 +409,7 @@ fn ordering_is_deterministic_and_permutation_stable() {
 }
 
 // (c) Duplicate probes collapse onto the lowest affordance identity.
+// WORK_UNIT_CASE: 610/5
 #[test]
 fn duplicate_probes_collapse() {
     let first = descriptor("aff-dup-a", gap_target("claim-same"));
@@ -587,6 +589,7 @@ fn bounds_and_digest_failures_fail_closed() {
 }
 
 // (f, continued) Cross-input binding mismatches fail the planner closed.
+// WORK_UNIT_CASE: 610/4
 #[test]
 fn binding_mismatches_fail_the_planner_closed() {
     let bundle = bundle();
