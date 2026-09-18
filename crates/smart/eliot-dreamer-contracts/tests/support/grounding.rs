@@ -12,7 +12,7 @@ use eliot_dreamer_contracts::grounding::canonical::{
 use eliot_dreamer_contracts::grounding::{
     AllowedReferenceManifest, AssertionWitness, AttemptIdentity, ClaimGroundingLedger,
     ClaimGroundingRecord, ClaimKind, GroundingDisposition, GroundingPolicy, MaterialClaim,
-    ModelDraft, NonMaterialClaim, PrecisionPayload, RouteIdentity,
+    NonMaterialClaim, PrecisionPayload, RouteIdentity, StructuredModelDraft,
 };
 use eliot_dreamer_contracts::{
     BudgetLimits, BundleCompleteness, DreamInputBundle, DreamJobAdmission, JobClass, Requester,
@@ -135,11 +135,11 @@ fn claim_with_handle(id: &str, handle: &str) -> MaterialClaim {
     claim
 }
 
-pub fn draft() -> ModelDraft {
+pub fn draft() -> StructuredModelDraft {
     let mut claims = vec![claim("claim-1"), claim("claim-2")];
     claims[0].subclaim_ids.insert("claim-2".into());
     claims[0].source_preimage_digest = claims[0].computed_digest().expect("claim digest");
-    let mut draft = ModelDraft {
+    let mut draft = StructuredModelDraft {
         schema_version: 2,
         job_id: job().canonical_id(),
         task_id: task(),

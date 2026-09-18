@@ -16,7 +16,8 @@ use eliot_dreamer_contracts::grounding::canonical::{
 };
 use eliot_dreamer_contracts::grounding::{
     AllowedReferenceManifest, AttemptIdentity, ClaimKind, GroundingPolicy, MaterialClaim,
-    ModelDraft, PrecisionPayload, RouteIdentity, ScreenTargetBinding, TypedEvidenceAssertion,
+    PrecisionPayload, RouteIdentity, ScreenTargetBinding, StructuredModelDraft,
+    TypedEvidenceAssertion,
 };
 use eliot_dreamer_contracts::{
     AtomicityMode, BudgetLimits, BundleCompleteness, DreamInputBundle, DreamJobAdmission, JobClass,
@@ -434,7 +435,7 @@ pub fn draft(
     manifest: &AllowedReferenceManifest,
     claims: Vec<MaterialClaim>,
     class: JobClass,
-) -> ModelDraft {
+) -> StructuredModelDraft {
     let provisional_job = job(manifest.digest.clone(), class);
     let bundle = DreamInputBundle {
         schema_version: 1,
@@ -448,7 +449,7 @@ pub fn draft(
         completeness: BundleCompleteness::Unknown,
         authoritative_denominator: None,
     };
-    let mut draft = ModelDraft {
+    let mut draft = StructuredModelDraft {
         schema_version: 2,
         job_id: provisional_job.canonical_id(),
         task_id: task(),

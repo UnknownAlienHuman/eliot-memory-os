@@ -43,7 +43,7 @@
 //!   projector binds the same frame the bundle plants, while the rest carry
 //!   zero bytes (this binary holds handles, not content) and a [`sha_hex`]
 //!   content digest. `bundle.job_id` is the admitted canonical identity because
-//!   [`ModelDraft::validate`](eliot_dreamer_contracts::grounding::ModelDraft::validate)
+//!   [`StructuredModelDraft::validate`](eliot_dreamer_contracts::grounding::StructuredModelDraft::validate)
 //!   requires it.
 //! * v1 hypothesis pair: the A-03 text track (`draft::ModelDraft` hypothesis
 //!   text plus `draft::GroundedDreamDraft` residues) carries the admitted
@@ -87,9 +87,9 @@ use crate::{DreamJobInput, DreamerError, KernelJobAdmission};
 /// SHA-256 hex over parts joined with `"\n"`.
 ///
 /// The newline join keeps multi-part preimages unambiguous: no two distinct
- /// part sequences join to the same preimage unless a part itself contains a
- /// newline, and admitted handles never do (the owner text check rejects
- /// control characters).
+/// part sequences join to the same preimage unless a part itself contains a
+/// newline, and admitted handles never do (the owner text check rejects
+/// control characters).
 pub(crate) fn sha_hex(parts: &[&str]) -> String {
     sha256_hex(parts.join("\n").as_bytes())
 }
@@ -145,7 +145,9 @@ fn frozen_manifest_shell(
 ///
 /// Defined as the digest of the frozen shell itself (see
 /// [`frozen_manifest_shell`]), so admission, bundle, and manifest cannot
-/// drift: all three derive it from the same task/scope/fence triple.
+/// drift: all three derive it from the same task/scope/fence triple. The job
+/// side of the triple is used because [`verify_admitted_binding`] guarantees
+/// `job.state_fence == admission.state_fence` before any derivation runs.
 fn frozen_digest(
     admission: &KernelJobAdmission,
     job: &DreamJobInput,
@@ -153,7 +155,7 @@ fn frozen_digest(
     let shell = frozen_manifest_shell(
         admitted_task_id(job).as_str(),
         admission.scope_id.as_str(),
-        &admission.state_fence,
+        &job.state_fence,
     )?;
     Ok(shell.digest)
 }
@@ -203,7 +205,9 @@ pub(crate) fn admission_of(
         idempotency_key: admission.idempotency_key.clone(),
         task_id: admitted_task_id(job),
         scope_id: admission.scope_id.clone(),
-        state_fence: admission.state_fence.clone(),
+        // The job side carries the fence: `verify_admitted_binding` proved it
+        // equals the admitted fence before this derivation ran.
+        state_fence: job.state_fence.clone(),
         privacy_profile: job.privacy_profile.clone(),
         contract_ref: format!("{}:contract", job.output_schema),
         policy_ref: format!("{}:policy", job.output_schema),
@@ -236,8 +240,7 @@ pub(crate) fn bundle_of(
     // identity, task binding, and frozen digest cannot drift from the job.
     let admitted = admission_of(admission, job)?;
     let carried: BTreeSet<&str> = job.evidence_handles.iter().map(String::as_str).collect();
-    let plant_frame =
-        job.job_class == JobClass::Orientation && !job.evidence_handles.is_empty();
+    let plant_frame = job.job_class == JobClass::Orientation && !job.evidence_handles.is_empty();
     let mut materials = Vec::with_capacity(job.evidence_handles.len());
     for (index, handle) in job.evidence_handles.iter().enumerate() {
         // The frame source is the first non-excluded material in bundle
@@ -289,7 +292,9 @@ pub(crate) fn bundle_of(
         job_id: admitted.canonical_id(),
         scope_id: admission.scope_id.clone(),
         task_id: admitted.task_id.clone(),
-        state_fence: admission.state_fence.clone(),
+        // Same fence agreement as `admission_of`: the verify gate proved the
+        // job fence equals the admitted fence.
+        state_fence: job.state_fence.clone(),
         manifest_digest: admitted.frozen_manifest_digest.clone(),
         materials,
         omissions,

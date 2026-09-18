@@ -35,8 +35,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
 use eliot_dreamer_claim_grounding::GroundingRequest;
-use eliot_dreamer_contracts::grounding::{GroundedDreamDraft, ModelDraft};
 use eliot_dreamer_contracts::ScreenBinding;
+use eliot_dreamer_contracts::grounding::{GroundedDreamDraft, StructuredModelDraft};
 use eliot_dreamer_curation::{NativeCurationPort, NativeCurationPortSet};
 
 use crate::admitted_material::{admission_of, validation_input_for};
@@ -49,22 +49,22 @@ use crate::dispatch_stage::{
     },
     dispatch_admitted,
 };
+use crate::grounding_stage::{ground_admitted_draft, resolve_grounding_inputs};
 use crate::kernel_port::{
     ClaimTransport, DREAMER_JOB_WIRE_ID, DispatchGrant, KernelPortError, ValidatedDreamerMaterial,
 };
-use eliot_protocol::dreamer_job::{DurableJobRequest, JobOperation, JobRole};
-use crate::grounding_stage::{ground_admitted_draft, resolve_grounding_inputs};
 use crate::model_stage::{resolve_model_inputs, run_admitted_model};
 use crate::result_stage::{project_result_view, render_jsonl};
 use crate::validation_stage::{resolve_validation_inputs, validate_admitted_draft};
-use eliot_dreamer_contracts::validation::structured::{
-    GroundingValidationInput, ValidatedGroundingCandidate,
-};
 use crate::{
     AuthenticatedKernelJobPort, CurationCarrierSource, DreamJobInput, DreamResult, DreamerError,
     JobClass, JobState, KERNEL_ADMISSION_REQUIRED, KernelJobAdmission, KernelJobPort,
     run_admitted_pipeline,
 };
+use eliot_dreamer_contracts::validation::structured::{
+    GroundingValidationInput, ValidatedGroundingCandidate,
+};
+use eliot_protocol::dreamer_job::{DurableJobRequest, JobOperation, JobRole};
 
 const TEST_LINEAGE_E2E: &str = "550e8400-e29b-41d4-a716-446655440000";
 const SCOPE_E2E: &str = "scope-e2e";
@@ -101,7 +101,9 @@ fn job_with_handles(job_id: &str, job_class: JobClass) -> DreamJobInput {
         requester: "e2e-harness".to_owned(),
         scope_id: SCOPE_E2E.to_owned(),
         task_id: Some("task-e2e".to_owned()),
-        state_fence: "kernel-owned".to_owned(),
+        // Same epoch-1 fence every admission fixture binds, so the binding
+        // check proves agreement and only owner gates can refuse.
+        state_fence: StateFence::new(test_epoch(1), ResourceGeneration::genesis()),
         evidence_handles: vec!["evidence-e2e-1".to_owned(), "evidence-e2e-2".to_owned()],
         memory_handles: vec!["memory-e2e-1".to_owned()],
         architecture_handles: vec!["architecture-e2e-1".to_owned()],
@@ -138,9 +140,16 @@ fn validate_through_model(
         }
     }
     let model_inputs = resolve_model_inputs(admission, job).expect("e2e model must resolve");
-    assert!(!model_inputs.route.is_empty(), "admitted route must be named");
-    assert!(model_inputs.budget_units > 0, "admitted budget must be positive");
-    let draft: ModelDraft = run_admitted_model(model_inputs).expect("e2e model must prove");
+    assert!(
+        !model_inputs.route.is_empty(),
+        "admitted route must be named"
+    );
+    assert!(
+        model_inputs.budget_units > 0,
+        "admitted budget must be positive"
+    );
+    let draft: StructuredModelDraft =
+        run_admitted_model(model_inputs).expect("e2e model must prove");
     let request: GroundingRequest =
         resolve_grounding_inputs(admission, job, draft).expect("e2e grounding must resolve");
     let grounded: GroundedDreamDraft =
@@ -182,11 +191,14 @@ fn orientation_pipeline_threads_screen_to_packet_receipt() {
     // G4: exactly the two owner residue markers travel as rival entries.
     assert_eq!(packet.rival_models_and_dissent.len(), 2);
     let job_id = packet.job_id.clone();
-    let view = project_result_view(&job_id, JobState::Completed, Some(DreamResult::Packet(packet)));
+    let view = project_result_view(
+        &job_id,
+        JobState::Completed,
+        Some(DreamResult::Packet(packet)),
+    );
     let line = render_jsonl(&view).expect("receipt must render");
     assert!(!line.contains('\n'), "receipt must be exactly one line");
-    let roundtrip: crate::JobView =
-        serde_json::from_str(&line).expect("receipt must round-trip");
+    let roundtrip: crate::JobView = serde_json::from_str(&line).expect("receipt must round-trip");
     assert_eq!(roundtrip, view);
 }
 
@@ -216,7 +228,8 @@ fn curation_pipeline_routes_a31_without_class_refusal() {
         .expect("screened binding must satisfy the real owner check");
     let model_inputs = resolve_model_inputs(&admission, &job).expect("e2e model must resolve");
     let draft = run_admitted_model(model_inputs).expect("e2e model must prove");
-    let request = resolve_grounding_inputs(&admission, &job, draft).expect("e2e grounding must resolve");
+    let request =
+        resolve_grounding_inputs(&admission, &job, draft).expect("e2e grounding must resolve");
     let grounded = ground_admitted_draft(request).expect("e2e grounding must prove");
     // The common A-05 owner directs Curation to its separate typed carrier:
     // a genuine semantic gate firing exactly as designed.
@@ -226,7 +239,9 @@ fn curation_pipeline_routes_a31_without_class_refusal() {
     assert!(
         matches!(
             rejected,
-            Err(DreamerError::InvalidAdmission("validation semantic rejection"))
+            Err(DreamerError::InvalidAdmission(
+                "validation semantic rejection"
+            ))
         ),
         "curation must take the separate-carrier gate, got {rejected:?}"
     );
@@ -268,7 +283,11 @@ fn submit_chain_returns_orientation_packet_with_jsonl() {
     assert_eq!(packet.scope_id, SCOPE_E2E);
     assert_eq!(packet.source_coverage.evidence, job.evidence_handles);
     let job_id = packet.job_id.clone();
-    let view = project_result_view(&job_id, JobState::Completed, Some(DreamResult::Packet(packet)));
+    let view = project_result_view(
+        &job_id,
+        JobState::Completed,
+        Some(DreamResult::Packet(packet)),
+    );
     let line = render_jsonl(&view).expect("chain receipt must render");
     assert!(!line.contains('\n'), "chain receipt must be one JSONL line");
     let roundtrip: crate::JobView =
@@ -812,8 +831,7 @@ impl SuccessClaimTransport {
         payload: &serde_json::Value,
     ) -> Result<DurableJobRequest, KernelPortError> {
         let denied = |detail: String| KernelPortError::Transport(detail);
-        if payload.get("operation").and_then(serde_json::Value::as_str)
-            != Some(DREAMER_JOB_WIRE_ID)
+        if payload.get("operation").and_then(serde_json::Value::as_str) != Some(DREAMER_JOB_WIRE_ID)
         {
             return Err(denied(
                 "success transport admits only the dreamer job wire".to_owned(),
@@ -858,9 +876,10 @@ impl SuccessClaimTransport {
         };
         let fence_json =
             serde_json::to_value(expected_fence).map_err(|error| denied(error.to_string()))?;
-        let generation = fence_json.get("resource_generation").cloned().ok_or_else(|| {
-            denied("echoed fence carries no resource generation".to_owned())
-        })?;
+        let generation = fence_json
+            .get("resource_generation")
+            .cloned()
+            .ok_or_else(|| denied("echoed fence carries no resource generation".to_owned()))?;
         let identity_json = serde_json::to_value(&request.request_identity)
             .map_err(|error| denied(error.to_string()))?;
         let product_id = request

@@ -112,7 +112,7 @@ pub fn route_fingerprint(route: &RouteIdentity) -> Result<String, ContractViolat
 /// Structured provider output retained before grounding.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ModelDraft {
+pub struct StructuredModelDraft {
     pub schema_version: u32,
     pub job_id: String,
     pub task_id: TaskId,
@@ -133,7 +133,7 @@ pub struct ModelDraft {
     pub draft_digest: String,
 }
 
-impl ModelDraft {
+impl StructuredModelDraft {
     #[allow(clippy::items_after_statements)]
     pub fn computed_digest(&self) -> Result<String, ContractViolation> {
         encoding::preflight(self)?;
@@ -319,7 +319,7 @@ pub struct GroundedDreamDraft {
     pub draft_digest: String,
     pub manifest_digest: String,
     pub policy_digest: String,
-    pub input: ModelDraft,
+    pub input: StructuredModelDraft,
     pub manifest: AllowedReferenceManifest,
     pub policy: GroundingPolicy,
     pub ledger: ClaimGroundingLedger,
