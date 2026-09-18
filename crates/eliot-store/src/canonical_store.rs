@@ -4415,9 +4415,15 @@ fn string_fragments(value: &str) -> Vec<String> {
 /// record-shaped strings at RPC var materialization, before any query
 /// executes, so no query-side cast can recover them; the templates rejoin the
 /// fragments with ``array::join(..., '')``, the same mechanism already used for
-/// reference/handle fields. Arbitrary JSON `payload` values are out of scope:
-/// only record-shaped string leaves are affected there and they need a
-/// recursive encoding designed separately.
+/// reference/handle fields.
+///
+/// Scope is exactly ten fields (see `TEXT_FIELDS` below); this is a bounded
+/// slice, NOT a complete core fix. Arbitrary JSON `payload` values are out of
+/// scope: only record-shaped string leaves are affected there and they need a
+/// recursive encoding designed separately. The full queued remainder
+/// (payload leaves plus the other unpatched mutation templates, with
+/// `file:line` citations) is recorded in the module docs of
+/// `payload_byte_preservation.rs`.
 pub(crate) fn envelope_with_text_fragments(
     envelope: &MemoryWriteEnvelope,
 ) -> Result<Value, StoreError> {
