@@ -16,7 +16,7 @@ normative_pair_ref = "docs/normative-pair.toml"
 [documentation]
 architecture = [
   "docs/architecture/A10-04-delegation.md#a104-delegation",
-  "docs/architecture/A10-07-swarm-and-concilium.md#a107-swarm-and-concilium",
+  "docs/architecture/A10-07-long-running-work.md#a107-long-running-work",
   "docs/architecture/A13-02-kernel-and-failure-domains.md#a132-kernel-and-failure-domains",
 ]
 implementation = [
