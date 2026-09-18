@@ -75,3 +75,6 @@ __pycache__/
 # The same applies to any other crate that declares its own `[workspace]`.
 # Those locks are build artifacts of an unadmitted crate, never release inputs.
 crates/*/*/Cargo.lock
+
+# Per-item build/verification evidence written by swarm managers. Never committed.
+items/

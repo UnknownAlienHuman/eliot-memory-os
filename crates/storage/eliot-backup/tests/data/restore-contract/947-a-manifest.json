@@ -1,0 +1,1 @@
+{"expected_levels":{"canonical_only_degraded":"isolated_import_complete","full_recovery":"reconciliation_required","scope_export":"isolated_import_complete"},"note":"Worker A fixture: class-to-level ceiling. FullRecovery archives can be valid while isolated import still requires effect reconciliation; scope transfers never report installation recovery."}

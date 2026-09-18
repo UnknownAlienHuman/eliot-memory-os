@@ -1,0 +1,52 @@
+{
+  "schema": "eliot-assignment-snapshot-v1",
+  "header": {
+    "repository": "UnknownAlienHuman/eliot-memory-os",
+    "base_sha": "fb3fc334e113236cb82cf5ca9139fc0970df032b",
+    "source_sha": "fb3fc334e113236cb82cf5ca9139fc0970df032b",
+    "producer": "root-controller",
+    "rule_revision": "v4",
+    "complete": true,
+    "missing_sections": [],
+    "canonical_branch_pattern": "^(work|fix|docs|chore|refactor|test)/([0-9]+)-([a-z0-9-]+)$",
+    "branch_exceptions": ["integration-exceptions"]
+  },
+  "issues": [
+    {
+      "number": 818,
+      "state": "open",
+      "title": "[D-ASSIGN-0] Implement the deterministic fail-closed assignment-integrity oracle",
+      "body": "## Exclusive mutable scope\n- scripts/audit-work-unit-assignments.py\n- scripts/tests/test_audit_work_unit_assignments.py\n\n## Must not modify\nRust/Cargo/WIT/manifests/lockfile\n\n## Required test matrix\nDeclared denominator: 2 cases, exactly 1..2.\n1. Case one\n2. Case two\n",
+      "write_paths": [
+        "scripts/audit-work-unit-assignments.py",
+        "scripts/tests/test_audit_work_unit_assignments.py"
+      ],
+      "prohibited_paths": [
+        "Cargo.toml"
+      ],
+      "dependencies": []
+    }
+  ],
+  "pull_requests": [
+    {
+      "number": 1367,
+      "state": "open",
+      "draft": false,
+      "merged": false,
+      "title": "feat: implement assignment integrity oracle",
+      "body": "Implements #818",
+      "head_ref": "work/818-assignment-integrity-oracle",
+      "head_repo": "UnknownAlienHuman/eliot-memory-os",
+      "base_ref": "main",
+      "base_sha": "fb3fc334e113236cb82cf5ca9139fc0970df032b",
+      "changed_paths": [
+        "scripts/audit-work-unit-assignments.py",
+        "scripts/tests/test_audit_work_unit_assignments.py"
+      ]
+    }
+  ],
+  "repository_records": {
+    "workstreams": [],
+    "retired_refs": []
+  }
+}

@@ -10,9 +10,10 @@ use crate::config::SurrealAdapterConfig;
 use crate::error::AdapterError;
 use crate::schema;
 use eliot_store_api::{
-    CommitId, RecoveryRecord, RecoveryRecordKey, RequestMeta, Resubmission, StoreError,
-    StoreGenesisRequest, TransitionClass, WriteReceipt, WriteReceiptStatus, genesis_manifest,
-    is_genesis_fence, issue_genesis_receipt_envelope, validate_genesis_receipt_envelope,
+    CommitId, MAX_DIGEST_DETAIL_CHARS, RecoveryRecord, RecoveryRecordKey, RequestMeta,
+    Resubmission, StoreError, StoreGenesisRequest, TransitionClass, WriteReceipt,
+    WriteReceiptStatus, genesis_manifest, is_genesis_fence, issue_genesis_receipt_envelope,
+    validate_genesis_receipt_envelope,
 };
 
 use super::receipt_reconciliation::read_receipt_by_operation;
@@ -242,16 +243,44 @@ pub(super) fn build_genesis_bindings(
     Ok(bindings)
 }
 
+/// Recomputes the genesis canonical hash and rejects divergence with the
+/// typed mismatch (RECHECK-63 slice C, shared-helper only).
+///
+/// Returns the recomputed digest so callers bind the receipt to it. Supplied
+/// != recomputed is `TransitionDigestMismatch` with no transaction and no
+/// lookup success; same key + different bytes with supplied == recomputed
+/// stays `IdentityConflict` at the caller's idempotency checks.
+pub(super) fn verify_genesis_canonical_hash(
+    request: &StoreGenesisRequest,
+) -> Result<String, AdapterError> {
+    let recomputed = request.compute_digest().map_err(AdapterError::Store)?;
+    if recomputed == request.canonical_request_hash {
+        Ok(recomputed)
+    } else {
+        Err(AdapterError::Store(StoreError::TransitionDigestMismatch {
+            expected: request
+                .canonical_request_hash
+                .chars()
+                .take(MAX_DIGEST_DETAIL_CHARS)
+                .collect(),
+            observed: recomputed.chars().take(MAX_DIGEST_DETAIL_CHARS).collect(),
+        }))
+    }
+}
+
 pub(super) fn genesis_receipt(
     context: &RequestMeta,
     request: &StoreGenesisRequest,
     commit_sequence: u64,
 ) -> Result<WriteReceipt, AdapterError> {
-    let manifest = genesis_manifest()?;
+    // RECHECK-63 slice C: recompute from the exact values to be committed and
+    // bind the receipt to the recomputed digest (never a blind copy).
+    let recomputed = verify_genesis_canonical_hash(request)?;
+    let manifest = genesis_manifest().map_err(AdapterError::Store)?;
     let mut receipt = WriteReceipt {
         operation_id: request.operation_id.clone(),
         idempotency_key: request.idempotency_key.clone(),
-        canonical_request_hash: request.canonical_request_hash.clone(),
+        canonical_request_hash: recomputed,
         transition_class: TransitionClass::RecoverySchema,
         status: WriteReceiptStatus::Committed,
         commit_id: Some(CommitId::new("commit-genesis")?),
@@ -284,6 +313,9 @@ async fn reconcile_genesis_receipt(
     context: &RequestMeta,
     request: &StoreGenesisRequest,
 ) -> Result<WriteReceipt, AdapterError> {
+    // Verify before any lookup success is returned: tamper is a typed
+    // digest mismatch, not a replay.
+    verify_genesis_canonical_hash(request)?;
     let Ok(Some(receipt)) = read_receipt_by_operation(db, config, &request.operation_id).await
     else {
         return Err(AdapterError::Store(StoreError::MissingReceiptEnvelope));
@@ -303,7 +335,13 @@ pub(crate) async fn initialize_genesis(
     context: &RequestMeta,
     request: StoreGenesisRequest,
 ) -> Result<WriteReceipt, AdapterError> {
-    request.validate_for_context(context)?;
+    // RECHECK-63 slice C: recompute first so tamper is TRANSITION_DIGEST_
+    // MISMATCH with no transaction and no lookup success, before the generic
+    // validation (which would report InvalidField).
+    verify_genesis_canonical_hash(&request)?;
+    request
+        .validate_for_context(context)
+        .map_err(AdapterError::Store)?;
     let db = super::client(adapter).await?;
     let _guard = adapter.write_lock.lock().await;
     let state = read_genesis_state(db, &adapter.config).await?;

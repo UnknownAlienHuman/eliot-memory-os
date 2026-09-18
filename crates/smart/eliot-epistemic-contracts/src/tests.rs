@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_contracts::{
-    ArtifactId, AuthorityEpoch, ContractId, OperationId, ProductId, ReceiptId, RequestId,
+    ArtifactId, ContractId, EpochId, EpochLineageId, OperationId, ProductId, ReceiptId, RequestId,
     ResourceGeneration, SourceId, StateFence, TaskId, TaskRevision, sha256_hex,
 };
 use eliot_evidence::{Assertability, EvidenceAuthority, EvidenceFreshness, VerificationBinding};
@@ -79,6 +79,69 @@ use SupportResult::{Contradicted, Partial, Supported, Unsupported};
 
 type CaseResult = Result<(), ContractError>;
 
+#[test]
+fn withheld_observation_is_neither_supported_nor_rejected() -> CaseResult {
+    let mut entry = claim_entry("claim-open", None, false, None, BTreeSet::new())?;
+    entry.verdict = ClaimVerdict::Withheld;
+    entry.audit = ClaimAuditOutcome::NotVerifiableInScope;
+    entry.grade = GradeAssignment::unknown("source was observed; proposition was not verified")?;
+    entry.validate()?;
+    let encoded = encoded(&entry)?;
+    let decoded: ClaimEntry = parse(&encoded)?;
+    assert_eq!(decoded, entry);
+    for unsupported_audit in [
+        ClaimAuditOutcome::Supported,
+        ClaimAuditOutcome::Unsupported,
+        ClaimAuditOutcome::Contradicted,
+    ] {
+        entry.audit = unsupported_audit;
+        assert!(entry.validate().is_err());
+    }
+    Ok(())
+}
+
+#[test]
+fn first_position_requires_explicit_absence_without_invented_support() -> CaseResult {
+    let mut candidate = candidate()?;
+    let delta = SupportDelta::new(
+        request()?.records,
+        BTreeSet::new(),
+        BTreeSet::new(),
+        BTreeSet::from(["new source capture".to_owned()]),
+    )?;
+    let mut movement = transition_with(|params| {
+        params.candidate_digest.clone_from(&candidate.digest);
+        params.before_support = SupportResult::Unknown;
+        params.before_assertability = PositionAssertability::UnknownWithheldQuarantined;
+        params.after_assertability = candidate.proposed_assertability;
+        params
+            .evidence_refs
+            .clone_from(&candidate.support[0].handles);
+        params.delta = delta;
+    })?;
+    movement.validate_closed(&request()?, &candidate, &[], &candidate.support)?;
+    movement.before_support = SupportResult::Supported;
+    movement.digest = movement.compute_digest()?;
+    assert_eq!(
+        movement.validate_closed(&request()?, &candidate, &[], &candidate.support),
+        Err(ContractError::ArithmeticMismatch {
+            field: "transition.before_support"
+        })
+    );
+    movement.before_support = SupportResult::Unknown;
+    candidate.predecessor = Some(PredecessorId::new("missing-prior-position")?);
+    candidate.digest = candidate.compute_digest()?;
+    movement.candidate_digest.clone_from(&candidate.digest);
+    movement.digest = movement.compute_digest()?;
+    assert_eq!(
+        movement.validate_closed(&request()?, &candidate, &[], &candidate.support),
+        Err(ContractError::MissingReference {
+            field: "transition.before"
+        })
+    );
+    Ok(())
+}
+
 // Asserts exact variant-plus-field equality in one line via `assert_eq!`.
 macro_rules! expect_err {
     ($result:expr, $variant:ident, $field:expr) => {
@@ -100,8 +163,18 @@ fn parse<T: DeserializeOwned>(wire: &str) -> Result<T, ContractError> {
 fn case_error(field: &'static str) -> ContractError {
     ContractError::Blank { field }
 }
+const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+const TEST_LINEAGE_B: &str = "550e8400-e29b-41d4-a716-446655440001";
+#[allow(clippy::expect_used)]
+fn case_epoch(lineage: &str, sequence: u64) -> EpochId {
+    EpochId::new(
+        EpochLineageId::new(lineage).expect("valid test lineage"),
+        std::num::NonZeroU64::new(sequence).expect("nonzero test sequence"),
+    )
+    .expect("valid test epoch")
+}
 fn case_fence() -> StateFence {
-    StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+    StateFence::new(case_epoch(TEST_LINEAGE_A, 1), ResourceGeneration::genesis())
 }
 fn artifact(value: &str) -> Result<ArtifactId, ContractError> {
     ArtifactId::new(value).map_err(|_| case_error("case.artifact"))
@@ -795,7 +868,7 @@ fn wrong_task_scope_fence_rejected() -> CaseResult {
         None,
     )?;
     let other_task = TaskId::new("task-other").map_err(|_| case_error("case.task"))?;
-    let epoch9 = AuthorityEpoch::new(9).map_err(|_| case_error("case.epoch"))?;
+    let epoch9 = case_epoch(TEST_LINEAGE_B, 9);
     let task_probe = record.validate_for(&other_task, "scope-580", &case_fence());
     expect_err!(task_probe, TaskMismatch, "support.task_id");
     let scope_probe = record.validate_for(&task()?, "scope-other", &case_fence());
@@ -1295,7 +1368,7 @@ fn changed_query_scope_fence_snapshot_invalidates_absence() -> CaseResult {
     let live_query = shape_digest(&live_spec)?;
     let other_query = sha256_hex("other-query".as_bytes());
     let genesis = case_fence();
-    let epoch7 = AuthorityEpoch::new(7).map_err(|_| case_error("case.epoch"))?;
+    let epoch7 = case_epoch(TEST_LINEAGE_B, 7);
     let drifted_fence = StateFence::new(epoch7, ResourceGeneration::genesis());
     let live = live_query.as_str();
     // One drifted axis per row: scope, query, snapshot, and fence each invalidate the claim.
@@ -2079,6 +2152,41 @@ fn planning_grants_no_effect() -> CaseResult {
     expect_err!(capped, CeilingViolation, "assertability.grade");
     Ok(())
 }
+// WORK_UNIT_CASE: 1025/F3 — seven closed levels project onto the three I12.5
+// architecture values at the closure boundary only; ceilings stay seven-valued.
+#[test]
+fn position_assertability_projects_to_arch_three_values() -> CaseResult {
+    use PositionAssertability as Closed;
+    assert_eq!(
+        Closed::ObservedFact.arch_assertability(),
+        Assertability::Assertable
+    );
+    assert_eq!(
+        Closed::QualifiedInference.arch_assertability(),
+        Assertability::Assertable
+    );
+    assert_eq!(
+        Closed::MaterialEffect.arch_assertability(),
+        Assertability::Assertable
+    );
+    assert_eq!(
+        Closed::HypothesisCandidate.arch_assertability(),
+        Assertability::NonAssertableUnverified
+    );
+    assert_eq!(
+        Closed::PlanningOnly.arch_assertability(),
+        Assertability::NonAssertableUnverified
+    );
+    assert_eq!(
+        Closed::ConflictQualificationRequired.arch_assertability(),
+        Assertability::NonAssertableUnverified
+    );
+    assert_eq!(
+        Closed::UnknownWithheldQuarantined.arch_assertability(),
+        Assertability::AbstainOrFence
+    );
+    Ok(())
+}
 // WORK_UNIT_CASE: 580/40
 #[test]
 fn transition_preserves_before_after_predecessor() -> CaseResult {
@@ -2139,15 +2247,15 @@ fn transition_preserves_before_after_predecessor() -> CaseResult {
     let rev_check = drifted_rev.validate_closed(&inquiry, &drifted_candidate, &before, &after);
     expect_err!(rev_check, StaleContext, "transition.candidate_revision");
     // Fence drift fails at close through the shared work-scope equality chain.
-    let epoch9 = AuthorityEpoch::new(9).map_err(|_| case_error("case.epoch"))?;
+    let epoch9 = case_epoch(TEST_LINEAGE_B, 9);
     let mut drifted_fence = closed_movement.clone();
-    drifted_fence.expected_fence = StateFence::new(epoch9, ResourceGeneration::genesis());
+    drifted_fence.expected_fence = StateFence::new(epoch9.clone(), ResourceGeneration::genesis());
     drifted_fence.digest = drifted_fence.compute_digest()?;
     let fence_check = drifted_fence.validate_closed(&inquiry, &current, &before, &after);
     expect_err!(fence_check, FenceMismatch, "transition.work_scope");
     // Candidate fence drift fails the candidate work-scope pin first.
     let mut fenced_candidate = candidate()?;
-    fenced_candidate.fence = StateFence::new(epoch9, ResourceGeneration::genesis());
+    fenced_candidate.fence = StateFence::new(epoch9.clone(), ResourceGeneration::genesis());
     fenced_candidate.digest = fenced_candidate.compute_digest()?;
     let mut fence_drifted = closed_movement.clone();
     fence_drifted.candidate_digest = fenced_candidate.digest.clone();
@@ -2450,5 +2558,207 @@ fn malformed_input_bounded_panic_free() -> CaseResult {
         crate::error::canonical_bytes(&AlwaysFail),
         Err(ContractError::Canonicalization)
     );
+    Ok(())
+}
+// WORK_UNIT_CASE: 580/46
+#[test]
+fn explicit_fence_and_lineage_survive_round_trip() -> CaseResult {
+    let epoch9 = case_epoch(TEST_LINEAGE_A, 9);
+    let fence9 = StateFence::new(epoch9, ResourceGeneration::genesis());
+    let content_a = sha256_hex("content-a".as_bytes());
+    let content_b = sha256_hex("content-b".as_bytes());
+    let closure9 = ProvenanceClosure::new(ProvenanceClosureParams {
+        records: BTreeSet::from([artifact("handle-1")?, artifact("handle-2")?]),
+        sources: BTreeSet::from([source("source-a")?]),
+        raw_handles: BTreeSet::from(["raw-1".to_owned(), "raw-2".to_owned()]),
+        revisions: BTreeSet::from(["r1".to_owned()]),
+        lineage: vec![
+            SourceLineage::new(
+                source("source-a")?,
+                SourceRevisionId::new("r1")?,
+                content_a.clone(),
+                Some("raw-1".to_owned()),
+                BTreeSet::new(),
+                None,
+            )?,
+            SourceLineage::new(
+                source("source-a")?,
+                SourceRevisionId::new("r1")?,
+                content_b.clone(),
+                Some("raw-2".to_owned()),
+                BTreeSet::from([content_a.clone()]),
+                None,
+            )?,
+        ],
+        record_origin: BTreeMap::from([
+            (artifact("handle-1")?, content_a.clone()),
+            (artifact("handle-2")?, content_b.clone()),
+        ]),
+        temporal_digest: None,
+        mixed_sources: false,
+        assertability: Assertability::NonAssertableUnverified,
+        scope: "scope-580".to_owned(),
+        fence: fence9.clone(),
+    })?;
+    closure9.validate()?;
+    assert_eq!(closure9.digest, closure9.compute_digest()?);
+    let wire = encoded(&closure9)?;
+    assert!(wire.contains("PROVENANCE_CLOSURE"));
+    let decoded: ProvenanceClosure = parse(&wire)?;
+    decoded.validate()?;
+    assert_eq!(decoded, closure9);
+    assert_eq!(decoded.fence, fence9);
+    assert_eq!(
+        decoded.records,
+        BTreeSet::from([artifact("handle-1")?, artifact("handle-2")?])
+    );
+    assert_eq!(decoded.sources, BTreeSet::from([source("source-a")?]));
+    assert_eq!(decoded.revisions, BTreeSet::from(["r1".to_owned()]));
+    assert_eq!(decoded.lineage.len(), 2);
+    assert_eq!(
+        decoded.lineage[1].predecessors,
+        BTreeSet::from([content_a.clone()])
+    );
+    assert_eq!(
+        decoded.record_origin.get(&artifact("handle-1")?),
+        Some(&content_a)
+    );
+    assert_eq!(
+        decoded.record_origin.get(&artifact("handle-2")?),
+        Some(&content_b)
+    );
+    assert!(!decoded.mixed_sources);
+    let tampered = wire.replacen("\"records\"", "\"no_records\"", 1);
+    assert!(serde_json::from_str::<ProvenanceClosure>(&tampered).is_err());
+    Ok(())
+}
+// Old-resolver migration helper for 580/47: rebuilds resolver
+// `provenance_for` semantics (BTreeSet ordering, mixed-source derivation,
+// weakest assertability) through the real closure constructors.
+fn old_resolver_closure() -> Result<ProvenanceClosure, ContractError> {
+    struct OldRecord {
+        handle: &'static str,
+        source: &'static str,
+        raw: &'static str,
+        revision: &'static str,
+        assertable: bool,
+    }
+    let old = vec![
+        OldRecord {
+            handle: "handle-1",
+            source: "source-a",
+            raw: "raw-1",
+            revision: "r1",
+            assertable: false,
+        },
+        OldRecord {
+            handle: "handle-2",
+            source: "source-a",
+            raw: "raw-2",
+            revision: "r1",
+            assertable: false,
+        },
+        OldRecord {
+            handle: "handle-3",
+            source: "source-b",
+            raw: "raw-3",
+            revision: "r2",
+            assertable: true,
+        },
+    ];
+    let mut records = BTreeSet::new();
+    let mut sources = BTreeSet::new();
+    let mut raws = BTreeSet::new();
+    let mut revisions = BTreeSet::new();
+    let mut lineage = Vec::new();
+    let mut record_origin = BTreeMap::new();
+    let mut assertability = Assertability::Assertable;
+    for item in &old {
+        let handle = artifact(item.handle)?;
+        let owner = source(item.source)?;
+        let content = sha256_hex(format!("content-{}", item.handle).as_bytes());
+        records.insert(handle.clone());
+        sources.insert(owner.clone());
+        raws.insert(item.raw.to_owned());
+        revisions.insert(item.revision.to_owned());
+        lineage.push(SourceLineage::new(
+            owner,
+            SourceRevisionId::new(item.revision)?,
+            content.clone(),
+            Some(item.raw.to_owned()),
+            BTreeSet::new(),
+            None,
+        )?);
+        record_origin.insert(handle, content);
+        let item_assertability = if item.assertable {
+            Assertability::Assertable
+        } else {
+            Assertability::NonAssertableUnverified
+        };
+        assertability = match (assertability, item_assertability) {
+            (Assertability::AbstainOrFence, _) | (_, Assertability::AbstainOrFence) => {
+                Assertability::AbstainOrFence
+            }
+            (Assertability::NonAssertableUnverified, _)
+            | (_, Assertability::NonAssertableUnverified) => Assertability::NonAssertableUnverified,
+            _ => Assertability::Assertable,
+        };
+    }
+    let closure = ProvenanceClosure::new(ProvenanceClosureParams {
+        records,
+        sources: sources.clone(),
+        raw_handles: raws,
+        revisions,
+        lineage,
+        record_origin,
+        temporal_digest: None,
+        mixed_sources: sources.len() > 1,
+        assertability,
+        scope: "scope-580".to_owned(),
+        fence: case_fence(),
+    })?;
+    closure.validate()?;
+    Ok(closure)
+}
+// WORK_UNIT_CASE: 580/47
+#[test]
+fn old_resolver_records_migrate_preserving_handles_sources_revisions() -> CaseResult {
+    let closure = old_resolver_closure()?;
+    assert_eq!(
+        closure.records,
+        BTreeSet::from([
+            artifact("handle-1")?,
+            artifact("handle-2")?,
+            artifact("handle-3")?
+        ])
+    );
+    assert_eq!(
+        closure.sources,
+        BTreeSet::from([source("source-a")?, source("source-b")?])
+    );
+    assert_eq!(
+        closure.raw_handles,
+        BTreeSet::from(["raw-1".to_owned(), "raw-2".to_owned(), "raw-3".to_owned()])
+    );
+    assert_eq!(
+        closure.revisions,
+        BTreeSet::from(["r1".to_owned(), "r2".to_owned()])
+    );
+    assert!(closure.mixed_sources);
+    assert_eq!(
+        closure.assertability,
+        Assertability::NonAssertableUnverified
+    );
+    assert_eq!(closure.scope.as_str(), "scope-580");
+    assert_eq!(closure.fence, case_fence());
+    let decoded: ProvenanceClosure = parse(&encoded(&closure)?)?;
+    assert_eq!(decoded, closure);
+    let view = admitted()?;
+    view.validate()?;
+    assert_eq!(view.admission.scope.as_str(), closure.scope.as_str());
+    assert_eq!(view.admission.fence, closure.fence);
+    assert_eq!(view.position_identity().0.as_str(), "position-580");
+    let view_decoded: CurrentEpistemicPosition = parse(&encoded(&view)?)?;
+    assert_eq!(view_decoded, view);
     Ok(())
 }

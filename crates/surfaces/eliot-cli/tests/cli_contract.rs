@@ -38,7 +38,10 @@ fn request_json(command: &str) -> Value {
                     "product_id": "product-1",
                     "source_id": "source-1",
                     "state_fence": {
-                        "authority_epoch": 1,
+                        "authority_epoch": {
+                            "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+                            "sequence": 1
+                        },
                         "resource_generation": 1,
                         "task_revision": null,
                         "policy_revision": null,
@@ -52,7 +55,10 @@ fn request_json(command: &str) -> Value {
                     }
                 },
                 "state_fence": {
-                    "authority_epoch": 1,
+                    "authority_epoch": {
+                        "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+                        "sequence": 1
+                    },
                     "resource_generation": 1,
                     "task_revision": null,
                     "policy_revision": null,
@@ -414,4 +420,126 @@ fn full_request_identity_and_intended_effect_survive_unavailable_results() {
             .map(|spec| spec.effect),
         Some(eliot_receipts::EffectClass::ExternalEffect)
     );
+}
+
+use eliot_cli::antigravity_terminal::{
+    AntigravityTerminalInputs, CanonicalDispositionInput, ErrorEventInput, ProjectedAttemptState,
+    ProjectedDisposition, TerminalView, ViewOrigin, project,
+};
+
+fn terminal_view(
+    origin: ViewOrigin,
+    sequence: u64,
+    cursor: &str,
+    attempt_state: ProjectedAttemptState,
+) -> TerminalView {
+    TerminalView {
+        origin,
+        session_id: "session-9b-terminal-1".to_owned(),
+        attempt_id: "attempt-9b-terminal-1".to_owned(),
+        task_id: "task-9b-terminal-1".to_owned(),
+        route_id: eliot_cli::antigravity_terminal::PRIMARY_ROUTE_ID.to_owned(),
+        sequence,
+        cursor: cursor.to_owned(),
+        attempt_state,
+        disposition: ProjectedDisposition::UnknownOutcome,
+    }
+}
+
+fn terminal_inputs() -> AntigravityTerminalInputs {
+    AntigravityTerminalInputs {
+        supervisor: terminal_view(
+            ViewOrigin::Supervisor,
+            9,
+            "cursor-9b-9",
+            ProjectedAttemptState::Reconciling,
+        ),
+        api: terminal_view(ViewOrigin::Api, 9, "cursor-9b-9", ProjectedAttemptState::Reconciling),
+        cli: terminal_view(ViewOrigin::Cli, 9, "cursor-9b-9", ProjectedAttemptState::Reconciling),
+        stale_cli: terminal_view(
+            ViewOrigin::Cli,
+            4,
+            "cursor-9b-4",
+            ProjectedAttemptState::Running,
+        ),
+        error_event: ErrorEventInput {
+            attempt_id: "attempt-9b-terminal-1".to_owned(),
+            event_id: "event-9b-error-5".to_owned(),
+            sequence: 5,
+            cursor: "cursor-9b-5".to_owned(),
+            error_code: "PROVIDER_TIMEOUT".to_owned(),
+        },
+        canonical: CanonicalDispositionInput {
+            session_id: "session-9b-terminal-1".to_owned(),
+            attempt_id: "attempt-9b-terminal-1".to_owned(),
+            task_id: "task-9b-terminal-1".to_owned(),
+            route_id: eliot_cli::antigravity_terminal::PRIMARY_ROUTE_ID.to_owned(),
+            disposition: ProjectedDisposition::UnknownOutcome,
+            terminal_ref: "terminal-9b-9".to_owned(),
+            sequence: 9,
+            cursor: "cursor-9b-9".to_owned(),
+        },
+    }
+}
+
+#[test]
+fn antigravity_terminal_projection_keeps_stale_error_and_canonical_independent() {
+    let inputs = terminal_inputs();
+    must(inputs.validate());
+    let receipt = must(project(&inputs));
+    assert!(receipt.same_identity);
+    assert!(receipt.same_disposition);
+    assert!(receipt.stale_independent);
+    assert!(receipt.error_independent);
+    assert!(!receipt.reduces_to_terminal);
+    assert_eq!(receipt.coverage, "documented_not_observed");
+    assert_eq!(receipt.reducer_handoff, "MGR02");
+    assert_ne!(inputs.stale_cli.sequence, inputs.canonical.sequence);
+    assert_ne!(inputs.error_event.sequence, inputs.canonical.sequence);
+    assert_ne!(
+        inputs.error_event.event_id,
+        inputs.canonical.terminal_ref
+    );
+    assert_eq!(inputs.supervisor.attempt_id, inputs.canonical.attempt_id);
+    assert_eq!(inputs.api.attempt_id, inputs.canonical.attempt_id);
+    assert_eq!(inputs.cli.attempt_id, inputs.canonical.attempt_id);
+}
+
+#[test]
+fn antigravity_terminal_projection_fails_closed_on_identity_or_disposition_drift() {
+    let mut drifted_cli = terminal_inputs();
+    drifted_cli.cli.attempt_id = "attempt-9b-terminal-2".to_owned();
+    assert!(matches!(
+        project(&drifted_cli),
+        Err(eliot_cli::antigravity_terminal::TerminalProjectionError::IdentityMismatch)
+    ));
+
+    let mut drifted_disposition = terminal_inputs();
+    drifted_disposition.cli.disposition = ProjectedDisposition::CandidateSucceeded;
+    assert!(matches!(
+        project(&drifted_disposition),
+        Err(eliot_cli::antigravity_terminal::TerminalProjectionError::DispositionMismatch)
+    ));
+
+    let mut blank = terminal_inputs();
+    blank.cli.cursor.clear();
+    assert!(matches!(
+        project(&blank),
+        Err(eliot_cli::antigravity_terminal::TerminalProjectionError::BlankField { .. })
+    ));
+
+    let mut zero = terminal_inputs();
+    zero.error_event.sequence = 0;
+    assert!(matches!(
+        project(&zero),
+        Err(eliot_cli::antigravity_terminal::TerminalProjectionError::ZeroSequence)
+    ));
+}
+
+#[test]
+fn severed_plan_gap_literal_stays_wire_stable() {
+    assert_eq!(eliot_cli::CONTROLBOARD_PLAN_GAP, "PLAN_GAP");
+    assert!(must(CommandCatalogue::current().help_text()).contains("[PLAN_GAP]"));
+    let schema = must(CommandCatalogue::current().schema_json());
+    assert!(schema.contains("\"code\":\"PLAN_GAP\""));
 }

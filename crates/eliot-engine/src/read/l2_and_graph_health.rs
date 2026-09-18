@@ -1,14 +1,15 @@
 //! Read-only L2 and graph-health boundary.
 //!
-//! Architecture anchors: `A4.5` (Evidence, relations & continuity) and `F:read`
-//! (scope + named read + consistency/cache) routed via `docs/ARCHITECTURE_CONTRACT.md`
-//! canonical pair `ELIOT_ARCHITECTURE.md` `4.5-draft` (`58E71A2BDB10925C63D85A708ED768AEE8617BED0FB52EB044478EC20AB439D8`)
-//! and `ELIOT_IMPLEMENTATION.md` `0.29-draft` (`C216FB7F6FDBC62D108C748BE6F61CA7EF9E5D24E5BB13AF2677C31A58460C0B`).
-//! Implementation anchors: `I5.3` (Store-neutral semantic API / named reads),
-//! `I5.8` (Canonical event and projections / `GraphRevisionFence`), `I5.9`
-//! (`SurrealDB` implementation / storage bridge), `I5.20` (Read model, consistency
-//! and cache - `Q2` exact evidence/relations, `at_least_revision` / stable-scope
-//! fence, revision-keyed cache).
+//! Architecture: `docs/architecture/ELIOT_ARCHITECTURE.md` handle `A4.5`
+//! (Evidence, relations & continuity) and scope `F:read` (scope + named read +
+//! consistency/cache). Implementation:
+//! `docs/architecture/ELIOT_IMPLEMENTATION.md` handles `I5.3` (Store-neutral
+//! semantic API / named reads), `I5.8` (Canonical event and projections /
+//! `GraphRevisionFence`), `I5.9` (`SurrealDB` implementation / storage bridge),
+//! and `I5.20` (Read model, consistency and cache — `Q2` exact
+//! evidence/relations, `at_least_revision` / stable-scope fence,
+//! revision-keyed cache). Normative precedence remains in
+//! `docs/ARCHITECTURE_CONTRACT.md`.
 //!
 //! Ownership: this child owns `ReadService` (`current_state`, `recall_l0`,
 //! `fetch_atoms_l2` with `STALE_READ_TIMEOUT` fence) and `GraphHealthService`

@@ -12,6 +12,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use super::{AuthorityHandoffRecord, KernelDispatchKey, is_lower_sha256};
+use crate::kernel_diagnostics::{EntrypointStage, observe_entrypoint_with_detail};
 use eliot_kernel_service::ProcessAuthorityHandoffDescriptor;
 use eliot_platform::PortError;
 #[cfg(windows)]
@@ -50,6 +51,13 @@ impl EliotdReceiptRootBinding {
         installation_id: impl Into<String>,
         approved_generation: impl Into<String>,
     ) -> Result<Self, String> {
+        // F-LOG-KERNEL-2 (#899): binding receipt observation only; the
+        // validation below stays the single owner of acceptance. Only fixed
+        // phase labels are emitted, never raw roots/digests/identities.
+        observe_entrypoint_with_detail(
+            EntrypointStage::Composition,
+            "kernel.build.eliotd_receipt_binding_received",
+        );
         let binding = Self {
             receipt_root: receipt_root.into(),
             kernel_ors_root: kernel_ors_root.into(),
@@ -57,8 +65,22 @@ impl EliotdReceiptRootBinding {
             installation_id: installation_id.into(),
             approved_generation: approved_generation.into(),
         };
-        binding.validate()?;
-        Ok(binding)
+        match binding.validate() {
+            Ok(()) => {
+                observe_entrypoint_with_detail(
+                    EntrypointStage::Composition,
+                    "kernel.build.eliotd_receipt_binding_validated",
+                );
+                Ok(binding)
+            }
+            Err(error) => {
+                observe_entrypoint_with_detail(
+                    EntrypointStage::Composition,
+                    "kernel.build.eliotd_receipt_binding_rejected",
+                );
+                Err(error)
+            }
+        }
     }
 
     pub(crate) fn validate(&self) -> Result<(), String> {
@@ -122,7 +144,25 @@ impl EliotdReceiptRootBinding {
 impl SupervisionLeaseAuthorityConfig {
     /// Validates the installer receipt before any ciphertext file is opened.
     pub fn validate(&self) -> Result<(), String> {
-        self.authority.validate().map_err(|error| error.to_string())
+        // F-LOG-KERNEL-2 (#899): supervision-authority validation observation
+        // only; the wrapped authority stays the single owner of acceptance.
+        // Only fixed phase labels, never key/seed/ciphertext material.
+        match self.authority.validate() {
+            Ok(()) => {
+                observe_entrypoint_with_detail(
+                    EntrypointStage::SupervisionAuthority,
+                    "kernel.build.supervision_authority_validated",
+                );
+                Ok(())
+            }
+            Err(error) => {
+                observe_entrypoint_with_detail(
+                    EntrypointStage::SupervisionAuthority,
+                    "kernel.build.supervision_authority_rejected",
+                );
+                Err(error.to_string())
+            }
+        }
     }
 }
 

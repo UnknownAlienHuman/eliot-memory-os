@@ -34,21 +34,27 @@ use crate::{
     CapabilityIntroductionActivation, CapabilityIntroductionFence, CapabilityIntroductionReceipt,
     DeliveryAcknowledgement, DeliveryCursorReceipt, DeliveryCursorState, EpochIdentity,
     EpochLineage, GenerationCutoverReceipt, GenerationCutoverRecord, GenerationCutoverSnapshot,
-    GenerationTransition, GenerationTransitionReceipt, JobCheckpoint, KernelAuthoritySnapshot,
-    OpaqueLabel, OperationalMutationReceipt, OperationalPhase, OperationalRecordContext,
-    OperationalRecordInput, OrsError, OrsSnapshotReceipt, OrsSnapshotRequest, PendingOperationPage,
-    ProcessEvidenceRecord, ProcessStartReplayAbort, ProcessStartReplayRecord,
-    ProcessStartReplayState, RecoveredAuthoritySnapshot, RecoveryCursor, RecoveryInboxDisposition,
-    RecoveryInboxItem, RecoveryInboxReceipt, RecoveryPage, RecoveryPayloadEnvelope,
-    ReservationRecord, ReservationRequest, ReservationState, ReservedScope, RetryState,
-    ScopeTerminalReceipt, ScopeTerminalView, SessionBindingReceipt, SessionDetach, StageReceipt,
-    StagedOperation, StateFenceSnapshot, SupervisionLeaseCommitTicket,
-    SupervisionLeasePrepareRequest, SupervisionLeaseProjection, SupervisionLeaseReceipt,
-    SupervisionLeaseReceiptInput, SupervisionLeaseRecord, SupervisionLeaseSnapshot,
-    SupervisionLeaseStageReceipt, SupervisionLeaseStageResolution,
-    SupervisionLeaseStageResolutionDisposition, SupervisionLeaseTicketReconciliation,
-    UserBrokerFence, UserBrokerRegistration, UserBrokerRegistrationReceipt, WriterReservationToken,
-    signed_supervision_lease_from_verified, signed_terminal_supervision_lease_from_verified,
+    GenerationTransition, GenerationTransitionReceipt, HostRequestRecord, HostRequestState,
+    JobCheckpoint, KernelAuthoritySnapshot, NativeWorkerClaimAdmission, NativeWorkerClaimRecord,
+    NativeWorkerClaimStageOutcome, NativeWorkerClaimState, OpaqueLabel, OperationalMutationReceipt,
+    OperationalPhase, OperationalRecordContext, OperationalRecordInput, OrsError,
+    OrsSnapshotReceipt, OrsSnapshotRequest, PendingOperationPage, ProcessEvidenceRecord,
+    ProcessStartReplayAbort, ProcessStartReplayRecord, ProcessStartReplayState,
+    RecoveredAuthoritySnapshot, RecoveryCursor, RecoveryInboxDisposition, RecoveryInboxItem,
+    RecoveryInboxReceipt, RecoveryPage, RecoveryPayloadEnvelope, ReservationRecord,
+    ReservationRequest, ReservationState, ReservedScope, RetryState, ScopeTerminalReceipt,
+    ScopeTerminalView, SessionBindingReceipt, SessionDetach, StageReceipt, StagedOperation,
+    StateFenceSnapshot, SupervisionLeaseCommitTicket, SupervisionLeasePrepareRequest,
+    SupervisionLeaseProjection, SupervisionLeaseReceipt, SupervisionLeaseReceiptInput,
+    SupervisionLeaseRecord, SupervisionLeaseSnapshot, SupervisionLeaseStageReceipt,
+    SupervisionLeaseStageResolution, SupervisionLeaseStageResolutionDisposition,
+    SupervisionLeaseTicketReconciliation, UnknownCommitOutcome, UnknownCommitRecord,
+    UserBrokerFence, UserBrokerRegistration, UserBrokerRegistrationReceipt, WorkerReplayAck,
+    WorkerReplayAckRecord, WorkerReplayBegin, WorkerReplayCursors, WorkerReplayDraft,
+    WorkerReplayEvent, WorkerReplayRequestDecision, WorkerReplayRequestRecord,
+    WorkerReplayStreamRecord, WriterReservationToken, is_replay_terminal_phase,
+    parse_replay_stream_id, require_replay_claim_binding, signed_supervision_lease_from_verified,
+    signed_terminal_supervision_lease_from_verified,
 };
 
 const META: TableDefinition<&str, &str> = TableDefinition::new("ors_meta_v1");
@@ -84,6 +90,20 @@ const SUPERVISION_LEASE_STAGE_RESOLUTIONS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_supervision_lease_stage_resolutions_v1");
 const STORE_REBIND_REPLAY: TableDefinition<&str, &str> =
     TableDefinition::new("ors_store_rebind_replay_v1");
+const STORE_FAILURE_RETENTION: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_store_failure_retention_v1");
+const UNKNOWN_COMMIT_RECOVERY: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_unknown_commit_recovery_v1");
+const HOST_REQUESTS: TableDefinition<&str, &str> = TableDefinition::new("ors_host_requests_v1");
+const NATIVE_WORKER_CLAIMS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_native_worker_claims_v1");
+const REPLAY_STREAMS: TableDefinition<&str, &str> = TableDefinition::new("ors_replay_streams_v1");
+const REPLAY_REQUESTS: TableDefinition<&str, &str> = TableDefinition::new("ors_replay_requests_v1");
+const REPLAY_EVENTS: TableDefinition<&str, &str> = TableDefinition::new("ors_replay_events_v1");
+const REPLAY_ACKS: TableDefinition<&str, &str> = TableDefinition::new("ors_replay_acks_v1");
+const DOCTOR_ATTEMPTS: TableDefinition<&str, &str> = TableDefinition::new("ors_doctor_attempts_v1");
+const DOCTOR_EFFECTS: TableDefinition<&str, &str> = TableDefinition::new("ors_doctor_effects_v1");
+const DOCTOR_BUDGETS: TableDefinition<&str, &str> = TableDefinition::new("ors_doctor_budgets_v1");
 const NEXT_GLOBAL_ORDER: &str = "next_global_order";
 const SUPERVISION_STAGE_RESOLUTION_SCHEMA_KEY: &str = "supervision_stage_resolution_schema";
 const SUPERVISION_STAGE_RESOLUTION_SCHEMA_V1: &str = "eliot.ors.supervision-stage-resolution.v1";
@@ -326,6 +346,171 @@ pub trait OperationalRecoveryStore: Send + Sync {
         scopes: &[crate::OrderingScope],
         successor: &EpochLineage,
     ) -> Result<(), OrsError>;
+    /// Stages one P-04 host-request operation before any acknowledgement.
+    ///
+    /// An exact replay under the same operation/request identity returns the
+    /// durable record unchanged; a changed binding fails with
+    /// [`OrsError::HostRequestIdentityConflict`].
+    fn stage_host_request(
+        &self,
+        record: &crate::HostRequestRecord,
+    ) -> Result<crate::HostRequestRecord, OrsError>;
+    /// Advances one staged host-request operation to its next mechanical state.
+    ///
+    /// An exact repeat of an applied advance returns the durable record
+    /// unchanged. An unknown operation returns `Ok(None)`; the caller stages
+    /// first and this method never invents a record.
+    fn advance_host_request(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        target: crate::HostRequestState,
+        result_digest: Option<&str>,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError>;
+    /// Persists one bounded local-read result body alongside its digest
+    /// (Implements #18: local read result).
+    ///
+    /// Atomically walks the mechanical lifecycle (`Admitted` → `Routed` →
+    /// `Submitted` → `ResultReceived`, or a direct legal edge such as
+    /// `Unknown`/`Reconciling`/`Submitted`/`PossiblyEffected` →
+    /// `ResultReceived`) and stores the exact bounded response JSON with its
+    /// digest. An exact replay (same digest and byte-identical body) returns
+    /// the durable record unchanged without re-dispatch; a changed digest or
+    /// body under the same identity fails as
+    /// [`OrsError::HostRequestIdentityConflict`] and never overwrites the
+    /// durable row. Rejection happens before any readback: the caller must
+    /// have already validated tool linkage and descriptor binding.
+    fn persist_host_request_result(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        result_digest: &str,
+        result_response: &serde_json::Value,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError>;
+    /// Loads one host-request operation by exact operation/request identity.
+    fn load_host_request(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError>;
+    /// Stages one native-worker claim intent before any acknowledgement.
+    ///
+    /// An exact replay under the same claim identity returns
+    /// [`crate::NativeWorkerClaimStageOutcome::Existing`] with the same
+    /// receipt identity; a changed binding fails with
+    /// [`OrsError::NativeWorkerClaimIdentityConflict`] and never overwrites.
+    fn stage_native_worker_claim(
+        &self,
+        record: &crate::NativeWorkerClaimRecord,
+    ) -> Result<crate::NativeWorkerClaimStageOutcome, OrsError>;
+    /// Advances one staged claim to its next mechanical state.
+    ///
+    /// An exact repeat of an applied advance returns the durable record
+    /// unchanged. An unknown claim returns `Ok(None)`; this method never
+    /// invents a record.
+    fn advance_native_worker_claim(
+        &self,
+        claim_id: &crate::OperationIdentity,
+        target: crate::NativeWorkerClaimState,
+        admission: Option<&crate::NativeWorkerClaimAdmission>,
+    ) -> Result<Option<crate::NativeWorkerClaimRecord>, OrsError>;
+    /// Loads one claim by exact claim identity.
+    fn load_native_worker_claim(
+        &self,
+        claim_id: &crate::OperationIdentity,
+    ) -> Result<Option<crate::NativeWorkerClaimRecord>, OrsError>;
+    /// Looks up one durable replay request without acquiring anything.
+    ///
+    /// An unknown identity returns [`WorkerReplayRequestDecision::New`]; a
+    /// retained identity with the same fingerprint returns
+    /// [`WorkerReplayRequestDecision::Replay`] with the request's retained
+    /// events in sequence order; a retained identity with a changed
+    /// fingerprint returns [`WorkerReplayRequestDecision::Conflict`]. No
+    /// claim binding is required: reads never execute.
+    fn lookup_replay_request(
+        &self,
+        stream_id: &str,
+        request_id: &str,
+        fingerprint: &str,
+    ) -> Result<WorkerReplayRequestDecision, OrsError>;
+    /// Atomically acquires one durable replay request or reports its durable
+    /// outcome.
+    ///
+    /// The first writer wins in one write transaction: an unknown identity is
+    /// durably acquired and returns [`WorkerReplayRequestDecision::New`]; a
+    /// retained acquisition returns `Replay` or `Conflict` exactly as
+    /// [`OperationalRecoveryStore::lookup_replay_request`] does, so a
+    /// retained acquisition is never a fresh request after a crash. The
+    /// presented generation/epoch/fence must equal the bound claim record
+    /// (read-only); a missing claim or a stale binding fails with
+    /// [`OrsError::WorkerReplayStaleStream`] and acquires nothing.
+    fn begin_replay_request(
+        &self,
+        begin: &WorkerReplayBegin,
+    ) -> Result<WorkerReplayRequestDecision, OrsError>;
+    /// Persists one replay draft under its exact stream with a durable
+    /// identity and sequence.
+    ///
+    /// An identical draft under the same `(stream, request)` replays the same
+    /// `event_id` and sequence instead of duplicating the event. A draft for
+    /// a request that was never acquired fails with
+    /// [`OrsError::ReservationNotFound`]; a stale binding fails with
+    /// [`OrsError::WorkerReplayStaleStream`].
+    fn append_replay_event(&self, draft: &WorkerReplayDraft)
+    -> Result<WorkerReplayEvent, OrsError>;
+    /// Returns the retained suffix strictly after `after_sequence` in
+    /// sequence order, preserving gaps.
+    ///
+    /// A suffix longer than [`crate::MAX_REPLAY_PAGE`] fails with
+    /// [`OrsError::ProjectionLimitExceeded`] instead of truncating silently;
+    /// a prefix gap from retention pruning (events at or before
+    /// `after_sequence` are gone) fails with
+    /// [`OrsError::WorkerReplayIncomplete`] instead of returning an empty
+    /// success on incomplete storage.
+    fn replay_stream(
+        &self,
+        stream_id: &str,
+        after_sequence: u64,
+    ) -> Result<Vec<WorkerReplayEvent>, OrsError>;
+    /// Verifies one acknowledgement against its exact durable event,
+    /// persists the disposition, and advances only the cursor its phase
+    /// allows (DURABLE advances the producer cursor, APPLIED or REJECTED the
+    /// consumer cursor, UNKNOWN none).
+    ///
+    /// A foreign acknowledgement fails with
+    /// [`OrsError::WorkerReplayAckMismatch`]; a stale binding fails with
+    /// [`OrsError::WorkerReplayStaleStream`].
+    fn acknowledge_replay_event(
+        &self,
+        ack: &WorkerReplayAck,
+    ) -> Result<WorkerReplayCursors, OrsError>;
+    /// Prunes the longest APPLIED-or-REJECTED event prefix of one stream,
+    /// retaining the newest [`crate::MAX_REPLAY_PAGE`] terminal events.
+    ///
+    /// Returns the number of events removed. Pruning is retention
+    /// maintenance, not execution: it requires no claim binding and never
+    /// touches UNKNOWN (still reconciling) events.
+    fn prune_replay_stream(&self, stream_id: &str) -> Result<u64, OrsError>;
+    /// Loads one replay stream head without mutating anything.
+    ///
+    /// Read-only projection for the Kernel replay transport: an unknown
+    /// stream returns `Ok(None)`; a stored head is validated before return.
+    /// Used to answer `New` decisions with the exact next sequence and to
+    /// build conflict evidence without acquiring.
+    fn load_replay_stream_head(
+        &self,
+        stream_id: &str,
+    ) -> Result<Option<WorkerReplayStreamRecord>, OrsError>;
+    /// Loads one retained replay acquisition without mutating anything.
+    ///
+    /// Read-only projection for the Kernel replay transport: an unknown
+    /// `(stream, request)` returns `Ok(None)`. Used to report the recorded
+    /// fingerprint in `Conflict` decisions.
+    fn load_replay_request_record(
+        &self,
+        stream_id: &str,
+        request_id: &str,
+    ) -> Result<Option<WorkerReplayRequestRecord>, OrsError>;
 }
 
 /// redb-backed ORS implementation. Every mutating method commits one short transaction.
@@ -352,6 +537,97 @@ fn same_store_rebind_binding(
         && left.job_name == right.job_name
         && left.generation == right.generation
         && left.authority_epoch == right.authority_epoch
+}
+
+impl persistence_codec::PersistedValue for HostRequestRecord {
+    const RECORD_TYPE: &'static str = "host_request";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+impl persistence_codec::PersistedValue for NativeWorkerClaimRecord {
+    const RECORD_TYPE: &'static str = "native_worker_claim";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+impl persistence_codec::PersistedValue for crate::WorkerReplayEvent {
+    const RECORD_TYPE: &'static str = "worker_replay_event";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+impl persistence_codec::PersistedValue for crate::WorkerReplayStreamRecord {
+    const RECORD_TYPE: &'static str = "worker_replay_stream";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+impl persistence_codec::PersistedValue for crate::WorkerReplayRequestRecord {
+    const RECORD_TYPE: &'static str = "worker_replay_request";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+impl persistence_codec::PersistedValue for crate::WorkerReplayAckRecord {
+    const RECORD_TYPE: &'static str = "worker_replay_ack";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+impl persistence_codec::PersistedValue for crate::StoreFailureRetentionRecord {
+    const RECORD_TYPE: &'static str = "store_failure_retention";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+impl persistence_codec::PersistedValue for crate::DoctorAttemptRecord {
+    const RECORD_TYPE: &'static str = "doctor_attempt";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+impl persistence_codec::PersistedValue for crate::DoctorEffectRecord {
+    const RECORD_TYPE: &'static str = "doctor_effect";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+impl persistence_codec::PersistedValue for crate::DoctorBudgetLedger {
+    const RECORD_TYPE: &'static str = "doctor_budget";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+fn doctor_storage(error: impl std::fmt::Display) -> crate::DoctorLedgerError {
+    crate::DoctorLedgerError::Storage(error.to_string())
+}
+
+fn map_ors_to_doctor(error: OrsError) -> crate::DoctorLedgerError {
+    match error {
+        OrsError::Encoding(reason) => crate::DoctorLedgerError::Encoding(reason),
+        other => crate::DoctorLedgerError::Storage(other.to_string()),
+    }
 }
 
 impl RedbRecoveryStore {
@@ -761,6 +1037,1753 @@ impl RedbRecoveryStore {
             records.push(record);
         }
         Ok(records)
+    }
+
+    /// Retains one closed typed Store failure bound to its exact admitted
+    /// operation identity.
+    ///
+    /// The owner envelope is validated by the owner contract and stored
+    /// verbatim; ORS never reinterprets disposition, retry, recovery, or
+    /// provider prose, and never derives control meaning from
+    /// `human_detail`. An exact replay under the same operation/request
+    /// identity returns the durably stored record unchanged; a changed
+    /// failure envelope, binding, or fence under the same identity fails
+    /// with an integrity error. A retained `UNKNOWN_OUTCOME` failure with
+    /// no reconciling receipt is the reconciling state: it is never
+    /// reported as committed, terminal, unavailable, or safe-to-retry.
+    /// There is no removal method: retained failures are terminal or
+    /// reconciling evidence and restart must rehydrate them unchanged.
+    pub fn retain_store_failure(
+        &self,
+        record: &crate::StoreFailureRetentionRecord,
+    ) -> Result<Option<crate::StoreFailureRetentionRecord>, OrsError> {
+        record.validate()?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let key = record.record_key();
+        let stored = {
+            let mut table = write.open_table(STORE_FAILURE_RETENTION).map_err(storage)?;
+            let retained_bytes = table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| value.value().to_owned());
+            let Some(bytes) = retained_bytes else {
+                let payload = encode(record)?;
+                table
+                    .insert(key.as_str(), payload.as_str())
+                    .map_err(storage)?;
+                drop(table);
+                write.commit().map_err(storage)?;
+                return Ok(None);
+            };
+            let existing: crate::StoreFailureRetentionRecord = decode(&bytes)?;
+            existing.validate()?;
+            if !existing.same_binding(record) {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "store_failure_retention",
+                    reason: "existing retained Store failure binding conflicts".to_owned(),
+                });
+            }
+            if existing.failure != record.failure {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "store_failure_retention",
+                    reason: "retained Store failure replacement rejected".to_owned(),
+                });
+            }
+            // Monotonic reconciliation only: an unresolved retention may
+            // bind its exact reconciling receipt, but a reconciled
+            // retention is immutable and can never become unresolved.
+            let mut next = existing.clone();
+            match (&existing.reconciled_receipt, &record.reconciled_receipt) {
+                (None, None) => {}
+                (None, Some(_)) => {
+                    next.reconciled_receipt
+                        .clone_from(&record.reconciled_receipt);
+                }
+                (Some(stored), Some(incoming)) if stored == incoming => {}
+                (Some(_), _) => {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "store_failure_retention",
+                        reason: "reconciling receipt replacement rejected".to_owned(),
+                    });
+                }
+            }
+            next.validate()?;
+            if next != existing {
+                let payload = encode(&next)?;
+                table
+                    .insert(key.as_str(), payload.as_str())
+                    .map_err(storage)?;
+            }
+            next
+        };
+        write.commit().map_err(storage)?;
+        Ok(Some(stored))
+    }
+
+    /// Loads one retained Store failure by exact operation/request identity.
+    ///
+    /// The envelope is returned verbatim: disposition, retry directive,
+    /// recovery action, mutation disposition, conflict observations, and
+    /// evidence identity are exactly as retained, including
+    /// `UNKNOWN_OUTCOME` as reconciling while no receipt is bound.
+    pub fn load_store_failure(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+    ) -> Result<Option<crate::StoreFailureRetentionRecord>, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read.open_table(STORE_FAILURE_RETENTION).map_err(storage)?;
+        let key = format!("{}::{}", operation_id.as_str(), request_digest);
+        table
+            .get(key.as_str())
+            .map_err(storage)?
+            .map(|value| {
+                let record: crate::StoreFailureRetentionRecord = decode(value.value())?;
+                record.validate()?;
+                Ok(record)
+            })
+            .transpose()
+    }
+
+    /// Binds the exact reconciling receipt to a retained unknown-outcome
+    /// Store failure after the original operation was reconciled.
+    ///
+    /// An unknown operation returns `Ok(None)`; this method never invents
+    /// a record, never retries, never reroutes, and never substitutes an
+    /// operation: it only records that the exact retained operation was
+    /// reconciled under the given receipt digest, so a later restart
+    /// rehydrates the reconciled state instead of re-reconciling. A bound
+    /// receipt is immutable, and reconciling a terminal
+    /// (non-unknown-outcome) retention fails: terminal evidence stays
+    /// terminal.
+    pub fn mark_store_failure_reconciled(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        reconciling_receipt: &str,
+    ) -> Result<Option<crate::StoreFailureRetentionRecord>, OrsError> {
+        crate::model::validate_digest(reconciling_receipt, "store_failure_reconciled_receipt")?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let key = format!("{}::{}", operation_id.as_str(), request_digest);
+        let retained = {
+            let mut table = write.open_table(STORE_FAILURE_RETENTION).map_err(storage)?;
+            let retained_bytes = table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| value.value().to_owned());
+            let Some(bytes) = retained_bytes else {
+                drop(table);
+                write.commit().map_err(storage)?;
+                return Ok(None);
+            };
+            let mut next: crate::StoreFailureRetentionRecord = decode(&bytes)?;
+            next.validate()?;
+            if next.failure.disposition != eliot_store_api::StoreFailureDisposition::UnknownOutcome
+            {
+                return Err(OrsError::InvalidField {
+                    field: "store_failure_reconciled_receipt",
+                    reason: "only unknown-outcome retention reconciles",
+                });
+            }
+            match &next.reconciled_receipt {
+                Some(existing) if existing == reconciling_receipt => {}
+                Some(_) => {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "store_failure_retention",
+                        reason: "reconciling receipt replacement rejected".to_owned(),
+                    });
+                }
+                None => {
+                    next.reconciled_receipt = Some(reconciling_receipt.to_owned());
+                }
+            }
+            next.validate()?;
+            let payload = encode(&next)?;
+            table
+                .insert(key.as_str(), payload.as_str())
+                .map_err(storage)?;
+            next
+        };
+        write.commit().map_err(storage)?;
+        Ok(Some(retained))
+    }
+
+    /// Loads every retained Store failure for restart rehydration.
+    ///
+    /// Restart restores the same typed terminal or reconciling state
+    /// without recomputation: terminal and unknown-outcome envelopes
+    /// round-trip verbatim, and an unknown outcome never degrades to
+    /// not-attempted, unavailable, or safe-to-retry.
+    pub fn load_all_store_failures(
+        &self,
+    ) -> Result<Vec<crate::StoreFailureRetentionRecord>, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read.open_table(STORE_FAILURE_RETENTION).map_err(storage)?;
+        let mut records = Vec::new();
+        for entry in table.iter().map_err(storage)? {
+            let (_, value) = entry.map_err(storage)?;
+            let record: crate::StoreFailureRetentionRecord = decode(value.value())?;
+            record.validate()?;
+            records.push(record);
+        }
+        Ok(records)
+    }
+
+    /// Stages one Kernel-owned unknown-commit recovery record before the
+    /// commit send (I14.21, issue #1690).
+    ///
+    /// The record must be open (no outcome, no evidence). An exact replay
+    /// under the same idempotency key returns the durably stored record
+    /// unchanged; a changed binding under the same key fails with an
+    /// integrity error, so one key can never cover two different attempts.
+    pub fn stage_unknown_commit(
+        &self,
+        record: &UnknownCommitRecord,
+    ) -> Result<Option<UnknownCommitRecord>, OrsError> {
+        record.validate()?;
+        if !record.is_open() {
+            return Err(OrsError::InvalidField {
+                field: "unknown_commit_outcome",
+                reason: "only an open unknown-commit record stages",
+            });
+        }
+        let write = self.database.begin_write().map_err(storage)?;
+        let key = record.record_key();
+        let stored = {
+            let mut table = write.open_table(UNKNOWN_COMMIT_RECOVERY).map_err(storage)?;
+            let staged_bytes = table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| value.value().to_owned());
+            let Some(bytes) = staged_bytes else {
+                let payload = encode(record)?;
+                table
+                    .insert(key.as_str(), payload.as_str())
+                    .map_err(storage)?;
+                drop(table);
+                write.commit().map_err(storage)?;
+                return Ok(None);
+            };
+            let existing: UnknownCommitRecord = decode(&bytes)?;
+            existing.validate()?;
+            if !existing.same_binding(record) {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "unknown_commit_recovery",
+                    reason: "existing unknown-commit binding conflicts".to_owned(),
+                });
+            }
+            existing
+        };
+        write.commit().map_err(storage)?;
+        Ok(Some(stored))
+    }
+
+    /// Loads one unknown-commit recovery record by exact idempotency key.
+    pub fn load_unknown_commit(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<Option<UnknownCommitRecord>, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read.open_table(UNKNOWN_COMMIT_RECOVERY).map_err(storage)?;
+        table
+            .get(idempotency_key)
+            .map_err(storage)?
+            .map(|value| {
+                let record: UnknownCommitRecord = decode(value.value())?;
+                record.validate()?;
+                Ok(record)
+            })
+            .transpose()
+    }
+
+    /// Lists every still-open unknown-commit record: the visible Problem
+    /// State for Doctor/Human disposition (I14.21, issue #1690).
+    ///
+    /// Restart rehydrates the same open set: an unknown outcome never
+    /// degrades to not-attempted, and a resolved record never reopens.
+    pub fn list_open_unknown_commits(&self) -> Result<Vec<UnknownCommitRecord>, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read.open_table(UNKNOWN_COMMIT_RECOVERY).map_err(storage)?;
+        let mut records = Vec::new();
+        for entry in table.iter().map_err(storage)? {
+            let (_, value) = entry.map_err(storage)?;
+            let record: UnknownCommitRecord = decode(value.value())?;
+            record.validate()?;
+            if record.is_open() {
+                records.push(record);
+            }
+        }
+        Ok(records)
+    }
+
+    /// Resolves one open unknown-commit record with its receipt evidence
+    /// (I14.21 evidence-backed disposition, issue #1690).
+    ///
+    /// Only an open record resolves, and only with a bound receipt digest:
+    /// resolution without evidence fails, a second resolution fails, and a
+    /// different digest never replaces the bound one. Returns `Ok(None)`
+    /// for an unknown key; this method never invents a record and never
+    /// retries a send.
+    pub fn resolve_unknown_commit(
+        &self,
+        idempotency_key: &str,
+        outcome: UnknownCommitOutcome,
+        evidence_receipt_digest: &str,
+    ) -> Result<Option<UnknownCommitRecord>, OrsError> {
+        crate::model::validate_digest(evidence_receipt_digest, "unknown_commit_evidence")?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let resolved = {
+            let mut table = write.open_table(UNKNOWN_COMMIT_RECOVERY).map_err(storage)?;
+            let staged_bytes = table
+                .get(idempotency_key)
+                .map_err(storage)?
+                .map(|value| value.value().to_owned());
+            let Some(bytes) = staged_bytes else {
+                drop(table);
+                write.commit().map_err(storage)?;
+                return Ok(None);
+            };
+            let mut next: UnknownCommitRecord = decode(&bytes)?;
+            next.validate()?;
+            if !next.is_open() {
+                return Err(OrsError::InvalidField {
+                    field: "unknown_commit_outcome",
+                    reason: "only an open unknown-commit record resolves",
+                });
+            }
+            next.outcome = Some(outcome);
+            next.evidence_receipt_digest = Some(evidence_receipt_digest.to_owned());
+            next.validate()?;
+            let payload = encode(&next)?;
+            table
+                .insert(idempotency_key, payload.as_str())
+                .map_err(storage)?;
+            next
+        };
+        write.commit().map_err(storage)?;
+        Ok(Some(resolved))
+    }
+
+    /// Stages one P-04 host-request operation before any acknowledgement.
+    ///
+    /// Persist-before-ack: the `Requested` record is durably inserted before
+    /// the caller may acknowledge admission or route the request. An exact
+    /// replay under the same operation/request identity returns the durable
+    /// record unchanged with its current state and result; a changed payload
+    /// or binding under the same identity fails with
+    /// [`OrsError::HostRequestIdentityConflict`].
+    pub fn stage_host_request(
+        &self,
+        record: &crate::HostRequestRecord,
+    ) -> Result<crate::HostRequestRecord, OrsError> {
+        record.validate()?;
+        if record.state != crate::HostRequestState::Requested {
+            return Err(OrsError::InvalidField {
+                field: "host_request_state",
+                reason: "staging requires the requested state",
+            });
+        }
+        let write = self.database.begin_write().map_err(storage)?;
+        let existing = {
+            let mut table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            let key = record.record_key();
+            if let Some(existing) = table.get(key.as_str()).map_err(storage)? {
+                let existing: crate::HostRequestRecord = decode(existing.value())?;
+                existing.validate()?;
+                if !existing.same_binding(record) {
+                    return Err(OrsError::HostRequestIdentityConflict {
+                        operation_id: record.operation_id.as_str().to_owned(),
+                        request_digest: record.request_digest.clone(),
+                    });
+                }
+                Some(existing)
+            } else {
+                let payload = encode(record)?;
+                table
+                    .insert(key.as_str(), payload.as_str())
+                    .map_err(storage)?;
+                None
+            }
+        };
+        write.commit().map_err(storage)?;
+        Ok(existing.unwrap_or_else(|| record.clone()))
+    }
+
+    /// Loads one host-request operation by exact operation/request identity.
+    pub fn load_host_request(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read.open_table(HOST_REQUESTS).map_err(storage)?;
+        let key = format!("{}::{}", operation_id.as_str(), request_digest);
+        table
+            .get(key.as_str())
+            .map_err(storage)?
+            .map(|value| {
+                let record: crate::HostRequestRecord = decode(value.value())?;
+                record.validate()?;
+                Ok(record)
+            })
+            .transpose()
+    }
+
+    /// Advances one staged host-request operation to its next mechanical state.
+    ///
+    /// The transition table owns the anti-blind-retry fence: once an
+    /// operation reaches `PossiblyEffected` it can only move forward to
+    /// `ResultReceived` through reconciliation evidence, or to `Unknown` /
+    /// `Reconciling`. The ORS write transaction assigns the monotonic commit
+    /// order atomically when the operation first reaches a terminal state;
+    /// the caller never supplies it.
+    pub fn advance_host_request(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        target: crate::HostRequestState,
+        result_digest: Option<&str>,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        let write = self.database.begin_write().map_err(storage)?;
+        let key = format!("{}::{}", operation_id.as_str(), request_digest);
+        let existing: Option<crate::HostRequestRecord> = {
+            let table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+        };
+        let Some(existing) = existing else {
+            return Ok(None);
+        };
+        existing.validate()?;
+        if existing.state == target {
+            let replay_matches = match (&existing.result_digest, result_digest) {
+                (Some(current), Some(replayed)) => current.as_str() == replayed,
+                (None, None) => true,
+                _ => false,
+            };
+            if !replay_matches {
+                return Err(OrsError::HostRequestIdentityConflict {
+                    operation_id: operation_id.as_str().to_owned(),
+                    request_digest: request_digest.to_owned(),
+                });
+            }
+            return Ok(Some(existing));
+        }
+        existing.state.transition_to(target)?;
+        let effective_result = match (target, &existing.result_digest, result_digest) {
+            (crate::HostRequestState::ResultReceived, _, Some(result)) => Some(result.to_owned()),
+            (crate::HostRequestState::ResultReceived, _, None) => {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_result_digest",
+                    reason: "received requires a result digest",
+                });
+            }
+            (crate::HostRequestState::Terminal, Some(current), None) => Some(current.clone()),
+            (crate::HostRequestState::Terminal, Some(current), Some(replayed))
+                if current.as_str() == replayed =>
+            {
+                Some(current.clone())
+            }
+            (crate::HostRequestState::Terminal, None, None) => None,
+            (crate::HostRequestState::Terminal, _, _) => {
+                return Err(OrsError::HostRequestIdentityConflict {
+                    operation_id: operation_id.as_str().to_owned(),
+                    request_digest: request_digest.to_owned(),
+                });
+            }
+            (_, _, Some(_)) => {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_result_digest",
+                    reason: "result only for received or terminal states",
+                });
+            }
+            (_, _, None) => None,
+        };
+        let mut next = existing.clone();
+        next.state = target;
+        next.result_digest = effective_result;
+        if target.is_terminal() && next.commit_order == 0 {
+            next.commit_order = Self::next_operational_order(&write)?;
+        }
+        next.validate()?;
+        if next != existing {
+            let payload = encode(&next)?;
+            let mut table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            table
+                .insert(key.as_str(), payload.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(Some(next))
+    }
+
+    /// Persists one bounded local-read result body alongside its digest.
+    ///
+    /// See [`OperationalRecoveryStore::persist_host_request_result`] for the
+    /// replay/conflict contract. The lifecycle walk stays inside the existing
+    /// transition table: no new edge is introduced, so the anti-blind-retry
+    /// fence is unchanged. A `Requested` operation cannot receive a result
+    /// (it must be admitted first); terminal states without a result cannot
+    /// gain one.
+    pub fn persist_host_request_result(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        result_digest: &str,
+        result_response: &serde_json::Value,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        crate::model::validate_digest(result_digest, "host_request_result_digest")?;
+        let key = format!("{}::{}", operation_id.as_str(), request_digest);
+        let write = self.database.begin_write().map_err(storage)?;
+        let existing: Option<crate::HostRequestRecord> = {
+            let table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+        };
+        let Some(existing) = existing else {
+            return Ok(None);
+        };
+        existing.validate()?;
+        if existing.state == crate::HostRequestState::ResultReceived {
+            let same_digest = existing.result_digest.as_deref() == Some(result_digest);
+            let same_body = existing.result_response.as_ref() == Some(result_response);
+            if same_digest && same_body {
+                return Ok(Some(existing));
+            }
+            // Legacy digest-only row completed by the exact same digest: the
+            // matching digest proves the same result, so binding the missing
+            // body is monotonic completion, not an overwrite. Anything else
+            // under the same identity stays a conflict.
+            let completes_legacy =
+                same_digest && existing.result_response.is_none();
+            if !completes_legacy {
+                return Err(OrsError::HostRequestIdentityConflict {
+                    operation_id: operation_id.as_str().to_owned(),
+                    request_digest: request_digest.to_owned(),
+                });
+            }
+        } else if existing.state == crate::HostRequestState::Terminal {
+            let same_digest = existing.result_digest.as_deref() == Some(result_digest);
+            let same_body = existing.result_response.as_ref() == Some(result_response);
+            if same_digest && same_body {
+                return Ok(Some(existing));
+            }
+            // A terminal record either carries this exact result already
+            // (handled above) or must never gain or replace one here.
+            if existing.result_digest.is_some() || existing.result_response.is_some() {
+                return Err(OrsError::HostRequestIdentityConflict {
+                    operation_id: operation_id.as_str().to_owned(),
+                    request_digest: request_digest.to_owned(),
+                });
+            }
+            return Err(OrsError::InvalidTransition);
+        }
+        // Walk the mechanical lifecycle to `ResultReceived` inside the
+        // existing table: direct when legal, otherwise via the canonical
+        // `Admitted -> Routed -> Submitted` progression the synchronous local
+        // dispatch stands in for (no router/submitter exists on this path).
+        let mut state = existing.state;
+        loop {
+            if state == crate::HostRequestState::ResultReceived {
+                break;
+            }
+            let next = if state == crate::HostRequestState::Admitted {
+                crate::HostRequestState::Routed
+            } else if state == crate::HostRequestState::Routed {
+                crate::HostRequestState::Submitted
+            } else {
+                crate::HostRequestState::ResultReceived
+            };
+            state = state.transition_to(next)?;
+        }
+        let mut next = existing.clone();
+        next.state = crate::HostRequestState::ResultReceived;
+        next.result_digest = Some(result_digest.to_owned());
+        next.result_response = Some(result_response.clone());
+        if next.commit_order == 0 {
+            next.commit_order = Self::next_operational_order(&write)?;
+        }
+        next.validate()?;
+        if next != existing {
+            let payload = encode(&next)?;
+            let mut table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            table
+                .insert(key.as_str(), payload.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(Some(next))
+    }
+
+    /// Stages one native-worker claim intent before any acknowledgement.
+    ///
+    /// Persist-before-ack: the record is durably inserted before the caller
+    /// may issue the immutable admission receipt or initialize provider
+    /// work. An exact replay under the same claim identity returns
+    /// [`NativeWorkerClaimStageOutcome::Existing`] carrying the same receipt
+    /// identity; a changed binding under the same identity fails with
+    /// [`OrsError::NativeWorkerClaimIdentityConflict`] and never overwrites
+    /// the durable row. Staging accepts the `Requested` intent entry state
+    /// and the `Admitted` Wave-B admission state; both are validated for
+    /// receipt coherence by the record itself. This table is disjoint from
+    /// the `HostRequest` and `ProcessStart` tables: one writer per state.
+    pub fn stage_native_worker_claim(
+        &self,
+        record: &crate::NativeWorkerClaimRecord,
+    ) -> Result<crate::NativeWorkerClaimStageOutcome, OrsError> {
+        record.validate()?;
+        if !matches!(
+            record.state,
+            crate::NativeWorkerClaimState::Requested | crate::NativeWorkerClaimState::Admitted
+        ) {
+            return Err(OrsError::InvalidField {
+                field: "native_worker_claim_state",
+                reason: "staging requires the requested or admitted state",
+            });
+        }
+        let write = self.database.begin_write().map_err(storage)?;
+        let existing = {
+            let mut table = write.open_table(NATIVE_WORKER_CLAIMS).map_err(storage)?;
+            let key = record.record_key();
+            if let Some(existing) = table.get(key.as_str()).map_err(storage)? {
+                let existing: crate::NativeWorkerClaimRecord = decode(existing.value())?;
+                existing.validate()?;
+                if !existing.same_binding(record) {
+                    return Err(OrsError::NativeWorkerClaimIdentityConflict {
+                        claim_id: record.claim_id.as_str().to_owned(),
+                    });
+                }
+                Some(existing)
+            } else {
+                let payload = encode(record)?;
+                table
+                    .insert(key.as_str(), payload.as_str())
+                    .map_err(storage)?;
+                None
+            }
+        };
+        write.commit().map_err(storage)?;
+        Ok(match existing {
+            Some(durable) => crate::NativeWorkerClaimStageOutcome::Existing(durable),
+            None => crate::NativeWorkerClaimStageOutcome::Stored(record.clone()),
+        })
+    }
+
+    /// Loads one native-worker claim by exact claim identity.
+    pub fn load_native_worker_claim(
+        &self,
+        claim_id: &crate::OperationIdentity,
+    ) -> Result<Option<crate::NativeWorkerClaimRecord>, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read.open_table(NATIVE_WORKER_CLAIMS).map_err(storage)?;
+        table
+            .get(claim_id.as_str())
+            .map_err(storage)?
+            .map(|value| {
+                let record: crate::NativeWorkerClaimRecord = decode(value.value())?;
+                record.validate()?;
+                if record.claim_id != *claim_id {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "native_worker_claim",
+                        reason: "claim record identity does not match its key".to_owned(),
+                    });
+                }
+                Ok(record)
+            })
+            .transpose()
+    }
+
+    /// Reverse-resolves one claim identity from its bound attempt and
+    /// operation labels (T9-04 supplier core, issue #1108).
+    ///
+    /// Read-only: this performs no writes, creates no table, and grants no
+    /// authority. It scans the existing claim rows with early exit on the
+    /// first exact attempt-plus-operation match, mirroring the
+    /// `replay_events_in` full-table scan precedent. The scan carries no row
+    /// cap on purpose: a cap would turn a present row past the bound into a
+    /// false unknown. A corrupt or unreadable row ends the scan without a
+    /// match, so callers must confirm any hit with
+    /// [`Self::load_native_worker_claim`] under the exact claim identity and
+    /// treat `None` as "no durable binding observed", never as proof of
+    /// absence. There is deliberately no reverse index and no second writer:
+    /// the claim table stays the single owner of claim state.
+    pub fn find_native_worker_claim_id_by_attempt_operation(
+        &self,
+        attempt_id: &str,
+        operation_id: &str,
+    ) -> Option<String> {
+        if crate::model::validate_text(attempt_id, "native_worker_claim_attempt_id").is_err()
+            || crate::model::validate_text(operation_id, "native_worker_claim_operation_id")
+                .is_err()
+        {
+            return None;
+        }
+        let read = self.database.begin_read().ok()?;
+        let table = read.open_table(NATIVE_WORKER_CLAIMS).ok()?;
+        for row in table.iter().ok()? {
+            let (_, value) = row.ok()?;
+            let record: crate::NativeWorkerClaimRecord = decode(value.value()).ok()?;
+            if record.attempt_id.as_str() == attempt_id
+                && record.operation_id.as_str() == operation_id
+            {
+                return Some(record.claim_id.as_str().to_owned());
+            }
+        }
+        None
+    }
+
+    /// Advances one staged claim to its next mechanical state.
+    ///
+    /// The transition table owns the anti-downgrade fence: `Terminal` is
+    /// absorbing, `Unknown` may only become `Reconciling`, no state returns
+    /// to `Requested`, and `Ready` is reachable only from `Admitted` (or
+    /// from `Reconciling` as the resolution of previously admitted work).
+    /// An exact repeat of an applied advance returns the durable record
+    /// unchanged. An unknown claim returns `Ok(None)`; this method never
+    /// invents a record and never retries blindly. Admission evidence binds
+    /// the receipt identity on `Requested -> Admitted`, is accepted
+    /// unchanged on an exact `Admitted -> Admitted` replay, and can never
+    /// overwrite a bound receipt. The ORS write transaction assigns the
+    /// monotonic commit order atomically when the claim first reaches its
+    /// terminal state; the caller never supplies it.
+    pub fn advance_native_worker_claim(
+        &self,
+        claim_id: &crate::OperationIdentity,
+        target: crate::NativeWorkerClaimState,
+        admission: Option<&crate::NativeWorkerClaimAdmission>,
+    ) -> Result<Option<crate::NativeWorkerClaimRecord>, OrsError> {
+        let write = self.database.begin_write().map_err(storage)?;
+        let key = claim_id.as_str().to_owned();
+        let existing: Option<crate::NativeWorkerClaimRecord> = {
+            let table = write.open_table(NATIVE_WORKER_CLAIMS).map_err(storage)?;
+            table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+        };
+        let Some(existing) = existing else {
+            return Ok(None);
+        };
+        existing.validate()?;
+        if existing.claim_id != *claim_id {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "native_worker_claim",
+                reason: "claim record identity does not match its key".to_owned(),
+            });
+        }
+        if existing.state == target {
+            if let Some(admission) = admission {
+                admission.validate()?;
+                if existing.receipt_digest.as_deref() != Some(admission.receipt_digest.as_str())
+                    || existing.admitted_at_unix_ms != Some(admission.admitted_at_unix_ms)
+                {
+                    return Err(OrsError::NativeWorkerClaimIdentityConflict {
+                        claim_id: claim_id.as_str().to_owned(),
+                    });
+                }
+            }
+            return Ok(Some(existing));
+        }
+        existing.state.transition_to(target)?;
+        let mut next = existing.clone();
+        next.state = target;
+        if target == crate::NativeWorkerClaimState::Admitted {
+            match (
+                &existing.receipt_digest,
+                existing.admitted_at_unix_ms,
+                admission,
+            ) {
+                (None, None, Some(admission)) => {
+                    admission.validate()?;
+                    next.receipt_digest = Some(admission.receipt_digest.clone());
+                    next.admitted_at_unix_ms = Some(admission.admitted_at_unix_ms);
+                }
+                (Some(_), Some(_), None) => {}
+                (Some(digest), Some(at), Some(admission))
+                    if digest == &admission.receipt_digest
+                        && at == admission.admitted_at_unix_ms => {}
+                (None, None, None) => {
+                    return Err(OrsError::InvalidField {
+                        field: "native_worker_claim_admission",
+                        reason: "admission requires admission evidence",
+                    });
+                }
+                _ => {
+                    return Err(OrsError::NativeWorkerClaimIdentityConflict {
+                        claim_id: claim_id.as_str().to_owned(),
+                    });
+                }
+            }
+        } else if admission.is_some() {
+            return Err(OrsError::InvalidField {
+                field: "native_worker_claim_admission",
+                reason: "admission evidence only for the admitted state",
+            });
+        }
+        if target.is_terminal() && next.commit_order == 0 {
+            next.commit_order = Self::next_operational_order(&write)?;
+        }
+        next.validate()?;
+        if next != existing {
+            let payload = encode(&next)?;
+            let mut table = write.open_table(NATIVE_WORKER_CLAIMS).map_err(storage)?;
+            table
+                .insert(key.as_str(), payload.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(Some(next))
+    }
+
+    /// Stages one Doctor attempt intent before any admission.
+    ///
+    /// Persist-before-ack: the `Requested` record is durably inserted before
+    /// the Kernel admission gate may bind an admission receipt. An exact
+    /// replay under the same attempt digest returns the durable row
+    /// unchanged; a changed binding under the same digest fails with
+    /// [`crate::DoctorLedgerError::AttemptIdentityConflict`] and never
+    /// overwrites the durable row. This table is disjoint from every other
+    /// ORS table: one writer per state.
+    pub fn stage_doctor_attempt(
+        &self,
+        record: &crate::DoctorAttemptRecord,
+    ) -> Result<crate::DoctorAttemptStageOutcome, crate::DoctorLedgerError> {
+        record.validate().map_err(map_ors_to_doctor)?;
+        if record.state != crate::DoctorAttemptState::Requested {
+            return Err(doctor_storage("staging requires the requested state"));
+        }
+        let write = self.database.begin_write().map_err(doctor_storage)?;
+        let existing = {
+            let mut table = write.open_table(DOCTOR_ATTEMPTS).map_err(doctor_storage)?;
+            let key = record.record_key();
+            if let Some(existing) = table.get(key.as_str()).map_err(doctor_storage)? {
+                let existing: crate::DoctorAttemptRecord =
+                    decode(existing.value()).map_err(map_ors_to_doctor)?;
+                if !existing.same_binding(record) {
+                    return Err(crate::DoctorLedgerError::AttemptIdentityConflict {
+                        attempt_digest: key,
+                    });
+                }
+                Some(existing)
+            } else {
+                let payload = encode(record).map_err(map_ors_to_doctor)?;
+                table
+                    .insert(key.as_str(), payload.as_str())
+                    .map_err(doctor_storage)?;
+                None
+            }
+        };
+        write.commit().map_err(doctor_storage)?;
+        Ok(match existing {
+            Some(durable) => crate::DoctorAttemptStageOutcome::Existing(durable),
+            None => crate::DoctorAttemptStageOutcome::Stored(record.clone()),
+        })
+    }
+
+    /// Loads one Doctor attempt by exact attempt digest.
+    pub fn load_doctor_attempt(
+        &self,
+        attempt_digest: &crate::OperationIdentity,
+    ) -> Result<Option<crate::DoctorAttemptRecord>, crate::DoctorLedgerError> {
+        let read = self.database.begin_read().map_err(doctor_storage)?;
+        let table = read.open_table(DOCTOR_ATTEMPTS).map_err(doctor_storage)?;
+        table
+            .get(attempt_digest.as_str())
+            .map_err(doctor_storage)?
+            .map(|value| {
+                let record: crate::DoctorAttemptRecord =
+                    decode(value.value()).map_err(map_ors_to_doctor)?;
+                if record.attempt_digest != *attempt_digest {
+                    return Err(doctor_storage(
+                        "doctor attempt identity does not match its key",
+                    ));
+                }
+                Ok(record)
+            })
+            .transpose()
+    }
+
+    /// Advances one staged Doctor attempt to its next mechanical state.
+    ///
+    /// The transition table owns the anti-blind-retry fence: `Unknown` may
+    /// only become `Reconciling`, neither `Unknown` nor `Reconciling` returns
+    /// to `Requested`, and `Terminal` is absorbing. An exact repeat of an
+    /// applied advance returns the durable record unchanged: a same-state
+    /// repeat carrying the bound admission evidence is accepted, and a
+    /// same-state repeat carrying no evidence re-observes the durable row
+    /// without touching the bound admission. Conflicting evidence fails
+    /// without overwriting. An unknown
+    /// attempt returns `Ok(None)`; this method never invents a record.
+    /// Admission evidence binds the admission digest on
+    /// `Requested -> Admitted` and `Requested -> Cancelled`, is accepted
+    /// unchanged on an exact replay of an applied advance, and can never
+    /// overwrite a bound admission. The ORS write transaction assigns the
+    /// monotonic commit order atomically when the attempt first reaches a
+    /// terminal state; the caller never supplies it.
+    pub fn advance_doctor_attempt(
+        &self,
+        attempt_digest: &crate::OperationIdentity,
+        target: crate::DoctorAttemptState,
+        admission: Option<&crate::DoctorAttemptAdmission>,
+    ) -> Result<Option<crate::DoctorAttemptRecord>, crate::DoctorLedgerError> {
+        let write = self.database.begin_write().map_err(doctor_storage)?;
+        let key = attempt_digest.as_str().to_owned();
+        let existing: Option<crate::DoctorAttemptRecord> = {
+            let table = write.open_table(DOCTOR_ATTEMPTS).map_err(doctor_storage)?;
+            table
+                .get(key.as_str())
+                .map_err(doctor_storage)?
+                .map(|value| decode(value.value()))
+                .transpose()
+                .map_err(map_ors_to_doctor)?
+        };
+        let Some(existing) = existing else {
+            return Ok(None);
+        };
+        if existing.attempt_digest != *attempt_digest {
+            return Err(doctor_storage(
+                "doctor attempt identity does not match its key",
+            ));
+        }
+        if existing.state == target {
+            let replayed = match (
+                &existing.admission_digest,
+                existing.admitted_at_unix_nanos,
+                admission,
+            ) {
+                (Some(digest), Some(at), Some(evidence)) => {
+                    evidence.validate().map_err(map_ors_to_doctor)?;
+                    evidence.admission_digest == *digest && evidence.admitted_at_unix_nanos == at
+                }
+                // A same-state re-observation that presents no evidence
+                // changes nothing: the bound admission is returned
+                // unchanged, so an at-least-once retry of an applied
+                // non-admission advance stays idempotent. Conflicting
+                // evidence below still fails without overwriting.
+                (Some(..), Some(..), None) => true,
+                (None, None, None) => true,
+                _ => false,
+            };
+            if !replayed {
+                return Err(crate::DoctorLedgerError::AttemptIdentityConflict {
+                    attempt_digest: key,
+                });
+            }
+            return Ok(Some(existing));
+        }
+        let from = existing.state;
+        from.transition_to(target).map_err(map_ors_to_doctor)?;
+        let mut next = existing.clone();
+        match (from, target) {
+            (
+                crate::DoctorAttemptState::Requested,
+                crate::DoctorAttemptState::Admitted | crate::DoctorAttemptState::Cancelled,
+            ) => {
+                let evidence =
+                    admission.ok_or_else(|| doctor_storage("admission evidence is required"))?;
+                evidence.validate().map_err(map_ors_to_doctor)?;
+                next.admission_digest = Some(evidence.admission_digest.clone());
+                next.admitted_at_unix_nanos = Some(evidence.admitted_at_unix_nanos);
+            }
+            (crate::DoctorAttemptState::Requested, crate::DoctorAttemptState::Expired) => {
+                if admission.is_some() {
+                    return Err(doctor_storage("an expired intent carries no admission"));
+                }
+            }
+            _ => {
+                if admission.is_some() {
+                    return Err(doctor_storage(
+                        "admission evidence binds only on first admission",
+                    ));
+                }
+            }
+        }
+        next.state = target;
+        if target.is_terminal() && next.commit_order == 0 {
+            next.commit_order = Self::next_operational_order(&write).map_err(map_ors_to_doctor)?;
+        }
+        next.validate().map_err(map_ors_to_doctor)?;
+        if next != existing {
+            let payload = encode(&next).map_err(map_ors_to_doctor)?;
+            let mut table = write.open_table(DOCTOR_ATTEMPTS).map_err(doctor_storage)?;
+            table
+                .insert(key.as_str(), payload.as_str())
+                .map_err(doctor_storage)?;
+        }
+        write.commit().map_err(doctor_storage)?;
+        Ok(Some(next))
+    }
+
+    /// Stages one Doctor effect intent before execution.
+    ///
+    /// Persist-before-effect: the `Intended` record is durably inserted
+    /// before the named effect adapter may run. An exact replay under the
+    /// same effect digest returns the durable row unchanged; a changed
+    /// intent under the same digest fails with
+    /// [`crate::DoctorLedgerError::EffectIdentityConflict`] and never
+    /// overwrites the durable row.
+    pub fn stage_doctor_effect(
+        &self,
+        record: &crate::DoctorEffectRecord,
+    ) -> Result<crate::DoctorEffectStageOutcome, crate::DoctorLedgerError> {
+        record.validate().map_err(map_ors_to_doctor)?;
+        if record.state != crate::DoctorEffectState::Intended {
+            return Err(doctor_storage("staging requires the intended state"));
+        }
+        let write = self.database.begin_write().map_err(doctor_storage)?;
+        let existing = {
+            let mut table = write.open_table(DOCTOR_EFFECTS).map_err(doctor_storage)?;
+            let key = record.record_key();
+            if let Some(existing) = table.get(key.as_str()).map_err(doctor_storage)? {
+                let existing: crate::DoctorEffectRecord =
+                    decode(existing.value()).map_err(map_ors_to_doctor)?;
+                if !existing.same_binding(record) {
+                    return Err(crate::DoctorLedgerError::EffectIdentityConflict {
+                        effect_digest: key,
+                    });
+                }
+                Some(existing)
+            } else {
+                let payload = encode(record).map_err(map_ors_to_doctor)?;
+                table
+                    .insert(key.as_str(), payload.as_str())
+                    .map_err(doctor_storage)?;
+                None
+            }
+        };
+        write.commit().map_err(doctor_storage)?;
+        Ok(match existing {
+            Some(durable) => crate::DoctorEffectStageOutcome::Existing(durable),
+            None => crate::DoctorEffectStageOutcome::Stored(record.clone()),
+        })
+    }
+
+    /// Loads one Doctor effect by exact effect digest.
+    pub fn load_doctor_effect(
+        &self,
+        effect_digest: &crate::OperationIdentity,
+    ) -> Result<Option<crate::DoctorEffectRecord>, crate::DoctorLedgerError> {
+        let read = self.database.begin_read().map_err(doctor_storage)?;
+        let table = read.open_table(DOCTOR_EFFECTS).map_err(doctor_storage)?;
+        table
+            .get(effect_digest.as_str())
+            .map_err(doctor_storage)?
+            .map(|value| {
+                let record: crate::DoctorEffectRecord =
+                    decode(value.value()).map_err(map_ors_to_doctor)?;
+                if record.effect_digest != *effect_digest {
+                    return Err(doctor_storage(
+                        "doctor effect identity does not match its key",
+                    ));
+                }
+                Ok(record)
+            })
+            .transpose()
+    }
+
+    /// Binds the exact outcome or unknown state to one Doctor effect.
+    ///
+    /// A known report on `Intended`, `Unknown`, or `Reconciling` moves the
+    /// effect to `Reported`; an unknown report on `Intended` moves it to
+    /// `Unknown` with the effect digest as its reconciliation key. An exact
+    /// repeat of an applied report returns the durable record unchanged; a
+    /// different outcome under the same effect digest fails with
+    /// [`crate::DoctorLedgerError::EffectIdentityConflict`]. An unknown
+    /// effect returns `Ok(None)`; this method never invents a record and
+    /// never retries blindly. The ORS write transaction assigns the
+    /// monotonic commit order atomically when the effect first reaches its
+    /// terminal state.
+    pub fn record_doctor_effect_outcome(
+        &self,
+        effect_digest: &crate::OperationIdentity,
+        report: &crate::DoctorEffectOutcomeReport,
+    ) -> Result<Option<crate::DoctorEffectRecord>, crate::DoctorLedgerError> {
+        report.validate().map_err(map_ors_to_doctor)?;
+        let write = self.database.begin_write().map_err(doctor_storage)?;
+        let key = effect_digest.as_str().to_owned();
+        let existing: Option<crate::DoctorEffectRecord> = {
+            let table = write.open_table(DOCTOR_EFFECTS).map_err(doctor_storage)?;
+            table
+                .get(key.as_str())
+                .map_err(doctor_storage)?
+                .map(|value| decode(value.value()))
+                .transpose()
+                .map_err(map_ors_to_doctor)?
+        };
+        let Some(existing) = existing else {
+            return Ok(None);
+        };
+        if existing.effect_digest != *effect_digest {
+            return Err(doctor_storage(
+                "doctor effect identity does not match its key",
+            ));
+        }
+        let mut next = existing.clone();
+        if report.unknown {
+            match existing.state {
+                crate::DoctorEffectState::Intended => {
+                    next.state = crate::DoctorEffectState::Unknown;
+                    next.reconciliation_key = Some(existing.effect_digest.as_str().to_owned());
+                }
+                crate::DoctorEffectState::Unknown | crate::DoctorEffectState::Reconciling => {}
+                crate::DoctorEffectState::Reported => {
+                    return Err(crate::DoctorLedgerError::EffectIdentityConflict {
+                        effect_digest: key,
+                    });
+                }
+            }
+        } else {
+            let outcome = report
+                .outcome_digest
+                .clone()
+                .ok_or_else(|| doctor_storage("a known outcome carries its exact digest"))?;
+            match existing.state {
+                crate::DoctorEffectState::Intended
+                | crate::DoctorEffectState::Unknown
+                | crate::DoctorEffectState::Reconciling => {
+                    next.state = crate::DoctorEffectState::Reported;
+                    next.outcome_digest = Some(outcome);
+                    next.adapter_receipt_digest
+                        .clone_from(&report.adapter_receipt_digest);
+                    next.reconciliation_key = None;
+                }
+                crate::DoctorEffectState::Reported => {
+                    if existing.outcome_digest.as_deref() != Some(outcome.as_str()) {
+                        return Err(crate::DoctorLedgerError::EffectIdentityConflict {
+                            effect_digest: key,
+                        });
+                    }
+                }
+            }
+        }
+        if next.state.is_terminal() && next.commit_order == 0 {
+            next.commit_order = Self::next_operational_order(&write).map_err(map_ors_to_doctor)?;
+        }
+        next.validate().map_err(map_ors_to_doctor)?;
+        if next != existing {
+            let payload = encode(&next).map_err(map_ors_to_doctor)?;
+            let mut table = write.open_table(DOCTOR_EFFECTS).map_err(doctor_storage)?;
+            table
+                .insert(key.as_str(), payload.as_str())
+                .map_err(doctor_storage)?;
+        }
+        write.commit().map_err(doctor_storage)?;
+        Ok(Some(next))
+    }
+
+    /// Loads one Doctor budget ledger by exact scope key.
+    pub fn load_doctor_budget(
+        &self,
+        scope_key: &crate::OpaqueLabel,
+    ) -> Result<Option<crate::DoctorBudgetLedger>, crate::DoctorLedgerError> {
+        let read = self.database.begin_read().map_err(doctor_storage)?;
+        let table = read.open_table(DOCTOR_BUDGETS).map_err(doctor_storage)?;
+        table
+            .get(scope_key.as_str())
+            .map_err(doctor_storage)?
+            .map(|value| {
+                let ledger: crate::DoctorBudgetLedger =
+                    decode(value.value()).map_err(map_ors_to_doctor)?;
+                if ledger.scope_key != *scope_key {
+                    return Err(doctor_storage("doctor budget scope does not match its key"));
+                }
+                Ok(ledger)
+            })
+            .transpose()
+    }
+
+    /// Persists one Doctor budget ledger row, replacing the prior row.
+    ///
+    /// Ledgers are Kernel-derived from durable admissions and outcomes,
+    /// never caller-supplied authority: this method validates shape and
+    /// replaces the row for its scope key so budget, cooldown, and
+    /// quarantine enforcement survives restarts.
+    pub fn store_doctor_budget(
+        &self,
+        ledger: &crate::DoctorBudgetLedger,
+    ) -> Result<(), crate::DoctorLedgerError> {
+        ledger.validate().map_err(map_ors_to_doctor)?;
+        let write = self.database.begin_write().map_err(doctor_storage)?;
+        {
+            let mut table = write.open_table(DOCTOR_BUDGETS).map_err(doctor_storage)?;
+            let key = ledger.record_key();
+            let payload = encode(ledger).map_err(map_ors_to_doctor)?;
+            table
+                .insert(key.as_str(), payload.as_str())
+                .map_err(doctor_storage)?;
+        }
+        write.commit().map_err(doctor_storage)
+    }
+
+    /// Reads the retained events of one stream, optionally scoped to one
+    /// request, in sequence order.
+    fn replay_events_in(
+        table: &impl ReadableTable<&'static str, &'static str>,
+        stream_id: &str,
+        request_id: Option<&str>,
+    ) -> Result<Vec<WorkerReplayEvent>, OrsError> {
+        let prefix = WorkerReplayEvent::key_prefix_for(stream_id);
+        let mut events = Vec::new();
+        for row in table.iter().map_err(storage)? {
+            let (key, value) = row.map_err(storage)?;
+            if !key.value().starts_with(prefix.as_str()) {
+                continue;
+            }
+            let event: WorkerReplayEvent = decode(value.value())?;
+            if event.stream_id != stream_id {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "worker_replay_event",
+                    reason: "event stream does not match its key".to_owned(),
+                });
+            }
+            if request_id.is_some_and(|request| event.request_id != request) {
+                continue;
+            }
+            events.push(event);
+        }
+        events.sort_by_key(|event| event.sequence);
+        Ok(events)
+    }
+
+    /// Loads one native-worker claim inside a write transaction without
+    /// mutating it. The replay journal only ever reads the claim table: the
+    /// claim contour stays the single writer of claim state.
+    fn load_claim_in(
+        write: &redb::WriteTransaction,
+        claim_id: &crate::OperationIdentity,
+    ) -> Result<Option<crate::NativeWorkerClaimRecord>, OrsError> {
+        let table = write.open_table(NATIVE_WORKER_CLAIMS).map_err(storage)?;
+        table
+            .get(claim_id.as_str())
+            .map_err(storage)?
+            .map(|value| {
+                let record: crate::NativeWorkerClaimRecord = decode(value.value())?;
+                record.validate()?;
+                if record.claim_id != *claim_id {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "native_worker_claim",
+                        reason: "claim record identity does not match its key".to_owned(),
+                    });
+                }
+                Ok(record)
+            })
+            .transpose()
+    }
+
+    /// Loads one replay stream head inside a write transaction.
+    fn load_stream_head_in(
+        write: &redb::WriteTransaction,
+        stream_id: &str,
+    ) -> Result<Option<WorkerReplayStreamRecord>, OrsError> {
+        let table = write.open_table(REPLAY_STREAMS).map_err(storage)?;
+        table
+            .get(stream_id)
+            .map_err(storage)?
+            .map(|value| {
+                let head: WorkerReplayStreamRecord = decode(value.value())?;
+                head.validate()?;
+                if head.stream_id != stream_id {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "worker_replay_stream",
+                        reason: "stream head identity does not match its key".to_owned(),
+                    });
+                }
+                Ok(head)
+            })
+            .transpose()
+    }
+
+    /// Looks up one durable replay request without acquiring anything.
+    ///
+    /// Read-only: an unknown identity returns
+    /// [`WorkerReplayRequestDecision::New`] and persists nothing, so a lookup
+    /// can never manufacture an acquisition.
+    pub fn lookup_replay_request(
+        &self,
+        stream_id: &str,
+        request_id: &str,
+        fingerprint: &str,
+    ) -> Result<WorkerReplayRequestDecision, OrsError> {
+        parse_replay_stream_id(stream_id)?;
+        crate::model::validate_text(request_id, "worker_replay_request_id")?;
+        crate::model::validate_text(fingerprint, "worker_replay_fingerprint")?;
+        let read = self.database.begin_read().map_err(storage)?;
+        let key = WorkerReplayRequestRecord::key_for(stream_id, request_id);
+        let stored: Option<WorkerReplayRequestRecord> = {
+            let table = read.open_table(REPLAY_REQUESTS).map_err(storage)?;
+            table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+        };
+        let Some(stored) = stored else {
+            return Ok(WorkerReplayRequestDecision::New);
+        };
+        if stored.stream_id != stream_id || stored.request_id != request_id {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "worker_replay_request",
+                reason: "request record identity does not match its key".to_owned(),
+            });
+        }
+        if stored.fingerprint != fingerprint {
+            return Ok(WorkerReplayRequestDecision::Conflict);
+        }
+        let events = {
+            let table = read.open_table(REPLAY_EVENTS).map_err(storage)?;
+            Self::replay_events_in(&table, stream_id, Some(request_id))?
+        };
+        Ok(WorkerReplayRequestDecision::Replay(events))
+    }
+
+    /// Atomically acquires one durable replay request or reports its durable
+    /// outcome.
+    ///
+    /// Persist-before-ack: the claim gate runs first against the existing
+    /// claim record (read-only); a missing claim or a stale
+    /// generation/epoch/fence fails closed and acquires nothing. The stream
+    /// head and the request record are then created in the same write
+    /// transaction, so concurrent acquirers serialize on first-writer-wins
+    /// and a retained acquisition is never a fresh request after a crash.
+    /// This table never writes the claim table: one writer per state.
+    pub fn begin_replay_request(
+        &self,
+        begin: &WorkerReplayBegin,
+    ) -> Result<WorkerReplayRequestDecision, OrsError> {
+        begin.validate()?;
+        let (claim_id, _) = parse_replay_stream_id(&begin.stream_id)?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let Some(claim) = Self::load_claim_in(&write, &claim_id)? else {
+            return Err(OrsError::WorkerReplayStaleStream {
+                stream_id: begin.stream_id.clone(),
+            });
+        };
+        require_replay_claim_binding(
+            &begin.stream_id,
+            begin.producer_generation,
+            begin.authority_epoch,
+            &begin.fence_digest,
+            &claim,
+        )?;
+        let key = WorkerReplayRequestRecord::key_for(&begin.stream_id, &begin.request_id);
+        let stored: Option<WorkerReplayRequestRecord> = {
+            let table = write.open_table(REPLAY_REQUESTS).map_err(storage)?;
+            table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+        };
+        if let Some(stored) = stored {
+            if stored.stream_id != begin.stream_id || stored.request_id != begin.request_id {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "worker_replay_request",
+                    reason: "request record identity does not match its key".to_owned(),
+                });
+            }
+            if stored.fingerprint != begin.fingerprint {
+                return Ok(WorkerReplayRequestDecision::Conflict);
+            }
+            let events = {
+                let table = write.open_table(REPLAY_EVENTS).map_err(storage)?;
+                Self::replay_events_in(&table, &begin.stream_id, Some(begin.request_id.as_str()))?
+            };
+            return Ok(WorkerReplayRequestDecision::Replay(events));
+        }
+        if Self::load_stream_head_in(&write, &begin.stream_id)?.is_none() {
+            let (head_claim_id, head_generation) = parse_replay_stream_id(&begin.stream_id)?;
+            let head = WorkerReplayStreamRecord {
+                contract_version: crate::CONTRACT_VERSION,
+                stream_id: begin.stream_id.clone(),
+                claim_id: head_claim_id,
+                worker_generation: head_generation,
+                producer_cursor: 0,
+                consumer_cursor: 0,
+                next_sequence: 1,
+            };
+            head.validate()?;
+            let mut streams = write.open_table(REPLAY_STREAMS).map_err(storage)?;
+            streams
+                .insert(begin.stream_id.as_str(), encode(&head)?.as_str())
+                .map_err(storage)?;
+        }
+        let record = WorkerReplayRequestRecord {
+            stream_id: begin.stream_id.clone(),
+            request_id: begin.request_id.clone(),
+            fingerprint: begin.fingerprint.clone(),
+            producer_generation: begin.producer_generation,
+            authority_epoch: begin.authority_epoch,
+            fence_digest: begin.fence_digest.clone(),
+            acquired_at_unix_ms: current_unix_ms_u64()?,
+        };
+        record.validate()?;
+        {
+            let mut table = write.open_table(REPLAY_REQUESTS).map_err(storage)?;
+            table
+                .insert(key.as_str(), encode(&record)?.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(WorkerReplayRequestDecision::New)
+    }
+
+    /// Persists one replay draft under its exact stream with a durable
+    /// identity and sequence.
+    ///
+    /// One write transaction: claim gate, acquisition check, idempotent
+    /// replay of an identical draft (same `event_id` and sequence), otherwise
+    /// assignment of the stream's next sequence. The claim table is only
+    /// read; the event row is immutable once written.
+    pub fn append_replay_event(
+        &self,
+        draft: &WorkerReplayDraft,
+    ) -> Result<WorkerReplayEvent, OrsError> {
+        draft.validate()?;
+        let digest = draft.draft_digest()?;
+        let (claim_id, _) = parse_replay_stream_id(&draft.stream_id)?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let Some(claim) = Self::load_claim_in(&write, &claim_id)? else {
+            return Err(OrsError::WorkerReplayStaleStream {
+                stream_id: draft.stream_id.clone(),
+            });
+        };
+        require_replay_claim_binding(
+            &draft.stream_id,
+            draft.producer_generation,
+            draft.authority_epoch,
+            &draft.fence_digest,
+            &claim,
+        )?;
+        let request_key = WorkerReplayRequestRecord::key_for(&draft.stream_id, &draft.request_id);
+        let request: WorkerReplayRequestRecord = {
+            let table = write.open_table(REPLAY_REQUESTS).map_err(storage)?;
+            table
+                .get(request_key.as_str())
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+                .ok_or(OrsError::ReservationNotFound)?
+        };
+        if request.stream_id != draft.stream_id || request.request_id != draft.request_id {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "worker_replay_request",
+                reason: "request record identity does not match its key".to_owned(),
+            });
+        }
+        let replayed = {
+            let table = write.open_table(REPLAY_EVENTS).map_err(storage)?;
+            Self::replay_events_in(&table, &draft.stream_id, Some(draft.request_id.as_str()))?
+                .into_iter()
+                .find(|event| event.draft_digest == digest)
+        };
+        if let Some(replayed) = replayed {
+            return Ok(replayed);
+        }
+        let mut head = Self::load_stream_head_in(&write, &draft.stream_id)?.ok_or_else(|| {
+            OrsError::IntegrityProblem {
+                record_type: "worker_replay_stream",
+                reason: "stream head is missing for an acquired request".to_owned(),
+            }
+        })?;
+        let sequence = head.next_sequence;
+        head.next_sequence = sequence
+            .checked_add(1)
+            .ok_or_else(|| OrsError::IntegrityProblem {
+                record_type: "worker_replay_stream",
+                reason: "sequence counter exhausted".to_owned(),
+            })?;
+        head.validate()?;
+        let stream_digest = crate::model::sha256_hex(draft.stream_id.as_bytes());
+        let stream_tag = stream_digest
+            .get(..16)
+            .ok_or_else(|| OrsError::IntegrityProblem {
+                record_type: "worker_replay_event",
+                reason: "stream digest is unexpectedly short".to_owned(),
+            })?;
+        let event = WorkerReplayEvent {
+            contract_version: crate::CONTRACT_VERSION,
+            stream_id: draft.stream_id.clone(),
+            event_id: format!("evt-{stream_tag}-{sequence:020}"),
+            sequence,
+            request_id: draft.request_id.clone(),
+            fingerprint: request.fingerprint.clone(),
+            producer_id: draft.producer_id.clone(),
+            producer_generation: draft.producer_generation,
+            authority_epoch: draft.authority_epoch,
+            fence_digest: draft.fence_digest.clone(),
+            causal_predecessor_refs: draft.causal_predecessor_refs.clone(),
+            delivery_class: draft.delivery_class,
+            ack_required: draft.ack_required,
+            payload_type: draft.payload_type.clone(),
+            payload: draft.payload.clone(),
+            disposition: draft.disposition.clone(),
+            trace_context: draft.trace_context.clone(),
+            draft_digest: digest,
+            durable_at_unix_ms: current_unix_ms_u64()?,
+        };
+        event.validate()?;
+        {
+            let mut events = write.open_table(REPLAY_EVENTS).map_err(storage)?;
+            events
+                .insert(event.record_key().as_str(), encode(&event)?.as_str())
+                .map_err(storage)?;
+            let mut streams = write.open_table(REPLAY_STREAMS).map_err(storage)?;
+            streams
+                .insert(head.stream_id.as_str(), encode(&head)?.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(event)
+    }
+
+    /// Returns the retained suffix strictly after `after_sequence` in
+    /// sequence order, preserving gaps.
+    ///
+    /// Read-only. An oversized suffix fails with
+    /// [`OrsError::ProjectionLimitExceeded`] instead of truncating silently;
+    /// a pruned prefix covering `after_sequence` fails with
+    /// [`OrsError::WorkerReplayIncomplete`] instead of returning an empty
+    /// success on incomplete storage. A caught-up consumer (nothing retained
+    /// after its cursor) honestly receives an empty suffix.
+    pub fn replay_stream(
+        &self,
+        stream_id: &str,
+        after_sequence: u64,
+    ) -> Result<Vec<WorkerReplayEvent>, OrsError> {
+        parse_replay_stream_id(stream_id)?;
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read.open_table(REPLAY_EVENTS).map_err(storage)?;
+        let events: Vec<WorkerReplayEvent> = Self::replay_events_in(&table, stream_id, None)?
+            .into_iter()
+            .filter(|event| event.sequence > after_sequence)
+            .collect();
+        let Some(first) = events.first() else {
+            return Ok(Vec::new());
+        };
+        let want =
+            after_sequence
+                .checked_add(1)
+                .ok_or_else(|| OrsError::WorkerReplayIncomplete {
+                    stream_id: stream_id.to_owned(),
+                    after_sequence,
+                })?;
+        if want < first.sequence {
+            return Err(OrsError::WorkerReplayIncomplete {
+                stream_id: stream_id.to_owned(),
+                after_sequence,
+            });
+        }
+        if events.len() > usize::from(crate::MAX_REPLAY_PAGE) {
+            return Err(OrsError::ProjectionLimitExceeded);
+        }
+        Ok(events)
+    }
+
+    /// Verifies one acknowledgement against its exact durable event,
+    /// persists the disposition, and advances only the cursor its phase
+    /// allows.
+    ///
+    /// One write transaction: claim gate, exact event binding (stream, event,
+    /// sequence, generation, epoch, fence), ack persistence, monotonic cursor
+    /// advance. UNKNOWN persists its disposition for reconciliation by the
+    /// original identity and moves no cursor.
+    pub fn acknowledge_replay_event(
+        &self,
+        ack: &WorkerReplayAck,
+    ) -> Result<WorkerReplayCursors, OrsError> {
+        ack.validate()?;
+        let mismatch = || OrsError::WorkerReplayAckMismatch {
+            stream_id: ack.stream_id.clone(),
+            sequence: ack.sequence,
+        };
+        let (claim_id, _) = parse_replay_stream_id(&ack.stream_id)?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let Some(claim) = Self::load_claim_in(&write, &claim_id)? else {
+            return Err(OrsError::WorkerReplayStaleStream {
+                stream_id: ack.stream_id.clone(),
+            });
+        };
+        require_replay_claim_binding(
+            &ack.stream_id,
+            ack.producer_generation,
+            ack.authority_epoch,
+            &ack.fence_digest,
+            &claim,
+        )?;
+        let event_key = WorkerReplayEvent::key_for(&ack.stream_id, ack.sequence);
+        let event: WorkerReplayEvent = {
+            let table = write.open_table(REPLAY_EVENTS).map_err(storage)?;
+            table
+                .get(event_key.as_str())
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+                .ok_or_else(&mismatch)?
+        };
+        if event.stream_id != ack.stream_id
+            || event.sequence != ack.sequence
+            || event.event_id != ack.event_id
+            || event.producer_generation != ack.producer_generation
+            || event.authority_epoch != ack.authority_epoch
+            || event.fence_digest != ack.fence_digest
+        {
+            return Err(mismatch());
+        }
+        let stored = WorkerReplayAckRecord {
+            stream_id: ack.stream_id.clone(),
+            event_id: ack.event_id.clone(),
+            sequence: ack.sequence,
+            phase: ack.phase,
+            acknowledged_at_unix_ms: current_unix_ms_u64()?,
+        };
+        stored.validate()?;
+        {
+            let mut acks = write.open_table(REPLAY_ACKS).map_err(storage)?;
+            acks.insert(event_key.as_str(), encode(&stored)?.as_str())
+                .map_err(storage)?;
+        }
+        let mut head = Self::load_stream_head_in(&write, &ack.stream_id)?.ok_or_else(|| {
+            OrsError::IntegrityProblem {
+                record_type: "worker_replay_stream",
+                reason: "stream head is missing for an acknowledged event".to_owned(),
+            }
+        })?;
+        if ack.phase.advances_producer_cursor() {
+            head.producer_cursor = head.producer_cursor.max(ack.sequence);
+        }
+        if ack.phase.advances_consumer_cursor() {
+            head.consumer_cursor = head.consumer_cursor.max(ack.sequence);
+        }
+        head.validate()?;
+        {
+            let mut streams = write.open_table(REPLAY_STREAMS).map_err(storage)?;
+            streams
+                .insert(head.stream_id.as_str(), encode(&head)?.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(WorkerReplayCursors {
+            stream_id: ack.stream_id.clone(),
+            producer_cursor: head.producer_cursor,
+            consumer_cursor: head.consumer_cursor,
+        })
+    }
+
+    /// Prunes the longest APPLIED-or-REJECTED event prefix of one stream,
+    /// retaining the newest [`crate::MAX_REPLAY_PAGE`] terminal events.
+    ///
+    /// Retention maintenance, not execution: no claim binding is required, so
+    /// old-generation history stays bounded too. The scan stops at the first
+    /// event without an APPLIED/REJECTED acknowledgement, so UNKNOWN (still
+    /// reconciling) events and their ack facts are never removed. Ack facts
+    /// of pruned events are removed with them. Returns the number of events
+    /// removed.
+    pub fn prune_replay_stream(&self, stream_id: &str) -> Result<u64, OrsError> {
+        parse_replay_stream_id(stream_id)?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let events = {
+            let table = write.open_table(REPLAY_EVENTS).map_err(storage)?;
+            Self::replay_events_in(&table, stream_id, None)?
+        };
+        let mut prunable: Vec<String> = Vec::new();
+        {
+            let acks = write.open_table(REPLAY_ACKS).map_err(storage)?;
+            for event in &events {
+                let key = event.record_key();
+                let terminal = match acks.get(key.as_str()).map_err(storage)? {
+                    None => false,
+                    Some(value) => {
+                        let ack: WorkerReplayAckRecord = decode(value.value())?;
+                        is_replay_terminal_phase(ack.phase)
+                    }
+                };
+                if !terminal {
+                    break;
+                }
+                prunable.push(key);
+            }
+        }
+        let drop_count = prunable
+            .len()
+            .saturating_sub(usize::from(crate::MAX_REPLAY_PAGE));
+        let mut removed: u64 = 0;
+        if drop_count > 0 {
+            let mut events_table = write.open_table(REPLAY_EVENTS).map_err(storage)?;
+            let mut acks_table = write.open_table(REPLAY_ACKS).map_err(storage)?;
+            for key in prunable.iter().take(drop_count) {
+                events_table.remove(key.as_str()).map_err(storage)?;
+                acks_table.remove(key.as_str()).map_err(storage)?;
+                removed += 1;
+            }
+        }
+        write.commit().map_err(storage)?;
+        Ok(removed)
+    }
+
+    /// Loads one replay stream head without mutating anything.
+    ///
+    /// Read-only projection for the Kernel replay transport: an unknown
+    /// stream returns `Ok(None)`; a stored head is validated before return.
+    pub fn load_replay_stream_head(
+        &self,
+        stream_id: &str,
+    ) -> Result<Option<WorkerReplayStreamRecord>, OrsError> {
+        parse_replay_stream_id(stream_id)?;
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read.open_table(REPLAY_STREAMS).map_err(storage)?;
+        table
+            .get(stream_id)
+            .map_err(storage)?
+            .map(|value| {
+                let head: WorkerReplayStreamRecord = decode(value.value())?;
+                head.validate()?;
+                if head.stream_id != stream_id {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "worker_replay_stream",
+                        reason: "stream head identity does not match its key".to_owned(),
+                    });
+                }
+                Ok(head)
+            })
+            .transpose()
+    }
+
+    /// Loads one retained replay acquisition without mutating anything.
+    ///
+    /// Read-only projection for the Kernel replay transport: an unknown
+    /// `(stream, request)` returns `Ok(None)`.
+    pub fn load_replay_request_record(
+        &self,
+        stream_id: &str,
+        request_id: &str,
+    ) -> Result<Option<WorkerReplayRequestRecord>, OrsError> {
+        parse_replay_stream_id(stream_id)?;
+        crate::model::validate_text(request_id, "worker_replay_request_id")?;
+        let read = self.database.begin_read().map_err(storage)?;
+        let key = WorkerReplayRequestRecord::key_for(stream_id, request_id);
+        let table = read.open_table(REPLAY_REQUESTS).map_err(storage)?;
+        table
+            .get(key.as_str())
+            .map_err(storage)?
+            .map(|value| {
+                let stored: WorkerReplayRequestRecord = decode(value.value())?;
+                stored.validate()?;
+                if stored.stream_id != stream_id || stored.request_id != request_id {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "worker_replay_request",
+                        reason: "request record identity does not match its key".to_owned(),
+                    });
+                }
+                Ok(stored)
+            })
+            .transpose()
     }
 
     #[cfg(feature = "test-support")]
@@ -2368,6 +4391,15 @@ impl RedbRecoveryStore {
                     .map_err(storage)?,
             );
             drop(write.open_table(STORE_REBIND_REPLAY).map_err(storage)?);
+            drop(write.open_table(UNKNOWN_COMMIT_RECOVERY).map_err(storage)?);
+            drop(write.open_table(NATIVE_WORKER_CLAIMS).map_err(storage)?);
+            drop(write.open_table(REPLAY_STREAMS).map_err(storage)?);
+            drop(write.open_table(REPLAY_REQUESTS).map_err(storage)?);
+            drop(write.open_table(REPLAY_EVENTS).map_err(storage)?);
+            drop(write.open_table(REPLAY_ACKS).map_err(storage)?);
+            drop(write.open_table(DOCTOR_ATTEMPTS).map_err(storage)?);
+            drop(write.open_table(DOCTOR_EFFECTS).map_err(storage)?);
+            drop(write.open_table(DOCTOR_BUDGETS).map_err(storage)?);
             if initialize_resolution_schema {
                 let mut meta = write.open_table(META).map_err(storage)?;
                 meta.insert(
@@ -3447,13 +5479,20 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             .ok_or(OrsError::ReservationNotFound)?;
         let operation: DurableOperationalRecord =
             decode_named(value.value(), "operational_current")?;
+        // Exact-tuple authority check (Implements #64): the receipt carries the
+        // canonical `EpochId`; the persisted `EpochLineage` contour keeps its
+        // shape and both tuple halves must agree. Equal sequences from
+        // different lineages are unrelated. The retained `u64` snapshot contour
+        // observes the canonical sequence; it never authorizes on its own.
+        let receipt_epoch = &receipt.core.authority.authority_epoch;
         let receipt_fence = crate::StateFenceSnapshot::capture(
             &receipt.core.operation.state_fence,
-            receipt.core.authority.authority_epoch.value(),
+            receipt_epoch.sequence.get(),
         )?;
         if operation.input.subject_id != operation_id
-            || operation.input.authority_epoch.current.epoch
-                != receipt.core.authority.authority_epoch.value()
+            || operation.input.authority_epoch.current.epoch != receipt_epoch.sequence.get()
+            || operation.input.authority_epoch.current.lineage_id.as_str()
+                != receipt_epoch.lineage_id.as_str()
             || operation.input.state_fence != receipt_fence
             || receipt.core.work_scope.state_fence != receipt.core.operation.state_fence
             || receipt.core.causal.state_fence != receipt.core.operation.state_fence
@@ -4022,13 +6061,26 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         {
             return Err(OrsError::ReconciliationMismatch);
         }
+        // Exact-tuple authority check (Implements #64): the receipt carries the
+        // canonical `EpochId`; the persisted `EpochLineage` contour keeps its
+        // shape and both tuple halves must agree. Equal sequences from
+        // different lineages are unrelated. The retained `u64` snapshot contour
+        // observes the canonical sequence; it never authorizes on its own.
+        let receipt_epoch = &receipt.core.authority.authority_epoch;
         let receipt_fence = crate::StateFenceSnapshot::capture(
             &receipt.core.operation.state_fence,
-            receipt.core.authority.authority_epoch.value(),
+            receipt_epoch.sequence.get(),
         )?;
         if receipt_fence != record.item.envelope.state_fence
-            || receipt.core.authority.authority_epoch.value()
-                != record.item.envelope.authority_epoch.current.epoch
+            || receipt_epoch.sequence.get() != record.item.envelope.authority_epoch.current.epoch
+            || receipt_epoch.lineage_id.as_str()
+                != record
+                    .item
+                    .envelope
+                    .authority_epoch
+                    .current
+                    .lineage_id
+                    .as_str()
             || receipt.core.work_scope.state_fence != receipt.core.operation.state_fence
             || receipt.core.causal.state_fence != receipt.core.operation.state_fence
             || receipt.core.authority.state_fence != receipt.core.operation.state_fence
@@ -4450,6 +6502,194 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         }
         write.commit().map_err(storage)
     }
+
+    fn stage_host_request(
+        &self,
+        record: &crate::HostRequestRecord,
+    ) -> Result<crate::HostRequestRecord, OrsError> {
+        RedbRecoveryStore::stage_host_request(self, record)
+    }
+
+    fn advance_host_request(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        target: crate::HostRequestState,
+        result_digest: Option<&str>,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        RedbRecoveryStore::advance_host_request(
+            self,
+            operation_id,
+            request_digest,
+            target,
+            result_digest,
+        )
+    }
+
+    fn persist_host_request_result(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        result_digest: &str,
+        result_response: &serde_json::Value,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        RedbRecoveryStore::persist_host_request_result(
+            self,
+            operation_id,
+            request_digest,
+            result_digest,
+            result_response,
+        )
+    }
+
+    fn load_host_request(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        RedbRecoveryStore::load_host_request(self, operation_id, request_digest)
+    }
+
+    fn stage_native_worker_claim(
+        &self,
+        record: &crate::NativeWorkerClaimRecord,
+    ) -> Result<crate::NativeWorkerClaimStageOutcome, OrsError> {
+        RedbRecoveryStore::stage_native_worker_claim(self, record)
+    }
+
+    fn advance_native_worker_claim(
+        &self,
+        claim_id: &crate::OperationIdentity,
+        target: crate::NativeWorkerClaimState,
+        admission: Option<&crate::NativeWorkerClaimAdmission>,
+    ) -> Result<Option<crate::NativeWorkerClaimRecord>, OrsError> {
+        RedbRecoveryStore::advance_native_worker_claim(self, claim_id, target, admission)
+    }
+
+    fn load_native_worker_claim(
+        &self,
+        claim_id: &crate::OperationIdentity,
+    ) -> Result<Option<crate::NativeWorkerClaimRecord>, OrsError> {
+        RedbRecoveryStore::load_native_worker_claim(self, claim_id)
+    }
+
+    fn lookup_replay_request(
+        &self,
+        stream_id: &str,
+        request_id: &str,
+        fingerprint: &str,
+    ) -> Result<WorkerReplayRequestDecision, OrsError> {
+        RedbRecoveryStore::lookup_replay_request(self, stream_id, request_id, fingerprint)
+    }
+
+    fn begin_replay_request(
+        &self,
+        begin: &WorkerReplayBegin,
+    ) -> Result<WorkerReplayRequestDecision, OrsError> {
+        RedbRecoveryStore::begin_replay_request(self, begin)
+    }
+
+    fn append_replay_event(
+        &self,
+        draft: &WorkerReplayDraft,
+    ) -> Result<WorkerReplayEvent, OrsError> {
+        RedbRecoveryStore::append_replay_event(self, draft)
+    }
+
+    fn replay_stream(
+        &self,
+        stream_id: &str,
+        after_sequence: u64,
+    ) -> Result<Vec<WorkerReplayEvent>, OrsError> {
+        RedbRecoveryStore::replay_stream(self, stream_id, after_sequence)
+    }
+
+    fn acknowledge_replay_event(
+        &self,
+        ack: &WorkerReplayAck,
+    ) -> Result<WorkerReplayCursors, OrsError> {
+        RedbRecoveryStore::acknowledge_replay_event(self, ack)
+    }
+
+    fn prune_replay_stream(&self, stream_id: &str) -> Result<u64, OrsError> {
+        RedbRecoveryStore::prune_replay_stream(self, stream_id)
+    }
+
+    fn load_replay_stream_head(
+        &self,
+        stream_id: &str,
+    ) -> Result<Option<WorkerReplayStreamRecord>, OrsError> {
+        RedbRecoveryStore::load_replay_stream_head(self, stream_id)
+    }
+
+    fn load_replay_request_record(
+        &self,
+        stream_id: &str,
+        request_id: &str,
+    ) -> Result<Option<WorkerReplayRequestRecord>, OrsError> {
+        RedbRecoveryStore::load_replay_request_record(self, stream_id, request_id)
+    }
+}
+
+impl crate::DoctorRecoveryLedger for RedbRecoveryStore {
+    fn stage_doctor_attempt(
+        &self,
+        record: &crate::DoctorAttemptRecord,
+    ) -> Result<crate::DoctorAttemptStageOutcome, crate::DoctorLedgerError> {
+        RedbRecoveryStore::stage_doctor_attempt(self, record)
+    }
+
+    fn load_doctor_attempt(
+        &self,
+        attempt_digest: &crate::OperationIdentity,
+    ) -> Result<Option<crate::DoctorAttemptRecord>, crate::DoctorLedgerError> {
+        RedbRecoveryStore::load_doctor_attempt(self, attempt_digest)
+    }
+
+    fn advance_doctor_attempt(
+        &self,
+        attempt_digest: &crate::OperationIdentity,
+        target: crate::DoctorAttemptState,
+        admission: Option<&crate::DoctorAttemptAdmission>,
+    ) -> Result<Option<crate::DoctorAttemptRecord>, crate::DoctorLedgerError> {
+        RedbRecoveryStore::advance_doctor_attempt(self, attempt_digest, target, admission)
+    }
+
+    fn stage_doctor_effect(
+        &self,
+        record: &crate::DoctorEffectRecord,
+    ) -> Result<crate::DoctorEffectStageOutcome, crate::DoctorLedgerError> {
+        RedbRecoveryStore::stage_doctor_effect(self, record)
+    }
+
+    fn load_doctor_effect(
+        &self,
+        effect_digest: &crate::OperationIdentity,
+    ) -> Result<Option<crate::DoctorEffectRecord>, crate::DoctorLedgerError> {
+        RedbRecoveryStore::load_doctor_effect(self, effect_digest)
+    }
+
+    fn record_doctor_effect_outcome(
+        &self,
+        effect_digest: &crate::OperationIdentity,
+        report: &crate::DoctorEffectOutcomeReport,
+    ) -> Result<Option<crate::DoctorEffectRecord>, crate::DoctorLedgerError> {
+        RedbRecoveryStore::record_doctor_effect_outcome(self, effect_digest, report)
+    }
+
+    fn load_doctor_budget(
+        &self,
+        scope_key: &crate::OpaqueLabel,
+    ) -> Result<Option<crate::DoctorBudgetLedger>, crate::DoctorLedgerError> {
+        RedbRecoveryStore::load_doctor_budget(self, scope_key)
+    }
+
+    fn store_doctor_budget(
+        &self,
+        ledger: &crate::DoctorBudgetLedger,
+    ) -> Result<(), crate::DoctorLedgerError> {
+        RedbRecoveryStore::store_doctor_budget(self, ledger)
+    }
 }
 
 /// Single coordinator facade. It owns no semantic policy and delegates one durable transition.
@@ -4555,6 +6795,150 @@ impl<S: OperationalRecoveryStore> OrsCoordinator<S> {
     ) -> Result<ReservationRecord, OrsError> {
         self.store.release(token, writer_epoch)
     }
+
+    /// Stages one P-04 host-request operation before any acknowledgement.
+    pub fn stage_host_request(
+        &self,
+        record: &HostRequestRecord,
+    ) -> Result<HostRequestRecord, OrsError> {
+        self.store.stage_host_request(record)
+    }
+
+    /// Advances one staged host-request operation to its next mechanical state.
+    pub fn advance_host_request(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        target: HostRequestState,
+        result_digest: Option<&str>,
+    ) -> Result<Option<HostRequestRecord>, OrsError> {
+        self.store
+            .advance_host_request(operation_id, request_digest, target, result_digest)
+    }
+
+    /// Persists one bounded local-read result body alongside its digest.
+    pub fn persist_host_request_result(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        result_digest: &str,
+        result_response: &serde_json::Value,
+    ) -> Result<Option<HostRequestRecord>, OrsError> {
+        self.store.persist_host_request_result(
+            operation_id,
+            request_digest,
+            result_digest,
+            result_response,
+        )
+    }
+
+    /// Loads one host-request operation by exact operation/request identity.
+    pub fn load_host_request(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+    ) -> Result<Option<HostRequestRecord>, OrsError> {
+        self.store.load_host_request(operation_id, request_digest)
+    }
+
+    /// Stages one native-worker claim intent before any acknowledgement.
+    pub fn stage_native_worker_claim(
+        &self,
+        record: &NativeWorkerClaimRecord,
+    ) -> Result<NativeWorkerClaimStageOutcome, OrsError> {
+        self.store.stage_native_worker_claim(record)
+    }
+
+    /// Advances one staged claim to its next mechanical state.
+    pub fn advance_native_worker_claim(
+        &self,
+        claim_id: &crate::OperationIdentity,
+        target: NativeWorkerClaimState,
+        admission: Option<&NativeWorkerClaimAdmission>,
+    ) -> Result<Option<NativeWorkerClaimRecord>, OrsError> {
+        self.store
+            .advance_native_worker_claim(claim_id, target, admission)
+    }
+
+    /// Loads one claim by exact claim identity.
+    pub fn load_native_worker_claim(
+        &self,
+        claim_id: &crate::OperationIdentity,
+    ) -> Result<Option<crate::NativeWorkerClaimRecord>, OrsError> {
+        self.store.load_native_worker_claim(claim_id)
+    }
+
+    /// Looks up one durable replay request without acquiring anything.
+    pub fn lookup_replay_request(
+        &self,
+        stream_id: &str,
+        request_id: &str,
+        fingerprint: &str,
+    ) -> Result<WorkerReplayRequestDecision, OrsError> {
+        self.store
+            .lookup_replay_request(stream_id, request_id, fingerprint)
+    }
+
+    /// Atomically acquires one durable replay request or reports its durable
+    /// outcome.
+    pub fn begin_replay_request(
+        &self,
+        begin: &WorkerReplayBegin,
+    ) -> Result<WorkerReplayRequestDecision, OrsError> {
+        self.store.begin_replay_request(begin)
+    }
+
+    /// Persists one replay draft under its exact stream with a durable
+    /// identity and sequence.
+    pub fn append_replay_event(
+        &self,
+        draft: &WorkerReplayDraft,
+    ) -> Result<WorkerReplayEvent, OrsError> {
+        self.store.append_replay_event(draft)
+    }
+
+    /// Returns the retained suffix strictly after `after_sequence` in
+    /// sequence order, preserving gaps.
+    pub fn replay_stream(
+        &self,
+        stream_id: &str,
+        after_sequence: u64,
+    ) -> Result<Vec<WorkerReplayEvent>, OrsError> {
+        self.store.replay_stream(stream_id, after_sequence)
+    }
+
+    /// Verifies one acknowledgement against its exact durable event,
+    /// persists the disposition, and advances only the cursor its phase
+    /// allows.
+    pub fn acknowledge_replay_event(
+        &self,
+        ack: &WorkerReplayAck,
+    ) -> Result<WorkerReplayCursors, OrsError> {
+        self.store.acknowledge_replay_event(ack)
+    }
+
+    /// Prunes the longest APPLIED-or-REJECTED event prefix of one stream,
+    /// retaining the newest [`crate::MAX_REPLAY_PAGE`] terminal events.
+    pub fn prune_replay_stream(&self, stream_id: &str) -> Result<u64, OrsError> {
+        self.store.prune_replay_stream(stream_id)
+    }
+
+    /// Loads one replay stream head without mutating anything.
+    pub fn load_replay_stream_head(
+        &self,
+        stream_id: &str,
+    ) -> Result<Option<WorkerReplayStreamRecord>, OrsError> {
+        self.store.load_replay_stream_head(stream_id)
+    }
+
+    /// Loads one retained replay acquisition without mutating anything.
+    pub fn load_replay_request_record(
+        &self,
+        stream_id: &str,
+        request_id: &str,
+    ) -> Result<Option<WorkerReplayRequestRecord>, OrsError> {
+        self.store.load_replay_request_record(stream_id, request_id)
+    }
 }
 
 fn request_matches(
@@ -4616,9 +7000,11 @@ fn reconciliation_matches(
     {
         return Err(OrsError::ReconciliationMismatch);
     }
+    // The retained `u64` snapshot contour observes the receipt's canonical
+    // `EpochId` sequence (Implements #64); it never authorizes on its own.
     let receipt_fence = crate::StateFenceSnapshot::capture(
         &receipt.core.operation.state_fence,
-        receipt.core.authority.authority_epoch.value(),
+        receipt.core.authority.authority_epoch.sequence.get(),
     )?;
     if receipt_fence != token.state_fence
         || receipt.core.work_scope.state_fence != receipt.core.operation.state_fence
@@ -4675,7 +7061,19 @@ fn storage(error: impl std::fmt::Display) -> OrsError {
 mod process_start_abort_tests {
     use super::*;
     use crate::OperationIdentity;
+    use eliot_contracts::{EpochId, EpochLineageId};
     use serde_json::json;
+
+    // Canonical `EpochId` fixture (Implements #64): lineage-aware exact tuple.
+    const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn test_epoch(sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(TEST_LINEAGE_A).expect("valid test lineage"),
+            std::num::NonZeroU64::new(sequence).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
 
     fn process_start_receipt(
         operation_id: &str,
@@ -4691,9 +7089,15 @@ mod process_start_abort_tests {
                 "generation": 1,
                 "action_lease_ref": "lease-1",
                 "authority_id": "authority-1",
-                "authority_epoch": 1,
+                "authority_epoch": {
+                    "lineage_id": TEST_LINEAGE_A,
+                    "sequence": 1
+                },
                 "state_fence": {
-                    "authority_epoch": 1,
+                    "authority_epoch": {
+                        "lineage_id": TEST_LINEAGE_A,
+                        "sequence": 1
+                    },
                     "generation": 1,
                     "nonce": "fence-1"
                 },
@@ -4742,7 +7146,7 @@ mod process_start_abort_tests {
         let owner = eliot_process::ProcessOwnerBinding::new(
             "testd",
             "a".repeat(64),
-            1,
+            test_epoch(1),
             eliot_process::Generation::new(1).map_err(|error| OrsError::IntegrityProblem {
                 record_type: "test",
                 reason: error.to_string(),
@@ -4765,7 +7169,7 @@ mod process_start_abort_tests {
         let wrong_owner = eliot_process::ProcessOwnerBinding::new(
             "testd",
             "b".repeat(64),
-            1,
+            test_epoch(1),
             eliot_process::Generation::new(1).map_err(|error| OrsError::IntegrityProblem {
                 record_type: "test",
                 reason: error.to_string(),
@@ -4865,6 +7269,289 @@ mod process_start_abort_tests {
                 .state,
             ProcessStartReplayState::Unknown
         );
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    reason = "test fixtures use expect for fail-fast setup"
+)]
+mod host_request_result_tests {
+    use super::*;
+    use crate::{HostRequestKind, HostRequestState, OpaqueLabel, OperationIdentity};
+    use eliot_contracts::{EpochId, EpochLineageId};
+    use serde_json::json;
+
+    const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn test_epoch() -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(TEST_LINEAGE).expect("valid test lineage"),
+            std::num::NonZeroU64::new(1).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
+
+    fn requested_fixture(operation: &str, digest: &str) -> crate::HostRequestRecord {
+        let label = |value: &str| OpaqueLabel::new(value.to_owned()).expect("valid test label");
+        crate::HostRequestRecord {
+            contract_version: crate::CONTRACT_VERSION,
+            operation_id: OperationIdentity::new(operation.to_owned()).expect("valid operation"),
+            kind: HostRequestKind::Invocation,
+            request_id: label("req-1"),
+            idempotency_key: label("req-1:invoke"),
+            cancellation_id: label("req-1:invoke:cancel"),
+            parent_operation_id: None,
+            request_digest: digest.to_owned(),
+            payload_digest: "b".repeat(64),
+            connection_ref: label("conn-1"),
+            session_ref: Some(label("session-1")),
+            task_ref: None,
+            scope_ref: None,
+            capability_ref: label("eliot.query"),
+            fence_digest: "c".repeat(64),
+            authority_epoch: test_epoch(),
+            generation: 1,
+            deadline_unix_ms: 9_999_999,
+            state: HostRequestState::Requested,
+            result_digest: None,
+            result_response: None,
+            commit_order: 0,
+        }
+    }
+
+    fn temp_store() -> (RedbRecoveryStore, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "eliot-host-request-result-{}-{}.redb",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos())
+        ));
+        let store = RedbRecoveryStore::open(&path).expect("temp store opens");
+        (store, path)
+    }
+
+    #[test]
+    fn persist_result_is_exact_replay_and_rejects_changed_body() -> Result<(), OrsError> {
+        let (store, path) = temp_store();
+        let digest = "d".repeat(64);
+        let operation =
+            OperationIdentity::new(format!("hostreq:{digest}")).expect("valid operation");
+        let staged = store.stage_host_request(&requested_fixture(operation.as_str(), &digest))?;
+        assert_eq!(staged.state, HostRequestState::Requested);
+        let admitted = store
+            .advance_host_request(&operation, &digest, HostRequestState::Admitted, None)?
+            .expect("admitted record must load");
+        assert_eq!(admitted.state, HostRequestState::Admitted);
+
+        // A `Requested` operation must never receive a result before admission.
+        let (early_store, early_path) = temp_store();
+        let early_digest = "e".repeat(64);
+        let early_op =
+            OperationIdentity::new(format!("hostreq:{early_digest}")).expect("valid operation");
+        early_store
+            .stage_host_request(&requested_fixture(early_op.as_str(), &early_digest))?;
+        assert!(matches!(
+            early_store.persist_host_request_result(
+                &early_op,
+                &early_digest,
+                &"f".repeat(64),
+                &json!({"response": "early"}),
+            ),
+            Err(OrsError::InvalidTransition)
+        ));
+        let _ = std::fs::remove_file(early_path);
+
+        let body = json!({
+            "request_id": "req-1",
+            "idempotency_key": "req-1:invoke",
+            "canonical_tool_name": "eliot.query",
+            "content": {
+                "operation": "GetEvidencePack",
+                "evidence_pack": {"subject": "evidence-alpha"},
+                "revision_heads": [{"key": "scope:scope-1", "revision": 3}],
+            },
+        });
+        let result_digest = crate::model::sha256_hex(
+            &serde_json::to_vec(&body).expect("test body must serialize"),
+        );
+        let received = store
+            .persist_host_request_result(&operation, &digest, &result_digest, &body)?
+            .expect("resulted record must load");
+        assert_eq!(received.state, HostRequestState::ResultReceived);
+        assert_eq!(
+            received.result_digest.as_deref(),
+            Some(result_digest.as_str())
+        );
+        assert_eq!(received.result_response.as_ref(), Some(&body));
+        assert_ne!(received.commit_order, 0, "terminal result must order");
+
+        // Exact replay returns the durable row unchanged: no duplicate dispatch.
+        let replay = store
+            .persist_host_request_result(&operation, &digest, &result_digest, &body)?
+            .expect("replay must load");
+        assert_eq!(replay, received);
+
+        // A changed payload digest or a forged body under the same identity is
+        // rejected before any readback and never overwrites the durable row.
+        assert!(matches!(
+            store.persist_host_request_result(&operation, &digest, &"0".repeat(64), &body,),
+            Err(OrsError::HostRequestIdentityConflict { .. })
+        ));
+        assert!(matches!(
+            store.persist_host_request_result(
+                &operation,
+                &digest,
+                &result_digest,
+                &json!({"forged": true}),
+            ),
+            Err(OrsError::HostRequestIdentityConflict { .. })
+        ));
+        let kept = store
+            .load_host_request(&operation, &digest)?
+            .expect("durable row must survive conflicts");
+        assert_eq!(kept, received);
+
+        // The old digest-only advance still requires a digest for received.
+        assert!(matches!(
+            store.advance_host_request(
+                &operation,
+                &digest,
+                HostRequestState::Terminal,
+                Some("1".repeat(64).as_str()),
+            ),
+            Err(OrsError::HostRequestIdentityConflict { .. })
+        ));
+
+        drop(store);
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_digest_only_row_completes_with_exact_body() -> Result<(), OrsError> {
+        let (store, path) = temp_store();
+        let digest = "d".repeat(64);
+        let operation =
+            OperationIdentity::new(format!("hostreq:{digest}")).expect("valid operation");
+        store.stage_host_request(&requested_fixture(operation.as_str(), &digest))?;
+        for target in [
+            HostRequestState::Admitted,
+            HostRequestState::Routed,
+            HostRequestState::Submitted,
+        ] {
+            store
+                .advance_host_request(&operation, &digest, target, None)?
+                .expect("walk must advance");
+        }
+        let result_digest = "f".repeat(64);
+        let legacy = store
+            .advance_host_request(
+                &operation,
+                &digest,
+                HostRequestState::ResultReceived,
+                Some(result_digest.as_str()),
+            )?
+            .expect("legacy row must store");
+        assert_eq!(legacy.state, HostRequestState::ResultReceived);
+        assert!(legacy.result_response.is_none());
+        // The legacy row still loads (compatibility, never served as a body).
+        let loaded = store
+            .load_host_request(&operation, &digest)?
+            .expect("legacy row must load");
+        assert_eq!(loaded, legacy);
+
+        // Completing it with the exact same digest binds the missing body;
+        // anything else stays a conflict.
+        let body = json!({"completed": "legacy-body"});
+        let completed = store
+            .persist_host_request_result(&operation, &digest, &result_digest, &body)?
+            .expect("exact-digest completion must store");
+        assert_eq!(completed.result_digest.as_deref(), Some(result_digest.as_str()));
+        assert_eq!(completed.result_response.as_ref(), Some(&body));
+        assert!(matches!(
+            store.persist_host_request_result(&operation, &digest, &"0".repeat(64), &body,),
+            Err(OrsError::HostRequestIdentityConflict { .. })
+        ));
+
+        drop(store);
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod unknown_commit_recovery_tests {
+    use super::*;
+    use crate::{UnknownCommitOutcome, UnknownCommitRecord};
+
+    fn open_record(key: &str, operation: &str, scopes: &[&str]) -> UnknownCommitRecord {
+        UnknownCommitRecord {
+            idempotency_key: key.to_owned(),
+            operation_id: crate::OperationIdentity::new(operation).expect("operation"),
+            canonical_request_hash: "a".repeat(64),
+            ordering_scopes: scopes.iter().map(|scope| (*scope).to_owned()).collect(),
+            outcome: None,
+            evidence_receipt_digest: None,
+        }
+    }
+
+    #[test]
+    fn unknown_commit_round_trip_conflict_and_resolve() -> Result<(), OrsError> {
+        let path = std::env::temp_dir().join(format!(
+            "eliot-unknown-commit-{}-{}.redb",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos())
+        ));
+        let store = RedbRecoveryStore::open(&path)?;
+        let record = open_record("key-1", "op-1", &["scope-a"]);
+        assert!(store.stage_unknown_commit(&record)?.is_none());
+        // Exact replay returns the stored record unchanged.
+        let replayed = store
+            .stage_unknown_commit(&record)?
+            .expect("replay returns the record");
+        assert_eq!(replayed, record);
+        // Changed binding under the same key conflicts.
+        let mut conflicting = record.clone();
+        conflicting.canonical_request_hash = "b".repeat(64);
+        assert!(matches!(
+            store.stage_unknown_commit(&conflicting),
+            Err(OrsError::IntegrityProblem { .. })
+        ));
+        // The open set carries the record; resolution binds evidence once.
+        assert_eq!(store.list_open_unknown_commits()?.len(), 1);
+        let resolved = store
+            .resolve_unknown_commit("key-1", UnknownCommitOutcome::Committed, &"c".repeat(64))?
+            .expect("resolution stores");
+        assert_eq!(resolved.outcome, Some(UnknownCommitOutcome::Committed));
+        assert!(store.list_open_unknown_commits()?.is_empty());
+        // A resolved record never reopens.
+        assert!(matches!(
+            store.resolve_unknown_commit(
+                "key-1",
+                UnknownCommitOutcome::RolledBack,
+                &"d".repeat(64)
+            ),
+            Err(OrsError::InvalidField { .. })
+        ));
+        // Unknown keys resolve to None without inventing records.
+        assert!(
+            store
+                .resolve_unknown_commit(
+                    "key-missing",
+                    UnknownCommitOutcome::Committed,
+                    &"e".repeat(64)
+                )?
+                .is_none()
+        );
+        drop(store);
         let _ = std::fs::remove_file(path);
         Ok(())
     }

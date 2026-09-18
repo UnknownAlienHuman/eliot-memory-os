@@ -21,7 +21,7 @@ WHERE project_id = $project_id
   AND (
     trace_ref = <string> $trace_ref
     OR (
-      (trace_ref = NONE OR trace_ref = NULL OR trace_ref = '')
+      (trace_ref ?? '') = ''
       AND <string> receipt_body.trace_ref = <string> $trace_ref
     )
   )

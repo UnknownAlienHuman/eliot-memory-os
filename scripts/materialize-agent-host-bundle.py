@@ -16,6 +16,11 @@ def main() -> int:
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--manifest", type=Path, default=MANIFEST_PATH)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--expect-bundle-identity",
+        default=None,
+        help="Fail closed unless the computed bundle identity digest matches this value.",
+    )
     arguments = parser.parse_args()
 
     try:
@@ -27,6 +32,12 @@ def main() -> int:
         )
     except BundleError as error:
         print(f"AGENT_HOST_BUNDLE_ERROR: {error}", file=sys.stderr)
+        return 2
+    if arguments.expect_bundle_identity is not None and receipt.get("bundle_identity") != arguments.expect_bundle_identity:
+        print(
+            f"AGENT_HOST_BUNDLE_ERROR: bundle identity mismatch for {arguments.host}",
+            file=sys.stderr,
+        )
         return 2
     print(json.dumps(receipt, ensure_ascii=False, sort_keys=True, indent=2))
     return 0

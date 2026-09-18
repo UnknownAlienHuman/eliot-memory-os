@@ -9,7 +9,9 @@
 use std::fmt;
 use std::str::FromStr;
 
-use eliot_contracts::{AuthorityEpoch, ResourceGeneration};
+use eliot_contracts::{
+    AuthorityEpoch, EpochId, EpochRelation, ResourceGeneration, epoch_identity_digest,
+};
 use eliot_process::Generation;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -264,10 +266,65 @@ impl EpochActivation {
     }
 }
 
+/// Returns `true` only for exact canonical tuple equality.
+///
+/// This is the lineage-aware counterpart to the scalar epoch equality check:
+/// equal sequences from different lineages are unrelated and return `false`.
+#[must_use]
+pub fn authorizes_canonical(fence_epoch: &EpochId, active: &EpochId) -> bool {
+    fence_epoch.is_same_authority(active)
+}
+
+/// Returns `true` when a canonical fence is fenced relative to the active epoch.
+///
+/// Same-lineage older fences are stale; cross-lineage fences are unrelated and
+/// therefore also fenced (fail-closed). Same-tuple and same-lineage newer
+/// fences are not stale — a newer fence is a future mismatch, not a stale one.
+#[must_use]
+pub fn is_stale_canonical(fence_epoch: &EpochId, active: &EpochId) -> bool {
+    match fence_epoch.relation_to(active) {
+        EpochRelation::Same | EpochRelation::DirectParent | EpochRelation::SameLineageNewer => {
+            false
+        }
+        EpochRelation::DirectChild
+        | EpochRelation::SameLineageOlder
+        | EpochRelation::UnrelatedLineage => true,
+    }
+}
+
+/// Returns `true` only for an exact one-step child in one lineage.
+///
+/// Cross-lineage inputs and skipped sequences return `false` without ordering
+/// epochs across lineages.
+#[must_use]
+pub fn is_direct_child_canonical(child: &EpochId, parent: &EpochId) -> bool {
+    child.is_direct_child_of(parent)
+}
+
+/// Computes the canonical digest binding both lineage and sequence.
+///
+/// The digest input includes the contract domain separator, the lineage UUID,
+/// and the sequence, so a lineage change with the same sequence yields a
+/// different digest.
+///
+/// # Errors
+///
+/// Returns [`KernelError::InvalidField`] when canonical digest serialization
+/// fails.
+pub fn canonical_epoch_digest(epoch: &EpochId) -> Result<String, KernelError> {
+    epoch_identity_digest(epoch)
+        .map(|digest| digest.as_str().to_owned())
+        .map_err(|_| KernelError::InvalidField {
+            field: "epoch_id",
+            reason: "canonical digest serialization failed",
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eliot_contracts::AuthorityEpoch;
+    use eliot_contracts::{AuthorityEpoch, EpochLineageId};
+    use std::num::NonZeroU64;
 
     fn fence(epoch: u64, route: &str) -> Result<RouteFence, KernelError> {
         RouteFence::new(
@@ -361,6 +418,62 @@ mod tests {
             )
             .is_err()
         );
+        Ok(())
+    }
+
+    fn canonical_epoch(lineage: &str, sequence: u64) -> Result<EpochId, KernelError> {
+        let lineage_id = EpochLineageId::new(lineage).map_err(|_| KernelError::InvalidField {
+            field: "lineage_id",
+            reason: "must be a canonical UUID lineage",
+        })?;
+        let sequence = NonZeroU64::new(sequence).ok_or(KernelError::InvalidField {
+            field: "sequence",
+            reason: "must be greater than zero",
+        })?;
+        EpochId::new(lineage_id, sequence).map_err(|_| KernelError::InvalidField {
+            field: "epoch_id",
+            reason: "invalid canonical epoch",
+        })
+    }
+
+    #[test]
+    fn canonical_tuple_authorizes_only_exact_match() -> Result<(), KernelError> {
+        let active = canonical_epoch("550e8400-e29b-41d4-a716-446655440000", 4)?;
+        let same = canonical_epoch("550e8400-e29b-41d4-a716-446655440000", 4)?;
+        let cross_lineage_same_sequence =
+            canonical_epoch("6ba7b810-9dad-11d1-80b4-00c04fd430c8", 4)?;
+        let same_lineage_older = canonical_epoch("550e8400-e29b-41d4-a716-446655440000", 3)?;
+        assert!(authorizes_canonical(&same, &active));
+        assert!(!authorizes_canonical(&cross_lineage_same_sequence, &active));
+        assert!(!authorizes_canonical(&same_lineage_older, &active));
+        // Cross-lineage and older fences are fenced; the exact tuple is not.
+        assert!(!is_stale_canonical(&same, &active));
+        assert!(is_stale_canonical(&cross_lineage_same_sequence, &active));
+        assert!(is_stale_canonical(&same_lineage_older, &active));
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_direct_child_requires_same_lineage_single_step() -> Result<(), KernelError> {
+        let parent = canonical_epoch("550e8400-e29b-41d4-a716-446655440000", 4)?;
+        let child = canonical_epoch("550e8400-e29b-41d4-a716-446655440000", 5)?;
+        let skipped = canonical_epoch("550e8400-e29b-41d4-a716-446655440000", 6)?;
+        let cross_lineage = canonical_epoch("6ba7b810-9dad-11d1-80b4-00c04fd430c8", 5)?;
+        assert!(is_direct_child_canonical(&child, &parent));
+        assert!(!is_direct_child_canonical(&skipped, &parent));
+        assert!(!is_direct_child_canonical(&cross_lineage, &parent));
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_digest_binds_lineage() -> Result<(), KernelError> {
+        let left = canonical_epoch("550e8400-e29b-41d4-a716-446655440000", 4)?;
+        let cross_lineage = canonical_epoch("6ba7b810-9dad-11d1-80b4-00c04fd430c8", 4)?;
+        let next_sequence = canonical_epoch("550e8400-e29b-41d4-a716-446655440000", 5)?;
+        let left_digest = canonical_epoch_digest(&left)?;
+        assert_eq!(left_digest, canonical_epoch_digest(&left)?);
+        assert_ne!(left_digest, canonical_epoch_digest(&cross_lineage)?);
+        assert_ne!(left_digest, canonical_epoch_digest(&next_sequence)?);
         Ok(())
     }
 }

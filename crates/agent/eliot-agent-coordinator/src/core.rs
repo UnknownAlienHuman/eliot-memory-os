@@ -1,13 +1,19 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_agent_api::{
-    AttemptId, ContractError, EffectCeiling, EffectKind, ResultDisposition, WorkLeaseId,
+    AgentAttempt, AttemptId, AttemptState, AuthorityEnvelope, CancellationState,
+    CandidateSelectionDisposition, ContinuityKind, ContractError, EffectCeiling, EffectKind,
+    HostEventNormalizationReceipt, HostEventQuarantineReason, HostEventReplayDisposition,
+    NormalizedHostEventEnvelope, ProviderExecutionBinding, ProviderObservationLineage,
+    RejectedRouteCandidate, ResultDisposition, RouteSelectionCandidate, WorkLeaseId,
+    candidate_digest_for, validate_execution_binding,
 };
 use eliot_agent_contracts::{
     AgentAttemptId, CoordinationEntry, CoordinationMapView, DescendantTerminalState,
     LivePeerMessage, LivePeerMessageState, MessageId, ParentFinishCeiling, RevisionId, WorkItemId,
     contract_shape_digest,
 };
+use eliot_contracts::PolicyRevision;
 use eliot_receipts::ProofCeiling;
 use serde::Serialize;
 
@@ -19,12 +25,13 @@ use crate::model::{
     DeliveryBoundaryReceipt, DescendantClosureCandidateReceipt, DescendantClosureSubmission,
     ExecutionContext, LostWorkerReceipt, OperationId, OutcomeReconciliationId, PeerMessageReceipt,
     PlanGap, ProviderAdmissionReceipt, ProviderBindingSnapshot, ProviderCancellationReconciliation,
-    ProviderIdentity, ProviderReassignmentReceipt, ProviderUnknownOutcomeReconciliation,
-    ProviderWorkerFenceReceipt, ReassignmentId, ReassignmentReceipt, RejectedRoute,
-    ResultSubmission, RoleProfileManifest, RouteCandidateEvidence, RouteRejectionReason,
-    RoutingReceipt, StaffingLaneCandidate, StaffingPlanCandidate, StaffingPlanRequest,
-    SubmissionId, UnknownOutcomeFinalReceipt, WorkerId, validate_text,
+    ProviderExecutionBindingSubmission, ProviderIdentity, ProviderReassignmentReceipt,
+    ProviderUnknownOutcomeReconciliation, ProviderWorkerFenceReceipt, ReassignmentId,
+    ReassignmentReceipt, ResultSubmission, RoleProfileManifest, RouteCandidateEvidence,
+    StaffingLaneCandidate, StaffingPlanCandidate, StaffingPlanRequest, SubmissionId,
+    UnknownOutcomeFinalReceipt, WorkerId, validate_text,
 };
+use crate::provider_admission::{AdmittedProviderCapability, KernelProviderVerifier};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum ProviderProofKind {
@@ -34,12 +41,21 @@ pub(crate) enum ProviderProofKind {
     Reassignment,
     Result,
     UnknownOutcome,
+    /// Authenticates the exact start correlation of one provider execution
+    /// unit before it is bound to an admitted attempt (issue #361 S2). This
+    /// is a sealed extension of the same verifier path: no public trait, no
+    /// caller-implementable or always-verified verifier. The plan-only
+    /// constructor still installs only the typed `PLAN_GAP` verifier; closed
+    /// production binding arrives only through `new_with_admitted_provider`
+    /// on daemon-supplied Kernel capability data.
+    Binding,
 }
 
 /// Sealed inside this crate so callers cannot implement an "always verified"
-/// provider. A future accepted A-01/G-11 adapter must be added here and bind
-/// its own authenticated receipts. Until then the public constructor installs
-/// only a typed `PLAN_GAP` verifier.
+/// provider. The closed production adapter (`provider_admission`) is added
+/// here and binds daemon-supplied Kernel capability data to its own
+/// authenticated receipts. The plan-only constructor still installs only a
+/// typed `PLAN_GAP` verifier.
 pub(crate) trait ProviderVerifier: Send + Sync {
     fn binding(&self) -> ProviderBindingSnapshot;
     fn minimum_event_sequence(&self) -> u64;
@@ -89,6 +105,19 @@ struct IdempotentRecord<T> {
     receipt: T,
 }
 
+/// Accepted v7 host-event observation entry (issue #371 S7). The canonical
+/// input binds the exact envelope plus presented-receipt bytes for durable
+/// replay; the stored envelope supports the typed
+/// [`NormalizedHostEventEnvelope::check_replay_against`] quarantine
+/// classification. Attempt scope, sequence, and output digest remain readable
+/// from the stored envelope plus [`ObservedHostEventSummary`] at insert time;
+/// per-attempt ordering lives in `last_host_sequence`.
+#[derive(Clone, Debug)]
+struct ObservedHostEventEntry {
+    canonical_input: String,
+    event: NormalizedHostEventEnvelope,
+}
+
 #[derive(Clone, Debug)]
 struct RouteCapacityRequest {
     requested: usize,
@@ -113,6 +142,17 @@ pub struct AgentCoordinator {
     reassignments: BTreeMap<ReassignmentId, IdempotentRecord<ReassignmentReceipt>>,
     submissions: BTreeMap<SubmissionId, IdempotentRecord<CandidateResultReceipt>>,
     result_by_attempt: BTreeMap<AttemptId, SubmissionId>,
+    bindings: BTreeMap<AttemptId, IdempotentRecord<ProviderExecutionBinding>>,
+    /// Accepted v7 provider host events by event identity (issue #371 S7).
+    /// The canonical input binds the exact envelope plus receipt bytes: an
+    /// identical replay is idempotent without duplicate effects, while a
+    /// conflicting same-identity replay is quarantined with its typed
+    /// [`HostEventQuarantineReason`] (never a generic conflict, never an
+    /// advance of the wrong attempt).
+    observed_host_events: BTreeMap<String, ObservedHostEventEntry>,
+    /// Last accepted host-event sequence per attempt. A new identity with a
+    /// nonmonotonic sequence rejects; a forward jump records an explicit gap.
+    last_host_sequence: BTreeMap<AttemptId, u64>,
     outcome_reconciliations:
         BTreeMap<OutcomeReconciliationId, IdempotentRecord<UnknownOutcomeFinalReceipt>>,
     descendant_closures: BTreeMap<AttemptId, IdempotentRecord<DescendantClosureCandidateReceipt>>,
@@ -127,6 +167,22 @@ impl AgentCoordinator {
     pub fn new(config: CoordinatorConfig, gap: PlanGap) -> Result<Self, CoordinatorError> {
         gap.validate()?;
         Self::with_provider(config, Box::new(GapProvider { gap }))
+    }
+
+    /// Creates a closed production coordinator on daemon-supplied Kernel
+    /// admission (T9-05, issue #1108).
+    ///
+    /// The `capability` is plain validated data extracted by the daemon
+    /// caller from its authenticated Kernel session (durable ORS claim row
+    /// plus observed Governor currentness): the coordinator performs no I/O
+    /// and launches nothing. Every proof re-runs the T9-04 pure Kernel
+    /// verifier, so stale, revoked, foreign, or conflicting evidence fails
+    /// closed exactly like the plan-only gap, but with live Kernel backing.
+    pub fn new_with_admitted_provider(
+        config: CoordinatorConfig,
+        capability: AdmittedProviderCapability,
+    ) -> Result<Self, CoordinatorError> {
+        Self::with_provider(config, Box::new(KernelProviderVerifier::new(capability)))
     }
 
     pub(crate) fn with_provider(
@@ -155,6 +211,9 @@ impl AgentCoordinator {
             reassignments: BTreeMap::new(),
             submissions: BTreeMap::new(),
             result_by_attempt: BTreeMap::new(),
+            bindings: BTreeMap::new(),
+            observed_host_events: BTreeMap::new(),
+            last_host_sequence: BTreeMap::new(),
             outcome_reconciliations: BTreeMap::new(),
             descendant_closures: BTreeMap::new(),
             peer_messages: BTreeMap::new(),
@@ -178,6 +237,21 @@ impl AgentCoordinator {
         validate_state_fence(&request.state_fence)?;
         validate_recipe(&request)?;
         self.validate_launch_effect_ceiling(&request.launch)?;
+
+        // I14.1 work class (issue #1698) is validated by construction:
+        // `StaffingPlanRequest.work_class` and every lane class are the
+        // closed `WorkClass` boundary type, so `Deserialize` already
+        // rejected any unknown spelling at decode ingress through
+        // `WorkClass::parse_wire` and no unvalidated `String` can reach
+        // here. The only remaining check is the single-class binding: every
+        // lane must carry the plan class so one definition, reservation and
+        // admission bind exactly one class. This runs before any capacity
+        // accounting and consumes no capacity on rejection.
+        for lane in &request.lanes {
+            if lane.work_class != request.work_class {
+                return Err(CoordinatorError::IdentityConflict("work_class"));
+            }
+        }
 
         if request.lanes.is_empty() {
             return Err(CoordinatorError::InvalidField("lanes"));
@@ -288,11 +362,24 @@ impl AgentCoordinator {
             }
             let routing =
                 select_route(&self.config, &request, role, lane.route_candidates.clone())?;
+            let selected_route = routing
+                .selected
+                .clone()
+                .ok_or(CoordinatorError::RouteEvidence)?;
+            let selected_evidence = lane
+                .route_candidates
+                .iter()
+                .find(|evidence| evidence.route == selected_route)
+                .ok_or(CoordinatorError::RouteEvidence)?;
             lanes.push(StaffingLaneCandidate {
                 work_unit_id: lane.work_unit_id.clone(),
                 role_id: lane.role_id.clone(),
                 role_revision: role.manifest_revision.clone(),
+                work_class: lane.work_class,
                 routing,
+                capacity_identity: selected_evidence.capacity_identity.clone(),
+                capacity_revision: selected_evidence.capacity_revision.clone(),
+                capacity_limit: selected_evidence.capacity_limit,
                 budget: lane.budget.clone(),
                 priority: lane.priority,
                 mutation_scope: lane.mutation_scope.clone(),
@@ -306,8 +393,7 @@ impl AgentCoordinator {
                 .then_with(|| left.work_unit_id.cmp(&right.work_unit_id))
                 .then_with(|| left.role_id.cmp(&right.role_id))
                 .then_with(|| {
-                    route_key(&left.routing.selected_route)
-                        .cmp(&route_key(&right.routing.selected_route))
+                    selected_route_key(&left.routing).cmp(&selected_route_key(&right.routing))
                 })
         });
 
@@ -321,6 +407,7 @@ impl AgentCoordinator {
             plan_revision: request.plan_revision.clone(),
             state_fence: request.state_fence.clone(),
             privacy_class: request.privacy_class,
+            work_class: request.work_class,
             lanes,
         };
         if let Some(existing) = self.plans.get(&candidate.candidate_id) {
@@ -415,17 +502,35 @@ impl AgentCoordinator {
             let candidate_lane = candidate_lanes
                 .get(&lane_key)
                 .ok_or(CoordinatorError::IdentityConflict("admitted_lane"))?;
-            let routing_digest = contract_shape_digest(&candidate_lane.routing)
+            let routing_digest = candidate_digest_for(&candidate_lane.routing)
                 .map_err(|error| CoordinatorError::Serialization(error.to_string()))?;
-            if lane.route != candidate_lane.routing.selected_route
+            let selected_route = candidate_lane
+                .routing
+                .selected
+                .as_ref()
+                .ok_or(CoordinatorError::IdentityConflict("admitted_lane"))?;
+            // Candidate itself must still validate: an invalid selection
+            // (e.g. selected absent from set) rejects here, never at intake.
+            candidate_lane
+                .routing
+                .validate()
+                .map_err(provider_contract)?;
+            if lane.route != *selected_route
                 || lane.routing_receipt_digest != routing_digest
                 || lane.role_revision != candidate_lane.role_revision
+                || lane.work_class != candidate_lane.work_class
                 || lane.budget != candidate_lane.budget
                 || lane.priority != candidate_lane.priority
                 || lane.mutation_scope != candidate_lane.mutation_scope
             {
                 return Err(CoordinatorError::IdentityConflict("admitted_lane"));
             }
+            // S5: validate the externally-issued admitted route decision
+            // against this exact lane/candidate/fence. `None` stays
+            // unresolved for additive pre-S5 wire and fails closed at intake;
+            // a present receipt is shape-validated and linkage-checked, never
+            // minted here.
+            validate_lane_admission(lane, &candidate_lane.routing, &receipt.state_fence)?;
             if !attempts.insert(lane.attempt_id.clone())
                 || self.attempts.contains_key(&lane.attempt_id)
             {
@@ -444,9 +549,9 @@ impl AgentCoordinator {
             }
             let capacity = RouteCapacityRequest {
                 requested: 1,
-                capacity_identity: candidate_lane.routing.capacity_identity.clone(),
-                capacity_revision: candidate_lane.routing.capacity_revision.clone(),
-                capacity_limit: candidate_lane.routing.capacity_limit,
+                capacity_identity: candidate_lane.capacity_identity.clone(),
+                capacity_revision: candidate_lane.capacity_revision.clone(),
+                capacity_limit: candidate_lane.capacity_limit,
             };
             match route_additions.entry(route_key(&lane.route)) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
@@ -486,15 +591,18 @@ impl AgentCoordinator {
                 attempt_id: lane.attempt_id.clone(),
                 lease_id: lane.lease_id.clone(),
                 worker_id: lane.worker_id.clone(),
+                work_class: lane.work_class,
                 route: lane.route.clone(),
-                capacity_identity: candidate_lane.routing.capacity_identity.clone(),
-                capacity_revision: candidate_lane.routing.capacity_revision.clone(),
-                capacity_limit: candidate_lane.routing.capacity_limit,
+                capacity_identity: candidate_lane.capacity_identity.clone(),
+                capacity_revision: candidate_lane.capacity_revision.clone(),
+                capacity_limit: candidate_lane.capacity_limit,
                 budget: lane.budget.clone(),
                 priority: lane.priority,
                 mutation_scope: lane.mutation_scope.clone(),
                 state: CoordinatedAttemptState::Admitted,
                 superseded_by: None,
+                provider_binding: None,
+                admitted_route: lane.admitted_route.clone(),
             };
             if let Some(scope) = &record.mutation_scope {
                 self.writer_holders
@@ -521,10 +629,24 @@ impl AgentCoordinator {
             .filter(|attempt| attempt.state == CoordinatedAttemptState::Admitted)
             .cloned()
             .collect::<Vec<_>>();
+        // I14.1 work class (issue #1698) routes/selects before priority:
+        // protected control first, then normal classes in document order.
+        // Every queued `AttemptRecord.work_class` is the closed `WorkClass`
+        // boundary type, so only validated values can be observed here:
+        // `admit` copies the class from the validated candidate lane, the
+        // retry path (`reassign`) copies it from the stored record, and
+        // restore replays `plan`/`admit` through the same `Deserialize`
+        // ingress. There is no invalid arm because invalid is
+        // unrepresentable.
         ready.sort_by(|left, right| {
-            right
-                .priority
-                .cmp(&left.priority)
+            left.work_class
+                .rank()
+                .cmp(&right.work_class.rank())
+                .then_with(|| {
+                    right
+                        .priority
+                        .cmp(&left.priority)
+                })
                 .then_with(|| left.work_unit_id.cmp(&right.work_unit_id))
                 .then_with(|| left.role_id.cmp(&right.role_id))
                 .then_with(|| left.attempt_id.cmp(&right.attempt_id))
@@ -568,6 +690,188 @@ impl AgentCoordinator {
             attempt_id,
         });
         Ok(record)
+    }
+
+    /// Binds exactly one provider execution unit to an existing externally
+    /// admitted attempt (issue #361 S2).
+    ///
+    /// Enforced, in order:
+    /// - the context names a known admission with exact fence/epoch/lease
+    ///   agreement (`validate_context`);
+    /// - the sealed provider verifier authenticates the exact start
+    ///   correlation (`ProviderProofKind::Binding` over the canonical
+    ///   submission); there is no `verified = true` shortcut and the
+    ///   plan-only constructor still installs only the typed `PLAN_GAP`
+    ///   verifier, so closed production binding arrives only through
+    ///   `new_with_admitted_provider` on daemon-supplied Kernel data;
+    /// - exact canonical-input replay returns the stored binding without a
+    ///   new event; the same attempt identity with different canonical bytes
+    ///   (a second unit rebound to the same attempt) is an
+    ///   `IdempotencyConflict`;
+    /// - the attempt exists, belongs to this admission, and is pre-execution
+    ///   (`Admitted` or `Running`; anything later is `InvalidAttemptState`);
+    /// - the shared S1 validator (`eliot_agent_api::validate_execution_binding`)
+    ///   checks binding shape plus exact typed attempt/lease/route agreement,
+    ///   complete fence equality, and exact runtime-generation equality. The
+    ///   coordinator's current generation view is the admitted fence's typed
+    ///   `resource_generation` (threaded by value, no numeric casts, no
+    ///   process-generation bridging): a live generation feed distinct from
+    ///   the fence has no entry point in `ExecutionContext` or
+    ///   `ProviderAdmissionReceipt` and stays T1/T5-owned. The coordinator
+    ///   likewise admits no session, so the projected attempt session is
+    ///   `None` and a sessionful binding fails closed here until T1/T5 supply
+    ///   session admission;
+    /// - a physical unit already bound to another attempt under the same
+    ///   authenticated provider scope and generation is a
+    ///   `DuplicateIdentity("execution_unit")` (a new turn, including
+    ///   resume/fork, is a new attempt but never reuses a live unit);
+    /// - the binding is persisted via `CoordinatorEvent::ProviderExecutionBound`
+    ///   before the bound value is returned for attribution, so restart
+    ///   replay reconstructs it and a missing event leaves the attempt
+    ///   unresolved (`None`, attribution fails closed). Map insertion alone
+    ///   is never treated as admission.
+    pub fn bind_provider_execution(
+        &mut self,
+        context: ExecutionContext,
+        submission: ProviderExecutionBindingSubmission,
+    ) -> Result<ProviderExecutionBinding, CoordinatorError> {
+        self.validate_context(&context)?;
+        validate_text(
+            &submission.provider_start_receipt_ref,
+            "provider_start_receipt_ref",
+        )?;
+        let canonical_input = canonical(&submission)?;
+        self.provider.verify(
+            ProviderProofKind::Binding,
+            &submission.provider_identity,
+            &submission.provider_start_receipt_ref,
+            &canonical_input,
+        )?;
+        self.validate_provider_identity(&submission.provider_identity)?;
+        let attempt_id = submission.binding.attempt_id.clone();
+        if let Some(existing) = self.bindings.get(&attempt_id) {
+            return idempotent(existing, &canonical_input);
+        }
+        let current = self
+            .attempts
+            .get(&attempt_id)
+            .cloned()
+            .ok_or(CoordinatorError::UnknownAttempt)?;
+        if current.admission_id != context.admission_id {
+            return Err(CoordinatorError::StaleController);
+        }
+        if current.provider_binding.is_some() {
+            // The idempotency index above is the only writer of the record
+            // field; a present field without an index entry is corruption, so
+            // fail closed instead of overwriting an immutable binding.
+            return Err(CoordinatorError::IdentityConflict("execution_binding"));
+        }
+        let admitted = self.binding_subject(&attempt_id)?;
+        validate_execution_binding(
+            &submission.binding,
+            &admitted,
+            &context.state_fence,
+            context.state_fence.resource_generation,
+        )
+        .map_err(binding_contract)?;
+        if self.attempts.values().any(|other| {
+            other.provider_binding.as_ref().is_some_and(|bound| {
+                bound.provider_scope_ref == submission.binding.provider_scope_ref
+                    && bound.execution_unit == submission.binding.execution_unit
+                    && bound.runtime_generation == submission.binding.runtime_generation
+            })
+        }) {
+            return Err(CoordinatorError::DuplicateIdentity("execution_unit"));
+        }
+        let binding = submission.binding.clone();
+        self.bindings.insert(
+            attempt_id.clone(),
+            IdempotentRecord {
+                canonical_input,
+                receipt: binding.clone(),
+            },
+        );
+        self.attempts
+            .get_mut(&attempt_id)
+            .ok_or(CoordinatorError::UnknownAttempt)?
+            .provider_binding = Some(binding.clone());
+        self.events.push(CoordinatorEvent::ProviderExecutionBound {
+            context,
+            submission: Box::new(submission),
+        });
+        Ok(binding)
+    }
+
+    /// Projects an admitted attempt for S1 binding validation and
+    /// attribution checks. Only identity fields participate in
+    /// `validate_execution_binding`; authority/continuity/cancellation
+    /// crossings are inert carriers documented below.
+    pub(crate) fn binding_subject(
+        &self,
+        attempt_id: &AttemptId,
+    ) -> Result<AgentAttempt, CoordinatorError> {
+        let attempt = self
+            .attempts
+            .get(attempt_id)
+            .ok_or(CoordinatorError::UnknownAttempt)?;
+        let admission = self
+            .admissions
+            .get(&attempt.admission_id)
+            .ok_or(CoordinatorError::UnknownAdmission)?;
+        self.binding_subject_inner(attempt, &admission.receipt)
+    }
+
+    fn binding_subject_inner(
+        &self,
+        attempt: &AttemptRecord,
+        admission: &ProviderAdmissionReceipt,
+    ) -> Result<AgentAttempt, CoordinatorError> {
+        // Binding pins the unit before execution: only pre-execution states
+        // project. Later states keep their stored binding read-only.
+        let state = match attempt.state {
+            CoordinatedAttemptState::Admitted => AttemptState::Admitted,
+            CoordinatedAttemptState::Running => AttemptState::Running,
+            other => return Err(CoordinatorError::InvalidAttemptState(other)),
+        };
+        let work_unit = self.work_unit_for(attempt)?;
+        Ok(AgentAttempt {
+            id: attempt.attempt_id.clone(),
+            launch_request_id: attempt.launch_request_id.clone(),
+            task_id: attempt.task_id.clone(),
+            parent_attempt: attempt.parent_attempt_id.clone(),
+            work_unit: work_unit.clone(),
+            // The coordinator admits no session: the projected session is
+            // `None`, so a sessionful binding fails closed in S1 until T1/T5
+            // supply session admission.
+            session: None,
+            lease: attempt.lease_id.clone(),
+            state,
+            // Inert for binding validation: the coordinator tracks lineage
+            // via `parent_attempt_id`, not this projection field.
+            continuity: ContinuityKind::Fresh,
+            route: attempt.route.clone(),
+            budget: attempt.budget.clone(),
+            // Inert for binding validation (never read by
+            // `validate_execution_binding`): epoch/lease/fence/ceiling are
+            // the real admitted values; `scope_ref` reuses the admitted
+            // work-unit ceiling scope for internal consistency;
+            // `valid_until` is left empty so this projection can never be
+            // mistaken for Governor-minted authority.
+            authority: AuthorityEnvelope {
+                epoch: admission.controller_epoch.clone(),
+                scope_ref: work_unit.effect_ceiling.scope_ref.clone(),
+                effect_ceiling: work_unit.effect_ceiling.clone(),
+                lease: attempt.lease_id.clone(),
+                state_fence: attempt.state_fence.clone(),
+                valid_until: String::new(),
+            },
+            // Factual: only `Admitted`/`Running` attempts project, and
+            // cancellation is never requested in those states.
+            cancellation: CancellationState::NotRequested,
+            event_cursor: None,
+            continuation: None,
+            provider_binding: attempt.provider_binding.clone(),
+        })
     }
 
     pub fn request_cancellation(
@@ -823,6 +1127,7 @@ impl AgentCoordinator {
             attempt_id: receipt.new_attempt_id.clone(),
             lease_id: receipt.new_lease_id.clone(),
             worker_id: receipt.new_worker_id.clone(),
+            work_class: old.work_class,
             route: receipt.route.clone(),
             capacity_identity: old.capacity_identity.clone(),
             capacity_revision: old.capacity_revision.clone(),
@@ -832,6 +1137,13 @@ impl AgentCoordinator {
             mutation_scope: old.mutation_scope.clone(),
             state: CoordinatedAttemptState::Admitted,
             superseded_by: None,
+            provider_binding: None,
+            // S5: a reassigned attempt carries a new attempt identity, so the
+            // old lane's admitted decision (bound to the old attempt_id)
+            // cannot transfer. It stays unresolved (`None`) until the
+            // external admission owner issues a new decision for the new
+            // identity; intake fails closed meanwhile (honest T1 gap).
+            admitted_route: None,
         };
         if let Some(scope) = &new_record.mutation_scope {
             self.writer_holders
@@ -909,12 +1221,49 @@ impl AgentCoordinator {
             .validate(&work_unit.effect_ceiling)
             .map_err(provider_contract)?;
         let actual = &submission.result.actual_route;
-        if actual.requested != current.route
-            || actual.observed.as_ref() != Some(&current.route)
-            || actual.route_id.as_str().trim().is_empty()
-        {
+        // Requested must equal the admitted/assigned route; a mismatch is an
+        // invalid candidate selection and rejects. Observed divergence or
+        // absence is retained evidence (DIVERGED/UNOBSERVED) at a capped
+        // ceiling, never a mismatch rejection.
+        if actual.requested_route != current.route {
             return Err(CoordinatorError::RouteMismatch);
         }
+        if actual.attempt_id != current.attempt_id {
+            return Err(CoordinatorError::IdentityConflict("attempt_id"));
+        }
+        // Binding-gated intake: an exact stored binding must match exactly;
+        // without a stored binding, the presented binding must still agree on
+        // attempt/lease/fence/route, otherwise it is forged and rejects.
+        if let Some(stored) = &current.provider_binding {
+            if &actual.binding != stored {
+                return Err(CoordinatorError::IdentityConflict("execution_binding"));
+            }
+        } else if actual.binding.attempt_id != current.attempt_id
+            || actual.binding.lease_id != current.lease_id
+            || actual.binding.state_fence != current.state_fence
+            || actual.binding.route != current.route
+        {
+            return Err(CoordinatorError::IdentityConflict("execution_binding"));
+        }
+        if actual.state_fence != current.state_fence {
+            return Err(CoordinatorError::IdentityConflict("execution_binding"));
+        }
+        // S5 binding closure (issue #370): the stored externally-issued
+        // admitted decision must exist and the result must close the full
+        // triple via the shared S5 validator. Stored-only, never
+        // provider-supplied: the observation already carries the digest link
+        // (`admitted_route_digest`), and equality against stored is enforced
+        // inside `validate_for_binding`. Missing stored admission fails
+        // closed as `admitted_route`; validator mismatches map via the
+        // existing binding convention (`execution_binding`).
+        let stored_admission = current
+            .admitted_route
+            .as_ref()
+            .ok_or(CoordinatorError::IdentityConflict("admitted_route"))?;
+        submission
+            .result
+            .validate_for_binding(&actual.binding, stored_admission, &work_unit.effect_ceiling)
+            .map_err(binding_contract)?;
         if submission.result.disposition == ResultDisposition::CandidateSucceeded {
             self.require_descendant_closure(&current.attempt_id)?;
         }
@@ -951,6 +1300,170 @@ impl AgentCoordinator {
             submission: Box::new(submission),
         });
         Ok(receipt)
+    }
+
+    /// Observes one closed v7 provider host event under the exact recorded
+    /// lineage (issue #371 S7).
+    ///
+    /// Signature note: the T4 S7 slice text spells the envelope as
+    /// `eliot_agent_api::HostEventEnvelope`, but the landed S6 owner is the
+    /// closed `eliot_agent_api::NormalizedHostEventEnvelope`
+    /// (`host-event-v7`). This signature preserves that landed owner; no
+    /// `Normalized` -> bridge `EventEnvelope` conversion happens here (bridge
+    /// wiring is a separate integrator concern).
+    ///
+    /// This method returns `()` and never a cursor: cursor acknowledgement
+    /// follows durable linkage/disposition (the appended
+    /// [`CoordinatorEvent::ProviderHostEventObserved`] plus snapshot/restore
+    /// re-verification), not this in-memory return. Until a real durable
+    /// Store/Governor edge is installed, durability is proven on the
+    /// in-memory event-log plus snapshot only; the installed durable commit
+    /// remains controller track and no `Store` commit is invented here.
+    ///
+    /// Enforced, in order:
+    /// - the context names a known admission with exact fence/epoch/lease
+    ///   agreement (`validate_context`);
+    /// - the presented normalization receipt must equal the envelope's
+    ///   embedded receipt: a caller-selected receipt never substitutes for
+    ///   the sealed one;
+    /// - an already-accepted event identity replays through the typed S6
+    ///   classifier
+    ///   (`eliot_agent_api::NormalizedHostEventEnvelope::check_replay_against`):
+    ///   an identical replay returns `Ok` without a new event or duplicate
+    ///   effects, while the same identity with different bytes is quarantined
+    ///   with its first differing dimension as
+    ///   [`CoordinatorError::HostEventQuarantine`] (`ConflictingPayload`,
+    ///   `ConflictingLineage`, `ConflictingNormalization`, `ConflictingSource`,
+    ///   or `ConflictingFraming`) — never a generic conflict. A cross-turn
+    ///   same-`event_id` replay (different lineage/binding) therefore
+    ///   quarantines explicitly and never advances the wrong attempt; nothing
+    ///   is mutated on any replay path;
+    /// - the attempt and admission resolve from recorded state, never from
+    ///   caller-selected identity: the lineage binding's attempt must exist
+    ///   under this admission (ghost callers fail as `UnknownAttempt`, foreign
+    ///   turns as `IdentityConflict`), the stored [`ProviderExecutionBinding`]
+    ///   must equal the presented binding exactly, and the stored #369
+    ///   admitted route must exist. The envelope then closes through the
+    ///   shared S6 validator
+    ///   (`eliot_agent_api::NormalizedHostEventEnvelope::validate_for_lineage`),
+    ///   which rejects a wrong binding/route-ref/fence/generation/cursor/
+    ///   parent before any mutation. Session-only observations validate on
+    ///   the session path (`validate_as_session_observation`, so
+    ///   attempt-terminal/attempt-usage payloads cannot ride session lineage)
+    ///   and mutate no attempt state: no sequencing entry, no cursor advance,
+    ///   no usage/result/completion effect;
+    /// - per-attempt sequencing is explicit: a new identity with a
+    ///   nonmonotonic sequence rejects as [`CoordinatorError::StaleResult`]
+    ///   without mutation, while a forward jump records an explicit
+    ///   [`CoordinatorEvent::ProviderHostEventGap`] before the observation.
+    ///   The gap marker itself advances no cursor (ordering evidence only,
+    ///   model 642-650); the accepted observation then records its own
+    ///   sequence. Reordered (stale) arrivals therefore stay stale and gaps
+    ///   regenerate deterministically on snapshot restore.
+    ///
+    /// Observations never synthesize a candidate result or a Finish: usage,
+    /// terminality, results, and completion are untouched here, so a
+    /// foreign-turn or session-terminal input can never reach result intake
+    /// (the `submit_result` binding gate independently requires the exact
+    /// stored binding).
+    pub fn observe_provider_event(
+        &mut self,
+        context: ExecutionContext,
+        event: NormalizedHostEventEnvelope,
+        normalization: HostEventNormalizationReceipt,
+    ) -> Result<(), CoordinatorError> {
+        self.validate_context(&context)?;
+        if event.normalization != normalization {
+            return Err(CoordinatorError::IdentityConflict("normalization_receipt"));
+        }
+        let canonical_input = canonical(&(&event, &normalization))?;
+        let event_key = event.event_id.as_str().to_owned();
+        if let Some(existing) = self.observed_host_events.get(&event_key) {
+            match event.check_replay_against(&existing.event) {
+                Ok(HostEventReplayDisposition::IdempotentReplay) => {
+                    if existing.canonical_input == canonical_input {
+                        return Ok(());
+                    }
+                    // Same typed envelope but different durable bytes (separate
+                    // receipt or serialization divergence): fail closed as a
+                    // framing quarantine, never advance or duplicate.
+                    return Err(CoordinatorError::HostEventQuarantine(
+                        HostEventQuarantineReason::ConflictingFraming,
+                    ));
+                }
+                Ok(HostEventReplayDisposition::Quarantined { reason }) => {
+                    return Err(CoordinatorError::HostEventQuarantine(reason));
+                }
+                Err(error) => {
+                    // Valid framing is required before any quarantine
+                    // classification; surfacing the contract error preserves
+                    // the exact framing failure without mutation.
+                    return Err(CoordinatorError::ProviderContract(error.to_string()));
+                }
+            }
+        }
+        let attempt_id = match &event.lineage {
+            ProviderObservationLineage::SessionObservation(observation) => {
+                observation.validate().map_err(binding_contract)?;
+                event
+                    .validate_as_session_observation()
+                    .map_err(binding_contract)?;
+                None
+            }
+            ProviderObservationLineage::ExecutionUnitObservation(unit) => {
+                let current = self
+                    .attempts
+                    .get(&unit.binding.attempt_id)
+                    .cloned()
+                    .ok_or(CoordinatorError::UnknownAttempt)?;
+                if current.admission_id != context.admission_id {
+                    return Err(CoordinatorError::StaleController);
+                }
+                let stored_binding = current
+                    .provider_binding
+                    .clone()
+                    .ok_or(CoordinatorError::IdentityConflict("execution_binding"))?;
+                let stored_admission = current
+                    .admitted_route
+                    .clone()
+                    .ok_or(CoordinatorError::IdentityConflict("admitted_route"))?;
+                event
+                    .validate_for_lineage(&stored_binding, &stored_admission)
+                    .map_err(binding_contract)?;
+                Some(current.attempt_id.clone())
+            }
+        };
+        if let Some(attempt) = &attempt_id {
+            let last = self.last_host_sequence.get(attempt).copied().unwrap_or(0);
+            if event.sequence <= last {
+                return Err(CoordinatorError::StaleResult);
+            }
+            if event.sequence > last + 1 {
+                self.events.push(CoordinatorEvent::ProviderHostEventGap {
+                    context: context.clone(),
+                    attempt_id: attempt.clone(),
+                    event_id: event.event_id.clone(),
+                    expected_sequence: last + 1,
+                    observed_sequence: event.sequence,
+                });
+            }
+            self.last_host_sequence
+                .insert(attempt.clone(), event.sequence);
+        }
+        self.observed_host_events.insert(
+            event_key,
+            ObservedHostEventEntry {
+                canonical_input,
+                event: event.clone(),
+            },
+        );
+        self.events
+            .push(CoordinatorEvent::ProviderHostEventObserved {
+                context,
+                event: Box::new(event),
+                normalization: Box::new(normalization),
+            });
+        Ok(())
     }
 
     pub fn reconcile_unknown_outcome(
@@ -1250,8 +1763,7 @@ impl AgentCoordinator {
             .map_err(|error| CoordinatorError::Serialization(error.to_string()))
     }
 
-    /// Public restore remains plan-only because no accepted A-01/G-11 provider
-    /// exists in this cell yet.
+    /// Plan-only public restore reinstalls the `PLAN_GAP` verifier.
     pub fn restore(
         snapshot: CoordinatorSnapshot,
         live_config: CoordinatorConfig,
@@ -1259,6 +1771,26 @@ impl AgentCoordinator {
     ) -> Result<Self, CoordinatorError> {
         gap.validate()?;
         Self::restore_with_provider(snapshot, live_config, Box::new(GapProvider { gap }))
+    }
+
+    /// Closed production restore on freshly supplied Kernel admission (T9-05,
+    /// issue #1108).
+    ///
+    /// The daemon re-queries Kernel and passes a fresh `capability`: the
+    /// snapshot's stored binding must equal the live binding derived from it,
+    /// and every replayed event re-verifies through the T9-04 pure verifier,
+    /// so a serialized `Verified` label alone never restores authority and
+    /// revoked or stale Kernel evidence fails closed.
+    pub fn restore_with_admitted_provider(
+        snapshot: CoordinatorSnapshot,
+        live_config: CoordinatorConfig,
+        capability: AdmittedProviderCapability,
+    ) -> Result<Self, CoordinatorError> {
+        Self::restore_with_provider(
+            snapshot,
+            live_config,
+            Box::new(KernelProviderVerifier::new(capability)),
+        )
     }
 
     pub fn restore_json(
@@ -1356,6 +1888,34 @@ impl AgentCoordinator {
                     message_id,
                 } => {
                     coordinator.deliver_message(context, recipient_attempt_id, message_id)?;
+                }
+                CoordinatorEvent::ProviderExecutionBound {
+                    context,
+                    submission,
+                } => {
+                    // Replay re-verifies the exact canonical input through
+                    // the sealed verifier and rebuilds the binding index plus
+                    // the record field together. Events without a binding
+                    // event leave the attempt unresolved (`None`); a binding
+                    // is never invented on restore, so attribution of an
+                    // unbound attempt fails closed.
+                    coordinator.bind_provider_execution(context, *submission)?;
+                }
+                CoordinatorEvent::ProviderHostEventObserved {
+                    context,
+                    event,
+                    normalization,
+                } => {
+                    // Replay re-validates the exact canonical input against
+                    // the restored binding/admission and rebuilds the
+                    // observation index plus per-attempt sequencing. Gap
+                    // markers regenerate deterministically inside the call,
+                    // so the trailing equality check still holds.
+                    coordinator.observe_provider_event(context, *event, *normalization)?;
+                }
+                CoordinatorEvent::ProviderHostEventGap { .. } => {
+                    // Ordering evidence only: no independent mutation, and
+                    // the observed stream regenerates the identical marker.
                 }
             }
         }
@@ -1616,7 +2176,7 @@ fn select_route(
     request: &StaffingPlanRequest,
     role: &RoleProfileManifest,
     mut candidates: Vec<RouteCandidateEvidence>,
-) -> Result<RoutingReceipt, CoordinatorError> {
+) -> Result<RouteSelectionCandidate, CoordinatorError> {
     if candidates.is_empty() {
         return Err(CoordinatorError::RouteEvidence);
     }
@@ -1656,23 +2216,45 @@ fn select_route(
             .then_with(|| route_key(&left.route).cmp(&route_key(&right.route)))
     });
     let selected = candidates.remove(0);
-    let rejected_alternatives = candidates
+    let all_routes = std::iter::once(selected.route.clone())
+        .chain(candidates.iter().map(|candidate| candidate.route.clone()))
+        .collect::<Vec<_>>();
+    let rejected = candidates
         .into_iter()
-        .map(|candidate| RejectedRoute {
+        .map(|candidate| RejectedRouteCandidate {
             route: candidate.route,
-            reason: RouteRejectionReason::LowerDeterministicRank,
+            reason_code: "LOWER_DETERMINISTIC_RANK".to_owned(),
+            evidence_ref: candidate.evidence_refs.first().cloned(),
         })
-        .collect();
-    Ok(RoutingReceipt {
-        selected_route: selected.route,
-        capacity_identity: selected.capacity_identity,
-        capacity_revision: selected.capacity_revision,
-        capacity_limit: selected.capacity_limit,
-        budget_evidence: selected.budget_evidence,
-        evidence_refs: selected.evidence_refs,
-        rejected_alternatives,
-        proof_ceiling: ProofCeiling::CandidateArtifact,
-    })
+        .collect::<Vec<_>>();
+    // Typed policy revision binds to the fence's policy revision when present;
+    // no bare-string parsing. Capability/intent/scope are deterministic
+    // staffing-lane projections, never admission claims.
+    let policy_revision = request
+        .state_fence
+        .policy_revision
+        .clone()
+        .unwrap_or_else(PolicyRevision::genesis);
+    let capability = role.required_competence.join("+");
+    let query_intent = request.candidate_id.as_str().to_owned();
+    let scope_ref = format!(
+        "{}:{}",
+        request.candidate_id.as_str(),
+        role.role_id.as_str()
+    );
+    let candidate = RouteSelectionCandidate {
+        capability,
+        query_intent,
+        scope_ref,
+        policy_revision,
+        candidates: all_routes,
+        selected: Some(selected.route.clone()),
+        rejected,
+        selection: CandidateSelectionDisposition::Selected,
+        evidence_refs: selected.evidence_refs.clone(),
+    };
+    candidate.validate().map_err(provider_contract)?;
+    Ok(candidate)
 }
 
 fn route_class_allowed(allowed_route_classes: &[String], provider: &str) -> bool {
@@ -1683,6 +2265,10 @@ fn route_class_allowed(allowed_route_classes: &[String], provider: &str) -> bool
 
 fn validate_admission_text(receipt: &ProviderAdmissionReceipt) -> Result<(), CoordinatorError> {
     receipt.provider_identity.validate()?;
+    // coordinator_lease is the canonical `WorkLeaseId` (re-exported owner):
+    // non-blank/control/boundary/length is already enforced by Deserialize;
+    // provenance and equality are enforced downstream via `==`/`!=`
+    // (`validate_context` coordinator_lease equality, `lease_exists` equality).
     for (value, field) in [
         (receipt.launch_request_id.as_str(), "launch_request_id"),
         (receipt.recipe_id.as_str(), "recipe_id"),
@@ -1690,7 +2276,6 @@ fn validate_admission_text(receipt: &ProviderAdmissionReceipt) -> Result<(), Coo
         (receipt.task_id.as_str(), "task_id"),
         (&receipt.task_revision, "task_revision"),
         (receipt.plan_revision.as_str(), "plan_revision"),
-        (receipt.coordinator_lease.as_str(), "coordinator_lease"),
         (
             &receipt.g11_admission_receipt_ref,
             "g11_admission_receipt_ref",
@@ -1700,7 +2285,10 @@ fn validate_admission_text(receipt: &ProviderAdmissionReceipt) -> Result<(), Coo
         validate_text(value, field)?;
     }
     validate_state_fence(&receipt.state_fence)?;
-    if receipt.controller_epoch != receipt.state_fence.authority_epoch {
+    if !receipt
+        .controller_epoch
+        .is_same_authority(&receipt.state_fence.authority_epoch)
+    {
         return Err(CoordinatorError::StaleController);
     }
     if receipt.admitted_lanes.is_empty() {
@@ -1742,14 +2330,60 @@ fn validate_admitted_lane(lane: &crate::AdmittedLaneReceipt) -> Result<(), Coord
     validate_text(lane.work_unit_id.as_str(), "work_unit_id")?;
     validate_text(lane.role_id.as_str(), "role_id")?;
     validate_text(lane.role_revision.as_str(), "role_revision")?;
+    // I14.1 work class needs no string revalidation here: the lane carries
+    // the closed `WorkClass` boundary type, so `Deserialize` already rejected
+    // unknown spellings at decode ingress and only validated values exist.
     validate_text(lane.attempt_id.as_str(), "attempt_id")?;
-    validate_text(lane.lease_id.as_str(), "lease_id")?;
+    // lease_id is the canonical `WorkLeaseId`: blank/control/boundary/length already
+    // enforced by Deserialize; uniqueness and binding are enforced via `==`
+    // (`leases` BTreeSet in `admit`, `validate_attempt_binding` lease equality).
+    // routing_receipt_digest is the typed `LowercaseSha256` candidate identity:
+    // form is enforced by Deserialize, exact value is recomputed in `admit`
+    // via `candidate_digest_for` (canonical JSON + SHA-256 hex).
     validate_text(lane.worker_id.as_str(), "worker_id")?;
-    validate_text(&lane.routing_receipt_digest, "routing_receipt_digest")?;
     lane.route.validate().map_err(provider_contract)?;
     lane.budget.validate().map_err(provider_contract)?;
     if let Some(scope) = &lane.mutation_scope {
         validate_text(scope, "mutation_scope")?;
+    }
+    Ok(())
+}
+
+/// Validates the externally-issued admitted route decision carried by one
+/// admitted lane (issue #370 S5). The coordinator never mints: shape and
+/// self-digest are checked via `admission.validate()`, then exact typed `==`
+/// linkage binds the decision to this lane's attempt/lease/fence/generation,
+/// requested/selected route, candidate digest, and policy revision. `None`
+/// is additive pre-S5 wire and stays unresolved here; intake fails closed
+/// later when no stored admission exists.
+fn validate_lane_admission(
+    lane: &crate::AdmittedLaneReceipt,
+    routing: &RouteSelectionCandidate,
+    admission_fence: &eliot_agent_api::StateFence,
+) -> Result<(), CoordinatorError> {
+    let Some(admission) = &lane.admitted_route else {
+        return Ok(());
+    };
+    admission.validate().map_err(provider_contract)?;
+    if admission.attempt_id != lane.attempt_id
+        || admission.lease_id != lane.lease_id
+        || admission.state_fence != *admission_fence
+        || admission.runtime_generation != admission_fence.resource_generation
+        || admission.requested_route != lane.route
+    {
+        return Err(CoordinatorError::IdentityConflict("admitted_route"));
+    }
+    // Only a selecting admission authorizes execution; a no-route denial
+    // carries no authorized route and cannot back an attempt.
+    if admission.selected_route.as_ref() != Some(&lane.route) {
+        return Err(CoordinatorError::IdentityConflict("admitted_route"));
+    }
+    // Bind the exact candidate bytes and policy: the admission cannot
+    // reinterpret a newer policy or route under the same identity.
+    if admission.candidate_digest != lane.routing_receipt_digest
+        || admission.policy_revision != routing.policy_revision
+    {
+        return Err(CoordinatorError::IdentityConflict("admitted_route"));
     }
     Ok(())
 }
@@ -1780,6 +2414,17 @@ fn provider_contract(error: impl std::fmt::Display) -> CoordinatorError {
     CoordinatorError::ProviderContract(error.to_string())
 }
 
+fn binding_contract(error: ContractError) -> CoordinatorError {
+    match error {
+        // S1 reports every binding-identity disagreement (attempt, lease,
+        // fence, generation, route, session, stored unit) as one closed
+        // mismatch; the coordinator surfaces it on the existing identity
+        // conflict variant without inventing a binding-specific error.
+        ContractError::BindingMismatch => CoordinatorError::IdentityConflict("execution_binding"),
+        other => CoordinatorError::ProviderContract(other.to_string()),
+    }
+}
+
 fn validate_effect_ceiling(
     child: &EffectCeiling,
     parent: &EffectCeiling,
@@ -1796,6 +2441,14 @@ fn route_key(route: &eliot_agent_api::RouteFingerprint) -> String {
     route
         .canonical_json()
         .unwrap_or_else(|_| "<invalid-route>".to_owned())
+}
+
+fn selected_route_key(candidate: &RouteSelectionCandidate) -> String {
+    candidate
+        .selected
+        .as_ref()
+        .map(route_key)
+        .unwrap_or_else(|| "<no-route>".to_owned())
 }
 
 fn canonical(value: &impl Serialize) -> Result<String, CoordinatorError> {

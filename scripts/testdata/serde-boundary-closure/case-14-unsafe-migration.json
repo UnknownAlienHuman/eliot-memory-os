@@ -1,0 +1,1 @@
+{"case": 14, "description": "unsafe migration missing protected identity/lineage rejected", "expected": "reject", "migrated_envelope": {"message_type": "request", "payload": {"kind": "request", "request_id": "req-001"}, "protocol_version": "v1", "schema_version": "v1", "scope": "task:123"}, "missing": ["identity", "lineage"]}

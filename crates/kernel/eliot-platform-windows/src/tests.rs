@@ -1535,7 +1535,11 @@ fn service_registration_plan_accepts_local_service_account() {
     )
     .unwrap_or_else(|error| panic!("Watchdog LocalService plan failed: {error}"));
     assert_eq!(watchdog.service_sid_type(), ServiceSidType::None);
-    assert!(!request.requires_host_service_control_grant());
+    // Issue #1345: both canonical services require the protected installer
+    // DACL (Host self-grant + Host-to-Watchdog grant) via the single
+    // `requires_host_service_control_grant` predicate. Host SID type stays
+    // UNRESTRICTED (load-bearing for the Watchdog grant reference).
+    assert!(request.requires_host_service_control_grant());
     assert!(watchdog.requires_host_service_control_grant());
 }
 
@@ -1616,7 +1620,9 @@ fn watchdog_installer_mutation_handle_retains_exact_dacl_readback_authority() {
     let host_access = service_registration_mutation_access(&host);
     assert_eq!(host_access & readback, readback);
     assert_ne!(host_access & SERVICE_CHANGE_CONFIG, 0);
-    assert_eq!(host_access & WRITE_DAC, 0);
+    // Issue #1345: Host handles require WRITE_DAC for the protected
+    // installer DACL install (SetSecurityInfo, same mechanism as Watchdog).
+    assert_eq!(host_access & WRITE_DAC, WRITE_DAC);
 
     let watchdog_access = service_registration_mutation_access(&watchdog);
     assert_eq!(watchdog_access & readback, readback);
@@ -1665,6 +1671,124 @@ fn watchdog_service_dacl_is_protected_exact_and_sid_bound_without_scm_mutation()
         digest,
         watchdog_service_security_descriptor_digest("S-1-5-80-6-7-8-9-10")
             .unwrap_or_else(|error| panic!("substituted digest failed: {error}"))
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn host_service_dacl_is_protected_exact_and_sid_bound_without_scm_mutation() {
+    use windows_sys::Win32::Security::{ACCESS_ALLOWED_ACE, GetAce};
+    use windows_sys::Win32::Storage::FileSystem::{READ_CONTROL, WRITE_DAC};
+    use windows_sys::Win32::System::Services::SERVICE_ALL_ACCESS;
+
+    // Issue #1345 (s38 item 1 + item 4 platform half): the Host service
+    // registration must carry the documented protected installer DACL via
+    // SetSecurityInfo with a service-SID ACE, mirroring the Watchdog pattern
+    // per docs/architecture/I03-01-installation-form.md:23. This test proves
+    // the DACL shape without SCM mutation (same harness as the Watchdog DACL
+    // test); live SCM registration is not exercised here (requires admin +
+    // real service creation, out of scope for this unit).
+    let required = 0x0000_0001 | 0x0000_0004 | 0x0000_0010 | 0x0002_0000;
+    let forbidden =
+        0x0000_0002 | 0x0000_0020 | 0x0000_0040 | 0x0000_0100 | 0x0001_0000 | 0x000C_0000;
+    assert_eq!(ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK, required);
+    assert_eq!(ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK & forbidden, 0);
+
+    let host_sid = "S-1-5-80-1-2-3-4-5";
+    let descriptor = OwnedSecurityDescriptor::for_host_service_control(host_sid)
+        .unwrap_or_else(|error| panic!("Host descriptor failed: {error}"));
+    let dacl = descriptor
+        .dacl()
+        .unwrap_or_else(|error| panic!("Host DACL failed: {error}"));
+    assert_eq!(unsafe { (*dacl).AceCount }, 3);
+    let mut observed = Vec::new();
+    for index in 0..3_u32 {
+        let mut ace = std::ptr::null_mut();
+        assert_ne!(unsafe { GetAce(dacl, index, &raw mut ace) }, 0);
+        let allowed = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
+        let sid = (&raw const allowed.SidStart).cast_mut().cast();
+        observed.push((
+            sid_to_string(sid).unwrap_or_else(|error| panic!("Host SID failed: {error}")),
+            allowed.Mask,
+        ));
+    }
+    assert_eq!(
+        observed,
+        vec![
+            ("S-1-5-18".to_owned(), SERVICE_ALL_ACCESS),
+            ("S-1-5-32-544".to_owned(), SERVICE_ALL_ACCESS),
+            (host_sid.to_owned(), ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK,),
+        ]
+    );
+    let digest = host_service_security_descriptor_digest(host_sid)
+        .unwrap_or_else(|error| panic!("Host digest failed: {error}"));
+    assert_ne!(
+        digest,
+        host_service_security_descriptor_digest("S-1-5-80-6-7-8-9-10")
+            .unwrap_or_else(|error| panic!("substituted Host digest failed: {error}"))
+    );
+    // Host and Watchdog contours share the Host SID but differ in mask/digest;
+    // Watchdog bytes stay identical (existing Watchdog tests prove it).
+    assert_ne!(
+        digest,
+        watchdog_service_security_descriptor_digest(host_sid)
+            .unwrap_or_else(|error| panic!("Watchdog digest failed: {error}"))
+    );
+    let host_grant = ServiceControlGrantReadback::new(
+        ELIOT_HOST_SERVICE_NAME,
+        host_sid,
+        ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK,
+        digest.clone(),
+    )
+    .unwrap_or_else(|error| panic!("Host grant receipt failed: {error}"));
+    assert!(host_grant.validate().is_ok());
+    // Cross-substitution must fail: Host mask with Watchdog digest, and
+    // Watchdog mask with Host digest, are both rejected.
+    let watchdog_digest = watchdog_service_security_descriptor_digest(host_sid)
+        .unwrap_or_else(|error| panic!("Watchdog digest failed: {error}"));
+    assert!(
+        ServiceControlGrantReadback::new(
+            ELIOT_HOST_SERVICE_NAME,
+            host_sid,
+            ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK,
+            watchdog_digest,
+        )
+        .is_err()
+    );
+    assert!(
+        ServiceControlGrantReadback::new(
+            ELIOT_HOST_SERVICE_NAME,
+            host_sid,
+            ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK,
+            digest,
+        )
+        .is_err()
+    );
+
+    // Registration wiring: Host keeps UNRESTRICTED SID type (load-bearing for
+    // the Watchdog grant reference), requires the grant predicate, and its
+    // mutation handle carries WRITE_DAC for the SetSecurityInfo install step.
+    let image = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("missing"));
+    let host_request = ServiceRegistrationRequest::new(
+        ELIOT_HOST_SERVICE_NAME,
+        ELIOT_HOST_SERVICE_DISPLAY_NAME,
+        image,
+        ServiceStartMode::Automatic,
+        ServiceAccount::LocalService,
+    )
+    .unwrap_or_else(|error| panic!("Host request failed: {error}"));
+    assert_eq!(
+        host_request.service_sid_type(),
+        ServiceSidType::Unrestricted
+    );
+    assert!(host_request.requires_host_service_control_grant());
+    assert_ne!(
+        service_registration_mutation_access(&host_request) & WRITE_DAC,
+        0
+    );
+    assert_ne!(
+        service_registration_mutation_access(&host_request) & READ_CONTROL,
+        0
     );
 }
 
@@ -2228,7 +2352,7 @@ fn post_create_readback_failure_cannot_report_success() {
         &ServiceRegistrationInspection::Mismatched
     ));
     assert!(!service_readback_is_acceptable(
-        &ServiceRegistrationInspection::Unknown
+        &ServiceRegistrationInspection::unknown(5, "read-grant")
     ));
     assert!(service_readback_is_acceptable(
         &ServiceRegistrationInspection::Matching {
@@ -2263,15 +2387,90 @@ fn partial_service_status_never_maps_to_matching() {
         generation: None,
         process: None,
     };
-    assert_eq!(
-        service_registration_inspection_from_status(
-            PortOutcome::Partial {
-                value: observation,
-                missing: vec![handle("authority")],
-            },
-            None
-        ),
-        ServiceRegistrationInspection::Unknown
+    let inspection = service_registration_inspection_from_status(
+        PortOutcome::Partial {
+            value: observation,
+            missing: vec![handle("authority")],
+        },
+        None,
+    );
+    // Fail-closed: Partial never becomes Matching or Mismatched.
+    assert!(matches!(
+        inspection,
+        ServiceRegistrationInspection::Unknown { .. }
+    ));
+    assert!(!service_readback_is_acceptable(&inspection));
+    let detail = inspection
+        .unknown_detail()
+        .unwrap_or_else(|| unreachable!("Unknown must carry diagnostics"));
+    assert_eq!(detail.stage(), "query-status");
+    assert_eq!(detail.win32_error(), 0);
+    assert!(detail.detail().contains("query-status"));
+    #[cfg(windows)]
+    {
+        // Running maps to SERVICE_RUNNING (4); PID is unavailable from the
+        // provider-neutral Partial value so the fallback carries 0.
+        assert_eq!(detail.current_state(), Some(4));
+        assert_eq!(detail.process_id(), Some(0));
+    }
+}
+
+#[test]
+fn host_selfcheck_is_dacl_only_with_typed_unknown_diagnostics() {
+    // Standing s40 (ELIOT #1352): read paths use DACL info only; the audit
+    // SACL contour is never opened or hashed and the digest stays DACL-scoped.
+    assert_eq!(SERVICE_DACL_READ_SECURITY_INFORMATION, 0x0000_0004);
+    assert_eq!(SERVICE_OWNER_READ_SECURITY_INFORMATION, 0x0000_0001);
+    assert_eq!(SERVICE_EXPECTED_OWNER_SID, "S-1-5-18");
+    // Neither read mask sets the SACL bit (0x0000_0008).
+    assert_eq!(SERVICE_DACL_READ_SECURITY_INFORMATION & 0x0000_0008, 0);
+    assert_eq!(SERVICE_OWNER_READ_SECURITY_INFORMATION & 0x0000_0008, 0);
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION};
+        assert_eq!(
+            SERVICE_DACL_READ_SECURITY_INFORMATION,
+            DACL_SECURITY_INFORMATION
+        );
+        assert_eq!(
+            SERVICE_OWNER_READ_SECURITY_INFORMATION,
+            OWNER_SECURITY_INFORMATION
+        );
+    }
+    // Unknown carries the preserved Win32 code and stage without weakening
+    // fail-closed semantics.
+    let unknown = ServiceRegistrationInspection::unknown(5, "read-grant");
+    let detail = unknown
+        .unknown_detail()
+        .unwrap_or_else(|| unreachable!("Unknown must carry diagnostics"));
+    assert_eq!(detail.win32_error(), 5);
+    assert_eq!(detail.stage(), "read-grant");
+    assert!(detail.detail().contains("read-grant"));
+    assert!(detail.detail().contains('5'));
+    assert!(!service_readback_is_acceptable(&unknown));
+    // Mismatched (AclMismatch/IdentityMismatch only) is never collapsed into
+    // Unknown and vice versa.
+    assert_ne!(unknown, ServiceRegistrationInspection::Mismatched);
+    assert!(
+        ServiceRegistrationInspection::Mismatched
+            .unknown_detail()
+            .is_none()
+    );
+    let runtime =
+        ServiceRegistrationRuntimeInspection::unknown_with_status(5, "query-status", 2, 1_234);
+    let runtime_detail = runtime
+        .unknown_detail()
+        .unwrap_or_else(|| unreachable!("runtime Unknown must carry diagnostics"));
+    assert_eq!(runtime_detail.win32_error(), 5);
+    assert_eq!(runtime_detail.stage(), "query-status");
+    assert_eq!(runtime_detail.current_state(), Some(2));
+    assert_eq!(runtime_detail.process_id(), Some(1_234));
+    assert!(runtime_detail.detail().contains("query-status"));
+    // An owner mismatch fails as AclMismatch (Mismatched), never as Unknown:
+    // the dispositions stay distinct even for the owner stage.
+    assert_ne!(
+        ServiceRegistrationInspection::Mismatched,
+        ServiceRegistrationInspection::unknown(5, "query-owner")
     );
 }
 
@@ -2334,7 +2533,7 @@ fn exact_runtime_service_observation_requires_handle_bound_live_identity() {
     ));
     assert_eq!(
         classify_service_runtime_observation(&request, ServiceState::Running, 0, 0, 41, None,),
-        ServiceRegistrationRuntimeInspection::Unknown
+        ServiceRegistrationRuntimeInspection::unknown_with_status(0, "query-status", 4, 41)
     );
     assert_eq!(
         classify_service_runtime_observation(
@@ -2349,7 +2548,7 @@ fn exact_runtime_service_observation_requires_handle_bound_live_identity() {
                 image_path: image.to_string_lossy().into_owned(),
             }),
         ),
-        ServiceRegistrationRuntimeInspection::Unknown
+        ServiceRegistrationRuntimeInspection::unknown_with_status(0, "query-status", 1, 41)
     );
     assert_eq!(
         classify_service_runtime_observation(
@@ -2457,7 +2656,10 @@ fn scm_mutation_outcomes_never_promote_unknown_readback() {
         ServiceStartOutcome::Started { .. }
     ));
     assert_eq!(
-        start_outcome_from_inspection(ServiceRegistrationRuntimeInspection::Unknown, true,),
+        start_outcome_from_inspection(
+            ServiceRegistrationRuntimeInspection::unknown(5, "query-status"),
+            true,
+        ),
         ServiceStartOutcome::EffectUnknown
     );
     assert!(matches!(
@@ -2930,6 +3132,273 @@ fn resumed_tree_termination_is_consuming_and_reaps_every_member() {
     assert!(terminal.job_empty());
     assert!(terminal.root_reaped());
     assert!(pids.into_iter().all(wait_for_process_gone));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(windows)]
+fn remapped_job_binding(
+    original: &RecoverableJobBinding,
+    edit: impl FnOnce(&mut serde_json::Value),
+) -> RecoverableJobBinding {
+    let mut value = serde_json::to_value(original).unwrap_or_else(|_| unreachable!());
+    edit(&mut value);
+    serde_json::from_value(value).unwrap_or_else(|_| unreachable!())
+}
+
+#[cfg(windows)]
+#[test]
+fn process_job_exact_tree_kill_in_place_reports_complete_history() {
+    let _spawn_guard = process_job_spawn_test_guard();
+    let root = std::env::temp_dir().join(format!("eliot-p02-exact-tree-{}", unique_suffix()));
+    std::fs::create_dir(&root).unwrap_or_else(|_| unreachable!());
+    let marker = root.join("started");
+    let child = spawn_suspended_child(&marker, &root, true);
+    let root_pid = child.id();
+    let mut running = child
+        .validate::<(), &'static str, _>(|_| Ok(()))
+        .unwrap_or_else(|_| unreachable!())
+        .resume()
+        .unwrap_or_else(|_| unreachable!());
+    wait_for_marker(&marker);
+    let mut members = Vec::new();
+    for _ in 0..100 {
+        if running
+            .job_processes()
+            .is_ok_and(|processes| processes.len() >= 2)
+        {
+            members = running
+                .job_processes()
+                .unwrap_or_else(|_| unreachable!())
+                .into_iter()
+                .map(|process| process.process_id)
+                .collect::<Vec<_>>();
+            if members.len() >= 2 {
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        members.len() >= 2,
+        "exact tree must contain root and descendant before kill, observed {}",
+        members.len()
+    );
+    assert!(members.contains(&root_pid));
+    assert!(matches!(
+        running.observe().unwrap_or_else(|_| unreachable!()),
+        RunningJobObservation::Running { active_processes } if active_processes >= 2
+    ));
+    let terminal = running
+        .terminate_in_place(0xE1_40)
+        .unwrap_or_else(|error| panic!("exact tree termination failed: {error}"));
+    assert_eq!(terminal.requested_exit_code(), 0xE1_40);
+    assert!(terminal.job_empty());
+    assert!(terminal.root_reaped());
+    let history = terminal.history();
+    assert!(
+        history.job_empty(),
+        "terminal history must observe an empty Job"
+    );
+    assert!(
+        history.complete(),
+        "exact tree kill must produce a complete history"
+    );
+    assert_eq!(history.capture_gap(), None);
+    assert!(
+        history.processes().len() >= 2,
+        "terminal history must retain every owned member"
+    );
+    for pid in &members {
+        assert!(
+            history
+                .processes()
+                .iter()
+                .any(|observed| observed.process().process_id == *pid),
+            "terminal history must account for owned member {pid}"
+        );
+    }
+    assert_eq!(
+        running.observe().unwrap_or_else(|_| unreachable!()),
+        RunningJobObservation::Exited {
+            exit_code: 0xE1_40_u32 as i32
+        }
+    );
+    assert_eq!(
+        running
+            .active_process_count()
+            .unwrap_or_else(|_| unreachable!()),
+        0
+    );
+    assert!(members.into_iter().all(wait_for_process_gone));
+    assert!(wait_for_process_gone(root_pid));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(windows)]
+#[test]
+fn process_job_recoverable_open_rejects_substituted_root_identity() {
+    let _spawn_guard = process_job_spawn_test_guard();
+    let root = std::env::temp_dir().join(format!("eliot-p02-adopt-negative-{}", unique_suffix()));
+    std::fs::create_dir(&root).unwrap_or_else(|_| unreachable!());
+    let marker = root.join("started");
+    let child = spawn_suspended_child(&marker, &root, false);
+    let running = child
+        .validate::<(), &'static str, _>(|_| Ok(()))
+        .unwrap_or_else(|_| unreachable!())
+        .resume()
+        .unwrap_or_else(|_| unreachable!());
+    wait_for_marker(&marker);
+    let binding = running.evidence().recoverable_job_binding().clone();
+    let live_pid = binding.root().process().process_id;
+    let live_start = binding.root().process().start_time_100ns;
+    // The exact live binding reopens while the owner is alive; the handle is
+    // retained so every rejection below proves a root mismatch, not absence.
+    let _live = RecoverableJobObject::open(binding.clone())
+        .unwrap_or_else(|error| panic!("live binding must reopen: {error}"));
+    // Same PID with a different start time models PID reuse: the Job must not
+    // adopt the new generation.
+    let reused_pid = remapped_job_binding(&binding, |value| {
+        value["root"]["process"]["start_time_100ns"] =
+            serde_json::json!(live_start.saturating_add(1));
+    });
+    assert!(matches!(
+        RecoverableJobObject::open(reused_pid),
+        Err(WindowsAdapterError::IdentityMismatch)
+    ));
+    // A different PID with the original start/image models a foreign process:
+    // it is never adopted.
+    let foreign_pid = remapped_job_binding(&binding, |value| {
+        value["root"]["process"]["process_id"] = serde_json::json!(live_pid.wrapping_add(1));
+    });
+    assert!(matches!(
+        RecoverableJobObject::open(foreign_pid),
+        Err(WindowsAdapterError::IdentityMismatch)
+    ));
+    // The same PID/start with a substituted image is never adopted either.
+    let live_image = binding.root().process().image_path.clone();
+    let substituted_image = remapped_job_binding(&binding, |value| {
+        value["root"]["process"]["image_path"] =
+            serde_json::json!(format!("{live_image}.substituted"));
+    });
+    assert!(matches!(
+        RecoverableJobObject::open(substituted_image),
+        Err(WindowsAdapterError::IdentityMismatch)
+    ));
+    running
+        .terminate(0xE1_41)
+        .unwrap_or_else(|_| unreachable!());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(windows)]
+#[test]
+fn process_job_foreign_job_and_stale_root_never_adopted() {
+    let _spawn_guard = process_job_spawn_test_guard();
+    let root = std::env::temp_dir().join(format!("eliot-p02-foreign-job-{}", unique_suffix()));
+    std::fs::create_dir(&root).unwrap_or_else(|_| unreachable!());
+    let first_marker = root.join("first");
+    let second_marker = root.join("second");
+    let first = spawn_suspended_child(&first_marker, &root, false);
+    let mut first_running = first
+        .validate::<(), &'static str, _>(|_| Ok(()))
+        .unwrap_or_else(|_| unreachable!())
+        .resume()
+        .unwrap_or_else(|_| unreachable!());
+    wait_for_marker(&first_marker);
+    let first_binding = first_running.evidence().recoverable_job_binding().clone();
+    let second = spawn_suspended_child(&second_marker, &root, false);
+    let second_running = second
+        .validate::<(), &'static str, _>(|_| Ok(()))
+        .unwrap_or_else(|_| unreachable!())
+        .resume()
+        .unwrap_or_else(|_| unreachable!());
+    wait_for_marker(&second_marker);
+    let second_binding = second_running.evidence().recoverable_job_binding().clone();
+    let _first_live = RecoverableJobObject::open(first_binding.clone())
+        .unwrap_or_else(|error| panic!("first binding must reopen: {error}"));
+    let _second_live = RecoverableJobObject::open(second_binding.clone())
+        .unwrap_or_else(|error| panic!("second binding must reopen: {error}"));
+    // A live foreign Job never adopts another Job's root.
+    let foreign = remapped_job_binding(&first_binding, |value| {
+        value["job"]["name"] = serde_json::json!(second_binding.job_identity().name());
+    });
+    assert!(matches!(
+        RecoverableJobObject::open(foreign),
+        Err(WindowsAdapterError::IdentityMismatch)
+    ));
+    // After the exact tree is terminated the retained binding admits neither
+    // reopen nor new members.
+    let first_pid = first_binding.root().process().process_id;
+    let recovered = RecoverableJobObject::open(first_binding.clone())
+        .unwrap_or_else(|error| panic!("pre-termination reopen failed: {error}"));
+    first_running
+        .terminate_in_place(0xE1_42)
+        .unwrap_or_else(|error| panic!("first tree termination failed: {error}"));
+    assert!(wait_for_process_gone(first_pid));
+    assert!(matches!(
+        RecoverableJobObject::open(first_binding),
+        Err(WindowsAdapterError::IdentityMismatch)
+    ));
+    assert!(matches!(
+        recovered.spawn_member(suspended_spec(&root.join("stale-member"), &root, false)),
+        Err(WindowsAdapterError::IdentityMismatch)
+    ));
+    let second_pid = second_binding.root().process().process_id;
+    second_running
+        .terminate(0xE1_43)
+        .unwrap_or_else(|_| unreachable!());
+    assert!(wait_for_process_gone(second_pid));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(windows)]
+#[test]
+fn process_job_owner_drop_kills_exact_tree_and_removes_reopen_path() {
+    let _spawn_guard = process_job_spawn_test_guard();
+    let root = std::env::temp_dir().join(format!("eliot-p02-owner-loss-{}", unique_suffix()));
+    std::fs::create_dir(&root).unwrap_or_else(|_| unreachable!());
+    let marker = root.join("started");
+    let child = spawn_suspended_child(&marker, &root, true);
+    let root_pid = child.id();
+    let running = child
+        .validate::<(), &'static str, _>(|_| Ok(()))
+        .unwrap_or_else(|_| unreachable!())
+        .resume()
+        .unwrap_or_else(|_| unreachable!());
+    wait_for_marker(&marker);
+    let mut members = Vec::new();
+    for _ in 0..100 {
+        if running
+            .job_processes()
+            .is_ok_and(|processes| processes.len() >= 2)
+        {
+            members = running
+                .job_processes()
+                .unwrap_or_else(|_| unreachable!())
+                .into_iter()
+                .map(|process| process.process_id)
+                .collect::<Vec<_>>();
+            if members.len() >= 2 {
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        members.len() >= 2,
+        "owner-loss contour must include the descendant, observed {}",
+        members.len()
+    );
+    let binding = running.evidence().recoverable_job_binding().clone();
+    // Dropping the sole kill-on-close owner is the owner-loss boundary: the OS
+    // terminates every descendant and destroys the named Job.
+    drop(running);
+    assert!(members.into_iter().all(wait_for_process_gone));
+    assert!(wait_for_process_gone(root_pid));
+    assert!(matches!(
+        RecoverableJobObject::open(binding),
+        Err(WindowsAdapterError::NotFound)
+    ));
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -3597,6 +4066,73 @@ fn runtime_file_access_is_ba_ls_sy_verify_only_while_legacy_keeps_write_dac() {
             .map(str::to_owned)
             .collect()
     );
+}
+
+#[cfg(windows)]
+#[test]
+fn runtime_file_create_mints_installer_descriptor_and_wrong_acl_fails_closed() {
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+    // Production-policy contour: this test never sets the test-root bypass,
+    // so the create branch mints the real installer descriptor and the
+    // readback below enforces it.
+    assert!(test_protected_root().is_none());
+    let dir = std::env::temp_dir().join(format!("eliot-runtime-acl-{}", unique_suffix()));
+    std::fs::create_dir_all(&dir).unwrap_or_else(|_| unreachable!());
+    let expected = OwnedSecurityDescriptor::for_installer_system_object(false)
+        .unwrap_or_else(|error| panic!("runtime descriptor failed: {error}"));
+
+    // (a) Create mints the installer descriptor AT CREATION: the retained
+    // handle verifies under the production policy with owner SYSTEM.
+    let created_path = dir.join(format!("created-{}", unique_suffix()));
+    let created =
+        open_runtime_file_with_share(&created_path, true, FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .unwrap_or_else(|error| {
+                panic!("runtime create must mint the installer descriptor: {error:?}")
+            });
+    verify_readonly_acl(&created, &expected).unwrap_or_else(|error| {
+        panic!("created file must verify under the installer descriptor: {error:?}")
+    });
+    assert_eq!(
+        sid_to_string(expected.owner().unwrap_or_else(|_| unreachable!()))
+            .unwrap_or_else(|_| unreachable!()),
+        "S-1-5-18"
+    );
+    // Passing `verify_readonly_acl` above already proves the created file
+    // carries exactly this descriptor's owner, protected bit, and DACL
+    // bytes; the descriptor's principal set {SY, LS, BA} is pinned by
+    // `runtime_file_access_is_ba_ls_sy_verify_only_while_legacy_keeps_write_dac`.
+    // (No ACE walk here: this contour adds no new `unsafe` sites.)
+    drop(created);
+    std::fs::remove_file(&created_path).unwrap_or_else(|_| unreachable!());
+
+    // (b) AlreadyExists with a wrong (user/inherited) ACL keeps failing
+    // closed: no silent re-ACL, and the file keeps its non-installer ACL.
+    let wrong_path = dir.join(format!("wrong-acl-{}", unique_suffix()));
+    std::fs::write(&wrong_path, b"user-owned").unwrap_or_else(|_| unreachable!());
+    let probe = std::fs::OpenOptions::new()
+        .read(true)
+        .open(&wrong_path)
+        .unwrap_or_else(|_| unreachable!());
+    assert!(
+        verify_readonly_acl(&probe, &expected).is_err(),
+        "fixture must carry a non-installer ACL"
+    );
+    drop(probe);
+    assert!(matches!(
+        open_runtime_file_with_share(&wrong_path, true, FILE_SHARE_READ | FILE_SHARE_WRITE),
+        Err(ProtectedPathError::AclMismatch)
+    ));
+    let after = std::fs::OpenOptions::new()
+        .read(true)
+        .open(&wrong_path)
+        .unwrap_or_else(|_| unreachable!());
+    assert!(
+        verify_readonly_acl(&after, &expected).is_err(),
+        "refused open must not re-ACL the file"
+    );
+    drop(after);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[cfg(windows)]

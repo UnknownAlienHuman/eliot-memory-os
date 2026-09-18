@@ -9,7 +9,7 @@
 #![forbid(unsafe_code)]
 
 use blake3::Hash;
-use eliot_contracts::{canonical_json_bytes, sha256_hex};
+use eliot_contracts::{EpochId, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_instrument_api::{Assertability, EvidenceAxes, EvidenceStatus};
 use eliot_platform::ClockObservation;
 use schemars::JsonSchema;
@@ -36,7 +36,7 @@ pub use execution_evidence::{
 };
 
 /// Current provider-neutral process contract revision.
-pub const PROCESS_CONTRACT_SCHEMA_VERSION: &str = "eliot-process-contract-v3";
+pub const PROCESS_CONTRACT_SCHEMA_VERSION: &str = "eliot-process-contract-v4";
 /// The sole admitted Windows semantic implementation identifier.
 pub const PROCESS_IMPLEMENTATION_ID: &str = "eliot.process.windows.v1";
 
@@ -168,10 +168,14 @@ impl Generation {
 }
 
 /// A state-fence snapshot. It is inert data and never grants dispatch authority.
+///
+/// The authority epoch is the canonical lineage-aware [`EpochId`] exact tuple.
+/// There is no scalar epoch field: legacy numeric wire cannot deserialize into
+/// this shape and is therefore quarantined, never promoted.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FencingToken {
-    authority_epoch: u64,
+    authority_epoch: EpochId,
     generation: Generation,
     nonce: String,
 }
@@ -179,16 +183,10 @@ pub struct FencingToken {
 impl FencingToken {
     /// Creates inert fence data. A valid [`DispatchPermit`] must authenticate it.
     pub fn new(
-        authority_epoch: u64,
+        authority_epoch: EpochId,
         generation: Generation,
         nonce: impl Into<String>,
     ) -> Result<Self, ContractError> {
-        if authority_epoch == 0 {
-            return Err(ContractError::InvalidValue {
-                field: "authority_epoch",
-                reason: "must be non-zero",
-            });
-        }
         Ok(Self {
             authority_epoch,
             generation,
@@ -196,9 +194,9 @@ impl FencingToken {
         })
     }
 
-    /// Returns the authority epoch.
-    pub const fn authority_epoch(&self) -> u64 {
-        self.authority_epoch
+    /// Returns the canonical authority epoch (exact lineage and sequence tuple).
+    pub const fn authority_epoch(&self) -> &EpochId {
+        &self.authority_epoch
     }
 
     /// Returns the generation covered by this fence.
@@ -209,6 +207,43 @@ impl FencingToken {
     /// Returns the opaque nonce.
     pub fn nonce(&self) -> &str {
         &self.nonce
+    }
+
+    /// Exact-tuple canonical authorization against the expected epoch.
+    ///
+    /// Returns true only when [`StateFence::authorizes_canonical`] holds for
+    /// the exact `(lineage_id, sequence)` tuple via `is_same_authority`.
+    /// Cross-lineage equal sequences never authorize.
+    pub fn authorizes_canonical(&self, expected: &EpochId) -> bool {
+        StateFence::authorizes_canonical(&self.authority_epoch, expected)
+    }
+
+    /// Fail-closed exact-tuple validation against the expected epoch.
+    pub fn validate_canonical_against(&self, expected: &EpochId) -> Result<(), ContractError> {
+        if StateFence::authorizes_canonical(&self.authority_epoch, expected) {
+            Ok(())
+        } else {
+            Err(ContractError::StaleAuthorityEpoch)
+        }
+    }
+
+    /// Fail-closed direct-child advancement check against an explicit parent.
+    ///
+    /// Returns `Ok(())` only when [`StateFence::validate_canonical_epoch`]
+    /// accepts the one-step transition. Cross-lineage and non-consecutive
+    /// sequences fail closed.
+    pub fn validate_canonical_epoch(&self, parent: &EpochId) -> Result<(), ContractError> {
+        StateFence::validate_canonical_epoch(&self.authority_epoch, parent)
+            .map_err(|_| ContractError::StaleAuthorityEpoch)
+    }
+
+    /// Lineage-bound canonical digest for the carried epoch.
+    ///
+    /// Equal sequences in different lineages digest differently.
+    pub fn canonical_epoch_digest(&self) -> Option<String> {
+        StateFence::canonical_epoch_digest(&self.authority_epoch)
+            .ok()
+            .map(|digest| digest.as_str().to_owned())
     }
 
     /// Checks exact fence equality.
@@ -599,7 +634,7 @@ pub struct ProcessExecutionAdmissionRequest {
 pub struct ProcessOwnerBinding {
     module_id: String,
     principal_digest: String,
-    authority_epoch: u64,
+    authority_epoch: EpochId,
     generation: Generation,
 }
 
@@ -608,15 +643,9 @@ impl ProcessOwnerBinding {
     pub fn new(
         module_id: impl Into<String>,
         principal_digest: impl Into<String>,
-        authority_epoch: u64,
+        authority_epoch: EpochId,
         generation: Generation,
     ) -> Result<Self, ContractError> {
-        if authority_epoch == 0 {
-            return Err(ContractError::InvalidValue {
-                field: "owner_authority_epoch",
-                reason: "authority epoch must be non-zero",
-            });
-        }
         let binding = Self {
             module_id: validate_opaque_id("owner_module_id", module_id.into())?,
             principal_digest: principal_digest.into(),
@@ -635,13 +664,41 @@ impl ProcessOwnerBinding {
     pub fn principal_digest(&self) -> &str {
         &self.principal_digest
     }
-    /// Returns the bound authority epoch.
-    pub const fn authority_epoch(&self) -> u64 {
-        self.authority_epoch
+    /// Returns the bound canonical authority epoch (exact lineage and
+    /// sequence tuple).
+    pub const fn authority_epoch(&self) -> &EpochId {
+        &self.authority_epoch
     }
     /// Returns the bound generation.
     pub const fn generation(&self) -> Generation {
         self.generation
+    }
+
+    /// Exact-tuple canonical authorization.
+    pub fn authorizes_canonical(&self, expected: &EpochId) -> bool {
+        StateFence::authorizes_canonical(&self.authority_epoch, expected)
+    }
+
+    /// Fail-closed exact-tuple validation.
+    pub fn validate_canonical_against(&self, expected: &EpochId) -> Result<(), ContractError> {
+        if StateFence::authorizes_canonical(&self.authority_epoch, expected) {
+            Ok(())
+        } else {
+            Err(ContractError::StaleAuthorityEpoch)
+        }
+    }
+
+    /// Fail-closed direct-child advancement check.
+    pub fn validate_canonical_epoch(&self, parent: &EpochId) -> Result<(), ContractError> {
+        StateFence::validate_canonical_epoch(&self.authority_epoch, parent)
+            .map_err(|_| ContractError::StaleAuthorityEpoch)
+    }
+
+    /// Lineage-bound canonical digest.
+    pub fn canonical_epoch_digest(&self) -> Option<String> {
+        StateFence::canonical_epoch_digest(&self.authority_epoch)
+            .ok()
+            .map(|digest| digest.as_str().to_owned())
     }
 }
 
@@ -680,6 +737,309 @@ impl ProcessSessionBinding {
     /// Returns the transport session epoch.
     pub const fn session_epoch(&self) -> u64 {
         self.session_epoch
+    }
+}
+
+/// Typed durable process-execution session class (issue #79).
+///
+/// A process caller session is never a transport connection: each class names
+/// the exact durable identity family that owns the execution session, while
+/// the replaceable pipe connection stays in the separate ephemeral
+/// [`ProcessSessionBinding`]. The class travels only inside the server-derived
+/// [`ProcessCallerSession`]; it is never parsed from a wire string, and no
+/// `connection_id` value is ever promoted into it.
+#[derive(
+    Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessSessionClass {
+    /// Service-owned daemon generation (`eliotd` launch lineage).
+    EliotdGeneration,
+    /// Interactive User Broker session (stable SID plus broker session identity).
+    UserBrokerSession,
+    /// Test daemon attempt (testd job plus attempt lineage).
+    TestdAttempt,
+    /// Native worker attempt (worker claim plus attempt lineage).
+    NativeWorkerAttempt,
+}
+
+impl ProcessSessionClass {
+    /// Returns the stable class name used in diagnostics and receipts.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::EliotdGeneration => "eliotd_generation",
+            Self::UserBrokerSession => "user_broker_session",
+            Self::TestdAttempt => "testd_attempt",
+            Self::NativeWorkerAttempt => "native_worker_attempt",
+        }
+    }
+}
+
+/// Durable admitted process-caller session (issue #79).
+///
+/// Server-derived binding of the exact [`ProcessOwnerBinding`] to the exact
+/// durable execution [`SessionId`]. It is constructed only from admitted
+/// Kernel state (active daemon launch, authenticated peer identity, front-door
+/// policy generation) and never from `connection_id` or any other
+/// wire-supplied transport value. A reconnect preserves this binding while the
+/// ephemeral [`ProcessSessionBinding`] changes; a detach, revoke, logoff, or
+/// authority-epoch change invalidates it even if the pipe stays alive.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessCallerSession {
+    class: ProcessSessionClass,
+    owner: ProcessOwnerBinding,
+    session_id: SessionId,
+}
+
+impl ProcessCallerSession {
+    /// Binds an exact owner to an exact durable session under one class.
+    ///
+    /// Callers must supply server-admitted values only: this constructor
+    /// cannot tell a transport `connection_id` from a durable session by
+    /// shape, so the invariant "never wire-supplied" is upheld by
+    /// constructing exclusively from Kernel-admitted state at the
+    /// dispatch seams.
+    pub fn new(
+        class: ProcessSessionClass,
+        owner: ProcessOwnerBinding,
+        session_id: SessionId,
+    ) -> Result<Self, ContractError> {
+        let session = Self {
+            class,
+            owner,
+            session_id,
+        };
+        session.validate()?;
+        Ok(session)
+    }
+
+    /// Validates the admitted binding without granting authority.
+    pub fn validate(&self) -> Result<(), ContractError> {
+        self.session_id.validate()?;
+        validate_opaque_id(
+            "caller_session_owner_module",
+            self.owner.module_id().to_owned(),
+        )?;
+        validate_hex_digest(
+            "caller_session_owner_principal",
+            self.owner.principal_digest(),
+        )?;
+        Ok(())
+    }
+
+    /// Returns the durable session class.
+    pub const fn class(&self) -> ProcessSessionClass {
+        self.class
+    }
+
+    /// Returns the exact admitted owner.
+    pub const fn owner(&self) -> &ProcessOwnerBinding {
+        &self.owner
+    }
+
+    /// Returns the exact durable session identity (never a `connection_id`).
+    pub const fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+}
+
+/// Validates `intent.session_id` against the admitted durable caller session.
+///
+/// The intent session is authorized only by equality with the server-derived
+/// admitted binding; it is never compared against the transport
+/// `connection_id`, so copying a connection ID into a [`ProcessIntent`] can
+/// never authorize launch. The sealed effect digest is untouched: this check
+/// reads `session_id` but never rewrites it.
+///
+/// Distinct fail-closed failures:
+/// - wrong process owner (module or principal differs) →
+///   [`ContractError::DispatchBindingMismatch`];
+/// - stale authority epoch on the presented owner or the admission fence →
+///   [`ContractError::StaleAuthorityEpoch`];
+/// - stale fence/owner generation → [`ContractError::FenceMismatch`];
+/// - stale or foreign durable session (including a copied `connection_id`) →
+///   [`ContractError::StaleProcessSession`].
+pub fn validate_process_intent_session(
+    intent: &ProcessIntent,
+    admitted: &ProcessCallerSession,
+    presented_owner: &ProcessOwnerBinding,
+    fence: &FencingToken,
+) -> Result<(), ContractError> {
+    admitted.validate()?;
+    if presented_owner.module_id() != admitted.owner.module_id()
+        || presented_owner.principal_digest() != admitted.owner.principal_digest()
+    {
+        return Err(ContractError::DispatchBindingMismatch);
+    }
+    if !presented_owner
+        .authority_epoch()
+        .is_same_authority(admitted.owner.authority_epoch())
+        || !fence
+            .authority_epoch()
+            .is_same_authority(admitted.owner.authority_epoch())
+    {
+        return Err(ContractError::StaleAuthorityEpoch);
+    }
+    if presented_owner.generation() != admitted.owner.generation()
+        || fence.generation() != admitted.owner.generation()
+    {
+        return Err(ContractError::FenceMismatch);
+    }
+    if intent.session_id() != admitted.session_id() {
+        return Err(ContractError::StaleProcessSession);
+    }
+    Ok(())
+}
+
+/// Validates that the presented ephemeral transport binding is exactly the
+/// currently established one.
+///
+/// Transport identity authorizes routing and replay fencing only: a mismatch
+/// fails with [`ContractError::StaleTransportBinding`] and never promotes the
+/// presenting pipe into process ownership.
+pub fn validate_process_transport_binding(
+    presented: &ProcessSessionBinding,
+    current: &ProcessSessionBinding,
+) -> Result<(), ContractError> {
+    if presented != current {
+        return Err(ContractError::StaleTransportBinding);
+    }
+    Ok(())
+}
+
+/// Explicit Kernel receipt rebinding replaceable transport to an unchanged
+/// durable caller session (issue #79, I7.14–I7.15).
+///
+/// Minted server-side when a reconnect (or a fresh pipe for the same
+/// principal) binds a new `(connection_id, session_epoch)` pair to the
+/// already-admitted [`ProcessCallerSession`]. The durable session, owner, and
+/// class never change across the rebind, so the sealed intent/effect digest
+/// is preserved by construction. The receipt digest seals the whole binding:
+/// a receipt cannot be transplanted across sessions, owners, connections, or
+/// epochs. Fencing the superseded transport remains the front-door's duty;
+/// this receipt only proves the new binding.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessTransportRebindReceipt {
+    class: ProcessSessionClass,
+    owner: ProcessOwnerBinding,
+    session_id: SessionId,
+    connection_id: String,
+    session_epoch: u64,
+    authority_epoch: EpochId,
+    receipt_digest: String,
+}
+
+impl ProcessTransportRebindReceipt {
+    /// Mints a rebind receipt for the new transport of an admitted caller.
+    ///
+    /// `connection_id` and `session_epoch` are the freshly established
+    /// transport values; a zero transport epoch is stale transport material
+    /// and fails with [`ContractError::StaleTransportBinding`].
+    pub fn mint(
+        caller: &ProcessCallerSession,
+        connection_id: impl Into<String>,
+        session_epoch: u64,
+    ) -> Result<Self, ContractError> {
+        caller.validate()?;
+        let connection_id = validate_opaque_id("rebind_connection_id", connection_id.into())?;
+        if session_epoch == 0 {
+            return Err(ContractError::StaleTransportBinding);
+        }
+        let mut receipt = Self {
+            class: caller.class,
+            owner: caller.owner.clone(),
+            session_id: caller.session_id.clone(),
+            connection_id,
+            session_epoch,
+            authority_epoch: caller.owner.authority_epoch.clone(),
+            receipt_digest: String::new(),
+        };
+        receipt.receipt_digest = receipt.compute_digest()?;
+        Ok(receipt)
+    }
+
+    /// Validates the receipt shape and its sealing digest.
+    pub fn validate(&self) -> Result<(), ContractError> {
+        self.session_id.validate()?;
+        validate_opaque_id("rebind_connection_id", self.connection_id.clone())?;
+        if self.session_epoch == 0 {
+            return Err(ContractError::StaleTransportBinding);
+        }
+        validate_stored_digest(
+            "rebind_receipt_digest",
+            &self.receipt_digest,
+            self.compute_digest()?,
+        )
+    }
+
+    /// Returns true only when this receipt rebinds transport for exactly
+    /// `caller` without changing durable identity.
+    pub fn rebinds(&self, caller: &ProcessCallerSession) -> bool {
+        self.validate().is_ok()
+            && self.class == caller.class
+            && self.owner == caller.owner
+            && self.session_id == caller.session_id
+    }
+
+    /// Returns the durable session class carried across the rebind.
+    pub const fn class(&self) -> ProcessSessionClass {
+        self.class
+    }
+
+    /// Returns the admitted owner carried across the rebind.
+    pub const fn owner(&self) -> &ProcessOwnerBinding {
+        &self.owner
+    }
+
+    /// Returns the unchanged durable session identity.
+    pub const fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
+    /// Returns the newly bound transport connection identity (routing only).
+    pub fn connection_id(&self) -> &str {
+        &self.connection_id
+    }
+
+    /// Returns the newly bound transport session epoch (routing only).
+    pub const fn session_epoch(&self) -> u64 {
+        self.session_epoch
+    }
+
+    /// Returns the authority epoch fenced at rebind time.
+    pub const fn authority_epoch(&self) -> &EpochId {
+        &self.authority_epoch
+    }
+
+    /// Returns the sealing digest over the whole rebind binding.
+    pub fn receipt_digest(&self) -> &str {
+        &self.receipt_digest
+    }
+
+    fn compute_digest(&self) -> Result<String, ContractError> {
+        #[derive(Serialize)]
+        struct RebindMaterial<'a> {
+            class: &'a str,
+            module_id: &'a str,
+            principal_digest: &'a str,
+            authority_epoch: &'a EpochId,
+            generation: Generation,
+            session_id: &'a SessionId,
+            connection_id: &'a str,
+            session_epoch: u64,
+        }
+        hash_serialized(&RebindMaterial {
+            class: self.class.as_str(),
+            module_id: self.owner.module_id(),
+            principal_digest: self.owner.principal_digest(),
+            authority_epoch: &self.authority_epoch,
+            generation: self.owner.generation(),
+            session_id: &self.session_id,
+            connection_id: &self.connection_id,
+            session_epoch: self.session_epoch,
+        })
     }
 }
 
@@ -984,7 +1344,7 @@ pub type ProcessSpec = ProcessRequest;
 pub struct DispatchValidationContext {
     clock: ClockObservation,
     state_fence: FencingToken,
-    authority_epoch: u64,
+    authority_epoch: EpochId,
     revision_heads: BTreeMap<String, String>,
     validation_revision: u64,
 }
@@ -994,7 +1354,7 @@ impl DispatchValidationContext {
     pub fn new(
         clock: ClockObservation,
         state_fence: FencingToken,
-        authority_epoch: u64,
+        authority_epoch: EpochId,
         revision_heads: BTreeMap<String, String>,
         validation_revision: u64,
     ) -> Result<Self, ContractError> {
@@ -1009,6 +1369,44 @@ impl DispatchValidationContext {
         Ok(context)
     }
 
+    /// Returns the current canonical authority epoch (exact lineage and
+    /// sequence tuple).
+    pub const fn authority_epoch(&self) -> &EpochId {
+        &self.authority_epoch
+    }
+
+    /// Exact-tuple canonical authorization for one fence under this context.
+    ///
+    /// Returns true only when the fence epoch and this context authority are
+    /// the exact tuple via [`StateFence::authorizes_canonical`].
+    /// Cross-lineage equal sequences never authorize.
+    pub fn canonical_authorizes(&self, fence: &FencingToken) -> bool {
+        if !self
+            .state_fence
+            .authority_epoch()
+            .is_same_authority(fence.authority_epoch())
+        {
+            return false;
+        }
+        StateFence::authorizes_canonical(fence.authority_epoch(), &self.authority_epoch)
+    }
+
+    /// Fail-closed canonical validation for one fence under this context.
+    pub fn validate_canonical_against(&self, fence: &FencingToken) -> Result<(), ContractError> {
+        if self.canonical_authorizes(fence) {
+            Ok(())
+        } else {
+            Err(ContractError::StaleAuthorityEpoch)
+        }
+    }
+
+    /// Lineage-bound digest for the context canonical authority.
+    pub fn canonical_authority_digest(&self) -> Option<String> {
+        StateFence::canonical_epoch_digest(&self.authority_epoch)
+            .ok()
+            .map(|digest| digest.as_str().to_owned())
+    }
+
     fn validate(&self) -> Result<(), ContractError> {
         self.clock
             .validate()
@@ -1017,13 +1415,17 @@ impl DispatchValidationContext {
                 reason: "P-01 clock observation is invalid",
             })?;
         let _ = self.now_unix_ms()?;
-        if self.authority_epoch == 0 || self.validation_revision == 0 {
+        if self.validation_revision == 0 {
             return Err(ContractError::InvalidValue {
                 field: "validation_context",
-                reason: "authority epoch and validation revision must be non-zero",
+                reason: "validation revision must be non-zero",
             });
         }
-        if self.state_fence.authority_epoch != self.authority_epoch {
+        if !self
+            .state_fence
+            .authority_epoch()
+            .is_same_authority(&self.authority_epoch)
+        {
             return Err(ContractError::FenceMismatch);
         }
         validate_revision_heads(&self.revision_heads)
@@ -1056,7 +1458,7 @@ pub struct ProcessExecutionBinding {
     generation: Generation,
     action_lease_ref: ActionLeaseRef,
     authority_id: DispatchAuthorityId,
-    authority_epoch: u64,
+    authority_epoch: EpochId,
     state_fence: FencingToken,
     request_digest: String,
     permit_digest: String,
@@ -1073,16 +1475,19 @@ impl ProcessExecutionBinding {
         self.session_id.validate()?;
         self.action_lease_ref.validate()?;
         self.authority_id.validate()?;
-        if self.authority_epoch == 0 || self.validation_revision == 0 {
+        if self.validation_revision == 0 {
             return Err(ContractError::InvalidValue {
                 field: "process_execution_binding",
-                reason: "authority epoch and validation revision must be non-zero",
+                reason: "validation revision must be non-zero",
             });
         }
         validate_hex_digest("request_digest", &self.request_digest)?;
         validate_hex_digest("permit_digest", &self.permit_digest)?;
         validate_hex_digest("effect_digest", &self.effect_digest)?;
-        if self.state_fence.authority_epoch != self.authority_epoch
+        if !self
+            .state_fence
+            .authority_epoch()
+            .is_same_authority(&self.authority_epoch)
             || self.state_fence.generation != self.generation
         {
             return Err(ContractError::FenceMismatch);
@@ -1133,6 +1538,55 @@ impl ProcessExecutionBinding {
     /// Returns the validation revision.
     pub const fn validation_revision(&self) -> u64 {
         self.validation_revision
+    }
+
+    /// Returns the bound canonical authority epoch (exact lineage and
+    /// sequence tuple).
+    pub const fn authority_epoch(&self) -> &EpochId {
+        &self.authority_epoch
+    }
+
+    /// Exact-tuple canonical authorization under one validation context.
+    ///
+    /// Returns true only when this binding epoch, its state fence epoch, and
+    /// the context authority are all the exact tuple via
+    /// [`StateFence::authorizes_canonical`]. Any mismatch returns false.
+    pub fn canonical_authorizes(&self, current: &DispatchValidationContext) -> bool {
+        if !self
+            .state_fence
+            .authority_epoch()
+            .is_same_authority(current.state_fence.authority_epoch())
+        {
+            return false;
+        }
+        StateFence::authorizes_canonical(&self.authority_epoch, &current.authority_epoch)
+            && StateFence::authorizes_canonical(
+                self.state_fence.authority_epoch(),
+                &current.authority_epoch,
+            )
+            && StateFence::authorizes_canonical(
+                &self.authority_epoch,
+                self.state_fence.authority_epoch(),
+            )
+    }
+
+    /// Fail-closed canonical validation under one validation context.
+    pub fn validate_canonical_against(
+        &self,
+        current: &DispatchValidationContext,
+    ) -> Result<(), ContractError> {
+        if self.canonical_authorizes(current) {
+            Ok(())
+        } else {
+            Err(ContractError::StaleAuthorityEpoch)
+        }
+    }
+
+    /// Lineage-bound digest for the binding canonical authority.
+    pub fn canonical_authority_digest(&self) -> Option<String> {
+        StateFence::canonical_epoch_digest(&self.authority_epoch)
+            .ok()
+            .map(|digest| digest.as_str().to_owned())
     }
 
     fn matches_identity(&self, identity: &ProcessIdentity) -> bool {
@@ -1887,6 +2341,12 @@ impl EliotdLiveSupervisionEvidence {
 /// Exact request/session evidence attached to one authenticated `daemon_ready`
 /// publication.  The request payload is represented by its canonical digest;
 /// the raw request remains on the authenticated transport only.
+///
+/// This evidence copy stays scalar-only by design: it is constructed by struct
+/// literal outside this crate, so any additive field would break downstream
+/// literals. Canonical authority lives in `FencingToken`/`ProcessOwnerBinding`/
+/// `DispatchValidationContext`/`ProcessExecutionBinding`; this scalar-only
+/// evidence is quarantined from canonical authority and never promotes it.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EliotdLiveReadyEvidence {
@@ -1933,6 +2393,14 @@ impl EliotdLiveReadyEvidence {
 /// authenticated readiness and was observed in its executor Job.  This is an
 /// inert evidence record: status consumers must independently re-read the
 /// manifest, receipt file, ORS, and live process contour.
+///
+/// This receipt copy stays scalar-only by design: it is a pub-field evidence
+/// copy (constructed via `new` from evidence assembled outside this crate),
+/// so any additive pub field would risk breaking downstream construction and
+/// wire-shape expectations. Canonical authority lives in
+/// `FencingToken`/`ProcessOwnerBinding`/`DispatchValidationContext`/
+/// `ProcessExecutionBinding`; this scalar-only receipt is quarantined from
+/// canonical authority and never promotes it.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EliotdLiveReceipt {
@@ -2282,6 +2750,16 @@ pub enum ContractError {
     /// The active authority epoch changed.
     #[error("STALE_AUTHORITY_EPOCH")]
     StaleAuthorityEpoch,
+    /// The presented durable process session does not match the admitted
+    /// caller binding. A transport `connection_id` copied into the intent
+    /// always fails here; transport identity never authorizes a session.
+    #[error("STALE_PROCESS_SESSION")]
+    StaleProcessSession,
+    /// The presented transport binding is stale or belongs to another
+    /// connection. Transport identity authorizes routing only, never
+    /// process ownership.
+    #[error("STALE_TRANSPORT_BINDING")]
+    StaleTransportBinding,
     /// A required revision head changed.
     #[error("dispatch permit revision heads are stale")]
     StaleRevisionHeads,
@@ -2490,7 +2968,11 @@ mod tests {
     }
 
     fn fence() -> Result<FencingToken, ContractError> {
-        FencingToken::new(7, Generation::new(1)?, "fence-7-1")
+        FencingToken::new(
+            test_epoch(CANONICAL_LINEAGE_A, 7)?,
+            Generation::new(1)?,
+            "fence-7-1",
+        )
     }
 
     fn authority() -> Result<DispatchPermitAuthority, ContractError> {
@@ -2520,7 +3002,7 @@ mod tests {
                 monotonic_ns: Some(1),
             },
             fence()?,
-            7,
+            test_epoch(CANONICAL_LINEAGE_A, 7)?,
             revisions(),
             41,
         )
@@ -2601,7 +3083,11 @@ mod tests {
 
     #[test]
     fn cross_process_admission_rejects_stale_generation_fence() -> TestResult {
-        let stale = FencingToken::new(7, Generation::new(2)?, "fence-7-2")?;
+        let stale = FencingToken::new(
+            test_epoch(CANONICAL_LINEAGE_A, 7)?,
+            Generation::new(2)?,
+            "fence-7-2",
+        )?;
         let Err(error) = ProcessExecutionAdmissionRequest::new(
             "eliotd",
             intent()?,
@@ -2781,7 +3267,11 @@ mod tests {
             )?,
         )?;
         let request = ProcessRequest::new(intent.clone(), permit)?;
-        let changed_fence = FencingToken::new(8, Generation::new(1)?, "other-fence")?;
+        let changed_fence = FencingToken::new(
+            test_epoch(CANONICAL_LINEAGE_A, 8)?,
+            Generation::new(1)?,
+            "other-fence",
+        )?;
         let changed_context = DispatchValidationContext::new(
             ClockObservation {
                 valid_time_ms: Some(150),
@@ -2790,7 +3280,7 @@ mod tests {
                 monotonic_ns: Some(1),
             },
             changed_fence,
-            8,
+            test_epoch(CANONICAL_LINEAGE_A, 8)?,
             revisions(),
             41,
         )?;
@@ -3130,6 +3620,794 @@ mod tests {
             authority.issue(&intent, issuance("duplicate")?),
             Err(ContractError::DuplicateValue { .. })
         ));
+        Ok(())
+    }
+
+    const CANONICAL_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+    const CANONICAL_LINEAGE_B: &str = "550e8400-e29b-41d4-a716-446655440001";
+
+    fn test_epoch(lineage: &str, sequence: u64) -> Result<EpochId, ContractError> {
+        let lineage_id = eliot_contracts::EpochLineageId::new(lineage).map_err(|_| {
+            ContractError::InvalidValue {
+                field: "test_epoch.lineage_id",
+                reason: "lineage must be canonical lowercase hyphenated UUID",
+            }
+        })?;
+        let sequence = std::num::NonZeroU64::new(sequence).ok_or(ContractError::InvalidValue {
+            field: "test_epoch.sequence",
+            reason: "sequence must be non-zero",
+        })?;
+        EpochId::new(lineage_id, sequence).map_err(|_| ContractError::InvalidValue {
+            field: "test_epoch",
+            reason: "epoch is invalid",
+        })
+    }
+
+    fn test_fence(
+        lineage: &str,
+        sequence: u64,
+        nonce: &str,
+    ) -> Result<FencingToken, ContractError> {
+        FencingToken::new(test_epoch(lineage, sequence)?, Generation::new(1)?, nonce)
+    }
+
+    fn test_context(
+        fence: FencingToken,
+        lineage: &str,
+        sequence: u64,
+    ) -> Result<DispatchValidationContext, ContractError> {
+        DispatchValidationContext::new(
+            ClockObservation {
+                valid_time_ms: Some(150),
+                known_time_ms: Some(150),
+                transaction_sequence: None,
+                monotonic_ns: Some(1),
+            },
+            fence,
+            test_epoch(lineage, sequence)?,
+            revisions(),
+            41,
+        )
+    }
+
+    #[test]
+    fn canonical_roundtrip_authorizes_exact_tuple() -> TestResult {
+        let epoch = test_epoch(CANONICAL_LINEAGE_A, 7)?;
+        let fence = test_fence(CANONICAL_LINEAGE_A, 7, "fence-7-1")?;
+        assert_eq!(fence.authority_epoch(), &epoch);
+        assert!(fence.authorizes_canonical(&epoch));
+        assert!(fence.validate_canonical_against(&epoch).is_ok());
+        assert!(fence.canonical_epoch_digest().is_some());
+        assert!(
+            fence
+                .validate_canonical_epoch(&test_epoch(CANONICAL_LINEAGE_A, 6)?)
+                .is_ok()
+        );
+
+        let owner = ProcessOwnerBinding::new(
+            "module-1",
+            "c".repeat(64),
+            test_epoch(CANONICAL_LINEAGE_A, 7)?,
+            Generation::new(1)?,
+        )?;
+        assert_eq!(owner.authority_epoch(), &epoch);
+        assert!(owner.authorizes_canonical(&epoch));
+
+        let ctx = context(150)?;
+        assert_eq!(ctx.authority_epoch(), &epoch);
+        assert!(ctx.canonical_authorizes(&fence));
+        assert!(ctx.validate_canonical_against(&fence).is_ok());
+        assert!(ctx.canonical_authority_digest().is_some());
+
+        let (_, validated) = validated()?;
+        let binding = validated.binding();
+        assert_eq!(binding.authority_epoch(), &epoch);
+        assert!(binding.canonical_authorizes(&ctx));
+        assert!(binding.canonical_authority_digest().is_some());
+
+        // v4 wire carries the exact tuple and round-trips.
+        let fence_value = serde_json::to_value(&fence)?;
+        assert_eq!(
+            fence_value["authority_epoch"]["lineage_id"],
+            serde_json::json!(CANONICAL_LINEAGE_A)
+        );
+        assert_eq!(
+            fence_value["authority_epoch"]["sequence"],
+            serde_json::json!(7)
+        );
+        let restored: FencingToken = serde_json::from_value(fence_value)?;
+        assert_eq!(restored, fence);
+
+        let ctx_value = serde_json::to_value(&ctx)?;
+        let restored_ctx: DispatchValidationContext = serde_json::from_value(ctx_value)?;
+        assert_eq!(restored_ctx, ctx);
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_bearing_authorizes_exact_tuple() -> TestResult {
+        let epoch = test_epoch(CANONICAL_LINEAGE_A, 7)?;
+        let fence = test_fence(CANONICAL_LINEAGE_A, 7, "fence-canon-1")?;
+        assert_eq!(fence.authority_epoch(), &epoch);
+        assert!(fence.authorizes_canonical(&epoch));
+        assert!(fence.validate_canonical_against(&epoch).is_ok());
+        assert!(fence.canonical_epoch_digest().is_some());
+
+        let owner = ProcessOwnerBinding::new(
+            "module-1",
+            "c".repeat(64),
+            test_epoch(CANONICAL_LINEAGE_A, 7)?,
+            Generation::new(1)?,
+        )?;
+        assert!(owner.authorizes_canonical(&epoch));
+
+        let ctx = test_context(fence.clone(), CANONICAL_LINEAGE_A, 7)?;
+        assert!(ctx.canonical_authorizes(&fence));
+
+        // Full dispatch flow under canonical authority.
+        let mut authority = authority()?;
+        let intent = intent()?;
+        let permit = authority.issue(
+            &intent,
+            PermitIssuance::new(
+                ActionLeaseRef::new("lease-1")?,
+                test_fence(CANONICAL_LINEAGE_A, 7, "fence-canon-flow")?,
+                revisions(),
+                100,
+                200,
+                "canon-flow-1",
+            )?,
+        )?;
+        let flow_fence = permit.state_fence.clone();
+        let request = ProcessRequest::new(intent.clone(), permit)?;
+        let flow_ctx = DispatchValidationContext::new(
+            ClockObservation {
+                valid_time_ms: Some(150),
+                known_time_ms: Some(150),
+                transaction_sequence: None,
+                monotonic_ns: Some(1),
+            },
+            flow_fence.clone(),
+            test_epoch(CANONICAL_LINEAGE_A, 7)?,
+            revisions(),
+            41,
+        )?;
+        assert!(flow_ctx.canonical_authorizes(&flow_fence));
+        let validated =
+            authority.validate_and_consume_canonical(request, observed(&intent)?, &flow_ctx)?;
+        assert!(validated.binding().canonical_authorizes(&flow_ctx));
+        let capability = authority.issue_recovery_capability_canonical(
+            validated.binding().clone(),
+            "p07-canon-1",
+            &flow_ctx,
+        )?;
+        assert_eq!(capability.capability_id(), "p07-canon-1");
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_mismatch_is_quarantined_skip_and_cross_lineage() -> TestResult {
+        let fence_a7 = test_fence(CANONICAL_LINEAGE_A, 7, "fence-a7")?;
+        let epoch_a7 = test_epoch(CANONICAL_LINEAGE_A, 7)?;
+        let epoch_a9 = test_epoch(CANONICAL_LINEAGE_A, 9)?;
+        let epoch_foreign7 = test_epoch(CANONICAL_LINEAGE_B, 7)?;
+        let epoch_a8 = test_epoch(CANONICAL_LINEAGE_A, 8)?;
+
+        // Exact-tuple authorization rejects skip and cross-lineage.
+        assert!(!fence_a7.authorizes_canonical(&epoch_a9));
+        assert!(!fence_a7.authorizes_canonical(&epoch_foreign7));
+        assert!(fence_a7.validate_canonical_against(&epoch_a9).is_err());
+        assert!(
+            fence_a7
+                .validate_canonical_against(&epoch_foreign7)
+                .is_err()
+        );
+
+        // Advancement is direct-child only with closed errors.
+        assert!(
+            eliot_contracts::StateFence::validate_canonical_epoch(&epoch_a8, &epoch_a7).is_ok()
+        );
+        assert_eq!(
+            eliot_contracts::StateFence::validate_canonical_epoch(&epoch_a9, &epoch_a7),
+            Err(eliot_contracts::EpochContractError::NotDirectChild)
+        );
+        assert_eq!(
+            eliot_contracts::StateFence::validate_canonical_epoch(&epoch_foreign7, &epoch_a7),
+            Err(eliot_contracts::EpochContractError::ParentLineageMismatch)
+        );
+
+        // Context-level and authority-level quarantine without nonce mutation:
+        // a context internally consistent in lineage B rejects a lineage-A
+        // fence (an inconsistent fence/authority pair cannot even construct).
+        let foreign_fence = test_fence(CANONICAL_LINEAGE_B, 7, "fence-b7")?;
+        let foreign_ctx = test_context(foreign_fence, CANONICAL_LINEAGE_B, 7)?;
+        assert!(!foreign_ctx.canonical_authorizes(&fence_a7));
+
+        let mut authority = authority()?;
+        let intent = intent()?;
+        let permit = authority.issue(
+            &intent,
+            PermitIssuance::new(
+                ActionLeaseRef::new("lease-1")?,
+                test_fence(CANONICAL_LINEAGE_A, 7, "fence-quarantine")?,
+                revisions(),
+                100,
+                200,
+                "canon-quarantine-1",
+            )?,
+        )?;
+        let request = ProcessRequest::new(intent.clone(), permit)?;
+        let before = authority.consumed_permit_count();
+        assert!(
+            authority
+                .validate_and_consume_canonical(request, observed(&intent)?, &foreign_ctx)
+                .is_err()
+        );
+        assert_eq!(authority.consumed_permit_count(), before);
+        Ok(())
+    }
+
+    #[test]
+    fn tampered_canonical_epoch_fails_closed() -> TestResult {
+        let fence_match = test_fence(CANONICAL_LINEAGE_A, 7, "fence-match")?;
+        let ctx_match = test_context(fence_match.clone(), CANONICAL_LINEAGE_A, 7)?;
+        assert!(ctx_match.canonical_authorizes(&fence_match));
+
+        // Same sequence but a foreign lineage still fails: no coercion from
+        // the sequence value, and no fallback when the tuple mismatches.
+        let fence_foreign = test_fence(CANONICAL_LINEAGE_B, 7, "fence-match")?;
+        assert!(!ctx_match.canonical_authorizes(&fence_foreign));
+        assert!(
+            ctx_match
+                .validate_canonical_against(&fence_foreign)
+                .is_err()
+        );
+
+        // Same lineage but a skipped sequence still fails.
+        let fence_skipped = test_fence(CANONICAL_LINEAGE_A, 9, "fence-match")?;
+        assert!(!ctx_match.canonical_authorizes(&fence_skipped));
+
+        // Context authority substituted for another lineage fails as well
+        // (an inconsistent fence/authority pair cannot even construct, so the
+        // foreign context is built consistently in lineage B).
+        let foreign_fence = test_fence(CANONICAL_LINEAGE_B, 7, "fence-foreign-ctx")?;
+        let ctx_tampered_canonical = test_context(foreign_fence, CANONICAL_LINEAGE_B, 7)?;
+        assert!(!ctx_tampered_canonical.canonical_authorizes(&fence_match));
+
+        // Binding-level also requires the exact triple.
+        let mut authority = authority()?;
+        let intent = intent()?;
+        let shared_fence = test_fence(CANONICAL_LINEAGE_A, 7, "fence-coercion-base")?;
+        let shared_ctx = test_context(shared_fence.clone(), CANONICAL_LINEAGE_A, 7)?;
+        let permit = authority.issue(
+            &intent,
+            PermitIssuance::new(
+                ActionLeaseRef::new("lease-1")?,
+                shared_fence,
+                revisions(),
+                100,
+                200,
+                "canon-coercion-1",
+            )?,
+        )?;
+        let request = ProcessRequest::new(intent.clone(), permit)?;
+        let validated =
+            authority.validate_and_consume_canonical(request, observed(&intent)?, &shared_ctx)?;
+        assert!(validated.binding().canonical_authorizes(&shared_ctx));
+        assert!(
+            !validated
+                .binding()
+                .canonical_authorizes(&ctx_tampered_canonical)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn v4_wire_carries_exact_tuple_and_sink_validates_it() -> TestResult {
+        let fence = test_fence(CANONICAL_LINEAGE_A, 7, "fence-wire")?;
+        let fence_value = serde_json::to_value(&fence)?;
+        // v4 fence shape is exactly the canonical triple; no scalar key remains.
+        assert_eq!(
+            fence_value.as_object().map(serde_json::Map::len),
+            Some(3),
+            "v4 fence must keep the exact three-field shape"
+        );
+        assert_eq!(
+            fence_value["authority_epoch"]["lineage_id"],
+            serde_json::json!(CANONICAL_LINEAGE_A)
+        );
+        assert_eq!(
+            fence_value["authority_epoch"]["sequence"],
+            serde_json::json!(7)
+        );
+
+        // Scalar-only binding bytes cannot deserialize into the v4 shape.
+        let (_, validated) = validated()?;
+        let binding_value = serde_json::to_value(validated.binding())?;
+        assert_eq!(
+            binding_value["authority_epoch"]["lineage_id"],
+            serde_json::json!(CANONICAL_LINEAGE_A)
+        );
+
+        // Sink canonical validation authorizes only the exact tuple.
+        let expected = test_epoch(CANONICAL_LINEAGE_A, 7)?;
+        let foreign = test_epoch(CANONICAL_LINEAGE_B, 7)?;
+        assert!(crate::binding_canonical_authorizes(
+            validated.binding(),
+            &expected
+        ));
+        assert!(crate::validate_binding_canonical(validated.binding(), &expected).is_ok());
+        assert!(!crate::binding_canonical_authorizes(
+            validated.binding(),
+            &foreign
+        ));
+        assert!(crate::validate_binding_canonical(validated.binding(), &foreign).is_err());
+
+        // Foreign-lineage binding fails the sink helper as well.
+        let mut authority = authority()?;
+        let intent = intent()?;
+        let permit = authority.issue(
+            &intent,
+            PermitIssuance::new(
+                ActionLeaseRef::new("lease-1")?,
+                test_fence(CANONICAL_LINEAGE_A, 7, "fence-sink-wire")?,
+                revisions(),
+                100,
+                200,
+                "canon-sink-wire-1",
+            )?,
+        )?;
+        let request = ProcessRequest::new(intent.clone(), permit)?;
+        let sink_fence = request.permit.state_fence.clone();
+        let sink_ctx = DispatchValidationContext::new(
+            ClockObservation {
+                valid_time_ms: Some(150),
+                known_time_ms: Some(150),
+                transaction_sequence: None,
+                monotonic_ns: Some(1),
+            },
+            sink_fence,
+            test_epoch(CANONICAL_LINEAGE_A, 7)?,
+            revisions(),
+            41,
+        )?;
+        let sink_validated =
+            authority.validate_and_consume_canonical(request, observed(&intent)?, &sink_ctx)?;
+        assert!(crate::binding_canonical_authorizes(
+            sink_validated.binding(),
+            &expected
+        ));
+        assert!(crate::validate_binding_canonical(sink_validated.binding(), &expected).is_ok());
+        assert!(!crate::binding_canonical_authorizes(
+            sink_validated.binding(),
+            &foreign
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn exact_tuple_same_sequence_different_lineage_rejected() -> TestResult {
+        // Proportionate exact-tuple proof: the same sequence in another lineage
+        // is unrelated authority and must fail closed at every P-03 gate.
+        let epoch_home = test_epoch(CANONICAL_LINEAGE_A, 7)?;
+        let epoch_foreign = test_epoch(CANONICAL_LINEAGE_B, 7)?;
+        let fence_home = test_fence(CANONICAL_LINEAGE_A, 7, "fence-exact-a7")?;
+        let ctx_home = test_context(fence_home.clone(), CANONICAL_LINEAGE_A, 7)?;
+
+        assert!(!fence_home.authorizes_canonical(&epoch_foreign));
+        assert!(
+            fence_home
+                .validate_canonical_against(&epoch_foreign)
+                .is_err()
+        );
+        assert!(fence_home.validate_canonical_epoch(&epoch_foreign).is_err());
+
+        let owner_home = ProcessOwnerBinding::new(
+            "module-1",
+            "c".repeat(64),
+            test_epoch(CANONICAL_LINEAGE_A, 7)?,
+            Generation::new(1)?,
+        )?;
+        assert!(!owner_home.authorizes_canonical(&epoch_foreign));
+        assert!(
+            owner_home
+                .validate_canonical_against(&epoch_foreign)
+                .is_err()
+        );
+
+        let fence_foreign = test_fence(CANONICAL_LINEAGE_B, 7, "fence-exact-b7")?;
+        assert!(!ctx_home.canonical_authorizes(&fence_foreign));
+        assert!(ctx_home.validate_canonical_against(&fence_foreign).is_err());
+
+        // A numerically larger sequence in another lineage is not newer
+        // authority either.
+        let epoch_foreign_newer = test_epoch(CANONICAL_LINEAGE_B, 9)?;
+        assert!(!fence_home.authorizes_canonical(&epoch_foreign_newer));
+        assert!(!ctx_home.canonical_authorizes(&test_fence(
+            CANONICAL_LINEAGE_B,
+            9,
+            "fence-exact-b9"
+        )?));
+
+        // Same tuple still authorizes, proving the rejection is lineage, not value.
+        assert!(fence_home.authorizes_canonical(&epoch_home));
+        assert!(ctx_home.canonical_authorizes(&fence_home));
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_numeric_authority_epoch_fails_deserialize() -> TestResult {
+        // Legacy-negative proof: a bare numeric `authority_epoch` carries no
+        // provable lineage, so it must fail deserialization into every v4
+        // authority-bearing shape instead of authorizing anything. Each case
+        // starts from a valid v4 serialization with only the epoch field
+        // substituted, isolating the failure to the numeric epoch.
+        let mut legacy_fence = serde_json::to_value(fence()?)?;
+        legacy_fence["authority_epoch"] = serde_json::json!(7);
+        assert!(serde_json::from_value::<FencingToken>(legacy_fence).is_err());
+
+        let mut legacy_owner = serde_json::to_value(ProcessOwnerBinding::new(
+            "module-1",
+            "c".repeat(64),
+            test_epoch(CANONICAL_LINEAGE_A, 7)?,
+            Generation::new(1)?,
+        )?)?;
+        legacy_owner["authority_epoch"] = serde_json::json!(7);
+        assert!(serde_json::from_value::<ProcessOwnerBinding>(legacy_owner).is_err());
+
+        let mut legacy_context = serde_json::to_value(context(150)?)?;
+        legacy_context["authority_epoch"] = serde_json::json!(7);
+        assert!(serde_json::from_value::<DispatchValidationContext>(legacy_context).is_err());
+
+        let (_, validated) = validated()?;
+        let mut legacy_binding = serde_json::to_value(validated.binding())?;
+        legacy_binding["authority_epoch"] = serde_json::json!(7);
+        assert!(serde_json::from_value::<ProcessExecutionBinding>(legacy_binding).is_err());
+
+        // The quarantined eliotd live evidence stays scalar-only by design and
+        // keeps accepting its numeric contour without promoting authority.
+        let ready = EliotdLiveReadyEvidence {
+            request_id: "daemon-ready-1".to_owned(),
+            request_payload_sha256: "e".repeat(64),
+            connection_id: "connection-1".to_owned(),
+            session_epoch: 2,
+            authority_epoch: 3,
+            generation: 1,
+            launch_nonce_sha256: "f".repeat(64),
+        };
+        ready.validate()?;
+        let ready_value = serde_json::to_value(&ready)?;
+        assert_eq!(ready_value["authority_epoch"], serde_json::json!(3));
+        Ok(())
+    }
+
+    fn caller_owner(
+        module: &str,
+        epoch_sequence: u64,
+        generation: u64,
+    ) -> Result<ProcessOwnerBinding, ContractError> {
+        ProcessOwnerBinding::new(
+            module,
+            "a".repeat(64),
+            test_epoch(CANONICAL_LINEAGE_A, epoch_sequence)?,
+            Generation::new(generation)?,
+        )
+    }
+
+    fn caller_fence(epoch_sequence: u64, generation: u64) -> Result<FencingToken, ContractError> {
+        FencingToken::new(
+            test_epoch(CANONICAL_LINEAGE_A, epoch_sequence)?,
+            Generation::new(generation)?,
+            format!("caller-fence-{epoch_sequence}-{generation}"),
+        )
+    }
+
+    fn caller_session(
+        class: ProcessSessionClass,
+        module: &str,
+        session: &str,
+        epoch_sequence: u64,
+        generation: u64,
+    ) -> Result<ProcessCallerSession, ContractError> {
+        ProcessCallerSession::new(
+            class,
+            caller_owner(module, epoch_sequence, generation)?,
+            SessionId::new(session)?,
+        )
+    }
+
+    fn intent_with_session(session: &str) -> Result<ProcessIntent, ContractError> {
+        let seed = intent()?;
+        ProcessIntent::new(
+            seed.operation_id().clone(),
+            seed.process_tree_id().clone(),
+            seed.job_id().clone(),
+            seed.image_id().clone(),
+            SessionId::new(session)?,
+            seed.generation(),
+            seed.executable(),
+            seed.executable_sha256(),
+            seed.argv().to_vec(),
+            seed.working_directory(),
+            seed.environment().clone(),
+            *seed.resource_limits(),
+        )
+    }
+
+    #[test]
+    fn session_class_names_are_stable() {
+        assert_eq!(
+            ProcessSessionClass::EliotdGeneration.as_str(),
+            "eliotd_generation"
+        );
+        assert_eq!(
+            ProcessSessionClass::UserBrokerSession.as_str(),
+            "user_broker_session"
+        );
+        assert_eq!(ProcessSessionClass::TestdAttempt.as_str(), "testd_attempt");
+        assert_eq!(
+            ProcessSessionClass::NativeWorkerAttempt.as_str(),
+            "native_worker_attempt"
+        );
+    }
+
+    #[test]
+    fn each_session_class_validates_its_exact_binding() -> TestResult {
+        for (class, module) in [
+            (ProcessSessionClass::EliotdGeneration, "eliotd"),
+            (ProcessSessionClass::UserBrokerSession, "eliot-user-broker"),
+            (ProcessSessionClass::TestdAttempt, "eliot-testd"),
+            (
+                ProcessSessionClass::NativeWorkerAttempt,
+                "eliot-native-worker",
+            ),
+        ] {
+            let admitted = caller_session(class, module, "session-1", 7, 1)?;
+            assert_eq!(admitted.class(), class);
+            validate_process_intent_session(
+                &intent()?,
+                &admitted,
+                &caller_owner(module, 7, 1)?,
+                &caller_fence(7, 1)?,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn copied_connection_id_never_authorizes_launch() -> TestResult {
+        let admitted = caller_session(
+            ProcessSessionClass::UserBrokerSession,
+            "eliot-user-broker",
+            "session-1",
+            7,
+            1,
+        )?;
+        // The admitted durable session is never the transport connection.
+        assert_ne!(admitted.session_id().as_str(), "pipe-conn-9");
+        let forged = intent_with_session("pipe-conn-9")?;
+        assert!(matches!(
+            validate_process_intent_session(
+                &forged,
+                &admitted,
+                &caller_owner("eliot-user-broker", 7, 1)?,
+                &caller_fence(7, 1)?,
+            ),
+            Err(ContractError::StaleProcessSession)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn foreign_session_fails_with_stale_process_session() -> TestResult {
+        let admitted = caller_session(
+            ProcessSessionClass::TestdAttempt,
+            "eliot-testd",
+            "session-1",
+            7,
+            1,
+        )?;
+        let foreign = intent_with_session("session-2")?;
+        assert!(matches!(
+            validate_process_intent_session(
+                &foreign,
+                &admitted,
+                &caller_owner("eliot-testd", 7, 1)?,
+                &caller_fence(7, 1)?,
+            ),
+            Err(ContractError::StaleProcessSession)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn wrong_owner_module_or_principal_fails_with_binding_mismatch() -> TestResult {
+        let admitted = caller_session(
+            ProcessSessionClass::UserBrokerSession,
+            "eliot-user-broker",
+            "session-1",
+            7,
+            1,
+        )?;
+        let current = intent()?;
+        let fence = caller_fence(7, 1)?;
+        // A different module can never present this binding.
+        assert!(matches!(
+            validate_process_intent_session(
+                &current,
+                &admitted,
+                &caller_owner("eliot-testd", 7, 1)?,
+                &fence,
+            ),
+            Err(ContractError::DispatchBindingMismatch)
+        ));
+        // A different principal under the same module cannot either.
+        let foreign_principal = ProcessOwnerBinding::new(
+            "eliot-user-broker",
+            "b".repeat(64),
+            test_epoch(CANONICAL_LINEAGE_A, 7)?,
+            Generation::new(1)?,
+        )?;
+        assert!(matches!(
+            validate_process_intent_session(&current, &admitted, &foreign_principal, &fence,),
+            Err(ContractError::DispatchBindingMismatch)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn stale_epoch_fails_with_stale_authority_epoch() -> TestResult {
+        let admitted = caller_session(
+            ProcessSessionClass::EliotdGeneration,
+            "eliotd",
+            "session-1",
+            7,
+            1,
+        )?;
+        let current = intent()?;
+        // A presented owner from a superseded epoch fences even for the
+        // same principal and module.
+        assert!(matches!(
+            validate_process_intent_session(
+                &current,
+                &admitted,
+                &caller_owner("eliotd", 6, 1)?,
+                &caller_fence(7, 1)?,
+            ),
+            Err(ContractError::StaleAuthorityEpoch)
+        ));
+        // A fence carried from a superseded epoch fences as well.
+        assert!(matches!(
+            validate_process_intent_session(
+                &current,
+                &admitted,
+                &caller_owner("eliotd", 7, 1)?,
+                &caller_fence(6, 1)?,
+            ),
+            Err(ContractError::StaleAuthorityEpoch)
+        ));
+        // Cross-lineage equal sequences never authorize.
+        let cross_lineage_owner = ProcessOwnerBinding::new(
+            "eliotd",
+            "a".repeat(64),
+            test_epoch(CANONICAL_LINEAGE_B, 7)?,
+            Generation::new(1)?,
+        )?;
+        assert!(matches!(
+            validate_process_intent_session(
+                &current,
+                &admitted,
+                &cross_lineage_owner,
+                &caller_fence(7, 1)?,
+            ),
+            Err(ContractError::StaleAuthorityEpoch)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn stale_generation_fails_with_fence_mismatch() -> TestResult {
+        let admitted = caller_session(
+            ProcessSessionClass::NativeWorkerAttempt,
+            "eliot-native-worker",
+            "session-1",
+            7,
+            1,
+        )?;
+        let current = intent()?;
+        assert!(matches!(
+            validate_process_intent_session(
+                &current,
+                &admitted,
+                &caller_owner("eliot-native-worker", 7, 2)?,
+                &caller_fence(7, 1)?,
+            ),
+            Err(ContractError::FenceMismatch)
+        ));
+        assert!(matches!(
+            validate_process_intent_session(
+                &current,
+                &admitted,
+                &caller_owner("eliot-native-worker", 7, 1)?,
+                &caller_fence(7, 2)?,
+            ),
+            Err(ContractError::FenceMismatch)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn transport_binding_mismatch_is_stale_transport() -> TestResult {
+        let current = ProcessSessionBinding::new("pipe-conn-9", 3)?;
+        assert!(validate_process_transport_binding(&current, &current).is_ok());
+        let other_pipe = ProcessSessionBinding::new("pipe-conn-10", 3)?;
+        assert!(matches!(
+            validate_process_transport_binding(&other_pipe, &current),
+            Err(ContractError::StaleTransportBinding)
+        ));
+        let other_epoch = ProcessSessionBinding::new("pipe-conn-9", 4)?;
+        assert!(matches!(
+            validate_process_transport_binding(&other_epoch, &current),
+            Err(ContractError::StaleTransportBinding)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn rebind_receipt_preserves_durable_session_across_connections() -> TestResult {
+        let caller = caller_session(
+            ProcessSessionClass::UserBrokerSession,
+            "eliot-user-broker",
+            "session-1",
+            7,
+            1,
+        )?;
+        let before = intent()?;
+        let first = ProcessTransportRebindReceipt::mint(&caller, "pipe-conn-9", 3)?;
+        let second = ProcessTransportRebindReceipt::mint(&caller, "pipe-conn-10", 4)?;
+        first.validate()?;
+        second.validate()?;
+        assert!(first.rebinds(&caller));
+        assert!(second.rebinds(&caller));
+        // The durable session never changes across the rebind, so the sealed
+        // intent/effect identity is preserved by construction.
+        assert_eq!(first.session_id(), second.session_id());
+        assert_eq!(first.session_id().as_str(), before.session_id().as_str());
+        assert_ne!(first.connection_id(), second.connection_id());
+        assert_ne!(first.receipt_digest(), second.receipt_digest());
+        Ok(())
+    }
+
+    #[test]
+    fn rebind_receipt_rejects_stale_transport_and_tampering() -> TestResult {
+        let caller = caller_session(
+            ProcessSessionClass::EliotdGeneration,
+            "eliotd",
+            "session-1",
+            7,
+            1,
+        )?;
+        assert!(matches!(
+            ProcessTransportRebindReceipt::mint(&caller, "pipe-conn-9", 0),
+            Err(ContractError::StaleTransportBinding)
+        ));
+        let receipt = ProcessTransportRebindReceipt::mint(&caller, "pipe-conn-9", 3)?;
+        let mut tampered_value = serde_json::to_value(&receipt)?;
+        tampered_value["connection_id"] = serde_json::json!("pipe-conn-10");
+        let tampered: ProcessTransportRebindReceipt = serde_json::from_value(tampered_value)?;
+        assert!(matches!(
+            tampered.validate(),
+            Err(ContractError::DigestMismatch { .. })
+        ));
+        assert!(!tampered.rebinds(&caller));
+        let foreign = caller_session(
+            ProcessSessionClass::EliotdGeneration,
+            "eliotd",
+            "session-2",
+            7,
+            1,
+        )?;
+        assert!(!receipt.rebinds(&foreign));
         Ok(())
     }
 }

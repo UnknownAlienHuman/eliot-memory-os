@@ -7,12 +7,12 @@ use eliot_kernel_service::{
     HostKernelCandidateBinding, KernelActivationReceipt, KernelReadyReceipt,
 };
 use eliot_platform::{
-    HostActivationTransition, HostProcessRecoveryBinding, HostShutdownMarker, HostStateError,
-    HostStateStore, PlatformHandle, PortError, PortOutcome, ServiceObservation, ServiceOperation,
-    ServicePort, ServiceRequest, ServiceState,
+    HostActivationTransition, HostBranchKind, HostBranchRecoveryFence, HostProcessRecoveryBinding,
+    HostShutdownMarker, HostStateError, HostStateStore, PlatformHandle, PortError, PortOutcome,
+    ServiceObservation, ServiceOperation, ServicePort, ServiceRequest, ServiceState,
 };
 use eliot_platform_windows::HostOwnerLease;
-use eliot_runtime_contracts::ServiceProcessRecord;
+use eliot_runtime_contracts::{ServiceProcessRecord, ServiceProcessState};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -70,6 +70,111 @@ impl HostDependencyPlan {
         validate_handle(&self.service, "dependency.service")?;
         validate_text(&self.expected_owner, "dependency.expected_owner")
     }
+}
+
+/// Immutable admitted material for one Host-managed child generation.
+///
+/// This is inert admission material, not dispatch authority. The executor
+/// proves the exact executable digest and generation against retained launch
+/// evidence before resume, and Host persists the observed lineage in the host
+/// state journal. No permit is minted here: Host never issues dispatch
+/// authority, so the pre-Kernel bootstrap route cannot flow through this seam
+/// until T0 names its admission mapping.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostManagedChildBinding {
+    /// Stable service identity registered by installation policy.
+    pub service: PlatformHandle,
+    /// Exact process owner expected in the returned observation.
+    pub expected_owner: String,
+    /// Lowercase SHA-256 of the approved executable image.
+    pub executable_digest: PlatformHandle,
+    /// Opaque admitted generation identity bound at admission.
+    pub generation: PlatformHandle,
+    /// Host-owned branch whose stale authority is fenced independently.
+    pub branch: HostBranchKind,
+}
+
+impl HostManagedChildBinding {
+    fn validate(&self) -> Result<(), HostServiceError> {
+        validate_handle(&self.service, "managed_child.service")?;
+        validate_text(&self.expected_owner, "managed_child.expected_owner")?;
+        if !is_lowercase_sha256(&self.executable_digest) {
+            return Err(HostServiceError::InvalidField {
+                field: "managed_child.executable_digest",
+                reason: "must be lowercase sha256",
+            });
+        }
+        validate_handle(&self.generation, "managed_child.generation")?;
+        Ok(())
+    }
+}
+
+/// Provider-neutral port for one Host-managed child generation.
+///
+/// The shared process executor implements this port in production; tests and
+/// the fenced bootstrap path substitute deterministic doubles. The port
+/// performs the physical launch directly: there is deliberately no
+/// IPC-before-launch step and no permit-issuance step, so
+/// launch-then-ProbeReady stays the only path to advertised readiness.
+/// Kernel ORS policy is neither consulted nor moved here; the port reports
+/// observations and Host records them in its journal.
+pub trait HostChildExecutor {
+    /// Launches the exact admitted child and returns its observed lineage.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when the admitted material cannot be proven.
+    fn spawn_admitted_child(
+        &mut self,
+        binding: &HostManagedChildBinding,
+    ) -> Result<ServiceProcessRecord, HostServiceError>;
+
+    /// Terminates the named service branch, returning the prior lineage when
+    /// one was live.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when termination cannot be proven.
+    fn terminate_admitted_child(
+        &mut self,
+        service: &PlatformHandle,
+    ) -> Result<Option<ServiceProcessRecord>, HostServiceError>;
+
+    /// Observes the named service branch without mutating it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when the observation itself cannot be produced.
+    fn observe_admitted_child(
+        &mut self,
+        service: &PlatformHandle,
+    ) -> Result<ManagedChildLiveness, HostServiceError>;
+}
+
+/// Point-in-time liveness of one Host-managed child branch.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+pub enum ManagedChildLiveness {
+    /// The branch is live with the exact observed lineage.
+    Live(ServiceProcessRecord),
+    /// The branch is provably absent.
+    Dead,
+    /// The branch outcome is unknown and must not be retried blindly.
+    Unknown,
+}
+
+/// Disposition of one owner-loss reconciliation pass over a managed child.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+pub enum ManagedChildReconcileOutcome {
+    /// The branch is live under the exact admitted owner and ready.
+    Healthy(ServiceProcessRecord),
+    /// A foreign owner was terminated and the durable recovery fence recorded.
+    OwnerLossCleaned {
+        /// The terminated foreign lineage.
+        terminated: ServiceProcessRecord,
+    },
+    /// The branch is absent and the durable recovery fence is recorded.
+    BranchAbsentFenced,
 }
 
 /// Receipt for a Kernel start that has an observed process lineage.
@@ -420,7 +525,13 @@ where
                     | HostServiceState::DegradedRecovery
                     | HostServiceState::Failed
             ) {
-                let _ = self.stop_kernel(context, prior_service.clone());
+                // Same-owner restart: verified platform stop without minting
+                // the durable pending-release ownership-transfer gate (which
+                // would block the start below via transition()'s gate) and
+                // without releasing the installation-wide owner lease (which
+                // would open a split-brain window with a kernel running and
+                // no lease held). Ownership never transfers mid-restart.
+                let _ = self.stop_kernel_for_restart(context, &prior_service);
             }
             match self.start_kernel(
                 context,
@@ -522,6 +633,198 @@ where
         Ok(process)
     }
 
+    /// Starts one admitted dependency generation through the shared child
+    /// executor and records its observed lineage.
+    ///
+    /// The executor performs the physical launch from the exact immutable
+    /// binding; Host validates the returned owner/readiness contour and
+    /// persists the lineage with the same journal contract as
+    /// [`HostService::start_dependency`]. A spawned child is never adopted:
+    /// an owner mismatch or unreadiness terminates it before this method
+    /// returns.
+    pub fn start_managed_child(
+        &mut self,
+        context: &RequestMetadata,
+        binding: &HostManagedChildBinding,
+        executor: &mut impl HostChildExecutor,
+    ) -> Result<ServiceProcessRecord, HostServiceError> {
+        validate_context(context)?;
+        binding.validate()?;
+        if !matches!(
+            self.state,
+            HostServiceState::ControlReady | HostServiceState::Active
+        ) {
+            return Err(HostServiceError::IllegalTransition {
+                from: self.state,
+                to: HostServiceState::Starting,
+            });
+        }
+        let process = executor.spawn_admitted_child(binding)?;
+        if process.owner != binding.expected_owner {
+            self.admission_closed = true;
+            self.fail(HostFailure::IdentityMismatch);
+            executor.terminate_admitted_child(&binding.service)?;
+            return Err(HostServiceError::IdentityMismatch);
+        }
+        if process.state != ServiceProcessState::Ready || !process.health.is_fully_healthy() {
+            self.admission_closed = true;
+            self.fail(HostFailure::ReadinessNotProven);
+            executor.terminate_admitted_child(&binding.service)?;
+            return Err(HostServiceError::ReadinessNotProven);
+        }
+        let transition = eliot_platform::ManagedDependencyTransition {
+            context: derived_context(context, "managed-child-lineage")?,
+            installation: self.installation.clone(),
+            dependency: process.clone(),
+        };
+        if let Err(error) = self.state_store.record_dependency(transition) {
+            self.admission_closed = true;
+            if let Err(cleanup_error) = executor.terminate_admitted_child(&binding.service) {
+                self.fail(HostFailure::Platform(format!(
+                    "managed-child persistence failed ({error}); cleanup failed: {cleanup_error}"
+                )));
+                return Err(cleanup_error);
+            }
+            self.fail(HostFailure::StateStore(error.to_string()));
+            return Err(HostServiceError::StateStore(error));
+        }
+        Ok(process)
+    }
+
+    /// Stops one admitted dependency generation through the shared child
+    /// executor and returns its prior lineage.
+    ///
+    /// The journal retains the observed lineage: there is no
+    /// dependency-forget contract in [`HostStateStore`], so a clean stop
+    /// terminates the branch without rewriting history. Stale authority stays
+    /// fenced through [`HostService::reconcile_managed_child_owner_loss`].
+    pub fn stop_managed_child(
+        &mut self,
+        context: &RequestMetadata,
+        binding: &HostManagedChildBinding,
+        executor: &mut impl HostChildExecutor,
+    ) -> Result<ServiceStopReceipt, HostServiceError> {
+        validate_context(context)?;
+        binding.validate()?;
+        if !matches!(
+            self.state,
+            HostServiceState::ControlReady
+                | HostServiceState::Active
+                | HostServiceState::DegradedRecovery
+                | HostServiceState::Failed
+        ) {
+            return Err(HostServiceError::IllegalTransition {
+                from: self.state,
+                to: HostServiceState::Draining,
+            });
+        }
+        match executor.observe_admitted_child(&binding.service)? {
+            ManagedChildLiveness::Live(process) => {
+                if executor
+                    .terminate_admitted_child(&binding.service)?
+                    .is_some()
+                {
+                    Ok(ServiceStopReceipt {
+                        service: binding.service.clone(),
+                        prior_process: process,
+                    })
+                } else {
+                    self.fail(HostFailure::UnknownOutcome);
+                    Err(HostServiceError::UnknownOutcome)
+                }
+            }
+            ManagedChildLiveness::Dead => {
+                self.fail(HostFailure::ReadinessNotProven);
+                Err(HostServiceError::ReadinessNotProven)
+            }
+            ManagedChildLiveness::Unknown => {
+                self.fail(HostFailure::UnknownOutcome);
+                Err(HostServiceError::UnknownOutcome)
+            }
+        }
+    }
+
+    /// Reconciles one managed child branch after a suspected owner loss.
+    ///
+    /// A live foreign owner is terminated on its exact branch and fenced in
+    /// the durable journal; an absent branch is fenced without termination.
+    /// An unknown observation stays unknown and is never retried blindly.
+    pub fn reconcile_managed_child_owner_loss(
+        &mut self,
+        context: &RequestMetadata,
+        binding: &HostManagedChildBinding,
+        executor: &mut impl HostChildExecutor,
+    ) -> Result<ManagedChildReconcileOutcome, HostServiceError> {
+        validate_context(context)?;
+        binding.validate()?;
+        if !matches!(
+            self.state,
+            HostServiceState::ControlReady
+                | HostServiceState::Active
+                | HostServiceState::DegradedRecovery
+                | HostServiceState::Failed
+        ) {
+            return Err(HostServiceError::IllegalTransition {
+                from: self.state,
+                to: HostServiceState::Draining,
+            });
+        }
+        match executor.observe_admitted_child(&binding.service)? {
+            ManagedChildLiveness::Live(process)
+                if process.owner == binding.expected_owner
+                    && process.state == ServiceProcessState::Ready
+                    && process.health.is_fully_healthy() =>
+            {
+                Ok(ManagedChildReconcileOutcome::Healthy(process))
+            }
+            ManagedChildLiveness::Live(process) if process.owner == binding.expected_owner => {
+                self.fail(HostFailure::ReadinessNotProven);
+                Err(HostServiceError::ReadinessNotProven)
+            }
+            ManagedChildLiveness::Live(process) => {
+                let Some(terminated) = executor.terminate_admitted_child(&binding.service)? else {
+                    self.fail(HostFailure::UnknownOutcome);
+                    return Err(HostServiceError::UnknownOutcome);
+                };
+                self.fence_managed_branch(binding, Some(process))?;
+                Ok(ManagedChildReconcileOutcome::OwnerLossCleaned { terminated })
+            }
+            ManagedChildLiveness::Dead => {
+                self.fence_managed_branch(binding, None)?;
+                Ok(ManagedChildReconcileOutcome::BranchAbsentFenced)
+            }
+            ManagedChildLiveness::Unknown => {
+                self.fail(HostFailure::UnknownOutcome);
+                Err(HostServiceError::UnknownOutcome)
+            }
+        }
+    }
+
+    fn fence_managed_branch(
+        &mut self,
+        binding: &HostManagedChildBinding,
+        observed: Option<ServiceProcessRecord>,
+    ) -> Result<(), HostServiceError> {
+        let reason = PlatformHandle::new("managed-child-owner-loss-cleanup").map_err(|_| {
+            HostServiceError::InvalidField {
+                field: "managed_child.reason",
+                reason: "must be non-blank and free of control characters",
+            }
+        })?;
+        let fence = HostBranchRecoveryFence {
+            installation: self.installation.clone(),
+            generation: binding.generation.clone(),
+            branch: binding.branch,
+            observed_process: observed,
+            reason,
+        };
+        if let Err(error) = self.state_store.record_branch_recovery(fence) {
+            self.fail(HostFailure::StateStore(error.to_string()));
+            return Err(HostServiceError::StateStore(error));
+        }
+        Ok(())
+    }
+
     /// Stops Kernel after closing normal admission and records a clean Host stop.
     pub fn stop_kernel(
         &mut self,
@@ -530,6 +833,68 @@ where
     ) -> Result<ServiceStopReceipt, HostServiceError> {
         validate_context(context)?;
         validate_handle(&service, "kernel.service")?;
+        let prior_process = self.verified_kernel_stop(context, &service)?;
+        let marker = HostShutdownMarker {
+            context: derived_context(context, "kernel-clean-stop")?,
+            installation: self.installation.clone(),
+            process: prior_process.clone(),
+        };
+        let token = match self.state_store.prepare_release_pending(marker) {
+            Ok(token) => token,
+            Err(error) => {
+                self.fail(HostFailure::StateStore(error.to_string()));
+                return Err(HostServiceError::StateStore(error));
+            }
+        };
+        self.pending_release = Some(token);
+        self.durable_finalized = false;
+        // The platform process is stopped, but the owner-release proof has not
+        // completed yet. Keep Host in recovery until the caller proves release
+        // and invokes `finalize_clean_shutdown`.
+        self.state = HostServiceState::DegradedRecovery;
+        self.failure = None;
+        Ok(ServiceStopReceipt {
+            service,
+            prior_process,
+        })
+    }
+
+    /// Restart-scoped stop: same verified platform stop as `stop_kernel`
+    /// (inspect -> Stop -> Stopped/Absent + process none, same fencing),
+    /// but without minting the durable pending-release ownership-transfer
+    /// gate and without touching the installation-wide owner lease. The gate
+    /// proves release before a NEW activation takes over ownership; in a
+    /// same-owner restart ownership never transfers, so the subsequent
+    /// `start_kernel` stays legal via `DegradedRecovery` -> `Starting` while the
+    /// single-owner invariant holds for the whole stop -> start sequence.
+    fn stop_kernel_for_restart(
+        &mut self,
+        context: &RequestMetadata,
+        service: &PlatformHandle,
+    ) -> Result<ServiceStopReceipt, HostServiceError> {
+        validate_handle(service, "kernel.service")?;
+        let prior_process = self.verified_kernel_stop(context, service)?;
+        // Platform process is verified stopped under the still-held owner
+        // lease. No pending-release token is minted, so the restart start is
+        // not fenced out by transition()'s pending-release gate.
+        self.state = HostServiceState::DegradedRecovery;
+        self.failure = None;
+        Ok(ServiceStopReceipt {
+            service: service.clone(),
+            prior_process,
+        })
+    }
+
+    /// Shared verified-stop core for `stop_kernel` and the restart path:
+    /// Draining gate, pre-stop inspect proving the lineage, platform Stop,
+    /// and post-stop Stopped/Absent + process-none verification. Failure
+    /// side effects (`fail()`/`unknown_stop()`) are identical for both callers
+    /// so the two paths cannot drift.
+    fn verified_kernel_stop(
+        &mut self,
+        context: &RequestMetadata,
+        service: &PlatformHandle,
+    ) -> Result<ServiceProcessRecord, HostServiceError> {
         if !matches!(
             self.state,
             HostServiceState::ControlReady
@@ -571,7 +936,7 @@ where
         )?;
         match stopped {
             PortOutcome::Known(observation)
-                if observation.service == service
+                if observation.service == *service
                     && matches!(
                         observation.state,
                         ServiceState::Stopped | ServiceState::Absent
@@ -587,29 +952,7 @@ where
                 return Err(HostServiceError::Platform(error));
             }
         }
-        let marker = HostShutdownMarker {
-            context: derived_context(context, "kernel-clean-stop")?,
-            installation: self.installation.clone(),
-            process: prior_process.clone(),
-        };
-        let token = match self.state_store.prepare_release_pending(marker) {
-            Ok(token) => token,
-            Err(error) => {
-                self.fail(HostFailure::StateStore(error.to_string()));
-                return Err(HostServiceError::StateStore(error));
-            }
-        };
-        self.pending_release = Some(token);
-        self.durable_finalized = false;
-        // The platform process is stopped, but the owner-release proof has not
-        // completed yet. Keep Host in recovery until the caller proves release
-        // and invokes `finalize_clean_shutdown`.
-        self.state = HostServiceState::DegradedRecovery;
-        self.failure = None;
-        Ok(ServiceStopReceipt {
-            service,
-            prior_process,
-        })
+        Ok(prior_process)
     }
 
     /// Releases this service's installation-wide owner capability and then
@@ -707,7 +1050,7 @@ where
         Ok(self.platform.execute(&request))
     }
 
-    fn unknown_stop(&mut self) -> Result<ServiceStopReceipt, HostServiceError> {
+    fn unknown_stop<T>(&mut self) -> Result<T, HostServiceError> {
         self.fail(HostFailure::UnknownOutcome);
         Err(HostServiceError::UnknownOutcome)
     }
@@ -786,6 +1129,14 @@ fn validate_handle(value: &PlatformHandle, field: &'static str) -> Result<(), Ho
     validate_text(value.as_str(), field)
 }
 
+fn is_lowercase_sha256(value: &PlatformHandle) -> bool {
+    value.as_str().len() == 64
+        && value
+            .as_str()
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
 fn validate_context(context: &RequestMetadata) -> Result<(), HostServiceError> {
     context.validate()?;
     Ok(())
@@ -832,5 +1183,330 @@ fn ready_process(
         PortOutcome::Partial { .. } => Err(HostServiceError::IncompleteObservation),
         PortOutcome::Unknown(_) => Err(HostServiceError::UnknownOutcome),
         PortOutcome::Error(error) => Err(HostServiceError::Platform(error)),
+    }
+}
+
+#[cfg(test)]
+mod managed_child_tests {
+    use super::{
+        HostChildExecutor, HostManagedChildBinding, HostService, ManagedChildLiveness,
+        ManagedChildReconcileOutcome,
+    };
+    use eliot_contracts::{
+        AuthorityEpoch, ClockReading, EpochId, EpochLineageId, ProductId, RequestId,
+        RequestMetadata, ResourceGeneration, SourceId, StateFence,
+    };
+    use eliot_platform::{
+        FakeHostStateStore, FakeService, HostBranchKind, HostInstallationState, HostJobDisposition,
+        HostProcessRecoveryBinding, HostShutdownDisposition, PlatformHandle, ServiceObservation,
+        ServiceState,
+    };
+    use eliot_runtime_contracts::{HealthVector, ServiceProcessRecord, ServiceProcessState};
+    use std::collections::VecDeque;
+    use std::num::NonZeroU64;
+
+    const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+    const KERNEL_OWNER: &str = "Kernel";
+    const STORE_OWNER: &str = "CanonicalStore";
+    const KERNEL_SERVICE: &str = "test-managed-kernel";
+    const STORE_SERVICE: &str = "test-managed-store";
+
+    fn test_context(request_id: &str) -> RequestMetadata {
+        let epoch = EpochId::new(
+            EpochLineageId::new(TEST_LINEAGE).unwrap_or_else(|_| unreachable!()),
+            NonZeroU64::new(1).unwrap_or_else(|| unreachable!()),
+        )
+        .unwrap_or_else(|_| unreachable!());
+        RequestMetadata {
+            request_id: RequestId::new(request_id).unwrap_or_else(|_| unreachable!()),
+            session_id: None,
+            task_id: None,
+            product_id: ProductId::new("product-1").unwrap_or_else(|_| unreachable!()),
+            source_id: SourceId::new("source-1").unwrap_or_else(|_| unreachable!()),
+            state_fence: StateFence::new(epoch, ResourceGeneration::genesis()),
+            clock: ClockReading::default(),
+        }
+    }
+
+    fn test_handle(value: &str) -> PlatformHandle {
+        PlatformHandle::new(value).unwrap_or_else(|_| unreachable!())
+    }
+
+    fn test_process(process_id: &str, owner: &str) -> ServiceProcessRecord {
+        ServiceProcessRecord {
+            process_id: process_id.to_owned(),
+            owner: owner.to_owned(),
+            state: ServiceProcessState::Ready,
+            health: HealthVector::healthy(),
+            authority_epoch: AuthorityEpoch::genesis(),
+        }
+    }
+
+    fn test_binding() -> HostManagedChildBinding {
+        HostManagedChildBinding {
+            service: test_handle(STORE_SERVICE),
+            expected_owner: STORE_OWNER.to_owned(),
+            executable_digest: test_handle(&"a".repeat(64)),
+            generation: test_handle("generation-1"),
+            branch: HostBranchKind::Store,
+        }
+    }
+
+    #[derive(Default)]
+    struct StubChildExecutor {
+        spawned_bindings: Vec<HostManagedChildBinding>,
+        spawn_results: VecDeque<Result<ServiceProcessRecord, super::HostServiceError>>,
+        terminated: Vec<PlatformHandle>,
+        terminate_results: VecDeque<Result<Option<ServiceProcessRecord>, super::HostServiceError>>,
+        observed: Vec<PlatformHandle>,
+        observe_results: VecDeque<Result<ManagedChildLiveness, super::HostServiceError>>,
+    }
+
+    impl HostChildExecutor for StubChildExecutor {
+        fn spawn_admitted_child(
+            &mut self,
+            binding: &HostManagedChildBinding,
+        ) -> Result<ServiceProcessRecord, super::HostServiceError> {
+            self.spawned_bindings.push(binding.clone());
+            self.spawn_results
+                .pop_front()
+                .unwrap_or_else(|| unreachable!())
+        }
+
+        fn terminate_admitted_child(
+            &mut self,
+            service: &PlatformHandle,
+        ) -> Result<Option<ServiceProcessRecord>, super::HostServiceError> {
+            self.terminated.push(service.clone());
+            self.terminate_results
+                .pop_front()
+                .unwrap_or_else(|| unreachable!())
+        }
+
+        fn observe_admitted_child(
+            &mut self,
+            service: &PlatformHandle,
+        ) -> Result<ManagedChildLiveness, super::HostServiceError> {
+            self.observed.push(service.clone());
+            self.observe_results
+                .pop_front()
+                .unwrap_or_else(|| unreachable!())
+        }
+    }
+
+    fn open_service(
+        installation: &str,
+        kernel_process: ServiceProcessRecord,
+    ) -> HostService<FakeService, FakeHostStateStore> {
+        let installation_handle = test_handle(installation);
+        let store = FakeHostStateStore::new(HostInstallationState {
+            installation: installation_handle.clone(),
+            active_process: None,
+            managed_dependencies: Vec::new(),
+            last_clean_shutdown: None,
+            disposition: HostShutdownDisposition::Clean,
+            active_process_recovery: None,
+            last_recovery_evidence: None,
+            recovery_fence: None,
+        })
+        .unwrap_or_else(|_| unreachable!());
+        let mut platform = FakeService::default();
+        platform.observations.push(ServiceObservation {
+            service: test_handle(KERNEL_SERVICE),
+            state: ServiceState::Running,
+            generation: None,
+            process: Some(kernel_process.clone()),
+        });
+        let mut service = HostService::open(platform, store, installation_handle.clone())
+            .unwrap_or_else(|_| unreachable!());
+        let recovery = HostProcessRecoveryBinding {
+            installation: installation_handle,
+            observed_process: kernel_process,
+            process_generation: test_handle("kernel-generation-1"),
+            process_id: 7,
+            image_path: test_handle("kernel-image-1"),
+            job: HostJobDisposition::NotAssigned,
+        };
+        service
+            .start_kernel(
+                &test_context("kernel-start"),
+                test_handle(KERNEL_SERVICE),
+                recovery,
+            )
+            .unwrap_or_else(|_| unreachable!());
+        service
+    }
+
+    fn kernel_process() -> ServiceProcessRecord {
+        test_process("7", KERNEL_OWNER)
+    }
+
+    #[test]
+    fn start_managed_child_persists_exact_observed_lineage() {
+        let mut service = open_service("installation-managed-start", kernel_process());
+        let binding = test_binding();
+        let spawned = test_process("store-11", STORE_OWNER);
+        let mut executor = StubChildExecutor {
+            spawn_results: VecDeque::from([Ok(spawned.clone())]),
+            ..StubChildExecutor::default()
+        };
+        let started = service
+            .start_managed_child(&test_context("managed-start"), &binding, &mut executor)
+            .unwrap_or_else(|_| unreachable!());
+        assert_eq!(started, spawned);
+        assert_eq!(executor.spawned_bindings, vec![binding]);
+        assert!(executor.terminated.is_empty());
+    }
+
+    #[test]
+    fn start_managed_child_terminates_foreign_owner_without_persisting() {
+        let mut service = open_service("installation-managed-foreign", kernel_process());
+        let binding = test_binding();
+        let foreign = test_process("store-12", "ForeignOwner");
+        let mut executor = StubChildExecutor {
+            spawn_results: VecDeque::from([Ok(foreign)]),
+            terminate_results: VecDeque::from([Ok(None)]),
+            ..StubChildExecutor::default()
+        };
+        assert!(matches!(
+            service.start_managed_child(&test_context("managed-foreign"), &binding, &mut executor),
+            Err(super::HostServiceError::IdentityMismatch)
+        ));
+        assert_eq!(executor.terminated, vec![test_handle(STORE_SERVICE)]);
+    }
+
+    #[test]
+    fn start_managed_child_rejects_malformed_binding_before_spawn() {
+        let mut service = open_service("installation-managed-malformed", kernel_process());
+        let mut executor = StubChildExecutor::default();
+        let mut binding = test_binding();
+        binding.executable_digest = test_handle("not-a-digest");
+        assert!(matches!(
+            service.start_managed_child(
+                &test_context("managed-malformed"),
+                &binding,
+                &mut executor
+            ),
+            Err(super::HostServiceError::InvalidField { .. })
+        ));
+        assert!(executor.spawned_bindings.is_empty());
+    }
+
+    #[test]
+    fn stop_managed_child_terminates_live_branch_with_prior_lineage() {
+        let mut service = open_service("installation-managed-stop", kernel_process());
+        let binding = test_binding();
+        let live = test_process("store-13", STORE_OWNER);
+        let mut executor = StubChildExecutor {
+            observe_results: VecDeque::from([Ok(ManagedChildLiveness::Live(live.clone()))]),
+            terminate_results: VecDeque::from([Ok(Some(live.clone()))]),
+            ..StubChildExecutor::default()
+        };
+        let receipt = service
+            .stop_managed_child(&test_context("managed-stop"), &binding, &mut executor)
+            .unwrap_or_else(|_| unreachable!());
+        assert_eq!(receipt.service, test_handle(STORE_SERVICE));
+        assert_eq!(receipt.prior_process, live);
+        assert_eq!(executor.observed, vec![test_handle(STORE_SERVICE)]);
+        assert_eq!(executor.terminated, vec![test_handle(STORE_SERVICE)]);
+    }
+
+    #[test]
+    fn stop_managed_child_refuses_dead_branch() {
+        let mut service = open_service("installation-managed-stop-dead", kernel_process());
+        let binding = test_binding();
+        let mut executor = StubChildExecutor {
+            observe_results: VecDeque::from([Ok(ManagedChildLiveness::Dead)]),
+            ..StubChildExecutor::default()
+        };
+        assert!(matches!(
+            service.stop_managed_child(&test_context("managed-stop-dead"), &binding, &mut executor),
+            Err(super::HostServiceError::ReadinessNotProven)
+        ));
+        assert!(executor.terminated.is_empty());
+    }
+
+    #[test]
+    fn reconcile_reports_healthy_branch_without_cleanup() {
+        let mut service = open_service("installation-managed-healthy", kernel_process());
+        let binding = test_binding();
+        let live = test_process("store-14", STORE_OWNER);
+        let mut executor = StubChildExecutor {
+            observe_results: VecDeque::from([Ok(ManagedChildLiveness::Live(live.clone()))]),
+            ..StubChildExecutor::default()
+        };
+        let outcome = service
+            .reconcile_managed_child_owner_loss(
+                &test_context("managed-healthy"),
+                &binding,
+                &mut executor,
+            )
+            .unwrap_or_else(|_| unreachable!());
+        assert_eq!(outcome, ManagedChildReconcileOutcome::Healthy(live));
+        assert!(executor.terminated.is_empty());
+    }
+
+    #[test]
+    fn reconcile_cleans_foreign_owner_and_records_branch_fence() {
+        let mut service = open_service("installation-managed-owner-loss", kernel_process());
+        let binding = test_binding();
+        let foreign = test_process("store-15", "ForeignOwner");
+        let mut executor = StubChildExecutor {
+            observe_results: VecDeque::from([Ok(ManagedChildLiveness::Live(foreign.clone()))]),
+            terminate_results: VecDeque::from([Ok(Some(foreign.clone()))]),
+            ..StubChildExecutor::default()
+        };
+        let outcome = service
+            .reconcile_managed_child_owner_loss(
+                &test_context("managed-owner-loss"),
+                &binding,
+                &mut executor,
+            )
+            .unwrap_or_else(|_| unreachable!());
+        assert_eq!(
+            outcome,
+            ManagedChildReconcileOutcome::OwnerLossCleaned {
+                terminated: foreign.clone()
+            }
+        );
+        assert_eq!(executor.terminated, vec![test_handle(STORE_SERVICE)]);
+    }
+
+    #[test]
+    fn reconcile_fences_absent_branch_without_termination() {
+        let mut service = open_service("installation-managed-absent", kernel_process());
+        let binding = test_binding();
+        let mut executor = StubChildExecutor {
+            observe_results: VecDeque::from([Ok(ManagedChildLiveness::Dead)]),
+            ..StubChildExecutor::default()
+        };
+        let outcome = service
+            .reconcile_managed_child_owner_loss(
+                &test_context("managed-absent"),
+                &binding,
+                &mut executor,
+            )
+            .unwrap_or_else(|_| unreachable!());
+        assert_eq!(outcome, ManagedChildReconcileOutcome::BranchAbsentFenced);
+        assert!(executor.terminated.is_empty());
+    }
+
+    #[test]
+    fn reconcile_keeps_unknown_observation_unknown() {
+        let mut service = open_service("installation-managed-unknown", kernel_process());
+        let binding = test_binding();
+        let mut executor = StubChildExecutor {
+            observe_results: VecDeque::from([Ok(ManagedChildLiveness::Unknown)]),
+            ..StubChildExecutor::default()
+        };
+        assert!(matches!(
+            service.reconcile_managed_child_owner_loss(
+                &test_context("managed-unknown"),
+                &binding,
+                &mut executor,
+            ),
+            Err(super::HostServiceError::UnknownOutcome)
+        ));
+        assert!(executor.terminated.is_empty());
     }
 }

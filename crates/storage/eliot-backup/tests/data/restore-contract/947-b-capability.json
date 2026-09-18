@@ -1,0 +1,1 @@
+{"note":"Worker B fixture: absent required class capability refuses before target dispatch with typed unsupported/not-attempted states.","refuse_before_dispatch":true,"typed_states":["unsupported","not_attempted"]}

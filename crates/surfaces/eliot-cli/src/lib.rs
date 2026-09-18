@@ -23,10 +23,17 @@ pub const CATALOGUE_REVISION: &str = "a11-plan-v2";
 pub const SCHEMA_VERSION: &str = "eliot-cli-schema-v1";
 /// MCP surface revision consumed by the CLI catalogue edge.
 pub const MCP_SURFACE_CONTRACT_REVISION: &str = eliot_mcp::CONTRACT_REVISION;
-/// Stable A-08 [`eliot_controlboard::PLAN_GAP`] marker bound into this
-/// catalogue edge while its admitted providers remain uninjected by
-/// composition.
-pub const CONTROLBOARD_PLAN_GAP: &str = eliot_controlboard::PLAN_GAP;
+/// Stable A-08 `PLAN_GAP` marker for this catalogue edge while its admitted
+/// providers remain uninjected by composition.
+///
+/// Provenance (#1213 MGR01 half): previously re-exported as
+/// `eliot_controlboard::PLAN_GAP`
+/// (`crates/surfaces/eliot-controlboard/src/lib.rs:40`, value `"PLAN_GAP"`).
+/// The `eliot-controlboard` dependency is severed here; this is now a local
+/// literal pinned by `controlboard_plan_gap_marker_is_pinned`. That crate is a
+/// bounded reference fixture whose remaining production consumer is the
+/// `bins/eliotd` daemon composition; its full delete follows with the eliotd lane.
+pub const CONTROLBOARD_PLAN_GAP: &str = "PLAN_GAP";
 
 /// Canonical command identifiers from the first-line command projection.
 #[derive(
@@ -377,7 +384,7 @@ pub mod kernel_client {
     use std::collections::BTreeMap;
     use std::time::Duration;
 
-    use eliot_contracts::RequestId;
+    use eliot_contracts::{EpochId, RequestId};
     use eliot_ipc::{
         DeliveryOutcome, NamedPipeTransport, TransportLimits, client_hello_frame,
         decode_server_hello_frame,
@@ -419,7 +426,10 @@ pub mod kernel_client {
         /// Protected principal binding selected by the Kernel owner.
         pub expected_server_principal_binding: String,
         /// Protected authority epoch for the configured module generation.
-        pub expected_authority_epoch: u64,
+        ///
+        /// Lineage-aware [`EpochId`] exact tuple installed by the Kernel owner;
+        /// matched via `is_same_authority` against the live Kernel `ServerHello`.
+        pub expected_authority_epoch: EpochId,
         /// Numeric identity of the expected immutable module generation.
         pub expected_generation: u64,
         /// Digest/identity of the expected server artifact.
@@ -478,7 +488,7 @@ pub mod kernel_client {
         service: String,
         protocol: String,
         generation: u64,
-        authority_epoch: u64,
+        authority_epoch: EpochId,
         artifact_digest: String,
     }
 
@@ -533,6 +543,13 @@ pub mod kernel_client {
         /// until Kernel advertises the operation and its handshake snapshot
         /// includes the current fence and observed clock needed to construct
         /// the request identity.  No local identity is a valid substitute.
+        ///
+        /// The `"controlboard.read"` capability string is retained because the
+        /// broker contract requires it: `OPERATOR_CAPABILITIES` in
+        /// `crates/surfaces/eliot-user-broker-core/src/lib.rs:29` is exactly
+        /// `["controlboard.read", "operator.command"]` (verified by grep for
+        /// `controlboard.read`; #1213). It is a broker-owned capability name,
+        /// not an `eliot-controlboard` crate binding.
         pub fn ensure_operator_launch(&mut self) -> Result<Value, KernelClientError> {
             let _request = OperatorLaunchRequest {
                 role: "human_operator".to_owned(),
@@ -753,8 +770,10 @@ pub mod kernel_client {
                 "Kernel server binding declaration is invalid".to_owned(),
             ));
         }
-        if config.expected_authority_epoch == 0
-            || config.expected_generation == 0
+        // `EpochId` is always a validated non-zero `(lineage_id, sequence)`
+        // tuple by construction; only the generation and snapshot digest need
+        // nonzero/shape checks here.
+        if config.expected_generation == 0
             || config.expected_config_snapshot_sha256.len() != 64
             || !config
                 .expected_config_snapshot_sha256
@@ -778,7 +797,9 @@ pub mod kernel_client {
         if hello.rejection_reason.is_some()
             || hello.selected_protocol != ProtocolVersion::CURRENT
             || hello.session_principal_binding != config.expected_server_principal_binding
-            || hello.authority_epoch.value() != config.expected_authority_epoch
+            || !hello
+                .authority_epoch
+                .is_same_authority(&config.expected_authority_epoch)
         {
             return Err(KernelClientError::Rejected(
                 "Kernel ServerHello is not bound to the protected authority".to_owned(),
@@ -786,7 +807,7 @@ pub mod kernel_client {
         }
         validate_server_snapshot(
             hello,
-            config.expected_authority_epoch,
+            &config.expected_authority_epoch,
             config.expected_generation,
             &config.expected_artifact_digest,
         )?;
@@ -803,7 +824,7 @@ pub mod kernel_client {
 
     fn validate_server_snapshot(
         hello: &ServerHello,
-        expected_authority_epoch: u64,
+        expected_authority_epoch: &EpochId,
         expected_generation: u64,
         expected_artifact_digest: &str,
     ) -> Result<(), KernelClientError> {
@@ -817,8 +838,12 @@ pub mod kernel_client {
             || snapshot.protocol != KERNEL_PROTOCOL_VERSION
             || snapshot.generation == 0
             || snapshot.generation != expected_generation
-            || snapshot.authority_epoch != expected_authority_epoch
-            || hello.authority_epoch.value() != snapshot.authority_epoch
+            || !snapshot
+                .authority_epoch
+                .is_same_authority(expected_authority_epoch)
+            || !hello
+                .authority_epoch
+                .is_same_authority(&snapshot.authority_epoch)
             || snapshot.artifact_digest.len() != 64
             || !snapshot
                 .artifact_digest
@@ -916,7 +941,23 @@ pub mod kernel_client {
     #[allow(clippy::expect_used, clippy::items_after_test_module)]
     mod tests {
         use super::*;
-        use eliot_contracts::AuthorityEpoch;
+        use eliot_contracts::{EpochId, EpochLineageId};
+        use std::num::NonZeroU64;
+
+        const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+        const OTHER_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440001";
+
+        fn test_epoch(sequence: u64) -> EpochId {
+            EpochId::new(
+                EpochLineageId::new(TEST_LINEAGE).expect("valid test lineage"),
+                NonZeroU64::new(sequence).expect("nonzero test sequence"),
+            )
+            .expect("valid test epoch")
+        }
+
+        fn epoch_json(sequence: u64) -> Value {
+            serde_json::json!({"lineage_id": TEST_LINEAGE, "sequence": sequence})
+        }
 
         fn server_hello(snapshot: Value) -> ServerHello {
             ServerHello {
@@ -928,47 +969,60 @@ pub mod kernel_client {
                 heartbeat_ms: 1_000,
                 control_channel: KERNEL_FRONT_DOOR_PIPE.to_owned(),
                 rejection_reason: None,
-                authority_epoch: AuthorityEpoch::new(7).expect("epoch"),
+                authority_epoch: test_epoch(7),
             }
         }
 
         #[test]
         fn server_hello_fixture_binds_numeric_generation_authority_and_artifact() {
             let artifact_digest = "a".repeat(64);
+            let expected = test_epoch(7);
             let hello = server_hello(serde_json::json!({
                 "service": KERNEL_SERVICE_NAME,
                 "protocol": KERNEL_PROTOCOL_VERSION,
                 "generation": 11,
-                "authority_epoch": 7,
+                "authority_epoch": epoch_json(7),
                 "artifact_digest": artifact_digest,
             }));
             assert_eq!(
-                validate_server_snapshot(&hello, 7, 11, &"a".repeat(64)),
+                validate_server_snapshot(&hello, &expected, 11, &"a".repeat(64)),
                 Ok(())
             );
         }
 
         #[test]
         fn server_hello_fixture_rejects_numeric_or_artifact_substitution() {
+            let expected = test_epoch(7);
             let hello = server_hello(serde_json::json!({
                 "service": KERNEL_SERVICE_NAME,
                 "protocol": KERNEL_PROTOCOL_VERSION,
                 "generation": 11,
-                "authority_epoch": 7,
+                "authority_epoch": epoch_json(7),
                 "artifact_digest": "a".repeat(64),
             }));
-            assert!(validate_server_snapshot(&hello, 7, 12, &"a".repeat(64)).is_err());
-            assert!(validate_server_snapshot(&hello, 7, 11, &"b".repeat(64)).is_err());
+            assert!(validate_server_snapshot(&hello, &expected, 12, &"a".repeat(64)).is_err());
+            assert!(validate_server_snapshot(&hello, &expected, 11, &"b".repeat(64)).is_err());
+            let wrong_sequence = test_epoch(8);
+            assert!(
+                validate_server_snapshot(&hello, &wrong_sequence, 11, &"a".repeat(64)).is_err()
+            );
+            let wrong_lineage = EpochId::new(
+                EpochLineageId::new(OTHER_LINEAGE).expect("valid test lineage"),
+                NonZeroU64::new(7).expect("nonzero test sequence"),
+            )
+            .expect("valid test epoch");
+            assert!(validate_server_snapshot(&hello, &wrong_lineage, 11, &"a".repeat(64)).is_err());
         }
 
         #[test]
         fn server_hello_fixture_rejects_current_open_kernel_snapshot_until_n4_binds_artifact() {
+            let expected = test_epoch(1);
             let hello = server_hello(serde_json::json!({
                 "service": KERNEL_SERVICE_NAME,
                 "protocol": KERNEL_PROTOCOL_VERSION,
                 "generation": 1,
             }));
-            assert!(validate_server_snapshot(&hello, 1, 1, &"a".repeat(64)).is_err());
+            assert!(validate_server_snapshot(&hello, &expected, 1, &"a".repeat(64)).is_err());
         }
     }
 
@@ -1950,6 +2004,8 @@ fn schema_command(spec: &CommandSpec) -> SchemaCommand {
             missing_work_id,
             dependency,
         } => SchemaAvailability {
+            // Local `"PLAN_GAP"` literal (#1213 severed edge): wire-stable
+            // unavailable code, not a live `eliot-controlboard` binding.
             code: CONTROLBOARD_PLAN_GAP,
             dependency,
             missing_work_id: Some(missing_work_id),
@@ -1994,9 +2050,361 @@ fn schema_command(spec: &CommandSpec) -> SchemaCommand {
 const fn availability_code(availability: CommandAvailability) -> &'static str {
     match availability {
         CommandAvailability::Admitted => "ADMITTED",
+        // Local `"PLAN_GAP"` literal (#1213 severed edge): help-text code for
+        // unavailable rows, not a live `eliot-controlboard` binding.
         CommandAvailability::PlanGap { .. } => CONTROLBOARD_PLAN_GAP,
         CommandAvailability::Unsupported { .. } => "UNSUPPORTED",
         CommandAvailability::Unimplemented { .. } => "UNIMPLEMENTED",
+    }
+}
+
+/// Antigravity terminal-reconciliation projection (Slice B, issue #9).
+///
+/// Pure projection only: it holds the Supervisor, API, and CLI views plus the
+/// stale-CLI, earlier-error, and final-canonical reducer inputs as independent
+/// fields. It proves same-identity and same-disposition agreement across the
+/// three views without defaulting missing values and without reducing to a
+/// terminal outcome. The terminal reducer itself is an explicit MGR02 handoff.
+pub mod antigravity_terminal {
+    use schemars::JsonSchema;
+    use serde::{Deserialize, Serialize};
+    use thiserror::Error;
+
+    /// Coverage recorded by this freeze; never an observation claim.
+    pub const COVERAGE: &str = "documented_not_observed";
+    /// Owner of the terminal reducer; this module never reduces.
+    pub const REDUCER_HANDOFF: &str = "MGR02";
+    /// Frozen antigravity route profile identity.
+    pub const PROFILE_ID: &str = "antigravity.local.supervised-stream";
+    /// Frozen primary route identity.
+    pub const PRIMARY_ROUTE_ID: &str = "antigravity.exec.persistent-ndjson";
+    /// Frozen alternative route identity.
+    pub const ALTERNATIVE_ROUTE_ID: &str = "antigravity.python-sdk.sidecar";
+    /// Frozen fallback route identity.
+    pub const FALLBACK_ROUTE_ID: &str = "antigravity.agy.readonly-diff";
+
+    /// Which surface produced one terminal view. The three views are compared
+    /// for agreement; no origin is authoritative over another.
+    #[derive(
+        Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize,
+    )]
+    #[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+    pub enum ViewOrigin {
+        Supervisor,
+        Api,
+        Cli,
+    }
+
+    /// Projected attempt lifecycle mirroring canonical `AttemptState`
+    /// (`crates/agent/eliot-agent-api/src/lib.rs:610`). No default, no
+    /// completion inference.
+    #[derive(
+        Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize,
+    )]
+    #[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+    pub enum ProjectedAttemptState {
+        Admitted,
+        Started,
+        Running,
+        Cancelling,
+        Checkpointed,
+        Reconciling,
+        Completed,
+        Failed,
+        UnknownOutcome,
+        Cancelled,
+        Quarantined,
+    }
+
+    impl ProjectedAttemptState {
+        /// Mirrors canonical terminality without deciding it.
+        #[must_use]
+        pub const fn is_terminal(self) -> bool {
+            matches!(
+                self,
+                Self::Completed
+                    | Self::Failed
+                    | Self::UnknownOutcome
+                    | Self::Cancelled
+                    | Self::Quarantined
+            )
+        }
+    }
+
+    /// Projected candidate disposition mirroring canonical `ResultDisposition`.
+    /// There is no completion variant; the strongest positive is
+    /// `CandidateSucceeded`.
+    #[derive(
+        Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize,
+    )]
+    #[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+    pub enum ProjectedDisposition {
+        CandidateSucceeded,
+        Partial,
+        Blocked,
+        FailedVerification,
+        DegradedNoProof,
+        Unsafe,
+        CancelledObserved,
+        Superseded,
+        UnknownOutcome,
+    }
+
+    /// One surface view of the same antigravity attempt. All identity fields
+    /// are required; absence is an error, never a default.
+    #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct TerminalView {
+        pub origin: ViewOrigin,
+        pub session_id: String,
+        pub attempt_id: String,
+        pub task_id: String,
+        pub route_id: String,
+        pub sequence: u64,
+        pub cursor: String,
+        pub attempt_state: ProjectedAttemptState,
+        pub disposition: ProjectedDisposition,
+    }
+
+    impl TerminalView {
+        /// Fail-closed validation: non-blank identities without control
+        /// characters, nonzero sequence, admitted antigravity route only.
+        pub fn validate(&self) -> Result<(), TerminalProjectionError> {
+            for (field, value) in [
+                ("session_id", self.session_id.as_str()),
+                ("attempt_id", self.attempt_id.as_str()),
+                ("task_id", self.task_id.as_str()),
+                ("route_id", self.route_id.as_str()),
+                ("cursor", self.cursor.as_str()),
+            ] {
+                if value.trim().is_empty() {
+                    return Err(TerminalProjectionError::BlankField { field });
+                }
+                if value.chars().any(char::is_control) {
+                    return Err(TerminalProjectionError::ControlCharacters { field });
+                }
+            }
+            if self.sequence == 0 {
+                return Err(TerminalProjectionError::ZeroSequence);
+            }
+            if self.route_id != PRIMARY_ROUTE_ID
+                && self.route_id != ALTERNATIVE_ROUTE_ID
+                && self.route_id != FALLBACK_ROUTE_ID
+            {
+                return Err(TerminalProjectionError::UnknownRoute);
+            }
+            Ok(())
+        }
+    }
+
+    /// Earlier normalized `Error` observation held as an independent reducer
+    /// input. It shares the attempt identity but keeps its own event identity,
+    /// sequence, and cursor.
+    #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct ErrorEventInput {
+        pub attempt_id: String,
+        pub event_id: String,
+        pub sequence: u64,
+        pub cursor: String,
+        pub error_code: String,
+    }
+
+    impl ErrorEventInput {
+        /// Fail-closed validation for the earlier error input.
+        pub fn validate(&self) -> Result<(), TerminalProjectionError> {
+            for (field, value) in [
+                ("attempt_id", self.attempt_id.as_str()),
+                ("event_id", self.event_id.as_str()),
+                ("cursor", self.cursor.as_str()),
+                ("error_code", self.error_code.as_str()),
+            ] {
+                if value.trim().is_empty() {
+                    return Err(TerminalProjectionError::BlankField { field });
+                }
+                if value.chars().any(char::is_control) {
+                    return Err(TerminalProjectionError::ControlCharacters { field });
+                }
+            }
+            if self.sequence == 0 {
+                return Err(TerminalProjectionError::ZeroSequence);
+            }
+            Ok(())
+        }
+    }
+
+    /// Final canonical disposition held as an independent reducer input. It is
+    /// stored, never derived from the stale view or the error event.
+    #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct CanonicalDispositionInput {
+        pub session_id: String,
+        pub attempt_id: String,
+        pub task_id: String,
+        pub route_id: String,
+        pub disposition: ProjectedDisposition,
+        pub terminal_ref: String,
+        pub sequence: u64,
+        pub cursor: String,
+    }
+
+    impl CanonicalDispositionInput {
+        /// Fail-closed validation for the canonical disposition input.
+        pub fn validate(&self) -> Result<(), TerminalProjectionError> {
+            for (field, value) in [
+                ("session_id", self.session_id.as_str()),
+                ("attempt_id", self.attempt_id.as_str()),
+                ("task_id", self.task_id.as_str()),
+                ("route_id", self.route_id.as_str()),
+                ("terminal_ref", self.terminal_ref.as_str()),
+                ("cursor", self.cursor.as_str()),
+            ] {
+                if value.trim().is_empty() {
+                    return Err(TerminalProjectionError::BlankField { field });
+                }
+                if value.chars().any(char::is_control) {
+                    return Err(TerminalProjectionError::ControlCharacters { field });
+                }
+            }
+            if self.sequence == 0 {
+                return Err(TerminalProjectionError::ZeroSequence);
+            }
+            if self.route_id != PRIMARY_ROUTE_ID
+                && self.route_id != ALTERNATIVE_ROUTE_ID
+                && self.route_id != FALLBACK_ROUTE_ID
+            {
+                return Err(TerminalProjectionError::UnknownRoute);
+            }
+            Ok(())
+        }
+    }
+
+    /// Independent reducer inputs for one antigravity attempt. The stale CLI
+    /// view, the earlier error event, and the final canonical disposition are
+    /// separate fields by construction; projecting agreement never merges them.
+    #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct AntigravityTerminalInputs {
+        pub supervisor: TerminalView,
+        pub api: TerminalView,
+        pub cli: TerminalView,
+        pub stale_cli: TerminalView,
+        pub error_event: ErrorEventInput,
+        pub canonical: CanonicalDispositionInput,
+    }
+
+    impl AntigravityTerminalInputs {
+        /// Validates every input and proves the three reducer inputs are
+        /// independent: the stale view and the error event share the canonical
+        /// attempt identity but carry distinct sequences, and the error event
+        /// identity differs from the canonical terminal reference.
+        pub fn validate(&self) -> Result<(), TerminalProjectionError> {
+            self.supervisor.validate()?;
+            self.api.validate()?;
+            self.cli.validate()?;
+            self.stale_cli.validate()?;
+            self.error_event.validate()?;
+            self.canonical.validate()?;
+            if self.stale_cli.attempt_id != self.canonical.attempt_id
+                || self.error_event.attempt_id != self.canonical.attempt_id
+            {
+                return Err(TerminalProjectionError::IdentityMismatch);
+            }
+            if self.stale_cli.sequence == self.canonical.sequence {
+                return Err(TerminalProjectionError::StaleNotIndependent);
+            }
+            if self.error_event.sequence == self.canonical.sequence {
+                return Err(TerminalProjectionError::ErrorNotIndependent);
+            }
+            if self.error_event.event_id == self.canonical.terminal_ref {
+                return Err(TerminalProjectionError::ErrorNotIndependent);
+            }
+            Ok(())
+        }
+    }
+
+    /// Agreement receipt from projecting the three views. It records whether
+    /// the views agree and whether the reducer inputs stayed independent. It
+    /// never carries a terminal decision: `reduces_to_terminal` is always
+    /// false and the reducer remains `MGR02`.
+    #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    #[allow(clippy::struct_excessive_bools)]
+    pub struct TerminalAgreementReceipt {
+        pub same_identity: bool,
+        pub same_disposition: bool,
+        pub stale_independent: bool,
+        pub error_independent: bool,
+        pub reduces_to_terminal: bool,
+        pub coverage: String,
+        pub reducer_handoff: String,
+    }
+
+    /// Projects Supervisor/API/CLI agreement without reducing.
+    ///
+    /// Fails closed on any invalid field, identity mismatch, disposition
+    /// mismatch, or non-independent reducer input. Success returns an
+    /// agreement receipt only; it never returns a terminal task outcome.
+    pub fn project(
+        inputs: &AntigravityTerminalInputs,
+    ) -> Result<TerminalAgreementReceipt, TerminalProjectionError> {
+        inputs.validate()?;
+        let views = [&inputs.supervisor, &inputs.api, &inputs.cli];
+        for view in &views {
+            if view.session_id != inputs.canonical.session_id
+                || view.attempt_id != inputs.canonical.attempt_id
+                || view.task_id != inputs.canonical.task_id
+                || view.route_id != inputs.canonical.route_id
+            {
+                return Err(TerminalProjectionError::IdentityMismatch);
+            }
+        }
+        if inputs.supervisor.disposition != inputs.api.disposition
+            || inputs.api.disposition != inputs.cli.disposition
+            || inputs.cli.disposition != inputs.canonical.disposition
+        {
+            return Err(TerminalProjectionError::DispositionMismatch);
+        }
+        Ok(TerminalAgreementReceipt {
+            same_identity: true,
+            same_disposition: true,
+            stale_independent: inputs.stale_cli.sequence != inputs.canonical.sequence,
+            error_independent: inputs.error_event.sequence != inputs.canonical.sequence
+                && inputs.error_event.event_id != inputs.canonical.terminal_ref,
+            reduces_to_terminal: false,
+            coverage: COVERAGE.to_owned(),
+            reducer_handoff: REDUCER_HANDOFF.to_owned(),
+        })
+    }
+
+    /// Fail-closed projection errors. No variant defaults or synthesizes an
+    /// identity, disposition, or terminal outcome.
+    #[derive(Clone, Debug, Eq, Error, PartialEq)]
+    pub enum TerminalProjectionError {
+        /// A required identity field is blank.
+        #[error("terminal projection field {field} is blank")]
+        BlankField { field: &'static str },
+        /// A required identity field contains control characters.
+        #[error("terminal projection field {field} contains control characters")]
+        ControlCharacters { field: &'static str },
+        /// A sequence is zero; sequences are always nonzero.
+        #[error("terminal projection sequence must be nonzero")]
+        ZeroSequence,
+        /// A route identity is not an admitted antigravity route.
+        #[error("terminal projection route is not an admitted antigravity route")]
+        UnknownRoute,
+        /// Supervisor/API/CLI/canonical identities do not agree.
+        #[error("terminal projection identities do not agree")]
+        IdentityMismatch,
+        /// Supervisor/API/CLI/canonical dispositions do not agree.
+        #[error("terminal projection dispositions do not agree")]
+        DispositionMismatch,
+        /// The stale CLI input is not independent of the canonical input.
+        #[error("stale CLI input is not independent of the canonical disposition")]
+        StaleNotIndependent,
+        /// The error event input is not independent of the canonical input.
+        #[error("error event input is not independent of the canonical disposition")]
+        ErrorNotIndependent,
     }
 }
 
@@ -2066,7 +2474,7 @@ mod tests {
 
     #[test]
     fn provider_identity_comes_from_actual_contract_shapes() -> Result<(), CatalogueError> {
-        assert_eq!(MCP_SURFACE_CONTRACT_REVISION, "1.0.0");
+        assert_eq!(MCP_SURFACE_CONTRACT_REVISION, eliot_mcp::CONTRACT_REVISION);
         let providers = CommandCatalogue::current().providers()?;
         assert_eq!(providers.len(), 4);
         assert!(

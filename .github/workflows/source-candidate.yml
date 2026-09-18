@@ -27,7 +27,7 @@ jobs:
     timeout-minutes: 180
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
 
@@ -55,7 +55,7 @@ jobs:
         run: rustup show active-toolchain
 
       - name: Cache Cargo inputs
-        uses: actions/cache@v4
+        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
         with:
           path: |
             ~/.cargo/registry
@@ -105,12 +105,26 @@ jobs:
       - name: Workspace all-target build
         run: cargo build --workspace --all-targets --locked
 
-      - name: Eliot.Operator Release build
-        run: dotnet build apps/Eliot.Operator/Eliot.Operator.csproj -c Release
-
-      - name: Record source-candidate ceiling
+      - name: Restore and build Eliot.Operator in locked mode
         shell: pwsh
         run: |
+          dotnet restore apps/Eliot.Operator/Eliot.Operator.csproj --locked-mode
+          dotnet build apps/Eliot.Operator/Eliot.Operator.csproj -c Release --no-restore
+
+      - name: Execute Eliot.Operator test harness
+        shell: pwsh
+        run: |
+          dotnet run --project tests/Eliot.Operator.Tests/Eliot.Operator.Tests.csproj -c Release --no-restore
+
+      - name: Record source-candidate ceiling and manifest
+        shell: pwsh
+        run: |
+          $sourceSha = (git rev-parse HEAD).Trim()
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "### Manual Source Candidate Run Manifest"
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Source SHA: $sourceSha"
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Actions: checkout@11bd7190, cache@1bd1e32a"
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- NuGet: locked-mode restore packages.lock.json"
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Operator tests: executed Eliot.Operator.Tests (exit 0)"
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value 'SOURCE_CANDIDATE_ONLY'
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value 'No installed-runtime/store/Product-Pulse claim.'
 

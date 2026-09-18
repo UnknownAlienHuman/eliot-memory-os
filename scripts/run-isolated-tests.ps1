@@ -1,5 +1,82 @@
+<#
+.SYNOPSIS
+    Bounded coordinator for isolated integration-test execution (issue #907 D-INT-CORE).
+
+.DESCRIPTION
+    Public entrypoint path preserved. Exactly one of -WhatIf, -ValidateConfiguration,
+    or -Run is required; the three profiles are mutually exclusive. A default
+    invocation (no profile) or a conflicting invocation (more than one profile)
+    launches NOTHING and fails usage validation with exit code 2. There is no
+    second -Mode API.
+
+    Profiles:
+      -WhatIf                 Validate inventory/configuration plus a finite explicitly
+                              selected row set, derive the fixed commands/resources/
+                              cleanup, and write at most an explicitly requested plan
+                              file under the admitted run root. No process, port, pipe,
+                              worktree, or data allocation.
+      -ValidateConfiguration  Read-only validation/plan seams only. No dependency or
+                              test launch, no file writes.
+      -Run                    Require explicit selection and start exactly those frozen
+                              identities via the Core/Model seams. An explicit
+                              -SelectAllRows resolves to a finite current list inside
+                              the seam; there is no implicit wildcard run-all and no
+                              package exclusion. Empty selection, or zero discovered
+                              execution, is NOT success (fail-closed).
+
+    Selection is explicit and finite: -SelectedTestId <id...> or -SelectAllRows,
+    never both, never neither (for -WhatIf/-Run). Duplicate or blank identities
+    prevent start (usage validation failure, exit 2).
+
+    Caller inputs cannot provide shell/executable/raw argv/URL/credential/
+    environment-map or unrestricted output-path values. The monolith's
+    caller-supplied -TestPackage/-TestBinary/-BinTarget/-LibTarget/-TestName/
+    -TestFilterExpression/-SurrealExecutable launch path is removed: the parameters
+    remain in the signature only for compatibility and any explicit use of them
+    fails closed with a usage error. -McpOnly and -RunIgnored encode implicit
+    selection/exclusion and are likewise rejected. Fixed recipes derive from
+    accepted inventory identities plus the committed toolchain inside the
+    IntegrationHarness.Core/Model modules. -HarnessProbe, -EvidenceLogPath,
+    -ResultArtifactPath, and -InjectFailureAfterSecretSetup are execution knobs
+    valid only with -Run. -PlanOutputPath is valid only with -WhatIf and must
+    descend from the admitted run root. -EvidenceLogPath/-ResultArtifactPath must
+    remain OUTSIDE the run-owned cleanup roots (preserved monolith check).
+
+    Real work is delegated to scripts/integration/IntegrationHarness.Core.psm1 and
+    scripts/integration/IntegrationHarness.Model.psm1 through this closed seam
+    contract (resolved dynamically; a missing seam fails closed, never passes):
+      Invoke-HarnessValidateConfiguration [-InventoryPath <file>] [-TimeoutSeconds <n>]
+      Invoke-HarnessWhatIf -SelectedTestId <ids>|-SelectAllRows [-InventoryPath <file>]
+        [-TimeoutSeconds <n>]  -> returns the finite plan object (never $null)
+      Invoke-HarnessRun -SelectedTestId <ids>|-SelectAllRows [-InventoryPath <file>]
+        [-RunId <id>] [-CandidateRoot <path>] [-TimeoutSeconds <n>]
+        [-HarnessProbe <name>] [-InjectFailureAfterSecretSetup]
+        [-EvidenceLogPath <path>] [-ResultArtifactPath <path>]
+        -> returns the run result object, or throws on any failure. A result that
+           reports zero executed tests is NOT success even without a throw.
+    This coordinator owns profile arbitration, selection binding, run-root
+    admission, and output-path admission only. It never duplicates the provider
+    state machine, never launches processes/ports/pipes/worktrees/data, and never
+    mutates process-global environment. Resource cleanup of run-owned state is
+    module-owned; the coordinator cleans up only its own explicitly requested
+    plan file (reverse order, idempotent) and retains the original failure
+    alongside any cleanup failure.
+
+    Exit codes: 2 = usage validation failure (nothing launched); 97 = harness
+    delegation failure (modules/seam missing, seam threw, empty plan, or zero
+    execution); 98 = coordinator-owned cleanup failure (original failure retained
+    in stderr). Exit 2 is reserved for usage validation: delegation outcomes are
+    never reported as 2.
+#>
 [CmdletBinding()]
 param(
+    [switch]$WhatIf,
+    [switch]$ValidateConfiguration,
+    [switch]$Run,
+    [AllowEmptyCollection()][string[]]$SelectedTestId = @(),
+    [switch]$SelectAllRows,
+    [string]$InventoryPath,
+    [string]$PlanOutputPath,
     [switch]$McpOnly,
     [string]$TestPackage = 'eliot-app',
     [string]$TestBinary,
@@ -19,867 +96,395 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
-$surrealCommandName = if ([string]::IsNullOrWhiteSpace($SurrealExecutable)) { 'surreal' } else { $SurrealExecutable }
-$surrealCommand = Get-Command $surrealCommandName -CommandType Application -ErrorAction Stop
-$surrealExePath = [IO.Path]::GetFullPath($surrealCommand.Source)
-if (-not (Test-Path -LiteralPath $surrealExePath -PathType Leaf)) {
-    throw "SurrealDB executable was not resolved to a file: $surrealExePath"
-}
-$surrealConfigPath = $surrealExePath.Replace('\', '/')
-$tempBase = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
-$runId = [guid]::NewGuid().ToString('N')
-$ownedRoot = [IO.Path]::GetFullPath((Join-Path $tempBase ("eliot-wt-{0}-{1}" -f $PID, $runId)))
-$ownedPrefix = $ownedRoot.TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
-$lower = $ownedRoot.ToLowerInvariant()
+$ProgressPreference = 'SilentlyContinue'
 
-function Assert-NoReparsePoint {
+$script:UsageExitCode = 2
+$script:DelegationFailureExitCode = 97
+$script:CleanupFailureExitCode = 98
+$script:MaxSelectedIds = 100000
+$script:MaxSelectedIdLength = 1024
+$script:MaxStderrDetailChars = 4096
+
+function Write-HarnessUsageError {
+    param([Parameter(Mandatory)][string]$Message)
+
+    [Console]::Error.WriteLine("run-isolated-tests usage error: $Message")
+    [Console]::Error.WriteLine('usage: run-isolated-tests.ps1 -WhatIf|-ValidateConfiguration|-Run -SelectedTestId <id...>|-SelectAllRows [-InventoryPath <file>] [-PlanOutputPath <under-run-root>]')
+    [Console]::Error.WriteLine('profiles are mutually exclusive; default or conflicting invocation launches nothing.')
+    exit $script:UsageExitCode
+}
+
+function Write-HarnessInternalError {
+    param([Parameter(Mandatory)][string]$Message)
+
+    [Console]::Error.WriteLine("run-isolated-tests harness error: $Message")
+    exit $script:DelegationFailureExitCode
+}
+
+function Get-BoundedErrorDetail {
+    param([Parameter(Mandatory)][string]$Text)
+
+    if ($Text.Length -gt $script:MaxStderrDetailChars) {
+        return $Text.Substring(0, $script:MaxStderrDetailChars) + '...[truncated]'
+    }
+    return $Text
+}
+
+function Get-FileSha256Hex {
     param([Parameter(Mandatory)][string]$Path)
 
-    $entry = Get-Item -LiteralPath ([IO.Path]::GetFullPath($Path)) -Force
-    while ($null -ne $entry) {
-        if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-            throw "owned test path crosses a reparse point: $($entry.FullName)"
-        }
-        $entry = $entry.Parent
-    }
+    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 
-function Protect-CurrentUserOnlyAcl {
-    param(
-        [Parameter(Mandatory)][string]$Path,
-        [switch]$Directory
-    )
-
-    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-    if ([string]::IsNullOrWhiteSpace($sid) -or -not $sid.StartsWith('S-', [StringComparison]::Ordinal)) {
-        throw 'could not resolve the current Windows SID for the owned test secret ACL'
-    }
-    $userGrant = if ($Directory) { "*$($sid):(OI)(CI)F" } else { "*$($sid):F" }
-    $systemGrant = if ($Directory) { '*S-1-5-18:(OI)(CI)F' } else { '*S-1-5-18:F' }
-    & icacls.exe $Path '/inheritance:r' '/grant:r' $userGrant '/grant:r' $systemGrant `
-        '/remove:g' '*S-1-1-0' '*S-1-5-11' '*S-1-5-32-545' 1>$null 2>$null
-    if ($LASTEXITCODE -ne 0) {
-        throw "failed to restrict the owned test secret ACL: $Path"
-    }
+# ---------------------------------------------------------------------------
+# 1. Profile arbitration. This runs before ANY allocation, import, process,
+#    port, pipe, worktree, or data touch. Nothing above this point has side
+#    effects (function definitions and pure assignments only).
+# ---------------------------------------------------------------------------
+$profileCount = 0
+$activeProfile = $null
+if ($WhatIf) { $profileCount++; $activeProfile = 'WhatIf' }
+if ($ValidateConfiguration) { $profileCount++; $activeProfile = 'ValidateConfiguration' }
+if ($Run) { $profileCount++; $activeProfile = 'Run' }
+if ($profileCount -eq 0) {
+    Write-HarnessUsageError 'exactly one profile (-WhatIf, -ValidateConfiguration, or -Run) is required; default invocation launches nothing.'
+}
+if ($profileCount -gt 1) {
+    Write-HarnessUsageError 'profiles -WhatIf, -ValidateConfiguration, and -Run are mutually exclusive; conflicting invocation launches nothing.'
 }
 
-function Remove-ExactOwnedSecretRoot {
-    param(
-        [Parameter(Mandatory)][string]$OwnedRoot,
-        [Parameter(Mandatory)][string]$ExpectedTestsRoot,
-        [Parameter(Mandatory)][string]$ExpectedRunId
-    )
-
-    $resolvedOwnedRoot = [IO.Path]::GetFullPath($OwnedRoot)
-    if (-not (Test-Path -LiteralPath $resolvedOwnedRoot)) {
-        return
+# ---------------------------------------------------------------------------
+# 2. Raw-launch guard. The monolith let callers steer execution with package/
+#    binary/target/name/filter/executable inputs. That path is removed: the
+#    parameters stay in the signature for compatibility, but any explicit use
+#    fails closed here, before anything launches.
+# ---------------------------------------------------------------------------
+$removedLaunchParams = @(
+    'TestPackage', 'TestBinary', 'BinTarget', 'LibTarget',
+    'TestName', 'TestFilterExpression', 'SurrealExecutable'
+)
+foreach ($name in $removedLaunchParams) {
+    if ($PSBoundParameters.ContainsKey($name)) {
+        Write-HarnessUsageError ("parameter -{0} no longer drives execution; fixed recipes derive from accepted inventory identities via -SelectedTestId/-SelectAllRows. Raw execution input is rejected and nothing launches." -f $name)
     }
-    $resolvedTestsRoot = [IO.Path]::GetFullPath($ExpectedTestsRoot)
-    $testsPrefix = $resolvedTestsRoot.TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
-    if (-not $resolvedOwnedRoot.StartsWith($testsPrefix, [StringComparison]::OrdinalIgnoreCase) -or
-        [IO.Path]::GetFileName($resolvedOwnedRoot) -cne $ExpectedRunId -or
-        [IO.Path]::GetFullPath((Split-Path $resolvedOwnedRoot -Parent)) -ine $resolvedTestsRoot) {
-        throw "owned test secret cleanup escaped its exact run boundary: $resolvedOwnedRoot"
-    }
-    Assert-NoReparsePoint $resolvedOwnedRoot
-
-    $marker = Join-Path $resolvedOwnedRoot '.eliot-test-owner.json'
-    $secrets = Join-Path $resolvedOwnedRoot 'secrets'
-    $password = Join-Path $secrets 'surreal_root_password.txt'
-    if (-not (Test-Path -LiteralPath $marker -PathType Leaf) -or
-        -not (Test-Path -LiteralPath $secrets -PathType Container) -or
-        -not (Test-Path -LiteralPath $password -PathType Leaf)) {
-        throw "owned test secret root has an incomplete ownership layout: $resolvedOwnedRoot"
-    }
-    $recordedOwner = Get-Content -LiteralPath $marker -Raw | ConvertFrom-Json
-    if ($recordedOwner.schema_version -cne 'eliot-owned-test-secret-root-v1' -or
-        $recordedOwner.run_id -cne $ExpectedRunId -or
-        [IO.Path]::GetFullPath([string]$recordedOwner.owned_root) -ine $resolvedOwnedRoot) {
-        throw "owned test secret root failed exact ownership verification: $resolvedOwnedRoot"
-    }
-
-    $rootEntries = @(Get-ChildItem -LiteralPath $resolvedOwnedRoot -Force)
-    $secretEntries = @(Get-ChildItem -LiteralPath $secrets -Force)
-    if ($rootEntries.Count -ne 2 -or
-        @($rootEntries.Name | Where-Object { $_ -notin @('.eliot-test-owner.json', 'secrets') }).Count -ne 0 -or
-        $secretEntries.Count -ne 1 -or
-        $secretEntries[0].Name -cne 'surreal_root_password.txt' -or
-        ($rootEntries + $secretEntries).Where({
-            ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
-        }).Count -ne 0) {
-        throw "owned test secret root contains an unexpected entry; preserving it for inspection: $resolvedOwnedRoot"
-    }
-
-    Remove-Item -LiteralPath $password -Force
-    Remove-Item -LiteralPath $marker -Force
-    Remove-Item -LiteralPath $secrets -Force
-    Remove-Item -LiteralPath $resolvedOwnedRoot -Force
+}
+if ($McpOnly) {
+    Write-HarnessUsageError '-McpOnly encodes an implicit package/test selection; use explicit -SelectedTestId/-SelectAllRows. Nothing launches.'
+}
+if ($RunIgnored) {
+    Write-HarnessUsageError '-RunIgnored encodes an implicit selection/exclusion; use explicit -SelectedTestId/-SelectAllRows. Nothing launches.'
 }
 
-function Stop-ExactOwnedProcess {
-    param(
-        [Parameter(Mandatory)][Diagnostics.Process]$Process,
-        [Parameter(Mandatory)][string]$Role,
-        [AllowEmptyCollection()]
-        [Parameter(Mandatory)][Collections.Generic.List[string]]$Failures,
-        [AllowEmptyCollection()]
-        [Parameter(Mandatory)][Collections.Generic.List[object]]$Receipts
-    )
+# ---------------------------------------------------------------------------
+# 3. Explicit finite selection. -Run and -WhatIf require exactly one selection
+#    form with at least one usable, non-duplicate identity. Empty selection is
+#    NOT success. -ValidateConfiguration accepts an optional selection for its
+#    read-only plan seams but still rejects contradictory/duplicate input.
+# ---------------------------------------------------------------------------
+$explicitIds = @()
+if ($PSBoundParameters.ContainsKey('SelectedTestId') -and $null -ne $SelectedTestId) {
+    $explicitIds = @($SelectedTestId | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_.Trim() })
+}
+if ($PSBoundParameters.ContainsKey('SelectedTestId') -and $explicitIds.Count -eq 0) {
+    Write-HarnessUsageError '-SelectedTestId was provided but contains no usable identity; empty selection is not success and launches nothing.'
+}
+$duplicateIds = @($explicitIds | Group-Object -NoElement | Where-Object { $_.Count -gt 1 } | ForEach-Object { $_.Name })
+if ($duplicateIds.Count -gt 0) {
+    Write-HarnessUsageError ("duplicate test identities prevent start: {0}" -f ($duplicateIds -join ', '))
+}
+foreach ($id in $explicitIds) {
+    if ($id.Length -gt $script:MaxSelectedIdLength) {
+        Write-HarnessUsageError 'a selected test identity exceeds the bounded length; selection rejected and nothing launches.'
+    }
+}
+if ($explicitIds.Count -gt $script:MaxSelectedIds) {
+    Write-HarnessUsageError 'selection exceeds the bounded row cap; selection rejected and nothing launches.'
+}
+if ($SelectAllRows -and $explicitIds.Count -gt 0) {
+    Write-HarnessUsageError '-SelectAllRows and -SelectedTestId are mutually exclusive; contradictory selection launches nothing.'
+}
+$hasSelection = ($explicitIds.Count -gt 0) -or [bool]$SelectAllRows
+if (($activeProfile -eq 'Run' -or $activeProfile -eq 'WhatIf') -and -not $hasSelection) {
+    Write-HarnessUsageError ("-{0} requires explicit finite selection (-SelectedTestId or -SelectAllRows); empty selection is not success and launches nothing." -f $activeProfile)
+}
 
-    $receipt = [ordered]@{
-        role = $Role
-        pid = $Process.Id
-        graceful_requested = $false
-        forced = $false
-        stopped = $false
+# ---------------------------------------------------------------------------
+# 4. Profile-gated knobs. Execution probes/artifacts belong to -Run; plan
+#    output belongs to -WhatIf; -ValidateConfiguration takes none of them.
+# ---------------------------------------------------------------------------
+if ($activeProfile -ne 'Run') {
+    if ($HarnessProbe -ne 'none') {
+        Write-HarnessUsageError ("-HarnessProbe is an execution probe and is valid only with -Run, not -{0}. Nothing launches." -f $activeProfile)
+    }
+    if ($InjectFailureAfterSecretSetup) {
+        Write-HarnessUsageError ("-InjectFailureAfterSecretSetup is an execution failure-injection knob and is valid only with -Run, not -{0}. Nothing launches." -f $activeProfile)
+    }
+    if ($PSBoundParameters.ContainsKey('EvidenceLogPath')) {
+        Write-HarnessUsageError ("-EvidenceLogPath is an execution artifact path and is valid only with -Run, not -{0}. Nothing launches." -f $activeProfile)
+    }
+    if ($PSBoundParameters.ContainsKey('ResultArtifactPath')) {
+        Write-HarnessUsageError ("-ResultArtifactPath is an execution artifact path and is valid only with -Run, not -{0}. Nothing launches." -f $activeProfile)
+    }
+}
+if ($PSBoundParameters.ContainsKey('PlanOutputPath') -and $activeProfile -ne 'WhatIf') {
+    Write-HarnessUsageError '-PlanOutputPath is valid only with -WhatIf. Nothing launches.'
+}
+
+# ---------------------------------------------------------------------------
+# 5. Admitted run-root derivation (no creation). The candidate root is unique
+#    per invocation, must descend from TEMP, and must not cross a forbidden
+#    host boundary. The seam admits (creates + writes the owner receipt for)
+#    the final run root; the coordinator never creates worktree/data state.
+# ---------------------------------------------------------------------------
+$tempBase = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
+$runId = [guid]::NewGuid().ToString('N')
+$candidateRoot = [IO.Path]::GetFullPath((Join-Path $tempBase ("eliot-harness-{0}-{1}" -f $PID, $runId)))
+$ownedPrefix = $candidateRoot.TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+if (-not $ownedPrefix.StartsWith($tempBase, [StringComparison]::OrdinalIgnoreCase)) {
+    Write-HarnessInternalError 'admitted run-root derivation escaped TEMP.'
+}
+$lowerRoot = $candidateRoot.ToLowerInvariant()
+if ($lowerRoot.Contains('onedrive') -or $lowerRoot.Contains('programdata')) {
+    Write-HarnessUsageError 'admitted run root crossed a forbidden host boundary; nothing launches.'
+}
+
+# ---------------------------------------------------------------------------
+# 6. Path admission. Inventory (when given) must be an existing file. The
+#    WhatIf plan file, when requested, must descend from the admitted run
+#    root. Execution artifacts must remain OUTSIDE the run-owned cleanup
+#    roots (preserved monolith check).
+# ---------------------------------------------------------------------------
+$resolvedInventoryPath = $null
+if ($PSBoundParameters.ContainsKey('InventoryPath')) {
+    if ([string]::IsNullOrWhiteSpace($InventoryPath)) {
+        Write-HarnessUsageError '-InventoryPath must be a nonempty path to an existing inventory file.'
     }
     try {
-        $Process.Refresh()
-        if (-not $Process.HasExited) {
-            $receipt.graceful_requested = $Process.CloseMainWindow()
-            if ($receipt.graceful_requested) {
-                $Process.WaitForExit(2000) | Out-Null
-                $Process.Refresh()
-            }
-        }
-        if (-not $Process.HasExited) {
-            Stop-Process -Id $Process.Id -Force -ErrorAction Stop
-            $receipt.forced = $true
-            if (-not $Process.WaitForExit(10000)) {
-                throw "owned process did not exit within the bounded fallback: role=$Role pid=$($Process.Id)"
-            }
-        }
-        $receipt.stopped = $true
+        $resolvedInventoryPath = [IO.Path]::GetFullPath($InventoryPath)
     }
     catch {
-        $Failures.Add("owned_process_cleanup_failed:$Role")
+        Write-HarnessUsageError 'the -InventoryPath value is not a usable path.'
     }
-    $Receipts.Add([pscustomobject]$receipt)
+    if (-not (Test-Path -LiteralPath $resolvedInventoryPath -PathType Leaf)) {
+        Write-HarnessUsageError ("inventory file is absent: {0}" -f $resolvedInventoryPath)
+    }
 }
 
-function Get-ExactRunOwnedProcesses {
-    param(
-        [Parameter(Mandatory)][string]$RunId,
-        [Parameter(Mandatory)][string]$OwnedRoot,
-        [Parameter(Mandatory)][int[]]$ExcludedPids
-    )
-
-    $normalizedRoot = $OwnedRoot.Replace('/', '\')
-    @(Get-CimInstance Win32_Process | Where-Object {
-        $_.ProcessId -notin $ExcludedPids -and
-        -not [string]::IsNullOrWhiteSpace($_.CommandLine) -and
-        ($_.CommandLine.Contains($RunId, [StringComparison]::OrdinalIgnoreCase) -or
-            $_.CommandLine.Replace('/', '\').Contains($normalizedRoot, [StringComparison]::OrdinalIgnoreCase))
-    })
-}
-
-function Merge-ProcessLogs {
-    param(
-        [Parameter(Mandatory)][string]$StdoutPath,
-        [Parameter(Mandatory)][string]$StderrPath,
-        [Parameter(Mandatory)][string]$Destination
-    )
-
-    $writer = [IO.StreamWriter]::new($Destination, $false, [Text.UTF8Encoding]::new($false))
+$resolvedPlanPath = $null
+if ($PSBoundParameters.ContainsKey('PlanOutputPath')) {
+    if ([string]::IsNullOrWhiteSpace($PlanOutputPath)) {
+        Write-HarnessUsageError '-PlanOutputPath must be a nonempty path under the admitted run root.'
+    }
     try {
-        foreach ($path in @($StdoutPath, $StderrPath)) {
-            if (Test-Path -LiteralPath $path -PathType Leaf) {
-                $reader = [IO.StreamReader]::new($path, [Text.UTF8Encoding]::new($false), $true)
-                try {
-                    $writer.Write($reader.ReadToEnd())
-                }
-                finally {
-                    $reader.Dispose()
-                }
-            }
-        }
+        $resolvedPlanPath = [IO.Path]::GetFullPath($PlanOutputPath)
     }
-    finally {
-        $writer.Dispose()
+    catch {
+        Write-HarnessUsageError 'the -PlanOutputPath value is not a usable path.'
+    }
+    if (-not $resolvedPlanPath.StartsWith($ownedPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        Write-HarnessUsageError 'the requested plan path escapes the admitted run root; path-escape and foreign-root output are rejected and nothing launches.'
+    }
+    if ((Test-Path -LiteralPath $resolvedPlanPath -PathType Container)) {
+        Write-HarnessUsageError 'the requested plan path names an existing directory, not a plan file.'
     }
 }
 
-function Read-NextestSummary {
-    param([Parameter(Mandatory)][string]$LogPath)
-
-    if (-not (Test-Path -LiteralPath $LogPath -PathType Leaf)) {
-        return $null
+$resolvedEvidenceLogPath = $null
+$resolvedResultArtifactPath = $null
+if ($PSBoundParameters.ContainsKey('EvidenceLogPath') -and -not [string]::IsNullOrWhiteSpace($EvidenceLogPath)) {
+    $resolvedEvidenceLogPath = [IO.Path]::GetFullPath($EvidenceLogPath)
+    if ($resolvedEvidenceLogPath.StartsWith($ownedPrefix, [StringComparison]::OrdinalIgnoreCase) -or
+        $resolvedEvidenceLogPath -ieq $candidateRoot) {
+        Write-HarnessUsageError 'evidence log path must remain outside the run-owned cleanup root.'
     }
-    $summaryLine = Get-Content -LiteralPath $LogPath | Where-Object {
-        $_ -match '^\s*Summary\s+\['
-    } | Select-Object -Last 1
-    if ([string]::IsNullOrWhiteSpace($summaryLine)) {
-        return $null
-    }
-    $testsRun = if ($summaryLine -match '(?<count>\d+)\s+tests? run:') { [int]$Matches.count } else { $null }
-    $passed = if ($summaryLine -match '(?<count>\d+)\s+passed') { [int]$Matches.count } else { 0 }
-    $failed = if ($summaryLine -match '(?<count>\d+)\s+failed') { [int]$Matches.count } else { 0 }
-    $skipped = if ($summaryLine -match '(?<count>\d+)\s+skipped') { [int]$Matches.count } else { 0 }
-    [pscustomobject]@{
-        text = $summaryLine.Trim()
-        tests_run = $testsRun
-        passed = $passed
-        failed = $failed
-        skipped = $skipped
+}
+if ($PSBoundParameters.ContainsKey('ResultArtifactPath') -and -not [string]::IsNullOrWhiteSpace($ResultArtifactPath)) {
+    $resolvedResultArtifactPath = [IO.Path]::GetFullPath($ResultArtifactPath)
+    if ($resolvedResultArtifactPath.StartsWith($ownedPrefix, [StringComparison]::OrdinalIgnoreCase) -or
+        $resolvedResultArtifactPath -ieq $candidateRoot) {
+        Write-HarnessUsageError 'result artifact path must remain outside the run-owned cleanup root.'
     }
 }
 
-function Get-BoundedRedactedText {
-    param(
-        [AllowEmptyString()]
-        [Parameter(Mandatory)][string]$Text,
-        [AllowNull()][string]$Secret,
-        [ValidateRange(1, 1048576)]
-        [int]$MaxBytes = 65536
-    )
-
-    $redacted = $Text
-    if (-not [string]::IsNullOrEmpty($Secret)) {
-        $redacted = $redacted.Replace($Secret, '[redacted-owned-test-secret]')
-    }
-    $bytes = [Text.Encoding]::UTF8.GetBytes($redacted)
-    $truncated = $bytes.Length -gt $MaxBytes
-    if ($truncated) {
-        $redacted = [Text.Encoding]::UTF8.GetString(
-            $bytes,
-            $bytes.Length - $MaxBytes,
-            $MaxBytes
-        )
-        $bytes = [Text.Encoding]::UTF8.GetBytes($redacted)
-    }
-    [pscustomobject]@{
-        text = $redacted
-        bytes = $bytes.Length
-        truncated = $truncated
-    }
-}
-
-if (-not $ownedPrefix.StartsWith($tempBase, [StringComparison]::OrdinalIgnoreCase)) {
-    throw "isolated test root must descend from TEMP: $ownedRoot"
-}
-if ($lower.Contains('onedrive') -or $lower.Contains('programdata')) {
-    throw "isolated test root crossed a forbidden host boundary: $ownedRoot"
-}
-$resolvedEvidenceLog = $null
-if (-not [string]::IsNullOrWhiteSpace($EvidenceLogPath)) {
-    $resolvedEvidenceLog = [IO.Path]::GetFullPath($EvidenceLogPath)
-    if ($resolvedEvidenceLog.StartsWith($ownedPrefix, [StringComparison]::OrdinalIgnoreCase)) {
-        throw 'evidence log path must remain outside the run-owned cleanup root'
-    }
-}
-$resolvedResultArtifact = $null
-if (-not [string]::IsNullOrWhiteSpace($ResultArtifactPath)) {
-    $resolvedResultArtifact = [IO.Path]::GetFullPath($ResultArtifactPath)
-    if ($resolvedResultArtifact.StartsWith($ownedPrefix, [StringComparison]::OrdinalIgnoreCase)) {
-        throw 'result artifact path must remain outside the run-owned cleanup root'
-    }
-    [IO.Directory]::CreateDirectory((Split-Path -Parent $resolvedResultArtifact)) | Out-Null
-}
-
-$ambientLocalAppData = [Environment]::GetEnvironmentVariable('LOCALAPPDATA', 'Process')
-if ([string]::IsNullOrWhiteSpace($ambientLocalAppData)) {
-    throw 'LOCALAPPDATA is required for the isolated test secret root'
-}
-$ambientLocalAppData = [IO.Path]::GetFullPath($ambientLocalAppData)
-if (-not [IO.Path]::IsPathFullyQualified($ambientLocalAppData)) {
-    throw 'LOCALAPPDATA must be an absolute Windows path'
-}
-$secretTestsRoot = [IO.Path]::GetFullPath((Join-Path $ambientLocalAppData 'Eliot\tests'))
-$secretOwnedRoot = [IO.Path]::GetFullPath((Join-Path $secretTestsRoot $runId))
-$secretTestsPrefix = $secretTestsRoot.TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
-if (-not $secretOwnedRoot.StartsWith($secretTestsPrefix, [StringComparison]::OrdinalIgnoreCase) -or
-    [IO.Path]::GetFileName($secretOwnedRoot) -cne $runId -or
-    [IO.Path]::GetFullPath((Split-Path $secretOwnedRoot -Parent)) -ine $secretTestsRoot) {
-    throw "owned test secret root escaped its exact run boundary: $secretOwnedRoot"
-}
-if ($null -ne $resolvedResultArtifact) {
-    $secretOwnedPrefix = $secretOwnedRoot.TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
-    if ($resolvedResultArtifact -ieq $secretOwnedRoot -or
-        $resolvedResultArtifact.StartsWith($secretOwnedPrefix, [StringComparison]::OrdinalIgnoreCase)) {
-        throw 'result artifact path must remain outside the run-owned secret cleanup root'
-    }
-}
-$secretRoot = Join-Path $secretOwnedRoot 'secrets'
-$passwordPath = Join-Path $secretRoot 'surreal_root_password.txt'
-$passwordConfigPath = "%LOCALAPPDATA%/Eliot/tests/$runId/secrets/surreal_root_password.txt"
-$ownerMarkerPath = Join-Path $secretOwnedRoot '.eliot-test-owner.json'
-
-$configPath = Join-Path $ownedRoot 'config\governor.toml'
-$storagePath = (Join-Path $ownedRoot 'surrealdb-rocks').Replace('\', '/')
-$walPath = (Join-Path $ownedRoot 'control\control.redb').Replace('\', '/')
-$blobPath = (Join-Path $ownedRoot 'blobs').Replace('\', '/')
-$surqlPath = (Join-Path $repo 'crates\eliot-store\src\surql').Replace('\', '/')
-$migrationsPath = (Join-Path $repo 'crates\eliot-store\migrations').Replace('\', '/')
-$pidPath = Join-Path $ownedRoot 'tmp\owned-surreal.pid'
-$nextestLog = Join-Path $ownedRoot 'reports\nextest-events.log'
-$nextestStdout = Join-Path $ownedRoot 'reports\nextest.stdout.log'
-$nextestStderr = Join-Path $ownedRoot 'reports\nextest.stderr.log'
-$surrealStdout = Join-Path $ownedRoot 'reports\surreal.stdout.log'
-$surrealStderr = Join-Path $ownedRoot 'reports\surreal.stderr.log'
-$surrealGuardianStdout = Join-Path $ownedRoot 'reports\surreal-guardian.stdout.jsonl'
-$surrealGuardianStderr = Join-Path $ownedRoot 'reports\surreal-guardian.stderr.log'
-$surrealStopPath = Join-Path $ownedRoot 'tmp\stop-surreal.guardian'
-$guardianBuildStdout = Join-Path $ownedRoot 'reports\guardian-build.stdout.log'
-$guardianBuildStderr = Join-Path $ownedRoot 'reports\guardian-build.stderr.log'
-$guardianStdout = Join-Path $ownedRoot 'reports\guardian.stdout.jsonl'
-$guardianStderr = Join-Path $ownedRoot 'reports\guardian.stderr.log'
-$cargoTargetDirectory = [IO.Path]::GetFullPath((
-    cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
-).target_directory)
-$guardianExe = Join-Path $cargoTargetDirectory 'debug\eliot-process-guardian.exe'
-$credentialGuardExe = Join-Path $cargoTargetDirectory 'debug\eliot-credential-suite-guard.exe'
-$credentialManifestPath = Join-Path $ownedRoot 'reports\isolated-credentials-before.json'
-$operatorCursorCredentialRoot = Join-Path $ownedRoot 'operator-cursor-credentials'
-$probeScript = Join-Path $ownedRoot 'tmp\wrapper-probe.ps1'
-$portListener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
-$portListener.Start()
-$port = ([Net.IPEndPoint]$portListener.LocalEndpoint).Port
-$portListener.Stop()
-
-$ambientUserRoots = @{}
-foreach ($name in @('LOCALAPPDATA', 'APPDATA', 'USERPROFILE', 'HOME')) {
-    $ambientUserRoots[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
-}
-
-$savedEnvironment = @{}
-foreach ($name in @(
-    'ELIOT_DISABLE_REAL_PROVIDER',
-    'ELIOT_GOVERNOR_CONFIG',
-    'ELIOT_TEST_SURREAL_BIND',
-    'ELIOT_TEST_SURREAL_ENDPOINT',
-    'ELIOT_TEST_SURREAL_PASSWORD_FILE',
-    'ELIOT_TEST_SURREAL_STORAGE',
-    'ELIOT_TEST_OPERATOR_CURSOR_CREDENTIAL_BACKEND',
-    'ELIOT_TEST_OPERATOR_CURSOR_CREDENTIAL_ROOT',
-    'ELIOT_TEST_OPERATOR_CURSOR_CREDENTIAL_TARGET',
-    'ELIOT_TEST_ALLOW_LEGACY_OPERATOR_CURSOR_KEY_FILE',
-    'ELIOT_TEST_REGISTERED_CARGO_TARGET_ROOT',
-    'ELIOT_COGNITIVE_FIELD_RESULT_PATH',
-    'ELIOT_SURREAL_EXE',
-    'SURREAL_USER',
-    'SURREAL_PASS'
-)) {
-    $savedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
-}
-
-$testExit = 1
-$childExit = $null
-$surrealGuardianProcess = $null
-$surrealGuardianOutputTask = $null
-$surrealGuardianErrorTask = $null
-$surrealGuardianStatus = $null
-$guardianBuildProcess = $null
-$guardianProcess = $null
-$guardianStatus = $null
-$nextestTimedOut = $false
-$nextestSummary = $null
-$nextestLogHash = $null
-$cleanupFailures = [Collections.Generic.List[string]]::new()
-$cleanupPendingPaths = [Collections.Generic.List[string]]::new()
-$processReceipts = [Collections.Generic.List[object]]::new()
-$boundedFailureExercised = $false
-$secretReparseChecked = $false
-$secretAclRestricted = $false
-$terminalError = $null
-$terminalErrorDetail = $null
-$nextestFailureExcerptBytes = 0
-$nextestFailureExcerptTruncated = $false
-$password = $null
+# ---------------------------------------------------------------------------
+# 7. Delegation. Import the real Core/Model modules (no duplicated state
+#    machine) and dispatch to the closed profile seam. Import happens only
+#    AFTER usage validation, so default/conflicting/contradictory invocations
+#    always report usage error (exit 2), never a delegation failure.
+# ---------------------------------------------------------------------------
+$coreModulePath = Join-Path $PSScriptRoot 'integration\IntegrationHarness.Core.psm1'
+$modelModulePath = Join-Path $PSScriptRoot 'integration\IntegrationHarness.Model.psm1'
 try {
-    New-Item -ItemType Directory -Force `
-        (Split-Path $configPath), `
-        (Split-Path $nextestLog), `
-        (Split-Path $probeScript), `
-        $secretRoot | Out-Null
-    Assert-NoReparsePoint $secretOwnedRoot
-    $secretReparseChecked = $true
-    Protect-CurrentUserOnlyAcl $secretOwnedRoot -Directory
-    $ownerMarker = [ordered]@{
-        schema_version = 'eliot-owned-test-secret-root-v1'
-        run_id = $runId
-        owned_root = $secretOwnedRoot
-    }
-    [IO.File]::WriteAllText($ownerMarkerPath, ($ownerMarker | ConvertTo-Json -Compress))
-    $password = [guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N')
-    [IO.File]::Create($passwordPath).Dispose()
-    Protect-CurrentUserOnlyAcl $passwordPath
-    [IO.File]::WriteAllText($passwordPath, $password)
-    $secretAclRestricted = $true
-    if ($InjectFailureAfterSecretSetup) {
-        throw 'injected bounded harness failure after secret setup'
-    }
-    $config = @"
-schema_version = "1"
-
-[service]
-service_name = "EliotGovernorWorkspaceTests"
-instance_id = "isolated-workspace-tests"
-
-[db]
-mode = "surreal_rpc_server"
-
-[db.surreal]
-exe = "$surrealConfigPath"
-bind = "127.0.0.1:$port"
-endpoint = "ws://127.0.0.1:$port/rpc"
-storage = "rocksdb:$storagePath"
-ns = "eliot"
-db = "system"
-user = "root"
-credential_provider = "legacy_password_file"
-credential_id = "test-only/isolated-workspace"
-password_file = "$passwordConfigPath"
-log_level = "warn"
-query_timeout_ms = 15000
-transaction_timeout_ms = 15000
-startup_timeout_ms = 20000
-restart_backoff_ms = 200
-max_restart_backoff_ms = 2000
-
-[db.surreal.capabilities]
-deny_all = true
-allow_funcs = ["array", "string", "time", "type", "math", "vector", "search"]
-allow_net = []
-allow_scripting = false
-allow_guests = false
-
-[control_wal]
-path = "$walPath"
-
-[blob_store]
-root = "$blobPath"
-
-[store]
-surql_dir = "$surqlPath"
-migrations_dir = "$migrationsPath"
-"@
-    [IO.File]::WriteAllText($configPath, $config)
-
-    $env:ELIOT_DISABLE_REAL_PROVIDER = '1'
-    $env:ELIOT_TEST_OPERATOR_CURSOR_CREDENTIAL_BACKEND = 'ephemeral-file'
-    $env:ELIOT_TEST_OPERATOR_CURSOR_CREDENTIAL_ROOT = $operatorCursorCredentialRoot
-    Remove-Item Env:ELIOT_TEST_OPERATOR_CURSOR_CREDENTIAL_TARGET -ErrorAction SilentlyContinue
-    Remove-Item Env:ELIOT_TEST_ALLOW_LEGACY_OPERATOR_CURSOR_KEY_FILE -ErrorAction SilentlyContinue
-    $env:ELIOT_TEST_REGISTERED_CARGO_TARGET_ROOT = $ownedRoot
-    $env:ELIOT_GOVERNOR_CONFIG = $configPath
-    $env:ELIOT_TEST_SURREAL_BIND = "127.0.0.1:$port"
-    $env:ELIOT_TEST_SURREAL_ENDPOINT = "ws://127.0.0.1:$port/rpc"
-    $env:ELIOT_TEST_SURREAL_PASSWORD_FILE = $passwordConfigPath
-    $env:ELIOT_TEST_SURREAL_STORAGE = "rocksdb:$storagePath"
-    if ($null -ne $resolvedResultArtifact) {
-        $env:ELIOT_COGNITIVE_FIELD_RESULT_PATH = $resolvedResultArtifact
-    }
-    else {
-        Remove-Item Env:ELIOT_COGNITIVE_FIELD_RESULT_PATH -ErrorAction SilentlyContinue
-    }
-    $env:ELIOT_SURREAL_EXE = $surrealExePath
-    $env:SURREAL_USER = 'root'
-    $env:SURREAL_PASS = $password
-
-    $guardianBuildProcess = Start-Process -FilePath 'cargo.exe' -ArgumentList @(
-        'build', '--offline', '-p', 'eliot-windows-ipc', '--bins', '--features', 'test-support'
-    ) -WorkingDirectory $repo -RedirectStandardOutput $guardianBuildStdout `
-        -RedirectStandardError $guardianBuildStderr -PassThru -WindowStyle Hidden
-    if (-not $guardianBuildProcess.WaitForExit(300000)) {
-        Stop-ExactOwnedProcess $guardianBuildProcess 'guardian_build' $cleanupFailures $processReceipts
-        $guardianBuildProcess = $null
-        throw 'native process guardian build exceeded its five-minute bound'
-    }
-    if ($guardianBuildProcess.ExitCode -ne 0 -or
-        -not (Test-Path -LiteralPath $guardianExe -PathType Leaf) -or
-        -not (Test-Path -LiteralPath $credentialGuardExe -PathType Leaf)) {
-        throw "native process guardian build failed: $($guardianBuildProcess.ExitCode)"
-    }
-    & $credentialGuardExe snapshot $credentialManifestPath
-    if ($LASTEXITCODE -ne 0) {
-        throw "isolated credential suite preflight failed: $LASTEXITCODE"
-    }
-
-    New-Item -ItemType Directory -Force (Split-Path $pidPath) | Out-Null
-    $surrealGuardianInfo = [Diagnostics.ProcessStartInfo]::new()
-    $surrealGuardianInfo.FileName = $guardianExe
-    $surrealGuardianInfo.WorkingDirectory = $ownedRoot
-    $surrealGuardianInfo.UseShellExecute = $false
-    $surrealGuardianInfo.CreateNoWindow = $true
-    $surrealGuardianInfo.RedirectStandardOutput = $true
-    $surrealGuardianInfo.RedirectStandardError = $true
-    $surrealGuardianArguments = @(
-        '--cwd', $ownedRoot,
-        '--timeout-seconds', ([Math]::Min(7200, $TestTimeoutSeconds + 120)).ToString([Globalization.CultureInfo]::InvariantCulture),
-        '--stdout', $surrealStdout,
-        '--stderr', $surrealStderr,
-        '--pid-file', $pidPath,
-        '--stop-file', $surrealStopPath,
-        '--', $surrealExePath,
-        'start', '--bind', "127.0.0.1:$port", '--log', 'warn', '--deny-all',
-        '--allow-funcs', 'array,string,time,type,math,vector,search', '--deny-net', '--',
-        "rocksdb:$storagePath"
-    )
-    foreach ($argument in $surrealGuardianArguments) {
-        $surrealGuardianInfo.ArgumentList.Add([string]$argument)
-    }
-    $surrealGuardianProcess = [Diagnostics.Process]::Start($surrealGuardianInfo)
-    if ($null -eq $surrealGuardianProcess) {
-        throw 'owned SurrealDB process guardian did not start'
-    }
-    $surrealGuardianOutputTask = $surrealGuardianProcess.StandardOutput.ReadToEndAsync()
-    $surrealGuardianErrorTask = $surrealGuardianProcess.StandardError.ReadToEndAsync()
-    $deadline = [DateTime]::UtcNow.AddSeconds(20)
-    $ready = $false
-    while ([DateTime]::UtcNow -lt $deadline) {
-        if ($surrealGuardianProcess.HasExited) {
-            throw "owned SurrealDB guardian exited before readiness: $($surrealGuardianProcess.ExitCode)"
-        }
-        Push-Location $ownedRoot
-        try {
-            "RETURN true;" | & $surrealExePath sql `
-                --endpoint "ws://127.0.0.1:$port/rpc" `
-                --namespace eliot `
-                --database system `
-                --json `
-                --hide-welcome 2>$null | Out-Null
-        }
-        finally {
-            Pop-Location
-        }
-        if ($LASTEXITCODE -eq 0) {
-            $ready = $true
-            break
-        }
-        Start-Sleep -Milliseconds 50
-    }
-    if (-not $ready) {
-        throw "owned SurrealDB did not become ready on port $port"
-    }
-    $serverStarted = $true
-
-    $nextestArgs = @(
-        'nextest', 'run', '--offline', '--workspace', '--all-features',
-        '--test-threads', '1', '--no-fail-fast', '--status-level', 'fail',
-        '--final-status-level', 'fail', '--failure-output', 'immediate'
-    )
-    if ($McpOnly) {
-        $nextestArgs += @('-p', 'eliot-app', '--test', 'mcp_protocol')
-    }
-    elseif ($TestBinary) {
-        $nextestArgs += @('-p', $TestPackage, '--test', $TestBinary)
-        if ($TestName) {
-            $nextestArgs += $TestName
-        }
-    }
-    elseif ($LibTarget) {
-        $nextestArgs += @('-p', $TestPackage, '--lib')
-        if ($TestName) {
-            $nextestArgs += $TestName
-        }
-    }
-    elseif ($BinTarget) {
-        $nextestArgs += @('-p', $TestPackage, '--bin', $BinTarget)
-        if ($TestName) {
-            $nextestArgs += $TestName
-        }
-    }
-    if (-not [string]::IsNullOrWhiteSpace($TestFilterExpression)) {
-        $nextestArgs += @('-E', $TestFilterExpression)
-    }
-    if ($RunIgnored) {
-        $nextestArgs += @('--run-ignored', 'ignored-only')
-    }
-
-    $childProgram = (Get-Command 'cargo.exe' -ErrorAction Stop).Source
-    $childArguments = $nextestArgs
-    if ($HarnessProbe -ne 'none') {
-        $childProgram = (Get-Command 'pwsh.exe' -ErrorAction Stop).Source
-        $probeBody = switch ($HarnessProbe) {
-            'success' {
-                "[Console]::Out.WriteLine('    Summary [   0.001s] 1 tests run: 1 passed, 0 skipped')`r`nexit 0`r`n"
-            }
-            'failure' {
-                "[Console]::Out.WriteLine('    Summary [   0.001s] 1 tests run: 0 passed, 1 failed, 0 skipped')`r`nexit 41`r`n"
-            }
-            'retained_handle' {
-                @'
-$info = [Diagnostics.ProcessStartInfo]::new()
-$info.FileName = $env:ComSpec
-$info.Arguments = '/D /C ping -n 120 127.0.0.1 >NUL'
-$info.UseShellExecute = $false
-$info.CreateNoWindow = $true
-[Diagnostics.Process]::Start($info) | Out-Null
-[Console]::Out.WriteLine('    Summary [   0.001s] 1 tests run: 0 passed, 1 failed, 0 skipped')
-exit 42
-'@
-            }
-        }
-        [IO.File]::WriteAllText($probeScript, $probeBody, [Text.UTF8Encoding]::new($false))
-        $childArguments = @('-NoProfile', '-NonInteractive', '-File', $probeScript)
-    }
-
-    $guardianInfo = [Diagnostics.ProcessStartInfo]::new()
-    $guardianInfo.FileName = $guardianExe
-    $guardianInfo.WorkingDirectory = $repo
-    $guardianInfo.UseShellExecute = $false
-    $guardianInfo.CreateNoWindow = $true
-    $guardianInfo.RedirectStandardOutput = $true
-    $guardianInfo.RedirectStandardError = $true
-    foreach ($argument in @(
-        '--cwd', $repo,
-        '--timeout-seconds', $TestTimeoutSeconds.ToString([Globalization.CultureInfo]::InvariantCulture),
-        '--stdout', $nextestStdout,
-        '--stderr', $nextestStderr,
-        '--', $childProgram
-    ) + $childArguments) {
-        $guardianInfo.ArgumentList.Add([string]$argument)
-    }
-    $guardianProcess = [Diagnostics.Process]::Start($guardianInfo)
-    if ($null -eq $guardianProcess) {
-        throw 'native process guardian did not start'
-    }
-    $guardianOutputTask = $guardianProcess.StandardOutput.ReadToEndAsync()
-    $guardianErrorTask = $guardianProcess.StandardError.ReadToEndAsync()
-    $guardianWaitMilliseconds = [Math]::Min(
-        [int]::MaxValue,
-        [int64]($TestTimeoutSeconds + 15) * 1000
-    )
-    if (-not $guardianProcess.WaitForExit([int]$guardianWaitMilliseconds)) {
-        $nextestTimedOut = $true
-        $terminalError = 'guardian_terminalization_timeout'
-        Stop-ExactOwnedProcess $guardianProcess 'nextest_guardian' $cleanupFailures $processReceipts
-        $guardianProcess = $null
-        $testExit = 124
-    }
-    else {
-        $testExit = $guardianProcess.ExitCode
-    }
-    $childExit = $testExit
-    $guardianOutputText = $guardianOutputTask.GetAwaiter().GetResult()
-    $guardianErrorText = $guardianErrorTask.GetAwaiter().GetResult()
-    [IO.File]::WriteAllText($guardianStdout, $guardianOutputText, [Text.UTF8Encoding]::new($false))
-    [IO.File]::WriteAllText($guardianStderr, $guardianErrorText, [Text.UTF8Encoding]::new($false))
-    $guardianStatusLine = @($guardianOutputText -split "`r?`n" | Where-Object {
-        -not [string]::IsNullOrWhiteSpace($_)
-    }) | Select-Object -Last 1
-    if (-not [string]::IsNullOrWhiteSpace($guardianStatusLine)) {
-        try {
-            $guardianStatus = $guardianStatusLine | ConvertFrom-Json
-            $nextestTimedOut = [bool]$guardianStatus.timed_out
-            $childExit = [int]$guardianStatus.root_exit_code
-        }
-        catch {
-            $terminalError = 'guardian_status_parse_failed'
-        }
-    }
-    elseif (-not $nextestTimedOut) {
-        $terminalError = 'guardian_status_missing'
-    }
-
-    Merge-ProcessLogs $nextestStdout $nextestStderr $nextestLog
-    $nextestSummary = Read-NextestSummary $nextestLog
-    if ($null -eq $nextestSummary) {
-        if ($null -eq $terminalError) {
-            $terminalError = 'nextest_summary_parse_failed'
-        }
-        $testExit = 96
-    }
-    $nextestLogHash = (Get-FileHash -LiteralPath $nextestLog -Algorithm SHA256).Hash.ToLowerInvariant()
-    if ($testExit -ne 0) {
-        $boundedFailureExercised = $true
-    }
+    Import-Module -Name $coreModulePath -ErrorAction Stop
+    Import-Module -Name $modelModulePath -ErrorAction Stop
 }
 catch {
-    $boundedFailureExercised = $true
-    if ($null -eq $terminalError) {
-        $terminalError = 'wrapper_exception'
-    }
-    $detail = Get-BoundedRedactedText -Text $_.Exception.Message -Secret $password -MaxBytes 4096
-    $terminalErrorDetail = $detail.text
-    $testExit = 97
+    [Console]::Error.WriteLine(
+        ("run-isolated-tests harness error: IntegrationHarness.Core/Model modules unavailable; cannot delegate -{0}. Missing file or import failure: {1}" -f
+            $activeProfile, (Get-BoundedErrorDetail $_.Exception.Message)))
+    exit $script:DelegationFailureExitCode
 }
-finally {
-    if ($guardianProcess) {
-        Stop-ExactOwnedProcess $guardianProcess 'nextest_guardian' $cleanupFailures $processReceipts
-    }
-    if ($surrealGuardianProcess) {
-        $surrealGuardianExited = $false
-        try {
-            $surrealGuardianProcess.Refresh()
-            if (-not $surrealGuardianProcess.HasExited) {
-                [IO.File]::WriteAllText($surrealStopPath, 'stop', [Text.UTF8Encoding]::new($false))
-                if (-not $surrealGuardianProcess.WaitForExit(10000)) {
-                    Stop-ExactOwnedProcess $surrealGuardianProcess 'surrealdb_guardian_fallback' $cleanupFailures $processReceipts
-                    $surrealGuardianProcess = $null
-                }
+
+$seamName = $null
+if ($activeProfile -eq 'WhatIf') { $seamName = 'Invoke-HarnessWhatIf' }
+elseif ($activeProfile -eq 'ValidateConfiguration') { $seamName = 'Invoke-HarnessValidateConfiguration' }
+else { $seamName = 'Invoke-HarnessRun' }
+$seam = Get-Command -Name $seamName -CommandType Function -ErrorAction SilentlyContinue
+if ($null -eq $seam) {
+    [Console]::Error.WriteLine(
+        ("run-isolated-tests harness error: required profile seam '{0}' is not exported by the IntegrationHarness modules; cannot delegate -{1}." -f
+            $seamName, $activeProfile))
+    exit $script:DelegationFailureExitCode
+}
+
+$seamArgs = @{ TimeoutSeconds = $TestTimeoutSeconds }
+if ($activeProfile -eq 'WhatIf' -or $activeProfile -eq 'Run') {
+    $seamArgs['SelectedTestId'] = [string[]]$explicitIds
+    if ($SelectAllRows) { $seamArgs['SelectAllRows'] = $true }
+}
+if ($null -ne $resolvedInventoryPath) { $seamArgs['InventoryPath'] = $resolvedInventoryPath }
+if ($activeProfile -eq 'Run') {
+    $seamArgs['RunId'] = $runId
+    $seamArgs['CandidateRoot'] = $candidateRoot
+    if ($HarnessProbe -ne 'none') { $seamArgs['HarnessProbe'] = $HarnessProbe }
+    if ($InjectFailureAfterSecretSetup) { $seamArgs['InjectFailureAfterSecretSetup'] = $true }
+    if ($null -ne $resolvedEvidenceLogPath) { $seamArgs['EvidenceLogPath'] = $resolvedEvidenceLogPath }
+    if ($null -ne $resolvedResultArtifactPath) { $seamArgs['ResultArtifactPath'] = $resolvedResultArtifactPath }
+}
+
+# Coordinator-owned state: at most the explicitly requested WhatIf plan file.
+# Everything run-owned (processes, ports, pipes, worktrees, data, secrets) is
+# module-owned and cleaned up by the seam in reverse order, idempotently.
+$planFileWritten = $false
+$terminalError = $null
+$seamResult = $null
+try {
+    $seamResult = & $seamName @seamArgs
+
+    if ($activeProfile -eq 'WhatIf') {
+        if ($null -eq $seamResult) {
+            throw 'the WhatIf seam returned an empty plan; an empty plan is not success.'
+        }
+        $planJson = $seamResult | ConvertTo-Json -Depth 16 -Compress
+        $planDigest = [BitConverter]::ToString(
+            [Security.Cryptography.SHA256]::Create().ComputeHash(
+                [Text.Encoding]::UTF8.GetBytes($planJson))).Replace('-', '').ToLowerInvariant()
+        if ($null -ne $resolvedPlanPath) {
+            $planParent = Split-Path -Parent $resolvedPlanPath
+            $planParentFull = [IO.Path]::GetFullPath($planParent)
+            $planParentPrefix = $planParentFull.TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+            if (-not $planParentPrefix.StartsWith($ownedPrefix, [StringComparison]::OrdinalIgnoreCase) -and
+                $planParentFull -ine $candidateRoot) {
+                throw 'the requested plan path escapes the admitted run root on re-admission.'
             }
-            if ($surrealGuardianProcess) {
-                Stop-ExactOwnedProcess $surrealGuardianProcess 'surrealdb_guardian' $cleanupFailures $processReceipts
-                $surrealGuardianProcess.Refresh()
-                $surrealGuardianExited = $surrealGuardianProcess.HasExited
+            [IO.Directory]::CreateDirectory($planParentFull) | Out-Null
+            try {
+                [IO.File]::WriteAllText($resolvedPlanPath, $planJson, [Text.UTF8Encoding]::new($false))
+                $planFileWritten = $true
             }
-            else {
-                $surrealGuardianExited = $true
-            }
-        }
-        catch {
-            $cleanupFailures.Add('owned_process_cleanup_failed:surrealdb_guardian')
-        }
-        try {
-            if ($surrealGuardianExited -and $surrealGuardianOutputTask) {
-                $surrealGuardianOutputText = $surrealGuardianOutputTask.GetAwaiter().GetResult()
-                [IO.File]::WriteAllText(
-                    $surrealGuardianStdout,
-                    $surrealGuardianOutputText,
-                    [Text.UTF8Encoding]::new($false)
-                )
-                $surrealGuardianStatusLine = @($surrealGuardianOutputText -split "`r?`n" | Where-Object {
-                    -not [string]::IsNullOrWhiteSpace($_)
-                }) | Select-Object -Last 1
-                if (-not [string]::IsNullOrWhiteSpace($surrealGuardianStatusLine)) {
-                    $surrealGuardianStatus = $surrealGuardianStatusLine | ConvertFrom-Json
-                }
-            }
-            if ($surrealGuardianExited -and $surrealGuardianErrorTask) {
-                $surrealGuardianErrorText = $surrealGuardianErrorTask.GetAwaiter().GetResult()
-                [IO.File]::WriteAllText(
-                    $surrealGuardianStderr,
-                    $surrealGuardianErrorText,
-                    [Text.UTF8Encoding]::new($false)
-                )
-            }
-        }
-        catch {
-            $cleanupFailures.Add('surrealdb_guardian_status_capture_failed')
-        }
-    }
-    if ($guardianBuildProcess) {
-        Stop-ExactOwnedProcess $guardianBuildProcess 'guardian_build' $cleanupFailures $processReceipts
-    }
-    if (Test-Path -LiteralPath $credentialManifestPath -PathType Leaf) {
-        & $credentialGuardExe verify $credentialManifestPath
-        if ($LASTEXITCODE -ne 0) {
-            $cleanupFailures.Add('isolated_operator_cursor_credential_set_changed')
-            $testExit = 98
-        }
-    }
-    try {
-        $evidenceParts = [Collections.Generic.List[string]]::new()
-        if (Test-Path -LiteralPath $nextestLog -PathType Leaf) {
-            $evidenceParts.Add((Get-Content -LiteralPath $nextestLog -Raw))
-        }
-        if (-not [string]::IsNullOrWhiteSpace($terminalErrorDetail)) {
-            $evidenceParts.Add("wrapper_error: $terminalErrorDetail")
-        }
-        $evidence = Get-BoundedRedactedText `
-            -Text ($evidenceParts -join [Environment]::NewLine) `
-            -Secret $password
-        if ($null -ne $resolvedEvidenceLog) {
-            New-Item -ItemType Directory -Force (Split-Path $resolvedEvidenceLog) | Out-Null
-            [IO.File]::WriteAllText(
-                $resolvedEvidenceLog,
-                $evidence.text,
-                [Text.UTF8Encoding]::new($false)
-            )
-        }
-        if ($testExit -ne 0 -and $evidence.bytes -gt 0) {
-            $nextestFailureExcerptBytes = $evidence.bytes
-            $nextestFailureExcerptTruncated = $evidence.truncated
-            [Console]::Error.WriteLine($evidence.text.TrimEnd())
-        }
-    }
-    catch {
-        $boundedFailureExercised = $true
-        $terminalError = 'evidence_publication_failed'
-        $detail = Get-BoundedRedactedText -Text $_.Exception.Message -Secret $password -MaxBytes 4096
-        $terminalErrorDetail = $detail.text
-        $testExit = 97
-        [Console]::Error.WriteLine('isolated test evidence publication failed')
-    }
-    foreach ($name in $savedEnvironment.Keys) {
-        [Environment]::SetEnvironmentVariable($name, $savedEnvironment[$name], 'Process')
-    }
-    try {
-        Remove-ExactOwnedSecretRoot $secretOwnedRoot $secretTestsRoot $runId
-    }
-    catch {
-        $cleanupFailures.Add('owned_secret_root_cleanup_failed')
-        $cleanupPendingPaths.Add($secretOwnedRoot.Replace('\', '/'))
-    }
-    $resolvedOwnedRoot = [IO.Path]::GetFullPath($ownedRoot)
-    try {
-        if (($resolvedOwnedRoot + [IO.Path]::DirectorySeparatorChar).StartsWith($ownedPrefix, [StringComparison]::OrdinalIgnoreCase) -and
-            $resolvedOwnedRoot.StartsWith($tempBase, [StringComparison]::OrdinalIgnoreCase) -and
-            (Test-Path -LiteralPath $resolvedOwnedRoot)) {
-            $cleanupDeadline = [DateTime]::UtcNow.AddSeconds(10)
-            do {
+            catch {
+                $writeError = $_.Exception.Message
+                $cleanupError = $null
                 try {
-                    Remove-Item -LiteralPath $resolvedOwnedRoot -Recurse -Force
+                    if (Test-Path -LiteralPath $resolvedPlanPath -PathType Leaf) {
+                        Remove-Item -LiteralPath $resolvedPlanPath -Force -ErrorAction Stop
+                    }
                 }
                 catch {
-                    if ([DateTime]::UtcNow -ge $cleanupDeadline) {
-                        throw
-                    }
-                    Start-Sleep -Milliseconds 100
+                    $cleanupError = Get-BoundedErrorDetail $_.Exception.Message
                 }
-            } while (Test-Path -LiteralPath $resolvedOwnedRoot)
+                if ($null -ne $cleanupError) {
+                    throw ("plan publication failed ({0}); coordinator-owned partial cleanup also failed ({1}); original failure retained." -f $writeError, $cleanupError)
+                }
+                throw
+            }
+        }
+        $receipt = [ordered]@{
+            component = 'run-isolated-tests'
+            profile = $activeProfile
+            operation_status = 'OPERATION_COMPLETED'
+            run_id = $runId
+            admitted_root = $candidateRoot.Replace('\', '/')
+            selection_count = $explicitIds.Count
+            select_all_rows = [bool]$SelectAllRows
+            inventory = if ($null -eq $resolvedInventoryPath) { 'default' } else { $resolvedInventoryPath.Replace('\', '/') }
+            plan_digest = $planDigest
+            plan_file = if ($null -eq $resolvedPlanPath) { $null } else { $resolvedPlanPath.Replace('\', '/') }
+            plan_file_written = $planFileWritten
+            seam = $seamName
+            entrypoint_sha256 = (Get-FileSha256Hex $PSCommandPath)
+            core_module_sha256 = (Get-FileSha256Hex $coreModulePath)
+            model_module_sha256 = (Get-FileSha256Hex $modelModulePath)
+            workspace_test_exit_code = 0
+        }
+        $receipt | ConvertTo-Json -Compress
+        exit 0
+    }
+
+    if ($activeProfile -eq 'ValidateConfiguration') {
+        $receipt = [ordered]@{
+            component = 'run-isolated-tests'
+            profile = $activeProfile
+            operation_status = 'OPERATION_COMPLETED'
+            run_id = $runId
+            inventory = if ($null -eq $resolvedInventoryPath) { 'default' } else { $resolvedInventoryPath.Replace('\', '/') }
+            seam = $seamName
+            entrypoint_sha256 = (Get-FileSha256Hex $PSCommandPath)
+            core_module_sha256 = (Get-FileSha256Hex $coreModulePath)
+            model_module_sha256 = (Get-FileSha256Hex $modelModulePath)
+            workspace_test_exit_code = 0
+        }
+        $receipt | ConvertTo-Json -Compress
+        exit 0
+    }
+
+    # -Run: the seam result carries the outcome. Probe its shape defensively
+    # (documented precedence) without second-guessing a successful seam, except
+    # for the load-bearing invariant: zero executed tests is NOT success.
+    $runExit = 0
+    $executedCount = $null
+    if ($null -eq $seamResult) {
+        throw 'the Run seam returned no result; an empty result is not success.'
+    }
+    foreach ($prop in @('workspace_test_exit_code', 'exit_code', 'exitCode')) {
+        if ($null -ne $seamResult.PSObject -and $null -ne $seamResult.PSObject.Properties[$prop]) {
+            $candidate = $seamResult.PSObject.Properties[$prop].Value
+            if ($candidate -is [int] -and $candidate -ge 0 -and $candidate -le 255) { $runExit = $candidate }
+            elseif ($candidate -is [int]) { $runExit = 1 }
+            break
         }
     }
-    catch {
-        $cleanupFailures.Add('owned_temp_root_cleanup_failed')
-        $cleanupPendingPaths.Add($resolvedOwnedRoot.Replace('\', '/'))
+    foreach ($prop in @('executed_test_count', 'tests_executed', 'tests_run')) {
+        if ($null -ne $seamResult.PSObject -and $null -ne $seamResult.PSObject.Properties[$prop]) {
+            $candidate = $seamResult.PSObject.Properties[$prop].Value
+            if ($candidate -is [int]) { $executedCount = $candidate }
+            break
+        }
     }
-    if ($cleanupFailures.Count -gt 0) {
-        $testExit = 98
-        $boundedFailureExercised = $true
+    if ($null -ne $executedCount -and $executedCount -eq 0) {
+        throw 'the Run seam reported zero executed tests; zero discovered execution is not success.'
     }
+    $receipt = [ordered]@{
+        component = 'run-isolated-tests'
+        profile = $activeProfile
+        operation_status = if ($runExit -eq 0) { 'OPERATION_COMPLETED' } else { 'FAILED' }
+        run_id = $runId
+        admitted_root = $candidateRoot.Replace('\', '/')
+        selection_count = $explicitIds.Count
+        select_all_rows = [bool]$SelectAllRows
+        inventory = if ($null -eq $resolvedInventoryPath) { 'default' } else { $resolvedInventoryPath.Replace('\', '/') }
+        executed_test_count = $executedCount
+        seam = $seamName
+        entrypoint_sha256 = (Get-FileSha256Hex $PSCommandPath)
+        core_module_sha256 = (Get-FileSha256Hex $coreModulePath)
+        model_module_sha256 = (Get-FileSha256Hex $modelModulePath)
+        workspace_test_exit_code = $runExit
+    }
+    $receipt | ConvertTo-Json -Compress
+    exit $runExit
 }
-
-$ambientUserRootsPreserved = $true
-$ambientUserRootMismatches = @()
-foreach ($name in @('LOCALAPPDATA', 'APPDATA', 'USERPROFILE', 'HOME')) {
-    if ([Environment]::GetEnvironmentVariable($name, 'Process') -cne $ambientUserRoots[$name]) {
-        $ambientUserRootsPreserved = $false
-        $ambientUserRootMismatches += $name
-    }
+catch {
+    $terminalError = Get-BoundedErrorDetail $_.Exception.Message
+    [Console]::Error.WriteLine("run-isolated-tests harness error: -{0} delegation failed: {1}" -f $activeProfile, $terminalError)
+    exit $script:DelegationFailureExitCode
 }
-
-$report = [ordered]@{
-    component = 'isolated_workspace_tests'
-    operation_status = if ($testExit -eq 0) { 'OPERATION_COMPLETED' } else { 'FAILED' }
-    harness_probe = $HarnessProbe
-    provider_calls = 0
-    historical_provider_total_expected = 3
-    owned_temp_root = $ownedRoot.Replace('\', '/')
-    temp_root_removed = -not (Test-Path -LiteralPath $ownedRoot)
-    owned_secret_root = $secretOwnedRoot.Replace('\', '/')
-    owned_secret_root_removed = -not (Test-Path -LiteralPath $secretOwnedRoot)
-    secret_config_path = $passwordConfigPath
-    secret_cleanup_scope = 'exact_recorded_run_root_only'
-    ambient_user_roots_preserved = $ambientUserRootsPreserved
-    ambient_user_root_mismatches = $ambientUserRootMismatches
-    bounded_failure_exercised = $boundedFailureExercised
-    secret_reparse_checked = $secretReparseChecked
-    secret_acl_restricted = $secretAclRestricted
-    cleanup_failures = @($cleanupFailures)
-    cleanup_pending = @($cleanupPendingPaths)
-    owned_process_receipts = @($processReceipts)
-    guardian_status = $guardianStatus
-    surrealdb_guardian_status = $surrealGuardianStatus
-    nextest_timed_out = $nextestTimedOut
-    nextest_terminal_summary = $nextestSummary
-    nextest_log_sha256 = $nextestLogHash
-    nextest_failure_excerpt_bytes = $nextestFailureExcerptBytes
-    nextest_failure_excerpt_truncated = $nextestFailureExcerptTruncated
-    evidence_log_path = if ($null -eq $resolvedEvidenceLog) { $null } else { $resolvedEvidenceLog.Replace('\', '/') }
-    result_artifact_path = if ($null -eq $resolvedResultArtifact) { $null } else { $resolvedResultArtifact.Replace('\', '/') }
-    result_artifact_exists = $null -ne $resolvedResultArtifact -and (Test-Path -LiteralPath $resolvedResultArtifact -PathType Leaf)
-    result_artifact_sha256 = if ($null -ne $resolvedResultArtifact -and (Test-Path -LiteralPath $resolvedResultArtifact -PathType Leaf)) {
-        (Get-FileHash -LiteralPath $resolvedResultArtifact -Algorithm SHA256).Hash.ToLowerInvariant()
-    }
-    else { $null }
-    child_exit_code = $childExit
-    terminal_error = $terminalError
-    terminal_error_detail = $terminalErrorDetail
-    host_configuration_changes = 0
-    workspace_test_exit_code = $testExit
-}
-$report | ConvertTo-Json -Compress
-exit $testExit

@@ -108,6 +108,18 @@ pub(crate) fn evaluate_claim(
     if !policy.permitted_kinds.contains(&claim.kind) {
         evaluated.disposition = SupportResult::Unknown;
     }
+    if has_dropped_counterevidence(claim, manifest)? {
+        evaluated.unknowns.insert(
+            "manifest contains dropped counterevidence for this proposition; selective draft omits a known contradictory witness"
+                .into(),
+        );
+        if evaluated.disposition == SupportResult::Supported {
+            evaluated.disposition = SupportResult::Unknown;
+            evaluated
+                .caps
+                .push(PositionAssertability::HypothesisCandidate);
+        }
+    }
     if !precision::class_is_groundable(claim, has_denominator)
         && matches!(evaluated.disposition, SupportResult::Supported)
     {
@@ -161,6 +173,44 @@ pub(crate) fn evaluate_claim(
         PositionAssertability::HypothesisCandidate,
     );
     Ok(record)
+}
+
+/// Case 28: reports whether the frozen manifest retains a usable
+/// contradictory witness for this claim that the selective draft omits.
+/// Only explicit proposed handles become witnesses; this bounded scan over
+/// `manifest.references` (already width-capped upstream) prevents a
+/// `Supported` disposition from silently dropping known counterevidence.
+fn has_dropped_counterevidence(
+    claim: &MaterialClaim,
+    manifest: &AllowedReferenceManifest,
+) -> Result<bool, ContractViolation> {
+    let proposed: BTreeSet<&ArtifactId> = claim
+        .proposed_support
+        .iter()
+        .chain(&claim.proposed_counterevidence)
+        .collect();
+    for (handle, reference) in &manifest.references {
+        if proposed.contains(handle) || !reference_is_usable(reference) {
+            continue;
+        }
+        for assertion in &reference.assertions {
+            // `assertion_matches` requires nested support handles to be
+            // proposed; test the dropped handle as hypothetically proposed.
+            let mut hypothetical = claim.clone();
+            hypothetical.proposed_support.insert(handle.clone());
+            if !assertion_matches(&hypothetical, assertion, handle, manifest)? {
+                continue;
+            }
+            if assertion
+                .support
+                .as_deref()
+                .is_some_and(|support| support.result == SupportResult::Contradicted)
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn resolve_handle(

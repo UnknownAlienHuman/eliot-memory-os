@@ -9,6 +9,31 @@
 //! Implementation: I6.4, I6.5, I7.1, I7.2, I7.3, I7.4, I7.5, I7.14, I1.4, I1.5, I2.2, I2.23, I8.1, I8.2, I8.3, I8.4, I14.10, I14.15
 //! Neutral Kernel admission/transport only; no Governor semantics, Store SDK, or default success.
 //! Forbidden authority: no semantic oracle, alternate lease authority, unbounded restart, or daemon-owned canonical transition.
+//!
+//! Capability cells (§15 req.1; I01-02; #13 thin bridge surface):
+//! cell 1 front-door/IPC admission — `agent_bridge`, `front_door_listener`,
+//!   `front_door_session`, `frame_dispatch` (+6), `host_request_route` (+6),
+//!   `daemon_session_guard` (+2), `runtime_identity` (+8);
+//! cell 2 epochs/fencing/leases — `supervision_lease_authority`,
+//!   `daemon_session_guard` (+1), `daemon_supervision` (+8);
+//! cell 3 ORS/generation state — `generation_recovery` (+5);
+//! cell 4 control reserve/lifecycle gateway — `control_plane` (+6);
+//! cell 5 generation routing — `generation_control`, `generation_recovery` (+3);
+//! cell 6 daemon/store-rebind dispatch — `daemon_request_dispatch` (+7),
+//!   `store_receipt_dispatch`, `control_plane` (+4), `frame_dispatch` (+1),
+//!   `host_request_route` (+1);
+//! cell 7 health/readiness view — `health_view`, `daemon_request_dispatch` (+6);
+//! cell 8 process/daemon/store runtime — `process_execution`,
+//!   `process_execution_client`, `daemon_runtime`, `daemon_process_launch`,
+//!   `daemon_live_receipt`, `daemon_supervision` (+2), `runtime_identity` (+1),
+//!   `canonical_store_runtime`;
+//! ROOT composition/entry — this `lib` (`KernelComposition`), the
+//!   `eliot-kernel` binary `main` plus `startup_binding` and
+//!   `front_door_driver`, `composition_bootstrap`, `kernel_build_contract`,
+//!   `kernel_config`;
+//! debt/out-of-scope for #15 — `r13_os_harness`, `r13_two_token_harness`,
+//!   `tests`, `tests/`; agent-bridge admission honors the #13 thin-surface
+//!   boundary, and process ownership follows I01-02.
 
 #![forbid(unsafe_code)]
 
@@ -19,7 +44,12 @@ mod composition_bootstrap;
 mod control_plane;
 mod kernel_build_contract;
 mod kernel_config;
+/// Kernel structured diagnostics facade (F-LOG-KERNEL-0, #895): compiled
+/// once here and imported by the binary; later leaves extend through their
+/// own serialized turns, never a second copy.
+pub mod kernel_diagnostics;
 mod process_execution;
+mod process_execution_client;
 mod supervision_lease_authority;
 
 pub(crate) use kernel_build_contract::PreparedAuthorityMaterial;
@@ -40,19 +70,27 @@ use process_execution::{
     ProcessStartGuard, ProcessStartPorts, RESERVED_STORE_SNAPSHOT_HEAD, ValidationContextSlot,
     authorize_process_owner, project_store_snapshot, run_process_start,
 };
+pub use process_execution_client::process_execution_client;
+pub(crate) use shutdown_drain::{
+    DRAIN_RECEIPT_DEADLINE, DrainCommitDecision, DrainHalt, DrainWakeDisposition,
+    ShutdownDrainCoordinator, ShutdownPhase, ShutdownTerminal, coordinator_for,
+    reverse_quiescence_order,
+};
 #[cfg(windows)]
 pub use supervision_lease_authority::{
     KernelSupervisionLeaseAuthority, ProtectedSupervisionLeaseSigner,
     SupervisionLeaseAuthorityError,
 };
+#[cfg(windows)]
+use supervision_lease_authority::{
+    SupervisionProgressRenewalError, daemon_renewal_receipt_for_decision,
+    daemon_supervision_current_state, supervision_binding_matches_contour,
+    supervision_operation_identity,
+};
 #[cfg(all(test, windows))]
 pub(crate) use supervision_lease_authority::{
     supervision_authority_root_spec, verification_context_for_supervision_payload,
     verify_superseded_supervision_replay,
-};
-#[cfg(windows)]
-use supervision_lease_authority::{
-    supervision_binding_matches_contour, supervision_operation_identity,
 };
 
 #[cfg(test)]
@@ -61,9 +99,6 @@ use eliot_kernel_core::{
     ProcessExecutionReplayRecord, ProcessExecutionReplayState, process_admission_digest,
 };
 
-#[cfg(feature = "r13-os-harness")]
-pub mod r13_os_harness;
-
 mod daemon_live_receipt;
 #[cfg(windows)]
 mod daemon_process_launch;
@@ -71,24 +106,38 @@ mod daemon_request_dispatch;
 mod daemon_runtime;
 mod daemon_session_guard;
 mod daemon_supervision;
+mod dispatch_launch;
+mod doctor_recovery_ledger;
+mod dreamer_job_dispatch;
 mod frame_dispatch;
 mod front_door_listener;
 mod front_door_session;
 mod generation_control;
 mod generation_recovery;
 mod health_view;
+#[cfg(windows)]
+mod host_request_route;
+mod native_worker_lifecycle_route;
+mod native_worker_reconcile_route;
+mod native_worker_replay_route;
+pub mod notify_operation_identity;
+mod provider_capability_route;
 mod runtime_identity;
+mod shutdown_drain;
 use daemon_session_guard::caller_binding;
 #[cfg(all(windows, test))]
 use daemon_supervision::EliotdSupervisionSuccessorEvidence;
 use daemon_supervision::{DaemonRuntimeState, DaemonRuntimeStatus, daemon_status_proves_ready};
 #[cfg(windows)]
 use daemon_supervision::{
-    DaemonSupervisionContour, EliotdLiveReceiptDisposition, classify_eliotd_live_receipt_transition,
+    DaemonSupervisionContour, DaemonSupervisionProgressState, EliotdLiveReceiptDisposition,
+    classify_eliotd_live_receipt_transition,
 };
 use generation_recovery::OrsGenerationCoordinator;
 #[cfg(test)]
 use generation_recovery::update_handshake_policy;
+#[cfg(windows)]
+use host_request_route::HostRequestOperationRef;
 use runtime_identity::stable_owner_principal_digest;
 #[cfg(windows)]
 use runtime_identity::{
@@ -102,6 +151,47 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// DISPATCH-CONTOUR-2 Slice B launch contour (issues #461 and #22).
+///
+/// The composed dispatch owner plus admit-then-launch through the admitted
+/// process executor, parameterized once for the Doctor, testd, and
+/// native-worker one-shot workers. The front-door dispatch arm admits
+/// through this contour; the production caller composes and launches
+/// through it.
+pub use dispatch_launch::{
+    ChildStartOutcome, DispatchGrant, DispatchLaunchError, DispatchedWorkerKind,
+    DoctorChildBinding, DoctorLaunchMaterial, DoctorLaunchOutcome, DoctorLaunchSkip,
+    NATIVE_WORKER_DISPATCH_AUTHORITY_PREFIX, NATIVE_WORKER_DISPATCH_DERIVATION_DOMAIN,
+    NATIVE_WORKER_DISPATCH_LAUNCH_GRANT_HEAD, NativeWorkerDispatchDerivation,
+    NativeWorkerLaunchMaterial, NativeWorkerLaunchOutcome, NativeWorkerLaunchSkip,
+    PreparedDoctorLaunch, PreparedNativeWorkerLaunch, PreparedTestdLaunch, ReadyDoctorLaunch,
+    ReadyNativeWorkerLaunch, ReadyTestdLaunch, ReconcileLaunchedOutcome, SpawnedChild,
+    TestdLaunchMaterial, TestdLaunchOutcome, TestdLaunchSkip, UncertainSpawn,
+    compose_dispatch_contour, compose_doctor_front_door, compose_production_doctor_front_door,
+    compose_production_native_worker_front_door, compose_production_testd_front_door,
+    dispatch_contour, doctor_repair_advertised, launch_admitted_doctor_attempt,
+    launch_admitted_native_worker_attempt, launch_admitted_testd_attempt,
+    native_worker_dispatch_derivation, native_worker_dispatch_derivation_from_epoch_json,
+    native_worker_production_composed, prepare_doctor_launch, prepare_native_worker_launch,
+    prepare_testd_launch, reconcile_launched_doctor_attempt,
+    reconcile_launched_native_worker_attempt, reconcile_launched_testd_attempt,
+    release_launched_attempt, start_ready_doctor_launch, start_ready_native_worker_launch,
+    start_ready_testd_launch, testd_admission_advertised, testd_production_composed,
+    trigger_admitted_doctor_launch,
+};
+/// Kernel-owned durable Doctor recovery ledger (DISPATCH-WIRE part D).
+///
+/// The production redb owner composed through
+/// [`dispatch_launch::compose_production_doctor_front_door`].
+pub use doctor_recovery_ledger::{KernelDoctorRecoveryLedger, doctor_recovery_ledger_path};
+/// K2 Dreamer wire seam for the front-door dispatch/driver arms (T12-05).
+///
+/// The dispatch arm (`frame_dispatch`) and the driver arm
+/// (`front_door_driver`) depend only on this closed wire identity plus the
+/// K0 request/response types. Slice K2 routes through the K1 gateway
+/// (`KernelStoreGateway::dreamer_job`); no process is spawned here and no
+/// worker binding is invented (worker handoff is T12-09).
+pub use dreamer_job_dispatch::DREAMER_JOB_WIRE_ID;
 use eliot_contracts::{
     ArtifactId, AuthorityEpoch, ContractId, RequestId, ResourceGeneration, StateFence,
 };
@@ -119,10 +209,53 @@ pub use eliot_kernel_service::KernelStoreGateway;
 use eliot_kernel_service::StoreRebindQuery;
 use eliot_kernel_service::{
     AgentBridgeAdmissionDescriptor, EliotdLaunchDescriptor, HostKernelCandidateBinding,
-    HostStoreBootstrapRequirement, KERNEL_CONTROL_PIPE, KernelActivationReceipt,
-    KernelControlCommand, KernelControlRequest, KernelControlResponse, KernelReadyReceipt,
-    KernelService, KernelServiceError, KernelServiceState, ProcessAuthorityHandoffDescriptor,
-    ProcessExecutionRequest, ProcessExecutionResponse, ProcessObservation, StoreBootstrapHandoff,
+    HostStoreBootstrapRequirement, KERNEL_CONTROL_PIPE, KernelActivationPermit,
+    KernelActivationReceipt, KernelControlCommand, KernelControlRequest, KernelControlResponse,
+    KernelReadyReceipt, KernelService, KernelServiceError, KernelServiceState,
+    ProcessAuthorityHandoffDescriptor, ProcessExecutionRequest, ProcessExecutionResponse,
+    ProcessObservation, StoreBootstrapHandoff,
+};
+/// P-07 Doctor wire seam for the front-door dispatch/driver arms (T6-D2 Slice B).
+///
+/// The dispatch arm (`frame_dispatch`) and the session binder
+/// (`front_door_session`) depend only on these existing `doctor.rs` /
+/// `doctor_front_door.rs` symbols. Slice B admits through the composed
+/// dispatch contour (`dispatch_launch`, over `handle_doctor_repair_attempt`)
+/// at the marked call site in `frame_dispatch::execute_doctor_request`.
+pub use eliot_kernel_service::{
+    AuthenticatedDoctorSession, ComposedDoctorFrontDoor, DOCTOR_REPAIR_WIRE_ID,
+    DOCTOR_REPAIR_WIRE_VERSION, DoctorAdmissionContext, DoctorRecipeRegistry,
+    DoctorRepairAdmission, DoctorRepairAttemptRequest, DoctorRepairResponse,
+    advertise_doctor_repair, handle_doctor_repair_attempt, route_doctor_repair,
+};
+/// P-07 testd wire seam for the front-door dispatch/driver arms (T6-X1 Slice B).
+///
+/// The dispatch arm (`frame_dispatch`) and the session binder
+/// (`front_door_session`) depend only on these existing
+/// `testd_front_door.rs` symbols. Slice B admits through the composed
+/// dispatch contour (`dispatch_launch`, over
+/// `handle_testd_admission_attempt`) at the marked call site in
+/// `frame_dispatch::execute_testd_request`.
+pub use eliot_kernel_service::{
+    AuthenticatedTestdSession, TESTD_ADMISSION_WIRE_ID, TESTD_ADMISSION_WIRE_VERSION,
+    TestdAdmission, TestdAdmissionAttemptRequest, TestdAdmissionContext, TestdAdmissionEnvelope,
+    TestdAdmissionResponse, handle_testd_admission_attempt, reconcile_testd_admission,
+    route_testd_admission,
+};
+/// P-07 native-worker claim wire seam for the front-door dispatch/driver arms
+/// (DISPATCH-CAUSE-FIX, issues #461/#20/#22).
+///
+/// The session binder (`front_door_session`) and the dispatch contour
+/// (`dispatch_launch`) depend only on these existing
+/// `protocol/native_worker_claim.rs` + `lifecycle.rs` symbols. Slice
+/// DISPATCH-CAUSE-FIX admits through the composed dispatch contour
+/// (`dispatch_launch`, over `KernelService::admit_native_worker_claim`) and
+/// binds the module through the same front-door session mechanism
+/// Doctor/Testd use (no dedicated `AuthenticatedNativeWorkerSession` type
+/// exists on this base).
+pub use eliot_kernel_service::{
+    NATIVE_WORKER_CLAIM_WIRE_ID, NATIVE_WORKER_CLAIM_WIRE_VERSION, NativeWorkerClaimReceipt,
+    NativeWorkerClaimRequest, NativeWorkerClaimResponse,
 };
 #[cfg(test)]
 use eliot_ors::CanonicalEvidenceProvider;
@@ -135,6 +268,7 @@ use eliot_ors::{
 pub use eliot_ors::{SupervisionLeaseCommitTicket, SupervisionLeaseStageReceipt};
 #[cfg(test)]
 use eliot_platform::ClockObservation;
+#[cfg(windows)]
 use eliot_platform::PlatformHandle;
 #[cfg(windows)]
 use eliot_platform_windows::{
@@ -153,9 +287,10 @@ pub use eliot_process::EliotdLiveSupervisionEvidence;
 use eliot_process::{
     ActionLeaseRef, DispatchAuthorityId, EliotdLiveReadyEvidence, EliotdLiveReceipt,
     EnvironmentInheritance, EnvironmentProjection, FencingToken, Generation, ImageId, JobId,
-    KernelDispatchKey, ProcessExecutionAdmissionRequest, ProcessExecutionError, ProcessIntent,
-    ProcessOwnerBinding, ProcessSessionBinding, ProcessStartReceipt, ProcessTreeId, ResourceLimits,
-    SessionId,
+    KernelDispatchKey, ProcessCallerSession, ProcessExecutionAdmissionRequest,
+    ProcessExecutionError, ProcessIntent, ProcessOwnerBinding, ProcessSessionBinding,
+    ProcessSessionClass, ProcessStartReceipt, ProcessTransportRebindReceipt, ProcessTreeId,
+    ResourceLimits, SessionId,
 };
 #[cfg(test)]
 use eliot_process::{
@@ -167,7 +302,8 @@ use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
 use eliot_protocol::{
     AGENT_BRIDGE_ACTIVATION_OPERATION, AGENT_BRIDGE_MODULE_ID, AGENT_BRIDGE_PEER_CHALLENGE_WIRE_ID,
     AGENT_BRIDGE_PEER_CHALLENGE_WIRE_VERSION, AgentActivationResolutionDecision,
-    AgentActivationResolutionTicket, AgentBridgeActivationDenialCode,
+    AgentActivationResolutionResult, AgentActivationResolutionTicket, AgentActivationResultAck,
+    AgentActivationResultReconcile, AgentActivationResultSubmit, AgentBridgeActivationDenialCode,
     AgentBridgeActivationDisposition, AgentBridgeActivationFence, AgentBridgeActivationRequest,
     AgentBridgeActivationResponse, AgentBridgeAuthenticatedBinding, AgentBridgeClientDeclaration,
     AgentBridgePeerAdmissionReceipt, AgentBridgePeerChallenge, EncodingProfile, Frame, FrameKind,
@@ -178,6 +314,13 @@ use eliot_runtime::{Runtime, RuntimeConfig, ShutdownOutcome};
 pub use eliot_runtime_contracts::SupervisionLeasePredecessorIdentity;
 #[cfg(windows)]
 use eliot_runtime_contracts::SupervisionLeaseTerminalDisposition;
+#[cfg(windows)]
+use eliot_runtime_contracts::{
+    DaemonSupervisionCurrentState, DaemonSupervisionHeartbeatError,
+    DaemonSupervisionRenewalDecision, DaemonSupervisionRenewalOutcome,
+    DaemonSupervisionRenewalPolicy, DaemonSupervisionRenewalReceipt,
+    DaemonSupervisionRenewalRequest, evaluate_daemon_supervision_renewal,
+};
 #[cfg(test)]
 pub use eliot_runtime_contracts::{
     Ed25519SupervisionLeaseSigner, ProvisionedSupervisionAuthority, SupervisionLease,
@@ -198,6 +341,11 @@ use sha2::{Digest as _, Sha256};
 
 #[cfg(all(test, windows))]
 use canonical_store_runtime::attach_then_retain_canonical_store;
+#[cfg(windows)]
+pub(crate) use canonical_store_runtime::{
+    is_store_rebind_latest_committed, store_rebind_receipt_from_ors_record,
+    store_rebind_record_is_committed, store_rebind_record_is_pending, store_rebind_record_matches,
+};
 #[cfg(all(test, windows))]
 use eliot_ipc::NamedPipeServer;
 #[cfg(all(test, windows))]
@@ -219,10 +367,27 @@ pub const KERNEL_STORE_REBIND_PRODUCTION_DISCRIMINATOR: &str =
     "eliot-kernel::production-store-rebind:v1";
 const STORE_BRIDGE_ROUTE: &str = "store_bridge";
 const ACTIVE_DAEMON_CALLER: &str = "eliotd";
+/// Wave-2 single timing owner for supervision-lease renewal (Implements #88).
+///
+/// `DaemonSupervisionRenewalPolicy` owns every renewal bound; the retired
+/// parallel `SUPERVISION_LEASE_VALIDITY_MS` / `SUPERVISION_LEASE_RENEW_AFTER_MS`
+/// constants must not be reintroduced beside it. The windows preserve the
+/// established lease shape (60s validity, renewal due after 30s); the
+/// observation freshness bounds match the wave-1 contract proof values.
+/// Watchdog coverage stays opt-in until wave 3 reports per-tick
+/// `watchdog_covered` from the daemon; the stale-cursor horizon (three missed
+/// renewal intervals, see `DaemonSupervisionProgressState`) applies
+/// regardless. `StoreHealth` (`health_view::daemon_health`) remains a separate
+/// evidence-only view and never renews.
 #[cfg(windows)]
-const SUPERVISION_LEASE_VALIDITY_MS: u64 = 60_000;
-#[cfg(windows)]
-const SUPERVISION_LEASE_RENEW_AFTER_MS: u64 = 30_000;
+pub(crate) const SUPERVISION_LEASE_RENEWAL_POLICY: DaemonSupervisionRenewalPolicy =
+    DaemonSupervisionRenewalPolicy {
+        validity_ms: 60_000,
+        renew_after_ms: 30_000,
+        max_observation_age_ms: 10_000,
+        max_wall_skew_ms: 5_000,
+        require_watchdog_coverage: false,
+    };
 const ELIOTD_RECEIPT_PENDING_DEPENDENCY: &str = "eliotd-process-receipt";
 const ELIOTD_RECEIPT_PENDING_REASON: &str = "exact launched process receipt publication is pending";
 #[cfg(windows)]
@@ -309,6 +474,30 @@ pub struct KernelComposition {
     agent_activation_pending: Mutex<AgentActivationPendingState>,
     #[cfg(windows)]
     agent_activation_changed: tokio::sync::Notify,
+    /// Full typed semantic resolution results retained verbatim under their
+    /// exact ticket identities, keyed by ticket id.
+    ///
+    /// Every one of the seven closed dispositions shares one
+    /// exact-replay/conflict ledger here, independent of the legacy
+    /// success-only decision ledger on the pending entry. Only a `Resolved`
+    /// disposition can later yield a transport Session, and that Session is
+    /// created exactly once by the bridge activation path. The map lives
+    /// beside the pending table (rather than inside its entries) so the
+    /// ticket ledger shape stays additive.
+    #[cfg(windows)]
+    agent_activation_results: Mutex<BTreeMap<String, AgentActivationResolutionResult>>,
+    /// Connection-scoped index of staged P-04 host-request operations. The
+    /// durable ORS record is the owner; this index only lets disconnect revoke
+    /// fence the presenting connection's still-uncertain operations to
+    /// `Unknown` without enumerating the store.
+    #[cfg(windows)]
+    host_request_connection_index: Mutex<BTreeMap<String, Vec<HostRequestOperationRef>>>,
+    /// Boot-unique seed for local-read attempt identities. Minted once per
+    /// composition so attempt IDs never repeat across restarts: a capability
+    /// serialized before a restart can never match a claim record minted after
+    /// it, even when the fencing generation restarts at 1.
+    #[cfg(windows)]
+    local_read_claim_boot_nonce: u64,
 }
 
 #[cfg(windows)]
@@ -338,6 +527,16 @@ struct AgentActivationPendingState {
     /// Bounded replay ledger. A request identity is never rebound to a new
     /// connection after completion or disconnect.
     replay: BTreeMap<String, String>,
+    /// Bounded durable semantic-result retention, keyed by ticket identity.
+    /// One ticket accepts at most one result identity: the bridge waiter
+    /// consumes the `entries` leg after projecting, but this record is kept
+    /// so an exact replay stays idempotent, a changed same-ticket result
+    /// conflicts, and a lost acknowledgement reconciles without a second
+    /// Governor read. Retention never expires on the ticket deadline; a
+    /// terminal accepted result outlives it.
+    results: BTreeMap<String, AgentActivationResultRecord>,
+    /// Insertion order of `results` for bounded eviction.
+    result_order: VecDeque<String>,
 }
 
 #[cfg(windows)]
@@ -371,12 +570,72 @@ fn classify_activation_decision(
     }
 }
 
+/// Submission phase of one retained v2 semantic result.
+///
+/// Absence of a record means the ticket is still awaiting its result. A
+/// retained record is never re-queued by claim-lease expiry: the lease only
+/// recycles result-less tickets for transient resolver failure. The sole
+/// re-queue path for a deferred ticket is a gated superseding submission on
+/// the submit path, never the lease clock.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AgentActivationResultPhase {
+    /// Terminal result. Exact replay is idempotent; any changed same-ticket
+    /// result is an identity conflict, even across deadline expiry.
+    AcceptedTerminal,
+    /// `NotReady` deferral. Reconsideration requires due time (the new
+    /// observation must not predate the retained `not_before`) and a changed
+    /// named dependency revision; anything else conflicts.
+    DeferredNotReady,
+}
+
+/// Exact retained semantic result for one Kernel-issued ticket: result
+/// identity, payload digest, full typed disposition, and submission phase.
+#[cfg(windows)]
+#[derive(Clone)]
+struct AgentActivationResultRecord {
+    result: AgentActivationResolutionResult,
+    phase: AgentActivationResultPhase,
+}
+
+/// Pure replay classifier for v2 results, mirroring the v1 decision
+/// classifier. The `NotReady` supersede gate is applied by the submit path
+/// only when this classifier reports `Conflict`.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActivationResultDisposition {
+    Commit,
+    ExactReplay,
+    Conflict,
+}
+
+#[cfg(windows)]
+fn classify_activation_result(
+    existing: Option<&AgentActivationResolutionResult>,
+    incoming: &AgentActivationResolutionResult,
+) -> ActivationResultDisposition {
+    match existing {
+        None => ActivationResultDisposition::Commit,
+        Some(existing) if existing.result_sha256 == incoming.result_sha256 => {
+            ActivationResultDisposition::ExactReplay
+        }
+        Some(_) => ActivationResultDisposition::Conflict,
+    }
+}
+
 #[cfg(windows)]
 impl AgentActivationPendingState {
     fn claim_at(&mut self, now: u64) -> Option<AgentActivationResolutionTicket> {
         let queue_len = self.fifo.len();
         for _ in 0..queue_len {
             let ticket_id = self.fifo.pop_front()?;
+            // A retained semantic result (v2) is terminal-or-deferred
+            // durable state: claim-lease expiry is not a semantic delta and
+            // never re-queues it. Only result-less tickets recycle through
+            // the lease for transient resolver failure.
+            if self.results.contains_key(&ticket_id) {
+                continue;
+            }
             let Some(entry) = self.entries.get_mut(&ticket_id) else {
                 continue;
             };
@@ -401,6 +660,26 @@ impl AgentActivationPendingState {
             return Some(ticket);
         }
         None
+    }
+
+    /// Retains one exact result record under its ticket identity, evicting the
+    /// oldest retained ticket when the bounded ledger is full. Eviction only
+    /// affects daemon-leg replay/reconcile memory; the bridge leg for an
+    /// evicted ticket is already projected or gone, and a resubmission for an
+    /// evicted ticket without a pending entry is answered `UnknownRequest`
+    /// rather than fabricated.
+    fn retain_activation_result(&mut self, record: AgentActivationResultRecord) {
+        const MAX_RETAINED_ACTIVATION_RESULTS: usize = 64;
+        let ticket_id = record.result.ticket_id.clone();
+        if !self.results.contains_key(&ticket_id) {
+            self.result_order.push_back(ticket_id.clone());
+            while self.result_order.len() > MAX_RETAINED_ACTIVATION_RESULTS {
+                if let Some(oldest) = self.result_order.pop_front() {
+                    self.results.remove(&oldest);
+                }
+            }
+        }
+        self.results.insert(ticket_id, record);
     }
 }
 
@@ -443,6 +722,50 @@ pub enum KernelFrameAction {
         /// Bounded operation payload.
         payload: serde_json::Value,
     },
+    /// Execute one authenticated Doctor repair-attempt operation (T6-D2 P-07).
+    /// The operation carries the exact Doctor wire identity; ledger-bound
+    /// admission itself is owned by the P-07 doctor handler through
+    /// `eliot_kernel_service::doctor` (`route_doctor_repair` /
+    /// `admit_doctor_repair`). New-effect intake is `Ready`-gated per kind;
+    /// cancel/reconcile control additionally routes while `Degraded`.
+    Doctor {
+        /// Correlation identity to echo in the response.
+        request_id: RequestId,
+        /// Closed operation name; must equal `DOCTOR_REPAIR_WIRE_ID`.
+        operation: String,
+        /// Bounded operation payload carrying the typed repair-attempt request.
+        payload: serde_json::Value,
+    },
+    /// Execute one authenticated testd admission operation (T6-X1 P-07).
+    /// The operation carries the exact testd wire identity; job-bound
+    /// admission itself is owned by the P-07 testd handler through
+    /// `eliot_kernel_service::testd_front_door` (`route_testd_admission` /
+    /// `handle_testd_admission_attempt`). New-execution intake is
+    /// `Ready`-gated per kind; cancel/reconcile control additionally routes
+    /// while `Degraded`.
+    Testd {
+        /// Correlation identity to echo in the response.
+        request_id: RequestId,
+        /// Closed operation name; must equal `TESTD_ADMISSION_WIRE_ID`.
+        operation: String,
+        /// Bounded operation payload carrying the typed admission request.
+        payload: serde_json::Value,
+    },
+    /// Execute one authenticated Dreamer job operation (T12-05 K2).
+    /// The operation carries the exact Dreamer wire identity; ledger-bound
+    /// admission itself is owned by the K1 gateway
+    /// (`KernelStoreGateway::dreamer_job`). Intake is `Ready`-gated; the
+    /// authenticated caller is the `eliotd` requester and the presented
+    /// `JobRole` must agree with it, never grant rights. No process is
+    /// spawned inside this handler.
+    Dreamer {
+        /// Correlation identity to echo in the response.
+        request_id: RequestId,
+        /// Closed operation name; must equal `DREAMER_JOB_WIRE_ID`.
+        operation: String,
+        /// Bounded operation payload carrying context plus typed job request.
+        payload: serde_json::Value,
+    },
     /// Return a typed rejection, then fence the connection.
     Fence(Frame),
 }
@@ -477,143 +800,6 @@ fn load_agent_bridge_declaration(
         .validate_client_declaration(&declaration)
         .map_err(|error| KernelBuildError::Service(error.to_string()))?;
     Ok(declaration)
-}
-
-#[cfg(windows)]
-fn store_rebind_record_matches(
-    record: &eliot_ors::StoreRebindReplayRecord,
-    handoff: &eliot_kernel_service::StoreRebindHandoff,
-    request_digest: &str,
-    requirement_digest: &str,
-) -> bool {
-    record.operation_id.as_str() == handoff.operation_id.as_str()
-        && record.request_digest == request_digest
-        && record.candidate_binding_digest == handoff.candidate_binding_digest
-        && record.store_fence == handoff.store_fence
-        && record.requirement_digest == requirement_digest
-        && record.process_id == handoff.process_binding.process.process_id
-        && record.process_start_time_100ns == handoff.process_binding.process.start_time_100ns
-        && record.process_image_path == handoff.process_binding.process.image_path
-        && record.job_name == handoff.process_binding.job.as_str()
-        && record.generation == handoff.generation.value()
-        && record.authority_epoch == handoff.authority_epoch.value()
-}
-
-#[cfg(windows)]
-fn store_rebind_record_is_committed(
-    record: &eliot_ors::StoreRebindReplayRecord,
-    handoff: &eliot_kernel_service::StoreRebindHandoff,
-    request_digest: &str,
-    requirement_digest: &str,
-) -> bool {
-    store_rebind_record_matches(record, handoff, request_digest, requirement_digest)
-        && record.state == eliot_ors::StoreRebindReplayState::Committed
-        && record.receipt.as_deref() == Some(request_digest)
-}
-
-#[cfg(windows)]
-fn store_rebind_record_is_pending(
-    record: &eliot_ors::StoreRebindReplayRecord,
-    handoff: &eliot_kernel_service::StoreRebindHandoff,
-    request_digest: &str,
-    requirement_digest: &str,
-) -> bool {
-    store_rebind_record_matches(record, handoff, request_digest, requirement_digest)
-        && record.state == eliot_ors::StoreRebindReplayState::Pending
-        && record.receipt.is_none()
-}
-
-#[cfg(windows)]
-fn store_rebind_receipt_from_ors_record(
-    record: &eliot_ors::StoreRebindReplayRecord,
-) -> Result<eliot_kernel_service::StoreRebindReceipt, KernelBuildError> {
-    if record.state != eliot_ors::StoreRebindReplayState::Committed
-        || record.receipt.as_deref() != Some(record.request_digest.as_str())
-    {
-        return Err(KernelBuildError::Service(
-            "ORS Store rebind record is not an exact committed receipt".to_owned(),
-        ));
-    }
-    let receipt = eliot_kernel_service::StoreRebindReceipt {
-        operation_id: PlatformHandle::new(record.operation_id.as_str())
-            .map_err(|error| KernelBuildError::Service(error.to_string()))?,
-        request_digest: record.request_digest.clone(),
-        requirement_digest: record.requirement_digest.clone(),
-        process_binding: eliot_kernel_service::StoreProcessBinding {
-            process: eliot_kernel_service::HostProcessBinding {
-                process_id: record.process_id,
-                start_time_100ns: record.process_start_time_100ns,
-                image_path: record.process_image_path.clone(),
-            },
-            job: PlatformHandle::new(record.job_name.clone())
-                .map_err(|error| KernelBuildError::Service(error.to_string()))?,
-        },
-        candidate_binding_digest: record.candidate_binding_digest.clone(),
-        generation: ResourceGeneration::new(record.generation)
-            .map_err(|error| KernelBuildError::Service(error.to_string()))?,
-        authority_epoch: AuthorityEpoch::new(record.authority_epoch)
-            .map_err(|error| KernelBuildError::Service(error.to_string()))?,
-        store_fence: record.store_fence.clone(),
-    };
-    receipt
-        .validate()
-        .map_err(|error| KernelBuildError::Service(error.to_string()))?;
-    Ok(receipt)
-}
-
-#[cfg(windows)]
-#[allow(clippy::unwrap_used)]
-fn is_store_rebind_latest_committed(
-    ors: &eliot_ors::RedbRecoveryStore,
-    record: &eliot_ors::StoreRebindReplayRecord,
-) -> Result<bool, KernelBuildError> {
-    let all = ors
-        .load_all_store_rebinds()
-        .map_err(|e| KernelBuildError::Service(e.to_string()))?;
-    let committed: Vec<_> = all
-        .iter()
-        .filter(|r| r.state == eliot_ors::StoreRebindReplayState::Committed)
-        .collect();
-    if committed.is_empty() {
-        return Ok(true);
-    }
-    let same_lineage_zeros = committed
-        .iter()
-        .filter(|r| {
-            r.commit_order == 0
-                && r.requirement_digest == record.requirement_digest
-                && r.generation == record.generation
-                && r.authority_epoch == record.authority_epoch
-        })
-        .count();
-    if same_lineage_zeros > 1 {
-        return Err(KernelBuildError::Service(
-            "Store rebind legacy commit order requires migration/recovery".to_owned(),
-        ));
-    }
-    let legacy_zeros = committed.iter().filter(|r| r.commit_order == 0).count();
-    if legacy_zeros > 1 && record.commit_order == 0 {
-        return Ok(false);
-    }
-    if record.commit_order == 0 {
-        let max_order = committed.iter().map(|r| r.commit_order).max().unwrap_or(0);
-        if max_order > 0 {
-            return Ok(false);
-        }
-    }
-    let latest = committed
-        .iter()
-        .max_by_key(|r| {
-            (
-                r.commit_order,
-                r.operation_id.as_str().to_owned(),
-                r.request_digest.clone(),
-            )
-        })
-        .unwrap();
-    Ok(latest.commit_order == record.commit_order
-        && latest.operation_id == record.operation_id
-        && latest.request_digest == record.request_digest)
 }
 
 #[cfg(windows)]
@@ -716,7 +902,7 @@ impl KernelComposition {
                 r.state == eliot_ors::StoreRebindReplayState::Committed
                     && r.requirement_digest == requirement_digest
                     && r.generation == requirement.state_fence.resource_generation.value()
-                    && r.authority_epoch == requirement.state_fence.authority_epoch.value()
+                    && r.authority_epoch == requirement.state_fence.authority_epoch.sequence.get()
             })
             .cloned()
             .collect();
@@ -748,8 +934,11 @@ impl KernelComposition {
                         )
                     });
                 if let Some(record) = non_zero_latest.cloned() {
-                    let receipt = store_rebind_receipt_from_ors_record(&record)
-                        .map_err(|error| error.to_string())?;
+                    let receipt = store_rebind_receipt_from_ors_record(
+                        &record,
+                        &requirement.state_fence.authority_epoch,
+                    )
+                    .map_err(|error| error.to_string())?;
                     service
                         .restore_store_rebind_for_recovery(
                             receipt.clone(),
@@ -778,7 +967,8 @@ impl KernelComposition {
             return Ok(None);
         };
         let receipt =
-            store_rebind_receipt_from_ors_record(&record).map_err(|error| error.to_string())?;
+            store_rebind_receipt_from_ors_record(&record, &requirement.state_fence.authority_epoch)
+                .map_err(|error| error.to_string())?;
         service
             .restore_store_rebind_for_recovery(receipt.clone(), record.request_digest.clone())
             .map_err(|e| e.to_string())?;
@@ -818,12 +1008,151 @@ impl KernelComposition {
     }
 
     #[cfg(windows)]
-    fn note_agent_bridge_peer_set_change(&self) {
+    pub fn note_agent_bridge_peer_set_change(&self) {
         self.agent_bridge_peer_set_revision
             .fetch_add(1, Ordering::AcqRel);
         // `notify_one` retains a permit if the listener changes state in the
         // check-to-await gap; `notify_waiters` would lose that wake.
         self.agent_bridge_peer_set_changed.notify_one();
+    }
+
+    /// Verifies that the retained bridge declaration binds the live Kernel
+    /// front-door policy, and returns the exact config-snapshot digest.
+    ///
+    /// Narrow S1 seam for the Instrument R13 conformance harness: the policy
+    /// lock and its snapshot never leave this composition.
+    #[cfg(windows)]
+    pub fn verify_harness_kernel_policy(
+        &self,
+        declaration: &AgentBridgeClientDeclaration,
+    ) -> Result<String, String> {
+        let policy = self
+            .front_door_policy
+            .lock()
+            .map_err(|_| "Kernel policy lock poisoned".to_owned())?
+            .clone();
+        let policy_artifact = policy
+            .config_snapshot
+            .get("artifact_digest")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "Kernel policy artifact digest is absent".to_owned())?;
+        let policy_config_digest = sha256_json(&policy.config_snapshot)
+            .map_err(|error| format!("compute Kernel policy digest: {error}"))?;
+        if policy.session_principal_binding != declaration.expected_kernel_principal_binding
+            || policy.module_generation.state_fence.authority_epoch
+                != declaration.expected_kernel_authority_epoch
+            || policy.module_generation.generation != declaration.expected_kernel_generation
+            || policy_artifact != declaration.expected_kernel_artifact_sha256
+            || policy_config_digest != declaration.expected_kernel_config_snapshot_sha256
+        {
+            return Err(
+                "retained declaration does not bind the actual LocalService Kernel policy"
+                    .to_owned(),
+            );
+        }
+        Ok(policy_config_digest)
+    }
+
+    /// Installs the retained Host-approved bridge profile and declaration.
+    ///
+    /// Narrow S2 seam for the Instrument R13 conformance harness: the profile
+    /// lock never leaves this composition.
+    #[cfg(windows)]
+    pub fn install_harness_bridge_profile(
+        &self,
+        admission: AgentBridgeAdmissionDescriptor,
+        declaration: AgentBridgeClientDeclaration,
+    ) -> Result<(), String> {
+        *self
+            .agent_bridge_profile
+            .lock()
+            .map_err(|_| "bridge profile lock poisoned".to_owned())? = Some(AgentBridgeProfile {
+            admission,
+            declaration,
+        });
+        Ok(())
+    }
+
+    /// Runs the exact harness candidate lifecycle through the single Kernel
+    /// transition boundary: `reconcile`, `Shadow`, `PrepareHandoff`, permit
+    /// activation, receipt, and `Ready` publication.
+    ///
+    /// Narrow S3 seam for the Instrument R13 conformance harness: the service
+    /// handle never leaves this composition.
+    #[cfg(windows)]
+    pub fn activate_harness_candidate(
+        &self,
+        candidate: &HostKernelCandidateBinding,
+        permit: &KernelActivationPermit,
+        expected_config_snapshot_sha256: &str,
+    ) -> Result<KernelActivationReceipt, String> {
+        let mut service = self
+            .service
+            .lock()
+            .map_err(|_| "Kernel service lock poisoned".to_owned())?;
+        service
+            .reconcile(candidate.clone())
+            .map_err(|error| format!("reconcile Kernel candidate: {error}"))?;
+        service
+            .apply(KernelControlCommand::Shadow)
+            .map_err(|error| format!("shadow Kernel candidate: {error}"))?;
+        service
+            .apply(KernelControlCommand::PrepareHandoff)
+            .map_err(|error| format!("prepare Kernel handoff: {error}"))?;
+        let receipt = service
+            .activate_permit(
+                permit,
+                permit.generation,
+                expected_config_snapshot_sha256.to_owned(),
+            )
+            .map_err(|error| format!("activate Kernel candidate: {error}"))?;
+        let activation_nonce_digest = service
+            .activation_receipt()
+            .ok_or_else(|| "Kernel activation receipt missing".to_owned())?
+            .activation_nonce_digest
+            .clone();
+        service
+            .publish_ready(KernelReadyReceipt {
+                activation_id: candidate.activation_id.clone(),
+                activation_operation_id: permit.operation_id.clone(),
+                activation_nonce_digest,
+                process: ProcessObservation {
+                    process_id: PlatformHandle::new(format!(
+                        "pid:{}:start:{}",
+                        candidate.host_process.process_id, candidate.host_process.start_time_100ns
+                    ))
+                    .map_err(|error| error.to_string())?,
+                    job_object_id: candidate.job_object_id.clone(),
+                    state: eliot_runtime_contracts::ServiceProcessState::Ready,
+                    health: HealthVector::healthy(),
+                    evidence_refs: vec![
+                        PlatformHandle::new("r13-two-token-worker-evidence")
+                            .map_err(|error| error.to_string())?,
+                    ],
+                },
+                health: HealthVector::healthy(),
+                evidence_refs: vec![
+                    PlatformHandle::new("r13-two-token-worker-evidence")
+                        .map_err(|error| error.to_string())?,
+                ],
+            })
+            .map_err(|error| format!("publish Kernel Ready state: {error}"))?;
+        Ok(receipt)
+    }
+
+    /// Reports whether the typed denial path unexpectedly minted a transport
+    /// session or auth binding.
+    ///
+    /// Narrow S5 seam for the Instrument R13 conformance harness: the
+    /// connection table never leaves this composition.
+    #[cfg(windows)]
+    pub fn harness_has_agent_bridge_session(&self) -> Result<bool, String> {
+        Ok(self
+            .agent_bridge_connections
+            .lock()
+            .map_err(|_| "bridge connection lock poisoned".to_owned())?
+            .values()
+            .any(|state| state.session.is_some() || state.activation_completed))
     }
 
     #[cfg(windows)]
@@ -909,7 +1238,7 @@ impl KernelComposition {
                     .map_err(|e| KernelBuildError::Service(e.to_string()))?,
             );
             hasher.update(handoff.generation.value().to_le_bytes());
-            hasher.update(handoff.authority_epoch.value().to_le_bytes());
+            hasher.update(handoff.authority_epoch.sequence.get().to_le_bytes());
             hasher.update(
                 handoff
                     .requirement
@@ -1008,7 +1337,7 @@ impl KernelComposition {
             .route(&route_scope)
             .map_err(|e| KernelBuildError::Core(e.to_string()))?
             .clone();
-        if route.authority_epoch() != requirement.authority_epoch()
+        if route.authority_epoch().value() != requirement.authority_epoch().sequence.get()
             || route.active_generation() != requirement.store_generation
             || requirement.route_identity.as_str() != STORE_BRIDGE_ROUTE
         {
@@ -1042,7 +1371,10 @@ impl KernelComposition {
                         "Store rebind superseded by newer durable commit".to_owned(),
                     ));
                 }
-                Some(store_rebind_receipt_from_ors_record(&existing)?)
+                Some(store_rebind_receipt_from_ors_record(
+                    &existing,
+                    &handoff.authority_epoch,
+                )?)
             } else {
                 if !store_rebind_record_matches(
                     &existing,
@@ -1094,6 +1426,9 @@ impl KernelComposition {
             self.service.clone(),
             std::sync::Arc::new(client),
             route.clone(),
+            // I14.21 (#1690): the rebind gateway recovers against the same
+            // composition-retained Kernel ORS handle as the live gateway.
+            Some(std::sync::Arc::clone(&self.generation_gateway.ors)),
         ));
         let receipt = {
             let mut svc = self
@@ -1136,11 +1471,9 @@ impl KernelComposition {
             .as_ref()
             .map_or_else(
                 || {
-                    struct NoopAttachment;
-                    impl CanonicalStoreAttachmentTransaction for NoopAttachment {
-                        fn commit(self: Box<Self>) {}
-                    }
-                    Ok(Box::new(NoopAttachment) as Box<dyn CanonicalStoreAttachmentTransaction>)
+                    Err(KernelBuildError::Service(
+                        "process authority is required before canonical Store rebind".to_owned(),
+                    ))
                 },
                 |pg| {
                     pg.replace_canonical_store(Arc::clone(&gateway))
@@ -1172,7 +1505,7 @@ impl KernelComposition {
                 process_image_path: handoff.process_binding.process.image_path.clone(),
                 job_name: handoff.process_binding.job.as_str().to_owned(),
                 generation: handoff.generation.value(),
-                authority_epoch: handoff.authority_epoch.value(),
+                authority_epoch: handoff.authority_epoch.sequence.get(),
                 state: eliot_ors::StoreRebindReplayState::Pending,
                 receipt: None,
                 commit_order: 0,
@@ -1323,7 +1656,7 @@ impl KernelComposition {
                 process_image_path: handoff.process_binding.process.image_path.clone(),
                 job_name: handoff.process_binding.job.as_str().to_owned(),
                 generation: handoff.generation.value(),
-                authority_epoch: handoff.authority_epoch.value(),
+                authority_epoch: handoff.authority_epoch.sequence.get(),
                 state: eliot_ors::StoreRebindReplayState::Committed,
                 receipt: Some(receipt.request_digest.clone()),
                 commit_order: 0,
@@ -1637,13 +1970,16 @@ impl KernelComposition {
         if activation.candidate_binding_digest != candidate_digest
             || activation.authority_epoch != candidate.kernel_epoch
             || session.module_generation.module_id.as_str() != ACTIVE_DAEMON_CALLER
-            || session.authority_epoch != activation.authority_epoch.value()
+            || !session
+                .authority_epoch
+                .is_same_authority(&activation.authority_epoch)
             || session.module_generation.generation != activation.generation
             || process.accepted_generation().get() != session.module_generation.generation.value()
         {
             return Err(KernelServiceError::ReadinessNotProven);
         }
-        let state_fence = StateFence::new(activation.authority_epoch, activation.generation);
+        let state_fence =
+            StateFence::new(activation.authority_epoch.clone(), activation.generation);
         if session.module_generation.state_fence != state_fence {
             return Err(KernelServiceError::ReadinessNotProven);
         }
@@ -1683,21 +2019,27 @@ impl KernelComposition {
     fn active_supervision_binding(
         contour: &DaemonSupervisionContour,
         issued_at_ms: u64,
+        policy: &DaemonSupervisionRenewalPolicy,
     ) -> Result<eliot_ors::SupervisionLeaseBinding, SupervisionLeaseAuthorityError> {
         if issued_at_ms == 0 {
             return Err(SupervisionLeaseAuthorityError::Configuration(
                 "supervision issue time is zero".to_owned(),
             ));
         }
+        policy.validate().map_err(|error| {
+            SupervisionLeaseAuthorityError::Configuration(format!(
+                "supervision renewal policy rejected: {error}"
+            ))
+        })?;
         let expires_at_ms = issued_at_ms
-            .checked_add(SUPERVISION_LEASE_VALIDITY_MS)
+            .checked_add(policy.validity_ms)
             .ok_or_else(|| {
                 SupervisionLeaseAuthorityError::Configuration(
                     "supervision validity interval overflowed".to_owned(),
                 )
             })?;
         let renew_before_ms = issued_at_ms
-            .checked_add(SUPERVISION_LEASE_RENEW_AFTER_MS)
+            .checked_add(policy.renew_after_ms)
             .ok_or_else(|| {
                 SupervisionLeaseAuthorityError::Configuration(
                     "supervision renewal interval overflowed".to_owned(),
@@ -1716,7 +2058,7 @@ impl KernelComposition {
                 .map_err(|error| SupervisionLeaseAuthorityError::Contract(error.to_string()))?,
             activation_id: OperationIdentity::new(incarnation.activation_id.clone())?,
             activation_generation: contour.activation.generation,
-            kernel_epoch: contour.activation.authority_epoch,
+            kernel_epoch: contour.activation.authority_epoch.clone(),
             watchdog_epoch: AuthorityEpoch::new(incarnation.watchdog_epoch.sequence)
                 .map_err(|error| SupervisionLeaseAuthorityError::Contract(error.to_string()))?,
             generation_binding: contour.generation_binding.clone(),
@@ -1860,7 +2202,11 @@ impl KernelComposition {
             }
             stage
         } else {
-            let binding = Self::active_supervision_binding(contour, now_ms)?;
+            let binding = Self::active_supervision_binding(
+                contour,
+                now_ms,
+                &SUPERVISION_LEASE_RENEWAL_POLICY,
+            )?;
             authority.prepare(SupervisionLeasePrepareRequest {
                 ticket_id: supervision_operation_identity("commit-ticket", lease_id, None)?,
                 operation_id: supervision_operation_identity("commit-operation", lease_id, None)?,
@@ -1917,7 +2263,11 @@ impl KernelComposition {
             }
             stage
         } else {
-            let binding = Self::active_supervision_binding(contour, now_ms)?;
+            let binding = Self::active_supervision_binding(
+                contour,
+                now_ms,
+                &SUPERVISION_LEASE_RENEWAL_POLICY,
+            )?;
             authority.prepare(SupervisionLeasePrepareRequest {
                 ticket_id: supervision_operation_identity(
                     "renew-ticket",
@@ -1947,6 +2297,203 @@ impl KernelComposition {
         Ok(renewed)
     }
 
+    /// Pure progress-renewal decision (issue #88, wave 2): joins one daemon
+    /// observation request against the exact Kernel current state through the
+    /// single timing owner, and advances Kernel-owned progress continuity.
+    ///
+    /// Check order: owner policy coherence, stale-cursor horizon (expired
+    /// leases never auto-revive, even for eligible observations), Kernel
+    /// binding pinning from shape-valid observations only, then the contract
+    /// join. `Renewed` records nothing here: the caller records via
+    /// [`DaemonSupervisionProgressState::record_renewed`] only after the ORS
+    /// commit and post-verify both succeed. Every other non-renewing outcome
+    /// updates continuity (`DegradedNoRenewal` and join refusals count a
+    /// miss; `ReconciliationRequired` latches the flag; `NotDue` and exact
+    /// replay change nothing). `StoreHealth` never reaches this route: it
+    /// carries no observation identity and fails request validation.
+    #[cfg(windows)]
+    pub(crate) fn decide_daemon_supervision_progress_renewal(
+        request: &DaemonSupervisionRenewalRequest,
+        current: &DaemonSupervisionCurrentState,
+        progress: &mut DaemonSupervisionProgressState,
+        policy: &DaemonSupervisionRenewalPolicy,
+        now_ms: u64,
+    ) -> Result<DaemonSupervisionRenewalDecision, SupervisionProgressRenewalError> {
+        policy.validate().map_err(|error| {
+            SupervisionProgressRenewalError::Authority(
+                SupervisionLeaseAuthorityError::Configuration(format!(
+                    "supervision renewal policy rejected: {error}"
+                )),
+            )
+        })?;
+        if progress.stale_renewal_expired(policy, now_ms) {
+            return Err(DaemonSupervisionHeartbeatError::SupervisionLeaseExpired.into());
+        }
+        if request.observation.validate().is_ok() {
+            progress.admit_boot_session_binding(&request.observation);
+            progress.advance_monotonic_ms(request.observation.observed_monotonic_ms);
+        }
+        let decision = match evaluate_daemon_supervision_renewal(request, current, policy, now_ms) {
+            Ok(decision) => decision,
+            Err(error) => {
+                progress.note_missed_renewal();
+                if progress.stale_renewal_expired(policy, now_ms) {
+                    return Err(DaemonSupervisionHeartbeatError::SupervisionLeaseExpired.into());
+                }
+                return Err(error.into());
+            }
+        };
+        match decision.outcome {
+            DaemonSupervisionRenewalOutcome::Renewed
+            | DaemonSupervisionRenewalOutcome::ExactReplay
+            | DaemonSupervisionRenewalOutcome::NotDue => {}
+            DaemonSupervisionRenewalOutcome::DegradedNoRenewal => {
+                progress.note_missed_renewal();
+                if progress.stale_renewal_expired(policy, now_ms) {
+                    return Err(DaemonSupervisionHeartbeatError::SupervisionLeaseExpired.into());
+                }
+            }
+            DaemonSupervisionRenewalOutcome::ReconciliationRequired => {
+                progress.note_reconciliation_pending();
+            }
+        }
+        Ok(decision)
+    }
+
+    /// Typed progress renewal entry (issue #88, wave 2): renews the current
+    /// supervision lease from an observed daemon progress request, not from
+    /// `StoreHealth`.
+    ///
+    /// The entry loads the exact ORS predecessor, surfaces natural expiry
+    /// with the typed refusal before signature work, checks the contour
+    /// binding, builds the join state from the exact predecessor plus
+    /// Kernel-owned continuity, decides through the single timing owner,
+    /// and commits exactly one successor on `Renewed` (resuming the exact
+    /// staged ticket when one is already staged, i.e. reconcile-by-identity).
+    /// A failed commit latches reconciliation-pending and propagates, so an
+    /// unknown durable outcome never mints a second successor. Non-renewing
+    /// decisions return the unchanged head with their complete receipt and no
+    /// commit. On `Renewed` the receipt is `None` by construction: the caller
+    /// completes it with the committed successor receipt digest plus the
+    /// published live-receipt digest via `daemon_renewal_receipt_for_decision`
+    /// after live-receipt publication, so a renewal can never ship without
+    /// its publication evidence.
+    #[cfg(windows)]
+    #[allow(
+        dead_code,
+        reason = "wave 3 (MGR02) wires the eliotd per-tick DaemonProgressObservation into this typed progress route; ProbeReady keeps the policy-driven legacy renew until then"
+    )]
+    fn renew_current_supervision_with_progress(
+        authority: &KernelSupervisionLeaseAuthority,
+        contour: &DaemonSupervisionContour,
+        request: &DaemonSupervisionRenewalRequest,
+        progress: &mut DaemonSupervisionProgressState,
+        policy: &DaemonSupervisionRenewalPolicy,
+        now_ms: u64,
+    ) -> Result<
+        (
+            SupervisionLeaseSnapshot,
+            DaemonSupervisionRenewalDecision,
+            Option<DaemonSupervisionRenewalReceipt>,
+        ),
+        SupervisionProgressRenewalError,
+    > {
+        let lease_id = contour.incarnation.supervision_lease_id.as_str();
+        let current_snapshot =
+            authority
+                .current_snapshot(lease_id)?
+                .ok_or(SupervisionLeaseAuthorityError::Ors(
+                    OrsError::SupervisionLeaseBindingMismatch,
+                ))?;
+        if now_ms >= current_snapshot.record.binding.expires_at_ms {
+            return Err(DaemonSupervisionHeartbeatError::SupervisionLeaseExpired.into());
+        }
+        authority.verify_active_snapshot(&current_snapshot, lease_id, now_ms)?;
+        if !supervision_binding_matches_contour(&current_snapshot.record.binding, contour)? {
+            return Err(SupervisionLeaseAuthorityError::Ors(
+                OrsError::SupervisionLeaseBindingMismatch,
+            )
+            .into());
+        }
+        let current = daemon_supervision_current_state(&current_snapshot, contour, progress)?;
+        let decision = Self::decide_daemon_supervision_progress_renewal(
+            request, &current, progress, policy, now_ms,
+        )?;
+        if decision.outcome != DaemonSupervisionRenewalOutcome::Renewed {
+            let receipt = daemon_renewal_receipt_for_decision(&decision, None, None)?;
+            return Ok((current_snapshot, decision, Some(receipt)));
+        }
+        let successor_revision =
+            decision
+                .successor_revision
+                .ok_or(SupervisionLeaseAuthorityError::Configuration(
+                    "renewed progress decision is missing its successor revision".to_owned(),
+                ))?;
+        let observation_sha256 = request
+            .observation
+            .digest()
+            .map_err(SupervisionProgressRenewalError::Heartbeat)?;
+        let stage = if let Some(stage) = authority.staged_snapshot(lease_id)? {
+            if stage.ticket.operation != SupervisionLeaseOperation::Renew
+                || stage.ticket.expected_revision != Some(current_snapshot.record.revision)
+                || stage.ticket.previous_receipt_sha256.as_deref()
+                    != Some(current_snapshot.receipt.receipt_sha256.as_str())
+                || stage.ticket.binding.state != LeaseState::Active
+                || !supervision_binding_matches_contour(&stage.ticket.binding, contour)?
+                || now_ms >= stage.ticket.binding.expires_at_ms
+            {
+                return Err(SupervisionLeaseAuthorityError::Ors(
+                    OrsError::SupervisionLeaseTicketConflict,
+                )
+                .into());
+            }
+            stage
+        } else {
+            let binding = Self::active_supervision_binding(contour, now_ms, policy)?;
+            authority.prepare(SupervisionLeasePrepareRequest {
+                ticket_id: supervision_operation_identity(
+                    "renew-ticket",
+                    lease_id,
+                    Some(&current_snapshot.receipt.receipt_sha256),
+                )?,
+                operation_id: supervision_operation_identity(
+                    "renew-operation",
+                    lease_id,
+                    Some(&current_snapshot.receipt.receipt_sha256),
+                )?,
+                lease_id: OperationIdentity::new(lease_id.to_owned())?,
+                expected_revision: Some(current_snapshot.record.revision),
+                operation: SupervisionLeaseOperation::Renew,
+                binding,
+            })?
+        };
+        let renewed = match authority.commit_active(&stage.ticket) {
+            Ok(renewed) => renewed,
+            Err(error) => {
+                progress.note_reconciliation_pending();
+                return Err(error.into());
+            }
+        };
+        authority.verify_active_snapshot(&renewed, lease_id, now_ms)?;
+        if renewed.record.revision != successor_revision
+            || renewed.record.revision <= current_snapshot.record.revision
+            || !supervision_binding_matches_contour(&renewed.record.binding, contour)?
+        {
+            progress.note_reconciliation_pending();
+            return Err(SupervisionLeaseAuthorityError::Ors(
+                OrsError::SupervisionLeaseBindingMismatch,
+            )
+            .into());
+        }
+        progress.record_renewed(
+            &request.observation,
+            observation_sha256,
+            successor_revision,
+            now_ms,
+        );
+        Ok((renewed, decision, None))
+    }
+
     #[cfg(windows)]
     fn establish_daemon_supervision(
         &self,
@@ -1963,6 +2510,16 @@ impl KernelComposition {
         Ok((contour, snapshot))
     }
 
+    // Wave-3 handoff (MGR02, `eliotd` per-tick observation, Implements #88):
+    // this ProbeReady path still renews through the policy-driven legacy
+    // `renew_current_supervision` because the daemon does not yet submit a
+    // per-tick `DaemonProgressObservation`. Wave 3 must build that observation
+    // in `eliotd`, retain a `DaemonSupervisionProgressState` for the active
+    // lease, build the join state with `daemon_supervision_current_state`,
+    // and call `renew_current_supervision_with_progress` here instead, then
+    // assemble the receipt with `daemon_renewal_receipt_for_decision` after
+    // live-receipt publication. `StoreHealth` (`health_view::daemon_health`)
+    // stays evidence-only and must never be passed as renewal evidence.
     #[cfg(windows)]
     fn renew_daemon_supervision_for_probe(
         &self,
@@ -2135,7 +2692,7 @@ impl KernelComposition {
                 .map_err(|_| TransportError::SessionFenced)?,
         );
         hasher.update(receipt.generation.value().to_le_bytes());
-        hasher.update(receipt.authority_epoch.value().to_le_bytes());
+        hasher.update(receipt.authority_epoch.sequence.get().to_le_bytes());
         hasher.update(
             handoff
                 .requirement
@@ -2167,7 +2724,7 @@ impl KernelComposition {
         query: &eliot_kernel_service::StoreRebindQuery,
         record: &eliot_ors::StoreRebindReplayRecord,
     ) -> Result<(), TransportError> {
-        let receipt = store_rebind_receipt_from_ors_record(record)
+        let receipt = store_rebind_receipt_from_ors_record(record, &request.candidate.kernel_epoch)
             .map_err(|_| TransportError::SessionFenced)?;
         let candidate_digest = request
             .candidate
@@ -2231,15 +2788,288 @@ impl KernelComposition {
         Ok(())
     }
 
-    /// Completes the bounded cooperative-then-forced shutdown sequence.
+    /// Completes the ordered I14.23 safe-shutdown sequence through the
+    /// Kernel-owned persisted drain state machine.
+    ///
+    /// Phases run in order: close admissions (`Draining`), revoke authority,
+    /// checkpoint jobs, reconcile canonical-write receipts against a bounded
+    /// deadline, flush ORS staged rows, quiesce modules in reverse dependency
+    /// order, prove the canonical-data lease-zero precondition, linearize the
+    /// `DrainCommit` decision, stop the service, poison the generation
+    /// gateway, and publish the terminal. Any gate failure — including
+    /// deadline expiry with pending work — records an incomplete-shutdown
+    /// terminal retaining the pending work instead of discarding it, while
+    /// runtime shutdown still proceeds. Host carries the linearized decision
+    /// into `DrainCommitRecord`; Watchdog observes it through the journal.
     pub async fn shutdown(&self) -> Result<ShutdownOutcome, ProcessExecutionError> {
+        let coordinator = coordinator_for(&self.work_root);
+        coordinator.request_shutdown();
+        let drain = self.run_shutdown_drain(&coordinator).await;
         let process_result = self
             .process_gateway
             .as_ref()
             .map_or(Ok(()), |gateway| gateway.executor.shutdown());
         let runtime_outcome = self.runtime.shutdown().await;
+        let mut pending = drain
+            .as_ref()
+            .err()
+            .map_or(Vec::new(), |halt| halt.pending.clone());
+        if process_result.is_err() {
+            pending.push("process-gateway-shutdown-failed".to_owned());
+        }
+        if !runtime_outcome.no_orphans {
+            pending.push("runtime-orphans-retained".to_owned());
+        }
+        if drain.is_ok() && pending.is_empty() {
+            coordinator.complete_terminal(ShutdownTerminal::Intentional);
+        } else {
+            if pending.is_empty() {
+                pending.push(
+                    drain
+                        .as_ref()
+                        .err()
+                        .map_or("shutdown-incomplete", |halt| halt.reason)
+                        .to_owned(),
+                );
+            }
+            coordinator.complete_terminal(ShutdownTerminal::Incomplete { pending });
+        }
+        coordinator.observe_published_state();
         process_result?;
         Ok(runtime_outcome)
+    }
+
+    /// Runs the ordered pre-terminal drain phases and returns the linearized
+    /// `DrainCommit` decision. Every failure retains its pending work in the
+    /// returned halt for the incomplete-shutdown terminal.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the ordered I14.23 drain phases keep one visible admission-to-linearization boundary"
+    )]
+    async fn run_shutdown_drain(
+        &self,
+        coordinator: &Arc<shutdown_drain::ShutdownDrainCoordinator>,
+    ) -> Result<DrainCommitDecision, DrainHalt> {
+        let generation = coordinator.drain_generation();
+        let resumed_note = coordinator
+            .recovery_interrupted()
+            .then_some(":resumed-interrupted");
+        let record = |phase: ShutdownPhase, evidence: String| {
+            coordinator
+                .record_phase(phase, evidence)
+                .map_err(|_| DrainHalt::new("phase-record-rejected"))
+        };
+
+        // AdmissionsClosed: the service gate closes normal admission; the
+        // frame-dispatch Ready gate denies new work from `Draining` on.
+        match self.apply_control(KernelControlCommand::Drain) {
+            Ok(state) => record(
+                ShutdownPhase::AdmissionsClosed,
+                format!(
+                    "service-drain-admitted:{state}{}",
+                    resumed_note.unwrap_or("")
+                ),
+            )?,
+            Err(_) => match self.service_state() {
+                Ok(KernelServiceState::Draining | KernelServiceState::Stopped) => record(
+                    ShutdownPhase::AdmissionsClosed,
+                    format!("service-already-draining{}", resumed_note.unwrap_or("")),
+                )?,
+                _ => return Err(DrainHalt::new("admissions-close-rejected")),
+            },
+        }
+
+        // AuthorityRevoked: with the service `Draining`, no new action
+        // authority is admitted; post-linearization control/cutover authority
+        // is revoked through the generation poison below.
+        match self.service_state() {
+            Ok(KernelServiceState::Draining) => record(
+                ShutdownPhase::AuthorityRevoked,
+                "service-draining:ready-gate-denies-new-admissions;control-revoked-at-commit-via-generation-poison"
+                    .to_owned(),
+            )?,
+            _ => return Err(DrainHalt::new("authority-revoke-unproven")),
+        }
+
+        // JobsCheckpointed: observe the daemon contour under drain. Job
+        // checkpoint/cancel semantics stay Governor-owned (handoff); Kernel
+        // admits no new daemon launches while `Draining`.
+        let daemon_status = self
+            .daemon_runtime
+            .lock()
+            .map(|guard| format!("daemon-status:{:?}", guard.status))
+            .map_err(|_| DrainHalt::new("daemon-contour-unavailable"))?;
+        record(
+            ShutdownPhase::JobsCheckpointed,
+            format!(
+                "{daemon_status};no-new-daemon-launches-while-draining;job-checkpoint-owned-by-eliotd-governor-handoff"
+            ),
+        )?;
+
+        // CanonicalDrainReceiptsReconciled: every pending canonical-write
+        // receipt (ORS store-rebind rows) must resolve before the
+        // linearization point; the bounded wait retains the remainder.
+        for identity in self
+            .pending_rebind_receipts()
+            .map_err(|_| DrainHalt::new("ors-rebind-scan-failed"))?
+        {
+            coordinator.register_pending_receipt(identity);
+        }
+        let remainder = coordinator
+            .reconcile_pending_to_deadline(DRAIN_RECEIPT_DEADLINE, || {
+                self.pending_rebind_receipts().unwrap_or_default()
+            })
+            .await;
+        if !remainder.is_empty() {
+            return Err(DrainHalt::with_pending(
+                "receipt-reconciliation-incomplete",
+                remainder,
+            ));
+        }
+        record(
+            ShutdownPhase::CanonicalDrainReceiptsReconciled,
+            "store-rebind-pending-reconciled-empty;supervision-lease-staging-owned-by-lease-authority-handoff;host-request-staging-owned-by-governor-handoff"
+                .to_owned(),
+        )?;
+
+        // FlushesCompleted: reconcile staged ORS generation cutovers.
+        // Audit/outbox flush stays Governor-owned (handoff); Kernel never
+        // fabricates Governor flush evidence.
+        match self
+            .generation_gateway
+            .ors
+            .reconcile_staged_generation_cutovers(eliot_ors::MAX_RECOVERY_PAGE)
+        {
+            Ok(snapshots) => record(
+                ShutdownPhase::FlushesCompleted,
+                format!(
+                    "ors-staged-cutovers-reconciled:{};audit-outbox-flush-owned-by-eliotd-governor-handoff",
+                    snapshots.len()
+                ),
+            )?,
+            Err(_) => return Err(DrainHalt::new("ors-flush-failed")),
+        }
+
+        // ModulesQuiescedReverse: dependents stop before the stores and
+        // bridges they depend on. The contour is the live composition state:
+        // the store bridge (dependency) ordered before the daemon
+        // (dependent), then reversed for quiescence.
+        let mut dependency_order = Vec::new();
+        #[cfg(windows)]
+        match self.canonical_store_gateway.lock() {
+            Ok(gateway) => {
+                if gateway.is_some() {
+                    dependency_order.push("store-bridge".to_owned());
+                }
+            }
+            Err(_) => return Err(DrainHalt::new("store-contour-unavailable")),
+        }
+        match self.daemon_active_launch.lock() {
+            Ok(launch) => {
+                if launch.is_some() {
+                    dependency_order.push("daemon".to_owned());
+                }
+            }
+            Err(_) => return Err(DrainHalt::new("daemon-contour-unavailable")),
+        }
+        let quiescence = reverse_quiescence_order(&dependency_order)
+            .map_err(|_| DrainHalt::new("module-contour-ambiguous"))?;
+        record(
+            ShutdownPhase::ModulesQuiescedReverse,
+            format!("quiescence-order:{}", quiescence.join(">")),
+        )?;
+
+        // StoreStopLeaseZero: the store-stop request below is admitted only
+        // with no outstanding canonical-data lease.
+        if ShutdownDrainCoordinator::check_lease_zero(
+            self.canonical_store_claimed.load(Ordering::Acquire),
+        )
+        .is_err()
+        {
+            return Err(DrainHalt::with_pending(
+                "canonical-data-lease-outstanding",
+                vec!["canonical-store-lease".to_owned()],
+            ));
+        }
+        #[cfg(windows)]
+        let store_evidence = match self.canonical_store_gateway.lock() {
+            Ok(gateway) => match gateway.as_ref() {
+                Some(gateway) if gateway.is_fenced() => "store-gateway-fenced",
+                Some(_) => "store-gateway-attached-unclaimed",
+                None => "store-gateway-absent",
+            },
+            Err(_) => return Err(DrainHalt::new("store-gateway-unavailable")),
+        };
+        #[cfg(not(windows))]
+        let store_evidence = "store-gateway-absent";
+        record(
+            ShutdownPhase::StoreStopLeaseZero,
+            format!("canonical-leases-zero;{store_evidence}"),
+        )?;
+
+        // DrainCommit linearization point.
+        let authority_epochs_fenced = match self.front_door_policy.lock() {
+            Ok(policy) => {
+                let fence = &policy.module_generation.state_fence;
+                vec![format!(
+                    "{}:{}@{}",
+                    fence.authority_epoch.lineage_id,
+                    fence.authority_epoch.sequence,
+                    fence.resource_generation.value()
+                )]
+            }
+            Err(_) => return Err(DrainHalt::new("authority-fence-unavailable")),
+        };
+        let decision = DrainCommitDecision {
+            generation: generation.clone(),
+            lease_and_pending_snapshot: Vec::new(),
+            authority_epochs_fenced,
+            branches_to_stop: quiescence,
+            wake_disposition: DrainWakeDisposition::QueueNextGeneration,
+            irreversible_stage: "authority-fenced".to_owned(),
+            recovery_owner: "kernel-composition".to_owned(),
+        };
+        coordinator.commit_drain(decision.clone()).map_err(|_| {
+            DrainHalt::with_pending("drain-commit-rejected", coordinator.pending_receipts())
+        })?;
+
+        // Service stop follows linearization; a committed drain without a
+        // clean stop is incomplete recovery state, never a silent success.
+        if self.apply_control(KernelControlCommand::Stop).is_err() {
+            return Err(DrainHalt::with_pending(
+                "service-stop-rejected",
+                coordinator.pending_receipts(),
+            ));
+        }
+
+        // Post-linearization revocation: no further control or cutover
+        // authority is admitted through the poisoned generation gateway.
+        match self.generation_poison.lock() {
+            Ok(mut poison) => {
+                *poison = Some(format!("shutdown-drain:{generation}"));
+            }
+            Err(_) => return Err(DrainHalt::new("authority-revoke-failed")),
+        }
+        record(
+            ShutdownPhase::IntentionalPublished,
+            format!("generation-poisoned;service-stopped;drain-commit-linearized:{generation}"),
+        )?;
+        Ok(decision)
+    }
+
+    /// Lists pending canonical-write receipts (ORS store-rebind rows) as
+    /// drain-gate identities. Read-only: shutdown never mutates staged rows.
+    fn pending_rebind_receipts(&self) -> Result<Vec<String>, String> {
+        let records = self
+            .generation_gateway
+            .ors
+            .load_all_store_rebinds()
+            .map_err(|_| "ors-rebind-scan-failed".to_owned())?;
+        Ok(records
+            .iter()
+            .filter(|record| record.state == eliot_ors::StoreRebindReplayState::Pending)
+            .map(|record| format!("store-rebind:{}", record.operation_id.as_str()))
+            .collect())
     }
 }
 
@@ -2324,6 +3154,10 @@ const _: () = {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/local_read_claim.rs"]
+mod local_read_claim_tests;
 
 // Store implementation E2E belongs to the Store/Host boundary. Kernel tests
 // exercise only the neutral descriptor and route/fence behavior.

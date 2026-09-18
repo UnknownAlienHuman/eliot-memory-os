@@ -10,7 +10,7 @@ use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use redb::{
     Database, ReadOnlyDatabase, ReadableDatabase, ReadableTable, TableDefinition, TableHandle,
@@ -44,6 +44,116 @@ const PUBLICATION_JOURNAL_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("source_bundle_publication_journal_v1");
 const TRANSACTION_TEMP_CREATE_ATTEMPTS: usize = 16;
 static NEXT_TRANSACTION_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Bounded file-lock contention retry for the installation-registry redb file
+/// (standing s37 + issue #1339, reader report).
+///
+/// A13.9 ("No transaction, exclusive owner, or global lock may be held during
+/// unbounded wait",
+/// `docs/architecture/A13-09-concurrency-and-durable-execution.md:14`)
+/// requires every registry handle to stay short-lived: one bounded read or one
+/// bounded write, never held across polling or waits. The installer already
+/// drops its writer before the SCM start + convergence wait
+/// (`bins/eliot/src/main.rs:2228`); terminal reconcile re-opens short-lived
+/// handles via `open_existing_at` (`bins/eliot/src/main.rs:2416`) while the
+/// Watchdog polls via `inspect_existing_at` on a 250ms/2s cadence.
+///
+/// redb 4.1.0 takes an exclusive OS file lock for `Database::create`/`open`
+/// and a shared lock for `ReadOnlyDatabase::open` (`src/db.rs:362,1212-1216`),
+/// so a short-lived writer and a polling reader on the same file transiently
+/// fail with `DatabaseError::DatabaseAlreadyOpen` ("Database already open.
+/// Cannot acquire lock.", `src/error.rs:208,257`). That contention is
+/// transient, not fatal: the sole-owner contract
+/// (`installation_registry.rs:6-13`) keeps both sides short-lived, so a
+/// bounded retry converges without holding any lock across an unbounded wait.
+///
+/// Only `DatabaseAlreadyOpen` is retried; every other error (fence/approval
+/// validation, corruption, IO) returns immediately with its cause preserved
+/// via `error.to_string()`. Fence and approval validation below are unchanged.
+pub(crate) const REGISTRY_READ_OPEN_ATTEMPTS: u32 = 8;
+pub(crate) const REGISTRY_READ_OPEN_INITIAL_BACKOFF: Duration = Duration::from_millis(25);
+pub(crate) const REGISTRY_READ_OPEN_MAX_BACKOFF: Duration = Duration::from_millis(250);
+pub(crate) const REGISTRY_WRITE_OPEN_ATTEMPTS: u32 = 10;
+pub(crate) const REGISTRY_WRITE_OPEN_INITIAL_BACKOFF: Duration = Duration::from_millis(50);
+pub(crate) const REGISTRY_WRITE_OPEN_MAX_BACKOFF: Duration = Duration::from_millis(500);
+
+/// Typed contention probe: only `DatabaseAlreadyOpen` is transient. Any other
+/// `DatabaseError` (corruption, upgrade, IO, transaction-in-progress) fails
+/// closed immediately so genuine faults are never masked as contention.
+pub(crate) fn is_registry_open_contended(error: &redb::DatabaseError) -> bool {
+    matches!(error, redb::DatabaseError::DatabaseAlreadyOpen)
+}
+
+/// Retries one redb open only on `DatabaseAlreadyOpen` with doubling backoff.
+/// The sleep total is bounded by construction (`attempts - 1` sleeps, each at
+/// most `max_backoff`): reads sleep at most 7 x 250ms (documented schedule
+/// 25+50+100+200+250+250+250 = 1125ms < 2s budget); writes sleep at most
+/// 9 x 500ms (documented schedule 50+100+200+400+500x5 = 3250ms < 5s budget).
+/// No lock is held here: each attempt opens and either returns the handle or
+/// drops the failure before sleeping.
+pub(crate) fn retry_registry_open_on_already_open<T>(
+    attempts: u32,
+    initial_backoff: Duration,
+    max_backoff: Duration,
+    mut open: impl FnMut() -> Result<T, redb::DatabaseError>,
+) -> Result<T, redb::DatabaseError> {
+    let mut backoff = initial_backoff;
+    let mut attempt: u32 = 1;
+    loop {
+        match open() {
+            Ok(value) => return Ok(value),
+            Err(error) if is_registry_open_contended(&error) && attempt < attempts => {
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(max_backoff);
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Opens (or creates) the registry writer file with bounded AlreadyOpen
+/// retry. This is the `open_at` (`Database::create`) primitive.
+pub(crate) fn open_registry_writer_create_with_retry(
+    path: &Path,
+) -> Result<Database, super::InstallationError> {
+    retry_registry_open_on_already_open(
+        REGISTRY_WRITE_OPEN_ATTEMPTS,
+        REGISTRY_WRITE_OPEN_INITIAL_BACKOFF,
+        REGISTRY_WRITE_OPEN_MAX_BACKOFF,
+        || Database::create(path),
+    )
+    .map_err(|error| super::InstallationError::Platform(error.to_string()))
+}
+
+/// Opens the existing registry writer file with bounded AlreadyOpen retry.
+/// This is the `open_existing_at` (`Database::open`) primitive.
+pub(crate) fn open_registry_writer_with_retry(
+    path: &Path,
+) -> Result<Database, super::InstallationError> {
+    retry_registry_open_on_already_open(
+        REGISTRY_WRITE_OPEN_ATTEMPTS,
+        REGISTRY_WRITE_OPEN_INITIAL_BACKOFF,
+        REGISTRY_WRITE_OPEN_MAX_BACKOFF,
+        || Database::open(path),
+    )
+    .map_err(|error| super::InstallationError::Platform(error.to_string()))
+}
+
+/// Opens the registry read-only file with bounded AlreadyOpen retry. This is
+/// the `inspect_existing`/`inspect_existing_at` (`ReadOnlyDatabase::open`)
+/// primitive.
+pub(crate) fn open_registry_reader_with_retry(
+    path: &Path,
+) -> Result<ReadOnlyDatabase, super::InstallationError> {
+    retry_registry_open_on_already_open(
+        REGISTRY_READ_OPEN_ATTEMPTS,
+        REGISTRY_READ_OPEN_INITIAL_BACKOFF,
+        REGISTRY_READ_OPEN_MAX_BACKOFF,
+        || ReadOnlyDatabase::open(path),
+    )
+    .map_err(|error| super::InstallationError::Platform(error.to_string()))
+}
 
 /// Typed durable state of one source-bundle directory publication.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -87,8 +197,10 @@ impl super::RedbInstallationRegistry {
         path_lease
             .verify_path_identity()
             .map_err(|error| super::InstallationError::Platform(error.to_string()))?;
-        let database = ReadOnlyDatabase::open(path_lease.path())
-            .map_err(|error| super::InstallationError::Platform(error.to_string()))?;
+        // A13.9 short-lived read: bounded AlreadyOpen retry only; the open
+        // handle is dropped (not held) across the backoff sleeps, and any
+        // non-contention error returns immediately with its cause preserved.
+        let database = open_registry_reader_with_retry(path_lease.path())?;
         path_lease
             .verify_path_identity()
             .map_err(|error| super::InstallationError::Platform(error.to_string()))?;
@@ -149,8 +261,11 @@ impl super::RedbInstallationRegistry {
         }
         file.verify_path_identity()
             .map_err(|error| super::InstallationError::Platform(error.to_string()))?;
-        let database = ReadOnlyDatabase::open(file.path())
-            .map_err(|error| super::InstallationError::Platform(error.to_string()))?;
+        // A13.9 short-lived Watchdog poll read: bounded AlreadyOpen retry
+        // only (sole-owner contract, installation_registry.rs:6-13); the open
+        // handle is never held across a wait, and non-contention errors
+        // return immediately with their cause preserved.
+        let database = open_registry_reader_with_retry(file.path())?;
         file.verify_path_identity()
             .map_err(|error| super::InstallationError::Platform(error.to_string()))?;
         read_existing_registry(&database).map(Some)
@@ -389,7 +504,7 @@ pub struct SourceBundlePublicationJournal {
     pub generation: PlatformHandle,
     /// Canonical package manifest digest.
     pub manifest_digest: PlatformHandle,
-    /// Complete nine-role artifact evidence digest.
+    /// Complete twelve-role artifact evidence digest.
     pub evidence_digest: PlatformHandle,
     /// Digest of the complete typed precommit role inventory.
     pub precommit_digest: PlatformHandle,
@@ -418,7 +533,7 @@ pub struct SourceBundlePublicationJournal {
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceBundlePublicationRole {
-    /// Canonical nine-role relative path.
+    /// Canonical twelve-role relative path.
     pub relative_path: String,
     /// Whether this role is an executable PE.
     pub executable: bool,
@@ -1802,7 +1917,7 @@ fn validate_publication_journal(
     if journal.precommit_files.len() != SOURCE_BUNDLE_REQUIRED_ROLES.len() {
         return Err(InstallationError::InvalidField {
             field: "publication.precommit_files".to_owned(),
-            reason: "publication journal must retain the exact nine-role inventory".to_owned(),
+            reason: "publication journal must retain the exact twelve-role inventory".to_owned(),
         });
     }
     for (role, (expected_path, expected_executable)) in journal
@@ -2617,6 +2732,9 @@ mod tests {
             ("eliot-store-surreal.exe", true),
             ("surreal.exe", true),
             ("eliotd.exe", true),
+            ("eliot-doctor.exe", true),
+            ("eliot-testd.exe", true),
+            ("eliot-native-worker.exe", true),
             ("generation.json", false),
             ("eliotd-governor.json", false),
             ("eliotd.json", false),

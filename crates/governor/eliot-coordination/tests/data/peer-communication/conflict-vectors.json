@@ -1,0 +1,14 @@
+{
+  "conflict_id": "conflict-peer-1",
+  "conflict_type": "epistemic",
+  "scope": "tenant-concilium",
+  "task": "task-concilium-1",
+  "dimensions": ["evidence_difference", "terminology_difference"],
+  "majority_position": "position-adopt-delta",
+  "majority_author": "session-conc-1",
+  "majority_lineage": ["lineage-source-a"],
+  "minority_position": "position-hold-delta",
+  "minority_author": "session-conc-2",
+  "minority_lineage": ["lineage-source-b"],
+  "shared_lineage": ["lineage-source-a"]
+}

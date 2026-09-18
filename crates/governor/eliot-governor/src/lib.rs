@@ -33,14 +33,58 @@
 #![forbid(unsafe_code)]
 
 mod activation_outcome;
+mod canonical_projections;
 mod composition;
+mod context_inputs;
+mod cue_composition;
+mod epistemic_composition;
+pub use epistemic_composition::{GovernorEpistemicComposition, ObservedEpistemicProposal};
+pub use context_inputs::{
+    ContextInputsError, ContextReconstructionRequest, GovernorContextInputs, ROLE_AFFORDANCES,
+    ROLE_ATTENTION_CONFLICT, ROLE_CUE_ACTIVATION, ROLE_EPISTEMIC_POSITION, ROLE_EVIDENCE_ASSURANCE,
+    ROLE_NEGATIVE_MEMORY, ROLE_TASK_FRAME, RoleAcquisition, SevenRoleInputs,
+};
+pub use cue_composition::{
+    CueCacheKey, CueCompositionError, CueReconstruction, CueReconstructionCache,
+    MAX_CACHED_CUE_RECONSTRUCTIONS, evidence_projection_payload, reconstruct_cue_snapshot,
+};
+mod controlboard_projection;
+mod observation_reconciliation;
+mod operator_reconciliation;
+mod owner_projection_refresh;
+mod skill_lifecycle;
+mod task_lifecycle;
 
 pub use activation_outcome::*;
+pub use canonical_projections::{
+    GOVERNOR_PROJECTIONS_SCHEMA_VERSION, GovernorAffordanceProjection,
+    GovernorContinuityProjection, GovernorProjectionError, GovernorProjectionSet,
+    GovernorSafetyProjection, GovernorTaskProjection, ProjectionOmission,
+    compose_canonical_projections,
+};
 pub use composition::*;
+pub use controlboard_projection::{
+    ControlBoardGovernorSnapshot, ControlBoardOwnerBinding, ControlBoardProjectionError,
+};
+/// Canonical write envelope admitted by `commit_canonical`. Re-exported so
+/// the daemon composition root can name the exact envelope type without a
+/// second canonical dependency path.
+pub use eliot_canonical::CanonicalWriteEnvelope;
+pub use observation_reconciliation::{
+    GovernorObservationReconciliation, WatchdogAdmittedEntry, WatchdogEntryAdmission,
+    WatchdogEntryKind,
+};
+pub use operator_reconciliation::{GovernorOperatorReconciliation, operator_command_envelope};
+pub use skill_lifecycle::GovernorSkillLifecycle;
+/// Task lifecycle domain types re-exported so the daemon composition root
+/// can name the exact task-command types without a second task dependency
+/// path (same reason as the [`CanonicalWriteEnvelope`] re-export below).
+pub use eliot_task::{TaskCommand, TaskCommandContext, TaskProposal, TaskRecord};
+pub use task_lifecycle::{GovernorTaskLifecycle, TaskLifecycleError};
 
 use std::collections::BTreeMap;
 
-use eliot_contracts::{AuthorityEpoch, ResourceGeneration};
+use eliot_contracts::{EpochId, ResourceGeneration};
 use eliot_runtime_contracts::{HealthDimension, HealthVector, ServiceProcessState};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -203,7 +247,7 @@ impl QueueLimits {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GovernorConfig {
-    pub authority_epoch: AuthorityEpoch,
+    pub authority_epoch: EpochId,
     pub resource_generation: ResourceGeneration,
     pub queues: QueueLimits,
     pub background_pause_interactive_depth: usize,
@@ -231,7 +275,7 @@ pub struct ServiceObservation {
     pub state: ServiceProcessState,
     pub health: HealthVector,
     pub generation: ResourceGeneration,
-    pub authority_epoch: AuthorityEpoch,
+    pub authority_epoch: EpochId,
 }
 
 impl ServiceObservation {
@@ -239,7 +283,10 @@ impl ServiceObservation {
         if self.generation != config.resource_generation {
             return Err(GovernorError::GenerationMismatch);
         }
-        if self.authority_epoch != config.authority_epoch {
+        if !self
+            .authority_epoch
+            .is_same_authority(&config.authority_epoch)
+        {
             return Err(GovernorError::AuthorityEpochMismatch);
         }
         Ok(())

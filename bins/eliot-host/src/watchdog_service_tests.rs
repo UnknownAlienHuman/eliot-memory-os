@@ -184,7 +184,18 @@ fn approved_registration_fixture(
         bootstrap,
     )?;
     let service_control_grant = match role {
-        InstallerServiceRole::Host => None,
+        InstallerServiceRole::Host => {
+            let principal_sid = "S-1-5-80-9-8-7-6-5";
+            Some(serde_json::json!({
+                "principal_service": ELIOT_HOST_SERVICE_NAME,
+                "principal_sid": principal_sid,
+                "access_mask": eliot_platform_windows::ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK,
+                "security_descriptor_digest":
+                    eliot_platform_windows::host_service_security_descriptor_digest(
+                        principal_sid,
+                    )?,
+            }))
+        }
         InstallerServiceRole::Watchdog => {
             let principal_sid = "S-1-5-80-1-2-3-4-5";
             Some(serde_json::json!({

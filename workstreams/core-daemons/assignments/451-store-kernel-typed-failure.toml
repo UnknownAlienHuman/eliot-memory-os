@@ -1,0 +1,109 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_AGENT_HANDOFF"
+status = "READY_FOR_IMPLEMENTATION"
+implementation_support = "PARTIAL"
+evidence_execution_status = "NOT_EXECUTED"
+proof_ceiling = "STORE_KERNEL_CONTRACT_EDGE_CANDIDATE"
+parent_issue = 76
+handoff_issue = 451
+issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/451"
+integration_issue_refs = [19, 15, 18, 11]
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "storage.store-failure-live-edge"
+causal_property = "Every live Store failure crosses EBP as a validated typed StoreFailure and retains exact request/operation identity, mutation certainty, retry rule and recovery directive through the Kernel consumer."
+old_path_discriminator = "The Store producer now emits Response::Failure for normal mapped errors, but its encoder-failure fallback still emits Response::Error; Kernel execute_raw still handles Error and Unknown strings, does not consume Failure, and reduces unknown outcomes to StoreError::Unavailable."
+result = "bounded source candidate; no runtime or Product claim"
+
+[documentation]
+architecture_contract = "docs/ARCHITECTURE_CONTRACT.md"
+implementation_sections = [
+  "docs/architecture/I02-06-error-and-crash-model.md#i26-error-and-crash-model",
+  "docs/architecture/I05-19-write-submission-execution-and-receipts.md#i519-write-submission-execution-and-receipts",
+  "docs/architecture/I06-13-zero-archaeology-error-contract.md#i613-zero-archaeology-error-contract",
+  "docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
+]
+decision_anchors = ["ARCH-SEC-02", "ARCH-OBS-01", "ARCH-RES-04", "ARCH-ORD-01", "ARCH-MOD-03"]
+
+[current_source]
+producer_path = "bins/eliot-store-surreal/src/request_dispatch.rs"
+producer_blob = "253b93cd3d165f09f410cacbc2a1f05c2110074c"
+consumer_path = "crates/kernel/eliot-kernel-service/src/store_exchange.rs"
+consumer_blob = "1b08e0bcbc124fb14689161930896e0fbc53a2e8"
+confirmed_facts = [
+  "map_store_error and map_composition_error already build StoreResponse::Failure for ordinary Store errors and provider unknown outcomes.",
+  "Failure encoding errors still fall back to legacy Response::Error with prose.",
+  "Kernel execute_raw validates the response but matches only StoreResponse::Error and StoreResponse::Unknown.",
+  "A valid StoreResponse::Failure therefore passes through as an ordinary success-shaped response and is misclassified by operation-specific callers.",
+  "RequestFailure::into_store_error discards unknown-outcome detail and returns StoreError::Unavailable.",
+]
+
+[mutable_scope]
+primary = [
+  "bins/eliot-store-surreal/src/request_dispatch.rs",
+  "crates/kernel/eliot-kernel-service/src/store_exchange.rs",
+]
+focused_tests = [
+  "bins/eliot-store-surreal/src/** directly relevant unit tests",
+  "crates/kernel/eliot-kernel-service/src/** directly relevant unit tests",
+  "bounded new cross-package fixtures only when an existing test target cannot exercise the real codec",
+]
+read_only_contracts = [
+  "crates/storage/eliot-store-api/src/store_failure.rs",
+  "crates/storage/eliot-store-api/src/wire.rs",
+]
+forbidden = [
+  "SurrealDB provider types on the public wire",
+  "PreparedTransition semantics",
+  "canonical write ownership",
+  "Host recovery durability",
+  "workflow triggers",
+  "unrelated Store or Kernel refactors",
+]
+
+[required_change]
+steps = [
+  "Replace the producer's Response::Error fallback with a bounded typed INTERNAL_DEFECT failure or an explicit transport-level contract failure; current Store dispatch must never emit the legacy error variant.",
+  "Add a Kernel-side typed failure carrier that retains StoreFailure without parsing or flattening human_detail.",
+  "Match StoreResponse::Failure immediately after response validation and verify request ID, operation ID, StateFence and all cross-field invariants against the admitted call.",
+  "For deterministic failures, preserve the stable disposition, reason, mutation disposition, retry directive and recovery action through operation-specific callers.",
+  "For UNKNOWN_OUTCOME, require the exact admitted operation identity and expose reconciliation of that operation only; never blind-retry or convert it to ordinary unavailable.",
+  "Treat malformed or identity-mismatched typed failures as protocol defects; when a write may have crossed the effect boundary, retain UNKNOWN outcome rather than claiming non-application.",
+  "Confine legacy StoreResponse::Error decoding to an explicit v1 compatibility boundary; current producer code and current v2 session must not use it.",
+  "Keep human_detail bounded and non-authoritative; changing wording must not change control behavior.",
+]
+
+[acceptance]
+criteria = [
+  "Current eliot-store-surreal dispatch emits no StoreResponse::Error and no string-shaped Unknown for any supported operation.",
+  "Kernel consumes a valid StoreResponse::Failure and preserves all machine-control fields without prose parsing.",
+  "A failure carrying the wrong request ID, operation ID or StateFence is rejected and never adopted as another call's outcome.",
+  "UNKNOWN_OUTCOME without the exact operation identity is rejected; operation B can never reconcile operation A.",
+  "Deterministic validation/conflict/unavailable/migration/internal-defect cases remain distinguishable at the Kernel boundary.",
+  "Changing only human_detail leaves equality, digest and selected recovery behavior unchanged.",
+  "Successful receipts keep their existing exact-operation reconciliation requirements.",
+  "No provider SDK/type, semantic admission rule, direct Store bypass or Product support claim is introduced.",
+]
+negative_cases = [
+  "malformed StoreFailure",
+  "wrong request identity",
+  "wrong operation identity",
+  "unknown outcome with missing operation identity",
+  "legacy Error received on a current v2 session",
+  "same machine fields with different human_detail",
+  "failure encoder contract violation",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-store-api -p eliot-store-surreal -p eliot-kernel-service --all-targets",
+  "cargo test --locked -p eliot-store-api -p eliot-store-surreal -p eliot-kernel-service --all-targets",
+  "cargo clippy --locked -p eliot-store-api -p eliot-store-surreal -p eliot-kernel-service --all-targets -- -D warnings",
+  "git diff --check",
+]
+edge_proof = "Run one real EBP producer/consumer profile with deterministic conflict, unavailable and unknown-outcome injections after package proof."
+product_pulse = "Owned by issue #11; not established by this work unit."

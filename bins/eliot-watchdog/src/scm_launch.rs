@@ -5,6 +5,10 @@
 //!
 //! Watchdog is an independent failure domain. SCM bootstrap validates approved
 //! identity and never becomes a semantic oracle.
+//!
+//! Concurrent-reader diagnosis: `ApprovalUnavailable` carries the bounded
+//! installer-registry cause (host-root open, registry open, approval binding)
+//! so the start-failure capsule names the gap instead of erasing it.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -34,10 +38,29 @@ pub enum WatchdogScmLaunchError {
     PlatformRoot(String),
     #[error("Watchdog SCM registration is not an exact read-only runtime match: {0:?}")]
     Registration(WatchdogRuntimeReadback),
-    #[error("Watchdog SCM installer approval is unavailable or invalid")]
-    ApprovalUnavailable,
+    #[error("Watchdog SCM installer approval is unavailable or invalid: {0}")]
+    ApprovalUnavailable(String),
     #[error("Watchdog SCM bootstrap does not match the installer-approved registration")]
     ApprovalMismatch,
+}
+
+/// Per-field ceiling for the approval-unavailable cause carried into the
+/// start-failure capsule detail. Mirrors the capsule detail bound so the typed
+/// class stays stable while the cause survives truncation secret-free.
+pub(crate) const APPROVAL_DETAIL_MAX_CHARS: usize = 512;
+
+fn truncate_approval_detail(value: &str) -> String {
+    if value.chars().count() > APPROVAL_DETAIL_MAX_CHARS {
+        value.chars().take(APPROVAL_DETAIL_MAX_CHARS).collect()
+    } else {
+        value.to_owned()
+    }
+}
+
+impl From<SpoolError> for WatchdogScmLaunchError {
+    fn from(error: SpoolError) -> Self {
+        Self::ApprovalUnavailable(truncate_approval_detail(&error.to_string()))
+    }
 }
 
 /// Exact, read-only launch evidence accepted from the Windows Service Control
@@ -87,8 +110,8 @@ impl ApprovedHostRegistration {
                 "installer SCM approval is not a Host registration".to_owned(),
             ));
         }
-        let request = approval.service_registration_request().map_err(|_| {
-            SpoolError::InvalidLease("installer Host SCM approval is invalid".to_owned())
+        let request = approval.service_registration_request().map_err(|error| {
+            SpoolError::InvalidLease(format!("installer Host SCM approval is invalid: {error}"))
         })?;
         if request.service_name() != eliot_platform_windows::ELIOT_HOST_SERVICE_NAME {
             return Err(SpoolError::InvalidLease(
@@ -223,6 +246,12 @@ where
     I: IntoIterator<Item = S>,
     S: Into<OsString>,
 {
+    let _span = tracing::debug_span!("watchdog.parse_process_argv").entered();
+    tracing::debug!(
+        event = "watchdog.process_argv_parse_attempted",
+        observation = "attempted",
+        "parsing watchdog process argv"
+    );
     let mut full = vec![OsString::from(SERVICE_NAME)];
     full.extend(args.into_iter().map(Into::into));
     parse_watchdog_scm_argv(full)
@@ -241,6 +270,12 @@ where
     I: IntoIterator<Item = S>,
     S: Into<OsString>,
 {
+    let _span = tracing::debug_span!("watchdog.validate_service_main_argv").entered();
+    tracing::debug!(
+        event = "watchdog.service_main_argv_attempted",
+        observation = "attempted",
+        "validating ServiceMain argv"
+    );
     let args = args.into_iter().map(Into::into).collect::<Vec<_>>();
     if args.len() == 1 && args[0].to_str() == Some(SERVICE_NAME) {
         Ok(())
@@ -266,6 +301,12 @@ where
     I: IntoIterator<Item = S>,
     S: Into<OsString>,
 {
+    let _span = tracing::debug_span!("watchdog.scm_launch_validation").entered();
+    tracing::debug!(
+        event = "watchdog.scm_launch_attempted",
+        observation = "attempted",
+        "validating SCM launch registration"
+    );
     let bootstrap = parse_watchdog_scm_argv(args)?;
     validate_watchdog_scm_bootstrap(&bootstrap)
 }
@@ -282,30 +323,82 @@ where
 pub fn validate_watchdog_scm_bootstrap(
     bootstrap: &ServiceBootstrapArguments,
 ) -> Result<ValidatedWatchdogScmLaunch, WatchdogScmLaunchError> {
+    let _span = tracing::debug_span!("watchdog.scm_bootstrap_validation").entered();
+    tracing::debug!(
+        event = "watchdog.scm_bootstrap_attempted",
+        observation = "attempted",
+        "validating SCM bootstrap against installer approval"
+    );
+    crate::diagnostics::observe_service_registration(
+        crate::diagnostics::ServiceRegistrationObservation::Requested,
+        "scm bootstrap validation requested",
+    );
     let (_, _, registration) =
-        read_approved_service_registration(bootstrap, InstallerServiceRole::Watchdog)
-            .map_err(|_| WatchdogScmLaunchError::ApprovalUnavailable)?;
-    let executable = std::env::current_exe().map_err(WatchdogScmLaunchError::Executable)?;
+        read_approved_service_registration(bootstrap, InstallerServiceRole::Watchdog).map_err(
+            |error| {
+                crate::diagnostics::observe_service_registration(
+                    crate::diagnostics::ServiceRegistrationObservation::Unknown,
+                    "scm approval readback unknown",
+                );
+                WatchdogScmLaunchError::from(error)
+            },
+        )?;
+    let executable = std::env::current_exe().map_err(|error| {
+        crate::diagnostics::observe_service_registration(
+            crate::diagnostics::ServiceRegistrationObservation::Unknown,
+            "current executable unavailable",
+        );
+        WatchdogScmLaunchError::Executable(error)
+    })?;
     if registration.service_name() != SERVICE_NAME
         || registration.bootstrap() != Some(bootstrap)
         || !windows_paths_equal(registration.binary_path(), &executable)
     {
+        crate::diagnostics::observe_service_registration(
+            crate::diagnostics::ServiceRegistrationObservation::Mismatched,
+            "scm bootstrap mismatched",
+        );
         return Err(WatchdogScmLaunchError::ApprovalMismatch);
     }
     let root = executable.parent().ok_or_else(|| {
+        crate::diagnostics::observe_service_registration(
+            crate::diagnostics::ServiceRegistrationObservation::Unknown,
+            "executable parent unknown",
+        );
         WatchdogScmLaunchError::InvalidArgv("current executable has no parent".to_owned())
     })?;
-    let platform = WindowsPlatform::new(root.to_path_buf())
-        .map_err(|error| WatchdogScmLaunchError::PlatformRoot(error.to_string()))?;
+    let platform = WindowsPlatform::new(root.to_path_buf()).map_err(|error| {
+        crate::diagnostics::observe_service_registration(
+            crate::diagnostics::ServiceRegistrationObservation::Unknown,
+            "platform root unknown",
+        );
+        WatchdogScmLaunchError::PlatformRoot(error.to_string())
+    })?;
     let inspection = project_service_runtime_inspection(
         platform.inspect_service_registration_runtime(&registration),
     );
-    if matches!(
-        inspection,
-        WatchdogRuntimeReadback::Absent | WatchdogRuntimeReadback::Mismatched
-    ) {
+    // SCM acknowledgement is never readiness evidence: the readback is
+    // recorded verbatim (`starting`/`unknown` stay non-ready) and only
+    // `Absent`/`Mismatched` fail closed here. No new readiness is invented.
+    crate::diagnostics::observe_scm_inspection(&inspection, "scm launch inspection read");
+    if matches!(inspection, WatchdogRuntimeReadback::Absent) {
+        crate::diagnostics::observe_service_registration(
+            crate::diagnostics::ServiceRegistrationObservation::Absent,
+            "scm registration absent",
+        );
         return Err(WatchdogScmLaunchError::Registration(inspection));
     }
+    if matches!(inspection, WatchdogRuntimeReadback::Mismatched) {
+        crate::diagnostics::observe_service_registration(
+            crate::diagnostics::ServiceRegistrationObservation::Mismatched,
+            "scm registration mismatched",
+        );
+        return Err(WatchdogScmLaunchError::Registration(inspection));
+    }
+    crate::diagnostics::observe_service_registration(
+        crate::diagnostics::ServiceRegistrationObservation::Observed,
+        "scm bootstrap observed",
+    );
     Ok(ValidatedWatchdogScmLaunch {
         bootstrap: bootstrap.clone(),
         registration,

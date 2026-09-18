@@ -521,6 +521,10 @@ impl EpistemicPositionCandidate {
             validate_bounded_text(rival.as_str(), "candidate.rivals", MAX_SHORT_TEXT)?;
         }
         // Open assertability treats coverage as incomplete.
+        // Boundary projection (I12.5): the seven closed levels project onto the three
+        // architecture values via `PositionAssertability::arch_assertability`
+        // (assertable / non-assertable-unverified / abstain-or-fence). Read-only at
+        // closure; ceilings stay seven-valued.
         PositionAssertability::check_closed(
             self.proposed_assertability,
             (&self.grade, self.authority),
@@ -571,6 +575,9 @@ impl EpistemicPositionCandidate {
         if let Some(verifier) = &self.verifier {
             verifier.validate_for(self.digest.as_str())?;
         }
+        // Boundary projection (I12.5): the closed seven-valued ceiling projects onto
+        // the three architecture values via `PositionAssertability::arch_assertability`.
+        // Read-only at closure; this check keeps enforcing the seven-valued ceilings.
         PositionAssertability::check_closed(
             self.proposed_assertability,
             (&self.grade, self.authority),

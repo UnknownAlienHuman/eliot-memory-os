@@ -10,6 +10,13 @@ use crate::{
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
+const LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+const LINEAGE_B: &str = "550e8400-e29b-41d4-a716-446655440001";
+
+fn epoch(lineage: &str, sequence: u64) -> serde_json::Value {
+    serde_json::json!({"lineage_id": lineage, "sequence": sequence})
+}
+
 fn binding() -> TestResult<ProcessExecutionBinding> {
     Ok(serde_json::from_value(serde_json::json!({
         "operation_id": "operation-1",
@@ -20,8 +27,12 @@ fn binding() -> TestResult<ProcessExecutionBinding> {
         "generation": 3,
         "action_lease_ref": "lease-1",
         "authority_id": "authority-1",
-        "authority_epoch": 7,
-        "state_fence": {"authority_epoch": 7, "generation": 3, "nonce": "fence-1"},
+        "authority_epoch": epoch(LINEAGE_A, 7),
+        "state_fence": {
+            "authority_epoch": epoch(LINEAGE_A, 7),
+            "generation": 3,
+            "nonce": "fence-1"
+        },
         "request_digest": "a".repeat(64),
         "permit_digest": "b".repeat(64),
         "effect_digest": "c".repeat(64),
@@ -1334,7 +1345,10 @@ fn terminal_identity_is_idempotent_and_unknown_readback_is_write_fenced() -> Tes
 fn binding_stream_policy_source_and_evidence_authority_mismatches_reject() -> TestResult {
     let session = session("one")?;
     let mut other = serde_json::to_value(binding()?)?;
-    other["authority_epoch"] = serde_json::json!(8);
+    // Same sequence in another lineage is unrelated authority: the binding
+    // still deserializes, but stream evidence bound to it must fail closed
+    // against the lineage-A session binding.
+    other["authority_epoch"] = epoch(LINEAGE_B, 7);
     let other_binding: ProcessExecutionBinding = serde_json::from_value(other)?;
     let evidence = ProcessStreamEvidence::new_raw(
         other_binding,

@@ -8,6 +8,7 @@
 use std::time::Duration;
 use std::{cmp::Ordering, future::Future};
 
+use eliot_contracts::EpochId;
 use eliot_protocol::{
     AgentBridgeClientDeclaration, AgentBridgePeerAdmissionReceipt, AgentBridgePeerChallenge,
     ClientHello, EncodingProfile, Frame, FrameKind, MessageType, ProtocolError, ProtocolPayload,
@@ -980,7 +981,7 @@ pub struct Session {
     pub protocol_version: ProtocolVersion,
     pub peer: PeerIdentity,
     /// Authority epoch captured by the handshake; reconnects must bind anew.
-    pub authority_epoch: u64,
+    pub authority_epoch: EpochId,
     /// Complete immutable generation, artifact and Kernel fence captured by the handshake.
     pub module_generation: ModuleGeneration,
     pub launch_nonce: String,
@@ -1017,7 +1018,7 @@ impl Session {
             connection_id,
             protocol_version: ProtocolVersion::CURRENT,
             peer,
-            authority_epoch: module_generation.state_fence.authority_epoch.value(),
+            authority_epoch: module_generation.state_fence.authority_epoch.clone(),
             module_generation,
             launch_nonce: session_nonce,
             capabilities: Vec::new(),
@@ -1045,7 +1046,7 @@ impl Session {
             connection_id,
             protocol_version,
             peer,
-            authority_epoch: client.authority_epoch.value(),
+            authority_epoch: client.authority_epoch.clone(),
             module_generation: client.module_generation.clone(),
             launch_nonce: client.launch_nonce.clone(),
             capabilities: client.capabilities.clone(),
@@ -1070,7 +1071,9 @@ impl Session {
             || client.module_generation.module_id.as_str() != server.module_id
             || client.module_generation != server.module_generation
             || client.artifact_hash != server.module_generation.artifact_id
-            || client.authority_epoch != server.module_generation.state_fence.authority_epoch
+            || !client
+                .authority_epoch
+                .is_same_authority(&server.module_generation.state_fence.authority_epoch)
             || client.launch_nonce != server.launch_nonce
         {
             return Err(TransportError::SessionFenced);
@@ -1084,7 +1087,7 @@ impl Session {
             connection_id: connection_id.into(),
             protocol_version,
             peer,
-            authority_epoch: server.module_generation.state_fence.authority_epoch.value(),
+            authority_epoch: server.module_generation.state_fence.authority_epoch.clone(),
             module_generation: server.module_generation.clone(),
             launch_nonce: server.launch_nonce.clone(),
             capabilities: capabilities.clone(),
@@ -1102,7 +1105,7 @@ impl Session {
             heartbeat_ms: server.heartbeat_ms,
             control_channel: server.control_channel.clone(),
             rejection_reason: None,
-            authority_epoch: server.module_generation.state_fence.authority_epoch,
+            authority_epoch: server.module_generation.state_fence.authority_epoch.clone(),
         };
         server_hello.validate()?;
         Ok(HandshakeResult {
@@ -1131,16 +1134,18 @@ impl Session {
     }
 
     /// Returns whether a frame belongs to this still-live session fence.
-    pub fn accepts(&self, authority_epoch: u64, session_epoch: u64) -> bool {
+    pub fn accepts(&self, authority_epoch: &EpochId, session_epoch: u64) -> bool {
         self.state == SessionState::Open
-            && self.authority_epoch == authority_epoch
+            && self.authority_epoch.is_same_authority(authority_epoch)
             && self.session_epoch == session_epoch
     }
 
     /// Checks all generation/fence bindings, not only the numeric epoch.
     pub fn accepts_bound(&self, generation: &ModuleGeneration, launch_nonce: &str) -> bool {
         self.state == SessionState::Open
-            && self.authority_epoch == generation.state_fence.authority_epoch.value()
+            && self
+                .authority_epoch
+                .is_same_authority(&generation.state_fence.authority_epoch)
             && self.module_generation == *generation
             && self.launch_nonce == launch_nonce
     }
@@ -1329,7 +1334,15 @@ fn health_dimension_rank(dimension: HealthDimension) -> u8 {
 ///
 /// The lifecycle and health enums use their explicit contract declaration
 /// ranks. All identifier, counter and optional fence fields use their typed
-/// `Ord`; no wire serialization participates in this order.
+/// `Ord`; the lineage-aware authority epoch uses its canonical digest
+/// ordering (digest-only, no scalar `Ord` on `EpochId`); no wire
+/// serialization participates in this order.
+fn epoch_digest_key(epoch: &EpochId) -> String {
+    eliot_contracts::StateFence::canonical_epoch_digest(epoch)
+        .map(|digest| digest.to_string())
+        .unwrap_or_default()
+}
+
 fn compare_module_generation(left: &ModuleGeneration, right: &ModuleGeneration) -> Ordering {
     left.module_id
         .cmp(&right.module_id)
@@ -1363,9 +1376,8 @@ fn compare_module_generation(left: &ModuleGeneration, right: &ModuleGeneration) 
                 .cmp(&health_dimension_rank(right.health.capacity))
         })
         .then_with(|| {
-            left.state_fence
-                .authority_epoch
-                .cmp(&right.state_fence.authority_epoch)
+            epoch_digest_key(&left.state_fence.authority_epoch)
+                .cmp(&epoch_digest_key(&right.state_fence.authority_epoch))
         })
         .then_with(|| {
             left.state_fence
@@ -1650,6 +1662,46 @@ pub fn validate_pipe_name(name: &str) -> Result<(), TransportError> {
     Ok(())
 }
 
+/// Maximum UTF-16 code units (including the NUL terminator) accepted for a
+/// server DACL descriptor string. Production descriptors are under two hundred
+/// units; the bound only rejects corrupt or adversarial input before it can
+/// reach `ConvertStringSecurityDescriptorToSecurityDescriptorW`.
+#[cfg(windows)]
+const MAX_SDDL_UTF16_UNITS: usize = 4096;
+
+/// Encodes an SDDL string for
+/// `ConvertStringSecurityDescriptorToSecurityDescriptorW`.
+///
+/// Enforces the preconditions the raw API cannot: the string is non-empty,
+/// carries no interior NUL (which would silently truncate the DACL at the
+/// Win32 boundary and weaken the allow-list), and fits the bounded unit
+/// budget. The returned buffer is always NUL-terminated.
+#[cfg(windows)]
+fn encode_sddl_utf16(sddl: &str) -> Result<Vec<u16>, TransportError> {
+    use std::os::windows::ffi::OsStrExt;
+    if sddl.is_empty() {
+        return Err(TransportError::Io(
+            "pipe security descriptor is empty".to_owned(),
+        ));
+    }
+    if sddl.contains('\0') {
+        return Err(TransportError::Io(
+            "pipe security descriptor contains an interior NUL".to_owned(),
+        ));
+    }
+    let units = std::ffi::OsStr::new(sddl)
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    if units.len() > MAX_SDDL_UTF16_UNITS {
+        return Err(TransportError::Io(
+            "pipe security descriptor exceeds the bounded UTF-16 budget".to_owned(),
+        ));
+    }
+    debug_assert_eq!(units.last(), Some(&0_u16));
+    Ok(units)
+}
+
 /// Windows named-pipe adapter. The concrete pipe and Win32 handles are private.
 #[cfg(windows)]
 pub struct NamedPipeTransport {
@@ -1661,6 +1713,14 @@ const AUTHENTICATION_PREFACE: &[u8; 8] = b"ELIOT-P2";
 
 /// Private owner for the server's protected named-pipe DACL. Raw security
 /// attributes never cross the `eliot-ipc` public package boundary.
+///
+/// `Self` is the unique owner of the `LocalAlloc`'d descriptor: both
+/// constructors move a non-null converted descriptor in (freeing it on their
+/// own pre-construction error paths instead), `raw_attributes` only lends the
+/// adjacent `SECURITY_ATTRIBUTES` for the duration of one synchronous pipe
+/// creation call (the OS copies the DACL; ownership never transfers), and
+/// `Drop` frees exactly once. The type is neither `Copy` nor `Clone`, its
+/// fields are private, and the descriptor pointer itself is never exposed.
 #[cfg(windows)]
 struct PipeSecurityDescriptor {
     descriptor: windows_sys::Win32::Security::PSECURITY_DESCRIPTOR,
@@ -1672,14 +1732,20 @@ impl PipeSecurityDescriptor {
     fn for_principal(
         expectation: &eliot_platform_windows::NamedPipePeerExpectation,
     ) -> Result<Self, TransportError> {
-        use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
         let sddl = pipe_security_sddl(expectation);
-        let sddl = std::ffi::OsStr::new(&sddl)
-            .encode_wide()
-            .chain(Some(0))
-            .collect::<Vec<_>>();
+        // Reject empty, interior-NUL, and oversize descriptors before the raw
+        // conversion; the buffer below is always NUL-terminated.
+        let sddl = encode_sddl_utf16(&sddl)?;
         let mut descriptor = std::ptr::null_mut();
+        // SAFETY: `sddl` is a live, NUL-terminated UTF-16 buffer owned by this
+        // frame with no interior NUL, so `sddl.as_ptr()` is a valid LPCWSTR
+        // for the duration of the call. `descriptor` is a valid
+        // `*mut PSECURITY_DESCRIPTOR` out-pointer (`&raw mut` of a live
+        // local); on success the API transfers a `LocalAlloc`'d
+        // absolute-format descriptor whose ownership moves into `Self` below,
+        // and on failure (`0` return or null out-pointer) no allocation
+        // escapes, so there is nothing to free here.
         if unsafe {
             ConvertStringSecurityDescriptorToSecurityDescriptorW(
                 sddl.as_ptr(),
@@ -1694,9 +1760,16 @@ impl PipeSecurityDescriptor {
                 std::io::Error::last_os_error().to_string(),
             ));
         }
+        // Ownership has moved to this frame: `descriptor` is non-null and
+        // `LocalAlloc`'d. Every error path below frees it before returning,
+        // and the success path moves it into `Self`, whose `Drop` frees it
+        // exactly once (see `Drop`).
         let Ok(n_length) = u32::try_from(std::mem::size_of::<
             windows_sys::Win32::Security::SECURITY_ATTRIBUTES,
         >()) else {
+            // SAFETY: `descriptor` is a live `LocalAlloc` allocation owned by
+            // this frame that `Self` never took over on this path, so freeing
+            // it here is exactly-once and cannot double-free.
             unsafe { windows_sys::Win32::Foundation::LocalFree(descriptor.cast()) };
             return Err(TransportError::Io(
                 "SECURITY_ATTRIBUTES size is not representable".to_owned(),
@@ -1716,14 +1789,20 @@ impl PipeSecurityDescriptor {
     fn for_peer_set(
         peers: &eliot_platform_windows::NamedPipePeerSet,
     ) -> Result<Self, TransportError> {
-        use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
         let sddl = pipe_security_sddl_for_peer_set(peers);
-        let sddl = std::ffi::OsStr::new(&sddl)
-            .encode_wide()
-            .chain(Some(0))
-            .collect::<Vec<_>>();
+        // Reject empty, interior-NUL, and oversize descriptors before the raw
+        // conversion; the buffer below is always NUL-terminated.
+        let sddl = encode_sddl_utf16(&sddl)?;
         let mut descriptor = std::ptr::null_mut();
+        // SAFETY: `sddl` is a live, NUL-terminated UTF-16 buffer owned by this
+        // frame with no interior NUL, so `sddl.as_ptr()` is a valid LPCWSTR
+        // for the duration of the call. `descriptor` is a valid
+        // `*mut PSECURITY_DESCRIPTOR` out-pointer (`&raw mut` of a live
+        // local); on success the API transfers a `LocalAlloc`'d
+        // absolute-format descriptor whose ownership moves into `Self` below,
+        // and on failure (`0` return or null out-pointer) no allocation
+        // escapes, so there is nothing to free here.
         if unsafe {
             ConvertStringSecurityDescriptorToSecurityDescriptorW(
                 sddl.as_ptr(),
@@ -1738,9 +1817,16 @@ impl PipeSecurityDescriptor {
                 std::io::Error::last_os_error().to_string(),
             ));
         }
+        // Ownership has moved to this frame: `descriptor` is non-null and
+        // `LocalAlloc`'d. Every error path below frees it before returning,
+        // and the success path moves it into `Self`, whose `Drop` frees it
+        // exactly once (see `Drop`).
         let Ok(n_length) = u32::try_from(std::mem::size_of::<
             windows_sys::Win32::Security::SECURITY_ATTRIBUTES,
         >()) else {
+            // SAFETY: `descriptor` is a live `LocalAlloc` allocation owned by
+            // this frame that `Self` never took over on this path, so freeing
+            // it here is exactly-once and cannot double-free.
             unsafe { windows_sys::Win32::Foundation::LocalFree(descriptor.cast()) };
             return Err(TransportError::Io(
                 "SECURITY_ATTRIBUTES size is not representable".to_owned(),
@@ -1793,6 +1879,13 @@ fn pipe_security_sddl_for_peer_set(peers: &eliot_platform_windows::NamedPipePeer
 #[cfg(windows)]
 impl Drop for PipeSecurityDescriptor {
     fn drop(&mut self) {
+        // SAFETY: `self.descriptor` is the non-null `LocalAlloc` allocation
+        // moved in by the constructor, never duplicated or transferred (see
+        // the type docs), and `Drop` runs exactly once per owner, so this
+        // `LocalFree` is the single release of a live allocation. The
+        // pre-construction size-fail paths free their own descriptor and
+        // return before `Self` exists, so they can never double-free with this.
+        debug_assert!(!self.descriptor.is_null());
         unsafe { windows_sys::Win32::Foundation::LocalFree(self.descriptor.cast()) };
     }
 }
@@ -1848,8 +1941,17 @@ impl NamedPipeServer {
         first_pipe_instance: bool,
     ) -> Result<Self, TransportError> {
         use tokio::net::windows::named_pipe::ServerOptions;
+        // Invalid names are rejected before any raw call; the SAFETY proof
+        // below relies on `name` being a validated `\\.\pipe\eliot\...` path.
         validate_pipe_name(name)?;
         let mut security = PipeSecurityDescriptor::for_principal(expectation)?;
+        // SAFETY: `security.attributes` is a live, correctly aligned
+        // `SECURITY_ATTRIBUTES` owned by this frame (`security` outlives the
+        // call and drops after `inner`), so `raw_attributes()` yields a valid
+        // non-null `LPSECURITY_ATTRIBUTES` for the synchronous
+        // `create_with_security_attributes_raw` call only. The OS copies the
+        // DACL during creation and retains no pointer. This block contains no
+        // `.await`, and `name` was validated immediately above.
         let inner = unsafe {
             ServerOptions::new()
                 .first_pipe_instance(first_pipe_instance)
@@ -1872,8 +1974,17 @@ impl NamedPipeServer {
         first_pipe_instance: bool,
     ) -> Result<Self, TransportError> {
         use tokio::net::windows::named_pipe::ServerOptions;
+        // Invalid names are rejected before any raw call; the SAFETY proof
+        // below relies on `name` being a validated `\\.\pipe\eliot\...` path.
         validate_pipe_name(name)?;
         let mut security = PipeSecurityDescriptor::for_peer_set(peers)?;
+        // SAFETY: `security.attributes` is a live, correctly aligned
+        // `SECURITY_ATTRIBUTES` owned by this frame (`security` outlives the
+        // call and drops after `inner`), so `raw_attributes()` yields a valid
+        // non-null `LPSECURITY_ATTRIBUTES` for the synchronous
+        // `create_with_security_attributes_raw` call only. The OS copies the
+        // DACL during creation and retains no pointer. This block contains no
+        // `.await`, and `name` was validated immediately above.
         let inner = unsafe {
             ServerOptions::new()
                 .first_pipe_instance(first_pipe_instance)
@@ -1910,8 +2021,16 @@ impl NamedPipeServer {
         self.wait_for_client(timeout).await?;
         windows_transport::read_authentication_preface(&mut self.inner, timeout).await?;
         let raw = self.inner.as_raw_handle();
-        // SAFETY: `self.inner` owns the connected server handle and remains
-        // alive for the complete borrowed-handle authentication call.
+        // SAFETY: `raw` is the live connected server handle owned by
+        // `self.inner`, which is borrowed as `&mut self` for the whole
+        // function and therefore outlives `borrowed`. The borrow scope is
+        // strictly synchronous: both `.await`s (bounded connect, preface read)
+        // complete before the borrow is created, and `borrowed` is consumed
+        // only by the synchronous platform authentication call below, so no
+        // `.await` runs while borrowed. Nothing moves, closes, duplicates, or
+        // transfers the handle while borrowed. The preface is read before the
+        // borrow so authentication observes the connected client; peer failure
+        // still maps to `UnauthenticatedPeer` with no handle cleanup change.
         let borrowed = unsafe { BorrowedHandle::borrow_raw(raw) };
         let evidence =
             eliot_platform_windows::authenticate_named_pipe_client(borrowed, expectation)
@@ -1933,8 +2052,17 @@ impl NamedPipeServer {
         self.wait_for_client(timeout).await?;
         windows_transport::read_authentication_preface(&mut self.inner, timeout).await?;
         let raw = self.inner.as_raw_handle();
-        // SAFETY: `self.inner` owns the connected server handle and remains
-        // alive for the complete borrowed-handle authentication call.
+        // SAFETY: `raw` is the live connected server handle owned by
+        // `self.inner`, which is borrowed as `&mut self` for the whole
+        // function and therefore outlives `borrowed`. The borrow scope is
+        // strictly synchronous: both `.await`s (bounded connect, preface read)
+        // complete before the borrow is created, and `borrowed` is consumed
+        // only by the synchronous platform peer-set authentication call below,
+        // so no `.await` runs while borrowed. Nothing moves, closes,
+        // duplicates, or transfers the handle while borrowed. The preface is
+        // read before the borrow so authentication observes the connected
+        // client; zero or multiple role matches still fail closed with no
+        // handle cleanup change.
         let borrowed = unsafe { BorrowedHandle::borrow_raw(raw) };
         let (evidence, selection) =
             eliot_platform_windows::authenticate_named_pipe_client_with_peer_set(borrowed, peers)
@@ -2161,8 +2289,14 @@ mod windows_transport {
             expectation: &eliot_platform_windows::NamedPipePeerExpectation,
         ) -> Result<(), TransportError> {
             let raw = self.client.as_raw_handle();
-            // SAFETY: `self.client` owns this live handle for the duration of
-            // the platform adapter call and is not moved or closed here.
+            // SAFETY: `raw` is the live client handle owned by `self.client`,
+            // borrowed via `&mut self` for the whole call, so the owner
+            // outlives `borrowed`. This is a synchronous function, so no
+            // `.await` can interleave while borrowed, and the handle is not
+            // moved, closed, duplicated, or transferred while borrowed. The
+            // platform adapter only queries the handle for this call; server
+            // proof failure maps to `UnauthenticatedPeer` with no ownership
+            // change.
             let borrowed = unsafe { BorrowedHandle::borrow_raw(raw) };
             let evidence =
                 eliot_platform_windows::authenticate_named_pipe_server(borrowed, expectation)
@@ -2177,8 +2311,14 @@ mod windows_transport {
             peers: &eliot_platform_windows::NamedPipePeerSet,
         ) -> Result<eliot_platform_windows::NamedPipePeerSelection, TransportError> {
             let raw = self.client.as_raw_handle();
-            // SAFETY: `self.client` owns this live handle for the duration of
-            // the platform adapter call and is not moved or closed here.
+            // SAFETY: `raw` is the live client handle owned by `self.client`,
+            // borrowed via `&mut self` for the whole call, so the owner
+            // outlives `borrowed`. This is a synchronous function, so no
+            // `.await` can interleave while borrowed, and the handle is not
+            // moved, closed, duplicated, or transferred while borrowed. The
+            // platform adapter only queries the handle for this call; a
+            // non-unique role match still fails closed with no ownership
+            // change.
             let borrowed = unsafe { BorrowedHandle::borrow_raw(raw) };
             let (evidence, selection) =
                 eliot_platform_windows::authenticate_named_pipe_server_with_peer_set(
@@ -2195,8 +2335,14 @@ mod windows_transport {
             expectation: &eliot_platform_windows::KernelFrontDoorServerExpectation,
         ) -> Result<(), TransportError> {
             let raw = self.client.as_raw_handle();
-            // SAFETY: `self.client` owns this live handle for the duration of
-            // the platform adapter call and is not moved or closed here.
+            // SAFETY: `raw` is the live client handle owned by `self.client`,
+            // borrowed via `&mut self` for the whole call, so the owner
+            // outlives `borrowed`. This is a synchronous function, so no
+            // `.await` can interleave while borrowed, and the handle is not
+            // moved, closed, duplicated, or transferred while borrowed. The
+            // platform adapter only queries the handle for this call; front-door
+            // proof failure maps to `UnauthenticatedPeer` with no ownership
+            // change.
             let borrowed = unsafe { BorrowedHandle::borrow_raw(raw) };
             let proof = eliot_platform_windows::authenticate_kernel_front_door_server(
                 borrowed,
@@ -2306,6 +2452,10 @@ mod windows_transport {
         let result = tokio::time::timeout(timeout, writer.write_all(wire)).await;
         match result {
             Ok(Ok(())) => Ok(DeliveryOutcome::Delivered),
+            // A timeout or I/O error here is not terminal proof: bytes may
+            // have reached the peer, so the caller must reconcile this same
+            // operation exactly like `classify_disconnect` instead of
+            // retrying blindly.
             Ok(Err(_)) | Err(_) => Ok(DeliveryOutcome::UnknownOutcome),
         }
     }
@@ -2328,15 +2478,30 @@ mod windows_transport {
                 maximum: limits.max_frame_bytes,
             })
         })?;
-        if length == 0 || length > limits.max_frame_bytes {
+        // Zero-length and oversize stay distinct terminal observations (coupled
+        // to `FrameDecoder::push`/`decode_frame`): a zero body is
+        // `ZeroLengthFrame`, never fused into `OversizeFrame`.
+        if length == 0 {
+            return Err(TransportError::Protocol(ProtocolError::ZeroLengthFrame));
+        }
+        if length > limits.max_frame_bytes {
             return Err(TransportError::Protocol(ProtocolError::OversizeFrame {
                 actual: length,
                 maximum: limits.max_frame_bytes,
             }));
         }
-        let mut wire = Vec::with_capacity(4 + length);
+        // Exact `4 + length` with overflow check: fail closed before any
+        // body-sized allocation so no attacker-controlled length reaches
+        // `with_capacity`/`resize` unchecked.
+        let total = 4_usize.checked_add(length).ok_or(
+            TransportError::Protocol(ProtocolError::OversizeFrame {
+                actual: usize::MAX,
+                maximum: limits.max_frame_bytes,
+            }),
+        )?;
+        let mut wire = Vec::with_capacity(total);
         wire.extend_from_slice(&prefix);
-        wire.resize(4 + length, 0);
+        wire.resize(total, 0);
         tokio::time::timeout(
             limits.operation_timeout,
             Inner::read_exact_reported(reader, &mut wire[4..]),
@@ -2361,6 +2526,18 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
+    fn test_epoch(sequence: u64) -> EpochId {
+        use eliot_contracts::{EpochId, EpochLineageId};
+        use std::num::NonZeroU64;
+        let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .expect("canonical test lineage-A");
+        EpochId::new(
+            lineage,
+            NonZeroU64::new(sequence).expect("non-zero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
+
     fn module_generation(epoch: u64) -> Result<ModuleGeneration, serde_json::Error> {
         serde_json::from_value(serde_json::json!({
             "module_id": "module.test",
@@ -2376,7 +2553,7 @@ mod tests {
                 "capacity": "HEALTHY"
             },
             "state_fence": {
-                "authority_epoch": epoch,
+                "authority_epoch": {"lineage_id": "550e8400-e29b-41d4-a716-446655440000", "sequence": epoch},
                 "resource_generation": 1,
                 "task_revision": null,
                 "policy_revision": null,
@@ -2501,8 +2678,9 @@ mod tests {
         }
 
         let mut variant = base.clone();
-        variant.module_generation.state_fence.authority_epoch =
-            serde_json::from_value(serde_json::json!(2))?;
+        variant.module_generation.state_fence.authority_epoch = serde_json::from_value(
+            serde_json::json!({"lineage_id": "550e8400-e29b-41d4-a716-446655440000", "sequence": 2}),
+        )?;
         variants.push(("authority_epoch".to_owned(), variant));
 
         let mut variant = base.clone();
@@ -2604,10 +2782,10 @@ mod tests {
     #[test]
     fn bound_identity_order_is_independent_of_serialization_field_order() -> TestResult {
         let first: ModuleGeneration = serde_json::from_str(
-            r#"{"module_id":"module.test","generation":1,"artifact_id":"artifact","state":"ACTIVE","health":{"liveness":"HEALTHY","readiness":"HEALTHY","freshness":"HEALTHY","compatibility":"HEALTHY","integrity":"HEALTHY","capacity":"HEALTHY"},"state_fence":{"authority_epoch":1,"resource_generation":1,"task_revision":null,"policy_revision":null,"integration_revision":null}}"#,
+            r#"{"module_id":"module.test","generation":1,"artifact_id":"artifact","state":"ACTIVE","health":{"liveness":"HEALTHY","readiness":"HEALTHY","freshness":"HEALTHY","compatibility":"HEALTHY","integrity":"HEALTHY","capacity":"HEALTHY"},"state_fence":{"authority_epoch":{"lineage_id":"550e8400-e29b-41d4-a716-446655440000","sequence":1},"resource_generation":1,"task_revision":null,"policy_revision":null,"integration_revision":null}}"#,
         )?;
         let second: ModuleGeneration = serde_json::from_str(
-            r#"{"state_fence":{"integration_revision":null,"policy_revision":null,"task_revision":null,"resource_generation":1,"authority_epoch":1},"health":{"capacity":"HEALTHY","integrity":"HEALTHY","compatibility":"HEALTHY","freshness":"HEALTHY","readiness":"HEALTHY","liveness":"HEALTHY"},"state":"ACTIVE","artifact_id":"artifact","generation":1,"module_id":"module.test"}"#,
+            r#"{"state_fence":{"integration_revision":null,"policy_revision":null,"task_revision":null,"resource_generation":1,"authority_epoch":{"lineage_id":"550e8400-e29b-41d4-a716-446655440000","sequence":1}},"health":{"capacity":"HEALTHY","integrity":"HEALTHY","compatibility":"HEALTHY","freshness":"HEALTHY","readiness":"HEALTHY","liveness":"HEALTHY"},"state":"ACTIVE","artifact_id":"artifact","generation":1,"module_id":"module.test"}"#,
         )?;
         let first = BoundIdentity::new("stream", first, "request")?;
         let second = BoundIdentity::new("stream", second, "request")?;
@@ -2645,9 +2823,9 @@ mod tests {
             module_generation(7)?,
             "kernel-session-fence-1",
         )?;
-        assert!(session.accepts(7, 1));
+        assert!(session.accepts(&test_epoch(7), 1));
         session.fence();
-        assert!(!session.accepts(7, 1));
+        assert!(!session.accepts(&test_epoch(7), 1));
         Ok(())
     }
 
@@ -2718,7 +2896,7 @@ mod tests {
                     "capacity": "HEALTHY"
                 },
                 "state_fence": {
-                    "authority_epoch": 7,
+                    "authority_epoch": {"lineage_id": "550e8400-e29b-41d4-a716-446655440000", "sequence": 7},
                     "resource_generation": 1,
                     "task_revision": null,
                     "policy_revision": null,
@@ -2731,7 +2909,7 @@ mod tests {
             "expected_kernel_sid": "S-1-5-18",
             "expected_kernel_session_id": 0,
             "expected_kernel_principal_binding": "kernel:agent-bridge",
-            "expected_kernel_authority_epoch": 8,
+            "expected_kernel_authority_epoch": {"lineage_id": "550e8400-e29b-41d4-a716-446655440000", "sequence": 8},
             "expected_kernel_generation": 2,
             "expected_kernel_artifact_sha256": "b".repeat(64),
             "expected_kernel_config_snapshot_sha256": "c".repeat(64),
@@ -2754,7 +2932,7 @@ mod tests {
             bridge_generation: declaration.module_generation.generation,
             state_fence: declaration.module_generation.state_fence.clone(),
             kernel_principal_binding: declaration.expected_kernel_principal_binding.clone(),
-            kernel_authority_epoch: declaration.expected_kernel_authority_epoch,
+            kernel_authority_epoch: declaration.expected_kernel_authority_epoch.clone(),
             kernel_generation: declaration.expected_kernel_generation,
             kernel_artifact_sha256: declaration.expected_kernel_artifact_sha256.clone(),
             kernel_config_snapshot_sha256: declaration
@@ -2997,7 +3175,9 @@ mod tests {
         );
 
         let mut fence_challenge = challenge.clone();
-        fence_challenge.state_fence.authority_epoch = serde_json::from_value(serde_json::json!(8))?;
+        fence_challenge.state_fence.authority_epoch = serde_json::from_value(
+            serde_json::json!({"lineage_id": "550e8400-e29b-41d4-a716-446655440000", "sequence": 8}),
+        )?;
         fence_challenge = fence_challenge.with_computed_digest()?;
         assert!(
             ServerFirstConnection::new("server-connection", fence_challenge, &declaration).is_err()
@@ -3077,7 +3257,7 @@ mod tests {
             peer: PeerIdentity::Unavailable {
                 reason: PeerIdentityUnavailable::ProviderProofNotComposed,
             },
-            authority_epoch: 4,
+            authority_epoch: test_epoch(4),
             module_generation: module_generation(4)?,
             launch_nonce: "nonce".into(),
             capabilities: Vec::new(),
@@ -3086,7 +3266,7 @@ mod tests {
             session_epoch: 2,
             state: SessionState::Open,
         };
-        assert!(!session.accepts(3, 2));
+        assert!(!session.accepts(&test_epoch(3), 2));
         let frame = heartbeat();
         let mut ledger = ReplayLedger::default();
         assert_eq!(ledger.observe("event", &frame)?, ReplayDisposition::New);
@@ -3119,7 +3299,7 @@ mod tests {
             IntegrationDependency::PlanGap
         );
         session.fence();
-        assert!(!session.accepts(4, 2));
+        assert!(!session.accepts(&test_epoch(4), 2));
         Ok(())
     }
 

@@ -10,6 +10,7 @@ or authority overclaims. It does not prove source or runtime conformance.
 from __future__ import annotations
 
 import argparse
+import re
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -60,6 +61,48 @@ FORBIDDEN_OVERCLAIMS = (
     "proves conformance",
 )
 
+ONBOARDING_START = "START.md"
+ONBOARDING_README = "README.md"
+# README lines 27-31 hold the out-of-scope fetch/prune block per issue #1231.
+# The writer must not touch that block, so onboarding sync checks skip it.
+README_OUT_OF_SCOPE_LINES = frozenset({27, 28, 29, 30, 31})
+
+ONBOARDING_PROHIBITION_HINTS = (
+    "never",
+    "must not",
+    "must never",
+    "do not",
+    "don't",
+    "does not",
+    "without",
+    "instead",
+    "forbidden",
+    "prohibited",
+    "controller-only",
+    "controller only",
+    "root-owned",
+    "root owned",
+    "no worker",
+    "workers never",
+    "managers and workers never",
+)
+
+ONBOARDING_CARGO_EVIDENCE = (
+    "cargo metadata",
+    "cargo check",
+    "cargo test",
+    "cargo build",
+)
+
+ONBOARDING_COUNT_PATTERNS = (
+    re.compile(r"\b\d+\s+(capability\s+)?cells?\b", re.IGNORECASE),
+    re.compile(r"\b\d+\s+open\s+issues?\b", re.IGNORECASE),
+    re.compile(r"\b\d+\s+open\s+pull\b", re.IGNORECASE),
+    re.compile(r"\b\d+\s+pull\s+requests?\b", re.IGNORECASE),
+    re.compile(r"\b\d+\s+tests?\s+ignored\b", re.IGNORECASE),
+    re.compile(r"\b\d+\s+implemented\b", re.IGNORECASE),
+)
+
 
 @dataclass(frozen=True)
 class Finding:
@@ -77,6 +120,95 @@ def has_canonical_boundary(normalized: str) -> bool:
     if any(marker in normalized for marker in CANONICAL_BOUNDARY_MARKERS):
         return True
     return "semantic admission" in normalized and "preparedtransition" in normalized
+
+
+def _is_prohibition(line_lower: str) -> bool:
+    return any(hint in line_lower for hint in ONBOARDING_PROHIBITION_HINTS)
+
+
+def _onboarding_lines(root: Path, rel: str) -> tuple[list[tuple[int, str]] | None, str | None]:
+    path = root / rel
+    if not path.is_file():
+        return None, "onboarding file is absent"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        return None, str(error)
+    lines: list[tuple[int, str]] = []
+    for lineno, raw in enumerate(text.splitlines(), start=1):
+        if rel == ONBOARDING_README and lineno in README_OUT_OF_SCOPE_LINES:
+            continue
+        lines.append((lineno, raw))
+    return lines, None
+
+
+def verify_onboarding(root: Path) -> list[Finding]:
+    findings: list[Finding] = []
+    for rel in (ONBOARDING_START, ONBOARDING_README):
+        result, error = _onboarding_lines(root, rel)
+        if result is None:
+            findings.append(Finding("onboarding_missing", rel, error or "missing"))
+            continue
+        lines = result
+        full = "\n".join(raw for _, raw in lines)
+        full_lower = full.lower()
+        for lineno, raw in lines:
+            low = raw.lower()
+            if _is_prohibition(low):
+                # Prohibition context (e.g. "never runs fetch") is allowed;
+                # only bare worker instructions fail.
+                if "gh pr merge" in low:
+                    continue
+                if "git fetch" in low or "git pull" in low or "fetch origin --prune" in low:
+                    continue
+                if ("rev-list" in low or "ls-tree" in low or "switch --detach" in low) and "origin/main" in low:
+                    continue
+                if "git reset" in low:
+                    continue
+            if "git fetch" in low or "git pull" in low or "fetch origin --prune" in low:
+                findings.append(
+                    Finding("onboarding_worker_sync", f"{rel}:{lineno}", f"worker sync instruction is forbidden: {raw.strip()[:120]}")
+                )
+            elif ("rev-list" in low and "origin/main" in low) or (
+                "ls-tree" in low and "origin/main" in low
+            ) or ("switch --detach" in low and "origin/main" in low):
+                findings.append(
+                    Finding("onboarding_worker_sync", f"{rel}:{lineno}", f"worker ref instruction is forbidden: {raw.strip()[:120]}")
+                )
+            elif "git reset" in low:
+                findings.append(
+                    Finding("onboarding_worker_sync", f"{rel}:{lineno}", f"worker ref-mutation instruction is forbidden: {raw.strip()[:120]}")
+                )
+            if "gh pr merge" in low:
+                findings.append(
+                    Finding("onboarding_self_merge", f"{rel}:{lineno}", f"onboarding self-merge instruction is forbidden: {raw.strip()[:120]}")
+                )
+            for cargo in ONBOARDING_CARGO_EVIDENCE:
+                if cargo in low and "--locked" not in low:
+                    findings.append(
+                        Finding(
+                            "onboarding_unlocked_cargo",
+                            f"{rel}:{lineno}",
+                            f"unlocked Cargo evidence is forbidden (missing --locked): {raw.strip()[:120]}",
+                        )
+                    )
+                    break
+        if "expensive" in full_lower:
+            findings.append(Finding("onboarding_routing_weakened", rel, "weakened routing wording is forbidden: 'expensive'"))
+        if "changing a contract" in full_lower and (
+            "only when" in full_lower or "not when" in full_lower or "already exists" in full_lower
+        ):
+            findings.append(
+                Finding("onboarding_routing_weakened", rel, "contract-only routing is forbidden: routing is mandatory for every mutation class")
+            )
+        for pattern in ONBOARDING_COUNT_PATTERNS:
+            match = pattern.search(full)
+            if match:
+                findings.append(
+                    Finding("onboarding_mutable_count", rel, f"hand-maintained count is forbidden: '{match.group(0)}'")
+                )
+                break
+    return findings
 
 
 def verify(root: Path) -> list[Finding]:
@@ -130,6 +262,8 @@ def verify(root: Path) -> list[Finding]:
         if not any(finding.path == path and finding.code == "guardrail_missing" for finding in findings):
             findings.append(Finding("guardrail_scan_gap", path, "required path was not discoverable by repository scan"))
 
+    findings.extend(verify_onboarding(root))
+
     return sorted(findings, key=lambda finding: (finding.path, finding.code, finding.detail))
 
 
@@ -160,6 +294,34 @@ Run the bounded proof. Stop when ownership or the proof boundary is unclear.
 """
 
 
+def good_onboarding_start_text() -> str:
+    return """# Fixture onboarding route
+
+Run routing for every mutation class.
+
+python scripts/docs_read.py read --path crates/foo --topic "bar" --output .eliot/docs-read-bundle.md --receipt-out .eliot/docs-read-receipt.json
+
+Validate the published authority receipt base SHA with git status --short --branch and git rev-parse HEAD.
+
+cargo metadata --locked --no-deps
+cargo check --locked -p foo --all-targets
+cargo test --locked -p foo
+
+An honest gap is reported and is not automatically mergeable.
+One issue, one branch, one PR.
+"""
+
+
+def good_onboarding_readme_text() -> str:
+    return """# Fixture README
+
+```powershell
+cargo metadata --locked --no-deps
+just quick
+```
+"""
+
+
 def self_test() -> None:
     with tempfile.TemporaryDirectory(prefix="eliot-guardrail-self-test-") as temp:
         root = Path(temp)
@@ -167,6 +329,8 @@ def self_test() -> None:
             path = root / spec.path
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(valid_fixture(spec), encoding="utf-8")
+        (root / ONBOARDING_START).write_text(good_onboarding_start_text(), encoding="utf-8")
+        (root / ONBOARDING_README).write_text(good_onboarding_readme_text(), encoding="utf-8")
 
         clean = verify(root)
         if clean:
@@ -242,8 +406,77 @@ def self_test() -> None:
             for item in no_canonical_findings
         ):
             raise AssertionError("missing-canonical-boundary fixture did not fail")
+        path.write_text(valid_fixture(no_canonical_spec), encoding="utf-8")
 
-    print("AGENT_GUARDRAILS_SELF_TEST: PASS cases=8")
+        start_path = root / ONBOARDING_START
+        readme_path = root / ONBOARDING_README
+        good_start = good_onboarding_start_text()
+        good_readme = good_onboarding_readme_text()
+
+        onboarding_clean = verify_onboarding(root)
+        if onboarding_clean:
+            raise AssertionError(f"valid onboarding fixture failed: {onboarding_clean}")
+
+        prohibition = good_start + "\nManagers and workers never run `git fetch` in a worktree.\n"
+        start_path.write_text(prohibition, encoding="utf-8")
+        if [item for item in verify_onboarding(root) if item.code == "onboarding_worker_sync"]:
+            raise AssertionError("prohibition-worded fetch line must not fail")
+        start_path.write_text(good_start, encoding="utf-8")
+
+        start_path.write_text(good_start + "\ngit fetch origin --prune\n", encoding="utf-8")
+        if not any(item.code == "onboarding_worker_sync" for item in verify_onboarding(root)):
+            raise AssertionError("worker-fetch fixture did not fail")
+        start_path.write_text(good_start, encoding="utf-8")
+
+        ref_bad = good_start + (
+            "\ngit rev-list --count HEAD..origin/main\n"
+            "git ls-tree -r --name-only origin/main\n"
+            "git switch --detach origin/main\n"
+        )
+        start_path.write_text(ref_bad, encoding="utf-8")
+        if not any(item.code == "onboarding_worker_sync" for item in verify_onboarding(root)):
+            raise AssertionError("worker-ref fixture did not fail")
+        start_path.write_text(good_start, encoding="utf-8")
+
+        start_path.write_text(good_start + "\ngh pr merge 12 --squash --delete-branch\n", encoding="utf-8")
+        if not any(item.code == "onboarding_self_merge" for item in verify_onboarding(root)):
+            raise AssertionError("self-merge fixture did not fail")
+        start_path.write_text(good_start, encoding="utf-8")
+
+        start_path.write_text(good_start + "\ncargo check -p foo --all-targets\n", encoding="utf-8")
+        if not any(item.code == "onboarding_unlocked_cargo" for item in verify_onboarding(root)):
+            raise AssertionError("unlocked-cargo fixture did not fail")
+        start_path.write_text(good_start, encoding="utf-8")
+        readme_path.write_text(good_readme.replace("cargo metadata --locked --no-deps", "cargo metadata --no-deps"), encoding="utf-8")
+        if not any(item.code == "onboarding_unlocked_cargo" for item in verify_onboarding(root)):
+            raise AssertionError("readme unlocked-cargo fixture did not fail")
+        readme_path.write_text(good_readme, encoding="utf-8")
+
+        weakened = good_start + (
+            "\nThe full verified-reading protocol routes documentation for contract-level changes. "
+            "It is expensive. Use it when you are changing a contract, not when you are filling in "
+            "an implementation whose contract already exists.\n"
+        )
+        start_path.write_text(weakened, encoding="utf-8")
+        if not any(item.code == "onboarding_routing_weakened" for item in verify_onboarding(root)):
+            raise AssertionError("weakened-routing fixture did not fail")
+        start_path.write_text(good_start, encoding="utf-8")
+
+        counts = good_start + (
+            "\n44 capability cells declared 2 implemented\n"
+            "318 open issues 42 open pull requests\n"
+            "134 tests ignored\n"
+        )
+        start_path.write_text(counts, encoding="utf-8")
+        if not any(item.code == "onboarding_mutable_count" for item in verify_onboarding(root)):
+            raise AssertionError("mutable-count fixture did not fail")
+        start_path.write_text(good_start, encoding="utf-8")
+
+        final = verify(root)
+        if final:
+            raise AssertionError(f"restored onboarding fixture failed: {final}")
+
+    print("AGENT_GUARDRAILS_SELF_TEST: PASS cases=14")
 
 
 def parse_args() -> argparse.Namespace:

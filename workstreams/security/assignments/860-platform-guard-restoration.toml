@@ -1,0 +1,122 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
+routing_authority = "owning_issue_and_normative_pair_only"
+status = "READY_FOR_IMPLEMENTATION"
+implementation_support = "GUARDS_PRESENT_NORMAL_RESTORATION_AND_CONTAINMENT_EVIDENCE_INCOMPLETE"
+evidence_execution_status = "SOURCE_SITE_SHAPE_INSPECTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "WINDOWS_GUARD_RESTORATION_MODULE_PROOF_ONLY"
+issue = 860
+unsafe_policy_issue = 728
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "security.windows-privilege-and-impersonation-guard-restoration"
+causal_property = "Normal installer privilege and named-pipe impersonation restoration returns an exact typed primary-plus-restoration outcome before Drop; emergency Drop attempts restoration once and retains fail-stop only when continued execution would violate the accepted privilege boundary and bounded containment evidence is already available."
+current_discriminator = "Current installer_root.rs and named_pipe_peer_auth.rs still contain the historically identified fail-stop abort sites; ordinary restoration failure can terminate without a first-class composite outcome and accepted package proof for normal/emergency paths is absent."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/860"
+
+[documentation]
+architecture = ["https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A00-03-hard-boundaries.md#a03-hard-boundaries"]
+implementation = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I02-06-error-and-crash-model.md#i26-error-and-crash-model",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-24-local-failure-containment-matrix.md#i1424-local-failure-containment-matrix",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I02-05-unsafe-policy.md#i25-unsafe-policy",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I15-02-principal-and-session-binding.md#i152-principal-and-session-binding",
+]
+anchors = ["ARCH-SEC-01", "ARCH-OBS-01", "ARCH-RES-04"]
+
+[current_source]
+confirmed = [
+  "installer_root.rs contains current std::process::abort() fail-stop branches around restore privilege and prior-thread-token restoration.",
+  "named_pipe_peer_auth.rs contains an armed Drop fail-stop after RevertToSelf failure.",
+  "The Issue owns exact current original/successor reconciliation rather than an artificial zero-abort target.",
+  "Other aborts found in Host/runtime test helpers and unrelated test code are outside #860 scope.",
+  "#728 owns the unsafe ADR and comments; #860 may not edit that policy surface.",
+]
+
+[scope]
+primary_paths = [
+  "crates/kernel/eliot-platform-windows/src/installer_root.rs only guard construction, explicit restore/disarm, direct callers and inline tests",
+  "crates/kernel/eliot-platform-windows/src/named_pipe_peer_auth.rs only impersonation restore/disarm and direct callers/inline tests",
+  "crates/kernel/eliot-platform-windows/tests/abort_boundary.rs",
+  "crates/kernel/eliot-platform-windows/tests/data/abort_boundary.json",
+  ".github/temporary/work-unit-860.md only if present",
+]
+forbidden = [
+  "other platform files or packages",
+  "Cargo, lockfile, namespace, ACL, authentication or installer semantic redesign",
+  "new logger, journal, authority/state owner or global poison registry",
+  "panic, unwrap, expect, ignored restore result or success after failed cleanup",
+  "removing a required fail-stop without proving safe OS state",
+  "unsafe ADR/oracle, workflow, normative documentation or shared registry changes",
+  "automatic workflow triggers",
+]
+
+[[waves]]
+id = "A"
+what = "Reconcile every current original/successor guard site and direct caller."
+how = [
+  "Freeze path/item/span/digest, guarded OS security state, construction, explicit restore/disarm, armed Drop state, primary operation, caller, restoration error, continuation safety and current fail-stop disposition.",
+  "Assign ReturnTypedFailure, RetainDocumentedFailStop or a blocking owner challenge to every current site; additions/removals require explicit accounting.",
+  "Do not preserve four aborts merely to match history and do not delete a required fail-stop merely to reach zero.",
+]
+
+[[waves]]
+id = "B"
+what = "Make normal restoration explicit and lossless."
+how = [
+  "Return the existing typed stage/code for privilege restore, prior-thread-token rebind and RevertToSelf failure before Drop.",
+  "Represent primary operation outcome, possible prior external effect and restoration/cleanup outcome independently; retain both when both fail.",
+  "Disarm exactly once only after observed successful restoration; duplicate restore/disarm cannot restore another token or double-close ownership.",
+  "A caller cannot report success after failed restoration.",
+]
+
+[[waves]]
+id = "C"
+what = "Restrict Drop to emergency containment."
+how = [
+  "An armed Drop attempts the exact restoration once and never panics or unwinds across FFI.",
+  "If restoration succeeds, disarm and continue without termination or a second restore.",
+  "Retain fail-stop only when continued execution would leave the thread under untrusted/elevated OS security state and no accepted safe continuation exists.",
+  "Before retained termination, emit the existing owner's preallocated bounded containment evidence without allocation, reentrancy, secrets or a new logging owner; absence of that mechanism blocks the site.",
+]
+
+[[waves]]
+id = "D"
+what = "Add deterministic normal, panic and contained fatal proof."
+how = [
+  "Use existing PrivilegeApi/peer-auth fault seams and deterministic injected failures, not sleeps.",
+  "Run retained fatal branches only in an exact owned contained subprocess so the test harness survives and observes the documented termination mechanism.",
+  "Prove token/handle ownership across success, early error, failed construction, panic, Drop and retained fail-stop.",
+  "Implement exactly WORK_UNIT_CASE: 860/1..16 and reconcile source aborts to the accepted successors/invariants.",
+]
+
+[acceptance]
+criteria = [
+  "Every current original/successor site has one exact disposition and no site is silently added or omitted.",
+  "Explicit installer privilege restoration succeeds and disarms exactly once.",
+  "Privilege restore and prior-thread-token rebind failures preserve exact typed stage/code and cannot be reported as success.",
+  "Failed guard construction preserves primary failure and separate cleanup/restoration failure.",
+  "Explicit impersonation revert succeeds/disarms; RevertToSelf failure preserves the exact Windows error.",
+  "Armed Drop attempts emergency restoration exactly once and successful emergency restoration neither terminates nor double-restores.",
+  "Any retained privilege or impersonation fail-stop has an accepted invariant and bounded containment record before termination.",
+  "Contained fatal subprocess terminates by the documented mechanism without Rust unwind crossing FFI.",
+  "No removed abort becomes panic, unwrap, expect, ignored result or silent poison while OS privilege remains active.",
+  "Token/handle close or explicitly retained ownership is exact on success, error and panic; protected principal/token values are absent from diagnostics.",
+  "Exactly 16 substantive tests execute via --test abort_boundary and reconcile the current abort denominator rather than using a name filter or skip.",
+  "Diff is confined to the two guard/caller spans, exact test/fixture and optional marker removal; no policy, Cargo or unrelated platform change.",
+  "Package proof does not claim hostile-peer schedules, universal Windows safety, full runtime or Product support.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --package eliot-platform-windows -- --check",
+  "cargo test --locked -p eliot-platform-windows --test abort_boundary",
+  "cargo test --locked -p eliot-platform-windows --all-targets",
+  "cargo clippy --locked -p eliot-platform-windows --all-targets -- -D warnings",
+  "git diff --check",
+]
+semantic_review = "Review the explicit and Drop state machines against actual Windows privilege/impersonation restoration contracts and verify any retained fail-stop is necessary for the accepted security boundary."
+product_proof = "This establishes package guard restoration and contained fail-stop proof only; live peer, SCM and Product proof remain separate."

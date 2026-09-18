@@ -1,0 +1,222 @@
+schema = "eliot.capability-cell-registry-implementation.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_CONTRACT"
+status = "READY_FOR_IMPLEMENTATION"
+implementation_support = "ROUTING_METADATA_PRESENT_EXECUTABLE_REGISTRY_MISSING"
+evidence_execution_status = "SOURCE_AUDIT_EXECUTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "CAPABILITY_CELL_REGISTRY_SOURCE_EDGE_CANDIDATE"
+issue = 13
+integration_issue = 11
+base_branch = "main"
+base_sha = "65b68d5eb56fbf31743e6ee78e133d3f2e4eaba1"
+normative_pair_ref = "docs/normative-pair.toml"
+normative_pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+normative_architecture_sha256 = "c6932eaf26935e752eefb4de591afc91ea1a7180be5a8ff0005554b8029bac1a"
+normative_implementation_sha256 = "7805bf238fe91819aba50d7e13aa86a8b977561195dbb98aa979f986e2fab063"
+
+[documentation]
+architecture = [
+  "docs/architecture/A02-03-modular-architecture.md#a23-modular-architecture",
+  "docs/architecture/A10-04-delegation.md#a104-delegation",
+  "docs/architecture/A14-08-development-doctrine.md#a148-development-doctrine",
+]
+implementation = [
+  "docs/architecture/I00-05-conformance-support-and-evidence-status.md#i05-conformance-support-and-evidence-status",
+  "docs/architecture/I02-08-package-metadata-source-ownership-and-generated-registry.md#i28-package-metadata-source-ownership-and-generated-registry",
+  "docs/architecture/I02-18-build-test-and-artifact-graph.md#i218-build-test-and-artifact-graph",
+  "docs/architecture/I02-23-capability-family-topology-and-crate-extraction-decisions.md#i223-capability-family-topology-and-crate-extraction-decisions",
+  "docs/architecture/I18-04-test-tiers.md#i184-test-tiers",
+]
+anchors = ["ARCH-MOD-01", "ARCH-MOD-02", "ARCH-MOD-03", "ARCH-GROUND-01"]
+
+[inventory_source]
+path = "workstreams/core-daemons/inventory.json"
+schema = "eliot.core-daemon-workstream.v4"
+updated_at = "2026-08-29"
+authority_pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+role = "Non-authoritative routing projection and migration input only; never runtime authority."
+
+[[inventory_family]]
+id = "host"
+process = "eliot-host.exe"
+paths = ["bins/eliot-host", "crates/kernel/eliot-host-state", "crates/kernel/eliot-host-service", "crates/kernel/eliot-installation", "crates/kernel/eliot-platform-windows"]
+
+[[inventory_family]]
+id = "kernel"
+process = "eliot-kernel.exe"
+paths = ["bins/eliot-kernel", "crates/kernel/eliot-kernel-core", "crates/kernel/eliot-kernel-service", "crates/kernel/eliot-ors", "crates/kernel/eliot-ipc", "crates/kernel/eliot-process", "crates/kernel/eliot-runtime"]
+
+[[inventory_family]]
+id = "governor_daemon"
+process = "eliotd.exe"
+paths = ["bins/eliotd", "crates/governor"]
+
+[[inventory_family]]
+id = "watchdog"
+process = "eliot-watchdog.exe"
+paths = ["bins/eliot-watchdog", "crates/supervision/eliot-watchdog-core"]
+
+[[inventory_family]]
+id = "doctor"
+process = "eliot-doctor.exe"
+paths = ["bins/eliot-doctor", "crates/meta/eliot-doctor-core"]
+
+[[inventory_family]]
+id = "store_bridge"
+process = "eliot-store-surreal.exe"
+paths = ["bins/eliot-store-surreal", "crates/storage/eliot-store-api", "crates/storage/eliot-store-surreal-adapter", "crates/storage/eliot-store-memory"]
+
+[[inventory_family]]
+id = "surreal_dependency"
+process = "surreal.exe"
+paths = ["crates/kernel/eliot-host-service", "crates/storage/eliot-store-surreal-adapter"]
+
+[[inventory_family]]
+id = "blob_store"
+process = "embedded or isolated BlobStore owner"
+paths = ["crates/storage/eliot-blob-api", "crates/storage/eliot-blob"]
+
+[[inventory_family]]
+id = "testd"
+process = "eliot-testd.exe"
+paths = ["bins/eliot-testd", "crates/instrument/eliot-testd-core", "crates/instrument"]
+
+[[inventory_family]]
+id = "wasm_host"
+process = "eliot-wasm-host.exe"
+paths = ["bins/eliot-wasm-host", "crates/modules/eliot-wasm-runtime"]
+
+[[inventory_family]]
+id = "native_worker"
+process = "eliot-native-worker.exe"
+paths = ["bins/eliot-native-worker", "crates/modules/eliot-native-worker-core"]
+
+[[inventory_family]]
+id = "user_broker"
+process = "eliot-user-broker.exe"
+paths = ["bins/eliot-user-broker", "crates/surfaces/eliot-user-broker-core"]
+
+[[inventory_family]]
+id = "notify_surface"
+process = "eliot-notify.exe"
+paths = ["bins/eliot-notify", "crates/surfaces/eliot-notify-core"]
+read_only = true
+read_only_reason = "MGR01-1119 owns notify delivery/ledger repair; this contract consumes notify paths as read-only data only."
+
+[[inventory_family]]
+id = "agent_bridge_surface"
+process = "eliot-agent-bridge.exe"
+paths = ["bins/eliot-agent-bridge", "crates/surfaces/eliot-agent-bridge-core", "crates/surfaces/eliot-mcp"]
+
+[[inventory_family]]
+id = "research_provider"
+process = "eliot-mod-research.exe"
+paths = ["bins/eliot-mod-research", "crates/research/eliot-researcher", "crates/research/eliot-research-exchange", "crates/research/eliot-research-exchange-api"]
+
+[[inventory_family]]
+id = "runtime_status_and_live_installation"
+process = "eliot.exe and installed SystemService topology"
+paths = ["bins/eliot", "crates/meta/eliot-runtime-status", "crates/kernel/eliot-installation", "docs/release/WINDOWS_X64_RELEASE.md"]
+
+[confirmed_gap]
+observations = [
+  "workstreams/core-daemons/inventory.json and package-local metadata provide planning and routing projections, not one executable current-pair CapabilityCellRegistry.",
+  "Repository-wide search on base 65b68d5e finds no CapabilityCellRegistry type or validator in crates/ or bins/ that resolves a process generation to one cell, contract digest, mutable-state owner, proof entrypoint and Product Pulse.",
+  "The current core-daemon verifier (scripts/verify-core-daemon-inventory.py) validates a handwritten inventory and fixed expected fields; it cannot generate current cells from Cargo/package/contract/proof inputs or prove every mutable state has exactly one owner.",
+  "Several parent Issues depend on #13, while package presence and metadata can still be mistaken for runtime support without one generated stale-rejecting registry.",
+]
+discriminator = "Ask current runtime/planning code to resolve any installed process generation to its capability cell, public contract digest, state owner, proof entrypoint and Product Pulse. No single generated current-pair record is available."
+
+[causal_property]
+statement = "Every independently supported capability resolves through one reproducible current-pair registry record naming exact contract, source owner, mutable-state/lifecycle owner, runtime generation, proof entrypoint/ceiling, affected edges, Product Pulse, replacement/removal boundary and invalidation set."
+
+[scope]
+primary_paths = [
+  "crates/foundation/eliot-contracts/ (package eliot-contracts: registry record and contract-digest owner candidate)",
+  "crates/meta/eliot-runtime-status/ (package eliot-runtime-status: real generation-to-cell consumer owner)",
+  "package-local Cargo.toml [package.metadata.eliot] fields required by the generated registry",
+  "workstreams/core-daemons/inventory.json only as a migration input, not runtime authority",
+  "scripts/verify-core-daemon-inventory.py migration/removal after the executable consumer exists",
+  "focused registry generation/validation fixtures",
+]
+read_only_dependencies = [
+  "bins/eliot-notify/** (MGR01-1119)",
+  "crates/surfaces/eliot-notify-core/** (MGR01-1119)",
+]
+required_inputs = [
+  "Cargo metadata and exact package/target identities",
+  "accepted normative-pair identity",
+  "public contract manifests and digests",
+  "package source-owner metadata",
+  "runtime bundle/generation manifests",
+  "ModuleContractKit, CrateContextCapsule and ModuleTestCapsule proof surfaces",
+  "declared state/lifecycle owners, replacement class, edges and Product Pulses",
+]
+forbidden_ownership = [
+  "authority or support created by registry presence",
+  "runtime liveness/currentness inferred from source or package names",
+  "second handwritten owner list alongside the generated registry",
+  "crate-name-derived semantic authority",
+  "empty concept crates added only to satisfy topology; a new package requires a current CrateExtractionDecision, real consumer, independent contract/test/context seam and migration/removal path",
+  "notify-surface state/effect ownership (read-only here; MGR01-1119 owns notify repair)",
+]
+
+[what_to_do]
+steps = [
+  "Define versioned CapabilityCellRegistry and EffectiveMicroModuleManifest records with deterministic canonical encoding and stale-input rejection.",
+  "Enumerate actual current cells for Host, Kernel, eliotd, Watchdog, Doctor, Store/Surreal/Blob, testd, WASM, native worker, User Broker, notification, Agent Bridge, CLI/runtime status and applicable Product Pulse cells.",
+  "Give every stateful cell exactly one mutable-state owner and one lifecycle owner, or declare statelessness explicitly.",
+  "Bind every cell to one public contract digest, runtime bundle/generation, proof entrypoint/ceiling, affected edges, Product Pulse and replacement/removal boundary.",
+  "Add one real validation/planning/runtime-status consumer; generated output cannot remain a report-only artifact.",
+  "Migrate or retire the handwritten core-daemon inventory verifier only after parity and reverse-consumer proof.",
+]
+
+[how_to_do]
+steps = [
+  "Generate from current Cargo metadata, accepted contract ownership, module/service manifests and executable proof metadata; never infer authority from crate or binary names.",
+  "Separate source-maintenance owner, semantic owner, mutable-state owner, lifecycle owner and runtime-generation owner into independent fields.",
+  "Require the ModuleContractKit + CrateContextCapsule + ModuleTestCapsule triad for every capability claiming independent support.",
+  "Bind registry identity to normative pair, source commit/tree, Cargo metadata/lock/toolchain, contract manifests and generator version; any relevant change invalidates the record.",
+  "Canonicalize only semantic sets and preserve meaningful ordered dependencies/proofs.",
+  "Reject duplicate/missing state owner, missing contract digest, missing proof surface, stale pair/source identity, unknown replacement class and unsupported runtime overclaim with typed diagnostics.",
+  "Keep generated records non-authoritative: they expose evidence and contradictions but cannot promote ContractMaturity, ImplementationSupport or EvidenceExecutionStatus.",
+  "Make one current consumer resolve process generation -> cell -> contract -> proof -> Product Pulse using exact generated identities.",
+  "Treat notify-surface paths as read-only data; notify delivery/ledger repair belongs to MGR01-1119.",
+  "Retain legacy inventory bytes as migration evidence and remove them only after every current consumer has an explicit successor.",
+]
+
+[acceptance]
+criteria = [
+  "Every in-scope cell has one lifecycle owner and exactly one owner for each mutable state, or explicit statelessness.",
+  "Every public contract has one owner and one digest source.",
+  "Source maintenance, semantic authority, state ownership, lifecycle ownership and runtime generation remain separate fields.",
+  "Duplicate/missing owners, stale pair/source identity, missing proof, undeclared state and inferred authority fail with stable typed diagnostics.",
+  "Every independently supported capability has the complete contract/context/test triad.",
+  "Generated output is byte-reproducible from equivalent semantic inputs and rejected when any bound input changes.",
+  "Source/package presence alone cannot produce runtime support, executed evidence or Product acceptance.",
+  "At least one real planning/runtime-status consumer uses the generated registry rather than a parallel manual list.",
+  "Issue #11 can resolve an installed process generation through cell, contract, proof entrypoint and Product Pulse without handwritten process mapping.",
+  "No new empty crate or duplicate registry/owner/status vocabulary is introduced.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo metadata --locked --format-version 1",
+  "cargo check --locked --workspace --all-targets",
+  "cargo test --locked -p eliot-contracts -p eliot-runtime-status --all-targets",
+  "cargo clippy --locked -p eliot-contracts -p eliot-runtime-status --all-targets -- -D warnings",
+  "python scripts/verify-core-daemon-inventory.py --self-test",
+  "python scripts/verify-core-daemon-inventory.py",
+  "git diff --check",
+]
+edge_proof = "Generate the registry twice, prove byte identity, inject duplicate/missing owners and stale pair/source/proof inputs, then resolve one real runtime-status process generation through cell/contract/proof/Product Pulse."
+
+[boundaries]
+non_goals = [
+  "live Product acceptance",
+  "automatic workflow triggers",
+  "runtime authority or liveness owner",
+  "global crate-per-cell extraction",
+  "notify delivery/ledger repair (MGR01-1119)",
+  "Dreamer or cognitive-scaffold cells",
+]

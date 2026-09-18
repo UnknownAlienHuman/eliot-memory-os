@@ -9,16 +9,22 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use eliot_contracts::{ClockReading, ProductId, RequestId, RequestMetadata, SourceId};
 use eliot_governor::{GovernorLaunchConfig, KernelGenerationSnapshot, KernelPortError};
 use eliot_protocol::{
-    AgentActivationResolutionDecision, AgentActivationResolutionTicket, EncodingProfile, Frame,
-    FrameKind, MessageType, ProtocolPayload, ProtocolVersion, RequestIdentity,
+    AgentActivationResolutionDecision, AgentActivationResolutionResult,
+    AgentActivationResolutionTicket, AgentActivationResultAck, AgentActivationResultReconcile,
+    AgentActivationResultSubmit, EncodingProfile, Frame, FrameKind,
+    HOST_REQUEST_INVOKE_READ_WIRE_ID, HostRequestEnvelope, HostRequestInvokeReadPayload,
+    HostRequestResultBody, LocalReadAttempt, MessageType, ProtocolPayload, ProtocolVersion,
+    RequestIdentity, host_request_operation_id,
 };
 use eliot_receipts::RequestBinding;
+use eliot_store_api::{NamedReadRequest, NamedReadResponse};
 
 #[cfg(windows)]
 use eliot_ipc::{DeliveryOutcome, NamedPipeTransport, TransportLimits};
@@ -45,6 +51,32 @@ pub struct DaemonKernelClient {
     pub(super) connection_id: String,
     pub(super) snapshot: KernelGenerationSnapshot,
     request_counter: Arc<AtomicU64>,
+    /// Literal Kernel-issued `sid=..;session=..` binding string retained only
+    /// after a successful [`validate_server_hello`](handshake::validate_server_hello)
+    /// in this process (AUD-C02-B, Implements #1187). Never the whole
+    /// `ServerHello`, never a constant, no secret: identity refs only. `None`
+    /// until the first validated handshake, so pre-handshake reads stay
+    /// fail-closed to "no live session".
+    validated_session_binding: Mutex<Option<String>>,
+}
+
+/// Already-validated Kernel-issued owner session facts for the single live
+/// owner session (AUD-C02-B, Implements #1187; single-owner decision #1376).
+///
+/// Every field is cloned from state this client already holds after the
+/// authenticated handshake: the validated `sid=..;session=..` binding string,
+/// the Kernel snapshot principal and receipt-relevant artifact digests, the
+/// local connection correlation id, and the descriptor launch nonce carried
+/// in [`KernelLaunchBinding::launch_nonce`]. No re-handshake, no secret, no
+/// constant, no parsing of constants.
+#[derive(Clone, Debug)]
+pub struct OwnerSessionFacts {
+    pub(crate) session_binding: String,
+    pub(crate) kernel_principal: String,
+    pub(crate) connection_id: String,
+    pub(crate) launch_nonce: String,
+    pub(crate) artifact_digest: String,
+    pub(crate) protected_snapshot_digest: String,
 }
 
 #[cfg(windows)]
@@ -73,6 +105,130 @@ where
             outcome => return outcome,
         }
     }
+}
+
+/// Typed outcome of one `local_read_result` submit (Implements #18).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalReadSubmitOutcome {
+    /// Kernel persisted the body through the ORS result path. An exact replay
+    /// of an already-resulted operation reports here too — idempotent, even
+    /// across deadline expiry.
+    Accepted,
+    /// The absolute deadline elapsed before the body could persist. This is
+    /// the expected claim/submit race, projected as a known outcome — never
+    /// as a transport error.
+    Expired,
+    /// The presented attempt is not the current fencing generation: lease
+    /// replacement, reassignment, disconnect, restart, epoch rotation, or
+    /// revocation quarantined the submission as a noncanonical observation.
+    /// The waiter never observes the stale result; the poller idles and the
+    /// current attempt can still complete through its own bound capability.
+    /// Never a transport error, never retried with the same capability.
+    StaleAttempt,
+}
+
+/// Parses one unwrapped `local_read_claim` answer value into the claimed
+/// admitted pair plus its fenced attempt capability.
+///
+/// The Kernel arm
+/// (`bins/eliot-kernel/src/daemon_request_dispatch.rs::local_read_claim`)
+/// answers the single-`operation`-key poll with `{"pair": {"envelope",
+/// "tool", "attempt"}}` or `{"pair": null}`. `None` is the empty-queue
+/// backoff signal, not an error — exactly like the activation ticket `None`
+/// case. The claimed envelope must already decode as admitted shape and the
+/// attempt must already decode as a bound capability (operation handle equal
+/// to the envelope handle); their closed linkage and fence binding are
+/// re-proved inside
+/// [`forward_admitted_local_read`](super::forward_admitted_local_read) before
+/// any read or submit touches them. A pair without an attempt fails closed:
+/// absent authority is never invented.
+pub fn parse_local_read_claimed_pair(
+    value: &serde_json::Value,
+) -> Result<Option<(HostRequestEnvelope, serde_json::Value, LocalReadAttempt)>, String> {
+    // #740: receipt span. Records pair presence/absence by identity; the
+    // tool payload value never enters the sink.
+    let _span = tracing::info_span!("eliotd.request_receipt").entered();
+    let pair = value
+        .get("pair")
+        .ok_or_else(|| "Kernel local_read_claim answer omits the pair".to_owned())?;
+    match pair {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::Object(_) => {
+            let envelope_value = pair
+                .get("envelope")
+                .cloned()
+                .ok_or_else(|| "Kernel local_read_claim pair omits the envelope".to_owned())?;
+            let tool = pair
+                .get("tool")
+                .cloned()
+                .ok_or_else(|| "Kernel local_read_claim pair omits the tool".to_owned())?;
+            let attempt_value = pair
+                .get("attempt")
+                .cloned()
+                .ok_or_else(|| "Kernel local_read_claim pair omits the attempt".to_owned())?;
+            let envelope: HostRequestEnvelope =
+                serde_json::from_value(envelope_value).map_err(|error| {
+                    format!("Kernel local_read_claim pair envelope does not decode: {error}")
+                })?;
+            envelope.validate().map_err(|error| {
+                format!("Kernel local_read_claim pair envelope is not admitted shape: {error}")
+            })?;
+            let attempt: LocalReadAttempt =
+                serde_json::from_value(attempt_value).map_err(|error| {
+                    format!("Kernel local_read_claim pair attempt does not decode: {error}")
+                })?;
+            attempt.validate().map_err(|error| {
+                format!("Kernel local_read_claim pair attempt is not bound shape: {error}")
+            })?;
+            if attempt.operation_id != host_request_operation_id(&envelope) {
+                return Err(
+                    "Kernel local_read_claim pair attempt does not bind the envelope".to_owned(),
+                );
+            }
+            Ok(Some((envelope, tool, attempt)))
+        }
+        _ => Err("Kernel local_read_claim pair is neither an admitted pair nor null".to_owned()),
+    }
+}
+
+/// Parses one unwrapped `local_read_result` answer value into the typed
+/// submit outcome.
+///
+/// The Kernel arm
+/// (`bins/eliot-kernel/src/daemon_request_dispatch.rs::local_read_result`)
+/// answers `{"accepted": true}` on persist (exact replays included),
+/// `{"accepted": false, "expired": true}` when the absolute deadline elapsed
+/// first, and `{"accepted": false, "stale": true, ...}` when the presented
+/// attempt is not the current fencing generation. Anything else is a contract
+/// violation, never a silent accept.
+pub fn parse_local_read_submit_outcome(
+    value: &serde_json::Value,
+) -> Result<LocalReadSubmitOutcome, String> {
+    // #740: submit-outcome span. Accepted/expired/stale stay distinct;
+    // anything else is a contract violation, never a silent accept.
+    let _span = tracing::info_span!("eliotd.local_read_submit").entered();
+    let accepted = value
+        .get("accepted")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| "Kernel local_read_result answer omits the accepted outcome".to_owned())?;
+    if accepted {
+        return Ok(LocalReadSubmitOutcome::Accepted);
+    }
+    if value
+        .get("expired")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Ok(LocalReadSubmitOutcome::Expired);
+    }
+    if value
+        .get("stale")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Ok(LocalReadSubmitOutcome::StaleAttempt);
+    }
+    Err("Kernel local_read_result answer is neither accepted, expired, nor stale".to_owned())
 }
 
 impl DaemonKernelClient {
@@ -112,18 +268,74 @@ impl DaemonKernelClient {
         .map_err(|error| super::DaemonError::Kernel(error.to_string()))
     }
 
+    #[cfg(windows)]
+    pub async fn submit_agent_activation_result(
+        &self,
+        result: &AgentActivationResolutionResult,
+    ) -> Result<AgentActivationResultAck, super::DaemonError> {
+        let submit = AgentActivationResultSubmit::new(result.clone())
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        let value = self
+            .transact_async(
+                "agent_activation_submit",
+                serde_json::json!({ "result": submit }),
+            )
+            .await
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        let ack_value = value.get("ack").cloned().ok_or_else(|| {
+            super::DaemonError::Kernel("Kernel submit response omitted acknowledgement".to_owned())
+        })?;
+        let ack: AgentActivationResultAck = serde_json::from_value(ack_value)
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        ack.validate()
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        Ok(ack)
+    }
+
+    #[cfg(windows)]
+    pub async fn reconcile_agent_activation_result(
+        &self,
+        query: &AgentActivationResultReconcile,
+    ) -> Result<AgentActivationResultAck, super::DaemonError> {
+        query
+            .validate()
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        let value = self
+            .transact_async(
+                "agent_activation_reconcile",
+                serde_json::json!({ "reconcile": query }),
+            )
+            .await
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        let ack_value = value.get("ack").cloned().ok_or_else(|| {
+            super::DaemonError::Kernel(
+                "Kernel reconcile response omitted acknowledgement".to_owned(),
+            )
+        })?;
+        let ack: AgentActivationResultAck = serde_json::from_value(ack_value)
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        ack.validate()
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        Ok(ack)
+    }
+
     pub fn connect(config: &super::DaemonConfig) -> Result<Arc<Self>, super::DaemonError> {
+        // #740: handshake span. Transport connect/session validation is not
+        // semantic readiness; readiness is reported separately.
+        let _span = tracing::info_span!("eliotd.kernel_handshake").entered();
         let client = Self {
             launch: config.launch.clone(),
             connection_id: format!(
-                "eliotd:{}:{}:{}",
+                "eliotd:{}:{}:{}:{}",
                 config.launch.instance_id,
                 config.launch.kernel.generation.value(),
-                config.launch.kernel.authority_epoch.value()
+                config.launch.kernel.authority_epoch.lineage_id.as_str(),
+                config.launch.kernel.authority_epoch.sequence.get()
             ),
             snapshot: expected_snapshot(&config.launch)?,
             kernel_binding: config.kernel_binding.clone(),
             request_counter: Arc::new(AtomicU64::new(1)),
+            validated_session_binding: Mutex::new(None),
         };
         #[cfg(windows)]
         {
@@ -147,7 +359,40 @@ impl DaemonKernelClient {
         }
     }
 
+    /// Returns the already-validated Kernel-issued owner session facts for
+    /// the single live owner session (AUD-C02-B, Implements #1187).
+    ///
+    /// Read-only over held fields: the retained `sid=..;session=..` binding
+    /// string (set only on successful `validate_server_hello`, never a
+    /// constant), the snapshot principal and artifact digests, the connection
+    /// id, and the descriptor launch nonce. No re-handshake, no secret.
+    /// `None` until a handshake in this process has validated a `ServerHello`,
+    /// so daemon composition without a live session keeps the empty
+    /// (unadmitted) controlboard behaviour.
+    #[must_use]
+    pub fn owner_session_facts(&self) -> Option<OwnerSessionFacts> {
+        Some(OwnerSessionFacts {
+            session_binding: self.validated_session_binding()?,
+            kernel_principal: self.snapshot.principal.clone(),
+            connection_id: self.connection_id.clone(),
+            launch_nonce: self.kernel_binding.launch_nonce.clone(),
+            artifact_digest: self.snapshot.artifact_digest.clone(),
+            protected_snapshot_digest: self.snapshot.protected_snapshot_digest.clone(),
+        })
+    }
+
+    /// Clones the retained validated binding string, if any. A poisoned slot
+    /// reads as absent (fail-closed to "no live session"), never invented.
+    fn validated_session_binding(&self) -> Option<String> {
+        self.validated_session_binding
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
     pub fn report_ready(&self) -> Result<(), super::DaemonError> {
+        // #740: readiness span, distinct from the handshake span above.
+        let _span = tracing::info_span!("eliotd.daemon_readiness").entered();
         #[cfg(windows)]
         {
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -169,6 +414,8 @@ impl DaemonKernelClient {
 
     pub fn report_degraded(&self, reason: impl Into<String>) -> Result<(), super::DaemonError> {
         let reason = reason.into();
+        // #740: owning error record at the degraded-report boundary.
+        let _span = tracing::info_span!("eliotd.kernel_degraded").entered();
         if reason.trim().is_empty() || reason.chars().any(char::is_control) || reason.len() > 512 {
             return Err(super::DaemonError::Kernel(
                 "daemon degradation reason is blank, unbounded, or contains control characters"
@@ -202,6 +449,8 @@ impl DaemonKernelClient {
 
     pub fn report_fatal(&self, reason: impl Into<String>) -> Result<(), super::DaemonError> {
         let reason = reason.into();
+        // #740: owning error record at the fatal-report boundary.
+        let _span = tracing::info_span!("eliotd.kernel_fatal").entered();
         if reason.trim().is_empty() || reason.chars().any(char::is_control) || reason.len() > 512 {
             return Err(super::DaemonError::Kernel(
                 "daemon fatal reason is blank, unbounded, or contains control characters"
@@ -253,7 +502,7 @@ impl DaemonKernelClient {
                     "daemon_ready",
                     serde_json::json!({
                         "generation": self.snapshot.generation.value(),
-                        "authority_epoch": self.snapshot.authority_epoch.value(),
+                        "authority_epoch": self.snapshot.authority_epoch.clone(),
                     }),
                 )
             },
@@ -421,6 +670,13 @@ impl DaemonKernelClient {
         let server = eliot_ipc::decode_server_hello_frame(&response, &self.connection_id)
             .map_err(|error| KernelClientError::Contract(error.to_string()))?;
         validate_server_hello(&self.launch, &self.kernel_binding, &server)?;
+        // Retain the literal Kernel-issued binding string only now that it
+        // validated: the owner session facts reader forwards these exact
+        // bytes, never a locally minted session. A lock failure keeps the
+        // previous value, so admission stays fail-closed, never invented.
+        if let Ok(mut slot) = self.validated_session_binding.lock() {
+            *slot = Some(server.session_principal_binding.clone());
+        }
         Ok((transport, limits))
     }
 
@@ -502,6 +758,246 @@ impl DaemonKernelClient {
         })
     }
 
+    /// Executes one closed named read through the authenticated Kernel route.
+    ///
+    /// Mirrors the `receipt` / `store_recovery` transport template: the
+    /// request validates before any transport is touched, the call travels as
+    /// the `"store_named"` operation with a fresh operation-bound identity,
+    /// and the typed response is decoded through the closed
+    /// `"store_named"` kind before exact validation. Kernel remains the route
+    /// and fence authority; this method performs no consistency algorithm and
+    /// no catalogue widening — callers enforce the operation/scope
+    /// capability (T11.1 activates `GetEvidencePack` only at the
+    /// `CanonicalReadClient` boundary).
+    ///
+    /// Errors: `Contract` when the request is malformed, the admitted fence
+    /// does not bind the request, the Kernel kind is unexpected, the payload
+    /// does not decode, the response does not validate, or the response
+    /// substitutes the operation or fence; `NotAdmitted` / `Unknown` for
+    /// transport outcomes via [`kernel_port_error`].
+    pub(super) async fn store_named_async(
+        &self,
+        request: NamedReadRequest,
+    ) -> Result<NamedReadResponse, KernelPortError> {
+        request
+            .validate()
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        if self.snapshot.state_fence() != request.state_fence {
+            return Err(KernelPortError::Contract(
+                "daemon named read fence does not match the admitted snapshot".to_owned(),
+            ));
+        }
+        let value = self
+            .transact_async(
+                "store_named",
+                serde_json::json!({
+                    "request": request,
+                }),
+            )
+            .await
+            .map_err(kernel_port_error)?;
+        let value = super::kind_value(&value, "store_named")?;
+        let response: NamedReadResponse = serde_json::from_value(value)
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        response
+            .validate()
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        if response.operation != request.operation || response.state_fence != request.state_fence {
+            return Err(KernelPortError::Contract(
+                "daemon named read response does not match the requested operation and active state fence"
+                    .to_owned(),
+            ));
+        }
+        Ok(response)
+    }
+
+    /// Claims one queued admitted `eliot.query` pair for the outbound-only
+    /// local-read poller (Implements #18).
+    ///
+    /// Mirrors
+    /// [`claim_agent_activation_ticket`](Self::claim_agent_activation_ticket):
+    /// the call travels as the single-`operation`-key `"local_read_claim"`
+    /// payload and a null `pair` is the empty-queue backoff signal, not an
+    /// error. The claimed pair carries the Kernel-minted fenced attempt
+    /// capability, which the caller must present back on the read leg and the
+    /// submit leg. The claimed pair still proves its closed linkage and fence
+    /// binding inside
+    /// [`forward_admitted_local_read`](super::forward_admitted_local_read)
+    /// before any read or submit touches it.
+    #[cfg(windows)]
+    pub async fn claim_local_read_pair_async(
+        &self,
+    ) -> Result<
+        Option<(HostRequestEnvelope, serde_json::Value, LocalReadAttempt)>,
+        super::DaemonError,
+    > {
+        let value = self
+            .transact_async(
+                "local_read_claim",
+                serde_json::json!({ "operation": "local_read_claim" }),
+            )
+            .await
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        parse_local_read_claimed_pair(&value).map_err(super::DaemonError::Kernel)
+    }
+
+    /// Submits one daemon-produced local-read result body for its waiting
+    /// host request (Implements #18).
+    ///
+    /// The body travels as the single-`result`-key `"local_read_result"`
+    /// payload and is validated before any transport is touched. Kernel
+    /// persists through the ORS result path: an exact replay stays idempotent
+    /// (even across deadline expiry); an elapsed absolute deadline is the
+    /// expected race and projects as
+    /// [`LocalReadSubmitOutcome::Expired`], never as a transport error.
+    #[cfg(windows)]
+    pub async fn submit_local_read_result_async(
+        &self,
+        body: &HostRequestResultBody,
+    ) -> Result<LocalReadSubmitOutcome, super::DaemonError> {
+        body.validate()
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        let value = self
+            .transact_async("local_read_result", serde_json::json!({ "result": body }))
+            .await
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        parse_local_read_submit_outcome(&value).map_err(super::DaemonError::Kernel)
+    }
+
+    /// Executes one closed local read through the authenticated Kernel route.
+    ///
+    /// Twin of [`store_named_async`](Self::store_named_async): the admitted
+    /// envelope+tool pair proves its closed linkage before any transport is
+    /// touched, the call travels as the `"local_read"` operation with a fresh
+    /// operation-bound identity plus the Kernel-issued attempt capability, and
+    /// the persisted result body behind the admitted receipt+record is rebuilt
+    /// through its closed body contract with exact envelope binding before
+    /// return. The returned body carries the presented attempt verbatim, so
+    /// the poller's submit completes under the same fencing generation the
+    /// read ran under. Kernel remains the
+    /// admission, read, and persistence authority; this method performs no
+    /// admission decision and no consistency algorithm.
+    ///
+    /// Wire note: the `local_read` leg answers the documented admission
+    /// shape (`accepted` plus receipt plus record); the `{kind: local_read}`
+    /// wrapper exists only on the error envelope, which never decodes past
+    /// the frame outcome (surfacing as `Unknown`, never as a body).
+    ///
+    /// Errors: `Contract` when the pair is malformed or unlinked, the attempt
+    /// does not bind the envelope, the admitted fence does not bind the
+    /// envelope, the admitted answer does not bind this envelope, or the
+    /// persisted body is absent (a packet admission carries no result body by
+    /// design) or fails its own digest binding; `NotAdmitted` / `Unknown` for
+    /// transport outcomes via [`kernel_port_error`].
+    ///
+    /// Production caller:
+    /// [`forward_admitted_local_read`](super::forward_admitted_local_read),
+    /// driven per claimed pair by the daemon runtime poller.
+    pub(crate) async fn local_read_async(
+        &self,
+        envelope: HostRequestEnvelope,
+        tool: serde_json::Value,
+        attempt: LocalReadAttempt,
+    ) -> Result<HostRequestResultBody, KernelPortError> {
+        let pair = HostRequestInvokeReadPayload {
+            wire_id: HOST_REQUEST_INVOKE_READ_WIRE_ID.to_owned(),
+            wire_version: HostRequestInvokeReadPayload::CONTRACT_VERSION,
+            envelope,
+            tool,
+        };
+        pair.validate()
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        attempt
+            .validate()
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        if attempt.operation_id != host_request_operation_id(&pair.envelope) {
+            return Err(KernelPortError::Contract(
+                "daemon local read attempt does not bind the admitted envelope".to_owned(),
+            ));
+        }
+        if self.snapshot.state_fence() != pair.envelope.state_fence {
+            return Err(KernelPortError::Contract(
+                "daemon local read fence does not match the admitted snapshot".to_owned(),
+            ));
+        }
+        let value = self
+            .transact_async(
+                "local_read",
+                serde_json::json!({
+                    "envelope": pair.envelope,
+                    "tool": pair.tool,
+                    "attempt": attempt,
+                }),
+            )
+            .await
+            .map_err(kernel_port_error)?;
+        let admitted = value.as_object().ok_or_else(|| {
+            KernelPortError::Contract("Kernel local read answer is not an object".to_owned())
+        })?;
+        if admitted.get("accepted") != Some(&serde_json::Value::Bool(true)) {
+            return Err(KernelPortError::Contract(
+                "Kernel local read answer is not an admission".to_owned(),
+            ));
+        }
+        let operation_id = admitted
+            .get("operation_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                KernelPortError::Contract(
+                    "Kernel local read admission omits the operation handle".to_owned(),
+                )
+            })?;
+        if operation_id != host_request_operation_id(&pair.envelope) {
+            return Err(KernelPortError::Contract(
+                "Kernel local read admission does not bind the admitted envelope".to_owned(),
+            ));
+        }
+        let body_digest = admitted
+            .get("record")
+            .and_then(|record| record.get("result_digest"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                KernelPortError::Contract(
+                    "Kernel local read admission carries no result digest; packet admissions stay admission-only"
+                        .to_owned(),
+                )
+            })?;
+        let body_response = admitted
+            .get("record")
+            .and_then(|record| record.get("result_response"))
+            .cloned()
+            .ok_or_else(|| {
+                KernelPortError::Contract(
+                    "Kernel local read admission carries no result body; packet admissions stay admission-only"
+                        .to_owned(),
+                )
+            })?;
+        // Rebuilt, never decoded: the ORS record carries the digest-bound
+        // response halves, while the operation handle, envelope binding, and
+        // attempt capability are proven here from the admitted answer. The
+        // body carries the presented attempt verbatim so submit completes
+        // under the generation the read ran under.
+        let body = HostRequestResultBody {
+            wire_id: eliot_protocol::HOST_REQUEST_RESULT_BODY_WIRE_ID.to_owned(),
+            wire_version: HostRequestResultBody::CONTRACT_VERSION,
+            operation_id: operation_id.to_owned(),
+            request_sha256: pair.envelope.envelope_sha256.clone(),
+            result_digest: body_digest.to_owned(),
+            response: body_response,
+            attempt: Some(attempt),
+        };
+        body.validate()
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        if body.request_sha256 != pair.envelope.envelope_sha256
+            || body.operation_id != host_request_operation_id(&pair.envelope)
+        {
+            return Err(KernelPortError::Contract(
+                "Kernel local read result does not bind the admitted envelope".to_owned(),
+            ));
+        }
+        Ok(body)
+    }
+
     fn clone_for_future(&self) -> Arc<Self> {
         Arc::new(Self {
             launch: self.launch.clone(),
@@ -509,6 +1005,500 @@ impl DaemonKernelClient {
             connection_id: self.connection_id.clone(),
             snapshot: self.snapshot.clone(),
             request_counter: Arc::clone(&self.request_counter),
+            validated_session_binding: Mutex::new(self.validated_session_binding()),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::num::NonZeroU64;
+
+    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
+    use eliot_governor::{
+        GovernorLaunchConfig, KernelGenerationExpectation, KernelGenerationSnapshot,
+        KernelPortError,
+    };
+    use eliot_protocol::{
+        HOST_REQUEST_WIRE_ID, HostRequestEnvelope, HostRequestIdentity, HostRequestKind,
+    };
+    use eliot_read::{
+        ProvenanceDisposition, ReadError, ReadProvenance, ReadService, StoreReadFailure,
+    };
+    use eliot_store_api::{
+        CanonicalReadClient, EVIDENCE_PACK_MAX_RECORDS, NamedReadOperation, RevisionHead,
+        RevisionKey, StoreError,
+    };
+    use serde_json::{Value, json};
+
+    use crate::KernelLaunchBinding;
+    use crate::forward_admitted_local_read;
+    use crate::kernel_context_read_client::KernelContextReadClient;
+
+    const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn test_epoch(sequence: u64) -> Result<EpochId, Box<dyn std::error::Error>> {
+        let lineage =
+            EpochLineageId::new(TEST_LINEAGE).map_err(|error| format!("lineage: {error}"))?;
+        let sequence = NonZeroU64::new(sequence).ok_or("non-zero test sequence")?;
+        EpochId::new(lineage, sequence).map_err(|error| format!("epoch: {error}").into())
+    }
+
+    fn test_fence(generation: u64) -> Result<StateFence, Box<dyn std::error::Error>> {
+        Ok(StateFence::new(
+            test_epoch(1)?,
+            ResourceGeneration::new(generation).map_err(|error| format!("generation: {error}"))?,
+        ))
+    }
+
+    fn tool_digest(tool: &Value) -> Result<String, Box<dyn std::error::Error>> {
+        let bytes = eliot_contracts::canonical_json_bytes(tool)
+            .map_err(|error| format!("canonical tool bytes: {error}"))?;
+        Ok(eliot_contracts::sha256_hex(&bytes))
+    }
+
+    fn query_tool() -> Value {
+        json!({"name":"eliot.query","arguments":{
+            "intent":{
+                "mode":"verification",
+                "time_scope":"session-window",
+                "branch_environment_scope":"branch",
+                "freshness_policy":"exact-fence",
+                "required_assurance":"evidence-provenance"
+            },
+            "query":"subject:evidence-alpha",
+            "exact_resource_uri": null
+        }})
+    }
+
+    fn packet_tool() -> Value {
+        json!({"name":"eliot.packet","arguments":{
+            "packet_ref": null,
+            "material_refs": []
+        }})
+    }
+
+    fn test_envelope(
+        capability: &str,
+        fence: &StateFence,
+        payload_sha256: &str,
+    ) -> Result<HostRequestEnvelope, Box<dyn std::error::Error>> {        HostRequestEnvelope {
+            wire_id: HOST_REQUEST_WIRE_ID.to_owned(),
+            wire_version: HostRequestEnvelope::CONTRACT_VERSION,
+            kind: HostRequestKind::Invocation,
+            connection_id: "conn-test-1".to_owned(),
+            identity: HostRequestIdentity {
+                request_id: eliot_contracts::RequestId::new("host-request-1")
+                    .map_err(|error| format!("request id: {error}"))?,
+                idempotency_key: "host-request-1:invoke".to_owned(),
+                cancellation_id: "host-request-1:invoke:cancel".to_owned(),
+                parent_operation_id: None,
+                deadline_unix_ms: 2_000_000,
+                capability: capability.to_owned(),
+                session_id: Some("kernel-session-1".to_owned()),
+                task_id: None,
+                work_scope_id: None,
+                payload_schema_id: "eliot.mcp.tool-request.v1".to_owned(),
+                payload_sha256: payload_sha256.to_owned(),
+            },
+            state_fence: fence.clone(),
+            descriptor_sha256: "d".repeat(64),
+            peer_admission_receipt_sha256: "e".repeat(64),
+            activation_binding: None,
+            envelope_sha256: String::new(),
+        }
+        .with_computed_digest()
+        .map_err(|error| format!("envelope digest: {error}").into())
+    }
+
+    fn test_attempt(
+        envelope: &HostRequestEnvelope,
+        generation: u64,
+    ) -> Result<LocalReadAttempt, Box<dyn std::error::Error>> {
+        let operation_id = host_request_operation_id(envelope);
+        let attempt = LocalReadAttempt {
+            wire_id: eliot_protocol::LOCAL_READ_ATTEMPT_WIRE_ID.to_owned(),
+            wire_version: LocalReadAttempt::CONTRACT_VERSION,
+            operation_id: operation_id.clone(),
+            attempt_id: format!("{operation_id}:attempt:test-boot:7:{generation}"),
+            fencing_generation: generation,
+            session_id: "kernel-session-1".to_owned(),
+            authority_epoch: envelope.state_fence.authority_epoch.clone(),
+            scope_id: "kernel-session-1".to_owned(),
+            facet_method: "eliot.query".to_owned(),
+            expires_at_unix_ms: envelope.identity.deadline_unix_ms,
+            use_budget: 1,
+        };
+        attempt
+            .validate()
+            .map_err(|error| format!("attempt must validate: {error}"))?;
+        Ok(attempt)
+    }
+
+    fn test_client(fence: &StateFence) -> Result<DaemonKernelClient, Box<dyn std::error::Error>> {
+        let epoch = test_epoch(1)?;
+        let generation =
+            ResourceGeneration::new(1).map_err(|error| format!("generation: {error}"))?;
+        Ok(DaemonKernelClient {
+            launch: GovernorLaunchConfig {
+                instance_id: "test-eliotd".to_owned(),
+                kernel: KernelGenerationExpectation {
+                    service: "eliot-kernel".to_owned(),
+                    protocol: "test".to_owned(),
+                    artifact_digest: "a".repeat(64),
+                    protected_snapshot_digest: "b".repeat(64),
+                    principal: "test-principal".to_owned(),
+                    generation,
+                    authority_epoch: epoch.clone(),
+                },
+                protected_snapshot_digest: "b".repeat(64),
+            },
+            kernel_binding: KernelLaunchBinding {
+                kernel_pipe_name: r"\\.\pipe\eliot\test".to_owned(),
+                expected_kernel_sid: "S-1-5-18".to_owned(),
+                expected_kernel_session_id: 0,
+                module_generation: generation,
+                authority_epoch: epoch.clone(),
+                state_fence: fence.clone(),
+                launch_nonce: "test-nonce".to_owned(),
+                kernel_artifact_sha256: "a".repeat(64),
+                daemon_artifact_sha256: "c".repeat(64),
+            },
+            connection_id: "test-connection".to_owned(),
+            snapshot: KernelGenerationSnapshot {
+                service: "eliot-kernel".to_owned(),
+                protocol: "test".to_owned(),
+                generation,
+                authority_epoch: epoch,
+                artifact_digest: "a".repeat(64),
+                protected_snapshot_digest: "b".repeat(64),
+                principal: "test-principal".to_owned(),
+            },
+            request_counter: Arc::new(AtomicU64::new(1)),
+            validated_session_binding: Mutex::new(None),
+        })
+    }
+
+    /// Minimal in-test evidence table. It stores captured subjects in capture
+    /// order and derives every response field from the incoming request: real
+    /// request validation, the closed evidence operation, exact fence
+    /// equality, the declared `subject` / `max_records` selectors, and the
+    /// catalogue bound. Nothing is canned.
+    struct EvidenceTable {
+        fence: StateFence,
+        captured: Vec<String>,
+    }
+
+    impl EvidenceTable {
+        fn new(fence: StateFence) -> Self {
+            Self {
+                fence,
+                captured: Vec::new(),
+            }
+        }
+
+        fn capture(&mut self, subject: &str) {
+            self.captured.push(subject.to_owned());
+        }
+
+        fn selectors(parameters: &BTreeMap<String, Value>) -> Result<(String, u32), StoreError> {
+            let subject = parameters
+                .get("subject")
+                .and_then(Value::as_str)
+                .filter(|subject| !subject.trim().is_empty())
+                .ok_or(StoreError::InvalidField {
+                    field: "operation.parameter",
+                    reason: "evidence subject must be exact",
+                })?;
+            let bound = parameters
+                .get("max_records")
+                .and_then(Value::as_str)
+                .ok_or(StoreError::InvalidField {
+                    field: "operation.parameter",
+                    reason: "max_records must ride as an exact decimal string",
+                })?;
+            let bound: u32 = bound.parse().map_err(|_| StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "max_records must ride as an exact decimal string",
+            })?;
+            if bound == 0 || bound > EVIDENCE_PACK_MAX_RECORDS {
+                return Err(StoreError::InvalidField {
+                    field: "operation.parameter",
+                    reason: "max_records must be within the catalogue bound",
+                });
+            }
+            Ok((subject.to_owned(), bound))
+        }
+    }
+
+    #[allow(async_fn_in_trait)]
+    impl CanonicalReadClient for EvidenceTable {
+        async fn revision_heads(
+            &self,
+            _keys: Vec<RevisionKey>,
+        ) -> Result<Vec<RevisionHead>, StoreError> {
+            Ok(Vec::new())
+        }
+
+        async fn execute_named(
+            &self,
+            query: NamedReadRequest,
+        ) -> Result<NamedReadResponse, StoreError> {
+            query.validate()?;
+            if query.operation != NamedReadOperation::GetEvidencePack {
+                return Err(StoreError::UnknownOperation);
+            }
+            if query.scope_id.is_none() {
+                return Err(StoreError::InvalidField {
+                    field: "scope_id",
+                    reason: "GetEvidencePack requires an exact scope",
+                });
+            }
+            if query.state_fence != self.fence {
+                return Err(StoreError::FenceMismatch);
+            }
+            let (subject, bound) = Self::selectors(&query.parameters)?;
+            let limit = usize::try_from(bound).map_err(|_| StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "max_records must be within the catalogue bound",
+            })?;
+            let records: Vec<Value> = self
+                .captured
+                .iter()
+                .filter(|captured| *captured == &subject)
+                .take(limit)
+                .map(|captured| json!({"subject": captured}))
+                .collect();
+            let response = NamedReadResponse {
+                operation: query.operation,
+                state_fence: query.state_fence.clone(),
+                revision_heads: Vec::new(),
+                payload: json!({
+                    "version": 1,
+                    "subject": subject,
+                    "max_records": bound,
+                    "records": records,
+                }),
+            };
+            response.validate()?;
+            Ok(response)
+        }
+    }
+
+    #[test]
+    fn local_read_bridge_serves_captured_evidence_and_fails_closed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fence = test_fence(1)?;
+        let client = test_client(&fence)?;
+        assert_eq!(
+            client.snapshot.state_fence(),
+            fence,
+            "the test client must bind the admitted fence or every leg fails before reading"
+        );
+
+        let tool = query_tool();
+        let envelope = test_envelope("eliot.query", &fence, &tool_digest(&tool)?)?;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("test runtime: {error}"))?;
+
+        // Capture an observation, then bridge eliot.query for the captured
+        // subject: the exact evidence record, provenance, and fence return.
+        let mut table = EvidenceTable::new(fence.clone());
+        table.capture("evidence-alpha");
+        let service = ReadService::new(table);
+        let result = runtime.block_on(KernelContextReadClient::execute_local_read(
+            &service, &fence, &envelope, &tool,
+        ))?;
+        assert_eq!(result.operation, NamedReadOperation::GetEvidencePack);
+        assert_eq!(result.state_fence, fence);
+        let records = result
+            .payload
+            .get("records")
+            .and_then(Value::as_array)
+            .ok_or("evidence records must ride the payload")?;
+        assert_eq!(
+            records.len(),
+            1,
+            "the captured subject reads back exactly once"
+        );
+        assert_eq!(
+            records[0].get("subject").and_then(Value::as_str),
+            Some("evidence-alpha"),
+            "the readback record is the captured evidence, never a substitute"
+        );
+        assert_eq!(
+            result.provenance,
+            ReadProvenance {
+                handles: Vec::new(),
+                disposition: ProvenanceDisposition::Unavailable,
+            },
+            "the readback provenance is the exact facade lineage"
+        );
+
+        // A wrong fence fails closed before any read: FenceMismatch, never
+        // Ok-empty.
+        let wrong = test_fence(2)?;
+        let wrong_envelope = test_envelope("eliot.query", &wrong, &tool_digest(&tool)?)?;
+        let fenced = runtime.block_on(KernelContextReadClient::execute_local_read(
+            &service,
+            &fence,
+            &wrong_envelope,
+            &tool,
+        ));
+        assert!(
+            matches!(
+                fenced,
+                Err(ReadError::Store(StoreReadFailure::FenceMismatch))
+            ),
+            "a wrong fence must fail closed as FenceMismatch, got {fenced:?}"
+        );
+
+        // Packet pairs stay admission-only: Unavailable, never a read.
+        let packet = packet_tool();
+        let packet_envelope = test_envelope("eliot.packet", &fence, &tool_digest(&packet)?)?;
+        let admitted_only = runtime.block_on(KernelContextReadClient::execute_local_read(
+            &service,
+            &fence,
+            &packet_envelope,
+            &packet,
+        ));
+        assert!(
+            matches!(
+                admitted_only,
+                Err(ReadError::Store(StoreReadFailure::Unavailable))
+            ),
+            "packet must stay admission-only as Unavailable, got {admitted_only:?}"
+        );
+
+        // The production forwarding bridge fails closed before transport: a
+        // wrong fence is Contract (not a Kernel round-trip), never Ok-empty.
+        let transport_fenced = runtime.block_on(forward_admitted_local_read(
+            &client,
+            wrong_envelope.clone(),
+            tool.clone(),
+            test_attempt(&wrong_envelope, 1)?,
+        ));
+        assert!(
+            matches!(transport_fenced, Err(KernelPortError::Contract(_))),
+            "a wrong fence must fail the local_read transport closed as Contract, got {transport_fenced:?}"
+        );
+
+        // A malformed pair is Contract before transport is touched.
+        let malformed = runtime.block_on(forward_admitted_local_read(
+            &client,
+            envelope.clone(),
+            json!("not-an-object"),
+            test_attempt(&envelope, 1)?,
+        ));
+        assert!(
+            matches!(malformed, Err(KernelPortError::Contract(_))),
+            "a malformed pair must fail the local_read transport closed as Contract, got {malformed:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn local_read_claim_submit_wire_shapes_parse_closed() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use super::{parse_local_read_claimed_pair, parse_local_read_submit_outcome};
+        use crate::LocalReadSubmitOutcome;
+
+        // A null pair is the empty-queue backoff signal, not an error.
+        let empty = serde_json::json!({ "pair": null });
+        assert_eq!(
+            parse_local_read_claimed_pair(&empty)
+                .map_err(|error| format!("empty claim must not fail: {error}"))?,
+            None,
+            "an empty claim must poll null"
+        );
+
+        // A claimed pair round-trips the exact admitted envelope, tool, and
+        // fenced attempt capability.
+        let fence = test_fence(1)?;
+        let tool = query_tool();
+        let envelope = test_envelope("eliot.query", &fence, &tool_digest(&tool)?)?;
+        let attempt = test_attempt(&envelope, 1)?;
+        let answer = serde_json::json!({
+            "pair": {
+                "envelope": envelope.clone(),
+                "tool": tool.clone(),
+                "attempt": attempt.clone(),
+            }
+        });
+        let (claimed_envelope, claimed_tool, claimed_attempt) =
+            parse_local_read_claimed_pair(&answer)
+                .map_err(|error| format!("queued pair must parse: {error}"))?
+                .ok_or("a queued pair must claim")?;
+        assert_eq!(
+            claimed_envelope.envelope_sha256, envelope.envelope_sha256,
+            "the claim returns the exact admitted envelope"
+        );
+        assert_eq!(claimed_tool, tool, "the claim returns the exact tool bytes");
+        assert_eq!(
+            claimed_attempt, attempt,
+            "the claim returns the exact fenced attempt"
+        );
+
+        // A pair omitting the envelope, the tool, or the attempt, a non-pair
+        // value, an attempt bound to another operation, and an answer omitting
+        // the pair all fail closed — never Ok-empty, never invented.
+        let mut foreign_attempt = serde_json::to_value(&attempt)
+            .map_err(|error| format!("attempt must encode: {error}"))?;
+        foreign_attempt["operation_id"] =
+            serde_json::json!("hostreq:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        for bad in [
+            serde_json::json!({ "pair": { "tool": tool.clone(), "attempt": attempt.clone() } }),
+            serde_json::json!({ "pair": { "envelope": envelope.clone(), "tool": tool.clone() } }),
+            serde_json::json!({ "pair": {
+                "envelope": envelope.clone(),
+                "tool": tool.clone(),
+                "attempt": foreign_attempt.clone(),
+            } }),
+            serde_json::json!({ "pair": "not-a-pair" }),
+            serde_json::json!({ "operation": "local_read_claim" }),
+        ] {
+            assert!(
+                parse_local_read_claimed_pair(&bad).is_err(),
+                "a malformed claim answer must fail closed, got {bad}"
+            );
+        }
+
+        // Accepted persists (exact replays included); expired is the expected
+        // deadline race; stale quarantines a replaced or revoked attempt —
+        // never a transport error.
+        assert_eq!(
+            parse_local_read_submit_outcome(&serde_json::json!({ "accepted": true }))
+                .map_err(|error| format!("accepted must parse: {error}"))?,
+            LocalReadSubmitOutcome::Accepted,
+        );
+        assert_eq!(
+            parse_local_read_submit_outcome(
+                &serde_json::json!({ "accepted": false, "expired": true })
+            )
+            .map_err(|error| format!("expired must parse: {error}"))?,
+            LocalReadSubmitOutcome::Expired,
+        );
+        assert_eq!(
+            parse_local_read_submit_outcome(
+                &serde_json::json!({ "accepted": false, "stale": true, "reason": "superseded" })
+            )
+            .map_err(|error| format!("stale must parse: {error}"))?,
+            LocalReadSubmitOutcome::StaleAttempt,
+        );
+        for bad in [
+            serde_json::json!({}),
+            serde_json::json!({ "accepted": false }),
+            serde_json::json!({ "accepted": "yes" }),
+        ] {
+            assert!(
+                parse_local_read_submit_outcome(&bad).is_err(),
+                "an unknown submit answer must fail closed, got {bad}"
+            );
+        }
+        Ok(())
     }
 }

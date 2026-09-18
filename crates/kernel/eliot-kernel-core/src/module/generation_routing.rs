@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 
-use eliot_contracts::{AuthorityEpoch, ResourceGeneration};
+use eliot_contracts::{AuthorityEpoch, EpochId, ResourceGeneration};
 use eliot_runtime_contracts::GenerationCutoverState;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -268,6 +268,30 @@ impl GenerationRouter {
         self.routes.get(scope).ok_or(KernelError::RouteMismatch)
     }
 
+    /// Resolves the active route only when the canonical exact-tuple fence matches.
+    ///
+    /// The canonical check runs first via exact lineage-plus-sequence equality:
+    /// cross-lineage same-sequence fences fail closed as
+    /// [`KernelError::FenceMismatch`] without any scalar coercion, and only an
+    /// exact canonical match delegates to the scalar [`Self::route_for_fence`]
+    /// path, which is left intact.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KernelError::FenceMismatch`] for a non-matching canonical
+    /// tuple, then the same failures as [`Self::route_for_fence`].
+    pub fn route_for_canonical_fence(
+        &self,
+        fence: &RouteFence,
+        fence_epoch: &EpochId,
+        active_epoch: &EpochId,
+    ) -> Result<&GenerationRoute, KernelError> {
+        if !fence_epoch.is_same_authority(active_epoch) {
+            return Err(KernelError::FenceMismatch);
+        }
+        self.route_for_fence(fence)
+    }
+
     /// Applies a committed cutover, raising the epoch and switching the route.
     ///
     /// # Errors
@@ -335,6 +359,8 @@ impl GenerationRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eliot_contracts::EpochLineageId;
+    use std::num::NonZeroU64;
 
     fn router_with_daemon(epoch: u64, generation: u64) -> Result<GenerationRouter, KernelError> {
         let mut router = GenerationRouter::at_epoch(AuthorityEpoch::new(epoch)?)?;
@@ -525,6 +551,47 @@ mod tests {
             assert_eq!(route.active_generation().value(), model_generation);
             assert_eq!(route.authority_epoch().value(), model_epoch);
         }
+        Ok(())
+    }
+
+    fn canonical_epoch(lineage: &str, sequence: u64) -> Result<EpochId, KernelError> {
+        let lineage_id = EpochLineageId::new(lineage).map_err(|_| KernelError::InvalidField {
+            field: "lineage_id",
+            reason: "must be a canonical UUID lineage",
+        })?;
+        let sequence = NonZeroU64::new(sequence).ok_or(KernelError::InvalidField {
+            field: "sequence",
+            reason: "must be greater than zero",
+        })?;
+        EpochId::new(lineage_id, sequence).map_err(|_| KernelError::InvalidField {
+            field: "epoch_id",
+            reason: "invalid canonical epoch",
+        })
+    }
+
+    #[test]
+    fn canonical_fence_gates_route_before_scalar_match() -> Result<(), KernelError> {
+        let router = router_with_daemon(2, 5)?;
+        let fence = RouteFence::new(
+            RouteScope::new("daemon")?,
+            AuthorityEpoch::new(2)?,
+            ResourceGeneration::new(5)?,
+            eliot_process::Generation::new(1)?,
+            "nonce",
+        )?;
+        let active = canonical_epoch("550e8400-e29b-41d4-a716-446655440000", 2)?;
+        let same = canonical_epoch("550e8400-e29b-41d4-a716-446655440000", 2)?;
+        let cross_lineage_same_sequence =
+            canonical_epoch("6ba7b810-9dad-11d1-80b4-00c04fd430c8", 2)?;
+        assert!(
+            router
+                .route_for_canonical_fence(&fence, &same, &active)
+                .is_ok()
+        );
+        assert!(matches!(
+            router.route_for_canonical_fence(&fence, &cross_lineage_same_sequence, &active),
+            Err(KernelError::FenceMismatch)
+        ));
         Ok(())
     }
 }

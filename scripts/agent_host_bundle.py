@@ -68,6 +68,21 @@ SENSITIVE_KEY_FRAGMENTS = (
     "private_key",
 )
 TEXT_SUFFIXES = {".json", ".md", ".txt", ".js", ".mjs", ".ts", ".toml", ".yaml", ".yml", ".py", ".sh", ".ps1"}
+IDENTITY_VERSION = "eliot.agent-host-bundle-identity.v1"
+DISPOSITIONS = (
+    "live-admitted",
+    "unavailable-target",
+    "compatibility-with-expiry",
+    "removal",
+)
+IDENTITY_BLOCK_KEYS = ("identity", "bundle_identity", "generation")
+# Manifest host-entry keys that carry caller-declared identity. They are excluded
+# from the manifest-entry digest so a generation can pin its own inputs without
+# circularity; declared digests are verified against recomputation instead.
+DECLARED_IDENTITY_KEYS = ("identity", "bundle_identity", "generation")
+_HEX_DIGEST_RE = re.compile(r"^[0-9a-f]+$")
+_HEX_DIGEST_LENGTHS = frozenset({32, 40, 48, 64, 96, 128})
+_DIGEST_NAME_RE = re.compile(r"(?:^|_)(sha256|sha512|sha384|sha1|md5|digest|hash|blake3)$")
 
 
 class BundleError(RuntimeError):
@@ -91,12 +106,71 @@ def sha256_file(path: Path) -> str:
 
 
 def _safe_relative(value: str, field: str) -> PurePosixPath:
+    if not isinstance(value, str) or not value:
+        raise BundleError(f"{field}: unsafe relative path")
+    if "\x00" in value or "\\" in value:
+        raise BundleError(f"{field}: unsafe relative path")
+    if any(ord(char) < 0x20 for char in value):
+        raise BundleError(f"{field}: unsafe relative path")
+    if re.match(r"^[A-Za-z]:", value):
+        raise BundleError(f"{field}: unsafe relative path")
     candidate = PurePosixPath(value)
     if not value or candidate.is_absolute() or ".." in candidate.parts or "." in candidate.parts:
         raise BundleError(f"{field}: unsafe relative path")
     if any(part in FORBIDDEN_PARTS for part in candidate.parts):
         raise BundleError(f"{field}: forbidden path component")
     return candidate
+
+
+def _validate_identity_node(name: str, value: Any, location: str) -> None:
+    """Generically validate a Part A identity/disposition field by name.
+
+    Digest-shaped fields must be well-formed lowercase hex, disposition fields
+    must name a known disposition, and version fields must be non-empty strings.
+    Every other field passes through untouched so the identity schema can grow
+    without a planning change. Malformed identity fails closed.
+    """
+    normalized = str(name).lower().replace("-", "_")
+    if normalized == "disposition":
+        if isinstance(value, dict):
+            # Specified Part A shape is a disposition BLOCK carrying the scalar
+            # under its own "disposition" key plus digests/versions/metadata.
+            # Recurse so the inner scalar, digest-likes, and versions validate
+            # exactly like a scalar disposition site. A block never admits.
+            for key, child in value.items():
+                if not isinstance(key, str) or not key:
+                    raise BundleError(f"{location}: identity mapping requires string keys")
+                _validate_identity_node(key, child, f"{location}.{key}")
+            return
+        if value not in DISPOSITIONS:
+            raise BundleError(f"{location}: unknown disposition {value!r}")
+        return
+    if normalized in {"schema_version", "identity_version", "version"}:
+        if not isinstance(value, str) or not value.strip():
+            raise BundleError(f"{location}: version must be a non-empty string")
+        return
+    if _DIGEST_NAME_RE.search(normalized):
+        if isinstance(value, list):
+            if not value:
+                raise BundleError(f"{location}: malformed digest (expected lowercase hex)")
+            for index, child in enumerate(value):
+                _validate_identity_node(name, child, f"{location}[{index}]")
+            return
+        if (
+            not isinstance(value, str)
+            or len(value) not in _HEX_DIGEST_LENGTHS
+            or _HEX_DIGEST_RE.match(value) is None
+        ):
+            raise BundleError(f"{location}: malformed digest (expected lowercase hex)")
+        return
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if not isinstance(key, str) or not key:
+                raise BundleError(f"{location}: identity mapping requires string keys")
+            _validate_identity_node(key, child, f"{location}.{key}")
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            _validate_identity_node(name, child, f"{location}[{index}]")
 
 
 def _allowed_placeholder(value: str) -> bool:
@@ -144,6 +218,8 @@ def _validate_source_file(path: Path, root: Path, max_file_bytes: int) -> bytes:
         raise BundleError(f"{relative.as_posix()}: file exceeds bundle limit")
     data = path.read_bytes()
     if path.suffix.lower() in TEXT_SUFFIXES:
+        if b"\x00" in data:
+            raise BundleError(f"{relative.as_posix()}: binary content in text payload is forbidden")
         try:
             text = data.decode("utf-8")
         except UnicodeDecodeError as error:
@@ -200,6 +276,13 @@ def load_manifest(root: Path, manifest_path: Path = MANIFEST_PATH) -> dict[str, 
             raise BundleError(f"host bundle limit {key} is invalid")
     _safe_relative(str(manifest.get("canonical_skill_root", "")), "canonical_skill_root")
     _safe_relative(str(manifest.get("canonical_skill_manifest", "")), "canonical_skill_manifest")
+    for host_name, host_config in hosts.items():
+        if not isinstance(host_config, dict):
+            raise BundleError(f"host bundle manifest entry is invalid: {host_name}")
+        for key in IDENTITY_BLOCK_KEYS:
+            if key in host_config and not isinstance(host_config[key], dict):
+                raise BundleError(f"{host_name}: manifest identity block {key!r} must be an object")
+    _validate_identity_node("manifest", manifest, "host bundle manifest")
     return manifest
 
 
@@ -233,6 +316,7 @@ def _validate_route_profile(profile: dict[str, Any], host: str) -> None:
         raise BundleError(f"{host}: durable mailbox is required")
     if coordination.get("meeting_form") != "concilium_over_sealed_evidence":
         raise BundleError(f"{host}: Concilium contract is required")
+    _validate_identity_node("route_profile", profile, f"{host} route profile")
 
 
 def _trigger_from_skill_body(text: str, fallback: str) -> str:
@@ -280,6 +364,8 @@ def _copy_payload(
 ) -> None:
     def copy_one(file_path: Path, destination_path: PurePosixPath) -> None:
         safe_destination = _safe_relative(destination_path.as_posix(), "bundle destination")
+        if safe_destination.name.lower() in FORBIDDEN_NAMES or safe_destination.suffix.lower() in FORBIDDEN_SUFFIXES:
+            raise BundleError(f"bundle destination {safe_destination.as_posix()}: credential/runtime artifact is forbidden")
         key = (PurePosixPath("host") / safe_destination).as_posix()
         if key in entries:
             raise BundleError(f"duplicate bundle destination: {key}")
@@ -299,6 +385,94 @@ def _copy_payload(
         copy_one(file_path, destination / relative)
 
 
+def compute_bundle_identity(
+    *,
+    manifest_entry_sha256: str,
+    route_profile_sha256: str,
+    skill_manifest_sha256: str,
+    skill_index_sha256: str,
+    payload_entries: list[dict[str, Any]],
+) -> str:
+    """Bind manifest entry, route profile, Skill manifest/index, and payload bytes.
+
+    The manifest entry digest covers the host entry WITHOUT its declared
+    identity blocks, so a generation can pin its own inputs without circularity.
+    """
+    document = {
+        "identity_version": IDENTITY_VERSION,
+        "manifest_entry_sha256": manifest_entry_sha256,
+        "route_profile_sha256": route_profile_sha256,
+        "skill_manifest_sha256": skill_manifest_sha256,
+        "skill_index_sha256": skill_index_sha256,
+        "payload": payload_entries,
+    }
+    return sha256_bytes(canonical_json_bytes(document))
+
+
+def _declared_identity_blocks(host_config: dict[str, Any], host: str) -> list[dict[str, Any]]:
+    blocks: list[dict[str, Any]] = []
+    for key in IDENTITY_BLOCK_KEYS:
+        block = host_config.get(key)
+        if block is not None:
+            if not isinstance(block, dict):
+                raise BundleError(f"{host}: manifest identity block {key!r} must be an object")
+            blocks.append(block)
+    return blocks
+
+
+def _verify_declared_identity(
+    blocks: list[dict[str, Any]],
+    host: str,
+    *,
+    route_profile_sha256: str,
+    skill_manifest_sha256: str,
+    manifest_entry_sha256: str,
+    bundle_identity: str,
+    bundle_sha256: str,
+    entries: dict[str, dict[str, Any]],
+) -> None:
+    """Fail closed when a manifest-declared digest contradicts recomputation.
+
+    Only names with a fixed local meaning are compared; every other declared
+    field was already shape-checked and is superseded by the computed receipt.
+    A forged digest therefore never survives planning.
+    """
+    comparable = {
+        "route_profile_sha256": route_profile_sha256,
+        "skill_manifest_sha256": skill_manifest_sha256,
+        "skill_pack_sha256": skill_manifest_sha256,
+        "manifest_entry_sha256": manifest_entry_sha256,
+        "bundle_identity": bundle_identity,
+        "bundle_sha256": bundle_sha256,
+    }
+    by_bundle_path = dict(entries)
+    for key, entry in entries.items():
+        by_bundle_path.setdefault(key.split("/", 1)[-1] if "/" in key else key, entry)
+    for block in blocks:
+        for name, expected in comparable.items():
+            declared = block.get(name)
+            if declared is not None and declared != expected:
+                raise BundleError(f"{host}: declared {name} does not match recomputation")
+        for list_key in ("payload", "files"):
+            declared_files = block.get(list_key)
+            if declared_files is None:
+                continue
+            if not isinstance(declared_files, list):
+                raise BundleError(f"{host}: declared {list_key} must be a list")
+            for item in declared_files:
+                if not isinstance(item, dict):
+                    raise BundleError(f"{host}: declared {list_key} entry must be an object")
+                declared_path = item.get("path")
+                declared_digest = item.get("sha256", item.get("digest"))
+                if not isinstance(declared_path, str) or not isinstance(declared_digest, str):
+                    raise BundleError(f"{host}: declared {list_key} entry requires path and digest strings")
+                actual = by_bundle_path.get(declared_path)
+                if actual is None:
+                    raise BundleError(f"{host}: declared {list_key} entry is unknown: {declared_path!r}")
+                if actual["sha256"] != declared_digest:
+                    raise BundleError(f"{host}: declared digest for {declared_path!r} does not match recomputation")
+
+
 def materialize_host_bundle(
     root: Path,
     host: str,
@@ -310,6 +484,14 @@ def materialize_host_bundle(
     host_config = manifest["hosts"].get(host)
     if not isinstance(host_config, dict):
         raise BundleError(f"unsupported host: {host}")
+    output_resolved = output.resolve()
+    try:
+        output_resolved.relative_to(root)
+        root_swallowed = True
+    except ValueError:
+        root_swallowed = False
+    if output_resolved == root or root_swallowed:
+        raise BundleError("output must not contain the repository root")
     if output.exists() and any(output.iterdir() if output.is_dir() else [output]):
         raise BundleError("output path must not contain existing data")
 
@@ -327,6 +509,20 @@ def materialize_host_bundle(
     skill_root = root.joinpath(*skill_root_relative.parts)
     if not skill_root.is_dir() or skill_root.is_symlink():
         raise BundleError("canonical Skill root is unavailable or unsafe")
+    skill_manifest_relative = _safe_relative(str(manifest["canonical_skill_manifest"]), "canonical_skill_manifest")
+    skill_manifest_path = root.joinpath(*skill_manifest_relative.parts)
+    skill_manifest_bytes = _validate_source_file(skill_manifest_path, root, limits["max_file_bytes"])
+    try:
+        skill_manifest_document = json.loads(skill_manifest_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise BundleError("canonical Skill manifest: unreadable JSON") from error
+    if not isinstance(skill_manifest_document, dict):
+        raise BundleError("canonical Skill manifest: JSON root must be an object")
+    skill_manifest_sha256 = sha256_bytes(skill_manifest_bytes)
+    manifest_entry_sha256 = sha256_bytes(
+        canonical_json_bytes({key: value for key, value in host_config.items() if key not in DECLARED_IDENTITY_KEYS})
+    )
+    declared_blocks = _declared_identity_blocks(host_config, host)
     description_manifest = root / manifest["canonical_skill_manifest"]
     descriptions = _skill_manifest_descriptions(description_manifest)
 
@@ -405,12 +601,34 @@ def materialize_host_bundle(
             raise BundleError("bundle bytes exceed limit")
         ordered_entries = [entries[key] for key in sorted(entries)]
         bundle_hash = sha256_bytes(canonical_json_bytes(ordered_entries))
+        bundle_identity = compute_bundle_identity(
+            manifest_entry_sha256=manifest_entry_sha256,
+            route_profile_sha256=sha256_bytes(route_bytes),
+            skill_manifest_sha256=skill_manifest_sha256,
+            skill_index_sha256=sha256_bytes(index_bytes),
+            payload_entries=ordered_entries,
+        )
+        _verify_declared_identity(
+            declared_blocks,
+            host,
+            route_profile_sha256=sha256_bytes(route_bytes),
+            skill_manifest_sha256=skill_manifest_sha256,
+            manifest_entry_sha256=manifest_entry_sha256,
+            bundle_identity=bundle_identity,
+            bundle_sha256=bundle_hash,
+            entries=entries,
+        )
         receipt = {
             "schema_version": RECEIPT_VERSION,
             "host": host,
+            "identity_version": IDENTITY_VERSION,
             "route_profile_id": route_profile.get("profile_id"),
             "route_profile_sha256": sha256_bytes(route_bytes),
             "skill_index_sha256": sha256_bytes(index_bytes),
+            "skill_manifest_sha256": skill_manifest_sha256,
+            "manifest_entry_sha256": manifest_entry_sha256,
+            "bundle_identity": bundle_identity,
+            "declared_identity": "verified" if declared_blocks else "absent",
             "bundle_sha256": bundle_hash,
             "file_count": len(ordered_entries),
             "total_bytes": total_bytes,
@@ -427,7 +645,9 @@ def materialize_host_bundle(
         install_plan = {
             "schema_version": INSTALL_PLAN_VERSION,
             "host": host,
+            "identity_version": IDENTITY_VERSION,
             "bundle_sha256": bundle_hash,
+            "bundle_identity": bundle_identity,
             "source_subdirectory": "host",
             "destination_hint": host_config.get("destination_hint"),
             "mode": "copy_after_explicit_operator_action",

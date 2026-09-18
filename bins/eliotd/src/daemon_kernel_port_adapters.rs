@@ -48,6 +48,8 @@ impl KernelServiceObservationPort for DaemonKernelClient {
         state_fence: &StateFence,
         protected_snapshot_digest: &str,
     ) -> Result<Vec<KernelServiceRecovery>, KernelPortError> {
+        // #740: request/result span over the observation boundary.
+        let _span = tracing::info_span!("eliotd.kernel_services").entered();
         let value = self.request_blocking(
             "services",
             serde_json::json!({
@@ -66,6 +68,12 @@ impl KernelDurableJobPort for DaemonKernelClient {
         job_id: &str,
         state_fence: &StateFence,
     ) -> Result<Option<MaintenanceJob>, KernelPortError> {
+        // #740: request/result span over the durable-job read boundary.
+        let _span = tracing::info_span!(
+            "eliotd.kernel_durable_read",
+            job = %super::diagnostics::sanitize_identity(job_id)
+        )
+        .entered();
         let value = self.request_blocking(
             "load_durable_job",
             serde_json::json!({ "job_id": job_id, "state_fence": state_fence }),
@@ -75,6 +83,8 @@ impl KernelDurableJobPort for DaemonKernelClient {
     }
 
     fn save_durable_job(&self, job: &MaintenanceJob) -> Result<(), KernelPortError> {
+        // #740: request/result span over the durable-job save boundary.
+        let _span = tracing::info_span!("eliotd.kernel_durable_save").entered();
         let _ = self.request_blocking("save_durable_job", serde_json::json!({ "job": job }))?;
         Ok(())
     }

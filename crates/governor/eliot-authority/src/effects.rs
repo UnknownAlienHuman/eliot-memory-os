@@ -433,10 +433,21 @@ mod recovery_tests {
 
     use super::*;
     use eliot_contracts::{
-        AuthorityEpoch, OperationId, RequestId, ResourceGeneration, StateFence,
+        EpochId, EpochLineageId, OperationId, RequestId, ResourceGeneration, StateFence,
         canonical_json_bytes,
     };
     use eliot_receipts::EffectClass;
+    use std::num::NonZeroU64;
+
+    const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn test_epoch(lineage: &str, sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(lineage).expect("valid test lineage"),
+            NonZeroU64::new(sequence).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
 
     type TestResult = Result<(), Box<dyn Error>>;
 
@@ -447,7 +458,10 @@ mod recovery_tests {
             idempotency_key: key.to_owned(),
             operation_kind: "test.effect".to_owned(),
             effect: EffectClass::ReversibleMutation,
-            state_fence: StateFence::new(AuthorityEpoch::new(1)?, ResourceGeneration::new(1)?),
+            state_fence: StateFence::new(
+                test_epoch(TEST_LINEAGE_A, 1),
+                ResourceGeneration::new(1)?,
+            ),
         })
     }
 

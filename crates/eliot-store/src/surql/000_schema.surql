@@ -51,7 +51,7 @@ DEFINE INDEX OVERWRITE idx_canonical_write ON TABLE canonical_record FIELDS writ
 -- every idempotent schema migration so an upgrade cannot hide prior authority.
 UPDATE canonical_record SET trace_ref = <string> receipt_body.trace_ref
 WHERE receipt_kind = 'trace_completeness_contract'
-  AND (trace_ref = NONE OR trace_ref = NULL OR trace_ref = '')
+  AND (trace_ref ?? '') = ''
   AND receipt_body.trace_ref != NONE
   AND receipt_body.trace_ref != NULL;
 UPDATE canonical_record SET
@@ -59,8 +59,8 @@ UPDATE canonical_record SET
   canonical_action = <string> receipt_body.action
 WHERE receipt_kind IN ['meta_policy_promotion', 'meta_policy_rollback']
   AND (
-    candidate_id = NONE OR candidate_id = NULL OR candidate_id = ''
-    OR canonical_action = NONE OR canonical_action = NULL OR canonical_action = ''
+    (candidate_id ?? '') = ''
+    OR (canonical_action ?? '') = ''
   )
   AND receipt_body.candidate_id != NONE
   AND receipt_body.candidate_id != NULL

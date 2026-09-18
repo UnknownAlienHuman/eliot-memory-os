@@ -331,3 +331,28 @@ fn coverage_profile_binds_each_event_to_profile_identity() {
         .validate()
         .expect("fresh capability evidence and receipt");
 }
+
+#[test]
+fn complete_snapshot_denominator_requires_known_expected() {
+    let complete_unknown = eliot_context_contracts::SnapshotDenominator {
+        observed: 0,
+        expected: None,
+        completeness: eliot_context_contracts::SnapshotCompleteness::Complete,
+    };
+    assert!(matches!(
+        complete_unknown.validate(),
+        Err(ReactiveInputError::InvalidField {
+            field: "session.denominator",
+            ..
+        })
+    ));
+
+    let complete_known = eliot_context_contracts::SnapshotDenominator {
+        observed: 2,
+        expected: Some(2),
+        completeness: eliot_context_contracts::SnapshotCompleteness::Complete,
+    };
+    complete_known
+        .validate()
+        .expect("complete denominator with known expected validates");
+}

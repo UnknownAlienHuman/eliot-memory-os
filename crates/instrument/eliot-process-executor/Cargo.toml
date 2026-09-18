@@ -7,10 +7,14 @@ license.workspace = true
 description = "The sole governed Windows ProcessExecutor implementation for ELIOT"
 
 [dependencies]
+eliot-contracts.workspace = true
 eliot-instrument-api.workspace = true
 eliot-platform-windows.workspace = true
 eliot-process.workspace = true
 sha2.workspace = true
+
+[dev-dependencies]
+eliot-platform.workspace = true
 
 [lints]
 workspace = true

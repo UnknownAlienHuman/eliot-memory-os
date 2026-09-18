@@ -21,6 +21,37 @@ use eliot_platform_windows::ELIOT_HOST_SERVICE_NAME;
 
 use super::super::HostError;
 
+// F-LOG-HOST-3 (#978) launch-options observation helpers.
+//
+// Through the #889 facade only
+// (`crate::host_diagnostics::observe_entrypoint_with_detail`); the Event Log
+// seam stays typed-Unavailable
+// (`crate::windows_event_log::event_log_sink_status`), never implemented here
+// (#984 still open).
+//
+// Observation-only contract: every helper projects facts already produced by
+// the semantic owner. Arguments are static literals only — never argv values,
+// paths, digests, env, or arbitrary error text — so bounding limits size, not
+// sensitivity (I15.4). Sink outcome never alters result/order/status/cleanup.
+// There is no mutable global dedup cache and no terminal emission here: one
+// terminal per failed operation is owned by the single outermost contour
+// (`HostJobBranches::start_approved` guard owns `host-launch-failed`; lib.rs
+// `HostTerminalGuard` owns composition terminals), while these parse phases
+// correlate by stage order only. Typed rejections stay
+// `HostError::Platform` (case 978/2); admitted launches are distinct positive
+// observations (case 978/1).
+fn host_launch_options_note_event_log_unavailable() {
+    let _ = crate::windows_event_log::event_log_sink_status();
+}
+
+fn host_launch_options_observe(detail: &str) {
+    host_launch_options_note_event_log_unavailable();
+    crate::host_diagnostics::observe_entrypoint_with_detail(
+        crate::host_diagnostics::EntrypointStage::LaunchConfig,
+        detail,
+    );
+}
+
 /// Exact launch authority supplied by the Runtime Live SCM registration.
 ///
 /// `SystemService` Host startup is argv-bound. The service must not recover any
@@ -50,6 +81,27 @@ impl HostLaunchOptions {
     /// Returns [`HostError::Platform`] when the argv shape or a typed value is
     /// invalid.
     pub fn parse<I, S>(args: I) -> Result<Self, HostError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<OsString>,
+    {
+        // WORK_UNIT_CASE: 978/1 — parse requested.
+        host_launch_options_observe("host.launch-options parse requested");
+        let result = Self::parse_inner(args);
+        match &result {
+            Ok(_) => {
+                // WORK_UNIT_CASE: 978/1 — parse admitted, distinct from rejection.
+                host_launch_options_observe("host.launch-options parse admitted");
+            }
+            Err(_) => {
+                // WORK_UNIT_CASE: 978/2 — typed rejection, never admitted.
+                host_launch_options_observe("host.launch-options parse typed rejection");
+            }
+        }
+        result
+    }
+
+    fn parse_inner<I, S>(args: I) -> Result<Self, HostError>
     where
         I: IntoIterator<Item = S>,
         S: Into<OsString>,
@@ -157,6 +209,27 @@ impl HostLaunchOptions {
         I: IntoIterator<Item = S>,
         S: Into<OsString>,
     {
+        // WORK_UNIT_CASE: 978/1 — system-service admission requested.
+        host_launch_options_observe("host.launch-options system-service requested");
+        let result = Self::parse_system_service_inner(args);
+        match &result {
+            Ok(_) => {
+                // WORK_UNIT_CASE: 978/1 — system-service admitted.
+                host_launch_options_observe("host.launch-options system-service admitted");
+            }
+            Err(_) => {
+                // WORK_UNIT_CASE: 978/2 — typed rejection, never admitted.
+                host_launch_options_observe("host.launch-options system-service typed rejection");
+            }
+        }
+        result
+    }
+
+    fn parse_system_service_inner<I, S>(args: I) -> Result<Self, HostError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<OsString>,
+    {
         let options = Self::parse(args)?;
         if options.registration_nonce.is_none() {
             return Err(Self::invalid_argv(
@@ -182,6 +255,27 @@ impl HostLaunchOptions {
         I: IntoIterator<Item = S>,
         S: Into<OsString>,
     {
+        // WORK_UNIT_CASE: 978/1 — service-main validation requested.
+        host_launch_options_observe("host.launch-options service-main requested");
+        let result = Self::validate_service_main_argv_inner(args);
+        match &result {
+            Ok(()) => {
+                // WORK_UNIT_CASE: 978/1 — service-main admitted.
+                host_launch_options_observe("host.launch-options service-main admitted");
+            }
+            Err(_) => {
+                // WORK_UNIT_CASE: 978/2 — typed rejection, never admitted.
+                host_launch_options_observe("host.launch-options service-main typed rejection");
+            }
+        }
+        result
+    }
+
+    fn validate_service_main_argv_inner<I, S>(args: I) -> Result<(), HostError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<OsString>,
+    {
         let args = args.into_iter().map(Into::into).collect::<Vec<_>>();
         if args.len() == 1 && args[0].to_str() == Some(ELIOT_HOST_SERVICE_NAME) {
             Ok(())
@@ -192,6 +286,11 @@ impl HostLaunchOptions {
         }
     }
 
+    // F-LOG-HOST-3 (#978) accessors stay pure borrows: no observation here,
+    // so exact return/order/count is preserved and no duplicate evaluation
+    // runs on the semantic path. Admission is already observed by
+    // `parse`/`parse_system_service` (cases 978/1/978/2); these getters only
+    // project already-admitted values.
     #[must_use]
     pub fn config_descriptor_path(&self) -> &Path {
         &self.config_descriptor_path

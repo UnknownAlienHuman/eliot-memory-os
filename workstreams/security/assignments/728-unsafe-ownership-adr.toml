@@ -1,0 +1,134 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
+routing_authority = "owning_issue_and_normative_pair_only"
+status = "READY_FOR_IMPLEMENTATION"
+implementation_support = "UNSAFE_EXCEPTIONS_PRESENT_ADR_AND_OPERATION_ORACLE_ABSENT"
+evidence_execution_status = "SOURCE_MANIFEST_AND_SITE_SHAPE_INSPECTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "UNSAFE_OWNERSHIP_POLICY_AND_SOURCE_COVERAGE_ONLY"
+issue = 728
+windows_ipc_issue = 789
+kernel_ipc_issue = 791
+guard_abort_issue = 860
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "security.unsafe-ownership-exceptions-and-source-oracle"
+causal_property = "Every package allowed to contain unsafe Rust has one exact owner, boundary class, operation-specific obligation, review/removal trigger and source-coverage proof; comments or package presence cannot manufacture safety."
+current_discriminator = "The canonical platform owner and four unsafe-code exceptions exist in Cargo manifests, but docs/ADR/0014-unsafe-ownership-and-exceptions.md is absent and no accepted package-local oracle proves operation-specific SAFETY coverage for the selected platform sites."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/728"
+
+[documentation]
+implementation = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I02-05-unsafe-policy.md#i25-unsafe-policy",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I15-17-agent-generated-rust-build-threat-model.md#i1517-agent-generated-rust-build-threat-model",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I00-06-decision-records.md#i06-decision-records",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I18-27-oracle-ownership-and-test-change-governance.md#i1827-oracle-ownership-and-test-change-governance",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I02-06-error-and-crash-model.md#i26-error-and-crash-model",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I01-06-windows-isolation.md#i16-windows-isolation",
+]
+anchors = ["ARCH-MOD-01", "ARCH-SEC-01", "ARCH-OBS-01"]
+
+[current_source]
+canonical_owner = "crates/kernel/eliot-platform-windows/Cargo.toml"
+exception_manifests = [
+  "crates/eliot-windows-ipc/Cargo.toml",
+  "crates/kernel/eliot-ipc/Cargo.toml",
+  "bins/eliot-host/Cargo.toml",
+  "bins/eliot-watchdog/Cargo.toml",
+]
+confirmed = [
+  "All five manifests currently set unsafe_code = allow; eliot-platform-windows and eliot-windows-ipc additionally deny unsafe_op_in_unsafe_fn.",
+  "docs/ADR/0014-unsafe-ownership-and-exceptions.md is absent on main.",
+  "The current platform package exposes real Windows unsafe sites and the dependent IPC packages have separate hardening Issues #789/#791.",
+  "Issue #728 permits comments/whitespace only in selected production source and manifest comment references only; executable production tokens must remain identical.",
+]
+
+[scope]
+primary_paths = [
+  "docs/ADR/0014-unsafe-ownership-and-exceptions.md",
+  "crates/eliot-windows-ipc/Cargo.toml comment/reference beside existing unsafe allow",
+  "crates/kernel/eliot-ipc/Cargo.toml comment/reference beside existing unsafe allow",
+  "bins/eliot-host/Cargo.toml comment/reference beside existing unsafe allow",
+  "bins/eliot-watchdog/Cargo.toml comment/reference beside existing unsafe allow",
+  "crates/kernel/eliot-platform-windows/src/lib.rs comments/whitespace only",
+  "crates/kernel/eliot-platform-windows/tests/safety_coverage.rs",
+  "crates/kernel/eliot-platform-windows/tests/data/safety_coverage_cases.json",
+  ".github/temporary/work-unit-728.md only if present",
+]
+forbidden = [
+  "any production executable-token change",
+  "lint level, dependency, feature, Cargo.lock or root manifest change",
+  "existing ADR modification or new raw unsafe family",
+  "installer_root.rs, named_pipe_peer_auth.rs or IPC source changes",
+  "workflow, architecture shard, shared registry or unrelated test change",
+  "generic SAFETY prose accepted as semantic proof",
+  "blanket directory exclusion or caller-authored pass evidence",
+]
+
+[[waves]]
+id = "A"
+what = "Create the case-correct ADR and exact exception inventory."
+how = [
+  "Reconcile ADR number 0014 against current docs/ADR before writing; never overwrite another decision or silently renumber.",
+  "Enumerate the canonical platform owner and every current unsafe-code exception from actual manifests rather than forcing the historical count.",
+  "For each exception record package/plane/source, allowed boundary/API classes, canonical owner, prohibited expansion, memory/privilege/handle/thread/callback/unwind risks, required proof/tests, evidence ceiling and review/removal/migration trigger.",
+  "Windows requires unsafe is not an accepted rationale.",
+]
+
+[[waves]]
+id = "B"
+what = "Add exact manifest references without semantic changes."
+how = [
+  "Add only a comment adjacent to each existing unsafe_code allow pointing to the exact accepted ADR row.",
+  "Preserve every manifest key, value, dependency, feature and ordering semantic.",
+  "Validate that every exception reference resolves to one case-correct ADR row and unknown/new exceptions fail.",
+]
+
+[[waves]]
+id = "C"
+what = "Implement the platform package source-coverage oracle."
+how = [
+  "Freeze every selected unsafe form with path/item/span/form/digest, production/test cfg and concrete pointer/buffer/string/handle/callback/lifetime/thread/impersonation/unwind obligations.",
+  "Use bounded Rust lexical states for ordinary/raw/byte strings, chars and nested comments plus actual item boundaries.",
+  "Detect unsafe block/fn/impl/trait/extern forms, including production code following cfg(test) items.",
+  "Reject missing, detached, following-only, duplicate, broad, generic and stale-digest SAFETY coverage.",
+]
+
+[[waves]]
+id = "D"
+what = "Prove comment-only token identity and 34-case coverage."
+how = [
+  "Compare controller-supplied base/candidate production token streams and require identity outside comments/whitespace.",
+  "Compare manifest semantics separately and permit only the four exact comment references.",
+  "Implement exactly WORK_UNIT_CASE: 728/1..34 against the actual inventory, ADR, lexical parser and finite failing mutations.",
+  "Require independent semantic unsafe review; mechanical adjacency alone is not safety proof.",
+]
+
+[acceptance]
+criteria = [
+  "The complete current unsafe-code manifest denominator has one canonical owner and one ADR row per exception.",
+  "ADR path/number/format is exact and every manifest reference resolves to it.",
+  "Missing, duplicate, unknown or stale exception rows fail closed.",
+  "Manifest lint/dependency/feature values and unrelated content are unchanged.",
+  "Every selected unsafe operation has one adjacent operation-specific obligation covering all applicable pointer/buffer/UTF-16/handle/callback/thread/impersonation/ABI/unwind concerns.",
+  "Generic, detached, following-only, broad or duplicate SAFETY prose is rejected.",
+  "Unsafe text in strings/comments is ignored while block/fn/impl/trait/extern forms are detected.",
+  "Production after cfg(test) remains production and actual test-only unsafe remains separately visible.",
+  "Malformed source, new unsafe site without coverage, new exception without ADR ownership and stale digest all fail nonzero.",
+  "Existing production executable tokens remain byte/token equivalent modulo comments/whitespace.",
+  "Exactly 34 substantive tests execute; shuffled traversal preserves canonical result and no network/process/source-mutation path exists.",
+  "The result proves policy/comment/source coverage only, not universal UB absence, IPC completion or Product support.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --package eliot-platform-windows -- --check",
+  "cargo test --locked -p eliot-platform-windows --test safety_coverage",
+  "cargo test --locked -p eliot-platform-windows --all-targets",
+  "cargo clippy --locked -p eliot-platform-windows -p eliot-windows-ipc -p eliot-ipc --all-targets -- -D warnings",
+  "git diff --check",
+]
+semantic_review = "Review every current site and ADR obligation against the actual Windows raw API contract; unresolved proof remains a ContractChallenge rather than plausible prose."
+product_proof = "No runtime, IPC, memory-safety, Product or release claim follows from #728."

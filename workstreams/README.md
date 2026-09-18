@@ -5,12 +5,14 @@ GitHub issues, pull requests, or the canonical Architecture/Implementation pair.
 
 ## Rules
 
-- `main` is the sole source and documentation authority.
+- `main` is the sole persistent source and documentation authority branch.
+- Any other visible branch must be a temporary issue-numbered branch with an
+  open pull request; it is deleted after merge, rejection, or supersession.
 - Each implementation unit uses a fresh issue-numbered branch from current
   `main` and one PR back to `main`.
 - The owning issue/PR is the live record for that branch.
 - `ACTIVE.toml` lists programmes and their reusable routing inputs; it does not
-  create shared implementation branches.
+  create shared implementation branches or retain a registry of deleted refs.
 - A nonstandard branch requires an explicit temporary exception. There are no
   active exceptions now.
 - Investigation findings remain in issues/PRs or CI artifacts. Only reusable

@@ -14,6 +14,7 @@ source_layer = "C1"
 proof_entrypoint = "cargo test -p eliot-kernel-core"
 
 [dependencies]
+eliot-authority.workspace = true
 eliot-contracts.workspace = true
 eliot-platform.workspace = true
 eliot-ors.workspace = true

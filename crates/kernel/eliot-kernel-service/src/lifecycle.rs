@@ -1,11 +1,23 @@
 //! Kernel lifecycle and admission state machine.
 
 use std::fmt;
+use std::num::NonZeroU64;
 
-use eliot_contracts::{AuthorityEpoch, ContractId, ResourceGeneration};
+use eliot_contracts::{
+    AuthorityEpoch, ContractId, EpochId, EpochLineageId, ResourceGeneration, canonical_json_bytes,
+    sha256_hex,
+};
 use eliot_kernel_core::{
-    AuthorityGrantRequest, ControlPermit, FrontDoor, KernelAuthority, KernelAuthorityKey,
-    KernelError, RouteScope,
+    AuthorityGrantRequest, ControlOperationClass, ControlPermit, FrontDoor, KernelAuthority,
+    KernelAuthorityKey, KernelError, NormalWorkClass, RouteScope,
+};
+use eliot_ors::{
+    NativeWorkerClaimAdmission, NativeWorkerClaimRecord, NativeWorkerClaimState, OpaqueLabel,
+    OperationIdentity, OperationalRecoveryStore, OrsError,
+};
+use eliot_protocol::{
+    AgentActivationResolutionResult, AgentBridgeProcessBinding, HostRequestAdmissionReceipt,
+    HostRequestEnvelope, HostRequestKind,
 };
 use eliot_receipts::{EffectClass, ProofCeiling};
 use schemars::JsonSchema;
@@ -13,14 +25,62 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::protocol::{
-    HostKernelCandidateBinding, KernelActivationPermit, KernelActivationQuery,
-    KernelActivationReceipt, KernelControlCommand, KernelReadyReceipt,
+    AgentBridgeAdmissionDescriptor, HostKernelCandidateBinding, KernelActivationPermit,
+    KernelActivationQuery, KernelActivationReceipt, KernelControlCommand, KernelReadyReceipt,
+    NATIVE_WORKER_CLAIM_WIRE_ID, NativeWorkerClaimConflict, NativeWorkerClaimReceipt,
+    NativeWorkerClaimRejection, NativeWorkerClaimRejectionReason, NativeWorkerClaimRequest,
+    NativeWorkerClaimResponse,
 };
 use crate::validate_text;
 
 /// Recovery may fast-forward to a durable epoch, but an unbounded value is
 /// treated as corrupt rather than allowed to become an implicit replay loop.
 const MAX_EPOCH_SYNC_GAP: u64 = 4_096;
+/// Cold-state placeholder lineage for the canonical epoch before Host
+/// reconciliation adopts the real Host-approved lineage (Implements #64).
+/// Uses lineage-A (the canonical test lineage) as the inert genesis value;
+/// `reconcile` replaces it with the candidate's lineage on first admission.
+const GENESIS_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+/// Returns the inert lineage-A genesis epoch for a Cold service.
+fn genesis_epoch() -> EpochId {
+    EpochId::new(
+        EpochLineageId::new(GENESIS_LINEAGE_A).unwrap_or_else(|_| unreachable!()),
+        NonZeroU64::MIN,
+    )
+    .unwrap_or_else(|_| unreachable!())
+}
+
+/// Projects a canonical sync target to the scalar control-reserve fence.
+///
+/// Canonical-first (Implements #64): the same-lineage and non-regression
+/// rule is proven on the exact `(lineage_id, sequence)` tuple before any
+/// scalar value exists, so a cross-lineage target can never project to a
+/// scalar fence. The scalar control-reserve fence (`FrontDoor` /
+/// `KernelAuthority`, both core-owned scalar residuals) only follows the
+/// canonical decision for receipt-fencing compatibility; it never
+/// authorizes canonical work. Epoch mint stays Host-owned: the Kernel only
+/// adopts a Host-approved tuple through `reconcile`, and the
+/// `canonical_epoch` switch fences the old tuple — every old session fails
+/// its exact-tuple `is_same_authority` re-check from then on.
+fn scalar_fence_for_canonical_target(
+    target: &EpochId,
+    current: &EpochId,
+) -> Result<AuthorityEpoch, KernelServiceError> {
+    if target.lineage_id != current.lineage_id {
+        return Err(KernelServiceError::HandshakeMismatch {
+            field: "authority_epoch",
+        });
+    }
+    if target.sequence.get() < current.sequence.get() {
+        return Err(KernelServiceError::HandshakeMismatch {
+            field: "authority_epoch_regression",
+        });
+    }
+    AuthorityEpoch::new(target.sequence.get()).map_err(|_| KernelServiceError::HandshakeMismatch {
+        field: "authority_epoch_corrupt",
+    })
+}
 const GENERATION_FENCE_REASON_SUBSTITUTED: &str =
     "generation fence reason was invalid; canonical reason substituted";
 
@@ -166,12 +226,32 @@ pub enum KernelServiceError {
     Core(#[from] KernelError),
 }
 
-/// A held admission lease backed by the Kernel control reserve.
+/// A held normal-work admission lease (Slices A+B, Implements #65).
+///
+/// Normal Store/daemon work (`apply_prepared`, `initialize_genesis`, ordinary
+/// daemon admission) holds this lease. It holds one Slice A typed normal
+/// permit ([`eliot_kernel_core::CapacityClass::NormalWorkload`],
+/// [`NormalWorkClass::CanonicalWrite`]) drawn from the normal partition only,
+/// so normal saturation backpressures as
+/// [`KernelError::NormalCapacityExhausted`] without ever consuming the
+/// protected control reserve: cancellation, fencing, health/drain,
+/// problem/incident, or recovery work keeps demonstrable capacity.
+///
+/// The lease remains bound to the exact activation identity and canonical
+/// authority epoch observed at admission; gateways re-check
+/// [`AdmissionLease::authority_epoch`] against the live fence before any
+/// Store effect.
+///
+/// Integrator rewire (#65): the former permit-less lease now consumes the
+/// Slice A typed normal path at [`KernelService::acquire_admission`]. The
+/// generic admission uses `CanonicalWrite`; per-path classes (`Interactive`
+/// for named reads, `ModelJob`/`Swarm` for jobs/agents) remain a follow-up
+/// once callers carry their work class.
 #[derive(Debug)]
 pub struct AdmissionLease {
     permit: ControlPermit,
     activation_id: String,
-    authority_epoch: AuthorityEpoch,
+    authority_epoch: EpochId,
 }
 
 impl AdmissionLease {
@@ -181,17 +261,17 @@ impl AdmissionLease {
     }
 
     /// Returns the authority epoch covered by this lease.
-    pub const fn authority_epoch(&self) -> AuthorityEpoch {
-        self.authority_epoch
+    pub fn authority_epoch(&self) -> EpochId {
+        self.authority_epoch.clone()
     }
 
-    /// Returns the opaque held permit for transition-gateway instrumentation.
+    /// Returns the held typed normal permit for instrumentation.
     #[must_use]
     pub const fn control_permit(&self) -> &ControlPermit {
         &self.permit
     }
 
-    /// Releases the bounded control capacity held by this lease.
+    /// Releases the held normal-work capacity.
     ///
     /// Dropping a lease also releases the permit; this explicit operation is
     /// provided for transition gateways that model release as a named step.
@@ -200,11 +280,119 @@ impl AdmissionLease {
     }
 }
 
+/// A held protected-control lease backed by the Kernel control reserve.
+///
+/// Only the closed protected operation family holds this lease:
+/// cancellation, fencing, health/readiness control, drain, problem/incident,
+/// and recovery work. Acquiring consumes one Slice A typed protected permit
+/// ([`eliot_kernel_core::CapacityClass::ProtectedControl`]) from the
+/// protected reserve and releasing returns it on drop, so consumption and
+/// release are observable via [`KernelService::available_control`] and bound
+/// to the exact operation and canonical epoch carried by the lease.
+/// Saturation surfaces [`KernelError::ProtectedReserveExhausted`] (via
+/// [`KernelServiceError::Core`]), never the legacy scalar.
+///
+/// Integrator rewire (#65): the former legacy `acquire_control` holder now
+/// consumes the Slice A typed protected path at
+/// [`KernelService::acquire_protected_control`] with the operation class
+/// classified from the `operation_id` prefix. Residual: crate-root export of
+/// this type via `eliot-kernel-service/src/lib.rs` is deferred (that file is
+/// outside the MGR01-65 claim); external callers name the lease through
+/// [`KernelService::acquire_protected_control`] in a follow-up.
+#[derive(Debug)]
+pub struct ProtectedControlLease {
+    permit: ControlPermit,
+    operation_id: String,
+    activation_id: String,
+    authority_epoch: EpochId,
+}
+
+impl ProtectedControlLease {
+    /// Returns the protected operation identity covered by this lease.
+    pub fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+
+    /// Returns the activation identity covered by this lease.
+    pub fn activation_id(&self) -> &str {
+        &self.activation_id
+    }
+
+    /// Returns the authority epoch covered by this lease.
+    pub fn authority_epoch(&self) -> EpochId {
+        self.authority_epoch.clone()
+    }
+
+    /// Returns the opaque held protected permit for instrumentation.
+    #[must_use]
+    pub const fn control_permit(&self) -> &ControlPermit {
+        &self.permit
+    }
+
+    /// Releases the bounded protected control capacity held by this lease.
+    ///
+    /// Dropping a lease also releases the permit; this explicit operation is
+    /// provided for transition gateways that model release as a named step.
+    pub fn release(self) {
+        drop(self);
+    }
+}
+
+/// Operation identity attributed to generic normal admission.
+///
+/// [`KernelService::acquire_admission`] carries no per-call work class, so it
+/// binds the Slice A typed normal permit to this stable operation label with
+/// the live activation as owner. Store write paths (`CANONICAL_WRITE`) are
+/// the dominant holders; per-path labels remain a follow-up.
+const NORMAL_ADMISSION_OPERATION: &str = "normal-admission";
+
+/// Classifies one protected `operation_id` into the closed Slice A
+/// [`ControlOperationClass`] family (issue #65).
+///
+/// Only the `<family>:<opaque-suffix>` labels below typecheck against the
+/// protected partition; anything else fails closed with `InvalidField` and
+/// consumes no capacity, so ordinary workload can never borrow a protected
+/// label to reach the reserve.
+fn classify_protected_operation(
+    operation_id: &str,
+) -> Result<ControlOperationClass, KernelServiceError> {
+    let family = operation_id.split(':').next().unwrap_or(operation_id);
+    match family {
+        "cancellation" | "cancel" => Ok(ControlOperationClass::CancelOperation),
+        "fencing" | "fence" => Ok(ControlOperationClass::FenceStaleOwner),
+        "revoke" | "revocation" => Ok(ControlOperationClass::RevokeAuthority),
+        "health" | "readiness" => Ok(ControlOperationClass::HealthReadinessControl),
+        "telemetry" => Ok(ControlOperationClass::CriticalTelemetry),
+        "attention" => Ok(ControlOperationClass::CriticalAttentionTransition),
+        "problem" => Ok(ControlOperationClass::ProblemTransition),
+        "incident" => Ok(ControlOperationClass::IncidentTransition),
+        "notification" => Ok(ControlOperationClass::PersistentNotificationTransition),
+        "shutdown" => Ok(ControlOperationClass::SafeShutdown),
+        "drain" => Ok(ControlOperationClass::Drain),
+        "recovery" => Ok(ControlOperationClass::Recovery),
+        "containment" => Ok(ControlOperationClass::Containment),
+        "reconciliation" | "unknown-outcome" => {
+            Ok(ControlOperationClass::UnknownOutcomeReconciliation)
+        }
+        _ => Err(KernelServiceError::InvalidField {
+            field: "protected_operation.operation_id",
+            reason: "operation family is outside the closed protected control set",
+        }),
+    }
+}
+
 /// The in-process Kernel service owner.
 pub struct KernelService {
     state: KernelServiceState,
     authority: KernelAuthority,
     front_door: FrontDoor,
+    /// Canonical lineage-aware authority epoch (Implements #64).
+    /// Initialized to the inert lineage-A genesis before Host admission;
+    /// `reconcile` adopts the Host-approved candidate lineage. The scalar
+    /// `FrontDoor`/`KernelAuthority` fence is retained for control-reserve
+    /// compatibility and advanced alongside, but canonical fencing uses this
+    /// exact `(lineage_id, sequence)` tuple via `is_same_authority`.
+    canonical_epoch: EpochId,
     candidate: Option<HostKernelCandidateBinding>,
     activation_receipt: Option<KernelActivationReceipt>,
     activation_request_digest: Option<String>,
@@ -238,6 +426,7 @@ impl KernelService {
             state: KernelServiceState::Cold,
             front_door: FrontDoor::new(authority.clone(), control_capacity, ledger_capacity)?,
             authority,
+            canonical_epoch: genesis_epoch(),
             candidate: None,
             activation_receipt: None,
             activation_request_digest: None,
@@ -257,11 +446,18 @@ impl KernelService {
     }
 
     /// Returns the active authority epoch.
-    pub const fn authority_epoch(&self) -> AuthorityEpoch {
-        self.front_door.epoch()
+    pub fn authority_epoch(&self) -> EpochId {
+        self.canonical_epoch.clone()
     }
 
-    /// Returns the available bounded control capacity.
+    /// Returns the available bounded protected-control capacity.
+    ///
+    /// This observes the protected reserve only. Normal admission
+    /// ([`Self::acquire_admission`]) never moves this counter; protected
+    /// admission ([`Self::acquire_protected_control`] and
+    /// [`Self::issue_control_receipt`]) consumes exactly one permit while
+    /// held and returns it on release/drop, bound to the lease's
+    /// operation/epoch.
     pub fn available_control(&self) -> usize {
         self.front_door.available_control()
     }
@@ -417,6 +613,12 @@ impl KernelService {
             });
         }
         self.transition(KernelServiceState::Reconciling)?;
+        // Adopt the Host-approved Kernel lineage (Implements #64): the live
+        // canonical epoch becomes the candidate's exact tuple from here on.
+        // Mint stays Host-owned — the Kernel never mints a lineage here; it
+        // only adopts and fences via this `canonical_epoch` switch, so every
+        // session bound to the previous tuple fails closed from then on.
+        self.canonical_epoch = candidate.kernel_epoch.clone();
         self.candidate = Some(candidate);
         self.activation_receipt = None;
         self.activation_request_digest = None;
@@ -483,6 +685,110 @@ impl KernelService {
                 field: "activation_query",
             }),
         }
+    }
+
+    /// Admits one versioned P-04 host request for routing after exact binding checks.
+    ///
+    /// This gate mirrors [`Self::activate_permit`] and [`Self::rebind_store`]:
+    /// it validates the envelope, the immutable admission descriptor, and the
+    /// live bridge process/connection binding, then validates the
+    /// process/connection/principal/Session/task/scope/fence/capability/
+    /// deadline/payload-digest continuity before routing. It performs no Frame
+    /// ingress, selects no Governor route, maps no resolution disposition, and
+    /// creates no Session, task, capability, or result authority. Activation
+    /// consumes the typed [`AgentActivationResolutionResult`] path: only a
+    /// `Resolved` result satisfies the gate, and every other disposition fails
+    /// without yielding a binding.
+    pub fn admit_host_request(
+        &self,
+        envelope: &HostRequestEnvelope,
+        descriptor: &AgentBridgeAdmissionDescriptor,
+        binding: &AgentBridgeProcessBinding,
+        resolution: Option<&AgentActivationResolutionResult>,
+    ) -> Result<HostRequestAdmissionReceipt, KernelServiceError> {
+        if self.generation_fenced {
+            return Err(KernelServiceError::GenerationFenced);
+        }
+        let degraded_admitted = matches!(
+            envelope.kind,
+            HostRequestKind::Cancellation
+                | HostRequestKind::Status
+                | HostRequestKind::Reconciliation
+        );
+        let state_admits = if degraded_admitted {
+            matches!(
+                self.state,
+                KernelServiceState::Ready | KernelServiceState::Degraded
+            )
+        } else {
+            self.state == KernelServiceState::Ready
+        };
+        if !state_admits {
+            return Err(KernelServiceError::AdmissionClosed(self.state));
+        }
+        descriptor.validate_host_request_binding(envelope)?;
+        descriptor.validate_process_binding(binding)?;
+        if envelope.connection_id != binding.connection_id {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "host_request.connection",
+            });
+        }
+        match envelope.kind {
+            HostRequestKind::Activation => {
+                let result = resolution.ok_or(KernelServiceError::InvalidField {
+                    field: "host_request.resolution",
+                    reason: "activation requires the exact typed resolution result",
+                })?;
+                envelope.validate_resolution(result).map_err(|_| {
+                    KernelServiceError::HandshakeMismatch {
+                        field: "host_request.resolution",
+                    }
+                })?;
+            }
+            HostRequestKind::Invocation
+            | HostRequestKind::Cancellation
+            | HostRequestKind::Status
+            | HostRequestKind::Reconciliation => {
+                if resolution.is_some() {
+                    return Err(KernelServiceError::InvalidField {
+                        field: "host_request.resolution",
+                        reason: "only activation carries a resolution result",
+                    });
+                }
+            }
+        }
+        let receipt = HostRequestAdmissionReceipt::issue(envelope).map_err(|_| {
+            KernelServiceError::InvalidField {
+                field: "host_request.envelope",
+                reason: "cannot issue an admission receipt",
+            }
+        })?;
+        receipt
+            .validate()
+            .map_err(|_| KernelServiceError::InvalidField {
+                field: "host_request.receipt",
+                reason: "issued admission receipt is not well-formed",
+            })?;
+        Ok(receipt)
+    }
+
+    /// Reconciles an unknown host-request admission delivery without admitting again.
+    ///
+    /// This pure check proves only that a retained receipt binds the exact
+    /// envelope. It changes no service state and issues no new authority; an
+    /// unknown delivery whose durable outcome is still uncertain remains the
+    /// responsibility of the ORS host-request record.
+    pub fn reconcile_host_request_admission(
+        &self,
+        receipt: &HostRequestAdmissionReceipt,
+        envelope: &HostRequestEnvelope,
+    ) -> Result<bool, KernelServiceError> {
+        receipt
+            .validate_envelope(envelope)
+            .map_err(|_| KernelServiceError::HandshakeMismatch {
+                field: "host_request.receipt",
+            })?;
+        Ok(true)
     }
 
     /// Admits a Store-only same-lineage rebind without restarting Kernel.
@@ -579,7 +885,7 @@ impl KernelService {
             process_binding: handoff.process_binding.clone(),
             candidate_binding_digest: handoff.candidate_binding_digest.clone(),
             generation: handoff.generation,
-            authority_epoch: handoff.authority_epoch,
+            authority_epoch: handoff.authority_epoch.clone(),
             store_fence: handoff.store_fence.clone(),
         };
         receipt.validate()?;
@@ -819,7 +1125,12 @@ impl KernelService {
     }
 
     /// Raises the Kernel authority epoch, fencing every previously issued receipt.
-    pub fn advance_authority_epoch(&mut self) -> Result<AuthorityEpoch, KernelServiceError> {
+    ///
+    /// Advances the canonical lineage by exactly one sequence within the same
+    /// lineage (Implements #64); cross-lineage advancement is impossible by
+    /// construction. The scalar control-reserve fence advances alongside for
+    /// compatibility but never authorizes canonical work.
+    pub fn advance_authority_epoch(&mut self) -> Result<EpochId, KernelServiceError> {
         if self.generation_fenced {
             return Err(KernelServiceError::GenerationFenced);
         }
@@ -828,6 +1139,23 @@ impl KernelService {
                 field: "authority_epoch",
             });
         }
+        let next_sequence = self.canonical_epoch.sequence.get().checked_add(1).ok_or(
+            KernelServiceError::InvalidField {
+                field: "authority_epoch",
+                reason: "sequence overflow",
+            },
+        )?;
+        let next = EpochId::new(
+            self.canonical_epoch.lineage_id.clone(),
+            NonZeroU64::new(next_sequence).ok_or(KernelServiceError::InvalidField {
+                field: "authority_epoch",
+                reason: "sequence overflow",
+            })?,
+        )
+        .map_err(|_| KernelServiceError::InvalidField {
+            field: "authority_epoch",
+            reason: "invalid canonical epoch",
+        })?;
         let epoch = self.front_door.advance_epoch()?;
         let mirrored = self.authority.advance_epoch()?;
         if epoch != mirrored {
@@ -835,51 +1163,75 @@ impl KernelService {
                 field: "authority_epoch",
             });
         }
-        Ok(epoch)
+        self.canonical_epoch = next.clone();
+        Ok(next)
     }
 
     /// Replays the durable epoch lineage before admitting a front-door
-    /// session.  Epochs may only move forward; a durable regression is a
-    /// startup fence rather than an implicit genesis reset.
+    /// session.  Epochs may only move forward within the same lineage; a
+    /// durable regression or a cross-lineage target is a startup fence rather
+    /// than an implicit genesis reset (Implements #64).
     pub fn synchronize_authority_epoch(
         &mut self,
-        target: AuthorityEpoch,
+        target: EpochId,
     ) -> Result<(), KernelServiceError> {
         if self.generation_fenced {
             return Err(KernelServiceError::GenerationFenced);
         }
         let current = self.authority_epoch();
-        if self.authority.current_epoch() != current {
+        if self.authority.current_epoch() != self.front_door.epoch() {
             return Err(KernelServiceError::HandshakeMismatch {
                 field: "authority_epoch",
             });
         }
-        if target.value() < current.value() {
+        if target.lineage_id != current.lineage_id {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "authority_epoch",
+            });
+        }
+        if target.sequence.get() < current.sequence.get() {
             return Err(KernelServiceError::HandshakeMismatch {
                 field: "authority_epoch_regression",
             });
         }
-        let gap = target.value().checked_sub(current.value()).ok_or(
-            KernelServiceError::HandshakeMismatch {
+        let gap = target
+            .sequence
+            .get()
+            .checked_sub(current.sequence.get())
+            .ok_or(KernelServiceError::HandshakeMismatch {
                 field: "authority_epoch_corrupt",
-            },
-        )?;
+            })?;
         if gap > MAX_EPOCH_SYNC_GAP {
             return Err(KernelServiceError::HandshakeMismatch {
                 field: "authority_epoch_oversized",
             });
         }
-        let front_door_epoch = self.front_door.synchronize_epoch(target)?;
-        let mirrored = self.authority.synchronize_epoch(target)?;
-        if front_door_epoch != mirrored || mirrored != target {
+        // The scalar control-reserve fence follows the canonical decision
+        // (core residual: no silent widening of the core). Projection goes
+        // through the canonical-first companion only — never a bare
+        // `AuthorityEpoch::new(sequence)` coercion.
+        let scalar_target = scalar_fence_for_canonical_target(&target, &current)?;
+        let front_door_epoch = self.front_door.synchronize_epoch(scalar_target)?;
+        let mirrored = self.authority.synchronize_epoch(scalar_target)?;
+        if front_door_epoch != mirrored || mirrored != scalar_target {
             return Err(KernelServiceError::HandshakeMismatch {
                 field: "authority_epoch",
             });
         }
+        self.canonical_epoch = target;
         Ok(())
     }
 
-    /// Acquires one bounded control lease for a normal admitted operation.
+    /// Acquires one normal-work admission lease for a normal admitted operation.
+    ///
+    /// Slice A+B enforcement (Implements #65): normal Store/daemon admission
+    /// (`apply_prepared`, `initialize_genesis`, ordinary daemon work) holds
+    /// one typed normal permit (`NORMAL_WORKLOAD` / `CanonicalWrite`) drawn
+    /// from the normal partition only, so normal saturation backpressures
+    /// with `NormalCapacityExhausted` while leaving
+    /// [`Self::available_control`] unchanged. Only `Ready` admits normal
+    /// work; `Degraded` keeps normal closed while protected control stays
+    /// open via [`Self::acquire_protected_control`].
     pub fn acquire_admission(&self) -> Result<AdmissionLease, KernelServiceError> {
         if self.generation_fenced {
             return Err(KernelServiceError::GenerationFenced);
@@ -891,21 +1243,74 @@ impl KernelService {
             .candidate
             .as_ref()
             .ok_or(KernelServiceError::AdmissionClosed(self.state))?;
+        let owner = candidate.activation_id.as_str();
         let permit = self
             .front_door
-            .acquire_control()
-            .map_err(|error| match error {
-                KernelError::ControlReserveExhausted => KernelServiceError::ControlReserveExhausted,
-                other => KernelServiceError::Core(other),
-            })?;
+            .acquire_normal(NormalWorkClass::CanonicalWrite, owner, NORMAL_ADMISSION_OPERATION)?;
         Ok(AdmissionLease {
             permit,
+            activation_id: owner.to_owned(),
+            authority_epoch: self.canonical_epoch.clone(),
+        })
+    }
+
+    /// Acquires one held protected-control lease for a protected operation.
+    ///
+    /// Only the closed protected family may hold this lease: cancellation,
+    /// fencing, health/readiness control, drain, problem/incident, and
+    /// recovery work. It consumes exactly one typed protected permit
+    /// (`PROTECTED_CONTROL`) while held (observable via
+    /// [`Self::available_control`]) and is bound to the given operation
+    /// identity plus the live activation/epoch, so consumption and release
+    /// are attributable per operation/epoch. Saturation surfaces
+    /// [`KernelError::ProtectedReserveExhausted`]. `Ready` and `Degraded`
+    /// both admit protected work; every other state fails closed. An
+    /// `operation_id` outside the closed family fails closed with
+    /// `InvalidField` and consumes nothing.
+    pub fn acquire_protected_control(
+        &self,
+        operation_id: &str,
+    ) -> Result<ProtectedControlLease, KernelServiceError> {
+        if self.generation_fenced {
+            return Err(KernelServiceError::GenerationFenced);
+        }
+        if !matches!(
+            self.state,
+            KernelServiceState::Ready | KernelServiceState::Degraded
+        ) {
+            return Err(KernelServiceError::AdmissionClosed(self.state));
+        }
+        crate::validate_text(operation_id, "protected_operation.operation_id")?;
+        let operation = classify_protected_operation(operation_id)?;
+        let candidate = self
+            .candidate
+            .as_ref()
+            .ok_or(KernelServiceError::AdmissionClosed(self.state))?;
+        let permit = self.front_door.acquire_protected(
+            operation,
+            candidate.activation_id.as_str(),
+            operation_id,
+        )?;
+        Ok(ProtectedControlLease {
+            permit,
+            operation_id: operation_id.to_owned(),
             activation_id: candidate.activation_id.as_str().to_owned(),
-            authority_epoch: self.front_door.epoch(),
+            authority_epoch: self.canonical_epoch.clone(),
         })
     }
 
     /// Issues one scoped authority receipt for a control-plane caller.
+    ///
+    /// Protected-pool path: consumes one protected [`ControlPermit`] for the
+    /// duration of issuance. Normal work must use [`Self::acquire_admission`]
+    /// and never this path.
+    ///
+    /// Residual (#65): this stays on the legacy `acquire_control` migration
+    /// path because generic receipt issuance carries no closed
+    /// [`ControlOperationClass`] label to typecheck against
+    /// `acquire_protected`. Migrating it requires attributing each caller to
+    /// the closed family; the legacy error mapping is kept so
+    /// `host_request_binding` and other matchers keep compiling.
     pub fn issue_control_receipt(
         &self,
         authority_id: ContractId,
@@ -939,6 +1344,807 @@ impl KernelService {
         )?;
         self.authority.issue(request).map_err(Into::into)
     }
+}
+
+// Wave B (issue #872): native-worker claim persistence and ready gates.
+//
+// Kernel persists the claim transition and returns one immutable claim
+// receipt before the worker can initialize a provider adapter. Ordering is
+// validate → persist → receipt, mirroring `admit_host_request`: the Wave-A
+// request shape and canonical digest are validated, registration/epoch
+// currency and the deadline are checked against live Kernel state, the
+// `Requested` intent is staged durably in ORS, the claim is advanced to
+// `Admitted` with the bound receipt identity, and only then is the receipt
+// returned. Readiness is gated on the persisted `Admitted` record plus a
+// validated ready report; heartbeat or transport liveness alone is
+// insufficient by construction (the ready call carries no liveness field,
+// and readiness without an exact current registration and persisted claimed
+// unit is rejected with `TransportOnlyReadiness`).
+//
+// One claim identity keeps one receipt identity: an exact replay rebuilds
+// the original receipt from the durable admission time instead of
+// manufacturing a second receipt, and changed work under one claim identity
+// reports a `Conflict` before any effect. No provider is selected here, no
+// credential bytes are stored (references only), and no canonical Store
+// write is performed.
+
+/// Maximum credential references admitted in one Wave-B readiness report.
+///
+/// Mirrors the worker-side bound; Kernel checks presence and shape only and
+/// never stores credential material.
+const MAX_NATIVE_WORKER_READY_CREDENTIAL_REFS: usize = 64;
+
+/// Maps one claim-shape validation failure to its typed rejection reason.
+///
+/// Unknown wire, protocol, and execution-unit schema versions each keep
+/// their own reason; epoch/fence disagreement maps to the stale reason for
+/// the disagreeing dimension; a self-inconsistent binding digest maps to
+/// `BindingConflict`; a missing Kernel-owned binding field maps to
+/// `MissingOwnerField`; every other malformed field maps to
+/// `InvalidClaimField`.
+fn native_worker_claim_rejection_reason(
+    error: &KernelServiceError,
+) -> (NativeWorkerClaimRejectionReason, &'static str) {
+    match error {
+        KernelServiceError::InvalidField { field, reason } => {
+            let mapped = match *field {
+                "native_worker_claim.wire" => NativeWorkerClaimRejectionReason::UnknownWireVersion,
+                "native_worker_claim.protocol_version" => {
+                    NativeWorkerClaimRejectionReason::UnknownProtocolVersion
+                }
+                "native_worker_claim.execution_unit_schema_version" => {
+                    NativeWorkerClaimRejectionReason::UnknownSchemaVersion
+                }
+                "native_worker_claim.binding_digest" => {
+                    NativeWorkerClaimRejectionReason::BindingConflict
+                }
+                _ if *reason == "must be non-blank" => {
+                    NativeWorkerClaimRejectionReason::MissingOwnerField
+                }
+                _ => NativeWorkerClaimRejectionReason::InvalidClaimField,
+            };
+            (mapped, field)
+        }
+        KernelServiceError::HandshakeMismatch { field } => {
+            let mapped = match *field {
+                "native_worker_claim.state_fence" => NativeWorkerClaimRejectionReason::StaleFence,
+                "native_worker_claim.epoch_fence" => NativeWorkerClaimRejectionReason::StaleEpoch,
+                _ => NativeWorkerClaimRejectionReason::InvalidClaimField,
+            };
+            (mapped, field)
+        }
+        _ => (
+            NativeWorkerClaimRejectionReason::InvalidClaimField,
+            "native_worker_claim.request",
+        ),
+    }
+}
+
+/// Maps one ORS failure to the Kernel service error surface.
+fn native_worker_claim_store_error(error: &OrsError) -> KernelServiceError {
+    KernelServiceError::Platform(error.to_string())
+}
+
+/// Builds the immutable admission receipt for one validated request.
+///
+/// The receipt digest is canonical over the request binding plus the given
+/// admission time, so rebuilding with the durable admission time reproduces
+/// the exact same receipt identity on replay.
+fn native_worker_claim_receipt(
+    request: &NativeWorkerClaimRequest,
+    admitted_at_unix_ms: u64,
+) -> Result<NativeWorkerClaimReceipt, KernelServiceError> {
+    NativeWorkerClaimReceipt {
+        wire_id: NATIVE_WORKER_CLAIM_WIRE_ID.to_owned(),
+        wire_version: NativeWorkerClaimReceipt::CONTRACT_VERSION,
+        claim_id: request.claim_id.clone(),
+        registration_id: request.registration_id.clone(),
+        attempt_id: request.attempt_id.clone(),
+        operation_id: request.operation_id.clone(),
+        worker_generation: request.worker_generation,
+        authority_epoch: request.authority_epoch.clone(),
+        state_fence: request.state_fence.clone(),
+        binding_digest: request.binding_digest.clone(),
+        admitted_at_unix_ms,
+        receipt_digest: String::new(),
+    }
+    .with_computed_digest()
+}
+
+/// Computes the opaque budget-envelope digest bound in the ORS record.
+fn native_worker_claim_budget_digest(
+    request: &NativeWorkerClaimRequest,
+) -> Result<String, KernelServiceError> {
+    canonical_json_bytes(&request.budget)
+        .map(|bytes| sha256_hex(&bytes))
+        .map_err(|_| KernelServiceError::InvalidField {
+            field: "native_worker_claim.budget",
+            reason: "cannot canonicalize budget envelope",
+        })
+}
+
+/// Computes the opaque fence digest bound in the ORS record.
+fn native_worker_claim_fence_digest(
+    request: &NativeWorkerClaimRequest,
+) -> Result<String, KernelServiceError> {
+    canonical_json_bytes(&request.state_fence)
+        .map(|bytes| sha256_hex(&bytes))
+        .map_err(|_| KernelServiceError::InvalidField {
+            field: "native_worker_claim.state_fence",
+            reason: "cannot canonicalize state fence",
+        })
+}
+
+/// Computes the opaque resource-envelope digest bound in the ORS record.
+///
+/// Covers the presenting worker generation's resource identity —
+/// installation, artifact, and configuration digests — as exact bytes. ORS
+/// compares the digest without interpreting it.
+fn native_worker_claim_resource_envelope_digest(
+    request: &NativeWorkerClaimRequest,
+) -> Result<String, KernelServiceError> {
+    #[derive(serde::Serialize)]
+    struct ResourceEnvelope<'a> {
+        installation_id: &'a str,
+        worker_artifact_digest: &'a str,
+        worker_config_digest: &'a str,
+    }
+    let envelope = ResourceEnvelope {
+        installation_id: &request.installation_id,
+        worker_artifact_digest: &request.worker_artifact_digest,
+        worker_config_digest: &request.worker_config_digest,
+    };
+    canonical_json_bytes(&envelope)
+        .map(|bytes| sha256_hex(&bytes))
+        .map_err(|_| KernelServiceError::InvalidField {
+            field: "native_worker_claim.resource_envelope",
+            reason: "cannot canonicalize resource envelope",
+        })
+}
+
+/// Binds one ORS identity value, attributing construction failures without
+/// propagating caller text.
+fn native_worker_claim_identity<T>(
+    result: Result<T, OrsError>,
+    field: &'static str,
+) -> Result<T, KernelServiceError> {
+    result.map_err(|_| KernelServiceError::InvalidField {
+        field,
+        reason: "durable claim identity could not be bound",
+    })
+}
+
+/// Builds the `Requested` ORS record for one validated claim request.
+///
+/// Every presented identity is preserved opaquely; digests are recomputed
+/// from the exact presented bytes so replay comparison is byte-exact.
+fn native_worker_claim_staged_record(
+    request: &NativeWorkerClaimRequest,
+) -> Result<NativeWorkerClaimRecord, KernelServiceError> {
+    Ok(NativeWorkerClaimRecord {
+        contract_version: eliot_ors::CONTRACT_VERSION,
+        claim_id: native_worker_claim_identity(
+            OperationIdentity::new(request.claim_id.as_str()),
+            "native_worker_claim.claim_id",
+        )?,
+        registration_id: native_worker_claim_identity(
+            OpaqueLabel::new(request.registration_id.as_str()),
+            "native_worker_claim.registration_id",
+        )?,
+        worker_generation: request.worker_generation,
+        parent_job_id: native_worker_claim_identity(
+            OpaqueLabel::new(request.parent_job_id.as_str()),
+            "native_worker_claim.parent_job_id",
+        )?,
+        task_id: native_worker_claim_identity(
+            OpaqueLabel::new(request.task_id.as_str()),
+            "native_worker_claim.task_id",
+        )?,
+        work_scope_id: native_worker_claim_identity(
+            OpaqueLabel::new(request.work_scope_id.as_str()),
+            "native_worker_claim.work_scope_id",
+        )?,
+        decision_id: native_worker_claim_identity(
+            OpaqueLabel::new(request.decision_id.as_str()),
+            "native_worker_claim.decision_id",
+        )?,
+        attempt_id: native_worker_claim_identity(
+            OpaqueLabel::new(request.attempt_id.as_str()),
+            "native_worker_claim.attempt_id",
+        )?,
+        operation_id: native_worker_claim_identity(
+            OpaqueLabel::new(request.operation_id.as_str()),
+            "native_worker_claim.operation_id",
+        )?,
+        route_class: native_worker_claim_identity(
+            OpaqueLabel::new(request.route_class.as_str()),
+            "native_worker_claim.route_class",
+        )?,
+        budget_digest: native_worker_claim_budget_digest(request)?,
+        deadline_unix_ms: request.deadline_unix_ms,
+        fence_digest: native_worker_claim_fence_digest(request)?,
+        // Retained `u64` contour (donor precedent: no silent widening of ORS).
+        // The exact tuple projection, never a cross-lineage coercion.
+        authority_epoch: request.authority_epoch.sequence.get(),
+        binding_digest: request.binding_digest.clone(),
+        request_digest: request.request_digest.clone(),
+        execution_unit_schema_version: request.execution_unit_schema_version,
+        predecessor_revision: native_worker_claim_identity(
+            OpaqueLabel::new(request.predecessor_revision.as_str()),
+            "native_worker_claim.predecessor_revision",
+        )?,
+        resource_envelope_digest: native_worker_claim_resource_envelope_digest(request)?,
+        state: NativeWorkerClaimState::Requested,
+        receipt_digest: None,
+        admitted_at_unix_ms: None,
+        commit_order: 0,
+    })
+}
+
+/// Diffs one presented claim against the durable binding in canonical field
+/// order.
+///
+/// Every bound dimension that differs is named; a bare digest mismatch with
+/// otherwise identical work is reported as a conflict on `binding_digest`
+/// itself. Mirrors the worker-side `compare_binding` discipline at the
+/// Kernel boundary.
+fn native_worker_claim_changed_fields(
+    durable: &NativeWorkerClaimRecord,
+    staged: &NativeWorkerClaimRecord,
+) -> Vec<String> {
+    let mut changed = Vec::new();
+    let mut note = |same: bool, field: &'static str| {
+        if !same {
+            changed.push(field.to_owned());
+        }
+    };
+    note(
+        durable.registration_id == staged.registration_id,
+        "registration_id",
+    );
+    note(
+        durable.worker_generation == staged.worker_generation,
+        "worker_generation",
+    );
+    note(
+        durable.parent_job_id == staged.parent_job_id,
+        "parent_job_id",
+    );
+    note(durable.task_id == staged.task_id, "task_id");
+    note(
+        durable.work_scope_id == staged.work_scope_id,
+        "work_scope_id",
+    );
+    note(durable.decision_id == staged.decision_id, "decision_id");
+    note(durable.attempt_id == staged.attempt_id, "attempt_id");
+    note(durable.operation_id == staged.operation_id, "operation_id");
+    note(durable.route_class == staged.route_class, "route_class");
+    note(durable.budget_digest == staged.budget_digest, "budget");
+    note(
+        durable.deadline_unix_ms == staged.deadline_unix_ms,
+        "deadline_unix_ms",
+    );
+    note(
+        durable.predecessor_revision == staged.predecessor_revision,
+        "predecessor_revision",
+    );
+    note(
+        durable.execution_unit_schema_version == staged.execution_unit_schema_version,
+        "expected_result_schema_version",
+    );
+    note(
+        durable.authority_epoch == staged.authority_epoch,
+        "authority_epoch",
+    );
+    note(durable.fence_digest == staged.fence_digest, "state_fence");
+    note(
+        durable.resource_envelope_digest == staged.resource_envelope_digest,
+        "resource_envelope",
+    );
+    note(
+        durable.request_digest == staged.request_digest,
+        "request_digest",
+    );
+    if changed.is_empty() {
+        changed.push("binding_digest".to_owned());
+    }
+    changed
+}
+
+/// Builds the changed-work conflict for one durable claim binding.
+fn native_worker_claim_conflict(
+    durable: &NativeWorkerClaimRecord,
+    request: &NativeWorkerClaimRequest,
+    staged: &NativeWorkerClaimRecord,
+) -> Result<NativeWorkerClaimConflict, KernelServiceError> {
+    let conflict = NativeWorkerClaimConflict {
+        claim_id: request.claim_id.clone(),
+        expected_digest: durable.binding_digest.clone(),
+        observed_digest: request.binding_digest.clone(),
+        changed_fields: native_worker_claim_changed_fields(durable, staged),
+    };
+    conflict.validate().map_err(|_| {
+        KernelServiceError::Platform("conflicting claim identity cannot be reported".to_owned())
+    })?;
+    Ok(conflict)
+}
+
+impl KernelService {
+    /// Admits one native-worker claim for exactly one bounded execution unit.
+    ///
+    /// Validates the Wave-A request shape and canonical digest, checks
+    /// registration/epoch currency against live Kernel authority and the
+    /// deadline against the caller clock, persists the `Requested` intent in
+    /// ORS, advances the claim to `Admitted` with the bound receipt
+    /// identity, and returns the immutable receipt — before any provider
+    /// initialization. A claim bound to a superseded epoch is rejected as
+    /// `StaleRegistration`; a claim carrying a newer-than-live epoch as
+    /// `StaleEpoch`. An exact replay under the same claim identity returns
+    /// the original receipt identity instead of a second receipt and never
+    /// downgrades the durable state; changed work under one claim identity
+    /// returns `Conflict` and takes no effect. Only mechanical failures
+    /// (closed admission, fenced generation, ORS storage) surface as `Err`;
+    /// every typed refusal is an `Ok` response value.
+    pub fn admit_native_worker_claim<S: OperationalRecoveryStore>(
+        &self,
+        store: &S,
+        request: &NativeWorkerClaimRequest,
+        now_unix_ms: u64,
+    ) -> Result<NativeWorkerClaimResponse, KernelServiceError> {
+        if self.generation_fenced {
+            return Err(KernelServiceError::GenerationFenced);
+        }
+        if self.state != KernelServiceState::Ready {
+            return Err(KernelServiceError::AdmissionClosed(self.state));
+        }
+        if now_unix_ms == 0 {
+            return Err(KernelServiceError::InvalidField {
+                field: "native_worker_claim.now",
+                reason: "admission time must be non-zero",
+            });
+        }
+        let rejected = |reason: NativeWorkerClaimRejectionReason, detail: &'static str| {
+            NativeWorkerClaimResponse::Rejected(NativeWorkerClaimRejection {
+                claim_id: request.claim_id.clone(),
+                reason,
+                detail: detail.to_owned(),
+                rejected_at_unix_ms: now_unix_ms,
+            })
+        };
+        if let Err(error) = request.validate() {
+            let (reason, detail) = native_worker_claim_rejection_reason(&error);
+            return Ok(rejected(reason, detail));
+        }
+        if let Err(error) = request.validate_canonical_digest() {
+            let (reason, detail) = native_worker_claim_rejection_reason(&error);
+            return Ok(rejected(reason, detail));
+        }
+        // Exact-tuple currency gate (Implements #64): the claim epoch must be
+        // the same `(lineage_id, sequence)` as live. Same-lineage older maps
+        // to `StaleRegistration`, same-lineage newer or cross-lineage to
+        // `StaleEpoch`; equal sequences across lineages are unrelated and
+        // never authorize.
+        let live_epoch = self.authority_epoch();
+        if !request.authority_epoch.is_same_authority(&live_epoch) {
+            if request.authority_epoch.lineage_id == live_epoch.lineage_id
+                && request.authority_epoch.sequence.get() < live_epoch.sequence.get()
+            {
+                return Ok(rejected(
+                    NativeWorkerClaimRejectionReason::StaleRegistration,
+                    "native_worker_claim.authority_epoch",
+                ));
+            }
+            return Ok(rejected(
+                NativeWorkerClaimRejectionReason::StaleEpoch,
+                "native_worker_claim.authority_epoch",
+            ));
+        }
+        if request.deadline_unix_ms <= now_unix_ms {
+            return Ok(rejected(
+                NativeWorkerClaimRejectionReason::ExpiredDeadline,
+                "native_worker_claim.deadline_unix_ms",
+            ));
+        }
+        Self::stage_and_finish_native_worker_claim_admission(store, request, now_unix_ms)
+    }
+
+    /// Stages one validated claim intent and binds its admission receipt.
+    ///
+    /// Persist-before-ack: the intent row is staged before any receipt is
+    /// issued. An exact replay under the same claim identity rebuilds the
+    /// original receipt identity instead of a second receipt and never
+    /// downgrades durable state; changed work under one identity returns
+    /// `Conflict`; a lost admission race reloads the winner's receipt. Only
+    /// mechanical failures (fenced generation, ORS storage) surface as
+    /// `Err`; every typed refusal is an `Ok` response value.
+    fn stage_and_finish_native_worker_claim_admission<S: OperationalRecoveryStore>(
+        store: &S,
+        request: &NativeWorkerClaimRequest,
+        now_unix_ms: u64,
+    ) -> Result<NativeWorkerClaimResponse, KernelServiceError> {
+        let staged = native_worker_claim_staged_record(request)?;
+        let durable = match store.stage_native_worker_claim(&staged) {
+            Ok(outcome) => outcome.record().clone(),
+            Err(OrsError::NativeWorkerClaimIdentityConflict { .. }) => {
+                let claim_id = native_worker_claim_identity(
+                    OperationIdentity::new(request.claim_id.as_str()),
+                    "native_worker_claim.claim_id",
+                )?;
+                let durable = store
+                    .load_native_worker_claim(&claim_id)
+                    .map_err(|error| native_worker_claim_store_error(&error))?
+                    .ok_or_else(|| {
+                        KernelServiceError::Platform(
+                            "conflicting claim disappeared before reconciliation".to_owned(),
+                        )
+                    })?;
+                let conflict = native_worker_claim_conflict(&durable, request, &staged)?;
+                return Ok(NativeWorkerClaimResponse::Conflict(conflict));
+            }
+            Err(error) => return Err(native_worker_claim_store_error(&error)),
+        };
+        if durable.state != NativeWorkerClaimState::Requested {
+            // Exact replay: the claim was already admitted (or moved forward
+            // under a later wave). Rebuild the original receipt identity
+            // from the durable admission time instead of manufacturing a
+            // second receipt. No state change, no downgrade, no re-admit.
+            let admitted_at = durable.admitted_at_unix_ms.ok_or_else(|| {
+                KernelServiceError::Platform(
+                    "durable admitted claim has no admission time".to_owned(),
+                )
+            })?;
+            let receipt = native_worker_claim_receipt(request, admitted_at)?;
+            receipt.validate().map_err(|_| {
+                KernelServiceError::Platform(
+                    "durable claim cannot reproduce its receipt identity".to_owned(),
+                )
+            })?;
+            return Ok(NativeWorkerClaimResponse::Admitted(receipt));
+        }
+        // A durable `Requested` row with our exact binding means either our
+        // own fresh intent or an interrupted earlier admit that never issued
+        // a receipt (a receipt is issued only after the advance below, so a
+        // crash before it leaves `Requested`, and a crash after it leaves
+        // `Admitted`). Binding the receipt here is therefore safe: no
+        // second identity can exist for this binding.
+        let receipt = native_worker_claim_receipt(request, now_unix_ms)?;
+        let admission = NativeWorkerClaimAdmission {
+            receipt_digest: receipt.receipt_digest.clone(),
+            admitted_at_unix_ms: now_unix_ms,
+        };
+        match store.advance_native_worker_claim(
+            &durable.claim_id,
+            NativeWorkerClaimState::Admitted,
+            Some(&admission),
+        ) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return Err(KernelServiceError::Platform(
+                    "admitted claim disappeared before acknowledgement".to_owned(),
+                ));
+            }
+            Err(OrsError::NativeWorkerClaimIdentityConflict { .. }) => {
+                // Lost the admission race: another writer bound the receipt
+                // first. Reload the durable truth and return its receipt
+                // identity instead of a second receipt.
+                let current = store
+                    .load_native_worker_claim(&durable.claim_id)
+                    .map_err(|error| native_worker_claim_store_error(&error))?
+                    .ok_or_else(|| {
+                        KernelServiceError::Platform(
+                            "admitted claim disappeared before acknowledgement".to_owned(),
+                        )
+                    })?;
+                if !current.same_binding(&staged) {
+                    let conflict = native_worker_claim_conflict(&current, request, &staged)?;
+                    return Ok(NativeWorkerClaimResponse::Conflict(conflict));
+                }
+                let admitted_at = current.admitted_at_unix_ms.ok_or_else(|| {
+                    KernelServiceError::Platform(
+                        "durable admitted claim has no admission time".to_owned(),
+                    )
+                })?;
+                let receipt = native_worker_claim_receipt(request, admitted_at)?;
+                return Ok(NativeWorkerClaimResponse::Admitted(receipt));
+            }
+            Err(error) => return Err(native_worker_claim_store_error(&error)),
+        }
+        receipt.validate().map_err(|_| {
+            KernelServiceError::Platform("issued admission receipt is not well-formed".to_owned())
+        })?;
+        Ok(NativeWorkerClaimResponse::Admitted(receipt))
+    }
+
+    /// Reconciles an unknown claim-admission delivery without admitting again.
+    ///
+    /// This pure receipt↔request check proves only that a retained receipt
+    /// binds the exact presented request. It changes no service state and
+    /// issues no new authority; an unknown delivery whose durable outcome is
+    /// still uncertain remains the responsibility of the ORS claim record.
+    pub fn reconcile_native_worker_claim_admission(
+        &self,
+        receipt: &NativeWorkerClaimReceipt,
+        request: &NativeWorkerClaimRequest,
+    ) -> Result<bool, KernelServiceError> {
+        receipt.validate()?;
+        let binds = receipt.claim_id == request.claim_id
+            && receipt.registration_id == request.registration_id
+            && receipt.attempt_id == request.attempt_id
+            && receipt.operation_id == request.operation_id
+            && receipt.worker_generation == request.worker_generation
+            && receipt.authority_epoch == request.authority_epoch
+            && receipt.state_fence == request.state_fence
+            && receipt.binding_digest == request.binding_digest;
+        if !binds {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "native_worker_claim.receipt",
+            });
+        }
+        Ok(true)
+    }
+
+    /// Validates one ready report's own fields without touching durable state.
+    ///
+    /// Checks the ready identity is readable and distinct from the claim
+    /// identity, the registration and adapter-registry-revision texts are
+    /// readable, generation and report time are nonzero, the
+    /// credential-reference list is bounded with readable provider/key pairs.
+    /// Deadline, epoch, and durable checks stay with the caller.
+    fn check_native_worker_ready_report(
+        ready_id: &str,
+        request: &NativeWorkerClaimRequest,
+        ready_registration_id: &str,
+        adapter_registry_revision: &str,
+        ready_worker_generation: u64,
+        credential_refs: &[(&str, &str)],
+        ready_at_unix_ms: u64,
+    ) -> Result<(), KernelServiceError> {
+        validate_text(ready_id, "native_worker_ready.ready_id")?;
+        if ready_id == request.claim_id {
+            return Err(KernelServiceError::InvalidField {
+                field: "native_worker_ready.ready_id",
+                reason: "readiness requires a distinct operation identity",
+            });
+        }
+        validate_text(ready_registration_id, "native_worker_ready.registration_id")?;
+        validate_text(
+            adapter_registry_revision,
+            "native_worker_ready.adapter_registry_revision",
+        )?;
+        if ready_worker_generation == 0 || ready_at_unix_ms == 0 {
+            return Err(KernelServiceError::InvalidField {
+                field: "native_worker_ready.bounded_fields",
+                reason: "generation and report time must be non-zero",
+            });
+        }
+        if credential_refs.len() > MAX_NATIVE_WORKER_READY_CREDENTIAL_REFS {
+            return Err(KernelServiceError::InvalidField {
+                field: "native_worker_ready.credential_refs",
+                reason: "exceeds the bounded credential-reference limit",
+            });
+        }
+        for (provider, key) in credential_refs {
+            validate_text(provider, "native_worker_ready.credential_refs")?;
+            validate_text(key, "native_worker_ready.credential_refs")?;
+        }
+        Ok(())
+    }
+
+    /// Marks one admitted claim ready after exact ready-report validation.
+    ///
+    /// Gated on the persisted `Admitted` record plus validation of the
+    /// presented request and the ready report, with Ready-only service
+    /// gating like [`Self::acquire_admission`]. The report carries a
+    /// distinct ready operation identity (never equal to the claim id), the
+    /// presenting registration and generation, the validated
+    /// adapter-registry revision presence, credential references by
+    /// reference only, and the report time; compatibility of the revision
+    /// value itself stays with #874 and credential bytes never cross this
+    /// boundary. Heartbeat or transport liveness alone is insufficient by
+    /// construction: the call carries no liveness field, and readiness
+    /// without an exact current registration and persisted claimed unit is
+    /// rejected with `TransportOnlyReadiness`. A presenting generation that
+    /// is not the admitted generation is rejected as `StaleRegistration`.
+    /// An exact replay on an already-`Ready` claim returns the same receipt
+    /// identity; readiness on a terminal (or otherwise non-admittable)
+    /// claim is refused without touching the durable state. Only mechanical
+    /// failures surface as `Err`; every typed refusal is an `Ok` response
+    /// value. Wave-B readiness is proven by the immutable admission receipt
+    /// plus the durable `Ready` state; a distinct ready-receipt type, ready
+    /// deduplication across ready ids, and blocked-report handling belong to
+    /// later waves.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Wave B passes ready evidence as primitives so no new public contract type is minted"
+    )]
+    pub fn mark_native_worker_ready<S: OperationalRecoveryStore>(
+        &self,
+        store: &S,
+        request: &NativeWorkerClaimRequest,
+        ready_id: &str,
+        ready_registration_id: &str,
+        ready_worker_generation: u64,
+        adapter_registry_revision: &str,
+        credential_refs: &[(&str, &str)],
+        ready_at_unix_ms: u64,
+        now_unix_ms: u64,
+    ) -> Result<NativeWorkerClaimResponse, KernelServiceError> {
+        if self.generation_fenced {
+            return Err(KernelServiceError::GenerationFenced);
+        }
+        if self.state != KernelServiceState::Ready {
+            return Err(KernelServiceError::AdmissionClosed(self.state));
+        }
+        if now_unix_ms == 0 {
+            return Err(KernelServiceError::InvalidField {
+                field: "native_worker_ready.now",
+                reason: "report time must be non-zero",
+            });
+        }
+        let rejected = |reason: NativeWorkerClaimRejectionReason, detail: &'static str| {
+            NativeWorkerClaimResponse::Rejected(NativeWorkerClaimRejection {
+                claim_id: request.claim_id.clone(),
+                reason,
+                detail: detail.to_owned(),
+                rejected_at_unix_ms: now_unix_ms,
+            })
+        };
+        if let Err(error) = request.validate() {
+            let (reason, detail) = native_worker_claim_rejection_reason(&error);
+            return Ok(rejected(reason, detail));
+        }
+        if let Err(error) = request.validate_canonical_digest() {
+            let (reason, detail) = native_worker_claim_rejection_reason(&error);
+            return Ok(rejected(reason, detail));
+        }
+        if let Err(error) = Self::check_native_worker_ready_report(
+            ready_id,
+            request,
+            ready_registration_id,
+            adapter_registry_revision,
+            ready_worker_generation,
+            credential_refs,
+            ready_at_unix_ms,
+        ) {
+            let (reason, detail) = native_worker_claim_rejection_reason(&error);
+            return Ok(rejected(reason, detail));
+        }
+        // Exact-tuple currency gate (Implements #64): the claim epoch must be
+        // the same `(lineage_id, sequence)` as live. Same-lineage older maps
+        // to `StaleRegistration`, same-lineage newer or cross-lineage to
+        // `StaleEpoch`; equal sequences across lineages are unrelated and
+        // never authorize.
+        let live_epoch = self.authority_epoch();
+        if !request.authority_epoch.is_same_authority(&live_epoch) {
+            if request.authority_epoch.lineage_id == live_epoch.lineage_id
+                && request.authority_epoch.sequence.get() < live_epoch.sequence.get()
+            {
+                return Ok(rejected(
+                    NativeWorkerClaimRejectionReason::StaleRegistration,
+                    "native_worker_claim.authority_epoch",
+                ));
+            }
+            return Ok(rejected(
+                NativeWorkerClaimRejectionReason::StaleEpoch,
+                "native_worker_claim.authority_epoch",
+            ));
+        }
+        if request.deadline_unix_ms <= now_unix_ms || ready_at_unix_ms > request.deadline_unix_ms {
+            return Ok(rejected(
+                NativeWorkerClaimRejectionReason::ExpiredDeadline,
+                "native_worker_claim.deadline_unix_ms",
+            ));
+        }
+        if ready_at_unix_ms > now_unix_ms {
+            return Ok(rejected(
+                NativeWorkerClaimRejectionReason::InvalidClaimField,
+                "native_worker_ready.ready_at_unix_ms",
+            ));
+        }
+        Self::finish_native_worker_ready_transition(
+            store,
+            request,
+            ready_registration_id,
+            ready_worker_generation,
+            now_unix_ms,
+        )
+    }
+
+    /// Applies the durable readiness transition for one validated report.
+    ///
+    /// Loads the persisted claim, refuses transport-only readiness (no exact
+    /// current registration and claimed unit) and stale generations,
+    /// conflicts on changed work under the claim identity, replays the
+    /// receipt identity on an already-`Ready` claim, and advances `Admitted`
+    /// to `Ready`. Every typed refusal is an `Ok` response value; only
+    /// mechanical failures surface as `Err`.
+    fn finish_native_worker_ready_transition<S: OperationalRecoveryStore>(
+        store: &S,
+        request: &NativeWorkerClaimRequest,
+        ready_registration_id: &str,
+        ready_worker_generation: u64,
+        now_unix_ms: u64,
+    ) -> Result<NativeWorkerClaimResponse, KernelServiceError> {
+        let rejected = |reason: NativeWorkerClaimRejectionReason, detail: &'static str| {
+            NativeWorkerClaimResponse::Rejected(NativeWorkerClaimRejection {
+                claim_id: request.claim_id.clone(),
+                reason,
+                detail: detail.to_owned(),
+                rejected_at_unix_ms: now_unix_ms,
+            })
+        };
+        let claim_id = native_worker_claim_identity(
+            OperationIdentity::new(request.claim_id.as_str()),
+            "native_worker_claim.claim_id",
+        )?;
+        let durable = store
+            .load_native_worker_claim(&claim_id)
+            .map_err(|error| native_worker_claim_store_error(&error))?;
+        let Some(durable) = durable else {
+            // No exact current registration and claimed unit exists, so no
+            // transport connection, heartbeat, or liveness observation can
+            // make this unit ready.
+            return Ok(rejected(
+                NativeWorkerClaimRejectionReason::TransportOnlyReadiness,
+                "native_worker_ready.claim",
+            ));
+        };
+        if ready_registration_id != durable.registration_id.as_str()
+            || ready_worker_generation != durable.worker_generation
+        {
+            // The presenting generation is not the admitted current
+            // generation: a stale or fenced generation cannot become ready.
+            // Checked before the binding diff so a generation mismatch keeps
+            // its precise reason instead of a generic conflict.
+            return Ok(rejected(
+                NativeWorkerClaimRejectionReason::StaleRegistration,
+                "native_worker_ready.generation",
+            ));
+        }
+        let staged = native_worker_claim_staged_record(request)?;
+        if !durable.same_binding(&staged) {
+            // Changed work under one claim identity conflicts before effect,
+            // regardless of the durable state: the admitted binding stands.
+            let conflict = native_worker_claim_conflict(&durable, request, &staged)?;
+            return Ok(NativeWorkerClaimResponse::Conflict(conflict));
+        }
+        if durable.state == NativeWorkerClaimState::Ready {
+            let admitted_at = durable.admitted_at_unix_ms.ok_or_else(|| {
+                KernelServiceError::Platform("durable ready claim has no admission time".to_owned())
+            })?;
+            let receipt = native_worker_claim_receipt(request, admitted_at)?;
+            receipt.validate().map_err(|_| {
+                KernelServiceError::Platform(
+                    "durable claim cannot reproduce its receipt identity".to_owned(),
+                )
+            })?;
+            return Ok(NativeWorkerClaimResponse::Admitted(receipt));
+        }
+        if durable.state != NativeWorkerClaimState::Admitted {
+            return Ok(rejected(
+                NativeWorkerClaimRejectionReason::InvalidClaimField,
+                "native_worker_claim.state",
+            ));
+        }
+        store
+            .advance_native_worker_claim(&durable.claim_id, NativeWorkerClaimState::Ready, None)
+            .map_err(|error| native_worker_claim_store_error(&error))?
+            .ok_or_else(|| {
+                KernelServiceError::Platform(
+                    "admitted claim disappeared before readiness".to_owned(),
+                )
+            })?;
+        let admitted_at = durable.admitted_at_unix_ms.ok_or_else(|| {
+            KernelServiceError::Platform("durable admitted claim has no admission time".to_owned())
+        })?;
+        let receipt = native_worker_claim_receipt(request, admitted_at)?;
+        receipt.validate().map_err(|_| {
+            KernelServiceError::Platform(
+                "durable claim cannot reproduce its receipt identity".to_owned(),
+            )
+        })?;
+        Ok(NativeWorkerClaimResponse::Admitted(receipt))
+    }
 
     fn transition(&mut self, next: KernelServiceState) -> Result<(), KernelServiceError> {
         self.state = self.state.transition_to(next)?;
@@ -966,6 +2172,15 @@ mod tests {
 
     fn handle(value: &str) -> PlatformHandle {
         PlatformHandle::new(value).unwrap_or_else(|_| unreachable!())
+    }
+
+    fn test_epoch(sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                .unwrap_or_else(|_| unreachable!()),
+            NonZeroU64::new(sequence).unwrap_or_else(|| unreachable!()),
+        )
+        .unwrap_or_else(|_| unreachable!())
     }
 
     fn supervision_incarnation() -> SupervisionLeaseIncarnationBinding {
@@ -1008,7 +2223,7 @@ mod tests {
         HostKernelCandidateBinding {
             installation_id: handle("installation-1"),
             host_epoch: AuthorityEpoch::new(1).unwrap_or_else(|_| unreachable!()),
-            kernel_epoch: AuthorityEpoch::genesis(),
+            kernel_epoch: test_epoch(1),
             activation_id: handle("activation-1"),
             artifact_hash: handle("artifact-1"),
             config_hash: handle("config-1"),
@@ -1052,7 +2267,7 @@ mod tests {
             journal_transaction_id: handle("journal-transaction-1"),
             journal_sequence: 7,
             generation: ResourceGeneration::genesis(),
-            authority_epoch: candidate.kernel_epoch,
+            authority_epoch: candidate.kernel_epoch.clone(),
             activation_nonce: KernelActivationNonce::new(handle(&"a".repeat(64)))
                 .unwrap_or_else(|_| unreachable!()),
         }
@@ -1085,12 +2300,12 @@ mod tests {
         process_id: u32,
     ) -> StoreRebindHandoff {
         let generation = ResourceGeneration::new(1).unwrap_or_else(|_| unreachable!());
-        let authority_epoch = AuthorityEpoch::new(1).unwrap_or_else(|_| unreachable!());
+        let authority_epoch = test_epoch(1);
         let requirement = crate::protocol::HostStoreBootstrapRequirement {
             route_identity: handle(crate::STORE_ROUTE_IDENTITY),
             canonical_pipe_identity: handle(r"\\.\pipe\eliot\store"),
             store_generation: generation,
-            state_fence: StateFence::new(authority_epoch, generation),
+            state_fence: StateFence::new(authority_epoch.clone(), generation),
             launch_nonce: handle("store-launch-nonce"),
             connection_id: handle("store-connection"),
             expected_peer_sid: handle("S-1-5-18"),
@@ -1115,7 +2330,7 @@ mod tests {
                 .compute_digest()
                 .unwrap_or_else(|_| unreachable!()),
             generation,
-            authority_epoch,
+            authority_epoch: authority_epoch.clone(),
             store_fence: format!("{process_id:0>64}"),
         };
         handoff.request_digest = handoff
@@ -1187,9 +2402,9 @@ mod tests {
     fn durable_epoch_sync_is_direct_and_rejects_oversized_values()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut service = KernelService::new([7; 32], 2, 4)?;
-        service.synchronize_authority_epoch(AuthorityEpoch::new(100)?)?;
-        assert_eq!(service.authority_epoch(), AuthorityEpoch::new(100)?);
-        let oversized = AuthorityEpoch::new(4_300)?;
+        service.synchronize_authority_epoch(test_epoch(100))?;
+        assert_eq!(service.authority_epoch(), test_epoch(100));
+        let oversized = test_epoch(4_300);
         assert!(matches!(
             service.synchronize_authority_epoch(oversized),
             Err(KernelServiceError::HandshakeMismatch {
@@ -1343,7 +2558,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let mut service = KernelService::new([19; 32], 2, 4)?;
         let mut candidate = candidate();
-        candidate.kernel_epoch = AuthorityEpoch::new(1)?;
+        candidate.kernel_epoch = test_epoch(1);
         let activation = activate(&mut service, candidate.clone());
         service.publish_ready(ready_receipt(&candidate, &activation, "ready-initial"))?;
 
@@ -1400,7 +2615,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let mut service = KernelService::new([21; 32], 2, 4)?;
         let mut candidate = candidate();
-        candidate.kernel_epoch = AuthorityEpoch::new(1)?;
+        candidate.kernel_epoch = test_epoch(1);
         let activation = activate(&mut service, candidate.clone());
         service.publish_ready(ready_receipt(&candidate, &activation, "ready-initial"))?;
 
@@ -1428,6 +2643,106 @@ mod tests {
                 .any(|receipt| receipt == &first_receipt)
         );
         assert!(service.store_rebind_previous.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn normal_admission_never_consumes_protected_reserve(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use eliot_kernel_core::CapacityClass;
+
+        // Slices A+B enforcement (Implements #65): normal Store/daemon
+        // admission holds a typed `NORMAL_WORKLOAD` permit from the disjoint
+        // normal partition; only the closed protected family consumes the
+        // protected reserve, observably bound to operation/epoch. The normal
+        // partition itself is bounded (capacity 1 here), so normal leases
+        // are held sequentially while protected assertions need the slot.
+        let mut service = KernelService::new([77; 32], 1, 4)?;
+        let candidate = candidate();
+        let activation = activate(&mut service, candidate.clone());
+        service.publish_ready(ready_receipt(&candidate, &activation, "ready-65b"))?;
+        assert_eq!(service.available_control(), 1);
+
+        let normal_one = service.acquire_admission()?;
+        assert_eq!(
+            normal_one.control_permit().capacity_class(),
+            CapacityClass::NormalWorkload
+        );
+        assert_eq!(service.available_control(), 1);
+        assert_eq!(
+            normal_one.activation_id(),
+            candidate.activation_id.as_str()
+        );
+        assert!(
+            normal_one
+                .authority_epoch()
+                .is_same_authority(&service.authority_epoch())
+        );
+        drop(normal_one);
+        let normal_two = service.acquire_admission()?;
+        assert_eq!(
+            normal_two.control_permit().capacity_class(),
+            CapacityClass::NormalWorkload
+        );
+        assert_eq!(service.available_control(), 1);
+        drop(normal_two);
+        assert_eq!(service.available_control(), 1);
+        // The bounded normal partition backpressures independently with the
+        // typed disposition while the protected reserve is untouched.
+        let held_normal = service.acquire_admission()?;
+        assert!(matches!(
+            service.acquire_admission(),
+            Err(KernelServiceError::Core(
+                KernelError::NormalCapacityExhausted { .. }
+            ))
+        ));
+        assert_eq!(service.available_control(), 1);
+        drop(held_normal);
+
+        let protected = service.acquire_protected_control("cancellation:op-1")?;
+        assert_eq!(protected.operation_id(), "cancellation:op-1");
+        assert_eq!(
+            protected.control_permit().capacity_class(),
+            CapacityClass::ProtectedControl
+        );
+        assert!(
+            protected
+                .authority_epoch()
+                .is_same_authority(&service.authority_epoch())
+        );
+        assert_eq!(service.available_control(), 0);
+        assert!(matches!(
+            service.acquire_protected_control("fencing:op-2"),
+            Err(KernelServiceError::Core(
+                KernelError::ProtectedReserveExhausted { .. }
+            ))
+        ));
+        // A label outside the closed protected family fails closed and
+        // consumes nothing.
+        assert!(matches!(
+            service.acquire_protected_control("store-write:op-9"),
+            Err(KernelServiceError::InvalidField { .. })
+        ));
+        // Exhausted protected reserve must not block normal admission:
+        // the pools are disjoint by construction.
+        let normal_during_exhaustion = service.acquire_admission()?;
+        assert_eq!(
+            normal_during_exhaustion.control_permit().capacity_class(),
+            CapacityClass::NormalWorkload
+        );
+        assert_eq!(service.available_control(), 0);
+        drop(normal_during_exhaustion);
+        drop(protected);
+        assert_eq!(service.available_control(), 1);
+
+        // Normal closes in Degraded while protected control stays open for
+        // cancellation/fencing/health/drain/problem/incident/recovery.
+        service.apply(KernelControlCommand::Degrade(handle("drain-65b")))?;
+        assert!(service.acquire_admission().is_err());
+        let draining = service.acquire_protected_control("drain:op-3")?;
+        assert_eq!(service.available_control(), 0);
+        draining.release();
+        assert_eq!(service.available_control(), 1);
         Ok(())
     }
 

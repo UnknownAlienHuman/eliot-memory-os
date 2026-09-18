@@ -216,10 +216,15 @@ pub(crate) fn project_service_registration_inspection(
                 ),
             }
         }
-        eliot_platform_windows::ServiceRegistrationRuntimeInspection::Unknown => {
+        eliot_platform_windows::ServiceRegistrationRuntimeInspection::Unknown { detail } => {
+            // `detail` is secret-free Win32/stage/state only (#1352), so it is
+            // surfaced as bounded diagnostics while the projection stays fail-closed.
             unknown_service_registration(
                 name,
-                "authoritative SCM {name} configuration or live process observation is indeterminate",
+                format!(
+                    "authoritative SCM {{name}} configuration or live process observation is indeterminate ({})",
+                    detail.detail()
+                ),
             )
         }
     }

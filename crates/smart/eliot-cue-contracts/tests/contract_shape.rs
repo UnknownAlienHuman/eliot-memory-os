@@ -8,7 +8,9 @@
 // target production paths.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use eliot_contracts::{AuthorityEpoch, ClockReading, ResourceGeneration, SourceId, StateFence};
+use eliot_contracts::{
+    ClockReading, EpochId, EpochLineageId, ResourceGeneration, SourceId, StateFence,
+};
 use eliot_cue_contracts::{
     ActivationBounds, ActivationBoundsSpec, ActivationRequest, ActivationRequestId,
     ActivationRequestSpec, ActivationResult, ActivationResultSpec, ActivationStrength,
@@ -36,7 +38,15 @@ fn digest(seed: u8) -> Digest {
 }
 
 fn fence() -> StateFence {
-    StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+    StateFence::new(
+        EpochId::new(
+            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440002")
+                .expect("valid test lineage"),
+            std::num::NonZeroU64::new(1).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch"),
+        ResourceGeneration::genesis(),
+    )
 }
 
 fn provenance() -> Provenance {
@@ -239,6 +249,7 @@ fn observed_cue_rejects_unknown_field() -> TestResult {
 }
 
 // Rule 2 -------------------------------------------------------------------
+// WORK_UNIT_CASE: 804/6
 #[test]
 fn canonical_identity_differs_from_comparison_key() -> TestResult {
     // A separate exact key may retain the same text: typed identity, kind and
@@ -325,6 +336,7 @@ fn snapshot_with_wrong_digest_is_rejected() {
 }
 
 // Rule 5 -------------------------------------------------------------------
+// WORK_UNIT_CASE: 804/24
 #[test]
 fn direct_activation_valid_with_zero_edges() -> TestResult {
     let direct_only = request(Vec::new(), 0);
@@ -412,6 +424,7 @@ fn snapshot_set_order_has_stable_digest() -> TestResult {
 }
 
 // Rule 6 -------------------------------------------------------------------
+// WORK_UNIT_CASE: 804/25
 #[test]
 fn direct_and_derived_are_not_interchangeable() -> TestResult {
     let direct = direct_hit();
@@ -474,6 +487,7 @@ fn broken_derived_path_is_rejected() {
 }
 
 // Rule 8 -------------------------------------------------------------------
+// WORK_UNIT_CASE: 804/34
 #[test]
 fn complete_result_cannot_carry_frontier() {
     let complete = result(vec![direct_hit()], Vec::new(), Completeness::Complete);
@@ -526,6 +540,7 @@ fn truncation_names_the_bound_it_hit() -> TestResult {
 }
 
 // Rule 10 ------------------------------------------------------------------
+// WORK_UNIT_CASE: 804/35
 #[test]
 fn known_empty_differs_from_unavailable() {
     let searched_and_found_nothing = result(Vec::new(), Vec::new(), Completeness::Complete);
@@ -618,6 +633,7 @@ fn identity_inputs_change_the_digest() {
 }
 
 // Rule 13 ------------------------------------------------------------------
+// WORK_UNIT_CASE: 804/1
 #[test]
 fn cue_kind_covers_the_declared_vocabulary() -> TestResult {
     // This cell is the Level-0 owner of the cue vocabulary (`depends_on = []`),
@@ -644,6 +660,7 @@ fn cue_kind_covers_the_declared_vocabulary() -> TestResult {
 }
 
 // Rule 14 ------------------------------------------------------------------
+// WORK_UNIT_CASE: 804/45
 #[test]
 fn malformed_input_never_panics() {
     for payload in [
@@ -676,6 +693,7 @@ fn malformed_input_never_panics() {
 }
 
 // Rule 15 ------------------------------------------------------------------
+// WORK_UNIT_CASE: 804/49
 #[test]
 fn consumer_fixture_compiles_standalone() -> TestResult {
     // A consumer stands in for A-11/A-12/A-13/A-14a/A-16a: it reads a request,

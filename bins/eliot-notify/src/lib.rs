@@ -6,13 +6,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::{Signature, VerifyingKey};
 use eliot_cli::kernel_client::{KernelClient, KernelClientError};
 use eliot_contracts::{
-    AuthorityEpoch, ClockReading, ProductId, RequestId, RequestMetadata, ResourceGeneration,
-    SessionId, SourceId, StateFence,
+    ClockReading, EpochId, EpochLineageId, ProductId, RequestId, RequestMetadata,
+    ResourceGeneration, SessionId, SourceId, StateFence,
 };
 use eliot_notify_core::{
     A08AdmissionPort, AdmissionRequest, AdmissionResult, DeliveryObservation,
@@ -35,14 +35,19 @@ use eliot_platform_windows::{
 };
 use eliot_protocol::RequestIdentity;
 use eliot_receipts::{
-    EffectClass, ProofCeiling, ReceiptEnvelope, RequestBinding, contract_identity,
+    EffectClass, ProofCeiling, ReceiptEnvelope, contract_identity,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::num::NonZeroU64;
 
 pub const SERVICE_NAME: &str = "eliot-notify";
 pub const PROTOCOL_VERSION: &str = "eliot.notify.v1";
+/// Lineage used to bind the installer-pinned fallback scalar to its canonical
+/// [`EpochId`] tuple. The declaration wire remains a scalar `u64`; this binary
+/// performs only the mechanical tuple binding and never mints authority.
+const FALLBACK_EPOCH_LINEAGE_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
 
 #[derive(Debug)]
 pub enum NotifyBuildError {
@@ -189,88 +194,53 @@ pub const KERNEL_VERIFICATION_OPERATIONS: &[&str] = &[
 ];
 
 trait NotifyKernelExchange: Send {
-    fn transact_for(
+    fn transact_with_identity(
         &mut self,
-        request: &NotificationRequest,
+        identity: &RequestIdentity,
         operation: &str,
         payload: Value,
     ) -> Result<Value, KernelClientError>;
 }
 
 impl NotifyKernelExchange for KernelClient {
-    fn transact_for(
+    fn transact_with_identity(
         &mut self,
-        request: &NotificationRequest,
+        identity: &RequestIdentity,
         operation: &str,
         payload: Value,
     ) -> Result<Value, KernelClientError> {
-        self.set_request_identity(request_identity(request)?);
+        identity
+            .validate()
+            .map_err(|error| KernelClientError::Configuration(error.to_string()))?;
+        self.set_request_identity(identity.clone());
         self.transact_json(operation, payload)
     }
 }
 
-fn request_identity(request: &NotificationRequest) -> Result<RequestIdentity, KernelClientError> {
-    const MAX_CLOCK_SKEW_MS: u64 = 5_000;
-    const MAX_CLOCK_AGE_MS: u64 = 60_000;
-
-    request
-        .validate()
-        .map_err(|error| KernelClientError::Configuration(error.to_string()))?;
-    let now_unix_ms = SystemTime::now()
+fn now_unix_ms() -> Result<u64, KernelClientError> {
+    let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| {
             KernelClientError::Configuration("host clock is before Unix epoch".to_owned())
         })?
         .as_millis();
-    let now_unix_ms = u64::try_from(now_unix_ms).map_err(|_| {
+    u64::try_from(now).map_err(|_| {
         KernelClientError::Configuration("host clock exceeds request deadline range".to_owned())
-    })?;
-    for observed in [
-        request.context.clock.valid_time_ms,
-        request.context.clock.known_time_ms,
-    ]
-    .into_iter()
-    .flatten()
-    {
-        let observed = u64::try_from(observed).map_err(|_| {
-            KernelClientError::Configuration(
-                "notification request contains a negative clock observation".to_owned(),
-            )
-        })?;
-        if observed > now_unix_ms.saturating_add(MAX_CLOCK_SKEW_MS)
-            || now_unix_ms.saturating_sub(observed) > MAX_CLOCK_AGE_MS
-        {
-            return Err(KernelClientError::Configuration(
-                "notification clock observation is stale or from the future".to_owned(),
-            ));
-        }
-    }
-    let deadline_unix_ms = now_unix_ms
-        .checked_add(
-            u64::try_from(Duration::from_secs(30).as_millis()).map_err(|_| {
-                KernelClientError::Configuration("request deadline overflow".to_owned())
-            })?,
-        )
-        .ok_or_else(|| KernelClientError::Configuration("request deadline overflow".to_owned()))?;
-    let metadata = request.context.clone();
-    let identity = RequestIdentity {
-        request: RequestBinding {
-            state_fence: metadata.state_fence.clone(),
-            metadata,
-        },
-        idempotency_key: request.canonical_request_hash.as_str().to_owned(),
-        deadline_unix_ms,
-        cancellation_id: format!("eliot-notify:{}", request.context.request_id.as_str()),
-    };
-    identity
-        .validate()
-        .map_err(|error| KernelClientError::Configuration(error.to_string()))?;
-    Ok(identity)
+    })
+}
+
+fn identity_conflict_outcome<T>(detail: &str) -> PortOutcome<T> {
+    let _ = detail.len();
+    PortOutcome::Error(PortError::Provider(ProviderError {
+        code: ProviderErrorCode::InvalidRequest,
+        retryable: false,
+    }))
 }
 
 #[derive(Clone)]
 struct KernelPort<E> {
     exchange: Arc<Mutex<E>>,
+    issuer: operation_identity::IssuerHandle,
 }
 
 impl<E> KernelPort<E>
@@ -279,12 +249,69 @@ where
 {
     fn execute_for<T: DeserializeOwned>(
         &self,
-        request: &NotificationRequest,
-        operation: &str,
+        parent: &NotificationRequest,
+        operation: operation_identity::NotifyOperation,
         payload: Value,
+        prior_receipt_digest: Option<&str>,
     ) -> PortOutcome<T> {
+        let Ok(now) = now_unix_ms() else {
+            return PortOutcome::Error(PortError::Provider(ProviderError {
+                code: ProviderErrorCode::InvalidRequest,
+                retryable: false,
+            }));
+        };
+        if self.exchange.lock().is_err() {
+            return PortOutcome::Error(PortError::Provider(ProviderError {
+                code: ProviderErrorCode::Failed,
+                retryable: false,
+            }));
+        }
+        let issued = match self.issuer.lock() {
+            Ok(mut issuer) => match operation {
+                operation_identity::NotifyOperation::G08Verify => {
+                    issuer.issue_g08(parent, &payload, now)
+                }
+                operation_identity::NotifyOperation::A08Admit => {
+                    issuer.issue_a08(parent, &payload, prior_receipt_digest, now)
+                }
+                operation_identity::NotifyOperation::WatchdogVerify => {
+                    issuer.issue_watchdog(parent, &payload, now)
+                }
+                operation_identity::NotifyOperation::DeliveryVerify => {
+                    issuer.issue_delivery(parent, &payload, prior_receipt_digest, now)
+                }
+                operation_identity::NotifyOperation::LedgerReserve => {
+                    issuer.issue_reserve(parent, &payload, prior_receipt_digest, now)
+                }
+                operation_identity::NotifyOperation::LedgerCommit => {
+                    issuer.issue_commit(parent, &payload, prior_receipt_digest, now)
+                }
+            },
+            Err(_) => {
+                return PortOutcome::Error(PortError::Provider(ProviderError {
+                    code: ProviderErrorCode::Failed,
+                    retryable: false,
+                }));
+            }
+        };
+        let issued = match issued {
+            Ok(issued) => issued,
+            Err(operation_identity::OperationIdentityError::IdentityConflict(detail)) => {
+                return identity_conflict_outcome(detail.as_str());
+            }
+            Err(_) => {
+                return PortOutcome::Error(PortError::Provider(ProviderError {
+                    code: ProviderErrorCode::InvalidRequest,
+                    retryable: false,
+                }));
+            }
+        };
         let result = match self.exchange.lock() {
-            Ok(mut exchange) => exchange.transact_for(request, operation, payload),
+            Ok(mut exchange) => exchange.transact_with_identity(
+                &issued.identity,
+                operation.selector(),
+                payload,
+            ),
             Err(_) => {
                 return PortOutcome::Error(PortError::Provider(ProviderError {
                     code: ProviderErrorCode::Failed,
@@ -293,6 +320,50 @@ where
             }
         };
         decode_kernel_outcome(result)
+    }
+
+    fn transact_ledger(
+        &self,
+        parent: &NotificationRequest,
+        operation: operation_identity::NotifyOperation,
+        payload: Value,
+        prior_receipt_digest: Option<&str>,
+    ) -> Result<Value, KernelClientError> {
+        let now = now_unix_ms()?;
+        let issued = {
+            let mut issuer = self.issuer.lock().map_err(|_| {
+                KernelClientError::Rejected(
+                    "Kernel verification exchange mutex is poisoned".to_owned(),
+                )
+            })?;
+            match operation {
+                operation_identity::NotifyOperation::LedgerReserve => {
+                    issuer.issue_reserve(parent, &payload, prior_receipt_digest, now)
+                }
+                operation_identity::NotifyOperation::LedgerCommit => {
+                    issuer.issue_commit(parent, &payload, prior_receipt_digest, now)
+                }
+                _ => issuer.issue_g08(parent, &payload, now),
+            }
+            .map_err(|error| match error {
+                operation_identity::OperationIdentityError::IdentityConflict(detail) => {
+                    KernelClientError::Rejected(format!("IDENTITY_CONFLICT: {detail}"))
+                }
+                other => KernelClientError::Configuration(other.to_string()),
+            })?
+        };
+        issued
+            .identity
+            .validate()
+            .map_err(|error| KernelClientError::Configuration(error.to_string()))?;
+        match self.exchange.lock() {
+            Ok(mut exchange) => {
+                exchange.transact_with_identity(&issued.identity, operation.selector(), payload)
+            }
+            Err(_) => Err(KernelClientError::Rejected(
+                "Kernel verification exchange mutex is poisoned".to_owned(),
+            )),
+        }
     }
 }
 
@@ -370,8 +441,9 @@ where
     ) -> PortOutcome<eliot_receipts::ReceiptEnvelope> {
         self.port.execute_for(
             request,
-            G08_VERIFY_OPERATION,
+            operation_identity::NotifyOperation::G08Verify,
             json!({"envelope": envelope, "request": request}),
+            None,
         )
     }
 }
@@ -385,9 +457,10 @@ where
     E: NotifyKernelExchange,
 {
     fn admit(&mut self, request: &AdmissionRequest<'_>) -> PortOutcome<AdmissionResult> {
+        let prior = request.source_receipt.canonical_sha256();
         self.port.execute_for(
             request.platform_request,
-            A08_ADMIT_OPERATION,
+            operation_identity::NotifyOperation::A08Admit,
             json!({
                 "platform_request": request.platform_request,
                 "source_receipt": request.source_receipt,
@@ -397,6 +470,7 @@ where
                 "requested_effect": request.requested_effect,
                 "normal_candidates": request.normal_candidates,
             }),
+            Some(prior),
         )
     }
 }
@@ -416,8 +490,9 @@ where
     ) -> PortOutcome<eliot_receipts::ReceiptEnvelope> {
         self.port.execute_for(
             request,
-            WATCHDOG_VERIFY_OPERATION,
+            operation_identity::NotifyOperation::WatchdogVerify,
             json!({"envelope": envelope, "request": request}),
+            None,
         )
     }
 }
@@ -434,9 +509,10 @@ where
         &mut self,
         evidence: &DeliveryReceiptEvidence<'_>,
     ) -> PortOutcome<eliot_receipts::ReceiptEnvelope> {
+        let prior = evidence.admission.receipt.canonical_sha256();
         self.port.execute_for(
             evidence.platform_request,
-            DELIVERY_VERIFY_OPERATION,
+            operation_identity::NotifyOperation::DeliveryVerify,
             json!({
                 "platform_request": evidence.platform_request,
                 "source_receipt": evidence.source_receipt,
@@ -445,6 +521,7 @@ where
                 "claim_digest": evidence.claim_digest,
                 "provider_evidence": evidence.provider_evidence,
             }),
+            Some(prior),
         )
     }
 }
@@ -462,16 +539,20 @@ where
         intent: &LedgerIntent,
         request: &NotificationRequest,
     ) -> LedgerReserveOutcome {
-        match decode_kernel_outcome(match self.port.exchange.lock() {
-            Ok(mut exchange) => exchange.transact_for(
-                request,
-                LEDGER_RESERVE_OPERATION,
-                json!({"intent": intent, "request": request}),
-            ),
-            Err(_) => Err(KernelClientError::Rejected(
-                "Kernel verification exchange mutex is poisoned".to_owned(),
-            )),
-        }) {
+        let payload = json!({"intent": intent, "request": request});
+        let outcome: PortOutcome<LedgerReserveOutcome> = match self.port.transact_ledger(
+            request,
+            operation_identity::NotifyOperation::LedgerReserve,
+            payload,
+            Some(intent.claim_digest.as_str()),
+        ) {
+            Ok(value) => decode_kernel_outcome(Ok(value)),
+            Err(KernelClientError::Rejected(detail)) if detail.starts_with("IDENTITY_CONFLICT") => {
+                return LedgerReserveOutcome::Conflict;
+            }
+            Err(_) => return LedgerReserveOutcome::Unavailable,
+        };
+        match outcome {
             PortOutcome::Known(value) => value,
             PortOutcome::Partial { .. } | PortOutcome::Unknown(_) | PortOutcome::Error(_) => {
                 LedgerReserveOutcome::Unavailable
@@ -485,20 +566,24 @@ where
         observation: &DeliveryObservation,
         request: &NotificationRequest,
     ) -> LedgerCommitOutcome {
-        match decode_kernel_outcome(match self.port.exchange.lock() {
-            Ok(mut exchange) => exchange.transact_for(
-                request,
-                LEDGER_COMMIT_OPERATION,
-                json!({
-                    "reservation": reservation,
-                    "observation": observation,
-                    "request": request,
-                }),
-            ),
-            Err(_) => Err(KernelClientError::Rejected(
-                "Kernel verification exchange mutex is poisoned".to_owned(),
-            )),
-        }) {
+        let payload = json!({
+            "reservation": reservation,
+            "observation": observation,
+            "request": request,
+        });
+        let outcome: PortOutcome<LedgerCommitOutcome> = match self.port.transact_ledger(
+            request,
+            operation_identity::NotifyOperation::LedgerCommit,
+            payload,
+            Some(reservation.claim_digest.as_str()),
+        ) {
+            Ok(value) => decode_kernel_outcome(Ok(value)),
+            Err(KernelClientError::Rejected(detail)) if detail.starts_with("IDENTITY_CONFLICT") => {
+                return LedgerCommitOutcome::Conflict;
+            }
+            Err(_) => return LedgerCommitOutcome::Unavailable,
+        };
+        match outcome {
             PortOutcome::Known(value) => value,
             PortOutcome::Partial { .. } | PortOutcome::Unknown(_) | PortOutcome::Error(_) => {
                 LedgerCommitOutcome::Unavailable
@@ -512,29 +597,38 @@ where
     E: NotifyKernelExchange + 'static,
 {
     let exchange = Arc::new(Mutex::new(exchange));
+    let issuer: operation_identity::IssuerHandle =
+        Arc::new(Mutex::new(operation_identity::NotifyIdentityIssuer::new()));
     VerificationPorts {
         a08: Some(Box::new(KernelA08 {
             port: KernelPort {
                 exchange: exchange.clone(),
+                issuer: issuer.clone(),
             },
         })),
         g08: Some(Box::new(KernelG08 {
             port: KernelPort {
                 exchange: exchange.clone(),
+                issuer: issuer.clone(),
             },
         })),
         watchdog: Some(Box::new(KernelWatchdog {
             port: KernelPort {
                 exchange: exchange.clone(),
+                issuer: issuer.clone(),
             },
         })),
         delivery_receipt: Some(Box::new(KernelDeliveryReceipt {
             port: KernelPort {
                 exchange: exchange.clone(),
+                issuer: issuer.clone(),
             },
         })),
         ledger: Some(Box::new(KernelLedger {
-            port: KernelPort { exchange },
+            port: KernelPort {
+                exchange,
+                issuer,
+            },
         })),
     }
 }
@@ -559,6 +653,7 @@ const DELIVERY_OPERATION: &str = "notification_delivery";
 const DELIVERY_OWNER: &str = "delivery-receipt-verifier";
 
 mod fallback_verification;
+pub mod operation_identity;
 #[cfg(test)]
 use fallback_verification::sha256_hex;
 use fallback_verification::{
@@ -712,8 +807,17 @@ pub fn load_watchdog_fallback_request()
         .map_err(|error| NotifyBuildError::Fallback(error.to_string()))?;
     let notification = watchdog_notification_id(&envelope)
         .map_err(|error| NotifyBuildError::Fallback(error.to_string()))?;
-    let authority_epoch = AuthorityEpoch::new(material.declaration.authority_epoch)
-        .map_err(|error| NotifyBuildError::Fallback(error.to_string()))?;
+    let authority_epoch = {
+        let lineage = EpochLineageId::new(FALLBACK_EPOCH_LINEAGE_ID)
+            .map_err(|error| NotifyBuildError::Fallback(error.to_string()))?;
+        let sequence = NonZeroU64::new(material.declaration.authority_epoch).ok_or_else(|| {
+            NotifyBuildError::Fallback(
+                "watchdog verification declaration has zero authority epoch".to_owned(),
+            )
+        })?;
+        EpochId::new(lineage, sequence)
+            .map_err(|error| NotifyBuildError::Fallback(error.to_string()))?
+    };
     let session_id = SessionId::new(material.declaration.audience.as_str())
         .map_err(|error| NotifyBuildError::Fallback(error.to_string()))?;
     let now_ms = SystemTime::now()
@@ -760,7 +864,7 @@ fn request_matches_fallback(
             .session_id
             .as_ref()
             .is_some_and(|session| session.as_str() == declaration.audience.as_str())
-        && request.context.state_fence.authority_epoch.value() == declaration.authority_epoch
+        && request.context.state_fence.authority_epoch.sequence.get() == declaration.authority_epoch
         && request.context.state_fence.resource_generation.value() == 1
         && request.context.product_id.as_str() == eliot_notify_core::WATCHDOG_PRODUCT_ID
         && request.context.source_id.as_str() == eliot_notify_core::WATCHDOG_SOURCE_ID
@@ -1208,7 +1312,8 @@ impl LocalFallbackLedger {
 
     fn validate_request(&self, request: &NotificationRequest, intent: &LedgerIntent) -> bool {
         intent.request_id.as_str() == request.context.request_id.as_str()
-            && request.context.state_fence.authority_epoch.value() == self.expected_authority_epoch
+            && request.context.state_fence.authority_epoch.sequence.get()
+                == self.expected_authority_epoch
     }
 
     fn poison_key(&mut self, key: &str) {
@@ -1522,7 +1627,8 @@ fn load_fallback_verification_ports(root: &Path) -> Result<VerificationPorts, No
 mod tests {
     #![allow(
         clippy::unwrap_used,
-        reason = "notification protocol tests use unwrap for fixed-valid fixture construction"
+        clippy::expect_used,
+        reason = "notification protocol tests use unwrap/expect for fixed-valid fixture construction"
     )]
 
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1530,8 +1636,8 @@ mod tests {
 
     use ed25519_dalek::{Signer, SigningKey};
     use eliot_contracts::{
-        AuthorityEpoch, ClockReading, ProductId, RequestId, RequestMetadata, ResourceGeneration,
-        SessionId, SourceId, StateFence,
+        ClockReading, EpochId, EpochLineageId, ProductId, RequestId, RequestMetadata,
+        ResourceGeneration, SessionId, SourceId, StateFence,
     };
     use eliot_notify_core::{
         DeliveryObservation, LedgerCommitOutcome, LedgerIntent, LedgerReservation,
@@ -1543,31 +1649,50 @@ mod tests {
 
     use super::*;
 
+    const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn test_epoch(sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(TEST_LINEAGE_A).expect("valid test lineage"),
+            NonZeroU64::new(sequence).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
+
     #[derive(Clone)]
     struct RecordingExchange {
-        calls: Arc<Mutex<Vec<(String, RequestId, Value)>>>,
+        calls: Arc<Mutex<Vec<(String, RequestIdentity, Value)>>>,
         response: Value,
     }
 
     impl NotifyKernelExchange for RecordingExchange {
-        fn transact_for(
+        fn transact_with_identity(
             &mut self,
-            request: &NotificationRequest,
+            identity: &RequestIdentity,
             operation: &str,
             payload: Value,
         ) -> Result<Value, KernelClientError> {
             self.calls.lock().unwrap().push((
                 operation.to_owned(),
-                request.context.request_id.clone(),
+                identity.clone(),
                 payload,
             ));
             Ok(self.response.clone())
         }
     }
 
+    fn fresh_clock_ms() -> i64 {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("test clock")
+            .as_millis();
+        i64::try_from(now).expect("test clock fits")
+    }
+
     fn request(id: &str) -> NotificationRequest {
         let request_id = RequestId::new(id).unwrap();
-        let fence = StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis());
+        let fence = StateFence::new(test_epoch(1), ResourceGeneration::genesis());
+        let now = fresh_clock_ms();
         NotificationRequest {
             context: RequestMetadata {
                 request_id,
@@ -1577,14 +1702,21 @@ mod tests {
                 source_id: SourceId::new("notify-test-source").unwrap(),
                 state_fence: fence,
                 clock: ClockReading {
-                    known_time_ms: Some(10_000),
+                    valid_time_ms: Some(now),
+                    known_time_ms: Some(now),
                     ..ClockReading::default()
                 },
             },
-            canonical_request_hash: PlatformHandle::new("a").unwrap(),
+            canonical_request_hash: PlatformHandle::new(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .unwrap(),
             notification: PlatformHandle::new("notification-1").unwrap(),
             audience: PlatformHandle::new("audience-1").unwrap(),
-            body_digest: PlatformHandle::new("b").unwrap(),
+            body_digest: PlatformHandle::new(
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            )
+            .unwrap(),
         }
     }
 
@@ -1615,7 +1747,7 @@ mod tests {
     }
 
     #[test]
-    fn ledger_exchange_binds_each_call_to_the_supplied_request() {
+    fn ledger_exchange_binds_each_call_to_a_distinct_child_identity() {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let exchange = RecordingExchange {
             calls: Arc::clone(&calls),
@@ -1625,8 +1757,13 @@ mod tests {
             }),
         };
         let shared = Arc::new(Mutex::new(exchange));
+        let issuer: operation_identity::IssuerHandle =
+            Arc::new(Mutex::new(operation_identity::NotifyIdentityIssuer::new()));
         let mut ledger = KernelLedger {
-            port: KernelPort { exchange: shared },
+            port: KernelPort {
+                exchange: shared,
+                issuer,
+            },
         };
         let first = request("request-a");
         let second = request("request-b");
@@ -1641,8 +1778,21 @@ mod tests {
         let calls = calls.lock().unwrap();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].0, LEDGER_RESERVE_OPERATION);
-        assert_eq!(calls[0].1.as_str(), "request-a");
-        assert_eq!(calls[1].1.as_str(), "request-b");
+        assert_eq!(calls[1].0, LEDGER_RESERVE_OPERATION);
+        // Parent intent is stable in the payload; the transport identity is a
+        // distinct versioned child per parent.
+        assert_ne!(
+            calls[0].1.request.metadata.request_id,
+            calls[1].1.request.metadata.request_id
+        );
+        assert_ne!(
+            calls[0].1.idempotency_key, calls[1].1.idempotency_key,
+            "different parents must not share a child idempotency key"
+        );
+        assert_ne!(
+            calls[0].1.cancellation_id, calls[1].1.cancellation_id,
+            "per-step cancellation isolation spans parents"
+        );
         assert_eq!(calls[0].2["request"]["context"]["request_id"], "request-a");
         assert_eq!(calls[1].2["request"]["context"]["request_id"], "request-b");
     }
@@ -1658,8 +1808,13 @@ mod tests {
             }),
         };
         let shared = Arc::new(Mutex::new(exchange));
+        let issuer: operation_identity::IssuerHandle =
+            Arc::new(Mutex::new(operation_identity::NotifyIdentityIssuer::new()));
         let mut ledger = KernelLedger {
-            port: KernelPort { exchange: shared },
+            port: KernelPort {
+                exchange: shared,
+                issuer,
+            },
         };
         assert!(matches!(
             ledger.reserve(&intent(), &request("request-a")),
@@ -1694,7 +1849,7 @@ mod tests {
         let request_hash = watchdog_request_hash(&envelope).unwrap();
         let expected_request_id = watchdog_request_id(&envelope).unwrap();
         let request_id = RequestId::new(expected_request_id).unwrap();
-        let fence = StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis());
+        let fence = StateFence::new(test_epoch(1), ResourceGeneration::genesis());
         let request = NotificationRequest {
             context: RequestMetadata {
                 request_id,

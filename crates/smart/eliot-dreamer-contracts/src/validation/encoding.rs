@@ -4,7 +4,7 @@ use serde::Serialize;
 
 use super::{DreamDraftValidationError, ValidationPolicy, bounds::MAX_CANONICAL_BYTES};
 use crate::{
-    BudgetLimits, BudgetUsage, DreamInputBundle, DreamJobInput, GroundedDreamDraft, ModelDraft,
+    BudgetLimits, BudgetUsage, DreamInputBundle, DreamJobAdmission, GroundedDreamDraft, ModelDraft,
     PreservationReport,
 };
 
@@ -15,7 +15,7 @@ pub const PROOF_CEILING: &str = "candidate-only";
 
 #[derive(Serialize)]
 pub struct InputPreimage<'a> {
-    pub job: &'a DreamJobInput,
+    pub job: &'a DreamJobAdmission,
     pub bundle: &'a DreamInputBundle,
     pub model: &'a ModelDraft,
     pub grounded: &'a GroundedDreamDraft,
@@ -28,7 +28,7 @@ pub struct InputPreimage<'a> {
 
 #[derive(Serialize)]
 struct OutputPreimage<'a> {
-    job: &'a DreamJobInput,
+    job: &'a DreamJobAdmission,
     bundle: &'a DreamInputBundle,
     model: &'a ModelDraft,
     grounded: &'a GroundedDreamDraft,
@@ -43,7 +43,7 @@ struct OutputPreimage<'a> {
 }
 
 pub struct OutputContext<'a> {
-    pub job: &'a DreamJobInput,
+    pub job: &'a DreamJobAdmission,
     pub bundle: &'a DreamInputBundle,
     pub model: &'a ModelDraft,
     pub grounded: &'a GroundedDreamDraft,
@@ -97,7 +97,7 @@ pub fn preservation_digest(
 }
 
 pub fn budget_digest(
-    job: &DreamJobInput,
+    job: &DreamJobAdmission,
     usage: &BudgetUsage,
 ) -> Result<String, DreamDraftValidationError> {
     #[derive(Serialize)]

@@ -410,7 +410,22 @@ impl WatchdogPublicationRetentionPlan {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence};
+    use std::num::NonZeroU64;
+
+    use eliot_contracts::{
+        AuthorityEpoch, EpochId, EpochLineageId, ResourceGeneration, StateFence,
+    };
+
+    /// Lineage-A fixture epoch for tests (canonical UUID lineage, no scalar).
+    fn test_epoch(sequence: u64) -> EpochId {
+        let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .expect("canonical test lineage-A");
+        EpochId::new(
+            lineage,
+            NonZeroU64::new(sequence).expect("non-zero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
 
     fn signed_lease_bytes(lease_id: &str) -> Vec<u8> {
         let signer = crate::Ed25519SupervisionLeaseSigner::from_secret_key(
@@ -420,7 +435,7 @@ mod tests {
         )
         .expect("signer");
         let generation = ResourceGeneration::new(1).expect("generation");
-        let kernel_epoch = AuthorityEpoch::new(2).expect("kernel epoch");
+        let kernel_epoch = test_epoch(2);
         let lease = crate::SupervisionLease {
             schema: crate::SUPERVISION_LEASE_SCHEMA.to_owned(),
             contract_name: crate::SUPERVISION_LEASE_CONTRACT_NAME.to_owned(),
@@ -432,7 +447,7 @@ mod tests {
             host_epoch: AuthorityEpoch::new(1).expect("host epoch"),
             activation_id: "activation-1".to_owned(),
             activation_generation: generation,
-            kernel_epoch,
+            kernel_epoch: kernel_epoch.clone(),
             watchdog_epoch: AuthorityEpoch::new(1).expect("watchdog epoch"),
             generation_binding: crate::SupervisionGenerationBinding {
                 target_id: "eliot-kernel".to_owned(),

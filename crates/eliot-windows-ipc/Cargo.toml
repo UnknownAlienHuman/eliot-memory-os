@@ -25,6 +25,7 @@ tokio.workspace = true
 windows-sys.workspace = true
 
 [lints.rust]
+# SAFETY-OWNERSHIP: audited FFI-bridge exception, see docs/ADR/0014-unsafe-ownership-and-exceptions.md#row-eliot-windows-ipc (canonical owner eliot-platform-windows).
 unsafe_code = "allow"
 unsafe_op_in_unsafe_fn = "deny"
 

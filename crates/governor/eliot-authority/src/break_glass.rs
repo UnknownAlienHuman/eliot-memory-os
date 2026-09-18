@@ -145,8 +145,12 @@ fn validate_binding(
     {
         return Err(AuthorityError::FenceMismatch);
     }
-    if authority.authority_epoch != session.authority_epoch
-        || authority.authority_epoch != authority.state_fence.authority_epoch
+    if !authority
+        .authority_epoch
+        .is_same_authority(&session.authority_epoch)
+        || !authority
+            .authority_epoch
+            .is_same_authority(&authority.state_fence.authority_epoch)
     {
         return Err(AuthorityError::EpochMismatch);
     }

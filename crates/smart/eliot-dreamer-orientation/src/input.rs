@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
-use eliot_dreamer_contracts::{DreamInputBundle, DreamJobInput, ValidatedCandidate};
+use eliot_dreamer_contracts::{DreamInputBundle, DreamJobAdmission, ValidatedCandidate};
 use eliot_epistemic_contracts::{CurrentEpistemicPosition, PositionId, PositionRevision};
 use eliot_evidence::EvidenceEnvelope;
 use schemars::JsonSchema;
@@ -40,7 +40,7 @@ impl LocalOrientationFrame {
         attempt: impl Into<String>,
         output_contract: impl Into<String>,
         frame_source_handle: impl Into<String>,
-        job: &DreamJobInput,
+        job: &DreamJobAdmission,
     ) -> Result<Self, OrientationError> {
         let mut frame = Self {
             schema_version: 1,
@@ -69,7 +69,7 @@ impl LocalOrientationFrame {
     /// Validates identity and digest bindings without external state.
     pub fn validate_for(
         &self,
-        job: &DreamJobInput,
+        job: &DreamJobAdmission,
         bundle: &DreamInputBundle,
     ) -> Result<(), OrientationError> {
         self.validate_shape()?;
@@ -218,7 +218,7 @@ impl LocalOrientationFrame {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AdmittedOrientationJob {
-    pub job: DreamJobInput,
+    pub job: DreamJobAdmission,
     pub frame: LocalOrientationFrame,
     pub admitted_evidence: Vec<CanonicalEvidenceHandle>,
     pub coverage_denominator: Option<OrientationCoverageDenominator>,
@@ -309,7 +309,7 @@ impl OrientationCoverageDenominator {
 
     pub fn validate_for(
         &self,
-        job: &DreamJobInput,
+        job: &DreamJobAdmission,
         bundle: &DreamInputBundle,
     ) -> Result<(), OrientationError> {
         self.validate_unsealed_shape()?;
@@ -511,7 +511,7 @@ pub struct CanonicalEvidenceHandle {
 impl CanonicalEvidenceHandle {
     pub fn validate_for(
         &self,
-        job: &DreamJobInput,
+        job: &DreamJobAdmission,
         bundle: &DreamInputBundle,
     ) -> Result<(), OrientationError> {
         if self.source_handle.trim().is_empty() {
@@ -592,7 +592,7 @@ pub struct CurrentEpistemicPositionHandle {
 }
 
 impl CurrentEpistemicPositionHandle {
-    pub fn validate_for(&self, job: &DreamJobInput) -> Result<(), OrientationError> {
+    pub fn validate_for(&self, job: &DreamJobAdmission) -> Result<(), OrientationError> {
         if self.source_handle.trim().is_empty() {
             return Err(OrientationError::Invalid("CEP source handle"));
         }

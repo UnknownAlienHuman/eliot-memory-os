@@ -495,7 +495,33 @@ pub(super) fn package_port_error(error: &PackageStagingError) -> PortError {
 }
 
 pub(super) fn package_staging_reference(stage: PackageStagingStage, code: u32) -> PlatformHandle {
-    let stage = match stage {
+    PlatformHandle::new(format!(
+        "stage-package-win32-v1:{}:{code:08x}",
+        package_staging_stage_name(stage)
+    ))
+    .unwrap_or_else(|_| unreachable!())
+}
+
+/// Pending reference for a sited native staging failure.
+///
+/// The site is the kebab-case `StagePackage` operation that failed, so a
+/// sharing violation attributes its exact open:
+/// `stage-package-win32-v1:create-file-w:<site>:00000020`. Stage and code keep
+/// their existing meaning; only the site is added.
+pub(super) fn package_staging_reference_at(
+    stage: PackageStagingStage,
+    site: &str,
+    code: u32,
+) -> PlatformHandle {
+    PlatformHandle::new(format!(
+        "stage-package-win32-v1:{}:{site}:{code:08x}",
+        package_staging_stage_name(stage)
+    ))
+    .unwrap_or_else(|_| unreachable!())
+}
+
+fn package_staging_stage_name(stage: PackageStagingStage) -> &'static str {
+    match stage {
         PackageStagingStage::KnownFolderPath => "known-folder-path",
         PackageStagingStage::CanonicalizePath => "canonicalize-path",
         PackageStagingStage::SymlinkMetadata => "symlink-metadata",
@@ -510,9 +536,7 @@ pub(super) fn package_staging_reference(stage: PackageStagingStage, code: u32) -
         PackageStagingStage::SetFilePointerEx => "set-file-pointer-ex",
         PackageStagingStage::ReadFile => "read-file",
         PackageStagingStage::WriteFile => "write-file",
-    };
-    PlatformHandle::new(format!("stage-package-win32-v1:{stage}:{code:08x}"))
-        .unwrap_or_else(|_| unreachable!())
+    }
 }
 
 fn package_staging_error_reference(error: &PackageStagingError) -> PlatformHandle {
@@ -539,6 +563,9 @@ fn package_staging_error_reference(error: &PackageStagingError) -> PlatformHandl
         PackageStagingError::Win32 { stage, code } => {
             return package_staging_reference(*stage, *code);
         }
+        PackageStagingError::Win32At { stage, site, code } => {
+            return package_staging_reference_at(*stage, site, *code);
+        }
     };
     PlatformHandle::new(format!("stage-package-error-v1:{semantic}"))
         .unwrap_or_else(|_| unreachable!())
@@ -546,11 +573,8 @@ fn package_staging_error_reference(error: &PackageStagingError) -> PlatformHandl
 
 fn package_staging_outcome<T>(error: &PackageStagingError) -> PortOutcome<T> {
     match error {
-        PackageStagingError::Win32 { stage, code } => {
-            PortOutcome::Error(package_port_error(&PackageStagingError::Win32 {
-                stage: *stage,
-                code: *code,
-            }))
+        error @ (PackageStagingError::Win32 { .. } | PackageStagingError::Win32At { .. }) => {
+            PortOutcome::Error(package_port_error(error))
         }
         PackageStagingError::UnsupportedPlatform => {
             PortOutcome::Unknown(UnknownReason::Unsupported)

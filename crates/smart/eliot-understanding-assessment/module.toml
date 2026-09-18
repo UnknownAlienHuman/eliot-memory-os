@@ -1,0 +1,75 @@
+schema_version = 4
+module_id = "smart.understanding.assessment"
+crate = "eliot-understanding-assessment"
+status = "PROTOTYPE"
+wave = "cognitive-micromodules-wave-09"
+agent_order = 85
+plane = "Smart"
+runtime_layer = "R5"
+delivery_depth = "D3b"
+source_layer = "C1"
+runtime_bundle = "eliotd"
+state_class = "stateless"
+hot_path = false
+lifecycle_owner = "smart.understanding.assessment"
+loc_soft_ceiling = 10000
+loc_policy = "review ceiling only; causal cohesion, proof, owner, build/test closure and replacement boundary decide topology"
+product_objective = "Common Ground and scoped understanding are assessed as public causal inheritance with rival-aware prediction-before-observation and held-out discipline."
+causal_property = "Common Ground and scoped understanding assessment"
+old_failure_or_missing_capability = "summaries, graph size, delivery receipts, or correlated-agent agreement are treated as understanding with no rival model, prediction, discriminator, or denominator (CC-004/CC-006)."
+discriminator = "LOCALLY_ADEQUATE requires a public rival-aware model, a prediction fixed before observation, a discriminative probe, applicable outcome/verifier evidence, and revision on failure; NOT_ONBOARDED forbids adequacy"
+primary_responsibility = "Assess one question/task family at one State Fence into a CommonGroundAssessment and ScopedUnderstandingAssessment pair."
+owned_mutable_state = []
+allowed_effects = []
+inputs = ["immutable ActiveUnderstandingView by handle via eliot-context-assembly (contract_only)", "immutable accepted-source projection by handle (CC-006)", "immutable outcome/verifier evidence by handle"]
+outputs = ["CommonGroundAssessment candidate", "ScopedUnderstandingAssessment"]
+depends_on = ["eliot-context-contracts", "eliot-contracts"]
+providers = ["A-15 admitted context contract", "accepted-source projection owner"]
+consumers = ["model/harness-change review path", "product acceptance path"]
+non_goals = ["second ContextCompiler invocation", "second admission pass", "mutable UnderstandingState", "semantic Understanding ownership", "global understands flag", "single understanding score"]
+invariants = ["Common Ground is public causal inheritance, not summary similarity or native continuation state", "no global understands flag and no single understanding score", "LOCALLY_ADEQUATE requires rival-aware model plus prediction before observation plus discriminator plus applicable outcome/verifier plus revision discipline", "product claims additionally require held-out or leakage-controlled evaluation", "every Complete state and every LOCALLY_ADEQUATE requires the exact independently recheckable denominator"]
+failure_behavior = "Return typed INCONCLUSIVE/REFUTED/STALE/NOT_ONBOARDED with exact missing inputs; never set LOCALLY_ADEQUATE without the full closure."
+proof_surface = ["rival-aware model with pre-observation prediction", "discriminative probe/action", "outcome/verifier binding", "revision on failure", "held-out/compositional transfer where applicable", "abstention precision/coverage where applicable"]
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+product_pulse = "W9_UNDERSTANDING_PULSE_01"
+replacement_boundary = "implementation behind the declared public contract; package ownership creates no runtime or semantic authority"
+merge_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
+split_trigger = "a second causal responsibility, mutable owner, independent proof surface or independent rollback boundary appears"
+
+[[donor]]
+path = "docs/architecture/I06-16-scoped-understanding-assessment.md"
+disposition = "authoritative contract"
+
+[[donor]]
+path = "docs/architecture/A00-07-core-vocabulary.md"
+disposition = "authoritative definition"
+
+[[donor]]
+path = "docs/architecture/A06-07-eliot-self-knowledge.md"
+disposition = "authoritative contract"
+
+[agent_task]
+objective = "Freeze the owner-neutral Common Ground and scoped-understanding field contract with exact denominator; no implementation in this work unit."
+write_scope = ["crates/smart/eliot-understanding-assessment/**"]
+deliverables = ["frozen field contract entry", "denominator recheck rule", "affected edge fixtures (contract_only)"]
+acceptance = ["one declared responsibility only", "bounded deterministic behavior", "visible local degradation"]
+forbidden = ["canonical writes outside the named Governor transition path", "truth/support/authority/policy/finish/effect promotion", "provider or model SDKs in pure cognitive cores", "vendor or storage types in public contracts", "unbounded synchronous work", "silent truncation", "oracle or verifier weakening in the same work unit", "implicit scope widening", "active-generation self-modification"]
+stop_condition = "Stop and return ContractChallenge when the work needs another owner, a second compilation/admission pass, model work or hidden state."
+challenge_path = "return ContractChallenge to the integration owner when owner, discriminator, proof ceiling or dependency boundary is wrong"
+integration_owner = "cognitive-wave-integrator"
+implementation_language = "Rust 2024"
+required_verification = ["module/package proof at the declared proof ceiling", "real provider/consumer fixture for every changed edge", "the named Product Pulse before promotion", "exact donor reuse/rewrite/reject trace"]
+writeback = "return implementation artifact, exact proof evidence, donor disposition, unresolved ContractChallenges and merge/remove recommendation"
+workspace_admission = "forbidden until implementation, package proof, affected edge proof, current-main rebase and integration-owner review"
+
+# Acceptance is decided by the owning contract and independent review
+# (I0.10: line/test/type counts are not goals). `scripts/verify-work-unit.py`
+# is a retired legacy diagnostic that always reports completion=NOT_VERIFIED
+# and never accepts a work unit. This table names the concrete contract and
+# the required exports/tests plus small behaviour checks the reviewer verifies.
+[acceptance]
+require_deny_unknown_fields = true
+forbid_unsafe = true
+required_exports = []
+required_tests = []
+forbidden_patterns = ['serde_json::Value', 'unimplemented!', 'todo!']
