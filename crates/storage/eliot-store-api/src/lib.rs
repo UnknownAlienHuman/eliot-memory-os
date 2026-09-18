@@ -37,6 +37,7 @@ mod payload_authority;
 mod request_hash;
 mod store_failure;
 mod wire;
+pub mod write_admission;
 
 pub use dreamer_job::{
     DREAMER_JOB_LEDGER_SCHEMA, DreamerJobExpectedState, DreamerJobLedgerEvent,
@@ -57,13 +58,12 @@ pub use request_hash::{
 };
 
 pub use store_failure::{
-    ErasureFailureKind, MAX_STORE_FAILURE_DETAIL_LEN,
-    MAX_STORE_FAILURE_EVIDENCE_HANDLES, MAX_STORE_FAILURE_REFERENCE_LEN,
-    MAX_STORE_FAILURE_RETRY_AFTER_MS, MAX_STORE_REASON_CODE_LEN, STORE_FAILURE_CONTRACT_REVISION,
-    StoreConflictObservation, StoreEvidenceHandles, StoreFailure, StoreFailureContractError,
-    StoreFailureDisposition, StoreFailureIdentityContext, StoreFailureRequestContext,
-    StoreMutationDisposition, StoreReasonCode, StoreRecoveryAction, StoreRetryDirective,
-    erasure_store_failure,
+    ErasureFailureKind, MAX_STORE_FAILURE_DETAIL_LEN, MAX_STORE_FAILURE_EVIDENCE_HANDLES,
+    MAX_STORE_FAILURE_REFERENCE_LEN, MAX_STORE_FAILURE_RETRY_AFTER_MS, MAX_STORE_REASON_CODE_LEN,
+    STORE_FAILURE_CONTRACT_REVISION, StoreConflictObservation, StoreEvidenceHandles, StoreFailure,
+    StoreFailureContractError, StoreFailureDisposition, StoreFailureIdentityContext,
+    StoreFailureRequestContext, StoreMutationDisposition, StoreReasonCode, StoreRecoveryAction,
+    StoreRetryDirective, erasure_store_failure,
 };
 
 pub use wire::{
@@ -91,6 +91,12 @@ pub use erasure_admission::{
     ERASURE_PARAM_SUBJECT, ERASURE_PARAM_SURFACES, ERASURE_SURFACE_SEPARATOR,
     ErasureAdmissionRequest, admit_erasure_transition, decode_erasure_surfaces,
     encode_erasure_surfaces,
+};
+
+pub use write_admission::{
+    MAX_WRITE_ADMISSION_LABEL_BYTES, MAX_WRITE_ADMISSION_SCOPES, ReservedScopeBinding,
+    ReservedWriteRequest, WRITE_ADMISSION_CONTRACT_VERSION, WriteAdmissionParams,
+    WriteAdmissionProjection, WriterEpochBinding, prepared_transition_digest,
 };
 
 pub use operation_catalogue::{
@@ -2382,6 +2388,22 @@ pub fn aggregate_erasure_outcomes(
 
 /// Canonical store boundary.  Only these store-neutral types cross into an
 /// adapter; SDK/query/credential/table types remain adapter-private.
+///
+/// Slice #990 is projection-only: this trait exposes no reserved-write
+/// operation, so a caller cannot invoke one regardless of payload shape.
+/// The following attempt must fail to compile because the method does not
+/// exist:
+///
+/// ```compile_fail
+/// use eliot_store_api::{CanonicalStoreClient, ReservedWriteRequest};
+///
+/// fn reserved_write_is_not_invocable<C: CanonicalStoreClient>(
+///     client: &C,
+///     request: ReservedWriteRequest,
+/// ) {
+///     let _ = client.apply_reserved_write(request);
+/// }
+/// ```
 #[allow(async_fn_in_trait)]
 pub trait CanonicalStoreClient: Send + Sync {
     /// Atomically applies one prepared transition and its expected heads.
