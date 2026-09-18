@@ -19,6 +19,7 @@ use eliot_wasm_runtime::{
     InvocationId, InvocationRequest, InvocationResult, RuntimeError, RuntimePorts, WasmRuntime,
 };
 
+mod admission;
 mod artifact_preflight;
 mod cli_contract;
 mod shadow;
@@ -26,6 +27,7 @@ mod typed_bindings;
 mod typed_execution;
 mod wasmtime_provider;
 
+pub use admission::{PortGrantError, resolve_kernel_port_grant};
 pub use artifact_preflight::{
     MAX_ARTIFACT_BYTES, Preflight, PreflightError, preflight_bytes, read_bounded_artifact,
 };
