@@ -28,10 +28,10 @@ use eliot_store_api::{
 
 use crate::commit_recovery::recover_commit;
 use crate::store_write_reservation::{
-    CompositionReservation, ReservationSeed, ResolvedSendKind, ResolvedSendOutcome,
-    begin_execute_after_send, cancel_before_send, ensure_eligible, finalize_reservation,
-    mark_unknown_outcome, project_reserved_write, reconcile_receipt, reserve_for_transition,
-    writer_epoch_for_fence, writer_epoch_for_fence_from_epoch,
+    CompositionReservation, ReservationSeed, ResolvedSendOutcome, begin_execute_after_send,
+    cancel_before_send, ensure_eligible, finalize_reservation, mark_unknown_outcome,
+    project_reserved_write, reconcile_receipt, reserve_for_transition, writer_epoch_for_fence,
+    writer_epoch_for_fence_from_epoch,
 };
 use crate::{EbpCanonicalStoreClient, EbpStoreTransport, KernelService};
 
@@ -455,10 +455,7 @@ impl KernelStoreGateway {
                 // A stale epoch here preserves the committed operation id for
                 // exact-receipt recovery under the current epoch instead of
                 // finalizing under the wrong one.
-                let post_send = ResolvedSendOutcome::for_token(
-                    &sealed.token,
-                    ResolvedSendKind::ReceiptReceived,
-                );
+                let post_send = ResolvedSendOutcome::after_resolved_send(&sealed.token);
                 begin_execute_after_send(&owner, &sealed.token, &post_send).map_err(|error| {
                     format!(
                         "reserved write committed for operation {operation_id} but the reservation cannot execute ({error}); reconcile by exact receipt once the writer epoch is current"
@@ -474,10 +471,7 @@ impl KernelStoreGateway {
                 // Still unknown after possible submission: preserve
                 // `Executing`/`Reconciling` identity until exact Store receipt
                 // reconciliation. Never a blind retry, never a release.
-                let post_send = ResolvedSendOutcome::for_token(
-                    &sealed.token,
-                    ResolvedSendKind::UnknownAfterSubmit,
-                );
+                let post_send = ResolvedSendOutcome::after_resolved_send(&sealed.token);
                 begin_execute_after_send(&owner, &sealed.token, &post_send)
                     .map_err(|error| error.to_string())?;
                 mark_unknown_outcome(&owner, &sealed.token).map_err(|error| error.to_string())?;

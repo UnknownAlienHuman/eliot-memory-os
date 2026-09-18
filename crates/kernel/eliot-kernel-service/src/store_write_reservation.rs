@@ -715,6 +715,15 @@ pub fn ensure_eligible(
 /// receipt evidence. A mismatched evidence object fails closed here without
 /// touching ORS. A stale executor fails with the owner `StaleWriterEpoch`
 /// error and can neither execute nor finalize another generation's token.
+///
+/// The evidence is unforgeable outside the crate: [`ResolvedSendOutcome`]
+/// fields are private and its only production constructor
+/// ([`ResolvedSendOutcome::after_resolved_send`]) is `pub(crate)`, called
+/// exclusively from the two resolved-send match arms in `store_gateway.rs`
+/// after the transport future returns. External lifecycle callers and tests
+/// cannot mint it; tests use the explicitly test-only
+/// [`ResolvedSendOutcome::mint_for_test`], which is compiled only with
+/// `debug_assertions` and is absent from production (release) builds.
 pub fn begin_execute_after_send(
     owner: &CompositionReservation,
     token: &WriterReservationToken,
@@ -732,47 +741,58 @@ pub fn begin_execute_after_send(
 
 /// Typed evidence that the single Store send for one reservation resolved.
 ///
-/// Minted by the path that observed the send resolve — the gateway's bounded
-/// post-send path in production, the lifecycle harness in proofs — and bound
-/// to the exact reservation operation. [`begin_execute_after_send`] re-checks
-/// the binding and fails closed on mismatch without touching ORS, so a
-/// pre-send caller cannot advance execution: the old evidence-free call no
-/// longer compiles, and a mismatched evidence object is refused at runtime.
+/// Unforgeable capability: the struct fields are private, so no caller outside
+/// this crate can construct a value. The only production constructor is the
+/// `pub(crate)` [`ResolvedSendOutcome::after_resolved_send`], which the
+/// gateway's bounded post-send path calls after the transport future returns
+/// (the `Ok` receipt arm and the still-unknown arm of `apply_reserved`); the
+/// deterministically-refused-without-effect path never reaches execution (it
+/// releases the still-`Eligible` token instead), so no constructor exists for
+/// it by construction. [`begin_execute_after_send`] re-checks the binding and
+/// fails closed on mismatch without touching ORS, so a pre-send caller
+/// holding only `(owner, token)` cannot advance execution: there is no public
+/// constructor to mint, and a mismatched evidence object is refused at
+/// runtime. The former `for_token` public constructor and the documentary
+/// `ResolvedSendKind` (which never participated in the transition contract)
+/// are removed.
+///
+/// Lifecycle proofs that drive ORS directly use the explicitly test-only
+/// [`ResolvedSendOutcome::mint_for_test`], which exists only in
+/// `debug_assertions` builds and is absent from production builds.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedSendOutcome {
     operation_id: String,
-    kind: ResolvedSendKind,
-}
-
-/// How the single send resolved. Both variants prove dispatch completed; the
-/// deterministically-refused-without-effect path never reaches execution (it
-/// releases the still-`Eligible` token instead), so it has no variant here by
-/// construction.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ResolvedSendKind {
-    /// The send returned a Store receipt (committed or terminally-not-applied).
-    ReceiptReceived,
-    /// The send resolved to a still-unknown outcome after possible submission.
-    UnknownAfterSubmit,
+    _sealed: (),
 }
 
 impl ResolvedSendOutcome {
-    /// Binds post-send evidence to one reservation token's operation.
-    pub fn for_token(token: &WriterReservationToken, kind: ResolvedSendKind) -> Self {
+    /// Mints post-send evidence bound to one reservation token's operation.
+    ///
+    /// Crate-internal: the only production callers are the two resolved-send
+    /// match arms in `store_gateway.rs`, invoked after the transport future
+    /// returns. Lifecycle callers outside the crate cannot reach this
+    /// constructor.
+    pub(crate) fn after_resolved_send(token: &WriterReservationToken) -> Self {
         Self {
             operation_id: token.operation_id.as_str().to_owned(),
-            kind,
+            _sealed: (),
         }
+    }
+
+    /// TEST-ONLY post-send evidence mint for lifecycle proofs.
+    ///
+    /// Compiled only with `debug_assertions` (dev/test builds) and absent
+    /// from production (release) builds. Production code must never call
+    /// this: the gateway mints evidence only after the transport future
+    /// returns via [`ResolvedSendOutcome::after_resolved_send`].
+    #[cfg(debug_assertions)]
+    pub fn mint_for_test(token: &WriterReservationToken) -> Self {
+        Self::after_resolved_send(token)
     }
 
     /// Returns the bound operation identity.
     pub fn operation_id(&self) -> &str {
         &self.operation_id
-    }
-
-    /// Returns how the send resolved.
-    pub fn kind(&self) -> ResolvedSendKind {
-        self.kind
     }
 }
 
