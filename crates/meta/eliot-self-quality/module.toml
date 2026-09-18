@@ -1,0 +1,66 @@
+schema_version = 4
+module_id = "meta.self_quality.diagnosis"
+crate = "eliot-self-quality"
+status = "PROTOTYPE"
+wave = "cognitive-micromodules-wave-02"
+agent_order = 38
+plane = "Meta"
+runtime_layer = "R7"
+delivery_depth = "D4"
+source_layer = "C1"
+runtime_bundle = "eliotd"
+state_class = "stateless"
+hot_path = false
+lifecycle_owner = "meta.self_quality.diagnosis"
+loc_soft_ceiling = 10000
+loc_policy = "review ceiling only; causal cohesion, proof, owner, build/test closure and replacement boundary decide topology"
+product_objective = "Self-quality findings become a bounded diagnosis candidate with inert owner handoffs, or an explicit non-candidate disposition."
+causal_property = "bounded self-quality diagnosis candidate"
+old_failure_or_missing_capability = "dimension findings, prior interventions and missing evidence were collapsed into one scalar or silently retried without an owner"
+discriminator = "every observed dimension survives aggregation or the output names its exact missing, unknown, blocked or conflicting evidence"
+primary_responsibility = "Diagnose one frozen self-quality observation snapshot into a diagnosis candidate or an explicit non-candidate disposition with inert owner handoffs."
+owned_mutable_state = []
+allowed_effects = []
+inputs = ["frozen SelfQualityInput snapshot with exact Product, source, observation, history and denominator identity", "explicit SelfQualityPolicy with finite bounds", "privacy/authority/proof EvidenceCeilings"]
+outputs = ["SelfQualityDiagnosisCandidate with per-dimension outcomes and inert handoffs", "no-problem / no-action / incomplete / unknown / blocked / conflicted dispositions", "invalidation conditions binding the exact input digest"]
+depends_on = ["eliot-conformance-contracts", "eliot-contracts"]
+providers = ["emitting evidence owners (observation snapshots)", "policy owner (finite bounds)"]
+consumers = ["conflict analysis (#673)", "development diagnosis (#675)", "maintenance plan (#677)", "configuration assistance (#679)", "incident recovery", "Human decision owners"]
+non_goals = ["Concilium planning", "vote tally", "source acquisition", "probe execution", "mutation", "authority issuance", "effect", "store writes", "provider or model calls", "clock reads"]
+invariants = ["missing evidence is never a pass", "a symptom is never a proven cause", "overall severity and priority are the per-dimension maxima", "every observed dimension survives aggregation", "handoffs carry refs only, never jobs, plans, executables or Finish tokens"]
+failure_behavior = "Return an explicit incomplete, unknown, blocked or conflicted disposition naming the exact evidence; never fabricate a diagnosis, retry blindly, or promote a candidate."
+proof_surface = ["blocked intervention", "blind repetition", "incomplete denominator", "conflicting evidence", "failing dimension", "stale evidence", "tolerated partial finding"]
+proof_ceiling = "module-proof-only: candidate-only diagnosis without Concilium planning, vote tally, source acquisition, probe execution, mutation, authority, effect, store, provider, model, clock, or finish"
+replacement_boundary = "implementation behind the declared public contract; package ownership creates no runtime or semantic authority"
+merge_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
+split_trigger = "a second causal responsibility, mutable owner, independent proof surface or independent rollback boundary appears"
+
+[[donor]]
+path = "ELIOT_IMPLEMENTATION I12 self-quality diagnosis candidate"
+disposition = "implement bounded candidate-only diagnosis behind the #971 contract"
+
+[agent_task]
+objective = "Implement the bounded candidate-only self-quality diagnosis."
+write_scope = ["crates/meta/eliot-self-quality/**"]
+deliverables = ["typed pure diagnosis core over the #971 contract", "deterministic routing to inert owner handoffs", "candidate and disposition validation against the exact input"]
+acceptance = ["candidate-only ceiling is explicit", "no planning, authority, effect or Finish ownership", "missing, unknown, blocked and conflicting evidence stay explicit"]
+forbidden = ["canonical writes outside the named Governor transition path", "truth/support/authority/policy/finish/effect promotion", "provider or model SDKs in pure cognitive cores", "vendor or storage types in public contracts", "unbounded synchronous work", "silent truncation", "oracle or verifier weakening in the same work unit", "implicit scope widening", "active-generation self-modification"]
+stop_condition = "Stop if the change would need Concilium planning, vote tally, source acquisition, probe execution, mutation, authority, effect, store, provider, model, clock, or finish capability."
+challenge_path = "return ContractChallenge to the integration owner when owner, discriminator, proof ceiling or dependency boundary is wrong"
+integration_owner = "cognitive-wave-integrator"
+implementation_language = "Rust 2024"
+required_verification = ["module/package proof at the declared proof ceiling", "real provider/consumer fixture for every changed edge", "the named Product Pulse or Edge proof before promotion", "exact donor reuse/rewrite/reject trace"]
+writeback = "return implementation artifact, exact proof evidence, donor disposition, unresolved ContractChallenges and merge/remove recommendation"
+workspace_admission = "deferred to #967; standalone until serialized root admission"
+
+# Acceptance is decided by the owning contract and independent review
+# (I0.10: line/test/type counts are not goals). `scripts/verify-work-unit.py`
+# is a retired legacy diagnostic that always reports completion=NOT_VERIFIED
+# and never accepts a work unit. This table names the concrete contract and
+# the required exports/tests plus small behaviour checks the reviewer verifies.
+[acceptance]
+require_deny_unknown_fields = true
+forbid_unsafe = true
+required_exports = []
+required_tests = []
+forbidden_patterns = ['serde_json::Value', 'unimplemented!', 'todo!']
