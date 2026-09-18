@@ -29,6 +29,7 @@ use crate::ScopeTerminalReceipt;
 use crate::SupervisionLeaseSnapshot;
 use crate::SupervisionLeaseStageReceipt;
 use crate::SupervisionLeaseStageResolution;
+use crate::UnknownCommitRecord;
 use eliot_runtime_contracts::GenerationCutoverState;
 
 pub(super) fn encode<T: Serialize>(value: &T) -> Result<String, OrsError> {
@@ -295,6 +296,14 @@ impl PersistedValue for DurableSupervisionLeaseResult {
 
 impl PersistedValue for crate::StoreRebindReplayRecord {
     const RECORD_TYPE: &'static str = "store_rebind_replay";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+impl PersistedValue for UnknownCommitRecord {
+    const RECORD_TYPE: &'static str = "unknown_commit_recovery";
 
     fn validate_persisted(&self) -> Result<(), OrsError> {
         self.validate()

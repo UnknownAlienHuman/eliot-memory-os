@@ -174,7 +174,7 @@ impl CodeCortexService {
             invariant_cards,
             evidence_sources,
             adapter_notes: vec![
-                "project_memory/codebase-memory D1 adapter is interface-only unless directly wired"
+                "unavailable evidence D1 adapter is interface-only unless directly wired"
                     .to_owned(),
                 "domain API adapter is disabled by default in D1".to_owned(),
             ],
@@ -962,8 +962,9 @@ fn diagnostics(
 
 fn unavailable_adapters(verifier_evidence: &mut Vec<VerifierEvidence>) {
     verifier_evidence.push(VerifierEvidence {
-        name: "codebase_memory_adapter".to_owned(),
-        command: "direct project_memory/codebase-memory adapter".to_owned(),
+        name: "unavailable_evidence_adapter".to_owned(),
+        command: "unavailable evidence adapter (no direct in-process adapter wired in D1)"
+            .to_owned(),
         status: "unavailable".to_owned(),
         summary: "no direct in-process adapter is wired in D1".to_owned(),
         source: CodeEvidenceSource::CodebaseMemory,

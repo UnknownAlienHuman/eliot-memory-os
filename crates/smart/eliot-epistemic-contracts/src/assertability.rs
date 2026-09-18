@@ -5,7 +5,7 @@
 //! directly (partial caps at qualified inference; unknown, stale, contradicted, and friends cap at hypothesis
 //! candidate); coverage completeness is never inferred from empty unknowns or conflicts; disclosure and privacy
 //! can only lower; a material effect additionally requires a competent verifier over a current freshness.
-use eliot_evidence::EvidenceAuthority;
+use eliot_evidence::{Assertability, EvidenceAuthority};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -118,6 +118,28 @@ impl PositionAssertability {
             4 => Self::QualifiedInference,
             5 => Self::ObservedFact,
             _ => Self::MaterialEffect,
+        }
+    }
+    /// Projects the seven closed assertability levels onto the three architecture
+    /// assertability values (`I12.5`: `ASSERTABLE | NON_ASSERTABLE_UNVERIFIED |
+    /// ABSTAIN_OR_FENCE`, owned as [`Assertability`] by foundation evidence).
+    ///
+    /// This is a read-only boundary projection for closed validation only
+    /// (`EpistemicPositionCandidate::validate_closed` / `check_closed`): it changes
+    /// no ceiling, keeps all seven `PositionAssertability` values, and never
+    /// redefines the evidence three. Withheld/quarantined maps to abstain-or-fence;
+    /// planning-only, hypothesis-candidate, and conflict-qualification-required map
+    /// to non-assertable-unverified (attributable only with qualification); observed
+    /// fact, qualified inference, and material effect map to assertable within scope.
+    pub const fn arch_assertability(self) -> Assertability {
+        match self {
+            Self::UnknownWithheldQuarantined => Assertability::AbstainOrFence,
+            Self::PlanningOnly
+            | Self::HypothesisCandidate
+            | Self::ConflictQualificationRequired => Assertability::NonAssertableUnverified,
+            Self::QualifiedInference | Self::ObservedFact | Self::MaterialEffect => {
+                Assertability::Assertable
+            }
         }
     }
     /// A claimed assertability sits at or below its ceilings.

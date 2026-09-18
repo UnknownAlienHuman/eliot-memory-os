@@ -1,6 +1,6 @@
 use eliot_agent_contracts::{AgentAttemptId, TargetId};
 use eliot_contracts::{
-    ArtifactId, AuthorityEpoch, OperationId, PolicyRevision, ProductId, RequestId,
+    ArtifactId, EpochId, EpochLineageId, OperationId, PolicyRevision, ProductId, RequestId,
     ResourceGeneration, SourceId, StateFence, TaskId, TaskRevision, sha256_hex,
 };
 use eliot_evidence::EvidenceFreshness;
@@ -28,7 +28,15 @@ fn binding(tag: &str) -> Result<ContractBinding, Box<dyn std::error::Error>> {
         product_id: ProductId::new("eliot")?,
         task_id: TaskId::new(format!("task-{tag}"))?,
         scope: WorkScopeId::new(format!("scope-{tag}"))?,
-        state_fence: StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis()),
+        state_fence: StateFence::new(
+            EpochId::new(
+                EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                    .expect("valid test lineage"),
+                std::num::NonZeroU64::new(1).expect("nonzero test sequence"),
+            )
+            .expect("valid test epoch"),
+            ResourceGeneration::genesis(),
+        ),
         source: identity::SourceLineage {
             owner: SourceId::new(format!("source-{tag}"))?,
             snapshot: aid(&format!("snapshot-{tag}"))?,

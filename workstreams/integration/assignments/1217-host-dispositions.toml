@@ -1,0 +1,99 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
+routing_authority = "owning_issue_and_normative_pair_only"
+status = "PART_A_DISPOSITION_DATA_ONLY"
+implementation_support = "STATIC_PROFILE_DATA_ONLY_NO_INSTALLER_NO_REGISTRY"
+evidence_execution_status = "SOURCE_INSPECTED_STATIC_VERIFIER_ONLY"
+proof_ceiling = "STATIC_DISPOSITION_AND_BUNDLE_IDENTITY_DATA_ONLY"
+issue = 1217
+parent_product_issue = 11
+base_branch = "main"
+base_sha = "4706f671101c84a151b74ea1854bced17da93141"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "integration.host-dispositions-1217-A"
+causal_property = "One host integration generation is bound to an exact canonical Skill pack, payload, route profile, and adapter contract as static disposition and bundle-identity data only; no installation, readback, or admission is claimed."
+current_discriminator = "At base 4706f671 all four route profiles report NOT_EXECUTED with target/PARTIAL support and documented_not_observed/unprobed/partial coverage; host-bundle.manifest.json carries only paths with no digests, versions, adapter generations, or invalidation set."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/1217"
+
+[documentation]
+implementation = [
+  "integrations/agent-runtimes/host-bundle.manifest.json",
+  "integrations/agent-runtimes/route-profile.schema.json",
+  "integrations/codex/route-profile.json",
+  "integrations/opencode/route-profile.json",
+  "integrations/claude/route-profile.json",
+  "integrations/antigravity/route-profile.json",
+]
+anchors = ["ARCH-PORT-01", "ARCH-CTX-03", "ARCH-SKL-01", "ARCH-SWM-01", "ARCH-SWM-02", "ARCH-LONG-01", "ARCH-SEC-04", "ARCH-FIN-01"]
+
+[current_source]
+confirmed = [
+  "codex profile codex.local.app-server reports TARGET and NOT_EXECUTED with App Server adapter not implemented.",
+  "opencode profile opencode.local.http-sse reports PARTIAL and NOT_EXECUTED with durable admission endpoint and credential materialization not implemented.",
+  "claude profile claude.local.agent-sdk-sidecar reports PARTIAL and NOT_EXECUTED with local sidecar not implemented and remote Managed Agents deferred.",
+  "antigravity profile antigravity.local.supervised-stream reports PARTIAL and NOT_EXECUTED with persistent headless and Python SDK adapters not implemented.",
+  "host-bundle.manifest.json at base carries only schema_version, canonical roots, limits, and payload source to destination mappings.",
+  "route-profile.schema.json at base forbids undeclared top-level properties via additionalProperties false.",
+]
+
+[scope]
+primary_paths = [
+  "integrations/agent-runtimes/host-bundle.manifest.json",
+  "integrations/agent-runtimes/route-profile.schema.json",
+  "integrations/codex/route-profile.json",
+  "integrations/opencode/route-profile.json",
+  "integrations/claude/route-profile.json",
+  "integrations/antigravity/route-profile.json",
+  "workstreams/integration/assignments/1217-host-dispositions.toml",
+]
+forbidden = [
+  "scripts/*.py",
+  "plugin/**",
+  "crates/**",
+  "bins/**",
+  "config/**",
+  "apps/**",
+  "new execution semantics",
+  "registry/installer/admission logic",
+  "weakened verifier checks",
+  "Rust changes",
+]
+
+[[waves]]
+id = "A"
+what = "Add versioned bundle/generation identity and one current disposition per host as pure data."
+how = [
+  "Extend host-bundle.manifest.json with bundle_generation 1217-A.1, generator identity, skill-pack digest and order, per-host route-profile digests, payload path/digest/mode, adapter contract and generation, null host-runtime versions with unprobed status, and an invalidation set; no installer or registry semantics.",
+  "Extend route-profile.schema.json with a required disposition object covering disposition, route_id, admittable, admitted, proof_ceiling, expiry_condition, per_attempt_receipt, required_probes, non_admittable_reasons, and optional bundle_generation.",
+  "Give each host exactly one unavailable-target disposition bound to its primary route_id with matching proof_ceiling, no-expiry condition, per_attempt_receipt true, full probe list, and explicit non-admittable reasons for target/PARTIAL/NOT_EXECUTED/unprobed; admittable and admitted stay false.",
+  "Record this allocation claim in 1217-host-dispositions.toml under the singular workstreams/integration/assignments path only.",
+]
+
+[acceptance]
+criteria = [
+  "Each of the four route profiles carries exactly one disposition with an exact primary route_id and matching proof_ceiling.",
+  "Every disposition sets admittable false, admitted false, and per_attempt_receipt true.",
+  "Every disposition lists required_probes and non_admittable_reasons marking target, PARTIAL, NOT_EXECUTED, and unprobed/documented_not_observed/partial-without-admission as non-admittable.",
+  "The manifest preserves schema_version, canonical roots, limits, four hosts, route_profile paths, destination hints, skill destinations, and payload source/destination/kind while adding only identity data with real digests.",
+  "Payload file sha256 values match current file bytes; the rules tree digest covers the exact current tree files; skill-pack order and pack_hash match the canonical manifest.",
+  "Adapter contracts reference only real files (opencode bridge contract, antigravity preflight contract) or explicit null with a not-implemented note; host-runtime versions are null with unprobed status.",
+  "No file outside the seven Part A paths is modified; no script, plugin, Rust, config, or app file is touched.",
+  "The route-bundle gate passes without weakening any existing check.",
+]
+
+[verification]
+commands = [
+  "python scripts/verify-agent-route-bundles.py --self-test",
+  "python scripts/verify-agent-route-bundles.py",
+  "git diff --check",
+]
+contained_proof = "Static verifier evidence only; live install, readback, probes, and admission remain H2/H3 handoffs and are not claimed."
+product_proof = "Disposition and bundle-identity data do not establish Skill ownership (H1), installation (H2), admission (H3), or legacy fallback removal (H4)."
+
+[handoff]
+H1_skill_owner = "Move SkillPackService lint/sync out of crates/eliot-engine into a current low-dependency owner; Part A only references the canonical pack hash and order."
+H2_installer = "User Broker install/update/remove with SID/session/host-identity/transaction/expected-generation binding and staged-verify-activate/rollback; Part A supplies only the expected generation identity."
+H3_registry = "Capability/Route Registry admission with live probes and AgentAttempt separation; Part A dispositions stay non-admittable until that owner admits."
+H4_legacy_removal = "Remove legacy eliot-governor hook/process fallbacks after consumer migration; Part A only retires nothing and changes no payload bytes."

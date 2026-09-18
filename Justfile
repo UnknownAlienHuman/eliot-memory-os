@@ -35,7 +35,7 @@ code-navigation-sync:
 docs-closure-audit:
     python scripts/docs_closure_audit.py --root .
 
-# Completion gate for one capability cell, e.g. `just work-unit eliot-cue-contracts`.
+# Legacy source-shape diagnostic (always NOT_VERIFIED; see module.toml acceptance), e.g. `just work-unit eliot-cue-contracts`.
 work-unit crate:
     python scripts/verify-work-unit.py --crate {{crate}} --root .
 # Crates that live outside the workspace and outside `exclude`, so no other gate
@@ -82,6 +82,15 @@ core-daemon-inventory-self-test:
 core-daemon-inventory:
     python scripts/verify-core-daemon-inventory.py --root .
 
+dependency-policy-self-test:
+    python scripts/verify-dependency-policy.py --self-test
+
+dependency-policy:
+    python scripts/verify-dependency-policy.py --root . --profile offline-source
+
+dependency-policy-advisories:
+    python scripts/verify-dependency-policy.py --root . --profile current-advisories
+
 opencode-plugin:
     Get-Content -Raw integrations/opencode/plugins/eliot.js | node --input-type=module --check
     node --test integrations/opencode/tests/eliot-plugin.test.mjs
@@ -113,10 +122,19 @@ claude-package:
 sync-skills:
     cargo run --quiet -p eliot-app -- host skill-sync
 
+# Bounded Quick profile as ordered by scripts/verify.ps1 -Profile Quick. Quick
+# success is never Review/release proof. The dependency list below is the
+# retained just-quick baseline pinned by scripts/docs_closure_audit.py
+# (DOC-GATE-JUST); it runs each bounded gate once.
 quick: docs-shards-self-test docs-shards docs-router-self-test docs-router docs-read-self-test doc-code-conformance-self-test doc-code-conformance code-navigation-self-test code-navigation docs-closure-audit standalone-crates core-daemon-inventory-self-test core-daemon-inventory normative architecture-boundaries-self-test architecture-boundaries agent-guardrails-self-test agent-guardrails agent-route-bundles-self-test agent-route-bundles runtime-source-hygiene-self-test runtime-source-hygiene agent-bridge-protocol-self-test agent-bridge-protocol metadata fmt-check check
 
+# Complete locked Review profile, sole definition in scripts/verify.ps1.
 verify:
-    pwsh -NoProfile -File scripts/verify.ps1
+    pwsh -NoProfile -File scripts/verify.ps1 -Profile Review
+
+# Explicit Review alias; identical single Review invocation as `verify`.
+verify-review:
+    pwsh -NoProfile -File scripts/verify.ps1 -Profile Review
 
 verify-list:
     pwsh -NoProfile -File scripts/verify.ps1 -List

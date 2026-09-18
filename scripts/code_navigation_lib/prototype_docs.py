@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import tempfile
 import urllib.parse
@@ -10,6 +11,7 @@ from typing import Any
 
 from .cargo import nearest_agents, package_metadata
 from .common import NavigationError, normalize_repo_path, read_toml, relative_to_root
+from .handle_destinations import get_resolver, natural_handle_key
 from .package_docs import INDEX_PATH as WORKSPACE_INDEX_PATH
 from .package_docs import PROTOCOL_PATH, family_contract
 from .registry import build_registry
@@ -115,7 +117,7 @@ def _handles(package: dict[str, Any], blocks: dict[str, dict[str, Any]]) -> list
             if handle not in seen:
                 result.append(handle)
                 seen.add(handle)
-    return result
+    return sorted(result, key=natural_handle_key)
 
 
 def _metadata(root: Path, package: dict[str, Any]) -> dict[str, Any]:
@@ -133,6 +135,7 @@ def validate(root: Path, registry: dict[str, Any]) -> None:
         raise NavigationError("nonmember Cargo package registry contains duplicate roots")
     blocks = _blocks(registry)
     _validate_contract(root)
+    resolver = None
 
     for package, package_root in zip(packages, roots, strict=True):
         if package.get("default_member") is True:
@@ -150,15 +153,7 @@ def validate(root: Path, registry: dict[str, Any]) -> None:
         manifest = normalize_repo_path(str(package.get("manifest_path", "")))
         if not (root / manifest).is_file():
             raise NavigationError(f"prototype manifest is missing: {manifest}")
-        logical_blocks = package.get("logical_blocks")
-        if not isinstance(logical_blocks, list) or not logical_blocks:
-            raise NavigationError(
-                f"prototype package is outside every logical block: {package_root}"
-            )
-        if not _handles(package, blocks):
-            raise NavigationError(
-                f"prototype package resolves no governing docs: {package_root}"
-            )
+
         metadata = _metadata(root, package)
         if metadata.get("prototype") is not True:
             raise NavigationError(
@@ -170,20 +165,43 @@ def validate(root: Path, registry: dict[str, Any]) -> None:
                 f"prototype package has no explicit workspace_admission: {package_root}"
             )
 
+        targets = package.get("targets")
+        if not isinstance(targets, list) or not targets:
+            raise NavigationError(f"prototype package has no target front door: {package_root}")
+        pkg_dir = (root / package_root).resolve()
+        for target in targets:
+            relative = normalize_repo_path(str(target.get("path", "")))
+            target_path = (root / package_root / relative).resolve()
+            if not target_path.is_file():
+                raise NavigationError(f"prototype package target is missing: {package_root}/{relative}")
+            try:
+                target_path.relative_to(pkg_dir)
+            except ValueError as exc:
+                raise NavigationError(f"prototype package target escapes package root: {package_root}/{relative}") from exc
+
+        logical_blocks = package.get("logical_blocks")
+        if not isinstance(logical_blocks, list) or not logical_blocks:
+            raise NavigationError(
+                f"prototype package is outside every logical block: {package_root}"
+            )
+        handles = _handles(package, blocks)
+        if not handles:
+            raise NavigationError(
+                f"prototype package resolves no governing docs: {package_root}"
+            )
+        for handle in handles:
+            if resolver is None:
+                resolver = get_resolver(root)
+            resolver.resolve(handle)
+
 
 def _md_link(label: str, destination: str) -> str:
     return f"[{label}]({destination})"
 
 
-def _block_handles(block: dict[str, Any]) -> str:
-    return "<br>".join(
-        _md_link(f"`{handle}`", "../architecture/HANDLE_INDEX.md")
-        for handle in block["documentation_handles"]
-    )
-
-
 def render(root: Path, registry: dict[str, Any]) -> str:
     root = root.resolve()
+    resolver = get_resolver(root)
     packages = _packages(registry)
     blocks = _blocks(registry)
     for package in packages:
@@ -196,6 +214,12 @@ def render(root: Path, registry: dict[str, Any]) -> str:
         for package in packages
         for block_id in package.get("logical_blocks", [])
     }
+    total_targets = sum(len(p.get("targets", [])) for p in packages)
+    all_prototype_handles: set[str] = set()
+    for package in packages:
+        all_prototype_handles.update(_handles(package, blocks))
+    sorted_handles = sorted(all_prototype_handles, key=natural_handle_key)
+
     lines = [
         MARKER,
         "# Nonmember prototype package ↔ documentation index",
@@ -205,7 +229,7 @@ def render(root: Path, registry: dict[str, Any]) -> str:
         "[`Cargo.toml`](../../Cargo.toml). Prototype presence is not workspace admission,",
         "implementation completion, runtime support, or Product acceptance. Package-to-",
         "documentation mappings come from [`logical-blocks.toml`](logical-blocks.toml),",
-        "the canonical [`HANDLE_INDEX.md`](../architecture/HANDLE_INDEX.md), and the",
+        "the canonical [`handle-index.json`](../architecture/handle-index.json), and the",
         "inherited [`crates/AGENTS.md`](../../crates/AGENTS.md) contract. Do not edit it",
         "by hand.",
         "",
@@ -218,33 +242,81 @@ def render(root: Path, registry: dict[str, Any]) -> str:
         "",
         f"- Nonmember Cargo packages: **{len(packages)}**.",
         f"- Explicitly classified prototypes: **{len(packages)}**.",
+        f"- Prototype Cargo targets: **{total_targets}**.",
         f"- Governing logical blocks represented: **{len(used_block_ids)}**.",
+        f"- Governing documentation handles: **{len(sorted_handles)}**.",
         "",
         "## Governing logical blocks",
         "",
-        "| Block | Governing handles |",
-        "|---|---|",
+        "| Block | Governing handles | Direct destinations |",
+        "|---|---|---|",
     ]
     for block_id, block in blocks.items():
         if block_id in used_block_ids:
-            lines.append(f"| `{block_id}` | {_block_handles(block)} |")
+            handle_links = []
+            dest_links = []
+            for handle in sorted(block["documentation_handles"], key=natural_handle_key):
+                rec = resolver.resolve(handle)
+                rel = resolver.relative_link(INDEX_PATH, handle)
+                handle_links.append(_md_link(f"`{handle}`", rel))
+                dest_links.append(_md_link(f"`{rec['direct_destination']}`", rel))
+            lines.append(f"| `{block_id}` | {'<br>'.join(handle_links)} | {'<br>'.join(dest_links)} |")
 
     lines.extend(
         [
             "",
             "## Nonmember prototype packages",
             "",
-            "| Package manifest | Admission | Logical blocks |",
-            "|---|---|---|",
+            "| Package manifest | Admission | Targets | Logical blocks | Governing handles | Direct destinations |",
+            "|---|---|---|---|---|---|",
         ]
     )
     for package in packages:
         root_path = str(package["root_path"])
         manifest_path = str(package["manifest_path"])
-        block_cell = "<br>".join(f"`{item}`" for item in package["logical_blocks"])
+        raw_targets = package.get("targets", [])
+        sorted_targets = sorted(raw_targets, key=lambda t: (t.get("kind", ""), t.get("name", ""), t.get("path", "")))
+        targets_str = "<br>".join(f"`{t.get('kind', 'target')}: {t.get('path', '')}`" for t in sorted_targets)
+        blocks_str = "<br>".join(f"`{item}`" for item in package["logical_blocks"])
+        package_handles = _handles(package, blocks)
+        handle_links = []
+        dest_links = []
+        for handle in package_handles:
+            rec = resolver.resolve(handle)
+            rel = resolver.relative_link(INDEX_PATH, handle)
+            handle_links.append(_md_link(f"`{handle}`", rel))
+            dest_links.append(_md_link(f"`{rec['direct_destination']}`", rel))
         package_link = _md_link(f"`{root_path}`", f"../../{manifest_path}")
         lines.append(
-            f"| {package_link} | `nonmember prototype` | {block_cell} |"
+            f"| {package_link} | `nonmember prototype` | {targets_str} | {blocks_str} | {'<br>'.join(handle_links)} | {'<br>'.join(dest_links)} |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Reverse documentation ↔ prototype package / target index",
+            "",
+            "| Handle | Direct destination | Prototype packages | Targets |",
+            "|---|---|---|---|",
+        ]
+    )
+    for handle in sorted_handles:
+        rec = resolver.resolve(handle)
+        rel = resolver.relative_link(INDEX_PATH, handle)
+        handle_link = _md_link(f"`{handle}`", rel)
+        dest_link = _md_link(f"`{rec['direct_destination']}`", rel)
+        proto_pkgs = []
+        target_list = []
+        for package in packages:
+            if handle in _handles(package, blocks):
+                p_root = str(package["root_path"])
+                p_manifest = str(package["manifest_path"])
+                proto_pkgs.append(_md_link(f"`{p_root}`", f"../../{p_manifest}"))
+                raw_targets = package.get("targets", [])
+                for t in sorted(raw_targets, key=lambda x: (x.get("kind", ""), x.get("name", ""), x.get("path", ""))):
+                    target_list.append(f"`{p_root}:{t.get('path', '')}`")
+        lines.append(
+            f"| {handle_link} | {dest_link} | {'<br>'.join(proto_pkgs)} | {'<br>'.join(target_list)} |"
         )
 
     lines.extend(
@@ -308,7 +380,7 @@ def check(root: Path) -> None:
 def self_test() -> None:
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
-        (root / "crates/p").mkdir(parents=True)
+        (root / "crates/p/src").mkdir(parents=True)
         (root / "docs/architecture").mkdir(parents=True)
         (root / "docs/code-navigation").mkdir(parents=True)
         (root / "AGENTS.md").write_text("# root\n", encoding="utf-8")
@@ -319,6 +391,7 @@ def self_test() -> None:
             "workspace_admission='pending proof'\n",
             encoding="utf-8",
         )
+        (root / "crates/p/src/lib.rs").write_text("pub fn p() {}\n", encoding="utf-8")
         (root / PROTOCOL_PATH).write_text("# protocol\n", encoding="utf-8")
         contract = (
             f"{ROUTING_START}\npython scripts/docs_read.py read\n"
@@ -328,6 +401,24 @@ def self_test() -> None:
             "[prototype](../docs/code-navigation/PROTOTYPE_DOCS_INDEX.md)\n"
         )
         (root / CONTRACT_PATH).write_text(contract, encoding="utf-8")
+        (root / "docs/architecture/handle-index.json").write_text(
+            json.dumps({
+                "schema_version": "eliot-handle-index-v1",
+                "handles": {
+                    "I2.8": {
+                        "source": "implementation",
+                        "title": "I2.8. Package metadata",
+                        "path": "docs/" + "architecture/I02-08.md",
+                        "anchor": "i28-package-metadata",
+                    }
+                },
+            }),
+            encoding="utf-8",
+        )
+        (root / ("docs/" + "architecture/I02-08.md")).write_text(
+            "## I2.8. Package metadata\n", encoding="utf-8"
+        )
+
         registry = {
             "packages": [
                 {
@@ -335,6 +426,7 @@ def self_test() -> None:
                     "manifest_path": "crates/p/Cargo.toml",
                     "workspace_member": False,
                     "default_member": False,
+                    "targets": [{"kind": "lib", "path": "src/lib.rs"}],
                     "logical_blocks": ["test"],
                 }
             ],

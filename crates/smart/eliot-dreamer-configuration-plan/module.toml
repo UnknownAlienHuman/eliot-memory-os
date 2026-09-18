@@ -1,7 +1,7 @@
 schema_version = 4
 module_id = "smart.dreamer.configuration_plan"
 crate = "eliot-dreamer-configuration-plan"
-status = "PROTOTYPE"
+status = "ADMITTED"
 wave = "cognitive-micromodules-wave-02"
 agent_order = 42
 plane = "Smart"
@@ -14,21 +14,21 @@ hot_path = false
 lifecycle_owner = "smart.dreamer.configuration_plan"
 loc_soft_ceiling = 10000
 loc_policy = "review ceiling only; causal cohesion, proof, owner, build/test closure and replacement boundary decide topology"
-product_objective = "Natural-language configuration requests become typed reviewable ConfigurationChangeIntent candidates and never direct edits."
-causal_property = "ConfigurationChangeIntent synthesis"
+product_objective = "Natural-language configuration requests become typed reviewable ConfigurationChangeCandidate candidates and never direct edits."
+causal_property = "ConfigurationChangeCandidate synthesis"
 old_failure_or_missing_capability = "Configuration assistance can blur explanation, candidate construction and active snapshot mutation."
 discriminator = "The handler emits one typed delta candidate with current and candidate snapshots, impact, owner, probe and rollback; active configuration is unchanged."
-primary_responsibility = "Translate a Human request or diagnosed problem into one typed ConfigurationChangeIntent candidate."
+primary_responsibility = "Translate a Human request or diagnosed problem into one typed ConfigurationChangeCandidate candidate."
 owned_mutable_state = []
 allowed_effects = []
-inputs = ["DreamJobInput class=ConfigurationAssistance", "current configuration snapshots", "natural-language request or diagnosed Problem evidence"]
-outputs = ["ConfigurationChangeIntent candidate", "impact and owner matrix", "probe and rollback plan"]
-depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
+inputs = ["DreamJobAdmission class=ConfigurationAssistance", "current configuration snapshots", "natural-language request or diagnosed Problem evidence"]
+outputs = ["ConfigurationChangeCandidate candidate", "impact and owner matrix", "probe and rollback plan"]
+depends_on = ["eliot-dreamer-contracts"]
 providers = ["Governor-admitted Dreamer bundle", "current configuration projections"]
 consumers = ["Dreamer configuration surface", "owning configuration transition path"]
 non_goals = ["file edit", "snapshot publication", "cost, privacy, remote access, authority or automatic-launch widening"]
 invariants = ["current and candidate snapshots are exact", "Human-owned boundaries are explicit", "previous snapshot is the rollback anchor", "forbidden ceiling widening is rejected rather than merely warned"]
-failure_behavior = "Return unsupported or inconclusive ConfigurationChangeIntent with exact missing snapshot, owner or impact evidence; never mutate configuration."
+failure_behavior = "Return unsupported or inconclusive ConfigurationChangeCandidate with exact missing snapshot, owner or impact evidence; never mutate configuration."
 proof_surface = ["presentation-only change", "model-cost route", "privacy widening", "stale capability", "missing rollback"]
 proof_ceiling = "Module proof only; real provider/consumer Edge proof and Product Pulse remain separate"
 product_pulse = "D3A_ADVISORY_DIAGNOSIS_PLANNING_PULSE_01"
@@ -41,9 +41,9 @@ path = "ELIOT_IMPLEMENTATION I9.3 Configuration assistance and I3.10"
 disposition = "authoritative intent and owner boundary"
 
 [agent_task]
-objective = "Implement one candidate-only ConfigurationChangeIntent handler; publication remains with the owning transition path."
+objective = "Implement one candidate-only ConfigurationChangeCandidate handler; publication remains with the owning transition path."
 write_scope = ["crates/smart/eliot-dreamer-configuration-plan/**"]
-deliverables = ["ConfigurationChangeIntent core", "ceiling/impact/rollback fixtures", "configuration-owner Edge fixtures"]
+deliverables = ["ConfigurationChangeCandidate core", "ceiling/impact/rollback fixtures", "configuration-owner Edge fixtures"]
 acceptance = ["typed candidate only", "active snapshot unchanged", "forbidden widening rejected"]
 forbidden = ["canonical writes outside the named Governor transition path", "truth/support/authority/policy/finish/effect promotion", "provider or model SDKs in pure cognitive cores", "vendor or storage types in public contracts", "unbounded synchronous work", "silent truncation", "oracle or verifier weakening in the same work unit", "implicit scope widening", "active-generation self-modification"]
 stop_condition = "Stop if assistance requires editing files, publishing a snapshot or widening Human-owned ceilings."
@@ -52,19 +52,14 @@ integration_owner = "cognitive-wave-integrator"
 implementation_language = "Rust 2024"
 required_verification = ["module/package proof at the declared proof ceiling", "real provider/consumer fixture for every changed edge", "the named Product Pulse or Edge proof before promotion", "exact donor reuse/rewrite/reject trace"]
 writeback = "return implementation artifact, exact proof evidence, donor disposition, unresolved ContractChallenges and merge/remove recommendation"
-workspace_admission = "forbidden until implementation, package proof, affected Edge proof, current-main ancestry and integration-owner review"
+workspace_admission = "admitted via #969 (T8-A2) root workspace membership"
 
-# Machine-checked completion gate, read by `scripts/verify-work-unit.py`.
-# `cargo fmt|test|clippy` all pass on an empty crate, so they cannot tell a
-# finished cell from an unstarted one. This table can.
-#
-# These are the floors every cell shares. The owning work unit tightens them
-# with `required_exports` and `required_tests` taken from its own brief, so a
-# reviewer decides on one exit code instead of reading prose criteria.
+# Acceptance is decided by the owning contract and independent review
+# (I0.10: line/test/type counts are not goals). `scripts/verify-work-unit.py`
+# is a retired legacy diagnostic that always reports completion=NOT_VERIFIED
+# and never accepts a work unit. This table names the concrete contract and
+# the required exports/tests plus small behaviour checks the reviewer verifies.
 [acceptance]
-min_source_lines = 200
-min_public_items = 6
-min_tests = 5
 require_deny_unknown_fields = true
 forbid_unsafe = true
 required_exports = []

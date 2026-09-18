@@ -69,6 +69,12 @@ use windows_sys::Win32::System::Threading::{
 };
 
 const MAX_PROCESS_IMAGE_CHARS: usize = 32_768;
+/// Maximum UTF-16 units (including the trailing NUL) accepted by
+/// `nul_terminated_wide`. Every legitimate input in this crate (job names,
+/// credential targets, SDDL text, watch paths, canonicalized file paths)
+/// fits the Windows 32_767-character limit; anything larger would expand a
+/// corrupt `OsStr` into an unbounded allocation, so it fails closed.
+const MAX_WIDE_UNITS_INCL_NUL: usize = 32_768;
 const MAX_JOB_PROCESS_IDS: usize = 4_096;
 const JOB_COMPLETION_KEY: usize = 0x454c_494f;
 const JOB_OBSERVER_SHUTDOWN_KEY: usize = 0x454e_4421;
@@ -228,9 +234,12 @@ pub struct DirectoryOplockGuard {
     _output: Box<REQUEST_OPLOCK_OUTPUT_BUFFER>,
 }
 
-// SAFETY: all pointers submitted to Windows refer to boxed allocations whose
-// addresses do not change. Moving the guard transfers unique ownership while
-// the kernel operation remains bound to the same handle/event/buffers.
+// SAFETY: transfer across threads moves unique ownership of the directory
+// `File`, the `OwnedHandle` event (exactly-once `CloseHandle`), and the
+// boxed `OVERLAPPED`/op-lock buffers whose heap addresses never change, so
+// the pending kernel request stays bound to the same allocations. The guard
+// is only moved, never shared (`Sync` is deliberately not implemented), and
+// `Drop` cancels and drains the request before the boxes drop.
 unsafe impl Send for DirectoryOplockGuard {}
 
 impl DirectoryOplockGuard {
@@ -415,11 +424,31 @@ fn query_process_image(process: HANDLE) -> io::Result<PathBuf> {
             "process image buffer is too large",
         )
     })?;
-    // SAFETY: the process handle is live and the UTF-16 output buffer has `chars` elements.
+    // SAFETY: `process` is a live retained handle (every constructor wraps it
+    // in `OwnedHandle` before any query); `image` owns `chars` initialized
+    // `u16` slots and both pointers are live only for this call. The callee
+    // retains nothing; the returned length is validated by
+    // `truncate_image_buffer` below.
     let queried =
         unsafe { QueryFullProcessImageNameW(process, 0, image.as_mut_ptr(), &raw mut chars) };
-    if queried == 0 || chars == 0 {
+    if queried == 0 {
         return Err(io::Error::last_os_error());
+    }
+    truncate_image_buffer(image, chars)
+}
+
+/// Truncates a `QueryFullProcessImageNameW` output buffer to its reported length.
+///
+/// `chars` must be non-zero and strictly below the buffer length: a return
+/// equal to or larger than the buffer means the image was truncated (no room
+/// for the NUL) or the length is corrupt, so it fails closed instead of
+/// exposing trailing NULs.
+fn truncate_image_buffer(mut image: Vec<u16>, chars: u32) -> io::Result<PathBuf> {
+    if chars == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "process image length is invalid",
+        ));
     }
     let chars = usize::try_from(chars).map_err(|_| {
         io::Error::new(
@@ -427,6 +456,12 @@ fn query_process_image(process: HANDLE) -> io::Result<PathBuf> {
             "process image length is invalid",
         )
     })?;
+    if chars >= image.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "process image length exceeds its buffer",
+        ));
+    }
     image.truncate(chars);
     Ok(PathBuf::from(OsString::from_wide(&image)))
 }
@@ -556,7 +591,7 @@ impl RecoverableProcess {
 /// Owns a Windows Job Object configured to kill the complete provider process
 /// tree when the guard is explicitly terminated or dropped.
 pub struct ProcessTreeGuard {
-    job: windows_sys::Win32::Foundation::HANDLE,
+    job: OwnedHandle,
 }
 
 impl ProcessTreeGuard {
@@ -573,11 +608,11 @@ impl ProcessTreeGuard {
                 "PID must be non-zero",
             ));
         }
-        // SAFETY: null name and security pointers request an unnamed job owned by this process.
-        let job = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
-        if job.is_null() {
-            return Err(io::Error::last_os_error());
-        }
+        // SAFETY: null name and security pointers request an unnamed job owned
+        // by this process. `OwnedHandle::new` rejects both failure sentinels,
+        // so only a live job reaches the configuration below; every early
+        // return drops it exactly once with no manual close path.
+        let job = OwnedHandle::new(unsafe { CreateJobObjectW(ptr::null(), ptr::null()) })?;
         let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         let info_size = u32::try_from(std::mem::size_of_val(&info)).map_err(|_| {
@@ -589,36 +624,27 @@ impl ProcessTreeGuard {
         // SAFETY: `job` is live and `info` has the exact structure required by the selected class.
         let configured = unsafe {
             SetInformationJobObject(
-                job,
+                job.0,
                 JobObjectExtendedLimitInformation,
                 (&raw const info).cast(),
                 info_size,
             )
         };
         if configured == 0 {
-            let error = io::Error::last_os_error();
-            // SAFETY: `job` was created above and is closed exactly once on this error path.
-            unsafe { CloseHandle(job) };
-            return Err(error);
+            return Err(io::Error::last_os_error());
         }
         // SAFETY: numeric PID is provided by the freshly spawned child.
-        let process = unsafe { OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid) };
-        if process.is_null() {
-            let error = io::Error::last_os_error();
-            // SAFETY: `job` was created above and is closed exactly once on this error path.
-            unsafe { CloseHandle(job) };
-            return Err(error);
-        }
+        // `OwnedHandle::new` rejects both failure sentinels, so only a live
+        // process reaches the assignment; it is dropped exactly once below.
+        let process = OwnedHandle::new(unsafe {
+            OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid)
+        })?;
         // SAFETY: both handles are live for the duration of the call.
-        let assigned = unsafe { AssignProcessToJobObject(job, process) };
-        let assign_error = (assigned == 0).then(io::Error::last_os_error);
-        // SAFETY: `process` is no longer needed after assignment and is owned here.
-        unsafe { CloseHandle(process) };
-        if let Some(error) = assign_error {
-            // SAFETY: `job` was created above and is closed exactly once on this error path.
-            unsafe { CloseHandle(job) };
-            return Err(error);
+        let assigned = unsafe { AssignProcessToJobObject(job.0, process.0) };
+        if assigned == 0 {
+            return Err(io::Error::last_os_error());
         }
+        drop(process);
         Ok(Self { job })
     }
 
@@ -628,8 +654,8 @@ impl ProcessTreeGuard {
     ///
     /// Returns an error when Windows cannot terminate the Job Object.
     pub fn terminate(&self, exit_code: u32) -> io::Result<()> {
-        // SAFETY: `self.job` remains live until Drop.
-        let terminated = unsafe { TerminateJobObject(self.job, exit_code) };
+        // SAFETY: `self.job` is a live `OwnedHandle` that outlives this call.
+        let terminated = unsafe { TerminateJobObject(self.job.0, exit_code) };
         if terminated == 0 {
             return Err(io::Error::last_os_error());
         }
@@ -637,22 +663,26 @@ impl ProcessTreeGuard {
     }
 }
 
-impl Drop for ProcessTreeGuard {
-    fn drop(&mut self) {
-        // SAFETY: `self.job` is uniquely owned and closed exactly once here.
-        unsafe { CloseHandle(self.job) };
-    }
-}
-
 struct OwnedHandle(HANDLE);
 
-// SAFETY: Windows kernel handles are valid across threads. Ownership remains
-// unique in this wrapper and CloseHandle is called exactly once in Drop.
+// SAFETY: a Windows kernel handle value is usable from any thread. This
+// wrapper keeps unique ownership of its single `HANDLE` field: it is created
+// only via `new` (both failure sentinels, null and `INVALID_HANDLE_VALUE`,
+// rejected), closed exactly once in `Drop`, or moved exactly once into
+// `File` via `into_file` (`mem::forget` prevents a double close). `Send`
+// therefore transfers only the unique owner. `Sync` is deliberately not
+// implemented: concurrent shared access is not established.
 unsafe impl Send for OwnedHandle {}
 
 impl OwnedHandle {
+    /// Takes ownership of a live kernel handle, rejecting both failure
+    /// sentinels: null (e.g. `CreateEventW`, `CreateJobObjectW`,
+    /// `CreateIoCompletionPort`, `OpenProcess` failures) and
+    /// `INVALID_HANDLE_VALUE` (e.g. `FindFirstChangeNotificationW`
+    /// failures; see also the explicit dual check in
+    /// `DirectoryMutationGuard::watch`).
     fn new(handle: HANDLE) -> io::Result<Self> {
-        if handle.is_null() {
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
             Err(io::Error::last_os_error())
         } else {
             Ok(Self(handle))
@@ -669,8 +699,11 @@ impl OwnedHandle {
 
 impl Drop for OwnedHandle {
     fn drop(&mut self) {
-        if !self.0.is_null() {
-            // SAFETY: the wrapper uniquely owns the handle until this Drop.
+        if !self.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
+            // SAFETY: the wrapper uniquely owns the handle until this Drop;
+            // both failure sentinels (null and `INVALID_HANDLE_VALUE`) were
+            // rejected by `new` and are re-checked here so neither sentinel
+            // can ever reach `CloseHandle`.
             unsafe { CloseHandle(self.0) };
         }
     }
@@ -997,6 +1030,23 @@ struct ProcThreadAttributeList {
 
 impl ProcThreadAttributeList {
     fn for_inherited_handles(handles: &[HANDLE]) -> io::Result<Self> {
+        // An empty slice would hand a dangling pointer to the attribute API,
+        // so it fails closed before any FFI call.
+        if handles.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "at least one inheritable handle is required",
+            ));
+        }
+        let handle_bytes = handles
+            .len()
+            .checked_mul(std::mem::size_of::<HANDLE>())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "process handle list is too large",
+                )
+            })?;
         let mut bytes = 0_usize;
         // SAFETY: the documented sizing call uses a null list and writes only
         // the required byte count.
@@ -1014,9 +1064,8 @@ impl ProcThreadAttributeList {
         if unsafe { InitializeProcThreadAttributeList(list, 1, 0, &raw mut bytes) } == 0 {
             return Err(io::Error::last_os_error());
         }
-        let handle_bytes = std::mem::size_of_val(handles);
-        // SAFETY: the attribute list is initialized, `handles` is live for the
-        // call, and the exact HANDLE array size is supplied.
+        // SAFETY: the attribute list is initialized, `handles` is non-empty
+        // and live for the call, and `handle_bytes` is its checked exact size.
         if unsafe {
             UpdateProcThreadAttribute(
                 list,
@@ -1066,19 +1115,30 @@ struct SuspendedProcessGuard {
 
 impl SuspendedProcessGuard {
     fn new(information: PROCESS_INFORMATION) -> io::Result<Self> {
-        if information.hProcess.is_null() || information.hThread.is_null() {
-            if !information.hProcess.is_null() {
+        // Both failure sentinels are rejected up front: a null handle was
+        // never opened, and `INVALID_HANDLE_VALUE` (-1) aliases the
+        // current-process pseudo-handle, so it must never reach
+        // `TerminateProcess` in the cleanup below.
+        let process_valid =
+            !information.hProcess.is_null() && information.hProcess != INVALID_HANDLE_VALUE;
+        let thread_valid =
+            !information.hThread.is_null() && information.hThread != INVALID_HANDLE_VALUE;
+        if !process_valid || !thread_valid {
+            if process_valid {
                 // SAFETY: `hProcess` was returned by CreateProcessW and is
-                // uniquely owned on this error path.
+                // uniquely owned on this error path (both sentinels rejected
+                // above). Termination plus a bounded wait prevents a suspended
+                // orphan before the error returns.
                 unsafe {
                     TerminateProcess(information.hProcess, 1);
                     WaitForSingleObject(information.hProcess, 5_000);
                     CloseHandle(information.hProcess);
                 }
             }
-            if !information.hThread.is_null() {
+            if thread_valid {
                 // SAFETY: `hThread` was returned by CreateProcessW and is
-                // uniquely owned on this error path.
+                // uniquely owned on this error path (both sentinels rejected
+                // above).
                 unsafe {
                     CloseHandle(information.hThread);
                 }
@@ -1097,6 +1157,12 @@ impl SuspendedProcessGuard {
 
     fn into_handles(mut self) -> (OwnedHandle, OwnedHandle) {
         self.armed = false;
+        debug_assert!(!self.process.is_null() && self.process != INVALID_HANDLE_VALUE);
+        debug_assert!(!self.thread.is_null() && self.thread != INVALID_HANDLE_VALUE);
+        // SAFETY: both handles were proven live by `new`'s dual-sentinel
+        // rejection; the fields are private and never mutated before this
+        // single transfer, and `armed = false` disables the Drop cleanup, so
+        // ownership moves into the two `OwnedHandle`s exactly once.
         (OwnedHandle(self.process), OwnedHandle(self.thread))
     }
 }
@@ -1623,6 +1689,45 @@ fn open_current_process_snapshot(pid: u32) -> io::Result<CurrentJobProcessSnapsh
     })
 }
 
+/// Views the first `count` process IDs of a `JobObjectBasicProcessIdList`
+/// buffer without lending provenance from its trailing `[usize; 1]` field.
+///
+/// The slice is derived from the whole-buffer base pointer in whole `usize`
+/// words with an exact bounds check, so it stays inside the live `buffer`.
+fn job_id_slice(buffer: &[usize], count: usize) -> io::Result<&[usize]> {
+    let word = std::mem::size_of::<usize>();
+    let list_offset = std::mem::size_of::<JOBOBJECT_BASIC_PROCESS_ID_LIST>()
+        .checked_sub(word)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Job process list layout is invalid",
+            )
+        })?;
+    if list_offset % word != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Job process list layout is invalid",
+        ));
+    }
+    let needed = (list_offset / word).checked_add(count).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "Job process list is too large")
+    })?;
+    if needed > buffer.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Job process list exceeded its supplied buffer",
+        ));
+    }
+    // SAFETY: the caller guarantees `buffer` starts with a kernel-initialized
+    // `JOBOBJECT_BASIC_PROCESS_ID_LIST` followed by at least `count` further
+    // initialized `usize` PIDs (proven by the exact bounds check above, with
+    // `count <= capacity` proven by the caller). The word-aligned base pointer
+    // keeps alignment; the slice is shared, overlaps no mutable borrow, and is
+    // copied out before return.
+    Ok(unsafe { std::slice::from_raw_parts(buffer.as_ptr().add(list_offset / word), count) })
+}
+
 fn job_process_ids(job: HANDLE) -> io::Result<Vec<u32>> {
     let mut capacity = 16_usize;
     loop {
@@ -1657,7 +1762,10 @@ fn job_process_ids(job: HANDLE) -> io::Result<Vec<u32>> {
                 &raw mut returned,
             )
         };
-        // SAFETY: the buffer is aligned and large enough for the fixed header on every path.
+        // SAFETY: `buffer` is `Vec<usize>` (pointer-aligned) and always holds
+        // at least the fixed header: capacity starts at 16 entries and only
+        // grows, so this header read stays in bounds on both paths and
+        // overlaps no live mutable borrow.
         let header = unsafe { &*buffer.as_ptr().cast::<JOBOBJECT_BASIC_PROCESS_ID_LIST>() };
         if queried != 0 {
             let count = usize::try_from(header.NumberOfProcessIdsInList).map_err(|_| {
@@ -1669,8 +1777,7 @@ fn job_process_ids(job: HANDLE) -> io::Result<Vec<u32>> {
                     "Job process list exceeded its supplied buffer",
                 ));
             }
-            // SAFETY: Windows reported `count` initialized entries within the supplied buffer.
-            let ids = unsafe { std::slice::from_raw_parts(header.ProcessIdList.as_ptr(), count) };
+            let ids = job_id_slice(&buffer, count)?;
             return ids
                 .iter()
                 .copied()
@@ -1777,8 +1884,10 @@ pub fn process_is_alive(pid: u32) -> io::Result<bool> {
         return Ok(false);
     }
     // SAFETY: OpenProcess receives a numeric PID and returns an owned handle.
+    // Failure is NULL per its contract; `INVALID_HANDLE_VALUE` is rejected
+    // alongside it so neither sentinel can reach the query below.
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-    if handle.is_null() {
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
         let error = io::Error::last_os_error();
         if error.raw_os_error() == i32::try_from(ERROR_INVALID_PARAMETER).ok() {
             return Ok(false);
@@ -1874,8 +1983,30 @@ fn nul_terminated_wide(value: &OsStr) -> io::Result<Vec<u16>> {
             "Windows path contains an embedded NUL",
         ));
     }
+    if wide.len() >= MAX_WIDE_UNITS_INCL_NUL {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Windows string exceeds the bounded wide-input length",
+        ));
+    }
     Ok(wide.into_iter().chain(std::iter::once(0)).collect())
 }
+
+/// Maximum logical credential-identifier bytes accepted by
+/// `validate_credential_id`. Bounds the `EliotGovernor/{id}` wide target far
+/// below `MAX_WIDE_UNITS_INCL_NUL` so a corrupt identifier fails closed
+/// before any `WinCred` FFI pointer is formed.
+const MAX_CREDENTIAL_ID_BYTES: usize = 240;
+/// Maximum UTF-16 target-name units (excluding the terminating NUL) accepted
+/// when scanning a `CREDENTIALW::TargetName` returned by `WinCred`. Bounds both
+/// the construction of `EliotGovernor/{id}` targets and the read-back scan in
+/// `credential_target_name` so unterminated data fails closed.
+const MAX_CREDENTIAL_TARGET_CHARS: usize = 512;
+/// Maximum `CredEnumerateW` entries accepted into a
+/// `std::slice::from_raw_parts` view. Far above any legitimate per-user
+/// credential store; a corrupt count fails closed instead of forming an
+/// unbounded slice.
+const MAX_CREDENTIAL_ENUM_ENTRIES: usize = 32_768;
 
 /// Validates an Eliot credential identifier against the bounded logical grammar.
 ///
@@ -1888,7 +2019,7 @@ fn nul_terminated_wide(value: &OsStr) -> io::Result<Vec<u16>> {
 /// Returns `InvalidInput` when the identifier violates the grammar.
 pub fn validate_credential_id(credential_id: &str) -> io::Result<()> {
     let valid = !credential_id.is_empty()
-        && credential_id.len() <= 240
+        && credential_id.len() <= MAX_CREDENTIAL_ID_BYTES
         && !credential_id.starts_with('/')
         && !credential_id.ends_with('/')
         && credential_id
@@ -1908,7 +2039,18 @@ pub fn validate_credential_id(credential_id: &str) -> io::Result<()> {
 
 fn credential_target(credential_id: &str) -> io::Result<Vec<u16>> {
     validate_credential_id(credential_id)?;
-    nul_terminated_wide(OsStr::new(&format!("EliotGovernor/{credential_id}")))
+    let namespaced = format!("EliotGovernor/{credential_id}");
+    // Fail closed before FFI: `validate_credential_id` already bounds the id
+    // to 240 bytes, so `EliotGovernor/` + id always fits well below the
+    // 512-unit target scan bound. Reject any future grammar drift that would
+    // widen the pointer input instead of truncating or defaulting.
+    if namespaced.encode_utf16().count() > MAX_CREDENTIAL_TARGET_CHARS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "credential target exceeds the bounded target length",
+        ));
+    }
+    nul_terminated_wide(OsStr::new(&namespaced))
 }
 
 struct CredentialBuffer(*mut CREDENTIALW);
@@ -1916,8 +2058,15 @@ struct CredentialBuffer(*mut CREDENTIALW);
 impl Drop for CredentialBuffer {
     fn drop(&mut self) {
         if !self.0.is_null() {
-            // SAFETY: `self.0` was allocated by `CredReadW` and remains owned by
-            // this guard until it is released exactly once here.
+            // SAFETY (WORK_UNIT 789, credential family — `CredFree` after
+            // `CredReadW`): `self.0` is non-null (checked above) and holds the
+            // exact allocation `CredReadW` stored into the `&mut raw` out
+            // pointer on its success path. The guard is constructed only on
+            // that path, never copied or cloned, and `Drop` runs exactly once
+            // with `&mut self` (exclusive access, no live borrows of the
+            // `CREDENTIALW` or its blob). `CredFree` is the documented
+            // deallocator for `CredReadW` buffers; `.cast()` preserves the
+            // address as `*mut c_void` without offsetting it.
             unsafe {
                 CredFree(self.0.cast());
             }
@@ -1930,8 +2079,15 @@ struct CredentialArray(*mut *mut CREDENTIALW);
 impl Drop for CredentialArray {
     fn drop(&mut self) {
         if !self.0.is_null() {
-            // SAFETY: `self.0` was allocated by `CredEnumerateW` and remains
-            // owned by this guard until it is released exactly once here.
+            // SAFETY (WORK_UNIT 789, credential family — `CredFree` after
+            // `CredEnumerateW`): `self.0` is non-null (checked above) and
+            // holds the exact array allocation `CredEnumerateW` stored into
+            // the `&mut raw` out pointer on its success path. The guard is
+            // constructed only on that path, never copied or cloned, and
+            // `Drop` runs exactly once with `&mut self` (exclusive access, no
+            // live `from_raw_parts` views or entry borrows). `CredFree` is
+            // the documented deallocator for `CredEnumerateW` arrays;
+            // `.cast()` preserves the address without offsetting it.
             unsafe {
                 CredFree(self.0.cast());
             }
@@ -1940,8 +2096,6 @@ impl Drop for CredentialArray {
 }
 
 fn credential_target_name(target: *const u16) -> io::Result<String> {
-    const MAX_TARGET_CHARS: usize = 512;
-
     if target.is_null() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1949,22 +2103,34 @@ fn credential_target_name(target: *const u16) -> io::Result<String> {
         ));
     }
     let mut length = 0;
-    // SAFETY: the pointer comes from a live `CREDENTIALW` allocation and
-    // WinCred guarantees a NUL-terminated target name. The bounded scan
-    // rejects malformed data rather than reading indefinitely.
+    // SAFETY (WORK_UNIT 789, credential family — bounded NUL scan): `target`
+    // is non-null (checked above) and, per the `CREDENTIALW` contract, points
+    // at the `TargetName` NUL-terminated UTF-16 string inside the live
+    // `CredentialBuffer`/`CredentialArray` allocation that the caller holds
+    // for the whole call, so the base pointer is valid for at least one
+    // `u16` (the terminator). Each `target.add(length)` dereference runs only
+    // while `length < MAX_CREDENTIAL_TARGET_CHARS` (512), so at most 512
+    // aligned `u16` reads occur and the loop cannot run indefinitely; a
+    // missing terminator within the bound fails closed below instead of
+    // over-reading further. No write occurs and no pointer is retained.
     unsafe {
-        while length < MAX_TARGET_CHARS && *target.add(length) != 0 {
+        while length < MAX_CREDENTIAL_TARGET_CHARS && *target.add(length) != 0 {
             length += 1;
         }
     }
-    if length == MAX_TARGET_CHARS {
+    if length == MAX_CREDENTIAL_TARGET_CHARS {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "credential target name exceeded the bounded scan",
         ));
     }
-    // SAFETY: the bounded scan above proved `length` readable UTF-16 units
-    // before the terminating NUL in the live credential allocation.
+    // SAFETY (WORK_UNIT 789, credential family — `from_raw_parts` of the
+    // scanned prefix): the scan above observed `length` consecutive non-NUL
+    // units followed by a NUL at `target[length]`, all within the live
+    // credential allocation owned by the caller's guard, proving
+    // `target[..length]` is readable, aligned, non-overlapping with any
+    // mutable borrow, and valid for the returned borrow's lifetime. `length`
+    // excludes the terminator, so the slice never includes the NUL.
     let wide = unsafe { std::slice::from_raw_parts(target, length) };
     String::from_utf16(wide).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
@@ -1981,15 +2147,30 @@ fn credential_target_name(target: *const u16) -> io::Result<String> {
 pub fn credential_ids_current_user_with_prefix(prefix: &str) -> io::Result<Vec<String>> {
     let _ = credential_target(prefix)?;
     let full_prefix = format!("EliotGovernor/{prefix}");
+    if full_prefix.encode_utf16().count() + 1 > MAX_CREDENTIAL_TARGET_CHARS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "credential prefix exceeds the bounded target length",
+        ));
+    }
     let mut filter = nul_terminated_wide(OsStr::new(&format!("{full_prefix}*")))?;
     let mut count = 0_u32;
     let mut raw = ptr::null_mut();
-    // SAFETY: `filter` is NUL-terminated and both out pointers are valid for
-    // the duration of the call.
+    // SAFETY (WORK_UNIT 789, credential family — `CredEnumerateW`): `filter`
+    // is NUL-terminated (built by `nul_terminated_wide`, which rejects
+    // embedded NUL and overlong input) and borrowed mutably for the whole
+    // call, so `filter.as_mut_ptr()` is valid, aligned, and not aliased
+    // during FFI. `&mut count`/`&mut raw` are live exclusive out pointers.
+    // Flags `0` request the default enumeration; the callee retains nothing.
+    // On nonzero return `raw` owns exactly `count` entries until
+    // `CredentialArray` frees it; on zero return `raw` is untouched.
     let enumerated =
         unsafe { CredEnumerateW(filter.as_mut_ptr(), 0, &raw mut count, &raw mut raw) };
     if enumerated == 0 {
-        // SAFETY: this call immediately follows the failed Win32 operation.
+        // SAFETY (WORK_UNIT 789, credential family — `GetLastError`): called
+        // immediately after the failed `CredEnumerateW` with no intervening
+        // Win32 call, so the code belongs to this failure. Reading the
+        // thread-local error value has no pointer/lifetime risk.
         let code = unsafe { GetLastError() };
         if code == ERROR_NOT_FOUND {
             return Ok(Vec::new());
@@ -1999,8 +2180,27 @@ pub fn credential_ids_current_user_with_prefix(prefix: &str) -> io::Result<Vec<S
     let credentials = CredentialArray(raw);
     let count = usize::try_from(count)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "credential count is invalid"))?;
-    // SAFETY: successful `CredEnumerateW` returned an array containing exactly
-    // `count` credential pointers, owned by `credentials`.
+    // Fail closed on a corrupt count before forming any slice: never default
+    // to zero or truncate, and keep the allocation bounded.
+    if count > MAX_CREDENTIAL_ENUM_ENTRIES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "credential enumeration count exceeds the bound",
+        ));
+    }
+    if count.saturating_mul(std::mem::size_of::<*mut CREDENTIALW>()) > isize::MAX as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "credential enumeration size is invalid",
+        ));
+    }
+    // SAFETY (WORK_UNIT 789, credential family — `from_raw_parts` of the
+    // enumeration array): `CredEnumerateW` succeeded, so per its contract
+    // `credentials.0` is non-null and points at `count` consecutive,
+    // initialized, properly aligned `*mut CREDENTIALW` entries (bounded above
+    // and byte-checked against `isize::MAX`). The array is owned exclusively
+    // by `credentials`, which outlives `entries`, with no mutable aliasing
+    // during the borrow.
     let entries = unsafe { std::slice::from_raw_parts(credentials.0, count) };
     let mut identifiers = Vec::with_capacity(entries.len());
     for entry in entries {
@@ -2010,7 +2210,14 @@ pub fn credential_ids_current_user_with_prefix(prefix: &str) -> io::Result<Vec<S
                 "credential enumeration returned a null entry",
             ));
         }
-        // SAFETY: every non-null entry belongs to the live enumeration buffer.
+        // SAFETY (WORK_UNIT 789, credential family — entry dereference): each
+        // non-null `entry` was just proven to belong to the live enumeration
+        // array owned by `credentials`; dereferencing one level (`**entry`)
+        // reads only the `CREDENTIALW` struct field `TargetName` (a
+        // `*const u16` with `windows-sys` layout matching Win32) without
+        // forming a mutable alias or retaining the pointer. The raw target is
+        // re-validated (null + 512-unit bounded scan) inside
+        // `credential_target_name`.
         let target = credential_target_name(unsafe { (**entry).TargetName })?;
         let identifier = target.strip_prefix("EliotGovernor/").ok_or_else(|| {
             io::Error::new(
@@ -2247,10 +2454,18 @@ pub fn credential_status_current_user(
 ) -> io::Result<CurrentUserCredentialStatus> {
     let target = credential_target(credential_id)?;
     let mut raw = ptr::null_mut();
-    // SAFETY: `target` is NUL-terminated and `raw` is a valid out pointer.
+    // SAFETY (WORK_UNIT 789, credential family — `CredReadW`): `target` is
+    // NUL-terminated (validated id + `nul_terminated_wide` rejects embedded
+    // NUL/overlong input) and borrowed for the whole call, so
+    // `target.as_ptr()` is valid and stable. `&mut raw` is a live exclusive
+    // out pointer. `CRED_TYPE_GENERIC`/`0` request the default read; the
+    // callee retains nothing. On success `raw` owns one `CREDENTIALW`
+    // allocation until `CredentialBuffer` frees it.
     let read = unsafe { CredReadW(target.as_ptr(), CRED_TYPE_GENERIC, 0, &raw mut raw) };
     if read == 0 {
-        // SAFETY: this call immediately follows the failed Win32 operation.
+        // SAFETY (WORK_UNIT 789, credential family — `GetLastError`): called
+        // immediately after the failed `CredReadW` with no intervening Win32
+        // call, so the code belongs to this failure.
         let code = unsafe { GetLastError() };
         if code == ERROR_NOT_FOUND {
             return Ok(CurrentUserCredentialStatus {
@@ -2261,8 +2476,20 @@ pub fn credential_status_current_user(
         }
         return Err(io::Error::from_raw_os_error(code.cast_signed()));
     }
+    if raw.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "credential read returned a null allocation",
+        ));
+    }
     let buffer = CredentialBuffer(raw);
-    // SAFETY: successful `CredReadW` returned the allocation owned by `buffer`.
+    // SAFETY (WORK_UNIT 789, credential family — `CREDENTIALW` dereference):
+    // `CredReadW` succeeded and `raw` was just proven non-null, so `buffer.0`
+    // points at one initialized `CREDENTIALW` (windows-sys layout matches
+    // Win32) owned exclusively by `buffer`, which outlives `credential`. The
+    // shared borrow overlaps no mutable borrow and reads only
+    // `LastWritten`/`CredentialBlobSize` (plain integers, no pointer
+    // traversal).
     let credential = unsafe { &*buffer.0 };
     let version = (u64::from(credential.LastWritten.dwHighDateTime) << 32)
         | u64::from(credential.LastWritten.dwLowDateTime);
@@ -2283,19 +2510,33 @@ pub fn credential_status_current_user(
 pub fn credential_read_current_user(credential_id: &str) -> io::Result<Option<Vec<u8>>> {
     let target = credential_target(credential_id)?;
     let mut raw = ptr::null_mut();
-    // SAFETY: `target` is NUL-terminated and `raw` is a valid out pointer.
+    // SAFETY (WORK_UNIT 789, credential family — `CredReadW`): same contract
+    // as `credential_status_current_user`: `target` is NUL-terminated and
+    // borrowed for the call, `&mut raw` is a live exclusive out pointer, and
+    // success transfers exactly one `CREDENTIALW` allocation to the caller.
     let read = unsafe { CredReadW(target.as_ptr(), CRED_TYPE_GENERIC, 0, &raw mut raw) };
     if read == 0 {
-        // SAFETY: this call immediately follows the failed Win32 operation.
+        // SAFETY (WORK_UNIT 789, credential family — `GetLastError`): called
+        // immediately after the failed `CredReadW` with no intervening Win32
+        // call, so the code belongs to this failure.
         let code = unsafe { GetLastError() };
         if code == ERROR_NOT_FOUND {
             return Ok(None);
         }
         return Err(io::Error::from_raw_os_error(code.cast_signed()));
     }
+    if raw.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "credential read returned a null allocation",
+        ));
+    }
     let buffer = CredentialBuffer(raw);
-    // SAFETY: a successful `CredReadW` returns a valid `CREDENTIALW` allocation
-    // owned by `buffer` for the duration of this function.
+    // SAFETY (WORK_UNIT 789, credential family — `CREDENTIALW` dereference):
+    // `CredReadW` succeeded and `raw` was just proven non-null, so `buffer.0`
+    // points at one initialized `CREDENTIALW` owned exclusively by `buffer`,
+    // which outlives `credential`. The shared borrow overlaps no mutable
+    // borrow; only integer/pointer fields are read here.
     let credential = unsafe { &*buffer.0 };
     let blob_size = usize::try_from(credential.CredentialBlobSize).map_err(|_| {
         io::Error::new(
@@ -2311,8 +2552,13 @@ pub fn credential_read_current_user(credential_id: &str) -> io::Result<Option<Ve
             "credential blob is invalid",
         ));
     }
-    // SAFETY: the blob belongs to the credential allocation, and the API
-    // guarantees `CredentialBlobSize` readable bytes on success.
+    // SAFETY (WORK_UNIT 789, credential family — blob `from_raw_parts`):
+    // `credential` is borrowed from the live `buffer` allocation, so
+    // `CredentialBlob` (when `blob_size > 0`, proven non-null above) points at
+    // `blob_size` initialized bytes inside that same allocation (WinCred blob
+    // contract), bounded by `CRED_MAX_CREDENTIAL_BLOB_SIZE` and converted
+    // without truncation. The slice is shared, overlaps no mutable borrow,
+    // and is copied out before the guard drops.
     let bytes = unsafe { std::slice::from_raw_parts(credential.CredentialBlob, blob_size) };
     Ok(Some(bytes.to_vec()))
 }
@@ -2349,8 +2595,16 @@ pub fn credential_write_current_user(credential_id: &str, value: &[u8]) -> io::R
         TargetAlias: ptr::null_mut(),
         UserName: username.as_mut_ptr(),
     };
-    // SAFETY: all pointers in `credential` remain valid for the complete call,
-    // and the blob length is checked against the Win32 maximum.
+    // SAFETY (WORK_UNIT 789, credential family — `CredWriteW`): `target` and
+    // `username` are NUL-terminated (validated id + `nul_terminated_wide`
+    // rejects embedded NUL/overlong input) and borrowed mutably for the whole
+    // call, so both pointers are valid, aligned, and unaliased during FFI.
+    // `CredentialBlob` borrows `value` (non-empty, `<=
+    // CRED_MAX_CREDENTIAL_BLOB_SIZE`, `u32`-checked above) for the call.
+    // Optional pointers are null with zero counts (`AttributeCount = 0`,
+    // null `Comment`/`Attributes`/`TargetAlias`), `Type`/`Persist` are valid
+    // constants, and `&raw const credential` passes a stable address without
+    // moving the struct. The callee retains nothing.
     let written = unsafe { CredWriteW(&raw const credential, 0) };
     if written == 0 {
         return Err(io::Error::last_os_error());
@@ -2368,12 +2622,18 @@ pub fn credential_write_current_user(credential_id: &str, value: &[u8]) -> io::R
 /// Manager failure.
 pub fn credential_delete_current_user(credential_id: &str) -> io::Result<bool> {
     let target = credential_target(credential_id)?;
-    // SAFETY: `target` is NUL-terminated and valid for the complete call.
+    // SAFETY (WORK_UNIT 789, credential family — `CredDeleteW`): `target` is
+    // NUL-terminated (validated id + `nul_terminated_wide` rejects embedded
+    // NUL/overlong input) and borrowed for the whole call, so the pointer is
+    // valid, aligned, and stable. `CRED_TYPE_GENERIC`/`0` select the default
+    // delete; the callee retains nothing.
     let deleted = unsafe { CredDeleteW(target.as_ptr(), CRED_TYPE_GENERIC, 0) };
     if deleted != 0 {
         return Ok(true);
     }
-    // SAFETY: this call immediately follows the failed Win32 operation.
+    // SAFETY (WORK_UNIT 789, credential family — `GetLastError`): called
+    // immediately after the failed `CredDeleteW` with no intervening Win32
+    // call, so the code belongs to this failure.
     let code = unsafe { GetLastError() };
     if code == ERROR_NOT_FOUND {
         Ok(false)
@@ -2440,10 +2700,11 @@ struct SecurityDescriptor {
 
 impl SecurityDescriptor {
     fn from_sddl(sddl: &str) -> io::Result<Self> {
-        let wide = sddl
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect::<Vec<_>>();
+        // Routed through `nul_terminated_wide` so an embedded NUL (which
+        // would silently truncate the DACL text) and an oversize SDDL fail
+        // closed before reaching the conversion API. Both live callers pass
+        // short constant or SID-bound strings far below the bound.
+        let wide = nul_terminated_wide(OsStr::new(sddl))?;
         let mut raw = ptr::null_mut();
         // SAFETY: `wide` is NUL-terminated and valid for the duration of the
         // call; `raw` is an out pointer initialized by the Win32 API.
@@ -2833,6 +3094,59 @@ mod tests {
     fn sid_validation_rejects_sddl_injection() {
         assert!(validate_sid("S-1-5-21-1234").is_ok());
         assert!(validate_sid("S-1-5-21)(A;;GA;;;WD").is_err());
+    }
+
+    #[test]
+    fn image_buffer_truncation_bound_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
+        let buffer = vec![u16::from(b'a'), u16::from(b'b'), 0_u16, 0_u16];
+        assert_eq!(
+            super::truncate_image_buffer(buffer.clone(), 2)?,
+            std::path::PathBuf::from("ab")
+        );
+        for bad in [0_u32, 4, 5, u32::MAX] {
+            let Err(error) = super::truncate_image_buffer(buffer.clone(), bad) else {
+                panic!("truncated image length must fail closed");
+            };
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn inherited_handle_list_rejects_empty_before_ffi() {
+        let Err(error) = super::ProcThreadAttributeList::for_inherited_handles(&[]) else {
+            panic!("empty handle list must fail closed before any FFI call");
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn suspended_guard_rejects_sentinel_handles_without_cleanup()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::System::Threading::PROCESS_INFORMATION;
+        // Both sentinels are rejected; with no live handle there is nothing to
+        // terminate or close. `INVALID_HANDLE_VALUE` (-1) aliases the
+        // current-process pseudo-handle, so surviving this loop proves the
+        // cleanup cannot terminate the test process itself.
+        for (process, thread) in [
+            (std::ptr::null_mut(), std::ptr::null_mut()),
+            (INVALID_HANDLE_VALUE, INVALID_HANDLE_VALUE),
+            (std::ptr::null_mut(), INVALID_HANDLE_VALUE),
+            (INVALID_HANDLE_VALUE, std::ptr::null_mut()),
+        ] {
+            let information = PROCESS_INFORMATION {
+                hProcess: process,
+                hThread: thread,
+                ..PROCESS_INFORMATION::default()
+            };
+            let Err(error) = super::SuspendedProcessGuard::new(information) else {
+                panic!("sentinel process handles must fail closed");
+            };
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        }
+        assert!(process_is_alive(std::process::id())?);
+        Ok(())
     }
 
     #[test]

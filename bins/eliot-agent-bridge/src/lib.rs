@@ -2,18 +2,23 @@
 
 #![forbid(unsafe_code)]
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::Duration;
 
 use eliot_agent_bridge_core::{
-    AgentBridgeCore, AttachBinding, AttachRequest, AttachView, BridgeError, ConnectionId,
-    CursorPolicy, DemandId, EventForwardStatus, EventPortOutcome, HostActivationPort,
-    HostEventEnvelope, McpForwardingPort, ProviderFailure, ProviderReadiness,
-    ReconciliationPortOutcome, ReconnectRequest,
+    AgentBridgeCore, AttachBinding, AttachRequest, AttachView, AttemptState, BridgeError,
+    ConnectionId, CursorPolicy, DemandId, EventForwardStatus, EventPortOutcome, HostActivationPort,
+    HostEventEnvelope, McpForwardingPort, OutstandingDeliveryView, ProviderFailure,
+    ProviderReadiness, ReconciliationPortOutcome, ReconnectRequest, RecoveryDirective,
+    TerminalReductionInputs, TransportEdge,
 };
+use eliot_mcp::KernelHostRequestPort;
 use eliot_protocol::{
     AckPhase, AgentBridgeClientDeclaration, AgentBridgePeerAdmissionReceipt,
     AgentBridgePeerChallenge, EventEnvelope,
@@ -22,13 +27,16 @@ use eliot_runtime::{Runtime, RuntimeConfig};
 
 mod cli_contract;
 mod kernel_activation_client;
+mod kernel_host_request_client;
 pub(crate) use cli_contract::validate_client_declaration_path;
 pub use cli_contract::{CliConfig, CliError, Profile, Transport, parse_args};
 use kernel_activation_client::KernelHostActivationPort;
 #[cfg(test)]
 use kernel_activation_client::{
     activation_frame_for_request, build_neutral_activation_request, decode_activation_response,
+    denial_reason_code,
 };
+use kernel_host_request_client::{KernelHostRequestClient, ReplayCacheEntry};
 
 fn decode_declaration_bytes(bytes: &[u8]) -> Result<AgentBridgeClientDeclaration, String> {
     let declaration: AgentBridgeClientDeclaration =
@@ -55,6 +63,32 @@ struct AdmittedConnection {
 // _loaded: LoadedAgentBridgeDeclaration
 // activation_used: bool
 // activation exchange already consumed; restart/reconnect
+
+/// Single retained transport owner behind both kernel faces.
+///
+/// Exactly one admitted transport, one tokio runtime, one declaration lease,
+/// and one activation one-shot guard live here. `KernelHostActivationPort`
+/// (runner side) and `KernelHostRequestClient` (host-gateway side) each hold
+/// a `SharedTransport`; no second transport, runtime, or lease is ever
+/// constructed. `activated_session` keeps the kernel-issued semantic session
+/// captured by the one-shot activation exchange, so invocation envelopes bind
+/// an honest kernel-issued selector instead of host text or a minted
+/// identity. `replay_cache` makes exact host replays byte-identical (the
+/// kernel deduplicates by envelope digest) and turns a changed payload under
+/// a known correlation into a local `IdempotencyConflict` with no wire
+/// traffic. Neither is durable: both die with this process, which spans
+/// exactly one admitted connection.
+struct KernelTransportOwner {
+    admitted: AdmittedConnection,
+    runtime: tokio::runtime::Runtime,
+    _loaded: LoadedAgentBridgeDeclaration,
+    activation_used: bool,
+    limits: eliot_ipc::TransportLimits,
+    activated_session: Option<String>,
+    replay_cache: HashMap<String, ReplayCacheEntry>,
+}
+
+type SharedTransport = Rc<RefCell<KernelTransportOwner>>;
 
 struct KernelMcpForwardingPort;
 
@@ -100,7 +134,11 @@ impl McpForwardingPort for KernelMcpForwardingPort {
     }
 }
 
-pub type KernelPorts = (Box<dyn HostActivationPort>, Box<dyn McpForwardingPort>);
+pub type KernelPorts = (
+    Box<dyn HostActivationPort>,
+    Box<dyn KernelHostRequestPort>,
+    Box<dyn McpForwardingPort>,
+);
 
 fn current_os_identity() -> Result<(String, u32), RuntimeBuildError> {
     let expectation = eliot_platform_windows::current_process_named_pipe_expectation()
@@ -220,16 +258,22 @@ pub fn kernel_ports_with_declaration(
             "receipt connection mismatch".to_owned(),
         ));
     }
-    let admitted = AdmittedConnection { transport, receipt };
-    let host: Box<dyn HostActivationPort> = Box::new(KernelHostActivationPort {
-        admitted,
+    let owner: SharedTransport = Rc::new(RefCell::new(KernelTransportOwner {
+        admitted: AdmittedConnection { transport, receipt },
         runtime,
         _loaded: loaded,
         activation_used: false,
         limits,
+        activated_session: None,
+        replay_cache: HashMap::new(),
+    }));
+    let host: Box<dyn HostActivationPort> = Box::new(KernelHostActivationPort {
+        shared: owner.clone(),
     });
+    let host_request: Box<dyn KernelHostRequestPort> =
+        Box::new(KernelHostRequestClient { shared: owner });
     let fwd: Box<dyn McpForwardingPort> = Box::new(KernelMcpForwardingPort);
-    Ok((host, fwd))
+    Ok((host, host_request, fwd))
 }
 
 pub struct BridgeRunner {
@@ -313,6 +357,74 @@ impl BridgeRunner {
     pub fn attach_view(&self) -> Option<AttachView> {
         self.core.attach_view()
     }
+    /// Read-only view of durable in-flight deliveries for bounded Stop accounting.
+    ///
+    /// Returns the exact core-retained outstanding identities (stream, event,
+    /// sequence) without completing, acknowledging, or recomputing anything:
+    /// the stdio Stop path reports them verbatim so a pending delivery is
+    /// reconciled under its original identity instead of being dropped and
+    /// re-issued under a new id. Empty in production while the forwarding
+    /// port stays unadmitted; non-empty only when a test or future admitted
+    /// forwarder holds durable deliveries below the required ack phase.
+    #[must_use]
+    pub fn outstanding_deliveries(&self) -> Vec<OutstandingDeliveryView> {
+        self.core.outstanding_deliveries()
+    }
+    /// Records one observed attempt state transition verbatim for the
+    /// terminal reducer. The transport decides no legality here.
+    pub fn observe_attempt_transition(
+        &mut self,
+        from: AttemptState,
+        to: AttemptState,
+        sequence: u64,
+    ) -> Result<(), BridgeError> {
+        self.core.observe_attempt_transition(from, to, sequence)
+    }
+    /// Files one typed recovery directive chaining an observed recoverable
+    /// failure to its corrected call under the retry/new-identity rule.
+    pub fn prescribe_recovery(&mut self, directive: RecoveryDirective) -> Result<(), BridgeError> {
+        self.core.prescribe_recovery(directive)
+    }
+    /// Records the candidate canonical-write submission reference.
+    pub fn record_canonical_submission(
+        &mut self,
+        reference: impl Into<String>,
+    ) -> Result<(), BridgeError> {
+        self.core.record_canonical_submission(reference)
+    }
+    /// Records the candidate canonical-write receipt reference.
+    pub fn record_canonical_receipt(
+        &mut self,
+        reference: impl Into<String>,
+    ) -> Result<(), BridgeError> {
+        self.core.record_canonical_receipt(reference)
+    }
+    /// Records the independent exact-readback reference.
+    pub fn record_canonical_readback(
+        &mut self,
+        reference: impl Into<String>,
+    ) -> Result<(), BridgeError> {
+        self.core.record_canonical_readback(reference)
+    }
+    /// Records one terminal-relevant transport edge without resolving it.
+    pub fn record_transport_edge(&mut self, edge: TransportEdge) -> Result<(), BridgeError> {
+        self.core.record_transport_edge(edge)
+    }
+    /// Notes the stale UI/CLI terminal display verbatim, independent of
+    /// the canonical references until reduction.
+    pub fn note_stale_ui_disposition(
+        &mut self,
+        disposition: impl Into<String>,
+    ) -> Result<(), BridgeError> {
+        self.core.note_stale_ui_disposition(disposition)
+    }
+    /// Projects the terminal reduction inputs for the external reducer.
+    /// History and terminal evidence stay independent; nothing here is a
+    /// terminal disposition.
+    #[must_use]
+    pub fn terminal_reduction_inputs(&self) -> Option<TerminalReductionInputs> {
+        self.core.terminal_reduction_inputs()
+    }
 }
 
 #[derive(Debug)]
@@ -339,8 +451,10 @@ impl std::error::Error for RuntimeBuildError {}
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use eliot_contracts::{ArtifactId, ContractId, ContractVersion, StateFence};
-    use eliot_contracts::{AuthorityEpoch, ResourceGeneration};
+    use eliot_contracts::ResourceGeneration;
+    use eliot_contracts::{
+        ArtifactId, ContractId, ContractVersion, EpochId, EpochLineageId, StateFence,
+    };
     use eliot_protocol::AgentBridgeActivationResponse;
     use eliot_protocol::{
         AGENT_BRIDGE_CLIENT_DECLARATION_WIRE_ID, AGENT_BRIDGE_CLIENT_DECLARATION_WIRE_VERSION,
@@ -353,12 +467,20 @@ mod tests {
     use eliot_runtime_contracts::{HealthVector, ModuleGenerationState};
     use eliot_runtime_contracts::{ModuleContract, ModuleGeneration};
     use std::collections::BTreeMap;
+    use std::num::NonZeroU64;
+
+    const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn test_epoch(sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(TEST_LINEAGE_A).expect("valid test lineage"),
+            NonZeroU64::new(sequence).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
 
     fn fixture_declaration() -> AgentBridgeClientDeclaration {
-        let fence = StateFence::new(
-            AuthorityEpoch::new(3).unwrap(),
-            ResourceGeneration::new(7).unwrap(),
-        );
+        let fence = StateFence::new(test_epoch(3), ResourceGeneration::new(7).unwrap());
         let artifact = ArtifactId::new("a".repeat(64)).unwrap();
         let module = ContractId::new(AGENT_BRIDGE_MODULE_ID).unwrap();
         let contract = ModuleContract {
@@ -398,7 +520,7 @@ mod tests {
             expected_kernel_sid: "S-1-5-18".to_owned(),
             expected_kernel_session_id: 0,
             expected_kernel_principal_binding: "kernel:agent-bridge".to_owned(),
-            expected_kernel_authority_epoch: AuthorityEpoch::new(8).unwrap(),
+            expected_kernel_authority_epoch: test_epoch(8),
             expected_kernel_generation: ResourceGeneration::new(2).unwrap(),
             expected_kernel_artifact_sha256: "b".repeat(64),
             expected_kernel_config_snapshot_sha256: "c".repeat(64),
@@ -419,7 +541,7 @@ mod tests {
             bridge_generation: decl.module_generation.generation,
             state_fence: decl.module_generation.state_fence.clone(),
             kernel_principal_binding: decl.expected_kernel_principal_binding.clone(),
-            kernel_authority_epoch: decl.expected_kernel_authority_epoch,
+            kernel_authority_epoch: decl.expected_kernel_authority_epoch.clone(),
             kernel_generation: decl.expected_kernel_generation,
             kernel_artifact_sha256: decl.expected_kernel_artifact_sha256.clone(),
             kernel_config_snapshot_sha256: decl.expected_kernel_config_snapshot_sha256.clone(),
@@ -731,10 +853,8 @@ mod tests {
         bad_deadline.receipt_sha256 = bad_deadline.compute_digest().unwrap();
         assert!(bad_deadline.validate_challenge(&chal).is_err());
         let mut bad_fence = receipt.clone();
-        bad_fence.state_fence = StateFence::new(
-            AuthorityEpoch::new(99).unwrap(),
-            ResourceGeneration::new(99).unwrap(),
-        );
+        bad_fence.state_fence =
+            StateFence::new(test_epoch(99), ResourceGeneration::new(99).unwrap());
         bad_fence.receipt_sha256 = bad_fence.compute_digest().unwrap();
         assert!(bad_fence.validate_challenge(&chal).is_err());
     }
@@ -870,6 +990,82 @@ mod tests {
     }
 
     #[test]
+    fn typed_denial_codes_surface_distinctly() {
+        use std::collections::BTreeSet;
+
+        use eliot_protocol::AgentBridgeActivationDenialCode;
+
+        let decl = fixture_declaration();
+        let chal = fixture_challenge(&decl);
+        let hello = decl.client_hello(chal.challenge_nonce.clone()).unwrap();
+        let receipt = fixture_receipt(&chal, &hello);
+        let core_req = AttachRequest::managed(
+            DemandId::new("demand-1").unwrap(),
+            ConnectionId::new("conn-1").unwrap(),
+        );
+        let req = build_neutral_activation_request(&core_req, &receipt, "demand-1").unwrap();
+        let cases = [
+            (
+                AgentBridgeActivationDenialCode::SemanticResolutionUnavailable,
+                eliot_protocol::AGENT_BRIDGE_SEMANTIC_RESOLUTION_UNAVAILABLE,
+            ),
+            (
+                AgentBridgeActivationDenialCode::TaskSelectionRequired,
+                eliot_protocol::AGENT_BRIDGE_TASK_SELECTION_REQUIRED,
+            ),
+            (
+                AgentBridgeActivationDenialCode::ScopeSelectionRequired,
+                eliot_protocol::AGENT_BRIDGE_SCOPE_SELECTION_REQUIRED,
+            ),
+            (
+                AgentBridgeActivationDenialCode::ScopeAmbiguous,
+                eliot_protocol::AGENT_BRIDGE_SCOPE_AMBIGUOUS,
+            ),
+            (
+                AgentBridgeActivationDenialCode::NotReady,
+                eliot_protocol::AGENT_BRIDGE_NOT_READY,
+            ),
+            (
+                AgentBridgeActivationDenialCode::StaleFence,
+                eliot_protocol::AGENT_BRIDGE_STALE_FENCE,
+            ),
+            (
+                AgentBridgeActivationDenialCode::FailedInternal,
+                eliot_protocol::AGENT_BRIDGE_FAILED_INTERNAL,
+            ),
+        ];
+        let mut seen = BTreeSet::new();
+        for (code, wire) in cases {
+            assert!(seen.insert(wire), "denial reason strings must be distinct");
+            assert_eq!(denial_reason_code(code), wire);
+            let resp = AgentBridgeActivationResponse::denied(&req, code).unwrap();
+            assert!(resp.validate_request(&req).is_ok());
+            let frame = Frame {
+                protocol_version: eliot_protocol::ProtocolVersion::CURRENT,
+                encoding_profile: EncodingProfile::JsonV1,
+                connection_id: req.connection_id.clone(),
+                request_id: Some(req.request_identity.request.metadata.request_id.clone()),
+                kind: FrameKind::Response,
+                message_type: MessageType::Result,
+                request_identity: None,
+                payload: ProtocolPayload::Json(serde_json::to_value(&resp).unwrap()),
+                trace_context: BTreeMap::new(),
+            };
+            let decoded = decode_activation_response(&frame, &req, &receipt).expect("decode");
+            match decoded.disposition {
+                eliot_protocol::AgentBridgeActivationDisposition::Denied { reason_code } => {
+                    assert_eq!(reason_code, code);
+                    assert_eq!(denial_reason_code(reason_code), wire);
+                }
+                eliot_protocol::AgentBridgeActivationDisposition::Authenticated { .. } => {
+                    panic!("denial response must not decode as authenticated");
+                }
+            }
+        }
+        assert_eq!(seen.len(), cases.len());
+    }
+
+    #[test]
     fn activation_response_join_rejects_connection_and_semantic_fence_substitutions() {
         let decl = fixture_declaration();
         let chal = fixture_challenge(&decl);
@@ -902,7 +1098,7 @@ mod tests {
                     session_id: "session-1".to_owned(),
                     activation_generation: receipt.state_fence.resource_generation,
                     state_fence: eliot_protocol::AgentBridgeActivationFence {
-                        authority_epoch: receipt.state_fence.authority_epoch,
+                        authority_epoch: receipt.state_fence.authority_epoch.clone(),
                         generation: receipt.state_fence.resource_generation,
                         nonce: "semantic-fence-1".to_owned(),
                     },
@@ -934,7 +1130,7 @@ mod tests {
         if let eliot_protocol::AgentBridgeActivationDisposition::Authenticated { binding } =
             &mut bad_authority_epoch.disposition
         {
-            binding.state_fence.authority_epoch = AuthorityEpoch::new(99).unwrap();
+            binding.state_fence.authority_epoch = test_epoch(99);
         }
         bad_authority_epoch = bad_authority_epoch.with_computed_digest().unwrap();
         let bad_authority_epoch_frame = frame_for(&bad_authority_epoch, "conn-1");

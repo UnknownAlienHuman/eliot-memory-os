@@ -1,0 +1,71 @@
+schema_version = 4
+module_id = "foundation.memory.projection-contracts"
+crate = "eliot-memory-projection-contracts"
+status = "PROTOTYPE"
+wave = "cognitive-micromodules-wave-01"
+agent_order = 44
+plane = "Foundation"
+runtime_layer = "R5"
+delivery_depth = "D3b"
+source_layer = "C0"
+runtime_bundle = "eliotd"
+state_class = "stateless"
+hot_path = false
+lifecycle_owner = "foundation.memory.projection-contracts"
+loc_soft_ceiling = 10000
+loc_policy = "review ceiling only; causal cohesion, proof, owner, build/test closure and replacement boundary decide topology"
+product_objective = "Task-local memory applicability is decided over an explicit bounded projection instead of store queries or cue-hit similarity."
+causal_property = "bounded canonical memory projection for applicability"
+old_failure_or_missing_capability = "Smart has no owner-neutral memory read set: cue hits, retrieval repetition or similarity are mistaken for applicability proof (CC-008)."
+discriminator = "a cue-hit record with an unmet precondition or scope/fence mismatch is excluded with its substantive reason; the cue hit never promotes it"
+primary_responsibility = "Own the versioned owner-neutral MemoryProjectionRecord read set and ApplicableMemorySet with shared-fence gating."
+owned_mutable_state = []
+allowed_effects = []
+inputs = ["foundation identities/fences/lifecycle labels", "evidence epistemic/provenance vocabulary"]
+outputs = ["MemoryProjectionRecord", "MemoryProjectionBatch", "ApplicableMemorySet"]
+depends_on = ["eliot-contracts", "eliot-evidence", "eliot-receipts"]
+providers = ["foundation contracts"]
+consumers = ["memory projection provider", "memory applicability evaluator", "context candidates memory slot"]
+non_goals = ["store reads", "retrieval", "ranking", "support/influence promotion", "cue scoring"]
+invariants = ["one fence governs a batch", "every record carries its denominator/coverage context", "unknowns stay explicit", "no score/rank/similarity field exists"]
+failure_behavior = "Reject fence/scope/version/denominator contradictions explicitly; never coerce an unknown into an applicable record."
+proof_surface = ["record/batch/set validation", "shared-fence gating", "truncation/omission/denominator accounting", "consumer compile fixtures"]
+proof_ceiling = "STATIC_CONTRACT_REGISTRATION_ONLY"
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+replacement_boundary = "implementation behind the declared public contract; package ownership creates no runtime or semantic authority"
+merge_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
+split_trigger = "a second causal responsibility, mutable owner, independent proof surface or independent rollback boundary appears"
+
+[[donor]]
+path = "crates/smart/eliot-context-contracts/src/identity.rs"
+disposition = "reuse the ContextBinding task/scope/fence shape read-only; no edit, no import (foundation must not depend on Smart)"
+
+[[donor]]
+path = "ELIOT_IMPLEMENTATION I14"
+disposition = "memory-ecology constraints: retrieval never promotes, exact negative triggers only"
+
+[agent_task]
+objective = "Freeze the owner-neutral memory projection read set for task-local applicability."
+write_scope = ["crates/foundation/eliot-memory-projection-contracts/**"]
+deliverables = ["versioned record/batch/set contracts", "shared-fence fixtures", "consumer compile fixtures"]
+acceptance = ["one declared responsibility only", "bounded deterministic behavior", "visible local degradation"]
+forbidden = ["canonical writes outside the named Governor transition path", "truth/support/authority/policy/finish/effect promotion", "provider or model SDKs in pure cognitive cores", "vendor or storage types in public contracts", "unbounded synchronous work", "silent truncation", "oracle or verifier weakening in the same work unit", "implicit scope widening", "active-generation self-modification"]
+stop_condition = "Stop and return ContractChallenge when the work needs another owner, store access, model work or hidden state."
+challenge_path = "return ContractChallenge to the integration owner when owner, discriminator, proof ceiling or dependency boundary is wrong"
+integration_owner = "cognitive-wave-integrator"
+implementation_language = "Rust 2024"
+required_verification = ["module/package proof at the declared proof ceiling", "real provider/consumer fixture for every changed edge", "the named Product Pulse before promotion", "exact donor reuse/rewrite/reject trace"]
+writeback = "return implementation artifact, exact proof evidence, donor disposition, unresolved ContractChallenges and merge/remove recommendation"
+workspace_admission = "forbidden until implementation, package proof, affected Edge proof, current-main rebase and integration-owner review"
+
+# Acceptance is decided by the owning contract and independent review
+# (I0.10: line/test/type counts are not goals). `scripts/verify-work-unit.py`
+# is a retired legacy diagnostic that always reports completion=NOT_VERIFIED
+# and never accepts a work unit. This table names the concrete contract and
+# the required exports/tests plus small behaviour checks the reviewer verifies.
+[acceptance]
+require_deny_unknown_fields = true
+forbid_unsafe = true
+required_exports = []
+required_tests = []
+forbidden_patterns = ['serde_json::Value', 'unimplemented!', 'todo!']

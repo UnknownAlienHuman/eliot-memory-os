@@ -2,6 +2,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod handoff;
+
 use std::collections::BTreeMap;
 
 use eliot_contracts::{ContractVersion, StateFence};

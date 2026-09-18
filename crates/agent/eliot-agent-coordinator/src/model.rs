@@ -1,13 +1,17 @@
 use eliot_agent_api::{
-    ActualRouteReceipt, AgentLaunchRequest, AgentResult, AttemptId, AuthorityEpoch, BudgetEnvelope,
-    CancelReason, LaunchRequestId, ResultDisposition, RouteFingerprint, StateFence, TaskId,
-    WorkLeaseId, WorkUnitId,
+    AdmittedRouteReceipt, AgentLaunchRequest, AgentResult, AttemptId, BudgetEnvelope, CancelReason,
+    EpochId, EventId, HostEventNormalizationReceipt, HostEventQuarantineReason, LaunchRequestId,
+    NormalizedHostEventEnvelope, PhysicalRouteObservationReceipt, ProviderExecutionBinding,
+    ResultDisposition, RouteFingerprint, RouteSelectionCandidate, StateFence, TaskId, WorkLeaseId,
+    WorkUnitId,
 };
 use eliot_agent_contracts::{
     DescendantClosureReceipt, LivePeerMessage, LivePeerMessageState, MessageId,
     ParentFinishCeiling, RevisionId,
 };
+use eliot_contracts::LowercaseSha256;
 use eliot_evaluation_contracts::BudgetEvidence;
+use eliot_kernel_core::NormalWorkClass;
 use eliot_receipts::ProofCeiling;
 use eliot_security_contracts::PrivacyClass;
 use serde::{Deserialize, Serialize};
@@ -195,37 +199,20 @@ pub struct RouteCandidateEvidence {
     pub evidence_refs: Vec<String>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum RouteRejectionReason {
-    LowerDeterministicRank,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RejectedRoute {
-    pub route: RouteFingerprint,
-    pub reason: RouteRejectionReason,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RoutingReceipt {
-    pub selected_route: RouteFingerprint,
-    pub capacity_identity: String,
-    pub capacity_revision: RevisionId,
-    pub capacity_limit: usize,
-    pub budget_evidence: BudgetEvidence,
-    pub evidence_refs: Vec<String>,
-    pub rejected_alternatives: Vec<RejectedRoute>,
-    pub proof_ceiling: ProofCeiling,
-}
-
+/// Staffing-lane capacity/budget/rank evidence stays in this lane.
+/// Route selection itself is the imported single-owner
+/// [`RouteSelectionCandidate`]; there is no second shared routing receipt.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StaffingLaneRequest {
     pub work_unit_id: WorkUnitId,
     pub role_id: RoleProfileId,
+    /// I14.1 work class (issue #1698) as the closed boundary type. The wire
+    /// carries exactly the nine lowercase spellings; `Deserialize` converts
+    /// through [`WorkClass::parse_wire`] so an unknown value rejects at
+    /// decode ingress and every in-memory value is validated by
+    /// construction. Absent or unknown is rejected, never defaulted.
+    pub work_class: WorkClass,
     pub route_candidates: Vec<RouteCandidateEvidence>,
     pub budget: BudgetEnvelope,
     pub priority: u16,
@@ -242,6 +229,11 @@ pub struct StaffingPlanRequest {
     pub plan_revision: RevisionId,
     pub state_fence: StateFence,
     pub privacy_class: PrivacyClass,
+    /// I14.1 work class for the whole plan (issue #1698) as the closed
+    /// boundary type. Every lane must carry this same class; a mixed-class
+    /// plan is rejected so one definition, reservation and admission bind
+    /// exactly one class.
+    pub work_class: WorkClass,
     pub lanes: Vec<StaffingLaneRequest>,
 }
 
@@ -251,7 +243,14 @@ pub struct StaffingLaneCandidate {
     pub work_unit_id: WorkUnitId,
     pub role_id: RoleProfileId,
     pub role_revision: RevisionId,
-    pub routing: RoutingReceipt,
+    /// I14.1 work class threaded from the requesting lane (issue #1698) as
+    /// the closed boundary type: deterministic recipe/route/admission policy
+    /// input, echoed exactly.
+    pub work_class: WorkClass,
+    pub routing: RouteSelectionCandidate,
+    pub capacity_identity: String,
+    pub capacity_revision: RevisionId,
+    pub capacity_limit: usize,
     pub budget: BudgetEnvelope,
     pub priority: u16,
     pub mutation_scope: Option<String>,
@@ -269,6 +268,9 @@ pub struct StaffingPlanCandidate {
     pub plan_revision: RevisionId,
     pub state_fence: StateFence,
     pub privacy_class: PrivacyClass,
+    /// I14.1 work class threaded from the requesting plan (issue #1698) as
+    /// the closed boundary type.
+    pub work_class: WorkClass,
     pub lanes: Vec<StaffingLaneCandidate>,
 }
 
@@ -281,11 +283,27 @@ pub struct AdmittedLaneReceipt {
     pub attempt_id: AttemptId,
     pub lease_id: WorkLeaseId,
     pub worker_id: WorkerId,
+    /// I14.1 work class echoed from the admitted candidate lane (issue
+    /// #1698) as the closed boundary type. Checked for exact equality at
+    /// admission; a mismatch rejects, never downgrades. Unknown values are
+    /// unrepresentable: `Deserialize` rejects them at decode ingress.
+    pub work_class: WorkClass,
     pub route: RouteFingerprint,
-    pub routing_receipt_digest: String,
+    /// Recomputed candidate identity: `candidate_digest_for` of the admitted
+    /// `RouteSelectionCandidate` bytes (canonical JSON + SHA-256 hex, typed).
+    /// Validators recompute; an unchecked copy is rejected at admission.
+    pub routing_receipt_digest: LowercaseSha256,
     pub budget: BudgetEnvelope,
     pub priority: u16,
     pub mutation_scope: Option<String>,
+    /// Externally-issued admitted route decision for this lane (issue #370
+    /// S5). The external admission owner issues the receipt; the coordinator
+    /// only stores and validates it, never mints. `None` is a legacy or
+    /// unresolved launch and is rejected for binding closure (fail-closed).
+    /// The `#[serde(default)]` keeps pre-S5 wire readable (additive, cf. S2
+    /// `provider_binding`).
+    #[serde(default)]
+    pub admitted_route: Option<AdmittedRouteReceipt>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -300,7 +318,7 @@ pub struct ProviderAdmissionReceipt {
     pub task_revision: String,
     pub plan_revision: RevisionId,
     pub state_fence: StateFence,
-    pub controller_epoch: AuthorityEpoch,
+    pub controller_epoch: EpochId,
     pub coordinator_lease: WorkLeaseId,
     pub provider_identity: ProviderIdentity,
     pub g11_admission_receipt_ref: String,
@@ -315,7 +333,7 @@ pub struct ExecutionContext {
     pub task_revision: String,
     pub plan_revision: RevisionId,
     pub state_fence: StateFence,
-    pub controller_epoch: AuthorityEpoch,
+    pub controller_epoch: EpochId,
     pub coordinator_lease: WorkLeaseId,
 }
 
@@ -326,7 +344,7 @@ impl From<&ProviderAdmissionReceipt> for ExecutionContext {
             task_revision: receipt.task_revision.clone(),
             plan_revision: receipt.plan_revision.clone(),
             state_fence: receipt.state_fence.clone(),
-            controller_epoch: receipt.controller_epoch,
+            controller_epoch: receipt.controller_epoch.clone(),
             coordinator_lease: receipt.coordinator_lease.clone(),
         }
     }
@@ -371,6 +389,10 @@ pub struct AttemptRecord {
     pub attempt_id: AttemptId,
     pub lease_id: WorkLeaseId,
     pub worker_id: WorkerId,
+    /// I14.1 work class carried from the admitted lane (issue #1698) as the
+    /// closed boundary type. The scheduler routes/selects on this class
+    /// before priority; only validated values can be stored here.
+    pub work_class: WorkClass,
     pub route: RouteFingerprint,
     pub capacity_identity: String,
     pub capacity_revision: RevisionId,
@@ -380,6 +402,20 @@ pub struct AttemptRecord {
     pub mutation_scope: Option<String>,
     pub state: CoordinatedAttemptState,
     pub superseded_by: Option<AttemptId>,
+    /// Immutable provider-execution binding for this attempt (issue #361 S2).
+    /// Set once by `bind_provider_execution`; `None` is an unresolved or
+    /// legacy launch and is rejected for attribution (fail-closed). The
+    /// `#[serde(default)]` keeps pre-S2 wire readable (additive).
+    #[serde(default)]
+    pub provider_binding: Option<ProviderExecutionBinding>,
+    /// Stored admitted route decision for this attempt (issue #370 S5).
+    /// Set from the admitted lane at admission; `None` is a legacy or
+    /// unresolved launch (including reassigned attempts awaiting a new
+    /// external decision for their new attempt identity) and is rejected for
+    /// binding closure (fail-closed). The `#[serde(default)]` keeps pre-S5
+    /// wire readable (additive, cf. S2 `provider_binding`).
+    #[serde(default)]
+    pub admitted_route: Option<AdmittedRouteReceipt>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -474,6 +510,20 @@ pub struct ResultSubmission {
     pub result: AgentResult,
 }
 
+/// Provider-execution binding submission for one admitted attempt (issue #361
+/// S2). It carries the shared `eliot_agent_api::ProviderExecutionBinding` plus
+/// the existing provider identity/proof-reference pattern from
+/// [`ResultSubmission`]: the sealed verifier authenticates the exact start
+/// correlation (`provider_start_receipt_ref` over the canonical submission).
+/// No credential, catalogue-as-admission, or session/login bridge is carried.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderExecutionBindingSubmission {
+    pub binding: ProviderExecutionBinding,
+    pub provider_identity: ProviderIdentity,
+    pub provider_start_receipt_ref: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CandidateResultReceipt {
@@ -481,7 +531,7 @@ pub struct CandidateResultReceipt {
     pub attempt_id: AttemptId,
     pub provider_disposition: ResultDisposition,
     pub proof_ceiling: ProofCeiling,
-    pub actual_route: ActualRouteReceipt,
+    pub actual_route: PhysicalRouteObservationReceipt,
     pub evidence_refs: Vec<String>,
     pub proposed_effect_count: usize,
 }
@@ -597,7 +647,55 @@ pub enum CoordinatorEvent {
         recipient_attempt_id: AttemptId,
         message_id: MessageId,
     },
+    /// A provider-execution binding was bound to an admitted attempt. The
+    /// submission carries the attempt identity (via `binding.attempt_id`) and
+    /// the canonical provider identity/proof, so replay re-verifies the exact
+    /// canonical input and reconstructs the binding; a missing event leaves
+    /// the attempt unresolved and attribution fails closed.
+    ProviderExecutionBound {
+        context: ExecutionContext,
+        submission: Box<ProviderExecutionBindingSubmission>,
+    },
+    /// A closed v7 provider host event was observed under exact recorded
+    /// lineage (issue #371 S7-partial). The envelope carries the attempt
+    /// identity via its execution-unit lineage (or no attempt identity for
+    /// session-only observations); replay re-validates the exact canonical
+    /// input and rebuilds the observation index plus per-attempt sequencing
+    /// without duplicating effects. Gap markers carry no independent
+    /// mutation and rebuild deterministically from the observed stream.
+    ProviderHostEventObserved {
+        context: ExecutionContext,
+        event: Box<NormalizedHostEventEnvelope>,
+        normalization: Box<HostEventNormalizationReceipt>,
+    },
+    /// An explicit sequence gap precedes one observed host event. Ordering
+    /// evidence only: it advances no cursor and synthesizes nothing.
+    ProviderHostEventGap {
+        context: ExecutionContext,
+        attempt_id: AttemptId,
+        event_id: EventId,
+        expected_sequence: u64,
+        observed_sequence: u64,
+    },
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ObservedHostEventSummary {
+    /// Observed event identity.
+    pub event_id: EventId,
+    /// Attempt scope for execution-unit observations; `None` for
+    /// session-only observations, which mutate no attempt state.
+    pub attempt_id: Option<AttemptId>,
+    /// Observed sequence within the attempt scope.
+    pub sequence: u64,
+    /// Canonical output digest of the accepted envelope.
+    pub output_digest: LowercaseSha256,
+}
+
+/// Stored summary of one observed v7 provider host event (issue #371
+/// S7-partial). The canonical input binds the exact envelope plus receipt
+/// bytes for idempotent replay; the summary carries the attempt scope (when
+/// any), sequence, and output digest for ordering and conflict checks.
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -648,6 +746,8 @@ pub enum CoordinatorError {
     StaleResult,
     #[error("route receipt does not match the admitted route")]
     RouteMismatch,
+    #[error("unknown work class: {0}")]
+    UnknownWorkClass(String),
     #[error("route evidence is missing or stale")]
     RouteEvidence,
     #[error("budget is wider than the admitted budget")]
@@ -668,6 +768,8 @@ pub enum CoordinatorError {
     DuplicateResult,
     #[error("idempotency identity was reused with different canonical input")]
     IdempotencyConflict,
+    #[error("host event quarantined with conflicting {0:?}")]
+    HostEventQuarantine(HostEventQuarantineReason),
     #[error("unknown outcome requires authenticated reconciliation")]
     UnknownOutcomeRequiresReconciliation,
     #[error("descendant closure is incomplete or mismatched")]
@@ -693,4 +795,135 @@ pub(crate) fn validate_text(value: &str, field: &'static str) -> Result<(), Coor
         return Err(CoordinatorError::InvalidField(field));
     }
     Ok(())
+}
+
+/// I14.1 closed work-class boundary type (issue #1698). This is the SOLE
+/// in-memory representation of the class: exactly the protected `control`
+/// partition plus the eight Kernel normal-work classes. The wire carries
+/// solely the nine lowercase I14.1 spellings; `Deserialize` converts
+/// immediately through [`WorkClass::parse_wire`], so an unknown, blank, or
+/// absent-shaped value rejects at decode ingress and `next_ready` plus every
+/// queue/projection read can only ever observe validated values (anything
+/// else is unrepresentable). There is no second enum, alias, or string
+/// bridge for this vocabulary.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum WorkClass {
+    /// Protected control partition: draws only from protected control
+    /// capacity owned by the Kernel (`ControlOperationClass` family), never
+    /// from the normal partition.
+    Control,
+    /// Ordinary workload class owned by the Kernel taxonomy.
+    Normal(NormalWorkClass),
+}
+
+impl WorkClass {
+    /// The nine canonical I14.1 wire spellings in scheduler order (control
+    /// first, then normal classes in I14.1 document order).
+    pub const ALL_WIRE_SPELLINGS: [&'static str; 9] = [
+        "control",
+        "interactive",
+        "verification",
+        "canonical_write",
+        "normal_background",
+        "model_jobs",
+        "swarm",
+        "reporting",
+        "maintenance",
+    ];
+
+    /// Returns the exact lowercase I14.1 wire spelling for this class.
+    /// Every [`NormalWorkClass`] variant is named explicitly so the mapping
+    /// is reviewable against the Kernel source; a Kernel-side addition fails
+    /// compilation here, never silently.
+    #[must_use]
+    pub const fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::Control => "control",
+            Self::Normal(NormalWorkClass::Interactive) => "interactive",
+            Self::Normal(NormalWorkClass::Verification) => "verification",
+            Self::Normal(NormalWorkClass::CanonicalWrite) => "canonical_write",
+            Self::Normal(NormalWorkClass::NormalBackground) => "normal_background",
+            // I14.1 spells the model class `model_jobs`; the frozen
+            // control-reserve vocabulary spells it `MODEL_JOB`.
+            Self::Normal(NormalWorkClass::ModelJob) => "model_jobs",
+            Self::Normal(NormalWorkClass::Swarm) => "swarm",
+            Self::Normal(NormalWorkClass::Reporting) => "reporting",
+            Self::Normal(NormalWorkClass::Maintenance) => "maintenance",
+        }
+    }
+
+    /// Converts one wire spelling to the boundary type (issue #1698): exactly
+    /// the nine canonical spellings. Blank or unknown values reject with the
+    /// typed [`CoordinatorError::UnknownWorkClass`]; the caller never
+    /// substitutes a less restrictive class. This is the SOLE validated
+    /// constructor from the wire `String`.
+    pub fn parse_wire(value: &str) -> Result<Self, CoordinatorError> {
+        match value {
+            "control" => Ok(Self::Control),
+            "interactive" => Ok(Self::Normal(NormalWorkClass::Interactive)),
+            "verification" => Ok(Self::Normal(NormalWorkClass::Verification)),
+            "canonical_write" => Ok(Self::Normal(NormalWorkClass::CanonicalWrite)),
+            "normal_background" => Ok(Self::Normal(NormalWorkClass::NormalBackground)),
+            "model_jobs" => Ok(Self::Normal(NormalWorkClass::ModelJob)),
+            "swarm" => Ok(Self::Normal(NormalWorkClass::Swarm)),
+            "reporting" => Ok(Self::Normal(NormalWorkClass::Reporting)),
+            "maintenance" => Ok(Self::Normal(NormalWorkClass::Maintenance)),
+            _ => Err(CoordinatorError::UnknownWorkClass(value.to_owned())),
+        }
+    }
+
+    /// Deterministic scheduler rank (issue #1698): protected `control` first
+    /// (the reserve exists so control is never crowded out by normal work),
+    /// then the eight normal classes in I14.1 document order. There is no
+    /// invalid arm: invalid values are unrepresentable in this type.
+    pub(crate) const fn rank(self) -> u8 {
+        match self {
+            Self::Control => 0,
+            Self::Normal(NormalWorkClass::Interactive) => 1,
+            Self::Normal(NormalWorkClass::Verification) => 2,
+            Self::Normal(NormalWorkClass::CanonicalWrite) => 3,
+            Self::Normal(NormalWorkClass::NormalBackground) => 4,
+            Self::Normal(NormalWorkClass::ModelJob) => 5,
+            Self::Normal(NormalWorkClass::Swarm) => 6,
+            Self::Normal(NormalWorkClass::Reporting) => 7,
+            Self::Normal(NormalWorkClass::Maintenance) => 8,
+        }
+    }
+}
+
+impl std::str::FromStr for WorkClass {
+    type Err = CoordinatorError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse_wire(value)
+    }
+}
+
+impl TryFrom<String> for WorkClass {
+    type Error = CoordinatorError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::parse_wire(&value)
+    }
+}
+
+impl TryFrom<&str> for WorkClass {
+    type Error = CoordinatorError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::parse_wire(value)
+    }
+}
+
+impl Serialize for WorkClass {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_wire_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for WorkClass {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Self::parse_wire(&value).map_err(serde::de::Error::custom)
+    }
 }

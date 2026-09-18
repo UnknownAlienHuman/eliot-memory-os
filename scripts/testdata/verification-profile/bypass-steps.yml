@@ -1,0 +1,29 @@
+name: Fixture step bypasses (must be rejected)
+# WORK_UNIT_CASE: 750/16 and 750/30 negative fixture. continue-on-error,
+# swallowed failures, weaker-profile selection, unqualified verify, and a
+# Quick run labelled Review must all fail validation.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: Swallowed failure
+        shell: pwsh
+        continue-on-error: true
+        run: cargo test --locked --workspace || true
+
+      - name: Unqualified verify
+        shell: pwsh
+        run: pwsh -NoProfile -File scripts/verify.ps1
+
+      - name: Weaker profile relabelled
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File scripts/verify.ps1 -Profile Quick
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "REVIEW: PASS"

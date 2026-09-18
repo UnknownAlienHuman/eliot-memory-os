@@ -7,8 +7,9 @@ use std::{
     process::Command,
 };
 
+use eliot_contracts::{EpochId, EpochLineageId};
 use eliot_installation::{
-    AuthorityEpoch, CandidateManifest, GenerationPackagePlanInput, GenerationPackagePlanner,
+    CandidateManifest, GenerationPackagePlanInput, GenerationPackagePlanner,
     INSTALLATION_TRANSACTION_WIRE_VERSION, InstallationEpoch, InstallationProfile,
     InstallationTransaction, InstallerAclPrincipal, InstallerEffectPlan, ManagedEnvironmentAction,
     ManagedEnvironmentChangeRequest, PHASE_B_PENDING_MARKER, PackageArtifactDigest, PlannedChange,
@@ -21,6 +22,14 @@ use eliot_platform_windows::{
     protected_program_data_root,
 };
 use serde_json::Value;
+
+fn test_epoch(sequence: u64) -> EpochId {
+    EpochId::new(
+        EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("lineage"),
+        std::num::NonZeroU64::new(sequence).expect("sequence"),
+    )
+    .expect("epoch")
+}
 
 fn repository_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -699,10 +708,7 @@ fn portable_cli_transaction(root: &Path) -> InstallationTransaction {
         installation_epoch: installation_epoch.clone(),
         generation: generation.clone(),
         authority_generation: ResourceGeneration::genesis(),
-        authority_state_fence: StateFence::new(
-            AuthorityEpoch::genesis(),
-            ResourceGeneration::genesis(),
-        ),
+        authority_state_fence: StateFence::new(test_epoch(1), ResourceGeneration::genesis()),
         supervision_authority: SupervisionAuthorityBinding::Pending {
             supervision_lease_scope_id: fixture_handle(format!(
                 "eliot-supervision-scope:v1:{}:{}",
@@ -743,6 +749,12 @@ fn portable_cli_transaction(root: &Path) -> InstallationTransaction {
             fixture_handle(PHASE_B_PENDING_MARKER),
             fixture_handle("--kernel-artifact-sha256"),
             fixture_handle("a".repeat(64)),
+            fixture_handle("--doctor-artifact-sha256"),
+            fixture_handle("6".repeat(64)),
+            fixture_handle("--testd-artifact-sha256"),
+            fixture_handle("7".repeat(64)),
+            fixture_handle("--native-worker-artifact-sha256"),
+            fixture_handle("b".repeat(64)),
             fixture_handle("--eliotd-descriptor"),
             fixture_path(root, "eliotd.json"),
             fixture_handle("--eliotd-descriptor-sha256"),
@@ -778,6 +790,12 @@ fn portable_cli_transaction(root: &Path) -> InstallationTransaction {
         host_artifact_digest: fixture_handle("8".repeat(64)),
         watchdog_executable_path: fixture_path(root, "eliot-watchdog.exe"),
         watchdog_artifact_digest: fixture_handle("4".repeat(64)),
+        doctor_artifact_digest: fixture_handle("6".repeat(64)),
+        testd_artifact_digest: fixture_handle("7".repeat(64)),
+        native_worker_artifact_digest: fixture_handle("b".repeat(64)),
+        doctor_executable_path: fixture_path(root, "eliot-doctor.exe"),
+        testd_executable_path: fixture_path(root, "eliot-testd.exe"),
+        native_worker_executable_path: fixture_path(root, "eliot-native-worker.exe"),
         descriptor_digest: fixture_handle("0".repeat(64)),
     };
     runtime_launch = runtime_launch
@@ -793,10 +811,16 @@ fn portable_cli_transaction(root: &Path) -> InstallationTransaction {
         store_bridge_artifact_digest: fixture_handle("1".repeat(64)),
         canonical_store_artifact_digest: fixture_handle("5".repeat(64)),
         host_artifact_digest: fixture_handle("8".repeat(64)),
+        doctor_artifact_digest: fixture_handle("6".repeat(64)),
+        testd_artifact_digest: fixture_handle("7".repeat(64)),
+        native_worker_artifact_digest: fixture_handle("b".repeat(64)),
         kernel_executable_path: fixture_path(root, "eliot-kernel.exe"),
         store_bridge_executable_path: fixture_path(root, "eliot-store-surreal.exe"),
         canonical_store_executable_path: fixture_path(root, "surreal.exe"),
         host_executable_path: fixture_path(root, "eliot-host.exe"),
+        doctor_executable_path: fixture_path(root, "eliot-doctor.exe"),
+        testd_executable_path: fixture_path(root, "eliot-testd.exe"),
+        native_worker_executable_path: fixture_path(root, "eliot-native-worker.exe"),
         config_path: fixture_path(root, "generation.json"),
         dependency_closure_refs: vec![fixture_handle("evidence:dependency-closure")],
         license_refs: vec![fixture_handle("evidence:licenses")],

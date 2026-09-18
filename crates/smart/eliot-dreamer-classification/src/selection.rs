@@ -110,11 +110,27 @@ pub fn select(
             reason: "multiple alternatives satisfy the grounded rules".to_owned(),
         });
     }
+    Ok(finish_single_selection(
+        input,
+        &eligible,
+        unresolved_rival,
+        traces,
+    ))
+}
+
+/// Resolves the at-most-one eligible alternative into its final report,
+/// including the known-subtype owner handoff and prior-position handling.
+fn finish_single_selection(
+    input: &ClassificationInput,
+    eligible: &[ArtifactId],
+    unresolved_rival: bool,
+    traces: Vec<AlternativeTrace>,
+) -> SelectionReport {
     let sole_legal = input.taxonomy.alternatives.len() == 1
         && input.taxonomy.declared_alternative_ids.len() == 1;
     let selected = eligible.first().cloned();
     let Some(selected) = selected else {
-        return Ok(SelectionReport {
+        return SelectionReport {
             kind: if unresolved_rival {
                 SelectionKind::Abstention
             } else {
@@ -127,15 +143,33 @@ pub fn select(
             } else {
                 "no alternative has qualified necessary and sufficient evidence".to_owned()
             },
-        });
+        };
     };
+    // A positive proposal must name an existing accepted subtype. A missing
+    // subtype means the ontology owner must extend the registry; the selector
+    // never invents a local class and never emits a typeless positive.
+    if alternative(input, &selected)
+        .and_then(|candidate| candidate.subtype_ref.clone())
+        .is_none_or(|subtype| subtype.trim().is_empty())
+    {
+        return SelectionReport {
+            kind: SelectionKind::Unsupported,
+            traces,
+            omitted_alternatives: Vec::new(),
+            reason: format!(
+                "selected alternative {} has no known subtype; taxonomy owner {} must supply it",
+                selected.as_str(),
+                input.taxonomy.owner,
+            ),
+        };
+    }
     if unresolved_rival && !sole_legal {
-        return Ok(SelectionReport {
+        return SelectionReport {
             kind: SelectionKind::Abstention,
             traces,
             omitted_alternatives: Vec::new(),
             reason: "an alternative retains unknown or partial live evidence".to_owned(),
-        });
+        };
     }
     let refinement = input
         .prior_assignment
@@ -165,12 +199,12 @@ pub fn select(
             refinement: false,
         },
     };
-    Ok(SelectionReport {
+    SelectionReport {
         kind,
         traces,
         omitted_alternatives: Vec::new(),
         reason: "grounded discriminator set selected a known alternative".to_owned(),
-    })
+    }
 }
 
 fn traces(

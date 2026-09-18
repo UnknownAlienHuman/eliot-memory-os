@@ -1,8 +1,9 @@
 #![forbid(unsafe_code)]
 
 use blake3::Hasher;
+use eliot_contracts::{EpochId, ResourceGeneration, StateFence as CanonicalStateFence};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 use time::{Duration, OffsetDateTime};
 
@@ -68,14 +69,14 @@ impl EvidenceHandle {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StateFence {
-    pub authority_epoch: u64,
+    pub authority_epoch: EpochId,
     pub generation: u64,
     pub digest: String,
 }
 
 impl StateFence {
     pub fn new(
-        authority_epoch: u64,
+        authority_epoch: EpochId,
         generation: u64,
         digest: impl Into<String>,
     ) -> Result<Self, DoctorError> {
@@ -88,14 +89,38 @@ impl StateFence {
         Ok(fence)
     }
     pub fn validate(&self) -> Result<(), DoctorError> {
-        if self.authority_epoch == 0 {
-            return Err(DoctorError::InvalidFence);
-        }
-        if self.generation == 0 {
-            return Err(DoctorError::InvalidFence);
-        }
+        let generation =
+            ResourceGeneration::new(self.generation).map_err(|_| DoctorError::InvalidFence)?;
+        CanonicalStateFence::new(self.authority_epoch.clone(), generation)
+            .validate()
+            .map_err(|_| DoctorError::InvalidFence)?;
         hex_digest(&self.digest, "state fence digest")
     }
+}
+
+/// Thin Doctor-side adapter echoing the Kernel-supplied fence through the
+/// canonical owner. Doctor never mints authority and never widens
+/// visibility: this only validates the echo via `eliot-contracts` and
+/// returns the canonical view for evaluation.
+pub fn canonical_fence(fence: &StateFence) -> Result<CanonicalStateFence, DoctorError> {
+    fence.validate()?;
+    let generation =
+        ResourceGeneration::new(fence.generation).map_err(|_| DoctorError::InvalidFence)?;
+    Ok(CanonicalStateFence::new(
+        fence.authority_epoch.clone(),
+        generation,
+    ))
+}
+
+/// Lineage-aware fence evaluation against the canonical epoch owner.
+/// Proves the echo is canonically valid and bound to the exact lineaged
+/// sequence. Doctor never mints the epoch, it only echoes and checks.
+pub fn check_fence_against_epoch(fence: &StateFence, epoch: &EpochId) -> Result<(), DoctorError> {
+    let canonical = canonical_fence(fence)?;
+    if !canonical.authority_epoch.is_same_authority(epoch) {
+        return Err(DoctorError::InvalidFence);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -175,6 +200,13 @@ pub struct RepairRecipe {
     pub attempt_budget: u32,
     pub cooldown: Duration,
     pub stop_conditions: Vec<String>,
+    /// Closed executable bindings keyed by operation id. Diagnose-only
+    /// recipes carry none; effect recipes carry exactly one binding per
+    /// listed operation, each keyed under an allowed effect. The digest
+    /// binds every entry, so Kernel admission binds the exact program,
+    /// argv template, env allowlist, and caps.
+    #[serde(default)]
+    pub executable_bindings: BTreeMap<String, ExecutableBinding>,
 }
 
 impl RepairRecipe {
@@ -201,10 +233,34 @@ impl RepairRecipe {
         if self.cooldown.is_negative() {
             return Err(DoctorError::InvalidBudget);
         }
-        if matches!(self.repair_class, RepairClass::DiagnoseOnly)
-            && (!self.allowed_effects.is_empty() || !self.operations.is_empty())
-        {
-            return Err(DoctorError::DiagnoseEffects);
+        if matches!(self.repair_class, RepairClass::DiagnoseOnly) {
+            if !self.allowed_effects.is_empty() || !self.operations.is_empty() {
+                return Err(DoctorError::DiagnoseEffects);
+            }
+            if !self.executable_bindings.is_empty() {
+                return Err(DoctorError::DiagnoseEffects);
+            }
+        } else {
+            // Every listed operation carries exactly one validated binding
+            // under an allowed effect; no unbound operation may execute.
+            let listed: BTreeSet<&str> = self.operations.iter().map(String::as_str).collect();
+            if self.executable_bindings.len() != listed.len() {
+                return Err(DoctorError::MissingField("executable bindings"));
+            }
+            for operation in &self.operations {
+                let Some(binding) = self.executable_bindings.get(operation) else {
+                    return Err(DoctorError::MissingField("executable bindings"));
+                };
+                binding.validate()?;
+                if !self.allowed_effects.contains(operation) {
+                    return Err(DoctorError::EffectAuthorizationMismatch);
+                }
+            }
+            for key in self.executable_bindings.keys() {
+                if !listed.contains(key.as_str()) {
+                    return Err(DoctorError::MissingField("executable bindings"));
+                }
+            }
         }
         Ok(())
     }
@@ -261,6 +317,7 @@ impl RepairRecipe {
             &self.rollback_or_compensation,
         );
         hash_list(&mut hasher, b"stop_conditions", &self.stop_conditions);
+        hash_bindings(&mut hasher, &self.executable_bindings);
         hasher.finalize().to_hex().to_string()
     }
     pub fn applies_to(&self, brief: &DiagnosticBrief) -> bool {
@@ -721,14 +778,1891 @@ pub enum DoctorError {
     ApprovalRequired,
     #[error("diagnose-only recipes cannot declare effects")]
     DiagnoseEffects,
+    #[error("repair manifest is invalid")]
+    InvalidManifest,
+    #[error("operation reference is not bound to the supplied manifest")]
+    ManifestMismatch,
+    #[error("presented identity does not match the recomputed binding")]
+    IdentityMismatch,
+    #[error("verification evidence is not independently verified")]
+    NotIndependentlyVerified,
+    #[error("invalid disposition transition from {from} to {to}")]
+    InvalidDispositionTransition {
+        from: &'static str,
+        to: &'static str,
+    },
+    #[error("invalid executable binding in {0}")]
+    InvalidBinding(&'static str),
+}
+
+// ============================================================================
+// Wave A closed contract: immutable identities, registered operations,
+// separated verifier axes, and closed terminal dispositions.
+//
+// Everything below this marker is additive. The legacy open contract above
+// (`RepairRequest`, `KernelAdmission`, `invoke_once`, `AttemptReceipt` with
+// its `verified: bool`, `InvocationOutcome::Completed`) is preserved
+// untouched so the existing proofs keep compiling and passing.
+// ============================================================================
+
+/// Domain separator binding `RepairRecipeIdentity` digests to one meaning.
+pub const RECIPE_IDENTITY_DOMAIN: &str = "eliot.doctor.recipe.v1";
+/// Domain separator binding `RepairAttemptIdentity` digests to one meaning.
+pub const ATTEMPT_IDENTITY_DOMAIN: &str = "eliot.doctor.attempt.v1";
+/// Domain separator binding `RepairEffectIdentity` digests to one meaning.
+pub const EFFECT_IDENTITY_DOMAIN: &str = "eliot.doctor.effect.v1";
+/// Domain separator binding `RepairRecipeManifest` digests to one meaning.
+pub const MANIFEST_IDENTITY_DOMAIN: &str = "eliot.doctor.manifest.v1";
+
+/// Canonical encoding version for `RepairRecipeIdentity`.
+pub const RECIPE_IDENTITY_VERSION: u8 = 1;
+/// Canonical encoding version for `RepairAttemptIdentity`.
+pub const ATTEMPT_IDENTITY_VERSION: u8 = 1;
+/// Canonical encoding version for `RepairEffectIdentity`.
+pub const EFFECT_IDENTITY_VERSION: u8 = 1;
+/// Canonical encoding version for `RepairOperationRef` and its manifest.
+pub const OPERATION_REF_VERSION: u8 = 1;
+
+/// Immutable identity of one exact registered recipe revision.
+///
+/// The digest binds every load-bearing recipe field under an explicit
+/// domain separator and version, so it is deterministic across
+/// serialization and process restart, and changes whenever any
+/// load-bearing field changes. It carries no authority material:
+/// `Display`/`Debug` expose only the version and digest.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct RepairRecipeIdentity {
+    version: u8,
+    digest: String,
+}
+
+impl RepairRecipeIdentity {
+    /// Binds the exact recipe contract. Fails closed on an invalid recipe.
+    pub fn bind(recipe: &RepairRecipe) -> Result<Self, DoctorError> {
+        recipe.validate()?;
+        let mut hasher = Hasher::new();
+        hash_field(&mut hasher, b"domain", RECIPE_IDENTITY_DOMAIN.as_bytes());
+        hash_field(&mut hasher, b"version", &[RECIPE_IDENTITY_VERSION]);
+        hash_recipe_body(&mut hasher, recipe);
+        Ok(Self {
+            version: RECIPE_IDENTITY_VERSION,
+            digest: hasher.finalize().to_hex().to_string(),
+        })
+    }
+    pub fn version(&self) -> u8 {
+        self.version
+    }
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+    pub fn validate(&self) -> Result<(), DoctorError> {
+        if self.version != RECIPE_IDENTITY_VERSION {
+            return Err(DoctorError::IdentityMismatch);
+        }
+        hex_digest(&self.digest, "recipe identity digest")
+    }
+}
+
+impl std::fmt::Display for RepairRecipeIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "recipe.v{}:{}", self.version, self.digest)
+    }
+}
+
+/// Immutable identity of one exact admitted repair attempt.
+///
+/// Binds target (problem/component), recipe identity, closed operation,
+/// fence echo, approval, budget, and deadline. A changed load-bearing
+/// field yields a different identity, so replay under one identity with
+/// changed terms fails the binding check instead of executing.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct RepairAttemptIdentity {
+    version: u8,
+    digest: String,
+}
+
+/// Borrowed load-bearing fields bound into one `RepairAttemptIdentity`.
+///
+/// The fence echo is validated through the canonical `eliot-contracts`
+/// owner (`canonical_fence`); the optional lineaged `EpochId` binds the
+/// exact lineage where the fence is evaluated. Doctor never mints fence
+/// authority, it only binds the exact fence the Kernel admission carried.
+/// `Some` carries the live Kernel `EpochId` the T6-D1 admission cutover
+/// (issue #461) enforces at the Kernel gate: the fence is proven against
+/// that exact authority before any effect. `None` preserves the pre-cutover
+/// echo path for the D2 bins front-door slice, which must supply the live
+/// epoch (via `ClosedRepairRequest::bind_attempt_on_epoch`) once its
+/// dispatch arm lands; the Kernel admission path never passes `None`.
+#[derive(Clone, Copy, Debug)]
+pub struct AttemptIdentityBinding<'a> {
+    pub attempt_id: &'a str,
+    pub brief: &'a DiagnosticBrief,
+    pub recipe: &'a RepairRecipeIdentity,
+    pub operation: &'a RepairOperationRef,
+    pub fence: &'a StateFence,
+    pub epoch: Option<&'a EpochId>,
+    pub approval: Option<&'a str>,
+    pub budget_units: u64,
+    pub deadline: OffsetDateTime,
+}
+
+impl RepairAttemptIdentity {
+    /// Binds every load-bearing attempt field. Fails closed on invalid input.
+    ///
+    /// T6-D1 admission cutover (issue #461): the fence authority encoding
+    /// is re-derived from the canonical `eliot-contracts` owner
+    /// (`canonical_fence`), never trusted from the presented struct fields
+    /// as authority. The presented `fence.digest` is bound only as an
+    /// opaque echo for exact-replay comparison; the lineage-aware epoch
+    /// tuple and generation bound here come from the canonical encoding,
+    /// so a caller-supplied digest can neither mint nor widen authority.
+    pub fn bind(binding: &AttemptIdentityBinding<'_>) -> Result<Self, DoctorError> {
+        text(binding.attempt_id, "attempt id")?;
+        binding.brief.validate()?;
+        binding.recipe.validate()?;
+        binding.operation.validate()?;
+        let canonical = canonical_fence(binding.fence)?;
+        if let Some(epoch) = binding.epoch {
+            check_fence_against_epoch(binding.fence, epoch)?;
+        }
+        if let Some(approval) = binding.approval {
+            text(approval, "approval")?;
+        }
+        let mut hasher = Hasher::new();
+        hash_field(&mut hasher, b"domain", ATTEMPT_IDENTITY_DOMAIN.as_bytes());
+        hash_field(&mut hasher, b"version", &[ATTEMPT_IDENTITY_VERSION]);
+        hash_field(&mut hasher, b"attempt_id", binding.attempt_id.as_bytes());
+        hash_field(
+            &mut hasher,
+            b"problem_id",
+            binding.brief.problem_id.as_bytes(),
+        );
+        hash_field(
+            &mut hasher,
+            b"component",
+            binding.brief.component.as_bytes(),
+        );
+        hash_field(
+            &mut hasher,
+            b"recipe_digest",
+            binding.recipe.digest.as_bytes(),
+        );
+        hash_operation_ref(&mut hasher, binding.operation);
+        // Authority encoding re-derived from the canonical owner: the exact
+        // `(lineage_id, sequence)` tuple plus the canonical generation. The
+        // byte encoding is unchanged from the pre-cutover echo path (the
+        // canonical owner echoes these same values after validation), so
+        // valid admissions keep their identity digests; only the source of
+        // authority changes, from presented fields to canonical bytes.
+        hash_field(
+            &mut hasher,
+            b"authority_epoch_lineage",
+            canonical.authority_epoch.lineage_id.as_str().as_bytes(),
+        );
+        hash_field(
+            &mut hasher,
+            b"authority_epoch_sequence",
+            &canonical.authority_epoch.sequence.get().to_le_bytes(),
+        );
+        hash_field(
+            &mut hasher,
+            b"generation",
+            &canonical.resource_generation.value().to_le_bytes(),
+        );
+        // Opaque echo only: bound for exact-replay comparison, never as
+        // authority. Authority over this digest is not established here;
+        // the Kernel gate owns fence currency and lineage agreement.
+        hash_field(
+            &mut hasher,
+            b"fence_digest",
+            binding.fence.digest.as_bytes(),
+        );
+        match binding.approval {
+            Some(approval) => {
+                hash_field(&mut hasher, b"approval_present", &[1]);
+                hash_field(&mut hasher, b"approval", approval.as_bytes());
+            }
+            None => hash_field(&mut hasher, b"approval_present", &[0]),
+        }
+        hash_field(
+            &mut hasher,
+            b"budget_units",
+            &binding.budget_units.to_le_bytes(),
+        );
+        hash_field(
+            &mut hasher,
+            b"deadline_nanos",
+            &binding.deadline.unix_timestamp_nanos().to_le_bytes(),
+        );
+        Ok(Self {
+            version: ATTEMPT_IDENTITY_VERSION,
+            digest: hasher.finalize().to_hex().to_string(),
+        })
+    }
+    pub fn version(&self) -> u8 {
+        self.version
+    }
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+    pub fn validate(&self) -> Result<(), DoctorError> {
+        if self.version != ATTEMPT_IDENTITY_VERSION {
+            return Err(DoctorError::IdentityMismatch);
+        }
+        hex_digest(&self.digest, "attempt identity digest")
+    }
+}
+
+impl std::fmt::Display for RepairAttemptIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "attempt.v{}:{}", self.version, self.digest)
+    }
+}
+
+/// Immutable identity of one exact effect inside one exact attempt.
+///
+/// `effect_seq` distinguishes several effects of a single attempt; every
+/// other load-bearing field arrives through the bound attempt identity
+/// and the closed operation reference.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct RepairEffectIdentity {
+    version: u8,
+    digest: String,
+}
+
+impl RepairEffectIdentity {
+    /// Binds attempt identity, closed operation, and effect sequence.
+    pub fn bind(
+        attempt: &RepairAttemptIdentity,
+        operation: &RepairOperationRef,
+        effect_seq: u32,
+    ) -> Result<Self, DoctorError> {
+        attempt.validate()?;
+        operation.validate()?;
+        let mut hasher = Hasher::new();
+        hash_field(&mut hasher, b"domain", EFFECT_IDENTITY_DOMAIN.as_bytes());
+        hash_field(&mut hasher, b"version", &[EFFECT_IDENTITY_VERSION]);
+        hash_field(&mut hasher, b"attempt_digest", attempt.digest.as_bytes());
+        hash_operation_ref(&mut hasher, operation);
+        hash_field(&mut hasher, b"effect_seq", &effect_seq.to_le_bytes());
+        Ok(Self {
+            version: EFFECT_IDENTITY_VERSION,
+            digest: hasher.finalize().to_hex().to_string(),
+        })
+    }
+    pub fn version(&self) -> u8 {
+        self.version
+    }
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+    pub fn validate(&self) -> Result<(), DoctorError> {
+        if self.version != EFFECT_IDENTITY_VERSION {
+            return Err(DoctorError::IdentityMismatch);
+        }
+        hex_digest(&self.digest, "effect identity digest")
+    }
+}
+
+impl std::fmt::Display for RepairEffectIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "effect.v{}:{}", self.version, self.digest)
+    }
+}
+
+fn hash_recipe_body(hasher: &mut Hasher, recipe: &RepairRecipe) {
+    hash_field(hasher, b"recipe_id", recipe.recipe_id.as_bytes());
+    hash_field(hasher, b"revision", &recipe.revision.to_le_bytes());
+    hash_field(
+        hasher,
+        b"repair_class",
+        &[repair_class_tag(recipe.repair_class)],
+    );
+    hash_field(
+        hasher,
+        b"required_authority",
+        recipe.required_authority.as_bytes(),
+    );
+    hash_field(
+        hasher,
+        b"attempt_budget",
+        &recipe.attempt_budget.to_le_bytes(),
+    );
+    hash_field(
+        hasher,
+        b"cooldown_nanoseconds",
+        &recipe.cooldown.whole_nanoseconds().to_le_bytes(),
+    );
+    hash_set(hasher, b"problem_classes", &recipe.problem_classes);
+    hash_set(hasher, b"components", &recipe.components);
+    hash_set(hasher, b"allowed_effects", &recipe.allowed_effects);
+    hash_list(hasher, b"prerequisites", &recipe.prerequisites);
+    hash_list(hasher, b"operations", &recipe.operations);
+    hash_list(
+        hasher,
+        b"expected_observables",
+        &recipe.expected_observables,
+    );
+    hash_list(
+        hasher,
+        b"verification_contract",
+        &recipe.verification_contract,
+    );
+    hash_list(
+        hasher,
+        b"rollback_or_compensation",
+        &recipe.rollback_or_compensation,
+    );
+    hash_list(hasher, b"stop_conditions", &recipe.stop_conditions);
+    hash_bindings(hasher, &recipe.executable_bindings);
+}
+
+fn hash_bindings(hasher: &mut Hasher, bindings: &BTreeMap<String, ExecutableBinding>) {
+    hash_field(
+        hasher,
+        b"executable_bindings",
+        &(bindings.len() as u64).to_le_bytes(),
+    );
+    for (operation_id, binding) in bindings {
+        hash_field(hasher, b"bound_operation", operation_id.as_bytes());
+        hash_executable_binding(hasher, binding);
+    }
+}
+
+fn repair_class_tag(class: RepairClass) -> u8 {
+    match class {
+        RepairClass::AutomaticSafe => 0,
+        RepairClass::Guarded => 1,
+        RepairClass::DiagnoseOnly => 2,
+    }
+}
+
+fn hash_operation_ref(hasher: &mut Hasher, operation: &RepairOperationRef) {
+    hash_field(hasher, b"operation_ref_version", &[operation.version]);
+    hash_field(hasher, b"operation_id", operation.operation_id.as_bytes());
+    hash_field(hasher, b"adapter_id", operation.adapter_id.as_bytes());
+    hash_field(
+        hasher,
+        b"definition_digest",
+        operation.definition_digest.as_bytes(),
+    );
+    hash_field(
+        hasher,
+        b"manifest_digest",
+        operation.manifest_digest.as_bytes(),
+    );
+}
+
+/// Closed reference to one registered named effect operation.
+///
+/// Values are produced only by `RepairRecipeManifest::resolve` against an
+/// immutable Kernel/Governor-supplied manifest. There is no public
+/// constructor from free-form text, so an unregistered operation cannot be
+/// named here: resolution fails with `OperationNotAdmitted`.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct RepairOperationRef {
+    version: u8,
+    operation_id: String,
+    adapter_id: String,
+    definition_digest: String,
+    manifest_digest: String,
+}
+
+impl RepairOperationRef {
+    pub fn version(&self) -> u8 {
+        self.version
+    }
+    pub fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+    pub fn adapter_id(&self) -> &str {
+        &self.adapter_id
+    }
+    pub fn definition_digest(&self) -> &str {
+        &self.definition_digest
+    }
+    pub fn manifest_digest(&self) -> &str {
+        &self.manifest_digest
+    }
+    pub fn validate(&self) -> Result<(), DoctorError> {
+        if self.version != OPERATION_REF_VERSION {
+            return Err(DoctorError::ManifestMismatch);
+        }
+        text(&self.operation_id, "operation id")?;
+        text(&self.adapter_id, "adapter id")?;
+        hex_digest(&self.definition_digest, "operation definition digest")?;
+        hex_digest(&self.manifest_digest, "operation manifest digest")
+    }
+}
+
+/// Domain separator binding `ExecutableBinding` digests to one meaning.
+pub const EXECUTABLE_BINDING_DOMAIN: &str = "eliot.doctor.executable.v1";
+/// Canonical encoding version for `ExecutableBinding`.
+pub const EXECUTABLE_BINDING_VERSION: u8 = 1;
+/// Maximum program path length in bytes (relative to the installed
+/// generation root).
+pub const MAX_BINDING_PROGRAM_LEN: usize = 256;
+/// Maximum argv template entries (literals plus slots).
+pub const MAX_BINDING_ARGV_ENTRIES: usize = 64;
+/// Maximum length of one argv literal or one resolved slot value.
+pub const MAX_BINDING_ARGV_VALUE_LEN: usize = 256;
+/// Maximum env allowlist entries (explicit list, no inherit).
+pub const MAX_BINDING_ENV_ENTRIES: usize = 32;
+/// Maximum env name length in bytes.
+pub const MAX_BINDING_ENV_NAME_LEN: usize = 128;
+/// Maximum env value length in bytes.
+pub const MAX_BINDING_ENV_VALUE_LEN: usize = 1024;
+/// Maximum child wall timeout in milliseconds (30s).
+pub const MAX_BINDING_TIMEOUT_MS: u64 = 30_000;
+/// Maximum captured stdout/stderr bytes per stream (1MiB).
+pub const MAX_BINDING_OUTPUT_BYTES: u64 = 1_048_576;
+
+/// Closed slot filled only from `ClosedRepairRequest` typed fields.
+///
+/// Each variant names one validated request field with its bound: text slots
+/// re-validate via `text` (non-blank, no control) plus the argv value bound,
+/// numeric slots render as decimal and are bounded by their admission checks
+/// (`fence.generation` non-zero via the canonical fence, `budget_units`
+/// non-zero via the closed validation). No caller-bytes passthrough exists:
+/// the template is fixed in the admitted binding and slots resolve only here.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BindingSlot {
+    RequestId,
+    ProblemId,
+    Component,
+    FailureClass,
+    RecipeId,
+    FenceGeneration,
+    BudgetUnits,
+}
+
+/// One argv template fragment: a fixed literal from the admitted binding, or
+/// a closed slot filled from validated request fields.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BindingArg {
+    Literal { value: String },
+    Slot { slot: BindingSlot },
+}
+
+/// Closed executable binding for one registered named effect.
+///
+/// The program runs with its working directory always the installed
+/// generation root (never caller-supplied): `program` is a relative path
+/// below that root (absolute paths, `..` escape, and empty paths are
+/// rejected fail-closed). `artifact_digest` pins the exact installed package
+/// artifact bytes (lowercase SHA-256); the governed executor re-hashes the
+/// file before start. `argv` is a fixed template of literals plus closed
+/// slots (no caller-bytes passthrough). `env` is an explicit allowlist with
+/// no inheritance and no secret material. Timeouts and output caps are
+/// bounded. The canonical `digest()` binds every load-bearing field and is
+/// stored as the operation `definition_digest`, so Kernel admission binds it
+/// via the manifest and recipe digests.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExecutableBinding {
+    pub artifact_digest: String,
+    pub program: String,
+    pub argv: Vec<BindingArg>,
+    pub env: BTreeMap<String, String>,
+    pub timeout_ms: u64,
+    pub max_stdout_bytes: u64,
+    pub max_stderr_bytes: u64,
+}
+
+impl ExecutableBinding {
+    pub fn validate(&self) -> Result<(), DoctorError> {
+        hex_digest(&self.artifact_digest, "executable artifact digest")?;
+        validate_binding_program(&self.program)?;
+        if self.argv.len() > MAX_BINDING_ARGV_ENTRIES {
+            return Err(DoctorError::InvalidBinding("argv"));
+        }
+        for arg in &self.argv {
+            match arg {
+                BindingArg::Literal { value } => {
+                    if value.is_empty()
+                        || value.len() > MAX_BINDING_ARGV_VALUE_LEN
+                        || value.chars().any(char::is_control)
+                    {
+                        return Err(DoctorError::InvalidBinding("argv literal"));
+                    }
+                }
+                BindingArg::Slot { .. } => {}
+            }
+        }
+        if self.env.len() > MAX_BINDING_ENV_ENTRIES {
+            return Err(DoctorError::InvalidBinding("env"));
+        }
+        for (name, value) in &self.env {
+            validate_binding_env_name(name)?;
+            if value.len() > MAX_BINDING_ENV_VALUE_LEN
+                || value.chars().any(char::is_control)
+                || looks_like_secret_value(value)
+            {
+                return Err(DoctorError::InvalidBinding("env value"));
+            }
+        }
+        if self.timeout_ms == 0 || self.timeout_ms > MAX_BINDING_TIMEOUT_MS {
+            return Err(DoctorError::InvalidBinding("timeout"));
+        }
+        if self.max_stdout_bytes == 0
+            || self.max_stdout_bytes > MAX_BINDING_OUTPUT_BYTES
+            || self.max_stderr_bytes == 0
+            || self.max_stderr_bytes > MAX_BINDING_OUTPUT_BYTES
+        {
+            return Err(DoctorError::InvalidBinding("output caps"));
+        }
+        Ok(())
+    }
+    /// Canonical digest binding every load-bearing field.
+    pub fn digest(&self) -> String {
+        let mut hasher = Hasher::new();
+        hash_field(&mut hasher, b"domain", EXECUTABLE_BINDING_DOMAIN.as_bytes());
+        hash_field(&mut hasher, b"version", &[EXECUTABLE_BINDING_VERSION]);
+        hash_field(
+            &mut hasher,
+            b"artifact_digest",
+            self.artifact_digest.as_bytes(),
+        );
+        hash_field(&mut hasher, b"program", self.program.as_bytes());
+        hash_field(
+            &mut hasher,
+            b"argv_count",
+            &(self.argv.len() as u64).to_le_bytes(),
+        );
+        for arg in &self.argv {
+            match arg {
+                BindingArg::Literal { value } => {
+                    hash_field(&mut hasher, b"argv_literal", value.as_bytes());
+                }
+                BindingArg::Slot { slot } => {
+                    hash_field(
+                        &mut hasher,
+                        b"argv_slot",
+                        &[match slot {
+                            BindingSlot::RequestId => 0,
+                            BindingSlot::ProblemId => 1,
+                            BindingSlot::Component => 2,
+                            BindingSlot::FailureClass => 3,
+                            BindingSlot::RecipeId => 4,
+                            BindingSlot::FenceGeneration => 5,
+                            BindingSlot::BudgetUnits => 6,
+                        }],
+                    );
+                }
+            }
+        }
+        hash_field(
+            &mut hasher,
+            b"env_count",
+            &(self.env.len() as u64).to_le_bytes(),
+        );
+        for (name, value) in &self.env {
+            hash_field(&mut hasher, b"env_name", name.as_bytes());
+            hash_field(&mut hasher, b"env_value", value.as_bytes());
+        }
+        hash_field(&mut hasher, b"timeout_ms", &self.timeout_ms.to_le_bytes());
+        hash_field(
+            &mut hasher,
+            b"max_stdout_bytes",
+            &self.max_stdout_bytes.to_le_bytes(),
+        );
+        hash_field(
+            &mut hasher,
+            b"max_stderr_bytes",
+            &self.max_stderr_bytes.to_le_bytes(),
+        );
+        hasher.finalize().to_hex().to_string()
+    }
+    /// Resolves the fixed argv template against validated request fields.
+    ///
+    /// Literals pass through (they were validated at binding admission);
+    /// slots fill only from typed `ClosedRepairRequest` fields with bounds
+    /// (non-blank, no control, argv length bound; numerics from admission-
+    /// checked non-zero fields). No argv, stdin, or environment byte ever
+    /// enters here.
+    pub fn resolve_argv(&self, request: &ClosedRepairRequest) -> Result<Vec<String>, DoctorError> {
+        let mut out = Vec::with_capacity(self.argv.len());
+        for arg in &self.argv {
+            match arg {
+                BindingArg::Literal { value } => out.push(value.clone()),
+                BindingArg::Slot { slot } => {
+                    let value = match slot {
+                        BindingSlot::RequestId => request.request_id.clone(),
+                        BindingSlot::ProblemId => request.brief.problem_id.clone(),
+                        BindingSlot::Component => request.brief.component.clone(),
+                        BindingSlot::FailureClass => request.brief.failure_class.clone(),
+                        BindingSlot::RecipeId => request.recipe.recipe_id.clone(),
+                        BindingSlot::FenceGeneration => request.fence.generation.to_string(),
+                        BindingSlot::BudgetUnits => request.budget_units.to_string(),
+                    };
+                    if value.trim().is_empty()
+                        || value.len() > MAX_BINDING_ARGV_VALUE_LEN
+                        || value.chars().any(char::is_control)
+                    {
+                        return Err(DoctorError::InvalidBinding("argv slot"));
+                    }
+                    // Numeric slots must be admission-checked non-zero.
+                    match slot {
+                        BindingSlot::FenceGeneration if request.fence.generation == 0 => {
+                            return Err(DoctorError::InvalidBinding("argv slot"));
+                        }
+                        BindingSlot::BudgetUnits if request.budget_units == 0 => {
+                            return Err(DoctorError::InvalidBinding("argv slot"));
+                        }
+                        _ => {}
+                    }
+                    out.push(value);
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+fn validate_binding_program(program: &str) -> Result<(), DoctorError> {
+    if program.trim().is_empty() || program.len() > MAX_BINDING_PROGRAM_LEN {
+        return Err(DoctorError::InvalidBinding("program"));
+    }
+    if program.chars().any(char::is_control) {
+        return Err(DoctorError::InvalidBinding("program"));
+    }
+    // Absolute paths are rejected on both platforms: POSIX `/`, Windows
+    // `\`, UNC, and drive-letter (`C:`) prefixes. `Path::is_absolute` alone
+    // is platform-dependent, so the wire rules are enforced explicitly.
+    if program.starts_with('/') || program.starts_with('\\') {
+        return Err(DoctorError::InvalidBinding("program"));
+    }
+    let bytes = program.as_bytes();
+    if bytes.len() >= 2 && bytes[1] == b':' {
+        return Err(DoctorError::InvalidBinding("program"));
+    }
+    for segment in program.split(['/', '\\']) {
+        if segment.is_empty() || segment == "." || segment == ".." {
+            return Err(DoctorError::InvalidBinding("program"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_binding_env_name(name: &str) -> Result<(), DoctorError> {
+    if name.is_empty() || name.len() > MAX_BINDING_ENV_NAME_LEN {
+        return Err(DoctorError::InvalidBinding("env name"));
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+    {
+        return Err(DoctorError::InvalidBinding("env name"));
+    }
+    if !(name.as_bytes()[0].is_ascii_uppercase() || name.as_bytes()[0] == b'_') {
+        return Err(DoctorError::InvalidBinding("env name"));
+    }
+    let upper = name.to_ascii_uppercase();
+    for marker in [
+        "PASSWORD",
+        "PASSWD",
+        "TOKEN",
+        "SECRET",
+        "PRIVATE_KEY",
+        "API_KEY",
+        "CREDENTIAL",
+    ] {
+        if upper.contains(marker) {
+            return Err(DoctorError::InvalidBinding("env name"));
+        }
+    }
+    Ok(())
+}
+
+fn looks_like_secret_value(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.contains("bearer ") || lower.contains("sk-") || lower.contains("-----begin ")
+}
+
+fn hash_executable_binding(hasher: &mut Hasher, binding: &ExecutableBinding) {
+    hash_field(
+        hasher,
+        b"binding_artifact_digest",
+        binding.artifact_digest.as_bytes(),
+    );
+    hash_field(hasher, b"binding_program", binding.program.as_bytes());
+    hash_field(hasher, b"binding_digest", binding.digest().as_bytes());
+}
+
+/// One registered named operation inside a Kernel/Governor manifest.
+///
+/// `description` is human-readable and intentionally non-executable: it is
+/// never consulted for resolution, admission, or identity, and it is
+/// excluded from the manifest digest so editorial text changes cannot
+/// alter authority. `definition_digest` binds the executable meaning: it
+/// must equal `binding.digest()`, so the manifest and recipe digests bind
+/// the exact program, argv template, env allowlist, and caps.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RegisteredOperation {
+    pub operation_id: String,
+    pub adapter_id: String,
+    pub description: String,
+    pub definition_digest: String,
+    pub binding: ExecutableBinding,
+}
+
+impl RegisteredOperation {
+    pub fn validate(&self) -> Result<(), DoctorError> {
+        text(&self.operation_id, "operation id")?;
+        text(&self.adapter_id, "adapter id")?;
+        text(&self.description, "operation description")?;
+        hex_digest(&self.definition_digest, "operation definition digest")?;
+        self.binding.validate()?;
+        if self.definition_digest != self.binding.digest() {
+            return Err(DoctorError::InvalidManifest);
+        }
+        Ok(())
+    }
+}
+
+/// Immutable registry of named effect operations supplied by
+/// Kernel/Governor. Doctor resolves closed references against exactly one
+/// admitted manifest revision; caller-supplied operations are rejected.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RepairRecipeManifest {
+    pub manifest_id: String,
+    pub manifest_revision: u64,
+    pub operations: Vec<RegisteredOperation>,
+}
+
+impl RepairRecipeManifest {
+    pub fn validate(&self) -> Result<(), DoctorError> {
+        text(&self.manifest_id, "manifest id")?;
+        if self.manifest_revision == 0 || self.operations.is_empty() {
+            return Err(DoctorError::InvalidManifest);
+        }
+        let mut seen = BTreeSet::new();
+        for operation in &self.operations {
+            operation.validate()?;
+            if !seen.insert(operation.operation_id.clone()) {
+                return Err(DoctorError::InvalidManifest);
+            }
+        }
+        Ok(())
+    }
+    /// Digest of the load-bearing manifest content: identity, revision,
+    /// and every registered operation except its non-executable
+    /// description. The executable binding enters explicitly, so a tampered
+    /// program path or argv changes the digest and fails admission.
+    /// Deterministic across serialization and restart.
+    pub fn digest(&self) -> String {
+        let mut hasher = Hasher::new();
+        hash_field(&mut hasher, b"domain", MANIFEST_IDENTITY_DOMAIN.as_bytes());
+        hash_field(&mut hasher, b"version", &[OPERATION_REF_VERSION]);
+        hash_field(&mut hasher, b"manifest_id", self.manifest_id.as_bytes());
+        hash_field(
+            &mut hasher,
+            b"manifest_revision",
+            &self.manifest_revision.to_le_bytes(),
+        );
+        hash_field(
+            &mut hasher,
+            b"operation_count",
+            &(self.operations.len() as u64).to_le_bytes(),
+        );
+        for operation in &self.operations {
+            hash_field(
+                &mut hasher,
+                b"operation_id",
+                operation.operation_id.as_bytes(),
+            );
+            hash_field(&mut hasher, b"adapter_id", operation.adapter_id.as_bytes());
+            hash_field(
+                &mut hasher,
+                b"definition_digest",
+                operation.definition_digest.as_bytes(),
+            );
+            hash_executable_binding(&mut hasher, &operation.binding);
+        }
+        hasher.finalize().to_hex().to_string()
+    }
+    /// Resolves one registered name to a closed reference. An unregistered
+    /// name fails with `OperationNotAdmitted`; it can never execute.
+    pub fn resolve(&self, operation_id: &str) -> Result<RepairOperationRef, DoctorError> {
+        self.validate()?;
+        text(operation_id, "operation id")?;
+        let manifest_digest = self.digest();
+        self.operations
+            .iter()
+            .find(|operation| operation.operation_id == operation_id)
+            .map(|operation| RepairOperationRef {
+                version: OPERATION_REF_VERSION,
+                operation_id: operation.operation_id.clone(),
+                adapter_id: operation.adapter_id.clone(),
+                definition_digest: operation.definition_digest.clone(),
+                manifest_digest: manifest_digest.clone(),
+            })
+            .ok_or(DoctorError::OperationNotAdmitted)
+    }
+    /// Proves a reference is still admitted by exactly this manifest
+    /// revision: the name must resolve here and the bound definition and
+    /// manifest digests must match. A reference carried over from a changed
+    /// manifest fails with `ManifestMismatch`.
+    pub fn check_admitted(&self, operation: &RepairOperationRef) -> Result<(), DoctorError> {
+        operation.validate()?;
+        let expected = self.resolve(&operation.operation_id)?;
+        if expected == *operation {
+            Ok(())
+        } else {
+            Err(DoctorError::ManifestMismatch)
+        }
+    }
+}
+
+/// Stable operation id for the read-only installed-health probe.
+pub const HEALTH_PROBE_OPERATION_ID: &str = "probe-installed-health";
+/// Stable recipe id for the read-only installed-health probe.
+pub const HEALTH_PROBE_RECIPE_ID: &str = "probe-installed-health";
+/// Adapter carrying the health probe (the closed automatic-safe executor).
+pub const HEALTH_PROBE_ADAPTER_ID: &str = "automatic-safe";
+/// Relative program for the health probe below the installed generation
+/// root: the Doctor binary itself. The working directory is always the
+/// generation root, never caller-supplied.
+pub const HEALTH_PROBE_PROGRAM: &str = "eliot-doctor.exe";
+
+/// Builds the closed executable binding for the read-only installed-health
+/// probe from the installed package artifact digest.
+///
+/// The probe runs the installed Doctor binary with `--version` only: no
+/// writes, no shell, bounded timeout and output caps, empty env (no
+/// inherit). `artifact_digest` is the installed package artifact digest
+/// (lowercase SHA-256) from the installation manifest — never invented
+/// here. Fails closed on a malformed digest.
+pub fn health_probe_binding(artifact_digest: &str) -> Result<ExecutableBinding, DoctorError> {
+    let binding = ExecutableBinding {
+        artifact_digest: artifact_digest.to_owned(),
+        program: HEALTH_PROBE_PROGRAM.to_owned(),
+        argv: vec![BindingArg::Literal {
+            value: "--version".to_owned(),
+        }],
+        env: BTreeMap::new(),
+        timeout_ms: 5_000,
+        max_stdout_bytes: 65_536,
+        max_stderr_bytes: 65_536,
+    };
+    binding.validate()?;
+    Ok(binding)
+}
+
+/// Builds the admitted manifest revision carrying the health probe binding.
+pub fn health_probe_manifest(artifact_digest: &str) -> Result<RepairRecipeManifest, DoctorError> {
+    let binding = health_probe_binding(artifact_digest)?;
+    let operation = RegisteredOperation {
+        operation_id: HEALTH_PROBE_OPERATION_ID.to_owned(),
+        adapter_id: HEALTH_PROBE_ADAPTER_ID.to_owned(),
+        description: "read-only probe of the installed generation artifact digest and version line"
+            .to_owned(),
+        definition_digest: binding.digest(),
+        binding,
+    };
+    let manifest = RepairRecipeManifest {
+        manifest_id: "doctor-health-probe".to_owned(),
+        manifest_revision: 1,
+        operations: vec![operation],
+    };
+    manifest.validate()?;
+    Ok(manifest)
+}
+
+/// Builds the automatic-safe health probe recipe bound to the installed
+/// artifact digest.
+pub fn health_probe_recipe(artifact_digest: &str) -> Result<RepairRecipe, DoctorError> {
+    let binding = health_probe_binding(artifact_digest)?;
+    let recipe = RepairRecipe {
+        recipe_id: HEALTH_PROBE_RECIPE_ID.to_owned(),
+        revision: 1,
+        problem_classes: ["installed-health".to_owned()].into_iter().collect(),
+        components: ["doctor-generation".to_owned()].into_iter().collect(),
+        repair_class: RepairClass::AutomaticSafe,
+        prerequisites: Vec::new(),
+        required_authority: "kernel.doctor-recovery".to_owned(),
+        allowed_effects: [HEALTH_PROBE_OPERATION_ID.to_owned()].into_iter().collect(),
+        operations: vec![HEALTH_PROBE_OPERATION_ID.to_owned()],
+        expected_observables: vec!["version-line".to_owned()],
+        verification_contract: vec!["version-line-matches-admitted-artifact".to_owned()],
+        rollback_or_compensation: Vec::new(),
+        attempt_budget: 3,
+        cooldown: Duration::seconds(60),
+        stop_conditions: vec!["probe-failed".to_owned()],
+        executable_bindings: [(HEALTH_PROBE_OPERATION_ID.to_owned(), binding)]
+            .into_iter()
+            .collect(),
+    };
+    recipe.validate()?;
+    Ok(recipe)
+}
+
+/// Owned construction parameters for a `ClosedRepairRequest`.
+///
+/// `Debug` redacts the approval value (presence only): approval is
+/// authority material and must not leak into logs through derived output.
+#[derive(Clone)]
+pub struct ClosedRequestParams {
+    pub request_id: String,
+    pub brief: DiagnosticBrief,
+    pub recipe: RepairRecipe,
+    pub operations: Vec<RepairOperationRef>,
+    pub fence: StateFence,
+    pub lease: RecoveryLease,
+    pub approval: Option<String>,
+    pub budget_units: u64,
+    pub deadline: OffsetDateTime,
+    pub cancellation: bool,
+    pub escalation_target: String,
+}
+
+impl std::fmt::Debug for ClosedRequestParams {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ClosedRequestParams")
+            .field("request_id", &self.request_id)
+            .field("brief", &self.brief)
+            .field("recipe", &self.recipe)
+            .field("operations", &self.operations)
+            .field("fence", &self.fence)
+            .field("lease", &self.lease)
+            .field("approval", &self.approval.as_deref().map(|_| "<redacted>"))
+            .field("budget_units", &self.budget_units)
+            .field("deadline", &self.deadline)
+            .field("cancellation", &self.cancellation)
+            .field("escalation_target", &self.escalation_target)
+            .finish()
+    }
+}
+
+/// Repair request over closed operation references.
+///
+/// The legacy free-form `RepairRequest.operations: Vec<String>` stays for
+/// compatibility; this type carries only manifest-resolved
+/// `RepairOperationRef` values and a bound `RepairRecipeIdentity`, and its
+/// admission entry point is `validate_closed`. `Debug` redacts approval.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClosedRepairRequest {
+    pub request_id: String,
+    pub brief: DiagnosticBrief,
+    pub recipe: RepairRecipe,
+    pub recipe_identity: RepairRecipeIdentity,
+    pub operations: Vec<RepairOperationRef>,
+    pub fence: StateFence,
+    pub lease: RecoveryLease,
+    pub approval: Option<String>,
+    pub budget_units: u64,
+    pub deadline: OffsetDateTime,
+    pub cancellation: bool,
+    pub escalation_target: String,
+}
+
+impl std::fmt::Debug for ClosedRepairRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ClosedRepairRequest")
+            .field("request_id", &self.request_id)
+            .field("brief", &self.brief)
+            .field("recipe", &self.recipe)
+            .field("recipe_identity", &self.recipe_identity)
+            .field("operations", &self.operations)
+            .field("fence", &self.fence)
+            .field("lease", &self.lease)
+            .field("approval", &self.approval.as_deref().map(|_| "<redacted>"))
+            .field("budget_units", &self.budget_units)
+            .field("deadline", &self.deadline)
+            .field("cancellation", &self.cancellation)
+            .field("escalation_target", &self.escalation_target)
+            .finish()
+    }
+}
+
+impl ClosedRepairRequest {
+    fn assemble(params: ClosedRequestParams, for_effect: bool) -> Result<Self, DoctorError> {
+        let recipe_identity = RepairRecipeIdentity::bind(&params.recipe)?;
+        if for_effect {
+            // A diagnose-only recipe cannot open an effect path, by
+            // construction: there is no effect constructor for it.
+            if matches!(params.recipe.repair_class, RepairClass::DiagnoseOnly) {
+                return Err(DoctorError::DiagnoseEffects);
+            }
+            if params.operations.is_empty() {
+                return Err(DoctorError::MissingField("operations"));
+            }
+        } else if !params.operations.is_empty() {
+            return Err(DoctorError::DiagnoseEffects);
+        }
+        Ok(Self {
+            request_id: params.request_id,
+            brief: params.brief,
+            recipe: params.recipe,
+            recipe_identity,
+            operations: params.operations,
+            fence: params.fence,
+            lease: params.lease,
+            approval: params.approval,
+            budget_units: params.budget_units,
+            deadline: params.deadline,
+            cancellation: params.cancellation,
+            escalation_target: params.escalation_target,
+        })
+    }
+    /// Builds a diagnose-only request. Carrying any operation fails here,
+    /// before admission.
+    pub fn diagnose(params: ClosedRequestParams) -> Result<Self, DoctorError> {
+        Self::assemble(params, false)
+    }
+    /// Builds an effect-carrying request. A diagnose-only recipe fails
+    /// here: it cannot construct the effect path in this type.
+    pub fn for_effect(params: ClosedRequestParams) -> Result<Self, DoctorError> {
+        Self::assemble(params, true)
+    }
+    /// Closed admission check against one admitted manifest revision.
+    ///
+    /// Mirrors the legacy `RepairRequest::validate` shape checks, then
+    /// additionally proves: the stored recipe identity matches the recipe,
+    /// every operation is still admitted by this exact manifest, every
+    /// operation is covered by the recipe allow-list and the live lease,
+    /// and guarded approval is present. Identity binding of that approval
+    /// to one attempt is proven separately by `check_attempt_binding`.
+    pub fn validate_closed(
+        &self,
+        manifest: &RepairRecipeManifest,
+        now: OffsetDateTime,
+    ) -> Result<(), DoctorError> {
+        text(&self.request_id, "request id")?;
+        text(&self.escalation_target, "escalation target")?;
+        self.brief.validate()?;
+        self.recipe.validate()?;
+        canonical_fence(&self.fence)?;
+        self.lease.validate_at(now)?;
+        manifest.validate()?;
+        if RepairRecipeIdentity::bind(&self.recipe)? != self.recipe_identity {
+            return Err(DoctorError::IdentityMismatch);
+        }
+        if !self.recipe.applies_to(&self.brief) {
+            return Err(DoctorError::RecipeNotApplicable);
+        }
+        if self.deadline <= now || self.budget_units == 0 {
+            return Err(DoctorError::DeadlineOrBudget);
+        }
+        let diagnosis_only = matches!(self.recipe.repair_class, RepairClass::DiagnoseOnly);
+        if diagnosis_only && !self.operations.is_empty() {
+            return Err(DoctorError::DiagnoseEffects);
+        }
+        if !diagnosis_only && self.operations.is_empty() {
+            return Err(DoctorError::MissingField("operations"));
+        }
+        for operation in &self.operations {
+            manifest.check_admitted(operation)?;
+            if !self
+                .recipe
+                .allowed_effects
+                .contains(operation.operation_id())
+            {
+                return Err(DoctorError::EffectAuthorizationMismatch);
+            }
+            if !self.lease.permits(operation.operation_id()) {
+                return Err(DoctorError::EffectNotLeased(
+                    operation.operation_id().to_owned(),
+                ));
+            }
+            // The recipe binding for this operation must equal the admitted
+            // manifest binding: a tampered program path or argv changes the
+            // binding digest, hence the manifest digest and the recipe
+            // digest, and fails here instead of executing.
+            let Some(recipe_binding) = self
+                .recipe
+                .executable_bindings
+                .get(operation.operation_id())
+            else {
+                return Err(DoctorError::MissingField("executable bindings"));
+            };
+            let Some(manifest_operation) = manifest
+                .operations
+                .iter()
+                .find(|entry| entry.operation_id == *operation.operation_id())
+            else {
+                return Err(DoctorError::OperationNotAdmitted);
+            };
+            if *recipe_binding != manifest_operation.binding {
+                return Err(DoctorError::AdmissionMismatch);
+            }
+            if operation.definition_digest() != manifest_operation.binding.digest() {
+                return Err(DoctorError::AdmissionMismatch);
+            }
+        }
+        if matches!(self.recipe.repair_class, RepairClass::Guarded)
+            && self.approval.as_deref().is_none_or(str::is_empty)
+        {
+            return Err(DoctorError::ApprovalRequired);
+        }
+        Ok(())
+    }
+    /// Binds one attempt identity over this admitted request. The operation
+    /// must be one of the admitted closed operations; anything else,
+    /// including a free-form name, fails with `OperationNotAdmitted`.
+    ///
+    /// Pre-cutover echo path: the fence is validated for canonical shape
+    /// but is not proven against a live epoch here. The Kernel admission
+    /// gate never uses this path (it binds `RepairAttemptIdentity` directly
+    /// with the live `EpochId`); the D2 bins front-door slice must migrate
+    /// to `bind_attempt_on_epoch` with the live Kernel epoch once its
+    /// dispatch arm lands (residual for D2, issue #461).
+    pub fn bind_attempt(
+        &self,
+        manifest: &RepairRecipeManifest,
+        attempt_id: &str,
+        operation: &RepairOperationRef,
+        now: OffsetDateTime,
+    ) -> Result<RepairAttemptIdentity, DoctorError> {
+        self.bind_attempt_inner(manifest, attempt_id, operation, None, now)
+    }
+    /// Binds one attempt identity over this admitted request against the
+    /// live Kernel epoch (T6-D1 admission cutover, issue #461).
+    ///
+    /// Identical to `bind_attempt` except the fence is additionally proven
+    /// against the exact lineaged authority via `check_fence_against_epoch`
+    /// before any identity is minted, so a foreign lineage fails closed
+    /// here instead of binding. This is the constructor the Kernel-admitted
+    /// path must use; `epoch` is the live Kernel `EpochId`, never a value
+    /// taken from the request envelope.
+    pub fn bind_attempt_on_epoch(
+        &self,
+        manifest: &RepairRecipeManifest,
+        attempt_id: &str,
+        operation: &RepairOperationRef,
+        epoch: &EpochId,
+        now: OffsetDateTime,
+    ) -> Result<RepairAttemptIdentity, DoctorError> {
+        self.bind_attempt_inner(manifest, attempt_id, operation, Some(epoch), now)
+    }
+    fn bind_attempt_inner(
+        &self,
+        manifest: &RepairRecipeManifest,
+        attempt_id: &str,
+        operation: &RepairOperationRef,
+        epoch: Option<&EpochId>,
+        now: OffsetDateTime,
+    ) -> Result<RepairAttemptIdentity, DoctorError> {
+        self.validate_closed(manifest, now)?;
+        if !self.operations.contains(operation) {
+            return Err(DoctorError::OperationNotAdmitted);
+        }
+        RepairAttemptIdentity::bind(&AttemptIdentityBinding {
+            attempt_id,
+            brief: &self.brief,
+            recipe: &self.recipe_identity,
+            operation,
+            fence: &self.fence,
+            epoch,
+            approval: self.approval.as_deref(),
+            budget_units: self.budget_units,
+            deadline: self.deadline,
+        })
+    }
+    /// Proves a presented attempt identity binds exactly this request, this
+    /// operation, and this approval. A guarded approval bound to any other
+    /// attempt or effect fails with `ApprovalMismatch`; any other binding
+    /// drift fails with `IdentityMismatch`.
+    pub fn check_attempt_binding(
+        &self,
+        manifest: &RepairRecipeManifest,
+        attempt_id: &str,
+        operation: &RepairOperationRef,
+        presented: &RepairAttemptIdentity,
+        now: OffsetDateTime,
+    ) -> Result<(), DoctorError> {
+        let recomputed = self.bind_attempt(manifest, attempt_id, operation, now)?;
+        if recomputed == *presented {
+            Ok(())
+        } else if matches!(self.recipe.repair_class, RepairClass::Guarded) {
+            Err(DoctorError::ApprovalMismatch)
+        } else {
+            Err(DoctorError::IdentityMismatch)
+        }
+    }
+    /// Binds one effect identity inside an admitted attempt. The operation
+    /// must be admitted on this request; unregistered names cannot execute.
+    pub fn bind_effect(
+        &self,
+        attempt: &RepairAttemptIdentity,
+        operation: &RepairOperationRef,
+        effect_seq: u32,
+    ) -> Result<RepairEffectIdentity, DoctorError> {
+        attempt.validate()?;
+        if !self.operations.contains(operation) {
+            return Err(DoctorError::OperationNotAdmitted);
+        }
+        RepairEffectIdentity::bind(attempt, operation, effect_seq)
+    }
+}
+
+/// Effect execution and disposition axis: whether the effect ran and how it
+/// ended. `UnknownOutcome` is terminal for blind retry: only reconciliation
+/// by exact effect identity may disposition it further.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectDisposition {
+    NotExecuted,
+    Succeeded,
+    Failed,
+    Partial,
+    UnknownOutcome,
+}
+
+/// Process/adapter receipt axis: the receipt the executing adapter or
+/// process contour returned. Distinct from whether the effect worked and
+/// from whether anyone verified it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdapterReceiptStatus {
+    Absent,
+    Received(EvidenceHandle),
+    Refused,
+}
+
+impl AdapterReceiptStatus {
+    pub fn validate(&self) -> Result<(), DoctorError> {
+        if let Self::Received(handle) = self {
+            handle.validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// Verification execution axis: whether the verification contract ran.
+/// `Simulated` explicitly never verifies; only `Executed` can endorse.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationExecution {
+    NotExecuted,
+    Simulated,
+    Executed,
+    UnknownOutcome,
+}
+
+/// Evaluation outcome axis: what the executed verification concluded.
+/// Parser or exit success is not evaluation; only `Pass` can endorse.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvaluationOutcome {
+    Unassessed,
+    Pass,
+    Fail,
+    Inconclusive,
+    Stale,
+}
+
+/// Artifact/target binding axis: which exact target the verification
+/// evidence is bound to. Endorsement requires `BoundExact` naming the
+/// verified effect identity digest; anything weaker cannot verify.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactBinding {
+    Unbound,
+    BoundPartial { target_digest: String },
+    BoundExact { target_digest: String },
+}
+
+impl ArtifactBinding {
+    pub fn validate(&self) -> Result<(), DoctorError> {
+        match self {
+            Self::Unbound => Ok(()),
+            Self::BoundPartial { target_digest } | Self::BoundExact { target_digest } => {
+                hex_digest(target_digest, "artifact binding digest")
+            }
+        }
+    }
+    pub fn bound_exact_digest(&self) -> Option<&str> {
+        if let Self::BoundExact { target_digest } = self {
+            Some(target_digest)
+        } else {
+            None
+        }
+    }
+}
+
+/// Scope/fence/freshness axis: the fence the evidence was observed under
+/// and whether that fence is still current. The fence digest is an echo of
+/// Kernel-owned authority, never Doctor-minted state.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScopeAttestation {
+    pub fence_digest: String,
+    pub observed_at: OffsetDateTime,
+    pub fence_current: bool,
+}
+
+impl ScopeAttestation {
+    pub fn validate(&self) -> Result<(), DoctorError> {
+        hex_digest(&self.fence_digest, "scope fence digest")
+    }
+}
+
+/// Independence failure-domain classes, mirroring the evidence-axis
+/// vocabulary: independence names what actually changed between effect
+/// path and verifier path. A different prompt on the same route, a
+/// self-report, or a different model over the same evidence never
+/// satisfies the independent-owner requirement on its own.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndependenceClass {
+    SelfReported,
+    SamePath,
+    SameRouteNewPrompt,
+    DistinctModelSameEvidence,
+    DistinctObservationRoute,
+    DistinctImplementationOrToolchain,
+    DistinctFailureDomain,
+    DistinctAnalystOrTeam,
+    HumanObservation,
+    IndependentFormalChecker,
+}
+
+/// Independence profile axis: the non-ordinal set of failure-domain
+/// separations between the effect path and the verifier. Multiple labels
+/// may apply; strength is not a ladder.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IndependenceProfile {
+    classes: BTreeSet<IndependenceClass>,
+}
+
+impl IndependenceProfile {
+    pub fn new(classes: BTreeSet<IndependenceClass>) -> Result<Self, DoctorError> {
+        if classes.is_empty() {
+            return Err(DoctorError::MissingField("independence classes"));
+        }
+        Ok(Self { classes })
+    }
+    pub fn classes(&self) -> &BTreeSet<IndependenceClass> {
+        &self.classes
+    }
+    /// True only when the verifier ran through a genuinely separate
+    /// failure domain: a distinct observation route, implementation or
+    /// toolchain, failure domain, analyst or team, human observation, or
+    /// an independent formal checker.
+    pub fn is_independent_owner(&self) -> bool {
+        self.classes.iter().any(|class| {
+            matches!(
+                class,
+                IndependenceClass::DistinctObservationRoute
+                    | IndependenceClass::DistinctImplementationOrToolchain
+                    | IndependenceClass::DistinctFailureDomain
+                    | IndependenceClass::DistinctAnalystOrTeam
+                    | IndependenceClass::HumanObservation
+                    | IndependenceClass::IndependentFormalChecker
+            )
+        })
+    }
+}
+
+/// Cleanup/rollback disposition axis: whether compensation ran. Rollback is
+/// another registered effect with its own identity, tracked here only as
+/// disposition, never as an unchecked callback.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CleanupDisposition {
+    NotRequired,
+    Pending,
+    Complete,
+    Failed,
+}
+
+/// Separated verifier evidence for one verification run.
+///
+/// This replaces the collapsed `AttemptReceipt.verified: bool` (which is
+/// preserved untouched for compatibility) with the orthogonal axes:
+/// verification execution, evaluation, artifact binding, scope/fence/
+/// freshness, independence, and raw evidence handles. A value of this type
+/// is evidence, not proof: only `VerificationReport::endorse` can promote
+/// it to `IndependentVerification`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct VerifierEvidence {
+    pub verification_execution: VerificationExecution,
+    pub evaluation: EvaluationOutcome,
+    pub artifact_binding: ArtifactBinding,
+    pub scope: ScopeAttestation,
+    pub independence: IndependenceProfile,
+    pub evidence: Vec<EvidenceHandle>,
+}
+
+impl VerifierEvidence {
+    pub fn validate(&self) -> Result<(), DoctorError> {
+        self.artifact_binding.validate()?;
+        self.scope.validate()?;
+        if self.evidence.is_empty() {
+            return Err(DoctorError::MissingField("verification evidence"));
+        }
+        for handle in &self.evidence {
+            handle.validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// Verification report binding verifier evidence to one exact attempt and
+/// effect. The binding is structural here; endorsement checks it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct VerificationReport {
+    pub attempt: RepairAttemptIdentity,
+    pub effect: RepairEffectIdentity,
+    pub evidence: VerifierEvidence,
+    pub reported_at: OffsetDateTime,
+}
+
+impl VerificationReport {
+    pub fn validate(&self) -> Result<(), DoctorError> {
+        self.attempt.validate()?;
+        self.effect.validate()?;
+        self.evidence.validate()?;
+        Ok(())
+    }
+    /// Endorses this report as independently verified evidence bound to the
+    /// live fence. Every axis must hold at once: executed (never
+    /// simulated) verification, passing evaluation, exact binding to this
+    /// effect identity, a current scope under the expected fence digest, an
+    /// independent owner, and non-empty evidence handles. Any weaker
+    /// combination fails with `NotIndependentlyVerified` and stays visible
+    /// instead of becoming a verified repair.
+    pub fn endorse(&self, fence: &StateFence) -> Result<IndependentVerification, DoctorError> {
+        self.validate()?;
+        canonical_fence(fence)?;
+        let evidence = &self.evidence;
+        if !matches!(
+            evidence.verification_execution,
+            VerificationExecution::Executed
+        ) {
+            return Err(DoctorError::NotIndependentlyVerified);
+        }
+        if !matches!(evidence.evaluation, EvaluationOutcome::Pass) {
+            return Err(DoctorError::NotIndependentlyVerified);
+        }
+        match evidence.artifact_binding.bound_exact_digest() {
+            Some(digest) if digest == self.effect.digest() => {}
+            _ => return Err(DoctorError::NotIndependentlyVerified),
+        }
+        if !evidence.scope.fence_current || evidence.scope.fence_digest != fence.digest {
+            return Err(DoctorError::NotIndependentlyVerified);
+        }
+        if !evidence.independence.is_independent_owner() {
+            return Err(DoctorError::NotIndependentlyVerified);
+        }
+        Ok(IndependentVerification {
+            report: self.clone(),
+        })
+    }
+}
+
+/// Independently verified repair evidence, bound to one exact attempt and
+/// effect under a current fence.
+///
+/// The only way to obtain a value is `VerificationReport::endorse`, which
+/// enforces every verifier axis including failure-domain independence.
+/// Doctor's effect executor cannot produce one: the legacy `invoke_once`
+/// and any closed executor return pending dispositions only, and the only
+/// constructor of the verified terminal disposition takes this type.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IndependentVerification {
+    report: VerificationReport,
+}
+
+impl IndependentVerification {
+    pub fn report(&self) -> &VerificationReport {
+        &self.report
+    }
+    pub fn attempt(&self) -> &RepairAttemptIdentity {
+        &self.report.attempt
+    }
+    pub fn effect(&self) -> &RepairEffectIdentity {
+        &self.report.effect
+    }
+}
+
+/// Closed attempt receipt carrying the separated axes.
+///
+/// Unlike the legacy `AttemptReceipt` (preserved untouched), this receipt
+/// never collapses verification to a boolean: effect disposition, adapter
+/// receipt, full verification report, and cleanup disposition travel
+/// separately so each can be checked, and only an endorsed report can
+/// yield the verified terminal disposition.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct VerifiedAttempt {
+    pub attempt: RepairAttemptIdentity,
+    pub effect: RepairEffectIdentity,
+    pub effect_disposition: EffectDisposition,
+    pub adapter_receipt: AdapterReceiptStatus,
+    pub verification: VerificationReport,
+    pub cleanup: CleanupDisposition,
+    pub observed_at: OffsetDateTime,
+}
+
+impl VerifiedAttempt {
+    pub fn validate(&self) -> Result<(), DoctorError> {
+        self.attempt.validate()?;
+        self.effect.validate()?;
+        self.adapter_receipt.validate()?;
+        self.verification.validate()?;
+        if self.verification.attempt != self.attempt || self.verification.effect != self.effect {
+            return Err(DoctorError::IdentityMismatch);
+        }
+        Ok(())
+    }
+    pub fn endorse_verification(
+        &self,
+        fence: &StateFence,
+    ) -> Result<IndependentVerification, DoctorError> {
+        self.validate()?;
+        canonical_fence(fence)?;
+        self.verification.endorse(fence)
+    }
+}
+
+/// Why a component or attempt was quarantined. Quarantine is terminal for
+/// the attempt; only a new admission with a new identity may retry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuarantineCause {
+    BudgetExhausted,
+    CooldownActive,
+    RepeatedFailure,
+    UnknownOutcomeUnresolved,
+}
+
+/// Closed terminal dispositions for one Doctor attempt.
+///
+/// This replaces the ambiguous outer `Completed`, which could wrap a
+/// failed job, with one precise value per outcome. `RepairedVerified` is
+/// impossible inside the effect executor by construction: the only
+/// constructor is `repaired_verified`, which requires
+/// `IndependentVerification`, which requires an endorsed independent
+/// verifier report. The executor returns pending dispositions only.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DoctorDisposition {
+    Diagnosed {
+        request_id: String,
+    },
+    RepairedPendingVerification {
+        attempt: RepairAttemptIdentity,
+        effect: RepairEffectIdentity,
+    },
+    RepairedVerified {
+        proof: IndependentVerification,
+    },
+    RepairFailed {
+        attempt: RepairAttemptIdentity,
+        effect: Option<RepairEffectIdentity>,
+    },
+    Partial {
+        attempt: RepairAttemptIdentity,
+    },
+    UnknownEffectOutcome {
+        attempt: RepairAttemptIdentity,
+        reconciliation_key: String,
+    },
+    Reconciling {
+        attempt: RepairAttemptIdentity,
+        effect: RepairEffectIdentity,
+    },
+    Cancelled {
+        request_id: String,
+    },
+    Quarantined {
+        attempt: Option<RepairAttemptIdentity>,
+        cause: QuarantineCause,
+    },
+    Escalated {
+        request_id: String,
+        target: String,
+    },
+}
+
+impl DoctorDisposition {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Diagnosed { .. } => "diagnosed",
+            Self::RepairedPendingVerification { .. } => "repaired_pending_verification",
+            Self::RepairedVerified { .. } => "repaired_verified",
+            Self::RepairFailed { .. } => "repair_failed",
+            Self::Partial { .. } => "partial",
+            Self::UnknownEffectOutcome { .. } => "unknown_effect_outcome",
+            Self::Reconciling { .. } => "reconciling",
+            Self::Cancelled { .. } => "cancelled",
+            Self::Quarantined { .. } => "quarantined",
+            Self::Escalated { .. } => "escalated",
+        }
+    }
+    /// Terminal dispositions admit no outgoing transition.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::RepairedVerified { .. }
+                | Self::Cancelled { .. }
+                | Self::Quarantined { .. }
+                | Self::Escalated { .. }
+        )
+    }
+    pub fn validate(&self) -> Result<(), DoctorError> {
+        match self {
+            Self::Diagnosed { request_id } | Self::Cancelled { request_id } => {
+                text(request_id, "request id")
+            }
+            Self::Escalated { request_id, target } => {
+                text(request_id, "request id")?;
+                text(target, "escalation target")
+            }
+            Self::RepairedPendingVerification { attempt, effect }
+            | Self::Reconciling { attempt, effect } => {
+                attempt.validate()?;
+                effect.validate()
+            }
+            Self::RepairedVerified { proof } => proof.report().validate(),
+            Self::RepairFailed { attempt, effect } => {
+                attempt.validate()?;
+                if let Some(effect) = effect {
+                    effect.validate()?;
+                }
+                Ok(())
+            }
+            Self::Partial { attempt } => attempt.validate(),
+            Self::UnknownEffectOutcome {
+                attempt,
+                reconciliation_key,
+            } => {
+                attempt.validate()?;
+                text(reconciliation_key, "reconciliation key")
+            }
+            Self::Quarantined { attempt, .. } => {
+                if let Some(attempt) = attempt {
+                    attempt.validate()?;
+                }
+                Ok(())
+            }
+        }
+    }
+    /// The only constructor for the verified terminal disposition.
+    /// Independence was already proven to obtain `proof`; this call only
+    /// wraps it. Executor paths never call this: they return pending
+    /// dispositions only.
+    pub fn repaired_verified(proof: IndependentVerification) -> Self {
+        Self::RepairedVerified { proof }
+    }
+    /// Advances one closed disposition to the next along the governed
+    /// lifecycle. Terminal dispositions have no outgoing transition;
+    /// anything outside the lifecycle fails instead of inventing a state.
+    pub fn advance(self, next: Self) -> Result<Self, DoctorError> {
+        if valid_disposition_transition(&self, &next) {
+            Ok(next)
+        } else {
+            Err(DoctorError::InvalidDispositionTransition {
+                from: self.name(),
+                to: next.name(),
+            })
+        }
+    }
+    /// Maps a legacy `InvocationOutcome` to a closed disposition without
+    /// altering the legacy flow: `Completed` holding a succeeded job maps
+    /// to pending verification, never to verified, because the legacy
+    /// receipt carries no independent verifier evidence. A legacy
+    /// `Quarantined` job maps to budget exhaustion, which is the only path
+    /// in `record_attempt` that produces it. A legacy `Diagnosed` job that
+    /// already escalated maps to the escalation target it carries.
+    pub fn from_legacy_outcome(
+        outcome: &InvocationOutcome,
+        attempt: &RepairAttemptIdentity,
+        effect: &RepairEffectIdentity,
+    ) -> Result<Self, DoctorError> {
+        attempt.validate()?;
+        effect.validate()?;
+        match outcome {
+            InvocationOutcome::Diagnosed(job) => {
+                text(&job.job_id, "request id")?;
+                text(&job.request.escalation_target, "escalation target")?;
+                match job.state {
+                    JobState::Cancelled => Ok(Self::Cancelled {
+                        request_id: job.job_id.clone(),
+                    }),
+                    JobState::Escalated => Ok(Self::Escalated {
+                        request_id: job.job_id.clone(),
+                        target: job.request.escalation_target.clone(),
+                    }),
+                    _ => Ok(Self::Diagnosed {
+                        request_id: job.job_id.clone(),
+                    }),
+                }
+            }
+            InvocationOutcome::Completed(job) => {
+                text(&job.job_id, "request id")?;
+                match job.state {
+                    JobState::Succeeded => Ok(Self::RepairedPendingVerification {
+                        attempt: attempt.clone(),
+                        effect: effect.clone(),
+                    }),
+                    JobState::Failed => Ok(Self::RepairFailed {
+                        attempt: attempt.clone(),
+                        effect: Some(effect.clone()),
+                    }),
+                    JobState::Partial => Ok(Self::Partial {
+                        attempt: attempt.clone(),
+                    }),
+                    JobState::Quarantined => Ok(Self::Quarantined {
+                        attempt: Some(attempt.clone()),
+                        cause: QuarantineCause::BudgetExhausted,
+                    }),
+                    other => Err(DoctorError::InvalidDispositionTransition {
+                        from: "completed",
+                        to: job_state_name(other),
+                    }),
+                }
+            }
+            InvocationOutcome::ReconciliationRequired {
+                job,
+                reconciliation_key,
+            } => {
+                text(&job.job_id, "request id")?;
+                text(reconciliation_key, "reconciliation key")?;
+                Ok(Self::UnknownEffectOutcome {
+                    attempt: attempt.clone(),
+                    reconciliation_key: reconciliation_key.clone(),
+                })
+            }
+        }
+    }
+}
+
+fn job_state_name(state: JobState) -> &'static str {
+    match state {
+        JobState::Requested => "requested",
+        JobState::Admitted => "admitted",
+        JobState::Diagnosing => "diagnosing",
+        JobState::ReadyForRepair => "ready_for_repair",
+        JobState::Running => "running",
+        JobState::Verifying => "verifying",
+        JobState::Succeeded => "succeeded",
+        JobState::Failed => "failed",
+        JobState::Partial => "partial",
+        JobState::Cancelled => "cancelled",
+        JobState::Quarantined => "quarantined",
+        JobState::Escalated => "escalated",
+    }
+}
+
+fn valid_disposition_transition(from: &DoctorDisposition, to: &DoctorDisposition) -> bool {
+    matches!(
+        (from, to),
+        (
+            DoctorDisposition::Diagnosed { .. },
+            DoctorDisposition::Cancelled { .. } | DoctorDisposition::Escalated { .. },
+        ) | (
+            DoctorDisposition::RepairedPendingVerification { .. },
+            DoctorDisposition::RepairedVerified { .. }
+                | DoctorDisposition::RepairFailed { .. }
+                | DoctorDisposition::Partial { .. }
+                | DoctorDisposition::UnknownEffectOutcome { .. }
+                | DoctorDisposition::Cancelled { .. },
+        ) | (
+            DoctorDisposition::UnknownEffectOutcome { .. },
+            DoctorDisposition::Reconciling { .. }
+                | DoctorDisposition::Quarantined { .. }
+                | DoctorDisposition::Escalated { .. },
+        ) | (
+            DoctorDisposition::Reconciling { .. },
+            DoctorDisposition::RepairedPendingVerification { .. }
+                | DoctorDisposition::RepairFailed { .. }
+                | DoctorDisposition::Partial { .. }
+                | DoctorDisposition::Quarantined { .. }
+                | DoctorDisposition::Escalated { .. },
+        ) | (
+            DoctorDisposition::RepairFailed { .. },
+            DoctorDisposition::Quarantined { .. }
+                | DoctorDisposition::Escalated { .. }
+                | DoctorDisposition::Cancelled { .. },
+        ) | (
+            DoctorDisposition::Partial { .. },
+            DoctorDisposition::Quarantined { .. } | DoctorDisposition::Escalated { .. },
+        )
+    )
+}
+
+/// Computes the closed terminal disposition for one closed attempt receipt.
+///
+/// A successfully executed effect becomes `REPAIRED_VERIFIED` only when
+/// the attached verification report endorses under the live fence; weaker
+/// evidence stays `REPAIRED_PENDING_VERIFICATION` and remains visible
+/// instead of becoming a false verified repair. Unknown effect outcome
+/// carries the exact effect digest as its reconciliation key, so a later
+/// reconciliation must name the same effect and can never blind-retry a
+/// fresh one.
+pub fn disposition_for_verified_attempt(
+    receipt: &VerifiedAttempt,
+    fence: &StateFence,
+) -> Result<DoctorDisposition, DoctorError> {
+    receipt.validate()?;
+    canonical_fence(fence)?;
+    match receipt.effect_disposition {
+        EffectDisposition::Succeeded => match receipt.endorse_verification(fence) {
+            Ok(proof) => Ok(DoctorDisposition::repaired_verified(proof)),
+            Err(DoctorError::NotIndependentlyVerified) => {
+                Ok(DoctorDisposition::RepairedPendingVerification {
+                    attempt: receipt.attempt.clone(),
+                    effect: receipt.effect.clone(),
+                })
+            }
+            Err(other) => Err(other),
+        },
+        EffectDisposition::Failed | EffectDisposition::NotExecuted => {
+            Ok(DoctorDisposition::RepairFailed {
+                attempt: receipt.attempt.clone(),
+                effect: Some(receipt.effect.clone()),
+            })
+        }
+        EffectDisposition::Partial => Ok(DoctorDisposition::Partial {
+            attempt: receipt.attempt.clone(),
+        }),
+        EffectDisposition::UnknownOutcome => Ok(DoctorDisposition::UnknownEffectOutcome {
+            attempt: receipt.attempt.clone(),
+            reconciliation_key: receipt.effect.digest().to_owned(),
+        }),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::num::NonZeroU64;
+
+    use eliot_contracts::EpochLineageId;
+
+    /// Lineage-A fixture epoch for tests (canonical UUID lineage, no scalar).
+    fn test_epoch(sequence: u64) -> EpochId {
+        let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .expect("canonical test lineage-A");
+        EpochId::new(
+            lineage,
+            NonZeroU64::new(sequence).expect("non-zero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
 
     fn now() -> OffsetDateTime {
         OffsetDateTime::UNIX_EPOCH + Duration::seconds(100)
+    }
+
+    fn test_binding() -> ExecutableBinding {
+        let binding = ExecutableBinding {
+            artifact_digest: "a".repeat(64),
+            program: "eliot-doctor.exe".to_owned(),
+            argv: vec![BindingArg::Literal {
+                value: "--version".to_owned(),
+            }],
+            env: BTreeMap::new(),
+            timeout_ms: 5_000,
+            max_stdout_bytes: 65_536,
+            max_stderr_bytes: 65_536,
+        };
+        binding.validate().expect("test binding validates");
+        binding
     }
 
     fn request(class: RepairClass, effects: &[&str]) -> RepairRequest {
@@ -736,6 +2670,14 @@ mod tests {
             Vec::new()
         } else {
             effects.iter().map(|value| (*value).to_owned()).collect()
+        };
+        let executable_bindings = if matches!(class, RepairClass::DiagnoseOnly) {
+            BTreeMap::new()
+        } else {
+            effects
+                .iter()
+                .map(|effect| ((*effect).to_owned(), test_binding()))
+                .collect()
         };
         let recipe = RepairRecipe {
             recipe_id: "recipe".into(),
@@ -753,6 +2695,7 @@ mod tests {
             attempt_budget: 1,
             cooldown: Duration::ZERO,
             stop_conditions: vec!["stop".into()],
+            executable_bindings,
         };
         RepairRequest {
             request_id: "job-1".into(),
@@ -766,7 +2709,7 @@ mod tests {
                 unknowns: Vec::new(),
             },
             recipe,
-            fence: StateFence::new(1, 1, "b".repeat(64)).unwrap(),
+            fence: StateFence::new(test_epoch(1), 1, "b".repeat(64)).unwrap(),
             lease: RecoveryLease {
                 lease_id: "lease".into(),
                 owner: "kernel".into(),
@@ -837,7 +2780,7 @@ mod tests {
         let baseline = recipe.digest();
         assert_eq!(
             baseline,
-            "d29350b431ed108d5b7606ae6009b77711e3da50bb229d419b389bbbbe999cbd"
+            "9f2a3161046a93e068362e6fa7e411e964234ec8794a185008dc84bef811d6ee"
         );
 
         let mut changed = recipe.clone();
@@ -848,8 +2791,22 @@ mod tests {
         changed.operations.push("reconnect".into());
         assert_ne!(changed.digest(), baseline);
 
-        let mut changed = recipe;
+        let mut changed = recipe.clone();
         changed.components.insert("other-component".into());
+        assert_ne!(changed.digest(), baseline);
+
+        // The executable binding enters the digest: a tampered program path
+        // or timeout changes identity instead of executing silently.
+        let mut changed = recipe.clone();
+        if let Some(binding) = changed.executable_bindings.get_mut("restart") {
+            binding.program = "tampered.exe".to_owned();
+        }
+        assert_ne!(changed.digest(), baseline);
+
+        let mut changed = recipe;
+        if let Some(binding) = changed.executable_bindings.get_mut("restart") {
+            binding.timeout_ms = 1_000;
+        }
         assert_ne!(changed.digest(), baseline);
     }
 

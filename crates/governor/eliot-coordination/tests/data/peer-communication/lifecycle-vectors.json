@@ -1,0 +1,8 @@
+{
+  "deliver_id": "msg-life-1",
+  "consume_id": "msg-life-2",
+  "disconnect_id": "msg-life-3",
+  "reconnect_stream_work": "work-life",
+  "endpoint": "route-life-peer",
+  "evidence_handle": "evidence-read-life-2"
+}

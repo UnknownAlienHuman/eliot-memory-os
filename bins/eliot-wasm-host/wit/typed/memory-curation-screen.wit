@@ -1,0 +1,153 @@
+package eliot:current@0.1.0;
+
+// ELIOT typed current ABI — memory-curation-screen world.
+// Package: eliot:current@0.1.0. World: memory-curation-screen. Interface: screen.
+// Native owner: #586/#588 (eliot-memory-curation-contracts, eliot-memory-curation-screen).
+// Consumer: #642. Read-only generic eligibility/protection; no A-03 Curation
+// kind/handler selector leaks here. Rules: provenance-gap-v1, conflict-ambiguity-v1.
+
+interface screen {
+  type artifact-id = string;
+  type digest-hex = string;
+
+  enum eligibility-status {
+    eligible-for-semantic-curation,
+    ineligible-protected,
+    ineligible-malformed,
+    ineligible-stale,
+    ineligible-unavailable,
+    ineligible-partial,
+    unknown,
+  }
+
+  enum protection-decision {
+    protected,
+    unprotected,
+    protection-unknown,
+  }
+
+  enum finding-class {
+    provenance-gap,
+    conflict-ambiguity,
+  }
+
+  enum finding-proof {
+    deterministic,
+  }
+
+  enum source-availability {
+    available,
+    unavailable,
+    stale,
+    partial,
+    truncated,
+    unprocessed,
+  }
+
+  enum result-state {
+    complete,
+    partial,
+    incomplete,
+    unknown,
+  }
+
+  record source-member {
+    member-id: artifact-id,
+    provenance: list<artifact-id>,
+    conflict: list<artifact-id>,
+  }
+
+  record protection-assessment {
+    member-id: artifact-id,
+    decision: protection-decision,
+  }
+
+  record curation-finding {
+    finding-id: artifact-id,
+    member-id: artifact-id,
+    rule-id: string,
+    class: finding-class,
+    evidence: list<artifact-id>,
+    invariant: string,
+    proof: finding-proof,
+    digest: digest-hex,
+  }
+
+  record screen-coverage {
+    members: u32,
+    assessed: u32,
+    omitted: u32,
+  }
+
+  record screen-frontier {
+    cursor: option<string>,
+    remaining: u32,
+  }
+
+  record screen-result-body {
+    operation-id: string,
+    task-id: string,
+    scope-id: string,
+    fence-epoch: string,
+    fence-generation: u64,
+    eligibility: eligibility-status,
+    protection: list<protection-assessment>,
+    findings: list<curation-finding>,
+    coverage: screen-coverage,
+    frontier: screen-frontier,
+    state: result-state,
+    output-bytes: u32,
+    proof-ceiling: string,
+    result-digest: digest-hex,
+  }
+
+  record screen-request {
+    schema-revision: u32,
+    operation-id: string,
+    task-id: string,
+    scope-id: string,
+    fence-epoch: string,
+    fence-generation: u64,
+    source-id: string,
+    snapshot-revision: string,
+    members: list<source-member>,
+    availability: source-availability,
+    profile-id: string,
+    rule-ids: list<string>,
+    deadline-ms: option<s64>,
+    cancelled: bool,
+    predecessor-digest: option<digest-hex>,
+  }
+
+  variant screen-outcome {
+    screened(screen-result-body),
+  }
+
+  record abi-descriptor {
+    world-name: string,
+    package-id: string,
+    abi-revision: u32,
+    native-contract: string,
+    native-revision: string,
+    abi-digest: string,
+  }
+
+  variant screen-error {
+    malformed(screen-malformed),
+    cancelled-screen(screen-cancelled),
+    unsupported-schema(screen-schema),
+    internal(screen-internal),
+  }
+
+  record screen-malformed { field: string, human-detail: string }
+  record screen-cancelled { human-detail: string }
+  record screen-schema { want-revision: u32, got-revision: u32, human-detail: string }
+  record screen-internal { human-detail: string }
+
+  screen: func(request: screen-request) -> result<screen-outcome, screen-error>;
+  describe: func() -> abi-descriptor;
+}
+
+world memory-curation-screen {
+  export screen;
+}

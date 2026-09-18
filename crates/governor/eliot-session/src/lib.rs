@@ -10,7 +10,7 @@
 
 use std::collections::BTreeMap;
 
-use eliot_contracts::{AuthorityEpoch, ClockReading, SessionId, StateFence};
+use eliot_contracts::{ClockReading, EpochId, SessionId, StateFence};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -100,7 +100,7 @@ pub struct AgentSession {
     pub expires_at: u64,
     pub status: SessionState,
     pub policy_snapshot_id: String,
-    pub authority_epoch: AuthorityEpoch,
+    pub authority_epoch: EpochId,
     pub state_fence: StateFence,
 }
 
@@ -120,7 +120,7 @@ pub struct RegisterSession {
     pub capability_profile_id: String,
     pub parent_session_id: Option<SessionId>,
     pub policy_snapshot_id: String,
-    pub authority_epoch: AuthorityEpoch,
+    pub authority_epoch: EpochId,
     pub state_fence: StateFence,
     pub now: u64,
     pub expires_at: u64,
@@ -147,7 +147,7 @@ pub struct SessionCommandContext {
     pub event_id: String,
     pub actor_ref: String,
     pub state_fence: StateFence,
-    pub authority_epoch: AuthorityEpoch,
+    pub authority_epoch: EpochId,
     pub observed_at: ClockReading,
     pub now: u64,
 }
@@ -160,7 +160,7 @@ pub struct SessionHeartbeat {
     pub session_id: SessionId,
     pub actor_ref: String,
     pub state_fence: StateFence,
-    pub authority_epoch: AuthorityEpoch,
+    pub authority_epoch: EpochId,
     pub observed_at: ClockReading,
     pub now: u64,
     pub expires_at: u64,
@@ -179,7 +179,7 @@ pub struct SessionLifecycleEvent {
     pub to: SessionState,
     pub command: Option<SessionCommand>,
     pub state_fence: StateFence,
-    pub authority_epoch: AuthorityEpoch,
+    pub authority_epoch: EpochId,
     pub observed_at: ClockReading,
 }
 
@@ -203,7 +203,7 @@ enum RequestResult {
 /// Deterministic, recoverable owner of all governed session transitions.
 #[derive(Clone, Debug)]
 pub struct SessionLifecycleOwner {
-    authority_epoch: AuthorityEpoch,
+    authority_epoch: EpochId,
     state_fence: StateFence,
     next_sequence: u64,
     sessions: BTreeMap<SessionId, AgentSession>,
@@ -213,14 +213,11 @@ pub struct SessionLifecycleOwner {
 
 impl SessionLifecycleOwner {
     /// Creates an empty owner at the genesis causal sequence.
-    pub fn new(
-        authority_epoch: AuthorityEpoch,
-        state_fence: StateFence,
-    ) -> Result<Self, SessionError> {
+    pub fn new(authority_epoch: EpochId, state_fence: StateFence) -> Result<Self, SessionError> {
         state_fence
             .validate()
             .map_err(|_| SessionError::FenceMismatch)?;
-        if authority_epoch != state_fence.authority_epoch {
+        if !authority_epoch.is_same_authority(&state_fence.authority_epoch) {
             return Err(SessionError::EpochMismatch);
         }
         Ok(Self {
@@ -235,11 +232,11 @@ impl SessionLifecycleOwner {
 
     /// Rebuilds an owner from a canonical snapshot and rejects malformed order.
     pub fn from_snapshot(
-        authority_epoch: AuthorityEpoch,
+        authority_epoch: EpochId,
         state_fence: StateFence,
         snapshot: SessionLifecycleSnapshot,
     ) -> Result<Self, SessionError> {
-        let mut owner = Self::new(authority_epoch, state_fence)?;
+        let mut owner = Self::new(authority_epoch.clone(), state_fence)?;
         if snapshot.next_sequence == 0
             || snapshot.next_sequence != snapshot.events.len() as u64 + 1
             || snapshot
@@ -251,7 +248,7 @@ impl SessionLifecycleOwner {
             return Err(SessionError::CausalSequenceMismatch);
         }
         for session in snapshot.sessions.values() {
-            if session.authority_epoch != authority_epoch
+            if !session.authority_epoch.is_same_authority(&authority_epoch)
                 || session.state_fence != owner.state_fence
                 || session.expires_at < session.heartbeat_at
             {
@@ -327,7 +324,7 @@ impl SessionLifecycleOwner {
         text(&req.project_scope, "project_scope")?;
         text(&req.capability_profile_id, "capability_profile_id")?;
         text(&req.policy_snapshot_id, "policy_snapshot_id")?;
-        self.check_fence(req.authority_epoch, &req.state_fence)?;
+        self.check_fence(req.authority_epoch.clone(), &req.state_fence)?;
         if req.expires_at <= req.now {
             return Err(SessionError::InvalidDeadline);
         }
@@ -358,7 +355,7 @@ impl SessionLifecycleOwner {
             expires_at: req.expires_at,
             status: SessionState::Registering,
             policy_snapshot_id: req.policy_snapshot_id,
-            authority_epoch: req.authority_epoch,
+            authority_epoch: req.authority_epoch.clone(),
             state_fence: req.state_fence.clone(),
         };
         let event = self.emit(
@@ -458,7 +455,7 @@ impl SessionLifecycleOwner {
             event_id: req.event_id.clone(),
             actor_ref: req.actor_ref.clone(),
             state_fence: req.state_fence.clone(),
-            authority_epoch: req.authority_epoch,
+            authority_epoch: req.authority_epoch.clone(),
             observed_at: req.observed_at,
             now: req.now,
         })?;
@@ -494,7 +491,7 @@ impl SessionLifecycleOwner {
             session.status,
             None,
             req.state_fence.clone(),
-            req.authority_epoch,
+            req.authority_epoch.clone(),
             req.observed_at,
         );
         let record = self
@@ -518,11 +515,13 @@ impl SessionLifecycleOwner {
             .observed_at
             .validate()
             .map_err(|_| SessionError::InvalidClock)?;
-        self.check_fence(context.authority_epoch, &context.state_fence)
+        self.check_fence(context.authority_epoch.clone(), &context.state_fence)
     }
 
-    fn check_fence(&self, epoch: AuthorityEpoch, fence: &StateFence) -> Result<(), SessionError> {
-        if epoch != self.authority_epoch || epoch != fence.authority_epoch {
+    fn check_fence(&self, epoch: EpochId, fence: &StateFence) -> Result<(), SessionError> {
+        if !epoch.is_same_authority(&self.authority_epoch)
+            || !epoch.is_same_authority(&fence.authority_epoch)
+        {
             return Err(SessionError::EpochMismatch);
         }
         if fence != &self.state_fence {
@@ -542,7 +541,7 @@ impl SessionLifecycleOwner {
         to: SessionState,
         command: Option<SessionCommand>,
         state_fence: StateFence,
-        authority_epoch: AuthorityEpoch,
+        authority_epoch: EpochId,
         observed_at: ClockReading,
     ) -> SessionLifecycleEvent {
         let event = SessionLifecycleEvent {

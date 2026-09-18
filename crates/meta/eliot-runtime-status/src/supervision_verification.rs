@@ -393,7 +393,10 @@ pub(super) fn verify_host_supervision_bundle(
         || current_binding.activation_id.as_str() != journaled_incarnation.activation_id
         || current_binding.activation_generation.value()
             != journaled_incarnation.activation_generation.sequence
-        || current_binding.kernel_epoch.value() != journaled_incarnation.kernel_generation.sequence
+        || current_binding.kernel_epoch.lineage_id.as_str()
+            != journaled_incarnation.kernel_generation.lineage_id.as_str()
+        || current_binding.kernel_epoch.sequence.get()
+            != journaled_incarnation.kernel_generation.sequence
         || current_binding.observation_scope != journaled_incarnation.observation_scope
         || current_binding.watchdog_epoch.value() != journaled_incarnation.watchdog_epoch.sequence
         || current_binding.wake_policy != journaled_incarnation.wake_policy

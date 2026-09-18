@@ -183,6 +183,7 @@ impl AssessmentResult {
     }
 
     /// Validate both canonical owner records and the local digest.
+    #[allow(clippy::too_many_lines)]
     pub fn validate(&self) -> Result<(), crate::ActivationAssessmentError> {
         crate::bounds::bounded_serialized_len(
             self,
@@ -193,6 +194,12 @@ impl AssessmentResult {
             .policy
             .validate_shape()
             .map_err(|field| crate::ActivationAssessmentError::Bound { field })?;
+        crate::bounds::ensure_unique_refs(&self.input.attrition, "attrition")?;
+        crate::bounds::ensure_unique_refs(&self.input.confounders, "confounders")?;
+        crate::bounds::ensure_unique_refs(
+            &self.input.external_review_refs,
+            "external_review_refs",
+        )?;
         crate::assessment::validate_supplied_evidence(
             &self.input.metrics,
             &self.input.stages,

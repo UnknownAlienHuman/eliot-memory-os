@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sha2::Digest;
 
 use super::{
-    ActivePhaseBRebindIntent, AuthorityEpoch, AuthoritySnapshotBindingWire, CandidateManifest,
+    ActivePhaseBRebindIntent, AuthoritySnapshotBindingWire, CandidateManifest,
     CredentialAccessReceipt, DispatchAuthorityId, EpochIdentity, EpochLineage, HostError,
     HostInstallationEpoch, HostPhaseBMaterialization, HostPhaseBMaterializationIntent,
     HostPhaseBMaterializationReceipt, HostPhaseBPreparedReceipt, LOCAL_SERVICE_SID, OpaqueLabel,
@@ -14,6 +14,38 @@ use super::{
     installation_phase_b_host_state_root_digest, installation_phase_b_watchdog_selector_digest,
     observe_named_pipe_peer_process,
 };
+
+#[cfg(windows)]
+// F-LOG-HOST-5 (#980) inner-phase observations for current projection.
+//
+// Through the #889 facade only
+// (`crate::host_diagnostics::observe_entrypoint_with_detail`); the Event Log
+// seam stays typed-Unavailable
+// (`crate::windows_event_log::event_log_sink_status`), never implemented here
+// (#984 still open).
+//
+// Observation-only contract (mirrors `host_composition_phase_b.rs:30-41`):
+// every call projects a boundary already decided by the semantic owner.
+// Arguments are static literals only — no digests, identities, bytes, or
+// error text are formatted, so no secret material can cross (I15.4) and no
+// extra evaluation runs on the semantic path. Sink outcome never alters
+// result, order, or cleanup. No terminal emission here: one terminal per
+// failed operation stays with the outermost contour (`lib.rs`
+// `HostTerminalGuard` / `host-phase-b-unknown`), while these inner phases
+// correlate by stage order only.
+#[cfg(windows)]
+fn phase_b_projection_note_event_log_unavailable() {
+    let _ = crate::windows_event_log::event_log_sink_status();
+}
+
+#[cfg(windows)]
+fn phase_b_projection_observe(detail: &str) {
+    phase_b_projection_note_event_log_unavailable();
+    crate::host_diagnostics::observe_entrypoint_with_detail(
+        crate::host_diagnostics::EntrypointStage::ScmDispatch,
+        detail,
+    );
+}
 
 #[cfg(windows)]
 pub(super) fn phase_b_manifest_digest(
@@ -54,7 +86,7 @@ pub(super) fn host_process_identity_digest_for_host(
                 format!(
                     "eliot.host.test-support-process.v1\0{}\0{}\0{}",
                     image.to_string_lossy(),
-                    host.epoch.current.lineage,
+                    host.epoch.current.lineage_id,
                     host.epoch.current.sequence,
                 )
                 .as_bytes(),
@@ -82,9 +114,11 @@ pub(super) fn validate_phase_b_credential_receipt(
     manifest: &CandidateManifest,
     intent: &HostPhaseBMaterializationIntent,
 ) -> Result<(), HostError> {
-    receipt
-        .validate()
-        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+    phase_b_projection_observe("host.phase-b projection requested");
+    receipt.validate().map_err(|error| {
+        phase_b_projection_observe("host.phase-b projection mismatch retained");
+        HostError::RecoveryRequired(error.to_string())
+    })?;
     if receipt.transaction_id != intent.transaction_id
         || receipt.effect_id != intent.credential_effect_id
         || receipt.generation != manifest.runtime_launch.authority_generation
@@ -94,6 +128,7 @@ pub(super) fn validate_phase_b_credential_receipt(
         || receipt.scope != StoreCredentialScope::LocalService
         || receipt.principal_sid.as_str() != LOCAL_SERVICE_SID
     {
+        phase_b_projection_observe("host.phase-b projection mismatch retained");
         return Err(HostError::RecoveryRequired(
             "Phase-B credential receipt is not the exact LocalService receipt for the candidate"
                 .to_owned(),
@@ -140,7 +175,9 @@ pub(super) fn phase_b_prepared_public_receipt(
     host: &HostInstallationEpoch,
     pending: Option<&eliot_installation::PendingActivation>,
 ) -> Result<HostPhaseBPreparedReceipt, HostError> {
+    phase_b_projection_observe("host.phase-b projection requested");
     if materialization.request_digest.as_ref() != Some(&intent.request_digest) {
+        phase_b_projection_observe("host.phase-b projection mismatch retained");
         return Err(HostError::RecoveryRequired(
             "Host Phase-B receipt is not bound to the requested transaction effect".to_owned(),
         ));
@@ -232,9 +269,11 @@ pub(super) fn phase_b_public_receipt_from_binding(
     credential_receipt: &CredentialAccessReceipt,
     pending: Option<&eliot_installation::PendingActivation>,
 ) -> Result<HostPhaseBMaterializationReceipt, HostError> {
-    credential_receipt
-        .validate()
-        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+    phase_b_projection_observe("host.phase-b projection requested");
+    credential_receipt.validate().map_err(|error| {
+        phase_b_projection_observe("host.phase-b projection mismatch retained");
+        HostError::RecoveryRequired(error.to_string())
+    })?;
     if binding.manifest_digest != intent.candidate_manifest_digest
         || binding.effect_id != intent.effect_id
         || binding.credential_receipt_digest != intent.credential_receipt_digest
@@ -245,6 +284,7 @@ pub(super) fn phase_b_public_receipt_from_binding(
         || phase_b_credential_receipt_digest(credential_receipt)?
             != binding.credential_receipt_digest
     {
+        phase_b_projection_observe("host.phase-b projection mismatch retained");
         return Err(HostError::RecoveryRequired(
             "persisted Phase-B receipt is bound to a different request".to_owned(),
         ));
@@ -290,6 +330,7 @@ fn validate_bridge_binding(
                 .map_err(HostError::Installation)?;
             if pending.phase_b_agent_bridge_stage_prepared.as_ref() != Some(&bridge.stage_prepared)
             {
+                phase_b_projection_observe("host.phase-b projection mismatch retained");
                 return Err(HostError::RecoveryRequired(
                     "Phase-B bridge proof does not match the durable stage carrier".to_owned(),
                 ));
@@ -297,9 +338,12 @@ fn validate_bridge_binding(
             Ok(())
         }
         (Some(_), Some(bridge), None) => bridge.validate().map_err(HostError::Installation),
-        _ => Err(HostError::RecoveryRequired(
-            "Phase-B bridge proof is absent or substituted for the exact intent".to_owned(),
-        )),
+        _ => {
+            phase_b_projection_observe("host.phase-b projection mismatch retained");
+            Err(HostError::RecoveryRequired(
+                "Phase-B bridge proof is absent or substituted for the exact intent".to_owned(),
+            ))
+        }
     }
 }
 
@@ -315,20 +359,19 @@ pub(super) fn phase_b_build_authority_descriptor(
         .map_err(|error| HostError::ProcessContour(error.to_string()))?;
     let record_id = OperationIdentity::new(intent.static_template.record_id.as_str())
         .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-    let lineage_id = OpaqueLabel::new(host.epoch.current.lineage.as_str())
+    let lineage_id = OpaqueLabel::new(host.epoch.current.lineage_id.as_str())
         .map_err(|error| HostError::ProcessContour(error.to_string()))?;
     let authority_epoch = EpochLineage {
         current: OrsEpochIdentity {
             lineage_id,
-            epoch: host.epoch.current.sequence,
+            epoch: host.epoch.current.sequence.get(),
         },
         predecessor: None,
     };
-    let authority = AuthorityEpoch::new(host.epoch.current.sequence)
-        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-    let state_fence = StateFence::new(authority, runtime.authority_generation);
-    let snapshot_fence = StateFenceSnapshot::capture(&state_fence, host.epoch.current.sequence)
-        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    let state_fence = StateFence::new(host.epoch.current.clone(), runtime.authority_generation);
+    let snapshot_fence =
+        StateFenceSnapshot::capture(&state_fence, host.epoch.current.sequence.get())
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| HostError::ProcessContour(error.to_string()))?
@@ -397,20 +440,19 @@ pub(super) fn phase_b_build_authority_descriptor_for_rebind(
         .map_err(|error| HostError::ProcessContour(error.to_string()))?;
     let record_id = OperationIdentity::new(intent.static_template.record_id.as_str())
         .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-    let lineage_id = OpaqueLabel::new(host.epoch.current.lineage.as_str())
+    let lineage_id = OpaqueLabel::new(host.epoch.current.lineage_id.as_str())
         .map_err(|error| HostError::ProcessContour(error.to_string()))?;
     let authority_epoch = EpochLineage {
         current: OrsEpochIdentity {
             lineage_id,
-            epoch: host.epoch.current.sequence,
+            epoch: host.epoch.current.sequence.get(),
         },
         predecessor: None,
     };
-    let authority = AuthorityEpoch::new(host.epoch.current.sequence)
-        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-    let state_fence = StateFence::new(authority, runtime.authority_generation);
-    let snapshot_fence = StateFenceSnapshot::capture(&state_fence, host.epoch.current.sequence)
-        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    let state_fence = StateFence::new(host.epoch.current.clone(), runtime.authority_generation);
+    let snapshot_fence =
+        StateFenceSnapshot::capture(&state_fence, host.epoch.current.sequence.get())
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| HostError::ProcessContour(error.to_string()))?
@@ -475,11 +517,11 @@ pub(super) fn phase_b_authority_marker(
 ) -> Result<PlatformHandle, HostError> {
     let fields = [
         host.installation.as_str().to_owned(),
-        host.epoch.current.lineage.as_str().to_owned(),
+        host.epoch.current.lineage_id.as_str().to_owned(),
         host.epoch.current.sequence.to_string(),
         host.nonce.as_str().to_owned(),
         manifest_digest.as_str().to_owned(),
-        activation_generation.lineage.as_str().to_owned(),
+        activation_generation.lineage_id.as_str().to_owned(),
         activation_generation.sequence.to_string(),
         descriptor.generation.value().to_string(),
     ];

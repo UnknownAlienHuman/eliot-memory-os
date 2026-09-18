@@ -1,0 +1,67 @@
+schema_version = 4
+module_id = "governor.memory.projection-provider"
+crate = "eliot-memory-projection-provider"
+status = "PROTOTYPE"
+wave = "cognitive-micromodules-wave-01"
+agent_order = 46
+plane = "Governor"
+runtime_layer = "R5"
+delivery_depth = "D3b"
+source_layer = "C1"
+runtime_bundle = "eliotd"
+state_class = "stateless"
+hot_path = false
+lifecycle_owner = "governor.memory.projection-provider"
+loc_soft_ceiling = 10000
+loc_policy = "review ceiling only; causal cohesion, proof, owner, build/test closure and replacement boundary decide topology"
+product_objective = "Smart receives one bounded, fenced, denominator-explicit memory read set instead of store access."
+causal_property = "bounded canonical memory projection"
+old_failure_or_missing_capability = "no Governor-owned memory read set exists, so Smart would have to query storage or invent role prose (CC-008)."
+discriminator = "fence-incompatible, scope-mismatched, and over-bound observations become explicit omissions/frontier, never silent loss or filler"
+primary_responsibility = "Project admitted memory observations into one bounded MemoryProjectionBatch under a shared binding."
+owned_mutable_state = []
+allowed_effects = []
+inputs = ["MemoryScopeBinding", "admitted memory observations", "projection revision", "observed denominator total"]
+outputs = ["MemoryProjectionBatch"]
+depends_on = ["eliot-memory-projection-contracts", "eliot-contracts", "eliot-evidence", "eliot-receipts"]
+providers = ["Governor read side (admitted observations; store read-through deferred to MGR04)"]
+consumers = ["memory applicability evaluator"]
+non_goals = ["store reads", "canonical writes", "retrieval scoring", "second graphs", "promotion decisions"]
+invariants = ["one binding governs the batch", "every observed item is projected, omitted, or frontier-named", "denominator equals supplied volume", "no storage or vendor types"]
+failure_behavior = "Reject denominator contradictions and over-bound intake explicitly; per-observation skips become named omissions."
+proof_surface = ["happy-path projection", "fence/scope omission", "bound truncation with frontier", "denominator contradiction", "shared fixtures with the evaluator"]
+proof_ceiling = "STATIC_CONTRACT_REGISTRATION_ONLY"
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+replacement_boundary = "implementation behind the declared public contract; package ownership creates no runtime or semantic authority"
+merge_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
+split_trigger = "a second causal responsibility, mutable owner, independent proof surface or independent rollback boundary appears"
+
+[[donor]]
+path = "crates/governor/eliot-read/src/lib.rs"
+disposition = "reuse the Governor read-projection posture read-only; no store, journal, or credential path is referenced"
+
+[agent_task]
+objective = "Project admitted observations into the bounded memory read set without store access."
+write_scope = ["crates/governor/eliot-memory-projection-provider/**"]
+deliverables = ["bounded projection provider", "omission/truncation fixtures", "shared evaluator fixtures"]
+acceptance = ["one declared responsibility only", "bounded deterministic behavior", "visible local degradation"]
+forbidden = ["canonical writes outside the named Governor transition path", "truth/support/authority/policy/finish/effect promotion", "SurrealDB SDK, raw queries, Host journal, or credential handling", "vendor or storage types in public contracts", "unbounded synchronous work", "silent truncation", "oracle or verifier weakening in the same work unit", "implicit scope widening", "active-generation self-modification"]
+stop_condition = "Stop and return ContractChallenge when the work needs another owner, store execution, or hidden state."
+challenge_path = "return ContractChallenge to the integration owner when owner, discriminator, proof ceiling or dependency boundary is wrong"
+integration_owner = "cognitive-wave-integrator"
+implementation_language = "Rust 2024"
+required_verification = ["module/package proof at the declared proof ceiling", "real provider/consumer fixture for every changed edge", "the named Product Pulse before promotion", "exact donor reuse/rewrite/reject trace"]
+writeback = "return implementation artifact, exact proof evidence, donor disposition, unresolved ContractChallenges and merge/remove recommendation"
+workspace_admission = "forbidden until implementation, package proof, affected Edge proof, current-main rebase and integration-owner review"
+
+# Acceptance is decided by the owning contract and independent review
+# (I0.10: line/test/type counts are not goals). `scripts/verify-work-unit.py`
+# is a retired legacy diagnostic that always reports completion=NOT_VERIFIED
+# and never accepts a work unit. This table names the concrete contract and
+# the required exports/tests plus small behaviour checks the reviewer verifies.
+[acceptance]
+require_deny_unknown_fields = true
+forbid_unsafe = true
+required_exports = []
+required_tests = []
+forbidden_patterns = ['serde_json::Value', 'unimplemented!', 'todo!']

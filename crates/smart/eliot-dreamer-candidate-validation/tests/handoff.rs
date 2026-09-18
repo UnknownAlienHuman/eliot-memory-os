@@ -1,22 +1,33 @@
 #![allow(clippy::unwrap_used)]
 
-use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence, sha256_hex};
+use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence, sha256_hex};
+use std::num::NonZeroU64;
 use eliot_dreamer_candidate_validation::{
     CandidateValidationOutcome, ValidationPolicy, validate_grounded_dream_draft_at,
 };
 use eliot_dreamer_contracts::candidate::DimensionVerdict;
 use eliot_dreamer_contracts::{
     BudgetLimits, BudgetUsage, BundleCompleteness, BundleMaterial, ClaimResidue, DreamInputBundle,
-    DreamJobInput, GroundedDreamDraft, JobClass, ModelDraft, OmissionHandle,
+    DreamJobAdmission, GroundedDreamDraft, JobClass, ModelDraft, OmissionHandle,
     PRESERVATION_DIMENSIONS, PreservationDimension, PreservationReport, Requester, RequesterOrigin,
     SourceDisposition, SupportState, canonical_bytes, digest_hex,
 };
 
 const MAX: u64 = 1_048_576;
 
+fn fence() -> StateFence {
+    let epoch = EpochId::new(
+        EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .expect("canonical test lineage-A"),
+        NonZeroU64::new(1).expect("non-zero test sequence"),
+    )
+    .expect("valid test epoch");
+    StateFence::new(epoch, ResourceGeneration::genesis())
+}
+
 #[allow(clippy::too_many_lines)]
 fn fixture() -> (
-    DreamJobInput,
+    DreamJobAdmission,
     DreamInputBundle,
     ModelDraft,
     GroundedDreamDraft,
@@ -24,7 +35,7 @@ fn fixture() -> (
     BudgetUsage,
     PreservationReport,
 ) {
-    let job = DreamJobInput {
+    let job = DreamJobAdmission {
         schema_version: 1,
         job_class: JobClass::Orientation,
         requester: Requester {
@@ -36,7 +47,7 @@ fn fixture() -> (
         idempotency_key: "idempotency-1".to_owned(),
         task_id: "task-1".to_owned(),
         scope_id: "scope-1".to_owned(),
-        state_fence: StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis()),
+        state_fence: fence(),
         privacy_profile: "local_only".to_owned(),
         contract_ref: "contract-1".to_owned(),
         policy_ref: "policy-1".to_owned(),
@@ -154,7 +165,7 @@ fn accepted_and_partial_results_bind_through_a03_and_keep_receipt_bytes() {
     let receipt_bytes = canonical_bytes(&candidate.validated.receipt).unwrap();
     assert_eq!(
         digest_hex(&receipt_bytes),
-        "5365d5d88946309c7f4cf65660074b7bcb058751408055758f082803fd00b09f"
+        "584f7acf347035fbc16ca54d9d7e95811c70d12c52b99654a3defa06950e2c99"
     );
 
     let (job, bundle, model, mut grounded, policy, usage, preservation) = fixture();

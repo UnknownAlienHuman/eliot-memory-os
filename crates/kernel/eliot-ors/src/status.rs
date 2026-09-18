@@ -693,7 +693,9 @@ mod tests {
     use std::sync::OnceLock;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence};
+    use eliot_contracts::{
+        AuthorityEpoch, EpochId, EpochLineageId, ResourceGeneration, StateFence,
+    };
     use eliot_runtime_contracts::{
         Ed25519SupervisionLeaseSigner, HealthDimension, LeaseState, RegisteredActivityWakePolicy,
         SupervisionGenerationBinding, SupervisionLeaseActiveStateBinding, SupervisionLeaseSigner,
@@ -721,6 +723,21 @@ mod tests {
 
     fn label(v: &str) -> OpaqueLabel {
         OpaqueLabel::new(v).unwrap()
+    }
+
+    // Canonical `EpochId` fixture (Implements #64): lineage-aware exact tuple.
+    // Scalar `AuthorityEpoch` fixtures below are retained only for fields whose
+    // owning contract still declares the scalar contour (`host_epoch`,
+    // `watchdog_epoch`, `revocation_epoch`); `kernel_epoch` and every
+    // `StateFence` take this canonical tuple.
+    const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn test_epoch(lineage: &str, sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(lineage).expect("valid test lineage"),
+            std::num::NonZeroU64::new(sequence).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch")
     }
 
     fn test_time(offset_ms: u64) -> u64 {
@@ -753,7 +770,7 @@ mod tests {
             host_epoch: AuthorityEpoch::new(1).unwrap(),
             activation_id: label("activation-1"),
             activation_generation: ResourceGeneration::new(1).unwrap(),
-            kernel_epoch: AuthorityEpoch::new(2).unwrap(),
+            kernel_epoch: test_epoch(TEST_LINEAGE_A, 2),
             watchdog_epoch: AuthorityEpoch::new(1).unwrap(),
             generation_binding: SupervisionGenerationBinding {
                 target_id: "target-1".to_owned(),
@@ -764,7 +781,7 @@ mod tests {
                 process_generation: ResourceGeneration::new(1).unwrap(),
             },
             state_fence: StateFence::new(
-                AuthorityEpoch::new(2).unwrap(),
+                test_epoch(TEST_LINEAGE_A, 2),
                 ResourceGeneration::new(1).unwrap(),
             ),
             issued_at_ms: issued,
@@ -820,7 +837,7 @@ mod tests {
             host_epoch: payload.host_epoch,
             activation_id: payload.activation_id.clone(),
             activation_generation: payload.activation_generation,
-            kernel_epoch: payload.kernel_epoch,
+            kernel_epoch: payload.kernel_epoch.clone(),
             watchdog_epoch: payload.watchdog_epoch,
             state_fence: payload.state_fence.clone(),
             scope_ref: payload.scope_ref.clone(),
@@ -937,10 +954,10 @@ mod tests {
             host_epoch: AuthorityEpoch::new(1).unwrap(),
             activation_id: "activation-1".to_owned(),
             activation_generation: ResourceGeneration::new(1).unwrap(),
-            kernel_epoch: AuthorityEpoch::new(2).unwrap(),
+            kernel_epoch: test_epoch(TEST_LINEAGE_A, 2),
             watchdog_epoch: AuthorityEpoch::new(1).unwrap(),
             state_fence: StateFence::new(
-                AuthorityEpoch::new(2).unwrap(),
+                test_epoch(TEST_LINEAGE_A, 2),
                 ResourceGeneration::new(1).unwrap(),
             ),
             scope_ref: "scope-supervision".to_owned(),
@@ -998,10 +1015,10 @@ mod tests {
             host_epoch: AuthorityEpoch::new(1).unwrap(),
             activation_id: "activation-1".to_owned(),
             activation_generation: ResourceGeneration::new(1).unwrap(),
-            kernel_epoch: AuthorityEpoch::new(2).unwrap(),
+            kernel_epoch: test_epoch(TEST_LINEAGE_A, 2),
             watchdog_epoch: AuthorityEpoch::new(1).unwrap(),
             state_fence: StateFence::new(
-                AuthorityEpoch::new(2).unwrap(),
+                test_epoch(TEST_LINEAGE_A, 2),
                 ResourceGeneration::new(1).unwrap(),
             ),
             scope_ref: "scope-supervision".to_owned(),
@@ -1081,7 +1098,7 @@ mod tests {
                 host_epoch: payload.host_epoch,
                 activation_id: payload.activation_id.clone(),
                 activation_generation: payload.activation_generation,
-                kernel_epoch: payload.kernel_epoch,
+                kernel_epoch: payload.kernel_epoch.clone(),
                 watchdog_epoch: payload.watchdog_epoch,
                 state_fence: payload.state_fence.clone(),
                 scope_ref: payload.scope_ref.clone(),
@@ -1159,7 +1176,7 @@ mod tests {
             host_epoch: payload.host_epoch,
             activation_id: payload.activation_id.clone(),
             activation_generation: payload.activation_generation,
-            kernel_epoch: payload.kernel_epoch,
+            kernel_epoch: payload.kernel_epoch.clone(),
             watchdog_epoch: payload.watchdog_epoch,
             state_fence: payload.state_fence.clone(),
             scope_ref: payload.scope_ref.clone(),
@@ -1230,7 +1247,7 @@ mod tests {
             host_epoch: payload.host_epoch,
             activation_id: payload.activation_id.clone(),
             activation_generation: payload.activation_generation,
-            kernel_epoch: payload.kernel_epoch,
+            kernel_epoch: payload.kernel_epoch.clone(),
             watchdog_epoch: payload.watchdog_epoch,
             state_fence: payload.state_fence.clone(),
             scope_ref: payload.scope_ref.clone(),
@@ -1300,7 +1317,7 @@ mod tests {
             host_epoch: payload.host_epoch,
             activation_id: payload.activation_id.clone(),
             activation_generation: payload.activation_generation,
-            kernel_epoch: payload.kernel_epoch,
+            kernel_epoch: payload.kernel_epoch.clone(),
             watchdog_epoch: payload.watchdog_epoch,
             state_fence: payload.state_fence.clone(),
             scope_ref: payload.scope_ref.clone(),
@@ -1382,7 +1399,7 @@ mod tests {
             host_epoch: payload.host_epoch,
             activation_id: payload.activation_id.clone(),
             activation_generation: payload.activation_generation,
-            kernel_epoch: payload.kernel_epoch,
+            kernel_epoch: payload.kernel_epoch.clone(),
             watchdog_epoch: payload.watchdog_epoch,
             state_fence: payload.state_fence.clone(),
             scope_ref: payload.scope_ref.clone(),
@@ -1455,7 +1472,7 @@ mod tests {
             host_epoch: payload.host_epoch,
             activation_id: payload.activation_id.clone(),
             activation_generation: payload.activation_generation,
-            kernel_epoch: payload.kernel_epoch,
+            kernel_epoch: payload.kernel_epoch.clone(),
             watchdog_epoch: payload.watchdog_epoch,
             state_fence: payload.state_fence.clone(),
             scope_ref: payload.scope_ref.clone(),
@@ -1527,10 +1544,10 @@ mod tests {
             host_epoch: AuthorityEpoch::new(1).unwrap(),
             activation_id: "activation-1".to_owned(),
             activation_generation: ResourceGeneration::new(1).unwrap(),
-            kernel_epoch: AuthorityEpoch::new(2).unwrap(),
+            kernel_epoch: test_epoch(TEST_LINEAGE_A, 2),
             watchdog_epoch: AuthorityEpoch::new(1).unwrap(),
             state_fence: StateFence::new(
-                AuthorityEpoch::new(2).unwrap(),
+                test_epoch(TEST_LINEAGE_A, 2),
                 ResourceGeneration::new(1).unwrap(),
             ),
             scope_ref: "scope-supervision".to_owned(),
@@ -1601,10 +1618,10 @@ mod tests {
             host_epoch: AuthorityEpoch::new(1).unwrap(),
             activation_id: "activation-1".to_owned(),
             activation_generation: ResourceGeneration::new(1).unwrap(),
-            kernel_epoch: AuthorityEpoch::new(2).unwrap(),
+            kernel_epoch: test_epoch(TEST_LINEAGE_A, 2),
             watchdog_epoch: AuthorityEpoch::new(1).unwrap(),
             state_fence: StateFence::new(
-                AuthorityEpoch::new(2).unwrap(),
+                test_epoch(TEST_LINEAGE_A, 2),
                 ResourceGeneration::new(1).unwrap(),
             ),
             scope_ref: "scope-supervision".to_owned(),
@@ -1677,10 +1694,10 @@ mod tests {
             host_epoch: AuthorityEpoch::new(1).unwrap(),
             activation_id: "activation-1".to_owned(),
             activation_generation: ResourceGeneration::new(1).unwrap(),
-            kernel_epoch: AuthorityEpoch::new(2).unwrap(),
+            kernel_epoch: test_epoch(TEST_LINEAGE_A, 2),
             watchdog_epoch: AuthorityEpoch::new(1).unwrap(),
             state_fence: StateFence::new(
-                AuthorityEpoch::new(2).unwrap(),
+                test_epoch(TEST_LINEAGE_A, 2),
                 ResourceGeneration::new(1).unwrap(),
             ),
             scope_ref: "scope-supervision".to_owned(),
@@ -1760,7 +1777,7 @@ mod tests {
             host_epoch: payload.host_epoch,
             activation_id: payload.activation_id.clone(),
             activation_generation: payload.activation_generation,
-            kernel_epoch: payload.kernel_epoch,
+            kernel_epoch: payload.kernel_epoch.clone(),
             watchdog_epoch: payload.watchdog_epoch,
             state_fence: payload.state_fence.clone(),
             scope_ref: payload.scope_ref.clone(),
@@ -1810,7 +1827,7 @@ mod tests {
                     host_epoch: AuthorityEpoch::new(1).unwrap(),
                     activation_id: label("activation-1"),
                     activation_generation: ResourceGeneration::new(1).unwrap(),
-                    kernel_epoch: AuthorityEpoch::new(2).unwrap(),
+                    kernel_epoch: test_epoch(TEST_LINEAGE_A, 2),
                     watchdog_epoch: AuthorityEpoch::new(1).unwrap(),
                     generation_binding: SupervisionGenerationBinding {
                         target_id: "target-1".to_owned(),
@@ -1821,7 +1838,7 @@ mod tests {
                         process_generation: ResourceGeneration::new(1).unwrap(),
                     },
                     state_fence: StateFence::new(
-                        AuthorityEpoch::new(2).unwrap(),
+                        test_epoch(TEST_LINEAGE_A, 2),
                         ResourceGeneration::new(1).unwrap(),
                     ),
                     issued_at_ms: test_time(100),
@@ -1858,10 +1875,10 @@ mod tests {
             host_epoch: AuthorityEpoch::new(1).unwrap(),
             activation_id: "activation-1".to_owned(),
             activation_generation: ResourceGeneration::new(1).unwrap(),
-            kernel_epoch: AuthorityEpoch::new(2).unwrap(),
+            kernel_epoch: test_epoch(TEST_LINEAGE_A, 2),
             watchdog_epoch: AuthorityEpoch::new(1).unwrap(),
             state_fence: StateFence::new(
-                AuthorityEpoch::new(2).unwrap(),
+                test_epoch(TEST_LINEAGE_A, 2),
                 ResourceGeneration::new(1).unwrap(),
             ),
             scope_ref: "scope-supervision".to_owned(),
@@ -1945,7 +1962,7 @@ mod tests {
                 host_epoch: payload.host_epoch,
                 activation_id: payload.activation_id.clone(),
                 activation_generation: payload.activation_generation,
-                kernel_epoch: payload.kernel_epoch,
+                kernel_epoch: payload.kernel_epoch.clone(),
                 watchdog_epoch: payload.watchdog_epoch,
                 state_fence: payload.state_fence.clone(),
                 scope_ref: payload.scope_ref.clone(),
@@ -1979,7 +1996,7 @@ mod tests {
             host_epoch: payload.host_epoch,
             activation_id: payload.activation_id.clone(),
             activation_generation: payload.activation_generation,
-            kernel_epoch: payload.kernel_epoch,
+            kernel_epoch: payload.kernel_epoch.clone(),
             watchdog_epoch: payload.watchdog_epoch,
             state_fence: payload.state_fence.clone(),
             scope_ref: payload.scope_ref.clone(),
@@ -2340,7 +2357,7 @@ mod tests {
                 host_epoch: payload.host_epoch,
                 activation_id: payload.activation_id.clone(),
                 activation_generation: payload.activation_generation,
-                kernel_epoch: payload.kernel_epoch,
+                kernel_epoch: payload.kernel_epoch.clone(),
                 watchdog_epoch: payload.watchdog_epoch,
                 state_fence: payload.state_fence.clone(),
                 scope_ref: payload.scope_ref.clone(),
@@ -2391,7 +2408,7 @@ mod tests {
                 host_epoch: payload.host_epoch,
                 activation_id: payload.activation_id.clone(),
                 activation_generation: payload.activation_generation,
-                kernel_epoch: payload.kernel_epoch,
+                kernel_epoch: payload.kernel_epoch.clone(),
                 watchdog_epoch: payload.watchdog_epoch,
                 state_fence: payload.state_fence.clone(),
                 scope_ref: payload.scope_ref.clone(),
@@ -2461,7 +2478,7 @@ mod tests {
             host_epoch: payload.host_epoch,
             activation_id: payload.activation_id.clone(),
             activation_generation: payload.activation_generation,
-            kernel_epoch: payload.kernel_epoch,
+            kernel_epoch: payload.kernel_epoch.clone(),
             watchdog_epoch: payload.watchdog_epoch,
             state_fence: payload.state_fence.clone(),
             scope_ref: payload.scope_ref.clone(),
@@ -2751,7 +2768,7 @@ mod tests {
                 host_epoch: payload.host_epoch,
                 activation_id: payload.activation_id.clone(),
                 activation_generation: payload.activation_generation,
-                kernel_epoch: payload.kernel_epoch,
+                kernel_epoch: payload.kernel_epoch.clone(),
                 watchdog_epoch: payload.watchdog_epoch,
                 state_fence: payload.state_fence.clone(),
                 scope_ref: payload.scope_ref.clone(),
@@ -2802,7 +2819,7 @@ mod tests {
                 host_epoch: payload.host_epoch,
                 activation_id: payload.activation_id.clone(),
                 activation_generation: payload.activation_generation,
-                kernel_epoch: payload.kernel_epoch,
+                kernel_epoch: payload.kernel_epoch.clone(),
                 watchdog_epoch: payload.watchdog_epoch,
                 state_fence: payload.state_fence.clone(),
                 scope_ref: payload.scope_ref.clone(),

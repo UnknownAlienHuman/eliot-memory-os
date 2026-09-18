@@ -673,16 +673,62 @@ fn wait_for_tcp_closed(port: u16, timeout: Duration) -> TestResult {
 }
 
 fn wait_for_runtime_pid(path: &Path, pid: u32, timeout: Duration) -> TestResult {
+    // T13-S3: the legacy `/status/pid` + `/status/ipc_enabled` bundle shape was
+    // deleted from the candidate (U3: the old reader is updated with its client).
+    // Poll the current health-only bundle plus the daemon publication/IPC auth
+    // files already produced by candidate daemon startup.
+    let runtime_root = path
+        .ancestors()
+        .nth(3)
+        .ok_or("runtime report path has no runtime root")?;
+    let publication_path = runtime_root.join("runtime").join("publication.json");
+    let auth_path = runtime_root.join("runtime").join("ipc-auth.json");
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if let Ok(bytes) = fs::read(path)
-            && let Ok(value) = serde_json::from_slice::<Value>(&bytes)
-            && value.pointer("/status/pid").and_then(Value::as_u64) == Some(u64::from(pid))
-            && value
-                .pointer("/status/ipc_enabled")
-                .and_then(Value::as_bool)
-                == Some(true)
-        {
+        let health_ready = fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .is_some_and(|value| {
+                value.pointer("/health/ready").and_then(Value::as_bool) == Some(true)
+                    && value.pointer("/health/mode").and_then(Value::as_str) == Some("daemon")
+            });
+        let publication = fs::read(&publication_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+        let pid_linked = publication.as_ref().is_some_and(|publication| {
+            publication.get("state").and_then(Value::as_str) == Some("ready")
+                && publication.get("daemon_pid").and_then(Value::as_u64)
+                    == Some(u64::from(pid))
+        });
+        let ipc_ready = fs::read(&auth_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .is_some_and(|auth| {
+                let runtime_linked = match (
+                    &publication,
+                    auth.get("runtime_id").and_then(Value::as_str),
+                ) {
+                    (Some(publication), Some(auth_runtime)) => {
+                        publication.get("runtime_id").and_then(Value::as_str)
+                            == Some(auth_runtime)
+                            && !auth_runtime.is_empty()
+                    }
+                    _ => auth
+                        .get("runtime_id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| !value.is_empty()),
+                };
+                let token_present = auth
+                    .get("token")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.is_empty())
+                    && auth
+                        .get("token_generation_id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| !value.is_empty());
+                runtime_linked && token_present
+            });
+        if health_ready && pid_linked && ipc_ready {
             return Ok(());
         }
         thread::sleep(Duration::from_millis(25));

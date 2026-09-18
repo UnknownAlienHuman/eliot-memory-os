@@ -1,11 +1,10 @@
 //! Fail-closed supervision lease/fence loading for the watchdog composition.
-//! Architecture: `A8. Watchdog` (`ELIOT_ARCHITECTURE.md`), `A5.4. Time и State Fence` (`ELIOT_ARCHITECTURE.md`).
-//! Implementation: `I8. Watchdog implementation contract` (`ELIOT_IMPLEMENTATION.md`), `I4.5. Generation vector and State Fence` (`ELIOT_IMPLEMENTATION.md`).
+//! Architecture: A8.1 (docs/architecture/A08-01-purpose.md#a81-purpose), A13.2 (docs/architecture/A13-02-kernel-and-failure-domains.md#a132-kernel-and-failure-domains).
+//! Implementation: I8.1 (docs/architecture/I08-01-process-and-authority.md#i81-process-and-authority), I8.2 (docs/architecture/I08-02-independent-observation-routes.md#i82-independent-observation-routes).
 //! This module only verifies the current lease against the retained Host journal, Kernel ORS and
 //! watchdog publication bundle and re-checks identity/contour after verification. It never mints
 //! authority, never selects an alternate current owner, and fails closed on any lease/fence mismatch.
 
-use eliot_installation::RedbInstallationRegistry;
 use eliot_platform_windows::{ProtectedRootLease, ProtectedRuntimePathLease, windows_paths_equal};
 use eliot_runtime_contracts::{
     SupervisionLeaseIncarnationBinding, SupervisionLeasePredecessorIdentity,
@@ -13,6 +12,7 @@ use eliot_runtime_contracts::{
     WatchdogAdmissionTemplate, WatchdogPublicationRetentionPlan,
 };
 
+use super::watchdog_admission::inspect_registry_at;
 use super::{
     FileWatchdogAdmission, HOST_JOURNAL_FILE_NAME, INSTALLATION_REGISTRY_FILE_NAME, SpoolError,
     VerifiedWatchdogAdmission, WatchdogAdmissionConfig, WatchdogRuntimeBinding, current_unix_ms,
@@ -56,6 +56,12 @@ fn read_journaled_current_supervision(
         .ok_or_else(|| SpoolError::LeaseFenced("Host journal is missing".to_owned()))?;
     let state = eliot_host_state::readonly_project_host_state(&inspection.image)
         .map_err(|error| SpoolError::LeaseFenced(format!("Host journal replay failed: {error}")))?;
+    // I14.23 safe shutdown is observed before any lease is trusted: a
+    // committed drain fences pre-drain leases until a fresh activation
+    // generation supersedes it, and an unlinearized drain is an explicit
+    // incomplete-shutdown state whose pending work must be retained, never
+    // silently revived through a stale lease.
+    check_shutdown_drain_fence(&state)?;
     let kernel = state
         .kernel
         .as_ref()
@@ -104,6 +110,71 @@ fn read_journaled_current_supervision(
     Ok(reconstructed)
 }
 
+/// Fail-closed marker for an observed intentional shutdown: the Host journal
+/// carries a linearized `DrainCommit` for the current activation generation,
+/// so every pre-drain lease is stale until a fresh generation supersedes it.
+pub(crate) const INTENTIONAL_SHUTDOWN_FENCE_MARKER: &str = "intentional-shutdown";
+
+/// Fail-closed marker for an observed incomplete shutdown: the Host journal
+/// carries an unlinearized drain (deadline expiry with pending work
+/// retained), so no stale lease is admitted while recovery is outstanding.
+pub(crate) const INCOMPLETE_SHUTDOWN_FENCE_MARKER: &str = "incomplete-shutdown";
+
+/// Observes the I14.23 shutdown state in the projected Host journal and
+/// fences stale leases without minting authority or selecting an owner.
+///
+/// A `DrainCommit` bound to the current activation generation is the
+/// post-linearization state: pre-drain leases cannot revive shutdown and a
+/// fresh activation generation is required. When the activation already moved
+/// to a fresh generation the committed drain is superseded and verification
+/// proceeds against the current generation. An unlinearized `Draining`
+/// activation is the incomplete-shutdown recovery state: pending work is
+/// retained in the journal and stale leases stay fenced.
+pub(crate) fn check_shutdown_drain_fence(
+    state: &eliot_host_state::HostState,
+) -> Result<(), SpoolError> {
+    if let Some(commit) = state.drain_commit.as_ref() {
+        let superseded = state.activation.as_ref().is_some_and(|activation| {
+            activation.fence.activation_generation != commit.drain_generation
+        });
+        if superseded {
+            return Ok(());
+        }
+        return Err(SpoolError::LeaseFenced(format!(
+            "{INTENTIONAL_SHUTDOWN_FENCE_MARKER}: drain committed; \
+             pre-drain leases fenced until a fresh activation generation"
+        )));
+    }
+    if state.drain.as_ref().is_some_and(|drain| {
+        matches!(
+            drain.state,
+            eliot_host_state::DrainState::Requested | eliot_host_state::DrainState::Draining
+        )
+    }) && state
+        .activation
+        .as_ref()
+        .is_some_and(|activation| activation.state == eliot_host_state::ActivationState::Draining)
+    {
+        return Err(SpoolError::LeaseFenced(format!(
+            "{INCOMPLETE_SHUTDOWN_FENCE_MARKER}: unlinearized drain; \
+             pending work retained, no stale lease admitted"
+        )));
+    }
+    Ok(())
+}
+
+/// Reports whether a lease-load failure is the observed intentional-shutdown
+/// fence. Thin classification over the existing `LeaseFenced` control path.
+pub(crate) fn is_intentional_shutdown_fence(error: &SpoolError) -> bool {
+    matches!(error, SpoolError::LeaseFenced(reason) if reason.contains(INTENTIONAL_SHUTDOWN_FENCE_MARKER))
+}
+
+/// Reports whether a lease-load failure is the observed incomplete-shutdown
+/// fence. Thin classification over the existing `LeaseFenced` control path.
+pub(crate) fn is_incomplete_shutdown_fence(error: &SpoolError) -> bool {
+    matches!(error, SpoolError::LeaseFenced(reason) if reason.contains(INCOMPLETE_SHUTDOWN_FENCE_MARKER))
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "the content-addressed admission read keeps registry, Host journal, ORS, publication, signature, retention, and final readback checks ordered"
@@ -113,6 +184,12 @@ pub(super) fn load_content_addressed_supervision_lease_bound(
     config: &WatchdogAdmissionConfig,
     expected_template_digest: &str,
 ) -> Result<VerifiedWatchdogAdmission, SpoolError> {
+    let _span = tracing::debug_span!("watchdog.lease_bound_load").entered();
+    tracing::debug!(
+        event = "watchdog.lease_load_attempted",
+        observation = "attempted",
+        "attempting content-addressed supervision lease load"
+    );
     let binding = &source.binding;
     binding
         .host_state_root_lease
@@ -138,7 +215,11 @@ pub(super) fn load_content_addressed_supervision_lease_bound(
             "Watchdog admission does not match provisioned Phase-B digest".to_owned(),
         ));
     }
-    let registry = RedbInstallationRegistry::inspect_existing_at(
+    // s37/#1339: the registry re-read flows through the single
+    // `watchdog_admission` inspection so lock handling has one fix site.
+    // Mapping is unchanged; per-tick failures stay nonfatal gaps in the
+    // composition loop.
+    let registry = inspect_registry_at(
         ProtectedRootLease::open_existing(binding.host_state_root()).map_err(|error| {
             SpoolError::InvalidLease(format!("Host state root reopen failed: {error}"))
         })?,
@@ -227,7 +308,8 @@ pub(super) fn load_content_addressed_supervision_lease_bound(
         || durable_binding.activation_id.as_str() != journaled_incarnation.activation_id
         || durable_binding.activation_generation.value()
             != journaled_incarnation.activation_generation.sequence
-        || durable_binding.kernel_epoch.value() != journaled_incarnation.kernel_generation.sequence
+        || durable_binding.kernel_epoch.sequence.get()
+            != journaled_incarnation.kernel_generation.sequence
         || durable_binding.observation_scope != journaled_incarnation.observation_scope
         || durable_binding.watchdog_epoch.value() != journaled_incarnation.watchdog_epoch.sequence
         || durable_binding.wake_policy != journaled_incarnation.wake_policy

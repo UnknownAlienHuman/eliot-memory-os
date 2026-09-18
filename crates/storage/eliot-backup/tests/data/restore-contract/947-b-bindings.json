@@ -1,0 +1,1 @@
+{"bound_fields":["transaction_id","phase","source_archive_id","source_class","source_digest","source_endpoint_ref","isolated_destination_ref","expected_predecessor_ref","schema_revision","build_manifest_digest","purge_ledger_revision","owner","observed_epoch","observed_generation","validation_digest"],"note":"Worker B fixture: provenance identity bindings are load-bearing."}

@@ -1,8 +1,8 @@
 //! Public proofs for neutral classification input and candidate contracts.
 #![allow(clippy::expect_used)]
 use eliot_contracts::{
-    ArtifactId, AuthorityEpoch, ReceiptId, RequestId, ResourceGeneration, SourceId, StateFence,
-    TaskId,
+    ArtifactId, EpochId, EpochLineageId, ReceiptId, RequestId, ResourceGeneration, SourceId,
+    StateFence, TaskId,
 };
 use eliot_dreamer_contracts::curation::{ClassificationPayload, TargetEvidence};
 use eliot_dreamer_contracts::*;
@@ -11,12 +11,19 @@ use eliot_evidence::{
     EvidenceFreshness, LifecycleState, Provenance,
 };
 use eliot_receipts::{ProofCeiling, ReceiptIdentity, WorkScopeId};
+use std::num::NonZeroU64;
 
 fn id(v: &str) -> ArtifactId {
     ArtifactId::new(v).expect("fixture id")
 }
 fn fence() -> StateFence {
-    StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+    let epoch = EpochId::new(
+        EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .expect("canonical test lineage-A"),
+        NonZeroU64::new(1).expect("non-zero test sequence"),
+    )
+    .expect("valid test epoch");
+    StateFence::new(epoch, ResourceGeneration::genesis())
 }
 fn digest(v: &str) -> String {
     eliot_contracts::sha256_hex(v.as_bytes())
@@ -96,8 +103,8 @@ fn taxonomy() -> TaxonomyDenominator {
     t.digest = t.computed_digest().expect("taxonomy digest");
     t
 }
-fn job() -> DreamJobInput {
-    DreamJobInput {
+fn job() -> DreamJobAdmission {
+    DreamJobAdmission {
         schema_version: 1,
         job_class: JobClass::Curation,
         requester: Requester {
@@ -529,4 +536,286 @@ fn partial_unknown_input_roundtrips_as_abstention() {
     );
     let closure = seal_classification(input, abstention_candidate, &ctx).expect("abstention seals");
     closure.validate().expect("abstention validates");
+}
+
+#[test]
+fn prior_assignment_closure_is_retained_and_drift_rejected() {
+    let (mut input, ctx) = fixtures();
+    let prior = PriorAssignmentRef {
+        assignment_id: id("assignment-1"),
+        selected_alternative_id: Some(id("alternative-a")),
+        selected_family: Some("interpretation".to_owned()),
+        selected_subtype: Some("cache-hit".to_owned()),
+        target_id: id("a"),
+        target_revision: "rev-1".to_owned(),
+        assignment_digest: digest("prior-1"),
+        predecessor: Some(id("assignment-0")),
+        source_handles: vec![id("a")],
+        status: EpistemicStatus::Supported,
+        lifecycle: LifecycleState::Active,
+        receipt: None,
+    };
+    input.prior_assignment = Some(prior.clone());
+    let mut supplied = candidate(&input);
+    supplied.before = ClassificationAssignmentSnapshot {
+        alternative_id: prior.selected_alternative_id.clone(),
+        family_ref: prior.selected_family.clone(),
+        subtype_ref: prior.selected_subtype.clone(),
+        assignment_digest: Some(prior.assignment_digest.clone()),
+    };
+    supplied.rollback.predecessor = Some(prior.assignment_id.clone());
+    let closure = seal_classification(input.clone(), supplied.clone(), &ctx).expect("prior seals");
+    closure.validate().expect("prior validates");
+    let bytes = serde_json::to_vec(&closure).expect("JSON");
+    let decoded: ClassificationCandidateClosure =
+        serde_json::from_slice(&bytes).expect("roundtrip");
+    decoded.validate().expect("decoded prior validates");
+    assert_eq!(decoded.input.prior_assignment, Some(prior));
+    assert_eq!(decoded.candidate.before, supplied.before);
+    assert_eq!(decoded.candidate.counterevidence_refs, vec![id("e-2")]);
+    assert_eq!(decoded.candidate.rollback.raw_history_handles, vec![id("a")]);
+    assert_eq!(
+        decoded.input.evidence[0].dependence_groups,
+        vec!["group-1".to_owned()]
+    );
+    let mut drifted = input.clone();
+    drifted
+        .prior_assignment
+        .as_mut()
+        .expect("prior")
+        .target_revision = "rev-2".to_owned();
+    assert!(validate_classification(&drifted, &supplied, &ctx).is_err());
+    let (plain_input, plain_ctx) = fixtures();
+    let mut invented = candidate(&plain_input);
+    invented.before = ClassificationAssignmentSnapshot {
+        alternative_id: Some(id("alternative-a")),
+        family_ref: Some("interpretation".to_owned()),
+        subtype_ref: Some("cache-hit".to_owned()),
+        assignment_digest: Some(digest("prior-1")),
+    };
+    invented.rollback.predecessor = Some(id("assignment-1"));
+    assert!(validate_classification(&plain_input, &invented, &plain_ctx).is_err());
+}
+
+#[test]
+fn acceptance_joins_alias_refinement_and_digests_are_fail_closed() {
+    let (input, ctx) = fixtures();
+    let mut aliased = input.clone();
+    aliased.taxonomy.alias_mappings = vec![TaxonomyAliasMapping {
+        alias_id: id("alias-x"),
+        canonical_alternative_id: id("alternative-a"),
+        refinement_of: Some(id("alternative-b")),
+    }];
+    aliased.taxonomy.digest = aliased
+        .taxonomy
+        .computed_digest()
+        .expect("alias digest");
+    aliased.validate().expect("aliased input validates");
+    let aliased_candidate = candidate(&aliased);
+    let closure =
+        seal_classification(aliased.clone(), aliased_candidate, &ctx).expect("alias seals");
+    closure.validate().expect("alias closure validates");
+    let mut bad = input.clone();
+    bad.taxonomy.alias_mappings = vec![TaxonomyAliasMapping {
+        alias_id: id("alternative-a"),
+        canonical_alternative_id: id("alternative-b"),
+        refinement_of: None,
+    }];
+    assert!(bad.taxonomy.validate().is_err());
+    let mut bad = input.clone();
+    bad.taxonomy.alias_mappings = vec![TaxonomyAliasMapping {
+        alias_id: id("alias-y"),
+        canonical_alternative_id: id("missing-alt"),
+        refinement_of: None,
+    }];
+    assert!(bad.taxonomy.validate().is_err());
+    let mut bad = input.clone();
+    bad.taxonomy.alias_mappings = vec![TaxonomyAliasMapping {
+        alias_id: id("alias-z"),
+        canonical_alternative_id: id("alternative-a"),
+        refinement_of: Some(id("missing-parent")),
+    }];
+    assert!(bad.taxonomy.validate().is_err());
+    let mut bad = input.clone();
+    bad.taxonomy.revision = "revision-2".to_owned();
+    assert!(bad.validate().is_err());
+    let supplied = candidate(&input);
+    let screen_mismatch = ScreenBinding {
+        result_digest: "d".repeat(64),
+        ..(*ctx.screen).clone()
+    };
+    let bad_ctx = CurationAcceptanceCtx {
+        job: ctx.job,
+        bundle: ctx.bundle,
+        receipt: ctx.receipt,
+        screen: Box::leak(Box::new(screen_mismatch)),
+        grounded: ctx.grounded,
+        request: ctx.request,
+        usage: ctx.usage,
+    };
+    assert!(validate_classification(&input, &supplied, &bad_ctx).is_err());
+    let mut bundle_mismatch = (*ctx.bundle).clone();
+    bundle_mismatch.materials[0].digest = "b".repeat(64);
+    let bad_ctx = CurationAcceptanceCtx {
+        job: ctx.job,
+        bundle: Box::leak(Box::new(bundle_mismatch)),
+        receipt: ctx.receipt,
+        screen: ctx.screen,
+        grounded: ctx.grounded,
+        request: ctx.request,
+        usage: ctx.usage,
+    };
+    assert!(validate_classification(&input, &supplied, &bad_ctx).is_err());
+    let mut job_mismatch = (*ctx.job).clone();
+    job_mismatch.operation_id = "op-99".to_owned();
+    let bad_ctx = CurationAcceptanceCtx {
+        job: Box::leak(Box::new(job_mismatch)),
+        bundle: ctx.bundle,
+        receipt: ctx.receipt,
+        screen: ctx.screen,
+        grounded: ctx.grounded,
+        request: ctx.request,
+        usage: ctx.usage,
+    };
+    assert!(validate_classification(&input, &supplied, &bad_ctx).is_err());
+}
+
+#[test]
+fn preservation_coverage_rival_and_rollback_gate_complete_candidate() {
+    let (input, ctx) = fixtures();
+    let mut failed = input.clone();
+    failed.preservation.verdicts[0].passed = false;
+    let mut failed_candidate = candidate(&failed);
+    assert!(validate_classification(&failed, &failed_candidate, &ctx).is_err());
+    failed_candidate.disposition = CandidateDisposition::Abstention;
+    failed_candidate.selected_alternative_id = None;
+    failed_candidate.family_ref = "unresolved".to_owned();
+    failed_candidate.subtype_ref = None;
+    failed_candidate.after = ClassificationAssignmentSnapshot {
+        alternative_id: None,
+        family_ref: None,
+        subtype_ref: None,
+        assignment_digest: None,
+    };
+    failed_candidate.candidate_id = ClassificationCandidate::expected_candidate_id(
+        "op-44",
+        &failed_candidate.input_digest,
+        &failed_candidate.policy_digest,
+        None,
+    );
+    let closure =
+        seal_classification(failed.clone(), failed_candidate, &ctx).expect("failed abstention");
+    closure.validate().expect("failed abstention validates");
+    let mut partial = input.clone();
+    partial.taxonomy.coverage = TaxonomyCoverage::Partial;
+    partial.taxonomy.digest = partial
+        .taxonomy
+        .computed_digest()
+        .expect("partial digest");
+    let partial_candidate = candidate(&partial);
+    assert!(validate_classification(&partial, &partial_candidate, &ctx).is_err());
+    let mut single = input.clone();
+    single.taxonomy.alternatives.truncate(1);
+    single.taxonomy.declared_alternative_ids.truncate(1);
+    single.taxonomy.provided_alternative_ids.truncate(1);
+    single.taxonomy.digest = single.taxonomy.computed_digest().expect("single digest");
+    let mut single_candidate = candidate(&single);
+    assert!(validate_classification(&single, &single_candidate, &ctx).is_err());
+    single_candidate.sole_legal_alternative_proof = true;
+    let closure =
+        seal_classification(single.clone(), single_candidate, &ctx).expect("sole proof seals");
+    closure.validate().expect("sole proof validates");
+    let mut no_rollback = candidate(&input);
+    no_rollback.rollback.rollback_handles.clear();
+    assert!(validate_classification(&input, &no_rollback, &ctx).is_err());
+    let mut dup = input.clone();
+    dup.preservation.verdicts[0].dimension = dup.preservation.verdicts[1].dimension;
+    assert!(dup.preservation.validate().is_err());
+    let mut replaced = candidate(&input);
+    replaced.preservation.verdicts[0].passed = false;
+    assert!(validate_classification(&input, &replaced, &ctx).is_err());
+}
+
+#[test]
+fn material_change_changes_identity_and_incompatible_selection_rejected() {
+    let (input, ctx) = fixtures();
+    let supplied = candidate(&input);
+    let closure = seal_classification(input.clone(), supplied.clone(), &ctx).expect("seal");
+    closure.validate().expect("validate");
+    let mut changed = supplied.clone();
+    changed.selected_alternative_id = Some(id("alternative-b"));
+    changed.family_ref = "interpretation".to_owned();
+    changed.subtype_ref = Some("cache-miss".to_owned());
+    changed.after = ClassificationAssignmentSnapshot {
+        alternative_id: Some(id("alternative-b")),
+        family_ref: Some("interpretation".to_owned()),
+        subtype_ref: Some("cache-miss".to_owned()),
+        assignment_digest: None,
+    };
+    changed.candidate_id = ClassificationCandidate::expected_candidate_id(
+        "op-44",
+        &changed.input_digest,
+        &changed.policy_digest,
+        changed.selected_alternative_id.as_ref(),
+    );
+    assert_ne!(changed.candidate_id, supplied.candidate_id);
+    let changed_closure =
+        seal_classification(input.clone(), changed, &ctx).expect("changed seals");
+    assert_ne!(
+        changed_closure.result_digest,
+        closure.result_digest
+    );
+    let mut changed_input = input.clone();
+    changed_input.evidence[0].dependence_groups = vec!["group-2".to_owned()];
+    let changed_digest = classification_input_digest(&changed_input).expect("changed digest");
+    assert_ne!(changed_digest, supplied.input_digest);
+    let mut unknown = input.clone();
+    unknown.features[0].value = None;
+    unknown.features[0].status = CriterionStatus::Unknown;
+    let unknown_candidate = candidate(&unknown);
+    let unknown_closure =
+        seal_classification(unknown.clone(), unknown_candidate, &ctx).expect("unknown seals");
+    unknown_closure.validate().expect("unknown validates");
+    let mut conflict_candidate = candidate(&input);
+    conflict_candidate.disposition = CandidateDisposition::Conflict;
+    let conflict_closure =
+        seal_classification(input.clone(), conflict_candidate, &ctx).expect("conflict seals");
+    conflict_closure.validate().expect("conflict validates");
+    let mut bad = candidate(&input);
+    bad.selected_alternative_id = Some(id("missing-alt"));
+    bad.candidate_id = ClassificationCandidate::expected_candidate_id(
+        "op-44",
+        &bad.input_digest,
+        &bad.policy_digest,
+        bad.selected_alternative_id.as_ref(),
+    );
+    assert!(validate_classification(&input, &bad, &ctx).is_err());
+    let mut bad = candidate(&input);
+    bad.family_ref = "source_record".to_owned();
+    assert!(validate_classification(&input, &bad, &ctx).is_err());
+    let mut bad = candidate(&input);
+    bad.after = ClassificationAssignmentSnapshot {
+        alternative_id: Some(id("alternative-b")),
+        family_ref: Some("interpretation".to_owned()),
+        subtype_ref: Some("cache-miss".to_owned()),
+        assignment_digest: None,
+    };
+    assert!(validate_classification(&input, &bad, &ctx).is_err());
+    let mut bad = candidate(&input);
+    bad.selected_alternative_id = None;
+    bad.family_ref = "unresolved".to_owned();
+    bad.subtype_ref = None;
+    bad.after = ClassificationAssignmentSnapshot {
+        alternative_id: None,
+        family_ref: None,
+        subtype_ref: None,
+        assignment_digest: None,
+    };
+    bad.candidate_id = ClassificationCandidate::expected_candidate_id(
+        "op-44",
+        &bad.input_digest,
+        &bad.policy_digest,
+        None,
+    );
+    assert!(validate_classification(&input, &bad, &ctx).is_err());
 }

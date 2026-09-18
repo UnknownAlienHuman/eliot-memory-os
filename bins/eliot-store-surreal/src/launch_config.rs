@@ -13,7 +13,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::path::Path;
+use std::path::{Component, Path};
 
 use eliot_installation::{
     PHASE_B_PENDING_SCM_DIGEST, RuntimeLaunchDescriptor, validate_store_credential_target,
@@ -131,8 +131,38 @@ impl StoreLaunchConfig {
         }
         SchemaGeneration::new(self.schema_generation.as_str())
             .map_err(|error| format!("invalid schema_generation: {error}"))?;
-        if !Path::new(&self.blob_root).is_absolute() {
-            return Err("blob_root must be an absolute path".to_owned());
+        if !Path::new(&self.blob_root).is_absolute()
+            || Path::new(&self.blob_root).components().any(|component| {
+                matches!(
+                    component,
+                    Component::CurDir | Component::ParentDir
+                )
+            })
+        {
+            return Err(
+                "blob_root must be an absolute path without relative components".to_owned(),
+            );
+        }
+        self.validate_blob_root_binding()?;
+        Ok(())
+    }
+
+    /// Refuses a Blob root that aliases a `SurrealKV` runtime root (issue #19).
+    ///
+    /// This runs inside [`StoreLaunchConfig::validate`], hence before the
+    /// composition claims the Blob root owner and materializes the adapter, so
+    /// one directory can never receive two owners through this launch path.
+    fn validate_blob_root_binding(&self) -> Result<(), String> {
+        let roots = &self.runtime_launch.runtime_state_roots;
+        if let Some(field) = blob_root_alias_field(
+            &self.blob_root,
+            roots.store_data_root.as_str(),
+            roots.store_work_root.as_str(),
+            roots.store_temp_root.as_str(),
+        ) {
+            return Err(format!(
+                "blob_root must not alias the SurrealKV {field}; one directory has one owner"
+            ));
         }
         Ok(())
     }
@@ -153,7 +183,8 @@ impl StoreLaunchConfig {
         self.runtime_launch
             .authority_state_fence
             .authority_epoch
-            .value()
+            .sequence
+            .get()
     }
 
     pub(crate) const fn store_generation(&self) -> u64 {
@@ -270,6 +301,40 @@ fn validate_provider_bind_address(value: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Names the `SurrealKV` runtime root aliased by `blob_root`, if any.
+///
+/// The Blob writer and the provider child must never share one directory
+/// identity: an aliased root would place the Blob lease file and the provider
+/// files under one tree, defeating the one-active-owner exclusion each lease
+/// proves separately. Comparison runs over the same normalized identity the
+/// adapter uses for its runtime roots, so separator, case, and trailing-slash
+/// respellings of one directory are still refused.
+fn blob_root_alias_field(
+    blob_root: &str,
+    store_data_root: &str,
+    store_work_root: &str,
+    store_temp_root: &str,
+) -> Option<&'static str> {
+    let blob = normalize_launch_root(blob_root);
+    for (field, root) in [
+        ("store_data_root", store_data_root),
+        ("store_work_root", store_work_root),
+        ("store_temp_root", store_temp_root),
+    ] {
+        if blob == normalize_launch_root(root) {
+            return Some(field);
+        }
+    }
+    None
+}
+
+fn normalize_launch_root(value: &str) -> String {
+    value
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_ascii_lowercase()
+}
+
 pub fn load_config(path: Option<&Path>) -> Result<StoreLaunchConfig, String> {
     let Some(path) = path else {
         return Err("--config is required; launch config must be explicit".to_owned());
@@ -309,5 +374,27 @@ pub(crate) fn parse_config_bytes(path: &Path, bytes: &[u8]) -> Result<StoreLaunc
             "config extension must be .json or .toml, got .{extension}"
         )),
         None => Err("config path must have a .json or .toml extension".to_owned()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blob_root_alias_is_refused_across_separator_case_and_trailing_slash() {
+        let data = r"C:\ProgramData\Eliot\store\data";
+        assert_eq!(
+            blob_root_alias_field(data, data, "w", "t"),
+            Some("store_data_root")
+        );
+        assert_eq!(
+            blob_root_alias_field("c:/programdata/eliot/store/data/", data, "w", "t"),
+            Some("store_data_root")
+        );
+        assert_eq!(
+            blob_root_alias_field(r"C:\ProgramData\Eliot\blob", data, "w", "t"),
+            None
+        );
     }
 }

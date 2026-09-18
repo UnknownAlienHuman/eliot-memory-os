@@ -8,6 +8,11 @@ use eliot_security_contracts::{
     IntegrityStatus, QuarantineState,
 };
 
+use crate::replacement::{
+    DrainSnapshot, GenerationCoordinator, GenerationRecord, PrepareRequest, PreparedSummary,
+    ReadinessOracle, ReplacementError, RollbackArmed, RollbackReceipt, RollbackRequest,
+    SwitchReceipt, SwitchRequest,
+};
 use crate::{
     AuthorityResolution, DerivedExecutionEvidence, EngineInvocation, EngineReport,
     EngineTermination, GovernorResolution, InvocationDisposition, InvocationRequest,
@@ -44,10 +49,12 @@ enum ReconciliationAttempt {
     Consumed,
 }
 
-/// Idempotent A-12 facade. It owns only its request/result replay cache.
+/// Idempotent A-12 facade. It owns only its request/result replay cache and its
+/// neutral generation-replacement coordinator.
 pub struct WasmRuntime {
     ports: Option<RuntimePorts>,
     cache: BTreeMap<crate::InvocationId, CachedInvocation>,
+    generation_coordinator: GenerationCoordinator,
 }
 
 impl fmt::Debug for WasmRuntime {
@@ -56,6 +63,10 @@ impl fmt::Debug for WasmRuntime {
             .debug_struct("WasmRuntime")
             .field("ports_bound", &self.ports.is_some())
             .field("cached_invocations", &self.cache.len())
+            .field(
+                "replacement_active",
+                &self.generation_coordinator.active_generation_number(),
+            )
             .finish()
     }
 }
@@ -66,7 +77,72 @@ impl WasmRuntime {
         Self {
             ports,
             cache: BTreeMap::new(),
+            generation_coordinator: GenerationCoordinator::new(),
         }
+    }
+
+    /// Returns the neutral generation-replacement coordinator owned by this
+    /// facade. Replacement never touches engine or authority ports directly.
+    pub const fn generation_coordinator(&self) -> &GenerationCoordinator {
+        &self.generation_coordinator
+    }
+
+    /// Returns the mutable neutral generation-replacement coordinator.
+    pub fn generation_coordinator_mut(&mut self) -> &mut GenerationCoordinator {
+        &mut self.generation_coordinator
+    }
+
+    /// Records the first externally admitted generation on the coordinator.
+    pub fn admit_initial_generation(
+        &self,
+        record: &GenerationRecord,
+    ) -> Result<u64, ReplacementError> {
+        self.generation_coordinator.admit_initial(record)
+    }
+
+    /// Prepares a candidate generation off-path through the coordinator.
+    pub fn prepare_replacement(
+        &self,
+        request: &PrepareRequest,
+        oracle: &mut dyn ReadinessOracle,
+    ) -> Result<PreparedSummary, ReplacementError> {
+        self.generation_coordinator.prepare(request, oracle)
+    }
+
+    /// Begins drain of the still-active old generation on the coordinator.
+    pub fn begin_replacement_drain(
+        &self,
+        operation_id: &str,
+        drain_deadline_ms: u64,
+    ) -> Result<DrainSnapshot, ReplacementError> {
+        self.generation_coordinator
+            .begin_drain(operation_id, drain_deadline_ms)
+    }
+
+    /// Performs the atomic admission-target switch on the coordinator.
+    pub fn switch_replacement(
+        &self,
+        request: &SwitchRequest,
+    ) -> Result<SwitchReceipt, ReplacementError> {
+        self.generation_coordinator.switch(request)
+    }
+
+    /// Arms an explicit rollback as its own operation on the coordinator.
+    pub fn arm_replacement_rollback(
+        &self,
+        request: &RollbackRequest,
+    ) -> Result<RollbackArmed, ReplacementError> {
+        self.generation_coordinator.arm_rollback(request)
+    }
+
+    /// Completes an armed rollback with drain and atomic restore.
+    pub fn complete_replacement_rollback(
+        &self,
+        operation_id: &str,
+        expected_current: u64,
+    ) -> Result<RollbackReceipt, ReplacementError> {
+        self.generation_coordinator
+            .complete_rollback(operation_id, expected_current)
     }
 
     /// Resolves external authority, starts through P-03, invokes, and caches.
@@ -495,7 +571,10 @@ fn validate_resolutions(
     if !matches!(governor.lease.state, LeaseState::Active) {
         return Err(RuntimeError::LeaseNotActive);
     }
-    if governor.lease.authority_epoch != governor.lease.state_fence.authority_epoch
+    if !governor
+        .lease
+        .authority_epoch
+        .is_same_authority(&governor.lease.state_fence.authority_epoch)
         || governor.lease.state_fence != governor.generation.state_fence
         || source.assurance.state_fence != governor.generation.state_fence
     {
@@ -589,7 +668,10 @@ fn validate_process_binding(
     if process.operation_id().as_str() != envelope.invocation_id.as_str()
         || process.process_tree_id().as_str() != envelope.work_scope.work_scope.to_string()
         || process.generation().get() != envelope.generation.generation.value()
-        || process.fence().authority_epoch() != envelope.lease.state_fence.authority_epoch.value()
+        || !process
+            .fence()
+            .authority_epoch()
+            .is_same_authority(&envelope.lease.state_fence.authority_epoch)
         || process.fence().generation().get() != envelope.generation.generation.value()
     {
         return Err(RuntimeError::InvalidProcessBinding);

@@ -11,6 +11,35 @@ use super::{
     approved_service_registration_request,
 };
 
+// F-LOG-HOST-5 (#980) inner-phase observations for composition validation.
+//
+// Through the #889 facade only
+// (`crate::host_diagnostics::observe_entrypoint_with_detail`); the Event Log
+// seam stays typed-Unavailable
+// (`crate::windows_event_log::event_log_sink_status`), never implemented here
+// (#984 still open).
+//
+// Observation-only contract (mirrors `host_composition_phase_b.rs:30-41`):
+// every call projects a boundary already decided by the semantic owner.
+// Arguments are static literals only — no digests, paths, generations, or
+// error text are formatted, so no secret material can cross (I15.4) and no
+// extra evaluation runs on the semantic path. Sink outcome never alters
+// result, order, or cleanup. No terminal emission here: one terminal per
+// failed operation stays with the outermost contour (`lib.rs`
+// `HostTerminalGuard` / `host-phase-b-unknown`), while these inner phases
+// correlate by stage order only.
+fn host_composition_validation_note_event_log_unavailable() {
+    let _ = crate::windows_event_log::event_log_sink_status();
+}
+
+fn host_composition_validation_observe(detail: &str) {
+    host_composition_validation_note_event_log_unavailable();
+    crate::host_diagnostics::observe_entrypoint_with_detail(
+        crate::host_diagnostics::EntrypointStage::ScmDispatch,
+        detail,
+    );
+}
+
 impl HostComposition {
     #[cfg(windows)]
     pub(super) fn active_phase_b_rebind_binding(
@@ -70,6 +99,7 @@ impl HostComposition {
         options: &HostLaunchOptions,
         manifest: &CandidateManifest,
     ) -> Result<(), HostError> {
+        host_composition_validation_observe("host.phase-b composition validation requested");
         let launch = &manifest.runtime_launch;
         // The optional registration nonce belongs to the installer effect
         // receipt. It has no approved-generation field to bind here, so it is
@@ -85,6 +115,9 @@ impl HostComposition {
             || launch.authority_generation.value() != options.transaction_plan_generation()
             || manifest_host_root != options.host_state_root
         {
+            host_composition_validation_observe(
+                "host.phase-b composition fence mismatch preserved",
+            );
             return Err(HostError::ProcessContour(
                 "SCM launch authority does not match the approved generation".to_owned(),
             ));
@@ -97,6 +130,7 @@ impl HostComposition {
         registry: &ApprovedGenerationRegistry,
         pending: Option<&eliot_installation::PendingActivation>,
     ) -> Result<(), HostError> {
+        host_composition_validation_observe("host.phase-b composition validation requested");
         if let Some(pending) = pending {
             Self::validate_launch_options_for_manifest(options, &pending.manifest)?;
             return Self::validate_host_registration_approval(options, registry, &pending.manifest);
@@ -105,6 +139,7 @@ impl HostComposition {
             Self::validate_launch_options_for_manifest(options, &active.manifest)?;
             return Self::validate_host_registration_approval(options, registry, &active.manifest);
         }
+        host_composition_validation_observe("host.phase-b composition fence mismatch preserved");
         Err(HostError::ProcessContour(
             "SCM launch authority has no approved generation".to_owned(),
         ))
@@ -125,6 +160,9 @@ impl HostComposition {
                 InstallerServiceRole::Host,
             )
             .ok_or_else(|| {
+                host_composition_validation_observe(
+                    "host.phase-b composition fence mismatch preserved",
+                );
                 HostError::ProcessContour(
                     "approved generation is missing the installer-owned Host SCM approval"
                         .to_owned(),
@@ -140,12 +178,18 @@ impl HostComposition {
             .bootstrap()
             .and_then(|bootstrap| bootstrap.registration_nonce())
             .ok_or_else(|| {
+                host_composition_validation_observe(
+                    "host.phase-b composition fence mismatch preserved",
+                );
                 HostError::ProcessContour(
                     "Host SCM approval is missing the installer-approved registration nonce"
                         .to_owned(),
                 )
             })?;
         if Some(approved_nonce) != options.registration_nonce().map(PlatformHandle::as_str) {
+            host_composition_validation_observe(
+                "host.phase-b composition fence mismatch preserved",
+            );
             return Err(HostError::ProcessContour(
                 "Host SCM launch nonce does not match installer approval".to_owned(),
             ));

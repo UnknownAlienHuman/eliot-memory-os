@@ -9,8 +9,10 @@
 
 mod bounds;
 mod error;
+mod plan;
 mod policy;
 mod receipt;
+mod sample;
 mod step;
 
 pub mod contract;
@@ -21,4 +23,6 @@ pub use contract::{
     RequestKind, StepDisposition,
 };
 pub use error::CycleError;
+pub use plan::{CyclePlan, ExperimentCandidate, ExperimentKind, PlanHorizon, plan_cycle};
+pub use sample::{CycleSample, SampleDenominator, SampleLimits, sample_cycle};
 pub use step::{step_dreamer_cycle, step_dreamer_cycle_at};

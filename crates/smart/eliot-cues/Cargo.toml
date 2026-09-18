@@ -9,6 +9,7 @@ description = "ELIOT bounded, revision-fenced cue projection and activation cont
 [dependencies]
 blake3.workspace = true
 eliot-contracts.workspace = true
+eliot-cue-contracts = { path = "../eliot-cue-contracts" }
 eliot-evidence.workspace = true
 schemars.workspace = true
 serde.workspace = true

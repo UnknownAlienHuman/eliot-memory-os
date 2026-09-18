@@ -1,0 +1,134 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
+routing_authority = "owning_issue_and_normative_pair_only"
+status = "BLOCKED_ON_750_905_907_AND_REQUIRED_PROVIDERS"
+implementation_support = "WORKFLOW_ABSENT_MANUAL_POLICY_PRESENT"
+evidence_execution_status = "SOURCE_AND_WORKFLOW_POLICY_INSPECTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "BOUNDED_MANUAL_WINDOWS_INTEGRATION_RUN_ONLY"
+issue = 915
+verification_issue = 750
+inventory_issue = 905
+harness_issue = 907
+store_provider_issue = 909
+runtime_provider_issue = 911
+git_provider_issue = 913
+parent_product_issue = 11
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "integration.manual-windows-workflow"
+causal_property = "One explicitly dispatched workflow executes one admitted source and finite isolated integration profile through the accepted inventory, harness and required providers; missing tests, providers, artifacts, cleanup or evidence cannot become green."
+current_discriminator = ".github/workflows/integration.yml is absent on main; the previous #928 PR was closed unmerged, while .github/README.md requires every repository workflow to remain workflow_dispatch-only."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/915"
+
+[documentation]
+repository = ["https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/.github/README.md#workflows"]
+implementation = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I18-32-stateful-test-environments.md#i1832-stateful-test-environments",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I18-04-test-tiers.md#i184-test-tiers",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I18-21-local-and-ci-parity.md#i1821-local-and-ci-parity",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I18-22-flake-hang-and-recurrence-handling.md#i1822-flake-hang-and-recurrence-handling",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I02-18-build-test-and-artifact-graph.md#i218-build-test-and-artifact-graph",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I02-22-parallel-build-cache-artifact-and-environment-lanes.md#i222-parallel-build-cache-artifact-and-environment-lanes",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-24-local-failure-containment-matrix.md#i1424-local-failure-containment-matrix",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I15-04-secrets.md#i154-secrets",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I15-17-agent-generated-rust-build-threat-model.md#i1517-agent-generated-rust-build-threat-model",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
+]
+anchors = ["ARCH-GROUND-01", "ARCH-SEC-01", "ARCH-RES-04", "ARCH-OBS-01"]
+
+[current_source]
+confirmed = [
+  ".github/workflows/integration.yml is absent on main.",
+  ".github/README.md requires workflow_dispatch as the sole trigger for all repository-owned workflows.",
+  "The previous implementation PR #928 was closed unmerged.",
+  "GitHub cannot manually dispatch a new workflow until it is registered on the default branch; source registration cannot close this Issue or substitute for live execution.",
+]
+
+[scope]
+primary_paths = [
+  ".github/workflows/integration.yml",
+  "scripts/tests/test_integration_workflow.py",
+  "scripts/testdata/integration/workflow/**",
+  ".github/temporary/work-unit-915.md only if present",
+]
+forbidden = [
+  "any other workflow",
+  "inventory, harness, provider or bridge implementation",
+  "Rust source/tests, Cargo, lockfile, build/release commands, Justfile or verify.ps1",
+  "repository settings, environments, secrets or branch protection",
+  "generated inventories/evidence committed under .github",
+  "schedule, push, pull_request, pull_request_target, workflow_run, release, deployment, comment, repository_dispatch, workflow_call or any indirect automatic trigger",
+  "arbitrary branch/ref, command, script, package/test filter, executable, URL, environment, secret, skip or proof override",
+  "write/OIDC/deployment/production authority or checkout credentials persisted",
+]
+
+[[waves]]
+id = "A"
+what = "Create one immutable-pinned manual-only Windows workflow."
+how = [
+  "Use workflow_dispatch as the only event and explicit contents:read permissions at workflow/job scope.",
+  "Pin every action to an accepted immutable full SHA and set checkout persist-credentials: false.",
+  "Accept only a bounded exact admitted source SHA, fixed supported target/profile and finite artifact retention; no arbitrary ref or weaker profile.",
+]
+
+[[waves]]
+id = "B"
+what = "Delegate build, inventory, validation and execution to the accepted owners."
+how = [
+  "Use #750's one fixed locked build/verification owner rather than a second YAML package/test list.",
+  "Generate and validate #905's complete current inventory, then invoke #907 -ValidateConfiguration and exactly one explicit -Run with a finite resolved profile.",
+  "Activate only providers required by the selected rows and require their accepted revisions/receipts.",
+  "Unknown/missing provider class or incomplete selected denominator is non-green; unsupported external/manual-credential rows remain visible outside the runnable profile.",
+]
+
+[[waves]]
+id = "C"
+what = "Close cancellation, cleanup, cache and artifact authority."
+how = [
+  "Always attempt bounded evidence and cleanup after every possible resource-start outcome, while acknowledging runner loss can leave cleanup unknown.",
+  "Do not kill by name or recreate provider ownership in YAML; Core owns cleanup.",
+  "Bind concurrency to workflow/source/target/profile and avoid cancel-in-progress that can bypass another run's cleanup.",
+  "A cache hit cannot skip inventory, validation, execution or cleanup; cache identity includes trust/source/toolchain/target/lock/profile.",
+  "Upload only bounded redacted receipts through the fixed artifact channel; arbitrary checked-out code receives no artifact/runtime token authority.",
+]
+
+[[waves]]
+id = "D"
+what = "Add 20-case structural proof and one mandatory live dispatch."
+how = [
+  "Parse YAML with the accepted safe loader, duplicate-key detection and effective permission evaluation; grep-only checks are insufficient.",
+  "Implement exactly WORK_UNIT_CASE: 915/1..20, with cases 1..19 testing structure/bypass fixtures and case 20 validating exact live-run evidence.",
+  "After reviewed default-branch registration, manually dispatch the exact admitted implementation and bind workflow/run/event/workflow-source/checkout SHAs, inventories, selected rows, providers, test outcomes, cleanup and redaction.",
+  "Merging/registering the workflow alone cannot close #915 or satisfy case 20.",
+]
+
+[acceptance]
+criteria = [
+  "workflow_dispatch is the sole direct or indirect trigger.",
+  "Inputs cannot select arbitrary refs, commands, scripts, filters, executables, URLs, environment, secrets, skips or proof overrides.",
+  "Workflow and checkout source identities are separately load-bearing and exact.",
+  "Effective permissions are read-only with no write, OIDC, deployment or production authority; checkout credentials are not persisted.",
+  "Every action and tool/dependency identity is immutable/pinned; no latest installer or caller-trusted checksum.",
+  "The complete inventory and selected denominator are validated before provider allocation or test execution.",
+  "Exactly required providers activate; missing/unknown required class cannot pass.",
+  "ValidateConfiguration precedes exactly one explicit finite Run and YAML defines no second test list.",
+  "Cancellation, timeout, runner loss, unfinished finalizer, missing upload, unknown cleanup and zero execution are non-green.",
+  "Cache hit/miss execute identical mandatory stages and untrusted output cannot poison trusted main.",
+  "Evidence is bounded/redacted and binds run/source/profile/tool/build/inventory/provider/test/cleanup identities and exact arithmetic.",
+  "Missing, duplicate, stale, contradictory or partial evidence cannot produce green.",
+  "Exactly 20 substantive cases execute; case 20 requires a real manual dispatch and rejects fabricated/wrong-SHA/partial/pre-registration evidence.",
+  "No other workflow, harness/provider source, Rust/Cargo/Just/release/docs/settings surface is modified.",
+  "Proof remains one bounded manual Windows tier, not automatic CI, complete external tier, Product or release support.",
+]
+
+[verification]
+commands = [
+  "python -m py_compile scripts/tests/test_integration_workflow.py",
+  "python -m unittest scripts.tests.test_integration_workflow -v",
+  "git diff --check",
+]
+live_evidence = "After default-branch registration, dispatch integration.yml manually against the exact admitted source and retain full/selected denominators, every selected terminal result, provider readiness, cleanup, redaction and workflow/checkout identity."
+product_proof = "Issue #915 remains open until the actual supported Windows dispatch completes; Product proof remains #11."

@@ -16,6 +16,7 @@ pub mod candidate;
 pub mod classification;
 pub mod concept;
 pub mod curation;
+pub mod curation_invocation;
 pub mod diagnosis;
 pub mod draft;
 pub mod encoding;
@@ -23,8 +24,10 @@ pub mod error;
 pub mod failure;
 pub mod grounding;
 pub mod job;
+pub mod model_route;
 pub mod probe;
 pub mod registry;
+pub mod rejection;
 pub mod relation;
 pub mod rival;
 pub mod screen;
@@ -75,6 +78,10 @@ pub use concept::{
     concept_proposal_digest, seal_concept, validate_concept, validate_concept_acceptance,
 };
 pub use curation::{CURATION_WIRE_KINDS, CurationKind, CurationPayload, kind_family, parse_kind};
+pub use curation_invocation::{
+    BoundCurationCall, FullCurationResult, NativeCurationHandler, ProducedCurationContent, invoke,
+    request_digest_of,
+};
 pub use diagnosis::{
     ACCEPTANCE_BINDING_SCHEMA_VERSION, AcceptanceBinding, CURRENT_DISCRIMINATOR_SCHEMA_VERSION,
     ConfirmationIndependenceClaim, CurrentDiscriminator, CurrentObservation,
@@ -104,17 +111,33 @@ pub use failure::{
     FailureRollback, FailureSourceMember, failure_input_digest, failure_proposal_digest,
     failure_result_digest, seal_failure, validate_failure,
 };
-pub use job::{DreamJobInput, JobClass, Requester, RequesterOrigin, parse_job_class};
+pub use job::{
+    DreamJobAdmission, DreamJobInput, JobClass, Requester, RequesterOrigin, parse_job_class,
+};
+pub use model_route::{
+    CostUsageReceipt, MAX_ALLOWED_ROUTES, MAX_NOTE_CHARS, MAX_ROUTE_CHARS,
+    MODEL_ROUTE_SCHEMA_VERSION, ModelRouteDisposition, ModelRouteOutcome, ModelRoutePrivacy,
+    ModelRouteRequest, bundle_digest_of,
+};
 pub use probe::{
-    GapUpdateMeaning, PossibleResultSchema, PossibleResultValue, ProbeObjective,
-    ProbeObjectiveOrigin, ProbeObjectiveRef, ProbeObjectiveTarget, ProbeOwnerRef, ResultBranch,
-    ResultTarget, ResultUpdate, RivalUpdateMeaning,
+    AffordanceKind, AffordanceTarget, AuthorityDimension, ConsentDimension, ContextDimension,
+    CostDimension, EffectDimension, FeasibilityDimension, GapUpdateMeaning,
+    HumanAttentionDimension, INQUIRY_AFFORDANCE_SCHEMA_VERSION,
+    INQUIRY_AFFORDANCE_SET_SCHEMA_VERSION, InformationDimension, InquiryAffordanceDescriptor,
+    InquiryAffordanceDescriptorParams, InquiryAffordanceSet, InquiryAffordanceSetParams,
+    LatencyDimension, PROBE_INPUT_SCHEMA_VERSION, PossibleResultSchema, PossibleResultValue,
+    PrivacyDimension, ProbeAffordanceRef, ProbeCapabilityAvailability, ProbeExternalOwners,
+    ProbeGroundingRef, ProbeInput, ProbeInputParams, ProbeInputRef, ProbeLifecycle, ProbeObjective,
+    ProbeObjectiveOrigin, ProbeObjectiveRef, ProbeObjectiveTarget, ProbeOwnerRef, ProbeParam,
+    ProbeRepeatRef, ProbeSourceRef, ResourceDimension, ResultBranch, ResultTarget, ResultUpdate,
+    ReversibilityDimension, RivalUpdateMeaning,
 };
 pub use registry::{
     AtomicityMode, CURATION_FAMILIES, CurationFamily, CurationHandlerDescriptor,
     CurationHandlerPort, CurationHandlerRegistry, TargetDenominator, TypedCurationHandlerRequest,
     TypedCurationHandlerResult, family_of, parse_family,
 };
+pub use rejection::CurationRejectionCode;
 pub use relation::{
     RELATION_FAMILIES, RelationAlternative, RelationCandidate, RelationCandidateClosure,
     RelationDirection, RelationDisclosureEvidence, RelationDisposition, RelationEndpoint,
@@ -126,14 +149,18 @@ pub use relation::{
 };
 pub use rival::{
     ClaimDeclarations, CommonModeDisclosure, ConditionAssumptionRef, CurrentPositionAvailability,
-    CurrentPositionBinding, DeclarationAvailability, ForecastAvailability, MaterialClaimRef,
-    PredictionAvailability, RIVAL_DECLARATION_SET_SCHEMA_VERSION, RIVAL_MODEL_SCHEMA_VERSION,
-    RIVAL_PREDICTION_SCHEMA_VERSION, RelatedRivalModelReference, RivalAssumptionSlot,
-    RivalClaimSlot, RivalCoverageDeclaration, RivalCoverageReceipt, RivalDeclarationSet,
-    RivalDeclarationSetParams, RivalDependency, RivalForecast, RivalModelDeclaration,
-    RivalModelDeclarationParams, RivalModelRef, RivalModelSlot, RivalPrediction,
+    CurrentPositionBinding, DeclarationAvailability, DiscriminatorPeerAddress,
+    ForecastAvailability, MaterialClaimRef, PredictionAvailability,
+    RIVAL_DECLARATION_SET_SCHEMA_VERSION, RIVAL_MODEL_SCHEMA_VERSION,
+    RIVAL_MODEL_SET_SCHEMA_VERSION, RIVAL_PREDICTION_SCHEMA_VERSION, RelatedRivalModelReference,
+    RequirementFacet, RequirementReason, RetainedDiscriminator, RivalAssumptionSlot,
+    RivalClaimSlot, RivalCoverageDeclaration, RivalCoverageReceipt, RivalCoverageStatus,
+    RivalCoverageSummary, RivalDeclarationSet, RivalDeclarationSetParams, RivalDeclarationSetRef,
+    RivalDependency, RivalForecast, RivalModelDeclaration, RivalModelDeclarationParams,
+    RivalModelRef, RivalModelSet, RivalModelSetParams, RivalModelSlot, RivalPrediction,
     RivalPredictionParams, RivalPredictionRef, RivalPredictionSlot, RivalSourceSlot,
-    SuppliedLineage, TemporalAvailability, VerifierAvailability,
+    SuppliedLineage, TemporalAvailability, UnresolvedDiscriminatorRequirement,
+    VerifierAvailability,
 };
 pub use screen::{ScreenBinding, ScreenEligibility, ScreenReference, ScreenState};
 pub use self_query::{

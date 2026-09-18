@@ -1,8 +1,8 @@
 #![allow(clippy::expect_used)]
 
 use eliot_contracts::{
-    ArtifactId, AuthorityEpoch, ReceiptId, RequestId, ResourceGeneration, SourceId, StateFence,
-    TaskId,
+    ArtifactId, EpochId, EpochLineageId, ReceiptId, RequestId, ResourceGeneration, SourceId,
+    StateFence, TaskId,
 };
 use eliot_dreamer_classification::{
     ClassificationDisposition, ClassificationPolicy, EvidenceGradeBinding, classify,
@@ -14,13 +14,20 @@ use eliot_evidence::{
     Assertability, EpistemicStatus, EvidenceAuthority, EvidenceCoverage, EvidenceEnvelope,
     EvidenceFreshness, LifecycleState, Provenance,
 };
-use eliot_receipts::{ReceiptIdentity, WorkScopeId};
+use eliot_receipts::{ProofCeiling, ReceiptIdentity, WorkScopeId};
+use std::num::NonZeroU64;
 
 fn id(v: &str) -> ArtifactId {
     ArtifactId::new(v).expect("id")
 }
 fn fence() -> StateFence {
-    StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+    let epoch = EpochId::new(
+        EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .expect("canonical test lineage-A"),
+        NonZeroU64::new(1).expect("non-zero test sequence"),
+    )
+    .expect("valid test epoch");
+    StateFence::new(epoch, ResourceGeneration::genesis())
 }
 fn hash(v: &str) -> String {
     eliot_contracts::sha256_hex(v.as_bytes())
@@ -161,7 +168,7 @@ fn make() -> (
     ClassificationPolicy,
 ) {
     let evidence_values = vec![evidence("e1"), evidence("e2")];
-    let job = DreamJobInput {
+    let job = DreamJobAdmission {
         schema_version: 1,
         job_class: JobClass::Curation,
         requester: Requester {
@@ -578,4 +585,947 @@ fn target_status_ceiling_is_explicit() {
     policy.policy_digest = policy.computed_digest().expect("digest");
     input.policy_digest = policy.policy_digest.clone();
     assert!(classify(&input, &ctx, &policy).is_err());
+}
+
+fn refresh_policy(input: &mut ClassificationInput, policy: &mut ClassificationPolicy) {
+    policy.policy_digest = policy.computed_digest().expect("policy digest");
+    input.policy_digest.clone_from(&policy.policy_digest);
+}
+
+fn rebind_grade(
+    input: &mut ClassificationInput,
+    policy: &mut ClassificationPolicy,
+    evidence: &ArtifactId,
+    assignment: GradeAssignment,
+) {
+    let binding = policy
+        .grade_bindings
+        .iter_mut()
+        .find(|binding| binding.evidence_id == *evidence)
+        .expect("grade binding");
+    binding.assignment = assignment;
+    binding.reference.digest = grade_binding_digest(binding).expect("grade digest");
+    let reference = binding.reference.clone();
+    input
+        .evidence
+        .iter_mut()
+        .find(|item| item.id == *evidence)
+        .expect("named evidence")
+        .external_grade = Some(reference);
+}
+
+fn fence_seq2() -> StateFence {
+    let epoch = EpochId::new(
+        EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .expect("canonical test lineage-A"),
+        NonZeroU64::new(2).expect("non-zero test sequence"),
+    )
+    .expect("valid test epoch");
+    StateFence::new(epoch, ResourceGeneration::genesis())
+}
+
+fn strip_to_sole_legal(input: &mut ClassificationInput) {
+    input
+        .taxonomy
+        .alternatives
+        .retain(|alternative| alternative.alternative_id == id("alt-a"));
+    input.taxonomy.declared_alternative_ids = vec![id("alt-a")];
+    input.taxonomy.provided_alternative_ids = vec![id("alt-a")];
+    input.taxonomy.omitted_alternative_ids = vec![];
+    input.taxonomy.coverage = TaxonomyCoverage::Complete;
+    refresh_taxonomy(input);
+}
+
+// WORK_UNIT_CASE: 653/1
+#[test]
+fn case_01_valid_post_admission_candidate() {
+    let (input, ctx, policy) = make();
+    let result = classify(&input, &ctx, &policy).expect("classify");
+    assert_eq!(result.disposition, ClassificationDisposition::Candidate);
+    let candidate = result.candidate.expect("candidate");
+    assert_eq!(candidate.family_ref, "interpretation");
+    assert_eq!(candidate.subtype_ref.as_deref(), Some("known-a"));
+    assert_eq!(candidate.selected_alternative_id, Some(id("alt-a")));
+    assert_eq!(candidate.target_id, id("target"));
+    assert_eq!(candidate.target_revision, "rev");
+    assert!(result.sealed.is_some());
+    assert!(!result.result_digest.is_empty());
+}
+
+// WORK_UNIT_CASE: 653/2
+#[test]
+fn case_02_canonical_vocabulary_and_unknown_rejection() {
+    let unknown_family = serde_json::json!({
+        "alternative_id": "alt-x",
+        "family": "not_a_family",
+        "subtype_ref": "known-x",
+        "criterion_refs": [],
+        "evidence_refs": [],
+        "counterevidence_refs": []
+    });
+    assert!(serde_json::from_value::<TaxonomyAlternative>(unknown_family).is_err());
+    let unknown_role = serde_json::json!({
+        "criterion_id": "c-x",
+        "role": "maybe_necessary",
+        "applicability": "required",
+        "evidence_refs": [],
+        "rationale": "r"
+    });
+    assert!(serde_json::from_value::<GroundedCriterion>(unknown_role).is_err());
+    let (mut input, ctx, policy) = make();
+    input.taxonomy.alternatives[0].family = ClassificationRecordFamily::DecisionRecord;
+    refresh_taxonomy(&mut input);
+    assert!(classify(&input, &ctx, &policy).is_err());
+}
+
+// WORK_UNIT_CASE: 653/3
+#[test]
+fn case_03_wrong_kind_payload_rejected() {
+    let (mut input, ctx, policy) = make();
+    input.item.kind_spelling = "relation".to_owned();
+    let err = classify(&input, &ctx, &policy).expect_err("wrong kind must fail");
+    assert!(matches!(err, ContractViolation::KindPayload(_)));
+    let (mut input, ctx, policy) = make();
+    input.item.family_spelling = "relation".to_owned();
+    assert!(matches!(
+        classify(&input, &ctx, &policy),
+        Err(ContractViolation::KindPayload(_))
+    ));
+    let (mut input, ctx, policy) = make();
+    input.item.payload = CurationPayload::Relation(curation::RelationPayload {
+        from_handle: "target".to_owned(),
+        to_handle: "target".to_owned(),
+        relation: "related".to_owned(),
+        target_evidence: curation::TargetEvidence {
+            targets: vec!["target".to_owned()],
+            evidence_refs: vec!["e1".to_owned()],
+        },
+    });
+    input.item.kind_spelling = "relation".to_owned();
+    input.item.family_spelling = "relation".to_owned();
+    assert!(classify(&input, &ctx, &policy).is_err());
+}
+
+// WORK_UNIT_CASE: 653/4
+#[test]
+fn case_04_unadmitted_target_rejected() {
+    let (mut input, ctx, policy) = make();
+    input.target.target_digest = "b".repeat(64);
+    let err = classify(&input, &ctx, &policy).expect_err("undigested target must fail");
+    assert!(format!("{err}").contains("target_digest"));
+    let (mut input, ctx, policy) = make();
+    input.target.source_handles.push(id("ghost"));
+    assert!(classify(&input, &ctx, &policy).is_err());
+}
+
+// WORK_UNIT_CASE: 653/5
+#[test]
+fn case_05_stale_deleted_superseded_wrong_scope() {
+    let (mut input, ctx, policy) = make();
+    input.target.freshness = EvidenceFreshness::Stale;
+    assert!(classify(&input, &ctx, &policy).is_err());
+    let (mut input, ctx, policy) = make();
+    input.target.lifecycle = LifecycleState::Extinguished;
+    assert!(classify(&input, &ctx, &policy).is_err());
+    let (mut input, ctx, policy) = make();
+    input.target.lifecycle = LifecycleState::Quarantined;
+    assert!(classify(&input, &ctx, &policy).is_err());
+    let (mut input, ctx, mut policy) = make();
+    policy.target_status = EpistemicStatus::Superseded;
+    refresh_policy(&mut input, &mut policy);
+    assert!(classify(&input, &ctx, &policy).is_err());
+    let (mut input, ctx, mut policy) = make();
+    policy.target_status = EpistemicStatus::Rejected;
+    refresh_policy(&mut input, &mut policy);
+    assert!(classify(&input, &ctx, &policy).is_err());
+    let (mut input, ctx, policy) = make();
+    input.evidence[0]
+        .foundation_evidence_envelope
+        .provenance
+        .scope = "other-scope".to_owned();
+    assert!(classify(&input, &ctx, &policy).is_err());
+}
+
+// WORK_UNIT_CASE: 653/6
+#[test]
+fn case_06_revision_fence_admission_mismatch() {
+    let (mut input, ctx, policy) = make();
+    input.target.state_fence = fence_seq2();
+    assert!(classify(&input, &ctx, &policy).is_err());
+    let (mut input, ctx, policy) = make();
+    input.target.task_id = TaskId::new("other-task").expect("task");
+    assert!(classify(&input, &ctx, &policy).is_err());
+    let (mut input, ctx, policy) = make();
+    input.target.admission.canonical_sha256 = "not-hex".to_owned();
+    assert!(classify(&input, &ctx, &policy).is_err());
+    let (mut input, ctx, policy) = make();
+    input.policy_digest = "0".repeat(64);
+    assert!(classify(&input, &ctx, &policy).is_err());
+}
+
+// WORK_UNIT_CASE: 653/7
+#[test]
+fn case_07_single_target_closure() {
+    let (mut input, ctx, policy) = make();
+    input.item.denominator.members = vec!["target".to_owned(), "target-two".to_owned()];
+    assert!(classify(&input, &ctx, &policy).is_err());
+    let (mut input, ctx, policy) = make();
+    if let CurationPayload::Classification(payload) = &mut input.item.payload {
+        payload.target_evidence.targets = vec!["target".to_owned(), "target-two".to_owned()];
+    }
+    assert!(classify(&input, &ctx, &policy).is_err());
+    let (mut input, ctx, policy) = make();
+    input.screen.screened_targets = vec!["target".to_owned(), "target-two".to_owned()];
+    assert!(classify(&input, &ctx, &policy).is_err());
+}
+
+// WORK_UNIT_CASE: 653/8
+#[test]
+fn case_08_criterion_role_rules() {
+    let (input, ctx, policy) = make();
+    let result = classify(&input, &ctx, &policy).expect("classify");
+    assert_eq!(result.disposition, ClassificationDisposition::Candidate);
+    let rival = result
+        .traces
+        .iter()
+        .find(|trace| trace.alternative_id == id("alt-b"))
+        .expect("rival trace");
+    assert!(!rival.excluding_criteria.is_empty());
+    let (mut input, ctx, policy) = make();
+    input
+        .taxonomy
+        .criteria
+        .iter_mut()
+        .find(|criterion| criterion.criterion_id == id("sufficient-a"))
+        .expect("criterion")
+        .role = ClassificationCriterionRole::Characteristic;
+    refresh_taxonomy(&mut input);
+    let result = classify(&input, &ctx, &policy).expect("characteristic result");
+    assert_ne!(result.disposition, ClassificationDisposition::Candidate);
+    let (mut input, ctx, policy) = make();
+    input.taxonomy.criteria.push(GroundedCriterion {
+        criterion_id: id("exclusion-a"),
+        role: ClassificationCriterionRole::Exclusion,
+        applicability: CriterionApplicability::Required,
+        evidence_refs: vec![id("e1")],
+        rationale: "exclusion discriminator".to_owned(),
+    });
+    input
+        .taxonomy
+        .alternatives
+        .iter_mut()
+        .find(|alternative| alternative.alternative_id == id("alt-a"))
+        .expect("alternative")
+        .criterion_refs
+        .push(id("exclusion-a"));
+    input.features.push(FeatureObservation {
+        feature_id: id("fx"),
+        criterion_id: id("exclusion-a"),
+        applicability: CriterionApplicability::Required,
+        value: Some(true),
+        status: CriterionStatus::Supported,
+        evidence_refs: vec![id("e1")],
+    });
+    refresh_taxonomy(&mut input);
+    let result = classify(&input, &ctx, &policy).expect("exclusion result");
+    assert_ne!(result.disposition, ClassificationDisposition::Candidate);
+    let winner = result
+        .traces
+        .iter()
+        .find(|trace| trace.alternative_id == id("alt-a"))
+        .expect("trace");
+    assert!(winner.excluding_criteria.contains(&id("exclusion-a")));
+}
+
+// WORK_UNIT_CASE: 653/9
+#[test]
+fn case_09_feature_evidence_statuses() {
+    for status in [
+        CriterionStatus::Partial,
+        CriterionStatus::Unsupported,
+        CriterionStatus::Contradicted,
+        CriterionStatus::Unknown,
+    ] {
+        let (mut input, ctx, policy) = make();
+        input.features[0].status = status;
+        let result = classify(&input, &ctx, &policy).expect("status result");
+        assert_ne!(
+            result.disposition,
+            ClassificationDisposition::Candidate,
+            "status {status:?} must not establish class"
+        );
+    }
+    let (mut input, ctx, policy) = make();
+    input.features[0].value = None;
+    let result = classify(&input, &ctx, &policy).expect("unknown value result");
+    assert_ne!(result.disposition, ClassificationDisposition::Candidate);
+}
+
+// WORK_UNIT_CASE: 653/10
+#[test]
+fn case_10_hints_confidence_frequency_cannot_establish() {
+    for authority in [
+        EvidenceAuthority::ModelInterpretation,
+        EvidenceAuthority::HeuristicStatic,
+        EvidenceAuthority::SourceIdentity,
+    ] {
+        let (mut input, ctx, policy) = make();
+        input.evidence[0].foundation_evidence_envelope.authority = authority;
+        let result = classify(&input, &ctx, &policy).expect("authority result");
+        assert_ne!(result.disposition, ClassificationDisposition::Candidate);
+    }
+    let (mut input, ctx, policy) = make();
+    input.features.clear();
+    let result = classify(&input, &ctx, &policy).expect("no-feature result");
+    assert_ne!(result.disposition, ClassificationDisposition::Candidate);
+}
+
+// WORK_UNIT_CASE: 653/11
+#[test]
+fn case_11_similarity_cannot_establish() {
+    let (mut input, ctx, policy) = make();
+    input
+        .features
+        .retain(|feature| feature.criterion_id != id("sufficient-a"));
+    let result = classify(&input, &ctx, &policy).expect("result");
+    assert_ne!(result.disposition, ClassificationDisposition::Candidate);
+    let (mut input, ctx, policy) = make();
+    input.features[1].evidence_refs.clear();
+    let result = classify(&input, &ctx, &policy).expect("result");
+    assert_ne!(result.disposition, ClassificationDisposition::Candidate);
+}
+
+// WORK_UNIT_CASE: 653/12
+#[test]
+fn case_12_complete_denominator() {
+    let (input, ctx, policy) = make();
+    assert_eq!(input.taxonomy.coverage, TaxonomyCoverage::Complete);
+    let result = classify(&input, &ctx, &policy).expect("classify");
+    assert_eq!(result.disposition, ClassificationDisposition::Candidate);
+    let candidate = result.candidate.expect("candidate");
+    assert!(candidate.alternatives.contains(&id("alt-a")));
+    assert!(candidate.alternatives.contains(&id("alt-b")));
+    assert_eq!(candidate.alternatives.len(), 2);
+    assert!(result.omitted_alternatives.is_empty());
+    assert!(!candidate.sole_legal_alternative_proof);
+}
+
+// WORK_UNIT_CASE: 653/13
+#[test]
+fn case_13_missing_material_alternative_blocks() {
+    let (mut input, ctx, policy) = make();
+    input
+        .taxonomy
+        .alternatives
+        .retain(|alternative| alternative.alternative_id != id("alt-b"));
+    input.taxonomy.provided_alternative_ids = vec![id("alt-a")];
+    input.taxonomy.omitted_alternative_ids = vec![id("alt-b")];
+    input.taxonomy.coverage = TaxonomyCoverage::Partial;
+    refresh_taxonomy(&mut input);
+    let result = classify(&input, &ctx, &policy).expect("partial result");
+    assert_eq!(result.disposition, ClassificationDisposition::Incomplete);
+    assert_eq!(result.omitted_alternatives, vec![id("alt-b")]);
+    assert!(
+        result
+            .candidate
+            .expect("candidate transport")
+            .selected_alternative_id
+            .is_none()
+    );
+}
+
+// WORK_UNIT_CASE: 653/14
+#[test]
+fn case_14_partial_taxonomy_cannot_prove_absence() {
+    let (mut input, ctx, policy) = make();
+    input.taxonomy.missing_criteria = vec![id("criterion-x")];
+    input.taxonomy.coverage = TaxonomyCoverage::Partial;
+    refresh_taxonomy(&mut input);
+    let result = classify(&input, &ctx, &policy).expect("partial result");
+    assert_eq!(result.disposition, ClassificationDisposition::Incomplete);
+    let (mut input, ctx, policy) = make();
+    input
+        .taxonomy
+        .alternatives
+        .retain(|alternative| alternative.alternative_id == id("alt-a"));
+    input.taxonomy.provided_alternative_ids = vec![id("alt-a")];
+    input.taxonomy.omitted_alternative_ids = vec![id("alt-b")];
+    input.taxonomy.coverage = TaxonomyCoverage::Complete;
+    refresh_taxonomy(&mut input);
+    assert!(classify(&input, &ctx, &policy).is_err());
+}
+
+// WORK_UNIT_CASE: 653/15
+#[test]
+fn case_15_rival_or_sole_legal_proof() {
+    let (input, ctx, policy) = make();
+    let result = classify(&input, &ctx, &policy).expect("classify");
+    assert!(
+        !result
+            .candidate
+            .expect("candidate")
+            .sole_legal_alternative_proof
+    );
+    let (mut input, ctx, policy) = make();
+    strip_to_sole_legal(&mut input);
+    let result = classify(&input, &ctx, &policy).expect("sole legal");
+    assert_eq!(result.disposition, ClassificationDisposition::Candidate);
+    assert!(
+        result
+            .candidate
+            .expect("candidate")
+            .sole_legal_alternative_proof
+    );
+    let (mut input, ctx, policy) = make();
+    strip_to_sole_legal(&mut input);
+    input.taxonomy.coverage = TaxonomyCoverage::Partial;
+    refresh_taxonomy(&mut input);
+    let result = classify(&input, &ctx, &policy).expect("partial sole");
+    assert_eq!(result.disposition, ClassificationDisposition::Incomplete);
+}
+
+// WORK_UNIT_CASE: 653/16
+#[test]
+fn case_16_equal_support_yields_ambiguity() {
+    let (mut input, ctx, policy) = make();
+    input.features[2].value = Some(true);
+    let result = classify(&input, &ctx, &policy).expect("abstention");
+    assert_eq!(result.disposition, ClassificationDisposition::Abstention);
+    let (mut input, ctx, policy) = make();
+    input
+        .taxonomy
+        .criteria
+        .iter_mut()
+        .find(|criterion| criterion.criterion_id == id("necessary-b"))
+        .expect("criterion")
+        .role = ClassificationCriterionRole::Sufficient;
+    input.features[2].value = Some(true);
+    refresh_taxonomy(&mut input);
+    let result = classify(&input, &ctx, &policy).expect("ambiguous");
+    assert_eq!(result.disposition, ClassificationDisposition::Ambiguous);
+    assert!(
+        result
+            .candidate
+            .expect("transport")
+            .selected_alternative_id
+            .is_none()
+    );
+}
+
+// WORK_UNIT_CASE: 653/17
+#[test]
+fn case_17_dependent_sources_do_not_inflate() {
+    let (input, ctx, policy) = make();
+    let result = classify(&input, &ctx, &policy).expect("classify");
+    assert_eq!(result.disposition, ClassificationDisposition::Candidate);
+    assert!(
+        result
+            .traces
+            .iter()
+            .all(|trace| trace.omitted_evidence.is_empty())
+    );
+    let winner = result
+        .traces
+        .iter()
+        .find(|trace| trace.alternative_id == id("alt-a"))
+        .expect("winner trace");
+    assert!(winner.supporting_criteria.contains(&id("necessary-a")));
+    assert!(winner.supporting_criteria.contains(&id("sufficient-a")));
+    let (mut input, ctx, mut policy) = make();
+    let mut duplicate = input.evidence[0].clone();
+    duplicate.id = id("e1-dup");
+    input.evidence.push(duplicate);
+    let mut dup_binding = policy.grade_bindings[0].clone();
+    dup_binding.evidence_id = id("e1-dup");
+    dup_binding.reference.record_id = id("grade-e1-dup");
+    dup_binding.reference.digest = grade_binding_digest(&dup_binding).expect("grade digest");
+    policy.grade_bindings.push(dup_binding);
+    for criterion_id in [id("necessary-a"), id("sufficient-a")] {
+        input
+            .taxonomy
+            .criteria
+            .iter_mut()
+            .find(|criterion| criterion.criterion_id == criterion_id)
+            .expect("criterion")
+            .evidence_refs
+            .push(id("e1-dup"));
+    }
+    for feature in input
+        .features
+        .iter_mut()
+        .filter(|feature| feature.feature_id == id("fa") || feature.feature_id == id("fs"))
+    {
+        feature.evidence_refs.push(id("e1-dup"));
+    }
+    let dup_reference = policy
+        .grade_bindings
+        .iter()
+        .find(|binding| binding.evidence_id == id("e1-dup"))
+        .expect("binding")
+        .reference
+        .clone();
+    let mut rebound = false;
+    for evidence in input
+        .evidence
+        .iter_mut()
+        .filter(|evidence| evidence.id == id("e1-dup"))
+    {
+        evidence.external_grade = Some(dup_reference.clone());
+        rebound = true;
+    }
+    assert!(rebound);
+    refresh_taxonomy(&mut input);
+    refresh_policy(&mut input, &mut policy);
+    let result = classify(&input, &ctx, &policy).expect("dup result");
+    assert_eq!(result.disposition, ClassificationDisposition::Candidate);
+    assert_eq!(
+        result.candidate.expect("candidate").selected_alternative_id,
+        Some(id("alt-a"))
+    );
+}
+
+// WORK_UNIT_CASE: 653/18
+#[test]
+fn case_18_grade_and_domain_ceiling() {
+    let (mut input, ctx, mut policy) = make();
+    rebind_grade(
+        &mut input,
+        &mut policy,
+        &id("e1"),
+        GradeAssignment::known(EvidenceGrade::Orienting),
+    );
+    refresh_policy(&mut input, &mut policy);
+    assert!(classify(&input, &ctx, &policy).is_err());
+    let (mut input, ctx, mut policy) = make();
+    policy.maximum_grade = EvidenceGrade::Corroborated;
+    rebind_grade(
+        &mut input,
+        &mut policy,
+        &id("e1"),
+        GradeAssignment::known(EvidenceGrade::ScienceGrade),
+    );
+    refresh_policy(&mut input, &mut policy);
+    assert!(classify(&input, &ctx, &policy).is_err());
+    let (mut input, ctx, mut policy) = make();
+    rebind_grade(
+        &mut input,
+        &mut policy,
+        &id("e1"),
+        GradeAssignment::unknown("pending review").expect("unknown grade"),
+    );
+    refresh_policy(&mut input, &mut policy);
+    let result = classify(&input, &ctx, &policy).expect("unknown grade result");
+    assert_ne!(result.disposition, ClassificationDisposition::Candidate);
+}
+
+// WORK_UNIT_CASE: 653/19
+#[test]
+fn case_19_same_assignment_is_duplicate() {
+    let (mut input, ctx, policy) = make();
+    input.prior_assignment = Some(prior(Some("alt-a")));
+    let result = classify(&input, &ctx, &policy).expect("duplicate");
+    assert_eq!(result.disposition, ClassificationDisposition::Duplicate);
+    let candidate = result.candidate.expect("candidate");
+    assert_eq!(candidate.selected_alternative_id, Some(id("alt-a")));
+    assert_eq!(candidate.after.subtype_ref.as_deref(), Some("known-a"));
+    assert!(result.sealed.is_some());
+}
+
+// WORK_UNIT_CASE: 653/20
+#[test]
+fn case_20_compatible_refinement_retains_predecessor() {
+    let (mut input, ctx, policy) = make();
+    input.prior_assignment = Some(prior(Some("alt-b")));
+    input.taxonomy.alias_mappings.push(TaxonomyAliasMapping {
+        alias_id: id("alias-a"),
+        canonical_alternative_id: id("alt-a"),
+        refinement_of: Some(id("alt-b")),
+    });
+    refresh_taxonomy(&mut input);
+    let result = classify(&input, &ctx, &policy).expect("refinement");
+    assert_eq!(result.disposition, ClassificationDisposition::Refinement);
+    let candidate = result.candidate.expect("candidate");
+    assert_eq!(candidate.before.alternative_id, Some(id("alt-b")));
+    assert_eq!(candidate.after.alternative_id, Some(id("alt-a")));
+    assert_eq!(candidate.rollback.predecessor, Some(id("prior-assignment")));
+}
+
+// WORK_UNIT_CASE: 653/21
+#[test]
+fn case_21_incompatible_assignment_preserves_conflict() {
+    let (mut input, ctx, policy) = make();
+    input.prior_assignment = Some(prior(Some("alt-b")));
+    let result = classify(&input, &ctx, &policy).expect("conflict");
+    assert_eq!(result.disposition, ClassificationDisposition::Conflicted);
+    let conflict = result.conflict.expect("conflict set");
+    assert_eq!(conflict.prior_alternative_id, Some(id("alt-b")));
+    assert_eq!(conflict.proposed_alternative_id, id("alt-a"));
+    let candidate = result.candidate.expect("candidate");
+    assert_eq!(candidate.before.alternative_id, Some(id("alt-b")));
+    assert_eq!(candidate.after.alternative_id, Some(id("alt-a")));
+}
+
+// WORK_UNIT_CASE: 653/22
+#[test]
+fn case_22_ontology_redesign_returns_owner_challenge() {
+    let (mut input, ctx, policy) = make();
+    input.item.kind_spelling = "merge".to_owned();
+    assert!(classify(&input, &ctx, &policy).is_err());
+    let (mut input, ctx, policy) = make();
+    input.taxonomy.alias_mappings.push(TaxonomyAliasMapping {
+        alias_id: id("alias-x"),
+        canonical_alternative_id: id("alt-a"),
+        refinement_of: Some(id("alt-ghost")),
+    });
+    refresh_taxonomy(&mut input);
+    assert!(classify(&input, &ctx, &policy).is_err());
+    let (mut input, ctx, policy) = make();
+    input
+        .taxonomy
+        .alternatives
+        .iter_mut()
+        .find(|alternative| alternative.alternative_id == id("alt-a"))
+        .expect("alternative")
+        .subtype_ref = None;
+    refresh_taxonomy(&mut input);
+    let result = classify(&input, &ctx, &policy).expect("unknown subtype");
+    assert_eq!(
+        result.disposition,
+        ClassificationDisposition::UnsupportedTaxonomy
+    );
+    assert!(result.reason.contains("owner"));
+}
+
+// WORK_UNIT_CASE: 653/23
+#[test]
+fn case_23_no_first_pass_capture_or_lifecycle_action() {
+    let (input, ctx, policy) = make();
+    let snapshot = input.clone();
+    let result = classify(&input, &ctx, &policy).expect("classify");
+    assert_eq!(input, snapshot);
+    assert_eq!(input.target.lifecycle, LifecycleState::Active);
+    let (mut input, ctx, policy) = make();
+    input.screen.state = ScreenState::Protected;
+    assert!(classify(&input, &ctx, &policy).is_err());
+    assert_eq!(
+        result.candidate.expect("candidate").proof_ceiling,
+        ProofCeiling::CandidateArtifact
+    );
+}
+
+// WORK_UNIT_CASE: 653/24
+#[test]
+fn case_24_rollback_and_history_preservation() {
+    let (mut input, ctx, policy) = make();
+    input.prior_assignment = Some(prior(Some("alt-b")));
+    let retained = input.target.source_handles.clone();
+    let result = classify(&input, &ctx, &policy).expect("conflict");
+    let candidate = result.candidate.expect("candidate");
+    assert_eq!(candidate.rollback.target_id, id("target"));
+    assert_eq!(candidate.rollback.predecessor, Some(id("prior-assignment")));
+    assert!(!candidate.rollback.rollback_handles.is_empty());
+    assert!(!candidate.rollback.raw_history_handles.is_empty());
+    assert!(!candidate.rollback.invalidation_handles.is_empty());
+    for handle in candidate
+        .rollback
+        .rollback_handles
+        .iter()
+        .chain(candidate.rollback.raw_history_handles.iter())
+        .chain(candidate.rollback.invalidation_handles.iter())
+    {
+        assert!(retained.contains(handle));
+    }
+    assert_eq!(candidate.before.alternative_id, Some(id("alt-b")));
+    assert_eq!(candidate.before.assignment_digest, Some(hash("prior")));
+    let (input, ctx, policy) = make();
+    let result = classify(&input, &ctx, &policy).expect("candidate");
+    let candidate = result.candidate.expect("candidate");
+    assert!(candidate.before.alternative_id.is_none());
+    assert!(candidate.rollback.predecessor.is_none());
+    assert!(!candidate.rollback.raw_history_handles.is_empty());
+}
+
+// WORK_UNIT_CASE: 653/25
+#[test]
+fn case_25_preservation_dimensions_and_prior_receipt() {
+    let (mut input, ctx, policy) = make();
+    input.preservation.verdicts.pop();
+    assert!(classify(&input, &ctx, &policy).is_err());
+    let (mut input, ctx, policy) = make();
+    input.preservation.verdicts[0].passed = false;
+    assert!(classify(&input, &ctx, &policy).is_err());
+    let (mut input, ctx, policy) = make();
+    input.preservation.verdicts[1].known = false;
+    assert!(classify(&input, &ctx, &policy).is_err());
+    let (mut input, ctx, policy) = make();
+    input.item.receipt.job_id = "other-job".to_owned();
+    assert!(classify(&input, &ctx, &policy).is_err());
+}
+
+// WORK_UNIT_CASE: 653/26
+#[test]
+fn case_26_partial_budget_deadline_cancel_omissions() {
+    let (mut input, ctx, mut policy) = make();
+    policy.cancellation_requested = true;
+    refresh_policy(&mut input, &mut policy);
+    assert!(classify(&input, &ctx, &policy).is_err());
+    let (mut input, ctx, mut policy) = make();
+    policy.now_ms = Some(20);
+    policy.deadline_ms = Some(10);
+    refresh_policy(&mut input, &mut policy);
+    let err = classify(&input, &ctx, &policy).expect_err("deadline");
+    assert!(format!("{err}").contains("deadline"));
+    let (mut input, ctx, mut policy) = make();
+    policy.max_features = 1;
+    refresh_policy(&mut input, &mut policy);
+    assert!(classify(&input, &ctx, &policy).is_err());
+    let (mut input, ctx, policy) = make();
+    input
+        .taxonomy
+        .alternatives
+        .retain(|alternative| alternative.alternative_id == id("alt-a"));
+    input.taxonomy.provided_alternative_ids = vec![id("alt-a")];
+    input.taxonomy.omitted_alternative_ids = vec![id("alt-b")];
+    input.taxonomy.coverage = TaxonomyCoverage::Partial;
+    refresh_taxonomy(&mut input);
+    let result = classify(&input, &ctx, &policy).expect("partial");
+    assert_eq!(result.disposition, ClassificationDisposition::Incomplete);
+    assert_eq!(result.omitted_alternatives, vec![id("alt-b")]);
+}
+
+// WORK_UNIT_CASE: 653/27
+#[test]
+fn case_27_privacy_authority_effect_proof_ceiling() {
+    let (input, ctx, policy) = make();
+    assert_eq!(ctx.job.privacy_profile, "local_only");
+    let result = classify(&input, &ctx, &policy).expect("classify");
+    let candidate = result.candidate.expect("candidate");
+    assert_eq!(candidate.proof_ceiling, ProofCeiling::CandidateArtifact);
+    assert_eq!(
+        result.sealed.expect("sealed").proof_ceiling,
+        ProofCeiling::CandidateArtifact
+    );
+    let retained = [id("target")];
+    for handle in candidate
+        .source_handles
+        .iter()
+        .chain(candidate.rollback.rollback_handles.iter())
+        .chain(candidate.rollback.invalidation_handles.iter())
+        .chain(candidate.rollback.raw_history_handles.iter())
+    {
+        assert!(retained.contains(handle));
+    }
+    let (mut input, ctx, mut policy) = make();
+    policy.maximum_grade = EvidenceGrade::Corroborated;
+    rebind_grade(
+        &mut input,
+        &mut policy,
+        &id("e1"),
+        GradeAssignment::known(EvidenceGrade::ScienceGrade),
+    );
+    refresh_policy(&mut input, &mut policy);
+    assert!(classify(&input, &ctx, &policy).is_err());
+}
+
+// WORK_UNIT_CASE: 653/28
+#[test]
+fn case_28_independent_count_byte_stu_work_bounds() {
+    let (mut input, ctx, mut policy) = make();
+    policy.max_evidence = 1;
+    refresh_policy(&mut input, &mut policy);
+    assert!(classify(&input, &ctx, &policy).is_err());
+    let (mut input, ctx, mut policy) = make();
+    policy.max_alternatives = 1;
+    refresh_policy(&mut input, &mut policy);
+    assert!(classify(&input, &ctx, &policy).is_err());
+    let (mut input, ctx, mut policy) = make();
+    policy.max_source_refs = 1;
+    refresh_policy(&mut input, &mut policy);
+    assert!(classify(&input, &ctx, &policy).is_err());
+    let (mut input, ctx, mut policy) = make();
+    policy.max_work_units = 1;
+    refresh_policy(&mut input, &mut policy);
+    assert!(classify(&input, &ctx, &policy).is_err());
+    let (mut input, ctx, mut policy) = make();
+    policy.observed_stu = 1;
+    refresh_policy(&mut input, &mut policy);
+    assert!(classify(&input, &ctx, &policy).is_err());
+    let (mut input, ctx, mut policy) = make();
+    policy.max_input_bytes = 1;
+    refresh_policy(&mut input, &mut policy);
+    assert!(classify(&input, &ctx, &policy).is_err());
+    let (mut input, ctx, mut policy) = make();
+    policy.max_output_bytes = 1;
+    refresh_policy(&mut input, &mut policy);
+    assert!(classify(&input, &ctx, &policy).is_err());
+}
+
+// WORK_UNIT_CASE: 653/29
+#[test]
+fn case_29_set_permutation_determinism() {
+    let (input, ctx, policy) = make();
+    let first = classify(&input, &ctx, &policy).expect("first");
+    let second = classify(&input, &ctx, &policy).expect("second");
+    assert_eq!(first.result_digest, second.result_digest);
+    let (mut permuted, ctx2, mut policy2) = make();
+    for alternative in &mut permuted.taxonomy.alternatives {
+        alternative.criterion_refs.reverse();
+        alternative.counterevidence_refs.reverse();
+    }
+    permuted.taxonomy.alternatives.reverse();
+    permuted.taxonomy.criteria.reverse();
+    permuted.taxonomy.declared_alternative_ids.reverse();
+    permuted.taxonomy.provided_alternative_ids.reverse();
+    permuted.evidence.reverse();
+    refresh_taxonomy(&mut permuted);
+    policy2.grade_bindings.reverse();
+    refresh_policy(&mut permuted, &mut policy2);
+    let permuted_result = classify(&permuted, &ctx2, &policy2).expect("permuted");
+    assert_eq!(first.result_digest, permuted_result.result_digest);
+    assert_eq!(
+        first.candidate.expect("candidate").candidate_id,
+        permuted_result.candidate.expect("candidate").candidate_id
+    );
+}
+
+// WORK_UNIT_CASE: 653/30
+#[test]
+fn case_30_replay_and_changed_input_policy_conflict() {
+    let (input, ctx, policy) = make();
+    let first = classify(&input, &ctx, &policy).expect("first");
+    let replay = classify(&input, &ctx, &policy).expect("replay");
+    assert_eq!(first.result_digest, replay.result_digest);
+    let (mut changed, ctx2, policy2) = make();
+    changed.features[2].value = Some(true);
+    let other = classify(&changed, &ctx2, &policy2).expect("changed");
+    assert_ne!(first.result_digest, other.result_digest);
+    assert_ne!(
+        first.candidate.expect("candidate").candidate_id,
+        other.candidate.expect("candidate").candidate_id
+    );
+    let (input, ctx, mut policy) = make();
+    policy.max_features = 999;
+    assert!(classify(&input, &ctx, &policy).is_err());
+}
+
+// WORK_UNIT_CASE: 653/31
+#[test]
+fn case_31_malformed_input_never_panics() {
+    let (mut input, ctx, policy) = make();
+    input.policy_digest = "not-hex".to_owned();
+    assert!(classify(&input, &ctx, &policy).is_err());
+    let (mut input, ctx, policy) = make();
+    input.taxonomy.digest = "z".repeat(64);
+    assert!(classify(&input, &ctx, &policy).is_err());
+    let (mut input, ctx, policy) = make();
+    input.target.target_digest = "short".to_owned();
+    assert!(classify(&input, &ctx, &policy).is_err());
+    let (mut input, ctx, policy) = make();
+    input.target.admission.canonical_sha256 = String::new();
+    assert!(classify(&input, &ctx, &policy).is_err());
+    let (mut input, ctx, policy) = make();
+    input.features.clear();
+    let result = classify(&input, &ctx, &policy).expect("empty features");
+    assert_ne!(result.disposition, ClassificationDisposition::Candidate);
+}
+
+// WORK_UNIT_CASE: 653/32
+#[test]
+fn case_32_positive_requires_known_subtype_and_admitted_target() {
+    let (input, ctx, policy) = make();
+    let result = classify(&input, &ctx, &policy).expect("classify");
+    assert_eq!(result.disposition, ClassificationDisposition::Candidate);
+    let candidate = result.candidate.expect("candidate");
+    assert_eq!(candidate.subtype_ref.as_deref(), Some("known-a"));
+    assert_eq!(candidate.family_ref, "interpretation");
+    assert_eq!(candidate.target_id, input.target.target_id);
+    assert_eq!(candidate.target_revision, input.target.target_revision);
+    assert_eq!(candidate.after.subtype_ref.as_deref(), Some("known-a"));
+    let (mut input, ctx, policy) = make();
+    input
+        .taxonomy
+        .alternatives
+        .iter_mut()
+        .find(|alternative| alternative.alternative_id == id("alt-a"))
+        .expect("alternative")
+        .subtype_ref = None;
+    refresh_taxonomy(&mut input);
+    let result = classify(&input, &ctx, &policy).expect("unknown subtype");
+    assert_ne!(result.disposition, ClassificationDisposition::Candidate);
+}
+
+// WORK_UNIT_CASE: 653/33
+#[test]
+fn case_33_complete_retains_alternatives_or_sole_proof() {
+    let (input, ctx, policy) = make();
+    let result = classify(&input, &ctx, &policy).expect("classify");
+    let candidate = result.candidate.expect("candidate");
+    assert_eq!(
+        candidate.alternatives.len(),
+        input.taxonomy.declared_alternative_ids.len()
+    );
+    assert!(candidate.alternatives.contains(&id("alt-a")));
+    assert!(candidate.alternatives.contains(&id("alt-b")));
+    let (mut input, ctx, policy) = make();
+    strip_to_sole_legal(&mut input);
+    let result = classify(&input, &ctx, &policy).expect("sole legal");
+    let candidate = result.candidate.expect("candidate");
+    assert_eq!(candidate.alternatives, vec![id("alt-a")]);
+    assert!(candidate.sole_legal_alternative_proof);
+}
+
+// WORK_UNIT_CASE: 653/34
+#[test]
+fn case_34_missing_discriminator_invalidates() {
+    let (input, ctx, policy) = make();
+    let baseline = classify(&input, &ctx, &policy).expect("baseline");
+    let (mut input, ctx, policy) = make();
+    input
+        .features
+        .retain(|feature| feature.criterion_id != id("sufficient-a"));
+    let result = classify(&input, &ctx, &policy).expect("dropped discriminator");
+    assert_ne!(result.disposition, ClassificationDisposition::Candidate);
+    assert_ne!(baseline.result_digest, result.result_digest);
+    let (mut input, ctx, policy) = make();
+    input
+        .taxonomy
+        .criteria
+        .iter_mut()
+        .find(|criterion| criterion.criterion_id == id("sufficient-a"))
+        .expect("criterion")
+        .evidence_refs = vec![id("ghost-evidence")];
+    refresh_taxonomy(&mut input);
+    assert!(classify(&input, &ctx, &policy).is_err());
+    let (mut input, ctx, policy) = make();
+    input.features[0].criterion_id = id("ghost-criterion");
+    assert!(classify(&input, &ctx, &policy).is_err());
+}
+
+// WORK_UNIT_CASE: 653/35
+#[test]
+fn case_35_no_capture_index_provider_model_store_finish_path() {
+    const LIB: &str = include_str!("../src/lib.rs");
+    const EVIDENCE: &str = include_str!("../src/evidence.rs");
+    const POLICY: &str = include_str!("../src/policy.rs");
+    const RESULT: &str = include_str!("../src/result.rs");
+    const SELECTION: &str = include_str!("../src/selection.rs");
+    const MANIFEST: &str = include_str!("../Cargo.toml");
+    for source in [LIB, EVIDENCE, POLICY, RESULT, SELECTION, MANIFEST] {
+        for forbidden in ["provider", "Store", "Finish", "capture", "reqwest", "tokio"] {
+            assert!(!source.contains(forbidden), "forbidden path {forbidden}");
+        }
+    }
+    let (input, ctx, policy) = make();
+    let snapshot = input.clone();
+    let result = classify(&input, &ctx, &policy).expect("classify");
+    assert_eq!(input, snapshot);
+    assert_eq!(
+        result.candidate.expect("candidate").proof_ceiling,
+        ProofCeiling::CandidateArtifact
+    );
+    let (mut input, ctx, policy) = make();
+    input.evidence[0].foundation_evidence_envelope.authority =
+        EvidenceAuthority::ModelInterpretation;
+    let result = classify(&input, &ctx, &policy).expect("model authority");
+    assert_ne!(result.disposition, ClassificationDisposition::Candidate);
 }

@@ -9,6 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use eliot_contracts::EpochId;
 use eliot_process::{
     CancellationReceipt, EnvironmentProjection, Generation, ImageId, JobId, OperationId,
     ProcessExecutionView, ProcessLifecycle, ProcessStartReceipt, ProcessTreeId, ResourceLimits,
@@ -298,11 +299,15 @@ impl RegistrationRequest {
 }
 
 /// Provider-issued registration grant.  A-09 validates and seals it before use.
+///
+/// `authority_epoch` is the lineage-aware Kernel authority minted ONLY at the
+/// admitted broker/registration owner with a migration receipt (T6-E3 Split C).
+/// `user_broker_epoch` is broker-local and never conflated with authority.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RegistrationGrant {
     pub registration: RegistrationRequest,
-    pub authority_epoch: u64,
+    pub authority_epoch: EpochId,
     pub user_broker_epoch: u64,
     pub fence_id: String,
     pub expires_at: u64,
@@ -320,7 +325,7 @@ pub struct RegistrationReceipt {
     pub boot_session_id: String,
     pub broker_process_id: String,
     pub user_broker_epoch: u64,
-    pub authority_epoch: u64,
+    pub authority_epoch: EpochId,
     pub fence_id: String,
     pub expires_at: u64,
     pub status: RegistrationStatus,
@@ -372,7 +377,7 @@ pub struct RegistrationFenceReceipt {
     pub windows_sid: String,
     pub interactive_session_id: String,
     pub user_broker_epoch: u64,
-    pub authority_epoch: u64,
+    pub authority_epoch: EpochId,
     pub fence_id: String,
     pub operation_id: OperationId,
     pub status: RegistrationStatus,
@@ -447,6 +452,10 @@ impl LaunchRequest {
 }
 
 /// Provider-issued exact launch approval; never accepted directly by public APIs.
+///
+/// `authority_epoch` is the lineage-aware authority minted ONLY at the
+/// admitted broker owner. `user_broker_epoch` is broker-local (u64) and is
+/// never conflated with authority.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LaunchGrant {
@@ -455,7 +464,7 @@ pub struct LaunchGrant {
     pub request_digest: String,
     pub registration_digest: String,
     pub user_broker_epoch: u64,
-    pub authority_epoch: u64,
+    pub authority_epoch: EpochId,
     pub fence_id: String,
     pub expires_at: u64,
     pub grant_digest: String,
@@ -490,7 +499,7 @@ pub struct OperationPermit {
     request_digest: String,
     registration_digest: String,
     user_broker_epoch: u64,
-    authority_epoch: u64,
+    authority_epoch: EpochId,
     fence_id: String,
     lease_expires_at: u64,
 }
@@ -512,7 +521,7 @@ pub struct OperationCursor {
     pub request_digest: String,
     pub registration_digest: String,
     pub user_broker_epoch: u64,
-    pub authority_epoch: u64,
+    pub authority_epoch: EpochId,
     pub fence_id: String,
     pub lease_expires_at: u64,
     pub process_tree_id: ProcessTreeId,
@@ -677,9 +686,15 @@ impl UserBroker {
         let mut operation_ids = BTreeSet::new();
         for cursor in snapshot.operation_cursors {
             cursor.validate()?;
+            // Scalar-only cursors have no lineage and stay HISTORICAL_SUSPENDED:
+            // they fail closed here via exact-tuple is_same_authority and are
+            // never promoted. Only an EVIDENCE_BOUND_ACTIVE import with a
+            // migration receipt may mint a new EpochId at this owner.
             if cursor.registration_digest != registration.registration_digest
                 || cursor.user_broker_epoch != registration.user_broker_epoch
-                || cursor.authority_epoch != registration.authority_epoch
+                || !cursor
+                    .authority_epoch
+                    .is_same_authority(&registration.authority_epoch)
                 || cursor.fence_id != registration.fence_id
                 || cursor.lease_expires_at > registration.expires_at
             {
@@ -1049,7 +1064,9 @@ impl UserBroker {
             .ok_or(BrokerError::PlanGap(RequiredProvider::G01Authority))?;
         if permit.registration_digest != registration.registration_digest
             || permit.user_broker_epoch != registration.user_broker_epoch
-            || permit.authority_epoch != registration.authority_epoch
+            || !permit
+                .authority_epoch
+                .is_same_authority(&registration.authority_epoch)
             || permit.fence_id != registration.fence_id
         {
             return Err(BrokerError::GrantBindingMismatch);
@@ -1168,8 +1185,10 @@ fn seal_registration(
         return Err(BrokerError::GrantBindingMismatch);
     }
     text(&grant.fence_id, "fence_id")?;
-    if grant.authority_epoch == 0
-        || grant.user_broker_epoch == 0
+    // EpochId carries non-zero sequence by construction; no scalar zero check.
+    // Digest input is lineage+sequence via serde (canonical lineage spelling +
+    // sequence), never a bare u64.
+    if grant.user_broker_epoch == 0
         || grant.expires_at <= request.observed_at
         || grant.expires_at > request.lease_expires_at
     {
@@ -1177,7 +1196,7 @@ fn seal_registration(
     }
     let expected = digest(&(
         request,
-        grant.authority_epoch,
+        &grant.authority_epoch,
         grant.user_broker_epoch,
         &grant.fence_id,
         grant.expires_at,
@@ -1189,7 +1208,7 @@ fn seal_registration(
         registration_digest: digest(&(
             request,
             grant.user_broker_epoch,
-            grant.authority_epoch,
+            &grant.authority_epoch,
             &grant.fence_id,
         ))?,
         installation_id: request.installation_id.clone(),
@@ -1198,7 +1217,7 @@ fn seal_registration(
         boot_session_id: request.boot_session_id.clone(),
         broker_process_id: request.broker_process_id.clone(),
         user_broker_epoch: grant.user_broker_epoch,
-        authority_epoch: grant.authority_epoch,
+        authority_epoch: grant.authority_epoch.clone(),
         fence_id: grant.fence_id.clone(),
         expires_at: grant.expires_at,
         status: RegistrationStatus::Active,
@@ -1229,7 +1248,9 @@ fn validate_fence_receipt(
         || receipt.windows_sid != request.registration.windows_sid
         || receipt.interactive_session_id != request.registration.interactive_session_id
         || receipt.user_broker_epoch != request.registration.user_broker_epoch
-        || receipt.authority_epoch != request.registration.authority_epoch
+        || !receipt
+            .authority_epoch
+            .is_same_authority(&request.registration.authority_epoch)
         || receipt.fence_id != request.registration.fence_id
         || receipt.operation_id != request.operation_id
         || receipt.status != request.status
@@ -1240,7 +1261,9 @@ fn validate_fence_receipt(
     text(&receipt.windows_sid, "windows_sid")?;
     text(&receipt.interactive_session_id, "interactive_session_id")?;
     text(&receipt.fence_id, "fence_id")?;
-    if receipt.user_broker_epoch == 0 || receipt.authority_epoch == 0 {
+    // EpochId is non-zero by construction; only the broker-local epoch needs
+    // a scalar zero guard.
+    if receipt.user_broker_epoch == 0 {
         return Err(BrokerError::GrantBindingMismatch);
     }
     Ok(())
@@ -1255,11 +1278,13 @@ fn seal_registration_from_grant(
     if digest(&(
         request,
         grant.user_broker_epoch,
-        grant.authority_epoch,
+        &grant.authority_epoch,
         &grant.fence_id,
     ))? != current.registration_digest
         || grant.user_broker_epoch != current.user_broker_epoch
-        || grant.authority_epoch != current.authority_epoch
+        || !grant
+            .authority_epoch
+            .is_same_authority(&current.authority_epoch)
         || grant.fence_id != current.fence_id
     {
         return Err(BrokerError::GrantBindingMismatch);
@@ -1277,7 +1302,9 @@ fn validate_launch_grant(
 ) -> Result<(), BrokerError> {
     if grant.registration_digest != current.registration_digest
         || grant.user_broker_epoch != current.user_broker_epoch
-        || grant.authority_epoch != current.authority_epoch
+        || !grant
+            .authority_epoch
+            .is_same_authority(&current.authority_epoch)
         || grant.fence_id != current.fence_id
         || grant.approved != request.approved
         || grant.request_digest != digest(request)?
@@ -1293,7 +1320,7 @@ fn validate_launch_grant(
         grant.proof_ceiling,
         grant.request_digest.clone(),
         grant.user_broker_epoch,
-        grant.authority_epoch,
+        &grant.authority_epoch,
         &grant.fence_id,
         grant.expires_at,
     ))?;
@@ -1313,7 +1340,7 @@ fn permit_from_grant(
         request_digest: request_digest.to_owned(),
         registration_digest: registration.registration_digest.clone(),
         user_broker_epoch: registration.user_broker_epoch,
-        authority_epoch: registration.authority_epoch,
+        authority_epoch: registration.authority_epoch.clone(),
         fence_id: registration.fence_id.clone(),
         lease_expires_at: grant.expires_at,
     }
@@ -1332,7 +1359,7 @@ fn cursor_from_grant(
         request_digest: request_digest.to_owned(),
         registration_digest: registration.registration_digest.clone(),
         user_broker_epoch: registration.user_broker_epoch,
-        authority_epoch: registration.authority_epoch,
+        authority_epoch: registration.authority_epoch.clone(),
         fence_id: registration.fence_id.clone(),
         lease_expires_at: grant.expires_at,
         process_tree_id: grant.approved.process_tree_id.clone(),
@@ -1349,7 +1376,7 @@ fn permit_from_cursor(cursor: &OperationCursor) -> OperationPermit {
         request_digest: cursor.request_digest.clone(),
         registration_digest: cursor.registration_digest.clone(),
         user_broker_epoch: cursor.user_broker_epoch,
-        authority_epoch: cursor.authority_epoch,
+        authority_epoch: cursor.authority_epoch.clone(),
         fence_id: cursor.fence_id.clone(),
         lease_expires_at: cursor.lease_expires_at,
     }
@@ -1360,10 +1387,16 @@ fn verify_cursor_lineage(
     view: &ProcessExecutionView,
 ) -> Result<(), BrokerError> {
     let identity = view.identity().ok_or(BrokerError::ProcessLineageMismatch)?;
+    // Full-pair exact-tuple check: equal sequences from different lineages are
+    // unrelated and never authorize (contract types.EpochId). No scalar
+    // comparison, no .sequence.get() adapter, no From<u64>.
     if view.lifecycle() != ProcessLifecycle::Running
         || view.operation_id() != &cursor.operation_id
         || view.request_digest() != cursor.process_request_digest
-        || view.fence().authority_epoch() != cursor.authority_epoch
+        || !view
+            .fence()
+            .authority_epoch()
+            .is_same_authority(&cursor.authority_epoch)
         || view.fence().nonce() != cursor.process_fence_nonce
         || identity.process_tree_id() != &cursor.process_tree_id
         || identity.generation() != cursor.generation
@@ -1420,6 +1453,9 @@ pub enum BrokerError {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use std::num::NonZeroU64;
+
+    use eliot_contracts::EpochLineageId;
     use eliot_platform::ClockObservation;
     use eliot_process::{
         ActionLeaseRef, DispatchAuthorityId, DispatchPermitAuthority, DispatchValidationContext,
@@ -1606,16 +1642,39 @@ mod tests {
     }
 
     struct FakeAuthority {
-        epoch: u64,
+        epoch: EpochId,
         broker_epoch: u64,
         tamper: Tamper,
         last: Option<RegistrationRequest>,
     }
 
+    /// Lineage-A fixture epoch for tests (canonical UUID lineage, no scalar).
+    /// Never invents lineage: lineage-A is the fixed test lineage, sequence is
+    /// explicit. No `.sequence.get()` adapter, no `From<u64>`.
+    fn test_epoch(sequence: u64) -> EpochId {
+        let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .expect("canonical test lineage-A");
+        EpochId::new(
+            lineage,
+            NonZeroU64::new(sequence).expect("non-zero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
+
+    fn test_epoch_b(sequence: u64) -> EpochId {
+        let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440001")
+            .expect("canonical test lineage-B");
+        EpochId::new(
+            lineage,
+            NonZeroU64::new(sequence).expect("non-zero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
+
     impl FakeAuthority {
         fn new() -> Self {
             Self {
-                epoch: 7,
+                epoch: test_epoch(7),
                 broker_epoch: 0,
                 tamper: Tamper::None,
                 last: None,
@@ -1636,7 +1695,7 @@ mod tests {
             let expires_at = request.lease_expires_at;
             let grant_digest = digest(&(
                 request.clone(),
-                self.epoch,
+                &self.epoch,
                 self.broker_epoch,
                 &fence_id,
                 expires_at,
@@ -1644,7 +1703,7 @@ mod tests {
             .expect("digest");
             RegistrationGrant {
                 registration: request,
-                authority_epoch: self.epoch,
+                authority_epoch: self.epoch.clone(),
                 user_broker_epoch: self.broker_epoch,
                 fence_id,
                 expires_at,
@@ -1706,7 +1765,7 @@ mod tests {
                 proof_ceiling,
                 request_digest.clone(),
                 receipt.user_broker_epoch,
-                receipt.authority_epoch,
+                &receipt.authority_epoch,
                 &fence_id,
                 expires_at,
             ))
@@ -1717,7 +1776,7 @@ mod tests {
                 request_digest,
                 registration_digest: receipt.registration_digest.clone(),
                 user_broker_epoch: receipt.user_broker_epoch,
-                authority_epoch: receipt.authority_epoch,
+                authority_epoch: receipt.authority_epoch.clone(),
                 fence_id,
                 expires_at,
                 grant_digest,
@@ -1738,7 +1797,7 @@ mod tests {
                 windows_sid: request.registration.windows_sid.clone(),
                 interactive_session_id: request.registration.interactive_session_id.clone(),
                 user_broker_epoch: request.registration.user_broker_epoch,
-                authority_epoch: request.registration.authority_epoch,
+                authority_epoch: request.registration.authority_epoch.clone(),
                 fence_id: request.registration.fence_id.clone(),
                 operation_id: request.operation_id.clone(),
                 status: request.status,
@@ -1992,8 +2051,11 @@ mod tests {
     }
 
     fn test_context(grant: &LaunchGrant, now: i64) -> Result<DispatchValidationContext, PortError> {
+        // INTENDED EpochId shape per T6-E3 reader (Split A cutover):
+        // FencingToken::new(EpochId), getter &EpochId, is_same_authority.
+        // Integrator resolves order B→A→C; this branch does not edit A files.
         let fence = FencingToken::new(
-            grant.authority_epoch,
+            grant.authority_epoch.clone(),
             grant.approved.generation,
             grant.approved.process_fence_nonce.clone(),
         )
@@ -2006,7 +2068,7 @@ mod tests {
                 monotonic_ns: Some(1),
             },
             fence,
-            grant.authority_epoch,
+            grant.authority_epoch.clone(),
             BTreeMap::from([("broker".to_owned(), "a".repeat(64))]),
             1,
         )
@@ -2039,7 +2101,7 @@ mod tests {
         )
         .map_err(|error| PortError::Invalid(error.to_string()))?;
         let fence = FencingToken::new(
-            grant.authority_epoch,
+            grant.authority_epoch.clone(),
             grant.approved.generation,
             grant.approved.process_fence_nonce.clone(),
         )
@@ -2337,7 +2399,7 @@ mod tests {
         ] {
             let mut first_broker = broker(
                 FakeAuthority {
-                    epoch: 7,
+                    epoch: test_epoch(7),
                     broker_epoch: 0,
                     tamper,
                     last: None,
@@ -2659,5 +2721,59 @@ mod tests {
             request.validate(),
             Err(BrokerError::Duplicate("dependency_closure"))
         );
+    }
+
+    #[test]
+    fn broker_grant_round_trip_with_epoch_id_and_wrong_lineage_cursor_rejected() {
+        // Proportionate T6-E3 Split C proof: EpochId grant round-trips through
+        // seal/validate, and a cursor minted in another lineage (same sequence)
+        // is rejected via exact-tuple is_same_authority, never promoted.
+        let mut broker = broker(
+            FakeAuthority::new(),
+            FakeProcess {
+                state: None,
+                unknown: false,
+                wrong_receipt: false,
+            },
+        );
+        let receipt = broker
+            .register(registration_request())
+            .expect("registration");
+        assert!(receipt.authority_epoch.is_same_authority(&test_epoch(7)));
+        assert_eq!(receipt.user_broker_epoch, 1);
+        let launch = broker.launch(launch_request()).expect("launch");
+        assert!(
+            launch
+                .operation_permit
+                .authority_epoch
+                .is_same_authority(&test_epoch(7))
+        );
+        // Wire round-trip preserves lineage+sequence.
+        let wire = serde_json::to_string(&receipt).expect("receipt json");
+        let decoded: RegistrationReceipt = serde_json::from_str(&wire).expect("decode");
+        assert!(decoded.authority_epoch.is_same_authority(&test_epoch(7)));
+
+        // Wrong-lineage cursor with equal sequence must fail closed.
+        let mut snapshot = broker.snapshot();
+        let mut wrong = snapshot.operation_cursors.first().expect("cursor").clone();
+        wrong.authority_epoch = test_epoch_b(7);
+        assert!(
+            !wrong
+                .authority_epoch
+                .is_same_authority(&receipt.authority_epoch)
+        );
+        snapshot.operation_cursors[0] = wrong;
+        let mut restarted = UserBroker::new(
+            Some(Box::new(FakeAuthority::new())),
+            Some(Box::new(FakeProcess {
+                state: None,
+                unknown: false,
+                wrong_receipt: false,
+            })),
+            Some(Box::new(FakeDurable {
+                snapshot: Some(snapshot),
+            })),
+        );
+        assert_eq!(restarted.recover(), Err(BrokerError::GrantBindingMismatch));
     }
 }

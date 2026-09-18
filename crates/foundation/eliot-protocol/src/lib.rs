@@ -12,7 +12,7 @@ use std::{collections::BTreeMap, fmt, io::Read};
 
 use eliot_agent_contracts::LivePeerMessage;
 use eliot_contracts::{
-    ArtifactId, AuthorityEpoch, ContractError, ContractIdentity, ContractVersion, RequestId,
+    ArtifactId, ContractError, ContractIdentity, ContractVersion, EpochId, RequestId,
     ResourceGeneration, StateFence, canonical_json_bytes, contract_identity,
 };
 use eliot_evidence::EvidenceEnvelope;
@@ -30,7 +30,8 @@ pub mod reactive_context;
 pub use pipe_name::{
     ELIOT_PIPE_PREFIX, EliotPipeFamily, EliotPipeName, EliotPipeNameError, EliotPipeSegment,
     EliotPipeSegmentReason, LegacyEliotPipeName, MAX_PIPE_NAME_BYTES, MAX_PIPE_SEGMENT_BYTES,
-    MAX_PIPE_SUFFIX_BYTES, PIPE_NAME_CONTRACT_NAME, PIPE_NAME_WIRE_REVISION,
+    MAX_PIPE_SUFFIX_BYTES, PIPE_NAME_CONTRACT_NAME, PIPE_NAME_CONTRACT_VERSION,
+    PIPE_NAME_UNICODE_PROFILE, PIPE_NAME_WIRE_REVISION, pipe_name_contract_identity,
 };
 pub use reactive_context::{
     MAX_REACTIVE_CONTEXT_ACK_HISTORY, MAX_REACTIVE_CONTEXT_CONTENT_BYTES,
@@ -49,9 +50,9 @@ pub mod dreamer_job;
 pub use dreamer_job::{
     AdmissionRef, CancellationState, DURABLE_JOB_CANONICAL_ENCODING, DURABLE_JOB_CONTRACT_NAME,
     DURABLE_JOB_CONTRACT_VERSION, DurableJobError, DurableJobRecord, DurableJobRequest,
-    DurableRequestIdentity, JobCapability, JobCheckpoint, JobLease, JobOperation, JobOperationKind,
-    JobOutcome, JobRole, JobState, JobSubmission, LeaseSelector, MutationDisposition,
-    MutationReconciliation, OpaqueContentRef, durable_job_contract_identity,
+    DurableJobResponse, DurableRequestIdentity, JobCapability, JobCheckpoint, JobLease,
+    JobOperation, JobOperationKind, JobOutcome, JobRole, JobState, JobSubmission, LeaseSelector,
+    MutationDisposition, MutationReconciliation, OpaqueContentRef, durable_job_contract_identity,
 };
 
 /// Stable identity of this protocol surface.
@@ -97,8 +98,22 @@ pub const AGENT_BRIDGE_ACTIVATION_RESPONSE_WIRE_ID: &str =
     "eliot.protocol.agent-bridge-activation-response";
 /// Current agent-bridge activation response wire version.
 pub const AGENT_BRIDGE_ACTIVATION_RESPONSE_WIRE_VERSION: u16 = 1;
-/// Stable denial code used until the eliotd semantic resolver exists.
+/// Stable denial code for a Kernel-owned activation refusal with no typed
+/// daemon semantic result (pre-ticket immediate denial or result-less expiry).
+/// It never stands in for one of the six typed disposition codes below.
 pub const AGENT_BRIDGE_SEMANTIC_RESOLUTION_UNAVAILABLE: &str = "SEMANTIC_RESOLUTION_UNAVAILABLE";
+/// Stable denial code projecting a daemon `TASK_SELECTION_REQUIRED` disposition.
+pub const AGENT_BRIDGE_TASK_SELECTION_REQUIRED: &str = "TASK_SELECTION_REQUIRED";
+/// Stable denial code projecting a daemon `SCOPE_SELECTION_REQUIRED` disposition.
+pub const AGENT_BRIDGE_SCOPE_SELECTION_REQUIRED: &str = "SCOPE_SELECTION_REQUIRED";
+/// Stable denial code projecting a daemon `SCOPE_AMBIGUOUS` disposition.
+pub const AGENT_BRIDGE_SCOPE_AMBIGUOUS: &str = "SCOPE_AMBIGUOUS";
+/// Stable denial code projecting a daemon `NOT_READY` disposition.
+pub const AGENT_BRIDGE_NOT_READY: &str = "NOT_READY";
+/// Stable denial code projecting a daemon `STALE_FENCE` disposition.
+pub const AGENT_BRIDGE_STALE_FENCE: &str = "STALE_FENCE";
+/// Stable denial code projecting a daemon `FAILED_INTERNAL` disposition.
+pub const AGENT_BRIDGE_FAILED_INTERNAL: &str = "FAILED_INTERNAL";
 /// Stable wire identity for a Kernel-to-eliotd semantic-resolution ticket.
 pub const AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_ID: &str =
     "eliot.protocol.agent-activation-resolution-ticket";
@@ -636,7 +651,11 @@ pub struct EventEnvelope {
     /// Producer generation used to fence old producers.
     pub producer_generation: ResourceGeneration,
     /// Authority epoch observed when the event was produced.
-    pub authority_epoch: AuthorityEpoch,
+    ///
+    /// Lineage-aware [`EpochId`] exact tuple; must match
+    /// `state_fence.authority_epoch` via `is_same_authority` (Implements #64).
+    /// Bare scalars are rejected at the wire boundary.
+    pub authority_epoch: EpochId,
     /// Stable event identity used for idempotent replay.
     pub event_id: String,
     /// Monotonic stream sequence.
@@ -673,7 +692,10 @@ impl EventEnvelope {
         unique_texts(&self.causal_predecessor_refs, "causal_predecessor_refs")?;
         self.payload_or_blob_ref.validate()?;
         self.state_fence.validate()?;
-        if self.authority_epoch != self.state_fence.authority_epoch {
+        if !self
+            .authority_epoch
+            .is_same_authority(&self.state_fence.authority_epoch)
+        {
             return Err(ProtocolError::InvalidField {
                 field: "authority_epoch",
                 reason: "must match state_fence.authority_epoch",
@@ -943,7 +965,10 @@ pub struct ClientHello {
     /// Maximum frame body accepted by the client.
     pub max_frame: u32,
     /// State/authority epoch observed by the client.
-    pub authority_epoch: AuthorityEpoch,
+    ///
+    /// Lineage-aware [`EpochId`]; must match the registered module generation
+    /// fence via `is_same_authority` (Implements #64).
+    pub authority_epoch: EpochId,
 }
 
 impl ClientHello {
@@ -973,7 +998,12 @@ impl ClientHello {
                 reason: "must match module contract and generation artifact",
             });
         }
-        if self.module_generation.state_fence.authority_epoch != self.authority_epoch {
+        if !self
+            .module_generation
+            .state_fence
+            .authority_epoch
+            .is_same_authority(&self.authority_epoch)
+        {
             return Err(ProtocolError::InvalidField {
                 field: "authority_epoch",
                 reason: "must match the registered module generation fence",
@@ -1032,7 +1062,9 @@ pub struct AgentBridgeClientDeclaration {
     /// Protected Kernel handshake principal binding. This is not an `AgentSession` principal.
     pub expected_kernel_principal_binding: String,
     /// Protected authority epoch expected from the Kernel server.
-    pub expected_kernel_authority_epoch: AuthorityEpoch,
+    ///
+    /// Lineage-aware [`EpochId`] (Implements #64).
+    pub expected_kernel_authority_epoch: EpochId,
     /// Protected immutable generation expected from the Kernel server.
     pub expected_kernel_generation: ResourceGeneration,
     /// Lowercase SHA-256 of the expected Kernel artifact.
@@ -1080,7 +1112,7 @@ impl AgentBridgeClientDeclaration {
             capabilities: self.capabilities.clone(),
             privacy_classes: self.privacy_classes.clone(),
             max_frame: self.max_frame,
-            authority_epoch: self.module_generation.state_fence.authority_epoch,
+            authority_epoch: self.module_generation.state_fence.authority_epoch.clone(),
         };
         hello.validate()?;
         Ok(hello)
@@ -1200,7 +1232,10 @@ pub struct AgentBridgePeerChallenge {
     /// Exact Kernel handshake principal binding observed by the Kernel.
     pub kernel_principal_binding: String,
     /// Exact Kernel authority epoch observed by the Kernel.
-    pub kernel_authority_epoch: AuthorityEpoch,
+    ///
+    /// Lineage-aware [`EpochId`]; validated by exact-tuple equality, never by
+    /// numeric ordering (Implements #64).
+    pub kernel_authority_epoch: EpochId,
     /// Exact Kernel generation observed by the Kernel.
     pub kernel_generation: ResourceGeneration,
     /// Lowercase SHA-256 of the exact Kernel executable artifact.
@@ -1263,7 +1298,9 @@ impl AgentBridgePeerChallenge {
             &self.kernel_principal_binding,
             "agent_bridge_peer_challenge.kernel_principal_binding",
         )?;
-        if self.kernel_authority_epoch.value() == 0 || self.kernel_generation.value() == 0 {
+        // `EpochId` is always a validated non-zero tuple; only the generation
+        // retains a scalar zero check.
+        if self.kernel_generation.value() == 0 {
             return Err(ProtocolError::InvalidField {
                 field: "agent_bridge_peer_challenge.kernel_generation",
                 reason: "Kernel authority and generation must be nonzero and generation-bound",
@@ -2002,7 +2039,11 @@ impl AgentActivationResolutionDecision {
 #[serde(deny_unknown_fields)]
 pub struct AgentBridgeActivationFence {
     /// Semantic authority epoch selected by Kernel admission.
-    pub authority_epoch: AuthorityEpoch,
+    ///
+    /// Lineage-aware [`EpochId`] exact tuple; lineage is threaded from the
+    /// Kernel activation receipt (`AgentBridgePeerAdmissionReceipt.state_fence`)
+    /// and matched via `is_same_authority`/`==` (Implements #64).
+    pub authority_epoch: EpochId,
     /// Semantic activation generation selected by Kernel admission.
     pub generation: ResourceGeneration,
     /// Kernel-issued fence nonce.
@@ -2011,10 +2052,13 @@ pub struct AgentBridgeActivationFence {
 
 impl AgentBridgeActivationFence {
     fn validate(&self) -> Result<(), ProtocolError> {
-        if self.authority_epoch.value() == 0 || self.generation.value() == 0 {
+        // `EpochId` is always a validated non-zero `(lineage_id, sequence)`
+        // tuple by construction; only the activation generation needs a
+        // nonzero check here.
+        if self.generation.value() == 0 {
             return Err(ProtocolError::InvalidField {
                 field: "agent_bridge_activation_response.state_fence",
-                reason: "authority epoch and activation generation must be nonzero",
+                reason: "activation generation must be nonzero",
             });
         }
         bounded_text(
@@ -2105,11 +2149,33 @@ impl AgentBridgeAuthenticatedBinding {
 }
 
 /// Typed reason why an admitted bridge transport cannot be activated.
+///
+/// The six disposition codes project the exact daemon-owned
+/// [`AgentActivationResolutionDisposition`](crate::AgentActivationResolutionDisposition)
+/// that refused the ticket; each carries that disposition's stable
+/// `SCREAMING_SNAKE_CASE` wire string so agents can distinguish selection,
+/// ambiguity, retry, fence, and internal outcomes. `Resolved` never maps here:
+/// it yields the `Authenticated` binding instead. `SemanticResolutionUnavailable`
+/// is Kernel-owned and is used only when no daemon disposition exists at all
+/// (pre-ticket immediate denial or result-less expiry); it never collapses two
+/// distinct dispositions into one code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum AgentBridgeActivationDenialCode {
-    /// The trusted eliotd semantic resolver is not yet available.
+    /// No typed daemon semantic result can be projected for this ticket.
     SemanticResolutionUnavailable,
+    /// The daemon reported `TASK_SELECTION_REQUIRED`.
+    TaskSelectionRequired,
+    /// The daemon reported `SCOPE_SELECTION_REQUIRED`.
+    ScopeSelectionRequired,
+    /// The daemon reported `SCOPE_AMBIGUOUS`.
+    ScopeAmbiguous,
+    /// The daemon reported `NOT_READY`.
+    NotReady,
+    /// The daemon reported `STALE_FENCE`.
+    StaleFence,
+    /// The daemon reported `FAILED_INTERNAL`.
+    FailedInternal,
 }
 
 impl AgentBridgeActivationDenialCode {
@@ -2118,6 +2184,12 @@ impl AgentBridgeActivationDenialCode {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::SemanticResolutionUnavailable => AGENT_BRIDGE_SEMANTIC_RESOLUTION_UNAVAILABLE,
+            Self::TaskSelectionRequired => AGENT_BRIDGE_TASK_SELECTION_REQUIRED,
+            Self::ScopeSelectionRequired => AGENT_BRIDGE_SCOPE_SELECTION_REQUIRED,
+            Self::ScopeAmbiguous => AGENT_BRIDGE_SCOPE_AMBIGUOUS,
+            Self::NotReady => AGENT_BRIDGE_NOT_READY,
+            Self::StaleFence => AGENT_BRIDGE_STALE_FENCE,
+            Self::FailedInternal => AGENT_BRIDGE_FAILED_INTERNAL,
         }
     }
 }
@@ -2169,7 +2241,10 @@ impl AgentBridgeActivationResponse {
     /// Current activation response contract version.
     pub const CONTRACT_VERSION: u16 = AGENT_BRIDGE_ACTIVATION_RESPONSE_WIRE_VERSION;
 
-    /// Constructs the only R13.1b-authorized response while semantic resolution is absent.
+    /// Constructs the fail-closed denial response for one exact request: either
+    /// a Kernel-owned refusal with no daemon disposition (pre-ticket immediate
+    /// denial or result-less expiry) or the typed projection of one daemon
+    /// non-`Resolved` disposition supplied by the caller.
     pub fn denied(
         request: &AgentBridgeActivationRequest,
         reason_code: AgentBridgeActivationDenialCode,
@@ -2321,7 +2396,7 @@ pub struct ServerHello {
     /// Rejection reason when no session was admitted.
     pub rejection_reason: Option<String>,
     /// Authority epoch selected for the session.
-    pub authority_epoch: AuthorityEpoch,
+    pub authority_epoch: EpochId,
 }
 
 impl ServerHello {
@@ -2529,17 +2604,1141 @@ pub fn negotiate(
     client.protocol_range.select(server_range)
 }
 
+/// Stable wire identity for a versioned P-04 host-request envelope.
+pub const HOST_REQUEST_WIRE_ID: &str = "eliot.protocol.host-request";
+/// Current P-04 host-request envelope wire version.
+pub const HOST_REQUEST_WIRE_VERSION: u16 = 1;
+/// Stable wire identity for a Kernel-issued host-request admission receipt.
+pub const HOST_REQUEST_ADMISSION_RECEIPT_WIRE_ID: &str =
+    "eliot.protocol.host-request-admission-receipt";
+/// Current host-request admission receipt wire version.
+pub const HOST_REQUEST_ADMISSION_RECEIPT_WIRE_VERSION: u16 = 1;
+/// Stable wire identity for a Kernel-observed bridge process binding.
+pub const AGENT_BRIDGE_PROCESS_BINDING_WIRE_ID: &str =
+    "eliot.protocol.agent-bridge-process-binding";
+/// Current bridge process binding wire version.
+pub const AGENT_BRIDGE_PROCESS_BINDING_WIRE_VERSION: u16 = 1;
+/// Bounded length for host-request identity text fields.
+const MAX_HOST_REQUEST_TEXT_BYTES: usize = 512;
+
+/// Closed P-04 host-request kinds admitted by the Kernel admission gate.
+///
+/// Activation covers the first-attach activation/onboarding path; re-attach of
+/// an existing durable Session uses Status or Reconciliation, never a second
+/// Activation under the same identity. Cancellation, Status, and
+/// Reconciliation always target one exact previously admitted operation
+/// through `parent_operation_id`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum HostRequestKind {
+    /// First-attach activation/onboarding bound to a typed resolution result.
+    Activation,
+    /// Invocation of an exact admitted capability under a bound Session.
+    Invocation,
+    /// Cancellation of one exact previously admitted operation.
+    Cancellation,
+    /// Observation-only status read of one exact admitted operation.
+    Status,
+    /// Reconciliation of one exact operation after an unknown delivery.
+    Reconciliation,
+}
+
+impl HostRequestKind {
+    /// Returns the stable wire code.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Activation => "ACTIVATION",
+            Self::Invocation => "INVOCATION",
+            Self::Cancellation => "CANCELLATION",
+            Self::Status => "STATUS",
+            Self::Reconciliation => "RECONCILIATION",
+        }
+    }
+}
+
+/// Exact request/idempotency/cancellation/parent/deadline/capability/
+/// task-scope-Session/payload-schema identities for one host request.
+///
+/// Caller-supplied Session/task/`WorkScope` values are selectors that Kernel
+/// validates against its own resolved binding; they never create authority.
+/// Connection, durable-Session, task, and operation identities are distinct
+/// domains: one string value must never be reused across domains.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HostRequestIdentity {
+    /// Exact request identity, unique per envelope.
+    pub request_id: RequestId,
+    /// Caller-provided idempotency key for exact replay.
+    pub idempotency_key: String,
+    /// Cancellation identity for the request lifecycle.
+    pub cancellation_id: String,
+    /// Exact previously admitted operation targeted by Cancellation, Status,
+    /// and Reconciliation kinds; lineage reference otherwise.
+    pub parent_operation_id: Option<String>,
+    /// Kernel-owned absolute deadline in Unix milliseconds.
+    pub deadline_unix_ms: u64,
+    /// Exact capability name requested; Kernel checks admission membership.
+    pub capability: String,
+    /// Durable semantic Session identity claimed by the request, if any.
+    pub session_id: Option<String>,
+    /// Governor-owned task identity claimed by the request, if any.
+    pub task_id: Option<String>,
+    /// Governor-owned `WorkScope` identity claimed by the request, if any.
+    pub work_scope_id: Option<String>,
+    /// Exact payload-schema identity; the opaque payload travels by digest.
+    pub payload_schema_id: String,
+    /// Lowercase SHA-256 over the exact opaque payload bytes.
+    pub payload_sha256: String,
+}
+
+impl HostRequestIdentity {
+    /// Validates identity shape without admitting any binding.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        text(self.request_id.as_str(), "host_request.request_id")?;
+        bounded_text(
+            &self.idempotency_key,
+            "host_request.idempotency_key",
+            MAX_HOST_REQUEST_TEXT_BYTES,
+        )?;
+        bounded_text(
+            &self.cancellation_id,
+            "host_request.cancellation_id",
+            MAX_HOST_REQUEST_TEXT_BYTES,
+        )?;
+        if let Some(parent) = &self.parent_operation_id {
+            bounded_text(
+                parent,
+                "host_request.parent_operation_id",
+                MAX_HOST_REQUEST_TEXT_BYTES,
+            )?;
+            if parent == self.request_id.as_str() {
+                return Err(ProtocolError::InvalidField {
+                    field: "host_request.parent_operation_id",
+                    reason: "must not reference the enclosing request identity",
+                });
+            }
+        }
+        if self.deadline_unix_ms == 0 {
+            return Err(ProtocolError::InvalidField {
+                field: "host_request.deadline_unix_ms",
+                reason: "must be greater than zero",
+            });
+        }
+        bounded_text(
+            &self.capability,
+            "host_request.capability",
+            MAX_HOST_REQUEST_TEXT_BYTES,
+        )?;
+        for (value, field) in [
+            (self.session_id.as_ref(), "host_request.session_id"),
+            (self.task_id.as_ref(), "host_request.task_id"),
+            (self.work_scope_id.as_ref(), "host_request.work_scope_id"),
+        ] {
+            if let Some(identity) = value {
+                bounded_text(identity, field, MAX_HOST_REQUEST_TEXT_BYTES)?;
+            }
+        }
+        bounded_text(
+            &self.payload_schema_id,
+            "host_request.payload_schema_id",
+            MAX_HOST_REQUEST_TEXT_BYTES,
+        )?;
+        lowercase_sha256(&self.payload_sha256, "host_request.payload_sha256")?;
+        Ok(())
+    }
+
+    /// Validates per-kind identity presence rules.
+    pub fn validate_for_kind(&self, kind: HostRequestKind) -> Result<(), ProtocolError> {
+        self.validate()?;
+        let semantic_selected =
+            self.session_id.is_some() || self.task_id.is_some() || self.work_scope_id.is_some();
+        match kind {
+            HostRequestKind::Activation => {
+                if semantic_selected {
+                    return Err(ProtocolError::InvalidField {
+                        field: "host_request.activation_identity",
+                        reason: "pre-activation identity must not contain semantic Session, task, or scope state",
+                    });
+                }
+                if self.parent_operation_id.is_some() {
+                    return Err(ProtocolError::InvalidField {
+                        field: "host_request.parent_operation_id",
+                        reason: "activation must not target a parent operation",
+                    });
+                }
+            }
+            HostRequestKind::Invocation => {
+                if self.session_id.is_none() {
+                    return Err(ProtocolError::InvalidField {
+                        field: "host_request.session_id",
+                        reason: "invocation must bind an exact durable Session identity",
+                    });
+                }
+            }
+            HostRequestKind::Cancellation
+            | HostRequestKind::Status
+            | HostRequestKind::Reconciliation => {
+                if self.parent_operation_id.is_none() {
+                    return Err(ProtocolError::InvalidField {
+                        field: "host_request.parent_operation_id",
+                        reason: "must target one exact previously admitted operation",
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Ticket/result digest binding carried only by Activation-kind envelopes.
+///
+/// The digests reference the exact Kernel-retained ticket and typed
+/// [`AgentActivationResolutionResult`]; they carry no semantic meaning and
+/// grant no binding by themselves.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HostRequestActivationBinding {
+    /// Exact Kernel-issued resolution ticket identity.
+    pub ticket_id: String,
+    /// Digest of the exact resolution ticket.
+    pub ticket_sha256: String,
+    /// Digest of the exact typed semantic resolution result.
+    pub resolution_result_sha256: String,
+}
+
+impl HostRequestActivationBinding {
+    /// Validates the closed digest binding shape.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        bounded_text(
+            &self.ticket_id,
+            "host_request.activation_binding.ticket_id",
+            MAX_HOST_REQUEST_TEXT_BYTES,
+        )?;
+        lowercase_sha256(
+            &self.ticket_sha256,
+            "host_request.activation_binding.ticket_sha256",
+        )?;
+        lowercase_sha256(
+            &self.resolution_result_sha256,
+            "host_request.activation_binding.resolution_result_sha256",
+        )?;
+        Ok(())
+    }
+}
+
+/// Versioned P-04 host-request envelope.
+///
+/// The envelope carries exact identities and digests only. It contains no
+/// generic JSON command, no raw MCP payload, and no arbitrary operation name:
+/// the opaque payload is referenced by `payload_schema_id`/`payload_sha256`
+/// and is never interpreted by Kernel. Transport success, liveness, SID,
+/// executable bytes, or a cached token never appear here as capability or
+/// Session continuity; the transport binding travels in
+/// `peer_admission_receipt_sha256` and the process binding travels alongside.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HostRequestEnvelope {
+    /// Envelope wire identity.
+    pub wire_id: String,
+    /// Envelope wire version.
+    pub wire_version: u16,
+    /// Closed request kind.
+    pub kind: HostRequestKind,
+    /// Kernel-created transport connection identity. This is distinct from
+    /// the durable semantic Session, the task, and the operation identities.
+    pub connection_id: String,
+    /// Exact request identities.
+    pub identity: HostRequestIdentity,
+    /// Exact fence observed with the transport admission.
+    pub state_fence: StateFence,
+    /// Digest of the exact immutable admission descriptor.
+    pub descriptor_sha256: String,
+    /// Digest of the exact Kernel-produced transport admission receipt.
+    pub peer_admission_receipt_sha256: String,
+    /// Ticket/result binding, present only for Activation.
+    pub activation_binding: Option<HostRequestActivationBinding>,
+    /// Lowercase SHA-256 over every envelope field except this field.
+    pub envelope_sha256: String,
+}
+
+impl HostRequestEnvelope {
+    /// Current envelope contract version.
+    pub const CONTRACT_VERSION: u16 = HOST_REQUEST_WIRE_VERSION;
+
+    /// Returns canonical bytes covered by `envelope_sha256`.
+    pub fn canonical_unsigned_bytes(&self) -> Result<Vec<u8>, ProtocolError> {
+        let mut unsigned = self.clone();
+        unsigned.envelope_sha256.clear();
+        canonical_json_bytes(&unsigned).map_err(|error| ProtocolError::Json(error.to_string()))
+    }
+
+    /// Computes the canonical envelope digest.
+    pub fn compute_digest(&self) -> Result<String, ProtocolError> {
+        Ok(eliot_contracts::sha256_hex(
+            &self.canonical_unsigned_bytes()?,
+        ))
+    }
+
+    /// Populates the canonical envelope digest.
+    pub fn with_computed_digest(mut self) -> Result<Self, ProtocolError> {
+        self.envelope_sha256 = self.compute_digest()?;
+        Ok(self)
+    }
+
+    /// Validates the closed envelope shape without admitting its transport.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.wire_id != HOST_REQUEST_WIRE_ID || self.wire_version != Self::CONTRACT_VERSION {
+            return Err(ProtocolError::InvalidField {
+                field: "host_request.wire",
+                reason: "unsupported host-request envelope",
+            });
+        }
+        bounded_text(
+            &self.connection_id,
+            "host_request.connection_id",
+            MAX_HOST_REQUEST_TEXT_BYTES,
+        )?;
+        self.identity.validate_for_kind(self.kind)?;
+        self.state_fence
+            .validate()
+            .map_err(ProtocolError::Foundation)?;
+        if self.kind == HostRequestKind::Activation && self.state_fence.task_revision.is_some() {
+            return Err(ProtocolError::InvalidField {
+                field: "host_request.state_fence",
+                reason: "pre-activation fence must not contain a task revision",
+            });
+        }
+        lowercase_sha256(&self.descriptor_sha256, "host_request.descriptor_sha256")?;
+        lowercase_sha256(
+            &self.peer_admission_receipt_sha256,
+            "host_request.peer_admission_receipt_sha256",
+        )?;
+        match (&self.kind, &self.activation_binding) {
+            (HostRequestKind::Activation, Some(binding)) => binding.validate()?,
+            (HostRequestKind::Activation, None) => {
+                return Err(ProtocolError::InvalidField {
+                    field: "host_request.activation_binding",
+                    reason: "activation must bind the exact resolution ticket and result",
+                });
+            }
+            (_, Some(_)) => {
+                return Err(ProtocolError::InvalidField {
+                    field: "host_request.activation_binding",
+                    reason: "only activation carries a resolution binding",
+                });
+            }
+            (_, None) => {}
+        }
+        lowercase_sha256(&self.envelope_sha256, "host_request.envelope_sha256")?;
+        if self.envelope_sha256 != self.compute_digest()? {
+            return Err(ProtocolError::InvalidField {
+                field: "host_request.envelope_sha256",
+                reason: "host-request envelope digest mismatch",
+            });
+        }
+        self.validate_identity_separation()
+    }
+
+    /// Rejects reuse of one string value across distinct identity domains.
+    fn validate_identity_separation(&self) -> Result<(), ProtocolError> {
+        let mut domains: Vec<(&str, &'static str)> = vec![
+            (self.identity.request_id.as_str(), "host_request.request_id"),
+            (
+                self.identity.idempotency_key.as_str(),
+                "host_request.idempotency_key",
+            ),
+            (
+                self.identity.cancellation_id.as_str(),
+                "host_request.cancellation_id",
+            ),
+            (self.connection_id.as_str(), "host_request.connection_id"),
+        ];
+        if let Some(parent) = &self.identity.parent_operation_id {
+            domains.push((parent.as_str(), "host_request.parent_operation_id"));
+        }
+        for (value, field) in [
+            (self.identity.session_id.as_ref(), "host_request.session_id"),
+            (self.identity.task_id.as_ref(), "host_request.task_id"),
+            (
+                self.identity.work_scope_id.as_ref(),
+                "host_request.work_scope_id",
+            ),
+        ] {
+            if let Some(identity) = value {
+                domains.push((identity.as_str(), field));
+            }
+        }
+        for (index, (value, field)) in domains.iter().enumerate() {
+            for (other, _) in domains.iter().take(index) {
+                if value == other {
+                    return Err(ProtocolError::InvalidField {
+                        field,
+                        reason: "identity must not reuse a value from another identity domain",
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Validates an Activation envelope against the exact typed resolution result.
+    ///
+    /// Only a `Resolved` disposition satisfies this check; every other
+    /// disposition fails without mapping to a Session, task, scope, or retry.
+    /// This contract consumes the typed result path without claiming any
+    /// external receiver identity.
+    pub fn validate_resolution(
+        &self,
+        result: &crate::AgentActivationResolutionResult,
+    ) -> Result<(), ProtocolError> {
+        if self.kind != HostRequestKind::Activation {
+            return Err(ProtocolError::InvalidField {
+                field: "host_request.activation_binding",
+                reason: "only activation consumes a resolution result",
+            });
+        }
+        let binding = self
+            .activation_binding
+            .as_ref()
+            .ok_or(ProtocolError::InvalidField {
+                field: "host_request.activation_binding",
+                reason: "activation must bind the exact resolution ticket and result",
+            })?;
+        binding.validate()?;
+        result.validate()?;
+        if result.ticket_id != binding.ticket_id
+            || result.ticket_sha256 != binding.ticket_sha256
+            || result.result_sha256 != binding.resolution_result_sha256
+            || result.ticket_state_fence != self.state_fence
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "host_request.activation_binding",
+                reason: "must bind the exact resolution ticket, result, and fence",
+            });
+        }
+        if result.resolved_binding().is_none() {
+            return Err(ProtocolError::InvalidField {
+                field: "host_request.activation_binding",
+                reason: "only a resolved semantic result yields an activation binding",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Derives the deterministic opaque Kernel operation handle for one envelope.
+///
+/// The handle is `hostreq:` followed by the exact envelope digest, so an
+/// exact replay derives the same handle and a changed envelope derives a
+/// different one. Callers must treat the handle as opaque.
+#[must_use]
+pub fn host_request_operation_id(envelope: &HostRequestEnvelope) -> String {
+    format!("hostreq:{}", envelope.envelope_sha256)
+}
+
+/// Kernel-issued admission receipt for one exact host-request envelope.
+///
+/// The receipt proves only that the Kernel admission gate accepted the exact
+/// envelope digest for routing. It creates no Session, task, capability, or
+/// result; those remain owned by their respective transitions.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HostRequestAdmissionReceipt {
+    /// Receipt wire identity.
+    pub wire_id: String,
+    /// Receipt wire version.
+    pub wire_version: u16,
+    /// Kernel-derived opaque operation handle.
+    pub operation_id: String,
+    /// Exact request identity echoed from the envelope.
+    pub request_id: RequestId,
+    /// Closed request kind echoed from the envelope.
+    pub kind: HostRequestKind,
+    /// Transport connection identity echoed from the envelope.
+    pub connection_id: String,
+    /// Digest of the exact admitted envelope.
+    pub request_sha256: String,
+    /// Absolute deadline echoed from the envelope.
+    pub deadline_unix_ms: u64,
+    /// Lowercase SHA-256 over every receipt field except this field.
+    pub receipt_sha256: String,
+}
+
+impl HostRequestAdmissionReceipt {
+    /// Current receipt contract version.
+    pub const CONTRACT_VERSION: u16 = HOST_REQUEST_ADMISSION_RECEIPT_WIRE_VERSION;
+
+    /// Issues a receipt for one validated envelope.
+    pub fn issue(envelope: &HostRequestEnvelope) -> Result<Self, ProtocolError> {
+        envelope.validate()?;
+        Self {
+            wire_id: HOST_REQUEST_ADMISSION_RECEIPT_WIRE_ID.to_owned(),
+            wire_version: Self::CONTRACT_VERSION,
+            operation_id: host_request_operation_id(envelope),
+            request_id: envelope.identity.request_id.clone(),
+            kind: envelope.kind,
+            connection_id: envelope.connection_id.clone(),
+            request_sha256: envelope.envelope_sha256.clone(),
+            deadline_unix_ms: envelope.identity.deadline_unix_ms,
+            receipt_sha256: String::new(),
+        }
+        .with_computed_digest()
+    }
+
+    /// Returns canonical bytes covered by `receipt_sha256`.
+    pub fn canonical_unsigned_bytes(&self) -> Result<Vec<u8>, ProtocolError> {
+        let mut unsigned = self.clone();
+        unsigned.receipt_sha256.clear();
+        canonical_json_bytes(&unsigned).map_err(|error| ProtocolError::Json(error.to_string()))
+    }
+
+    /// Computes the canonical receipt digest.
+    pub fn compute_digest(&self) -> Result<String, ProtocolError> {
+        Ok(eliot_contracts::sha256_hex(
+            &self.canonical_unsigned_bytes()?,
+        ))
+    }
+
+    /// Populates the canonical receipt digest.
+    pub fn with_computed_digest(mut self) -> Result<Self, ProtocolError> {
+        self.receipt_sha256 = self.compute_digest()?;
+        Ok(self)
+    }
+
+    /// Validates receipt shape and canonical self digest.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.wire_id != HOST_REQUEST_ADMISSION_RECEIPT_WIRE_ID
+            || self.wire_version != Self::CONTRACT_VERSION
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "host_request_admission_receipt.wire",
+                reason: "unsupported host-request admission receipt",
+            });
+        }
+        bounded_text(
+            &self.operation_id,
+            "host_request_admission_receipt.operation_id",
+            MAX_HOST_REQUEST_TEXT_BYTES,
+        )?;
+        if !self
+            .operation_id
+            .strip_prefix("hostreq:")
+            .is_some_and(|digest| {
+                digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            })
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "host_request_admission_receipt.operation_id",
+                reason: "must be the deterministic opaque handle for the envelope digest",
+            });
+        }
+        text(
+            self.request_id.as_str(),
+            "host_request_admission_receipt.request_id",
+        )?;
+        bounded_text(
+            &self.connection_id,
+            "host_request_admission_receipt.connection_id",
+            MAX_HOST_REQUEST_TEXT_BYTES,
+        )?;
+        lowercase_sha256(
+            &self.request_sha256,
+            "host_request_admission_receipt.request_sha256",
+        )?;
+        if self.deadline_unix_ms == 0 {
+            return Err(ProtocolError::InvalidField {
+                field: "host_request_admission_receipt.deadline_unix_ms",
+                reason: "must be greater than zero",
+            });
+        }
+        lowercase_sha256(
+            &self.receipt_sha256,
+            "host_request_admission_receipt.receipt_sha256",
+        )?;
+        if self.receipt_sha256 != self.compute_digest()? {
+            return Err(ProtocolError::InvalidField {
+                field: "host_request_admission_receipt.receipt_sha256",
+                reason: "admission receipt digest mismatch",
+            });
+        }
+        Ok(())
+    }
+
+    /// Validates that this receipt was issued for the exact envelope.
+    pub fn validate_envelope(&self, envelope: &HostRequestEnvelope) -> Result<(), ProtocolError> {
+        self.validate()?;
+        envelope.validate()?;
+        if self.operation_id != host_request_operation_id(envelope)
+            || self.request_id != envelope.identity.request_id
+            || self.kind != envelope.kind
+            || self.connection_id != envelope.connection_id
+            || self.request_sha256 != envelope.envelope_sha256
+            || self.deadline_unix_ms != envelope.identity.deadline_unix_ms
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "host_request_admission_receipt.request_sha256",
+                reason: "must bind the exact admitted envelope",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Stable wire identity for a P-04 host-request invoke-read payload.
+pub const HOST_REQUEST_INVOKE_READ_WIRE_ID: &str = "eliot.protocol.host-request-invoke-read";
+/// Current host-request invoke-read payload wire version.
+pub const HOST_REQUEST_INVOKE_READ_WIRE_VERSION: u16 = 1;
+/// Stable wire identity for a P-04 host-request result body.
+pub const HOST_REQUEST_RESULT_BODY_WIRE_ID: &str = "eliot.protocol.host-request-result-body";
+/// Current host-request result body wire version.
+///
+/// Version 2 carries the governed attempt binding (`attempt`): the
+/// Kernel-issued fenced capability the completing daemon must present. Stored
+/// version-1 rows predate attempt ownership and still decode (the field
+/// defaults to `None`); the Kernel claim/submit legs require a current attempt
+/// and never accept a body without one.
+pub const HOST_REQUEST_RESULT_BODY_WIRE_VERSION: u16 = 2;
+/// Stable wire identity for a Kernel-issued local-read attempt capability.
+pub const LOCAL_READ_ATTEMPT_WIRE_ID: &str = "eliot.protocol.local-read-attempt";
+/// Current local-read attempt capability wire version.
+pub const LOCAL_READ_ATTEMPT_WIRE_VERSION: u16 = 1;
+
+/// Versioned P-04 invoke-read payload: one exact envelope plus the exact
+/// canonical tool bytes it admits (Implements #18: local read result).
+///
+/// The envelope stays digest-only in spirit: the opaque tool payload still
+/// travels by `payload_schema_id`/`payload_sha256` reference, and this carrier
+/// only proves the presented bytes are the admitted ones. The canonical tool
+/// name must equal the envelope capability and the canonical digest over the
+/// tool bytes must equal the envelope payload digest; anything else is
+/// rejected before any read. The tool value is opaque here (no MCP edge from
+/// the wire crate): it must be a JSON object carrying a non-blank `name`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HostRequestInvokeReadPayload {
+    /// Payload wire identity.
+    pub wire_id: String,
+    /// Payload wire version.
+    pub wire_version: u16,
+    /// Exact admitted envelope.
+    pub envelope: HostRequestEnvelope,
+    /// Exact canonical tool bytes (opaque `ToolRequest` JSON).
+    pub tool: Value,
+}
+
+impl HostRequestInvokeReadPayload {
+    /// Current payload contract version.
+    pub const CONTRACT_VERSION: u16 = HOST_REQUEST_INVOKE_READ_WIRE_VERSION;
+
+    /// Validates the closed payload shape and the envelope/tool linkage.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.wire_id != HOST_REQUEST_INVOKE_READ_WIRE_ID
+            || self.wire_version != Self::CONTRACT_VERSION
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "host_request_invoke_read.wire",
+                reason: "unsupported host-request invoke-read payload",
+            });
+        }
+        self.envelope.validate()?;
+        let object = self.tool.as_object().ok_or(ProtocolError::InvalidField {
+            field: "host_request_invoke_read.tool",
+            reason: "tool bytes must be a JSON object",
+        })?;
+        let name = object
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or(ProtocolError::InvalidField {
+                field: "host_request_invoke_read.tool.name",
+                reason: "tool bytes must carry the canonical tool name",
+            })?;
+        bounded_text(
+            name,
+            "host_request_invoke_read.tool.name",
+            MAX_HOST_REQUEST_TEXT_BYTES,
+        )?;
+        if name != self.envelope.identity.capability {
+            return Err(ProtocolError::InvalidField {
+                field: "host_request_invoke_read.tool.name",
+                reason: "presented tool does not match the admitted capability",
+            });
+        }
+        let bytes = canonical_json_bytes(&self.tool).map_err(|error| {
+            ProtocolError::Json(error.to_string())
+        })?;
+        if eliot_contracts::sha256_hex(&bytes) != self.envelope.identity.payload_sha256 {
+            return Err(ProtocolError::InvalidField {
+                field: "host_request_invoke_read.tool",
+                reason: "presented payload does not match the admitted payload digest",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Versioned P-04 result body: the exact bounded answer bound to one admitted
+/// envelope (Implements #18: local read result) and to one governed attempt.
+///
+/// Carries the opaque bounded response JSON (payload plus revision inside its
+/// content, preserved verbatim from the read owner) with the digests binding
+/// it to the exact operation. `response` must be a JSON object within the
+/// hard structured-response ceiling, and its canonical digest must equal
+/// `result_digest`; a changed payload digest or forged body is rejected
+/// before reading.
+///
+/// The optional `attempt` carries the Kernel-minted fenced attempt capability
+/// for the completing daemon (see [`LocalReadAttempt`]). It is optional on
+/// the wire only so stored pre-ownership rows still decode for exact-replay
+/// readback; every daemon read-port call and result submission must present
+/// the current attempt, enforced by the Kernel legs rather than by shape
+/// validation alone.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HostRequestResultBody {
+    /// Body wire identity.
+    pub wire_id: String,
+    /// Body wire version.
+    pub wire_version: u16,
+    /// Kernel-derived opaque operation handle (`hostreq:` + envelope digest).
+    pub operation_id: String,
+    /// Digest of the exact admitted envelope.
+    pub request_sha256: String,
+    /// Canonical digest over the exact bounded response bytes.
+    pub result_digest: String,
+    /// Exact bounded response JSON (answer payload plus revision).
+    pub response: Value,
+    /// Governed attempt binding for the completing daemon. `None` only for
+    /// stored rows that predate attempt ownership; submissions must carry the
+    /// current attempt.
+    #[serde(default)]
+    pub attempt: Option<LocalReadAttempt>,
+}
+
+impl HostRequestResultBody {
+    /// Current body contract version.
+    pub const CONTRACT_VERSION: u16 = HOST_REQUEST_RESULT_BODY_WIRE_VERSION;
+
+    /// Validates the closed body shape and the digest binding.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.wire_id != HOST_REQUEST_RESULT_BODY_WIRE_ID
+            || self.wire_version != Self::CONTRACT_VERSION
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "host_request_result_body.wire",
+                reason: "unsupported host-request result body",
+            });
+        }
+        bounded_text(
+            &self.operation_id,
+            "host_request_result_body.operation_id",
+            MAX_HOST_REQUEST_TEXT_BYTES,
+        )?;
+        if !self
+            .operation_id
+            .strip_prefix("hostreq:")
+            .is_some_and(|digest| {
+                digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            })
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "host_request_result_body.operation_id",
+                reason: "must be the deterministic opaque handle for the envelope digest",
+            });
+        }
+        lowercase_sha256(
+            &self.request_sha256,
+            "host_request_result_body.request_sha256",
+        )?;
+        lowercase_sha256(
+            &self.result_digest,
+            "host_request_result_body.result_digest",
+        )?;
+        if !self.response.is_object() {
+            return Err(ProtocolError::InvalidField {
+                field: "host_request_result_body.response",
+                reason: "result body must be a bounded JSON object",
+            });
+        }
+        let bytes =
+            canonical_json_bytes(&self.response).map_err(|error| ProtocolError::Json(error.to_string()))?;
+        if bytes.len() > HARD_STRUCTURED_RESPONSE_BYTES {
+            return Err(ProtocolError::InvalidField {
+                field: "host_request_result_body.response",
+                reason: "result body exceeds the bounded response ceiling",
+            });
+        }
+        if eliot_contracts::sha256_hex(&bytes) != self.result_digest {
+            return Err(ProtocolError::InvalidField {
+                field: "host_request_result_body.result_digest",
+                reason: "result digest does not bind the exact response bytes",
+            });
+        }
+        if let Some(attempt) = &self.attempt {
+            attempt.validate()?;
+            if attempt.operation_id != self.operation_id {
+                return Err(ProtocolError::InvalidField {
+                    field: "host_request_result_body.attempt",
+                    reason: "attempt does not bind the exact operation handle",
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Kernel-issued fenced attempt capability for one queued local read.
+///
+/// Replaces the former time-only claim lease: the Kernel mints exactly one
+/// current attempt per queued operation, with a monotonically increasing
+/// fencing generation per operation and a boot-unique attempt identity, and
+/// only the current generation may complete. The daemon must present this
+/// capability verbatim on every read-port call (`local_read`) and on the
+/// result submission (`local_read_result`); the Kernel legs re-check every
+/// field against the live claim record, so a late, duplicate, reassigned, or
+/// revoked attempt fails as a stale noncanonical observation instead of
+/// binding a waiting caller.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LocalReadAttempt {
+    /// Capability wire identity.
+    pub wire_id: String,
+    /// Capability wire version.
+    pub wire_version: u16,
+    /// Kernel-derived opaque operation handle (`hostreq:` + envelope digest):
+    /// the work-item identity this attempt may complete.
+    pub operation_id: String,
+    /// Boot-unique attempt identity minted by the Kernel at claim. Never
+    /// reused across claims, restarts, or generations.
+    pub attempt_id: String,
+    /// Monotonic fencing generation for this operation, starting at 1. Only
+    /// the current generation may complete or extend the attempt.
+    pub fencing_generation: u64,
+    /// Admitted envelope session binding (I15.2 principal/session binding).
+    pub session_id: String,
+    /// Authority epoch observed at claim; rotation invalidates the attempt.
+    pub authority_epoch: EpochId,
+    /// Trusted Kernel-issued scope the read is admitted for.
+    pub scope_id: String,
+    /// Exact facet method admitted for this attempt (`eliot.query`).
+    pub facet_method: String,
+    /// Absolute expiry: the admitted envelope deadline. Elapsed expiry is the
+    /// expected race and projects as expiry, never as authority.
+    pub expires_at_unix_ms: u64,
+    /// Remaining completions this attempt may produce. Exactly one: a
+    /// persisted completion retires the attempt.
+    pub use_budget: u32,
+}
+
+impl LocalReadAttempt {
+    /// Current attempt capability contract version.
+    pub const CONTRACT_VERSION: u16 = LOCAL_READ_ATTEMPT_WIRE_VERSION;
+
+    /// Validates the closed capability shape. Currency (current generation,
+    /// live owner, live epoch) is owned by the Kernel claim record, never by
+    /// shape validation alone.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.wire_id != LOCAL_READ_ATTEMPT_WIRE_ID
+            || self.wire_version != Self::CONTRACT_VERSION
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "local_read_attempt.wire",
+                reason: "unsupported local-read attempt capability",
+            });
+        }
+        bounded_text(
+            &self.operation_id,
+            "local_read_attempt.operation_id",
+            MAX_HOST_REQUEST_TEXT_BYTES,
+        )?;
+        if !self
+            .operation_id
+            .strip_prefix("hostreq:")
+            .is_some_and(|digest| {
+                digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            })
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "local_read_attempt.operation_id",
+                reason: "must be the deterministic opaque handle for the envelope digest",
+            });
+        }
+        bounded_text(
+            &self.attempt_id,
+            "local_read_attempt.attempt_id",
+            MAX_HOST_REQUEST_TEXT_BYTES,
+        )?;
+        if self.attempt_id == self.operation_id {
+            return Err(ProtocolError::InvalidField {
+                field: "local_read_attempt.attempt_id",
+                reason: "attempt identity must not reuse the operation handle",
+            });
+        }
+        if self.fencing_generation == 0 {
+            return Err(ProtocolError::InvalidField {
+                field: "local_read_attempt.fencing_generation",
+                reason: "fencing generation must be positive",
+            });
+        }
+        bounded_text(
+            &self.session_id,
+            "local_read_attempt.session_id",
+            MAX_HOST_REQUEST_TEXT_BYTES,
+        )?;
+        eliot_contracts::epoch_identity_digest(&self.authority_epoch)
+            .map_err(|_| ProtocolError::InvalidField {
+                field: "local_read_attempt.authority_epoch",
+                reason: "authority epoch is not a valid epoch",
+            })?;
+        bounded_text(
+            &self.scope_id,
+            "local_read_attempt.scope_id",
+            MAX_HOST_REQUEST_TEXT_BYTES,
+        )?;
+        bounded_text(
+            &self.facet_method,
+            "local_read_attempt.facet_method",
+            MAX_HOST_REQUEST_TEXT_BYTES,
+        )?;
+        if self.expires_at_unix_ms == 0 {
+            return Err(ProtocolError::InvalidField {
+                field: "local_read_attempt.expires_at_unix_ms",
+                reason: "attempt expiry must be greater than zero",
+            });
+        }
+        if self.use_budget == 0 {
+            return Err(ProtocolError::InvalidField {
+                field: "local_read_attempt.use_budget",
+                reason: "attempt use budget must be positive",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Stable typed denial codes for host-request admission control.
+///
+/// Codes are control values, never human prose: no error text drives routing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum HostRequestRejectionCode {
+    /// The transport connection is not a currently admitted bridge connection.
+    UnknownConnection,
+    /// The request fence does not match the admitted generation or epoch.
+    StaleFence,
+    /// The requested capability is not in the admitted profile set.
+    CapabilityNotAdmitted,
+    /// The claimed Session is not bound to the requesting connection.
+    SessionNotBound,
+    /// The same identity was reused with a different payload or binding.
+    IdentityConflict,
+    /// The absolute deadline already elapsed or is not admitted.
+    ExpiredDeadline,
+    /// Kernel admission is closed in the current service state.
+    AdmissionClosed,
+    /// The activation result is not a resolved semantic binding.
+    ResolutionNotResolved,
+    /// The targeted parent operation is unknown to durable state.
+    UnknownOperation,
+}
+
+impl HostRequestRejectionCode {
+    /// Returns the stable wire code.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::UnknownConnection => "UNKNOWN_CONNECTION",
+            Self::StaleFence => "STALE_FENCE",
+            Self::CapabilityNotAdmitted => "CAPABILITY_NOT_ADMITTED",
+            Self::SessionNotBound => "SESSION_NOT_BOUND",
+            Self::IdentityConflict => "IDENTITY_CONFLICT",
+            Self::ExpiredDeadline => "EXPIRED_DEADLINE",
+            Self::AdmissionClosed => "ADMISSION_CLOSED",
+            Self::ResolutionNotResolved => "RESOLUTION_NOT_RESOLVED",
+            Self::UnknownOperation => "UNKNOWN_OPERATION",
+        }
+    }
+}
+
+/// Kernel-observed binding of one live bridge process to its static profile.
+///
+/// This value extends the admission-descriptor span with the live
+/// bridge-artifact, process-generation, and process-start observations that
+/// Kernel must compare against the immutable descriptor before any request
+/// from the connection is admitted. It is inert output until Kernel validates
+/// it against retained challenge state and trusted platform evidence.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentBridgeProcessBinding {
+    /// Binding wire identity.
+    pub wire_id: String,
+    /// Binding wire version.
+    pub wire_version: u16,
+    /// Exact bridge module identity.
+    pub module_id: String,
+    /// Static bridge profile identity.
+    pub profile_id: String,
+    /// Kernel-created transport connection identity.
+    pub connection_id: String,
+    /// Digest of the immutable admission descriptor.
+    pub descriptor_sha256: String,
+    /// Lowercase SHA-256 of the observed bridge executable bytes.
+    pub executable_sha256: String,
+    /// Volume serial number of the observed executable file.
+    pub executable_volume_serial: u32,
+    /// File index of the observed executable file.
+    pub executable_file_index: u64,
+    /// Live bridge generation observed for the connected process.
+    pub bridge_generation: ResourceGeneration,
+    /// Generation/authority fence observed for the connected process.
+    pub state_fence: StateFence,
+    /// Windows SID observed from the connected peer token.
+    pub observed_sid: String,
+    /// Interactive Windows session observed from the connected peer.
+    pub observed_session_id: u32,
+    /// Process ID observed for the connected peer.
+    pub observed_process_id: u32,
+    /// Process start identity observed for the connected peer.
+    pub observed_process_start_time_100ns: u64,
+    /// Absolute image path observed for the connected peer.
+    pub observed_image_path: String,
+    /// Lowercase SHA-256 over every binding field except this field.
+    pub binding_sha256: String,
+}
+
+impl AgentBridgeProcessBinding {
+    /// Current binding contract version.
+    pub const CONTRACT_VERSION: u16 = AGENT_BRIDGE_PROCESS_BINDING_WIRE_VERSION;
+
+    /// Returns canonical bytes covered by `binding_sha256`.
+    pub fn canonical_unsigned_bytes(&self) -> Result<Vec<u8>, ProtocolError> {
+        let mut unsigned = self.clone();
+        unsigned.binding_sha256.clear();
+        canonical_json_bytes(&unsigned).map_err(|error| ProtocolError::Json(error.to_string()))
+    }
+
+    /// Computes the canonical binding digest.
+    pub fn compute_digest(&self) -> Result<String, ProtocolError> {
+        Ok(eliot_contracts::sha256_hex(
+            &self.canonical_unsigned_bytes()?,
+        ))
+    }
+
+    /// Populates the canonical binding digest.
+    pub fn with_computed_digest(mut self) -> Result<Self, ProtocolError> {
+        self.binding_sha256 = self.compute_digest()?;
+        Ok(self)
+    }
+
+    /// Validates the binding shape without authenticating the peer.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.wire_id != AGENT_BRIDGE_PROCESS_BINDING_WIRE_ID
+            || self.wire_version != Self::CONTRACT_VERSION
+            || self.module_id != AGENT_BRIDGE_MODULE_ID
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_bridge_process_binding.wire",
+                reason: "unsupported bridge process binding",
+            });
+        }
+        bounded_text(
+            &self.profile_id,
+            "agent_bridge_process_binding.profile_id",
+            MAX_HOST_REQUEST_TEXT_BYTES,
+        )?;
+        bounded_text(
+            &self.connection_id,
+            "agent_bridge_process_binding.connection_id",
+            MAX_HOST_REQUEST_TEXT_BYTES,
+        )?;
+        lowercase_sha256(
+            &self.descriptor_sha256,
+            "agent_bridge_process_binding.descriptor_sha256",
+        )?;
+        lowercase_sha256(
+            &self.executable_sha256,
+            "agent_bridge_process_binding.executable_sha256",
+        )?;
+        if self.executable_volume_serial == 0 || self.executable_file_index == 0 {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_bridge_process_binding.executable_identity",
+                reason: "executable file identity must be nonzero",
+            });
+        }
+        self.state_fence
+            .validate()
+            .map_err(ProtocolError::Foundation)?;
+        if self.bridge_generation.value() == 0
+            || self.bridge_generation != self.state_fence.resource_generation
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_bridge_process_binding.bridge_generation",
+                reason: "must match the state fence resource generation",
+            });
+        }
+        windows_sid(
+            &self.observed_sid,
+            "agent_bridge_process_binding.observed_sid",
+        )?;
+        if self.observed_session_id == 0
+            || self.observed_process_id == 0
+            || self.observed_process_start_time_100ns == 0
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_bridge_process_binding.observed_identity",
+                reason: "interactive process identities must be nonzero",
+            });
+        }
+        absolute_windows_path(
+            &self.observed_image_path,
+            "agent_bridge_process_binding.observed_image_path",
+        )?;
+        lowercase_sha256(
+            &self.binding_sha256,
+            "agent_bridge_process_binding.binding_sha256",
+        )?;
+        if self.binding_sha256 != self.compute_digest()? {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_bridge_process_binding.binding_sha256",
+                reason: "process binding digest mismatch",
+            });
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use eliot_contracts::{
-        ArtifactId, AuthorityEpoch, ClockReading, ContractId, ContractVersion, ProductId,
+        ArtifactId, ClockReading, ContractId, ContractVersion, EpochLineageId, ProductId,
         RequestMetadata, ResourceGeneration, SourceId,
     };
     use eliot_runtime_contracts::{HealthVector, ModuleGenerationState};
+    use std::num::NonZeroU64;
+
+    const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+    const TEST_LINEAGE_B: &str = "550e8400-e29b-41d4-a716-446655440001";
+
+    fn test_epoch(lineage: &str, sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(lineage).expect("valid test lineage"),
+            NonZeroU64::new(sequence).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
 
     fn fence() -> StateFence {
-        StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+        StateFence::new(test_epoch(TEST_LINEAGE_A, 1), ResourceGeneration::genesis())
     }
 
     fn agent_bridge_client_declaration() -> Result<AgentBridgeClientDeclaration, ProtocolError> {
@@ -2580,7 +3779,7 @@ mod tests {
             expected_kernel_sid: "S-1-5-18".to_owned(),
             expected_kernel_session_id: 0,
             expected_kernel_principal_binding: "kernel:agent-bridge".to_owned(),
-            expected_kernel_authority_epoch: AuthorityEpoch::new(7)?,
+            expected_kernel_authority_epoch: test_epoch(TEST_LINEAGE_A, 7),
             expected_kernel_generation: ResourceGeneration::new(11)?,
             expected_kernel_artifact_sha256: "b".repeat(64),
             expected_kernel_config_snapshot_sha256: "c".repeat(64),
@@ -2712,7 +3911,7 @@ mod tests {
             bridge_generation: declaration.module_generation.generation,
             state_fence: declaration.module_generation.state_fence.clone(),
             kernel_principal_binding: declaration.expected_kernel_principal_binding.clone(),
-            kernel_authority_epoch: declaration.expected_kernel_authority_epoch,
+            kernel_authority_epoch: declaration.expected_kernel_authority_epoch.clone(),
             kernel_generation: declaration.expected_kernel_generation,
             kernel_artifact_sha256: declaration.expected_kernel_artifact_sha256.clone(),
             kernel_config_snapshot_sha256: declaration
@@ -3071,6 +4270,54 @@ mod tests {
     }
 
     #[test]
+    fn bridge_activation_denial_codes_roundtrip_each_typed_variant() -> Result<(), ProtocolError> {
+        let cases = [
+            (
+                AgentBridgeActivationDenialCode::SemanticResolutionUnavailable,
+                AGENT_BRIDGE_SEMANTIC_RESOLUTION_UNAVAILABLE,
+            ),
+            (
+                AgentBridgeActivationDenialCode::TaskSelectionRequired,
+                AGENT_BRIDGE_TASK_SELECTION_REQUIRED,
+            ),
+            (
+                AgentBridgeActivationDenialCode::ScopeSelectionRequired,
+                AGENT_BRIDGE_SCOPE_SELECTION_REQUIRED,
+            ),
+            (
+                AgentBridgeActivationDenialCode::ScopeAmbiguous,
+                AGENT_BRIDGE_SCOPE_AMBIGUOUS,
+            ),
+            (
+                AgentBridgeActivationDenialCode::NotReady,
+                AGENT_BRIDGE_NOT_READY,
+            ),
+            (
+                AgentBridgeActivationDenialCode::StaleFence,
+                AGENT_BRIDGE_STALE_FENCE,
+            ),
+            (
+                AgentBridgeActivationDenialCode::FailedInternal,
+                AGENT_BRIDGE_FAILED_INTERNAL,
+            ),
+        ];
+        let mut seen = std::collections::BTreeSet::new();
+        for (code, wire) in cases {
+            assert_eq!(code.as_str(), wire);
+            assert!(seen.insert(wire), "denial wire codes must be distinct");
+            let encoded = serde_json::to_value(&code)
+                .map_err(|error| ProtocolError::Json(error.to_string()))?;
+            assert_eq!(encoded, Value::String(wire.to_owned()));
+            let decoded: AgentBridgeActivationDenialCode = serde_json::from_value(encoded)
+                .map_err(|error| ProtocolError::Json(error.to_string()))?;
+            assert_eq!(decoded, code);
+            assert_eq!(decoded.as_str(), wire);
+        }
+        assert_eq!(seen.len(), cases.len());
+        Ok(())
+    }
+
+    #[test]
     fn bridge_authenticated_shape_rejects_incomplete_or_mismatched_semantic_bindings()
     -> Result<(), ProtocolError> {
         let binding = AgentBridgeAuthenticatedBinding {
@@ -3078,7 +4325,7 @@ mod tests {
             session_id: "session-1".to_owned(),
             activation_generation: ResourceGeneration::new(3)?,
             state_fence: AgentBridgeActivationFence {
-                authority_epoch: AuthorityEpoch::new(2)?,
+                authority_epoch: test_epoch(TEST_LINEAGE_A, 2),
                 generation: ResourceGeneration::new(3)?,
                 nonce: "semantic-fence-nonce-1".to_owned(),
             },
@@ -3165,7 +4412,7 @@ mod tests {
         assert!(receipt.validate_challenge(&substituted_generation).is_err());
 
         let mut substituted_fence = challenge.clone();
-        substituted_fence.state_fence.authority_epoch = AuthorityEpoch::new(2)?;
+        substituted_fence.state_fence.authority_epoch = test_epoch(TEST_LINEAGE_A, 2);
         substituted_fence = substituted_fence.with_computed_digest()?;
         assert!(substituted_fence.validate().is_ok());
         assert!(receipt.validate_challenge(&substituted_fence).is_err());
@@ -3392,7 +4639,7 @@ mod tests {
             stream_id: "stream-1".to_owned(),
             producer_id: "module-1".to_owned(),
             producer_generation: ResourceGeneration::genesis(),
-            authority_epoch: AuthorityEpoch::genesis(),
+            authority_epoch: test_epoch(TEST_LINEAGE_A, 1),
             event_id: "event-1".to_owned(),
             sequence: 1,
             causal_predecessor_refs: Vec::new(),
@@ -3575,7 +4822,7 @@ mod tests {
     #[test]
     fn event_rejects_authority_epoch_mismatch() -> Result<(), ProtocolError> {
         let mut value = event();
-        value.authority_epoch = AuthorityEpoch::new(2)?;
+        value.authority_epoch = test_epoch(TEST_LINEAGE_A, 2);
         assert!(matches!(
             value.validate(),
             Err(ProtocolError::InvalidField {

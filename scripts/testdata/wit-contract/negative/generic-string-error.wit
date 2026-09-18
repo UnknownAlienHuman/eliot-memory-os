@@ -1,0 +1,14 @@
+package eliot:current@0.1.0;
+
+interface probe-string-err {
+  record probe-input {
+    schema-revision: u32,
+  }
+
+  // FORBIDDEN: generic result<_, string> machine status. Must be rejected.
+  run: func(input: probe-input) -> result<probe-input, string>;
+}
+
+world probe-string-err {
+  export probe-string-err;
+}

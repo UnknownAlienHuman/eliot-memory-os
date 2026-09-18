@@ -1,17 +1,12 @@
 //! Watchdog SCM self-admission cell — bounded timing and identity gate only.
 
 //!
-//! Architecture (verified via `codebase_memory` against `eliot-architecture-docs-fa941135` at `ELIOT_ARCHITECTURE.md`):
-//! R0 independent supervision — A0.3 Hard boundaries / A2.2 Watchdog и Doctor / A8 Watchdog /
-//! A13 Resilience, recovery и observability — SCM registration is read-only projection with
-//! fail-closed identity handles (PID + creation time + image path). No lifecycle authority.
-//!
-//! Implementation (verified via `codebase_memory` against `eliot-architecture-docs-fa941135` at `ELIOT_IMPLEMENTATION.md`
-//! and stale routing graph `eliot-memory-os-44e8b4b-live` verified against base `6ecf2b2217b5bd67247184928663a3e0584dedb9`):
-//! I8 Watchdog implementation contract (I8.1 Process and authority, I8.2 Independent observation routes,
-//! I8.3 Deterministic supervision loop) and I14 Queueing, backpressure and degraded behavior
-//! (I14.6 Durable work, admission and execution axes, I14.10 Supervision strategies and restart intensity)
-//! — Watchdog self-admission / bounded `SERVICE_START_PENDING` gate with wait-hint clamping.
+//! Architecture: A0.3 (docs/architecture/A00-03-hard-boundaries.md#a03-hard-boundaries),
+//! A2.2 (docs/architecture/A02-02-roles.md#a22-roles), A8.1 (docs/architecture/A08-01-purpose.md#a81-purpose),
+//! A13.2 (docs/architecture/A13-02-kernel-and-failure-domains.md#a132-kernel-and-failure-domains).
+//! Implementation: I8.1 (docs/architecture/I08-01-process-and-authority.md#i81-process-and-authority),
+//! I8.2 (docs/architecture/I08-02-independent-observation-routes.md#i82-independent-observation-routes).
+//! Normative precedence remains in `docs/ARCHITECTURE_CONTRACT.md`.
 //!
 //! This cell explicitly forbids start/stop/registration mutation and semantic readiness authority.
 //! It owns only timing/bounded wait and same-process identity equality; it does not own
@@ -85,7 +80,7 @@ pub fn project_service_runtime_inspection(
         }
         ServiceRegistrationRuntimeInspection::Absent => WatchdogRuntimeReadback::Absent,
         ServiceRegistrationRuntimeInspection::Mismatched => WatchdogRuntimeReadback::Mismatched,
-        ServiceRegistrationRuntimeInspection::Unknown => WatchdogRuntimeReadback::Unknown,
+        ServiceRegistrationRuntimeInspection::Unknown { .. } => WatchdogRuntimeReadback::Unknown,
     }
 }
 
@@ -146,6 +141,12 @@ where
     P: WatchdogSelfAdmissionProbe,
     S: WatchdogSelfAdmissionStatus,
 {
+    let _span = tracing::debug_span!("watchdog.self_admission").entered();
+    tracing::debug!(
+        event = "watchdog.self_admission_requested",
+        observation = "requested",
+        "watchdog self-admission requested"
+    );
     admit_watchdog_self_start_with_deadline(probe, status, WATCHDOG_SELF_ADMISSION_DEADLINE_MS)
 }
 
@@ -159,6 +160,10 @@ where
 /// Returns a fail-closed error when the current process identity cannot be
 /// observed, the SCM registration is absent/mismatched/stopped, or the
 /// injected deadline expires before an exact `Starting`/`Running` match.
+#[allow(
+    clippy::too_many_lines,
+    reason = "each fail-closed outcome carries one observation-only timing record without changing the deadline decision"
+)]
 pub fn admit_watchdog_self_start_with_deadline<P, S>(
     probe: &mut P,
     status: &mut S,
@@ -168,9 +173,18 @@ where
     P: WatchdogSelfAdmissionProbe,
     S: WatchdogSelfAdmissionStatus,
 {
-    let expected = probe
-        .current_process_identity()
-        .ok_or(WatchdogSelfAdmissionError::CurrentProcessUnavailable)?;
+    let _deadline_span = tracing::debug_span!("watchdog.self_admission_deadline").entered();
+    crate::diagnostics::observe_self_admission_timing("requested", 0, deadline_ms);
+    let expected = probe.current_process_identity().ok_or_else(|| {
+        crate::diagnostics::observe_self_admission_timing(
+            crate::diagnostics::self_admission_error_diagnostic(
+                WatchdogSelfAdmissionError::CurrentProcessUnavailable,
+            ),
+            0,
+            deadline_ms,
+        );
+        WatchdogSelfAdmissionError::CurrentProcessUnavailable
+    })?;
     let started_at = probe.now_ms();
     let deadline = started_at.saturating_add(deadline_ms);
     let mut checkpoint = 1u32;
@@ -178,6 +192,13 @@ where
     loop {
         let now = probe.now_ms();
         if now >= deadline {
+            crate::diagnostics::observe_self_admission_timing(
+                crate::diagnostics::self_admission_error_diagnostic(
+                    WatchdogSelfAdmissionError::Timeout,
+                ),
+                now.saturating_sub(started_at),
+                deadline_ms,
+            );
             return Err(WatchdogSelfAdmissionError::Timeout);
         }
         let observation = probe.inspect();
@@ -187,9 +208,22 @@ where
                 process: Some(ref actual),
                 ..
             } if same_process_identity(actual, &expected) => {
-                if probe.now_ms() >= deadline {
+                let admitted_at = probe.now_ms();
+                if admitted_at >= deadline {
+                    crate::diagnostics::observe_self_admission_timing(
+                        crate::diagnostics::self_admission_error_diagnostic(
+                            WatchdogSelfAdmissionError::Timeout,
+                        ),
+                        admitted_at.saturating_sub(started_at),
+                        deadline_ms,
+                    );
                     return Err(WatchdogSelfAdmissionError::Timeout);
                 }
+                crate::diagnostics::observe_self_admission_timing(
+                    "admitted",
+                    admitted_at.saturating_sub(started_at),
+                    deadline_ms,
+                );
                 return Ok(actual.clone());
             }
             WatchdogRuntimeReadback::Matching {
@@ -198,21 +232,53 @@ where
                 ..
             }
             | WatchdogRuntimeReadback::Mismatched => {
+                crate::diagnostics::observe_self_admission_timing(
+                    crate::diagnostics::self_admission_error_diagnostic(
+                        WatchdogSelfAdmissionError::RegistrationMismatched,
+                    ),
+                    now.saturating_sub(started_at),
+                    deadline_ms,
+                );
                 return Err(WatchdogSelfAdmissionError::RegistrationMismatched);
             }
             WatchdogRuntimeReadback::Matching {
                 state: WatchdogRuntimeState::Stopped,
                 ..
-            } => return Err(WatchdogSelfAdmissionError::ServiceStopped),
+            } => {
+                crate::diagnostics::observe_self_admission_timing(
+                    crate::diagnostics::self_admission_error_diagnostic(
+                        WatchdogSelfAdmissionError::ServiceStopped,
+                    ),
+                    now.saturating_sub(started_at),
+                    deadline_ms,
+                );
+                return Err(WatchdogSelfAdmissionError::ServiceStopped);
+            }
             WatchdogRuntimeReadback::Matching {
                 state: WatchdogRuntimeState::Stopping,
                 ..
-            } => return Err(WatchdogSelfAdmissionError::ServiceStopping),
+            } => {
+                crate::diagnostics::observe_self_admission_timing(
+                    crate::diagnostics::self_admission_error_diagnostic(
+                        WatchdogSelfAdmissionError::ServiceStopping,
+                    ),
+                    now.saturating_sub(started_at),
+                    deadline_ms,
+                );
+                return Err(WatchdogSelfAdmissionError::ServiceStopping);
+            }
             WatchdogRuntimeReadback::Matching {
                 state: WatchdogRuntimeState::Absent,
                 ..
-            } => return Err(WatchdogSelfAdmissionError::RegistrationAbsent),
-            WatchdogRuntimeReadback::Absent => {
+            }
+            | WatchdogRuntimeReadback::Absent => {
+                crate::diagnostics::observe_self_admission_timing(
+                    crate::diagnostics::self_admission_error_diagnostic(
+                        WatchdogSelfAdmissionError::RegistrationAbsent,
+                    ),
+                    now.saturating_sub(started_at),
+                    deadline_ms,
+                );
                 return Err(WatchdogSelfAdmissionError::RegistrationAbsent);
             }
             WatchdogRuntimeReadback::Matching {
@@ -232,6 +298,13 @@ where
         let wait_hint_ms = bounded_wait_hint_ms(wait_hint_ms);
         let remaining_ms = deadline.saturating_sub(probe.now_ms());
         if remaining_ms == 0 {
+            crate::diagnostics::observe_self_admission_timing(
+                crate::diagnostics::self_admission_error_diagnostic(
+                    WatchdogSelfAdmissionError::Timeout,
+                ),
+                deadline_ms,
+                deadline_ms,
+            );
             return Err(WatchdogSelfAdmissionError::Timeout);
         }
         let status_wait_hint_ms = wait_hint_ms.min(u32::try_from(remaining_ms).unwrap_or(u32::MAX));

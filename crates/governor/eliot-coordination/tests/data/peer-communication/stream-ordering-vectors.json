@@ -1,0 +1,7 @@
+{
+  "stream_a_ids": ["msg-stream-a1", "msg-stream-a2", "msg-stream-a3"],
+  "stream_b_ids": ["msg-stream-b1", "msg-stream-b2"],
+  "deliver_order_a": ["msg-stream-a3", "msg-stream-a1", "msg-stream-a2"],
+  "duplicate_id": "msg-stream-a1",
+  "expected_gap_after_partial": [2]
+}

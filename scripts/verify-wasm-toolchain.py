@@ -5,6 +5,8 @@ Default mode is offline/read-only and proves declaration only. --diagnostic
 inspects an already installed toolchain; --probe also compiles a fixed, empty
 component in temporary storage. Neither mode qualifies a clean bootstrap,
 executes the component, downloads Rust, or proves guest/WIT behavior.
+--self-test runs two focused offline self-checks (absent-manifest fail-closed
+plus pinned guest-target declaration); the full 16-case matrix stays deferred.
 
 Normative target: docs/architecture/I14-19-wasm-components.md. Refs #870.
 """
@@ -316,6 +318,64 @@ def diagnose(declaration: Declaration, *, probe: bool = False) -> dict[str, obje
             result.update(status="INCOMPLETE", cleanup="UNKNOWN", scratch_retained=True)
 
 
+def self_test() -> None:
+    """Two focused offline self-checks for the checker lane (#870A).
+
+    1. Absent rust-toolchain.toml fails closed with typed TOOLCHAIN_UNAVAILABLE
+       through both read_declaration and the CLI (exit 1, status FAIL).
+    2. The pinned guest-target declaration parses with exact host+guest
+       targets, pinned channel, and expected components.
+
+    No network, install, ambient rustup repair, or repository mutation.
+    The remaining 870 cases (3-16 plus clean bootstrap) stay deferred.
+    """
+    import io
+    from contextlib import redirect_stdout
+
+    # 1. Absent manifest must fail closed with a typed reason.
+    with tempfile.TemporaryDirectory(prefix="eliot-wasm-toolchain-selftest-") as temporary:
+        root = Path(temporary)
+        try:
+            read_declaration(root)
+        except ToolchainError as error:
+            if str(error) != "TOOLCHAIN_UNAVAILABLE":
+                raise AssertionError(f"self-test absent-manifest typed {error!r}") from None
+        else:
+            raise AssertionError("self-test absent manifest must fail closed")
+        captured = io.StringIO()
+        with redirect_stdout(captured):
+            code = main(["--root", str(root), "--format", "json"])
+        if code != 1:
+            raise AssertionError(f"self-test absent-manifest CLI exit {code}")
+        try:
+            payload = json.loads(captured.getvalue())
+        except ValueError:
+            raise AssertionError("self-test absent-manifest CLI is not JSON") from None
+        if payload.get("status") != "FAIL" or payload.get("reason") != "TOOLCHAIN_UNAVAILABLE":
+            raise AssertionError(f"self-test absent-manifest payload {payload!r}")
+        if sorted(p.name for p in root.iterdir()):
+            raise AssertionError("self-test must not mutate the probe root")
+
+    # 2. Pinned guest compilation target for reproducible component builds.
+    raw = (
+        b'[toolchain]\nchannel = "1.97.1"\nprofile = "default"\n'
+        b'components = ["clippy", "rustfmt", "rust-analyzer", "rust-src"]\n'
+        b'targets = ["x86_64-pc-windows-msvc", "wasm32-wasip2"]\n'
+    )
+    declaration = parse_declaration(raw)
+    if declaration.channel != "1.97.1":
+        raise AssertionError("self-test channel must stay pinned")
+    if declaration.targets.count(GUEST_TARGET) != 1:
+        raise AssertionError("self-test guest target must be declared once")
+    if set(declaration.targets) != {HOST_TARGET, GUEST_TARGET}:
+        raise AssertionError("self-test must retain host plus one guest target")
+    if set(declaration.components) != set(COMPONENTS):
+        raise AssertionError("self-test components must match pinned policy")
+    if parse_declaration(raw).digest != declaration.digest:
+        raise AssertionError("self-test declaration digest must be deterministic")
+    print("WASM_TOOLCHAIN_SELF_TEST: PASS (2/2)")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
@@ -323,7 +383,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--diagnostic", action="store_true")
     modes.add_argument("--probe", action="store_true")
+    modes.add_argument("--self-test", action="store_true")
     args = parser.parse_args(argv)
+    if args.self_test:
+        self_test()
+        return 0
     payload: dict[str, object] = {"schema": SCHEMA, "proof_ceiling": "DECLARATION_ONLY"}
     try:
         declaration = read_declaration(args.root)

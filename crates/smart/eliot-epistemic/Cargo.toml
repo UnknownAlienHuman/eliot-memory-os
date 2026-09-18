@@ -8,6 +8,7 @@ description = "ELIOT current epistemic position and provenance resolution"
 
 [dependencies]
 eliot-contracts.workspace = true
+eliot-epistemic-contracts = { path = "../eliot-epistemic-contracts", version = "0.1.0" }
 eliot-evidence.workspace = true
 schemars.workspace = true
 serde.workspace = true

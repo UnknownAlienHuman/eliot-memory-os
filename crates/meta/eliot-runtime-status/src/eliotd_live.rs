@@ -215,7 +215,8 @@ pub(super) fn inspect_eliotd_live(
             .runtime_launch
             .authority_state_fence
             .authority_epoch
-            .value()
+            .sequence
+            .get()
     {
         return super::unknown_component(
             "eliotd",
@@ -226,7 +227,8 @@ pub(super) fn inspect_eliotd_live(
                     .runtime_launch
                     .authority_state_fence
                     .authority_epoch
-                    .value()
+                    .sequence
+                    .get()
             ),
         );
     }
@@ -537,7 +539,8 @@ impl EliotdLiveObserver for ProductionEliotdLiveObserver {
                         .runtime_launch
                         .authority_state_fence
                         .authority_epoch
-                        .value()
+                        .sequence
+                        .get()
                 || live_receipt.config_descriptor_sha256
                     != manifest.runtime_launch.eliotd_config_digest.as_str()
                 || live_receipt.descriptor_sha256 != expected_descriptor_digest
@@ -612,12 +615,16 @@ impl EliotdLiveObserver for ProductionEliotdLiveObserver {
         {
             return Ok(None);
         }
-        if receipt.binding().state_fence().authority_epoch()
-            != manifest
-                .runtime_launch
-                .authority_state_fence
-                .authority_epoch
-                .value()
+        if !receipt
+            .binding()
+            .state_fence()
+            .authority_epoch()
+            .is_same_authority(
+                &manifest
+                    .runtime_launch
+                    .authority_state_fence
+                    .authority_epoch,
+            )
         {
             return Ok(None);
         }
@@ -706,7 +713,8 @@ impl EliotdLiveObserver for ProductionEliotdLiveObserver {
                 .runtime_launch
                 .authority_state_fence
                 .authority_epoch
-                .value(),
+                .sequence
+                .get(),
             observed_at_unix_ms: observed_at,
             ready_binding_digest: ready_binding,
         };

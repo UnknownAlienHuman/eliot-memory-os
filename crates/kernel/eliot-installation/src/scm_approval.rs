@@ -4,10 +4,11 @@ use std::path::Path;
 
 use eliot_contracts::sha256_hex;
 use eliot_platform_windows::{
-    ELIOT_HOST_SERVICE_DISPLAY_NAME, ELIOT_HOST_SERVICE_NAME,
-    ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK, ELIOT_WATCHDOG_SERVICE_DISPLAY_NAME,
-    ELIOT_WATCHDOG_SERVICE_NAME, ServiceAccount, ServiceBootstrapArguments,
-    ServiceControlGrantReadback, ServiceRegistrationRequest, ServiceStartMode,
+    ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK, ELIOT_HOST_SERVICE_DISPLAY_NAME,
+    ELIOT_HOST_SERVICE_NAME, ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK,
+    ELIOT_WATCHDOG_SERVICE_DISPLAY_NAME, ELIOT_WATCHDOG_SERVICE_NAME, ServiceAccount,
+    ServiceBootstrapArguments, ServiceControlGrantReadback, ServiceRegistrationRequest,
+    ServiceStartMode, host_service_security_descriptor_digest,
     watchdog_service_security_descriptor_digest,
 };
 use schemars::JsonSchema;
@@ -17,9 +18,12 @@ use super::{
     InstallationError, InstallationServiceBootstrap, InstallerServiceAccount, InstallerServiceRole,
     PlatformHandle, approved_path, handle, sha256_handle,
 };
-/// Durable installer receipt for the one narrow Host-to-Watchdog SCM control
-/// grant. The private service key and SCM mutation handles never cross this
-/// projection.
+/// Durable installer receipt for one narrow per-service installer-policy SCM
+/// control grant: the `EliotHost` self-grant on the canonical `EliotHost`
+/// registration, or the `EliotHost` service-SID grant on the canonical
+/// `EliotWatchdog` registration. Both carry the deterministic Host SID as
+/// principal and differ only in mask/descriptor digest. The private service
+/// key and SCM mutation handles never cross this projection.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InstallerServiceControlGrantReceipt {
@@ -114,7 +118,10 @@ impl InstallerServiceControlGrantReceipt {
         })
     }
 
-    /// Validates the receipt without touching SCM.
+    /// Validates the receipt without touching SCM. Accepts both canonical
+    /// per-service installer-policy grants (Host self-grant and
+    /// Host-to-Watchdog grant), mirroring
+    /// `ServiceControlGrantReadback::validate`.
     pub fn validate(&self) -> Result<(), InstallationError> {
         handle(
             &self.principal_service,
@@ -139,13 +146,25 @@ impl InstallerServiceControlGrantReceipt {
                             || part.parse::<u32>().is_err()
                     })
             })
-            || self.access_mask != ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK
-            || !watchdog_service_security_descriptor_digest(self.principal_sid.as_str())
-                .is_ok_and(|expected| expected == self.security_descriptor_digest.as_str())
         {
             return Err(InstallationError::IdentityConflict);
         }
-        Ok(())
+        // Watchdog grant path (byte-identical legacy behavior).
+        if self.access_mask == ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK
+            && watchdog_service_security_descriptor_digest(self.principal_sid.as_str())
+                .is_ok_and(|expected| expected == self.security_descriptor_digest.as_str())
+        {
+            return Ok(());
+        }
+        // Host self-grant path (per-service generalization; Watchdog path
+        // above unchanged).
+        if self.access_mask == ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK
+            && host_service_security_descriptor_digest(self.principal_sid.as_str())
+                .is_ok_and(|expected| expected == self.security_descriptor_digest.as_str())
+        {
+            return Ok(());
+        }
+        Err(InstallationError::IdentityConflict)
     }
 }
 
@@ -182,7 +201,11 @@ pub struct InstallerServiceRegistrationApproval {
     pub(super) registration_nonce: PlatformHandle,
     /// Authoritative SCM configuration digest returned by readback.
     pub(super) configuration_digest: PlatformHandle,
-    /// Exact Host service-SID grant required only by the Watchdog service.
+    /// Exact installer-policy service DACL grant read back from SCM for
+    /// this registration's service. Both Host and Watchdog registrations
+    /// carry the grant: a service whose security descriptor is not the
+    /// installer policy must never be reported `Applied`. The receipt always
+    /// names the Host service SID authorized by the installer policy.
     pub(super) service_control_grant: Option<InstallerServiceControlGrantReceipt>,
 }
 
@@ -205,8 +228,9 @@ impl InstallerServiceRegistrationApproval {
         &self.configuration_digest
     }
 
-    /// Returns the authoritative Host control grant for the Watchdog
-    /// registration. Host registrations deliberately return `None`.
+    /// Returns the authoritative installer-policy service DACL grant read
+    /// back from SCM for this registration. Both Host and Watchdog
+    /// registrations carry `Some` after authoritative readback.
     #[must_use]
     pub fn service_control_grant(&self) -> Option<&InstallerServiceControlGrantReceipt> {
         self.service_control_grant.as_ref()
@@ -263,10 +287,16 @@ impl InstallerServiceRegistrationApproval {
                 .to_owned(),
             ));
         }
+        // s38 (#1345): Host and Watchdog registrations both require the
+        // exact installer-policy service DACL grant. A Host service whose
+        // security descriptor is not the installer policy must never be
+        // reported `Applied`, so a Host approval without its grant receipt
+        // fails closed exactly like a Watchdog approval without its own.
         match (self.role, &self.service_control_grant) {
-            (InstallerServiceRole::Host, None) => {}
-            (InstallerServiceRole::Watchdog, Some(receipt)) => receipt.validate()?,
-            (InstallerServiceRole::Host, Some(_)) | (InstallerServiceRole::Watchdog, None) => {
+            (InstallerServiceRole::Host | InstallerServiceRole::Watchdog, Some(receipt)) => {
+                receipt.validate()?;
+            }
+            (InstallerServiceRole::Host | InstallerServiceRole::Watchdog, None) => {
                 return Err(InstallationError::IdentityConflict);
             }
         }
@@ -317,8 +347,25 @@ impl InstallerServiceRegistrationApproval {
         if request.expected_configuration_digest() != self.configuration_digest.as_str() {
             return Err(InstallationError::IdentityConflict);
         }
-        if request.requires_host_service_control_grant() != self.service_control_grant.is_some() {
-            return Err(InstallationError::IdentityConflict);
+        // s38 (#1345): both roles prove the installer-policy service DACL
+        // with `Some` grant. The platform flag is still authoritative for the
+        // Watchdog grant install/read; for Host it is advisory across the
+        // platform generalization (older builds report `false` while newer
+        // builds report `true`), so Host requires its own proof under either
+        // flag value while Watchdog keeps the exact flag coupling.
+        match self.role {
+            InstallerServiceRole::Watchdog => {
+                if !request.requires_host_service_control_grant()
+                    || self.service_control_grant.is_none()
+                {
+                    return Err(InstallationError::IdentityConflict);
+                }
+            }
+            InstallerServiceRole::Host => {
+                if self.service_control_grant.is_none() {
+                    return Err(InstallationError::IdentityConflict);
+                }
+            }
         }
         Ok(request)
     }

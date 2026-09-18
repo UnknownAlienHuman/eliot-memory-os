@@ -8,11 +8,20 @@
 //! boundary via `super::*`. It is an ordinary module kept under 10k LOC.
 
 use super::*;
+use eliot_contracts::{EpochId, EpochLineageId};
+
+fn test_epoch(sequence: u64) -> EpochId {
+    EpochId::new(
+        EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("lineage"),
+        std::num::NonZeroU64::new(sequence).expect("sequence"),
+    )
+    .expect("epoch")
+}
 
 #[cfg(windows)]
 fn activation_test_entry(deadline: u64) -> (String, AgentActivationPending) {
     let state_fence = StateFence::new(
-        AuthorityEpoch::new(1).expect("authority epoch"),
+        test_epoch(1),
         ResourceGeneration::new(1).expect("resource generation"),
     );
     let request_id = RequestId::new("activation-request-test").expect("request id");
@@ -82,7 +91,7 @@ fn activation_test_decision(ticket_id: &str) -> AgentActivationResolutionDecisio
         ticket_id: ticket_id.to_owned(),
         ticket_sha256: "c".repeat(64),
         state_fence: StateFence::new(
-            AuthorityEpoch::new(1).expect("authority epoch"),
+            test_epoch(1),
             ResourceGeneration::new(1).expect("resource generation"),
         ),
         principal_id: "principal-test".to_owned(),
@@ -130,6 +139,102 @@ fn activation_claim_expires_at_deadline_and_decided_ticket_is_not_reclaimed() {
     assert!(
         pending.claim_at(1).is_none(),
         "decided tickets are terminal"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn activation_denial_codes_map_each_non_resolved_disposition_distinctly() {
+    use eliot_protocol::{
+        AgentActivationCandidateCoverage, AgentActivationResolutionDisposition,
+        AgentActivationResolvedBinding, AgentActivationRetryDirective,
+        AgentActivationSelectionDirective, AgentBridgeActivationDenialCode,
+    };
+
+    let selection = AgentActivationSelectionDirective {
+        candidate_handles: vec!["candidate-1".to_owned(), "candidate-2".to_owned()],
+        candidate_coverage: AgentActivationCandidateCoverage::Complete,
+        recovery_handle: "recovery-1".to_owned(),
+    };
+    let retry = AgentActivationRetryDirective {
+        dependency_ref: "owner-dependency-1".to_owned(),
+        observed_dependency_revision: "revision-1".to_owned(),
+        not_before_unix_ms: 2_001,
+    };
+    let fence = StateFence::new(
+        test_epoch(1),
+        ResourceGeneration::new(1).expect("resource generation"),
+    );
+    let cases: [(
+        AgentActivationResolutionDisposition,
+        AgentBridgeActivationDenialCode,
+    ); 6] = [
+        (
+            AgentActivationResolutionDisposition::TaskSelectionRequired {
+                selection: selection.clone(),
+            },
+            AgentBridgeActivationDenialCode::TaskSelectionRequired,
+        ),
+        (
+            AgentActivationResolutionDisposition::ScopeSelectionRequired {
+                selection: selection.clone(),
+            },
+            AgentBridgeActivationDenialCode::ScopeSelectionRequired,
+        ),
+        (
+            AgentActivationResolutionDisposition::ScopeAmbiguous {
+                selection: selection.clone(),
+            },
+            AgentBridgeActivationDenialCode::ScopeAmbiguous,
+        ),
+        (
+            AgentActivationResolutionDisposition::NotReady {
+                recovery_handle: "recovery-1".to_owned(),
+                retry,
+            },
+            AgentBridgeActivationDenialCode::NotReady,
+        ),
+        (
+            AgentActivationResolutionDisposition::StaleFence {
+                recovery_handle: "recovery-1".to_owned(),
+                observed_state_fence: Some(fence),
+            },
+            AgentBridgeActivationDenialCode::StaleFence,
+        ),
+        (
+            AgentActivationResolutionDisposition::FailedInternal {
+                failure_handle: "failure-1".to_owned(),
+            },
+            AgentBridgeActivationDenialCode::FailedInternal,
+        ),
+    ];
+    let mut seen = std::collections::BTreeSet::new();
+    for (disposition, expected) in &cases {
+        let code = KernelComposition::activation_denial_code_for_disposition(disposition);
+        assert_eq!(code, Some(*expected));
+        assert!(
+            seen.insert(expected.as_str()),
+            "each disposition must project a distinct denial code"
+        );
+    }
+    assert_eq!(seen.len(), cases.len());
+
+    let resolved = AgentActivationResolutionDisposition::Resolved {
+        binding: Box::new(AgentActivationResolvedBinding {
+            principal_id: "principal-test".to_owned(),
+            session_id: "session-test".to_owned(),
+            task_id: "task-test".to_owned(),
+            work_unit_id: "work-unit-test".to_owned(),
+            work_scope_id: "scope-test".to_owned(),
+            task_revision: "task-revision-test".to_owned(),
+            plan_id: "plan-test".to_owned(),
+            plan_revision: "plan-revision-test".to_owned(),
+        }),
+    };
+    assert_eq!(
+        KernelComposition::activation_denial_code_for_disposition(&resolved),
+        None,
+        "a resolved disposition never projects a denial"
     );
 }
 

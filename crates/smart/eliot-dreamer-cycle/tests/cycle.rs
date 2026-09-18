@@ -2,20 +2,21 @@
 
 use eliot_agent_contracts::AgentAttemptId;
 use eliot_contracts::{
-    ArtifactId, AuthorityEpoch, ClockReading, ContractId, OperationId, PolicyRevision, ProductId,
-    RequestId, ResourceGeneration, SourceId, StateFence, TaskId, TaskRevision, TransactionSequence,
-    canonical_json_bytes, sha256_hex,
+    ArtifactId, ClockReading, ContractId, EpochId, EpochLineageId, OperationId, PolicyRevision,
+    ProductId, RequestId, ResourceGeneration, SourceId, StateFence, TaskId, TaskRevision,
+    TransactionSequence, canonical_json_bytes, sha256_hex,
 };
 use eliot_dreamer_contracts::curation::{ClassificationPayload, TargetEvidence};
 use eliot_dreamer_contracts::{
     AtomicityMode, BudgetLimits, BudgetUsage, CurationFamily, CurationKind, CurationPayload,
-    DreamJobInput, JobClass, Requester, RequesterOrigin, ScreenBinding, ScreenState,
+    DreamJobAdmission, JobClass, Requester, RequesterOrigin, ScreenBinding, ScreenState,
     TargetDenominator, TypedCurationHandlerRequest, TypedCurationHandlerResult, ValidationReceipt,
 };
 use eliot_dreamer_cycle::{
-    CyclePhase, CyclePolicy, DreamerCycleState, ExpectedArtifact, ObservedOutcome,
-    OutcomeDisposition, PendingRequest, PhasePolicyRule, RequestKind, StepDisposition,
-    step_dreamer_cycle,
+    CycleError, CyclePhase, CyclePolicy, DreamerCycleState, ExpectedArtifact, ExperimentKind,
+    ObservedOutcome, OutcomeDisposition, PendingRequest, PhasePolicyRule, PlanHorizon, RequestKind,
+    SampleLimits, StepDisposition, plan_cycle, sample_cycle, step_dreamer_cycle,
+    step_dreamer_cycle_at,
 };
 use eliot_receipts::{
     AuthorityBinding, CausalBinding, EffectClass, OperationBinding, ProofCeiling, ReceiptCore,
@@ -23,11 +24,23 @@ use eliot_receipts::{
     WorkScopeBinding, WorkScopeId, contract_identity,
 };
 
+use std::num::NonZeroU64;
+
 const PAYLOAD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+fn test_epoch(sequence: u64) -> EpochId {
+    EpochId::new(
+        EpochLineageId::new(TEST_LINEAGE_A).unwrap(),
+        NonZeroU64::new(sequence).unwrap(),
+    )
+    .unwrap()
+}
 
 fn fence() -> StateFence {
     StateFence {
-        authority_epoch: AuthorityEpoch::genesis(),
+        authority_epoch: test_epoch(1),
         resource_generation: ResourceGeneration::genesis(),
         task_revision: Some(TaskRevision::genesis()),
         policy_revision: Some(PolicyRevision::genesis()),
@@ -35,8 +48,8 @@ fn fence() -> StateFence {
     }
 }
 
-fn job(fence: &StateFence) -> DreamJobInput {
-    DreamJobInput {
+fn job(fence: &StateFence) -> DreamJobAdmission {
+    DreamJobAdmission {
         schema_version: 1,
         job_class: JobClass::Curation,
         requester: Requester {
@@ -244,7 +257,7 @@ fn receipt_with_artifacts(
         authority: AuthorityBinding {
             authority_id: ContractId::new("authority-1").unwrap(),
             authority_owner: request.owner.clone(),
-            authority_epoch: fence.authority_epoch,
+            authority_epoch: fence.authority_epoch.clone(),
             state_fence: fence.clone(),
             allowed_effect: request.effect,
             proof_ceiling: request.proof_ceiling,
@@ -464,6 +477,7 @@ fn validation_receipt(state: &DreamerCycleState, request: &PendingRequest) -> Va
     }
 }
 
+// WORK_UNIT_CASE: 806/2
 #[test]
 #[allow(clippy::too_many_lines)]
 fn completed_receipt_advances_one_adjacent_phase() {
@@ -706,6 +720,7 @@ fn completed_receipt_advances_one_adjacent_phase() {
     assert_eq!(closure_step.next_state.phase, CyclePhase::ClosureObserved);
 }
 
+// WORK_UNIT_CASE: 806/4
 #[test]
 fn exact_receipt_replays_without_mutation() {
     let fence = fence();
@@ -730,6 +745,7 @@ fn exact_receipt_replays_without_mutation() {
     assert_eq!(replay.next_state, replay_state);
 }
 
+// WORK_UNIT_CASE: 806/4
 #[test]
 fn changed_payload_under_same_receipt_id_is_rejected() {
     let fence = fence();
@@ -751,6 +767,7 @@ fn changed_payload_under_same_receipt_id_is_rejected() {
     assert!(step_dreamer_cycle(&first.next_state, &[changed], &policy).is_err());
 }
 
+// WORK_UNIT_CASE: 806/8
 #[test]
 #[allow(clippy::too_many_lines)]
 fn unknown_then_predecessor_linked_completion_reconciles_same_operation() {
@@ -859,6 +876,7 @@ fn unknown_then_predecessor_linked_completion_reconciles_same_operation() {
     assert!(done.next_state.pending.is_empty());
 }
 
+// WORK_UNIT_CASE: 806/5
 #[test]
 fn unrelated_valid_receipt_cannot_advance_pending_request() {
     let fence = fence();
@@ -888,6 +906,7 @@ fn unrelated_valid_receipt_cannot_advance_pending_request() {
     assert_eq!(current.phase, CyclePhase::Validated);
 }
 
+// WORK_UNIT_CASE: 806/6
 #[test]
 fn pending_operation_must_match_frozen_phase_rule() {
     let fence = fence();
@@ -974,4 +993,200 @@ fn pending_operation_must_match_frozen_phase_rule() {
     );
     handler_outcome.phase = CyclePhase::HandlerObserved;
     assert!(step_dreamer_cycle(&handler_state, &[handler_outcome], &handler_policy).is_err());
+}
+
+// WORK_UNIT_CASE: 806/4
+#[test]
+fn injected_observation_time_replay_matches_timeless_digest() {
+    let fence = fence();
+    let policy = policy(&fence, "bundle_validation");
+    let request = pending(&policy);
+    let current = state(&policy, request.clone());
+    let receipt = receipt(
+        &request,
+        ReceiptDisposition::Success {
+            proof: ProofCeiling::Observation,
+        },
+        None,
+    );
+    let observed = outcome(&request, receipt, OutcomeDisposition::Completed, false);
+    let first = step_dreamer_cycle(&current, std::slice::from_ref(&observed), &policy).unwrap();
+    let mut replay_state = first.next_state.clone();
+    replay_state.proposed_requests.push(request);
+    replay_state.seal().unwrap();
+    let timeless =
+        step_dreamer_cycle(&replay_state, std::slice::from_ref(&observed), &policy).unwrap();
+    let injected = step_dreamer_cycle_at(
+        &replay_state,
+        std::slice::from_ref(&observed),
+        &policy,
+        Some(1),
+    )
+    .unwrap();
+    assert_eq!(timeless.disposition, StepDisposition::Replayed);
+    assert_eq!(injected.disposition, StepDisposition::Replayed);
+    assert_eq!(injected.next_state, replay_state);
+    assert_eq!(injected.transition_digest, timeless.transition_digest);
+}
+
+// WORK_UNIT_CASE: 806/2
+#[test]
+fn rejected_common_validation_blocks_without_advancing() {
+    let fence = fence();
+    let common_policy = policy_for_phase(&fence, CyclePhase::CommonValidated, "common_validation");
+    let mut request = pending(&common_policy);
+    set_phase(
+        &mut request,
+        CyclePhase::CommonValidated,
+        RequestKind::CommonValidation,
+    );
+    let mut current = state(&common_policy, request.clone());
+    current.phase = CyclePhase::GroundingValidated;
+    current.seal().unwrap();
+    let mut validation = validation_receipt(&current, &request);
+    validation.terminal_disposition = "rejected".to_owned();
+    let validation_input = validation.input_digest.clone();
+    let validation_output = validation.output_digest.clone();
+    let validation_digest = sha256_hex(&canonical_json_bytes(&validation).unwrap());
+    let common_receipt = receipt_with_artifacts(
+        &request,
+        ReceiptDisposition::Success {
+            proof: ProofCeiling::Observation,
+        },
+        request.predecessor_receipt_id.clone(),
+        &[
+            ("validation-input", &validation_input),
+            ("validation-output", &validation_output),
+            ("validation-evidence", &validation_digest),
+        ],
+    );
+    let common_outcome = outcome_at(
+        &request,
+        common_receipt,
+        CyclePhase::CommonValidated,
+        OutcomeDisposition::Completed,
+        false,
+        vec![
+            ArtifactId::new("payload-1").unwrap(),
+            ArtifactId::new("validation-input").unwrap(),
+            ArtifactId::new("validation-output").unwrap(),
+            ArtifactId::new("validation-evidence").unwrap(),
+        ],
+        None,
+        Some(validation),
+        None,
+    );
+    let step = step_dreamer_cycle(&current, &[common_outcome], &common_policy).unwrap();
+    assert_eq!(step.disposition, StepDisposition::Blocked);
+    assert_eq!(step.next_state.phase, CyclePhase::GroundingValidated);
+    assert_eq!(step.next_state.pending.len(), 1);
+    assert_eq!(step.next_state.pending[0].request_id, request.request_id);
+    assert_eq!(step.next_state.outcomes.len(), 1);
+    assert!(step.requests.is_empty());
+}
+
+#[test]
+fn cycle_sample_carries_explicit_denominator_and_omissions() {
+    let fence = fence();
+    let policy = policy(&fence, "op-kind");
+    let first = pending(&policy);
+    let mut state = state(&policy, first);
+    for tag in ["b", "c"] {
+        let mut extra = pending(&policy);
+        set_phase_identity(&mut extra, tag);
+        state.pending.push(extra);
+    }
+    state.seal().unwrap();
+    let partial = sample_cycle(&state, &policy, &SampleLimits { max_sampled: 2 }).unwrap();
+    assert_eq!(partial.denominator.pending_total, 3);
+    assert_eq!(partial.sampled_pending.len(), 2);
+    assert_eq!(partial.omitted_pending.len(), 1);
+    assert!(!partial.complete);
+    assert!(partial.validate(&state, &policy).is_ok());
+    let full = sample_cycle(&state, &policy, &SampleLimits { max_sampled: 8 }).unwrap();
+    assert!(full.complete);
+    assert!(full.omitted_pending.is_empty());
+    assert!(full.validate(&state, &policy).is_ok());
+    let mut tampered = full;
+    tampered.complete = false;
+    assert!(tampered.validate(&state, &policy).is_err());
+}
+
+#[test]
+fn cycle_plan_covers_exactly_one_adjacent_phase_with_one_experiment_per_target() {
+    let fence = fence();
+    let policy = policy(&fence, "op-kind");
+    let request = pending(&policy);
+    let state = state(&policy, request);
+    let sample = sample_cycle(&state, &policy, &SampleLimits { max_sampled: 8 }).unwrap();
+    let plan = plan_cycle(&sample, &state, &policy, None).unwrap();
+    assert_eq!(plan.from_phase, CyclePhase::Validated);
+    assert_eq!(plan.to_phase, CyclePhase::BundleValidated);
+    assert_eq!(plan.horizon, PlanHorizon::OneCycle);
+    assert_eq!(plan.experiments.len(), 1);
+    assert_eq!(plan.experiments[0].kind, ExperimentKind::ClarificationProbe);
+    assert_eq!(plan.requests.len(), 1);
+    assert!(plan.validate(&sample, &state, &policy).is_ok());
+    let mut duplicated = plan.clone();
+    duplicated
+        .experiments
+        .push(duplicated.experiments[0].clone());
+    duplicated.plan_digest = duplicated.computed_digest().unwrap();
+    assert!(duplicated.validate(&sample, &state, &policy).is_err());
+    let mut stretched = plan.clone();
+    stretched.to_phase = CyclePhase::Screened;
+    stretched.plan_digest = stretched.computed_digest().unwrap();
+    assert!(stretched.validate(&sample, &state, &policy).is_err());
+    let encoded = String::from_utf8(canonical_json_bytes(&plan).unwrap()).unwrap();
+    for forbidden in [
+        "DurableJob",
+        "WakeIntent",
+        "RuntimeLease",
+        "schedule",
+        "Researcher",
+        "Storage",
+        "self-enqueue",
+        "route_reservation",
+    ] {
+        assert!(!encoded.contains(forbidden), "forbidden field {forbidden}");
+    }
+}
+
+#[test]
+fn cycle_plan_rejects_terminal_phase_and_reconciles_observed_targets() {
+    let fence = fence();
+    let policy = policy(&fence, "op-kind");
+    let request = pending(&policy);
+    let mut terminal = state(&policy, request);
+    terminal.phase = CyclePhase::ClosureObserved;
+    terminal.seal().unwrap();
+    let sample = sample_cycle(&terminal, &policy, &SampleLimits { max_sampled: 8 }).unwrap();
+    assert!(matches!(
+        plan_cycle(&sample, &terminal, &policy, None),
+        Err(CycleError::PhaseViolation(_))
+    ));
+    let request = pending(&policy);
+    let mut observed_state = state(&policy, request.clone());
+    let accepted = outcome(
+        &request,
+        receipt(
+            &request,
+            ReceiptDisposition::Success {
+                proof: ProofCeiling::Observation,
+            },
+            None,
+        ),
+        OutcomeDisposition::Accepted,
+        false,
+    );
+    observed_state.outcomes.push(accepted);
+    observed_state.seal().unwrap();
+    let sample = sample_cycle(&observed_state, &policy, &SampleLimits { max_sampled: 8 }).unwrap();
+    let plan = plan_cycle(&sample, &observed_state, &policy, None).unwrap();
+    assert_eq!(plan.experiments.len(), 1);
+    assert_eq!(
+        plan.experiments[0].kind,
+        ExperimentKind::ReconciliationProbe
+    );
+    assert!(plan.validate(&sample, &observed_state, &policy).is_ok());
 }

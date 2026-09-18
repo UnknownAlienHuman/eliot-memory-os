@@ -1,0 +1,16 @@
+{
+  "profile_id": "eliot.agent-bridge.request-input.v1",
+  "revision": "fixture-rev-1",
+  "owner": "#977",
+  "source": "bins/eliot-agent-bridge/src/request_input.rs",
+  "note": "Synthetic accepted-profile table for 929 unit tests only. Production limits are parsed from the real source file, never copied from here.",
+  "limits": [
+    {"name": "max_record_bytes", "unit": "bytes", "encoding": "utf8-encoded-record", "stage": "acquisition", "source": "bridge-local-decision"},
+    {"name": "max_buffered_bytes", "unit": "bytes", "encoding": "retained-scratch", "stage": "acquisition", "source": "bridge-local-decision"},
+    {"name": "max_json_string_bytes", "unit": "bytes", "encoding": "decoded-string", "stage": "decode", "source": "bridge-local-decision"},
+    {"name": "max_container_items", "unit": "items", "encoding": "decoded-container", "stage": "decode", "source": "bridge-local-decision"},
+    {"name": "max_nesting_depth", "unit": "levels", "encoding": "decoded-tree", "stage": "decode", "source": "bridge-local-decision"}
+  ],
+  "framing_policy": "discard-through-terminator-then-typed-rejection",
+  "compatibility": "bounded-supported-corpus-only"
+}

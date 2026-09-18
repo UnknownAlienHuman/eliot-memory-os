@@ -5,27 +5,184 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(test)]
+mod epistemic_tests;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, MutexGuard, TryLockError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use eliot_store_api::epistemic_revision::{EpistemicCommit, position_key};
 use eliot_store_api::{
-    CanonicalStoreClient, CanonicalValidationSnapshot, CommitId, EventId,
-    EventProjectionRelationIntents, NamedReadOperation, NamedReadRequest, NamedReadResponse,
-    OperationId, OperationManifestDigest, OrderingHead, OrderingHeadExpectation, OrderingScopeId,
-    OutboxId, OutboxIntent, OutboxState, PreparedTransition, ProjectionMode,
-    ProjectionPublicationId, ProjectionPublicationRecord, ProjectionStatus, RecoveryRecord,
-    RecoveryRecordKey, RequestMeta, Resubmission, RevisionDelta, RevisionHead,
-    RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, SplitView, StateFence,
-    StoreError, StoreGenesisRequest, StoreHealth, StoreHealthStatus, StoreRecoveryRequest,
-    StoreRecoverySnapshot, WriteReceipt, WriteReceiptStatus, canonical_json_bytes,
-    genesis_manifest, is_genesis_fence, issue_genesis_receipt_envelope,
-    issue_store_receipt_envelope, sha256_hex, validate_genesis_receipt_envelope,
-    validate_store_receipt_envelope,
+    CanonicalRequestView, CanonicalStoreClient, CanonicalValidationSnapshot, CommitId,
+    ERASURE_PARAM_OPERATION_ID, ERASURE_PARAM_SUBJECT, ERASURE_PARAM_SURFACES,
+    EVIDENCE_PACK_MAX_RECORDS, EventId, EventProjectionRelationIntents, NamedMutationOperation,
+    NamedReadOperation, NamedReadRequest, NamedReadResponse, OperationId, OperationManifestDigest,
+    OrderingHead, OrderingHeadExpectation, OrderingScopeId, OutboxId, OutboxIntent, OutboxState,
+    PreparedTransition, ProjectionMode, ProjectionPublicationId, ProjectionPublicationRecord,
+    ProjectionStatus, RecoveryRecord, RecoveryRecordKey, RequestMeta, Resubmission, RevisionDelta,
+    RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, SplitView,
+    StateFence, StoreError, StoreGenesisRequest, StoreHealth, StoreHealthStatus,
+    StoreRecoveryRequest, StoreRecoverySnapshot, TransitionClass, WriteReceipt, WriteReceiptStatus,
+    canonical_json_bytes, canonical_request_hash, decode_erasure_surfaces,
+    generated_operation_manifests, genesis_manifest,
+    is_genesis_fence, issue_genesis_receipt_envelope, issue_store_receipt_envelope,
+    named_mutation_operation_name, sha256_hex, validate_genesis_receipt_envelope,
+    validate_store_receipt_envelope, verify_canonical_request_hash,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+
+// `EVIDENCE_PACK_MAX_RECORDS` is the canonical bound owned by the
+// `GetEvidencePack` catalogue row in `eliot-store-api`; imported above.
+
+/// Version of the `GetEvidencePack` payload shape built below.
+///
+/// The pack returns exact captured bytes, so consumers match on this version
+/// before interpreting `records` / `provenance`; any shape change bumps it.
+const EVIDENCE_PACK_PAYLOAD_VERSION: u32 = 1;
+
+/// 688-B store-side erasure execution (memory contour).
+///
+/// Local intent/outcome model only: the store depends solely on existing
+/// `eliot-store-api` types plus this local model (the neutral purge port is
+/// defined in a parallel subtask and is not yet on this base; the store never
+/// imports `eliot-erasure`). Protocol order mirrors the erasure owner:
+/// [`MemoryStore::record_erasure_intent`] before
+/// [`MemoryStore::apply_erasure`]; `apply_erasure` names only a recorded
+/// operation id, so no destructive path exists without a recorded intent;
+/// `Unknown` per surface is preserved for same-operation reconciliation (no
+/// blind retry, no second ledger); same-operation replay returns the original
+/// per-surface outcomes without duplicate destructive work.
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum StoreErasureSurface {
+    CanonicalPayload,
+    Projection,
+    Index,
+    Blob,
+    OperationalRecovery,
+    ProviderCopy,
+    BackupRestorePath,
+    RouteContinuation,
+}
+
+impl StoreErasureSurface {
+    /// Store-owned surfaces whose evidence lives in the capture rows below.
+    ///
+    /// Every other surface is out of store scope: the store marks it
+    /// `Incomplete` (never `Purged`) instead of claiming foreign removal.
+    #[must_use]
+    pub const fn is_store_owned(self) -> bool {
+        match self {
+            Self::CanonicalPayload | Self::Projection | Self::Index => true,
+            Self::Blob
+            | Self::OperationalRecovery
+            | Self::ProviderCopy
+            | Self::BackupRestorePath
+            | Self::RouteContinuation => false,
+        }
+    }
+}
+
+/// Per-surface erasure outcome for one operation.
+///
+/// `NotAttempted` is the initial registry state per surface after intent
+/// recording, before dispatch. `Unknown` preserves an ambiguous effect for
+/// same-operation reconciliation: it is stored and replayed, never retried
+/// blindly and never promoted into suppression.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum StoreSurfaceOutcome {
+    NotAttempted { surface: StoreErasureSurface },
+    Purged { surface: StoreErasureSurface },
+    Incomplete { surface: StoreErasureSurface },
+    Unknown { surface: StoreErasureSurface },
+}
+
+impl StoreSurfaceOutcome {
+    /// Returns the surface this outcome reports on.
+    #[must_use]
+    pub const fn surface(self) -> StoreErasureSurface {
+        match self {
+            Self::NotAttempted { surface }
+            | Self::Purged { surface }
+            | Self::Incomplete { surface }
+            | Self::Unknown { surface } => surface,
+        }
+    }
+}
+
+/// Durable erasure intent recorded BEFORE any destructive dispatch.
+///
+/// `operation_id` is the caller-supplied stable identity (never regenerated
+/// on retry, so replaying the same id names the same operation); `subject` +
+/// `scope_id` name the exact admitted pair; `surfaces` is the exact admitted
+/// surface denominator; `state_fence` pins the fence the destructive calls
+/// execute under.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StoreErasureIntent {
+    pub operation_id: String,
+    pub subject: String,
+    pub scope_id: ScopeId,
+    pub surfaces: Vec<StoreErasureSurface>,
+    pub state_fence: StateFence,
+}
+
+impl StoreErasureIntent {
+    /// Fail-closed validation of the frozen intent.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        validate_erasure_text(&self.operation_id, "erasure.operation_id")?;
+        validate_erasure_text(&self.subject, "erasure.subject")?;
+        self.state_fence
+            .validate()
+            .map_err(StoreError::Foundation)?;
+        if self.surfaces.is_empty() {
+            return Err(StoreError::Empty {
+                field: "erasure.surfaces",
+            });
+        }
+        let mut seen = BTreeSet::new();
+        for surface in &self.surfaces {
+            if !seen.insert(*surface) {
+                return Err(StoreError::Duplicate {
+                    field: "erasure.surfaces",
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Evidence-backed suppression key for one erased pair.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ErasedSubject {
+    pub scope_id: ScopeId,
+    pub subject: String,
+}
+
+fn validate_erasure_text(value: &str, field: &'static str) -> Result<(), StoreError> {
+    if value.trim().is_empty() || value.chars().any(char::is_control) {
+        return Err(StoreError::InvalidField {
+            field,
+            reason: "blank or control character",
+        });
+    }
+    Ok(())
+}
+/// Version of the `GetTaskState` payload shape (T11.3).
+const TASK_STATE_PAYLOAD_VERSION: u32 = 1;
+/// Version of the `GetAttentionAndProblems` payload shape (T11.3).
+const ATTENTION_PROBLEMS_PAYLOAD_VERSION: u32 = 1;
+/// Version of the `GetUnderstandingProjectionInputs` payload shape (T11.3).
+const UNDERSTANDING_INPUTS_PAYLOAD_VERSION: u32 = 1;
+/// Version of the `GetCapabilityEvidenceState` payload shape (T11.3).
+const CAPABILITY_EVIDENCE_PAYLOAD_VERSION: u32 = 1;
 
 /// A deterministic reference store with no external authority or I/O.
 ///
@@ -70,6 +227,15 @@ impl MemoryStore {
     }
 
     /// Applies one transition synchronously for model/reference tests.
+    ///
+    /// RECHECK-63 slice C: recomputes the canonical request hash from the
+    /// exact values to be executed (`ctx` + `transition` + expected heads)
+    /// via the shared helper and rejects divergence with
+    /// `TransitionDigestMismatch` BEFORE any idempotency-lookup success and
+    /// BEFORE any transaction/receipt. The receipt binds the recomputed
+    /// digest, never a blind copy of the supplied value. Same
+    /// idempotency key + different executable bytes (recomputed != stored,
+    /// supplied == recomputed) stays `IdentityConflict` with no transaction.
     pub fn apply_transaction(
         &self,
         ctx: &RequestMeta,
@@ -78,9 +244,18 @@ impl MemoryStore {
         expected_ordering_heads: &[OrderingHeadExpectation],
     ) -> Result<WriteReceipt, StoreError> {
         validate_transaction(ctx, &transition)?;
+        // Recompute before any lookup or effect: supplied != recomputed is a
+        // typed digest mismatch with no transaction and no lookup success.
+        let view = CanonicalRequestView::from_apply(
+            ctx,
+            &transition,
+            expected_revision_heads,
+            expected_ordering_heads,
+        );
+        verify_canonical_request_hash(&view, &transition.identity.canonical_request_hash)?;
+        let recomputed = canonical_request_hash(&view)?;
         let operation_key = transition.identity.operation_id.to_string();
         let mut state = self.lock_state()?;
-        let canonical_hash = transition.identity.canonical_request_hash.clone();
         let idempotency_key = transition.identity.idempotency_key.clone();
         if let Some(receipt) = existing_receipt(
             &state,
@@ -88,7 +263,7 @@ impl MemoryStore {
             &transition,
             &operation_key,
             &idempotency_key,
-            &canonical_hash,
+            &recomputed,
         )? {
             return Ok(receipt);
         }
@@ -98,9 +273,46 @@ impl MemoryStore {
             expected_revision_heads,
             expected_ordering_heads,
         )?;
+        let epistemic = EpistemicCommit::from_prepared(ctx, &transition)?;
+        let epistemic_key = epistemic
+            .as_ref()
+            .map(|commit| commit.payload.position_key())
+            .transpose()?;
+        if let (Some(commit), Some(key)) = (&epistemic, &epistemic_key) {
+            let predecessor = state
+                .epistemic_positions
+                .get(key)
+                .map(|(previous, _)| previous.payload.candidate.digest.as_str());
+            let predecessor_matches = match (&commit.payload.candidate.predecessor, predecessor) {
+                (None, None) => true,
+                (Some(expected), Some(actual)) => expected.as_str() == actual,
+                _ => false,
+            };
+            if !predecessor_matches {
+                return Err(StoreError::RevisionConflict);
+            }
+            let current = state
+                .epistemic_positions
+                .get(key)
+                .map(|(previous, _)| previous.payload.next_revision())
+                .transpose()?;
+            if current != commit.payload.expected_position_revision {
+                return Err(StoreError::RevisionConflict);
+            }
+        }
         let plan = transaction_plan(&state, &transition, &operation_key)?;
-        let receipt =
-            transaction_receipt(ctx, &transition, idempotency_key, canonical_hash, &plan)?;
+        let receipt = transaction_receipt(ctx, &transition, idempotency_key, recomputed, &plan)?;
+        if let (Some(commit), Some(key)) = (epistemic, epistemic_key) {
+            commit.readback(&receipt)?;
+            state
+                .epistemic_positions
+                .insert(key, (commit, receipt.clone()));
+        }
+        // Issue #1712: the admitted erasure operation executes its recorded
+        // plan here, under the same lock as the receipt commit: one identity,
+        // one receipt, recoverable replay without duplicate work. Any other
+        // class is a no-op in this hook.
+        dispatch_apply_erasure(&mut state, &transition)?;
         Ok(commit_transaction(
             &mut state,
             transition,
@@ -109,6 +321,220 @@ impl MemoryStore {
             receipt,
         ))
     }
+}
+
+/// Records one erasure intent on already-locked state (688-B).
+///
+/// Same behavior as [`MemoryStore::record_erasure_intent`]: durable-only
+/// registry write, idempotent on byte-identical re-record,
+/// [`StoreError::IdentityConflict`] on divergence. Split out so the
+/// named-operation commit path can record under its held lock.
+fn record_erasure_intent_state(
+    state: &mut MemoryState,
+    intent: StoreErasureIntent,
+) -> Result<Vec<StoreSurfaceOutcome>, StoreError> {
+    if let Some(existing) = state.erasure_intents.get(intent.operation_id.as_str()) {
+        if existing.intent == intent {
+            return Ok(existing.outcomes.clone());
+        }
+        return Err(StoreError::IdentityConflict);
+    }
+    let outcomes = intent
+        .surfaces
+        .iter()
+        .map(|surface| StoreSurfaceOutcome::NotAttempted { surface: *surface })
+        .collect::<Vec<_>>();
+    state.erasure_intents.insert(
+        intent.operation_id.clone(),
+        ErasureRegistryEntry {
+            intent,
+            outcomes: outcomes.clone(),
+            dispatched: false,
+        },
+    );
+    Ok(outcomes)
+}
+
+/// Executes one recorded erasure intent on already-locked state (688-B).
+///
+/// Same behavior as [`MemoryStore::apply_erasure`], including sealed-outcome
+/// replay without duplicate destructive work. Split out so the
+/// named-operation commit path can dispatch under its held lock.
+fn apply_erasure_state(
+    state: &mut MemoryState,
+    operation_id: &str,
+) -> Result<Vec<StoreSurfaceOutcome>, StoreError> {
+    // Replay: a sealed entry returns its original outcomes verbatim.
+    if let Some(existing) = state.erasure_intents.get(operation_id)
+        && existing.dispatched
+    {
+        return Ok(existing.outcomes.clone());
+    }
+    let (subject, scope_id, surfaces) = {
+        let entry = state
+            .erasure_intents
+            .get(operation_id)
+            .ok_or(StoreError::ReceiptNotFound)?;
+        if entry.dispatched {
+            return Ok(entry.outcomes.clone());
+        }
+        (
+            entry.intent.subject.clone(),
+            entry.intent.scope_id.clone(),
+            entry.intent.surfaces.clone(),
+        )
+    };
+    let mut outcomes = Vec::with_capacity(surfaces.len());
+    let mut store_owned_dispatched = false;
+    for surface in &surfaces {
+        if !surface.is_store_owned() {
+            outcomes.push(StoreSurfaceOutcome::Incomplete { surface: *surface });
+            continue;
+        }
+        // Preserve an already-terminal outcome on this surface instead of
+        // re-running destructive work (partial-resume identity).
+        let preserved = state
+            .erasure_intents
+            .get(operation_id)
+            .and_then(|entry| {
+                entry.outcomes.iter().find(|outcome| {
+                    outcome.surface() == *surface
+                        && !matches!(outcome, StoreSurfaceOutcome::NotAttempted { .. })
+                })
+            })
+            .copied();
+        if let Some(outcome) = preserved {
+            outcomes.push(outcome);
+            if matches!(outcome, StoreSurfaceOutcome::Purged { .. }) {
+                store_owned_dispatched = true;
+            }
+            continue;
+        }
+        // Exact subject match on capture rows admitted under the exact
+        // recorded scope. Ambiguous rows (missing/non-string subject)
+        // never match: they stay and the surface reports `Incomplete`,
+        // preserving `Unknown`-style caution (`Unknown` itself is never
+        // fabricated here).
+        let had_match = state.named_operations.iter().any(|record| {
+            record.scope_id == scope_id
+                && record.operation.operation == NamedMutationOperation::CaptureObservation
+                && record
+                    .operation
+                    .parameters
+                    .get("subject")
+                    .and_then(Value::as_str)
+                    == Some(subject.as_str())
+        });
+        state.named_operations.retain(|record| {
+            !(record.scope_id == scope_id
+                && record.operation.operation == NamedMutationOperation::CaptureObservation
+                && record
+                    .operation
+                    .parameters
+                    .get("subject")
+                    .and_then(Value::as_str)
+                    == Some(subject.as_str()))
+        });
+        if had_match {
+            store_owned_dispatched = true;
+            outcomes.push(StoreSurfaceOutcome::Purged { surface: *surface });
+        } else {
+            // No matching rows under the exact pair: nothing to remove,
+            // which is a complete store-side removal of zero rows.
+            store_owned_dispatched = true;
+            outcomes.push(StoreSurfaceOutcome::Purged { surface: *surface });
+        }
+    }
+    let entry = state
+        .erasure_intents
+        .get_mut(operation_id)
+        .ok_or(StoreError::ReceiptNotFound)?;
+    entry.outcomes.clone_from(&outcomes);
+    entry.dispatched = true;
+    // Suppression is evidence-backed only: recorded intent + dispatched
+    // store-owned removal. Out-of-scope-only intents never suppress.
+    if store_owned_dispatched && surfaces.iter().any(|surface| surface.is_store_owned()) {
+        state
+            .erased_subjects
+            .insert((scope_id.to_string(), subject));
+    }
+    Ok(outcomes)
+}
+
+/// Resolves one handler-surface name of the named erasure transaction.
+///
+/// Closed vocabulary: the eight store surfaces shared with the Surreal
+/// handler. Unknown names fail closed; the bridge never invents a surface.
+fn store_surface_by_name(name: &str) -> Result<StoreErasureSurface, StoreError> {
+    match name {
+        "CanonicalPayload" => Ok(StoreErasureSurface::CanonicalPayload),
+        "Projection" => Ok(StoreErasureSurface::Projection),
+        "Index" => Ok(StoreErasureSurface::Index),
+        "Blob" => Ok(StoreErasureSurface::Blob),
+        "OperationalRecovery" => Ok(StoreErasureSurface::OperationalRecovery),
+        "ProviderCopy" => Ok(StoreErasureSurface::ProviderCopy),
+        "BackupRestorePath" => Ok(StoreErasureSurface::BackupRestorePath),
+        "RouteContinuation" => Ok(StoreErasureSurface::RouteContinuation),
+        _ => Err(StoreError::InvalidField {
+            field: "erasure.surfaces",
+            reason: "unknown erasure surface",
+        }),
+    }
+}
+
+/// Dispatches the admitted `ApplyErasure` named operation (issue #1712).
+///
+/// No-op for every other transition class. For the erasure class the bridge
+/// applies only the recorded plan: subject, scope, and surfaces are copied
+/// verbatim from the admitted parameters into the local intent (recorded
+/// idempotently, so same-operation retry replays instead of duplicating),
+/// then the recorded intent is applied. The stable intent identity must equal
+/// the transition identity, binding record, execution, and receipt under one
+/// identity; divergence is an [`StoreError::IdentityConflict`] with no
+/// destructive effect beyond the already-recorded identical intent.
+fn dispatch_apply_erasure(
+    state: &mut MemoryState,
+    transition: &PreparedTransition,
+) -> Result<(), StoreError> {
+    if transition.transition_class != TransitionClass::Erasure {
+        return Ok(());
+    }
+    let Some(command) = transition.named_operations.first() else {
+        return Err(StoreError::TransitionClassExceeded);
+    };
+    if command.operation != NamedMutationOperation::ApplyErasure {
+        return Err(StoreError::TransitionClassExceeded);
+    }
+    let text_param = |name: &str| {
+        command
+            .parameters
+            .get(name)
+            .and_then(Value::as_str)
+            .ok_or(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "missing required parameter",
+            })
+    };
+    let subject = text_param(ERASURE_PARAM_SUBJECT)?;
+    let surfaces_value = text_param(ERASURE_PARAM_SURFACES)?;
+    let operation_id = text_param(ERASURE_PARAM_OPERATION_ID)?;
+    if operation_id != transition.identity.operation_id.to_string() {
+        return Err(StoreError::IdentityConflict);
+    }
+    let mut surfaces = Vec::new();
+    for name in decode_erasure_surfaces(surfaces_value)? {
+        surfaces.push(store_surface_by_name(&name)?);
+    }
+    let intent = StoreErasureIntent {
+        operation_id: operation_id.to_owned(),
+        subject: subject.to_owned(),
+        scope_id: transition.scope_id.clone(),
+        surfaces,
+        state_fence: transition.state_fence.clone(),
+    };
+    record_erasure_intent_state(state, intent)?;
+    apply_erasure_state(state, operation_id)?;
+    Ok(())
 }
 
 fn validate_transaction(
@@ -168,6 +594,17 @@ fn validate_transaction_state(
     }
     validate_expected_revisions(state, &transition.state_fence, expected_revision_heads)?;
     validate_expected_ordering(state, &transition.state_fence, expected_ordering_heads)?;
+    if transition
+        .named_operations
+        .iter()
+        .any(|command| command.operation == NamedMutationOperation::ApplyEpistemicRevision)
+        || transition
+            .named_operations
+            .iter()
+            .any(|command| command.operation == NamedMutationOperation::ApplyErasure)
+    {
+        return transition.validate_against_catalogue(&generated_operation_manifests()?);
+    }
     let manifest = state
         .manifests
         .get(transition.operation_manifest_digest.as_str())
@@ -351,7 +788,15 @@ fn commit_transaction(
         .extend(transition.event_projection_relation_intents.relation_kinds);
     state
         .named_operations
-        .extend(transition.named_operations.clone());
+        .extend(
+            transition
+                .named_operations
+                .into_iter()
+                .map(|operation| ScopedNamedOperation {
+                    scope_id: transition.scope_id.clone(),
+                    operation,
+                }),
+        );
     state.receipts_by_idempotency.insert(
         receipt.idempotency_key.clone(),
         (
@@ -379,6 +824,85 @@ impl MemoryStore {
     /// Returns all outbox intents in stable identity order.
     pub fn outbox(&self) -> Result<Vec<OutboxIntent>, StoreError> {
         Ok(self.lock_state()?.outbox.values().cloned().collect())
+    }
+
+    /// Records one erasure intent BEFORE any destructive dispatch (688-B).
+    ///
+    /// Durable-only registry write: `NotAttempted` per surface, never a
+    /// removal. Recording the same `operation_id` with byte-identical intent
+    /// content is idempotent and returns the current outcomes; the same id
+    /// with different content is an [`StoreError::IdentityConflict`], never
+    /// a silent overwrite. There is exactly one intent registry per store —
+    /// no second ledger.
+    pub fn record_erasure_intent(
+        &self,
+        intent: StoreErasureIntent,
+    ) -> Result<Vec<StoreSurfaceOutcome>, StoreError> {
+        intent.validate()?;
+        let mut state = self.lock_state()?;
+        record_erasure_intent_state(&mut state, intent)
+    }
+
+    /// Executes one recorded erasure intent (688-B).
+    ///
+    /// Fail-closed with zero destructive effects when no recorded intent
+    /// exists for `operation_id` ([`StoreError::ReceiptNotFound`]).
+    /// Same-operation replay returns the original per-surface outcomes without
+    /// duplicate destructive work. Otherwise dispatches per-surface removal —
+    /// exact subject match on `CaptureObservation` rows admitted under the
+    /// exact recorded scope — with outcome semantics:
+    ///
+    /// * `CanonicalPayload`/`Projection`/`Index` are store-owned: matching
+    ///   capture rows are removed (observations vanish from the reference log)
+    ///   and the surface reports `Purged`. When the intent pair had a
+    ///   recorded intent plus dispatched removal, the pair enters
+    ///   `erased_subjects` suppression so `GetEvidencePack` no longer returns
+    ///   its observations even if rows remain — suppression is evidence-backed,
+    ///   never a guess.
+    /// * every other surface is out of store scope and reports `Incomplete`
+    ///   (never a claimed foreign removal).
+    /// * `Unknown` is not produced here (no transport ambiguity exists
+    ///   in-memory) but is preserved verbatim wherever it already sits: this
+    ///   entry point never fabricates, clears, or retries an `Unknown`.
+    pub fn apply_erasure(
+        &self,
+        operation_id: &str,
+    ) -> Result<Vec<StoreSurfaceOutcome>, StoreError> {
+        validate_erasure_text(operation_id, "erasure.operation_id")?;
+        let mut state = self.lock_state()?;
+        apply_erasure_state(&mut state, operation_id)
+    }
+
+    /// Returns the current per-surface outcomes for one operation, if any.
+    pub fn erasure_outcomes(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<Vec<StoreSurfaceOutcome>>, StoreError> {
+        validate_erasure_text(operation_id, "erasure.operation_id")?;
+        Ok(self
+            .lock_state()?
+            .erasure_intents
+            .get(operation_id)
+            .map(|entry| entry.outcomes.clone()))
+    }
+
+    /// Returns the evidence-backed erased `(scope_id, subject)` pairs.
+    ///
+    /// Scope ids are validated at intent admission, so every stored key
+    /// parses; a key that cannot parse is skipped instead of failing the
+    /// observation read or inventing a fallback identity.
+    pub fn erased_subjects(&self) -> Result<Vec<ErasedSubject>, StoreError> {
+        let mut erased = Vec::new();
+        for (scope_id, subject) in &self.lock_state()?.erased_subjects {
+            let Ok(scope_id) = ScopeId::new(scope_id.clone()) else {
+                continue;
+            };
+            erased.push(ErasedSubject {
+                scope_id,
+                subject: subject.clone(),
+            });
+        }
+        Ok(erased)
     }
 
     fn lock_state(&self) -> Result<MutexGuard<'_, MemoryState>, StoreError> {
@@ -457,11 +981,42 @@ impl MemoryStore {
         Ok(view)
     }
 
+    /// Enforces the generated catalogue pre-dispatch for activated reads.
+    ///
+    /// Slice T11.1 (issues #18/#19): `GetEvidencePack` is catalogue
+    /// activated, so it enforces the generated catalogue (membership,
+    /// typed `subject` / `max_records` selectors, scope declaration,
+    /// input bound) pre-dispatch, identically to the Surreal adapter's
+    /// pre-dispatch gate. T11.2 adds `GetCurrentEpistemicPosition` with
+    /// its `position` selector; T11.3 adds the four cognitive reads
+    /// (`GetTaskState`, `GetAttentionAndProblems`,
+    /// `GetUnderstandingProjectionInputs`, `GetCapabilityEvidenceState`)
+    /// with their bounded exact selectors.
+    fn enforce_catalogue_gate(query: &NamedReadRequest) -> Result<(), StoreError> {
+        if matches!(
+            query.operation,
+            NamedReadOperation::GetEvidencePack
+                | NamedReadOperation::GetCurrentEpistemicPosition
+                | NamedReadOperation::GetTaskState
+                | NamedReadOperation::GetAttentionAndProblems
+                | NamedReadOperation::GetUnderstandingProjectionInputs
+                | NamedReadOperation::GetCapabilityEvidenceState
+        ) {
+            let entries = generated_operation_manifests()?;
+            query.validate_against_catalogue(&entries)?;
+        }
+        Ok(())
+    }
+
     fn execute_named_sync(
         &self,
         query: &NamedReadRequest,
     ) -> Result<NamedReadResponse, StoreError> {
         query.validate()?;
+        // The older reads keep their legacy reference-contour behavior below.
+        // 688-B: the pack handler also suppresses evidence-backed erased pairs
+        // (see `evidence_pack_payload`); suppression never guesses.
+        Self::enforce_catalogue_gate(query)?;
         let state = self.lock_state()?;
         let fence = match state.fences.clone() {
             Some(fence) => fence,
@@ -472,6 +1027,24 @@ impl MemoryStore {
         }
         let revision_heads = state.revision_heads.values().cloned().collect::<Vec<_>>();
         let payload = match query.operation {
+            NamedReadOperation::GetCurrentEpistemicPosition => {
+                let scope = query
+                    .scope_id
+                    .as_ref()
+                    .ok_or(StoreError::ManifestMismatch)?;
+                let position = query
+                    .parameters
+                    .get("position")
+                    .and_then(Value::as_str)
+                    .ok_or(StoreError::ManifestMismatch)?;
+                let key = position_key(scope.as_str(), position)?;
+                let view = state
+                    .epistemic_positions
+                    .get(&key)
+                    .map(|(commit, receipt)| commit.readback(receipt))
+                    .transpose()?;
+                serde_json::to_value(view)
+            }
             NamedReadOperation::GetRevisionHeads => serde_json::to_value(&revision_heads),
             NamedReadOperation::GetOrderingHeads => {
                 serde_json::to_value(state.ordering_heads.values().collect::<Vec<_>>())
@@ -507,9 +1080,29 @@ impl MemoryStore {
                     "state_fence": fence,
                 }))
             }
+            NamedReadOperation::GetEvidencePack => {
+                let payload = Self::evidence_pack_payload(&state, query, &fence)?;
+                serde_json::to_value(&payload)
+            }
+            NamedReadOperation::GetTaskState => {
+                let payload = Self::task_state_payload(&state, query, &fence)?;
+                serde_json::to_value(&payload)
+            }
+            NamedReadOperation::GetAttentionAndProblems => {
+                let payload = Self::attention_problems_payload(&state, query, &fence)?;
+                serde_json::to_value(&payload)
+            }
+            NamedReadOperation::GetUnderstandingProjectionInputs => {
+                let payload = Self::understanding_inputs_payload(&state, query, &fence)?;
+                serde_json::to_value(&payload)
+            }
+            NamedReadOperation::GetCapabilityEvidenceState => {
+                let payload = Self::capability_evidence_payload(&state, query, &fence)?;
+                serde_json::to_value(&payload)
+            }
             _ => serde_json::to_value(json!({
                 "operation": format!("{:?}", query.operation),
-                "records": state.named_operations,
+                "records": state.named_operations.iter().map(|record| &record.operation).collect::<Vec<_>>(),
             })),
         };
         let payload = payload.map_err(|error| StoreError::Serialization(error.to_string()))?;
@@ -521,6 +1114,455 @@ impl MemoryStore {
         };
         response.validate()?;
         Ok(response)
+    }
+
+    /// Builds the versioned exact evidence-pack payload for one request.
+    ///
+    /// Reads only actually captured observations: the `CaptureObservation`
+    /// records stored by the commit path, in capture order, filtered by exact
+    /// scope and `subject` match — never substring or a default scope.
+    /// The commit path retains each operation's admitted scope. The current
+    /// fence gates the read, not the visibility of historical observations;
+    /// the explicit `max_records` bound caps the returned records with a
+    /// visible `truncated` marker plus totals, while an over-bound request
+    /// refuses with [`StoreError::PayloadTooLarge`] instead of returning a
+    /// successful over-bound view. Zero matches are an exact empty result,
+    /// not an error.
+    ///
+    /// 688-B: an evidence-backed erased `(scope_id, subject)` pair suppresses
+    /// its records — the pack returns exact empty with `matched_total = 0` —
+    /// even if rows remain in the log. Suppression requires a recorded intent
+    /// with dispatched removal; nothing else hides rows.
+    fn evidence_pack_payload(
+        state: &MemoryState,
+        query: &NamedReadRequest,
+        fence: &StateFence,
+    ) -> Result<Value, StoreError> {
+        let scope_id = query.scope_id.clone().ok_or(StoreError::InvalidField {
+            field: "scope_id",
+            reason: "evidence pack read requires scope_id",
+        })?;
+        // The catalogue gate already enforces presence and shape; re-check
+        // fail-closed so this arm never depends on call order.
+        let subject = query
+            .parameters
+            .get("subject")
+            .and_then(Value::as_str)
+            .ok_or(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "missing required parameter",
+            })?;
+        if subject.trim().is_empty() || subject.chars().any(char::is_control) {
+            return Err(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "subject must be a non-blank string",
+            });
+        }
+        let bound_raw = query
+            .parameters
+            .get("max_records")
+            .and_then(Value::as_str)
+            .ok_or(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "missing required parameter",
+            })?;
+        let max_records: u32 = bound_raw.parse().map_err(|_| StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "max_records must be a positive decimal bound",
+        })?;
+        if max_records == 0 {
+            return Err(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "max_records must be a positive decimal bound",
+            });
+        }
+        if max_records > EVIDENCE_PACK_MAX_RECORDS {
+            return Err(StoreError::PayloadTooLarge);
+        }
+        let limit = usize::try_from(max_records).map_err(|_| StoreError::PayloadTooLarge)?;
+        // Evidence-backed suppression: erased pairs return exact empty even
+        // when capture rows remain. No other state hides rows.
+        let suppressed = state
+            .erased_subjects
+            .contains(&(scope_id.to_string(), subject.to_owned()));
+        let matched: Vec<(usize, &eliot_store_api::NamedMutationRequest)> = if suppressed {
+            Vec::new()
+        } else {
+            state
+                .named_operations
+                .iter()
+                .enumerate()
+                .filter(|(_, record)| {
+                    record.scope_id == scope_id
+                        && record.operation.operation == NamedMutationOperation::CaptureObservation
+                        && record
+                            .operation
+                            .parameters
+                            .get("subject")
+                            .and_then(Value::as_str)
+                            == Some(subject)
+                })
+                .map(|(index, record)| (index, &record.operation))
+                .collect()
+        };
+        let matched_total = matched.len();
+        let records: Vec<Value> = matched
+            .into_iter()
+            .take(limit)
+            .map(|(capture_index, operation)| {
+                json!({
+                    "capture_index": capture_index,
+                    "operation": named_mutation_operation_name(operation.operation),
+                    "parameters": operation.parameters,
+                })
+            })
+            .collect();
+        let returned = records.len();
+        Ok(json!({
+            "version": EVIDENCE_PACK_PAYLOAD_VERSION,
+            "subject": subject,
+            "scope_id": scope_id,
+            "records": records,
+            "provenance": {
+                "state_fence": fence,
+                "matched_total": matched_total,
+                "returned": returned,
+                "max_records": max_records,
+                "truncated": matched_total > returned,
+            },
+        }))
+    }
+
+    /// Parses the explicit `max_records` decimal-string bound shared by the
+    /// T11.3 cognitive reads (same bound as `GetEvidencePack`).
+    fn parse_max_records(query: &NamedReadRequest) -> Result<(u32, usize), StoreError> {
+        let bound_raw = query
+            .parameters
+            .get("max_records")
+            .and_then(Value::as_str)
+            .ok_or(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "missing required parameter",
+            })?;
+        let max_records: u32 = bound_raw.parse().map_err(|_| StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "max_records must be a positive decimal bound",
+        })?;
+        if max_records == 0 {
+            return Err(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "max_records must be a positive decimal bound",
+            });
+        }
+        if max_records > EVIDENCE_PACK_MAX_RECORDS {
+            return Err(StoreError::PayloadTooLarge);
+        }
+        let limit = usize::try_from(max_records).map_err(|_| StoreError::PayloadTooLarge)?;
+        Ok((max_records, limit))
+    }
+
+    /// Builds the versioned `GetTaskState` payload for one request (T11.3).
+    ///
+    /// Reads only actually admitted task transitions: the `UpdateTaskState`
+    /// records stored by the commit path, in commit order, filtered by exact
+    /// scope and exact `task_id` match — never substring or a default scope.
+    /// Returns the bounded history plus the current parameters (the last
+    /// matching record) or null when no task transition exists. Zero matches
+    /// are an exact empty result, not an error.
+    fn task_state_payload(
+        state: &MemoryState,
+        query: &NamedReadRequest,
+        fence: &StateFence,
+    ) -> Result<Value, StoreError> {
+        let scope_id = query.scope_id.clone().ok_or(StoreError::InvalidField {
+            field: "scope_id",
+            reason: "task state read requires scope_id",
+        })?;
+        let task_id = query
+            .parameters
+            .get("task_id")
+            .and_then(Value::as_str)
+            .ok_or(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "missing required parameter",
+            })?;
+        if task_id.trim().is_empty() || task_id.chars().any(char::is_control) {
+            return Err(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "task_id must be a non-blank string",
+            });
+        }
+        let (max_records, limit) = Self::parse_max_records(query)?;
+        let matched: Vec<(usize, &eliot_store_api::NamedMutationRequest)> = state
+            .named_operations
+            .iter()
+            .enumerate()
+            .filter(|(_, record)| {
+                record.scope_id == scope_id
+                    && record.operation.operation == NamedMutationOperation::UpdateTaskState
+                    && record
+                        .operation
+                        .parameters
+                        .get("task_id")
+                        .and_then(Value::as_str)
+                        == Some(task_id)
+            })
+            .map(|(index, record)| (index, &record.operation))
+            .collect();
+        let matched_total = matched.len();
+        let current = matched.last().map(|(_, operation)| operation.parameters.clone());
+        let records: Vec<Value> = matched
+            .into_iter()
+            .take(limit)
+            .map(|(capture_index, operation)| {
+                json!({
+                    "capture_index": capture_index,
+                    "operation": named_mutation_operation_name(operation.operation),
+                    "parameters": operation.parameters,
+                })
+            })
+            .collect();
+        let returned = records.len();
+        Ok(json!({
+            "version": TASK_STATE_PAYLOAD_VERSION,
+            "task_id": task_id,
+            "scope_id": scope_id,
+            "records": records,
+            "current": current,
+            "provenance": {
+                "state_fence": fence,
+                "matched_total": matched_total,
+                "returned": returned,
+                "max_records": max_records,
+                "truncated": matched_total > returned,
+            },
+        }))
+    }
+
+    /// Builds the versioned `GetAttentionAndProblems` payload (T11.3).
+    ///
+    /// Reads only actually admitted problem-leg transitions: the
+    /// `ReconcileRecovery` records stored by the commit path, in commit
+    /// order, filtered by exact scope and, when supplied, exact `problem_id`
+    /// match. Zero matches are an exact empty result, not an error.
+    fn attention_problems_payload(
+        state: &MemoryState,
+        query: &NamedReadRequest,
+        fence: &StateFence,
+    ) -> Result<Value, StoreError> {
+        let scope_id = query.scope_id.clone().ok_or(StoreError::InvalidField {
+            field: "scope_id",
+            reason: "attention read requires scope_id",
+        })?;
+        let problem_id = match query.parameters.get("problem_id") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(text)) => {
+                if text.trim().is_empty() || text.chars().any(char::is_control) {
+                    return Err(StoreError::InvalidField {
+                        field: "operation.parameter",
+                        reason: "problem_id must be a non-blank string",
+                    });
+                }
+                Some(text.as_str())
+            }
+            Some(_) => {
+                return Err(StoreError::InvalidField {
+                    field: "operation.parameter",
+                    reason: "problem_id must be a non-blank string",
+                });
+            }
+        };
+        let (max_records, limit) = Self::parse_max_records(query)?;
+        let matched: Vec<(usize, &eliot_store_api::NamedMutationRequest)> = state
+            .named_operations
+            .iter()
+            .enumerate()
+            .filter(|(_, record)| {
+                record.scope_id == scope_id
+                    && record.operation.operation == NamedMutationOperation::ReconcileRecovery
+                    && problem_id.is_none_or(|wanted| {
+                        record
+                            .operation
+                            .parameters
+                            .get("problem_id")
+                            .and_then(Value::as_str)
+                            == Some(wanted)
+                    })
+            })
+            .map(|(index, record)| (index, &record.operation))
+            .collect();
+        let matched_total = matched.len();
+        let records: Vec<Value> = matched
+            .into_iter()
+            .take(limit)
+            .map(|(capture_index, operation)| {
+                json!({
+                    "capture_index": capture_index,
+                    "operation": named_mutation_operation_name(operation.operation),
+                    "parameters": operation.parameters,
+                })
+            })
+            .collect();
+        let returned = records.len();
+        Ok(json!({
+            "version": ATTENTION_PROBLEMS_PAYLOAD_VERSION,
+            "scope_id": scope_id,
+            "problem_id": problem_id,
+            "records": records,
+            "provenance": {
+                "state_fence": fence,
+                "matched_total": matched_total,
+                "returned": returned,
+                "max_records": max_records,
+                "truncated": matched_total > returned,
+            },
+        }))
+    }
+
+    /// Builds the versioned `GetUnderstandingProjectionInputs` payload (T11.3).
+    ///
+    /// Reads the admitted operation inputs for one scope: every committed
+    /// named operation whose admitted parameters contain the exact `selector`
+    /// as a string parameter value (exact equality, never substring), in
+    /// commit order. Zero matches are an exact empty result, not an error.
+    fn understanding_inputs_payload(
+        state: &MemoryState,
+        query: &NamedReadRequest,
+        fence: &StateFence,
+    ) -> Result<Value, StoreError> {
+        let scope_id = query.scope_id.clone().ok_or(StoreError::InvalidField {
+            field: "scope_id",
+            reason: "understanding inputs read requires scope_id",
+        })?;
+        let selector = query
+            .parameters
+            .get("selector")
+            .and_then(Value::as_str)
+            .ok_or(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "missing required parameter",
+            })?;
+        if selector.trim().is_empty() || selector.chars().any(char::is_control) {
+            return Err(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "selector must be a non-blank string",
+            });
+        }
+        let (max_records, limit) = Self::parse_max_records(query)?;
+        let matched: Vec<(usize, &eliot_store_api::NamedMutationRequest)> = state
+            .named_operations
+            .iter()
+            .enumerate()
+            .filter(|(_, record)| {
+                record.scope_id == scope_id
+                    && record
+                        .operation
+                        .parameters
+                        .values()
+                        .any(|value| value.as_str() == Some(selector))
+            })
+            .map(|(index, record)| (index, &record.operation))
+            .collect();
+        let matched_total = matched.len();
+        let records: Vec<Value> = matched
+            .into_iter()
+            .take(limit)
+            .map(|(capture_index, operation)| {
+                json!({
+                    "capture_index": capture_index,
+                    "operation": named_mutation_operation_name(operation.operation),
+                    "parameters": operation.parameters,
+                })
+            })
+            .collect();
+        let returned = records.len();
+        Ok(json!({
+            "version": UNDERSTANDING_INPUTS_PAYLOAD_VERSION,
+            "selector": selector,
+            "scope_id": scope_id,
+            "records": records,
+            "provenance": {
+                "state_fence": fence,
+                "matched_total": matched_total,
+                "returned": returned,
+                "max_records": max_records,
+                "truncated": matched_total > returned,
+            },
+        }))
+    }
+
+    /// Builds the versioned `GetCapabilityEvidenceState` payload (T11.3).
+    ///
+    /// Reads only actually admitted capability transitions: the
+    /// `ApplyLifecyclePolicy` records stored by the commit path, in commit
+    /// order, filtered by exact scope and exact `skill_id` match. Zero
+    /// matches are an exact empty result, not an error.
+    fn capability_evidence_payload(
+        state: &MemoryState,
+        query: &NamedReadRequest,
+        fence: &StateFence,
+    ) -> Result<Value, StoreError> {
+        let scope_id = query.scope_id.clone().ok_or(StoreError::InvalidField {
+            field: "scope_id",
+            reason: "capability evidence read requires scope_id",
+        })?;
+        let skill_id = query
+            .parameters
+            .get("skill_id")
+            .and_then(Value::as_str)
+            .ok_or(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "missing required parameter",
+            })?;
+        if skill_id.trim().is_empty() || skill_id.chars().any(char::is_control) {
+            return Err(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "skill_id must be a non-blank string",
+            });
+        }
+        let (max_records, limit) = Self::parse_max_records(query)?;
+        let matched: Vec<(usize, &eliot_store_api::NamedMutationRequest)> = state
+            .named_operations
+            .iter()
+            .enumerate()
+            .filter(|(_, record)| {
+                record.scope_id == scope_id
+                    && record.operation.operation == NamedMutationOperation::ApplyLifecyclePolicy
+                    && record
+                        .operation
+                        .parameters
+                        .get("skill_id")
+                        .and_then(Value::as_str)
+                        == Some(skill_id)
+            })
+            .map(|(index, record)| (index, &record.operation))
+            .collect();
+        let matched_total = matched.len();
+        let records: Vec<Value> = matched
+            .into_iter()
+            .take(limit)
+            .map(|(capture_index, operation)| {
+                json!({
+                    "capture_index": capture_index,
+                    "operation": named_mutation_operation_name(operation.operation),
+                    "parameters": operation.parameters,
+                })
+            })
+            .collect();
+        let returned = records.len();
+        Ok(json!({
+            "version": CAPABILITY_EVIDENCE_PAYLOAD_VERSION,
+            "skill_id": skill_id,
+            "scope_id": scope_id,
+            "records": records,
+            "provenance": {
+                "state_fence": fence,
+                "matched_total": matched_total,
+                "returned": returned,
+                "max_records": max_records,
+                "truncated": matched_total > returned,
+            },
+        }))
     }
 
     fn health_sync(&self) -> Result<StoreHealth, StoreError> {
@@ -602,6 +1644,10 @@ impl MemoryStore {
         context: &RequestMeta,
         request: &StoreGenesisRequest,
     ) -> Result<WriteReceipt, StoreError> {
+        // RECHECK-63 slice C: recompute first so tamper is a typed digest
+        // mismatch with no lookup success and no transaction, before the
+        // generic validation (which would report InvalidField).
+        let recomputed = verify_genesis_canonical_hash(request)?;
         request.validate_for_context(context)?;
         let mut state = self.lock_state()?;
 
@@ -670,12 +1716,11 @@ impl MemoryStore {
         }
         state.fences = Some(request.state_fence.clone());
         state.next_commit_sequence = next_commit_sequence;
+        // Bind the recomputed digest, never a blind copy of the supplied value
+        // (equal here after verification, but explicit for the receipt invariant).
         state.receipts_by_idempotency.insert(
             request.idempotency_key.clone(),
-            (
-                request.canonical_request_hash.clone(),
-                request.operation_id.to_string(),
-            ),
+            (recomputed, request.operation_id.to_string()),
         );
         state
             .receipts_by_operation
@@ -756,16 +1801,45 @@ impl CanonicalStoreClient for MemoryStore {
     }
 }
 
+/// Recomputes the genesis canonical hash and rejects divergence with the
+/// typed mismatch (RECHECK-63 slice C).
+///
+/// Returns the recomputed digest so callers bind the receipt to it, never a
+/// blind copy of the supplied value. Supplied != recomputed is
+/// `TransitionDigestMismatch` with no transaction and no lookup success;
+/// same key + different bytes with supplied == recomputed stays
+/// `IdentityConflict` at the caller's idempotency checks.
+fn verify_genesis_canonical_hash(request: &StoreGenesisRequest) -> Result<String, StoreError> {
+    let recomputed = request.compute_digest()?;
+    if recomputed == request.canonical_request_hash {
+        Ok(recomputed)
+    } else {
+        Err(StoreError::TransitionDigestMismatch {
+            expected: request
+                .canonical_request_hash
+                .chars()
+                .take(eliot_store_api::MAX_DIGEST_DETAIL_CHARS)
+                .collect(),
+            observed: recomputed
+                .chars()
+                .take(eliot_store_api::MAX_DIGEST_DETAIL_CHARS)
+                .collect(),
+        })
+    }
+}
+
 fn genesis_receipt(
     context: &RequestMeta,
     request: &StoreGenesisRequest,
     commit_sequence: u64,
 ) -> Result<WriteReceipt, StoreError> {
+    // Bind the receipt to the recomputed digest, never a blind copy.
+    let recomputed = verify_genesis_canonical_hash(request)?;
     let manifest = genesis_manifest()?;
     let mut receipt = WriteReceipt {
         operation_id: request.operation_id.clone(),
         idempotency_key: request.idempotency_key.clone(),
-        canonical_request_hash: request.canonical_request_hash.clone(),
+        canonical_request_hash: recomputed,
         transition_class: eliot_store_api::TransitionClass::RecoverySchema,
         status: WriteReceiptStatus::Committed,
         commit_id: Some(CommitId::new("commit-genesis")?),
@@ -793,7 +1867,30 @@ fn genesis_receipt(
 }
 
 #[derive(Clone, Debug, PartialEq)]
+struct ScopedNamedOperation {
+    scope_id: ScopeId,
+    operation: eliot_store_api::NamedMutationRequest,
+}
+
+/// In-memory erasure-intent registry entry (688-B).
+///
+/// One operation id names exactly one frozen intent with one per-surface
+/// outcome each, all initially `NotAttempted`. Outcomes advance to
+/// `Purged`/`Incomplete`/`Unknown` in the dispatch below; a sealed
+/// `dispatched` entry replays its stored outcomes verbatim instead of
+/// re-running destructive work. Sealing happens only after every requested
+/// surface has a terminal (`Purged`/`Incomplete`/`Unknown`) outcome; an
+/// entry with any `NotAttempted` surface is never suppression evidence.
+#[derive(Clone, Debug, PartialEq)]
+struct ErasureRegistryEntry {
+    intent: StoreErasureIntent,
+    outcomes: Vec<StoreSurfaceOutcome>,
+    dispatched: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 struct MemoryState {
+    epistemic_positions: BTreeMap<String, (EpistemicCommit, WriteReceipt)>,
     fences: Option<StateFence>,
     recovery_records: BTreeMap<RecoveryRecordKey, RecoveryRecord>,
     recovery_jobs: BTreeMap<RecoveryRecordKey, RecoveryRecord>,
@@ -804,8 +1901,14 @@ struct MemoryState {
     projections: BTreeMap<String, ProjectionPublicationRecord>,
     outbox: BTreeMap<String, OutboxIntent>,
     relations: BTreeSet<String>,
-    named_operations: Vec<eliot_store_api::NamedMutationRequest>,
+    named_operations: Vec<ScopedNamedOperation>,
     manifests: BTreeMap<String, eliot_store_api::NamedOperationManifest>,
+    /// 688-B in-memory erasure-intent registry (`operation_id` -> entry).
+    erasure_intents: BTreeMap<String, ErasureRegistryEntry>,
+    /// 688-B evidence-backed suppression keys: `(scope_id, subject)` pairs
+    /// erased under a recorded intent with dispatched removal. The pack hides
+    /// only suppressed pairs, even if rows remain; never a guess.
+    erased_subjects: BTreeSet<(String, String)>,
     next_commit_sequence: u64,
     next_outbox_sequence: u64,
 }
@@ -813,6 +1916,7 @@ struct MemoryState {
 impl Default for MemoryState {
     fn default() -> Self {
         Self {
+            epistemic_positions: BTreeMap::new(),
             fences: None,
             recovery_records: BTreeMap::new(),
             recovery_jobs: BTreeMap::new(),
@@ -825,6 +1929,8 @@ impl Default for MemoryState {
             relations: BTreeSet::new(),
             named_operations: Vec::new(),
             manifests: BTreeMap::new(),
+            erasure_intents: BTreeMap::new(),
+            erased_subjects: BTreeSet::new(),
             next_commit_sequence: 1,
             next_outbox_sequence: 1,
         }
@@ -843,6 +1949,8 @@ impl MemoryState {
             && self.outbox.is_empty()
             && self.relations.is_empty()
             && self.named_operations.is_empty()
+            && self.erasure_intents.is_empty()
+            && self.erased_subjects.is_empty()
     }
 
     fn snapshot(&self) -> MemorySnapshot {
@@ -854,7 +1962,11 @@ impl MemoryState {
             projections: self.projections.values().cloned().collect(),
             outbox: self.outbox.values().cloned().collect(),
             relations: self.relations.iter().cloned().collect(),
-            named_operations: self.named_operations.clone(),
+            named_operations: self
+                .named_operations
+                .iter()
+                .map(|record| record.operation.clone())
+                .collect(),
         }
     }
 }
@@ -1063,16 +2175,27 @@ fn checked_increment(
 mod tests {
     use super::*;
     use eliot_contracts::{
-        AuthorityEpoch, ClockReading, ProductId, RequestId, ResourceGeneration, SessionId,
+        ClockReading, EpochId, EpochLineageId, ProductId, RequestId, ResourceGeneration, SessionId,
         SourceId, TaskId,
     };
     use eliot_store_api::{
         EffectClass, NamedOperationManifest, StoreGenesisRequest, StoreRecoveryRequest,
         TransitionClass,
     };
+    use std::num::NonZeroU64;
+
+    const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn test_epoch(sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(TEST_LINEAGE_A).expect("valid test lineage"),
+            NonZeroU64::new(sequence).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
 
     fn fence() -> StateFence {
-        StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+        StateFence::new(test_epoch(1), ResourceGeneration::genesis())
     }
 
     fn metadata(state_fence: &StateFence) -> Result<RequestMeta, StoreError> {
@@ -1163,8 +2286,12 @@ mod tests {
         operation: &str,
         state_fence: &StateFence,
     ) -> Result<PreparedTransition, StoreError> {
+        // RECHECK-63 slice C: bind the real shared-function digest for the
+        // empty-heads view (the old `"a".repeat(64)` was a placeholder, never
+        // the hash of these executable bytes). Callers that apply with
+        // non-empty expected heads must rebind via `transition_with_heads`.
         let operation_id = OperationId::new(operation).map_err(StoreError::Foundation)?;
-        Ok(PreparedTransition {
+        let mut prepared = PreparedTransition {
             identity: eliot_store_api::OperationIdentity {
                 operation_id,
                 idempotency_key: format!("idem-{operation}"),
@@ -1189,7 +2316,33 @@ mod tests {
             },
             security: eliot_store_api::SecurityContext::default(),
             required_proof_and_approval_refs: vec![],
-        })
+        };
+        let ctx = metadata(state_fence)?;
+        let view = CanonicalRequestView::from_apply(&ctx, &prepared, &[], &[]);
+        prepared.identity.canonical_request_hash = canonical_request_hash(&view)?;
+        Ok(prepared)
+    }
+
+    /// Rebinds a transition's digest for the exact expected heads it will be
+    /// applied with (non-empty-heads callers must use this; the empty-heads
+    /// `transition` digest would otherwise mismatch and yield a typed digest
+    /// error instead of the intended revision/ordering check).
+    fn transition_with_heads(
+        operation: &str,
+        state_fence: &StateFence,
+        ctx: &RequestMeta,
+        expected_revision_heads: &[RevisionHeadExpectation],
+        expected_ordering_heads: &[OrderingHeadExpectation],
+    ) -> Result<PreparedTransition, StoreError> {
+        let mut prepared = transition(operation, state_fence)?;
+        let view = CanonicalRequestView::from_apply(
+            ctx,
+            &prepared,
+            expected_revision_heads,
+            expected_ordering_heads,
+        );
+        prepared.identity.canonical_request_hash = canonical_request_hash(&view)?;
+        Ok(prepared)
     }
 
     #[test]
@@ -1304,10 +2457,7 @@ mod tests {
             vec![recovery_record("owner", "one", &state_fence, b"one")],
         )?;
         let first = store.initialize_genesis_sync(&metadata(&state_fence)?, &request)?;
-        let substituted_fence = StateFence::new(
-            AuthorityEpoch::new(2).map_err(StoreError::Foundation)?,
-            ResourceGeneration::genesis(),
-        );
+        let substituted_fence = StateFence::new(test_epoch(2), ResourceGeneration::genesis());
         store.lock_state()?.fences = Some(substituted_fence);
         let before = store.lock_state()?.clone();
         assert_eq!(
@@ -1335,12 +2485,20 @@ mod tests {
         let before = store.lock_state()?.clone();
         let mut changed_hash = request.clone();
         changed_hash.canonical_request_hash = "d".repeat(64);
-        assert_eq!(
-            store.initialize_genesis_sync(&metadata(&state_fence)?, &changed_hash),
-            Err(StoreError::InvalidField {
-                field: "canonical_request_hash",
-                reason: "does not match canonical genesis request",
-            })
+        // RECHECK-63 slice C: supplied != recomputed is now the typed digest
+        // mismatch (not the generic InvalidField), still with no state change.
+        // Proof: `changed_hash` keeps every committed field identical so its
+        // recomputed digest equals the original request digest; only the
+        // supplied claimant (`"d".repeat`) diverges.
+        let tampered = store.initialize_genesis_sync(&metadata(&state_fence)?, &changed_hash);
+        assert!(
+            matches!(
+                &tampered,
+                Err(StoreError::TransitionDigestMismatch { expected, observed })
+                    if expected == &"d".repeat(64)
+                        && observed == &request.compute_digest().expect("recomputed digest")
+            ),
+            "tampered genesis hash must be a typed digest mismatch, got {tampered:?}"
         );
         let mut changed_operation = request.clone();
         changed_operation.operation_id =
@@ -1370,12 +2528,21 @@ mod tests {
         ))?;
         let mut changed_owner_records = request.clone();
         changed_owner_records.owner_records[0].key = "two".to_owned();
-        assert_eq!(
-            store.initialize_genesis_sync(&metadata(&state_fence)?, &changed_owner_records,),
-            Err(StoreError::InvalidField {
-                field: "canonical_request_hash",
-                reason: "does not match canonical genesis request",
-            })
+        // Same typed-mismatch rule: the owner mutation changes the recomputed
+        // digest while the supplied claimant stays the original hash.
+        let tampered_owners =
+            store.initialize_genesis_sync(&metadata(&state_fence)?, &changed_owner_records);
+        assert!(
+            matches!(
+                &tampered_owners,
+                Err(StoreError::TransitionDigestMismatch { expected, observed })
+                    if expected == &request.canonical_request_hash
+                        && observed
+                            == &changed_owner_records
+                                .compute_digest()
+                                .expect("recomputed owner digest")
+            ),
+            "mutated genesis owners must be a typed digest mismatch, got {tampered_owners:?}"
         );
         let after = store.lock_state()?.clone();
         assert_eq!(before_snapshot, store.snapshot()?);
@@ -1432,10 +2599,7 @@ mod tests {
         );
         assert_eq!(before, store.lock_state()?.clone());
 
-        let other_fence = StateFence::new(
-            AuthorityEpoch::new(2).map_err(StoreError::Foundation)?,
-            ResourceGeneration::genesis(),
-        );
+        let other_fence = StateFence::new(test_epoch(2), ResourceGeneration::genesis());
         let mut stale = recovery_request(
             &state_fence,
             vec![RecoveryRecordKey::new("owner", "one")?],
@@ -1559,15 +2723,25 @@ mod tests {
         let ctx = metadata(&state_fence)?;
         let prepared = transition("op-substitution", &state_fence)?;
         store.apply_transaction(&ctx, prepared.clone(), &[], &[])?;
+        let before = store.snapshot()?;
 
         let mut substituted = prepared;
         substituted.named_operations[0]
             .parameters
             .insert("subject".to_owned(), json!("substituted"));
-        assert_eq!(
-            store.apply_transaction(&ctx, substituted, &[], &[]),
-            Err(StoreError::InvalidReceipt)
+        // RECHECK-63 slice C: the substituted bytes keep the original claim,
+        // so supplied != recomputed is now the typed digest mismatch (not the
+        // legacy InvalidReceipt from envelope replay), still with no state
+        // change. Proof: `transition()` binds the real digest for the exact
+        // bytes; mutating one parameter without rebinding must diverge.
+        let err = store
+            .apply_transaction(&ctx, substituted, &[], &[])
+            .expect_err("substituted payload must fail");
+        assert!(
+            matches!(err, StoreError::TransitionDigestMismatch { .. }),
+            "payload substitution must be TRANSITION_DIGEST_MISMATCH, got {err:?}"
         );
+        assert_eq!(before, store.snapshot()?);
         Ok(())
     }
 
@@ -1607,16 +2781,15 @@ mod tests {
             expected_revision: 1,
             state_fence: state_fence.clone(),
         }];
-        let error = store.apply_transaction(
-            &ctx,
-            transition("op-2", &state_fence)?,
-            &stale,
-            &[OrderingHeadExpectation {
-                scope: OrderingScopeId::new("scope-1")?,
-                expected_sequence: 2,
-                state_fence,
-            }],
-        );
+        let stale_ordering = vec![OrderingHeadExpectation {
+            scope: OrderingScopeId::new("scope-1")?,
+            expected_sequence: 2,
+            state_fence: state_fence.clone(),
+        }];
+        // Rebind the digest for the exact heads under test so the revision
+        // gate (not a digest mismatch) is what fails here.
+        let prepared = transition_with_heads("op-2", &state_fence, &ctx, &stale, &stale_ordering)?;
+        let error = store.apply_transaction(&ctx, prepared, &stale, &stale_ordering);
         assert!(matches!(error, Err(StoreError::RevisionConflict)));
         assert_eq!(before, store.snapshot()?);
         Ok(())
@@ -1670,7 +2843,13 @@ mod tests {
         }];
         left.apply_transaction(
             &ctx,
-            transition("op-left", &state_fence)?,
+            transition_with_heads(
+                "op-left",
+                &state_fence,
+                &ctx,
+                &expected_next_revision,
+                &expected_next_ordering,
+            )?,
             &expected_next_revision,
             &expected_next_ordering,
         )?;
@@ -1680,7 +2859,13 @@ mod tests {
 
         right.apply_transaction(
             &ctx,
-            transition("op-right", &state_fence)?,
+            transition_with_heads(
+                "op-right",
+                &state_fence,
+                &ctx,
+                &expected_next_revision,
+                &expected_next_ordering,
+            )?,
             &expected_next_revision,
             &expected_next_ordering,
         )?;
@@ -1867,6 +3052,1188 @@ mod tests {
         }));
         assert!(poison_result.is_err());
         assert_eq!(store.health_sync()?.status, StoreHealthStatus::Unavailable);
+        Ok(())
+    }
+
+    #[test]
+    fn tampered_canonical_hash_is_a_typed_mismatch_with_no_state_change() -> Result<(), StoreError>
+    {
+        // RECHECK-63 slice C: supplied != recomputed fails typed before any
+        // idempotency-lookup success and before any transaction/receipt, with
+        // the receipt binding the recomputed digest on the exact path.
+        let state_fence = fence();
+        let store = store()?;
+        let ctx = metadata(&state_fence)?;
+        let exact = transition("op-tamper", &state_fence)?;
+        let view = CanonicalRequestView::from_apply(&ctx, &exact, &[], &[]);
+        let recomputed = canonical_request_hash(&view)?;
+        assert_eq!(exact.identity.canonical_request_hash, recomputed);
+        // Exact commits and binds the recomputed digest.
+        let receipt = store.apply_transaction(&ctx, exact.clone(), &[], &[])?;
+        assert_eq!(receipt.canonical_request_hash, recomputed);
+        let before = store.snapshot()?;
+        // Tamper one load-bearing byte (subject) while keeping the old claim.
+        let mut tampered = exact.clone();
+        tampered.named_operations[0]
+            .parameters
+            .insert("subject".to_owned(), json!("tampered"));
+        let err = store
+            .apply_transaction(&ctx, tampered, &[], &[])
+            .expect_err("tampered bytes must fail");
+        assert!(
+            matches!(
+                &err,
+                StoreError::TransitionDigestMismatch { expected, observed }
+                    if expected == &recomputed
+                        && observed
+                            != &recomputed
+            ),
+            "tamper must be TRANSITION_DIGEST_MISMATCH, got {err:?}"
+        );
+        assert_eq!(before, store.snapshot()?);
+        // Same-key-different-bytes with a correctly recomputed claim for the
+        // new bytes stays IDENTITY_CONFLICT (not a digest mismatch) and is
+        // still atomic.
+        let mut forked = exact;
+        forked.identity.operation_id =
+            OperationId::new("op-tamper-fork").map_err(StoreError::Foundation)?;
+        forked.named_operations[0]
+            .parameters
+            .insert("subject".to_owned(), json!("forked"));
+        let forked_view = CanonicalRequestView::from_apply(&ctx, &forked, &[], &[]);
+        forked.identity.canonical_request_hash = canonical_request_hash(&forked_view)?;
+        // Force the idempotency-key collision while keeping the fork's own
+        // digest self-consistent: reuse the original idempotency key.
+        forked.identity.idempotency_key = format!("idem-op-tamper");
+        let conflict = store
+            .apply_transaction(&ctx, forked, &[], &[])
+            .expect_err("same-key fork must conflict");
+        assert_eq!(conflict, StoreError::IdentityConflict);
+        assert_eq!(before, store.snapshot()?);
+        Ok(())
+    }
+
+    #[test]
+    fn exact_replay_binds_recomputed_digest_and_is_byte_identical() -> Result<(), StoreError> {
+        // Proves cross-crate stability: the store recompute uses the same
+        // shared helper as Slice A (golden vector
+        // `55e62e405f35c7f137fe9fcdf177c66a1cba54a5b75fb547deaa11f001a89ec1`
+        // is produced by `canonical_request_hash` in `eliot-store-api`).
+        // Here the memory path binds its own recomputed digest and replays
+        // byte-identically.
+        let state_fence = fence();
+        let store = store()?;
+        let ctx = metadata(&state_fence)?;
+        let prepared = transition("op-replay-digest", &state_fence)?;
+        let view = CanonicalRequestView::from_apply(&ctx, &prepared, &[], &[]);
+        let recomputed = canonical_request_hash(&view)?;
+        verify_canonical_request_hash(&view, &prepared.identity.canonical_request_hash)?;
+        let first = store.apply_transaction(&ctx, prepared.clone(), &[], &[])?;
+        assert_eq!(first.canonical_request_hash, recomputed);
+        let before = store.snapshot()?;
+        let replay = store.apply_transaction(&ctx, prepared, &[], &[])?;
+        assert_eq!(first, replay);
+        assert_eq!(before, store.snapshot()?);
+        Ok(())
+    }
+
+    fn capture_with_subject(
+        operation: &str,
+        subject: &str,
+        state_fence: &StateFence,
+        ctx: &RequestMeta,
+    ) -> Result<PreparedTransition, StoreError> {
+        // Captures one real observation through the existing capture path
+        // with an explicit subject, rebinding the canonical request hash for
+        // the exact executable bytes (same pattern as
+        // `transition_with_heads`).
+        let mut prepared = transition(operation, state_fence)?;
+        prepared.named_operations[0]
+            .parameters
+            .insert("subject".to_owned(), json!(subject));
+        let view = CanonicalRequestView::from_apply(ctx, &prepared, &[], &[]);
+        prepared.identity.canonical_request_hash = canonical_request_hash(&view)?;
+        Ok(prepared)
+    }
+
+    fn evidence_params(subject: &str, max_records: &str) -> BTreeMap<String, Value> {
+        BTreeMap::from([
+            ("subject".to_owned(), json!(subject)),
+            ("max_records".to_owned(), json!(max_records)),
+        ])
+    }
+
+    fn evidence_pack_query(
+        state_fence: &StateFence,
+        scope: Option<&str>,
+        parameters: BTreeMap<String, Value>,
+    ) -> Result<NamedReadRequest, StoreError> {
+        Ok(NamedReadRequest {
+            operation: NamedReadOperation::GetEvidencePack,
+            scope_id: scope.map(ScopeId::new).transpose()?,
+            consistency: eliot_store_api::ReadConsistency::Eventual,
+            state_fence: state_fence.clone(),
+            parameters,
+        })
+    }
+
+    fn pack_records(payload: &Value) -> Result<&Vec<Value>, StoreError> {
+        payload
+            .get("records")
+            .and_then(Value::as_array)
+            .ok_or(StoreError::Empty {
+                field: "evidence.records",
+            })
+    }
+
+    fn pack_provenance(payload: &Value) -> Result<&serde_json::Map<String, Value>, StoreError> {
+        payload
+            .get("provenance")
+            .and_then(Value::as_object)
+            .ok_or(StoreError::Empty {
+                field: "evidence.provenance",
+            })
+    }
+
+    #[test]
+    fn evidence_pack_isolates_scopes_with_the_same_subject() -> Result<(), StoreError> {
+        let state_fence = fence();
+        let ctx = metadata(&state_fence)?;
+        let store = store()?;
+        for (index, scope) in ["scope-other", "scope-1"].into_iter().enumerate() {
+            let mut capture = capture_with_subject(
+                &format!("scope-capture-{index}"),
+                "shared-subject",
+                &state_fence,
+                &ctx,
+            )?;
+            capture.scope_id = ScopeId::new(scope)?;
+            capture.ordering_scopes = vec![OrderingScopeId::new(scope)?];
+            capture.identity.canonical_request_hash = canonical_request_hash(
+                &CanonicalRequestView::from_apply(&ctx, &capture, &[], &[]),
+            )?;
+            store.apply_transaction(&ctx, capture.clone(), &[], &[])?;
+            // Exact replay must not add an observation or shift its identity.
+            store.apply_transaction(&ctx, capture, &[], &[])?;
+        }
+        for (scope, expected_index) in [
+            ("scope-other", Some(0)),
+            ("scope-1", Some(1)),
+            ("scope-missing", None),
+        ] {
+            let response = store.execute_named_sync(&evidence_pack_query(
+                &state_fence,
+                Some(scope),
+                evidence_params("shared-subject", "1"),
+            )?)?;
+            let records = pack_records(&response.payload)?;
+            assert_eq!(records.len(), usize::from(expected_index.is_some()));
+            if let Some(index) = expected_index {
+                assert_eq!(records[0]["capture_index"], json!(index));
+            }
+            assert_eq!(
+                response.payload["provenance"]["matched_total"],
+                json!(records.len())
+            );
+            assert_eq!(response.payload["provenance"]["truncated"], json!(false));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_pack_preserves_history_after_current_fence_advances() -> Result<(), StoreError> {
+        let initial = fence();
+        let ctx = metadata(&initial)?;
+        let store = store()?;
+        let receipt = store.apply_transaction(
+            &ctx,
+            capture_with_subject("historical-capture", "historical-subject", &initial, &ctx)?,
+            &[],
+            &[],
+        )?;
+        let query = evidence_pack_query(
+            &initial,
+            Some("scope-1"),
+            evidence_params("historical-subject", "1"),
+        )?;
+        let before = store.execute_named_sync(&query)?;
+        assert_eq!(pack_records(&before.payload)?.len(), 1);
+        let mut current = initial.clone();
+        for component in 0..5 {
+            match component {
+                0 => current.authority_epoch = test_epoch(2),
+                1 => {
+                    current.resource_generation =
+                        ResourceGeneration::new(2).map_err(StoreError::Foundation)?;
+                }
+                2 => {
+                    current.task_revision = Some(
+                        eliot_contracts::TaskRevision::new(2).map_err(StoreError::Foundation)?,
+                    );
+                }
+                3 => {
+                    current.policy_revision = Some(
+                        eliot_contracts::PolicyRevision::new(2).map_err(StoreError::Foundation)?,
+                    );
+                }
+                _ => {
+                    current.integration_revision = Some(
+                        eliot_contracts::IntegrationRevision::new(2)
+                            .map_err(StoreError::Foundation)?,
+                    );
+                }
+            }
+            // Fixture installs the new current fence. Historical observations
+            // and receipts stay untouched; lifecycle admission is outside this test.
+            store.lock_state()?.fences = Some(current.clone());
+            let mut current_query = query.clone();
+            current_query.state_fence = current.clone();
+            let response = store.execute_named_sync(&current_query)?;
+            assert_eq!(response.payload["records"], before.payload["records"]);
+            assert_eq!(response.payload["provenance"]["matched_total"], json!(1));
+            assert_eq!(
+                response.payload["provenance"]["state_fence"],
+                json!(current)
+            );
+            assert_eq!(response.state_fence, current);
+            assert_eq!(
+                store.execute_named_sync(&query),
+                Err(StoreError::FenceMismatch)
+            );
+            assert_eq!(
+                store
+                    .lock_state()?
+                    .receipts_by_operation
+                    .get("historical-capture"),
+                Some(&receipt),
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_pack_returns_exact_captured_record_with_provenance() -> Result<(), StoreError> {
+        // Slice T11.1: capture one real observation via the existing capture
+        // path, then `GetEvidencePack` returns its exact record (identity)
+        // with fence-bound provenance.
+        let state_fence = fence();
+        let store = store()?;
+        let ctx = metadata(&state_fence)?;
+        let prepared = capture_with_subject("op-evidence-1", "evidence-alpha", &state_fence, &ctx)?;
+        let receipt = store.apply_transaction(&ctx, prepared, &[], &[])?;
+        assert_eq!(receipt.operation_id.as_str(), "op-evidence-1");
+
+        let query = evidence_pack_query(
+            &state_fence,
+            Some("scope-1"),
+            evidence_params("evidence-alpha", "10"),
+        )?;
+        let response = store.execute_named_sync(&query)?;
+        assert_eq!(response.operation, NamedReadOperation::GetEvidencePack);
+        assert_eq!(response.state_fence, state_fence);
+        response.validate()?;
+        let payload = &response.payload;
+        assert_eq!(
+            payload.get("version").and_then(Value::as_u64),
+            Some(u64::from(EVIDENCE_PACK_PAYLOAD_VERSION))
+        );
+        assert_eq!(
+            payload.get("subject").and_then(Value::as_str),
+            Some("evidence-alpha")
+        );
+        let records = pack_records(payload)?;
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].get("operation").and_then(Value::as_str),
+            Some("CaptureObservation")
+        );
+        assert_eq!(
+            records[0].get("capture_index").and_then(Value::as_u64),
+            Some(0)
+        );
+        assert_eq!(
+            records[0]
+                .get("parameters")
+                .and_then(|parameters| parameters.get("subject"))
+                .and_then(Value::as_str),
+            Some("evidence-alpha")
+        );
+        let provenance = pack_provenance(payload)?;
+        assert_eq!(
+            provenance.get("state_fence"),
+            Some(
+                &serde_json::to_value(&state_fence)
+                    .map_err(|error| StoreError::Serialization(error.to_string()))?
+            )
+        );
+        assert_eq!(
+            provenance.get("matched_total").and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(provenance.get("returned").and_then(Value::as_u64), Some(1));
+        assert_eq!(
+            provenance.get("max_records").and_then(Value::as_u64),
+            Some(10)
+        );
+        assert_eq!(
+            provenance.get("truncated").and_then(Value::as_bool),
+            Some(false)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_pack_absence_is_an_exact_empty_result() -> Result<(), StoreError> {
+        // No captured observation matches: an exact empty result, never a
+        // successful current view of unrelated state.
+        let state_fence = fence();
+        let store = store()?;
+        let ctx = metadata(&state_fence)?;
+        let prepared = capture_with_subject("op-evidence-2", "evidence-alpha", &state_fence, &ctx)?;
+        store.apply_transaction(&ctx, prepared, &[], &[])?;
+
+        let query = evidence_pack_query(
+            &state_fence,
+            Some("scope-1"),
+            evidence_params("evidence-missing", "10"),
+        )?;
+        let response = store.execute_named_sync(&query)?;
+        response.validate()?;
+        let records = pack_records(&response.payload)?;
+        assert!(records.is_empty());
+        let provenance = pack_provenance(&response.payload)?;
+        assert_eq!(
+            provenance.get("matched_total").and_then(Value::as_u64),
+            Some(0)
+        );
+        assert_eq!(
+            provenance.get("truncated").and_then(Value::as_bool),
+            Some(false)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_pack_wrong_fence_is_refused() -> Result<(), StoreError> {
+        let state_fence = fence();
+        let store = store()?;
+        let ctx = metadata(&state_fence)?;
+        let prepared = capture_with_subject("op-evidence-3", "evidence-alpha", &state_fence, &ctx)?;
+        store.apply_transaction(&ctx, prepared, &[], &[])?;
+
+        let other_fence = StateFence::new(test_epoch(2), ResourceGeneration::genesis());
+        assert_ne!(other_fence, state_fence);
+        let query = evidence_pack_query(
+            &other_fence,
+            Some("scope-1"),
+            evidence_params("evidence-alpha", "10"),
+        )?;
+        assert_eq!(
+            store.execute_named_sync(&query),
+            Err(StoreError::FenceMismatch)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_pack_over_bound_request_is_refused() -> Result<(), StoreError> {
+        // An over-bound request refuses with `PayloadTooLarge`: never a
+        // successful over-bound view.
+        let state_fence = fence();
+        let store = store()?;
+        let ctx = metadata(&state_fence)?;
+        let prepared = capture_with_subject("op-evidence-4", "evidence-alpha", &state_fence, &ctx)?;
+        store.apply_transaction(&ctx, prepared, &[], &[])?;
+
+        for bound in [
+            (EVIDENCE_PACK_MAX_RECORDS + 1).to_string(),
+            "1000".to_owned(),
+        ] {
+            let query = evidence_pack_query(
+                &state_fence,
+                Some("scope-1"),
+                evidence_params("evidence-alpha", &bound),
+            )?;
+            assert_eq!(
+                store.execute_named_sync(&query),
+                Err(StoreError::PayloadTooLarge),
+                "bound {bound} exceeds the declared maximum"
+            );
+        }
+        // The exact maximum stays admissible.
+        let query = evidence_pack_query(
+            &state_fence,
+            Some("scope-1"),
+            evidence_params("evidence-alpha", &format!("{EVIDENCE_PACK_MAX_RECORDS}")),
+        )?;
+        assert!(store.execute_named_sync(&query).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_pack_malformed_selectors_fail_closed() -> Result<(), StoreError> {
+        let state_fence = fence();
+        let store = store()?;
+
+        // Scope-addressed read without a scope.
+        let query =
+            evidence_pack_query(&state_fence, None, evidence_params("evidence-alpha", "10"))?;
+        assert_eq!(
+            store.execute_named_sync(&query),
+            Err(StoreError::InvalidField {
+                field: "scope_id",
+                reason: "scope revision read requires scope_id",
+            })
+        );
+
+        // Missing subject selector.
+        let query = evidence_pack_query(
+            &state_fence,
+            Some("scope-1"),
+            BTreeMap::from([("max_records".to_owned(), json!("10"))]),
+        )?;
+        assert!(matches!(
+            store.execute_named_sync(&query),
+            Err(StoreError::InvalidField {
+                field: "operation.parameter",
+                ..
+            })
+        ));
+
+        // Extra undeclared parameter.
+        let mut extra = evidence_params("evidence-alpha", "10");
+        extra.insert("limit".to_owned(), json!(1));
+        let query = evidence_pack_query(&state_fence, Some("scope-1"), extra)?;
+        assert!(matches!(
+            store.execute_named_sync(&query),
+            Err(StoreError::InvalidField {
+                field: "operation.parameter",
+                ..
+            })
+        ));
+
+        // Zero and non-decimal bounds fail the bound shape.
+        for bound in ["0", "many"] {
+            let query = evidence_pack_query(
+                &state_fence,
+                Some("scope-1"),
+                evidence_params("evidence-alpha", bound),
+            )?;
+            assert!(
+                matches!(
+                    store.execute_named_sync(&query),
+                    Err(StoreError::InvalidField {
+                        field: "operation.parameter",
+                        ..
+                    })
+                ),
+                "bound {bound} must fail closed"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_pack_bounds_results_with_visible_truncation() -> Result<(), StoreError> {
+        // Three captures share one subject; a bound of two returns the first
+        // two in capture order with an explicit truncation marker and totals.
+        let state_fence = fence();
+        let store = store()?;
+        let ctx = metadata(&state_fence)?;
+        for index in ["op-bulk-1", "op-bulk-2", "op-bulk-3"] {
+            let prepared = capture_with_subject(index, "evidence-bulk", &state_fence, &ctx)?;
+            store.apply_transaction(&ctx, prepared, &[], &[])?;
+        }
+
+        let query = evidence_pack_query(
+            &state_fence,
+            Some("scope-1"),
+            evidence_params("evidence-bulk", "2"),
+        )?;
+        let response = store.execute_named_sync(&query)?;
+        response.validate()?;
+        let records = pack_records(&response.payload)?;
+        assert_eq!(records.len(), 2);
+        assert_eq!(
+            records[0].get("capture_index").and_then(Value::as_u64),
+            Some(0)
+        );
+        assert_eq!(
+            records[1].get("capture_index").and_then(Value::as_u64),
+            Some(1)
+        );
+        let provenance = pack_provenance(&response.payload)?;
+        assert_eq!(
+            provenance.get("matched_total").and_then(Value::as_u64),
+            Some(3)
+        );
+        assert_eq!(provenance.get("returned").and_then(Value::as_u64), Some(2));
+        assert_eq!(
+            provenance.get("truncated").and_then(Value::as_bool),
+            Some(true)
+        );
+
+        // A bound covering every match is not truncated.
+        let query = evidence_pack_query(
+            &state_fence,
+            Some("scope-1"),
+            evidence_params("evidence-bulk", "3"),
+        )?;
+        let response = store.execute_named_sync(&query)?;
+        let provenance = pack_provenance(&response.payload)?;
+        assert_eq!(
+            provenance.get("truncated").and_then(Value::as_bool),
+            Some(false)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn erased_observation_disappears_from_evidence_pack_with_replay_identity()
+    -> Result<(), StoreError> {
+        // 688-B memory erasure execution: one capture, then record-intent
+        // before dispatch; the pack no longer returns the erased pair even
+        // though rows remain suppressed (not deleted from the log shape in
+        // this contour — suppression is evidence-backed, never a guess);
+        // same-operation replay returns the original outcomes with no
+        // duplicate destructive work; dispatch without intent fails closed
+        // with zero effects.
+        let state_fence = fence();
+        let store = store()?;
+        let ctx = metadata(&state_fence)?;
+        let prepared = capture_with_subject("op-erased-1", "evidence-erased", &state_fence, &ctx)?;
+        store.apply_transaction(&ctx, prepared, &[], &[])?;
+        let query = evidence_pack_query(
+            &state_fence,
+            Some("scope-1"),
+            evidence_params("evidence-erased", "10"),
+        )?;
+        assert_eq!(
+            pack_records(&store.execute_named_sync(&query)?.payload)?.len(),
+            1
+        );
+
+        // Fail-closed: no recorded intent means zero destructive effects.
+        assert_eq!(
+            store.apply_erasure("erasure-missing"),
+            Err(StoreError::ReceiptNotFound)
+        );
+        assert_eq!(
+            pack_records(&store.execute_named_sync(&query)?.payload)?.len(),
+            1
+        );
+
+        let intent = StoreErasureIntent {
+            operation_id: "erasure-op-1".to_owned(),
+            subject: "evidence-erased".to_owned(),
+            scope_id: ScopeId::new("scope-1")?,
+            surfaces: vec![
+                StoreErasureSurface::CanonicalPayload,
+                StoreErasureSurface::Blob,
+            ],
+            state_fence: state_fence.clone(),
+        };
+        let pending = store.record_erasure_intent(intent.clone())?;
+        assert_eq!(
+            pending,
+            vec![
+                StoreSurfaceOutcome::NotAttempted {
+                    surface: StoreErasureSurface::CanonicalPayload,
+                },
+                StoreSurfaceOutcome::NotAttempted {
+                    surface: StoreErasureSurface::Blob,
+                },
+            ]
+        );
+        // Idempotent re-record of identical content; conflict on divergence.
+        assert_eq!(store.record_erasure_intent(intent.clone())?, pending);
+        let mut diverged = intent.clone();
+        diverged.subject = "evidence-other".to_owned();
+        assert_eq!(
+            store.record_erasure_intent(diverged),
+            Err(StoreError::IdentityConflict)
+        );
+
+        let outcomes = store.apply_erasure("erasure-op-1")?;
+        assert_eq!(
+            outcomes,
+            vec![
+                StoreSurfaceOutcome::Purged {
+                    surface: StoreErasureSurface::CanonicalPayload,
+                },
+                StoreSurfaceOutcome::Incomplete {
+                    surface: StoreErasureSurface::Blob,
+                },
+            ]
+        );
+        // An erased observation disappears from GetEvidencePack.
+        let response = store.execute_named_sync(&query)?;
+        let records = pack_records(&response.payload)?;
+        assert!(records.is_empty());
+        assert_eq!(response.payload["provenance"]["matched_total"], json!(0));
+        // Same-operation replay returns the original outcomes, no duplicate
+        // destructive work, and the pack stays suppressed.
+        assert_eq!(store.apply_erasure("erasure-op-1")?, outcomes);
+        let replayed = store.execute_named_sync(&query)?;
+        assert!(pack_records(&replayed.payload)?.is_empty());
+        // Suppression is scoped exactly: a neighbouring subject still reads.
+        let neighbour =
+            capture_with_subject("op-neighbour-1", "evidence-neighbour", &state_fence, &ctx)?;
+        store.apply_transaction(&ctx, neighbour, &[], &[])?;
+        let neighbour_query = evidence_pack_query(
+            &state_fence,
+            Some("scope-1"),
+            evidence_params("evidence-neighbour", "10"),
+        )?;
+        assert_eq!(
+            pack_records(&store.execute_named_sync(&neighbour_query)?.payload)?.len(),
+            1
+        );
+        Ok(())
+    }
+
+    fn erasure_set_digest() -> Result<OperationManifestDigest, StoreError> {
+        Ok(eliot_store_api::operation_manifest_set_digest(
+            &generated_operation_manifests()?,
+        )?)
+    }
+
+    fn named_erasure_transition(
+        operation: &str,
+        idempotency_key: &str,
+        state_fence: &StateFence,
+        ctx: &RequestMeta,
+        subject: &str,
+        approvals: Vec<String>,
+    ) -> Result<PreparedTransition, StoreError> {
+        let request = eliot_store_api::ErasureAdmissionRequest {
+            identity: eliot_store_api::OperationIdentity {
+                operation_id: OperationId::new(operation).map_err(StoreError::Foundation)?,
+                idempotency_key: idempotency_key.to_owned(),
+                canonical_request_hash: "c".repeat(64),
+            },
+            scope_id: ScopeId::new("scope-1")?,
+            ordering_scope: OrderingScopeId::new("scope-1")?,
+            state_fence: state_fence.clone(),
+            subject: subject.to_owned(),
+            surfaces: vec!["CanonicalPayload".to_owned()],
+            reason: "user requested deletion".to_owned(),
+            requester: "user:test".to_owned(),
+            approval_refs: approvals,
+            admission_contract_set_digest: "b".repeat(64),
+            operation_manifest_digest: erasure_set_digest()?,
+            security: eliot_store_api::SecurityContext::default(),
+            event_projection_relation_intents: EventProjectionRelationIntents {
+                event_ids: vec![],
+                projection_kinds: vec![],
+                relation_kinds: vec![],
+            },
+        };
+        let mut prepared = eliot_store_api::admit_erasure_transition(&request)?;
+        let view = CanonicalRequestView::from_apply(ctx, &prepared, &[], &[]);
+        prepared.identity.canonical_request_hash = canonical_request_hash(&view)?;
+        Ok(prepared)
+    }
+
+    fn rebind_erasure_hash(
+        ctx: &RequestMeta,
+        transition: &mut PreparedTransition,
+    ) -> Result<(), StoreError> {
+        let view = CanonicalRequestView::from_apply(ctx, transition, &[], &[]);
+        transition.identity.canonical_request_hash = canonical_request_hash(&view)?;
+        Ok(())
+    }
+
+    #[test]
+    fn named_erasure_stages_receipts_and_replays_without_duplicates() -> Result<(), StoreError> {
+        let state_fence = fence();
+        let ctx = metadata(&state_fence)?;
+        let store = store()?;
+        // Seed one governed observation under the exact admitted pair.
+        store.apply_transaction(
+            &ctx,
+            capture_with_subject("op-seed-1", "doomed-subject", &state_fence, &ctx)?,
+            &[],
+            &[],
+        )?;
+        let query = evidence_pack_query(
+            &state_fence,
+            Some("scope-1"),
+            evidence_params("doomed-subject", "10"),
+        )?;
+        assert_eq!(
+            pack_records(&store.execute_named_sync(&query)?.payload)?.len(),
+            1
+        );
+
+        // Specified request + valid authority stages under one identity and
+        // executes through the named operation into one receipt.
+        let staged = named_erasure_transition(
+            "op-erase-1",
+            "idem-erase-1",
+            &state_fence,
+            &ctx,
+            "doomed-subject",
+            vec!["approval-user-1".to_owned()],
+        )?;
+        let receipt = store.apply_transaction(&ctx, staged.clone(), &[], &[])?;
+        assert_eq!(receipt.transition_class, TransitionClass::Erasure);
+        assert_eq!(receipt.status, WriteReceiptStatus::Committed);
+        // The recorded plan executed: the observation is gone and suppressed.
+        assert!(pack_records(&store.execute_named_sync(&query)?.payload)?.is_empty());
+        assert!(
+            store
+                .erased_subjects()?
+                .iter()
+                .any(|erased| erased.subject == "doomed-subject")
+        );
+
+        // Same key + same hash resolves to the original receipt: no duplicate
+        // destructive work and no second receipt.
+        let replayed = store.apply_transaction(&ctx, staged, &[], &[])?;
+        assert_eq!(replayed, receipt);
+
+        // Same key + different hash is an identity conflict with no effect.
+        let conflicted = named_erasure_transition(
+            "op-erase-2",
+            "idem-erase-1",
+            &state_fence,
+            &ctx,
+            "other-subject",
+            vec!["approval-user-1".to_owned()],
+        )?;
+        assert_eq!(
+            store.apply_transaction(&ctx, conflicted, &[], &[]),
+            Err(StoreError::IdentityConflict)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn named_erasure_rejects_unapproved_and_out_of_manifest() -> Result<(), StoreError> {
+        let state_fence = fence();
+        let ctx = metadata(&state_fence)?;
+        let store = store()?;
+
+        // No explicit approval: rejected pre-execution with no receipt and no
+        // recorded intent.
+        let mut unapproved = named_erasure_transition(
+            "op-erase-na",
+            "idem-erase-na",
+            &state_fence,
+            &ctx,
+            "doomed-subject",
+            vec!["approval-user-1".to_owned()],
+        )?;
+        unapproved.required_proof_and_approval_refs.clear();
+        rebind_erasure_hash(&ctx, &mut unapproved)?;
+        assert!(matches!(
+            store.apply_transaction(&ctx, unapproved, &[], &[]),
+            Err(StoreError::InvalidField {
+                field: "proof_or_approval_ref",
+                ..
+            })
+        ));
+        assert!(
+            store
+                .receipt_sync(
+                    &OperationId::new("op-erase-na").map_err(StoreError::Foundation)?
+                )?
+                .is_none()
+        );
+        assert_eq!(store.erasure_outcomes("op-erase-na")?, None);
+
+        // Out-of-manifest digest: rejected pre-execution with no receipt.
+        let mut stale = named_erasure_transition(
+            "op-erase-stale",
+            "idem-erase-stale",
+            &state_fence,
+            &ctx,
+            "doomed-subject",
+            vec!["approval-user-1".to_owned()],
+        )?;
+        stale.operation_manifest_digest =
+            OperationManifestDigest::new("0".repeat(64))?;
+        rebind_erasure_hash(&ctx, &mut stale)?;
+        assert_eq!(
+            store.apply_transaction(&ctx, stale, &[], &[]),
+            Err(StoreError::ManifestMismatch)
+        );
+
+        // Unknown surface: the closed shape passes the catalogue gate, then
+        // dispatch refuses with no receipt and no recorded intent.
+        let mut unknown = named_erasure_transition(
+            "op-erase-unknown",
+            "idem-erase-unknown",
+            &state_fence,
+            &ctx,
+            "doomed-subject",
+            vec!["approval-user-1".to_owned()],
+        )?;
+        unknown.named_operations[0]
+            .parameters
+            .insert("surfaces".to_owned(), json!("Nope"));
+        rebind_erasure_hash(&ctx, &mut unknown)?;
+        assert!(matches!(
+            store.apply_transaction(&ctx, unknown, &[], &[]),
+            Err(StoreError::InvalidField {
+                field: "erasure.surfaces",
+                ..
+            })
+        ));
+        assert_eq!(store.erasure_outcomes("op-erase-unknown")?, None);
+        Ok(())
+    }
+
+    /// `ERASURE_STATE_IRREVERSIBLE` restore direction on the reference
+    /// executor (issue #1712): a genuinely committed erasure receipt refuses
+    /// state rehydration, while same-identity replay still returns the
+    /// identical receipt (replay of the deletion proof stays legitimate) and
+    /// a non-erasure receipt stays rehydratable.
+    #[test]
+    fn erasure_receipt_refuses_restore_rehydration_and_replays_identically(
+    ) -> Result<(), StoreError> {
+        use eliot_store_api::ERASURE_STATE_IRREVERSIBLE_CONSTRAINT;
+
+        assert_eq!(
+            ERASURE_STATE_IRREVERSIBLE_CONSTRAINT,
+            "ERASURE_STATE_IRREVERSIBLE"
+        );
+        let state_fence = fence();
+        let ctx = metadata(&state_fence)?;
+        let store = store()?;
+        let staged = named_erasure_transition(
+            "op-erase-guard",
+            "idem-erase-guard",
+            &state_fence,
+            &ctx,
+            "guarded-subject",
+            vec!["approval-user-1".to_owned()],
+        )?;
+        let receipt = store.apply_transaction(&ctx, staged.clone(), &[], &[])?;
+        assert_eq!(receipt.transition_class, TransitionClass::Erasure);
+        assert_eq!(
+            receipt.refuse_rehydration_from_erasure(),
+            Err(StoreError::InvalidReceipt),
+            "a committed erasure receipt must never authorize state rehydration"
+        );
+        // Replay is not rehydration: the same identity resolves to the
+        // identical deletion proof without duplicate destructive work.
+        assert_eq!(
+            store.apply_transaction(&ctx, staged, &[], &[])?,
+            receipt
+        );
+
+        // A non-erasure receipt from the same executor stays rehydratable.
+        let capture = capture_with_subject("op-guard-seed", "kept-subject", &state_fence, &ctx)?;
+        let kept = store.apply_transaction(&ctx, capture, &[], &[])?;
+        assert!(
+            kept.refuse_rehydration_from_erasure().is_ok(),
+            "non-erasure receipt stays rehydratable"
+        );
+        Ok(())
+    }
+
+    fn manifest_for(
+        classes: Vec<TransitionClass>,
+        effect: EffectClass,
+    ) -> Result<NamedOperationManifest, StoreError> {
+        NamedOperationManifest::new(
+            format!("memory-cognitive-{}-{:?}", classes.len(), classes[0]),
+            eliot_store_api::CONTRACT_VERSION,
+            classes,
+            effect,
+            65_536,
+            3_145_728,
+            1_000,
+        )
+    }
+
+    fn cognitive_store() -> Result<(MemoryStore, StateFence), StoreError> {
+        let fence = self::fence();
+        let store = MemoryStore::new();
+        store.register_manifest(manifest()?)?;
+        store.register_manifest(manifest_for(
+            vec![TransitionClass::TaskControl],
+            EffectClass::ReversibleMutation,
+        )?)?;
+        store.register_manifest(manifest_for(
+            vec![TransitionClass::RecoverySchema],
+            EffectClass::ReversibleMutation,
+        )?)?;
+        store.register_manifest(manifest_for(
+            vec![TransitionClass::LifecyclePolicy],
+            EffectClass::ReversibleMutation,
+        )?)?;
+        Ok((store, fence))
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "test helper mirrors the PreparedTransition fields one-to-one"
+    )]
+    fn cognitive_transition(
+        operation: &str,
+        state_fence: &StateFence,
+        ctx: &RequestMeta,
+        manifest_digest: OperationManifestDigest,
+        class: TransitionClass,
+        effect: EffectClass,
+        mutation: eliot_store_api::NamedMutationOperation,
+        parameters: BTreeMap<String, Value>,
+    ) -> Result<PreparedTransition, StoreError> {
+        let operation_id = OperationId::new(operation).map_err(StoreError::Foundation)?;
+        let mut prepared = PreparedTransition {
+            identity: eliot_store_api::OperationIdentity {
+                operation_id,
+                idempotency_key: format!("idem-{operation}"),
+                canonical_request_hash: "a".repeat(64),
+            },
+            state_fence: state_fence.clone(),
+            scope_id: ScopeId::new("scope-1")?,
+            task_id: None,
+            ordering_scopes: vec![OrderingScopeId::new("scope-1")?],
+            transition_class: class,
+            requested_effect_ceiling: effect,
+            admission_contract_set_digest: "a".repeat(64),
+            operation_manifest_digest: manifest_digest,
+            named_operations: vec![eliot_store_api::NamedMutationRequest {
+                operation: mutation,
+                parameters,
+            }],
+            event_projection_relation_intents: EventProjectionRelationIntents {
+                event_ids: vec![],
+                projection_kinds: vec![],
+                relation_kinds: vec![],
+            },
+            security: eliot_store_api::SecurityContext::default(),
+            required_proof_and_approval_refs: vec![],
+        };
+        let view = CanonicalRequestView::from_apply(ctx, &prepared, &[], &[]);
+        prepared.identity.canonical_request_hash = canonical_request_hash(&view)?;
+        Ok(prepared)
+    }
+
+    fn task_params(task_id: &str, to: &str) -> BTreeMap<String, Value> {
+        BTreeMap::from([
+            ("task_id".to_owned(), json!(task_id)),
+            ("event_id".to_owned(), json!(format!("event-{task_id}"))),
+            ("to".to_owned(), json!(to)),
+            ("expected_revision".to_owned(), json!("1")),
+            ("actor_ref".to_owned(), json!("actor-1")),
+        ])
+    }
+
+    fn recovery_params(problem_id: &str) -> BTreeMap<String, Value> {
+        BTreeMap::from([
+            ("problem_id".to_owned(), json!(problem_id)),
+            ("expected_problem_revision".to_owned(), json!("1")),
+            ("attempt_digest".to_owned(), json!("a".repeat(64))),
+            ("effect_digest".to_owned(), json!("b".repeat(64))),
+            (
+                "operation_manifest_digest".to_owned(),
+                json!("c".repeat(64)),
+            ),
+            ("artifact_binding_digest".to_owned(), json!("b".repeat(64))),
+            ("fence_digest".to_owned(), json!("d".repeat(64))),
+            ("observation_operation_id".to_owned(), json!("operation-1")),
+            ("observation_record_id".to_owned(), json!("record-1")),
+            (
+                "observation_request_digest".to_owned(),
+                json!("e".repeat(64)),
+            ),
+        ])
+    }
+
+    fn lifecycle_params(skill_id: &str) -> BTreeMap<String, Value> {
+        BTreeMap::from([
+            ("action".to_owned(), json!("keep")),
+            ("base_view_digest".to_owned(), json!("a".repeat(64))),
+            ("candidate_digest".to_owned(), json!("b".repeat(64))),
+            ("candidate_package_digest".to_owned(), json!("c".repeat(64))),
+            ("skill_id".to_owned(), json!(skill_id)),
+            ("verifier_ref".to_owned(), json!("verifier-1")),
+        ])
+    }
+
+    fn cognitive_query(
+        state_fence: &StateFence,
+        operation: NamedReadOperation,
+        scope: Option<&str>,
+        parameters: BTreeMap<String, Value>,
+    ) -> Result<NamedReadRequest, StoreError> {
+        Ok(NamedReadRequest {
+            operation,
+            scope_id: scope.map(ScopeId::new).transpose()?,
+            consistency: eliot_store_api::ReadConsistency::Eventual,
+            state_fence: state_fence.clone(),
+            parameters,
+        })
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "single canonical proof committing one record per cognitive family"
+    )]
+    fn t11_3_cognitive_reads_serve_canonical_records() -> Result<(), StoreError> {
+        use eliot_store_api::NamedMutationOperation;
+        let (store, state_fence) = cognitive_store()?;
+        let ctx = metadata(&state_fence)?;
+        let task_manifest = manifest_for(
+            vec![TransitionClass::TaskControl],
+            EffectClass::ReversibleMutation,
+        )?;
+        let recovery_manifest = manifest_for(
+            vec![TransitionClass::RecoverySchema],
+            EffectClass::ReversibleMutation,
+        )?;
+        let lifecycle_manifest = manifest_for(
+            vec![TransitionClass::LifecyclePolicy],
+            EffectClass::ReversibleMutation,
+        )?;
+        // Commit one real record per cognitive family through the canonical
+        // apply path (never test-injected receipts).
+        store.apply_transaction(
+            &ctx,
+            cognitive_transition(
+                "op-t11-task-1",
+                &state_fence,
+                &ctx,
+                task_manifest.digest.clone(),
+                TransitionClass::TaskControl,
+                EffectClass::ReversibleMutation,
+                NamedMutationOperation::UpdateTaskState,
+                task_params("task-1", "OPEN"),
+            )?,
+            &[],
+            &[],
+        )?;
+        store.apply_transaction(
+            &ctx,
+            cognitive_transition(
+                "op-t11-prob-1",
+                &state_fence,
+                &ctx,
+                recovery_manifest.digest.clone(),
+                TransitionClass::RecoverySchema,
+                EffectClass::ReversibleMutation,
+                NamedMutationOperation::ReconcileRecovery,
+                recovery_params("problem-1"),
+            )?,
+            &[],
+            &[],
+        )?;
+        store.apply_transaction(
+            &ctx,
+            cognitive_transition(
+                "op-t11-skill-1",
+                &state_fence,
+                &ctx,
+                lifecycle_manifest.digest.clone(),
+                TransitionClass::LifecyclePolicy,
+                EffectClass::ReversibleMutation,
+                NamedMutationOperation::ApplyLifecyclePolicy,
+                lifecycle_params("skill-1"),
+            )?,
+            &[],
+            &[],
+        )?;
+        // GetTaskState returns the exact history plus current.
+        let response = store.execute_named_sync(&cognitive_query(
+            &state_fence,
+            NamedReadOperation::GetTaskState,
+            Some("scope-1"),
+            BTreeMap::from([
+                ("task_id".to_owned(), json!("task-1")),
+                ("max_records".to_owned(), json!("10")),
+            ]),
+        )?)?;
+        assert_eq!(
+            response.payload["records"].as_array().map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            response.payload["current"]["to"],
+            json!("OPEN"),
+        );
+        // Unknown task is an exact empty, not an error.
+        let empty = store.execute_named_sync(&cognitive_query(
+            &state_fence,
+            NamedReadOperation::GetTaskState,
+            Some("scope-1"),
+            BTreeMap::from([
+                ("task_id".to_owned(), json!("task-missing")),
+                ("max_records".to_owned(), json!("10")),
+            ]),
+        )?)?;
+        assert!(empty.payload["records"].as_array().is_some_and(Vec::is_empty));
+        // GetAttentionAndProblems returns the admitted problem record.
+        let response = store.execute_named_sync(&cognitive_query(
+            &state_fence,
+            NamedReadOperation::GetAttentionAndProblems,
+            Some("scope-1"),
+            BTreeMap::from([("max_records".to_owned(), json!("10"))]),
+        )?)?;
+        assert_eq!(
+            response.payload["records"].as_array().map(Vec::len),
+            Some(1)
+        );
+        // GetUnderstandingProjectionInputs matches the exact selector across
+        // families (never substring).
+        let response = store.execute_named_sync(&cognitive_query(
+            &state_fence,
+            NamedReadOperation::GetUnderstandingProjectionInputs,
+            Some("scope-1"),
+            BTreeMap::from([
+                ("selector".to_owned(), json!("task-1")),
+                ("max_records".to_owned(), json!("10")),
+            ]),
+        )?)?;
+        assert_eq!(
+            response.payload["records"].as_array().map(Vec::len),
+            Some(1)
+        );
+        let response = store.execute_named_sync(&cognitive_query(
+            &state_fence,
+            NamedReadOperation::GetUnderstandingProjectionInputs,
+            Some("scope-1"),
+            BTreeMap::from([
+                ("selector".to_owned(), json!("task")),
+                ("max_records".to_owned(), json!("10")),
+            ]),
+        )?)?;
+        assert!(response.payload["records"]
+            .as_array()
+            .is_some_and(Vec::is_empty));
+        // GetCapabilityEvidenceState returns the exact skill record.
+        let response = store.execute_named_sync(&cognitive_query(
+            &state_fence,
+            NamedReadOperation::GetCapabilityEvidenceState,
+            Some("scope-1"),
+            BTreeMap::from([
+                ("skill_id".to_owned(), json!("skill-1")),
+                ("max_records".to_owned(), json!("10")),
+            ]),
+        )?)?;
+        assert_eq!(
+            response.payload["records"].as_array().map(Vec::len),
+            Some(1)
+        );
+        // Over-bound requests refuse instead of returning a view.
+        let over = store.execute_named_sync(&cognitive_query(
+            &state_fence,
+            NamedReadOperation::GetTaskState,
+            Some("scope-1"),
+            BTreeMap::from([
+                ("task_id".to_owned(), json!("task-1")),
+                (
+                    "max_records".to_owned(),
+                    json!((EVIDENCE_PACK_MAX_RECORDS + 1).to_string()),
+                ),
+            ]),
+        )?);
+        assert_eq!(over, Err(StoreError::PayloadTooLarge));
         Ok(())
     }
 }

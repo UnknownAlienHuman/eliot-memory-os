@@ -26,6 +26,7 @@ use eliot_agent_bridge_core::ProviderFailure;
 use eliot_agent_bridge_core::SessionId;
 use eliot_agent_bridge_core::TaskId;
 use eliot_agent_bridge_core::WorkUnitId;
+use eliot_protocol::AgentBridgeActivationDenialCode;
 use eliot_protocol::AgentBridgeActivationRequest;
 use eliot_protocol::AgentBridgeActivationResponse;
 use eliot_protocol::AgentBridgePeerAdmissionReceipt;
@@ -34,8 +35,33 @@ use eliot_protocol::FrameKind;
 use eliot_protocol::MessageType;
 use eliot_protocol::ProtocolPayload;
 
-use crate::AdmittedConnection;
-use crate::LoadedAgentBridgeDeclaration;
+use crate::KernelTransportOwner;
+use crate::SharedTransport;
+
+/// Surfaces one typed activation denial as its stable agent-visible reason
+/// string. The match is exhaustive with no wildcard arm, so a future denial
+/// code breaks compilation here instead of collapsing into another string.
+pub(super) fn denial_reason_code(reason_code: AgentBridgeActivationDenialCode) -> &'static str {
+    match reason_code {
+        AgentBridgeActivationDenialCode::SemanticResolutionUnavailable => {
+            eliot_protocol::AGENT_BRIDGE_SEMANTIC_RESOLUTION_UNAVAILABLE
+        }
+        AgentBridgeActivationDenialCode::TaskSelectionRequired => {
+            eliot_protocol::AGENT_BRIDGE_TASK_SELECTION_REQUIRED
+        }
+        AgentBridgeActivationDenialCode::ScopeSelectionRequired => {
+            eliot_protocol::AGENT_BRIDGE_SCOPE_SELECTION_REQUIRED
+        }
+        AgentBridgeActivationDenialCode::ScopeAmbiguous => {
+            eliot_protocol::AGENT_BRIDGE_SCOPE_AMBIGUOUS
+        }
+        AgentBridgeActivationDenialCode::NotReady => eliot_protocol::AGENT_BRIDGE_NOT_READY,
+        AgentBridgeActivationDenialCode::StaleFence => eliot_protocol::AGENT_BRIDGE_STALE_FENCE,
+        AgentBridgeActivationDenialCode::FailedInternal => {
+            eliot_protocol::AGENT_BRIDGE_FAILED_INTERNAL
+        }
+    }
+}
 
 fn provider_failure() -> ProviderFailure {
     ProviderFailure::new(
@@ -238,7 +264,10 @@ pub(super) fn decode_activation_response(
     if let eliot_protocol::AgentBridgeActivationDisposition::Authenticated { binding } =
         &response.disposition
         && (binding.activation_generation != admission.state_fence.resource_generation
-            || binding.state_fence.authority_epoch != admission.state_fence.authority_epoch
+            || !binding
+                .state_fence
+                .authority_epoch
+                .is_same_authority(&admission.state_fence.authority_epoch)
             || binding.state_fence.generation != admission.state_fence.resource_generation)
     {
         return Err(provider_failure());
@@ -246,16 +275,29 @@ pub(super) fn decode_activation_response(
     Ok(response)
 }
 
+/// Runner-side face of the single retained transport owner.
+///
+/// Holds no transport of its own: every activation call borrows the shared
+/// owner, so the one-shot guard, the runtime, and the admitted transport stay
+/// singular while the host-request face serves envelopes beside it.
 pub(super) struct KernelHostActivationPort {
-    pub(super) admitted: AdmittedConnection,
-    pub(super) runtime: tokio::runtime::Runtime,
-    pub(super) _loaded: LoadedAgentBridgeDeclaration,
-    pub(super) activation_used: bool,
-    pub(super) limits: eliot_ipc::TransportLimits,
+    pub(super) shared: SharedTransport,
 }
 
 impl HostActivationPort for KernelHostActivationPort {
     fn activate(
+        &mut self,
+        request: &AttachRequest,
+    ) -> Result<ActivationPortOutcome, ProviderFailure> {
+        self.shared
+            .try_borrow_mut()
+            .map_err(|_| provider_failure())?
+            .activate_inner(request)
+    }
+}
+
+impl KernelTransportOwner {
+    fn activate_inner(
         &mut self,
         request: &AttachRequest,
     ) -> Result<ActivationPortOutcome, ProviderFailure> {
@@ -286,15 +328,12 @@ impl HostActivationPort for KernelHostActivationPort {
             decode_activation_response(&wire, &activation_request, &self.admitted.receipt)?;
         match response.disposition {
             eliot_protocol::AgentBridgeActivationDisposition::Denied { reason_code } => {
-                let code: &'static str = match reason_code {
-                    eliot_protocol::AgentBridgeActivationDenialCode::SemanticResolutionUnavailable => {
-                        "SEMANTIC_RESOLUTION_UNAVAILABLE"
-                    }
-                };
+                let code: &'static str = denial_reason_code(reason_code);
                 Ok(ActivationPortOutcome::Denied { reason_code: code })
             }
             eliot_protocol::AgentBridgeActivationDisposition::Authenticated { binding } => {
                 let b = *binding;
+                self.activated_session = Some(b.session_id.clone());
                 let principal_id =
                     PrincipalId::new(b.principal_id).map_err(|_| provider_failure())?;
                 let session_id = SessionId::new(b.session_id).map_err(|_| provider_failure())?;
@@ -303,8 +342,9 @@ impl HostActivationPort for KernelHostActivationPort {
                     WorkUnitId::new(b.work_unit_id).map_err(|_| provider_failure())?;
                 let generation = Generation::new(b.activation_generation.value())
                     .map_err(|_| provider_failure())?;
+                // INTENDED EpochId shape (B→A→C): fence carries EpochId after B.
                 let fence = FencingToken::new(
-                    b.state_fence.authority_epoch.value(),
+                    b.state_fence.authority_epoch.clone(),
                     generation,
                     b.state_fence.nonce,
                 )

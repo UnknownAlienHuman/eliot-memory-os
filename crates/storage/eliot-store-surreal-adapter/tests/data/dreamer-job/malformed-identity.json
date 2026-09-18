@@ -1,0 +1,6 @@
+{
+  "operation_id": "operation-775-20-malformed",
+  "idempotency_key": "",
+  "canonical_request_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+  "operation_kind": "SUBMIT_JOB"
+}

@@ -4,6 +4,15 @@
 //! Implementation: I3.15 (redb registry store owner), I2.2 (explicit protected `ProgramData` path), I2.23 (CAS/revision transaction), I15.3/I15.8 (typed approval and fence validation).
 //!
 //! This is the sole redb owner for the installation registry. It owns durable bytes and atomic CAS only; it does not mint canonical memory, Kernel authority, or Governor semantics, does not synthesize defaults, does not infer migration, and does not retry unowned operations. All production mutations are narrow transaction-bound operations with expected revision and exact typed approval. Validated projections are operational only.
+//!
+//! Handle lifetime: the installer holds this writer `Database` only for the
+//! bounded stage/load projection and releases it before any SCM start or
+//! convergence wait, and the Host holds no writer across its process lifetime
+//! (one short-lived open-use-drop per CAS/readback via
+//! `open_existing_at` + bounded `AlreadyOpen` retry, #1339). A held writer
+//! blocks the Watchdog approval reader (`inspect_existing_at`, a short-lived
+//! `ReadOnlyDatabase`); terminal reconcile re-opens short-lived handles via
+//! `open_existing_at`.
 
 use std::path::{Path, PathBuf};
 
@@ -145,8 +154,13 @@ impl RedbInstallationRegistry {
                 "installation registry path is not the retained canonical Host child".to_owned(),
             ));
         }
-        let database = Database::create(file.path())
-            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        // A13.9 short-lived writer: bounded AlreadyOpen retry only
+        // (sole-owner contract above, lines 6-13). The installer drops this
+        // handle before any SCM start or convergence wait
+        // (bins/eliot/src/main.rs:2228), so contention with the Watchdog poll
+        // reader is transient; non-contention errors return immediately with
+        // their cause preserved.
+        let database = crate::redb_state::open_registry_writer_create_with_retry(file.path())?;
         file.verify_path_identity()
             .map_err(|error| InstallationError::Platform(error.to_string()))?;
         Ok(Self {
@@ -191,8 +205,11 @@ impl RedbInstallationRegistry {
         }
         file.verify_path_identity()
             .map_err(|error| InstallationError::Platform(error.to_string()))?;
-        let database = Database::open(file.path())
-            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        // A13.9 short-lived terminal-reconcile writer
+        // (bins/eliot/src/main.rs:2416): bounded AlreadyOpen retry only
+        // against live Watchdog poll readers; nothing is held across a wait,
+        // and non-contention errors return immediately with cause preserved.
+        let database = crate::redb_state::open_registry_writer_with_retry(file.path())?;
         file.verify_path_identity()
             .map_err(|error| InstallationError::Platform(error.to_string()))?;
         Ok(Some(Self {

@@ -61,6 +61,137 @@ def production_prefix(text: str) -> str:
     return text if position < 0 else text[:position]
 
 
+def strip_cfg_test_gated(text: str) -> str:
+    """Remove only #[cfg(test)]-gated items, preserving later production code.
+
+    #342: bins/eliot-agent-bridge/src/main.rs:12-13 is a test-only import
+    before the production enum Request (:39-69) and production
+    HostRequestGateway uses (:14-17, :188, :410, :421). Cutting at the first
+    marker hides production and is stale. Like BRIDGE_LIB_PATH owner-block
+    inspection below, strip only gated items instead of truncating.
+    See also PR #1273 (real port cutover since 666526cf), PR #1248, and
+    workstreams/surfaces/assignments/077-agent-bridge-kernel-port.toml:24,51.
+    """
+    marker = "#[cfg(test)]"
+    output_parts: list[str] = []
+    cursor = 0
+    while True:
+        marker_start = text.find(marker, cursor)
+        if marker_start < 0:
+            output_parts.append(text[cursor:])
+            break
+        output_parts.append(text[cursor:marker_start])
+        scan = marker_start + len(marker)
+        while scan < len(text) and text[scan] in " \t\r\n":
+            scan += 1
+        while text.startswith("#[", scan):
+            close = text.find("]", scan + 2)
+            if close < 0:
+                break
+            scan = close + 1
+            while scan < len(text) and text[scan] in " \t\r\n":
+                scan += 1
+        semi = text.find(";", scan)
+        brace = text.find("{", scan)
+        if brace < 0 or (semi >= 0 and semi < brace):
+            if semi < 0:
+                cursor = len(text)
+            else:
+                cursor = semi + 1
+        else:
+            depth = 0
+            in_string = False
+            string_quote = ""
+            escaped = False
+            line_comment = False
+            block_comment_depth = 0
+            index = brace
+            end = -1
+            while index < len(text):
+                char = text[index]
+                nxt = text[index + 1] if index + 1 < len(text) else ""
+                if line_comment:
+                    if char == "\n":
+                        line_comment = False
+                    index += 1
+                    continue
+                if block_comment_depth:
+                    if char == "/" and nxt == "*":
+                        block_comment_depth += 1
+                        index += 2
+                        continue
+                    if char == "*" and nxt == "/":
+                        block_comment_depth -= 1
+                        index += 2
+                        continue
+                    index += 1
+                    continue
+                if in_string:
+                    if escaped:
+                        escaped = False
+                    elif char == "\\":
+                        escaped = True
+                    elif char == string_quote:
+                        in_string = False
+                    index += 1
+                    continue
+                if char == "/" and nxt == "/":
+                    line_comment = True
+                    index += 2
+                    continue
+                if char == "/" and nxt == "*":
+                    block_comment_depth = 1
+                    index += 2
+                    continue
+                if char in ('"', "'"):
+                    in_string = True
+                    string_quote = char
+                    index += 1
+                    continue
+                if char == "{":
+                    depth += 1
+                elif char == "}":
+                    depth -= 1
+                    if depth == 0:
+                        end = index + 1
+                        break
+                index += 1
+            if end < 0:
+                cursor = len(text)
+            else:
+                cursor = end
+    return "".join(output_parts)
+
+
+def is_directly_cfg_test_gated(text: str, marker: str) -> bool:
+    """Check whether marker is directly gated by #[cfg(test)].
+
+    Looks only at attribute lines immediately preceding the marker, stopping
+    at the first non-attribute code line. Prevents a previous item's gate
+    (e.g. the struct's gate) from masking an ungated impl.
+    Cited for #342 test-only Unavailable port (main.rs:117,121).
+    """
+    pos = text.find(marker)
+    if pos < 0:
+        return False
+    window_start = max(0, pos - 800)
+    snippet = text[window_start:pos]
+    lines = snippet.splitlines()
+    for line in reversed(lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("#["):
+            if "cfg(test)" in stripped.replace(" ", ""):
+                return True
+            continue
+        if stripped.startswith("///") or stripped.startswith("//"):
+            continue
+        # First non-attribute code line stops the attached-attribute scan.
+        return False
+    return False
+
+
 def extract_braced_block(text: str, marker: str) -> str | None:
     start = text.find(marker)
     if start < 0:
@@ -159,27 +290,41 @@ def verify(root: Path) -> list[Finding]:
     ):
         return sorted(findings, key=lambda item: (item.path, item.code, item.detail))
 
-    main_prod = production_prefix(main_text)
+    # #342 MAIN prefix fix: main.rs:12-13 is a test-only import before the
+    # production enum Request (:39-69) and production HostRequestGateway uses
+    # (:14-17, :188, :410, :421). Truncating at the first #[cfg(test)] hides
+    # production. Strip only gated items instead, mirroring the BRIDGE_LIB_PATH
+    # owner-block approach below. See also PR #1273, PR #1248, and
+    # workstreams/surfaces/assignments/077-agent-bridge-kernel-port.toml:24,51.
+    main_prod = strip_cfg_test_gated(main_text)
     request_block = extract_braced_block(main_prod, "enum Request")
     if request_block is None:
         findings.append(Finding("public_request_enum_missing", MAIN_PATH, "enum Request cannot be resolved"))
     else:
-        require_contains(
-            findings,
-            MAIN_PATH,
-            request_block,
-            "Invoke { request: HostInvocationRequest }",
-            "typed_invoke_missing",
-            "public stdin protocol must expose typed Invoke",
-        )
-        require_contains(
-            findings,
-            MAIN_PATH,
-            request_block,
-            "Cancel { request: HostCancellationRequest }",
-            "typed_cancel_missing",
-            "public stdin protocol must expose typed Cancel",
-        )
+        # #342: production enum Request (:39-69) spells Invoke/Cancel across
+        # multiple lines (e.g. `Invoke {\n request: HostInvocationRequest,\n }`).
+        # Match whitespace-tolerantly without weakening the typed shape.
+        # See also PR #1273, PR #1248.
+        if not re.search(
+            r"Invoke\s*\{\s*request\s*:\s*HostInvocationRequest\s*,?\s*\}", request_block
+        ):
+            findings.append(
+                Finding(
+                    "typed_invoke_missing",
+                    MAIN_PATH,
+                    "public stdin protocol must expose typed Invoke",
+                )
+            )
+        if not re.search(
+            r"Cancel\s*\{\s*request\s*:\s*HostCancellationRequest\s*,?\s*\}", request_block
+        ):
+            findings.append(
+                Finding(
+                    "typed_cancel_missing",
+                    MAIN_PATH,
+                    "public stdin protocol must expose typed Cancel",
+                )
+            )
         if "ForwardFrame" in request_block or "forward_frame" in request_block:
             findings.append(
                 Finding(
@@ -263,26 +408,85 @@ def verify(root: Path) -> list[Finding]:
         "host_gateway_missing",
         "typed ingress must use HostRequestGateway",
     )
+    # #342 / #1273 real-port cutover: production composes the real
+    # KernelHostRequestClient via kernel_ports_with_declaration
+    # (main.rs:168-175 -> bins/eliot-agent-bridge/src/lib.rs:176-275 ->
+    # kernel_host_request_client.rs:593 impl KernelHostRequestPort for
+    # KernelHostRequestClient, merged #1273, cutover 666526cf).
+    # Production already composes real KernelHostRequestClient since 666526cf
+    # (PR #1273 MERGED body). See also PR #1248 and
+    # workstreams/surfaces/assignments/077-agent-bridge-kernel-port.toml:24,51.
     require_contains(
         findings,
         MAIN_PATH,
         main_prod,
-        "impl KernelHostRequestPort for UnavailableKernelHostRequestPort",
-        "unavailable_kernel_port_missing",
-        "temporary Kernel gap must be represented by a typed port",
+        "kernel_ports_with_declaration",
+        "production_kernel_port_missing",
+        "production must compose the real Kernel port via kernel_ports_with_declaration",
     )
-    unavailable_block = extract_braced_block(
-        main_prod, "impl KernelHostRequestPort for UnavailableKernelHostRequestPort"
+    require_contains(
+        findings,
+        BRIDGE_LIB_PATH,
+        bridge_lib_text,
+        "kernel_ports_with_declaration",
+        "production_kernel_port_missing",
+        "bridge library must expose kernel_ports_with_declaration composing the real port",
     )
-    if unavailable_block is None:
+    require_contains(
+        findings,
+        BRIDGE_LIB_PATH,
+        bridge_lib_text,
+        "KernelHostRequestClient",
+        "real_kernel_port_missing",
+        "bridge library must compose the real KernelHostRequestClient (cutover 666526cf)",
+    )
+    # UnavailableKernelHostRequestPort is a #[cfg(test)]-only fixture
+    # (main.rs:117,121, returns Err PortFailure::PlanGap, never fabricates
+    # success). Expect it gated, absent from stripped production, with typed
+    # PlanGap and no fabricated success. See #342, PR #1273, PR #1248, and
+    # workstreams/surfaces/assignments/077-agent-bridge-kernel-port.toml:24,51.
+    if "impl KernelHostRequestPort for UnavailableKernelHostRequestPort" not in main_text:
         findings.append(
             Finding(
-                "unavailable_kernel_port_unresolved",
+                "unavailable_kernel_port_missing",
                 MAIN_PATH,
-                "typed unavailable Kernel port implementation cannot be resolved",
+                "test-only Kernel gap fixture must remain as #[cfg(test)]-gated typed port",
             )
         )
+        unavailable_block = None
     else:
+        if not is_directly_cfg_test_gated(
+            main_text, "impl KernelHostRequestPort for UnavailableKernelHostRequestPort"
+        ):
+            findings.append(
+                Finding(
+                    "unavailable_kernel_port_not_test_only",
+                    MAIN_PATH,
+                    "UnavailableKernelHostRequestPort impl must remain #[cfg(test)]-only "
+                    "(production uses KernelHostRequestClient)",
+                )
+            )
+        if "UnavailableKernelHostRequestPort" in main_prod:
+            findings.append(
+                Finding(
+                    "unavailable_kernel_port_in_production",
+                    MAIN_PATH,
+                    "UnavailableKernelHostRequestPort must not appear in production "
+                    "(strip test gates); production uses kernel_ports_with_declaration",
+                )
+            )
+        unavailable_block = extract_braced_block(
+            main_text, "impl KernelHostRequestPort for UnavailableKernelHostRequestPort"
+        )
+        if unavailable_block is None:
+            findings.append(
+                Finding(
+                    "unavailable_kernel_port_unresolved",
+                    MAIN_PATH,
+                    "typed unavailable Kernel port implementation cannot be resolved",
+                )
+            )
+    if unavailable_block is not None:
         if "PortFailure::PlanGap" not in unavailable_block:
             findings.append(
                 Finding(
@@ -386,17 +590,31 @@ def verify(root: Path) -> list[Finding]:
                 )
             )
 
-    invoke_gateway = extract_braced_block(
+    # #342 / PR #1248 GATEWAY delegate fix: host_gateway.rs:305-312 is a thin
+    # `pub fn invoke` delegate forwarding to invoke_with_receipt (:310-311).
+    # Real logic lives in invoke_with_receipt :320-350: request.validate()?;
+    # (:325) before port.invoke (:328), correlation_id capture (:326) before
+    # dispatch, HostInvocationResult {correlation_id, outcome} (:344-347).
+    # Resolve the invoke surface as combined delegate+impl (mirroring the
+    # inlined fixture shape). See also PR #1273 and
+    # workstreams/surfaces/assignments/077-agent-bridge-kernel-port.toml:24,51.
+    # Cancel path already passes; its checks below are unchanged.
+    invoke_delegate_block = extract_braced_block(
         gateway_text, "pub fn invoke<P: KernelHostRequestPort + ?Sized>"
+    )
+    invoke_impl_block = extract_braced_block(
+        gateway_text, "pub fn invoke_with_receipt<P: KernelHostRequestPort + ?Sized>"
     )
     cancel_gateway = extract_braced_block(
         gateway_text, "pub fn cancel<P: KernelHostRequestPort + ?Sized>"
     )
-    if invoke_gateway is None:
+    if invoke_delegate_block is None:
         findings.append(
             Finding("gateway_invoke_missing", GATEWAY_PATH, "gateway invoke function is absent")
         )
+        invoke_gateway = None
     else:
+        invoke_gateway = invoke_delegate_block + "\n" + (invoke_impl_block or "")
         validate_index = invoke_gateway.find("request.validate()?;")
         port_index = invoke_gateway.find("port.invoke(request)")
         correlation_index = invoke_gateway.find("request.correlation_id.clone()")
@@ -476,10 +694,18 @@ def print_findings(findings: list[Finding]) -> None:
 
 
 def fixture_main() -> str:
+    # Fixture mirrors production shape for #342: a #[cfg(test)]-only import
+    # precedes production (main.rs:12-13 before enum Request :39-69), the
+    # Unavailable port is #[cfg(test)]-only, and production composes the real
+    # port via kernel_ports_with_declaration. See PR #1273, PR #1248, and
+    # workstreams/surfaces/assignments/077-agent-bridge-kernel-port.toml:24,51.
     return '''#![forbid(unsafe_code)]
+#[cfg(test)]
+use eliot_mcp::{HostCancellationPortOutcome, HostInvocationPortOutcome, PortFailure};
 use eliot_mcp::{HostCancellationRequest, HostInvocationRequest, HostRequestGateway,
     KernelHostRequestPort, PortFailure, HostInvocationPortOutcome,
     HostCancellationPortOutcome};
+use eliot_agent_bridge::{kernel_ports_with_declaration, BridgeRunner};
 use eliot_protocol::EventEnvelope;
 #[derive(Debug)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
@@ -488,7 +714,9 @@ enum Request {
     Cancel { request: HostCancellationRequest },
     ForwardEvent { event: EventEnvelope },
 }
+#[cfg(test)]
 struct UnavailableKernelHostRequestPort;
+#[cfg(test)]
 impl KernelHostRequestPort for UnavailableKernelHostRequestPort {
     fn invoke(&mut self, _request: &HostInvocationRequest)
         -> Result<HostInvocationPortOutcome, PortFailure> {
@@ -499,7 +727,7 @@ impl KernelHostRequestPort for UnavailableKernelHostRequestPort {
         Err(PortFailure::PlanGap { missing_capability: "cancel".into(), reason: "missing".into() })
     }
 }
-fn main() { let _gateway = HostRequestGateway; }
+fn main() { let _gateway = HostRequestGateway; let _ = kernel_ports_with_declaration; }
 #[cfg(test)]
 mod tests {}
 '''
@@ -518,7 +746,13 @@ impl AgentBridgeCore {
 
 
 def fixture_bridge_lib() -> str:
+    # Fixture mirrors production composition for #342/#1273: the real
+    # KernelHostRequestClient composed via kernel_ports_with_declaration
+    # (cutover 666526cf). See PR #1248 and
+    # workstreams/surfaces/assignments/077-agent-bridge-kernel-port.toml:24,51.
     return '''
+use kernel_host_request_client::KernelHostRequestClient;
+pub fn kernel_ports_with_declaration() { let _ = KernelHostRequestClient; }
 struct KernelMcpForwardingPort;
 impl McpForwardingPort for KernelMcpForwardingPort {
     fn forward_hook(&mut self) {}
@@ -557,15 +791,26 @@ pub struct HostCancellationRequest {
 
 
 def fixture_gateway() -> str:
+    # Fixture mirrors production delegate+impl shape for #342/PR #1248:
+    # host_gateway.rs:305-312 thin `invoke` delegate forwarding to
+    # invoke_with_receipt :320-350 which holds validate/port/correlation.
+    # See also PR #1273 and
+    # workstreams/surfaces/assignments/077-agent-bridge-kernel-port.toml:24,51.
     return '''
 impl HostRequestGateway {
     pub fn invoke<P: KernelHostRequestPort + ?Sized>(
         &self, port: &mut P, request: &HostInvocationRequest,
     ) -> Result<HostInvocationResult, HostGatewayError> {
+        self.invoke_with_receipt(port, request)
+            .map(|paired| paired.0)
+    }
+    pub fn invoke_with_receipt<P: KernelHostRequestPort + ?Sized>(
+        &self, port: &mut P, request: &HostInvocationRequest,
+    ) -> Result<(HostInvocationResult, HostCorrelationReceipt), HostGatewayError> {
         request.validate()?;
         let correlation_id = request.correlation_id.clone();
         let outcome = match port.invoke(request) { _ => todo!() };
-        Ok(HostInvocationResult { correlation_id, outcome })
+        Ok((HostInvocationResult { correlation_id, outcome }, todo!()))
     }
     pub fn cancel<P: KernelHostRequestPort + ?Sized>(
         &self, port: &mut P, request: &HostCancellationRequest,

@@ -2,3 +2,4 @@
 
 from .contracts import *  # noqa: F401,F403
 from .contracts import __all__
+from . import cohort

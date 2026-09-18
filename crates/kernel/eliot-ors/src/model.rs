@@ -1,6 +1,8 @@
-use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence, canonical_json_bytes};
+use eliot_contracts::{
+    AuthorityEpoch, EpochId, ResourceGeneration, StateFence, canonical_json_bytes,
+};
 use eliot_platform::{PlatformHandle, SecretReference};
-use eliot_receipts::ReceiptEnvelope;
+use eliot_receipts::{ReceiptDisposition, ReceiptEnvelope};
 use eliot_runtime_contracts::{
     GenerationCutoverRecord as RuntimeGenerationCutoverRecord, LeaseState, SignedSupervisionLease,
     SupervisionGenerationBinding, SupervisionLease, SupervisionLeaseActiveStateBinding,
@@ -16,7 +18,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::reservation_model::ReservationRecord;
-use crate::{CONTRACT_VERSION, MAX_RECOVERY_PAGE};
+use crate::{CONTRACT_VERSION, MAX_INLINE_RECOVERY_BYTES, MAX_RECOVERY_PAGE};
+use std::collections::BTreeMap;
 
 /// A validated opaque label that carries no semantic authority.
 #[derive(Clone, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
@@ -161,7 +164,7 @@ pub struct SupervisionLeaseBinding {
     pub host_epoch: AuthorityEpoch,
     pub activation_id: OpaqueLabel,
     pub activation_generation: ResourceGeneration,
-    pub kernel_epoch: AuthorityEpoch,
+    pub kernel_epoch: EpochId,
     pub watchdog_epoch: AuthorityEpoch,
     pub generation_binding: SupervisionGenerationBinding,
     pub state_fence: StateFence,
@@ -210,7 +213,7 @@ impl SupervisionLeaseBinding {
             host_epoch: self.host_epoch,
             activation_id: self.activation_id.as_str().to_owned(),
             activation_generation: self.activation_generation,
-            kernel_epoch: self.kernel_epoch,
+            kernel_epoch: self.kernel_epoch.clone(),
             watchdog_epoch: self.watchdog_epoch,
             generation_binding: self.generation_binding.clone(),
             state_fence: self.state_fence.clone(),
@@ -846,7 +849,7 @@ impl SupervisionLeaseSnapshot {
             host_epoch: binding.host_epoch,
             activation_id: binding.activation_id.as_str().to_owned(),
             activation_generation: binding.activation_generation,
-            kernel_epoch: binding.kernel_epoch,
+            kernel_epoch: binding.kernel_epoch.clone(),
             watchdog_epoch: binding.watchdog_epoch,
             state_fence: binding.state_fence.clone(),
             scope_ref: binding.scope_ref.as_str().to_owned(),
@@ -911,7 +914,7 @@ impl ProcessStartReplayRecord {
         eliot_process::ProcessOwnerBinding::new(
             self.owner.module_id(),
             self.owner.principal_digest(),
-            self.owner.authority_epoch(),
+            self.owner.authority_epoch().clone(),
             self.owner.generation(),
         )
         .map_err(|error| OrsError::IntegrityProblem {
@@ -1074,6 +1077,13 @@ pub enum AuthorityHandoffBegin {
 }
 
 /// Observation-only process evidence retained by ORS.
+///
+/// The authority epoch is the lineage-aware [`EpochId`] exact tuple
+/// (Implements #64, donor precedent `origin/work/100-process-epoch-v4-F`).
+/// It is bound from the owner's canonical epoch at admission; scalar-only
+/// owners without canonical lineage evidence cannot produce active authority
+/// and fail closed. Adjacent `AuthorityHandoffRecord` u64 contours are
+/// intentionally not widened here (flagged residual).
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessEvidenceRecord {
@@ -1085,7 +1095,7 @@ pub struct ProcessEvidenceRecord {
     pub image_id: OpaqueLabel,
     pub session_id: OpaqueLabel,
     pub owner: eliot_process::ProcessOwnerBinding,
-    pub authority_epoch: u64,
+    pub authority_epoch: EpochId,
     pub generation: u64,
     pub state_fence_digest: String,
     pub binding_digest: String,
@@ -1118,6 +1128,10 @@ impl ProcessEvidenceRecord {
             .map_err(|error| OrsError::Encoding(error.to_string()))?;
         let evidence_bytes =
             serde_json::to_vec(&evidence).map_err(|error| OrsError::Encoding(error.to_string()))?;
+        // Lineage-aware binding (Implements #64): the active epoch comes only
+        // from the owner's canonical `EpochId` via `authority_epoch`.
+        // No scalar-to-authority coercion exists.
+        let authority_epoch = owner.authority_epoch().clone();
         let record = Self {
             contract_version: CONTRACT_VERSION,
             operation_id: OperationIdentity::new(binding.operation_id().as_str())?,
@@ -1126,7 +1140,7 @@ impl ProcessEvidenceRecord {
             job_id: OpaqueLabel::new(binding.job_id().as_str())?,
             image_id: OpaqueLabel::new(binding.image_id().as_str())?,
             session_id: OpaqueLabel::new(binding.session_id().as_str())?,
-            authority_epoch: owner.authority_epoch(),
+            authority_epoch,
             generation: owner.generation().get(),
             owner,
             state_fence_digest: sha256_hex(&state_fence_bytes),
@@ -1184,7 +1198,9 @@ impl ProcessEvidenceRecord {
         )?;
         validate_digest(&self.binding_digest, "process_evidence_binding_digest")?;
         validate_digest(&self.evidence_digest, "process_evidence_digest")?;
-        if self.authority_epoch == 0 || self.generation == 0 || self.observed_at_ms <= 0 {
+        // `EpochId` is always a validated non-zero tuple; only generation and
+        // observation time retain scalar positivity checks.
+        if self.generation == 0 || self.observed_at_ms <= 0 {
             return Err(OrsError::InvalidField {
                 field: "process_evidence_identity",
                 reason: "epoch, generation, and observation time must be positive",
@@ -1211,15 +1227,20 @@ impl ProcessEvidenceRecord {
         let owner = eliot_process::ProcessOwnerBinding::new(
             self.owner.module_id(),
             self.owner.principal_digest(),
-            self.owner.authority_epoch(),
+            self.owner.authority_epoch().clone(),
             self.owner.generation(),
         )
         .map_err(|error| OrsError::IntegrityProblem {
             record_type: "process_evidence",
             reason: error.to_string(),
         })?;
+        // Exact-tuple lineage check (Implements #64): the record epoch must be
+        // the same `(lineage_id, sequence)` as the owner's canonical epoch
+        // via `authority_epoch`; equal sequences from different lineages are
+        // unrelated.
+        let owner_canonical = self.owner.authority_epoch();
         if owner != self.owner
-            || self.authority_epoch != self.owner.authority_epoch()
+            || !self.authority_epoch.is_same_authority(owner_canonical)
             || self.generation != self.owner.generation().get()
             || self.operation_id.as_str() != self.evidence.operation_id().as_str()
             || self.request_digest != self.evidence.request_digest()
@@ -1254,15 +1275,18 @@ impl ProcessEvidenceRecord {
         }
         let fence: Value = serde_json::from_slice(&state_fence_bytes)
             .map_err(|error| OrsError::Encoding(error.to_string()))?;
-        let fence_epoch = fence
-            .get("authority_epoch")
-            .and_then(Value::as_u64)
-            .ok_or(OrsError::FenceMismatch)?;
+        // Lineage-aware fence binding (Implements #64): the P-03 execution
+        // fence carries its canonical `EpochId`; authorization uses
+        // exact-tuple `is_same_authority`.
+        let fence_canonical = binding.state_fence().authority_epoch();
+        if !fence_canonical.is_same_authority(&self.authority_epoch) {
+            return Err(OrsError::FenceMismatch);
+        }
         let fence_generation = fence
             .get("generation")
             .and_then(Value::as_u64)
             .ok_or(OrsError::FenceMismatch)?;
-        if fence_epoch != self.authority_epoch || fence_generation != self.generation {
+        if fence_generation != self.generation {
             return Err(OrsError::FenceMismatch);
         }
         Ok(())
@@ -1319,6 +1343,87 @@ impl StateFenceSnapshot {
         }
         Ok(())
     }
+
+    /// Lineage-bound validation against an [`EpochLineage`] gate (Implements #64, T6-E4-C).
+    ///
+    /// The `u64` contour is intentionally retained (donor precedent: no silent
+    /// widening without a migration receipt). This check requires the
+    /// snapshot's observed sequence to equal the lineage's current epoch AND,
+    /// when the canonical JSON binds an `authority_epoch` lineage tuple, that
+    /// tuple to agree exactly: equal sequences from different lineages are
+    /// unrelated and fail as `FenceMismatch`. Legacy scalar fences without a
+    /// bound lineage tuple keep the sequence-only check as a residual; callers
+    /// holding a canonical [`EpochId`] must use [`Self::validate_against_epoch`]
+    /// for exact-tuple `is_same_authority` enforcement at their own boundary.
+    pub fn validate_against_lineage(&self, lineage: &EpochLineage) -> Result<(), OrsError> {
+        self.validate()?;
+        lineage.validate()?;
+        if self.observed_authority_epoch != lineage.current.epoch {
+            return Err(OrsError::FenceMismatch);
+        }
+        let (bound_lineage, bound_sequence) = self.fence_epoch_tuple()?;
+        if let Some(bound_sequence) = bound_sequence
+            && bound_sequence != self.observed_authority_epoch
+        {
+            return Err(OrsError::FenceMismatch);
+        }
+        if let Some(bound_lineage) = bound_lineage
+            && bound_lineage != lineage.current.lineage_id.as_str()
+        {
+            return Err(OrsError::FenceMismatch);
+        }
+        Ok(())
+    }
+
+    /// Exact-tuple validation against a canonical [`EpochId`] (Implements #64, T6-E4-C).
+    ///
+    /// Requires `observed_authority_epoch == expected.sequence.get()` AND the
+    /// canonical JSON's bound `authority_epoch.lineage_id` to equal
+    /// `expected.lineage_id`: the `is_same_authority` spelling across the
+    /// `u64` contour boundary. Legacy scalar fences without a bound lineage
+    /// tuple fail closed here; use [`Self::validate_against_lineage`] only for
+    /// the residual contour path.
+    pub fn validate_against_epoch(&self, expected: &EpochId) -> Result<(), OrsError> {
+        self.validate()?;
+        if self.observed_authority_epoch != expected.sequence.get() {
+            return Err(OrsError::FenceMismatch);
+        }
+        let (bound_lineage, bound_sequence) = self.fence_epoch_tuple()?;
+        match (bound_lineage, bound_sequence) {
+            (Some(lineage_id), Some(sequence))
+                if lineage_id == expected.lineage_id.as_str()
+                    && sequence == expected.sequence.get() => {}
+            _ => return Err(OrsError::FenceMismatch),
+        }
+        Ok(())
+    }
+
+    /// Extracts the bound `(lineage_id, sequence)` tuple from the canonical
+    /// fence JSON when it carries the migrated `EpochId` object shape.
+    ///
+    /// Returns `(None, None)` for legacy scalar fences
+    /// (`{"authority_epoch": N}`) or fences without an `authority_epoch`
+    /// member; those stay readable through [`Self::validate_against_lineage`]
+    /// but never satisfy [`Self::validate_against_epoch`].
+    fn fence_epoch_tuple(&self) -> Result<(Option<String>, Option<u64>), OrsError> {
+        let parsed: Value = serde_json::from_str(&self.canonical_json)
+            .map_err(|error| OrsError::Encoding(error.to_string()))?;
+        let Some(authority) = parsed.get("authority_epoch") else {
+            return Ok((None, None));
+        };
+        if let Some(sequence) = authority.as_u64() {
+            return Ok((None, Some(sequence)));
+        }
+        if let Some(object) = authority.as_object() {
+            let lineage_id = object
+                .get("lineage_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let sequence = object.get("sequence").and_then(Value::as_u64);
+            return Ok((lineage_id, sequence));
+        }
+        Ok((None, None))
+    }
 }
 
 /// Exact epoch identity, including its lineage namespace.
@@ -1338,7 +1443,19 @@ pub struct EpochLineage {
 }
 
 impl EpochLineage {
-    /// Validates the explicit lineage edge.
+    /// Validates the explicit lineage edge (Implements #64, T6-E4-C).
+    ///
+    /// Same-lineage succession requires the exact direct-child step
+    /// (`current.epoch == predecessor.epoch + 1`, overflow-closed via
+    /// `checked_add`): a same-lineage jump of `+2` or more, a stall, or a
+    /// backward step fails as `InvalidEpochLineage`. This mirrors the
+    /// canonical `EpochId::is_direct_child_of` / `EpochTransition::validate`
+    /// one-step rule without naming the canonical `EpochLineageId` contour
+    /// (this contour keeps `OpaqueLabel` labels, so it cannot delegate
+    /// directly). Cross-lineage predecessors stay allowed with no numeric
+    /// ordering: restore / break-glass mints a new lineage whose predecessor
+    /// names the fenced old tuple, and equal sequences across lineages stay
+    /// unrelated.
     pub fn validate(&self) -> Result<(), OrsError> {
         self.current.validate()?;
         if let Some(predecessor) = &self.predecessor {
@@ -1346,9 +1463,14 @@ impl EpochLineage {
         }
         if let Some(predecessor) = &self.predecessor
             && predecessor.lineage_id == self.current.lineage_id
-            && predecessor.epoch >= self.current.epoch
         {
-            return Err(OrsError::InvalidEpochLineage);
+            let expected = predecessor
+                .epoch
+                .checked_add(1)
+                .ok_or(OrsError::InvalidEpochLineage)?;
+            if self.current.epoch != expected {
+                return Err(OrsError::InvalidEpochLineage);
+            }
         }
         Ok(())
     }
@@ -2177,6 +2299,37 @@ pub enum OrsError {
         record_type: &'static str,
         reason: String,
     },
+    #[error(
+        "host request {operation_id} with digest {request_digest} conflicts with durable ORS state: IDENTITY_CONFLICT"
+    )]
+    HostRequestIdentityConflict {
+        operation_id: String,
+        request_digest: String,
+    },
+    #[error("native-worker claim {claim_id} conflicts with durable ORS state: IDENTITY_CONFLICT")]
+    NativeWorkerClaimIdentityConflict { claim_id: String },
+    #[error(
+        "worker replay stream {stream_id} request {request_id} conflicts with durable ORS state: IDENTITY_CONFLICT"
+    )]
+    WorkerReplayIdentityConflict {
+        stream_id: String,
+        request_id: String,
+    },
+    #[error(
+        "worker replay stream {stream_id} has no bound claim or a stale generation/epoch/fence"
+    )]
+    WorkerReplayStaleStream { stream_id: String },
+    #[error(
+        "worker replay acknowledgement does not bind its durable event on stream {stream_id} at sequence {sequence}"
+    )]
+    WorkerReplayAckMismatch { stream_id: String, sequence: u64 },
+    #[error(
+        "worker replay suffix on stream {stream_id} is incomplete after sequence {after_sequence}"
+    )]
+    WorkerReplayIncomplete {
+        stream_id: String,
+        after_sequence: u64,
+    },
     #[error("durable ORS storage failed: {0}")]
     Storage(String),
     #[error("durable ORS encoding failed: {0}")]
@@ -2268,6 +2421,478 @@ impl StoreRebindReplayRecord {
     }
 }
 
+/// Durable retention of one closed typed Store failure bound to the exact
+/// admitted Store operation it reports on.
+///
+/// ORS preserves the owner `eliot_store_api::StoreFailure` envelope
+/// opaquely: the envelope is validated by the owner contract, pinned to the
+/// exact operation/request/fence/binding identity, and returned verbatim on
+/// readback. ORS never interprets disposition, retry, recovery, or
+/// human-detail prose for control decisions, and never re-derives retry or
+/// terminality from provider text: the retained typed envelope alone carries
+/// control meaning.
+///
+/// A retained `UNKNOWN_OUTCOME` failure with no reconciling receipt is the
+/// reconciling state: it is neither committed nor terminal, it is never
+/// reported as unavailable, failed, absent, or safe-to-retry, and only
+/// `crate::RedbRecoveryStore::mark_store_failure_reconciled` may bind the
+/// exact reconciling receipt afterwards. Terminal dispositions are retained
+/// as terminal evidence and can never become reconciled.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoreFailureRetentionRecord {
+    pub operation_id: OperationIdentity,
+    pub request_digest: String,
+    pub store_fence: String,
+    pub candidate_binding_digest: String,
+    pub requirement_digest: String,
+    pub failure: eliot_store_api::StoreFailure,
+    /// Digest of the reconciling `WriteReceipt` bound after the exact
+    /// retained operation was reconciled following a possible
+    /// commit/effect. `None` while the retained failure is unresolved.
+    pub reconciled_receipt: Option<String>,
+}
+
+impl StoreFailureRetentionRecord {
+    /// Returns the durable key binding one operation to one exact request.
+    pub fn record_key(&self) -> String {
+        format!("{}::{}", self.operation_id.as_str(), self.request_digest)
+    }
+
+    /// Returns whether two records carry the exact same admitted binding.
+    ///
+    /// The retained failure envelope and the reconciling receipt are
+    /// excluded: they are retained Store evidence and ORS-owned
+    /// reconciliation progression, not caller binding.
+    pub fn same_binding(&self, other: &Self) -> bool {
+        self.operation_id == other.operation_id
+            && self.request_digest == other.request_digest
+            && self.store_fence == other.store_fence
+            && self.candidate_binding_digest == other.candidate_binding_digest
+            && self.requirement_digest == other.requirement_digest
+    }
+
+    /// Validates shape, owner envelope, and identity binding without
+    /// interpreting Store semantic policy.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        validate_text(self.operation_id.as_str(), "store_failure_operation_id")?;
+        validate_digest(&self.request_digest, "store_failure_request_digest")?;
+        validate_digest(&self.store_fence, "store_failure_store_fence")?;
+        validate_digest(
+            &self.candidate_binding_digest,
+            "store_failure_candidate_digest",
+        )?;
+        validate_digest(&self.requirement_digest, "store_failure_requirement_digest")?;
+        // The owner contract alone decides envelope validity. Owner prose
+        // is never propagated: ORS reports a fixed field/reason pair so
+        // provider text cannot change control meaning.
+        self.failure
+            .validate()
+            .map_err(|_| OrsError::InvalidField {
+                field: "store_failure_envelope",
+                reason: "owner contract rejected the retained Store failure",
+            })?;
+        // The retained disposition must report on this exact operation. A
+        // failure carrying another operation identity is a binding
+        // mismatch, never a candidate for quiet adoption.
+        if let Some(operation_id) = self.failure.operation_id.as_ref()
+            && operation_id.as_str() != self.operation_id.as_str()
+        {
+            return Err(OrsError::InvalidField {
+                field: "store_failure_operation_id",
+                reason: "retained failure must bind the exact retained operation",
+            });
+        }
+        if let Some(receipt) = &self.reconciled_receipt {
+            validate_digest(receipt, "store_failure_reconciled_receipt")?;
+            // Only a possible commit/effect reconciles: terminal
+            // dispositions are retained as terminal evidence and can never
+            // become reconciled.
+            if self.failure.disposition != eliot_store_api::StoreFailureDisposition::UnknownOutcome
+            {
+                return Err(OrsError::InvalidField {
+                    field: "store_failure_reconciled_receipt",
+                    reason: "only unknown-outcome retention reconciles",
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Terminal outcome of one Kernel-owned unknown-commit recovery record.
+///
+/// The outcome names what evidence proved, never a retry policy: a resolved
+/// record is immutable terminal evidence. `RolledBack` covers every terminal
+/// non-committed receipt (rejected, cancelled) whose digest is bound as
+/// evidence; `DeadLetter` and `NewIdentityRequired` keep their distinct
+/// Store-reported meanings so no caller can mistake them for a safe
+/// same-identity retry.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnknownCommitOutcome {
+    Committed,
+    RolledBack,
+    DeadLetter,
+    NewIdentityRequired,
+}
+
+/// Durable Kernel-owned unknown-commit recovery record (I14.21, issue #1690).
+///
+/// The Kernel stages one record per canonical write attempt keyed by the
+/// admitted operation idempotency key before the commit send, and resolves
+/// it exactly once when receipt evidence arrives. While a record is open,
+/// its ordering scopes are paused: no dependent mutation in those scopes is
+/// admitted until an evidence-backed disposition resolves it. ORS stores the
+/// record verbatim and never interprets commit, retry, or problem semantics.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnknownCommitRecord {
+    /// Durable write-attempt identity: the admitted idempotency key.
+    pub idempotency_key: String,
+    /// Exact admitted operation identity bound to the attempt.
+    pub operation_id: OperationIdentity,
+    /// Digest of the exact canonical request bytes admitted for the attempt.
+    pub canonical_request_hash: String,
+    /// Ordering scopes paused while this record is open. Empty only for
+    /// scopeless commits (genesis); a scoped commit always names its scopes.
+    pub ordering_scopes: Vec<String>,
+    /// `None` while the commit outcome is unknown; the terminal outcome once
+    /// receipt evidence resolved it. A resolved record never reopens.
+    pub outcome: Option<UnknownCommitOutcome>,
+    /// Digest of the resolving `WriteReceipt` bound at disposition. `None`
+    /// while open; required once resolved.
+    pub evidence_receipt_digest: Option<String>,
+}
+
+impl UnknownCommitRecord {
+    /// Returns the durable key binding one write attempt to its idempotency key.
+    #[must_use]
+    pub fn record_key(&self) -> String {
+        self.idempotency_key.clone()
+    }
+
+    /// Returns whether two records carry the exact same admitted binding.
+    ///
+    /// Outcome and evidence are excluded: they are ORS-owned reconciliation
+    /// progression, not caller binding.
+    #[must_use]
+    pub fn same_binding(&self, other: &Self) -> bool {
+        self.idempotency_key == other.idempotency_key
+            && self.operation_id == other.operation_id
+            && self.canonical_request_hash == other.canonical_request_hash
+            && self.ordering_scopes == other.ordering_scopes
+    }
+
+    /// Returns true while the commit outcome is still unknown.
+    #[must_use]
+    pub const fn is_open(&self) -> bool {
+        self.outcome.is_none()
+    }
+
+    /// Validates shape and identity binding without interpreting commit
+    /// semantics. An open record carries no evidence; a resolved record
+    /// always binds its resolving receipt digest.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        validate_text(&self.idempotency_key, "unknown_commit_idempotency_key")?;
+        validate_text(self.operation_id.as_str(), "unknown_commit_operation_id")?;
+        validate_digest(
+            &self.canonical_request_hash,
+            "unknown_commit_canonical_request_hash",
+        )?;
+        for scope in &self.ordering_scopes {
+            validate_text(scope, "unknown_commit_ordering_scope")?;
+        }
+        match (&self.outcome, &self.evidence_receipt_digest) {
+            (None, None) => Ok(()),
+            (None, Some(_)) => Err(OrsError::InvalidField {
+                field: "unknown_commit_evidence_receipt_digest",
+                reason: "an open unknown-commit record carries no evidence",
+            }),
+            (Some(_), Some(digest)) => {
+                validate_digest(digest, "unknown_commit_evidence_receipt_digest")?;
+                Ok(())
+            }
+            (Some(_), None) => Err(OrsError::InvalidField {
+                field: "unknown_commit_evidence_receipt_digest",
+                reason: "a resolved unknown-commit record binds its receipt evidence",
+            }),
+        }
+    }
+}
+
+/// Closed P-04 host-request kinds preserved by ORS without interpretation.
+///
+/// The kind is an opaque routing label. ORS never interprets task, scope,
+/// payload, or semantic meaning from it; it only enforces that one operation
+/// identity is never rebound across kinds or bindings.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum HostRequestKind {
+    Activation,
+    Invocation,
+    Cancellation,
+    Status,
+    Reconciliation,
+}
+
+/// Durable P-04 host-request operation state.
+///
+/// `PossiblyEffected` is the anti-blind-retry fence: once an operation may
+/// have produced an external or canonical effect it can only move forward to
+/// `ResultReceived` through reconciliation evidence, or to `Unknown` /
+/// `Reconciling`. It can never return to `Routed` or `Submitted`.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum HostRequestState {
+    Requested,
+    Admitted,
+    Routed,
+    Submitted,
+    PossiblyEffected,
+    ResultReceived,
+    Cancelled,
+    Expired,
+    Conflicted,
+    Unknown,
+    Reconciling,
+    Terminal,
+}
+
+impl HostRequestState {
+    /// Returns whether the state closes the operation.
+    pub const fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::ResultReceived
+                | Self::Cancelled
+                | Self::Expired
+                | Self::Conflicted
+                | Self::Terminal
+        )
+    }
+
+    /// Validates one mechanical state advance without interpreting meaning.
+    pub fn transition_to(self, next: Self) -> Result<Self, OrsError> {
+        let legal = matches!(
+            (self, next),
+            (
+                Self::Requested,
+                Self::Admitted | Self::Expired | Self::Conflicted | Self::Unknown
+            ) | (
+                Self::Admitted,
+                Self::Routed | Self::Cancelled | Self::Expired | Self::Conflicted | Self::Unknown
+            ) | (
+                Self::Routed,
+                Self::Submitted
+                    | Self::Cancelled
+                    | Self::Expired
+                    | Self::Conflicted
+                    | Self::Unknown
+            ) | (
+                Self::Submitted,
+                Self::PossiblyEffected
+                    | Self::ResultReceived
+                    | Self::Cancelled
+                    | Self::Expired
+                    | Self::Conflicted
+                    | Self::Unknown
+            ) | (
+                Self::PossiblyEffected,
+                Self::ResultReceived | Self::Unknown | Self::Reconciling
+            ) | (
+                Self::Unknown,
+                Self::Reconciling | Self::ResultReceived | Self::Cancelled | Self::Expired
+            ) | (
+                Self::Reconciling,
+                Self::ResultReceived
+                    | Self::Cancelled
+                    | Self::Expired
+                    | Self::Unknown
+                    | Self::Conflicted
+            ) | (
+                Self::ResultReceived | Self::Cancelled | Self::Expired | Self::Conflicted,
+                Self::Terminal
+            )
+        );
+        legal.then_some(next).ok_or(OrsError::InvalidTransition)
+    }
+}
+
+/// Durable P-04 host-request operation record.
+///
+/// Every identity is opaque to ORS: Session, task, scope, capability, fence,
+/// and payload values are preserved as exact bytes/digests for replay
+/// comparison and are never interpreted. The Kernel admission gate owns fence,
+/// capability, and Session validation; ORS owns durable identity continuity:
+/// an exact replay returns the same state and result, while a changed
+/// payload or binding under the same identity is rejected as
+/// `HostRequestIdentityConflict`.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostRequestRecord {
+    pub contract_version: u16,
+    pub operation_id: OperationIdentity,
+    pub kind: HostRequestKind,
+    pub request_id: OpaqueLabel,
+    pub idempotency_key: OpaqueLabel,
+    pub cancellation_id: OpaqueLabel,
+    pub parent_operation_id: Option<OpaqueLabel>,
+    pub request_digest: String,
+    pub payload_digest: String,
+    pub connection_ref: OpaqueLabel,
+    pub session_ref: Option<OpaqueLabel>,
+    pub task_ref: Option<OpaqueLabel>,
+    pub scope_ref: Option<OpaqueLabel>,
+    pub capability_ref: OpaqueLabel,
+    pub fence_digest: String,
+    /// Lineage-aware authority epoch (Implements #64).
+    ///
+    /// Widened from the `u64` contour because `host_request_binding`
+    /// (owned Split B path) binds it directly from the migrated `StateFence`
+    /// `EpochId`; a scalar contour would require a forbidden
+    /// `.sequence.get()` adapter. `AuthorityHandoffRecord` u64 contours remain
+    /// flagged adjacent residuals.
+    pub authority_epoch: EpochId,
+    pub generation: u64,
+    pub deadline_unix_ms: u64,
+    pub state: HostRequestState,
+    pub result_digest: Option<String>,
+    /// Exact bounded result body for `ResultReceived`/`Terminal` readback
+    /// (Implements #18: local read result).
+    ///
+    /// Opaque to ORS: the Kernel binder stores the canonical bounded
+    /// `McpResponse` JSON here (payload plus revision carried inside its
+    /// content by the read owner) and serves it verbatim on exact replay
+    /// without re-dispatch. Excluded from [`HostRequestRecord::same_binding`]
+    /// like `result_digest`: ORS-owned progression, not caller binding.
+    /// `None` while no result was received; `Some` exactly when
+    /// `result_digest` is `Some`. Bounded to the protocol structured-response
+    /// ceiling (256 KiB, mirrors `eliot-protocol::HARD_STRUCTURED_RESPONSE_BYTES`
+    /// without adding a layering edge from durable state to the wire crate).
+    #[serde(default)]
+    pub result_response: Option<Value>,
+    /// Monotonic ORS order assigned atomically when the operation first
+    /// reaches a terminal state. Zero while non-terminal.
+    #[serde(default)]
+    pub commit_order: u64,
+}
+
+impl HostRequestRecord {
+    /// Returns the durable key binding one operation to one exact request.
+    pub fn record_key(&self) -> String {
+        format!("{}::{}", self.operation_id.as_str(), self.request_digest)
+    }
+
+    /// Returns whether two records carry the exact same request binding.
+    ///
+    /// State, result, and commit order are excluded: they are ORS-owned
+    /// progression, not caller binding.
+    pub fn same_binding(&self, other: &Self) -> bool {
+        self.operation_id == other.operation_id
+            && self.kind == other.kind
+            && self.request_id == other.request_id
+            && self.idempotency_key == other.idempotency_key
+            && self.cancellation_id == other.cancellation_id
+            && self.parent_operation_id == other.parent_operation_id
+            && self.request_digest == other.request_digest
+            && self.payload_digest == other.payload_digest
+            && self.connection_ref == other.connection_ref
+            && self.session_ref == other.session_ref
+            && self.task_ref == other.task_ref
+            && self.scope_ref == other.scope_ref
+            && self.capability_ref == other.capability_ref
+            && self.fence_digest == other.fence_digest
+            && self.authority_epoch == other.authority_epoch
+            && self.generation == other.generation
+            && self.deadline_unix_ms == other.deadline_unix_ms
+    }
+
+    /// Validates identity shape and state/result coherence.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        if self.contract_version != CONTRACT_VERSION {
+            return Err(OrsError::UnsupportedContractVersion(self.contract_version));
+        }
+        validate_text(self.operation_id.as_str(), "host_request_operation_id")?;
+        validate_text(self.request_id.as_str(), "host_request_request_id")?;
+        validate_text(
+            self.idempotency_key.as_str(),
+            "host_request_idempotency_key",
+        )?;
+        validate_text(
+            self.cancellation_id.as_str(),
+            "host_request_cancellation_id",
+        )?;
+        if let Some(parent) = &self.parent_operation_id {
+            validate_text(parent.as_str(), "host_request_parent_operation_id")?;
+            if parent == &self.operation_id {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_parent_operation_id",
+                    reason: "must not reference the enclosing operation",
+                });
+            }
+        }
+        validate_digest(&self.request_digest, "host_request_request_digest")?;
+        validate_digest(&self.payload_digest, "host_request_payload_digest")?;
+        validate_text(self.connection_ref.as_str(), "host_request_connection_ref")?;
+        for (value, field) in [
+            (self.session_ref.as_ref(), "host_request_session_ref"),
+            (self.task_ref.as_ref(), "host_request_task_ref"),
+            (self.scope_ref.as_ref(), "host_request_scope_ref"),
+        ] {
+            if let Some(identity) = value {
+                validate_text(identity.as_str(), field)?;
+            }
+        }
+        validate_text(self.capability_ref.as_str(), "host_request_capability_ref")?;
+        validate_digest(&self.fence_digest, "host_request_fence_digest")?;
+        // `EpochId` is always validated; only generation retains a scalar check.
+        if self.generation == 0 {
+            return Err(OrsError::InvalidField {
+                field: "host_request_epoch",
+                reason: "must be non-zero",
+            });
+        }
+        if self.deadline_unix_ms == 0 {
+            return Err(OrsError::InvalidField {
+                field: "host_request_deadline",
+                reason: "must be greater than zero",
+            });
+        }
+        match (&self.state, &self.result_digest, &self.result_response) {
+            (
+                HostRequestState::ResultReceived | HostRequestState::Terminal,
+                Some(result),
+                Some(body),
+            ) => {
+                validate_digest(result, "host_request_result_digest")?;
+                validate_result_response(body)?;
+            }
+            // Legacy digest-only row (produced by the digest-only advance
+            // before the bounded body existed): loads for compatibility but
+            // is never served as a body until completed by an exact-digest
+            // persist. Digests in any other state remain rejected as before.
+            (HostRequestState::ResultReceived | HostRequestState::Terminal, Some(result), None) => {
+                validate_digest(result, "host_request_result_digest")?;
+            }
+            (_, None, None) => {}
+            (_, Some(_), _) | (_, None, Some(_)) => {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_result_digest",
+                    reason: "result digest and body must be present together, only for received or terminal states",
+                });
+            }
+        }
+        if !self.state.is_terminal() && self.commit_order != 0 {
+            return Err(OrsError::InvalidField {
+                field: "host_request_commit_order",
+                reason: "non-terminal states must not carry a commit order",
+            });
+        }
+        Ok(())
+    }
+}
+
 pub(crate) fn validate_text(value: &str, field: &'static str) -> Result<(), OrsError> {
     if value.trim().is_empty() {
         return Err(OrsError::InvalidField {
@@ -2304,6 +2929,32 @@ pub(crate) fn validate_digest(value: &str, field: &'static str) -> Result<(), Or
     Ok(())
 }
 
+/// Bounded size of one stored host-request result body (Implements #18).
+///
+/// Mirrors `eliot-protocol::HARD_STRUCTURED_RESPONSE_BYTES` without adding a
+/// wire-crate edge to durable state.
+pub const MAX_HOST_REQUEST_RESULT_RESPONSE_BYTES: usize = 256 * 1024;
+
+fn validate_result_response(body: &Value) -> Result<(), OrsError> {
+    if !body.is_object() {
+        return Err(OrsError::InvalidField {
+            field: "host_request_result_response",
+            reason: "result body must be a bounded JSON object",
+        });
+    }
+    let encoded = serde_json::to_vec(body).map_err(|_| OrsError::InvalidField {
+        field: "host_request_result_response",
+        reason: "result body must serialize to bounded JSON",
+    })?;
+    if encoded.len() > MAX_HOST_REQUEST_RESULT_RESPONSE_BYTES {
+        return Err(OrsError::InvalidField {
+            field: "host_request_result_response",
+            reason: "result body exceeds the bounded response ceiling",
+        });
+    }
+    Ok(())
+}
+
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let digest = Sha256::digest(bytes);
@@ -2328,5 +2979,948 @@ fn canonicalize(value: Value) -> Value {
             Value::Object(sorted)
         }
         scalar => scalar,
+    }
+}
+
+/// Durable native-worker claim operation state (Wave B, issue #872).
+///
+/// `Terminal` is absorbing: once a claim is terminal it never leaves that
+/// state, so restart rehydrates the terminal outcome instead of downgrading
+/// the unit to unclaimed. `Unknown` may only move to `Reconciling`, and
+/// neither `Unknown` nor `Reconciling` may return to `Requested`: an
+/// uncertain outcome is reconciled under the original claim, never
+/// blind-retried as new work. `Ready` is reachable only from `Admitted` or
+/// from `Reconciling` as the resolution of previously admitted work; a
+/// direct `Requested -> Ready` or `Unknown -> Ready` skip is forbidden, so
+/// transport liveness alone can never manufacture readiness.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum NativeWorkerClaimState {
+    Requested,
+    Admitted,
+    Ready,
+    Active,
+    Cancelling,
+    Submitted,
+    Unknown,
+    Reconciling,
+    Terminal,
+}
+
+impl NativeWorkerClaimState {
+    /// Returns whether the state closes the claim.
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Terminal)
+    }
+
+    /// Validates one mechanical state advance without interpreting meaning.
+    pub fn transition_to(self, next: Self) -> Result<Self, OrsError> {
+        let legal = matches!(
+            (self, next),
+            (Self::Requested, Self::Admitted | Self::Unknown)
+                | (
+                    Self::Admitted,
+                    Self::Ready | Self::Cancelling | Self::Unknown
+                )
+                | (Self::Ready, Self::Active | Self::Cancelling | Self::Unknown)
+                | (
+                    Self::Active,
+                    Self::Cancelling | Self::Submitted | Self::Unknown
+                )
+                | (
+                    Self::Cancelling,
+                    Self::Submitted | Self::Unknown | Self::Terminal
+                )
+                | (Self::Submitted, Self::Terminal | Self::Unknown)
+                | (Self::Unknown, Self::Reconciling)
+                | (
+                    Self::Reconciling,
+                    Self::Ready | Self::Active | Self::Submitted | Self::Terminal | Self::Unknown
+                )
+        );
+        legal.then_some(next).ok_or(OrsError::InvalidTransition)
+    }
+}
+
+/// Durable native-worker claim intent and admission record (Wave B, issue
+/// #872).
+///
+/// Every identity is opaque to ORS: the parent Durable-Job, task, scope,
+/// decision, attempt, and operation ids, the route/provider-class label, and
+/// the budget/fence/resource digests are preserved as exact bytes for replay
+/// comparison and are never interpreted. The Kernel admission gate owns
+/// registration currency, epoch/fence, deadline, and readiness validation;
+/// ORS owns durable identity continuity: an exact replay under the same
+/// claim identity returns the same receipt identity, while changed work,
+/// generation, route, budget, schema, fence, or predecessor under one claim
+/// identity is rejected as
+/// [`OrsError::NativeWorkerClaimIdentityConflict`] and never overwrites the
+/// durable binding.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeWorkerClaimRecord {
+    pub contract_version: u16,
+    /// Distinct claim operation identity; the durable key. At most one live
+    /// claim exists per id.
+    pub claim_id: OperationIdentity,
+    /// Registration the claim was presented under; opaque reference only.
+    pub registration_id: OpaqueLabel,
+    /// Claiming worker generation; stale generations cannot claim.
+    pub worker_generation: u64,
+    /// Kernel-owned parent Durable-Job identity; opaque to ORS.
+    pub parent_job_id: OpaqueLabel,
+    /// Governed task identity; opaque to ORS.
+    pub task_id: OpaqueLabel,
+    /// Task `WorkScope` identity; opaque to ORS.
+    pub work_scope_id: OpaqueLabel,
+    /// Logical decision identity; opaque to ORS.
+    pub decision_id: OpaqueLabel,
+    /// Attempt identity bound to this claim; opaque to ORS.
+    pub attempt_id: OpaqueLabel,
+    /// Exact external-effect operation identity; opaque to ORS.
+    pub operation_id: OpaqueLabel,
+    /// Admitted route/provider-class label. Selection stays with #874; ORS
+    /// compares it byte-wise and never interprets it.
+    pub route_class: OpaqueLabel,
+    /// Opaque digest of the claim budget envelope.
+    pub budget_digest: String,
+    /// Claim deadline in Unix milliseconds.
+    pub deadline_unix_ms: u64,
+    /// Opaque digest of the exact immutable fence paired with the
+    /// generation and epoch.
+    pub fence_digest: String,
+    /// Current authority epoch at admission time.
+    pub authority_epoch: u64,
+    /// Canonical digest over every bound work field.
+    pub binding_digest: String,
+    /// Canonical digest over the presenting request envelope.
+    pub request_digest: String,
+    /// Supported execution-unit schema version.
+    pub execution_unit_schema_version: u16,
+    /// Predecessor revision this claim continues from; opaque to ORS.
+    pub predecessor_revision: OpaqueLabel,
+    /// Opaque digest of the presenting worker generation's resource
+    /// envelope (installation, artifact, and configuration identity).
+    pub resource_envelope_digest: String,
+    /// Durable claim state.
+    pub state: NativeWorkerClaimState,
+    /// Canonical digest of the immutable admission receipt. `None` while
+    /// the intent is only requested; `Some` once Kernel admits the claim.
+    /// The receipt identity never changes afterwards: exact replay returns
+    /// this same digest.
+    pub receipt_digest: Option<String>,
+    /// Admission time in Unix milliseconds. `None` while requested.
+    pub admitted_at_unix_ms: Option<u64>,
+    /// Monotonic ORS order assigned atomically when the claim first reaches
+    /// its terminal state. Zero while non-terminal.
+    #[serde(default)]
+    pub commit_order: u64,
+}
+
+impl NativeWorkerClaimRecord {
+    /// Returns the durable key binding one claim identity to one exact row.
+    pub fn record_key(&self) -> String {
+        self.claim_id.as_str().to_owned()
+    }
+
+    /// Returns whether two records carry the exact same admitted binding.
+    ///
+    /// State, receipt, admission time, and commit order are excluded: they
+    /// are ORS-owned progression, not caller binding. Mirrors
+    /// [`HostRequestRecord::same_binding`].
+    pub fn same_binding(&self, other: &Self) -> bool {
+        self.claim_id == other.claim_id
+            && self.registration_id == other.registration_id
+            && self.worker_generation == other.worker_generation
+            && self.parent_job_id == other.parent_job_id
+            && self.task_id == other.task_id
+            && self.work_scope_id == other.work_scope_id
+            && self.decision_id == other.decision_id
+            && self.attempt_id == other.attempt_id
+            && self.operation_id == other.operation_id
+            && self.route_class == other.route_class
+            && self.budget_digest == other.budget_digest
+            && self.deadline_unix_ms == other.deadline_unix_ms
+            && self.fence_digest == other.fence_digest
+            && self.authority_epoch == other.authority_epoch
+            && self.binding_digest == other.binding_digest
+            && self.request_digest == other.request_digest
+            && self.execution_unit_schema_version == other.execution_unit_schema_version
+            && self.predecessor_revision == other.predecessor_revision
+            && self.resource_envelope_digest == other.resource_envelope_digest
+    }
+
+    /// Validates identity shape and state/receipt coherence.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        if self.contract_version != CONTRACT_VERSION {
+            return Err(OrsError::UnsupportedContractVersion(self.contract_version));
+        }
+        validate_text(self.claim_id.as_str(), "native_worker_claim_id")?;
+        for (value, field) in [
+            (&self.registration_id, "native_worker_claim_registration_id"),
+            (&self.parent_job_id, "native_worker_claim_parent_job_id"),
+            (&self.task_id, "native_worker_claim_task_id"),
+            (&self.work_scope_id, "native_worker_claim_work_scope_id"),
+            (&self.decision_id, "native_worker_claim_decision_id"),
+            (&self.attempt_id, "native_worker_claim_attempt_id"),
+            (&self.operation_id, "native_worker_claim_operation_id"),
+            (&self.route_class, "native_worker_claim_route_class"),
+            (
+                &self.predecessor_revision,
+                "native_worker_claim_predecessor_revision",
+            ),
+        ] {
+            validate_text(value.as_str(), field)?;
+        }
+        for (value, field) in [
+            (&self.budget_digest, "native_worker_claim_budget_digest"),
+            (&self.fence_digest, "native_worker_claim_fence_digest"),
+            (&self.binding_digest, "native_worker_claim_binding_digest"),
+            (&self.request_digest, "native_worker_claim_request_digest"),
+            (
+                &self.resource_envelope_digest,
+                "native_worker_claim_resource_envelope_digest",
+            ),
+        ] {
+            validate_digest(value, field)?;
+        }
+        if self.worker_generation == 0
+            || self.deadline_unix_ms == 0
+            || self.authority_epoch == 0
+            || self.execution_unit_schema_version == 0
+        {
+            return Err(OrsError::InvalidField {
+                field: "native_worker_claim_bounded_fields",
+                reason: "generation, deadline, epoch, and schema version must be non-zero",
+            });
+        }
+        match (&self.state, &self.receipt_digest, self.admitted_at_unix_ms) {
+            (NativeWorkerClaimState::Requested, None, None) => {}
+            (NativeWorkerClaimState::Requested, _, _) => {
+                return Err(OrsError::InvalidField {
+                    field: "native_worker_claim_receipt",
+                    reason: "a requested intent carries no admission receipt",
+                });
+            }
+            (_, Some(receipt), Some(admitted_at)) => {
+                validate_digest(receipt, "native_worker_claim_receipt_digest")?;
+                if admitted_at == 0 {
+                    return Err(OrsError::InvalidField {
+                        field: "native_worker_claim_admitted_at",
+                        reason: "admission time must be greater than zero",
+                    });
+                }
+            }
+            _ => {
+                return Err(OrsError::InvalidField {
+                    field: "native_worker_claim_receipt",
+                    reason: "an admitted claim carries its immutable receipt identity",
+                });
+            }
+        }
+        if !self.state.is_terminal() && self.commit_order != 0 {
+            return Err(OrsError::InvalidField {
+                field: "native_worker_claim_commit_order",
+                reason: "non-terminal states must not carry a commit order",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Admission evidence bound when a requested claim becomes admitted.
+///
+/// Carried only by the `Requested -> Admitted` transition (and accepted
+/// unchanged on an exact `Admitted -> Admitted` replay); it is never
+/// overwritten once bound, so one claim identity keeps one receipt identity.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeWorkerClaimAdmission {
+    pub receipt_digest: String,
+    pub admitted_at_unix_ms: u64,
+}
+
+impl NativeWorkerClaimAdmission {
+    pub(crate) fn validate(&self) -> Result<(), OrsError> {
+        validate_digest(&self.receipt_digest, "native_worker_claim_receipt_digest")?;
+        if self.admitted_at_unix_ms == 0 {
+            return Err(OrsError::InvalidField {
+                field: "native_worker_claim_admitted_at",
+                reason: "admission time must be greater than zero",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Result of the atomic claim-staging write.
+///
+/// `Stored` is a newly persisted intent; `Existing` is an exact replay
+/// carrying the same receipt identity. A changed binding under the same
+/// claim identity is not a variant here: staging fails with
+/// [`OrsError::NativeWorkerClaimIdentityConflict`] and never overwrites.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NativeWorkerClaimStageOutcome {
+    Stored(NativeWorkerClaimRecord),
+    Existing(NativeWorkerClaimRecord),
+}
+
+impl NativeWorkerClaimStageOutcome {
+    /// Returns the durable record regardless of how the write resolved.
+    pub fn record(&self) -> &NativeWorkerClaimRecord {
+        match self {
+            Self::Stored(record) | Self::Existing(record) => record,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// T9-03 owner-backed durable replay stream (issue #22, M3).
+//
+// Kernel/ORS owns the stream. The stream id is the exact `(claim id, worker
+// generation)` pair rendered as `"{claim_id}/{generation}"` (two-part shape
+// precedent: the T9-02 fixture `stream-claim-t9-02-1/gen-1`). The sequence is
+// a monotonic `u64` per stream persisted in ORS. The producer cursor advances
+// at DURABLE, the consumer cursor advances at APPLIED or REJECTED, and
+// UNKNOWN never advances a cursor: an unknown outcome stays reconciling under
+// its original identity. Retention holds every event until APPLIED/REJECTED,
+// plus a bounded newest window of [`crate::MAX_REPLAY_PAGE`] terminal events. A new
+// generation may read retained history but never acquires, appends, or
+// acknowledges under a stale binding. Semantic observation ownership stays
+// with its owner: ORS preserves the opaque envelope bytes, the owner receipt
+// disposition, and the mechanical delivery class without interpreting them.
+// The Kernel admission owner validates identity/epoch/fence; ORS compares the
+// presented binding for exact equality against the bound claim record
+// (read-only) and never re-derives authority.
+//
+// Wire revision is the kernel-service (W-B) adapter's business: W-B projects
+// the worker `EpochId`/`StateFence` bindings onto the `u64` epoch sequence
+// and fence digest the claim record already binds, exactly as the existing
+// claim contour does (`authority_epoch` is the epoch sequence, `fence_digest`
+// the opaque fence binding).
+// ---------------------------------------------------------------------------
+
+/// Maximum opaque causal-predecessor references retained on one replay event.
+const MAX_REPLAY_EVENT_REFS: usize = 64;
+/// Maximum trace-context entries retained on one replay event.
+const MAX_REPLAY_TRACE_ENTRIES: usize = 64;
+
+/// Builds the durable replay stream identity for one claim generation.
+///
+/// The stream id is `"{claim_id}/gen-{generation}"` with a nonzero generation,
+/// matching the T9-02 executable-binding fixture (`stream-claim-t9-02-1/gen-1`)
+/// and the kernel-service replay wire constructor. The claim identity is
+/// already validated by construction; only the generation bound is checked
+/// here.
+pub fn replay_stream_id(claim_id: &OperationIdentity, generation: u64) -> Result<String, OrsError> {
+    if generation == 0 {
+        return Err(OrsError::InvalidField {
+            field: "worker_replay_generation",
+            reason: "generation must be greater than zero",
+        });
+    }
+    Ok(format!("{}/gen-{}", claim_id.as_str(), generation))
+}
+
+/// Splits a replay stream identity back into its claim and generation halves.
+///
+/// The split is at the last `/` so a claim identity containing `/` still
+/// round-trips through [`replay_stream_id`]. The generation half must be
+/// `gen-{nonzero integer}`; owner-shaped strings without the `gen-` prefix
+/// are rejected as malformed (fail closed) and must be mapped through
+/// [`replay_stream_id`] by the kernel-service adapter before reaching ORS.
+pub fn parse_replay_stream_id(stream_id: &str) -> Result<(OperationIdentity, u64), OrsError> {
+    let (claim_part, generation_part) =
+        stream_id.rsplit_once('/').ok_or(OrsError::InvalidField {
+            field: "worker_replay_stream_id",
+            reason: "stream identity must be \"{claim_id}/gen-{generation}\"",
+        })?;
+    let claim_id = OperationIdentity::new(claim_part).map_err(|_| OrsError::InvalidField {
+        field: "worker_replay_stream_id",
+        reason: "stream claim identity must be non-blank",
+    })?;
+    let generation: u64 = generation_part
+        .strip_prefix("gen-")
+        .and_then(|digits| digits.parse().ok())
+        .filter(|generation| *generation > 0)
+        .ok_or(OrsError::InvalidField {
+            field: "worker_replay_stream_id",
+            reason: "stream generation must be gen-{nonzero integer}",
+        })?;
+    Ok((claim_id, generation))
+}
+
+/// Explicit cursor phase for one replay acknowledgement.
+///
+/// Mirrors the worker acknowledgement phases mechanically: ORS routes cursors
+/// from this value and never lets transport receipt impersonate application
+/// outcome.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum WorkerReplayPhase {
+    Received,
+    Durable,
+    Normalized,
+    Applied,
+    Rejected,
+    Unknown,
+}
+
+impl WorkerReplayPhase {
+    /// M3 producer rule: only a DURABLE acknowledgement advances the producer
+    /// cursor.
+    pub const fn advances_producer_cursor(self) -> bool {
+        matches!(self, Self::Durable)
+    }
+
+    /// M3 consumer rule: only APPLIED or REJECTED advances the consumer
+    /// cursor. UNKNOWN (and the non-terminal phases) never advance a cursor.
+    pub const fn advances_consumer_cursor(self) -> bool {
+        matches!(self, Self::Applied | Self::Rejected)
+    }
+}
+
+/// Mechanical delivery class preserved opaquely on one replay event.
+///
+/// This is delivery mechanics only: ORS never interprets payload meaning from
+/// it, and semantic observation ownership stays with its owner.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum WorkerReplayDeliveryClass {
+    DurableControl,
+    DurableObservation,
+    BestEffortTelemetry,
+}
+
+/// Acquisition request for one durable replay request identity.
+///
+/// Lookup with this identity acquires nothing; begin atomically acquires or
+/// reports the durable conflict. The numeric binding travels with the request
+/// so the store can reject a stale generation/epoch/fence against the bound
+/// claim without trusting the caller.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerReplayBegin {
+    pub stream_id: String,
+    pub request_id: String,
+    pub fingerprint: String,
+    pub producer_generation: u64,
+    pub authority_epoch: u64,
+    pub fence_digest: String,
+}
+
+impl WorkerReplayBegin {
+    pub(crate) fn validate(&self) -> Result<(), OrsError> {
+        parse_replay_stream_id(&self.stream_id)?;
+        validate_text(&self.request_id, "worker_replay_request_id")?;
+        validate_text(&self.fingerprint, "worker_replay_fingerprint")?;
+        if self.producer_generation == 0 || self.authority_epoch == 0 {
+            return Err(OrsError::InvalidField {
+                field: "worker_replay_epoch",
+                reason: "generation and epoch must be greater than zero",
+            });
+        }
+        validate_digest(&self.fence_digest, "worker_replay_fence_digest")?;
+        Ok(())
+    }
+}
+
+/// Exact event content handed to the durable replay owner.
+///
+/// Every identity is opaque to ORS: the producer, request, payload label, and
+/// payload bytes are preserved exactly for replay comparison and never
+/// interpreted. The owner receipt disposition is preserved opaquely; the
+/// Kernel admission owner validates it and ORS never re-derives control
+/// meaning from it.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerReplayDraft {
+    pub stream_id: String,
+    pub producer_id: String,
+    pub producer_generation: u64,
+    pub authority_epoch: u64,
+    pub fence_digest: String,
+    pub request_id: String,
+    pub causal_predecessor_refs: Vec<String>,
+    pub delivery_class: WorkerReplayDeliveryClass,
+    pub ack_required: bool,
+    pub payload_type: String,
+    pub payload: String,
+    pub disposition: ReceiptDisposition,
+    pub trace_context: BTreeMap<String, String>,
+}
+
+impl WorkerReplayDraft {
+    pub(crate) fn validate(&self) -> Result<(), OrsError> {
+        parse_replay_stream_id(&self.stream_id)?;
+        validate_text(&self.producer_id, "worker_replay_producer_id")?;
+        validate_text(&self.request_id, "worker_replay_request_id")?;
+        if self.producer_generation == 0 || self.authority_epoch == 0 {
+            return Err(OrsError::InvalidField {
+                field: "worker_replay_epoch",
+                reason: "generation and epoch must be greater than zero",
+            });
+        }
+        validate_digest(&self.fence_digest, "worker_replay_fence_digest")?;
+        validate_text(&self.payload_type, "worker_replay_payload_type")?;
+        let payload_len =
+            u64::try_from(self.payload.len()).map_err(|_| OrsError::PayloadTooLarge)?;
+        if payload_len > MAX_INLINE_RECOVERY_BYTES {
+            return Err(OrsError::PayloadTooLarge);
+        }
+        if self.causal_predecessor_refs.len() > MAX_REPLAY_EVENT_REFS {
+            return Err(OrsError::InvalidField {
+                field: "worker_replay_causal_predecessor_refs",
+                reason: "causal predecessor references exceed the retained bound",
+            });
+        }
+        for reference in &self.causal_predecessor_refs {
+            validate_text(reference, "worker_replay_causal_predecessor_ref")?;
+        }
+        if self.trace_context.len() > MAX_REPLAY_TRACE_ENTRIES {
+            return Err(OrsError::InvalidField {
+                field: "worker_replay_trace_context",
+                reason: "trace context exceeds the retained bound",
+            });
+        }
+        for (key, value) in &self.trace_context {
+            validate_text(key, "worker_replay_trace_key")?;
+            validate_text(value, "worker_replay_trace_value")?;
+        }
+        Ok(())
+    }
+
+    /// Canonical digest over the exact draft binding used for append
+    /// idempotency: an identical draft replays the same durable identity and
+    /// sequence instead of duplicating the event.
+    pub(crate) fn draft_digest(&self) -> Result<String, OrsError> {
+        let canonical = serde_json::json!({
+            "ack_required": self.ack_required,
+            "authority_epoch": self.authority_epoch,
+            "causal_predecessor_refs": self.causal_predecessor_refs,
+            "delivery_class": self.delivery_class,
+            "disposition": self.disposition,
+            "fence_digest": self.fence_digest,
+            "payload": self.payload,
+            "payload_type": self.payload_type,
+            "producer_generation": self.producer_generation,
+            "producer_id": self.producer_id,
+            "request_id": self.request_id,
+            "stream_id": self.stream_id,
+            "trace_context": self.trace_context,
+        });
+        let bytes = canonical_json_bytes(&canonical)
+            .map_err(|error| OrsError::Encoding(error.to_string()))?;
+        Ok(sha256_hex(&bytes))
+    }
+}
+
+/// Durable replay event envelope returned by the replay owner.
+///
+/// The `event_id` and `sequence` are assigned atomically by ORS on append:
+/// the sequence is monotonic per stream starting at 1, and the identity is
+/// stable across close/reopen. The `fingerprint` is the request fingerprint
+/// bound at acquisition, copied here for locality.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerReplayEvent {
+    pub contract_version: u16,
+    pub stream_id: String,
+    pub event_id: String,
+    pub sequence: u64,
+    pub request_id: String,
+    pub fingerprint: String,
+    pub producer_id: String,
+    pub producer_generation: u64,
+    pub authority_epoch: u64,
+    pub fence_digest: String,
+    pub causal_predecessor_refs: Vec<String>,
+    pub delivery_class: WorkerReplayDeliveryClass,
+    pub ack_required: bool,
+    pub payload_type: String,
+    pub payload: String,
+    pub disposition: ReceiptDisposition,
+    pub trace_context: BTreeMap<String, String>,
+    pub draft_digest: String,
+    pub durable_at_unix_ms: u64,
+}
+
+impl WorkerReplayEvent {
+    /// Returns the durable key binding one stream to one exact sequence.
+    /// The separator is a control character that validated identities can
+    /// never contain, so composite keys cannot collide.
+    pub fn record_key(&self) -> String {
+        Self::key_for(&self.stream_id, self.sequence)
+    }
+
+    pub(crate) fn key_for(stream_id: &str, sequence: u64) -> String {
+        format!("{stream_id}\u{1f}{sequence:020}")
+    }
+
+    pub(crate) fn key_prefix_for(stream_id: &str) -> String {
+        format!("{stream_id}\u{1f}")
+    }
+
+    /// Validates identity shape and stream/binding coherence.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        if self.contract_version != CONTRACT_VERSION {
+            return Err(OrsError::UnsupportedContractVersion(self.contract_version));
+        }
+        let (_, stream_generation) = parse_replay_stream_id(&self.stream_id)?;
+        validate_text(&self.event_id, "worker_replay_event_id")?;
+        validate_text(&self.request_id, "worker_replay_request_id")?;
+        validate_text(&self.fingerprint, "worker_replay_fingerprint")?;
+        validate_text(&self.producer_id, "worker_replay_producer_id")?;
+        validate_text(&self.payload_type, "worker_replay_payload_type")?;
+        if self.sequence == 0 {
+            return Err(OrsError::InvalidField {
+                field: "worker_replay_sequence",
+                reason: "sequence must be greater than zero",
+            });
+        }
+        if self.producer_generation == 0 || self.authority_epoch == 0 {
+            return Err(OrsError::InvalidField {
+                field: "worker_replay_epoch",
+                reason: "generation and epoch must be greater than zero",
+            });
+        }
+        if stream_generation != self.producer_generation {
+            return Err(OrsError::InvalidField {
+                field: "worker_replay_generation",
+                reason: "stream generation and producer generation must agree",
+            });
+        }
+        validate_digest(&self.fence_digest, "worker_replay_fence_digest")?;
+        validate_digest(&self.draft_digest, "worker_replay_draft_digest")?;
+        let payload_len =
+            u64::try_from(self.payload.len()).map_err(|_| OrsError::PayloadTooLarge)?;
+        if payload_len > MAX_INLINE_RECOVERY_BYTES {
+            return Err(OrsError::PayloadTooLarge);
+        }
+        if self.causal_predecessor_refs.len() > MAX_REPLAY_EVENT_REFS {
+            return Err(OrsError::InvalidField {
+                field: "worker_replay_causal_predecessor_refs",
+                reason: "causal predecessor references exceed the retained bound",
+            });
+        }
+        for reference in &self.causal_predecessor_refs {
+            validate_text(reference, "worker_replay_causal_predecessor_ref")?;
+        }
+        if self.trace_context.len() > MAX_REPLAY_TRACE_ENTRIES {
+            return Err(OrsError::InvalidField {
+                field: "worker_replay_trace_context",
+                reason: "trace context exceeds the retained bound",
+            });
+        }
+        for (key, value) in &self.trace_context {
+            validate_text(key, "worker_replay_trace_key")?;
+            validate_text(value, "worker_replay_trace_value")?;
+        }
+        if self.durable_at_unix_ms == 0 {
+            return Err(OrsError::InvalidField {
+                field: "worker_replay_durable_at",
+                reason: "durability time must be greater than zero",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Durable per-stream replay head: cursors plus the next sequence.
+///
+/// The producer cursor is the newest DURABLE sequence, the consumer cursor
+/// the newest APPLIED-or-REJECTED sequence, and `next_sequence` the sequence
+/// the next append assigns. All three survive close/reopen in redb.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerReplayStreamRecord {
+    pub contract_version: u16,
+    pub stream_id: String,
+    pub claim_id: OperationIdentity,
+    pub worker_generation: u64,
+    pub producer_cursor: u64,
+    pub consumer_cursor: u64,
+    pub next_sequence: u64,
+}
+
+impl WorkerReplayStreamRecord {
+    /// Validates identity shape and cursor/sequence coherence.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        if self.contract_version != CONTRACT_VERSION {
+            return Err(OrsError::UnsupportedContractVersion(self.contract_version));
+        }
+        let (claim_id, stream_generation) = parse_replay_stream_id(&self.stream_id)?;
+        if claim_id != self.claim_id || stream_generation != self.worker_generation {
+            return Err(OrsError::InvalidField {
+                field: "worker_replay_stream_binding",
+                reason: "stream identity must bind its claim and generation",
+            });
+        }
+        if self.worker_generation == 0 {
+            return Err(OrsError::InvalidField {
+                field: "worker_replay_generation",
+                reason: "generation must be greater than zero",
+            });
+        }
+        if self.next_sequence == 0 {
+            return Err(OrsError::InvalidField {
+                field: "worker_replay_next_sequence",
+                reason: "next sequence must be greater than zero",
+            });
+        }
+        if self.producer_cursor >= self.next_sequence || self.consumer_cursor >= self.next_sequence
+        {
+            return Err(OrsError::InvalidField {
+                field: "worker_replay_cursor",
+                reason: "cursors must stay below the next sequence",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Durable acquisition of one `(stream, request)` identity.
+///
+/// The first writer wins: the fingerprint bound here rejects every later
+/// changed binding under the same identity without overwriting.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerReplayRequestRecord {
+    pub stream_id: String,
+    pub request_id: String,
+    pub fingerprint: String,
+    pub producer_generation: u64,
+    pub authority_epoch: u64,
+    pub fence_digest: String,
+    pub acquired_at_unix_ms: u64,
+}
+
+impl WorkerReplayRequestRecord {
+    /// Returns the durable key binding one stream to one exact request.
+    pub fn record_key(&self) -> String {
+        Self::key_for(&self.stream_id, &self.request_id)
+    }
+
+    pub(crate) fn key_for(stream_id: &str, request_id: &str) -> String {
+        format!("{stream_id}\u{1f}{request_id}")
+    }
+
+    /// Validates identity shape and binding coherence.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        let (_, stream_generation) = parse_replay_stream_id(&self.stream_id)?;
+        validate_text(&self.request_id, "worker_replay_request_id")?;
+        validate_text(&self.fingerprint, "worker_replay_fingerprint")?;
+        if self.producer_generation == 0 || self.authority_epoch == 0 {
+            return Err(OrsError::InvalidField {
+                field: "worker_replay_epoch",
+                reason: "generation and epoch must be greater than zero",
+            });
+        }
+        if stream_generation != self.producer_generation {
+            return Err(OrsError::InvalidField {
+                field: "worker_replay_generation",
+                reason: "stream generation and producer generation must agree",
+            });
+        }
+        validate_digest(&self.fence_digest, "worker_replay_fence_digest")?;
+        if self.acquired_at_unix_ms == 0 {
+            return Err(OrsError::InvalidField {
+                field: "worker_replay_acquired_at",
+                reason: "acquisition time must be greater than zero",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Acknowledgement of one durable replay event.
+///
+/// Every field must bind the stored event exactly: a foreign acknowledgement
+/// (wrong stream, event, generation, epoch, or fence) is rejected and never
+/// moves a cursor.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerReplayAck {
+    pub stream_id: String,
+    pub event_id: String,
+    pub sequence: u64,
+    pub producer_generation: u64,
+    pub authority_epoch: u64,
+    pub fence_digest: String,
+    pub phase: WorkerReplayPhase,
+}
+
+impl WorkerReplayAck {
+    pub(crate) fn validate(&self) -> Result<(), OrsError> {
+        let (_, stream_generation) = parse_replay_stream_id(&self.stream_id)?;
+        validate_text(&self.event_id, "worker_replay_event_id")?;
+        if self.sequence == 0 {
+            return Err(OrsError::InvalidField {
+                field: "worker_replay_sequence",
+                reason: "sequence must be greater than zero",
+            });
+        }
+        if self.producer_generation == 0 || self.authority_epoch == 0 {
+            return Err(OrsError::InvalidField {
+                field: "worker_replay_epoch",
+                reason: "generation and epoch must be greater than zero",
+            });
+        }
+        if stream_generation != self.producer_generation {
+            return Err(OrsError::InvalidField {
+                field: "worker_replay_generation",
+                reason: "stream generation and producer generation must agree",
+            });
+        }
+        validate_digest(&self.fence_digest, "worker_replay_fence_digest")?;
+        Ok(())
+    }
+}
+
+/// Durable per-event acknowledgement fact.
+///
+/// One record per acknowledged `(stream, sequence)`, keyed exactly like its
+/// event. Later phases overwrite the retained phase (DURABLE then APPLIED is
+/// the normal lifecycle across two acknowledgements); cursors only move
+/// forward under the phase rule, so reordering never regresses them.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerReplayAckRecord {
+    pub stream_id: String,
+    pub event_id: String,
+    pub sequence: u64,
+    pub phase: WorkerReplayPhase,
+    pub acknowledged_at_unix_ms: u64,
+}
+
+impl WorkerReplayAckRecord {
+    /// Returns the durable key binding one acknowledgement to its event.
+    pub fn record_key(&self) -> String {
+        WorkerReplayEvent::key_for(&self.stream_id, self.sequence)
+    }
+
+    /// Validates identity shape.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        parse_replay_stream_id(&self.stream_id)?;
+        validate_text(&self.event_id, "worker_replay_event_id")?;
+        if self.sequence == 0 {
+            return Err(OrsError::InvalidField {
+                field: "worker_replay_sequence",
+                reason: "sequence must be greater than zero",
+            });
+        }
+        if self.acknowledged_at_unix_ms == 0 {
+            return Err(OrsError::InvalidField {
+                field: "worker_replay_acknowledged_at",
+                reason: "acknowledgement time must be greater than zero",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Result of a replay-request lookup or atomic acquisition.
+///
+/// `New` carries no durable state: lookup acquired nothing and begin durably
+/// acquired for the first time. `Replay` carries the request's retained
+/// events in sequence order, so a retained acquisition after a crash is never
+/// mistaken for a fresh request. `Conflict` reports a changed fingerprint
+/// under a retained identity without overwriting it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WorkerReplayRequestDecision {
+    New,
+    Replay(Vec<WorkerReplayEvent>),
+    Conflict,
+}
+
+/// Durable per-stream cursor projection returned by acknowledgement.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerReplayCursors {
+    pub stream_id: String,
+    pub producer_cursor: u64,
+    pub consumer_cursor: u64,
+}
+
+/// Requires the presented stream binding to equal the bound claim.
+///
+/// The stream suffix, the presented generation, the claim's bound generation,
+/// the presented epoch, the claim's bound epoch, and the fence binding must
+/// all agree exactly. Reads never call this; every mutating replay path does,
+/// against the existing claim record, read-only. A missing claim, a rotated
+/// generation, or a disagreeing epoch/fence fails closed: the caller never
+/// executes under a stale epoch.
+pub(crate) fn require_replay_claim_binding(
+    stream_id: &str,
+    producer_generation: u64,
+    authority_epoch: u64,
+    fence_digest: &str,
+    claim: &NativeWorkerClaimRecord,
+) -> Result<(), OrsError> {
+    let (claim_id, stream_generation) = parse_replay_stream_id(stream_id)?;
+    if claim.claim_id != claim_id
+        || stream_generation != producer_generation
+        || producer_generation != claim.worker_generation
+        || authority_epoch != claim.authority_epoch
+        || fence_digest != claim.fence_digest
+    {
+        return Err(OrsError::WorkerReplayStaleStream {
+            stream_id: stream_id.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Returns true when an acknowledgement phase makes an event eligible for
+/// retention pruning. Only APPLIED or REJECTED events prune; UNKNOWN stays
+/// reconciling under its original identity.
+pub(crate) const fn is_replay_terminal_phase(phase: WorkerReplayPhase) -> bool {
+    phase.advances_consumer_cursor()
+}
+
+// ---------------------------------------------------------------------------
+// T9-04 provider-capability read projection (issue #1108, M2 supplier core).
+//
+// Read-only lookup identity for resolving one durable claim row from the
+// exact claim/attempt/operation triple carried by a provider-capability
+// proof. This adds no new authority table and no write path: the claim row
+// stays the single durable binding, and this projection only names the row a
+// reverse scan must agree with byte-for-byte.
+//
+// Residual: there is deliberately no `executable_binding_digest` column here
+// (no write migration in this slice). The executable digest is presented per
+// call by daemon composition and compared for equality against the durable
+// claim binding material, exactly like the T9-02 presented-expectation
+// pattern — never trusted by value.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderCapabilityLookup {
+    /// Durable claim identity under which the proof is presented.
+    pub claim_id: String,
+    /// Attempt identity the proof claims to bind.
+    pub attempt_id: String,
+    /// Exact external-effect operation identity the proof claims to bind.
+    pub operation_id: String,
+}
+
+impl ProviderCapabilityLookup {
+    /// Validates the bounded lookup shape without consulting any authority.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        validate_text(&self.claim_id, "provider_capability_claim_id")?;
+        validate_text(&self.attempt_id, "provider_capability_attempt_id")?;
+        validate_text(&self.operation_id, "provider_capability_operation_id")?;
+        Ok(())
+    }
+
+    /// Returns true only when a durable claim row carries exactly this
+    /// claim/attempt/operation identity.
+    ///
+    /// All three comparisons are exact strings: attempt and operation labels
+    /// are opaque to ORS (same opacity as on the claim row), so a foreign
+    /// attempt or operation under a known claim identity never matches.
+    pub fn matches(&self, record: &NativeWorkerClaimRecord) -> bool {
+        record.claim_id.as_str() == self.claim_id
+            && record.attempt_id.as_str() == self.attempt_id
+            && record.operation_id.as_str() == self.operation_id
     }
 }

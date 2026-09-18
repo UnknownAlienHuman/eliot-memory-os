@@ -5,7 +5,7 @@ This generated projection exposes the `ARCH-*` identifiers defined by the
 canonical A16.1 table. It is navigation and validation data, not a third
 normative source.
 
-- Normative pair: `sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b`
+- Normative pair: `sha256:3ea4dc3442f03d3a0020380854d45cdf20c9d5098197e0bfe1e80cf6f2b805ea`
 - Canonical table: [`A16-01-decision-anchors.md`](A16-01-decision-anchors.md#a161-decision-anchors)
 - Canonical table SHA-256: `8ecdc335274e5f9d9f67ffa9fcce535a7d3049e0b03af461a3ab9c362b89058c`
 - Architecture source SHA-256: `c6932eaf26935e752eefb4de591afc91ea1a7180be5a8ff0005554b8029bac1a`

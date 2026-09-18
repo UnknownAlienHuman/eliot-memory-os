@@ -98,7 +98,7 @@ impl ObservedCue {
     /// Rejects a blank observed value and an oversized one.
     pub fn validate(&self) -> Result<(), CueContractError> {
         const MAX_OBSERVED_BYTES: usize = 8192;
-        if self.schema_revision != crate::CONTRACT_REVISION {
+        if !crate::is_supported_schema_revision(&self.schema_revision) {
             return Err(CueContractError::InvalidText {
                 field: "schema_revision",
             });

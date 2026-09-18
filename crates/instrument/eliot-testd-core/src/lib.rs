@@ -7,10 +7,14 @@
 
 #![forbid(unsafe_code)]
 
+use eliot_contracts::EpochId;
+pub use eliot_instrument_api::KernelProcessAdmissionRequest;
 use eliot_instrument_api::{
     ExecutionStatus, InstrumentInvocation, InstrumentKind, VerificationRun,
 };
-use eliot_process::ProcessRequest;
+use eliot_process::{
+    EnvironmentInheritance, EnvironmentProjection, ProcessRequest, ResourceLimits,
+};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -20,6 +24,305 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use uuid::Uuid;
+
+mod claim;
+
+pub use claim::{
+    ClaimBindingExpectation, ExpiredRunningReconciliation, reconcile_expired_running,
+    validate_claim_binding,
+};
+
+// ---- Closed testd profile to executable binding registry (issue #20) ----
+//
+// Testd executes only admitted typed Instrument profiles bound to exact
+// executable/environment/artifact/State Fence identities. This registry is
+// the closed profile side of that binding: it maps one admitted profile
+// name to its exact executable meaning. The Doctor design is mirrored
+// (`RepairRecipeManifest` in `eliot-doctor-core`): a closed registry, a
+// per-definition digest, resolution that fails closed on unregistered
+// names, and no public constructor from free-form text.
+//
+// * `profile` is the closed name below; anything else is refused at
+//   registration (`TestdStore::submit`) and at every Drive gate.
+// * `package_artifact_digest` is the lowercase SHA-256 of the installed
+//   tool file bytes, recorded at registration from the installed tool
+//   itself (the Drive resolves the relative program through the platform
+//   tool locator and hashes the file; no digest is hardcoded, because the
+//   installed bytes differ per host).
+// * `program_path` is relative and closed (`cargo` only): absolute paths
+//   and parent traversal are refused, so no caller can redirect execution
+//   by path.
+// * `fixed_argv` is the complete argv. This slice's single profile takes
+//   no typed slots, so any invocation-supplied argument is refused at
+//   registration: there is no caller passthrough. A future profile with
+//   typed slots arrives as a new registry entry with its own slot
+//   validation, never by widening this one.
+// * `env_allowlist` is the exact non-secret environment for the child.
+//   This profile takes none (`EnvironmentInheritance::None` with an empty
+//   map): the bounded probe needs no environment, so none is supplied.
+// * the working directory is never stored here: the Drive always uses the
+//   generation root supplied with the admitted material, never a
+//   caller-chosen directory.
+// * the timeout/output caps are fixed below and bound into the definition
+//   digest, so a widened execution window cannot substitute silently.
+//
+// Two digests separate the host-stable meaning from the installed bytes:
+// [`testd_definition_digest`] covers the static fields only and is bound
+// into the Kernel front-door admission (`TestdAdmission` in
+// `eliot-kernel-service`); [`testd_binding_digest`] additionally covers
+// the installed artifact digest and binds one Drive registration.
+
+/// The single admitted testd profile in this slice.
+///
+/// The name keeps the established `cargo-test` instrument profile spelling
+/// already used across testd fixtures; in this slice it executes the
+/// bounded `cargo --version` tool probe. A real `cargo test` execution with
+/// scoped arguments arrives as a new profile, never by widening this one.
+pub const TESTD_ADMITTED_PROFILE: &str = "cargo-test";
+/// Relative program for the admitted probe, resolved through the platform
+/// tool locator at Drive time. Never absolute, never parent traversal.
+pub const TESTD_PROFILE_PROGRAM: &str = "cargo";
+/// Fixed argv for the admitted probe. No caller slot exists.
+pub const TESTD_PROFILE_ARGV: &[&str] = &["--version"];
+/// Bounded wall timeout for the probe, in milliseconds.
+pub const TESTD_PROFILE_WALL_TIMEOUT_MS: u64 = 15_000;
+/// Bounded CPU ceiling for the probe, in milliseconds.
+pub const TESTD_PROFILE_CPU_TIME_MS: u64 = 5_000;
+/// Bounded memory ceiling for the probe, in bytes.
+pub const TESTD_PROFILE_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
+/// Bounded stdout capture for the probe, in bytes.
+pub const TESTD_PROFILE_STDOUT_BYTES: u64 = 64 * 1024;
+/// Bounded stderr capture for the probe, in bytes.
+pub const TESTD_PROFILE_STDERR_BYTES: u64 = 64 * 1024;
+/// Bounded descendant ceiling for the probe.
+pub const TESTD_PROFILE_MAX_DESCENDANTS: u32 = 4;
+
+/// Closed executable binding for one admitted testd profile.
+///
+/// Values are produced only by [`testd_profile_binding`] against the
+/// closed registry above. There is no public constructor from free-form
+/// text, so an unregistered profile or widened argv/environment/limit
+/// cannot be named here.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestdExecutableBinding {
+    /// Closed admitted profile name.
+    pub profile: String,
+    /// Lowercase SHA-256 of the installed tool file bytes, recorded at
+    /// registration from the installed tool itself.
+    pub package_artifact_digest: String,
+    /// Relative program path (`cargo` only).
+    pub program_path: String,
+    /// Complete fixed argv (`--version` only).
+    pub fixed_argv: Vec<String>,
+    /// Exact non-secret environment allowlist (empty for this profile).
+    pub env_allowlist: Vec<String>,
+    /// Bounded wall timeout, in milliseconds.
+    pub wall_timeout_ms: u64,
+    /// Bounded CPU ceiling, in milliseconds.
+    pub cpu_time_ms: Option<u64>,
+    /// Bounded memory ceiling, in bytes.
+    pub memory_bytes: Option<u64>,
+    /// Bounded stdout capture, in bytes.
+    pub stdout_bytes: u64,
+    /// Bounded stderr capture, in bytes.
+    pub stderr_bytes: u64,
+    /// Bounded descendant ceiling.
+    pub max_descendants: u32,
+}
+
+impl TestdExecutableBinding {
+    /// Validates the closed binding shape.
+    pub fn validate(&self) -> Result<(), TestdError> {
+        if self.profile != TESTD_ADMITTED_PROFILE {
+            return Err(TestdError::Invalid {
+                field: "profile",
+                reason: "testd admits only the closed cargo-test tool-probe profile",
+            });
+        }
+        if !is_binding_digest(&self.package_artifact_digest) {
+            return Err(TestdError::Invalid {
+                field: "package_artifact_digest",
+                reason: "must be a lowercase SHA-256 digest",
+            });
+        }
+        // Closed by equality: the admitted program is relative by
+        // construction, so absolute paths and parent traversal have no
+        // spelling that validates.
+        if self.program_path != TESTD_PROFILE_PROGRAM {
+            return Err(TestdError::Invalid {
+                field: "program_path",
+                reason: "testd admits only the closed relative tool program",
+            });
+        }
+        let expected_argv: Vec<String> =
+            TESTD_PROFILE_ARGV.iter().map(ToString::to_string).collect();
+        if self.fixed_argv != expected_argv {
+            return Err(TestdError::Invalid {
+                field: "fixed_argv",
+                reason: "the admitted profile takes fixed argv; caller arguments are refused",
+            });
+        }
+        if !self.env_allowlist.is_empty() {
+            return Err(TestdError::Invalid {
+                field: "env_allowlist",
+                reason: "the admitted profile takes no environment passthrough",
+            });
+        }
+        if self.wall_timeout_ms != TESTD_PROFILE_WALL_TIMEOUT_MS
+            || self.cpu_time_ms != Some(TESTD_PROFILE_CPU_TIME_MS)
+            || self.memory_bytes != Some(TESTD_PROFILE_MEMORY_BYTES)
+            || self.stdout_bytes != TESTD_PROFILE_STDOUT_BYTES
+            || self.stderr_bytes != TESTD_PROFILE_STDERR_BYTES
+            || self.max_descendants != TESTD_PROFILE_MAX_DESCENDANTS
+        {
+            return Err(TestdError::Invalid {
+                field: "resource_limits",
+                reason: "the admitted profile takes fixed timeout and output caps",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Returns true only for the closed admitted testd profile name.
+#[must_use]
+pub fn is_admitted_testd_profile(profile: &str) -> bool {
+    profile == TESTD_ADMITTED_PROFILE
+}
+
+/// Resolves the closed binding for one admitted profile.
+///
+/// The artifact digest is the caller's recorded SHA-256 of the installed
+/// tool file bytes (see [`resolve_testd_tool_digest`] on the bins side);
+/// it is shape-checked here and bound into [`testd_binding_digest`].
+/// An unregistered profile fails with `Invalid` and can never execute.
+pub fn testd_profile_binding(
+    profile: &str,
+    package_artifact_digest: &str,
+) -> Result<TestdExecutableBinding, TestdError> {
+    let binding = TestdExecutableBinding {
+        profile: profile.to_owned(),
+        package_artifact_digest: package_artifact_digest.to_owned(),
+        program_path: TESTD_PROFILE_PROGRAM.to_owned(),
+        fixed_argv: TESTD_PROFILE_ARGV.iter().map(ToString::to_string).collect(),
+        env_allowlist: Vec::new(),
+        wall_timeout_ms: TESTD_PROFILE_WALL_TIMEOUT_MS,
+        cpu_time_ms: Some(TESTD_PROFILE_CPU_TIME_MS),
+        memory_bytes: Some(TESTD_PROFILE_MEMORY_BYTES),
+        stdout_bytes: TESTD_PROFILE_STDOUT_BYTES,
+        stderr_bytes: TESTD_PROFILE_STDERR_BYTES,
+        max_descendants: TESTD_PROFILE_MAX_DESCENDANTS,
+    };
+    binding.validate()?;
+    Ok(binding)
+}
+
+/// Canonical definition digest over the static binding fields.
+///
+/// Excludes the per-host artifact digest, so the value is stable across
+/// hosts and can be bound into the Kernel front-door admission. The
+/// canonical shape (field names and JSON representation) must stay
+/// identical to `testd_profile_definition_digest` in
+/// `crates/kernel/eliot-kernel-service/src/testd_front_door.rs`, which
+/// mirrors these constants without a dependency: `canonical_json_bytes`
+/// sorts object keys, so only the field set and values must agree.
+pub fn testd_definition_digest() -> Result<String, TestdError> {
+    #[derive(Serialize)]
+    struct Canonical<'a> {
+        cpu_time_ms: Option<u64>,
+        env_allowlist: &'a [String],
+        fixed_argv: &'a [String],
+        max_descendants: u32,
+        memory_bytes: Option<u64>,
+        profile: &'a str,
+        program_path: &'a str,
+        stderr_bytes: u64,
+        stdout_bytes: u64,
+        wall_timeout_ms: u64,
+    }
+    let empty: Vec<String> = Vec::new();
+    let argv: Vec<String> = TESTD_PROFILE_ARGV.iter().map(ToString::to_string).collect();
+    let canonical = Canonical {
+        cpu_time_ms: Some(TESTD_PROFILE_CPU_TIME_MS),
+        env_allowlist: &empty,
+        fixed_argv: &argv,
+        max_descendants: TESTD_PROFILE_MAX_DESCENDANTS,
+        memory_bytes: Some(TESTD_PROFILE_MEMORY_BYTES),
+        profile: TESTD_ADMITTED_PROFILE,
+        program_path: TESTD_PROFILE_PROGRAM,
+        stderr_bytes: TESTD_PROFILE_STDERR_BYTES,
+        stdout_bytes: TESTD_PROFILE_STDOUT_BYTES,
+        wall_timeout_ms: TESTD_PROFILE_WALL_TIMEOUT_MS,
+    };
+    eliot_contracts::canonical_json_bytes(&canonical)
+        .map(|bytes| eliot_contracts::sha256_hex(&bytes))
+        .map_err(|_| TestdError::GrantDigestSerialization)
+}
+
+/// Canonical digest over the full binding including the installed
+/// artifact digest. Binds one Drive registration to its exact installed
+/// bytes; a substituted executable fails the comparison.
+pub fn testd_binding_digest(binding: &TestdExecutableBinding) -> Result<String, TestdError> {
+    binding.validate()?;
+    eliot_contracts::canonical_json_bytes(binding)
+        .map(|bytes| eliot_contracts::sha256_hex(&bytes))
+        .map_err(|_| TestdError::GrantDigestSerialization)
+}
+
+/// Proves a presented binding digest names exactly this binding.
+/// A tampered binding (substituted digest, argv, program, environment,
+/// or caps) fails with `InvalidBinding` and executes nothing.
+pub fn validate_testd_binding_digest(
+    binding: &TestdExecutableBinding,
+    expected: &str,
+) -> Result<(), TestdError> {
+    if testd_binding_digest(binding)? != expected {
+        return Err(TestdError::InvalidBinding);
+    }
+    Ok(())
+}
+
+/// Builds the closed resource limits for one validated binding.
+pub fn testd_profile_resource_limits(
+    binding: &TestdExecutableBinding,
+) -> Result<ResourceLimits, TestdError> {
+    binding.validate()?;
+    ResourceLimits::new(
+        binding.wall_timeout_ms,
+        binding.cpu_time_ms,
+        binding.memory_bytes,
+        binding.stdout_bytes,
+        binding.stderr_bytes,
+        binding.max_descendants,
+    )
+    .map_err(|error| TestdError::Contract(error.to_string()))
+}
+
+/// Builds the closed environment projection for one validated binding:
+/// no inherited values and no supplied values for this profile.
+pub fn testd_profile_environment(
+    binding: &TestdExecutableBinding,
+) -> Result<EnvironmentProjection, TestdError> {
+    binding.validate()?;
+    EnvironmentProjection::new(
+        binding
+            .env_allowlist
+            .iter()
+            .map(|key| (key.clone(), String::new()))
+            .collect(),
+        Vec::new(),
+        EnvironmentInheritance::None,
+    )
+    .map_err(|error| TestdError::Contract(error.to_string()))
+}
+
+fn is_binding_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
 
 const JOBS: TableDefinition<&str, &[u8]> = TableDefinition::new("testd_jobs_v1");
 const EVENTS: TableDefinition<&str, &[u8]> = TableDefinition::new("testd_events_v1");
@@ -117,7 +420,7 @@ pub struct ProcessAdmission {
     pub operation_id: String,
     pub process_tree_id: String,
     pub generation: u64,
-    pub authority_epoch: u64,
+    pub authority_epoch: EpochId,
     pub invocation_digest: String,
 }
 
@@ -128,42 +431,9 @@ impl ProcessAdmission {
             operation_id: request.operation_id().as_str().to_owned(),
             process_tree_id: request.process_tree_id().as_str().to_owned(),
             generation: request.generation().get(),
-            authority_epoch: request.fence().authority_epoch(),
+            authority_epoch: request.fence().authority_epoch().clone(),
             invocation_digest: request.invocation_digest().to_owned(),
         }
-    }
-}
-
-/// Neutral request delivered to the injected Kernel/Governor admission port.
-///
-/// This is an inert description only. It contains no contour authority and
-/// cannot be used to construct a process permit without the core sealing
-/// boundary below.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct KernelProcessAdmissionRequest {
-    pub job_id: String,
-    pub project_id: String,
-    pub invocation: InstrumentInvocation,
-    pub source_root: String,
-    pub target_root: String,
-    pub cache_root: String,
-}
-
-impl KernelProcessAdmissionRequest {
-    fn validate(&self) -> Result<(), TestdError> {
-        validate_text(&self.job_id, "job_id")?;
-        validate_text(&self.project_id, "project_id")?;
-        for (field, value) in [
-            ("source_root", self.source_root.as_str()),
-            ("target_root", self.target_root.as_str()),
-            ("cache_root", self.cache_root.as_str()),
-        ] {
-            validate_text(value, field)?;
-        }
-        self.invocation
-            .validate()
-            .map_err(|error| TestdError::Contract(error.to_string()))
     }
 }
 
@@ -196,7 +466,9 @@ pub fn issue_process_admission(
     provider: &dyn KernelProcessAdmissionProvider,
     request: &KernelProcessAdmissionRequest,
 ) -> Result<ProcessAdmissionPermit, TestdError> {
-    request.validate()?;
+    request
+        .validate()
+        .map_err(|error| TestdError::Contract(error.to_string()))?;
     let evidence = provider.admit(request)?;
     evidence
         .process
@@ -218,13 +490,11 @@ pub fn issue_process_admission(
             .non_secret()
             .get("CARGO_HOME")
             != Some(&request.cache_root)
-        || evidence.process.fence().authority_epoch()
-            != request
-                .invocation
-                .request
-                .state_fence
-                .authority_epoch
-                .value()
+        || !evidence
+            .process
+            .fence()
+            .authority_epoch()
+            .is_same_authority(&request.invocation.request.state_fence.authority_epoch)
         || evidence.process.generation().get()
             != request
                 .invocation
@@ -258,7 +528,7 @@ pub struct ExecutionContourGrant {
     invocation_id: String,
     operation_id: String,
     process_tree_id: String,
-    authority_epoch: u64,
+    authority_epoch: EpochId,
     resource_generation: u64,
     grant_id: String,
     grant_digest: String,
@@ -284,7 +554,7 @@ impl ExecutionContourGrant {
             invocation_id: invocation_id.into(),
             operation_id: process.operation_id().as_str().to_owned(),
             process_tree_id: process.process_tree_id().as_str().to_owned(),
-            authority_epoch: process.fence().authority_epoch(),
+            authority_epoch: process.fence().authority_epoch().clone(),
             resource_generation: process.generation().get(),
             grant_id: grant_id.into(),
             grant_digest: String::new(),
@@ -324,7 +594,9 @@ impl ExecutionContourGrant {
             || self.invocation_id != invocation_id
             || self.operation_id != process.operation_id().as_str()
             || self.process_tree_id != process.process_tree_id().as_str()
-            || self.authority_epoch != process.fence().authority_epoch()
+            || !self
+                .authority_epoch
+                .is_same_authority(process.fence().authority_epoch())
             || self.resource_generation != process.generation().get()
         {
             return Err(TestdError::InvalidBinding);
@@ -396,7 +668,7 @@ fn contour_grant_digest(grant: &ExecutionContourGrant) -> Result<String, TestdEr
         &grant.invocation_id,
         &grant.operation_id,
         &grant.process_tree_id,
-        grant.authority_epoch,
+        &grant.authority_epoch,
         grant.resource_generation,
         &grant.grant_id,
     ))
@@ -533,7 +805,7 @@ pub struct ReceiptBinding {
     pub operation_id: String,
     pub process_tree_id: String,
     pub generation: u64,
-    pub authority_epoch: u64,
+    pub authority_epoch: EpochId,
     pub invocation_id: String,
     pub invocation_digest: String,
     pub allowed_contour_root: String,
@@ -615,7 +887,7 @@ pub struct VerificationReceipt {
     pub operation_id: String,
     pub process_tree_id: String,
     pub generation: u64,
-    pub authority_epoch: u64,
+    pub authority_epoch: EpochId,
     pub invocation_id: String,
     pub invocation_digest: String,
     pub allowed_contour_root: String,
@@ -635,7 +907,7 @@ impl VerificationReceipt {
             operation_id: self.operation_id.clone(),
             process_tree_id: self.process_tree_id.clone(),
             generation: self.generation,
-            authority_epoch: self.authority_epoch,
+            authority_epoch: self.authority_epoch.clone(),
             invocation_id: self.invocation_id.clone(),
             invocation_digest: self.invocation_digest.clone(),
             allowed_contour_root: self.allowed_contour_root.clone(),
@@ -757,7 +1029,7 @@ impl EvidenceCollector {
             operation_id: job.process.operation_id.clone(),
             process_tree_id: job.process.process_tree_id.clone(),
             generation: job.process.generation,
-            authority_epoch: job.process.authority_epoch,
+            authority_epoch: job.process.authority_epoch.clone(),
             invocation_id: job.invocation.request.request_id.as_str().to_owned(),
             invocation_digest: job.process.invocation_digest.clone(),
             allowed_contour_root: job.target_roots.allowed_contour_root.clone(),
@@ -1009,11 +1281,30 @@ impl TestdStore {
         if !matches!(invocation.kind, InstrumentKind::Test) {
             return Err(TestdError::WrongInstrumentKind);
         }
+        // Closed-profile registration (issue #20): only the admitted
+        // tool-probe profile registers, and it takes no caller arguments:
+        // the fixed argv comes from the registry binding, never from the
+        // invocation.
+        if !is_admitted_testd_profile(&invocation.profile) {
+            return Err(TestdError::Invalid {
+                field: "invocation.profile",
+                reason: "testd admits only the closed cargo-test tool-probe profile",
+            });
+        }
+        if !invocation.arguments.is_empty() {
+            return Err(TestdError::Invalid {
+                field: "invocation.arguments",
+                reason: "the admitted profile takes fixed argv; caller arguments are refused",
+            });
+        }
         if invocation.request.request_id.as_str() != process.operation_id().as_str() {
             return Err(TestdError::InvalidBinding);
         }
-        if invocation.request.state_fence.authority_epoch.value()
-            != process.fence().authority_epoch()
+        if !invocation
+            .request
+            .state_fence
+            .authority_epoch
+            .is_same_authority(process.fence().authority_epoch())
             || invocation.request.state_fence.resource_generation.value()
                 != process.generation().get()
         {
@@ -1100,6 +1391,11 @@ impl TestdStore {
                 reason: "must be non-zero",
             });
         }
+        // Opportunistic restart recovery: fence-expired running jobs reconcile
+        // to Unknown/RetryWait on absent process evidence instead of blocking
+        // their project head forever. A reconciled job never reruns silently;
+        // it needs a fresh claim, lease, and permit binding.
+        self.reconcile_expired_running_all(now)?;
         let candidates = self.ready_heads(now)?;
         let Some(candidate) = candidates.into_iter().max_by(compare_ready) else {
             return Ok(None);
@@ -1154,6 +1450,168 @@ impl TestdStore {
         Ok(Some(job))
     }
 
+    /// Binds one claimed job to a freshly-issued process permit (preflight).
+    ///
+    /// The durable record is reloaded by id and is the only authority; a
+    /// caller-owned job is never accepted. The live lease, the stable
+    /// operation/process-tree/generation/epoch/invocation/roots tuple, and
+    /// the issuer grant binding must all match exactly, and the presented
+    /// request must pass #100 dispatch validation. On success the consuming
+    /// request is returned for the bins-side starter; this method performs no
+    /// OS start itself. Any binding failure returns a typed [`TestdError`].
+    pub fn bind_claimed_process_start(
+        &self,
+        job_id: &str,
+        lease: &Lease,
+        now: u64,
+        permit: ProcessAdmissionPermit,
+    ) -> Result<ProcessRequest, TestdError> {
+        validate_text(job_id, "job_id")?;
+        let job = self
+            .get(job_id)?
+            .ok_or_else(|| TestdError::Corrupt("job not found".to_owned()))?;
+        job.target_roots.validate()?;
+        let request = permit.request();
+        request
+            .validate()
+            .map_err(|error| TestdError::Contract(error.to_string()))?;
+        let invocation_id = job.invocation.request.request_id.as_str();
+        permit
+            .grant()
+            .validate_for_process(&job.job_id, invocation_id, request)?;
+        let target_root = request
+            .environment()
+            .non_secret()
+            .get("CARGO_TARGET_DIR")
+            .ok_or(TestdError::InvalidBinding)?;
+        let cache_root = request
+            .environment()
+            .non_secret()
+            .get("CARGO_HOME")
+            .ok_or(TestdError::InvalidBinding)?;
+        let expected = ClaimBindingExpectation {
+            operation_id: request.operation_id().as_str(),
+            process_tree_id: request.process_tree_id().as_str(),
+            generation: request.generation().get(),
+            authority_epoch: request.fence().authority_epoch(),
+            invocation_id,
+            allowed_contour_root: permit.grant().contour_root(),
+            source_root: request.working_directory(),
+            target_root: target_root.as_str(),
+            cache_root: cache_root.as_str(),
+        };
+        validate_claim_binding(&job, lease, now, &expected)?;
+        Ok(permit.into_parts().0)
+    }
+
+    /// Recovers one fence-expired running job to Unknown/RetryWait.
+    ///
+    /// Returns `Ok(None)` when the job needs no reconciliation (not running,
+    /// or still under a live fence). Otherwise the attempt is durably closed
+    /// as [`ExecutionStatus::Unknown`] with the lease cleared and bounded
+    /// retry timing applied, so a later attempt requires a fresh claim and
+    /// `bind_claimed_process_start`. The optional process lifecycle is the
+    /// process-evidence check; terminal evidence still lands on `Unknown`
+    /// because only `finish` with a validated receipt may resolve an attempt.
+    pub fn reconcile_expired(
+        &self,
+        job_id: &str,
+        now: u64,
+        evidence: Option<eliot_process::ProcessLifecycle>,
+    ) -> Result<Option<TestJob>, TestdError> {
+        validate_text(job_id, "job_id")?;
+        let job = self
+            .get(job_id)?
+            .ok_or_else(|| TestdError::Corrupt("job not found".to_owned()))?;
+        let Some(decision) = reconcile_expired_running(&job, now, evidence) else {
+            return Ok(None);
+        };
+        self.persist_expiry_reconciliation(job, now, decision)
+            .map(Some)
+    }
+
+    /// Restart sweeper for fence-expired running jobs without live evidence.
+    ///
+    /// Reconciles every running job whose fence no longer holds at `now` to
+    /// Unknown/RetryWait (or Failed once attempts are exhausted), so a daemon
+    /// restart cannot leave a project head blocked behind an orphaned lease
+    /// and can never silently rerun ambiguous work. Callers that hold live
+    /// executor evidence reconcile those jobs explicitly via
+    /// [`TestdStore::reconcile_expired`] instead.
+    pub fn reconcile_expired_running_all(&self, now: u64) -> Result<Vec<TestJob>, TestdError> {
+        let running = {
+            let read = self.database.begin_read().map_err(database)?;
+            let table = read.open_table(JOBS).map_err(database)?;
+            let mut running = Vec::new();
+            for item in table.iter().map_err(database)? {
+                let (key, value) = item.map_err(database)?;
+                let job: TestJob = serde_json::from_slice(value.value())
+                    .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+                if matches!(job.state, JobState::Running) {
+                    running.push(key.value().to_owned());
+                }
+            }
+            running
+        };
+        let mut reconciled = Vec::new();
+        for job_id in running {
+            if let Some(job) = self.reconcile_expired(&job_id, now, None)? {
+                reconciled.push(job);
+            }
+        }
+        Ok(reconciled)
+    }
+
+    fn persist_expiry_reconciliation(
+        &self,
+        mut job: TestJob,
+        now: u64,
+        decision: ExpiredRunningReconciliation,
+    ) -> Result<TestJob, TestdError> {
+        let actor = job
+            .lease
+            .as_ref()
+            .map_or("testd-reconciler", |lease| lease.owner.as_str())
+            .to_owned();
+        let previous = job.state;
+        job.execution = Some(decision.execution);
+        job.lease = None;
+        let terminal = if job.attempts < self.retry.max_attempts {
+            JobState::RetryWait
+        } else {
+            JobState::Failed
+        };
+        job.state = terminal;
+        job.not_before_ms = if terminal == JobState::RetryWait {
+            now.saturating_add(
+                self.retry.delays_ms
+                    [(job.attempts.saturating_sub(1) as usize).min(self.retry.delays_ms.len() - 1)],
+            )
+        } else {
+            now
+        };
+        job.updated_at_ms = now;
+        let write = self.database.begin_write().map_err(database)?;
+        let mut table = write.open_table(JOBS).map_err(database)?;
+        let encoded =
+            serde_json::to_vec(&job).map_err(|error| TestdError::Corrupt(error.to_string()))?;
+        table
+            .insert(job.job_id.as_str(), encoded.as_slice())
+            .map_err(database)?;
+        drop(table);
+        append_event(
+            &write,
+            &job,
+            Some(previous),
+            terminal,
+            &actor,
+            now,
+            Some(decision.reason.to_owned()),
+        )?;
+        write.commit().map_err(database)?;
+        Ok(job)
+    }
+
     /// Completes an attempt, or durably schedules a bounded retry.
     #[allow(clippy::too_many_arguments)]
     pub fn finish(
@@ -1175,6 +1633,10 @@ impl TestdStore {
             .get(job_id)?
             .ok_or_else(|| TestdError::Corrupt("job not found".to_owned()))?;
         if !lease_matches(&job, lease, now) {
+            // Fail closed: an expired or foreign fence never completes an
+            // attempt. Recovery flows through `reconcile_expired`
+            // (Unknown/RetryWait) followed by a fresh claim and
+            // `bind_claimed_process_start`, never through this path.
             return Err(TestdError::LeaseRejected(job_id.to_owned()));
         }
         receipt.validate(&job)?;
@@ -1198,6 +1660,10 @@ impl TestdStore {
             ExecutionStatus::Unknown | ExecutionStatus::Failed
         );
         let terminal = if matches!(execution, ExecutionStatus::Succeeded) {
+            // Local daemon projection only: a local Succeeded never becomes a
+            // canonical Durable Job outcome. Canonical promotion happens
+            // exclusively through the Governor path; this subtree has no
+            // canonical-store authority.
             JobState::Succeeded
         } else if retryable && job.attempts < self.retry.max_attempts {
             JobState::RetryWait
@@ -1481,7 +1947,9 @@ fn validate_receipt_binding(job: &TestJob, receipt: &ReceiptBinding) -> Result<(
         && receipt.operation_id == job.process.operation_id
         && receipt.process_tree_id == job.process.process_tree_id
         && receipt.generation == job.process.generation
-        && receipt.authority_epoch == job.process.authority_epoch
+        && receipt
+            .authority_epoch
+            .is_same_authority(&job.process.authority_epoch)
         && receipt_invocation_matches(receipt, job.invocation.request.request_id.as_str())
         && receipt.invocation_digest == job.process.invocation_digest
         && receipt.allowed_contour_root == job.target_roots.allowed_contour_root
@@ -1635,6 +2103,18 @@ pub fn sha256_artifact(length: u64, bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eliot_contracts::{EpochId, EpochLineageId};
+    use std::num::NonZeroU64;
+
+    fn test_epoch(sequence: u64) -> EpochId {
+        let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .expect("canonical test lineage-A");
+        EpochId::new(
+            lineage,
+            NonZeroU64::new(sequence).expect("non-zero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
 
     fn lease() -> Lease {
         Lease {
@@ -1652,7 +2132,7 @@ mod tests {
             invocation_id: "invocation".to_owned(),
             operation_id: "operation".to_owned(),
             process_tree_id: "tree".to_owned(),
-            authority_epoch: 7,
+            authority_epoch: test_epoch(7),
             resource_generation: 3,
             grant_id: "grant-1".to_owned(),
             grant_digest: String::new(),
@@ -1726,7 +2206,7 @@ mod tests {
             operation_id: "operation".to_owned(),
             process_tree_id: "tree".to_owned(),
             generation: 1,
-            authority_epoch: 1,
+            authority_epoch: test_epoch(1),
             invocation_id: "invocation-a".to_owned(),
             invocation_digest: "digest".to_owned(),
             allowed_contour_root: "contour".to_owned(),
