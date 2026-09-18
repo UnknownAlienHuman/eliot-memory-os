@@ -89,7 +89,6 @@ OWNED_PATHS = frozenset({
     "crates/smart/eliot-dreamer-curation/module.toml",
     "crates/research/eliot-dreamer-source-assurance/Cargo.toml",
     "crates/smart/cognitive-contract-challenges.toml",
-    "docs/operations/HANDOFF-2026-09-17.md",
     "docs/code-navigation/PACKAGE_DOCS_INDEX.md",
     "docs/code-navigation/PROTOTYPE_DOCS_INDEX.md",
     "scripts/tests/test_wave_admission_s2.py",

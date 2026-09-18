@@ -9,17 +9,29 @@
 - Project navigation: [workflow](WORKFLOW.md), [active workstreams](workstreams/ACTIVE.toml), [architecture contract](docs/ARCHITECTURE_CONTRACT.md).
 
 <!-- eliot-doc-routing:start -->
-## Documentation before editing
+## Mandatory documentation routing
 
-Before changing code, configuration, tests, workflows, or normative prose, run from the repository root:
+Before changing code, configuration, tests, workflows, or normative prose, run
+from the repository root:
 
 ```text
 python scripts/docs_read.py read --path <repository/path> --topic "<causal property>" --output .eliot/docs-read-bundle.md --receipt-out .eliot/docs-read-receipt.json
 ```
 
-Repeat `--path` for each changed path family, or use `--changed-from origin/main` for the complete branch delta.
-Read every required item in the verified bundle before editing. Rerun the reader when scope changes; resolve missing or stale routes before proceeding.
-Keep the generated receipt, bundle hash, and reading attestation in the work record or PR, following the [reading protocol](docs/architecture/READING_PROTOCOL.md).
+Repeat `--path` for every mutable path family, or use `--changed-from
+origin/main` for the complete branch delta, including deletions. Open the
+verified bundle and read every required item before mutation. A route alone is
+navigation, not reading evidence.
+
+Record the route receipt ID, read receipt ID, matched routes, required handles,
+fragment paths and SHA-256 values, verified bundle SHA-256, and explicit reading
+attestation in the work unit or pull request. Optional fragments are loaded only
+when the current decision crosses their stated boundary. A legacy `ELIOT_*`
+compatibility map is never an acceptable read receipt.
+
+If no non-baseline route matches, a required item is stale or missing, or scope
+expands beyond the receipt, stop and rerun or repair the route; silence is not
+permission. See [`docs/architecture/READING_PROTOCOL.md`](docs/architecture/READING_PROTOCOL.md).
 <!-- eliot-doc-routing:end -->
 
 ## Verification and delivery
