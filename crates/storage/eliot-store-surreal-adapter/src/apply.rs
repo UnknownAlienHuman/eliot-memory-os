@@ -786,6 +786,7 @@ async fn apply_with_retry(
             erasure_dispatched = true;
         }
 
+        let first_attempt = semantic_plan.is_none();
         let plan = if let Some(semantic) = &semantic_plan {
             plan::recompute_allocation(semantic, next_commit_sequence, next_outbox_sequence)?
         } else {
@@ -806,7 +807,7 @@ async fn apply_with_retry(
         // only, after every pre-transaction read and the plan build, before
         // the canonical transaction is sent. See
         // `rendezvous_before_transaction`.
-        if semantic_plan.is_none() {
+        if first_attempt {
             rendezvous_before_transaction(adapter).await?;
         }
 

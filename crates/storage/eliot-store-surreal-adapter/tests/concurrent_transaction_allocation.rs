@@ -1276,15 +1276,23 @@ async fn production_path_disjoint_writers_overlap_and_conflicts_fail_closed() {
     let (ctx_a, transition_a) = admitted("op-989-case21-a", "scope-989-a", "subject-989-21-a");
     let (ctx_b, transition_b) = admitted("op-989-case21-b", "scope-989-b", "subject-989-21-b");
     let adapter = harness.adapter();
-    adapter.arm_tx_rendezvous(Arc::new(tokio::sync::Barrier::new(2)));
-    let (receipt_a, receipt_b) = tokio::time::timeout(Duration::from_mins(2), async {
+    // Arrival proof: a three-party barrier with a test-side third party.
+    // The barrier releases only after BOTH production writers block inside
+    // `apply_with_retry`, so the observer future completing proves both
+    // writers actually reached the rendezvous before either proceeded — with
+    // an unreachable gate this join would hang and the bound below would
+    // fire instead of passing vacuously.
+    let rendezvous = Arc::new(tokio::sync::Barrier::new(3));
+    adapter.arm_tx_rendezvous(Arc::clone(&rendezvous));
+    let (receipt_a, receipt_b, _) = tokio::time::timeout(Duration::from_mins(2), async {
         tokio::join!(
             CanonicalStoreClient::apply_prepared(adapter, &ctx_a, transition_a, vec![], vec![]),
             CanonicalStoreClient::apply_prepared(adapter, &ctx_b, transition_b, vec![], vec![]),
+            rendezvous.wait(),
         )
     })
     .await
-    .expect("both production writers reach the post-admission rendezvous and commit");
+    .expect("both production writers block at the post-admission rendezvous and commit");
     adapter.disarm_tx_rendezvous();
     let receipt_a = receipt_a.expect("production writer A commits");
     let receipt_b = receipt_b.expect("production writer B commits");
