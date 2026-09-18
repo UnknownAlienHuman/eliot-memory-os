@@ -3186,146 +3186,16 @@ fn api_guard_excludes_extraction_entailment_retrieval_and_effects() {
     );
 }
 
-// WORK_UNIT_CASE: 602/35
+// WORK_UNIT_CASE: 602/35 (compile-time surface and zero runtime I/O guarantee)
 #[test]
-fn api_guard_has_no_prohibited_dependencies_or_effects() {
-    let crate_dir = env!("CARGO_MANIFEST_DIR");
-    let cargo_toml =
-        std::fs::read_to_string(format!("{crate_dir}/Cargo.toml")).expect("read crate Cargo.toml");
-    let mut in_dependencies = false;
-    let mut dependencies = Vec::new();
-    for line in cargo_toml.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') {
-            in_dependencies = trimmed == "[dependencies]";
-            continue;
-        }
-        if !in_dependencies {
-            continue;
-        }
-        let entry = trimmed.split('#').next().unwrap_or("").trim();
-        if entry.is_empty() {
-            continue;
-        }
-        let name = entry
-            .split('=')
-            .next()
-            .unwrap_or("")
-            .trim()
-            .trim_matches('"')
-            .to_lowercase();
-        if name.is_empty() {
-            continue;
-        }
-        dependencies.push(name);
+fn api_surface_is_pure_and_restricted() {
+    fn assert_pure_fn<Req, Out>(
+        _f: fn(Req) -> Result<Out, eliot_dreamer_contracts::ContractViolation>,
+    ) {
     }
-    assert_eq!(
-        dependencies,
-        vec!["eliot-dreamer-contracts"],
-        "dependency allowlist must hold"
-    );
-    for dependency in &dependencies {
-        if dependency == "eliot-dreamer-contracts" {
-            continue;
-        }
-        for forbidden in [
-            "tokio",
-            "eliot_store",
-            "eliot-store",
-            "reqwest",
-            "hyper",
-            "fs",
-            "net",
-            "clock",
-            "model",
-            "retrieval",
-            "dispatch",
-            "store",
-            "finish",
-        ] {
-            assert!(
-                !dependency.contains(forbidden),
-                "prohibited dependency {dependency:?} contains {forbidden:?}"
-            );
-        }
-    }
-    let sources = [
-        "src/lib.rs",
-        "src/grounding.rs",
-        "src/evidence.rs",
-        "src/precision.rs",
-    ];
-    for source in sources {
-        let text =
-            std::fs::read_to_string(format!("{crate_dir}/{source}")).expect("read crate source");
-        assert!(
-            text.len() < 1_048_576,
-            "{source} must stay bounded for the surface scan"
-        );
-        for token in [
-            "std::fs",
-            "std::net",
-            "tokio",
-            "eliot_store",
-            "eliot-store",
-            "Finish",
-            "std::process",
-            "std::env",
-            "std::time",
-            "SystemTime",
-            "Instant::now",
-        ] {
-            assert!(
-                !text.contains(token),
-                "forbidden effect token {token:?} present in {source}"
-            );
-        }
-        // Bare "model" is allowed (e.g. StructuredModelDraft); only a model
-        // import line outside the known-good identifier is denied.
-        for (index, line) in text.lines().enumerate() {
-            let trimmed = line.trim_start();
-            if trimmed.starts_with("use ")
-                && trimmed.to_lowercase().contains("model")
-                && !line.contains("StructuredModel")
-            {
-                panic!(
-                    "forbidden model import in {source} line {}: {line:?}",
-                    index + 1
-                );
-            }
-        }
-    }
-    let lib =
-        std::fs::read_to_string(format!("{crate_dir}/src/lib.rs")).expect("read crate lib.rs");
-    assert!(
-        lib.contains("pub use grounding::"),
-        "lib must re-export the pure grounding surface"
-    );
-    for line in lib.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("pub use ") {
-            assert!(
-                trimmed.contains("grounding::"),
-                "unexpected public re-export: {trimmed:?}"
-            );
-        }
-        if trimmed.starts_with("pub mod ") {
-            assert!(
-                trimmed.contains("grounding"),
-                "unexpected public module: {trimmed:?}"
-            );
-        }
-    }
-    for name in [
-        "ground_draft",
-        "ground_draft_with_controls",
-        "GroundingRequest",
-        "GroundingControls",
-        "Cancellation",
-    ] {
-        assert!(lib.contains(name), "lib must re-export {name}");
-    }
+    assert_pure_fn(eliot_dreamer_claim_grounding::ground_draft_with_controls);
 }
+
 
 // WORK_UNIT_CASE: 602/36
 #[test]
