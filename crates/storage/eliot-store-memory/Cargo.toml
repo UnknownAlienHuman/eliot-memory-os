@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 description = "Deterministic in-memory reference implementation for the ELIOT store contracts"
 
+[package.metadata.eliot]
+workspace_admission = "non-runtime implementation-support reference per #1715; validates the same admitted named-operation and protocol-generation set as eliot-store-api; no production binary selects it as a storage fallback"
+
 [dependencies]
 eliot-store-api = { workspace = true }
 serde.workspace = true
