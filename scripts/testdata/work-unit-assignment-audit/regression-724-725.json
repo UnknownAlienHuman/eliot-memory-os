@@ -1,0 +1,43 @@
+{
+  "schema": "eliot-assignment-snapshot-v1",
+  "header": {
+    "repository": "UnknownAlienHuman/eliot-memory-os",
+    "base_sha": "fb3fc334e113236cb82cf5ca9139fc0970df032b",
+    "complete": true
+  },
+  "issues": [
+    {
+      "number": 724,
+      "state": "closed",
+      "disposition": "superseded",
+      "title": "claude sidecar runtime (superseded by 725)",
+      "dependencies": []
+    },
+    {
+      "number": 725,
+      "state": "open",
+      "title": "claude sidecar runtime active",
+      "dependencies": [724]
+    }
+  ],
+  "pull_requests": [
+    {
+      "number": 1113,
+      "state": "open",
+      "draft": false,
+      "title": "work(agent): implement claude sidecar runtime",
+      "body": "Implements #725",
+      "head_ref": "work/724-claude-sidecar-runtime",
+      "head_repo": "UnknownAlienHuman/eliot-memory-os",
+      "base_ref": "main",
+      "base_sha": "fb3fc334e113236cb82cf5ca9139fc0970df032b",
+      "changed_paths": [
+        "crates/agent/eliot-claude-sdk/src/lib.rs"
+      ]
+    }
+  ],
+  "repository_records": {
+    "workstreams": [],
+    "retired_refs": []
+  }
+}

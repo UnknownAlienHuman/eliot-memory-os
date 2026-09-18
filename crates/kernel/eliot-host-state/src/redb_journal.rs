@@ -1118,7 +1118,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        EpochIdentity, EpochTransition, HostInstallationEpoch, HostStateJournal,
+        EpochLineageId, EpochTransition, HostInstallationEpoch, HostStateJournal,
         IdempotencyIdentity, MemoryBackend,
     };
 
@@ -1128,16 +1128,20 @@ mod tests {
         PlatformHandle::new(value).unwrap_or_else(|_| unreachable!())
     }
 
+    fn test_lineage() -> EpochLineageId {
+        EpochLineageId::new("550e8400-e29b-41d4-a716-446655440020")
+            .unwrap_or_else(|_| unreachable!())
+    }
+
+    fn test_activation_lineage() -> EpochLineageId {
+        EpochLineageId::new("550e8400-e29b-41d4-a716-446655440021")
+            .unwrap_or_else(|_| unreachable!())
+    }
+
     fn test_host() -> HostInstallationEpoch {
         HostInstallationEpoch {
             installation: handle("test-installation"),
-            epoch: EpochTransition {
-                current: EpochIdentity {
-                    lineage: handle("test-lineage"),
-                    sequence: 1,
-                },
-                parent: None,
-            },
+            epoch: EpochTransition::genesis(test_lineage()),
             nonce: handle("test-nonce"),
             recovery: None,
         }
@@ -1160,13 +1164,7 @@ mod tests {
         host: HostInstallationEpoch,
         operation: &str,
     ) -> (PreparedAppend, Vec<u8>) {
-        let generation = EpochTransition {
-            current: EpochIdentity {
-                lineage: handle("test-activation-lineage"),
-                sequence: 1,
-            },
-            parent: None,
-        };
+        let generation = EpochTransition::genesis(test_activation_lineage());
         let record = crate::tests::redb_test_activation(&host, &generation, operation);
         let journal = HostStateJournal::open(MemoryBackend::default(), host)
             .unwrap_or_else(|_| unreachable!());
@@ -1680,7 +1678,9 @@ mod tests {
             match tamper {
                 "epoch" => {
                     let mut wrong_host = test_host();
-                    wrong_host.epoch.current.lineage = handle("wrong-epoch-lineage");
+                    wrong_host.epoch.current.lineage_id =
+                        EpochLineageId::new("550e8400-e29b-41d4-a716-446655440029")
+                            .unwrap_or_else(|_| unreachable!());
                     value["host"] =
                         serde_json::to_value(wrong_host).unwrap_or_else(|_| unreachable!());
                 }
@@ -1785,13 +1785,10 @@ mod tests {
 
         let recovered_host = HostInstallationEpoch {
             installation: handle("test-installation"),
-            epoch: EpochTransition {
-                current: EpochIdentity {
-                    lineage: handle("recovered-lineage"),
-                    sequence: 1,
-                },
-                parent: None,
-            },
+            epoch: EpochTransition::genesis(
+                EpochLineageId::new("550e8400-e29b-41d4-a716-446655440022")
+                    .unwrap_or_else(|_| unreachable!()),
+            ),
             nonce: handle("recovered-nonce"),
             recovery: Some(crate::RecoveryLineageEvidence {
                 reason: crate::RecoveryLineageReason::Corruption,
@@ -1812,13 +1809,10 @@ mod tests {
             Err(crate::JournalError::StaleFence)
         ));
 
-        let generation = EpochTransition {
-            current: EpochIdentity {
-                lineage: handle("recovered-activation-lineage"),
-                sequence: 1,
-            },
-            parent: None,
-        };
+        let generation = EpochTransition::genesis(
+            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440023")
+                .unwrap_or_else(|_| unreachable!()),
+        );
         let record =
             crate::tests::redb_test_activation(&recovered_host, &generation, "recovered-append");
         recovered.append(record).unwrap_or_else(|_| unreachable!());

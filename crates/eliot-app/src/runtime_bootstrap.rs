@@ -141,7 +141,16 @@ async fn stop_owned_daemon(
 }
 
 #[cfg(windows)]
-fn recover_stale_runtime(instance: &RuntimeInstance, protocol_version: &str) -> Result<bool> {
+/// Removes a stale daemon single-instance lock whose owner PID is dead.
+///
+/// Shared by client-side `ensure_daemon_ready` recovery and daemon-side
+/// `run_daemon_instance` startup retry so both paths delegate to the same
+/// liveness/removal logic. Returns `Ok(true)` only when a stale lock was
+/// actually removed; refuses removal while the owner is alive.
+pub(crate) fn recover_stale_runtime(
+    instance: &RuntimeInstance,
+    protocol_version: &str,
+) -> Result<bool> {
     let lock_path = instance.runtime_dir().join("daemon.lock");
     if !lock_path.is_file() {
         return Ok(false);
@@ -225,7 +234,12 @@ fn process_is_alive(pid: u32) -> Result<bool> {
 }
 
 #[cfg(not(windows))]
-fn recover_stale_runtime(_instance: &RuntimeInstance, _protocol_version: &str) -> Result<bool> {
+/// Non-Windows counterpart: single-instance stale-lock recovery is a
+/// Windows-runtime concern, so this always reports no recovery.
+pub(crate) fn recover_stale_runtime(
+    _instance: &RuntimeInstance,
+    _protocol_version: &str,
+) -> Result<bool> {
     Ok(false)
 }
 

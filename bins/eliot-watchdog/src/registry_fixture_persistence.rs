@@ -19,18 +19,19 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence, sha256_hex};
+use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence, sha256_hex};
 use eliot_installation::{
     CandidateManifest, INSTALLATION_REGISTRY_WIRE_VERSION, InstallationEpoch, InstallationProfile,
     PHASE_B_PENDING_MARKER, PHASE_B_PENDING_SCM_DIGEST, PlatformHandle, RuntimeLaunchDescriptor,
     RuntimeStateRoots, phase_b_scm_selector,
 };
 use eliot_platform_windows::{
-    ELIOT_HOST_SERVICE_DISPLAY_NAME, ELIOT_HOST_SERVICE_NAME,
-    ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK, ELIOT_WATCHDOG_SERVICE_DISPLAY_NAME,
-    ELIOT_WATCHDOG_SERVICE_NAME, InstallerRootPrimitiveSpec, InstallerRootProfile, ServiceAccount,
-    ServiceBootstrapArguments, ServiceRegistrationRequest, ServiceStartMode,
-    WindowsInstallerRootPrimitive, prepare_protected_directory,
+    ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK, ELIOT_HOST_SERVICE_DISPLAY_NAME,
+    ELIOT_HOST_SERVICE_NAME, ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK,
+    ELIOT_WATCHDOG_SERVICE_DISPLAY_NAME, ELIOT_WATCHDOG_SERVICE_NAME, InstallerRootPrimitiveSpec,
+    InstallerRootProfile, ServiceAccount, ServiceBootstrapArguments, ServiceRegistrationRequest,
+    ServiceStartMode, WindowsInstallerRootPrimitive, host_service_security_descriptor_digest,
+    prepare_protected_directory,
     test_support::{self, ProtectedRootOverride},
     watchdog_service_security_descriptor_digest,
 };
@@ -120,6 +121,9 @@ impl RegistryFixture {
             "eliot-store-surreal.exe",
             "surreal.exe",
             "eliotd.exe",
+            "eliot-doctor.exe",
+            "eliot-testd.exe",
+            "eliot-native-worker.exe",
         ] {
             let destination = artifact_root.join(name);
             std::fs::copy(&source, &destination).unwrap_or_else(|error| {
@@ -505,7 +509,15 @@ impl RegistryFixture {
         )
         .unwrap_or_else(|error| panic!("invalid service approval request: {error}"));
         let service_control_grant = if host {
-            Value::Null
+            let principal_sid = "S-1-5-80-1-2-3-4-5";
+            let security_descriptor_digest = host_service_security_descriptor_digest(principal_sid)
+                .unwrap_or_else(|error| panic!("Host control-grant fixture: {error}"));
+            json!({
+                "principal_service": ELIOT_HOST_SERVICE_NAME,
+                "principal_sid": principal_sid,
+                "access_mask": ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK,
+                "security_descriptor_digest": security_descriptor_digest,
+            })
         } else {
             let principal_sid = "S-1-5-80-1-2-3-4-5";
             let security_descriptor_digest =
@@ -570,6 +582,12 @@ impl RegistryFixture {
         let canonical_store_path = self.artifact_root.join("surreal.exe");
         let host_path = self.artifact_root.join("eliot-host.exe");
         let watchdog_path = self.artifact_root.join("eliot-watchdog.exe");
+        let doctor_path = self.artifact_root.join("eliot-doctor.exe");
+        let testd_path = self.artifact_root.join("eliot-testd.exe");
+        let native_worker_path = self.artifact_root.join("eliot-native-worker.exe");
+        let doctor_digest = Self::artifact_digest(&doctor_path);
+        let testd_digest = Self::artifact_digest(&testd_path);
+        let native_worker_digest = Self::artifact_digest(&native_worker_path);
         let config_handle = path_handle(&config_path);
         let mut runtime_launch = RuntimeLaunchDescriptor {
             profile: InstallationProfile::SystemService,
@@ -583,7 +601,12 @@ impl RegistryFixture {
             authority_generation: ResourceGeneration::new(generation)
                 .unwrap_or_else(|error| panic!("invalid authority generation: {error}")),
             authority_state_fence: StateFence::new(
-                AuthorityEpoch::genesis(),
+                EpochId::new(
+                    EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                        .expect("canonical test lineage-A"),
+                    std::num::NonZeroU64::new(1).expect("non-zero test sequence"),
+                )
+                .expect("valid test epoch"),
                 ResourceGeneration::new(generation)
                     .unwrap_or_else(|error| panic!("invalid state generation: {error}")),
             ),
@@ -634,6 +657,12 @@ impl RegistryFixture {
             host_artifact_digest: handle(host_digest),
             watchdog_executable_path: path_handle(&watchdog_path),
             watchdog_artifact_digest: handle(watchdog_digest),
+            doctor_artifact_digest: handle(doctor_digest),
+            testd_artifact_digest: handle(testd_digest),
+            native_worker_artifact_digest: handle(native_worker_digest),
+            doctor_executable_path: path_handle(&doctor_path),
+            testd_executable_path: path_handle(&testd_path),
+            native_worker_executable_path: path_handle(&native_worker_path),
             descriptor_digest: handle(Self::digest(22)),
         };
         runtime_launch.kernel_arguments = vec![
@@ -649,6 +678,12 @@ impl RegistryFixture {
             runtime_launch.authority_descriptor_digest.clone(),
             handle("--kernel-artifact-sha256"),
             runtime_launch.kernel_artifact_digest.clone(),
+            handle("--doctor-artifact-sha256"),
+            runtime_launch.doctor_artifact_digest.clone(),
+            handle("--testd-artifact-sha256"),
+            runtime_launch.testd_artifact_digest.clone(),
+            handle("--native-worker-artifact-sha256"),
+            runtime_launch.native_worker_artifact_digest.clone(),
             handle("--eliotd-descriptor"),
             runtime_launch.eliotd_descriptor_path.clone(),
             handle("--eliotd-descriptor-sha256"),
@@ -666,10 +701,16 @@ impl RegistryFixture {
             store_bridge_artifact_digest: runtime_launch.store_bridge_artifact_digest.clone(),
             canonical_store_artifact_digest: runtime_launch.canonical_store_artifact_digest.clone(),
             host_artifact_digest: runtime_launch.host_artifact_digest.clone(),
+            doctor_artifact_digest: runtime_launch.doctor_artifact_digest.clone(),
+            testd_artifact_digest: runtime_launch.testd_artifact_digest.clone(),
+            native_worker_artifact_digest: runtime_launch.native_worker_artifact_digest.clone(),
             kernel_executable_path: path_handle(&kernel_path),
             store_bridge_executable_path: runtime_launch.store_bridge_executable_path.clone(),
             canonical_store_executable_path: runtime_launch.canonical_store_executable_path.clone(),
             host_executable_path: runtime_launch.host_executable_path.clone(),
+            doctor_executable_path: runtime_launch.doctor_executable_path.clone(),
+            testd_executable_path: runtime_launch.testd_executable_path.clone(),
+            native_worker_executable_path: runtime_launch.native_worker_executable_path.clone(),
             config_path: config_handle,
             dependency_closure_refs: vec![handle("evidence:dependency-closure")],
             license_refs: vec![handle("evidence:licenses")],
@@ -770,6 +811,19 @@ impl RegistryFixture {
     fn digest(value: u64) -> String {
         let nibble = b"0123456789abcdef"[(value % 16) as usize] as char;
         std::iter::repeat_n(nibble, 64).collect()
+    }
+
+    /// Returns the real SHA-256 of one materialized fixture artifact, the same
+    /// way Phase-A source-bundle materialization digests role bytes before
+    /// binding them into the launch descriptor.
+    fn artifact_digest(path: &Path) -> String {
+        let bytes = std::fs::read(path).unwrap_or_else(|error| {
+            panic!(
+                "read fixture artifact {}: {error}",
+                path.display()
+            )
+        });
+        sha256_hex(&bytes)
     }
 
     fn ensure_registry_file(&self) {

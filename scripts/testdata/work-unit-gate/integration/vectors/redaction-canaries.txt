@@ -1,0 +1,6 @@
+ISSUE_CANARY-837-source-secret-alpha
+SOURCE_PAYLOAD_CANARY-837-body-fragment-beta
+STDOUT_CANARY-837-execution-output-gamma
+STDERR_CANARY-837-diagnostic-output-delta
+SECRET_CANARY-837-credential-omega
+TOKEN_CANARY-837-github-token-epsilon

@@ -17,9 +17,11 @@ use eliot_store_api::{
     CONTRACT_VERSION, OperationId, StoreGenesisRequest, validate_genesis_receipt_envelope,
 };
 use eliot_store_api::{
-    OrderingHead, OrderingHeadExpectation, OrderingScopeId, RecoveryRecord, RevisionHead,
-    RevisionHeadExpectation, RevisionKey, StateFence, StoreError, StoreRecoveryRequest,
-    StoreRecoverySnapshot, WriteReceipt,
+    ERASURE_PARAM_OPERATION_ID, ERASURE_PARAM_SUBJECT, ERASURE_PARAM_SURFACES, ExactJsonBytes,
+    NamedMutationOperation, OrderingHead, OrderingHeadExpectation, OrderingScopeId, RecoveryRecord,
+    RevisionHead, RevisionHeadExpectation, RevisionKey, StateFence, StoreError,
+    StoreRecoveryRequest, StoreRecoverySnapshot, TransitionClass, WriteReceipt,
+    decode_erasure_surfaces, generated_operation_manifests, operation_manifest_set_digest,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
@@ -309,7 +311,15 @@ fn take_schema_meta(
     response: &mut client::RpcResults,
     index: usize,
 ) -> Result<Option<SchemaMetaRecord>, AdapterError> {
-    if !response.take_errors().is_empty() {
+    let errors = response.take_errors();
+    if !errors.is_empty() {
+        // S1 #775 real-provider compatibility: reads against never-defined
+        // tables observe absent-table, which preflight translates into
+        // "not yet migrated" (`None`). Every other error class keeps its
+        // existing reconciling disposition.
+        if errors.iter().all(|error| client::is_absent_table(error)) {
+            return Ok(None);
+        }
         return Err(AdapterError::PartialOutcome);
     }
     match take_optional(response, index) {
@@ -527,6 +537,10 @@ pub(crate) async fn apply_migration(
 /// Atomically applies one exact S-01 transition and returns its immutable receipt.
 /// Projection publications and outbox intents are derived by the shared
 /// transition planner, matching the in-memory reference implementation.
+///
+/// Legacy entry point: no operation claims a payload authority, so planning
+/// keeps the exact historical digest path. Authority-carrying callers use
+/// [`apply_prepared_with_authority`].
 pub(crate) async fn apply_prepared(
     adapter: &SurrealStoreAdapter,
     ctx: &eliot_store_api::RequestMeta,
@@ -534,7 +548,36 @@ pub(crate) async fn apply_prepared(
     expected_revision_heads: Vec<eliot_store_api::RevisionHeadExpectation>,
     expected_ordering_heads: Vec<eliot_store_api::OrderingHeadExpectation>,
 ) -> Result<WriteReceipt, AdapterError> {
-    validate_transition(adapter, ctx, &transition)?;
+    let authorities: Vec<Option<ExactJsonBytes>> = vec![None; transition.named_operations.len()];
+    apply_prepared_with_authority(
+        adapter,
+        ctx,
+        transition,
+        expected_revision_heads,
+        expected_ordering_heads,
+        &authorities,
+    )
+    .await
+}
+
+/// Atomically applies one exact S-01 transition with per-operation payload
+/// authorities bound in (slice C2, issue #19).
+///
+/// `authorities` aligns 1:1 with the transition's named operations and
+/// carries the original authority values (never re-parsed from a
+/// re-serialized `Value`): entries with at least one claimed authority plan
+/// through the authority-carrying path, all-`None` entries keep the legacy
+/// path. The admitted-operation gate ([`validate_transition`]) runs before
+/// any provider I/O in both cases.
+pub(crate) async fn apply_prepared_with_authority(
+    adapter: &SurrealStoreAdapter,
+    ctx: &eliot_store_api::RequestMeta,
+    transition: eliot_store_api::PreparedTransition,
+    expected_revision_heads: Vec<eliot_store_api::RevisionHeadExpectation>,
+    expected_ordering_heads: Vec<eliot_store_api::OrderingHeadExpectation>,
+    authorities: &[Option<ExactJsonBytes>],
+) -> Result<WriteReceipt, AdapterError> {
+    validate_transition(ctx, &transition)?;
 
     let db = client(adapter).await?;
     ensure_ready(adapter, db).await?;
@@ -576,8 +619,20 @@ pub(crate) async fn apply_prepared(
         &transition.state_fence,
     )?;
 
-    let plan = plan::plan_apply(
+    // Issue #1712: the admitted erasure operation dispatches its recorded
+    // intent-before-delete plan here, after every fallible precondition and
+    // before receipt planning. Same-operation replay returns the sealed
+    // outcomes without duplicate destructive work; a lost commit response
+    // reconciles by same-operation retry through the receipt path above,
+    // never by blind retry.
+    if transition.transition_class == TransitionClass::Erasure {
+        let intent = surreal_intent_from_transition(&transition)?;
+        apply_surreal_erasure(adapter, &intent).await?;
+    }
+
+    let plan = plan::select_apply_plan(
         &transition,
+        authorities,
         &current_revisions,
         &current_orderings,
         next_commit_sequence,
@@ -603,14 +658,171 @@ pub(crate) async fn apply_prepared(
     Ok(receipt)
 }
 
-fn validate_transition(
+/// 688-B: the adapter's apply-path erasure execution.
+///
+/// The erasure protocol needs the same intent-before-dispatch gate as the
+/// reference store: a `record_erasure_intent` step persists the intent row(s)
+/// in the same atomic transaction BEFORE any destructive statement (see the
+/// intent-before-delete template in `atomic_write`). This gate refuses
+/// fail-closed with zero destructive effects when no recorded intent exists
+/// ([`StoreError::ReceiptNotFound`]), sealing the original per-surface
+/// outcomes for same-operation replay (idempotent on `operation_id`,
+/// `Unknown` preserved for reconciliation, no blind retry, no second
+/// ledger). Destructive statements delete only the selected surfaces for the
+/// exact subject/scope. All `SurrealQL` stays in `apply`/`schema` modules;
+/// this boundary carries store-api types only (plus the local intent/outcome
+/// model in `atomic_write`, since the neutral purge port is defined in a
+/// parallel subtask and is not yet on this base; the adapter never imports
+/// `eliot-erasure`).
+///
+/// `record_surreal_erasure_intent` validates and freezes the intent: in the
+/// live path the returned intent is the durable row the atomic transaction
+/// below opens with, so no destructive statement can precede it.
+///
+/// Issue #1712 admits the named dispatch: `apply_prepared_with_authority`
+/// routes an admitted `ApplyErasure` transition through this gate, so the
+/// intent-before-delete path is live.
+///
+/// Follow-up integration slice (NOT this contour): `GetEvidencePack`
+/// suppression of sealed erasures plus the `erasure_intent`/`erasure_outcome`
+/// table migration stay with the real-Surreal integration owner.
+pub(crate) fn record_surreal_erasure_intent(
+    intent: atomic_write::SurrealErasureIntent,
+) -> Result<atomic_write::SurrealErasureIntent, AdapterError> {
+    intent.validate().map_err(AdapterError::Store)?;
+    Ok(intent)
+}
+
+/// 688-B: dispatches one recorded erasure intent through the atomic writer.
+///
+/// Same-operation replay returns the original per-surface outcomes without
+/// duplicate destructive work (the writer's sealed-outcome replay check);
+/// `Unknown` outcomes stay preserved for same-operation reconciliation.
+/// Fail-closed with zero destructive effects when the intent step above
+/// refuses: `write_erasure_transaction` is never reached, so no `DELETE`
+/// can precede the durable intent row.
+///
+/// Issue #1712 admits the named dispatch (see
+/// `apply_prepared_with_authority`); this entry executes only the recorded
+/// plan and never derives deletion semantics.
+///
+/// Follow-up integration slice (NOT this contour): `GetEvidencePack`
+/// suppression of sealed erasures plus the `erasure_intent`/`erasure_outcome`
+/// table migration stay with the real-Surreal integration owner.
+pub(crate) async fn apply_surreal_erasure(
     adapter: &SurrealStoreAdapter,
+    intent: &atomic_write::SurrealErasureIntent,
+) -> Result<Vec<atomic_write::SurrealSurfaceOutcome>, AdapterError> {
+    let intent = record_surreal_erasure_intent(intent.clone())?;
+    let db = client(adapter).await?;
+    ensure_ready(adapter, db).await?;
+    let _guard = adapter.write_lock.lock().await;
+    atomic_write::write_erasure_transaction(db, &adapter.config, &intent).await
+}
+
+/// Builds the pure intent-before-delete ordering assertion used by tests:
+/// the intent upsert opens the transaction before every destructive
+/// statement and the outcome seal closes it. Returns the byte offsets of
+/// the three sections inside the rendered template.
+#[allow(dead_code)]
+pub(crate) fn erasure_template_ordering(
+    store_owned_surface_count: usize,
+) -> Result<(usize, usize, usize), AdapterError> {
+    let sql = atomic_write::erasure_transaction_template(store_owned_surface_count);
+    let intent_at = sql.find("erasure_intent").ok_or_else(|| {
+        AdapterError::Serialization("erasure template is missing its intent step".to_owned())
+    })?;
+    let delete_at = sql.find("DELETE").ok_or_else(|| {
+        AdapterError::Serialization("erasure template is missing its delete step".to_owned())
+    })?;
+    let outcome_at = sql.find("erasure_outcome").ok_or_else(|| {
+        AdapterError::Serialization("erasure template is missing its outcome seal".to_owned())
+    })?;
+    if intent_at < delete_at && delete_at < outcome_at {
+        Ok((intent_at, delete_at, outcome_at))
+    } else {
+        Err(AdapterError::Serialization(
+            "erasure template orders intent before delete before outcome seal".to_owned(),
+        ))
+    }
+}
+
+/// Builds the recorded erasure intent verbatim from the admitted named
+/// operation (issue #1712).
+///
+/// The bridge applies only the recorded plan: subject, scope, fence, and
+/// surfaces are copied verbatim from the admitted `ApplyErasure` parameters
+/// into the local intent, never derived. The stable intent identity must
+/// equal the transition identity, binding record, execution, and receipt
+/// under one identity; divergence is an identity conflict with no
+/// destructive effect.
+fn surreal_intent_from_transition(
+    transition: &eliot_store_api::PreparedTransition,
+) -> Result<atomic_write::SurrealErasureIntent, AdapterError> {
+    if transition.transition_class != TransitionClass::Erasure {
+        return Err(AdapterError::Store(StoreError::TransitionClassExceeded));
+    }
+    let Some(command) = transition.named_operations.first() else {
+        return Err(AdapterError::Store(StoreError::TransitionClassExceeded));
+    };
+    if command.operation != NamedMutationOperation::ApplyErasure {
+        return Err(AdapterError::Store(StoreError::TransitionClassExceeded));
+    }
+    let text_param = |name: &'static str| {
+        command
+            .parameters
+            .get(name)
+            .and_then(Value::as_str)
+            .ok_or(AdapterError::Store(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "missing required parameter",
+            }))
+    };
+    let subject = text_param(ERASURE_PARAM_SUBJECT)?;
+    let surfaces_value = text_param(ERASURE_PARAM_SURFACES)?;
+    let operation_id = text_param(ERASURE_PARAM_OPERATION_ID)?;
+    if operation_id != transition.identity.operation_id.to_string() {
+        return Err(AdapterError::Store(StoreError::IdentityConflict));
+    }
+    let surfaces = decode_erasure_surfaces(surfaces_value)
+        .map_err(AdapterError::Store)?
+        .iter()
+        .map(|name| atomic_write::SurrealErasureSurface::by_name(name))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(AdapterError::Store)?;
+    Ok(atomic_write::SurrealErasureIntent {
+        operation_id: operation_id.to_owned(),
+        subject: subject.to_owned(),
+        scope_id: transition.scope_id.clone(),
+        surfaces,
+        state_fence: transition.state_fence.clone(),
+    })
+}
+
+/// Enforces the same admitted operation before staging and commit (slice C2).
+///
+/// The pre-stage gate binds, in order: the generic transition shape
+/// ([`PreparedTransition::validate`], which also aligns security scope/proof
+/// material and the effect ceiling with the transition fence), the active
+/// generated catalogue set ([`generated_operation_manifests`] with its
+/// [`operation_manifest_set_digest`] well-formedness proof and
+/// [`PreparedTransition::validate_against_catalogue`] membership/digest/bound
+/// checks, covering the original admitted plan identity through the
+/// operation-manifest digest), and the caller/transition fence equality. A
+/// set-digest mismatch, an unknown or extra operation, a scope/effect excess,
+/// or a fence mismatch fails closed here, before any provider I/O, receipt,
+/// or fence advance. There is no aggregate-manifest fallback.
+fn validate_transition(
     ctx: &eliot_store_api::RequestMeta,
     transition: &eliot_store_api::PreparedTransition,
 ) -> Result<(), AdapterError> {
     ctx.validate().map_err(StoreError::Foundation)?;
     transition.validate()?;
-    transition.validate_against_manifest(&adapter.operation_manifest)?;
+    let entries = generated_operation_manifests().map_err(AdapterError::Store)?;
+    operation_manifest_set_digest(&entries).map_err(AdapterError::Store)?;
+    transition
+        .validate_against_catalogue(&entries)
+        .map_err(AdapterError::Store)?;
     if ctx.state_fence != transition.state_fence {
         return Err(AdapterError::Store(StoreError::FenceMismatch));
     }
@@ -853,3 +1065,648 @@ fn ensure_unique_ordering_scopes(scopes: &[OrderingScopeId]) -> Result<(), Adapt
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod admitted_operation_gate_tests {
+    #![allow(clippy::expect_used)]
+
+    use super::*;
+    use eliot_store_api::{
+        EffectClass, EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
+        OperationIdentity, OperationManifestDigest, OrderingScopeId, ScopeId, SecurityContext,
+        TransitionClass, genesis_manifest,
+    };
+    use serde_json::json;
+    use std::collections::BTreeMap;
+
+    const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn test_epoch(sequence: u64) -> eliot_contracts::EpochId {
+        use eliot_contracts::{EpochId, EpochLineageId};
+        use std::num::NonZeroU64;
+        EpochId::new(
+            EpochLineageId::new(TEST_LINEAGE_A).expect("canonical test lineage-A"),
+            NonZeroU64::new(sequence).expect("non-zero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
+
+    fn test_fence(sequence: u64) -> StateFence {
+        StateFence::new(
+            test_epoch(sequence),
+            eliot_contracts::ResourceGeneration::genesis(),
+        )
+    }
+
+    fn test_context(fence: &StateFence) -> eliot_store_api::RequestMeta {
+        eliot_store_api::RequestMeta {
+            request_id: eliot_contracts::RequestId::new("request-gate").expect("request id"),
+            session_id: None,
+            task_id: None,
+            product_id: eliot_contracts::ProductId::new("product-gate").expect("product"),
+            source_id: eliot_contracts::SourceId::new("source-gate").expect("source"),
+            state_fence: fence.clone(),
+            clock: eliot_contracts::ClockReading::default(),
+        }
+    }
+
+    fn transition_with(
+        fence: &StateFence,
+        manifest_digest: OperationManifestDigest,
+        class: TransitionClass,
+        ceiling: eliot_store_api::EffectClass,
+        named_operations: Vec<eliot_store_api::NamedMutationRequest>,
+    ) -> eliot_store_api::PreparedTransition {
+        eliot_store_api::PreparedTransition {
+            identity: OperationIdentity {
+                operation_id: eliot_store_api::OperationId::new("op-gate").expect("operation"),
+                idempotency_key: "idem-gate".to_owned(),
+                canonical_request_hash: "a".repeat(64),
+            },
+            state_fence: fence.clone(),
+            scope_id: ScopeId::new("scope-gate").expect("scope"),
+            task_id: None,
+            ordering_scopes: vec![OrderingScopeId::new("scope-gate").expect("ordering")],
+            transition_class: class,
+            requested_effect_ceiling: ceiling,
+            admission_contract_set_digest: "b".repeat(64),
+            operation_manifest_digest: manifest_digest,
+            named_operations,
+            event_projection_relation_intents: EventProjectionRelationIntents {
+                event_ids: Vec::new(),
+                projection_kinds: Vec::new(),
+                relation_kinds: Vec::new(),
+            },
+            security: SecurityContext::default(),
+            required_proof_and_approval_refs: Vec::new(),
+        }
+    }
+
+    fn mutation_operation() -> eliot_store_api::NamedMutationRequest {
+        NamedMutationRequest {
+            operation: NamedMutationOperation::CaptureObservation,
+            parameters: BTreeMap::from([("subject".to_owned(), json!("op-gate"))]),
+        }
+    }
+
+    fn audit_operation() -> eliot_store_api::NamedMutationRequest {
+        NamedMutationRequest {
+            operation: NamedMutationOperation::AppendAuditEvent,
+            parameters: BTreeMap::from([
+                ("operation_id".to_owned(), json!("op-gate")),
+                ("idempotency_key".to_owned(), json!("idem-gate")),
+                ("session_id".to_owned(), json!("session-gate")),
+                ("access_digest".to_owned(), json!("a".repeat(64))),
+                ("action_digest".to_owned(), json!("b".repeat(64))),
+                ("expected_revision".to_owned(), json!("7")),
+            ]),
+        }
+    }
+
+    fn lifecycle_operation() -> eliot_store_api::NamedMutationRequest {
+        NamedMutationRequest {
+            operation: NamedMutationOperation::ApplyLifecyclePolicy,
+            parameters: BTreeMap::from([
+                ("action".to_owned(), json!("keep")),
+                ("base_view_digest".to_owned(), json!("a".repeat(64))),
+                ("candidate_digest".to_owned(), json!("b".repeat(64))),
+                ("candidate_package_digest".to_owned(), json!("c".repeat(64))),
+                ("skill_id".to_owned(), json!("skill-gate")),
+                ("verifier_ref".to_owned(), json!("verifier-gate")),
+            ]),
+        }
+    }
+
+    fn recovery_operation() -> eliot_store_api::NamedMutationRequest {
+        NamedMutationRequest {
+            operation: NamedMutationOperation::ReconcileRecovery,
+            parameters: BTreeMap::from([
+                ("problem_id".to_owned(), json!("problem-gate")),
+                ("expected_problem_revision".to_owned(), json!("7")),
+                ("attempt_digest".to_owned(), json!("a".repeat(64))),
+                ("effect_digest".to_owned(), json!("b".repeat(64))),
+                (
+                    "operation_manifest_digest".to_owned(),
+                    json!("c".repeat(64)),
+                ),
+                ("artifact_binding_digest".to_owned(), json!("b".repeat(64))),
+                ("fence_digest".to_owned(), json!("d".repeat(64))),
+                ("observation_operation_id".to_owned(), json!("op-gate")),
+                ("observation_record_id".to_owned(), json!("record-gate")),
+                (
+                    "observation_request_digest".to_owned(),
+                    json!("e".repeat(64)),
+                ),
+            ]),
+        }
+    }
+
+    fn task_state_operation() -> eliot_store_api::NamedMutationRequest {
+        NamedMutationRequest {
+            operation: NamedMutationOperation::UpdateTaskState,
+            parameters: BTreeMap::from([
+                ("task_id".to_owned(), json!("task-gate")),
+                ("event_id".to_owned(), json!("event-gate")),
+                ("from".to_owned(), json!("PROPOSED")),
+                ("to".to_owned(), json!("OPEN")),
+                ("expected_revision".to_owned(), json!("1")),
+                ("actor_ref".to_owned(), json!("actor-gate")),
+            ]),
+        }
+    }
+
+    #[test]
+    fn genesis_shaped_transition_passes_the_pre_stage_gate() {
+        let fence = test_fence(1);
+        let context = test_context(&fence);
+        let manifest = genesis_manifest().expect("genesis entry is active");
+        let transition = transition_with(
+            &fence,
+            manifest.digest.clone(),
+            TransitionClass::RecoverySchema,
+            EffectClass::ReversibleMutation,
+            Vec::new(),
+        );
+        assert!(
+            validate_transition(&context, &transition).is_ok(),
+            "genesis/bootstrap shape stays admitted"
+        );
+    }
+
+    #[test]
+    fn pre_stage_digest_mismatch_leaves_no_receipt_or_fence_effect() {
+        // The gate runs before any provider I/O, receipt, or fence advance
+        // (see `apply_prepared_with_authority` ordering): every rejection
+        // below is deterministic and repeatable with no durable effect.
+        let fence = test_fence(1);
+        let context = test_context(&fence);
+        let entries = generated_operation_manifests().expect("active catalogue generates");
+        let set_digest = operation_manifest_set_digest(&entries).expect("set digest computes");
+
+        // Stale manifest digest on a mutation: membership cannot even start.
+        let stale = transition_with(
+            &fence,
+            OperationManifestDigest::new("stale-manifest-digest").expect("digest"),
+            TransitionClass::CaptureCandidate,
+            EffectClass::Candidate,
+            vec![mutation_operation()],
+        );
+        assert_eq!(
+            validate_transition(&context, &stale),
+            Err(AdapterError::Store(StoreError::ManifestMismatch))
+        );
+        // T11.2 activates both UpdateTaskState and ApplyEpistemicRevision, so
+        // the remaining unactivated mutation (RecordAuthorityRevocation) still
+        // fails closed before staging.
+        let unadmitted = transition_with(
+            &fence,
+            set_digest.clone(),
+            TransitionClass::RecoverySchema,
+            EffectClass::ReversibleMutation,
+            vec![revocation_operation()],
+        );
+        assert_eq!(
+            validate_transition(&context, &unadmitted),
+            Err(AdapterError::Store(StoreError::UnknownOperation))
+        );
+        // ApplyEpistemicRevision is admitted: an empty payload fails as a
+        // typed parameter error, not UnknownOperation.
+        let missing_epistemic_payload = transition_with(
+            &fence,
+            set_digest.clone(),
+            TransitionClass::Epistemic,
+            EffectClass::Candidate,
+            vec![NamedMutationRequest {
+                operation: NamedMutationOperation::ApplyEpistemicRevision,
+                parameters: BTreeMap::new(),
+            }],
+        );
+        assert!(matches!(
+            validate_transition(&context, &missing_epistemic_payload),
+            Err(AdapterError::Store(StoreError::InvalidField {
+                field: "operation.parameter",
+                ..
+            }))
+        ));
+        // Admitted `CaptureObservation` with current set digest and approved
+        // subject params passes the pre-stage gate.
+        let admitted = transition_with(
+            &fence,
+            set_digest.clone(),
+            TransitionClass::CaptureCandidate,
+            EffectClass::Candidate,
+            vec![mutation_operation()],
+        );
+        assert!(
+            validate_transition(&context, &admitted).is_ok(),
+            "admitted CaptureObservation passes the pre-stage gate"
+        );
+        // Admitted `AppendAuditEvent` with current set digest and approved
+        // receipt-bound params passes the pre-stage gate.
+        let admitted_audit = transition_with(
+            &fence,
+            set_digest.clone(),
+            TransitionClass::CaptureCandidate,
+            EffectClass::Candidate,
+            vec![audit_operation()],
+        );
+        assert!(
+            validate_transition(&context, &admitted_audit).is_ok(),
+            "admitted AppendAuditEvent passes the pre-stage gate"
+        );
+        // Admitted `ApplyLifecyclePolicy` with current set digest and approved
+        // lifecycle-policy params passes the pre-stage gate.
+        let admitted_lifecycle = transition_with(
+            &fence,
+            set_digest.clone(),
+            TransitionClass::LifecyclePolicy,
+            EffectClass::ReversibleMutation,
+            vec![lifecycle_operation()],
+        );
+        assert!(
+            validate_transition(&context, &admitted_lifecycle).is_ok(),
+            "admitted ApplyLifecyclePolicy passes the pre-stage gate"
+        );
+        // Admitted `ReconcileRecovery` with current set digest and approved
+        // problem-leg recovery params passes the pre-stage gate.
+        let admitted_recovery = transition_with(
+            &fence,
+            set_digest.clone(),
+            TransitionClass::RecoverySchema,
+            EffectClass::ReversibleMutation,
+            vec![recovery_operation()],
+        );
+        assert!(
+            validate_transition(&context, &admitted_recovery).is_ok(),
+            "admitted ReconcileRecovery passes the pre-stage gate"
+        );
+        // Admitted `UpdateTaskState` with current set digest and approved
+        // task-control params passes the pre-stage gate.
+        let admitted_task = transition_with(
+            &fence,
+            set_digest,
+            TransitionClass::TaskControl,
+            EffectClass::ReversibleMutation,
+            vec![task_state_operation()],
+        );
+        assert!(
+            validate_transition(&context, &admitted_task).is_ok(),
+            "admitted UpdateTaskState passes the pre-stage gate"
+        );
+        // Fence divergence between caller context and transition.
+        let manifest = genesis_manifest().expect("genesis entry is active");
+        let drifted = transition_with(
+            &test_fence(2),
+            manifest.digest.clone(),
+            TransitionClass::RecoverySchema,
+            EffectClass::ReversibleMutation,
+            Vec::new(),
+        );
+        assert_eq!(
+            validate_transition(&context, &drifted),
+            Err(AdapterError::Store(StoreError::FenceMismatch))
+        );
+        // Deterministic: repeating the rejections changes nothing.
+        assert_eq!(
+            validate_transition(&context, &stale),
+            Err(AdapterError::Store(StoreError::ManifestMismatch))
+        );
+    }
+
+    fn revocation_operation() -> eliot_store_api::NamedMutationRequest {
+        NamedMutationRequest {
+            operation: NamedMutationOperation::RecordAuthorityRevocation,
+            parameters: BTreeMap::from([
+                ("origin_ref".to_owned(), json!("root:alpha")),
+                ("closure_id".to_owned(), json!("revocation-686-01")),
+                ("closure_revision".to_owned(), json!("9")),
+                ("affected_digest".to_owned(), json!("a".repeat(64))),
+                ("affected_count".to_owned(), json!("3")),
+                ("invalidation_reason".to_owned(), json!("SOURCE_REVOKED")),
+                ("fence_digest".to_owned(), json!("b".repeat(64))),
+            ]),
+        }
+    }
+
+    /// Issue #686: the revocation-record mutation is known-but-unsupported
+    /// until a store-owned slice activates its catalogue row with proven
+    /// handlers. The closed name spelling holds and the pre-stage gate
+    /// refuses it with typed `UnknownOperation` — never silent success.
+    #[test]
+    fn revocation_record_mutation_fails_closed_until_store_activation() {
+        use eliot_store_api::{named_mutation_operation_by_name, named_mutation_operation_name};
+        assert_eq!(
+            named_mutation_operation_name(NamedMutationOperation::RecordAuthorityRevocation),
+            "RecordAuthorityRevocation"
+        );
+        assert_eq!(
+            named_mutation_operation_by_name("RecordAuthorityRevocation"),
+            Some(NamedMutationOperation::RecordAuthorityRevocation)
+        );
+        assert_eq!(
+            NamedMutationOperation::RecordAuthorityRevocation.transition_class(),
+            TransitionClass::RecoverySchema
+        );
+        let fence = test_fence(1);
+        let context = test_context(&fence);
+        let entries = generated_operation_manifests().expect("active catalogue generates");
+        let set_digest = operation_manifest_set_digest(&entries).expect("set digest computes");
+        let pending = transition_with(
+            &fence,
+            set_digest,
+            TransitionClass::RecoverySchema,
+            EffectClass::ReversibleMutation,
+            vec![revocation_operation()],
+        );
+        assert_eq!(
+            validate_transition(&context, &pending),
+            Err(AdapterError::Store(StoreError::UnknownOperation))
+        );
+    }
+
+    /// Issue #686: the revocation-history read is known-but-unsupported
+    /// until a store-owned slice activates its catalogue row with a proven
+    /// handler. The closed name spelling holds and the read gate refuses it
+    /// with typed `UnknownOperation` — never a successful empty view.
+    #[test]
+    fn revocation_history_read_fails_closed_until_store_activation() {
+        use eliot_store_api::{
+            NamedReadOperation, ReadConsistency, ScopeId, named_read_operation_by_name,
+            named_read_operation_name,
+        };
+        assert_eq!(
+            named_read_operation_name(NamedReadOperation::GetAuthorityRevocationHistory),
+            "GetAuthorityRevocationHistory"
+        );
+        assert_eq!(
+            named_read_operation_by_name("GetAuthorityRevocationHistory"),
+            Some(NamedReadOperation::GetAuthorityRevocationHistory)
+        );
+        let fence = test_fence(1);
+        let entries = generated_operation_manifests().expect("active catalogue generates");
+        let query = eliot_store_api::NamedReadRequest {
+            operation: NamedReadOperation::GetAuthorityRevocationHistory,
+            scope_id: Some(ScopeId::new("governor").expect("scope")),
+            consistency: ReadConsistency::Eventual,
+            state_fence: fence,
+            parameters: BTreeMap::from([
+                ("origin_ref".to_owned(), json!("root:alpha")),
+                ("max_records".to_owned(), json!("8")),
+            ]),
+        };
+        assert_eq!(
+            query.validate_against_catalogue(&entries),
+            Err(StoreError::UnknownOperation)
+        );
+    }
+
+    fn erasure_operation() -> eliot_store_api::NamedMutationRequest {
+        NamedMutationRequest {
+            operation: NamedMutationOperation::ApplyErasure,
+            parameters: BTreeMap::from([
+                ("subject".to_owned(), json!("subject-gate")),
+                ("surfaces".to_owned(), json!("CanonicalPayload,Index")),
+                ("reason".to_owned(), json!("user requested deletion")),
+                ("requester".to_owned(), json!("user:test")),
+                ("erasure_operation_id".to_owned(), json!("op-gate")),
+            ]),
+        }
+    }
+
+    fn erasure_transition(
+        fence: &StateFence,
+        manifest_digest: OperationManifestDigest,
+    ) -> eliot_store_api::PreparedTransition {
+        let mut transition = transition_with(
+            fence,
+            manifest_digest,
+            TransitionClass::Erasure,
+            EffectClass::ReversibleMutation,
+            vec![erasure_operation()],
+        );
+        transition.required_proof_and_approval_refs = vec!["approval-user-1".to_owned()];
+        transition
+    }
+
+    /// Issue #1712: the admitted erasure operation passes the pre-stage gate
+    /// under its declared class, and the intent builder binds the recorded
+    /// plan verbatim from the admitted parameters.
+    #[test]
+    fn admitted_erasure_passes_the_pre_stage_gate() {
+        let fence = test_fence(1);
+        let context = test_context(&fence);
+        let entries = generated_operation_manifests().expect("active catalogue generates");
+        let set_digest = operation_manifest_set_digest(&entries).expect("set digest computes");
+        let transition = erasure_transition(&fence, set_digest);
+        assert!(
+            validate_transition(&context, &transition).is_ok(),
+            "admitted erasure passes the pre-stage gate"
+        );
+        let intent = surreal_intent_from_transition(&transition).expect("intent binds");
+        assert_eq!(intent.operation_id, "op-gate");
+        assert_eq!(intent.subject, "subject-gate");
+        assert_eq!(intent.scope_id.as_str(), "scope-gate");
+        assert_eq!(
+            intent.surfaces,
+            vec![
+                atomic_write::SurrealErasureSurface::CanonicalPayload,
+                atomic_write::SurrealErasureSurface::Index,
+            ]
+        );
+    }
+
+    /// Issue #1712: unapproved, out-of-manifest, and divergent erasure plans
+    /// are rejected pre-stage with no provider effect.
+    #[test]
+    fn erasure_gate_rejects_unapproved_and_out_of_manifest() {
+        let fence = test_fence(1);
+        let context = test_context(&fence);
+        let entries = generated_operation_manifests().expect("active catalogue generates");
+        let set_digest = operation_manifest_set_digest(&entries).expect("set digest computes");
+
+        // No explicit approval: automatic paths furnish none and fail here.
+        let mut unapproved = erasure_transition(&fence, set_digest.clone());
+        unapproved.required_proof_and_approval_refs.clear();
+        assert!(matches!(
+            validate_transition(&context, &unapproved),
+            Err(AdapterError::Store(StoreError::InvalidField { .. }))
+        ));
+
+        // Wrong transition class for the named erasure operation.
+        let mut wrong_class = erasure_transition(&fence, set_digest.clone());
+        wrong_class.transition_class = TransitionClass::CaptureCandidate;
+        assert_eq!(
+            validate_transition(&context, &wrong_class),
+            Err(AdapterError::Store(StoreError::TransitionClassExceeded))
+        );
+
+        // Stale manifest digest never reaches the store.
+        let mut stale = transition_with(
+            &fence,
+            OperationManifestDigest::new("stale-manifest-digest").expect("digest"),
+            TransitionClass::Erasure,
+            EffectClass::ReversibleMutation,
+            vec![erasure_operation()],
+        );
+        stale.required_proof_and_approval_refs = vec!["approval-user-1".to_owned()];
+        assert_eq!(
+            validate_transition(&context, &stale),
+            Err(AdapterError::Store(StoreError::ManifestMismatch))
+        );
+
+        // Unknown surface: dispatch refuses the invented denominator.
+        let mut unknown = erasure_transition(&fence, set_digest);
+        unknown.named_operations[0]
+            .parameters
+            .insert("surfaces".to_owned(), json!("Nope"));
+        assert!(matches!(
+            surreal_intent_from_transition(&unknown),
+            Err(AdapterError::Store(StoreError::InvalidField { .. }))
+        ));
+
+        // Divergent intent identity: record, execution, and receipt stay
+        // bound under one identity.
+        let mut divergent = erasure_operation();
+        divergent
+            .parameters
+            .insert("erasure_operation_id".to_owned(), json!("op-other"));
+        let mut transition = erasure_transition(
+            &fence,
+            operation_manifest_set_digest(
+                &generated_operation_manifests().expect("active catalogue generates"),
+            )
+            .expect("set digest computes"),
+        );
+        transition.named_operations = vec![divergent];
+        assert_eq!(
+            surreal_intent_from_transition(&transition),
+            Err(AdapterError::Store(StoreError::IdentityConflict))
+        );
+    }
+}
+
+/// 688-B: memory + Surreal erasure execution (adapter contour).
+///
+/// The intent-before-delete template asserts the whole protocol ordering —
+/// intent row first, destructive deletes second, outcome seal last — and
+/// the bindings assertion pins the sealed per-surface derivation (store
+/// surfaces purge, foreign surfaces stay incomplete, `Unknown` preserved).
+/// The live round-trip stays with integration (not this unit).
+#[cfg(test)]
+mod erasure_execution_tests {
+    use super::atomic_write::{
+        SurrealErasureIntent, SurrealErasureSurface, SurrealSurfaceOutcome,
+        erasure_transaction_bindings, erasure_transaction_template,
+    };
+    use super::{erasure_template_ordering, record_surreal_erasure_intent};
+
+    fn test_fence() -> Result<eliot_store_api::StateFence, Box<dyn std::error::Error>> {
+        use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
+        use std::num::NonZeroU64;
+        let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .map_err(|error| format!("canonical test lineage-A: {error:?}"))?;
+        let sequence = NonZeroU64::new(1).ok_or("non-zero test sequence")?;
+        let epoch = EpochId::new(lineage, sequence)
+            .map_err(|error| format!("valid test epoch: {error:?}"))?;
+        Ok(eliot_store_api::StateFence::new(
+            epoch,
+            ResourceGeneration::genesis(),
+        ))
+    }
+
+    fn intent() -> Result<SurrealErasureIntent, Box<dyn std::error::Error>> {
+        Ok(SurrealErasureIntent {
+            operation_id: "erasure-op-1".to_owned(),
+            subject: "evidence-alpha".to_owned(),
+            scope_id: eliot_store_api::ScopeId::new("scope-1")
+                .map_err(|error| format!("valid test scope: {error:?}"))?,
+            surfaces: vec![
+                SurrealErasureSurface::CanonicalPayload,
+                SurrealErasureSurface::Blob,
+            ],
+            state_fence: test_fence()?,
+        })
+    }
+
+    #[test]
+    fn erasure_template_records_intent_before_delete_before_outcome_seal()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Real template + real ordering gate: the intent step opens the
+        // transaction before any destructive statement and the outcome seal
+        // closes it; destructive statements delete only the exact
+        // subject/scope pair.
+        let intent = record_surreal_erasure_intent(intent()?)
+            .map_err(|error| format!("intent records: {error:?}"))?;
+        let store_owned = intent
+            .surfaces
+            .iter()
+            .filter(|surface| surface.is_store_owned())
+            .count();
+        assert_eq!(store_owned, 1);
+        let sql = erasure_transaction_template(store_owned);
+        assert!(sql.starts_with("BEGIN TRANSACTION;"));
+        assert!(sql.ends_with("COMMIT TRANSACTION;"));
+        let (intent_at, delete_at, outcome_at) = erasure_template_ordering(store_owned)
+            .map_err(|error| format!("ordering resolves: {error:?}"))?;
+        assert!(intent_at < delete_at && delete_at < outcome_at);
+        assert_eq!(sql.matches("DELETE").count(), store_owned);
+        assert!(sql.contains("$erasure_subject0"));
+        assert!(sql.contains("$erasure_scope_expected0"));
+        assert!(sql.contains("erasure_intent_conflict"));
+        let (bindings, outcomes) = erasure_transaction_bindings(&intent, &[])
+            .map_err(|error| format!("bindings build: {error:?}"))?;
+        assert!(bindings.contains_key("erasure_table"));
+        assert!(bindings.contains_key("erasure_intent_expected"));
+        assert!(bindings.contains_key("erasure_intent_record"));
+        assert!(bindings.contains_key("erasure_subject0"));
+        assert!(!bindings.contains_key("erasure_subject1"));
+        assert!(bindings.contains_key("erasure_outcome_record"));
+        assert_eq!(
+            outcomes,
+            vec![
+                SurrealSurfaceOutcome::Purged {
+                    surface: SurrealErasureSurface::CanonicalPayload,
+                },
+                SurrealSurfaceOutcome::Incomplete {
+                    surface: SurrealErasureSurface::Blob,
+                },
+            ]
+        );
+        // Same-operation replay keeps a preserved `Unknown` verbatim instead
+        // of re-running destructive work or clearing it: the replay emits no
+        // `erasure_subject{i}` bindings, so the rendered template carries no
+        // `DELETE` for the replayed surface.
+        let prior = vec![SurrealSurfaceOutcome::Unknown {
+            surface: SurrealErasureSurface::CanonicalPayload,
+        }];
+        let (replay_bindings, replayed) = erasure_transaction_bindings(&intent, &prior)
+            .map_err(|error| format!("replay binds: {error:?}"))?;
+        assert_eq!(replayed[0], prior[0]);
+        assert!(
+            !replay_bindings
+                .keys()
+                .any(|key| key.starts_with("erasure_subject")),
+            "replayed-Unknown emits no destructive bindings"
+        );
+        let replay_store_owned = replay_bindings
+            .keys()
+            .filter(|key| {
+                key.starts_with("erasure_subject")
+                    && key["erasure_subject".len()..]
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit())
+            })
+            .count();
+        let replay_sql = erasure_transaction_template(replay_store_owned);
+        assert_eq!(replay_sql.matches("DELETE").count(), 0);
+        assert!(
+            !replay_sql.contains("DELETE"),
+            "replayed-Unknown renders no DELETE statement"
+        );
+        // No intent, no template: the gate refuses before any provider I/O.
+        let mut missing = intent.clone();
+        missing.operation_id.clear();
+        assert!(record_surreal_erasure_intent(missing).is_err());
+        Ok(())
+    }
+}

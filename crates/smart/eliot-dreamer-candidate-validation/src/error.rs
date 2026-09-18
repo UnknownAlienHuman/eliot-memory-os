@@ -1,7 +1,7 @@
 //! Stable result and diagnostic shapes owned by the A-05 gate.
 
 use eliot_dreamer_contracts::{
-    BudgetUsage, DreamInputBundle, DreamJobInput, GroundedDreamDraft, ModelDraft,
+    BudgetUsage, DreamInputBundle, DreamJobAdmission, GroundedDreamDraft, ModelDraft,
     PreservationReport,
 };
 use schemars::JsonSchema;
@@ -19,6 +19,8 @@ pub enum RejectionCode {
     IdentityMismatch,
     /// A model handle or grounded lineage points outside supplied material.
     LineageMismatch,
+    /// Duplicate item, claim, evidence, receipt, or dimension identity.
+    DuplicateItem,
     /// Candidate content asks the gate to make an unsupported claim.
     UnsupportedPrecision,
     /// The supplied independent usage cannot authorize this input.
@@ -38,7 +40,7 @@ pub enum RejectionCode {
 #[serde(deny_unknown_fields)]
 pub struct CandidateRejectionReport {
     /// Frozen job supplied to the gate.
-    pub job: DreamJobInput,
+    pub job: DreamJobAdmission,
     /// Exact input bundle supplied to the gate.
     pub bundle: DreamInputBundle,
     /// Structured model draft, retained without rewriting.

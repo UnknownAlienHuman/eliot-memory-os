@@ -5,7 +5,9 @@
 //! Doctor needs to choose the next bounded step, and it never interprets
 //! project semantics or fabricates a completion.
 
-use eliot_contracts::AuthorityEpoch;
+use std::num::NonZeroU64;
+
+use eliot_contracts::{EpochId, EpochLineageId};
 use eliot_ors::{EpochIdentity, OperationalControlProjection};
 use eliot_runtime_contracts::{
     HealthDimension, ModuleGeneration, OperationalRecoveryState, RecoveryDirective, RecoveryView,
@@ -118,14 +120,13 @@ impl RecoveryViewBuilder {
 ///
 /// # Errors
 ///
-/// Returns an error when the authority epoch in the lineage is zero, the
-/// resulting operational state fails validation, or the ref-vector bounds are
-/// exceeded.
+/// Returns an error when the lineage is not a canonical UUID or the sequence
+/// is zero, or when the resulting operational state fails validation.
 pub fn project_operational_state(
     projection: &OperationalControlProjection,
     integrity: HealthDimension,
 ) -> Result<OperationalRecoveryState, KernelError> {
-    let authority_epoch = authority_epoch_from(&projection.authority_lineage.current)?;
+    let authority_epoch = authority_epoch_id_from(&projection.authority_lineage.current)?;
     let state = OperationalRecoveryState {
         ors_revision: "eliot.kernel.ors/v1".to_owned(),
         integrity,
@@ -138,8 +139,32 @@ pub fn project_operational_state(
     Ok(state)
 }
 
-fn authority_epoch_from(current: &EpochIdentity) -> Result<AuthorityEpoch, KernelError> {
-    AuthorityEpoch::new(current.epoch).map_err(KernelError::from)
+/// Builds the canonical lineage-aware [`EpochId`] for an ORS epoch identity.
+///
+/// The ORS lineage label is validated as a canonical lowercase hyphenated UUID
+/// and the sequence must be non-zero; any other spelling fails closed without
+/// manufacturing a lineage. Authorization over the resulting tuple is exact
+/// via `is_same_authority`.
+///
+/// # Errors
+///
+/// Returns [`KernelError::InvalidField`] when the lineage is not a canonical
+/// UUID, the sequence is zero, or the canonical epoch cannot be constructed.
+pub fn authority_epoch_id_from(current: &EpochIdentity) -> Result<EpochId, KernelError> {
+    let lineage = EpochLineageId::new(current.lineage_id.as_str()).map_err(|_| {
+        KernelError::InvalidField {
+            field: "epoch_identity.lineage_id",
+            reason: "must be a canonical UUID lineage",
+        }
+    })?;
+    let sequence = NonZeroU64::new(current.epoch).ok_or(KernelError::InvalidField {
+        field: "epoch_identity.epoch",
+        reason: "must be greater than zero",
+    })?;
+    EpochId::new(lineage, sequence).map_err(|_| KernelError::InvalidField {
+        field: "epoch_identity",
+        reason: "invalid canonical epoch",
+    })
 }
 
 #[cfg(test)]
@@ -152,7 +177,7 @@ mod tests {
         let ors = OperationalRecoveryState {
             ors_revision: "eliot.kernel.ors/v1".to_owned(),
             integrity: HealthDimension::Healthy,
-            authority_epoch: AuthorityEpoch::genesis(),
+            authority_epoch: test_epoch(),
             pending_operation_refs: Vec::new(),
             active_generation_refs: Vec::new(),
             recovery_intent_refs: Vec::new(),
@@ -175,7 +200,7 @@ mod tests {
         let ors = OperationalRecoveryState {
             ors_revision: "eliot.kernel.ors/v1".to_owned(),
             integrity: HealthDimension::Healthy,
-            authority_epoch: AuthorityEpoch::genesis(),
+            authority_epoch: test_epoch(),
             pending_operation_refs: Vec::new(),
             active_generation_refs: Vec::new(),
             recovery_intent_refs: Vec::new(),
@@ -188,7 +213,7 @@ mod tests {
         let ors = OperationalRecoveryState {
             ors_revision: "eliot.kernel.ors/v1".to_owned(),
             integrity: HealthDimension::Healthy,
-            authority_epoch: AuthorityEpoch::genesis(),
+            authority_epoch: test_epoch(),
             pending_operation_refs: Vec::new(),
             active_generation_refs: Vec::new(),
             recovery_intent_refs: Vec::new(),
@@ -205,5 +230,38 @@ mod tests {
                 .add_directive(malformed)
                 .is_err()
         );
+    }
+
+    fn epoch_identity(lineage: &str, epoch: u64) -> EpochIdentity {
+        EpochIdentity {
+            lineage_id: eliot_ors::OpaqueLabel::new(lineage).unwrap(),
+            epoch,
+        }
+    }
+
+    fn test_epoch() -> EpochId {
+        authority_epoch_id_from(&epoch_identity("550e8400-e29b-41d4-a716-446655440000", 1)).unwrap()
+    }
+
+    #[test]
+    fn canonical_epoch_id_rejects_cross_lineage_same_sequence() -> Result<(), KernelError> {
+        let left =
+            authority_epoch_id_from(&epoch_identity("550e8400-e29b-41d4-a716-446655440000", 3))?;
+        let right =
+            authority_epoch_id_from(&epoch_identity("6ba7b810-9dad-11d1-80b4-00c04fd430c8", 3))?;
+        // Same numeric sequence from different lineages is unrelated authority.
+        assert!(!left.is_same_authority(&right));
+        assert!(!right.is_same_authority(&left));
+        // The exact same tuple authorizes.
+        let again =
+            authority_epoch_id_from(&epoch_identity("550e8400-e29b-41d4-a716-446655440000", 3))?;
+        assert!(left.is_same_authority(&again));
+        // Non-UUID lineage and zero sequence fail closed without manufacturing.
+        assert!(authority_epoch_id_from(&epoch_identity("not-a-uuid-lineage", 3)).is_err());
+        assert!(
+            authority_epoch_id_from(&epoch_identity("550e8400-e29b-41d4-a716-446655440000", 0))
+                .is_err()
+        );
+        Ok(())
     }
 }

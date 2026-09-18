@@ -69,7 +69,7 @@ finish authority.
 MSVC Rust 1.97.1 is pinned by `rust-toolchain.toml`.
 
 ```powershell
-cargo metadata --no-deps
+cargo metadata --locked --no-deps
 just quick
 ```
 

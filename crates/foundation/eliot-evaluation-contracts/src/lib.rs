@@ -1903,6 +1903,18 @@ impl GraphEvidenceRef {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eliot_contracts::{EpochId, EpochLineageId};
+    use std::num::NonZeroU64;
+
+    const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn test_epoch(lineage: &str, sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(lineage).expect("valid test lineage"),
+            NonZeroU64::new(sequence).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
 
     macro_rules! valid {
         ($type:ty, $value:expr) => {{
@@ -1991,7 +2003,7 @@ mod tests {
             decision_opportunity_ref: "opportunity-1".to_owned(),
             state_fence: {
                 let mut fence = StateFence::new(
-                    eliot_contracts::AuthorityEpoch::genesis(),
+                    test_epoch(TEST_LINEAGE_A, 1),
                     eliot_contracts::ResourceGeneration::genesis(),
                 );
                 fence.task_revision = Some(task_revision);

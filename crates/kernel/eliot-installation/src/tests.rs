@@ -21,6 +21,7 @@ use super::*;
 use eliot_platform_windows::UserOwnedRootLease;
 use eliot_platform_windows::{HostOwnerEpochCapability, HostOwnerLease};
 
+mod registry_concurrent_read;
 mod registry_wire_launch;
 mod rollback_recovery;
 mod service_start_recovery;
@@ -550,6 +551,32 @@ where
         Ok(value) => value,
         Err(error) => panic!("invalid installation test fixture: {error}"),
     }
+}
+
+// Canonical lineage-A fixture epoch (Implements #64).
+const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+fn test_epoch(sequence: u64) -> eliot_contracts::EpochId {
+    use std::num::NonZeroU64;
+    eliot_contracts::EpochId::new(
+        eliot_contracts::EpochLineageId::new(TEST_LINEAGE_A).expect("valid test lineage"),
+        NonZeroU64::new(sequence).expect("nonzero test sequence"),
+    )
+    .expect("valid test epoch")
+}
+
+fn next_epoch(current: &eliot_contracts::EpochId) -> eliot_contracts::EpochId {
+    use std::num::NonZeroU64;
+    let next_sequence = current
+        .sequence
+        .get()
+        .checked_add(1)
+        .unwrap_or_else(|| unreachable!());
+    eliot_contracts::EpochId::new(
+        current.lineage_id.clone(),
+        NonZeroU64::new(next_sequence).unwrap_or_else(|| unreachable!()),
+    )
+    .unwrap_or_else(|_| unreachable!())
 }
 
 fn test_handle(value: impl Into<String>) -> PlatformHandle {
@@ -1270,6 +1297,29 @@ fn test_watchdog_control_grant() -> InstallerServiceControlGrantReceipt {
     receipt
 }
 
+// s38 (#1345): the installer-policy service DACL grant read back for the
+// Host registration itself. The receipt uses the exact Host installer-policy
+// DACL shape (principal Host SID, Host mask
+// `ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK`, Host policy digest computed by
+// the real platform Host digest authority
+// `host_service_security_descriptor_digest` for a distinct valid Host SID),
+// so the Host proof round-trips through the same marker/evidence/approval
+// gates as the Watchdog proof without canned digests. The Watchdog fixture
+// above stays on the Watchdog mask/digest (byte-identical behavior).
+fn test_host_service_control_grant() -> InstallerServiceControlGrantReceipt {
+    let principal_sid = "S-1-5-80-9-8-7-6-5";
+    let receipt = InstallerServiceControlGrantReceipt {
+        principal_service: test_handle(ELIOT_HOST_SERVICE_NAME),
+        principal_sid: test_handle(principal_sid),
+        access_mask: ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK,
+        security_descriptor_digest: test_handle(must(host_service_security_descriptor_digest(
+            principal_sid,
+        ))),
+    };
+    must(receipt.validate());
+    receipt
+}
+
 fn test_activation_approval(
     manifest: &CandidateManifest,
     transaction_id: PlatformHandle,
@@ -1604,10 +1654,16 @@ fn registering_transaction() -> InstallationTransaction {
         store_bridge_artifact_digest: test_handle("1".repeat(64)),
         canonical_store_artifact_digest: test_handle("5".repeat(64)),
         host_artifact_digest: test_handle("8".repeat(64)),
+        doctor_artifact_digest: test_handle("b".repeat(64)),
+        testd_artifact_digest: test_handle("c".repeat(64)),
+        native_worker_artifact_digest: test_handle("d".repeat(64)),
         kernel_executable_path: test_path(&root, "eliot-kernel.exe"),
         store_bridge_executable_path: test_path(&root, "eliot-store-surreal.exe"),
         canonical_store_executable_path: test_path(&root, "surreal.exe"),
         host_executable_path: test_path(&root, "eliot-host.exe"),
+        doctor_executable_path: test_path(&root, "eliot-doctor.exe"),
+        testd_executable_path: test_path(&root, "eliot-testd.exe"),
+        native_worker_executable_path: test_path(&root, "eliot-native-worker.exe"),
         config_path: test_path(&root, "generation.json"),
         dependency_closure_refs: vec![test_handle("evidence:dependency-closure")],
         license_refs: vec![test_handle("evidence:licenses")],
@@ -1628,7 +1684,7 @@ fn registering_transaction() -> InstallationTransaction {
                 generation: test_handle("generation:candidate"),
                 authority_generation: ResourceGeneration::genesis(),
                 authority_state_fence: StateFence::new(
-                    eliot_contracts::AuthorityEpoch::genesis(),
+                    test_epoch(1),
                     ResourceGeneration::genesis(),
                 ),
                 supervision_authority: SupervisionAuthorityBinding::Pending {
@@ -1670,6 +1726,12 @@ fn registering_transaction() -> InstallationTransaction {
                     test_handle("7".repeat(64)),
                     test_handle("--kernel-artifact-sha256"),
                     test_handle("4".repeat(64)),
+                    test_handle("--doctor-artifact-sha256"),
+                    test_handle("b".repeat(64)),
+                    test_handle("--testd-artifact-sha256"),
+                    test_handle("c".repeat(64)),
+                    test_handle("--native-worker-artifact-sha256"),
+                    test_handle("d".repeat(64)),
                     test_handle("--eliotd-descriptor"),
                     test_path(&root, "eliotd.json"),
                     test_handle("--eliotd-descriptor-sha256"),
@@ -1705,6 +1767,12 @@ fn registering_transaction() -> InstallationTransaction {
                 host_artifact_digest: test_handle("8".repeat(64)),
                 watchdog_executable_path: test_path(&root, "eliot-watchdog.exe"),
                 watchdog_artifact_digest: test_handle("4".repeat(64)),
+                doctor_artifact_digest: test_handle("b".repeat(64)),
+                testd_artifact_digest: test_handle("c".repeat(64)),
+                native_worker_artifact_digest: test_handle("d".repeat(64)),
+                doctor_executable_path: test_path(&root, "eliot-doctor.exe"),
+                testd_executable_path: test_path(&root, "eliot-testd.exe"),
+                native_worker_executable_path: test_path(&root, "eliot-native-worker.exe"),
                 descriptor_digest: test_handle("0".repeat(64)),
             };
             descriptor.authority_descriptor_digest = test_handle(PHASE_B_PENDING_MARKER);
@@ -2102,8 +2170,13 @@ fn system_registration_transaction() -> InstallationTransaction {
         ));
         let configuration_digest = test_handle(request.expected_configuration_digest());
         progress.registration_nonce = Some(nonce);
-        let service_control_grant =
-            (*role == InstallerServiceRole::Watchdog).then(test_watchdog_control_grant);
+        // s38 (#1345): Host and Watchdog registrations both persist their
+        // installer-policy DACL grant; an `Applied` service effect without
+        // its receipt fails closed and can never report DACL ownership.
+        let service_control_grant = match role {
+            InstallerServiceRole::Host => Some(test_host_service_control_grant()),
+            InstallerServiceRole::Watchdog => Some(test_watchdog_control_grant()),
+        };
         progress.service_control_grant = service_control_grant.clone();
         let mut evidence = vec![test_handle(format!("evidence:service:{role:?}"))];
         if let Some(receipt) = &service_control_grant {
@@ -2422,43 +2495,6 @@ fn pending_start_precondition(
 }
 
 #[cfg(windows)]
-fn start_absent(
-    transaction: &InstallationTransaction,
-    index: usize,
-    reason: &str,
-) -> InstallationEffectObservation {
-    InstallationEffectObservation::Absent {
-        observed_precondition: pending_start_precondition(transaction, index),
-        evidence: vec![test_handle(format!(
-            "{reason}:{}",
-            match &transaction.installer_effects[index] {
-                InstallerEffectPlan::StartService { service_name, .. } => service_name,
-                _ => unreachable!(),
-            }
-        ))],
-        service_runtime_lineage: None,
-    }
-}
-
-#[cfg(windows)]
-fn start_absent_with_lineage(
-    transaction: &InstallationTransaction,
-    index: usize,
-    reason: &str,
-    lineage: InstallationServiceProcessLineage,
-) -> InstallationEffectObservation {
-    let mut observation = start_absent(transaction, index, reason);
-    if let InstallationEffectObservation::Absent {
-        service_runtime_lineage,
-        ..
-    } = &mut observation
-    {
-        *service_runtime_lineage = Some(lineage);
-    }
-    observation
-}
-
-#[cfg(windows)]
 fn configure_start_runtime_receipt(port: &mut FakeEffectPort, external_identity: &str) {
     port.execute_outcomes
         .push_back(PortOutcome::Known(InstallationEffectExecution {
@@ -2671,14 +2707,17 @@ fn matching_for(
     index: usize,
     disposition: InstallationEffectDisposition,
 ) -> InstallationEffectObservation {
-    let service_control_grant = matches!(
-        effect,
+    let service_control_grant = match effect {
+        InstallerEffectPlan::RegisterService {
+            role: InstallerServiceRole::Host,
+            ..
+        } => Some(test_host_service_control_grant()),
         InstallerEffectPlan::RegisterService {
             role: InstallerServiceRole::Watchdog,
             ..
-        }
-    )
-    .then(test_watchdog_control_grant);
+        } => Some(test_watchdog_control_grant()),
+        _ => None,
+    };
     InstallationEffectObservation::Matching {
         disposition,
         external_identity: test_handle(format!("external:matching-{index}")),
@@ -2888,6 +2927,9 @@ fn first_install_bootstrap_handoff_keeps_both_starts_pending_through_projection(
             ("eliot-store-surreal.exe", true),
             ("surreal.exe", true),
             ("eliotd.exe", true),
+            ("eliot-doctor.exe", true),
+            ("eliot-testd.exe", true),
+            ("eliot-native-worker.exe", true),
             ("generation.json", false),
             ("eliotd-governor.json", false),
             ("eliotd.json", false),
@@ -3653,6 +3695,119 @@ fn service_marker_requires_exact_transaction_nonce_and_configuration() {
         &"e".repeat(64),
         Some(&substituted_grant),
     ));
+}
+
+// s38 (#1345): a Host service whose DACL is not the installer policy must
+// never be reported `Applied` / `CREATED_BY_TRANSACTION`. Production
+// `inspect_service`/`reconcile_service` map a Host readback without the
+// installer-policy DACL proof to `Mismatch(service-config)`; this
+// pure/durable-level test proves the rest of the lifecycle gate: a Host
+// `Matching` observation without (or with a forged) grant can never
+// validate, while the policy DACL grant validates and round-trips through
+// the ownership marker and the matching evidence binding. No live SCM.
+#[test]
+fn host_service_registration_requires_installer_policy_dacl_proof() {
+    let effect = InstallerEffectPlan::RegisterService {
+        effect_id: test_handle("effect:service:EliotHost"),
+        role: InstallerServiceRole::Host,
+        service_name: test_handle(ELIOT_HOST_SERVICE_NAME),
+        executable_path: test_handle(r"C:\ProgramData\Eliot\packages\canary\eliot-host.exe"),
+        account: InstallerServiceAccount::LocalService,
+        automatic_start: true,
+    };
+    let matching_with = |service_control_grant: Option<InstallerServiceControlGrantReceipt>| {
+        InstallationEffectObservation::Matching {
+            disposition: InstallationEffectDisposition::CreatedByTransaction,
+            external_identity: test_handle("b".repeat(64)),
+            evidence: vec![test_handle("evidence:host-service")],
+            postcondition_digest: test_handle("c".repeat(64)),
+            service_control_grant: service_control_grant.map(Box::new),
+            credential_receipt: None,
+            staging_receipt: None,
+            phase_b_receipt: None,
+            service_runtime_lineage: None,
+        }
+    };
+    // A default-DACL readback carries no grant proof: the observation fails
+    // the Host parity gate and can never become `Applied`.
+    assert!(matches!(
+        matching_with(None).validate_for_effect(&effect),
+        Err(InstallationError::IncompleteObservation(_))
+    ));
+    // A non-policy (forged) DACL digest fails the exact receipt check.
+    let mut forged_grant = test_host_service_control_grant();
+    forged_grant.security_descriptor_digest = test_handle("f".repeat(64));
+    assert!(matches!(
+        matching_with(Some(forged_grant)).validate_for_effect(&effect),
+        Err(InstallationError::IdentityConflict)
+    ));
+    // The policy DACL grant validates as a Host `Matching` observation.
+    let grant = test_host_service_control_grant();
+    must(matching_with(Some(grant.clone())).validate_for_effect(&effect));
+    // The grant digest round-trips through the durable ownership marker: a
+    // policy-DACL marker matches only its own grant proof, never a
+    // default-DACL (`None`) or substituted-digest readback.
+    let transaction = planned_transaction();
+    let mut request = must(effect_request(
+        &transaction,
+        0,
+        1,
+        InstallationEffectAction::Apply,
+        None,
+    ));
+    request.registration_nonce = Some(test_handle("a".repeat(64)));
+    let configuration_digest = "b".repeat(64);
+    let marker = must(WindowsServiceOwnershipMarker::new(
+        &request,
+        ELIOT_HOST_SERVICE_NAME,
+        &configuration_digest,
+        Some(&grant),
+    ));
+    assert!(marker.matches(
+        &request,
+        ELIOT_HOST_SERVICE_NAME,
+        &configuration_digest,
+        Some(&grant),
+    ));
+    assert!(!marker.matches(
+        &request,
+        ELIOT_HOST_SERVICE_NAME,
+        &configuration_digest,
+        None,
+    ));
+    let mut substituted_grant = grant.clone();
+    substituted_grant.security_descriptor_digest = test_handle("f".repeat(64));
+    assert!(!marker.matches(
+        &request,
+        ELIOT_HOST_SERVICE_NAME,
+        &configuration_digest,
+        Some(&substituted_grant),
+    ));
+    // The matching observation carries the typed grant and binds its digest
+    // in evidence, so the Host DACL proof survives into durable `Applied`
+    // state instead of only the configuration digest.
+    let marker_digest = must(marker.digest());
+    let observation = must(service_matching_observation(
+        &request,
+        InstallationEffectDisposition::CreatedByTransaction,
+        &configuration_digest,
+        &marker_digest,
+        Some(grant.clone()),
+    ));
+    let InstallationEffectObservation::Matching {
+        evidence,
+        service_control_grant,
+        ..
+    } = observation
+    else {
+        unreachable!()
+    };
+    assert_eq!(service_control_grant.as_deref(), Some(&grant));
+    assert!(
+        evidence
+            .iter()
+            .any(|handle| handle.as_str() == must(grant.canonical_digest()).as_str())
+    );
 }
 
 #[cfg(windows)]
@@ -4767,9 +4922,8 @@ fn activation_approval_rejects_each_transaction_binding_mismatch() {
     value.authority_state_fence.resource_generation = next_generation;
     mismatches.push(value);
     let mut value = approval.clone();
-    value.authority_state_fence.authority_epoch = must(AuthorityEpoch::new(
-        approval.authority_state_fence.authority_epoch.value() + 1,
-    ));
+    value.authority_state_fence.authority_epoch =
+        next_epoch(&approval.authority_state_fence.authority_epoch);
     mismatches.push(value);
 
     assert_eq!(mismatches.len(), 11);
@@ -6097,7 +6251,27 @@ fn service_registration_projection_is_durable_and_exact() {
         approvals[0].configuration_digest,
         approvals[1].configuration_digest
     );
-    assert!(approvals[0].service_control_grant().is_none());
+    // s38 (#1345): the Host approval carries its own installer-policy DACL
+    // grant exactly like the Watchdog approval; a grant-less Host approval
+    // fails `validate()` and can never authorize `Applied` state.
+    let host_grant = approvals[0]
+        .service_control_grant()
+        .unwrap_or_else(|| unreachable!());
+    must(host_grant.validate());
+    assert_eq!(
+        host_grant.principal_service().as_str(),
+        ELIOT_HOST_SERVICE_NAME
+    );
+    assert_eq!(
+        host_grant.access_mask(),
+        ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK
+    );
+    assert_eq!(
+        host_grant.security_descriptor_digest().as_str(),
+        must(host_service_security_descriptor_digest(
+            host_grant.principal_sid().as_str()
+        ))
+    );
     let watchdog_grant = approvals[1]
         .service_control_grant()
         .unwrap_or_else(|| unreachable!());
@@ -6609,15 +6783,7 @@ fn committed_registry_terminal_reconciles_real_redb_transaction_once() {
     stale_epoch
         .commit_fence
         .authority_state_fence
-        .authority_epoch = must(AuthorityEpoch::new(
-        stale_epoch
-            .commit_fence
-            .authority_state_fence
-            .authority_epoch
-            .value()
-            .checked_add(1)
-            .unwrap_or_else(|| unreachable!()),
-    ));
+        .authority_epoch = next_epoch(&receipt.commit_fence.authority_state_fence.authority_epoch);
     assert!(matches!(
         transaction_store
             .reconcile_active_verified(stale_epoch, vec![test_handle("evidence:stale-epoch")],),
@@ -8701,6 +8867,86 @@ fn rollback_registering_with_durable_pending_evidence_succeeds() {
     );
     port.secret_absence = vec![PortOutcome::Known(true)].into();
     let mut coordinator = InstallationCoordinator::new(port, store.clone());
+    let outcome = must(coordinator.rollback(&transaction_id));
+    assert!(matches!(
+        outcome,
+        InstallationStepOutcome::Applied {
+            stage: InstallationStage::RolledBack,
+            ..
+        }
+    ));
+    assert!(*execute_count.lock().unwrap_or_else(|_| unreachable!()) > 0);
+    let saved = must(store.load(&transaction_id)).unwrap_or_else(|| unreachable!());
+    assert_eq!(saved.stage(), InstallationStage::RolledBack);
+    assert!(saved.pending_external_changes.is_empty());
+    assert!(
+        saved
+            .completed_stage_refs
+            .iter()
+            .all(|r| !r.as_str().contains("recovery:rejected-to-rollback"))
+    );
+}
+
+#[test]
+fn rollback_registering_with_cli_persisted_registry_rejection_succeeds() {
+    // Post-bootstrap shape: Registering, one Applied CreatedByTransaction
+    // effect, empty unknowns, empty pending (the E4/E5 pre-fix shape that
+    // recover rejects with IllegalTransition). The CLI-persisted typed
+    // rejection must make recover/rollback reach RolledBack.
+    let mut transaction = planned_transaction();
+    transaction.effect_progress[0].admitted_precondition =
+        Some(admitted_precondition(&transaction));
+    transaction.effect_progress[0].ownership_secret = Some(test_ownership_secret(
+        InstallationCreateDisposition::Created,
+        InstallationSecretLifecycle::Active,
+    ));
+    transaction.effect_progress[0].state = InstallationEffectProgressState::Applied {
+        disposition: InstallationEffectDisposition::CreatedByTransaction,
+        external_identity: test_handle("external:effect-0"),
+        evidence: vec![test_handle("evidence:recover-registering")],
+        postcondition_digest: test_handle("a".repeat(64)),
+    };
+    transaction.stage = InstallationStage::Registering;
+    transaction.pending_external_changes.clear();
+    transaction.revision = 4;
+    must(transaction.validate());
+    let transaction_id = transaction.transaction_id.clone();
+    let store = SharedStore {
+        state: Arc::new(Mutex::new(Some(transaction.clone()))),
+        ..SharedStore::default()
+    };
+    let execute_count = Arc::new(Mutex::new(0usize));
+    let mut port = fake_port(
+        store.clone(),
+        Vec::new(),
+        vec![
+            PortOutcome::Known(matching(
+                InstallationEffectDisposition::CreatedByTransaction,
+            )),
+            PortOutcome::Known(absent(&transaction)),
+        ],
+        execute_count.clone(),
+    );
+    port.secret_absence = vec![PortOutcome::Known(true)].into();
+    let mut coordinator = InstallationCoordinator::new(port, store.clone());
+    // CLI-persisted typed rejection (E4/E5 seam).
+    let pending_ref = must(registry_projection_pending_ref(&transaction_id));
+    assert_eq!(
+        pending_ref.as_str(),
+        format!("pending:registry-projection:{}", transaction_id.as_str())
+    );
+    let persisted =
+        must(coordinator.persist_non_effect_rejection(&transaction_id, pending_ref.clone()));
+    assert!(matches!(
+        persisted,
+        InstallationStepOutcome::RollbackRequired { ref pending_refs }
+            if pending_refs == &vec![pending_ref.clone()]
+    ));
+    let persisted_state = must(store.load(&transaction_id)).unwrap_or_else(|| unreachable!());
+    assert_eq!(persisted_state.stage(), InstallationStage::RollbackRequired);
+    assert_eq!(persisted_state.pending_external_changes, vec![pending_ref]);
+    assert!(!persisted_state.has_activation_projection_intent());
+    // Later recover/rollback reaches RolledBack with registration rollback executed.
     let outcome = must(coordinator.rollback(&transaction_id));
     assert!(matches!(
         outcome,

@@ -1,7 +1,7 @@
 schema_version = 4
 module_id = "smart.dreamer.development_diagnosis"
 crate = "eliot-dreamer-development-diagnosis"
-status = "PROTOTYPE"
+status = "ADMITTED"
 wave = "cognitive-micromodules-wave-02"
 agent_order = 40
 plane = "Smart"
@@ -21,9 +21,9 @@ discriminator = "The handler must preserve rival root causes, expose common-mode
 primary_responsibility = "Diagnose one bounded development or product gap using repair history, discriminators, product identity and a validated ConflictAnalysisCandidate when available."
 owned_mutable_state = []
 allowed_effects = []
-inputs = ["DreamJobInput class=DevelopmentDiagnosis", "Product Objective and gap", "repair, discriminator and runtime evidence", "optional ConflictAnalysisCandidate"]
+inputs = ["DreamJobAdmission class=DevelopmentDiagnosis", "Product Objective and gap", "repair, discriminator and runtime evidence", "optional ConflictAnalysisCandidate"]
 outputs = ["DevelopmentDiagnosisCandidate", "minimum discriminating experiment", "owner, repair-scope and guardrail recommendation"]
-depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation", "eliot-dreamer-conflict-analysis"]
+depends_on = ["eliot-dreamer-contracts"]
 providers = ["Governor-admitted Dreamer bundle", "conflict-analysis sub-handler"]
 consumers = ["Dreamer diagnosis surface", "Governor or Task Controller named disposition"]
 non_goals = ["feature freeze", "problem closure", "status promotion", "repair execution", "verifier mutation"]
@@ -56,19 +56,14 @@ integration_owner = "cognitive-wave-integrator"
 implementation_language = "Rust 2024"
 required_verification = ["module/package proof at the declared proof ceiling", "real provider/consumer fixture for every changed edge", "the named Product Pulse or Edge proof before promotion", "exact donor reuse/rewrite/reject trace"]
 writeback = "return implementation artifact, exact proof evidence, donor disposition, unresolved ContractChallenges and merge/remove recommendation"
-workspace_admission = "forbidden until implementation, package proof, affected Edge proof, current-main ancestry and integration-owner review"
+workspace_admission = "admitted via #969 (T8-A2) root workspace membership"
 
-# Machine-checked completion gate, read by `scripts/verify-work-unit.py`.
-# `cargo fmt|test|clippy` all pass on an empty crate, so they cannot tell a
-# finished cell from an unstarted one. This table can.
-#
-# These are the floors every cell shares. The owning work unit tightens them
-# with `required_exports` and `required_tests` taken from its own brief, so a
-# reviewer decides on one exit code instead of reading prose criteria.
+# Acceptance is decided by the owning contract and independent review
+# (I0.10: line/test/type counts are not goals). `scripts/verify-work-unit.py`
+# is a retired legacy diagnostic that always reports completion=NOT_VERIFIED
+# and never accepts a work unit. This table names the concrete contract and
+# the required exports/tests plus small behaviour checks the reviewer verifies.
 [acceptance]
-min_source_lines = 200
-min_public_items = 6
-min_tests = 5
 require_deny_unknown_fields = true
 forbid_unsafe = true
 required_exports = []

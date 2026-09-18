@@ -9,6 +9,8 @@
 
 #![forbid(unsafe_code)]
 
+mod classifier;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 pub use eliot_evidence::{
@@ -305,14 +307,29 @@ pub enum RecordFamilyAdmission {
 }
 
 /// Validates the v2 record at the real Governor consumer boundary.
+///
+/// Consistency is routed through the private first-pass classifier
+/// ([`classifier::classify`]); the accepted/cold/fail-closed mapping below
+/// preserves the exact prior behavior while keeping the table-driven match in
+/// one Governor-owned place.
 pub fn admit_record_family_v2(
     record: &ObservationRecordEnvelopeV2,
 ) -> Result<RecordFamilyAdmission, GovernorObservationError> {
-    match record.classification()? {
-        RecordFamilyClassification::Exact { family } => {
+    match classifier::classify(record) {
+        classifier::FirstPassClassification::Exact { family } => {
             Ok(RecordFamilyAdmission::AcceptedExact { family })
         }
-        classification => Ok(RecordFamilyAdmission::Cold { classification }),
+        classifier::FirstPassClassification::CompatibleHint { hinted_family } => {
+            Ok(RecordFamilyAdmission::Cold {
+                classification: RecordFamilyClassification::CompatibleHint { hinted_family },
+            })
+        }
+        classifier::FirstPassClassification::AmbiguousPreserveCandidate => {
+            Ok(RecordFamilyAdmission::Cold {
+                classification: RecordFamilyClassification::AmbiguousCandidate,
+            })
+        }
+        classifier::FirstPassClassification::ConflictingHint { error } => Err(error.into()),
     }
 }
 
@@ -367,13 +384,25 @@ impl ObservationSubmission {
         self.state_fence.validate()?;
         self.record.validate()?;
         if let Some(record_v2) = &self.record_v2 {
-            eliot_observation_contracts::check_v1_v2_coherence(&self.record, record_v2)?;
-            if let RecordFamilyAdmission::Cold { classification } =
-                admit_record_family_v2(record_v2)?
-            {
-                return Err(GovernorObservationError::RecordFamilyNotAccepted {
-                    disposition: classification,
-                });
+            // First-pass consistency is owned by the private classifier, which
+            // applies only the foundation mechanical discriminators
+            // (`classification()` + `check_v1_v2_coherence`). The mapping below
+            // preserves the exact prior admission behavior.
+            match classifier::classify_coherent(&self.record, record_v2) {
+                classifier::FirstPassClassification::Exact { .. } => {}
+                classifier::FirstPassClassification::CompatibleHint { hinted_family } => {
+                    return Err(GovernorObservationError::RecordFamilyNotAccepted {
+                        disposition: RecordFamilyClassification::CompatibleHint { hinted_family },
+                    });
+                }
+                classifier::FirstPassClassification::AmbiguousPreserveCandidate => {
+                    return Err(GovernorObservationError::RecordFamilyNotAccepted {
+                        disposition: RecordFamilyClassification::AmbiguousCandidate,
+                    });
+                }
+                classifier::FirstPassClassification::ConflictingHint { error } => {
+                    return Err(error.into());
+                }
             }
         }
         if !route_supports(self.capture_route, self.durability) {
@@ -528,7 +557,15 @@ impl ObservationAdmissionReceipt {
             return Err(GovernorObservationError::IdentityConflict);
         }
         if let Some(record_v2) = &self.record_v2 {
-            eliot_observation_contracts::check_v1_v2_coherence(&self.record, record_v2)?;
+            // Same classifier consistency as submission validation; only a
+            // mechanically proved conflict fails here. Non-exact coherent
+            // material stays coherent and is re-checked by the submission
+            // replay below.
+            if let classifier::FirstPassClassification::ConflictingHint { error } =
+                classifier::classify_coherent(&self.record, record_v2)
+            {
+                return Err(error.into());
+            }
         }
         if let Some(evidence) = &self.evidence {
             evidence.validate()?;
@@ -976,10 +1013,21 @@ pub fn contract_identity() -> Result<ContractIdentity, GovernorObservationError>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eliot_contracts::{AuthorityEpoch, ClockReading, ResourceGeneration};
+    use eliot_contracts::{ClockReading, EpochId, EpochLineageId, ResourceGeneration};
+    use std::num::NonZeroU64;
+
+    const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn test_epoch(lineage: &str, sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(lineage).expect("valid test lineage"),
+            NonZeroU64::new(sequence).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
 
     fn fence() -> StateFence {
-        StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+        StateFence::new(test_epoch(TEST_LINEAGE_A, 1), ResourceGeneration::genesis())
     }
 
     fn event() -> ObservationEventCore {

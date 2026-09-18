@@ -69,6 +69,12 @@ pub enum CliError {
     MalformedArgument(String),
     /// A non-local transport was requested.
     RemoteTransportForbidden(String),
+    /// An experimental world was selected without its component artifact.
+    MissingExperimentalComponent,
+    /// An experimental component was supplied without its world selection.
+    MissingExperimentalWorld,
+    /// The experimental world spelling is not a frozen typed world.
+    UnknownWorld(String),
 }
 
 impl fmt::Display for CliError {
@@ -80,6 +86,11 @@ impl fmt::Display for CliError {
             Self::RemoteTransportForbidden(transport) => {
                 write!(formatter, "REMOTE_TRANSPORT_FORBIDDEN:{transport}")
             }
+            Self::MissingExperimentalComponent => {
+                formatter.write_str("MISSING_EXPERIMENTAL_COMPONENT")
+            }
+            Self::MissingExperimentalWorld => formatter.write_str("MISSING_EXPERIMENTAL_WORLD"),
+            Self::UnknownWorld(world) => write!(formatter, "UNKNOWN_WORLD:{world}"),
         }
     }
 }
@@ -98,16 +109,21 @@ impl std::str::FromStr for Profile {
     }
 }
 
-/// Parsed profile and local transport selection.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Parsed profile, local transport, and optional explicit experimental selection.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CliConfig {
     /// Selected profile.
     pub profile: Profile,
     /// Selected local transport.
     pub transport: Transport,
+    /// Explicit bounded local artifact for the non-governed experimental path.
+    pub experimental_typed_component: Option<std::path::PathBuf>,
+    /// Explicit frozen world selection for the experimental path.
+    pub experimental_world: Option<String>,
 }
 
 /// Parses B-12's profile and transport arguments without adding a CLI crate.
+#[allow(clippy::too_many_lines)]
 pub fn parse_args<I, S>(arguments: I) -> Result<CliConfig, CliError>
 where
     I: IntoIterator<Item = S>,
@@ -116,6 +132,8 @@ where
     let arguments: Vec<String> = arguments.into_iter().map(Into::into).collect();
     let mut profile = None;
     let mut transport = Transport::Stdio;
+    let mut experimental_typed_component: Option<std::path::PathBuf> = None;
+    let mut experimental_world: Option<String> = None;
     let mut index = 0;
     while index < arguments.len() {
         match arguments[index].as_str() {
@@ -153,11 +171,69 @@ where
                 transport = Transport::parse(value)?;
                 index += 1;
             }
+            "--experimental-typed-component" => {
+                let value = arguments.get(index + 1).ok_or_else(|| {
+                    CliError::MalformedArgument(
+                        "--experimental-typed-component requires a value".to_owned(),
+                    )
+                })?;
+                if value.is_empty() {
+                    return Err(CliError::MalformedArgument(
+                        "--experimental-typed-component requires a value".to_owned(),
+                    ));
+                }
+                experimental_typed_component = Some(std::path::PathBuf::from(value));
+                index += 2;
+            }
+            value if value.starts_with("--experimental-typed-component=") => {
+                let value = value.trim_start_matches("--experimental-typed-component=");
+                if value.is_empty() {
+                    return Err(CliError::MalformedArgument(
+                        "--experimental-typed-component= requires a value".to_owned(),
+                    ));
+                }
+                experimental_typed_component = Some(std::path::PathBuf::from(value));
+                index += 1;
+            }
+            "--world" => {
+                let value = arguments.get(index + 1).ok_or_else(|| {
+                    CliError::MalformedArgument("--world requires a value".to_owned())
+                })?;
+                if value.is_empty() {
+                    return Err(CliError::MalformedArgument(
+                        "--world requires a value".to_owned(),
+                    ));
+                }
+                experimental_world = Some(value.clone());
+                index += 2;
+            }
+            value if value.starts_with("--world=") => {
+                let value = value.trim_start_matches("--world=");
+                if value.is_empty() {
+                    return Err(CliError::MalformedArgument(
+                        "--world= requires a value".to_owned(),
+                    ));
+                }
+                experimental_world = Some(value.to_owned());
+                index += 1;
+            }
             value => return Err(CliError::MalformedArgument(value.to_owned())),
         }
+    }
+    match (&experimental_typed_component, &experimental_world) {
+        (Some(_), None) => return Err(CliError::MissingExperimentalWorld),
+        (None, Some(_)) => return Err(CliError::MissingExperimentalComponent),
+        (Some(_), Some(world)) => {
+            if crate::typed_bindings::TypedWorld::parse(world).is_none() {
+                return Err(CliError::UnknownWorld(world.clone()));
+            }
+        }
+        (None, None) => {}
     }
     Ok(CliConfig {
         profile: profile.ok_or(CliError::MissingProfile)?,
         transport,
+        experimental_typed_component,
+        experimental_world,
     })
 }

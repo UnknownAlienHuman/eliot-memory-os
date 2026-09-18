@@ -16,19 +16,49 @@
 use std::future::Future;
 use std::pin::Pin;
 
+#[cfg(windows)]
+mod commit_recovery;
+#[cfg(windows)]
+pub use commit_recovery::{
+    CommitRecoveryClass, CommitRecoveryError, classify_commit_receipt, paused_ordering_scope_view,
+    paused_scopes_snapshot, receipt_evidence_digest, recover_commit,
+};
+mod doctor;
+mod doctor_front_door;
+mod host_request_binding;
 mod lifecycle;
+mod process_execution_client;
 mod protocol;
 mod store_client;
 #[cfg(windows)]
 mod store_gateway;
+mod testd_front_door;
 
+pub use doctor::{
+    ComposedDoctorFrontDoor, DOCTOR_CONFLICT_MAX_FIELDS, DOCTOR_MAX_ENVELOPE_BYTES,
+    DOCTOR_MAX_LEASE_DURATION_NANOS, DOCTOR_RECOVERY_LEASE_OWNER, DOCTOR_REPAIR_ADVERTISED,
+    DOCTOR_REPAIR_WIRE_ID, DOCTOR_REPAIR_WIRE_VERSION, DoctorAdmissionContext,
+    DoctorRecipeRegistry, DoctorRegistryError, DoctorRepairAdmission, DoctorRepairAttemptRequest,
+    DoctorRepairConflict, DoctorRepairRejection, DoctorRepairRejectionReason, DoctorRepairResponse,
+    RegisteredDoctorRecipe, admit_doctor_repair, advertise_doctor_repair,
+    reconcile_doctor_repair_admission, route_doctor_repair,
+};
+pub use doctor_front_door::{
+    AuthenticatedDoctorSession, handle_doctor_repair_attempt, handle_doctor_repair_cancellation,
+    is_doctor_diagnosis_only_envelope, reconcile_doctor_repair_delivery,
+};
 pub use eliot_process::ProcessExecutionAdmissionRequest;
 pub use eliot_protocol::{
     AGENT_BRIDGE_CLIENT_DECLARATION_WIRE_ID, AGENT_BRIDGE_CLIENT_DECLARATION_WIRE_VERSION,
     AgentBridgeClientDeclaration,
 };
+pub use host_request_binding::{AuthenticatedHostSession, KernelHostRequestBinder};
 pub use lifecycle::{
     AdmissionLease, KernelService, KernelServiceError, KernelServiceState, ServiceFailure,
+};
+pub use process_execution_client::{
+    KernelProcessExecutionClient, ProcessOperationFuture, ProcessOperationPort, ProcessStarter,
+    ProcessStarterFuture,
 };
 pub use protocol::{
     AGENT_BRIDGE_ADMISSION_DESCRIPTOR_WIRE_ID, AGENT_BRIDGE_ADMISSION_DESCRIPTOR_WIRE_VERSION,
@@ -38,16 +68,44 @@ pub use protocol::{
     HostStoreBootstrapRequirement, KERNEL_CONTROL_PIPE, KERNEL_CONTROL_WIRE_ID,
     KERNEL_CONTROL_WIRE_VERSION, KernelActivationPermit, KernelActivationQuery,
     KernelActivationReceipt, KernelControlCommand, KernelControlRequest, KernelControlResponse,
-    KernelReadyReceipt, ProcessAuthorityHandoffDescriptor, ProcessExecutionRejection,
-    ProcessExecutionRequest, ProcessExecutionResponse, ProcessObservation, RestartBudget,
+    KernelReadyReceipt, NATIVE_WORKER_CLAIM_WIRE_ID, NATIVE_WORKER_CLAIM_WIRE_VERSION,
+    NATIVE_WORKER_CLAIM_WIRE_VERSION_V1, NATIVE_WORKER_EXECUTABLE_BINDING_EXPECTED_WIRE_VERSION,
+    NATIVE_WORKER_EXECUTION_UNIT_SCHEMA_VERSION, NATIVE_WORKER_PROTOCOL_VERSION,
+    NATIVE_WORKER_REPLAY_MAX_EVENT_BYTES, NATIVE_WORKER_REPLAY_MAX_EVENT_REFS,
+    NATIVE_WORKER_REPLAY_MAX_PAGE, NATIVE_WORKER_REPLAY_MAX_TRACE_ENTRIES,
+    NATIVE_WORKER_REPLAY_WIRE_ID, NATIVE_WORKER_REPLAY_WIRE_VERSION, NativeWorkerClaimBudget,
+    NativeWorkerClaimConflict, NativeWorkerClaimReceipt, NativeWorkerClaimRejection,
+    NativeWorkerClaimRejectionReason, NativeWorkerClaimRequest, NativeWorkerClaimResponse,
+    NativeWorkerExecutableBinding, NativeWorkerExecutableExpectation, NativeWorkerReplayAckPhase,
+    NativeWorkerReplayAckReceipt, NativeWorkerReplayAcknowledgeReply,
+    NativeWorkerReplayAcknowledgeRequest, NativeWorkerReplayAppendReply,
+    NativeWorkerReplayAppendRequest, NativeWorkerReplayAuthority, NativeWorkerReplayBeginReply,
+    NativeWorkerReplayBeginRequest, NativeWorkerReplayConflict, NativeWorkerReplayDecision,
+    NativeWorkerReplayDeliveryClass, NativeWorkerReplayEnvelope, NativeWorkerReplayEventDraft,
+    NativeWorkerReplayExpectation, NativeWorkerReplayLookupReply, NativeWorkerReplayLookupRequest,
+    NativeWorkerReplayOperation, NativeWorkerReplayPage, NativeWorkerReplayReplayReply,
+    NativeWorkerReplayReplayRequest, NativeWorkerReplayStreamBinding,
+    NativeWorkerReplayStreamPosition, PROVIDER_CAPABILITY_WIRE_VERSION,
+    ProcessAuthorityHandoffDescriptor, ProcessExecutionRejection, ProcessExecutionRequest,
+    ProcessExecutionResponse, ProcessObservation, ProviderCapabilityError,
+    ProviderCapabilityExpectation, ProviderCapabilityRequest, ProviderProofKind, RestartBudget,
     StoreBootstrapDescriptor, StoreBootstrapHandoff, StoreProcessBinding, StoreRebindHandoff,
-    StoreRebindQuery, StoreRebindReceipt, control_request_frame, control_response_frame,
-    decode_control_request_frame, decode_control_response_frame,
-    semantic_store_config_hash_from_json,
+    StoreRebindQuery, StoreRebindReceipt, admit_replay_request, control_request_frame,
+    control_response_frame, decode_control_request_frame, decode_control_response_frame,
+    replay_stream_id, semantic_store_config_hash_from_json, verify_provider_capability,
 };
 pub use store_client::{EbpCanonicalStoreClient, EbpStoreTransport, StoreClientError};
 #[cfg(windows)]
 pub use store_gateway::KernelStoreGateway;
+pub use testd_front_door::{
+    AuthenticatedTestdSession, TESTD_ADMISSION_ADVERTISED, TESTD_ADMISSION_WIRE_ID,
+    TESTD_ADMISSION_WIRE_VERSION, TESTD_CONFLICT_MAX_FIELDS, TESTD_MAX_ENVELOPE_BYTES,
+    TestdAdmission, TestdAdmissionAttemptRequest, TestdAdmissionConflict, TestdAdmissionContext,
+    TestdAdmissionEnvelope, TestdAdmissionRejection, TestdAdmissionRejectionReason,
+    TestdAdmissionResponse, advertise_testd_admission, advertise_testd_admission_when_composed,
+    handle_testd_admission_attempt, handle_testd_cancellation, is_testd_diagnosis_only_envelope,
+    reconcile_testd_admission, reconcile_testd_delivery, route_testd_admission,
+};
 
 /// Boxed future for provider-neutral Kernel process operations.
 pub type ProcessExecutionFuture<'a> =

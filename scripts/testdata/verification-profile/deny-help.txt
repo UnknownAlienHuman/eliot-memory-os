@@ -1,0 +1,40 @@
+# WORK_UNIT_CASE: 750/17 provenance fixture. Exact captured output of
+# `cargo deny check --help` from the pinned scanner (cargo-deny 0.20.2).
+# `check` accepts no --locked flag: dependency locking for deny flows from
+# Cargo.lock + deny.toml (read-only reference), never an invented flag.
+#
+# Checks a project's crate graph
+#
+# Usage: cargo-deny.exe check [OPTIONS] [WHICH]...
+#
+# Arguments:
+#   [WHICH]...
+#           The check(s) to perform.
+#
+#           [possible values: advisories, bans, licenses, sources, all]
+#
+# Options:
+#   -g, --graph <GRAPH>
+#           Path to graph output root directory.
+#
+#           If set, a dotviz graph will be created for whenever multiple versions of the same crate are detected.
+#
+#           Each file will be created at `<dir>/graph_output/<crate_name>.dot`. `<dir>/graph_output/*` is deleted and recreated each run.
+#
+#       --hide-inclusion-graph
+#           Hide the inclusion graph when printing out info for a crate.
+#
+#   -s, --show-stats
+#           Show stats for all the checks, regardless of the log-level.
+#
+#   -W, --warn <WARN>
+#           Set lint warnings.
+#
+#   -A, --allow <ALLOW>
+#           Set lint allowed.
+#
+#   -D, --deny <DENY>
+#           Set lint denied.
+#
+#   -h, --help
+#           Print help (see a summary with '-h')

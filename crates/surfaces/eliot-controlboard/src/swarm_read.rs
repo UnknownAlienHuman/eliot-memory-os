@@ -129,11 +129,12 @@ fn validate_envelope(
             "swarm_projection.source_digest",
         ));
     }
-    envelope.fence.validate()?;
-    if envelope.fence.revision != envelope.revision
-        || envelope.revision != access.binding.access_revision
-        || envelope.fence.authority_epoch != access.binding.authority_epoch
-        || envelope.fence.fence_id != access.binding.access_fence_id
+    envelope
+        .fence
+        .validate()
+        .map_err(|error| ControlBoardError::Provider(error.to_string()))?;
+    if envelope.revision != access.binding.access_revision
+        || envelope.fence != access.binding.access_fence
         || request
             .expected_revision
             .is_some_and(|revision| revision != envelope.revision)
@@ -210,10 +211,22 @@ mod tests {
     use eliot_agent_coordinator::{
         ModelQueryReceipt, SwarmCatalogueProjection, SwarmProjectionGap, SwarmProjectionProvider,
     };
+    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
+    use std::num::NonZeroU64;
 
     use super::*;
 
     use crate::{AccessResolverPort, PLAN_GAP};
+
+    const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn test_epoch(sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(TEST_LINEAGE_A).expect("valid test lineage"),
+            NonZeroU64::new(sequence).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
 
     #[derive(Clone)]
     struct FakeAccess {
@@ -246,7 +259,10 @@ mod tests {
     }
 
     fn fence() -> StateFence {
-        StateFence::new(3, revision(), "swarm-fence-7").expect("fence")
+        StateFence::new(
+            test_epoch(3),
+            ResourceGeneration::new(7).expect("generation"),
+        )
     }
 
     fn request() -> ReadRequest {
@@ -280,8 +296,7 @@ mod tests {
                 observed_at_unix_ms: 1_100,
                 expires_at_unix_ms: 2_000,
                 access_revision: revision(),
-                authority_epoch: 3,
-                access_fence_id: "swarm-fence-7".to_owned(),
+                access_fence: fence(),
             },
         }
     }
@@ -411,7 +426,10 @@ mod tests {
     fn stale_fence_and_cross_scope_envelopes_fail_closed() {
         let mut stale = envelope(Visibility::Public, PrivacyClass::Public);
         stale.revision = ViewRevision::new(8).expect("revision");
-        stale.fence = StateFence::new(3, stale.revision, "swarm-fence-8").expect("fence");
+        stale.fence = StateFence::new(
+            test_epoch(3),
+            ResourceGeneration::new(8).expect("generation"),
+        );
         stale.source_digest = swarm_projection_source_digest(&stale).expect("digest");
         let mut stale_board = board(Role::HumanRequester, vec![PrivacyClass::Public], stale);
         assert_eq!(

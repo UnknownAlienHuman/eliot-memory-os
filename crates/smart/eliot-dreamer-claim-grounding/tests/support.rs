@@ -2,21 +2,25 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use std::num::NonZeroU64;
+
 use eliot_dreamer_contracts::grounding::canonical::{
-    AbsenceClaim, AbsenceClaimParams, ArtifactId, AuthorityEpoch, BoundedProof, CausalClaim,
-    CausalClaimParams, CausalStatus, CoverageDenominator, CoverageDenominatorParams,
-    CoverageReceipt, CoverageReceiptParams, DenominatorKind, EvidenceAuthority, EvidenceFreshness,
-    EvidenceGrade, FrontierRevision, FrontierSpec, LineageRootId, MemberDisposition, MemberOutcome,
-    OwnerLookup, PaginationBounds, PositionAssertability, Precision, PrivacyHandling,
-    QueryRevision, QuerySpec, ResourceGeneration, SnapshotRef, SourceAssurance, SourceId,
-    SourceLineage, SourceRevisionId, StateFence, TaskId, TemporalRecord, ValidityBounds,
+    AbsenceClaim, AbsenceClaimParams, ArtifactId, BoundedProof, CausalClaim, CausalClaimParams,
+    CausalStatus, CoverageDenominator, CoverageDenominatorParams, CoverageReceipt,
+    CoverageReceiptParams, DenominatorKind, EpochId, EpochLineageId, EvidenceAuthority,
+    EvidenceFreshness, EvidenceGrade, FrontierRevision, FrontierSpec, LineageRootId,
+    MemberDisposition, MemberOutcome, OwnerLookup, PaginationBounds, PositionAssertability,
+    Precision, PrivacyHandling, QueryRevision, QuerySpec, ResourceGeneration, SnapshotRef,
+    SourceAssurance, SourceId, SourceLineage, SourceRevisionId, StateFence, TaskId, TemporalRecord,
+    ValidityBounds,
 };
 use eliot_dreamer_contracts::grounding::{
     AllowedReferenceManifest, AttemptIdentity, ClaimKind, GroundingPolicy, MaterialClaim,
-    ModelDraft, PrecisionPayload, RouteIdentity, ScreenTargetBinding, TypedEvidenceAssertion,
+    PrecisionPayload, RouteIdentity, ScreenTargetBinding, StructuredModelDraft,
+    TypedEvidenceAssertion,
 };
 use eliot_dreamer_contracts::{
-    AtomicityMode, BudgetLimits, BundleCompleteness, DreamInputBundle, DreamJobInput, JobClass,
+    AtomicityMode, BudgetLimits, BundleCompleteness, DreamInputBundle, DreamJobAdmission, JobClass,
     Requester, RequesterOrigin, ScreenBinding, ScreenState, TargetDenominator,
 };
 
@@ -27,7 +31,13 @@ pub fn artifact(value: &str) -> ArtifactId {
 }
 
 pub fn fence() -> StateFence {
-    StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+    let epoch = EpochId::new(
+        EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .expect("canonical test lineage-A"),
+        NonZeroU64::new(1).expect("non-zero test sequence"),
+    )
+    .expect("valid test epoch");
+    StateFence::new(epoch, ResourceGeneration::genesis())
 }
 
 pub fn task() -> TaskId {
@@ -232,8 +242,8 @@ pub fn complete_absence_payload() -> (PrecisionPayload, CoverageDenominator, Cov
     )
 }
 
-pub fn job(manifest_digest: String, class: JobClass) -> DreamJobInput {
-    DreamJobInput {
+pub fn job(manifest_digest: String, class: JobClass) -> DreamJobAdmission {
+    DreamJobAdmission {
         schema_version: 1,
         job_class: class,
         requester: Requester {
@@ -425,7 +435,7 @@ pub fn draft(
     manifest: &AllowedReferenceManifest,
     claims: Vec<MaterialClaim>,
     class: JobClass,
-) -> ModelDraft {
+) -> StructuredModelDraft {
     let provisional_job = job(manifest.digest.clone(), class);
     let bundle = DreamInputBundle {
         schema_version: 1,
@@ -439,7 +449,7 @@ pub fn draft(
         completeness: BundleCompleteness::Unknown,
         authoritative_denominator: None,
     };
-    let mut draft = ModelDraft {
+    let mut draft = StructuredModelDraft {
         schema_version: 2,
         job_id: provisional_job.canonical_id(),
         task_id: task(),
@@ -505,4 +515,145 @@ pub fn policy() -> GroundingPolicy {
     };
     policy.digest = policy.computed_digest().expect("policy digest");
     policy
+}
+
+pub fn temporal_record() -> TemporalRecord {
+    TemporalRecord::new(90, 100, 110, 120, 130).expect("temporal")
+}
+
+pub fn temporal_payload() -> PrecisionPayload {
+    PrecisionPayload::TemporalVersioned {
+        temporal: temporal_record(),
+        version: "revision-grounding".into(),
+        revision: "revision-grounding".into(),
+    }
+}
+
+pub fn comparative_payload() -> PrecisionPayload {
+    PrecisionPayload::ComparativeSuperlative {
+        measure: "latency-ms".into(),
+        population: "all-candidates".into(),
+        reference: "baseline".into(),
+        relation: "less-than".into(),
+        value: Some("5".into()),
+    }
+}
+
+pub fn quote_payload() -> PrecisionPayload {
+    PrecisionPayload::QuoteAttribution {
+        quoted_text: "exact quoted sentence".into(),
+        source: artifact("evidence-1"),
+        span: "span-1".into(),
+        attributed_to: "fixture-source".into(),
+    }
+}
+
+pub fn recommendation_payload() -> PrecisionPayload {
+    PrecisionPayload::RecommendationNormativeInference {
+        recommendation: "rotate keys".into(),
+        fact_components: BTreeSet::from(["value".into()]),
+        assumptions: BTreeSet::from(["assumption-1".into()]),
+        inference_rule: "if fact then recommend".into(),
+    }
+}
+
+pub fn identity_payload() -> PrecisionPayload {
+    PrecisionPayload::IdentityEntity {
+        entity: "entity-1".into(),
+        entity_type: "service".into(),
+        version: "revision-grounding".into(),
+        scope: "grounding-scope".into(),
+    }
+}
+
+pub fn support_for(
+    proposition: &str,
+    handles: BTreeSet<ArtifactId>,
+    result: eliot_dreamer_contracts::grounding::canonical::SupportResult,
+    grade: eliot_dreamer_contracts::grounding::canonical::EvidenceGrade,
+    temporal: Option<TemporalRecord>,
+) -> eliot_dreamer_contracts::grounding::canonical::SupportRecord {
+    eliot_dreamer_contracts::grounding::canonical::SupportRecord {
+        proposition: eliot_dreamer_contracts::grounding::PropositionId::new(proposition)
+            .expect("proposition"),
+        result,
+        handles,
+        validity: eliot_dreamer_contracts::grounding::canonical::ValidityBounds {
+            scope: "grounding-scope".into(),
+            window_start_ms: None,
+            window_end_ms: None,
+            version: "revision-grounding".into(),
+            precision: "file".into(),
+        },
+        grade: eliot_dreamer_contracts::grounding::canonical::GradeAssignment::known(grade),
+        task_id: task(),
+        fence: fence(),
+        temporal,
+        assurance: None,
+        reopen_reason: None,
+        proof_digest: DIGEST.into(),
+    }
+}
+
+pub fn temporal_support_for(
+    proposition: &str,
+) -> eliot_dreamer_contracts::grounding::canonical::SupportRecord {
+    support_for(
+        proposition,
+        BTreeSet::from([artifact("evidence-1")]),
+        eliot_dreamer_contracts::grounding::canonical::SupportResult::Supported,
+        EvidenceGrade::Grounded,
+        Some(temporal_record()),
+    )
+}
+
+pub fn non_material_claim(id: &str) -> eliot_dreamer_contracts::grounding::NonMaterialClaim {
+    let mut claim = eliot_dreamer_contracts::grounding::NonMaterialClaim {
+        claim_id: id.into(),
+        category: "unresolved".into(),
+        reason: "explicit non-evidentiary residue".into(),
+        source_preimage_digest: String::new(),
+    };
+    claim.source_preimage_digest = claim.computed_digest().expect("residue digest");
+    claim
+}
+
+pub fn refresh_claim(claim: &mut MaterialClaim) {
+    claim.source_preimage_digest = claim.computed_digest().expect("claim digest");
+}
+
+pub fn refresh_draft(draft: &mut StructuredModelDraft) {
+    draft.draft_digest = draft.computed_digest().expect("draft digest");
+}
+
+pub fn refresh_manifest(manifest: &mut AllowedReferenceManifest) {
+    manifest.digest = manifest.computed_digest().expect("manifest digest");
+}
+
+pub fn refresh_policy(policy: &mut GroundingPolicy) {
+    policy.digest = policy.computed_digest().expect("policy digest");
+}
+
+pub fn claim_with_components(
+    id: &str,
+    proposition: &str,
+    payload: PrecisionPayload,
+    handle: Option<&str>,
+    extra_components: &[&str],
+) -> MaterialClaim {
+    let mut claim = claim_with_payload(id, proposition, payload, handle);
+    let proposition_id =
+        eliot_dreamer_contracts::grounding::PropositionId::new(proposition).expect("proposition");
+    for component in extra_components {
+        claim.component_digests.insert(
+            (*component).into(),
+            eliot_dreamer_contracts::grounding::component_content_digest(
+                &proposition_id,
+                component,
+            )
+            .expect("component"),
+        );
+    }
+    refresh_claim(&mut claim);
+    claim
 }

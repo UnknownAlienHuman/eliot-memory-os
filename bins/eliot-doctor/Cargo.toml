@@ -14,7 +14,25 @@ name = "eliot-doctor"
 path = "src/main.rs"
 
 [dependencies]
+eliot-cli.workspace = true
+eliot-contracts.workspace = true
 eliot-doctor-core.workspace = true
+eliot-kernel-service.workspace = true
+eliot-platform.workspace = true
+eliot-process.workspace = true
+eliot-process-executor.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+eliot-instrument-api.workspace = true
+# T2-S06 second-consumer proof (test-only): the in-memory durable recovery
+# ledger behind the real Kernel admission gate. Production durability stays
+# with the store slice; this edge never enters the runtime boundary.
+eliot-ors.workspace = true

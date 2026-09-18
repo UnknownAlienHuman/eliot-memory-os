@@ -10,7 +10,7 @@ use crate::curation::{CurationKind, CurationPayload};
 use crate::draft::{CurationAcceptanceCtx, ValidatedCurationItem};
 use crate::encoding::{canonical_bytes, digest_hex};
 use crate::error::{ContractViolation, check_fence, check_text, check_vec_bound, is_hex64_lower};
-use crate::job::DreamJobInput;
+use crate::job::DreamJobAdmission;
 use crate::registry::TypedCurationHandlerRequest;
 use crate::screen::{ScreenBinding, ScreenState};
 
@@ -168,7 +168,7 @@ pub struct ConceptInput {
     pub scope_id: String,
     pub state_fence: StateFence,
     pub policy_digest: String,
-    pub job: DreamJobInput,
+    pub job: DreamJobAdmission,
     pub item: ValidatedCurationItem,
     pub request: TypedCurationHandlerRequest,
     pub sources: ConceptSourceSet,

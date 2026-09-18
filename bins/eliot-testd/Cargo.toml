@@ -14,7 +14,10 @@ name = "eliot-testd"
 path = "src/main.rs"
 
 [dependencies]
+eliot-cli.workspace = true
+eliot-contracts.workspace = true
 eliot-instrument-api.workspace = true
+eliot-platform.workspace = true
 eliot-platform-windows.workspace = true
 eliot-process.workspace = true
 eliot-process-executor.workspace = true

@@ -1,5 +1,5 @@
 use eliot_contracts::{
-    ArtifactId, AuthorityEpoch, OperationId, PolicyRevision, ProductId, RequestId,
+    ArtifactId, EpochId, EpochLineageId, OperationId, PolicyRevision, ProductId, RequestId,
     ResourceGeneration, SourceId, StateFence, TaskId, TaskRevision, sha256_hex,
 };
 use eliot_learning_activation_assessment::*;
@@ -19,6 +19,17 @@ fn digest(value: &str) -> String {
     sha256_hex(value.as_bytes())
 }
 
+const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+#[allow(clippy::expect_used)]
+fn test_epoch(sequence: u64) -> EpochId {
+    EpochId::new(
+        EpochLineageId::new(TEST_LINEAGE_A).expect("valid test lineage"),
+        std::num::NonZeroU64::new(sequence).expect("nonzero test sequence"),
+    )
+    .expect("valid test epoch")
+}
+
 fn binding() -> Result<ContractBinding, Box<dyn std::error::Error>> {
     Ok(ContractBinding {
         schema_version: 1,
@@ -28,7 +39,7 @@ fn binding() -> Result<ContractBinding, Box<dyn std::error::Error>> {
         product_id: ProductId::new("eliot")?,
         task_id: TaskId::new("task-620")?,
         scope: WorkScopeId::new("scope-620")?,
-        state_fence: StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis()),
+        state_fence: StateFence::new(test_epoch(1), ResourceGeneration::genesis()),
         source: eliot_learning_contracts::identity::SourceLineage {
             owner: SourceId::new("source-620")?,
             snapshot: aid("snapshot-620")?,

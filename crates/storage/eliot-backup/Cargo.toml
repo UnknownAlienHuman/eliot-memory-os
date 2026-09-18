@@ -16,5 +16,8 @@ serde_json.workspace = true
 thiserror.workspace = true
 blake3.workspace = true
 
+[dev-dependencies]
+eliot-store-memory = { path = "../eliot-store-memory" }
+
 [lints]
 workspace = true

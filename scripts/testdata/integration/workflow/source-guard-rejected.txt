@@ -1,0 +1,5 @@
+SOURCE_GUARD: REJECTED
+reason: foreign source SHA does not match the pinned dispatch source
+expected: b5c8ac6e26b827125b6067bb89f6df5aa5f4aa68
+actual: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+# WORK_UNIT_CASE: 915/19 negative fixture. Foreign or mismatched sources must be rejected.

@@ -10,9 +10,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use eliot_contracts::{
-    ArtifactId, AuthorityEpoch, ContractId, ResourceGeneration, TransactionSequence,
-};
+use eliot_contracts::{ArtifactId, ContractId, ResourceGeneration, TransactionSequence};
 pub use eliot_contracts::{
     ContractError, ContractVersion, ErrorCode, OperationId, RequestMetadata, StateFence,
     canonical_json_bytes, sha256_hex,
@@ -24,31 +22,95 @@ use eliot_receipts::{
 };
 pub use eliot_receipts::{EffectClass, ReceiptEnvelope};
 pub use eliot_security_contracts::{
-    DisclosureDependencyClosure, InfluenceDependencyClosure, PurgeLedgerEntry,
-    SelectionIntegrityReceipt, SourceAssurance, TransformationLineage,
+    DisclosureDependencyClosure, InfluenceDependencyClosure, InfluenceState, PurgeLedgerEntry,
+    RevocationReason, SelectionIntegrityReceipt, SourceAssurance, TransformationLineage,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+mod dreamer_job;
+pub mod epistemic_revision;
+pub mod erasure_admission;
+mod payload_authority;
+mod request_hash;
 mod store_failure;
 mod wire;
 
+pub use dreamer_job::{
+    DREAMER_JOB_LEDGER_SCHEMA, DreamerJobExpectedState, DreamerJobLedgerEvent,
+    DreamerJobLedgerRecord, DreamerJobMutationIdentity, MAX_DREAMER_JOB_HISTORY,
+    MAX_DREAMER_JOB_QUEUE_KEY_BYTES, MAX_DREAMER_JOB_TEXT_BYTES, dreamer_job_queue_key,
+    map_durable_error, validate_ledger_bundle,
+};
+
+pub use payload_authority::{
+    CONTROL_FIELD_DENYLIST, CanonicalJson, ExactJsonBytes, MAX_EXACT_JSON_BYTES,
+    PAYLOAD_AUTHORITY_VERSION, PayloadEncoding, PayloadSource, json_shape_name,
+    number_token_would_narrow, reject_control_parameter_name,
+};
+
+pub use request_hash::{
+    CanonicalRequestView, MAX_DIGEST_DETAIL_CHARS, canonical_request_bytes, canonical_request_hash,
+    verify_canonical_request_hash,
+};
+
 pub use store_failure::{
-    LegacyStoreFailureV1, MAX_STORE_FAILURE_DETAIL_LEN, MAX_STORE_FAILURE_REFERENCE_LEN,
+    ErasureFailureKind, MAX_STORE_FAILURE_DETAIL_LEN,
+    MAX_STORE_FAILURE_EVIDENCE_HANDLES, MAX_STORE_FAILURE_REFERENCE_LEN,
     MAX_STORE_FAILURE_RETRY_AFTER_MS, MAX_STORE_REASON_CODE_LEN, STORE_FAILURE_CONTRACT_REVISION,
-    StoreConflictObservation, StoreFailure, StoreFailureContractError, StoreFailureDisposition,
-    StoreFailureIdentityContext, StoreFailureRequestContext, StoreMutationDisposition,
-    StoreReasonCode, StoreRecoveryAction, StoreRetryDirective, decode_legacy_store_failure_v1,
+    StoreConflictObservation, StoreEvidenceHandles, StoreFailure, StoreFailureContractError,
+    StoreFailureDisposition, StoreFailureIdentityContext, StoreFailureRequestContext,
+    StoreMutationDisposition, StoreReasonCode, StoreRecoveryAction, StoreRetryDirective,
+    erasure_store_failure,
 };
 
 pub use wire::{
-    CAPABILITIES, CAPABILITY_APPLY, CAPABILITY_HEALTH, CAPABILITY_INITIALIZE_GENESIS,
+    CAPABILITIES, CAPABILITY_APPLY, CAPABILITY_DREAMER_JOB_BEGIN_VERIFICATION,
+    CAPABILITY_DREAMER_JOB_CHECKPOINT, CAPABILITY_DREAMER_JOB_LEASE_EXACT,
+    CAPABILITY_DREAMER_JOB_LEASE_NEXT, CAPABILITY_DREAMER_JOB_PUBLISH,
+    CAPABILITY_DREAMER_JOB_RECONCILE, CAPABILITY_DREAMER_JOB_RENEW,
+    CAPABILITY_DREAMER_JOB_REQUEST_CANCEL, CAPABILITY_DREAMER_JOB_RESUME,
+    CAPABILITY_DREAMER_JOB_START, CAPABILITY_DREAMER_JOB_STATUS, CAPABILITY_DREAMER_JOB_SUBMIT,
+    CAPABILITY_ERASURE_INTENT, CAPABILITY_HEALTH, CAPABILITY_INITIALIZE_GENESIS,
     CAPABILITY_NAMED_READ, CAPABILITY_ORDERING_HEADS, CAPABILITY_READINESS, CAPABILITY_RECEIPT,
     CAPABILITY_RECOVERY, CAPABILITY_REVISION_HEADS, CAPABILITY_VALIDATION_SNAPSHOT, EFFECTS,
-    ReadinessReceipt, ReadinessStatus, StoreRequest, StoreResponse, StoreWireError,
-    decode_request_frame, decode_response_frame, request_frame, response_frame,
+    ErasureSurfaceRequest, ReadinessReceipt, ReadinessStatus, StoreRequest, StoreResponse,
+    StoreWireError, decode_request_frame, decode_request_frame_with_authority,
+    decode_response_frame, dreamer_job_capability, request_frame,
+    request_frame_with_payload_authority, response_frame,
+};
+
+mod operation_catalogue;
+mod operation_parameters;
+mod revocation_history;
+
+pub use erasure_admission::{
+    ERASURE_PARAM_OPERATION_ID, ERASURE_PARAM_REASON, ERASURE_PARAM_REQUESTER,
+    ERASURE_PARAM_SUBJECT, ERASURE_PARAM_SURFACES, ERASURE_SURFACE_SEPARATOR,
+    ErasureAdmissionRequest, admit_erasure_transition, decode_erasure_surfaces,
+    encode_erasure_surfaces,
+};
+
+pub use operation_catalogue::{
+    ACTIVATED_READ_OWNING_SECTION, EVIDENCE_PACK_MAX_RECORDS, GENESIS_OWNING_SECTION,
+    MINIMUM_COMPATIBLE_VERSION, OPERATION_CATALOGUE_PROFILE, OperationKind, READ_MAX_INPUT_BYTES,
+    READ_MAX_OUTPUT_BYTES, READ_TIMEOUT_MS, SCOPE_KIND_NONE, SCOPE_KIND_SCOPE,
+    SINGLE_MANIFEST_OWNING_SECTION, activated_read_operations, generated_operation_manifests,
+    operation_manifest_set_digest,
+};
+
+pub use operation_parameters::{
+    ParameterDeclaration, ParameterSchemaField, ParameterShape, declared_read_parameters,
+    named_mutation_operation_by_name, named_mutation_operation_name, named_read_operation_by_name,
+    named_read_operation_name, parameter_schema_digest, project_parameter_schema,
+    validate_typed_read_parameters,
+};
+
+pub use revocation_history::{
+    REVOCATION_HISTORY_MAX_RECORDS, REVOCATION_HISTORY_PAYLOAD_VERSION, RecordedRevocation,
+    RevocationHistoryPayload, parse_revocation_history_payload,
 };
 
 /// Stable identity of this contract surface.
@@ -376,9 +438,13 @@ fn validate_recovery_packet_size<T: Serialize>(value: &T) -> Result<(), StoreErr
 }
 
 /// Returns whether a fence is the only accepted empty-genesis fence.
+///
+/// Genesis is lineage-agnostic: any lineage at sequence 1 with genesis
+/// resources and no bound revisions qualifies. Epoch lineage itself is never
+/// compared by scalar ordering; only the genesis sequence position is checked.
 #[must_use]
 pub fn is_genesis_fence(fence: &StateFence) -> bool {
-    fence.authority_epoch == AuthorityEpoch::genesis()
+    fence.authority_epoch.sequence.get() == 1
         && fence.resource_generation == ResourceGeneration::genesis()
         && fence.task_revision.is_none()
         && fence.policy_revision.is_none()
@@ -505,6 +571,21 @@ pub enum TransitionClass {
     TaskControl,
     LifecyclePolicy,
     RecoverySchema,
+    /// Explicit user-requested canonical erasure/disposition (issue #1712).
+    ///
+    /// Irreversible deletion semantics inside the canonical store: admitted
+    /// only through the named erasure transaction carrying explicit
+    /// user-initiated identity (identity + exact scope + reason) and
+    /// non-empty proof/approval handles. Maintenance, curation, Dreamer, and
+    /// scheduler paths never carry those handles, so no automatic trigger can
+    /// reach this class. The ceiling stays the maximum store-allowed effect;
+    /// existing class maxima are unchanged. The ceiling means
+    /// ledger-reversible / state-irreversible (see
+    /// [`ERASURE_STATE_IRREVERSIBLE_CONSTRAINT`]): the deletion commits as an
+    /// audited, ordered, sealed transition, while the erased bytes are not
+    /// recoverable and no restore path may rehydrate them from the receipt
+    /// (see [`WriteReceipt::refuse_rehydration_from_erasure`]).
+    Erasure,
 }
 
 impl TransitionClass {
@@ -512,7 +593,7 @@ impl TransitionClass {
     pub const fn maximum_effect(self) -> EffectClass {
         match self {
             Self::CaptureCandidate | Self::Epistemic => EffectClass::Candidate,
-            Self::TaskControl | Self::LifecyclePolicy | Self::RecoverySchema => {
+            Self::TaskControl | Self::LifecyclePolicy | Self::RecoverySchema | Self::Erasure => {
                 EffectClass::ReversibleMutation
             }
         }
@@ -562,6 +643,11 @@ pub enum NamedReadOperation {
     GetMailbox,
     GetAuditRange,
     ResolveWriteReceipt,
+    /// CURRENT authority revocation history (issue #686). Known-but-
+    /// unsupported until a store-owned slice activates its catalogue row
+    /// with proven handlers; the typed parameters and payload contract
+    /// (`revocation_history`) are already closed.
+    GetAuthorityRevocationHistory,
 }
 
 /// Closed mutation catalogue activated by the current contract catalogue.
@@ -576,6 +662,20 @@ pub enum NamedMutationOperation {
     ApplyLifecyclePolicy,
     ReconcileRecovery,
     AppendAuditEvent,
+    /// Durable authority-revocation record (issue #686). Known-but-
+    /// unsupported until a store-owned slice activates its catalogue row
+    /// with proven handlers; the typed parameters are already closed.
+    RecordAuthorityRevocation,
+    /// Named canonical erasure/disposition transaction (issue #1712).
+    ///
+    /// Explicit user request ONLY, never automatic: the prepared transition
+    /// must carry [`TransitionClass::Erasure`], the declared erasure effect
+    /// ceiling, the closed erasure typed parameters (exact subject, surface
+    /// denominator, explicit reason, user-initiated requester identity, and
+    /// the stable intent identity), and non-empty proof/approval handles.
+    /// The store bridge applies only the recorded plan; it never derives
+    /// deletion semantics.
+    ApplyErasure,
 }
 
 impl NamedMutationOperation {
@@ -586,7 +686,10 @@ impl NamedMutationOperation {
             Self::ApplyEpistemicRevision => TransitionClass::Epistemic,
             Self::UpdateTaskState => TransitionClass::TaskControl,
             Self::ApplyLifecyclePolicy => TransitionClass::LifecyclePolicy,
-            Self::ReconcileRecovery => TransitionClass::RecoverySchema,
+            Self::ReconcileRecovery | Self::RecordAuthorityRevocation => {
+                TransitionClass::RecoverySchema
+            }
+            Self::ApplyErasure => TransitionClass::Erasure,
         }
     }
 }
@@ -624,6 +727,19 @@ impl NamedReadRequest {
             .validate()
             .map_err(StoreError::Foundation)?;
         validate_parameters(&self.parameters)
+    }
+
+    /// Validates this request against a generated operation catalogue set.
+    ///
+    /// This is the pre-dispatch authority for named reads: catalogue
+    /// membership, typed parameters, scope declaration, and declared input
+    /// bounds. It issues no authority; scope, role, fence, and expiry
+    /// enforcement stay in slice C2.
+    pub fn validate_against_catalogue(
+        &self,
+        entries: &[NamedOperationManifest],
+    ) -> Result<(), StoreError> {
+        operation_catalogue::validate_read_against_catalogue(self, entries)
     }
 }
 
@@ -897,11 +1013,36 @@ impl EventProjectionRelationIntents {
 
 /// One named operation manifest entry.  Its digest binds the ceiling and
 /// compatibility range to a prepared transition.
+///
+/// An entry describes exactly one operation: the operation identity in
+/// `name`, its [`OperationKind`], the owning architecture section, the exact
+/// parameter-schema revision and digest, the scope declaration, and the
+/// compatibility range together with the input/output/timeout bounds. Read
+/// entries persist no effect (`maximum_effect` is `Read`) and carry no
+/// transition classes; a non-empty transition-class set is required only for
+/// mutations. Entries hash without their own digest; the catalogue set digest
+/// binds the ordered entries (see [`operation_manifest_set_digest`]).
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NamedOperationManifest {
     pub name: String,
     pub version: ContractVersion,
+    #[serde(default = "default_manifest_operation_kind")]
+    pub operation_kind: OperationKind,
+    #[serde(default)]
+    pub owning_section: String,
+    #[serde(default = "default_manifest_schema_revision")]
+    pub schema_revision: ContractVersion,
+    #[serde(default)]
+    pub parameter_schema: Vec<ParameterSchemaField>,
+    #[serde(default)]
+    pub schema_digest: String,
+    #[serde(default)]
+    pub requires_scope_id: bool,
+    #[serde(default)]
+    pub scope_kind: String,
+    #[serde(default = "default_manifest_minimum_compatible")]
+    pub minimum_compatible_version: ContractVersion,
     pub transition_classes: Vec<TransitionClass>,
     pub maximum_effect: EffectClass,
     pub max_input_bytes: u32,
@@ -910,8 +1051,91 @@ pub struct NamedOperationManifest {
     pub digest: OperationManifestDigest,
 }
 
+fn default_manifest_operation_kind() -> OperationKind {
+    OperationKind::Mutation
+}
+
+fn default_manifest_schema_revision() -> ContractVersion {
+    CONTRACT_VERSION
+}
+
+fn default_manifest_minimum_compatible() -> ContractVersion {
+    ContractVersion::new(1, 0, 0)
+}
+
+/// Complete pre-digest construction spec for one manifest entry.
+///
+/// Every manifest, whether built through the legacy [`NamedOperationManifest::new`]
+/// or generated from the operation catalogue table, flows through
+/// [`NamedOperationManifest::from_spec`] so schema and entry digests are
+/// derived in exactly one place.
+#[derive(Clone, Debug)]
+pub struct OperationManifestSpec {
+    /// Canonical operation identity (a closed operation name).
+    pub name: String,
+    /// Manifest revision of this entry.
+    pub version: ContractVersion,
+    /// Whether this entry describes a read or a mutation.
+    pub operation_kind: OperationKind,
+    /// Owning architecture section for the operation's meaning.
+    pub owning_section: String,
+    /// Revision of the declared parameter schema.
+    pub schema_revision: ContractVersion,
+    /// Owner-approved parameter schema projection.
+    pub parameter_schema: Vec<ParameterSchemaField>,
+    /// Whether callers must address a scope for this operation.
+    pub requires_scope_id: bool,
+    /// Scope kind paired with `requires_scope_id` (`"none"` or `"scope"`).
+    pub scope_kind: String,
+    /// Oldest compatible manifest version.
+    pub minimum_compatible_version: ContractVersion,
+    /// Allowed transition families (empty for reads, non-empty for mutations).
+    pub transition_classes: Vec<TransitionClass>,
+    /// Maximum canonical effect (`Read` for read entries).
+    pub maximum_effect: EffectClass,
+    /// Maximum canonical input bytes.
+    pub max_input_bytes: u32,
+    /// Maximum canonical output bytes.
+    pub max_output_bytes: u32,
+    /// Admission timeout in milliseconds.
+    pub timeout_ms: u32,
+}
+
 impl NamedOperationManifest {
+    /// Builds a manifest from a complete spec and derives its digests.
+    pub fn from_spec(spec: OperationManifestSpec) -> Result<Self, StoreError> {
+        validate_text(&spec.name, "manifest.name")?;
+        let schema_digest = parameter_schema_digest(&spec.parameter_schema)?;
+        let mut manifest = Self {
+            name: spec.name,
+            version: spec.version,
+            operation_kind: spec.operation_kind,
+            owning_section: spec.owning_section,
+            schema_revision: spec.schema_revision,
+            parameter_schema: spec.parameter_schema,
+            schema_digest,
+            requires_scope_id: spec.requires_scope_id,
+            scope_kind: spec.scope_kind,
+            minimum_compatible_version: spec.minimum_compatible_version,
+            transition_classes: spec.transition_classes,
+            maximum_effect: spec.maximum_effect,
+            max_input_bytes: spec.max_input_bytes,
+            max_output_bytes: spec.max_output_bytes,
+            timeout_ms: spec.timeout_ms,
+            digest: OperationManifestDigest::new("pending")?,
+        };
+        let digest = manifest_digest(&manifest)?;
+        manifest.digest = OperationManifestDigest::new(digest)?;
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
     /// Builds a manifest and derives its canonical digest.
+    ///
+    /// Legacy single-manifest constructor retained for the genesis/bootstrap
+    /// path and already-deployed single manifests. The catalogue-owned fields
+    /// take neutral single-manifest values owned by the catalogue mechanism
+    /// itself; per-operation entries are generated from the catalogue table.
     pub fn new(
         name: impl Into<String>,
         version: ContractVersion,
@@ -921,42 +1145,82 @@ impl NamedOperationManifest {
         max_output_bytes: u32,
         timeout_ms: u32,
     ) -> Result<Self, StoreError> {
-        let mut manifest = Self {
+        Self::from_spec(OperationManifestSpec {
             name: name.into(),
             version,
+            operation_kind: OperationKind::Mutation,
+            owning_section: SINGLE_MANIFEST_OWNING_SECTION.to_owned(),
+            schema_revision: version,
+            parameter_schema: Vec::new(),
+            requires_scope_id: false,
+            scope_kind: SCOPE_KIND_NONE.to_owned(),
+            minimum_compatible_version: ContractVersion::new(1, 0, 0),
             transition_classes,
             maximum_effect,
             max_input_bytes,
             max_output_bytes,
             timeout_ms,
-            digest: OperationManifestDigest::new("pending")?,
-        };
-        let digest = manifest_digest(&manifest)?;
-        manifest.digest = OperationManifestDigest::new(digest)?;
-        manifest.validate()?;
-        Ok(manifest)
+        })
     }
 
     /// Validates the closed manifest and its self-digest.
     pub fn validate(&self) -> Result<(), StoreError> {
         validate_text(&self.name, "manifest.name")?;
-        if self.transition_classes.is_empty() {
-            return Err(StoreError::Empty {
-                field: "manifest.transition_classes",
+        validate_text(&self.owning_section, "manifest.owning_section")?;
+        if self.minimum_compatible_version > self.version {
+            return Err(StoreError::InvalidField {
+                field: "manifest.compatibility",
+                reason: "minimum compatible version exceeds manifest version",
             });
         }
-        unique(
-            self.transition_classes.iter().copied(),
-            "manifest.transition_classes",
-        )?;
-        if self.maximum_effect == EffectClass::ExternalEffect {
-            return Err(StoreError::EffectCeilingExceeded);
+        match self.operation_kind {
+            OperationKind::Read => {
+                if !self.transition_classes.is_empty() {
+                    return Err(StoreError::InvalidField {
+                        field: "manifest.transition_classes",
+                        reason: "read entries carry no transition class",
+                    });
+                }
+                if self.maximum_effect != EffectClass::Read {
+                    return Err(StoreError::InvalidField {
+                        field: "manifest.maximum_effect",
+                        reason: "read entries persist no effect",
+                    });
+                }
+            }
+            OperationKind::Mutation => {
+                if self.transition_classes.is_empty() {
+                    return Err(StoreError::Empty {
+                        field: "manifest.transition_classes",
+                    });
+                }
+                unique(
+                    self.transition_classes.iter().copied(),
+                    "manifest.transition_classes",
+                )?;
+                if self.maximum_effect == EffectClass::ExternalEffect {
+                    return Err(StoreError::EffectCeilingExceeded);
+                }
+            }
+        }
+        let scope_pair_ok = (self.requires_scope_id && self.scope_kind == SCOPE_KIND_SCOPE)
+            || (!self.requires_scope_id && self.scope_kind == SCOPE_KIND_NONE);
+        if !scope_pair_ok {
+            return Err(StoreError::InvalidField {
+                field: "manifest.scope",
+                reason: "scope declaration must pair requires_scope_id with its scope kind",
+            });
         }
         if self.max_input_bytes == 0 || self.max_output_bytes == 0 || self.timeout_ms == 0 {
             return Err(StoreError::InvalidField {
                 field: "manifest.limits",
                 reason: "must be non-zero",
             });
+        }
+        validate_digest(&self.schema_digest, "manifest.schema_digest")?;
+        let schema_digest = parameter_schema_digest(&self.parameter_schema)?;
+        if self.schema_digest != schema_digest {
+            return Err(StoreError::ManifestMismatch);
         }
         let digest = manifest_digest(self)?;
         if self.digest.as_str() != digest {
@@ -977,6 +1241,14 @@ fn manifest_digest(manifest: &NamedOperationManifest) -> Result<String, StoreErr
     let shape = (
         &manifest.name,
         manifest.version,
+        manifest.operation_kind,
+        &manifest.owning_section,
+        manifest.schema_revision,
+        &manifest.parameter_schema,
+        &manifest.schema_digest,
+        manifest.requires_scope_id,
+        &manifest.scope_kind,
+        manifest.minimum_compatible_version,
         &manifest.transition_classes,
         manifest.maximum_effect,
         manifest.max_input_bytes,
@@ -1048,6 +1320,23 @@ impl PreparedTransition {
         ) {
             return Err(StoreError::TransitionClassExceeded);
         }
+        // Issue #1712: erasure travels under exactly one operation identity.
+        // Bundling the irreversible deletion with any other command (or
+        // splitting it across commands) is rejected pre-execution, and the
+        // plan must carry the explicit user approval handles: automatic
+        // maintenance, curation, Dreamer, and scheduler paths furnish none,
+        // so they can never reach the erasure transaction.
+        if self.transition_class == TransitionClass::Erasure {
+            if self.named_operations.len() != 1 {
+                return Err(StoreError::TransitionClassExceeded);
+            }
+            if self.required_proof_and_approval_refs.is_empty() {
+                return Err(StoreError::InvalidField {
+                    field: "proof_or_approval_ref",
+                    reason: "erasure requires explicit user approval",
+                });
+            }
+        }
         validate_digest(
             &self.admission_contract_set_digest,
             "admission_contract_set_digest",
@@ -1076,6 +1365,13 @@ impl PreparedTransition {
     }
 
     /// Checks this plan against a closed named-operation manifest.
+    ///
+    /// Bootstrap/single-manifest check retained for the genesis path and
+    /// already-deployed single manifests. Named operations validate against
+    /// the generated catalogue set instead (see
+    /// [`PreparedTransition::validate_against_catalogue`]); both mechanisms
+    /// derive from the same generated table, so there are no competing
+    /// manifest authorities.
     pub fn validate_against_manifest(
         &self,
         manifest: &NamedOperationManifest,
@@ -1090,21 +1386,33 @@ impl PreparedTransition {
         }
         Ok(())
     }
+
+    /// Checks this plan against a generated operation catalogue set.
+    ///
+    /// Pre-dispatch authority for prepared transitions: the genesis/bootstrap
+    /// shape binds to the genesis entry, while a plan carrying named
+    /// operations binds to the whole set digest with every command resolved
+    /// in order against a mutation entry. Plan commands are never reordered.
+    pub fn validate_against_catalogue(
+        &self,
+        entries: &[NamedOperationManifest],
+    ) -> Result<(), StoreError> {
+        operation_catalogue::validate_transition_against_catalogue(self, entries)
+    }
 }
 
 /// Builds the one provider-independent manifest admitted for Store genesis.
 /// The digest is derived from the complete manifest shape and is shared by
 /// every adapter; no provider name or zero digest is accepted as a substitute.
+///
+/// The entry is sourced from the generated operation catalogue
+/// ([`generated_operation_manifests`]), so the genesis path and the named
+/// operation catalogue share one authority.
 pub fn genesis_manifest() -> Result<NamedOperationManifest, StoreError> {
-    NamedOperationManifest::new(
-        GENESIS_MANIFEST_NAME,
-        CONTRACT_VERSION,
-        vec![TransitionClass::RecoverySchema],
-        EffectClass::ReversibleMutation,
-        3_145_728,
-        3_145_728,
-        1_000,
-    )
+    generated_operation_manifests()?
+        .into_iter()
+        .find(|entry| entry.name == GENESIS_MANIFEST_NAME)
+        .ok_or(StoreError::UnknownOperation)
 }
 
 /// Derives the canonical neutral transition used to issue and validate every
@@ -1305,6 +1613,26 @@ pub struct RevisionDelta {
     pub after: u64,
 }
 
+/// Name of the issue-#1712 erasure non-resurrection constraint enforced at
+/// the manifest/effect-policy boundary.
+///
+/// `ERASURE_STATE_IRREVERSIBLE` states the exact ceiling semantics of the
+/// named erasure transaction: erasure is ledger-reversible (it commits as an
+/// audited, ordered, sealed transition under the maximum store-allowed
+/// `EffectClass::ReversibleMutation` ceiling, with a purge receipt and a
+/// non-revealing tombstone/digest) but state-irreversible (the erased
+/// canonical bytes are not recoverable). No rollback, recovery, maintenance,
+/// scheduler, Dreamer, or restoration capability may consume an erasure
+/// receipt to recreate or rehydrate erased canonical state (I5.14: "Restore
+/// refuses to resurrect purged payload"). The manifest/effect gate enforces
+/// the execution direction (an `Erasure`-class plan admits only the named
+/// `ApplyErasure` operation; see
+/// [`PreparedTransition::validate_against_catalogue`]), and
+/// [`WriteReceipt::refuse_rehydration_from_erasure`] enforces the restore
+/// direction: every rollback/restore/reconcile executor must call it before
+/// rehydrating state from a receipt.
+pub const ERASURE_STATE_IRREVERSIBLE_CONSTRAINT: &str = "ERASURE_STATE_IRREVERSIBLE";
+
 /// Immutable canonical write receipt.  It proves durable store transport only.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1409,6 +1737,23 @@ impl WriteReceipt {
             .as_ref()
             .ok_or(StoreError::MissingReceiptEnvelope)
     }
+
+    /// Enforces [`ERASURE_STATE_IRREVERSIBLE_CONSTRAINT`] on the restore
+    /// direction (issue #1712).
+    ///
+    /// An erasure receipt proves that canonical state was deleted; it must
+    /// never authorize recreating or rehydrating the erased bytes. Every
+    /// rollback, recovery, restore, and reconcile executor must call this
+    /// before rehydrating state from a receipt: an erasure receipt fails with
+    /// [`StoreError::InvalidReceipt`], every other class passes unchanged.
+    /// Replay and audit reads of the erasure receipt itself stay legitimate;
+    /// only state rehydration from it is refused.
+    pub fn refuse_rehydration_from_erasure(&self) -> Result<(), StoreError> {
+        if self.transition_class == TransitionClass::Erasure {
+            return Err(StoreError::InvalidReceipt);
+        }
+        Ok(())
+    }
 }
 
 /// Issues the one store-owned receipt envelope for a planned committed write.
@@ -1474,7 +1819,7 @@ pub fn issue_store_receipt_envelope(
             ))
             .map_err(StoreError::Foundation)?,
             authority_owner: context.source_id.to_string(),
-            authority_epoch: state_fence.authority_epoch,
+            authority_epoch: state_fence.authority_epoch.clone(),
             state_fence: state_fence.clone(),
             allowed_effect: transition.requested_effect_ceiling,
             proof_ceiling,
@@ -1588,7 +1933,24 @@ fn receipt_task(
     {
         return Err(StoreError::InvalidReceipt);
     }
-    match (&context.task_id, state_fence.task_revision) {
+    // Epistemic admission carries its exact task revision in the frozen
+    // payload. The daemon generation fence may deliberately be unscoped;
+    // do not substitute the independently advancing Store/position revision.
+    let task_revision =
+        match epistemic_revision::EpistemicCommit::from_prepared(context, transition)? {
+            Some(commit) => {
+                let revision = commit.payload.candidate.revision;
+                if state_fence
+                    .task_revision
+                    .is_some_and(|bound| bound != revision)
+                {
+                    return Err(StoreError::InvalidReceipt);
+                }
+                Some(revision)
+            }
+            None => state_fence.task_revision,
+        };
+    match (&context.task_id, task_revision) {
         (Some(task_id), Some(task_revision)) => Ok(Some(TaskBinding {
             task_id: task_id.clone(),
             task_revision,
@@ -1602,7 +1964,7 @@ fn receipt_task(
 fn receipt_session(context: &RequestMeta, state_fence: &StateFence) -> Option<SessionBinding> {
     context.session_id.clone().map(|session_id| SessionBinding {
         session_id,
-        authority_epoch: state_fence.authority_epoch,
+        authority_epoch: state_fence.authority_epoch.clone(),
         state_fence: state_fence.clone(),
     })
 }
@@ -1655,6 +2017,7 @@ fn operation_kind(class: TransitionClass) -> &'static str {
         TransitionClass::TaskControl => "store.apply.task_control",
         TransitionClass::LifecyclePolicy => "store.apply.lifecycle_policy",
         TransitionClass::RecoverySchema => "store.apply.recovery_schema",
+        TransitionClass::Erasure => "store.apply.erasure",
     }
 }
 
@@ -1826,6 +2189,13 @@ pub enum StoreError {
     InvalidReceipt,
     #[error("identity conflict")]
     IdentityConflict,
+    #[error("transition digest mismatch: expected {expected}, observed {observed}")]
+    TransitionDigestMismatch {
+        /// Claimed digest, bounded to [`MAX_DIGEST_DETAIL_CHARS`] characters.
+        expected: String,
+        /// Recomputed digest, bounded to [`MAX_DIGEST_DETAIL_CHARS`] characters.
+        observed: String,
+    },
     #[error("receipt not found")]
     ReceiptNotFound,
     #[error("receipt envelope is missing; write outcome is unknown")]
@@ -1836,6 +2206,178 @@ pub enum StoreError {
     Unavailable,
     #[error("canonical serialization failed: {0}")]
     Serialization(String),
+}
+
+/// Closed canonical store surfaces covered by one erasure intent (issue #688).
+///
+/// These are the only surfaces the neutral store port addresses. They restate
+/// the I05-14 retention-and-erasure enumeration in store-neutral vocabulary
+/// without importing the erasure orchestration crate: the orchestration layer
+/// depends on this neutral port, never the reverse. Declaration order is the
+/// deterministic canonical order.
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+pub enum ErasureSurfaceKind {
+    /// Observations and canonical payload.
+    Observations,
+    /// Projections, indexes and derived material.
+    Projections,
+    /// Caches, ORS copies, checkpoints and pending transitions.
+    Caches,
+    /// Backups, snapshots and restore-suppression state.
+    Backups,
+    /// Provider-side copies.
+    ProviderCopies,
+    /// Route residues and logs.
+    RouteResidues,
+}
+
+/// Durable neutral erasure intent recorded before any destructive dispatch.
+///
+/// The store never invents this record: it carries the stable operation
+/// identity, the digest binding the exact admitted request bytes, the subject,
+/// the surface plan in deterministic canonical order, and the
+/// policy/closure/fence binding. Every planned surface starts `NotAttempted`
+/// (see [`ErasureIntentRecord::initial_state`]) and advances only through
+/// owner-reported [`ErasureSurfaceOutcome`] values aggregated by
+/// [`aggregate_erasure_outcomes`].
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ErasureIntentRecord {
+    pub operation_id: OperationId,
+    pub request_digest: String,
+    pub subject: String,
+    pub surfaces: Vec<ErasureSurfaceKind>,
+    pub policy_digest: String,
+    pub closure_digest: String,
+    pub state_fence: StateFence,
+}
+
+impl ErasureIntentRecord {
+    /// Validates the frozen intent without performing any destructive effect.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        validate_text(self.operation_id.as_str(), "erasure.operation_id")?;
+        validate_digest(&self.request_digest, "erasure.request_digest")?;
+        validate_text(&self.subject, "erasure.subject")?;
+        if self.surfaces.is_empty() {
+            return Err(StoreError::Empty {
+                field: "erasure.surfaces",
+            });
+        }
+        let mut seen = BTreeSet::new();
+        for surface in &self.surfaces {
+            if !seen.insert(*surface) {
+                return Err(StoreError::Duplicate {
+                    field: "erasure.surfaces",
+                });
+            }
+        }
+        if self.surfaces.windows(2).any(|pair| pair[0] > pair[1]) {
+            return Err(StoreError::InvalidField {
+                field: "erasure.surfaces",
+                reason: "must be deterministic canonical surface order",
+            });
+        }
+        validate_digest(&self.policy_digest, "erasure.policy_digest")?;
+        validate_digest(&self.closure_digest, "erasure.closure_digest")?;
+        self.state_fence.validate().map_err(StoreError::Foundation)
+    }
+
+    /// Returns the NotAttempted-per-surface initial state in canonical order.
+    ///
+    /// This is the only state a freshly recorded intent may carry: no surface
+    /// is attempted before the intent is durable.
+    #[must_use]
+    pub fn initial_state(&self) -> Vec<(ErasureSurfaceKind, StoreMutationDisposition)> {
+        self.surfaces
+            .iter()
+            .map(|surface| (*surface, StoreMutationDisposition::NotAttempted))
+            .collect()
+    }
+}
+
+/// Per-surface erasure outcome reported by the owning surface.
+///
+/// Mirrors the `{Purged, Incomplete, Unknown}` domain: `Purged` proves removal
+/// of the named surface, while `Incomplete` and `Unknown` preserve the surface
+/// that must block a complete result. An `Unknown` surface keeps its possible
+/// effect explicit so the same operation is reconciled before retry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+pub enum ErasureSurfaceOutcome {
+    Purged { surface: ErasureSurfaceKind },
+    Incomplete { surface: ErasureSurfaceKind },
+    Unknown { surface: ErasureSurfaceKind },
+}
+
+impl ErasureSurfaceOutcome {
+    /// Returns the surface this outcome reports on.
+    #[must_use]
+    pub const fn surface(self) -> ErasureSurfaceKind {
+        match self {
+            Self::Purged { surface } | Self::Incomplete { surface } | Self::Unknown { surface } => {
+                surface
+            }
+        }
+    }
+}
+
+/// Fail-closed aggregation over per-surface erasure outcomes.
+///
+/// Returns the committed surfaces in deterministic canonical order only when
+/// every planned surface reports [`ErasureSurfaceOutcome::Purged`] with no
+/// extras and no duplicates. Any `Unknown` surface refuses with
+/// [`ErasureFailureKind::Unknown`], which takes precedence over
+/// [`ErasureFailureKind::Incomplete`]; any `Incomplete` surface — including an
+/// empty, duplicate, misordered, missing, extra, or duplicated outcome entry —
+/// refuses with `Incomplete`. Either refusal must prevent a complete purge
+/// result; callers never map these refusals to success.
+#[must_use = "an erasure refusal must never be dropped"]
+pub fn aggregate_erasure_outcomes(
+    planned: &[ErasureSurfaceKind],
+    outcomes: &[ErasureSurfaceOutcome],
+) -> Result<Vec<ErasureSurfaceKind>, ErasureFailureKind> {
+    if planned.is_empty() {
+        return Err(ErasureFailureKind::Incomplete);
+    }
+    let mut seen = BTreeSet::new();
+    for surface in planned {
+        if !seen.insert(*surface) {
+            return Err(ErasureFailureKind::Incomplete);
+        }
+    }
+    if planned.windows(2).any(|pair| pair[0] > pair[1]) {
+        return Err(ErasureFailureKind::Incomplete);
+    }
+    let mut by_surface = BTreeMap::new();
+    for outcome in outcomes {
+        if by_surface.insert(outcome.surface(), *outcome).is_some() {
+            return Err(ErasureFailureKind::Incomplete);
+        }
+    }
+    if by_surface.len() != planned.len() {
+        return Err(ErasureFailureKind::Incomplete);
+    }
+    for surface in planned {
+        if !by_surface.contains_key(surface) {
+            return Err(ErasureFailureKind::Incomplete);
+        }
+    }
+    if by_surface
+        .values()
+        .any(|outcome| matches!(outcome, ErasureSurfaceOutcome::Unknown { .. }))
+    {
+        return Err(ErasureFailureKind::Unknown);
+    }
+    if by_surface
+        .values()
+        .any(|outcome| matches!(outcome, ErasureSurfaceOutcome::Incomplete { .. }))
+    {
+        return Err(ErasureFailureKind::Incomplete);
+    }
+    Ok(planned.to_vec())
 }
 
 /// Canonical store boundary.  Only these store-neutral types cross into an
@@ -1892,16 +2434,87 @@ pub trait CanonicalStoreClient: Send + Sync {
     -> Result<NamedReadResponse, StoreError>;
     /// Reports bounded store health and active manifest identity.
     async fn health(&self) -> Result<StoreHealth, StoreError>;
+    /// Applies one closed Dreamer ledger operation (S0 named family).
+    ///
+    /// The default body validates the K0 request shape and then refuses with
+    /// [`StoreError::Unavailable`] without manufacturing durable evidence.
+    /// Unadvertised per-operation capabilities fail as
+    /// [`StoreError::UnknownOperation`] through the K0 role check; no
+    /// successful default body exists. Real persistence lands in S1 (#775).
+    async fn dreamer_job(
+        &self,
+        ctx: &RequestMeta,
+        request: eliot_protocol::dreamer_job::DurableJobRequest,
+    ) -> Result<eliot_protocol::dreamer_job::DurableJobResponse, StoreError> {
+        ctx.validate().map_err(StoreError::Foundation)?;
+        request.validate().map_err(map_durable_error)?;
+        if ctx.state_fence != request.request_identity.operation.state_fence {
+            return Err(StoreError::FenceMismatch);
+        }
+        Err(StoreError::Unavailable)
+    }
+}
+
+/// Narrow read-only capability over the canonical store boundary.
+///
+/// Read-only consumers (notably the Governor `ReadService`) depend on this
+/// trait instead of the full [`CanonicalStoreClient`] write capability. The
+/// two methods carry the exact signatures and fail-closed semantics of the
+/// matching [`CanonicalStoreClient`] declarations: `revision_heads` reads
+/// revision heads by stable key, and `execute_named` executes one closed
+/// named read (raw query strings remain impossible here).
+#[allow(async_fn_in_trait)]
+pub trait CanonicalReadClient: Send + Sync {
+    /// Reads revision heads by stable key.
+    async fn revision_heads(&self, keys: Vec<RevisionKey>)
+    -> Result<Vec<RevisionHead>, StoreError>;
+    /// Executes one closed named read; raw query strings are impossible here.
+    async fn execute_named(&self, query: NamedReadRequest)
+    -> Result<NamedReadResponse, StoreError>;
+}
+
+/// Every full store client satisfies the narrow read capability.
+///
+/// This blanket implementation delegates to the matching
+/// [`CanonicalStoreClient`] read declarations, which are retained so the
+/// existing cross-lane `impl CanonicalStoreClient for EbpCanonicalStoreClient`
+/// keeps compiling untouched (blanket impl instead of declaration removal).
+impl<T: CanonicalStoreClient + ?Sized> CanonicalReadClient for T {
+    async fn revision_heads(
+        &self,
+        keys: Vec<RevisionKey>,
+    ) -> Result<Vec<RevisionHead>, StoreError> {
+        CanonicalStoreClient::revision_heads(self, keys).await
+    }
+
+    async fn execute_named(
+        &self,
+        query: NamedReadRequest,
+    ) -> Result<NamedReadResponse, StoreError> {
+        CanonicalStoreClient::execute_named(self, query).await
+    }
 }
 
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use eliot_contracts::{AuthorityEpoch, ResourceGeneration};
+    use eliot_contracts::{EpochId, ResourceGeneration};
+
+    fn test_epoch(sequence: u64) -> EpochId {
+        use eliot_contracts::EpochLineageId;
+        use std::num::NonZeroU64;
+        let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .expect("canonical test lineage-A");
+        EpochId::new(
+            lineage,
+            NonZeroU64::new(sequence).expect("non-zero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
 
     fn fence() -> StateFence {
-        StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+        StateFence::new(test_epoch(1), ResourceGeneration::genesis())
     }
 
     fn id(value: &str) -> Result<OperationId, StoreError> {
@@ -2034,7 +2647,7 @@ mod tests {
 
         let mut mixed_fence = valid.clone();
         mixed_fence.revision_heads[0].state_fence =
-            StateFence::new(AuthorityEpoch::new(2)?, ResourceGeneration::genesis());
+            StateFence::new(test_epoch(2), ResourceGeneration::genesis());
         assert_eq!(mixed_fence.validate(), Err(StoreError::FenceMismatch));
 
         let mut zero_revision = valid.clone();
@@ -2122,10 +2735,7 @@ mod tests {
         ));
 
         let mut stale = recovery_record("one", b"payload");
-        stale.state_fence = StateFence::new(
-            AuthorityEpoch::new(2).expect("epoch"),
-            ResourceGeneration::genesis(),
-        );
+        stale.state_fence = StateFence::new(test_epoch(2), ResourceGeneration::genesis());
         assert_eq!(
             recovery_snapshot(vec![stale]).validate(),
             Err(StoreError::FenceMismatch)
@@ -2373,7 +2983,7 @@ mod tests {
         ));
 
         let mut stale = request.clone();
-        stale.state_fence = StateFence::new(AuthorityEpoch::new(2)?, ResourceGeneration::genesis());
+        stale.state_fence = StateFence::new(test_epoch(2), ResourceGeneration::genesis());
         assert_eq!(stale.validate(), Err(StoreError::FenceMismatch));
 
         let mut semantic = request;
@@ -2409,8 +3019,25 @@ mod tests {
     #[test]
     fn recovery_and_genesis_caps_are_advertised_after_validation_snapshot() {
         assert_eq!(
-            &CAPABILITIES[8..],
+            &CAPABILITIES[8..10],
             &[CAPABILITY_RECOVERY, CAPABILITY_INITIALIZE_GENESIS]
+        );
+        assert_eq!(
+            &CAPABILITIES[10..],
+            &[
+                CAPABILITY_DREAMER_JOB_SUBMIT,
+                CAPABILITY_DREAMER_JOB_LEASE_NEXT,
+                CAPABILITY_DREAMER_JOB_LEASE_EXACT,
+                CAPABILITY_DREAMER_JOB_RENEW,
+                CAPABILITY_DREAMER_JOB_START,
+                CAPABILITY_DREAMER_JOB_CHECKPOINT,
+                CAPABILITY_DREAMER_JOB_RESUME,
+                CAPABILITY_DREAMER_JOB_BEGIN_VERIFICATION,
+                CAPABILITY_DREAMER_JOB_PUBLISH,
+                CAPABILITY_DREAMER_JOB_STATUS,
+                CAPABILITY_DREAMER_JOB_REQUEST_CANCEL,
+                CAPABILITY_DREAMER_JOB_RECONCILE,
+            ]
         );
     }
 
@@ -2475,6 +3102,155 @@ mod tests {
                 ..
             }))
         ));
+        Ok(())
+    }
+
+    fn erasure_test_fence() -> StateFence {
+        fence()
+    }
+
+    fn erasure_intent_record() -> ErasureIntentRecord {
+        ErasureIntentRecord {
+            operation_id: id("erasure-op-1").expect("operation id"),
+            request_digest: "c".repeat(64),
+            subject: "subject-1".to_owned(),
+            surfaces: vec![
+                ErasureSurfaceKind::Observations,
+                ErasureSurfaceKind::Projections,
+                ErasureSurfaceKind::Caches,
+            ],
+            policy_digest: "d".repeat(64),
+            closure_digest: "e".repeat(64),
+            state_fence: erasure_test_fence(),
+        }
+    }
+
+    #[test]
+    fn erasure_aggregate_is_fail_closed_with_unknown_precedence() {
+        let planned = vec![
+            ErasureSurfaceKind::Observations,
+            ErasureSurfaceKind::Projections,
+        ];
+        let purged: Vec<ErasureSurfaceOutcome> = planned
+            .iter()
+            .map(|surface| ErasureSurfaceOutcome::Purged { surface: *surface })
+            .collect();
+        assert_eq!(
+            aggregate_erasure_outcomes(&planned, &purged).expect("all purged commits"),
+            planned
+        );
+
+        let unknown_mixed = vec![
+            ErasureSurfaceOutcome::Unknown {
+                surface: ErasureSurfaceKind::Observations,
+            },
+            ErasureSurfaceOutcome::Incomplete {
+                surface: ErasureSurfaceKind::Projections,
+            },
+        ];
+        assert_eq!(
+            aggregate_erasure_outcomes(&planned, &unknown_mixed),
+            Err(crate::ErasureFailureKind::Unknown)
+        );
+
+        let incomplete_only = vec![
+            ErasureSurfaceOutcome::Purged {
+                surface: ErasureSurfaceKind::Observations,
+            },
+            ErasureSurfaceOutcome::Incomplete {
+                surface: ErasureSurfaceKind::Projections,
+            },
+        ];
+        assert_eq!(
+            aggregate_erasure_outcomes(&planned, &incomplete_only),
+            Err(crate::ErasureFailureKind::Incomplete)
+        );
+
+        let missing = vec![ErasureSurfaceOutcome::Purged {
+            surface: ErasureSurfaceKind::Observations,
+        }];
+        assert_eq!(
+            aggregate_erasure_outcomes(&planned, &missing),
+            Err(crate::ErasureFailureKind::Incomplete)
+        );
+
+        let duplicate = vec![
+            ErasureSurfaceOutcome::Purged {
+                surface: ErasureSurfaceKind::Observations,
+            },
+            ErasureSurfaceOutcome::Purged {
+                surface: ErasureSurfaceKind::Observations,
+            },
+        ];
+        assert_eq!(
+            aggregate_erasure_outcomes(&planned, &duplicate),
+            Err(crate::ErasureFailureKind::Incomplete)
+        );
+
+        let extra = vec![
+            ErasureSurfaceOutcome::Purged {
+                surface: ErasureSurfaceKind::Observations,
+            },
+            ErasureSurfaceOutcome::Purged {
+                surface: ErasureSurfaceKind::Projections,
+            },
+            ErasureSurfaceOutcome::Purged {
+                surface: ErasureSurfaceKind::Caches,
+            },
+        ];
+        assert_eq!(
+            aggregate_erasure_outcomes(&planned, &extra),
+            Err(crate::ErasureFailureKind::Incomplete)
+        );
+
+        assert_eq!(
+            aggregate_erasure_outcomes(&[], &[]),
+            Err(crate::ErasureFailureKind::Incomplete)
+        );
+
+        let intent = erasure_intent_record();
+        let initial: Vec<ErasureSurfaceKind> = intent
+            .initial_state()
+            .iter()
+            .map(|(surface, _)| *surface)
+            .collect();
+        assert_eq!(initial, intent.surfaces);
+        assert!(
+            intent
+                .initial_state()
+                .iter()
+                .all(|(_, disposition)| *disposition == StoreMutationDisposition::NotAttempted)
+        );
+    }
+
+    #[test]
+    fn erasure_surface_request_validates_plan_and_intent_capability() -> Result<(), StoreError> {
+        use crate::ErasureSurfaceRequest;
+        let intent = erasure_intent_record();
+        let request = ErasureSurfaceRequest {
+            identity: OperationIdentity {
+                operation_id: intent.operation_id.clone(),
+                idempotency_key: "erasure-retry-1".to_owned(),
+                canonical_request_hash: intent.request_digest.clone(),
+            },
+            surfaces: intent.surfaces.clone(),
+            intent,
+        };
+        request.validate()?;
+        request.validate_for_dispatch(&[crate::CAPABILITY_ERASURE_INTENT])?;
+
+        assert_eq!(
+            request.validate_for_dispatch(&[]),
+            Err(StoreError::UnknownOperation)
+        );
+
+        let mut narrowed = request.clone();
+        narrowed.surfaces.pop();
+        assert!(narrowed.validate().is_err());
+
+        let mut conflicted = request.clone();
+        conflicted.identity.canonical_request_hash = "f".repeat(64);
+        assert_eq!(conflicted.validate(), Err(StoreError::IdentityConflict));
         Ok(())
     }
 }

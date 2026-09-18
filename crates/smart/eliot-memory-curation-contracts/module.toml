@@ -1,7 +1,7 @@
 schema_version = 2
 module_id = "smart.memory.curation_contracts"
 crate = "eliot-memory-curation-contracts"
-status = "PROTOTYPE"
+status = "ADMITTED"
 wave = "cognitive-micromodules-wave-01"
 agent_order = 19
 plane = "Smart"
@@ -26,7 +26,7 @@ failure_behavior = "Return incomplete/unsupported screen status with exact omiss
 proof_surface = ["schema round-trip", "protection-role compatibility", "bounded coverage fixtures", "no-action authority tests"]
 replacement_boundary = "screening protocol; screen algorithm and Dreamer handlers remain independent"
 split_trigger = "screen request/result versions diverge from finding/protection vocabulary"
-rust_contract_dependencies = ["eliot-contracts", "eliot-evidence"]
+rust_contract_dependencies = ["eliot-contracts", "eliot-evidence", "eliot-agent-contracts", "eliot-receipts"]
 
 [[donor]]
 path = "crates/smart/eliot-memory-curation/src/lib.rs"
@@ -48,19 +48,14 @@ stop_condition = "Stop if a contract field requires deciding archive/suppress/fo
 integration_owner = "cognitive-wave-01-integrator"
 implementation_language = "Rust 2024"
 required_verification = ["schema proof", "old curation donor migration fixtures", "screen/facade edge proof"]
-workspace_admission = "forbidden until src/lib.rs, package proof and both consumer edges pass"
+workspace_admission = "admitted via #829 (T8-A0) root workspace membership"
 
-# Machine-checked completion gate, read by `scripts/verify-work-unit.py`.
-# `cargo fmt|test|clippy` all pass on an empty crate, so they cannot tell a
-# finished cell from an unstarted one. This table can.
-#
-# These are the floors every cell shares. The owning work unit tightens them
-# with `required_exports` and `required_tests` taken from its own brief, so a
-# reviewer decides on one exit code instead of reading prose criteria.
+# Acceptance is decided by the owning contract and independent review
+# (I0.10: line/test/type counts are not goals). `scripts/verify-work-unit.py`
+# is a retired legacy diagnostic that always reports completion=NOT_VERIFIED
+# and never accepts a work unit. This table names the concrete contract and
+# the required exports/tests plus small behaviour checks the reviewer verifies.
 [acceptance]
-min_source_lines = 200
-min_public_items = 6
-min_tests = 5
 require_deny_unknown_fields = true
 forbid_unsafe = true
 required_exports = []

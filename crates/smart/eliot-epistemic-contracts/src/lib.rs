@@ -115,4 +115,4 @@ pub const CONTRACT_NAME: &str = "eliot.smart.epistemic-contracts";
 /// Current wire revision of this contract surface: prototype wire, where minor revisions add hardened
 /// families (request, closure, assumption, investigation, verifier) without reinterpreting frozen bytes.
 pub const CONTRACT_VERSION: eliot_contracts::ContractVersion =
-    eliot_contracts::ContractVersion::new(1, 1, 0);
+    eliot_contracts::ContractVersion::new(1, 2, 0);

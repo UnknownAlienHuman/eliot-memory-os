@@ -938,7 +938,20 @@ impl<T: InstallationActivationApprovalVerifier + ?Sized> InstallationActivationV
 #[allow(clippy::expect_used, clippy::similar_names)]
 mod tests {
     use super::*;
-    use eliot_contracts::AuthorityEpoch;
+    use std::num::NonZeroU64;
+
+    use eliot_contracts::{EpochId, EpochLineageId};
+
+    /// Lineage-A fixture epoch for tests (canonical UUID lineage, no scalar).
+    fn test_epoch(sequence: u64) -> EpochId {
+        let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .expect("canonical test lineage-A");
+        EpochId::new(
+            lineage,
+            NonZeroU64::new(sequence).expect("non-zero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
 
     #[derive(serde::Serialize)]
     struct LegacyCanonicalPayload<'a> {
@@ -1011,7 +1024,7 @@ mod tests {
             elevation_evidence_digest: digest('9'),
             authority_generation: ResourceGeneration::new(4).expect("generation"),
             authority_state_fence: StateFence::new(
-                AuthorityEpoch::new(5).expect("epoch"),
+                test_epoch(5),
                 ResourceGeneration::new(4).expect("generation"),
             ),
             issued_at_ms: 1_000,

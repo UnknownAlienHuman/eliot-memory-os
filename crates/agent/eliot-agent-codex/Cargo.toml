@@ -10,6 +10,7 @@ description = "Bounded Codex App Server stdio/JSONL adapter for ELIOT"
 blake3.workspace = true
 eliot-agent-api.workspace = true
 eliot-agent-coordinator.workspace = true
+eliot-contracts.workspace = true
 eliot-process.workspace = true
 eliot-receipts.workspace = true
 eliot-source-assurance.workspace = true

@@ -544,6 +544,21 @@ impl ContextCompiler {
                     .iter()
                     .map(|claim| format!("claim:{}", claim.claim_id)),
             );
+            // Canonical current_state is authoritative for L3 separation; recall is
+            // best-effort ranking and must not be the sole carrier for
+            // Supported/Weak handles when candidate_handles is empty.
+            handles.extend(
+                current_state
+                    .supported_now
+                    .iter()
+                    .map(|claim| format!("claim:{}", claim.claim_id)),
+            );
+            handles.extend(
+                current_state
+                    .weak_or_candidate
+                    .iter()
+                    .map(|claim| format!("claim:{}", claim.claim_id)),
+            );
             read_audit.l0_reads += 1;
             let recall = self
                 .read

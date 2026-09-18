@@ -567,3 +567,30 @@ test("configured HTTP outage never crosses transport into the legacy process bri
   )
   assert.equal(legacySpawns, 0)
 })
+
+test("plugin tool identity matches the single-source contract", async () => {
+  const contract = JSON.parse(
+    await readFile(resolve("integrations/opencode/plugin-bridge-contract.json"), "utf8"),
+  )
+  const identity = contract.tool_identity
+  assert.equal(identity.version, "eliot.opencode.tools.v1")
+  assert.equal(identity.classification, "exact_case_sensitive_allowlist_member")
+  assert.equal(identity.unknown_tools, "fail_closed_without_bridge_dispatch")
+
+  const versionMatch = source.match(/const TOOL_IDENTITY_VERSION = "([^"]+)"/)
+  assert.ok(versionMatch)
+  assert.equal(versionMatch[1], identity.version)
+
+  const mutatingMatch = source.match(/const MUTATING_TOOLS = new Set\(\[([^\]]*)\]\)/)
+  const readOnlyMatch = source.match(/const READ_ONLY_TOOLS = new Set\(\[([^\]]*)\]\)/)
+  assert.ok(mutatingMatch)
+  assert.ok(readOnlyMatch)
+  const parseSet = (fragment) =>
+    [...fragment.matchAll(/"([^"]+)"/g)].map((entry) => entry[1])
+  assert.deepEqual(parseSet(mutatingMatch[1]), identity.mutating_tools)
+  assert.deepEqual(parseSet(readOnlyMatch[1]), identity.read_only_tools)
+  assert.deepEqual(
+    identity.mutating_tools.filter((tool) => identity.read_only_tools.includes(tool)),
+    [],
+  )
+})

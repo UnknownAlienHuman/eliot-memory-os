@@ -485,12 +485,22 @@ impl ImpersonationGuard {
 #[cfg(windows)]
 impl Drop for ImpersonationGuard {
     fn drop(&mut self) {
-        if self.active && unsafe { windows_sys::Win32::Security::RevertToSelf() } == 0 {
-            // Continuing a privileged server thread under an untrusted client
-            // token is less safe than terminating the process. The explicit
-            // `revert` path normally disarms this guard; this is its fail-stop.
+        if !self.active {
+            return;
+        }
+        // Single emergency restoration: only `RevertToSelf` plus the active
+        // flag below — no allocation, logging, or reentrancy, and nothing
+        // that can panic or unwind across FFI. Success disarms the guard so
+        // this attempt happens exactly once and execution continues without
+        // termination or a second restore. Failure keeps the fail-stop
+        // abort: a privileged server thread must not continue under an
+        // untrusted client token (accepted least-privilege boundary), and
+        // no bounded containment-evidence owner exists to
+        // report-and-continue, so none is invented here.
+        if unsafe { windows_sys::Win32::Security::RevertToSelf() } == 0 {
             std::process::abort();
         }
+        self.active = false;
     }
 }
 

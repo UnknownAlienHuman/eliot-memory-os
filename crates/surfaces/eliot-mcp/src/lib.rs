@@ -2,9 +2,7 @@
 //!
 //! This crate owns no transport, process, database, session, task, admission,
 //! authority, verification, or finish state. The host-facing request contract
-//! carries only inert operation intent and correlation. Existing bound request
-//! types remain Kernel/Governor-facing compatibility surfaces until the bridge
-//! adapter and Kernel identity-binding units migrate under issue #77.
+//! carries only inert operation intent and correlation.
 
 #![forbid(unsafe_code)]
 

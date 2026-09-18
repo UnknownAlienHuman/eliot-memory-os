@@ -1,0 +1,8 @@
+{
+  "now": 1000,
+  "live_expiry": 1500,
+  "boundary_expiry": 1000,
+  "past_expiry": 999,
+  "deliver_at": 1200,
+  "ack_after_expiry_at": 1600
+}

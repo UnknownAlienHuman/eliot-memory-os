@@ -1,0 +1,6 @@
+# WORK_UNIT_CASE: 750/28 identity fixture. Real SHA-256 and byte length of
+# .github/workflows/source-candidate.yml at base c225b36a (computed locally,
+# never copied from prose). The file must remain byte-identical.
+sha256=6a8aeacb02551762321bf2ee498952f46bebeb8ba56fcbd0a166e47f282ca82c
+bytes=5334
+path=.github/workflows/source-candidate.yml

@@ -1,0 +1,9 @@
+test_sync_ignored: test
+test_tokio_ignored: test
+test_disabled_ignored: test
+test_cfg_attr_ignored: test
+test_bare_ignored: test
+test_unknown_reason_ignored: test
+nested::test_nested_ignored: test
+
+7 tests, 0 benchmarks

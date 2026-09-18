@@ -23,8 +23,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    CurrentSystemEvidenceCompiler, CurrentSystemEvidenceSnapshot, CurrentSystemEvidenceSource,
-    EvidenceEvaluation, EvidenceRecord, NormativePair, SourceProjection,
+    CONFORMANCE_CONTRACT_VERSION, CurrentSystemEvidenceCompiler, CurrentSystemEvidenceSnapshot,
+    CurrentSystemEvidenceSource, DomainCoverage, EvidenceDomain, EvidenceEvaluation,
+    EvidenceRecord, NormativePair, SourceProjection, SupportObservationState,
     normative::{self, parse_normative_pair_receipt},
 };
 
@@ -217,6 +218,14 @@ pub fn capture_snapshot(repository_root: &Path) -> Result<SnapshotExecutionArtif
         .as_deref()
         .unwrap_or("CLEAN")
         .to_owned();
+    // Anchor every coverage row to the exact HEAD commit time: the
+    // deterministic evidence moment bound to the captured source identity.
+    // Capture owns no wall-clock observation of build, runtime, store, or
+    // integrations, so only source is OBSERVED; the rest stay explicit
+    // UNKNOWN, except runtime which is explicitly NOT_RUNNING. The adapter
+    // supplies these attributed observations and never decides support.
+    let observed_at_ms = git_head_time_ms(&discovered_root)?;
+    let domain_coverage = capture_domain_coverage(&source_head, observed_at_ms);
 
     let records = vec![
         evidence(
@@ -278,6 +287,8 @@ pub fn capture_snapshot(repository_root: &Path) -> Result<SnapshotExecutionArtif
                 "runtime".to_owned(),
                 "store".to_owned(),
             ],
+            domain_coverage,
+            support_rows: Vec::new(),
         },
     );
     let snapshot = CurrentSystemEvidenceCompiler::compile(source)
@@ -453,6 +464,90 @@ fn evidence(
         evidence_ref: evidence_ref.to_owned(),
         evaluation,
     }
+}
+
+fn coverage_row(
+    domain: EvidenceDomain,
+    state: SupportObservationState,
+    source_handle: &str,
+    evidence_refs: Vec<String>,
+    observed_at_ms: Option<u64>,
+    invalidation_set: Vec<String>,
+) -> DomainCoverage {
+    DomainCoverage {
+        contract_version: CONFORMANCE_CONTRACT_VERSION,
+        domain,
+        state,
+        source_handles: vec![source_handle.to_owned()],
+        evidence_refs,
+        blind_boundaries: Vec::new(),
+        observed_at_ms,
+        expires_at_ms: None,
+        invalidation_set,
+    }
+}
+
+/// Builds the exact five-domain observation set for one captured source head.
+///
+/// Source is `OBSERVED` through the Git capture routes; build, store, and
+/// integrations are explicitly `UNKNOWN`; runtime is explicitly `NOT_RUNNING`.
+/// Every non-source row carries the `capture:unavailable` route attribution.
+/// No support row is minted here: the adapter cannot decide support.
+fn capture_domain_coverage(source_head: &str, observed_at_ms: u64) -> Vec<DomainCoverage> {
+    let head_binding = format!("git:head:{source_head}");
+    vec![
+        coverage_row(
+            EvidenceDomain::Source,
+            SupportObservationState::Observed,
+            "git:rev-parse",
+            vec![head_binding.clone()],
+            Some(observed_at_ms),
+            vec![head_binding.clone()],
+        ),
+        coverage_row(
+            EvidenceDomain::Build,
+            SupportObservationState::Unknown,
+            "capture:unavailable",
+            Vec::new(),
+            None,
+            Vec::new(),
+        ),
+        coverage_row(
+            EvidenceDomain::Runtime,
+            SupportObservationState::NotRunning,
+            "capture:unavailable",
+            Vec::new(),
+            Some(observed_at_ms),
+            vec![head_binding.clone()],
+        ),
+        coverage_row(
+            EvidenceDomain::Store,
+            SupportObservationState::Unknown,
+            "capture:unavailable",
+            Vec::new(),
+            None,
+            Vec::new(),
+        ),
+        coverage_row(
+            EvidenceDomain::Integrations,
+            SupportObservationState::Unknown,
+            "capture:unavailable",
+            Vec::new(),
+            None,
+            Vec::new(),
+        ),
+    ]
+}
+
+fn git_head_time_ms(repository_root: &Path) -> Result<u64, CaptureError> {
+    let seconds = git_output(repository_root, ["log", "-1", "--format=%ct", "HEAD"])?
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| CaptureError::Git {
+            command: "git log -1 --format=%ct HEAD".to_owned(),
+            detail: "HEAD commit time is not a Unix timestamp".to_owned(),
+        })?;
+    Ok(seconds.saturating_mul(1_000))
 }
 
 fn git_output<const N: usize>(

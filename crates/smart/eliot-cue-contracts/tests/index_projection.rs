@@ -2,7 +2,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use eliot_contracts::{
-    AuthorityEpoch, ReceiptId, ResourceGeneration, SourceId, StateFence, TaskId,
+    EpochId, EpochLineageId, ReceiptId, ResourceGeneration, SourceId, StateFence, TaskId,
 };
 use eliot_cue_contracts::*;
 use eliot_evidence::{
@@ -18,7 +18,15 @@ fn digest(seed: u8) -> Digest {
     Digest::new(format!("{seed:02x}").repeat(32)).expect("digest")
 }
 fn fence() -> StateFence {
-    StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+    StateFence::new(
+        EpochId::new(
+            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440003")
+                .expect("valid test lineage"),
+            std::num::NonZeroU64::new(1).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch"),
+        ResourceGeneration::genesis(),
+    )
 }
 fn provenance() -> Provenance {
     Provenance {

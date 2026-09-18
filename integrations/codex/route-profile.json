@@ -149,5 +149,28 @@
     "https://developers.openai.com/codex/plugins",
     "https://developers.openai.com/codex/hooks",
     "https://developers.openai.com/codex/skills"
-  ]
+  ],
+  "disposition": {
+    "disposition": "unavailable-target",
+    "route_id": "codex.app-server.stdio",
+    "bundle_generation": "1217-A.1",
+    "admittable": false,
+    "admitted": false,
+    "proof_ceiling": "A stable App Server method can produce one bounded candidate attempt; plugin installation alone proves neither route readiness nor task completion.",
+    "expiry_condition": "No expiry; static unavailable-target. Admission requires the App Server adapter implementation, current-account model and quota live probes, and registry admission after exact static and live probes. Plugin installation alone proves neither route readiness nor task completion; experimental collaboration methods stay excluded.",
+    "per_attempt_receipt": true,
+    "required_probes": [
+      "pin executable and stable schema fingerprint",
+      "prove initialize, model/list, thread/start, turn/start, terminal event, and turn/interrupt",
+      "prove reconnect or rehydration without reviving stale authority",
+      "prove plugin hooks are present only when their feature gate and exact event coverage are observed",
+      "prove no child or terminal task result is lost before parent reconciliation"
+    ],
+    "non_admittable_reasons": [
+      "implementation_support=TARGET is non-admittable",
+      "evidence_execution_status=NOT_EXECUTED is non-admittable",
+      "execution_routes[0].status=target is non-admittable",
+      "event_contract.coverage_status=documented_not_observed is non-admittable"
+    ]
+  }
 }

@@ -107,6 +107,19 @@ pub(crate) fn profile_digest(
 }
 
 /// A touched denominator row composed from existing A-10/A-11/C1 contracts.
+///
+/// Contract-link note (T11-ADM830): the `normalization` field retains the
+/// concrete A-11 `NormalizationEnvelope` value rather than a neutral copy. This
+/// cell never invokes the A-11 algorithm (`normalize_cue`, `capture_cue` and
+/// `fire_cue` are not referenced here); it only reads the already validated
+/// shape and digests plus the intrinsic `NormalizationEnvelope::validate`
+/// binding, the same intrinsic-receipt pattern Dreamer handlers apply to A-05
+/// receipts. The implementation-crate link is declared, not incidental: this
+/// cell's `module.toml` lists `eliot-cue-normalizer` under both `depends_on`
+/// and `providers`, and `crates/smart/cognitive-edge-map.toml` forbids only
+/// the `eliot-cue-index -> eliot-cue-normalizer` compile edge, not this one.
+/// Downstream cells still meet this cell through the owner-neutral
+/// `CueBindingCandidate` contract only.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TouchedResourceProjection {

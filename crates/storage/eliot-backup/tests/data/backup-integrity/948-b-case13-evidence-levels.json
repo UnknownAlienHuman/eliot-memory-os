@@ -1,0 +1,1 @@
+{"levels":["ArchiveValid","IsolatedImportComplete","ReconciliationRequired"],"note":"Worker B fixture: evidence ceilings. Pure archive validation never asserts capture binding, decryptability, or recovery; absent decryption or capture-owner evidence limits the proof to the strongest level actually observed.","rule":"absence-of-evidence-is-never-success"}

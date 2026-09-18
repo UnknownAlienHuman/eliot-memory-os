@@ -1,32 +1,19 @@
 //! SCM service registration contract and runtime-inspection types.
 //!
-//! Architecture handles (verified at `docs/architecture/ELIOT_ARCHITECTURE.md`):
-//! - A13.2 Kernel and failure domains (lines 2062-2075): minimal alive Kernel
-//!   preserves authority/fencing/health, Host Supervisor is outside the shared
-//!   failure domain of Kernel/Watchdog/Doctor and only bounded-restarts approved
-//!   services without reading project semantics.
-//! - A13.3 Module supervision and Doctor (lines 2081-2088): start, health/readiness
-//!   check, quiesce/drain, checkpoint, restart/rebuild, replace/rollback, quarantine,
-//!   retire.
+//! Architecture: A13.2 (docs/architecture/A13-02-kernel-and-failure-domains.md#a132-kernel-and-failure-domains).
 //!
-//! Implementation tier (separately labeled):
-//! - `docs/PROJECT_MAP.md` lines 101-108: Windows protected paths, ACLs, SCM and
-//!   process/Job observations are owned by `crates/kernel/eliot-platform-windows`
-//!   (and `crates/eliot-windows-ipc`), distinct from installation, host-state,
-//!   kernel-service, store, daemon, watchdog boundaries.
-//! - `docs/architecture/ELIOT_IMPLEMENTATION.md` lines 1218-1237: `eliotd` owns
-//!   WorkScopes/tasks/plan revisions and is hot-replaceable without changing
-//!   canonical owner; lines 1941-2005: crate-rich, process-sparse, owner-sparse
-//!   with one owner per mutable state and one canonical semantic path.
+//! Implementation: I1.2 (docs/architecture/I01-02-required-processes-of-the-first-complete-runtime.md#i12-required-processes-of-the-first-complete-runtime),
+//! I1.6 (docs/architecture/I01-06-windows-isolation.md#i16-windows-isolation).
 //!
 //! Ownership: this module is the sole owner of the SCM service registration
 //! contract and runtime-inspection types — `ServiceAccount`, `ServiceStartMode`,
 //! `ServiceSidType`, service constants, `ServiceControlGrantReadback`,
 //! `ServiceBootstrapArguments`, `ServiceRegistrationCurrent`,
 //! `ServiceRegistrationRequest`, `ServiceRegistrationOutcome`,
-//! `ServiceRegistrationInspection`, `ServiceRuntimeObservation`,
-//! `ServiceRegistrationRuntimeInspection`, `ServiceStartOutcome`,
-//! `ServiceStopOutcome` — and their proven closure-owned private helpers.
+//! `ServiceAbsentProof`, `ServiceRegistrationInspection`,
+//! `ServiceRuntimeObservation`, `ServiceRegistrationRuntimeInspection`,
+//! `ServiceStartOutcome`, `ServiceStopOutcome` — and their proven closure-owned
+//! private helpers.
 //! Physical SCM register, update, delete, start, stop and inspect operations
 //! remain root-owned in `lib.rs` and must not be duplicated here. It does not
 //! own and must not duplicate or broaden: Kernel generation/fencing,
@@ -94,8 +81,33 @@ pub const ELIOT_WATCHDOG_SERVICE_DISPLAY_NAME: &str = "Eliot Watchdog";
 pub const ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK: u32 =
     0x0000_0001 | 0x0000_0004 | 0x0000_0010 | 0x0000_0020 | 0x0002_0000;
 
-/// Authoritative readback of the one narrow service-object grant installed by
-/// the privileged installer for the non-elevated Host service.
+/// Exact service-object rights granted to the `EliotHost` service SID on the
+/// canonical `EliotHost` registration.
+///
+/// This mirrors the Watchdog installer pattern (protected DACL, `SY`/`BA`
+/// full, least-privilege service-SID grantee) for the Host's own service
+/// object. The mask follows `docs/architecture/I03-01-installation-form.md:23`:
+/// query-config plus query-status plus demand-start plus `READ_CONTROL` for
+/// DACL reverification. It deliberately excludes `SERVICE_STOP` (SCM stop is
+/// recovery-only per I03-01:23; normal stop flows through authenticated ELIOT
+/// control), change-config, delete, write-DACL, write-owner, pause/continue
+/// and user-defined control rights.
+///
+/// DOC GAP: I03-01:23 states "authorized local users may query and
+/// demand-start" but does not name the exact user SID(s) (`AU`/`IU`/`BU`
+/// versus the explicit broker allow-list at I03-01:27). Until that allow-list
+/// is typed, the installer DACL grants only the deterministic Host service
+/// SID (the sole concrete least-privilege SID available to the platform
+/// adapter); an ordinary-user ACE remains a follow-up once the SID set is
+/// specified.
+pub const ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK: u32 =
+    0x0000_0001 | 0x0000_0004 | 0x0000_0010 | 0x0002_0000;
+
+/// Authoritative readback of one narrow per-service grant installed by the
+/// privileged installer: the `EliotHost` self-grant on the canonical
+/// `EliotHost` registration, or the `EliotHost` service-SID grant on the
+/// canonical `EliotWatchdog` registration. Both carry the deterministic Host
+/// SID as principal and differ only in mask/descriptor digest.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ServiceControlGrantReadback {
     principal_service: String,
@@ -151,19 +163,31 @@ impl ServiceControlGrantReadback {
     /// # Errors
     ///
     /// Returns [`WindowsAdapterError::IdentityMismatch`] when the principal,
-    /// concrete access mask, or descriptor digest differs from the canonical
-    /// Host-to-Watchdog control grant.
+    /// concrete access mask, or descriptor digest differs from both canonical
+    /// per-service grants (Host self-grant and Host-to-Watchdog grant).
     pub fn validate(&self) -> Result<(), WindowsAdapterError> {
         if self.principal_service != ELIOT_HOST_SERVICE_NAME
             || !crate::valid_service_sid_text(&self.principal_sid)
-            || self.access_mask != ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK
             || !crate::valid_sha256_hex(&self.security_descriptor_digest)
-            || !crate::watchdog_service_security_descriptor_digest(&self.principal_sid)
-                .is_ok_and(|expected| expected == self.security_descriptor_digest)
         {
             return Err(WindowsAdapterError::IdentityMismatch);
         }
-        Ok(())
+        // Watchdog grant path (byte-identical legacy behavior).
+        if self.access_mask == ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK
+            && crate::watchdog_service_security_descriptor_digest(&self.principal_sid)
+                .is_ok_and(|expected| expected == self.security_descriptor_digest)
+        {
+            return Ok(());
+        }
+        // Host self-grant path (per-service generalization; Watchdog path
+        // above unchanged).
+        if self.access_mask == ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK
+            && crate::host_service_security_descriptor_digest(&self.principal_sid)
+                .is_ok_and(|expected| expected == self.security_descriptor_digest)
+        {
+            return Ok(());
+        }
+        Err(WindowsAdapterError::IdentityMismatch)
     }
 }
 
@@ -594,10 +618,21 @@ impl ServiceRegistrationRequest {
     }
 
     /// Returns whether this registration requires the installer-owned
-    /// `EliotHost` service-control grant and exact DACL readback.
+    /// protected service DACL and exact readback.
+    ///
+    /// Both canonical services require it: `EliotWatchdog` carries the
+    /// `EliotHost` service-SID grant, and `EliotHost` carries its own
+    /// `EliotHost` service-SID self-grant (same SID, Host-specific mask; see
+    /// `ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK`). This predicate remains the
+    /// sole gate for `WRITE_DAC` mutation access and for the install/readback
+    /// helpers; per-service helpers branch on `service_name` so Watchdog
+    /// bytes stay identical.
     #[must_use]
     pub fn requires_host_service_control_grant(&self) -> bool {
-        self.service_name == ELIOT_WATCHDOG_SERVICE_NAME
+        matches!(
+            self.service_name.as_str(),
+            ELIOT_HOST_SERVICE_NAME | ELIOT_WATCHDOG_SERVICE_NAME
+        )
     }
 
     #[must_use]
@@ -683,6 +718,54 @@ impl ServiceRegistrationRequest {
     }
 }
 
+/// Independently observed SCM proof that one canonical service name is absent.
+///
+/// The proof is constructed only on the live `OpenServiceW` path that returns
+/// `ERROR_SERVICE_DOES_NOT_EXIST` for the validated request's canonical name.
+/// It carries the queried name and the admitted configuration digest so an
+/// absence observation can be bound to the exact effect without trusting plan
+/// data alone.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceAbsentProof {
+    service_name: String,
+    configuration_digest: String,
+}
+
+impl ServiceAbsentProof {
+    /// Binds a live `ERROR_SERVICE_DOES_NOT_EXIST` outcome to its query.
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` for a non-canonical service name or digest.
+    pub(super) fn new(
+        service_name: impl Into<String>,
+        configuration_digest: impl Into<String>,
+    ) -> Result<Self, WindowsAdapterError> {
+        let service_name = service_name.into();
+        let configuration_digest = configuration_digest.into();
+        if !crate::canonical_runtime_service_name(&service_name)
+            || !crate::valid_sha256_hex(&configuration_digest)
+        {
+            return Err(WindowsAdapterError::InvalidInput);
+        }
+        Ok(Self {
+            service_name,
+            configuration_digest,
+        })
+    }
+
+    /// Returns the canonical SCM service name that was queried and found absent.
+    #[must_use]
+    pub fn service_name(&self) -> &str {
+        &self.service_name
+    }
+
+    /// Returns the admitted configuration digest bound to the absent query.
+    #[must_use]
+    pub fn configuration_digest(&self) -> &str {
+        &self.configuration_digest
+    }
+}
+
 /// Registration result preserving whether an external SCM effect requires
 /// reconciliation before it can be called successful.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -715,6 +798,112 @@ pub enum ServiceRegistrationOutcome {
     EffectUnknown,
 }
 
+/// DACL-only security-information mask used by Host/Watchdog service read
+/// paths (standing s40, ELIOT issue #1352).
+///
+/// The value equals `DACL_SECURITY_INFORMATION` (`0x0000_0004`). Read paths
+/// must never set `SACL_SECURITY_INFORMATION` (`0x0000_0008`) and must never
+/// request `ACCESS_SYSTEM_SECURITY`: SACL `S:(AU;FA;;;WD)` is installer-owned
+/// and never opened or hashed here. The digest remains DACL-scoped; the
+/// SYSTEM-owner proof is a separate check.
+pub const SERVICE_DACL_READ_SECURITY_INFORMATION: u32 = 0x0000_0004;
+
+/// DACL-only read contour also requires `OWNER_SECURITY_INFORMATION`
+/// (`0x0000_0001`) on the same handle for the separate SYSTEM-owner proof.
+/// `READ_CONTROL` suffices; no `SeSecurityPrivilege` is required.
+pub const SERVICE_OWNER_READ_SECURITY_INFORMATION: u32 = 0x0000_0001;
+
+/// Canonical owner required by Host/Watchdog service-object readback.
+/// User-owned service objects are never accepted.
+pub const SERVICE_EXPECTED_OWNER_SID: &str = "S-1-5-18";
+
+/// Typed diagnostics carried by fail-closed `Unknown` inspections
+/// (standing s40, ELIOT issue #1352).
+///
+/// `Unknown` remains fail-closed: callers map it to `EffectUnknown`/`Unknown`
+/// inspection, never to `Matching`. `Mismatched` (`AclMismatch`/
+/// `IdentityMismatch` only) is never collapsed into `Unknown` and vice versa.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ServiceInspectionUnknownDetail {
+    /// `GetLastError` code observed at the failing stage (`0` when the
+    /// failure is a logic contour violation with no Win32 error).
+    pub win32_error: u32,
+    /// Failing stage (e.g. `"open-scm"`, `"open-service"`, `"query-config"`,
+    /// `"query-sid-type"`, `"read-grant"`, `"query-owner"`, `"query-status"`).
+    pub stage: &'static str,
+    /// Raw `dwCurrentState` when the status sample was available.
+    pub current_state: Option<u32>,
+    /// Raw `dwProcessId` when the status sample was available.
+    pub process_id: Option<u32>,
+}
+
+impl ServiceInspectionUnknownDetail {
+    /// Creates diagnostics without a status sample.
+    #[must_use]
+    pub const fn new(win32_error: u32, stage: &'static str) -> Self {
+        Self {
+            win32_error,
+            stage,
+            current_state: None,
+            process_id: None,
+        }
+    }
+
+    /// Creates diagnostics with the raw SCM status sample attached.
+    #[must_use]
+    pub const fn with_status(
+        win32_error: u32,
+        stage: &'static str,
+        current_state: u32,
+        process_id: u32,
+    ) -> Self {
+        Self {
+            win32_error,
+            stage,
+            current_state: Some(current_state),
+            process_id: Some(process_id),
+        }
+    }
+
+    /// Returns the preserved `GetLastError` code.
+    #[must_use]
+    pub const fn win32_error(&self) -> u32 {
+        self.win32_error
+    }
+
+    /// Returns the failing stage.
+    #[must_use]
+    pub const fn stage(&self) -> &'static str {
+        self.stage
+    }
+
+    /// Returns the raw `dwCurrentState` when available.
+    #[must_use]
+    pub const fn current_state(&self) -> Option<u32> {
+        self.current_state
+    }
+
+    /// Returns the raw `dwProcessId` when available.
+    #[must_use]
+    pub const fn process_id(&self) -> Option<u32> {
+        self.process_id
+    }
+
+    /// Renders the detail so unit tests can assert the stage/code survive.
+    #[must_use]
+    pub fn detail(&self) -> String {
+        match (self.current_state, self.process_id) {
+            (Some(state), Some(pid)) => {
+                format!(
+                    "stage={} win32_error={} current_state={state} process_id={pid}",
+                    self.stage, self.win32_error
+                )
+            }
+            _ => format!("stage={} win32_error={}", self.stage, self.win32_error),
+        }
+    }
+}
+
 /// Read-only classification of one canonical Runtime Live SCM registration.
 ///
 /// `Matching` means the SCM name, binary command, own-process service type,
@@ -728,11 +917,62 @@ pub enum ServiceRegistrationInspection {
         control_grant: Option<ServiceControlGrantReadback>,
     },
     /// The canonical service name is not registered.
-    Absent,
+    ///
+    /// The proof carries the live `ERROR_SERVICE_DOES_NOT_EXIST` observation
+    /// (queried name plus admitted configuration digest) so callers bind the
+    /// absence to their exact effect instead of trusting plan data alone.
+    Absent {
+        /// Independently observed SCM absence proof for the queried service.
+        proof: ServiceAbsentProof,
+    },
     /// A service exists at the canonical name with different configuration.
     Mismatched,
     /// SCM could not provide authoritative configuration and state readback.
-    Unknown,
+    ///
+    /// The payload preserves the `GetLastError` code and failing stage
+    /// without weakening fail-closed semantics: `Unknown{..}` still maps to
+    /// `EffectUnknown`/`Unknown` inspection, never to `Matching`.
+    Unknown {
+        /// Typed diagnostics for the failing stage.
+        detail: ServiceInspectionUnknownDetail,
+    },
+}
+
+impl ServiceRegistrationInspection {
+    /// Constructs fail-closed diagnostics without a status sample.
+    #[must_use]
+    pub const fn unknown(win32_error: u32, stage: &'static str) -> Self {
+        Self::Unknown {
+            detail: ServiceInspectionUnknownDetail::new(win32_error, stage),
+        }
+    }
+
+    /// Constructs fail-closed diagnostics with the raw SCM status attached.
+    #[must_use]
+    pub const fn unknown_with_status(
+        win32_error: u32,
+        stage: &'static str,
+        current_state: u32,
+        process_id: u32,
+    ) -> Self {
+        Self::Unknown {
+            detail: ServiceInspectionUnknownDetail::with_status(
+                win32_error,
+                stage,
+                current_state,
+                process_id,
+            ),
+        }
+    }
+
+    /// Returns the typed `Unknown` diagnostics, if this inspection is `Unknown`.
+    #[must_use]
+    pub const fn unknown_detail(&self) -> Option<ServiceInspectionUnknownDetail> {
+        match self {
+            Self::Unknown { detail } => Some(*detail),
+            _ => None,
+        }
+    }
 }
 
 /// Exact read-only SCM runtime observation for one validated registration.
@@ -843,7 +1083,51 @@ pub enum ServiceRegistrationRuntimeInspection {
     /// The registration or live image differs from the validated request.
     Mismatched,
     /// SCM or the live process could not be observed authoritatively.
-    Unknown,
+    ///
+    /// The payload preserves the `GetLastError` code and failing stage
+    /// without weakening fail-closed semantics: `Unknown{..}` still maps to
+    /// `EffectUnknown`, never to `Matching`.
+    Unknown {
+        /// Typed diagnostics for the failing stage.
+        detail: ServiceInspectionUnknownDetail,
+    },
+}
+
+impl ServiceRegistrationRuntimeInspection {
+    /// Constructs fail-closed diagnostics without a status sample.
+    #[must_use]
+    pub const fn unknown(win32_error: u32, stage: &'static str) -> Self {
+        Self::Unknown {
+            detail: ServiceInspectionUnknownDetail::new(win32_error, stage),
+        }
+    }
+
+    /// Constructs fail-closed diagnostics with the raw SCM status attached.
+    #[must_use]
+    pub const fn unknown_with_status(
+        win32_error: u32,
+        stage: &'static str,
+        current_state: u32,
+        process_id: u32,
+    ) -> Self {
+        Self::Unknown {
+            detail: ServiceInspectionUnknownDetail::with_status(
+                win32_error,
+                stage,
+                current_state,
+                process_id,
+            ),
+        }
+    }
+
+    /// Returns the typed `Unknown` diagnostics, if this inspection is `Unknown`.
+    #[must_use]
+    pub const fn unknown_detail(&self) -> Option<ServiceInspectionUnknownDetail> {
+        match self {
+            Self::Unknown { detail } => Some(*detail),
+            _ => None,
+        }
+    }
 }
 
 /// Result of one exact-registration-bound SCM start attempt.

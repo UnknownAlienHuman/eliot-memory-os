@@ -1,0 +1,75 @@
+schema_version = 4
+module_id = "smart.cognitive.quality"
+crate = "eliot-cognitive-quality"
+status = "PROTOTYPE"
+wave = "cognitive-micromodules-wave-09"
+agent_order = 80
+plane = "Smart"
+runtime_layer = "R6"
+delivery_depth = "D3a"
+source_layer = "C1"
+runtime_bundle = "eliot-dreamer"
+state_class = "stateless"
+hot_path = false
+lifecycle_owner = "smart.cognitive.quality"
+loc_soft_ceiling = 10000
+loc_policy = "review ceiling only; causal cohesion, proof, owner, build/test closure and replacement boundary decide topology"
+product_objective = "Skill lifecycle, tool-surface, Dreamer economics, self-quality, bottleneck, and intervention evidence arrive as candidate-only assessments with exact denominators and no aggregate score."
+causal_property = "cognitive quality assessment (skill lifecycle, tool-surface, Dreamer economics, self-quality, bottleneck, intervention candidate)"
+old_failure_or_missing_capability = "installed/delivered/executed/useful collapse into one score, elegant-but-unused synthesis counts as utility, and recurring same-hypothesis failure retries instead of opening Mechanism Review (CC-007)."
+discriminator = "per-attempt HarnessActivationReceipt refs decide eligibility/activation/adherence; per-sub-assessment denominators decide completeness; activity or summary volume never closes the loop"
+primary_responsibility = "Project one bounded quality scope into a CognitiveQualityAssessment with skill, tool-surface, economics, self-quality, bottleneck, and intervention sections."
+owned_mutable_state = []
+allowed_effects = []
+inputs = ["immutable Skill execution evidence by handle", "immutable tool-definition versions by handle", "immutable Durable Job and route-usage/curation/outcome receipts by handle", "immutable SystemObservationJournal/EliotSystemExperienceBank/AgentFeedbackReceipt projections by handle", "immutable Problem/ImprovementCandidate refs by handle"]
+outputs = ["CognitiveQualityAssessment"]
+depends_on = ["eliot-dreamer-contracts", "eliot-learning-contracts"]
+providers = ["Context/host observations", "attempt/verifier evidence", "Governor/Diagnostic Compiler projection owner (candidate supply only)"]
+consumers = ["Dreamer/Curator review surface", "Human/Main Agent/Governor decision owner"]
+non_goals = ["Skill/tool/config/route mutation", "scheduler/effect/authority ownership", "task finish", "promotion decision", "aggregate intelligence or learning score", "self-certification or self-promotion"]
+invariants = ["installed != delivered != executed != useful", "acknowledgement is not use, use is not adherence, adherence is not benefit", "retrieval/repetition/agreement never reinforce a Skill", "Dreamer/Curator proposals remain reversible candidates until governed promotion", "recurring failure without changed hypothesis or discriminator opens Mechanism Review", "every Complete state requires its exact per-sub-assessment denominator"]
+failure_behavior = "Return explicit inconclusive/no-change/unsupported output with exact missing evidence; never fabricate quality, benefit, or promotion."
+proof_surface = ["not delivered", "delivered unused", "early follow/final violation", "stale on tool-definition change", "missing host coverage", "job cost ledger vs held-out outcome", "bottleneck table rows"]
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+product_pulse = "W9_COGNITIVE_QUALITY_PULSE_01"
+replacement_boundary = "implementation behind the declared public contract; package ownership creates no runtime or semantic authority"
+merge_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
+split_trigger = "a second causal responsibility, mutable owner, independent proof surface or independent rollback boundary appears"
+
+[[donor]]
+path = "docs/architecture/I07-25-skill-lifecycle-interaction-and-execution-evidence.md"
+disposition = "authoritative contract"
+
+[[donor]]
+path = "docs/architecture/I09-16-dreamer-quality-and-job-economics.md"
+disposition = "authoritative contract"
+
+[[donor]]
+path = "docs/architecture/I16-23-eliot-self-quality-and-feedback-observability.md"
+disposition = "authoritative contract"
+
+[agent_task]
+objective = "Freeze the owner-neutral cognitive-quality field contract with exact per-sub-assessment denominators; no implementation in this work unit."
+write_scope = ["crates/smart/eliot-cognitive-quality/**"]
+deliverables = ["frozen field contract entry", "per-sub-assessment denominator recheck rules", "affected edge fixtures (contract_only)"]
+acceptance = ["one declared responsibility only", "bounded deterministic behavior", "visible local degradation"]
+forbidden = ["canonical writes outside the named Governor transition path", "truth/support/authority/policy/finish/effect promotion", "provider or model SDKs in pure cognitive cores", "vendor or storage types in public contracts", "unbounded synchronous work", "silent truncation", "oracle or verifier weakening in the same work unit", "implicit scope widening", "active-generation self-modification"]
+stop_condition = "Stop and return ContractChallenge when the work needs another owner, model work, hidden reasoning inference, or hidden state."
+challenge_path = "return ContractChallenge to the integration owner when owner, discriminator, proof ceiling or dependency boundary is wrong"
+integration_owner = "cognitive-wave-integrator"
+implementation_language = "Rust 2024"
+required_verification = ["module/package proof at the declared proof ceiling", "real provider/consumer fixture for every changed edge", "the named Product Pulse before promotion", "exact donor reuse/rewrite/reject trace"]
+writeback = "return implementation artifact, exact proof evidence, donor disposition, unresolved ContractChallenges and merge/remove recommendation"
+workspace_admission = "forbidden until implementation, package proof, affected edge proof, current-main rebase and integration-owner review"
+
+# Acceptance is decided by the owning contract and independent review
+# (I0.10: line/test/type counts are not goals). `scripts/verify-work-unit.py`
+# is a retired legacy diagnostic that always reports completion=NOT_VERIFIED
+# and never accepts a work unit. This table names the concrete contract and
+# the required exports/tests plus small behaviour checks the reviewer verifies.
+[acceptance]
+require_deny_unknown_fields = true
+forbid_unsafe = true
+required_exports = []
+required_tests = []
+forbidden_patterns = ['serde_json::Value', 'unimplemented!', 'todo!']

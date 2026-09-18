@@ -1,0 +1,1 @@
+{"note": "ordering vectors: same semantic rows in different input orders must yield identical digests", "rows_a": [{"issue": 837, "unit": "D-WU-FINAL"}, {"issue": 850, "unit": "D-WU-RUNNERS"}], "rows_b": [{"issue": 850, "unit": "D-WU-RUNNERS"}, {"issue": 837, "unit": "D-WU-FINAL"}]}

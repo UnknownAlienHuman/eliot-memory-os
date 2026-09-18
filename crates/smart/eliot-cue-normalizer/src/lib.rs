@@ -23,7 +23,7 @@ pub use policy::{
 
 pub use bounds::{MAX_INPUT_BYTES, MAX_KEYS, MAX_OUTPUT_BYTES, MAX_STEPS};
 
-use eliot_cue_contracts::{NormalizationProfile, ObservedCue};
+use eliot_cue_contracts::{NormalizationProfile, NormalizedCue, ObservedCue};
 
 /// Normalizes one observed cue under one exact policy and profile binding.
 pub fn normalize_cue(
@@ -50,4 +50,20 @@ pub fn fire_cue(
     profile: &NormalizationProfile,
 ) -> Result<NormalizationEnvelope, NormalizationError> {
     normalize_cue(observed, policy, profile)
+}
+
+/// Records the lossless v2 source value for one observed cue under one exact
+/// policy. The spelling is verbatim; comparison semantics stay in the key.
+pub fn source_value(
+    observed: &ObservedCue,
+    policy: &NormalizationPolicy,
+) -> Result<eliot_cue_contracts::CueSourceValue, NormalizationError> {
+    normalize::source_value_for(observed, policy)
+}
+
+/// Derives the explicit v2 comparison key for one normalized cue.
+pub fn comparison_key(
+    normalized: &NormalizedCue,
+) -> Result<eliot_cue_contracts::CueComparisonKey, NormalizationError> {
+    normalize::comparison_key_for(normalized)
 }

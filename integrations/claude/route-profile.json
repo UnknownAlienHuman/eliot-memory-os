@@ -213,5 +213,30 @@
     "https://docs.anthropic.com/en/docs/claude-code/hooks",
     "https://docs.anthropic.com/en/docs/claude-code/plugins",
     "https://docs.anthropic.com/en/docs/claude-code/skills"
-  ]
+  ],
+  "disposition": {
+    "disposition": "unavailable-target",
+    "route_id": "claude.agent-sdk.local-sidecar",
+    "bundle_generation": "1217-A.1",
+    "admittable": false,
+    "admitted": false,
+    "proof_ceiling": "The local sidecar may execute one bounded candidate attempt. Claude Code plugin hooks observe or gate a host session but do not own SDK attempt state, finish, or recovery.",
+    "expiry_condition": "No expiry; static unavailable-target. Admission requires the local Agent SDK sidecar implementation and live sidecar probes. The remote route claude.managed-agents.remote remains a separate deferred route with separate credentials, billing, retention, and receipt and never shares admission with the local route.",
+    "per_attempt_receipt": true,
+    "required_probes": [
+      "pin Claude Code executable, Agent SDK package, sidecar artifact, account, and behavior-affecting options",
+      "prove read-only start, streamed events, result, cancellation, cleanup, resume, and optional fork independently",
+      "prove hook output and SDK event output are not merged into one terminal status",
+      "prove every admitted subagent has a WorkItem and descendant closure before parent disposition",
+      "prove local and remote routes have separate credentials, billing, retention, and ActualRouteReceipt"
+    ],
+    "non_admittable_reasons": [
+      "implementation_support=PARTIAL is non-admittable",
+      "evidence_execution_status=NOT_EXECUTED is non-admittable",
+      "execution_routes[local].status=target is non-admittable",
+      "execution_routes[remote].status=deferred is non-admittable",
+      "event_contract.coverage_status=documented_not_observed is non-admittable",
+      "event_contract.coverage_status=unprobed is non-admittable"
+    ]
+  }
 }

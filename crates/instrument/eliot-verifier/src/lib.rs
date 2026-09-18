@@ -6,11 +6,12 @@
 
 #![forbid(unsafe_code)]
 
-use eliot_types::verification::{
-    SkippedTest, SkippedTestReason, TestInventory, TestMetadata, TestStatefulness,
-    TestSuiteProfile, VerificationCommandResult, VerificationCommandStatus, VerificationDecision,
-    VerificationPlan, VerificationRun, VerificationRunStatus, VerificationVerdict,
+use eliot_contracts::{ClockReading, ContractId, RequestId, sha256_hex};
+use eliot_instrument_api::{
+    EvidenceCoverage, EvidenceFreshness, InstrumentContractError, InstrumentKind, RawEvidence,
+    VerificationOutcome, VerificationRun as CurrentVerificationRun,
 };
+use eliot_instrument_nextest::{NEXTEST_INSTRUMENT, parse_jsonl};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -38,6 +39,31 @@ pub enum VerifierError {
     DuplicateCommand(String),
     #[error("command result is not valid: {0}")]
     InvalidResult(String),
+    #[error("current verification requires a non-empty required test set from the admitted plan")]
+    EmptyRequiredTests,
+    #[error("current verification requires non-empty digest-bound raw evidence")]
+    EmptyRawEvidence,
+    #[error("raw evidence {artifact} is truncated; incomplete capture cannot pass")]
+    TruncatedRawEvidence { artifact: String },
+    #[error("raw evidence {artifact} does not belong to this invocation")]
+    ForeignRawEvidence { artifact: String },
+    #[error("raw evidence {artifact} is not valid: {reason}")]
+    InvalidRawEvidence {
+        artifact: String,
+        reason: &'static str,
+    },
+    #[error(
+        "wrong instrument {instrument}: current verification requires eliot.instrument.nextest"
+    )]
+    WrongInstrument { instrument: String },
+    #[error("unsupported instrument kind {kind:?}: current verification requires TEST")]
+    UnsupportedKind { kind: InstrumentKind },
+    #[error("nextest output could not be parsed: {reason}")]
+    UnparsableReport { reason: String },
+    #[error("clock interval is not ordered at {field}")]
+    UnorderedClock { field: &'static str },
+    #[error("current verification binding is invalid: {detail}")]
+    InvalidBinding { detail: String },
 }
 
 fn text(value: &str, field: &'static str) -> Result<(), VerifierError> {
@@ -53,6 +79,204 @@ fn id(prefix: &str, value: impl Serialize) -> String {
     let mut digest = Sha256::new();
     digest.update(bytes);
     format!("{prefix}-{:x}", digest.finalize())
+}
+
+// Verifier-local planning DTOs.
+//
+// These types are owned by this crate. They cover exactly the inventory,
+// profile, plan, run, and verdict shapes the `plan` / `execute` / `verdict`
+// path genuinely reads or constructs. The legacy donor crate is never
+// referenced here.
+
+/// Intent of one verifiable test, as read by profile filtering.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TestIntent {
+    TypeContract,
+    BoundarySecurity,
+    Regression,
+    /// Tests that prove a unit of work is actually finished. Records written
+    /// under the retired milestone spelling still load.
+    #[serde(alias = "phase_closeout")]
+    CompletionProof,
+    BehaviorEval,
+    StatefulDbSafety,
+    RuntimeServiceSafety,
+    ExternalProviderSafety,
+    PerformanceCost,
+    FlakeDetection,
+}
+
+/// Cost class of one verifiable test, as compared against a profile ceiling.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TestCostClass {
+    Tiny,
+    Small,
+    Medium,
+    Large,
+    VeryLarge,
+}
+
+/// Statefulness of one verifiable test, as filtered by a profile.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TestStatefulness {
+    Pure,
+    TempFs,
+    LocalDbIsolated,
+    LocalDbSharedSerial,
+    NetworkForbidden,
+    ServiceProcess,
+    WindowsServiceDryRun,
+}
+
+/// One verifiable test, with exactly the fields planning reads.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TestMetadata {
+    pub test_id: String,
+    pub crate_name: String,
+    pub intent: TestIntent,
+    pub component_refs: Vec<String>,
+    pub risk_refs: Vec<String>,
+    pub estimated_cost: TestCostClass,
+    pub statefulness: TestStatefulness,
+    pub required_profiles: Vec<String>,
+}
+
+/// Immutable test inventory input to planning, with exactly the fields used.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TestInventory {
+    pub inventory_id: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub generated_at: OffsetDateTime,
+    pub tests: Vec<TestMetadata>,
+}
+
+/// Profile selecting which inventory tests are in scope, with exactly the
+/// fields planning reads.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TestSuiteProfile {
+    pub profile_id: String,
+    pub included_intents: Vec<TestIntent>,
+    pub excluded_statefulness: Vec<TestStatefulness>,
+    pub max_cost_class: Option<TestCostClass>,
+    pub requires_serial: bool,
+    pub required_commands: Vec<String>,
+}
+
+/// Estimated runtime severity carried as write-only plan metadata.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationRuntimeClass {
+    Fast,
+    Medium,
+    Full,
+    Deep,
+}
+
+/// One test left out of a plan and why.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SkippedTest {
+    pub test_id: String,
+    pub reason: SkippedTestReason,
+}
+
+/// Reason a test was left out of a plan.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkippedTestReason {
+    OutOfScopeForProfile,
+    CoveredByRequiredGate,
+    PlatformNotSupported,
+    RequiresManualServiceInstall,
+    DeepOnly,
+}
+
+/// Deterministic plan payload produced by [`plan`].
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct VerificationPlan {
+    pub plan_id: String,
+    pub profile_id: String,
+    pub changed_refs: Vec<String>,
+    pub selected_tests: Vec<String>,
+    pub required_commands: Vec<String>,
+    pub skipped_tests: Vec<SkippedTest>,
+    pub estimated_runtime_class: VerificationRuntimeClass,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+}
+
+/// Status of one executed command observation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationCommandStatus {
+    Passed,
+    Failed,
+    Skipped,
+    TimedOut,
+    NotSupported,
+}
+
+/// Executor-owned observation for one planned command.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct VerificationCommandResult {
+    pub command: String,
+    pub status: VerificationCommandStatus,
+    pub duration_ms: u64,
+    pub stdout_ref: Option<String>,
+    pub stderr_ref: Option<String>,
+    pub parsed_test_count: Option<u64>,
+    pub warnings: Vec<String>,
+}
+
+/// Lifecycle status of one completed verification run.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationRunStatus {
+    Passed,
+    Failed,
+    Partial,
+    Blocked,
+}
+
+/// Completed run vessel consumed by [`verdict`].
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct VerificationRun {
+    pub run_id: String,
+    pub plan_id: String,
+    pub profile_id: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub started_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub finished_at: Option<OffsetDateTime>,
+    pub command_results: Vec<VerificationCommandResult>,
+    pub status: VerificationRunStatus,
+}
+
+/// Finish-gate decision produced by [`verdict`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationDecision {
+    Allow,
+    AllowWithWarnings,
+    Block,
+    RequireFullVerify,
+    RequireSerialDbVerify,
+}
+
+/// Durable verdict vessel produced by [`verdict`].
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct VerificationVerdict {
+    pub verdict_id: String,
+    pub run_id: String,
+    pub profile_id: String,
+    pub decision: VerificationDecision,
+    pub blocking_failures: Vec<String>,
+    pub warnings: Vec<String>,
+    pub required_followups: Vec<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
 }
 
 /// A command selected for one verifier plan.
@@ -181,11 +405,11 @@ pub fn plan(
     selected.sort();
     skipped.sort_by(|a, b| a.test_id.cmp(&b.test_id));
     let runtime = if commands.iter().any(|c| c.serial) {
-        eliot_types::verification::VerificationRuntimeClass::Deep
+        VerificationRuntimeClass::Deep
     } else if commands.len() > 3 {
-        eliot_types::verification::VerificationRuntimeClass::Full
+        VerificationRuntimeClass::Full
     } else {
-        eliot_types::verification::VerificationRuntimeClass::Fast
+        VerificationRuntimeClass::Fast
     };
     let profile_id = profile.profile_id.clone();
     let base = VerificationPlan {
@@ -303,7 +527,18 @@ fn run_status(results: &[VerificationCommandResult], expected: usize) -> Verific
             VerificationCommandStatus::Passed | VerificationCommandStatus::Skipped
         )
     }) {
-        VerificationRunStatus::Passed
+        // Legacy promotion removed (T7-S2): an all-skipped run executed
+        // nothing, so it is incomplete rather than passed. A genuine pass
+        // still requires at least one passed command; an empty result set
+        // can never pass either.
+        if results
+            .iter()
+            .any(|r| matches!(r.status, VerificationCommandStatus::Passed))
+        {
+            VerificationRunStatus::Passed
+        } else {
+            VerificationRunStatus::Partial
+        }
     } else {
         VerificationRunStatus::Blocked
     }
@@ -342,10 +577,23 @@ pub fn verdict(
         .iter()
         .flat_map(|r| r.warnings.clone())
         .collect::<Vec<_>>();
+    // Anti-promotion guard (T7-S2): a run marked passed without a single
+    // passed command carries no proof, so it stays incomplete and can never
+    // become Allow or AllowWithWarnings.
+    let has_passed_command = run
+        .command_results
+        .iter()
+        .any(|r| matches!(r.status, VerificationCommandStatus::Passed));
     let decision = match run.status {
-        VerificationRunStatus::Passed if warnings.is_empty() => VerificationDecision::Allow,
-        VerificationRunStatus::Passed => VerificationDecision::AllowWithWarnings,
-        VerificationRunStatus::Partial => VerificationDecision::RequireFullVerify,
+        VerificationRunStatus::Passed if warnings.is_empty() && has_passed_command => {
+            VerificationDecision::Allow
+        }
+        VerificationRunStatus::Passed if has_passed_command => {
+            VerificationDecision::AllowWithWarnings
+        }
+        VerificationRunStatus::Passed | VerificationRunStatus::Partial => {
+            VerificationDecision::RequireFullVerify
+        }
         VerificationRunStatus::Blocked | VerificationRunStatus::Failed => {
             VerificationDecision::Block
         }
@@ -364,4 +612,629 @@ pub fn verdict(
         },
         created_at,
     })
+}
+
+/// Evaluates one current verification run from already-captured evidence.
+///
+/// This is the T7-S2 current evaluator. It launches no process, resolves no
+/// registry, and promotes no legacy record: the caller supplies the admitted
+/// [`InstrumentInvocation`], the digest-bound [`RawEvidence`] captured for
+/// exactly that invocation, and the `required_test_ids` taken from the
+/// admitted plan only. Raw bytes are checked by digest, parsed with the
+/// registered nextest `parse_jsonl` projection, and the passed test names are
+/// intersected with the required set. `NextestReport::outcome` alone never
+/// decides: an all-skipped report passes its counters while proving nothing,
+/// so a pass additionally requires every required id to appear among the
+/// passed names. A full failed run is `Fail`; incomplete coverage is
+/// `Partial` when at least one required test completed and `Unknown`
+/// otherwise. Truncated, foreign, digest-broken, or unparsable input fails
+/// closed with a typed error instead of any outcome.
+///
+/// The returned run is bound to the invocation's declared scope and admitted
+/// state fence. Normalized evidence is intentionally empty: normalization
+/// belongs to the registered `eliot.instrument.diagnostic` owner, and this
+/// evaluator attaches no projection it did not compute.
+#[allow(clippy::too_many_lines)]
+pub fn evaluate_current(
+    invocation: &eliot_instrument_api::InstrumentInvocation,
+    raw: &[eliot_instrument_api::RawEvidence],
+    required_test_ids: &std::collections::BTreeSet<String>,
+    started_at: eliot_contracts::ClockReading,
+    finished_at: eliot_contracts::ClockReading,
+) -> Result<eliot_instrument_api::VerificationRun, VerifierError> {
+    invocation
+        .validate()
+        .map_err(|error| VerifierError::InvalidBinding {
+            detail: format!("invocation rejected: {error}"),
+        })?;
+    if invocation.kind != InstrumentKind::Test {
+        return Err(VerifierError::UnsupportedKind {
+            kind: invocation.kind,
+        });
+    }
+    if invocation.instrument.as_str() != NEXTEST_INSTRUMENT {
+        return Err(VerifierError::WrongInstrument {
+            instrument: invocation.instrument.to_string(),
+        });
+    }
+    if required_test_ids.is_empty() {
+        return Err(VerifierError::EmptyRequiredTests);
+    }
+    if raw.is_empty() {
+        return Err(VerifierError::EmptyRawEvidence);
+    }
+    started_at
+        .validate()
+        .map_err(|error| VerifierError::InvalidBinding {
+            detail: format!("started_at rejected: {error}"),
+        })?;
+    finished_at
+        .validate()
+        .map_err(|error| VerifierError::InvalidBinding {
+            detail: format!("finished_at rejected: {error}"),
+        })?;
+    if let (Some(start), Some(end)) = (started_at.known_time_ms, finished_at.known_time_ms)
+        && end < start
+    {
+        return Err(VerifierError::UnorderedClock {
+            field: "finished_at",
+        });
+    }
+    let mut stream = Vec::new();
+    for item in raw {
+        item.validate().map_err(|error| {
+            let reason = match error {
+                InstrumentContractError::InvalidDigest { .. } => "digest mismatch",
+                InstrumentContractError::InvalidText { .. } => "invalid content type",
+                InstrumentContractError::InvalidInterval { .. } => "invalid capture clock",
+                _ => "invalid raw evidence",
+            };
+            VerifierError::InvalidRawEvidence {
+                artifact: item.artifact_id.to_string(),
+                reason,
+            }
+        })?;
+        if item.truncated {
+            return Err(VerifierError::TruncatedRawEvidence {
+                artifact: item.artifact_id.to_string(),
+            });
+        }
+        if item.invocation_id != invocation.request.request_id {
+            return Err(VerifierError::ForeignRawEvidence {
+                artifact: item.artifact_id.to_string(),
+            });
+        }
+        stream.extend_from_slice(&item.bytes);
+    }
+    let report = parse_jsonl(&stream).map_err(|error| VerifierError::UnparsableReport {
+        reason: error.to_string(),
+    })?;
+    let (passed_names, completed_names) = completed_test_names(&stream);
+    let has_missing = required_test_ids.difference(&passed_names).next().is_some();
+    let observed_required = required_test_ids
+        .intersection(&completed_names)
+        .next()
+        .is_some();
+    let (outcome, coverage) = match report.outcome() {
+        VerificationOutcome::Pass if !has_missing => (
+            VerificationOutcome::Pass,
+            EvidenceCoverage::CompleteForScope,
+        ),
+        VerificationOutcome::Pass | VerificationOutcome::Unknown => {
+            // Covers the all-skipped quirk: the counters pass while no
+            // required test actually passed.
+            if observed_required {
+                (
+                    VerificationOutcome::Partial,
+                    EvidenceCoverage::PartialForScope,
+                )
+            } else {
+                (VerificationOutcome::Unknown, EvidenceCoverage::Unknown)
+            }
+        }
+        VerificationOutcome::Fail => {
+            let coverage = if report.started > 0 && report.completed == report.started {
+                EvidenceCoverage::CompleteForScope
+            } else {
+                EvidenceCoverage::PartialForScope
+            };
+            (VerificationOutcome::Fail, coverage)
+        }
+        VerificationOutcome::Cancelled => {
+            (VerificationOutcome::Cancelled, EvidenceCoverage::Unknown)
+        }
+        VerificationOutcome::Partial | VerificationOutcome::Blocked => {
+            if observed_required {
+                (
+                    VerificationOutcome::Partial,
+                    EvidenceCoverage::PartialForScope,
+                )
+            } else {
+                (VerificationOutcome::Unknown, EvidenceCoverage::Unknown)
+            }
+        }
+    };
+    let freshness = if captured_within_window(&started_at, &finished_at, raw) {
+        EvidenceFreshness::ExactCandidate
+    } else {
+        EvidenceFreshness::Unknown
+    };
+    let digest_input = raw.iter().fold(
+        invocation.request.request_id.as_str().as_bytes().to_vec(),
+        |mut acc, item| {
+            acc.extend_from_slice(item.sha256.as_bytes());
+            acc
+        },
+    );
+    let run_id =
+        RequestId::new(format!("current-{}", sha256_hex(&digest_input))).map_err(|error| {
+            VerifierError::InvalidBinding {
+                detail: format!("run identity rejected: {error}"),
+            }
+        })?;
+    let verifier =
+        ContractId::new(CONTRACT_NAME).map_err(|error| VerifierError::InvalidBinding {
+            detail: format!("verifier identity rejected: {error}"),
+        })?;
+    let run = CurrentVerificationRun {
+        run_id,
+        verifier,
+        invocation_id: invocation.request.request_id.clone(),
+        property: format!(
+            "nextest profile '{}' proves the admitted required tests",
+            invocation.profile
+        ),
+        scope: invocation.declared_scope.clone(),
+        execution: report.execution_status(),
+        outcome,
+        freshness,
+        coverage,
+        evidence: Vec::new(),
+        raw_evidence: raw.iter().map(|item| item.artifact_id.clone()).collect(),
+        state_fence: invocation.request.state_fence.clone(),
+        started_at,
+        finished_at: Some(finished_at),
+    };
+    run.validate()
+        .map_err(|error| VerifierError::InvalidBinding {
+            detail: format!("constructed run rejected: {error}"),
+        })?;
+    Ok(run)
+}
+
+/// Projects completed and passed test names from one canonical nextest JSONL
+/// stream.
+///
+/// This follows the registered adapter event shape (`type == "test"` with
+/// `started`/`completed` events and `PASS`/`pass` completion status) without
+/// replacing the authoritative [`parse_jsonl`] counters: callers must parse
+/// first, so malformed, duplicate, or unsupported events already failed
+/// closed before names are read here.
+fn completed_test_names(bytes: &[u8]) -> (BTreeSet<String>, BTreeSet<String>) {
+    let mut passed = BTreeSet::new();
+    let mut completed = BTreeSet::new();
+    for line in bytes.split(|byte| *byte == b'\n') {
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) else {
+            continue;
+        };
+        let is_test = value
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|kind| kind == "test");
+        if !is_test {
+            continue;
+        }
+        let name = value
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let event = value
+            .get("event")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let Some(name) = name else { continue };
+        if !matches!(event, "completed" | "COMPLETED") {
+            continue;
+        }
+        completed.insert(name.clone());
+        let status = value
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if matches!(status, "PASS" | "pass") {
+            passed.insert(name);
+        }
+    }
+    (passed, completed)
+}
+
+/// Bounds freshness to capture clocks inside the admitted run window.
+///
+/// Returns true only when the window is fully known and every raw capture
+/// clock falls inside it. Anything less stays [`EvidenceFreshness::Unknown`];
+/// the evaluator never upgrades uncertain lineage to exact-candidate proof.
+fn captured_within_window(
+    started_at: &ClockReading,
+    finished_at: &ClockReading,
+    raw: &[RawEvidence],
+) -> bool {
+    let (Some(start), Some(end)) = (started_at.known_time_ms, finished_at.known_time_ms) else {
+        return false;
+    };
+    raw.iter().all(|item| {
+        item.captured_at
+            .known_time_ms
+            .is_some_and(|known| known >= start && known <= end)
+    })
+}
+
+#[cfg(test)]
+mod current_tests {
+    use super::*;
+    use eliot_contracts::{
+        ArtifactId, EpochId, EpochLineageId, ProductId, RequestId, RequestMetadata,
+        ResourceGeneration, SourceId, StateFence,
+    };
+    use eliot_instrument_api::InstrumentInvocation;
+    use std::num::NonZeroU64;
+    use std::path::{Path, PathBuf};
+
+    type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+    const PROBE_ID: &str = "t13s2-current-probe";
+
+    /// Minimal genuine test program. It really executes a check (a checksum
+    /// comparison over real arithmetic) and reports canonical nextest-schema
+    /// events reflecting its genuine outcome: `PASS` is printed only when
+    /// the check actually holds, `FAIL` when it genuinely fails, and `SKIP`
+    /// when the mode asks to skip without executing the check. Nothing is
+    /// asserted about literal output text; the outer tests assert only on
+    /// the evaluator verdict over real process bytes.
+    const PROBE_SOURCE: &str = r#"
+use std::env;
+
+fn main() {
+    let args: Vec<String> = env::args().collect();
+    let mode = args.get(1).map(String::as_str).unwrap_or("pass");
+    let name = args
+        .get(2)
+        .map(String::as_str)
+        .unwrap_or("t13s2-current-probe");
+    println!("{{\"type\":\"test\",\"event\":\"started\",\"name\":\"{name}\"}}");
+    if mode == "skip" {
+        println!("{{\"type\":\"test\",\"event\":\"completed\",\"name\":\"{name}\",\"status\":\"SKIP\"}}");
+        return;
+    }
+    let total: u64 = (1..=1000).sum();
+    let expected: u64 = if mode == "pass" { 500_500 } else { 0 };
+    let status = if total == expected { "PASS" } else { "FAIL" };
+    println!("{{\"type\":\"test\",\"event\":\"completed\",\"name\":\"{name}\",\"status\":\"{status}\"}}");
+    if status != "PASS" {
+        std::process::exit(1);
+    }
+}
+"#;
+
+    fn test_error(message: impl Into<String>) -> Box<dyn std::error::Error + Send + Sync> {
+        Box::new(std::io::Error::other(message.into()))
+    }
+
+    fn scratch_dir(tag: &str) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+        let dir =
+            std::env::temp_dir().join(format!("eliot-t13s2-verifier-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        Ok(dir)
+    }
+
+    fn compile_probe(dir: &Path) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+        let source = dir.join("current_probe.rs");
+        std::fs::write(&source, PROBE_SOURCE)?;
+        let exe = dir.join(if cfg!(windows) {
+            "current_probe.exe"
+        } else {
+            "current_probe"
+        });
+        let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_owned());
+        let output = std::process::Command::new(rustc)
+            .arg("--edition=2021")
+            .arg(&source)
+            .arg("-o")
+            .arg(&exe)
+            .output()?;
+        if !output.status.success() {
+            return Err(test_error(format!(
+                "probe rustc failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+        Ok(exe)
+    }
+
+    fn run_probe(
+        exe: &Path,
+        mode: &str,
+        name: &str,
+    ) -> Result<std::process::Output, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(std::process::Command::new(exe)
+            .arg(mode)
+            .arg(name)
+            .output()?)
+    }
+
+    fn fence() -> Result<StateFence, Box<dyn std::error::Error + Send + Sync>> {
+        let lineage = EpochLineageId::new(TEST_LINEAGE)?;
+        let Some(sequence) = NonZeroU64::new(7) else {
+            return Err(test_error("sequence must be non-zero"));
+        };
+        let epoch = EpochId::new(lineage, sequence)?;
+        Ok(StateFence::new(epoch, ResourceGeneration::genesis()))
+    }
+
+    fn clock(known_ms: i64) -> ClockReading {
+        ClockReading {
+            valid_time_ms: Some(known_ms - 1),
+            known_time_ms: Some(known_ms),
+            transaction_sequence: None,
+            monotonic_ns: Some(1),
+        }
+    }
+
+    fn invocation() -> Result<InstrumentInvocation, Box<dyn std::error::Error + Send + Sync>> {
+        let fence = fence()?;
+        let request = RequestMetadata {
+            request_id: RequestId::new("current-request-1")?,
+            session_id: None,
+            task_id: None,
+            product_id: ProductId::new("product-1")?,
+            source_id: SourceId::new("source-1")?,
+            state_fence: fence,
+            clock: clock(100),
+        };
+        Ok(InstrumentInvocation {
+            request,
+            instrument: eliot_contracts::ContractId::new("eliot.instrument.nextest")?,
+            kind: InstrumentKind::Test,
+            profile: "default".to_owned(),
+            target: "probe-worktree".to_owned(),
+            arguments: vec!["-E".to_owned(), "test(probe)".to_owned()],
+            input_artifacts: Vec::new(),
+            declared_scope: "probe-scope".to_owned(),
+            requested_at: clock(100),
+        })
+    }
+
+    fn raw_for(
+        invocation: &InstrumentInvocation,
+        bytes: Vec<u8>,
+        captured_known_ms: i64,
+    ) -> Result<RawEvidence, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(RawEvidence {
+            artifact_id: ArtifactId::new("raw-probe-output")?,
+            invocation_id: invocation.request.request_id.clone(),
+            source: eliot_instrument_api::RawEvidenceSource::Process,
+            content_type: "application/json".to_owned(),
+            sha256: sha256_hex(&bytes),
+            bytes,
+            captured_at: clock(captured_known_ms),
+            truncated: false,
+        })
+    }
+
+    fn required(ids: &[&str]) -> BTreeSet<String> {
+        ids.iter().map(|id| (*id).to_owned()).collect()
+    }
+
+    #[test]
+    fn real_probe_pass_evaluates_to_pass() -> TestResult {
+        let dir = scratch_dir("pass")?;
+        let exe = compile_probe(&dir)?;
+        let invocation = invocation()?;
+        let output = run_probe(&exe, "pass", PROBE_ID)?;
+        assert!(
+            output.status.success(),
+            "real probe process must exit successfully"
+        );
+        let raw = raw_for(&invocation, output.stdout, 101)?;
+        let run = evaluate_current(
+            &invocation,
+            std::slice::from_ref(&raw),
+            &required(&[PROBE_ID]),
+            clock(100),
+            clock(102),
+        )?;
+        assert_eq!(run.outcome, VerificationOutcome::Pass);
+        assert_eq!(
+            run.execution,
+            eliot_instrument_api::ExecutionStatus::Succeeded
+        );
+        assert_eq!(run.coverage, EvidenceCoverage::CompleteForScope);
+        assert_eq!(run.scope, "probe-scope");
+        assert_eq!(run.invocation_id, invocation.request.request_id);
+        assert_eq!(run.state_fence, invocation.request.state_fence);
+        assert_eq!(run.raw_evidence, vec![raw.artifact_id.clone()]);
+        assert!(run.validate().is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn real_probe_skip_and_incomplete_set_never_pass() -> TestResult {
+        let dir = scratch_dir("skip")?;
+        let exe = compile_probe(&dir)?;
+        let invocation = invocation()?;
+        // All-skipped stream: the nextest counters alone report Pass, but no
+        // required test actually passed, so the evaluator must not pass it.
+        let skipped = run_probe(&exe, "skip", PROBE_ID)?;
+        assert!(
+            skipped.status.success(),
+            "a skipped probe still exits successfully"
+        );
+        let skipped_report = eliot_instrument_nextest::parse_jsonl(&skipped.stdout)?;
+        assert_eq!(
+            skipped_report.outcome(),
+            VerificationOutcome::Pass,
+            "precondition: all-skipped counters alone report Pass"
+        );
+        let raw = raw_for(&invocation, skipped.stdout, 101)?;
+        let run = evaluate_current(
+            &invocation,
+            std::slice::from_ref(&raw),
+            &required(&[PROBE_ID]),
+            clock(100),
+            clock(102),
+        )?;
+        assert_ne!(run.outcome, VerificationOutcome::Pass);
+        assert_eq!(run.outcome, VerificationOutcome::Partial);
+        assert_ne!(run.coverage, EvidenceCoverage::CompleteForScope);
+
+        // Incomplete required set: one real pass plus one required id that
+        // never ran must not pass either.
+        let passed = run_probe(&exe, "pass", PROBE_ID)?;
+        let raw = raw_for(&invocation, passed.stdout, 101)?;
+        let run = evaluate_current(
+            &invocation,
+            std::slice::from_ref(&raw),
+            &required(&[PROBE_ID, "never-executed-required-test"]),
+            clock(100),
+            clock(102),
+        )?;
+        assert_ne!(run.outcome, VerificationOutcome::Pass);
+        assert_eq!(run.outcome, VerificationOutcome::Partial);
+        Ok(())
+    }
+
+    #[test]
+    fn real_probe_fail_and_tampered_bytes_do_not_pass() -> TestResult {
+        let dir = scratch_dir("fail")?;
+        let exe = compile_probe(&dir)?;
+        let invocation = invocation()?;
+        // A genuinely failing check reports FAIL through the real process.
+        let failed = run_probe(&exe, "fail", PROBE_ID)?;
+        assert!(
+            !failed.status.success(),
+            "a failing probe must exit non-zero"
+        );
+        let raw = raw_for(&invocation, failed.stdout, 101)?;
+        let run = evaluate_current(
+            &invocation,
+            std::slice::from_ref(&raw),
+            &required(&[PROBE_ID]),
+            clock(100),
+            clock(102),
+        )?;
+        assert_eq!(run.outcome, VerificationOutcome::Fail);
+
+        // Tampered bytes break the digest binding and fail closed.
+        let passed = run_probe(&exe, "pass", PROBE_ID)?;
+        let mut tampered = passed.stdout.clone();
+        tampered.extend_from_slice(b" ");
+        let raw = RawEvidence {
+            artifact_id: ArtifactId::new("raw-tampered")?,
+            invocation_id: invocation.request.request_id.clone(),
+            source: eliot_instrument_api::RawEvidenceSource::Process,
+            content_type: "application/json".to_owned(),
+            sha256: sha256_hex(&passed.stdout),
+            bytes: tampered,
+            captured_at: clock(101),
+            truncated: false,
+        };
+        assert!(
+            evaluate_current(
+                &invocation,
+                std::slice::from_ref(&raw),
+                &required(&[PROBE_ID]),
+                clock(100),
+                clock(102),
+            )
+            .is_err()
+        );
+
+        // Truncated capture and empty inputs fail closed as well.
+        let mut truncated = raw_for(&invocation, passed.stdout, 101)?;
+        truncated.truncated = true;
+        assert!(
+            evaluate_current(
+                &invocation,
+                std::slice::from_ref(&truncated),
+                &required(&[PROBE_ID]),
+                clock(100),
+                clock(102),
+            )
+            .is_err()
+        );
+        assert!(
+            evaluate_current(
+                &invocation,
+                &[],
+                &required(&[PROBE_ID]),
+                clock(100),
+                clock(102)
+            )
+            .is_err()
+        );
+        assert!(
+            evaluate_current(
+                &invocation,
+                std::slice::from_ref(&raw_for(&invocation, b"\n".to_vec(), 101)?),
+                &BTreeSet::new(),
+                clock(100),
+                clock(102),
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_all_skipped_plan_no_longer_passes() -> TestResult {
+        let plan = VerifierPlan {
+            plan: VerificationPlan {
+                plan_id: "plan-legacy".to_owned(),
+                profile_id: "nextest".to_owned(),
+                changed_refs: Vec::new(),
+                selected_tests: Vec::new(),
+                required_commands: Vec::new(),
+                skipped_tests: Vec::new(),
+                estimated_runtime_class: VerificationRuntimeClass::Fast,
+                created_at: OffsetDateTime::now_utc(),
+            },
+            commands: vec![PlannedCommand {
+                command_id: "command-1".to_owned(),
+                command: "cargo nextest run".to_owned(),
+                test_ids: Vec::new(),
+                required: false,
+                serial: false,
+            }],
+            inventory_id: "inventory-1".to_owned(),
+            inventory_generated_at: OffsetDateTime::now_utc(),
+        };
+        let run = VerificationRun {
+            run_id: "run-legacy".to_owned(),
+            plan_id: "plan-legacy".to_owned(),
+            profile_id: "nextest".to_owned(),
+            started_at: OffsetDateTime::now_utc(),
+            finished_at: Some(OffsetDateTime::now_utc()),
+            command_results: vec![VerificationCommandResult {
+                command: "cargo nextest run".to_owned(),
+                status: VerificationCommandStatus::Skipped,
+                duration_ms: 1,
+                stdout_ref: None,
+                stderr_ref: None,
+                parsed_test_count: None,
+                warnings: Vec::new(),
+            }],
+            status: VerificationRunStatus::Passed,
+        };
+        assert_eq!(
+            run_status(&run.command_results, 1),
+            VerificationRunStatus::Partial
+        );
+        let verdict = verdict(&plan, &run, OffsetDateTime::now_utc())
+            .map_err(|error| test_error(error.to_string()))?;
+        assert_eq!(verdict.decision, VerificationDecision::RequireFullVerify);
+        Ok(())
+    }
 }

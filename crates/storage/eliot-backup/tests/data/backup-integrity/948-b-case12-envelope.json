@@ -1,0 +1,1 @@
+{"envelope":"sealed-blob-envelope-v1","key_lineage_field":"manifest.encryption.key_lineages","note":"Worker B fixture: sealed-envelope identity. Ciphertext checksum plus algorithm/key-lineage/version identity is checked without opening a key; explicit AAD/nonce wire fields are worker-A hardening and are pinned as a gap, not fabricated here.","plaintext_keys_present":false}

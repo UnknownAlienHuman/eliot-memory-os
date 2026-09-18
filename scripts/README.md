@@ -24,8 +24,8 @@ committed as repository authority.
 | `docs_router_core.py` | Byte-preserved router implementation called by `docs_router.py`; not a separate operator entrypoint | Internal documentation implementation |
 | `docs_read.py` | Verify routed files/fragments by hash and byte count, materialize a bounded bundle, and emit a read receipt | Documentation reading evidence only |
 | `docs_closure_audit.py` | Temporary independent audit of shard reconstruction, original Git blobs, generated indexes, operational references, and workstream issue-state parity | Audit evidence for the current documentation closure only; remove after closure |
-| `verify-work-unit.py` | Machine-checked completion gate for one capability cell: reads `[acceptance]` from the crate's `module.toml` and proves the required exports, tests, wire discipline and cargo reachability exist | Fails on an empty crate, which `cargo fmt|test|clippy` do not |
-| `code_navigation.py` | Navigate current Cargo packages, Rust files, logical blocks, local dependencies, and documentation routes | Repository navigation and static path/dependency consistency only |
+| `verify-work-unit.py` | Retired legacy source-shape diagnostic for one capability cell: reads `[acceptance]` from the crate's `module.toml` for hints only; always reports completion=NOT_VERIFIED and never accepts a work unit — acceptance is decided by the owning contract plus independent review | Hints only; no work unit is accepted by this entrypoint |
+| `code_navigation.py` | Navigate current Cargo packages, Rust files, logical blocks, and documentation routes (supported commands: `check`, `sync-index`, `package-docs-self-test`, `prototype-docs-self-test`, `self-test`, `list`, `route`) | Repository navigation and static path/dependency consistency only |
 | `verify-standalone-crates.py` | Runs fmt, clippy and tests for every crate that declares its own `[workspace]` and is neither a workspace member nor an excluded capability cell | Package proof for crates no other gate reaches; admits nothing to the workspace |
 | `verify-doc-code-conformance.py` | Public conformance front door for reader instructions, workflow claims, retired/nonexistent references, script/binary maps, owner bindings, and documentation-pipeline integrity | Static repository path/inventory/instruction consistency only |
 | `verify-process-deadline-owner.py` | Source-shape discriminator for the #83 failure where a resumed process receives a start receipt while the wall-deadline owner thread is never spawned | Static source-shape evidence only; not Windows containment or wall-time proof |
@@ -36,6 +36,16 @@ committed as repository authority.
 | `audit-runtime-source-hygiene.py` | Expose unsafe, panic/unwrap/expect, ambient configuration, unbounded-output, blocking-sleep, and source-concentration signals | Static source-quality evidence only |
 | `verify-agent-bridge-protocol.py` | Reject raw canonical Frame ingress, host-minted authority fields, validation bypass, correlation loss, and mandatory cancellation prose | Static protocol/source-policy evidence only |
 | `verify-wasm-toolchain.py` | Check the declared WASI component target without installing or executing external binaries | Offline toolchain declaration evidence only |
+| `verify-workstream-routing.py` | Verify workstream routing, assignment boundaries, non-overlapping mutable scopes, and owner projections | Static workstream routing and control-plane evidence only |
+| `verify-github-workflows.py` | Verify GitHub workflows, action SHA pinning, minimal permissions, hash-locked dependencies, and test execution | Static workflow and dependency-input evidence only |
+| `verify-dependency-policy.py` | Verify multi-ecosystem dependency admission, scanner tool pinning, inventory completeness, lockfiles, and advisory evidence | Static and advisory admission evidence only |
+| `crate_reachability_inventory.py` | Generate deterministic support-neutral Cargo package reachability and source-shape inventory | Reachability and source-shape evidence only |
+| `audit-work-unit-assignments.py` | Deterministic fail-closed assignment-integrity oracle over a frozen complete repository/GitHub snapshot (#818) | Assignment integrity oracle evidence only |
+| `audit-serde-boundary-closure.py` | Serde-boundary closure coordinator (#710, Slice A) | Static source/boundary evidence only |
+| `long_lived_collection_inventory.py` | Deterministic source-bound inventory of mutable collections in long-lived owners (#885) | Static source classification only |
+| `serde_boundary_inventory.py` | Deterministic serialized-boundary inventory and finite repair allocations (#929, freezing the F-DENY denominator for #710) | Static source classification only |
+| `wasm_component_lane.py` | Affected-component WASM build/test lane selector and evidence helper (#764) | Build/test lane selection only |
+| `verify-legacy-config-retirement.py` | Verify legacy config filenames, modes, roots, and module manifests stay retired (#1219) | Static source and packaging evidence only |
 | `verify-lint-policy.ps1` | Verify the Rust lint-policy configuration and declared exceptions | Static source-policy evidence only |
 | `requirements-verification.txt` | Python dependency manifest for repository verification scripts | Verification dependency manifest |
 
@@ -62,7 +72,7 @@ The conformance policy introduced by issue #291 lives at
 
 - `DCC-001` — verified-reader contract drift across instruction/generator surfaces;
 - `DCC-002` — workflow documentation differs from actual trigger source;
-- `DCC-003` — retired or unstable documentation authority references;
+- `DCC-003` — retired or unstable documentation authority references (rejects path-qualified and bare normative line numbers and ranges);
 - `DCC-004` — maintained top-level script missing from this map;
 - `DCC-005` — root Cargo `bins/*` composition package missing from `PROJECT_MAP`;
 - `DCC-006` — stale current-owner/work reference;
@@ -74,9 +84,10 @@ The conformance policy introduced by issue #291 lives at
 
 The conformance self-test and repository audit run from `just quick` and
 `scripts/verify.ps1`; `scripts/verify.sh` delegates to the same PowerShell-owned
-profile. Any finding fails the normal local verification path. A clean result
-still proves no Architecture semantics, compilation, runtime behavior, authority
-correctness, Product acceptance, or release support.
+profile. Any finding fails the normal local verification path. The proof ceiling
+for documentation/source conformance is static reference-shape consistency only;
+a clean result proves no Architecture semantics, compilation, runtime behavior,
+authority correctness, Product acceptance, or release support.
 
 ## Agent route, host, and model-selection utilities
 
@@ -116,7 +127,9 @@ be promoted to live multi-agent/runtime proof.
 |---|---|---|
 | `build-eliot-windows-x64-release.ps1` | Build declared Windows x64 release inputs and an unsigned bundle | Build/staging only |
 | `finalize-eliot-windows-x64-release.ps1` | Sign/finalize and independently read back declared release artifacts | Release-artifact evidence only |
+| `install-pipeline.ps1` | Root-controller install pipeline executing materialization and installation apply | Installation orchestration only |
 | `invoke-eliot-windows-x64-production.ps1` | Execute the manifest-bound production invocation/installation flow | Live acceptance remains issue #11 |
+| `reset-developer-install.ps1` | Reset developer installation state across services, processes, directories, and credentials | Developer machine reset only |
 
 Read `docs/release/WINDOWS_X64_RELEASE.md` before use. The canonical operator
 surface is `eliot.exe`; scripts do not create a parallel CLI or direct
@@ -130,6 +143,20 @@ storage/process authority.
 | `test-claude-connector.ps1` | Run the bounded Claude connector probe/fixture path | Exact integration-fingerprint evidence only |
 | `eliot-mcp-reference-client.ps1` | Reference MCP client for protocol/bridge diagnostics | Diagnostic/client evidence only |
 | `run-isolated-tests.ps1` | Provision an owned Windows/Surreal test namespace and run one selected package/test profile | Exact selected Module/Edge evidence only |
+| `scripts/integration/ignored_test_inventory.py` | Derive the exact ignored-test denominator and environment classification (#905) | Ignored-test identity and environment classification only |
+
+The ignored-test inventory entrypoint (`scripts/integration/ignored_test_inventory.py`)
+derives the exact bounded denominator of ignored Rust tests across workspace packages,
+reconciling admitted test sources with compiled libtest listings, and classifying each
+item against required environments (Store, Runtime, Git, External credentials). Its
+proof ceiling is `IGNORED_TEST_IDENTITY_AND_ENVIRONMENT_CLASSIFICATION_ONLY`; it performs
+no test execution, provisions no background state, and touches no credentials.
+
+Run its internal self-tests locally:
+
+```powershell
+python scripts/integration/ignored_test_inventory.py --self-test
+```
 
 Provider versions, accounts, routes, and host behavior are requalified per issue;
 an old successful probe is not current support. An in-memory/fake test is not

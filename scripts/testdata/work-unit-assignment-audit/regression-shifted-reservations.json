@@ -1,0 +1,64 @@
+{
+  "schema": "eliot-assignment-snapshot-v1",
+  "header": {
+    "repository": "UnknownAlienHuman/eliot-memory-os",
+    "base_sha": "fb3fc334e113236cb82cf5ca9139fc0970df032b",
+    "complete": true
+  },
+  "issues": [
+    {
+      "number": 610,
+      "state": "open",
+      "title": "Dreamer reconsolidation reservation",
+      "write_paths": ["crates/smart/eliot-dreamer-core/"],
+      "dependencies": []
+    },
+    {
+      "number": 611,
+      "state": "open",
+      "title": "Dreamer core",
+      "write_paths": ["crates/smart/eliot-dreamer-core/"],
+      "dependencies": []
+    }
+  ],
+  "pull_requests": [
+    {
+      "number": 1001,
+      "state": "open",
+      "draft": true,
+      "title": "reserve: work unit 610 reconsolidation",
+      "body": "Reservation for #610",
+      "head_ref": "work/610-reconsolidation",
+      "head_repo": "UnknownAlienHuman/eliot-memory-os",
+      "base_ref": "main",
+      "base_sha": "fb3fc334e113236cb82cf5ca9139fc0970df032b",
+      "changed_paths": [
+        ".github/temporary/work-unit-610.md",
+        "crates/smart/eliot-dreamer-core/Cargo.toml"
+      ]
+    }
+  ],
+  "repository_records": {
+    "manifests": [
+      {
+        "path": "crates/smart/eliot-dreamer-reconsolidation/Cargo.toml",
+        "package": "eliot-dreamer-reconsolidation",
+        "plane": "smart"
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-core/Cargo.toml",
+        "package": "eliot-dreamer-core",
+        "plane": "smart"
+      }
+    ],
+    "workstreams": [
+      {
+        "path": "workstreams/dreamer/assignments/610-reconsolidation.toml",
+        "internal_issue": 610,
+        "package": "eliot-dreamer-reconsolidation",
+        "target_dir": "crates/smart/eliot-dreamer-reconsolidation/",
+        "write_paths": ["crates/smart/eliot-dreamer-core/"]
+      }
+    ]
+  }
+}

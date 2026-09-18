@@ -15,9 +15,11 @@ proof_entrypoint = "cargo test --manifest-path crates/surfaces/eliot-agent-bridg
 
 [dependencies]
 eliot-agent-api.workspace = true
+eliot-contracts.workspace = true
 eliot-observation-contracts.workspace = true
 eliot-process.workspace = true
 eliot-protocol.workspace = true
+eliot-skill.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 

@@ -1,0 +1,367 @@
+{
+  "contract": "F-LOG-KERNEL-1 instrument authenticated front-door and request/session boundaries",
+  "issue": 897,
+  "target": "eliot_kernel::diagnostics",
+  "terminal_event": "kernel.terminal_error",
+  "files": [
+    "bins/eliot-kernel/src/agent_bridge.rs",
+    "bins/eliot-kernel/src/daemon_request_dispatch.rs",
+    "bins/eliot-kernel/src/daemon_session_guard.rs",
+    "bins/eliot-kernel/src/frame_dispatch.rs",
+    "bins/eliot-kernel/src/front_door_listener.rs",
+    "bins/eliot-kernel/src/front_door_session.rs"
+  ],
+  "test_file": "bins/eliot-kernel/tests/kernel_front_door_diagnostics.rs",
+  "events": {
+    "listener_create": "kernel.front_door_listener_create",
+    "listener_bind": "kernel.front_door_listener_bind",
+    "listener_rotate": "kernel.front_door_listener_rotate",
+    "listener_accept_ready": "kernel.front_door_listener_accept_ready",
+    "peer_set_build": "kernel.front_door_peer_set_build",
+    "peer_set_snapshot": "kernel.front_door_peer_set_snapshot",
+    "handshake_decode": "kernel.front_door_handshake_decode",
+    "handshake_reject": "kernel.front_door_handshake_reject",
+    "handshake_accept": "kernel.front_door_handshake_accept",
+    "doctor_bind": "kernel.front_door_doctor_bind",
+    "testd_bind": "kernel.front_door_testd_bind",
+    "native_worker_bind": "kernel.front_door_native_worker_bind",
+    "eliotd_peer_validate": "kernel.front_door_eliotd_peer_validate",
+    "bridge_peer_observed": "kernel.bridge_peer_observed",
+    "bridge_peer_validate": "kernel.bridge_peer_validate",
+    "bridge_connect": "kernel.bridge_connect",
+    "bridge_attach": "kernel.bridge_attach",
+    "bridge_readiness": "kernel.bridge_readiness",
+    "bridge_hello_accept": "kernel.bridge_hello_accept",
+    "bridge_hello_reject": "kernel.bridge_hello_reject",
+    "bridge_receipt_prepared": "kernel.bridge_receipt_prepared",
+    "bridge_activation_request": "kernel.bridge_activation_request",
+    "bridge_activation_enqueue": "kernel.bridge_activation_enqueue",
+    "bridge_activation_claim": "kernel.bridge_activation_claim",
+    "bridge_activation_submit": "kernel.bridge_activation_submit",
+    "bridge_activation_result_submit": "kernel.bridge_activation_result_submit",
+    "bridge_activation_reconcile": "kernel.bridge_activation_reconcile",
+    "bridge_cleanup": "kernel.bridge_cleanup",
+    "frame_received": "kernel.frame_received",
+    "frame_validated": "kernel.frame_validated",
+    "frame_admitted": "kernel.frame_admitted",
+    "frame_dispatched": "kernel.frame_dispatched",
+    "frame_decode_reject": "kernel.frame_decode_reject",
+    "frame_doctor_dispatch": "kernel.frame_doctor_dispatch",
+    "frame_testd_dispatch": "kernel.frame_testd_dispatch",
+    "frame_doctor_execute": "kernel.frame_doctor_execute",
+    "frame_testd_execute": "kernel.frame_testd_execute",
+    "daemon_request_received": "kernel.daemon_request_received",
+    "daemon_request_validated": "kernel.daemon_request_validated",
+    "daemon_request_admitted": "kernel.daemon_request_admitted",
+    "daemon_request_operation": "kernel.daemon_request_operation",
+    "daemon_response_prepared": "kernel.daemon_response_prepared",
+    "daemon_response_delivered": "kernel.daemon_response_delivered",
+    "session_guard_bind": "kernel.session_guard_bind",
+    "session_class_resolve": "kernel.session_class_resolve",
+    "session_durable_id": "kernel.session_durable_id",
+    "session_admitted_caller": "kernel.session_admitted_caller",
+    "session_eliotd_id": "kernel.session_eliotd_id",
+    "session_rebind": "kernel.session_rebind",
+    "session_current_guard": "kernel.session_current_guard"
+  },
+  "terminal_codes": {
+    "listener": "listener_bind_fenced",
+    "peer_set": "peer_set_fenced",
+    "handshake": [
+      "session_fenced",
+      "peer_identity_unavailable",
+      "unauthenticated_peer"
+    ],
+    "bridge": [
+      "bridge_fenced",
+      "bridge_peer_unavailable",
+      "bridge_timeout",
+      "bridge_unknown_request",
+      "bridge_unknown_outcome",
+      "bridge_identity_conflict"
+    ],
+    "frame": [
+      "frame_fenced",
+      "frame_peer_unavailable",
+      "frame_timeout",
+      "frame_unknown_request",
+      "frame_unknown_outcome"
+    ],
+    "daemon": [
+      "daemon_fenced",
+      "daemon_peer_unavailable",
+      "daemon_timeout",
+      "daemon_unknown_request",
+      "daemon_unknown_outcome"
+    ]
+  },
+  "trusted_daemon_operations": [
+    "snapshot",
+    "daemon_ready",
+    "health",
+    "store_recovery",
+    "store_initialize_genesis",
+    "apply_prepared",
+    "receipt",
+    "store_named",
+    "local_read",
+    "daemon_degraded",
+    "daemon_fatal",
+    "agent_activation_claim",
+    "agent_activation_submit",
+    "agent_activation_reconcile",
+    "local_read_claim",
+    "local_read_result",
+    "agent_host_request_submit",
+    "agent_host_request_cancel",
+    "agent_host_request_reconcile",
+    "agent_host_request_rehydrate"
+  ],
+  "boundaries": [
+    {
+      "path": "bins/eliot-kernel/src/front_door_listener.rs",
+      "operation": "bind_authenticated_front_door",
+      "phase": "create",
+      "event": "kernel.front_door_listener_create"
+    },
+    {
+      "path": "bins/eliot-kernel/src/front_door_listener.rs",
+      "operation": "bind_authenticated_front_door",
+      "phase": "bind",
+      "event": "kernel.front_door_listener_bind"
+    },
+    {
+      "path": "bins/eliot-kernel/src/front_door_listener.rs",
+      "operation": "bind_authenticated_front_door",
+      "phase": "accept_ready",
+      "event": "kernel.front_door_listener_accept_ready"
+    },
+    {
+      "path": "bins/eliot-kernel/src/front_door_listener.rs",
+      "operation": "bind_authenticated_front_door_next",
+      "phase": "rotate",
+      "event": "kernel.front_door_listener_rotate"
+    },
+    {
+      "path": "bins/eliot-kernel/src/front_door_listener.rs",
+      "operation": "bind_authenticated_front_door_with_peer_set",
+      "phase": "bind",
+      "event": "kernel.front_door_listener_bind"
+    },
+    {
+      "path": "bins/eliot-kernel/src/front_door_listener.rs",
+      "operation": "bind_authenticated_front_door_next_with_peer_set",
+      "phase": "rotate",
+      "event": "kernel.front_door_listener_rotate"
+    },
+    {
+      "path": "bins/eliot-kernel/src/front_door_session.rs",
+      "operation": "front_door_peer_set",
+      "phase": "build",
+      "event": "kernel.front_door_peer_set_build"
+    },
+    {
+      "path": "bins/eliot-kernel/src/front_door_session.rs",
+      "operation": "front_door_peer_set_snapshot",
+      "phase": "snapshot",
+      "event": "kernel.front_door_peer_set_snapshot"
+    },
+    {
+      "path": "bins/eliot-kernel/src/front_door_session.rs",
+      "operation": "bind_session",
+      "phase": "decode",
+      "event": "kernel.front_door_handshake_decode"
+    },
+    {
+      "path": "bins/eliot-kernel/src/front_door_session.rs",
+      "operation": "bind_session",
+      "phase": "reject",
+      "event": "kernel.front_door_handshake_reject"
+    },
+    {
+      "path": "bins/eliot-kernel/src/front_door_session.rs",
+      "operation": "bind_session",
+      "phase": "accept",
+      "event": "kernel.front_door_handshake_accept"
+    },
+    {
+      "path": "bins/eliot-kernel/src/front_door_session.rs",
+      "operation": "bind_doctor_session",
+      "phase": "attempt",
+      "event": "kernel.front_door_doctor_bind"
+    },
+    {
+      "path": "bins/eliot-kernel/src/front_door_session.rs",
+      "operation": "bind_testd_session",
+      "phase": "attempt",
+      "event": "kernel.front_door_testd_bind"
+    },
+    {
+      "path": "bins/eliot-kernel/src/front_door_session.rs",
+      "operation": "bind_native_worker_session",
+      "phase": "attempt",
+      "event": "kernel.front_door_native_worker_bind"
+    },
+    {
+      "path": "bins/eliot-kernel/src/agent_bridge.rs",
+      "operation": "agent_bridge_peer_admitted",
+      "phase": "observed",
+      "event": "kernel.bridge_peer_observed"
+    },
+    {
+      "path": "bins/eliot-kernel/src/agent_bridge.rs",
+      "operation": "begin_agent_bridge",
+      "phase": "connect",
+      "event": "kernel.bridge_connect"
+    },
+    {
+      "path": "bins/eliot-kernel/src/agent_bridge.rs",
+      "operation": "begin_agent_bridge",
+      "phase": "attach",
+      "event": "kernel.bridge_attach"
+    },
+    {
+      "path": "bins/eliot-kernel/src/agent_bridge.rs",
+      "operation": "begin_agent_bridge",
+      "phase": "readiness",
+      "event": "kernel.bridge_readiness"
+    },
+    {
+      "path": "bins/eliot-kernel/src/agent_bridge.rs",
+      "operation": "accept_agent_bridge_hello",
+      "phase": "accept",
+      "event": "kernel.bridge_hello_accept"
+    },
+    {
+      "path": "bins/eliot-kernel/src/agent_bridge.rs",
+      "operation": "accept_agent_bridge_hello",
+      "phase": "reject",
+      "event": "kernel.bridge_hello_reject"
+    },
+    {
+      "path": "bins/eliot-kernel/src/agent_bridge.rs",
+      "operation": "agent_bridge_admission_receipt_frame",
+      "phase": "prepared",
+      "event": "kernel.bridge_receipt_prepared"
+    },
+    {
+      "path": "bins/eliot-kernel/src/agent_bridge.rs",
+      "operation": "agent_bridge_activation_response",
+      "phase": "request",
+      "event": "kernel.bridge_activation_request"
+    },
+    {
+      "path": "bins/eliot-kernel/src/agent_bridge.rs",
+      "operation": "revoke_agent_bridge",
+      "phase": "cleanup",
+      "event": "kernel.bridge_cleanup"
+    },
+    {
+      "path": "bins/eliot-kernel/src/frame_dispatch.rs",
+      "operation": "dispatch_frame",
+      "phase": "received",
+      "event": "kernel.frame_received"
+    },
+    {
+      "path": "bins/eliot-kernel/src/frame_dispatch.rs",
+      "operation": "dispatch_frame",
+      "phase": "validated",
+      "event": "kernel.frame_validated"
+    },
+    {
+      "path": "bins/eliot-kernel/src/frame_dispatch.rs",
+      "operation": "dispatch_frame",
+      "phase": "admitted",
+      "event": "kernel.frame_admitted"
+    },
+    {
+      "path": "bins/eliot-kernel/src/frame_dispatch.rs",
+      "operation": "dispatch_frame",
+      "phase": "dispatched",
+      "event": "kernel.frame_dispatched"
+    },
+    {
+      "path": "bins/eliot-kernel/src/frame_dispatch.rs",
+      "operation": "dispatch_frame",
+      "phase": "decode_reject",
+      "event": "kernel.frame_decode_reject"
+    },
+    {
+      "path": "bins/eliot-kernel/src/daemon_request_dispatch.rs",
+      "operation": "execute_daemon_request",
+      "phase": "received",
+      "event": "kernel.daemon_request_received"
+    },
+    {
+      "path": "bins/eliot-kernel/src/daemon_request_dispatch.rs",
+      "operation": "execute_daemon_request",
+      "phase": "validated",
+      "event": "kernel.daemon_request_validated"
+    },
+    {
+      "path": "bins/eliot-kernel/src/daemon_request_dispatch.rs",
+      "operation": "execute_daemon_request",
+      "phase": "admitted",
+      "event": "kernel.daemon_request_admitted"
+    },
+    {
+      "path": "bins/eliot-kernel/src/daemon_request_dispatch.rs",
+      "operation": "execute_daemon_request",
+      "phase": "dispatched",
+      "event": "kernel.daemon_request_operation"
+    },
+    {
+      "path": "bins/eliot-kernel/src/daemon_request_dispatch.rs",
+      "operation": "execute_daemon_request",
+      "phase": "prepared",
+      "event": "kernel.daemon_response_prepared"
+    },
+    {
+      "path": "bins/eliot-kernel/src/daemon_request_dispatch.rs",
+      "operation": "execute_daemon_request",
+      "phase": "delivered",
+      "event": "kernel.daemon_response_delivered"
+    },
+    {
+      "path": "bins/eliot-kernel/src/daemon_session_guard.rs",
+      "operation": "caller_binding",
+      "phase": "bind",
+      "event": "kernel.session_guard_bind"
+    },
+    {
+      "path": "bins/eliot-kernel/src/daemon_session_guard.rs",
+      "operation": "admitted_process_caller_session",
+      "phase": "admitted",
+      "event": "kernel.session_admitted_caller"
+    },
+    {
+      "path": "bins/eliot-kernel/src/daemon_session_guard.rs",
+      "operation": "require_current_daemon_session",
+      "phase": "current_guard",
+      "event": "kernel.session_current_guard"
+    },
+    {
+      "path": "bins/eliot-kernel/src/daemon_session_guard.rs",
+      "operation": "rebind_process_transport",
+      "phase": "rebind",
+      "event": "kernel.session_rebind"
+    }
+  ],
+  "canaries": {
+    "frame": "CANARY_FRAME_PAYLOAD_897",
+    "request": "CANARY_REQUEST_BODY_897",
+    "user": "CANARY_USER_CONTENT_897",
+    "model": "CANARY_MODEL_OUTPUT_897",
+    "evidence": "CANARY_EVIDENCE_BLOB_897",
+    "credential": "CANARY_CREDENTIAL_897",
+    "token": "CANARY_TOKEN_897",
+    "env": "CANARY_ENV_SECRET_897"
+  },
+  "inline_tests": [
+    "store_named_dispatch_tests::store_named_operation_rejects_unknown_fields_and_projects_typed_response",
+    "local_read_dispatch_tests::local_read_operation_rejects_unknown_fields",
+    "local_read_dispatch_tests::local_read_gate_admits_only_evidence_pack"
+  ],
+  "max_field_bytes": 256,
+  "max_detail_bytes": 1024
+}

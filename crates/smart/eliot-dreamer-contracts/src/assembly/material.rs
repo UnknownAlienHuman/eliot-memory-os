@@ -1119,7 +1119,7 @@ impl AssemblyMaterialSet {
         #[derive(Serialize)]
         struct ModelInputProjection<'a> {
             recipe_digest: &'a str,
-            job: &'a crate::job::DreamJobInput,
+            job: &'a crate::job::DreamJobAdmission,
             inputs: &'a [crate::assembly::recipe::RecipeInput],
             selected_references: &'a BTreeMap<ArtifactId, crate::grounding::AuthorizedReference>,
             materials: &'a [AssemblyMaterial],
@@ -1992,7 +1992,7 @@ impl AssemblyMaterialSet {
     fn validate_curation_header(
         &self,
         curation: &CurationMaterial,
-        job: &crate::job::DreamJobInput,
+        job: &crate::job::DreamJobAdmission,
     ) -> Result<(), ContractViolation> {
         if job.job_class != crate::job::JobClass::Curation {
             return Err(ContractViolation::BindingMismatch {

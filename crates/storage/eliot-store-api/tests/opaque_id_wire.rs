@@ -268,10 +268,14 @@ define_opaque_id_tests! {
 
 #[test]
 fn store_wire_nested_structs_reject_malformed_ids() {
-    use eliot_contracts::{AuthorityEpoch, ResourceGeneration};
+    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
     use eliot_store_api::{OrderingHead, RevisionHead, ScopeRevisionView, StateFence};
-
-    let fence = StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis());
+    use std::num::NonZeroU64;
+    let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+        .expect("canonical test lineage-A");
+    let epoch =
+        EpochId::new(lineage, NonZeroU64::new(1).expect("non-zero")).expect("valid test epoch");
+    let fence = StateFence::new(epoch, ResourceGeneration::genesis());
     // Build a valid RevisionHead and try to deserialize with malformed RevisionKey via JSON
     let malformed = malformed_samples();
     for bad in malformed {

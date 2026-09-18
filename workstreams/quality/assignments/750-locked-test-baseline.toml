@@ -1,0 +1,121 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
+routing_authority = "owning_issue_and_normative_pair_only"
+status = "READY_FOR_IMPLEMENTATION"
+implementation_support = "INCOMPLETE_UNVERSIONED_VERIFICATION_PROFILE"
+evidence_execution_status = "SOURCE_INSPECTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "MANUAL_VERIFICATION_PROFILE_EDGE_CANDIDATE_ONLY"
+issue = 750
+parent_product_issue = 11
+base_branch = "main"
+base_sha = "c225b36aeb7c11b4648a6709d7f8b96466d9e31f"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "quality.manual-locked-verification-profiles"
+causal_property = "One fixed command-definition owner supplies bounded Quick and complete Review profiles to direct, Just and manual-CI callers; mandatory failure, skip, cancellation, unavailability or denominator mismatch can never become green."
+current_discriminator = "scripts/verify.ps1 accepts only -List and -SkipCargoCheck, defines no closed Quick/Review profile and stops after workspace check; Justfile verify invokes the unqualified script; ci.yml invokes the same incomplete path and omits clippy, workspace tests and cargo-deny."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/750"
+
+[documentation]
+implementation = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I18-21-local-and-ci-parity.md#i1821-local-and-ci-parity",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I18-13-full-release-gate.md#i1813-full-release-gate",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I18-26-parallel-build-and-test-execution-for-agent-swarms.md#i1826-parallel-build-and-test-execution-for-agent-swarms",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I18-27-oracle-ownership-and-test-change-governance.md#i1827-oracle-ownership-and-test-change-governance",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I02-18-build-test-and-artifact-graph.md#i218-build-test-and-artifact-graph",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I02-22-parallel-build-cache-artifact-and-environment-lanes.md#i222-parallel-build-cache-artifact-and-environment-lanes",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
+]
+anchors = ["ARCH-GROUND-01", "ARCH-FIN-01", "ARCH-ORD-01", "ARCH-RES-04", "ARCH-OBS-01"]
+
+[current_source]
+confirmed = [
+  "Justfile quick preserves the current bounded repository/document/source gates plus metadata, fmt and workspace check.",
+  "Justfile verify invokes scripts/verify.ps1 without selecting a profile.",
+  "scripts/verify.ps1 has no -Profile parameter, exposes SkipCargoCheck, and includes no workspace Clippy, workspace test or cargo-deny step.",
+  "ci.yml is workflow_dispatch-only but invokes the incomplete unqualified verify.ps1 path and its checkout does not set persist-credentials: false.",
+  "repository-policy.yml is workflow_dispatch-only and also omits persist-credentials: false on checkout.",
+  "source-candidate.yml is outside mutable scope and must remain byte-identical.",
+]
+reverified_at = "c225b36aeb7c11b4648a6709d7f8b96466d9e31f"
+
+[allocation_refresh]
+refreshed_by = "WRITER-1149-B"
+previous_base_sha = "superseded; see git history of this path under abdfbd1c64fb8193da1ed5fbfbb16a7c3b49c493"
+writer_scope = "scripts/tests/test_verification_profile.py plus scripts/testdata/verification-profile/** only"
+route_receipts = ["sha256:630e1d1b828b2d41ea8f4367d47bb0be3cc4156336e9dad7fe56d212facf631c", "sha256:fb5bcd1db79b62f42649300c3241fe5ecd8082308c1d7c878b46c2a9f1ec6f0a", "sha256:a9243349a64da970a5679d396a17d42394e744d458d1970a46e85a39aab8401c"]
+read_receipts = ["sha256:288ced4a8ba2456ca9a7d5165b1dda7b4cce98c77fb710182368e7915e9e756a", "sha256:3df4579c5874ac001abf8a51ca5fbfe898053d2b1e50ce428eddb36e6e1cb4de", "sha256:ec373733eefae0c332fd3c4c1d57717e1ac6e55cd077caa42d576773521f1d20"]
+matched_routes = ["instrument-verification", "workspace-governance"]
+bundle_shas = ["1f389d505e14eb112e7069782f744d1ea310f8be05d2d4b22a850c43e06a161d", "5129d372d98576311f72c2a2751713dcf931cbf07543f2b31029c9af58298198", "50d72b74d3f60db5e4e48923d917a981994d3710bc9fb07ab89f149c58acf860"]
+
+[[waves]]
+id = "A"
+what = "Freeze one command-definition owner and two closed profiles."
+how = [
+  "Add -Profile Quick|Review to scripts/verify.ps1 and make it the sole ordered gate-definition owner.",
+  "Preserve every current Just quick gate in Quick; do not add full workspace test/Clippy/deny to Quick or remove existing Quick checks.",
+  "Review runs all current repository/document/source oracles, then locked metadata, fmt, workspace check, workspace Clippy -D warnings, workspace tests and cargo-deny.",
+  "List/configuration mode is read-only and cannot claim execution.",
+]
+
+[[waves]]
+id = "B"
+what = "Make direct, Just and manual-CI callers select exact profiles."
+how = [
+  "just quick invokes Quick exactly once and reports only the Quick proof ceiling.",
+  "just verify invokes Review exactly once.",
+  "manual ci.yml invokes Review exactly once on the checked-out candidate.",
+  "repository-policy.yml validates manual-only triggers, exact profile wiring, least privilege and source-candidate.yml byte identity.",
+]
+
+[[waves]]
+id = "C"
+what = "Close failure, cancellation, cache and result semantics."
+how = [
+  "Check the current exit status of every external command and propagate PowerShell exceptions without stale LASTEXITCODE masking.",
+  "Keep failed, skipped, cancelled, timed-out, unavailable, cleanup-unknown and not-run mandatory gates nonpassing and distinct.",
+  "Use bounded diagnostic continuation only if the aggregate remains nonzero and every unrun gate is explicit.",
+  "Cache keys bind OS, target, toolchain, lock, relevant configuration and profile; cache hit never skips a gate or supplies a passed receipt.",
+]
+
+[[waves]]
+id = "D"
+what = "Prove structure and live direct/manual parity."
+how = [
+  "Add exactly 34 substantive WORK_UNIT_CASE: 750/1..34 tests over real YAML, PowerShell and Just structures plus finite bypass fixtures.",
+  "Reuse one actual Review run for multiple assertions; do not execute the full workspace inside every unit test.",
+  "Final acceptance requires one direct Review and one manually dispatched ci.yml Review on the exact same candidate source, with matching mandatory definitions and denominators.",
+  "Ignored/stateful/live-provider tests remain explicitly outside the normal Review ceiling and assigned to D-INT.",
+]
+
+[acceptance]
+criteria = [
+  "ci.yml and repository-policy.yml remain workflow_dispatch-only and every forbidden direct or indirect trigger is rejected.",
+  "Manual inputs cannot select arbitrary commands, refs or a weaker profile.",
+  "Direct Review, just verify and manual ci.yml use one fixed ordered Review definition exactly once.",
+  "just quick preserves the existing bounded Quick baseline and can never be labelled Review or release proof.",
+  "Review order is repository/document/source oracles, cargo metadata --locked, fmt, workspace check, workspace clippy -D warnings, workspace tests and cargo deny.",
+  "Missing or duplicate mandatory gates fail profile validation.",
+  "Every Python/Cargo/tool failure, skip, cancellation, timeout, unavailable tool and unknown cleanup is nonpassing.",
+  "No warning filter/downgrade, continue-on-error green, hidden retry or text-only success path exists.",
+  "All dependency-resolution commands use the actual supported locked semantics of the pinned tools.",
+  "Checkout persists no credentials and workflows have no secret/write/comment/merge/release/deploy/OIDC authority.",
+  "Cache hit and miss run the same mandatory gates and untrusted caches cannot contaminate trusted main.",
+  "Summaries are bounded/redacted and bind source, profile, package/target denominator, tool identities, ordered gate states and proof ceiling.",
+  "source-candidate.yml remains byte-identical.",
+  "Exactly 34 substantive test cases execute against production parsers/interfaces and no fixture can fabricate live direct/manual evidence.",
+  "One actual direct Review and one actual manual ci.yml Review execute on the same candidate and their mandatory denominators match.",
+  "Structural success alone cannot close the Issue or claim Product support.",
+]
+
+[verification]
+commands = [
+  "python -m py_compile scripts/tests/test_verification_profile.py",
+  "python -m unittest scripts.tests.test_verification_profile -v",
+  "pwsh -NoProfile -File scripts/verify.ps1 -Profile Review",
+  "just quick",
+  "git diff --check",
+]
+manual_evidence = "Dispatch .github/workflows/ci.yml manually on the exact candidate source and compare its source/profile/gate/package/target denominator with the direct Review receipt."
+product_proof = "The completed profile establishes manual verification parity only; ignored/stateful/provider and installed Product proof remain D-INT and #11."

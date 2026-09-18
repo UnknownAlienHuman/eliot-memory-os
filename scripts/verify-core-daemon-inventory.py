@@ -62,26 +62,6 @@ EXPECTED_ACTIVE_CORE_DAEMON_FIELDS = {
     "inventories": ["workstreams/core-daemons/inventory.json"],
     "excluded_capabilities": ["dreamer"],
 }
-EXPECTED_ACTIVE_RETIRED_REFS = {
-    "status": "non_mutable_aliases_of_main",
-    "physical_delete_supported": False,
-    "rule": "Visible legacy refs may remain because the connected GitHub surface cannot delete refs. They are forced to current main and are never valid work branches.",
-    "branches": [
-        "audit/core-daemon-conformance-20260828",
-        "chore/28-repository-hygiene",
-        "chore/32-finalize-branch-state",
-        "chore/32-retire-stale-branches",
-        "chore/32-sync-cognitive-authority",
-        "chore/48-control-plane-cleanup",
-        "claude/codex-swarm-audit-p576l9",
-        "claude/eliot-search-architecture-45fdpe",
-        "claude/loving-wozniak-tw3r2s",
-        "cognitive-crates-prototypes-01",
-        "cognitive-materialize-run",
-        "cognitive-micromodules-wave-01",
-        "docs/related-repositories",
-    ],
-}
 EXPECTED_FACADES = [
     {
         "path": "crates/eliot-app",
@@ -313,13 +293,12 @@ def verify_active_registry(registry: Any) -> list[Finding]:
                     )
                 )
 
-    retired_refs = registry.get("retired_refs")
-    if retired_refs != EXPECTED_ACTIVE_RETIRED_REFS:
+    if "retired_refs" in registry:
         findings.append(
             _finding(
                 "active_registry_identity",
                 "retired_refs",
-                "ACTIVE retired-reference registry drifted",
+                "ACTIVE retired_refs is obsolete state: main is the sole persistent branch; temporary issue branches are deleted after disposition",
             )
         )
 
@@ -542,7 +521,6 @@ def _valid_active_registry() -> dict[str, Any]:
         "authority_branch": "main",
         "branch_policy": copy.deepcopy(EXPECTED_ACTIVE_BRANCH_POLICY),
         "workstream": [copy.deepcopy(EXPECTED_ACTIVE_CORE_DAEMON_FIELDS)],
-        "retired_refs": copy.deepcopy(EXPECTED_ACTIVE_RETIRED_REFS),
     }
 
 
@@ -640,10 +618,15 @@ def self_test() -> None:
         _expect_only(payload, code)
         print(f"INVENTORY_FIXTURE: {case}: FAILS_AS={code}")
 
-    active_registry = _valid_active_registry()
-    active_registry["retired_refs"]["branches"].append("tampered/branch")
-    _expect_active_only(active_registry, "active_registry_identity")
-    print("INVENTORY_FIXTURE: ACTIVE registry tamper: FAILS_AS=active_registry_identity")
+    obsolete = _valid_active_registry()
+    obsolete["retired_refs"] = {
+        "status": "non_mutable_aliases_of_main",
+        "physical_delete_supported": False,
+        "rule": "obsolete compatibility state",
+        "branches": ["docs/related-repositories"],
+    }
+    _expect_active_only(obsolete, "active_registry_identity")
+    print("INVENTORY_FIXTURE: reintroduced retired_refs: FAILS_AS=active_registry_identity")
 
     duplicate_active_registry = _valid_active_registry()
     duplicate_active_registry["workstream"].append(copy.deepcopy(duplicate_active_registry["workstream"][0]))

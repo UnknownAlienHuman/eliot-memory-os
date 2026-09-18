@@ -11,6 +11,17 @@ use thiserror::Error;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+pub mod learning_closure;
+
+pub mod promotion_input;
+
+pub use promotion_input::{
+    AGENT_ORDER, CAUSAL_PROPERTY, ClosureBinding, MODULE_ID, PriorPromotionHistory,
+    PromotionCandidate, PromotionGateEvidence, PromotionInputError, PromotionInputPolicy,
+    PromotionPreparation, PromotionRequest, RUNTIME_LAYER, SOURCE_LAYER, prepare_promotion_input,
+    promotion_evidence_digest,
+};
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ImprovementSurface {

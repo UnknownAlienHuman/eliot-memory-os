@@ -1,0 +1,202 @@
+{
+  "fixtures": [
+    {
+      "id": "976-01-valid-envelope",
+      "case": 1,
+      "description": "exact envelope allocation, legacy valid",
+      "raw": "{\"record_id\":\"0196a1b2-c3d4-7e5f-8000-aaaa00000001\",\"receipt_kind\":\"autonomy_budget_ledger\",\"project_id\":\"0196a1b2-c3d4-7e5f-8000-bbbb00000002\",\"task_id\":null,\"subject_ref\":\"autonomy:operator-runtime-proof\",\"receipt_body\":{\"state\":\"active\"},\"canonical_receipt\":{\"receipt_id\":\"0196a1b2-c3d4-7e5f-8000-cccc00000003\",\"write_id\":\"0196a1b2-c3d4-7e5f-8000-dddd00000004\"},\"memory_revision\":1,\"project_sequence\":1}",
+      "expected": "accept",
+      "notes": "case1 allocation"
+    },
+    {
+      "id": "976-02-legacy-valid",
+      "case": 2,
+      "description": "legacy-only preserves fields",
+      "raw": "{\"record_id\":\"0196a1b2-c3d4-7e5f-8000-aaaa00000001\",\"receipt_kind\":\"autonomy_budget_ledger\",\"project_id\":\"0196a1b2-c3d4-7e5f-8000-bbbb00000002\",\"task_id\":null,\"subject_ref\":\"autonomy:operator-runtime-proof\",\"receipt_body\":{\"state\":\"active\"},\"canonical_receipt\":{\"receipt_id\":\"0196a1b2-c3d4-7e5f-8000-cccc00000003\",\"write_id\":\"0196a1b2-c3d4-7e5f-8000-dddd00000004\"},\"memory_revision\":1,\"project_sequence\":1}",
+      "expected": "accept",
+      "notes": "golden digest in test"
+    },
+    {
+      "id": "976-03-b64-valid",
+      "case": 3,
+      "description": "STANDARD_NO_PAD body decodes",
+      "raw": "{\"record_id\":\"0196a1b2-c3d4-7e5f-8000-aaaa00000001\",\"receipt_kind\":\"autonomy_budget_ledger\",\"project_id\":\"0196a1b2-c3d4-7e5f-8000-bbbb00000002\",\"task_id\":null,\"subject_ref\":\"autonomy:operator-runtime-proof\",\"receipt_body_json_b64\":\"eyJ0YXJnZXRfcmVmIjoibWVtb3J5Om9wZXJhdG9yLXJ1bnRpbWUtcHJvb2YifQ\",\"canonical_receipt\":{\"receipt_id\":\"0196a1b2-c3d4-7e5f-8000-cccc00000003\",\"write_id\":\"0196a1b2-c3d4-7e5f-8000-dddd00000004\"},\"memory_revision\":1,\"project_sequence\":1}",
+      "expected": "accept",
+      "notes": "b64 only, no legacy field"
+    },
+    {
+      "id": "976-04-dual-precedence",
+      "case": 4,
+      "description": "dual-form b64 precedence",
+      "raw": "{\"record_id\":\"0196a1b2-c3d4-7e5f-8000-aaaa00000001\",\"receipt_kind\":\"autonomy_budget_ledger\",\"project_id\":\"0196a1b2-c3d4-7e5f-8000-bbbb00000002\",\"task_id\":null,\"subject_ref\":\"autonomy:operator-runtime-proof\",\"receipt_body\":{\"target_ref\":\"memory:operator\"},\"receipt_body_json_b64\":\"eyJ0YXJnZXRfcmVmIjoibWVtb3J5Om9wZXJhdG9yLXJ1bnRpbWUtcHJvb2YifQ\",\"canonical_receipt\":{\"receipt_id\":\"0196a1b2-c3d4-7e5f-8000-cccc00000003\",\"write_id\":\"0196a1b2-c3d4-7e5f-8000-dddd00000004\"},\"memory_revision\":1,\"project_sequence\":1}",
+      "expected": "accept",
+      "notes": "b64 wins"
+    },
+    {
+      "id": "976-05a-bad-b64",
+      "case": 5,
+      "description": "malformed base64 no fallback",
+      "raw": "{\"record_id\":\"0196a1b2-c3d4-7e5f-8000-aaaa00000001\",\"receipt_kind\":\"autonomy_budget_ledger\",\"project_id\":\"0196a1b2-c3d4-7e5f-8000-bbbb00000002\",\"task_id\":null,\"subject_ref\":\"autonomy:operator-runtime-proof\",\"receipt_body\":{\"state\":\"active\"},\"receipt_body_json_b64\":\"!!!not-base64!!!\",\"canonical_receipt\":{\"receipt_id\":\"0196a1b2-c3d4-7e5f-8000-cccc00000003\",\"write_id\":\"0196a1b2-c3d4-7e5f-8000-dddd00000004\"},\"memory_revision\":1,\"project_sequence\":1}",
+      "expected": "reject",
+      "notes": "must fail, no legacy fallback"
+    },
+    {
+      "id": "976-05b-bad-selected-json",
+      "case": 5,
+      "description": "invalid selected JSON no fallback",
+      "raw": "{\"record_id\":\"0196a1b2-c3d4-7e5f-8000-aaaa00000001\",\"receipt_kind\":\"autonomy_budget_ledger\",\"project_id\":\"0196a1b2-c3d4-7e5f-8000-bbbb00000002\",\"task_id\":null,\"subject_ref\":\"autonomy:operator-runtime-proof\",\"receipt_body\":{\"state\":\"active\"},\"receipt_body_json_b64\":\"e2JhZCBqc29u\",\"canonical_receipt\":{\"receipt_id\":\"0196a1b2-c3d4-7e5f-8000-cccc00000003\",\"write_id\":\"0196a1b2-c3d4-7e5f-8000-dddd00000004\"},\"memory_revision\":1,\"project_sequence\":1}",
+      "expected": "reject",
+      "notes": "selected JSON invalid"
+    },
+    {
+      "id": "976-06-unknown-envelope",
+      "case": 6,
+      "description": "unknown protected envelope field rejected",
+      "raw": "{\"record_id\":\"0196a1b2-c3d4-7e5f-8000-aaaa00000001\",\"receipt_kind\":\"autonomy_budget_ledger\",\"project_id\":\"0196a1b2-c3d4-7e5f-8000-bbbb00000002\",\"task_id\":null,\"subject_ref\":\"autonomy:operator-runtime-proof\",\"receipt_body\":{\"state\":\"active\"},\"canonical_receipt\":{\"receipt_id\":\"0196a1b2-c3d4-7e5f-8000-cccc00000003\",\"write_id\":\"0196a1b2-c3d4-7e5f-8000-dddd00000004\"},\"memory_revision\":1,\"project_sequence\":1,\"__unknown_976\":1}",
+      "expected": "reject",
+      "notes": "raw unknown"
+    },
+    {
+      "id": "976-07a-dup-ordinary",
+      "case": 7,
+      "description": "duplicate ordinary key rejected",
+      "raw": "{\"record_id\":\"0196a1b2-c3d4-7e5f-8000-aaaa00000001\",\"receipt_kind\":\"autonomy_budget_ledger\",\"project_id\":\"0196a1b2-c3d4-7e5f-8000-bbbb00000002\",\"task_id\":null,\"subject_ref\":\"a\",\"subject_ref\":\"b\",\"receipt_body\":{\"state\":\"active\"},\"canonical_receipt\":{\"receipt_id\":\"0196a1b2-c3d4-7e5f-8000-cccc00000003\",\"write_id\":\"0196a1b2-c3d4-7e5f-8000-dddd00000004\"},\"memory_revision\":1,\"project_sequence\":1}",
+      "expected": "reject",
+      "notes": "subject_ref dup"
+    },
+    {
+      "id": "976-07b-dup-identity",
+      "case": 7,
+      "description": "duplicate identity key rejected",
+      "raw": "{\"record_id\":\"0196a1b2-c3d4-7e5f-8000-aaaa00000001\",\"receipt_kind\":\"autonomy_budget_ledger\",\"project_id\":\"0196a1b2-c3d4-7e5f-8000-bbbb00000002\",\"project_id\":\"0196a1b2-c3d4-7e5f-8000-bbbb00000002\",\"task_id\":null,\"subject_ref\":\"autonomy:operator-runtime-proof\",\"receipt_body\":{\"state\":\"active\"},\"canonical_receipt\":{\"receipt_id\":\"0196a1b2-c3d4-7e5f-8000-cccc00000003\",\"write_id\":\"0196a1b2-c3d4-7e5f-8000-dddd00000004\"},\"memory_revision\":1,\"project_sequence\":1}",
+      "expected": "reject",
+      "notes": "project_id dup"
+    },
+    {
+      "id": "976-07c-dup-selector",
+      "case": 7,
+      "description": "duplicate body selector rejected",
+      "raw": "{\"record_id\":\"0196a1b2-c3d4-7e5f-8000-aaaa00000001\",\"receipt_kind\":\"autonomy_budget_ledger\",\"project_id\":\"0196a1b2-c3d4-7e5f-8000-bbbb00000002\",\"task_id\":null,\"subject_ref\":\"autonomy:operator-runtime-proof\",\"receipt_body\":{\"state\":\"a\"},\"receipt_body\":{\"state\":\"b\"},\"canonical_receipt\":{\"receipt_id\":\"0196a1b2-c3d4-7e5f-8000-cccc00000003\",\"write_id\":\"0196a1b2-c3d4-7e5f-8000-dddd00000004\"},\"memory_revision\":1,\"project_sequence\":1}",
+      "expected": "reject",
+      "notes": "receipt_body dup"
+    },
+    {
+      "id": "976-07d-dup-escape",
+      "case": 7,
+      "description": "escape-equivalent duplicate rejected",
+      "raw": "{\"record_id\":\"0196a1b2-c3d4-7e5f-8000-aaaa00000001\",\"\\u0072ecord_id\":\"0196a1b2-c3d4-7e5f-8000-aaaa00000001\",\"receipt_kind\":\"autonomy_budget_ledger\",\"project_id\":\"0196a1b2-c3d4-7e5f-8000-bbbb00000002\",\"task_id\":null,\"subject_ref\":\"autonomy:operator-runtime-proof\",\"receipt_body\":{\"state\":\"active\"},\"canonical_receipt\":{\"receipt_id\":\"0196a1b2-c3d4-7e5f-8000-cccc00000003\",\"write_id\":\"0196a1b2-c3d4-7e5f-8000-dddd00000004\"},\"memory_revision\":1,\"project_sequence\":1}",
+      "expected": "reject",
+      "notes": "record_id escape dup"
+    },
+    {
+      "id": "976-08-legacy-body-dup",
+      "case": 8,
+      "description": "legacy raw-body duplicates detectable",
+      "raw": "{\"record_id\":\"0196a1b2-c3d4-7e5f-8000-aaaa00000001\",\"receipt_kind\":\"autonomy_budget_ledger\",\"project_id\":\"0196a1b2-c3d4-7e5f-8000-bbbb00000002\",\"task_id\":null,\"subject_ref\":\"autonomy:operator-runtime-proof\",\"receipt_body\":{\"k\":\"a\",\"k\":\"b\"},\"canonical_receipt\":{\"receipt_id\":\"0196a1b2-c3d4-7e5f-8000-cccc00000003\",\"write_id\":\"0196a1b2-c3d4-7e5f-8000-dddd00000004\"},\"memory_revision\":1,\"project_sequence\":1}",
+      "expected": "reject",
+      "notes": "legacy body dup"
+    },
+    {
+      "id": "976-09-b64-body-dup",
+      "case": 9,
+      "description": "b64-decoded body duplicates rejected",
+      "raw": "{\"record_id\":\"0196a1b2-c3d4-7e5f-8000-aaaa00000001\",\"receipt_kind\":\"autonomy_budget_ledger\",\"project_id\":\"0196a1b2-c3d4-7e5f-8000-bbbb00000002\",\"task_id\":null,\"subject_ref\":\"autonomy:operator-runtime-proof\",\"receipt_body_json_b64\":\"eyJrIjoiYSIsImsiOiJiIn0\",\"canonical_receipt\":{\"receipt_id\":\"0196a1b2-c3d4-7e5f-8000-cccc00000003\",\"write_id\":\"0196a1b2-c3d4-7e5f-8000-dddd00000004\"},\"memory_revision\":1,\"project_sequence\":1}",
+      "expected": "reject",
+      "notes": "b64 body dup via actual path"
+    },
+    {
+      "id": "976-10a-strict-unknown-nested",
+      "case": 10,
+      "description": "strict T unknown nested rejected via owner",
+      "raw": "{\"record_id\":\"0196a1b2-c3d4-7e5f-8000-aaaa00000001\",\"receipt_kind\":\"autonomy_budget_ledger\",\"project_id\":\"0196a1b2-c3d4-7e5f-8000-bbbb00000002\",\"task_id\":null,\"subject_ref\":\"autonomy:operator-runtime-proof\",\"receipt_body\":{\"bogus_976\":1},\"canonical_receipt\":{\"receipt_id\":\"0196a1b2-c3d4-7e5f-8000-cccc00000003\",\"write_id\":\"0196a1b2-c3d4-7e5f-8000-dddd00000004\"},\"memory_revision\":1,\"project_sequence\":1}",
+      "expected": "reject-strict-T",
+      "notes": "decode as OperatorProjectionFilter in test; Value opaque would accept"
+    },
+    {
+      "id": "976-10b-wrong-shape",
+      "case": 10,
+      "description": "wrong T shape rejected via owner",
+      "raw": "{\"record_id\":\"0196a1b2-c3d4-7e5f-8000-aaaa00000001\",\"receipt_kind\":\"autonomy_budget_ledger\",\"project_id\":\"0196a1b2-c3d4-7e5f-8000-bbbb00000002\",\"task_id\":null,\"subject_ref\":\"autonomy:operator-runtime-proof\",\"receipt_body\":{},\"canonical_receipt\":{\"receipt_id\":\"0196a1b2-c3d4-7e5f-8000-cccc00000003\",\"write_id\":\"0196a1b2-c3d4-7e5f-8000-dddd00000004\"},\"memory_revision\":1,\"project_sequence\":1}",
+      "expected": "reject-typed-T",
+      "notes": "decode as MemoryStateTransition in test"
+    },
+    {
+      "id": "976-11a-missing-record-id",
+      "case": 11,
+      "description": "missing required rejected",
+      "raw": "{\"receipt_kind\":\"autonomy_budget_ledger\",\"project_id\":\"0196a1b2-c3d4-7e5f-8000-bbbb00000002\",\"task_id\":null,\"subject_ref\":\"s\",\"receipt_body\":{\"state\":\"active\"},\"canonical_receipt\":{\"receipt_id\":\"0196a1b2-c3d4-7e5f-8000-cccc00000003\",\"write_id\":\"0196a1b2-c3d4-7e5f-8000-dddd00000004\"},\"memory_revision\":1,\"project_sequence\":1}",
+      "expected": "reject",
+      "notes": "missing record_id"
+    },
+    {
+      "id": "976-11b-null-task-ok",
+      "case": 11,
+      "description": "null task_id accepted as None",
+      "raw": "{\"record_id\":\"0196a1b2-c3d4-7e5f-8000-aaaa00000001\",\"receipt_kind\":\"autonomy_budget_ledger\",\"project_id\":\"0196a1b2-c3d4-7e5f-8000-bbbb00000002\",\"task_id\":null,\"subject_ref\":\"autonomy:operator-runtime-proof\",\"receipt_body\":{\"state\":\"active\"},\"canonical_receipt\":{\"receipt_id\":\"0196a1b2-c3d4-7e5f-8000-cccc00000003\",\"write_id\":\"0196a1b2-c3d4-7e5f-8000-dddd00000004\"},\"memory_revision\":1,\"project_sequence\":1}",
+      "expected": "accept",
+      "notes": "task null ok"
+    },
+    {
+      "id": "976-12-version-incompatible",
+      "case": 12,
+      "description": "version-incompatible legacy rejected, no trial decode",
+      "raw": "{\"record_id\":\"0196a1b2-c3d4-7e5f-8000-aaaa00000001\",\"receipt_kind\":\"autonomy_budget_ledger\",\"project_id\":\"0196a1b2-c3d4-7e5f-8000-bbbb00000002\",\"task_id\":null,\"subject_ref\":\"autonomy:operator-runtime-proof\",\"receipt_body\":{\"state\":\"active\"},\"canonical_receipt\":{\"receipt_id\":\"0196a1b2-c3d4-7e5f-8000-cccc00000003\",\"write_id\":\"0196a1b2-c3d4-7e5f-8000-dddd00000004\"},\"memory_revision\":1,\"project_sequence\":1,\"envelope_version\":\"v0-legacy\"}",
+      "expected": "reject",
+      "notes": "unknown version field"
+    },
+    {
+      "id": "976-13-value-weaker",
+      "case": 13,
+      "description": "normalized Value weaker provenance",
+      "raw": "{\"record_id\":\"0196a1b2-c3d4-7e5f-8000-aaaa00000001\",\"receipt_kind\":\"autonomy_budget_ledger\",\"project_id\":\"0196a1b2-c3d4-7e5f-8000-bbbb00000002\",\"task_id\":null,\"subject_ref\":\"a\",\"subject_ref\":\"b\",\"receipt_body\":{\"state\":\"active\"},\"canonical_receipt\":{\"receipt_id\":\"0196a1b2-c3d4-7e5f-8000-cccc00000003\",\"write_id\":\"0196a1b2-c3d4-7e5f-8000-dddd00000004\"},\"memory_revision\":1,\"project_sequence\":1}",
+      "expected": "reject-raw-accept-value",
+      "notes": "raw rejects; from_value after collapse accepts; upstream #929 row required"
+    },
+    {
+      "id": "976-14a-truncated",
+      "case": 14,
+      "description": "truncated JSON no panic",
+      "raw": "{\"record_id\":\"0196a1b2-c3d4-7e5f-8000-aaaa00000001\",\"receipt",
+      "expected": "reject",
+      "notes": "truncated"
+    },
+    {
+      "id": "976-14b-bad-escape",
+      "case": 14,
+      "description": "bad escape no panic",
+      "raw": "{\"record_id\":\"0196a1b2-c3d4-7e5f-8000-aaaa00000001\",\"receipt_kind\":\"bad\\xescape\",\"project_id\":\"0196a1b2-c3d4-7e5f-8000-bbbb00000002\",\"task_id\":null,\"subject_ref\":\"s\",\"receipt_body\":{\"state\":\"active\"},\"canonical_receipt\":{\"receipt_id\":\"0196a1b2-c3d4-7e5f-8000-cccc00000003\",\"write_id\":\"0196a1b2-c3d4-7e5f-8000-dddd00000004\"},\"memory_revision\":1,\"project_sequence\":1}",
+      "expected": "reject",
+      "notes": "bad escape"
+    },
+    {
+      "id": "976-14c-trailing",
+      "case": 14,
+      "description": "trailing data rejected",
+      "raw": "{\"record_id\":\"0196a1b2-c3d4-7e5f-8000-aaaa00000001\",\"receipt_kind\":\"autonomy_budget_ledger\",\"project_id\":\"0196a1b2-c3d4-7e5f-8000-bbbb00000002\",\"task_id\":null,\"subject_ref\":\"autonomy:operator-runtime-proof\",\"receipt_body\":{\"state\":\"active\"},\"canonical_receipt\":{\"receipt_id\":\"0196a1b2-c3d4-7e5f-8000-cccc00000003\",\"write_id\":\"0196a1b2-c3d4-7e5f-8000-dddd00000004\"},\"memory_revision\":1,\"project_sequence\":1} trailing",
+      "expected": "reject",
+      "notes": "trailing data"
+    },
+    {
+      "id": "976-14d-deep-nesting",
+      "case": 14,
+      "description": "deep nesting bounded, no panic",
+      "raw": "{\"record_id\":\"0196a1b2-c3d4-7e5f-8000-aaaa00000001\",\"receipt_kind\":\"autonomy_budget_ledger\",\"project_id\":\"0196a1b2-c3d4-7e5f-8000-bbbb00000002\",\"task_id\":null,\"subject_ref\":\"autonomy:operator-runtime-proof\",\"receipt_body\":{\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": {\"a\": 1}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}},\"canonical_receipt\":{\"receipt_id\":\"0196a1b2-c3d4-7e5f-8000-cccc00000003\",\"write_id\":\"0196a1b2-c3d4-7e5f-8000-dddd00000004\"},\"memory_revision\":1,\"project_sequence\":1}",
+      "expected": "reject",
+      "notes": "150-deep nested objects exceed serde_json depth limit, must fail closed without panic"
+    },
+    {
+      "id": "976-16-allowed-shape",
+      "case": 16,
+      "description": "allowed serialization shape",
+      "raw": "{\"record_id\":\"0196a1b2-c3d4-7e5f-8000-aaaa00000001\",\"receipt_kind\":\"autonomy_budget_ledger\",\"project_id\":\"0196a1b2-c3d4-7e5f-8000-bbbb00000002\",\"task_id\":null,\"subject_ref\":\"autonomy:operator-runtime-proof\",\"receipt_body\":{\"state\":\"active\"},\"canonical_receipt\":{\"receipt_id\":\"0196a1b2-c3d4-7e5f-8000-cccc00000003\",\"write_id\":\"0196a1b2-c3d4-7e5f-8000-dddd00000004\"},\"memory_revision\":1,\"project_sequence\":1}",
+      "expected": "accept",
+      "notes": "serialize keys guard in test"
+    }
+  ],
+  "meta": {
+    "issue": 976,
+    "base": "2cd0e44d6cb882699db4e7fb672e7bbeeba91d27",
+    "encoding": "raw stored as strings so duplicates survive",
+    "count": 24
+  }
+}

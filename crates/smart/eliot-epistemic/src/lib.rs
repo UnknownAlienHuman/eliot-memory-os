@@ -6,6 +6,33 @@
 
 #![forbid(unsafe_code)]
 
+mod candidate_adaptation;
+
+/// Constructs an inert observed/withheld proposal using the private resolver.
+pub fn propose_observed_candidate(
+    request: &eliot_epistemic_contracts::PositionRequest,
+    observation: &eliot_evidence::ObservationRecord,
+    coverage: &eliot_epistemic_contracts::CoverageDenominator,
+    claims: &eliot_epistemic_contracts::ClaimMap,
+    predecessor: Option<eliot_epistemic_contracts::PredecessorId>,
+    disclosure: (
+        eliot_epistemic_contracts::DisclosureClass,
+        eliot_epistemic_contracts::PrivacyHandling,
+    ),
+) -> Result<
+    eliot_epistemic_contracts::EpistemicPositionCandidate,
+    eliot_epistemic_contracts::ContractError,
+> {
+    candidate_adaptation::propose_observed_candidate(
+        request,
+        observation,
+        coverage,
+        claims,
+        predecessor,
+        disclosure,
+    )
+}
+
 use std::collections::BTreeSet;
 
 use eliot_contracts::{ArtifactId, ContractVersion, StateFence};
@@ -13,6 +40,22 @@ use eliot_evidence::{Assertability, EpistemicStatus, EvidenceEnvelope, EvidenceF
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+// Contract boundary: wire types live in `eliot-epistemic-contracts` and are
+// re-exported here so consumers migrate to one vocabulary. The resolver's
+// local algebra (`PositionState`, `EpistemicRecord`, `PositionRequest`,
+// `CurrentEpistemicPosition`, `ProvenanceView`) is policy, not a wire
+// duplicate: local `PositionState` stays six-variant per the algebra below
+// while the contracts `PositionState` is foundation `EpistemicStatus`
+// (eight states); contract `PositionRequest` / `CurrentEpistemicPosition` /
+// `ProvenanceClosure` carry digests, work-scope bindings, and lineage while
+// resolver inputs carry embedded `EvidenceEnvelope`s. Donor `resolve`,
+// `provenance_for`, and `lowest_assertability` remain resolver policy.
+pub use eliot_epistemic_contracts::{
+    AdmittedReceipt, AssumptionRecord, ContractError as EpistemicContractError,
+    CurrentEpistemicPosition as ContractPosition, InvestigationRequirement,
+    PositionRequest as ContractPositionRequest, ProvenanceClosure, SupportRecord,
+};
 
 pub const CONTRACT_NAME: &str = "eliot.smart.epistemic";
 pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);
@@ -371,11 +414,22 @@ fn lowest_assertability(left: Assertability, right: Assertability) -> Assertabil
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use eliot_contracts::{AuthorityEpoch, ContractId, ResourceGeneration, SourceId};
+    use eliot_contracts::{ContractId, EpochId, EpochLineageId, ResourceGeneration, SourceId};
+    use std::num::NonZeroU64;
+
+    fn test_epoch(sequence: u64) -> EpochId {
+        let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .expect("canonical test lineage-A");
+        EpochId::new(
+            lineage,
+            NonZeroU64::new(sequence).expect("non-zero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
     use eliot_evidence::{EvidenceAuthority, EvidenceCoverage, Provenance, VerificationBinding};
 
     fn fence() -> StateFence {
-        StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+        StateFence::new(test_epoch(1), ResourceGeneration::genesis())
     }
 
     fn id(value: &str) -> ArtifactId {

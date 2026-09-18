@@ -276,6 +276,9 @@ pub(crate) fn validate_lineage(
 ) -> Option<(RejectionCode, &'static str)> {
     let grounded = &input.grounded;
     let model = &grounded.input;
+    if let Some(detail) = duplicate_identity(input) {
+        return Some((RejectionCode::DuplicateItem, detail));
+    }
     if model.draft_digest != grounded.draft_digest
         || model.input_manifest_digest != grounded.manifest_digest
         || grounded.manifest.digest != grounded.manifest_digest
@@ -309,6 +312,50 @@ pub(crate) fn validate_lineage(
                     RejectionCode::LineageMismatch,
                     "an admitted source is not bound to an included bundle material",
                 ));
+            }
+        }
+    }
+    None
+}
+
+/// Fail-closed duplicate rejection for structured item, claim, evidence,
+/// and dimension identities. Map and set keys cannot duplicate by
+/// construction, so this covers the remaining vectors and cross-set joins:
+/// repeated claim identities, ledger partition overlap, and repeated
+/// accepted evidence handles within one record or across the manifest.
+fn duplicate_identity(input: &GroundingValidationInput) -> Option<&'static str> {
+    let grounded = &input.grounded;
+    let mut seen_claims = BTreeSet::new();
+    for claim in &grounded.input.claims {
+        if !seen_claims.insert(claim.claim_id.as_str()) {
+            return Some("duplicate structured claim identity");
+        }
+    }
+    if grounded
+        .ledger
+        .records
+        .keys()
+        .any(|key| grounded.ledger.unprocessed_claim_ids.contains(key))
+    {
+        return Some("duplicate ledger claim partition");
+    }
+    let mut seen_evidence = BTreeSet::new();
+    for record in grounded.ledger.records.values() {
+        if record
+            .accepted_support
+            .intersection(&record.accepted_counterevidence)
+            .next()
+            .is_some()
+        {
+            return Some("duplicate accepted evidence handle");
+        }
+        for handle in record
+            .accepted_support
+            .iter()
+            .chain(record.accepted_counterevidence.iter())
+        {
+            if !seen_evidence.insert(handle) {
+                return Some("duplicate accepted evidence handle across ledger records");
             }
         }
     }

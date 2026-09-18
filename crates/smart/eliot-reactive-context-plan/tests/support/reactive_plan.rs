@@ -7,7 +7,8 @@ use eliot_context_contracts::{
     AdmissionDisposition, AdmissionRecord, ReactiveDeliveryMode, SemanticRole,
 };
 use eliot_contracts::{
-    AuthorityEpoch, ClockReading, OperationId, ResourceGeneration, SourceId, StateFence, TaskId,
+    ClockReading, EpochId, EpochLineageId, OperationId, ResourceGeneration, SourceId, StateFence,
+    TaskId,
 };
 use eliot_cue_contracts::{
     ActivationBounds, ActivationBoundsSpec, ActivationRequest, ActivationRequestSpec,
@@ -45,7 +46,12 @@ struct AdmittedCanonical<'a> {
 
 pub fn fence() -> StateFence {
     StateFence::new(
-        AuthorityEpoch::new(1).unwrap(),
+        EpochId::new(
+            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                .expect("valid test lineage"),
+            std::num::NonZeroU64::new(1).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch"),
         ResourceGeneration::new(1).unwrap(),
     )
 }
@@ -484,9 +490,29 @@ pub fn reseal_context_view(
         .and_then(|value| value.checked_sub(admitted_required))
         .and_then(|value| value.checked_sub(admitted_optional))
         .expect("fixture admitted bytes fit route");
+    // The allocation edit above changed the receipt preimage, so reseal the
+    // receipt before any validating call; the measurement digest below changes
+    // it again and is resealed a second time. This mirrors the issuing order
+    // in the contracts support fixture.
+    {
+        let mut unsigned = admitted.economy.clone();
+        unsigned.receipt_digest = "0".repeat(64);
+        admitted.economy.receipt_digest =
+            eliot_context_contracts::canonical_digest(&unsigned).expect("resealed receipt");
+    }
     admitted.economy.measurement.digest = admitted
         .canonical_payload_digest()
         .expect("admitted digest");
+    // The allocations and measurement above changed the receipt preimage, so
+    // the sealed receipt digest must be recomputed exactly as the issuing
+    // contracts do; otherwise `AdmittedContextSet::validate` rejects the set
+    // with `IdentityConflict` on the stale receipt binding.
+    {
+        let mut unsigned = admitted.economy.clone();
+        unsigned.receipt_digest = "0".repeat(64);
+        admitted.economy.receipt_digest =
+            eliot_context_contracts::canonical_digest(&unsigned).expect("resealed receipt");
+    }
 
     let rendered: Vec<_> = admitted
         .records

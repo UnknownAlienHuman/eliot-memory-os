@@ -37,7 +37,11 @@ use thiserror::Error;
 /// Stable contract identity.
 pub const CONTRACT_NAME: &str = "eliot.storage.blob";
 /// Current wire revision.
-pub const CONTRACT_VERSION: &str = "s-04-v1";
+///
+/// `s-04-v2` is the breaking I05-12 residency wave: every locator carries a
+/// full [`ObjectResidencyKey`]. Wire bytes from `s-04-v1` (hash-only locators)
+/// are rejected, never silently upgraded.
+pub const CONTRACT_VERSION: &str = "s-04-v2";
 
 fn valid_text(value: &str, field: &'static str) -> Result<(), BlobError> {
     if value.trim().is_empty() || value.chars().any(char::is_control) {
@@ -129,11 +133,150 @@ impl<'de> Deserialize<'de> for BlobHash {
     }
 }
 
+/// Algorithm- and version-tagged content digest (I05-12 `content_digest`).
+///
+/// The current default algorithm is BLAKE3, but the ownership rule is
+/// algorithm-neutral: the algorithm name and version are part of the identity,
+/// so a digest rotation is a different object, never a metadata relabel.
+/// The digest bytes reuse [`BlobHash`] (lowercase hex); a future algorithm
+/// with a different digest length needs an owner-approved registry change and
+/// is rejected by this shape until then.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct VersionedContentDigest {
+    /// Digest algorithm identity (for example `blake3`).
+    pub algorithm: BlobId,
+    /// Algorithm/format version. Must be greater than zero.
+    pub version: u32,
+    /// Lowercase hex digest of the exact post-policy canonical bytes.
+    pub digest: BlobHash,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VersionedContentDigestWire {
+    algorithm: BlobId,
+    version: u32,
+    digest: BlobHash,
+}
+
+impl VersionedContentDigest {
+    /// Validates the algorithm/version tag.
+    pub fn validate(&self) -> Result<(), BlobError> {
+        if self.version == 0 {
+            return Err(BlobError::InvalidField {
+                field: "content_digest.version",
+                reason: "must be greater than zero",
+            });
+        }
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for VersionedContentDigest {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = VersionedContentDigestWire::deserialize(deserializer)?;
+        let value = Self {
+            algorithm: wire.algorithm,
+            version: wire.version,
+            digest: wire.digest,
+        };
+        value.validate().map_err(de::Error::custom)?;
+        Ok(value)
+    }
+}
+
+/// Full I05-12 object residency identity.
+///
+/// ```text
+/// ObjectResidencyKey = scope_domain_id + access_domain_id
+///     + confidentiality_domain_id + encryption_key_domain_id
+///     + retention_domain_id + erasure_domain_id + content_digest
+/// ```
+///
+/// Equal bytes deduplicate only when **all** six domain identities are
+/// equivalent. Byte equality never permits cross-domain physical co-residency,
+/// ciphertext reuse, encryption-key reuse, or coupling of retention and
+/// erasure obligations. Domain values are opaque owner-scoped identities: any
+/// non-blank path-free text is accepted structurally, but no value registry is
+/// implied here and no silent default domain is ever substituted.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct ObjectResidencyKey {
+    /// Lawful `WorkScope` or source namespace binding.
+    pub scope_domain_id: BlobId,
+    /// Principal/access binding.
+    pub access_domain_id: BlobId,
+    /// Disclosure/confidentiality binding.
+    pub confidentiality_domain_id: BlobId,
+    /// Permitted key-lineage binding.
+    pub encryption_key_domain_id: BlobId,
+    /// Lifecycle/retention binding.
+    pub retention_domain_id: BlobId,
+    /// Purge-closure/erasure binding.
+    pub erasure_domain_id: BlobId,
+    /// Algorithm- and version-tagged content digest.
+    pub content_digest: VersionedContentDigest,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ObjectResidencyKeyWire {
+    scope_domain_id: BlobId,
+    access_domain_id: BlobId,
+    confidentiality_domain_id: BlobId,
+    encryption_key_domain_id: BlobId,
+    retention_domain_id: BlobId,
+    erasure_domain_id: BlobId,
+    content_digest: VersionedContentDigest,
+}
+
+impl ObjectResidencyKey {
+    /// Validates the versioned content digest tag. Domain identities are
+    /// already validated by [`BlobId`] construction.
+    pub fn validate(&self) -> Result<(), BlobError> {
+        self.content_digest.validate()
+    }
+
+    /// Computes the canonical residency-key digest used for physical path
+    /// derivation and receipt linkage. It is a pure derivation and grants no
+    /// authority.
+    pub fn key_digest(&self) -> Result<String, BlobError> {
+        serde_json::to_vec(self)
+            .map(|bytes| hex_sha256(&bytes))
+            .map_err(|error| BlobError::InvalidContract(error.to_string()))
+    }
+}
+
+impl<'de> Deserialize<'de> for ObjectResidencyKey {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = ObjectResidencyKeyWire::deserialize(deserializer)?;
+        let value = Self {
+            scope_domain_id: wire.scope_domain_id,
+            access_domain_id: wire.access_domain_id,
+            confidentiality_domain_id: wire.confidentiality_domain_id,
+            encryption_key_domain_id: wire.encryption_key_domain_id,
+            retention_domain_id: wire.retention_domain_id,
+            erasure_domain_id: wire.erasure_domain_id,
+            content_digest: wire.content_digest,
+        };
+        value.validate().map_err(de::Error::custom)?;
+        Ok(value)
+    }
+}
+
 /// CAS locator. It is an identity, never an ambient filesystem path.
+///
+/// `s-04-v2` carries the full I05-12 residency identity. A `s-04-v1` 3-field
+/// locator (`hash`/`root_generation`/`path_generation` without `residency`)
+/// fails deserialization with a missing-field error and is **rejected**.
+/// Migration between residency domains is an explicit copy or re-encryption
+/// transition with a new receipt and an explicit disposition for the old copy;
+/// a silent default-domain upgrade is never performed.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct BlobLocator {
-    /// Exact content identity.
+    /// Exact content identity. Must equal `residency.content_digest.digest`.
     pub hash: BlobHash,
+    /// Full I05-12 residency identity.
+    pub residency: ObjectResidencyKey,
     /// Root generation that produced the path.
     pub root_generation: u64,
     /// Immutable path-shape generation.
@@ -144,12 +287,13 @@ pub struct BlobLocator {
 #[serde(deny_unknown_fields)]
 struct BlobLocatorWire {
     hash: BlobHash,
+    residency: ObjectResidencyKey,
     root_generation: u64,
     path_generation: u32,
 }
 
 impl BlobLocator {
-    /// Validates non-zero generation identities.
+    /// Validates non-zero generation identities and hash/residency coherence.
     pub fn validate(&self) -> Result<(), BlobError> {
         if self.root_generation == 0 || self.path_generation == 0 {
             return Err(BlobError::InvalidField {
@@ -157,7 +301,25 @@ impl BlobLocator {
                 reason: "must be greater than zero",
             });
         }
+        self.residency.validate()?;
+        if self.hash != self.residency.content_digest.digest {
+            return Err(BlobError::InvalidField {
+                field: "locator.hash",
+                reason: "must equal residency content digest",
+            });
+        }
         Ok(())
+    }
+
+    /// Returns the full residency identity.
+    #[must_use]
+    pub fn residency(&self) -> &ObjectResidencyKey {
+        &self.residency
+    }
+
+    /// Computes the canonical residency-key digest for path derivation.
+    pub fn residency_key_digest(&self) -> Result<String, BlobError> {
+        self.residency.key_digest()
     }
 }
 
@@ -166,6 +328,7 @@ impl<'de> Deserialize<'de> for BlobLocator {
         let wire = BlobLocatorWire::deserialize(deserializer)?;
         let value = Self {
             hash: wire.hash,
+            residency: wire.residency,
             root_generation: wire.root_generation,
             path_generation: wire.path_generation,
         };
@@ -209,6 +372,16 @@ impl BlobPolicyBinding {
     /// independently versioned serde boundaries.
     pub fn validate(&self) -> Result<(), BlobError> {
         valid_text(self.policy_ref.as_str(), "policy_ref")
+    }
+
+    /// Validates that an explicit policy binding and an explicit residency
+    /// identity travel together. Both sides must be well-formed; no value
+    /// registry is consulted here and no default domain is substituted. The
+    /// cryptographic linkage of policy and residency lives in
+    /// [`receipt_binding_sha256`], which binds both into the receipt.
+    pub fn validate_for_residency(&self, residency: &ObjectResidencyKey) -> Result<(), BlobError> {
+        self.validate()?;
+        residency.validate()
     }
 }
 
@@ -345,11 +518,14 @@ pub struct BlobReceiptBinding {
     root_generation: u64,
     path_generation: Option<u32>,
     blob_hash: Option<BlobHash>,
+    residency: Option<ObjectResidencyKey>,
     proof_id: Option<BlobId>,
 }
 
 impl BlobReceiptBinding {
-    /// Creates the exact binding for a blob operation.
+    /// Creates the exact binding for a blob operation, including its full
+    /// residency identity. A binding created for one residency domain never
+    /// authenticates a receipt for another domain.
     pub fn for_blob(
         context: &BlobReceiptContext,
         locator: &BlobLocator,
@@ -363,6 +539,7 @@ impl BlobReceiptBinding {
             root_generation: locator.root_generation,
             path_generation: Some(locator.path_generation),
             blob_hash: Some(locator.hash.clone()),
+            residency: Some(locator.residency.clone()),
             proof_id: None,
         })
     }
@@ -386,6 +563,7 @@ impl BlobReceiptBinding {
             root_generation,
             path_generation,
             blob_hash: None,
+            residency: None,
             proof_id: proof_id.cloned(),
         })
     }
@@ -412,6 +590,14 @@ impl BlobReceiptBinding {
     #[must_use]
     pub fn blob_hash(&self) -> Option<&BlobHash> {
         self.blob_hash.as_ref()
+    }
+
+    /// Returns the expected residency identity, when this binding is
+    /// blob-specific. `None` for operation-level (reachability/GC/CAS)
+    /// bindings that authenticate a proof instead of one object.
+    #[must_use]
+    pub fn residency(&self) -> Option<&ObjectResidencyKey> {
+        self.residency.as_ref()
     }
 
     /// Returns the expected root generation.
@@ -468,6 +654,20 @@ impl BlobReceiptBinding {
             }
             if let Some(path_generation) = self.path_generation {
                 let marker = format!("path-generation:{path_generation}");
+                if !receipt.core.artifacts.iter().any(|artifact| {
+                    artifact
+                        .source_revision
+                        .as_deref()
+                        .is_some_and(|source| source.contains(&marker))
+                }) {
+                    return Err(BlobError::MetadataPayloadMismatch);
+                }
+            }
+            if let Some(residency) = &self.residency {
+                let key_digest = residency
+                    .key_digest()
+                    .map_err(|_| BlobError::MetadataPayloadMismatch)?;
+                let marker = format!("residency:{key_digest}");
                 if !receipt.core.artifacts.iter().any(|artifact| {
                     artifact
                         .source_revision
@@ -929,12 +1129,18 @@ impl<'de> Deserialize<'de> for CryptoDescriptor {
 }
 
 /// Durable stage request.
+///
+/// `residency` declares the full I05-12 residency identity for the object to
+/// be staged. It is required: there is no default-domain inference, and the
+/// service must derive the content digest from the exact post-policy canonical
+/// bytes and bind all six domains before durable publication.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct BlobStageRequest {
     pub context: BlobReceiptContext,
     pub root_lease: BlobRootLease,
     pub bytes: Vec<u8>,
     pub policy: BlobPolicyBinding,
+    pub residency: ObjectResidencyKey,
 }
 
 #[derive(Deserialize)]
@@ -944,13 +1150,14 @@ struct BlobStageRequestWire {
     root_lease: BlobRootLease,
     bytes: Vec<u8>,
     policy: BlobPolicyBinding,
+    residency: ObjectResidencyKey,
 }
 
 impl BlobStageRequest {
     pub fn validate(&self) -> Result<(), BlobError> {
         self.context.validate_for(EffectClass::ReversibleMutation)?;
         self.root_lease.validate_context(&self.context)?;
-        self.policy.validate()?;
+        self.policy.validate_for_residency(&self.residency)?;
         Ok(())
     }
 }
@@ -963,6 +1170,7 @@ impl<'de> Deserialize<'de> for BlobStageRequest {
             root_lease: wire.root_lease,
             bytes: wire.bytes,
             policy: wire.policy,
+            residency: wire.residency,
         };
         value.validate().map_err(de::Error::custom)?;
         Ok(value)
@@ -1314,7 +1522,8 @@ pub struct BlobReadyReceipt {
 
 impl BlobReadyReceipt {
     /// Constructs a capability from an independently verified receipt. The
-    /// verified binding must identify this exact locator and generations.
+    /// verified binding must identify this exact locator, residency identity,
+    /// and generations.
     /// Ownership-taking parameters retain the established public constructor
     /// shape even where validation only needs borrowed views.
     #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
@@ -1336,6 +1545,7 @@ impl BlobReadyReceipt {
     ) -> Result<Self, BlobError> {
         if verified.anchor_fingerprint() != expected_anchor.fingerprint()
             || verified.binding().blob_hash() != Some(&locator.hash)
+            || verified.binding().residency() != Some(&locator.residency)
             || verified.binding().root_generation() != locator.root_generation
             || verified.binding().path_generation() != Some(locator.path_generation)
         {
@@ -1381,7 +1591,8 @@ impl BlobReadyReceipt {
         }
         self.compression.validate()?;
         self.crypto.validate()?;
-        self.policy.validate()?;
+        self.policy
+            .validate_for_residency(&self.locator.residency)?;
         canonical_sha256(&self.anchor_fingerprint, "anchor_fingerprint")?;
         if self.root_generation != self.locator.root_generation
             || self.path_generation != self.locator.path_generation
@@ -1532,6 +1743,7 @@ impl BlobReadChunk {
     ) -> Result<Self, BlobError> {
         if verified.anchor_fingerprint() != expected_anchor.fingerprint()
             || verified.binding().blob_hash() != Some(&ready_receipt.locator.hash)
+            || verified.binding().residency() != Some(&ready_receipt.locator.residency)
             || verified.binding().root_generation() != ready_receipt.root_generation
             || verified.binding().path_generation() != Some(ready_receipt.path_generation)
         {
@@ -1802,6 +2014,11 @@ impl<'de> Deserialize<'de> for BlobHealth {
 /// Computes the versioned identity digest that binds one blob's immutable
 /// description into its receipt. It is a pure derivation shared by the contract
 /// validation and the S-04 service; it grants no authority.
+///
+/// The binding covers the full [`ObjectResidencyKey`] both through `locator`
+/// and through an explicit residency entry, so equal bytes in different
+/// residency domains never share a binding. Policy and residency are thereby
+/// cryptographically linked into the same receipt identity.
 #[allow(clippy::too_many_arguments)]
 pub fn receipt_binding_sha256(
     format: &BlobId,
@@ -1815,11 +2032,14 @@ pub fn receipt_binding_sha256(
     crypto: &CryptoDescriptor,
     policy: &BlobPolicyBinding,
 ) -> Result<String, BlobError> {
+    locator.validate()?;
+    policy.validate_for_residency(&locator.residency)?;
     let bytes = serde_json::to_vec(&(
         CONTRACT_VERSION,
         format,
         format_version,
         locator,
+        &locator.residency,
         plaintext_length,
         stored_length,
         stored_length, // envelope_length == stored_length
@@ -1860,6 +2080,18 @@ fn hex_sha256(bytes: &[u8]) -> String {
     output
 }
 
+/// Versioned wire revision for every CAS request/effect commitment.
+///
+/// Commitments bind this exact revision into their canonical bytes, so a
+/// future CAS wire revision is a different commitment, never a silent
+/// reinterpretation of `s-04-cas-v1` bytes. Legacy shapes are preserved only
+/// under this explicit version.
+pub const BLOB_CAS_WIRE_VERSION: &str = "s-04-cas-v1";
+/// Deterministic domain separator for CAS request commitments.
+pub const BLOB_CAS_REQUEST_DOMAIN: &str = "eliot.storage.blob.cas";
+/// Deterministic domain separator for CAS effect commitments.
+pub const BLOB_CAS_EFFECT_DOMAIN: &str = "eliot.storage.blob.cas.effect";
+
 /// The only targets admitted by the v1 journal CAS contract.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -1869,6 +2101,12 @@ pub enum BlobCasNamespace {
 }
 
 /// Capability reported before a backend considers a CAS mutation.
+///
+/// `AtomicCompareAndReplace` means the backend holds a real conditional
+/// primitive behind its stable serialization boundary. `UnsupportedAtomicCas`
+/// is a typed **pre-mutation** state: no target byte was compared, written,
+/// or retried under this operation. It is never transient provider
+/// unavailability and never authorizes a blind retry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum BlobCasCapability {
@@ -1877,6 +2115,11 @@ pub enum BlobCasCapability {
 }
 
 /// Expected or observed SHA-256 state of a journal object.
+///
+/// `Missing` is a positively observed absence at the declared journal target,
+/// not a default. Unknown fields, unknown `kind` tags, and non-canonical
+/// digests are rejected at the wire boundary; no protected default is ever
+/// substituted.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BlobCasState {
     Missing,
@@ -1937,6 +2180,11 @@ impl<'de> Deserialize<'de> for BlobCasState {
 }
 
 /// Durability requested or observed by one journal CAS operation.
+///
+/// `NotRequested`/`Requested` are the only request-side values; `Confirmed`
+/// and `Unconfirmed` are observed values carried on receipts and uncertain
+/// outcomes. `Unconfirmed` never decodes as `Confirmed`, and an unconfirmed
+/// write never decodes as a durable apply.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum BlobCasDurability {
@@ -1948,6 +2196,12 @@ pub enum BlobCasDurability {
 
 /// Narrow v1 request for a control-plane journal CAS. Replacement bytes remain
 /// private to the backend; their exact SHA-256 and length are committed here.
+///
+/// The request binds the full operation identity (operation, request,
+/// idempotency via `context`), the journal namespace/target, the expected
+/// state, the replacement digest/length, the backend generation fence, and
+/// the requested durability. No token, raw content, filesystem handle, or
+/// platform lock authority is representable in this type.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct BlobCasRequest {
     pub context: BlobReceiptContext,
@@ -1992,6 +2246,10 @@ struct BlobCasRequestCommitment<'a> {
 }
 
 impl BlobCasRequest {
+    /// Intrinsic constructor: validates operation/lease identities,
+    /// kind-payload compatibility, journal-namespace/target bounds, digest
+    /// shapes, generation fences, and the deterministic canonical commitment
+    /// encoding. Performs no I/O and holds no lock, store, or authority.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         context: BlobReceiptContext,
@@ -2016,6 +2274,15 @@ impl BlobCasRequest {
             requested_durability,
         };
         value.validate()?;
+        // Deterministic canonical encoding: the same validated request always
+        // yields the same commitment bytes (byte-identical digest on repeat).
+        let first = value.request_commitment_sha256()?;
+        let second = value.request_commitment_sha256()?;
+        if first != second {
+            return Err(BlobError::InvalidContract(
+                "CAS request commitment encoding is not deterministic".to_owned(),
+            ));
+        }
         Ok(value)
     }
 
@@ -2061,8 +2328,8 @@ impl BlobCasRequest {
     pub fn request_commitment_sha256(&self) -> Result<String, BlobError> {
         self.validate()?;
         canonical_json_sha256(&(
-            "eliot.storage.blob.cas",
-            "s-04-cas-v1",
+            BLOB_CAS_REQUEST_DOMAIN,
+            BLOB_CAS_WIRE_VERSION,
             BlobCasRequestCommitment {
                 context: &self.context,
                 root_lease: &self.root_lease,
@@ -2080,6 +2347,13 @@ impl BlobCasRequest {
     /// Rejects replay under a changed operation or request commitment. The
     /// operation id is a distinct step identity even when all other bytes are
     /// equal; parent/causal links remain owned by the receipt context.
+    ///
+    /// Reusing one operation identity (`operation_id` + `idempotency_key`)
+    /// with a changed expected state, replacement digest/length, target,
+    /// namespace, generation fence, or durability is an `IdentityConflict`:
+    /// I05-27 requires the changed canonical payload to conflict rather than
+    /// transition. A changed operation identity with otherwise equal bytes is
+    /// also an `IdentityConflict` (distinct step, no shared apply evidence).
     pub fn validate_exact_replay(&self, replay: &Self) -> Result<(), BlobError> {
         self.validate()?;
         replay.validate()?;
@@ -2182,6 +2456,14 @@ pub enum BlobCasSuccessKind {
 
 /// Authority-issued evidence for one applied CAS or exact supported no-op.
 /// Private fields prevent callers from minting effect evidence.
+///
+/// The receipt binds the full operation identity (`operation_id`,
+/// `request_id`, `idempotency_key`), the journal namespace/target, the
+/// expected state, the replacement digest/length, the backend generation
+/// fence, and the requested/observed durability behind the canonical
+/// `s-04-cas-v1` request/effect commitments. A later digest match on the
+/// target alone is not proof which operation committed: only the retained
+/// operation-bound receipt distinguishes same-byte writers.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct BlobCasReceipt {
     receipt: Receipt,
@@ -2200,6 +2482,10 @@ pub struct BlobCasReceipt {
 }
 
 impl BlobCasReceipt {
+    /// Constructs operation-bound durable evidence from an independently
+    /// verified receipt. The verified binding must identify this exact
+    /// operation, request, idempotency key, generations, proof, and
+    /// `CONFIRMED` observed durability; receipt construction performs no I/O.
     #[allow(clippy::too_many_arguments)]
     pub fn from_verified(
         verified: &VerifiedBlobReceipt,
@@ -2379,8 +2665,8 @@ fn cas_effect_commitment_sha256(
     // previous state named by `request.expected`, then classified the result
     // as Applied or the exact expected==replacement NoOp.
     canonical_json_sha256(&(
-        "eliot.storage.blob.cas.effect",
-        "s-04-cas-v1",
+        BLOB_CAS_EFFECT_DOMAIN,
+        BLOB_CAS_WIRE_VERSION,
         request_commitment_sha256,
         &request.expected,
         &request.replacement_sha256,
@@ -2425,6 +2711,21 @@ fn require_cas_artifacts(
 /// Lossless CAS result vocabulary. Failed outcomes map to [`BlobError`] only
 /// through the typed `CasFailure` variant; no state is flattened to transient
 /// provider unavailability.
+///
+/// Disposition invariants (lossless, decode-stable):
+/// - `UnsupportedAtomicCas` is a not-attempted pre-mutation state. It never
+///   decodes as `ProviderUnavailable` (transient, blind-retry eligible) and
+///   never authorizes a blind retry under any operation identity.
+/// - `UnknownOutcome` is an uncertain possible write. It never decodes as
+///   `NotAttempted` and never decodes as `Applied`/`NoOp`.
+/// - `DurabilityUnconfirmed` is an installed-but-unproven write. It never
+///   decodes as `Applied`/`NoOp`.
+/// - `ExpectedStateConflict` (byte/value mismatch under one operation
+///   identity) and `IdentityConflict` (same operation identity reused with a
+///   changed canonical payload) are distinct and never merge.
+/// - `Applied`/`NoOp` carry operation-bound durable evidence whose digest
+///   match alone is not proof of which operation committed: only the retained
+///   operation receipt distinguishes same-byte writers.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BlobCasOutcome {
     Applied {
@@ -2471,6 +2772,33 @@ pub enum BlobCasOutcome {
 }
 
 impl BlobCasOutcome {
+    /// Returns the operation-bound request carried by every outcome variant.
+    #[must_use]
+    pub fn request(&self) -> &BlobCasRequest {
+        match self {
+            Self::Applied { receipt } | Self::NoOp { receipt } => receipt.request(),
+            Self::ExpectedStateConflict { request, .. }
+            | Self::IdentityConflict { request }
+            | Self::NotFound { request }
+            | Self::NotAttempted { request }
+            | Self::UnsupportedAtomicCas { request }
+            | Self::UnknownOutcome { request, .. }
+            | Self::DurabilityUnconfirmed { request, .. }
+            | Self::Internal { request, .. } => request,
+        }
+    }
+
+    /// Decodes this outcome into the lossless public [`BlobError`] surface.
+    ///
+    /// Successful `Applied`/`NoOp` receipts stay `Ok`; every other
+    /// disposition becomes the exact typed `BlobError::CasFailure` variant
+    /// with the same name. This mapping never produces
+    /// `BlobError::ProviderUnavailable`: `UnsupportedAtomicCas` is a typed
+    /// pre-mutation capability state, not transient unavailability, and
+    /// `UnknownOutcome`/`DurabilityUnconfirmed` require same-operation
+    /// reconciliation rather than blind retry. Successful receipts never
+    /// decode as `NotAttempted`, and unknown commits never decode as
+    /// `NotAttempted` or as successful applies.
     pub fn into_blob_result(self) -> Result<Self, BlobError> {
         match self {
             Self::Applied { receipt } if receipt.success() == BlobCasSuccessKind::Applied => {
@@ -2561,8 +2889,16 @@ pub enum BlobCasFailure {
     NotFound { request: Box<BlobCasRequest> },
     #[error("CAS was not attempted")]
     NotAttempted { request: Box<BlobCasRequest> },
+    /// Typed pre-mutation state: the backend holds no conditional primitive
+    /// for this target, so the mutation was never compared, written, or
+    /// retried under this operation. Distinct from `NotAttempted` (a capable
+    /// backend that did not attempt this step) and never eligible for blind
+    /// retry as transient `ProviderUnavailable`.
     #[error("atomic CAS is unsupported")]
     UnsupportedAtomicCas { request: Box<BlobCasRequest> },
+    /// Uncertain possible write: the commit may or may not have installed.
+    /// Never decodes as `NotAttempted` and never decodes as a successful
+    /// `Applied`/`NoOp`; recovery must reconcile under the same operation.
     #[error("CAS outcome is unknown")]
     UnknownOutcome {
         request: Box<BlobCasRequest>,
@@ -2572,6 +2908,9 @@ pub enum BlobCasFailure {
         observed_backend_generation: Option<u64>,
         observed_durability: BlobCasDurability,
     },
+    /// Installed-but-unproven write: the replacement is visible but the
+    /// required durability boundary was not confirmed. Never decodes as a
+    /// durable `Applied`/`NoOp`.
     #[error("CAS durability is unconfirmed")]
     DurabilityUnconfirmed {
         request: Box<BlobCasRequest>,
@@ -2587,6 +2926,57 @@ pub enum BlobCasFailure {
     },
     #[error("CAS success kind did not match its outcome wrapper")]
     SuccessKindMismatch { request: Box<BlobCasRequest> },
+}
+
+impl BlobCasFailure {
+    /// Returns the operation-bound request carried by every failure variant.
+    ///
+    /// Every applicable CAS value binds exact operation/idempotency, journal
+    /// namespace/target, expected state, replacement digest/length,
+    /// backend generation fence, and requested durability through this
+    /// request; observed generations/durability travel on the
+    /// `UnknownOutcome`/`DurabilityUnconfirmed` variants only.
+    #[must_use]
+    pub fn request(&self) -> &BlobCasRequest {
+        match self {
+            Self::ExpectedStateConflict { request, .. }
+            | Self::IdentityConflict { request }
+            | Self::NotFound { request }
+            | Self::NotAttempted { request }
+            | Self::UnsupportedAtomicCas { request }
+            | Self::UnknownOutcome { request, .. }
+            | Self::DurabilityUnconfirmed { request, .. }
+            | Self::Internal { request, .. }
+            | Self::SuccessKindMismatch { request } => request,
+        }
+    }
+
+    /// Reports whether a blind retry under a new operation identity is safe.
+    ///
+    /// Always `false`: no CAS disposition authorizes a blind retry. Conflict
+    /// and not-found outcomes require an explicit re-read and a new operation
+    /// identity; `NotAttempted` and `UnsupportedAtomicCas` require the backend
+    /// to attempt or declare capability first (`UnsupportedAtomicCas` is never
+    /// transient `ProviderUnavailable` and never becomes retry-eligible by
+    /// waiting); `UnknownOutcome`/`DurabilityUnconfirmed`/`Internal` require
+    /// same-operation reconciliation.
+    #[must_use]
+    pub const fn blind_retry_safe(&self) -> bool {
+        false
+    }
+
+    /// Reports whether this failure authorizes a blind retry as transient
+    /// provider unavailability.
+    ///
+    /// Always `false`: no CAS disposition degrades to transient
+    /// `ProviderUnavailable`. `UnsupportedAtomicCas` is a pre-mutation
+    /// capability state, `UnknownOutcome`/`DurabilityUnconfirmed` require
+    /// same-operation reconciliation, and conflict outcomes require an
+    /// explicit re-read/re-issue under a new operation identity.
+    #[must_use]
+    pub const fn retryable_as_transient_unavailable(&self) -> bool {
+        false
+    }
 }
 
 /// The precise operation phase at which the storage provider reported a
@@ -3024,13 +3414,19 @@ pub trait BlobStoreClient: Send + Sync {
 
 /// Computes the canonical relative payload path for a locator. The adapter
 /// must still prove component/reparse containment before using it.
+///
+/// The path is derived from the full residency identity, not from the content
+/// digest alone: equal bytes in different residency domains map to different
+/// residency-key directories and never co-reside.
 pub fn payload_path(locator: &BlobLocator) -> Result<WorkScopePath, BlobError> {
     locator.validate()?;
     let hash = locator.hash.as_str();
+    let residency_digest = locator.residency_key_digest()?;
     WorkScopePath::new(format!(
-        "objects/g{}/{}/{}.p{}",
+        "objects/g{}/{}/{}/{}.p{}",
         locator.root_generation,
-        &hash[..2],
+        &residency_digest[..2],
+        residency_digest,
         hash,
         locator.path_generation
     ))
@@ -3038,13 +3434,19 @@ pub fn payload_path(locator: &BlobLocator) -> Result<WorkScopePath, BlobError> {
 }
 
 /// Computes the canonical relative metadata path.
+///
+/// Like [`payload_path`], the metadata path is scoped by the full residency
+/// identity so that stored metadata for equal bytes in different domains is a
+/// distinct object.
 pub fn metadata_path(locator: &BlobLocator) -> Result<WorkScopePath, BlobError> {
     locator.validate()?;
     let hash = locator.hash.as_str();
+    let residency_digest = locator.residency_key_digest()?;
     WorkScopePath::new(format!(
-        "objects/g{}/{}/{}.m{}",
+        "objects/g{}/{}/{}/{}.m{}",
         locator.root_generation,
-        &hash[..2],
+        &residency_digest[..2],
+        residency_digest,
         hash,
         locator.path_generation
     ))
@@ -3060,6 +3462,14 @@ mod tests {
         assert!(serde_json::from_str::<BlobHash>("\"AA\"").is_err());
         let malformed = r#"{"hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","root_generation":0,"path_generation":1}"#;
         assert!(serde_json::from_str::<BlobLocator>(malformed).is_err());
+        // s-04-v1 legacy shape: valid generations but no residency identity.
+        // Rejected; migration is explicit re-encrypt-copy, never silent upgrade.
+        let legacy = r#"{"hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","root_generation":7,"path_generation":1}"#;
+        let legacy_error = match serde_json::from_str::<BlobLocator>(legacy) {
+            Ok(_) => panic!("legacy locator without residency must be rejected"),
+            Err(error) => format!("{error:?}"),
+        };
+        assert!(legacy_error.contains("residency"));
     }
 
     #[test]
@@ -3070,13 +3480,53 @@ mod tests {
 
     #[test]
     fn generated_paths_are_component_relative() {
-        let locator = BlobLocator {
-            hash: match BlobHash::new("a".repeat(64)) {
-                Ok(hash) => hash,
-                Err(error) => panic!("hash: {error}"),
+        let digest = match BlobHash::new("a".repeat(64)) {
+            Ok(hash) => hash,
+            Err(error) => panic!("hash: {error}"),
+        };
+        let residency = ObjectResidencyKey {
+            scope_domain_id: match BlobId::new("scope-a") {
+                Ok(id) => id,
+                Err(error) => panic!("scope: {error}"),
             },
+            access_domain_id: match BlobId::new("access-a") {
+                Ok(id) => id,
+                Err(error) => panic!("access: {error}"),
+            },
+            confidentiality_domain_id: match BlobId::new("conf-a") {
+                Ok(id) => id,
+                Err(error) => panic!("conf: {error}"),
+            },
+            encryption_key_domain_id: match BlobId::new("key-lineage-a") {
+                Ok(id) => id,
+                Err(error) => panic!("key: {error}"),
+            },
+            retention_domain_id: match BlobId::new("retention-a") {
+                Ok(id) => id,
+                Err(error) => panic!("retention: {error}"),
+            },
+            erasure_domain_id: match BlobId::new("erasure-a") {
+                Ok(id) => id,
+                Err(error) => panic!("erasure: {error}"),
+            },
+            content_digest: VersionedContentDigest {
+                algorithm: match BlobId::new("blake3") {
+                    Ok(id) => id,
+                    Err(error) => panic!("algorithm: {error}"),
+                },
+                version: 1,
+                digest: digest.clone(),
+            },
+        };
+        let locator = BlobLocator {
+            hash: digest,
+            residency,
             root_generation: 7,
             path_generation: 1,
+        };
+        let residency_digest = match locator.residency_key_digest() {
+            Ok(digest) => digest,
+            Err(error) => panic!("residency digest: {error}"),
         };
         let path = match payload_path(&locator) {
             Ok(path) => path,
@@ -3084,12 +3534,22 @@ mod tests {
         };
         assert_eq!(
             path.normalized_identity(),
-            format!("objects/g7/aa/{}.p1", "a".repeat(64))
+            format!(
+                "objects/g7/{}/{}/{}.p1",
+                &residency_digest[..2],
+                residency_digest,
+                "a".repeat(64)
+            )
         );
         assert_eq!(
             path.adapter_input().containment,
             eliot_platform::AdapterContainment::ReparseAndProveWithinWorkScope
         );
+        let metadata = match metadata_path(&locator) {
+            Ok(path) => path,
+            Err(error) => panic!("metadata path: {error}"),
+        };
+        assert_ne!(path.normalized_identity(), metadata.normalized_identity());
     }
 
     #[test]
