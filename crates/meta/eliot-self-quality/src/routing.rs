@@ -21,7 +21,7 @@
 //!    [`SelfQualityHandoffOwner::ConfigurationAssistance679`].
 //! 9. Dimension [`SelfQualityDimension::LearningQuality`] /
 //!    [`SelfQualityDimension::ContextQuality`], or status
-//!    [`DimensionStatus::Inconclusive`] =>
+//!    [`DimensionStatus::Inconclusive`] / [`DimensionStatus::Missing`] =>
 //!    [`SelfQualityHandoffOwner::Instrumentation`].
 //! 10. Otherwise => [`SelfQualityHandoffOwner::DevelopmentDiagnosis675`].
 //!
@@ -81,6 +81,7 @@ pub fn route_owner(observation: &SelfQualityObservation) -> SelfQualityHandoffOw
     if core.dimension == SelfQualityDimension::LearningQuality
         || core.dimension == SelfQualityDimension::ContextQuality
         || core.status == DimensionStatus::Inconclusive
+        || core.status == DimensionStatus::Missing
     {
         return SelfQualityHandoffOwner::Instrumentation;
     }

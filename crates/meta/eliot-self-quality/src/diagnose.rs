@@ -474,26 +474,8 @@ fn candidate_outcome(
             handoff_index += 1;
         }
     }
-    for rollup in rollups {
-        if rollup.status != DimensionStatus::Inconclusive {
-            continue;
-        }
-        let tag = format!("{:?}", rollup.dimension);
-        let observations = dimension_refs(input, rollup.dimension, None);
-        handoffs.push(make_handoff(
-            &format!("handoff-{}-{handoff_index}", tag.to_ascii_lowercase()),
-            SelfQualityHandoffOwner::Instrumentation,
-            &observations,
-            &[format!("problem:{tag}")],
-            &observations,
-            &observations,
-            &[format!("applies:{tag}")],
-            rollup.priority,
-            &["ceiling:privacy-authority-proof".to_owned()],
-            &[format!("invalidate:{}", input.input_ref)],
-        )?);
-        handoff_index += 1;
-    }
+    let instr_handoffs = candidate_instrumentation_handoffs(input, rollups, handoff_index)?;
+    handoffs.extend(instr_handoffs);
     handoffs.sort_by(|left, right| left.handoff_ref.cmp(&right.handoff_ref));
 
     let candidate = SelfQualityDiagnosisCandidate {
@@ -512,6 +494,53 @@ fn candidate_outcome(
     };
     validate_candidate_against_input(&candidate, input).map_err(SelfQualityError::Contract)?;
     Ok(Some(SelfQualityOutcome::Candidate(candidate)))
+}
+
+/// Bounded inert instrumentation handoffs for Inconclusive and Missing dimensions.
+fn candidate_instrumentation_handoffs(
+    input: &SelfQualityInput,
+    rollups: &[DimensionRollup],
+    start_index: u32,
+) -> Result<Vec<SelfQualityHandoff>, SelfQualityError> {
+    let mut handoffs = Vec::new();
+    let mut index = start_index;
+    for rollup in rollups {
+        if rollup.status != DimensionStatus::Inconclusive
+            && rollup.status != DimensionStatus::Missing
+        {
+            continue;
+        }
+        let tag = format!("{:?}", rollup.dimension);
+        let observations = dimension_refs(input, rollup.dimension, None);
+        let missing = dimension_refs(
+            input,
+            rollup.dimension,
+            if rollup.status == DimensionStatus::Missing {
+                Some(DimensionStatus::Missing)
+            } else {
+                Some(DimensionStatus::Inconclusive)
+            },
+        );
+        let priority = if rollup.priority == Priority::None {
+            Priority::Low
+        } else {
+            rollup.priority
+        };
+        handoffs.push(make_handoff(
+            &format!("handoff-{}-{index}", tag.to_ascii_lowercase()),
+            SelfQualityHandoffOwner::Instrumentation,
+            &observations,
+            &[format!("problem:{tag}")],
+            &observations,
+            &missing,
+            &[format!("applies:{tag}")],
+            priority,
+            &["ceiling:privacy-authority-proof".to_owned()],
+            &[format!("invalidate:{}", input.input_ref)],
+        )?);
+        index += 1;
+    }
+    Ok(handoffs)
 }
 
 /// One handoff for a failing dimension, routed over its first failing observation.
@@ -534,7 +563,15 @@ fn failing_handoff(
         vec![format!("problem:{tag}")]
     };
     let missing = if owner == SelfQualityHandoffOwner::Instrumentation {
-        dimension_refs(input, rollup.dimension, Some(DimensionStatus::Inconclusive))
+        let mut m = dimension_refs(input, rollup.dimension, Some(DimensionStatus::Inconclusive));
+        m.extend(dimension_refs(
+            input,
+            rollup.dimension,
+            Some(DimensionStatus::Missing),
+        ));
+        m.sort();
+        m.dedup();
+        m
     } else {
         Vec::new()
     };
