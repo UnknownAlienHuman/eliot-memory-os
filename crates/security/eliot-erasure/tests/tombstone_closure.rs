@@ -1,11 +1,10 @@
-//! Erasure-owned fail-closed behaviour slice for #688.
+//! Tombstone-first adversarial closure for #1130.
 //!
-//! Three end-to-end protocol proofs inside `eliot-erasure` only: durable
-//! intent precedes every destructive call (and a missing intent capability
-//! means zero destructive calls), exact replay returns the original receipt
-//! with no second dispatch, and one unknown/incomplete surface blocks a
-//! `Purged` result. Live Store producers land later; these tests aggregate
-//! typed outcomes passed in, never store-surface writes.
+//! Proves the tombstone lifecycle inside `eliot-erasure` only: the durable
+//! tombstone commits before every destructive call, tombstone failure yields
+//! zero destructive effects, a missing tombstone (or missing capability)
+//! fails closed, replay without the tombstone refuses, and a changed scope
+//! under one operation identity conflicts instead of overwriting.
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -51,13 +50,9 @@ fn test_fence() -> StateFence {
 fn test_request(request_id: &str) -> ErasureRequest {
     ErasureRequest {
         request_id: request_id.to_string(),
-        subject_ref: "subject:purge-protocol".to_string(),
-        scope: "scope:purge-protocol".to_string(),
-        locations: vec![
-            PurgeLocation::CanonicalPayload,
-            PurgeLocation::Blob,
-            PurgeLocation::Index,
-        ],
+        subject_ref: "subject:tombstone-closure".to_string(),
+        scope: "scope:tombstone-closure".to_string(),
+        locations: vec![PurgeLocation::CanonicalPayload, PurgeLocation::Blob],
         expected_revision: 7,
         approval_digest: "ab".repeat(32),
         evidence: Vec::new(),
@@ -71,8 +66,6 @@ struct RecordingBackend {
     tombstones: BTreeMap<String, Tombstone>,
     completions: BTreeMap<String, ErasureReceipt>,
     call_order: Vec<String>,
-    scripted_outcomes: Option<Vec<SurfaceOutcome>>,
-    fail_record: bool,
     fail_tombstone: bool,
 }
 
@@ -84,8 +77,6 @@ impl RecordingBackend {
             tombstones: BTreeMap::new(),
             completions: BTreeMap::new(),
             call_order: Vec::new(),
-            scripted_outcomes: None,
-            fail_record: false,
             fail_tombstone: false,
         }
     }
@@ -124,9 +115,6 @@ impl ErasureBackend for RecordingBackend {
 
     fn record_intent(&mut self, intent: ErasureIntent) -> Result<IntentReceipt, ErasureError> {
         self.call_order.push("record_intent".to_string());
-        if self.fail_record {
-            return Err(ErasureError::UnsupportedIntent);
-        }
         intent.validate()?;
         if let Some(existing) = self.intents.get(&intent.operation_id) {
             if *existing != intent {
@@ -177,8 +165,7 @@ impl ErasureBackend for RecordingBackend {
         if intent.request_digest != receipt.request_digest {
             return Err(ErasureError::IntentConflict);
         }
-        self.completions
-            .insert(receipt.request_id.clone(), receipt);
+        self.completions.insert(receipt.request_id.clone(), receipt);
         Ok(())
     }
 
@@ -187,13 +174,17 @@ impl ErasureBackend for RecordingBackend {
         if intent.validate().is_err() {
             return Err(BackendError("invalid intent at dispatch".to_string()));
         }
-        if let Some(scripted) = &self.scripted_outcomes {
-            return Ok(scripted.clone());
+        if !self.tombstones.contains_key(&intent.operation_id) {
+            return Err(BackendError(
+                "erase dispatched without a tombstone".to_string(),
+            ));
         }
         Ok(intent
             .locations
             .iter()
-            .map(|location| SurfaceOutcome::Purged { location: *location })
+            .map(|location| SurfaceOutcome::Purged {
+                location: *location,
+            })
             .collect())
     }
 
@@ -206,18 +197,35 @@ impl ErasureBackend for RecordingBackend {
     }
 }
 
-/// Backend that never overrides the intent capability: the trait defaults
-/// must refuse, proving missing-capability handling without a stub success.
-struct NoIntentBackend {
+/// Backend that never overrides tombstone capability: trait defaults refuse.
+struct NoTombstoneBackend {
     revision: u64,
+    intents: BTreeMap<String, ErasureIntent>,
     erase_calls: usize,
 }
 
-impl ErasureBackend for NoIntentBackend {
+impl ErasureBackend for NoTombstoneBackend {
     type Error = BackendError;
 
     fn current_revision(&self, _subject_ref: &str, _scope: &str) -> Result<u64, Self::Error> {
         Ok(self.revision)
+    }
+
+    fn completed_receipt(
+        &self,
+        _operation_id: &str,
+    ) -> Result<Option<ErasureReceipt>, ErasureError> {
+        Ok(None)
+    }
+
+    fn record_intent(&mut self, intent: ErasureIntent) -> Result<IntentReceipt, ErasureError> {
+        intent.validate()?;
+        self.intents
+            .insert(intent.operation_id.clone(), intent.clone());
+        Ok(IntentReceipt {
+            operation_id: intent.operation_id.clone(),
+            request_digest: intent.request_digest.clone(),
+        })
     }
 
     fn erase(&mut self, intent: &ErasureIntent) -> Result<Vec<SurfaceOutcome>, Self::Error> {
@@ -225,7 +233,9 @@ impl ErasureBackend for NoIntentBackend {
         Ok(intent
             .locations
             .iter()
-            .map(|location| SurfaceOutcome::Purged { location: *location })
+            .map(|location| SurfaceOutcome::Purged {
+                location: *location,
+            })
             .collect())
     }
 
@@ -234,134 +244,114 @@ impl ErasureBackend for NoIntentBackend {
     }
 }
 
-// WORK_UNIT_CASE: 688/1
+// WORK_UNIT_CASE: 1130/tombstone-first
 #[test]
-fn durable_intent_precedes_every_destructive_call() {
-    let request = test_request("request-688-intent");
+fn tombstone_commits_before_every_destructive_call() {
+    let request = test_request("request-1130-tombstone-order");
     let mut backend = RecordingBackend::ready();
     let receipt = match execute(&mut backend, &request) {
         Ok(receipt) => receipt,
         Err(error) => panic!("clean execute succeeds: {error:?}"),
     };
-    assert_eq!(receipt.request_id, "request-688-intent");
-    let Some(record_position) = backend
+    assert!(!receipt.purge.tombstone_digest.is_empty());
+    let stored = backend
+        .tombstones
+        .get("request-1130-tombstone-order")
+        .unwrap_or_else(|| panic!("tombstone persisted"));
+    assert_eq!(stored.tombstone_digest, receipt.purge.tombstone_digest);
+    let tombstone_pos = backend
         .call_order
         .iter()
-        .position(|call| call.as_str() == "record_intent")
-    else {
-        panic!("intent recorded: {:?}", backend.call_order)
-    };
-    let Some(erase_position) = backend
+        .position(|call| call.as_str() == "commit_tombstone")
+        .unwrap_or_else(|| panic!("tombstone committed: {:?}", backend.call_order));
+    let erase_pos = backend
         .call_order
         .iter()
         .position(|call| call.as_str() == "erase")
-    else {
-        panic!("erase dispatched: {:?}", backend.call_order)
-    };
+        .unwrap_or_else(|| panic!("erase dispatched: {:?}", backend.call_order));
     assert!(
-        record_position < erase_position,
-        "intent {record_position} precedes erase {erase_position}"
+        tombstone_pos < erase_pos,
+        "tombstone {tombstone_pos} precedes erase {erase_pos}"
     );
-
-    let refused = test_request("request-688-no-intent");
-    let mut failing = RecordingBackend {
-        fail_record: true,
-        ..RecordingBackend::ready()
-    };
-    match execute(&mut failing, &refused) {
-        Ok(_) => panic!("missing intent capability must refuse"),
-        Err(ErasureError::UnsupportedIntent) => {},
-        Err(other) => panic!("typed intent refusal, got: {other:?}"),
-    }
-    assert_eq!(failing.erase_calls(), 0);
-    assert_eq!(failing.ledger_appends(), 0);
-
-    let missing = test_request("request-688-default-refusal");
-    let mut missing_capability = NoIntentBackend {
-        revision: 7,
-        erase_calls: 0,
-    };
-    match execute(&mut missing_capability, &missing) {
-        Ok(_) => panic!("default intent capability must refuse"),
-        Err(ErasureError::UnsupportedIntent) => {},
-        Err(other) => panic!("default refusal is typed, got: {other:?}"),
-    }
-    assert_eq!(missing_capability.erase_calls, 0);
 }
 
-// WORK_UNIT_CASE: 688/14
+// WORK_UNIT_CASE: 1130/tombstone-failure
 #[test]
-fn exact_replay_returns_original_without_second_dispatch() {
-    let request = test_request("request-688-replay");
+fn tombstone_failure_yields_zero_destructive_effects() {
+    let request = test_request("request-1130-tombstone-fails");
+    let mut backend = RecordingBackend {
+        fail_tombstone: true,
+        ..RecordingBackend::ready()
+    };
+    match execute(&mut backend, &request) {
+        Ok(_) => panic!("tombstone failure must refuse"),
+        Err(ErasureError::UnsupportedIntent) => {}
+        Err(other) => panic!("typed tombstone refusal, got: {other:?}"),
+    }
+    assert_eq!(backend.erase_calls(), 0);
+    assert_eq!(backend.ledger_appends(), 0);
+    assert!(backend.completions.is_empty());
+}
+
+// WORK_UNIT_CASE: 1130/missing-tombstone
+#[test]
+fn missing_tombstone_capability_fails_closed() {
+    let request = test_request("request-1130-no-tombstone-cap");
+    let mut backend = NoTombstoneBackend {
+        revision: 7,
+        intents: BTreeMap::new(),
+        erase_calls: 0,
+    };
+    match execute(&mut backend, &request) {
+        Ok(_) => panic!("missing tombstone capability must refuse"),
+        Err(ErasureError::UnsupportedIntent) => {}
+        Err(other) => panic!("default tombstone refusal is typed, got: {other:?}"),
+    }
+    assert_eq!(backend.erase_calls, 0);
+}
+
+// WORK_UNIT_CASE: 1130/replay-tombstone
+#[test]
+fn replay_without_tombstone_fails_closed() {
+    let request = test_request("request-1130-replay-tombstone");
     let mut backend = RecordingBackend::ready();
     let first = match execute(&mut backend, &request) {
         Ok(receipt) => receipt,
         Err(error) => panic!("first execute succeeds: {error:?}"),
     };
     assert_eq!(backend.erase_calls(), 1);
-    assert_eq!(backend.ledger_appends(), 1);
-
-    let second = match execute(&mut backend, &request) {
-        Ok(receipt) => receipt,
-        Err(error) => panic!("replay returns the original: {error:?}"),
-    };
-    assert_eq!(first, second);
-    assert_eq!(first.request_digest, second.request_digest);
-    assert_eq!(first.purge.purge_id, second.purge.purge_id);
+    backend.tombstones.clear();
+    match execute(&mut backend, &request) {
+        Ok(_) => panic!("replay without tombstone must refuse"),
+        Err(ErasureError::MissingTombstone) => {}
+        Err(other) => panic!("replay tombstone refusal is typed, got: {other:?}"),
+    }
     assert_eq!(
         backend.erase_calls(),
         1,
-        "replay must not dispatch destructively again"
+        "refused replay must not dispatch again"
     );
-    assert_eq!(backend.ledger_appends(), 1);
+    assert_eq!(
+        first.purge.state,
+        eliot_security_contracts::PurgeState::Purged
+    );
 }
 
-// WORK_UNIT_CASE: 688/18
+// WORK_UNIT_CASE: 1130/identity-conflict
 #[test]
-fn unknown_or_incomplete_surface_blocks_purged_result() {
-    let request = test_request("request-688-unknown");
-    let mut unknown = RecordingBackend {
-        scripted_outcomes: Some(vec![
-            SurfaceOutcome::Purged {
-                location: PurgeLocation::CanonicalPayload,
-            },
-            SurfaceOutcome::Unknown {
-                location: PurgeLocation::Blob,
-            },
-            SurfaceOutcome::Purged {
-                location: PurgeLocation::Index,
-            },
-        ]),
-        ..RecordingBackend::ready()
-    };
-    match execute(&mut unknown, &request) {
-        Ok(_) => panic!("unknown surface must block a purged result"),
-        Err(ErasureError::UnknownSurface) => {},
-        Err(other) => panic!("unknown refusal is typed, got: {other:?}"),
+fn changed_scope_under_same_identity_conflicts() {
+    let mut backend = RecordingBackend::ready();
+    let first = test_request("request-1130-identity");
+    match execute(&mut backend, &first) {
+        Ok(_) => {}
+        Err(error) => panic!("first execute succeeds: {error:?}"),
     }
-    assert_eq!(unknown.ledger_appends(), 0);
-    assert!(unknown.completions.is_empty());
-
-    let partial_request = test_request("request-688-incomplete");
-    let mut incomplete = RecordingBackend {
-        scripted_outcomes: Some(vec![
-            SurfaceOutcome::Purged {
-                location: PurgeLocation::CanonicalPayload,
-            },
-            SurfaceOutcome::Incomplete {
-                location: PurgeLocation::Blob,
-            },
-            SurfaceOutcome::Purged {
-                location: PurgeLocation::Index,
-            },
-        ]),
-        ..RecordingBackend::ready()
-    };
-    match execute(&mut incomplete, &partial_request) {
-        Ok(_) => panic!("incomplete surface must block a purged result"),
-        Err(ErasureError::IncompleteErasure) => {},
-        Err(other) => panic!("incomplete refusal is typed, got: {other:?}"),
+    let mut second = test_request("request-1130-identity");
+    second.locations.push(PurgeLocation::Index);
+    match execute(&mut backend, &second) {
+        Ok(_) => panic!("changed scope under one identity must conflict"),
+        Err(ErasureError::IntentConflict) => {}
+        Err(other) => panic!("identity conflict is typed, got: {other:?}"),
     }
-    assert_eq!(incomplete.ledger_appends(), 0);
-    assert!(incomplete.completions.is_empty());
+    assert_eq!(backend.erase_calls(), 1);
 }

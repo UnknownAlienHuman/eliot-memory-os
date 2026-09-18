@@ -201,6 +201,40 @@ pub struct IntentReceipt {
     pub request_digest: String,
 }
 
+/// Durable non-revivable tombstone committed BEFORE any destructive dispatch.
+///
+/// The tombstone carries no erased content: only the operation/request
+/// digests, subject/scope refs, revision and fence. The orchestration commits
+/// it after [`ErasureIntent`] and before [`ErasureBackend::erase`]; a missing
+/// or mismatched tombstone fails closed with
+/// [`ErasureError::MissingTombstone`] and zero destructive calls.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Tombstone {
+    pub operation_id: String,
+    pub request_digest: String,
+    pub tombstone_digest: String,
+    pub subject_ref: String,
+    pub scope: String,
+    pub revision: u64,
+    pub state_fence: StateFence,
+}
+
+impl Tombstone {
+    /// Fail-closed validation of the durable tombstone.
+    pub fn validate(&self) -> Result<(), ErasureError> {
+        text(&self.operation_id, "tombstone.operation_id")?;
+        digest(&self.request_digest, "tombstone.request_digest")?;
+        digest(&self.tombstone_digest, "tombstone.tombstone_digest")?;
+        text(&self.subject_ref, "tombstone.subject_ref")?;
+        text(&self.scope, "tombstone.scope")?;
+        self.state_fence
+            .validate()
+            .map_err(|_| ErasureError::InvalidField("tombstone.state_fence"))?;
+        Ok(())
+    }
+}
+
 /// Per-surface erasure outcome, supplied as a typed value.
 ///
 /// Live Store/provider owners will produce these per surface in their own
@@ -296,11 +330,15 @@ pub fn aggregate_surface_outcomes(
 /// that state.
 ///
 /// Protocol order, enforced by [`execute`]: `current_revision`, then
-/// `completed_receipt` (replay check), then `record_intent` (durable intent),
-/// then `erase` (destructive dispatch under the recorded intent), then the
-/// fail-closed outcome aggregation, then `append_purge_ledger` (only on
-/// aggregate success), then `note_completed` (seals the replayable result).
-/// No destructive call happens before `record_intent` succeeds.
+/// `completed_receipt` (replay check, tombstone-verified), then
+/// `record_intent` (durable intent), then `commit_tombstone` (durable
+/// non-revivable tombstone), then `load_tombstone` verification, then `erase`
+/// (destructive dispatch under the recorded intent and verified tombstone),
+/// then the fail-closed outcome aggregation, then `append_purge_ledger` (only
+/// on aggregate success), then `note_completed` (seals the replayable result).
+/// No destructive call happens before both `record_intent` and
+/// `commit_tombstone` succeed, and a missing tombstone fails closed with
+/// [`ErasureError::MissingTombstone`].
 pub trait ErasureBackend {
     type Error: std::error::Error + Send + Sync + 'static;
 
@@ -315,6 +353,26 @@ pub trait ErasureBackend {
     /// twice with identical content is idempotent, while the same id with
     /// different content must yield [`ErasureError::IntentConflict`].
     fn record_intent(&mut self, _intent: ErasureIntent) -> Result<IntentReceipt, ErasureError> {
+        Err(ErasureError::UnsupportedIntent)
+    }
+
+    /// Commits the durable tombstone before any destructive call.
+    ///
+    /// The default refuses with [`ErasureError::UnsupportedIntent`] so a
+    /// backend without tombstone durability fails closed with zero
+    /// destructive calls. Implementations must persist the tombstone under
+    /// its stable `operation_id`; committing the same tombstone twice with
+    /// identical content is idempotent, while the same id with different
+    /// content must yield [`ErasureError::IntentConflict`].
+    fn commit_tombstone(&mut self, _tombstone: Tombstone) -> Result<Tombstone, ErasureError> {
+        Err(ErasureError::UnsupportedIntent)
+    }
+
+    /// Loads the durable tombstone for fail-closed verification.
+    ///
+    /// The default refuses with [`ErasureError::UnsupportedIntent`]; a
+    /// backend that cannot prove the tombstone must not erase.
+    fn load_tombstone(&self, _operation_id: &str) -> Result<Option<Tombstone>, ErasureError> {
         Err(ErasureError::UnsupportedIntent)
     }
 
@@ -364,12 +422,16 @@ pub struct ErasureReceipt {
 
 /// Executes one exact-fence erasure against the already-authoritative backend.
 ///
-/// Intent and replay identity are durable before destructive dispatch:
-/// the intent is built and recorded first, an exact replay of a completed
-/// intent returns the original receipt with no second destructive dispatch,
-/// and only then does erasure fan out under the recorded intent. Per-surface
-/// outcomes aggregate fail-closed — one incomplete or unknown surface
-/// prevents a `Purged` result and no ledger entry is appended on refusal.
+/// Tombstone-first lifecycle: the intent is built and recorded, then the
+/// durable tombstone is committed and load-verified, and only then does
+/// erasure fan out under the recorded intent and verified tombstone. An exact
+/// replay of a completed intent returns the original receipt with no second
+/// destructive dispatch after verifying the tombstone still binds the same
+/// digest. Tombstone commit failure or a missing/mismatched tombstone yields
+/// [`ErasureError::MissingTombstone`] (or the backend refusal) with zero
+/// destructive calls. Per-surface outcomes aggregate fail-closed — one
+/// incomplete or unknown surface prevents a `Purged` result and no ledger
+/// entry is appended on refusal.
 pub fn execute<B: ErasureBackend>(
     backend: &mut B,
     request: &ErasureRequest,
@@ -387,27 +449,61 @@ pub fn execute<B: ErasureBackend>(
     }
 
     let intent = ErasureIntent::new(request, &request_digest)?;
+    let computed_tombstone_digest = tombstone_digest(request, &request_digest);
 
     if let Some(prior) = backend.completed_receipt(&intent.operation_id)? {
         if prior.request_digest != request_digest {
             return Err(ErasureError::IntentConflict);
+        }
+        let stored = backend.load_tombstone(&intent.operation_id)?;
+        let Some(stored) = stored else {
+            return Err(ErasureError::MissingTombstone);
+        };
+        if stored.tombstone_digest != computed_tombstone_digest
+            || stored.tombstone_digest != prior.purge.tombstone_digest
+        {
+            return Err(ErasureError::MissingTombstone);
         }
         return Ok(prior);
     }
 
     backend.record_intent(intent.clone())?;
 
+    let candidate = Tombstone {
+        operation_id: intent.operation_id.clone(),
+        request_digest: request_digest.clone(),
+        tombstone_digest: computed_tombstone_digest.clone(),
+        subject_ref: request.subject_ref.clone(),
+        scope: request.scope.clone(),
+        revision,
+        state_fence: request.state_fence.clone(),
+    };
+    candidate.validate()?;
+    let committed = backend.commit_tombstone(candidate)?;
+    if committed.tombstone_digest != computed_tombstone_digest
+        || committed.operation_id != intent.operation_id
+        || committed.request_digest != request_digest
+    {
+        return Err(ErasureError::MissingTombstone);
+    }
+    let stored = backend.load_tombstone(&intent.operation_id)?;
+    let Some(stored) = stored else {
+        return Err(ErasureError::MissingTombstone);
+    };
+    if stored != committed {
+        return Err(ErasureError::MissingTombstone);
+    }
+
     let outcomes = backend
         .erase(&intent)
         .map_err(|error| ErasureError::Backend(Box::new(error)))?;
     let purged_locations = aggregate_surface_outcomes(&intent.locations, &outcomes)?;
-    let tombstone_digest = tombstone_digest(request, &request_digest);
     let purge = PurgeLedgerEntry {
         purge_id: format!("purge-{request_digest}"),
         subject_ref: request.subject_ref.clone(),
         scope: request.scope.clone(),
         purged_locations,
-        tombstone_digest,
+        tombstone_digest: committed.tombstone_digest.clone(),
         state: PurgeState::Purged,
         state_fence: request.state_fence.clone(),
         revision,
@@ -497,6 +593,8 @@ pub enum ErasureError {
     UnknownSurface,
     #[error("erasure backend does not implement durable intent")]
     UnsupportedIntent,
+    #[error("erasure tombstone is missing or does not bind this operation")]
+    MissingTombstone,
     #[error("erasure intent conflicts with the already-recorded operation")]
     IntentConflict,
     #[error("generated purge ledger entry is invalid")]

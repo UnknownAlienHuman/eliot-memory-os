@@ -422,6 +422,38 @@ impl ChildEffectId {
             effect_kind,
         })
     }
+
+    /// Derives exactly one child effect identity per frozen snapshot target.
+    ///
+    /// The caller supplies one [`EffectKind`] per target in snapshot order, so
+    /// this constructor enforces the one-identity-per-target denominator
+    /// without inventing a location-to-kind catalogue: byte deletion, key
+    /// destruction, canonical redaction, index/cache removal, influence
+    /// revocation and external withdrawal stay distinct because the caller
+    /// names a distinct kind per target. A length mismatch, an invalid
+    /// snapshot, or an ordinal overflow fails closed; the returned vector is
+    /// in target order so reconciliation retries the same
+    /// `(erasure_id, target_ordinal)` without duplication or skipping.
+    pub fn for_snapshot(
+        snapshot: &ErasureScopeSnapshot,
+        kinds: &[EffectKind],
+    ) -> Result<Vec<Self>, ScopeError> {
+        snapshot.validate()?;
+        if kinds.len() != snapshot.targets.len() {
+            return Err(ScopeError::EffectDenominatorMismatch);
+        }
+        let mut effects = Vec::with_capacity(snapshot.targets.len());
+        for (ordinal, kind) in kinds.iter().enumerate() {
+            let target_ordinal: u32 =
+                u32::try_from(ordinal).map_err(|_| ScopeError::EffectDenominatorMismatch)?;
+            effects.push(Self::for_target(
+                &snapshot.erasure_id,
+                target_ordinal,
+                *kind,
+            )?);
+        }
+        Ok(effects)
+    }
 }
 
 /// Frozen erasure scope for one admitted operation (contract shapes only).
@@ -611,6 +643,8 @@ pub enum ScopeError {
     IdentityConflict,
     #[error("erasure identity comparison across different identities")]
     DifferentIdentity,
+    #[error("erasure child-effect denominator does not match the frozen targets")]
+    EffectDenominatorMismatch,
 }
 
 #[cfg(test)]
@@ -892,6 +926,57 @@ mod tests {
         };
         assert_eq!(first, replay);
         assert!(ChildEffectId::for_target("", 0, EffectKind::KeyDestruction).is_err());
+    }
+
+    #[test]
+    fn derives_one_child_effect_per_frozen_target() {
+        let snapshot = test_snapshot();
+        let kinds = vec![
+            EffectKind::CanonicalRedaction,
+            EffectKind::IndexCacheRemoval,
+            EffectKind::IndexCacheRemoval,
+            EffectKind::BlobDeletion,
+            EffectKind::KeyDestruction,
+            EffectKind::InfluenceRevocation,
+            EffectKind::InfluenceRevocation,
+            EffectKind::ExternalWithdrawal,
+        ];
+        assert_eq!(kinds.len(), snapshot.targets.len());
+        let effects = match ChildEffectId::for_snapshot(&snapshot, &kinds) {
+            Ok(effects) => effects,
+            Err(error) => panic!("child effects derive: {error:?}"),
+        };
+        assert_eq!(effects.len(), snapshot.targets.len());
+        for (ordinal, (effect, kind)) in effects.iter().zip(kinds.iter()).enumerate() {
+            let expected_ordinal = match u32::try_from(ordinal) {
+                Ok(expected_ordinal) => expected_ordinal,
+                Err(error) => panic!("target ordinal fits u32: {error:?}"),
+            };
+            assert_eq!(effect.erasure_id, snapshot.erasure_id);
+            assert_eq!(effect.target_ordinal, expected_ordinal);
+            assert_eq!(effect.effect_kind, *kind);
+        }
+        let replay = match ChildEffectId::for_snapshot(&test_snapshot(), &kinds) {
+            Ok(replay) => replay,
+            Err(error) => panic!("child effect replay derives: {error:?}"),
+        };
+        assert_eq!(effects, replay);
+    }
+
+    #[test]
+    fn rejects_child_effect_denominator_mismatch() {
+        let snapshot = test_snapshot();
+        let short = vec![EffectKind::BlobDeletion];
+        assert_eq!(
+            ChildEffectId::for_snapshot(&snapshot, &short),
+            Err(ScopeError::EffectDenominatorMismatch)
+        );
+        let mut oversized = vec![EffectKind::BlobDeletion; snapshot.targets.len()];
+        oversized.push(EffectKind::KeyDestruction);
+        assert_eq!(
+            ChildEffectId::for_snapshot(&snapshot, &oversized),
+            Err(ScopeError::EffectDenominatorMismatch)
+        );
     }
 
     fn bound_request(snapshot: &ErasureScopeSnapshot) -> ErasureRequest {
