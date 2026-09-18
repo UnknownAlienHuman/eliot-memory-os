@@ -108,6 +108,33 @@ fn is_semantic_conflict(error: &str) -> bool {
         .any(|marker| error.contains(marker))
 }
 
+/// Provider prose narrating an aborted transaction's cascade, never an
+/// independent statement outcome.
+///
+/// Observed on a real fence race (S-CONC-TX, issue #989): the fence `THROW`
+/// aborts the transaction, and the provider reports one allocation marker
+/// plus this deterministic fallout for every unexecuted statement —
+/// `"The query was not executed due to a failed/cancelled transaction"`
+/// and `"Cannot COMMIT: the transaction was aborted due to a prior
+/// error"`. Those lines assert non-execution, so they carry no outcome
+/// evidence of their own: filtering them before classification neither
+/// invents contention nor hides a possible commit. A genuine transport
+/// ambiguity (`"connection reset during COMMIT"`, timeouts, duplicate
+/// creates) never matches these markers and still resolves unknown.
+const TRANSACTION_ABORT_FALLOUT_MARKERS: &[&str] = &[
+    "was not executed due to a failed transaction",
+    "was not executed due to a cancelled transaction",
+    "the transaction was aborted due to a prior error",
+];
+
+/// Reports whether a provider statement error is aborted-transaction
+/// cascade narration rather than an executed statement's outcome.
+fn is_abort_fallout(error: &str) -> bool {
+    TRANSACTION_ABORT_FALLOUT_MARKERS
+        .iter()
+        .any(|marker| error.contains(marker))
+}
+
 /// Classifies one canonical-transaction statement-error set without wildcard
 /// collapse (S-CONC-TX, issue #989).
 ///
@@ -115,21 +142,34 @@ fn is_semantic_conflict(error: &str) -> bool {
 /// names are stale regardless of fence movement. Pure fence/sequence
 /// movement is transient allocation contention on proved-not-committed
 /// ground (the fence CAS precedes the receipt create in statement order, so
-/// its abort commits nothing). Anything else — transport prose, duplicate
-/// receipt creates, malformed responses — is an unknown outcome resolved by
-/// exact receipt reconciliation, never retried blindly and never reported as
-/// a semantic conflict. Provider diagnostic text is matched only against
-/// these exact closed markers; no trustworthy code is inferred from
-/// arbitrary prose.
+/// its abort commits nothing) — but ONLY when every executed statement
+/// error is a recognized allocation marker: a mixed allocation-plus-unknown
+/// set is an unknown outcome resolved by exact receipt reconciliation,
+/// never retried blindly and never reported as a semantic conflict.
+/// Aborted-transaction cascade narration is filtered first (see
+/// [`TRANSACTION_ABORT_FALLOUT_MARKERS`]): it asserts non-execution, so it
+/// is non-evidence, not ambiguity. A cascade with no executed error behind
+/// it resolves unknown — never contention, which requires positive fence
+/// evidence. Provider diagnostic text is matched only against these exact
+/// closed markers; no trustworthy code is inferred from arbitrary prose.
 fn classify_transaction_errors(errors: &[String], operation_id: &str) -> AdapterError {
+    debug_assert!(
+        !errors.is_empty(),
+        "classification runs only on a non-empty statement-error set"
+    );
     if errors.iter().any(|error| is_semantic_conflict(error)) {
         return AdapterError::ProviderConflict;
     }
-    if errors.iter().any(|error| is_allocation_conflict(error)) {
+    let executed: Vec<&String> = errors
+        .iter()
+        .filter(|error| !is_abort_fallout(error))
+        .collect();
+    if !executed.is_empty() && executed.iter().all(|error| is_allocation_conflict(error)) {
         return AdapterError::AllocationContention {
             operation_id: operation_id.to_owned(),
         };
     }
+
     AdapterError::UnknownOutcome {
         operation_id: operation_id.to_owned(),
     }
@@ -1276,6 +1316,85 @@ mod allocation_classification_tests {
                 unexpected => panic!("unrecognized error must stay unknown, got {unexpected:?}"),
             }
         }
+    }
+
+    #[test]
+    fn mixed_fence_plus_unknown_stays_unknown_never_retries() {
+        // S-CONC-TX rework (issue #989): retry eligibility is exclusive.
+        // An error set pairing a recognized allocation marker with any
+        // unrecognized observation is an unknown outcome — the provider
+        // result is no longer proved-not-committed, so it must reconcile
+        // by receipt identity instead of retrying as contention.
+        for marker in [
+            "THROW 'canonical_fence_cas_conflict'",
+            "THROW 'canonical_fence_create_conflict'",
+        ] {
+            for unknown in ["connection reset during COMMIT".to_owned(), String::new()] {
+                let errors = vec![marker.to_owned(), unknown];
+                match classify_transaction_errors(&errors, "op-mixed") {
+                    AdapterError::UnknownOutcome { operation_id } => {
+                        assert_eq!(operation_id, "op-mixed");
+                    }
+                    unexpected => {
+                        panic!("mixed fence-plus-unknown set must stay unknown, got {unexpected:?}")
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fence_race_with_abort_cascade_stays_contention() {
+        // S-CONC-TX rework (issue #989): the exact provider shape of a
+        // genuine fence race. The fence `THROW` aborts the transaction and
+        // every unexecuted statement reports deterministic cascade
+        // narration; that narration asserts non-execution, so the set
+        // still proves allocation movement on proved-not-committed ground
+        // and the bounded retry may absorb it.
+        let errors = vec![
+            "\"The query was not executed due to a failed transaction\"".to_owned(),
+            "\"An error occurred: canonical_fence_cas_conflict\"".to_owned(),
+            "\"The query was not executed due to a cancelled transaction\"".to_owned(),
+            "\"Cannot COMMIT: the transaction was aborted due to a prior error\"".to_owned(),
+        ];
+        match classify_transaction_errors(&errors, "op-race") {
+            AdapterError::AllocationContention { operation_id } => {
+                assert_eq!(operation_id, "op-race");
+            }
+            unexpected => panic!("fence race with cascade must contend, got {unexpected:?}"),
+        }
+    }
+
+    #[test]
+    fn bare_abort_cascade_without_executed_error_stays_unknown() {
+        // Cascade narration alone proves no fence movement: contention
+        // requires a positive allocation marker, so this resolves unknown.
+        let errors = vec![
+            "\"The query was not executed due to a cancelled transaction\"".to_owned(),
+            "\"Cannot COMMIT: the transaction was aborted due to a prior error\"".to_owned(),
+        ];
+        match classify_transaction_errors(&errors, "op-cascade") {
+            AdapterError::UnknownOutcome { operation_id } => {
+                assert_eq!(operation_id, "op-cascade");
+            }
+            unexpected => panic!("bare cascade must stay unknown, got {unexpected:?}"),
+        }
+    }
+
+    #[test]
+    fn semantic_marker_wins_through_abort_cascade() {
+        // A semantic trigger behind the same cascade is deterministic, not
+        // contention: stale heads never retry.
+        let errors = vec![
+            "\"An error occurred: revision_head_cas_conflict\"".to_owned(),
+            "\"The query was not executed due to a cancelled transaction\"".to_owned(),
+            "\"Cannot COMMIT: the transaction was aborted due to a prior error\"".to_owned(),
+        ];
+        assert_eq!(
+            classify_transaction_errors(&errors, "op-semantic-cascade"),
+            AdapterError::ProviderConflict,
+            "semantic marker wins through the cascade"
+        );
     }
 
     #[test]

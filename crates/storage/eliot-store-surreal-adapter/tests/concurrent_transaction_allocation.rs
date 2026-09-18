@@ -2,8 +2,8 @@
 //!
 //! Proves the minimal provider transaction/allocation correction against the
 //! merged #987 bounded session set: disjoint admitted transitions stay
-//! correct when provider sessions overlap, without a second
-//! application-global write gate and without changing Store transaction
+//! correct when provider sessions overlap, without an application-global
+//! write gate on the allocation path and without changing Store transaction
 //! semantics. The deterministic unguarded race repro and the pooled-session
 //! overlap proofs execute as inline tests beside the seam
 //! (`apply::concurrent_allocation_tests`); this target binds the twenty
@@ -42,6 +42,12 @@
 //! 20. source/API/diff guard excludes dropped optimistic guards, non-atomic
 //!    receipts, hidden sequence reinterpretation, blind retry, process-local
 //!    authority, or unrelated changes.
+//!
+//! Rework proofs beyond the denominator (no denominator change):
+//! `production_path_disjoint_writers_overlap_and_conflicts_fail_closed`
+//! races two disjoint writers through the public production entry from a
+//! barrier-synchronized start, and Case 3 derives its stale expectation
+//! from the baseline receipt's observed pre-commit head value.
 //!
 //! Provider evidence (recorded on failure output and in the work item): the
 //! pinned `surreal.exe` path plus its SHA-256, the server version handshake
@@ -478,10 +484,20 @@ async fn disjoint_commits_carry_unique_allocation_and_exact_per_scope_heads() {
 #[tokio::test]
 async fn revision_head_checks_remain_inside_the_provider_transaction() {
     let harness = Harness::fresh("03").await;
-    harness
+    let baseline = harness
         .commit("op-989-case03-a", "scope-989-a", "subject-989-03-a")
         .await
         .expect("baseline commit");
+    // The stale expectation is the baseline's own observed pre-commit head
+    // value: the baseline advanced the head by exactly one, so that value
+    // is provably superseded rather than merely plausibly old.
+    assert_eq!(baseline.revision_before_after.len(), 1);
+    let stale_revision = baseline.revision_before_after[0].before;
+    assert_eq!(
+        baseline.revision_before_after[0].after,
+        stale_revision + 1,
+        "baseline advanced the head by exactly one"
+    );
     let (ctx, transition) = admitted("op-989-case03-stale", "scope-989-a", "subject-989-03-stale");
     let stale = CanonicalStoreClient::apply_prepared(
         harness.adapter(),
@@ -489,7 +505,7 @@ async fn revision_head_checks_remain_inside_the_provider_transaction() {
         transition,
         vec![RevisionHeadExpectation {
             key: RevisionKey::new("scope:scope-989-a").expect("revision key"),
-            expected_revision: 1,
+            expected_revision: stale_revision,
             state_fence: fence(),
         }],
         vec![],
@@ -1238,17 +1254,133 @@ async fn real_provider_run_records_sessions_outcomes_and_progress() {
     harness.cleanup().await;
 }
 
+// PROOF (rework, beyond the 20-case denominator): production-path overlap.
+// Two independent disjoint-scope transitions race through the public
+// production entry (facade lane, no process-global gate) from a
+// barrier-synchronized start: both commit with unique allocations over
+// overlapping wall-clock intervals, and a genuine same-scope stale-head
+// conflict still fails closed with no allocation consumed.
+#[tokio::test]
+async fn production_path_disjoint_writers_overlap_and_conflicts_fail_closed() {
+    use std::sync::Arc;
+
+    let harness = Harness::fresh("21").await;
+    let (ctx_a, transition_a) = admitted("op-989-case21-a", "scope-989-a", "subject-989-21-a");
+    let (ctx_b, transition_b) = admitted("op-989-case21-b", "scope-989-b", "subject-989-21-b");
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let barrier_a = Arc::clone(&barrier);
+    let barrier_b = Arc::clone(&barrier);
+    let adapter = harness.adapter();
+    let (outcome_a, outcome_b) = tokio::join!(
+        async move {
+            barrier_a.wait().await;
+            let entered = Instant::now();
+            let receipt =
+                CanonicalStoreClient::apply_prepared(adapter, &ctx_a, transition_a, vec![], vec![])
+                    .await;
+            (entered, Instant::now(), receipt)
+        },
+        async move {
+            barrier_b.wait().await;
+            let entered = Instant::now();
+            let receipt =
+                CanonicalStoreClient::apply_prepared(adapter, &ctx_b, transition_b, vec![], vec![])
+                    .await;
+            (entered, Instant::now(), receipt)
+        }
+    );
+    let (entered_a, finished_a, receipt_a) = outcome_a;
+    let (entered_b, finished_b, receipt_b) = outcome_b;
+    let receipt_a = receipt_a.expect("production writer A commits");
+    let receipt_b = receipt_b.expect("production writer B commits");
+    assert!(
+        entered_a <= finished_b && entered_b <= finished_a,
+        "production writers overlapped in time"
+    );
+    let mut committed = BTreeSet::new();
+    committed.insert(commit_sequence(&receipt_a));
+    committed.insert(commit_sequence(&receipt_b));
+    assert_eq!(
+        committed,
+        BTreeSet::from([
+            "commit-sequence-0000000000000001".to_owned(),
+            "commit-sequence-0000000000000002".to_owned(),
+        ]),
+        "overlapping production writers share no allocation"
+    );
+    for receipt in [&receipt_a, &receipt_b] {
+        receipt.validate().expect("receipt validates");
+    }
+    println!(
+        "SCONC-989 case=21 overlap_a_ms={} overlap_b_ms={} committed={:?}",
+        finished_a.duration_since(entered_a).as_millis(),
+        finished_b.duration_since(entered_b).as_millis(),
+        committed
+    );
+    // Genuine conflict on the same production path still fails closed: the
+    // stale expectation is writer A's own observed pre-commit head value,
+    // provably superseded by exactly one.
+    assert_eq!(receipt_a.revision_before_after.len(), 1);
+    let stale_revision = receipt_a.revision_before_after[0].before;
+    let (ctx_s, transition_s) = admitted("op-989-case21-stale", "scope-989-a", "subject-989-21-s");
+    let refused = CanonicalStoreClient::apply_prepared(
+        harness.adapter(),
+        &ctx_s,
+        transition_s,
+        vec![RevisionHeadExpectation {
+            key: RevisionKey::new("scope:scope-989-a").expect("revision key"),
+            expected_revision: stale_revision,
+            state_fence: fence(),
+        }],
+        vec![],
+    )
+    .await;
+    assert!(
+        matches!(refused, Err(StoreError::RevisionConflict)),
+        "genuine same-scope conflict fails closed, got {refused:?}"
+    );
+    // The refused attempt consumed no allocation: the next commit still
+    // takes exactly sequence 3 and exactly three receipts are durable.
+    let next = harness
+        .commit("op-989-case21-next", "scope-989-c", "subject-989-21-next")
+        .await
+        .expect("next commit");
+    assert_eq!(commit_sequence(&next), "commit-sequence-0000000000000003");
+    assert_eq!(harness.snapshot().await.receipts.len(), 3);
+    harness.cleanup().await;
+}
+
 // WORK_UNIT_CASE: 989/20
 #[test]
 fn source_api_diff_guard_excludes_out_of_scope_changes() {
     let descriptor = descriptor();
     assert_eq!(descriptor["denominator"], 20);
     let apply = source("src/apply.rs");
-    // The default production normal-write guard is retained; the scheduler
-    // is not activated here and no second global gate appears.
+    // Rework shape: the normal-write allocation loop (fence/head reads,
+    // allocation attempts, retries, canonical transaction) runs without
+    // the process-global gate; the gate survives only on the migration and
+    // erasure-dispatch entrypoints — exactly two sites — and no second
+    // global gate appears. The scheduler is not activated here.
     assert!(
         apply.contains("let _guard = adapter.write_lock.lock().await;"),
-        "production normal-write guard retained"
+        "migration and erasure guards retained"
+    );
+    assert_eq!(
+        apply
+            .matches("let _guard = adapter.write_lock.lock().await;")
+            .count(),
+        2,
+        "no guard site remains on the normal-write allocation path"
+    );
+    // The bounded retry re-enters only through the narrow allocation
+    // recompute, never through full planning.
+    assert!(
+        apply.contains("recompute_allocation"),
+        "retry loop recomputes allocation only"
+    );
+    assert!(
+        source("src/plan.rs").contains("pub(crate) fn recompute_allocation"),
+        "narrow allocation recompute is the sole retry planner"
     );
     assert!(
         !apply.contains("WriteScheduler") && !apply.contains("write_scheduler"),

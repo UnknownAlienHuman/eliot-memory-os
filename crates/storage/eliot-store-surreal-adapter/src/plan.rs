@@ -179,7 +179,7 @@ pub(crate) fn plan_apply_with_payload_authority(
     transition.validate()?;
     let records = payload_authority_records(transition, authorities)?;
     let commit_sequence = next_commit_sequence;
-    let committed_at = format!("commit-sequence-{next_commit_sequence:016}");
+    let committed_at = committed_at_for(next_commit_sequence);
     let next_commit_sequence =
         checked_increment(next_commit_sequence, "commit.sequence", "sequence overflow")?;
 
@@ -257,6 +257,51 @@ pub(crate) fn plan_apply_with_payload_authority(
         payload_authority: records,
         evidence_records,
     })
+}
+
+/// Renders the commit instant bound to one allocated commit sequence.
+///
+/// Single owner for the allocation-derived instant format: full planning
+/// and allocation-only recomputation both bind through here, so a retry
+/// can never drift from the planned instant representation.
+fn committed_at_for(next_commit_sequence: u64) -> String {
+    format!("commit-sequence-{next_commit_sequence:016}")
+}
+
+/// Recomputes only the allocation-derived outputs of an established
+/// semantic plan (S-CONC-TX, issue #989).
+///
+/// Sole owner of every allocative field: `commit_sequence`, the derived
+/// `committed_at` instant, `next_commit_sequence`, the outbox record
+/// sequences plus `next_outbox_sequence`, and the evidence capture order.
+/// The caller's [`build_receipt`] then rebinds the receipt fields that
+/// carry those allocation values. Every semantic field — event and
+/// command identities, payloads and digests, projections, relations,
+/// revision deltas, ordering-head results, semantic receipt bindings — is
+/// preserved byte-for-byte from `semantic_plan`, never re-derived: the
+/// bounded allocation retry loop re-enters through here and never through
+/// the full planner, so retry planning cannot duplicate or drift from
+/// full-plan logic by construction.
+pub(crate) fn recompute_allocation(
+    semantic_plan: &ApplyPlan,
+    next_commit_sequence: u64,
+    next_outbox_sequence: u64,
+) -> Result<ApplyPlan, StoreError> {
+    let mut plan = semantic_plan.clone();
+    plan.commit_sequence = next_commit_sequence;
+    plan.committed_at = committed_at_for(next_commit_sequence);
+    plan.next_commit_sequence =
+        checked_increment(next_commit_sequence, "commit.sequence", "sequence overflow")?;
+    let mut outbox_cursor = next_outbox_sequence;
+    for record in &mut plan.outbox_records {
+        record.sequence = outbox_cursor;
+        outbox_cursor = checked_increment(outbox_cursor, "outbox.sequence", "sequence overflow")?;
+    }
+    plan.next_outbox_sequence = outbox_cursor;
+    for evidence in &mut plan.evidence_records {
+        evidence.commit_sequence = next_commit_sequence;
+    }
+    Ok(plan)
 }
 
 /// Validates per-operation payload authorities against the transition's
@@ -1035,6 +1080,94 @@ mod tests {
         assert_eq!(
             stale.revision_before_after, fresh.revision_before_after,
             "revision deltas do not move with allocation"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn allocation_recompute_preserves_semantic_material_and_advances_sequences()
+    -> Result<(), StoreError> {
+        // S-CONC-TX rework (issue #989, pure, no live DB): the bounded
+        // retry re-enters ONLY through `recompute_allocation`. Recomputing
+        // the established semantic plan against the moved fence must equal
+        // a full plan built at the moved allocation, field for field, while
+        // the pre-retry semantic material stays byte-identical.
+        let (context, transition) = fixture()?;
+        let authorities = vec![None; transition.named_operations.len()];
+        let semantic = select_apply_plan(&transition, &authorities, &[], &[], 1, 1)?;
+        let recomputed = recompute_allocation(&semantic, 2, 4)?;
+        let fresh = select_apply_plan(&transition, &authorities, &[], &[], 2, 4)?;
+        // Allocative outputs track the moved fence.
+        assert_eq!(recomputed.commit_sequence, 2);
+        assert_eq!(recomputed.committed_at, "commit-sequence-0000000000000002");
+        assert_eq!(recomputed.next_commit_sequence, 3);
+        assert_eq!(recomputed.next_outbox_sequence, 5);
+        assert_eq!(recomputed.outbox_records.len(), 1);
+        assert_eq!(recomputed.outbox_records[0].sequence, 4);
+        assert_eq!(recomputed.evidence_records.len(), 1);
+        assert_eq!(recomputed.evidence_records[0].commit_sequence, 2);
+        // Identical to the full plan at the same allocation.
+        assert_eq!(
+            format!("{recomputed:?}"),
+            format!("{fresh:?}"),
+            "recompute equals a full plan at the moved allocation"
+        );
+        // Semantic material is unchanged from the pre-retry plan.
+        assert_eq!(
+            recomputed.event_ids, semantic.event_ids,
+            "event identity is semantic, not allocative"
+        );
+        assert_eq!(
+            recomputed.command_ids, semantic.command_ids,
+            "command identity is semantic, not allocative"
+        );
+        assert_eq!(
+            recomputed.revision_before_after, semantic.revision_before_after,
+            "revision deltas do not move with allocation"
+        );
+        assert_eq!(
+            recomputed.next_revision_heads, semantic.next_revision_heads,
+            "revision heads do not move with allocation"
+        );
+        assert_eq!(
+            recomputed.next_ordering_heads, semantic.next_ordering_heads,
+            "ordering heads do not move with allocation"
+        );
+        assert_eq!(
+            format!("{:?}", recomputed.projection_records),
+            format!("{:?}", semantic.projection_records),
+            "projections do not move with allocation"
+        );
+        assert_eq!(
+            format!("{:?}", recomputed.payload_authority),
+            format!("{:?}", semantic.payload_authority),
+            "payload authority is semantic, not allocative"
+        );
+        for (recomputed_evidence, semantic_evidence) in recomputed
+            .evidence_records
+            .iter()
+            .zip(semantic.evidence_records.iter())
+        {
+            assert_eq!(recomputed_evidence.subject, semantic_evidence.subject);
+            assert_eq!(recomputed_evidence.parameters, semantic_evidence.parameters);
+            assert_eq!(recomputed_evidence.bytes, semantic_evidence.bytes);
+            assert_eq!(recomputed_evidence.digest_hex, semantic_evidence.digest_hex);
+        }
+        // The receipt rebinds the recomputed allocation values.
+        let receipt = build_receipt(&context, &transition, &recomputed)?;
+        assert_eq!(
+            receipt.committed_at.as_deref(),
+            Some("commit-sequence-0000000000000002")
+        );
+        validate_store_receipt_envelope(&context, &transition, &receipt)?;
+        // Allocation bounds fail closed here exactly as in full planning.
+        assert!(
+            recompute_allocation(&semantic, u64::MAX, 1).is_err(),
+            "commit allocation overflow fails closed"
+        );
+        assert!(
+            recompute_allocation(&semantic, 1, u64::MAX).is_err(),
+            "outbox allocation overflow fails closed"
         );
         Ok(())
     }

@@ -580,6 +580,16 @@ pub(crate) async fn apply_prepared(
 /// retries. The bound absorbs racing disjoint-scope writers without an
 /// unbounded CAS spin; exhaustion reports exact allocation contention, never
 /// a false semantic conflict and never an unknown outcome.
+///
+/// S-CONC-TX rework: this production entry holds no process-global write
+/// guard across the allocation loop below. Independent transitions overlap
+/// their fence/head reads, allocation attempts, and bounded retries; the
+/// canonical transaction's fence CAS plus its revision and ordering head
+/// predicates arbitrate shared sequence allocation, so disjoint scopes
+/// commit concurrently while genuine conflicts fail closed. Each provider
+/// RPC stays atomic on its own session socket. The process-global write
+/// lock now guards only the migration and erasure-dispatch entrypoints,
+/// never normal-write allocation network I/O.
 const MAX_ALLOCATION_RETRIES: u32 = 7;
 
 pub(crate) async fn apply_prepared_with_authority(
@@ -594,8 +604,6 @@ pub(crate) async fn apply_prepared_with_authority(
 
     let db = client(adapter).await?;
     ensure_ready(adapter, db).await?;
-
-    let _guard = adapter.write_lock.lock().await;
 
     apply_with_retry(
         adapter,
@@ -612,15 +620,14 @@ pub(crate) async fn apply_prepared_with_authority(
 
 /// Explicit test/private allocation seam (S-CONC-TX, issue #989).
 ///
-/// Runs the exact production attempt loop without the process-global write
-/// guard so overlapping transaction paths execute against real separate
-/// sessions: pre-transaction reads already fan out over the admitted #987
-/// pooled read lane, and the canonical transaction rides the pooled
-/// normal-write lane (one checked-out session per concurrent task). The
-/// default production normal-write guard stays in
-/// [`apply_prepared_with_authority`] until the separate complete-scope
-/// runtime integration is accepted; this seam never disables safety globally
-/// and never compiles outside `#[cfg(test)]`.
+/// Runs the exact production attempt loop over the admitted #987 pooled
+/// read lane for pre-transaction reads and the pooled normal-write lane
+/// for the canonical transaction (one checked-out session per concurrent
+/// task). Since the rework, the production entry above is equally
+/// unguarded and arbitrates through the same fence CAS and head
+/// predicates; this seam never disables safety globally, never compiles
+/// outside `#[cfg(test)]`, and remains as additional pooled-lane
+/// coverage — never as the only concurrent path.
 #[cfg(test)]
 pub(crate) async fn apply_prepared_without_write_guard(
     adapter: &SurrealStoreAdapter,
@@ -652,10 +659,11 @@ pub(crate) async fn apply_prepared_without_write_guard(
 ///
 /// Allocation lives in the canonical transaction: every attempt re-reads the
 /// fence and the union heads, re-verifies every declared expected revision
-/// and ordering head plus the fence, recomputes only allocation-dependent
-/// plan values under the unchanged semantic input/scope/fence/expected-head
-/// contract, and commits event/projection/relation/head/outbox/idempotency/
-/// receipt effects atomically with the fence CAS.
+/// and ordering head plus the fence, recomputes only the allocation-derived
+/// plan values through [`plan::recompute_allocation`] under the unchanged
+/// semantic input/scope/fence/expected-head contract, and commits
+/// event/projection/relation/head/outbox/idempotency/receipt effects
+/// atomically with the fence CAS.
 ///
 /// Retry discipline: only a provider-classified allocation contention
 /// (`AllocationContention`, proved-not-committed: the fence CAS precedes the
@@ -683,6 +691,12 @@ async fn apply_with_retry(
 ) -> Result<WriteReceipt, AdapterError> {
     let mut retries = 0u32;
     let mut erasure_dispatched = false;
+    // The full semantic plan is established once, on the first attempt.
+    // Allocation-contention retries re-enter ONLY through
+    // `plan::recompute_allocation` below, never through the full planner,
+    // so retry planning owns allocation-derived values alone and cannot
+    // duplicate or drift from semantic logic by construction.
+    let mut semantic_plan: Option<plan::ApplyPlan> = None;
     loop {
         match read_idempotency(db, &adapter.config, ctx, &transition).await? {
             Idempotency::Replay(receipt) => {
@@ -737,14 +751,20 @@ async fn apply_with_retry(
             erasure_dispatched = true;
         }
 
-        let plan = plan::select_apply_plan(
-            &transition,
-            authorities,
-            &current_revisions,
-            &current_orderings,
-            next_commit_sequence,
-            next_outbox_sequence,
-        )?;
+        let plan = if let Some(semantic) = &semantic_plan {
+            plan::recompute_allocation(semantic, next_commit_sequence, next_outbox_sequence)?
+        } else {
+            let full = plan::select_apply_plan(
+                &transition,
+                authorities,
+                &current_revisions,
+                &current_orderings,
+                next_commit_sequence,
+                next_outbox_sequence,
+            )?;
+            semantic_plan = Some(full.clone());
+            full
+        };
         let receipt = build_receipt(ctx, &transition, &plan)?;
 
         match write_transaction(
@@ -1830,7 +1850,8 @@ mod erasure_execution_tests {
 /// S-CONC-TX (issue #989) allocation tests.
 ///
 /// Pure pins cover the bounded retry contract; live proofs exercise the
-/// explicit test/private seam against real separate pooled sessions on an
+/// production entry (facade lane, no process-global guard) alongside the
+/// explicit test/private seam against real provider sessions on an
 /// isolated provider. No production database, no user credentials.
 #[cfg(test)]
 mod concurrent_allocation_tests {
@@ -1848,10 +1869,14 @@ mod concurrent_allocation_tests {
     #[cfg(windows)]
     mod live_seam_tests {
         #![allow(clippy::expect_used, clippy::print_stdout)]
+        // Live allocation proofs necessarily hold admitted transitions
+        // across awaits while concurrent writers overlap; same rationale as
+        // the `concurrent_transaction_allocation` target allowance.
+        #![allow(clippy::large_futures)]
 
         use super::super::{
-            apply_prepared_without_write_guard, atomic_write, build_receipt, client, read_fence,
-            validate_receipt_identity,
+            apply_prepared_with_authority, apply_prepared_without_write_guard, atomic_write,
+            build_receipt, client, read_fence, validate_receipt_identity,
         };
         use crate::client::session_pool::SessionRole;
         use crate::config::{ClientSetLimits, SurrealAdapterConfig};
@@ -1875,7 +1900,7 @@ mod concurrent_allocation_tests {
         use std::time::Duration;
         use tokio::net::TcpStream;
         use tokio::process::Command;
-        use tokio::time::{Instant, sleep};
+        use tokio::time::{Instant, sleep, timeout};
 
         const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
 
@@ -2385,6 +2410,91 @@ mod concurrent_allocation_tests {
                 heads.get("scope-989-b"),
                 "symmetric disjoint commits advance symmetric per-scope heads"
             );
+            harness.cleanup().await;
+        }
+
+        #[tokio::test]
+        async fn production_apply_commits_while_global_guard_is_held() {
+            let mut harness = Harness::start().await;
+            harness.migrate().await;
+            let adapter = harness.adapter();
+            // Discriminator: hold the process-global write guard for the
+            // whole concurrent section. If production allocation still rode
+            // under it, both writers below would block until this guard
+            // drops and the bounded wait would time out; with fence-CAS
+            // plus head-predicate arbitration they commit while it is held.
+            let held = adapter.write_lock.lock().await;
+            let prepared_a = admitted("op-989-prod-a", "scope-989-a", "subject-989-a");
+            let prepared_b = admitted("op-989-prod-b", "scope-989-b", "subject-989-b");
+            let authorities_a = vec![None; prepared_a.transition.named_operations.len()];
+            let authorities_b = vec![None; prepared_b.transition.named_operations.len()];
+            let (receipt_a, receipt_b) = timeout(Duration::from_mins(2), async {
+                tokio::join!(
+                    apply_prepared_with_authority(
+                        adapter,
+                        &prepared_a.ctx,
+                        prepared_a.transition.clone(),
+                        Vec::new(),
+                        Vec::new(),
+                        &authorities_a,
+                    ),
+                    apply_prepared_with_authority(
+                        adapter,
+                        &prepared_b.ctx,
+                        prepared_b.transition.clone(),
+                        Vec::new(),
+                        Vec::new(),
+                        &authorities_b,
+                    )
+                )
+            })
+            .await
+            .expect("production writers commit while the global guard is held elsewhere");
+            let receipt_a = receipt_a.expect("production writer A commits");
+            let receipt_b = receipt_b.expect("production writer B commits");
+            // Interleaving-insensitive: the allocated pair is exactly {1,2}
+            // whatever the commit order was.
+            let mut committed: Vec<_> = [
+                receipt_a.committed_at.clone(),
+                receipt_b.committed_at.clone(),
+            ]
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .expect("both receipts carry commit instants");
+            committed.sort();
+            assert_eq!(
+                committed,
+                vec![
+                    "commit-sequence-0000000000000001".to_owned(),
+                    "commit-sequence-0000000000000002".to_owned(),
+                ],
+                "production disjoint commits hold unique valid allocations"
+            );
+            assert_ne!(
+                receipt_a.outbox_refs, receipt_b.outbox_refs,
+                "outbox allocation is unique per commit"
+            );
+            for receipt in [&receipt_a, &receipt_b] {
+                validate_store_receipt_envelope_for_test(receipt);
+            }
+            drop(held);
+            let snapshot = adapter
+                .recovery(StoreRecoveryRequest {
+                    contract_version: CONTRACT_VERSION,
+                    state_fence: fence(),
+                    records: Vec::new(),
+                    include_receipts: true,
+                    include_jobs: false,
+                })
+                .await
+                .expect("recovery snapshot");
+            snapshot.validate().expect("snapshot validates");
+            assert_eq!(
+                snapshot.receipts.len(),
+                2,
+                "exactly the two production effect sets are durable"
+            );
+            println!("SCONC-989 production-guard-held committed={committed:?} receipts=2");
             harness.cleanup().await;
         }
 
