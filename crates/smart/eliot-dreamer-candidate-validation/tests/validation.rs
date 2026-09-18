@@ -1,7 +1,6 @@
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence, sha256_hex};
-use std::num::NonZeroU64;
 use eliot_dreamer_candidate_validation::{
     CandidateValidationOutcome, RejectionCode, ValidationPolicy, validate_grounded_dream_draft_at,
 };
@@ -12,6 +11,7 @@ use eliot_dreamer_contracts::{
     PRESERVATION_DIMENSIONS, PreservationDimension, PreservationReport, Requester, RequesterOrigin,
     SourceDisposition, SupportState,
 };
+use std::num::NonZeroU64;
 
 const MAX: u64 = 1_048_576;
 
