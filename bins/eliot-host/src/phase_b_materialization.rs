@@ -30,6 +30,39 @@ mod rollback_backup;
 pub(super) use rollback_backup::{phase_b_remove_rollback_backup, phase_b_restore_or_remove};
 use rollback_backup::{phase_b_rollback_path, phase_b_write_rollback_backup};
 
+// F-LOG-HOST-2 (#893) inner-phase observations for Agent Bridge and Phase-B
+// file publication.
+//
+// Through the #889 facade only
+// (`super::host_diagnostics::observe_entrypoint_with_detail`); the Event Log
+// seam stays typed-Unavailable
+// (`super::windows_event_log::event_log_sink_status`), never implemented here
+// (#984 still open).
+//
+// Observation-only contract (mirrors the #891 `lib.rs` helpers): every call
+// projects a boundary already decided by the semantic owner. Arguments are
+// static literals only — no digests, identities, bytes, paths, SIDs, or error
+// text are formatted, so no secret material can cross (I15.4) and no extra
+// evaluation runs on the semantic path. Sink outcome never alters result,
+// order, state, receipt, or cleanup. There is no mutable global dedup cache
+// and no terminal emission here: one terminal per failed operation is owned by
+// the single outermost contour (`lib.rs` `HostTerminalGuard` / Unknown
+// terminals), while these inner phases correlate by stage order only
+// (case 22).
+#[cfg(windows)]
+fn phase_b_materialization_note_event_log_unavailable() {
+    let _ = super::windows_event_log::event_log_sink_status();
+}
+
+#[cfg(windows)]
+fn phase_b_materialization_observe(detail: &str) {
+    phase_b_materialization_note_event_log_unavailable();
+    super::host_diagnostics::observe_entrypoint_with_detail(
+        super::host_diagnostics::EntrypointStage::ScmDispatch,
+        detail,
+    );
+}
+
 #[cfg(windows)]
 pub(super) struct AgentBridgePreparedMaterialization {
     pub platform_prepared: PlatformAgentBridgeStagePrepared,
@@ -116,6 +149,8 @@ pub(super) fn prepare_agent_bridge_materialization(
     ),
     HostError,
 > {
+    // WORK_UNIT_CASE: 893/3 — Agent Bridge stage preparation requested.
+    phase_b_materialization_observe("host.phase-b-bridge prepare requested");
     let installation_root = launch.runtime_state_roots.installation_root.clone();
     let root = ProtectedRootLease::open_existing(Path::new(installation_root.as_str())).map_err(
         |error| {
@@ -153,6 +188,9 @@ pub(super) fn prepare_agent_bridge_materialization(
         launch.generation.clone(),
     )
     .map_err(HostError::Installation)?;
+    // WORK_UNIT_CASE: 893/3 — Agent Bridge stage prepared; distinct from pair
+    // publication below.
+    phase_b_materialization_observe("host.phase-b-bridge prepare staged");
     Ok((root, platform, installation))
 }
 
@@ -227,6 +265,9 @@ pub(super) fn publish_agent_bridge_pair(
     allowed_profile_digests: &[&PlatformHandle],
     allowed_declaration_digests: &[&PlatformHandle],
 ) -> Result<(), HostError> {
+    // WORK_UNIT_CASE: 893/4 — Agent Bridge pair publication requested;
+    // observed commit is recorded only after exact readback below.
+    phase_b_materialization_observe("host.phase-b-bridge publish requested");
     let binding = &materialization.binding;
     let profile_path = Path::new(binding.profile_path.as_str());
     let declaration_path = Path::new(binding.declaration_path.as_str());
@@ -255,7 +296,11 @@ pub(super) fn publish_agent_bridge_pair(
         allowed_declaration_digests,
         "Agent Bridge client declaration",
     )?;
-    verify_agent_bridge_pair_readback(profile, portable_root, &materialization.binding)
+    verify_agent_bridge_pair_readback(profile, portable_root, &materialization.binding)?;
+    // WORK_UNIT_CASE: 893/4 — pair publication observed committed by exact
+    // readback; the request above stays distinct.
+    phase_b_materialization_observe("host.phase-b-bridge publish observed commit");
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -283,6 +328,9 @@ pub(super) fn verify_agent_bridge_pair_readback(
             )));
         }
     }
+    // WORK_UNIT_CASE: 893/4 — pair readback is exact against the durable
+    // binding; classification only, no publication here.
+    phase_b_materialization_observe("host.phase-b-bridge pair readback exact");
     Ok(())
 }
 
@@ -318,6 +366,9 @@ pub(super) fn open_agent_bridge_final_lease(
     binding: &AgentBridgePhaseBBinding,
     approved_user_sid: &str,
 ) -> Result<eliot_platform_windows::AgentBridgeFinalReadLease, HostError> {
+    // WORK_UNIT_CASE: 893/8 — protected-root final lease requested; the lease
+    // identity is checked against the durable binding below.
+    phase_b_materialization_observe("host.phase-b-bridge final-lease requested");
     let bridge_directory = Path::new(binding.profile_path.as_str())
         .parent()
         .ok_or_else(|| {
@@ -353,6 +404,9 @@ pub(super) fn open_agent_bridge_final_lease(
             "Agent Bridge final ACL readback differs from durable binding".to_owned(),
         ));
     }
+    // WORK_UNIT_CASE: 893/8 — final lease identity verified exact; a mismatch
+    // above emits no verified record.
+    phase_b_materialization_observe("host.phase-b-bridge final-lease verified");
     Ok(lease)
 }
 
@@ -361,6 +415,9 @@ pub(super) fn rehydrate_agent_bridge_binding(
     launch: &eliot_installation::RuntimeLaunchDescriptor,
     binding: &AgentBridgePhaseBBinding,
 ) -> Result<AgentBridgePhaseBBinding, HostError> {
+    // WORK_UNIT_CASE: 893/5 — Agent Bridge binding rehydrate requested;
+    // response-loss replays arrive here without republishing.
+    phase_b_materialization_observe("host.phase-b-bridge rehydrate requested");
     binding.validate().map_err(HostError::Installation)?;
     let expected_paths = eliot_installation::derive_agent_bridge_protected_paths(
         &launch.runtime_state_roots.host_state_root,
@@ -440,6 +497,9 @@ pub(super) fn rehydrate_agent_bridge_binding(
             "Agent Bridge declaration differs from the retained profile".to_owned(),
         ));
     }
+    // WORK_UNIT_CASE: 893/5 — binding rehydrated by exact readback replay;
+    // never a duplicate publication.
+    phase_b_materialization_observe("host.phase-b-bridge rehydrate readback replay");
     Ok(binding.clone())
 }
 
@@ -458,6 +518,9 @@ pub(super) fn agent_bridge_admission_descriptor(
     portable_root: Option<&UserOwnedRootLease>,
     binding: &AgentBridgePhaseBBinding,
 ) -> Result<AgentBridgeAdmissionDescriptor, HostError> {
+    // WORK_UNIT_CASE: 893/6 — admission projection requested; every fact is
+    // read back against the durable binding first, never synthesized.
+    phase_b_materialization_observe("host.phase-b-bridge admission requested");
     let approved_sid = &binding.approved_user_sid;
     let mut lease = open_agent_bridge_final_lease(binding, approved_sid.as_str())?;
     let profile_bytes = lease.read_profile_bytes().map_err(|error| {
@@ -536,7 +599,7 @@ pub(super) fn agent_bridge_admission_descriptor(
         ));
     }
 
-    AgentBridgeAdmissionDescriptor {
+    let descriptor = AgentBridgeAdmissionDescriptor {
         wire_id: AGENT_BRIDGE_ADMISSION_DESCRIPTOR_WIRE_ID.to_owned(),
         wire_version: AGENT_BRIDGE_ADMISSION_DESCRIPTOR_WIRE_VERSION,
         module_id: profile.module_id,
@@ -549,7 +612,11 @@ pub(super) fn agent_bridge_admission_descriptor(
             file_index: profile.executable_identity.file_index,
         },
         generation: profile.module_generation.generation,
-        authority_epoch: profile.module_generation.state_fence.authority_epoch,
+        authority_epoch: profile
+            .module_generation
+            .state_fence
+            .authority_epoch
+            .clone(),
         state_fence: profile.module_generation.state_fence,
         approved_user_sid: profile.approved_user_sid,
         caller_session_policy: match profile.caller_session_policy {
@@ -573,7 +640,11 @@ pub(super) fn agent_bridge_admission_descriptor(
         descriptor_sha256: String::new(),
     }
     .with_computed_digest()
-    .map_err(|error| HostError::ProcessContour(error.to_string()))
+    .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    // WORK_UNIT_CASE: 893/6 — admission projected from exact readback
+    // evidence; identities stay in the receipt, never in diagnostics.
+    phase_b_materialization_observe("host.phase-b-bridge admission projected");
+    Ok(descriptor)
 }
 
 #[cfg(windows)]
@@ -586,6 +657,9 @@ pub(super) fn rehydrate_agent_bridge_binding_from_pending(
     binding: &AgentBridgePreparedBinding,
     prior_binding: Option<&AgentBridgePhaseBBinding>,
 ) -> Result<AgentBridgePhaseBBinding, HostError> {
+    // WORK_UNIT_CASE: 893/5 — pending-bound pair rehydrate requested; the
+    // prepared binding is re-derived and republished only from exact evidence.
+    phase_b_materialization_observe("host.phase-b-bridge rehydrate-pending requested");
     binding.validate().map_err(HostError::Installation)?;
     let (installation_root, platform_prepared, installation_prepared) =
         prepare_agent_bridge_materialization(
@@ -678,7 +752,7 @@ pub(super) fn rehydrate_agent_bridge_binding_from_pending(
     .map_err(|error| {
         HostError::RecoveryRequired(format!("verify Agent Bridge final ACL: {error}"))
     })?;
-    AgentBridgePhaseBBinding::from_prepared_security(
+    let rebound = AgentBridgePhaseBBinding::from_prepared_security(
         binding.clone(),
         source.approved_user_sid.as_str(),
         PlatformHandle::new(host_state_root.to_string_lossy())
@@ -687,7 +761,11 @@ pub(super) fn rehydrate_agent_bridge_binding_from_pending(
             .map_err(|error| HostError::Platform(error.to_string()))?,
         &acl,
     )
-    .map_err(HostError::Installation)
+    .map_err(HostError::Installation)?;
+    // WORK_UNIT_CASE: 893/5 — pending-bound pair rehydrated by exact readback
+    // replay; never a duplicate commit.
+    phase_b_materialization_observe("host.phase-b-bridge rehydrate-pending readback replay");
+    Ok(rebound)
 }
 
 #[cfg(windows)]
@@ -755,6 +833,9 @@ pub(super) fn rollback_agent_bridge_pair(
     portable_root: Option<&UserOwnedRootLease>,
     binding: &AgentBridgePreparedBinding,
 ) -> Result<(), HostError> {
+    // WORK_UNIT_CASE: 893/9 — Agent Bridge pair rollback requested;
+    // restoration is observed only after both leaves are restored below.
+    phase_b_materialization_observe("host.phase-b-bridge rollback requested");
     for (path, expected, label) in [
         (
             Path::new(binding.profile_path.as_str()),
@@ -807,6 +888,9 @@ pub(super) fn rollback_agent_bridge_pair(
             delete_agent_bridge_file_if_digest(profile, portable_root, path, expected, label)?;
         }
     }
+    // WORK_UNIT_CASE: 893/10 — pair restored; a foreign-bytes failure above
+    // emits no restored record and never claims restoration.
+    phase_b_materialization_observe("host.phase-b-bridge rollback restored");
     Ok(())
 }
 
@@ -814,6 +898,8 @@ pub(super) fn rollback_agent_bridge_pair(
 pub(super) fn rollback_agent_bridge_stage(
     stage: &AgentBridgeStagePrepared,
 ) -> Result<(), HostError> {
+    // WORK_UNIT_CASE: 893/9 — executable-stage rollback requested.
+    phase_b_materialization_observe("host.phase-b-bridge stage-rollback requested");
     stage.validate().map_err(HostError::Installation)?;
     let temporary_path = PathBuf::from(stage.temporary_path.as_str());
     let destination_path = PathBuf::from(stage.destination_path.as_str());
@@ -827,7 +913,11 @@ pub(super) fn rollback_agent_bridge_stage(
         &destination_path,
         stage.temporary_identity,
         "published stage",
-    )
+    )?;
+    // WORK_UNIT_CASE: 893/10 — staged executable removed; restoration of a
+    // foreign-identity stage above emits no restored record.
+    phase_b_materialization_observe("host.phase-b-bridge stage-rollback restored");
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -909,6 +999,9 @@ fn phase_b_materialize_file_inner(
         let current = phase_b_lease_bytes(&lease)?;
         let current_digest = format!("{:x}", Sha256::digest(&current));
         if current == desired {
+            // WORK_UNIT_CASE: 893/19 — destination already exact; replay by
+            // readback, never a duplicate publication.
+            phase_b_materialization_observe("host.phase-b-file readback exact");
             return Ok((desired_digest, phase_b_lease_identity(&lease)));
         }
         if !allowed_existing_digests
@@ -945,6 +1038,11 @@ fn phase_b_materialize_file_inner(
     if let Some(previous) = previous_bytes.as_deref() {
         phase_b_write_rollback_backup(profile, portable_root, path, previous, label)?;
     }
+    // Tracks whether the replacement below committed with an Unknown
+    // outcome: the effect stays possible-but-unproven and must retain the
+    // unknown label through readback (cases 5/21). Observation-only; the
+    // publication and reconciliation flow is unchanged.
+    let mut publication_unknown = false;
     match adapter
         .publish_atomic(&relative, desired)
         .map_err(|error| HostError::RecoveryRequired(format!("publish Phase-B {label}: {error}")))?
@@ -966,6 +1064,7 @@ fn phase_b_materialize_file_inner(
                     "Phase-B {label} publication outcome is unknown and readback is not exact"
                 )));
             }
+            publication_unknown = true;
         }
     }
     let lease = phase_b_open_existing(profile, portable_root, path)?;
@@ -974,6 +1073,15 @@ fn phase_b_materialize_file_inner(
         return Err(HostError::RecoveryRequired(format!(
             "Phase-B {label} publication readback is not exact"
         )));
+    }
+    if publication_unknown {
+        // WORK_UNIT_CASE: 893/5 — Unknown outcome with exact readback: the
+        // possible publication is retained as unknown, never promoted.
+        phase_b_materialization_observe("host.phase-b-file unknown readback exact");
+    } else {
+        // WORK_UNIT_CASE: 893/4 — publication observed committed by exact
+        // readback.
+        phase_b_materialization_observe("host.phase-b-file published readback exact");
     }
     Ok((desired_digest, phase_b_lease_identity(&lease)))
 }
@@ -1010,6 +1118,9 @@ pub(super) fn phase_b_template_bytes(
     expected_digest: &PlatformHandle,
     label: &str,
 ) -> Result<Vec<u8>, HostError> {
+    // WORK_UNIT_CASE: 893/7 — immutable Phase-A template requested; a stale
+    // or substituted source fails closed below with no admitted record.
+    phase_b_materialization_observe("host.phase-b-template requested");
     // Phase A's destination is an immutable approved template until Host
     // first publishes the live overlay. Retain the exact bytes in a Host
     // scoped sidecar before that replacement so a fresh Host epoch can
@@ -1058,5 +1169,7 @@ pub(super) fn phase_b_template_bytes(
             "Phase-B {label} retained template readback is not exact"
         )));
     }
+    // WORK_UNIT_CASE: 893/7 — template is the exact immutable Phase-A digest.
+    phase_b_materialization_observe("host.phase-b-template admitted contour");
     Ok(retained_bytes)
 }

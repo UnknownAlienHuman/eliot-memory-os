@@ -1,0 +1,21 @@
+{
+  "profile": "ascii-lowercase-v1",
+  "cases": [
+    { "module_id": "con", "generation": 1, "reason": "ReservedDevice" },
+    { "module_id": "prn", "generation": 1, "reason": "ReservedDevice" },
+    { "module_id": "aux", "generation": 1, "reason": "ReservedDevice" },
+    { "module_id": "nul", "generation": 1, "reason": "ReservedDevice" },
+    { "module_id": "com1", "generation": 1, "reason": "ReservedDevice" },
+    { "module_id": "com9", "generation": 1, "reason": "ReservedDevice" },
+    { "module_id": "lpt1", "generation": 1, "reason": "ReservedDevice" },
+    { "module_id": "lpt9", "generation": 1, "reason": "ReservedDevice" },
+    { "module_id": "con.txt", "generation": 1, "reason": "ReservedDevice" },
+    { "module_id": "aux.json", "generation": 1, "reason": "ReservedDevice" },
+    { "module_id": "еliot", "generation": 1, "reason": "NonCanonical", "note": "Cyrillic ie (U+0435) confusable, refused under ascii-lowercase-v1" },
+    { "module_id": "аgent-bridge", "generation": 1, "reason": "NonCanonical", "note": "Cyrillic a (U+0430) confusable, refused under ascii-lowercase-v1" },
+    { "module_id": "agent-bridgeé", "generation": 1, "reason": "NonCanonical", "note": "Latin e-acute (U+00E9), refused under ascii-lowercase-v1" },
+    { "module_id": "agent.", "generation": 1, "reason": "DotSegment" },
+    { "module_id": "agent ", "generation": 1, "reason": "Whitespace" },
+    { "module_id": "agent bridge", "generation": 1, "reason": "Whitespace" }
+  ]
+}

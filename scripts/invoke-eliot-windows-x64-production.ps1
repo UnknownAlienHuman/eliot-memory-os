@@ -27,7 +27,7 @@ $ErrorActionPreference = 'Stop'
 if ($MyInvocation.InvocationName -eq '.') {
     throw 'the canonical production materialize launcher cannot be dot-sourced'
 }
-$script:ProductionCliSigningScope = 'runtime-materializer-six-plus-cli-pe-roles'
+$script:ProductionCliSigningScope = 'runtime-materializer-nine-plus-cli-pe-roles'
 $script:ProductionCliSigningPolicy = 'authenticode-rfc3161'
 $script:ProductionCliVerifier = 'SignTool(/pa,/all,/v,/tw)+Get-AuthenticodeSignature/WinTrust+RFC3161-CMS'
 $script:ProductionCliCodeSigningEku = '1.3.6.1.5.5.7.3.3'
@@ -42,6 +42,9 @@ $script:ProductionMaterializedRoles = @(
     [pscustomobject]@{ name = 'eliot-store-surreal.exe'; executable = $true }
     [pscustomobject]@{ name = 'surreal.exe'; executable = $true }
     [pscustomobject]@{ name = 'eliotd.exe'; executable = $true }
+    [pscustomobject]@{ name = 'eliot-doctor.exe'; executable = $true }
+    [pscustomobject]@{ name = 'eliot-testd.exe'; executable = $true }
+    [pscustomobject]@{ name = 'eliot-native-worker.exe'; executable = $true }
     [pscustomobject]@{ name = 'generation.json'; executable = $false }
     [pscustomobject]@{ name = 'eliotd-governor.json'; executable = $false }
     [pscustomobject]@{ name = 'eliotd.json'; executable = $false }
@@ -749,7 +752,11 @@ function New-TrustedSignedRolePins([string]$SignedBundlePath) {
                 if ($handle -and -not $handle.IsClosed) { $handle.Dispose() }
             }
         }
-        if ($pins.Count -ne 7) { throw 'trusted release role pin inventory is not exactly seven' }
+        # Part B (#1227): exact nine-plus-CLI PE role count (10).  Bound
+        # dynamically to the finalizer denominator so scripts, manifests and
+        # the aggregator agree; hardcoded seven/nine counts are forbidden.
+        $expectedRoleCount = @(Get-AuthenticodeRoleDefinitions).Count
+        if ($pins.Count -ne $expectedRoleCount) { throw "trusted release role pin inventory is not exactly $expectedRoleCount" }
         return ,@($pins)
     }
     catch {
@@ -761,8 +768,9 @@ function New-TrustedSignedRolePins([string]$SignedBundlePath) {
 }
 
 function Assert-TrustedSignedRolePins([object[]]$Pins, [string]$Purpose) {
-    if (-not $Pins -or $Pins.Count -ne 7) {
-        throw "$Purpose retained signed-role set is incomplete"
+    $expectedRoleCount = @(Get-AuthenticodeRoleDefinitions).Count
+    if (-not $Pins -or $Pins.Count -ne $expectedRoleCount) {
+        throw "$Purpose retained signed-role set is incomplete (expected exactly $expectedRoleCount)"
     }
     foreach ($pin in $Pins) {
         $current = Get-PinnedCliObservation $pin.handle ([string]$pin.path)
@@ -904,13 +912,16 @@ function Get-VerifiedSignedRoleManifestBinding(
 ) {
     $bundle = Assert-ExistingBundleDirectory $SignedBundlePath 'SignedBundle'
     $normalizedRolePath = $RolePath.Replace('\', '/')
+    # Part B (#1227): exact nine-plus-CLI verification size, bound
+    # dynamically to the finalizer denominator (10), not a stale seven.
+    $expectedVerificationRoles = @(Get-AuthenticodeRoleDefinitions).Count
     if (-not $Verification -or [string]$Verification.status -cne 'VERIFIED_SIGNED' -or
         [string]$Verification.verification_kind -cne 'READ_ONLY_SNAPSHOT' -or
         $Verification.durable_install_authority -ne $false -or
         [string]$Verification.signed_scope -cne $script:ProductionCliSigningScope -or
-        [int]$Verification.roles -ne 7 -or
+        [int]$Verification.roles -ne [int]$expectedVerificationRoles -or
         -not (Test-ExactWindowsPath ([string]$Verification.bundle) $bundle)) {
-        throw 'trusted CLI launch requires the exact seven-role public bundle verification result'
+        throw "trusted CLI launch requires the exact $expectedVerificationRoles-role public bundle verification result"
     }
 
     if (-not $PinnedManifestTexts) {
@@ -1022,8 +1033,85 @@ function Get-VerifiedSignedRoleManifestBindings(
                     $ExpectedThumbprint `
                     $ExpectedTimestampUrl))
     }
-    if ($bindings.Count -ne 7) { throw 'signed role binding inventory is not exactly seven' }
+    $expectedBindingCount = @(Get-AuthenticodeRoleDefinitions).Count
+    if ($bindings.Count -ne $expectedBindingCount) { throw "signed role binding inventory is not exactly $expectedBindingCount" }
     return ,@($bindings)
+}
+
+function Assert-ProductionSignedGenerationBinding(
+    [object]$PinnedManifestTexts,
+    [object]$Contract
+) {
+    # Install-time generation/registry/config/schema/rollback compatibility
+    # + stale-generation refusal (Part B, #1227 gaps j/k).  Runs BEFORE any
+    # mutation (before CreateSuspended/ResumeAndWait and before the CLI can
+    # create OutputBundle/Output/Store).  Reads ONLY the retained manifest
+    # bytes pinned before verification (no TOCTOU re-read from disk).
+    # Fail-closed: a signed bundle without an explicit generation_binding is
+    # a pre-generation-binding bundle and is refused here.  The full
+    # registry/config/schema type widening lives in
+    # crates/kernel/eliot-installation (follow-on, NOT this script); this
+    # gate enforces the script-side shape so installation consumes exactly
+    # the signed generation and stale/incompatible generations never reach
+    # the installer.
+    if (-not $PinnedManifestTexts -or -not $Contract) {
+        throw 'install-time generation binding requires retained manifests and a materialize contract'
+    }
+    $release = [string]$PinnedManifestTexts.release | ConvertFrom-Json
+    $runtime = [string]$PinnedManifestTexts.runtime | ConvertFrom-Json
+    $verified = [string]$PinnedManifestTexts.verified | ConvertFrom-Json
+    foreach ($manifest in @($release, $runtime)) {
+        if ($manifest.signed -ne $true -or
+            [string]$manifest.signature_policy -cne $script:ProductionCliSigningPolicy -or
+            [string]$manifest.signed_scope -cne $script:ProductionCliSigningScope) {
+            throw 'install-time generation binding observed a manifest outside the exact signed boundary'
+        }
+    }
+    $releaseBinding = $release.generation_binding
+    $runtimeBinding = $runtime.generation_binding
+    $verifiedBinding = $verified.generation_binding
+    if (-not $releaseBinding -or -not $runtimeBinding -or -not $verifiedBinding) {
+        throw 'signed bundle does not declare an explicit generation_binding (pre-generation-binding bundle refused; see #1227 Part A/B: bundle → manifest → generation)'
+    }
+    $releaseJson = [string]($releaseBinding | ConvertTo-Json -Depth 12 -Compress)
+    $runtimeJson = [string]($runtimeBinding | ConvertTo-Json -Depth 12 -Compress)
+    $verifiedJson = [string]($verifiedBinding | ConvertTo-Json -Depth 12 -Compress)
+    if ($releaseJson -cne $runtimeJson -or $releaseJson -cne $verifiedJson) {
+        throw 'signed generation_binding is not exactly repeated across RELEASE/RUNTIME_ARTIFACTS/SIGNING_VERIFIED'
+    }
+    foreach ($field in @('generation', 'registry_generation', 'config_generation', 'schema_generation', 'rollback_generation', 'install_authoritative_cli')) {
+        $value = [string]$releaseBinding.$field
+        if ([string]::IsNullOrWhiteSpace($value) -or $value.IndexOf([char]0) -ge 0 -or $value -match '[\r\n]') {
+            throw "signed generation_binding field is missing or malformed: $field"
+        }
+    }
+    $declaredGeneration = [string]$releaseBinding.generation
+    if ([System.IO.Path]::IsPathRooted($declaredGeneration) -or
+        @($declaredGeneration -split '[\\/]').Where({ $_ -eq '.' -or $_ -eq '..' -or $_ -eq '' }).Count -ne 0) {
+        throw 'signed generation_binding.generation must be a canonical non-traversing relative identity'
+    }
+    if ($declaredGeneration -cne [string]$Contract.generation) {
+        throw "stale generation refused: signed bundle generation '$declaredGeneration' does not equal requested generation '$([string]$Contract.generation)' (refusal before mutation)"
+    }
+    foreach ($field in @('registry_generation', 'config_generation', 'schema_generation', 'rollback_generation')) {
+        $declared = [string]$releaseBinding.$field
+        if ([System.IO.Path]::IsPathRooted($declared) -or
+            @($declared -split '[\\/]').Where({ $_ -eq '.' -or $_ -eq '..' -or $_ -eq '' }).Count -ne 0) {
+            throw "signed generation_binding field must be a canonical non-traversing identity: $field"
+        }
+    }
+    $declaredCli = ([string]$releaseBinding.install_authoritative_cli).Replace('\', '/')
+    if ($declaredCli -cne 'runtime/eliot.exe') {
+        throw 'signed generation_binding.install_authoritative_cli must be exactly runtime/eliot.exe'
+    }
+    return [pscustomobject]@{
+        generation = $declaredGeneration
+        registry_generation = [string]$releaseBinding.registry_generation
+        config_generation = [string]$releaseBinding.config_generation
+        schema_generation = [string]$releaseBinding.schema_generation
+        rollback_generation = [string]$releaseBinding.rollback_generation
+        install_authoritative_cli = $declaredCli
+    }
 }
 
 function New-ProductionMaterializePathPins([object]$Contract) {
@@ -1204,7 +1292,8 @@ function Assert-ProductionMaterializeReceipt(
         -not (Test-ExactWindowsPath ([string]$materialized.bundle_path) ([string]$Contract.output_bundle)) -or
         [string]$materialized.durable_authority -cne 'DURABLE_TRANSACTION_STORE_PLUS_TRANSACTION_ID' -or
         [string]$materialized.output_role -cne 'DIAGNOSTIC_NON_IMPORTABLE' -or
-        [int]$materialized.file_count -ne 9 -or @($materialized.files).Count -ne 9) {
+        [int]$materialized.file_count -ne [int]$script:ProductionMaterializedRoles.Count -or
+        @($materialized.files).Count -ne [int]$script:ProductionMaterializedRoles.Count) {
         throw 'SOURCE_BUNDLE_MATERIALIZED receipt is not bound to the exact typed handoff'
     }
     return [pscustomobject]@{ generated = $generated; materialized = $materialized }
@@ -1242,7 +1331,7 @@ function Get-ProductionMaterializeReadback([object]$Contract, [object]$Receipt) 
             $fact = $receiptFiles[$index]
             if ([string]$fact.relative_path -cne [string]$definition.name -or
                 [bool]$fact.executable -ne [bool]$definition.executable) {
-                throw 'materialized nine-role receipt is missing, reordered, or substituted'
+                throw 'materialized twelve-role receipt is missing, reordered, or substituted'
             }
             $rolePath = Join-Path ([string]$Contract.output_bundle) ([string]$definition.name)
             $handle = [EliotReleaseNativeFileSystem]::OpenFileReadFence($rolePath)
@@ -1325,11 +1414,23 @@ function Invoke-ProductionEliotMaterializeSourceBundle {
             $signed $null $baseline $plan $certificateIdentity
         $bindings = Get-VerifiedSignedRoleManifestBindings `
             $signed $rolePins $manifestTexts $verification $Thumbprint $Rfc3161Url
+        # Part B (#1227 gaps j/k): install-time generation/registry/config/
+        # schema/rollback compatibility + stale-generation refusal, BEFORE any
+        # mutation (before CreateSuspended and before the CLI can create
+        # OutputBundle/Output/Store).  Uses only retained manifest bytes.
+        $generationBinding = Assert-ProductionSignedGenerationBinding $manifestTexts $Contract
         Assert-TrustedCliDirectoryPins $directoryPins 'trusted CLI path after verification'
         Assert-TrustedCliManifestPins $manifestPins 'trusted CLI evidence after verification'
         Assert-TrustedSignedRolePins $rolePins 'trusted release after verification'
         Assert-ProductionMaterializePathPins $materializePathPins 'materialize paths after verification'
         Assert-ProductionMaterializeOutputsAbsent $Contract 'materialize post-verification prelaunch'
+        # The generation gate above must precede this absent-outputs gate in
+        # program order: a stale/incompatible generation is refused before
+        # the launcher even re-checks the create-new boundary.
+        if (-not $generationBinding -or
+            [string]$generationBinding.generation -cne [string]$Contract.generation) {
+            throw 'install-time generation binding did not match the requested generation'
+        }
 
         Initialize-EliotReleaseTrustedCliProcess
         $arguments = New-ProductionMaterializeArguments $Contract $rolePins

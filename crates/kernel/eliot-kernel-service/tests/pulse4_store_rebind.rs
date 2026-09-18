@@ -1,6 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence};
+use eliot_contracts::{AuthorityEpoch, EpochId, EpochLineageId, ResourceGeneration, StateFence};
 use eliot_kernel_service::{
     HostJobBinding, HostProcessBinding, HostStoreBootstrapRequirement, KernelService,
     StoreProcessBinding, StoreRebindHandoff, StoreRebindQuery,
@@ -10,13 +10,24 @@ use eliot_runtime_contracts::{
     RegisteredActivityWakePolicy, SupervisionJournalEpoch, SupervisionLeaseIncarnationBinding,
     SupervisionObservationScope,
 };
+use std::num::NonZeroU64;
+
+const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+fn test_epoch(sequence: u64) -> EpochId {
+    EpochId::new(
+        EpochLineageId::new(TEST_LINEAGE_A).expect("valid test lineage"),
+        NonZeroU64::new(sequence).expect("nonzero test sequence"),
+    )
+    .expect("valid test epoch")
+}
 
 fn handle(v: &str) -> PlatformHandle {
     PlatformHandle::new(v).unwrap()
 }
 
 fn requirement() -> HostStoreBootstrapRequirement {
-    let fence = StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis());
+    let fence = StateFence::new(test_epoch(1), ResourceGeneration::genesis());
     HostStoreBootstrapRequirement {
         route_identity: handle("store_bridge"),
         canonical_pipe_identity: handle(r"\\.\pipe\eliot\store"),
@@ -37,7 +48,7 @@ fn candidate_binding() -> eliot_kernel_service::HostKernelCandidateBinding {
     eliot_kernel_service::HostKernelCandidateBinding {
         installation_id: handle("installation-1"),
         host_epoch: AuthorityEpoch::new(1).unwrap(),
-        kernel_epoch: AuthorityEpoch::genesis(),
+        kernel_epoch: test_epoch(1),
         activation_id: handle("activation-1"),
         artifact_hash: handle("artifact-1"),
         config_hash: handle("config-1"),
@@ -121,7 +132,7 @@ fn ready_service() -> (
         journal_transaction_id: handle("txn-1"),
         journal_sequence: 1,
         generation: ResourceGeneration::genesis(),
-        authority_epoch: cand.kernel_epoch,
+        authority_epoch: cand.kernel_epoch.clone(),
         activation_nonce: eliot_platform::KernelActivationNonce::new(handle(&"a".repeat(64)))
             .unwrap(),
     };
@@ -155,7 +166,7 @@ fn store_fence_for(handoff: &StoreRebindHandoff) -> String {
     let mut hasher = Sha256::new();
     hasher.update(serde_json::to_vec(&handoff.requirement.state_fence).unwrap());
     hasher.update(handoff.generation.value().to_le_bytes());
-    hasher.update(handoff.authority_epoch.value().to_le_bytes());
+    hasher.update(handoff.authority_epoch.sequence.get().to_le_bytes());
     hasher.update(
         handoff
             .requirement
@@ -239,7 +250,7 @@ fn rebind_preserves_kernel_identity_and_changes_store_identity() {
         },
         candidate_binding_digest: cand_digest.clone(),
         generation: ResourceGeneration::genesis(),
-        authority_epoch: AuthorityEpoch::genesis(),
+        authority_epoch: test_epoch(1),
         store_fence: String::new(),
     };
     let mut handoff = handoff;
@@ -289,7 +300,7 @@ fn rebind_preserves_kernel_identity_and_changes_store_identity() {
     );
     assert_eq!(receipt.candidate_binding_digest, cand_digest);
     assert_eq!(receipt.generation, ResourceGeneration::genesis());
-    assert_eq!(receipt.authority_epoch, AuthorityEpoch::genesis());
+    assert_eq!(receipt.authority_epoch, test_epoch(1));
     assert_eq!(receipt.store_fence, handoff.store_fence);
     assert_ne!(receipt.process_binding.process.process_id, 42);
 }
@@ -314,7 +325,7 @@ fn rebind_rejects_stale_requirement() {
         },
         candidate_binding_digest: cand_digest.clone(),
         generation: ResourceGeneration::genesis(),
-        authority_epoch: AuthorityEpoch::genesis(),
+        authority_epoch: test_epoch(1),
         store_fence: "a".repeat(64),
     };
     handoff.store_fence = store_fence_for(&handoff);
@@ -340,7 +351,7 @@ fn rebind_service_accepts_fresh_store_evidence_with_recomputed_fence() {
         },
         candidate_binding_digest: cand_digest.clone(),
         generation: ResourceGeneration::genesis(),
-        authority_epoch: AuthorityEpoch::genesis(),
+        authority_epoch: test_epoch(1),
         store_fence: "a".repeat(64),
     };
     let mut fresh_pid = base.clone();
@@ -381,7 +392,7 @@ fn rebind_rejects_fence_mismatch_without_recompute() {
         },
         candidate_binding_digest: cand_digest,
         generation: ResourceGeneration::genesis(),
-        authority_epoch: AuthorityEpoch::genesis(),
+        authority_epoch: test_epoch(1),
         store_fence: "a".repeat(64),
     };
     handoff.store_fence = "b".repeat(64);
@@ -410,7 +421,7 @@ fn rebind_rejects_substituted_candidate_binding_digest() {
         },
         candidate_binding_digest: "f".repeat(64),
         generation: ResourceGeneration::genesis(),
-        authority_epoch: AuthorityEpoch::genesis(),
+        authority_epoch: test_epoch(1),
         store_fence: String::new(),
     };
     handoff.store_fence = store_fence_for(&handoff);
@@ -429,7 +440,7 @@ fn rebind_rejects_substituted_candidate_binding_digest() {
         },
         candidate_binding_digest: "f".repeat(64),
         generation: ResourceGeneration::genesis(),
-        authority_epoch: AuthorityEpoch::genesis(),
+        authority_epoch: test_epoch(1),
         store_fence: "a".repeat(64),
     };
     assert!(handoff2.validate().is_ok());
@@ -458,7 +469,7 @@ fn rebind_rejects_substituted_generation_and_authority() {
         },
         candidate_binding_digest: cand_digest.clone(),
         generation: ResourceGeneration::new(2).unwrap(),
-        authority_epoch: AuthorityEpoch::genesis(),
+        authority_epoch: test_epoch(1),
         store_fence: String::new(),
     };
     handoff_gen.store_fence = store_fence_for(&handoff_gen);
@@ -478,7 +489,7 @@ fn rebind_rejects_substituted_generation_and_authority() {
         },
         candidate_binding_digest: cand_digest,
         generation: ResourceGeneration::genesis(),
-        authority_epoch: AuthorityEpoch::new(2).unwrap(),
+        authority_epoch: test_epoch(2),
         store_fence: String::new(),
     };
     handoff_epoch.store_fence = store_fence_for(&handoff_epoch);
@@ -505,7 +516,7 @@ fn rebind_rejects_substituted_pipe_and_config() {
         },
         candidate_binding_digest: cand_digest.clone(),
         generation: ResourceGeneration::genesis(),
-        authority_epoch: AuthorityEpoch::genesis(),
+        authority_epoch: test_epoch(1),
         store_fence: String::new(),
     };
     handoff_pipe.store_fence = store_fence_for(&handoff_pipe);
@@ -532,7 +543,7 @@ fn rebind_rejects_substituted_pipe_and_config() {
         },
         candidate_binding_digest: cand_digest,
         generation: ResourceGeneration::genesis(),
-        authority_epoch: AuthorityEpoch::genesis(),
+        authority_epoch: test_epoch(1),
         store_fence: String::new(),
     };
     handoff_config.store_fence = store_fence_for(&handoff_config);
@@ -562,7 +573,7 @@ fn rebind_rejects_stale_requirement_pipe_substitution() {
         },
         candidate_binding_digest: cand_digest.clone(),
         generation: ResourceGeneration::genesis(),
-        authority_epoch: AuthorityEpoch::genesis(),
+        authority_epoch: test_epoch(1),
         store_fence: "a".repeat(64),
     };
     let mut req2 = req;
@@ -581,7 +592,7 @@ fn rebind_rejects_stale_requirement_pipe_substitution() {
         },
         candidate_binding_digest: cand_digest,
         generation: ResourceGeneration::genesis(),
-        authority_epoch: AuthorityEpoch::genesis(),
+        authority_epoch: test_epoch(1),
         store_fence: String::new(),
     };
     bad.store_fence = store_fence_for(&bad);
@@ -607,7 +618,7 @@ fn rebind_query_only_recovery_on_response_loss() {
         },
         candidate_binding_digest: cand_digest,
         generation: ResourceGeneration::genesis(),
-        authority_epoch: AuthorityEpoch::genesis(),
+        authority_epoch: test_epoch(1),
         store_fence: "a".repeat(64),
     };
     handoff.store_fence = store_fence_for(&handoff);
@@ -650,7 +661,7 @@ fn rebind_query_does_not_resend_authority() {
         },
         candidate_binding_digest: cand_digest,
         generation: ResourceGeneration::genesis(),
-        authority_epoch: AuthorityEpoch::genesis(),
+        authority_epoch: test_epoch(1),
         store_fence: String::new(),
     };
     handoff.store_fence = store_fence_for(&handoff);
@@ -696,7 +707,7 @@ fn fresh_probe_required_after_rebind_before_healthy() {
         },
         candidate_binding_digest: cand_digest,
         generation: ResourceGeneration::genesis(),
-        authority_epoch: AuthorityEpoch::genesis(),
+        authority_epoch: test_epoch(1),
         store_fence: "a".repeat(64),
     };
     handoff.store_fence = store_fence_for(&handoff);
@@ -746,7 +757,7 @@ fn no_healthy_on_unknown_journal_outcome() {
         },
         candidate_binding_digest: cand_digest,
         generation: ResourceGeneration::genesis(),
-        authority_epoch: AuthorityEpoch::genesis(),
+        authority_epoch: test_epoch(1),
         store_fence: "a".repeat(64),
     };
     handoff.store_fence = store_fence_for(&handoff);
@@ -779,7 +790,7 @@ fn rebind_preserves_one_shot_flags() {
         },
         candidate_binding_digest: cand_digest,
         generation: ResourceGeneration::genesis(),
-        authority_epoch: AuthorityEpoch::genesis(),
+        authority_epoch: test_epoch(1),
         store_fence: "a".repeat(64),
     };
     handoff.store_fence = store_fence_for(&handoff);
@@ -796,7 +807,7 @@ fn rebind_preserves_one_shot_flags() {
         journal_transaction_id: handle("txn-1"),
         journal_sequence: 1,
         generation: ResourceGeneration::genesis(),
-        authority_epoch: AuthorityEpoch::genesis(),
+        authority_epoch: test_epoch(1),
         activation_nonce: eliot_platform::KernelActivationNonce::new(handle(&"a".repeat(64)))
             .unwrap(),
     };
@@ -825,7 +836,7 @@ fn durable_restart_cannot_reconcile_rebind_without_memory() {
         },
         candidate_binding_digest: cand_digest,
         generation: ResourceGeneration::genesis(),
-        authority_epoch: AuthorityEpoch::genesis(),
+        authority_epoch: test_epoch(1),
         store_fence: String::new(),
     };
     handoff.store_fence = store_fence_for(&handoff);
@@ -856,7 +867,7 @@ fn durable_restart_cannot_reconcile_rebind_without_memory() {
         journal_transaction_id: handle("txn-1"),
         journal_sequence: 1,
         generation: ResourceGeneration::genesis(),
-        authority_epoch: cand2.kernel_epoch,
+        authority_epoch: cand2.kernel_epoch.clone(),
         activation_nonce: eliot_platform::KernelActivationNonce::new(handle(&"a".repeat(64)))
             .unwrap(),
     };
@@ -908,7 +919,7 @@ fn rebind_recovery_restores_degraded_from_ors_commit() {
         },
         candidate_binding_digest: cand_digest.clone(),
         generation: ResourceGeneration::genesis(),
-        authority_epoch: AuthorityEpoch::genesis(),
+        authority_epoch: test_epoch(1),
         store_fence: String::new(),
     };
     handoff.store_fence = store_fence_for(&handoff);
@@ -980,7 +991,7 @@ fn rebind_fence_recheck_blocks_stale_second_rebind_without_probe() {
         },
         candidate_binding_digest: cand_digest.clone(),
         generation: ResourceGeneration::genesis(),
-        authority_epoch: AuthorityEpoch::genesis(),
+        authority_epoch: test_epoch(1),
         store_fence: String::new(),
     };
     handoff.store_fence = store_fence_for(&handoff);
@@ -1010,7 +1021,7 @@ fn rebind_requires_ready_state_and_fences_on_second_rebind() {
         },
         candidate_binding_digest: cand_digest.clone(),
         generation: ResourceGeneration::genesis(),
-        authority_epoch: AuthorityEpoch::genesis(),
+        authority_epoch: test_epoch(1),
         store_fence: String::new(),
     };
     handoff.store_fence = store_fence_for(&handoff);
@@ -1029,7 +1040,7 @@ fn rebind_requires_ready_state_and_fences_on_second_rebind() {
         },
         candidate_binding_digest: cand_digest,
         generation: ResourceGeneration::genesis(),
-        authority_epoch: AuthorityEpoch::genesis(),
+        authority_epoch: test_epoch(1),
         store_fence: String::new(),
     };
     handoff2.store_fence = store_fence_for(&handoff2);
@@ -1070,7 +1081,7 @@ fn rebind_ors_persist_failure_is_forward_fenced_and_pending_aborted() {
         },
         candidate_binding_digest: cand_digest.clone(),
         generation: ResourceGeneration::genesis(),
-        authority_epoch: AuthorityEpoch::genesis(),
+        authority_epoch: test_epoch(1),
         store_fence: String::new(),
     };
     handoff.store_fence = store_fence_for(&handoff);
@@ -1147,7 +1158,7 @@ fn rebind_service_mutation_failure_does_not_leave_pending() {
         },
         candidate_binding_digest: cand_digest,
         generation: ResourceGeneration::genesis(),
-        authority_epoch: AuthorityEpoch::genesis(),
+        authority_epoch: test_epoch(1),
         store_fence: String::new(),
     };
     handoff.store_fence = store_fence_for(&handoff);
@@ -1191,7 +1202,7 @@ fn rebind_both_composition_boundaries_are_fenced_on_failure() {
         },
         candidate_binding_digest: cand_digest,
         generation: ResourceGeneration::genesis(),
-        authority_epoch: AuthorityEpoch::genesis(),
+        authority_epoch: test_epoch(1),
         store_fence: String::new(),
     };
     handoff.store_fence = store_fence_for(&handoff);
@@ -1220,7 +1231,7 @@ fn rebind_response_loss_reconciles_exact_operation_via_query() {
         },
         candidate_binding_digest: cand_digest,
         generation: ResourceGeneration::genesis(),
-        authority_epoch: AuthorityEpoch::genesis(),
+        authority_epoch: test_epoch(1),
         store_fence: String::new(),
     };
     handoff.store_fence = store_fence_for(&handoff);
@@ -1255,7 +1266,7 @@ fn rebind_restart_recovers_exact_operation_and_fence() {
         },
         candidate_binding_digest: cand_digest.clone(),
         generation: ResourceGeneration::genesis(),
-        authority_epoch: AuthorityEpoch::genesis(),
+        authority_epoch: test_epoch(1),
         store_fence: String::new(),
     };
     handoff.store_fence = store_fence_for(&handoff);

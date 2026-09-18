@@ -1,31 +1,54 @@
 use std::collections::BTreeSet;
 
 use eliot_agent_api::{
-    ActualRouteReceipt, AgentLaunchRequest, AgentResult, AgentWorkUnitBrief, ArtifactId, AttemptId,
-    AuthorityEpoch, BudgetEnvelope, EffectCeiling, EffectKind, LaunchRequestId, QuotaKnowledge,
-    ResourceGeneration, ResultDisposition, RouteFingerprint, RouteFingerprintId, StateFence,
-    TaskId, UsageReceipt, WorkLeaseId, WorkUnitId,
+    AdmittedRouteReceipt, AgentLaunchRequest, AgentResult, AgentWorkUnitBrief, ArtifactId,
+    AssistantDeltaObservation, AttemptId, BudgetEnvelope, CONTRACT_VERSION, CancelReason,
+    ClockReading, ContractError, DecisionId, EffectCeiling, EffectKind, EpochId, EventCursor,
+    EventId, ExecutionOutcome, ExecutionUnit, ExecutionUnitObservation,
+    HOST_EVENT_CONTRACT_VERSION, HOST_EVENT_DIGEST_ALGORITHM, HostEventDeliveryDisposition,
+    HostEventNormalizationReceipt, HostEventPrivacyClass, HostEventQuarantineReason,
+    LaunchRequestId, LowercaseSha256, NativeSession, NativeSessionLocator, NormalizationCoverage,
+    NormalizedHostEventEnvelope, NormalizedHostEventPayload, PhysicalRouteObservationReceipt,
+    ProposedEffect, ProviderExecutionBinding, ProviderObservationLineage, QualifiedSourceDigest,
+    QuotaKnowledge, RawSourceRecord, RequestId, ResourceGeneration, RestrictedRawSourceHandle,
+    ResultDisposition, RouteFingerprint, RouteObservationState, RouteSelectionCandidate,
+    SessionLifecycleObservation, SessionLifecycleTransition, SessionObservation, StateFence,
+    TaskId, UnsupportedDisposition, UsageReceipt, WorkLeaseId, WorkUnitId, candidate_digest_for,
 };
 use eliot_agent_contracts::{
     DeliveryPolicy, DescendantClosureReceipt, LivePeerMessage, LivePeerMessageState, RevisionId,
-    contract_shape_digest,
 };
-use eliot_contracts::{IntegrationRevision, PolicyRevision, TaskRevision};
+use eliot_contracts::{
+    EpochLineageId, IntegrationRevision, PolicyRevision, TaskRevision, sha256_hex,
+};
 use eliot_evaluation_contracts::BudgetEvidence;
+use eliot_kernel_service::ProviderCapabilityExpectation;
 use eliot_security_contracts::PrivacyClass;
 
 use crate::core::{ProviderProofKind, ProviderVerifier};
 use crate::{
-    AdmissionId, AdmittedLaneReceipt, AgentCoordinator, CandidateId, CoordinatorConfig,
-    CoordinatorError, DescendantClosureSubmission, ExecutionContext, ObservationId, OperationId,
+    AdmissionId, AdmittedLaneReceipt, AdmittedProviderCapability, AgentCoordinator, CancelCommand,
+    CancellationReconciliationId, CandidateId, CoordinatorConfig, CoordinatorError,
+    CoordinatorEvent, DescendantClosureSubmission, ExecutionContext, ObservationId, OperationId,
     OutcomeReconciliationId, PlanGap, ProviderAdmissionReceipt, ProviderBindingSnapshot,
-    ProviderIdentity, ProviderReassignmentReceipt, ProviderUnknownOutcomeReconciliation,
-    ProviderWorkerFenceReceipt, ReassignmentId, RecipeId, RecipeManifest, ResultSubmission,
-    RoleProfileId, RoleProfileManifest, RouteCandidateEvidence, StaffingLaneRequest,
-    StaffingPlanCandidate, StaffingPlanRequest, SubmissionId, UnknownOutcomeResolution, WorkerId,
+    ProviderCancellationReconciliation, ProviderExecutionBindingSubmission, ProviderIdentity,
+    ProviderReassignmentReceipt, ProviderUnknownOutcomeReconciliation, ProviderWorkerFenceReceipt,
+    ReassignmentId, RecipeId, RecipeManifest, ResultSubmission, RoleProfileId, RoleProfileManifest,
+    RouteCandidateEvidence, StaffingLaneRequest, StaffingPlanCandidate, StaffingPlanRequest,
+    SubmissionId, UnknownOutcomeResolution, WorkClass, WorkerId,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+fn test_epoch(lineage: &str, sequence: u64) -> EpochId {
+    EpochId::new(
+        EpochLineageId::new(lineage).expect("valid test lineage"),
+        std::num::NonZeroU64::new(sequence).expect("nonzero test sequence"),
+    )
+    .expect("valid test epoch")
+}
 
 #[derive(Clone)]
 struct TestProvider {
@@ -70,12 +93,12 @@ fn rev(value: &str) -> RevisionId {
 }
 
 fn fence() -> StateFence {
-    StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+    StateFence::new(test_epoch(TEST_LINEAGE_A, 1), ResourceGeneration::genesis())
 }
 
 fn full_fence() -> StateFence {
     StateFence {
-        authority_epoch: AuthorityEpoch::genesis(),
+        authority_epoch: test_epoch(TEST_LINEAGE_A, 1),
         resource_generation: ResourceGeneration::genesis(),
         task_revision: Some(TaskRevision::genesis()),
         policy_revision: Some(PolicyRevision::genesis()),
@@ -119,6 +142,66 @@ fn coordinator(
     AgentCoordinator::with_provider(cfg, Box::new(verifier(proofs, 0)))
 }
 
+fn admitted_capability(minimum_sequence: u64) -> TestResult<AdmittedProviderCapability> {
+    admitted_capability_for(
+        provider_identity(),
+        false,
+        "route-rev-7",
+        "capacity-rev-3",
+        "route-rev-7",
+        "capacity-rev-3",
+        1,
+        1,
+        minimum_sequence,
+    )
+}
+
+/// Builds daemon-supplied Kernel admission from exact owner records. Every
+/// digest is recomputed here with the same `sha256_hex` validator the
+/// verifier uses; no canned pass value is hardcoded.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the test fixture mirrors the admitted capability's flat owner tuple one-to-one"
+)]
+fn admitted_capability_for(
+    identity: ProviderIdentity,
+    revoked: bool,
+    route_revision: &str,
+    capacity_revision: &str,
+    current_route_revision: &str,
+    current_capacity_revision: &str,
+    expectation_sequence: u64,
+    live_sequence: u64,
+    minimum_sequence: u64,
+) -> TestResult<AdmittedProviderCapability> {
+    let live_epoch = test_epoch(TEST_LINEAGE_A, live_sequence);
+    Ok(AdmittedProviderCapability::new(
+        identity,
+        "claim-t9-05-1".to_owned(),
+        "attempt-t9-05-1".to_owned(),
+        "op-t9-05-1".to_owned(),
+        sha256_hex(b"claim-binding-material-t9-05-1"),
+        sha256_hex(b"executable-material-t9-05-1"),
+        route_revision.to_owned(),
+        capacity_revision.to_owned(),
+        ProviderCapabilityExpectation {
+            current_route_revision: current_route_revision.to_owned(),
+            current_capacity_revision: current_capacity_revision.to_owned(),
+            live_authority_epoch: test_epoch(TEST_LINEAGE_A, expectation_sequence),
+            revoked,
+        },
+        live_epoch,
+        minimum_sequence,
+    )?)
+}
+
+fn production_coordinator(cfg: CoordinatorConfig) -> TestResult<AgentCoordinator> {
+    Ok(AgentCoordinator::new_with_admitted_provider(
+        cfg,
+        admitted_capability(0)?,
+    )?)
+}
+
 fn budget() -> BudgetEnvelope {
     BudgetEnvelope {
         context_tokens: 8_000,
@@ -131,20 +214,26 @@ fn budget() -> BudgetEnvelope {
 }
 
 fn route(name: &str) -> RouteFingerprint {
+    let digest = |seed: &str| {
+        serde_json::from_value::<LowercaseSha256>(serde_json::json!(sha256_hex(
+            format!("coordinator-fixture-{seed}-{name}").as_bytes()
+        )))
+        .expect("valid fixture digest")
+    };
     RouteFingerprint {
         host_family: "test-host".to_owned(),
         adapter: format!("adapter-{name}"),
         protocol_transport: "fixture".to_owned(),
-        runtime_hash: format!("runtime-{name}"),
-        adapter_hash: format!("adapter-hash-{name}"),
+        runtime_hash: digest("runtime"),
+        adapter_hash: digest("adapter"),
         provider: format!("provider-{name}"),
         model: format!("model-{name}"),
         auth_billing: "fixture-account".to_owned(),
-        serializer_hash: "serializer-v1".to_owned(),
-        tool_semantics_hash: "tools-v1".to_owned(),
+        serializer_hash: digest("serializer"),
+        tool_semantics_hash: digest("tools"),
         reasoning_mode: "bounded".to_owned(),
         continuation_behavior: "fresh".to_owned(),
-        feature_flags_hash: "features-v1".to_owned(),
+        feature_flags_hash: digest("features"),
     }
 }
 
@@ -275,12 +364,14 @@ fn request(
         plan_revision: rev(&format!("plan-rev-{tag}")),
         state_fence: fence(),
         privacy_class: PrivacyClass::Private,
+        work_class: "swarm".parse()?,
         lanes: specs
             .iter()
             .map(|spec| {
                 Ok(StaffingLaneRequest {
                     work_unit_id: WorkUnitId::new(spec.work)?,
                     role_id: RoleProfileId::new(spec.role)?,
+                    work_class: "swarm".parse()?,
                     route_candidates: vec![route_evidence(route(spec.route), 0)],
                     budget: budget(),
                     priority: spec.priority,
@@ -289,6 +380,42 @@ fn request(
             })
             .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?,
     })
+}
+
+fn admitted_route_receipt(
+    tag: &str,
+    index: usize,
+    routing: &RouteSelectionCandidate,
+    attempt_id: &AttemptId,
+    lease_id: &WorkLeaseId,
+    route: &RouteFingerprint,
+    fence: &StateFence,
+) -> TestResult<AdmittedRouteReceipt> {
+    // Test-only mint via the api fixture pattern (lib.rs admitted_fixture):
+    // the external admission owner issues the decision; the coordinator only
+    // stores/validates. Candidate digest + policy come from the real routing
+    // so linkage checks bind exact bytes, never a hardcoded digest.
+    let mut receipt = AdmittedRouteReceipt {
+        schema_version: CONTRACT_VERSION.to_owned(),
+        decision_id: DecisionId::new(format!("decision-{tag}-{index}"))?,
+        candidate_digest: candidate_digest_for(routing)?,
+        attempt_id: attempt_id.clone(),
+        lease_id: lease_id.clone(),
+        state_fence: fence.clone(),
+        runtime_generation: ResourceGeneration::genesis(),
+        policy_revision: routing.policy_revision.clone(),
+        requested_route: route.clone(),
+        selected_route: Some(route.clone()),
+        no_route: None,
+        evidence_refs: routing.evidence_refs.clone(),
+        proof_ceiling: eliot_receipts::ProofCeiling::CandidateArtifact,
+        self_digest: zero_digest()?,
+    };
+    receipt.self_digest = receipt.compute_digest()?;
+    receipt
+        .validate()
+        .map_err(|error| format!("admission fixture must validate: {error}"))?;
+    Ok(receipt)
 }
 
 fn provider_receipt(
@@ -300,18 +427,37 @@ fn provider_receipt(
         .iter()
         .enumerate()
         .map(|(index, lane)| {
+            let selected = lane
+                .routing
+                .selected
+                .clone()
+                .ok_or("candidate must select a route")?;
+            let attempt_id = AttemptId::new(format!("attempt-{tag}-{index}"))?;
+            let lease_id = serde_json::from_value::<WorkLeaseId>(serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": format!("lease-{tag}-{index}")}))?;
+            let routing_receipt_digest = candidate_digest_for(&lane.routing)?;
+            let admitted_route = admitted_route_receipt(
+                tag,
+                index,
+                &lane.routing,
+                &attempt_id,
+                &lease_id,
+                &selected,
+                &candidate.state_fence,
+            )?;
             Ok(AdmittedLaneReceipt {
                 work_unit_id: lane.work_unit_id.clone(),
                 role_id: lane.role_id.clone(),
                 role_revision: lane.role_revision.clone(),
-                attempt_id: AttemptId::new(format!("attempt-{tag}-{index}"))?,
-                lease_id: WorkLeaseId::new(format!("lease-{tag}-{index}"))?,
+                attempt_id,
+                lease_id,
                 worker_id: WorkerId::new(format!("worker-{tag}-{index}"))?,
-                route: lane.routing.selected_route.clone(),
-                routing_receipt_digest: contract_shape_digest(&lane.routing)?,
+                work_class: lane.work_class,
+                route: selected,
+                routing_receipt_digest,
                 budget: lane.budget.clone(),
                 priority: lane.priority,
                 mutation_scope: lane.mutation_scope.clone(),
+                admitted_route: Some(admitted_route),
             })
         })
         .collect::<TestResult<Vec<_>>>()?;
@@ -325,8 +471,10 @@ fn provider_receipt(
         task_revision: candidate.task_revision.clone(),
         plan_revision: candidate.plan_revision.clone(),
         state_fence: candidate.state_fence.clone(),
-        controller_epoch: AuthorityEpoch::new(1)?,
-        coordinator_lease: WorkLeaseId::new(format!("coordinator-lease-{tag}"))?,
+        controller_epoch: test_epoch(TEST_LINEAGE_A, 1),
+        coordinator_lease: serde_json::from_value::<WorkLeaseId>(
+            serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": format!("coordinator-lease-{tag}")}),
+        )?,
         provider_identity: provider_identity(),
         g11_admission_receipt_ref: format!("proof-admission-{tag}"),
         durable_job_ref: format!("durable-job-{tag}"),
@@ -353,11 +501,151 @@ fn usage() -> UsageReceipt {
     }
 }
 
+fn observation_binding(lane: &AdmittedLaneReceipt) -> TestResult<ProviderExecutionBinding> {
+    Ok(ProviderExecutionBinding {
+        attempt_id: lane.attempt_id.clone(),
+        lease_id: lane.lease_id.clone(),
+        state_fence: fence(),
+        runtime_generation: ResourceGeneration::genesis(),
+        route: lane.route.clone(),
+        session_id: None,
+        provider_scope_ref: "scope:test".to_owned(),
+        native_session: NativeSession::Native(NativeSessionLocator::new("thread-1")?),
+        execution_unit: ExecutionUnit::new("test-provider", "unit-1")?,
+        start_request_id: RequestId::new("req-1")?,
+        start_request_sha256: sha256_hex(b"req-1"),
+    })
+}
+
+fn zero_digest() -> TestResult<LowercaseSha256> {
+    Ok(serde_json::from_value(serde_json::json!(
+        "0000000000000000000000000000000000000000000000000000000000000000"
+    ))?)
+}
+
+fn stored_admission_digest(lane: &AdmittedLaneReceipt) -> TestResult<LowercaseSha256> {
+    // S5 linkage: the observation must reference the stored admission's
+    // self_digest. Legacy lanes without stored admission fall back to the
+    // zero digest so the observation shape still validates; intake then
+    // fails closed on the missing stored decision.
+    Ok(lane
+        .admitted_route
+        .as_ref()
+        .map(|admission| admission.self_digest.clone())
+        .unwrap_or(try_zero_digest()))
+}
+
+fn try_zero_digest() -> LowercaseSha256 {
+    serde_json::from_value(serde_json::json!(
+        "0000000000000000000000000000000000000000000000000000000000000000"
+    ))
+    .expect("zero digest must decode")
+}
+
+fn matched_observation(
+    lane: &AdmittedLaneReceipt,
+    binding: &ProviderExecutionBinding,
+) -> TestResult<PhysicalRouteObservationReceipt> {
+    let mut observation = PhysicalRouteObservationReceipt {
+        schema_version: CONTRACT_VERSION.to_owned(),
+        attempt_id: lane.attempt_id.clone(),
+        state_fence: fence(),
+        runtime_generation: ResourceGeneration::genesis(),
+        admitted_route_digest: stored_admission_digest(lane)?,
+        binding: binding.clone(),
+        requested_route: lane.route.clone(),
+        observed_route: Some(lane.route.clone()),
+        route_state: RouteObservationState::Matched,
+        diverged_fields: Vec::new(),
+        execution_outcome: ExecutionOutcome::Observed,
+        request_digest: zero_digest()?,
+        translation_digest: None,
+        raw_evidence_digest: None,
+        raw_evidence_ref: None,
+        usage: usage(),
+        started: ClockReading {
+            valid_time_ms: Some(1_000),
+            known_time_ms: Some(1_001),
+            transaction_sequence: None,
+            monotonic_ns: None,
+        },
+        first_byte: ClockReading::default(),
+        first_semantic: ClockReading::default(),
+        terminal: ClockReading {
+            valid_time_ms: Some(2_000),
+            known_time_ms: Some(2_001),
+            transaction_sequence: None,
+            monotonic_ns: None,
+        },
+        event_cursor: EventCursor::new("cursor-1")?,
+        event_sequence: 1,
+        cancellation: None,
+        unobserved_reason: None,
+        recovery_ref: None,
+        safe_public_error: None,
+        restricted_raw_error_ref: None,
+        self_digest: zero_digest()?,
+    };
+    observation.self_digest = observation.compute_digest()?;
+    observation.validate()?;
+    Ok(observation)
+}
+
+fn unknown_observation(
+    lane: &AdmittedLaneReceipt,
+    binding: &ProviderExecutionBinding,
+) -> TestResult<PhysicalRouteObservationReceipt> {
+    let mut observation = PhysicalRouteObservationReceipt {
+        schema_version: CONTRACT_VERSION.to_owned(),
+        attempt_id: lane.attempt_id.clone(),
+        state_fence: fence(),
+        runtime_generation: ResourceGeneration::genesis(),
+        admitted_route_digest: stored_admission_digest(lane)?,
+        binding: binding.clone(),
+        requested_route: lane.route.clone(),
+        observed_route: Some(lane.route.clone()),
+        route_state: RouteObservationState::Matched,
+        diverged_fields: Vec::new(),
+        execution_outcome: ExecutionOutcome::UnknownOutcome,
+        request_digest: zero_digest()?,
+        translation_digest: None,
+        raw_evidence_digest: None,
+        raw_evidence_ref: None,
+        usage: usage(),
+        started: ClockReading {
+            valid_time_ms: Some(1_000),
+            known_time_ms: Some(1_001),
+            transaction_sequence: None,
+            monotonic_ns: None,
+        },
+        first_byte: ClockReading::default(),
+        first_semantic: ClockReading::default(),
+        terminal: ClockReading::default(),
+        event_cursor: EventCursor::new("cursor-1")?,
+        event_sequence: 1,
+        cancellation: None,
+        unobserved_reason: None,
+        recovery_ref: Some("provider outcome unresolved".to_owned()),
+        safe_public_error: None,
+        restricted_raw_error_ref: None,
+        self_digest: zero_digest()?,
+    };
+    observation.self_digest = observation.compute_digest()?;
+    observation.validate()?;
+    Ok(observation)
+}
+
 fn result_submission(
     tag: &str,
     lane: &AdmittedLaneReceipt,
     disposition: ResultDisposition,
 ) -> TestResult<ResultSubmission> {
+    let binding = observation_binding(lane)?;
+    let actual_route = if disposition == ResultDisposition::UnknownOutcome {
+        unknown_observation(lane, &binding)?
+    } else {
+        matched_observation(lane, &binding)?
+    };
     Ok(ResultSubmission {
         submission_id: SubmissionId::new(format!("submission-{tag}"))?,
         lease_id: lane.lease_id.clone(),
@@ -376,14 +664,7 @@ fn result_submission(
             proposed_effects: Vec::new(),
             unresolved_questions: Vec::new(),
             usage: usage(),
-            actual_route: ActualRouteReceipt {
-                requested: lane.route.clone(),
-                observed: Some(lane.route.clone()),
-                route_id: RouteFingerprintId::new(format!("route-receipt-{tag}"))?,
-                usage: usage(),
-                started_at: "2026-08-14T00:00:00Z".to_owned(),
-                terminal_at: Some("2026-08-14T00:00:01Z".to_owned()),
-            },
+            actual_route,
             unknown_reason: (disposition == ResultDisposition::UnknownOutcome)
                 .then(|| "provider outcome unresolved".to_owned()),
         },
@@ -679,7 +960,9 @@ fn admission_bijection_and_reassignment_capacity_fail_closed() -> TestResult {
         old_attempt_id: a_lane.attempt_id.clone(),
         old_lease_id: a_lane.lease_id.clone(),
         new_attempt_id: AttemptId::new("attempt-a-new")?,
-        new_lease_id: WorkLeaseId::new("lease-a-new")?,
+        new_lease_id: serde_json::from_value::<WorkLeaseId>(
+            serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-a-new"}),
+        )?,
         new_worker_id: WorkerId::new("worker-a-new")?,
         route: b.admitted_lanes[0].route.clone(),
         budget: budget(),
@@ -734,7 +1017,7 @@ fn live_capacity_evidence_limits_admission_and_reassignment() -> TestResult {
     )?;
     old_request.lanes[0].route_candidates[0].capacity_limit = 1;
     let old_candidate = coordinator.plan(old_request)?;
-    assert_eq!(old_candidate.lanes[0].routing.capacity_limit, 1);
+    assert_eq!(old_candidate.lanes[0].capacity_limit, 1);
     let old = coordinator.admit(provider_receipt(&old_candidate, "cap-old")?)?;
     let old_lane = old.admitted_lanes[0].clone();
     let old_context = ExecutionContext::from(&old);
@@ -788,7 +1071,9 @@ fn live_capacity_evidence_limits_admission_and_reassignment() -> TestResult {
         old_attempt_id: old_lane.attempt_id.clone(),
         old_lease_id: old_lane.lease_id.clone(),
         new_attempt_id: AttemptId::new("attempt-cap-route")?,
-        new_lease_id: WorkLeaseId::new("lease-cap-route")?,
+        new_lease_id: serde_json::from_value::<WorkLeaseId>(
+            serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-cap-route"}),
+        )?,
         new_worker_id: WorkerId::new("worker-cap-route")?,
         route: route("b"),
         budget: budget(),
@@ -805,7 +1090,9 @@ fn live_capacity_evidence_limits_admission_and_reassignment() -> TestResult {
         old_attempt_id: old_lane.attempt_id,
         old_lease_id: old_lane.lease_id,
         new_attempt_id: AttemptId::new("attempt-cap-widen")?,
-        new_lease_id: WorkLeaseId::new("lease-cap-widen")?,
+        new_lease_id: serde_json::from_value::<WorkLeaseId>(
+            serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-cap-widen"}),
+        )?,
         new_worker_id: WorkerId::new("worker-cap-widen")?,
         route: live.admitted_lanes[0].route.clone(),
         budget: budget(),
@@ -925,7 +1212,7 @@ fn peer_message(
         "delivery_policy": delivery,
         "state": "DRAFT",
         "state_fence": {
-            "authority_epoch": 1,
+            "authority_epoch": {"lineage_id": TEST_LINEAGE_A, "sequence": 1},
             "resource_generation": 1,
             "task_revision": null,
             "policy_revision": null,
@@ -1165,7 +1452,7 @@ fn coordinator_case_11_wrong_controller_epoch_has_no_mutation() -> TestResult {
     )?)?;
     let before = coordinator.snapshot_json()?;
     let mut receipt = provider_receipt(&candidate, "case-11")?;
-    receipt.controller_epoch = AuthorityEpoch::new(2)?;
+    receipt.controller_epoch = test_epoch(TEST_LINEAGE_A, 2);
     assert_eq!(
         coordinator.admit(receipt).err(),
         Some(CoordinatorError::StaleController)
@@ -1752,5 +2039,2269 @@ fn plan_same_identity_changed_bytes_fails_identity_conflict_before_ready_backpre
             limit: 1
         })
     );
+    Ok(())
+}
+
+fn binding_submission(
+    tag: &str,
+    lane: &AdmittedLaneReceipt,
+    unit: &str,
+    scope: &str,
+) -> TestResult<ProviderExecutionBindingSubmission> {
+    Ok(ProviderExecutionBindingSubmission {
+        binding: ProviderExecutionBinding {
+            attempt_id: lane.attempt_id.clone(),
+            lease_id: lane.lease_id.clone(),
+            state_fence: fence(),
+            runtime_generation: ResourceGeneration::genesis(),
+            route: lane.route.clone(),
+            session_id: None,
+            provider_scope_ref: format!("provider-scope-{scope}"),
+            native_session: NativeSession::Native(NativeSessionLocator::new(format!(
+                "thread-{tag}"
+            ))?),
+            execution_unit: ExecutionUnit::new("test-turn", format!("turn-{unit}"))?,
+            start_request_id: RequestId::new(format!("start-{tag}"))?,
+            start_request_sha256: sha256_hex(format!("start-{tag}").as_bytes()),
+        },
+        provider_identity: provider_identity(),
+        provider_start_receipt_ref: format!("proof-bind-{tag}"),
+    })
+}
+
+fn bind_lane_spec<'a>(work: &'a str, role: &'a str, route: &'a str) -> LaneSpec<'a> {
+    LaneSpec {
+        work,
+        role,
+        route,
+        scope: None,
+        write: false,
+        priority: 1,
+    }
+}
+
+#[test]
+fn binding_identical_replay_returns_existing_without_new_event() -> TestResult {
+    let proofs = ["proof-admission-bind-a", "proof-bind-bind-a"];
+    let mut coordinator = coordinator(config(4, 4), &proofs)?;
+    let admitted = plan_and_admit(
+        &mut coordinator,
+        "bind-a",
+        &[bind_lane_spec("work-bind-a", "reader-bind-a", "a")],
+        None,
+    )?;
+    let context = ExecutionContext::from(&admitted);
+    let lane = admitted.admitted_lanes[0].clone();
+    coordinator.start_attempt(context.clone(), lane.attempt_id.clone())?;
+    let submission = binding_submission("bind-a", &lane, "unit-a", "scope-a")?;
+    let events_before = coordinator.events().len();
+    let first = coordinator.bind_provider_execution(context.clone(), submission.clone())?;
+    assert_eq!(coordinator.events().len(), events_before + 1);
+    assert_eq!(
+        coordinator
+            .attempt(&lane.attempt_id)
+            .unwrap_or_else(|| panic!("bound attempt must exist"))
+            .provider_binding,
+        Some(first.clone())
+    );
+    let replayed = coordinator.bind_provider_execution(context, submission)?;
+    assert_eq!(replayed, first);
+    assert_eq!(coordinator.events().len(), events_before + 1);
+    Ok(())
+}
+
+#[test]
+fn binding_second_unit_rebind_conflicts_and_preserves_stored() -> TestResult {
+    let proofs = [
+        "proof-admission-bind-b",
+        "proof-bind-bind-b",
+        "proof-bind-bind-b-re",
+    ];
+    let mut coordinator = coordinator(config(4, 4), &proofs)?;
+    let admitted = plan_and_admit(
+        &mut coordinator,
+        "bind-b",
+        &[bind_lane_spec("work-bind-b", "reader-bind-b", "a")],
+        None,
+    )?;
+    let context = ExecutionContext::from(&admitted);
+    let lane = admitted.admitted_lanes[0].clone();
+    coordinator.start_attempt(context.clone(), lane.attempt_id.clone())?;
+    coordinator.bind_provider_execution(
+        context.clone(),
+        binding_submission("bind-b", &lane, "unit-b1", "scope-b")?,
+    )?;
+    let events_after_bind = coordinator.events().len();
+    assert_eq!(
+        coordinator.bind_provider_execution(
+            context,
+            binding_submission("bind-b-re", &lane, "unit-b2", "scope-b")?
+        ),
+        Err(CoordinatorError::IdempotencyConflict)
+    );
+    assert_eq!(coordinator.events().len(), events_after_bind);
+    assert_eq!(
+        coordinator
+            .attempt(&lane.attempt_id)
+            .unwrap_or_else(|| panic!("bound attempt must exist"))
+            .provider_binding
+            .as_ref()
+            .unwrap_or_else(|| panic!("stored binding must survive a rebind conflict"))
+            .execution_unit
+            .unit_id,
+        "turn-unit-b1"
+    );
+    Ok(())
+}
+
+#[test]
+fn binding_duplicate_unit_reuse_conflicts_across_attempts() -> TestResult {
+    let proofs = [
+        "proof-admission-bind-c",
+        "proof-bind-bind-c-0",
+        "proof-bind-bind-c-1",
+    ];
+    let mut coordinator = coordinator(config(4, 4), &proofs)?;
+    let admitted = plan_and_admit(
+        &mut coordinator,
+        "bind-c",
+        &[
+            bind_lane_spec("work-bind-c-0", "reader-bind-c-0", "a"),
+            bind_lane_spec("work-bind-c-1", "reader-bind-c-1", "b"),
+        ],
+        None,
+    )?;
+    let first = admitted.admitted_lanes[0].clone();
+    let second = admitted.admitted_lanes[1].clone();
+    coordinator.start_attempt(ExecutionContext::from(&admitted), first.attempt_id.clone())?;
+    coordinator.start_attempt(ExecutionContext::from(&admitted), second.attempt_id.clone())?;
+    coordinator.bind_provider_execution(
+        ExecutionContext::from(&admitted),
+        binding_submission("bind-c-0", &first, "unit-shared", "scope-shared")?,
+    )?;
+    let events_after_first = coordinator.events().len();
+    assert_eq!(
+        coordinator.bind_provider_execution(
+            ExecutionContext::from(&admitted),
+            binding_submission("bind-c-1", &second, "unit-shared", "scope-shared")?
+        ),
+        Err(CoordinatorError::DuplicateIdentity("execution_unit"))
+    );
+    assert_eq!(coordinator.events().len(), events_after_first);
+    assert_eq!(
+        coordinator
+            .attempt(&second.attempt_id)
+            .unwrap_or_else(|| panic!("second attempt must exist"))
+            .provider_binding,
+        None
+    );
+    Ok(())
+}
+
+#[test]
+fn binding_snapshot_restore_preserves_binding_and_absent_stays_unresolved() -> TestResult {
+    let proofs = ["proof-admission-bind-d", "proof-bind-bind-d"];
+    let mut coordinator = coordinator(config(4, 4), &proofs)?;
+    let admitted = plan_and_admit(
+        &mut coordinator,
+        "bind-d",
+        &[bind_lane_spec("work-bind-d", "reader-bind-d", "a")],
+        None,
+    )?;
+    let context = ExecutionContext::from(&admitted);
+    let lane = admitted.admitted_lanes[0].clone();
+    coordinator.start_attempt(context.clone(), lane.attempt_id.clone())?;
+    let pre_binding = coordinator.snapshot()?;
+    let bound = coordinator.bind_provider_execution(
+        context,
+        binding_submission("bind-d", &lane, "unit-d", "scope-d")?,
+    )?;
+    let post_binding = coordinator.snapshot()?;
+    // Restore without the binding event: the attempt stays unresolved and
+    // attribution fails closed; no binding is invented.
+    let restored_pre = AgentCoordinator::restore_with_provider(
+        pre_binding.clone(),
+        config(4, 4),
+        Box::new(verifier(&proofs, pre_binding.event_sequence)),
+    )?;
+    assert_eq!(
+        restored_pre
+            .attempt(&lane.attempt_id)
+            .unwrap_or_else(|| panic!("restored attempt must exist"))
+            .provider_binding,
+        None
+    );
+    assert_eq!(
+        restored_pre
+            .binding_subject(&lane.attempt_id)?
+            .attributable_binding()
+            .err(),
+        Some(ContractError::BindingMismatch)
+    );
+    // Restore with the binding event: the binding is preserved and
+    // attributable, and the journal matches exactly.
+    let restored_post = AgentCoordinator::restore_with_provider(
+        post_binding.clone(),
+        config(4, 4),
+        Box::new(verifier(&proofs, post_binding.event_sequence)),
+    )?;
+    assert_eq!(
+        restored_post
+            .attempt(&lane.attempt_id)
+            .unwrap_or_else(|| panic!("restored attempt must exist"))
+            .provider_binding,
+        Some(bound.clone())
+    );
+    assert_eq!(
+        restored_post
+            .binding_subject(&lane.attempt_id)?
+            .attributable_binding()?,
+        &bound
+    );
+    assert_eq!(restored_post.events(), coordinator.events());
+    Ok(())
+}
+
+fn diverged_observation(
+    lane: &AdmittedLaneReceipt,
+    binding: &ProviderExecutionBinding,
+    observed: &RouteFingerprint,
+) -> TestResult<PhysicalRouteObservationReceipt> {
+    use eliot_agent_api::route_divergence_fields;
+    let diverged = route_divergence_fields(&lane.route, observed);
+    assert!(!diverged.is_empty(), "diverged fixture must differ");
+    let zero = zero_digest()?;
+    let admitted_digest = stored_admission_digest(lane)?;
+    let mut observation = PhysicalRouteObservationReceipt {
+        schema_version: CONTRACT_VERSION.to_owned(),
+        attempt_id: lane.attempt_id.clone(),
+        state_fence: fence(),
+        runtime_generation: ResourceGeneration::genesis(),
+        admitted_route_digest: admitted_digest,
+        binding: binding.clone(),
+        requested_route: lane.route.clone(),
+        observed_route: Some(observed.clone()),
+        route_state: RouteObservationState::Diverged,
+        diverged_fields: diverged,
+        execution_outcome: ExecutionOutcome::Observed,
+        request_digest: zero.clone(),
+        translation_digest: None,
+        raw_evidence_digest: None,
+        raw_evidence_ref: None,
+        usage: usage(),
+        started: ClockReading {
+            valid_time_ms: Some(1_000),
+            known_time_ms: Some(1_001),
+            transaction_sequence: None,
+            monotonic_ns: None,
+        },
+        first_byte: ClockReading::default(),
+        first_semantic: ClockReading::default(),
+        terminal: ClockReading {
+            valid_time_ms: Some(2_000),
+            known_time_ms: Some(2_001),
+            transaction_sequence: None,
+            monotonic_ns: None,
+        },
+        event_cursor: EventCursor::new("cursor-diverged")?,
+        event_sequence: 2,
+        cancellation: None,
+        unobserved_reason: None,
+        recovery_ref: Some("diverged-quarantine".to_owned()),
+        safe_public_error: None,
+        restricted_raw_error_ref: None,
+        self_digest: zero,
+    };
+    observation.self_digest = observation.compute_digest()?;
+    observation.validate()?;
+    Ok(observation)
+}
+
+fn unobserved_observation(
+    lane: &AdmittedLaneReceipt,
+    binding: &ProviderExecutionBinding,
+) -> TestResult<PhysicalRouteObservationReceipt> {
+    let zero = zero_digest()?;
+    let admitted_digest = stored_admission_digest(lane)?;
+    let mut observation = PhysicalRouteObservationReceipt {
+        schema_version: CONTRACT_VERSION.to_owned(),
+        attempt_id: lane.attempt_id.clone(),
+        state_fence: fence(),
+        runtime_generation: ResourceGeneration::genesis(),
+        admitted_route_digest: admitted_digest,
+        binding: binding.clone(),
+        requested_route: lane.route.clone(),
+        observed_route: None,
+        route_state: RouteObservationState::Unobserved,
+        diverged_fields: Vec::new(),
+        execution_outcome: ExecutionOutcome::UnknownOutcome,
+        request_digest: zero.clone(),
+        translation_digest: None,
+        raw_evidence_digest: None,
+        raw_evidence_ref: None,
+        usage: usage(),
+        started: ClockReading {
+            valid_time_ms: Some(1_000),
+            known_time_ms: Some(1_001),
+            transaction_sequence: None,
+            monotonic_ns: None,
+        },
+        first_byte: ClockReading::default(),
+        first_semantic: ClockReading::default(),
+        terminal: ClockReading::default(),
+        event_cursor: EventCursor::new("cursor-unobserved")?,
+        event_sequence: 3,
+        cancellation: None,
+        unobserved_reason: Some("provider did not attest route".to_owned()),
+        recovery_ref: Some("unobserved-recovery".to_owned()),
+        safe_public_error: None,
+        restricted_raw_error_ref: None,
+        self_digest: zero,
+    };
+    observation.self_digest = observation.compute_digest()?;
+    observation.validate()?;
+    Ok(observation)
+}
+
+#[test]
+fn diverged_observation_is_retained_with_capped_ceiling() -> TestResult {
+    let mut coordinator = coordinator(
+        config(2, 2),
+        &["proof-admission-diverged", "proof-result-diverged"],
+    )?;
+    let admitted = plan_and_admit(
+        &mut coordinator,
+        "diverged",
+        &[LaneSpec {
+            work: "work-diverged",
+            role: "reader-diverged",
+            route: "a",
+            scope: None,
+            write: false,
+            priority: 1,
+        }],
+        None,
+    )?;
+    let context = ExecutionContext::from(&admitted);
+    let lane = admitted.admitted_lanes[0].clone();
+    coordinator.start_attempt(context.clone(), lane.attempt_id.clone())?;
+    let binding = observation_binding(&lane)?;
+    let observed = route("b");
+    let mut submission = result_submission("diverged", &lane, ResultDisposition::Partial)?;
+    submission.provider_result_receipt_ref = "proof-result-diverged".to_owned();
+    submission.result.actual_route = diverged_observation(&lane, &binding, &observed)?;
+    let receipt = coordinator.submit_result(context, submission)?;
+    assert_eq!(
+        receipt.proof_ceiling,
+        eliot_receipts::ProofCeiling::CandidateArtifact
+    );
+    assert_eq!(
+        receipt.actual_route.route_state,
+        RouteObservationState::Diverged
+    );
+    assert_eq!(
+        receipt.actual_route.observed_route.as_ref(),
+        Some(&observed)
+    );
+    Ok(())
+}
+
+#[test]
+fn unobserved_observation_is_retained_with_capped_ceiling() -> TestResult {
+    let mut coordinator = coordinator(
+        config(2, 2),
+        &["proof-admission-unobserved", "proof-result-unobserved"],
+    )?;
+    let admitted = plan_and_admit(
+        &mut coordinator,
+        "unobserved",
+        &[LaneSpec {
+            work: "work-unobserved",
+            role: "reader-unobserved",
+            route: "a",
+            scope: None,
+            write: false,
+            priority: 1,
+        }],
+        None,
+    )?;
+    let context = ExecutionContext::from(&admitted);
+    let lane = admitted.admitted_lanes[0].clone();
+    coordinator.start_attempt(context.clone(), lane.attempt_id.clone())?;
+    let binding = observation_binding(&lane)?;
+    let mut submission = result_submission("unobserved", &lane, ResultDisposition::UnknownOutcome)?;
+    submission.provider_result_receipt_ref = "proof-result-unobserved".to_owned();
+    submission.result.actual_route = unobserved_observation(&lane, &binding)?;
+    submission.result.unknown_reason = Some("provider outcome unresolved".to_owned());
+    let receipt = coordinator.submit_result(context, submission)?;
+    assert_eq!(
+        receipt.proof_ceiling,
+        eliot_receipts::ProofCeiling::CandidateArtifact
+    );
+    assert_eq!(
+        receipt.actual_route.route_state,
+        RouteObservationState::Unobserved
+    );
+    assert_eq!(receipt.actual_route.observed_route, None);
+    Ok(())
+}
+
+#[test]
+fn mismatched_requested_route_rejects_as_invalid_candidate() -> TestResult {
+    let mut coordinator = coordinator(
+        config(2, 2),
+        &["proof-admission-mismatch", "proof-result-mismatch"],
+    )?;
+    let admitted = plan_and_admit(
+        &mut coordinator,
+        "mismatch",
+        &[LaneSpec {
+            work: "work-mismatch",
+            role: "reader-mismatch",
+            route: "a",
+            scope: None,
+            write: false,
+            priority: 1,
+        }],
+        None,
+    )?;
+    let context = ExecutionContext::from(&admitted);
+    let lane = admitted.admitted_lanes[0].clone();
+    coordinator.start_attempt(context.clone(), lane.attempt_id.clone())?;
+    let binding = observation_binding(&lane)?;
+    // Requested differs from the admitted/assigned route: invalid candidate.
+    // Build a matched observation for a different requested route (b) while
+    // keeping the binding attempt so the failure is the requested mismatch.
+    let mut forged_lane = lane.clone();
+    forged_lane.route = route("b");
+    let mut submission = result_submission("mismatch", &lane, ResultDisposition::Partial)?;
+    submission.provider_result_receipt_ref = "proof-result-mismatch".to_owned();
+    let mut observation = matched_observation(&forged_lane, &binding)?;
+    observation.binding = binding.clone();
+    observation.self_digest = observation.compute_digest()?;
+    submission.result.actual_route = observation;
+    assert_eq!(
+        coordinator.submit_result(context, submission).err(),
+        Some(CoordinatorError::RouteMismatch)
+    );
+    Ok(())
+}
+
+#[test]
+fn forged_binding_rejects_at_intake() -> TestResult {
+    let mut coordinator = coordinator(
+        config(2, 2),
+        &["proof-admission-forged", "proof-result-forged"],
+    )?;
+    let admitted = plan_and_admit(
+        &mut coordinator,
+        "forged",
+        &[LaneSpec {
+            work: "work-forged",
+            role: "reader-forged",
+            route: "a",
+            scope: None,
+            write: false,
+            priority: 1,
+        }],
+        None,
+    )?;
+    let context = ExecutionContext::from(&admitted);
+    let lane = admitted.admitted_lanes[0].clone();
+    coordinator.start_attempt(context.clone(), lane.attempt_id.clone())?;
+    // Forge the lease: the presented binding no longer agrees with the
+    // admitted attempt on the exact typed lease, so intake fails closed.
+    let mut binding = observation_binding(&lane)?;
+    binding.lease_id = serde_json::from_value::<WorkLeaseId>(
+        serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-forged"}),
+    )?;
+    let mut submission = result_submission("forged", &lane, ResultDisposition::Partial)?;
+    submission.provider_result_receipt_ref = "proof-result-forged".to_owned();
+    let mut observation = matched_observation(&lane, &observation_binding(&lane)?)?;
+    observation.binding = binding;
+    observation.self_digest = observation.compute_digest()?;
+    submission.result.actual_route = observation;
+    assert_eq!(
+        coordinator.submit_result(context, submission).err(),
+        Some(CoordinatorError::IdentityConflict("execution_binding"))
+    );
+    Ok(())
+}
+
+#[test]
+fn invalid_candidate_selection_rejects_with_route_mismatch() -> TestResult {
+    use eliot_agent_api::{
+        CandidateSelectionDisposition, PolicyRevision, RejectedRouteCandidate,
+        RouteSelectionCandidate,
+    };
+    let valid = route("a");
+    let absent = route("b");
+    let candidate = RouteSelectionCandidate {
+        capability: "test-capability".to_owned(),
+        query_intent: "test-intent".to_owned(),
+        scope_ref: "scope:test".to_owned(),
+        policy_revision: PolicyRevision::new(3)?,
+        candidates: vec![valid],
+        selected: Some(absent),
+        rejected: Vec::<RejectedRouteCandidate>::new(),
+        selection: CandidateSelectionDisposition::Selected,
+        evidence_refs: vec!["evidence-1".to_owned()],
+    };
+    assert_eq!(candidate.validate(), Err(ContractError::RouteMismatch));
+    Ok(())
+}
+
+#[test]
+fn s5_stored_admission_closes_binding_and_forged_digest_rejects() -> TestResult {
+    // S5 happy path + digest-linkage negative + snapshot preservation.
+    // Stored admission comes from the external decision carried in the
+    // admitted lane (never minted); intake closes via validate_for_binding
+    // and a forged admitted_route_digest fails closed.
+    let proofs = [
+        "proof-admission-s5a",
+        "proof-result-s5a-0",
+        "proof-result-s5a-1-forged",
+    ];
+    let mut coordinator = coordinator(config(4, 4), &proofs)?;
+    let admitted = plan_and_admit(
+        &mut coordinator,
+        "s5a",
+        &[
+            LaneSpec {
+                work: "work-s5a-0",
+                role: "reader-s5a-0",
+                route: "a",
+                scope: None,
+                write: false,
+                priority: 2,
+            },
+            LaneSpec {
+                work: "work-s5a-1",
+                role: "reader-s5a-1",
+                route: "b",
+                scope: None,
+                write: false,
+                priority: 1,
+            },
+        ],
+        None,
+    )?;
+    // Stored admission is present and equals the presented lane decision.
+    for lane in &admitted.admitted_lanes {
+        let stored = coordinator
+            .attempt(&lane.attempt_id)
+            .unwrap_or_else(|| panic!("admitted attempt must exist"))
+            .admitted_route
+            .clone();
+        assert_eq!(stored, lane.admitted_route);
+        assert!(stored.is_some());
+    }
+    let context = ExecutionContext::from(&admitted);
+    let first = admitted.admitted_lanes[0].clone();
+    let second = admitted.admitted_lanes[1].clone();
+    coordinator.start_attempt(context.clone(), first.attempt_id.clone())?;
+    coordinator.start_attempt(context.clone(), second.attempt_id.clone())?;
+    // Snapshot round-trip preserves the stored decision; restore-then-submit
+    // still closes.
+    let snapshot = coordinator.snapshot()?;
+    let mut restored = AgentCoordinator::restore_with_provider(
+        snapshot.clone(),
+        config(4, 4),
+        Box::new(verifier(&proofs, snapshot.event_sequence)),
+    )?;
+    assert_eq!(
+        restored
+            .attempt(&first.attempt_id)
+            .unwrap_or_else(|| panic!("restored attempt must exist"))
+            .admitted_route,
+        first.admitted_route
+    );
+    let happy = result_submission("s5a-0", &first, ResultDisposition::Partial)?;
+    let receipt = restored.submit_result(context.clone(), happy)?;
+    assert_eq!(
+        receipt.proof_ceiling,
+        eliot_receipts::ProofCeiling::CandidateArtifact
+    );
+    // Forged digest: same attempt/binding/route but a zero digest instead of
+    // the stored self_digest. Shape still validates (recomputed self_digest)
+    // so only the admission linkage can fail.
+    let mut forged = result_submission("s5a-1-forged", &second, ResultDisposition::Partial)?;
+    forged.result.actual_route.admitted_route_digest = zero_digest()?;
+    forged.result.actual_route.self_digest = forged.result.actual_route.compute_digest()?;
+    assert_eq!(
+        coordinator.submit_result(context, forged).err(),
+        Some(CoordinatorError::IdentityConflict("execution_binding"))
+    );
+    Ok(())
+}
+
+#[test]
+fn s5_foreign_turn_binding_admission_triple_mismatch_rejects() -> TestResult {
+    // Foreign execution unit and foreign admission digest both fail closed,
+    // preserving DIVERGED/UNOBSERVED handling (those stay retained, not
+    // rejected as mismatch).
+    let proofs = [
+        "proof-admission-s5b",
+        "proof-result-s5b-foreign-bind",
+        "proof-result-s5b-foreign-digest",
+    ];
+    let mut coordinator = coordinator(config(4, 4), &proofs)?;
+    let admitted = plan_and_admit(
+        &mut coordinator,
+        "s5b",
+        &[
+            LaneSpec {
+                work: "work-s5b-0",
+                role: "reader-s5b-0",
+                route: "a",
+                scope: None,
+                write: false,
+                priority: 2,
+            },
+            LaneSpec {
+                work: "work-s5b-1",
+                role: "reader-s5b-1",
+                route: "b",
+                scope: None,
+                write: false,
+                priority: 1,
+            },
+        ],
+        None,
+    )?;
+    let context = ExecutionContext::from(&admitted);
+    let lane_a = admitted.admitted_lanes[0].clone();
+    let lane_b = admitted.admitted_lanes[1].clone();
+    coordinator.start_attempt(context.clone(), lane_a.attempt_id.clone())?;
+    coordinator.start_attempt(context.clone(), lane_b.attempt_id.clone())?;
+    // Foreign turn: result names attempt A but the embedded binding is B's
+    // unit (different attempt/lease). Intake fails closed.
+    let binding_b = observation_binding(&lane_b)?;
+    let mut foreign_bind =
+        result_submission("s5b-foreign-bind", &lane_a, ResultDisposition::Partial)?;
+    foreign_bind.result.actual_route.binding = binding_b;
+    foreign_bind.result.actual_route.self_digest =
+        foreign_bind.result.actual_route.compute_digest()?;
+    assert_eq!(
+        coordinator
+            .submit_result(context.clone(), foreign_bind)
+            .err(),
+        Some(CoordinatorError::IdentityConflict("execution_binding"))
+    );
+    // Foreign admission: binding is A's but the digest points at B's
+    // decision. Linkage against stored A fails closed.
+    let foreign_digest = lane_b
+        .admitted_route
+        .as_ref()
+        .unwrap_or_else(|| panic!("lane must carry stored admission"))
+        .self_digest
+        .clone();
+    let mut foreign_digest_sub =
+        result_submission("s5b-foreign-digest", &lane_a, ResultDisposition::Partial)?;
+    foreign_digest_sub.result.actual_route.admitted_route_digest = foreign_digest;
+    foreign_digest_sub.result.actual_route.self_digest =
+        foreign_digest_sub.result.actual_route.compute_digest()?;
+    assert_eq!(
+        coordinator.submit_result(context, foreign_digest_sub).err(),
+        Some(CoordinatorError::IdentityConflict("execution_binding"))
+    );
+    Ok(())
+}
+
+#[test]
+fn s5_per_effect_attempt_mismatch_rejects() -> TestResult {
+    // Reachable via submit_result: the effect itself satisfies the ceiling
+    // so only the S5 per-effect attempt linkage can fail.
+    let mut coordinator = coordinator(config(2, 2), &["proof-admission-s5c", "proof-result-s5c"])?;
+    let admitted = plan_and_admit(
+        &mut coordinator,
+        "s5c",
+        &[LaneSpec {
+            work: "work-s5c",
+            role: "reader-s5c",
+            route: "a",
+            scope: None,
+            write: false,
+            priority: 1,
+        }],
+        None,
+    )?;
+    let context = ExecutionContext::from(&admitted);
+    let lane = admitted.admitted_lanes[0].clone();
+    coordinator.start_attempt(context.clone(), lane.attempt_id.clone())?;
+    let mut submission = result_submission("s5c", &lane, ResultDisposition::Partial)?;
+    let foreign_effect = ProposedEffect {
+        effect_id: "effect-s5c-1".to_owned(),
+        attempt_id: AttemptId::new("attempt-s5c-foreign")?,
+        kind: EffectKind::Observe,
+        scope_ref: "scope-work-s5c".to_owned(),
+        payload_digest: serde_json::from_value(serde_json::json!(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ))?,
+        rationale_ref: None,
+    };
+    submission.result.proposed_effects = vec![foreign_effect];
+    assert_eq!(
+        coordinator.submit_result(context, submission).err(),
+        Some(CoordinatorError::IdentityConflict("execution_binding"))
+    );
+    Ok(())
+}
+
+#[test]
+fn s5_missing_stored_admission_and_reassigned_stays_unresolved() -> TestResult {
+    // Legacy `None` (pre-S5 wire) and reassigned attempts (new identity
+    // awaiting a new external decision) both fail closed at intake with the
+    // admission owner named, never silently upgraded.
+    let mut legacy = coordinator(config(2, 2), &["proof-admission-s5d", "proof-result-s5d"])?;
+    let candidate = legacy.plan(request(
+        "s5d",
+        &[LaneSpec {
+            work: "work-s5d",
+            role: "reader-s5d",
+            route: "a",
+            scope: None,
+            write: false,
+            priority: 1,
+        }],
+        None,
+    )?)?;
+    let mut receipt = provider_receipt(&candidate, "s5d")?;
+    receipt.admitted_lanes[0].admitted_route = None;
+    let admitted = legacy.admit(receipt)?;
+    let context = ExecutionContext::from(&admitted);
+    let lane = admitted.admitted_lanes[0].clone();
+    assert_eq!(
+        legacy
+            .attempt(&lane.attempt_id)
+            .unwrap_or_else(|| panic!("legacy attempt must exist"))
+            .admitted_route,
+        None
+    );
+    legacy.start_attempt(context.clone(), lane.attempt_id.clone())?;
+    let submission = result_submission("s5d", &lane, ResultDisposition::Partial)?;
+    assert_eq!(
+        legacy.submit_result(context, submission).err(),
+        Some(CoordinatorError::IdentityConflict("admitted_route"))
+    );
+
+    // Reassigned attempt: new identity starts unresolved.
+    let proofs = [
+        "proof-admission-s5e",
+        "proof-fence-s5e",
+        "proof-reassign-s5e",
+        "proof-result-s5e-new",
+    ];
+    let mut coordinator = coordinator(config(4, 4), &proofs)?;
+    let admitted = plan_and_admit(
+        &mut coordinator,
+        "s5e",
+        &[LaneSpec {
+            work: "work-s5e",
+            role: "reader-s5e",
+            route: "a",
+            scope: None,
+            write: false,
+            priority: 1,
+        }],
+        None,
+    )?;
+    let context = ExecutionContext::from(&admitted);
+    let lane = admitted.admitted_lanes[0].clone();
+    coordinator.start_attempt(context.clone(), lane.attempt_id.clone())?;
+    coordinator.mark_worker_lost(
+        context.clone(),
+        worker_fence(&lane, "s5e", "proof-fence-s5e")?,
+    )?;
+    let new_attempt = AttemptId::new("attempt-s5e-new")?;
+    let new_lease = serde_json::from_value::<WorkLeaseId>(
+        serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-s5e-new"}),
+    )?;
+    let new_worker = WorkerId::new("worker-s5e-new")?;
+    coordinator.reassign(
+        context.clone(),
+        ProviderReassignmentReceipt {
+            reassignment_id: ReassignmentId::new("reassign-s5e")?,
+            provider_identity: provider_identity(),
+            g11_receipt_ref: "proof-reassign-s5e".to_owned(),
+            old_attempt_id: lane.attempt_id.clone(),
+            old_lease_id: lane.lease_id.clone(),
+            new_attempt_id: new_attempt.clone(),
+            new_lease_id: new_lease.clone(),
+            new_worker_id: new_worker.clone(),
+            route: lane.route.clone(),
+            budget: budget(),
+        },
+    )?;
+    let reassigned = coordinator
+        .attempt(&new_attempt)
+        .unwrap_or_else(|| panic!("reassigned attempt must exist"))
+        .clone();
+    assert_eq!(reassigned.admitted_route, None);
+    coordinator.start_attempt(context.clone(), new_attempt.clone())?;
+    // Build a submission naming the new identity; the embedded binding and
+    // digest are well-formed for the new identity but no stored decision
+    // exists, so intake names the admission owner.
+    let fake_lane = AdmittedLaneReceipt {
+        work_unit_id: reassigned.work_unit_id.clone(),
+        role_id: reassigned.role_id.clone(),
+        role_revision: reassigned.role_revision.clone(),
+        attempt_id: new_attempt.clone(),
+        lease_id: new_lease.clone(),
+        worker_id: new_worker.clone(),
+        work_class: reassigned.work_class,
+        route: reassigned.route.clone(),
+        routing_receipt_digest: lane.routing_receipt_digest.clone(),
+        budget: reassigned.budget.clone(),
+        priority: reassigned.priority,
+        mutation_scope: reassigned.mutation_scope.clone(),
+        admitted_route: None,
+    };
+    let mut submission = result_submission("s5e-new", &fake_lane, ResultDisposition::Partial)?;
+    submission.provider_result_receipt_ref = "proof-result-s5e-new".to_owned();
+    assert_eq!(
+        coordinator.submit_result(context, submission).err(),
+        Some(CoordinatorError::IdentityConflict("admitted_route"))
+    );
+    Ok(())
+}
+
+#[test]
+fn s5_forged_lane_admission_rejects_at_admit() -> TestResult {
+    // Forged decisions are rejected at admission, never stored: wrong
+    // attempt/route/digest/policy and no-route denials all fail closed, and
+    // a tampered self_digest fails as a provider contract (shape) error.
+    let mut coord = coordinator(config(4, 4), &["proof-admission-s5f"])?;
+    let candidate = coord.plan(request(
+        "s5f",
+        &[LaneSpec {
+            work: "work-s5f",
+            role: "reader-s5f",
+            route: "a",
+            scope: None,
+            write: false,
+            priority: 1,
+        }],
+        None,
+    )?)?;
+    let good = provider_receipt(&candidate, "s5f")?;
+    // Sanity: the good receipt admits.
+    let mut sanity = crate::core::AgentCoordinator::with_provider(
+        config(4, 4),
+        Box::new(verifier(&["proof-admission-s5f"], 0)),
+    )?;
+    let sanity_candidate = sanity.plan(request(
+        "s5f-sanity",
+        &[LaneSpec {
+            work: "work-s5f",
+            role: "reader-s5f",
+            route: "a",
+            scope: None,
+            write: false,
+            priority: 1,
+        }],
+        None,
+    )?)?;
+    sanity.admit(provider_receipt(&sanity_candidate, "s5f")?)?;
+
+    // Wrong attempt identity (recomputed digest isolates the linkage failure).
+    let mut wrong_attempt = good.clone();
+    {
+        let lane = &mut wrong_attempt.admitted_lanes[0];
+        let admission = lane
+            .admitted_route
+            .as_mut()
+            .unwrap_or_else(|| panic!("lane must carry admission"));
+        admission.attempt_id = AttemptId::new("attempt-s5f-foreign")?;
+        admission.self_digest = admission.compute_digest()?;
+    }
+    assert_eq!(
+        coord.admit(wrong_attempt).err(),
+        Some(CoordinatorError::IdentityConflict("admitted_route"))
+    );
+
+    // Wrong route (requested/selected no longer match the lane).
+    let mut wrong_route = good.clone();
+    {
+        let lane = &mut wrong_route.admitted_lanes[0];
+        let admission = lane
+            .admitted_route
+            .as_mut()
+            .unwrap_or_else(|| panic!("lane must carry admission"));
+        admission.requested_route = route("b");
+        admission.selected_route = Some(route("b"));
+        admission.self_digest = admission.compute_digest()?;
+    }
+    assert_eq!(
+        coord.admit(wrong_route).err(),
+        Some(CoordinatorError::IdentityConflict("admitted_route"))
+    );
+
+    // Wrong candidate digest (exact bytes no longer bound).
+    let mut wrong_digest = good.clone();
+    {
+        let lane = &mut wrong_digest.admitted_lanes[0];
+        let admission = lane
+            .admitted_route
+            .as_mut()
+            .unwrap_or_else(|| panic!("lane must carry admission"));
+        admission.candidate_digest = zero_digest()?;
+        admission.self_digest = admission.compute_digest()?;
+    }
+    assert_eq!(
+        coord.admit(wrong_digest).err(),
+        Some(CoordinatorError::IdentityConflict("admitted_route"))
+    );
+
+    // No-route denial cannot back an attempt (selected absent).
+    let mut no_route = good.clone();
+    {
+        let lane = &mut no_route.admitted_lanes[0];
+        let admission = lane
+            .admitted_route
+            .as_mut()
+            .unwrap_or_else(|| panic!("lane must carry admission"));
+        admission.selected_route = None;
+        admission.no_route = Some(eliot_agent_api::NoRouteDisposition::AdmissionDenied);
+        admission.self_digest = admission.compute_digest()?;
+    }
+    assert_eq!(
+        coord.admit(no_route).err(),
+        Some(CoordinatorError::IdentityConflict("admitted_route"))
+    );
+
+    // Tampered self_digest without recompute fails as a shape/contract error.
+    let mut bad_digest = good.clone();
+    {
+        let lane = &mut bad_digest.admitted_lanes[0];
+        let admission = lane
+            .admitted_route
+            .as_mut()
+            .unwrap_or_else(|| panic!("lane must carry admission"));
+        admission.self_digest = zero_digest()?;
+    }
+    assert!(matches!(
+        coord.admit(bad_digest).err(),
+        Some(CoordinatorError::ProviderContract(_))
+    ));
+    Ok(())
+}
+
+fn host_event_envelope(
+    lane: &AdmittedLaneReceipt,
+    binding: &ProviderExecutionBinding,
+    sequence: u64,
+    cursor_tag: &str,
+    event_tag: &str,
+) -> TestResult<NormalizedHostEventEnvelope> {
+    let cursor = EventCursor::new(format!("cursor-{cursor_tag}"))?;
+    let raw_bytes = format!("host-event-source-{event_tag}").into_bytes();
+    let raw = RawSourceRecord {
+        handle: RestrictedRawSourceHandle::new(format!("restricted-test:{event_tag}"))?,
+        digest: QualifiedSourceDigest {
+            algorithm: HOST_EVENT_DIGEST_ALGORITHM.to_owned(),
+            digest: serde_json::from_value(serde_json::json!(sha256_hex(&raw_bytes)))?,
+        },
+    };
+    let stored = lane
+        .admitted_route
+        .as_ref()
+        .ok_or("lane must carry the stored admission")?;
+    let mut envelope = NormalizedHostEventEnvelope {
+        schema_version: HOST_EVENT_CONTRACT_VERSION.to_owned(),
+        event_id: EventId::new(format!("evt-{event_tag}"))?,
+        cursor: cursor.clone(),
+        lineage: ProviderObservationLineage::ExecutionUnitObservation(Box::new(
+            ExecutionUnitObservation {
+                binding: binding.clone(),
+                cursor,
+                sequence,
+            },
+        )),
+        producer_adapter_identity: "test-adapter".into(),
+        adapter_contract_version: "test-adapter/v1".into(),
+        sequence,
+        causal_predecessors: Vec::new(),
+        payload: NormalizedHostEventPayload::AssistantDelta(AssistantDeltaObservation {
+            delta_chars: 4,
+            truncated: false,
+        }),
+        admitted_route_digest: Some(stored.self_digest.clone()),
+        raw_source: raw.clone(),
+        normalization: HostEventNormalizationReceipt {
+            normalizer_identity: "test-adapter".into(),
+            normalizer_version: "test-adapter/v1".into(),
+            input_handle: raw.handle.clone(),
+            input_digest: raw.digest.clone(),
+            output_schema_version: HOST_EVENT_CONTRACT_VERSION.to_owned(),
+            output_digest: zero_digest()?,
+            omitted_fields: Vec::new(),
+            warnings: Vec::new(),
+            unsupported_disposition: UnsupportedDisposition::None,
+            privacy_class: HostEventPrivacyClass::RedactedSummary,
+            coverage: NormalizationCoverage::Complete,
+            proof_ceiling: eliot_receipts::ProofCeiling::Observation,
+        },
+        observed_at: ClockReading {
+            valid_time_ms: Some(1_700_000_000_000),
+            known_time_ms: Some(1_700_000_000_001),
+            transaction_sequence: None,
+            monotonic_ns: None,
+        },
+        delivery: HostEventDeliveryDisposition::DurableOrdered,
+    };
+    envelope
+        .seal()
+        .map_err(|error| format!("envelope must seal: {error}"))?;
+    Ok(envelope)
+}
+
+fn bound_observe_setup() -> TestResult<(
+    AgentCoordinator,
+    ExecutionContext,
+    AdmittedLaneReceipt,
+    ProviderExecutionBinding,
+)> {
+    let proofs = ["proof-admission-observe", "proof-bind-observe"];
+    let mut coordinator = coordinator(config(4, 4), &proofs)?;
+    let admitted = plan_and_admit(
+        &mut coordinator,
+        "observe",
+        &[bind_lane_spec("work-observe", "reader-observe", "a")],
+        None,
+    )?;
+    let context = ExecutionContext::from(&admitted);
+    let lane = admitted.admitted_lanes[0].clone();
+    coordinator.start_attempt(context.clone(), lane.attempt_id.clone())?;
+    let stored = coordinator.bind_provider_execution(
+        context.clone(),
+        binding_submission("observe", &lane, "unit-observe", "scope-observe")?,
+    )?;
+    Ok((coordinator, context, lane, stored))
+}
+
+#[test]
+fn observe_accepts_exact_binding_and_replays_without_duplicate_effects() -> TestResult {
+    let (mut coordinator, context, lane, stored) = bound_observe_setup()?;
+    let envelope = host_event_envelope(&lane, &stored, 1, "observe-1", "observe-1")?;
+    let receipt = envelope.normalization.clone();
+    let events_before = coordinator.events().len();
+    coordinator.observe_provider_event(context.clone(), envelope.clone(), receipt.clone())?;
+    assert_eq!(coordinator.events().len(), events_before + 1);
+    // Exact replay is idempotent: no new event, no duplicate effects.
+    coordinator.observe_provider_event(context.clone(), envelope.clone(), receipt.clone())?;
+    assert_eq!(coordinator.events().len(), events_before + 1);
+    // Conflicting same-identity replay is quarantined with its typed reason
+    // (issue #371 S7): a changed payload is `ConflictingPayload`, never a
+    // generic conflict, and nothing is mutated.
+    let mut conflict = envelope.clone();
+    conflict.payload = NormalizedHostEventPayload::AssistantDelta(AssistantDeltaObservation {
+        delta_chars: 5,
+        truncated: false,
+    });
+    conflict
+        .seal()
+        .map_err(|error| format!("conflict must seal: {error}"))?;
+    let conflict_receipt = conflict.normalization.clone();
+    assert_eq!(
+        coordinator.observe_provider_event(context, conflict, conflict_receipt),
+        Err(CoordinatorError::HostEventQuarantine(
+            HostEventQuarantineReason::ConflictingPayload
+        ))
+    );
+    assert_eq!(coordinator.events().len(), events_before + 1);
+    Ok(())
+}
+
+#[test]
+fn observe_rejects_foreign_turn_and_unknown_attempt_before_mutation() -> TestResult {
+    let (mut coordinator, context, lane, _stored) = bound_observe_setup()?;
+    let events_before = coordinator.events().len();
+    // Same thread, different provider turn: the foreign unit cannot enter the
+    // recorded attempt even though the attempt identity matches.
+    let foreign = binding_submission("observe-f", &lane, "unit-foreign", "scope-observe")?.binding;
+    let foreign_event = host_event_envelope(&lane, &foreign, 1, "observe-f-1", "observe-f-1")?;
+    let foreign_receipt = foreign_event.normalization.clone();
+    assert_eq!(
+        coordinator.observe_provider_event(context.clone(), foreign_event, foreign_receipt),
+        Err(CoordinatorError::IdentityConflict("execution_binding"))
+    );
+    assert_eq!(coordinator.events().len(), events_before);
+    // A caller-selected identity for an unknown attempt resolves to nothing.
+    let mut ghost = host_event_envelope(
+        &lane,
+        &binding_submission("observe", &lane, "unit-observe", "scope-observe")?.binding,
+        1,
+        "observe-g-1",
+        "observe-g-1",
+    )?;
+    if let ProviderObservationLineage::ExecutionUnitObservation(observation) = &mut ghost.lineage {
+        observation.binding.attempt_id = AttemptId::new("attempt-ghost")?;
+    } else {
+        panic!("envelope must carry execution-unit lineage");
+    }
+    ghost
+        .seal()
+        .map_err(|error| format!("ghost must seal: {error}"))?;
+    let ghost_receipt = ghost.normalization.clone();
+    assert_eq!(
+        coordinator.observe_provider_event(context, ghost, ghost_receipt),
+        Err(CoordinatorError::UnknownAttempt)
+    );
+    assert_eq!(coordinator.events().len(), events_before);
+    Ok(())
+}
+
+/// Builds a session-only observation envelope through the real S6 api
+/// constructors plus `seal()` (adapter-style normalized envelope+receipt, no
+/// mock adapter). Session lineage carries no admission reference and the
+/// session stays `None`: no session is invented here (T1/T5 own admission).
+fn session_event_envelope(
+    tag: &str,
+    event_tag: &str,
+    payload: NormalizedHostEventPayload,
+) -> TestResult<NormalizedHostEventEnvelope> {
+    let cursor = EventCursor::new(format!("cursor-session-{tag}"))?;
+    let raw_bytes = format!("host-event-session-source-{event_tag}").into_bytes();
+    let raw = RawSourceRecord {
+        handle: RestrictedRawSourceHandle::new(format!("restricted-session-test:{event_tag}"))?,
+        digest: QualifiedSourceDigest {
+            algorithm: HOST_EVENT_DIGEST_ALGORITHM.to_owned(),
+            digest: serde_json::from_value(serde_json::json!(sha256_hex(&raw_bytes)))?,
+        },
+    };
+    let mut envelope = NormalizedHostEventEnvelope {
+        schema_version: HOST_EVENT_CONTRACT_VERSION.to_owned(),
+        event_id: EventId::new(format!("evt-session-{event_tag}"))?,
+        cursor: cursor.clone(),
+        lineage: ProviderObservationLineage::SessionObservation(SessionObservation {
+            session_id: None,
+            native: NativeSession::Native(NativeSessionLocator::new(format!("thread-{tag}"))?),
+        }),
+        producer_adapter_identity: "test-adapter".into(),
+        adapter_contract_version: "test-adapter/v1".into(),
+        sequence: 1,
+        causal_predecessors: Vec::new(),
+        payload,
+        admitted_route_digest: None,
+        raw_source: raw.clone(),
+        normalization: HostEventNormalizationReceipt {
+            normalizer_identity: "test-adapter".into(),
+            normalizer_version: "test-adapter/v1".into(),
+            input_handle: raw.handle.clone(),
+            input_digest: raw.digest.clone(),
+            output_schema_version: HOST_EVENT_CONTRACT_VERSION.to_owned(),
+            output_digest: zero_digest()?,
+            omitted_fields: Vec::new(),
+            warnings: Vec::new(),
+            unsupported_disposition: UnsupportedDisposition::None,
+            privacy_class: HostEventPrivacyClass::RedactedSummary,
+            coverage: NormalizationCoverage::Complete,
+            proof_ceiling: eliot_receipts::ProofCeiling::Observation,
+        },
+        observed_at: ClockReading {
+            valid_time_ms: Some(1_700_000_000_000),
+            known_time_ms: Some(1_700_000_000_001),
+            transaction_sequence: None,
+            monotonic_ns: None,
+        },
+        delivery: HostEventDeliveryDisposition::DurableOrdered,
+    };
+    envelope
+        .seal()
+        .map_err(|error| format!("session envelope must seal: {error}"))?;
+    Ok(envelope)
+}
+
+#[test]
+fn observe_changed_duplicate_quarantines_with_typed_reason_per_dimension() -> TestResult {
+    let (mut coordinator, context, lane, stored) = bound_observe_setup()?;
+    let envelope = host_event_envelope(&lane, &stored, 1, "typed-1", "typed-1")?;
+    let receipt = envelope.normalization.clone();
+    let events_before = coordinator.events().len();
+    coordinator.observe_provider_event(context.clone(), envelope.clone(), receipt.clone())?;
+
+    // Same-turn steer of the lineage binding under the same event identity is
+    // a cross-turn replay: quarantined as lineage, never advancing any
+    // attempt.
+    let cross_turn_binding =
+        binding_submission("typed-x", &lane, "unit-typed-x", "scope-observe")?.binding;
+    let mut lineage = envelope.clone();
+    if let ProviderObservationLineage::ExecutionUnitObservation(observation) = &mut lineage.lineage
+    {
+        observation.binding = cross_turn_binding;
+    } else {
+        panic!("envelope must carry execution-unit lineage");
+    }
+    lineage
+        .seal()
+        .map_err(|error| format!("lineage conflict must seal: {error}"))?;
+    let lineage_receipt = lineage.normalization.clone();
+    assert_eq!(
+        coordinator.observe_provider_event(context.clone(), lineage, lineage_receipt),
+        Err(CoordinatorError::HostEventQuarantine(
+            HostEventQuarantineReason::ConflictingLineage
+        ))
+    );
+
+    // Same identity with different restricted source bytes quarantines as
+    // source (first differing dimension wins over the rebound receipt).
+    let mut source = envelope.clone();
+    let alt_bytes = b"host-event-source-typed-1-alt".to_vec();
+    let alt_digest: LowercaseSha256 =
+        serde_json::from_value(serde_json::json!(sha256_hex(&alt_bytes)))?;
+    source.raw_source.handle = RestrictedRawSourceHandle::new("restricted-test:typed-1-alt")?;
+    source.raw_source.digest = QualifiedSourceDigest {
+        algorithm: HOST_EVENT_DIGEST_ALGORITHM.to_owned(),
+        digest: alt_digest,
+    };
+    source.normalization.input_handle = source.raw_source.handle.clone();
+    source.normalization.input_digest = source.raw_source.digest.clone();
+    source
+        .seal()
+        .map_err(|error| format!("source conflict must seal: {error}"))?;
+    let source_receipt = source.normalization.clone();
+    assert_eq!(
+        coordinator.observe_provider_event(context.clone(), source, source_receipt),
+        Err(CoordinatorError::HostEventQuarantine(
+            HostEventQuarantineReason::ConflictingSource
+        ))
+    );
+
+    // Same identity and source bytes with a changed normalization manifest
+    // quarantines as normalization.
+    let mut normalization = envelope.clone();
+    normalization
+        .normalization
+        .warnings
+        .push("test-warning".to_owned());
+    normalization
+        .seal()
+        .map_err(|error| format!("normalization conflict must seal: {error}"))?;
+    let normalization_receipt = normalization.normalization.clone();
+    assert_eq!(
+        coordinator.observe_provider_event(context.clone(), normalization, normalization_receipt),
+        Err(CoordinatorError::HostEventQuarantine(
+            HostEventQuarantineReason::ConflictingNormalization
+        ))
+    );
+
+    // A sealed framing-only change (delivery) is bound by the receipt output
+    // digest, so it surfaces as a normalization conflict rather than
+    // silently; the S6 `ConflictingFraming` bucket remains the defensive
+    // fallback for valid-framing duplicates whose compared dimensions all
+    // match, and it passes through unchanged.
+    let mut framing = envelope.clone();
+    framing.delivery = HostEventDeliveryDisposition::Replay;
+    framing
+        .seal()
+        .map_err(|error| format!("framing conflict must seal: {error}"))?;
+    let framing_receipt = framing.normalization.clone();
+    assert_eq!(
+        coordinator.observe_provider_event(context.clone(), framing, framing_receipt),
+        Err(CoordinatorError::HostEventQuarantine(
+            HostEventQuarantineReason::ConflictingNormalization
+        ))
+    );
+
+    // No quarantine path mutated durable state: exactly the one observation.
+    assert_eq!(coordinator.events().len(), events_before + 1);
+    Ok(())
+}
+
+#[test]
+fn observe_gap_reorder_and_stale_sequence_are_explicit() -> TestResult {
+    let (mut coordinator, context, lane, stored) = bound_observe_setup()?;
+    let events_before = coordinator.events().len();
+    let first = host_event_envelope(&lane, &stored, 1, "seq-1", "seq-1")?;
+    coordinator.observe_provider_event(
+        context.clone(),
+        first.clone(),
+        first.normalization.clone(),
+    )?;
+    // Forward jump records an explicit gap marker before the observation; the
+    // marker itself advances no cursor (ordering evidence only).
+    let third = host_event_envelope(&lane, &stored, 3, "seq-3", "seq-3")?;
+    coordinator.observe_provider_event(
+        context.clone(),
+        third.clone(),
+        third.normalization.clone(),
+    )?;
+    assert_eq!(coordinator.events().len(), events_before + 3);
+    match &coordinator.events()[events_before + 1] {
+        CoordinatorEvent::ProviderHostEventGap {
+            expected_sequence,
+            observed_sequence,
+            ..
+        } => {
+            assert_eq!((*expected_sequence, *observed_sequence), (2, 3));
+        }
+        other => panic!("expected an explicit gap marker, got {other:?}"),
+    }
+    // Exact replay of the post-gap event stays idempotent.
+    coordinator.observe_provider_event(
+        context.clone(),
+        third.clone(),
+        third.normalization.clone(),
+    )?;
+    assert_eq!(coordinator.events().len(), events_before + 3);
+    // Reordered arrival under a new identity with a nonmonotonic sequence
+    // stays stale without mutation.
+    let second = host_event_envelope(&lane, &stored, 2, "seq-2", "seq-2")?;
+    assert_eq!(
+        coordinator.observe_provider_event(
+            context.clone(),
+            second.clone(),
+            second.normalization.clone()
+        ),
+        Err(CoordinatorError::StaleResult)
+    );
+    assert_eq!(coordinator.events().len(), events_before + 3);
+    // The next in-order event advances with no new gap.
+    let fourth = host_event_envelope(&lane, &stored, 4, "seq-4", "seq-4")?;
+    coordinator.observe_provider_event(
+        context.clone(),
+        fourth.clone(),
+        fourth.normalization.clone(),
+    )?;
+    assert_eq!(coordinator.events().len(), events_before + 4);
+    match &coordinator.events()[events_before + 3] {
+        CoordinatorEvent::ProviderHostEventObserved { .. } => {}
+        other => panic!("expected a direct observation without a gap, got {other:?}"),
+    }
+    Ok(())
+}
+
+#[test]
+fn observe_session_only_mutates_nothing_and_terminal_never_reaches_intake() -> TestResult {
+    let (mut coordinator, context, lane, stored) = bound_observe_setup()?;
+    let events_before = coordinator.events().len();
+    let binding_before = coordinator
+        .attempt(&lane.attempt_id)
+        .unwrap_or_else(|| panic!("bound attempt must exist"))
+        .provider_binding
+        .clone();
+    // A valid session-only observation is accepted but mutates no attempt
+    // state: no sequencing entry, no cursor advance, no result.
+    let session = session_event_envelope(
+        "session-1",
+        "session-1",
+        NormalizedHostEventPayload::SessionLifecycle(SessionLifecycleObservation {
+            transition: SessionLifecycleTransition::Started,
+            detail_ref: None,
+        }),
+    )?;
+    coordinator.observe_provider_event(
+        context.clone(),
+        session.clone(),
+        session.normalization.clone(),
+    )?;
+    assert_eq!(coordinator.events().len(), events_before + 1);
+    assert_eq!(
+        coordinator
+            .attempt(&lane.attempt_id)
+            .unwrap_or_else(|| panic!("bound attempt must exist"))
+            .provider_binding,
+        binding_before
+    );
+    // Exact session replay is idempotent.
+    coordinator.observe_provider_event(
+        context.clone(),
+        session.clone(),
+        session.normalization.clone(),
+    )?;
+    assert_eq!(coordinator.events().len(), events_before + 1);
+    // Attempt sequencing is untouched: the next execution-unit event continues
+    // the attempt stream with no gap.
+    let next = host_event_envelope(&lane, &stored, 1, "sess-next-1", "sess-next-1")?;
+    coordinator.observe_provider_event(
+        context.clone(),
+        next.clone(),
+        next.normalization.clone(),
+    )?;
+    assert_eq!(coordinator.events().len(), events_before + 2);
+    match &coordinator.events()[events_before + 1] {
+        CoordinatorEvent::ProviderHostEventObserved { .. } => {}
+        other => panic!("session observation must not emit a gap, got {other:?}"),
+    }
+    // Session-terminal smuggling: an attempt-usage payload on session lineage
+    // cannot validate as a session observation.
+    let terminal = session_event_envelope(
+        "session-t",
+        "session-t",
+        NormalizedHostEventPayload::Usage(usage()),
+    )?;
+    assert_eq!(
+        coordinator.observe_provider_event(
+            context.clone(),
+            terminal.clone(),
+            terminal.normalization.clone()
+        ),
+        Err(CoordinatorError::IdentityConflict("execution_binding"))
+    );
+    // Session-lifecycle payload on execution-unit lineage is rejected before
+    // any mutation.
+    let mut misplaced = host_event_envelope(&lane, &stored, 9, "sess-mis-9", "sess-mis-9")?;
+    misplaced.payload = NormalizedHostEventPayload::SessionLifecycle(SessionLifecycleObservation {
+        transition: SessionLifecycleTransition::Closed,
+        detail_ref: None,
+    });
+    misplaced
+        .seal()
+        .map_err(|error| format!("misplaced session payload must seal: {error}"))?;
+    assert_eq!(
+        coordinator.observe_provider_event(
+            context.clone(),
+            misplaced.clone(),
+            misplaced.normalization.clone()
+        ),
+        Err(CoordinatorError::IdentityConflict("execution_binding"))
+    );
+    assert_eq!(coordinator.events().len(), events_before + 2);
+    Ok(())
+}
+
+#[test]
+fn observe_e2e_lost_ack_reconstruct_replay_once_without_duplicate_effects() -> TestResult {
+    // Owner-path end to end on real api constructors (no mock adapter):
+    // ingest a normalized envelope+receipt, lose the acknowledgement,
+    // reconstruct via restore, replay once. Until a real durable
+    // Store/Governor edge exists this asserts on the in-memory event-log plus
+    // snapshot only; the installed durable commit remains controller track
+    // and no `Store` commit is invented here.
+    let cfg = config(4, 4);
+    let mut coordinator = production_coordinator(cfg.clone())?;
+    let admitted = plan_and_admit(
+        &mut coordinator,
+        "e2e-observe",
+        &[bind_lane_spec(
+            "work-e2e-observe",
+            "reader-e2e-observe",
+            "a",
+        )],
+        None,
+    )?;
+    let context = ExecutionContext::from(&admitted);
+    let lane = admitted.admitted_lanes[0].clone();
+    coordinator.start_attempt(context.clone(), lane.attempt_id.clone())?;
+    let stored = coordinator.bind_provider_execution(
+        context.clone(),
+        binding_submission(
+            "e2e-observe",
+            &lane,
+            "unit-e2e-observe",
+            "scope-e2e-observe",
+        )?,
+    )?;
+    // No session is invented at binding time: the projected session stays
+    // `None` until T1/T5 supply session admission.
+    assert!(stored.session_id.is_none());
+
+    // Durable baseline before the event exists.
+    let pre_snapshot = coordinator.snapshot()?;
+    let event_count_before = coordinator.events().len();
+
+    // Ingest one real adapter-style normalized envelope+receipt. The
+    // acknowledgement is then lost (in-memory state dropped before any
+    // further durable commit): reconstruct from the pre-ingest snapshot,
+    // which cannot contain the event.
+    let envelope = host_event_envelope(&lane, &stored, 1, "e2e-1", "e2e-1")?;
+    let receipt = envelope.normalization.clone();
+    coordinator.observe_provider_event(context.clone(), envelope.clone(), receipt.clone())?;
+    assert_eq!(coordinator.events().len(), event_count_before + 1);
+    drop(coordinator);
+    let mut coordinator = AgentCoordinator::restore_with_admitted_provider(
+        pre_snapshot.clone(),
+        cfg.clone(),
+        admitted_capability(pre_snapshot.event_sequence)?,
+    )?;
+    assert_eq!(coordinator.events().len(), event_count_before);
+    // Replay once: accepted exactly once, never duplicated.
+    coordinator.observe_provider_event(context.clone(), envelope.clone(), receipt.clone())?;
+    assert_eq!(coordinator.events().len(), event_count_before + 1);
+
+    // Redelivery after durability is idempotent: snapshot, restore, replay,
+    // and prove no duplicate usage/result mutation (event count, event log,
+    // and snapshot digest all unchanged).
+    let durable = coordinator.snapshot()?;
+    let mut restored = AgentCoordinator::restore_with_admitted_provider(
+        durable.clone(),
+        cfg.clone(),
+        admitted_capability(durable.event_sequence)?,
+    )?;
+    assert_eq!(restored.events(), coordinator.events());
+    restored.observe_provider_event(context.clone(), envelope.clone(), receipt.clone())?;
+    assert_eq!(restored.events(), coordinator.events());
+    assert_eq!(restored.snapshot()?, durable);
+
+    // A session-terminal input on the restored state still cannot reach
+    // result intake.
+    let terminal = session_event_envelope(
+        "e2e-session-t",
+        "e2e-session-t",
+        NormalizedHostEventPayload::Usage(usage()),
+    )?;
+    assert_eq!(
+        restored.observe_provider_event(
+            context.clone(),
+            terminal.clone(),
+            terminal.normalization.clone()
+        ),
+        Err(CoordinatorError::IdentityConflict("execution_binding"))
+    );
+    assert_eq!(restored.events(), coordinator.events());
+
+    // A foreign turn never reaches result intake: the binding gate rejects it
+    // even though the attempt identity matches.
+    let foreign_binding = binding_submission(
+        "e2e-foreign",
+        &lane,
+        "unit-e2e-foreign",
+        "scope-e2e-observe",
+    )?
+    .binding;
+    let mut foreign = result_submission("e2e-foreign", &lane, ResultDisposition::Partial)?;
+    foreign.result.actual_route = matched_observation(&lane, &foreign_binding)?;
+    assert_eq!(
+        restored.submit_result(context.clone(), foreign).err(),
+        Some(CoordinatorError::IdentityConflict("execution_binding"))
+    );
+
+    // The replays synthesized no usage/result: exact intake still closes
+    // exactly once, and a second intake is a duplicate.
+    let mut submission = result_submission("e2e-observe", &lane, ResultDisposition::Partial)?;
+    submission.result.actual_route = matched_observation(&lane, &stored)?;
+    let intake = restored.submit_result(context.clone(), submission)?;
+    assert_eq!(
+        intake.proof_ceiling,
+        eliot_receipts::ProofCeiling::CandidateArtifact
+    );
+    let mut again = result_submission("e2e-observe-again", &lane, ResultDisposition::Partial)?;
+    again.result.actual_route = matched_observation(&lane, &stored)?;
+    assert_eq!(
+        restored.submit_result(context, again).err(),
+        Some(CoordinatorError::DuplicateResult)
+    );
+    Ok(())
+}
+
+#[test]
+fn production_verifier_admits_binds_and_accepts_result() -> TestResult {
+    let mut coordinator = production_coordinator(config(4, 4))?;
+    let admitted = plan_and_admit(
+        &mut coordinator,
+        "prod-abr",
+        &[bind_lane_spec("work-prod-abr", "reader-prod-abr", "a")],
+        None,
+    )?;
+    let context = ExecutionContext::from(&admitted);
+    let lane = admitted.admitted_lanes[0].clone();
+    coordinator.start_attempt(context.clone(), lane.attempt_id.clone())?;
+    let binding = coordinator.bind_provider_execution(
+        context.clone(),
+        binding_submission("prod-abr", &lane, "unit-prod-abr", "scope-prod-abr")?,
+    )?;
+    assert_eq!(
+        coordinator
+            .attempt(&lane.attempt_id)
+            .unwrap_or_else(|| panic!("bound attempt must exist"))
+            .provider_binding,
+        Some(binding.clone())
+    );
+    // The result closes on the exact stored binding, never a second unit.
+    let mut submission = result_submission("prod-abr", &lane, ResultDisposition::Partial)?;
+    submission.result.actual_route = matched_observation(&lane, &binding)?;
+    let receipt = coordinator.submit_result(context, submission)?;
+    assert_eq!(
+        receipt.proof_ceiling,
+        eliot_receipts::ProofCeiling::CandidateArtifact
+    );
+    Ok(())
+}
+
+#[test]
+fn production_verifier_reconciles_cancellation() -> TestResult {
+    let mut coordinator = production_coordinator(config(2, 2))?;
+    let admitted = plan_and_admit(
+        &mut coordinator,
+        "prod-cancel",
+        &[bind_lane_spec(
+            "work-prod-cancel",
+            "reader-prod-cancel",
+            "a",
+        )],
+        None,
+    )?;
+    let context = ExecutionContext::from(&admitted);
+    let lane = admitted.admitted_lanes[0].clone();
+    coordinator.start_attempt(context.clone(), lane.attempt_id.clone())?;
+    let operation_id = OperationId::new("operation-prod-cancel")?;
+    coordinator.request_cancellation(
+        context.clone(),
+        CancelCommand {
+            operation_id: operation_id.clone(),
+            attempt_id: lane.attempt_id.clone(),
+            lease_id: lane.lease_id.clone(),
+            worker_id: lane.worker_id.clone(),
+            reason: CancelReason::UserRequested,
+        },
+    )?;
+    let final_receipt = coordinator.reconcile_cancellation(
+        context,
+        ProviderCancellationReconciliation {
+            reconciliation_id: CancellationReconciliationId::new("cancel-final-prod")?,
+            request_operation_id: operation_id,
+            attempt_id: lane.attempt_id.clone(),
+            lease_id: lane.lease_id.clone(),
+            worker_id: lane.worker_id.clone(),
+            provider_identity: provider_identity(),
+            no_effect_or_cleanup_receipt_ref: "proof-cancel-prod".to_owned(),
+        },
+    )?;
+    assert_eq!(final_receipt.attempt_id, lane.attempt_id);
+    assert_eq!(
+        final_receipt.state,
+        crate::CoordinatedAttemptState::Cancelled
+    );
+    Ok(())
+}
+
+#[test]
+fn production_verifier_fences_and_reassigns() -> TestResult {
+    let mut coordinator = production_coordinator(config(4, 4))?;
+    let admitted = plan_and_admit(
+        &mut coordinator,
+        "prod-fence",
+        &[bind_lane_spec("work-prod-fence", "reader-prod-fence", "a")],
+        None,
+    )?;
+    let context = ExecutionContext::from(&admitted);
+    let lane = admitted.admitted_lanes[0].clone();
+    coordinator.start_attempt(context.clone(), lane.attempt_id.clone())?;
+    coordinator.mark_worker_lost(
+        context.clone(),
+        worker_fence(&lane, "prod-fence", "proof-fence-prod")?,
+    )?;
+    let new_attempt = AttemptId::new("attempt-prod-fence-new")?;
+    coordinator.reassign(
+        context,
+        ProviderReassignmentReceipt {
+            reassignment_id: ReassignmentId::new("reassign-prod-fence")?,
+            provider_identity: provider_identity(),
+            g11_receipt_ref: "proof-reassign-prod".to_owned(),
+            old_attempt_id: lane.attempt_id.clone(),
+            old_lease_id: lane.lease_id.clone(),
+            new_attempt_id: new_attempt.clone(),
+            new_lease_id: serde_json::from_value::<WorkLeaseId>(
+                serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-prod-fence-new"}),
+            )?,
+            new_worker_id: WorkerId::new("worker-prod-fence-new")?,
+            route: lane.route.clone(),
+            budget: budget(),
+        },
+    )?;
+    assert!(coordinator.attempt(&new_attempt).is_some());
+    Ok(())
+}
+
+#[test]
+fn production_verifier_reconciles_unknown_outcome() -> TestResult {
+    let mut coordinator = production_coordinator(config(2, 2))?;
+    let admitted = plan_and_admit(
+        &mut coordinator,
+        "prod-unknown",
+        &[bind_lane_spec(
+            "work-prod-unknown",
+            "reader-prod-unknown",
+            "a",
+        )],
+        None,
+    )?;
+    let context = ExecutionContext::from(&admitted);
+    let lane = admitted.admitted_lanes[0].clone();
+    coordinator.start_attempt(context.clone(), lane.attempt_id.clone())?;
+    let submission = result_submission("prod-unknown", &lane, ResultDisposition::UnknownOutcome)?;
+    let submission_id = submission.submission_id.clone();
+    coordinator.submit_result(context.clone(), submission)?;
+    let final_receipt = coordinator.reconcile_unknown_outcome(
+        context,
+        ProviderUnknownOutcomeReconciliation {
+            reconciliation_id: OutcomeReconciliationId::new("unknown-final-prod")?,
+            submission_id,
+            attempt_id: lane.attempt_id.clone(),
+            lease_id: lane.lease_id.clone(),
+            worker_id: lane.worker_id.clone(),
+            provider_identity: provider_identity(),
+            resolution: UnknownOutcomeResolution::NoEffect,
+            effect_reconciliation_ref: "proof-unknown-prod".to_owned(),
+        },
+    )?;
+    assert_eq!(
+        final_receipt.state,
+        crate::CoordinatedAttemptState::CandidateResultSubmitted
+    );
+    Ok(())
+}
+
+#[test]
+fn production_replay_is_idempotent_and_conflict_fails_closed() -> TestResult {
+    let mut coordinator = production_coordinator(config(2, 2))?;
+    let candidate = coordinator.plan(request(
+        "prod-replay",
+        &[bind_lane_spec(
+            "work-prod-replay",
+            "reader-prod-replay",
+            "a",
+        )],
+        None,
+    )?)?;
+    let receipt = provider_receipt(&candidate, "prod-replay")?;
+    let events_before = coordinator.events().len();
+    let first = coordinator.admit(receipt.clone())?;
+    assert_eq!(coordinator.events().len(), events_before + 1);
+    let replayed = coordinator.admit(receipt.clone())?;
+    assert_eq!(replayed, first);
+    assert_eq!(coordinator.events().len(), events_before + 1);
+    let mut conflict = receipt;
+    conflict.durable_job_ref = "durable-job-changed".to_owned();
+    assert_eq!(
+        coordinator.admit(conflict).err(),
+        Some(CoordinatorError::IdentityConflict("admission_id"))
+    );
+    assert_eq!(coordinator.events().len(), events_before + 1);
+    Ok(())
+}
+
+#[test]
+fn production_revoked_capability_fails_closed_without_mutation() -> TestResult {
+    let revoked = admitted_capability_for(
+        provider_identity(),
+        true,
+        "route-rev-7",
+        "capacity-rev-3",
+        "route-rev-7",
+        "capacity-rev-3",
+        1,
+        1,
+        0,
+    )?;
+    let mut coordinator = AgentCoordinator::new_with_admitted_provider(config(2, 2), revoked)?;
+    let candidate = coordinator.plan(request(
+        "prod-revoked",
+        &[bind_lane_spec(
+            "work-prod-revoked",
+            "reader-prod-revoked",
+            "a",
+        )],
+        None,
+    )?)?;
+    let before = coordinator.snapshot_json()?;
+    assert_eq!(
+        coordinator
+            .admit(provider_receipt(&candidate, "prod-revoked")?)
+            .err(),
+        Some(CoordinatorError::StaleProviderBinding)
+    );
+    assert_eq!(coordinator.snapshot_json()?, before);
+    Ok(())
+}
+
+#[test]
+fn production_stale_route_capacity_epoch_fail_closed() -> TestResult {
+    let stale_capacity = admitted_capability_for(
+        provider_identity(),
+        false,
+        "route-rev-7",
+        "capacity-rev-stale",
+        "route-rev-7",
+        "capacity-rev-3",
+        1,
+        1,
+        0,
+    )?;
+    let mut coordinator =
+        AgentCoordinator::new_with_admitted_provider(config(2, 2), stale_capacity)?;
+    let candidate = coordinator.plan(request(
+        "prod-stale-cap",
+        &[bind_lane_spec(
+            "work-prod-stale-cap",
+            "reader-prod-stale-cap",
+            "a",
+        )],
+        None,
+    )?)?;
+    let before = coordinator.snapshot_json()?;
+    assert_eq!(
+        coordinator
+            .admit(provider_receipt(&candidate, "prod-stale-cap")?)
+            .err(),
+        Some(CoordinatorError::StaleCapacity)
+    );
+    assert_eq!(coordinator.snapshot_json()?, before);
+
+    let stale_route = admitted_capability_for(
+        provider_identity(),
+        false,
+        "route-rev-stale",
+        "capacity-rev-3",
+        "route-rev-7",
+        "capacity-rev-3",
+        1,
+        1,
+        0,
+    )?;
+    let mut coordinator = AgentCoordinator::new_with_admitted_provider(config(2, 2), stale_route)?;
+    let candidate = coordinator.plan(request(
+        "prod-stale-route",
+        &[bind_lane_spec(
+            "work-prod-stale-route",
+            "reader-prod-stale-route",
+            "a",
+        )],
+        None,
+    )?)?;
+    assert_eq!(
+        coordinator
+            .admit(provider_receipt(&candidate, "prod-stale-route")?)
+            .err(),
+        Some(CoordinatorError::RouteEvidence)
+    );
+
+    let stale_epoch = admitted_capability_for(
+        provider_identity(),
+        false,
+        "route-rev-7",
+        "capacity-rev-3",
+        "route-rev-7",
+        "capacity-rev-3",
+        1,
+        2,
+        0,
+    )?;
+    let mut coordinator = AgentCoordinator::new_with_admitted_provider(config(2, 2), stale_epoch)?;
+    let candidate = coordinator.plan(request(
+        "prod-stale-epoch",
+        &[bind_lane_spec(
+            "work-prod-stale-epoch",
+            "reader-prod-stale-epoch",
+            "a",
+        )],
+        None,
+    )?)?;
+    assert_eq!(
+        coordinator
+            .admit(provider_receipt(&candidate, "prod-stale-epoch")?)
+            .err(),
+        Some(CoordinatorError::StaleController)
+    );
+    Ok(())
+}
+
+#[test]
+fn production_foreign_identity_fails_closed() -> TestResult {
+    let mut coordinator = production_coordinator(config(2, 2))?;
+    let candidate = coordinator.plan(request(
+        "prod-foreign",
+        &[bind_lane_spec(
+            "work-prod-foreign",
+            "reader-prod-foreign",
+            "a",
+        )],
+        None,
+    )?)?;
+    let mut receipt = provider_receipt(&candidate, "prod-foreign")?;
+    receipt.provider_identity.verifier_identity = "foreign-verifier".to_owned();
+    let before = coordinator.snapshot_json()?;
+    assert_eq!(
+        coordinator.admit(receipt).err(),
+        Some(CoordinatorError::StaleProviderBinding)
+    );
+    assert_eq!(coordinator.snapshot_json()?, before);
+    Ok(())
+}
+
+#[test]
+fn plan_only_constructor_still_refuses_effects() -> TestResult {
+    let cfg = config(2, 2);
+    let gap = PlanGap::G11Unavailable {
+        reason: "G-11 absent".to_owned(),
+    };
+    let mut gap_coordinator = AgentCoordinator::new(cfg.clone(), gap)?;
+    let candidate = gap_coordinator.plan(request(
+        "prod-split",
+        &[bind_lane_spec("work-prod-split", "reader-prod-split", "a")],
+        None,
+    )?)?;
+    let receipt = provider_receipt(&candidate, "prod-split")?;
+    assert!(matches!(
+        gap_coordinator.admit(receipt.clone()),
+        Err(CoordinatorError::PlanGap(_))
+    ));
+    let mut production = production_coordinator(cfg)?;
+    production.plan(request(
+        "prod-split",
+        &[bind_lane_spec("work-prod-split", "reader-prod-split", "a")],
+        None,
+    )?)?;
+    production.admit(receipt)?;
+    Ok(())
+}
+
+#[test]
+fn production_restore_reverifies_against_fresh_kernel_evidence() -> TestResult {
+    let cfg = config(4, 4);
+    let mut coordinator = production_coordinator(cfg.clone())?;
+    let admitted = plan_and_admit(
+        &mut coordinator,
+        "prod-restore",
+        &[bind_lane_spec(
+            "work-prod-restore",
+            "reader-prod-restore",
+            "a",
+        )],
+        None,
+    )?;
+    coordinator.start_attempt(
+        ExecutionContext::from(&admitted),
+        admitted.admitted_lanes[0].attempt_id.clone(),
+    )?;
+    let snapshot = coordinator.snapshot()?;
+    let restored = AgentCoordinator::restore_with_admitted_provider(
+        snapshot.clone(),
+        cfg.clone(),
+        admitted_capability(snapshot.event_sequence)?,
+    )?;
+    assert_eq!(restored.events(), coordinator.events());
+    assert_eq!(
+        AgentCoordinator::restore_with_admitted_provider(
+            snapshot.clone(),
+            cfg.clone(),
+            admitted_capability_for(
+                provider_identity(),
+                true,
+                "route-rev-7",
+                "capacity-rev-3",
+                "route-rev-7",
+                "capacity-rev-3",
+                1,
+                1,
+                0,
+            )?,
+        )
+        .err(),
+        Some(CoordinatorError::StaleProviderBinding)
+    );
+    assert_eq!(
+        AgentCoordinator::restore_with_admitted_provider(
+            snapshot.clone(),
+            cfg.clone(),
+            admitted_capability(snapshot.event_sequence + 1)?,
+        )
+        .err(),
+        Some(CoordinatorError::SnapshotRollback)
+    );
+    // A serialized `Verified` label alone never restores authority: a
+    // foreign identity fails even though the snapshot claims verification.
+    let mut foreign_identity = provider_identity();
+    foreign_identity.verifier_identity = "foreign-verifier".to_owned();
+    assert_eq!(
+        AgentCoordinator::restore_with_admitted_provider(
+            snapshot,
+            cfg,
+            admitted_capability_for(
+                foreign_identity,
+                false,
+                "route-rev-7",
+                "capacity-rev-3",
+                "route-rev-7",
+                "capacity-rev-3",
+                1,
+                1,
+                0,
+            )?,
+        )
+        .err(),
+        Some(CoordinatorError::StaleProviderBinding)
+    );
+    Ok(())
+}
+
+#[test]
+fn coordinator_case_12_effect_payload_digest_is_canonical() -> TestResult {
+    // #228 narrow slice consumer proof: coordinator intake carries the v7
+    // canonical `LowercaseSha256` effect digest; legacy placeholders never
+    // deserialize as `ProposedEffect`.
+    let digest: LowercaseSha256 = serde_json::from_value(serde_json::json!(
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    ))?;
+    let effect = ProposedEffect {
+        effect_id: "effect-case-12".to_owned(),
+        attempt_id: AttemptId::new("attempt-case-12")?,
+        kind: EffectKind::Observe,
+        scope_ref: "scope-work-case-12".to_owned(),
+        payload_digest: digest,
+        rationale_ref: None,
+    };
+    let ceiling = EffectCeiling {
+        scope_ref: "scope-work-case-12".to_owned(),
+        allowed: BTreeSet::from([EffectKind::Observe]),
+        max_external_effects: 0,
+    };
+    effect.validate_against(&ceiling)?;
+    let legacy = serde_json::json!({
+        "effect_id": "effect-case-12",
+        "attempt_id": "attempt-case-12",
+        "kind": "observe",
+        "scope_ref": "scope-work-case-12",
+        "payload_digest": "payload-case-12",
+        "rationale_ref": null,
+    });
+    assert!(serde_json::from_value::<ProposedEffect>(legacy).is_err());
+    Ok(())
+}
+
+// I14.1 work classes (issue #1698): the nine canonical values plan, admit,
+// and echo through the receipt and scheduled record; anything else is
+// unrepresentable in the `WorkClass` boundary type and rejects at decode
+// ingress through `WorkClass::parse_wire` with the typed error.
+
+fn classified_request(tag: &str, class: &str) -> TestResult<StaffingPlanRequest> {
+    let mut req = request(
+        tag,
+        &[LaneSpec {
+            work: "work-wc",
+            role: "reader-wc",
+            route: "a",
+            scope: None,
+            write: false,
+            priority: 1,
+        }],
+        None,
+    )?;
+    let parsed: WorkClass = class
+        .parse()
+        .map_err(|error: CoordinatorError| format!("fixture class must be valid: {error}"))?;
+    req.work_class = parsed;
+    for lane in &mut req.lanes {
+        lane.work_class = parsed;
+    }
+    Ok(req)
+}
+
+#[test]
+fn work_class_all_nine_values_admit_and_echo() -> TestResult {
+    let classes = WorkClass::ALL_WIRE_SPELLINGS;
+    for (index, class) in classes.iter().enumerate() {
+        let tag = format!("wc9-{index}");
+        let proof = format!("proof-admission-{tag}");
+        let mut coord = coordinator(config(4, 4), &[proof.as_str()])?;
+        let expected: WorkClass = class
+            .parse()
+            .map_err(|error: CoordinatorError| format!("canonical class must parse: {error}"))?;
+        let candidate = coord.plan(classified_request(&tag, class)?)?;
+        assert_eq!(candidate.work_class, expected);
+        assert_eq!(candidate.work_class.as_wire_str(), *class);
+        assert_eq!(candidate.lanes.len(), 1);
+        assert_eq!(candidate.lanes[0].work_class, expected);
+        let receipt = coord.admit(provider_receipt(&candidate, &tag)?)?;
+        assert_eq!(receipt.admitted_lanes.len(), 1);
+        assert_eq!(receipt.admitted_lanes[0].work_class, expected);
+        let next = coord.next_ready().ok_or("admitted work must be ready")?;
+        assert_eq!(next.work_class, expected);
+    }
+    Ok(())
+}
+
+#[test]
+fn work_class_wire_spellings_stay_nine_lowercase() -> TestResult {
+    // Locks the serialized wire: exactly the nine I14.1 lowercase strings,
+    // in scheduler order, with no silent default or alternate spelling.
+    assert_eq!(
+        WorkClass::ALL_WIRE_SPELLINGS,
+        [
+            "control",
+            "interactive",
+            "verification",
+            "canonical_write",
+            "normal_background",
+            "model_jobs",
+            "swarm",
+            "reporting",
+            "maintenance",
+        ]
+    );
+    for spelling in WorkClass::ALL_WIRE_SPELLINGS {
+        let parsed: WorkClass = spelling
+            .parse()
+            .map_err(|error: CoordinatorError| format!("wire spelling must parse: {error}"))?;
+        assert_eq!(parsed.as_wire_str(), spelling);
+        let json = serde_json::to_string(&parsed)?;
+        assert_eq!(json, format!("\"{spelling}\""));
+        let roundtrip: WorkClass = serde_json::from_str(&json)?;
+        assert_eq!(roundtrip, parsed);
+    }
+    Ok(())
+}
+
+#[test]
+fn work_class_unknown_blank_and_mixed_reject_before_capacity() -> TestResult {
+    let mut coord = coordinator(config(4, 4), &["proof-admission-wcf"])?;
+    // Fill the ready window so a capacity check would fire first if class
+    // validation were ordered after it.
+    let mut tight = AgentCoordinator::with_provider(
+        CoordinatorConfig {
+            max_ready_items: 1,
+            max_admitted_attempts: 4,
+            max_active_per_route: 4,
+            capacity_identity: "capacity-a".to_owned(),
+            capacity_revision: rev("capacity-rev-1"),
+        },
+        Box::new(verifier(&[], 0)),
+    )?;
+    tight.plan(classified_request("wcfill", "swarm")?)?;
+    // Unknown and blank reject at the validated constructor with the typed
+    // variant before any coordinator insertion: no silent downgrade to a
+    // less restrictive class, no capacity consumed. The `String` exists
+    // solely at this decode ingress; no `StaffingPlanRequest` with an
+    // invalid class can be constructed to reach `plan`.
+    assert_eq!(
+        WorkClass::parse_wire("proton").err(),
+        Some(CoordinatorError::UnknownWorkClass("proton".to_owned()))
+    );
+    assert_eq!(
+        WorkClass::parse_wire("").err(),
+        Some(CoordinatorError::UnknownWorkClass(String::new()))
+    );
+    // Serde ingress rejects the same way: the wire `String` converts
+    // immediately, so invalid JSON never becomes a request.
+    let mut valid_json = serde_json::to_value(classified_request("wcx", "swarm")?)?;
+    valid_json["work_class"] = serde_json::json!("proton");
+    let decoded: Result<StaffingPlanRequest, _> = serde_json::from_value(valid_json);
+    let message = decoded.err().map(|error| error.to_string()).unwrap_or_default();
+    assert!(
+        message.contains("unknown work class: proton"),
+        "decode must reject unknown class, got {message:?}"
+    );
+    // The failed ingress consumed no capacity: the tight coordinator still
+    // holds exactly its one filled plan and a second valid plan still hits
+    // the capacity fence (not a class error).
+    let overfill = classified_request("wcover", "swarm")?;
+    assert!(matches!(
+        tight.plan(overfill).err(),
+        Some(CoordinatorError::Backpressure { .. })
+    ));
+    // Mixed plan/lane classes reject as an identity conflict.
+    let mut mixed = classified_request("wcm", "swarm")?;
+    mixed.lanes[0].work_class = "interactive".parse()?;
+    assert_eq!(
+        coord.plan(mixed).err(),
+        Some(CoordinatorError::IdentityConflict("work_class"))
+    );
+    // A forged receipt class that disagrees with the candidate rejects.
+    let candidate = coord.plan(classified_request("wcf", "swarm")?)?;
+    let mut forged = provider_receipt(&candidate, "wcf")?;
+    forged.admitted_lanes[0].work_class = WorkClass::Control;
+    assert_eq!(
+        coord
+            .admit(forged)
+            .err()
+            .map(|error| matches!(error, CoordinatorError::IdentityConflict("admitted_lane"))),
+        Some(true)
+    );
+    // No silent default: a missing `work_class` field fails decode.
+    let mut missing_json = serde_json::to_value(classified_request("wcmiss", "swarm")?)?;
+    missing_json.as_object_mut().ok_or("request must be an object")?.remove("work_class");
+    assert!(serde_json::from_value::<StaffingPlanRequest>(missing_json).is_err());
+    Ok(())
+}
+
+#[test]
+fn work_class_control_sorts_before_higher_priority_normal() -> TestResult {
+    let mut coord = coordinator(
+        config(4, 4),
+        &["proof-admission-wchi", "proof-admission-wclo"],
+    )?;
+    let mut hi = classified_request("wchi", "maintenance")?;
+    hi.lanes[0].priority = 9;
+    let mut lo = classified_request("wclo", "control")?;
+    lo.lanes[0].priority = 0;
+    let hi_candidate = coord.plan(hi)?;
+    let lo_candidate = coord.plan(lo)?;
+    coord.admit(provider_receipt(&hi_candidate, "wchi")?)?;
+    coord.admit(provider_receipt(&lo_candidate, "wclo")?)?;
+    let next = coord.next_ready().ok_or("admitted work must be ready")?;
+    assert_eq!(next.work_class, WorkClass::Control);
+    Ok(())
+}
+
+#[test]
+fn work_class_taxonomy_matches_kernel_control_reserve() -> TestResult {
+    use eliot_kernel_core::{ControlOperationClass, NormalWorkClass};
+    // Every normal Kernel variant maps to exactly one I14.1 wire spelling
+    // via the single `WorkClass` boundary (no wildcard: a Kernel-side
+    // addition fails compilation in `as_wire_str` and here).
+    let normals = [
+        NormalWorkClass::Interactive,
+        NormalWorkClass::Verification,
+        NormalWorkClass::CanonicalWrite,
+        NormalWorkClass::NormalBackground,
+        NormalWorkClass::ModelJob,
+        NormalWorkClass::Swarm,
+        NormalWorkClass::Reporting,
+        NormalWorkClass::Maintenance,
+    ];
+    for variant in normals {
+        let boundary = WorkClass::Normal(variant);
+        let wire = boundary.as_wire_str();
+        assert_eq!(WorkClass::parse_wire(wire), Ok(boundary));
+        // Serde round-trips the same spelling: the wire `String` exists
+        // solely at decode ingress.
+        let json = serde_json::to_string(&boundary)?;
+        assert_eq!(json, format!("\"{wire}\""));
+        assert_eq!(serde_json::from_str::<WorkClass>(&json)?, boundary);
+    }
+    // The protected family (no wildcard: additions fail compilation) carries
+    // no ordinary lane work; only the single `control` partition label is
+    // wire-admissible, and raw protected spellings reject through the same
+    // validated constructor.
+    let protected = [
+        ControlOperationClass::CancelOperation,
+        ControlOperationClass::FenceStaleOwner,
+        ControlOperationClass::RevokeAuthority,
+        ControlOperationClass::HealthReadinessControl,
+        ControlOperationClass::CriticalTelemetry,
+        ControlOperationClass::CriticalAttentionTransition,
+        ControlOperationClass::ProblemTransition,
+        ControlOperationClass::IncidentTransition,
+        ControlOperationClass::PersistentNotificationTransition,
+        ControlOperationClass::SafeShutdown,
+        ControlOperationClass::Drain,
+        ControlOperationClass::Recovery,
+        ControlOperationClass::Containment,
+        ControlOperationClass::UnknownOutcomeReconciliation,
+    ];
+    for operation in protected {
+        match operation {
+            ControlOperationClass::CancelOperation
+            | ControlOperationClass::FenceStaleOwner
+            | ControlOperationClass::RevokeAuthority
+            | ControlOperationClass::HealthReadinessControl
+            | ControlOperationClass::CriticalTelemetry
+            | ControlOperationClass::CriticalAttentionTransition
+            | ControlOperationClass::ProblemTransition
+            | ControlOperationClass::IncidentTransition
+            | ControlOperationClass::PersistentNotificationTransition
+            | ControlOperationClass::SafeShutdown
+            | ControlOperationClass::Drain
+            | ControlOperationClass::Recovery
+            | ControlOperationClass::Containment
+            | ControlOperationClass::UnknownOutcomeReconciliation => {}
+        }
+    }
+    assert_eq!(WorkClass::parse_wire("control"), Ok(WorkClass::Control));
+    assert_eq!(WorkClass::Control.as_wire_str(), "control");
+    assert_eq!(WorkClass::Control.rank(), 0);
+    assert!(WorkClass::parse_wire("CANCEL_OPERATION").is_err());
+    assert!(WorkClass::parse_wire("MODEL_JOB").is_err());
     Ok(())
 }

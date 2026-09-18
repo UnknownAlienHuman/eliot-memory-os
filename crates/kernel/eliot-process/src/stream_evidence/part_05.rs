@@ -38,7 +38,7 @@ struct ProcessExecutionBindingValidationWire {
     generation: Generation,
     action_lease_ref: ActionLeaseRef,
     authority_id: DispatchAuthorityId,
-    authority_epoch: u64,
+    authority_epoch: EpochId,
     state_fence: FencingToken,
     request_digest: String,
     permit_digest: String,
@@ -53,6 +53,10 @@ fn validate_process_execution_binding(
         serde_json::to_value(binding).map_err(|_| ProcessStreamEvidenceError::InvalidBinding)?;
     let wire: ProcessExecutionBindingValidationWire = serde_json::from_value(serialized)
         .map_err(|_| ProcessStreamEvidenceError::InvalidBinding)?;
+    // EpochId-only mirror: a legacy numeric `authority_epoch` cannot
+    // deserialize into `EpochId` and is therefore quarantined here. The fence
+    // epoch must be the exact tuple of the binding epoch; equal sequences
+    // from different lineages are unrelated and rejected.
 
     for value in [
         wire.operation_id.as_str(),
@@ -69,9 +73,11 @@ fn validate_process_execution_binding(
         }
     }
     if wire.generation.get() == 0
-        || wire.authority_epoch == 0
         || wire.validation_revision == 0
-        || wire.state_fence.authority_epoch() != wire.authority_epoch
+        || !wire
+            .state_fence
+            .authority_epoch()
+            .is_same_authority(&wire.authority_epoch)
         || wire.state_fence.generation() != wire.generation
     {
         return Err(ProcessStreamEvidenceError::InvalidBinding);

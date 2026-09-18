@@ -46,6 +46,38 @@ use eliot_store_api::{
 };
 use serde::{Deserialize, Serialize};
 
+/// F-LOG-KERNEL-3 (#901): process-execution boundary observations.
+///
+/// Observation only, via #895's facade: fixed `kernel.process.*` event names
+/// plus a bounded stable outcome. Never carries operation identities,
+/// digests, paths, command material, receipts, or owner error strings
+/// (I15.4, I07.20).
+fn observe_process(event: &'static str, outcome: &'static str) {
+    use super::kernel_diagnostics::{KERNEL_DIAGNOSTICS_TARGET, bound_field};
+    let event_bound = bound_field(event);
+    let outcome_bound = bound_field(outcome);
+    tracing::info!(
+        target: KERNEL_DIAGNOSTICS_TARGET,
+        event = event_bound.text(),
+        outcome = outcome_bound.text(),
+        "process execution observation"
+    );
+}
+
+/// Maps one process-execution failure to its stable diagnostic code.
+///
+/// Only the variant is emitted; any `String` payload (executor detail, sink
+/// message, contract field/reason) is never logged.
+fn process_terminal_code(error: &ProcessExecutionError) -> &'static str {
+    match error {
+        ProcessExecutionError::Contract(_) => "process_contract",
+        ProcessExecutionError::NotFound => "process_not_found",
+        ProcessExecutionError::Unavailable(_) => "process_unavailable",
+        ProcessExecutionError::EvidenceSink(_) => "process_evidence_sink",
+        ProcessExecutionError::UnknownOutcome => "process_unknown_outcome",
+    }
+}
+
 pub struct ProcessExecutionAuthorityConfig {
     pub authority_id: DispatchAuthorityId,
     pub key: KernelDispatchKey,
@@ -342,7 +374,8 @@ pub(crate) fn project_store_snapshot(
         snapshot_digest.clone(),
     );
     let fence = FencingToken::new(
-        snapshot.state_fence.authority_epoch.value(),
+        // INTENDED EpochId shape (B→A→C): snapshot fence carries EpochId after B.
+        snapshot.state_fence.authority_epoch.clone(),
         Generation::new(snapshot.state_fence.resource_generation.value())
             .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?,
         format!("store-snapshot-{snapshot_digest}"),
@@ -585,7 +618,9 @@ pub(crate) trait ProcessStartPorts {
         &self,
         clock: ClockObservation,
         store_fence: FencingToken,
-        authority_epoch: u64,
+        // INTENDED EpochId shape (Split A): DispatchValidationContext::new
+        // takes EpochId. B→A→C order.
+        authority_epoch: eliot_contracts::EpochId,
         revision_heads: BTreeMap<String, String>,
         validation_revision: u64,
     ) -> Result<DispatchValidationContext, ProcessExecutionError>;
@@ -896,7 +931,23 @@ impl ProcessExecutionGateway {
         admission: ProcessExecutionAdmissionRequest,
         path_proof: ProcessPathProof,
     ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
-        run_process_start(self, owner, admission, path_proof).await
+        // F-LOG-KERNEL-3 (#901): admitted-launch boundary. Reservation,
+        // replay, fence, and executor handoff stay inside
+        // `run_process_start`; exactly one terminal is emitted per failed
+        // start, and an `UnknownOutcome` (possible launch/response loss)
+        // keeps its unknown code instead of a committed-start claim.
+        observe_process("kernel.process.start_requested", "attempt");
+        match run_process_start(self, owner, admission, path_proof).await {
+            Ok(receipt) => {
+                observe_process("kernel.process.start_committed", "success");
+                Ok(receipt)
+            }
+            Err(error) => {
+                observe_process("kernel.process.start_failed", "rejected");
+                super::kernel_diagnostics::observe_terminal_error(process_terminal_code(&error));
+                Err(error)
+            }
+        }
     }
 
     pub(crate) async fn inspect(
@@ -904,8 +955,23 @@ impl ProcessExecutionGateway {
         owner: &ProcessOwnerBinding,
         operation_id: eliot_process::OperationId,
     ) -> Result<eliot_process::ProcessExecutionView, ProcessExecutionError> {
-        self.authorize_operation(owner, &operation_id)?;
-        self.executor.inspect(operation_id).await
+        observe_process("kernel.process.inspect_requested", "attempt");
+        if let Err(error) = self.authorize_operation(owner, &operation_id) {
+            observe_process("kernel.process.inspect_rejected", "fenced");
+            super::kernel_diagnostics::observe_terminal_error(process_terminal_code(&error));
+            return Err(error);
+        }
+        match self.executor.inspect(operation_id).await {
+            Ok(view) => {
+                observe_process("kernel.process.inspect_reported", "success");
+                Ok(view)
+            }
+            Err(error) => {
+                observe_process("kernel.process.inspect_failed", "unknown");
+                super::kernel_diagnostics::observe_terminal_error(process_terminal_code(&error));
+                Err(error)
+            }
+        }
     }
 
     #[cfg(windows)]
@@ -948,8 +1014,26 @@ impl ProcessExecutionGateway {
         owner: &ProcessOwnerBinding,
         operation_id: eliot_process::OperationId,
     ) -> Result<eliot_process::CancellationReceipt, ProcessExecutionError> {
-        self.authorize_operation(owner, &operation_id)?;
-        self.executor.cancel(operation_id.clone()).await
+        // F-LOG-KERNEL-3 (#901): cancellation boundary. The returned receipt
+        // is delivery acknowledgement, not terminal cancellation; exactly one
+        // terminal is emitted per failed cancel.
+        observe_process("kernel.process.cancel_requested", "attempt");
+        if let Err(error) = self.authorize_operation(owner, &operation_id) {
+            observe_process("kernel.process.cancel_rejected", "fenced");
+            super::kernel_diagnostics::observe_terminal_error(process_terminal_code(&error));
+            return Err(error);
+        }
+        match self.executor.cancel(operation_id.clone()).await {
+            Ok(receipt) => {
+                observe_process("kernel.process.cancel_acknowledged", "success");
+                Ok(receipt)
+            }
+            Err(error) => {
+                observe_process("kernel.process.cancel_failed", "unknown");
+                super::kernel_diagnostics::observe_terminal_error(process_terminal_code(&error));
+                Err(error)
+            }
+        }
     }
 
     pub(crate) async fn reconcile(
@@ -957,8 +1041,27 @@ impl ProcessExecutionGateway {
         owner: &ProcessOwnerBinding,
         operation_id: eliot_process::OperationId,
     ) -> Result<ProcessEvidence, ProcessExecutionError> {
-        self.authorize_operation(owner, &operation_id)?;
-        self.executor.reconcile(operation_id).await
+        // F-LOG-KERNEL-3 (#901): exit/evidence reconciliation boundary. Exit
+        // zero and provider success never imply semantic completion; the
+        // reported evidence stays the owner's, and exactly one terminal is
+        // emitted per failed reconcile.
+        observe_process("kernel.process.reconcile_requested", "attempt");
+        if let Err(error) = self.authorize_operation(owner, &operation_id) {
+            observe_process("kernel.process.reconcile_rejected", "fenced");
+            super::kernel_diagnostics::observe_terminal_error(process_terminal_code(&error));
+            return Err(error);
+        }
+        match self.executor.reconcile(operation_id).await {
+            Ok(evidence) => {
+                observe_process("kernel.process.reconcile_reported", "success");
+                Ok(evidence)
+            }
+            Err(error) => {
+                observe_process("kernel.process.reconcile_unknown", "unknown");
+                super::kernel_diagnostics::observe_terminal_error(process_terminal_code(&error));
+                Err(error)
+            }
+        }
     }
 
     fn authorize_operation(
@@ -1037,7 +1140,12 @@ pub(crate) async fn run_process_start<P: ProcessStartPorts>(
             Err(_) => ProcessExecutionError::UnknownOutcome,
         });
     }
-    if admission.state_fence().authority_epoch() != snapshot.state_fence.authority_epoch.value()
+    // INTENDED EpochId shape (B→A→C): exact-tuple is_same_authority for the
+    // fence side; snapshot scalar side resolves with B cutover.
+    if !admission
+        .state_fence()
+        .authority_epoch()
+        .is_same_authority(&snapshot.state_fence.authority_epoch)
         || admission.state_fence().generation().get()
             != snapshot.state_fence.resource_generation.value()
     {
@@ -1065,7 +1173,7 @@ pub(crate) async fn run_process_start<P: ProcessStartPorts>(
             monotonic_ns: None,
         },
         store_fence.clone(),
-        snapshot.state_fence.authority_epoch.value(),
+        snapshot.state_fence.authority_epoch.clone(),
         revision_heads.clone(),
         snapshot.validation_revision,
     ) {
@@ -1147,15 +1255,23 @@ impl ProcessStartPorts for ProcessExecutionGateway {
         admission: &ProcessExecutionAdmissionRequest,
         owner: &ProcessOwnerBinding,
     ) -> Result<(), ProcessExecutionError> {
+        // INTENDED EpochId shape (Split A): exact-tuple is_same_authority for
+        // fence/owner; snapshot scalar side resolves with B cutover.
         if admission.recipient_module_id() != owner.module_id()
-            || admission.state_fence().authority_epoch() != owner.authority_epoch()
+            || !admission
+                .state_fence()
+                .authority_epoch()
+                .is_same_authority(owner.authority_epoch())
             || admission.state_fence().generation().get() != owner.generation().get()
         {
             return Err(ProcessExecutionError::Contract(
                 eliot_process::ContractError::DispatchBindingMismatch,
             ));
         }
-        if admission.state_fence().authority_epoch()
+        // Scalar ORS snapshot contour (residual): project the canonical fence
+        // sequence for the stale-fence join; lineage-exact gating lives in the
+        // admission/owner `is_same_authority` check above.
+        if admission.state_fence().authority_epoch().sequence.get()
             != self.snapshot_binding.authority_epoch().current.epoch
             || admission.state_fence().generation() != admission.intent().generation()
         {
@@ -1239,7 +1355,7 @@ impl ProcessStartPorts for ProcessExecutionGateway {
         &self,
         clock: ClockObservation,
         store_fence: FencingToken,
-        authority_epoch: u64,
+        authority_epoch: eliot_contracts::EpochId,
         revision_heads: BTreeMap<String, String>,
         validation_revision: u64,
     ) -> Result<DispatchValidationContext, ProcessExecutionError> {
@@ -1366,11 +1482,44 @@ pub(crate) fn authorize_process_owner(
     presented: &ProcessOwnerBinding,
 ) -> Result<(), ProcessExecutionError> {
     if expected != presented {
+        // F-LOG-KERNEL-3 (#901): subordinate observation only; the calling
+        // gateway boundary owns the single terminal for the failed operation.
+        observe_process("kernel.process.owner_rejected", "fenced");
         return Err(ProcessExecutionError::Contract(
             eliot_process::ContractError::DispatchBindingMismatch,
         ));
     }
+    observe_process("kernel.process.owner_admitted", "success");
     Ok(())
+}
+
+/// Maps a typed process session validation failure to a bounded stable
+/// rejection (issue #79).
+///
+/// Stale transport, stale session, stale epoch/fence, and wrong owner each
+/// keep a distinct wire code so callers can tell a superseded pipe from a
+/// foreign session without trusting the pipe. Any other contract failure
+/// keeps the existing generic contract projection.
+pub(crate) fn process_session_rejection(
+    error: eliot_process::ContractError,
+) -> eliot_kernel_service::ProcessExecutionRejection {
+    let code = match &error {
+        eliot_process::ContractError::StaleProcessSession => "STALE_PROCESS_SESSION",
+        eliot_process::ContractError::StaleTransportBinding => "STALE_TRANSPORT_BINDING",
+        eliot_process::ContractError::StaleAuthorityEpoch => "STALE_AUTHORITY_EPOCH",
+        eliot_process::ContractError::StaleStateFence
+        | eliot_process::ContractError::FenceMismatch => "STALE_PROCESS_FENCE",
+        eliot_process::ContractError::DispatchBindingMismatch => "PROCESS_OWNER_MISMATCH",
+        _ => {
+            return eliot_kernel_service::ProcessExecutionRejection::from_error(
+                &ProcessExecutionError::Contract(error),
+            );
+        }
+    };
+    eliot_kernel_service::ProcessExecutionRejection {
+        code: code.to_owned(),
+        detail: error.to_string().chars().take(512).collect(),
+    }
 }
 
 impl KernelComposition {
@@ -1380,7 +1529,13 @@ impl KernelComposition {
         session_binding: ProcessSessionBinding,
         request: ProcessExecutionRequest,
     ) -> ProcessExecutionResponse {
+        // F-LOG-KERNEL-3 (#901): process front-door boundary. Receipt is an
+        // observation of the gateway outcome; rejections below are typed
+        // responses (subordinate infos), while a failed gateway operation
+        // emits exactly one terminal through its own boundary.
+        observe_process("kernel.process.request_received", "attempt");
         let Ok((owner, expected_session_binding)) = super::caller_binding(session) else {
+            observe_process("kernel.process.request_rejected", "caller_unavailable");
             return ProcessExecutionResponse::Rejected(
                 eliot_kernel_service::ProcessExecutionRejection {
                     code: "AUTHENTICATED_CALLER_REQUIRED".to_owned(),
@@ -1389,7 +1544,13 @@ impl KernelComposition {
                 },
             );
         };
-        if session_binding != expected_session_binding {
+        if eliot_process::validate_process_transport_binding(
+            &session_binding,
+            &expected_session_binding,
+        )
+        .is_err()
+        {
+            observe_process("kernel.process.request_rejected", "session_mismatch");
             return ProcessExecutionResponse::Rejected(
                 eliot_kernel_service::ProcessExecutionRejection {
                     code: "SESSION_BINDING_MISMATCH".to_owned(),
@@ -1397,7 +1558,38 @@ impl KernelComposition {
                 },
             );
         }
+        // Issue #79: the intent session must validate against the
+        // server-derived admitted process-owner/session binding, never
+        // against the presenting pipe. Identity validates before authority
+        // dispatch: a copied `connection_id`, a foreign or stale session, a
+        // stale epoch/fence, and a wrong owner each reject with a distinct
+        // typed code, while cancel and reconcile below stay on
+        // operation/owner identity.
+        if let ProcessExecutionRequest::Start(admission) = &request {
+            let caller = match self.admitted_process_caller_session(session) {
+                Ok(caller) => caller,
+                Err(error) => {
+                    observe_process("kernel.process.request_rejected", "caller_session");
+                    return ProcessExecutionResponse::Rejected(
+                        eliot_kernel_service::ProcessExecutionRejection {
+                            code: "ADMITTED_CALLER_SESSION_REQUIRED".to_owned(),
+                            detail: error.to_string().chars().take(512).collect(),
+                        },
+                    );
+                }
+            };
+            if let Err(error) = eliot_process::validate_process_intent_session(
+                admission.intent(),
+                &caller,
+                &owner,
+                admission.state_fence(),
+            ) {
+                observe_process("kernel.process.request_rejected", "intent_session");
+                return ProcessExecutionResponse::Rejected(process_session_rejection(error));
+            }
+        }
         let Some(gateway) = &self.process_gateway else {
+            observe_process("kernel.process.request_rejected", "authority_unavailable");
             return ProcessExecutionResponse::Rejected(
                 eliot_kernel_service::ProcessExecutionRejection {
                     code: "PROCESS_AUTHORITY_CONFIGURATION_REQUIRED".to_owned(),
@@ -1405,11 +1597,13 @@ impl KernelComposition {
                 },
             );
         };
+        observe_process("kernel.process.request_admitted", "success");
         let result = match request {
             ProcessExecutionRequest::Start(admission) => {
                 let proof = match self.retain_process_path_proof(&admission) {
                     Ok(proof) => proof,
                     Err(error) => {
+                        observe_process("kernel.process.request_rejected", "path_proof");
                         return ProcessExecutionResponse::Rejected(
                             eliot_kernel_service::ProcessExecutionRejection::from_error(&error),
                         );
@@ -1434,13 +1628,17 @@ impl KernelComposition {
                 .map(ProcessExecutionResponse::Reconciled),
         };
         result.unwrap_or_else(|error| {
+            // F-LOG-KERNEL-3 (#901): subordinate observation only; the
+            // gateway boundary above owns the single terminal for the failed
+            // operation (case 25 across propagation).
+            observe_process("kernel.process.request_failed", "rejected");
             ProcessExecutionResponse::Rejected(
                 eliot_kernel_service::ProcessExecutionRejection::from_error(&error),
             )
         })
     }
 
-    fn retain_process_path_proof(
+    pub(crate) fn retain_process_path_proof(
         &self,
         admission: &ProcessExecutionAdmissionRequest,
     ) -> Result<ProcessPathProof, ProcessExecutionError> {
@@ -1512,5 +1710,125 @@ impl KernelComposition {
             });
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod process_execution_diagnostics_tests {
+    //! F-LOG-KERNEL-3 (#901) focused diagnostics proof: terminal-code
+    //! stability, owner admission-boundary preservation, and secret-free
+    //! capture for the process-execution observations added above.
+
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use super::*;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct CaptureSink {
+        bytes: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for CaptureSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.bytes
+                .lock()
+                .map_err(|_| std::io::Error::other("capture lock poisoned"))?
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn capture(run: impl FnOnce()) -> String {
+        let sink = CaptureSink::default();
+        let writer_sink = sink.clone();
+        {
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || writer_sink.clone())
+                .finish();
+            tracing::subscriber::with_default(subscriber, run);
+        }
+        String::from_utf8_lossy(&sink.bytes.lock().expect("capture lock")).into_owned()
+    }
+
+    fn test_owner(digest: &str) -> ProcessOwnerBinding {
+        let epoch = eliot_contracts::EpochId::new(
+            eliot_contracts::EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                .expect("lineage"),
+            std::num::NonZeroU64::new(1).expect("sequence"),
+        )
+        .expect("epoch");
+        ProcessOwnerBinding::new(
+            "eliotd",
+            digest.to_owned(),
+            epoch,
+            Generation::new(1).expect("generation"),
+        )
+        .expect("owner")
+    }
+
+    #[test]
+    fn process_diagnostics_terminal_mapping_and_owner_boundary() {
+        // Every failure variant keeps a distinct stable code even when its
+        // payload carries secret-like canaries; only the code may be logged.
+        let contract =
+            ProcessExecutionError::Contract(eliot_process::ContractError::DispatchBindingMismatch);
+        let not_found = ProcessExecutionError::NotFound;
+        let unavailable =
+            ProcessExecutionError::Unavailable("argv --token=top-secret-canary".to_owned());
+        let sink = ProcessExecutionError::EvidenceSink(eliot_process::EvidenceSinkError {
+            message: "credential=super-secret-canary".to_owned(),
+        });
+        let unknown = ProcessExecutionError::UnknownOutcome;
+        assert_eq!(process_terminal_code(&contract), "process_contract");
+        assert_eq!(process_terminal_code(&not_found), "process_not_found");
+        assert_eq!(process_terminal_code(&unavailable), "process_unavailable");
+        assert_eq!(process_terminal_code(&sink), "process_evidence_sink");
+        assert_eq!(process_terminal_code(&unknown), "process_unknown_outcome");
+
+        // The admission boundary is preserved: the same owner admits, a
+        // foreign owner rejects with the exact contract error.
+        let owner = test_owner(&"a".repeat(64));
+        let foreign = test_owner(&"b".repeat(64));
+        assert!(authorize_process_owner(&owner, &owner).is_ok());
+        let rejected = authorize_process_owner(&owner, &foreign);
+        assert!(matches!(
+            rejected,
+            Err(ProcessExecutionError::Contract(
+                eliot_process::ContractError::DispatchBindingMismatch
+            ))
+        ));
+
+        // Captured diagnostics carry fixed events and stable codes only; the
+        // canary payloads above never reach the sink.
+        let text = capture(|| {
+            observe_process("kernel.process.start_requested", "attempt");
+            observe_process("kernel.process.owner_admitted", "success");
+            observe_process("kernel.process.owner_rejected", "fenced");
+            for error in [&contract, &not_found, &unavailable, &sink, &unknown] {
+                crate::kernel_diagnostics::observe_terminal_error(process_terminal_code(error));
+            }
+        });
+        for marker in [
+            "kernel.process.start_requested",
+            "kernel.process.owner_admitted",
+            "kernel.process.owner_rejected",
+            "process_contract",
+            "process_not_found",
+            "process_unavailable",
+            "process_evidence_sink",
+            "process_unknown_outcome",
+        ] {
+            assert!(text.contains(marker), "missing diagnostics marker {marker}");
+        }
+        for canary in ["top-secret-canary", "super-secret-canary"] {
+            assert!(!text.contains(canary), "secret canary leaked: {canary}");
+        }
     }
 }

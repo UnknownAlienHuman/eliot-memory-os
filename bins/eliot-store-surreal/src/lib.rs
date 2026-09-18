@@ -30,10 +30,11 @@ use eliot_protocol::{
     ProtocolVersion, ServerHello,
 };
 use eliot_store_api::{
-    CAPABILITIES, CanonicalStoreClient, CanonicalValidationSnapshot, EFFECTS, NamedReadRequest,
-    NamedReadResponse, OperationId, OrderingHead, OrderingHeadExpectation, OrderingScopeId,
-    PreparedTransition, RequestMeta, RevisionHead, RevisionHeadExpectation, RevisionKey,
-    StoreError, StoreHealth, WriteReceipt, decode_request_frame,
+    CAPABILITIES, CanonicalStoreClient, CanonicalValidationSnapshot, EFFECTS, ExactJsonBytes,
+    NamedReadRequest, NamedReadResponse, OperationId, OrderingHead, OrderingHeadExpectation,
+    OrderingScopeId, PreparedTransition, RequestMeta, RevisionHead, RevisionHeadExpectation,
+    RevisionKey, StoreError, StoreHealth, WriteReceipt, decode_request_frame_with_authority,
+    generated_operation_manifests, genesis_manifest,
 };
 pub use eliot_store_api::{
     ReadinessReceipt, ReadinessStatus, StoreRequest as Request, StoreResponse as Response,
@@ -111,7 +112,40 @@ fn map_adapter_error(error: AdapterError) -> StoreCompositionError {
             Err(error) => StoreCompositionError::Store(StoreError::Foundation(error)),
         },
         AdapterError::Store(error) => StoreCompositionError::Store(error),
-        other => StoreCompositionError::Store(other.into_store_error()),
+        // Distinct provider-to-typed mappings (mirroring
+        // `AdapterError::into_store_error`): provider compare-and-set
+        // conflict stays `RevisionConflict`; unknown named operations stay
+        // unsupported `UnknownOperation`; partial provider outcomes stay
+        // reconciling `MissingReceiptEnvelope`; configuration and
+        // serialization defects keep deterministic/defect shape with provider
+        // prose dropped. No provider variant collapses to `Unavailable`
+        // except the contract-ceiling remainder below.
+        AdapterError::ProviderConflict => {
+            StoreCompositionError::Store(StoreError::RevisionConflict)
+        }
+        AdapterError::NamedOperationUnavailable { .. } => {
+            StoreCompositionError::Store(StoreError::UnknownOperation)
+        }
+        AdapterError::PartialOutcome => {
+            StoreCompositionError::Store(StoreError::MissingReceiptEnvelope)
+        }
+        AdapterError::Config(_) => StoreCompositionError::Store(StoreError::InvalidField {
+            field: "store.configuration",
+            reason: "invalid store configuration",
+        }),
+        AdapterError::Serialization(_) => StoreCompositionError::Store(StoreError::Serialization(
+            "canonical provider response serialization failed".to_owned(),
+        )),
+        // Contract ceiling (honest stop; see `into_store_error`):
+        // `StoreError` has no Backpressure, Deadline, MigrationRequired or
+        // Partial variants, so transport loss, required migrations and
+        // unknown migration outcomes share `Unavailable` here. Live migration
+        // paths keep their exact outcome via `map_schema_bootstrap_error`.
+        AdapterError::ProviderUnavailable
+        | AdapterError::MigrationRequired
+        | AdapterError::UnknownMigrationOutcome { .. } => {
+            StoreCompositionError::Store(error.into_store_error())
+        }
     }
 }
 
@@ -362,6 +396,34 @@ impl StoreComposition {
         expected_revision_heads: Vec<RevisionHeadExpectation>,
         expected_ordering_heads: Vec<OrderingHeadExpectation>,
     ) -> Result<WriteReceipt, StoreCompositionError> {
+        let authorities: Vec<Option<ExactJsonBytes>> =
+            vec![None; transition.named_operations.len()];
+        self.apply_with_authority(
+            context,
+            transition,
+            expected_revision_heads,
+            expected_ordering_heads,
+            &authorities,
+        )
+        .await
+    }
+
+    /// Applies one fully prepared transition with per-operation payload
+    /// authorities bound in (slice C2, issue #19).
+    ///
+    /// `authorities` aligns 1:1 with the transition's named operations and
+    /// carries the original authority values. The same admitted-operation
+    /// gate runs before any provider I/O in both cases; entries with at
+    /// least one claimed authority plan through the authority-carrying path,
+    /// all-`None` entries keep the legacy path.
+    pub async fn apply_with_authority(
+        &self,
+        context: &RequestMeta,
+        transition: PreparedTransition,
+        expected_revision_heads: Vec<RevisionHeadExpectation>,
+        expected_ordering_heads: Vec<OrderingHeadExpectation>,
+        authorities: &[Option<ExactJsonBytes>],
+    ) -> Result<WriteReceipt, StoreCompositionError> {
         context
             .validate()
             .map_err(StoreError::Foundation)
@@ -372,12 +434,17 @@ impl StoreComposition {
         if context.state_fence != transition.state_fence {
             return Err(StoreCompositionError::Store(StoreError::FenceMismatch));
         }
+        let entries = generated_operation_manifests().map_err(StoreCompositionError::Store)?;
+        transition
+            .validate_against_catalogue(&entries)
+            .map_err(StoreCompositionError::Store)?;
         self.store
-            .apply_prepared(
+            .apply_prepared_with_authority(
                 context,
                 transition,
                 expected_revision_heads,
                 expected_ordering_heads,
+                authorities,
             )
             .await
             .map_err(map_adapter_error)
@@ -542,7 +609,7 @@ pub fn admit_handshake(
         || state_fence.resource_generation != hello.module_generation.generation
         || state_fence.resource_generation.value() != config.store_generation()
         || state_fence.authority_epoch != hello.authority_epoch
-        || state_fence.authority_epoch.value() != config.authority_epoch()
+        || state_fence.authority_epoch.sequence.get() != config.authority_epoch()
         || state_fence != &config.runtime_launch.authority_state_fence
     {
         return Err(
@@ -606,6 +673,17 @@ pub fn admit_handshake(
 }
 
 /// Validates one request against the admitted session and replay ledger.
+///
+/// After the existing session, fence, replay, and capability checks, the
+/// request is re-checked against the active generated operation catalogue
+/// before any provider I/O: named reads and prepared transitions must satisfy
+/// the same validators the adapter enforces pre-commit, and embedded payload
+/// authorities (when present) are rebound to the decoded transition here via
+/// [`decode_request_frame_with_authority`] — a mismatch fails closed before
+/// dispatch. Schema/manifest mismatches are returned as typed errors and
+/// never normalized or fallen back. The recovered authority bytes cannot ride
+/// the frozen `StoreRequest` shape further; authority-byte flow to the plan
+/// uses [`StoreComposition::apply_with_authority`].
 pub fn validate_request_frame(
     session: &mut StoreEbpSession,
     frame: &Frame,
@@ -615,8 +693,8 @@ pub fn validate_request_frame(
     {
         return Err("request frame is outside the negotiated EBP session".to_owned());
     }
-    let (request_id, identity, request) =
-        decode_request_frame(frame).map_err(|error| error.to_string())?;
+    let (request_id, identity, request, _) =
+        decode_request_frame_with_authority(frame).map_err(|error| error.to_string())?;
     if identity.request.state_fence != session.state_fence {
         return Err("request identity state fence does not match the handshake fence".to_owned());
     }
@@ -640,7 +718,56 @@ pub fn validate_request_frame(
     if !session.capabilities.contains(capability) {
         return Err(format!("capability is not admitted: {capability}"));
     }
+    enforce_admitted_operation(&request)?;
     Ok(request)
+}
+
+/// Re-enforces the active generated catalogue on one session-validated
+/// request before any provider I/O (slice C2, issue #19).
+///
+/// Named reads and prepared transitions use the same catalogue validators as
+/// the adapter's pre-commit gate. Genesis is an explicit closed admitted
+/// path bound to the active genesis entry — not a wildcard: the seed must
+/// satisfy its context contract while the entry exists. Recovery, receipt,
+/// head, snapshot, health, readiness, and Dreamer ledger requests keep their
+/// own bounded validation (already run by the wire decode) and perform no
+/// canonical mutation.
+fn enforce_admitted_operation(request: &Request) -> Result<(), String> {
+    match request {
+        Request::Named { request } => {
+            let entries = generated_operation_manifests().map_err(|error| error.to_string())?;
+            request
+                .validate_against_catalogue(&entries)
+                .map_err(|error| error.to_string())
+        }
+        Request::Apply { transition, .. } => {
+            let entries = generated_operation_manifests().map_err(|error| error.to_string())?;
+            transition
+                .validate_against_catalogue(&entries)
+                .map_err(|error| error.to_string())
+        }
+        Request::InitializeGenesis { context, request } => {
+            genesis_manifest().map_err(|error| error.to_string())?;
+            request
+                .validate_for_context(context)
+                .map_err(|error| error.to_string())
+        }
+        // Health, readiness, head, snapshot, recovery, and receipt requests
+        // keep their own bounded validation and perform no canonical
+        // mutation. Dreamer ledger requests join them here: the wire decode
+        // already ran the closed S0 shape plus identity binding,
+        // `validate_request_frame` already enforced the exact per-operation
+        // session capability, and Dreamer operations live outside the
+        // generated named/apply catalogue.
+        Request::Health
+        | Request::Readiness
+        | Request::Recovery { .. }
+        | Request::Receipt { .. }
+        | Request::RevisionHeads { .. }
+        | Request::OrderingHeads { .. }
+        | Request::ValidationSnapshot
+        | Request::DreamerJob { .. } => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -649,7 +776,7 @@ pub fn validate_request_frame(
 mod tests {
     use super::*;
     use eliot_contracts::{
-        ArtifactId, AuthorityEpoch, ClockReading, ContractId, ContractVersion, ProductId,
+        ArtifactId, ClockReading, ContractId, ContractVersion, EpochId, EpochLineageId, ProductId,
         RequestId, ResourceGeneration, SourceId,
     };
     use eliot_installation::{InstallationEpoch, RuntimeStateRoots};
@@ -659,6 +786,14 @@ mod tests {
 
     fn handle(value: impl Into<String>) -> PlatformHandle {
         PlatformHandle::new(value).expect("valid test handle")
+    }
+
+    fn test_epoch(sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("lineage"),
+            std::num::NonZeroU64::new(sequence).expect("sequence"),
+        )
+        .expect("epoch")
     }
 
     fn request_meta(state_fence: StateFence) -> RequestMeta {
@@ -730,8 +865,7 @@ mod tests {
         let roots = runtime_state_roots();
         let config_path = handle(r"C:\ProgramData\Eliot\generation.json");
         let authority_generation = ResourceGeneration::genesis();
-        let authority_state_fence =
-            StateFence::new(AuthorityEpoch::genesis(), authority_generation);
+        let authority_state_fence = StateFence::new(test_epoch(1), authority_generation);
         let mut descriptor = RuntimeLaunchDescriptor {
             profile: InstallationProfile::SystemService,
             portable_root: None,
@@ -782,6 +916,12 @@ mod tests {
                 handle(eliot_installation::PHASE_B_PENDING_MARKER),
                 handle("--kernel-artifact-sha256"),
                 handle("1".repeat(64)),
+                handle("--doctor-artifact-sha256"),
+                handle("5".repeat(64)),
+                handle("--testd-artifact-sha256"),
+                handle("6".repeat(64)),
+                handle("--native-worker-artifact-sha256"),
+                handle("7".repeat(64)),
                 handle("--eliotd-descriptor"),
                 handle(r"C:\ProgramData\Eliot\eliotd.json"),
                 handle("--eliotd-descriptor-sha256"),
@@ -809,6 +949,14 @@ mod tests {
             host_artifact_digest: handle("c".repeat(64)),
             watchdog_executable_path: handle(r"C:\ProgramData\Eliot\bin\eliot-watchdog.exe"),
             watchdog_artifact_digest: handle("4".repeat(64)),
+            doctor_executable_path: handle(r"C:\ProgramData\Eliot\bin\eliot-doctor.exe"),
+            doctor_artifact_digest: handle("5".repeat(64)),
+            testd_executable_path: handle(r"C:\ProgramData\Eliot\bin\eliot-testd.exe"),
+            testd_artifact_digest: handle("6".repeat(64)),
+            native_worker_executable_path: handle(
+                r"C:\ProgramData\Eliot\bin\eliot-native-worker.exe",
+            ),
+            native_worker_artifact_digest: handle("7".repeat(64)),
             descriptor_digest: handle("0".repeat(64)),
         };
         reseal_runtime_launch(&mut descriptor);
@@ -930,10 +1078,7 @@ mod tests {
 
         let binding = StoreSchemaBootstrapBinding::from_config(&config);
         let mut drifted = command;
-        drifted.state_fence = StateFence::new(
-            AuthorityEpoch::new(2).expect("epoch"),
-            ResourceGeneration::genesis(),
-        );
+        drifted.state_fence = StateFence::new(test_epoch(2), ResourceGeneration::genesis());
         assert!(matches!(
             binding.validate_command(&drifted, &migration),
             Err(StoreSchemaBootstrapError::Rejected(reason))
@@ -1177,7 +1322,7 @@ mod tests {
     fn recovery_dispatch_default_unavailable_is_error() {
         let request = eliot_store_api::StoreRecoveryRequest {
             contract_version: eliot_store_api::CONTRACT_VERSION,
-            state_fence: StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis()),
+            state_fence: StateFence::new(test_epoch(1), ResourceGeneration::genesis()),
             records: Vec::new(),
             include_receipts: false,
             include_jobs: false,
@@ -1210,7 +1355,7 @@ mod tests {
             operation_id: OperationId::new("genesis-dispatch").expect("operation id"),
             idempotency_key: "genesis-retry".to_owned(),
             canonical_request_hash: String::new(),
-            state_fence: StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis()),
+            state_fence: StateFence::new(test_epoch(1), ResourceGeneration::genesis()),
             owner_records: Vec::new(),
         };
         let context = request_meta(request.state_fence.clone());
@@ -1234,6 +1379,18 @@ mod tests {
             &[
                 eliot_store_api::CAPABILITY_RECOVERY,
                 eliot_store_api::CAPABILITY_INITIALIZE_GENESIS,
+                eliot_store_api::CAPABILITY_DREAMER_JOB_SUBMIT,
+                eliot_store_api::CAPABILITY_DREAMER_JOB_LEASE_NEXT,
+                eliot_store_api::CAPABILITY_DREAMER_JOB_LEASE_EXACT,
+                eliot_store_api::CAPABILITY_DREAMER_JOB_RENEW,
+                eliot_store_api::CAPABILITY_DREAMER_JOB_START,
+                eliot_store_api::CAPABILITY_DREAMER_JOB_CHECKPOINT,
+                eliot_store_api::CAPABILITY_DREAMER_JOB_RESUME,
+                eliot_store_api::CAPABILITY_DREAMER_JOB_BEGIN_VERIFICATION,
+                eliot_store_api::CAPABILITY_DREAMER_JOB_PUBLISH,
+                eliot_store_api::CAPABILITY_DREAMER_JOB_STATUS,
+                eliot_store_api::CAPABILITY_DREAMER_JOB_REQUEST_CANCEL,
+                eliot_store_api::CAPABILITY_DREAMER_JOB_RECONCILE,
             ]
         );
     }
@@ -1246,7 +1403,7 @@ mod tests {
             operation_id: operation_id.clone(),
             idempotency_key: "genesis-retry".to_owned(),
             canonical_request_hash: String::new(),
-            state_fence: StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis()),
+            state_fence: StateFence::new(test_epoch(1), ResourceGeneration::genesis()),
             owner_records: Vec::new(),
         };
         let context = request_meta(request.state_fence.clone());
@@ -1327,7 +1484,11 @@ mod tests {
         let module_id = ContractId::new(STORE_MODULE_IDENTITY).expect("module id");
         let artifact_id =
             ArtifactId::new(config.approved_artifact_hash.as_str()).expect("artifact");
-        let authority_epoch = config.runtime_launch.authority_state_fence.authority_epoch;
+        let authority_epoch = config
+            .runtime_launch
+            .authority_state_fence
+            .authority_epoch
+            .clone();
         let generation = config.runtime_launch.authority_generation;
         let hello = ClientHello {
             protocol_range: ProtocolRange {
@@ -1354,7 +1515,7 @@ mod tests {
                 artifact_id,
                 state: ModuleGenerationState::Active,
                 health: HealthVector::healthy(),
-                state_fence: StateFence::new(authority_epoch, generation),
+                state_fence: StateFence::new(authority_epoch.clone(), generation),
             },
             launch_nonce: config.launch_nonce.clone(),
             capabilities: CAPABILITIES
@@ -1389,7 +1550,11 @@ mod tests {
         };
         let mut hello: ClientHello = serde_json::from_value(payload).expect("client hello");
         hello.module_generation.state_fence = StateFence::new(
-            config.runtime_launch.authority_state_fence.authority_epoch,
+            config
+                .runtime_launch
+                .authority_state_fence
+                .authority_epoch
+                .clone(),
             ResourceGeneration::new(config.store_generation() + 1).expect("generation"),
         );
         let mismatched =
@@ -1398,9 +1563,17 @@ mod tests {
             admit_handshake(mismatched, TransportLimits::default(), &config, &identity,).is_err()
         );
 
-        let mismatched_authority =
-            AuthorityEpoch::new(config.authority_epoch() + 1).expect("epoch");
-        hello.authority_epoch = mismatched_authority;
+        let mismatched_authority = EpochId::new(
+            config
+                .runtime_launch
+                .authority_state_fence
+                .authority_epoch
+                .lineage_id
+                .clone(),
+            std::num::NonZeroU64::new(config.authority_epoch() + 1).expect("epoch"),
+        )
+        .expect("epoch");
+        hello.authority_epoch = mismatched_authority.clone();
         hello.module_generation.state_fence = StateFence::new(
             mismatched_authority,
             config.runtime_launch.authority_generation,
@@ -1436,7 +1609,10 @@ mod tests {
                     "capacity": "HEALTHY"
                 },
                 "state_fence": {
-                    "authority_epoch": 1,
+                    "authority_epoch": {
+                        "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+                        "sequence": 1
+                    },
                     "resource_generation": 1
                 }
             }))
@@ -1497,7 +1673,10 @@ mod tests {
                     "capacity": "HEALTHY"
                 },
                 "state_fence": {
-                    "authority_epoch": 1,
+                    "authority_epoch": {
+                        "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+                        "sequence": 1
+                    },
                     "resource_generation": 1
                 }
             }))
@@ -1527,5 +1706,535 @@ mod tests {
             ledger.observe_bound(overflow, &frame),
             Err(TransportError::RegistryFull)
         );
+    }
+
+    fn admitted_session(config: &StoreLaunchConfig) -> StoreEbpSession {
+        let identity = StoreHandshakeIdentity::new("manifest-test", serde_json::json!({}));
+        let (session, _) = admit_handshake(
+            client_hello_frame(config),
+            TransportLimits::default(),
+            config,
+            &identity,
+        )
+        .expect("handshake admits");
+        session
+    }
+
+    fn session_identity(
+        context: &RequestMeta,
+        idempotency_key: &str,
+    ) -> eliot_protocol::RequestIdentity {
+        // `RequestBinding` is not re-exported to this crate, so the identity
+        // is built through its canonical JSON shape (field names are covered
+        // by the `deny_unknown_fields` contract on both structs).
+        serde_json::from_value(serde_json::json!({
+            "request": {
+                "metadata": context,
+                "state_fence": context.state_fence,
+            },
+            "idempotency_key": idempotency_key,
+            "deadline_unix_ms": 1,
+            "cancellation_id": "cancel-bridge",
+        }))
+        .expect("test identity builds")
+    }
+
+    fn ingress_frame(
+        session: &StoreEbpSession,
+        context: &RequestMeta,
+        identity: eliot_protocol::RequestIdentity,
+        request: Request,
+    ) -> Frame {
+        eliot_store_api::request_frame(
+            session.connection_id(),
+            session.protocol_version(),
+            context.request_id.clone(),
+            identity,
+            request,
+        )
+        .expect("ingress frame builds")
+    }
+
+    fn mutation_transition(
+        fence: &StateFence,
+        manifest_digest: &str,
+    ) -> eliot_store_api::PreparedTransition {
+        use eliot_store_api::{
+            EffectClass, EventProjectionRelationIntents, NamedMutationOperation,
+            NamedMutationRequest, OperationIdentity, OperationManifestDigest, OrderingScopeId,
+            ScopeId, SecurityContext, TransitionClass,
+        };
+        eliot_store_api::PreparedTransition {
+            identity: OperationIdentity {
+                operation_id: OperationId::new("op-bridge").expect("operation id"),
+                idempotency_key: "idem-bridge".to_owned(),
+                canonical_request_hash: "a".repeat(64),
+            },
+            state_fence: fence.clone(),
+            scope_id: ScopeId::new("scope-bridge").expect("scope"),
+            task_id: None,
+            ordering_scopes: vec![OrderingScopeId::new("scope-bridge").expect("ordering")],
+            transition_class: TransitionClass::CaptureCandidate,
+            requested_effect_ceiling: EffectClass::Candidate,
+            admission_contract_set_digest: "b".repeat(64),
+            operation_manifest_digest: OperationManifestDigest::new(manifest_digest)
+                .expect("manifest digest"),
+            named_operations: vec![NamedMutationRequest {
+                operation: NamedMutationOperation::CaptureObservation,
+                parameters: std::collections::BTreeMap::from([(
+                    "subject".to_owned(),
+                    serde_json::json!("op-bridge"),
+                )]),
+            }],
+            event_projection_relation_intents: EventProjectionRelationIntents {
+                event_ids: Vec::new(),
+                projection_kinds: Vec::new(),
+                relation_kinds: Vec::new(),
+            },
+            security: SecurityContext::default(),
+            required_proof_and_approval_refs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn ingress_rejects_stale_manifest_before_any_provider_effect() {
+        let config = config();
+        let mut session = admitted_session(&config);
+        let fence = config.runtime_launch.authority_state_fence.clone();
+        let context = request_meta(fence.clone());
+        let transition = mutation_transition(&fence, "stale-manifest-digest");
+        let identity = session_identity(&context, &transition.identity.idempotency_key);
+        let frame = ingress_frame(
+            &session,
+            &context,
+            identity,
+            Request::Apply {
+                context: context.clone(),
+                transition,
+                expected_revision_heads: Vec::new(),
+                expected_ordering_heads: Vec::new(),
+            },
+        );
+        let error = validate_request_frame(&mut session, &frame)
+            .expect_err("stale manifest must fail before dispatch");
+        assert!(
+            error.contains("operation manifest digest mismatch")
+                || error.contains("unknown named operation"),
+            "typed catalogue rejection, never generic: {error}"
+        );
+    }
+
+    fn erasure_transition(
+        fence: &StateFence,
+        manifest_digest: &str,
+    ) -> eliot_store_api::PreparedTransition {
+        use eliot_store_api::{
+            EffectClass, EventProjectionRelationIntents, NamedMutationOperation,
+            NamedMutationRequest, OperationIdentity, OperationManifestDigest, OrderingScopeId,
+            ScopeId, SecurityContext, TransitionClass,
+        };
+        eliot_store_api::PreparedTransition {
+            identity: OperationIdentity {
+                operation_id: OperationId::new("op-erasure-bridge").expect("operation id"),
+                idempotency_key: "idem-erasure-bridge".to_owned(),
+                canonical_request_hash: "c".repeat(64),
+            },
+            state_fence: fence.clone(),
+            scope_id: ScopeId::new("scope-bridge").expect("scope"),
+            task_id: None,
+            ordering_scopes: vec![OrderingScopeId::new("scope-bridge").expect("ordering")],
+            transition_class: TransitionClass::Erasure,
+            requested_effect_ceiling: EffectClass::ReversibleMutation,
+            admission_contract_set_digest: "b".repeat(64),
+            operation_manifest_digest: OperationManifestDigest::new(manifest_digest)
+                .expect("manifest digest"),
+            named_operations: vec![NamedMutationRequest {
+                operation: NamedMutationOperation::ApplyErasure,
+                parameters: std::collections::BTreeMap::from([
+                    ("subject".to_owned(), serde_json::json!("subject-bridge")),
+                    (
+                        "surfaces".to_owned(),
+                        serde_json::json!("CanonicalPayload,Index"),
+                    ),
+                    (
+                        "reason".to_owned(),
+                        serde_json::json!("user requested deletion"),
+                    ),
+                    ("requester".to_owned(), serde_json::json!("user:test")),
+                    (
+                        "erasure_operation_id".to_owned(),
+                        serde_json::json!("op-erasure-bridge"),
+                    ),
+                ]),
+            }],
+            event_projection_relation_intents: EventProjectionRelationIntents {
+                event_ids: Vec::new(),
+                projection_kinds: Vec::new(),
+                relation_kinds: Vec::new(),
+            },
+            security: SecurityContext::default(),
+            required_proof_and_approval_refs: vec!["approval-user-1".to_owned()],
+        }
+    }
+
+    #[test]
+    fn ingress_admits_named_erasure_apply_with_live_catalogue() {
+        use eliot_store_api::{generated_operation_manifests, operation_manifest_set_digest};
+        let config = config();
+        let mut session = admitted_session(&config);
+        let fence = config.runtime_launch.authority_state_fence.clone();
+        let context = request_meta(fence.clone());
+        // The live catalogue digest admits the named erasure operation at
+        // the bins ingress gate: the frame reaches dispatch instead of
+        // failing as an unknown operation.
+        let entries = generated_operation_manifests().expect("catalogue generates");
+        let set_digest = operation_manifest_set_digest(&entries).expect("set digest computes");
+        let transition = erasure_transition(&fence, set_digest.as_str());
+        let identity = session_identity(&context, &transition.identity.idempotency_key);
+        let frame = ingress_frame(
+            &session,
+            &context,
+            identity,
+            Request::Apply {
+                context: context.clone(),
+                transition,
+                expected_revision_heads: Vec::new(),
+                expected_ordering_heads: Vec::new(),
+            },
+        );
+        let request = validate_request_frame(&mut session, &frame)
+            .expect("admitted erasure apply passes ingress");
+        assert!(
+            matches!(request, Request::Apply { .. }),
+            "erasure apply frame reaches dispatch"
+        );
+
+        // A stale manifest digest on the same erasure shape still fails
+        // before any provider effect.
+        let mut session = admitted_session(&config);
+        let stale = erasure_transition(&fence, "stale-manifest-digest");
+        let identity = session_identity(&context, &stale.identity.idempotency_key);
+        let frame = ingress_frame(
+            &session,
+            &context,
+            identity,
+            Request::Apply {
+                context: context.clone(),
+                transition: stale,
+                expected_revision_heads: Vec::new(),
+                expected_ordering_heads: Vec::new(),
+            },
+        );
+        assert!(
+            validate_request_frame(&mut session, &frame).is_err(),
+            "stale erasure manifest must fail before dispatch"
+        );
+    }
+
+    #[test]
+    fn ingress_rejects_extra_read_parameter_before_dispatch() {
+        use eliot_store_api::{NamedReadOperation, ReadConsistency};
+        let config = config();
+        let mut session = admitted_session(&config);
+        let fence = config.runtime_launch.authority_state_fence.clone();
+        let context = request_meta(fence.clone());
+        let read = NamedReadRequest {
+            operation: NamedReadOperation::GetRevisionHeads,
+            scope_id: None,
+            consistency: ReadConsistency::Eventual,
+            state_fence: fence,
+            parameters: std::collections::BTreeMap::from([(
+                "extra".to_owned(),
+                serde_json::json!(1),
+            )]),
+        };
+        let identity = session_identity(&context, "idem-read");
+        let frame = ingress_frame(
+            &session,
+            &context,
+            identity,
+            Request::Named { request: read },
+        );
+        assert!(
+            validate_request_frame(&mut session, &frame).is_err(),
+            "extra read parameter must fail before dispatch"
+        );
+    }
+
+    #[test]
+    fn ingress_accepts_activated_read_and_closed_genesis() {
+        use eliot_store_api::{NamedReadOperation, OWNER_SNAPSHOT_SCHEMA, ReadConsistency};
+        let config = config();
+        let mut session = admitted_session(&config);
+        let fence = config.runtime_launch.authority_state_fence.clone();
+        let context = request_meta(fence.clone());
+        let read = NamedReadRequest {
+            operation: NamedReadOperation::GetRevisionHeads,
+            scope_id: None,
+            consistency: ReadConsistency::Eventual,
+            state_fence: fence.clone(),
+            parameters: std::collections::BTreeMap::new(),
+        };
+        let identity = session_identity(&context, "idem-read-ok");
+        let frame = ingress_frame(
+            &session,
+            &context,
+            identity,
+            Request::Named { request: read },
+        );
+        assert!(
+            matches!(
+                validate_request_frame(&mut session, &frame),
+                Ok(Request::Named { .. })
+            ),
+            "activated read passes ingress"
+        );
+
+        // Genesis is an explicit closed admitted path, not a wildcard.
+        let payload = b"{\"seed\":true}".to_vec();
+        let genesis = StoreGenesisRequest {
+            contract_version: eliot_store_api::CONTRACT_VERSION,
+            operation_id: OperationId::new("genesis-bridge").expect("operation id"),
+            idempotency_key: "genesis-bridge-key".to_owned(),
+            canonical_request_hash: String::new(),
+            state_fence: fence.clone(),
+            owner_records: vec![eliot_store_api::RecoveryRecord {
+                namespace: "owner".to_owned(),
+                key: "seed".to_owned(),
+                state_fence: fence,
+                revision: 1,
+                schema: OWNER_SNAPSHOT_SCHEMA.to_owned(),
+                payload: payload.clone(),
+                value_digest: eliot_store_api::sha256_hex(&payload),
+            }],
+        };
+        let genesis = genesis
+            .with_computed_digest()
+            .expect("genesis digest computes");
+        let mut genesis_context = request_meta(genesis.state_fence.clone());
+        genesis_context.request_id =
+            eliot_contracts::RequestId::new("request-genesis-bridge").expect("request id");
+        let genesis_identity = session_identity(&genesis_context, &genesis.idempotency_key);
+        let genesis_frame = ingress_frame(
+            &session,
+            &genesis_context,
+            genesis_identity,
+            Request::InitializeGenesis {
+                context: genesis_context.clone(),
+                request: genesis,
+            },
+        );
+        assert!(
+            matches!(
+                validate_request_frame(&mut session, &genesis_frame),
+                Ok(Request::InitializeGenesis { .. })
+            ),
+            "closed genesis path passes ingress"
+        );
+    }
+
+    fn dreamer_submit_request(
+        fence: &StateFence,
+        context: &RequestMeta,
+        transport_key: &str,
+        operation_id: &str,
+        idempotency_key: &str,
+    ) -> eliot_protocol::dreamer_job::DurableJobRequest {
+        use eliot_protocol::dreamer_job::{DurableRequestIdentity, JobOperation, JobRole};
+        let fence_json = serde_json::to_value(fence).expect("fence json");
+        let scope = serde_json::json!({
+            "scope_id": "scope-dreamer-s2",
+            "product_id": "product-dispatch",
+            "resource_generation": 1,
+            "state_fence": fence_json.clone(),
+        });
+        let opaque = |revision: &str| {
+            serde_json::json!({
+                "contract": {
+                    "name": "eliot.smart.dreamer.contracts",
+                    "version": {"major": 1, "minor": 0, "patch": 0},
+                    "shape_sha256": "0".repeat(64),
+                },
+                "source_revision": revision,
+                "byte_length": 8,
+                "sha256": "1".repeat(64),
+                "artifact_id": format!("artifact-{revision}"),
+            })
+        };
+        let operation = {
+            let submission: eliot_protocol::dreamer_job::JobSubmission =
+                serde_json::from_value(serde_json::json!({
+                    "job_id": "job-bridge",
+                    "attempt_id": "attempt-bridge",
+                    "work_scope": scope.clone(),
+                    "semantic_input": opaque("input-bridge"),
+                    "output_contract": opaque("output-bridge"),
+                    "admission": {
+                        "authority": {
+                            "authority_id": "kernel",
+                            "authority_owner": "kernel",
+                            "authority_epoch": fence_json.get("authority_epoch").cloned().unwrap_or(serde_json::Value::Null),
+                            "state_fence": fence_json.clone(),
+                            "allowed_effect": "CANDIDATE",
+                            "proof_ceiling": "CANDIDATE_ARTIFACT",
+                        },
+                        "requester_principal": "requester-bridge",
+                        "session": null,
+                        "scope": scope,
+                        "capability": "dreamer.submit",
+                        "route_class": "bounded",
+                        "budget_units": 1,
+                        "deadline_unix_ms": 600_000,
+                        "validity_epoch": fence_json.get("authority_epoch").cloned().unwrap_or(serde_json::Value::Null),
+                        "resource_generation": 1,
+                        "admission_receipt": "admission-bridge",
+                    },
+                    "cancellation_id": "cancel-bridge",
+                }))
+                .expect("submission");
+            JobOperation::Submit {
+                submission: Box::new(submission),
+            }
+        };
+        let kind = operation.kind().as_str().to_owned();
+        let context_json = serde_json::to_value(context).expect("context json");
+        let mut identity: DurableRequestIdentity = serde_json::from_value(serde_json::json!({
+            "request": {
+                "request": {"metadata": context_json, "state_fence": fence_json.clone()},
+                "idempotency_key": transport_key,
+                "deadline_unix_ms": 600_000,
+                "cancellation_id": "cancel-bridge",
+            },
+            "operation": {
+                "operation_id": operation_id,
+                "request_id": "originating-bridge",
+                "idempotency_key": idempotency_key,
+                "operation_kind": kind,
+                "effect": "CANDIDATE",
+                "state_fence": fence_json,
+            },
+            "canonical_request_hash": "0".repeat(64),
+        }))
+        .expect("identity");
+        identity.canonical_request_hash = DurableRequestIdentity::digest_for(
+            &identity.operation,
+            &identity.request,
+            &operation,
+            JobRole::Requester,
+        )
+        .expect("hash");
+        let request = eliot_protocol::dreamer_job::DurableJobRequest {
+            request_identity: identity,
+            role: JobRole::Requester,
+            operation,
+        };
+        request.validate().expect("request validates");
+        request
+    }
+
+    fn session_without_capability(config: &StoreLaunchConfig, withheld: &str) -> StoreEbpSession {
+        let identity = StoreHandshakeIdentity::new("manifest-test", serde_json::json!({}));
+        let frame = client_hello_frame(config);
+        let ProtocolPayload::Json(payload) = frame.payload.clone() else {
+            panic!("hello payload");
+        };
+        let mut hello: ClientHello = serde_json::from_value(payload).expect("client hello");
+        hello
+            .capabilities
+            .retain(|capability| capability.as_str() != withheld);
+        let filtered =
+            eliot_ipc::client_hello_frame("connection-test", &hello).expect("filtered hello");
+        admit_handshake(filtered, TransportLimits::default(), config, &identity)
+            .expect("handshake admits")
+            .0
+    }
+
+    #[test]
+    fn dreamer_submit_capability_denied_before_dispatch_without_write() {
+        // The session below never admitted `store.dreamer_job.submit`, so the
+        // existing session mechanism rejects the frame before any dispatch or
+        // backend write can happen: `validate_request_frame` returns `Err`,
+        // and the transport loop only dispatches `Ok` requests.
+        let config = config();
+        let mut session =
+            session_without_capability(&config, eliot_store_api::CAPABILITY_DREAMER_JOB_SUBMIT);
+        let fence = config.runtime_launch.authority_state_fence.clone();
+        let context = request_meta(fence.clone());
+        let request = dreamer_submit_request(
+            &fence,
+            &context,
+            "transport-dreamer-bridge",
+            "op-dreamer-bridge",
+            "idem-dreamer-bridge",
+        );
+        assert_eq!(
+            eliot_store_api::dreamer_job_capability(&request.operation),
+            eliot_store_api::CAPABILITY_DREAMER_JOB_SUBMIT
+        );
+        let identity = session_identity(&context, "transport-dreamer-bridge");
+        let frame = ingress_frame(
+            &session,
+            &context,
+            identity,
+            Request::DreamerJob {
+                context: context.clone(),
+                request,
+            },
+        );
+        let error = validate_request_frame(&mut session, &frame).expect_err("withheld capability");
+        assert!(
+            error.contains("capability is not admitted")
+                && error.contains(eliot_store_api::CAPABILITY_DREAMER_JOB_SUBMIT),
+            "capability rejection before dispatch, never generic: {error}"
+        );
+    }
+
+    #[test]
+    fn dreamer_working_edge_capabilities_are_advertised() {
+        // S2 registration proof: the handshake denominator carries exactly
+        // the per-operation capabilities of the S1 working edge
+        // (Submit/LeaseExact/Status, owner #775), and the wire maps each
+        // Dreamer request to the same string the session gate enforces.
+        for capability in [
+            eliot_store_api::CAPABILITY_DREAMER_JOB_SUBMIT,
+            eliot_store_api::CAPABILITY_DREAMER_JOB_LEASE_EXACT,
+            eliot_store_api::CAPABILITY_DREAMER_JOB_STATUS,
+        ] {
+            assert!(
+                CAPABILITIES.contains(&capability),
+                "working-edge capability is advertised: {capability}"
+            );
+        }
+        let fence = StateFence::new(test_epoch(1), ResourceGeneration::genesis());
+        let context = request_meta(fence.clone());
+        let request = dreamer_submit_request(
+            &fence,
+            &context,
+            "transport-dreamer-advertised",
+            "op-dreamer-advertised",
+            "idem-dreamer-advertised",
+        );
+        assert_eq!(
+            Request::DreamerJob { context, request }.capability(),
+            eliot_store_api::CAPABILITY_DREAMER_JOB_SUBMIT
+        );
+    }
+
+    #[test]
+    fn dreamer_request_passes_admitted_operation_gate() {
+        // The S2 `lib.rs` registration keeps session-validated Dreamer
+        // requests on the admitted path: wire decode plus the per-operation
+        // session capability already gate shape and authority, and Dreamer
+        // operations live outside the generated named/apply catalogue.
+        let fence = StateFence::new(test_epoch(1), ResourceGeneration::genesis());
+        let context = request_meta(fence.clone());
+        let request = dreamer_submit_request(
+            &fence,
+            &context,
+            "transport-dreamer-gate",
+            "op-dreamer-gate",
+            "idem-dreamer-gate",
+        );
+        assert!(enforce_admitted_operation(&Request::DreamerJob { context, request }).is_ok());
     }
 }

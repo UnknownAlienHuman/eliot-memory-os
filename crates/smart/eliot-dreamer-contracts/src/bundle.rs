@@ -5,7 +5,7 @@
 //! assembly, fetching, grounding or validation behavior: those belong to the
 //! A-04/A-05 composition that consumes these contracts.
 //!
-//! Job (`crate::job::DreamJobInput`) and budget (`crate::budget`) shapes live
+//! Job (`crate::job::DreamJobAdmission`) and budget (`crate::budget`) shapes live
 //! in sibling modules and are never redefined here.
 
 #![forbid(unsafe_code)]
@@ -260,11 +260,19 @@ pub fn omit_handle(
 }
 
 #[cfg(test)]
-use eliot_contracts::{AuthorityEpoch, ResourceGeneration, sha256_hex};
+use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, sha256_hex};
+#[cfg(test)]
+use std::num::NonZeroU64;
 
 #[cfg(test)]
 pub(crate) fn valid_fence() -> StateFence {
-    StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+    let epoch = EpochId::new(
+        EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .expect("canonical test lineage-A"),
+        NonZeroU64::new(1).expect("non-zero test sequence"),
+    )
+    .expect("valid test epoch");
+    StateFence::new(epoch, ResourceGeneration::genesis())
 }
 
 #[cfg(test)]
@@ -340,9 +348,11 @@ mod tests {
         assert!(serde_json::from_str::<StateFence>(fence_json).is_err());
 
         let wire = serde_json::to_string(&valid_bundle()).expect("fixture serializes");
-        assert!(wire.contains("\"authority_epoch\":1"));
-        let tampered = wire.replace("\"authority_epoch\":1", "\"authority_epoch\":0");
-        assert!(tampered.contains("\"authority_epoch\":0"));
+        assert!(wire.contains(
+            "\"authority_epoch\":{\"lineage_id\":\"550e8400-e29b-41d4-a716-446655440000\",\"sequence\":1}"
+        ));
+        let tampered = wire.replace("\"sequence\":1", "\"sequence\":0");
+        assert!(tampered.contains("\"sequence\":0"));
         assert!(serde_json::from_str::<DreamInputBundle>(&tampered).is_err());
         let mut over_handle = valid_bundle();
         over_handle.materials[0].handle = "h".repeat(129);

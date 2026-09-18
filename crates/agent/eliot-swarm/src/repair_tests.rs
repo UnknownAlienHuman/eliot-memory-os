@@ -68,7 +68,7 @@ fn binding(
     work_item_id: &str,
     role_id: &str,
     route_id: &str,
-    lease_id: &str,
+    lease_id: eliot_agent_api::WorkLeaseId,
     plan_revision: &str,
     root_revision: &str,
 ) -> Result<ProviderBinding, Box<dyn Error>> {
@@ -88,7 +88,7 @@ fn binding(
         work_item_id: WorkItemId::new(work_item_id)?,
         role_id: RoleId::new(role_id)?,
         route_id: route_id.to_owned(),
-        lease_id: lease_id.to_owned(),
+        lease_id,
         reviewer_attempt_id: None,
         affected_branch: None,
     })
@@ -316,6 +316,12 @@ fn work(spec: &WorkSpec<'_>, plan_revision: &str) -> Result<WorkItem, Box<dyn Er
 }
 
 fn map(spec: &WorkSpec<'_>) -> Result<IndependentMapSubmission, Box<dyn Error>> {
+    // Canonical `WorkLeaseId` via real object wire (never `new(String)`; fail-closed on scalar).
+    let lease_id = serde_json::from_value::<eliot_agent_api::WorkLeaseId>(serde_json::json!({
+        "namespace": "eliot.governor.work-lease",
+        "revision": "v1",
+        "value": format!("lease-{}", spec.id)
+    }))?;
     Ok(IndependentMapSubmission {
         lane_id: LaneId::new(spec.id)?,
         root_context_revision: RootContextRevision::new("root-1")?,
@@ -331,7 +337,7 @@ fn map(spec: &WorkSpec<'_>) -> Result<IndependentMapSubmission, Box<dyn Error>> 
             spec.id,
             &format!("role-{}", spec.id),
             &format!("route-{}", spec.id),
-            &format!("lease-{}", spec.id),
+            lease_id,
             "plan-1",
             "root-1",
         )?,
@@ -424,7 +430,7 @@ fn assigned(
             "stop_condition": "bounded"
         },
         "session": "session-1",
-        "lease": format!("lease-{work_item_id}"),
+        "lease": {"namespace": "eliot.governor.work-lease", "revision": "v1", "value": format!("lease-{work_item_id}")},
         "state": "ADMITTED",
         "continuity": "Fresh",
         "route": {
@@ -440,7 +446,7 @@ fn assigned(
             "epoch": 1, "scope_ref": "scope-1",
             "effect_ceiling": {"scope_ref": "scope-1", "allowed": ["observe"],
                 "max_external_effects": 0},
-            "lease": format!("lease-{work_item_id}"),
+            "lease": {"namespace": "eliot.governor.work-lease", "revision": "v1", "value": format!("lease-{work_item_id}")},
             "state_fence": fence(),
             "valid_until": "later"
         },
@@ -806,7 +812,9 @@ fn p3_rejects_scope_fence_contract_and_lease_mismatch() -> TestResult {
         Err(SwarmError::AssignmentMismatch)
     );
     let mut wrong_lease = assigned(&plan, "lane-a", "route-a")?;
-    wrong_lease.launch_attempt.lease = eliot_agent_api::WorkLeaseId::new("other-lease")?;
+    wrong_lease.launch_attempt.lease = serde_json::from_value::<eliot_agent_api::WorkLeaseId>(
+        serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "other-lease"}),
+    )?;
     assert_eq!(
         admit_wave(
             &plan,

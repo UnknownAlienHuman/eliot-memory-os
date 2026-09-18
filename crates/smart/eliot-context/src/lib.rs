@@ -10,7 +10,9 @@
 
 use std::{cmp::Ordering, collections::BTreeSet};
 
-use eliot_contracts::{ArtifactId, ContractVersion, DecisionId, StateFence, TaskRevision};
+use eliot_contracts::{
+    ArtifactId, ContractVersion, DecisionId, StateFence, TaskRevision, fences_match_exact,
+};
 use eliot_evidence::{Assertability, EpistemicStatus, EvidenceFreshness};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -294,7 +296,7 @@ impl ContextInput {
                 });
             }
             atom.validate()?;
-            if !self.state_fence.is_compatible_with(&atom.state_fence) {
+            if !fences_match_exact(&self.state_fence, &atom.state_fence) {
                 return Err(ContextError::FenceMismatch);
             }
         }

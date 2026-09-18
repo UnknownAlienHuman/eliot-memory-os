@@ -2,8 +2,8 @@
 #![allow(clippy::expect_used)]
 
 use eliot_contracts::{
-    ArtifactId, AuthorityEpoch, ReceiptId, RequestId, ResourceGeneration, SourceId, StateFence,
-    TaskId, sha256_hex,
+    ArtifactId, EpochId, EpochLineageId, ReceiptId, RequestId, ResourceGeneration, SourceId,
+    StateFence, TaskId, sha256_hex,
 };
 use eliot_dreamer_contracts::curation::{RelationPayload, TargetEvidence};
 use eliot_dreamer_contracts::encoding::canonical_bytes;
@@ -13,6 +13,7 @@ use eliot_evidence::{
     EvidenceFreshness, LifecycleState, Provenance,
 };
 use eliot_receipts::{ProofCeiling, ReceiptIdentity, WorkScopeId};
+use std::num::NonZeroU64;
 
 fn id(value: &str) -> ArtifactId {
     ArtifactId::new(value).expect("id")
@@ -21,7 +22,13 @@ fn digest(value: &str) -> String {
     sha256_hex(value.as_bytes())
 }
 fn fence() -> StateFence {
-    StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+    let epoch = EpochId::new(
+        EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .expect("canonical test lineage-A"),
+        NonZeroU64::new(1).expect("non-zero test sequence"),
+    )
+    .expect("valid test epoch");
+    StateFence::new(epoch, ResourceGeneration::genesis())
 }
 
 fn preservation() -> RelationPreservation {
@@ -39,8 +46,8 @@ fn preservation() -> RelationPreservation {
     }
 }
 
-fn job() -> DreamJobInput {
-    DreamJobInput {
+fn job() -> DreamJobAdmission {
+    DreamJobAdmission {
         schema_version: 1,
         job_class: JobClass::Curation,
         requester: Requester {
@@ -260,7 +267,7 @@ fn endpoint(target: &str, role: &str, material: &str) -> RelationEndpoint {
 }
 
 fn relation_item(
-    job_ref: &DreamJobInput,
+    job_ref: &DreamJobAdmission,
     receipt_ref: &ValidationReceipt,
 ) -> ValidatedCurationItem {
     ValidatedCurationItem {

@@ -14,16 +14,29 @@ use crate::activation_outcome::{
     GovernorActivationOutcome, GovernorCandidateCoverage, GovernorRetryDirective,
     GovernorSelectionDirective,
 };
+use crate::controlboard_projection::{
+    ControlBoardGovernorSnapshot, ControlBoardProjectionParts, compile_controlboard_snapshot,
+};
+use crate::observation_reconciliation::GovernorObservationReconciliation;
+use crate::operator_reconciliation::GovernorOperatorReconciliation;
+use crate::owner_projection_refresh::{coherence_result, compare_scope_heads};
+use crate::skill_lifecycle::GovernorSkillLifecycle;
+use crate::task_lifecycle::GovernorTaskLifecycle;
 use crate::{
     Governor, GovernorConfig, GovernorState, QueueLimits, STARTUP_ORDER, ServiceId,
     ServiceObservation,
+};
+use eliot_authority::{
+    GrantActivationRequest, GrantId, GrantRevocationRequest, GrantStatus,
+    IntroductionActivationRequest, IntroductionId, IntroductionRevocationRequest,
+    IntroductionStatus, P07AuthorityPort, P07PortError,
 };
 use eliot_budget::{BudgetLedger, BudgetLedgerRecoverySnapshot};
 use eliot_canonical::{CanonicalError, CanonicalWriteEnvelope};
 use eliot_change_monitor::ChangeMonitor;
 use eliot_contracts::{
-    AuthorityEpoch, OperationId, RequestMetadata, ResourceGeneration, SessionId, StateFence,
-    TaskId, canonical_json_bytes, sha256_hex,
+    EpochId, OperationId, ResourceGeneration, SessionId, StateFence, TaskId, canonical_json_bytes,
+    sha256_hex,
 };
 use eliot_coordination::CoordinationOwner;
 use eliot_finish::{FinishDecisionReceipt, FinishService};
@@ -33,6 +46,8 @@ use eliot_maintenance::{
 use eliot_module_registry::ModuleCatalog;
 use eliot_module_registry::ModuleCatalogSnapshot;
 use eliot_observation::{ObservationJournal, ObservationJournalEntry};
+use eliot_protocol::RequestIdentity;
+use eliot_runtime_contracts::{AuthorityActivationReceipt, AuthorityRevocationReceipt};
 use eliot_session::{SessionLifecycleOwner, SessionLifecycleSnapshot, SessionState};
 use eliot_skill::{SkillLifecycleView, SkillRegistry};
 use eliot_store_api::{
@@ -47,13 +62,28 @@ use thiserror::Error;
 
 #[path = "authority_recovery.rs"]
 mod authority_recovery;
-pub use authority_recovery::{AuthorityOwner, AuthorityOwnerSnapshot};
+pub use authority_recovery::{
+    AuthorityOwner, AuthorityOwnerSnapshot, AuthorityPresentationState, AuthorityRestoreOutcome,
+    PresentedAuthorityRequest, RetainedAuthorityRequest,
+};
+#[path = "authority_revocation.rs"]
+mod authority_revocation;
+pub use authority_revocation::{
+    authority_revocation_envelope, decode_revocation_history_evidence,
+    revocation_history_read_request,
+};
 #[path = "genesis_owner_packet.rs"]
 mod genesis_owner_packet;
 pub use genesis_owner_packet::GovernorGenesisPacket as GovernorGenesisRequest;
 pub use genesis_owner_packet::{
     GOVERNOR_GENESIS_PACKET_SCHEMA, GOVERNOR_GENESIS_PACKET_VERSION, GovernorGenesisOwnerRecord,
     GovernorGenesisPacket,
+};
+#[path = "native_worker_binding.rs"]
+mod native_worker_binding;
+pub use native_worker_binding::{
+    NATIVE_WORKER_EXECUTABLE_BINDING_WIRE_ID, NATIVE_WORKER_EXECUTABLE_BINDING_WIRE_VERSION,
+    NativeWorkerExecutableBinding, process_invocation_digest_for,
 };
 
 /// The only application write port exposed to the daemon.
@@ -62,10 +92,13 @@ pub use genesis_owner_packet::{
 /// it to the authenticated Kernel generation.  It deliberately does not
 /// expose a store client, query surface, provider SDK, or completion API.
 pub trait KernelTransitionPort: Send + Sync {
-    /// Applies one prepared transition under the exact caller/fence binding.
+    /// Applies one prepared transition under the exact admitted request
+    /// identity. The identity carries the original caller/fence binding plus
+    /// the admitted idempotency, deadline and cancellation terms; the port
+    /// must forward those terms unchanged and never synthesize defaults.
     fn apply_prepared<'a>(
         &'a self,
-        request: &RequestMetadata,
+        identity: &RequestIdentity,
         transition: PreparedTransition,
         expected_revision_heads: Vec<RevisionHeadExpectation>,
         expected_ordering_heads: Vec<OrderingHeadExpectation>,
@@ -184,7 +217,7 @@ pub struct KernelGenerationSnapshot {
     /// Active resource generation.
     pub generation: ResourceGeneration,
     /// Active authority epoch.
-    pub authority_epoch: AuthorityEpoch,
+    pub authority_epoch: EpochId,
     /// SHA-256 of the admitted Kernel artifact.
     pub artifact_digest: String,
     /// SHA-256 of the protected full handoff snapshot.
@@ -223,7 +256,7 @@ impl KernelGenerationSnapshot {
                 )));
             }
         }
-        if self.generation.value() == 0 || self.authority_epoch.value() == 0 {
+        if self.generation.value() == 0 {
             return Err(KernelPortError::Contract(
                 "generation and authority_epoch must be non-zero".to_owned(),
             ));
@@ -233,8 +266,8 @@ impl KernelGenerationSnapshot {
 
     /// Returns the exact state fence represented by this snapshot.
     #[must_use]
-    pub const fn state_fence(&self) -> StateFence {
-        StateFence::new(self.authority_epoch, self.generation)
+    pub fn state_fence(&self) -> StateFence {
+        StateFence::new(self.authority_epoch.clone(), self.generation)
     }
 }
 
@@ -255,7 +288,7 @@ pub struct KernelGenerationExpectation {
     /// Expected resource generation.
     pub generation: ResourceGeneration,
     /// Expected authority epoch.
-    pub authority_epoch: AuthorityEpoch,
+    pub authority_epoch: EpochId,
 }
 
 impl KernelGenerationExpectation {
@@ -269,7 +302,7 @@ impl KernelGenerationExpectation {
             protected_snapshot_digest: snapshot.protected_snapshot_digest.clone(),
             principal: snapshot.principal.clone(),
             generation: snapshot.generation,
-            authority_epoch: snapshot.authority_epoch,
+            authority_epoch: snapshot.authority_epoch.clone(),
         })
     }
 
@@ -282,7 +315,9 @@ impl KernelGenerationExpectation {
             || self.protected_snapshot_digest != observed.protected_snapshot_digest
             || self.principal != observed.principal
             || self.generation != observed.generation
-            || self.authority_epoch != observed.authority_epoch
+            || !self
+                .authority_epoch
+                .is_same_authority(&observed.authority_epoch)
         {
             return Err(KernelPortError::Contract(
                 "observed Kernel snapshot does not match Host-approved expectation".to_owned(),
@@ -723,6 +758,9 @@ pub enum CompositionError {
     /// Canonical admission rejected the envelope.
     #[error("canonical admission: {0}")]
     Canonical(#[from] CanonicalError),
+    /// P-07 authority activation refused, mismatched, or of unknown outcome.
+    #[error("authority activation: {0}")]
+    Authority(#[from] P07PortError),
     /// Kernel transition failed at the neutral port.
     #[error("Kernel transition: {0}")]
     Kernel(#[from] KernelPortError),
@@ -907,19 +945,50 @@ impl CanonicalAdmissionOwner {
         Ok(envelope.prepare()?)
     }
 
-    /// Sends only a Canonical-produced transition to the neutral Kernel port.
-    async fn commit<P: KernelTransitionPort + ?Sized>(
+    /// Sends only a Canonical-produced transition to the neutral Kernel port
+    /// under the exact admitted request identity.
+    ///
+    /// The identity comes from admitted ingress, not from the envelope: the
+    /// envelope's request binding and idempotency key must agree exactly with
+    /// the admitted identity, and the immutable transition derived from the
+    /// envelope must agree with both. Any substitution of the binding,
+    /// operation/idempotency terms, deadline or cancellation fails closed
+    /// here; nothing is rehashed or repaired locally, preserving the shared
+    /// canonical hashing contract. The transport peer stays distinct from the
+    /// initiating principal/session: this method never rewrites the
+    /// identity's source. `prepare()` alone remains non-authorizing.
+    pub(crate) async fn commit<P: KernelTransitionPort + ?Sized>(
         &self,
         port: &P,
+        identity: &RequestIdentity,
         envelope: CanonicalWriteEnvelope,
     ) -> Result<WriteReceipt, CompositionError> {
+        identity
+            .validate()
+            .map_err(|error| CompositionError::Provider(error.to_string()))?;
+        if envelope.request != identity.request.metadata {
+            return Err(CompositionError::Provider(
+                "admitted request binding does not match the Canonical envelope request".to_owned(),
+            ));
+        }
+        if envelope.idempotency_key != identity.idempotency_key {
+            return Err(CompositionError::Provider(
+                "admitted idempotency key does not match the Canonical envelope".to_owned(),
+            ));
+        }
         let expected_revision_heads = envelope.expected_revision_heads.clone();
         let expected_ordering_heads = envelope.expected_ordering_heads.clone();
-        let request = envelope.request.clone();
         let transition = self.prepare(&envelope)?;
+        if transition.identity.idempotency_key != identity.idempotency_key
+            || transition.state_fence != identity.request.metadata.state_fence
+        {
+            return Err(CompositionError::Provider(
+                "immutable transition does not agree with the admitted request identity".to_owned(),
+            ));
+        }
         Ok(port
             .apply_prepared(
-                &request,
+                identity,
                 transition,
                 expected_revision_heads,
                 expected_ordering_heads,
@@ -1168,12 +1237,15 @@ impl<P: KernelDurableJobPort + ?Sized> GovernorOwners<P> {
         config_snapshot_digest: String,
         recovery: &GovernorRecoverySnapshot,
     ) -> Result<Self, CompositionError> {
-        let authority_epoch = state_fence.authority_epoch;
+        let authority_epoch = state_fence.authority_epoch.clone();
         let task_snapshot: TaskLifecycleSnapshot =
             decode_owner_snapshot(recovery, RecoveryOwner::Task)?;
-        let task =
-            TaskLifecycleOwner::from_snapshot(authority_epoch, state_fence.clone(), task_snapshot)
-                .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let task = TaskLifecycleOwner::from_snapshot(
+            authority_epoch.clone(),
+            state_fence.clone(),
+            task_snapshot,
+        )
+        .map_err(|error| CompositionError::Recovery(error.to_string()))?;
         let session_snapshot: SessionLifecycleSnapshot =
             decode_owner_snapshot(recovery, RecoveryOwner::Session)?;
         let session = SessionLifecycleOwner::from_snapshot(
@@ -1209,7 +1281,7 @@ impl<P: KernelDurableJobPort + ?Sized> GovernorOwners<P> {
             decode_owner_snapshot(recovery, RecoveryOwner::Coordination)?;
         let coordination = CoordinationOwner::from_snapshot_at(
             coordination_wire,
-            state_fence.authority_epoch,
+            state_fence.authority_epoch.clone(),
             state_fence,
         )
         .map_err(|error| CompositionError::Recovery(error.to_string()))?;
@@ -1351,18 +1423,25 @@ pub enum CompositionReadiness {
 /// process executor hidden behind this value.
 pub struct GovernorComposition<P: ?Sized> {
     kernel: Arc<P>,
+    /// Retained P-07 authority port. `None` means diagnosed degradation
+    /// (reads/degraded status only) and never issues rights.
+    authority_activation: Option<Arc<dyn P07AuthorityPort>>,
     governor: Governor,
     owners: GovernorOwners<P>,
     snapshot: KernelGenerationSnapshot,
     recovery: GovernorRecoverySnapshot,
     service_observations: Vec<KernelServiceRecovery>,
     readiness: CompositionReadiness,
+    /// Exact P-07 presentations retained with their owner snapshots until
+    /// exact reconciliation, keyed by [`PresentedAuthorityRequest::ledger_key`].
+    authority_presentations: BTreeMap<String, RetainedAuthorityRequest>,
 }
 
 impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// Builds one composition only after exact provider and recovery checks.
     pub fn new(
         kernel: Arc<P>,
+        authority_activation: Option<Arc<dyn P07AuthorityPort>>,
         expected: &KernelGenerationExpectation,
         queues: QueueLimits,
     ) -> Result<Self, CompositionError> {
@@ -1382,7 +1461,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
         validate_service_observations(&service_observations, &state_fence)?;
         let mut governor = Governor::new(GovernorConfig {
-            authority_epoch: snapshot.authority_epoch,
+            authority_epoch: snapshot.authority_epoch.clone(),
             resource_generation: snapshot.generation,
             queues,
             background_pause_interactive_depth: 1,
@@ -1419,12 +1498,14 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         )?;
         Ok(Self {
             kernel,
+            authority_activation,
             governor,
             owners,
             snapshot,
             recovery,
             service_observations,
             readiness: CompositionReadiness::Ready,
+            authority_presentations: BTreeMap::new(),
         })
     }
 
@@ -1466,11 +1547,136 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         &self.governor
     }
 
+    /// Compiles the `ControlBoard` read projection over the current owners.
+    ///
+    /// The snapshot is assembled from the live coordination, problem,
+    /// observation, task, and read-scope owners at the retained fence, with
+    /// the board revision and receipt references taken from the
+    /// refresh-consistent recovery named reads. Only a fully admitted
+    /// composition publishes: any other readiness fails closed so the
+    /// surface reports a typed provider gap instead of a stale projection.
+    pub fn controlboard_snapshot(&self) -> Result<ControlBoardGovernorSnapshot, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        let fence = self.snapshot.state_fence();
+        if self.owners.read.state_fence() != &fence {
+            return Err(CompositionError::Recovery(
+                "read owner projection is not bound to the active fence".to_owned(),
+            ));
+        }
+        let read_revision = self.recovery.owner_read(RecoveryOwner::Read)?.revision;
+        let coordination_receipt = self
+            .recovery
+            .owner_read(RecoveryOwner::Coordination)?
+            .value_digest
+            .clone();
+        let observation_receipt = self
+            .recovery
+            .owner_read(RecoveryOwner::Observation)?
+            .value_digest
+            .clone();
+        compile_controlboard_snapshot(&ControlBoardProjectionParts {
+            fence: &fence,
+            read_revision,
+            coordination: &self.owners.coordination,
+            task: &self.owners.task,
+            observation: &self.owners.observation,
+            problem_revisions: &self.owners.problem.revisions,
+            read_scope: self.owners.read.scope(),
+            coordination_receipt_digest: &coordination_receipt,
+            observation_receipt_digest: &observation_receipt,
+        })
+        .map_err(|error| CompositionError::Owner(error.to_string()))
+    }
+
+    /// Borrows the single Skill lifecycle owner as a canonical
+    /// [`SkillLifecycleApi`](eliot_skill::SkillLifecycleApi) adapter.
+    ///
+    /// The adapter reads the current `skill: SkillRegistry` owner (recovered
+    /// via the `Skill` named read) together with the canonical admission owner
+    /// and the retained neutral Kernel port. It creates no per-caller
+    /// registry; promotion commits through the existing canonical path and
+    /// publishes only via `refresh_from_kernel` at the returned receipt
+    /// revisions.
+    #[must_use]
+    pub fn skill_lifecycle(&self) -> GovernorSkillLifecycle<'_, P> {
+        GovernorSkillLifecycle::new(
+            &self.owners.skill,
+            &self.owners.canonical,
+            self.kernel.as_ref(),
+        )
+    }
+
+    /// Borrows the single task lifecycle owner as a canonical
+    /// [`GovernorTaskLifecycle`](crate::GovernorTaskLifecycle) adapter.
+    ///
+    /// The adapter reads the current `task: TaskLifecycleOwner` owner
+    /// (recovered via the `Task` recovery owner) together with the canonical
+    /// admission owner and the retained neutral Kernel port. It creates no
+    /// per-caller owner; proposals and guarded transitions validate against
+    /// a scratch clone (including the task-revision compare-and-swap base
+    /// and the exact legal-transition rule), commit through the existing
+    /// canonical path as one `UpdateTaskState` / `TaskControl` transition,
+    /// and publish only via `refresh_from_kernel` at the returned receipt
+    /// revisions.
+    #[must_use]
+    pub fn task_lifecycle(&self) -> GovernorTaskLifecycle<'_, P> {
+        GovernorTaskLifecycle::new(
+            &self.owners.task,
+            &self.owners.canonical,
+            self.kernel.as_ref(),
+        )
+    }
+
+    /// Borrows the single observation/verified-repair reconciliation owner as
+    /// a canonical [`GovernorObservationReconciliation`] adapter.
+    ///
+    /// The adapter reads the current `observation: ObservationJournal` owner
+    /// (recovered via the `Observation` named read) together with the
+    /// `ProblemOwner` revision map, the canonical admission owner, and the
+    /// retained neutral Kernel port. It creates no per-caller journal or
+    /// problem map; admission commits through the existing canonical path
+    /// and publishes only via `refresh_from_kernel` at the returned receipt
+    /// revisions.
+    #[must_use]
+    pub fn observation_reconciliation(&self) -> GovernorObservationReconciliation<'_, P> {
+        GovernorObservationReconciliation::new(
+            &self.owners.observation,
+            &self.owners.problem.revisions,
+            &self.owners.canonical,
+            self.kernel.as_ref(),
+            self.readiness,
+        )
+    }
+
+    /// Borrows the single operator-command reconciliation owner as a canonical
+    /// [`GovernorOperatorReconciliation`] adapter.
+    ///
+    /// The adapter reads the canonical admission owner together with the
+    /// retained neutral Kernel port. It creates no per-caller ledger: operator
+    /// admission commits through the existing canonical path and every retry
+    /// reconciles through the Kernel receipt route, so a newly created board
+    /// resolves the original operation identity instead of re-admitting it.
+    /// Publication follows `refresh_from_kernel` at the returned receipt
+    /// revisions.
+    #[must_use]
+    pub fn operator_reconciliation(&self) -> GovernorOperatorReconciliation<'_, P> {
+        GovernorOperatorReconciliation::new(
+            &self.owners.canonical,
+            self.kernel.as_ref(),
+            self.readiness,
+        )
+    }
+
     /// Applies one Canonical-admitted transition through the sole retained
-    /// Kernel port. Callers cannot provide a second client or bypass
-    /// Canonical admission with an arbitrary transition.
+    /// Kernel port under the exact admitted request identity. Callers cannot
+    /// provide a second client or bypass Canonical admission with an
+    /// arbitrary transition. The identity comes from admitted ingress;
+    /// `prepare()` alone is not an authorization.
     pub async fn commit_canonical(
         &self,
+        identity: &RequestIdentity,
         envelope: CanonicalWriteEnvelope,
     ) -> Result<WriteReceipt, CompositionError> {
         if self.readiness != CompositionReadiness::Ready {
@@ -1478,8 +1684,669 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         }
         self.owners
             .canonical
-            .commit(self.kernel.as_ref(), envelope)
+            .commit(self.kernel.as_ref(), identity, envelope)
             .await
+    }
+
+    /// Publishes one versioned Governor-owned executable binding projection
+    /// (T9-01 M1, `T9.md` 3.2) for a registered native-worker attempt.
+    ///
+    /// The binding is a pure projection over admitted owner records at the
+    /// retained fence: `state_fence`, `authority_epoch`, and `generation` are
+    /// taken from the retained Kernel snapshot, never from the caller. The
+    /// caller-supplied `plan_id` / `plan_revision` / `task_id` /
+    /// `work_scope_id` must equal the current canonical plan at that fence,
+    /// `task_revision` must equal the task owner revision, `session_id` must
+    /// name a session at the fence with `route_ref` equal to its admitted
+    /// `model_route`, `work_scope_id` must equal the bound `WorkScope` scope,
+    /// and `config_snapshot_digest` must equal the retained protected snapshot
+    /// digest. Any mismatch fails closed as `Recovery` (stale), never repaired
+    /// locally. T9-02 enforces the remaining currentness (route/adapter/
+    /// config/facet/grant/epoch change makes stale) at the Kernel before
+    /// resume; this method binds to the current fence/epoch and refuses a
+    /// stale fence.
+    ///
+    /// This method performs no transport: the caller commits a sibling
+    /// `PreparedTransition` through the existing `commit_canonical` path and
+    /// correlates by `operation_id` / `canonical_request_hash` / `state_fence`.
+    /// All parameters are required; blank or malformed input fails closed.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "M1 binding joins every T9.md 3.2 denominator field in one versioned projection"
+    )]
+    pub fn publish_native_worker_binding(
+        &self,
+        claim_id: &str,
+        registration_id: &str,
+        installation_id: &str,
+        task_id: &str,
+        work_unit_id: &str,
+        work_scope_id: &str,
+        attempt: u32,
+        lease_id: &str,
+        operation_id: &str,
+        canonical_request_hash: &str,
+        principal_id: &str,
+        session_id: &str,
+        worker_generation: u64,
+        process_tree_id: &str,
+        process_generation: u64,
+        process_fence: &str,
+        route_ref: &str,
+        adapter_id: &str,
+        adapter_revision: u64,
+        artifact_digest: &str,
+        config_digest: &str,
+        protocol_digest: &str,
+        command_ref: &str,
+        facet_manifest_ref: &str,
+        introduction_refs: Vec<String>,
+        supporting_grant_refs: Vec<String>,
+        grant_graph_revision: u64,
+        effective_ceiling: eliot_store_api::EffectClass,
+        credential_refs: Vec<String>,
+        resource_refs: Vec<String>,
+        replay_stream_id: &str,
+        launch_nonce: &str,
+        process_invocation_digest: &str,
+        deadline_unix_ms: u64,
+        expires_at_unix_ms: u64,
+        plan_id: &str,
+        plan_revision: &str,
+        task_revision: u64,
+        config_snapshot_digest: &str,
+        admission_revision_ref: &str,
+    ) -> Result<NativeWorkerExecutableBinding, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        let fence = self.snapshot.state_fence();
+        let authority_epoch = self.snapshot.authority_epoch.clone();
+        let generation = self.snapshot.generation;
+        if config_snapshot_digest != self.snapshot.protected_snapshot_digest
+            || config_snapshot_digest != self.owners.config.snapshot_digest()
+        {
+            return Err(CompositionError::Recovery(
+                "native binding config snapshot is not the retained protected snapshot".to_owned(),
+            ));
+        }
+        let plan = self.owners.canonical.read_current_plan(&fence)?;
+        if plan.plan_id != plan_id
+            || plan.plan_revision != plan_revision
+            || plan.task_id.as_str() != task_id
+            || plan.work_scope_id != work_scope_id
+        {
+            return Err(CompositionError::Recovery(
+                "native binding plan/task/scope does not match the current canonical plan"
+                    .to_owned(),
+            ));
+        }
+        let task_key = TaskId::new(task_id.to_owned())
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let task = self.owners.task.task(&task_key).ok_or_else(|| {
+            CompositionError::Recovery("native binding task has no owner record".to_owned())
+        })?;
+        if task.revision != task_revision || task.state_fence != fence {
+            return Err(CompositionError::Recovery(
+                "native binding task revision is stale or foreign".to_owned(),
+            ));
+        }
+        let session_key = SessionId::new(session_id.to_owned())
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let session = self.owners.session.session(&session_key).ok_or_else(|| {
+            CompositionError::Recovery("native binding session has no owner record".to_owned())
+        })?;
+        if session.state_fence != fence
+            || session.authority_epoch != authority_epoch
+            || session.model_route != route_ref
+        {
+            return Err(CompositionError::Recovery(
+                "native binding session/route is stale or foreign".to_owned(),
+            ));
+        }
+        let scope_owner = self.owners.work_scope.as_ref().ok_or_else(|| {
+            CompositionError::Recovery(
+                "native binding WorkScope is unbound; semantic activation is unavailable"
+                    .to_owned(),
+            )
+        })?;
+        let scope = scope_owner
+            .read_current(&fence)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        if scope.binding.scope.scope_ref != work_scope_id {
+            return Err(CompositionError::Recovery(
+                "native binding work scope does not match the bound WorkScope".to_owned(),
+            ));
+        }
+        let mut binding = NativeWorkerExecutableBinding {
+            claim_id: claim_id.to_owned(),
+            registration_id: registration_id.to_owned(),
+            task_id: task_id.to_owned(),
+            work_unit_id: work_unit_id.to_owned(),
+            work_scope_id: work_scope_id.to_owned(),
+            attempt,
+            lease_id: lease_id.to_owned(),
+            operation_id: operation_id.to_owned(),
+            canonical_request_hash: canonical_request_hash.to_owned(),
+            installation_id: installation_id.to_owned(),
+            principal_id: principal_id.to_owned(),
+            session_id: session_id.to_owned(),
+            worker_generation,
+            process_tree_id: process_tree_id.to_owned(),
+            process_generation,
+            process_fence: process_fence.to_owned(),
+            route_ref: route_ref.to_owned(),
+            adapter_id: adapter_id.to_owned(),
+            adapter_revision,
+            artifact_digest: artifact_digest.to_owned(),
+            config_digest: config_digest.to_owned(),
+            protocol_digest: protocol_digest.to_owned(),
+            command_ref: command_ref.to_owned(),
+            facet_manifest_ref: facet_manifest_ref.to_owned(),
+            introduction_refs,
+            supporting_grant_refs,
+            grant_graph_revision,
+            effective_ceiling,
+            credential_refs,
+            resource_refs,
+            replay_stream_id: replay_stream_id.to_owned(),
+            launch_nonce: launch_nonce.to_owned(),
+            process_invocation_digest: process_invocation_digest.to_owned(),
+            state_fence: fence,
+            authority_epoch: authority_epoch.clone(),
+            generation,
+            deadline_unix_ms,
+            expires_at_unix_ms,
+            plan_id: plan_id.to_owned(),
+            plan_revision: plan_revision.to_owned(),
+            task_revision,
+            config_snapshot_digest: config_snapshot_digest.to_owned(),
+            admission_revision_ref: admission_revision_ref.to_owned(),
+            wire_id: NATIVE_WORKER_EXECUTABLE_BINDING_WIRE_ID.to_owned(),
+            wire_version: NATIVE_WORKER_EXECUTABLE_BINDING_WIRE_VERSION,
+            binding_digest: String::new(),
+        };
+        let digest = binding
+            .compute_digest()
+            .map_err(CompositionError::Recovery)?;
+        binding.binding_digest = digest;
+        binding.validate().map_err(CompositionError::Recovery)?;
+        Ok(binding)
+    }
+
+    /// Publishes one versioned Governor-owned executable binding projection
+    /// (T9-01 M1) with the R1 production `process_invocation_digest` derived
+    /// from the exact process invocation value.
+    ///
+    /// This is the production producer for the dispatch join: it
+    /// canonicalizes the exact invocation JSON with the same
+    /// `canonical_json_bytes` + `sha256_hex` the wire uses (via
+    /// [`process_invocation_digest_for`]), so the published binding carries
+    /// the real invocation digest, never a placeholder. Canonicalization
+    /// failure fails closed as [`CompositionError::Recovery`]; no digest is
+    /// synthesized. Every other field follows
+    /// [`Self::publish_native_worker_binding`] exactly, including the
+    /// sibling-`commit_canonical` correlation contract (`operation_id` /
+    /// `canonical_request_hash` / `state_fence`).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "R1 producer joins every T9.md 3.2 denominator field plus the exact invocation value in one versioned projection"
+    )]
+    pub fn publish_native_worker_binding_for_invocation(
+        &self,
+        claim_id: &str,
+        registration_id: &str,
+        installation_id: &str,
+        task_id: &str,
+        work_unit_id: &str,
+        work_scope_id: &str,
+        attempt: u32,
+        lease_id: &str,
+        operation_id: &str,
+        canonical_request_hash: &str,
+        principal_id: &str,
+        session_id: &str,
+        worker_generation: u64,
+        process_tree_id: &str,
+        process_generation: u64,
+        process_fence: &str,
+        route_ref: &str,
+        adapter_id: &str,
+        adapter_revision: u64,
+        artifact_digest: &str,
+        config_digest: &str,
+        protocol_digest: &str,
+        command_ref: &str,
+        facet_manifest_ref: &str,
+        introduction_refs: Vec<String>,
+        supporting_grant_refs: Vec<String>,
+        grant_graph_revision: u64,
+        effective_ceiling: eliot_store_api::EffectClass,
+        credential_refs: Vec<String>,
+        resource_refs: Vec<String>,
+        replay_stream_id: &str,
+        launch_nonce: &str,
+        process_invocation: &serde_json::Value,
+        deadline_unix_ms: u64,
+        expires_at_unix_ms: u64,
+        plan_id: &str,
+        plan_revision: &str,
+        task_revision: u64,
+        config_snapshot_digest: &str,
+        admission_revision_ref: &str,
+    ) -> Result<NativeWorkerExecutableBinding, CompositionError> {
+        let derived = native_worker_binding::process_invocation_digest_for(process_invocation)
+            .map_err(CompositionError::Recovery)?;
+        self.publish_native_worker_binding(
+            claim_id,
+            registration_id,
+            installation_id,
+            task_id,
+            work_unit_id,
+            work_scope_id,
+            attempt,
+            lease_id,
+            operation_id,
+            canonical_request_hash,
+            principal_id,
+            session_id,
+            worker_generation,
+            process_tree_id,
+            process_generation,
+            process_fence,
+            route_ref,
+            adapter_id,
+            adapter_revision,
+            artifact_digest,
+            config_digest,
+            protocol_digest,
+            command_ref,
+            facet_manifest_ref,
+            introduction_refs,
+            supporting_grant_refs,
+            grant_graph_revision,
+            effective_ceiling,
+            credential_refs,
+            resource_refs,
+            replay_stream_id,
+            launch_nonce,
+            &derived,
+            deadline_unix_ms,
+            expires_at_unix_ms,
+            plan_id,
+            plan_revision,
+            task_revision,
+            config_snapshot_digest,
+            admission_revision_ref,
+        )
+    }
+
+    /// Re-reads Kernel-owned owner projections and publishes a coherent live
+    /// update without a daemon restart.
+    ///
+    /// This closes the `commit_canonical` publication gap: owner state
+    /// committed through the canonical path becomes visible to Governor
+    /// readers after one successful refresh instead of only after a restart.
+    ///
+    /// Fail-closed behavior:
+    /// - The retained generation/epoch/identity is re-admitted through
+    ///   `KernelGenerationExpectation::admits`; any change is
+    ///   `CompositionError::Recovery` telling the daemon to drop this
+    ///   composition and re-run authenticated connect+start. A new generation
+    ///   is never inferred locally.
+    /// - Owner reads re-run the exact authenticated `recover_from_kernel`
+    ///   path under the retained fence and protected-snapshot digest,
+    ///   including the all-empty genesis branch. Partial state is an error;
+    ///   no default is manufactured.
+    /// - A post-read canonical scope must agree with the recovered heads on
+    ///   scope identity, fence, and every revision/ordering head; mid-read
+    ///   revision churn blocks publication.
+    /// - Service observations are re-validated and owners are rebuilt through
+    ///   `GovernorOwners::from_recovery`. Only a fully coherent result swaps
+    ///   `owners`, `recovery`, and `service_observations`. On any failure the
+    ///   previous projection and receipts are kept untouched; callers observe
+    ///   `Err`, never a false success.
+    /// - The orchestration lifecycle object is retained: re-validated
+    ///   observations still satisfy the required-base admission proved at
+    ///   construction under the same fence.
+    /// - Operator command replay lives in Kernel ORS behind the receipt route
+    ///   (see `operator_reconciliation`); the refresh swaps Governor owners
+    ///   only and never resets that durable identity.
+    pub fn refresh_from_kernel(&mut self) -> Result<(), CompositionError> {
+        let observed = self.kernel.snapshot().clone();
+        let expected =
+            KernelGenerationExpectation::from_snapshot(&self.snapshot).map_err(|error| {
+                CompositionError::Recovery(format!(
+                    "retained Kernel snapshot is no longer well-formed: {error}"
+                ))
+            })?;
+        expected.admits(&observed).map_err(|error| {
+            CompositionError::Recovery(format!(
+                "Kernel generation changed; drop this composition and re-run authenticated \
+                 connect+start before publishing projections: {error}"
+            ))
+        })?;
+        let state_fence = self.snapshot.state_fence();
+        let protected_snapshot_digest = self.snapshot.protected_snapshot_digest.clone();
+        let recovery = recover_from_kernel(
+            self.kernel.as_ref(),
+            &state_fence,
+            &protected_snapshot_digest,
+        )?;
+        recovery.validate(&state_fence, &protected_snapshot_digest)?;
+        let post_scope = self
+            .kernel
+            .canonical_scope(&state_fence, &protected_snapshot_digest)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        coherence_result(compare_scope_heads(
+            &recovery.canonical_scope,
+            &post_scope,
+            &state_fence,
+        ))?;
+        let service_observations = self
+            .kernel
+            .services(&state_fence, &protected_snapshot_digest)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        validate_service_observations(&service_observations, &state_fence)?;
+        let owners = GovernorOwners::from_recovery(
+            self.kernel.clone(),
+            &state_fence,
+            protected_snapshot_digest.clone(),
+            &recovery,
+        )?;
+        self.owners = owners;
+        self.recovery = recovery;
+        self.service_observations = service_observations;
+        Ok(())
+    }
+
+    /// Returns whether a live P-07 authority port was retained. `None` means
+    /// diagnosed degradation (reads/degraded status only); it never issues
+    /// rights and every activation entry point fails closed with
+    /// [`P07PortError::Unavailable`].
+    #[must_use]
+    pub fn authority_activation_available(&self) -> bool {
+        self.authority_activation.is_some()
+    }
+
+    /// Presents one canonical grant activation to the retained P-07 port and
+    /// records `PendingActivation -> Active` only after the exact
+    /// Kernel-issued receipt validates `Active`.
+    ///
+    /// Fail-closed behavior:
+    /// - Without a retained port, or when the composition is not ready, no
+    ///   right is issued.
+    /// - The recovered grant must still be `PendingActivation`; a restored
+    ///   `Active`, an unknown grant, or a second activation on a recorded
+    ///   identity fails closed instead of issuing twice.
+    /// - An `UnknownOutcome` retains the exact request with its owner snapshot
+    ///   until exact reconciliation; the grant stays pending, never active.
+    /// - A receipt bound to another snapshot or epoch, or failing
+    ///   `validate()`, leaves the retained state untouched.
+    pub fn activate_grant(
+        &mut self,
+        request: &GrantActivationRequest,
+    ) -> Result<AuthorityActivationReceipt, CompositionError> {
+        self.require_ready_for_authority()?;
+        let port = self.authority_port()?;
+        let presented = PresentedAuthorityRequest::GrantActivation(request.clone());
+        self.require_activatable_grant(&presented)?;
+        let receipt = match port.activate_grant(request) {
+            Ok(receipt) => receipt,
+            Err(P07PortError::UnknownOutcome { snapshot_id }) => {
+                self.note_unknown_outcome(presented, &snapshot_id)?;
+                return Err(CompositionError::Authority(P07PortError::UnknownOutcome {
+                    snapshot_id,
+                }));
+            }
+            Err(error) => return Err(CompositionError::Authority(error)),
+        };
+        let retained = self.retain_presentation(presented)?;
+        retained.note_activated(&receipt)?;
+        Ok(receipt)
+    }
+
+    /// Revokes one grant through the retained P-07 port, Kernel first. The
+    /// Kernel-issued revocation receipt is validated before the local
+    /// projection is reconciled; when that reconciliation cannot complete, the
+    /// retained revocation intent keeps effects blocked instead of reporting
+    /// an active right.
+    pub fn revoke_grant(
+        &mut self,
+        request: &GrantRevocationRequest,
+    ) -> Result<AuthorityRevocationReceipt, CompositionError> {
+        self.require_ready_for_authority()?;
+        let port = self.authority_port()?;
+        let presented = PresentedAuthorityRequest::GrantRevocation(request.clone());
+        let receipt = match port.revoke_grant(request) {
+            Ok(receipt) => receipt,
+            Err(P07PortError::UnknownOutcome { snapshot_id }) => {
+                self.note_unknown_outcome(presented, &snapshot_id)?;
+                return Err(CompositionError::Authority(P07PortError::UnknownOutcome {
+                    snapshot_id,
+                }));
+            }
+            Err(error) => return Err(CompositionError::Authority(error)),
+        };
+        receipt
+            .validate()
+            .map_err(|_| CompositionError::Authority(P07PortError::InvalidBinding))?;
+        if receipt.snapshot_id != request.snapshot_id.as_str()
+            || !receipt
+                .authority_epoch
+                .is_same_authority(&request.binding.state_fence.authority_epoch)
+        {
+            return Err(CompositionError::Authority(P07PortError::InvalidBinding));
+        }
+        // Canonical-second reconciliation: absorb the validated Kernel receipt
+        // into the local projection. The graph mutation runs before the ledger
+        // files the receipt.
+        let graph_reconciled = self
+            .owners
+            .authority
+            .grants
+            .revoke(&request.grant_id)
+            .is_ok();
+        let retained = self.retain_presentation(presented)?;
+        if !graph_reconciled {
+            // Kernel already fenced this grant (the receipt above validated),
+            // but the local projection cannot reconcile it — typically a grant
+            // unknown to the recovered graph. The visible revocation intent is
+            // strictly stronger than any right, so effects stay blocked.
+            retained.note_revocation_intended();
+            return Err(CompositionError::Recovery(
+                "grant revocation reconciled at Kernel but not in the recovered graph; \
+                 revocation intent retained and effects remain blocked"
+                    .to_owned(),
+            ));
+        }
+        if retained.note_revoked(&receipt).is_err() {
+            retained.note_revocation_intended();
+            return Err(CompositionError::Recovery(
+                "grant revocation receipt could not be filed; \
+                 revocation intent retained and effects remain blocked"
+                    .to_owned(),
+            ));
+        }
+        Ok(receipt)
+    }
+
+    /// Presents one canonical introduction activation to the retained P-07
+    /// port. The same receipt gate as [`Self::activate_grant`] applies:
+    /// `Active` is recorded only after the exact Kernel-issued receipt
+    /// validates, and a second activation on a recorded identity fails closed.
+    pub fn activate_introduction(
+        &mut self,
+        request: &IntroductionActivationRequest,
+    ) -> Result<AuthorityActivationReceipt, CompositionError> {
+        self.require_ready_for_authority()?;
+        let port = self.authority_port()?;
+        let presented = PresentedAuthorityRequest::IntroductionActivation(request.clone());
+        if let Some(retained) = self
+            .authority_presentations
+            .get(presented.ledger_key().as_str())
+            && matches!(retained.state(), AuthorityPresentationState::Active { .. })
+        {
+            return Err(CompositionError::Authority(P07PortError::InvalidBinding));
+        }
+        let receipt = match port.activate_introduction(request) {
+            Ok(receipt) => receipt,
+            Err(P07PortError::UnknownOutcome { snapshot_id }) => {
+                self.note_unknown_outcome(presented, &snapshot_id)?;
+                return Err(CompositionError::Authority(P07PortError::UnknownOutcome {
+                    snapshot_id,
+                }));
+            }
+            Err(error) => return Err(CompositionError::Authority(error)),
+        };
+        let retained = self.retain_presentation(presented)?;
+        retained.note_activated(&receipt)?;
+        Ok(receipt)
+    }
+
+    /// Revokes one introduction through the retained P-07 port, Kernel first,
+    /// with the same revocation-intent fallback as [`Self::revoke_grant`].
+    /// Introductions have no recovered graph fallback, so the validated Kernel
+    /// receipt files directly into the retained presentation.
+    pub fn revoke_introduction(
+        &mut self,
+        request: &IntroductionRevocationRequest,
+    ) -> Result<AuthorityRevocationReceipt, CompositionError> {
+        self.require_ready_for_authority()?;
+        let port = self.authority_port()?;
+        let presented = PresentedAuthorityRequest::IntroductionRevocation(request.clone());
+        let receipt = match port.revoke_introduction(request) {
+            Ok(receipt) => receipt,
+            Err(P07PortError::UnknownOutcome { snapshot_id }) => {
+                self.note_unknown_outcome(presented, &snapshot_id)?;
+                return Err(CompositionError::Authority(P07PortError::UnknownOutcome {
+                    snapshot_id,
+                }));
+            }
+            Err(error) => return Err(CompositionError::Authority(error)),
+        };
+        let retained = self.retain_presentation(presented)?;
+        if retained.note_revoked(&receipt).is_err() {
+            retained.note_revocation_intended();
+            return Err(CompositionError::Recovery(
+                "introduction revocation receipt could not be filed; \
+                 revocation intent retained and effects remain blocked"
+                    .to_owned(),
+            ));
+        }
+        Ok(receipt)
+    }
+
+    /// Returns the effective grant status: retained receipt-driven state
+    /// composes over the recovered graph status. Only a validated `Active`
+    /// receipt reports `Active`; revocation intent reports `Revoked`; anything
+    /// unresolved keeps the recovered status. `None` means the recovered graph
+    /// carries no such grant and no presentation was retained.
+    #[must_use]
+    pub fn authority_grant_status(&self, grant_id: &GrantId) -> Option<GrantStatus> {
+        let key = format!("grant:{grant_id}");
+        let graph = self.recovered_grant_status(grant_id);
+        match self.authority_presentations.get(&key) {
+            Some(retained) => Some(retained.grant_status(graph)),
+            None => graph,
+        }
+    }
+
+    /// Returns the effective introduction status. Introductions have no
+    /// recovered graph fallback: only a validated receipt reports `Active`,
+    /// revocation intent reports `Revoked`, and anything unresolved reports
+    /// nothing rather than an effective right.
+    #[must_use]
+    pub fn authority_introduction_status(
+        &self,
+        introduction_id: &IntroductionId,
+    ) -> Option<IntroductionStatus> {
+        let key = format!("introduction:{introduction_id}");
+        self.authority_presentations
+            .get(&key)
+            .and_then(RetainedAuthorityRequest::introduction_status)
+    }
+
+    fn require_ready_for_authority(&self) -> Result<(), CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        Ok(())
+    }
+
+    fn authority_port(&self) -> Result<Arc<dyn P07AuthorityPort>, CompositionError> {
+        self.authority_activation
+            .clone()
+            .ok_or_else(|| CompositionError::Authority(P07PortError::Unavailable))
+    }
+
+    /// Resolves the canonical grant for an activation presentation: the
+    /// recovered graph must still carry it as `PendingActivation`. Restored
+    /// `Active` history, unknown grants, and already-recorded activations fail
+    /// closed before any transport is touched.
+    fn require_activatable_grant(
+        &self,
+        presented: &PresentedAuthorityRequest,
+    ) -> Result<(), CompositionError> {
+        let PresentedAuthorityRequest::GrantActivation(request) = presented else {
+            return Err(CompositionError::Authority(P07PortError::InvalidBinding));
+        };
+        if self.recovered_grant_status(&request.grant_id) != Some(GrantStatus::PendingActivation) {
+            return Err(CompositionError::Authority(P07PortError::InvalidBinding));
+        }
+        if let Some(retained) = self
+            .authority_presentations
+            .get(presented.ledger_key().as_str())
+            && matches!(retained.state(), AuthorityPresentationState::Active { .. })
+        {
+            return Err(CompositionError::Authority(P07PortError::InvalidBinding));
+        }
+        Ok(())
+    }
+
+    fn recovered_grant_status(&self, grant_id: &GrantId) -> Option<GrantStatus> {
+        self.owners
+            .authority
+            .grants
+            .recovery_snapshot()
+            .ok()?
+            .grants
+            .iter()
+            .find(|record| record.grant_id == grant_id.as_str())
+            .map(|record| record.status)
+    }
+
+    /// Retains the exact presentation with the current owner snapshot,
+    /// preserving an already-recorded reconciliation state. A conflicting
+    /// presentation under the same identity fails closed.
+    fn retain_presentation(
+        &mut self,
+        presented: PresentedAuthorityRequest,
+    ) -> Result<&mut RetainedAuthorityRequest, CompositionError> {
+        let key = presented.ledger_key();
+        if let Some(retained) = self.authority_presentations.get(&key) {
+            if retained.request() != &presented {
+                return Err(CompositionError::Authority(P07PortError::InvalidBinding));
+            }
+        } else {
+            let snapshot = self.owners.authority.snapshot()?;
+            let retained = RetainedAuthorityRequest::retain(presented, snapshot)?;
+            self.authority_presentations.insert(key.clone(), retained);
+        }
+        self.authority_presentations.get_mut(&key).ok_or_else(|| {
+            CompositionError::Recovery("retained authority presentation vanished".to_owned())
+        })
+    }
+
+    /// Files a lost acknowledgement against the retained presentation. The
+    /// grant stays pending; only the exact snapshot reconciles it.
+    fn note_unknown_outcome(
+        &mut self,
+        presented: PresentedAuthorityRequest,
+        snapshot_id: &eliot_authority::SnapshotId,
+    ) -> Result<(), CompositionError> {
+        let retained = self.retain_presentation(presented)?;
+        retained.note_unknown_outcome(snapshot_id)
     }
 
     /// Reads one coherent semantic activation from all required owner records.
@@ -1498,7 +2365,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         let work = self
             .owners
             .coordination
-            .read_unique_active_work_lease(now, state_fence.authority_epoch, &state_fence)
+            .read_unique_active_work_lease(now, state_fence.authority_epoch.clone(), &state_fence)
             .map_err(|error| {
                 CompositionError::Recovery(format!(
                     "unique coordination activation read failed: {error}"
@@ -1519,7 +2386,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             })?;
         if lifecycle_session.session_id != lifecycle_session_id
             || lifecycle_session.status != SessionState::Active
-            || lifecycle_session.authority_epoch != state_fence.authority_epoch
+            || !lifecycle_session
+                .authority_epoch
+                .is_same_authority(&state_fence.authority_epoch)
             || lifecycle_session.state_fence != state_fence
             || lifecycle_session.started_at == 0
             || lifecycle_session.heartbeat_at < lifecycle_session.started_at
@@ -1672,7 +2541,7 @@ fn recover_from_kernel<P: KernelRecoveryPort + ?Sized>(
     }
     if missing != 0 {
         if missing != RecoveryOwner::ALL.len()
-            || state_fence.authority_epoch != AuthorityEpoch::genesis()
+            || state_fence.authority_epoch.sequence.get() != 1
             || state_fence.resource_generation != ResourceGeneration::genesis()
             || state_fence.task_revision.is_some()
             || state_fence.policy_revision.is_some()
@@ -1734,7 +2603,10 @@ fn validate_service_observations(
     for recovered in observations {
         if !services.insert(recovered.service)
             || recovered.observation.generation != expected_fence.resource_generation
-            || recovered.observation.authority_epoch != expected_fence.authority_epoch
+            || !recovered
+                .observation
+                .authority_epoch
+                .is_same_authority(&expected_fence.authority_epoch)
             || recovered.observation.state != eliot_runtime_contracts::ServiceProcessState::Ready
             || !recovered.observation.health.is_fully_healthy()
         {
@@ -1875,7 +2747,7 @@ impl GovernorLaunchConfig {
             service: self.kernel.service.clone(),
             protocol: self.kernel.protocol.clone(),
             generation: self.kernel.generation,
-            authority_epoch: self.kernel.authority_epoch,
+            authority_epoch: self.kernel.authority_epoch.clone(),
             artifact_digest: self.kernel.artifact_digest.clone(),
             protected_snapshot_digest: self.protected_snapshot_digest.clone(),
             principal: self.kernel.principal.clone(),
@@ -1904,21 +2776,68 @@ mod tests {
     use super::*;
     use crate::{STARTUP_ORDER, ServiceId};
     use eliot_budget::{BudgetEnvelope, BudgetLedger, ProviderToolAttribution, QuotaState};
+    use eliot_canonical::CanonicalWriteEnvelope;
     use eliot_config::Applicability;
-    use eliot_contracts::{ClockReading, ContractId, SessionId, TaskId};
+    use eliot_contracts::{
+        ClockReading, ContractId, ProductId, RequestId, RequestMetadata, SessionId, SourceId,
+        TaskId,
+    };
     use eliot_coordination::{
         RegisterSession as CoordinationRegisterSession, WorkItem, WorkLeaseRequest, WorkState,
     };
-    use eliot_receipts::{AuthorityBinding, EffectClass, ProofCeiling};
-    use eliot_runtime_contracts::{HealthVector, ServiceProcessState};
+    use eliot_protocol::RequestIdentity;
+    use eliot_receipts::{AuthorityBinding, EffectClass, ProofCeiling, RequestBinding};
+    use eliot_runtime_contracts::{AuthorityState, HealthVector, ServiceProcessState};
     use eliot_session::{RegisterSession, SessionCommand, SessionCommandContext};
-    use eliot_store_api::ScopeId;
+    use eliot_store_api::{
+        CommitId, EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
+        OperationManifestDigest, OrderingHead, OrderingHeadExpectation, OrderingScopeId,
+        Resubmission, RevisionHead, RevisionKey, ScopeId, SecurityContext, TransitionClass,
+        WriteReceipt, WriteReceiptStatus, validate_store_receipt_envelope,
+    };
     use eliot_task::{TaskCommandContext, TaskLifecycleEvent, TaskProposal, TaskRecord};
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+    const TEST_LINEAGE_B: &str = "550e8400-e29b-41d4-a716-446655440001";
+
+    fn test_epoch(lineage: &str, sequence: u64) -> EpochId {
+        EpochId::new(
+            eliot_contracts::EpochLineageId::new(lineage).expect("valid test lineage"),
+            std::num::NonZeroU64::new(sequence).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
+
+    fn test_fence(sequence: u64) -> StateFence {
+        StateFence::new(
+            test_epoch(TEST_LINEAGE_A, sequence),
+            ResourceGeneration::genesis(),
+        )
+    }
 
     struct FakeKernel {
         snapshot: KernelGenerationSnapshot,
         payloads: BTreeMap<RecoveryOwner, Vec<u8>>,
+        /// Post-construction owner overrides keyed by owner. `Some(bytes)`
+        /// replaces the seeded payload; `None` drops the read to simulate
+        /// partial recovery. Checked before `payloads`/`missing`.
+        live_reads: Mutex<BTreeMap<RecoveryOwner, Option<Vec<u8>>>>,
+        /// Staged canonical scope views. While more than one view is staged,
+        /// calls consume them in order (simulating heads moving between
+        /// reads); a single remaining view is served stably; empty falls back
+        /// to the default empty view.
+        staged_scopes: Mutex<Vec<ScopeRevisionView>>,
+        /// Terminal receipts served by the receipts route.
+        receipts: Vec<WriteReceipt>,
+        /// Committed transitions keyed by operation id, served by the
+        /// transition-port receipt route for exact reconciliation.
+        committed: Mutex<BTreeMap<OperationId, (RequestIdentity, WriteReceipt)>>,
+        /// Number of actual gateway executions. Idempotent replays of an
+        /// already committed operation resolve to the stored receipt without
+        /// incrementing this count.
+        apply_calls: Mutex<u64>,
         missing: Option<RecoveryOwner>,
         genesis_all_absent: bool,
         genesis_seeded: Arc<AtomicBool>,
@@ -1935,19 +2854,136 @@ mod tests {
     impl KernelTransitionPort for FakeKernel {
         fn apply_prepared<'a>(
             &'a self,
-            _request: &RequestMetadata,
-            _transition: PreparedTransition,
-            _expected_revision_heads: Vec<RevisionHeadExpectation>,
-            _expected_ordering_heads: Vec<OrderingHeadExpectation>,
+            identity: &RequestIdentity,
+            transition: PreparedTransition,
+            expected_revision_heads: Vec<RevisionHeadExpectation>,
+            expected_ordering_heads: Vec<OrderingHeadExpectation>,
         ) -> KernelPortFuture<'a, WriteReceipt> {
-            Box::pin(async { Err(KernelPortError::Unknown("test port".to_owned())) })
+            let identity = identity.clone();
+            Box::pin(async move {
+                identity
+                    .validate()
+                    .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+                transition
+                    .validate()
+                    .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+                // Exact binding agreement: the admitted identity's request
+                // binding, fence and idempotency terms must match the
+                // immutable transition. Substitutions fail closed here and
+                // are never repaired or rehashed.
+                if identity.request.metadata.state_fence != transition.state_fence
+                    || identity.request.state_fence != transition.state_fence
+                {
+                    return Err(KernelPortError::Contract(
+                        "fake gateway: identity fence does not match the transition fence"
+                            .to_owned(),
+                    ));
+                }
+                if identity.idempotency_key != transition.identity.idempotency_key {
+                    return Err(KernelPortError::Contract(
+                        "fake gateway: identity idempotency does not match the transition"
+                            .to_owned(),
+                    ));
+                }
+                for head in &expected_revision_heads {
+                    head.validate()
+                        .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+                    if head.state_fence != transition.state_fence {
+                        return Err(KernelPortError::Contract(
+                            "fake gateway: revision head fence does not match the transition"
+                                .to_owned(),
+                        ));
+                    }
+                }
+                for head in &expected_ordering_heads {
+                    head.validate()
+                        .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+                    if head.state_fence != transition.state_fence {
+                        return Err(KernelPortError::Contract(
+                            "fake gateway: ordering head fence does not match the transition"
+                                .to_owned(),
+                        ));
+                    }
+                }
+                let mut committed = self.committed.lock().expect("committed lock");
+                if let Some((_, receipt)) = committed.get(&transition.identity.operation_id) {
+                    // Exact idempotent replay: the same operation identity
+                    // resolves to the stored receipt without re-execution. A
+                    // different idempotency or hash under a committed
+                    // operation id is an identity conflict, never a silent
+                    // second execution.
+                    if receipt.idempotency_key == transition.identity.idempotency_key
+                        && receipt.canonical_request_hash
+                            == transition.identity.canonical_request_hash
+                    {
+                        return Ok(receipt.clone());
+                    }
+                    return Err(KernelPortError::Contract(
+                        "fake gateway: committed operation identity conflict".to_owned(),
+                    ));
+                }
+                // Issue the store-owned receipt envelope through the real
+                // shared contract: no canned receipt bypasses validation.
+                let sequence = u64::try_from(committed.len())
+                    .map_err(|error| KernelPortError::Contract(error.to_string()))?
+                    + 1;
+                let operation_id = transition.identity.operation_id.clone();
+                let candidate = WriteReceipt {
+                    operation_id: operation_id.clone(),
+                    idempotency_key: transition.identity.idempotency_key.clone(),
+                    canonical_request_hash: transition.identity.canonical_request_hash.clone(),
+                    transition_class: transition.transition_class,
+                    status: WriteReceiptStatus::Committed,
+                    commit_id: Some(
+                        CommitId::new(format!("commit-{operation_id}"))
+                            .map_err(|error| KernelPortError::Contract(error.to_string()))?,
+                    ),
+                    state_fence: transition.state_fence.clone(),
+                    ordering_sequences: Vec::new(),
+                    revision_before_after: Vec::new(),
+                    applied_command_ids: vec!["cmd-1".to_owned()],
+                    emitted_event_ids: Vec::new(),
+                    projection_refs: Vec::new(),
+                    outbox_refs: Vec::new(),
+                    operation_manifest_digest: transition.operation_manifest_digest.clone(),
+                    error_code: None,
+                    resubmission: Resubmission::None,
+                    committed_at: Some(format!("commit-sequence-{sequence:016}")),
+                    envelope: None,
+                };
+                candidate
+                    .validate()
+                    .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+                let envelope = eliot_store_api::issue_store_receipt_envelope(
+                    &identity.request.metadata,
+                    &transition,
+                    &candidate,
+                    sequence,
+                )
+                .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+                let mut receipt = candidate;
+                receipt.envelope = Some(envelope);
+                eliot_store_api::validate_store_receipt_envelope(
+                    &identity.request.metadata,
+                    &transition,
+                    &receipt,
+                )
+                .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+                *self.apply_calls.lock().expect("apply call lock") += 1;
+                committed.insert(operation_id, (identity, receipt.clone()));
+                Ok(receipt)
+            })
         }
 
-        fn receipt(
-            &self,
-            _operation_id: OperationId,
-        ) -> KernelPortFuture<'_, Option<WriteReceipt>> {
-            Box::pin(async { Ok(None) })
+        fn receipt(&self, operation_id: OperationId) -> KernelPortFuture<'_, Option<WriteReceipt>> {
+            Box::pin(async move {
+                Ok(self
+                    .committed
+                    .lock()
+                    .expect("committed lock")
+                    .get(&operation_id)
+                    .map(|(_, receipt)| receipt.clone()))
+            })
         }
 
         fn health(&self) -> KernelPortFuture<'_, StoreHealth> {
@@ -1960,6 +2996,25 @@ mod tests {
             &self,
             request: KernelNamedReadRequest,
         ) -> Result<Option<KernelNamedReadReply>, KernelPortError> {
+            let live = self
+                .live_reads
+                .lock()
+                .expect("live read lock")
+                .get(&request.owner)
+                .cloned();
+            if let Some(live) = live {
+                return match live {
+                    Some(payload) => Ok(Some(KernelNamedReadReply {
+                        owner: request.owner,
+                        state_fence: request.state_fence,
+                        revision: 1,
+                        schema: OWNER_SNAPSHOT_SCHEMA.to_owned(),
+                        value_digest: sha256_hex(&payload),
+                        payload,
+                    })),
+                    None => Ok(None),
+                };
+            }
             if self.missing == Some(request.owner) {
                 return Ok(None);
             }
@@ -2000,6 +3055,13 @@ mod tests {
             state_fence: &StateFence,
             _protected_snapshot_digest: &str,
         ) -> Result<ScopeRevisionView, KernelPortError> {
+            let mut staged = self.staged_scopes.lock().expect("staged scope lock");
+            if staged.len() > 1 {
+                return Ok(staged.remove(0));
+            }
+            if let Some(view) = staged.first() {
+                return Ok(view.clone());
+            }
             Ok(ScopeRevisionView {
                 scope_id: ScopeId::new("governor").expect("scope"),
                 revision_heads: Vec::new(),
@@ -2013,7 +3075,7 @@ mod tests {
             _state_fence: &StateFence,
             _protected_snapshot_digest: &str,
         ) -> Result<Vec<WriteReceipt>, KernelPortError> {
-            Ok(Vec::new())
+            Ok(self.receipts.clone())
         }
 
         fn durable_jobs(
@@ -2062,7 +3124,7 @@ mod tests {
             service: "eliot-kernel".to_owned(),
             protocol: "eliot.kernel.v1".to_owned(),
             generation: ResourceGeneration::genesis(),
-            authority_epoch: AuthorityEpoch::genesis(),
+            authority_epoch: test_epoch(TEST_LINEAGE_A, 1),
             artifact_digest: "a".repeat(64),
             protected_snapshot_digest: "b".repeat(64),
             principal: "S-1-5-18".to_owned(),
@@ -2073,6 +3135,11 @@ mod tests {
         FakeKernel {
             snapshot,
             payloads: BTreeMap::new(),
+            live_reads: Mutex::new(BTreeMap::new()),
+            staged_scopes: Mutex::new(Vec::new()),
+            receipts: Vec::new(),
+            committed: Mutex::new(BTreeMap::new()),
+            apply_calls: Mutex::new(0),
             missing: None,
             genesis_all_absent: false,
             genesis_seeded: Arc::new(AtomicBool::new(false)),
@@ -2090,7 +3157,7 @@ mod tests {
                     state: ServiceProcessState::Ready,
                     health: HealthVector::healthy(),
                     generation: state_fence.resource_generation,
-                    authority_epoch: state_fence.authority_epoch,
+                    authority_epoch: state_fence.authority_epoch.clone(),
                 },
             })
             .collect()
@@ -2224,7 +3291,7 @@ mod tests {
                 to: TaskState::ActionAuthorized,
                 command: None,
                 state_fence: fence.clone(),
-                authority_epoch: fence.authority_epoch,
+                authority_epoch: fence.authority_epoch.clone(),
                 observed_at: ClockReading::default(),
             }],
         }
@@ -2240,7 +3307,7 @@ mod tests {
                 session_id: "session-1".to_owned(),
                 principal_id: "principal-1".to_owned(),
                 route_ref: "route-1".to_owned(),
-                authority_epoch: fence.authority_epoch,
+                authority_epoch: fence.authority_epoch.clone(),
                 state_fence: fence.clone(),
                 now: 1,
                 heartbeat_deadline: 100,
@@ -2270,7 +3337,7 @@ mod tests {
                 lease_id: "lease-1".to_owned(),
                 work_item_id: "work-1".to_owned(),
                 session_id: "session-1".to_owned(),
-                authority_epoch: fence.authority_epoch,
+                authority_epoch: fence.authority_epoch.clone(),
                 state_fence: fence.clone(),
                 now: 2,
                 lease_duration: 40,
@@ -2289,7 +3356,7 @@ mod tests {
                 session_id: "session-2".to_owned(),
                 principal_id: "principal-2".to_owned(),
                 route_ref: "route-2".to_owned(),
-                authority_epoch: fence.authority_epoch,
+                authority_epoch: fence.authority_epoch.clone(),
                 state_fence: fence.clone(),
                 now: 1,
                 heartbeat_deadline: 100,
@@ -2319,7 +3386,7 @@ mod tests {
                 lease_id: "lease-2".to_owned(),
                 work_item_id: "work-2".to_owned(),
                 session_id: "session-2".to_owned(),
-                authority_epoch: fence.authority_epoch,
+                authority_epoch: fence.authority_epoch.clone(),
                 state_fence: fence.clone(),
                 now: 2,
                 lease_duration: 40,
@@ -2329,7 +3396,7 @@ mod tests {
     }
 
     fn activation_session_snapshot(fence: &StateFence) -> SessionLifecycleSnapshot {
-        let mut owner = SessionLifecycleOwner::new(fence.authority_epoch, fence.clone())
+        let mut owner = SessionLifecycleOwner::new(fence.authority_epoch.clone(), fence.clone())
             .expect("session owner");
         let session_id = SessionId::new("session-1").expect("session id");
         owner
@@ -2346,7 +3413,7 @@ mod tests {
                 capability_profile_id: "profile-1".to_owned(),
                 parent_session_id: None,
                 policy_snapshot_id: "policy-1".to_owned(),
-                authority_epoch: fence.authority_epoch,
+                authority_epoch: fence.authority_epoch.clone(),
                 state_fence: fence.clone(),
                 now: 1,
                 expires_at: 100,
@@ -2360,7 +3427,7 @@ mod tests {
                     event_id: "session-activate-event".to_owned(),
                     actor_ref: "agent-1".to_owned(),
                     state_fence: fence.clone(),
-                    authority_epoch: fence.authority_epoch,
+                    authority_epoch: fence.authority_epoch.clone(),
                     observed_at: ClockReading::default(),
                     now: 2,
                 },
@@ -2440,9 +3507,9 @@ mod tests {
         let observed = snapshot();
         let mut expected =
             KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
-        expected.authority_epoch = AuthorityEpoch::new(2).expect("epoch");
+        expected.authority_epoch = test_epoch(TEST_LINEAGE_A, 2);
         let provider = Arc::new(fake_kernel(observed));
-        let result = GovernorComposition::new(provider, &expected, QueueLimits::default());
+        let result = GovernorComposition::new(provider, None, &expected, QueueLimits::default());
         assert!(matches!(result, Err(CompositionError::Provider(_))));
     }
 
@@ -2457,8 +3524,9 @@ mod tests {
                 .expect("canonical bytes"),
         );
         let provider = Arc::new(fake);
-        let composition = GovernorComposition::new(provider, &expected, QueueLimits::default())
-            .expect("composition");
+        let composition =
+            GovernorComposition::new(provider, None, &expected, QueueLimits::default())
+                .expect("composition");
         assert_eq!(composition.readiness(), CompositionReadiness::Ready);
         assert_eq!(STARTUP_ORDER[0], ServiceId::Config);
         assert_eq!(STARTUP_ORDER[15], ServiceId::Maintenance);
@@ -2486,6 +3554,7 @@ mod tests {
         let expected = KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
         let first = GovernorComposition::new(
             Arc::new(fake_kernel(observed.clone())),
+            None,
             &expected,
             QueueLimits::default(),
         )
@@ -2495,9 +3564,13 @@ mod tests {
         let mut reversed = service_observations(&observed.state_fence());
         reversed.reverse();
         second_fake.service_observations = Some(reversed);
-        let second =
-            GovernorComposition::new(Arc::new(second_fake), &expected, QueueLimits::default())
-                .expect("second composition");
+        let second = GovernorComposition::new(
+            Arc::new(second_fake),
+            None,
+            &expected,
+            QueueLimits::default(),
+        )
+        .expect("second composition");
 
         assert_ne!(first.service_observations(), second.service_observations());
         assert_eq!(first.recovery(), second.recovery());
@@ -2514,7 +3587,8 @@ mod tests {
         let expected = KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
         let mut fake = fake_kernel(observed);
         fake.service_failure = true;
-        let result = GovernorComposition::new(Arc::new(fake), &expected, QueueLimits::default());
+        let result =
+            GovernorComposition::new(Arc::new(fake), None, &expected, QueueLimits::default());
         assert!(matches!(result, Err(CompositionError::Recovery(_))));
     }
 
@@ -2541,7 +3615,7 @@ mod tests {
         .expect("owner");
 
         let stale_fence = StateFence::new(
-            AuthorityEpoch::genesis(),
+            test_epoch(TEST_LINEAGE_A, 1),
             ResourceGeneration::new(2).expect("resource generation"),
         );
         assert!(owner.read_current_plan(&stale_fence).is_err());
@@ -2559,7 +3633,7 @@ mod tests {
 
         let mut stale_scope = scope;
         stale_scope.state_fence = StateFence::new(
-            AuthorityEpoch::genesis(),
+            test_epoch(TEST_LINEAGE_A, 1),
             ResourceGeneration::new(2).expect("resource generation"),
         );
         assert!(
@@ -2636,7 +3710,7 @@ mod tests {
         let mut fake = activation_fake(&observed);
         fake.payloads.insert(RecoveryOwner::Canonical, payload);
         let composition =
-            GovernorComposition::new(Arc::new(fake), &expected, QueueLimits::default())
+            GovernorComposition::new(Arc::new(fake), None, &expected, QueueLimits::default())
                 .expect("genesis null is recoverable");
         assert!(matches!(
             composition.read_unique_agent_activation(20),
@@ -2656,7 +3730,8 @@ mod tests {
         })
         .expect("old canonical payload");
         fake.payloads.insert(RecoveryOwner::Canonical, payload);
-        let result = GovernorComposition::new(Arc::new(fake), &expected, QueueLimits::default());
+        let result =
+            GovernorComposition::new(Arc::new(fake), None, &expected, QueueLimits::default());
         assert!(matches!(result, Err(CompositionError::Recovery(_))));
 
         let mut legacy = fake_kernel(observed.clone());
@@ -2672,7 +3747,8 @@ mod tests {
             RecoveryOwner::Canonical,
             serde_json::to_vec(&legacy_unscoped).expect("legacy canonical payload"),
         );
-        let result = GovernorComposition::new(Arc::new(legacy), &expected, QueueLimits::default());
+        let result =
+            GovernorComposition::new(Arc::new(legacy), None, &expected, QueueLimits::default());
         assert!(matches!(result, Err(CompositionError::Recovery(_))));
     }
 
@@ -2684,7 +3760,7 @@ mod tests {
         fake.genesis_all_absent = true;
         let seeded = Arc::clone(&fake.genesis_seeded);
         let composition =
-            GovernorComposition::new(Arc::new(fake), &expected, QueueLimits::default())
+            GovernorComposition::new(Arc::new(fake), None, &expected, QueueLimits::default())
                 .expect("genesis composition");
         assert!(seeded.load(Ordering::Acquire));
         assert_eq!(composition.readiness(), CompositionReadiness::Ready);
@@ -2698,7 +3774,8 @@ mod tests {
     fn restart_rehydrates_nonempty_task_and_session_snapshots() {
         let observed = snapshot();
         let fence = observed.state_fence();
-        let mut task = TaskLifecycleOwner::new(fence.authority_epoch, fence.clone()).expect("task");
+        let mut task =
+            TaskLifecycleOwner::new(fence.authority_epoch.clone(), fence.clone()).expect("task");
         let task_snapshot = {
             task.propose(TaskProposal {
                 task_id: TaskId::new("task-1").expect("task id"),
@@ -2709,15 +3786,15 @@ mod tests {
                     event_id: "task-event-1".to_owned(),
                     actor_ref: "actor-1".to_owned(),
                     state_fence: fence.clone(),
-                    authority_epoch: fence.authority_epoch,
+                    authority_epoch: fence.authority_epoch.clone(),
                     observed_at: ClockReading::default(),
                 },
             })
             .expect("task proposal");
             task.snapshot()
         };
-        let mut session =
-            SessionLifecycleOwner::new(fence.authority_epoch, fence.clone()).expect("session");
+        let mut session = SessionLifecycleOwner::new(fence.authority_epoch.clone(), fence.clone())
+            .expect("session");
         let session_snapshot = {
             session
                 .register(RegisterSession {
@@ -2733,7 +3810,7 @@ mod tests {
                     capability_profile_id: "profile-1".to_owned(),
                     parent_session_id: None,
                     policy_snapshot_id: "policy-1".to_owned(),
-                    authority_epoch: fence.authority_epoch,
+                    authority_epoch: fence.authority_epoch.clone(),
                     state_fence: fence.clone(),
                     now: 1,
                     expires_at: 10,
@@ -2752,7 +3829,7 @@ mod tests {
         );
         let expected = KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
         let composition =
-            GovernorComposition::new(Arc::new(fake), &expected, QueueLimits::default())
+            GovernorComposition::new(Arc::new(fake), None, &expected, QueueLimits::default())
                 .expect("composition");
         assert_eq!(composition.owners().task.snapshot(), task_snapshot);
         assert_eq!(composition.owners().session.snapshot(), session_snapshot);
@@ -2764,6 +3841,7 @@ mod tests {
         let expected = KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
         let composition = GovernorComposition::new(
             Arc::new(activation_fake(&observed)),
+            None,
             &expected,
             QueueLimits::default(),
         )
@@ -2793,7 +3871,7 @@ mod tests {
         let mut missing = activation_fake(&observed);
         missing.payloads.remove(&RecoveryOwner::Session);
         let composition =
-            GovernorComposition::new(Arc::new(missing), &expected, QueueLimits::default())
+            GovernorComposition::new(Arc::new(missing), None, &expected, QueueLimits::default())
                 .expect("composition");
         assert!(composition.read_unique_agent_activation(20).is_err());
 
@@ -2809,7 +3887,7 @@ mod tests {
             canonical_json_bytes(&inactive_snapshot).expect("inactive session bytes"),
         );
         let composition =
-            GovernorComposition::new(Arc::new(inactive), &expected, QueueLimits::default())
+            GovernorComposition::new(Arc::new(inactive), None, &expected, QueueLimits::default())
                 .expect("composition");
         assert!(composition.read_unique_agent_activation(20).is_err());
 
@@ -2825,7 +3903,7 @@ mod tests {
             canonical_json_bytes(&expired_snapshot).expect("expired session bytes"),
         );
         let composition =
-            GovernorComposition::new(Arc::new(expired), &expected, QueueLimits::default())
+            GovernorComposition::new(Arc::new(expired), None, &expected, QueueLimits::default())
                 .expect("composition");
         assert!(composition.read_unique_agent_activation(20).is_err());
     }
@@ -2836,6 +3914,7 @@ mod tests {
         let expected = KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
         let valid = GovernorComposition::new(
             Arc::new(activation_fake(&observed)),
+            None,
             &expected,
             QueueLimits::default(),
         )
@@ -2857,8 +3936,13 @@ mod tests {
             canonical_json_bytes(&coordination).expect("coordination bytes"),
         );
         assert!(
-            GovernorComposition::new(Arc::new(malformed_owner), &expected, QueueLimits::default())
-                .is_err(),
+            GovernorComposition::new(
+                Arc::new(malformed_owner),
+                None,
+                &expected,
+                QueueLimits::default()
+            )
+            .is_err(),
             "recovery accepted an active work item with a missing session"
         );
 
@@ -2879,7 +3963,7 @@ mod tests {
                 canonical_json_bytes(&coordination).expect("coordination bytes"),
             );
             assert!(
-                GovernorComposition::new(Arc::new(fake), &expected, QueueLimits::default())
+                GovernorComposition::new(Arc::new(fake), None, &expected, QueueLimits::default())
                     .is_err(),
                 "recovery accepted {name}"
             );
@@ -2903,12 +3987,12 @@ mod tests {
             canonical_json_bytes(&scoped_snapshot).expect("scoped session bytes"),
         );
         let composition =
-            GovernorComposition::new(Arc::new(scoped), &expected, QueueLimits::default())
+            GovernorComposition::new(Arc::new(scoped), None, &expected, QueueLimits::default())
                 .expect("composition");
         assert!(composition.read_unique_agent_activation(20).is_err());
 
         let stale_fence = StateFence::new(
-            AuthorityEpoch::genesis(),
+            test_epoch(TEST_LINEAGE_A, 1),
             ResourceGeneration::new(2).expect("generation"),
         );
         let mut stale_scope = activation_scope_snapshot(&stale_fence);
@@ -2919,7 +4003,8 @@ mod tests {
             canonical_json_bytes(&stale_scope).expect("stale scope bytes"),
         );
         assert!(
-            GovernorComposition::new(Arc::new(stale), &expected, QueueLimits::default(),).is_err()
+            GovernorComposition::new(Arc::new(stale), None, &expected, QueueLimits::default(),)
+                .is_err()
         );
 
         let mut stale_task = activation_task_snapshot(&observed.state_fence());
@@ -2928,7 +4013,7 @@ mod tests {
             .get_mut(&TaskId::new("task-1").expect("task id"))
             .expect("task")
             .state_fence = StateFence::new(
-            AuthorityEpoch::genesis(),
+            test_epoch(TEST_LINEAGE_A, 1),
             ResourceGeneration::new(2).expect("generation"),
         );
         let mut stale_task_fake = activation_fake(&observed);
@@ -2937,8 +4022,13 @@ mod tests {
             canonical_json_bytes(&stale_task).expect("stale task bytes"),
         );
         assert!(
-            GovernorComposition::new(Arc::new(stale_task_fake), &expected, QueueLimits::default(),)
-                .is_err()
+            GovernorComposition::new(
+                Arc::new(stale_task_fake),
+                None,
+                &expected,
+                QueueLimits::default(),
+            )
+            .is_err()
         );
 
         let mut stale_session = activation_session_snapshot(&observed.state_fence());
@@ -2947,7 +4037,7 @@ mod tests {
             .get_mut(&SessionId::new("session-1").expect("session id"))
             .expect("session")
             .state_fence = StateFence::new(
-            AuthorityEpoch::genesis(),
+            test_epoch(TEST_LINEAGE_A, 1),
             ResourceGeneration::new(2).expect("generation"),
         );
         let mut stale_session_fake = activation_fake(&observed);
@@ -2958,6 +4048,7 @@ mod tests {
         assert!(
             GovernorComposition::new(
                 Arc::new(stale_session_fake),
+                None,
                 &expected,
                 QueueLimits::default(),
             )
@@ -2982,7 +4073,7 @@ mod tests {
             canonical_json_bytes(&terminal_snapshot).expect("terminal task bytes"),
         );
         let composition =
-            GovernorComposition::new(Arc::new(terminal), &expected, QueueLimits::default())
+            GovernorComposition::new(Arc::new(terminal), None, &expected, QueueLimits::default())
                 .expect("composition");
         assert!(composition.read_unique_agent_activation(20).is_err());
 
@@ -3003,7 +4094,7 @@ mod tests {
             canonical_json_bytes(&mismatched_plan).expect("mismatched plan bytes"),
         );
         let composition =
-            GovernorComposition::new(Arc::new(mismatch), &expected, QueueLimits::default())
+            GovernorComposition::new(Arc::new(mismatch), None, &expected, QueueLimits::default())
                 .expect("composition");
         assert!(composition.read_unique_agent_activation(20).is_err());
     }
@@ -3021,7 +4112,7 @@ mod tests {
             .expect("ambiguous coordination bytes"),
         );
         let composition =
-            GovernorComposition::new(Arc::new(fake), &expected, QueueLimits::default())
+            GovernorComposition::new(Arc::new(fake), None, &expected, QueueLimits::default())
                 .expect("composition");
         assert!(composition.read_unique_agent_activation(20).is_err());
     }
@@ -3038,12 +4129,14 @@ mod tests {
         );
         payload.push(b'x');
         fake.payloads.insert(RecoveryOwner::Task, payload);
-        let result = GovernorComposition::new(Arc::new(fake), &expected, QueueLimits::default());
+        let result =
+            GovernorComposition::new(Arc::new(fake), None, &expected, QueueLimits::default());
         assert!(matches!(result, Err(CompositionError::Recovery(_))));
 
         let mut partial = fake_kernel(observed.clone());
         partial.missing = Some(RecoveryOwner::Task);
-        let result = GovernorComposition::new(Arc::new(partial), &expected, QueueLimits::default());
+        let result =
+            GovernorComposition::new(Arc::new(partial), None, &expected, QueueLimits::default());
         assert!(matches!(result, Err(CompositionError::Recovery(_))));
     }
 
@@ -3059,7 +4152,7 @@ mod tests {
             let mut fake = fake_kernel(observed.clone());
             fake.payloads.insert(RecoveryOwner::Task, payload.to_vec());
             let result =
-                GovernorComposition::new(Arc::new(fake), &expected, QueueLimits::default());
+                GovernorComposition::new(Arc::new(fake), None, &expected, QueueLimits::default());
             assert!(matches!(
                 result,
                 Err(CompositionError::Recovery(message))
@@ -3072,7 +4165,7 @@ mod tests {
         let authority = AuthorityBinding {
             authority_id: ContractId::new("authority:budget").expect("authority id"),
             authority_owner: "budget-owner".to_owned(),
-            authority_epoch: fence.authority_epoch,
+            authority_epoch: fence.authority_epoch.clone(),
             state_fence: fence.clone(),
             allowed_effect: EffectClass::ExternalEffect,
             proof_ceiling: ProofCeiling::ObservedExternalEffect,
@@ -3175,7 +4268,8 @@ mod tests {
         let payload = canonical_json_bytes(&substituted_revision).expect("budget bytes");
         fake.payloads.insert(RecoveryOwner::Budget, payload);
         assert!(
-            GovernorComposition::new(Arc::new(fake), &expected, QueueLimits::default()).is_err()
+            GovernorComposition::new(Arc::new(fake), None, &expected, QueueLimits::default())
+                .is_err()
         );
 
         let encoded = serde_json::to_value(valid).expect("budget json");
@@ -3193,6 +4287,7 @@ mod tests {
         let expected = KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
         let coherent = GovernorComposition::new(
             Arc::new(activation_fake(&observed)),
+            None,
             &expected,
             QueueLimits::default(),
         )
@@ -3223,9 +4318,13 @@ mod tests {
             ))
             .expect("ambiguous bytes"),
         );
-        let ambiguous =
-            GovernorComposition::new(Arc::new(ambiguous_fake), &expected, QueueLimits::default())
-                .expect("ambiguous composition");
+        let ambiguous = GovernorComposition::new(
+            Arc::new(ambiguous_fake),
+            None,
+            &expected,
+            QueueLimits::default(),
+        )
+        .expect("ambiguous composition");
         let outcome = ambiguous.resolve_activation_outcome(20);
         assert!(!outcome.is_resolved());
         assert_eq!(outcome.kind_str(), "SCOPE_AMBIGUOUS");
@@ -3254,5 +4353,864 @@ mod tests {
         // internal defects are not downgraded to user ambiguity.
         assert_eq!(failed.kind_str(), "FAILED_INTERNAL");
         assert!(!failed.is_resolved());
+    }
+
+    fn refresh_task_snapshot(fence: &StateFence, goal: &str) -> TaskLifecycleSnapshot {
+        let mut task =
+            TaskLifecycleOwner::new(fence.authority_epoch.clone(), fence.clone()).expect("task");
+        task.propose(TaskProposal {
+            task_id: TaskId::new("task-1").expect("task id"),
+            project_ref: "project-1".to_owned(),
+            goal: goal.to_owned(),
+            context: TaskCommandContext {
+                request_id: "task-request-1".to_owned(),
+                event_id: "task-event-1".to_owned(),
+                actor_ref: "actor-1".to_owned(),
+                state_fence: fence.clone(),
+                authority_epoch: fence.authority_epoch.clone(),
+                observed_at: ClockReading::default(),
+            },
+        })
+        .expect("task proposal");
+        task.snapshot()
+    }
+
+    fn refresh_heads(
+        fence: &StateFence,
+        task_revision: u64,
+        ordering_sequence: u64,
+    ) -> ScopeRevisionView {
+        ScopeRevisionView {
+            scope_id: ScopeId::new("governor").expect("scope"),
+            revision_heads: vec![RevisionHead {
+                key: RevisionKey::new("task:task-1").expect("revision key"),
+                revision: task_revision,
+                state_fence: fence.clone(),
+            }],
+            ordering_heads: vec![OrderingHead {
+                scope: OrderingScopeId::new("scope:governor").expect("ordering scope"),
+                sequence: ordering_sequence,
+                state_fence: fence.clone(),
+            }],
+            state_fence: fence.clone(),
+        }
+    }
+
+    #[test]
+    fn refresh_publishes_committed_owner_change_across_restart() {
+        let observed = snapshot();
+        let fence = observed.state_fence();
+        let task_id = TaskId::new("task-1").expect("task id");
+        let mut fake = fake_kernel(observed.clone());
+        fake.payloads.insert(
+            RecoveryOwner::Task,
+            canonical_json_bytes(&refresh_task_snapshot(&fence, "goal before refresh"))
+                .expect("task bytes"),
+        );
+        let expected = KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
+        let kernel = Arc::new(fake);
+        let mut composition =
+            GovernorComposition::new(kernel.clone(), None, &expected, QueueLimits::default())
+                .expect("composition");
+        assert_eq!(
+            composition.owners().task.task(&task_id).expect("task").goal,
+            "goal before refresh"
+        );
+        // The Kernel commits a new task revision plus a new stable canonical
+        // head set; both reads of one refresh observe the same heads.
+        kernel.live_reads.lock().expect("live read lock").insert(
+            RecoveryOwner::Task,
+            Some(
+                canonical_json_bytes(&refresh_task_snapshot(&fence, "goal after refresh"))
+                    .expect("task bytes"),
+            ),
+        );
+        let moved_heads = refresh_heads(&fence, 2, 2);
+        kernel
+            .staged_scopes
+            .lock()
+            .expect("staged scope lock")
+            .push(moved_heads.clone());
+        composition
+            .refresh_from_kernel()
+            .expect("refresh publishes the committed change");
+        assert_eq!(
+            composition.owners().task.task(&task_id).expect("task").goal,
+            "goal after refresh"
+        );
+        assert_eq!(composition.recovery().canonical_scope, moved_heads);
+        // A restart rehydrates the same committed state, proving the refreshed
+        // projection was Kernel-owned rather than locally fabricated.
+        let restarted =
+            GovernorComposition::new(kernel.clone(), None, &expected, QueueLimits::default())
+                .expect("restart");
+        assert_eq!(
+            restarted.owners().task.task(&task_id).expect("task").goal,
+            "goal after refresh"
+        );
+        assert_eq!(restarted.recovery().canonical_scope, moved_heads);
+    }
+
+    #[test]
+    fn refresh_rejects_changed_heads_and_partial_recovery() {
+        let observed = snapshot();
+        let fence = observed.state_fence();
+        let task_id = TaskId::new("task-1").expect("task id");
+        let receipt = WriteReceipt {
+            operation_id: OperationId::new("op-refresh-1").expect("operation id"),
+            idempotency_key: "refresh-retry-1".to_owned(),
+            canonical_request_hash: "d".repeat(64),
+            transition_class: TransitionClass::TaskControl,
+            status: WriteReceiptStatus::Committed,
+            commit_id: Some(CommitId::new("commit-refresh-1").expect("commit id")),
+            state_fence: fence.clone(),
+            ordering_sequences: Vec::new(),
+            revision_before_after: Vec::new(),
+            applied_command_ids: vec!["cmd-1".to_owned()],
+            emitted_event_ids: Vec::new(),
+            projection_refs: Vec::new(),
+            outbox_refs: Vec::new(),
+            operation_manifest_digest: OperationManifestDigest::new("manifest")
+                .expect("manifest digest"),
+            error_code: None,
+            resubmission: Resubmission::None,
+            committed_at: Some("commit-sequence-0000000000000001".to_owned()),
+            envelope: None,
+        };
+        receipt.validate().expect("seeded receipt is valid");
+        let mut fake = fake_kernel(observed.clone());
+        fake.payloads.insert(
+            RecoveryOwner::Task,
+            canonical_json_bytes(&refresh_task_snapshot(&fence, "stable goal"))
+                .expect("task bytes"),
+        );
+        fake.receipts.push(receipt.clone());
+        let expected = KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
+        let kernel = Arc::new(fake);
+        let mut composition =
+            GovernorComposition::new(kernel.clone(), None, &expected, QueueLimits::default())
+                .expect("composition");
+        assert_eq!(composition.recovery().receipts, vec![receipt.clone()]);
+        let retained = composition.recovery().clone();
+
+        // Heads move between the recovery reads and the post-read: publication
+        // is blocked and the previous projection is kept.
+        kernel
+            .staged_scopes
+            .lock()
+            .expect("staged scope lock")
+            .extend([refresh_heads(&fence, 2, 2), refresh_heads(&fence, 3, 2)]);
+        let churned = composition.refresh_from_kernel();
+        assert!(
+            matches!(
+                churned,
+                Err(CompositionError::Recovery(ref message)) if message.contains("moved mid-read")
+            ),
+            "refresh accepted heads that moved mid-read: {churned:?}"
+        );
+        assert_eq!(composition.readiness(), CompositionReadiness::Ready);
+        assert_eq!(*composition.recovery(), retained);
+        assert_eq!(composition.recovery().receipts, vec![receipt.clone()]);
+        assert_eq!(
+            composition.owners().task.task(&task_id).expect("task").goal,
+            "stable goal"
+        );
+
+        // One owner read goes missing: partial recovery fails closed without
+        // manufacturing a default, preserving projection and receipt.
+        kernel
+            .live_reads
+            .lock()
+            .expect("live read lock")
+            .insert(RecoveryOwner::Task, None);
+        let partial = composition.refresh_from_kernel();
+        assert!(
+            matches!(
+                partial,
+                Err(CompositionError::Recovery(ref message)) if message.contains("partial")
+            ),
+            "refresh accepted partial recovery: {partial:?}"
+        );
+        assert_eq!(composition.readiness(), CompositionReadiness::Ready);
+        assert_eq!(*composition.recovery(), retained);
+        assert_eq!(composition.recovery().receipts, vec![receipt]);
+        assert_eq!(
+            composition.owners().task.task(&task_id).expect("task").goal,
+            "stable goal"
+        );
+    }
+
+    struct NoopWaker;
+
+    impl std::task::Wake for NoopWaker {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    /// Drives an immediately-ready future without an external executor. The
+    /// fake gateway never pends, so this terminates; it exists only because
+    /// this crate takes no executor dependency.
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        use std::task::{Context, Poll};
+        let waker = std::task::Waker::from(Arc::new(NoopWaker));
+        let mut context = Context::from_waker(&waker);
+        let mut future = Box::pin(future);
+        loop {
+            match future.as_mut().poll(&mut context) {
+                Poll::Ready(output) => return output,
+                Poll::Pending => std::thread::yield_now(),
+            }
+        }
+    }
+
+    /// Admitted ingress metadata. The source is an external principal, never
+    /// the daemon transport peer, and the session is the initiating session.
+    fn commit_metadata(fence: &StateFence) -> RequestMetadata {
+        RequestMetadata {
+            request_id: RequestId::new("req-t1-2-1").expect("request id"),
+            session_id: Some(SessionId::new("session-t1-2").expect("session id")),
+            task_id: None,
+            product_id: ProductId::new("test-product").expect("product id"),
+            source_id: SourceId::new("agent-bridge").expect("source id"),
+            state_fence: fence.clone(),
+            clock: ClockReading::default(),
+        }
+    }
+
+    fn commit_identity(fence: &StateFence) -> RequestIdentity {
+        let metadata = commit_metadata(fence);
+        RequestIdentity {
+            request: RequestBinding {
+                metadata,
+                state_fence: fence.clone(),
+            },
+            idempotency_key: "idem-t1-2-1".to_owned(),
+            deadline_unix_ms: 1_800_000_000_000,
+            cancellation_id: "cancel-t1-2-1".to_owned(),
+        }
+    }
+
+    fn commit_envelope(
+        fence: &StateFence,
+        metadata: RequestMetadata,
+        idempotency_key: &str,
+        operation_id: &str,
+    ) -> CanonicalWriteEnvelope {
+        CanonicalWriteEnvelope {
+            operation_id: OperationId::new(operation_id).expect("operation id"),
+            request: metadata,
+            idempotency_key: idempotency_key.to_owned(),
+            scope_id: ScopeId::new("governor").expect("scope"),
+            task_id: None,
+            transition_class: TransitionClass::TaskControl,
+            requested_effect_ceiling: EffectClass::ReversibleMutation,
+            admission_contract_set_digest: "a".repeat(64),
+            operation_manifest_digest: OperationManifestDigest::new("manifest")
+                .expect("manifest digest"),
+            semantic_commands: vec![NamedMutationRequest {
+                operation: NamedMutationOperation::UpdateTaskState,
+                parameters: BTreeMap::new(),
+            }],
+            event_projection_relation_intents: EventProjectionRelationIntents {
+                event_ids: Vec::new(),
+                projection_kinds: Vec::new(),
+                relation_kinds: Vec::new(),
+            },
+            security: SecurityContext::default(),
+            required_proof_and_approval_refs: Vec::new(),
+            expected_revision_heads: Vec::new(),
+            expected_ordering_heads: vec![OrderingHeadExpectation {
+                scope: OrderingScopeId::new("scope:governor").expect("ordering scope"),
+                expected_sequence: 1,
+                state_fence: fence.clone(),
+            }],
+        }
+    }
+
+    fn committed_composition() -> (Arc<FakeKernel>, GovernorComposition<FakeKernel>) {
+        let observed = snapshot();
+        let expected = KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
+        let kernel = Arc::new(fake_kernel(observed));
+        let composition =
+            GovernorComposition::new(kernel.clone(), None, &expected, QueueLimits::default())
+                .expect("composition");
+        (kernel, composition)
+    }
+
+    #[test]
+    fn admitted_identity_reaches_gateway_with_exact_terms() {
+        let (kernel, composition) = committed_composition();
+        let fence = composition.kernel_snapshot().state_fence();
+        let identity = commit_identity(&fence);
+        let envelope = commit_envelope(
+            &fence,
+            identity.request.metadata.clone(),
+            &identity.idempotency_key,
+            "op-t1-2-positive",
+        );
+        let receipt = block_on(composition.commit_canonical(&identity, envelope.clone()))
+            .expect("admitted commit");
+        // The gateway observed the exact admitted terms: initiating source
+        // and session preserved, never rewritten to a transport peer.
+        let stored = kernel
+            .committed
+            .lock()
+            .expect("committed lock")
+            .get(&receipt.operation_id)
+            .expect("stored operation")
+            .clone();
+        assert_eq!(stored.0, identity);
+        assert_eq!(stored.0.request.metadata.source_id.as_str(), "agent-bridge");
+        assert_eq!(
+            stored
+                .0
+                .request
+                .metadata
+                .session_id
+                .as_ref()
+                .expect("session")
+                .as_str(),
+            "session-t1-2"
+        );
+        assert_eq!(stored.0.deadline_unix_ms, 1_800_000_000_000);
+        assert_eq!(stored.0.cancellation_id, "cancel-t1-2-1");
+        // The exact validated receipt binds the same operation identity.
+        assert_eq!(receipt.operation_id.as_str(), "op-t1-2-positive");
+        assert_eq!(receipt.idempotency_key, identity.idempotency_key);
+        assert_eq!(receipt.status, WriteReceiptStatus::Committed);
+        let transition = envelope.prepare().expect("immutable transition");
+        assert_eq!(
+            receipt.canonical_request_hash,
+            transition.identity.canonical_request_hash
+        );
+        validate_store_receipt_envelope(&identity.request.metadata, &transition, &receipt)
+            .expect("shared receipt envelope");
+        assert_eq!(*kernel.apply_calls.lock().expect("apply call lock"), 1);
+    }
+
+    #[test]
+    fn substituted_binding_is_rejected_before_the_gateway() {
+        let (kernel, composition) = committed_composition();
+        let fence = composition.kernel_snapshot().state_fence();
+        let identity = commit_identity(&fence);
+        // A substituted request binding under the same fence is rejected even
+        // though the envelope is internally well-formed.
+        let mut substituted = identity.request.metadata.clone();
+        substituted.source_id = SourceId::new("intruder").expect("source id");
+        let substituted_envelope = commit_envelope(
+            &fence,
+            substituted,
+            &identity.idempotency_key,
+            "op-t1-2-substituted",
+        );
+        let rejected = block_on(composition.commit_canonical(&identity, substituted_envelope));
+        assert!(
+            matches!(rejected, Err(CompositionError::Provider(_))),
+            "substituted binding was not rejected: {rejected:?}"
+        );
+        // A substituted idempotency key is rejected the same way.
+        let idempotency_envelope = commit_envelope(
+            &fence,
+            identity.request.metadata.clone(),
+            "idem-substituted",
+            "op-t1-2-substituted-idem",
+        );
+        let rejected = block_on(composition.commit_canonical(&identity, idempotency_envelope));
+        assert!(
+            matches!(rejected, Err(CompositionError::Provider(_))),
+            "substituted idempotency was not rejected: {rejected:?}"
+        );
+        // Neither rejection reached the gateway: no execution, no receipt.
+        assert_eq!(*kernel.apply_calls.lock().expect("apply call lock"), 0);
+        assert!(kernel.committed.lock().expect("committed lock").is_empty());
+    }
+
+    #[test]
+    fn lost_acknowledgement_reconciles_to_the_same_operation_receipt() {
+        let (kernel, composition) = committed_composition();
+        let fence = composition.kernel_snapshot().state_fence();
+        let identity = commit_identity(&fence);
+        let envelope = commit_envelope(
+            &fence,
+            identity.request.metadata.clone(),
+            &identity.idempotency_key,
+            "op-t1-2-reconcile",
+        );
+        let receipt = block_on(composition.commit_canonical(&identity, envelope.clone()))
+            .expect("admitted commit");
+        // A lost acknowledgement resolves through exact receipt
+        // reconciliation, not through a second execution.
+        let reconciled = block_on(kernel.receipt(receipt.operation_id.clone()))
+            .expect("receipt route")
+            .expect("stored receipt");
+        assert_eq!(reconciled, receipt);
+        // A retry carrying a fresh deadline/cancellation for the same
+        // operation replays the stored receipt instead of re-executing.
+        let mut retry = identity.clone();
+        retry.deadline_unix_ms = 1_900_000_000_000;
+        retry.cancellation_id = "cancel-t1-2-retry".to_owned();
+        let replayed =
+            block_on(composition.commit_canonical(&retry, envelope)).expect("idempotent replay");
+        assert_eq!(replayed, receipt);
+        assert_eq!(
+            *kernel.apply_calls.lock().expect("apply call lock"),
+            1,
+            "retry with a new deadline must not re-execute"
+        );
+    }
+
+    #[test]
+    fn operator_borrow_admits_through_the_retained_kernel_port() {
+        let (kernel, composition) = committed_composition();
+        let fence = composition.kernel_snapshot().state_fence();
+        let identity = commit_identity(&fence);
+        let operation_id = OperationId::new("op-operator-borrow").expect("operation id");
+        let envelope = crate::operator_reconciliation::operator_command_envelope(
+            &identity,
+            &operation_id,
+            "session-t1-2",
+            &"a".repeat(64),
+            &"b".repeat(64),
+            1,
+        )
+        .expect("operator envelope");
+        // The composition borrow admits through the retained Kernel port and
+        // stores the operation in Kernel ORS for later receipt reconciliation.
+        let receipt = block_on(
+            composition
+                .operator_reconciliation()
+                .admit_operator_command(&identity, &operation_id, envelope),
+        )
+        .expect("operator admission");
+        assert_eq!(receipt.operation_id, operation_id);
+        assert_eq!(receipt.idempotency_key, identity.idempotency_key);
+        assert_eq!(receipt.transition_class, TransitionClass::CaptureCandidate);
+        assert_eq!(receipt.status, WriteReceiptStatus::Committed);
+        assert_eq!(receipt.state_fence, fence);
+        assert_eq!(*kernel.apply_calls.lock().expect("apply call lock"), 1);
+        let stored = block_on(kernel.receipt(operation_id.clone()))
+            .expect("receipt route")
+            .expect("stored receipt");
+        assert_eq!(stored, receipt);
+    }
+
+    #[test]
+    fn commit_then_refresh_publishes_the_kernel_change() {
+        let observed = snapshot();
+        let fence = observed.state_fence();
+        let mut fake = fake_kernel(observed.clone());
+        fake.payloads.insert(
+            RecoveryOwner::Task,
+            canonical_json_bytes(&refresh_task_snapshot(&fence, "goal before commit"))
+                .expect("task bytes"),
+        );
+        let expected = KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
+        let kernel = Arc::new(fake);
+        let mut composition =
+            GovernorComposition::new(kernel.clone(), None, &expected, QueueLimits::default())
+                .expect("composition");
+        let identity = commit_identity(&fence);
+        let envelope = commit_envelope(
+            &fence,
+            identity.request.metadata.clone(),
+            &identity.idempotency_key,
+            "op-t1-2-refresh",
+        );
+        let receipt =
+            block_on(composition.commit_canonical(&identity, envelope)).expect("admitted commit");
+        assert_eq!(receipt.status, WriteReceiptStatus::Committed);
+        // The Kernel advances task state plus a new stable head set; one
+        // refresh publishes both without a daemon restart.
+        kernel.live_reads.lock().expect("live read lock").insert(
+            RecoveryOwner::Task,
+            Some(
+                canonical_json_bytes(&refresh_task_snapshot(&fence, "goal after commit"))
+                    .expect("task bytes"),
+            ),
+        );
+        let moved_heads = refresh_heads(&fence, 2, 2);
+        kernel
+            .staged_scopes
+            .lock()
+            .expect("staged scope lock")
+            .push(moved_heads.clone());
+        composition
+            .refresh_from_kernel()
+            .expect("refresh publishes the committed change");
+        let task_id = TaskId::new("task-1").expect("task id");
+        assert_eq!(
+            composition.owners().task.task(&task_id).expect("task").goal,
+            "goal after commit"
+        );
+        assert_eq!(composition.recovery().canonical_scope, moved_heads);
+    }
+
+    /// Scripted P-07 port for the authority gating proof below. Each behavior
+    /// is an explicit gate assertion, never a production success path: this
+    /// double is `cfg(test)`-only, while end-to-end production activation
+    /// awaits the Kernel P-07 front-door route (T6/#15).
+    struct ScriptedAuthorityPort {
+        behavior: Mutex<ScriptedAuthorityBehavior>,
+    }
+
+    #[derive(Clone)]
+    enum ScriptedAuthorityBehavior {
+        Unavailable,
+        UnknownAck,
+        NonActiveReceipt,
+        Active { activation_id: String },
+    }
+
+    impl P07AuthorityPort for ScriptedAuthorityPort {
+        fn activate_grant(
+            &self,
+            request: &GrantActivationRequest,
+        ) -> Result<AuthorityActivationReceipt, P07PortError> {
+            let behavior = self.behavior.lock().expect("script lock").clone();
+            let snapshot_id = request.snapshot_id.as_str().to_owned();
+            let authority_epoch = request.binding.state_fence.authority_epoch.clone();
+            match behavior {
+                ScriptedAuthorityBehavior::Unavailable => Err(P07PortError::Unavailable),
+                ScriptedAuthorityBehavior::UnknownAck => Err(P07PortError::UnknownOutcome {
+                    snapshot_id: request.snapshot_id.clone(),
+                }),
+                ScriptedAuthorityBehavior::NonActiveReceipt => Ok(AuthorityActivationReceipt {
+                    activation_id: "act-scripted-non-active".to_owned(),
+                    snapshot_id,
+                    authority_epoch,
+                    state: AuthorityState::PendingKernelActivation,
+                }),
+                ScriptedAuthorityBehavior::Active { activation_id } => {
+                    Ok(AuthorityActivationReceipt {
+                        activation_id,
+                        snapshot_id,
+                        authority_epoch,
+                        state: AuthorityState::Active,
+                    })
+                }
+            }
+        }
+
+        fn revoke_grant(
+            &self,
+            _request: &GrantRevocationRequest,
+        ) -> Result<AuthorityRevocationReceipt, P07PortError> {
+            Err(P07PortError::Unavailable)
+        }
+
+        fn activate_introduction(
+            &self,
+            _request: &IntroductionActivationRequest,
+        ) -> Result<AuthorityActivationReceipt, P07PortError> {
+            Err(P07PortError::Unavailable)
+        }
+
+        fn revoke_introduction(
+            &self,
+            _request: &IntroductionRevocationRequest,
+        ) -> Result<AuthorityRevocationReceipt, P07PortError> {
+            Err(P07PortError::Unavailable)
+        }
+    }
+
+    fn pending_grant_fixture(
+        grant_id: &str,
+        fence: &StateFence,
+    ) -> eliot_authority::CapabilityGrant {
+        eliot_authority::CapabilityGrant {
+            grant_id: eliot_authority::GrantId::new(grant_id).expect("grant id"),
+            parent_grant_id: None,
+            authority_root_ref: "authority:test-root".to_owned(),
+            issuer: eliot_authority::PrincipalRef::new("principal:issuer").expect("issuer"),
+            holder: eliot_authority::PrincipalRef::new("principal:holder").expect("holder"),
+            authority: eliot_authority::AuthoritySet::new(
+                ["op:test".to_owned()],
+                ["res:test".to_owned()],
+                EffectClass::ReversibleMutation,
+            )
+            .expect("authority set"),
+            inherited_source_ceiling: None,
+            binding: AuthorityBinding {
+                authority_id: ContractId::new("authority:test").expect("authority id"),
+                authority_owner: "test-owner".to_owned(),
+                authority_epoch: fence.authority_epoch.clone(),
+                state_fence: fence.clone(),
+                allowed_effect: EffectClass::ExternalEffect,
+                proof_ceiling: ProofCeiling::ObservedExternalEffect,
+            },
+            issued_at: eliot_authority::LogicalTime::new(1),
+            expires_at: eliot_authority::LogicalTime::new(2),
+            max_uses: 1,
+            status: eliot_authority::GrantStatus::PendingActivation,
+        }
+    }
+
+    fn authority_payload_with_pending_grants(fence: &StateFence) -> Vec<u8> {
+        let graph = eliot_authority::GrantGraph::from_grants(
+            [
+                pending_grant_fixture("grant-a", fence),
+                pending_grant_fixture("grant-b", fence),
+            ],
+            1,
+        )
+        .expect("pending grant graph");
+        let effect_authorizer = eliot_authority::EffectAuthorizer::default()
+            .snapshot()
+            .expect("effect snapshot");
+        let snapshot = AuthorityOwnerSnapshot::new(
+            fence.clone(),
+            graph.recovery_snapshot().expect("grant snapshot"),
+            effect_authorizer,
+        )
+        .expect("authority snapshot");
+        canonical_json_bytes(&serde_json::to_value(snapshot).expect("authority JSON"))
+            .expect("authority bytes")
+    }
+
+    fn grant_activation_fixture(
+        grant_id: &str,
+        fence: &StateFence,
+    ) -> eliot_authority::GrantActivationRequest {
+        eliot_authority::GrantActivationRequest {
+            grant_id: eliot_authority::GrantId::new(grant_id).expect("grant id"),
+            snapshot_id: eliot_authority::SnapshotId::new("snap-1").expect("snapshot id"),
+            binding: AuthorityBinding {
+                authority_id: ContractId::new("authority:test").expect("authority id"),
+                authority_owner: "test-owner".to_owned(),
+                authority_epoch: fence.authority_epoch.clone(),
+                state_fence: fence.clone(),
+                allowed_effect: EffectClass::ExternalEffect,
+                proof_ceiling: ProofCeiling::ObservedExternalEffect,
+            },
+        }
+    }
+
+    #[test]
+    fn pending_grant_becomes_effective_only_after_real_activation() {
+        let observed = snapshot();
+        let fence = observed.state_fence();
+        let expected = KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
+        let mut fake = fake_kernel(observed.clone());
+        fake.payloads.insert(
+            RecoveryOwner::Authority,
+            authority_payload_with_pending_grants(&fence),
+        );
+        let script = Arc::new(ScriptedAuthorityPort {
+            behavior: Mutex::new(ScriptedAuthorityBehavior::Unavailable),
+        });
+        let mut composition = GovernorComposition::new(
+            Arc::new(fake),
+            Some(script.clone() as Arc<dyn P07AuthorityPort>),
+            &expected,
+            QueueLimits::default(),
+        )
+        .expect("composition");
+        assert!(composition.authority_activation_available());
+        let grant_a = eliot_authority::GrantId::new("grant-a").expect("grant id");
+        let grant_b = eliot_authority::GrantId::new("grant-b").expect("grant id");
+
+        // Unavailable: the grant stays pending and is never read as effective.
+        let request_a = grant_activation_fixture("grant-a", &fence);
+        assert_eq!(
+            composition.authority_grant_status(&grant_a),
+            Some(eliot_authority::GrantStatus::PendingActivation)
+        );
+        let error = composition
+            .activate_grant(&request_a)
+            .expect_err("unavailable activation must fail closed");
+        assert!(matches!(
+            error,
+            CompositionError::Authority(P07PortError::Unavailable)
+        ));
+        assert_eq!(
+            composition.authority_grant_status(&grant_a),
+            Some(eliot_authority::GrantStatus::PendingActivation)
+        );
+
+        // Lost acknowledgement: the exact request is retained under its
+        // snapshot and the grant stays pending, never active.
+        *script.behavior.lock().expect("script lock") = ScriptedAuthorityBehavior::UnknownAck;
+        let error = composition
+            .activate_grant(&request_a)
+            .expect_err("unknown outcome must fail closed");
+        match error {
+            CompositionError::Authority(P07PortError::UnknownOutcome { snapshot_id }) => {
+                assert_eq!(snapshot_id.as_str(), "snap-1");
+            }
+            other => panic!("expected an unknown outcome, got {other:?}"),
+        }
+        assert_eq!(
+            composition.authority_grant_status(&grant_a),
+            Some(eliot_authority::GrantStatus::PendingActivation)
+        );
+
+        // A receipt that fails validate() (non-Active) never flips the grant.
+        *script.behavior.lock().expect("script lock") = ScriptedAuthorityBehavior::NonActiveReceipt;
+        let request_b = grant_activation_fixture("grant-b", &fence);
+        let error = composition
+            .activate_grant(&request_b)
+            .expect_err("non-active receipt must fail closed");
+        assert!(matches!(
+            error,
+            CompositionError::Authority(P07PortError::InvalidBinding)
+        ));
+        assert_eq!(
+            composition.authority_grant_status(&grant_b),
+            Some(eliot_authority::GrantStatus::PendingActivation)
+        );
+
+        // A validated Active receipt flips pending -> active exactly once.
+        *script.behavior.lock().expect("script lock") = ScriptedAuthorityBehavior::Active {
+            activation_id: "act-a-1".to_owned(),
+        };
+        let receipt = composition
+            .activate_grant(&request_a)
+            .expect("validated active receipt");
+        assert_eq!(receipt.activation_id, "act-a-1");
+        assert_eq!(receipt.snapshot_id, "snap-1");
+        assert_eq!(
+            composition.authority_grant_status(&grant_a),
+            Some(eliot_authority::GrantStatus::Active)
+        );
+
+        // A second activation on the recorded identity fails closed: the
+        // receipt is not issued twice and the status never leaves Active for
+        // a second proof.
+        let error = composition
+            .activate_grant(&request_a)
+            .expect_err("second activation must fail closed");
+        assert!(matches!(
+            error,
+            CompositionError::Authority(P07PortError::InvalidBinding)
+        ));
+        assert_eq!(
+            composition.authority_grant_status(&grant_a),
+            Some(eliot_authority::GrantStatus::Active)
+        );
+
+        // Without a retained port the same presentation is diagnosed
+        // degradation: unavailable, never issuance.
+        let mut degraded = GovernorComposition::new(
+            Arc::new(fake_kernel(observed.clone())),
+            None,
+            &expected,
+            QueueLimits::default(),
+        )
+        .expect("degraded composition");
+        assert!(!degraded.authority_activation_available());
+        let error = degraded
+            .activate_grant(&request_a)
+            .expect_err("missing port must fail closed");
+        assert!(matches!(
+            error,
+            CompositionError::Authority(P07PortError::Unavailable)
+        ));
+    }
+
+    fn r1_publish(
+        composition: &GovernorComposition<FakeKernel>,
+        claim_id: &str,
+        operation_id: &str,
+        invocation: &serde_json::Value,
+    ) -> NativeWorkerExecutableBinding {
+        composition
+            .publish_native_worker_binding_for_invocation(
+                claim_id,
+                "reg-1",
+                "install-1",
+                "task-1",
+                "work-1",
+                "scope:work",
+                1,
+                "lease-1",
+                operation_id,
+                &"c".repeat(64),
+                "principal-1",
+                "session-1",
+                1,
+                "proc-tree-1",
+                1,
+                "process-fence-1",
+                "route-1",
+                "adapter-1",
+                1,
+                &"d".repeat(64),
+                &"e".repeat(64),
+                &"f".repeat(64),
+                "cmd-1",
+                "facet-1",
+                vec!["intro-1".to_owned()],
+                vec!["grant-1".to_owned()],
+                1,
+                eliot_store_api::EffectClass::ReversibleMutation,
+                vec!["cred-1".to_owned()],
+                vec!["res-1".to_owned()],
+                "stream-1",
+                "0123456789abcdef",
+                invocation,
+                100,
+                200,
+                "plan:current",
+                "1",
+                1,
+                &"b".repeat(64),
+                "adm-1",
+            )
+            .expect("R1 publish builds")
+    }
+
+    #[test]
+    fn r1_producer_derives_invocation_digest_from_exact_bytes() {
+        // R1 production producer (Implements #22): the dispatch join carries
+        // the real invocation digest derived from the exact invocation JSON,
+        // never a placeholder. The caller still commits a sibling
+        // `PreparedTransition` via `commit_canonical` correlated by
+        // `operation_id` / `canonical_request_hash` / `state_fence`.
+        let observed = snapshot();
+        let expected =
+            KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
+        let composition = GovernorComposition::new(
+            Arc::new(activation_fake(&observed)),
+            None,
+            &expected,
+            QueueLimits::default(),
+        )
+        .expect("composition");
+        let invocation = serde_json::json!({
+            "claim_id": "claim-r1-1",
+            "operation_id": "op-r1-1",
+            "argv": ["--check"],
+            "fence": {"generation": 1},
+        });
+        let derived = process_invocation_digest_for(&invocation).expect("derivation builds");
+        assert_eq!(derived.len(), 64);
+        let binding = r1_publish(&composition, "claim-r1-1", "op-r1-1", &invocation);
+        assert_eq!(
+            binding.process_invocation_digest, derived,
+            "published binding must carry the derived invocation digest"
+        );
+        binding.validate().expect("published binding validates");
+        // A mutated invocation derives a different digest, so the join gate
+        // observes the change instead of a stable placeholder.
+        let mutated = serde_json::json!({
+            "claim_id": "claim-r1-1",
+            "operation_id": "op-r1-1",
+            "argv": ["--other"],
+            "fence": {"generation": 1},
+        });
+        let mutated_digest =
+            process_invocation_digest_for(&mutated).expect("mutated derivation builds");
+        assert_ne!(
+            derived, mutated_digest,
+            "mutated invocation must derive a different digest"
+        );
+        let mutated_binding = r1_publish(&composition, "claim-r1-1", "op-r1-1", &mutated);
+        assert_eq!(
+            mutated_binding.process_invocation_digest, mutated_digest,
+            "mutated publish must carry the mutated digest"
+        );
+        assert_ne!(
+            binding.binding_digest, mutated_binding.binding_digest,
+            "invocation change must move the binding digest"
+        );
     }
 }

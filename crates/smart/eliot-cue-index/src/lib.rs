@@ -12,4 +12,7 @@
 mod bounds;
 mod build;
 
-pub use build::{build_cue_snapshot, rebuild_cue_snapshot};
+pub use build::{
+    build_cue_snapshot, build_cue_snapshot_closed, rebuild_cue_snapshot,
+    rebuild_cue_snapshot_closed,
+};

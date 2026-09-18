@@ -11,17 +11,23 @@
 use std::path::{Path, PathBuf};
 
 use eliot_installation::{
-    ApprovedGenerationRegistry, CandidateManifest, PendingActivationState,
-    RedbInstallationRegistry, phase_b_scm_selector,
+    ApprovedGenerationRegistry, CandidateManifest, PendingActivationState, phase_b_scm_selector,
 };
 use eliot_platform_windows::{ProtectedRootLease, ServiceBootstrapArguments, windows_paths_equal};
 
 use crate::SpoolError;
+use crate::watchdog_admission::inspect_registry_at;
 
 pub(crate) fn select_runtime_manifest(
     registry: &ApprovedGenerationRegistry,
     bootstrap: &ServiceBootstrapArguments,
 ) -> Result<CandidateManifest, SpoolError> {
+    let _span = tracing::debug_span!("watchdog.select_runtime_manifest").entered();
+    tracing::debug!(
+        event = "watchdog.manifest_selection_attempted",
+        observation = "attempted",
+        "attempting installer-approved manifest selection"
+    );
     let matching_generations = registry
         .generations()
         .iter()
@@ -126,7 +132,9 @@ pub(crate) fn approved_host_artifact_path(
     let (path, _) = manifest
         .runtime_launch
         .host_artifact_binding()
-        .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
+        .map_err(|error| {
+            SpoolError::InvalidLease(format!("approved Host artifact binding failed: {error}"))
+        })?;
     Ok(PathBuf::from(path.as_str()))
 }
 
@@ -138,13 +146,18 @@ pub(crate) fn read_registry_for_bootstrap(
             "Watchdog SCM bootstrap omitted the installer-approved Host state root".to_owned(),
         )
     })?;
-    let registry = RedbInstallationRegistry::inspect_existing_at(
-        ProtectedRootLease::open_existing(host_state_root).map_err(|error| {
-            SpoolError::InvalidLease(format!("Host state root open failed: {error}"))
-        })?,
-    )
-    .map_err(|error| SpoolError::InvalidLease(error.to_string()))?
-    .ok_or_else(|| SpoolError::InvalidLease("installation registry is missing".to_owned()))?;
+    // s37/#1339: the registry read flows through the single
+    // `watchdog_admission` inspection so lock handling has one fix site.
+    // Mapping is unchanged, including the `installation registry open
+    // failed` prefix carried into the approval capsule.
+    let registry =
+        inspect_registry_at(ProtectedRootLease::open_existing(host_state_root).map_err(
+            |error| SpoolError::InvalidLease(format!("Host state root open failed: {error}")),
+        )?)
+        .map_err(|error| {
+            SpoolError::InvalidLease(format!("installation registry open failed: {error}"))
+        })?
+        .ok_or_else(|| SpoolError::InvalidLease("installation registry is missing".to_owned()))?;
     let manifest = select_runtime_manifest(&registry, bootstrap)?;
     Ok((registry, manifest))
 }

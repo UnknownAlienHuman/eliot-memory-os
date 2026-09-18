@@ -1,0 +1,99 @@
+{
+  "request_identity": {
+    "request": {
+      "request": {
+        "metadata": {
+          "request_id": "fresh-request",
+          "session_id": null,
+          "task_id": "job",
+          "product_id": "product",
+          "source_id": "source",
+          "state_fence": {
+            "authority_epoch": {
+              "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+              "sequence": 1
+            },
+            "resource_generation": 1,
+            "task_revision": null,
+            "policy_revision": null,
+            "integration_revision": null
+          },
+          "clock": {
+            "valid_time_ms": null,
+            "known_time_ms": null,
+            "transaction_sequence": null,
+            "monotonic_ns": null
+          }
+        },
+        "state_fence": {
+          "authority_epoch": {
+            "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+            "sequence": 1
+          },
+          "resource_generation": 1,
+          "task_revision": null,
+          "policy_revision": null,
+          "integration_revision": null
+        }
+      },
+      "idempotency_key": "transport-request",
+      "deadline_unix_ms": 100,
+      "cancellation_id": "cancel"
+    },
+    "operation": {
+      "operation_id": "operation-fixture-reconcile",
+      "request_id": "originating-request",
+      "idempotency_key": "stable-fixture-reconcile",
+      "operation_kind": "PUBLISH_OUTCOME",
+      "effect": "CANDIDATE",
+      "state_fence": {
+        "authority_epoch": {
+          "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+          "sequence": 1
+        },
+        "resource_generation": 1,
+        "task_revision": null,
+        "policy_revision": null,
+        "integration_revision": null
+      }
+    },
+    "canonical_request_hash": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "role": "CONTROLLER",
+  "operation": {
+    "operation": "RECONCILE_MUTATION",
+    "mutation": {
+      "job_id": "job",
+      "attempt_id": "attempt",
+      "operation": {
+        "operation_id": "operation-fixture-reconcile",
+        "request_id": "originating-request",
+        "idempotency_key": "stable-fixture-reconcile",
+        "operation_kind": "PUBLISH_OUTCOME",
+        "effect": "CANDIDATE",
+        "state_fence": {
+          "authority_epoch": {
+            "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+            "sequence": 1
+          },
+          "resource_generation": 1,
+          "task_revision": null,
+          "policy_revision": null,
+          "integration_revision": null
+        }
+      },
+      "canonical_request_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "disposition": "COMMITTED",
+      "committed_state": "UNKNOWN_OUTCOME",
+      "receipt_id": "commit-receipt",
+      "evidence": [
+        {
+          "artifact_id": "unknown-evidence",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+          "role": "ARTIFACT",
+          "source_revision": "test"
+        }
+      ]
+    }
+  }
+}

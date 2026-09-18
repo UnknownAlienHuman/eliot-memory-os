@@ -7,9 +7,16 @@ license.workspace = true
 description = "Local Claude Agent SDK sidecar contract and native skeleton (wave1, candidate-only, no authority)"
 
 [dependencies]
+eliot-agent-api.workspace = true
+eliot-process.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+eliot-contracts.workspace = true
+eliot-instrument-api.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true

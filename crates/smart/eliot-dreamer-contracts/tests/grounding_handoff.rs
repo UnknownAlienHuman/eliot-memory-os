@@ -71,7 +71,7 @@ fn v1_shape_cannot_cross_decode_and_payload_kind_is_closed() {
         Err(eliot_dreamer_contracts::ContractViolation::KindPayload(_))
     ));
     let legacy = r#"{"statement":"old","source_handles":["x"]}"#;
-    assert!(serde_json::from_str::<grounding::ModelDraft>(legacy).is_err());
+    assert!(serde_json::from_str::<grounding::StructuredModelDraft>(legacy).is_err());
 }
 
 #[test]

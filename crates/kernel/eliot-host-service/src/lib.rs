@@ -18,8 +18,9 @@ pub mod runtime_control;
 mod service;
 
 pub use service::{
-    BoundedRestartOutcome, HostDependencyPlan, HostFailure, HostService, HostServiceError,
-    HostServiceState, KernelStartReceipt, ServiceStopReceipt,
+    BoundedRestartOutcome, HostChildExecutor, HostDependencyPlan, HostFailure,
+    HostManagedChildBinding, HostService, HostServiceError, HostServiceState, KernelStartReceipt,
+    ManagedChildLiveness, ManagedChildReconcileOutcome, ServiceStopReceipt,
 };
 
 use eliot_contracts::{

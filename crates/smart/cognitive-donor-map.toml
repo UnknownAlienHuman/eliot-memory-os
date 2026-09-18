@@ -1,6 +1,6 @@
 schema_version = 3
 map_id = "cognitive-donor-map-2026-08-28-rev6"
-current_main_commit = "7f075ddf5d168f3d2ad3144807b7f0b9d4f0bb61"
+current_main_commit = "29715ec120863e1b0148846fc4ed6e1d1d1a195f"
 superseded_prototype_branch_commit = "b35e4a489d45d81f172ef7d5b44bea165438cb1c"
 rule = "Reuse requires one current causal owner, current documentation fit, a pure or reconstructible boundary, exact donor anchors, an independent proof path and an explicit rejected-overgeneralization."
 source_status = "STATIC_REVIEW_ONLY"
@@ -21,22 +21,29 @@ rejected_overgeneralization = "Nested compilation, mixed ownership and a facade 
 
 [[donor]]
 path = "crates/smart/eliot-understanding"
-disposition = "MERGE_RENDERING_INTO_CONTEXT_ASSEMBLY_THEN_RETIRE"
+disposition = "RETIRED_DUPLICATE_UNDERSTANDING_FACADE"
 targets = ["eliot-context-assembly"]
-rationale = "Retain role-preserving sections, omission manifest and expansion handles; remove the second ContextCompiler invocation and duplicate understanding owner."
+rationale = "Extraction outcome idea-only: role-preserving sections, omission manifest and expansion-handle ideas inform Context assembly rendering; second ContextCompiler invocation and duplicate understanding owner rejected, nothing copied. Zero-consumer proof at base 29715ec1 (no external Cargo dependents, no eliot_understanding:: import, Cargo.lock own-entry only). Package source, root member and lock entry removed in work/251-retire-understanding-facade atop base 29715ec1 (Implements #251, Supersedes #1197)."
 rejected_overgeneralization = "Independent mutable Understanding State or a second admission pass."
+extraction_proof = "Context assembly rendering via crates/smart/eliot-context-assembly (no second compilation; retirement Implements #251, Supersedes #1197)"
 
 [[donor]]
 path = "crates/smart/eliot-cues"
 disposition = "SPLIT_AND_RETAIN_AS_TEMPORARY_FACADE"
 targets = ["eliot-cue-contracts", "eliot-cue-normalizer", "eliot-cue-binding", "eliot-cue-index", "eliot-cue-activation"]
+# GAP(#40): rebuildable snapshot construction has no admitted contract cell yet;
+# CueSnapshot/CueRuntime stay in this facade until a snapshot cell is proposed.
+# No snapshot target name is listed here; inventing one would fake the boundary.
 rationale = "Retain deterministic matching, bounded spreading and trace shape; split canonical normalization, binding proposals, admitted projection construction and hot evaluation."
 rejected_overgeneralization = "Destructive canonical-path lowercasing, candidate bindings bypassing Governor admission, session delivery state in the pure evaluator, or graph-edge minimums for exact firing."
 
 [[donor]]
 path = "crates/smart/eliot-dreamer-core"
 disposition = "SPLIT_AND_RETAIN_AS_TEMPORARY_FACADE"
-targets = ["eliot-dreamer-contracts", "eliot-dreamer-bundle", "eliot-dreamer-candidate-validation", "eliot-dreamer-orientation", "eliot-dreamer-clarification", "eliot-dreamer-architecture-brief", "eliot-dreamer-implementation-brief", "eliot-dreamer-classification", "eliot-dreamer-relation", "eliot-dreamer-episode", "eliot-dreamer-concept", "eliot-dreamer-procedure", "eliot-dreamer-failure", "eliot-dreamer-structure-repair", "eliot-dreamer-reconsolidation", "eliot-dreamer-accessibility", "eliot-dreamer-memory-repair", "eliot-dreamer-curation", "eliot-dreamer-conflict-analysis", "eliot-dreamer-development-diagnosis", "eliot-dreamer-maintenance-plan", "eliot-dreamer-configuration-plan", "eliot-dreamer-orchestration-plan"]
+# REPAIR(#40): claim-grounding, rival-model and probe-plan were omitted from this
+# target list. All three exist as C1 cells, are named by cognitive-edge-map.toml,
+# and are the #836 (T8-A4) admission leaves alongside bundle/candidate-validation.
+targets = ["eliot-dreamer-contracts", "eliot-dreamer-bundle", "eliot-dreamer-claim-grounding", "eliot-dreamer-candidate-validation", "eliot-dreamer-rival-model", "eliot-dreamer-probe-plan", "eliot-dreamer-orientation", "eliot-dreamer-clarification", "eliot-dreamer-architecture-brief", "eliot-dreamer-implementation-brief", "eliot-dreamer-classification", "eliot-dreamer-relation", "eliot-dreamer-episode", "eliot-dreamer-concept", "eliot-dreamer-procedure", "eliot-dreamer-failure", "eliot-dreamer-structure-repair", "eliot-dreamer-reconsolidation", "eliot-dreamer-accessibility", "eliot-dreamer-memory-repair", "eliot-dreamer-curation", "eliot-dreamer-conflict-analysis", "eliot-dreamer-development-diagnosis", "eliot-dreamer-maintenance-plan", "eliot-dreamer-configuration-plan", "eliot-dreamer-orchestration-plan"]
 rationale = "Retain candidate-only ceiling, bounded draft validation, lineage and preservation concepts; separate top-level job classes from shared sub-handlers and move each transformation, diagnosis or planning function behind an independent boundary."
 rejected_overgeneralization = "One generator that mixes job contracts, bundle construction, validation, self-query authority domains, subtype semantics, scheduling or promotion."
 
@@ -56,16 +63,17 @@ rejected_overgeneralization = "Duplicate domain enums, writer utility as authori
 
 [[donor]]
 path = "crates/smart/eliot-memory"
-disposition = "RETIRE_AS_COGNITIVE_STATE_OWNER_AFTER_EDGE_MIGRATION"
+disposition = "RETIRED_DUPLICATE_COGNITIVE_STATE_OWNER"
 targets = ["governor.observation.classifier"]
-rationale = "Salvage only pure classification heuristics. Arc/Mutex canonical memory, retrieval, status, lifecycle and influence ownership conflict with the sole Governor/canonical path."
+rationale = "Extraction outcome idea-only: the classify helper informed the Governor observation classifier; ObservationHint/RecordKind/EpistemicStatus vocabulary rejected, nothing copied. Zero-consumer proof at base 7a1a6eaa (cargo metadata reverse-deps 0, no eliot_memory:: import, Cargo.lock own-entry only). Package source, root member and lock entry removed in work/39-retire-duplicate-cognitive-owners atop base 7a1a6eaa (removal commit SHA in #39 work unit)."
 rejected_overgeneralization = "Any second memory plane, status owner, retrieval reinforcement or direct write surface."
+extraction_proof = "D1_CAPTURE_CLASSIFICATION_EDGE_01 via crates/governor/eliot-observation/tests/classifier_first_pass.rs (5 tests)"
 
 [[donor]]
 path = "crates/smart/eliot-system-experience"
 disposition = "RETIRE_AS_STATE_OWNER_DEFER_READ_PROJECTION_IDEAS"
 targets = []
-rationale = "The canonical self-scope experience bank and SystemObservationJournal already have Governor/Memory OS owners. Later reuse only bounded read/filter/projection mechanics over those records."
+rationale = "The canonical self-scope experience bank and SystemObservationJournal already have Governor/Memory OS owners. Later reuse only bounded read/filter/projection mechanics over those records. Status under #39: retained-stateless v2 confirmed, owner-neutral edge deferred; source untouched by the eliot-memory retirement."
 rejected_overgeneralization = "A second self-memory owner, relation store or lifecycle transition path."
 
 [[donor]]

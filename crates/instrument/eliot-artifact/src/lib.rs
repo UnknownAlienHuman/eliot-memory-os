@@ -303,8 +303,19 @@ pub(crate) fn validate_digest(value: &str, field: &'static str) -> Result<(), Ar
 mod tests {
     use super::*;
     use eliot_contracts::{
-        AuthorityEpoch, ClockReading, ContractId, ResourceGeneration, SourceId, Status,
+        ClockReading, ContractId, EpochId, EpochLineageId, ResourceGeneration, SourceId, Status,
     };
+    use std::num::NonZeroU64;
+
+    const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn test_epoch(sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(TEST_LINEAGE_A).expect("valid test lineage"),
+            NonZeroU64::new(sequence).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
 
     fn clock() -> ClockReading {
         ClockReading {
@@ -316,7 +327,7 @@ mod tests {
     }
 
     fn fence() -> eliot_contracts::StateFence {
-        eliot_contracts::StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+        eliot_contracts::StateFence::new(test_epoch(1), ResourceGeneration::genesis())
     }
 
     fn source() -> SourceBinding {

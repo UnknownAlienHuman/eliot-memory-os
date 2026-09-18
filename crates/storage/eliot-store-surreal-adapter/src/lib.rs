@@ -18,6 +18,7 @@
 mod apply;
 mod client;
 mod config;
+mod dreamer_job;
 mod error;
 mod health;
 mod plan;
@@ -33,12 +34,12 @@ pub use config::{
 use eliot_platform::ClockObservation;
 use eliot_platform_windows::RetainedProcessPathLease;
 use eliot_store_api::{
-    CONTRACT_VERSION, CanonicalStoreClient, CanonicalValidationSnapshot, EffectClass,
+    CanonicalStoreClient, CanonicalValidationSnapshot, ExactJsonBytes, GENESIS_MANIFEST_NAME,
     NamedOperationManifest, NamedReadRequest, NamedReadResponse, OperationId, OrderingHead,
     OrderingHeadExpectation, OrderingScopeId, PreparedTransition, RequestMeta, RevisionHead,
     RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, StoreError,
-    StoreGenesisRequest, StoreHealth, StoreRecoveryRequest, StoreRecoverySnapshot, TransitionClass,
-    WriteReceipt,
+    StoreGenesisRequest, StoreHealth, StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt,
+    generated_operation_manifests, operation_manifest_set_digest,
 };
 pub use error::AdapterError;
 pub use health::{AdapterAvailability, AdapterHealth, ProviderHealth};
@@ -48,7 +49,7 @@ pub use readiness::{CompiledMigration, MigrationReceipt, SemanticReadiness};
 /// store.
 pub struct SurrealStoreAdapter {
     pub(crate) config: SurrealAdapterConfig,
-    pub(crate) provider_process_lease: RetainedProcessPathLease,
+    pub(crate) provider_process_lease: std::sync::Arc<RetainedProcessPathLease>,
     pub(crate) client: tokio::sync::OnceCell<Result<client::RpcTransport, AdapterError>>,
     pub(crate) write_lock: tokio::sync::Mutex<()>,
     /// Immutable closed operation manifest admitted by this adapter instance.
@@ -59,8 +60,8 @@ impl fmt::Debug for SurrealStoreAdapter {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("SurrealStoreAdapter")
-            .field("config", &self.config)
-            .field("provider_process_lease", &self.provider_process_lease)
+            .field("config", &"private")
+            .field("provider_process_lease", &"retained")
             .field("connected", &self.client.get().is_some_and(Result::is_ok))
             .field("write_lock", &"private")
             .field("operation_manifest", &self.operation_manifest)
@@ -70,6 +71,15 @@ impl fmt::Debug for SurrealStoreAdapter {
 
 impl SurrealStoreAdapter {
     /// Builds an adapter with the given connection and generation settings.
+    ///
+    /// Construction binds the instance to the active generated operation
+    /// catalogue: the catalogue set is generated and its set digest is
+    /// computed here, so a malformed catalogue fails closed at composition
+    /// time instead of at first write. The single-manifest slot keeps the
+    /// generated bootstrap (genesis) entry for health/handshake display; the
+    /// authoritative pre-stage gate always validates against the whole active
+    /// set (see `apply::validate_transition`). There is no aggregate
+    /// broad-manifest fallback.
     pub fn new(
         config: SurrealAdapterConfig,
         provider_process_lease: RetainedProcessPathLease,
@@ -88,12 +98,18 @@ impl SurrealStoreAdapter {
                     "canonical provider process lease failed identity validation".to_owned(),
                 )
             })?;
+        let entries = generated_operation_manifests().map_err(AdapterError::Store)?;
+        operation_manifest_set_digest(&entries).map_err(AdapterError::Store)?;
+        let operation_manifest = entries
+            .into_iter()
+            .find(|entry| entry.name == GENESIS_MANIFEST_NAME)
+            .ok_or(AdapterError::Store(StoreError::UnknownOperation))?;
         Ok(Self {
             config,
-            provider_process_lease,
+            provider_process_lease: std::sync::Arc::new(provider_process_lease),
             client: tokio::sync::OnceCell::new(),
             write_lock: tokio::sync::Mutex::new(()),
-            operation_manifest: default_manifest(),
+            operation_manifest,
         })
     }
 
@@ -116,7 +132,7 @@ impl SurrealStoreAdapter {
         manifest.validate()?;
         Ok(Self {
             config,
-            provider_process_lease,
+            provider_process_lease: std::sync::Arc::new(provider_process_lease),
             client: tokio::sync::OnceCell::new(),
             write_lock: tokio::sync::Mutex::new(()),
             operation_manifest: manifest,
@@ -176,6 +192,33 @@ impl SurrealStoreAdapter {
             transition,
             expected_revision_heads,
             expected_ordering_heads,
+        )
+        .await
+    }
+
+    /// Applies one prepared S-01 transition with per-operation payload
+    /// authorities bound in (slice C2, issue #19).
+    ///
+    /// `authorities` aligns 1:1 with the transition's named operations and
+    /// carries the original authority values. Entries with at least one
+    /// claimed authority plan through the authority-carrying path; all-`None`
+    /// entries keep the legacy path. The admitted-operation gate runs before
+    /// any provider I/O in both cases.
+    pub async fn apply_prepared_with_authority(
+        &self,
+        ctx: &RequestMeta,
+        transition: PreparedTransition,
+        expected_revision_heads: Vec<RevisionHeadExpectation>,
+        expected_ordering_heads: Vec<OrderingHeadExpectation>,
+        authorities: &[Option<ExactJsonBytes>],
+    ) -> Result<WriteReceipt, AdapterError> {
+        apply::apply_prepared_with_authority(
+            self,
+            ctx,
+            transition,
+            expected_revision_heads,
+            expected_ordering_heads,
+            authorities,
         )
         .await
     }
@@ -309,28 +352,17 @@ impl CanonicalStoreClient for SurrealStoreAdapter {
     async fn health(&self) -> Result<StoreHealth, StoreError> {
         apply::health(self).await
     }
-}
 
-fn default_manifest() -> NamedOperationManifest {
-    match NamedOperationManifest::new(
-        ADAPTER_NAME,
-        CONTRACT_VERSION,
-        vec![
-            TransitionClass::CaptureCandidate,
-            TransitionClass::Epistemic,
-            TransitionClass::TaskControl,
-            TransitionClass::LifecyclePolicy,
-            TransitionClass::RecoverySchema,
-        ],
-        EffectClass::ReversibleMutation,
-        1024 * 1024,
-        1024 * 1024,
-        30_000,
-    ) {
-        Ok(manifest) => manifest,
-        Err(error) => unreachable!(
-            "built-in adapter manifest literals violated the typed manifest invariant: {error}"
-        ),
+    async fn dreamer_job(
+        &self,
+        ctx: &RequestMeta,
+        request: eliot_protocol::dreamer_job::DurableJobRequest,
+    ) -> Result<eliot_protocol::dreamer_job::DurableJobResponse, StoreError> {
+        // Boxed: the ledger future holds multi-kilobyte canonical payloads
+        // across provider awaits, exceeding the default future-size lint.
+        Box::pin(dreamer_job::dreamer_job(self, ctx, request))
+            .await
+            .map_err(AdapterError::into_store_error)
     }
 }
 

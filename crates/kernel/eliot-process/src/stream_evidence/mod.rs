@@ -6,7 +6,7 @@
 
 use std::collections::BTreeSet;
 
-use eliot_contracts::{canonical_json_bytes, sha256_hex};
+use eliot_contracts::{EpochId, canonical_json_bytes, sha256_hex};
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, de};
 use thiserror::Error;

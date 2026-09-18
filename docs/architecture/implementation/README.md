@@ -3,8 +3,8 @@
 
 The adopted `Implementation` byte stream is split into 504 bounded Markdown fragments.
 
-- Original SHA-256: `7805bf238fe91819aba50d7e13aa86a8b977561195dbb98aa979f986e2fab063`
-- Original bytes: `999718`
+- Original SHA-256: `40b0908a637f46ba6c7c51db08e008673f9232ed74d510d3a4f38489d05d4e89`
+- Original bytes: `1003351`
 - Manifest: [`manifest.json`](manifest.json)
 - Stable compatibility path: [`../ELIOT_IMPLEMENTATION.md`](../ELIOT_IMPLEMENTATION.md)
 - Do not read this entire index as task context. Resolve a route first.
@@ -228,7 +228,7 @@ Use [`../READING_PROTOCOL.md`](../READING_PROTOCOL.md), [`../ROUTES.md`](../ROUT
 - [I9.1. Process model](../I09-01-process-model.md#i91-process-model) — `I9.1` (958 bytes)
 - [I9.2. Dreamer service responsibilities](../I09-02-dreamer-service-responsibilities.md#i92-dreamer-service-responsibilities) — `I9.2` (612 bytes)
 - [I9.3. Job classes](../I09-03-job-classes.md#i93-job-classes) — `I9.3` (5178 bytes)
-- [I9.4. Dreamer input bundle](../I09-04-dreamer-input-bundle.md#i94-dreamer-input-bundle) — `I9.4` (481 bytes)
+- [I9.4. Dreamer input bundle](../I09-04-dreamer-input-bundle.md#i94-dreamer-input-bundle) — `I9.4` (4114 bytes)
 - [I9.5. Dream Packet](../I09-05-dream-packet.md#i95-dream-packet) — `I9.5` (554 bytes)
 - [I9.6. Curation candidate](../I09-06-curation-candidate.md#i96-curation-candidate) — `I9.6` (414 bytes)
 - [I9.7. Memory transformation validation](../I09-07-memory-transformation-validation.md#i97-memory-transformation-validation) — `I9.7` (555 bytes)

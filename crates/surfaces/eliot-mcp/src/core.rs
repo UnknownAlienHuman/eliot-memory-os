@@ -5,7 +5,8 @@ use std::collections::BTreeSet;
 use eliot_protocol::HARD_STRUCTURED_RESPONSE_BYTES;
 use eliot_receipts::{ArtifactBinding, ProofCeiling, SessionBinding};
 use eliot_source_assurance::{
-    AdmissionOutcome, OwnerSourceEvidence, SourceAssurance, SourceAssuranceError, canonical_digest,
+    AdmissionOutcome, AssuranceFinding, OwnerSourceEvidence, SourceAssurance, SourceAssuranceError,
+    canonical_digest,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -14,7 +15,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
-    ApplicationRequest, ContractViolation, McpProtocolVersion, ToolRequest, validate_proof_ceiling,
+    ApplicationRequest, ContractViolation, McpProtocolVersion, QueryInput, QueryMode, ToolRequest,
+    TypedRejection, decode_protected_request_bytes, validate_proof_ceiling,
 };
 
 /// Default and optional local transport profiles. This is validation only.
@@ -164,42 +166,22 @@ pub struct InitializeResponse {
     pub protocol_version: McpProtocolVersion,
     /// Exact canonical tool count.
     pub canonical_tool_count: usize,
-    /// Whether the legacy alias is available in the compatibility adapter.
-    pub legacy_memory_use_alias: bool,
     /// Hard encoded structured-response limit.
     pub structured_response_limit_bytes: usize,
     /// Explicit statement that initialize did not create application identity.
     pub application_binding_created: bool,
 }
 
-/// Correlation-only hint admitted only by the 2025-11-25 adapter.
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CompatibilityCorrelation {
-    /// Opaque transport hint. It is not a Session identity.
-    pub transport_session_hint: Option<String>,
-}
-
 /// Immutable forwarded request passed to the injected semantic owner.
 #[derive(Clone, Debug, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ForwardedRequest {
-    /// Validated request with its canonical tool form.
+    /// Validated request in its canonical tool form.
     pub request: ApplicationRequest,
-    /// Original typed request, retained before compatibility normalization.
-    pub original_request: ApplicationRequest,
-    /// Canonical digest of the original typed request.
-    pub original_request_sha256: String,
-    /// Canonical digest of the original typed payload.
-    pub original_payload_sha256: String,
-    /// Canonical digest of the normalized typed payload.
-    pub canonical_payload_sha256: String,
     /// SHA-256 over canonical serialized request bytes, including identity.
     pub canonical_request_sha256: String,
     /// Trusted current operational binding resolved for this exact request.
     pub active_session_binding: ActiveSessionBinding,
-    /// Compatibility-only transport correlation hint.
-    pub compatibility_correlation_hint: Option<String>,
     /// Owner-authenticated source evidence required by every semantic handoff.
     pub source_assurance: ForwardedSourceAssurance,
 }
@@ -212,7 +194,7 @@ pub struct ForwardedSourceAssurance {
     pub owner_principal_ref: String,
     pub evidence_ref: String,
     pub request_id: String,
-    /// Exact typed pre-normalization request identity.
+    /// Exact typed request identity.
     pub original_request_sha256: String,
     pub idempotency_key: String,
     pub cancellation_id: String,
@@ -299,6 +281,306 @@ pub trait KernelGovernorPort {
 
     /// Evaluate one validated and explicitly bound request.
     fn dispatch(&self, request: &ForwardedRequest) -> Result<PortProjection, PortFailure>;
+}
+
+/// Closed T11.1 evidence-pack query plan derived from an explicit-intent
+/// `eliot.query`.
+///
+/// This is the pure planning half of the `KernelGovernorPort::dispatch` seam
+/// for `ToolRequest::Query`: it maps a validated `QueryInput` with explicit
+/// read intent into the store catalogue's closed selectors
+/// (`subject`/`max_records` for `GetEvidencePack`) without importing store
+/// types, so this crate stays transport-only and the store catalogue remains
+/// the authority. Free-text `query` is intent data, never a selector: T11.1
+/// requires the exact form `subject:<exact-subject>`; anything else fails
+/// closed instead of becoming a substring search or a forwarded `query`
+/// parameter.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvidencePackQueryPlan {
+    /// Exact captured-observation subject (never a substring, never blank).
+    pub subject: String,
+    /// Explicit `max_records` bound carried as its decimal string.
+    pub max_records: String,
+    /// Exact scope the read is bound to.
+    pub scope_id: String,
+}
+
+impl EvidencePackQueryPlan {
+    /// Closed operation name this plan executes.
+    #[must_use]
+    pub const fn operation_name() -> &'static str {
+        "GetEvidencePack"
+    }
+}
+
+/// Plans one closed `GetEvidencePack` read from an explicit-intent query.
+///
+/// `scope_id` comes from the trusted active session binding (never from MCP
+/// arguments alone) and `max_records` is the caller's explicit decimal bound;
+/// the store enforces the catalogue `EVIDENCE_PACK_MAX_RECORDS` cap. Fails
+/// closed when the intent is `CurrentPosition` (which never admits
+/// `GetEvidencePack`), when `exact_resource_uri` is present (exact expansion
+/// uses the resource path, not a query), or when `query` is not the exact
+/// `subject:<exact-subject>` selector form.
+pub fn plan_evidence_pack_query(
+    input: &QueryInput,
+    scope_id: &str,
+    max_records: &str,
+) -> Result<EvidencePackQueryPlan, BridgeError> {
+    if matches!(input.intent.mode, QueryMode::CurrentPosition) {
+        return Err(BridgeError::Port(PortFailure::Unsupported {
+            capability: "GetEvidencePack".to_owned(),
+            reason: "CurrentPosition intent never admits GetEvidencePack".to_owned(),
+        }));
+    }
+    if input.exact_resource_uri.is_some() {
+        return Err(BridgeError::invalid(
+            "query.exact_resource_uri",
+            "exact resource expansion uses the resource path, not eliot.query",
+        ));
+    }
+    if scope_id.trim().is_empty() || scope_id.chars().any(char::is_control) {
+        return Err(BridgeError::invalid(
+            "query.scope_id",
+            "must be non-blank and contain no control characters",
+        ));
+    }
+    if max_records.trim().is_empty() || max_records.chars().any(char::is_control) {
+        return Err(BridgeError::invalid(
+            "query.max_records",
+            "must be a non-blank decimal bound",
+        ));
+    }
+    let bound: u32 = max_records.trim().parse().map_err(|_| {
+        BridgeError::invalid(
+            "query.max_records",
+            "must be a positive decimal bound",
+        )
+    })?;
+    if bound == 0 {
+        return Err(BridgeError::invalid(
+            "query.max_records",
+            "must be a positive decimal bound",
+        ));
+    }
+    let subject = input
+        .query
+        .strip_prefix("subject:")
+        .map(str::trim)
+        .filter(|subject| !subject.is_empty() && !subject.chars().any(char::is_control))
+        .ok_or_else(|| {
+            BridgeError::invalid(
+                "query.query",
+                "T11.1 requires the exact form `subject:<exact-subject>`; free-text search is not an exact selector",
+            )
+        })?;
+    Ok(EvidencePackQueryPlan {
+        subject: subject.to_owned(),
+        max_records: max_records.trim().to_owned(),
+        scope_id: scope_id.trim().to_owned(),
+    })
+}
+
+/// Projects a successful evidence-pack payload into a bounded `Projection`.
+///
+/// Kind is always `Projection` (read-only owner state, never a candidate);
+/// proof ceiling is `ScopedVerification` (the strongest ceiling MCP
+/// projections may claim); no `CurrentPosition` claim is expressed. The exact
+/// store payload crosses unchanged under `evidence_pack` with its
+/// subject/scope identity.
+#[must_use]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "payload moves into the JSON projection; clippy cannot see through json!"
+)]
+pub fn project_evidence_pack_projection(
+    plan: &EvidencePackQueryPlan,
+    payload: Value,
+) -> PortProjection {
+    PortProjection {
+        kind: ProjectionKind::Projection,
+        content: json!({
+            "operation": EvidencePackQueryPlan::operation_name(),
+            "subject": plan.subject,
+            "scope_id": plan.scope_id,
+            "evidence_pack": payload,
+        }),
+        artifacts: Vec::new(),
+        proof_ceiling: ProofCeiling::ScopedVerification,
+        resource: None,
+        durable_job: None,
+    }
+}
+
+/// Closed T11.3 reconstruction query plan derived from an explicit-intent
+/// `eliot.query` with `ContextReconstruction` mode.
+///
+/// This is the pure planning half of the `KernelGovernorPort::dispatch` seam
+/// for `ToolRequest::Query`: it carries only validated strings (task-bound
+/// scope, exact task selector, evidence selectors, position selector) without
+/// importing store types, so this crate stays transport-only and the store
+/// catalogue remains the authority. Free-text `query` is intent data, never a
+/// selector: T11.3 requires the exact form `task:<exact-task-id>`; anything
+/// else fails closed instead of becoming a substring search or a forwarded
+/// `query` parameter. The Governor reconstruction composition behind
+/// `KernelGovernorPort` binds these selectors to the six
+/// ContextReconstruction-admitted named reads; the seven provider-role
+/// dispositions return through
+/// [`project_context_reconstruction_projection`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContextReconstructionQueryPlan {
+    /// Exact task-bound scope (from the trusted active session binding, never
+    /// from MCP arguments alone).
+    pub scope_id: String,
+    /// Exact task identity (never a substring, never blank).
+    pub task_id: String,
+    /// Exact captured-observation subject for the evidence role.
+    pub evidence_subject: String,
+    /// Explicit evidence `max_records` bound carried as its decimal string.
+    pub evidence_max_records: String,
+    /// Exact position selector for the activation-evidence role.
+    pub position: String,
+}
+
+impl ContextReconstructionQueryPlan {
+    /// Closed intent name this plan executes.
+    #[must_use]
+    pub const fn operation_name() -> &'static str {
+        "ContextReconstruction"
+    }
+
+    /// Closed named-read operation names bound by this plan, in canonical
+    /// role order. Spellings match the store catalogue's `PascalCase` wire
+    /// form; the catalogue — not this crate — admits them for execution.
+    #[must_use]
+    pub const fn role_operation_names() -> [&'static str; 6] {
+        [
+            "GetTaskState",
+            "GetAttentionAndProblems",
+            "GetCurrentEpistemicPosition",
+            "GetUnderstandingProjectionInputs",
+            "GetEvidencePack",
+            "GetCapabilityEvidenceState",
+        ]
+    }
+}
+
+/// Plans one closed reconstruction closure from an explicit-intent query.
+///
+/// Only the `ContextReconstruction` intent plans here (any other mode fails
+/// closed as unsupported instead of borrowing the reconstruction closure);
+/// `exact_resource_uri` fails closed because exact expansion uses the
+/// resource path, not a query; `query` must be the exact
+/// `task:<exact-task-id>` selector form. `scope_id` comes from the trusted
+/// active session binding and the store enforces the catalogue
+/// `EVIDENCE_PACK_MAX_RECORDS` cap on the carried bound.
+pub fn plan_context_reconstruction_query(
+    input: &QueryInput,
+    scope_id: &str,
+    evidence_subject: &str,
+    evidence_max_records: &str,
+    position: &str,
+) -> Result<ContextReconstructionQueryPlan, BridgeError> {
+    if !matches!(input.intent.mode, QueryMode::ContextReconstruction) {
+        return Err(BridgeError::Port(PortFailure::Unsupported {
+            capability: "ContextReconstruction".to_owned(),
+            reason: "the reconstruction closure admits only the ContextReconstruction intent"
+                .to_owned(),
+        }));
+    }
+    if input.exact_resource_uri.is_some() {
+        return Err(BridgeError::invalid(
+            "query.exact_resource_uri",
+            "exact resource expansion uses the resource path, not eliot.query",
+        ));
+    }
+    if scope_id.trim().is_empty() || scope_id.chars().any(char::is_control) {
+        return Err(BridgeError::invalid(
+            "query.scope_id",
+            "must be non-blank and contain no control characters",
+        ));
+    }
+    let task_id = input
+        .query
+        .strip_prefix("task:")
+        .map(str::trim)
+        .filter(|task| !task.is_empty() && !task.chars().any(char::is_control))
+        .ok_or_else(|| {
+            BridgeError::invalid(
+                "query.query",
+                "T11.3 requires the exact form `task:<exact-task-id>`; free-text search is not an exact selector",
+            )
+        })?;
+    if evidence_subject.trim().is_empty() || evidence_subject.chars().any(char::is_control) {
+        return Err(BridgeError::invalid(
+            "query.evidence_subject",
+            "must be non-blank and contain no control characters",
+        ));
+    }
+    if evidence_max_records.trim().is_empty() || evidence_max_records.chars().any(char::is_control)
+    {
+        return Err(BridgeError::invalid(
+            "query.evidence_max_records",
+            "must be a non-blank decimal bound",
+        ));
+    }
+    let bound: u32 = evidence_max_records.trim().parse().map_err(|_| {
+        BridgeError::invalid(
+            "query.evidence_max_records",
+            "must be a positive decimal bound",
+        )
+    })?;
+    if bound == 0 {
+        return Err(BridgeError::invalid(
+            "query.evidence_max_records",
+            "must be a positive decimal bound",
+        ));
+    }
+    if position.trim().is_empty() || position.chars().any(char::is_control) {
+        return Err(BridgeError::invalid(
+            "query.position",
+            "must be non-blank and contain no control characters",
+        ));
+    }
+    Ok(ContextReconstructionQueryPlan {
+        scope_id: scope_id.trim().to_owned(),
+        task_id: task_id.to_owned(),
+        evidence_subject: evidence_subject.trim().to_owned(),
+        evidence_max_records: evidence_max_records.trim().to_owned(),
+        position: position.trim().to_owned(),
+    })
+}
+
+/// Projects a successful reconstruction payload into a bounded `Projection`.
+///
+/// Kind is always `Projection` (read-only owner state, never a candidate);
+/// proof ceiling is `ScopedVerification` (the strongest ceiling MCP
+/// projections may claim); no `CurrentPosition` claim is expressed. The exact
+/// owner payload — the seven role dispositions with their fence identity —
+/// crosses unchanged under `context_reconstruction` with its task/scope
+/// identity.
+#[must_use]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "payload moves into the JSON projection; clippy cannot see through json!"
+)]
+pub fn project_context_reconstruction_projection(
+    plan: &ContextReconstructionQueryPlan,
+    payload: Value,
+) -> PortProjection {
+    PortProjection {
+        kind: ProjectionKind::Projection,
+        content: json!({
+            "operation": ContextReconstructionQueryPlan::operation_name(),
+            "task_id": plan.task_id,
+            "scope_id": plan.scope_id,
+            "context_reconstruction": payload,
+        }),
+        artifacts: Vec::new(),
+        proof_ceiling: ProofCeiling::ScopedVerification,
+        resource: None,
+        durable_job: None,
+    }
 }
 
 /// Closed non-authoritative projection classes returned by the injected port.
@@ -446,7 +728,7 @@ pub struct McpResponse {
     pub canonical_request_sha256: String,
     /// Candidate/projection/typed-gap class.
     pub kind: ResponseKind,
-    /// Canonical tool name after alias normalization.
+    /// Canonical tool name.
     pub canonical_tool_name: String,
     /// Structured bounded content or a resource pointer.
     pub content: Value,
@@ -458,8 +740,36 @@ pub struct McpResponse {
     pub resource: Option<ResourceHandle>,
     /// Long-operation presentation.
     pub job: Option<JobPresentation>,
-    /// Compat-only hint echoed solely for transport correlation.
-    pub compatibility_correlation_hint: Option<String>,
+}
+
+/// Immutable identity binding one bounded MCP response to its request.
+///
+/// Built once at server receive from the validated request identity and
+/// carried end-to-end through the host gateway to the bridge stdio span, so a
+/// completed response is never mistaken for a timeout when host/UI
+/// observability is missing. It carries correlation only; it mints no
+/// principal, Session, task, fence, or authority identity.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequestCorrelation {
+    /// Exact request identity echoed for correlation.
+    pub request_id: String,
+    /// Exact idempotency identity echoed for retry correlation.
+    pub idempotency_key: String,
+    /// SHA-256 of canonical request bytes.
+    pub canonical_request_sha256: String,
+}
+
+impl McpResponse {
+    /// Returns the immutable request binding echoed by this response.
+    #[must_use]
+    pub fn correlation(&self) -> RequestCorrelation {
+        RequestCorrelation {
+            request_id: self.request_id.clone(),
+            idempotency_key: self.idempotency_key.clone(),
+            canonical_request_sha256: self.canonical_request_sha256.clone(),
+        }
+    }
 }
 
 /// Pure stateless MCP core. It stores neither a port nor application state.
@@ -473,7 +783,6 @@ impl McpCore {
         InitializeResponse {
             protocol_version: request.protocol_version,
             canonical_tool_count: crate::CANONICAL_TOOL_NAMES.len(),
-            legacy_memory_use_alias: true,
             structured_response_limit_bytes: HARD_STRUCTURED_RESPONSE_BYTES,
             application_binding_created: false,
         }
@@ -492,80 +801,65 @@ impl McpCore {
                 "the primary entrypoint admits only 2026-07-28",
             ));
         }
-        Self::execute_inner(port, transport, request, None)
+        Self::execute_inner(port, transport, request)
     }
 
-    /// Isolated 2025-11-25 adapter. The hint cannot replace the application binding.
-    pub fn execute_compat<P: KernelGovernorPort + ?Sized>(
+    /// Validates raw request bytes through the protected decoder before any
+    /// trusted construction or semantic dispatch.
+    ///
+    /// Raw duplicate protected keys (including escape-equivalent forms) and
+    /// unknown protected variants fail here with zero port calls; no trial
+    /// decoding is performed.
+    pub fn execute_raw<P: KernelGovernorPort + ?Sized>(
         &self,
         port: &P,
         transport: TransportRequestContext,
-        request: ApplicationRequest,
-        correlation: CompatibilityCorrelation,
+        request_bytes: &[u8],
     ) -> Result<McpResponse, BridgeError> {
-        if request.protocol_version != McpProtocolVersion::Compat2025_11_25 {
-            return Err(BridgeError::invalid(
-                "protocol_version",
-                "compatibility correlation is only admitted for 2025-11-25",
-            ));
-        }
-        if correlation
-            .transport_session_hint
-            .as_ref()
-            .is_some_and(|value| value.trim().is_empty())
-        {
-            return Err(BridgeError::invalid(
-                "compatibility.transport_session_hint",
-                "must be non-blank when present",
-            ));
-        }
-        Self::execute_inner(port, transport, request, correlation.transport_session_hint)
+        let request =
+            decode_protected_request_bytes(request_bytes).map_err(raw_rejection_to_bridge)?;
+        self.execute(port, transport, request)
     }
 
     #[allow(clippy::too_many_lines)]
     fn execute_inner<P: KernelGovernorPort + ?Sized>(
         port: &P,
         transport: TransportRequestContext,
-        mut request: ApplicationRequest,
-        compatibility_hint: Option<String>,
+        request: ApplicationRequest,
     ) -> Result<McpResponse, BridgeError> {
         transport.validate()?;
         validate_application_request(&request)?;
-        let original_request = request.clone();
-        let original_request_sha256 = canonical_sha256(&original_request)?;
-        let original_payload_sha256 = canonical_sha256(&original_request.tool)?;
-        request.tool = request.tool.canonicalized();
-        let canonical_payload_sha256 = canonical_sha256(&request.tool)?;
-        let request_id = request
-            .identity
-            .request
-            .metadata
-            .request_id
-            .as_str()
-            .to_owned();
-        let idempotency_key = request.identity.idempotency_key.clone();
+        let correlation = RequestCorrelation {
+            request_id: request
+                .identity
+                .request
+                .metadata
+                .request_id
+                .as_str()
+                .to_owned(),
+            idempotency_key: request.identity.idempotency_key.clone(),
+            canonical_request_sha256: canonical_sha256(&request)?,
+        };
         let canonical_tool_name = request.tool.canonical_name().to_owned();
-        let canonical_request_sha256 = canonical_sha256(&request)?;
         let client_capabilities = request.client_capabilities;
         let resolution_request = BindingResolutionRequest {
             transport,
             claimed_session: request.session.clone(),
-            request_id: request_id.clone(),
-            original_request_sha256: original_request_sha256.clone(),
-            idempotency_key: idempotency_key.clone(),
+            request_id: correlation.request_id.clone(),
+            original_request_sha256: correlation.canonical_request_sha256.clone(),
+            idempotency_key: correlation.idempotency_key.clone(),
             cancellation_id: request.identity.cancellation_id.clone(),
-            canonical_request_sha256: canonical_request_sha256.clone(),
+            canonical_request_sha256: correlation.canonical_request_sha256.clone(),
             deadline_unix_ms: request.identity.deadline_unix_ms,
         };
         let active_session_binding = match port.resolve_active_session(&resolution_request) {
             Ok(binding) => binding,
             Err(failure @ (PortFailure::PlanGap { .. } | PortFailure::Unsupported { .. })) => {
                 return negative_response(
-                    &request_id,
-                    &idempotency_key,
-                    &canonical_request_sha256,
+                    &correlation.request_id,
+                    &correlation.idempotency_key,
+                    &correlation.canonical_request_sha256,
                     &canonical_tool_name,
-                    compatibility_hint,
                     failure,
                 );
             }
@@ -577,11 +871,10 @@ impl McpCore {
                 Ok(evidence) => evidence,
                 Err(failure @ (PortFailure::PlanGap { .. } | PortFailure::Unsupported { .. })) => {
                     return negative_response(
-                        &request_id,
-                        &idempotency_key,
-                        &canonical_request_sha256,
+                        &correlation.request_id,
+                        &correlation.idempotency_key,
+                        &correlation.canonical_request_sha256,
                         &canonical_tool_name,
-                        compatibility_hint,
                         failure,
                     );
                 }
@@ -594,24 +887,18 @@ impl McpCore {
         )?;
         let forwarded = ForwardedRequest {
             request,
-            original_request,
-            original_request_sha256,
-            original_payload_sha256,
-            canonical_payload_sha256,
-            canonical_request_sha256: canonical_request_sha256.clone(),
+            canonical_request_sha256: correlation.canonical_request_sha256.clone(),
             active_session_binding,
-            compatibility_correlation_hint: compatibility_hint.clone(),
             source_assurance,
         };
         let projection = match port.dispatch(&forwarded) {
             Ok(value) => value,
             Err(failure @ (PortFailure::PlanGap { .. } | PortFailure::Unsupported { .. })) => {
                 return negative_response(
-                    &request_id,
-                    &idempotency_key,
-                    &canonical_request_sha256,
+                    &correlation.request_id,
+                    &correlation.idempotency_key,
+                    &correlation.canonical_request_sha256,
                     &canonical_tool_name,
-                    compatibility_hint,
                     failure,
                 );
             }
@@ -630,9 +917,9 @@ impl McpCore {
             }
         });
         let response = McpResponse {
-            request_id,
-            idempotency_key,
-            canonical_request_sha256,
+            request_id: correlation.request_id.clone(),
+            idempotency_key: correlation.idempotency_key.clone(),
+            canonical_request_sha256: correlation.canonical_request_sha256.clone(),
             kind,
             canonical_tool_name,
             content: projection.content,
@@ -640,7 +927,6 @@ impl McpCore {
             proof_ceiling: projection.proof_ceiling,
             resource: projection.resource,
             job,
-            compatibility_correlation_hint: compatibility_hint,
         };
         bounded_response(response)
     }
@@ -674,7 +960,6 @@ fn negative_response(
     idempotency_key: &str,
     canonical_request_sha256: &str,
     canonical_tool_name: &str,
-    compatibility_hint: Option<String>,
     failure: PortFailure,
 ) -> Result<McpResponse, BridgeError> {
     let (kind, content) = match failure {
@@ -710,8 +995,28 @@ fn negative_response(
         proof_ceiling: ProofCeiling::Observation,
         resource: None,
         job: None,
-        compatibility_correlation_hint: compatibility_hint,
     })
+}
+
+/// Bounded typed recovery code for source-assurance admission failures.
+///
+/// `Rejected` covers conflicting or policy-rejected evidence,
+/// `Quarantined` covers quarantined sources, `Incomplete` covers missing or
+/// incomplete evidence, `Stale` covers needs-revalidation, and
+/// `InternalDefect` covers encoding defects that are never caller recovery.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AssuranceRecoveryCode {
+    /// Conflicting, wrong-scope, or policy-rejected evidence.
+    Rejected,
+    /// Quarantined source; retained as evidence but excluded from admission.
+    Quarantined,
+    /// Missing or incomplete evidence.
+    Incomplete,
+    /// Stale snapshot/frontier/scope requiring revalidation.
+    Stale,
+    /// Internal encoding defect, not caller recovery.
+    InternalDefect,
 }
 
 /// Pure bridge validation/forwarding failure.
@@ -877,22 +1182,24 @@ fn validate_owner_evidence(
     resolution: &BindingResolutionRequest,
     binding: &ActiveSessionBinding,
 ) -> Result<ForwardedSourceAssurance, BridgeError> {
-    evidence
-        .validate()
-        .map_err(|error| BridgeError::SourceAssuranceRejected {
-            reason: safe_assurance_error_reason(&error),
-        })?;
+    evidence.validate().map_err(|error| {
+        assurance_rejection(
+            assurance_error_code(&error),
+            &safe_assurance_error_reason(&error),
+        )
+    })?;
     if evidence.owner_principal_ref != binding.principal_ref {
-        return Err(BridgeError::SourceAssuranceRejected {
-            reason: "owner evidence principal must match the authenticated active binding"
-                .to_owned(),
-        });
+        return Err(assurance_rejection(
+            AssuranceRecoveryCode::Rejected,
+            "owner evidence principal must match the authenticated active binding",
+        ));
     }
     let state_fence_digest =
         canonical_digest(&resolution.claimed_session.state_fence).map_err(|error| {
-            BridgeError::SourceAssuranceRejected {
-                reason: safe_assurance_error_reason(&error),
-            }
+            assurance_rejection(
+                assurance_error_code(&error),
+                &safe_assurance_error_reason(&error),
+            )
         })?;
     if evidence.request_id != resolution.request_id
         || evidence.original_request_sha256 != resolution.original_request_sha256
@@ -902,25 +1209,31 @@ fn validate_owner_evidence(
         || evidence.state_fence_digest != state_fence_digest
         || evidence.canonical_request_sha256 != resolution.canonical_request_sha256
     {
-        return Err(BridgeError::SourceAssuranceRejected {
-            reason: "owner evidence must bind the resolver's exact canonical request".to_owned(),
-        });
+        return Err(assurance_rejection(
+            AssuranceRecoveryCode::Rejected,
+            "owner evidence must bind the resolver's exact canonical request",
+        ));
     }
     let outcome = evidence
         .assurance
         .admit_with_policy(&evidence.policy)
-        .map_err(|error| BridgeError::SourceAssuranceRejected {
-            reason: safe_assurance_error_reason(&error),
+        .map_err(|error| {
+            assurance_rejection(
+                assurance_error_code(&error),
+                &safe_assurance_error_reason(&error),
+            )
         })?;
     let AdmissionOutcome::Admitted { assurance_digest } = outcome else {
+        let (_, reason, _) = admission_outcome_recovery(&outcome);
         return Err(BridgeError::SourceAssuranceRejected {
-            reason: admission_outcome_reason(&outcome).to_owned(),
+            reason: reason.to_owned(),
         });
     };
     if evidence.verifier_ref != evidence.policy.required_verifier {
-        return Err(BridgeError::SourceAssuranceRejected {
-            reason: "owner evidence does not satisfy the policy verifier requirement".to_owned(),
-        });
+        return Err(assurance_rejection(
+            AssuranceRecoveryCode::Rejected,
+            "owner evidence does not satisfy the policy verifier requirement",
+        ));
     }
     Ok(ForwardedSourceAssurance {
         owner_principal_ref: evidence.owner_principal_ref.clone(),
@@ -941,12 +1254,65 @@ fn validate_owner_evidence(
 
 fn admission_outcome_reason(outcome: &AdmissionOutcome) -> &'static str {
     match outcome {
-        AdmissionOutcome::Admitted { .. } => "source assurance admitted",
-        AdmissionOutcome::NeedsRevalidation { .. } => "source assurance needs revalidation",
-        AdmissionOutcome::Missing { .. } => "source assurance is incomplete",
-        AdmissionOutcome::Conflicted { .. } => "source assurance has conflicting identities",
-        AdmissionOutcome::WrongScope { .. } => "source assurance scope does not match",
-        AdmissionOutcome::Quarantined { .. } => "source assurance is quarantined",
+        AdmissionOutcome::Admitted { .. } => "REJECTED: source assurance admitted",
+        AdmissionOutcome::NeedsRevalidation { .. } => "STALE: source assurance needs revalidation",
+        AdmissionOutcome::Missing { .. } => "INCOMPLETE: source assurance is incomplete",
+        AdmissionOutcome::Conflicted { .. } => {
+            "REJECTED: source assurance has conflicting identities"
+        }
+        AdmissionOutcome::WrongScope { .. } => "REJECTED: source assurance scope does not match",
+        AdmissionOutcome::Quarantined { .. } => "QUARANTINED: source assurance is quarantined",
+    }
+}
+
+/// Maps a non-admitted outcome to its bounded recovery code, redacted reason,
+/// and preserved evaluator findings.
+///
+/// The error itself carries only the distinct single-field reason below; the
+/// returned findings vec preserves the full typed evaluator detail without
+/// protected bodies for callers that need it. Diagnostics never echo
+/// protected bodies.
+#[must_use]
+pub fn admission_outcome_recovery(
+    outcome: &AdmissionOutcome,
+) -> (AssuranceRecoveryCode, &'static str, Vec<AssuranceFinding>) {
+    match outcome {
+        AdmissionOutcome::Admitted { .. } => (
+            AssuranceRecoveryCode::Rejected,
+            admission_outcome_reason(outcome),
+            Vec::new(),
+        ),
+        AdmissionOutcome::NeedsRevalidation { findings } => (
+            AssuranceRecoveryCode::Stale,
+            admission_outcome_reason(outcome),
+            findings.clone(),
+        ),
+        AdmissionOutcome::Missing { findings } => (
+            AssuranceRecoveryCode::Incomplete,
+            admission_outcome_reason(outcome),
+            findings.clone(),
+        ),
+        AdmissionOutcome::Conflicted { findings } | AdmissionOutcome::WrongScope { findings } => (
+            AssuranceRecoveryCode::Rejected,
+            admission_outcome_reason(outcome),
+            findings.clone(),
+        ),
+        AdmissionOutcome::Quarantined { findings } => (
+            AssuranceRecoveryCode::Quarantined,
+            admission_outcome_reason(outcome),
+            findings.clone(),
+        ),
+    }
+}
+
+fn assurance_error_code(error: &SourceAssuranceError) -> AssuranceRecoveryCode {
+    match error {
+        SourceAssuranceError::MissingField(_) => AssuranceRecoveryCode::Incomplete,
+        SourceAssuranceError::Json(_) => AssuranceRecoveryCode::InternalDefect,
+        SourceAssuranceError::InvalidDigest(_)
+        | SourceAssuranceError::DuplicateSourceId(_)
+        | SourceAssuranceError::NonCanonicalSourceSet
+        | SourceAssuranceError::UnsupportedSchema(_) => AssuranceRecoveryCode::Rejected,
     }
 }
 
@@ -961,6 +1327,226 @@ fn safe_assurance_error_reason(error: &SourceAssuranceError) -> String {
         SourceAssuranceError::UnsupportedSchema(_) => "unsupported assurance schema".to_owned(),
         SourceAssuranceError::Json(_) => "assurance encoding failed".to_owned(),
     }
+}
+
+/// Builds the single-field assurance rejection with the recovery-code name
+/// embedded as a `CODE: detail` prefix, keeping stale, incomplete, rejected,
+/// quarantined, and internal-defect outcomes distinct without structured
+/// fields. `detail` is already redacted; protected bodies are never echoed.
+fn assurance_rejection(code: AssuranceRecoveryCode, detail: &str) -> BridgeError {
+    let prefix = match code {
+        AssuranceRecoveryCode::Rejected => "REJECTED",
+        AssuranceRecoveryCode::Quarantined => "QUARANTINED",
+        AssuranceRecoveryCode::Incomplete => "INCOMPLETE",
+        AssuranceRecoveryCode::Stale => "STALE",
+        AssuranceRecoveryCode::InternalDefect => "INTERNAL_DEFECT",
+    };
+    BridgeError::SourceAssuranceRejected {
+        reason: format!("{prefix}: {detail}"),
+    }
+}
+
+/// Maps a raw protected rejection to a redacted bridge error.
+///
+/// Only bounded control names and static reasons are echoed; raw bodies,
+/// secrets, and protected payloads are never included.
+fn raw_rejection_to_bridge(rejection: TypedRejection) -> BridgeError {
+    match rejection {
+        TypedRejection::DuplicateKey { key } => {
+            BridgeError::invalid("request", format!("duplicate protected key: {key}"))
+        }
+        TypedRejection::UnknownVariant { variant } => {
+            BridgeError::invalid("tool.name", format!("unsupported tool variant: {variant}"))
+        }
+        TypedRejection::Malformed { reason } => BridgeError::invalid("request", reason),
+        TypedRejection::Oversized { actual, maximum } => {
+            BridgeError::ResourceRequired { actual, maximum }
+        }
+    }
+}
+
+/// Trusted routing authority taken strictly from the envelope, the active
+/// binding, and owner evidence. Nested JSON/XML/YAML/Markdown/code payloads,
+/// encoded strings, and bidi/zero-width text remain inert data: this struct
+/// never reads selector, identity, policy, authority, effect-ceiling, or
+/// `Finish` routing from data prose.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EnvelopeAuthority {
+    /// Canonical tool selector from the typed envelope.
+    pub selector: String,
+    /// Exact request identity from the envelope.
+    pub request_id: String,
+    /// Exact retry identity from the envelope.
+    pub idempotency_key: String,
+    /// Exact cancellation identity from the envelope.
+    pub cancellation_id: String,
+    /// Exact session identity from the envelope and binding.
+    pub session_id: String,
+    /// Authenticated principal from the active binding.
+    pub principal_ref: String,
+    /// Owner policy version from the assurance envelope.
+    pub policy_version: String,
+    /// Required verifier from the owner policy, when present.
+    pub verifier_ref: Option<String>,
+    /// Canonical assurance digest from the forwarding envelope.
+    pub assurance_digest: String,
+}
+
+/// Extracts the trusted routing authority strictly from the envelope,
+/// binding, and assurance. Data payloads are never consulted.
+#[must_use]
+pub fn envelope_authority(
+    request: &ApplicationRequest,
+    binding: &ActiveSessionBinding,
+    assurance: &ForwardedSourceAssurance,
+) -> EnvelopeAuthority {
+    EnvelopeAuthority {
+        selector: request.tool.canonical_name().to_owned(),
+        request_id: request
+            .identity
+            .request
+            .metadata
+            .request_id
+            .as_str()
+            .to_owned(),
+        idempotency_key: request.identity.idempotency_key.clone(),
+        cancellation_id: request.identity.cancellation_id.clone(),
+        session_id: request.session.session_id.to_string(),
+        principal_ref: binding.principal_ref.clone(),
+        policy_version: assurance.policy.policy_version.clone(),
+        verifier_ref: assurance.verifier_ref.clone(),
+        assurance_digest: assurance.assurance_digest.clone(),
+    }
+}
+
+/// How a candidate forwarded request relates to an original under one retry
+/// identity. Pure comparison over `ForwardedRequest` fields and the
+/// assurance digest; no store and no I/O.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ReplayConflictKind {
+    /// Canonical payload or request bytes changed.
+    PayloadChanged,
+    /// Owner source evidence or assurance digest changed.
+    SourceChanged,
+    /// Owner policy changed.
+    PolicyChanged,
+    /// Active session binding changed.
+    BindingChanged,
+}
+
+/// Replay disposition for two forwarded requests sharing a retry identity.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ReplayDisposition {
+    /// Every digest, binding, source, and policy field matches.
+    ExactReplay,
+    /// Same retry identity but a protected field changed.
+    Conflict(ReplayConflictKind),
+    /// Different retry identities; not a replay comparison.
+    DifferentIdentity,
+}
+
+/// Compares two forwarded requests for exact replay or invalidation.
+///
+/// Exact replay requires identical retry identity plus identical canonical
+/// request digests, active binding, source assurance (including the assurance
+/// digest), and policy. Any protected change under one identity conflicts and
+/// invalidates reuse.
+#[must_use]
+pub fn replay_disposition(
+    original: &ForwardedRequest,
+    candidate: &ForwardedRequest,
+) -> ReplayDisposition {
+    if original.source_assurance.idempotency_key != candidate.source_assurance.idempotency_key
+        || original.request.identity.idempotency_key != candidate.request.identity.idempotency_key
+    {
+        return ReplayDisposition::DifferentIdentity;
+    }
+    if original.canonical_request_sha256 != candidate.canonical_request_sha256
+        || original.request != candidate.request
+    {
+        return ReplayDisposition::Conflict(ReplayConflictKind::PayloadChanged);
+    }
+    if original.source_assurance.assurance_digest != candidate.source_assurance.assurance_digest
+        || original.source_assurance.assurance != candidate.source_assurance.assurance
+        || original.source_assurance.evidence_ref != candidate.source_assurance.evidence_ref
+        || original.source_assurance.owner_principal_ref
+            != candidate.source_assurance.owner_principal_ref
+    {
+        return ReplayDisposition::Conflict(ReplayConflictKind::SourceChanged);
+    }
+    if original.source_assurance.policy != candidate.source_assurance.policy {
+        return ReplayDisposition::Conflict(ReplayConflictKind::PolicyChanged);
+    }
+    if original.active_session_binding != candidate.active_session_binding
+        || original.source_assurance.session_id != candidate.source_assurance.session_id
+        || original.source_assurance.state_fence_digest
+            != candidate.source_assurance.state_fence_digest
+        || original.source_assurance.canonical_request_sha256
+            != candidate.source_assurance.canonical_request_sha256
+    {
+        return ReplayDisposition::Conflict(ReplayConflictKind::BindingChanged);
+    }
+    ReplayDisposition::ExactReplay
+}
+
+/// Returns true only for a deterministic exact replay.
+#[must_use]
+pub fn is_exact_replay(original: &ForwardedRequest, candidate: &ForwardedRequest) -> bool {
+    matches!(
+        replay_disposition(original, candidate),
+        ReplayDisposition::ExactReplay
+    )
+}
+
+/// Lineage derived by a transformation. The original digest is preserved
+/// unchanged; the derived digest adds provenance for the transform.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TransformedLineage {
+    /// Original lineage digest, preserved exactly.
+    pub original_lineage_digest: String,
+    /// Bounded transform reference that produced the derivation.
+    pub transform_ref: String,
+    /// Canonical digest over the original digest plus the transform.
+    pub derived_digest: String,
+}
+
+/// Derives transformed lineage while preserving the original digest.
+///
+/// The derived digest is computed through the assurance crate's canonical
+/// `blake3` helper (`canonical_digest`), not by duplicating digest logic.
+/// No store and no I/O are performed.
+pub fn derive_transformed_lineage(
+    original_lineage_digest: &str,
+    transform_ref: &str,
+) -> Result<TransformedLineage, BridgeError> {
+    if !is_sha256(original_lineage_digest) {
+        return Err(BridgeError::invalid(
+            "provenance.lineage_digest",
+            "must be a lowercase hex digest",
+        ));
+    }
+    if transform_ref.trim().is_empty() || transform_ref.chars().any(char::is_control) {
+        return Err(BridgeError::invalid(
+            "provenance.transform_ref",
+            "must be non-blank and contain no control characters",
+        ));
+    }
+    let derived_digest =
+        canonical_digest(&(original_lineage_digest, transform_ref)).map_err(|error| {
+            assurance_rejection(
+                assurance_error_code(&error),
+                &safe_assurance_error_reason(&error),
+            )
+        })?;
+    Ok(TransformedLineage {
+        original_lineage_digest: original_lineage_digest.to_owned(),
+        transform_ref: transform_ref.to_owned(),
+        derived_digest,
+    })
 }
 
 fn validate_projection(
@@ -1147,4 +1733,331 @@ fn hex_digest(bytes: &[u8]) -> String {
         value.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     value
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::too_many_lines,
+    reason = "T11.1 planning tests: every asserted subject, bound, scope, intent gate, and projection value is derived from the test inputs; nothing is canned"
+)]
+mod evidence_pack_query_plan_tests {
+    //! T11.1 `eliot.query` planning tests at the MCP dispatch seam.
+    //!
+    //! The planner maps explicit-intent `QueryInput` to the store catalogue's
+    //! closed `subject`/`max_records` selectors without ever forwarding free
+    //! text. Every asserted subject, bound, scope, intent gate, and projection
+    //! shape is derived from the test inputs; nothing is canned.
+
+    use super::*;
+    use crate::{QueryInput, QueryIntent};
+
+    fn verification_intent(mode: QueryMode) -> QueryIntent {
+        QueryIntent {
+            mode,
+            time_scope: "evidence window for verification".to_owned(),
+            branch_environment_scope: "test branch and environment".to_owned(),
+            freshness_policy: "exact captured records only".to_owned(),
+            required_assurance: "verifier evidence read".to_owned(),
+        }
+    }
+
+    fn input(mode: QueryMode, query: &str) -> QueryInput {
+        QueryInput {
+            intent: verification_intent(mode),
+            query: query.to_owned(),
+            exact_resource_uri: None,
+        }
+    }
+
+    #[test]
+    fn plans_exact_subject_with_explicit_bound_and_scope() {
+        let plan = plan_evidence_pack_query(
+            &input(QueryMode::Verification, "subject:evidence-alpha"),
+            "scope-evidence",
+            "10",
+        )
+        .expect("exact selector plans");
+        assert_eq!(plan.subject, "evidence-alpha");
+        assert_eq!(plan.max_records, "10");
+        assert_eq!(plan.scope_id, "scope-evidence");
+        assert_eq!(
+            EvidencePackQueryPlan::operation_name(),
+            "GetEvidencePack"
+        );
+    }
+
+    #[test]
+    fn verification_family_intents_plan_but_current_position_never_does() {
+        for mode in [
+            QueryMode::HistoricalReconstruction,
+            QueryMode::Provenance,
+            QueryMode::Navigation,
+            QueryMode::Verification,
+            QueryMode::ChangeImpact,
+            QueryMode::ContextReconstruction,
+        ] {
+            plan_evidence_pack_query(&input(mode, "subject:evidence-alpha"), "scope-evidence", "8")
+                .expect("verification family admits GetEvidencePack");
+        }
+        match plan_evidence_pack_query(
+            &input(QueryMode::CurrentPosition, "subject:evidence-alpha"),
+            "scope-evidence",
+            "8",
+        ) {
+            Err(BridgeError::Port(PortFailure::Unsupported { capability, .. })) => {
+                assert_eq!(capability, "GetEvidencePack");
+            }
+            other => panic!("CurrentPosition must never admit GetEvidencePack: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_free_text_resource_uri_and_bad_bounds() {
+        // Free text without the exact `subject:` form is not a selector.
+        assert!(matches!(
+            plan_evidence_pack_query(
+                &input(QueryMode::Verification, "retrieve the exact evidence"),
+                "scope-evidence",
+                "8",
+            ),
+            Err(BridgeError::InvalidArgument { field, .. }) if field == "query.query"
+        ));
+        // Exact expansion uses the resource path, not a query.
+        let mut with_uri = input(QueryMode::Verification, "subject:evidence-alpha");
+        with_uri.exact_resource_uri = Some("eliot://resource/evidence-1".to_owned());
+        assert!(matches!(
+            plan_evidence_pack_query(&with_uri, "scope-evidence", "8"),
+            Err(BridgeError::InvalidArgument { field, .. })
+                if field == "query.exact_resource_uri"
+        ));
+        // Zero, non-numeric, and blank bounds fail closed before transport.
+        for bound in ["0", "ten", "  "] {
+            assert!(
+                plan_evidence_pack_query(
+                    &input(QueryMode::Verification, "subject:evidence-alpha"),
+                    "scope-evidence",
+                    bound,
+                )
+                .is_err(),
+                "bound {bound:?} must fail closed"
+            );
+        }
+        assert!(matches!(
+            plan_evidence_pack_query(
+                &input(QueryMode::Verification, "subject:evidence-alpha"),
+                "  ",
+                "8",
+            ),
+            Err(BridgeError::InvalidArgument { field, .. }) if field == "query.scope_id"
+        ));
+    }
+
+    #[test]
+    fn projects_bounded_projection_without_current_position_claim() {
+        let plan = plan_evidence_pack_query(
+            &input(QueryMode::Verification, "subject:evidence-alpha"),
+            "scope-evidence",
+            "8",
+        )
+        .expect("exact selector plans");
+        let payload = json!({"version": 1, "records": []});
+        let projection = project_evidence_pack_projection(&plan, payload.clone());
+        assert_eq!(projection.kind, ProjectionKind::Projection);
+        assert_eq!(projection.proof_ceiling, ProofCeiling::ScopedVerification);
+        assert!(projection.proof_ceiling.is_at_most(ProofCeiling::ScopedVerification));
+        assert_eq!(projection.content["operation"], "GetEvidencePack");
+        assert_eq!(projection.content["subject"], "evidence-alpha");
+        assert_eq!(projection.content["scope_id"], "scope-evidence");
+        assert_eq!(projection.content["evidence_pack"], payload);
+        assert!(projection.artifacts.is_empty());
+        assert!(projection.resource.is_none());
+        assert!(projection.durable_job.is_none());
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::too_many_lines,
+    reason = "T11.3 planning tests: every asserted task, bound, scope, intent gate, and projection value is derived from the test inputs; nothing is canned"
+)]
+mod context_reconstruction_query_plan_tests {
+    //! T11.3 `eliot.query` planning tests at the MCP dispatch seam.
+    //!
+    //! The planner maps an explicit-intent `QueryInput` with
+    //! `ContextReconstruction` mode to the closed task/evidence/position
+    //! selectors without ever forwarding free text. Every asserted task,
+    //! bound, scope, intent gate, and projection shape is derived from the
+    //! test inputs; nothing is canned.
+
+    use super::*;
+    use crate::{QueryInput, QueryIntent};
+
+    fn reconstruction_intent(mode: QueryMode) -> QueryIntent {
+        QueryIntent {
+            mode,
+            time_scope: "task window for reconstruction".to_owned(),
+            branch_environment_scope: "test branch and environment".to_owned(),
+            freshness_policy: "exact admitted generation only".to_owned(),
+            required_assurance: "reconstruction input read".to_owned(),
+        }
+    }
+
+    fn input(mode: QueryMode, query: &str) -> QueryInput {
+        QueryInput {
+            intent: reconstruction_intent(mode),
+            query: query.to_owned(),
+            exact_resource_uri: None,
+        }
+    }
+
+    fn plan(query: &str) -> Result<ContextReconstructionQueryPlan, BridgeError> {
+        plan_context_reconstruction_query(
+            &input(QueryMode::ContextReconstruction, query),
+            "scope-task",
+            "evidence-alpha",
+            "8",
+            "position-one",
+        )
+    }
+
+    #[test]
+    fn plans_exact_task_with_explicit_selectors_and_scope() {
+        let plan = plan("task:task-7").expect("exact selector plans");
+        assert_eq!(plan.task_id, "task-7");
+        assert_eq!(plan.scope_id, "scope-task");
+        assert_eq!(plan.evidence_subject, "evidence-alpha");
+        assert_eq!(plan.evidence_max_records, "8");
+        assert_eq!(plan.position, "position-one");
+        assert_eq!(
+            ContextReconstructionQueryPlan::operation_name(),
+            "ContextReconstruction"
+        );
+        assert_eq!(
+            ContextReconstructionQueryPlan::role_operation_names(),
+            [
+                "GetTaskState",
+                "GetAttentionAndProblems",
+                "GetCurrentEpistemicPosition",
+                "GetUnderstandingProjectionInputs",
+                "GetEvidencePack",
+                "GetCapabilityEvidenceState",
+            ]
+        );
+    }
+
+    #[test]
+    fn only_context_reconstruction_intent_plans() {
+        for mode in [
+            QueryMode::CurrentPosition,
+            QueryMode::HistoricalReconstruction,
+            QueryMode::Provenance,
+            QueryMode::Navigation,
+            QueryMode::Verification,
+            QueryMode::ChangeImpact,
+        ] {
+            match plan_context_reconstruction_query(
+                &input(mode, "task:task-7"),
+                "scope-task",
+                "evidence-alpha",
+                "8",
+                "position-one",
+            ) {
+                Err(BridgeError::Port(PortFailure::Unsupported { capability, .. })) => {
+                    assert_eq!(capability, "ContextReconstruction");
+                }
+                other => panic!("non-reconstruction intent must fail closed: {other:?}"),
+            }
+        }
+        plan("task:task-7").expect("ContextReconstruction intent plans");
+    }
+
+    #[test]
+    fn rejects_free_text_resource_uri_and_bad_selectors() {
+        // Free text without the exact `task:` form is not a selector.
+        assert!(matches!(
+            plan("retrieve the task context"),
+            Err(BridgeError::InvalidArgument { field, .. }) if field == "query.query"
+        ));
+        // Exact expansion uses the resource path, not a query.
+        let mut with_uri = input(QueryMode::ContextReconstruction, "task:task-7");
+        with_uri.exact_resource_uri = Some("eliot://resource/task-7".to_owned());
+        assert!(matches!(
+            plan_context_reconstruction_query(
+                &with_uri,
+                "scope-task",
+                "evidence-alpha",
+                "8",
+                "position-one",
+            ),
+            Err(BridgeError::InvalidArgument { field, .. })
+                if field == "query.exact_resource_uri"
+        ));
+        // Zero, non-numeric, and blank evidence bounds fail closed.
+        for bound in ["0", "ten", "  "] {
+            assert!(
+                plan_context_reconstruction_query(
+                    &input(QueryMode::ContextReconstruction, "task:task-7"),
+                    "scope-task",
+                    "evidence-alpha",
+                    bound,
+                    "position-one",
+                )
+                .is_err(),
+                "bound {bound:?} must fail closed"
+            );
+        }
+        // Blank scope, subject, and position fail closed before transport.
+        assert!(matches!(
+            plan_context_reconstruction_query(
+                &input(QueryMode::ContextReconstruction, "task:task-7"),
+                "  ",
+                "evidence-alpha",
+                "8",
+                "position-one",
+            ),
+            Err(BridgeError::InvalidArgument { field, .. }) if field == "query.scope_id"
+        ));
+        assert!(matches!(
+            plan_context_reconstruction_query(
+                &input(QueryMode::ContextReconstruction, "task:task-7"),
+                "scope-task",
+                "  ",
+                "8",
+                "position-one",
+            ),
+            Err(BridgeError::InvalidArgument { field, .. })
+                if field == "query.evidence_subject"
+        ));
+        assert!(matches!(
+            plan_context_reconstruction_query(
+                &input(QueryMode::ContextReconstruction, "task:task-7"),
+                "scope-task",
+                "evidence-alpha",
+                "8",
+                "  ",
+            ),
+            Err(BridgeError::InvalidArgument { field, .. }) if field == "query.position"
+        ));
+    }
+
+    #[test]
+    fn projects_bounded_projection_without_current_position_claim() {
+        let plan = plan("task:task-7").expect("exact selector plans");
+        let payload = json!({"roles": [], "state_fence": "fence-1"});
+        let projection = project_context_reconstruction_projection(&plan, payload.clone());
+        assert_eq!(projection.kind, ProjectionKind::Projection);
+        assert_eq!(projection.proof_ceiling, ProofCeiling::ScopedVerification);
+        assert!(projection.proof_ceiling.is_at_most(ProofCeiling::ScopedVerification));
+        assert_eq!(projection.content["operation"], "ContextReconstruction");
+        assert_eq!(projection.content["task_id"], "task-7");
+        assert_eq!(projection.content["scope_id"], "scope-task");
+        assert_eq!(projection.content["context_reconstruction"], payload);
+        assert!(projection.artifacts.is_empty());
+        assert!(projection.resource.is_none());
+        assert!(projection.durable_job.is_none());
+    }
 }

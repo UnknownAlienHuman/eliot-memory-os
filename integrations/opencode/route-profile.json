@@ -160,5 +160,34 @@
     "https://opencode.ai/docs/server/",
     "https://opencode.ai/docs/config/",
     "https://opencode.ai/docs/mcp-servers/"
-  ]
+  ],
+  "disposition": {
+    "disposition": "unavailable-target",
+    "route_id": "opencode.server.http-sse",
+    "bundle_generation": "1217-A.1",
+    "admittable": false,
+    "admitted": false,
+    "proof_ceiling": "The public OpenAPI/SSE surface can host one bounded candidate attempt; OpenCode internal storage and plugin callbacks are not ELIOT task or recovery truth.",
+    "expiry_condition": "No expiry; static unavailable-target. Admission requires the server-side /v1/host-events durable admission endpoint, User Broker credential materialization, and live HTTP/SSE probes. The one-shot process bridge remains a compatibility fallback only when the HTTP bridge is entirely unconfigured and never crosses transport after an HTTP attempt.",
+    "per_attempt_receipt": true,
+    "required_probes": [
+      "pin executable and OpenAPI digest for the exact installed runtime",
+      "prove health, provider/model discovery, session create, prompt, SSE terminal event, fork, and abort",
+      "prove plugin mutating gates fail closed only for attached mutating tasks",
+      "prove exact tool identity and canonical argument values bind the versioned effect digest",
+      "prove exact read-only tools emit deterministic skipped receipts through the host-event bridge",
+      "prove aliases, unknown tools, unsupported values, sparse values, and oversize values fail closed before dispatch",
+      "prove the plugin prefers authenticated literal-loopback HTTP and preserves one event identity across a bounded transient retry",
+      "prove an attempted HTTP delivery never crosses transport into the legacy process fallback",
+      "prove passive plugin events use bounded serialized dispatch and cannot exhaust child processes",
+      "prove no environment outside the explicit allowlist reaches the compatibility process bridge",
+      "prove child-session closure and cancellation before parent attempt disposition"
+    ],
+    "non_admittable_reasons": [
+      "implementation_support=PARTIAL is non-admittable",
+      "evidence_execution_status=NOT_EXECUTED is non-admittable",
+      "execution_routes[0].status=target is non-admittable",
+      "event_contract.coverage_status=documented_not_observed is non-admittable"
+    ]
+  }
 }

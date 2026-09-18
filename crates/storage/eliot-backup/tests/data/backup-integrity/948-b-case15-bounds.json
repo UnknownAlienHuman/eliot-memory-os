@@ -1,0 +1,1 @@
+{"classified_errors":["LimitExceeded","IntegrityMismatch","Serialization"],"max_record_bytes":33554432,"max_sealed_blob_bytes":536870912,"note":"Worker B fixture: aggregate and per-member bounds. One byte over, overflow-shaped growth, truncation, and declared-size mismatch all reject before unbounded parsing or allocation."}

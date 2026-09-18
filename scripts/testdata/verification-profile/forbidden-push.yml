@@ -1,0 +1,15 @@
+name: Fixture forbidden triggers (must be rejected)
+# WORK_UNIT_CASE: 750/3 negative fixture. Automatic triggers are forbidden
+# by repository policy; only workflow_dispatch is allowed.
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - run: echo "must never validate"

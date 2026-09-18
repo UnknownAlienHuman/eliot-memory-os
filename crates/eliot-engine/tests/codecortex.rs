@@ -110,7 +110,7 @@ fn codecortex_health_reports_unavailable_adapters_honestly() -> TestResult {
 
     assert!(adapter_status(
         &report,
-        "codebase_memory_adapter",
+        "unavailable_evidence_adapter",
         "unavailable"
     ));
     assert!(adapter_status(&report, "domain_api_adapter", "disabled"));

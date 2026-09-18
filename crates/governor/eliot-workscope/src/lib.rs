@@ -922,9 +922,21 @@ impl WorkScopeBindingOwner {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)] // test-only panic-acceptable (#838).
     use super::*;
-    use eliot_contracts::{AuthorityEpoch, ResourceGeneration};
+    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
     use serde::de::DeserializeOwned;
+    use std::num::NonZeroU64;
+
+    const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn test_epoch(lineage: &str, sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(lineage).expect("valid test lineage"),
+            NonZeroU64::new(sequence).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
 
     fn source(privacy_class: PrivacyClass) -> SourceAssurance {
         from_json(serde_json::json!({
@@ -944,7 +956,7 @@ mod tests {
             "required_verifier": null,
             "quarantine": "NONE",
             "state_fence": {
-                "authority_epoch": 1,
+                "authority_epoch": {"lineage_id": TEST_LINEAGE_A, "sequence": 1},
                 "resource_generation": 1,
                 "task_revision": null,
                 "policy_revision": null,
@@ -1004,7 +1016,7 @@ mod tests {
             },
         );
         (
-            StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis()),
+            StateFence::new(test_epoch(TEST_LINEAGE_A, 1), ResourceGeneration::genesis()),
             binding,
             receipt,
         )
@@ -1220,7 +1232,7 @@ mod tests {
             Err(error) => panic!("binding owner fixture is invalid: {error}"),
         };
         let stale_fence = StateFence::new(
-            AuthorityEpoch::genesis(),
+            test_epoch(TEST_LINEAGE_A, 1),
             ResourceGeneration::new(2).unwrap_or(ResourceGeneration::genesis()),
         );
         assert_eq!(

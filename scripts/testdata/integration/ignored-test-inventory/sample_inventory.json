@@ -1,0 +1,45 @@
+{
+  "header": {
+    "aggregate_sha256": "9b0084a62aa1fdd2733a23a1f0e451474791881465a47eabaca1cf375c1ac0b5",
+    "cargo_lock_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "compiled_count": 1,
+    "complete": true,
+    "counts_by_state": {
+      "CLASSIFIED": 1
+    },
+    "duration_observation_ms": 12,
+    "proof_ceiling": "IGNORED_TEST_IDENTITY_AND_ENVIRONMENT_CLASSIFICATION_ONLY",
+    "row_count": 1,
+    "schema": "eliot.integration.ignored-test-inventory.v1",
+    "source_count": 1,
+    "source_identity": {
+      "head": "666da5cbc905c95ab9ac5e932dc3178f8ee3762a",
+      "tracked_tree_clean": true
+    },
+    "tool_version": "0.1.0"
+  },
+  "rows": [
+    {
+      "attribute_digest": "0db9d47e375012b1a631bf03f889249ad280c4aa43ffbf850d047f13b17b9653",
+      "attribute_text": "#[test]\n#[ignore = \"requires local authenticated SurrealDB store\"]",
+      "cfg_evidence": [],
+      "executable": "target/debug/deps/sample_package-1111111111111111",
+      "executable_digest": "6e36a4016c37f17b270745694e01bfcb98bbda0311193691b7f8bfcb28c16fc9",
+      "ignore_reason": "requires local authenticated SurrealDB store",
+      "package_id": "sample-package 0.1.0 (path+file:///crates/sample-package)",
+      "package_name": "sample-package",
+      "remediation_owner": "declared-environment-owner",
+      "requirements": [
+        "STORE"
+      ],
+      "row_digest": "4dfe26e746e03f8eca824e222ae9d5be1e48671d1e80ee3242e130fe5b717153",
+      "source_digest": "a2a16df9e279919e44132dd9243bd94ccae4c3cac46169acd11adc9e44aad0e8",
+      "source_line": 5,
+      "source_path": "crates/sample-package/src/lib.rs",
+      "state": "CLASSIFIED",
+      "target_kind": "lib",
+      "target_name": "sample_package",
+      "test_name": "test_sync_ignored"
+    }
+  ]
+}

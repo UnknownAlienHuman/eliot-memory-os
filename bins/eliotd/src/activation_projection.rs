@@ -10,7 +10,7 @@
 //! - **I1.11 Startup algorithm** — resolution is available only after Governor/Kernel admission; no startup authority issuance here.
 //! - **I2.2 When a capability becomes a separate crate** — pure contract/test seam justifies isolated module; no placeholder proliferation.
 //! - **I2.23 Capability-family topology and crate extraction decisions** — Governor task/authority/canonical-transition family; validated via `CrateExtractionDecision`.
-//! - **Semantic-grant handle: `eliot_governor::GovernorActivationSnapshot` / `eliot_protocol::AgentActivationResolutionTicket` -> `eliot_protocol::AgentActivationResolutionDecision` via `GovernorComposition::read_unique_agent_activation`** — Kernel-issued ticket resolved against the current Governor owner set.
+//! - **Semantic-grant handle: `eliot_governor::GovernorActivationOutcome` / `eliot_protocol::AgentActivationResolutionTicket` -> `eliot_protocol::AgentActivationResolutionDecision` via `GovernorComposition::resolve_activation_outcome`** — Kernel-issued ticket resolved against the current Governor owner set.
 //! - **Wave 2 Governor-internal outcome -> protocol v2**: `eliot_governor::GovernorActivationOutcome` -> `eliot_protocol::AgentActivationResolutionResult` is a lossless, exhaustive mapping; no resolver error is coerced to success or dropped.
 //!
 //! This is a read-only activation resolution projection and owns no authority issuance, write/effect, fence, default, retry, Kernel, Store, or lifecycle semantics.
@@ -34,48 +34,37 @@ use crate::DaemonError;
 /// accept caller-selected semantic IDs and does not issue transport sessions,
 /// fences, capabilities, or effects.
 pub trait AgentActivationResolver {
-    /// Resolves one exact ticket against the current Governor owner set.
+    /// v1 compatibility projection: resolves one exact ticket to the legacy
+    /// `AgentActivationResolutionDecision` shape.
+    ///
+    /// v1-compat only. This method must not consume v2 typed-result data
+    /// (`AgentActivationResolutionResult` / `AgentActivationResolutionDisposition`);
+    /// v2 (`resolve_agent_activation_v2`) is the single production resolver
+    /// spine. Callers on the typed-outcome path must call v2.
+    ///
+    /// Removal is owned separately by the #839 follow-up (Slice 2 migrates the
+    /// daemon runtime call site to v2) with final v1 retirement tracked by #66;
+    /// this method is not removed as opportunistic cleanup.
     fn resolve_agent_activation(
         &self,
         ticket: &AgentActivationResolutionTicket,
         now: u64,
     ) -> Result<AgentActivationResolutionDecision, DaemonError>;
 
-    /// Resolves one exact ticket to the canonical v2 typed result. This is the
-    /// lossless projection for wave 2; every `GovernorActivationOutcome`
-    /// variant maps to exactly one `AgentActivationResolutionDisposition`
-    /// without silent coercion.
+    /// Canonical v2 production spine: resolves one exact ticket to the typed
+    /// v2 result. This is the lossless projection for wave 2; every
+    /// `GovernorActivationOutcome` variant maps to exactly one
+    /// `AgentActivationResolutionDisposition` without silent coercion.
+    ///
+    /// No default body is provided on purpose: every concrete resolver must
+    /// supply the exhaustive typed-outcome projection, so a resolver that has
+    /// not moved to the typed outcome fails closed at build time instead of
+    /// silently inheriting a synthesized `Resolved` binding.
     fn resolve_agent_activation_v2(
         &self,
         ticket: &AgentActivationResolutionTicket,
         now: u64,
-    ) -> Result<AgentActivationResolutionResult, DaemonError> {
-        // Default implementation falls back to mapping the legacy decision as
-        // Resolved. Implementations that own a typed Governor outcome should
-        // override this to provide the exhaustive variant coverage.
-        let decision = self.resolve_agent_activation(ticket, now)?;
-        // This path is only used when a concrete resolver has not yet moved to
-        // the typed Governor outcome; it synthesizes a Resolved binding from
-        // the legacy decision to preserve lossless mapping for that single path.
-        let binding = AgentActivationResolvedBinding {
-            principal_id: decision.principal_id,
-            session_id: decision.session_id,
-            task_id: decision.task_id,
-            work_unit_id: decision.work_unit_id,
-            work_scope_id: decision.work_scope_id,
-            task_revision: decision.task_revision,
-            plan_id: decision.plan_id,
-            plan_revision: decision.plan_revision,
-        };
-        AgentActivationResolutionResult::new(
-            ticket,
-            now.max(1),
-            AgentActivationResolutionDisposition::Resolved {
-                binding: Box::new(binding),
-            },
-        )
-        .map_err(|error| DaemonError::Lifecycle(error.to_string()))
-    }
+    ) -> Result<AgentActivationResolutionResult, DaemonError>;
 }
 
 pub(super) fn map_activation_snapshot(
@@ -106,13 +95,6 @@ pub(super) fn map_activation_snapshot(
 // Wave 2: lossless Governor -> protocol v2 mapping
 // ---------------------------------------------------------------------------
 
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "lossless outcome projection is exercised by projection_tests; the daemon still maps through map_activation_snapshot until #839 wires it"
-    )
-)]
 fn map_coverage(coverage: GovernorCandidateCoverage) -> AgentActivationCandidateCoverage {
     match coverage {
         GovernorCandidateCoverage::Complete => AgentActivationCandidateCoverage::Complete,
@@ -121,13 +103,6 @@ fn map_coverage(coverage: GovernorCandidateCoverage) -> AgentActivationCandidate
     }
 }
 
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "lossless outcome projection is exercised by projection_tests; the daemon still maps through map_activation_snapshot until #839 wires it"
-    )
-)]
 fn map_selection(selection: GovernorSelectionDirective) -> AgentActivationSelectionDirective {
     AgentActivationSelectionDirective {
         candidate_handles: selection.candidate_handles,
@@ -136,13 +111,6 @@ fn map_selection(selection: GovernorSelectionDirective) -> AgentActivationSelect
     }
 }
 
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "lossless outcome projection is exercised by projection_tests; the daemon still maps through map_activation_snapshot until #839 wires it"
-    )
-)]
 fn map_retry(retry: GovernorRetryDirective) -> AgentActivationRetryDirective {
     AgentActivationRetryDirective {
         dependency_ref: retry.dependency_ref,
@@ -154,18 +122,19 @@ fn map_retry(retry: GovernorRetryDirective) -> AgentActivationRetryDirective {
 /// Lossless mapping from the Governor-internal typed outcome to the wire v2
 /// protocol result. Every variant is preserved 1:1; no error is coerced to
 /// `Resolved` and no error is dropped.
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "lossless outcome projection is exercised by projection_tests; the daemon still maps through map_activation_snapshot until #839 wires it"
-    )
-)]
 pub fn map_governor_outcome_to_protocol(
     ticket: &AgentActivationResolutionTicket,
     outcome: GovernorActivationOutcome,
     resolved_at_unix_ms: u64,
 ) -> Result<AgentActivationResolutionResult, DaemonError> {
+    // #740: request/result span over the typed projection boundary. The
+    // Governor outcome stays the sole discriminator; the span only names the
+    // resulting disposition plus the available ticket/result identities.
+    let _span = tracing::info_span!(
+        "eliotd.activation_projection",
+        ticket = %crate::diagnostics::sanitize_identity(&ticket.ticket_id)
+    )
+    .entered();
     let disposition = match outcome {
         GovernorActivationOutcome::Resolved(snapshot) => {
             let binding = AgentActivationResolvedBinding {
@@ -218,19 +187,40 @@ pub fn map_governor_outcome_to_protocol(
 
     AgentActivationResolutionResult::new(ticket, resolved_at_unix_ms, disposition)
         .map_err(|error| DaemonError::Lifecycle(error.to_string()))
+        .inspect(|result| {
+            // #740: result span carries disposition + digest identities only.
+            let _ = crate::diagnostics::AdmissionRecord::of(
+                crate::diagnostics::disposition_of_resolution(&result.disposition),
+                &ticket.ticket_id,
+                &result.result_sha256,
+            )
+            .emit();
+        })
 }
 
 #[cfg(test)]
 mod projection_tests {
+    #![allow(clippy::expect_used)] // test-only panic-acceptable (#838).
     use super::*;
     use eliot_contracts::RequestId;
-    use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence};
+    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
     use eliot_governor::{
         GovernorActivationSnapshot, fixture_failed_internal, fixture_not_ready,
         fixture_scope_ambiguous, fixture_scope_selection_required, fixture_stale_fence,
         fixture_task_selection_required,
     };
     use eliot_protocol::AgentActivationResolutionTicket;
+    use std::num::NonZeroU64;
+
+    const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn test_epoch(sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(TEST_LINEAGE_A).expect("valid test lineage"),
+            NonZeroU64::new(sequence).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
 
     fn test_ticket(deadline: u64) -> AgentActivationResolutionTicket {
         let mut ticket = AgentActivationResolutionTicket {
@@ -241,10 +231,7 @@ mod projection_tests {
             activation_request_sha256: "a".repeat(64),
             peer_admission_receipt_sha256: "b".repeat(64),
             connection_id: "connection-1".to_owned(),
-            state_fence: StateFence::new(
-                AuthorityEpoch::new(1).expect("epoch"),
-                ResourceGeneration::new(1).expect("gen"),
-            ),
+            state_fence: StateFence::new(test_epoch(1), ResourceGeneration::new(1).expect("gen")),
             kernel_deadline_unix_ms: deadline,
             ticket_sha256: String::new(),
         };
@@ -254,10 +241,7 @@ mod projection_tests {
 
     fn test_snapshot() -> GovernorActivationSnapshot {
         GovernorActivationSnapshot {
-            state_fence: StateFence::new(
-                AuthorityEpoch::new(1).expect("epoch"),
-                ResourceGeneration::new(1).expect("gen"),
-            ),
+            state_fence: StateFence::new(test_epoch(1), ResourceGeneration::new(1).expect("gen")),
             principal_id: "principal-1".to_owned(),
             session_id: "session-1".to_owned(),
             task_id: eliot_contracts::TaskId::new("task-1").expect("task id"),
@@ -357,10 +341,7 @@ mod projection_tests {
     #[test]
     fn stale_fence_with_observed_fence_preserves_difference() {
         let ticket = test_ticket(100);
-        let observed = StateFence::new(
-            AuthorityEpoch::new(1).expect("epoch"),
-            ResourceGeneration::new(2).expect("gen"),
-        );
+        let observed = StateFence::new(test_epoch(1), ResourceGeneration::new(2).expect("gen"));
         let outcome = fixture_stale_fence(Some(observed.clone()));
         let result = map_governor_outcome_to_protocol(&ticket, outcome, 50).expect("mapping");
         match result.disposition {

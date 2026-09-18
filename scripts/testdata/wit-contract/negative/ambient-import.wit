@@ -1,0 +1,22 @@
+package eliot:current@0.1.0;
+
+interface probe-ambient-api {
+  record probe-input {
+    schema-revision: u32,
+  }
+
+  variant probe-error {
+    bad(probe-bad),
+  }
+
+  record probe-bad {
+    human-detail: string,
+  }
+
+  run: func(input: probe-input) -> result<probe-input, probe-error>;
+}
+
+world probe-ambient {
+  import wasi:filesystem/types@0.2.0;
+  export probe-ambient-api;
+}

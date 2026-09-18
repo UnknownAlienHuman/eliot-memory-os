@@ -1,4 +1,4 @@
-use eliot_agent_api::RouteFingerprint;
+use eliot_agent_api::{LowercaseSha256, RouteFingerprint};
 use eliot_agent_coordinator::{
     BillingClass, BillingEvidence, CapabilityObservation, CapabilityStatus,
     MODEL_CATALOGUE_SCHEMA_VERSION, ModelAvailability, ModelCatalogueEntry, ModelCatalogueSnapshot,
@@ -82,33 +82,25 @@ pub enum OpenCodeBillingMode {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OpenCodeRouteTemplate {
-    pub runtime_hash: String,
-    pub adapter_hash: String,
+    pub runtime_hash: LowercaseSha256,
+    pub adapter_hash: LowercaseSha256,
     pub auth_billing: String,
-    pub serializer_hash: String,
-    pub tool_semantics_hash: String,
+    pub serializer_hash: LowercaseSha256,
+    pub tool_semantics_hash: LowercaseSha256,
     pub reasoning_mode: String,
     pub continuation_behavior: String,
-    pub feature_flags_hash: String,
+    pub feature_flags_hash: LowercaseSha256,
 }
 
 impl OpenCodeRouteTemplate {
     fn validate(&self) -> Result<(), OpenCodeCatalogueError> {
         for (value, field) in [
-            (self.runtime_hash.as_str(), "route.runtime_hash"),
-            (self.adapter_hash.as_str(), "route.adapter_hash"),
             (self.auth_billing.as_str(), "route.auth_billing"),
-            (self.serializer_hash.as_str(), "route.serializer_hash"),
-            (
-                self.tool_semantics_hash.as_str(),
-                "route.tool_semantics_hash",
-            ),
             (self.reasoning_mode.as_str(), "route.reasoning_mode"),
             (
                 self.continuation_behavior.as_str(),
                 "route.continuation_behavior",
             ),
-            (self.feature_flags_hash.as_str(), "route.feature_flags_hash"),
         ] {
             text(value, field)?;
         }
@@ -707,17 +699,24 @@ mod tests {
         }
     }
 
+    fn template_digest(seed: &str) -> LowercaseSha256 {
+        serde_json::from_value(serde_json::json!(eliot_contracts::sha256_hex(
+            format!("opencode-catalogue-{seed}").as_bytes()
+        )))
+        .expect("valid fixture digest")
+    }
+
     fn policy(mode: OpenCodeBillingMode) -> OpenCodeProviderRoutePolicy {
         OpenCodeProviderRoutePolicy {
             route: OpenCodeRouteTemplate {
-                runtime_hash: "runtime-hash".to_owned(),
-                adapter_hash: "adapter-hash".to_owned(),
+                runtime_hash: template_digest("runtime"),
+                adapter_hash: template_digest("adapter"),
                 auth_billing: "interactive-user".to_owned(),
-                serializer_hash: "serializer-hash".to_owned(),
-                tool_semantics_hash: "tool-semantics-hash".to_owned(),
+                serializer_hash: template_digest("serializer"),
+                tool_semantics_hash: template_digest("tools"),
                 reasoning_mode: "catalogue-default".to_owned(),
                 continuation_behavior: "native-resume".to_owned(),
-                feature_flags_hash: "feature-flags-hash".to_owned(),
+                feature_flags_hash: template_digest("features"),
             },
             route_admission: RouteAdmissionStatus::Admitted,
             route_health: RouteHealthStatus::Healthy,

@@ -16,15 +16,18 @@ use eliot_contracts::{
     canonical_json_bytes, contract_identity as foundation_contract_identity,
 };
 use eliot_store_api::{
-    CanonicalStoreClient, EffectClass, EventProjectionRelationIntents, NamedMutationOperation,
-    NamedMutationRequest, OperationIdentity, OperationManifestDigest, OrderingHead,
-    OrderingHeadExpectation, PreparedTransition, ReadConsistency, RevisionHead,
-    RevisionHeadExpectation, ScopeId, ScopeRevisionView, SecurityContext, StoreError, StoreHealth,
-    TransitionClass, WriteReceipt,
+    CanonicalRequestView, CanonicalStoreClient, EffectClass, EventProjectionRelationIntents,
+    NamedMutationOperation, NamedMutationRequest, OperationIdentity, OperationManifestDigest,
+    OrderingHead, OrderingHeadExpectation, PreparedTransition, ReadConsistency, RevisionHead,
+    RevisionHeadExpectation, ScopeId, ScopeRevisionView, SecurityContext, StoreConflictObservation,
+    StoreError, StoreFailure, StoreFailureDisposition, StoreHealth, StoreMutationDisposition,
+    StoreRecoveryAction, StoreRetryDirective, TransitionClass, WriteReceipt,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+pub mod epistemic_revision;
 
 /// Stable identity of this Governor contract surface.
 pub const CONTRACT_NAME: &str = "eliot.governor.canonical";
@@ -100,6 +103,229 @@ impl From<StoreError> for CanonicalError {
     fn from(error: StoreError) -> Self {
         Self::Store(error)
     }
+}
+
+impl CanonicalError {
+    /// Projects the store boundary failure behind this error into bounded
+    /// recovery semantics. Returns `None` for non-store errors. The projection
+    /// is read-only input for Governor task/Problem/admission derivation; it
+    /// never decides those consequences itself.
+    pub fn store_recovery_projection(&self) -> Option<StoreRecoveryProjection<'static>> {
+        match self {
+            Self::Store(error) => Some(StoreRecoveryProjection::for_store_error(error)),
+            _ => None,
+        }
+    }
+}
+
+/// Bounded Governor-side projection of a store failure's recovery semantics.
+///
+/// The projection carries only stable machine fields — disposition, reason
+/// token, mutation state, retry directive, recovery action, exact operation
+/// identity, bounded evidence handle, bounded retry delay, and conflict
+/// observations — plus `human_detail` as diagnostics. It never decides task,
+/// Problem, admission, or finish consequences: Governor alone owns those and
+/// reads this projection as input data. Provider, version, and configuration
+/// detail stay behind the redacted `evidence_ref` handle; `human_detail` must
+/// never steer retry, reconciliation, task state, or recovery behavior.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoreRecoveryProjection<'a> {
+    /// Validated provider-neutral control axis.
+    pub disposition: StoreFailureDisposition,
+    /// Stable reason token: borrowed from the validated typed failure, or a
+    /// file-local literal mirroring the failure contract on the ceiling path.
+    pub reason_code: &'a str,
+    /// What is known about the mutation when the failure was reported.
+    pub mutation: StoreMutationDisposition,
+    /// The next safe retry or reconciliation operation, as data.
+    pub retry: StoreRetryDirective,
+    /// The bounded recovery action, as data. It grants no authority.
+    pub recovery: StoreRecoveryAction,
+    /// Exact operation identity. `None` on the `StoreError`-ceiling path,
+    /// which cannot carry it.
+    pub operation_id: Option<&'a OperationId>,
+    /// Bounded redacted evidence handle. Never provider prose.
+    pub evidence_ref: Option<&'a str>,
+    /// Bounded retry delay, present only for retryable dispositions.
+    pub retry_after_ms: Option<u64>,
+    /// Safe provider-neutral conflict observations, if any.
+    pub conflict: Option<&'a StoreConflictObservation>,
+    /// Diagnostic prose only. Never control input.
+    pub human_detail: Option<&'a str>,
+}
+
+impl<'a> StoreRecoveryProjection<'a> {
+    /// Projects the complete typed failure losslessly. Every machine field
+    /// crosses by reference; nothing is parsed, stringified, or re-inferred.
+    pub fn from_failure(failure: &'a StoreFailure) -> Self {
+        Self {
+            disposition: failure.disposition,
+            reason_code: failure.reason_code.as_str(),
+            mutation: failure.mutation_disposition,
+            retry: failure.retry_directive,
+            recovery: failure.recovery_action,
+            operation_id: failure.operation_id.as_ref(),
+            evidence_ref: failure.evidence_ref.as_deref(),
+            retry_after_ms: failure.retry_after_ms,
+            conflict: failure.conflict.as_ref(),
+            human_detail: failure.human_detail.as_deref(),
+        }
+    }
+
+    /// Projects a `StoreError` at the current contract ceiling. Disposition,
+    /// reason token, mutation state, retry directive, and recovery action
+    /// mirror `StoreFailure::from_store_error` exactly; operation identity,
+    /// evidence, conflict, delay, and diagnostic detail are unrepresentable in
+    /// `StoreError` and stay `None`. Unknown stays unknown
+    /// (`MissingReceiptEnvelope` projects to unknown-outcome reconciliation,
+    /// never to retryable `Unavailable`); capacity collapse
+    /// (Backpressure/Deadline/Migration have no `StoreError` variants) is a
+    /// Contract Challenge remainder, not a silent retry claim.
+    pub fn for_store_error(error: &StoreError) -> StoreRecoveryProjection<'static> {
+        use StoreFailureDisposition::{Unavailable, UnknownOutcome};
+        use StoreMutationDisposition::{NotAttempted, Unknown};
+        use StoreRecoveryAction::{
+            ReconcileUnknownOutcome, RefreshRevisionHeads, RefreshStateFence, ResolveWriteReceipt,
+            RestoreStoreConnectivity,
+        };
+        use StoreRetryDirective::{ReconcileExactOperation, RetrySameIdentityAfterBackoff};
+        let (disposition, reason_code, mutation, retry, recovery) = match error {
+            StoreError::InvalidField { .. } => {
+                deterministic_rejection_parts("INVALID_FIELD", StoreRecoveryAction::None)
+            }
+            StoreError::Empty { .. } => {
+                deterministic_rejection_parts("EMPTY_FIELD", StoreRecoveryAction::None)
+            }
+            StoreError::Duplicate { .. } => {
+                deterministic_rejection_parts("DUPLICATE_IDENTITY", StoreRecoveryAction::None)
+            }
+            StoreError::Foundation(_) => deterministic_rejection_parts(
+                "FOUNDATION_CONTRACT_REJECTED",
+                StoreRecoveryAction::None,
+            ),
+            StoreError::Security(_) => deterministic_rejection_parts(
+                "SECURITY_CONTRACT_REJECTED",
+                StoreRecoveryAction::None,
+            ),
+            StoreError::Receipt(_) => deterministic_rejection_parts(
+                "RECEIPT_CONTRACT_REJECTED",
+                StoreRecoveryAction::None,
+            ),
+            StoreError::UnknownOperation => unsupported_parts("UNKNOWN_NAMED_OPERATION"),
+            StoreError::ManifestMismatch => unsupported_parts("OPERATION_MANIFEST_MISMATCH"),
+            StoreError::TransitionClassExceeded => unsupported_parts("TRANSITION_CLASS_EXCEEDED"),
+            StoreError::EffectCeilingExceeded => unsupported_parts("EFFECT_CEILING_EXCEEDED"),
+            StoreError::FenceMismatch => conflict_parts("STATE_FENCE_MISMATCH", RefreshStateFence),
+            StoreError::RevisionConflict => {
+                conflict_parts("REVISION_CONFLICT", RefreshRevisionHeads)
+            }
+            StoreError::OrderingConflict => {
+                conflict_parts("ORDERING_CONFLICT", RefreshRevisionHeads)
+            }
+            StoreError::InvalidProjection => internal_defect_parts("INVALID_PROJECTION"),
+            StoreError::InvalidOutbox => internal_defect_parts("INVALID_OUTBOX"),
+            StoreError::InvalidReceipt => internal_defect_parts("INVALID_RECEIPT"),
+            StoreError::IdentityConflict => {
+                conflict_parts("IDENTITY_CONFLICT", StoreRecoveryAction::None)
+            }
+            StoreError::TransitionDigestMismatch { .. } => {
+                conflict_parts("TRANSITION_DIGEST_MISMATCH", StoreRecoveryAction::None)
+            }
+            StoreError::ReceiptNotFound => {
+                deterministic_rejection_parts("RECEIPT_NOT_FOUND", ResolveWriteReceipt)
+            }
+            StoreError::MissingReceiptEnvelope => (
+                UnknownOutcome,
+                "RECEIPT_ENVELOPE_MISSING",
+                Unknown,
+                ReconcileExactOperation,
+                ReconcileUnknownOutcome,
+            ),
+            StoreError::PayloadTooLarge => {
+                deterministic_rejection_parts("PAYLOAD_TOO_LARGE", StoreRecoveryAction::None)
+            }
+            StoreError::Unavailable => (
+                Unavailable,
+                "STORE_UNAVAILABLE",
+                NotAttempted,
+                RetrySameIdentityAfterBackoff,
+                RestoreStoreConnectivity,
+            ),
+            StoreError::Serialization(_) => internal_defect_parts("SERIALIZATION_FAILURE"),
+        };
+        StoreRecoveryProjection {
+            disposition,
+            reason_code,
+            mutation,
+            retry,
+            recovery,
+            operation_id: None,
+            evidence_ref: None,
+            retry_after_ms: None,
+            conflict: None,
+            human_detail: None,
+        }
+    }
+}
+
+/// Shared tuple behind every `StoreError` ceiling projection.
+type StoreErrorProjectionParts = (
+    StoreFailureDisposition,
+    &'static str,
+    StoreMutationDisposition,
+    StoreRetryDirective,
+    StoreRecoveryAction,
+);
+
+/// Parts for deterministic rejections: never attempted, never retried.
+fn deterministic_rejection_parts(
+    reason_code: &'static str,
+    recovery: StoreRecoveryAction,
+) -> StoreErrorProjectionParts {
+    (
+        StoreFailureDisposition::DeterministicRejection,
+        reason_code,
+        StoreMutationDisposition::NotAttempted,
+        StoreRetryDirective::DoNotRetry,
+        recovery,
+    )
+}
+
+/// Parts for unsupported operations: never attempted, never retried.
+fn unsupported_parts(reason_code: &'static str) -> StoreErrorProjectionParts {
+    (
+        StoreFailureDisposition::Unsupported,
+        reason_code,
+        StoreMutationDisposition::NotAttempted,
+        StoreRetryDirective::DoNotRetry,
+        StoreRecoveryAction::None,
+    )
+}
+
+/// Parts for conflicts: never attempted, retried only under a new identity
+/// once the stated condition is resolved.
+fn conflict_parts(
+    reason_code: &'static str,
+    recovery: StoreRecoveryAction,
+) -> StoreErrorProjectionParts {
+    (
+        StoreFailureDisposition::Conflict,
+        reason_code,
+        StoreMutationDisposition::NotAttempted,
+        StoreRetryDirective::NewIdentityAfterCondition,
+        recovery,
+    )
+}
+
+/// Parts for internal defects: never attempted, manual recovery only.
+fn internal_defect_parts(reason_code: &'static str) -> StoreErrorProjectionParts {
+    (
+        StoreFailureDisposition::InternalDefect,
+        reason_code,
+        StoreMutationDisposition::NotAttempted,
+        StoreRetryDirective::ManualRecovery,
+        StoreRecoveryAction::EscalateInternalDefect,
+    )
 }
 
 fn text(value: &str, field: &'static str) -> Result<(), CanonicalError> {
@@ -272,12 +498,37 @@ impl CanonicalWriteEnvelope {
     /// Computes the immutable request hash used by the store's idempotency
     /// boundary.  Expected heads are included, so changing the CAS contract
     /// cannot silently reuse an earlier semantic decision.
+    ///
+    /// This routes through the shared provider-neutral
+    /// [`eliot_store_api::canonical_request_hash`] over the
+    /// envelope-equivalent [`CanonicalRequestView`] (issue #63, RECHECK-63
+    /// slice A). The view is field-identical to the envelope, so the emitted
+    /// value is byte-identical to the previous envelope hash; Kernel/store
+    /// rebuild the same view from their transported apply values.
     pub fn canonical_request_hash(&self) -> Result<String, CanonicalError> {
-        let bytes = canonical_json_bytes(self).map_err(|_| CanonicalError::InvalidField {
-            field: "canonical_request",
-            reason: "cannot serialize canonical request",
-        })?;
-        Ok(eliot_contracts::sha256_hex(&bytes))
+        eliot_store_api::canonical_request_hash(&self.canonical_request_view())
+            .map_err(CanonicalError::Store)
+    }
+
+    /// Builds the shared provider-neutral hash input for this envelope.
+    fn canonical_request_view(&self) -> CanonicalRequestView {
+        CanonicalRequestView {
+            operation_id: self.operation_id.clone(),
+            request: self.request.clone(),
+            idempotency_key: self.idempotency_key.clone(),
+            scope_id: self.scope_id.clone(),
+            task_id: self.task_id.clone(),
+            transition_class: self.transition_class,
+            requested_effect_ceiling: self.requested_effect_ceiling,
+            admission_contract_set_digest: self.admission_contract_set_digest.clone(),
+            operation_manifest_digest: self.operation_manifest_digest.clone(),
+            semantic_commands: self.semantic_commands.clone(),
+            event_projection_relation_intents: self.event_projection_relation_intents.clone(),
+            security: self.security.clone(),
+            required_proof_and_approval_refs: self.required_proof_and_approval_refs.clone(),
+            expected_revision_heads: self.expected_revision_heads.clone(),
+            expected_ordering_heads: self.expected_ordering_heads.clone(),
+        }
     }
 
     /// Converts the admitted envelope to the one shared prepared-transition
@@ -585,7 +836,7 @@ pub enum RequestedFinishOutcome {
     Superseded,
 }
 
-/// ELIOT_ARCH_OWNER: ARCH-FIN-01
+/// `ELIOT_ARCH_OWNER`: ARCH-FIN-01
 /// The closed canonical finish decision set from I7.9.
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -901,4 +1152,135 @@ pub fn contract_identity() -> Result<ContractIdentity, CanonicalError> {
         }),
     )
     .map_err(CanonicalError::Foundation)
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+    use eliot_store_api::{EventId, OrderingScopeId, RevisionKey};
+    use std::collections::BTreeMap;
+
+    fn test_fence() -> StateFence {
+        use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
+        use std::num::NonZeroU64;
+        let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .expect("canonical test lineage-A");
+        let epoch = EpochId::new(lineage, NonZeroU64::new(1).expect("non-zero")).expect("epoch");
+        StateFence::new(epoch, ResourceGeneration::genesis())
+    }
+
+    fn test_request(fence: &StateFence) -> RequestMetadata {
+        RequestMetadata {
+            request_id: eliot_contracts::RequestId::new("request-byte-identity")
+                .expect("request id"),
+            session_id: None,
+            task_id: None,
+            product_id: eliot_contracts::ProductId::new("product-byte-identity")
+                .expect("product id"),
+            source_id: eliot_contracts::SourceId::new("source-byte-identity").expect("source id"),
+            state_fence: fence.clone(),
+            clock: eliot_contracts::ClockReading::default(),
+        }
+    }
+
+    /// Pre-slice envelope hash logic, kept here as the byte-identity oracle:
+    /// canonical JSON of the envelope itself, then SHA-256 hex.
+    fn legacy_envelope_hash(envelope: &CanonicalWriteEnvelope) -> String {
+        let bytes = canonical_json_bytes(envelope).expect("legacy envelope serializes");
+        eliot_contracts::sha256_hex(&bytes)
+    }
+
+    fn minimal_envelope(fence: &StateFence) -> CanonicalWriteEnvelope {
+        CanonicalWriteEnvelope {
+            operation_id: OperationId::new("op-byte-identity-min").expect("operation id"),
+            request: test_request(fence),
+            idempotency_key: "idem-byte-identity-min".to_owned(),
+            scope_id: ScopeId::new("scope-byte-identity").expect("scope"),
+            task_id: None,
+            transition_class: TransitionClass::CaptureCandidate,
+            requested_effect_ceiling: EffectClass::Candidate,
+            admission_contract_set_digest: "c".repeat(64),
+            operation_manifest_digest: OperationManifestDigest::new("manifest-byte-identity")
+                .expect("manifest digest"),
+            semantic_commands: vec![NamedMutationRequest {
+                operation: NamedMutationOperation::CaptureObservation,
+                parameters: BTreeMap::from([(
+                    "subject".to_owned(),
+                    serde_json::json!("observation-byte-identity"),
+                )]),
+            }],
+            event_projection_relation_intents: EventProjectionRelationIntents {
+                event_ids: Vec::new(),
+                projection_kinds: Vec::new(),
+                relation_kinds: Vec::new(),
+            },
+            security: SecurityContext::default(),
+            required_proof_and_approval_refs: Vec::new(),
+            expected_revision_heads: Vec::new(),
+            expected_ordering_heads: vec![OrderingHeadExpectation {
+                scope: OrderingScopeId::new("scope-byte-identity").expect("ordering scope"),
+                expected_sequence: 1,
+                state_fence: fence.clone(),
+            }],
+        }
+    }
+
+    #[test]
+    fn shared_request_hash_is_byte_identical_to_the_envelope_hash() {
+        let fence = test_fence();
+        let minimal = minimal_envelope(&fence);
+        assert_eq!(
+            minimal
+                .canonical_request_hash()
+                .expect("shared hash computes"),
+            legacy_envelope_hash(&minimal)
+        );
+
+        // Representative envelope: task binding, sorted multi-element heads,
+        // sorted proof refs, and event/projection/relation intents. Set-like
+        // collections are already in canonical order here, so the shared
+        // normalization is the identity and byte-identity must hold exactly.
+        let mut representative = minimal_envelope(&fence);
+        representative.operation_id =
+            OperationId::new("op-byte-identity-rep").expect("operation id");
+        representative.task_id = Some("task-byte-identity".to_owned());
+        representative.event_projection_relation_intents = EventProjectionRelationIntents {
+            event_ids: vec![
+                EventId::new("event-byte-identity-1").expect("event id"),
+                EventId::new("event-byte-identity-2").expect("event id"),
+            ],
+            projection_kinds: vec!["projection-a".to_owned(), "projection-b".to_owned()],
+            relation_kinds: vec!["relation-a".to_owned()],
+        };
+        representative.required_proof_and_approval_refs =
+            vec!["approval-1".to_owned(), "proof-1".to_owned()];
+        representative.expected_revision_heads = vec![
+            RevisionHeadExpectation {
+                key: RevisionKey::new("revision-a").expect("key"),
+                expected_revision: 1,
+                state_fence: fence.clone(),
+            },
+            RevisionHeadExpectation {
+                key: RevisionKey::new("revision-b").expect("key"),
+                expected_revision: 2,
+                state_fence: fence.clone(),
+            },
+        ];
+        assert_eq!(
+            representative
+                .canonical_request_hash()
+                .expect("shared hash computes"),
+            legacy_envelope_hash(&representative)
+        );
+
+        // prepare() routes through the same shared function.
+        let transition = representative.prepare().expect("envelope prepares");
+        assert_eq!(
+            transition.identity.canonical_request_hash,
+            representative
+                .canonical_request_hash()
+                .expect("shared hash recomputes")
+        );
+    }
 }

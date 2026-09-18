@@ -1422,7 +1422,6 @@ enum CollectiveCommand {
 
 #[derive(Clone, Copy, Debug, Subcommand)]
 enum RuntimeCommand {
-    Status,
     Health,
     Report,
     Supervision {
@@ -3371,7 +3370,6 @@ async fn dispatch_runtime_command(
     implicit_instance: Option<&str>,
 ) -> Result<()> {
     match command {
-        RuntimeCommand::Status => commands::run_runtime_status(config),
         RuntimeCommand::Health => commands::run_runtime_health(config),
         RuntimeCommand::Report => commands::run_runtime_report(config),
         RuntimeCommand::Supervision {

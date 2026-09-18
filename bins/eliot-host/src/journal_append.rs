@@ -2,13 +2,13 @@ mod readiness_append;
 #[cfg(windows)]
 pub(super) use readiness_append::append_authenticated_kernel_readiness;
 
-use super::{HostError, fresh_identity, operation, record_fence, sha256_json};
+use super::{HostError, fresh_identity, fresh_lineage_id, operation, record_fence, sha256_json};
 use eliot_host_state::{
-    ActivationState, AppendReceipt, CleanMarker, EliotActivationRecord, EpochIdentity,
+    ActivationState, AppendReceipt, CleanMarker, DrainCommitRecord, EliotActivationRecord,
     EpochTransition, HostInstallationEpoch, HostKernelStoreLineage, HostState,
     HostStateJournalService, HostStateRecord, JOURNAL_VERSION, JournalBackend, JournalError,
     JournalManifest, KernelJobBinding, KernelRecord, LifecycleTimestamps, PriorKernelDisposition,
-    PriorKernelSource, ReadinessEvidence, ReconcileOutcome,
+    PriorKernelSource, ReadinessEvidence, ReconcileOutcome, WakeDisposition,
 };
 #[cfg(windows)]
 use eliot_host_state::{StoreRebindRecord, StoreRebindState};
@@ -18,6 +18,31 @@ use eliot_platform::PlatformHandle;
 use eliot_runtime_contracts::{
     HealthDimension, HealthVector, ServiceProcessRecord, ServiceProcessState,
 };
+
+// F-LOG-HOST-6 (#981) journal-append observation helpers.
+//
+// Through the #889 facade only
+// (`crate::host_diagnostics::observe_entrypoint_with_detail`); the Event Log
+// seam stays typed-Unavailable
+// (`crate::windows_event_log::event_log_sink_status`), never implemented here
+// (#984 still open).
+//
+// Observation-only contract: every helper projects facts already produced by
+// the semantic owner. Arguments are static literals only — never records,
+// receipts, digests, or arbitrary error text — so bounding limits size, not
+// sensitivity (I15.4). Requested append, durable observed append, and
+// unknown outcome stay distinct (I14.21): possible loss is never promoted
+// into a receipt. These primitives own no terminal: a single terminal per
+// failed journal operation is enforced by the outermost owner boundary in
+// `lib.rs` (#891) or Host composition (#893), while these phases correlate
+// by stage order only. Sink outcome never alters result/order/cleanup.
+fn host_journal_observe(detail: &str) {
+    let _ = crate::windows_event_log::event_log_sink_status();
+    crate::host_diagnostics::observe_entrypoint_with_detail(
+        crate::host_diagnostics::EntrypointStage::Startup,
+        detail,
+    );
+}
 
 /// Checks every identity that the authoritative Job termination observation
 /// can be compared against in the durable Kernel binding.
@@ -129,18 +154,9 @@ pub(super) fn initial_activation_record(
         drain_generation,
         lineage: HostKernelStoreLineage {
             host_epoch: host.epoch.current.clone(),
-            kernel_epoch: EpochIdentity {
-                lineage: fresh_identity("kernel-lineage")?,
-                sequence: 1,
-            },
-            watchdog_epoch: EpochIdentity {
-                lineage: fresh_identity("watchdog-lineage")?,
-                sequence: 1,
-            },
-            store_generation: EpochIdentity {
-                lineage: fresh_identity("store-lineage")?,
-                sequence: 1,
-            },
+            kernel_epoch: EpochTransition::genesis(fresh_lineage_id()?).current,
+            watchdog_epoch: EpochTransition::genesis(fresh_lineage_id()?).current,
+            store_generation: EpochTransition::genesis(fresh_lineage_id()?).current,
         },
         readiness: ReadinessEvidence {
             supervision_ready: ready,
@@ -213,23 +229,61 @@ pub(super) fn transition_activation_record(
     Ok(next)
 }
 
+/// Single reconcile-decision choke for every `ProductionHostStateJournal` write.
+///
+/// Both generic `HostStateRecord` appends and readiness-observation appends
+/// funnel their `OutcomeUnknown` reconciliation through this helper so the
+/// retry/fail-closed policy has exactly one owner. The underlying journal
+/// admission stays distinct (`append` rejects readiness observations by
+/// design; `append_readiness_observation` enforces the approved contour), but
+/// the durable-outcome handling does not fork. Each caller performs its own
+/// retry append so its by-value record stays consumed (moved) into the retry
+/// instead of only cloned inside a closure.
+fn reconcile_unknown_outcome<B: JournalBackend>(
+    journal: &HostStateJournalService<B>,
+    transaction_id: &PlatformHandle,
+) -> Result<bool, HostError> {
+    match journal.reconcile(transaction_id)? {
+        ReconcileOutcome::Committed => {
+            host_journal_observe("host.journal reconcile committed observed");
+            Ok(true)
+        }
+        ReconcileOutcome::NotCommitted | ReconcileOutcome::StillUnknown => {
+            host_journal_observe("host.journal reconcile unknown observed");
+            Err(HostError::Journal(JournalError::OutcomeUnknown {
+                transaction_id: transaction_id.clone(),
+            }))
+        }
+    }
+}
+
 pub(super) fn append_reconciled<B: JournalBackend>(
     journal: &HostStateJournalService<B>,
     record: HostStateRecord,
 ) -> Result<AppendReceipt, HostError> {
+    host_journal_observe("host.journal append requested");
     match journal.append(record.clone()) {
-        Ok(receipt) => Ok(receipt),
+        Ok(receipt) => {
+            host_journal_observe("host.journal append durable observed");
+            Ok(receipt)
+        }
         Err(JournalError::OutcomeUnknown { transaction_id }) => {
-            match journal.reconcile(&transaction_id)? {
-                ReconcileOutcome::Committed => journal.append(record).map_err(HostError::Journal),
-                ReconcileOutcome::NotCommitted | ReconcileOutcome::StillUnknown => {
-                    Err(HostError::Journal(JournalError::OutcomeUnknown {
-                        transaction_id,
-                    }))
-                }
+            host_journal_observe("host.journal append outcome unknown observed");
+            if reconcile_unknown_outcome(journal, &transaction_id)? {
+                journal.append(record).map_err(HostError::Journal)
+            } else {
+                // Unreachable today: the choke fails closed instead of returning
+                // `Ok(false)`. Retained fail-closed so semantics stay identical
+                // if the policy ever evolves.
+                Err(HostError::Journal(JournalError::OutcomeUnknown {
+                    transaction_id,
+                }))
             }
         }
-        Err(error) => Err(HostError::Journal(error)),
+        Err(error) => {
+            host_journal_observe("host.journal append rejected observed");
+            Err(HostError::Journal(error))
+        }
     }
 }
 
@@ -240,7 +294,9 @@ pub(super) fn append_store_rebind_terminal<B: JournalBackend>(
     state: StoreRebindState,
     receipt: Option<&StoreRebindReceipt>,
 ) -> Result<(), HostError> {
+    host_journal_observe("host.journal rebind terminal requested");
     if record.state == state && state == StoreRebindState::Unknown {
+        host_journal_observe("host.journal rebind unknown noop observed");
         return Ok(());
     }
     match state {
@@ -261,7 +317,7 @@ pub(super) fn append_store_rebind_terminal<B: JournalBackend>(
                 || receipt.process_binding.process.image_path != record.process_image_path.as_str()
                 || receipt.process_binding.job != record.job_name
                 || receipt.generation.value() != record.generation
-                || receipt.authority_epoch.value() != record.authority_epoch
+                || receipt.authority_epoch.sequence.get() != record.authority_epoch
             {
                 return Err(HostError::RecoveryRequired(
                     "Store rebind startup receipt did not match exact journal identity".to_owned(),
@@ -301,6 +357,7 @@ pub(super) fn append_store_rebind_terminal<B: JournalBackend>(
         }
     ))?;
     append_reconciled(journal, HostStateRecord::StoreRebind(record))?;
+    host_journal_observe("host.journal rebind terminal appended");
     Ok(())
 }
 
@@ -311,6 +368,7 @@ pub(super) fn persist_store_rebind_disposition<B: JournalBackend>(
     request_digest: &str,
     disposition: StoreRebindState,
 ) -> Result<(), HostError> {
+    host_journal_observe("host.journal rebind disposition requested");
     if !matches!(
         disposition,
         StoreRebindState::Aborted | StoreRebindState::Unknown
@@ -337,6 +395,7 @@ pub(super) fn persist_store_rebind_disposition<B: JournalBackend>(
             )
         })?;
     if record.state == StoreRebindState::Unknown && disposition == StoreRebindState::Unknown {
+        host_journal_observe("host.journal rebind unknown noop observed");
         return Ok(());
     }
     let mut terminal = record;
@@ -353,7 +412,70 @@ pub(super) fn persist_store_rebind_disposition<B: JournalBackend>(
     terminal.receipt_request_digest = None;
     terminal.receipt_store_fence = None;
     append_reconciled(journal, HostStateRecord::StoreRebind(terminal))?;
+    host_journal_observe("host.journal rebind disposition appended");
     Ok(())
+}
+
+/// Builds the I1.5 `DrainCommit` linearization record for Host stop,
+/// carrying the Kernel lease/receipt snapshot observed in the journal into
+/// `lease_and_pending_operation_snapshot`.
+///
+/// The snapshot is the exact live authority Host must fence before stopping:
+/// the activation's runtime and supervision lease refs, the latest readiness
+/// observation's predecessor lease identity and ORS receipt, and every
+/// non-terminal store-rebind operation. An empty snapshot is honest only
+/// when the journal proves no lease or pending operation remains; callers
+/// must not substitute a placeholder. The `drain_generation` correlation
+/// binds this commit to the `Requested`/`Draining` records that precede it.
+pub(super) fn drain_commit_record_for_stop(
+    snapshot: &HostState,
+    activation: &EliotActivationRecord,
+    drain_generation: &EpochTransition,
+) -> Result<DrainCommitRecord, HostError> {
+    let mut lease_and_pending: Vec<PlatformHandle> = Vec::new();
+    lease_and_pending.extend(activation.runtime_lease_refs.iter().cloned());
+    lease_and_pending.extend(activation.supervision_lease_refs.iter().cloned());
+    if let Some(readiness) = snapshot.readiness_observations.last()
+        && let Some(predecessor) = readiness.active_supervision_lease.as_ref()
+    {
+        lease_and_pending.push(
+            PlatformHandle::new(predecessor.supervision_lease_id.clone())
+                .map_err(|error| HostError::Platform(error.to_string()))?,
+        );
+        lease_and_pending.push(
+            PlatformHandle::new(predecessor.ors_receipt_sha256.clone())
+                .map_err(|error| HostError::Platform(error.to_string()))?,
+        );
+    }
+    for rebind in snapshot.store_rebinds.iter().filter(|record| {
+        matches!(
+            record.state,
+            eliot_host_state::StoreRebindState::Pending
+                | eliot_host_state::StoreRebindState::Unknown
+        )
+    }) {
+        lease_and_pending.push(rebind.operation_id.clone());
+    }
+    Ok(DrainCommitRecord {
+        fence: activation.fence.clone(),
+        operation: operation("host-drain-commit")?,
+        drain_generation: drain_generation.clone(),
+        last_admission_closed_at: fresh_identity("host-admission-closed-at")?,
+        lease_and_pending_operation_snapshot: lease_and_pending,
+        authority_epochs_fenced: vec![activation.lineage.kernel_epoch.clone()],
+        processes_modules_and_store_branches_to_stop: vec![
+            PlatformHandle::new("canonical-store-branch")
+                .map_err(|error| HostError::Platform(error.to_string()))?,
+            PlatformHandle::new("kernel-branch")
+                .map_err(|error| HostError::Platform(error.to_string()))?,
+        ],
+        wake_during_drain_disposition: WakeDisposition::QueueNextGeneration,
+        irreversible_stage: PlatformHandle::new("authority-fenced")
+            .map_err(|error| HostError::Platform(error.to_string()))?,
+        recovery_owner: PlatformHandle::new("host-composition")
+            .map_err(|error| HostError::Platform(error.to_string()))?,
+        committed_at: fresh_identity("host-drain-committed-at")?,
+    })
 }
 
 pub(super) fn clean_marker_record(
@@ -387,6 +509,7 @@ pub(super) fn append_clean_marker<B: JournalBackend>(
     activation_id: &PlatformHandle,
     activation_generation: &EpochTransition,
 ) -> Result<(), HostError> {
+    host_journal_observe("host.journal clean marker requested");
     let snapshot = journal.snapshot()?;
     append_reconciled(
         journal,

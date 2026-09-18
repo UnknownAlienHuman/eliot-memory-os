@@ -1,0 +1,151 @@
+package eliot:current@0.1.0;
+
+// ELIOT typed current ABI — cue-activation world.
+// Package: eliot:current@0.1.0. World: cue-activation. Interface: activation.
+// Native owner: #804/#600 (eliot-cue-contracts, eliot-cue-activation).
+// Consumer: #640. Supports exact-first direct matching and forward-only bounded
+// spreading. Direct has no path; derived always has a contiguous path from a direct seed.
+
+interface activation {
+  type artifact-id = string;
+  type digest-hex = string;
+
+  enum completeness {
+    complete,
+    truncated,
+    source-unavailable,
+    stale,
+    no-direct-match,
+  }
+
+  enum bound-kind {
+    depth,
+    fanout,
+    results,
+    nodes,
+    edges,
+    work,
+    path-len,
+    seeds,
+    direct,
+    derived,
+    trace-steps,
+    output-bytes,
+  }
+
+  record activation-bounds {
+    max-depth: u8,
+    max-fanout: u16,
+    max-results: u16,
+    max-nodes: u32,
+    max-edges: u32,
+    max-work: u64,
+    max-path-len: u16,
+    max-seeds: u16,
+    max-direct: u16,
+    max-derived: u16,
+    max-trace-steps: u16,
+    max-output-bytes: u32,
+    activation-threshold: u16,
+  }
+
+  record seed-cue {
+    cue-id: artifact-id,
+    comparison-key: string,
+    normalization-profile: string,
+  }
+
+  record relation-edge {
+    edge-id: artifact-id,
+    from-handle: string,
+    to-handle: string,
+    weight-milli: u32,
+  }
+
+  record direct-activation {
+    target: string,
+    strength: u16,
+    seed: artifact-id,
+  }
+
+  record derived-activation {
+    target: string,
+    strength: u16,
+    path: list<artifact-id>,
+    seed: artifact-id,
+  }
+
+  record trace-step {
+    node: string,
+    depth: u8,
+    strength: u16,
+  }
+
+  record activation-trace {
+    steps: list<trace-step>,
+    inspected-nodes: u32,
+    inspected-edges: u32,
+  }
+
+  record activation-result-body {
+    request-id: artifact-id,
+    snapshot-id: artifact-id,
+    direct: list<direct-activation>,
+    derived: list<derived-activation>,
+    trace: activation-trace,
+    completeness: completeness,
+    frontier: list<artifact-id>,
+    output-bytes: u32,
+    proof-ceiling: string,
+    result-digest: digest-hex,
+  }
+
+  record activation-request {
+    schema-revision: u32,
+    request-id: artifact-id,
+    seeds: list<seed-cue>,
+    snapshot-id: artifact-id,
+    relation-edges: list<relation-edge>,
+    bounds: activation-bounds,
+    fence-epoch: string,
+    fence-generation: u64,
+    normalization-profile: string,
+    observed-at-ms: s64,
+    deadline-ms: option<s64>,
+    cancelled: bool,
+  }
+
+  variant activation-outcome {
+    activated(activation-result-body),
+  }
+
+  record abi-descriptor {
+    world-name: string,
+    package-id: string,
+    abi-revision: u32,
+    native-contract: string,
+    native-revision: string,
+    abi-digest: string,
+  }
+
+  variant activation-error {
+    malformed(activation-malformed),
+    bound-exceeded(activation-bound),
+    stale-snapshot(activation-stale),
+    unsupported-schema(activation-schema),
+    internal(activation-internal),
+  }
+
+  record activation-malformed { field: string, human-detail: string }
+  record activation-bound { bound: bound-kind, human-detail: string }
+  record activation-stale { human-detail: string }
+  record activation-schema { want-revision: u32, got-revision: u32, human-detail: string }
+  record activation-internal { human-detail: string }
+
+  activate: func(request: activation-request) -> result<activation-outcome, activation-error>;
+  describe: func() -> abi-descriptor;
+}
+
+world cue-activation {
+  export activation;
+}

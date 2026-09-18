@@ -10,9 +10,7 @@
 #[cfg(test)]
 use std::ffi::OsString;
 use std::future::Future;
-#[cfg(test)]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 #[cfg(test)]
 use std::sync::Arc;
@@ -45,7 +43,6 @@ use eliot_runtime_contracts::{VerifiedSupervisionLease, WatchdogAdmissionTemplat
 use eliot_watchdog_core::{Epoch, Watchdog};
 use thiserror::Error;
 
-#[cfg(test)]
 use redb::Database;
 
 #[cfg(test)]
@@ -59,6 +56,7 @@ const LEASE_FILE_LIMIT: u64 = 1024 * 1024;
 const KERNEL_ORS_FILE_NAME: &str = "kernel-ors.redb";
 const HOST_JOURNAL_FILE_NAME: &str = "host-state-journal.redb";
 
+mod diagnostics;
 mod host_identity_observation;
 mod runtime_manifest_selection;
 mod scm_launch;
@@ -71,6 +69,9 @@ mod watchdog_config;
 mod watchdog_publication_readback;
 mod watchdog_spool;
 
+pub use diagnostics::install_subscriber;
+
+pub use eliot_watchdog_core::{WatchdogSpoolAcknowledgement, WatchdogSpoolExportBatch};
 #[cfg(test)]
 use host_identity_observation::classify_host_error;
 use host_identity_observation::read_host_registration_runtime;
@@ -82,8 +83,15 @@ use watchdog_publication_readback::{
     observe_watchdog_publication, read_manifest_selected_ors_current, scan_watchdog_publications,
     verify_against_durable_current,
 };
-pub(crate) use watchdog_spool::{SpoolAppendOutcome, WatchdogSpool};
-pub use watchdog_spool::{WatchdogSpoolEntry, WatchdogSpoolPayload};
+pub(crate) use watchdog_spool::{
+    SPOOL_EXPORT_CURSOR_SCHEMA_VERSION, WatchdogSpool, watchdog_spool_path,
+};
+pub use watchdog_spool::{
+    SpoolAppendOutcome, WatchdogSpoolEntry, WatchdogSpoolExportLimits, WatchdogSpoolPayload,
+};
+pub use watchdog_spool::export_driver::{
+    WatchdogEntryView, WatchdogExportSink, export_once, watchog_entry_views, watchdog_entry_views,
+};
 
 #[cfg(test)]
 impl WatchdogSpool {
@@ -102,7 +110,7 @@ impl WatchdogSpool {
 #[cfg(test)]
 pub(crate) use watchdog_spool::{
     SPOOL_HIGH_WATER_KEY, SPOOL_HIGH_WATER_TABLE, SPOOL_SCHEMA_VERSION, SPOOL_TABLE,
-    WatchdogSpoolHeader, encode_entry, encode_high_water, validate_header, watchdog_spool_path,
+    WatchdogSpoolHeader, encode_entry, encode_high_water, validate_header,
 };
 
 #[cfg(test)]
@@ -261,7 +269,17 @@ pub struct GapRecoveryDisposition {
 pub struct IndependentKernelSensor {
     watchdog: Mutex<Option<Watchdog>>,
     spool: WatchdogSpool,
-    _runtime_binding: WatchdogRuntimeBinding,
+    /// Retained installer-approved binding and its no-follow leases for
+    /// production sensors; `None` for test-constructed sensors, which carry no
+    /// protected leases. Export identities always come from the stored fields
+    /// below so both contours export identically.
+    _runtime_binding: Option<WatchdogRuntimeBinding>,
+    /// Owning installation bound at construction, from the retained binding's
+    /// selected manifest in production or explicit in tests.
+    installation_id: String,
+    /// Watchdog generation bound at construction, from the retained binding's
+    /// selected manifest in production or explicit in tests.
+    watchdog_generation: u64,
 }
 
 impl IndependentKernelSensor {
@@ -276,6 +294,18 @@ impl IndependentKernelSensor {
         watchdog_epoch: u64,
     ) -> Result<Self, SpoolError> {
         let spool = WatchdogSpool::open_runtime_binding(&binding)?;
+        let installation_id = binding
+            .selected_manifest
+            .runtime_launch
+            .installation_epoch
+            .installation
+            .as_str()
+            .to_owned();
+        let watchdog_generation = binding
+            .selected_manifest
+            .runtime_launch
+            .authority_generation
+            .value();
         let watchdog = Watchdog::new(
             eliot_watchdog_core::WatchdogConfig::default(),
             Epoch(watchdog_epoch),
@@ -284,7 +314,9 @@ impl IndependentKernelSensor {
         Ok(Self {
             watchdog: Mutex::new(Some(watchdog)),
             spool,
-            _runtime_binding: binding,
+            _runtime_binding: Some(binding),
+            installation_id,
+            watchdog_generation,
         })
     }
 
@@ -299,10 +331,24 @@ impl IndependentKernelSensor {
         binding: WatchdogRuntimeBinding,
     ) -> Result<Self, SpoolError> {
         let spool = WatchdogSpool::open_runtime_binding(&binding)?;
+        let installation_id = binding
+            .selected_manifest
+            .runtime_launch
+            .installation_epoch
+            .installation
+            .as_str()
+            .to_owned();
+        let watchdog_generation = binding
+            .selected_manifest
+            .runtime_launch
+            .authority_generation
+            .value();
         Ok(Self {
             watchdog: Mutex::new(None),
             spool,
-            _runtime_binding: binding,
+            _runtime_binding: Some(binding),
+            installation_id,
+            watchdog_generation,
         })
     }
 
@@ -318,6 +364,243 @@ impl IndependentKernelSensor {
         binding: &WatchdogRuntimeBinding,
     ) -> Result<Vec<WatchdogSpoolEntry>, SpoolError> {
         WatchdogSpool::open_existing_runtime_binding(binding)?.readback()
+    }
+
+    /// Exports one bounded immutable spool batch for an exact sink
+    /// acknowledgement.
+    ///
+    /// Every identity is real: the installation id and watchdog generation
+    /// come from the retained binding's selected manifest, the watchdog epoch
+    /// comes from the epoch retained at sensor construction, and only the
+    /// sink id arrives as a parameter because the sensor owns no sink
+    /// identity. The export itself is read-only over the spool; the cursor
+    /// advances only through [`IndependentKernelSensor::apply_spool_acknowledgement`].
+    /// A gap-only sensor without an established epoch fails closed instead
+    /// of inventing one, since a placeholder epoch would poison the stored
+    /// cursor against the first real heartbeat. There is no semantic
+    /// interpretation here and no canonical store write.
+    ///
+    /// Expose-or-drop decision: the spool's canonical raw entry bytes are
+    /// not discarded silently. The typed batch is the transport unit the
+    /// Governor/eliotd path admits (its digests already bind the raw bytes,
+    /// so downstream never parses raws); the raws themselves stay available
+    /// through [`IndependentKernelSensor::export_spool_batch_with_raws`] for
+    /// transport debugging and re-encoding. This method keeps the typed-only
+    /// surface for the existing caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the epoch is not established, the stored cursor
+    /// or retained records fail validation, or the bounded window cannot be
+    /// covered consecutively.
+    pub fn export_spool_batch(
+        &self,
+        sink_id: &str,
+        limits: WatchdogSpoolExportLimits,
+    ) -> Result<WatchdogSpoolExportBatch, SpoolError> {
+        self.export_spool_batch_with_raws(sink_id, limits)
+            .map(|(batch, _raw_entry_bytes)| batch)
+    }
+
+    /// Exports one bounded immutable spool batch plus its canonical raw
+    /// entry bytes for transport.
+    ///
+    /// The raws are the canonical entry encodings whose digests the batch
+    /// binds; they are timestamp-free, so an exact retry stays
+    /// digest-equivalent. Downstream admission consumes the typed batch, not
+    /// the raws. There is no semantic interpretation here and no canonical
+    /// store write.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the epoch is not established, the stored cursor
+    /// or retained records fail validation, or the bounded window cannot be
+    /// covered consecutively.
+    pub fn export_spool_batch_with_raws(
+        &self,
+        sink_id: &str,
+        limits: WatchdogSpoolExportLimits,
+    ) -> Result<(WatchdogSpoolExportBatch, Vec<Vec<u8>>), SpoolError> {
+        let installation_id = self.installation_id.clone();
+        let watchdog_generation = self.watchdog_generation;
+        let watchdog_epoch = self
+            .watchdog
+            .lock()
+            .map_err(|_| {
+                SpoolError::Corrupt(
+                    "watchdog spool export cannot read the retained watchdog epoch".to_owned(),
+                )
+            })?
+            .as_ref()
+            .map(|watchdog| watchdog.epoch().0)
+            .ok_or_else(|| {
+                SpoolError::InvalidLease(
+                    "watchdog spool export refuses a gap-only sensor without an established watchdog epoch"
+                        .to_owned(),
+                )
+            })?;
+        let stored = self.spool.read_export_cursor()?;
+        let predecessor = eliot_watchdog_core::WatchdogSpoolCursor {
+            schema_version: SPOOL_EXPORT_CURSOR_SCHEMA_VERSION,
+            acknowledged_sequence: stored.acknowledged_sequence,
+            watchdog_generation,
+            watchdog_epoch,
+            installation_id,
+            sink_id: sink_id.to_owned(),
+        };
+        let high_water = self.spool.high_water_sequence()?;
+        self.spool.export_batch(&predecessor, high_water, limits)
+    }
+
+    /// Applies an exact authenticated sink acknowledgement to the export
+    /// cursor and returns the new acknowledged sequence.
+    ///
+    /// Authenticated gating runs before the spool owner is touched: the
+    /// acknowledgement must echo the exact batch identity (id, digest,
+    /// predecessor, range, sink, generation, epoch, installation) with
+    /// per-entry digest coverage and usable outcomes, and the batch must be
+    /// fresh on the owner clock. A forged acknowledgement (mutated digest,
+    /// predecessor, sink, generation, epoch, installation, range, or record
+    /// digest), an expired batch, or an unknown outcome fails closed without
+    /// writing. A duplicate acknowledgement returns the stored sequence
+    /// unchanged instead of failing. Unknown outcomes, timeouts, and
+    /// disconnects must never reach beyond this gate; only a complete
+    /// acknowledgement for one immutable batch is applied. There is no
+    /// semantic interpretation here and no canonical store write. Transport
+    /// signature binding arrives via the EBP durable-observation path
+    /// (deferred composition wiring; see PR residual) — no new auth system,
+    /// user account, or OAuth is introduced here per #1376.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the batch or acknowledgement fails validation,
+    /// expires, or breaks the stored cursor.
+    pub fn apply_spool_acknowledgement(
+        &self,
+        batch: &WatchdogSpoolExportBatch,
+        ack: &WatchdogSpoolAcknowledgement,
+    ) -> Result<u64, SpoolError> {
+        let stored = self.spool.read_export_cursor()?;
+        let now_ms = current_unix_ms()?;
+        if let Some(duplicate) =
+            validate_authenticated_spool_ack(batch, ack, stored.acknowledged_sequence, now_ms)?
+        {
+            return Ok(duplicate);
+        }
+        self.spool.apply_acknowledgement(batch, ack)
+    }
+
+    /// Compacts durably acknowledged spool records below the stored export
+    /// cursor and returns the number of records removed.
+    ///
+    /// This is the Wave C compaction entry point, driven by
+    /// [`crate::export_once`] after every successful acknowledgement. The
+    /// caller passes the live acknowledged sequence it read from the stored
+    /// cursor, and the spool refuses to compact on any divergence. There is
+    /// no semantic interpretation here and no canonical store write.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the caller sequence differs from the stored
+    /// cursor or the retained state fails validation.
+    pub fn compact_spool_below_cursor(
+        &self,
+        stored_cursor_acknowledged: u64,
+    ) -> Result<u64, SpoolError> {
+        self.spool.compact_below_cursor(stored_cursor_acknowledged)
+    }
+
+    /// Opens a test-only sensor over an unprotected state directory with
+    /// explicit export identities.
+    ///
+    /// Opens (or creates) `watchdog.redb` directly under `state_dir` with no
+    /// protected-root lease, no registry, and no supervision authority — the
+    /// same storage shape as the crate-internal test spool, made public only
+    /// so Wave C integration tests can drive the real export,
+    /// acknowledgement, and compaction paths without inventing canned batches.
+    /// Production must use [`Self::open_runtime_binding`] or
+    /// [`Self::open_runtime_binding_without_epoch`]; this constructor never
+    /// runs in production.
+    ///
+    /// Identity rules mirror the core cursor contract exactly, neither
+    /// stricter nor laxer: `installation_id` must be non-empty and
+    /// `watchdog_generation` nonzero because the acknowledgement validators
+    /// require both, while the epoch passes through verbatim because the core
+    /// contract admits zero as the explicit initial epoch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError`] when an identity is unusable or the spool file
+    /// cannot be created, opened, or recovered.
+    pub fn open_for_export_driver_test(
+        state_dir: &Path,
+        installation_id: &str,
+        watchdog_generation: u64,
+        watchdog_epoch: u64,
+    ) -> Result<Self, SpoolError> {
+        if installation_id.is_empty() {
+            return Err(SpoolError::InvalidLease(
+                "watchdog export test sensor requires a non-empty installation id".to_owned(),
+            ));
+        }
+        if watchdog_generation == 0 {
+            return Err(SpoolError::InvalidLease(
+                "watchdog export test sensor requires a nonzero watchdog generation".to_owned(),
+            ));
+        }
+        let database = Database::create(watchdog_spool_path(state_dir))
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        let spool = WatchdogSpool {
+            database,
+            _path_lease: None,
+        };
+        spool.initialize_or_recover()?;
+        let watchdog = Watchdog::new(
+            eliot_watchdog_core::WatchdogConfig::default(),
+            Epoch(watchdog_epoch),
+        )
+        .map_err(|_| SpoolError::InvalidLease("watchdog epoch is invalid".to_owned()))?;
+        Ok(Self {
+            watchdog: Mutex::new(Some(watchdog)),
+            spool,
+            _runtime_binding: None,
+            installation_id: installation_id.to_owned(),
+            watchdog_generation,
+        })
+    }
+
+    /// Appends one test-only spool record through the real retention path.
+    ///
+    /// Delegates directly to the spool owner, so header, high-water, pressure,
+    /// and bounded-frame validation behave exactly as in production. Test-only:
+    /// production records arrive through supervision admission, never here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError`] when the retained state fails validation or the
+    /// record exceeds the bounded frame.
+    pub fn append_spool_entry_for_export_driver_test(
+        &self,
+        observed_at_ms: u64,
+        payload: WatchdogSpoolPayload,
+    ) -> Result<SpoolAppendOutcome, SpoolError> {
+        self.spool.append(observed_at_ms, payload)
+    }
+
+    /// Reads the retained spool records in sequence order without mutating
+    /// any spool state.
+    ///
+    /// Read-only observation for Wave C integration tests to prove compaction
+    /// boundaries. Test-only: production readers use
+    /// [`Self::readback`] against the retained binding.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError`] when the retained state fails validation.
+    pub fn retained_spool_entries_for_export_driver_test(
+        &self,
+    ) -> Result<Vec<WatchdogSpoolEntry>, SpoolError> {
+        self.spool.readback()
     }
 
     fn record_heartbeat(
@@ -360,7 +643,7 @@ impl IndependentKernelSensor {
                     service: SERVICE_NAME.to_owned(),
                     lease_id: lease.lease().lease_id.clone(),
                     scope_ref: lease.lease().scope_ref.clone(),
-                    kernel_epoch: lease.lease().kernel_epoch.value(),
+                    kernel_epoch: lease.lease().kernel_epoch.sequence.get(),
                     watchdog_epoch: lease.lease().watchdog_epoch.value(),
                     payload_digest: digest,
                     envelope_digest: lease.envelope_digest().to_owned(),
@@ -496,10 +779,30 @@ pub fn inspect_approved_host_registration(
 
 fn inspect_host_registration(approved: &ApprovedHostRegistration) -> Result<(), SpoolError> {
     match read_host_registration_runtime(approved) {
-        WatchdogRuntimeReadback::Matching { .. } => Ok(()),
-        other => Err(SpoolError::InvalidLease(format!(
-            "approved Host SCM registration is not an exact read-only runtime match: {other:?}"
-        ))),
+        WatchdogRuntimeReadback::Matching { .. } => {
+            tracing::debug!(
+                event = "watchdog.host_registration_observed",
+                observation = "admitted",
+                "approved Host registration matches runtime readback"
+            );
+            Ok(())
+        }
+        other => {
+            let observation = match &other {
+                WatchdogRuntimeReadback::Matching { .. } => "admitted",
+                WatchdogRuntimeReadback::Absent => "unavailable",
+                WatchdogRuntimeReadback::Mismatched => "mismatched",
+                WatchdogRuntimeReadback::Unknown => "unknown",
+            };
+            tracing::debug!(
+                event = "watchdog.host_registration_observed",
+                observation = observation,
+                "approved Host registration is not an exact runtime match"
+            );
+            Err(SpoolError::InvalidLease(format!(
+                "approved Host SCM registration is not an exact read-only runtime match: {other:?}"
+            )))
+        }
     }
 }
 
@@ -512,13 +815,53 @@ fn current_unix_ms() -> Result<u64, SpoolError> {
         .map_err(|_| SpoolError::InvalidLease("current time overflows u64".to_owned()))
 }
 
+/// Validates an authenticated sink acknowledgement before the spool owner is
+/// touched.
+///
+/// Returns `Ok(Some(stored))` for an idempotent duplicate (the caller
+/// returns the stored sequence unchanged without writing) and `Ok(None)`
+/// when the acknowledgement may proceed to
+/// `WatchdogSpool::apply_acknowledgement`, which revalidates authoritatively
+/// inside its write transaction. Any forged identity echo, expired batch, or
+/// unusable outcome fails closed here without writing.
+///
+/// # Errors
+///
+/// Returns [`SpoolError`] carrying the exact reconciliation failure for a
+/// forged, expired, or otherwise unusable acknowledgement.
+fn validate_authenticated_spool_ack(
+    batch: &WatchdogSpoolExportBatch,
+    ack: &WatchdogSpoolAcknowledgement,
+    stored_acknowledged: u64,
+    now_ms: u64,
+) -> Result<Option<u64>, SpoolError> {
+    if eliot_watchdog_core::is_duplicate_ack(stored_acknowledged, ack) {
+        return Ok(Some(stored_acknowledged));
+    }
+    eliot_watchdog_core::validate_batch_freshness(batch, now_ms)?;
+    eliot_watchdog_core::validate_acknowledgement(batch, ack)?;
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::registry_fixture::RegistryFixture;
     use super::*;
+    use eliot_contracts::{EpochId, EpochLineageId};
     use eliot_runtime_contracts::{SupervisionLeaseSigner, SupervisionLeaseVerifier};
     use std::collections::VecDeque;
+    use std::num::NonZeroU64;
     use std::sync::atomic::AtomicUsize;
+
+    const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn test_epoch(sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(TEST_LINEAGE_A).expect("valid test lineage"),
+            NonZeroU64::new(sequence).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
 
     static FIXTURE_ID: AtomicUsize = AtomicUsize::new(0);
 
@@ -797,7 +1140,22 @@ mod tests {
             ),
         };
         let service_control_grant = match role {
-            InstallerServiceRole::Host => serde_json::Value::Null,
+            InstallerServiceRole::Host => {
+                let principal_sid = "S-1-5-80-1-2-3-4-5";
+                let security_descriptor_digest =
+                    match eliot_platform_windows::host_service_security_descriptor_digest(
+                        principal_sid,
+                    ) {
+                        Ok(digest) => digest,
+                        Err(error) => panic!("Host control-grant fixture: {error}"),
+                    };
+                serde_json::json!({
+                    "principal_service": eliot_platform_windows::ELIOT_HOST_SERVICE_NAME,
+                    "principal_sid": principal_sid,
+                    "access_mask": eliot_platform_windows::ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK,
+                    "security_descriptor_digest": security_descriptor_digest,
+                })
+            }
             InstallerServiceRole::Watchdog => {
                 let principal_sid = "S-1-5-80-1-2-3-4-5";
                 let security_descriptor_digest =
@@ -920,7 +1278,10 @@ mod tests {
             "generation": generation,
             "authority_generation": authority_generation,
             "authority_state_fence": {
-                "authority_epoch": 1,
+                "authority_epoch": {
+                    "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "sequence": 1
+                },
                 "resource_generation": authority_generation,
                 "task_revision": null,
                 "policy_revision": null,
@@ -970,6 +1331,12 @@ mod tests {
             "host_artifact_digest": "7".repeat(64),
             "watchdog_executable_path": r"C:\ProgramData\Eliot\packages\generation-7\eliot-watchdog.exe",
             "watchdog_artifact_digest": "8".repeat(64),
+            "doctor_artifact_digest": "b".repeat(64),
+            "testd_artifact_digest": "c".repeat(64),
+            "native_worker_artifact_digest": "e".repeat(64),
+            "doctor_executable_path": r"C:\ProgramData\Eliot\packages\generation-7\eliot-doctor.exe",
+            "testd_executable_path": r"C:\ProgramData\Eliot\packages\generation-7\eliot-testd.exe",
+            "native_worker_executable_path": r"C:\ProgramData\Eliot\packages\generation-7\eliot-native-worker.exe",
             "descriptor_digest": "9".repeat(64)
         });
         serde_json::from_value(serde_json::json!({
@@ -979,10 +1346,16 @@ mod tests {
             "store_bridge_artifact_digest": "4".repeat(64),
             "canonical_store_artifact_digest": "6".repeat(64),
             "host_artifact_digest": "7".repeat(64),
+            "doctor_artifact_digest": "b".repeat(64),
+            "testd_artifact_digest": "c".repeat(64),
+            "native_worker_artifact_digest": "e".repeat(64),
             "kernel_executable_path": r"C:\ProgramData\Eliot\packages\generation-7\eliot-kernel.exe",
             "store_bridge_executable_path": r"C:\ProgramData\Eliot\packages\generation-7\eliot-store-surreal.exe",
             "canonical_store_executable_path": r"C:\ProgramData\Eliot\packages\generation-7\surreal.exe",
             "host_executable_path": r"C:\ProgramData\Eliot\packages\generation-7\host\eliot-host.exe",
+            "doctor_executable_path": r"C:\ProgramData\Eliot\packages\generation-7\eliot-doctor.exe",
+            "testd_executable_path": r"C:\ProgramData\Eliot\packages\generation-7\eliot-testd.exe",
+            "native_worker_executable_path": r"C:\ProgramData\Eliot\packages\generation-7\eliot-native-worker.exe",
             "config_path": r"C:\ProgramData\Eliot\packages\generation-7\store.json",
             "dependency_closure_refs": ["evidence-dependencies"],
             "license_refs": ["evidence-licenses"],
@@ -1585,6 +1958,7 @@ mod tests {
     }
 
     mod self_admission_and_gap;
+    mod s08w_recovery_containment;
 
     fn heartbeat(sequence: u64) -> WatchdogSpoolEntry {
         WatchdogSpoolEntry {
@@ -1731,7 +2105,7 @@ mod tests {
             host_epoch: AuthorityEpoch::new(1)?,
             activation_id: eliot_ors::OperationIdentity::new("activation-1")?,
             activation_generation: eliot_contracts::ResourceGeneration::new(1)?,
-            kernel_epoch: AuthorityEpoch::new(2)?,
+            kernel_epoch: test_epoch(2),
             watchdog_epoch: AuthorityEpoch::new(1)?,
             generation_binding: eliot_runtime_contracts::SupervisionGenerationBinding {
                 target_id: "target-1".to_owned(),
@@ -1742,7 +2116,7 @@ mod tests {
                 process_generation: eliot_contracts::ResourceGeneration::new(1)?,
             },
             state_fence: eliot_contracts::StateFence::new(
-                AuthorityEpoch::new(2)?,
+                test_epoch(2),
                 eliot_contracts::ResourceGeneration::new(1)?,
             ),
             issued_at_ms,
@@ -1816,7 +2190,7 @@ mod tests {
             host_epoch: envelope.payload.host_epoch,
             activation_id: envelope.payload.activation_id.clone(),
             activation_generation: envelope.payload.activation_generation,
-            kernel_epoch: envelope.payload.kernel_epoch,
+            kernel_epoch: envelope.payload.kernel_epoch.clone(),
             watchdog_epoch: envelope.payload.watchdog_epoch,
             state_fence: envelope.payload.state_fence.clone(),
             scope_ref: envelope.payload.scope_ref.clone(),
@@ -2157,5 +2531,104 @@ mod tests {
         );
         drop(reopened);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn spool_ack_fixture_digest(byte: u8) -> String {
+        format!("{byte:02x}").repeat(32)
+    }
+
+    fn spool_ack_fixture_batch() -> WatchdogSpoolExportBatch {
+        let predecessor = eliot_watchdog_core::WatchdogSpoolCursor {
+            schema_version: SPOOL_EXPORT_CURSOR_SCHEMA_VERSION,
+            acknowledged_sequence: 0,
+            watchdog_generation: 7,
+            watchdog_epoch: 3,
+            installation_id: "installation-test".to_owned(),
+            sink_id: "sink-test".to_owned(),
+        };
+        eliot_watchdog_core::WatchdogSpoolExportBatch {
+            schema_version: SPOOL_EXPORT_CURSOR_SCHEMA_VERSION,
+            batch_id: "batch-test-1".to_owned(),
+            installation_id: "installation-test".to_owned(),
+            watchdog_generation: 7,
+            watchdog_epoch: 3,
+            predecessor_cursor: predecessor,
+            first_sequence: 1,
+            last_sequence: 1,
+            high_water_sequence: 1,
+            entries: vec![eliot_watchdog_core::WatchdogSpoolExportEntry {
+                sequence: 1,
+                schema_version: SPOOL_EXPORT_CURSOR_SCHEMA_VERSION,
+                observed_at_ms: 1_000,
+                payload_kind: eliot_watchdog_core::WatchdogSpoolPayloadKind::Heartbeat,
+                payload_digest: spool_ack_fixture_digest(0x0c),
+                record_digest: spool_ack_fixture_digest(0x0d),
+            }],
+            item_count: 1,
+            byte_size: 64,
+            batch_digest: spool_ack_fixture_digest(0x0b),
+            is_empty_batch: false,
+            created_at_ms: 1_000,
+            expires_at_ms: 2_000,
+        }
+    }
+
+    fn spool_ack_fixture_ack(batch: &WatchdogSpoolExportBatch) -> WatchdogSpoolAcknowledgement {
+        WatchdogSpoolAcknowledgement {
+            schema_version: batch.schema_version,
+            batch_id: batch.batch_id.clone(),
+            batch_digest: batch.batch_digest.clone(),
+            predecessor_sequence: batch.predecessor_cursor.acknowledged_sequence,
+            first_sequence: batch.first_sequence,
+            last_sequence: batch.last_sequence,
+            sink_id: batch.predecessor_cursor.sink_id.clone(),
+            watchdog_generation: batch.watchdog_generation,
+            watchdog_epoch: batch.watchdog_epoch,
+            installation_id: batch.installation_id.clone(),
+            dispositions: vec![eliot_watchdog_core::WatchdogSpoolEntryDisposition {
+                sequence: 1,
+                disposition: eliot_watchdog_core::WatchdogSpoolSinkDisposition::Applied,
+                record_digest: batch.entries[0].record_digest.clone(),
+            }],
+        }
+    }
+
+    #[test]
+    fn authenticated_spool_ack_gating_rejects_forged_expired_and_duplicate() {
+        let batch = spool_ack_fixture_batch();
+        let ack = spool_ack_fixture_ack(&batch);
+        assert!(
+            validate_authenticated_spool_ack(&batch, &ack, 0, 1_500)
+                .unwrap_or_else(|error| panic!("valid ack must pass the gate: {error}"))
+                .is_none(),
+            "a valid acknowledgement must proceed to the spool owner"
+        );
+
+        let mut forged = ack.clone();
+        forged.batch_digest = spool_ack_fixture_digest(0xff);
+        assert!(
+            validate_authenticated_spool_ack(&batch, &forged, 0, 1_500).is_err(),
+            "a forged acknowledgement digest must fail closed without writing"
+        );
+
+        assert!(
+            validate_authenticated_spool_ack(&batch, &ack, 0, 2_000).is_err(),
+            "an expired batch must fail closed without writing"
+        );
+
+        assert_eq!(
+            validate_authenticated_spool_ack(&batch, &ack, 1, 1_500)
+                .unwrap_or_else(|error| panic!("duplicate ack must be idempotent: {error}")),
+            Some(1),
+            "a duplicate acknowledgement must return the stored sequence unchanged"
+        );
+
+        let mut unknown = ack.clone();
+        unknown.dispositions[0].disposition =
+            eliot_watchdog_core::WatchdogSpoolSinkDisposition::Unknown;
+        assert!(
+            validate_authenticated_spool_ack(&batch, &unknown, 0, 1_500).is_err(),
+            "an unknown outcome must never advance the cursor"
+        );
     }
 }

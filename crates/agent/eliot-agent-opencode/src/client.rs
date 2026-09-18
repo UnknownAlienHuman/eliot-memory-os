@@ -1,10 +1,13 @@
 use crate::{
-    ActualRouteReceipt, AuthorityCeiling, BasicAuth, HealthResponse, HttpMethod, HttpRequest,
-    LoopbackEndpoint, LoopbackHttpClient, LoopbackHttpError, ModelSelection, NoAuthorityRunResult,
-    OpenCodeEvent, ProviderCatalog, QuotaAvailability, ReadOnlyRunRequest, RunRequestError,
-    RunStatus, Session, SessionDiff, SessionStatus, SessionStatusMap, SseConnection,
-    SseDecodeError, SseDecoder, SseLimits, UnknownFields, UsageAvailability, UsageTelemetry,
+    AdmittedAttemptCandidate, AdmittedAttemptError, AdmittedOpenCodeAttempt, AuthorityCeiling,
+    BasicAuth, HealthResponse, HttpMethod, HttpRequest, LoopbackEndpoint, LoopbackHttpClient,
+    LoopbackHttpError, ModelSelection, NoAuthorityRunResult, OpenCodeEvent,
+    OpenCodeWireRouteReceipt, ProviderCatalog, QuotaAvailability, ReadOnlyRunRequest,
+    RunRequestError, RunStatus, Session, SessionDiff, SessionStatus, SessionStatusMap,
+    SseConnection, SseDecodeError, SseDecoder, SseLimits, UnknownFields, UsageAvailability,
+    UsageTelemetry,
 };
+use eliot_contracts::{ResourceGeneration, StateFence};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeSet;
@@ -166,6 +169,19 @@ pub enum OpenCodeRunError {
         cause: String,
         reconciliation: String,
     },
+}
+
+/// Outcome of one admitted read-only attempt: the supervised wire result plus
+/// its candidate-only seal.
+///
+/// The wire result carries the SSE observations for downstream normalization
+/// bound to the exact attempt; the seal carries only attempt/admission/result
+/// digests under the candidate-only ceiling — never launch, process, or
+/// finish authority.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AdmittedAttemptOutcome {
+    pub run: NoAuthorityRunResult,
+    pub candidate: AdmittedAttemptCandidate,
 }
 
 pub struct OpenCodeClient {
@@ -575,6 +591,33 @@ impl OpenCodeClient {
         Ok(self.success_result(request, prepared, projection, collection.events))
     }
 
+    /// Runs one admitted read-only attempt through the supervised loopback
+    /// route (issue #487).
+    ///
+    /// Fail-closed before start: the admission/binding/attempt agreement is
+    /// re-verified against the live fence and generation, and the presented
+    /// request must carry the exact admitted provider/model in a valid
+    /// read-only shape — all before any session, prompt, or event-stream
+    /// call. Execution reuses exactly [`OpenCodeClient::run_read_only`]:
+    /// attach-only loopback HTTP+SSE against the externally supervised
+    /// server, the read-only `plan` agent ceiling, and no server launch,
+    /// process control, credential exposure, or finish authority. The
+    /// returned seal is candidate-only; unknown outcomes surface as
+    /// [`OpenCodeRunError`] (including `UnknownOutcome`) and never seal.
+    pub async fn run_admitted_read_only(
+        &self,
+        admitted: &AdmittedOpenCodeAttempt,
+        request: &ReadOnlyRunRequest,
+        current_fence: &StateFence,
+        runtime_generation: ResourceGeneration,
+    ) -> Result<AdmittedAttemptOutcome, AdmittedAttemptError> {
+        admitted.verify(current_fence, runtime_generation)?;
+        admitted.verify_request(request)?;
+        let run = self.run_read_only(request).await?;
+        let candidate = AdmittedAttemptCandidate::seal(admitted, &run)?;
+        Ok(AdmittedAttemptOutcome { run, candidate })
+    }
+
     async fn prepare_run(
         &self,
         request: &ReadOnlyRunRequest,
@@ -935,8 +978,10 @@ impl OpenCodeClient {
             &request.model,
             READ_ONLY_AGENT,
         );
-        let mut actual_route =
-            ActualRouteReceipt::observed(request.model.clone(), projection.observed_model.clone());
+        let mut actual_route = OpenCodeWireRouteReceipt::observed(
+            request.model.clone(),
+            projection.observed_model.clone(),
+        );
         actual_route.provider = Some(projection.observed_model.provider_id.clone());
         actual_route.endpoint = Some(self.endpoint.to_string());
         actual_route.route_fingerprint = Some(route_fingerprint);
@@ -1506,8 +1551,8 @@ mod tests {
         encode_component, generate_message_id,
     };
     use crate::{
-        ActualRouteState, AuthorityCeiling, BasicAuth, LoopbackEndpoint, ModelSelection,
-        OpenCodeEvent, ReadOnlyRunRequest, RunStatus,
+        AuthorityCeiling, BasicAuth, LoopbackEndpoint, LoopbackHttpError, ModelSelection,
+        OpenCodeEvent, OpenCodeWireRouteState, ReadOnlyRunRequest, RunStatus,
     };
     use secrecy::SecretString;
     use std::collections::VecDeque;
@@ -1720,7 +1765,7 @@ mod tests {
         assert_eq!(result.status, RunStatus::Succeeded);
         assert!(result.candidate_only);
         assert_eq!(result.authority, AuthorityCeiling::CandidateOnly);
-        assert_eq!(result.actual_route.state, ActualRouteState::Observed);
+        assert_eq!(result.actual_route.state, OpenCodeWireRouteState::Observed);
         assert_eq!(result.output, Some(serde_json::json!({"status":"ready"})));
         assert!(result.diff.is_empty());
 
@@ -1819,5 +1864,28 @@ mod tests {
             }
         });
         Ok((port, requests))
+    }
+
+    #[test]
+    fn rate_limit_status_is_definitively_rejected_typed() {
+        // A 429 rate-limit response stays a typed HTTP status error and is
+        // definitively rejected: it is never retried blindly and never
+        // becomes an empty successful result.
+        let limited = OpenCodeRunError::Http(LoopbackHttpError::Status {
+            status: 429,
+            body_preview: String::new(),
+        });
+        assert!(matches!(
+            limited,
+            OpenCodeRunError::Http(LoopbackHttpError::Status { status: 429, .. })
+        ));
+        assert!(super::dispatch_definitively_rejected(&limited));
+        // 5xx stays outside the definitive-rejection band (separate
+        // unknown/retryable path), proving the 4xx band is exact.
+        let server = OpenCodeRunError::Http(LoopbackHttpError::Status {
+            status: 503,
+            body_preview: String::new(),
+        });
+        assert!(!super::dispatch_definitively_rejected(&server));
     }
 }

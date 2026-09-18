@@ -122,11 +122,16 @@ where
     if !quality.results.iter().all(|result| result.passed) {
         return Err(AssemblyError::QualityIncomplete(Box::new(quality)));
     }
+    let expected_fence_digest =
+        eliot_context_contracts::canonical_fence_digest(&admitted.binding.state_fence)?;
+    if policy.fence_digest != expected_fence_digest {
+        return Err(AssemblyError::Contract(ContextError::InvalidFence));
+    }
     let rendered = render::render(admitted);
     let (output_digest, bytes) = measurement::canonical_matches(
         &admitted.binding,
         &recipe.recipe_sha256,
-        &policy.fence_digest,
+        &expected_fence_digest,
         &rendered,
     )?;
     let final_bytes =
@@ -165,7 +170,7 @@ where
         measurement: measured,
         output_digest,
         recipe_digest: recipe.recipe_sha256.clone(),
-        fence_digest: policy.fence_digest.clone(),
+        fence_digest: expected_fence_digest,
     };
     view.validate_against(admitted)?;
     Ok(ActiveUnderstandingViewResult {

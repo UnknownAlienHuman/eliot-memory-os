@@ -1,0 +1,1 @@
+{"operation":"LEASE_EXACT","selector":{"scope_id":"scope-edge","expected_revision":1,"expected_fence":{"authority_epoch":{"lineage_id":"550e8400-e29b-41d4-a716-446655440000","sequence":1},"resource_generation":1,"task_revision":null,"policy_revision":null,"integration_revision":null},"worker_artifact_id":"worker-edge-01","max_candidates":4},"job_id":"job-edge-01"}

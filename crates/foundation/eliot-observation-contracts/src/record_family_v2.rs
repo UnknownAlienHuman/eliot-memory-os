@@ -628,12 +628,23 @@ mod tests {
         ObservationEventIdentity, ObservationKind, ObservationScope, PrivacyRetentionDisclosure,
         ProducerTrace,
     };
-    use eliot_contracts::{AuthorityEpoch, ClockReading, ResourceGeneration, StateFence};
+    use eliot_contracts::{ClockReading, EpochId, EpochLineageId, ResourceGeneration, StateFence};
+    use std::num::NonZeroU64;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
+    const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn test_epoch(lineage: &str, sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(lineage).expect("valid test lineage"),
+            NonZeroU64::new(sequence).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
+
     fn fence() -> StateFence {
-        StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+        StateFence::new(test_epoch(TEST_LINEAGE_A, 1), ResourceGeneration::genesis())
     }
 
     fn event(kind: ObservationKind) -> Result<ObservationEventCore, ObservationError> {

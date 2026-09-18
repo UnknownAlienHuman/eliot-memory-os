@@ -8,15 +8,21 @@ use crate::backend::{BackendReconcileState, CommittedAppend, DurableImage, Prepa
 use crate::model::{
     AppliedOperation, EpochEvidence, HostInstallationEpoch, HostState, HostStateRecord,
     IdempotencyIdentity, RecoveryLineageReason, activation_transition, dependency_transition,
-    drain_transition, kernel_transition, store_rebind_transition, wake_transition,
+    drain_transition, epoch_transition_is_direct_child_of, kernel_transition,
+    store_rebind_transition, wake_transition,
 };
 use crate::{JournalBackend, JournalError, ReconcileOutcome};
 
 pub const JOURNAL_MAGIC: &[u8] = b"ELIOT-HOST-STATE\n";
 /// Current journal wire revision. Version 1 readiness records did not retain
 /// the exact supervision predecessor and are therefore never replayed into a
-/// current Host contour.
-pub const JOURNAL_VERSION: u16 = 2;
+/// current Host contour. Version 2 carried the retired Host-local
+/// `EpochIdentity { lineage, sequence }` spelling; version 3 carries the
+/// canonical `EpochId { lineage_id, sequence }` wire shape instead. Version 2
+/// frames are rejected explicitly as `UnknownVersion` and are never silently
+/// rewritten: recovery proceeds through an explicit new-lineage Host epoch,
+/// and rollback to a version 2 reader requires the version 2 journal bytes.
+pub const JOURNAL_VERSION: u16 = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AppendDisposition {
@@ -357,18 +363,33 @@ fn apply(
             if state.kernel.is_none()
                 && let Some(prior) = state.prior_kernel.as_ref()
             {
-                let authority_advances = prior
-                    .process
-                    .as_ref()
-                    .zip(next.process.as_ref())
-                    .is_some_and(|(prior, candidate)| {
-                        candidate.authority_epoch.value() > prior.authority_epoch.value()
-                    });
-                if !next
-                    .kernel_generation
-                    .is_direct_child_of(&prior.kernel_generation)?
-                    || next.state
-                        != eliot_runtime_contracts::KernelActivationState::ShadowNoAuthority
+                // T6-E4-A host scalar closure: scalar process ordering is
+                // intra-lineage only. Cross-lineage numeric ordering is
+                // forbidden, so the scalar `>` below is gated on the typed
+                // epoch tuple proving same lineage via `relation_to`. The
+                // typed direct-child check remains the admission authority;
+                // this gate ensures a larger scalar from another lineage can
+                // never satisfy `authority_advances` on its own.
+                let same_kernel_lineage = !matches!(
+                    next.kernel_generation
+                        .current
+                        .relation_to(&prior.kernel_generation.current),
+                    eliot_contracts::EpochRelation::UnrelatedLineage
+                );
+                let authority_advances = same_kernel_lineage
+                    && prior
+                        .process
+                        .as_ref()
+                        .zip(next.process.as_ref())
+                        .is_some_and(|(prior_process, candidate_process)| {
+                            candidate_process.authority_epoch.value()
+                                > prior_process.authority_epoch.value()
+                        });
+                if !epoch_transition_is_direct_child_of(
+                    &next.kernel_generation,
+                    &prior.kernel_generation,
+                )? || next.state
+                    != eliot_runtime_contracts::KernelActivationState::ShadowNoAuthority
                     || !authority_advances
                 {
                     return Err(JournalError::StaleFence);
@@ -719,13 +740,13 @@ fn state_for_host(
     }
     if host.epoch.parent.is_none() {
         if host.recovery.is_none()
-            || host.epoch.current.sequence != 1
+            || host.epoch.current.sequence.get() != 1
             || all_evidence
                 .iter()
                 .any(|item| item.host.installation != host.installation)
             || all_evidence
                 .iter()
-                .any(|item| item.host.epoch.current.lineage == host.epoch.current.lineage)
+                .any(|item| item.host.epoch.current.lineage_id == host.epoch.current.lineage_id)
         {
             return Err(JournalError::RecoveryRequiresNewEpoch);
         }

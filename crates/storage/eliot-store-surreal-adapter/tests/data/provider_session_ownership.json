@@ -1,0 +1,75 @@
+{
+  "issue": 986,
+  "denominator": 16,
+  "base_sha": "67a1af95af0b029cb4bf3005ac98991ae2c7abe0",
+  "source_moves": [
+    {
+      "symbol": "reject_occupied_endpoint",
+      "from": "src/client.rs",
+      "to": "src/client/provider_owner.rs",
+      "old_body_sha256": "d9cc7e96cd698fd64b3f66f1e43cc275473e0479beb9d09b742c04ce0fe6b8bd"
+    },
+    {
+      "symbol": "spawn_provider",
+      "from": "src/client.rs",
+      "to": "src/client/provider_owner.rs",
+      "old_body_sha256": "e8ac250d3031cfdd0f041697c96587caa6880951b8fd5cedd5c351686df1b711"
+    },
+    {
+      "symbol": "configure_provider_command",
+      "from": "src/client.rs",
+      "to": "src/client/provider_owner.rs",
+      "old_body_sha256": "276183967f31d49157e1ed68f69ac787857b8d0e77eb4835352310067debf28e"
+    },
+    {
+      "symbol": "validate_child_process",
+      "from": "src/client.rs",
+      "to": "src/client/provider_owner.rs",
+      "old_body_sha256": "a5a9f8bd44d0623aefd78c9eb695cf12c41e6b95bdd0ae6f71fea5a7790a3fb8"
+    },
+    {
+      "symbol": "require_live_child",
+      "from": "src/client.rs",
+      "to": "src/client/provider_owner.rs",
+      "old_body_sha256": "f354ccdbfca7debf541731052aed9df8b3f5c1bc446d0dc1c4c5635bfc45103b"
+    },
+    {
+      "symbol": "require_listener_owner",
+      "from": "src/client.rs",
+      "to": "src/client/provider_owner.rs",
+      "old_body_sha256": "b1e0f6007af979cedab0d3d1fe56cfe377a058658540906a4e86d3f969f8917a"
+    },
+    {
+      "symbol": "require_unchanged_identity",
+      "from": "src/client.rs",
+      "to": "src/client/provider_owner.rs",
+      "old_body_sha256": "038347dc253e8965a615fa5e368215ed3b2303beb045ba1a37cd188b2014667e"
+    },
+    {
+      "symbol": "provider_environment",
+      "from": "src/client.rs",
+      "to": "src/client/provider_owner.rs",
+      "old_body_sha256": "a51e3995ef0fba6d1d53ff8a6a1187c03c40a2691c5ed692370741fd0c10ec85"
+    },
+    {
+      "symbol": "connect_started_provider",
+      "from": "src/client.rs",
+      "to": "src/client/session.rs",
+      "old_body_sha256": "321920f05781ca81184da357ab8383791d66f2f5f6a3006e9477378e51eca13d"
+    }
+  ],
+  "callers": [
+    "SurrealStoreAdapter::connect -> apply::client -> RpcTransport::connect -> ProviderOwner::start + RpcSession::connect",
+    "apply::client -> RpcTransport::validate_liveness -> ProviderOwner::validate_liveness",
+    "client::query -> RpcTransport::query -> RpcSession::request -> request_payload",
+    "payload_tests native fixture -> test-only child projection; version/request delegation"
+  ],
+  "scope": [
+    "src/client.rs",
+    "src/client/provider_owner.rs",
+    "src/client/session.rs",
+    "src/lib.rs",
+    "tests/provider_session_ownership.rs",
+    "tests/data/provider_session_ownership.json"
+  ]
+}

@@ -1,0 +1,37 @@
+{
+  "schema": "eliot-assignment-snapshot-v1",
+  "header": {
+    "repository": "UnknownAlienHuman/eliot-memory-os",
+    "base_sha": "fb3fc334e113236cb82cf5ca9139fc0970df032b",
+    "complete": true
+  },
+  "issues": [
+    {
+      "number": 840,
+      "state": "open",
+      "title": "Mixed acceptance section and conditional clauses",
+      "body": "## Exclusive mutable scope\n- scripts/verify.ps1\n\n## Acceptance criteria\n- Only when verification profile Quick passes exit 0\n- If crates/kernel is modified, require full clippy\n- Where doc routing changes, run docs_router check\n- Declared denominator: 2 cases, exactly 1..2.\n1. Case one\n2. Case two\n\n## Must not modify\n- Cargo.lock\n",
+      "dependencies": []
+    }
+  ],
+  "pull_requests": [
+    {
+      "number": 1391,
+      "state": "open",
+      "draft": false,
+      "title": "work(scripts): update verify.ps1",
+      "body": "Implements #840",
+      "head_ref": "work/840-mixed-acceptance",
+      "head_repo": "UnknownAlienHuman/eliot-memory-os",
+      "base_ref": "main",
+      "base_sha": "fb3fc334e113236cb82cf5ca9139fc0970df032b",
+      "changed_paths": [
+        "scripts/verify.ps1"
+      ]
+    }
+  ],
+  "repository_records": {
+    "workstreams": [],
+    "retired_refs": []
+  }
+}

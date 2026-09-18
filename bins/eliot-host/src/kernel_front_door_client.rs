@@ -25,6 +25,37 @@ use eliot_platform_windows::{ProcessIdentity, observe_named_pipe_peer_process_in
 
 use super::{HostError, LOCAL_SERVICE_SID};
 
+// F-LOG-HOST-3 (#978) Kernel front-door observation helpers.
+//
+// Through the #889 facade only
+// (`super::host_diagnostics::observe_entrypoint_with_detail`); the Event Log
+// seam stays typed-Unavailable
+// (`super::windows_event_log::event_log_sink_status`), never implemented here
+// (#984 still open). No terminal is owned here: the single terminal for a
+// failed front-door/activation stays with the outermost #891 contour;
+// handshake, auth, activation, before-start, timeout, disconnect, and unknown
+// correlate by stage order only.
+//
+// Observation-only contract: every helper projects facts already produced by
+// the semantic owner. Arguments are static literals only — never pipe
+// identities, PIDs, start-times, image paths, SIDs, digests, message ids, or
+// arbitrary error text — so bounding limits size, not sensitivity (I15.4).
+// Sink outcome never alters result/order/status/cleanup. There is no mutable
+// global dedup cache.
+#[cfg(windows)]
+fn kernel_front_door_note_event_log_unavailable() {
+    let _ = super::windows_event_log::event_log_sink_status();
+}
+
+#[cfg(windows)]
+fn kernel_front_door_observe(detail: &str) {
+    kernel_front_door_note_event_log_unavailable();
+    super::host_diagnostics::observe_entrypoint_with_detail(
+        super::host_diagnostics::EntrypointStage::ScmDispatch,
+        detail,
+    );
+}
+
 #[cfg(windows)]
 pub(super) fn kernel_control_request(
     candidate: &HostKernelCandidateBinding,
@@ -32,6 +63,9 @@ pub(super) fn kernel_control_request(
     command: KernelControlCommand,
     sequence: u64,
 ) -> Result<KernelControlRequest, HostError> {
+    // WORK_UNIT_CASE: 978/7 — control request built; handshake/auth material
+    // stays distinct from activation, no secrets observed.
+    kernel_front_door_observe("host.kernel-front-door control requested");
     KernelControlRequest {
         wire_id: eliot_kernel_service::KERNEL_CONTROL_WIRE_ID.to_owned(),
         wire_version: eliot_kernel_service::KERNEL_CONTROL_WIRE_VERSION,
@@ -54,18 +88,38 @@ pub(super) fn activation_response_or_reconcile(
     expected_message_id: &PlatformHandle,
     expected_request_digest: &str,
 ) -> Result<Option<KernelActivationReceipt>, HostError> {
+    // WORK_UNIT_CASE: 978/9 — reconcile decision requested; transport loss
+    // (timeout/disconnect/unknown) reconciles as None without inventing
+    // evidence, distinct from a before-start rejection below.
+    kernel_front_door_observe("host.kernel-front-door reconcile requested");
     let Ok(response) = response else {
+        // WORK_UNIT_CASE: 978/9 — disconnect/unknown observed as reconcile;
+        // no invented receipt, exact None propagates.
+        kernel_front_door_observe("host.kernel-front-door disconnect observed");
         return Ok(None);
     };
     if response.message_id != *expected_message_id
         || response.request_digest != expected_request_digest
     {
+        // WORK_UNIT_CASE: 978/9 — unknown binding observed as reconcile;
+        // mismatched identity never promotes into activation.
+        kernel_front_door_observe("host.kernel-front-door unknown observed");
         return Ok(None);
     }
     if let Some(error) = response.error {
+        // WORK_UNIT_CASE: 978/9 — before-start rejection observed; exact
+        // rejection propagates, no secrets observed.
+        kernel_front_door_observe("host.kernel-front-door before-start observed");
         return Err(HostError::ProcessContour(format!(
             "Kernel rejected Activate: {error}"
         )));
+    }
+    // WORK_UNIT_CASE: 978/9 — timeout observed as reconcile when no receipt
+    // is carried; a carried receipt is activation evidence, not a timeout.
+    if response.activation_receipt.is_none() {
+        kernel_front_door_observe("host.kernel-front-door timeout observed");
+    } else {
+        kernel_front_door_observe("host.kernel-front-door activation observed");
     }
     Ok(response.activation_receipt)
 }
@@ -77,6 +131,9 @@ pub(super) fn validate_authenticated_kernel_peer(
     expected_start_time_100ns: u64,
     expected_image: &Path,
 ) -> Result<(), HostError> {
+    // WORK_UNIT_CASE: 978/7 — auth requested; peer authentication stays
+    // distinct from nonce/handshake/activation, no secrets observed.
+    kernel_front_door_observe("host.kernel-front-door auth requested");
     let peer = peer.process_binding().ok_or_else(|| {
         HostError::ProcessContour("Kernel peer identity is unavailable".to_owned())
     })?;
@@ -92,6 +149,9 @@ pub(super) fn validate_authenticated_kernel_peer(
             "authenticated Kernel peer is not the retained approved process".to_owned(),
         ));
     }
+    // WORK_UNIT_CASE: 978/7 — authenticated peer observed; start-identity
+    // (PID + start-time + image) matched, distinct from activation.
+    kernel_front_door_observe("host.kernel-front-door authenticated peer observed");
     Ok(())
 }
 
@@ -154,6 +214,9 @@ pub(super) async fn connect_authenticated_kernel_front_door(
     candidate: &HostKernelCandidateBinding,
     kernel_process: &ProcessIdentity,
 ) -> Result<NamedPipeTransport, HostError> {
+    // WORK_UNIT_CASE: 978/7 — handshake requested; authenticated connect is
+    // distinct from nonce issuance and activation, no secrets observed.
+    kernel_front_door_observe("host.kernel-front-door handshake requested");
     let expected_extra_sid = candidate
         .agent_bridge_admission
         .as_ref()
@@ -170,8 +233,18 @@ pub(super) async fn connect_authenticated_kernel_front_door(
         transport.kernel_front_door_observed_extra_sid(),
         expected_extra_sid,
     ) {
-        (None, None) => Ok(transport),
-        (Some(observed), Some(expected)) if observed == expected => Ok(transport),
+        (None, None) => {
+            // WORK_UNIT_CASE: 978/7 — handshake observed; exact transport
+            // propagates unchanged.
+            kernel_front_door_observe("host.kernel-front-door handshake observed");
+            Ok(transport)
+        }
+        (Some(observed), Some(expected)) if observed == expected => {
+            // WORK_UNIT_CASE: 978/7 — handshake observed; exact transport
+            // propagates unchanged.
+            kernel_front_door_observe("host.kernel-front-door handshake observed");
+            Ok(transport)
+        }
         _ => Err(HostError::ProcessContour(
             "Kernel front-door extra SID does not match the retained bridge policy".to_owned(),
         )),

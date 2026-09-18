@@ -1,0 +1,22 @@
+package eliot:current@0.1.0;
+
+interface probe-escape {
+  record probe-input {
+    schema-revision: u32,
+  }
+
+  // FORBIDDEN: whole-request list<u8> escape. Must be rejected by semantic check.
+  run: func(input: list<u8>) -> result<probe-input, probe-error>;
+
+  variant probe-error {
+    bad(probe-bad),
+  }
+
+  record probe-bad {
+    human-detail: string,
+  }
+}
+
+world probe-escape {
+  export probe-escape;
+}

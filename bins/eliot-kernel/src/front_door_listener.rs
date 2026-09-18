@@ -18,44 +18,94 @@ use eliot_ipc::NamedPipeServer;
 use eliot_platform_windows::NamedPipePeerSet;
 
 #[cfg(windows)]
+fn observe_listener(event: &'static str, outcome: &'static str) {
+    use super::kernel_diagnostics::{KERNEL_DIAGNOSTICS_TARGET, bound_field};
+    let event_bound = bound_field(event);
+    let outcome_bound = bound_field(outcome);
+    tracing::info!(
+        target: KERNEL_DIAGNOSTICS_TARGET,
+        event = event_bound.text(),
+        outcome = outcome_bound.text(),
+        "front-door listener observation"
+    );
+}
+
+#[cfg(windows)]
+fn listener_terminal_code(_: &KernelBuildError) -> &'static str {
+    "listener_bind_fenced"
+}
+
+#[cfg(windows)]
 impl KernelComposition {
     /// Binds the authenticated local Windows front door to the current
     /// installation principal.  The returned server must be retained by the
     /// service loop for the lifetime of the accepted connection.
     pub fn bind_authenticated_front_door(&self) -> Result<NamedPipeServer, KernelBuildError> {
-        if self
-            .generation_poison
-            .lock()
-            .map_err(|_| KernelBuildError::Principal("generation poison lock poisoned".to_owned()))?
-            .is_some()
-        {
-            return Err(KernelBuildError::Principal(
-                "generation gateway fenced; forward recovery is required".to_owned(),
-            ));
+        observe_listener("kernel.front_door_listener_create", "attempt");
+        let result: Result<NamedPipeServer, KernelBuildError> = (|| {
+            if self
+                .generation_poison
+                .lock()
+                .map_err(|_| {
+                    KernelBuildError::Principal("generation poison lock poisoned".to_owned())
+                })?
+                .is_some()
+            {
+                return Err(KernelBuildError::Principal(
+                    "generation gateway fenced; forward recovery is required".to_owned(),
+                ));
+            }
+            let expectation = eliot_platform_windows::current_process_named_pipe_expectation()
+                .map_err(|error| KernelBuildError::Principal(error.to_string()))?;
+            NamedPipeServer::create(self.ipc.name(), &expectation)
+                .map_err(|error| KernelBuildError::Principal(error.to_string()))
+        })();
+        match &result {
+            Ok(_) => {
+                observe_listener("kernel.front_door_listener_bind", "success");
+                observe_listener("kernel.front_door_listener_accept_ready", "success");
+            }
+            Err(error) => {
+                observe_listener("kernel.front_door_listener_create", "fenced");
+                super::kernel_diagnostics::observe_terminal_error(listener_terminal_code(error));
+            }
         }
-        let expectation = eliot_platform_windows::current_process_named_pipe_expectation()
-            .map_err(|error| KernelBuildError::Principal(error.to_string()))?;
-        NamedPipeServer::create(self.ipc.name(), &expectation)
-            .map_err(|error| KernelBuildError::Principal(error.to_string()))
+        result
     }
 
     /// Binds one additional authenticated Windows front-door instance for a
     /// concurrent session while the first instance remains connected.
     pub fn bind_authenticated_front_door_next(&self) -> Result<NamedPipeServer, KernelBuildError> {
-        if self
-            .generation_poison
-            .lock()
-            .map_err(|_| KernelBuildError::Principal("generation poison lock poisoned".to_owned()))?
-            .is_some()
-        {
-            return Err(KernelBuildError::Principal(
-                "generation gateway fenced; forward recovery is required".to_owned(),
-            ));
+        observe_listener("kernel.front_door_listener_rotate", "attempt");
+        let result: Result<NamedPipeServer, KernelBuildError> = (|| {
+            if self
+                .generation_poison
+                .lock()
+                .map_err(|_| {
+                    KernelBuildError::Principal("generation poison lock poisoned".to_owned())
+                })?
+                .is_some()
+            {
+                return Err(KernelBuildError::Principal(
+                    "generation gateway fenced; forward recovery is required".to_owned(),
+                ));
+            }
+            let expectation = eliot_platform_windows::current_process_named_pipe_expectation()
+                .map_err(|error| KernelBuildError::Principal(error.to_string()))?;
+            NamedPipeServer::create_additional(self.ipc.name(), &expectation)
+                .map_err(|error| KernelBuildError::Principal(error.to_string()))
+        })();
+        match &result {
+            Ok(_) => {
+                observe_listener("kernel.front_door_listener_rotate", "success");
+                observe_listener("kernel.front_door_listener_accept_ready", "success");
+            }
+            Err(error) => {
+                observe_listener("kernel.front_door_listener_rotate", "fenced");
+                super::kernel_diagnostics::observe_terminal_error(listener_terminal_code(error));
+            }
         }
-        let expectation = eliot_platform_windows::current_process_named_pipe_expectation()
-            .map_err(|error| KernelBuildError::Principal(error.to_string()))?;
-        NamedPipeServer::create_additional(self.ipc.name(), &expectation)
-            .map_err(|error| KernelBuildError::Principal(error.to_string()))
+        result
     }
 
     /// Binds the first front-door instance using the exact sealed Host,
@@ -64,18 +114,34 @@ impl KernelComposition {
         &self,
         peers: &NamedPipePeerSet,
     ) -> Result<NamedPipeServer, KernelBuildError> {
-        if self
-            .generation_poison
-            .lock()
-            .map_err(|_| KernelBuildError::Principal("generation poison lock poisoned".to_owned()))?
-            .is_some()
-        {
-            return Err(KernelBuildError::Principal(
-                "generation gateway fenced; forward recovery is required".to_owned(),
-            ));
+        observe_listener("kernel.front_door_listener_bind", "attempt");
+        let result: Result<NamedPipeServer, KernelBuildError> = (|| {
+            if self
+                .generation_poison
+                .lock()
+                .map_err(|_| {
+                    KernelBuildError::Principal("generation poison lock poisoned".to_owned())
+                })?
+                .is_some()
+            {
+                return Err(KernelBuildError::Principal(
+                    "generation gateway fenced; forward recovery is required".to_owned(),
+                ));
+            }
+            NamedPipeServer::create_with_peer_set(self.ipc.name(), peers)
+                .map_err(|error| KernelBuildError::Principal(error.to_string()))
+        })();
+        match &result {
+            Ok(_) => {
+                observe_listener("kernel.front_door_listener_bind", "success");
+                observe_listener("kernel.front_door_listener_accept_ready", "success");
+            }
+            Err(error) => {
+                observe_listener("kernel.front_door_listener_bind", "fenced");
+                super::kernel_diagnostics::observe_terminal_error(listener_terminal_code(error));
+            }
         }
-        NamedPipeServer::create_with_peer_set(self.ipc.name(), peers)
-            .map_err(|error| KernelBuildError::Principal(error.to_string()))
+        result
     }
 
     /// Binds one replacement instance using the current immutable peer set.
@@ -83,17 +149,33 @@ impl KernelComposition {
         &self,
         peers: &NamedPipePeerSet,
     ) -> Result<NamedPipeServer, KernelBuildError> {
-        if self
-            .generation_poison
-            .lock()
-            .map_err(|_| KernelBuildError::Principal("generation poison lock poisoned".to_owned()))?
-            .is_some()
-        {
-            return Err(KernelBuildError::Principal(
-                "generation gateway fenced; forward recovery is required".to_owned(),
-            ));
+        observe_listener("kernel.front_door_listener_rotate", "attempt");
+        let result: Result<NamedPipeServer, KernelBuildError> = (|| {
+            if self
+                .generation_poison
+                .lock()
+                .map_err(|_| {
+                    KernelBuildError::Principal("generation poison lock poisoned".to_owned())
+                })?
+                .is_some()
+            {
+                return Err(KernelBuildError::Principal(
+                    "generation gateway fenced; forward recovery is required".to_owned(),
+                ));
+            }
+            NamedPipeServer::create_additional_with_peer_set(self.ipc.name(), peers)
+                .map_err(|error| KernelBuildError::Principal(error.to_string()))
+        })();
+        match &result {
+            Ok(_) => {
+                observe_listener("kernel.front_door_listener_rotate", "success");
+                observe_listener("kernel.front_door_listener_accept_ready", "success");
+            }
+            Err(error) => {
+                observe_listener("kernel.front_door_listener_rotate", "fenced");
+                super::kernel_diagnostics::observe_terminal_error(listener_terminal_code(error));
+            }
         }
-        NamedPipeServer::create_additional_with_peer_set(self.ipc.name(), peers)
-            .map_err(|error| KernelBuildError::Principal(error.to_string()))
+        result
     }
 }

@@ -43,7 +43,7 @@ use eliot_platform_windows::{
     InstallerRootPrimitiveCreate, InstallerRootPrimitiveObservation, InstallerRootPrimitiveSpec,
     InstallerRootProfile, InstallerRootStage, InstallerSecretCreateDisposition,
     InstallerSecretObservation, ProtectedPathLease, ProtectedRootLease, ProtectedRuntimePathLease,
-    ServiceAccount, ServiceBootstrapArguments, ServiceRegistrationCurrent,
+    ServiceAbsentProof, ServiceAccount, ServiceBootstrapArguments, ServiceRegistrationCurrent,
     ServiceRegistrationInspection, ServiceRegistrationOutcome, ServiceRegistrationRequest,
     ServiceRegistrationRuntimeInspection, ServiceStartMode, ServiceStartOutcome,
     ServiceStopOutcome, StagingReceipt, SupervisionAuthorityKeyError,
@@ -55,7 +55,8 @@ use eliot_platform_windows::{
 };
 #[cfg(test)]
 use eliot_platform_windows::{
-    ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK, watchdog_service_security_descriptor_digest,
+    ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK, ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK,
+    host_service_security_descriptor_digest, watchdog_service_security_descriptor_digest,
 };
 pub use eliot_runtime_contracts::ProvisionedSupervisionAuthority;
 use eliot_runtime_contracts::{
@@ -943,6 +944,12 @@ pub struct CandidateManifest {
     pub canonical_store_artifact_digest: PlatformHandle,
     /// SHA-256 digest of the approved Host image.
     pub host_artifact_digest: PlatformHandle,
+    /// SHA-256 digest of the approved Doctor image.
+    pub doctor_artifact_digest: PlatformHandle,
+    /// SHA-256 digest of the approved Testd image.
+    pub testd_artifact_digest: PlatformHandle,
+    /// SHA-256 digest of the approved native worker image.
+    pub native_worker_artifact_digest: PlatformHandle,
     /// Canonical installation-approved Kernel executable path.
     pub kernel_executable_path: PlatformHandle,
     /// Canonical installation-approved eliot-store-surreal bridge path.
@@ -951,6 +958,12 @@ pub struct CandidateManifest {
     pub canonical_store_executable_path: PlatformHandle,
     /// Canonical installation-approved Host executable path.
     pub host_executable_path: PlatformHandle,
+    /// Canonical installation-approved Doctor executable path.
+    pub doctor_executable_path: PlatformHandle,
+    /// Canonical installation-approved Testd executable path.
+    pub testd_executable_path: PlatformHandle,
+    /// Canonical installation-approved native worker executable path.
+    pub native_worker_executable_path: PlatformHandle,
     /// Canonical installation-approved generation configuration path.
     pub config_path: PlatformHandle,
     /// Executable/dependency closure evidence.
@@ -973,7 +986,7 @@ pub struct CandidateManifest {
     /// Runtime Live canary artifact-set evidence reference.
     ///
     /// This is a content-addressed, domain-separated SHA-256 over the
-    /// canonical generation and exact ordered nine-file Phase-A facts. It is not a
+    /// canonical generation and exact ordered twelve-file Phase-A facts. It is not a
     /// production release signature; production signing remains unclaimed.
     pub signature_ref: PlatformHandle,
     /// Digest of the exact mutable root topology approved by this manifest.
@@ -1149,6 +1162,18 @@ pub struct RuntimeLaunchDescriptor {
     pub watchdog_executable_path: PlatformHandle,
     /// SHA-256 digest of the Watchdog image.
     pub watchdog_artifact_digest: PlatformHandle,
+    /// SHA-256 digest of the approved Doctor image.
+    pub doctor_artifact_digest: PlatformHandle,
+    /// SHA-256 digest of the approved Testd image.
+    pub testd_artifact_digest: PlatformHandle,
+    /// SHA-256 digest of the approved native worker image.
+    pub native_worker_artifact_digest: PlatformHandle,
+    /// Explicit installation-approved Doctor executable path.
+    pub doctor_executable_path: PlatformHandle,
+    /// Explicit installation-approved Testd executable path.
+    pub testd_executable_path: PlatformHandle,
+    /// Explicit installation-approved native worker executable path.
+    pub native_worker_executable_path: PlatformHandle,
     /// SHA-256 of the descriptor fields excluding this digest.
     pub descriptor_digest: PlatformHandle,
 }
@@ -1486,6 +1511,12 @@ impl RuntimeLaunchDescriptor {
             self.authority_descriptor_digest.as_str().to_owned(),
             "--kernel-artifact-sha256".to_owned(),
             self.kernel_artifact_digest.as_str().to_owned(),
+            "--doctor-artifact-sha256".to_owned(),
+            self.doctor_artifact_digest.as_str().to_owned(),
+            "--testd-artifact-sha256".to_owned(),
+            self.testd_artifact_digest.as_str().to_owned(),
+            "--native-worker-artifact-sha256".to_owned(),
+            self.native_worker_artifact_digest.as_str().to_owned(),
             "--eliotd-descriptor".to_owned(),
             self.eliotd_descriptor_path.as_str().to_owned(),
             "--eliotd-descriptor-sha256".to_owned(),
@@ -1545,6 +1576,33 @@ impl RuntimeLaunchDescriptor {
         Ok((&self.host_executable_path, &self.host_artifact_digest))
     }
 
+    /// Returns the three dispatch child image digests from the launch
+    /// descriptor: Doctor, Testd, and native worker. Validated exactly like
+    /// `kernel_artifact_digest`; never defaulted.
+    pub fn dispatch_child_artifact_digests(
+        &self,
+    ) -> Result<(&PlatformHandle, &PlatformHandle, &PlatformHandle), InstallationError> {
+        self.validate()?;
+        Ok((
+            &self.doctor_artifact_digest,
+            &self.testd_artifact_digest,
+            &self.native_worker_artifact_digest,
+        ))
+    }
+
+    /// Returns the three dispatch child executable paths from the launch
+    /// descriptor: Doctor, Testd, and native worker.
+    pub fn dispatch_child_paths(
+        &self,
+    ) -> Result<(&PlatformHandle, &PlatformHandle, &PlatformHandle), InstallationError> {
+        self.validate()?;
+        Ok((
+            &self.doctor_executable_path,
+            &self.testd_executable_path,
+            &self.native_worker_executable_path,
+        ))
+    }
+
     fn unsigned_bytes(&self) -> Result<Vec<u8>, InstallationError> {
         #[derive(Serialize)]
         struct Unsigned<'a> {
@@ -1583,6 +1641,12 @@ impl RuntimeLaunchDescriptor {
             host_artifact_digest: &'a PlatformHandle,
             watchdog_executable_path: &'a PlatformHandle,
             watchdog_artifact_digest: &'a PlatformHandle,
+            doctor_artifact_digest: &'a PlatformHandle,
+            testd_artifact_digest: &'a PlatformHandle,
+            native_worker_artifact_digest: &'a PlatformHandle,
+            doctor_executable_path: &'a PlatformHandle,
+            testd_executable_path: &'a PlatformHandle,
+            native_worker_executable_path: &'a PlatformHandle,
         }
         serde_json::to_vec(&Unsigned {
             profile: self.profile,
@@ -1620,6 +1684,12 @@ impl RuntimeLaunchDescriptor {
             host_artifact_digest: &self.host_artifact_digest,
             watchdog_executable_path: &self.watchdog_executable_path,
             watchdog_artifact_digest: &self.watchdog_artifact_digest,
+            doctor_artifact_digest: &self.doctor_artifact_digest,
+            testd_artifact_digest: &self.testd_artifact_digest,
+            native_worker_artifact_digest: &self.native_worker_artifact_digest,
+            doctor_executable_path: &self.doctor_executable_path,
+            testd_executable_path: &self.testd_executable_path,
+            native_worker_executable_path: &self.native_worker_executable_path,
         })
         .map_err(|error| InstallationError::InvalidField {
             field: "manifest.runtime_launch".to_owned(),
@@ -1825,6 +1895,69 @@ impl RuntimeLaunchDescriptor {
             &self.watchdog_artifact_digest,
             "runtime_launch.watchdog_artifact_digest",
         )?;
+        approved_path(
+            &self.doctor_executable_path,
+            "runtime_launch.doctor_executable_path",
+        )?;
+        approved_filename(
+            &self.doctor_executable_path,
+            "eliot-doctor.exe",
+            "runtime_launch.doctor_executable_path",
+        )?;
+        runtime_sha256_handle(
+            &self.doctor_artifact_digest,
+            "runtime_launch.doctor_artifact_digest",
+        )?;
+        approved_path(
+            &self.testd_executable_path,
+            "runtime_launch.testd_executable_path",
+        )?;
+        approved_filename(
+            &self.testd_executable_path,
+            "eliot-testd.exe",
+            "runtime_launch.testd_executable_path",
+        )?;
+        runtime_sha256_handle(
+            &self.testd_artifact_digest,
+            "runtime_launch.testd_artifact_digest",
+        )?;
+        approved_path(
+            &self.native_worker_executable_path,
+            "runtime_launch.native_worker_executable_path",
+        )?;
+        approved_filename(
+            &self.native_worker_executable_path,
+            "eliot-native-worker.exe",
+            "runtime_launch.native_worker_executable_path",
+        )?;
+        runtime_sha256_handle(
+            &self.native_worker_artifact_digest,
+            "runtime_launch.native_worker_artifact_digest",
+        )?;
+        if self.doctor_executable_path == self.testd_executable_path
+            || self.doctor_executable_path == self.native_worker_executable_path
+            || self.testd_executable_path == self.native_worker_executable_path
+            || self.doctor_executable_path == self.host_executable_path
+            || self.doctor_executable_path == self.watchdog_executable_path
+            || self.doctor_executable_path == self.store_bridge_executable_path
+            || self.doctor_executable_path == self.canonical_store_executable_path
+            || self.doctor_executable_path == self.eliotd_executable_path
+            || self.testd_executable_path == self.host_executable_path
+            || self.testd_executable_path == self.watchdog_executable_path
+            || self.testd_executable_path == self.store_bridge_executable_path
+            || self.testd_executable_path == self.canonical_store_executable_path
+            || self.testd_executable_path == self.eliotd_executable_path
+            || self.native_worker_executable_path == self.host_executable_path
+            || self.native_worker_executable_path == self.watchdog_executable_path
+            || self.native_worker_executable_path == self.store_bridge_executable_path
+            || self.native_worker_executable_path == self.canonical_store_executable_path
+            || self.native_worker_executable_path == self.eliotd_executable_path
+        {
+            return Err(InstallationError::Duplicate {
+                kind: "runtime_launch.named_artifact_paths".to_owned(),
+                identity: "aliased dispatch executable path".to_owned(),
+            });
+        }
         match (self.profile, &self.portable_root) {
             (InstallationProfile::PortableDev, Some(root)) => {
                 approved_path(root, "runtime_launch.portable_root")?;
@@ -1865,6 +1998,18 @@ impl RuntimeLaunchDescriptor {
             (
                 &self.host_executable_path,
                 "runtime_launch.host_executable_path",
+            ),
+            (
+                &self.doctor_executable_path,
+                "runtime_launch.doctor_executable_path",
+            ),
+            (
+                &self.testd_executable_path,
+                "runtime_launch.testd_executable_path",
+            ),
+            (
+                &self.native_worker_executable_path,
+                "runtime_launch.native_worker_executable_path",
             ),
             (&self.store_config_path, "runtime_launch.store_config_path"),
             (
@@ -1931,6 +2076,18 @@ impl RuntimeLaunchDescriptor {
             (
                 &self.host_executable_path,
                 "runtime_launch.host_executable_path",
+            ),
+            (
+                &self.doctor_executable_path,
+                "runtime_launch.doctor_executable_path",
+            ),
+            (
+                &self.testd_executable_path,
+                "runtime_launch.testd_executable_path",
+            ),
+            (
+                &self.native_worker_executable_path,
+                "runtime_launch.native_worker_executable_path",
             ),
         ] {
             self.runtime_state_roots
@@ -2006,6 +2163,18 @@ impl CandidateManifest {
             "manifest.canonical_store_artifact_digest",
         )?;
         sha256_handle(&self.host_artifact_digest, "manifest.host_artifact_digest")?;
+        sha256_handle(
+            &self.doctor_artifact_digest,
+            "manifest.doctor_artifact_digest",
+        )?;
+        sha256_handle(
+            &self.testd_artifact_digest,
+            "manifest.testd_artifact_digest",
+        )?;
+        sha256_handle(
+            &self.native_worker_artifact_digest,
+            "manifest.native_worker_artifact_digest",
+        )?;
         approved_path(
             &self.kernel_executable_path,
             "manifest.kernel_executable_path",
@@ -2048,12 +2217,72 @@ impl CandidateManifest {
         self.runtime_launch
             .runtime_state_roots
             .reject_mutable_alias(&self.host_executable_path, "manifest.host_executable_path")?;
+        approved_path(
+            &self.doctor_executable_path,
+            "manifest.doctor_executable_path",
+        )?;
+        approved_filename(
+            &self.doctor_executable_path,
+            "eliot-doctor.exe",
+            "manifest.doctor_executable_path",
+        )?;
+        self.runtime_launch
+            .runtime_state_roots
+            .reject_mutable_alias(
+                &self.doctor_executable_path,
+                "manifest.doctor_executable_path",
+            )?;
+        approved_path(
+            &self.testd_executable_path,
+            "manifest.testd_executable_path",
+        )?;
+        approved_filename(
+            &self.testd_executable_path,
+            "eliot-testd.exe",
+            "manifest.testd_executable_path",
+        )?;
+        self.runtime_launch
+            .runtime_state_roots
+            .reject_mutable_alias(
+                &self.testd_executable_path,
+                "manifest.testd_executable_path",
+            )?;
+        approved_path(
+            &self.native_worker_executable_path,
+            "manifest.native_worker_executable_path",
+        )?;
+        approved_filename(
+            &self.native_worker_executable_path,
+            "eliot-native-worker.exe",
+            "manifest.native_worker_executable_path",
+        )?;
+        self.runtime_launch
+            .runtime_state_roots
+            .reject_mutable_alias(
+                &self.native_worker_executable_path,
+                "manifest.native_worker_executable_path",
+            )?;
         if self.kernel_executable_path == self.store_bridge_executable_path
             || self.kernel_executable_path == self.canonical_store_executable_path
             || self.kernel_executable_path == self.host_executable_path
+            || self.kernel_executable_path == self.doctor_executable_path
+            || self.kernel_executable_path == self.testd_executable_path
+            || self.kernel_executable_path == self.native_worker_executable_path
             || self.store_bridge_executable_path == self.canonical_store_executable_path
             || self.store_bridge_executable_path == self.host_executable_path
+            || self.store_bridge_executable_path == self.doctor_executable_path
+            || self.store_bridge_executable_path == self.testd_executable_path
+            || self.store_bridge_executable_path == self.native_worker_executable_path
             || self.canonical_store_executable_path == self.host_executable_path
+            || self.canonical_store_executable_path == self.doctor_executable_path
+            || self.canonical_store_executable_path == self.testd_executable_path
+            || self.canonical_store_executable_path == self.native_worker_executable_path
+            || self.host_executable_path == self.doctor_executable_path
+            || self.host_executable_path == self.testd_executable_path
+            || self.host_executable_path == self.native_worker_executable_path
+            || self.doctor_executable_path == self.testd_executable_path
+            || self.doctor_executable_path == self.native_worker_executable_path
+            || self.testd_executable_path == self.native_worker_executable_path
         {
             return Err(InstallationError::Duplicate {
                 kind: "manifest.named_artifact_paths".to_owned(),
@@ -2099,10 +2328,23 @@ impl CandidateManifest {
         if self.runtime_launch.eliotd_executable_path == self.kernel_executable_path
             || self.runtime_launch.eliotd_executable_path == self.store_bridge_executable_path
             || self.runtime_launch.eliotd_executable_path == self.canonical_store_executable_path
+            || self.runtime_launch.eliotd_executable_path == self.doctor_executable_path
+            || self.runtime_launch.eliotd_executable_path == self.testd_executable_path
+            || self.runtime_launch.eliotd_executable_path == self.native_worker_executable_path
         {
             return Err(InstallationError::Duplicate {
                 kind: "manifest.named_artifact_paths".to_owned(),
                 identity: "eliotd executable aliases another approved executable".to_owned(),
+            });
+        }
+        if self.runtime_launch.doctor_executable_path == self.config_path
+            || self.runtime_launch.testd_executable_path == self.config_path
+            || self.runtime_launch.native_worker_executable_path == self.config_path
+        {
+            return Err(InstallationError::InvalidField {
+                field: "manifest.runtime_launch.dispatch_executable_path".to_owned(),
+                reason: "dispatch executables must be distinct from the approved Store config"
+                    .to_owned(),
             });
         }
         handle(
@@ -2147,6 +2389,21 @@ impl CandidateManifest {
             &self.host_executable_path,
             "manifest.host_executable_path",
         )?;
+        reject_authority_alias(
+            &self.runtime_launch.authority_descriptor_path,
+            &self.doctor_executable_path,
+            "manifest.doctor_executable_path",
+        )?;
+        reject_authority_alias(
+            &self.runtime_launch.authority_descriptor_path,
+            &self.testd_executable_path,
+            "manifest.testd_executable_path",
+        )?;
+        reject_authority_alias(
+            &self.runtime_launch.authority_descriptor_path,
+            &self.native_worker_executable_path,
+            "manifest.native_worker_executable_path",
+        )?;
         if self.runtime_launch.canonical_store_executable_path
             != self.canonical_store_executable_path
         {
@@ -2162,6 +2419,14 @@ impl CandidateManifest {
                 != self.canonical_store_artifact_digest
             || self.runtime_launch.host_executable_path != self.host_executable_path
             || self.runtime_launch.host_artifact_digest != self.host_artifact_digest
+            || self.runtime_launch.doctor_executable_path != self.doctor_executable_path
+            || self.runtime_launch.doctor_artifact_digest != self.doctor_artifact_digest
+            || self.runtime_launch.testd_executable_path != self.testd_executable_path
+            || self.runtime_launch.testd_artifact_digest != self.testd_artifact_digest
+            || self.runtime_launch.native_worker_executable_path
+                != self.native_worker_executable_path
+            || self.runtime_launch.native_worker_artifact_digest
+                != self.native_worker_artifact_digest
         {
             return Err(InstallationError::InvalidField {
                 field: "manifest.runtime_launch.artifact_bindings".to_owned(),
@@ -2257,6 +2522,35 @@ impl CandidateManifest {
             &self.store_bridge_executable_path,
             &self.config_path,
         )
+    }
+
+    /// Returns the three dispatch child image digests: Doctor, Testd, and
+    /// native worker. Each digest is validated exactly like
+    /// `kernel_artifact_digest`; a missing or placeholder value fails closed
+    /// and is never defaulted.
+    pub fn dispatch_child_artifact_digests(
+        &self,
+    ) -> Result<(&PlatformHandle, &PlatformHandle, &PlatformHandle), InstallationError> {
+        self.validate()?;
+        Ok((
+            &self.doctor_artifact_digest,
+            &self.testd_artifact_digest,
+            &self.native_worker_artifact_digest,
+        ))
+    }
+
+    /// Returns the three dispatch child executable paths: Doctor, Testd, and
+    /// native worker. These mirror `host_child_paths` for the Kernel-owned
+    /// dispatch contour.
+    pub fn dispatch_child_paths(
+        &self,
+    ) -> Result<(&PlatformHandle, &PlatformHandle, &PlatformHandle), InstallationError> {
+        self.validate()?;
+        Ok((
+            &self.doctor_executable_path,
+            &self.testd_executable_path,
+            &self.native_worker_executable_path,
+        ))
     }
 }
 
@@ -2763,8 +3057,11 @@ pub enum InstallationEffectObservation {
         evidence: Vec<PlatformHandle>,
         /// Digest of the authoritative postcondition.
         postcondition_digest: PlatformHandle,
-        /// Exact service-object DACL receipt, present only for the Watchdog
-        /// registration effect.
+        /// Exact installer-policy service DACL receipt, present for Host and
+        /// Watchdog registration effects. A Host service whose security
+        /// descriptor is not the installer policy must never be reported
+        /// `Applied`, so Host registrations prove their DACL exactly like
+        /// Watchdog registrations.
         service_control_grant: Option<Box<InstallerServiceControlGrantReceipt>>,
         /// Typed credential receipt, only for the Store credential effect.
         credential_receipt: Option<CredentialAccessReceipt>,
@@ -2821,13 +3118,21 @@ impl InstallationEffectObservation {
                     )
                 })?;
             }
+            // s38 (#1345): Host parity with the Watchdog rule above. A Host
+            // service whose DACL is not the installer policy must never be
+            // reported `Applied` / `CREATED_BY_TRANSACTION`, so a Host
+            // `Matching` observation without its grant receipt fails closed
+            // here before it can reach durable `Applied` state.
             InstallerEffectPlan::RegisterService {
                 role: InstallerServiceRole::Host,
                 ..
-            } => {
-                if matching_control_grant.is_some() {
-                    return Err(InstallationError::IdentityConflict);
-                }
+            } if matches!(self, Self::Matching { .. }) => {
+                matching_control_grant.ok_or_else(|| {
+                    InstallationError::IncompleteObservation(
+                        "Host registration requires exact installer-policy service-control grant readback"
+                            .to_owned(),
+                    )
+                })?;
             }
             _ if matching_control_grant.is_some() => {
                 return Err(InstallationError::IdentityConflict);
@@ -2913,8 +3218,17 @@ impl InstallationEffectObservation {
                 service_runtime_lineage,
             } => {
                 observed_precondition.validate()?;
+                // s33.3 (#1313): a package `Absent` carries its independently
+                // observed `package_snapshot` (trusted source-bundle readback),
+                // not an OS/credential contour. Accept it as the third
+                // absence-snapshot kind alongside OS and credential snapshots.
+                // This is not a blanket allow: at least one typed snapshot is
+                // still required when `allow_service_absence` is false (the
+                // strict rollback gate), and `InstallationEffectPrecondition`
+                // still enforces mutual exclusivity plus digest binding.
                 if observed_precondition.os_snapshot.is_none()
                     && observed_precondition.credential_snapshot.is_none()
+                    && observed_precondition.package_snapshot.is_none()
                     && !allow_service_absence
                 {
                     return Err(InstallationError::InvalidField {
@@ -3848,11 +4162,39 @@ impl WindowsInstallationEffectPort {
             .ok_or(PortError::InvalidRequestMetadata)?
             .validate()
             .map_err(|_| PortError::InvalidRequestMetadata)?;
+        // s33.3 (#1313): preserve an admitted generation snapshot verbatim
+        // when rollback reconcile revisits a fixed inspect (same pattern as
+        // `service_absent_from_live_inspection`). A first-time pending
+        // Phase-B has no independently observed OS/credential/package contour
+        // yet — its materialization is Host-owned and the Host wire
+        // (`HostCredentialControlResponse`, credential_provision.rs, not owned
+        // here) returns no absence snapshot for pending — so the precondition
+        // is cloned unchanged. Identity is still bound: evidence covers the
+        // exact effect, plan, and candidate generation, mirroring the
+        // service-absent-v2 binding, so a foreign generation can never be
+        // mistaken for this pending one. Rollback never applies the strict
+        // gate here: a Pending Phase-B is skipped by the reverse loop and an
+        // Applied Phase-B quarantines as retained authority before the loop.
+        let InstallerEffectPlan::MaterializePhaseB {
+            candidate_manifest_digest,
+            ..
+        } = &request.plan
+        else {
+            return Err(PortError::InvalidRequestMetadata);
+        };
         Ok(InstallationEffectObservation::Absent {
             observed_precondition: request.precondition.clone(),
             evidence: vec![
-                PlatformHandle::new(format!("phase-b-pending:{}", request.effect_id.as_str()))
-                    .unwrap_or_else(|_| unreachable!()),
+                PlatformHandle::new(sha256_hex(
+                    format!(
+                        "phase-b-pending-v1\0{}\0{}\0{}",
+                        request.effect_id.as_str(),
+                        request.plan_digest.as_str(),
+                        candidate_manifest_digest.as_str(),
+                    )
+                    .as_bytes(),
+                ))
+                .map_err(|_| PortError::InvalidRequestMetadata)?,
             ],
             service_runtime_lineage: None,
         })
@@ -4042,11 +4384,17 @@ impl WindowsInstallationEffectPort {
         let (platform, registration, spec) = Self::service_context(request)?;
         let service_name = registration.service_name().to_owned();
         match platform.inspect_service_registration(&registration) {
-            ServiceRegistrationInspection::Absent => {
+            ServiceRegistrationInspection::Absent { proof } => {
                 if std::fs::symlink_metadata(service_marker_path(request)).is_ok() {
                     return Ok(root_mismatch("service-marker-before-intent"));
                 }
-                service_absent_observation(request)
+                service_absent_from_live_inspection(
+                    request,
+                    &registration,
+                    &proof,
+                    &self.primitive,
+                    &spec,
+                )
             }
             ServiceRegistrationInspection::Matching { control_grant, .. } => {
                 let digest = registration.expected_configuration_digest();
@@ -4055,6 +4403,22 @@ impl WindowsInstallationEffectPort {
                     .map(InstallerServiceControlGrantReceipt::from_readback)
                     .transpose()
                     .map_err(|_| PortError::InvalidRequestMetadata)?;
+                // s38 (#1345): a Host service whose DACL is not the installer
+                // policy must never be reported `Applied`. The platform only
+                // reports `Matching` with `Some` grant once it has proven the
+                // installer-policy DACL; without that proof the registration
+                // is a configuration mismatch even when the SCM configuration
+                // digest already matches.
+                if matches!(
+                    &request.plan,
+                    InstallerEffectPlan::RegisterService {
+                        role: InstallerServiceRole::Host,
+                        ..
+                    }
+                ) && control_grant.is_none()
+                {
+                    return Ok(root_mismatch("service-config"));
+                }
                 match service_marker_read(
                     &self.primitive,
                     &spec,
@@ -4075,7 +4439,7 @@ impl WindowsInstallationEffectPort {
                 }
             }
             ServiceRegistrationInspection::Mismatched => Ok(root_mismatch("service-config")),
-            ServiceRegistrationInspection::Unknown => Ok(root_mismatch("service-readback")),
+            ServiceRegistrationInspection::Unknown { .. } => Ok(root_mismatch("service-readback")),
         }
     }
 
@@ -4087,13 +4451,33 @@ impl WindowsInstallationEffectPort {
         let service_name = registration.service_name().to_owned();
         let digest = registration.expected_configuration_digest();
         match platform.inspect_service_registration(&registration) {
-            ServiceRegistrationInspection::Absent => service_absent_observation(request),
+            ServiceRegistrationInspection::Absent { proof } => service_absent_from_live_inspection(
+                request,
+                &registration,
+                &proof,
+                &self.primitive,
+                &spec,
+            ),
             ServiceRegistrationInspection::Matching { control_grant, .. } => {
                 let control_grant = control_grant
                     .as_ref()
                     .map(InstallerServiceControlGrantReceipt::from_readback)
                     .transpose()
                     .map_err(|_| PortError::InvalidRequestMetadata)?;
+                // s38 (#1345): same fail-closed gate as `inspect_service`
+                // above. The ownership marker must never be minted and the
+                // effect must never be reported `CREATED_BY_TRANSACTION`
+                // without the installer-policy DACL proof.
+                if matches!(
+                    &request.plan,
+                    InstallerEffectPlan::RegisterService {
+                        role: InstallerServiceRole::Host,
+                        ..
+                    }
+                ) && control_grant.is_none()
+                {
+                    return Ok(root_mismatch("service-config"));
+                }
                 let marker = if let Some(marker) = service_marker_read(
                     &self.primitive,
                     &spec,
@@ -4141,7 +4525,7 @@ impl WindowsInstallationEffectPort {
                 )
             }
             ServiceRegistrationInspection::Mismatched => Ok(root_mismatch("service-config")),
-            ServiceRegistrationInspection::Unknown => Ok(root_mismatch("service-readback")),
+            ServiceRegistrationInspection::Unknown { .. } => Ok(root_mismatch("service-readback")),
         }
     }
 
@@ -4227,6 +4611,100 @@ impl WindowsInstallationEffectPort {
         })
     }
 
+    /// Attaches a platform-observed absence snapshot to a live stopped/starting
+    /// `StartService` readback, the start analogue of
+    /// `service_absent_with_snapshot` (#1308).
+    ///
+    /// The snapshot is never derived from the plan alone: callers pass the
+    /// live `ServiceRuntimeObservation` (stopped/starting) so the target binds
+    /// the exact queried service name plus admitted configuration digest, and
+    /// the parents are the installer-root handles just read back in this call.
+    /// A precondition that already carries the admitted OS snapshot (rollback
+    /// reconcile after a fixed inspect) is preserved verbatim.
+    fn service_start_absent_with_snapshot(
+        request: &InstallationEffectRequest,
+        registration: &ServiceRegistrationRequest,
+        reason: &str,
+        service_runtime_lineage: Option<InstallationServiceProcessLineage>,
+        snapshot: InstallerRootAbsentSnapshot,
+    ) -> Result<InstallationEffectObservation, PortError> {
+        let snapshot = installation_absent_snapshot(snapshot)?;
+        let precondition = request
+            .precondition
+            .with_os_snapshot(snapshot)
+            .map_err(|_| PortError::InvalidRequestMetadata)?;
+        Self::service_start_absent(
+            &InstallationEffectRequest {
+                precondition,
+                ..request.clone()
+            },
+            registration,
+            reason,
+            service_runtime_lineage,
+        )
+    }
+
+    /// Builds the `Absent` observation for a just-observed stopped/starting
+    /// `StartService` runtime.
+    ///
+    /// The live SCM observation must bind this exact validated registration; a
+    /// readback for any other name or configuration digest is a
+    /// provider/readback substitution and fails closed, so a foreign service
+    /// is never mistaken for our stopped start. Nothing is derived from the
+    /// plan alone: the snapshot target covers the live stopped/starting
+    /// outcome and the parents are the handles just read back in this call.
+    fn service_start_absent_from_live_inspection(
+        &self,
+        request: &InstallationEffectRequest,
+        registration: &ServiceRegistrationRequest,
+        reason: &str,
+        service_runtime_lineage: Option<InstallationServiceProcessLineage>,
+        observation: &eliot_platform_windows::ServiceRuntimeObservation,
+        spec: &InstallerRootPrimitiveSpec,
+    ) -> Result<InstallationEffectObservation, PortError> {
+        if observation.service_name() != registration.service_name()
+            || observation.configuration_digest() != registration.expected_configuration_digest()
+        {
+            return Err(PortError::InvalidRequestMetadata);
+        }
+        if request.precondition.os_snapshot.is_some() {
+            return Self::service_start_absent(
+                request,
+                registration,
+                reason,
+                service_runtime_lineage,
+            );
+        }
+        let snapshot = match self.primitive.inspect(spec).map_err(root_port_error)? {
+            InstallerRootPrimitiveObservation::Absent(snapshot) => snapshot,
+            InstallerRootPrimitiveObservation::Matching(root) => InstallerRootAbsentSnapshot {
+                target_path_digest: sha256_hex(
+                    format!(
+                        "service-start-absent-target-v1\0{}\0{}\0{}",
+                        registration.service_name(),
+                        registration.expected_configuration_digest(),
+                        reason,
+                    )
+                    .as_bytes(),
+                ),
+                profile_anchor: root.clone(),
+                ancestors: vec![root.clone()],
+                parent: root,
+                root_absent: true,
+            },
+            InstallerRootPrimitiveObservation::Mismatch => {
+                return Ok(root_mismatch("service-root-readback"));
+            }
+        };
+        Self::service_start_absent_with_snapshot(
+            request,
+            registration,
+            reason,
+            service_runtime_lineage,
+            snapshot,
+        )
+    }
+
     fn service_runtime_identity_evidence(
         registration: &ServiceRegistrationRequest,
         observation: &eliot_platform_windows::ServiceRuntimeObservation,
@@ -4248,15 +4726,11 @@ impl WindowsInstallationEffectPort {
             .map_err(|_| PortError::InvalidRequestMetadata)
     }
 
-    #[allow(
-        clippy::unused_self,
-        reason = "the sealed effect-port receiver keeps StartService context behind one adapter"
-    )]
     fn service_start_inspect(
         &self,
         request: &InstallationEffectRequest,
     ) -> Result<InstallationEffectObservation, PortError> {
-        let (platform, registration, _) = Self::service_start_context(request)?;
+        let (platform, registration, spec) = Self::service_start_context(request)?;
         match platform.inspect_service_registration_runtime(&registration) {
             ServiceRegistrationRuntimeInspection::Matching { observation }
                 if observation.is_running() =>
@@ -4271,26 +4745,31 @@ impl WindowsInstallationEffectPort {
             ServiceRegistrationRuntimeInspection::Matching { observation }
                 if observation.is_stopped() =>
             {
-                Self::service_start_absent(request, &registration, "service-stopped", None)
+                self.service_start_absent_from_live_inspection(
+                    request,
+                    &registration,
+                    "service-stopped",
+                    None,
+                    &observation,
+                    &spec,
+                )
             }
             ServiceRegistrationRuntimeInspection::Matching { .. } => {
                 Ok(root_mismatch("service-state-indeterminate"))
             }
             ServiceRegistrationRuntimeInspection::Absent => Ok(root_mismatch("service-missing")),
             ServiceRegistrationRuntimeInspection::Mismatched => Ok(root_mismatch("service-config")),
-            ServiceRegistrationRuntimeInspection::Unknown => Ok(root_mismatch("service-readback")),
+            ServiceRegistrationRuntimeInspection::Unknown { .. } => {
+                Ok(root_mismatch("service-readback"))
+            }
         }
     }
 
-    #[allow(
-        clippy::unused_self,
-        reason = "the sealed effect-port receiver keeps StartService context behind one adapter"
-    )]
     fn service_start_reconcile(
         &self,
         request: &InstallationEffectRequest,
     ) -> Result<InstallationEffectObservation, PortError> {
-        let (platform, registration, _) = Self::service_start_context(request)?;
+        let (platform, registration, spec) = Self::service_start_context(request)?;
         match platform.inspect_service_registration_runtime(&registration) {
             ServiceRegistrationRuntimeInspection::Matching { observation }
                 if observation.is_running() =>
@@ -4318,25 +4797,36 @@ impl WindowsInstallationEffectPort {
                 if observation.is_starting()
                     && request.action == InstallationEffectAction::Apply =>
             {
-                Self::service_start_absent(
+                self.service_start_absent_from_live_inspection(
                     request,
                     &registration,
                     "service-starting",
                     Self::service_process_lineage_if_available(&observation)?,
+                    &observation,
+                    &spec,
                 )
             }
             ServiceRegistrationRuntimeInspection::Matching { observation }
                 if observation.is_stopped()
                     && request.action == InstallationEffectAction::Rollback =>
             {
-                Self::service_start_absent(request, &registration, "service-stopped", None)
+                self.service_start_absent_from_live_inspection(
+                    request,
+                    &registration,
+                    "service-stopped",
+                    None,
+                    &observation,
+                    &spec,
+                )
             }
             ServiceRegistrationRuntimeInspection::Matching { .. } => {
                 Ok(root_mismatch("service-state-indeterminate"))
             }
             ServiceRegistrationRuntimeInspection::Absent => Ok(root_mismatch("service-missing")),
             ServiceRegistrationRuntimeInspection::Mismatched => Ok(root_mismatch("service-config")),
-            ServiceRegistrationRuntimeInspection::Unknown => Ok(root_mismatch("service-readback")),
+            ServiceRegistrationRuntimeInspection::Unknown { .. } => {
+                Ok(root_mismatch("service-readback"))
+            }
         }
     }
 
@@ -4692,11 +5182,55 @@ impl WindowsInstallationEffectPort {
                 if expected != absence_digest {
                     return Err(PortError::IdentityConflict);
                 }
-                Ok(InstallationEffectObservation::Absent {
-                    observed_precondition: request.precondition.clone(),
-                    evidence: vec![absence_digest],
-                    service_runtime_lineage: None,
-                })
+                // s33.3 (#1313): a delete acknowledgement without a typed
+                // absence snapshot cannot pass the strict rollback gate
+                // (`validate()` requires os/credential/package). Preserve the
+                // admitted credential snapshot verbatim when the rollback
+                // request already carries it (fixed inspect followed by
+                // reconcile). Otherwise independently re-observe absence now
+                // through an `Inspect` Host call and bind its snapshot via
+                // `with_credential_snapshot` — never fabricated from the plan.
+                // The delete digest stays in evidence alongside the fresh
+                // absent digest so both the authenticated delete and the
+                // re-observed absence are bound. Any non-absent re-readback
+                // fails closed.
+                if request.precondition.credential_snapshot.is_some() {
+                    return Ok(InstallationEffectObservation::Absent {
+                        observed_precondition: request.precondition.clone(),
+                        evidence: vec![absence_digest],
+                        service_runtime_lineage: None,
+                    });
+                }
+                let inspect_request = Self::host_credential_request(
+                    request,
+                    HostCredentialControlOperation::Inspect,
+                    Vec::new(),
+                )?;
+                match self.call_credential_host(&inspect_request)? {
+                    HostCredentialControlResponse::Absent {
+                        snapshot,
+                        response_digest,
+                    } => {
+                        if response_digest
+                            != credential_absent_response_digest(
+                                &inspect_request.intent.request_digest,
+                                &snapshot,
+                            )
+                            .map_err(|_| PortError::IdentityConflict)?
+                        {
+                            return Err(PortError::IdentityConflict);
+                        }
+                        Ok(InstallationEffectObservation::Absent {
+                            observed_precondition: request
+                                .precondition
+                                .with_credential_snapshot(snapshot)
+                                .map_err(|_| PortError::InvalidRequestMetadata)?,
+                            evidence: vec![absence_digest, response_digest],
+                            service_runtime_lineage: None,
+                        })
+                    }
+                    _ => Err(PortError::IdentityConflict),
+                }
             }
             HostCredentialControlResponse::PhaseBReady { .. }
             | HostCredentialControlResponse::PhaseBPrepared { .. } => {
@@ -5215,6 +5749,17 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
         let Ok(control_grant) = control_grant else {
             return PortOutcome::Error(PortError::InvalidRequestMetadata);
         };
+        // s38 (#1345): Host and Watchdog creations both require the
+        // installer-policy DACL proof before the ownership marker may be
+        // minted. Older platform builds never return a Host grant, so Host
+        // creation honestly stays `Unknown` until the platform generalizes
+        // the grant install/read (WRITER-A); it can never be reported
+        // `Created` with a default DACL. The Watchdog outcome is unchanged:
+        // a missing Watchdog grant already took this `Unknown` path through
+        // the flag comparison below.
+        if control_grant.is_none() {
+            return PortOutcome::Unknown(UnknownReason::Indeterminate);
+        }
         if registration.requires_host_service_control_grant() != control_grant.is_some() {
             return PortOutcome::Unknown(UnknownReason::Indeterminate);
         }
@@ -5970,17 +6515,34 @@ fn service_marker_read(
     Ok(Some((readback.object, marker)))
 }
 
+/// Builds a rollback-valid `Absent` observation bound to the live SCM proof.
+///
+/// The proof must bind this exact validated registration; a proof for any
+/// other name or configuration digest is a provider/readback substitution and
+/// fails closed. Evidence binds the effect, plan, observed service identity,
+/// and the `DOES_NOT_EXIST` outcome, mirroring the service-matching-v2
+/// binding. The precondition is cloned unchanged so an admitted snapshot is
+/// preserved verbatim.
 fn service_absent_observation(
     request: &InstallationEffectRequest,
+    registration: &ServiceRegistrationRequest,
+    proof: &ServiceAbsentProof,
 ) -> Result<InstallationEffectObservation, PortError> {
+    if proof.service_name() != registration.service_name()
+        || proof.configuration_digest() != registration.expected_configuration_digest()
+    {
+        return Err(PortError::InvalidRequestMetadata);
+    }
     Ok(InstallationEffectObservation::Absent {
         observed_precondition: request.precondition.clone(),
         evidence: vec![
             PlatformHandle::new(sha256_hex(
                 format!(
-                    "service-absent-v1\0{}\0{}",
+                    "service-absent-v2\0{}\0{}\0{}\0{}\0DOES_NOT_EXIST",
                     request.effect_id.as_str(),
-                    request.plan_digest.as_str()
+                    request.plan_digest.as_str(),
+                    proof.service_name(),
+                    proof.configuration_digest(),
                 )
                 .as_bytes(),
             ))
@@ -5988,6 +6550,73 @@ fn service_absent_observation(
         ],
         service_runtime_lineage: None,
     })
+}
+
+/// Attaches a platform-observed absence snapshot to a live SCM absence, the
+/// service analogue of `package_absent_with_snapshot`.
+fn service_absent_with_snapshot(
+    request: &InstallationEffectRequest,
+    registration: &ServiceRegistrationRequest,
+    proof: &ServiceAbsentProof,
+    snapshot: InstallerRootAbsentSnapshot,
+) -> Result<InstallationEffectObservation, PortError> {
+    let snapshot = installation_absent_snapshot(snapshot)?;
+    let precondition = request
+        .precondition
+        .with_os_snapshot(snapshot)
+        .map_err(|_| PortError::InvalidRequestMetadata)?;
+    service_absent_observation(
+        &InstallationEffectRequest {
+            precondition,
+            ..request.clone()
+        },
+        registration,
+        proof,
+    )
+}
+
+/// Builds the `Absent` observation for a just-observed SCM absence.
+///
+/// A precondition that already carries the admitted OS snapshot (rollback
+/// reconcile after a fixed inspect) is preserved by cloning it. Otherwise the
+/// snapshot is observed now through the installer-root owner: a genuinely
+/// absent root yields its retained absence snapshot, while a present root
+/// contributes its live retained-handle readback as the parent contour under
+/// the independently observed SCM `DOES_NOT_EXIST` proof carried as the
+/// snapshot target. Nothing is derived from the plan alone: the target digest
+/// covers the live SCM outcome and the parents are the handles just read back
+/// in this call.
+fn service_absent_from_live_inspection(
+    request: &InstallationEffectRequest,
+    registration: &ServiceRegistrationRequest,
+    proof: &ServiceAbsentProof,
+    primitive: &WindowsInstallerRootPrimitive,
+    spec: &InstallerRootPrimitiveSpec,
+) -> Result<InstallationEffectObservation, PortError> {
+    if request.precondition.os_snapshot.is_some() {
+        return service_absent_observation(request, registration, proof);
+    }
+    let snapshot = match primitive.inspect(spec).map_err(root_port_error)? {
+        InstallerRootPrimitiveObservation::Absent(snapshot) => snapshot,
+        InstallerRootPrimitiveObservation::Matching(root) => InstallerRootAbsentSnapshot {
+            target_path_digest: sha256_hex(
+                format!(
+                    "service-absent-target-v1\0{}\0{}\0DOES_NOT_EXIST",
+                    proof.service_name(),
+                    proof.configuration_digest(),
+                )
+                .as_bytes(),
+            ),
+            profile_anchor: root.clone(),
+            ancestors: vec![root.clone()],
+            parent: root,
+            root_absent: true,
+        },
+        InstallerRootPrimitiveObservation::Mismatch => {
+            return Ok(root_mismatch("service-root-readback"));
+        }
+    };
+    service_absent_with_snapshot(request, registration, proof, snapshot)
 }
 
 fn service_matching_observation(
@@ -6326,6 +6955,25 @@ pub enum InstallationStepOutcome {
     },
     /// The effect could not be admitted before changing an external object.
     Rejected,
+}
+
+/// Builds the durable typed rejection reference for a registry-projection
+/// failure observed after the Host bootstrap prefix (`E4`/`E5` and the
+/// still-`Registering` branch of `E6`).
+///
+/// The reference binds the exact transaction (`pending:registry-projection:<tx>`)
+/// so a later `recover`/`rollback` promotes through the existing
+/// `Registering → RollbackRequired → RolledBack` gate and removes exactly the
+/// `CreatedByTransaction` service registrations. It never deletes the
+/// registry file itself (no documented owner).
+pub fn registry_projection_pending_ref(
+    transaction_id: &PlatformHandle,
+) -> Result<PlatformHandle, InstallationError> {
+    PlatformHandle::new(format!(
+        "pending:registry-projection:{}",
+        transaction_id.as_str()
+    ))
+    .map_err(|error| platform_error(&error))
 }
 
 /// Coordinates one durable installation transaction without owning platform mechanics.
@@ -6835,21 +7483,40 @@ where
                 evidence,
                 service_runtime_lineage,
             } => {
+                // s33.3 (#1313): align the drive gate with the strict
+                // rollback gate (`validate()` requires os/credential/package)
+                // and with what production now observes. Register/Start carry
+                // a live OS snapshot (#1308 plus StartService live inspection
+                // above); Stage carries its package snapshot; Provision
+                // carries its credential snapshot; roots carry OS. Phase-B
+                // pending keeps os_none+cred_none (matching
+                // `validate_effect_progress`, which allows empty-or-package
+                // for Phase-B): a Pending Phase-B is skipped by the rollback
+                // reverse loop and an Applied Phase-B quarantines before the
+                // loop, so the strict gate never applies to it. Snapshots are
+                // mutually exclusive, so each arm also requires the other two
+                // to be absent.
                 let snapshot_matches_effect = match &transaction.installer_effects[index] {
                     InstallerEffectPlan::ProvisionStoreCredential { .. } => {
                         observed_precondition.credential_snapshot.is_some()
                             && observed_precondition.os_snapshot.is_none()
+                            && observed_precondition.package_snapshot.is_none()
                     }
-                    InstallerEffectPlan::RegisterService { .. }
-                    | InstallerEffectPlan::StartService { .. } => true,
-                    InstallerEffectPlan::StagePackage { .. }
-                    | InstallerEffectPlan::MaterializePhaseB { .. } => {
+                    InstallerEffectPlan::StagePackage { .. } => {
+                        observed_precondition.package_snapshot.is_some()
+                            && observed_precondition.os_snapshot.is_none()
+                            && observed_precondition.credential_snapshot.is_none()
+                    }
+                    InstallerEffectPlan::MaterializePhaseB { .. } => {
                         observed_precondition.os_snapshot.is_none()
                             && observed_precondition.credential_snapshot.is_none()
                     }
+                    // Register/Start carry a live OS snapshot and roots carry
+                    // OS: both require os_some with the other snapshots absent.
                     _ => {
                         observed_precondition.os_snapshot.is_some()
                             && observed_precondition.credential_snapshot.is_none()
+                            && observed_precondition.package_snapshot.is_none()
                     }
                 };
                 if observed_precondition.evidence_refs != request.precondition.evidence_refs
@@ -8150,20 +8817,14 @@ where
             &transaction.installer_effects[index],
             &service_control_grant,
         ) {
-            (
-                InstallerEffectPlan::RegisterService {
-                    role: InstallerServiceRole::Watchdog,
-                    ..
-                },
-                Some(receipt),
-            ) => receipt.validate()?,
-            (
-                InstallerEffectPlan::RegisterService {
-                    role: InstallerServiceRole::Host,
-                    ..
-                },
-                None,
-            ) => {}
+            // s38 (#1345): Host and Watchdog service effects both persist
+            // `Applied` only with a validated installer-policy DACL grant
+            // receipt. The digest is already bound into the ownership marker
+            // and the matching evidence; persisting without the receipt
+            // would let a default-DACL service read as transaction-owned.
+            (InstallerEffectPlan::RegisterService { .. }, Some(receipt)) => {
+                receipt.validate()?;
+            }
             (InstallerEffectPlan::RegisterService { .. }, _) | (_, Some(_)) => {
                 return Err(InstallationError::IdentityConflict);
             }
@@ -8273,6 +8934,35 @@ where
         transaction.stage = InstallationStage::RollbackRequired;
         increment_revision(&mut transaction)?;
         transaction.validate()?;
+        self.store.compare_and_save(expected, &transaction)?;
+        Ok(InstallationStepOutcome::RollbackRequired {
+            pending_refs: vec![pending_ref],
+        })
+    }
+
+    /// Persists a durable typed rejection for a non-effect failure observed
+    /// after the Host bootstrap prefix (registry projection open/load).
+    ///
+    /// This is the `mark_unknown`-equivalent coordinator-owned CAS seam: it
+    /// sets `pending_external_changes=[pending_ref]` and advances
+    /// `Registering → RollbackRequired` via [`InstallationTransaction::mark_unknown`]
+    /// plus a version-checked `compare_and_save`. It is refused in `Activating`
+    /// or when an activation projection intent is present (mirroring
+    /// `mark_unknown`), so `E6` callers must reload and only persist while
+    /// still `Registering`. The `rollback()` gate itself is unchanged.
+    pub fn persist_non_effect_rejection(
+        &mut self,
+        transaction_id: &PlatformHandle,
+        pending_ref: PlatformHandle,
+    ) -> Result<InstallationStepOutcome, InstallationError> {
+        let mut transaction = self.store.load(transaction_id)?.ok_or_else(|| {
+            InstallationError::TransactionNotFound {
+                transaction_id: transaction_id.as_str().to_owned(),
+            }
+        })?;
+        transaction.validate()?;
+        let expected = TransactionVersion::of(&transaction)?;
+        transaction.mark_unknown(vec![pending_ref.clone()])?;
         self.store.compare_and_save(expected, &transaction)?;
         Ok(InstallationStepOutcome::RollbackRequired {
             pending_refs: vec![pending_ref],
@@ -8453,6 +9143,24 @@ where
         transaction_id: &PlatformHandle,
     ) -> Result<InstallationStepOutcome, InstallationError> {
         self.inner.rollback(transaction_id)
+    }
+
+    /// Persists a durable typed rejection for a post-bootstrap non-effect
+    /// failure (registry projection open/load, `E4`/`E5` and the
+    /// still-`Registering` branch of `E6`).
+    ///
+    /// Coordinator-owned `mark_unknown`-equivalent CAS:
+    /// `pending_external_changes=[pending_ref]` + `Registering → RollbackRequired`.
+    /// Refused in `Activating` or with an activation intent (mirroring
+    /// `mark_unknown`); `E6` must reload first and only call this while still
+    /// `Registering`. The `rollback()` gate is unchanged.
+    pub fn persist_non_effect_rejection(
+        &mut self,
+        transaction_id: &PlatformHandle,
+        pending_ref: PlatformHandle,
+    ) -> Result<InstallationStepOutcome, InstallationError> {
+        self.inner
+            .persist_non_effect_rejection(transaction_id, pending_ref)
     }
 
     /// Borrows only the durable store; the mutating port remains sealed.

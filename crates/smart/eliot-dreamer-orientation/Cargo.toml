@@ -1,19 +1,18 @@
 [package]
 name = "eliot-dreamer-orientation"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.94"
-license = "MIT"
-publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
 description = "Build a bounded candidate-only Orientation DreamPacket with epistemic handles, rivals, gaps, hidden relations, and probes"
 
 [lib]
 path = "src/lib.rs"
 
 [package.metadata.eliot]
-prototype = true
+prototype = false
 source_status = "IMPLEMENTED"
-workspace_admission = "pending_agent_implementation_and_proof"
+workspace_admission = "admitted via #702 (T12-10 prerequisite) root workspace membership"
 functional_cell = "smart.dreamer.orientation"
 source_layer = "C1"
 runtime_layer = "R6"
@@ -21,42 +20,16 @@ runtime_bundle = "eliot-dreamer"
 agent_order = 6
 
 [dependencies]
-eliot-contracts = { path = "../../foundation/eliot-contracts" }
-eliot-evidence = { path = "../../foundation/eliot-evidence" }
-eliot-epistemic-contracts = { path = "../eliot-epistemic-contracts" }
-eliot-dreamer-contracts = { path = "../eliot-dreamer-contracts" }
-schemars = { version = "1.2.1", features = ["derive"] }
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
-thiserror = "2.0.18"
+eliot-contracts.workspace = true
+eliot-evidence.workspace = true
+eliot-epistemic-contracts = { path = "../eliot-epistemic-contracts", version = "0.1.0" }
+eliot-dreamer-contracts = { path = "../eliot-dreamer-contracts", version = "0.1.0" }
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
 
 [lints]
 workspace = true
-
-# Standalone workspace root. Without this, cargo walks above the repository
-# and can bind this package to an unrelated ancestor manifest, so every
-# per-crate `cargo check|test|clippy` fails before it starts. Remove this
-# table when the cell is promoted into the root workspace `members`.
-[workspace]
-
-# Mirrors the root `[workspace.lints]` verbatim so an excluded cell is linted
-# exactly like an admitted one. Keep in sync; the promotion commit drops this
-# whole `[workspace]` table and restores plain inheritance.
-[workspace.lints.rust]
-unsafe_code = "forbid"
-missing_docs = "allow"
-
-[workspace.lints.clippy]
-all = { level = "warn", priority = -1 }
-pedantic = { level = "warn", priority = -1 }
-dbg_macro = "warn"
-expect_used = "warn"
-missing_errors_doc = "allow"
-missing_panics_doc = "allow"
-module_name_repetitions = "allow"
-must_use_candidate = "allow"
-print_stderr = "warn"
-print_stdout = "warn"
-unwrap_used = "warn"

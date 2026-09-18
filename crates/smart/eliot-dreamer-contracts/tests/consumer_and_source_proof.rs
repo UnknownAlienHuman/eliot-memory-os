@@ -4,23 +4,26 @@
 
 #![allow(clippy::expect_used)]
 
-use eliot_contracts::{AuthorityEpoch, ReceiptId, RequestId, ResourceGeneration, StateFence};
+use eliot_contracts::{
+    EpochId, EpochLineageId, ReceiptId, RequestId, ResourceGeneration, StateFence,
+};
 use eliot_dreamer_contracts::curation::{ClassificationPayload, TargetEvidence, route_payload};
 use eliot_dreamer_contracts::job::{Requester, RequesterOrigin};
 use eliot_dreamer_contracts::{
     AtomicityMode, BudgetLimits, BudgetUsage, BundleCompleteness, BundleMaterial,
     CURATION_WIRE_KINDS, ClaimResidue, ContractViolation, CurationAcceptanceCtx, CurationFamily,
     CurationHandlerDescriptor, CurationHandlerPort, CurationHandlerRegistry, CurationKind,
-    CurationPayload, DreamInputBundle, DreamJobInput, GroundedDreamDraft, JobClass, ModelDraft,
+    CurationPayload, DreamInputBundle, DreamJobAdmission, GroundedDreamDraft, JobClass, ModelDraft,
     OmissionHandle, ScreenBinding, ScreenEligibility, ScreenReference, ScreenState,
     SourceDisposition, SupportState, TargetDenominator, TypedCurationHandlerRequest,
     ValidatedCurationItem, ValidationReceipt, canonical_bytes, digest_hex, family_of, parse_kind,
 };
+use std::num::NonZeroU64;
 
 fn assert_stable(check: impl Fn() -> bool, ctx: &str) {
     assert_eq!(check(), check(), "{ctx} must be stable");
 }
-fn assembler_shape(job: &DreamJobInput, bundle: &DreamInputBundle) {
+fn assembler_shape(job: &DreamJobAdmission, bundle: &DreamInputBundle) {
     assert_stable(|| job.validate().is_ok(), "assembler job");
     assert_stable(|| bundle.validate().is_ok(), "assembler bundle");
 }
@@ -32,7 +35,7 @@ fn replacer_shape(registry: &CurationHandlerRegistry, screen: &ScreenReference) 
     assert_stable(|| registry.validate_closure().is_ok(), "replacer registry");
     assert_stable(|| screen.validate().is_ok(), "replacer screen");
 }
-fn handler_shape(job: &DreamJobInput, registry: &CurationHandlerRegistry) {
+fn handler_shape(job: &DreamJobAdmission, registry: &CurationHandlerRegistry) {
     assert_stable(|| job.validate().is_ok(), "handler job");
     assert_stable(|| registry.validate_closure().is_ok(), "handler registry");
 }
@@ -50,11 +53,17 @@ fn consumer_shape(
 }
 
 fn fence() -> StateFence {
-    StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+    let epoch = EpochId::new(
+        EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .expect("canonical test lineage-A"),
+        NonZeroU64::new(1).expect("non-zero test sequence"),
+    )
+    .expect("valid test epoch");
+    StateFence::new(epoch, ResourceGeneration::genesis())
 }
 
-fn fixture_job() -> DreamJobInput {
-    DreamJobInput {
+fn fixture_job() -> DreamJobAdmission {
+    DreamJobAdmission {
         schema_version: 1,
         job_class: JobClass::Orientation,
         requester: Requester {
@@ -305,7 +314,7 @@ fn assert_typed_dispatch(registry: &CurationHandlerRegistry, ports: &[CurationHa
 }
 
 fn seam_fixtures(
-    job: &DreamJobInput,
+    job: &DreamJobAdmission,
 ) -> (
     GroundedDreamDraft,
     BudgetUsage,
@@ -398,7 +407,7 @@ fn seam_request(
 
 fn seam_ctx<'a>(
     parts: (
-        &'a DreamJobInput,
+        &'a DreamJobAdmission,
         &'a DreamInputBundle,
         &'a ValidationReceipt,
         &'a GroundedDreamDraft,
@@ -420,7 +429,7 @@ fn seam_ctx<'a>(
 }
 
 fn assert_item_accept_seam(
-    job: &DreamJobInput,
+    job: &DreamJobAdmission,
     bundle: &DreamInputBundle,
     receipt: &ValidationReceipt,
 ) {
@@ -508,7 +517,7 @@ fn assert_item_accept_seam(
 }
 
 fn assert_item_accept_negatives(
-    job: &DreamJobInput,
+    job: &DreamJobAdmission,
     bundle: &DreamInputBundle,
     receipt: &ValidationReceipt,
 ) {

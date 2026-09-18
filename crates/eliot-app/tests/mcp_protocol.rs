@@ -6626,20 +6626,48 @@ fn current_state_memory_free_control_excludes_all_memory_content() -> TestResult
 fn recall_l0_mcp_matches_cli() -> TestResult {
     let _guard = TestLock::acquire()?;
     let project_id = seed_with_writer_smoke()?;
-    let cli = run_json(&[
+    let mut client = McpClient::start()?;
+    let config_path = test_config_path();
+    let config_str = config_path.to_string_lossy().into_owned();
+    let cli_args = [
+        "--config",
+        config_str.as_str(),
         "memory",
         "recall-l0",
         "--project",
         &project_id,
         "--query",
         "writer smoke",
-    ])?;
-    let mut client = McpClient::start()?;
-    let mcp = client.tool_call(
+    ];
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut cli = run_json(&cli_args)?;
+    loop {
+        let published = cli.get("projection_state").and_then(Value::as_str) == Some("published");
+        let has_handles = cli
+            .get("handles")
+            .and_then(Value::as_array)
+            .is_some_and(|handles| !handles.is_empty());
+        if published || has_handles {
+            break;
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        thread::sleep(Duration::from_millis(250));
+        cli = run_json(&cli_args)?;
+    }
+    let mut mcp = client.tool_call(
         2,
         "eliot_recall_l0",
-        &json!({ "project_id": project_id, "query": "writer smoke", "scope": null, "limit": 50 }),
+        &json!({ "project_id": project_id, "query": "writer smoke", "scope": null, "limit": null }),
     )?;
+    // ul_boot is a separate once-per-session MCP delivery surface, not part of recall_l0:
+    // "Context arrives by itself as ul_boot" (protocol_support.rs:35); ul_boot is listed
+    // distinct from recall_l0 with ul_boot<->mcp_auto_boot binding (ul_cross_agent_runner.rs:1608,:1384),
+    // inserted at injection.rs:437,538, while CLI recall_l0 writes the response directly (data_and_memory.rs:217-232); strip only this key.
+    if let Value::Object(ref mut map) = mcp {
+        map.remove("ul_boot");
+    }
 
     assert_eq!(mcp, cli);
     Ok(())

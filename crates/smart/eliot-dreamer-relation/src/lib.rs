@@ -7,10 +7,13 @@
 
 #![forbid(unsafe_code)]
 
+mod draft;
 mod evidence;
 mod policy;
 mod result;
 mod selection;
+
+pub use draft::GroundedRelationDraft;
 
 pub use evidence::{
     material_evidence_grounded, qualify_alternatives, qualify_causal_claim, qualify_disclosure,
@@ -24,7 +27,8 @@ pub use result::{RelationResult, assemble_candidate};
 pub use selection::{Selection, select, validate_alternative_coverage, validate_path};
 
 use eliot_dreamer_contracts::{
-    CurationAcceptanceCtx, RelationDisposition, RelationInput, seal_relation,
+    CurationAcceptanceCtx, RelationDisposition, RelationEndpoint, RelationInput,
+    RelationNeighborhood, RelationRegistrySnapshot, ValidatedCurationItem, seal_relation,
 };
 
 type SemanticEvaluation = Result<
@@ -234,7 +238,44 @@ fn evaluate_semantics(
     Ok((support, counter, unknown, selected))
 }
 
+/// Canonical decomposed relation proposal: the validated Curation item, the
+/// grounded relation draft, the already-admitted source and target endpoints,
+/// the registry snapshot and the existing neighborhood arrive as separate
+/// typed inputs. Endpoints are caller-owned admission records, never created,
+/// admitted or reclassified here; the draft carries the remaining semantic
+/// content and is assembled into the closed input closure without mutation.
+///
+/// The acceptance context is the handler-boundary eligibility reference (the
+/// A-05 pre-handler receipt, bundle, screen and usage); it is validated
+/// intrinsically and never re-executed. The accepted-item seam is crossed only
+/// by [`seal_relation`] after the candidate has been assembled.
+// The eight-argument arity is the canonical contract: seven decomposed typed
+// records plus the eligibility reference. Bundling them would reintroduce
+// the bundled-input predecessor this form replaces.
+#[allow(clippy::too_many_arguments)]
 pub fn propose_relation(
+    validated: &ValidatedCurationItem,
+    draft: &GroundedRelationDraft,
+    source: &RelationEndpoint,
+    target: &RelationEndpoint,
+    registry: &RelationRegistrySnapshot,
+    neighborhood: &RelationNeighborhood,
+    ctx: &CurationAcceptanceCtx<'_>,
+    policy: &RelationPolicy,
+) -> Result<RelationResult, eliot_dreamer_contracts::ContractViolation> {
+    draft.validate()?;
+    let input = draft.assemble(validated, source, target, registry, neighborhood);
+    propose_relation_from_input(input, ctx, policy)
+}
+
+/// Closed-bundle core behind [`propose_relation`]: proposes one typed directed
+/// relation from the supplied immutable closure. Retained for closed-bundle
+/// callers such as replay harnesses.
+///
+/// All clock observations, bounds, cancellation and policy identity are
+/// supplied by the caller. The accepted-item seam is crossed only by
+/// [`seal_relation`] after the candidate has been assembled.
+pub fn propose_relation_from_input(
     input: RelationInput,
     ctx: &CurationAcceptanceCtx<'_>,
     policy: &RelationPolicy,

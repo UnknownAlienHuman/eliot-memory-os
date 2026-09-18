@@ -33,6 +33,22 @@ fn push_bounded(values: &mut Vec<String>, value: String, limit: usize) -> Result
     Ok(())
 }
 
+/// Exact-tuple authority match across the ORS contour boundary (Implements #64, T6-E4-C).
+///
+/// The persisted `EpochLineage` contour keeps `OpaqueLabel` + `u64` labels and
+/// cannot name the canonical `EpochLineageId` / `NonZeroU64` types, so the
+/// canonical `is_same_authority` call cannot cross this boundary. The dual-half
+/// string + integer comparison below is the exact-tuple spelling: both halves
+/// must agree, equal sequences from different lineages are unrelated, and a
+/// numerically larger foreign sequence never matches.
+fn authority_tuple_matches(
+    record_lineage: &crate::EpochLineage,
+    active: &eliot_contracts::EpochId,
+) -> bool {
+    record_lineage.current.epoch == active.sequence.get()
+        && record_lineage.current.lineage_id.as_str() == active.lineage_id.as_str()
+}
+
 fn active_operational_refs(
     store: &RedbRecoveryStore,
     kinds: &[OperationalKind],
@@ -83,7 +99,15 @@ impl RedbRecoveryStore {
             .validate()
             .map_err(|error| OrsError::Contract(error.to_string()))?;
         self.evidence.verify_receipt(active_receipt)?;
-        let active_epoch = active_receipt.core.authority.authority_epoch.value();
+        // Exact-tuple authority comparison (Implements #64, T6-E4-C): the receipt
+        // carries the canonical `EpochId`; the persisted `EpochLineage` contour
+        // keeps its shape and both tuple halves must agree via
+        // `authority_tuple_matches` above. Equal sequences from different
+        // lineages are unrelated. The `EpochLineage` contour cannot name a
+        // canonical `EpochLineageId` (non-UUID contour labels), so the
+        // comparison is spelled across the contour boundary instead of calling
+        // `is_same_authority` directly.
+        let active_epoch = active_receipt.core.authority.authority_epoch.clone();
         let read = self.database.begin_read().map_err(storage)?;
         let operational = read
             .open_table(super::OPERATIONAL_CURRENT)
@@ -95,7 +119,7 @@ impl RedbRecoveryStore {
                 decode_named(value.value(), "operational_current")?;
             if record.kind == OperationalKind::AuthoritySnapshot
                 && record.phase == OperationalPhase::Active
-                && record.input.authority_epoch.current.epoch == active_epoch
+                && authority_tuple_matches(&record.input.authority_epoch, &active_epoch)
             {
                 authority_snapshot_found = true;
                 break;
@@ -129,7 +153,10 @@ impl RedbRecoveryStore {
         let projection = OperationalRecoveryState {
             ors_revision: format!("eliot.kernel.ors/v{}", crate::CONTRACT_VERSION),
             integrity: HealthDimension::Healthy,
-            authority_epoch: active_receipt.core.authority.authority_epoch,
+            // Canonical `EpochId` (Implements #64): the receipt carries the
+            // lineage-aware exact tuple and the migrated contract field takes
+            // it by clone, never by scalar coercion.
+            authority_epoch: active_receipt.core.authority.authority_epoch.clone(),
             pending_operation_refs,
             active_generation_refs,
             recovery_intent_refs,

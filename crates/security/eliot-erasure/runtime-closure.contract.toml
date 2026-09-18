@@ -1,0 +1,105 @@
+schema = "eliot.erasure-runtime-closure.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_CONTRACT"
+status = "READY_AFTER_STORE_OWNER_BINDING"
+implementation_support = "ERASURE_AND_INFLUENCE_COMPONENTS_PRESENT_END_TO_END_EFFECT_CLOSURE_MISSING"
+evidence_execution_status = "SOURCE_AUDIT_EXECUTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "ERASURE_INFLUENCE_EDGE_CANDIDATE"
+issue = 1130
+owner_issue_refs = [15, 18, 19]
+product_pulse_issue = 11
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[documentation]
+architecture = [
+  "docs/architecture/A12-03-one-governed-write-path.md#a123-one-governed-write-path",
+  "docs/architecture/A13-06-data-durability-and-recovery.md#a136-data-durability-and-recovery",
+]
+implementation = [
+  "docs/architecture/I05-09-blobstore.md#i59-blobstore",
+  "docs/architecture/I05-19-write-submission-execution-and-receipts.md#i519-write-submission-execution-and-receipts",
+  "docs/architecture/I05-20-read-model-consistency-and-cache.md#i520-read-model-consistency-and-cache",
+  "docs/architecture/I06-15-capability-grant-lineage-introductions-and-resource-facets.md#i615-capability-grant-lineage-introductions-and-resource-facets",
+  "docs/architecture/I14-20-canonical-runtime-lifecycle-vocabulary.md#i1420-canonical-runtime-lifecycle-vocabulary",
+  "docs/architecture/I14-24-local-failure-containment-matrix.md#i1424-local-failure-containment-matrix",
+  "docs/architecture/I15-04-secrets.md#i154-secrets",
+]
+anchors = ["ARCH-SEC-01", "ARCH-SEC-02", "ARCH-RES-03", "ARCH-ORD-01", "ARCH-OBS-01", "ARCH-GROUND-01"]
+
+[confirmed_gap]
+observations = [
+  "eliot-erasure and eliot-influence exist, but no accepted production edge proves tombstone-first canonical admission, physical Blob/key effects and complete derived-influence revocation under one operation lineage.",
+  "No current closure proves that indexes, caches, embeddings, cues, Skills, Context/inheritance and provider projections remain blocked after crash, rebuild, restore, migration or stale-generation replay.",
+  "Store/Blob ownership remains #19, Governor admission #18, Kernel reconciliation #15 and Product proof #11.",
+]
+discriminator = "Erase one source with Blob payload/key and multiple derived projections, crash after each boundary, restore an old export and replay an old generation. Current accepted evidence does not prove non-resurrection and exact per-target reconciliation."
+
+[causal_property]
+statement = "One admitted erasure commits a durable non-revivable tombstone and exact target denominator before destructive effects, then reconciles every payload, key and derived-influence target under one operation/effect lineage."
+
+[scope]
+primary_paths = [
+  "crates/security/eliot-erasure/src/**",
+  "crates/security/eliot-influence/src/**",
+  "crates/governor/eliot-canonical/src/**erasure**",
+  "crates/storage/eliot-store-api/src/**erasure**",
+  "crates/storage/eliot-blob-api/src/**",
+  "crates/storage/eliot-blob/src/**",
+  "crates/kernel/eliot-kernel-service/src/**erasure**",
+  "crates/kernel/eliot-ors/src/**erasure**",
+  "focused erasure/influence/restore tests",
+]
+forbidden_ownership = [
+  "second canonical, Store, Blob, influence, authority or Finish owner",
+  "hidden retention of erased payload or keys in evidence/logs",
+  "blind retry after possible destructive effect",
+]
+
+[what_to_do]
+steps = [
+  "Define one canonical erasure request, scope graph, tombstone, child-effect plan, receipt and reconciliation contract.",
+  "Bind semantic admission to Governor, mechanical state to Kernel/ORS and physical effects to the sole Store/Blob owners.",
+  "Freeze a finite derivative/reachability denominator across canonical records, payloads/keys, indexes, caches, embeddings, cues, Skills, Context and external projections.",
+  "Persist the tombstone and each effect intent before destructive/revocation work.",
+  "Keep legal hold, retention, missing, unavailable and unknown targets explicit.",
+  "Prevent resurrection through reads, rebuild, migration, backup/ECXF restore and stale process/module generations.",
+]
+
+[how_to_do]
+steps = [
+  "Reuse canonical operation/effect identity, State Fence, lineaged epoch, Ordering Scope, retention/legal-hold, Blob owner and influence contracts.",
+  "Freeze ErasureScopeSnapshot with authority, purpose/legal basis, exact targets, derivative graph revision, privacy/retention domain, owners, holds, verifiers, deadline and invalidation set.",
+  "Commit the tombstone through the one canonical transition path before physical effects; tombstone failure performs no destructive effect.",
+  "Derive one child effect identity per canonical revocation, Blob deletion, key destruction, index/cache removal, derivative influence revocation and external withdrawal.",
+  "Keep crypto-erasure, byte deletion and semantic influence revocation as separate outcomes.",
+  "Persist intent before each effect; crash/timeout after possible effect becomes UNKNOWN_OUTCOME and reconciles the same target before retry.",
+  "Exact replay returns the same tombstone/receipt; changed scope/graph/hold/target under one identity conflicts.",
+  "Filter every read/retrieval/Context/Skill/cue/index/provider projection by current tombstone/influence state, including rebuild and replay.",
+  "Restore/import tombstones, key-destruction state and influence revocations before dependent payload/derivatives and reject resurrection.",
+]
+
+[acceptance]
+criteria = [
+  "Every accepted erasure has one durable canonical tombstone before any destructive effect.",
+  "Tombstone failure yields zero destructive effects and effect uncertainty never hides the tombstone.",
+  "The plan has a finite current target/derivative denominator with exact owner and disposition per target.",
+  "Byte deletion, key destruction, canonical revocation and derived-influence removal have distinct receipts.",
+  "Missing, held, unavailable, stale, conflicted and unknown targets prevent false complete status.",
+  "Exact replay is idempotent and changed same-identity scope/target/graph/hold conflicts.",
+  "Unknown child effects reconcile before retry and cannot be duplicated or skipped.",
+  "Reads, caches, embeddings, cues, Skills, Context and provider projections cannot use revoked influence after tombstone commit.",
+  "Old generations, stale Sessions and restored archives cannot reintroduce erased content or influence.",
+  "Legal hold retains only the declared minimum, blocks influence and never masquerades as complete erasure.",
+  "Audit/status output contains no erased payload, secret or recoverable key material.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-erasure -p eliot-influence -p eliot-canonical -p eliot-store-api -p eliot-blob-api -p eliot-blob -p eliot-kernel-service -p eliot-ors --all-targets",
+  "cargo test --locked -p eliot-erasure -p eliot-influence -p eliot-canonical -p eliot-store-api -p eliot-blob-api -p eliot-blob -p eliot-kernel-service -p eliot-ors --all-targets",
+  "cargo clippy --locked -p eliot-erasure -p eliot-influence -p eliot-canonical -p eliot-store-api -p eliot-blob-api -p eliot-blob -p eliot-kernel-service -p eliot-ors --all-targets -- -D warnings",
+  "git diff --check",
+]
+edge_proof = "Execute erasure with Blob/key effects, derived projections, crash at each boundary, legal hold, export/restore and stale-generation replay."

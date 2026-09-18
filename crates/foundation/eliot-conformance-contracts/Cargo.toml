@@ -1,9 +1,9 @@
 [package]
 name = "eliot-conformance-contracts"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.94"
-license = "MIT"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
 publish = false
 description = "Owner-neutral I0.5 contract maturity, implementation support, evidence execution, and observation-state contracts"
 
@@ -11,14 +11,14 @@ description = "Owner-neutral I0.5 contract maturity, implementation support, evi
 path = "src/lib.rs"
 
 [dependencies]
-serde = { version = "1", features = ["derive"] }
-thiserror = "2"
+serde.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
-serde_json = "1"
+serde_json.workspace = true
 
 [package.metadata.eliot]
-prototype = true
+prototype = false
 layer = "C0"
 purpose = "Own the exact orthogonal conformance/support/observation dimensions shared by bootstrap, registries, reports, and ControlBoard without probing or promoting support."
 source_maintenance_owner = "foundation-contract-owner"
@@ -33,7 +33,7 @@ contract_refs = [
 ]
 implementation_support = "CURRENT_UNVERIFIED"
 evidence_execution_status = "NOT_EXECUTED"
-workspace_admission = "forbidden until source implementation, package proof, first bootstrap consumer fixture, current-main rebase, and integration-owner review"
+workspace_admission = "admitted via #744 root workspace membership"
 
-[workspace]
-resolver = "3"
+[lints]
+workspace = true

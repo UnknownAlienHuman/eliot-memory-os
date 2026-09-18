@@ -10,7 +10,19 @@ use eliot_agent_bridge_core::{
     ReconciliationPortOutcome, ReconciliationPortResult, ReconciliationReceiptRef,
     ReconnectRequest, RequiredProvider, SessionId, TaskId, WorkUnitId,
 };
+use eliot_contracts::{EpochId, EpochLineageId};
 use serde_json::json;
+use std::num::NonZeroU64;
+
+const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+fn test_epoch(sequence: u64) -> EpochId {
+    EpochId::new(
+        EpochLineageId::new(TEST_LINEAGE_A).expect("valid test lineage"),
+        NonZeroU64::new(sequence).expect("nonzero test sequence"),
+    )
+    .expect("valid test epoch")
+}
 
 #[derive(Default)]
 struct HostState {
@@ -131,7 +143,7 @@ fn generation(value: u64) -> Result<Generation, Box<dyn std::error::Error>> {
 
 fn fence(value: u64) -> Result<FencingToken, Box<dyn std::error::Error>> {
     Ok(FencingToken::new(
-        value,
+        test_epoch(value),
         generation(value)?,
         format!("fence-{value}"),
     )?)
@@ -178,7 +190,10 @@ fn event(class: &str, event_id: &str, sequence: u64) -> Result<EventEnvelope, se
         "stream_id": "stream-1",
         "producer_id": "bridge-producer",
         "producer_generation": 1,
-        "authority_epoch": 1,
+        "authority_epoch": {
+            "lineage_id": TEST_LINEAGE_A,
+            "sequence": 1
+        },
         "event_id": event_id,
         "sequence": sequence,
         "causal_predecessor_refs": [],
@@ -187,7 +202,10 @@ fn event(class: &str, event_id: &str, sequence: u64) -> Result<EventEnvelope, se
         "payload_type": "fixture",
         "payload_or_blob_ref": {"inline": {"Json": {"value": 1}}},
         "state_fence": {
-            "authority_epoch": 1,
+            "authority_epoch": {
+                "lineage_id": TEST_LINEAGE_A,
+                "sequence": 1
+            },
             "resource_generation": 1,
             "task_revision": null,
             "policy_revision": null,
@@ -208,16 +226,16 @@ fn hook() -> Result<HostEventEnvelope, serde_json::Error> {
             "host_family": "test",
             "adapter": "test",
             "protocol_transport": "stdio",
-            "runtime_hash": "runtime",
-            "adapter_hash": "adapter",
+            "runtime_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "adapter_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             "provider": "provider",
             "model": "model",
             "auth_billing": "test",
-            "serializer_hash": "serializer",
-            "tool_semantics_hash": "tools",
+            "serializer_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "tool_semantics_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
             "reasoning_mode": "test",
             "continuation_behavior": "fresh",
-            "feature_flags_hash": "flags"
+            "feature_flags_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
         },
         "raw_payload_digest": "digest",
         "normalized_payload": {},
@@ -278,7 +296,12 @@ fn attach_binds_authenticated_connection_session_generation_and_fence()
     assert_eq!(binding.session_id().as_str(), "session-1");
     assert_eq!(binding.connection_id().as_str(), "connection-1");
     assert_eq!(binding.activation_generation().get(), 1);
-    assert_eq!(binding.state_fence().authority_epoch(), 1);
+    assert!(
+        binding
+            .state_fence()
+            .authority_epoch()
+            .is_same_authority(&test_epoch(1))
+    );
     assert_eq!(binding.state_fence().generation().get(), 1);
     assert_eq!(binding.task_binding().task_id().as_str(), "task-1");
     assert_eq!(
@@ -1052,6 +1075,226 @@ fn type_level_port_contract_is_object_safe() {
     ) {
     }
     accepts_ports(None, None);
+}
+
+// ---- Skill lifecycle surface read + typed propose (#1191 bullet 14) ----
+
+use eliot_agent_bridge_core::{ProposeSkillRequest, SkillLifecyclePort};
+use eliot_contracts::{
+    ClockReading, ProductId, RequestId, RequestMetadata, ResourceGeneration, SourceId, StateFence,
+};
+use eliot_skill::{
+    LifecycleAction, LifecycleCounters, SkillCandidate, SkillError, SkillInteractionView,
+    SkillLifecycleView, SkillRef, SkillScope, SkillStatus,
+};
+use std::future::Future;
+use std::pin::Pin;
+
+struct FakeSkill {
+    view: Option<SkillLifecycleView>,
+    candidate: SkillCandidate,
+    calls: Arc<Mutex<usize>>,
+}
+
+impl SkillLifecyclePort for FakeSkill {
+    fn skill_read<'a>(
+        &'a mut self,
+        _ctx: &'a RequestMetadata,
+        _skill_id: String,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<SkillLifecycleView>, SkillError>> + 'a>> {
+        Box::pin(async move {
+            *self
+                .calls
+                .lock()
+                .map_err(|_| SkillError::Surface("test lock poisoned".to_owned()))? += 1;
+            Ok(self.view.clone())
+        })
+    }
+
+    fn propose_skill<'a>(
+        &'a mut self,
+        _ctx: &'a RequestMetadata,
+        _request: ProposeSkillRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<SkillCandidate, SkillError>> + 'a>> {
+        Box::pin(async move {
+            *self
+                .calls
+                .lock()
+                .map_err(|_| SkillError::Surface("test lock poisoned".to_owned()))? += 1;
+            Ok(self.candidate.clone())
+        })
+    }
+}
+
+fn skill_fence() -> StateFence {
+    StateFence::new(
+        test_epoch(1),
+        ResourceGeneration::new(1).expect("generation"),
+    )
+}
+
+fn skill_ctx(fence: &StateFence) -> RequestMetadata {
+    RequestMetadata {
+        request_id: RequestId::new("req-skill-1").expect("request"),
+        session_id: Some(eliot_contracts::SessionId::new("session-1").expect("session")),
+        task_id: None,
+        product_id: ProductId::new("test-product").expect("product"),
+        source_id: SourceId::new("agent-bridge").expect("source"),
+        state_fence: fence.clone(),
+        clock: ClockReading::default(),
+    }
+}
+
+fn skill_scope() -> SkillScope {
+    SkillScope {
+        task_scope: "task-scope".to_owned(),
+        host: "host-1".to_owned(),
+        route: "route-1".to_owned(),
+        governance_scope: "gov-1".to_owned(),
+    }
+}
+
+fn skill_view(fence: &StateFence) -> SkillLifecycleView {
+    SkillLifecycleView {
+        skill_ref: SkillRef::new("skill-demo", "rev-1", "Demo Skill", "a".repeat(64))
+            .expect("skill ref"),
+        scope: skill_scope(),
+        applies_when: vec!["when-a".to_owned()],
+        does_not_apply_when: vec!["not-when-a".to_owned()],
+        dependencies: Vec::new(),
+        counters: LifecycleCounters::default(),
+        execution_evidence: Vec::new(),
+        observed_decision_or_verifier_delta: None,
+        false_activation_refs: Vec::new(),
+        interactions: SkillInteractionView::default(),
+        status: SkillStatus::Current,
+        stale_or_quarantine_reason: None,
+        proposed_action: LifecycleAction::Keep,
+        review: None,
+        state_fence: fence.clone(),
+        lifecycle_revision: 1,
+    }
+}
+
+fn skill_proposal() -> Result<ProposeSkillRequest, Box<dyn std::error::Error>> {
+    Ok(ProposeSkillRequest::new(
+        "skill-demo",
+        "b".repeat(64),
+        LifecycleAction::Patch,
+        vec!["evidence-1".to_owned()],
+        Vec::new(),
+        skill_scope(),
+    )?)
+}
+
+fn skill_candidate(fence: &StateFence) -> Result<SkillCandidate, Box<dyn std::error::Error>> {
+    let view = skill_view(fence);
+    Ok(SkillCandidate::new(
+        &view,
+        "b".repeat(64),
+        LifecycleAction::Patch,
+        vec!["evidence-1".to_owned()],
+        Vec::new(),
+        skill_scope(),
+        fence.clone(),
+    )?)
+}
+
+fn skill_bridge(
+    view: Option<SkillLifecycleView>,
+    candidate: SkillCandidate,
+    calls: Arc<Mutex<usize>>,
+) -> Result<AgentBridgeCore, Box<dyn std::error::Error>> {
+    Ok(bridge(
+        Arc::new(Mutex::new(HostState::default())),
+        Arc::new(Mutex::new(ForwardState::default())),
+    )?
+    .with_skill_lifecycle(Box::new(FakeSkill {
+        view,
+        candidate,
+        calls,
+    })))
+}
+
+fn block_on<T>(future: impl Future<Output = T>) -> T {
+    struct NoopWaker;
+    impl std::task::Wake for NoopWaker {
+        fn wake(self: std::sync::Arc<Self>) {}
+    }
+    let waker = std::task::Waker::from(std::sync::Arc::new(NoopWaker));
+    let mut context = std::task::Context::from_waker(&waker);
+    let mut future = Box::pin(future);
+    loop {
+        match future.as_mut().poll(&mut context) {
+            std::task::Poll::Ready(output) => return output,
+            std::task::Poll::Pending => std::thread::yield_now(),
+        }
+    }
+}
+
+#[test]
+fn skill_read_returns_the_cloned_governor_view() -> Result<(), Box<dyn std::error::Error>> {
+    let fence = skill_fence();
+    let view = skill_view(&fence);
+    let mut core = skill_bridge(
+        Some(view.clone()),
+        skill_candidate(&fence)?,
+        Arc::new(Mutex::new(0)),
+    )?;
+    core.attach(managed_request("connection-1")?)?;
+    let read = block_on(core.skill_view(&skill_ctx(&fence), "skill-demo"))?;
+    assert_eq!(read, Some(view.clone()));
+    assert_eq!(
+        read.as_ref()
+            .map(|view| view.identity_digest())
+            .transpose()?,
+        Some(view.identity_digest()?)
+    );
+    Ok(())
+}
+
+#[test]
+fn typed_propose_returns_the_exact_candidate_digest() -> Result<(), Box<dyn std::error::Error>> {
+    let fence = skill_fence();
+    let mut core = skill_bridge(
+        Some(skill_view(&fence)),
+        skill_candidate(&fence)?,
+        Arc::new(Mutex::new(0)),
+    )?;
+    core.attach(managed_request("connection-1")?)?;
+    let returned = block_on(core.propose_skill_candidate(&skill_ctx(&fence), skill_proposal()?))?;
+    let expected = skill_candidate(&fence)?;
+    assert_eq!(returned, expected);
+    assert_eq!(returned.candidate_digest, expected.candidate_digest);
+    Ok(())
+}
+
+#[test]
+fn stale_skill_fence_fails_closed_without_touching_the_port()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fence = skill_fence();
+    let calls = Arc::new(Mutex::new(0));
+    let mut core = skill_bridge(
+        Some(skill_view(&fence)),
+        skill_candidate(&fence)?,
+        Arc::clone(&calls),
+    )?;
+    core.attach(managed_request("connection-1")?)?;
+    let stale = StateFence::new(
+        test_epoch(2),
+        ResourceGeneration::new(1).expect("generation"),
+    );
+    let ctx = skill_ctx(&stale);
+    assert!(matches!(
+        block_on(core.skill_view(&ctx, "skill-demo")),
+        Err(BridgeError::StaleAuthority)
+    ));
+    assert!(matches!(
+        block_on(core.propose_skill_candidate(&ctx, skill_proposal()?)),
+        Err(BridgeError::StaleAuthority)
+    ));
+    assert_eq!(*calls.lock().map_err(|_| "skill call lock poisoned")?, 0);
+    Ok(())
 }
 
 #[test]

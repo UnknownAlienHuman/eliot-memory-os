@@ -1,5 +1,6 @@
 use std::fmt;
 
+use eliot_contracts::{EpochContractError, EpochId as EpochIdentity, EpochTransition};
 use eliot_observation_contracts::ObservationRecordEnvelope;
 use eliot_platform::{HostProcessNonce, KernelActivationNonce, PlatformHandle, PortOutcome};
 use eliot_runtime_contracts::{
@@ -67,75 +68,37 @@ fn handles(
     Ok(())
 }
 
-/// An epoch is comparable only by exact identity inside one explicit lineage.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct EpochIdentity {
-    pub lineage: PlatformHandle,
-    pub sequence: u64,
-}
-
-impl EpochIdentity {
-    pub(crate) fn validate(&self) -> Result<(), JournalError> {
-        handle(&self.lineage, "epoch.lineage")?;
-        if self.sequence == 0 {
-            return Err(JournalError::Invalid(
-                "epoch.sequence must be positive".into(),
-            ));
-        }
-        Ok(())
-    }
-
-    pub(crate) fn is_direct_child_of(&self, parent: &Self) -> Result<bool, JournalError> {
-        self.validate()?;
-        parent.validate()?;
-        if self.lineage != parent.lineage {
-            return Ok(false);
-        }
-        Ok(parent.sequence.checked_add(1) == Some(self.sequence))
+/// Epoch identity is the canonical lineage-aware [`EpochId`] owned by
+/// `eliot-contracts`. Host keeps no parallel implementation: exact tuple
+/// equality is the authority-match rule and only a same-lineage sequence+1
+/// step is a direct child. There is deliberately no `Ord`, no scalar
+/// coercion, and no cross-lineage ordering.
+fn map_epoch_contract_error(error: &EpochContractError) -> JournalError {
+    match error {
+        EpochContractError::SequenceOverflow => JournalError::Sequence,
+        _ => JournalError::EpochLineageConflict,
     }
 }
 
-/// Carries the parent explicitly; no caller may infer ancestry by integer order.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct EpochTransition {
-    pub current: EpochIdentity,
-    pub parent: Option<EpochIdentity>,
+/// Validates a canonical transition against the genesis/explicit-parent
+/// invariants. Construction alone cannot prove them, so every admission and
+/// reducer boundary calls this explicitly.
+pub(crate) fn validate_epoch_transition(transition: &EpochTransition) -> Result<(), JournalError> {
+    transition
+        .validate()
+        .map_err(|error| map_epoch_contract_error(&error))
 }
 
-impl EpochTransition {
-    pub(crate) fn validate(&self) -> Result<(), JournalError> {
-        self.current.validate()?;
-        match &self.parent {
-            None if self.current.sequence == 1 => Ok(()),
-            Some(parent) if self.current.is_direct_child_of(parent)? => Ok(()),
-            _ => Err(JournalError::EpochLineageConflict),
-        }
-    }
-
-    pub(crate) fn is_direct_child_of(&self, parent: &Self) -> Result<bool, JournalError> {
-        self.validate()?;
-        parent.validate()?;
-        Ok(self.parent.as_ref() == Some(&parent.current))
-    }
-
-    /// Creates the only legal next generation in this exact lineage.
-    pub fn direct_child(&self) -> Result<Self, JournalError> {
-        self.validate()?;
-        let sequence = self
-            .current
-            .sequence
-            .checked_add(1)
-            .ok_or(JournalError::Sequence)?;
-        Ok(Self {
-            current: EpochIdentity {
-                lineage: self.current.lineage.clone(),
-                sequence,
-            },
-            parent: Some(self.current.clone()),
-        })
-    }
+/// Exact one-step child check between two validated transitions. `false`
+/// covers both "valid but not a child" and cross-lineage inputs; an invalid
+/// transition fails closed instead of comparing.
+pub(crate) fn epoch_transition_is_direct_child_of(
+    child: &EpochTransition,
+    parent: &EpochTransition,
+) -> Result<bool, JournalError> {
+    validate_epoch_transition(child)?;
+    validate_epoch_transition(parent)?;
+    Ok(child.advances(&parent.current))
 }
 
 /// Reasons that require a fresh Host lineage instead of continuing a counter.
@@ -167,7 +130,11 @@ impl RecoveryLineageEvidence {
 }
 
 /// Installation identity and exact parent-fenced Host epoch.
-#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+///
+/// The epoch is the canonical [`EpochTransition`]: equality (not ordering)
+/// is the authority rule, so this type keeps `Eq` but deliberately has no
+/// `Ord` and no `Hash` over the transition.
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostInstallationEpoch {
     pub installation: PlatformHandle,
@@ -192,7 +159,7 @@ impl HostInstallationEpoch {
     pub(crate) fn validate(&self) -> Result<(), JournalError> {
         handle(&self.installation, "host.installation")?;
         handle(&self.nonce, "host.nonce")?;
-        self.epoch.validate()?;
+        validate_epoch_transition(&self.epoch)?;
         if let Some(recovery) = &self.recovery {
             recovery.validate()?;
             if self.epoch.parent.is_some() {
@@ -206,7 +173,7 @@ impl HostInstallationEpoch {
         self.validate()?;
         parent.validate()?;
         Ok(self.installation == parent.installation
-            && self.epoch.is_direct_child_of(&parent.epoch)?)
+            && epoch_transition_is_direct_child_of(&self.epoch, &parent.epoch)?)
     }
 
     /// Returns the Host-process credential under its canonical, non-activation type.
@@ -227,7 +194,7 @@ pub fn host_owner_epoch_digest(
     let bytes = serde_json::to_vec(&(
         "eliot.host.owner-epoch.v2",
         &host_epoch.installation,
-        &host_epoch.epoch.current.lineage,
+        &host_epoch.epoch.current.lineage_id,
         host_epoch.epoch.current.sequence,
     ))
     .map_err(|error| {
@@ -271,7 +238,7 @@ impl RecordFence {
     fn validate(&self) -> Result<(), JournalError> {
         self.host.validate()?;
         handle(&self.activation_id, "fence.activation_id")?;
-        self.activation_generation.validate()
+        validate_epoch_transition(&self.activation_generation)
     }
 }
 
@@ -299,10 +266,9 @@ pub struct HostKernelStoreLineage {
 
 impl HostKernelStoreLineage {
     fn validate(&self, host: &HostInstallationEpoch) -> Result<(), JournalError> {
-        self.host_epoch.validate()?;
-        self.kernel_epoch.validate()?;
-        self.watchdog_epoch.validate()?;
-        self.store_generation.validate()?;
+        // Canonical epoch values are valid by construction (validated
+        // lineage spelling, non-zero sequence); only the Host binding is
+        // checked here.
         if self.host_epoch != host.epoch.current {
             return Err(JournalError::StaleFence);
         }
@@ -410,8 +376,8 @@ impl EliotActivationRecord {
         handles(&self.requested_capabilities, "requested_capabilities", true)?;
         handle(&self.candidate_scope, "candidate_scope")?;
         if let Some(drain) = &self.drain_generation {
-            drain.validate()?;
-            if drain.current.lineage != self.fence.activation_generation.current.lineage {
+            validate_epoch_transition(drain)?;
+            if drain.current.lineage_id != self.fence.activation_generation.current.lineage_id {
                 return Err(JournalError::EpochLineageConflict);
             }
         }
@@ -538,7 +504,7 @@ impl PriorKernelSource {
             &self.activation_identity,
             "prior_kernel.activation_identity",
         )?;
-        self.generation.validate()?;
+        validate_epoch_transition(&self.generation)?;
         self.job.validate()?;
         self.process
             .validate()
@@ -786,7 +752,8 @@ pub struct KernelRecord {
 impl KernelRecord {
     /// Computes a fresh direct-child Kernel generation without changing the Host epoch.
     pub fn direct_child_generation(&self) -> Result<EpochTransition, JournalError> {
-        self.kernel_generation.direct_child()
+        EpochTransition::direct_child(&self.kernel_generation.current)
+            .map_err(|error| map_epoch_contract_error(&error))
     }
 
     pub(crate) fn restore_legacy_nonce_for_replay(
@@ -826,7 +793,7 @@ impl KernelRecord {
         if let Some(candidate) = &self.candidate_pipe_identity {
             handle(candidate, "kernel.candidate_pipe_identity")?;
         }
-        self.kernel_generation.validate()?;
+        validate_epoch_transition(&self.kernel_generation)?;
         self.one_time_nonce.validate()?;
         self.prior_kernel_disposition.validate()?;
         if let Some(binding) = &self.candidate_job_binding {
@@ -1135,7 +1102,7 @@ impl DependencyRecord {
         handle(&self.dependency, "dependency")?;
         self.process_manifest.validate()?;
         handle(&self.requester_identity, "requester_identity")?;
-        self.process_generation.validate()?;
+        validate_epoch_transition(&self.process_generation)?;
         validate_process_outcome(&self.outcome)?;
         handles(&self.pid_job_lineage_refs, "pid_job_lineage_refs", false)?;
         self.lifecycle_budget.validate()?;
@@ -1200,8 +1167,9 @@ impl DrainRecord {
     fn validate(&self) -> Result<(), JournalError> {
         self.fence.validate()?;
         self.operation.validate()?;
-        self.drain_generation.validate()?;
-        if self.drain_generation.current.lineage != self.fence.activation_generation.current.lineage
+        validate_epoch_transition(&self.drain_generation)?;
+        if self.drain_generation.current.lineage_id
+            != self.fence.activation_generation.current.lineage_id
         {
             return Err(JournalError::EpochLineageConflict);
         }
@@ -1230,7 +1198,7 @@ impl DrainCommitRecord {
     fn validate(&self) -> Result<(), JournalError> {
         self.fence.validate()?;
         self.operation.validate()?;
-        self.drain_generation.validate()?;
+        validate_epoch_transition(&self.drain_generation)?;
         handle(&self.last_admission_closed_at, "last_admission_closed_at")?;
         handles(
             &self.lease_and_pending_operation_snapshot,
@@ -1242,8 +1210,9 @@ impl DrainCommitRecord {
                 "authority_epochs_fenced must not be empty".into(),
             ));
         }
+        // Fenced epochs are canonical values, valid by construction; only
+        // exact duplication is rejected here.
         for (index, epoch) in self.authority_epochs_fenced.iter().enumerate() {
-            epoch.validate()?;
             if self.authority_epochs_fenced[..index].contains(epoch) {
                 return Err(JournalError::Invalid(
                     "authority_epochs_fenced contains duplicates".into(),
@@ -1857,17 +1826,15 @@ pub(crate) fn activation_transition(
     };
     let same_generation = current.fence.activation_generation == next.fence.activation_generation;
     if !same_generation {
-        if !next
-            .fence
-            .activation_generation
-            .is_direct_child_of(&current.fence.activation_generation)?
-            || !matches!(
-                current.state,
-                ActivationState::StoppedClean
-                    | ActivationState::Failed
-                    | ActivationState::DegradedRecovery
-            )
-            || next.state != ActivationState::Starting
+        if !epoch_transition_is_direct_child_of(
+            &next.fence.activation_generation,
+            &current.fence.activation_generation,
+        )? || !matches!(
+            current.state,
+            ActivationState::StoppedClean
+                | ActivationState::Failed
+                | ActivationState::DegradedRecovery
+        ) || next.state != ActivationState::Starting
         {
             return Err(JournalError::StaleFence);
         }
@@ -1929,21 +1896,34 @@ pub(crate) fn kernel_transition(
     };
     let same = current.kernel_generation == next.kernel_generation;
     if !same {
-        let authority_advances = current
-            .process
-            .as_ref()
-            .zip(next.process.as_ref())
-            .is_some_and(|(prior, candidate)| {
-                candidate.authority_epoch.value() > prior.authority_epoch.value()
-            });
-        if !next
-            .kernel_generation
-            .is_direct_child_of(&current.kernel_generation)?
-            || !matches!(
-                current.state,
-                KernelActivationState::Failed | KernelActivationState::ManualRecovery
-            )
-            || next.state != KernelActivationState::ShadowNoAuthority
+        // T6-E4-A host scalar closure: scalar process ordering is
+        // intra-lineage only. Cross-lineage numeric ordering is forbidden,
+        // so the scalar `>` below is gated on the typed epoch tuple proving
+        // same lineage via `relation_to`. The typed direct-child check
+        // remains the admission authority; this gate ensures a larger scalar
+        // from another lineage can never satisfy `authority_advances`.
+        let same_kernel_lineage = !matches!(
+            next.kernel_generation
+                .current
+                .relation_to(&current.kernel_generation.current),
+            eliot_contracts::EpochRelation::UnrelatedLineage
+        );
+        let authority_advances = same_kernel_lineage
+            && current
+                .process
+                .as_ref()
+                .zip(next.process.as_ref())
+                .is_some_and(|(prior_process, candidate_process)| {
+                    candidate_process.authority_epoch.value()
+                        > prior_process.authority_epoch.value()
+                });
+        if !epoch_transition_is_direct_child_of(
+            &next.kernel_generation,
+            &current.kernel_generation,
+        )? || !matches!(
+            current.state,
+            KernelActivationState::Failed | KernelActivationState::ManualRecovery
+        ) || next.state != KernelActivationState::ShadowNoAuthority
             || !authority_advances
             || !next.prior_kernel_disposition.binds_to(current)
             || !next.prior_kernel_disposition.proves_terminated()
@@ -2174,14 +2154,13 @@ pub(crate) fn dependency_transition(
     };
     let same = current.process_generation == next.process_generation;
     if !same {
-        if !next
-            .process_generation
-            .is_direct_child_of(&current.process_generation)?
-            || !matches!(
-                current.state,
-                DependencyState::Failed | DependencyState::Stopped | DependencyState::Unknown
-            )
-            || next.state != DependencyState::Starting
+        if !epoch_transition_is_direct_child_of(
+            &next.process_generation,
+            &current.process_generation,
+        )? || !matches!(
+            current.state,
+            DependencyState::Failed | DependencyState::Stopped | DependencyState::Unknown
+        ) || next.state != DependencyState::Starting
         {
             return Err(JournalError::StaleFence);
         }
@@ -2297,5 +2276,59 @@ fn illegal(
         machine,
         from: format!("{from:?}"),
         to: format!("{to:?}"),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod host_scalar_closure_tests {
+    use std::num::NonZeroU64;
+
+    use eliot_contracts::{EpochId, EpochLineageId, EpochRelation};
+
+    use super::epoch_transition_is_direct_child_of;
+
+    const LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+    const LINEAGE_B: &str = "550e8400-e29b-41d4-a716-446655440001";
+
+    fn lineage(value: &str) -> EpochLineageId {
+        EpochLineageId::new(value).expect("valid test lineage")
+    }
+
+    fn epoch(lineage_value: &str, sequence: u64) -> EpochId {
+        EpochId::new(
+            lineage(lineage_value),
+            NonZeroU64::new(sequence).expect("non-zero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
+
+    /// T6-E4-A: same-lineage seq+1 advances via the typed tuple;
+    /// changed-lineage equal-seq is unrelated and fails typed (callers map
+    /// `Ok(false)` to `StaleFence`; lineage mismatches elsewhere map to
+    /// `EpochLineageConflict`). No scalar ordering is consulted here.
+    #[test]
+    fn same_lineage_direct_child_advances_cross_lineage_equal_seq_rejected() {
+        let parent_epoch = epoch(LINEAGE_A, 1);
+        let parent = eliot_contracts::EpochTransition::genesis(lineage(LINEAGE_A));
+        let child = eliot_contracts::EpochTransition::direct_child(&parent_epoch)
+            .expect("direct child mint");
+        assert!(epoch(LINEAGE_A, 2).is_direct_child_of(&parent_epoch));
+        assert!(
+            epoch_transition_is_direct_child_of(&child, &parent).expect("validated transitions")
+        );
+
+        let foreign_genesis = eliot_contracts::EpochTransition::genesis(lineage(LINEAGE_B));
+        let foreign_epoch = epoch(LINEAGE_B, 1);
+        assert!(!foreign_epoch.is_same_authority(&parent_epoch));
+        assert!(!foreign_epoch.is_direct_child_of(&parent_epoch));
+        assert_eq!(
+            foreign_epoch.relation_to(&parent_epoch),
+            EpochRelation::UnrelatedLineage
+        );
+        assert!(
+            !epoch_transition_is_direct_child_of(&foreign_genesis, &parent)
+                .expect("validated transitions")
+        );
     }
 }

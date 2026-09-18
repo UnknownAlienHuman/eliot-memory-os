@@ -1,0 +1,13 @@
+{
+  "issue": 984,
+  "source": "EliotHost",
+  "max_insertion_bytes": 1024,
+  "max_insertion_utf16_units": 1024,
+  "max_insertions": 1,
+  "queue_capacity": 64,
+  "events": [
+    { "name": "service_start", "id": 100, "severity": "information" },
+    { "name": "service_stop", "id": 101, "severity": "information" },
+    { "name": "service_failure", "id": 102, "severity": "error" }
+  ]
+}

@@ -1,0 +1,137 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
+status = "READY_WITH_CHILD_CONTRACTS"
+implementation_support = "PROVIDER_SPECIFIC_SURFACES_PRESENT_SHARED_EXECUTION_CONTRACT_INCOMPLETE"
+evidence_execution_status = "ISSUE_FAMILY_AND_SOURCE_ROUTING_INSPECTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "PROVIDER_NEUTRAL_EXECUTION_CONTRACT_CANDIDATE_ONLY"
+issue = 361
+child_issue_refs = [368, 369, 370, 371]
+related_issue_refs = [265, 874, 1109, 1126, 1100]
+parent_product_issue = 11
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "agent.provider-neutral-execution-contract"
+causal_property = "Every external agent/model/provider attempt uses one provider-neutral logical-decision, physical-attempt, route, capability, budget, privacy, cancellation, event and candidate-result contract; vendor adapters translate only at the boundary and cannot create authority, task meaning, canonical state or Finish."
+current_discriminator = "Claude, Codex, OpenCode, ACP and swarm/runtime packages expose uneven provider-specific contracts; without one accepted parent contract and the #368-#371 child seams, adapters can disagree on identity, turn framing, usage, cancellation, raw-event lineage, terminal result and unknown-outcome semantics."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/361"
+
+[documentation]
+architecture = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A10-04-delegation.md#a104-delegation",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A12-02-principal-session-and-visibility.md#a122-principal-session-and-visibility",
+]
+implementation = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I03-06-model-route-and-portfolio-policy.md#i36-model-route-and-portfolio-policy",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-01-eliot-bridge-protocol-ebp1.md#i71-eliot-bridge-protocol-ebp1",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-02-frame.md#i72-frame",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-23-raw-and-normalized-host-events.md#i723-raw-and-normalized-host-events",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I09-09-agentswarm-launch-and-no-lost-child-contract.md#i99-agentswarm-launch-and-no-lost-child-contract",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I10-11-external-model-bridges.md#i1011-external-model-bridges",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I10-15-agent-execution-fabric-and-durable-swarm.md#i1015-agent-execution-fabric-and-durable-swarm",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-20-canonical-runtime-lifecycle-vocabulary.md#i1420-canonical-runtime-lifecycle-vocabulary",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I15-02-principal-and-session-binding.md#i152-principal-and-session-binding",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I15-04-secrets.md#i154-secrets",
+]
+anchors = ["ARCH-SWM-02", "ARCH-PORT-01", "ARCH-AUTH-01", "ARCH-SEC-01", "ARCH-OBS-01", "ARCH-RES-04"]
+
+[current_source]
+confirmed = [
+  "Provider-specific adapter packages and shared agent API/contract/coordinator packages exist.",
+  "The provider catalogue #265, adapter registry #874 and package disposition #1109 require one common execution contract rather than parallel vendor semantics.",
+  "A logical decision, physical provider attempt, process generation, stream event, candidate result and Governor admission are different identities and stages.",
+  "Raw provider output and usage must remain evidence; normalization cannot manufacture progress, success, support or Finish.",
+]
+
+[scope]
+primary_paths = [
+  "crates/agent/eliot-agent-contracts/src/**",
+  "crates/agent/eliot-agent-api/src/**",
+  "exact shared types in crates/agent/eliot-agent-coordinator/src/**",
+  "provider-adapter conformance fixtures consumed by #874/#1109",
+  "directly relevant tests",
+]
+serialized_dependencies = [
+  "#368-#371 child contracts",
+  "#265 provider catalogue observations",
+  "#874 native adapter registry",
+  "#1109 provider package dispositions",
+  "#1126 durable swarm runtime",
+  "#1100 Dreamer runtime",
+  "#15/#18 Kernel and Governor ownership",
+]
+forbidden = [
+  "vendor SDK types or provider-specific status enums in the public contract",
+  "raw credentials, cookies, tokens or unrestricted provider payloads",
+  "generic JSON maps, Other variants or prose-driven control decisions",
+  "logical decision and physical attempt identity collapse",
+  "process exit, provider acknowledgement or model text treated as completion",
+  "provider-local task scheduling, canonical writes, authority or Finish",
+  "automatic GitHub workflow triggers",
+]
+
+[[waves]]
+id = "A"
+what = "Freeze the parent execution-unit and identity closure."
+how = [
+  "Bind installation, principal/Session, parent task/work unit, logical decision, physical attempt, operation/effect, route/provider/model, adapter/artifact/config/protocol generation, StateFence, deadline and cancellation identities.",
+  "Keep logical decision, attempt, provider process, stream and result IDs distinct with explicit lineage.",
+  "Reject missing, stale, duplicate and same-ID changed-meaning inputs before provider/process work.",
+]
+
+[[waves]]
+id = "B"
+what = "Compose the exact turn/request and capability envelope."
+how = [
+  "Reuse the child contract owned by #368-#371 for bounded structured input, expected output schema, tool/capability facets, privacy/data-use class, budget, stop/retry rules and omission policy.",
+  "Unknown fields, generic maps and provider-specific escape hatches fail closed.",
+  "Caller/provider cannot widen route, tools, filesystem/network/process, secrets, budget, privacy or effect ceiling.",
+]
+
+[[waves]]
+id = "C"
+what = "Separate raw events, normalized events, usage and terminal candidate result."
+how = [
+  "Preserve immutable raw stream/provider/process evidence or bounded omission handles before normalization.",
+  "Normalized events retain exact raw predecessor, sequence, timestamp/source, attempt and parser identity and cannot invent progress/completion.",
+  "Usage retains provider-declared, observed and billed quantities separately with unit/revision/unknown state.",
+  "Terminal result remains candidate-only with exact output, omissions, tool/effect observations, usage, coverage and proof ceiling.",
+]
+
+[[waves]]
+id = "D"
+what = "Close cancellation, replay, unknown outcome and adapter conformance."
+how = [
+  "Cancellation targets one exact active attempt/process and cannot alter another logical decision or erase a possible effect.",
+  "After possible provider/process/result delivery, reconcile the same identity before retry or route substitution.",
+  "Exact replay returns the same accepted attempt/result; changed route/model/config/input/capability/budget/privacy under one identity conflicts.",
+  "Run one shared conformance corpus against every retained adapter before registration as current.",
+]
+
+[acceptance]
+criteria = [
+  "One closed provider-neutral contract accounts for execution unit, identity/fence, turn/request, events, usage, terminal candidate and reconciliation.",
+  "Logical decision, physical attempt, provider process, stream event, candidate result and Governor admission remain distinct identities with explicit lineage.",
+  "Public contracts contain no vendor SDK type, raw secret, generic JSON authority, Other variant or human-detail control branch.",
+  "Every attempt binds exact provider/model/route, adapter/artifact/config/protocol generation, input, capabilities, privacy, budget, deadline, cancellation, operation/effect and StateFence identities.",
+  "Caller/provider input cannot widen tools, resources, authority, effect or privacy ceilings.",
+  "Raw events/output/usage are retained or explicitly omitted before normalization; normalized events preserve exact predecessors and cannot manufacture progress or completion.",
+  "Provider-declared, observed and billed usage remain separate and unknown quantities cannot become zero.",
+  "Terminal provider output remains candidate-only and cannot become canonical truth, support, authority, task completion or VERIFIED_COMPLETE.",
+  "Exact replay is idempotent; changed same-identity route/model/config/input/capability/budget/privacy conflicts.",
+  "Possible provider/process/result effects require exact reconciliation before retry or route substitution.",
+  "Cancellation affects one exact attempt and preserves possible external effects for reconciliation.",
+  "Every retained provider adapter passes the same identity, framing, event, usage, cancellation, malformed-input, unknown-outcome and candidate-only corpus.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-agent-contracts -p eliot-agent-api -p eliot-agent-coordinator --all-targets",
+  "cargo test --locked -p eliot-agent-contracts -p eliot-agent-api -p eliot-agent-coordinator --all-targets",
+  "cargo clippy --locked -p eliot-agent-contracts -p eliot-agent-api -p eliot-agent-coordinator --all-targets -- -D warnings",
+  "git diff --check",
+]
+edge_proof = "Run the shared corpus through every retained Claude/Codex/OpenCode/ACP adapter and the native registry, including replay, cancellation, malformed streams, unknown outcome and changed-route conflicts."
+product_proof = "Issue #11 remains open; provider-neutral contract proof cannot establish any provider's live availability or Product behavior."

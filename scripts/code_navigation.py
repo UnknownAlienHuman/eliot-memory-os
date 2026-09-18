@@ -43,6 +43,10 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     add_root(check_parser)
     self_test_parser = sub.add_parser("self-test")
     add_root(self_test_parser)
+    pkg_self_test_parser = sub.add_parser("package-docs-self-test")
+    add_root(pkg_self_test_parser)
+    proto_self_test_parser = sub.add_parser("prototype-docs-self-test")
+    add_root(proto_self_test_parser)
     sync_index_parser = sub.add_parser("sync-index")
     add_root(sync_index_parser)
 
@@ -66,6 +70,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "self-test":
             self_test()
             package_docs_self_test()
+            prototype_docs_self_test()
+        elif args.command == "package-docs-self-test":
+            package_docs_self_test()
+        elif args.command == "prototype-docs-self-test":
             prototype_docs_self_test()
         elif args.command == "check":
             check(root)
