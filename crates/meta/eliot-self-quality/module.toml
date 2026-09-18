@@ -1,7 +1,7 @@
 schema_version = 4
 module_id = "meta.self_quality.diagnosis"
 crate = "eliot-self-quality"
-status = "PROTOTYPE"
+status = "IMPLEMENTED"
 wave = "cognitive-micromodules-wave-02"
 agent_order = 38
 plane = "Meta"
