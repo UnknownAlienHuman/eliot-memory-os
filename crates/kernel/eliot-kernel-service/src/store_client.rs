@@ -228,6 +228,22 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
     }
 
     /// Binds one reserved-write answer to the exact admitted reservation
+    /// through the shared #991 verifier for the Kernel gateway boundary
+    /// (issue #992).
+    ///
+    /// This is the same production check as the `apply_reserved_write` send
+    /// path above, pinned to the Host-approved requirement fence: the gateway
+    /// reconciliation path calls it instead of a second implementation, so
+    /// there is exactly one receipt-binding authority.
+    pub(crate) fn check_reserved_write_receipt(
+        &self,
+        request: &ReservedWriteRequest,
+        receipt: &WriteReceipt,
+    ) -> Result<(), StoreError> {
+        self.validate_reserved_write_receipt(request, receipt)
+    }
+
+    /// Binds one reserved-write answer to the exact admitted reservation
     /// (issue #991).
     ///
     /// Operation, idempotency, canonical hash, transition class, fence, and
