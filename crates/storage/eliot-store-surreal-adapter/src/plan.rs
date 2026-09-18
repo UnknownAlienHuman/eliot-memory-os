@@ -977,4 +977,90 @@ mod tests {
         ));
         Ok(())
     }
+
+    #[test]
+    fn fresh_allocation_recomputes_only_allocation_dependent_values() -> Result<(), StoreError> {
+        // S-CONC-TX (issue #989, pure, no live DB): the bounded retry
+        // re-plans the unchanged admitted transition against a moved fence.
+        // Only allocation-dependent values may change; every semantic effect
+        // (revision/ordering heads, event/command/projection/relation
+        // contents) is identical.
+        let (_, transition) = fixture()?;
+        let stale = plan_apply(&transition, &[], &[], 1, 1)?;
+        let fresh = plan_apply(&transition, &[], &[], 2, 4)?;
+        assert_eq!(stale.commit_sequence, 1);
+        assert_eq!(fresh.commit_sequence, 2);
+        assert_eq!(stale.next_commit_sequence, 2);
+        assert_eq!(fresh.next_commit_sequence, 3);
+        assert_eq!(stale.next_outbox_sequence, 2);
+        assert_eq!(fresh.next_outbox_sequence, 5);
+        assert_ne!(stale.committed_at, fresh.committed_at);
+        assert_eq!(
+            stale.outbox_records.len(),
+            fresh.outbox_records.len(),
+            "same semantic input plans the same outbox count"
+        );
+        for (stale_outbox, fresh_outbox) in
+            stale.outbox_records.iter().zip(fresh.outbox_records.iter())
+        {
+            assert_eq!(
+                stale_outbox.outbox_id, fresh_outbox.outbox_id,
+                "outbox identity is semantic, not allocative"
+            );
+            assert_eq!(
+                stale_outbox.payload_digest, fresh_outbox.payload_digest,
+                "outbox payload digest is semantic, not allocative"
+            );
+            assert_ne!(
+                stale_outbox.sequence, fresh_outbox.sequence,
+                "outbox sequences consume the moved allocation"
+            );
+        }
+        assert_eq!(
+            stale.next_revision_heads, fresh.next_revision_heads,
+            "revision heads do not move with allocation"
+        );
+        assert_eq!(
+            stale.next_ordering_heads, fresh.next_ordering_heads,
+            "ordering heads do not move with allocation"
+        );
+        assert_eq!(
+            stale.event_ids, fresh.event_ids,
+            "event identity is semantic, not allocative"
+        );
+        assert_eq!(
+            stale.command_ids, fresh.command_ids,
+            "command identity is semantic, not allocative"
+        );
+        assert_eq!(
+            stale.revision_before_after, fresh.revision_before_after,
+            "revision deltas do not move with allocation"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sequence_overflow_fails_closed_never_wraps() -> Result<(), StoreError> {
+        // S-CONC-TX (issue #989, pure): integer bounds on every allocated
+        // sequence fail closed with an exact disposition; allocation never
+        // wraps, resets, or invents a duplicate identity.
+        let (_, transition) = fixture()?;
+        assert!(
+            plan_apply(&transition, &[], &[], u64::MAX, 1).is_err(),
+            "commit allocation overflow fails closed"
+        );
+        assert!(
+            plan_apply(&transition, &[], &[], 1, u64::MAX).is_err(),
+            "outbox allocation overflow fails closed"
+        );
+        assert!(
+            plan_apply(&transition, &[], &[], u64::MAX, u64::MAX).is_err(),
+            "joint allocation overflow fails closed"
+        );
+        assert!(
+            checked_increment(u64::MAX, "commit.sequence", "sequence overflow").is_err(),
+            "increment helper never wraps"
+        );
+        Ok(())
+    }
 }

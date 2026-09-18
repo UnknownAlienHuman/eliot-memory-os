@@ -1,0 +1,51 @@
+{
+  "issue": 989,
+  "denominator": 20,
+  "genesis_allocation": {
+    "next_commit_sequence": 1,
+    "next_outbox_sequence": 1
+  },
+  "disjoint_scopes": [
+    "scope-989-a",
+    "scope-989-b",
+    "scope-989-c",
+    "scope-989-d"
+  ],
+  "operation_prefix": "op-989-case",
+  "allocation_markers": [
+    "canonical_fence_cas_conflict",
+    "canonical_fence_create_conflict"
+  ],
+  "semantic_markers": [
+    "epistemic_position_cas_conflict",
+    "revision_head_cas_conflict",
+    "revision_head_create_conflict",
+    "ordering_head_cas_conflict",
+    "ordering_head_create_conflict"
+  ],
+  "error_mapping": {
+    "allocation_contention": "Unavailable",
+    "provider_conflict": "RevisionConflict",
+    "unknown_outcome": "MissingReceiptEnvelope"
+  },
+  "max_allocation_retries": 7,
+  "sequence_bounds": {
+    "zero_expected_is_rejected": 0,
+    "overflow": 18446744073709551615
+  },
+  "expected_dependencies": [
+    "eliot-platform",
+    "eliot-platform-windows",
+    "eliot-protocol",
+    "eliot-store-api",
+    "futures-util",
+    "schemars",
+    "secrecy",
+    "serde",
+    "serde_json",
+    "thiserror",
+    "tokio",
+    "tokio-tungstenite",
+    "uuid"
+  ]
+}

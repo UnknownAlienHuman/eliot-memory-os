@@ -62,6 +62,79 @@ const TX_ERASURE_OUTCOME: &str = "LET $erasure_outcome_existing = (SELECT VALUE 
 /// Reads one sealed erasure-outcome row by exact operation id.
 const READ_ERASURE_OUTCOME: &str = "SELECT VALUE { operation_id: operation_id, outcomes: outcomes } FROM ONLY type::record($erasure_outcome_table, $erasure_outcome_id);";
 
+/// Session lane carrying one canonical transaction (S-CONC-TX, issue #989).
+///
+/// Production canonical writes use the pre-pool facade session. The explicit
+/// test/private seam routes through the admitted #987 pooled normal-write
+/// lane so concurrent tasks execute on real separate sessions; no other lane
+/// may carry a canonical transaction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum TxLane {
+    Facade,
+    #[cfg(test)]
+    PooledWrite,
+}
+
+/// Provider markers proving the shared fence/sequence allocation moved while
+/// the transaction carried no semantic conflict marker.
+const ALLOCATION_CONFLICT_MARKERS: &[&str] = &[
+    "canonical_fence_cas_conflict",
+    "canonical_fence_create_conflict",
+];
+
+/// Provider markers proving a deterministic semantic conflict: stale
+/// epistemic position, revision head, or ordering head.
+const SEMANTIC_CONFLICT_MARKERS: &[&str] = &[
+    "epistemic_position_cas_conflict",
+    "revision_head_cas_conflict",
+    "revision_head_create_conflict",
+    "ordering_head_cas_conflict",
+    "ordering_head_create_conflict",
+];
+
+/// Reports whether a provider statement error proves shared-allocation
+/// movement (fence/sequence CAS).
+fn is_allocation_conflict(error: &str) -> bool {
+    ALLOCATION_CONFLICT_MARKERS
+        .iter()
+        .any(|marker| error.contains(marker))
+}
+
+/// Reports whether a provider statement error proves a deterministic
+/// semantic conflict (epistemic/revision/ordering CAS).
+fn is_semantic_conflict(error: &str) -> bool {
+    SEMANTIC_CONFLICT_MARKERS
+        .iter()
+        .any(|marker| error.contains(marker))
+}
+
+/// Classifies one canonical-transaction statement-error set without wildcard
+/// collapse (S-CONC-TX, issue #989).
+///
+/// A deterministic semantic marker anywhere in the set wins: the heads it
+/// names are stale regardless of fence movement. Pure fence/sequence
+/// movement is transient allocation contention on proved-not-committed
+/// ground (the fence CAS precedes the receipt create in statement order, so
+/// its abort commits nothing). Anything else — transport prose, duplicate
+/// receipt creates, malformed responses — is an unknown outcome resolved by
+/// exact receipt reconciliation, never retried blindly and never reported as
+/// a semantic conflict. Provider diagnostic text is matched only against
+/// these exact closed markers; no trustworthy code is inferred from
+/// arbitrary prose.
+fn classify_transaction_errors(errors: &[String], operation_id: &str) -> AdapterError {
+    if errors.iter().any(|error| is_semantic_conflict(error)) {
+        return AdapterError::ProviderConflict;
+    }
+    if errors.iter().any(|error| is_allocation_conflict(error)) {
+        return AdapterError::AllocationContention {
+            operation_id: operation_id.to_owned(),
+        };
+    }
+    AdapterError::UnknownOutcome {
+        operation_id: operation_id.to_owned(),
+    }
+}
+
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -78,7 +151,74 @@ pub(super) async fn write_transaction(
     expected_outbox_sequence: u64,
     current_revisions: &[RevisionHead],
     current_orderings: &[OrderingHead],
+    lane: TxLane,
 ) -> Result<(), AdapterError> {
+    let operation_id = transition.identity.operation_id.to_string();
+    let (sql, bindings) = build_apply_statements(
+        transition,
+        plan,
+        receipt,
+        initial_state,
+        expected_commit_sequence,
+        expected_outbox_sequence,
+        current_revisions,
+        current_orderings,
+    )?;
+    let mut response = match send_transaction(db, config, &sql, bindings, lane).await {
+        Ok(response) => response,
+        Err(AdapterError::ProviderUnavailable) => {
+            return Err(AdapterError::UnknownOutcome { operation_id });
+        }
+        Err(error) => return Err(error),
+    };
+    let errors = response.take_errors();
+    if !errors.is_empty() {
+        return Err(classify_transaction_errors(&errors, &operation_id));
+    }
+    Ok(())
+}
+
+/// Sends one assembled canonical transaction on the selected lane.
+///
+/// Both lanes use the identical parameterized `query` RPC and binding codec;
+/// only the session differs (facade vs pooled normal-write).
+async fn send_transaction(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    sql: &str,
+    bindings: Map<String, Value>,
+    lane: TxLane,
+) -> Result<client::RpcResults, AdapterError> {
+    match lane {
+        TxLane::Facade => client::query(db, config, "transaction.apply", sql, bindings).await,
+        #[cfg(test)]
+        TxLane::PooledWrite => db.query_write("transaction.apply", sql, bindings).await,
+    }
+}
+
+/// Assembles one canonical apply transaction (pure SQL + bindings).
+///
+/// Statement order is the commit boundary: epistemic CAS, fence CAS/create,
+/// revision CAS/create, ordering CAS/create(s), event/projection/relation/
+/// outbox creates, receipt create — all inside one `BEGIN`/`COMMIT`. Every
+/// declared expected revision head, ordering head, and the fence allocation
+/// is verified inside this transaction immediately before applying changes;
+/// shared allocation contention never waives those checks.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the transaction writer preserves the closed named-operation order and atomic SQL assembly"
+)]
+fn build_apply_statements(
+    transition: &eliot_store_api::PreparedTransition,
+    plan: &ApplyPlan,
+    receipt: &WriteReceipt,
+    initial_state: bool,
+    expected_commit_sequence: u64,
+    expected_outbox_sequence: u64,
+    current_revisions: &[RevisionHead],
+    current_orderings: &[OrderingHead],
+) -> Result<(String, Map<String, Value>), AdapterError> {
     let operation_id = transition.identity.operation_id.to_string();
     let revision = plan.next_revision_heads.first().ok_or_else(|| {
         AdapterError::Serialization(
@@ -324,36 +464,7 @@ pub(super) async fn write_transaction(
     );
 
     sql.push_str(schema::TX_COMMIT);
-
-    let mut response = match client::query(db, config, "transaction.apply", &sql, bindings).await {
-        Ok(response) => response,
-        Err(AdapterError::ProviderUnavailable) => {
-            return Err(AdapterError::UnknownOutcome { operation_id });
-        }
-        Err(error) => return Err(error),
-    };
-    let errors = response.take_errors();
-    if !errors.is_empty() {
-        if errors.iter().any(|error| is_transaction_conflict(error)) {
-            return Err(AdapterError::ProviderConflict);
-        }
-        return Err(AdapterError::UnknownOutcome { operation_id });
-    }
-    Ok(())
-}
-
-fn is_transaction_conflict(error: &str) -> bool {
-    [
-        "epistemic_position_cas_conflict",
-        "canonical_fence_cas_conflict",
-        "canonical_fence_create_conflict",
-        "revision_head_cas_conflict",
-        "revision_head_create_conflict",
-        "ordering_head_cas_conflict",
-        "ordering_head_create_conflict",
-    ]
-    .iter()
-    .any(|marker| error.contains(marker))
+    Ok((sql, bindings))
 }
 
 pub(super) fn to_value<T: Serialize>(value: &T) -> Result<Value, AdapterError> {
@@ -1035,6 +1146,269 @@ mod authority_binding_tests {
             evidence_binding(&[]).expect("empty renders"),
             Value::Array(Vec::new()),
             "non-capture transitions persist an empty evidence array"
+        );
+    }
+}
+
+#[cfg(test)]
+mod allocation_classification_tests {
+    #![allow(clippy::expect_used)]
+
+    use super::*;
+    use crate::plan::{build_receipt, plan_apply};
+    use eliot_store_api::{
+        EffectClass, EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
+        OperationIdentity, OperationManifestDigest, OrderingScopeId, ScopeId, SecurityContext,
+        TransitionClass,
+    };
+
+    const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn fence() -> StateFence {
+        use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
+        use std::num::NonZeroU64;
+        let lineage = EpochLineageId::new(TEST_LINEAGE).expect("lineage");
+        let epoch = EpochId::new(lineage, NonZeroU64::new(1).expect("non-zero")).expect("epoch");
+        StateFence::new(epoch, ResourceGeneration::genesis())
+    }
+
+    fn transition(operation: &str) -> eliot_store_api::PreparedTransition {
+        use serde_json::json;
+        use std::collections::BTreeMap;
+        eliot_store_api::PreparedTransition {
+            identity: OperationIdentity {
+                operation_id: eliot_store_api::OperationId::new(operation).expect("operation"),
+                idempotency_key: format!("idem-{operation}"),
+                canonical_request_hash: "a".repeat(64),
+            },
+            state_fence: fence(),
+            scope_id: ScopeId::new("scope-alloc").expect("scope"),
+            task_id: None,
+            ordering_scopes: vec![OrderingScopeId::new("scope-alloc").expect("ordering")],
+            transition_class: TransitionClass::CaptureCandidate,
+            requested_effect_ceiling: EffectClass::Candidate,
+            admission_contract_set_digest: "b".repeat(64),
+            operation_manifest_digest: OperationManifestDigest::new("manifest-1")
+                .expect("manifest"),
+            named_operations: vec![NamedMutationRequest {
+                operation: NamedMutationOperation::CaptureObservation,
+                parameters: BTreeMap::from([("subject".to_owned(), json!(operation))]),
+            }],
+            event_projection_relation_intents: EventProjectionRelationIntents {
+                event_ids: Vec::new(),
+                projection_kinds: Vec::new(),
+                relation_kinds: Vec::new(),
+            },
+            security: SecurityContext::default(),
+            required_proof_and_approval_refs: Vec::new(),
+        }
+    }
+
+    fn context() -> eliot_store_api::RequestMeta {
+        use eliot_contracts::{ClockReading, ProductId, RequestId, SourceId};
+        eliot_store_api::RequestMeta {
+            request_id: RequestId::new("request-alloc").expect("request"),
+            session_id: None,
+            task_id: None,
+            product_id: ProductId::new("product-alloc").expect("product"),
+            source_id: SourceId::new("source-alloc").expect("source"),
+            state_fence: fence(),
+            clock: ClockReading::default(),
+        }
+    }
+
+    #[test]
+    fn fence_only_errors_are_allocation_contention() {
+        for marker in [
+            "THROW 'canonical_fence_cas_conflict'",
+            "THROW 'canonical_fence_create_conflict'",
+        ] {
+            match classify_transaction_errors(&[format!("statement failed: {marker}")], "op-alloc")
+            {
+                AdapterError::AllocationContention { operation_id } => {
+                    assert_eq!(operation_id, "op-alloc");
+                }
+                unexpected => panic!("fence marker must contend, got {unexpected:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn semantic_markers_win_over_fence_markers() {
+        for marker in [
+            "epistemic_position_cas_conflict",
+            "revision_head_cas_conflict",
+            "revision_head_create_conflict",
+            "ordering_head_cas_conflict",
+            "ordering_head_create_conflict",
+        ] {
+            // A semantic marker anywhere in the set is deterministic, even
+            // beside a fence marker: stale heads never retry as contention.
+            let errors = vec![
+                "THROW 'canonical_fence_cas_conflict'".to_owned(),
+                format!("THROW '{marker}'"),
+            ];
+            assert_eq!(
+                classify_transaction_errors(&errors, "op-semantic"),
+                AdapterError::ProviderConflict,
+                "semantic marker {marker} must win"
+            );
+            assert_eq!(
+                classify_transaction_errors(&[format!("THROW '{marker}'")], "op-semantic"),
+                AdapterError::ProviderConflict,
+                "lone semantic marker {marker} is deterministic"
+            );
+        }
+    }
+
+    #[test]
+    fn unrecognized_errors_stay_unknown_never_conflict() {
+        for error in [
+            "connection reset during COMMIT".to_owned(),
+            "THROW 'erasure_intent_conflict'".to_owned(),
+            "Database index `wr_operation` already contains op-alloc".to_owned(),
+            String::new(),
+        ] {
+            match classify_transaction_errors(std::slice::from_ref(&error), "op-unknown") {
+                AdapterError::UnknownOutcome { operation_id } => {
+                    assert_eq!(operation_id, "op-unknown");
+                }
+                unexpected => panic!("unrecognized error must stay unknown, got {unexpected:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn assembled_transaction_verifies_fence_revision_ordering_before_receipt() {
+        use eliot_store_api::{OrderingHead, RevisionHead};
+        let ctx = context();
+        let transition = transition("op-assemble");
+        let plan = plan_apply(&transition, &[], &[], 1, 1).expect("plan applies");
+        let receipt = build_receipt(&ctx, &transition, &plan).expect("receipt builds");
+        // Existing heads select the CAS-update path, mirroring a live
+        // steady-state commit: every declared expectation is verified inside
+        // the transaction immediately before effects.
+        let current_revisions: Vec<RevisionHead> = plan
+            .revision_before_after
+            .iter()
+            .map(|delta| RevisionHead {
+                key: delta.key.clone(),
+                revision: delta.before,
+                state_fence: fence(),
+            })
+            .collect();
+        let current_orderings: Vec<OrderingHead> = plan
+            .next_ordering_heads
+            .iter()
+            .map(|head| OrderingHead {
+                scope: head.scope.clone(),
+                sequence: head.sequence.saturating_sub(1),
+                state_fence: fence(),
+            })
+            .collect();
+        let (sql, bindings) = build_apply_statements(
+            &transition,
+            &plan,
+            &receipt,
+            false,
+            1,
+            1,
+            &current_revisions,
+            &current_orderings,
+        )
+        .expect("statements assemble");
+        assert!(sql.starts_with(schema::TX_BEGIN), "one transaction opens");
+        assert!(sql.ends_with(schema::TX_COMMIT), "one transaction closes");
+        let fence = sql
+            .find("canonical_fence_cas_conflict")
+            .expect("fence CAS guards allocation");
+        let revision = sql
+            .find("revision_head_cas_conflict")
+            .expect("revision CAS guards heads");
+        let ordering = sql
+            .find("ordering_head_cas_conflict")
+            .expect("ordering CAS guards heads");
+        let receipt_create = sql
+            .find("CREATE type::record($receipt_table")
+            .expect("receipt create closes the boundary");
+        assert!(
+            fence < revision && revision < ordering && ordering < receipt_create,
+            "checks precede effects: fence, revision, ordering, receipt"
+        );
+        assert_eq!(
+            bindings.get("expected_commit_sequence"),
+            Some(&json!(1)),
+            "allocation expectation travels"
+        );
+        assert_eq!(
+            bindings.get("expected_outbox_sequence"),
+            Some(&json!(1)),
+            "outbox allocation expectation travels"
+        );
+        assert!(
+            bindings.contains_key("expected_state_fence"),
+            "fence expectation travels"
+        );
+        // Absent heads select the create path instead of the CAS-update
+        // path; the fence singleton still CAS-guards the steady state.
+        let (create_sql, _) =
+            build_apply_statements(&transition, &plan, &receipt, false, 1, 1, &[], &[])
+                .expect("create path assembles");
+        assert!(
+            create_sql.contains("revision_head_create_conflict"),
+            "absent revision head is created guarded"
+        );
+        assert!(
+            create_sql.contains("ordering_head_create_conflict"),
+            "absent ordering head is created guarded"
+        );
+        assert!(
+            create_sql.contains("canonical_fence_cas_conflict"),
+            "steady-state fence still CAS-guards allocation"
+        );
+        let (genesis_sql, _) =
+            build_apply_statements(&transition, &plan, &receipt, true, 1, 1, &[], &[])
+                .expect("genesis assembles");
+        assert!(
+            genesis_sql.contains("canonical_fence_create_conflict"),
+            "initial state creates the fence singleton"
+        );
+        assert!(
+            !genesis_sql.contains("canonical_fence_cas_conflict"),
+            "initial state never CAS-updates an absent fence"
+        );
+    }
+
+    #[test]
+    fn assembled_transaction_preserves_plan_contents() {
+        let ctx = context();
+        let transition = transition("op-contents");
+        let plan = plan_apply(&transition, &[], &[], 3, 7).expect("plan applies");
+        let receipt = build_receipt(&ctx, &transition, &plan).expect("receipt builds");
+        let (sql, bindings) =
+            build_apply_statements(&transition, &plan, &receipt, false, 3, 7, &[], &[])
+                .expect("statements assemble");
+        assert_eq!(
+            sql.matches("CREATE type::record($event_table0").count(),
+            1,
+            "exactly the planned event is created"
+        );
+        assert_eq!(
+            sql.matches("CREATE type::record($outbox_table0").count(),
+            1,
+            "exactly the planned outbox row is created"
+        );
+        assert_eq!(
+            bindings.get("receipt_operation_id"),
+            Some(&json!("op-contents")),
+            "receipt binds the admitted operation"
+        );
+        assert_eq!(
+            bindings
+                .get("receipt")
+                .and_then(|receipt| receipt.get("commit_sequence")),
+            Some(&json!(3)),
+            "receipt binds the allocated commit sequence"
         );
     }
 }
