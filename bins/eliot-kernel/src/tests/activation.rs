@@ -257,3 +257,274 @@ fn activation_decision_replay_is_exact_and_conflicts_are_rejected() {
         ActivationDecisionDisposition::Conflict
     );
 }
+
+// ---------------------------------------------------------------------------
+// #203 / #1115: one canonical terminal result identity per ticket across the
+// daemon and host-request legs.
+// ---------------------------------------------------------------------------
+
+#[cfg(windows)]
+fn activation_v2_ticket(ticket_id: &str, deadline: u64) -> AgentActivationResolutionTicket {
+    AgentActivationResolutionTicket {
+        wire_id: eliot_protocol::AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_ID.to_owned(),
+        wire_version: eliot_protocol::AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_VERSION,
+        ticket_id: ticket_id.to_owned(),
+        activation_request_id: RequestId::new("activation-request-test").expect("request id"),
+        activation_request_sha256: "a".repeat(64),
+        peer_admission_receipt_sha256: "b".repeat(64),
+        connection_id: "activation-connection-test".to_owned(),
+        state_fence: StateFence::new(
+            test_epoch(1),
+            ResourceGeneration::new(1).expect("resource generation"),
+        ),
+        kernel_deadline_unix_ms: deadline,
+        ticket_sha256: String::new(),
+    }
+    .with_computed_digest()
+    .expect("ticket digest")
+}
+
+#[cfg(windows)]
+fn activation_v2_entry(ticket: &AgentActivationResolutionTicket) -> AgentActivationPending {
+    let (_, template) = activation_test_entry(ticket.kernel_deadline_unix_ms);
+    AgentActivationPending {
+        ticket: ticket.clone(),
+        request: template.request,
+        decision: None,
+        claim_lease_until_unix_ms: None,
+    }
+}
+
+#[cfg(windows)]
+fn activation_v2_resolved(
+    ticket: &AgentActivationResolutionTicket,
+    resolved_at: u64,
+) -> eliot_protocol::AgentActivationResolutionResult {
+    use eliot_protocol::{
+        AgentActivationResolutionDisposition, AgentActivationResolutionResult,
+        AgentActivationResolvedBinding,
+    };
+    AgentActivationResolutionResult::new(
+        ticket,
+        resolved_at,
+        AgentActivationResolutionDisposition::Resolved {
+            binding: Box::new(AgentActivationResolvedBinding {
+                principal_id: "principal-test".to_owned(),
+                session_id: "session-test".to_owned(),
+                task_id: "task-test".to_owned(),
+                work_unit_id: "work-unit-test".to_owned(),
+                work_scope_id: "scope-test".to_owned(),
+                task_revision: "task-revision-test".to_owned(),
+                plan_id: "plan-test".to_owned(),
+                plan_revision: "plan-revision-test".to_owned(),
+            }),
+        },
+    )
+    .expect("resolved result")
+}
+
+#[cfg(windows)]
+fn activation_v2_failed(
+    ticket: &AgentActivationResolutionTicket,
+    resolved_at: u64,
+) -> eliot_protocol::AgentActivationResolutionResult {
+    use eliot_protocol::{AgentActivationResolutionDisposition, AgentActivationResolutionResult};
+    AgentActivationResolutionResult::new(
+        ticket,
+        resolved_at,
+        AgentActivationResolutionDisposition::FailedInternal {
+            failure_handle: "failure-test".to_owned(),
+        },
+    )
+    .expect("failed result")
+}
+
+#[cfg(windows)]
+fn activation_host_envelope(
+    ticket: &AgentActivationResolutionTicket,
+    result_sha256: &str,
+    connection_id: &str,
+) -> eliot_protocol::HostRequestEnvelope {
+    use eliot_protocol::{
+        HostRequestActivationBinding, HostRequestEnvelope, HostRequestIdentity, HostRequestKind,
+    };
+    HostRequestEnvelope {
+        wire_id: eliot_protocol::HOST_REQUEST_WIRE_ID.to_owned(),
+        wire_version: eliot_protocol::HOST_REQUEST_WIRE_VERSION,
+        kind: HostRequestKind::Activation,
+        connection_id: connection_id.to_owned(),
+        identity: HostRequestIdentity {
+            request_id: RequestId::new("host-request-activation-test").expect("request id"),
+            idempotency_key: "host-request-idempotency-test".to_owned(),
+            cancellation_id: "host-request-cancellation-test".to_owned(),
+            parent_operation_id: None,
+            deadline_unix_ms: 9_000,
+            capability: "activation-test-capability".to_owned(),
+            session_id: None,
+            task_id: None,
+            work_scope_id: None,
+            payload_schema_id: "activation-test-schema".to_owned(),
+            payload_sha256: "e".repeat(64),
+        },
+        state_fence: ticket.state_fence.clone(),
+        descriptor_sha256: "f".repeat(64),
+        peer_admission_receipt_sha256: "b".repeat(64),
+        activation_binding: Some(HostRequestActivationBinding {
+            ticket_id: ticket.ticket_id.clone(),
+            ticket_sha256: ticket.ticket_sha256.clone(),
+            resolution_result_sha256: result_sha256.to_owned(),
+        }),
+        envelope_sha256: String::new(),
+    }
+    .with_computed_digest()
+    .expect("envelope digest")
+}
+
+#[cfg(windows)]
+fn activation_kernel_with_ticket(
+    name: &str,
+    ticket: &AgentActivationResolutionTicket,
+    canonical: Option<eliot_protocol::AgentActivationResolutionResult>,
+    raw: Option<eliot_protocol::AgentActivationResolutionResult>,
+) -> (std::path::PathBuf, KernelComposition) {
+    let root = std::env::temp_dir().join(format!(
+        "eliot-kernel-activation-v2-{name}-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root).expect("test work root");
+    let kernel = KernelComposition::new(KernelConfig::new(&root)).expect("kernel composition");
+    {
+        let mut pending = kernel
+            .agent_activation_pending
+            .lock()
+            .expect("pending lock");
+        pending
+            .entries
+            .insert(ticket.ticket_id.clone(), activation_v2_entry(ticket));
+        if let Some(result) = canonical {
+            pending.retain_activation_result(AgentActivationResultRecord {
+                result,
+                phase: AgentActivationResultPhase::AcceptedTerminal,
+            });
+        }
+    }
+    if let Some(result) = raw {
+        kernel
+            .agent_activation_results
+            .lock()
+            .expect("raw result lock")
+            .insert(ticket.ticket_id.clone(), result);
+    }
+    (root, kernel)
+}
+
+#[cfg(windows)]
+#[test]
+fn activation_host_request_resolves_canonical_v2_envelope_result() {
+    let ticket = activation_v2_ticket("activation-ticket-v2", 2_000);
+    let result = activation_v2_resolved(&ticket, 1_000);
+    let (root, kernel) =
+        activation_kernel_with_ticket("canonical", &ticket, Some(result.clone()), None);
+    let envelope = activation_host_envelope(&ticket, &result.result_sha256, &ticket.connection_id);
+    let resolved = kernel
+        .host_request_activation_resolution(&envelope)
+        .expect("canonical v2 result must be addressable");
+    assert_eq!(resolved.result_sha256, result.result_sha256);
+    assert!(resolved.resolved_binding().is_some());
+    drop(kernel);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(windows)]
+#[test]
+fn activation_host_request_falls_back_to_raw_result_map() {
+    let ticket = activation_v2_ticket("activation-ticket-raw", 2_000);
+    let result = activation_v2_resolved(&ticket, 1_000);
+    let (root, kernel) =
+        activation_kernel_with_ticket("raw-fallback", &ticket, None, Some(result.clone()));
+    let envelope = activation_host_envelope(&ticket, &result.result_sha256, &ticket.connection_id);
+    let resolved = kernel
+        .host_request_activation_resolution(&envelope)
+        .expect("raw P-04 result must stay addressable");
+    assert_eq!(resolved.result_sha256, result.result_sha256);
+    drop(kernel);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(windows)]
+#[test]
+fn activation_host_request_prefers_canonical_v2_over_raw_result() {
+    let ticket = activation_v2_ticket("activation-ticket-priority", 2_000);
+    let canonical = activation_v2_resolved(&ticket, 1_000);
+    let raw = activation_v2_resolved(&ticket, 1_001);
+    assert_ne!(
+        canonical.result_sha256, raw.result_sha256,
+        "fixture requires two distinct result identities"
+    );
+    let (root, kernel) =
+        activation_kernel_with_ticket("priority", &ticket, Some(canonical.clone()), Some(raw));
+    let envelope =
+        activation_host_envelope(&ticket, &canonical.result_sha256, &ticket.connection_id);
+    let resolved = kernel
+        .host_request_activation_resolution(&envelope)
+        .expect("canonical v2 result wins over the raw leg");
+    assert_eq!(resolved.result_sha256, canonical.result_sha256);
+    drop(kernel);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(windows)]
+#[test]
+fn activation_host_request_without_any_result_is_unknown() {
+    let ticket = activation_v2_ticket("activation-ticket-unknown", 2_000);
+    let probe = activation_v2_resolved(&ticket, 1_000);
+    let (root, kernel) = activation_kernel_with_ticket("unknown", &ticket, None, None);
+    let envelope = activation_host_envelope(&ticket, &probe.result_sha256, &ticket.connection_id);
+    let error = kernel
+        .host_request_activation_resolution(&envelope)
+        .expect_err("result-less ticket must not resolve");
+    assert!(
+        matches!(error, TransportError::UnknownRequest),
+        "unexpected error: {error:?}"
+    );
+    drop(kernel);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(windows)]
+#[test]
+fn activation_host_request_non_resolved_v2_fails_closed() {
+    let ticket = activation_v2_ticket("activation-ticket-negative", 2_000);
+    let failed = activation_v2_failed(&ticket, 1_000);
+    let (root, kernel) =
+        activation_kernel_with_ticket("negative", &ticket, Some(failed.clone()), None);
+    let envelope = activation_host_envelope(&ticket, &failed.result_sha256, &ticket.connection_id);
+    let error = kernel
+        .host_request_activation_resolution(&envelope)
+        .expect_err("a negative disposition must never yield a binding");
+    assert!(
+        matches!(error, TransportError::SessionFenced),
+        "unexpected error: {error:?}"
+    );
+    drop(kernel);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(windows)]
+#[test]
+fn activation_host_request_wrong_connection_fails_closed() {
+    let ticket = activation_v2_ticket("activation-ticket-conn", 2_000);
+    let result = activation_v2_resolved(&ticket, 1_000);
+    let (root, kernel) =
+        activation_kernel_with_ticket("connection", &ticket, Some(result.clone()), None);
+    let envelope = activation_host_envelope(&ticket, &result.result_sha256, "other-connection");
+    let error = kernel
+        .host_request_activation_resolution(&envelope)
+        .expect_err("cross-connection resolution must fail closed");
+    assert!(
+        matches!(error, TransportError::SessionFenced),
+        "unexpected error: {error:?}"
+    );
+    drop(kernel);
+    let _ = std::fs::remove_dir_all(root);
+}

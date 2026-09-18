@@ -1476,6 +1476,39 @@ mod tests {
     }
 
     #[test]
+    fn v1_string_failure_payload_is_rejected_not_decoded() {
+        // Issue #1714: the legacy v1 string-failure wire shape must be
+        // rejected as unsupported protocol input. A bare string payload
+        // decodes into no StoreResponse variant — not even the bounded
+        // `Unknown` reconciliation variant — and a response frame carrying
+        // one fails closed at the typed decode boundary.
+        let legacy = json!("store unavailable: connection reset");
+        let decoded: Result<StoreResponse, _> = serde_json::from_value(legacy.clone());
+        assert!(
+            decoded.is_err(),
+            "bare string failure payload must not decode into any StoreResponse"
+        );
+        let frame = response_frame(
+            "connection-authority",
+            ProtocolVersion::CURRENT,
+            Some(RequestId::new("request-authority").expect("request id")),
+            StoreResponse::Receipt { receipt: None },
+        )
+        .expect("typed receipt frame builds");
+        let mut tampered = frame;
+        tampered.payload = ProtocolPayload::Json(legacy);
+        assert!(
+            decode_response_frame(
+                &tampered,
+                "connection-authority",
+                ProtocolVersion::CURRENT
+            )
+            .is_err(),
+            "string failure payload must be rejected, not decoded"
+        );
+    }
+
+    #[test]
     fn apply_canonical_hash_verifies_the_recomputed_digest() {
         use crate::{OrderingHeadExpectation, RevisionHeadExpectation};
         let (context, mut transition) = apply_parts(BTreeMap::from([(

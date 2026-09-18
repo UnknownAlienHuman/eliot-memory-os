@@ -267,6 +267,104 @@ impl SurrealAdapterConfig {
 /// OS-exclusion lease file proving exclusive ownership of one `SurrealKV` data root.
 pub(crate) const STORE_DATA_ROOT_LEASE_FILE: &str = ".eliot-store-data-root.lock";
 
+/// Maximum sessions admitted for one client-set role. The bound keeps the
+/// fixed set auditable against I5.9 (read lanes Q0-Q4, one `WriteCoordinator`
+/// lane family, one isolated health/admin lane) and preserves Control Reserve:
+/// normal workload cannot consume the pool without limit.
+pub const MAX_CLIENT_SET_SESSIONS_PER_ROLE: u8 = 8;
+
+/// Closed non-secret limits for the fixed bounded RPC session set owned by
+/// one provider generation (S-CONC-CLIENTS, issue #987).
+///
+/// Every role admits at least one session so read, normal-write and
+/// health/admin traffic never share a socket, and no role admits more than
+/// [`MAX_CLIENT_SET_SESSIONS_PER_ROLE`] sessions. The value carries no
+/// credential, endpoint, or command material: sessions connect only against
+/// the already validated [`SurrealAdapterConfig`] and the single provider
+/// owner the pool is built from, so a pool can never start a second provider
+/// process.
+///
+/// The per-role fields are private so the `1..=8` bound cannot be bypassed
+/// by struct-literal construction: every instance originates from the
+/// validated [`ClientSetLimits::new`] or [`ClientSetLimits::compatibility`]
+/// constructors below.
+///
+/// The shared `_sessions` postfix is deliberate domain vocabulary: it mirrors
+/// the `read_sessions` / `write_sessions` / `admin_sessions` keys of the
+/// reviewed pool-profile fixture (`tests/data/rpc_session_pool.json`), so the
+/// lint below is allowed rather than renamed away.
+#[allow(clippy::struct_field_names)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClientSetLimits {
+    /// Bounded read-lane sessions (`Q0-Q4` named reads).
+    read_sessions: u8,
+    /// Bounded normal-write sessions (canonical transactions).
+    write_sessions: u8,
+    /// Bounded isolated health/admin sessions.
+    admin_sessions: u8,
+}
+
+impl ClientSetLimits {
+    /// Builds validated limits. Rejects zero (a role without a lane would
+    /// silently share another role's socket) and anything above
+    /// [`MAX_CLIENT_SET_SESSIONS_PER_ROLE`].
+    pub fn new(
+        read_sessions: u8,
+        write_sessions: u8,
+        admin_sessions: u8,
+    ) -> Result<Self, ConfigError> {
+        for count in [read_sessions, write_sessions, admin_sessions] {
+            if count == 0 || count > MAX_CLIENT_SET_SESSIONS_PER_ROLE {
+                return Err(ConfigError::InvalidField {
+                    field: "client_set_limits",
+                });
+            }
+        }
+        Ok(Self {
+            read_sessions,
+            write_sessions,
+            admin_sessions,
+        })
+    }
+
+    /// Bounded compatibility profile preserving the pre-pool facade: one
+    /// session per role, the minimum that separates read, normal-write and
+    /// health/admin traffic. Existing constructors use this profile, so no
+    /// existing `SurrealAdapterConfig` struct literal changes.
+    #[must_use]
+    pub const fn compatibility() -> Self {
+        Self {
+            read_sessions: 1,
+            write_sessions: 1,
+            admin_sessions: 1,
+        }
+    }
+
+    /// Validated read-lane session bound.
+    #[must_use]
+    pub const fn read_sessions(self) -> u8 {
+        self.read_sessions
+    }
+
+    /// Validated normal-write session bound.
+    #[must_use]
+    pub const fn write_sessions(self) -> u8 {
+        self.write_sessions
+    }
+
+    /// Validated isolated health/admin session bound.
+    #[must_use]
+    pub const fn admin_sessions(self) -> u8 {
+        self.admin_sessions
+    }
+
+    /// Total sessions across all roles.
+    #[must_use]
+    pub const fn total_sessions(self) -> u16 {
+        self.read_sessions as u16 + self.write_sessions as u16 + self.admin_sessions as u16
+    }
+}
+
 /// Windows reparse-point attribute flag used to reject symlinked data roots.
 #[cfg(windows)]
 const WINDOWS_REPARSE_POINT: u32 = 0x400;

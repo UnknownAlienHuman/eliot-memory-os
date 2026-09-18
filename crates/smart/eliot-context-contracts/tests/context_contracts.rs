@@ -166,6 +166,7 @@ fn quality(context: &ContextBinding) -> QualityScorecard {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn admitted_set(candidate: ContextCandidate) -> AdmittedContextSet {
     let context = candidate.binding.clone();
     let atom_id = candidate.atom_id.clone();
@@ -282,6 +283,7 @@ fn admitted_set(candidate: ContextCandidate) -> AdmittedContextSet {
     admitted
 }
 
+// WORK_UNIT_CASE: 584/1
 #[test]
 fn loss_policy_wire_names_are_closed_over_all_four_variants() {
     #[derive(serde::Deserialize)]

@@ -1796,10 +1796,12 @@ pub mod surface_types {
         CostValueStatus, CoverageState, DecisionOpportunityDenominator, DelayedOutcomeWindow,
         DeliveryExposureDisposition, DeliveryExposureEvidence, EvaluationReportInput,
         EvidenceScope, ExpectedObservableSpec, GraphEvidenceRef, HarmDisposition,
-        InclusionDisposition, IneligibleSubjectRef, MemoryOutcome, MemoryOutcomeEconomicsRecord,
-        ObjectiveStatus, ObservableInfluence, ObservationWindowSpec, ObservationWindowStatus,
-        OperationalSpineProofBrief, OutcomeObservation, PlannedVerifierRef, ProductEvaluationPlan,
-        ProductEvidenceStatus, ProductIdentityRef, ProtectedRole, RecoveryAcceptanceProfile,
+        InclusionDisposition, IneligibleSubjectRef, InstalledProductPulsePlan,
+        InstalledPulseDenominator, MemoryOutcome, MemoryOutcomeEconomicsRecord, ObjectiveStatus,
+        ObservableInfluence, ObservationWindowSpec, ObservationWindowStatus,
+        OperationalSpineProofBrief, OutcomeObservation, PlannedPulseScenario, PlannedVerifierRef,
+        ProductEvaluationPlan, ProductEvidenceStatus, ProductIdentityRef, ProtectedRole,
+        PulseEvidenceDomain, PulseEvidenceRow, PulseRowDisposition, RecoveryAcceptanceProfile,
         RecoveryGap, RecoveryProfileStatus, RegretDisposition, ReportInput,
         TerminalVerifierBinding, Trial, TrialOutcome, TrialRecord, TrialStatus, UseDisposition,
         UserOutcomeObjectiveState, VerifierEvidenceRef,
@@ -1900,6 +1902,307 @@ impl GraphEvidenceRef {
     }
 }
 
+/// Evidence domain covered by one installed-pulse evidence row.
+///
+/// The five domains mirror the current-system evidence model: source, build,
+/// runtime, Store and integration rows are independently observed and can
+/// never be merged into one row.
+#[derive(
+    Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PulseEvidenceDomain {
+    Source,
+    Build,
+    Runtime,
+    Store,
+    Integration,
+}
+
+/// Terminal-or-open disposition of one installed-pulse evidence row.
+///
+/// Every applicable row carries exactly one disposition before execution;
+/// rows never disappear from the denominator. `Passed` is the only
+/// disposition that can support a promotion claim, and only together with
+/// the bound receipt evidence.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PulseRowDisposition {
+    NotExecuted,
+    NotRunning,
+    Unavailable,
+    Partial,
+    Unknown,
+    Stale,
+    Conflicted,
+    Failed,
+    Passed,
+}
+
+impl PulseRowDisposition {
+    /// Weakest-first rank used for aggregation. A failed required stage is
+    /// weakest because it fails the pulse; a passed stage is strongest.
+    /// Aggregation is the minimum rank, never a majority or scalar score.
+    const fn rank(self) -> u8 {
+        match self {
+            Self::Failed => 0,
+            Self::Conflicted => 1,
+            Self::Stale => 2,
+            Self::Unknown => 3,
+            Self::Unavailable => 4,
+            Self::NotRunning => 5,
+            Self::NotExecuted => 6,
+            Self::Partial => 7,
+            Self::Passed => 8,
+        }
+    }
+
+    /// Returns the weaker of two dispositions.
+    #[must_use]
+    pub const fn weaker(self, other: Self) -> Self {
+        if self.rank() <= other.rank() {
+            self
+        } else {
+            other
+        }
+    }
+}
+
+/// One explicitly-dispositioned evidence row of an installed Product Pulse.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PulseEvidenceRow {
+    pub row_id: ContractId,
+    pub domain: PulseEvidenceDomain,
+    pub subject: String,
+    pub disposition: PulseRowDisposition,
+    /// Required unless `disposition` is `Passed`: the omission, conflict,
+    /// unknown, staleness, failure or partial observation stays visible.
+    #[serde(default)]
+    pub detail: Option<String>,
+    pub evidence_refs: Vec<ArtifactId>,
+}
+
+impl PulseEvidenceRow {
+    /// Validates that passed rows carry evidence and every other
+    /// disposition carries its visible reason. Structural only: a
+    /// non-passed row is valid data, never a promotion claim.
+    pub fn validate(&self) -> Result<(), EvaluationContractError> {
+        text(&self.subject, "pulse_row.subject")?;
+        if self.disposition == PulseRowDisposition::Passed {
+            if self.evidence_refs.is_empty() {
+                return Err(EvaluationContractError::EmptyCollection {
+                    field: "pulse_row.evidence_refs",
+                });
+            }
+        } else {
+            match &self.detail {
+                Some(detail) => text(detail, "pulse_row.detail")?,
+                None => {
+                    return Err(EvaluationContractError::EvidenceState {
+                        field: "pulse_row.detail",
+                        reason: "non-passed pulse row requires a visible reason",
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The single current-identity denominator every pulse row and scenario is
+/// bound to. One plan carries exactly one denominator; evidence from another
+/// source, build, installation, generation, machine or run cannot be combined
+/// into the pulse.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstalledPulseDenominator {
+    pub source: ProductIdentityRef,
+    pub normative_pair_key: String,
+    pub cargo_lock_digest: String,
+    pub toolchain_id: String,
+    pub artifact_digests: Vec<String>,
+    pub installation_id: String,
+    pub lineage_id: String,
+    pub generation_id: String,
+    pub machine_class: String,
+    pub environment_class: String,
+    pub principal_id: String,
+    pub session_id: String,
+    pub authority_fence: StateFence,
+    pub store_namespace: String,
+    pub store_schema_revision: String,
+    pub store_heads_digest: String,
+    pub capability_registry_ref: ContractId,
+}
+
+impl InstalledPulseDenominator {
+    /// Validates that every identity leg is explicit. No leg is inferred.
+    pub fn validate(&self) -> Result<(), EvaluationContractError> {
+        self.source.validate()?;
+        for (field, value) in [
+            (
+                "pulse_identity.normative_pair_key",
+                &self.normative_pair_key,
+            ),
+            ("pulse_identity.cargo_lock_digest", &self.cargo_lock_digest),
+            ("pulse_identity.toolchain_id", &self.toolchain_id),
+            ("pulse_identity.installation_id", &self.installation_id),
+            ("pulse_identity.lineage_id", &self.lineage_id),
+            ("pulse_identity.generation_id", &self.generation_id),
+            ("pulse_identity.machine_class", &self.machine_class),
+            ("pulse_identity.environment_class", &self.environment_class),
+            ("pulse_identity.principal_id", &self.principal_id),
+            ("pulse_identity.session_id", &self.session_id),
+            ("pulse_identity.store_namespace", &self.store_namespace),
+            (
+                "pulse_identity.store_schema_revision",
+                &self.store_schema_revision,
+            ),
+            (
+                "pulse_identity.store_heads_digest",
+                &self.store_heads_digest,
+            ),
+        ] {
+            text(value, field)?;
+        }
+        unique_texts(&self.artifact_digests, "pulse_identity.artifact_digests")?;
+        Ok(())
+    }
+}
+
+/// One finite, versioned, predeclared pulse scenario. Scenarios are declared
+/// before the run; observations are matched against them, never inferred
+/// after the run.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlannedPulseScenario {
+    pub scenario_id: ContractId,
+    pub scenario_version: ContractVersion,
+    pub description: String,
+    pub expected_stage_ids: Vec<String>,
+}
+
+impl PlannedPulseScenario {
+    /// Validates that the scenario is bounded and versioned.
+    pub fn validate(&self) -> Result<(), EvaluationContractError> {
+        text(&self.description, "pulse_scenario.description")?;
+        unique_texts(
+            &self.expected_stage_ids,
+            "pulse_scenario.expected_stage_ids",
+        )
+    }
+}
+
+/// Immutable plan for one installed current-identity Product Pulse (#11).
+///
+/// The plan binds one causal property, one identity denominator, one
+/// explicit disposition per applicable evidence row, finite versioned
+/// scenarios and the exact planned verifier set. It creates no task
+/// semantics, canonical authority, repair policy, deployment or Finish:
+/// validation is structural, and a non-passed denominator remains valid
+/// diagnostic data under its explicit ceiling.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstalledProductPulsePlan {
+    pub plan_id: ContractId,
+    pub cell_id: String,
+    pub causal_property: String,
+    pub identity: InstalledPulseDenominator,
+    pub evidence_rows: Vec<PulseEvidenceRow>,
+    pub scenarios: Vec<PlannedPulseScenario>,
+    pub planned_verifiers: Vec<PlannedVerifierRef>,
+    pub proof_ceiling: ProofCeiling,
+}
+
+impl InstalledProductPulsePlan {
+    /// Validates plan completeness without executing or promoting anything.
+    pub fn validate(&self) -> Result<(), EvaluationContractError> {
+        text(&self.cell_id, "pulse_plan.cell_id")?;
+        text(&self.causal_property, "pulse_plan.causal_property")?;
+        self.identity.validate()?;
+        if self.evidence_rows.is_empty() {
+            return Err(EvaluationContractError::EmptyCollection {
+                field: "pulse_plan.evidence_rows",
+            });
+        }
+        {
+            let mut seen = BTreeSet::new();
+            let mut seen_domains = BTreeSet::new();
+            for row in &self.evidence_rows {
+                if !seen.insert(row.row_id.clone()) {
+                    return Err(EvaluationContractError::DuplicateIdentity {
+                        field: "pulse_plan.evidence_rows",
+                    });
+                }
+                if !seen_domains.insert(row.domain) {
+                    return Err(EvaluationContractError::DuplicateIdentity {
+                        field: "pulse_plan.evidence_rows.domain",
+                    });
+                }
+                row.validate()?;
+            }
+            if seen_domains.len() != 5 {
+                return Err(EvaluationContractError::InvalidDependency {
+                    field: "pulse_plan.evidence_rows.domain",
+                    reason: "installed pulse requires exactly one row for every evidence domain",
+                });
+            }
+        }
+        if self.scenarios.is_empty() {
+            return Err(EvaluationContractError::EmptyCollection {
+                field: "pulse_plan.scenarios",
+            });
+        }
+        {
+            let mut seen = BTreeSet::new();
+            for scenario in &self.scenarios {
+                if !seen.insert(scenario.scenario_id.clone()) {
+                    return Err(EvaluationContractError::DuplicateIdentity {
+                        field: "pulse_plan.scenarios",
+                    });
+                }
+                scenario.validate()?;
+            }
+        }
+        if self.planned_verifiers.is_empty() {
+            return Err(EvaluationContractError::EmptyCollection {
+                field: "pulse_plan.planned_verifiers",
+            });
+        }
+        for verifier in &self.planned_verifiers {
+            verifier.validate()?;
+            if !self
+                .identity
+                .source
+                .contract_revisions
+                .contains(&verifier.contract_revision)
+            {
+                return Err(EvaluationContractError::InvalidDependency {
+                    field: "pulse_plan.planned_verifiers.contract_revision",
+                    reason: "planned verifier revision must be listed in product identity contract revisions",
+                });
+            }
+            if self.proof_ceiling > verifier.proof_ceiling {
+                return Err(EvaluationContractError::ProofOverclaim);
+            }
+        }
+        Ok(())
+    }
+
+    /// Aggregates the evidence rows to the weakest required disposition.
+    /// Never a majority or scalar score. An unvalidated empty row set
+    /// aggregates to `NotExecuted` rather than panicking.
+    #[must_use]
+    pub fn aggregate(&self) -> PulseRowDisposition {
+        self.evidence_rows
+            .iter()
+            .map(|row| row.disposition)
+            .reduce(PulseRowDisposition::weaker)
+            .unwrap_or(PulseRowDisposition::NotExecuted)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1909,11 +2212,16 @@ mod tests {
     const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
 
     fn test_epoch(lineage: &str, sequence: u64) -> EpochId {
-        EpochId::new(
-            EpochLineageId::new(lineage).expect("valid test lineage"),
-            NonZeroU64::new(sequence).expect("nonzero test sequence"),
-        )
-        .expect("valid test epoch")
+        let Ok(lineage) = EpochLineageId::new(lineage) else {
+            panic!("invalid test lineage");
+        };
+        let Some(sequence) = NonZeroU64::new(sequence) else {
+            panic!("invalid test sequence");
+        };
+        let Ok(epoch) = EpochId::new(lineage, sequence) else {
+            panic!("invalid test epoch");
+        };
+        epoch
     }
 
     macro_rules! valid {
@@ -2357,6 +2665,252 @@ mod tests {
             evidence_refs: vec![],
         };
         assert!(evidence.validate().is_err());
+    }
+
+    fn pulse_denominator() -> InstalledPulseDenominator {
+        InstalledPulseDenominator {
+            source: product_identity(),
+            normative_pair_key: "pair-fixture-1".to_owned(),
+            cargo_lock_digest: "lock-fixture-1".to_owned(),
+            toolchain_id: "toolchain-fixture-1".to_owned(),
+            artifact_digests: vec!["artifact-digest-fixture-1".to_owned()],
+            installation_id: "installation-fixture-1".to_owned(),
+            lineage_id: "lineage-fixture-1".to_owned(),
+            generation_id: "generation-fixture-1".to_owned(),
+            machine_class: "machine-fixture-1".to_owned(),
+            environment_class: "environment-fixture-1".to_owned(),
+            principal_id: "principal-fixture-1".to_owned(),
+            session_id: "session-fixture-1".to_owned(),
+            authority_fence: StateFence::new(
+                test_epoch(TEST_LINEAGE_A, 1),
+                eliot_contracts::ResourceGeneration::genesis(),
+            ),
+            store_namespace: "store-fixture-1".to_owned(),
+            store_schema_revision: "schema-fixture-1".to_owned(),
+            store_heads_digest: "heads-fixture-1".to_owned(),
+            capability_registry_ref: valid!(ContractId, "registry-1"),
+        }
+    }
+
+    fn passed_row(id: &str, domain: PulseEvidenceDomain) -> PulseEvidenceRow {
+        PulseEvidenceRow {
+            row_id: valid!(ContractId, id),
+            domain,
+            subject: format!("{id}-subject"),
+            disposition: PulseRowDisposition::Passed,
+            detail: None,
+            evidence_refs: vec![valid!(ArtifactId, "artifact-1")],
+        }
+    }
+
+    fn open_row(
+        id: &str,
+        domain: PulseEvidenceDomain,
+        disposition: PulseRowDisposition,
+    ) -> PulseEvidenceRow {
+        PulseEvidenceRow {
+            row_id: valid!(ContractId, id),
+            domain,
+            subject: format!("{id}-subject"),
+            disposition,
+            detail: Some("fixture reason".to_owned()),
+            evidence_refs: vec![],
+        }
+    }
+
+    fn pulse_scenario(id: &str) -> PlannedPulseScenario {
+        PlannedPulseScenario {
+            scenario_id: valid!(ContractId, id),
+            scenario_version: CONTRACT_VERSION,
+            description: "fixture scenario".to_owned(),
+            expected_stage_ids: vec!["stage-1".to_owned()],
+        }
+    }
+
+    fn pulse_plan() -> InstalledProductPulsePlan {
+        InstalledProductPulsePlan {
+            plan_id: valid!(ContractId, "pulse-plan-1"),
+            cell_id: "product.installed-current-identity-pulse".to_owned(),
+            causal_property: "fixture causal property".to_owned(),
+            identity: pulse_denominator(),
+            evidence_rows: vec![
+                passed_row("row-source-1", PulseEvidenceDomain::Source),
+                passed_row("row-build-1", PulseEvidenceDomain::Build),
+                passed_row("row-runtime-1", PulseEvidenceDomain::Runtime),
+                passed_row("row-store-1", PulseEvidenceDomain::Store),
+                passed_row("row-integration-1", PulseEvidenceDomain::Integration),
+            ],
+            scenarios: vec![pulse_scenario("scenario-1")],
+            planned_verifiers: vec![planned_verifier()],
+            proof_ceiling: ProofCeiling::ScopedVerification,
+        }
+    }
+
+    #[test]
+    fn installed_pulse_plan_validates_and_aggregates_passed() {
+        let plan = pulse_plan();
+        assert!(plan.validate().is_ok());
+        assert_eq!(plan.aggregate(), PulseRowDisposition::Passed);
+    }
+
+    #[test]
+    fn stale_row_stays_valid_data_but_lowers_aggregate() {
+        let mut plan = pulse_plan();
+        plan.evidence_rows[2] = open_row(
+            "row-runtime-1",
+            PulseEvidenceDomain::Runtime,
+            PulseRowDisposition::Stale,
+        );
+        assert!(plan.validate().is_ok());
+        assert_eq!(plan.aggregate(), PulseRowDisposition::Stale);
+    }
+
+    #[test]
+    fn failed_row_is_weakest_in_aggregation() {
+        let mut plan = pulse_plan();
+        plan.evidence_rows[1] = open_row(
+            "row-build-1",
+            PulseEvidenceDomain::Build,
+            PulseRowDisposition::Unknown,
+        );
+        plan.evidence_rows[3] = open_row(
+            "row-store-1",
+            PulseEvidenceDomain::Store,
+            PulseRowDisposition::Failed,
+        );
+        assert!(plan.validate().is_ok());
+        assert_eq!(plan.aggregate(), PulseRowDisposition::Failed);
+    }
+
+    #[test]
+    fn passed_row_without_evidence_is_rejected() {
+        let mut row = passed_row("row-1", PulseEvidenceDomain::Source);
+        row.evidence_refs.clear();
+        assert!(row.validate().is_err());
+    }
+
+    #[test]
+    fn non_passed_row_without_visible_reason_is_rejected() {
+        let mut row = open_row(
+            "row-1",
+            PulseEvidenceDomain::Source,
+            PulseRowDisposition::Partial,
+        );
+        row.detail = None;
+        assert!(matches!(
+            row.validate(),
+            Err(EvaluationContractError::EvidenceState {
+                field: "pulse_row.detail",
+                ..
+            })
+        ));
+        row.detail = Some(" ".to_owned());
+        assert!(row.validate().is_err());
+    }
+
+    #[test]
+    fn pulse_plan_rejects_empty_or_duplicate_denominator_rows() {
+        let mut plan = pulse_plan();
+        plan.evidence_rows.clear();
+        assert!(plan.validate().is_err());
+
+        plan = pulse_plan();
+        plan.evidence_rows[0].row_id = plan.evidence_rows[1].row_id.clone();
+        assert_eq!(
+            plan.validate(),
+            Err(EvaluationContractError::DuplicateIdentity {
+                field: "pulse_plan.evidence_rows",
+            })
+        );
+    }
+
+    #[test]
+    fn pulse_plan_rejects_missing_or_duplicate_evidence_domains() {
+        let mut plan = pulse_plan();
+        plan.evidence_rows.remove(4);
+        assert!(matches!(
+            plan.validate(),
+            Err(EvaluationContractError::InvalidDependency {
+                field: "pulse_plan.evidence_rows.domain",
+                ..
+            })
+        ));
+
+        plan = pulse_plan();
+        plan.evidence_rows[4].domain = PulseEvidenceDomain::Runtime;
+        assert_eq!(
+            plan.validate(),
+            Err(EvaluationContractError::DuplicateIdentity {
+                field: "pulse_plan.evidence_rows.domain",
+            })
+        );
+    }
+
+    #[test]
+    fn pulse_plan_rejects_missing_scenarios_or_verifiers() {
+        let mut plan = pulse_plan();
+        plan.scenarios.clear();
+        assert!(plan.validate().is_err());
+
+        plan = pulse_plan();
+        plan.planned_verifiers.clear();
+        assert!(plan.validate().is_err());
+
+        plan = pulse_plan();
+        plan.scenarios.push(pulse_scenario("scenario-1"));
+        assert_eq!(
+            plan.validate(),
+            Err(EvaluationContractError::DuplicateIdentity {
+                field: "pulse_plan.scenarios",
+            })
+        );
+    }
+
+    #[test]
+    fn pulse_plan_ceiling_above_verifier_is_overclaim() {
+        let mut plan = pulse_plan();
+        plan.proof_ceiling = ProofCeiling::ObservedExternalEffect;
+        assert_eq!(
+            plan.validate(),
+            Err(EvaluationContractError::ProofOverclaim)
+        );
+    }
+
+    #[test]
+    fn pulse_plan_rejects_verifier_revision_outside_identity() {
+        let mut plan = pulse_plan();
+        plan.planned_verifiers[0].contract_revision = ContractVersion::new(9, 0, 0);
+        assert!(matches!(
+            plan.validate(),
+            Err(EvaluationContractError::InvalidDependency { .. })
+        ));
+    }
+
+    #[test]
+    fn pulse_denominator_rejects_blank_or_duplicate_identity_legs() {
+        let mut denominator = pulse_denominator();
+        assert!(denominator.validate().is_ok());
+
+        denominator.installation_id = " ".to_owned();
+        assert!(denominator.validate().is_err());
+
+        denominator = pulse_denominator();
+        denominator
+            .artifact_digests
+            .push("artifact-digest-fixture-1".to_owned());
+        assert!(denominator.validate().is_err());
+    }
+
+    #[test]
+    fn pulse_row_rejects_unknown_serde_fields() {
+        let value = serde_json::json!({
+            "row_id": "row-1",
+            "domain": "SOURCE",
+            "subject": "fixture subject",
+            "evidence_refs": [],
+            "unknown": true
+        });
+        assert!(serde_json::from_value::<PulseEvidenceRow>(value).is_err());
     }
 
     #[test]

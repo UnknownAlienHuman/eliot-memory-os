@@ -12,6 +12,7 @@ functional_cell = "swarm"
 lifecycle_owner = "A-07"
 source_layer = "C3"
 proof_entrypoint = "cargo test -p eliot-swarm --all-targets --all-features"
+workspace_admission = "retire-candidate per #1139 (closed via PR #1673); provider adapters wired through eliot-native-worker; swarm planning/execution successors are eliot-agent-coordinator, eliot-agent-contracts and the native-worker claim path; removal requires an owner manifest"
 
 [dependencies]
 eliot-agent-api.workspace = true
@@ -24,6 +25,9 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+toml.workspace = true
 
 [lints]
 workspace = true

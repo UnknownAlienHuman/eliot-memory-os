@@ -256,7 +256,12 @@ pub(crate) async fn client(
     let transport = match adapter
         .client
         .get_or_init(|| async {
-            client::RpcTransport::connect(&adapter.config, &adapter.provider_process_lease).await
+            client::RpcTransport::connect_with_limits(
+                &adapter.config,
+                &adapter.provider_process_lease,
+                adapter.client_limits,
+            )
+            .await
         })
         .await
     {
