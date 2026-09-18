@@ -7,7 +7,7 @@ pub(crate) use eliot_dreamer_contracts::validation::{
     model_digest, output_digest, preservation_digest,
 };
 use eliot_dreamer_contracts::{
-    DreamInputBundle, DreamJobInput, PreservationReport, ValidatedDreamDraft, ValidationReceipt,
+    DreamInputBundle, DreamJobAdmission, PreservationReport, ValidatedDreamDraft, ValidationReceipt,
 };
 
 pub(crate) fn rejection_size(
@@ -32,7 +32,7 @@ pub(crate) fn rejection_size(
 
 /// A05 receipt issuance context. Canonical field encoding is owned by A03.
 pub(crate) struct ReceiptContext<'a> {
-    pub job: &'a DreamJobInput,
+    pub job: &'a DreamJobAdmission,
     pub bundle: &'a DreamInputBundle,
     pub policy: &'a ValidationPolicy,
     pub preservation: &'a PreservationReport,

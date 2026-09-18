@@ -14,6 +14,10 @@ schemars.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+eliot-canonical.workspace = true
+eliot-epistemic-contracts = { path = "../../smart/eliot-epistemic-contracts" }
+eliot-evidence.workspace = true
+eliot-receipts.workspace = true
 eliot-contracts = { workspace = true }
 
 [lints]

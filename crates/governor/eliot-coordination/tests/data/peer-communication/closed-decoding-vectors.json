@@ -1,0 +1,10 @@
+{
+  "schema": "peer-message/v1",
+  "required_fields": ["message_id", "kind", "stream_recipient", "stream_work_item", "sender", "payload_digest"],
+  "unknown_schemas": ["peer-message/v9", "Peer-Message/v1", "peer-board/v1", ""],
+  "unknown_kinds": ["assignment", "broadcast", "other", "NOTE", ""],
+  "unknown_fields": ["priority", "ttl_ms"],
+  "duplicate_key_field": "kind",
+  "valid_message_id": "msg-closed-1",
+  "valid_kind": "note"
+}

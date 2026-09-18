@@ -5,12 +5,14 @@ use eliot_engine::{
     VerificationDoctorIntegration, VerificationPlannerService, VerificationProfileService,
     VerificationRunnerService, VerificationVerdictService,
 };
-use eliot_types::{
-    ProjectId, TestCostClass, TestIntent, TestKind, TestStatefulness, VerificationCommandResult,
-    VerificationCommandStatus, VerificationDecision, VerificationRunStatus,
+use eliot_types::verification::{
+    VerificationCommandResult, VerificationCommandStatus, VerificationDecision, VerificationRun,
+    VerificationRunStatus,
 };
+use eliot_types::{ProjectId, TestCostClass, TestIntent, TestKind, TestStatefulness};
 use std::fs;
 use std::path::PathBuf;
+use time::OffsetDateTime;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -205,10 +207,41 @@ fn verification_run_rejects_raw_command() {
 }
 
 #[test]
-fn verification_verdict_generated() {
-    let run = VerificationRunnerService
-        .run_profile_record(&plan("change-gate"))
-        .expect("profile run");
+fn verification_run_profile_record_is_fail_closed_without_execution() {
+    // T7-S2 removed the legacy promotion that fabricated a Passed run
+    // without executing anything. The recorded command allowlist still
+    // applies first; afterwards the call fails closed instead of passing.
+    assert!(
+        VerificationRunnerService
+            .run_profile_record(&plan("change-gate"))
+            .is_err()
+    );
+}
+
+fn recorded_run(status: VerificationRunStatus) -> VerificationRun {
+    VerificationRun {
+        run_id: "verification-run-fixture".to_owned(),
+        plan_id: "verification-plan-fixture".to_owned(),
+        profile_id: "change-gate".to_owned(),
+        started_at: OffsetDateTime::now_utc(),
+        finished_at: Some(OffsetDateTime::now_utc()),
+        command_results: Vec::new(),
+        status,
+    }
+}
+
+#[test]
+fn verification_verdict_allows_genuine_pass() {
+    let mut run = recorded_run(VerificationRunStatus::Passed);
+    run.command_results.push(VerificationCommandResult {
+        command: "just verify".to_owned(),
+        status: VerificationCommandStatus::Passed,
+        duration_ms: 100,
+        stdout_ref: None,
+        stderr_ref: None,
+        parsed_test_count: None,
+        warnings: Vec::new(),
+    });
     let verdict = VerificationVerdictService.verdict(&run);
 
     assert_eq!(verdict.run_id, run.run_id);
@@ -217,10 +250,7 @@ fn verification_verdict_generated() {
 
 #[test]
 fn verification_verdict_blocks_failed_command() {
-    let mut run = VerificationRunnerService
-        .run_profile_record(&plan("change-gate"))
-        .expect("profile run");
-    run.status = VerificationRunStatus::Failed;
+    let mut run = recorded_run(VerificationRunStatus::Failed);
     run.command_results.push(VerificationCommandResult {
         command: "just verify".to_owned(),
         status: VerificationCommandStatus::Failed,
@@ -303,9 +333,7 @@ fn full_profile_runs_dependency_absence_checks() {
 #[test]
 fn test_cost_report_generated() {
     let inventory = inventory();
-    let run = VerificationRunnerService
-        .run_profile_record(&plan("change-gate"))
-        .expect("profile run");
+    let run = recorded_run(VerificationRunStatus::Failed);
     let report = TestCostService.report(&inventory, Some(&run));
 
     assert_eq!(report.total_tests, inventory.test_count);
@@ -356,9 +384,7 @@ fn stateful_db_profile_marks_serial() {
 #[test]
 fn doctor_reports_verification_status() {
     let inventory = inventory();
-    let run = VerificationRunnerService
-        .run_profile_record(&plan("change-gate"))
-        .expect("profile run");
+    let run = recorded_run(VerificationRunStatus::Failed);
     let cost = TestCostService.report(&inventory, Some(&run));
     let flake = FlakeDetectionService.report("change-gate", 2, &inventory);
     let db = StatefulDbTestIsolationService.report(&inventory);

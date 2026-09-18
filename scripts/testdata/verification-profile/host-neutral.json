@@ -1,0 +1,10 @@
+{
+  "schema": "eliot.host-neutral-fixture.v1",
+  "note": "WORK_UNIT_CASE: 750/19 and 750/20 fixture. Platform-neutral verification derives owned-tree paths from the runner environment and pins portable diagnostics; Windows-only coverage still requires a Windows runner disposition.",
+  "runners": ["ubuntu-latest", "windows-latest"],
+  "portable_env": ["CARGO_TERM_COLOR", "CARGO_TERM_VERBOSE", "RUST_BACKTRACE"],
+  "owned_tree_from_env": ["RUNNER_TEMP"],
+  "forbidden_hardcoded_paths": ["C:\\", "/home/", "D:\\a\\"],
+  "windows_runner_required_when_cfg_present": ["cfg(windows)"],
+  "unavailable_runner_disposition": "INCOMPLETE"
+}

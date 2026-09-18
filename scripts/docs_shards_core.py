@@ -18,6 +18,7 @@ import posixpath
 import re
 import shutil
 import sys
+import tempfile
 import tomllib
 import urllib.parse
 from dataclasses import dataclass
@@ -208,7 +209,7 @@ def choose_cuts(text: str, headings: Sequence[Heading]) -> list[int]:
         if heading.level == 1 or heading.handle is not None:
             cuts.add(heading.char_start)
 
-    for max_level, threshold in ((2, 48_000), (3, 64_000), (4, 80_000), (6, 120_000)):
+    for max_level, threshold in ((2, 48_000), (3, 48_000), (4, 48_000), (6, 48_000)):
         changed = True
         while changed:
             changed = False
@@ -1306,6 +1307,7 @@ def verify_manifest(root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
     expected_order = 0
     expected_start = 0
     largest = 0
+    seen_paths: set[str] = set()
     for record in manifest["fragments"]:
         order = int(record["order"])
         if order != expected_order:
@@ -1320,7 +1322,14 @@ def verify_manifest(root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
             )
         expected_start = int(record["source_end_char"])
 
-        path = repo_path(root, str(record["path"]))
+        fragment_path_str = str(record["path"])
+        if fragment_path_str in seen_paths:
+            raise DocsError(
+                f"duplicate canonical shard in {manifest['source_key']} manifest: {fragment_path_str}"
+            )
+        seen_paths.add(fragment_path_str)
+
+        path = repo_path(root, fragment_path_str)
         if not path.is_file():
             raise DocsError(f"missing normative fragment: {record['path']}")
         rendered = read_utf8(path)
@@ -1330,9 +1339,15 @@ def verify_manifest(root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
                 f"rendered fragment hash mismatch: {record['path']} "
                 f"expected {record['rendered_sha256']}, actual {rendered_hash}"
             )
-        if len(rendered.encode("utf-8")) != int(record["rendered_bytes"]):
+        rendered_bytes = len(rendered.encode("utf-8"))
+        if rendered_bytes != int(record["rendered_bytes"]):
             raise DocsError(f"rendered fragment byte count mismatch: {record['path']}")
-        largest = max(largest, int(record["rendered_bytes"]))
+        if rendered_bytes > 48000:
+            raise DocsError(
+                f"canonical shard exceeds 48000 byte limit: path={record['path']} "
+                f"bytes={rendered_bytes} limit=48000 manifest={manifest['source_key']}"
+            )
+        largest = max(largest, rendered_bytes)
         source = reverse_rewrites(rendered, record.get("navigation_rewrites", []))
         if sha256_text(source) != record["source_sha256"]:
             raise DocsError(f"source fragment hash mismatch after reverse rewrite: {record['path']}")
@@ -1583,10 +1598,73 @@ Done.
         raise DocsError(f"slug duplicate self-test failed: {duplicate}")
     if pair_key("a" * 64, "b" * 64) == pair_key("b" * 64, "a" * 64):
         raise DocsError("pair-key domain/order self-test failed")
-    print("DOC_SHARDS_SELF_TEST: PASS cases=5")
+
+    with tempfile.TemporaryDirectory() as td:
+        t_root = Path(td)
+        frag_48k = t_root / "frag_48k.md"
+        frag_48k.write_bytes(b"a" * 48000)
+        m_48k = {
+            "source_key": "architecture",
+            "source_sha256": sha256_text("a" * 48000),
+            "source_bytes": 48000,
+            "source_characters": 48000,
+            "fragments": [{
+                "order": 0,
+                "path": "frag_48k.md",
+                "source_start_char": 0,
+                "source_end_char": 48000,
+                "source_sha256": sha256_text("a" * 48000),
+                "rendered_sha256": sha256_text("a" * 48000),
+                "source_bytes": 48000,
+                "rendered_bytes": 48000,
+                "navigation_rewrites": [],
+                "headings": [],
+            }],
+        }
+        verify_manifest(t_root, m_48k)
+
+        frag_48k1 = t_root / "frag_48k1.md"
+        frag_48k1.write_bytes(b"a" * 48001)
+        m_48k1 = {
+            "source_key": "architecture",
+            "source_sha256": sha256_text("a" * 48001),
+            "source_bytes": 48001,
+            "source_characters": 48001,
+            "fragments": [{
+                "order": 0,
+                "path": "frag_48k1.md",
+                "source_start_char": 0,
+                "source_end_char": 48001,
+                "source_sha256": sha256_text("a" * 48001),
+                "rendered_sha256": sha256_text("a" * 48001),
+                "source_bytes": 48001,
+                "rendered_bytes": 48001,
+                "navigation_rewrites": [],
+                "headings": [],
+            }],
+        }
+        try:
+            verify_manifest(t_root, m_48k1)
+        except DocsError as exc:
+            if "48000" not in str(exc):
+                raise
+        else:
+            raise DocsError("shard with 48001 bytes was unexpectedly accepted")
+    print("DOC_SHARDS_SELF_TEST: PASS cases=6")
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
+    raw = list(argv)
+    if "--self-test" in raw:
+        return argparse.Namespace(command="self-test", root=Path("."), normative_only=False)
+    if "--check" in raw:
+        root_path = Path(".")
+        if "--root" in raw:
+            idx = raw.index("--root")
+            if idx + 1 < len(raw):
+                root_path = Path(raw[idx + 1])
+        return argparse.Namespace(command="verify", root=root_path, normative_only=True)
+
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -1607,7 +1685,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = parse_args(argv or sys.argv[1:])
+    args = parse_args(argv if argv is not None else sys.argv[1:])
     try:
         if args.command == "migrate":
             migrate(args.root)

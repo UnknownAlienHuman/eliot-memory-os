@@ -1,0 +1,1 @@
+{"abi_digest": "883fa6a9fd1d40897da879e366b2e7e147b118ef420bd61c00e58b10d82e6a0b", "normalization": "strip // comments, trim lines, drop blanks, sort files by name, join with newline; abi-digest field values excluded from runtime descriptor digests (WIT text contains no digest values)", "package": "eliot:current@0.1.0", "payload_bytes": 22406}

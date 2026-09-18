@@ -9,8 +9,8 @@
 )]
 
 use eliot_contracts::{
-    AuthorityEpoch, ClockReading, ProductId, RequestId, RequestMetadata, ResourceGeneration,
-    SourceId, StateFence,
+    ClockReading, EpochId, EpochLineageId, ProductId, RequestId, RequestMetadata,
+    ResourceGeneration, SourceId, StateFence,
 };
 use eliot_platform::PlatformHandle;
 use eliot_protocol::{
@@ -504,7 +504,16 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 fn durable_frame_identity(digest: &str) -> Result<(RequestId, RequestIdentity), String> {
     let request_id = RequestId::new(digest.to_owned()).map_err(|_| "SessionFenced".to_owned())?;
-    let state_fence = StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis());
+    // Canonical lineage-A genesis fence for the synthetic frame identity
+    // (Implements #64): the frame carries no authority; the exact tuple uses
+    // the fixed canonical lineage at sequence 1.
+    let genesis_epoch = EpochId::new(
+        EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .map_err(|_| "SessionFenced".to_owned())?,
+        std::num::NonZeroU64::new(1).ok_or("SessionFenced")?,
+    )
+    .map_err(|_| "SessionFenced".to_owned())?;
+    let state_fence = StateFence::new(genesis_epoch, ResourceGeneration::genesis());
     let product_id = ProductId::new("eliot.host.runtime-control".to_owned())
         .map_err(|_| "SessionFenced".to_owned())?;
     let source_id =

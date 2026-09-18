@@ -174,7 +174,11 @@ impl ReceiptLocator {
         if self.authority.state_fence != authority.state_fence {
             return Err(BudgetError::FenceMismatch);
         }
-        if self.authority.authority_epoch != authority.authority_epoch {
+        if !self
+            .authority
+            .authority_epoch
+            .is_same_authority(&authority.authority_epoch)
+        {
             return Err(BudgetError::EpochMismatch);
         }
         if &self.authority != authority
@@ -465,7 +469,10 @@ impl BudgetLedger {
             .state_fence
             .validate()
             .map_err(|_| BudgetError::FenceMismatch)?;
-        if authority.authority_epoch != authority.state_fence.authority_epoch {
+        if !authority
+            .authority_epoch
+            .is_same_authority(&authority.state_fence.authority_epoch)
+        {
             return Err(BudgetError::EpochMismatch);
         }
         Ok(Self {
@@ -1085,7 +1092,11 @@ impl BudgetLedger {
             .state_fence
             .validate()
             .map_err(|_| BudgetError::FenceMismatch)?;
-        if snapshot.authority.authority_epoch != snapshot.authority.state_fence.authority_epoch {
+        if !snapshot
+            .authority
+            .authority_epoch
+            .is_same_authority(&snapshot.authority.state_fence.authority_epoch)
+        {
             return Err(BudgetError::EpochMismatch);
         }
 
@@ -1432,7 +1443,11 @@ fn validate_operation_authority(
     if operation.state_fence != authority.state_fence {
         return Err(BudgetError::FenceMismatch);
     }
-    if operation.state_fence.authority_epoch != authority.authority_epoch {
+    if !operation
+        .state_fence
+        .authority_epoch
+        .is_same_authority(&authority.authority_epoch)
+    {
         return Err(BudgetError::EpochMismatch);
     }
     Ok(())
@@ -1491,20 +1506,31 @@ mod tests {
 
     use super::*;
     use eliot_contracts::{
-        AuthorityEpoch, ContractId, OperationId, ReceiptId, RequestId, ResourceGeneration,
+        ContractId, EpochId, EpochLineageId, OperationId, ReceiptId, RequestId, ResourceGeneration,
         StateFence,
     };
     use eliot_receipts::{EffectClass, ProofCeiling};
+    use std::num::NonZeroU64;
 
-    fn authority() -> AuthorityBinding {
-        authority_at(AuthorityEpoch::genesis())
+    const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn test_epoch(lineage: &str, sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(lineage).expect("valid test lineage"),
+            NonZeroU64::new(sequence).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch")
     }
 
-    fn authority_at(epoch: AuthorityEpoch) -> AuthorityBinding {
+    fn authority() -> AuthorityBinding {
+        authority_at(test_epoch(TEST_LINEAGE_A, 1))
+    }
+
+    fn authority_at(epoch: EpochId) -> AuthorityBinding {
         AuthorityBinding {
             authority_id: ContractId::new("authority:test").expect("valid id"),
             authority_owner: "G-01".to_owned(),
-            authority_epoch: epoch,
+            authority_epoch: epoch.clone(),
             state_fence: StateFence::new(epoch, ResourceGeneration::genesis()),
             allowed_effect: EffectClass::ExternalEffect,
             proof_ceiling: ProofCeiling::ObservedExternalEffect,
@@ -2137,7 +2163,7 @@ mod tests {
 
         let admission = receipt_ref("admission-stable", &auth);
         let activation = receipt_ref("activation-stable", &auth);
-        let wrong_epoch = AuthorityEpoch::new(2).expect("valid epoch");
+        let wrong_epoch = test_epoch(TEST_LINEAGE_A, 2);
         let wrong_authority = authority_at(wrong_epoch);
         assert_eq!(
             ledger.activate(

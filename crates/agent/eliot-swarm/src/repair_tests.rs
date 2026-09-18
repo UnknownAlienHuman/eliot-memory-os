@@ -10,12 +10,16 @@ type TestResult = Result<(), Box<dyn Error>>;
 
 fn fence() -> Value {
     json!({
-        "authority_epoch": 1,
+        "authority_epoch": epoch(),
         "resource_generation": 1,
         "task_revision": 1,
         "policy_revision": null,
         "integration_revision": null
     })
+}
+
+fn epoch() -> Value {
+    json!({"lineage_id": "550e8400-e29b-41d4-a716-446655440000", "sequence": 1})
 }
 
 fn work_scope() -> Result<WorkScopeBinding, serde_json::Error> {
@@ -68,7 +72,7 @@ fn binding(
     work_item_id: &str,
     role_id: &str,
     route_id: &str,
-    lease_id: &str,
+    lease_id: eliot_agent_api::WorkLeaseId,
     plan_revision: &str,
     root_revision: &str,
 ) -> Result<ProviderBinding, Box<dyn Error>> {
@@ -88,7 +92,7 @@ fn binding(
         work_item_id: WorkItemId::new(work_item_id)?,
         role_id: RoleId::new(role_id)?,
         route_id: route_id.to_owned(),
-        lease_id: lease_id.to_owned(),
+        lease_id,
         reviewer_attempt_id: None,
         affected_branch: None,
     })
@@ -143,7 +147,7 @@ fn receipt_for_attestation(
         },
         "session": {
             "session_id": request.binding.session_id,
-            "authority_epoch": 1,
+            "authority_epoch": epoch(),
             "state_fence": fence()
         },
         "causal": {
@@ -180,7 +184,7 @@ fn receipt_for_attestation(
         "authority": {
             "authority_id": format!("authority-{owner}"),
             "authority_owner": owner,
-            "authority_epoch": 1,
+            "authority_epoch": epoch(),
             "state_fence": fence(),
             "allowed_effect": "READ",
             "proof_ceiling": "SCOPED_VERIFICATION"
@@ -316,6 +320,12 @@ fn work(spec: &WorkSpec<'_>, plan_revision: &str) -> Result<WorkItem, Box<dyn Er
 }
 
 fn map(spec: &WorkSpec<'_>) -> Result<IndependentMapSubmission, Box<dyn Error>> {
+    // Canonical `WorkLeaseId` via real object wire (never `new(String)`; fail-closed on scalar).
+    let lease_id = serde_json::from_value::<eliot_agent_api::WorkLeaseId>(serde_json::json!({
+        "namespace": "eliot.governor.work-lease",
+        "revision": "v1",
+        "value": format!("lease-{}", spec.id)
+    }))?;
     Ok(IndependentMapSubmission {
         lane_id: LaneId::new(spec.id)?,
         root_context_revision: RootContextRevision::new("root-1")?,
@@ -331,7 +341,7 @@ fn map(spec: &WorkSpec<'_>) -> Result<IndependentMapSubmission, Box<dyn Error>> 
             spec.id,
             &format!("role-{}", spec.id),
             &format!("route-{}", spec.id),
-            &format!("lease-{}", spec.id),
+            lease_id,
             "plan-1",
             "root-1",
         )?,
@@ -424,23 +434,23 @@ fn assigned(
             "stop_condition": "bounded"
         },
         "session": "session-1",
-        "lease": format!("lease-{work_item_id}"),
+        "lease": {"namespace": "eliot.governor.work-lease", "revision": "v1", "value": format!("lease-{work_item_id}")},
         "state": "ADMITTED",
         "continuity": "Fresh",
         "route": {
             "host_family": "host", "adapter": "adapter", "protocol_transport": "transport",
-            "runtime_hash": "runtime", "adapter_hash": "adapter-hash", "provider": "provider",
-            "model": "model", "auth_billing": "billing", "serializer_hash": "serializer",
-            "tool_semantics_hash": "tools", "reasoning_mode": "reasoning",
-            "continuation_behavior": "fresh", "feature_flags_hash": "features"
+            "runtime_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "adapter_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "provider": "provider",
+            "model": "model", "auth_billing": "billing", "serializer_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "tool_semantics_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", "reasoning_mode": "reasoning",
+            "continuation_behavior": "fresh", "feature_flags_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
         },
         "budget": {"context_tokens": 10, "wall_time_ms": 10, "output_bytes": 10,
             "cost_microunits": 10, "max_depth": 1, "max_descendants": 0},
         "authority": {
-            "epoch": 1, "scope_ref": "scope-1",
+            "epoch": epoch(), "scope_ref": "scope-1",
             "effect_ceiling": {"scope_ref": "scope-1", "allowed": ["observe"],
                 "max_external_effects": 0},
-            "lease": format!("lease-{work_item_id}"),
+            "lease": {"namespace": "eliot.governor.work-lease", "revision": "v1", "value": format!("lease-{work_item_id}")},
             "state_fence": fence(),
             "valid_until": "later"
         },
@@ -777,7 +787,7 @@ fn p3_rejects_scope_fence_contract_and_lease_mismatch() -> TestResult {
     );
     let mut wrong_fence = assigned(&plan, "lane-a", "route-a")?;
     wrong_fence.launch_attempt.authority.state_fence = serde_json::from_value(json!({
-        "authority_epoch": 2,
+        "authority_epoch": {"lineage_id": "550e8400-e29b-41d4-a716-446655440000", "sequence": 2},
         "resource_generation": 1,
         "task_revision": null,
         "policy_revision": null,
@@ -806,7 +816,9 @@ fn p3_rejects_scope_fence_contract_and_lease_mismatch() -> TestResult {
         Err(SwarmError::AssignmentMismatch)
     );
     let mut wrong_lease = assigned(&plan, "lane-a", "route-a")?;
-    wrong_lease.launch_attempt.lease = eliot_agent_api::WorkLeaseId::new("other-lease")?;
+    wrong_lease.launch_attempt.lease = serde_json::from_value::<eliot_agent_api::WorkLeaseId>(
+        serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "other-lease"}),
+    )?;
     assert_eq!(
         admit_wave(
             &plan,
@@ -1458,7 +1470,7 @@ fn swarm_case_24_each_fence_component_rejects_before_state_or_cursor_mutation() 
         (
             "authority_epoch",
             json!({
-                "authority_epoch": 2,
+                "authority_epoch": {"lineage_id": "550e8400-e29b-41d4-a716-446655440000", "sequence": 2},
                 "resource_generation": 1,
                 "task_revision": 1,
                 "policy_revision": null,
@@ -1468,7 +1480,7 @@ fn swarm_case_24_each_fence_component_rejects_before_state_or_cursor_mutation() 
         (
             "resource_generation",
             json!({
-                "authority_epoch": 1,
+                "authority_epoch": epoch(),
                 "resource_generation": 2,
                 "task_revision": 1,
                 "policy_revision": null,
@@ -1478,7 +1490,7 @@ fn swarm_case_24_each_fence_component_rejects_before_state_or_cursor_mutation() 
         (
             "task_revision",
             json!({
-                "authority_epoch": 1,
+                "authority_epoch": epoch(),
                 "resource_generation": 1,
                 "task_revision": 2,
                 "policy_revision": null,
@@ -1488,7 +1500,7 @@ fn swarm_case_24_each_fence_component_rejects_before_state_or_cursor_mutation() 
         (
             "policy_revision",
             json!({
-                "authority_epoch": 1,
+                "authority_epoch": epoch(),
                 "resource_generation": 1,
                 "task_revision": 1,
                 "policy_revision": 2,
@@ -1498,7 +1510,7 @@ fn swarm_case_24_each_fence_component_rejects_before_state_or_cursor_mutation() 
         (
             "integration_revision",
             json!({
-                "authority_epoch": 1,
+                "authority_epoch": epoch(),
                 "resource_generation": 1,
                 "task_revision": 1,
                 "policy_revision": null,

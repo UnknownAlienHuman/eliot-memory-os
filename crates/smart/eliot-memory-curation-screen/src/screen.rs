@@ -132,13 +132,18 @@ fn member_decision(
     request: &CurationScreenRequest,
     member_id: &eliot_memory_curation_contracts::MemberId,
     assessment: &ProtectionAssessment,
-    findings: &BTreeSet<FindingId>,
+    all_findings: &[CurationFinding],
+    source_available: bool,
+    denominator_complete: bool,
     base_status: EligibilityStatus,
-) -> (EligibilityStatus, bool, MemberDisposition) {
+) -> Result<(EligibilityStatus, bool, MemberDisposition), ContractError> {
     let immutable = request.partition.immutable_references.contains(member_id);
+    let observed = all_findings
+        .iter()
+        .any(|finding| finding.member_id == *member_id);
     let status = if immutable {
         EligibilityStatus::OutsideScope
-    } else if !findings.is_empty() {
+    } else if observed {
         EligibilityStatus::UnknownBlocked
     } else if base_status != EligibilityStatus::EligibleForSemanticCuration {
         base_status
@@ -152,16 +157,19 @@ fn member_decision(
     let eligible = status == EligibilityStatus::EligibleForSemanticCuration
         && assessment.decision == ProtectionDecision::Unprotected
         && !immutable;
-    let disposition = if immutable {
-        MemberDisposition::PreservedReference
-    } else if eligible {
-        MemberDisposition::Eligible
-    } else if assessment.decision == ProtectionDecision::Protected {
-        MemberDisposition::Protected
-    } else {
-        MemberDisposition::Blocked
-    };
-    (status, eligible, disposition)
+    // The aggregate disposition is derived from the five explicit dimension
+    // verdicts with no cross-subsidy; protection still wins over any
+    // structural block and any flagged or unknown dimension still blocks.
+    let dimensions = crate::dimensions::assess_dimensions(
+        member_id,
+        assessment,
+        all_findings,
+        immutable,
+        source_available,
+        denominator_complete,
+    )?;
+    let disposition = dimensions.derive_disposition()?;
+    Ok((status, eligible, disposition))
 }
 
 fn eligibility_and_coverage(
@@ -198,6 +206,8 @@ fn eligibility_and_coverage(
     } else {
         EligibilityStatus::IncompleteTruncated
     };
+    let source_available = source.availability == SourceAvailability::Available;
+    let denominator_complete = source.denominator.is_complete();
     for member in &source.members {
         let assessment = protection
             .iter()
@@ -213,9 +223,11 @@ fn eligibility_and_coverage(
             request,
             &member.member_id,
             assessment,
-            &member_findings,
+            findings,
+            source_available,
+            denominator_complete,
             base_status,
-        );
+        )?;
         eligibility.push(Eligibility {
             source: source.identity.clone(),
             member_id: member.member_id.clone(),

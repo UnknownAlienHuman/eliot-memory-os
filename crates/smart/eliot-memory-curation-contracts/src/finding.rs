@@ -4,8 +4,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ContractError, Digest, FindingId, MemberId, ProfileId, RuleId, SnapshotId, SourceIdentity,
-    source_matches, text,
+    ContractError, Digest, FindingId, MemberId, ProfileId, RuleId, ScreenProfile, SnapshotId,
+    SourceIdentity, source_matches, text,
 };
 
 /// Closed structural finding vocabulary. It contains no action or semantic kind.
@@ -95,6 +95,32 @@ impl CurationFinding {
         if &self.profile_id != profile_id {
             return Err(ContractError::BindingMismatch {
                 field: "finding.profile",
+            });
+        }
+        Ok(())
+    }
+    /// Validates that the finding names a rule declared by the bound profile
+    /// and that the finding class matches the rule declaration.
+    ///
+    /// A producer checks one finding against the frozen profile without
+    /// assembling a complete screen result. Rule execution itself stays
+    /// outside this crate.
+    pub fn validate_against_profile(&self, profile: &ScreenProfile) -> Result<(), ContractError> {
+        if self.profile_id != profile.profile_id {
+            return Err(ContractError::BindingMismatch {
+                field: "finding.profile",
+            });
+        }
+        let rule = profile
+            .rules
+            .iter()
+            .find(|rule| rule.rule_id == self.rule_id)
+            .ok_or(ContractError::BindingMismatch {
+                field: "finding.rule",
+            })?;
+        if rule.finding_class != self.class {
+            return Err(ContractError::BindingMismatch {
+                field: "finding.rule_class",
             });
         }
         Ok(())

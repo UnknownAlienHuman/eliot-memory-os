@@ -7,21 +7,33 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 
 pub use eliot_agent_api::{
-    AttemptId, EventCursor, EventId, HostEventEnvelope, HostEventKind, RouteFingerprint, SessionId,
-    TaskId, WorkUnitId,
+    AttemptId, AttemptState, EventCursor, EventId, HostEventEnvelope, HostEventKind,
+    RouteFingerprint, SessionId, TaskId, WorkUnitId,
 };
+use eliot_contracts::RequestMetadata;
 pub use eliot_observation_contracts::{
     BlindInterval, CoverageGap, CoverageInterval, GapDisposition,
 };
 pub use eliot_process::{FencingToken, Generation};
 pub use eliot_protocol::{AckPhase, DeliveryClass, EventDisposition, EventEnvelope};
 use eliot_protocol::{EventAckReceipt, EventIdentityKey, ReplayLedger};
+use eliot_skill::{
+    DependencyVersion, LifecycleAction, SkillCandidate, SkillError, SkillLifecycleView, SkillScope,
+};
 use serde::{Deserialize, Deserializer, Serialize, de};
 use thiserror::Error;
+
+mod terminal_inputs;
+pub use terminal_inputs::{
+    AttemptTransition, CanonicalWriteRefs, CoverageFlags, RecoveryDirective, RecoveryDirectiveKind,
+    TERMINAL_JOURNAL_CAPACITY, TerminalReductionInputs, TransportEdge, TransportEdgeKind,
+};
 
 /// Stable A-16 source contract identity.
 pub const CONTRACT_ID: &str = "eliot.surfaces.agent-bridge-core/v1";
@@ -92,6 +104,7 @@ pub enum RequiredProvider {
     P03ProcessContracts,
     HostActivationPort,
     McpForwardingPort,
+    SkillLifecyclePort,
 }
 
 impl RequiredProvider {
@@ -112,6 +125,7 @@ impl RequiredProvider {
             Self::P03ProcessContracts => "crates/kernel/eliot-process",
             Self::HostActivationPort => "injected host activation port",
             Self::McpForwardingPort => "injected A-06/MCP forwarding port",
+            Self::SkillLifecyclePort => "injected Skill lifecycle port",
         }
     }
 }
@@ -836,12 +850,21 @@ pub struct AgentBridgeCore {
     readiness: ProviderReadiness,
     host_activation: Option<Box<dyn HostActivationPort>>,
     mcp_forwarding: Option<Box<dyn McpForwardingPort>>,
+    skill_lifecycle: Option<Box<dyn SkillLifecyclePort>>,
     cursor_policy: CursorPolicy,
     active: Option<ActiveAttach>,
     replay: ReplayLedger,
     acknowledged_phases: BTreeMap<EventIdentityKey, AckPhase>,
     pending_deliveries: BTreeMap<EventIdentityKey, PendingDelivery>,
     cursors: BTreeMap<String, u64>,
+    host_journal: Vec<HostEventEnvelope>,
+    attempt_transitions: Vec<AttemptTransition>,
+    recovery_directives: Vec<RecoveryDirective>,
+    canonical_refs: CanonicalWriteRefs,
+    transport_edges: Vec<TransportEdge>,
+    terminal_coverage: CoverageFlags,
+    stale_ui_disposition: Option<String>,
+    error_event_refs: Vec<String>,
 }
 
 impl AgentBridgeCore {
@@ -855,12 +878,21 @@ impl AgentBridgeCore {
             readiness,
             host_activation,
             mcp_forwarding,
+            skill_lifecycle: None,
             cursor_policy,
             active: None,
             replay: ReplayLedger::new(),
             acknowledged_phases: BTreeMap::new(),
             pending_deliveries: BTreeMap::new(),
             cursors: BTreeMap::new(),
+            host_journal: Vec::new(),
+            attempt_transitions: Vec::new(),
+            recovery_directives: Vec::new(),
+            canonical_refs: CanonicalWriteRefs::default(),
+            transport_edges: Vec::new(),
+            terminal_coverage: CoverageFlags::default(),
+            stale_ui_disposition: None,
+            error_event_refs: Vec::new(),
         }
     }
 
@@ -919,6 +951,14 @@ impl AgentBridgeCore {
         self.replay = ReplayLedger::new();
         self.acknowledged_phases.clear();
         self.cursors.clear();
+        self.host_journal.clear();
+        self.attempt_transitions.clear();
+        self.recovery_directives.clear();
+        self.canonical_refs = CanonicalWriteRefs::default();
+        self.transport_edges.clear();
+        self.terminal_coverage = CoverageFlags::default();
+        self.stale_ui_disposition = None;
+        self.error_event_refs.clear();
         self.attach_view().ok_or(BridgeError::NotAttached)
     }
 
@@ -989,6 +1029,7 @@ impl AgentBridgeCore {
         event
             .validate()
             .map_err(|error| BridgeError::ProviderContract(error.to_string()))?;
+        self.observe_host_event(event)?;
         let binding = self.binding()?.clone();
         self.forwarder()?.forward_hook(&binding, event)?;
         Ok(())
@@ -1028,6 +1069,179 @@ impl AgentBridgeCore {
                 required_phase: pending.required_phase,
             })
             .collect()
+    }
+
+    /// Admits one validated host event into the transport journal.
+    ///
+    /// The route fingerprint passes through untouched, the raw and
+    /// normalized payloads stay paired on the retained envelope, and the
+    /// host sequence must increase so the journal preserves observation
+    /// order. The observation is journaled before port forwarding so a
+    /// forwarding failure still leaves immutable diagnostic history. Error
+    /// events are additionally cited in `error_event_refs` without
+    /// affecting any other field.
+    fn observe_host_event(&mut self, event: &HostEventEnvelope) -> Result<(), BridgeError> {
+        if let Some(previous) = self.host_journal.last()
+            && event.sequence <= previous.sequence
+        {
+            return Err(BridgeError::ProviderContract(
+                "host event sequence must increase".to_owned(),
+            ));
+        }
+        if self.host_journal.len() >= TERMINAL_JOURNAL_CAPACITY {
+            self.host_journal.remove(0);
+            self.terminal_coverage = self.terminal_coverage.mark_incomplete_coverage();
+        }
+        if event.kind == HostEventKind::Error {
+            self.error_event_refs
+                .push(event.event_id.as_str().to_owned());
+        }
+        self.host_journal.push(event.clone());
+        Ok(())
+    }
+
+    fn require_attached(&self) -> Result<(), BridgeError> {
+        self.active
+            .as_ref()
+            .map(|_| ())
+            .ok_or(BridgeError::NotAttached)
+    }
+
+    /// Records one observed attempt state transition verbatim.
+    ///
+    /// Legality of the transition is decided by the terminal reducer, not
+    /// the transport.
+    pub fn observe_attempt_transition(
+        &mut self,
+        from: AttemptState,
+        to: AttemptState,
+        sequence: u64,
+    ) -> Result<(), BridgeError> {
+        self.require_attached()?;
+        self.attempt_transitions
+            .push(AttemptTransition::observe(from, to, sequence)?);
+        Ok(())
+    }
+
+    /// Files one typed recovery directive chaining an observed recoverable
+    /// failure to its corrected call.
+    ///
+    /// The directive's `for_event` must reference an already journaled host
+    /// event and `corrected_event` must be a new identity absent from the
+    /// journal, proving the retry/new-identity rule structurally.
+    pub fn prescribe_recovery(&mut self, directive: RecoveryDirective) -> Result<(), BridgeError> {
+        self.require_attached()?;
+        if !self
+            .host_journal
+            .iter()
+            .any(|event| event.event_id.as_str() == directive.for_event())
+        {
+            return Err(BridgeError::InvalidTransition(
+                "recovery directive must reference an observed host event",
+            ));
+        }
+        if self
+            .host_journal
+            .iter()
+            .any(|event| event.event_id.as_str() == directive.corrected_event())
+        {
+            return Err(BridgeError::InvalidTransition(
+                "corrected call must use a new identity not yet present in history",
+            ));
+        }
+        self.recovery_directives.push(directive);
+        Ok(())
+    }
+
+    /// Records the candidate canonical-write submission reference.
+    pub fn record_canonical_submission(
+        &mut self,
+        reference: impl Into<String>,
+    ) -> Result<(), BridgeError> {
+        self.require_attached()?;
+        self.canonical_refs.record_submission(reference)
+    }
+
+    /// Records the candidate canonical-write receipt reference.
+    pub fn record_canonical_receipt(
+        &mut self,
+        reference: impl Into<String>,
+    ) -> Result<(), BridgeError> {
+        self.require_attached()?;
+        self.canonical_refs.record_receipt(reference)
+    }
+
+    /// Records the independent exact-readback reference.
+    pub fn record_canonical_readback(
+        &mut self,
+        reference: impl Into<String>,
+    ) -> Result<(), BridgeError> {
+        self.require_attached()?;
+        self.canonical_refs.record_readback(reference)
+    }
+
+    /// Records one transport edge without resolving it.
+    ///
+    /// Unknown-commit, unconfirmed-cancel, and disconnect edges raise their
+    /// explicit coverage flags; every other edge is carried verbatim.
+    pub fn record_transport_edge(&mut self, edge: TransportEdge) -> Result<(), BridgeError> {
+        self.require_attached()?;
+        match edge.kind() {
+            TransportEdgeKind::UnknownCommit => {
+                self.terminal_coverage = self.terminal_coverage.mark_unknown_commit();
+            }
+            TransportEdgeKind::CancelRequested => {
+                self.terminal_coverage = self.terminal_coverage.mark_cancel_unconfirmed();
+            }
+            TransportEdgeKind::Disconnect => {
+                self.terminal_coverage = self.terminal_coverage.mark_incomplete_coverage();
+            }
+            TransportEdgeKind::Timeout
+            | TransportEdgeKind::ParseFailure
+            | TransportEdgeKind::LateSuccess
+            | TransportEdgeKind::DuplicateCorrectedCall => {}
+        }
+        self.transport_edges.push(edge);
+        Ok(())
+    }
+
+    /// Notes the stale UI/CLI terminal display verbatim.
+    ///
+    /// This is a snapshot of what the surface showed, kept independent of
+    /// the canonical references until the reducer compares them.
+    pub fn note_stale_ui_disposition(
+        &mut self,
+        disposition: impl Into<String>,
+    ) -> Result<(), BridgeError> {
+        self.require_attached()?;
+        let disposition = disposition.into();
+        validate_text(&disposition, "stale_ui_disposition")?;
+        self.stale_ui_disposition = Some(disposition);
+        Ok(())
+    }
+
+    /// Projects the terminal reduction inputs for the external reducer.
+    ///
+    /// History, stale display, error citations, canonical references,
+    /// edges, cursors, and outstanding deliveries are carried as
+    /// independent fields. Nothing here is a terminal disposition.
+    #[must_use]
+    pub fn terminal_reduction_inputs(&self) -> Option<TerminalReductionInputs> {
+        self.active.as_ref().map(|_| {
+            TerminalReductionInputs::new(
+                self.host_journal.last().map(|event| event.route.clone()),
+                self.host_journal.clone(),
+                self.attempt_transitions.clone(),
+                self.recovery_directives.clone(),
+                self.stale_ui_disposition.clone(),
+                self.error_event_refs.clone(),
+                self.canonical_refs.clone(),
+                self.transport_edges.clone(),
+                self.terminal_coverage,
+                self.cursors.clone(),
+                self.outstanding_deliveries(),
+            )
+        })
     }
 
     fn forward_durable(
@@ -1163,8 +1377,13 @@ impl AgentBridgeCore {
         event: &EventEnvelope,
     ) -> Result<(), BridgeError> {
         let fence = binding.state_fence();
-        if event.authority_epoch.value() != fence.authority_epoch()
-            || event.state_fence.authority_epoch.value() != fence.authority_epoch()
+        if !event
+            .authority_epoch
+            .is_same_authority(fence.authority_epoch())
+            || !event
+                .state_fence
+                .authority_epoch
+                .is_same_authority(fence.authority_epoch())
             || event.producer_generation.value() != fence.generation().get()
             || event.state_fence.resource_generation.value() != fence.generation().get()
         {
@@ -1213,10 +1432,10 @@ fn validate_authority_binding(
     state_fence: &FencingToken,
 ) -> Result<(), BridgeError> {
     validate_text(session_id.as_str(), "session_id")?;
-    if activation_generation.get() == 0
-        || state_fence.authority_epoch() == 0
-        || state_fence.generation().get() == 0
-    {
+    // EpochId is always a validated non-zero (lineage_id, sequence) tuple by
+    // construction (Implements #64); only the generation retains a scalar
+    // non-zero check here.
+    if activation_generation.get() == 0 || state_fence.generation().get() == 0 {
         return Err(BridgeError::InvalidContract {
             field: "authority_binding",
             reason: "session generation and authority epoch must be non-zero",
@@ -1241,6 +1460,254 @@ const fn phase_reaches(required: AckPhase, observed: AckPhase) -> bool {
         AckPhase::Applied => matches!(observed, AckPhase::Applied),
         AckPhase::Rejected => matches!(observed, AckPhase::Rejected),
         AckPhase::Received | AckPhase::Unknown => false,
+    }
+}
+
+/// Typed Skill candidate submission. Fields are private and deserialization
+/// re-runs the constructor, so malformed digests, blank references, or
+/// duplicate evidence cannot be created. The admission fence travels in the
+/// caller's [`RequestMetadata`], never here: this surface mints no fence,
+/// principal, session, epoch, or operation identity.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProposeSkillRequest {
+    skill_id: String,
+    candidate_package_digest: String,
+    action: LifecycleAction,
+    evidence_refs: Vec<String>,
+    dependency_versions: Vec<DependencyVersion>,
+    scope: SkillScope,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawProposeSkillRequest {
+    skill_id: String,
+    candidate_package_digest: String,
+    action: LifecycleAction,
+    evidence_refs: Vec<String>,
+    dependency_versions: Vec<DependencyVersion>,
+    scope: SkillScope,
+}
+
+impl<'de> Deserialize<'de> for ProposeSkillRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawProposeSkillRequest::deserialize(deserializer)?;
+        Self::new(
+            raw.skill_id,
+            raw.candidate_package_digest,
+            raw.action,
+            raw.evidence_refs,
+            raw.dependency_versions,
+            raw.scope,
+        )
+        .map_err(de::Error::custom)
+    }
+}
+
+impl ProposeSkillRequest {
+    /// Creates a typed candidate submission. Every typed rule is enforced
+    /// here and re-enforced by the owning Skill lifecycle before promotion.
+    pub fn new(
+        skill_id: impl Into<String>,
+        candidate_package_digest: impl Into<String>,
+        action: LifecycleAction,
+        evidence_refs: Vec<String>,
+        dependency_versions: Vec<DependencyVersion>,
+        scope: SkillScope,
+    ) -> Result<Self, SkillError> {
+        let request = Self {
+            skill_id: skill_id.into(),
+            candidate_package_digest: candidate_package_digest.into(),
+            action,
+            evidence_refs,
+            dependency_versions,
+            scope,
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
+    /// Re-checks every typed rule without mutating the request.
+    pub fn validate(&self) -> Result<(), SkillError> {
+        if self.skill_id.trim().is_empty() || self.skill_id.chars().any(char::is_control) {
+            return Err(SkillError::InvalidField {
+                field: "skill_id",
+                reason: "must be non-blank and contain no control characters",
+            });
+        }
+        if self.candidate_package_digest.len() != 64
+            || self
+                .candidate_package_digest
+                .bytes()
+                .any(|byte| !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase())
+        {
+            return Err(SkillError::InvalidField {
+                field: "candidate.candidate_package_digest",
+                reason: "must be lowercase SHA-256 hex",
+            });
+        }
+        if self.evidence_refs.is_empty() {
+            return Err(SkillError::InvalidField {
+                field: "candidate.evidence_refs",
+                reason: "candidate evidence is required",
+            });
+        }
+        let mut seen = BTreeSet::new();
+        for reference in &self.evidence_refs {
+            validate_text(reference, "candidate.evidence_ref").map_err(|_| {
+                SkillError::InvalidField {
+                    field: "candidate.evidence_ref",
+                    reason: "must be non-blank and contain no control characters",
+                }
+            })?;
+            if !seen.insert(reference) {
+                return Err(SkillError::Duplicate {
+                    field: "candidate.evidence_refs",
+                });
+            }
+        }
+        let mut dependencies = BTreeSet::new();
+        for dependency in &self.dependency_versions {
+            dependency.validate()?;
+            if !dependencies.insert(dependency) {
+                return Err(SkillError::Duplicate {
+                    field: "candidate.dependencies",
+                });
+            }
+        }
+        self.scope.validate()?;
+        Ok(())
+    }
+
+    /// Returns the Skill under lifecycle review.
+    pub fn skill_id(&self) -> &str {
+        &self.skill_id
+    }
+
+    /// Returns the materialized candidate package digest.
+    pub fn candidate_package_digest(&self) -> &str {
+        &self.candidate_package_digest
+    }
+
+    /// Returns the proposed lifecycle change.
+    pub const fn action(&self) -> LifecycleAction {
+        self.action
+    }
+
+    /// Returns the exact evidence references.
+    pub fn evidence_refs(&self) -> &[String] {
+        &self.evidence_refs
+    }
+
+    /// Returns the pinned dependency versions.
+    pub fn dependency_versions(&self) -> &[DependencyVersion] {
+        &self.dependency_versions
+    }
+
+    /// Returns the candidate scope.
+    pub const fn scope(&self) -> &SkillScope {
+        &self.scope
+    }
+}
+
+/// Injected Skill lifecycle boundary. The Governor skill owner, not A-16,
+/// owns lifecycle evidence, conflict state, reversible proposals, and
+/// evidence-gated promotion. A-16 forwards the exact admitted fence and typed
+/// fields and returns only typed results.
+///
+/// The boxed-future shape (instead of `async fn`) keeps this trait
+/// object-safe without a new async-trait dependency. No `Send` bound is
+/// imposed: the Governor borrows behind a production implementation are not
+/// guaranteed `Send`, and this surface holds the port thread-locally like its
+/// other injected ports.
+pub trait SkillLifecyclePort {
+    /// Reads one immutable Skill lifecycle view at the admitted fence.
+    fn skill_read<'a>(
+        &'a mut self,
+        ctx: &'a RequestMetadata,
+        skill_id: String,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<SkillLifecycleView>, SkillError>> + 'a>>;
+
+    /// Submits one typed Skill candidate at the admitted fence.
+    fn propose_skill<'a>(
+        &'a mut self,
+        ctx: &'a RequestMetadata,
+        request: ProposeSkillRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<SkillCandidate, SkillError>> + 'a>>;
+}
+
+impl AgentBridgeCore {
+    /// Injects the composition-selected Skill lifecycle owner.
+    #[must_use]
+    pub fn with_skill_lifecycle(mut self, port: Box<dyn SkillLifecyclePort>) -> Self {
+        self.skill_lifecycle = Some(port);
+        self
+    }
+
+    /// Returns one cloned Skill lifecycle view at the exact attached fence.
+    pub async fn skill_view(
+        &mut self,
+        ctx: &RequestMetadata,
+        skill_id: &str,
+    ) -> Result<Option<SkillLifecycleView>, BridgeError> {
+        ctx.validate()
+            .map_err(|error| BridgeError::ProviderContract(error.to_string()))?;
+        self.skill_authority_matches(ctx)?;
+        let view = self
+            .skill_port()?
+            .skill_read(ctx, skill_id.to_owned())
+            .await?;
+        if let Some(view) = &view {
+            view.validate()
+                .map_err(|error| BridgeError::ProviderContract(error.to_string()))?;
+        }
+        Ok(view)
+    }
+
+    /// Submits one typed Skill candidate at the exact attached fence.
+    pub async fn propose_skill_candidate(
+        &mut self,
+        ctx: &RequestMetadata,
+        request: ProposeSkillRequest,
+    ) -> Result<SkillCandidate, BridgeError> {
+        request.validate()?;
+        ctx.validate()
+            .map_err(|error| BridgeError::ProviderContract(error.to_string()))?;
+        self.skill_authority_matches(ctx)?;
+        let candidate = self.skill_port()?.propose_skill(ctx, request).await?;
+        candidate
+            .validate()
+            .map_err(|error| BridgeError::ProviderContract(error.to_string()))?;
+        Ok(candidate)
+    }
+
+    /// Fails closed unless the caller fence covers the exact attached
+    /// transport authority. [`RequestMetadata`] carries the dependency-only
+    /// [`eliot_contracts::StateFence`] while the attach binding carries the
+    /// process [`FencingToken`], so the comparison is the shared authority
+    /// epoch tuple plus the resource generation, mirroring
+    /// [`AgentBridgeCore::validate_event_binding`].
+    fn skill_authority_matches(&self, ctx: &RequestMetadata) -> Result<(), BridgeError> {
+        let fence = self.binding()?.state_fence();
+        if !ctx
+            .state_fence
+            .authority_epoch
+            .is_same_authority(fence.authority_epoch())
+            || ctx.state_fence.resource_generation.value() != fence.generation().get()
+        {
+            return Err(BridgeError::StaleAuthority);
+        }
+        Ok(())
+    }
+
+    fn skill_port(&mut self) -> Result<&mut (dyn SkillLifecyclePort + 'static), BridgeError> {
+        self.skill_lifecycle.as_deref_mut().ok_or_else(|| {
+            BridgeError::PlanGap(PlanGap::missing(RequiredProvider::SkillLifecyclePort))
+        })
     }
 }
 
@@ -1293,6 +1760,8 @@ pub enum BridgeError {
     AckIdentityMismatch,
     #[error("provider returned invalid event disposition {0:?}")]
     InvalidEventDisposition(EventDisposition),
+    #[error(transparent)]
+    Skill(#[from] SkillError),
 }
 
 impl fmt::Debug for AgentBridgeCore {

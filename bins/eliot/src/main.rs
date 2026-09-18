@@ -12,8 +12,8 @@ use eliot_installation::{
     InstallationProfile, InstallationStage, InstallationStepOutcome, InstallationTransaction,
     InstallationTransactionStore, PlatformHandle, RedbInstallationRegistry,
     RedbInstallationTransactionStore, WindowsInstallationCoordinator,
-    parse_installation_transaction_id, require_published_source_bundle_journal,
-    validate_installation_transaction_json,
+    parse_installation_transaction_id, registry_projection_pending_ref,
+    require_published_source_bundle_journal, validate_installation_transaction_json,
 };
 use eliot_live_canary::{
     CANARY_COMPLETION_SCHEMA, CanaryConfig, CanaryError, ProductionCanary,
@@ -27,12 +27,10 @@ use eliot_platform_windows::{
     is_eliot_governor_running, is_process_elevated, observe_current_user_config,
     windows_path_identity_digest,
 };
-use eliot_runtime_contracts::{
-    RUNTIME_LIVE_STORE_BIND, RUNTIME_LIVE_STORE_ENDPOINT, RUNTIME_LIVE_STORE_NAMESPACE,
-    RuntimeLiveStoreIdentity,
-};
+use eliot_runtime_contracts::RuntimeLiveStoreIdentity;
 use eliot_store_surreal::{StoreLaunchConfig, launch_config_digest};
-use eliot_types::GovernorConfig;
+#[cfg(windows)]
+mod legacy_governor_config;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
@@ -217,7 +215,7 @@ enum InstallationCommand {
         #[arg(long)]
         transaction_id: Option<String>,
     },
-    /// Materialize an exact nine-role Phase-A source bundle and feed it through
+    /// Materialize an exact twelve-role Phase-A source bundle and feed it through
     /// the publication-bound generation planner. `--store` is required because
     /// the durable transaction store is the sole authority for a generated plan.
     MaterializeSourceBundle {
@@ -233,6 +231,12 @@ enum InstallationCommand {
         surreal: PathBuf,
         #[arg(long, value_parser = absolute_path)]
         eliotd: PathBuf,
+        #[arg(long, value_parser = absolute_path)]
+        eliot_doctor: PathBuf,
+        #[arg(long, value_parser = absolute_path)]
+        eliot_testd: PathBuf,
+        #[arg(long, value_parser = absolute_path)]
+        eliot_native_worker: PathBuf,
         /// Optional explicit external agent-bridge executable source. Must be
         /// supplied together with `--agent-bridge-account`.
         #[arg(long, value_parser = absolute_path)]
@@ -486,7 +490,6 @@ struct ManifestBoundCanaryBinding {
     manifest: CandidateManifest,
     fence: ActivationCommitFence,
     store_config_lease: ProtectedRuntimePathLease,
-    legacy_config: Option<eliot_platform_windows::LocalAppDataConfigRead>,
 }
 
 #[cfg(windows)]
@@ -618,83 +621,35 @@ fn classify_legacy_governor_process_state(state: Result<bool, String>) -> Result
 }
 
 #[cfg(windows)]
-fn observe_legacy_governor_config() -> Result<Option<eliot_platform_windows::LocalAppDataConfigRead>>
-{
-    let retained = match observe_current_user_config(INSTALLATION_INPUT_LIMIT) {
-        Ok(eliot_platform_windows::LocalAppDataConfigObservation::Absent { .. }) => None,
+fn observe_legacy_governor_config() -> Result<()> {
+    // #1687: the legacy Governor file is never adopted as authority. A present
+    // file fails closed with the Kernel-surface migration action; an absent
+    // file is provisional and lets the canary/install path proceed.
+    match observe_current_user_config(INSTALLATION_INPUT_LIMIT) {
+        Ok(eliot_platform_windows::LocalAppDataConfigObservation::Absent { .. }) => {
+            legacy_governor_config::gate_legacy_config_observation(None)
+                .map_err(|error| anyhow::anyhow!(error))?;
+        }
         Ok(eliot_platform_windows::LocalAppDataConfigObservation::Present(read)) => {
-            let text = std::str::from_utf8(read.bytes())
-                .map_err(|error| anyhow::anyhow!("legacy Governor config is not UTF-8: {error}"))?;
-            let config: GovernorConfig = toml::from_str(text)
-                .map_err(|error| anyhow::anyhow!("legacy Governor config is malformed: {error}"))?;
-            config
-                .validate()
-                .map_err(|error| anyhow::anyhow!("legacy Governor config is invalid: {error}"))?;
-            config
-                .db
-                .surreal
-                .reject_store_collision(
-                    RUNTIME_LIVE_STORE_BIND,
-                    RUNTIME_LIVE_STORE_ENDPOINT,
-                    RUNTIME_LIVE_STORE_NAMESPACE,
-                )
-                .map_err(|error| {
-                    anyhow::anyhow!(
-                        "legacy Governor config collides with runtime-live Store: {error}"
-                    )
-                })?;
-            read.verify_stable().map_err(|error| {
-                anyhow::anyhow!("legacy Governor config changed during validation: {error}")
-            })?;
-            Some(read)
+            legacy_governor_config::gate_legacy_config_observation(Some((
+                read.path(),
+                read.bytes(),
+            )))
+            .map_err(|error| anyhow::anyhow!(error))?;
         }
         Err(error) => anyhow::bail!("legacy Governor config observation is unknown: {error}"),
-    };
-    classify_legacy_governor_process_state(
-        is_eliot_governor_running().map_err(|error| error.to_string()),
-    )
-    .map_err(|error| anyhow::anyhow!(error))?;
-    Ok(retained)
-}
-
-#[cfg(windows)]
-fn revalidate_legacy_governor_gate(
-    retained: Option<&eliot_platform_windows::LocalAppDataConfigRead>,
-) -> Result<()> {
-    if let Some(read) = retained {
-        let text = std::str::from_utf8(read.bytes()).map_err(|error| {
-            anyhow::anyhow!("retained legacy Governor config is not UTF-8: {error}")
-        })?;
-        let config: GovernorConfig = toml::from_str(text).map_err(|error| {
-            anyhow::anyhow!("retained legacy Governor config is malformed: {error}")
-        })?;
-        config.validate().map_err(|error| {
-            anyhow::anyhow!("retained legacy Governor config is invalid: {error}")
-        })?;
-        config
-            .db
-            .surreal
-            .reject_store_collision(
-                RUNTIME_LIVE_STORE_BIND,
-                RUNTIME_LIVE_STORE_ENDPOINT,
-                RUNTIME_LIVE_STORE_NAMESPACE,
-            )
-            .map_err(|error| {
-                anyhow::anyhow!(
-                    "retained legacy Governor config collides with runtime-live Store: {error}"
-                )
-            })?;
-        read.verify_stable()
-            .map_err(|error| anyhow::anyhow!("retained legacy Governor config changed: {error}"))?;
-    } else {
-        // An absent legacy config is provisional; reobserve the OS-known path
-        // after the guarded operation so appearance is not silently adopted.
-        let _ = observe_legacy_governor_config()?;
     }
     classify_legacy_governor_process_state(
         is_eliot_governor_running().map_err(|error| error.to_string()),
     )
     .map_err(|error| anyhow::anyhow!(error))
+}
+
+#[cfg(windows)]
+fn revalidate_legacy_governor_gate() -> Result<()> {
+    // Re-observe the OS-known path after the guarded operation so a file that
+    // appears mid-operation is rejected rather than silently adopted.
+    observe_legacy_governor_config()
 }
 
 #[cfg(windows)]
@@ -799,7 +754,9 @@ fn load_manifest_bound_canary_binding(
         anyhow::bail!("active manifest and committed activation fence disagree");
     }
     validate_active_phase_b_runtime_binding(&registry, &manifest, &fence)?;
-    let legacy_config = observe_legacy_governor_config()?;
+    // #1687: reject a present legacy Governor file before any canary effect;
+    // absent proceeds with no legacy config adopted.
+    observe_legacy_governor_config()?;
     let store_config_lease = ProtectedRuntimePathLease::open_existing_absolute_exclusive(
         Path::new(manifest.runtime_launch.store_config_path.as_str()),
     )
@@ -881,7 +838,6 @@ fn load_manifest_bound_canary_binding(
         manifest,
         fence,
         store_config_lease,
-        legacy_config,
     })
 }
 
@@ -893,7 +849,6 @@ fn revalidate_manifest_bound_canary_binding(
     expected_manifest: &CandidateManifest,
     expected_fence: &ActivationCommitFence,
     expected_store_config_lease: &ProtectedRuntimePathLease,
-    expected_legacy_config: Option<&eliot_platform_windows::LocalAppDataConfigRead>,
 ) -> Result<()> {
     let canonical_host_root = validate_snapshot_matches_lease(
         &PathBuf::from(
@@ -940,7 +895,7 @@ fn revalidate_manifest_bound_canary_binding(
         anyhow::bail!("committed activation fence changed during canary");
     }
     validate_active_phase_b_runtime_binding(&registry, &active.manifest, fence)?;
-    revalidate_legacy_governor_gate(expected_legacy_config)?;
+    revalidate_legacy_governor_gate()?;
     validate_manifest_store_config(expected_manifest, expected_store_config_lease)?;
     retained_host
         .verify_stable_identity()
@@ -984,7 +939,6 @@ fn validate_manifest_bound_canary_state(binding: &ManifestBoundCanaryBinding) ->
         &binding.manifest,
         &binding.fence,
         &binding.store_config_lease,
-        binding.legacy_config.as_ref(),
     )
 }
 
@@ -1157,6 +1111,9 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
             eliot_store_surreal,
             surreal,
             eliotd,
+            eliot_doctor,
+            eliot_testd,
+            eliot_native_worker,
             agent_bridge_exe,
             agent_bridge_account,
             output_bundle,
@@ -1180,6 +1137,9 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
             eliot_store_surreal,
             surreal,
             eliotd,
+            eliot_doctor,
+            eliot_testd,
+            eliot_native_worker,
             output_bundle,
             output,
             store,
@@ -1400,6 +1360,9 @@ fn run_installation_materialize_source_bundle(
     eliot_store_surreal: PathBuf,
     surreal: PathBuf,
     eliotd: PathBuf,
+    eliot_doctor: PathBuf,
+    eliot_testd: PathBuf,
+    eliot_native_worker: PathBuf,
     output_bundle: PathBuf,
     output: PathBuf,
     store: PathBuf,
@@ -1424,6 +1387,9 @@ fn run_installation_materialize_source_bundle(
         eliot_store_surreal_exe: eliot_store_surreal,
         surreal_exe: surreal,
         eliotd_exe: eliotd,
+        eliot_doctor_exe: eliot_doctor,
+        eliot_testd_exe: eliot_testd,
+        eliot_native_worker_exe: eliot_native_worker,
         agent_bridge_exe,
         agent_bridge_account,
         output_bundle: output_bundle.clone(),
@@ -1694,7 +1660,6 @@ fn installation_status_error_code(error: &InstallationError) -> &'static str {
 struct InstallationRuntimePreflightGuard {
     _source: TrustedSourceBundle,
     generation: TrustedSourceFileLease,
-    legacy_config: Option<eliot_platform_windows::LocalAppDataConfigRead>,
 }
 
 #[cfg(windows)]
@@ -1746,7 +1711,7 @@ impl InstallationRuntimePreflightGuard {
         {
             anyhow::bail!("retained generation.json runtime binding changed during effects");
         }
-        revalidate_legacy_governor_gate(self.legacy_config.as_ref())
+        revalidate_legacy_governor_gate()
     }
 }
 
@@ -1837,11 +1802,12 @@ fn validate_installation_runtime_preflight(
         .read_bounded(INSTALLATION_INPUT_LIMIT)
         .map_err(anyhow::Error::new)
         .context("re-read generation.json lease")?;
-    let legacy_config = observe_legacy_governor_config()?;
+    // #1687: reject a present legacy Governor file before installation effects;
+    // absent proceeds with no legacy config adopted.
+    observe_legacy_governor_config()?;
     Ok(InstallationRuntimePreflightGuard {
         _source: source,
         generation: lease,
-        legacy_config,
     })
 }
 
@@ -2151,6 +2117,13 @@ fn run_installation_effect(
                 let registry = match RedbInstallationRegistry::open_at(host_root) {
                     Ok(registry) => registry,
                     Err(error) => {
+                        // E4: persist a durable typed rejection so a later
+                        // recover/rollback reaches RolledBack and removes exactly
+                        // the CreatedByTransaction service registrations.
+                        if let Ok(pending_ref) = registry_projection_pending_ref(&transaction_id) {
+                            let _ = coordinator
+                                .persist_non_effect_rejection(&transaction_id, pending_ref);
+                        }
                         write_installation_error(
                             "INSTALLATION_APPLY_ERROR",
                             &format!("pending registry could not be opened: {error}"),
@@ -2161,6 +2134,12 @@ fn run_installation_effect(
                 let expected_revision = match registry.load() {
                     Ok(registry) => registry.revision(),
                     Err(error) => {
+                        // E5: same durable rejection as E4 (registry unreadable
+                        // after open is UNKNOWN_OUTCOME/ROLLBACK_REQUIRED).
+                        if let Ok(pending_ref) = registry_projection_pending_ref(&transaction_id) {
+                            let _ = coordinator
+                                .persist_non_effect_rejection(&transaction_id, pending_ref);
+                        }
                         write_installation_error(
                             "INSTALLATION_APPLY_ERROR",
                             &format!("pending registry preflight failed: {error}"),
@@ -2173,12 +2152,38 @@ fn run_installation_effect(
                     &transaction_id,
                     expected_revision,
                 ) {
+                    // E6: reload first. If an activation projection intent is now
+                    // present (Activating) do NOT persist — mark_unknown is
+                    // refused in Activating — and resume via the existing
+                    // Activating reconcile / terminal query path. Only persist
+                    // while still Registering (CAS never happened).
+                    let still_registering = match coordinator.store().load(&transaction_id) {
+                        Ok(Some(current)) => {
+                            current.stage() == InstallationStage::Registering
+                                && !current.has_activation_projection_intent()
+                        }
+                        Ok(None) | Err(_) => false,
+                    };
+                    if still_registering
+                        && let Ok(pending_ref) = registry_projection_pending_ref(&transaction_id)
+                    {
+                        let _ =
+                            coordinator.persist_non_effect_rejection(&transaction_id, pending_ref);
+                    }
                     write_installation_error(
                         "INSTALLATION_APPLY_ERROR",
                         &format!("pending registry projection failed: {error}"),
                     );
                     return Ok(INVALID_REQUEST_EXIT);
                 }
+                // INSTALL-WATCHDOG-APPROVAL: the staged `registry` is the sole
+                // redb writer for the installation registry. Release it (with
+                // its retained root/file leases) before the unbounded SCM
+                // start + convergence wait so the Watchdog approval reader
+                // (`inspect_existing_at`, a short-lived ReadOnlyDatabase) can
+                // open the same file. Terminal reconcile re-opens short-lived
+                // handles via `open_existing_at`.
+                drop(registry);
                 coordinator.drive_all_effects_until_blocked(&transaction_id)
             }
             outcome => outcome,
@@ -2353,20 +2358,70 @@ fn run_installation_effect(
 /// terminal is the expected fenced first-install state and remains pending;
 /// this query never starts services, rewrites descriptors, or retries a
 /// credential/SCM effect.
+///
+/// The terminal-reconcile writer open below is short-lived and bounded: it
+/// retries only redb exclusive-lock contention with backoff, then fails
+/// typed with the preserved cause (A13.9:14 no exclusive owner across an
+/// unbounded wait; `crates/kernel/eliot-installation/src/installation_registry.rs:8-13`
+/// bounded-hold contract; prior `drop(registry)` fix at main.rs:2221-2228;
+/// redb `Database::open` takes an exclusive file lock while the Watchdog
+/// 250ms poll may hold the file).
+fn is_redb_exclusive_lock_contention(error: &InstallationError) -> bool {
+    match error {
+        InstallationError::Platform(reason) => {
+            let normalized = reason.to_lowercase();
+            normalized.contains("already open") || normalized.contains("cannot acquire lock")
+        }
+        _ => false,
+    }
+}
+
+/// Opens the existing registry for terminal reconcile with bounded
+/// lock-contention retry. Absent stays `Ok(None)`; non-lock failures fail
+/// fast with the preserved cause. Total sleep is bounded well below 5s so
+/// this second-apply query-reconcile never becomes an unbounded wait.
+fn open_existing_registry_for_terminal_reconcile(
+    host_state_root: &Path,
+) -> Result<Option<RedbInstallationRegistry>, InstallationError> {
+    // NOTE: Writer-A may add a shared retry primitive in the registry crate;
+    // writers run in parallel from the same base, so this file keeps a small
+    // local loop. The integrator may dedupe to the shared helper on merge.
+    const MAX_ATTEMPTS: usize = 6;
+    // 100+200+400+800+1600 = 3100ms total sleep, strictly below the 5s bound.
+    const BACKOFF_MS: [u64; 5] = [100, 200, 400, 800, 1600];
+    let mut last_contention: Option<InstallationError> = None;
+    for attempt in 0..MAX_ATTEMPTS {
+        let host_root = ProtectedRootLease::open_existing(host_state_root)
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        match RedbInstallationRegistry::open_existing_at(host_root) {
+            Ok(registry) => return Ok(registry),
+            Err(error) if is_redb_exclusive_lock_contention(&error) => {
+                last_contention = Some(error);
+                if attempt + 1 < MAX_ATTEMPTS {
+                    std::thread::sleep(Duration::from_millis(BACKOFF_MS[attempt]));
+                    continue;
+                }
+                break;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_contention.expect("lock-contention loop must retain its cause"))
+}
+
 fn reconcile_host_activation_terminal(
     store_path: &Path,
     transaction: &InstallationTransaction,
 ) -> Result<Option<InstallationStepOutcome>, InstallationError> {
-    let host_root = ProtectedRootLease::open_existing(Path::new(
+    let host_state_root = Path::new(
         transaction
             .candidate_manifest
             .runtime_launch
             .runtime_state_roots
             .host_state_root
             .as_str(),
-    ))
-    .map_err(|error| InstallationError::Platform(error.to_string()))?;
-    let Some(registry) = RedbInstallationRegistry::open_existing_at(host_root)? else {
+    );
+    let Some(registry) = open_existing_registry_for_terminal_reconcile(host_state_root)? else {
         return Ok(None);
     };
     let receipt = match registry.read_committed_activation_receipt(

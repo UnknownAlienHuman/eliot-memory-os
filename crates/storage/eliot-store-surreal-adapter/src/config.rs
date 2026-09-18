@@ -6,10 +6,16 @@
 //! config is assembled programmatically by the composition owner (the store
 //! bridge); it is not a TOML/JSON projection.
 
+use std::collections::BTreeSet;
 use std::fmt;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use secrecy::SecretString;
+
+use crate::error::AdapterError;
 
 /// Stable identity of this adapter surface.
 pub const ADAPTER_NAME: &str = "eliot.storage.store-surreal-adapter";
@@ -225,6 +231,347 @@ impl SurrealAdapterConfig {
             format!("surrealkv://{}", self.store_data_root.replace('\\', "/")),
         ]
     }
+
+    /// Re-proves that a retained data-root lease was claimed for exactly this
+    /// configuration's `store_data_root`.
+    ///
+    /// The lease identity (canonical path plus owner token) travels alongside
+    /// `store_data_root` as validated configuration: it is checked after the
+    /// lease claim before the provider spawn gap, and rechecked on every
+    /// transport-liveness validation, so a lease can never drift onto a
+    /// different root than the one it excludes. A second configuration sharing
+    /// one data root with distinct work roots fails here or at claim time with
+    /// a typed denial.
+    pub(crate) fn validate_data_root_lease(
+        &self,
+        lease: &StoreDataRootLease,
+    ) -> Result<(), AdapterError> {
+        if self.store_data_root != lease.configured_root {
+            return Err(AdapterError::Config(
+                "store data root lease is not bound to the configured store data root".to_owned(),
+            ));
+        }
+        let (_, identity) = resolve_data_root(&self.store_data_root, false)?;
+        if identity != lease.root_identity
+            || lease.owner_token.trim().is_empty()
+            || lease.process_id == 0
+        {
+            return Err(AdapterError::Config(
+                "store data root lease is not bound to the configured store data root".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// OS-exclusion lease file proving exclusive ownership of one `SurrealKV` data root.
+pub(crate) const STORE_DATA_ROOT_LEASE_FILE: &str = ".eliot-store-data-root.lock";
+
+/// Windows reparse-point attribute flag used to reject symlinked data roots.
+#[cfg(windows)]
+const WINDOWS_REPARSE_POINT: u32 = 0x400;
+
+/// Win32 sharing-violation code: a takeover open failing with this code proves a
+/// live owner still holds its unshareable lease handle.
+#[cfg(windows)]
+const WINDOWS_SHARING_VIOLATION: i32 = 32;
+
+static DATA_ROOT_LEASE_TOKEN_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Same-process registry of claimed canonical data-root identities. This is only
+/// a secondary defense: cross-process exclusion is enforced by the unshareable OS
+/// handle each lease holds for its full lifetime.
+static PROCESS_DATA_ROOT_CLAIMS: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+
+/// Exclusive process-owned claim on one canonical `SurrealKV` data root.
+///
+/// This is the adapter-native analogue of the proven `BlobRootOwner` exclusion
+/// pattern, implemented for a directory root with only `std` primitives: the claim
+/// is backed by an OS-visible lease file inside the canonicalized data root, and
+/// the owner holds the OS file handle for its full lifetime. A second
+/// bridge/provider generation that configures the same data root — even with a
+/// distinct work root — fails lease acquisition with a typed denial instead of
+/// spawning a second `surreal.exe` against the same files.
+///
+/// The OS handle is the authority. A crashed owner releases the claim when the OS
+/// closes the handle; the next claimer then takes over by reopening and rewriting
+/// the informational record. The lock path is never unlinked, which would
+/// reintroduce an unlink race. No heartbeat is required: a live owner always holds
+/// an unshareable handle, so a takeover open can succeed only when no live owner
+/// exists. The record content is informational only and is never trusted for an
+/// ownership decision.
+pub(crate) struct StoreDataRootLease {
+    configured_root: String,
+    root_identity: String,
+    canonical_root: PathBuf,
+    owner_token: String,
+    process_id: u32,
+    lock_file: std::fs::File,
+}
+
+impl fmt::Debug for StoreDataRootLease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StoreDataRootLease")
+            .field("configured_root", &self.configured_root)
+            .field("root_identity", &self.root_identity)
+            .field("canonical_root", &self.canonical_root)
+            .field("owner_token", &"[REDACTED]")
+            .field("process_id", &self.process_id)
+            .field("lock_file", &self.lock_file)
+            .finish()
+    }
+}
+
+impl Drop for StoreDataRootLease {
+    fn drop(&mut self) {
+        // The OS handle close is the cross-process release; this only clears the
+        // secondary same-process registry. Never unlink the lock path.
+        if let Some(registry) = PROCESS_DATA_ROOT_CLAIMS.get()
+            && let Ok(mut claims) = registry.lock()
+        {
+            claims.remove(&self.root_identity);
+        }
+    }
+}
+
+impl StoreDataRootLease {
+    /// Claims exclusive ownership of the canonical data root named by
+    /// `store_data_root`. The OS handle is held for the lease lifetime, so a
+    /// second claimer on the same root — in this process or another — receives
+    /// an `AdapterError::Config` denial.
+    pub(crate) fn claim(store_data_root: &str) -> Result<Self, AdapterError> {
+        let process_id = std::process::id();
+        let (canonical_root, root_identity) = resolve_data_root(store_data_root, true)?;
+        let lock_path = canonical_root.join(STORE_DATA_ROOT_LEASE_FILE);
+        reject_lease_path_reparse(&lock_path)?;
+        let mut lock_file = open_data_root_lease(&lock_path)?;
+        let owner_token = lease_token(process_id);
+        write_lease_record(&mut lock_file, &root_identity, &owner_token, process_id)?;
+        // The OS exclusion above is the primary authority; the same-process set
+        // below only names the conflict deterministically inside one process.
+        let registry = PROCESS_DATA_ROOT_CLAIMS.get_or_init(|| Mutex::new(BTreeSet::new()));
+        let mut claims = registry.lock().map_err(|_| {
+            AdapterError::Config("store data root claim registry is unavailable".to_owned())
+        })?;
+        if !claims.insert(root_identity.clone()) {
+            return Err(AdapterError::Config(
+                "store data root is already owned by another bridge generation in this process"
+                    .to_owned(),
+            ));
+        }
+        Ok(Self {
+            configured_root: store_data_root.to_owned(),
+            root_identity,
+            canonical_root,
+            owner_token,
+            process_id,
+            lock_file,
+        })
+    }
+}
+
+/// Canonicalizes `store_data_root` to its directory identity, creating the
+/// directory only for the initial claim. Reparse points anywhere on the
+/// configured or canonical path are rejected: the lease must pin the real
+/// directory the provider will open, never a link that could alias two roots.
+fn resolve_data_root(
+    configured_root: &str,
+    create: bool,
+) -> Result<(PathBuf, String), AdapterError> {
+    if configured_root.trim().is_empty() || configured_root.chars().any(char::is_control) {
+        return Err(AdapterError::Config(
+            "store data root claim requires a non-blank root".to_owned(),
+        ));
+    }
+    let configured = PathBuf::from(configured_root);
+    if !configured.is_absolute()
+        || configured
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        return Err(AdapterError::Config(
+            "store data root must be an absolute path without relative components".to_owned(),
+        ));
+    }
+    if create {
+        std::fs::create_dir_all(&configured).map_err(|_| {
+            AdapterError::Config("store data root directory could not be created".to_owned())
+        })?;
+    }
+    let metadata = std::fs::symlink_metadata(&configured).map_err(|_| {
+        AdapterError::Config("store data root directory could not be inspected".to_owned())
+    })?;
+    if !metadata.is_dir() {
+        return Err(AdapterError::Config(
+            "store data root must resolve to a directory".to_owned(),
+        ));
+    }
+    reject_reparse_ancestors(&configured)?;
+    let canonical = std::fs::canonicalize(&configured).map_err(|_| {
+        AdapterError::Config("store data root could not be canonicalized".to_owned())
+    })?;
+    reject_reparse_ancestors(&canonical)?;
+    let identity = canonical_data_root_identity(&canonical);
+    Ok((canonical, identity))
+}
+
+fn canonical_data_root_identity(canonical: &Path) -> String {
+    let mut identity = canonical.to_string_lossy().replace('\\', "/");
+    if cfg!(windows) {
+        identity.make_ascii_lowercase();
+    }
+    identity
+}
+
+fn reject_reparse_ancestors(path: &Path) -> Result<(), AdapterError> {
+    let mut current = Some(path);
+    while let Some(candidate) = current {
+        if let Ok(metadata) = std::fs::symlink_metadata(candidate)
+            && is_data_root_reparse(&metadata)
+        {
+            return Err(AdapterError::Config(
+                "store data root with reparse components is not permitted".to_owned(),
+            ));
+        }
+        current = candidate.parent();
+    }
+    Ok(())
+}
+
+fn reject_lease_path_reparse(lock_path: &Path) -> Result<(), AdapterError> {
+    match std::fs::symlink_metadata(lock_path) {
+        Ok(metadata) if is_data_root_reparse(&metadata) => Err(AdapterError::Config(
+            "store data root lease reparse points are not permitted".to_owned(),
+        )),
+        Ok(_) | Err(_) => Ok(()),
+    }
+}
+
+fn is_data_root_reparse(metadata: &std::fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::MetadataExt::file_attributes(metadata) & WINDOWS_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+#[cfg(windows)]
+fn open_data_root_lease(lock_path: &Path) -> Result<std::fs::File, AdapterError> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let mut exclusive = std::fs::OpenOptions::new();
+    exclusive
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .share_mode(0);
+    match exclusive.open(lock_path) {
+        Ok(file) => Ok(file),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            // A crashed owner leaves the record but not the handle. Reopening the
+            // existing path with zero sharing transfers ownership, while a live
+            // owner denies this open with a sharing violation.
+            let mut takeover = std::fs::OpenOptions::new();
+            takeover.read(true).write(true).share_mode(0);
+            takeover.open(lock_path).map_err(|takeover_error| {
+                if is_sharing_denial(&takeover_error) {
+                    AdapterError::Config(
+                        "store data root is already owned by another bridge generation; two generations cannot open the same production data root"
+                            .to_owned(),
+                    )
+                } else {
+                    AdapterError::Config(
+                        "store data root lease could not be reopened after a prior owner record"
+                            .to_owned(),
+                    )
+                }
+            })
+        }
+        Err(_) => Err(AdapterError::Config(
+            "store data root lease file could not be created".to_owned(),
+        )),
+    }
+}
+
+#[cfg(not(windows))]
+fn open_data_root_lease(lock_path: &Path) -> Result<std::fs::File, AdapterError> {
+    // The production runtime is native Windows. On other targets, fail closed on
+    // an existing lease path rather than pretending portable `std::fs` semantics
+    // provide equivalent cross-process exclusion.
+    std::fs::OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                AdapterError::Config(
+                    "store data root is already owned by another bridge generation; two generations cannot open the same production data root"
+                        .to_owned(),
+                )
+            } else {
+                AdapterError::Config(
+                    "store data root lease file could not be created".to_owned(),
+                )
+            }
+        })
+}
+
+#[cfg(windows)]
+fn is_sharing_denial(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::PermissionDenied
+            | std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::AlreadyExists
+    ) || error.raw_os_error() == Some(WINDOWS_SHARING_VIOLATION)
+}
+
+fn lease_token(process_id: u32) -> String {
+    let sequence = DATA_ROOT_LEASE_TOKEN_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{process_id}-{}-{sequence}", now_unix_ms())
+}
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+fn write_lease_record(
+    lock_file: &mut std::fs::File,
+    root_identity: &str,
+    owner_token: &str,
+    process_id: u32,
+) -> Result<(), AdapterError> {
+    use std::io::{Seek, Write};
+
+    lock_file.set_len(0).map_err(|_| {
+        AdapterError::Config("store data root lease record could not be written".to_owned())
+    })?;
+    lock_file.rewind().map_err(|_| {
+        AdapterError::Config("store data root lease record could not be written".to_owned())
+    })?;
+    write!(
+        lock_file,
+        "eliot-store-data-root-lease-v1\nroot={root_identity}\ntoken={owner_token}\nprocess={process_id}\n"
+    )
+    .map_err(|_| {
+        AdapterError::Config("store data root lease record could not be written".to_owned())
+    })?;
+    lock_file.flush().map_err(|_| {
+        AdapterError::Config("store data root lease record could not be written".to_owned())
+    })?;
+    Ok(())
 }
 
 fn validate_name(value: &str, field: &'static str) -> Result<(), ConfigError> {

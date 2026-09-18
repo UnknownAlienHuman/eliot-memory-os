@@ -1,0 +1,27 @@
+{
+  "packages": [
+    {
+      "id": "sample-package 0.1.0 (path+file:///crates/sample-package)",
+      "name": "sample-package",
+      "version": "0.1.0",
+      "manifest_path": "crates/sample-package/Cargo.toml",
+      "targets": [
+        {
+          "name": "sample_package",
+          "kind": ["lib"],
+          "src_path": "crates/sample-package/src/lib.rs"
+        },
+        {
+          "name": "sample_integration",
+          "kind": ["test"],
+          "src_path": "crates/sample-package/tests/sample_integration.rs"
+        }
+      ]
+    }
+  ],
+  "workspace_members": [
+    "sample-package 0.1.0 (path+file:///crates/sample-package)"
+  ],
+  "workspace_root": ".",
+  "target_directory": "target"
+}

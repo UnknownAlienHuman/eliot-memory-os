@@ -1,0 +1,936 @@
+schema = "eliot.legacy-retirement-s1.v1"
+issue = 1189
+slice = "T7-S1"
+title = "T7-S1 private legacy GovernorConfig decoder for bins/eliot canary gate"
+base_commit = "a597e763a72a7af8d2282c34b948029a7d096cf4"
+branch = "work/1189-legacy-governor-config-s1"
+scope_paths = [
+  "bins/eliot/src/main.rs",
+  "bins/eliot/src/legacy_governor_config.rs",
+  "bins/eliot/Cargo.toml",
+  "Cargo.lock",
+  "workstreams/legacy/retirement-1189.toml",
+]
+authority_note = "main is the only documentation authority; this ledger is bounded S1 evidence, not a cutover receipt. Lock edge deletion (Cargo.lock -\"eliot-types\" under name = \"eliot\" deps) is included here per T7.md:105 build-closed; final 4-package removal stays S9 integrator-owned. S1 scope is exactly the 5 paths above."
+
+[source_pin]
+base_commit = "a597e763a72a7af8d2282c34b948029a7d096cf4"
+config_rs = "crates/eliot-types/src/config.rs (503 lines, SHA256 375AD160A0CA232A7BEC8EA014E1CCA6E5BC0DCECA015D554F643383724BD939)"
+error_rs = "crates/eliot-types/src/error.rs (40 lines, SHA256 7A50331E61EBF34DB4DA18AA594783ECDF6774FB6003BB03FE4DBEF87E123326)"
+service_rs = "crates/eliot-types/src/service.rs (359 lines, SHA256 873156679CA7FBD52BB09F553BF2E333ACF8C351BD9766272952753C2F535570)"
+lib_rs = "crates/eliot-types/src/lib.rs (493 lines, SHA256 39B999F7AF120B126A73FDE2EA9A9B64D4F3E599AD68D4F09A947FDC6E180B6D)"
+main_rs_base = "bins/eliot/src/main.rs (3773 lines at base, SHA256 8B1F87099C30ECC2C038C8A3DCFE1C5F007EB1807A3AF5C9657C660864D6A064)"
+cargo_toml_base = "bins/eliot/Cargo.toml (50 lines at base, SHA256 979080947D95A67F6CBF2CF3DA81B63B5E50214B85A2CF22A96E2467175DD654)"
+runtime_live_rs = "crates/foundation/eliot-runtime-contracts/src/runtime_live.rs (RUNTIME_LIVE_STORE_BIND=127.0.0.1:8000, ENDPOINT=ws://127.0.0.1:8000/rpc, NAMESPACE=eliot)"
+
+[common]
+target_owner = "bins/eliot private legacy_governor_config (frozen, Windows canary gate only; no new public API, no new runtime authority)"
+wire_schema = "TOML governor.toml decoded with toml::from_str; schema_version must equal \"1\"; no network wire; no credentials read or used"
+mutable_root_effects = "none; read-only decode + validate + runtime-live Store collision check; no writer, no database, no child process, no credential use"
+expiry = "T7-S9 legacy retirement closure; frozen decoder is removed only when retained legacy configs and all named callers receive a migration/archive/rejection disposition and the current canary path no longer needs the legacy gate"
+rollback_boundary = "revert the single T7-S1 commit to restore the bins/eliot -> eliot-types Cargo edge and the eliot_types::GovernorConfig import; no data migration involved"
+cutover_receipt = "none-yet for final eliot-types retirement; S1 cutover for this edge is the T7-S1 commit itself (private frozen decoder + Cargo edge removal, no dual-read, no dual authority); final crate retirement cutover is owned by T7-S9"
+verifier_check = "cargo check -p eliot --all-targets exit 0"
+verifier_test = "cargo test -p eliot: 55 unit + 3 bootstrap_brief + 20 system_snapshot passed, 0 failed, 0 ignored (7 legacy_governor tests: 6 new decoder + 1 retained classify)"
+verifier_clippy = "cargo clippy -p eliot --all-targets: eliot bin zero warnings from this diff (workspace clippy exit 0; remaining workspace warnings are pre-existing in untouched crates)"
+verifier_grep = "git grep -n eliot_types -- bins/eliot/ zero hits; git grep -n eliot-types -- bins/eliot/ one provenance doc hit at legacy_governor_config.rs:5 (allowed); local GovernorConfig name remains only in private legacy_governor_config.rs + minimal main.rs glue by design"
+
+# ---------------------------------------------------------------------------
+# Frozen DTOs (exact semantics copied from crates/eliot-types at base)
+# ---------------------------------------------------------------------------
+
+[[object]]
+qualified_symbol = "legacy_governor_config::GovernorConfig"
+source = "crates/eliot-types/src/config.rs:6-19@a597e763 (frozen target bins/eliot/src/legacy_governor_config.rs)"
+construction_callers = "constructed by toml::from_str in observe_legacy_governor_config (main.rs) and revalidate_legacy_governor_gate (main.rs); Default impl used in tests"
+cargo_edges = "normal: bins/eliot serde + toml (workspace, no features); dev: none; build: none; feature: none (no feature-gated consumer)"
+wire_schema = "TOML governor.toml; schema_version must equal \"1\""
+mutable_root_effects = "none; read-only"
+target_owner = "bins/eliot private legacy_governor_config"
+disposition = "FROZEN_PRIVATE_DECODER"
+transform_verifier = "exact field-for-field copy minus schemars JsonSchema derives (no schemars dep in bins/eliot); serde defaults preserved (supervision/delegation_calibration/ul); verifier: cargo check + cargo test valid_non_colliding_config_passes_including_defaults"
+expiry = "T7-S9"
+rollback_boundary = "revert S1 commit"
+cutover_receipt = "S1 commit (no dual-read)"
+
+[[object]]
+qualified_symbol = "legacy_governor_config::ServiceConfig"
+source = "crates/eliot-types/src/config.rs:83-86@a597e763"
+construction_callers = "nested in GovernorConfig TOML decode; no direct caller"
+cargo_edges = "normal: serde only; dev/build/feature: none"
+wire_schema = "TOML [service]; service_name + instance_id require_non_empty"
+mutable_root_effects = "none; read-only"
+target_owner = "bins/eliot private legacy_governor_config"
+disposition = "FROZEN_PRIVATE_DECODER"
+transform_verifier = "exact copy; verifier: invalid_variants_are_invalid (empty service_name => EmptyField)"
+expiry = "T7-S9"
+rollback_boundary = "revert S1 commit"
+cutover_receipt = "S1 commit (no dual-read)"
+
+[[object]]
+qualified_symbol = "legacy_governor_config::DbConfig"
+source = "crates/eliot-types/src/config.rs:89-92@a597e763"
+construction_callers = "nested in GovernorConfig TOML decode"
+cargo_edges = "normal: serde only; dev/build/feature: none"
+wire_schema = "TOML [db]; mode + surreal"
+mutable_root_effects = "none; read-only"
+target_owner = "bins/eliot private legacy_governor_config"
+disposition = "FROZEN_PRIVATE_DECODER"
+transform_verifier = "exact copy; verifier: cargo test valid_non_colliding decode"
+expiry = "T7-S9"
+rollback_boundary = "revert S1 commit"
+cutover_receipt = "S1 commit (no dual-read)"
+
+[[object]]
+qualified_symbol = "legacy_governor_config::DbMode"
+source = "crates/eliot-types/src/config.rs:95-101@a597e763"
+construction_callers = "decoded from [db] mode; default GovernorConfig uses SurrealRpcServer"
+cargo_edges = "normal: serde rename_all snake_case; dev/build/feature: none"
+wire_schema = "TOML strings surreal_rpc_server|surreal_mcp_child|surreal_sql_cli|surreal_sdk_experimental"
+mutable_root_effects = "none; read-only"
+target_owner = "bins/eliot private legacy_governor_config"
+disposition = "FROZEN_PRIVATE_DECODER"
+transform_verifier = "exact variants preserved (clippy enum_variant_names allowed with reason: renaming would change TOML semantics); verifier: valid TOML uses surreal_rpc_server"
+expiry = "T7-S9"
+rollback_boundary = "revert S1 commit"
+cutover_receipt = "S1 commit (no dual-read)"
+
+[[object]]
+qualified_symbol = "legacy_governor_config::SurrealServerConfig"
+source = "crates/eliot-types/src/config.rs:104-125@a597e763"
+construction_callers = "nested in GovernorConfig; gate calls db.surreal.reject_store_collision + validate fields"
+cargo_edges = "normal: serde + serde defaults for credential_provider/credential_id/password_file; dev/build/feature: none"
+wire_schema = "TOML [db.surreal]; bind 127.0.0.1:<port>; endpoint ws://127.0.0.1:<port>/rpc; storage rocksdb:<path> (not rocksdb://)"
+mutable_root_effects = "none; read-only collision check only"
+target_owner = "bins/eliot private legacy_governor_config"
+disposition = "FROZEN_PRIVATE_DECODER"
+transform_verifier = "exact copy incl. default fns; verifier: cargo test invalid_variants (bind/endpoint/storage/provider) + collision tests"
+expiry = "T7-S9"
+rollback_boundary = "revert S1 commit"
+cutover_receipt = "S1 commit (no dual-read)"
+
+[[object]]
+qualified_symbol = "legacy_governor_config::SurrealCapabilities"
+source = "crates/eliot-types/src/config.rs:128-134@a597e763"
+construction_callers = "nested in SurrealServerConfig TOML decode"
+cargo_edges = "normal: serde only; dev/build/feature: none"
+wire_schema = "TOML [db.surreal.capabilities]; deny_all=true, allow_scripting=false, allow_guests=false, allow_net=[] required"
+mutable_root_effects = "none; read-only"
+target_owner = "bins/eliot private legacy_governor_config"
+disposition = "FROZEN_PRIVATE_DECODER"
+transform_verifier = "exact copy; verifier: invalid_variants capability cases"
+expiry = "T7-S9"
+rollback_boundary = "revert S1 commit"
+cutover_receipt = "S1 commit (no dual-read)"
+
+[[object]]
+qualified_symbol = "legacy_governor_config::ControlWalConfig"
+source = "crates/eliot-types/src/config.rs:137-139@a597e763"
+construction_callers = "nested in GovernorConfig TOML decode"
+cargo_edges = "normal: serde only; dev/build/feature: none"
+wire_schema = "TOML [control_wal]; path require_non_empty"
+mutable_root_effects = "none; read-only"
+target_owner = "bins/eliot private legacy_governor_config"
+disposition = "FROZEN_PRIVATE_DECODER"
+transform_verifier = "exact copy; verifier: valid decode"
+expiry = "T7-S9"
+rollback_boundary = "revert S1 commit"
+cutover_receipt = "S1 commit (no dual-read)"
+
+[[object]]
+qualified_symbol = "legacy_governor_config::BlobStoreConfig"
+source = "crates/eliot-types/src/config.rs:142-144@a597e763"
+construction_callers = "nested in GovernorConfig TOML decode"
+cargo_edges = "normal: serde only; dev/build/feature: none"
+wire_schema = "TOML [blob_store]; root require_non_empty"
+mutable_root_effects = "none; read-only"
+target_owner = "bins/eliot private legacy_governor_config"
+disposition = "FROZEN_PRIVATE_DECODER"
+transform_verifier = "exact copy; verifier: valid decode"
+expiry = "T7-S9"
+rollback_boundary = "revert S1 commit"
+cutover_receipt = "S1 commit (no dual-read)"
+
+[[object]]
+qualified_symbol = "legacy_governor_config::StoreConfig"
+source = "crates/eliot-types/src/config.rs:147-150@a597e763"
+construction_callers = "nested in GovernorConfig TOML decode"
+cargo_edges = "normal: serde only; dev/build/feature: none"
+wire_schema = "TOML [store]; surql_dir + migrations_dir require_non_empty"
+mutable_root_effects = "none; read-only"
+target_owner = "bins/eliot private legacy_governor_config"
+disposition = "FROZEN_PRIVATE_DECODER"
+transform_verifier = "exact copy; verifier: valid decode"
+expiry = "T7-S9"
+rollback_boundary = "revert S1 commit"
+cutover_receipt = "S1 commit (no dual-read)"
+
+[[object]]
+qualified_symbol = "legacy_governor_config::RuntimeSupervisionConfig"
+source = "crates/eliot-types/src/config.rs:22-32@a597e763"
+construction_callers = "serde default when [supervision] omitted; Default watchdog 2000"
+cargo_edges = "normal: serde default; dev/build/feature: none"
+wire_schema = "TOML [supervision] optional; watchdog_interval_ms != 0"
+mutable_root_effects = "none; read-only"
+target_owner = "bins/eliot private legacy_governor_config"
+disposition = "FROZEN_PRIVATE_DECODER"
+transform_verifier = "exact Default(2000) + ZeroField rule; verifier: defaults test + watchdog-zero invalid case"
+expiry = "T7-S9"
+rollback_boundary = "revert S1 commit"
+cutover_receipt = "S1 commit (no dual-read)"
+
+[[object]]
+qualified_symbol = "legacy_governor_config::DelegationCalibrationConfig"
+source = "crates/eliot-types/src/config.rs:54-80@a597e763"
+construction_callers = "serde default when [delegation_calibration] omitted; Default 12/5/4/3/0.80/12/true/true/true"
+cargo_edges = "normal: serde default; dev/build/feature: none"
+wire_schema = "TOML [delegation_calibration] optional; f64 fraction preserved"
+mutable_root_effects = "none; read-only"
+target_owner = "bins/eliot private legacy_governor_config"
+disposition = "FROZEN_PRIVATE_DECODER"
+transform_verifier = "exact Default preserved; verifier: defaults test asserts all 9 fields incl. 0.80 bit-exact"
+expiry = "T7-S9"
+rollback_boundary = "revert S1 commit"
+cutover_receipt = "S1 commit (no dual-read)"
+
+[[object]]
+qualified_symbol = "legacy_governor_config::UlConfig"
+source = "crates/eliot-types/src/config.rs:35-38@a597e763"
+construction_callers = "serde default when [ul] omitted; activation serde default"
+cargo_edges = "normal: serde default; dev/build/feature: none"
+wire_schema = "TOML [ul] optional"
+mutable_root_effects = "none; read-only"
+target_owner = "bins/eliot private legacy_governor_config"
+disposition = "FROZEN_PRIVATE_DECODER"
+transform_verifier = "exact copy incl. Default derive; verifier: defaults test"
+expiry = "T7-S9"
+rollback_boundary = "revert S1 commit"
+cutover_receipt = "S1 commit (no dual-read)"
+
+[[object]]
+qualified_symbol = "legacy_governor_config::UlActivationConfig"
+source = "crates/eliot-types/src/config.rs:41-51@a597e763"
+construction_callers = "serde default; Default enable_min_edges 500"
+cargo_edges = "normal: serde default; dev/build/feature: none"
+wire_schema = "TOML [ul.activation] optional"
+mutable_root_effects = "none; read-only"
+target_owner = "bins/eliot private legacy_governor_config"
+disposition = "FROZEN_PRIVATE_DECODER"
+transform_verifier = "exact Default(500); verifier: defaults test"
+expiry = "T7-S9"
+rollback_boundary = "revert S1 commit"
+cutover_receipt = "S1 commit (no dual-read)"
+
+[[object]]
+qualified_symbol = "legacy_governor_config::SCHEMA_VERSION"
+source = "crates/eliot-types/src/lib.rs:493@a597e763 (pub const SCHEMA_VERSION: &str = \"1\")"
+construction_callers = "compared in GovernorConfig::validate; Default GovernorConfig sets it"
+cargo_edges = "none"
+wire_schema = "TOML schema_version must equal \"1\""
+mutable_root_effects = "none"
+target_owner = "bins/eliot private legacy_governor_config"
+disposition = "FROZEN_PRIVATE_DECODER"
+transform_verifier = "exact value \"1\"; verifier: schema-mismatch invalid case"
+expiry = "T7-S9"
+rollback_boundary = "revert S1 commit"
+cutover_receipt = "S1 commit (no dual-read)"
+
+[[object]]
+qualified_symbol = "legacy_governor_config::CredentialProviderKind"
+source = "crates/eliot-types/src/service.rs:192-200@a597e763"
+construction_callers = "decoded from [db.surreal] credential_provider (serde default WindowsCredentialManager); validate gates providers"
+cargo_edges = "normal: serde rename_all snake_case; dev/build/feature: none"
+wire_schema = "TOML strings windows_credential_manager|dpapi_protected_file|service_environment|test_in_memory|legacy_password_file; only first + last pass validate"
+mutable_root_effects = "none; no credential material is read (only the provider KIND string is decoded)"
+target_owner = "bins/eliot private legacy_governor_config"
+disposition = "FROZEN_PRIVATE_DECODER"
+transform_verifier = "exact 5 variants preserved; verifier: DpapiProtectedFile => UnsupportedCredentialProvider; LegacyPasswordFile with empty password_file => EmptyField; omitted => WindowsCredentialManager default"
+expiry = "T7-S9"
+rollback_boundary = "revert S1 commit"
+cutover_receipt = "S1 commit (no dual-read)"
+
+[[object]]
+qualified_symbol = "legacy_governor_config::CredentialProviderKind::WindowsCredentialManager"
+source = "crates/eliot-types/src/service.rs:195@a597e763"
+construction_callers = "serde default when credential_provider omitted; requires non-empty credential_id"
+cargo_edges = "normal: serde; dev/build/feature: none"
+wire_schema = "TOML \"windows_credential_manager\"; default credential_id surreal-runtime/local-dev"
+mutable_root_effects = "none; provider KIND only, no secret access"
+target_owner = "bins/eliot private legacy_governor_config"
+disposition = "FROZEN_PRIVATE_DECODER (gated-accepted provider)"
+transform_verifier = "verifier: defaults test asserts provider + credential_id"
+expiry = "T7-S9"
+rollback_boundary = "revert S1 commit"
+cutover_receipt = "S1 commit (no dual-read)"
+
+[[object]]
+qualified_symbol = "legacy_governor_config::CredentialProviderKind::LegacyPasswordFile"
+source = "crates/eliot-types/src/service.rs:199@a597e763"
+construction_callers = "only when explicitly named in TOML; requires non-empty password_file"
+cargo_edges = "normal: serde; dev/build/feature: none"
+wire_schema = "TOML \"legacy_password_file\"; default password_file %LOCALAPPDATA%/Eliot/secrets/surreal_root_password.txt"
+mutable_root_effects = "none; provider KIND only, file is never opened here"
+target_owner = "bins/eliot private legacy_governor_config"
+disposition = "FROZEN_PRIVATE_DECODER (gated-accepted legacy provider)"
+transform_verifier = "verifier: empty password_file => EmptyField case"
+expiry = "T7-S9"
+rollback_boundary = "revert S1 commit"
+cutover_receipt = "S1 commit (no dual-read)"
+
+[[object]]
+qualified_symbol = "legacy_governor_config::CredentialProviderKind::DpapiProtectedFile"
+source = "crates/eliot-types/src/service.rs:196@a597e763"
+construction_callers = "decoded if named; validate rejects"
+cargo_edges = "normal: serde; dev/build/feature: none"
+wire_schema = "TOML \"dpapi_protected_file\" => UnsupportedCredentialProvider"
+mutable_root_effects = "none"
+target_owner = "bins/eliot private legacy_governor_config"
+disposition = "FROZEN_PRIVATE_DECODER (decoded but validate-rejected)"
+transform_verifier = "verifier: DpapiProtectedFile => UnsupportedCredentialProvider case"
+expiry = "T7-S9"
+rollback_boundary = "revert S1 commit"
+cutover_receipt = "S1 commit (no dual-read)"
+
+[[object]]
+qualified_symbol = "legacy_governor_config::CredentialProviderKind::ServiceEnvironment"
+source = "crates/eliot-types/src/service.rs:197@a597e763"
+construction_callers = "decoded if named; validate rejects"
+cargo_edges = "normal: serde; dev/build/feature: none"
+wire_schema = "TOML \"service_environment\" => UnsupportedCredentialProvider"
+mutable_root_effects = "none"
+target_owner = "bins/eliot private legacy_governor_config"
+disposition = "FROZEN_PRIVATE_DECODER (decoded but validate-rejected)"
+transform_verifier = "same validate arm as DpapiProtectedFile (provider => catch-all); covered by Dpapi case + exact enum parity"
+expiry = "T7-S9"
+rollback_boundary = "revert S1 commit"
+cutover_receipt = "S1 commit (no dual-read)"
+
+[[object]]
+qualified_symbol = "legacy_governor_config::CredentialProviderKind::TestInMemory"
+source = "crates/eliot-types/src/service.rs:198@a597e763"
+construction_callers = "decoded if named; validate rejects"
+cargo_edges = "normal: serde; dev/build/feature: none"
+wire_schema = "TOML \"test_in_memory\" => UnsupportedCredentialProvider"
+mutable_root_effects = "none"
+target_owner = "bins/eliot private legacy_governor_config"
+disposition = "FROZEN_PRIVATE_DECODER (decoded but validate-rejected)"
+transform_verifier = "same validate catch-all arm; exact enum parity with source"
+expiry = "T7-S9"
+rollback_boundary = "revert S1 commit"
+cutover_receipt = "S1 commit (no dual-read)"
+
+[[object]]
+qualified_symbol = "legacy_governor_config::ConfigError"
+source = "crates/eliot-types/src/error.rs:1-40@a597e763 (thiserror enum, 9 variants)"
+construction_callers = "returned by validate()/reject_store_collision(); gate maps to anyhow strings with collides/malformed/invalid prefixes"
+cargo_edges = "normal: thiserror (workspace, no features); dev/build/feature: none"
+wire_schema = "no wire; Display strings preserved exactly (validated by gate error-prefix tests)"
+mutable_root_effects = "none"
+target_owner = "bins/eliot private legacy_governor_config"
+disposition = "FROZEN_PRIVATE_DECODER"
+transform_verifier = "exact thiserror messages copied; verifier: collision display contains reserved runtime-live store; invalid/malformed prefix tests"
+expiry = "T7-S9"
+rollback_boundary = "revert S1 commit"
+cutover_receipt = "S1 commit (no dual-read)"
+
+[[object]]
+qualified_symbol = "legacy_governor_config::ConfigError::UnsupportedSchemaVersion"
+source = "crates/eliot-types/src/error.rs:5-9@a597e763"
+construction_callers = "validate() when schema_version != \"1\""
+cargo_edges = "thiserror only"
+wire_schema = "Display: schema_version must be {expected}, got {actual}"
+mutable_root_effects = "none"
+target_owner = "bins/eliot private legacy_governor_config"
+disposition = "FROZEN_PRIVATE_DECODER"
+transform_verifier = "verifier: schema-mismatch invalid case"
+expiry = "T7-S9"
+rollback_boundary = "revert S1 commit"
+cutover_receipt = "S1 commit (no dual-read)"
+
+[[object]]
+qualified_symbol = "legacy_governor_config::ConfigError::EmptyField"
+source = "crates/eliot-types/src/error.rs:11-12@a597e763"
+construction_callers = "require_non_empty() for service/db/control_wal/blob_store/store/credential fields"
+cargo_edges = "thiserror only"
+wire_schema = "Display: {field} must not be empty"
+mutable_root_effects = "none"
+target_owner = "bins/eliot private legacy_governor_config"
+disposition = "FROZEN_PRIVATE_DECODER"
+transform_verifier = "verifier: empty service_name + empty password_file cases"
+expiry = "T7-S9"
+rollback_boundary = "revert S1 commit"
+cutover_receipt = "S1 commit (no dual-read)"
+
+[[object]]
+qualified_symbol = "legacy_governor_config::ConfigError::ZeroField"
+source = "crates/eliot-types/src/error.rs:14-15@a597e763"
+construction_callers = "validate() when supervision.watchdog_interval_ms == 0"
+cargo_edges = "thiserror only"
+wire_schema = "Display: {field} must be non-zero"
+mutable_root_effects = "none"
+target_owner = "bins/eliot private legacy_governor_config"
+disposition = "FROZEN_PRIVATE_DECODER"
+transform_verifier = "verifier: watchdog-zero invalid case"
+expiry = "T7-S9"
+rollback_boundary = "revert S1 commit"
+cutover_receipt = "S1 commit (no dual-read)"
+
+[[object]]
+qualified_symbol = "legacy_governor_config::ConfigError::ForbiddenDbBind"
+source = "crates/eliot-types/src/error.rs:17-18@a597e763"
+construction_callers = "validate() when bind does not start with 127.0.0.1:"
+cargo_edges = "thiserror only"
+wire_schema = "Display: SurrealDB bind address must stay on 127.0.0.1, got {bind}"
+mutable_root_effects = "none"
+target_owner = "bins/eliot private legacy_governor_config"
+disposition = "FROZEN_PRIVATE_DECODER"
+transform_verifier = "verifier: non-loopback bind invalid case"
+expiry = "T7-S9"
+rollback_boundary = "revert S1 commit"
+cutover_receipt = "S1 commit (no dual-read)"
+
+[[object]]
+qualified_symbol = "legacy_governor_config::ConfigError::ForbiddenDbEndpoint"
+source = "crates/eliot-types/src/error.rs:20-21@a597e763"
+construction_callers = "validate() when endpoint does not match ws://127.0.0.1:<port>/rpc"
+cargo_edges = "thiserror only"
+wire_schema = "Display: SurrealDB endpoint must be ws://127.0.0.1:<port>/rpc, got {endpoint}"
+mutable_root_effects = "none"
+target_owner = "bins/eliot private legacy_governor_config"
+disposition = "FROZEN_PRIVATE_DECODER"
+transform_verifier = "verifier: endpoint-shape invalid case"
+expiry = "T7-S9"
+rollback_boundary = "revert S1 commit"
+cutover_receipt = "S1 commit (no dual-read)"
+
+[[object]]
+qualified_symbol = "legacy_governor_config::ConfigError::ForbiddenDbStorage"
+source = "crates/eliot-types/src/error.rs:23-24@a597e763"
+construction_callers = "validate() when storage does not start with rocksdb: or starts with rocksdb://"
+cargo_edges = "thiserror only"
+wire_schema = "Display: SurrealDB storage must be a local rocksdb:<path> URI, got {storage}"
+mutable_root_effects = "none"
+target_owner = "bins/eliot private legacy_governor_config"
+disposition = "FROZEN_PRIVATE_DECODER"
+transform_verifier = "verifier: rocksdb:// invalid case"
+expiry = "T7-S9"
+rollback_boundary = "revert S1 commit"
+cutover_receipt = "S1 commit (no dual-read)"
+
+[[object]]
+qualified_symbol = "legacy_governor_config::ConfigError::ForbiddenCapability"
+source = "crates/eliot-types/src/error.rs:26-27@a597e763"
+construction_callers = "validate() for deny_all/allow_scripting/allow_guests/allow_net rules"
+cargo_edges = "thiserror only"
+wire_schema = "Display: forbidden SurrealDB capability {field}={value}"
+mutable_root_effects = "none"
+target_owner = "bins/eliot private legacy_governor_config"
+disposition = "FROZEN_PRIVATE_DECODER"
+transform_verifier = "verifier: 4 capability invalid cases (deny_all/scripting/guests/net)"
+expiry = "T7-S9"
+rollback_boundary = "revert S1 commit"
+cutover_receipt = "S1 commit (no dual-read)"
+
+[[object]]
+qualified_symbol = "legacy_governor_config::ConfigError::UnsupportedCredentialProvider"
+source = "crates/eliot-types/src/error.rs:29-30@a597e763"
+construction_callers = "validate() catch-all provider arm"
+cargo_edges = "thiserror only"
+wire_schema = "Display: unsupported SurrealDB credential provider: {provider}"
+mutable_root_effects = "none"
+target_owner = "bins/eliot private legacy_governor_config"
+disposition = "FROZEN_PRIVATE_DECODER"
+transform_verifier = "verifier: DpapiProtectedFile invalid case"
+expiry = "T7-S9"
+rollback_boundary = "revert S1 commit"
+cutover_receipt = "S1 commit (no dual-read)"
+
+[[object]]
+qualified_symbol = "legacy_governor_config::ConfigError::RuntimeLiveStoreCollision"
+source = "crates/eliot-types/src/error.rs:32-39@a597e763"
+construction_callers = "reject_store_collision() when collides_with_store; gate prefixes with collides with runtime-live Store"
+cargo_edges = "thiserror only"
+wire_schema = "Display: configuration collides with the reserved runtime-live store: bind={bind}, endpoint={endpoint}, namespace={namespace}"
+mutable_root_effects = "none; fail-closed before any writer/DB/child"
+target_owner = "bins/eliot private legacy_governor_config"
+disposition = "FROZEN_PRIVATE_DECODER"
+transform_verifier = "verifier: exact + loopback-port + bind-only collision tests assert RuntimeLiveStoreCollision + display prefix"
+expiry = "T7-S9"
+rollback_boundary = "revert S1 commit"
+cutover_receipt = "S1 commit (no dual-read)"
+
+# Frozen helpers (exact logic, module-private)
+[[object]]
+qualified_symbol = "legacy_governor_config::GovernorConfig::validate"
+source = "crates/eliot-types/src/config.rs:175-263@a597e763"
+construction_callers = "gate calls config.validate() in both observe + revalidate paths"
+cargo_edges = "none beyond ConfigError"
+wire_schema = "all require_non_empty/watchdog/bind/endpoint/storage/capability/provider rules preserved exactly"
+mutable_root_effects = "none"
+target_owner = "bins/eliot private legacy_governor_config"
+disposition = "FROZEN_PRIVATE_DECODER"
+transform_verifier = "line-for-line copy; verifier: invalid_variants_are_invalid (11 sub-cases)"
+expiry = "T7-S9"
+rollback_boundary = "revert S1 commit"
+cutover_receipt = "S1 commit (no dual-read)"
+
+[[object]]
+qualified_symbol = "legacy_governor_config::SurrealServerConfig::reject_store_collision"
+source = "crates/eliot-types/src/config.rs:279-293@a597e763"
+construction_callers = "gate calls config.db.surreal.reject_store_collision(RUNTIME_LIVE_STORE_*) in both observe + revalidate paths"
+cargo_edges = "none"
+wire_schema = "ns equality AND (endpoint== OR same_loopback_port OR bind== OR same_loopback_port)"
+mutable_root_effects = "none; fail-closed"
+target_owner = "bins/eliot private legacy_governor_config"
+disposition = "FROZEN_PRIVATE_DECODER"
+transform_verifier = "exact copy; verifier: 3 collision tests"
+expiry = "T7-S9"
+rollback_boundary = "revert S1 commit"
+cutover_receipt = "S1 commit (no dual-read)"
+
+[[object]]
+qualified_symbol = "legacy_governor_config::SurrealServerConfig::collides_with_store"
+source = "crates/eliot-types/src/config.rs:270-276@a597e763"
+construction_callers = "used by reject_store_collision + GovernorConfig wrapper + tests"
+cargo_edges = "none"
+wire_schema = "same predicate as above"
+mutable_root_effects = "none"
+target_owner = "bins/eliot private legacy_governor_config"
+disposition = "FROZEN_PRIVATE_DECODER"
+transform_verifier = "exact copy incl. #[must_use]; verifier: collision tests assert bool both ways"
+expiry = "T7-S9"
+rollback_boundary = "revert S1 commit"
+cutover_receipt = "S1 commit (no dual-read)"
+
+[[object]]
+qualified_symbol = "legacy_governor_config::GovernorConfig::collides_with_store + reject_store_collision wrappers"
+source = "crates/eliot-types/src/config.rs:152-173@a597e763"
+construction_callers = "retained for exact legacy parity; gate calls via db.surreal; tests exercise wrappers (dead_code allowed with reason in non-test build)"
+cargo_edges = "none"
+wire_schema = "delegation to db.surreal preserved"
+mutable_root_effects = "none"
+target_owner = "bins/eliot private legacy_governor_config"
+disposition = "FROZEN_PRIVATE_DECODER"
+transform_verifier = "exact copy; verifier: wrapper-level collision test (exact case)"
+expiry = "T7-S9"
+rollback_boundary = "revert S1 commit"
+cutover_receipt = "S1 commit (no dual-read)"
+
+[[object]]
+qualified_symbol = "legacy_governor_config::require_non_empty + same_loopback_port + loopback_port + default_surreal_* + Default impls"
+source = "crates/eliot-types/src/config.rs:296-394@a597e763"
+construction_callers = "internal to validate/collision/serde defaults; defaults: SCHEMA_VERSION 1, watchdog 2000, enable_min_edges 500, delegation 12/5/4/3/0.80/12/true/true/true, provider WindowsCredentialManager, credential_id surreal-runtime/local-dev, password_file %LOCALAPPDATA%/Eliot/secrets/surreal_root_password.txt"
+cargo_edges = "none"
+wire_schema = "loopback_port parses 127.0.0.1:<port> and ws://127.0.0.1:<port>[/rpc] case-insensitively"
+mutable_root_effects = "none"
+target_owner = "bins/eliot private legacy_governor_config"
+disposition = "FROZEN_PRIVATE_DECODER"
+transform_verifier = "exact copy; verifier: defaults test asserts every default value"
+expiry = "T7-S9"
+rollback_boundary = "revert S1 commit"
+cutover_receipt = "S1 commit (no dual-read)"
+
+# ---------------------------------------------------------------------------
+# Gate glue (retained in main.rs, unchanged semantics)
+# ---------------------------------------------------------------------------
+
+[[object]]
+qualified_symbol = "bins::eliot::classify_legacy_governor_process_state"
+source = "bins/eliot/src/main.rs:612-618@a597e763 (post-S1 615-621; same body)"
+construction_callers = "called by observe_legacy_governor_config + revalidate_legacy_governor_gate + all 4 downstream callers transitively; unit-tested directly"
+cargo_edges = "normal: none (pure); dev: none; build: none; feature: none"
+wire_schema = "no wire; Ok(false)=>pass, Ok(true)=>\"legacy eliot-governor.exe is running\", Err=>\"legacy Governor process state is unknown: {error}\""
+mutable_root_effects = "none; pure classifier"
+target_owner = "bins/eliot canary gate glue (retained)"
+disposition = "RETAIN_GLUE"
+transform_verifier = "no transform; verifier: retained test legacy_governor_pre_gate_rejects_present_and_unknown_process_state (untouched)"
+expiry = "T7-S9 (removed only with the whole legacy gate)"
+rollback_boundary = "revert S1 commit"
+cutover_receipt = "none-yet (gate retained)"
+
+[[object]]
+qualified_symbol = "bins::eliot::observe_legacy_governor_config"
+source = "bins/eliot/src/main.rs:620-658@a597e763 (post-S1 624-661; same body except GovernorConfig now resolves to legacy_governor_config::GovernorConfig)"
+construction_callers = "load_manifest_bound_canary_binding:802@base (805 post-S1); validate_installation_runtime_preflight:1840@base (1843 post-S1); revalidate None-path re-observes"
+cargo_edges = "normal: eliot-platform-windows observe_current_user_config + verify_stable + is_eliot_governor_running, eliot-runtime-contracts RUNTIME_LIVE_STORE_*, toml, anyhow; dev/build/feature: none"
+wire_schema = "Absent=>None(provisional); Present=>UTF-8/malformed/invalid/collides/changed-during-validation mapping preserved incl. non-retained error strings"
+mutable_root_effects = "read-only retained-file observation + process probe; no writer/DB/child/credential use"
+target_owner = "bins/eliot canary gate glue (retained)"
+disposition = "RETAIN_GLUE"
+transform_verifier = "only import retargeted; verifier: cargo check + decoder unit tests + git diff shows gate body unchanged"
+expiry = "T7-S9"
+rollback_boundary = "revert S1 commit"
+cutover_receipt = "none-yet (gate retained)"
+
+[[object]]
+qualified_symbol = "bins::eliot::revalidate_legacy_governor_gate"
+source = "bins/eliot/src/main.rs:660-698@a597e763 (post-S1 664-701; same body except GovernorConfig retarget + retained error strings)"
+construction_callers = "revalidate_manifest_bound_canary_binding:943@base (946 post-S1); InstallationRuntimePreflightGuard::revalidate:1749@base (1752 post-S1)"
+cargo_edges = "normal: same platform edges as observe; dev/build/feature: none"
+wire_schema = "Some=>retained UTF-8/malformed/invalid/collides/changed mapping (retained... strings); None=>provisional re-observe comment preserved"
+mutable_root_effects = "read-only revalidation; no writer/DB/child/credential use"
+target_owner = "bins/eliot canary gate glue (retained)"
+disposition = "RETAIN_GLUE"
+transform_verifier = "only import retargeted; verifier: cargo check + decoder tests; Some vs None paths are OS-fixture-bound (see deferred)"
+expiry = "T7-S9"
+rollback_boundary = "revert S1 commit"
+cutover_receipt = "none-yet (gate retained)"
+
+# Callers (unchanged; recorded for S1 traceability)
+[[object]]
+qualified_symbol = "caller load_manifest_bound_canary_binding::observe_legacy_governor_config"
+source = "bins/eliot/src/main.rs:802@a597e763 (805 post-S1)"
+construction_callers = "manifest-bound canary load path retains Option<LocalAppDataConfigRead> into binding.legacy_config"
+cargo_edges = "unchanged"
+wire_schema = "passes retained read downstream to revalidate_manifest_bound_canary_binding"
+mutable_root_effects = "read-only; no new effects"
+target_owner = "bins/eliot canary path (unchanged)"
+disposition = "RETAIN_GLUE"
+transform_verifier = "no transform; verifier: git diff shows caller line unchanged"
+expiry = "T7-S9"
+rollback_boundary = "revert S1 commit"
+cutover_receipt = "none-yet"
+
+[[object]]
+qualified_symbol = "caller revalidate_manifest_bound_canary_binding::revalidate_legacy_governor_gate"
+source = "bins/eliot/src/main.rs:943@a597e763 (946 post-S1)"
+construction_callers = "post-canary + post-pending revalidation with binding.legacy_config.as_ref()"
+cargo_edges = "unchanged"
+wire_schema = "Some vs None paths preserved"
+mutable_root_effects = "read-only"
+target_owner = "bins/eliot canary path (unchanged)"
+disposition = "RETAIN_GLUE"
+transform_verifier = "no transform; verifier: git diff shows caller line unchanged"
+expiry = "T7-S9"
+rollback_boundary = "revert S1 commit"
+cutover_receipt = "none-yet"
+
+[[object]]
+qualified_symbol = "caller InstallationRuntimePreflightGuard::revalidate::revalidate_legacy_governor_gate"
+source = "bins/eliot/src/main.rs:1749@a597e763 (1752 post-S1)"
+construction_callers = "installation effects revalidation with self.legacy_config.as_ref()"
+cargo_edges = "unchanged"
+wire_schema = "retained-gate revalidation"
+mutable_root_effects = "read-only"
+target_owner = "bins/eliot installation preflight (unchanged)"
+disposition = "RETAIN_GLUE"
+transform_verifier = "no transform; verifier: git diff shows caller line unchanged"
+expiry = "T7-S9"
+rollback_boundary = "revert S1 commit"
+cutover_receipt = "none-yet"
+
+[[object]]
+qualified_symbol = "caller validate_installation_runtime_preflight::observe_legacy_governor_config"
+source = "bins/eliot/src/main.rs:1840@a597e763 (1843 post-S1)"
+construction_callers = "installation preflight retains legacy_config into InstallationRuntimePreflightGuard"
+cargo_edges = "unchanged"
+wire_schema = "fresh observation before effects"
+mutable_root_effects = "read-only"
+target_owner = "bins/eliot installation preflight (unchanged)"
+disposition = "RETAIN_GLUE"
+transform_verifier = "no transform; verifier: git diff shows caller line unchanged"
+expiry = "T7-S9"
+rollback_boundary = "revert S1 commit"
+cutover_receipt = "none-yet"
+
+# Platform edges (read-only; no writer/DB/child/credentials)
+[[object]]
+qualified_symbol = "eliot_platform_windows::observe_current_user_config"
+source = "crates/kernel/eliot-platform-windows/src/lib.rs:565@a597e763"
+construction_callers = "observe_legacy_governor_config only (INSTALLATION_INPUT_LIMIT bound)"
+cargo_edges = "normal: eliot-platform-windows (workspace, no features in bins/eliot); dev/build/feature: none"
+wire_schema = "OS known-folder LocalAppData/Eliot/config/governor.toml retained read; Absent is provisional"
+mutable_root_effects = "read-only retained-file observation; no writer/DB/child; no credentials"
+target_owner = "platform (unchanged; S1 does not wrap or duplicate)"
+disposition = "RETAIN_READ_ONLY_EDGE"
+transform_verifier = "no transform; verifier: gate body unchanged in git diff"
+expiry = "T7-S9"
+rollback_boundary = "revert S1 commit"
+cutover_receipt = "none-yet"
+
+[[object]]
+qualified_symbol = "eliot_platform_windows::LocalAppDataConfigRead::verify_stable"
+source = "crates/kernel/eliot-platform-windows/src/lib.rs:527@a597e763"
+construction_callers = "observe + revalidate paths map failure to changed-during-validation strings"
+cargo_edges = "unchanged"
+wire_schema = "same-handle re-read identity/size/hash check"
+mutable_root_effects = "read-only stability proof; no mutation"
+target_owner = "platform (unchanged)"
+disposition = "RETAIN_READ_ONLY_EDGE"
+transform_verifier = "no transform; OS-fixture-bound (see deferred)"
+expiry = "T7-S9"
+rollback_boundary = "revert S1 commit"
+cutover_receipt = "none-yet"
+
+[[object]]
+qualified_symbol = "eliot_platform_windows::is_eliot_governor_running"
+source = "crates/kernel/eliot-platform-windows/src/lib.rs:2623@a597e763"
+construction_callers = "observe + revalidate paths via classify_legacy_governor_process_state"
+cargo_edges = "unchanged"
+wire_schema = "process probe => Result<bool, _>; unknown maps to reject"
+mutable_root_effects = "read-only process observation; infers nothing from PID/name alone per bins AGENTS.md (gate only fails closed on positive/unknown)"
+target_owner = "platform (unchanged)"
+disposition = "RETAIN_READ_ONLY_EDGE"
+transform_verifier = "no transform; verifier: retained classify unit test"
+expiry = "T7-S9"
+rollback_boundary = "revert S1 commit"
+cutover_receipt = "none-yet"
+
+# Cargo edges
+[[object]]
+qualified_symbol = "cargo-edge bins/eliot -> eliot-types"
+source = "bins/eliot/Cargo.toml:31@a597e763 (eliot-types.workspace = true)"
+construction_callers = "only the two canary TOML decodes (main.rs:628,668@base) consumed eliot_types::GovernorConfig; verified by git grep at base (3 hits: import + 2 constructions) and zero second consumer"
+cargo_edges = "normal edge removed in S1; dev: eliot-types was never a dev-dependency of bins/eliot; build: none; feature: none (plain workspace=true, no features)"
+wire_schema = "compile-time dependency edge only; no runtime wire"
+mutable_root_effects = "none (manifest-only)"
+target_owner = "bins/eliot manifest + Cargo.lock edge (S1 writer); final 4-package removal stays S9 integrator-owned"
+disposition = "REMOVE_AFTER_S1"
+transform_verifier = "verifier: git diff bins/eliot/Cargo.toml removes exactly line 31; cargo tree -p eliot --depth 1 shows no eliot-types; git grep eliot_types zero hits + one eliot-types provenance doc hit at legacy_governor_config.rs:5 (allowed); cargo check exit 0 and cargo check --locked exit 0 (lock edge deletion included here per T7.md:105 build-closed)"
+expiry = "removed in S1 commit"
+rollback_boundary = "revert S1 commit restores line 31"
+cutover_receipt = "S1 commit (edge removal incl. Cargo.lock -\"eliot-types\" under name = \"eliot\" deps per T7.md:105 build-closed; final 4-package removal stays S9 integrator-owned)"
+
+[[object]]
+qualified_symbol = "cargo-edges bins/eliot remaining (no feature-gated consumer proof)"
+source = "bins/eliot/Cargo.toml post-S1 (49 lines): anyhow/clap/eliot-*/serde/serde_json/toml/sha2/thiserror/tokio/tracing/tracing-subscriber/windows-sys + dev eliot-installation[test-support]/tempfile"
+construction_callers = "private decoder uses only serde + toml + thiserror (all retained); gate uses anyhow + eliot-platform-windows + eliot-runtime-contracts (all retained)"
+cargo_edges = "normal: no features except windows-sys Win32_Foundation + Win32_Storage_FileSystem (pre-existing, unrelated to config); dev: eliot-installation test-support + tempfile (test-only); build: none; feature: no feature-gated eliot-types consumer exists (edge removed)"
+wire_schema = "manifest edges only"
+mutable_root_effects = "none"
+target_owner = "bins/eliot manifest (S1 writer)"
+disposition = "RETAIN (decoder-required deps kept: toml/serde/anyhow/eliot-platform-windows/eliot-runtime-contracts)"
+transform_verifier = "verifier: cargo tree -p eliot --depth 1 (no eliot-types, decoder deps present) + cargo check exit 0"
+expiry = "n/a (standing manifest)"
+rollback_boundary = "revert S1 commit"
+cutover_receipt = "n/a"
+
+# Denominator: every other eliot-types module has NO S1 disposition (UNRESOLVED).
+# Source: crates/eliot-types/src/lib.rs pub mod list (lines 3-38) + lib.rs SHA above.
+# S1 disposes ONLY the Governor-config slice of config + error::ConfigError + service::CredentialProviderKind.
+[[denominator]]
+module = "eliot_types::adapter"
+source = "crates/eliot-types/src/lib.rs:3 + adapter.rs@a597e763"
+disposition = "UNRESOLVED"
+note = "no S1 consumer in bins/eliot; no S1 transform; deferred to later T7 slices"
+
+[[denominator]]
+module = "eliot_types::antigravity"
+source = "crates/eliot-types/src/lib.rs:4 + antigravity.rs@a597e763"
+disposition = "UNRESOLVED"
+note = "no S1 consumer in bins/eliot; deferred"
+
+[[denominator]]
+module = "eliot_types::antigravity_persistent"
+source = "crates/eliot-types/src/lib.rs:5 + antigravity_persistent.rs@a597e763"
+disposition = "UNRESOLVED"
+note = "no S1 consumer in bins/eliot; deferred"
+
+[[denominator]]
+module = "eliot_types::cognition"
+source = "crates/eliot-types/src/lib.rs:6 + cognition.rs@a597e763"
+disposition = "UNRESOLVED"
+note = "no S1 consumer in bins/eliot; deferred"
+
+[[denominator]]
+module = "eliot_types::cognitive_field"
+source = "crates/eliot-types/src/lib.rs:7 + cognitive_field.rs@a597e763"
+disposition = "UNRESOLVED"
+note = "no S1 consumer in bins/eliot; deferred"
+
+[[denominator]]
+module = "eliot_types::cognitive_run"
+source = "crates/eliot-types/src/lib.rs:8 + cognitive_run.rs@a597e763"
+disposition = "UNRESOLVED"
+note = "no S1 consumer in bins/eliot; deferred"
+
+[[denominator]]
+module = "eliot_types::config (non-Governor-slice exports)"
+source = "crates/eliot-types/src/lib.rs:9 + config.rs@a597e763"
+disposition = "PARTIAL_S1 (Governor slice frozen; any other config export is UNRESOLVED)"
+note = "S1 freezes exactly the 13 Governor DTOs listed above; nothing else in config.rs is claimed"
+
+[[denominator]]
+module = "eliot_types::delegation"
+source = "crates/eliot-types/src/lib.rs:10 + delegation.rs@a597e763"
+disposition = "UNRESOLVED"
+note = "no S1 consumer in bins/eliot; deferred"
+
+[[denominator]]
+module = "eliot_types::delegation_calibration"
+source = "crates/eliot-types/src/lib.rs:11 + delegation_calibration.rs@a597e763"
+disposition = "UNRESOLVED"
+note = "no S1 consumer in bins/eliot; deferred"
+
+[[denominator]]
+module = "eliot_types::distillation"
+source = "crates/eliot-types/src/lib.rs:12 + distillation.rs@a597e763"
+disposition = "UNRESOLVED"
+note = "no S1 consumer in bins/eliot; deferred"
+
+[[denominator]]
+module = "eliot_types::error (non-ConfigError exports)"
+source = "crates/eliot-types/src/lib.rs:13 + error.rs@a597e763"
+disposition = "PARTIAL_S1 (ConfigError frozen; any other error export is UNRESOLVED)"
+note = "error.rs at base contains only ConfigError; recorded for completeness"
+
+[[denominator]]
+module = "eliot_types::eval"
+source = "crates/eliot-types/src/lib.rs:14 + eval.rs@a597e763"
+disposition = "UNRESOLVED"
+note = "no S1 consumer in bins/eliot; deferred"
+
+[[denominator]]
+module = "eliot_types::external_agent"
+source = "crates/eliot-types/src/lib.rs:15 + external_agent.rs@a597e763"
+disposition = "UNRESOLVED"
+note = "no S1 consumer in bins/eliot; deferred"
+
+[[denominator]]
+module = "eliot_types::external_review"
+source = "crates/eliot-types/src/lib.rs:16 + external_review.rs@a597e763"
+disposition = "UNRESOLVED"
+note = "no S1 consumer in bins/eliot; deferred"
+
+[[denominator]]
+module = "eliot_types::health"
+source = "crates/eliot-types/src/lib.rs:17 + health.rs@a597e763"
+disposition = "UNRESOLVED"
+note = "no S1 consumer in bins/eliot; deferred"
+
+[[denominator]]
+module = "eliot_types::host"
+source = "crates/eliot-types/src/lib.rs:18 + host.rs@a597e763"
+disposition = "UNRESOLVED"
+note = "no S1 consumer in bins/eliot; deferred"
+
+[[denominator]]
+module = "eliot_types::ids"
+source = "crates/eliot-types/src/lib.rs:19 + ids.rs@a597e763"
+disposition = "UNRESOLVED"
+note = "no S1 consumer in bins/eliot; deferred"
+
+[[denominator]]
+module = "eliot_types::lifecycle"
+source = "crates/eliot-types/src/lib.rs:20 + lifecycle.rs@a597e763"
+disposition = "UNRESOLVED"
+note = "no S1 consumer in bins/eliot; deferred"
+
+[[denominator]]
+module = "eliot_types::mcp_contract"
+source = "crates/eliot-types/src/lib.rs:21 + mcp_contract.rs@a597e763"
+disposition = "UNRESOLVED"
+note = "no S1 consumer in bins/eliot; deferred"
+
+[[denominator]]
+module = "eliot_types::memory"
+source = "crates/eliot-types/src/lib.rs:22 + memory.rs@a597e763"
+disposition = "UNRESOLVED"
+note = "no S1 consumer in bins/eliot; deferred"
+
+[[denominator]]
+module = "eliot_types::metrics"
+source = "crates/eliot-types/src/lib.rs:23 + metrics.rs@a597e763"
+disposition = "UNRESOLVED"
+note = "no S1 consumer in bins/eliot; deferred"
+
+[[denominator]]
+module = "eliot_types::observability"
+source = "crates/eliot-types/src/lib.rs:24 + observability.rs@a597e763"
+disposition = "UNRESOLVED"
+note = "no S1 consumer in bins/eliot; deferred"
+
+[[denominator]]
+module = "eliot_types::project_understanding"
+source = "crates/eliot-types/src/lib.rs:25 + project_understanding.rs@a597e763"
+disposition = "UNRESOLVED"
+note = "no S1 consumer in bins/eliot; deferred"
+
+[[denominator]]
+module = "eliot_types::provider_invocation"
+source = "crates/eliot-types/src/lib.rs:26 + provider_invocation.rs@a597e763"
+disposition = "UNRESOLVED"
+note = "no S1 consumer in bins/eliot; deferred"
+
+[[denominator]]
+module = "eliot_types::records"
+source = "crates/eliot-types/src/lib.rs:27 + records.rs@a597e763"
+disposition = "UNRESOLVED"
+note = "no S1 consumer in bins/eliot; deferred"
+
+[[denominator]]
+module = "eliot_types::replay"
+source = "crates/eliot-types/src/lib.rs:28 + replay.rs@a597e763"
+disposition = "UNRESOLVED"
+note = "no S1 consumer in bins/eliot; deferred"
+
+[[denominator]]
+module = "eliot_types::runtime"
+source = "crates/eliot-types/src/lib.rs:29 + runtime.rs@a597e763"
+disposition = "UNRESOLVED"
+note = "no S1 consumer in bins/eliot; deferred"
+
+[[denominator]]
+module = "eliot_types::runtime_supervision"
+source = "crates/eliot-types/src/lib.rs:30 + runtime_supervision.rs@a597e763"
+disposition = "UNRESOLVED"
+note = "no S1 consumer in bins/eliot; deferred"
+
+[[denominator]]
+module = "eliot_types::safety"
+source = "crates/eliot-types/src/lib.rs:31 + safety.rs@a597e763"
+disposition = "UNRESOLVED"
+note = "no S1 consumer in bins/eliot; deferred"
+
+[[denominator]]
+module = "eliot_types::secret_boundary"
+source = "crates/eliot-types/src/lib.rs:32 + secret_boundary.rs@a597e763"
+disposition = "UNRESOLVED"
+note = "no S1 consumer in bins/eliot; deferred"
+
+[[denominator]]
+module = "eliot_types::semantic_memory"
+source = "crates/eliot-types/src/lib.rs:33 + semantic_memory.rs@a597e763"
+disposition = "UNRESOLVED"
+note = "no S1 consumer in bins/eliot; deferred"
+
+[[denominator]]
+module = "eliot_types::service (non-CredentialProviderKind exports)"
+source = "crates/eliot-types/src/lib.rs:34 + service.rs@a597e763"
+disposition = "PARTIAL_S1 (CredentialProviderKind frozen; all other service exports UNRESOLVED)"
+note = "S1 claims only the provider-KIND enum; WindowsServiceConfig/IpcConfig/CredentialRef/etc. are explicitly UNRESOLVED"
+
+[[denominator]]
+module = "eliot_types::skill"
+source = "crates/eliot-types/src/lib.rs:35 + skill.rs@a597e763"
+disposition = "UNRESOLVED"
+note = "no S1 consumer in bins/eliot; deferred"
+
+[[denominator]]
+module = "eliot_types::task_execution"
+source = "crates/eliot-types/src/lib.rs:36 + task_execution.rs@a597e763"
+disposition = "UNRESOLVED"
+note = "no S1 consumer in bins/eliot; deferred"
+
+[[denominator]]
+module = "eliot_types::ul"
+source = "crates/eliot-types/src/lib.rs:37 (ul/*)@a597e763"
+disposition = "UNRESOLVED"
+note = "no S1 consumer in bins/eliot; deferred"
+
+[[denominator]]
+module = "eliot_types::verification"
+source = "crates/eliot-types/src/lib.rs:38 + verification.rs@a597e763"
+disposition = "UNRESOLVED"
+note = "no S1 consumer in bins/eliot; deferred"
+
+[denominator_verifier]
+method = "pinned/current-delta source + Cargo metadata census per T7 S1 Implementation"
+commands = ["git grep -n eliot_types|eliot-types -- bins/eliot/ (zero hits post-S1)", "cargo tree -p eliot --depth 1 (no eliot-types)", "cargo check -p eliot --all-targets exit 0"]
+result = "bins/eliot consumes no eliot-types export of any kind post-S1; every non-S1 export is therefore UNRESOLVED by construction, not implicitly retired"
+policy = "no export is implicitly retired (I19-16); UNRESOLVED rows above are the denominator"
+
+[deferred]
+unit_covered = ["absent=>pass shape is a platform-observation property (Absent=>None) covered by gate body review, not a decoder unit test", "valid non-colliding incl. defaults (covered)", "collision exact + loopback-port + bind-only with collides prefix (covered)", "malformed vs invalid split (covered)", "invalid variants schema/empty/watchdog/bind/endpoint/storage/capability/provider (covered)", "classify process unknown/present (retained test, untouched)"]
+integration_deferred = ["stable-violation (verify_stable failure) rejection: requires a real retained OS handle that changes mid-validation; not simulable without fakes/mocks (forbidden); gate string mapping verified by code review only", "unknown observation (observe_current_user_config Err) rejection: requires a real OS known-folder/ACL failure; same constraint", "revalidate Some vs None paths end-to-end: require a real %LOCALAPPDATA%/Eliot retained config + canary binding; covered only by gate body preservation + decoder unit tests", "live Governor running/unknown process end-to-end: requires a real eliot-governor.exe probe; covered only by retained classify unit test"]
+fuzzing = "no new fuzzing framework per T7-S1 acceptance (explicit non-goal)"

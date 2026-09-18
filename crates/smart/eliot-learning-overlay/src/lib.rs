@@ -3,13 +3,18 @@
 //! This crate consumes an immutable A-32 state view and an exact set of
 //! externally admitted-for-evaluation A-32 delta candidates. It never admits,
 //! activates, delivers, evaluates, persists, or promotes an overlay. The
-//! supported prototype only changes deterministic verification ordering and
+//! supported composer only changes deterministic verification ordering and
 //! search/probe stopping surfaces; broader protected-owner evidence remains an
-//! integration gap because the current A-32 contracts do not carry those fields.
-//! The two supported surface labels are A-32 enum values; they do not prove a
-//! target-to-surface schema or protected payload. Protected-surface digests in
-//! the input are caller-supplied equality assertions, not recomputed policy
-//! evidence.
+//! integration gap because the current A-32 contracts do not carry those fields
+//! (no objective/acceptance/evaluator/authority/privacy/cost payload, no
+//! per-change lineage/shadow/precedence record, no target-edge dependency
+//! graph). The two supported surface labels are A-32 enum values; they do not
+//! prove a target-to-surface schema or protected payload. Protected-surface
+//! digests in the input are caller-supplied equality assertions, not recomputed
+//! policy evidence. The composer therefore enforces the boundary contract-only:
+//! unsupported surfaces fail as `Unsupported`, scope/fence/admission drift
+//! fails as `Contract`, same-target divergence fails as `Conflict`, and every
+//! emitted change carries an exact inverse proven by [`remove_overlay`].
 
 #![forbid(unsafe_code)]
 
@@ -17,6 +22,7 @@ mod base;
 mod bounds;
 mod changes;
 mod compose;
+mod remove;
 
 use eliot_contracts::{ArtifactId, TaskRevision};
 use eliot_learning_contracts::{
@@ -26,6 +32,9 @@ use eliot_learning_contracts::{
 use thiserror::Error;
 
 pub use compose::compose_campaign_harness_overlay;
+pub use remove::{
+    overlay_base_states, overlay_inverse_operations, overlay_proposed_states, remove_overlay,
+};
 
 /// Maximum delta candidates in one pure composition.
 pub const MAX_DELTAS: usize = 128;

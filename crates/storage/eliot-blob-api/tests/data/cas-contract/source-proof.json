@@ -1,0 +1,1 @@
+{"forbidden_markers":["std::fs","std::io::Read","std::net","std::process","std::thread","std::sync","tokio","Mutex","RwLock","OnceLock","OpenOptions","File::open","mmap","flock","fsync","compare_exchange","AtomicU","spawn","try_lock",".lock()","retry(","process::exit","CreateFile","unsafe {","todo!","unimplemented!"],"source_file":"crates/storage/eliot-blob-api/src/lib.rs"}

@@ -1,0 +1,34 @@
+{
+  "schema": "watchdog_publication_service_timing_diagnostics.v1",
+  "description": "Focused fixture for item 979 (Implements, never Closes): watchdog-side publication/service/timing diagnostic vocabulary, bounds, and redaction canaries. Host-side bins/eliot-host files stay for a follow-up after the SHIM wave.",
+  "expected_publication_observations": ["requested", "observed", "absent", "stale", "conflicting"],
+  "expected_service_observations": ["requested", "observed", "absent", "mismatched", "unknown"],
+  "expected_timing_outcomes": ["requested", "admitted", "timeout", "registration_mismatched", "registration_absent", "service_stopped", "service_stopping", "current_unavailable"],
+  "expected_host_observations": ["running", "absent_or_stopped", "pid_reused", "image_substituted", "identity_changed", "unknown"],
+  "bounds": {
+    "field_bytes": 256,
+    "detail_bytes": 1024,
+    "capture_bytes_max": 32768
+  },
+  "timing": {
+    "deadline_ms": 30,
+    "one_over_advance_ms": 30,
+    "unknown_deadline_ms": 100,
+    "production_deadline_ms": 30000
+  },
+  "canaries": [
+    "SUPER-SECRET-LEASE-CANARY-979",
+    "NONCE-CANARY-979-abc123",
+    "C:\\Secret\\canary-979\\host.exe",
+    "BEGIN PRIVATE KEY CANARY 979"
+  ],
+  "sink": {
+    "event_log_unavailable": true,
+    "note": "Windows Event Log stays unavailable per #984; no Event Log FFI is acquired. Sink drop/failure must leave return/state/cursor identical."
+  },
+  "residuals": [
+    "host-side bins/eliot-host/src/watchdog_* files (follow-up after SHIM wave)",
+    "remaining matrix cases from #979 (12-case host matrix stays host-side)",
+    "live SCM proof (fake SCM clocks prove code behavior only, not actual Windows service readiness)"
+  ]
+}

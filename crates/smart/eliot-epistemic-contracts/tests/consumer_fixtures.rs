@@ -3,8 +3,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_contracts::{
-    ArtifactId, AuthorityEpoch, OperationId, ProductId, ReceiptId, RequestId, ResourceGeneration,
-    SourceId, StateFence, TaskId, TaskRevision, sha256_hex,
+    ArtifactId, EpochId, EpochLineageId, OperationId, ProductId, ReceiptId, RequestId,
+    ResourceGeneration, SourceId, StateFence, TaskId, TaskRevision, sha256_hex,
 };
 use eliot_epistemic_contracts::{
     AdmittedKind, AdmittedReceipt, AdmittedReceiptParams, AssumptionRecord, AssumptionRecordParams,
@@ -23,8 +23,17 @@ type FixtureResult = Result<(), Box<dyn std::error::Error>>;
 fn digest(seed: &str) -> String {
     sha256_hex(seed.as_bytes())
 }
+const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+#[allow(clippy::expect_used)]
+fn test_epoch(sequence: u64) -> EpochId {
+    EpochId::new(
+        EpochLineageId::new(TEST_LINEAGE_A).expect("valid test lineage"),
+        std::num::NonZeroU64::new(sequence).expect("nonzero test sequence"),
+    )
+    .expect("valid test epoch")
+}
 fn fence() -> StateFence {
-    StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+    StateFence::new(test_epoch(1), ResourceGeneration::genesis())
 }
 fn work_scope() -> Result<WorkScope, Box<dyn std::error::Error>> {
     Ok(WorkScope {

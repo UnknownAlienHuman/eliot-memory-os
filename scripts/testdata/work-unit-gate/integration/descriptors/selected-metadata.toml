@@ -1,0 +1,17 @@
+schema_version = "eliot-work-unit-descriptor-v2"
+identity = {value = "work-unit-849"}
+issue = {repository = {owner = "UnknownAlienHuman", name = "eliot-memory-os"}, number = 849}
+unit = {value = "A-1"}
+mode = "metadata-python"
+source_roots = [{value = "scripts/testdata/work-unit-gate/integration/repos/metadata-tiny/check.py"}]
+test_roots = [{value = "scripts/testdata/work-unit-gate/integration/repos/metadata-tiny/check.py"}]
+matrix_cases = 2
+proof_ceiling = {value = "package-local"}
+revision = 1
+body_sha256 = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+matrix_sha256 = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+require_workspace_member = false
+package = {name = "wu837_meta"}
+module = {value = "integration.metadata_tiny.check"}
+requirements = {source_floor = 1, public_floor = 0, test_floor = 2, required_guards = [{value = "bounded"}]}
+bounds = {wall_ms = 10000, idle_ms = 5000, output_bytes = 65536, line_bytes = 4096, discovery_tests = 1000, child_processes = 4}

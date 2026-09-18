@@ -432,6 +432,20 @@ pub(crate) fn bounded_serialized_len<T: Serialize>(
     Ok(counter.count)
 }
 
+/// Check that one reference collection carries no repeated identity.
+pub(crate) fn ensure_unique_refs(
+    ids: &[eliot_contracts::ArtifactId],
+    field: &'static str,
+) -> Result<(), ActivationAssessmentError> {
+    let mut seen = std::collections::BTreeSet::new();
+    for id in ids {
+        if !seen.insert(id.as_str()) {
+            return Err(ActivationAssessmentError::Duplicate { field });
+        }
+    }
+    Ok(())
+}
+
 /// Check operation-level cardinalities and complete retained-input accounting.
 pub(crate) fn preflight(input: &AssessmentInput<'_>) -> Result<(), ActivationAssessmentError> {
     if input.stages.len() > MAX_STAGES {
@@ -458,6 +472,9 @@ pub(crate) fn preflight(input: &AssessmentInput<'_>) -> Result<(), ActivationAss
             field: "references",
         });
     }
+    ensure_unique_refs(input.attrition, "attrition")?;
+    ensure_unique_refs(input.confounders, "confounders")?;
+    ensure_unique_refs(input.external_review_refs, "external_review_refs")?;
     input
         .policy
         .validate_shape()

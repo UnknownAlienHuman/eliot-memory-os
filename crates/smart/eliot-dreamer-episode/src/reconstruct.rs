@@ -312,7 +312,7 @@ fn finalize_candidate(
 struct WholeInputPreimage<'a> {
     version: u8,
     item: &'a ValidatedCurationItem,
-    job: &'a eliot_dreamer_contracts::DreamJobInput,
+    job: &'a eliot_dreamer_contracts::DreamJobAdmission,
     bundle: &'a eliot_dreamer_contracts::DreamInputBundle,
     receipt: &'a eliot_dreamer_contracts::ValidationReceipt,
     screen: &'a eliot_dreamer_contracts::ScreenBinding,

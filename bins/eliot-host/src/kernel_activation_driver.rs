@@ -8,6 +8,37 @@ use super::{
     record_fence, sha256_json,
 };
 
+// F-LOG-HOST-3 (#978) Kernel-activation observation helpers.
+//
+// Through the #889 facade only
+// (`super::host_diagnostics::observe_entrypoint_with_detail`); the Event Log
+// seam stays typed-Unavailable
+// (`super::windows_event_log::event_log_sink_status`), never implemented here
+// (#984 still open). No terminal is owned here: the single terminal for a
+// failed activation stays with the outermost #891 contour (e.g.
+// `host-start-failed` / `host-resume-pending-failed` in `lib.rs`); nonce,
+// handshake, auth, activation, and readiness correlate by stage order only.
+// This coordinates the "one terminal across nesting" rule with #891.
+//
+// Observation-only contract: every helper projects facts already produced by
+// the semantic owner. Arguments are static literals only — never nonces,
+// digests, operation ids, pipe identities, evidence refs, or arbitrary error
+// text — so bounding limits size, not sensitivity (I15.4). Sink outcome never
+// alters result/order/status/cleanup. There is no mutable global dedup cache.
+#[cfg(windows)]
+fn kernel_activation_note_event_log_unavailable() {
+    let _ = super::windows_event_log::event_log_sink_status();
+}
+
+#[cfg(windows)]
+fn kernel_activation_observe(detail: &str) {
+    kernel_activation_note_event_log_unavailable();
+    super::host_diagnostics::observe_entrypoint_with_detail(
+        super::host_diagnostics::EntrypointStage::Startup,
+        detail,
+    );
+}
+
 #[cfg(windows)]
 pub(super) struct DurableKernelActivationDriver<'a, B: JournalBackend> {
     journal: &'a HostStateJournalService<B>,
@@ -18,6 +49,9 @@ pub(super) struct DurableKernelActivationDriver<'a, B: JournalBackend> {
 #[cfg(windows)]
 impl<'a, B: JournalBackend> DurableKernelActivationDriver<'a, B> {
     pub(super) fn resume(journal: &'a HostStateJournalService<B>, current: KernelRecord) -> Self {
+        // WORK_UNIT_CASE: 978/10 — resume correlates by stage order only;
+        // no terminal here, the outermost #891 contour owns it.
+        kernel_activation_observe("host.kernel-activation resume requested");
         Self {
             journal,
             current,
@@ -41,6 +75,9 @@ impl<'a, B: JournalBackend> DurableKernelActivationDriver<'a, B> {
         kernel_generation: EpochTransition,
         process: ServiceProcessRecord,
     ) -> Result<Self, HostError> {
+        // WORK_UNIT_CASE: 978/7 — candidate bind requested; handshake/auth
+        // material is distinct from nonce/activation, no secrets observed.
+        kernel_activation_observe("host.kernel-activation bind requested");
         let current = KernelRecord {
             fence: record_fence(host, activation_id, activation_generation),
             operation: operation("kernel-candidate-shadow")?,
@@ -61,6 +98,9 @@ impl<'a, B: JournalBackend> DurableKernelActivationDriver<'a, B> {
             ],
         };
         append_reconciled(journal, HostStateRecord::Kernel(current.clone()))?;
+        // WORK_UNIT_CASE: 978/7 — candidate observed; still distinct from
+        // nonce issuance and activation below.
+        kernel_activation_observe("host.kernel-activation candidate observed");
         Ok(Self {
             journal,
             current,
@@ -106,6 +146,9 @@ impl<'a, B: JournalBackend> DurableKernelActivationDriver<'a, B> {
         candidate: &HostKernelCandidateBinding,
         generation: ResourceGeneration,
     ) -> Result<KernelActivationPermit, HostError> {
+        // WORK_UNIT_CASE: 978/7 — nonce requested; the nonce value itself is
+        // never observed, only this static literal (no secrets).
+        kernel_activation_observe("host.kernel-activation nonce requested");
         if self.current.state != KernelActivationState::OldTerminated {
             return Err(HostError::ProcessContour(
                 "activation nonce cannot be issued before prior disposition commit".to_owned(),
@@ -131,17 +174,23 @@ impl<'a, B: JournalBackend> DurableKernelActivationDriver<'a, B> {
             journal_transaction_id: receipt.transaction_id().clone(),
             journal_sequence: receipt.sequence(),
             generation,
-            authority_epoch: candidate.kernel_epoch,
+            authority_epoch: candidate.kernel_epoch.clone(),
             activation_nonce: nonce,
         };
         permit
             .validate(candidate, generation)
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
         self.issued_permit = Some(permit.clone());
+        // WORK_UNIT_CASE: 978/7 — nonce issued distinctly from handshake/auth
+        // and activation; exact permit propagates unchanged.
+        kernel_activation_observe("host.kernel-activation nonce issued");
         Ok(permit)
     }
 
     pub(super) fn activating(&mut self) -> Result<(), HostError> {
+        // WORK_UNIT_CASE: 978/7 — activating requested; forbidden before the
+        // committed NonceIssued receipt, distinct from nonce issuance.
+        kernel_activation_observe("host.kernel-activation activating requested");
         if self.issued_permit.is_none() {
             return Err(HostError::ProcessContour(
                 "Activate is forbidden before a committed NonceIssued receipt".to_owned(),
@@ -161,6 +210,10 @@ impl<'a, B: JournalBackend> DurableKernelActivationDriver<'a, B> {
         activation_receipt: &KernelActivationReceipt,
         ready: &KernelReadyReceipt,
     ) -> Result<(), HostError> {
+        // WORK_UNIT_CASE: 978/8 — readiness requested; positive activation
+        // requires actual owner evidence (permit + receipts), never liveness
+        // alone.
+        kernel_activation_observe("host.kernel-activation readiness requested");
         let permit = self.issued_permit.as_ref().ok_or_else(|| {
             HostError::ProcessContour("active Kernel is missing its issued permit".to_owned())
         })?;
@@ -188,10 +241,19 @@ impl<'a, B: JournalBackend> DurableKernelActivationDriver<'a, B> {
             );
             Ok(())
         })?;
+        // WORK_UNIT_CASE: 978/7 — activation observed distinctly from nonce/
+        // handshake/auth; WORK_UNIT_CASE: 978/8 — readiness observed only on
+        // exact owner evidence above, exact errors propagate unchanged.
+        kernel_activation_observe("host.kernel-activation activation observed");
+        kernel_activation_observe("host.kernel-activation readiness observed");
         Ok(())
     }
 
     pub(super) fn fail(&mut self, evidence: &str) -> Result<(), HostError> {
+        // WORK_UNIT_CASE: 978/10 — failure observed without owning a terminal;
+        // the outermost #891 contour emits the single terminal. The evidence
+        // label stays owner-supplied; only this static literal is observed.
+        kernel_activation_observe("host.kernel-activation fail observed");
         if self.current.state == KernelActivationState::Failed {
             return Ok(());
         }

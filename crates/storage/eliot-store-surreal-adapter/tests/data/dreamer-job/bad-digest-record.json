@@ -1,0 +1,15 @@
+{
+  "namespace": "dreamer-job-v1",
+  "key": "job_probe_probe",
+  "state_fence": {
+    "authority_epoch": { "lineage_id": "550e8400-e29b-41d4-a716-446655440000", "sequence": 1 },
+    "resource_generation": 1,
+    "task_revision": null,
+    "policy_revision": null,
+    "integration_revision": null
+  },
+  "revision": 1,
+  "schema": "eliot.storage.dreamer-job.v1:ledger-record",
+  "payload": [1, 2, 3],
+  "value_digest": "0000000000000000000000000000000000000000000000000000000000000000"
+}

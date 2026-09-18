@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::io::{self, Write};
 
 const SERVICE_NAME: &str = "eliot-mod-research";

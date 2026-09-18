@@ -94,19 +94,6 @@ pub struct ServiceRuntimeStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct RuntimeStatusReport {
-    pub component: String,
-    pub mode: RuntimeMode,
-    pub pid: u32,
-    pub data_root: String,
-    pub active_profile: String,
-    pub single_instance_owned: bool,
-    pub ipc_enabled: bool,
-    pub services: Vec<ServiceRuntimeStatus>,
-    pub generated_at: OffsetDateTime,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeHealthReport {
     pub component: String,
     pub mode: RuntimeMode,

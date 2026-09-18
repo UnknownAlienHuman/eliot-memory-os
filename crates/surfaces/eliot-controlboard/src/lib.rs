@@ -5,21 +5,39 @@
 //! typed commands to the owners selected by composition. Missing G-11/I-12
 //! providers therefore remain an explicit `PLAN_GAP`; this crate never creates
 //! a caller-mintable substitute.
+//!
+//! Fixture disposition (#1213 MGR01 half): bounded reference fixture. The
+//! `eliot-cli` catalogue edge is severed to an inlined `PLAN_GAP` literal;
+//! the remaining reverse dependency is the `bins/eliotd` production daemon
+//! composition (`DaemonComposition::controlboard`) over production adapters
+//! (`bins/eliotd/src/controlboard_adapters.rs`). Full delete follows with the
+//! eliotd lane. This crate is frozen: no board extension, owner bindings, authority,
+//! or currentness is added here.
 
 #![forbid(unsafe_code)]
 
+mod swarm_command;
 mod swarm_read;
 
+pub use swarm_command::*;
 pub use swarm_read::*;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 
+use eliot_agent_coordinator::{HumanModelPreferencePolicy, ModelCatalogueSnapshot, ModelRole};
+use eliot_contracts::{OperationId, RequestMetadata, SessionId};
 use eliot_evaluation_contracts::ObjectiveStatus;
 use eliot_evidence::{EpistemicStatus, EvidenceFreshness};
 use eliot_observation_contracts::ObservationKind;
+use eliot_protocol::RequestIdentity;
 use eliot_receipts::ProofCeiling;
-use eliot_security_contracts::{EffectCeiling, PrivacyClass};
+pub use eliot_security_contracts::{EffectCeiling, PrivacyClass};
+use eliot_skill::{
+    DependencyVersion, LifecycleAction, SkillCandidate, SkillError, SkillLifecycleView, SkillScope,
+};
 use serde::{Deserialize, Deserializer, Serialize, de};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -66,41 +84,16 @@ impl<'de> Deserialize<'de> for ViewRevision {
     }
 }
 
-/// A state fence carried by every read and command boundary.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct StateFence {
-    /// Monotonic authority epoch from the owning state boundary.
-    pub authority_epoch: u64,
-    /// Revision at which this fence was observed.
-    pub revision: ViewRevision,
-    /// Opaque owner-issued fence identity.
-    pub fence_id: String,
-}
-
-impl StateFence {
-    /// Creates a validated fence; it does not grant authority.
-    pub fn new(
-        authority_epoch: u64,
-        revision: ViewRevision,
-        fence_id: impl Into<String>,
-    ) -> Result<Self, ControlBoardError> {
-        let fence = Self {
-            authority_epoch,
-            revision,
-            fence_id: fence_id.into(),
-        };
-        fence.validate()?;
-        Ok(fence)
-    }
-
-    fn validate(&self) -> Result<(), ControlBoardError> {
-        if self.authority_epoch == 0 {
-            return Err(ControlBoardError::InvalidField("authority_epoch"));
-        }
-        text(&self.fence_id, "fence_id")
-    }
-}
+/// Shared Governor state fence carried by every read and command boundary.
+///
+/// T1.4 migration: the former local scalar fence
+/// (`authority_epoch`/`revision`/`fence_id`) is replaced by the migrated
+/// [`StateFence`](eliot_contracts::StateFence) contract. The exact board
+/// revision stays separate as [`ViewRevision`]; an exact view is pinned by
+/// the `(revision, fence)` pair, compared with full-fence equality at every
+/// boundary. There is no scalar-to-canonical coercion and no lineage
+/// invention here; full epoch-lineage migration remains owned by T6/#64.
+pub use eliot_contracts::StateFence;
 
 /// Authenticated role resolved by the session owner.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -136,6 +129,10 @@ pub enum ActionCapability {
     AnswerReview,
     ResolveReview,
     RejectReview,
+    RefreshSwarmCatalogue,
+    ReplaceSwarmPolicy,
+    RequestSwarmLaunch,
+    CancelSwarmAttempt,
 }
 
 /// Visibility selector attached by the canonical owner.
@@ -211,7 +208,9 @@ impl ReadRequest {
             return Err(ControlBoardError::InvalidField("generation"));
         }
         if let Some(fence) = &self.expected_fence {
-            fence.validate()?;
+            fence
+                .validate()
+                .map_err(|_| ControlBoardError::InvalidField("expected_fence"))?;
         }
         Ok(())
     }
@@ -241,8 +240,10 @@ pub struct AccessBinding {
     pub observed_at_unix_ms: u64,
     pub expires_at_unix_ms: u64,
     pub access_revision: ViewRevision,
-    pub authority_epoch: u64,
-    pub access_fence_id: String,
+    /// Complete shared fence observed with the access binding. This replaces
+    /// the former scalar `authority_epoch`/`access_fence_id` surrogate; the
+    /// exact board revision stays separate as [`ViewRevision`].
+    pub access_fence: StateFence,
 }
 
 impl AccessBinding {
@@ -254,7 +255,6 @@ impl AccessBinding {
         text(&self.credential_binding, "credential_binding")?;
         text(&self.challenge, "challenge")?;
         text(&self.request_id, "request_id")?;
-        text(&self.access_fence_id, "access_fence_id")?;
         if self.session_id != request.session_id
             || self.connection_id != request.connection_id
             || self.credential_binding != request.credential_binding
@@ -262,10 +262,12 @@ impl AccessBinding {
             || self.request_id != request.request_id
             || self.generation != request.generation
             || self.admitted_privacy.is_empty()
-            || self.authority_epoch == 0
         {
             return Err(ControlBoardError::Unauthorized);
         }
+        self.access_fence
+            .validate()
+            .map_err(|_| ControlBoardError::Unauthorized)?;
         if self.issued_at_unix_ms == 0
             || self.observed_at_unix_ms < self.issued_at_unix_ms
             || self.observed_at_unix_ms >= self.expires_at_unix_ms
@@ -275,11 +277,10 @@ impl AccessBinding {
         if request
             .expected_revision
             .is_some_and(|revision| revision != self.access_revision)
-            || request.expected_fence.as_ref().is_some_and(|fence| {
-                fence.revision != self.access_revision
-                    || fence.authority_epoch != self.authority_epoch
-                    || fence.fence_id != self.access_fence_id
-            })
+            || request
+                .expected_fence
+                .as_ref()
+                .is_some_and(|fence| fence != &self.access_fence)
         {
             return Err(ControlBoardError::StaleAccess);
         }
@@ -329,8 +330,7 @@ fn access_digest(access: &AccessBinding) -> Result<String, ControlBoardError> {
             access.observed_at_unix_ms,
             access.expires_at_unix_ms,
             access.access_revision,
-            access.authority_epoch,
-            &access.access_fence_id,
+            &access.access_fence,
         ),
     ))
     .map_err(|error| ControlBoardError::Provider(error.to_string()))?;
@@ -357,6 +357,7 @@ pub enum RequiredProvider {
     CanonicalState,
     OperatorCommand,
     SwarmProjection,
+    SkillLifecycle,
     G11ReviewProjection,
     I12ReportProjection,
 }
@@ -371,6 +372,8 @@ pub enum PortError {
     Unavailable,
     #[error("provider outcome is unknown")]
     Unknown,
+    #[error("provider reported an identity conflict")]
+    IdentityConflict,
     #[error("provider contract is invalid: {0}")]
     Invalid(String),
 }
@@ -565,11 +568,14 @@ pub struct CanonicalState {
 
 impl CanonicalState {
     /// Validates exact identity and rejects duplicate projection records.
+    ///
+    /// The shared fence carries no per-view revision; the exact view is
+    /// pinned by the `(revision, fence)` pair, whose equality is enforced at
+    /// every read/command boundary rather than inside this shape check.
     pub fn validate(&self) -> Result<(), ControlBoardError> {
-        if self.fence.revision != self.revision {
-            return Err(ControlBoardError::FenceMismatch);
-        }
-        self.fence.validate()?;
+        self.fence
+            .validate()
+            .map_err(|error| ControlBoardError::Provider(error.to_string()))?;
         self.completeness.validate(self.revision, &self.fence)?;
         let mut ids = BTreeSet::new();
         for item in &self.items {
@@ -744,6 +750,26 @@ pub enum OperatorAction {
         review_item_id: String,
         reason: String,
     },
+    RefreshSwarmCatalogue {
+        catalogue: ModelCatalogueSnapshot,
+        reason: String,
+    },
+    ReplaceSwarmPolicy {
+        policy: HumanModelPreferencePolicy,
+        expected_policy_revision: String,
+        expected_policy_digest: String,
+    },
+    RequestSwarmLaunch {
+        catalogue: ModelCatalogueSnapshot,
+        policy: HumanModelPreferencePolicy,
+        task_id: String,
+        plan_revision: String,
+        demand: Vec<ModelRole>,
+    },
+    CancelSwarmAttempt {
+        attempt_id: String,
+        reason: String,
+    },
 }
 
 impl OperatorAction {
@@ -778,6 +804,10 @@ impl OperatorAction {
                 rule_id: item_id, ..
             }
             | Self::RecoveryAction { action_id: item_id } => item_id,
+            Self::RefreshSwarmCatalogue { catalogue, .. } => &catalogue.snapshot_id,
+            Self::ReplaceSwarmPolicy { policy, .. } => &policy.policy_id,
+            Self::RequestSwarmLaunch { task_id, .. } => task_id,
+            Self::CancelSwarmAttempt { attempt_id, .. } => attempt_id,
             Self::StartQuery { query_kind } => query_kind,
         }
     }
@@ -804,10 +834,20 @@ impl OperatorAction {
             } => text(item_id, "action.target_id")?,
             Self::PauseTask { task_id }
             | Self::CancelTask { task_id, .. }
-            | Self::ReplanTask { task_id, .. } => text(task_id, "action.task_id")?,
+            | Self::ReplanTask { task_id, .. }
+            | Self::RequestSwarmLaunch { task_id, .. } => text(task_id, "action.task_id")?,
             Self::ChallengeRule { rule_id, .. } => text(rule_id, "action.rule_id")?,
             Self::StartQuery { query_kind } => text(query_kind, "action.query_kind")?,
             Self::RecoveryAction { action_id } => text(action_id, "action.action_id")?,
+            Self::RefreshSwarmCatalogue { catalogue, .. } => {
+                text(&catalogue.snapshot_id, "action.catalogue_snapshot_id")?;
+            }
+            Self::ReplaceSwarmPolicy { policy, .. } => {
+                text(&policy.policy_id, "action.preference_policy_id")?;
+            }
+            Self::CancelSwarmAttempt { attempt_id, .. } => {
+                text(attempt_id, "action.attempt_id")?;
+            }
         }
         for value in self.textual_reasons() {
             text(value, "action.reason")?;
@@ -820,7 +860,9 @@ impl OperatorAction {
             Self::ResolveAttention { reason, .. }
             | Self::CancelTask { reason, .. }
             | Self::ResolveReview { reason, .. }
-            | Self::RejectReview { reason, .. } => vec![reason],
+            | Self::RejectReview { reason, .. }
+            | Self::RefreshSwarmCatalogue { reason, .. }
+            | Self::CancelSwarmAttempt { reason, .. } => vec![reason],
             Self::ReplanTask { rationale, .. } | Self::ChallengeRule { rationale, .. } => {
                 vec![rationale]
             }
@@ -828,16 +870,35 @@ impl OperatorAction {
             Self::Approve {
                 approval_digest, ..
             } => vec![approval_digest],
+            Self::ReplaceSwarmPolicy {
+                expected_policy_revision,
+                expected_policy_digest,
+                ..
+            } => vec![expected_policy_revision, expected_policy_digest],
+            Self::RequestSwarmLaunch { plan_revision, .. } => vec![plan_revision],
             _ => Vec::new(),
         }
     }
 }
 
 /// Command request bound to the exact view revision and fence observed.
+///
+/// The caller submits inert intent; the authenticated owner supplies and
+/// verifies the operation binding. `identity` is the owner-issued
+/// [`RequestIdentity`](eliot_protocol::RequestIdentity) whose fence must
+/// equal `expected_fence`, and `operation_id` is the owner-issued
+/// [`OperationId`] for this exact action. Payloads in the pre-T1.4 shape
+/// (scalar session-only binding without `identity`/`operation_id`) are
+/// rejected by construction and by deserialization before any effect.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CommandRequest {
+    /// Session bound at construction from the owner-issued identity.
     pub session_id: String,
+    /// Owner-issued operation identity for this exact action.
+    pub operation_id: OperationId,
+    /// Owner-issued request identity binding session, fence, and lifecycle.
+    pub identity: RequestIdentity,
     /// Set only by A-08 after the resolver seals the access binding.
     pub access_digest: String,
     pub expected_revision: ViewRevision,
@@ -852,21 +913,40 @@ pub struct CommandRequest {
 
 impl CommandRequest {
     /// Creates a request with no implicit authority.
+    ///
+    /// The owner-issued `identity` must already bind the same fence and the
+    /// session this command is submitted under; otherwise construction fails
+    /// closed and nothing is effecting.
     pub fn new(
-        session_id: impl Into<String>,
+        identity: RequestIdentity,
+        operation_id: OperationId,
         revision: ViewRevision,
         fence: StateFence,
         action: OperatorAction,
     ) -> Result<Self, ControlBoardError> {
-        if fence.revision != revision {
+        identity
+            .validate()
+            .map_err(|_| ControlBoardError::InvalidField("identity"))?;
+        fence
+            .validate()
+            .map_err(|_| ControlBoardError::InvalidField("expected_fence"))?;
+        if identity.request.state_fence != fence {
             return Err(ControlBoardError::FenceMismatch);
         }
+        let session_id = identity
+            .request
+            .metadata
+            .session_id
+            .clone()
+            .map(SessionId::into_string)
+            .filter(|session| !session.trim().is_empty())
+            .ok_or(ControlBoardError::InvalidField("identity.session_id"))?;
         action.validate()?;
-        let session_id = session_id.into();
-        text(&session_id, "session_id")?;
         let action_digest = action_digest(&action)?;
         Ok(Self {
             session_id,
+            operation_id,
+            identity,
             access_digest: String::new(),
             expected_revision: revision,
             expected_fence: fence,
@@ -882,12 +962,29 @@ impl CommandRequest {
         request: &ReadRequest,
         access: &ResolvedAccess,
     ) -> Result<Self, ControlBoardError> {
-        self.expected_fence.validate()?;
+        self.expected_fence
+            .validate()
+            .map_err(|_| ControlBoardError::InvalidField("expected_fence"))?;
+        self.identity
+            .validate()
+            .map_err(|_| ControlBoardError::InvalidField("identity"))?;
         self.action.validate()?;
-        if self.session_id != request.session_id
-            || self.expected_fence.revision != self.expected_revision
-        {
+        if self.session_id != request.session_id {
             return Err(ControlBoardError::StaleView);
+        }
+        if self.identity.request.state_fence != self.expected_fence {
+            return Err(ControlBoardError::FenceMismatch);
+        }
+        let identity_session = self
+            .identity
+            .request
+            .metadata
+            .session_id
+            .clone()
+            .map(SessionId::into_string)
+            .unwrap_or_default();
+        if identity_session != self.session_id {
+            return Err(ControlBoardError::ActionBindingMismatch);
         }
         if self.proof_ceiling != ProofCeiling::Observation {
             return Err(ControlBoardError::InvalidField("proof_ceiling"));
@@ -968,6 +1065,10 @@ impl OperatorAction {
             Self::AnswerReview { .. } => ActionCapability::AnswerReview,
             Self::ResolveReview { .. } => ActionCapability::ResolveReview,
             Self::RejectReview { .. } => ActionCapability::RejectReview,
+            Self::RefreshSwarmCatalogue { .. } => ActionCapability::RefreshSwarmCatalogue,
+            Self::ReplaceSwarmPolicy { .. } => ActionCapability::ReplaceSwarmPolicy,
+            Self::RequestSwarmLaunch { .. } => ActionCapability::RequestSwarmLaunch,
+            Self::CancelSwarmAttempt { .. } => ActionCapability::CancelSwarmAttempt,
         }
     }
 }
@@ -995,12 +1096,179 @@ pub trait OperatorCommandPort: Send {
     fn submit(&mut self, request: &CommandRequest) -> Result<CommandReceipt, PortError>;
 }
 
+/// Typed Skill candidate submission. All fields are owner-neutral data; the
+/// admission fence travels in the caller's [`RequestMetadata`], never here:
+/// this surface mints no fence, principal, session, epoch, or operation
+/// identity. Deserialization rejects unknown fields by construction, and every
+/// typed rule is re-checked by [`ProposeSkillRequest::validate`] at the
+/// surface boundary and again by the owning Skill lifecycle.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProposeSkillRequest {
+    /// Skill under lifecycle review.
+    pub skill_id: String,
+    /// Materialized candidate package digest (lowercase SHA-256 hex).
+    pub candidate_package_digest: String,
+    /// Proposed lifecycle change.
+    pub action: LifecycleAction,
+    /// Exact evidence references (non-empty, unique).
+    pub evidence_refs: Vec<String>,
+    /// Pinned dependency versions.
+    pub dependency_versions: Vec<DependencyVersion>,
+    /// Candidate scope.
+    pub scope: SkillScope,
+}
+
+impl ProposeSkillRequest {
+    /// Creates a typed candidate submission.
+    pub fn new(
+        skill_id: impl Into<String>,
+        candidate_package_digest: impl Into<String>,
+        action: LifecycleAction,
+        evidence_refs: Vec<String>,
+        dependency_versions: Vec<DependencyVersion>,
+        scope: SkillScope,
+    ) -> Result<Self, ControlBoardError> {
+        let request = Self {
+            skill_id: skill_id.into(),
+            candidate_package_digest: candidate_package_digest.into(),
+            action,
+            evidence_refs,
+            dependency_versions,
+            scope,
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
+    /// Re-checks every typed rule without mutating the request.
+    pub fn validate(&self) -> Result<(), ControlBoardError> {
+        text(&self.skill_id, "skill_id")?;
+        if self.candidate_package_digest.len() != 64
+            || self
+                .candidate_package_digest
+                .bytes()
+                .any(|byte| !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase())
+        {
+            return Err(ControlBoardError::InvalidField(
+                "candidate.candidate_package_digest",
+            ));
+        }
+        if self.evidence_refs.is_empty() {
+            return Err(ControlBoardError::InvalidField("candidate.evidence_refs"));
+        }
+        let mut seen = BTreeSet::new();
+        for reference in &self.evidence_refs {
+            text(reference, "candidate.evidence_ref")?;
+            if !seen.insert(reference) {
+                return Err(ControlBoardError::DuplicateReference);
+            }
+        }
+        let mut dependencies = BTreeSet::new();
+        for dependency in &self.dependency_versions {
+            dependency
+                .validate()
+                .map_err(|_| ControlBoardError::InvalidField("candidate.dependencies"))?;
+            if !dependencies.insert(dependency) {
+                return Err(ControlBoardError::DuplicateReference);
+            }
+        }
+        self.scope
+            .validate()
+            .map_err(|_| ControlBoardError::InvalidField("candidate.scope"))?;
+        Ok(())
+    }
+}
+
+/// Skill lifecycle owner port. It is the only route for Skill lifecycle reads
+/// and typed candidate submissions.
+///
+/// The port is defined locally (rather than reused from the agent-bridge
+/// surface) to avoid a cross-surface dependency, mirroring the
+/// [`SwarmProjectionPort`] pattern. Results are the Governor-owned
+/// [`SkillLifecycleView`] and [`SkillCandidate`] types directly: there is no
+/// generic-JSON submission path by construction.
+///
+/// The boxed-future shape (instead of `async fn`) keeps this trait
+/// object-safe without a new async-trait dependency. No `Send` bound is
+/// imposed: the Governor borrows behind a production implementation are not
+/// guaranteed `Send`, and the board holds the port like its other injected
+/// boundaries.
+pub trait SkillLifecyclePort {
+    /// Reads one immutable Skill lifecycle view at the admitted fence.
+    fn skill_read<'a>(
+        &'a mut self,
+        ctx: &'a RequestMetadata,
+        skill_id: String,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<SkillLifecycleView>, SkillError>> + 'a>>;
+
+    /// Submits one typed Skill candidate at the admitted fence.
+    fn propose_skill<'a>(
+        &'a mut self,
+        ctx: &'a RequestMetadata,
+        request: ProposeSkillRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<SkillCandidate, SkillError>> + 'a>>;
+}
+
 /// A-08 surface over sealed provider boundaries.
 pub struct ControlBoard {
     access: Option<Box<dyn AccessResolverPort>>,
     state: Option<Box<dyn CanonicalStatePort>>,
     commands: Option<Box<dyn OperatorCommandPort>>,
     swarm_projection: Option<Box<dyn SwarmProjectionPort>>,
+    skill_lifecycle: Option<Box<dyn SkillLifecyclePort>>,
+    replay: HashMap<String, StoredReplay>,
+}
+
+/// In-memory exact-replay record for one `operation_id` (#1187 R1).
+///
+/// The key is the operation identity text; the binding holds exactly the
+/// receipt-bound fields compared for replay. Cross-restart durability is
+/// explicitly out of scope for R1 and owned by R2; this record lives only as
+/// long as the `ControlBoard` instance.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StoredReplay {
+    session_id: String,
+    access_digest: String,
+    action: OperatorAction,
+    action_digest: String,
+    expected_revision: ViewRevision,
+    expected_fence: StateFence,
+    proof_ceiling: ProofCeiling,
+    effect_ceiling: EffectCeiling,
+    receipt: CommandReceipt,
+}
+
+impl StoredReplay {
+    fn bind(command: &CommandRequest, receipt: CommandReceipt) -> Self {
+        Self {
+            session_id: command.session_id.clone(),
+            access_digest: command.access_digest.clone(),
+            action: command.action.clone(),
+            action_digest: command.action_digest.clone(),
+            expected_revision: command.expected_revision,
+            expected_fence: command.expected_fence.clone(),
+            proof_ceiling: command.proof_ceiling,
+            effect_ceiling: command.effect_ceiling,
+            receipt,
+        }
+    }
+
+    /// Compares exactly the fields the receipt binds. `operation_id` is the
+    /// lookup key and `identity` is the authenticator, so neither is compared
+    /// here; session, access binding (capability), action/target bytes and
+    /// digest, revision, fence, and ceilings must all match for an exact
+    /// replay.
+    fn matches(&self, command: &CommandRequest) -> bool {
+        self.session_id == command.session_id
+            && self.access_digest == command.access_digest
+            && self.action == command.action
+            && self.action_digest == command.action_digest
+            && self.expected_revision == command.expected_revision
+            && self.expected_fence == command.expected_fence
+            && self.proof_ceiling == command.proof_ceiling
+            && self.effect_ceiling == command.effect_ceiling
+    }
 }
 
 impl ControlBoard {
@@ -1015,6 +1283,8 @@ impl ControlBoard {
             state,
             commands,
             swarm_projection: None,
+            skill_lifecycle: None,
+            replay: HashMap::new(),
         }
     }
 
@@ -1055,8 +1325,7 @@ impl ControlBoard {
             })?;
         state.validate()?;
         if state.revision != access.binding.access_revision
-            || state.fence.authority_epoch != access.binding.authority_epoch
-            || state.fence.fence_id != access.binding.access_fence_id
+            || state.fence != access.binding.access_fence
         {
             return Err(ControlBoardError::StaleAccess);
         }
@@ -1083,6 +1352,18 @@ impl ControlBoard {
         request.validate()?;
         let access = self.resolve_access(request)?;
         let command = command.validate_for(request, &access)?;
+        // #1187 R1: in-memory exact-replay idempotency keyed by operation_id.
+        // An identical binding returns the stored receipt without touching the
+        // effecting port again; any differing bound field is IDENTITY_CONFLICT
+        // with zero effecting-port calls and no store mutation. Cross-restart
+        // durability is explicitly out of scope here (owned by R2).
+        let operation_key = command.operation_id.as_str().to_owned();
+        if let Some(stored) = self.replay.get(&operation_key) {
+            if stored.matches(&command) {
+                return Ok(stored.receipt.clone());
+            }
+            return Err(ControlBoardError::IdentityConflict);
+        }
         let view = self.view_with_access(
             &request
                 .clone()
@@ -1104,7 +1385,96 @@ impl ControlBoard {
                 ControlBoardError::from_port(RequiredProvider::OperatorCommand, error)
             })?;
         validate_receipt(&receipt, &command)?;
+        self.replay
+            .insert(operation_key, StoredReplay::bind(&command, receipt.clone()));
         Ok(receipt)
+    }
+}
+
+impl ControlBoard {
+    /// Injects the composition-selected Skill lifecycle owner.
+    #[must_use]
+    pub fn with_skill_lifecycle(mut self, port: Box<dyn SkillLifecyclePort>) -> Self {
+        self.skill_lifecycle = Some(port);
+        self
+    }
+
+    /// Returns one cloned Skill lifecycle view at the exact access fence.
+    ///
+    /// The caller supplies the admitted [`RequestMetadata`] observed at
+    /// ingress; A-08 never mints it. The metadata fence must equal the
+    /// resolved access fence, otherwise the read fails closed as
+    /// [`ControlBoardError::StaleView`].
+    pub async fn skill_view(
+        &mut self,
+        request: &ReadRequest,
+        ctx: &RequestMetadata,
+        skill_id: &str,
+    ) -> Result<Option<SkillLifecycleView>, ControlBoardError> {
+        request.validate()?;
+        ctx.validate()
+            .map_err(|_| ControlBoardError::InvalidField("request_metadata"))?;
+        let access = self.resolve_access(request)?;
+        if ctx.state_fence != access.binding.access_fence {
+            return Err(ControlBoardError::StaleView);
+        }
+        let view = self
+            .skill_lifecycle
+            .as_mut()
+            .ok_or(ControlBoardError::PlanGap(RequiredProvider::SkillLifecycle))?
+            .skill_read(ctx, skill_id.to_owned())
+            .await
+            .map_err(map_skill_error)?;
+        if let Some(view) = &view {
+            view.validate()
+                .map_err(|error| ControlBoardError::Provider(error.to_string()))?;
+        }
+        Ok(view)
+    }
+
+    /// Submits one typed Skill candidate at the exact access fence.
+    ///
+    /// There is no generic-JSON submission path: only the typed
+    /// [`ProposeSkillRequest`] reaches the owner, which re-enforces every
+    /// rule before returning the [`SkillCandidate`] with its exact
+    /// `candidate_digest`.
+    pub async fn propose_skill_candidate(
+        &mut self,
+        request: &ReadRequest,
+        ctx: &RequestMetadata,
+        proposal: ProposeSkillRequest,
+    ) -> Result<SkillCandidate, ControlBoardError> {
+        request.validate()?;
+        proposal.validate()?;
+        ctx.validate()
+            .map_err(|_| ControlBoardError::InvalidField("request_metadata"))?;
+        let access = self.resolve_access(request)?;
+        if ctx.state_fence != access.binding.access_fence {
+            return Err(ControlBoardError::StaleView);
+        }
+        let candidate = self
+            .skill_lifecycle
+            .as_mut()
+            .ok_or(ControlBoardError::PlanGap(RequiredProvider::SkillLifecycle))?
+            .propose_skill(ctx, proposal)
+            .await
+            .map_err(map_skill_error)?;
+        candidate
+            .validate()
+            .map_err(|error| ControlBoardError::Provider(error.to_string()))?;
+        Ok(candidate)
+    }
+}
+
+/// Maps an owner Skill failure onto the closed board errors without widening.
+/// A fence disagreement stays a fence mismatch and a revision conflict stays
+/// stale; every other owner rejection is preserved verbatim as a provider
+/// contract failure.
+fn map_skill_error(error: SkillError) -> ControlBoardError {
+    match error {
+        SkillError::FenceMismatch => ControlBoardError::FenceMismatch,
+        SkillError::RevisionConflict => ControlBoardError::StaleView,
+        other => ControlBoardError::Provider(other.to_string()),
     }
 }
 
@@ -1290,6 +1660,8 @@ pub enum ControlBoardError {
     ReceiptBindingMismatch,
     #[error("command receipt exceeds requested proof/effect ceiling")]
     ReceiptOverclaim,
+    #[error("IDENTITY_CONFLICT")]
+    IdentityConflict,
     #[error("provider denied the operation")]
     Unauthorized,
     #[error("provider outcome is unknown")]
@@ -1304,6 +1676,7 @@ impl ControlBoardError {
             PortError::Denied => Self::Unauthorized,
             PortError::Unavailable => Self::PlanGap(provider),
             PortError::Unknown => Self::UnknownOutcome,
+            PortError::IdentityConflict => Self::IdentityConflict,
             PortError::Invalid(detail) => Self::Provider(detail),
         }
     }
@@ -1316,6 +1689,7 @@ impl fmt::Display for RequiredProvider {
             Self::CanonicalState => "CANONICAL_STATE",
             Self::OperatorCommand => "OPERATOR_COMMAND",
             Self::SwarmProjection => "SWARM_PROJECTION",
+            Self::SkillLifecycle => "SKILL_LIFECYCLE",
             Self::G11ReviewProjection => "G11_REVIEW_PROJECTION",
             Self::I12ReportProjection => "I12_REPORT_PROJECTION",
         })
@@ -1326,6 +1700,23 @@ impl fmt::Display for RequiredProvider {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use eliot_contracts::{
+        ClockReading, EpochId, EpochLineageId, ProductId, RequestId, RequestMetadata,
+        ResourceGeneration, SourceId,
+    };
+    use eliot_receipts::RequestBinding;
+    use std::num::NonZeroU64;
+    use std::sync::{Arc, Mutex};
+
+    const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn test_epoch(sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(TEST_LINEAGE_A).expect("valid test lineage"),
+            NonZeroU64::new(sequence).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
 
     struct FakeRead {
         state: CanonicalState,
@@ -1406,7 +1797,53 @@ mod tests {
     }
 
     fn fence() -> StateFence {
-        StateFence::new(1, ViewRevision::new(7).expect("revision"), "fence-7").expect("fence")
+        StateFence::new(
+            test_epoch(1),
+            ResourceGeneration::new(7).expect("generation"),
+        )
+    }
+
+    fn fence_at_generation(generation: u64) -> StateFence {
+        StateFence::new(
+            test_epoch(1),
+            ResourceGeneration::new(generation).expect("generation"),
+        )
+    }
+
+    fn identity_for(fence: &StateFence) -> RequestIdentity {
+        RequestIdentity {
+            request: RequestBinding {
+                metadata: RequestMetadata {
+                    request_id: RequestId::new("request-1").expect("request id"),
+                    session_id: Some(SessionId::new("session").expect("session id")),
+                    task_id: None,
+                    product_id: ProductId::new("product").expect("product id"),
+                    source_id: SourceId::new("source").expect("source id"),
+                    state_fence: fence.clone(),
+                    clock: ClockReading::default(),
+                },
+                state_fence: fence.clone(),
+            },
+            idempotency_key: "idem-1".to_owned(),
+            deadline_unix_ms: 1_000,
+            cancellation_id: "cancel-1".to_owned(),
+        }
+    }
+
+    fn operation_id() -> OperationId {
+        OperationId::new("operation-1").expect("operation id")
+    }
+
+    fn command(action: OperatorAction) -> CommandRequest {
+        let fence = fence();
+        CommandRequest::new(
+            identity_for(&fence),
+            operation_id(),
+            ViewRevision::new(7).expect("revision"),
+            fence,
+            action,
+        )
+        .expect("command")
     }
 
     fn state() -> CanonicalState {
@@ -1539,8 +1976,7 @@ mod tests {
                 observed_at_unix_ms: 1_100,
                 expires_at_unix_ms: 2_000,
                 access_revision: ViewRevision::new(7).expect("revision"),
-                authority_epoch: 1,
-                access_fence_id: "fence-7".to_owned(),
+                access_fence: fence(),
             },
         }
     }
@@ -1582,15 +2018,9 @@ mod tests {
             Some(Box::new(FakeRead { state: state() })),
             None,
         );
-        let command = CommandRequest::new(
-            "session",
-            ViewRevision::new(7).expect("revision"),
-            fence(),
-            OperatorAction::PauseTask {
-                task_id: "public".to_owned(),
-            },
-        )
-        .expect("command");
+        let command = command(OperatorAction::PauseTask {
+            task_id: "public".to_owned(),
+        });
         assert_eq!(
             board.submit(&read_request(Role::HumanRequester), command),
             Err(ControlBoardError::PlanGap(
@@ -1610,12 +2040,13 @@ mod tests {
             Some(Box::new(FakeRead { state: state() })),
             Some(Box::new(FakeCommand)),
         );
-        let stale =
-            StateFence::new(1, ViewRevision::new(6).expect("revision"), "fence-6").expect("fence");
+        let stale_fence = fence_at_generation(6);
+        let stale_identity = identity_for(&stale_fence);
         let command = CommandRequest::new(
-            "session",
+            stale_identity,
+            operation_id(),
             ViewRevision::new(6).expect("revision"),
-            stale,
+            stale_fence,
             OperatorAction::AcknowledgeAttention {
                 item_id: "public".to_owned(),
             },
@@ -1640,16 +2071,10 @@ mod tests {
             Some(Box::new(FakeRead { state: state() })),
             Some(Box::new(FakeCommand)),
         );
-        let command = CommandRequest::new(
-            "session",
-            ViewRevision::new(7).expect("revision"),
-            fence(),
-            OperatorAction::AnswerReview {
-                review_item_id: "review-1".to_owned(),
-                answer: "addressed".to_owned(),
-            },
-        )
-        .expect("command");
+        let command = command(OperatorAction::AnswerReview {
+            review_item_id: "review-1".to_owned(),
+            answer: "addressed".to_owned(),
+        });
         let receipt = board
             .submit(&read_request(Role::HumanRequester), command)
             .expect("receipt");
@@ -1665,7 +2090,7 @@ mod tests {
             duplicate.validate(),
             Err(ControlBoardError::DuplicateId(_))
         ));
-        let json = r#"{"revision":7,"fence":{"authority_epoch":1,"revision":7,"fence_id":"f"},"completeness":{"g11_coordination":{"provider":"G11","work_id":"G-11","binding_id":"g11","binding_revision":7,"binding_fence":{"authority_epoch":1,"revision":7,"fence_id":"f"},"binding_digest":"d1","receipt_ref":"r1"},"i12_report_projection":{"provider":"I12","work_id":"I-12","binding_id":"i12","binding_revision":7,"binding_fence":{"authority_epoch":1,"revision":7,"fence_id":"f"},"binding_digest":"d2","receipt_ref":"r2"}},"items":[],"reviews":[],"provenance":[],"extra":true}"#;
+        let json = r#"{"revision":7,"fence":{"authority_epoch":1,"resource_generation":7},"completeness":{"g11_coordination":{"provider":"G11","work_id":"G-11","binding_id":"g11","binding_revision":7,"binding_fence":{"authority_epoch":1,"resource_generation":7},"binding_digest":"d1","receipt_ref":"r1"},"i12_report_projection":{"provider":"I12","work_id":"I-12","binding_id":"i12","binding_revision":7,"binding_fence":{"authority_epoch":1,"resource_generation":7},"binding_digest":"d2","receipt_ref":"r2"}},"items":[],"reviews":[],"provenance":[],"extra":true}"#;
         let parsed = serde_json::from_str::<CanonicalState>(json);
         assert!(parsed.is_err());
     }
@@ -1681,15 +2106,9 @@ mod tests {
             Some(Box::new(FakeRead { state: state() })),
             Some(Box::new(FakeCommand)),
         );
-        let command = CommandRequest::new(
-            "session",
-            ViewRevision::new(7).expect("revision"),
-            fence(),
-            OperatorAction::PauseTask {
-                task_id: "task-1".to_owned(),
-            },
-        )
-        .expect("command");
+        let command = command(OperatorAction::PauseTask {
+            task_id: "task-1".to_owned(),
+        });
         assert_eq!(
             board.submit(&read_request(Role::ReadOnlyApi), command),
             Err(ControlBoardError::Unauthorized)
@@ -1698,16 +2117,10 @@ mod tests {
 
     #[test]
     fn exact_human_roles_and_capabilities_are_required() {
-        let command = CommandRequest::new(
-            "session",
-            ViewRevision::new(7).expect("revision"),
-            fence(),
-            OperatorAction::Approve {
-                item_id: "public".to_owned(),
-                approval_digest: "approval".to_owned(),
-            },
-        )
-        .expect("command");
+        let command = command(OperatorAction::Approve {
+            item_id: "public".to_owned(),
+            approval_digest: "approval".to_owned(),
+        });
         let mut board = ControlBoard::new(
             Some(Box::new(access(
                 Role::HumanRequester,
@@ -1747,30 +2160,18 @@ mod tests {
             Some(Box::new(FakeRead { state: state() })),
             Some(Box::new(FakeCommand)),
         );
-        let hidden = CommandRequest::new(
-            "session",
-            ViewRevision::new(7).expect("revision"),
-            fence(),
-            OperatorAction::ResolveReview {
-                review_item_id: "human-only".to_owned(),
-                reason: "no".to_owned(),
-            },
-        )
-        .expect("command");
+        let hidden = command(OperatorAction::ResolveReview {
+            review_item_id: "human-only".to_owned(),
+            reason: "no".to_owned(),
+        });
         assert_eq!(
             board.submit(&read_request(Role::HumanRequester), hidden),
             Err(ControlBoardError::HiddenOrMissingTarget)
         );
-        let illegal = CommandRequest::new(
-            "session",
-            ViewRevision::new(7).expect("revision"),
-            fence(),
-            OperatorAction::ResolveReview {
-                review_item_id: "review-1".to_owned(),
-                reason: "no".to_owned(),
-            },
-        )
-        .expect("command");
+        let illegal = command(OperatorAction::ResolveReview {
+            review_item_id: "review-1".to_owned(),
+            reason: "no".to_owned(),
+        });
         assert_eq!(
             board.submit(&read_request(Role::HumanRequester), illegal),
             Err(ControlBoardError::InvalidReviewTransition)
@@ -1788,15 +2189,9 @@ mod tests {
             Some(Box::new(FakeRead { state: state() })),
             Some(Box::new(BadCommand)),
         );
-        let command = CommandRequest::new(
-            "session",
-            ViewRevision::new(7).expect("revision"),
-            fence(),
-            OperatorAction::PauseTask {
-                task_id: "public".to_owned(),
-            },
-        )
-        .expect("command");
+        let command = command(OperatorAction::PauseTask {
+            task_id: "public".to_owned(),
+        });
         assert_eq!(
             board.submit(&read_request(Role::HumanRequester), command),
             Err(ControlBoardError::InvalidField("receipt_ref"))
@@ -1822,7 +2217,7 @@ mod tests {
 
     #[test]
     fn zero_revision_duplicate_grants_and_references_are_rejected() {
-        let zero = r#"{"revision":0,"fence":{"authority_epoch":1,"revision":0,"fence_id":"f"},"completeness":{"g11_coordination":{"provider":"G11","work_id":"G-11","binding_id":"g11","binding_revision":0,"binding_fence":{"authority_epoch":1,"revision":0,"fence_id":"f"},"binding_digest":"d1","receipt_ref":"r1"},"i12_report_projection":{"provider":"I12","work_id":"I-12","binding_id":"i12","binding_revision":0,"binding_fence":{"authority_epoch":1,"revision":0,"fence_id":"f"},"binding_digest":"d2","receipt_ref":"r2"}},"items":[],"reviews":[],"provenance":[]}"#;
+        let zero = r#"{"revision":0,"fence":{"authority_epoch":1,"resource_generation":7},"completeness":{"g11_coordination":{"provider":"G11","work_id":"G-11","binding_id":"g11","binding_revision":0,"binding_fence":{"authority_epoch":1,"resource_generation":7},"binding_digest":"d1","receipt_ref":"r1"},"i12_report_projection":{"provider":"I12","work_id":"I-12","binding_id":"i12","binding_revision":0,"binding_fence":{"authority_epoch":1,"resource_generation":7},"binding_digest":"d2","receipt_ref":"r2"}},"items":[],"reviews":[],"provenance":[]}"#;
         assert!(serde_json::from_str::<CanonicalState>(zero).is_err());
         let mut duplicate_privacy = access(
             Role::ReadOnlyApi,
@@ -1922,15 +2317,9 @@ mod tests {
             Some(Box::new(FakeRead { state: state() })),
             Some(Box::new(WrongAccessCommand)),
         );
-        let command = CommandRequest::new(
-            "session",
-            ViewRevision::new(7).expect("revision"),
-            fence(),
-            OperatorAction::PauseTask {
-                task_id: "public".to_owned(),
-            },
-        )
-        .expect("command");
+        let command = command(OperatorAction::PauseTask {
+            task_id: "public".to_owned(),
+        });
         assert_eq!(
             board.submit(&read_request(Role::HumanRequester), command),
             Err(ControlBoardError::ReceiptBindingMismatch)
@@ -1948,31 +2337,19 @@ mod tests {
             Some(Box::new(FakeRead { state: state() })),
             Some(Box::new(FakeCommand)),
         );
-        let wrong = CommandRequest::new(
-            "session",
-            ViewRevision::new(7).expect("revision"),
-            fence(),
-            OperatorAction::ChallengeRule {
-                rule_id: "public".to_owned(),
-                rationale: "wrong kind".to_owned(),
-            },
-        )
-        .expect("command");
+        let wrong = command(OperatorAction::ChallengeRule {
+            rule_id: "public".to_owned(),
+            rationale: "wrong kind".to_owned(),
+        });
         assert_eq!(
             wrong_kind.submit(&read_request(Role::HumanRequester), wrong),
             Err(ControlBoardError::WrongTargetKind)
         );
 
-        let approval = CommandRequest::new(
-            "session",
-            ViewRevision::new(7).expect("revision"),
-            fence(),
-            OperatorAction::Approve {
-                item_id: "public".to_owned(),
-                approval_digest: "critical-action-digest".to_owned(),
-            },
-        )
-        .expect("command");
+        let approval = command(OperatorAction::Approve {
+            item_id: "public".to_owned(),
+            approval_digest: "critical-action-digest".to_owned(),
+        });
         let mut task_target = ControlBoard::new(
             Some(Box::new(access(
                 Role::HumanApprover,
@@ -2016,15 +2393,9 @@ mod tests {
             Some(Box::new(FakeRead { state: state() })),
             Some(Box::new(FakeCommand)),
         );
-        let command = CommandRequest::new(
-            "session",
-            ViewRevision::new(7).expect("revision"),
-            fence(),
-            OperatorAction::StartQuery {
-                query_kind: "semantic-search".to_owned(),
-            },
-        )
-        .expect("command");
+        let command = command(OperatorAction::StartQuery {
+            query_kind: "semantic-search".to_owned(),
+        });
         assert_eq!(
             query
                 .submit(&read_request(Role::HumanRequester), command)
@@ -2036,15 +2407,9 @@ mod tests {
 
     #[test]
     fn deserialized_ceiling_widening_and_unknown_enums_fail_closed() {
-        let command = CommandRequest::new(
-            "session",
-            ViewRevision::new(7).expect("revision"),
-            fence(),
-            OperatorAction::PauseTask {
-                task_id: "public".to_owned(),
-            },
-        )
-        .expect("command");
+        let command = command(OperatorAction::PauseTask {
+            task_id: "public".to_owned(),
+        });
         let mut widened = serde_json::to_value(&command).expect("json");
         widened["proof_ceiling"] = serde_json::json!("SCOPED_VERIFICATION");
         let widened = serde_json::from_value::<CommandRequest>(widened).expect("command json");
@@ -2091,6 +2456,410 @@ mod tests {
             Err(ControlBoardError::PlanGap(
                 RequiredProvider::G11ReviewProjection
             ))
+        );
+    }
+
+    #[test]
+    fn owner_identity_and_fence_must_bind_the_command() {
+        let fence = fence();
+        let foreign_fence = fence_at_generation(6);
+        let foreign_identity = identity_for(&foreign_fence);
+        assert_eq!(
+            CommandRequest::new(
+                foreign_identity,
+                operation_id(),
+                ViewRevision::new(7).expect("revision"),
+                fence.clone(),
+                OperatorAction::StartQuery {
+                    query_kind: "semantic-search".to_owned(),
+                },
+            ),
+            Err(ControlBoardError::FenceMismatch)
+        );
+
+        let mut no_session = identity_for(&fence);
+        no_session.request.metadata.session_id = None;
+        assert_eq!(
+            CommandRequest::new(
+                no_session,
+                operation_id(),
+                ViewRevision::new(7).expect("revision"),
+                fence.clone(),
+                OperatorAction::StartQuery {
+                    query_kind: "semantic-search".to_owned(),
+                },
+            ),
+            Err(ControlBoardError::InvalidField("identity.session_id"))
+        );
+
+        let mut substituted = command(OperatorAction::StartQuery {
+            query_kind: "semantic-search".to_owned(),
+        });
+        substituted.identity.request.metadata.session_id =
+            Some(SessionId::new("other-session").expect("session id"));
+        let mut board = ControlBoard::new(
+            Some(Box::new(access(
+                Role::HumanRequester,
+                &[ActionCapability::StartQuery],
+                &[PrivacyClass::Public],
+            ))),
+            Some(Box::new(FakeRead { state: state() })),
+            Some(Box::new(FakeCommand)),
+        );
+        assert_eq!(
+            board.submit(&read_request(Role::HumanRequester), substituted),
+            Err(ControlBoardError::ActionBindingMismatch)
+        );
+    }
+
+    #[test]
+    fn pre_t1_4_mutation_payloads_are_rejected_before_effects() {
+        let command = command(OperatorAction::PauseTask {
+            task_id: "public".to_owned(),
+        });
+        let wire = serde_json::to_value(&command).expect("json");
+        let mut legacy = wire.clone();
+        for field in ["identity", "operation_id"] {
+            legacy
+                .as_object_mut()
+                .expect("command object")
+                .remove(field);
+        }
+        assert!(serde_json::from_value::<CommandRequest>(legacy).is_err());
+
+        let mut rebound = wire;
+        let foreign_fence = serde_json::to_value(fence_at_generation(6)).expect("fence json");
+        rebound["identity"]["request"]["state_fence"] = foreign_fence.clone();
+        rebound["identity"]["request"]["metadata"]["state_fence"] = foreign_fence;
+        let rebound = serde_json::from_value::<CommandRequest>(rebound).expect("command json");
+        let mut board = ControlBoard::new(
+            Some(Box::new(access(
+                Role::HumanRequester,
+                &[ActionCapability::PauseTask],
+                &[PrivacyClass::Public],
+            ))),
+            Some(Box::new(FakeRead { state: state() })),
+            Some(Box::new(FakeCommand)),
+        );
+        assert_eq!(
+            board.submit(&read_request(Role::HumanRequester), rebound),
+            Err(ControlBoardError::FenceMismatch)
+        );
+    }
+
+    /// Counting operator command port (#1187 R1). It records invocations and
+    /// answers each *new* effect with a distinct receipt, so a replay that
+    /// returns the stored receipt instead of re-effecting is observable.
+    struct CountingCommand {
+        calls: Arc<Mutex<usize>>,
+    }
+
+    impl OperatorCommandPort for CountingCommand {
+        fn submit(&mut self, request: &CommandRequest) -> Result<CommandReceipt, PortError> {
+            let mut calls = self.calls.lock().expect("call count");
+            *calls += 1;
+            Ok(CommandReceipt {
+                receipt_ref: format!("receipt-{}", *calls),
+                session_id: request.session_id.clone(),
+                access_digest: request.access_digest.clone(),
+                action_digest: request.action_digest.clone(),
+                proof_ceiling: request.proof_ceiling,
+                effect_ceiling: request.effect_ceiling,
+                disposition: CommandDisposition::Accepted,
+                observed_revision: request.expected_revision,
+                observed_fence: request.expected_fence.clone(),
+            })
+        }
+    }
+
+    fn replay_board(calls: Arc<Mutex<usize>>) -> ControlBoard {
+        ControlBoard::new(
+            Some(Box::new(access(
+                Role::HumanRequester,
+                &[ActionCapability::StartQuery],
+                &[PrivacyClass::Public],
+            ))),
+            Some(Box::new(FakeRead { state: state() })),
+            Some(Box::new(CountingCommand { calls })),
+        )
+    }
+
+    fn start_query() -> CommandRequest {
+        command(OperatorAction::StartQuery {
+            query_kind: "semantic-search".to_owned(),
+        })
+    }
+
+    #[test]
+    fn exact_replay_returns_same_receipt() {
+        let calls = Arc::new(Mutex::new(0));
+        let mut board = replay_board(Arc::clone(&calls));
+        let request = read_request(Role::HumanRequester);
+        let submitted = start_query();
+        let first = board
+            .submit(&request, submitted.clone())
+            .expect("first receipt");
+        let second = board.submit(&request, submitted).expect("replay receipt");
+        assert_eq!(first, second);
+        assert_eq!(first.receipt_ref, "receipt-1");
+        assert_eq!(*calls.lock().expect("call count"), 1);
+    }
+
+    #[test]
+    fn changed_payload_same_operation_is_identity_conflict() {
+        let calls = Arc::new(Mutex::new(0));
+        let mut board = replay_board(Arc::clone(&calls));
+        let request = read_request(Role::HumanRequester);
+        let submitted = start_query();
+        board
+            .submit(&request, submitted.clone())
+            .expect("first receipt");
+        assert_eq!(*calls.lock().expect("call count"), 1);
+        let changed = command(OperatorAction::StartQuery {
+            query_kind: "other-query".to_owned(),
+        });
+        assert_eq!(changed.operation_id, submitted.operation_id);
+        assert_ne!(changed.action_digest, submitted.action_digest);
+        assert_eq!(
+            board.submit(&request, changed),
+            Err(ControlBoardError::IdentityConflict)
+        );
+        assert_eq!(
+            ControlBoardError::IdentityConflict.to_string(),
+            "IDENTITY_CONFLICT"
+        );
+        assert_eq!(*calls.lock().expect("call count"), 1);
+        // The conflict mutates no state: the original binding still replays.
+        let replay = board.submit(&request, submitted).expect("replay receipt");
+        assert_eq!(replay.receipt_ref, "receipt-1");
+        assert_eq!(*calls.lock().expect("call count"), 1);
+    }
+
+    #[test]
+    fn replay_skips_owner_ports_and_returns_stored_receipt() {
+        struct CountingRead {
+            state: CanonicalState,
+            reads: Arc<Mutex<usize>>,
+        }
+
+        impl CanonicalStatePort for CountingRead {
+            fn read(
+                &mut self,
+                _request: &ReadRequest,
+                _access: &AccessBinding,
+            ) -> Result<CanonicalState, PortError> {
+                *self.reads.lock().expect("read count") += 1;
+                Ok(self.state.clone())
+            }
+        }
+
+        let calls = Arc::new(Mutex::new(0));
+        let reads = Arc::new(Mutex::new(0));
+        let mut board = ControlBoard::new(
+            Some(Box::new(access(
+                Role::HumanRequester,
+                &[ActionCapability::StartQuery],
+                &[PrivacyClass::Public],
+            ))),
+            Some(Box::new(CountingRead {
+                state: state(),
+                reads: Arc::clone(&reads),
+            })),
+            Some(Box::new(CountingCommand {
+                calls: Arc::clone(&calls),
+            })),
+        );
+        let request = read_request(Role::HumanRequester);
+        let submitted = start_query();
+        let first = board
+            .submit(&request, submitted.clone())
+            .expect("first receipt");
+        assert_eq!(*calls.lock().expect("call count"), 1);
+        assert_eq!(*reads.lock().expect("read count"), 1);
+        // The replay returns the stored receipt without re-reading canonical
+        // state and without a second effect.
+        let second = board.submit(&request, submitted).expect("replay receipt");
+        assert_eq!(first, second);
+        assert_eq!(*calls.lock().expect("call count"), 1);
+        assert_eq!(*reads.lock().expect("read count"), 1);
+    }
+
+    // ---- Skill lifecycle surface read + typed propose (#1191 bullet 14) ----
+
+    use eliot_skill::{LifecycleCounters, SkillInteractionView, SkillRef, SkillStatus};
+    use std::future::Future;
+    use std::pin::Pin;
+
+    struct FakeSkill {
+        view: Option<SkillLifecycleView>,
+        candidate: SkillCandidate,
+    }
+
+    impl SkillLifecyclePort for FakeSkill {
+        fn skill_read<'a>(
+            &'a mut self,
+            _ctx: &'a RequestMetadata,
+            _skill_id: String,
+        ) -> Pin<Box<dyn Future<Output = Result<Option<SkillLifecycleView>, SkillError>> + 'a>>
+        {
+            Box::pin(async move { Ok(self.view.clone()) })
+        }
+
+        fn propose_skill<'a>(
+            &'a mut self,
+            _ctx: &'a RequestMetadata,
+            _request: ProposeSkillRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<SkillCandidate, SkillError>> + 'a>> {
+            Box::pin(async move { Ok(self.candidate.clone()) })
+        }
+    }
+
+    fn skill_scope() -> SkillScope {
+        SkillScope {
+            task_scope: "task-scope".to_owned(),
+            host: "host-1".to_owned(),
+            route: "route-1".to_owned(),
+            governance_scope: "gov-1".to_owned(),
+        }
+    }
+
+    fn skill_view(fence: &StateFence) -> SkillLifecycleView {
+        SkillLifecycleView {
+            skill_ref: SkillRef::new("skill-demo", "rev-1", "Demo Skill", "a".repeat(64))
+                .expect("skill ref"),
+            scope: skill_scope(),
+            applies_when: vec!["when-a".to_owned()],
+            does_not_apply_when: vec!["not-when-a".to_owned()],
+            dependencies: Vec::new(),
+            counters: LifecycleCounters::default(),
+            execution_evidence: Vec::new(),
+            observed_decision_or_verifier_delta: None,
+            false_activation_refs: Vec::new(),
+            interactions: SkillInteractionView::default(),
+            status: SkillStatus::Current,
+            stale_or_quarantine_reason: None,
+            proposed_action: LifecycleAction::Keep,
+            review: None,
+            state_fence: fence.clone(),
+            lifecycle_revision: 1,
+        }
+    }
+
+    fn skill_ctx(fence: &StateFence) -> RequestMetadata {
+        RequestMetadata {
+            request_id: RequestId::new("req-skill-1").expect("request id"),
+            session_id: Some(SessionId::new("session").expect("session id")),
+            task_id: None,
+            product_id: ProductId::new("product").expect("product id"),
+            source_id: SourceId::new("source").expect("source id"),
+            state_fence: fence.clone(),
+            clock: ClockReading::default(),
+        }
+    }
+
+    fn skill_board(view: Option<SkillLifecycleView>, candidate: SkillCandidate) -> ControlBoard {
+        ControlBoard::new(
+            Some(Box::new(access(
+                Role::HumanRequester,
+                &[],
+                &[PrivacyClass::Public],
+            ))),
+            None,
+            None,
+        )
+        .with_skill_lifecycle(Box::new(FakeSkill { view, candidate }))
+    }
+
+    fn skill_candidate(fence: &StateFence) -> SkillCandidate {
+        SkillCandidate::new(
+            &skill_view(fence),
+            "b".repeat(64),
+            LifecycleAction::Patch,
+            vec!["evidence-1".to_owned()],
+            Vec::new(),
+            skill_scope(),
+            fence.clone(),
+        )
+        .expect("candidate")
+    }
+
+    fn block_on<T>(future: impl Future<Output = T>) -> T {
+        struct NoopWaker;
+        impl std::task::Wake for NoopWaker {
+            fn wake(self: std::sync::Arc<Self>) {}
+        }
+        let waker = std::task::Waker::from(std::sync::Arc::new(NoopWaker));
+        let mut context = std::task::Context::from_waker(&waker);
+        let mut future = Box::pin(future);
+        loop {
+            match future.as_mut().poll(&mut context) {
+                std::task::Poll::Ready(output) => return output,
+                std::task::Poll::Pending => std::thread::yield_now(),
+            }
+        }
+    }
+
+    #[test]
+    fn skill_view_returns_the_cloned_governor_view() {
+        let fence = fence();
+        let view = skill_view(&fence);
+        let mut board = skill_board(Some(view.clone()), skill_candidate(&fence));
+        let read = block_on(board.skill_view(
+            &read_request(Role::HumanRequester),
+            &skill_ctx(&fence),
+            "skill-demo",
+        ))
+        .expect("view");
+        assert_eq!(read, Some(view));
+    }
+
+    #[test]
+    fn typed_propose_returns_the_exact_candidate_digest_and_stale_fences_fail_closed() {
+        let fence = fence();
+        let mut board = skill_board(Some(skill_view(&fence)), skill_candidate(&fence));
+        let proposal = ProposeSkillRequest::new(
+            "skill-demo",
+            "b".repeat(64),
+            LifecycleAction::Patch,
+            vec!["evidence-1".to_owned()],
+            Vec::new(),
+            skill_scope(),
+        )
+        .expect("proposal");
+        let returned = block_on(board.propose_skill_candidate(
+            &read_request(Role::HumanRequester),
+            &skill_ctx(&fence),
+            proposal,
+        ))
+        .expect("candidate");
+        let expected = skill_candidate(&fence);
+        assert_eq!(returned, expected);
+        assert_eq!(returned.candidate_digest, expected.candidate_digest);
+        let stale = fence_at_generation(6);
+        assert_eq!(
+            block_on(board.skill_view(
+                &read_request(Role::HumanRequester),
+                &skill_ctx(&stale),
+                "skill-demo",
+            )),
+            Err(ControlBoardError::StaleView)
+        );
+        let stale_proposal = ProposeSkillRequest::new(
+            "skill-demo",
+            "b".repeat(64),
+            LifecycleAction::Patch,
+            vec!["evidence-1".to_owned()],
+            Vec::new(),
+            skill_scope(),
+        )
+        .expect("proposal");
+        assert_eq!(
+            block_on(board.propose_skill_candidate(
+                &read_request(Role::HumanRequester),
+                &skill_ctx(&stale),
+                stale_proposal,
+            )),
+            Err(ControlBoardError::StaleView)
         );
     }
 }

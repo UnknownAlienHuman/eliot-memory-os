@@ -397,6 +397,41 @@ impl InstrumentInvocation {
     }
 }
 
+/// Neutral request delivered to the injected Kernel/Governor admission port.
+///
+/// This is an inert description only. It contains no contour authority and
+/// cannot be used to construct a process permit without the core sealing
+/// boundary in `eliot-testd-core`. Shape validation is stateless: it checks
+/// non-blank identities, delegates to [`InstrumentInvocation::validate`], and
+/// checks non-blank roots. It performs no filesystem access and makes no
+/// admission decision.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KernelProcessAdmissionRequest {
+    pub job_id: String,
+    pub project_id: String,
+    pub invocation: InstrumentInvocation,
+    pub source_root: String,
+    pub target_root: String,
+    pub cache_root: String,
+}
+
+impl KernelProcessAdmissionRequest {
+    /// Validates shape only, with no filesystem or admission effects.
+    pub fn validate(&self) -> Result<(), InstrumentContractError> {
+        validate_text(&self.job_id, "job_id")?;
+        validate_text(&self.project_id, "project_id")?;
+        for (field, value) in [
+            ("source_root", self.source_root.as_str()),
+            ("target_root", self.target_root.as_str()),
+            ("cache_root", self.cache_root.as_str()),
+        ] {
+            validate_text(value, field)?;
+        }
+        self.invocation.validate()
+    }
+}
+
 /// Semantic outcome of a verification run; it is not a finish decision.
 #[derive(Clone, Copy, Debug, Eq, Hash, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -537,7 +572,18 @@ impl fmt::Display for VerificationOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eliot_contracts::{AuthorityEpoch, ProductId, ResourceGeneration, SourceId};
+    use eliot_contracts::{EpochId, EpochLineageId, ProductId, ResourceGeneration, SourceId};
+    use std::num::NonZeroU64;
+
+    const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn test_epoch(lineage: &str, sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(lineage).expect("valid test lineage"),
+            NonZeroU64::new(sequence).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
 
     fn request() -> RequestMetadata {
         RequestMetadata {
@@ -546,7 +592,10 @@ mod tests {
             task_id: None,
             product_id: ProductId::new("product-1").unwrap_or_else(|_| unreachable!()),
             source_id: SourceId::new("source-1").unwrap_or_else(|_| unreachable!()),
-            state_fence: StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis()),
+            state_fence: StateFence::new(
+                test_epoch(TEST_LINEAGE_A, 1),
+                ResourceGeneration::genesis(),
+            ),
             clock: ClockReading {
                 valid_time_ms: Some(10),
                 known_time_ms: Some(11),

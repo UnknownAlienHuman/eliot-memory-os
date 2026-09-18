@@ -376,7 +376,7 @@ impl ProviderRoleDenominator {
         }
         let mut seen = std::collections::BTreeSet::new();
         for disposition in &self.dispositions {
-            disposition.slot.validate()?;
+            disposition.validate()?;
             let key = (disposition.slot.provider.clone(), disposition.slot.role);
             if !expected.contains(&key) || !seen.insert(key) {
                 return Err(ContextError::DenominatorMismatch);
@@ -399,6 +399,27 @@ pub struct ProviderDisposition {
     pub state: AtomAvailability,
     /// Evidence for the state, if available.
     pub evidence: Option<ProofBinding>,
+}
+
+impl ProviderDisposition {
+    /// Validate slot identity and require evidence for blocked/unavailable.
+    ///
+    /// A `Blocked` or `Unavailable` slot without named evidence cannot
+    /// support a coverage or absence claim, so it fails closed. All other
+    /// states preserve the previous acceptance shape.
+    pub fn validate(&self) -> Result<(), ContextError> {
+        self.slot.validate()?;
+        if matches!(
+            self.state,
+            AtomAvailability::Blocked | AtomAvailability::Unavailable
+        ) && self.evidence.is_none()
+        {
+            return Err(ContextError::MissingField(
+                "denominator.dispositions.evidence",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Independent route capacity components.
@@ -468,6 +489,16 @@ impl ContextCandidate {
     ///
     /// A Governor-owned route/disclosure contract must replace this narrow
     /// prototype rule before scoped or restricted material can cross a route.
+    ///
+    /// Owner transfer (issue #1025 finding 2): this cell refuses every
+    /// non-public atom at the validation call sites and defines no
+    /// `Secret`/`Restricted` route rule of its own. Route and disclosure
+    /// enforcement for non-public material is owned by Governor
+    /// `eliot-workscope` (`crates/governor/eliot-workscope/src/lib.rs:587`,
+    /// `PrivacyProfile::admits`, denying with `PrivacyDenied` at `:676-677`
+    /// and `:737-738`); downstream non-public disclosure is additionally
+    /// withheld as `WithheldPrivacy` by `classify_privacy_and_proof`
+    /// (`crates/smart/eliot-reactive-context-plan/src/plan.rs:2551-2557`).
     pub(crate) fn validate_public_privacy(&self) -> Result<(), ContextError> {
         if self.privacy == PrivacyClass::Public {
             Ok(())

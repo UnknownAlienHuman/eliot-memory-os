@@ -6,18 +6,64 @@
 //! reference store so two stores produce equivalent receipts from the same
 //! inputs.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_store_api::{
-    CommitId, EventId, EventProjectionRelationIntents, OrderingHead, OrderingScopeId, OutboxId,
-    OutboxIntent, OutboxState, PreparedTransition, ProjectionMode, ProjectionPublicationId,
-    ProjectionPublicationRecord, ProjectionStatus, RequestMeta, Resubmission, RevisionDelta,
-    RevisionHead, RevisionKey, SplitView, StoreError, WriteReceipt, WriteReceiptStatus,
-    canonical_json_bytes, issue_store_receipt_envelope, sha256_hex,
-    validate_store_receipt_envelope,
+    CanonicalRequestView, CommitId, EventId, EventProjectionRelationIntents, ExactJsonBytes,
+    NamedMutationOperation, OrderingHead, OrderingHeadExpectation, OrderingScopeId, OutboxId,
+    OutboxIntent, OutboxState, PAYLOAD_AUTHORITY_VERSION, PayloadEncoding, PayloadSource,
+    PreparedTransition, ProjectionMode, ProjectionPublicationId, ProjectionPublicationRecord,
+    ProjectionStatus, RequestMeta, Resubmission, RevisionDelta, RevisionHead,
+    RevisionHeadExpectation, RevisionKey, SplitView, StoreError, WriteReceipt, WriteReceiptStatus,
+    canonical_json_bytes, canonical_request_hash, issue_store_receipt_envelope, sha256_hex,
+    validate_store_receipt_envelope, verify_canonical_request_hash,
 };
+use serde_json::Value;
 
 use crate::error::AdapterError;
+
+/// Opaque payload-authority provenance for one named operation (issue #10).
+///
+/// This record carries identity only (version, encoding, digest, length):
+/// the exact bytes are persisted opaquely by the transaction writer, while
+/// every queryable body below stays a derivative projection. A plan with an
+/// empty `payload_authority` vector is a legacy transition with no claimed
+/// authority; its behavior is unchanged.
+#[derive(Clone, Debug)]
+pub(crate) struct PayloadAuthorityRecord {
+    pub(crate) operation_index: usize,
+    pub(crate) version: u16,
+    pub(crate) encoding: String,
+    pub(crate) digest_hex: String,
+    pub(crate) byte_len: usize,
+    pub(crate) bytes: Vec<u8>,
+}
+
+/// Recoverable evidence record for one `CaptureObservation` (T11.1, #19).
+///
+/// Carries the full recoverable content, never a lossy projection: the exact
+/// subject selector, the complete admitted parameters, and the exact bytes
+/// with their version/encoding/digest/length provenance. When the transition
+/// supplied an [`ExactJsonBytes`] authority, `bytes` are those original raw
+/// bytes; otherwise they are the canonical JSON of the admitted parameters
+/// (the only exact representation available on the legacy path, sufficient
+/// for the memory-parity `parameters` readback and for T13 full-content
+/// recovery). `commit_sequence` plus `operation_index` give the durable
+/// capture order; `named_operation_count` is the transition's total operation
+/// count so readers can reconstruct global capture identity.
+#[derive(Clone, Debug)]
+pub(crate) struct EvidenceRecord {
+    pub(crate) operation_index: usize,
+    pub(crate) subject: String,
+    pub(crate) parameters: BTreeMap<String, Value>,
+    pub(crate) version: u16,
+    pub(crate) encoding: String,
+    pub(crate) digest_hex: String,
+    pub(crate) byte_len: usize,
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) commit_sequence: u64,
+    pub(crate) named_operation_count: usize,
+}
 
 /// Planned durable effects of one committed transition.
 #[derive(Clone, Debug)]
@@ -34,10 +80,24 @@ pub(crate) struct ApplyPlan {
     pub(crate) outbox_records: Vec<OutboxIntent>,
     pub(crate) next_commit_sequence: u64,
     pub(crate) next_outbox_sequence: u64,
+    /// Per-operation payload authorities bound into this plan. Empty for
+    /// legacy transitions. Queryable `projection_records` and outbox bodies
+    /// are derivatives of these authorities, never replacements for them.
+    pub(crate) payload_authority: Vec<PayloadAuthorityRecord>,
+    /// Recoverable `CaptureObservation` evidence persisted alongside the
+    /// receipt for the `GetEvidencePack` closed read (T11.1, #19). Present
+    /// for every capture regardless of authority presence; empty when the
+    /// transition carries no capture.
+    pub(crate) evidence_records: Vec<EvidenceRecord>,
 }
 
 /// Computes the durable effects of a transition from current heads and the
 /// store's next sequence values.
+///
+/// Legacy entry point: every operation claims no payload authority, so the
+/// plan carries no authority records and all digests keep their historical
+/// values. Authority-carrying callers use
+/// [`plan_apply_with_payload_authority`].
 pub(crate) fn plan_apply(
     transition: &PreparedTransition,
     current_revision_heads: &[RevisionHead],
@@ -45,7 +105,79 @@ pub(crate) fn plan_apply(
     next_commit_sequence: u64,
     next_outbox_sequence: u64,
 ) -> Result<ApplyPlan, StoreError> {
+    let authorities: Vec<Option<ExactJsonBytes>> = vec![None; transition.named_operations.len()];
+    plan_apply_with_payload_authority(
+        transition,
+        &authorities,
+        current_revision_heads,
+        current_ordering_heads,
+        next_commit_sequence,
+        next_outbox_sequence,
+    )
+}
+
+/// Routes one transition to the legacy or the authority-carrying plan.
+///
+/// Slice C2 (issue #19): when at least one operation claims a payload
+/// authority, the transaction plans through
+/// [`plan_apply_with_payload_authority`] with the original authority values
+/// (never re-parsed from a re-serialized `Value`); otherwise it keeps the
+/// exact legacy [`plan_apply`] path. Authority alignment is enforced in both
+/// directions: a length mismatch against the transition's named operations
+/// fails closed instead of silently dropping or inventing authorities.
+pub(crate) fn select_apply_plan(
+    transition: &PreparedTransition,
+    authorities: &[Option<ExactJsonBytes>],
+    current_revision_heads: &[RevisionHead],
+    current_ordering_heads: &[OrderingHead],
+    next_commit_sequence: u64,
+    next_outbox_sequence: u64,
+) -> Result<ApplyPlan, StoreError> {
+    if authorities.len() != transition.named_operations.len() {
+        return Err(StoreError::InvalidField {
+            field: "payload.authority",
+            reason: "payload authority count does not match named operations",
+        });
+    }
+    if authorities.iter().any(Option::is_some) {
+        plan_apply_with_payload_authority(
+            transition,
+            authorities,
+            current_revision_heads,
+            current_ordering_heads,
+            next_commit_sequence,
+            next_outbox_sequence,
+        )
+    } else {
+        plan_apply(
+            transition,
+            current_revision_heads,
+            current_ordering_heads,
+            next_commit_sequence,
+            next_outbox_sequence,
+        )
+    }
+}
+///
+/// Plans one committed transition with per-operation payload authorities
+/// bound in (issue #10, Wave C).
+///
+/// `authorities` aligns 1:1 with `transition.named_operations`: `Some`
+/// entries are revalidated and must decode to exactly the operation's
+/// queryable parameters, `None` entries mean that operation claims no
+/// authority. When at least one authority is present, the outbox payload
+/// digest binds every authority digest on top of the whole-transition
+/// digest; legacy all-`None` plans keep the exact historical digest.
+pub(crate) fn plan_apply_with_payload_authority(
+    transition: &PreparedTransition,
+    authorities: &[Option<ExactJsonBytes>],
+    current_revision_heads: &[RevisionHead],
+    current_ordering_heads: &[OrderingHead],
+    next_commit_sequence: u64,
+    next_outbox_sequence: u64,
+) -> Result<ApplyPlan, StoreError> {
     transition.validate()?;
+    let records = payload_authority_records(transition, authorities)?;
     let commit_sequence = next_commit_sequence;
     let committed_at = format!("commit-sequence-{next_commit_sequence:016}");
     let next_commit_sequence =
@@ -93,10 +225,11 @@ pub(crate) fn plan_apply(
         &operation_key,
     )?;
     let command_ids = command_ids(transition, &operation_key);
-    let payload_digest = sha256_hex(
-        &canonical_json_bytes(transition)
-            .map_err(|error| StoreError::Serialization(error.to_string()))?,
-    );
+    let payload_digest = if records.is_empty() {
+        transition_payload_digest(transition)?
+    } else {
+        bound_payload_digest(transition, &records)?
+    };
     let projection_records =
         projection_records(transition, &operation_key, &commit_id, &next_revision_heads)?;
     let (outbox_records, next_outbox_sequence) = outbox_records(
@@ -106,6 +239,7 @@ pub(crate) fn plan_apply(
         &payload_digest,
         next_outbox_sequence,
     )?;
+    let evidence_records = evidence_records(transition, authorities, commit_sequence)?;
 
     Ok(ApplyPlan {
         commit_sequence,
@@ -120,7 +254,164 @@ pub(crate) fn plan_apply(
         outbox_records,
         next_commit_sequence,
         next_outbox_sequence,
+        payload_authority: records,
+        evidence_records,
     })
+}
+
+/// Validates per-operation payload authorities against the transition's
+/// queryable parameters and renders their plan records.
+///
+/// Length, digest, duplicate-key, control-field, and narrowing checks all
+/// run here, before any durable effect is planned: a mismatched authority
+/// fails the plan instead of reaching the transaction writer.
+fn payload_authority_records(
+    transition: &PreparedTransition,
+    authorities: &[Option<ExactJsonBytes>],
+) -> Result<Vec<PayloadAuthorityRecord>, StoreError> {
+    if authorities.len() != transition.named_operations.len() {
+        return Err(StoreError::InvalidField {
+            field: "payload.authority",
+            reason: "payload authority count does not match named operations",
+        });
+    }
+    let mut records = Vec::new();
+    for (index, (operation, authority)) in transition
+        .named_operations
+        .iter()
+        .zip(authorities.iter())
+        .enumerate()
+    {
+        if let Some(authority) = authority {
+            authority.validate()?;
+            let decoded = authority.decode_object_parameters()?;
+            if decoded != operation.parameters {
+                return Err(StoreError::InvalidField {
+                    field: "payload.authority",
+                    reason: "payload authority does not match named-operation parameters",
+                });
+            }
+            records.push(PayloadAuthorityRecord {
+                operation_index: index,
+                version: authority.version,
+                encoding: authority.encoding.mnemonic().to_owned(),
+                digest_hex: authority.digest_hex(),
+                byte_len: authority.byte_len(),
+                bytes: authority.bytes.clone(),
+            });
+        }
+    }
+    Ok(records)
+}
+
+/// Builds the recoverable `CaptureObservation` evidence for one transition.
+///
+/// Runs after [`payload_authority_records`] so supplied authorities are
+/// already validated against the queryable parameters. Every capture is
+/// persisted regardless of authority presence: with an authority the original
+/// raw bytes travel verbatim; without one the canonical JSON of the admitted
+/// parameters is the exact recoverable representation (the legacy path has no
+/// original bytes, only the admitted `Value`). A missing or blank subject
+/// fails closed here instead of persisting an unselectable record.
+fn evidence_records(
+    transition: &PreparedTransition,
+    authorities: &[Option<ExactJsonBytes>],
+    commit_sequence: u64,
+) -> Result<Vec<EvidenceRecord>, StoreError> {
+    if authorities.len() != transition.named_operations.len() {
+        return Err(StoreError::InvalidField {
+            field: "payload.authority",
+            reason: "payload authority count does not match named operations",
+        });
+    }
+    let named_operation_count = transition.named_operations.len();
+    let mut records = Vec::new();
+    for (index, (operation, authority)) in transition
+        .named_operations
+        .iter()
+        .zip(authorities.iter())
+        .enumerate()
+    {
+        if operation.operation != NamedMutationOperation::CaptureObservation {
+            continue;
+        }
+        let subject = operation
+            .parameters
+            .get("subject")
+            .and_then(Value::as_str)
+            .ok_or(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "missing required parameter",
+            })?;
+        if subject.trim().is_empty() || subject.chars().any(char::is_control) {
+            return Err(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "subject must be a non-blank string",
+            });
+        }
+        let (version, encoding, digest_hex, byte_len, bytes) = if let Some(authority) = authority {
+            (
+                authority.version,
+                authority.encoding.mnemonic().to_owned(),
+                authority.digest_hex(),
+                authority.byte_len(),
+                authority.bytes.clone(),
+            )
+        } else {
+            let canonical = canonical_json_bytes(&operation.parameters)
+                .map_err(|error| StoreError::Serialization(error.to_string()))?;
+            let bound = ExactJsonBytes::parse(PayloadSource::NamedOperationParameter, &canonical)?;
+            (
+                bound.version,
+                bound.encoding.mnemonic().to_owned(),
+                bound.digest_hex(),
+                bound.byte_len(),
+                bound.bytes.clone(),
+            )
+        };
+        // Legacy fallback provenance uses the canonical authority version;
+        // keep the single owner: the derived bytes must carry the current
+        // authority version, never a hardcoded constant.
+        debug_assert_eq!(version, PAYLOAD_AUTHORITY_VERSION);
+        debug_assert_eq!(encoding, PayloadEncoding::Utf8Json.mnemonic());
+        records.push(EvidenceRecord {
+            operation_index: index,
+            subject: subject.to_owned(),
+            parameters: operation.parameters.clone(),
+            version,
+            encoding,
+            digest_hex,
+            byte_len,
+            bytes,
+            commit_sequence,
+            named_operation_count,
+        });
+    }
+    Ok(records)
+}
+
+/// Whole-transition digest used when no payload authority is claimed.
+/// Computed in exactly one place so legacy and bound plans agree on the
+/// base value.
+fn transition_payload_digest(transition: &PreparedTransition) -> Result<String, StoreError> {
+    Ok(sha256_hex(&canonical_json_bytes(transition).map_err(
+        |error| StoreError::Serialization(error.to_string()),
+    )?))
+}
+
+/// Binds per-operation payload-authority digests over the
+/// whole-transition digest. The base digest keeps its historical value; the
+/// bound digest additionally covers every authority digest in operation
+/// order, so a substituted authority can never reuse a bound outbox row.
+fn bound_payload_digest(
+    transition: &PreparedTransition,
+    records: &[PayloadAuthorityRecord],
+) -> Result<String, StoreError> {
+    let mut material = transition_payload_digest(transition)?;
+    for record in records {
+        material.push_str(&record.digest_hex);
+    }
+    Ok(sha256_hex(material.as_bytes()))
 }
 
 /// Builds and validates the immutable write receipt for a planned transition.
@@ -187,6 +478,139 @@ pub(crate) fn validate_receipt_identity(
     Ok(())
 }
 
+/// Recomputes the canonical request hash from the exact values to be
+/// executed/committed (RECHECK-63 slice C).
+///
+/// Shared-helper only: builds [`CanonicalRequestView::from_apply`] from the
+/// transported `ctx` + `transition` + expected heads and hashes via
+/// [`canonical_request_hash`]. Never reimplements hashing.
+#[allow(dead_code)]
+pub(crate) fn recomputed_canonical_request_hash(
+    ctx: &RequestMeta,
+    transition: &PreparedTransition,
+    expected_revision_heads: &[RevisionHeadExpectation],
+    expected_ordering_heads: &[OrderingHeadExpectation],
+) -> Result<String, StoreError> {
+    let view = CanonicalRequestView::from_apply(
+        ctx,
+        transition,
+        expected_revision_heads,
+        expected_ordering_heads,
+    );
+    canonical_request_hash(&view)
+}
+
+/// Verifies the supplied claim against the recomputed digest and returns the
+/// recomputed value for receipt binding.
+///
+/// Supplied != recomputed is [`StoreError::TransitionDigestMismatch`] with no
+/// transaction and no lookup success. Callers must invoke this BEFORE any
+/// idempotency-lookup success is returned and BEFORE any transaction/receipt.
+#[allow(dead_code)]
+pub(crate) fn verify_apply_canonical_hash(
+    ctx: &RequestMeta,
+    transition: &PreparedTransition,
+    expected_revision_heads: &[RevisionHeadExpectation],
+    expected_ordering_heads: &[OrderingHeadExpectation],
+) -> Result<String, StoreError> {
+    let view = CanonicalRequestView::from_apply(
+        ctx,
+        transition,
+        expected_revision_heads,
+        expected_ordering_heads,
+    );
+    verify_canonical_request_hash(&view, &transition.identity.canonical_request_hash)?;
+    canonical_request_hash(&view)
+}
+
+/// Builds the receipt bound to the recomputed digest (slice C).
+///
+/// Verifies first, then binds `WriteReceipt.canonical_request_hash` to the
+/// recomputed value (never a blind copy of the supplied claim).
+/// Residual wiring (cannot edit `apply.rs` here): `apply.rs:622`
+/// `build_receipt(ctx, &transition, &plan)` must switch to this function with
+/// the `expected_revision_heads` / `expected_ordering_heads` available in
+/// `apply_prepared_with_authority`, otherwise the live Surreal path keeps the
+/// legacy blind-copy receipt for non-empty-heads applies.
+#[allow(dead_code)]
+pub(crate) fn build_receipt_with_expected_heads(
+    ctx: &RequestMeta,
+    transition: &PreparedTransition,
+    plan: &ApplyPlan,
+    expected_revision_heads: &[RevisionHeadExpectation],
+    expected_ordering_heads: &[OrderingHeadExpectation],
+) -> Result<WriteReceipt, StoreError> {
+    let recomputed = verify_apply_canonical_hash(
+        ctx,
+        transition,
+        expected_revision_heads,
+        expected_ordering_heads,
+    )?;
+    let mut receipt = WriteReceipt {
+        operation_id: transition.identity.operation_id.clone(),
+        idempotency_key: transition.identity.idempotency_key.clone(),
+        canonical_request_hash: recomputed,
+        transition_class: transition.transition_class,
+        status: WriteReceiptStatus::Committed,
+        commit_id: Some(plan.commit_id.clone()),
+        state_fence: transition.state_fence.clone(),
+        ordering_sequences: plan.next_ordering_heads.clone(),
+        revision_before_after: plan.revision_before_after.clone(),
+        applied_command_ids: plan.command_ids.clone(),
+        emitted_event_ids: plan.event_ids.clone(),
+        projection_refs: plan
+            .projection_records
+            .iter()
+            .map(|record| record.publication_id.clone())
+            .collect(),
+        outbox_refs: plan
+            .outbox_records
+            .iter()
+            .map(|record| record.outbox_id.clone())
+            .collect(),
+        operation_manifest_digest: transition.operation_manifest_digest.clone(),
+        error_code: None,
+        resubmission: Resubmission::None,
+        committed_at: Some(plan.committed_at.clone()),
+        envelope: None,
+    };
+    receipt.envelope = Some(issue_store_receipt_envelope(
+        ctx,
+        transition,
+        &receipt,
+        plan.commit_sequence,
+    )?);
+    receipt.validate()?;
+    Ok(receipt)
+}
+
+/// Validates receipt identity plus the recomputed digest (slice C).
+///
+/// Checks supplied == recomputed (typed mismatch otherwise), receipt ==
+/// recomputed, and the legacy identity/envelope rules. Residual wiring:
+/// `apply.rs:581` and `apply.rs:638` `validate_receipt_identity` calls must
+/// switch here with the expected heads from `apply_prepared_with_authority`.
+#[allow(dead_code)]
+pub(crate) fn validate_receipt_identity_with_expected_heads(
+    receipt: &WriteReceipt,
+    ctx: &RequestMeta,
+    transition: &PreparedTransition,
+    expected_revision_heads: &[RevisionHeadExpectation],
+    expected_ordering_heads: &[OrderingHeadExpectation],
+) -> Result<(), AdapterError> {
+    let recomputed = verify_apply_canonical_hash(
+        ctx,
+        transition,
+        expected_revision_heads,
+        expected_ordering_heads,
+    )
+    .map_err(AdapterError::Store)?;
+    if receipt.canonical_request_hash != recomputed {
+        return Err(AdapterError::Store(StoreError::InvalidReceipt));
+    }
+    validate_receipt_identity(receipt, ctx, transition)
+}
+
 /// Validates a deduplicated revision-head result set.
 pub(crate) fn validate_revision_heads(heads: &[RevisionHead]) -> Result<(), StoreError> {
     ensure_unique_revision_keys(
@@ -240,6 +664,13 @@ fn command_ids(transition: &PreparedTransition, operation_key: &str) -> Vec<Stri
         .collect()
 }
 
+/// Derives queryable projection publications for a transition.
+///
+/// These records are explicitly derivatives: when a plan carries payload
+/// authorities, the opaque authority bytes (persisted alongside the receipt)
+/// are the lossless representation and these projections must never be used
+/// to reconstruct payload content. Any authority/projection disagreement is
+/// a typed error at the read boundary, never a silent fallback.
 fn projection_records(
     transition: &PreparedTransition,
     operation_key: &str,
@@ -343,7 +774,7 @@ fn ensure_unique_ordering_scopes(scopes: &[OrderingScopeId]) -> Result<(), Store
 mod tests {
     use super::*;
     use eliot_contracts::{
-        AuthorityEpoch, ClockReading, ProductId, RequestId, ResourceGeneration, SourceId,
+        ClockReading, EpochId, EpochLineageId, ProductId, RequestId, ResourceGeneration, SourceId,
     };
     use eliot_store_api::{
         EffectClass, EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
@@ -352,9 +783,20 @@ mod tests {
     };
     use serde_json::json;
     use std::collections::BTreeMap;
+    use std::num::NonZeroU64;
+
+    const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn test_epoch(sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(TEST_LINEAGE_A).expect("valid test lineage"),
+            NonZeroU64::new(sequence).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
 
     fn fixture() -> Result<(RequestMeta, PreparedTransition), StoreError> {
-        let state_fence = StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis());
+        let state_fence = StateFence::new(test_epoch(1), ResourceGeneration::genesis());
         let context = RequestMeta {
             request_id: RequestId::new("request-1").map_err(StoreError::Foundation)?,
             session_id: None,
@@ -437,6 +879,102 @@ mod tests {
         substituted_receipt.envelope =
             Some(ReceiptEnvelope::issue(substituted_core).map_err(StoreError::Receipt)?);
         assert!(validate_receipt_identity(&substituted_receipt, &context, &transition).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn plan_routing_keeps_legacy_path_without_authorities() -> Result<(), StoreError> {
+        use crate::plan::select_apply_plan;
+
+        let (_, transition) = fixture()?;
+        let legacy = plan_apply(&transition, &[], &[], 1, 1)?;
+        assert!(legacy.payload_authority.is_empty());
+        let routed = select_apply_plan(&transition, &[None], &[], &[], 1, 1)?;
+        assert!(routed.payload_authority.is_empty());
+        assert_eq!(
+            routed.outbox_records, legacy.outbox_records,
+            "all-None authorities keep the exact historical digest path"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn plan_routing_binds_original_authority_bytes_when_present() -> Result<(), StoreError> {
+        use crate::plan::select_apply_plan;
+        use eliot_store_api::{ExactJsonBytes, PayloadSource};
+
+        let (_, transition) = fixture()?;
+        let raw = br#"{"subject":"op-envelope"}"#;
+        let authority = ExactJsonBytes::parse(PayloadSource::NamedOperationParameter, raw)?;
+        assert_eq!(
+            authority.decode_object_parameters()?,
+            transition.named_operations[0].parameters,
+            "fixture authority matches the admitted parameters"
+        );
+        let routed = select_apply_plan(&transition, &[Some(authority)], &[], &[], 1, 1)?;
+        assert_eq!(routed.payload_authority.len(), 1);
+        assert_eq!(
+            routed.payload_authority[0].bytes, raw,
+            "original raw bytes reach the plan, never a re-serialized Value"
+        );
+        let legacy = plan_apply(&transition, &[], &[], 1, 1)?;
+        assert_ne!(
+            routed.outbox_records[0].payload_digest, legacy.outbox_records[0].payload_digest,
+            "claimed authority changes the bound outbox digest"
+        );
+        // Misaligned or substituted authorities fail closed.
+        assert!(
+            select_apply_plan(&transition, &[], &[], &[], 1, 1).is_err(),
+            "authority count mismatch fails closed"
+        );
+        let substituted = ExactJsonBytes::parse(
+            PayloadSource::NamedOperationParameter,
+            br#"{"subject":"substituted"}"#,
+        )?;
+        assert!(
+            select_apply_plan(&transition, &[Some(substituted)], &[], &[], 1, 1).is_err(),
+            "substituted authority fails closed"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_recompute_rejects_tamper_and_binds_recomputed() -> Result<(), StoreError> {
+        // RECHECK-63 slice C (pure, no live DB): the shared helper recomputes
+        // from the exact values to be committed. The legacy fixture claim
+        // `"a".repeat(64)` is a placeholder (proof below: it never equals the
+        // recomputed digest), so the new validators bind the recomputed value.
+        // Cross-crate stability: this uses the same `canonical_request_hash`
+        // that yields the Slice A golden
+        // `55e62e405f35c7f137fe9fcdf177c66a1cba54a5b75fb547deaa11f001a89ec1`
+        // in `eliot-store-api`.
+        let (context, mut transition) = fixture()?;
+        let recomputed = recomputed_canonical_request_hash(&context, &transition, &[], &[])?;
+        assert_ne!(
+            recomputed,
+            "a".repeat(64),
+            "placeholder claim is never the real digest"
+        );
+        // Exact binds recomputed and validates.
+        transition.identity.canonical_request_hash = recomputed.clone();
+        let plan = plan_apply(&transition, &[], &[], 1, 1)?;
+        let receipt = build_receipt_with_expected_heads(&context, &transition, &plan, &[], &[])?;
+        assert_eq!(receipt.canonical_request_hash, recomputed);
+        validate_receipt_identity_with_expected_heads(&receipt, &context, &transition, &[], &[])
+            .expect("exact receipt identity validates");
+        // Tampered executable bytes with the old claim fail typed.
+        let mut tampered = transition.clone();
+        tampered.named_operations[0]
+            .parameters
+            .insert("subject".to_owned(), json!("tampered"));
+        assert!(matches!(
+            verify_apply_canonical_hash(&context, &tampered, &[], &[]),
+            Err(StoreError::TransitionDigestMismatch { .. })
+        ));
+        assert!(matches!(
+            build_receipt_with_expected_heads(&context, &tampered, &plan, &[], &[]),
+            Err(StoreError::TransitionDigestMismatch { .. })
+        ));
         Ok(())
     }
 }

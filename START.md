@@ -1,80 +1,71 @@
 # START HERE
 
-Read this file first. It is the shortest complete path from a cold start to a
-merged change. It does not replace `AGENTS.md`, `WORKFLOW.md` or the normative
-pair; it tells you which of them you actually need for the task in front of you.
+Read this file first. It is the shortest route from a cold start to a merged change.
+It does not replace `AGENTS.md`, `WORKFLOW.md`, or the normative pair; it points to the authority you need.
 
-## 1. Current phase — draft product, code first
+## 1. Priority — code first
 
-The product does not run end to end yet. **The priority is writing the missing
-code and landing it on `main`**, not proving the code that is already there.
+The product is a draft: write the missing code and land it on `main`. Do not build
+ceremony, exhaustive negative matrices, or projections before the capability exists.
 
-    44 capability cells declared      2 implemented
-    318 open issues                   42 open pull requests
-    134 tests ignored (need a live runtime)
+## 2. Roles are distinct
 
-Consequences for how you work, in order of importance:
+- **Controller (root-owned sync only):** performs the coordinated upstream fetch and
+  publishes the authority receipt (remote URL, tracked ref, commit SHA, sync result, UTC timestamp).
+- **Manager:** works in its own worktree, never runs fetch or pull, and merges its own
+  verified PR only after the standing gate passes.
+- **Writer:** implements one owning issue inside the claimed scope only, and never merges its own work.
+- **Independent verifier:** reviews the diff against the owning issue; never the writer.
 
-1. **Write implementation, not test scaffolding.** A cell needs enough tests to
-   show it does what its issue says. It does not need an exhaustive negative
-   matrix before the product has ever started. Tests that prove an unbuilt
-   system are deferred work, not progress.
-2. **Land on `main` quickly.** A branch that lives longer than its own work is
-   a liability. Merge, delete the branch, move on.
-3. **Do not accumulate on disk.** No stray `target/` directories outside the
-   configured shared one, no long-lived worktrees, no local-only branches. One
-   worktree per active task, removed when the task ends.
+## 3. Start from the published authority
 
-## 2. Cold start — six commands
-
-```bash
-git fetch origin --prune
-git rev-list --count HEAD..origin/main        # must print 0; if not, fast-forward
-gh issue view <N> -R UnknownAlienHuman/eliot-memory-os --json title,body
-git switch --detach origin/main
-git switch -c work/<N>-<short-slug>           # ^(work|fix|docs|chore|refactor|test)/[0-9]+-[a-z0-9-]+$
-cargo check -p <package> --all-targets
+```powershell
+git status --short --branch
+git rev-parse HEAD
 ```
 
-Existence of any path is checked with `git ls-tree -r --name-only origin/main`,
-never with `ls` — the Windows filesystem is case-insensitive and git is not, and
-a local working copy can be behind.
+Confirm `HEAD` equals the base SHA from the published authority receipt and the tree is clean
+for your scope. Provision one worktree per mutating branch from that published SHA, then create:
 
-## 3. The rules that actually block a merge
-
-- One issue, one branch, one PR. The branch name carries the issue number.
-- `Implements #N` in the PR body. `Closes #N` only when the issue is fully done.
-- Exclusive mutable scope: touch only the paths your issue owns. If two issues
-  write one file, say so in the PR body and agree an order — do not race.
-- Do not edit an issue's acceptance to match what you built.
-- Never claim a check you did not run. If build, tests or lint were not
-  executed, say so in the PR body in one sentence. An honest gap is mergeable;
-  a false claim is not.
-
-## 4. Where the documentation is, and when you need it
-
-| You are doing | Read |
-| --- | --- |
-| any change at all | this file, then `AGENTS.md` |
-| branch/worktree mechanics | `WORKFLOW.md` |
-| a capability cell | the issue body, then the cell's `module.toml` |
-| something touching contracts or the wire | `docs/ARCHITECTURE_CONTRACT.md` and the named shard only |
-| finding the owner of a file | `docs/PROJECT_MAP.md` |
-| running a repository script | `scripts/README.md` |
-
-The full verified-reading protocol in `docs/architecture/READING_PROTOCOL.md`
-routes documentation for contract-level changes. It is expensive. Use it when
-you are changing a contract, not when you are filling in an implementation whose
-contract already exists.
-
-## 5. Finishing
-
-```bash
-cargo check -p <package> --all-targets        # must pass
-cargo test -p <package>                       # run it; report the number
-git push -u origin work/<N>-<slug>
-gh pr create --base main --title "[<UNIT>] <what>" --body "Implements #N ..."
-gh pr merge <PR> --squash --delete-branch      # when green and reviewed
+```powershell
+git switch -c <kind>/<issue>-<short-slug>
 ```
 
-Then remove your worktree. Nothing regenerable stays on disk.
+Form is `<kind>/<issue>-<slug>` with kind `work`, `fix`, `docs`, `chore`, `refactor`, or `test`.
+One issue, one branch, one PR. One mutable path scope has one writer. See `AGENTS.md` and `WORKFLOW.md`
+for branch validity and the forbidden sync and ref-mutation list.
+
+## 4. Route docs for every change
+
+```text
+python scripts/docs_read.py read --path <repository/path> --topic "<causal property>" --output .eliot/docs-read-bundle.md --receipt-out .eliot/docs-read-receipt.json
+```
+
+Run routing for every mutation class (code, configuration, tests, workflows, normative prose).
+Repeat `--path` for every mutable path family. Open the verified bundle and read every required
+item before mutation. Record receipt IDs, matched routes, required handles, fragment paths and hashes,
+bundle hash, and attestation in the PR. See `docs/architecture/READING_PROTOCOL.md`.
+
+## 5. Proof is governed by the owning issue
+
+The owning-issue acceptance defines the required proof. Run the smallest proof that can fail on the
+changed path while iterating; iteration speed never waives mandatory package, edge, negative, or Product
+checks at completion. Keep iteration checks separate from completion gates.
+
+```powershell
+cargo metadata --locked --no-deps
+cargo check --locked -p <package> --all-targets
+cargo test --locked -p <package>
+```
+
+Use focused package and edge proofs while iterating; run wider suites only for a matching blast radius.
+Report every skipped, failed, simulated, or unavailable check exactly. An honest gap is reported and is
+not automatically mergeable; a false claim never merges. See `WORKFLOW.md` and `docs/ARCHITECTURE_CONTRACT.md`.
+
+## 6. Finish
+
+Open a PR to `main` with the authority receipt, read receipt, base and candidate revisions, scope, proof,
+and residuals. The writer never merges; the manager merges its verified PR after the gate, then retires
+the branch and removes the worktree. See `workstreams/ACTIVE.toml` for programme state.
+
+Map: Architecture `docs/ARCHITECTURE_CONTRACT.md` · source `docs/PROJECT_MAP.md` · scripts `scripts/README.md`.

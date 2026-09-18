@@ -9,11 +9,10 @@ use std::{
 
 use eliot_mcp::{
     ActInput, ActiveSessionBinding, ApplicationRequest, BindingResolutionRequest, BridgeError,
-    CANONICAL_TOOL_NAMES, CompatibilityCorrelation, CoordinateInput, DurableJobHandle,
-    FinishAttemptDraft, InitializeRequest, JobPresentation, KernelGovernorPort, LoopbackProfile,
-    McpCore, McpProtocolVersion, NoProviderPort, ObserveInput, PacketInput, PortFailure,
-    PortProjection, ProjectionKind, QueryInput, ResponseKind, StateInput, ToolRequest,
-    TransportProfile, TransportRequestContext, VerifyInput, canonical_schema,
+    CANONICAL_TOOL_NAMES, CoordinateInput, DurableJobHandle, FinishAttemptDraft, InitializeRequest,
+    JobPresentation, KernelGovernorPort, LoopbackProfile, McpCore, NoProviderPort, ObserveInput,
+    PacketInput, PortFailure, PortProjection, ProjectionKind, QueryInput, ResponseKind, StateInput,
+    ToolRequest, TransportProfile, TransportRequestContext, VerifyInput, canonical_schema,
     canonical_tool_schemas,
 };
 use eliot_protocol::HARD_STRUCTURED_RESPONSE_BYTES;
@@ -679,13 +678,36 @@ impl KernelGovernorPort for CapturePort {
 }
 
 #[test]
-fn memory_use_alias_is_exactly_observe_influence_ack() -> Result<(), Box<dyn Error>> {
+fn legacy_memory_use_alias_is_rejected_as_unknown_variant() -> Result<(), Box<dyn Error>> {
+    use eliot_mcp::{TypedRejection, decode_protected_request_bytes};
     let port = CapturePort::default();
     let arguments = json!({
         "memory_handle": "memory-1",
         "influence_class": "changed_verifier",
         "downstream_public_ref": "verification-1"
     });
+    let alias_value = request_value(
+        "request-2",
+        "idem-2",
+        false,
+        json!({"name":"eliot.memory_use","arguments":arguments}),
+    );
+    assert!(
+        parse_request(alias_value.clone()).is_err(),
+        "legacy alias must not decode to a dispatchable request"
+    );
+    let raw = serde_json::to_vec(&alias_value)?;
+    assert!(
+        matches!(
+            decode_protected_request_bytes(&raw),
+            Err(TypedRejection::UnknownVariant { .. })
+        ),
+        "legacy alias must be an unknown protected variant"
+    );
+    assert!(
+        port.tools.borrow().is_empty(),
+        "rejected alias must never reach dispatch"
+    );
     let canonical = parse_request(request_value(
         "request-1",
         "idem-1",
@@ -700,21 +722,8 @@ fn memory_use_alias_is_exactly_observe_influence_ack() -> Result<(), Box<dyn Err
             }
         }),
     ))?;
-    let alias = parse_request(request_value(
-        "request-2",
-        "idem-2",
-        false,
-        json!({"name":"eliot.memory_use","arguments":arguments}),
-    ))?;
-    let canonical_response =
-        McpCore.execute(&port, stdio_transport("connection-1", 1), canonical)?;
-    let alias_response = McpCore.execute(&port, stdio_transport("connection-1", 1), alias)?;
-
-    assert_eq!(canonical_response.canonical_tool_name, "eliot.observe");
-    assert_eq!(alias_response.canonical_tool_name, "eliot.observe");
-    let tools = port.tools.borrow();
-    assert_eq!(tools.len(), 2);
-    assert_eq!(tools[0], tools[1]);
+    let response = McpCore.execute(&port, stdio_transport("connection-1", 1), canonical)?;
+    assert_eq!(response.canonical_tool_name, "eliot.observe");
     Ok(())
 }
 
@@ -983,42 +992,34 @@ fn absent_provider_is_typed_plan_gap_never_fake_success() -> Result<(), Box<dyn 
 }
 
 #[test]
-fn compatibility_hint_is_isolated_and_cannot_supply_session() -> Result<(), Box<dyn Error>> {
+fn primary_path_admits_final_without_hint_and_rejects_legacy() -> Result<(), Box<dyn Error>> {
     let port = CapturePort::default();
-    let mut request = parse_request(request_value("request-1", "idem-1", false, state_tool()))?;
-    request.protocol_version = McpProtocolVersion::Compat2025_11_25;
-    assert!(matches!(
-        McpCore.execute(&port, stdio_transport("connection-1", 1), request.clone()),
-        Err(BridgeError::InvalidArgument { .. })
-    ));
-    let response = McpCore.execute_compat(
-        &port,
-        stdio_transport("connection-1", 1),
-        request,
-        CompatibilityCorrelation {
-            transport_session_hint: Some("transport-only".to_owned()),
-        },
-    )?;
-    assert_eq!(
-        response.compatibility_correlation_hint.as_deref(),
-        Some("transport-only")
+    let request = parse_request(request_value("request-1", "idem-1", false, state_tool()))?;
+    let response = McpCore.execute(&port, stdio_transport("connection-1", 1), request)?;
+    assert_eq!(response.canonical_tool_name, "eliot.state");
+    let encoded = serde_json::to_value(&response)?;
+    assert!(
+        encoded.get("compatibility_correlation_hint").is_none(),
+        "single native path carries no compat hint"
     );
 
-    let mut missing_session = request_value("request-2", "idem-2", false, state_tool());
-    missing_session["protocol_version"] = json!("2025-11-25");
+    let mut legacy_protocol = request_value("request-2", "idem-2", false, state_tool());
+    legacy_protocol["protocol_version"] = json!("2025-11-25");
+    assert!(
+        parse_request(legacy_protocol).is_err(),
+        "legacy protocol must not decode to a dispatchable request"
+    );
+
+    let mut missing_session = request_value("request-3", "idem-3", false, state_tool());
     missing_session["identity"]["request"]["metadata"]["session_id"] = Value::Null;
     let parsed = parse_request(missing_session)?;
-    assert!(matches!(
-        McpCore.execute_compat(
-            &port,
-            stdio_transport("connection-1", 1),
-            parsed,
-            CompatibilityCorrelation {
-                transport_session_hint: Some("session-1".to_owned())
-            }
+    assert!(
+        matches!(
+            McpCore.execute(&port, stdio_transport("connection-1", 1), parsed),
+            Err(BridgeError::InvalidArgument { .. })
         ),
-        Err(BridgeError::InvalidArgument { .. })
-    ));
+        "explicit session binding remains required on the single path"
+    );
     Ok(())
 }
 

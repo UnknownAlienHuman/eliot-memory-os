@@ -249,7 +249,11 @@ pub fn validate_no_secret_or_fixed_input(
     Ok(())
 }
 
-fn diversity_gaps(
+/// Reports the required dimensions on which `current` collides with `prior`
+/// by exact equality (`host_family`, full `RouteFingerprint`, `model_family`).
+/// Display strings such as model/entry labels are never compared: a different
+/// display name alone never satisfies independence.
+pub(crate) fn entry_diversity_gaps(
     current: &ModelCatalogueEntry,
     prior: &ModelCatalogueEntry,
     dimensions: &BTreeSet<DiversityDimension>,
@@ -304,7 +308,7 @@ pub fn decide_diversity(
             attempt_id: attempt_id.clone(),
         },
         (Some(req), Some((_, prior_entry))) => {
-            let gaps = diversity_gaps(current, prior_entry, &req.dimensions);
+            let gaps = entry_diversity_gaps(current, prior_entry, &req.dimensions);
             if gaps.is_empty() {
                 DiversityOutcome::Satisfied {
                     attempt_id: attempt_id.clone(),
@@ -397,7 +401,7 @@ pub fn decide_swarm_diversity(
             return Err(DiversityError::InvalidField("diversity.attempt_id"));
         }
         let gaps = if let (Some(req), Some((_, prior_entry))) = (requirement.as_ref(), prior) {
-            diversity_gaps(entry, prior_entry, &req.dimensions)
+            entry_diversity_gaps(entry, prior_entry, &req.dimensions)
         } else {
             Vec::new()
         };

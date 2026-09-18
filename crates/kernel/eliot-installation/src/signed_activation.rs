@@ -262,11 +262,18 @@ fn require_stopped_scm_observation(
                 "transaction-approved SCM service is absent during activation staging".to_owned(),
             ))
         }
-        ServiceRegistrationRuntimeInspection::Mismatched
-        | ServiceRegistrationRuntimeInspection::Unknown => {
+        ServiceRegistrationRuntimeInspection::Mismatched => {
             Err(InstallationError::IncompleteObservation(
                 "SCM configuration or process observation is unknown or mismatched".to_owned(),
             ))
+        }
+        ServiceRegistrationRuntimeInspection::Unknown { detail } => {
+            // s40 (#1352): `detail` is secret-free Win32/stage/state only, so it
+            // is safe to surface as bounded diagnostics while staying fail-closed.
+            Err(InstallationError::IncompleteObservation(format!(
+                "SCM configuration or process observation is unknown or mismatched ({})",
+                detail.detail()
+            )))
         }
     }
 }
@@ -985,7 +992,7 @@ mod tests {
         for observation in [
             ServiceRegistrationRuntimeInspection::Absent,
             ServiceRegistrationRuntimeInspection::Mismatched,
-            ServiceRegistrationRuntimeInspection::Unknown,
+            ServiceRegistrationRuntimeInspection::unknown(5, "query-status"),
         ] {
             assert!(require_stopped_scm_observation(observation).is_err());
         }

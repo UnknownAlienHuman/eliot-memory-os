@@ -7,9 +7,10 @@ Start with the [mandatory verified-reading protocol](architecture/READING_PROTOC
 <!-- eliot-doc-routing:end -->
 
 
-Status: current routing map for `main`, audited against
-`0f2c94730a7e7947ec973474e3b469ce75f9469d` on 2026-08-31. Navigation only;
-product status remains `NOT_ACCEPTED / UNVERIFIED`.
+Status: stable source-plane and capability boundary routing map for `main`.
+Current work routing observations are derived from current capability registry
+(#13) and workstream assignments. Navigation only; product status remains
+`NOT_ACCEPTED / UNVERIFIED`.
 
 ## Authority and work
 
@@ -63,19 +64,19 @@ runtime health, authority correctness, Product acceptance, or release support.
 | Cargo member | Executable | Intended boundary | Work item |
 |---|---|---|---|
 | `bins/eliot` | `eliot.exe` | canonical one-shot operator/agent CLI and installation/runtime-status front door | current surface/installation issue; live proof #11 |
-| `bins/eliot-agent-bridge` | `eliot-agent-bridge.exe` | thin public agent bridge ingress surface | open #13; full bridge integration #77 |
-| `bins/eliot-doctor` | `eliot-doctor.exe` | bounded one-shot repair composition root | completed baseline #17; open process follow-up #100 |
-| `bins/eliot-dreamer` | `eliot-dreamer.exe` | candidate-only Dreamer execution surface | open cognitive issues #38–#45 |
+| `bins/eliot-agent-bridge` | `eliot-agent-bridge.exe` | thin public agent bridge ingress surface | completed baseline #13; current bridge port and admission #77 / #342 |
+| `bins/eliot-doctor` | `eliot-doctor.exe` | bounded one-shot repair composition root | completed baseline #17; process convergence #100; runtime recovery #461 |
+| `bins/eliot-dreamer` | `eliot-dreamer.exe` | candidate-only Dreamer execution surface | open Dreamer runtime issues #461, #1098, #1100, #78, #342 |
 | `bins/eliot-host` | `eliot-host.exe` | external lifecycle, journal, launch, and recovery boundary | open #14 |
 | `bins/eliot-kernel` | `eliot-kernel.exe` | identity, fencing, ORS, reserve, and generation routing | open #15 |
 | `bins/eliot-mod-research` | `eliot-mod-research.exe` | governed external-corpus acquisition provider process | open #24 |
 | `bins/eliot-native-worker` | `eliot-native-worker.exe` | isolated OS-heavy native generation | open #22 |
-| `bins/eliot-notify` | `eliot-notify.exe` | thin stateless/near-stateless notification surface | open #13 |
+| `bins/eliot-notify` | `eliot-notify.exe` | thin stateless/near-stateless notification surface | completed baseline #13; ledger delivery repair #1119 |
 | `bins/eliot-store-surreal` | `eliot-store-surreal.exe` | closed Surreal store bridge composition root | open #19; payload regression #10 |
 | `bins/eliot-testd` | `eliot-testd.exe` | isolated typed Instrument execution | open #20 |
-| `bins/eliot-user-broker` | `eliot-user-broker.exe` | SID/session-bound interactive-user launch and resources | completed baseline #23; open process follow-up #100 |
+| `bins/eliot-user-broker` | `eliot-user-broker.exe` | SID/session-bound interactive-user launch and resources | completed baseline #23; process convergence #100; operation identity #74 |
 | `bins/eliot-wasm-host` | `eliot-wasm-host.exe` | capability-limited WASM/component mechanics | open #21 |
-| `bins/eliot-watchdog` | `eliot-watchdog.exe` | independent supervision process | completed baseline #16; open process follow-up #100 |
+| `bins/eliot-watchdog` | `eliot-watchdog.exe` | independent supervision process | completed baseline #16; process convergence #100; spool reconciliation #458 |
 | `bins/eliotd` | `eliotd.exe` | Governor semantic daemon/application owner | open #18 |
 
 The executable inventory is checked against the root `Cargo.toml`; a new or
@@ -91,7 +92,7 @@ do not make them current runtime or semantic owners.
 
 | Facade | Current disposition |
 |---|---|
-| `crates/eliot-app` / `eliot-governor` | Legacy migration/regression facade. Not a production composition root or root default member. Read its local `AGENTS.md`; no new feature or state/effect owner is allowed. Extraction/disposition is owned by open #18 and registry binding by open #13. |
+| `crates/eliot-app` / `eliot-governor` | Legacy migration/regression facade. Not a production composition root or root default member. Read its local `AGENTS.md`; no new feature or state/effect owner is allowed. Extraction/disposition is owned by open #18, registry binding by #13, and aggregate retirement by #1189. |
 | `crates/eliot-engine` | Migration facade for historical application/domain logic. New capabilities belong in the declared current owner; edits require a proven current consumer or extraction path. |
 | `crates/eliot-store` | Migration facade around historical store-facing behavior. It cannot bypass the current store API/bridge or become a second storage owner. |
 | `crates/eliot-types` | Migration contract/type facade. It must not become an unbounded common-type owner; stable current contracts live in the declared foundation/domain contract crates. |
@@ -139,17 +140,17 @@ table cannot grant authority by itself.
 - Open core/daemon issues #13–#15, #18–#22, and #24 use fresh issue-numbered
   branches and `workstreams/core-daemons/AGENTS.md`.
 - Completed boundary baselines #16, #17, and #23 remain historical references;
-  open #100 owns the shared native-process contract/convergence follow-up across
+  #100 owns the shared native-process contract/convergence follow-up across
   those and other process clients.
-- Open cognitive issues #38–#45 use the wave/edge/donor/decision manifests
-  already on `main`; every implementation cell receives a fresh issue-numbered
-  branch.
+- Current Dreamer and cognitive runtime issues #461, #1098, #1100, #78, #342 use
+  fresh issue-numbered branches under their owning assignments.
+- Current storage issues #1221 (schema migration owner) and #451 (store failure
+  propagation/transport) own storage-layer repairs.
 - Issue #11 owns current live Windows installation and Product-Pulse evidence.
 
 Dreamer remains outside the core/daemon workstream. Its source/build presence is
 not runtime or Product support.
 
-There is no shared long-lived implementation branch. Visible legacy refs are
-non-mutable aliases of `main` until they can be physically deleted. Current
+There is no shared long-lived implementation branch. `main` is the sole persistent authority branch; any other visible branch is a temporary issue-numbered branch with an open pull request and is deleted after merge, rejection, or supersession. Current
 support still requires exact source/build/runtime/store evidence and the
 applicable Product Pulse; committed prose does not substitute for that proof.

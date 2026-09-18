@@ -64,12 +64,73 @@ pub const MAX_PACKAGE_FILE_BYTES: u64 = 512 * 1024 * 1024;
 /// Maximum aggregate bytes copied by one default stager call.
 pub const MAX_PACKAGE_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
+
+/// Distinct `CreateFileW` operation sites along the `StagePackage` create path,
+/// in sequence order.
+///
+/// Every site names the exact path-open that failed so a sharing violation
+/// (`ERROR_SHARING_VIOLATION`, 32) attributes its operation instead of
+/// collapsing all ~15 opens to the same `CreateFileW` stage. The
+/// `PackageStagingStage` wire enum is intentionally left unchanged: it is a
+/// `SCREAMING_SNAKE_CASE` + `JsonSchema` wire surface with exhaustive matches
+/// in crates this change does not own, so the site travels as a kebab-case
+/// side-channel string on the additive `Win32At` error variant (old `Win32`
+/// payloads still deserialize) and into the `stage-package-win32-v1` pending
+/// reference as `create-file-w:<site>:<code>`.
+const STAGING_SITE_OPEN: &str = "open";
+const STAGING_SITE_MARKER_PROBE: &str = "marker-probe";
+const STAGING_SITE_MARKER_READ: &str = "marker-read";
+const STAGING_SITE_MARKER_CREATE: &str = "marker-create";
+const STAGING_SITE_RETAIN_GENERATION_PARENT: &str = "retain-generation-parent";
+const STAGING_SITE_TRUSTED_SOURCE_ROOT: &str = "trusted-source-root";
+const STAGING_SITE_TRUSTED_SOURCE_READ_DIR: &str = "trusted-source-read-dir";
+const STAGING_SITE_TRUSTED_SOURCE_ENTRY: &str = "trusted-source-entry";
+const STAGING_SITE_TRUSTED_SOURCE_METADATA: &str = "trusted-source-metadata";
+const STAGING_SITE_TRUSTED_SOURCE_CHILD_DIR: &str = "trusted-source-child-dir";
+const STAGING_SITE_TRUSTED_SOURCE_CHILD_FILE: &str = "trusted-source-child-file";
+const STAGING_SITE_GENERATION_ROOT_PROBE: &str = "generation-root-probe";
+const STAGING_SITE_GENERATION_ROOT_CREATE: &str = "generation-root-create";
+const STAGING_SITE_DESTINATION_DIRECTORY_CREATE: &str = "destination-directory-create";
+const STAGING_SITE_SOURCE_OPEN: &str = "source-open";
+const STAGING_SITE_DESTINATION_FILE_CREATE: &str = "destination-file-create";
+const STAGING_SITE_DESTINATION_WALK_ROOT: &str = "destination-walk-root";
+const STAGING_SITE_DESTINATION_WALK_READ_DIR: &str = "destination-walk-read-dir";
+const STAGING_SITE_DESTINATION_WALK_ENTRY: &str = "destination-walk-entry";
+const STAGING_SITE_DESTINATION_WALK_METADATA: &str = "destination-walk-metadata";
+const STAGING_SITE_DESTINATION_WALK_CHILD_DIR: &str = "destination-walk-child-dir";
+const STAGING_SITE_DESTINATION_WALK_CHILD_FILE: &str = "destination-walk-child-file";
 #[cfg(test)]
 const AGENT_BRIDGE_FAIL_FINAL_PATH: u8 = 1;
 #[cfg(test)]
 const AGENT_BRIDGE_FAIL_DESTINATION_EXISTS: u8 = 2;
 #[cfg(test)]
 static AGENT_BRIDGE_POST_CREATE_FAILURE: AtomicU8 = AtomicU8::new(0);
+#[cfg(test)]
+thread_local! {
+    /// Test-only binding of one armed post-create injection to the preparing
+    /// thread. The global arm flag is claimed exactly once at prepare entry,
+    /// so a concurrent prepare on another thread can no longer consume an
+    /// injection armed for this thread's test. Injection kinds and error
+    /// mappings are unchanged; only the claim point moves from use to entry.
+    static STAGED_BRIDGE_FAILURE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+/// Claim one armed post-create injection for the calling thread, resetting
+/// any prior claim. Called first on every prepare so an armed kind can
+/// neither leak across prepares nor be stolen across threads.
+#[cfg(test)]
+fn consume_armed_bridge_failure() {
+    let armed = AGENT_BRIDGE_POST_CREATE_FAILURE.swap(0, AtomicOrdering::SeqCst);
+    STAGED_BRIDGE_FAILURE.with(|slot| slot.set(armed));
+}
+
+/// Peek the calling thread's claimed injection kind without consuming it: at
+/// most one armed kind exists per prepare, and each post-create checkpoint
+/// matches only its own kind.
+#[cfg(test)]
+fn staged_bridge_failure() -> u8 {
+    STAGED_BRIDGE_FAILURE.with(std::cell::Cell::get)
+}
 /// Maximum number of files plus directories walked from one source root.
 pub const MAX_ENUMERATED_ENTRIES: usize = MAX_PACKAGE_FILES * 2 + MAX_PACKAGE_PATH_DEPTH;
 
@@ -477,6 +538,16 @@ pub enum PackageStagingError {
         stage: PackageStagingStage,
         code: u32,
     },
+    /// Same as [`Self::Win32`] but with the distinct `CreateFileW` operation
+    /// site attached (see the `STAGING_SITE_*` constants). The stage and code
+    /// are preserved verbatim; the site only attributes which path-open along
+    /// the `StagePackage` sequence failed. Additive so existing `Win32`
+    /// payloads and matches keep compiling and deserializing.
+    Win32At {
+        stage: PackageStagingStage,
+        site: String,
+        code: u32,
+    },
 }
 
 impl fmt::Display for PackageStagingError {
@@ -489,6 +560,12 @@ impl fmt::Display for PackageStagingError {
             }
             Self::Win32 { stage, code } => {
                 write!(formatter, "{stage:?} failed with Win32 status {code:#010x}")
+            }
+            Self::Win32At { stage, site, code } => {
+                write!(
+                    formatter,
+                    "{stage:?} failed with Win32 status {code:#010x} at operation site '{site}'"
+                )
             }
             other => formatter.write_str(match other {
                 Self::InvalidRelativePath => "invalid package-relative path",
@@ -510,7 +587,8 @@ impl fmt::Display for PackageStagingError {
                 Self::PeParse(_)
                 | Self::Authenticode(_)
                 | Self::AuthenticodeRejected(_)
-                | Self::Win32 { .. } => {
+                | Self::Win32 { .. }
+                | Self::Win32At { .. } => {
                     unreachable!()
                 }
             }),
@@ -519,6 +597,26 @@ impl fmt::Display for PackageStagingError {
 }
 
 impl std::error::Error for PackageStagingError {}
+
+impl PackageStagingError {
+    /// Attach a distinct `CreateFileW` operation site to a native staging error.
+    ///
+    /// A bare [`Self::Win32`] becomes [`Self::Win32At`] with the stage and code
+    /// preserved verbatim; an already-sited error keeps its original site so a
+    /// single failure cannot be relabeled while propagating through nested
+    /// staging calls. Non-Win32 errors pass through unchanged.
+    #[must_use]
+    fn with_site(self, site: &'static str) -> Self {
+        match self {
+            Self::Win32 { stage, code } => Self::Win32At {
+                stage,
+                site: site.to_owned(),
+                code,
+            },
+            other => other,
+        }
+    }
+}
 
 /// One retained trusted source bundle contour.
 ///
@@ -958,6 +1056,15 @@ fn map_package_open_error(error: std::io::Error) -> PackageStagingError {
     map_package_io_error(error, PackageStagingStage::CreateFileW)
 }
 
+/// Same as [`map_package_open_error`] but with the distinct `StagePackage`
+/// operation site attached, so the pending reference names the exact failing
+/// open (`create-file-w:<site>:<code>`) instead of collapsing every site to
+/// bare `create-file-w`. `NotFound` still classifies as `RootUnavailable` and
+/// unmapped I/O still reports bare `Io`; only the Win32 case gains a site.
+fn map_package_open_error_at(error: std::io::Error, site: &'static str) -> PackageStagingError {
+    map_package_open_error(error).with_site(site)
+}
+
 #[allow(
     clippy::needless_pass_by_value,
     reason = "std::io::Error is consumed by each map_err boundary"
@@ -993,6 +1100,16 @@ fn map_restore_privilege_error(error: super::InstallerRootError) -> PackageStagi
     }
 }
 
+/// Map a handle-relative directory-publication failure into staging errors.
+///
+/// `DirectoryPublicationError::Win32` originates only in
+/// `apply_owned_directory_security` (`SetSecurityInfo`), so it keeps the
+/// `SetSecurityInfo` stage here: relabeling it `CreateFileW` would erase the
+/// real failing call. Native `NtCreateFile` failures arrive as bare `Io`
+/// (the publication error carries no NT status), which this mapper preserves
+/// as `Io` rather than inventing a code. Callers attach their distinct
+/// `StagePackage` operation site on top via [`PackageStagingError::with_site`],
+/// keeping the `NtCreateFile` vs `SetSecurityInfo` distinction intact.
 fn map_directory_publication_error(error: super::DirectoryPublicationError) -> PackageStagingError {
     match error {
         super::DirectoryPublicationError::AlreadyExists => PackageStagingError::GenerationExists,
@@ -1008,6 +1125,33 @@ fn map_directory_publication_error(error: super::DirectoryPublicationError) -> P
             PackageStagingError::UnsupportedPlatform
         }
     }
+}
+
+/// Preserve the exact conversion status when the expected installer security
+/// descriptor cannot be built.
+///
+/// `OwnedSecurityDescriptor::for_installer_system_object` converts a fixed
+/// SDDL string, so its adapter error carries no object classification of its
+/// own. The conversion issues no other Win32 call between its failure and
+/// this mapping, so the calling thread's last-error value still reports the
+/// exact conversion status. A zero status would mean that status was lost;
+/// stay fail-closed with a bare mismatch in that impossible case. The `stage`
+/// names the security operation the descriptor was being built for, so a
+/// mismatch keeps its security meaning with its native detail attached.
+#[cfg(windows)]
+fn map_installer_descriptor_error(
+    _error: super::WindowsAdapterError,
+    stage: PackageStagingStage,
+) -> PackageStagingError {
+    let code = unsafe {
+        // SAFETY: `GetLastError` only reads the calling thread's last-error
+        // value; it preserves that value and touches no other state.
+        windows_sys::Win32::Foundation::GetLastError()
+    };
+    if code == 0 {
+        return PackageStagingError::SecurityMismatch;
+    }
+    PackageStagingError::Win32 { stage, code }
 }
 
 #[derive(Debug)]
@@ -1066,15 +1210,7 @@ fn final_path_after_agent_bridge_create(
     file: &std::fs::File,
 ) -> Result<PathBuf, PackageStagingError> {
     #[cfg(test)]
-    if AGENT_BRIDGE_POST_CREATE_FAILURE
-        .compare_exchange(
-            AGENT_BRIDGE_FAIL_FINAL_PATH,
-            0,
-            AtomicOrdering::SeqCst,
-            AtomicOrdering::SeqCst,
-        )
-        .is_ok()
-    {
+    if staged_bridge_failure() == AGENT_BRIDGE_FAIL_FINAL_PATH {
         return Err(PackageStagingError::Win32 {
             stage: PackageStagingStage::GetFinalPathNameByHandleW,
             code: 5,
@@ -1085,15 +1221,7 @@ fn final_path_after_agent_bridge_create(
 
 fn destination_exists_after_agent_bridge_create(path: &Path) -> Result<bool, PackageStagingError> {
     #[cfg(test)]
-    if AGENT_BRIDGE_POST_CREATE_FAILURE
-        .compare_exchange(
-            AGENT_BRIDGE_FAIL_DESTINATION_EXISTS,
-            0,
-            AtomicOrdering::SeqCst,
-            AtomicOrdering::SeqCst,
-        )
-        .is_ok()
-    {
+    if staged_bridge_failure() == AGENT_BRIDGE_FAIL_DESTINATION_EXISTS {
         return Err(PackageStagingError::Win32 {
             stage: PackageStagingStage::GetFileInformationByHandle,
             code: 5,
@@ -1203,6 +1331,19 @@ fn validate_stage_binding(
         return Err(PackageStagingError::IdentityMismatch);
     }
     Ok(())
+}
+
+/// Classify a size divergence against a prepared bridge capability as an
+/// identity mismatch: the live object no longer matches the bound source
+/// facts, so it is not the bound object. Direct measurement helpers keep
+/// reporting `SizeMismatch` for their own callers; only the
+/// capability-binding layer translates, so a substituted or tampered binding
+/// is never mistaken for a benign same-object truncation.
+fn map_prepared_binding_size_error(error: PackageStagingError) -> PackageStagingError {
+    match error {
+        PackageStagingError::SizeMismatch => PackageStagingError::IdentityMismatch,
+        other => other,
+    }
 }
 
 fn validate_agent_bridge_prepared(
@@ -1344,6 +1485,8 @@ pub fn prepare_agent_bridge_stage(
     effect_id: &str,
     request_digest: &str,
 ) -> Result<AgentBridgeStagePrepared, PackageStagingError> {
+    #[cfg(test)]
+    consume_armed_bridge_failure();
     let root_path = installation_root
         .canonical_path()
         .map_err(map_protected_path_error)?;
@@ -1357,6 +1500,7 @@ pub fn prepare_agent_bridge_stage(
     validate_agent_bridge_request(&root_path, request)?;
     verify_system_directory_at(&root_path)?;
     let parent = retain_destination_parent(
+        &root_path,
         request
             .destination_path
             .parent()
@@ -1373,7 +1517,8 @@ pub fn prepare_agent_bridge_stage(
     if path_exists(&destination_path)? {
         return Err(PackageStagingError::GenerationExists);
     }
-    let source = snapshot_source_file(&request.source_path, request.source_size)?;
+    let source = snapshot_source_file(&request.source_path, request.source_size)
+        .map_err(map_prepared_binding_size_error)?;
     if source.identity != request.source_identity
         || !super::windows_paths_equal(&final_path_from_handle(&source.file)?, &request.source_path)
     {
@@ -1382,6 +1527,19 @@ pub fn prepare_agent_bridge_stage(
     if source.sha256 != request.source_sha256 {
         return Err(PackageStagingError::HashMismatch);
     }
+    // Stage each temporary relative to the retained destination parent handle
+    // instead of reopening the parent pathname, which would fail with a
+    // sharing violation while the retained contour is live.
+    let temporary_parent: Option<&std::fs::File> = {
+        #[cfg(windows)]
+        {
+            Some(parent.contour.last().ok_or(PackageStagingError::Io)?)
+        }
+        #[cfg(not(windows))]
+        {
+            None
+        }
+    };
     let mut staged = None;
     for _ in 0..64 {
         let temporary_path = agent_bridge_operation_temporary_path(
@@ -1394,7 +1552,12 @@ pub fn prepare_agent_bridge_stage(
         if path_exists(&temporary_path)? {
             continue;
         }
-        match copy_destination_bytes(&source, &temporary_path, request.source_size) {
+        match copy_destination_bytes(
+            &source,
+            &temporary_path,
+            request.source_size,
+            temporary_parent,
+        ) {
             Ok(copied) => {
                 staged = Some((temporary_path, copied));
                 break;
@@ -1476,12 +1639,27 @@ fn read_prepared_final(
     prepared: &AgentBridgeStagePrepared,
 ) -> Result<AgentBridgeStagingReceipt, PackageStagingError> {
     let final_file = open_existing_file(&prepared.destination_path)?;
+    read_prepared_final_from_handle(&final_file, prepared)
+}
+
+/// Read back a published bridge file through an already-retained handle.
+///
+/// Publish keeps the renamed temporary handle live across its own readback,
+/// and that handle carries DELETE access without delete sharing, so
+/// reopening the final pathname here would fail with a sharing violation.
+/// The handle-bound snapshot proves identity, exact final-path binding, bytes
+/// and security from the live object instead.
+fn read_prepared_final_from_handle(
+    final_file: &std::fs::File,
+    prepared: &AgentBridgeStagePrepared,
+) -> Result<AgentBridgeStagingReceipt, PackageStagingError> {
     let actual = read_destination_snapshot_handle(
-        &final_file,
+        final_file,
         &prepared.destination_path,
         prepared.source_size,
         prepared.destination_identity,
-    )?;
+    )
+    .map_err(map_prepared_binding_size_error)?;
     if actual.sha256 != prepared.source_sha256 || actual.size != prepared.source_size {
         return Err(PackageStagingError::HashMismatch);
     }
@@ -1525,7 +1703,7 @@ pub fn publish_agent_bridge_stage(
         .map_err(map_protected_path_error)?;
     validate_agent_bridge_prepared(&root_path, prepared)?;
     verify_system_directory_at(&root_path)?;
-    let parent = retain_destination_parent(&prepared.parent_path)?;
+    let parent = retain_destination_parent(&root_path, &prepared.parent_path)?;
     if parent.identity != prepared.parent_identity
         || !super::windows_paths_equal(&parent.path, &prepared.parent_path)
     {
@@ -1547,7 +1725,8 @@ pub fn publish_agent_bridge_stage(
         &prepared.temporary_path,
         prepared.source_size,
         prepared.temporary_identity,
-    )?;
+    )
+    .map_err(map_prepared_binding_size_error)?;
     if actual.sha256 != prepared.source_sha256 || actual.size != prepared.source_size {
         return Err(PackageStagingError::HashMismatch);
     }
@@ -1562,7 +1741,7 @@ pub fn publish_agent_bridge_stage(
     if !super::windows_paths_equal(&destination_path, &prepared.destination_path) {
         return Err(PackageStagingError::IdentityMismatch);
     }
-    let receipt = read_prepared_final(prepared)?;
+    let receipt = read_prepared_final_from_handle(&temporary, prepared)?;
     installation_root
         .verify_stable_identity()
         .map_err(map_protected_path_error)?;
@@ -1586,7 +1765,7 @@ pub fn reconcile_agent_bridge_stage(
         .map_err(map_protected_path_error)?;
     validate_agent_bridge_prepared(&root_path, prepared)?;
     verify_system_directory_at(&root_path)?;
-    let parent = retain_destination_parent(&prepared.parent_path)?;
+    let parent = retain_destination_parent(&root_path, &prepared.parent_path)?;
     if parent.identity != prepared.parent_identity {
         return Err(PackageStagingError::IdentityMismatch);
     }
@@ -1666,7 +1845,7 @@ fn reconcile_receipt_at_installation_root(
     for component in parent_components {
         parent_path.push(component);
     }
-    let parent = retain_destination_parent(&parent_path)?;
+    let parent = retain_destination_parent(installation_root, &parent_path)?;
     let root_path = generation.join_to(&parent.path);
     if !receipt.root_path.is_absolute() {
         return Err(PackageStagingError::RootUnavailable);
@@ -1775,7 +1954,7 @@ fn inspect_published_destination_at_installation_root(
     for component in parent_components {
         parent_path.push(component);
     }
-    let parent = retain_destination_parent(&parent_path)?;
+    let parent = retain_destination_parent(installation_root, &parent_path)?;
     let root_path = generation.join_to(&parent.path);
     if !path_exists(&root_path)? {
         return Ok(PackageStagingObservation::Absent);
@@ -1833,7 +2012,7 @@ fn write_or_validate_prepared_marker(
     ownership_key: &[u8],
 ) -> Result<(), PackageStagingError> {
     let marker_path = authorization.marker_path();
-    if path_exists(&marker_path)? {
+    if path_exists(&marker_path).map_err(|error| error.with_site(STAGING_SITE_MARKER_PROBE))? {
         let marker = read_prepared_marker(&marker_path, ownership_key)?;
         let mut expected = authorization.clone();
         let mut observed = marker.authorization;
@@ -1854,7 +2033,9 @@ fn write_or_validate_prepared_marker(
         mac,
     };
     let bytes = serde_json::to_vec(&marker).map_err(|_| PackageStagingError::Io)?;
-    let (mut file, _) = match create_destination_file(&marker_path) {
+    let (mut file, _) = match create_destination_file(&marker_path)
+        .map_err(|error| error.with_site(STAGING_SITE_MARKER_CREATE))
+    {
         Ok(file) => file,
         Err(PackageStagingError::GenerationExists) => {
             let marker = read_prepared_marker(&marker_path, ownership_key)?;
@@ -1885,7 +2066,8 @@ fn read_prepared_marker(
     if ownership_key.is_empty() {
         return Err(PackageStagingError::IdentityMismatch);
     }
-    let file = open_existing_file(path)?;
+    let file =
+        open_existing_file(path).map_err(|error| error.with_site(STAGING_SITE_MARKER_READ))?;
     #[cfg(windows)]
     {
         let canonical = final_path_from_handle(&file)?;
@@ -1930,7 +2112,8 @@ impl PackageStager {
         #[cfg(windows)]
         {
             let lease = super::ProtectedRootLease::open_existing(installation_root)
-                .map_err(map_protected_path_error)?;
+                .map_err(map_protected_path_error)
+                .map_err(|error| error.with_site(STAGING_SITE_OPEN))?;
             let canonical = lease.canonical_path().map_err(map_protected_path_error)?;
             verify_system_directory_at(&canonical)?;
             Ok(Self {
@@ -2052,13 +2235,38 @@ impl PackageStager {
         let generation = validate_relative_text(&manifest.generation)?;
         let parent = self.retain_generation_parent(&generation)?;
         self.source.verify_stable()?;
+        // Enumerate from the already-retained source root handle instead of
+        // reopening the source root pathname while the source contour is
+        // live, mirroring what `observe()` does.
+        #[cfg(windows)]
+        let source_tree = {
+            let retained = self.source.contour.last().ok_or(PackageStagingError::Io)?;
+            enumerate_trusted_source_tree_with_root(self.source.path(), Some(retained), &manifest)?
+        };
+        #[cfg(not(windows))]
         let source_tree = enumerate_trusted_source_tree(self.source.path(), &manifest)?;
         ensure_tree_matches_manifest(&source_tree, &manifest)?;
         let generation_root = generation.join_to(&parent.path);
-        if path_exists(&generation_root)? {
+        if path_exists(&generation_root)
+            .map_err(|error| error.with_site(STAGING_SITE_GENERATION_ROOT_PROBE))?
+        {
             return Err(PackageStagingError::GenerationExists);
         }
-        let root_file = create_generation_root(&generation_root)?;
+        // Create the generation root relative to the just-retained parent
+        // handle instead of reopening the parent pathname, which would fail
+        // with a sharing violation while the retained contour is live.
+        let root_file = {
+            #[cfg(windows)]
+            {
+                let retained = parent.contour.last().ok_or(PackageStagingError::Io)?;
+                create_generation_root_at(retained, &generation_root)
+                    .map_err(|error| error.with_site(STAGING_SITE_GENERATION_ROOT_CREATE))?
+            }
+            #[cfg(not(windows))]
+            {
+                create_generation_root(&generation_root)?
+            }
+        };
         let root_identity = file_identity_from_open_handle(&root_file)?;
         verify_system_security(&root_file, true)?;
         let mut created = CreatedTree {
@@ -2073,7 +2281,21 @@ impl PackageStager {
         match result {
             Ok(files) => {
                 let finalized = (|| {
-                    let destination_tree = enumerate_tree(&generation_root, &manifest)?;
+                    // Read back from the retained created handles instead of
+                    // reopening every just-created child by path. Each child
+                    // handle carries DELETE access without delete sharing, so
+                    // a path reopen fails with a sharing violation while the
+                    // tree is live: a child-file reopen (READ/share READ-only)
+                    // conflicts with the live READ|WRITE|DELETE/share READ
+                    // create handle, and a child-directory reopen (READ/share
+                    // RW) conflicts with the live
+                    // READ|ADD_SUBDIR|DELETE|WRITE_DAC|WRITE_OWNER/share RW
+                    // handle because DELETE is uncovered. The copy path
+                    // already measured every child from its create-only
+                    // handle (duplicate + read); here the retained inventory
+                    // is compared against the manifest without opening any
+                    // pathname.
+                    let destination_tree = created_tree_entries(&created, &files)?;
                     ensure_tree_matches_manifest(&destination_tree, &manifest)?;
                     let generation_name = manifest.generation.clone();
                     let manifest_sha256 = manifest.canonical_digest();
@@ -2323,7 +2545,7 @@ impl PackageStager {
         for component in parent_components {
             parent_path.push(component);
         }
-        let parent = retain_destination_parent(&parent_path)?;
+        let parent = retain_destination_parent(installation_root, &parent_path)?;
         let root_path = generation.join_to(&parent.path);
         if !receipt.root_path.is_absolute()
             || !super::windows_paths_equal(&receipt.root_path, &root_path)
@@ -2381,7 +2603,8 @@ impl PackageStager {
         for component in parent_components {
             path.push(component);
         }
-        retain_destination_parent(&path)
+        retain_destination_parent(&self.installation_root, &path)
+            .map_err(|error| error.with_site(STAGING_SITE_RETAIN_GENERATION_PARENT))
     }
 
     fn read_current_directories(
@@ -2484,8 +2707,24 @@ impl PackageStager {
                 continue;
             }
             let path = entry.relative.join_to(destination_root);
-            let (directory, identity, security_descriptor_sha256) =
-                create_destination_directory(&path)?;
+            // Create each directory relative to its already-retained owner
+            // (the generation root handle or the exact created ancestor
+            // handle) instead of reopening that owner by path, which would
+            // fail with a sharing violation while the owner handle is live.
+            let (directory, identity, security_descriptor_sha256) = {
+                #[cfg(windows)]
+                {
+                    let retained = created_parent_handle(created, destination_root, &path)
+                        .ok_or(PackageStagingError::IdentityMismatch)?;
+                    create_destination_directory_at(retained, &path).map_err(|error| {
+                        error.with_site(STAGING_SITE_DESTINATION_DIRECTORY_CREATE)
+                    })?
+                }
+                #[cfg(not(windows))]
+                {
+                    create_destination_directory(&path)?
+                }
+            };
             created.directories.push(CreatedDirectory {
                 relative_path: entry.relative.canonical,
                 identity,
@@ -2518,7 +2757,22 @@ impl PackageStager {
         let relative = validate_relative_text(&spec.relative_path)?;
         let source = relative.join_to(self.source.path());
         let destination = relative.join_to(destination_root);
-        let source_snapshot = snapshot_source_file(&source, spec.expected_size)?;
+        // Resolve the already-retained owner of this file (the generation
+        // root handle or the exact created ancestor handle) so the create
+        // below pins to that live handle instead of reopening its pathname,
+        // which would fail with a sharing violation while the owner is live.
+        let destination_parent: Option<&std::fs::File> = {
+            #[cfg(windows)]
+            {
+                created_parent_handle(created, destination_root, &destination)
+            }
+            #[cfg(not(windows))]
+            {
+                None
+            }
+        };
+        let source_snapshot = snapshot_source_file(&source, spec.expected_size)
+            .map_err(|error| error.with_site(STAGING_SITE_SOURCE_OPEN))?;
         if !expected_sources.is_empty() {
             let expected = expected_sources
                 .iter()
@@ -2543,7 +2797,12 @@ impl PackageStager {
             None
         };
         let (mut destination_file, destination_identity, destination_readback) =
-            copy_destination_bytes(&source_snapshot, &destination, spec.expected_size)?;
+            copy_destination_bytes(
+                &source_snapshot,
+                &destination,
+                spec.expected_size,
+                destination_parent,
+            )?;
         let authenticode = if spec.executable {
             let evidence = match verify_authenticode_handle(
                 &destination,
@@ -2593,8 +2852,18 @@ fn copy_destination_bytes(
     source_snapshot: &SourceSnapshot,
     destination: &Path,
     expected_size: u64,
+    parent: Option<&std::fs::File>,
 ) -> Result<(std::fs::File, FileIdentity, DestinationSnapshot), PackageStagingError> {
-    let (mut destination_file, destination_identity) = create_destination_file(destination)?;
+    // A `Some` parent is the already-retained destination owner: the create
+    // runs relative to that live handle instead of resolving any pathname,
+    // which would fail with a sharing violation while the retained handle is
+    // live. A missing owner is a fail-closed identity error, never a reason
+    // to fall back to an absolute create.
+    let (mut destination_file, destination_identity) = match parent {
+        Some(handle) => create_destination_file_at(handle, destination)
+            .map_err(|error| error.with_site(STAGING_SITE_DESTINATION_FILE_CREATE))?,
+        None => return Err(PackageStagingError::IdentityMismatch),
+    };
     let copy_hash =
         match copy_source_to_destination(source_snapshot, &mut destination_file, expected_size) {
             Ok(hash) => hash,
@@ -2645,6 +2914,7 @@ fn copy_destination_bytes(
     _source_snapshot: &SourceSnapshot,
     _destination: &Path,
     _expected_size: u64,
+    _parent: Option<&std::fs::File>,
 ) -> Result<(std::fs::File, FileIdentity, DestinationSnapshot), PackageStagingError> {
     Err(PackageStagingError::UnsupportedPlatform)
 }
@@ -2800,6 +3070,45 @@ fn ensure_tree_matches_manifest(
     Ok(())
 }
 
+/// Build the finalize tree inventory from the retained created handles.
+///
+/// The copy path created exactly the manifest's directories and files with
+/// create-only semantics and measured each child from its own handle, so the
+/// retained inventory is the tree. This deliberately performs no pathname
+/// resolution: the created handles are still live (DELETE without delete
+/// sharing) and any path reopen would fail with a sharing violation. A file
+/// planted concurrently after the create-only window is not visible here; it
+/// is caught by the next path-based reconcile once the created handles have
+/// been released.
+#[cfg(windows)]
+fn created_tree_entries(
+    created: &CreatedTree,
+    files: &[StagedFileReceipt],
+) -> Result<Vec<TreeEntry>, PackageStagingError> {
+    let mut entries = Vec::with_capacity(created.directories.len().saturating_add(files.len()));
+    for directory in &created.directories {
+        entries.push(TreeEntry {
+            relative: validate_relative_text(&directory.relative_path)?,
+            kind: TreeEntryKind::Directory,
+        });
+    }
+    for file in files {
+        entries.push(TreeEntry {
+            relative: validate_relative_text(&file.relative_path)?,
+            kind: TreeEntryKind::File,
+        });
+    }
+    Ok(entries)
+}
+
+#[cfg(not(windows))]
+fn created_tree_entries(
+    _created: &CreatedTree,
+    _files: &[StagedFileReceipt],
+) -> Result<Vec<TreeEntry>, PackageStagingError> {
+    Err(PackageStagingError::UnsupportedPlatform)
+}
+
 #[cfg(windows)]
 fn enumerate_tree(
     root: &Path,
@@ -2824,7 +3133,8 @@ where
         FileIdentity,
     ) -> Result<(), PackageStagingError>,
 {
-    let root_handle = open_existing_directory(root)?;
+    let root_handle = open_existing_directory(root)
+        .map_err(|error| error.with_site(STAGING_SITE_DESTINATION_WALK_ROOT))?;
     let root_final = final_path_from_handle(&root_handle)?;
     if !super::windows_paths_equal(&root_final, root) {
         return Err(PackageStagingError::IdentityMismatch);
@@ -2841,9 +3151,13 @@ where
             return Err(PackageStagingError::BoundExceeded);
         }
         let mut pending = Vec::new();
-        let read_dir = std::fs::read_dir(&directory).map_err(map_package_open_error)?;
+        let read_dir = std::fs::read_dir(&directory).map_err(|error| {
+            map_package_open_error_at(error, STAGING_SITE_DESTINATION_WALK_READ_DIR)
+        })?;
         for entry in read_dir {
-            let entry = entry.map_err(map_package_open_error)?;
+            let entry = entry.map_err(|error| {
+                map_package_open_error_at(error, STAGING_SITE_DESTINATION_WALK_ENTRY)
+            })?;
             let name = entry
                 .file_name()
                 .to_str()
@@ -2871,12 +3185,15 @@ where
             if entries.len() >= MAX_ENUMERATED_ENTRIES {
                 return Err(PackageStagingError::BoundExceeded);
             }
-            let metadata = std::fs::symlink_metadata(&path).map_err(map_package_open_error)?;
+            let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+                map_package_open_error_at(error, STAGING_SITE_DESTINATION_WALK_METADATA)
+            })?;
             if is_reparse_metadata(&metadata) {
                 return Err(PackageStagingError::ReparsePoint);
             }
             if metadata.is_dir() {
-                let child = open_existing_directory(&path)?;
+                let child = open_existing_directory(&path)
+                    .map_err(|error| error.with_site(STAGING_SITE_DESTINATION_WALK_CHILD_DIR))?;
                 let final_path = final_path_from_handle(&child)?;
                 if !super::windows_paths_equal(&final_path, &path) {
                     return Err(PackageStagingError::IdentityMismatch);
@@ -2892,7 +3209,8 @@ where
                     child,
                 ));
             } else if metadata.is_file() {
-                let file = open_existing_file(&path)?;
+                let file = open_existing_file(&path)
+                    .map_err(|error| error.with_site(STAGING_SITE_DESTINATION_WALK_CHILD_FILE))?;
                 let identity = file_identity_from_open_handle(&file)?;
                 let final_path = final_path_from_handle(&file)?;
                 if !super::windows_paths_equal(&final_path, &path) {
@@ -2913,20 +3231,25 @@ where
     Ok(entries)
 }
 
+/// Enumerate one trusted source tree without reopening an already-retained
+/// root by path.
+///
+/// The stage path threads the retained source contour (`observe()` already
+/// does the same) instead of reopening the source root pathname while the
+/// contour is live.
 #[cfg(windows)]
-fn walk_trusted_source_tree<F>(
+fn enumerate_trusted_source_tree_with_root(
     root: &Path,
-    on_file: F,
-) -> Result<Vec<TreeEntry>, PackageStagingError>
-where
-    F: FnMut(
-        &PackageRelativePath,
-        &Path,
-        &std::fs::File,
-        FileIdentity,
-    ) -> Result<(), PackageStagingError>,
-{
-    walk_trusted_source_tree_with_root(root, None, on_file)
+    retained_root: Option<&std::fs::File>,
+    manifest: &PackageManifest,
+) -> Result<Vec<TreeEntry>, PackageStagingError> {
+    let entries = walk_trusted_source_tree_with_root(
+        root,
+        retained_root,
+        |_relative, _path, _file, _identity| Ok(()),
+    )?;
+    let _ = manifest;
+    Ok(entries)
 }
 
 #[cfg(windows)]
@@ -2947,7 +3270,8 @@ where
         Some(root) => root
             .try_clone()
             .map_err(|error| map_package_io_error(error, PackageStagingStage::DuplicateHandle))?,
-        None => open_existing_directory(root)?,
+        None => open_existing_directory(root)
+            .map_err(|error| error.with_site(STAGING_SITE_TRUSTED_SOURCE_ROOT))?,
     };
     let root_final = final_path_from_handle(&root_handle)?;
     if !super::windows_paths_equal(&root_final, root) {
@@ -2965,9 +3289,13 @@ where
             return Err(PackageStagingError::BoundExceeded);
         }
         let mut pending = Vec::new();
-        let read_dir = std::fs::read_dir(&directory).map_err(map_package_open_error)?;
+        let read_dir = std::fs::read_dir(&directory).map_err(|error| {
+            map_package_open_error_at(error, STAGING_SITE_TRUSTED_SOURCE_READ_DIR)
+        })?;
         for entry in read_dir {
-            let entry = entry.map_err(map_package_open_error)?;
+            let entry = entry.map_err(|error| {
+                map_package_open_error_at(error, STAGING_SITE_TRUSTED_SOURCE_ENTRY)
+            })?;
             let name = entry
                 .file_name()
                 .to_str()
@@ -2995,12 +3323,15 @@ where
             if entries.len() >= MAX_ENUMERATED_ENTRIES {
                 return Err(PackageStagingError::BoundExceeded);
             }
-            let metadata = std::fs::symlink_metadata(&path).map_err(map_package_open_error)?;
+            let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+                map_package_open_error_at(error, STAGING_SITE_TRUSTED_SOURCE_METADATA)
+            })?;
             if is_reparse_metadata(&metadata) {
                 return Err(PackageStagingError::ReparsePoint);
             }
             if metadata.is_dir() {
-                let child = open_existing_directory(&path)?;
+                let child = open_existing_directory(&path)
+                    .map_err(|error| error.with_site(STAGING_SITE_TRUSTED_SOURCE_CHILD_DIR))?;
                 let final_path = final_path_from_handle(&child)?;
                 if !super::windows_paths_equal(&final_path, &path) {
                     return Err(PackageStagingError::IdentityMismatch);
@@ -3016,7 +3347,8 @@ where
                     child,
                 ));
             } else if metadata.is_file() {
-                let file = open_trusted_source_file(&path)?;
+                let file = open_trusted_source_file(&path)
+                    .map_err(|error| error.with_site(STAGING_SITE_TRUSTED_SOURCE_CHILD_FILE))?;
                 let identity = file_identity_from_open_handle(&file)?;
                 let final_path = final_path_from_handle(&file)?;
                 if !super::windows_paths_equal(&final_path, &path) {
@@ -3034,16 +3366,6 @@ where
         drop(directory_handle);
         stack.extend(child_directories.into_iter().rev());
     }
-    Ok(entries)
-}
-
-#[cfg(windows)]
-fn enumerate_trusted_source_tree(
-    root: &Path,
-    manifest: &PackageManifest,
-) -> Result<Vec<TreeEntry>, PackageStagingError> {
-    let entries = walk_trusted_source_tree(root, |_relative, _path, _file, _identity| Ok(()))?;
-    let _ = manifest;
     Ok(entries)
 }
 
@@ -3095,23 +3417,60 @@ fn retain_directory_contour(path: &Path) -> Result<Vec<std::fs::File>, PackageSt
 
 #[cfg(windows)]
 fn retain_destination_parent(
+    anchor: &Path,
     path: &Path,
 ) -> Result<RetainedDestinationParent, PackageStagingError> {
-    let contour = retain_directory_contour(path)?;
-    let canonical =
-        final_path_from_handle(contour.last().ok_or(PackageStagingError::RootUnavailable)?)?;
-    verify_system_directory_handles(&contour)?;
+    // `anchor` is the installer-owned root this retain is bound to (the lease
+    // canonical path or the installation root). The full ancestor contour is
+    // still retained handle-by-handle so no pathname is trusted blindly, but
+    // exact installer-descriptor proof applies only to the owned suffix:
+    // ancestors above the anchor are OS-owned and can never carry the
+    // installer descriptor, so demanding descriptor proof there would make
+    // every anchored retain unsatisfiable. Those entries are pinned by live
+    // final-path binding instead, matching the protected-root lease's own
+    // ancestor discipline. The leaf is always descriptor-proven, and every
+    // caller additionally binds the leaf to its exact expected identity and
+    // request before use.
+    let mut ancestors = path.ancestors().map(Path::to_path_buf).collect::<Vec<_>>();
+    ancestors.reverse();
+    let mut contour = Vec::with_capacity(ancestors.len());
+    for (index, ancestor) in ancestors.iter().enumerate() {
+        // The leaf stays retained with flush capability so post-rename
+        // durability proof never reopens a pathname; ancestors stay
+        // read-only. Neither shape carries DELETE access, so the
+        // substitution fence is identical for every entry.
+        if index + 1 == ancestors.len() {
+            contour.push(open_existing_directory_for_sync(ancestor)?);
+        } else {
+            contour.push(open_existing_directory(ancestor)?);
+        }
+    }
+    let leaf = contour.last().ok_or(PackageStagingError::RootUnavailable)?;
+    let canonical = final_path_from_handle(leaf)?;
+    let count = contour.len();
+    for (index, (ancestor, handle)) in ancestors.iter().zip(contour.iter()).enumerate() {
+        let owned = index + 1 == count
+            || super::windows_paths_equal(anchor, ancestor)
+            || agent_bridge_path_is_at_or_below(anchor, ancestor);
+        if owned {
+            let _ = verify_system_security(handle, true)?;
+        } else {
+            let observed = final_path_from_handle(handle)?;
+            if !super::windows_paths_equal(&observed, ancestor) {
+                return Err(PackageStagingError::IdentityMismatch);
+            }
+        }
+    }
     Ok(RetainedDestinationParent {
         path: canonical,
-        identity: file_identity_from_open_handle(
-            contour.last().ok_or(PackageStagingError::RootUnavailable)?,
-        )?,
+        identity: file_identity_from_open_handle(leaf)?,
         contour,
     })
 }
 
 #[cfg(not(windows))]
 fn retain_destination_parent(
+    _anchor: &Path,
     _path: &Path,
 ) -> Result<RetainedDestinationParent, PackageStagingError> {
     Err(PackageStagingError::UnsupportedPlatform)
@@ -3123,10 +3482,44 @@ fn open_existing_directory(path: &Path) -> Result<std::fs::File, PackageStagingE
     open_existing_directory_with_access(path, FILE_GENERIC_READ)
 }
 
+/// Open one existing directory with flush capability for a retained leaf.
+///
+/// The access stays DELETE-free with read/write sharing only, so the
+/// substitution fence is unchanged: same-token rename/delete opens still
+/// fail while the retained handle is live. Write access is the documented
+/// directory-sync requirement (mirroring the publication owner's sync
+/// opener); read-only retained handles cannot be flushed.
 #[cfg(windows)]
-fn open_existing_directory_for_create(path: &Path) -> Result<std::fs::File, PackageStagingError> {
-    use windows_sys::Win32::Storage::FileSystem::{FILE_ADD_SUBDIRECTORY, FILE_GENERIC_READ};
-    open_existing_directory_with_access(path, FILE_GENERIC_READ | FILE_ADD_SUBDIRECTORY)
+fn open_existing_directory_for_sync(path: &Path) -> Result<std::fs::File, PackageStagingError> {
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .access_mode(FILE_GENERIC_READ | FILE_GENERIC_WRITE)
+        // Delete sharing remains omitted so the retained leaf keeps blocking
+        // rename/delete substitution exactly like a read-only retain.
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    let file = options.open(path).map_err(map_package_open_error)?;
+    let metadata = file.metadata().map_err(|error| {
+        map_package_io_error(error, PackageStagingStage::GetFileInformationByHandle)
+    })?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(PackageStagingError::ReparsePoint);
+    }
+    if !metadata.is_dir() {
+        return Err(PackageStagingError::WrongEntryKind);
+    }
+    Ok(file)
+}
+
+#[cfg(not(windows))]
+fn open_existing_directory_for_sync(_path: &Path) -> Result<std::fs::File, PackageStagingError> {
+    Err(PackageStagingError::UnsupportedPlatform)
 }
 
 #[cfg(windows)]
@@ -3385,8 +3778,9 @@ fn verify_system_security(
     file: &std::fs::File,
     directory: bool,
 ) -> Result<String, PackageStagingError> {
-    let expected = super::OwnedSecurityDescriptor::for_installer_system_object(directory)
-        .map_err(|_| PackageStagingError::SecurityMismatch)?;
+    let expected = super::OwnedSecurityDescriptor::for_installer_system_object(directory).map_err(
+        |error| map_installer_descriptor_error(error, PackageStagingStage::GetSecurityInfo),
+    )?;
     if super::verify_exact_file_security(file, &expected, "S-1-5-18").is_err() {
         // The shared verifier intentionally exposes only its semantic adapter
         // error. Probe the same handle once more to retain a raw GetSecurityInfo
@@ -3423,14 +3817,6 @@ fn verify_system_directory_at(path: &Path) -> Result<(), PackageStagingError> {
 #[cfg(not(windows))]
 fn verify_system_directory_at(_path: &Path) -> Result<(), PackageStagingError> {
     Err(PackageStagingError::UnsupportedPlatform)
-}
-
-#[cfg(windows)]
-fn verify_system_directory_handles(contour: &[std::fs::File]) -> Result<(), PackageStagingError> {
-    for directory in contour {
-        let _ = verify_system_security(directory, true)?;
-    }
-    Ok(())
 }
 
 #[cfg(windows)]
@@ -3483,35 +3869,416 @@ fn security_descriptor_digest(file: &std::fs::File) -> Result<String, PackageSta
     digest.ok_or(PackageStagingError::Io)
 }
 
+/// Native `UNICODE_STRING` layout for the staging `NtCreateFile` calls below.
+///
+/// Shared by the test-only absolute-path creates and the production
+/// handle-relative file create: both pass a UTF-16 name with a retained (or
+/// null) root directory and create only the absent final component.
 #[cfg(windows)]
-fn create_generation_root(path: &Path) -> Result<std::fs::File, PackageStagingError> {
-    let parent = path.parent().ok_or(PackageStagingError::RootUnavailable)?;
-    let parent_file = open_existing_directory_for_create(parent)?;
-    let descriptor = super::OwnedSecurityDescriptor::for_installer_system_object(true)
+#[repr(C)]
+struct StagingNativeUnicodeString {
+    length: u16,
+    maximum_length: u16,
+    buffer: *mut u16,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct StagingNativeObjectAttributes {
+    length: u32,
+    root_directory: windows_sys::Win32::Foundation::HANDLE,
+    object_name: *mut StagingNativeUnicodeString,
+    attributes: u32,
+    security_descriptor: windows_sys::Win32::Security::PSECURITY_DESCRIPTOR,
+    security_quality_of_service: *mut std::ffi::c_void,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct StagingNativeIoStatusBlock {
+    status: i32,
+    information: usize,
+}
+
+#[cfg(windows)]
+const STAGING_STATUS_OBJECT_NAME_COLLISION: i32 = -0x3FFF_FFCB;
+
+#[cfg(windows)]
+const STAGING_STATUS_OBJECT_NAME_EXISTS: i32 = 0x4000_0000;
+
+#[cfg(windows)]
+const STAGING_FILE_CREATE: u32 = 2;
+
+#[cfg(windows)]
+#[cfg(test)]
+const STAGING_FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
+
+#[cfg(windows)]
+const STAGING_FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
+
+#[cfg(windows)]
+const STAGING_FILE_WRITE_THROUGH: u32 = 0x0000_0002;
+
+#[cfg(windows)]
+const STAGING_FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x0000_0020;
+
+#[cfg(windows)]
+const STAGING_FILE_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+#[cfg(windows)]
+const STAGING_OBJ_CASE_INSENSITIVE: u32 = 0x0000_0040;
+
+#[cfg(windows)]
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    fn NtCreateFile(
+        file_handle: *mut windows_sys::Win32::Foundation::HANDLE,
+        desired_access: u32,
+        object_attributes: *mut StagingNativeObjectAttributes,
+        io_status_block: *mut StagingNativeIoStatusBlock,
+        allocation_size: *mut i64,
+        file_attributes: u32,
+        share_access: u32,
+        create_disposition: u32,
+        create_options: u32,
+        ea_buffer: *mut std::ffi::c_void,
+        ea_length: u32,
+    ) -> i32;
+}
+
+#[cfg(windows)]
+fn staging_nt_status_is_success(status: i32) -> bool {
+    status >= 0
+}
+
+/// Build the absolute NT object-manager path for one create-only directory
+/// allocation without opening any ancestor by path.
+///
+/// A retained ancestor handle carries DELETE access without delete sharing,
+/// so reopening that ancestor by path fails with a sharing violation while
+/// the handle is live. The no-parent-handle entry points below therefore
+/// never resolve ancestors by path: the NT namespace accepts the resulting
+/// `\??\`-prefixed absolute path with a null root directory, intermediate
+/// components are only traversed, and the final name is created only when
+/// absent.
+#[cfg(windows)]
+#[cfg(test)]
+fn staging_nt_full_path(path: &Path) -> Result<Vec<u16>, PackageStagingError> {
+    let text = path
+        .to_str()
+        .ok_or(PackageStagingError::InvalidRelativePath)?;
+    if !path.is_absolute() || text.contains('\0') {
+        return Err(PackageStagingError::InvalidRelativePath);
+    }
+    let normalized = if let Some(rest) = text
+        .strip_prefix(r"\\?\")
+        .or_else(|| text.strip_prefix(r"\\.\"))
+    {
+        format!(r"\??\{rest}")
+    } else if text.starts_with(r"\??\") {
+        text.to_owned()
+    } else {
+        format!(r"\??\{text}")
+    };
+    let wide: Vec<u16> = normalized.encode_utf16().collect();
+    if wide.len().saturating_mul(2).gt(&usize::from(u16::MAX)) {
+        return Err(PackageStagingError::InvalidRelativePath);
+    }
+    Ok(wide)
+}
+
+/// Apply one caller-owned installer descriptor to a freshly created staging
+/// directory handle.
+///
+/// This mirrors the publication owner's apply step: the exact descriptor is
+/// applied immediately on the create-only handle, before the handle reaches
+/// any caller, so no pathname resolution happens between creation and the
+/// exact ACL proof that follows.
+#[cfg(windows)]
+#[cfg(test)]
+fn staging_apply_directory_security(
+    file: &std::fs::File,
+    descriptor: &super::OwnedSecurityDescriptor,
+) -> Result<(), PackageStagingError> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Security::Authorization::{SE_FILE_OBJECT, SetSecurityInfo};
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+    };
+    let owner = descriptor
+        .owner()
         .map_err(|_| PackageStagingError::SecurityMismatch)?;
+    let dacl = descriptor
+        .dacl()
+        .map_err(|_| PackageStagingError::SecurityMismatch)?;
+    let status = unsafe {
+        // SAFETY: `file` is a live handle opened with WRITE_DAC/WRITE_OWNER;
+        // owner and DACL point into the caller-owned descriptor and remain
+        // live for this synchronous operation.
+        SetSecurityInfo(
+            file.as_raw_handle().cast(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION
+                | DACL_SECURITY_INFORMATION
+                | PROTECTED_DACL_SECURITY_INFORMATION,
+            owner,
+            std::ptr::null_mut(),
+            dacl,
+            std::ptr::null(),
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(PackageStagingError::Win32 {
+            stage: PackageStagingStage::SetSecurityInfo,
+            code: status,
+        })
+    }
+}
+
+#[cfg(windows)]
+#[cfg(test)]
+fn delete_created_directory_object(file: &std::fs::File) {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
+    };
+    let Ok(length) = u32::try_from(std::mem::size_of::<FILE_DISPOSITION_INFO>()) else {
+        return;
+    };
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    unsafe {
+        // SAFETY: `file` is the exact create-only directory handle opened
+        // with DELETE; the disposition buffer has the documented size.
+        SetFileInformationByHandle(
+            file.as_raw_handle().cast(),
+            FileDispositionInfo,
+            (&raw const disposition).cast(),
+            length,
+        );
+    }
+}
+
+/// Create one directory through the NT object manager from an absolute NT
+/// path, without opening any ancestor by path.
+///
+/// This is the entry point for callers that hold no retained parent handle.
+/// Production creates with a retained parent use the handle-relative
+/// publication primitive instead; both converge on the same post-create
+/// proof in [`finish_created_directory`].
+#[cfg(windows)]
+#[cfg(test)]
+fn nt_create_directory_object(
+    name: &[u16],
+    descriptor: &super::OwnedSecurityDescriptor,
+) -> Result<std::fs::File, PackageStagingError> {
+    use std::os::windows::fs::MetadataExt as _;
+    use std::os::windows::io::FromRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_ADD_SUBDIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_GENERIC_READ,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, WRITE_DAC, WRITE_OWNER,
+    };
+    if name.is_empty() || name.len().saturating_mul(2).gt(&usize::from(u16::MAX)) {
+        return Err(PackageStagingError::InvalidRelativePath);
+    }
+    let length = u16::try_from(name.len().saturating_mul(2))
+        .map_err(|_| PackageStagingError::InvalidRelativePath)?;
+    let mut unicode = StagingNativeUnicodeString {
+        length,
+        maximum_length: length,
+        buffer: name.as_ptr().cast_mut(),
+    };
+    let mut attributes = StagingNativeObjectAttributes {
+        length: u32::try_from(std::mem::size_of::<StagingNativeObjectAttributes>())
+            .map_err(|_| PackageStagingError::Io)?,
+        root_directory: std::ptr::null_mut(),
+        object_name: &raw mut unicode,
+        attributes: STAGING_OBJ_CASE_INSENSITIVE,
+        // The exact descriptor is applied to the returned handle immediately
+        // below, matching the handle-relative primitive, because an ordinary
+        // token cannot carry every caller-owned absolute owner through the
+        // native attributes.
+        security_descriptor: std::ptr::null_mut(),
+        security_quality_of_service: std::ptr::null_mut(),
+    };
+    let mut io_status = StagingNativeIoStatusBlock {
+        status: 0,
+        information: 0,
+    };
+    let mut raw = std::ptr::null_mut();
+    let status = unsafe {
+        // SAFETY: all native structures and UTF-16 storage remain live for
+        // the synchronous call; a null root with an absolute NT path creates
+        // only the absent final component, and `FILE_CREATE` forbids adoption.
+        NtCreateFile(
+            &raw mut raw,
+            FILE_GENERIC_READ | FILE_ADD_SUBDIRECTORY | DELETE | WRITE_DAC | WRITE_OWNER,
+            &raw mut attributes,
+            &raw mut io_status,
+            std::ptr::null_mut(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            STAGING_FILE_CREATE,
+            STAGING_FILE_DIRECTORY_FILE
+                | STAGING_FILE_OPEN_REPARSE_POINT
+                | STAGING_FILE_SYNCHRONOUS_IO_NONALERT,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if !staging_nt_status_is_success(status) {
+        if status == STAGING_STATUS_OBJECT_NAME_COLLISION
+            || status == STAGING_STATUS_OBJECT_NAME_EXISTS
+        {
+            return Err(PackageStagingError::GenerationExists);
+        }
+        // Preserve the exact native status bitwise instead of erasing the
+        // create failure to a bare I/O error.
+        return Err(PackageStagingError::Win32 {
+            stage: PackageStagingStage::CreateFileW,
+            code: u32::from_ne_bytes(status.to_ne_bytes()),
+        });
+    }
+    if raw.is_null() {
+        return Err(PackageStagingError::Io);
+    }
+    let file = unsafe {
+        // SAFETY: NtCreateFile returned a unique owned handle.
+        std::fs::File::from_raw_handle(raw.cast())
+    };
+    let result = (|| {
+        staging_apply_directory_security(&file, descriptor)?;
+        let metadata = file.metadata().map_err(|_| PackageStagingError::Io)?;
+        if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(PackageStagingError::ReparsePoint);
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => Ok(file),
+        Err(error) => {
+            // The native create was create-only. On post-create validation
+            // failure, dispose through the exact child handle; never resolve
+            // the pathname for cleanup or adopt the failed directory.
+            delete_created_directory_object(&file);
+            Err(error)
+        }
+    }
+}
+
+/// Prove that a retained directory handle still names the exact parent of one
+/// staged child, without opening any path.
+///
+/// The retained parent carries DELETE access without delete sharing, so while
+/// it is live its object can be neither deleted nor renamed away. Comparing
+/// the handle's live final path against the child's parent therefore pins the
+/// create below to the retained object instead of a substituted pathname.
+#[cfg(windows)]
+fn pin_retained_parent(parent: &std::fs::File, child: &Path) -> Result<(), PackageStagingError> {
+    let expected = child.parent().ok_or(PackageStagingError::RootUnavailable)?;
+    let canonical = final_path_from_handle(parent)?;
+    if !super::windows_paths_equal(&canonical, expected) {
+        return Err(PackageStagingError::IdentityMismatch);
+    }
+    Ok(())
+}
+
+/// Resolve the retained handle that owns one staged child: the generation
+/// root handle for root-level children, otherwise the exact created ancestor
+/// handle. Directory entries arrive parents-first, so every ancestor is
+/// already retained when its child is created. A missing owner is a
+/// fail-closed identity error, never a reason to reopen a live path.
+#[cfg(windows)]
+fn created_parent_handle<'a>(
+    created: &'a CreatedTree,
+    destination_root: &Path,
+    child: &Path,
+) -> Option<&'a std::fs::File> {
+    let parent = child.parent()?;
+    if super::windows_paths_equal(parent, destination_root) {
+        return Some(&created.root_file);
+    }
+    created.directories.iter().find_map(|directory| {
+        let relative = validate_relative_text(&directory.relative_path).ok()?;
+        super::windows_paths_equal(&relative.join_to(destination_root), parent)
+            .then_some(&directory.file)
+    })
+}
+
+/// Run the shared post-create proof for one create-only staging directory:
+/// handle identity, exact final-path binding, installer security descriptor,
+/// and durability flush. Failures delete through the exact created handle.
+#[cfg(windows)]
+fn finish_created_directory(
+    directory: std::fs::File,
+    expected: &Path,
+) -> Result<(std::fs::File, FileIdentity, String), PackageStagingError> {
+    let Ok(identity) = file_identity_from_open_handle(&directory) else {
+        drop(directory);
+        return Err(PackageStagingError::RollbackRefused);
+    };
+    let result = (|| {
+        let canonical = final_path_from_handle(&directory)?;
+        if !super::windows_paths_equal(&canonical, expected) {
+            return Err(PackageStagingError::IdentityMismatch);
+        }
+        let security_descriptor_sha256 = verify_system_security(&directory, true)?;
+        flush_file_buffers(&directory)?;
+        Ok(security_descriptor_sha256)
+    })();
+    match result {
+        Ok(security_descriptor_sha256) => Ok((directory, identity, security_descriptor_sha256)),
+        Err(error) => Err(cleanup_created_handle(directory, identity, error)),
+    }
+}
+
+#[cfg(windows)]
+#[cfg(test)]
+fn create_generation_root(path: &Path) -> Result<std::fs::File, PackageStagingError> {
+    // No-parent-handle entry point for fixtures and direct probes with no
+    // retained contour in scope. The absolute NT create below traverses a
+    // live retained ancestor instead of reopening it: reopening that ancestor
+    // by path would fail with a sharing violation because the retained handle
+    // carries DELETE access without delete sharing.
+    let name = staging_nt_full_path(path)?;
+    let descriptor =
+        super::OwnedSecurityDescriptor::for_installer_system_object(true).map_err(|error| {
+            map_installer_descriptor_error(error, PackageStagingStage::SetSecurityInfo)
+        })?;
+    let root = nt_create_directory_object(&name, &descriptor)?;
+    finish_created_directory(root, path).map(|(file, _, _)| file)
+}
+
+/// Create one generation root as a child of an already-retained destination
+/// parent handle. The retained parent pathname is never reopened while its
+/// handle is live; the child is created relative to the exact retained
+/// object instead.
+#[cfg(windows)]
+fn create_generation_root_at(
+    parent: &std::fs::File,
+    path: &Path,
+) -> Result<std::fs::File, PackageStagingError> {
+    pin_retained_parent(parent, path)?;
     let name = path
         .file_name()
         .and_then(|value| value.to_str())
         .ok_or(PackageStagingError::InvalidRelativePath)?;
-    let root = super::create_owned_directory_relative(&parent_file, name, descriptor.raw)
+    let descriptor =
+        super::OwnedSecurityDescriptor::for_installer_system_object(true).map_err(|error| {
+            map_installer_descriptor_error(error, PackageStagingStage::SetSecurityInfo)
+        })?;
+    let root = super::create_owned_directory_relative(parent, name, descriptor.raw)
         .map_err(map_directory_publication_error)?;
-    let Ok(identity) = file_identity_from_open_handle(&root) else {
-        drop(root);
-        return Err(PackageStagingError::RollbackRefused);
-    };
-    let result = (|| {
-        let canonical = final_path_from_handle(&root)?;
-        if !super::windows_paths_equal(&canonical, path) {
-            return Err(PackageStagingError::IdentityMismatch);
-        }
-        verify_system_security(&root, true)?;
-        flush_file_buffers(&root)?;
-        Ok(())
-    })();
-    match result {
-        Ok(()) => Ok(root),
-        Err(error) => Err(cleanup_created_handle(root, identity, error)),
-    }
+    finish_created_directory(root, path).map(|(file, _, _)| file)
+}
+
+#[cfg(not(windows))]
+fn create_generation_root_at(
+    _parent: &std::fs::File,
+    _path: &Path,
+) -> Result<std::fs::File, PackageStagingError> {
+    Err(PackageStagingError::UnsupportedPlatform)
 }
 
 #[cfg(not(windows))]
@@ -3538,10 +4305,16 @@ fn create_destination_file(
         FILE_FLAG_WRITE_THROUGH, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ,
     };
 
-    let parent = path.parent().ok_or(PackageStagingError::RootUnavailable)?;
-    let parent_file = open_existing_directory(parent)?;
-    let descriptor = super::OwnedSecurityDescriptor::for_installer_system_object(false)
-        .map_err(|_| PackageStagingError::SecurityMismatch)?;
+    let descriptor =
+        super::OwnedSecurityDescriptor::for_installer_system_object(false).map_err(|error| {
+            map_installer_descriptor_error(error, PackageStagingStage::SetSecurityInfo)
+        })?;
+    // Absolute-path create-only entry point for callers with no retained
+    // parent in scope (the preparation marker) and for fixtures. Staged file
+    // bytes below a retained generation tree never use this path: production
+    // file bytes go through `create_destination_file_at`, which creates
+    // relative to the exact retained parent handle instead of resolving any
+    // pathname while that parent is live.
     let attributes = SECURITY_ATTRIBUTES {
         nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>())
             .map_err(|_| PackageStagingError::Io)?,
@@ -3562,7 +4335,6 @@ fn create_destination_file(
             std::ptr::null_mut(),
         )
     };
-    drop(parent_file);
     if handle == INVALID_HANDLE_VALUE {
         let code = unsafe { GetLastError() };
         return if is_create_new_collision(code) {
@@ -3597,6 +4369,205 @@ fn create_destination_file(
     }
 }
 
+/// Apply one caller-owned installer file descriptor to a freshly created
+/// staging file handle.
+///
+/// This mirrors the publication owner's directory apply step: the exact
+/// descriptor is applied immediately on the create-only handle, before the
+/// handle reaches any caller, so no pathname resolution happens between the
+/// relative create and the exact ACL proof that follows.
+#[cfg(windows)]
+fn staging_apply_file_security(
+    file: &std::fs::File,
+    descriptor: &super::OwnedSecurityDescriptor,
+) -> Result<(), PackageStagingError> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Security::Authorization::{SE_FILE_OBJECT, SetSecurityInfo};
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+    };
+    let owner = descriptor
+        .owner()
+        .map_err(|_| PackageStagingError::SecurityMismatch)?;
+    let dacl = descriptor
+        .dacl()
+        .map_err(|_| PackageStagingError::SecurityMismatch)?;
+    let status = unsafe {
+        // SAFETY: `file` is a live handle opened with WRITE_DAC/WRITE_OWNER;
+        // owner and DACL point into the caller-owned descriptor and remain
+        // live for this synchronous operation.
+        SetSecurityInfo(
+            file.as_raw_handle().cast(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION
+                | DACL_SECURITY_INFORMATION
+                | PROTECTED_DACL_SECURITY_INFORMATION,
+            owner,
+            std::ptr::null_mut(),
+            dacl,
+            std::ptr::null(),
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(PackageStagingError::Win32 {
+            stage: PackageStagingStage::SetSecurityInfo,
+            code: status,
+        })
+    }
+}
+
+/// Create one destination file as a child of an already-retained destination
+/// parent handle, without resolving any pathname.
+///
+/// This is the file analogue of the handle-relative directory publication
+/// primitive: `NtCreateFile` with `RootDirectory` set to the retained parent
+/// and `FILE_CREATE` touches only the absent final name. The retained parent
+/// carries DELETE access without delete sharing, so reopening it by path
+/// would fail with a sharing violation while it is live; the relative create
+/// traverses the live handle instead. No delete sharing is added: the child
+/// keeps `FILE_SHARE_READ` only, matching [`create_destination_file`], so the
+/// substitution fence is unchanged. A colliding name reports
+/// `GenerationExists` and is never adopted.
+#[cfg(windows)]
+fn nt_create_file_relative(
+    parent: &std::fs::File,
+    name: &str,
+    expected: &Path,
+) -> Result<(std::fs::File, FileIdentity), PackageStagingError> {
+    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ,
+        WRITE_DAC, WRITE_OWNER,
+    };
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name
+            .chars()
+            .any(|character| character == '\0' || character == '/' || character == '\\')
+        || name.encode_utf16().count() > usize::from(u16::MAX / 2)
+    {
+        return Err(PackageStagingError::InvalidRelativePath);
+    }
+    let wide: Vec<u16> = name.encode_utf16().collect();
+    let length =
+        u16::try_from(wide.len().saturating_mul(2)).map_err(|_| PackageStagingError::Io)?;
+    let mut unicode = StagingNativeUnicodeString {
+        length,
+        maximum_length: length,
+        buffer: wide.as_ptr().cast_mut(),
+    };
+    let mut attributes = StagingNativeObjectAttributes {
+        length: u32::try_from(std::mem::size_of::<StagingNativeObjectAttributes>())
+            .map_err(|_| PackageStagingError::Io)?,
+        root_directory: parent.as_raw_handle().cast(),
+        object_name: &raw mut unicode,
+        attributes: STAGING_OBJ_CASE_INSENSITIVE,
+        // The exact descriptor is applied to the returned handle immediately
+        // below, matching the handle-relative directory primitive, because an
+        // ordinary token cannot carry every caller-owned absolute owner
+        // through the native attributes.
+        security_descriptor: std::ptr::null_mut(),
+        security_quality_of_service: std::ptr::null_mut(),
+    };
+    let mut io_status = StagingNativeIoStatusBlock {
+        status: 0,
+        information: 0,
+    };
+    let mut raw = std::ptr::null_mut();
+    let status = unsafe {
+        // SAFETY: all native structures and UTF-16 storage remain live for
+        // the synchronous call; RootDirectory is the pinned retained parent
+        // handle and FILE_CREATE forbids adoption of an existing child.
+        NtCreateFile(
+            &raw mut raw,
+            FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE | WRITE_DAC | WRITE_OWNER,
+            &raw mut attributes,
+            &raw mut io_status,
+            std::ptr::null_mut(),
+            FILE_ATTRIBUTE_NORMAL,
+            FILE_SHARE_READ,
+            STAGING_FILE_CREATE,
+            STAGING_FILE_NON_DIRECTORY_FILE
+                | STAGING_FILE_OPEN_REPARSE_POINT
+                | STAGING_FILE_SYNCHRONOUS_IO_NONALERT
+                | STAGING_FILE_WRITE_THROUGH,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if !staging_nt_status_is_success(status) {
+        if status == STAGING_STATUS_OBJECT_NAME_COLLISION
+            || status == STAGING_STATUS_OBJECT_NAME_EXISTS
+        {
+            return Err(PackageStagingError::GenerationExists);
+        }
+        // Preserve the exact native status bitwise instead of erasing the
+        // create failure to a bare I/O error.
+        return Err(PackageStagingError::Win32At {
+            stage: PackageStagingStage::CreateFileW,
+            site: STAGING_SITE_DESTINATION_FILE_CREATE.to_owned(),
+            code: u32::from_ne_bytes(status.to_ne_bytes()),
+        });
+    }
+    if raw.is_null() {
+        return Err(PackageStagingError::Io);
+    }
+    let file = unsafe {
+        // SAFETY: NtCreateFile returned a unique owned handle.
+        std::fs::File::from_raw_handle(raw.cast())
+    };
+    let descriptor =
+        super::OwnedSecurityDescriptor::for_installer_system_object(false).map_err(|error| {
+            map_installer_descriptor_error(error, PackageStagingStage::SetSecurityInfo)
+        })?;
+    let Ok(identity) = file_identity_from_open_handle(&file) else {
+        drop(file);
+        return Err(PackageStagingError::RollbackRefused);
+    };
+    let result = (|| {
+        staging_apply_file_security(&file, &descriptor)?;
+        ensure_single_link(&file)?;
+        let canonical = final_path_from_handle(&file)?;
+        if !super::windows_paths_equal(&canonical, expected) {
+            return Err(PackageStagingError::IdentityMismatch);
+        }
+        verify_system_security(&file, false)?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => Ok((file, identity)),
+        Err(error) => Err(cleanup_created_handle(file, identity, error)),
+    }
+}
+
+/// Create one destination file below an already-retained destination parent
+/// handle. The retained parent is pinned through its live handle and never
+/// reopened by path; the byte create then runs the same create-only proof as
+/// [`create_destination_file`].
+#[cfg(windows)]
+fn create_destination_file_at(
+    parent: &std::fs::File,
+    path: &Path,
+) -> Result<(std::fs::File, FileIdentity), PackageStagingError> {
+    pin_retained_parent(parent, path)?;
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or(PackageStagingError::InvalidRelativePath)?;
+    nt_create_file_relative(parent, name, path)
+}
+
+#[cfg(not(windows))]
+fn create_destination_file_at(
+    _parent: &std::fs::File,
+    _path: &Path,
+) -> Result<(std::fs::File, FileIdentity), PackageStagingError> {
+    Err(PackageStagingError::UnsupportedPlatform)
+}
+
 #[cfg(not(windows))]
 fn create_destination_file(
     _path: &Path,
@@ -3605,36 +4576,52 @@ fn create_destination_file(
 }
 
 #[cfg(windows)]
+#[cfg(test)]
 fn create_destination_directory(
     path: &Path,
 ) -> Result<(std::fs::File, FileIdentity, String), PackageStagingError> {
-    let parent = path.parent().ok_or(PackageStagingError::RootUnavailable)?;
-    let parent_file = open_existing_directory_for_create(parent)?;
-    let descriptor = super::OwnedSecurityDescriptor::for_installer_system_object(true)
-        .map_err(|_| PackageStagingError::SecurityMismatch)?;
+    // No-parent-handle entry point for fixtures and direct probes with no
+    // retained contour in scope. Like `create_generation_root`, it creates
+    // through the absolute NT path so a live retained ancestor is traversed,
+    // never reopened.
+    let name = staging_nt_full_path(path)?;
+    let descriptor =
+        super::OwnedSecurityDescriptor::for_installer_system_object(true).map_err(|error| {
+            map_installer_descriptor_error(error, PackageStagingStage::SetSecurityInfo)
+        })?;
+    let directory = nt_create_directory_object(&name, &descriptor)?;
+    finish_created_directory(directory, path)
+}
+
+/// Create one destination directory as a child of an already-retained
+/// destination parent handle. The retained parent pathname is never reopened
+/// while its handle is live; the child is created relative to the exact
+/// retained object instead.
+#[cfg(windows)]
+fn create_destination_directory_at(
+    parent: &std::fs::File,
+    path: &Path,
+) -> Result<(std::fs::File, FileIdentity, String), PackageStagingError> {
+    pin_retained_parent(parent, path)?;
     let name = path
         .file_name()
         .and_then(|value| value.to_str())
         .ok_or(PackageStagingError::InvalidRelativePath)?;
-    let directory = super::create_owned_directory_relative(&parent_file, name, descriptor.raw)
+    let descriptor =
+        super::OwnedSecurityDescriptor::for_installer_system_object(true).map_err(|error| {
+            map_installer_descriptor_error(error, PackageStagingStage::SetSecurityInfo)
+        })?;
+    let directory = super::create_owned_directory_relative(parent, name, descriptor.raw)
         .map_err(map_directory_publication_error)?;
-    let Ok(identity) = file_identity_from_open_handle(&directory) else {
-        drop(directory);
-        return Err(PackageStagingError::RollbackRefused);
-    };
-    let result = (|| {
-        let canonical = final_path_from_handle(&directory)?;
-        if !super::windows_paths_equal(&canonical, path) {
-            return Err(PackageStagingError::IdentityMismatch);
-        }
-        let security_descriptor_sha256 = verify_system_security(&directory, true)?;
-        flush_file_buffers(&directory)?;
-        Ok(security_descriptor_sha256)
-    })();
-    match result {
-        Ok(security_descriptor_sha256) => Ok((directory, identity, security_descriptor_sha256)),
-        Err(error) => Err(cleanup_created_handle(directory, identity, error)),
-    }
+    finish_created_directory(directory, path)
+}
+
+#[cfg(not(windows))]
+fn create_destination_directory_at(
+    _parent: &std::fs::File,
+    _path: &Path,
+) -> Result<(std::fs::File, FileIdentity, String), PackageStagingError> {
+    Err(PackageStagingError::UnsupportedPlatform)
 }
 
 #[cfg(not(windows))]
@@ -4005,9 +4992,17 @@ fn read_file_prefix_handle(
     file: &std::fs::File,
     limit: usize,
 ) -> Result<Vec<u8>, PackageStagingError> {
-    let file = file
+    let mut file = file
         .try_clone()
         .map_err(|error| map_package_io_error(error, PackageStagingStage::DuplicateHandle))?;
+    // `try_clone` duplicates the handle with a shared file position on
+    // Windows, so seek to the start before the bounded read. Callers such as
+    // `read_current_files` drain the same handle to EOF through
+    // `read_destination_snapshot_handle` first; without this seek the prefix
+    // read starts at EOF, yields 0 bytes, and every `executable = true`
+    // entry fails PE parsing with `Truncated`.
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| map_package_io_error(error, PackageStagingStage::SetFilePointerEx))?;
     let mut bytes = Vec::new();
     file.take(u64::try_from(limit).map_err(|_| PackageStagingError::BoundExceeded)?)
         .read_to_end(&mut bytes)
@@ -5171,6 +6166,37 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn prefix_reader_is_position_independent_after_snapshot_read() -> TestResult {
+        use std::io::{Read as _, Seek as _};
+
+        let path = std::env::temp_dir().join(format!(
+            "eliot-package-prefix-seek-{}",
+            super::super::unique_suffix()
+        ));
+        let expected = minimal_pe(0x8664, 0x20b);
+        std::fs::write(&path, &expected)?;
+        let file = open_existing_file(&path)?;
+        // Mirror `read_destination_snapshot_handle`: the clone shares the
+        // file position on Windows (`DuplicateHandle`), so draining it
+        // leaves the original handle at EOF — the exact precondition that
+        // made `read_current_files` read a 0-byte prefix and fail every
+        // `executable = true` entry with `PeParse(Truncated)`.
+        let mut drain = file.try_clone()?;
+        drain.seek(std::io::SeekFrom::Start(0))?;
+        let mut sink = Vec::new();
+        drain.read_to_end(&mut sink)?;
+        assert_eq!(sink, expected);
+        let prefix = read_file_prefix_handle(&file, MAX_PE_HEADER_BYTES)?;
+        assert_eq!(prefix, expected);
+        assert_eq!(parse_pe_coff(&prefix)?.machine, 0x8664);
+        drop(drain);
+        drop(file);
+        std::fs::remove_file(&path)?;
+        Ok(())
+    }
+
     fn minimal_pe(machine: u16, magic: u16) -> Vec<u8> {
         let pe_offset = 0x80_usize;
         let optional_size = 0xf0_usize;
@@ -5588,6 +6614,151 @@ mod tests {
         std::fs::remove_file(&source_path)?;
         std::fs::remove_file(&dest_path)?;
         std::fs::remove_dir(&root)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stage_authorized_finalizes_from_retained_handles_without_path_reopen() -> TestResult {
+        // Regression for the finalize sharing violation: every just-created
+        // child handle carries DELETE access without delete sharing, so
+        // reopening any child by path while the created tree is live fails
+        // with ERROR_SHARING_VIOLATION (32). The finalize readback must
+        // therefore measure the retained handles (duplicate + read) and never
+        // reopen a live pathname. Before the handle-relative fix this test
+        // fails with `Win32At { stage: CreateFileW, code: 32, .. }`; after the
+        // fix the full authorized stage succeeds with an exact receipt.
+        let work = std::env::temp_dir().join(format!(
+            "eliot-package-stage-finalize-{}",
+            super::super::unique_suffix()
+        ));
+        std::fs::create_dir(&work)?;
+        let source_dir = work.join("source");
+        std::fs::create_dir(&source_dir)?;
+        std::fs::create_dir(source_dir.join("bin"))?;
+        let root_payload = vec![0xA5_u8; 1024];
+        let nested_payload = vec![0x5A_u8; 512];
+        std::fs::write(source_dir.join("app.bin"), &root_payload)?;
+        std::fs::write(source_dir.join("bin").join("tool.bin"), &nested_payload)?;
+        let source = TrustedSourceBundle::open(&source_dir)?;
+        let source_identity = source.identity();
+        let observed = source.observe()?;
+        assert_eq!(observed.files.len(), 2);
+
+        // The installation root must live below the OS-protected ProgramData
+        // contour: `PackageStager::open` retains it through a
+        // `ProtectedRootLease`, which rejects anything outside that contour.
+        let install_dir = crate::protected_program_data_root()?.join(format!(
+            "eliot-package-stage-finalize-{}",
+            super::super::unique_suffix()
+        ));
+        if let Err(error) = create_destination_directory(&install_dir).map(|_| ()) {
+            drop(source);
+            if security_fixture_unavailable(&error) {
+                let _ = std::fs::remove_dir_all(&install_dir);
+                let _ = std::fs::remove_dir_all(&work);
+                return Ok(());
+            }
+            let _ = std::fs::remove_dir_all(&install_dir);
+            let _ = std::fs::remove_dir_all(&work);
+            return Err(error.into());
+        }
+        let stager = match PackageStager::open(source, &install_dir) {
+            Ok(stager) => stager,
+            Err(error) => {
+                if security_fixture_unavailable(&error) {
+                    let _ = std::fs::remove_dir_all(&install_dir);
+                    let _ = std::fs::remove_dir_all(&work);
+                    return Ok(());
+                }
+                let _ = std::fs::remove_dir_all(&install_dir);
+                let _ = std::fs::remove_dir_all(&work);
+                return Err(error.into());
+            }
+        };
+        let manifest = PackageManifest::new(
+            "generation",
+            vec![
+                PackageFileSpec {
+                    relative_path: "app.bin".to_owned(),
+                    executable: false,
+                    expected_size: root_payload.len() as u64,
+                },
+                PackageFileSpec {
+                    relative_path: "bin/tool.bin".to_owned(),
+                    executable: false,
+                    expected_size: nested_payload.len() as u64,
+                },
+            ],
+        )?;
+        let authorization = StagePackageAuthorization {
+            transaction_id: "test-transaction-finalize".to_owned(),
+            effect_id: "test-effect-finalize".to_owned(),
+            plan_digest: "3".repeat(64),
+            source_bundle_identity: source_identity,
+            source_snapshot_digest: "1".repeat(64),
+            staging_root: stager.installation_root().to_path_buf(),
+            installation_root_identity: Some(stager.installation_root_identity()),
+            generation: manifest.generation.clone(),
+            manifest_sha256: manifest.canonical_digest(),
+            marker_nonce: "2".repeat(64),
+            expected_files: observed
+                .files
+                .iter()
+                .map(|file| StagePackageExpectedFile {
+                    relative_path: file.relative_path.clone(),
+                    source_identity: file.identity,
+                    size: file.size,
+                    sha256: file.sha256.clone(),
+                })
+                .collect(),
+        };
+        let receipt =
+            match stager.stage_authorized(&manifest, &authorization, b"test-ownership-key") {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    drop(stager);
+                    if security_fixture_unavailable(&error) {
+                        let _ = std::fs::remove_dir_all(&install_dir);
+                        let _ = std::fs::remove_dir_all(&work);
+                        return Ok(());
+                    }
+                    let _ = std::fs::remove_dir_all(&install_dir);
+                    let _ = std::fs::remove_dir_all(&work);
+                    panic!("authorized stage through finalize failed: {error:?}");
+                }
+            };
+        assert_eq!(receipt.generation, "generation");
+        assert_eq!(receipt.manifest_sha256, manifest.canonical_digest());
+        assert_eq!(receipt.directories.len(), 1);
+        assert_eq!(receipt.directories[0].relative_path, "bin");
+        assert_eq!(receipt.files.len(), 2);
+        let root_receipt = receipt
+            .files
+            .iter()
+            .find(|file| file.relative_path == "app.bin")
+            .ok_or_else(|| std::io::Error::other("missing root file receipt"))?;
+        assert_eq!(root_receipt.size, root_payload.len() as u64);
+        assert_eq!(root_receipt.sha256, hex_digest(&root_payload));
+        let nested_receipt = receipt
+            .files
+            .iter()
+            .find(|file| file.relative_path == "bin/tool.bin")
+            .ok_or_else(|| std::io::Error::other("missing nested file receipt"))?;
+        assert_eq!(nested_receipt.size, nested_payload.len() as u64);
+        assert_eq!(nested_receipt.sha256, hex_digest(&nested_payload));
+        assert_eq!(
+            std::fs::read(install_dir.join("generation").join("app.bin"))?,
+            root_payload
+        );
+        assert_eq!(
+            std::fs::read(install_dir.join("generation").join("bin").join("tool.bin"))?,
+            nested_payload
+        );
+        drop(stager);
+        drop(receipt);
+        std::fs::remove_dir_all(&install_dir)?;
+        std::fs::remove_dir_all(&work)?;
         Ok(())
     }
 

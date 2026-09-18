@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Barrier;
@@ -5,9 +6,11 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 
-use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence, sha256_hex};
+use eliot_contracts::{
+    AuthorityEpoch, EpochId, EpochLineageId, ResourceGeneration, StateFence, sha256_hex,
+};
 use eliot_platform::SecretReference;
-use eliot_receipts::{ReceiptCore, ReceiptEnvelope};
+use eliot_receipts::{ProofCeiling, ReceiptCore, ReceiptDisposition, ReceiptEnvelope};
 use eliot_runtime_contracts::{
     Ed25519SupervisionLeaseSigner, GenerationCutoverRecord as RuntimeGenerationCutoverRecord,
     GenerationCutoverState, LeaseState, RegisteredActivityWakePolicy, SignedSupervisionLease,
@@ -23,6 +26,23 @@ use serde_json::{Value, json};
 use crate::*;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+// Canonical lineage fixtures (Implements #64): every contour lineage that can
+// reach an `EpochId` wire shape (receipt authority, fence canonical JSON) must
+// name a canonical UUID lineage, because `EpochLineageId` validation rejects
+// display-name labels at deserialization. Contours that never cross that
+// boundary keep their display names.
+const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+const TEST_LINEAGE_B: &str = "550e8400-e29b-41d4-a716-446655440001";
+const TEST_LINEAGE_C: &str = "550e8400-e29b-41d4-a716-446655440002";
+
+fn test_epoch(sequence: u64) -> EpochId {
+    EpochId::new(
+        EpochLineageId::new(TEST_LINEAGE_A).expect("lineage"),
+        std::num::NonZeroU64::new(sequence).expect("sequence"),
+    )
+    .expect("epoch")
+}
 
 static NEXT_DATABASE: AtomicU64 = AtomicU64::new(1);
 
@@ -262,16 +282,23 @@ fn successor(prior: &EpochIdentity, lineage: &str, value: u64) -> Result<EpochLi
     })
 }
 
-fn fence(epoch: u64) -> Result<StateFenceSnapshot, OrsError> {
+fn fence(authority_epoch: &EpochLineage) -> Result<StateFenceSnapshot, OrsError> {
+    // Exact-tuple fence contour (Implements #64): the snapshot's canonical JSON
+    // carries the canonical `EpochId` object shape so it deserializes into the
+    // migrated fence contracts; the retained `u64` contour observes the same
+    // sequence and never authorizes on its own.
     StateFenceSnapshot::capture(
         &json!({
-            "authority_epoch": epoch,
+            "authority_epoch": {
+                "lineage_id": authority_epoch.current.lineage_id.as_str(),
+                "sequence": authority_epoch.current.epoch
+            },
             "integration_revision": null,
             "policy_revision": null,
             "resource_generation": 1,
             "task_revision": null
         }),
-        epoch,
+        authority_epoch.current.epoch,
     )
 }
 
@@ -288,13 +315,13 @@ fn operational_input(
     authority_epoch: EpochLineage,
     payload: &str,
 ) -> Result<OperationalRecordInput, OrsError> {
-    let epoch_value = authority_epoch.current.epoch;
+    let state_fence = fence(&authority_epoch)?;
     OperationalRecordInput::encrypted(
         OperationalRecordContext {
             record_id: label(record_id)?,
             subject_id: label(subject_id)?,
             authority_epoch,
-            state_fence: fence(epoch_value)?,
+            state_fence,
             created_at_ms: 100,
             cleanup_after_ms: Some(10_000),
         },
@@ -310,13 +337,13 @@ fn request(
     writer_epoch: EpochLineage,
     scopes: &[&str],
 ) -> TestResult<ReservationRequest> {
-    let epoch_value = writer_epoch.current.epoch;
+    let state_fence = fence(&writer_epoch)?;
     let envelope = RecoveryPayloadEnvelope::encrypted(
         RecoveryEnvelopeContext {
             operation_or_checkpoint_id: label(operation_id)?,
             privacy_and_visibility_class: access()?,
             authority_epoch: writer_epoch.clone(),
-            state_fence: fence(epoch_value)?,
+            state_fence,
             created_at_ms: 10,
             known_at_ms: 11,
             expires_at_ms: Some(10_000),
@@ -396,7 +423,10 @@ fn receipt(token: &WriterReservationToken, disposition: &Value) -> TestResult<Re
         "authority": {
             "authority_id": "authority-1",
             "authority_owner": "governor",
-            "authority_epoch": token.writer_epoch.current.epoch,
+            "authority_epoch": {
+                "lineage_id": token.writer_epoch.current.lineage_id.as_str(),
+                "sequence": token.writer_epoch.current.epoch
+            },
             "state_fence": state_fence,
             "allowed_effect": "REVERSIBLE_MUTATION",
             "proof_ceiling": "SCOPED_VERIFICATION"
@@ -466,7 +496,7 @@ fn envelope_validation_rejects_tamper_version_and_bad_fence() -> TestResult {
     let original = request(
         "reservation-a",
         "operation-a",
-        epoch("lineage-a", 7)?,
+        epoch(TEST_LINEAGE_A, 7)?,
         &["a"],
     )?;
     original.envelope.validate()?;
@@ -504,7 +534,7 @@ fn process_start_replay_has_one_atomic_winner_and_rejects_substitution() -> Test
     let owner = eliot_process::ProcessOwnerBinding::new(
         "testd",
         "a".repeat(64),
-        1,
+        test_epoch(1),
         eliot_process::Generation::new(1)?,
     )?;
     let record = ProcessStartReplayRecord {
@@ -638,7 +668,7 @@ fn supervision_binding(
         host_epoch: AuthorityEpoch::new(1)?,
         activation_id: label("activation-1")?,
         activation_generation: ResourceGeneration::new(1)?,
-        kernel_epoch: AuthorityEpoch::new(2)?,
+        kernel_epoch: test_epoch(2),
         watchdog_epoch: AuthorityEpoch::new(1)?,
         generation_binding: SupervisionGenerationBinding {
             target_id: "target-1".to_owned(),
@@ -648,7 +678,7 @@ fn supervision_binding(
             process_id: "kernel-process-1".to_owned(),
             process_generation: ResourceGeneration::new(1)?,
         },
-        state_fence: StateFence::new(AuthorityEpoch::new(2)?, ResourceGeneration::new(1)?),
+        state_fence: StateFence::new(test_epoch(2), ResourceGeneration::new(1)?),
         issued_at_ms,
         expires_at_ms: issued_at_ms + 900,
         renew_before_ms: issued_at_ms + 450,
@@ -797,7 +827,7 @@ fn supervision_verification_inputs(
         host_epoch: payload.host_epoch,
         activation_id: payload.activation_id.clone(),
         activation_generation: payload.activation_generation,
-        kernel_epoch: payload.kernel_epoch,
+        kernel_epoch: payload.kernel_epoch.clone(),
         watchdog_epoch: payload.watchdog_epoch,
         state_fence: payload.state_fence.clone(),
         scope_ref: payload.scope_ref.clone(),
@@ -1085,9 +1115,8 @@ fn supervision_lease_renew_is_monotonic_and_history_is_bounded() -> TestResult {
         Err(OrsError::SupervisionLeaseStaleRevision)
     ));
     let mut mismatched_binding = supervision_binding(LeaseState::Active, 250)?;
-    mismatched_binding.kernel_epoch = AuthorityEpoch::new(3)?;
-    mismatched_binding.state_fence =
-        StateFence::new(AuthorityEpoch::new(3)?, ResourceGeneration::new(1)?);
+    mismatched_binding.kernel_epoch = test_epoch(3);
+    mismatched_binding.state_fence = StateFence::new(test_epoch(3), ResourceGeneration::new(1)?);
     assert!(matches!(
         store.prepare_supervision_lease(supervision_request(
             "ticket-fence-mismatch",
@@ -1560,9 +1589,15 @@ fn process_evidence(
                 "generation": 1,
                 "action_lease_ref": "lease-1",
                 "authority_id": "authority-1",
-                "authority_epoch": 1,
+                "authority_epoch": {
+                    "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "sequence": 1
+                },
                 "state_fence": {
-                    "authority_epoch": 1,
+                    "authority_epoch": {
+                        "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+                        "sequence": 1
+                    },
                     "generation": 1,
                     "nonce": "fence-1"
                 },
@@ -1600,10 +1635,13 @@ fn process_evidence_record(
     lifecycle: &str,
     observed_at_ms: i64,
 ) -> TestResult<ProcessEvidenceRecord> {
+    // `new_with_canonical` was sealed away with the v4 `EpochId`-only cutover:
+    // the owner binding carries the canonical tuple directly, so the fixture
+    // passes `test_epoch(1)` as the authority epoch itself.
     let owner = eliot_process::ProcessOwnerBinding::new(
         "testd",
         "aa".repeat(32),
-        1,
+        test_epoch(1),
         eliot_process::Generation::new(1)?,
     )?;
     Ok(ProcessEvidenceRecord::from_evidence(
@@ -1627,9 +1665,15 @@ fn process_start_receipt(
             "generation": 1,
             "action_lease_ref": "lease-1",
             "authority_id": "authority-1",
-            "authority_epoch": 1,
+            "authority_epoch": {
+                "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+                "sequence": 1
+            },
             "state_fence": {
-                "authority_epoch": 1,
+                "authority_epoch": {
+                    "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "sequence": 1
+                },
                 "generation": 1,
                 "nonce": "fence-1"
             },
@@ -1682,7 +1726,7 @@ fn process_evidence_appends_history_idempotently_and_recovers_in_order() -> Test
     conflicting.owner = eliot_process::ProcessOwnerBinding::new(
         "native",
         conflicting.owner.principal_digest(),
-        conflicting.owner.authority_epoch(),
+        conflicting.owner.authority_epoch().clone(),
         conflicting.owner.generation(),
     )?;
     assert_eq!(conflicting.record_key()?, first.record_key()?);
@@ -1987,7 +2031,7 @@ fn multi_scope_reservation_is_atomic_ordered_and_conflict_on_duplicate() -> Test
     let path = database_path("atomic");
     cleanup(&path);
     let coordinator = coordinator(&path)?;
-    let writer_epoch = epoch("lineage-a", 7)?;
+    let writer_epoch = epoch(TEST_LINEAGE_A, 7)?;
     let original = request(
         "reservation-a",
         "operation-a",
@@ -2021,7 +2065,7 @@ fn multi_scope_reservation_is_atomic_ordered_and_conflict_on_duplicate() -> Test
     coordinator.release(&token, &writer_epoch.current)?;
     coordinator.eligible(&second)?;
 
-    let wrong_epoch = epoch("other-lineage", 1)?;
+    let wrong_epoch = epoch(TEST_LINEAGE_B, 1)?;
     let failed = request(
         "reservation-failed",
         "operation-failed",
@@ -2049,7 +2093,7 @@ fn multi_scope_reservation_is_atomic_ordered_and_conflict_on_duplicate() -> Test
 fn crash_restart_enters_reconciliation_and_receipt_unblocks_scope() -> TestResult {
     let path = database_path("restart");
     cleanup(&path);
-    let writer_epoch = epoch("lineage-a", 7)?;
+    let writer_epoch = epoch(TEST_LINEAGE_A, 7)?;
     let token = {
         let coordinator = coordinator(&path)?;
         let token = coordinator.reserve(request(
@@ -2109,7 +2153,7 @@ fn unknown_outcome_has_no_blind_replay_or_cleanup_expiry() -> TestResult {
     let path = database_path("unknown");
     cleanup(&path);
     let coordinator = coordinator(&path)?;
-    let writer_epoch = epoch("lineage-a", 7)?;
+    let writer_epoch = epoch(TEST_LINEAGE_A, 7)?;
     let token = coordinator.reserve(request(
         "reservation-a",
         "operation-a",
@@ -2164,7 +2208,7 @@ fn lineage_fences_old_owner_and_requires_recovery() -> TestResult {
     let path = database_path("lineage");
     cleanup(&path);
     let coordinator = coordinator(&path)?;
-    let old = epoch("lineage-a", 7)?;
+    let old = epoch(TEST_LINEAGE_A, 7)?;
     let token = coordinator.reserve(request(
         "reservation-a",
         "operation-a",
@@ -2214,7 +2258,7 @@ fn recovery_cursor_is_bounded_and_expiry_requires_owner() -> TestResult {
     let path = database_path("cursor");
     cleanup(&path);
     let coordinator = coordinator(&path)?;
-    let writer_epoch = epoch("lineage-a", 7)?;
+    let writer_epoch = epoch(TEST_LINEAGE_A, 7)?;
     let first = coordinator.reserve(request(
         "reservation-1",
         "operation-1",
@@ -2281,7 +2325,7 @@ fn canonical_head_readback_blocks_jump_and_preserves_predecessor_fairness() -> T
     let path = database_path("head-binding");
     cleanup(&path);
     let coordinator = coordinator_with_evidence(&path, Arc::new(GenesisHeadEvidence))?;
-    let writer_epoch = epoch("lineage-a", 7)?;
+    let writer_epoch = epoch(TEST_LINEAGE_A, 7)?;
     let mut fabricated = request(
         "reservation-fabricated",
         "operation-fabricated",
@@ -2389,7 +2433,7 @@ fn reservation_order_and_scope_sequences_hold_over_generated_matrix() -> TestRes
 fn caller_issued_receipt_cannot_finalize_without_injected_readback() -> TestResult {
     let path = database_path("readback-auth");
     cleanup(&path);
-    let writer_epoch = epoch("lineage-a", 7)?;
+    let writer_epoch = epoch(TEST_LINEAGE_A, 7)?;
     let token;
     let exact;
     {
@@ -2437,7 +2481,7 @@ fn persisted_invalid_label_and_envelope_digest_fail_closed() -> TestResult {
         coordinator.reserve(request(
             "reservation-a",
             "operation-a",
-            epoch("lineage-a", 7)?,
+            epoch(TEST_LINEAGE_A, 7)?,
             &["scope-a"],
         )?)?;
         stored = coordinator
@@ -2478,7 +2522,7 @@ fn persisted_invalid_label_and_envelope_digest_fail_closed() -> TestResult {
         let token = coordinator.reserve(request(
             "reservation-b",
             "operation-b",
-            epoch("lineage-a", 7)?,
+            epoch(TEST_LINEAGE_A, 7)?,
             &["scope-b"],
         )?)?;
         operation_id = token.operation_id;
@@ -2513,6 +2557,557 @@ fn persisted_invalid_label_and_envelope_digest_fail_closed() -> TestResult {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// T9-03 owner-backed durable replay stream (issue #22, M3).
+// ---------------------------------------------------------------------------
+
+fn replay_claim_fixture(
+    claim_id: &str,
+    generation: u64,
+    epoch: u64,
+    fence_digest: &str,
+) -> TestResult<NativeWorkerClaimRecord> {
+    Ok(NativeWorkerClaimRecord {
+        contract_version: CONTRACT_VERSION,
+        claim_id: OperationIdentity::new(claim_id)?,
+        registration_id: OpaqueLabel::new("reg-replay-1")?,
+        worker_generation: generation,
+        parent_job_id: OpaqueLabel::new("parent-replay-1")?,
+        task_id: OpaqueLabel::new("task-replay-1")?,
+        work_scope_id: OpaqueLabel::new("scope-replay-1")?,
+        decision_id: OpaqueLabel::new("decision-replay-1")?,
+        attempt_id: OpaqueLabel::new("attempt-replay-1")?,
+        operation_id: OpaqueLabel::new("op-replay-1")?,
+        route_class: OpaqueLabel::new("route-replay-1")?,
+        budget_digest: "b".repeat(64),
+        deadline_unix_ms: 1_700_000_500_000,
+        fence_digest: fence_digest.to_owned(),
+        authority_epoch: epoch,
+        binding_digest: "c".repeat(64),
+        request_digest: "d".repeat(64),
+        execution_unit_schema_version: 1,
+        predecessor_revision: OpaqueLabel::new("predecessor-replay-0")?,
+        resource_envelope_digest: "e".repeat(64),
+        state: NativeWorkerClaimState::Requested,
+        receipt_digest: None,
+        admitted_at_unix_ms: None,
+        commit_order: 0,
+    })
+}
+
+fn replay_begin_fixture(
+    stream_id: &str,
+    request_id: &str,
+    fingerprint: &str,
+    generation: u64,
+    epoch: u64,
+    fence_digest: &str,
+) -> WorkerReplayBegin {
+    WorkerReplayBegin {
+        stream_id: stream_id.to_owned(),
+        request_id: request_id.to_owned(),
+        fingerprint: fingerprint.to_owned(),
+        producer_generation: generation,
+        authority_epoch: epoch,
+        fence_digest: fence_digest.to_owned(),
+    }
+}
+
+fn replay_draft_fixture(
+    stream_id: &str,
+    request_id: &str,
+    generation: u64,
+    epoch: u64,
+    fence_digest: &str,
+    payload: &str,
+) -> WorkerReplayDraft {
+    WorkerReplayDraft {
+        stream_id: stream_id.to_owned(),
+        producer_id: "producer-replay-1".to_owned(),
+        producer_generation: generation,
+        authority_epoch: epoch,
+        fence_digest: fence_digest.to_owned(),
+        request_id: request_id.to_owned(),
+        causal_predecessor_refs: Vec::new(),
+        delivery_class: WorkerReplayDeliveryClass::DurableControl,
+        ack_required: true,
+        payload_type: "test-event".to_owned(),
+        payload: payload.to_owned(),
+        disposition: ReceiptDisposition::Success {
+            proof: ProofCeiling::Observation,
+        },
+        trace_context: BTreeMap::new(),
+    }
+}
+
+fn replay_ack_fixture(event: &WorkerReplayEvent, phase: WorkerReplayPhase) -> WorkerReplayAck {
+    WorkerReplayAck {
+        stream_id: event.stream_id.clone(),
+        event_id: event.event_id.clone(),
+        sequence: event.sequence,
+        producer_generation: event.producer_generation,
+        authority_epoch: event.authority_epoch,
+        fence_digest: event.fence_digest.clone(),
+        phase,
+    }
+}
+
+/// Opens a store, stages one bound claim, and derives its replay stream.
+fn open_bound_replay_stream(
+    label: &str,
+    claim_id: &str,
+    generation: u64,
+    epoch: u64,
+    fence_digest: &str,
+) -> TestResult<(PathBuf, RedbRecoveryStore, String)> {
+    let path = database_path(label);
+    cleanup(&path);
+    let store = RedbRecoveryStore::open(&path)?;
+    let claim = replay_claim_fixture(claim_id, generation, epoch, fence_digest)?;
+    store.stage_native_worker_claim(&claim)?;
+    let stream_id = replay_stream_id(&claim.claim_id, generation)?;
+    Ok((path, store, stream_id))
+}
+
+#[test]
+fn worker_replay_stream_id_constructor_matches_claim_generation_shape() -> TestResult {
+    let claim_id = OperationIdentity::new("claim-t9-03-1")?;
+    assert_eq!(
+        replay_stream_id(&claim_id, 1)?.as_str(),
+        "claim-t9-03-1/gen-1"
+    );
+    let (parsed_claim, parsed_generation) = parse_replay_stream_id("claim-t9-03-1/gen-1")?;
+    assert_eq!(parsed_claim, claim_id);
+    assert_eq!(parsed_generation, 1);
+    assert!(replay_stream_id(&claim_id, 0).is_err());
+    assert!(parse_replay_stream_id("claim-t9-03-1/1").is_err());
+    assert!(parse_replay_stream_id("claim-t9-03-1/gen-0").is_err());
+    assert!(parse_replay_stream_id("no-separator").is_err());
+    Ok(())
+}
+
+#[test]
+fn worker_replay_close_reopen_retains_stream_and_cursors() -> TestResult {
+    let fence = "a".repeat(64);
+    let (path, store, stream_id) =
+        open_bound_replay_stream("replay-reopen", "claim-reopen-1", 1, 1, &fence)?;
+    assert!(matches!(
+        store.lookup_replay_request(&stream_id, "req-reopen-1", "fp-reopen-1")?,
+        WorkerReplayRequestDecision::New
+    ));
+    assert!(matches!(
+        store.begin_replay_request(&replay_begin_fixture(
+            &stream_id,
+            "req-reopen-1",
+            "fp-reopen-1",
+            1,
+            1,
+            &fence
+        ))?,
+        WorkerReplayRequestDecision::New
+    ));
+    let first = store.append_replay_event(&replay_draft_fixture(
+        &stream_id,
+        "req-reopen-1",
+        1,
+        1,
+        &fence,
+        "first",
+    ))?;
+    let second = store.append_replay_event(&replay_draft_fixture(
+        &stream_id,
+        "req-reopen-1",
+        1,
+        1,
+        &fence,
+        "second",
+    ))?;
+    assert_eq!((first.sequence, second.sequence), (1, 2));
+    let cursors =
+        store.acknowledge_replay_event(&replay_ack_fixture(&first, WorkerReplayPhase::Durable))?;
+    assert_eq!((cursors.producer_cursor, cursors.consumer_cursor), (1, 0));
+    let cursors =
+        store.acknowledge_replay_event(&replay_ack_fixture(&first, WorkerReplayPhase::Applied))?;
+    assert_eq!((cursors.producer_cursor, cursors.consumer_cursor), (1, 1));
+
+    drop(store);
+    let reopened = RedbRecoveryStore::open(&path)?;
+    let replayed = reopened.replay_stream(&stream_id, 0)?;
+    assert_eq!(replayed.len(), 2);
+    assert_eq!(replayed[0].event_id, first.event_id);
+    assert_eq!(replayed[1].event_id, second.event_id);
+    assert_eq!(replayed[1].sequence, 2);
+    let decision = reopened.lookup_replay_request(&stream_id, "req-reopen-1", "fp-reopen-1")?;
+    assert!(
+        matches!(decision, WorkerReplayRequestDecision::Replay(ref events) if events.len() == 2)
+    );
+    // UNKNOWN advances no cursor after reopen either.
+    let cursors = reopened
+        .acknowledge_replay_event(&replay_ack_fixture(&second, WorkerReplayPhase::Unknown))?;
+    assert_eq!((cursors.producer_cursor, cursors.consumer_cursor), (1, 1));
+
+    drop(reopened);
+    cleanup(&path);
+    Ok(())
+}
+
+#[test]
+fn worker_replay_identical_draft_keeps_identity_and_sequence() -> TestResult {
+    let fence = "b".repeat(64);
+    let (path, store, stream_id) =
+        open_bound_replay_stream("replay-idempotent", "claim-idem-1", 1, 1, &fence)?;
+    assert!(matches!(
+        store.begin_replay_request(&replay_begin_fixture(
+            &stream_id,
+            "req-idem-1",
+            "fp-idem-1",
+            1,
+            1,
+            &fence
+        ))?,
+        WorkerReplayRequestDecision::New
+    ));
+    let draft = replay_draft_fixture(&stream_id, "req-idem-1", 1, 1, &fence, "same");
+    let first = store.append_replay_event(&draft)?;
+    let replayed = store.append_replay_event(&draft)?;
+    assert_eq!(first.event_id, replayed.event_id);
+    assert_eq!(first.sequence, replayed.sequence);
+    assert_eq!(replayed.sequence, 1);
+    // A retained acquisition is never a fresh request: begin and lookup both
+    // report the retained event.
+    let decision = store.begin_replay_request(&replay_begin_fixture(
+        &stream_id,
+        "req-idem-1",
+        "fp-idem-1",
+        1,
+        1,
+        &fence,
+    ))?;
+    assert!(
+        matches!(decision, WorkerReplayRequestDecision::Replay(ref events)
+            if events.len() == 1 && events[0].event_id == first.event_id)
+    );
+    let decision = store.lookup_replay_request(&stream_id, "req-idem-1", "fp-idem-1")?;
+    assert!(
+        matches!(decision, WorkerReplayRequestDecision::Replay(ref events)
+            if events.len() == 1 && events[0].sequence == 1)
+    );
+
+    drop(store);
+    cleanup(&path);
+    Ok(())
+}
+
+#[test]
+fn worker_replay_changed_fingerprint_conflicts_without_overwrite() -> TestResult {
+    let fence = "c".repeat(64);
+    let (path, store, stream_id) =
+        open_bound_replay_stream("replay-conflict", "claim-conflict-1", 1, 1, &fence)?;
+    assert!(matches!(
+        store.begin_replay_request(&replay_begin_fixture(
+            &stream_id,
+            "req-conflict-1",
+            "fp-original",
+            1,
+            1,
+            &fence
+        ))?,
+        WorkerReplayRequestDecision::New
+    ));
+    assert!(matches!(
+        store.begin_replay_request(&replay_begin_fixture(
+            &stream_id,
+            "req-conflict-1",
+            "fp-changed",
+            1,
+            1,
+            &fence
+        ))?,
+        WorkerReplayRequestDecision::Conflict
+    ));
+    assert!(matches!(
+        store.lookup_replay_request(&stream_id, "req-conflict-1", "fp-changed")?,
+        WorkerReplayRequestDecision::Conflict
+    ));
+    // The durable binding is untouched: the original fingerprint still replays.
+    assert!(matches!(
+        store.lookup_replay_request(&stream_id, "req-conflict-1", "fp-original")?,
+        WorkerReplayRequestDecision::Replay(_)
+    ));
+
+    drop(store);
+    cleanup(&path);
+    Ok(())
+}
+
+#[test]
+fn worker_replay_foreign_ack_rejects_without_moving_cursors() -> TestResult {
+    let fence = "d".repeat(64);
+    let (path, store, stream_id) =
+        open_bound_replay_stream("replay-foreign-ack", "claim-foreign-1", 1, 1, &fence)?;
+    store.begin_replay_request(&replay_begin_fixture(
+        &stream_id,
+        "req-foreign-1",
+        "fp-foreign-1",
+        1,
+        1,
+        &fence,
+    ))?;
+    let event = store.append_replay_event(&replay_draft_fixture(
+        &stream_id,
+        "req-foreign-1",
+        1,
+        1,
+        &fence,
+        "guarded",
+    ))?;
+
+    let mut wrong_id = replay_ack_fixture(&event, WorkerReplayPhase::Applied);
+    wrong_id.event_id = "evt-foreign".to_owned();
+    assert!(matches!(
+        store.acknowledge_replay_event(&wrong_id),
+        Err(OrsError::WorkerReplayAckMismatch { .. })
+    ));
+
+    let mut wrong_sequence = replay_ack_fixture(&event, WorkerReplayPhase::Applied);
+    wrong_sequence.sequence = 999;
+    assert!(matches!(
+        store.acknowledge_replay_event(&wrong_sequence),
+        Err(OrsError::WorkerReplayAckMismatch { .. })
+    ));
+
+    // A second bound claim owns a disjoint stream: acknowledging the first
+    // event there is foreign and rejected.
+    let other_claim = replay_claim_fixture("claim-foreign-2", 1, 1, &fence)?;
+    store.stage_native_worker_claim(&other_claim)?;
+    let other_stream = replay_stream_id(&other_claim.claim_id, 1)?;
+    store.begin_replay_request(&replay_begin_fixture(
+        &other_stream,
+        "req-foreign-2",
+        "fp-foreign-2",
+        1,
+        1,
+        &fence,
+    ))?;
+    let mut foreign_stream = replay_ack_fixture(&event, WorkerReplayPhase::Applied);
+    foreign_stream.stream_id = other_stream.clone();
+    assert!(matches!(
+        store.acknowledge_replay_event(&foreign_stream),
+        Err(OrsError::WorkerReplayAckMismatch { .. })
+    ));
+
+    // No rejected acknowledgement moved a cursor: an exact ack still lands on
+    // the virgin head.
+    let cursors =
+        store.acknowledge_replay_event(&replay_ack_fixture(&event, WorkerReplayPhase::Durable))?;
+    assert_eq!((cursors.producer_cursor, cursors.consumer_cursor), (1, 0));
+
+    drop(store);
+    cleanup(&path);
+    Ok(())
+}
+
+#[test]
+fn worker_replay_generation_change_never_relaunches() -> TestResult {
+    let fence = "e".repeat(64);
+    let (path, store, stream_id) =
+        open_bound_replay_stream("replay-generation", "claim-generation-1", 1, 1, &fence)?;
+    store.begin_replay_request(&replay_begin_fixture(
+        &stream_id,
+        "req-generation-1",
+        "fp-generation-1",
+        1,
+        1,
+        &fence,
+    ))?;
+    let event = store.append_replay_event(&replay_draft_fixture(
+        &stream_id,
+        "req-generation-1",
+        1,
+        1,
+        &fence,
+        "history",
+    ))?;
+    assert_eq!(event.sequence, 1);
+
+    // A new generation under the same claim is stale against the bound claim:
+    // acquire, append, and acknowledge all fail closed.
+    let rotated_stream = "claim-generation-1/gen-2".to_owned();
+    assert!(matches!(
+        store.begin_replay_request(&replay_begin_fixture(
+            &rotated_stream,
+            "req-generation-2",
+            "fp-generation-2",
+            2,
+            1,
+            &fence
+        )),
+        Err(OrsError::WorkerReplayStaleStream { .. })
+    ));
+    assert!(matches!(
+        store.append_replay_event(&replay_draft_fixture(
+            &rotated_stream,
+            "req-generation-2",
+            2,
+            1,
+            &fence,
+            "relaunched"
+        )),
+        Err(OrsError::WorkerReplayStaleStream { .. })
+    ));
+    let mut rotated_ack = replay_ack_fixture(&event, WorkerReplayPhase::Applied);
+    rotated_ack.stream_id = rotated_stream.clone();
+    rotated_ack.producer_generation = 2;
+    assert!(matches!(
+        store.acknowledge_replay_event(&rotated_ack),
+        Err(OrsError::WorkerReplayStaleStream { .. })
+    ));
+    // A stale epoch under the current generation is rejected the same way.
+    assert!(matches!(
+        store.begin_replay_request(&replay_begin_fixture(
+            &stream_id,
+            "req-generation-3",
+            "fp-generation-3",
+            1,
+            2,
+            &fence
+        )),
+        Err(OrsError::WorkerReplayStaleStream { .. })
+    ));
+    // Nothing was acquired for the rotated stream, and the retained history
+    // still reads.
+    assert!(matches!(
+        store.lookup_replay_request(&rotated_stream, "req-generation-2", "fp-generation-2")?,
+        WorkerReplayRequestDecision::New
+    ));
+    assert_eq!(store.replay_stream(&stream_id, 0)?.len(), 1);
+
+    drop(store);
+    cleanup(&path);
+    Ok(())
+}
+
+#[test]
+fn worker_replay_bounded_page_and_pruned_gap() -> TestResult {
+    let fence = "f".repeat(64);
+    let (path, store, stream_id) =
+        open_bound_replay_stream("replay-page-gap", "claim-page-1", 1, 1, &fence)?;
+    store.begin_replay_request(&replay_begin_fixture(
+        &stream_id,
+        "req-page-1",
+        "fp-page-1",
+        1,
+        1,
+        &fence,
+    ))?;
+    let window = u64::from(MAX_REPLAY_PAGE);
+    let total = window + 4;
+    let mut envelopes = Vec::new();
+    for n in 1..=total {
+        let event = store.append_replay_event(&replay_draft_fixture(
+            &stream_id,
+            "req-page-1",
+            1,
+            1,
+            &fence,
+            &format!("payload-{n}"),
+        ))?;
+        assert_eq!(event.sequence, n);
+        envelopes.push(event);
+    }
+    // An oversized suffix fails instead of truncating silently ...
+    assert!(matches!(
+        store.replay_stream(&stream_id, 0),
+        Err(OrsError::ProjectionLimitExceeded)
+    ));
+    // ... while a bounded tail pages honestly.
+    let tail = store.replay_stream(&stream_id, total - 5)?;
+    assert_eq!(tail.len(), 5);
+    assert_eq!(tail[0].sequence, total - 4);
+
+    // Every event reaches APPLIED, so retention may prune the prefix while
+    // keeping the newest window.
+    for event in &envelopes {
+        store.acknowledge_replay_event(&replay_ack_fixture(event, WorkerReplayPhase::Applied))?;
+    }
+    assert_eq!(store.prune_replay_stream(&stream_id)?, 4);
+    // The pruned prefix is a loud gap, not an empty success ...
+    assert!(matches!(
+        store.replay_stream(&stream_id, 0),
+        Err(OrsError::WorkerReplayIncomplete { .. })
+    ));
+    // ... while the retained suffix pages exactly at the bound and a
+    // caught-up consumer honestly receives nothing.
+    let retained = store.replay_stream(&stream_id, 4)?;
+    assert_eq!(retained.len(), usize::from(MAX_REPLAY_PAGE));
+    assert_eq!(retained[0].sequence, 5);
+    assert_eq!(retained[retained.len() - 1].sequence, total);
+    assert!(store.replay_stream(&stream_id, total)?.is_empty());
+
+    drop(store);
+    cleanup(&path);
+    Ok(())
+}
+
+#[test]
+fn worker_replay_ack_advances_only_its_phase_cursor() -> TestResult {
+    let fence = "9".repeat(64);
+    let (path, store, stream_id) =
+        open_bound_replay_stream("replay-cursors", "claim-cursor-1", 1, 1, &fence)?;
+    store.begin_replay_request(&replay_begin_fixture(
+        &stream_id,
+        "req-cursor-1",
+        "fp-cursor-1",
+        1,
+        1,
+        &fence,
+    ))?;
+    let first = store.append_replay_event(&replay_draft_fixture(
+        &stream_id,
+        "req-cursor-1",
+        1,
+        1,
+        &fence,
+        "one",
+    ))?;
+    let second = store.append_replay_event(&replay_draft_fixture(
+        &stream_id,
+        "req-cursor-1",
+        1,
+        1,
+        &fence,
+        "two",
+    ))?;
+
+    // DURABLE advances only the producer cursor.
+    let cursors =
+        store.acknowledge_replay_event(&replay_ack_fixture(&first, WorkerReplayPhase::Durable))?;
+    assert_eq!((cursors.producer_cursor, cursors.consumer_cursor), (1, 0));
+    // A non-terminal phase persists without moving any cursor.
+    let cursors =
+        store.acknowledge_replay_event(&replay_ack_fixture(&first, WorkerReplayPhase::Received))?;
+    assert_eq!((cursors.producer_cursor, cursors.consumer_cursor), (1, 0));
+    // UNKNOWN never advances a cursor.
+    let cursors =
+        store.acknowledge_replay_event(&replay_ack_fixture(&second, WorkerReplayPhase::Unknown))?;
+    assert_eq!((cursors.producer_cursor, cursors.consumer_cursor), (1, 0));
+    // APPLIED advances only the consumer cursor, monotonically.
+    let cursors =
+        store.acknowledge_replay_event(&replay_ack_fixture(&second, WorkerReplayPhase::Applied))?;
+    assert_eq!((cursors.producer_cursor, cursors.consumer_cursor), (1, 2));
+    // The normal lifecycle order (DURABLE then APPLIED) converges per phase.
+    let cursors =
+        store.acknowledge_replay_event(&replay_ack_fixture(&second, WorkerReplayPhase::Durable))?;
+    assert_eq!((cursors.producer_cursor, cursors.consumer_cursor), (2, 2));
+    let cursors =
+        store.acknowledge_replay_event(&replay_ack_fixture(&first, WorkerReplayPhase::Rejected))?;
+    assert_eq!((cursors.producer_cursor, cursors.consumer_cursor), (2, 2));
+
+    drop(store);
+    cleanup(&path);
+    Ok(())
+}
+
 #[test]
 #[allow(
     clippy::too_many_lines,
@@ -2523,7 +3118,7 @@ fn appendix_p4_operational_surface_projects_rollover_and_retains_snapshot() -> T
     cleanup(&path);
     let coordinator = coordinator(&path)?;
     let store = coordinator.store();
-    let old = epoch("kernel-lineage-a", 7)?;
+    let old = epoch(TEST_LINEAGE_C, 7)?;
     let token = coordinator.reserve(request(
         "reservation-p4",
         "operation-p4",

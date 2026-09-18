@@ -1,0 +1,27 @@
+name: Fixture arbitrary inputs (must be rejected)
+# WORK_UNIT_CASE: 750/5 negative fixture. Manual inputs must be a closed
+# enum (Quick|Review) or absent; free-form ref/command/profile is forbidden.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Arbitrary ref to check out
+        required: false
+        type: string
+      command:
+        description: Arbitrary command to run
+        required: false
+        type: string
+      profile:
+        description: Unconstrained profile selector
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - run: echo "must never validate"

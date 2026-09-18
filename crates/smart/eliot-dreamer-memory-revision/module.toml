@@ -1,0 +1,71 @@
+schema_version = 4
+module_id = "smart.dreamer.memory_revision"
+crate = "eliot-dreamer-memory-revision"
+status = "PROTOTYPE"
+wave = "cognitive-micromodules-wave-09"
+agent_order = 79
+plane = "Smart"
+runtime_layer = "R6"
+delivery_depth = "D3a"
+source_layer = "C1"
+runtime_bundle = "eliot-dreamer"
+state_class = "stateless"
+hot_path = false
+lifecycle_owner = "smart.dreamer.memory_revision"
+loc_soft_ceiling = 10000
+loc_policy = "review ceiling only; causal cohesion, proof, owner, build/test closure and replacement boundary decide topology"
+product_objective = "Negative memory narrows advisory activation/influence only after new evidence while the original failure history is preserved verbatim."
+causal_property = "negative-memory extinction candidate"
+old_failure_or_missing_capability = "negative memory is suppressed from rare action-change alone or rewritten as though it never existed, with no closure denominator or adjudication boundary."
+discriminator = "the extinction candidate narrows only the advisory activation/influence fields and preserves every history field; without adequate adjudication only reversible suppress/quarantine/archive is allowed"
+primary_responsibility = "Propose one advisory NegativeMemoryExtinctionCandidate over an exact FailureFingerprint with full dependency-closure denominator."
+owned_mutable_state = []
+allowed_effects = []
+inputs = ["immutable FailureObservation by handle (CC-FAILURE-OBSERVATION-SCHEMA)", "immutable MemoryRevisionEvidence refs by handle", "immutable admitted task/safety projections by handle (CC-004)"]
+outputs = ["NegativeMemoryExtinctionCandidate"]
+depends_on = ["eliot-dreamer-contracts"]
+providers = ["validated Dreamer draft", "admitted failure/memory handles"]
+consumers = ["Governor transition path (advisory only)"]
+non_goals = ["physical purge without full closure", "narrative rewrite", "support revision", "automatic deletion"]
+invariants = ["extinction narrows influence after new evidence and history remains", "raw episodes and source observations remain immutable", "no second memory system", "recurring failure with the same causal hypothesis yields Mechanism Review rather than another equivalent retry", "every Complete state requires the exact independently recheckable closure denominator"]
+failure_behavior = "Return unsupported/inconclusive extinction candidate with exact missing evidence; original records remain unchanged."
+proof_surface = ["exact-trigger block/probe cases", "valid-near-match positive controls", "false-delete/false-retain/false-block/reopen counts", "rollback/reopen boundary"]
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+product_pulse = "W9_MEMORY_QUALITY_PULSE_01"
+replacement_boundary = "implementation behind the declared public contract; package ownership creates no runtime or semantic authority"
+merge_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
+split_trigger = "a second causal responsibility, mutable owner, independent proof surface or independent rollback boundary appears"
+
+[[donor]]
+path = "docs/architecture/I12-19-negative-memory.md"
+disposition = "authoritative contract"
+
+[[donor]]
+path = "docs/architecture/I12-21-memory-ecology-residual-experience-and-transfer.md"
+disposition = "authoritative contract"
+
+[agent_task]
+objective = "Freeze the owner-neutral negative-memory extinction field contract with exact closure denominator; no implementation in this work unit."
+write_scope = ["crates/smart/eliot-dreamer-memory-revision/**"]
+deliverables = ["frozen field contract entry", "closure denominator recheck rule", "affected edge fixtures (contract_only)"]
+acceptance = ["one declared responsibility only", "bounded deterministic behavior", "visible local degradation"]
+forbidden = ["canonical writes outside the named Governor transition path", "truth/support/authority/policy/finish/effect promotion", "provider or model SDKs in pure cognitive cores", "vendor or storage types in public contracts", "unbounded synchronous work", "silent truncation", "oracle or verifier weakening in the same work unit", "implicit scope widening", "active-generation self-modification"]
+stop_condition = "Stop and return ContractChallenge when the work needs another owner, unbounded traversal, model call or hidden state."
+challenge_path = "return ContractChallenge to the integration owner when owner, discriminator, proof ceiling or dependency boundary is wrong"
+integration_owner = "cognitive-wave-integrator"
+implementation_language = "Rust 2024"
+required_verification = ["module/package proof at the declared proof ceiling", "real provider/consumer fixture for every changed edge", "the named Product Pulse before promotion", "exact donor reuse/rewrite/reject trace"]
+writeback = "return implementation artifact, exact proof evidence, donor disposition, unresolved ContractChallenges and merge/remove recommendation"
+workspace_admission = "forbidden until implementation, package proof, affected edge proof, current-main rebase and integration-owner review"
+
+# Acceptance is decided by the owning contract and independent review
+# (I0.10: line/test/type counts are not goals). `scripts/verify-work-unit.py`
+# is a retired legacy diagnostic that always reports completion=NOT_VERIFIED
+# and never accepts a work unit. This table names the concrete contract and
+# the required exports/tests plus small behaviour checks the reviewer verifies.
+[acceptance]
+require_deny_unknown_fields = true
+forbid_unsafe = true
+required_exports = []
+required_tests = []
+forbidden_patterns = ['serde_json::Value', 'unimplemented!', 'todo!']

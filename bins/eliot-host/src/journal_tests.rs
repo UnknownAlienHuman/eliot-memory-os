@@ -4,7 +4,8 @@ mod journal_termination_tests;
 
 use super::*;
 use eliot_host_state::{
-    BackendError, BackendReconcileState, DurableImage, FaultPoint, MemoryBackend, PreparedAppend,
+    BackendError, BackendReconcileState, DrainCommitRecord, DurableImage, FaultPoint,
+    MemoryBackend, PreparedAppend, WakeDisposition,
 };
 #[cfg(windows)]
 use eliot_installation::{InstallationEpoch, RuntimeStateRoots};
@@ -43,6 +44,16 @@ fn test_supervision_incarnation(
         predecessor: None,
     }
     .with_derived_ids()
+    .unwrap_or_else(|_| unreachable!())
+}
+
+#[cfg(windows)]
+fn test_epoch(sequence: u64) -> EpochId {
+    EpochId::new(
+        EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .unwrap_or_else(|_| unreachable!()),
+        std::num::NonZeroU64::new(sequence).unwrap_or_else(|| unreachable!()),
+    )
     .unwrap_or_else(|_| unreachable!())
 }
 
@@ -158,7 +169,10 @@ fn runtime_control_unknown_ref_preserves_request_identity_across_reopen() -> Tes
         HostRuntimeControlOperation::RestartKernel,
         PlatformHandle::new("reopen-request-17")?,
     )?;
-    let pending_ref = runtime_control_unknown_ref("kernel-restart-reconcile", &request);
+    let pending_ref = eliot_host_service::runtime_control::runtime_control_unknown_ref(
+        "kernel-restart-reconcile",
+        &request,
+    );
     assert!(pending_ref.as_str().contains("RestartKernel"));
     assert!(pending_ref.as_str().contains(request.request_id.as_str()));
     assert!(
@@ -239,7 +253,7 @@ struct ReadinessFixture {
 )]
 fn active_readiness_fixture() -> Result<ReadinessFixture, TestError> {
     let host = test_host();
-    let activation_generation = root_epoch(fresh_identity("readiness-activation-lineage")?);
+    let activation_generation = root_epoch(fresh_lineage_id()?);
     let activation_id = fresh_identity("readiness-activation")?;
     let journal = HostStateJournalService::from_backend(MemoryBackend::default(), host.clone())?;
     append_reconciled(
@@ -259,8 +273,8 @@ fn active_readiness_fixture() -> Result<ReadinessFixture, TestError> {
     let image = "C:\\eliot\\eliot-kernel.exe".to_owned();
     let candidate = HostKernelCandidateBinding {
         installation_id: host.installation.clone(),
-        host_epoch: AuthorityEpoch::new(host.epoch.current.sequence)?,
-        kernel_epoch: AuthorityEpoch::new(2)?,
+        host_epoch: AuthorityEpoch::new(host.epoch.current.sequence.get())?,
+        kernel_epoch: test_epoch(2),
         activation_id: activation_id.clone(),
         artifact_hash: kernel_artifact.clone(),
         config_hash: config.clone(),
@@ -290,7 +304,7 @@ fn active_readiness_fixture() -> Result<ReadinessFixture, TestError> {
         supervision_incarnation: test_supervision_incarnation(
             host.installation.as_str(),
             activation_id.as_str(),
-            host.epoch.current.lineage.as_str(),
+            host.epoch.current.lineage_id.as_str(),
             "readiness-kernel-lineage",
         ),
         restart_budget: RestartBudget::new(1, 1)?,
@@ -315,13 +329,13 @@ fn active_readiness_fixture() -> Result<ReadinessFixture, TestError> {
         candidate.pipe_identity.clone(),
         durable_job,
         PriorKernelDisposition::NoPriorKernel,
-        root_epoch(fresh_identity("readiness-kernel-lineage")?),
+        root_epoch(fresh_lineage_id()?),
         ServiceProcessRecord {
             process_id: "pid:42:start:10".to_owned(),
             owner: "Kernel".to_owned(),
             state: ServiceProcessState::Starting,
             health: HealthVector::healthy(),
-            authority_epoch: candidate.kernel_epoch,
+            authority_epoch: AuthorityEpoch::new(candidate.kernel_epoch.sequence.get())?,
         },
     )?;
     driver.handoff_prepared()?;
@@ -349,7 +363,10 @@ fn active_readiness_fixture() -> Result<ReadinessFixture, TestError> {
         route_identity: PlatformHandle::new(eliot_kernel_service::STORE_ROUTE_IDENTITY)?,
         canonical_pipe_identity: PlatformHandle::new(r"\\.\pipe\eliot\store-readiness")?,
         store_generation: ResourceGeneration::genesis(),
-        state_fence: StateFence::new(candidate.kernel_epoch, ResourceGeneration::genesis()),
+        state_fence: StateFence::new(
+            candidate.kernel_epoch.clone(),
+            ResourceGeneration::genesis(),
+        ),
         launch_nonce: PlatformHandle::new("store-launch-nonce")?,
         connection_id: PlatformHandle::new("store-connection")?,
         expected_peer_sid: PlatformHandle::new("S-1-5-18")?,
@@ -395,7 +412,7 @@ fn readiness_supervision_snapshot(
         host_epoch: fixture.candidate.host_epoch,
         activation_id: eliot_ors::OperationIdentity::new(fixture.candidate.activation_id.as_str())?,
         activation_generation: fixture.activation.generation,
-        kernel_epoch: fixture.candidate.kernel_epoch,
+        kernel_epoch: fixture.candidate.kernel_epoch.clone(),
         watchdog_epoch: AuthorityEpoch::new(1)?,
         generation_binding: eliot_runtime_contracts::SupervisionGenerationBinding {
             target_id: "kernel-readiness".to_owned(),
@@ -406,7 +423,7 @@ fn readiness_supervision_snapshot(
             process_generation: fixture.activation.generation,
         },
         state_fence: StateFence::new(
-            fixture.candidate.kernel_epoch,
+            fixture.candidate.kernel_epoch.clone(),
             fixture.activation.generation,
         ),
         issued_at_ms,
@@ -459,7 +476,7 @@ fn readiness_supervision_snapshot(
         host_epoch: envelope.payload.host_epoch,
         activation_id: envelope.payload.activation_id.clone(),
         activation_generation: envelope.payload.activation_generation,
-        kernel_epoch: envelope.payload.kernel_epoch,
+        kernel_epoch: envelope.payload.kernel_epoch.clone(),
         watchdog_epoch: envelope.payload.watchdog_epoch,
         state_fence: envelope.payload.state_fence.clone(),
         scope_ref: envelope.payload.scope_ref.clone(),
@@ -662,10 +679,7 @@ pub(super) fn liveness_manifest_with_distinct_store_digests()
         },
         generation: generation.clone(),
         authority_generation: ResourceGeneration::genesis(),
-        authority_state_fence: StateFence::new(
-            AuthorityEpoch::genesis(),
-            ResourceGeneration::genesis(),
-        ),
+        authority_state_fence: StateFence::new(test_epoch(1), ResourceGeneration::genesis()),
         supervision_authority: eliot_installation::SupervisionAuthorityBinding::Provisioned {
             authority: Box::new(test_provisioned_supervision_authority(
                 "installation:liveness-store-split",
@@ -707,6 +721,12 @@ pub(super) fn liveness_manifest_with_distinct_store_digests()
             handle("9".repeat(64)),
             handle("--kernel-artifact-sha256"),
             kernel_digest.clone(),
+            handle("--doctor-artifact-sha256"),
+            handle("b".repeat(64)),
+            handle("--testd-artifact-sha256"),
+            handle("c".repeat(64)),
+            handle("--native-worker-artifact-sha256"),
+            handle("d".repeat(64)),
             handle("--eliotd-descriptor"),
             path(&portable, "eliotd.json"),
             handle("--eliotd-descriptor-sha256"),
@@ -742,6 +762,12 @@ pub(super) fn liveness_manifest_with_distinct_store_digests()
         host_artifact_digest: handle("e".repeat(64)),
         watchdog_executable_path: path(&portable, "eliot-watchdog.exe"),
         watchdog_artifact_digest: handle("7".repeat(64)),
+        doctor_artifact_digest: handle("b".repeat(64)),
+        testd_artifact_digest: handle("c".repeat(64)),
+        native_worker_artifact_digest: handle("d".repeat(64)),
+        doctor_executable_path: path(&portable, "eliot-doctor.exe"),
+        testd_executable_path: path(&portable, "eliot-testd.exe"),
+        native_worker_executable_path: path(&portable, "eliot-native-worker.exe"),
         descriptor_digest: handle("0".repeat(64)),
     };
     runtime_launch = runtime_launch.with_computed_digest()?;
@@ -752,10 +778,16 @@ pub(super) fn liveness_manifest_with_distinct_store_digests()
         store_bridge_artifact_digest: bridge_digest,
         canonical_store_artifact_digest: provider_digest,
         host_artifact_digest: handle("e".repeat(64)),
+        doctor_artifact_digest: handle("b".repeat(64)),
+        testd_artifact_digest: handle("c".repeat(64)),
+        native_worker_artifact_digest: handle("d".repeat(64)),
         kernel_executable_path: path(&portable, "eliot-kernel.exe"),
         store_bridge_executable_path: bridge_path,
         canonical_store_executable_path: provider_path,
         host_executable_path: host_path,
+        doctor_executable_path: path(&portable, "eliot-doctor.exe"),
+        testd_executable_path: path(&portable, "eliot-testd.exe"),
+        native_worker_executable_path: path(&portable, "eliot-native-worker.exe"),
         config_path,
         dependency_closure_refs: vec![handle("evidence:dependency-closure")],
         license_refs: vec![handle("evidence:licenses")],
@@ -1140,8 +1172,11 @@ fn phase_b_live_epoch_and_manifest_digest_are_observed_not_synthesized() -> Test
     let host = test_host();
     let live = phase_b_live_installation_epoch(&host);
     assert_eq!(live.installation, host.installation);
-    assert_eq!(live.lineage_id, host.epoch.current.lineage);
-    assert_eq!(live.sequence, host.epoch.current.sequence);
+    assert_eq!(
+        live.lineage_id.as_str(),
+        host.epoch.current.lineage_id.as_str()
+    );
+    assert_eq!(live.sequence, host.epoch.current.sequence.get());
 
     let (manifest, root) = liveness_manifest_with_distinct_store_digests()?;
     let expected = manifest.compute_digest()?;
@@ -1307,7 +1342,7 @@ fn materialize_descriptor_bound_host_fixture(
         config_descriptor_sha256: launch.eliotd_config_digest.as_str().to_owned(),
         protected_snapshot_digest: launch.protected_snapshot_digest.as_str().to_owned(),
         launch_nonce: eliotd_nonce,
-        authority_epoch: launch.authority_state_fence.authority_epoch,
+        authority_epoch: launch.authority_state_fence.authority_epoch.clone(),
         generation: descriptor_generation,
         descriptor_sha256: String::new(),
     }
@@ -1318,7 +1353,7 @@ fn materialize_descriptor_bound_host_fixture(
         &descriptor_bytes,
     )?;
     launch.eliotd_descriptor_digest = descriptor_digest.clone();
-    launch.kernel_arguments[15] = descriptor_digest;
+    launch.kernel_arguments[21] = descriptor_digest;
     launch.descriptor_digest = PlatformHandle::new(launch.compute_digest()?)?;
     Ok(())
 }
@@ -2166,7 +2201,11 @@ fn activation_reopen_starts_a_fresh_child_after_historical_active() -> TestResul
         reopened_host.epoch.parent,
         Some(last_host.epoch.current.clone())
     );
-    assert_eq!(reopened_generation, prior_generation.direct_child()?);
+    assert_eq!(
+        reopened_generation,
+        EpochTransition::direct_child(&prior_generation.current)
+            .map_err(|error| epoch_contract_error(&error))?
+    );
     let recovered = reopened.snapshot()?;
     assert!(recovered.activation.is_none());
     assert!(recovered.prior_kernel.is_some());
@@ -2381,16 +2420,20 @@ fn host_owner_epoch_digest_is_bound_to_exact_direct_child_sequence() -> TestResu
     let installation = handle("owner-digest-sequence-installation")?;
     let parent = fresh_host_epoch(installation, None)?;
     let child = child_host_epoch(&parent)?;
-    assert_eq!(parent.epoch.current.lineage, child.epoch.current.lineage);
-    assert_eq!(parent.epoch.current.sequence, 1);
-    assert_eq!(child.epoch.current.sequence, 2);
+    assert_eq!(
+        parent.epoch.current.lineage_id,
+        child.epoch.current.lineage_id
+    );
+    assert_eq!(parent.epoch.current.sequence.get(), 1);
+    assert_eq!(child.epoch.current.sequence.get(), 2);
     assert_ne!(
         host_owner_epoch_digest(&parent)?,
         host_owner_epoch_digest(&child)?,
         "owner proof must not collapse same-lineage parent and direct child"
     );
     let mut overflow = parent;
-    overflow.epoch.current.sequence = u64::MAX;
+    overflow.epoch.current.sequence =
+        std::num::NonZeroU64::new(u64::MAX).unwrap_or_else(|| unreachable!());
     assert!(
         child_host_epoch(&overflow).is_err(),
         "direct-child owner epoch minting must fail closed on sequence overflow"
@@ -2417,7 +2460,7 @@ fn host_composition_production_field_is_the_redb_journal_service() {
 #[test]
 fn open_activation_clean_stop_and_child_reopen_replay() -> TestResult {
     let host = test_host();
-    let generation = root_epoch(fresh_identity("test-activation-lineage")?);
+    let generation = root_epoch(fresh_lineage_id()?);
     let activation_id = fresh_identity("test-activation")?;
     let journal = HostStateJournalService::from_backend(MemoryBackend::default(), host.clone())
         .unwrap_or_else(|_| unreachable!());
@@ -2437,7 +2480,8 @@ fn open_activation_clean_stop_and_child_reopen_replay() -> TestResult {
     let child = child_host_epoch(&host)?;
     let reopened = HostStateJournalService::from_backend(backend, child.clone())?;
     assert_eq!(reopened.snapshot()?.retained_epochs.len(), 1);
-    let child_generation = generation.direct_child()?;
+    let child_generation = EpochTransition::direct_child(&generation.current)
+        .map_err(|error| epoch_contract_error(&error))?;
     let child_activation = fresh_identity("test-child-activation")?;
     append_reconciled(
         &reopened,
@@ -2457,7 +2501,7 @@ fn open_activation_clean_stop_and_child_reopen_replay() -> TestResult {
 #[test]
 fn unknown_commit_is_reconciled_by_transaction_identity() -> TestResult {
     let host = test_host();
-    let generation = root_epoch(fresh_identity("unknown-lineage")?);
+    let generation = root_epoch(fresh_lineage_id()?);
     let activation_id = fresh_identity("unknown-activation")?;
     let journal = HostStateJournalService::from_backend(
         MemoryBackend::with_fault(FaultPoint::CommitAfterUnknown),
@@ -2480,7 +2524,7 @@ fn unknown_commit_is_reconciled_by_transaction_identity() -> TestResult {
 #[test]
 fn torn_current_epoch_fails_closed() -> TestResult {
     let host = test_host();
-    let generation = root_epoch(fresh_identity("torn-lineage")?);
+    let generation = root_epoch(fresh_lineage_id()?);
     let activation_id = fresh_identity("torn-activation")?;
     let journal = HostStateJournalService::from_backend(MemoryBackend::default(), host.clone())?;
     append_reconciled(
@@ -2544,7 +2588,7 @@ fn activation_failure_nonce_discriminator_revokes_only_pre_active_issuance() {
 )]
 fn reconciled_active_readiness_failure_preserves_contour_then_recovers() -> TestResult {
     let host = test_host();
-    let activation_generation = root_epoch(fresh_identity("reconcile-activation-lineage")?);
+    let activation_generation = root_epoch(fresh_lineage_id()?);
     let activation_id = fresh_identity("reconcile-activation")?;
     let journal = HostStateJournalService::from_backend(MemoryBackend::default(), host.clone())?;
     append_reconciled(
@@ -2562,8 +2606,8 @@ fn reconciled_active_readiness_failure_preserves_contour_then_recovers() -> Test
     let kernel_image = "C:\\eliot\\eliot-kernel.exe".to_owned();
     let candidate = HostKernelCandidateBinding {
         installation_id: host.installation.clone(),
-        host_epoch: AuthorityEpoch::new(host.epoch.current.sequence)?,
-        kernel_epoch: AuthorityEpoch::new(2)?,
+        host_epoch: AuthorityEpoch::new(host.epoch.current.sequence.get())?,
+        kernel_epoch: test_epoch(2),
         activation_id: activation_id.clone(),
         artifact_hash: PlatformHandle::new("a".repeat(64))?,
         config_hash: PlatformHandle::new("c".repeat(64))?,
@@ -2593,7 +2637,7 @@ fn reconciled_active_readiness_failure_preserves_contour_then_recovers() -> Test
         supervision_incarnation: test_supervision_incarnation(
             host.installation.as_str(),
             activation_id.as_str(),
-            host.epoch.current.lineage.as_str(),
+            host.epoch.current.lineage_id.as_str(),
             "reconcile-kernel-lineage",
         ),
         restart_budget: RestartBudget::new(1, 1)?,
@@ -2609,7 +2653,7 @@ fn reconciled_active_readiness_failure_preserves_contour_then_recovers() -> Test
         root_volume_serial_number: 1,
         root_file_index: 2,
     };
-    let kernel_generation = root_epoch(fresh_identity("reconcile-kernel-lineage")?);
+    let kernel_generation = root_epoch(fresh_lineage_id()?);
     let mut driver = DurableKernelActivationDriver::bind_candidate(
         &journal,
         &host,
@@ -2625,7 +2669,7 @@ fn reconciled_active_readiness_failure_preserves_contour_then_recovers() -> Test
             owner: "Kernel".to_owned(),
             state: ServiceProcessState::Starting,
             health: HealthVector::healthy(),
-            authority_epoch: candidate.kernel_epoch,
+            authority_epoch: AuthorityEpoch::new(candidate.kernel_epoch.sequence.get())?,
         },
     )?;
     driver.handoff_prepared()?;
@@ -2663,7 +2707,10 @@ fn reconciled_active_readiness_failure_preserves_contour_then_recovers() -> Test
         route_identity: PlatformHandle::new(eliot_kernel_service::STORE_ROUTE_IDENTITY)?,
         canonical_pipe_identity: PlatformHandle::new(r"\\.\pipe\eliot\store-readiness")?,
         store_generation: ResourceGeneration::genesis(),
-        state_fence: StateFence::new(candidate.kernel_epoch, ResourceGeneration::genesis()),
+        state_fence: StateFence::new(
+            candidate.kernel_epoch.clone(),
+            ResourceGeneration::genesis(),
+        ),
         launch_nonce: PlatformHandle::new("reconcile-store-launch")?,
         connection_id: PlatformHandle::new("reconcile-store-connection")?,
         expected_peer_sid: PlatformHandle::new("S-1-5-18")?,
@@ -2787,7 +2834,7 @@ fn reconciled_active_readiness_failure_preserves_contour_then_recovers() -> Test
 #[test]
 fn store_rebind_disposition_uses_exact_operation_and_request_identity() -> TestResult {
     let host = test_host();
-    let activation_generation = root_epoch(fresh_identity("store-rebind-disposition")?);
+    let activation_generation = root_epoch(fresh_lineage_id()?);
     let activation_id = fresh_identity("store-rebind-disposition-activation")?;
     let journal = HostStateJournalService::from_backend(MemoryBackend::default(), host.clone())?;
     append_reconciled(
@@ -2868,7 +2915,7 @@ fn store_rebind_disposition_uses_exact_operation_and_request_identity() -> TestR
         },
         candidate_binding_digest: third.candidate_binding_digest.as_str().to_owned(),
         generation: ResourceGeneration::new(third.generation)?,
-        authority_epoch: AuthorityEpoch::new(third.authority_epoch)?,
+        authority_epoch: test_epoch(third.authority_epoch),
         store_fence: third.store_fence.as_str().to_owned(),
     };
     substituted_receipt.process_binding.process.process_id += 1;
@@ -3187,7 +3234,7 @@ fn store_recovery_committed_inner_crash_reopens_as_fenced_unknown_without_child_
         PlatformHandle::new("store-recovery-physical-installation")?,
         None,
     )?;
-    let activation_generation = root_epoch(fresh_identity("store-recovery-physical-generation")?);
+    let activation_generation = root_epoch(fresh_lineage_id()?);
     let activation_id = fresh_identity("store-recovery-physical-activation")?;
     let backend = RedbJournalBackend::open_unprotected_for_test(&journal_path)?;
     let journal = HostStateJournalService::from_backend(backend, host.clone())?;
@@ -3218,8 +3265,8 @@ fn store_recovery_committed_inner_crash_reopens_as_fenced_unknown_without_child_
         request_id: request.request_id.as_str().to_owned(),
         mutation_digest: request.mutation_digest.as_str().to_owned(),
         request_digest: request.request_digest.as_str().to_owned(),
-        host_epoch: host.epoch.current.sequence,
-        host_lineage: host.epoch.current.lineage.as_str().to_owned(),
+        host_epoch: host.epoch.current.sequence.get(),
+        host_lineage: host.epoch.current.lineage_id.as_str().to_owned(),
         process_id: 4_101,
         process_start_time_100ns: 41_010,
         process_image_path: r"C:\Eliot\store-old.exe".to_owned(),
@@ -3235,12 +3282,12 @@ fn store_recovery_committed_inner_crash_reopens_as_fenced_unknown_without_child_
     )?;
 
     let generation = ResourceGeneration::genesis();
-    let authority_epoch = AuthorityEpoch::genesis();
+    let authority_epoch = host.epoch.current.clone();
     let requirement = HostStoreBootstrapRequirement {
         route_identity: PlatformHandle::new(eliot_kernel_service::STORE_ROUTE_IDENTITY)?,
         canonical_pipe_identity: PlatformHandle::new(r"\\.\pipe\eliot\store")?,
         store_generation: generation,
-        state_fence: StateFence::new(authority_epoch, generation),
+        state_fence: StateFence::new(authority_epoch.clone(), generation),
         launch_nonce: PlatformHandle::new("store-recovery-physical-nonce")?,
         connection_id: PlatformHandle::new("store-recovery-physical-connection")?,
         expected_peer_sid: PlatformHandle::new("S-1-5-18")?,
@@ -3264,7 +3311,7 @@ fn store_recovery_committed_inner_crash_reopens_as_fenced_unknown_without_child_
         process_binding: process_binding.clone(),
         candidate_binding_digest: "d".repeat(64),
         generation,
-        authority_epoch,
+        authority_epoch: authority_epoch.clone(),
         store_fence: "e".repeat(64),
     };
     handoff.request_digest = handoff.canonical_request_digest()?;
@@ -3289,7 +3336,7 @@ fn store_recovery_committed_inner_crash_reopens_as_fenced_unknown_without_child_
         process_image_path: PlatformHandle::new(process_binding.process.image_path.clone())?,
         job_name: process_binding.job.clone(),
         generation: generation.value(),
-        authority_epoch: authority_epoch.value(),
+        authority_epoch: authority_epoch.sequence.get(),
         receipt_request_digest: None,
         receipt_store_fence: None,
     };
@@ -3437,10 +3484,11 @@ fn production_bound_active_phase_b_receipt_recovery_uses_physical_cas() -> TestR
     manifest.validate()?;
 
     let handle = |value: String| PlatformHandle::new(value).unwrap_or_else(|_| unreachable!());
+    let prior_lineage = handle(first_host.epoch.current.lineage_id.as_str().to_owned());
     let mut prior = active_startup_prior_binding(
         &manifest,
-        &first_host.epoch.current.lineage,
-        first_host.epoch.current.sequence - 1,
+        &prior_lineage,
+        first_host.epoch.current.sequence.get() - 1,
     );
     prior.authority_descriptor_digest = handle("9".repeat(64));
     prior.store_bootstrap_descriptor_digest = handle("8".repeat(64));
@@ -3472,6 +3520,9 @@ fn production_bound_active_phase_b_receipt_recovery_uses_physical_cas() -> TestR
         &commit_fence,
     )?;
     let registry = registry_store.load()?;
+    // #1339: Host never retains the exclusive writer; drop the seeding handle
+    // so the composition below uses short-lived open-use-drop handles only.
+    drop(registry_store);
     let launch_options = HostLaunchOptions {
         config_descriptor_path: PathBuf::from(
             manifest.runtime_launch.authority_descriptor_path.as_str(),
@@ -3495,7 +3546,7 @@ fn production_bound_active_phase_b_receipt_recovery_uses_physical_cas() -> TestR
         HOST_STORE_REBIND_PRODUCTION_DISCRIMINATOR
     );
     let build_composition = |journal: ProductionHostStateJournal,
-                             registry_store: RedbInstallationRegistry,
+                             registry_file: PathBuf,
                              registry: ApprovedGenerationRegistry,
                              launch_options: HostLaunchOptions,
                              host: HostInstallationEpoch,
@@ -3504,11 +3555,13 @@ fn production_bound_active_phase_b_receipt_recovery_uses_physical_cas() -> TestR
                              owner_lease: HostOwnerLease|
      -> Result<HostComposition, WindowsAdapterError> {
         let jobs = HostJobBranches::new_test_support(&host)?;
+        let registry_host_root = launch_options.host_state_root().to_path_buf();
         Ok(HostComposition {
             store_rebind_boundary: HostStoreRebindProductionBoundary,
             runtime_control_boundary: HostRuntimeControlProductionBoundary,
             journal,
-            registry_store,
+            registry_host_root,
+            test_registry_file: Some(registry_file),
             registry,
             launch_options,
             host,
@@ -3533,7 +3586,7 @@ fn production_bound_active_phase_b_receipt_recovery_uses_physical_cas() -> TestR
     };
     let mut first = build_composition(
         first_journal,
-        registry_store,
+        registry_path.clone(),
         registry,
         launch_options.clone(),
         first_host.clone(),
@@ -3610,9 +3663,10 @@ fn production_bound_active_phase_b_receipt_recovery_uses_physical_cas() -> TestR
     let recovery_owner_lease = HostOwnerLease::acquire(&installation)?;
     let recovery_registry_store = RedbInstallationRegistry::open_test_support(&registry_path)?;
     let recovery_registry = recovery_registry_store.load()?;
+    drop(recovery_registry_store);
     let mut second = build_composition(
         second_journal,
-        recovery_registry_store,
+        registry_path.clone(),
         recovery_registry,
         launch_options,
         second_host,

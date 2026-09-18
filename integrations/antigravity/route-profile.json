@@ -96,9 +96,9 @@
         "credential_boundary": "authorized user-owned Antigravity profile; provider credentials are not copied into ELIOT"
       },
       "schema_and_health_probe": {
-        "version": "antigravity version/help plus executable hash",
-        "schema": "headless NDJSON event schema fingerprint from one disposable read-only run",
-        "health": "start persistent stream, submit one read-only prompt, observe terminal result, cancel, and prove process-tree cleanup",
+        "version": "Slice B freeze: runtime antigravity.headless program antigravity argv exec --stdin --persistent --json plus fallback antigravity.agy-readonly program agy; contract eliot.antigravity-runtime-preflight.v1 receipt eliot.antigravity-runtime-preflight-receipt.v1 ceiling ZERO_MODEL_STABLE_EXECUTABLE_PATH_AND_HELP_FINGERPRINT_ONLY (integrations/antigravity/runtime-preflight.contract.json; validator scripts/antigravity_runtime_preflight.py:155 validate_contract); version probe antigravity version/help plus executable hash (sha256+byte_length+file_identity pre_version/post_version/post_help, process_image_proof false); route policy crates/eliot-engine/src/provider_invocation.rs:734 antigravity_plan_route_policy (AgentHostId::Antigravity, agy plan print audit)",
+        "schema": "Slice B freeze: headless NDJSON event schema fingerprint from one disposable read-only run must equal closed NormalizedHostEventEnvelope eliot-agent-api/host-event-v7 (crates/agent/eliot-agent-api/src/host_event.rs:719); raw legacy HostEventEnvelope quarantine boundary untouched (crates/agent/eliot-agent-api/src/lib.rs:754); bridge EventEnvelope crates/foundation/eliot-protocol/src/lib.rs:646 with protocol CONTRACT_VERSION 1.0.0 and protocol_contract_identity (:2424)",
+        "health": "Slice B freeze: start persistent stream, submit one read-only prompt, observe terminal result, cancel, and prove process-tree cleanup; adapter AdapterSupervisor crates/eliot-engine/src/adapter.rs:85 under I10.17, bridge eliot.surfaces.agent-bridge-core/v1 transport-only (crates/surfaces/eliot-agent-bridge-core/src/lib.rs:33), Governor session eliot.governor.session_lifecycle v1.0.0 / task eliot.governor.task_lifecycle v1.0.0, attempt owner eliot_agent_coordinator; health proves no admission (route_admitted false, model_calls 0)",
         "negative_capability_challenge": "send a harmless invalid optional lifecycle or permission value and require a typed non-success"
       },
       "model_selection": {
@@ -108,15 +108,15 @@
         "per_attempt_receipt": true
       },
       "session_control": {
-        "start": "persistent headless stream with one ELIOT AgentAttempt identity",
+        "start": "Slice B freeze: persistent headless stream with one ELIOT AgentAttempt identity (AgentAttempt crates/agent/eliot-agent-api/src/lib.rs:804: id AttemptId/AgentAttemptId, task_id TaskId, session Option<SessionId>, lease WorkLeaseId, state AttemptState, continuity ContinuityKind, route RouteFingerprint eliot.agent.route-fingerprint.v6, budget, authority AuthorityEnvelope, cancellation CancellationState, event_cursor Option<EventCursor>, continuation RouteContinuationLocator route-bound, provider_binding Option<ProviderExecutionBinding> #361 unresolved-until-validated). Session Governor AgentSession eliot.governor.session_lifecycle v1.0.0 (crates/governor/eliot-session/src/lib.rs:18; SessionState Registering/Active/Idle/Disconnected/Expired/Revoked/Draining/Closed, terminal Expired/Revoked/Closed). Task Governor TaskState Proposed/Open/Framed/UnderstandingRequired/ActionAuthorized/Executing/Verifying/DoneVerified/Blocked/Failed/Partial, terminal DoneVerified/Blocked/Failed/Partial (crates/governor/eliot-task/src/lib.rs:59). Route profile antigravity.local.supervised-stream host_family antigravity route_class later-local-sidecar route_id antigravity.exec.persistent-ndjson per_attempt_receipt true fixed_model_id null.",
         "resume": "native session identifier only after exact-version retention and replay probes pass",
         "fork": null,
-        "cancel": "stream cancellation followed by bounded process-tree cleanup and terminal readback",
+        "cancel": "Slice B freeze: stream cancellation followed by bounded process-tree cleanup and terminal readback; Attempt Cancelling->Cancelled/Reconciling/UnknownOutcome, CancellationObserved reason CancelReason observed_state != NotRequested, StopBoundaryRecord I7.9 (stop identity/time, task/attempt/fence/cursor, in-flight ops/children, external-effect dispositions, last durable/normalized/applied event, required checkpoint/reconciliation/finish); forged Stop/hook text cannot mint terminal outcome",
         "continuation_kind": "native_resume"
       },
       "event_contract": {
-        "source": "headless NDJSON lifecycle, tool, permission, child, error, and terminal events",
-        "ordering": "native event/session identity wrapped in ELIOT EventEnvelope sequence and durable acknowledgement phases",
+        "source": "Slice B freeze (issue #9, base dfa3547e): raw legacy HostEventEnvelope (crates/agent/eliot-agent-api/src/lib.rs:754; event_id/EventId, sequence u64 nonzero, cursor/EventCursor, kind SessionStarted/PromptSubmitted/ReasoningDelta/AssistantDelta/ToolCall/ToolResult/Checkpoint/Usage/Warning/Error/CancelRequested/Completed/Failed/Unknown, route RouteFingerprint, raw_payload_digest, normalized_payload Value, lineage; quarantine boundary issue #371 T4 S6, untouched) plus closed normalized NormalizedHostEventEnvelope schema eliot-agent-api/host-event-v7 (crates/agent/eliot-agent-api/src/host_event.rs:51,719; producer_adapter_identity target-unimplemented for antigravity, adapter_contract_version target, causal_predecessors bounded, admitted_route_digest Some-exactly-for-execution-unit/None-for-session-only, raw_source RawSourceRecord handle+QualifiedSourceDigest sha256-canonical-json-v1, normalization HostEventNormalizationReceipt proof_ceiling Observation, observed_at ClockReading, delivery DurableOrdered/BestEffortOrdered/Replay). Payload family: SessionLifecycle(Started/Resumed/Suspended/Closed, session-only, no attempt authority)/ExecutionStarted/AssistantDelta/ReasoningSummary/ToolInvocation/ToolOutcome/Checkpoint/Usage/Warning/Error/CancellationObserved/ProviderTerminalObserved(CompletedObserved/FailedObserved/CancelledObserved + terminal_ref)/CandidateResultAvailable(result_digest + admitted_route_digest, digest-checked only)/UnsupportedQuarantined. Headless NDJSON lifecycle, tool, permission, child, error, and terminal events are the unobserved native source; every observed ELIOT event must arrive as the closed normalized envelope above.",
+        "ordering": "Slice B freeze: native event/session identity wrapped in ELIOT EventEnvelope (crates/foundation/eliot-protocol/src/lib.rs:646; stream_id/producer_id/producer_generation/authority_epoch is_same_authority state_fence.authority_epoch/event_id/sequence nonzero/causal_predecessor_refs/delivery_class/ack_required/payload_type/state_fence/trace_context) with durable acknowledgement phases RECEIVED->DURABLE->NORMALIZED->APPLIED plus REJECTED/UNKNOWN (EventAckReceipt validate_advance), disposition accepted/duplicate/rejected/conflict, identity key domain eliot:event:v1 (stream_id+event_id), per-stream cursor max(sequence) advanced only on phase-reaches-required-phase, duplicate replay idempotent without cursor advance, conflict rejected. Normalized envelope sequence u64 nonzero must equal ExecutionUnitObservation sequence and cursor must equal observation cursor; replay same event_id identical-bytes IdempotentReplay else Quarantined ConflictingPayload/Lineage/Normalization/Source/Framing. Attempt transitions AttemptState Admitted->Started->Running->Cancelling/Checkpointed/Completed/Failed/UnknownOutcome->Cancelling->Cancelled/Reconciling/UnknownOutcome->Reconciling->Completed/Failed/UnknownOutcome/Quarantined, terminal {Completed, Failed, UnknownOutcome, Cancelled, Quarantined} immutable (crates/agent/eliot-agent-api/src/lib.rs:610). Terminal reducer inputs (MGR02 handoff, not reduced here): ProviderTerminalObserved + CandidateResultAvailable + Error/CancellationObserved/Usage/Checkpoint + SessionLifecycle + AdmittedRouteReceipt #369 + ProviderExecutionBinding #361 + AgentResult disposition candidate-only (no VERIFIED_COMPLETE) + Task Finish I7.9 DerivedCompletionProof. Stale UI/CLI state, earlier Error event, and final canonical disposition are independent inputs until reduction.",
         "durable_bridge_required": true,
         "terminal_result_separate": true,
         "coverage_status": "documented_not_observed"
@@ -133,7 +133,7 @@
         "recursive_launch_default": "disabled",
         "context_policy": "minimum_decision_sufficient_packet"
       },
-      "proof_ceiling": "The persistent stream may execute one bounded candidate attempt only after exact probes; plugin presence and terminal prose do not prove child closure or task completion."
+      "proof_ceiling": "Slice B freeze (issue #9): the persistent stream may execute one bounded candidate attempt only after exact probes; plugin presence and terminal prose do not prove child closure or task completion. Bridge eliot.surfaces.agent-bridge-core/v1 transport-only, no semantic/reducer authority; Governor owns Session/Task/Attempt admission, protocol owns EventEnvelope/AckPhase/EventDisposition ordering, AgentResult disposition stays candidate-only (ResultDisposition, no VERIFIED_COMPLETE), Task finish stays I7.9 DerivedCompletionProof/FinishDecisionOutcome. Terminal reducer is MGR02 handoff; this profile only freezes reducer inputs with coverage documented_not_observed."
     },
     {
       "route_id": "antigravity.python-sdk.sidecar",
@@ -278,18 +278,47 @@
     "pin exact plugin schema, CLI/SDK version, account profile, executable/package hash, and model catalogue",
     "prove persistent stdin, ordered NDJSON events, permission handling, terminal result, cancellation, and process-tree cleanup",
     "prove native child agents remain disabled until child-event and descendant-closure coverage is observed",
-    "prove the legacy agy fallback remains read-only and unknown outcomes are non-redispatchable"
+    "prove the legacy agy fallback remains read-only and unknown outcomes are non-redispatchable",
+    "Slice B freeze (issue #9): pin runtime antigravity.headless/antigravity.agy-readonly with eliot.antigravity-runtime-preflight.v1 (scripts/antigravity_runtime_preflight.py:155), adapter target-unimplemented under I10.17 AdapterSupervisor crates/eliot-engine/src/adapter.rs:85, bridge eliot.surfaces.agent-bridge-core/v1 transport-only with EventEnvelope/AckPhase/EventDisposition ordering, Governor eliot.governor.session_lifecycle v1.0.0 + eliot.governor.task_lifecycle v1.0.0 with attempt owner eliot_agent_coordinator, protocol eliot-protocol v1.0.0 protocol_contract_identity, Session/Attempt/Task/Route identities above, raw HostEventEnvelope vs normalized eliot-agent-api/host-event-v7 with nonzero sequence/cursor and AttemptState transitions, and terminal reducer inputs (ProviderTerminalObserved + CandidateResultAvailable + Error/CancellationObserved) held independent with coverage documented_not_observed; reducer is MGR02 handoff"
   ],
   "known_gaps": [
     "persistent headless and Python SDK adapters are not implemented by this profile change",
     "the current plugin bundle lacks an admitted hook and MCP registration path",
     "current-account models, quotas, permission events, resume behavior, and child events are unprobed",
-    "the existing agy route remains a conservative candidate-diff fallback rather than the primary integration"
+    "the existing agy route remains a conservative candidate-diff fallback rather than the primary integration",
+    "Slice B freeze records raw/normalized host events, sequences/cursors, attempt transitions, and terminal reducer inputs as documented_not_observed only; no live NDJSON lifecycle/tool/permission/child/error/terminal observation exists, no sequence/cursor ordering has been observed, no AttemptState terminal transition has been proven, and the MGR02 terminal reducer is explicitly out of scope for this route slice"
   ],
   "source_refs": [
     "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/integrations/antigravity/README.md",
     "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/integrations/antigravity/integration.json",
     "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/plugin/eliot-antigravity-official/plugin.json",
     "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/9"
-  ]
+  ],
+  "disposition": {
+    "disposition": "unavailable-target",
+    "route_id": "antigravity.exec.persistent-ndjson",
+    "bundle_generation": "1217-A.1",
+    "admittable": false,
+    "admitted": false,
+    "proof_ceiling": "Slice B freeze (issue #9): the persistent stream may execute one bounded candidate attempt only after exact probes; plugin presence and terminal prose do not prove child closure or task completion. Frozen identities: runtime antigravity.headless/agy-readonly eliot.antigravity-runtime-preflight.v1, adapter target I10.17, bridge eliot.surfaces.agent-bridge-core/v1 transport-only, Governor session/task v1.0.0, protocol v1.0.0 EventEnvelope/AckPhase/EventDisposition, Session/Attempt (terminal Completed/Failed/UnknownOutcome/Cancelled/Quarantined)/Task (terminal DoneVerified/Blocked/Failed/Partial)/Route eliot.agent.route-fingerprint.v6, raw vs normalized host-event-v7 with nonzero sequence/cursor, reducer inputs independent with coverage documented_not_observed; reducer is MGR02 handoff.",
+    "expiry_condition": "No expiry; static unavailable-target. Admission requires persistent headless and Python SDK adapter implementation and live probes. The agy fallback antigravity.agy.readonly-diff remains a candidate unified-diff fallback only under a read-only boundary with unknown-outcome non-redispatch; it cannot mutate the worktree or prove a full lifecycle integration. Slice B adds no expiry and no admission: stale UI/CLI state, earlier Error event, and final canonical disposition stay independent until the MGR02 reducer runs.",
+    "per_attempt_receipt": true,
+    "required_probes": [
+      "pin exact plugin schema, CLI/SDK version, account profile, executable/package hash, and model catalogue",
+      "prove persistent stdin, ordered NDJSON events, permission handling, terminal result, cancellation, and process-tree cleanup",
+      "prove native child agents remain disabled until child-event and descendant-closure coverage is observed",
+      "prove the legacy agy fallback remains read-only and unknown outcomes are non-redispatchable",
+      "Slice B freeze: prove runtime/adapter/bridge/Governor/protocol/Session/Attempt/Task/route identities above plus raw/normalized host events, nonzero sequences/cursors with AckPhase ordering, AttemptState transitions, and terminal reducer inputs (ProviderTerminalObserved/CandidateResultAvailable/Error/CancellationObserved) before any admission; coverage stays documented_not_observed"
+    ],
+    "non_admittable_reasons": [
+      "implementation_support=PARTIAL is non-admittable",
+      "evidence_execution_status=NOT_EXECUTED is non-admittable",
+      "execution_routes[primary].status=target is non-admittable",
+      "execution_routes[alternative].status=target is non-admittable",
+      "event_contract.coverage_status=documented_not_observed is non-admittable",
+      "event_contract.coverage_status=unprobed is non-admittable",
+      "event_contract.coverage_status=partial without live admission is non-admittable",
+      "Slice B terminal-reducer handoff is non-admittable: stale UI/CLI projection, earlier Error event, and final canonical disposition are frozen as independent reducer inputs only; no MGR02 reduction has been observed"
+    ]
+  }
 }

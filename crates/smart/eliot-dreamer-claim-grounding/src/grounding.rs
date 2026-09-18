@@ -5,10 +5,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use eliot_dreamer_contracts::grounding::canonical::{GradeAssignment, SupportResult};
 use eliot_dreamer_contracts::grounding::{
     AllowedReferenceManifest, ClaimGroundingLedger, GROUNDING_SCHEMA_VERSION, GroundedDreamDraft,
-    GroundingPolicy, ModelDraft,
+    GroundingPolicy, StructuredModelDraft,
 };
 use eliot_dreamer_contracts::{
-    ContractViolation, DreamInputBundle, DreamJobInput, canonical_bytes,
+    ContractViolation, DreamInputBundle, DreamJobAdmission, canonical_bytes,
 };
 
 use crate::evidence;
@@ -51,10 +51,10 @@ impl Default for GroundingControls {
 /// Complete owned input to the pure grounding operation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GroundingRequest {
-    pub job: DreamJobInput,
+    pub job: DreamJobAdmission,
     pub bundle: DreamInputBundle,
     pub manifest: AllowedReferenceManifest,
-    pub draft: ModelDraft,
+    pub draft: StructuredModelDraft,
     pub policy: GroundingPolicy,
     pub controls: GroundingControls,
 }
@@ -64,10 +64,10 @@ impl GroundingRequest {
     /// signal.
     #[must_use]
     pub fn new(
-        job: DreamJobInput,
+        job: DreamJobAdmission,
         bundle: DreamInputBundle,
         manifest: AllowedReferenceManifest,
-        draft: ModelDraft,
+        draft: StructuredModelDraft,
         policy: GroundingPolicy,
     ) -> Self {
         Self {
@@ -91,10 +91,10 @@ impl GroundingRequest {
 /// Grounds one complete A03 v2 context. Only explicit proposed handles are
 /// inspected; no manifest-wide search is performed.
 pub fn ground_draft(
-    job: DreamJobInput,
+    job: DreamJobAdmission,
     bundle: DreamInputBundle,
     manifest: AllowedReferenceManifest,
-    draft: ModelDraft,
+    draft: StructuredModelDraft,
     policy: GroundingPolicy,
 ) -> Result<GroundedDreamDraft, ContractViolation> {
     ground_draft_with_controls(GroundingRequest::new(job, bundle, manifest, draft, policy))
@@ -257,7 +257,7 @@ pub fn ground_draft_with_controls(
 
 #[allow(clippy::too_many_arguments)]
 fn initial_grounded(
-    draft: ModelDraft,
+    draft: StructuredModelDraft,
     manifest: AllowedReferenceManifest,
     policy: GroundingPolicy,
     expected_claim_ids: BTreeSet<String>,
@@ -569,7 +569,7 @@ fn stop_reason(controls: &GroundingControls) -> Option<String> {
 }
 
 fn claim_screen_matches(
-    draft: &ModelDraft,
+    draft: &StructuredModelDraft,
     claim: &eliot_dreamer_contracts::grounding::MaterialClaim,
 ) -> bool {
     claim
@@ -580,7 +580,7 @@ fn claim_screen_matches(
 
 #[allow(clippy::too_many_lines)]
 fn aggregate_parent_record(
-    draft: &ModelDraft,
+    draft: &StructuredModelDraft,
     job_class: eliot_dreamer_contracts::JobClass,
     claim: &eliot_dreamer_contracts::grounding::MaterialClaim,
     record: &mut eliot_dreamer_contracts::grounding::ClaimGroundingRecord,

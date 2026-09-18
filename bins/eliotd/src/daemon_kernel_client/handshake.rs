@@ -6,10 +6,9 @@
 //! I2.23 (typed contract payloads).
 //! Kernel remains the sole process, Store, and canonical authority owner.
 
+use eliot_contracts::EpochId;
 #[cfg(windows)]
-use eliot_contracts::{
-    ArtifactId, AuthorityEpoch, ContractId, ContractVersion, ResourceGeneration,
-};
+use eliot_contracts::{ArtifactId, ContractId, ContractVersion, ResourceGeneration};
 use eliot_governor::{GovernorLaunchConfig, KernelGenerationSnapshot, KernelPortError};
 #[cfg(windows)]
 use eliot_protocol::{
@@ -67,7 +66,7 @@ struct KernelSnapshotWire {
     service: String,
     protocol: String,
     generation: u64,
-    authority_epoch: u64,
+    authority_epoch: EpochId,
     artifact_digest: String,
     protected_snapshot_digest: String,
 }
@@ -79,7 +78,7 @@ pub(super) fn expected_snapshot(
         service: launch.kernel.service.clone(),
         protocol: launch.kernel.protocol.clone(),
         generation: launch.kernel.generation,
-        authority_epoch: launch.kernel.authority_epoch,
+        authority_epoch: launch.kernel.authority_epoch.clone(),
         artifact_digest: launch.kernel.artifact_digest.clone(),
         protected_snapshot_digest: launch.protected_snapshot_digest.clone(),
         principal: launch.kernel.principal.clone(),
@@ -105,8 +104,7 @@ impl super::DaemonKernelClient {
             protocol: wire.protocol,
             generation: ResourceGeneration::new(wire.generation)
                 .map_err(|error| KernelClientError::Contract(error.to_string()))?,
-            authority_epoch: AuthorityEpoch::new(wire.authority_epoch)
-                .map_err(|error| KernelClientError::Contract(error.to_string()))?,
+            authority_epoch: wire.authority_epoch,
             artifact_digest: wire.artifact_digest,
             protected_snapshot_digest: wire.protected_snapshot_digest,
             principal: self.launch.kernel.principal.clone(),
@@ -164,7 +162,7 @@ pub(super) fn client_hello(
         privacy_classes: vec!["PUBLIC".to_owned()],
         max_frame: u32::try_from(eliot_protocol::MAX_FRAME_BYTES)
             .map_err(|_| KernelClientError::Contract("maximum frame exceeds u32".to_owned()))?,
-        authority_epoch: binding.authority_epoch,
+        authority_epoch: binding.authority_epoch.clone(),
     })
 }
 
@@ -202,7 +200,9 @@ pub(crate) fn validate_server_hello(
         .validate()
         .map_err(|error| KernelClientError::Contract(error.to_string()))?;
     if hello.selected_protocol != ProtocolVersion::CURRENT
-        || hello.authority_epoch != launch.kernel.authority_epoch
+        || !hello
+            .authority_epoch
+            .is_same_authority(&launch.kernel.authority_epoch)
         || hello.session_principal_binding
             != format!(
                 "sid={};session={}",
@@ -218,7 +218,9 @@ pub(crate) fn validate_server_hello(
     if snapshot.service != launch.kernel.service
         || snapshot.protocol != launch.kernel.protocol
         || snapshot.generation != launch.kernel.generation.value()
-        || snapshot.authority_epoch != launch.kernel.authority_epoch.value()
+        || !snapshot
+            .authority_epoch
+            .is_same_authority(&launch.kernel.authority_epoch)
         || snapshot.artifact_digest != launch.kernel.artifact_digest
         || snapshot.protected_snapshot_digest != launch.protected_snapshot_digest
         || snapshot.protected_snapshot_digest != launch.kernel.protected_snapshot_digest

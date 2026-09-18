@@ -23,7 +23,6 @@ use eliot_process::{
     ProcessExecutor, ProcessIntent, ProcessRequest, SuspendedProcessIdentity, ValidatedDispatch,
 };
 use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
-use eliot_protocol::RequestIdentity;
 use eliot_user_broker_core::{
     AuthorityPort, BrokerError, BrokerSnapshot, DurableRegistrationPort, HeartbeatReceipt,
     HeartbeatRequest, LaunchGrant, LaunchRequest, PortError, ProcessPort, ProcessStartOutcome,
@@ -34,9 +33,14 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 mod kernel_authority_port;
+mod operation_identity;
 mod protected_launch_config;
 use kernel_authority_port::KernelAuthorityPort;
-use protected_launch_config::BrokerLaunchConfig;
+use operation_identity::{IssuerHandle, OperationIdentityIssuer};
+use protected_launch_config::{
+    BrokerLaunchBinding, REGISTRATION_LEASE_TTL_MS, binding_digest, fresh_registration_request,
+    load_protected_launch_binding,
+};
 
 pub const SERVICE_NAME: &str = "eliot-user-broker";
 pub const PROTOCOL_VERSION: &str = "eliot.user-broker.v1";
@@ -130,7 +134,7 @@ impl BrokerDispatchAuthority {
         let mut key = [0_u8; 32];
         let nonce = uuid::Uuid::new_v4().as_bytes().to_owned();
         key[..16].copy_from_slice(&nonce);
-        key[16..].copy_from_slice(&Sha256::digest(nonce));
+        key[16..].copy_from_slice(&Sha256::digest(nonce)[..16]);
         let key = KernelDispatchKey::from_secret_bytes(key)
             .map_err(|error| PortError::Invalid(error.to_string()))?;
         Ok(Self {
@@ -145,8 +149,11 @@ impl BrokerDispatchAuthority {
         grant: &LaunchGrant,
         now: u64,
     ) -> Result<ProcessRequest, PortError> {
+        // INTENDED EpochId shape (Split C broker mint + Split A cutover):
+        // LaunchGrant.authority_epoch is EpochId; FencingToken::new(EpochId).
+        // B→A→C order; do not edit A/B files.
         let fence = FencingToken::new(
-            grant.authority_epoch,
+            grant.authority_epoch.clone(),
             grant.approved.generation,
             grant.approved.process_fence_nonce.clone(),
         )
@@ -175,7 +182,7 @@ impl BrokerDispatchAuthority {
                 monotonic_ns: Some(1),
             },
             fence,
-            grant.authority_epoch,
+            grant.authority_epoch.clone(),
             BTreeMap::from([("launch-grant".to_owned(), grant.grant_digest.clone())]),
             1,
         )
@@ -221,6 +228,7 @@ struct LocalProcessPort {
     runtime: tokio::runtime::Runtime,
     evidence: Arc<Mutex<Vec<ProcessEvidence>>>,
     pending_requests: BTreeMap<OperationId, ProcessRequest>,
+    identity_issuer: Option<IssuerHandle>,
 }
 
 impl LocalProcessPort {
@@ -240,7 +248,34 @@ impl LocalProcessPort {
             runtime,
             evidence: Arc::new(Mutex::new(Vec::new())),
             pending_requests: BTreeMap::new(),
+            identity_issuer: None,
         })
+    }
+
+    /// Attaches the operation-identity issuer for process/effect lineage
+    /// bookkeeping. Lineage never blocks an effect; a missing issuer only
+    /// omits the broker-local lineage entry.
+    pub(crate) fn set_identity_issuer(&mut self, issuer: IssuerHandle) {
+        self.identity_issuer = Some(issuer);
+    }
+
+    fn note_process_effect(
+        &self,
+        caller_request_id: &str,
+        grant_request_digest: &str,
+        process_request_digest: &str,
+    ) {
+        let now = Self::now_ms().unwrap_or(0);
+        if let Some(issuer) = self.identity_issuer.as_ref()
+            && let Ok(mut issuer) = issuer.lock()
+        {
+            issuer.note_process_effect(
+                caller_request_id,
+                grant_request_digest,
+                process_request_digest,
+                now,
+            );
+        }
     }
 
     fn now_ms() -> Result<u64, PortError> {
@@ -297,6 +332,14 @@ impl ProcessPort for LocalProcessPort {
         let request = self.request_from_grant(grant)?;
         let operation_id = request.operation_id().clone();
         let request_digest = request.invocation_digest().to_owned();
+        // Record the authorization→effect lineage link before the physical
+        // start boundary. The grant, transport, and effect identities stay
+        // distinct; this entry only joins them for reconciliation.
+        self.note_process_effect(
+            &grant.approved.request_id,
+            &grant.request_digest,
+            &request_digest,
+        );
         if self
             .pending_requests
             .insert(operation_id, request)
@@ -548,11 +591,11 @@ pub struct BrokerReadiness<'a> {
 pub struct BrokerComposition {
     broker: UserBroker,
     snapshot: PathBuf,
-    kernel_client: Option<SharedKernelClient>,
     providers_admitted: bool,
-    launch_config: Option<BrokerLaunchConfig>,
+    launch_binding: Option<BrokerLaunchBinding>,
     launch_lease: Option<ProtectedPathLease>,
     registration_digest: Option<String>,
+    identity_issuer: IssuerHandle,
 }
 
 impl BrokerComposition {
@@ -564,29 +607,44 @@ impl BrokerComposition {
     /// front door. The binary never substitutes a local authority/process
     /// provider when this composition is unavailable.
     pub fn start_with_kernel(config: BrokerConfig) -> Result<Self, CompositionError> {
-        let (launch_config, launch_lease) =
-            protected_launch_config::load_protected_launch_config()?;
+        let (launch_binding, launch_lease) = load_protected_launch_binding()?;
         let client = eliot_cli::kernel_client::KernelClient::load()
             .map_err(|error| CompositionError::Kernel(error.to_string()))?;
         let client = Arc::new(Mutex::new(client));
-        let process = LocalProcessPort::new()?;
+        let issuer = Self::issuer_for_binding(&launch_binding)?;
+        let mut process = LocalProcessPort::new()?;
+        process.set_identity_issuer(issuer.clone());
         Self::start_with_ports(
             config,
             Some(Box::new(KernelAuthorityPort {
                 client: client.clone(),
+                issuer: issuer.clone(),
             })),
             Some(Box::new(process)),
             Some(client),
-            Some((launch_config, launch_lease)),
+            Some((launch_binding, launch_lease)),
+            issuer,
         )
+    }
+
+    /// Builds the per-operation identity issuer for one stable launch
+    /// binding. The issuer carries the installation fence baseline; every
+    /// register, heartbeat, authorize-launch, and fence transaction then
+    /// mints its own exact transport identity.
+    fn issuer_for_binding(binding: &BrokerLaunchBinding) -> Result<IssuerHandle, CompositionError> {
+        let digest = binding_digest(binding)?;
+        let issuer = OperationIdentityIssuer::bound(digest, binding.launch_authority_fence.clone())
+            .map_err(|error| CompositionError::Launch(error.to_string()))?;
+        Ok(Arc::new(Mutex::new(issuer)))
     }
 
     fn start_with_ports(
         config: BrokerConfig,
         authority: Option<Box<dyn AuthorityPort>>,
         process: Option<Box<dyn ProcessPort>>,
-        kernel_client: Option<SharedKernelClient>,
-        launch: Option<(BrokerLaunchConfig, ProtectedPathLease)>,
+        _kernel_client: Option<SharedKernelClient>,
+        launch: Option<(BrokerLaunchBinding, ProtectedPathLease)>,
+        issuer: IssuerHandle,
     ) -> Result<Self, CompositionError> {
         config.validate()?;
         let snapshot = config.data_root.join(config.snapshot_name);
@@ -620,16 +678,17 @@ impl BrokerComposition {
         let mut broker = UserBroker::new(authority, process, Some(Box::new(durable)));
         broker.recover().map_err(CompositionError::Recovery)?;
         let registration_digest = broker.registration_digest().map(ToOwned::to_owned);
-        let (launch_config, launch_lease) =
-            launch.map_or((None, None), |(config, lease)| (Some(config), Some(lease)));
+        let (launch_binding, launch_lease) = launch.map_or((None, None), |(binding, lease)| {
+            (Some(binding), Some(lease))
+        });
         Ok(Self {
             broker,
             snapshot,
-            kernel_client,
             providers_admitted,
-            launch_config,
+            launch_binding,
             launch_lease,
             registration_digest,
+            identity_issuer: issuer,
         })
     }
 
@@ -647,23 +706,38 @@ impl BrokerComposition {
         }
     }
 
-    /// Performs broker self-authentication from the retained installation
-    /// declaration, then registers or refreshes the recovered lease.  No
+    /// Performs broker self-authentication from the retained stable
+    /// installation declaration, then registers or refreshes the recovered
+    /// lease. Every Kernel transaction mints its own exact operation
+    /// identity: no static request identity is installed or reused. No
     /// caller-provided registration tuple is accepted by this boundary.
     pub fn self_register(&mut self) -> Result<(), CompositionError> {
         self.verify_launch_lease()?;
-        let launch = self.launch_config.clone().ok_or_else(|| {
+        let binding = self.launch_binding.clone().ok_or_else(|| {
             CompositionError::Launch("protected launch configuration is not composed".to_owned())
         })?;
-        self.set_request_identity(launch.request_identity.clone())?;
+        // A fresh lease window per registration operation: a restart never
+        // revives historical request bytes, so it never revives a historical
+        // request identity either.
+        let observed_at = now_unix_ms()?;
+        let lease_expires_at = observed_at
+            .checked_add(REGISTRATION_LEASE_TTL_MS)
+            .filter(|expires| *expires > observed_at)
+            .ok_or_else(|| {
+                CompositionError::Launch("registration lease window overflowed".to_owned())
+            })?;
+        let declaration = fresh_registration_request(&binding, observed_at, lease_expires_at)?;
         if self.broker.registration_digest().is_some() {
             let receipt = self.heartbeat()?;
             self.registration_digest = Some(receipt.registration_digest);
         } else {
             let receipt = self
                 .broker
-                .register(launch.registration.clone())
+                .register(declaration)
                 .map_err(CompositionError::Recovery)?;
+            let epoch = serde_json::to_value(&receipt.authority_epoch)
+                .map_err(|error| CompositionError::Launch(error.to_string()))?;
+            self.sync_authority_epoch(&epoch)?;
             self.registration_digest = Some(receipt.registration_digest);
         }
         Ok(())
@@ -752,21 +826,36 @@ impl BrokerComposition {
         Ok(())
     }
 
-    /// Binds the current EBP request identity before one provider operation.
-    fn set_request_identity(&mut self, identity: RequestIdentity) -> Result<(), CompositionError> {
-        let client = self.kernel_client.as_ref().ok_or_else(|| {
-            CompositionError::Kernel("Kernel front door is not composed".to_owned())
-        })?;
-        client
+    /// Refreshes the issuer fence from a Kernel-issued registration
+    /// authority epoch, serialized as its exact JSON value. Only the
+    /// lineage-aware epoch moves; no scalar authority is copied into
+    /// broker-local state.
+    fn sync_authority_epoch(&self, epoch: &serde_json::Value) -> Result<(), CompositionError> {
+        self.identity_issuer
             .lock()
             .map_err(|_| CompositionError::KernelLock)?
-            .set_request_identity(identity);
-        Ok(())
+            .note_authority_epoch(epoch)
+            .map_err(|error| CompositionError::Launch(error.to_string()))
     }
 }
 
 pub fn canonical_root(path: &Path) -> Result<PathBuf, CompositionError> {
     fs::canonicalize(path).map_err(CompositionError::Durable)
+}
+
+fn now_unix_ms() -> Result<u64, CompositionError> {
+    let now: u64 = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| CompositionError::Launch(error.to_string()))?
+        .as_millis()
+        .try_into()
+        .map_err(|error| CompositionError::Launch(format!("clock overflow: {error}")))?;
+    if now == 0 {
+        return Err(CompositionError::Launch(
+            "broker clock observation is zero".to_owned(),
+        ));
+    }
+    Ok(now)
 }
 
 pub fn snapshot_digest(path: &Path) -> Result<String, CompositionError> {
@@ -777,4 +866,24 @@ pub fn snapshot_digest(path: &Path) -> Result<String, CompositionError> {
     let mut digest = Sha256::new();
     digest.update(bytes);
     Ok(format!("{:x}", digest.finalize()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BrokerDispatchAuthority, LocalProcessPort};
+
+    #[test]
+    fn broker_dispatch_authority_constructs_ephemeral_key() {
+        // Regression for #1390: key assembly panicked copying the 32-byte
+        // digest into the 16-byte second half of the 32-byte key.
+        assert!(BrokerDispatchAuthority::new().is_ok());
+        assert!(BrokerDispatchAuthority::new().is_ok());
+    }
+
+    #[test]
+    fn local_process_port_constructs_on_this_platform() {
+        // Production path `start_with_kernel` -> `LocalProcessPort::new()`;
+        // unit-level only: no daemon/service start, no network.
+        assert!(LocalProcessPort::new().is_ok());
+    }
 }

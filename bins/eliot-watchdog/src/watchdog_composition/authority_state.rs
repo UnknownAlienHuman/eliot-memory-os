@@ -1,13 +1,9 @@
 //! Watchdog readiness and bounded authority-state cell.
 //!
-//! Architecture anchors (`docs/architecture/ELIOT_ARCHITECTURE.md`): A8.1
-//! Watchdog purpose, A13.2 Kernel and failure domains, ARCH-WDG-01 Independent
-//! supervision, ARCH-RES-01 Fail locally, recover globally, and ARCH-RES-04
-//! Degradation is visible and local.
-//! Implementation anchors (`docs/architecture/ELIOT_IMPLEMENTATION.md`): I8.1
-//! Process and authority, I8.3 Deterministic supervision loop, I8.4 Interaction
-//! heartbeat, I14.10 Supervision strategies and restart intensity, and I14.15
-//! Daemon hot replacement.
+//! Architecture: A8.1 (docs/architecture/A08-01-purpose.md#a81-purpose),
+//! A13.2 (docs/architecture/A13-02-kernel-and-failure-domains.md#a132-kernel-and-failure-domains),
+//! ARCH-WDG-01, ARCH-RES-01, ARCH-RES-04.
+//! Implementation: I8.1 (docs/architecture/I08-01-process-and-authority.md#i81-process-and-authority).
 //!
 //! This child owns only readiness values and the bounded in-memory authority
 //! state transitions; it owns no Kernel effect, Host identity, lease issuance,

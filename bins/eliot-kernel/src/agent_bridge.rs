@@ -5,9 +5,11 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use super::{
-    AGENT_BRIDGE_ACTIVATION_WINDOW_MS, ActivationDecisionDisposition, AgentActivationPending,
+    AGENT_BRIDGE_ACTIVATION_WINDOW_MS, ActivationDecisionDisposition, ActivationResultDisposition,
+    AgentActivationPending, AgentActivationResultPhase, AgentActivationResultRecord,
     AgentBridgeHandshake, AgentBridgeProfile, KernelComposition, activation_deadline_expired,
-    classify_activation_decision, load_agent_bridge_declaration, sha256_json, unix_ms,
+    classify_activation_decision, classify_activation_result, load_agent_bridge_declaration,
+    sha256_json, unix_ms,
 };
 use eliot_ipc::{
     PeerIdentity, ServerFirstConnection, Session, TransportError,
@@ -20,10 +22,45 @@ use eliot_platform_windows::{
 use eliot_protocol::{
     AGENT_BRIDGE_ACTIVATION_OPERATION, AGENT_BRIDGE_MODULE_ID, AGENT_BRIDGE_PEER_CHALLENGE_WIRE_ID,
     AGENT_BRIDGE_PEER_CHALLENGE_WIRE_VERSION, AgentActivationResolutionDecision,
-    AgentActivationResolutionTicket, AgentBridgeActivationDenialCode, AgentBridgeActivationFence,
-    AgentBridgeActivationRequest, AgentBridgeActivationResponse, AgentBridgeAuthenticatedBinding,
-    AgentBridgePeerChallenge, Frame, FrameKind, MessageType, ProtocolPayload,
+    AgentActivationResolutionDisposition, AgentActivationResolutionResult,
+    AgentActivationResolutionTicket, AgentActivationResolvedBinding, AgentActivationResultAck,
+    AgentActivationResultReconcile, AgentActivationResultSubmit, AgentBridgeActivationDenialCode,
+    AgentBridgeActivationFence, AgentBridgeActivationRequest, AgentBridgeActivationResponse,
+    AgentBridgeAuthenticatedBinding, AgentBridgePeerChallenge, Frame, FrameKind, MessageType,
+    ProtocolPayload,
 };
+
+fn observe_bridge(event: &'static str, outcome: &'static str) {
+    use super::kernel_diagnostics::{KERNEL_DIAGNOSTICS_TARGET, bound_field};
+    let event_bound = bound_field(event);
+    let outcome_bound = bound_field(outcome);
+    tracing::info!(
+        target: KERNEL_DIAGNOSTICS_TARGET,
+        event = event_bound.text(),
+        outcome = outcome_bound.text(),
+        "agent bridge observation"
+    );
+}
+
+fn bridge_terminal_code(error: &TransportError) -> &'static str {
+    match error {
+        TransportError::SessionFenced => "bridge_fenced",
+        TransportError::PeerIdentityUnavailable => "bridge_peer_unavailable",
+        TransportError::Timeout => "bridge_timeout",
+        TransportError::UnknownRequest => "bridge_unknown_request",
+        TransportError::UnknownOutcome => "bridge_unknown_outcome",
+        TransportError::IdentityConflict => "bridge_identity_conflict",
+        TransportError::Cancelled => "bridge_cancelled",
+        TransportError::Backpressure => "bridge_backpressure",
+        TransportError::InvalidLimits => "bridge_invalid_limits",
+        TransportError::UnauthenticatedPeer => "bridge_unauthenticated_peer",
+        TransportError::InvalidPipeName => "bridge_invalid_pipe",
+        TransportError::RegistryFull => "bridge_registry_full",
+        TransportError::Io(_) => "bridge_io",
+        TransportError::PlanGap { .. } => "bridge_plan_gap",
+        TransportError::Protocol(_) => "bridge_protocol",
+    }
+}
 
 impl KernelComposition {
     /// Reports whether the exact bounded peer-set selection and Host-approved
@@ -36,7 +73,9 @@ impl KernelComposition {
         selection: &NamedPipePeerSelection,
         peer: &PeerIdentity,
     ) -> bool {
-        self.agent_bridge_profile
+        observe_bridge("kernel.bridge_peer_observed", "attempt");
+        let admitted = self
+            .agent_bridge_profile
             .lock()
             .ok()
             .and_then(|profile| profile.clone())
@@ -45,7 +84,13 @@ impl KernelComposition {
                     && selection.module_id() == AGENT_BRIDGE_MODULE_ID
                     && selection.profile_id() == Some(profile.admission.profile_id.as_str())
                     && Self::validate_agent_bridge_peer(&profile.admission, peer).is_ok()
-            })
+            });
+        if admitted {
+            observe_bridge("kernel.bridge_peer_observed", "admitted");
+        } else {
+            observe_bridge("kernel.bridge_peer_observed", "not_admitted");
+        }
+        admitted
     }
 
     #[cfg(windows)]
@@ -53,6 +98,7 @@ impl KernelComposition {
         admission: &AgentBridgeAdmissionDescriptor,
         peer: &PeerIdentity,
     ) -> Result<(), TransportError> {
+        observe_bridge("kernel.bridge_peer_validate", "attempt");
         admission
             .validate()
             .map_err(|_| TransportError::SessionFenced)?;
@@ -153,12 +199,18 @@ impl KernelComposition {
         } else {
             return Err(TransportError::SessionFenced);
         }
+        if let Ok(mut results) = self.agent_activation_results.lock() {
+            results.clear();
+        } else {
+            return Err(TransportError::SessionFenced);
+        }
+        self.fence_all_host_requests();
         self.agent_activation_changed.notify_waiters();
         Ok(())
     }
 
     #[cfg(windows)]
-    fn validate_active_bridge_profile(
+    pub(super) fn validate_active_bridge_profile(
         &self,
         admission: &AgentBridgeAdmissionDescriptor,
     ) -> Result<(), TransportError> {
@@ -197,6 +249,28 @@ impl KernelComposition {
     /// hello acceptance, timeout, disconnect, or explicit revocation.
     #[cfg(windows)]
     pub fn begin_agent_bridge(
+        &self,
+        selection: &NamedPipePeerSelection,
+        peer: PeerIdentity,
+    ) -> Result<AgentBridgeHandshake, TransportError> {
+        observe_bridge("kernel.bridge_connect", "attempt");
+        let result = self.begin_agent_bridge_inner(selection, peer);
+        match &result {
+            Ok(_) => {
+                observe_bridge("kernel.bridge_connect", "success");
+                observe_bridge("kernel.bridge_attach", "success");
+                observe_bridge("kernel.bridge_readiness", "success");
+            }
+            Err(error) => {
+                observe_bridge("kernel.bridge_connect", "fenced");
+                super::kernel_diagnostics::observe_terminal_error(bridge_terminal_code(error));
+            }
+        }
+        result
+    }
+
+    #[cfg(windows)]
+    fn begin_agent_bridge_inner(
         &self,
         selection: &NamedPipePeerSelection,
         peer: PeerIdentity,
@@ -303,6 +377,24 @@ impl KernelComposition {
         connection_id: &str,
         frame: &Frame,
     ) -> Result<eliot_protocol::AgentBridgePeerAdmissionReceipt, TransportError> {
+        observe_bridge("kernel.bridge_hello_accept", "attempt");
+        let result = self.accept_agent_bridge_hello_inner(connection_id, frame);
+        match &result {
+            Ok(_) => observe_bridge("kernel.bridge_hello_accept", "success"),
+            Err(error) => {
+                observe_bridge("kernel.bridge_hello_reject", "fenced");
+                super::kernel_diagnostics::observe_terminal_error(bridge_terminal_code(error));
+            }
+        }
+        result
+    }
+
+    #[cfg(windows)]
+    fn accept_agent_bridge_hello_inner(
+        &self,
+        connection_id: &str,
+        frame: &Frame,
+    ) -> Result<eliot_protocol::AgentBridgePeerAdmissionReceipt, TransportError> {
         let mut connections = self
             .agent_bridge_connections
             .lock()
@@ -343,6 +435,23 @@ impl KernelComposition {
         &self,
         connection_id: &str,
     ) -> Result<Frame, TransportError> {
+        observe_bridge("kernel.bridge_receipt_prepared", "attempt");
+        let result = self.agent_bridge_admission_receipt_frame_inner(connection_id);
+        match &result {
+            Ok(_) => observe_bridge("kernel.bridge_receipt_prepared", "success"),
+            Err(error) => {
+                observe_bridge("kernel.bridge_receipt_prepared", "fenced");
+                super::kernel_diagnostics::observe_terminal_error(bridge_terminal_code(error));
+            }
+        }
+        result
+    }
+
+    #[cfg(windows)]
+    fn agent_bridge_admission_receipt_frame_inner(
+        &self,
+        connection_id: &str,
+    ) -> Result<Frame, TransportError> {
         let connections = self
             .agent_bridge_connections
             .lock()
@@ -368,6 +477,7 @@ impl KernelComposition {
         connection_id: &str,
         frame: &Frame,
     ) -> Result<AgentActivationResolutionTicket, TransportError> {
+        observe_bridge("kernel.bridge_activation_enqueue", "attempt");
         let (request, receipt) = {
             let connections = self
                 .agent_bridge_connections
@@ -496,6 +606,7 @@ impl KernelComposition {
     pub(super) fn claim_agent_activation_ticket(
         &self,
     ) -> Result<Option<AgentActivationResolutionTicket>, TransportError> {
+        observe_bridge("kernel.bridge_activation_claim", "attempt");
         let mut pending = self
             .agent_activation_pending
             .lock()
@@ -508,6 +619,7 @@ impl KernelComposition {
         &self,
         decision: AgentActivationResolutionDecision,
     ) -> Result<(), TransportError> {
+        observe_bridge("kernel.bridge_activation_submit", "attempt");
         decision
             .validate()
             .map_err(|_| TransportError::SessionFenced)?;
@@ -535,6 +647,366 @@ impl KernelComposition {
         entry.decision = Some(decision);
         let ticket_id = entry.ticket.ticket_id.clone();
         pending.fifo.retain(|queued_id| queued_id != &ticket_id);
+        drop(pending);
+        self.agent_activation_changed.notify_waiters();
+        Ok(())
+    }
+
+    /// Validates that the ticket's bridge leg is still owned by the live
+    /// admitted transport under the current profile and fence. This is the
+    /// Kernel-owned half of result validation: exact ticket binding is
+    /// checked by the protocol `validate_against`, while connection liveness,
+    /// admission receipt identity, profile currency, and service readiness
+    /// are checked here against current Kernel owners. Governor-side semantic
+    /// currency (task/plan revision against current Governor state) is owned
+    /// by the trusted resolver read per I1.8; Kernel rechecks only what it
+    /// owns and never invents semantic identity.
+    ///
+    /// Must be called without holding the pending lock; it takes the
+    /// connection, profile, and service locks in that order.
+    #[cfg(windows)]
+    fn validate_result_bridge_leg(
+        &self,
+        ticket: &AgentActivationResolutionTicket,
+    ) -> Result<(), TransportError> {
+        let receipt = {
+            let connections = self
+                .agent_bridge_connections
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            let state = connections
+                .get(&ticket.connection_id)
+                .ok_or(TransportError::SessionFenced)?;
+            if state.activation_completed || state.session.is_some() {
+                return Err(TransportError::SessionFenced);
+            }
+            let accepted = state
+                .accepted_transport
+                .as_ref()
+                .ok_or(TransportError::SessionFenced)?;
+            accepted.admission_receipt().clone()
+        };
+        if receipt.receipt_sha256 != ticket.peer_admission_receipt_sha256
+            || receipt.connection_id != ticket.connection_id
+            || receipt.state_fence != ticket.state_fence
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let profile = self
+            .agent_bridge_profile
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?
+            .clone()
+            .ok_or(TransportError::SessionFenced)?;
+        if receipt.descriptor_sha256 != profile.admission.descriptor_sha256
+            || receipt.profile_id != profile.admission.profile_id.as_str()
+            || receipt.state_fence != profile.admission.state_fence
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        self.validate_active_bridge_profile(&profile.admission)?;
+        Ok(())
+    }
+
+    /// Decides whether a changed same-ticket submission may supersede a
+    /// retained `NotReady` deferral instead of conflicting.
+    ///
+    /// Terminality is decided by the retained submission phase, not by
+    /// re-matching text: only a record in phase `DeferredNotReady` can be
+    /// superseded at all. Within that phase, reconsideration additionally
+    /// requires due time (the new observation must not predate the retained
+    /// `not_before`) and fresh Governor evidence: a re-observed `NotReady`
+    /// must carry a changed named dependency revision for the same
+    /// dependency, while any non-`NotReady` outcome at or after due time is
+    /// itself the fresh evidence. Human detail and log text never
+    /// participate; only the retained phase plus typed disposition fields
+    /// decide.
+    #[cfg(windows)]
+    fn not_ready_supersede_allowed(
+        retained: &AgentActivationResultRecord,
+        incoming: &AgentActivationResolutionResult,
+    ) -> bool {
+        if retained.phase != AgentActivationResultPhase::DeferredNotReady {
+            return false;
+        }
+        let AgentActivationResolutionDisposition::NotReady {
+            retry: retained_retry,
+            ..
+        } = &retained.result.disposition
+        else {
+            return false;
+        };
+        if incoming.resolved_at_unix_ms < retained_retry.not_before_unix_ms {
+            return false;
+        }
+        match &incoming.disposition {
+            AgentActivationResolutionDisposition::NotReady {
+                retry: incoming_retry,
+                ..
+            } => {
+                incoming_retry.dependency_ref != retained_retry.dependency_ref
+                    || incoming_retry.observed_dependency_revision
+                        != retained_retry.observed_dependency_revision
+            }
+            _ => true,
+        }
+    }
+
+    /// Maps one validated disposition to its retention phase: only
+    /// `NotReady` defers reconsideration, every other disposition is
+    /// terminal on commit.
+    #[cfg(windows)]
+    fn result_phase_for_disposition(
+        disposition: &AgentActivationResolutionDisposition,
+    ) -> AgentActivationResultPhase {
+        match disposition {
+            AgentActivationResolutionDisposition::NotReady { .. } => {
+                AgentActivationResultPhase::DeferredNotReady
+            }
+            _ => AgentActivationResultPhase::AcceptedTerminal,
+        }
+    }
+
+    /// Submits against an already-retained per-ticket record: exact digest
+    /// replay is idempotent, and a changed result supersedes only a
+    /// still-open `NotReady` deferral that meets the due-time plus
+    /// changed-revision gate. Anything else is an identity conflict.
+    #[cfg(windows)]
+    fn submit_against_retained_result(
+        &self,
+        entry_ticket: Option<AgentActivationResolutionTicket>,
+        retained: &AgentActivationResultRecord,
+        incoming: AgentActivationResolutionResult,
+    ) -> Result<AgentActivationResultAck, TransportError> {
+        let ticket_id = incoming.ticket_id.clone();
+        match classify_activation_result(Some(&retained.result), &incoming) {
+            ActivationResultDisposition::ExactReplay => {
+                return AgentActivationResultAck::replayed(&retained.result)
+                    .map_err(|_| TransportError::SessionFenced);
+            }
+            ActivationResultDisposition::Commit => {
+                return Err(TransportError::SessionFenced);
+            }
+            ActivationResultDisposition::Conflict => {}
+        }
+        // A changed result supersedes only a still-open `NotReady`
+        // deferral that meets the due-time plus changed-revision gate.
+        // The bridge leg must still be open (pending entry present):
+        // once the waiter has projected, the record is terminal and any
+        // changed result conflicts, so no orphaned Session can be minted
+        // for a completed bridge.
+        let Some(entry_ticket) = entry_ticket else {
+            return Err(TransportError::IdentityConflict);
+        };
+        if !Self::not_ready_supersede_allowed(retained, &incoming) {
+            return Err(TransportError::IdentityConflict);
+        }
+        incoming
+            .validate_against(&entry_ticket)
+            .map_err(|_| TransportError::SessionFenced)?;
+        self.validate_result_bridge_leg(&entry_ticket)?;
+        let phase = Self::result_phase_for_disposition(&incoming.disposition);
+        let ack = AgentActivationResultAck::accepted(&incoming)
+            .map_err(|_| TransportError::SessionFenced)?;
+        {
+            let mut pending = self
+                .agent_activation_pending
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            if !pending.entries.contains_key(&ticket_id)
+                || pending.results.get(&ticket_id).is_none_or(|record| {
+                    record.result.result_sha256 != retained.result.result_sha256
+                })
+            {
+                return Err(TransportError::IdentityConflict);
+            }
+            pending.retain_activation_result(AgentActivationResultRecord {
+                result: incoming,
+                phase,
+            });
+        }
+        self.agent_activation_changed.notify_waiters();
+        Ok(ack)
+    }
+
+    /// Accepts one v2 semantic result for its exact pending ticket. This is
+    /// the production submit path: the typed result (all seven dispositions)
+    /// is validated against the pending ticket, the live bridge
+    /// admission/connection, the current fence, and the deadline, then
+    /// retained with its exact identity, digest, disposition, and submission
+    /// phase before the acknowledgement is built.
+    ///
+    /// Replay and race semantics, all decided from retained identity plus
+    /// digests: an exact digest replay is idempotent (even across deadline
+    /// expiry, which never invalidates a terminal accepted result); a
+    /// changed same-ticket result is `IdentityConflict` unless it meets the
+    /// `NotReady` supersede gate while the bridge leg is still open.
+    #[cfg(windows)]
+    pub(super) fn submit_agent_activation_result(
+        &self,
+        submit: AgentActivationResultSubmit,
+    ) -> Result<AgentActivationResultAck, TransportError> {
+        observe_bridge("kernel.bridge_activation_result_submit", "attempt");
+        // Unknown submission versions are rejected before any inner result
+        // field is adopted.
+        submit
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let incoming = submit.result;
+        let ticket_id = incoming.ticket_id.clone();
+        let (entry_ticket, retained) = {
+            let pending = self
+                .agent_activation_pending
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            let entry_ticket = pending
+                .entries
+                .get(&ticket_id)
+                .map(|entry| entry.ticket.clone());
+            let retained = pending.results.get(&ticket_id).cloned();
+            (entry_ticket, retained)
+        };
+        if let Some(retained) = retained {
+            return self.submit_against_retained_result(entry_ticket, &retained, incoming);
+        }
+        // Fresh commit: the bridge leg must still be open.
+        let Some(entry_ticket) = entry_ticket else {
+            return Err(TransportError::UnknownRequest);
+        };
+        incoming
+            .validate_against(&entry_ticket)
+            .map_err(|_| TransportError::SessionFenced)?;
+        self.validate_result_bridge_leg(&entry_ticket)?;
+        // Deadline expiry with no retained result is the expected race at
+        // this boundary. A retained result would have taken the replay path
+        // above and survived the deadline; here there is nothing terminal to
+        // preserve.
+        if activation_deadline_expired(unix_ms(), entry_ticket.kernel_deadline_unix_ms) {
+            return Err(TransportError::Timeout);
+        }
+        let phase = Self::result_phase_for_disposition(&incoming.disposition);
+        let ack = AgentActivationResultAck::accepted(&incoming)
+            .map_err(|_| TransportError::SessionFenced)?;
+        {
+            let mut pending = self
+                .agent_activation_pending
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            if !pending.entries.contains_key(&ticket_id) || pending.results.contains_key(&ticket_id)
+            {
+                return Err(TransportError::IdentityConflict);
+            }
+            pending.fifo.retain(|queued_id| queued_id != &ticket_id);
+            pending.retain_activation_result(AgentActivationResultRecord {
+                result: incoming,
+                phase,
+            });
+        }
+        self.agent_activation_changed.notify_waiters();
+        Ok(ack)
+    }
+
+    /// Answers one lost-acknowledgement reconcile query purely from the
+    /// retained per-ticket record. This path never reads the Governor and
+    /// never recomputes semantics: a digest match returns the exact retained
+    /// result (including its observed dependency revision for `NotReady`),
+    /// an unknown ticket returns a typed `Unknown` so the daemon resubmits
+    /// its retained result instead of re-reading, and a digest mismatch is
+    /// an identity conflict that must never overwrite retention.
+    #[cfg(windows)]
+    pub(super) fn reconcile_agent_activation_result(
+        &self,
+        query: &AgentActivationResultReconcile,
+    ) -> Result<AgentActivationResultAck, TransportError> {
+        observe_bridge("kernel.bridge_activation_reconcile", "attempt");
+        query
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let pending = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        match pending.results.get(&query.ticket_id) {
+            None => {
+                AgentActivationResultAck::unknown(query).map_err(|_| TransportError::SessionFenced)
+            }
+            Some(record) if record.result.result_sha256 == query.result_sha256 => {
+                AgentActivationResultAck::reconciled(&record.result)
+                    .map_err(|_| TransportError::SessionFenced)
+            }
+            Some(_) => Err(TransportError::IdentityConflict),
+        }
+    }
+
+    /// Classifies one typed resolution result against the retained ledger.
+    ///
+    /// An exact replay of the same ticket, digests, fence, observation
+    /// instant, and disposition commits nothing new; any changed binding under
+    /// the same ticket identity is a conflict. Dispositions are compared as
+    /// opaque typed values: no disposition outranks another here.
+    #[cfg(windows)]
+    fn classify_activation_result_for_entry(
+        existing: Option<&AgentActivationResolutionResult>,
+        incoming: &AgentActivationResolutionResult,
+    ) -> ActivationDecisionDisposition {
+        match existing {
+            None => ActivationDecisionDisposition::Commit,
+            Some(existing) if existing == incoming => ActivationDecisionDisposition::ExactReplay,
+            Some(_) => ActivationDecisionDisposition::Conflict,
+        }
+    }
+
+    /// Records one full typed semantic resolution result for its exact ticket.
+    ///
+    /// The result is stored verbatim in the ticket-keyed result map beside
+    /// the pending table: all seven closed dispositions (`Resolved`,
+    /// `TaskSelectionRequired`, `ScopeSelectionRequired`, `ScopeAmbiguous`,
+    /// `NotReady`, `StaleFence`, `FailedInternal`) share one
+    /// exact-replay/conflict ledger and one Kernel ticket deadline. No
+    /// disposition is mapped, selected, or completed here, and no transport
+    /// Session is created here for any disposition. A legacy success-only
+    /// decision keeps its own independent ledger on the pending entry;
+    /// whichever arrives first drives the single waiting bridge exchange, and
+    /// the bridge await path creates a Session only for a `Resolved`
+    /// disposition.
+    #[cfg(windows)]
+    pub(super) fn submit_agent_activation_resolution_result(
+        &self,
+        result: AgentActivationResolutionResult,
+    ) -> Result<(), TransportError> {
+        result
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let mut pending = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let entry_ticket = pending
+            .entries
+            .get(&result.ticket_id)
+            .map(|entry| entry.ticket.clone())
+            .ok_or(TransportError::UnknownRequest)?;
+        result
+            .validate_against(&entry_ticket)
+            .map_err(|_| TransportError::SessionFenced)?;
+        let mut results = self
+            .agent_activation_results
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        match Self::classify_activation_result_for_entry(results.get(&result.ticket_id), &result) {
+            ActivationDecisionDisposition::ExactReplay => return Ok(()),
+            ActivationDecisionDisposition::Conflict => {
+                return Err(TransportError::IdentityConflict);
+            }
+            ActivationDecisionDisposition::Commit => {}
+        }
+        if activation_deadline_expired(unix_ms(), entry_ticket.kernel_deadline_unix_ms) {
+            return Err(TransportError::Timeout);
+        }
+        let ticket_id = entry_ticket.ticket_id.clone();
+        results.insert(ticket_id.clone(), result);
+        pending.fifo.retain(|queued_id| queued_id != &ticket_id);
+        drop(results);
         drop(pending);
         self.agent_activation_changed.notify_waiters();
         Ok(())
@@ -579,7 +1051,7 @@ impl KernelComposition {
             session_id: decision.session_id.clone(),
             activation_generation: decision.state_fence.resource_generation,
             state_fence: AgentBridgeActivationFence {
-                authority_epoch: decision.state_fence.authority_epoch,
+                authority_epoch: decision.state_fence.authority_epoch.clone(),
                 generation: decision.state_fence.resource_generation,
                 nonce: session_nonce,
             },
@@ -640,72 +1112,166 @@ impl KernelComposition {
         Ok(reply)
     }
 
-    /// Queues one validated bridge request and waits for the sole eliotd
-    /// resolver decision. Kernel owns the final transport Session/fence.
+    /// Maps one non-`Resolved` daemon disposition to its exact agent-visible
+    /// denial code. The match is exhaustive with no wildcard arm, so a future
+    /// disposition breaks compilation here and at every projection site instead
+    /// of collapsing into another code. `Resolved` yields `None` because it
+    /// never projects a denial; it builds the `Authenticated` binding instead.
+    /// Kernel-owned refusals with no daemon disposition at all (pre-ticket
+    /// immediate denial, result-less expiry) never reach this function; they
+    /// keep the Kernel-owned `SemanticResolutionUnavailable` code.
+    pub(super) fn activation_denial_code_for_disposition(
+        disposition: &AgentActivationResolutionDisposition,
+    ) -> Option<AgentBridgeActivationDenialCode> {
+        match disposition {
+            AgentActivationResolutionDisposition::Resolved { .. } => None,
+            AgentActivationResolutionDisposition::TaskSelectionRequired { .. } => {
+                Some(AgentBridgeActivationDenialCode::TaskSelectionRequired)
+            }
+            AgentActivationResolutionDisposition::ScopeSelectionRequired { .. } => {
+                Some(AgentBridgeActivationDenialCode::ScopeSelectionRequired)
+            }
+            AgentActivationResolutionDisposition::ScopeAmbiguous { .. } => {
+                Some(AgentBridgeActivationDenialCode::ScopeAmbiguous)
+            }
+            AgentActivationResolutionDisposition::NotReady { .. } => {
+                Some(AgentBridgeActivationDenialCode::NotReady)
+            }
+            AgentActivationResolutionDisposition::StaleFence { .. } => {
+                Some(AgentBridgeActivationDenialCode::StaleFence)
+            }
+            AgentActivationResolutionDisposition::FailedInternal { .. } => {
+                Some(AgentBridgeActivationDenialCode::FailedInternal)
+            }
+        }
+    }
+
+    /// Projects one accepted v2 result to its exact bridge connection. The
+    /// match is exhaustive over all seven typed dispositions with no
+    /// fallback arm, so the compiler rejects any silent coercion: only an
+    /// exact valid `Resolved` binding creates a Session, and every
+    /// non-`Resolved` disposition receives an immediate typed denial carrying
+    /// its own exact denial code, creating no Session, authority, capability,
+    /// or Finish state. The exact disposition remains retained in the Kernel
+    /// record and the daemon-facing acknowledgement; mapping is decided by
+    /// these typed arms alone and never by human detail or log text.
     #[cfg(windows)]
-    pub async fn await_agent_bridge_activation_response(
+    fn activation_result_response_frame(
+        &self,
+        connection_id: &str,
+        original: &Frame,
+        pending: &AgentActivationPending,
+        result: &AgentActivationResolutionResult,
+    ) -> Result<Frame, TransportError> {
+        result
+            .validate_against(&pending.ticket)
+            .map_err(|_| TransportError::SessionFenced)?;
+        if pending.ticket.ticket_id != result.ticket_id
+            || pending.ticket.connection_id != connection_id
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        self.validate_result_bridge_leg(&pending.ticket)?;
+        // The match stays exhaustive with no wildcard arm, so adding a
+        // future disposition breaks compilation instead of silently
+        // coercing. All six non-success dispositions share the bridge
+        // outcome below: an immediate typed denial carrying the exact
+        // per-disposition code, with no Session, authority, capability, or
+        // Finish. Their exact typed content stays retained in the Kernel
+        // record and the daemon-facing acknowledgement; mapping is decided
+        // by these typed arms alone.
+        match &result.disposition {
+            AgentActivationResolutionDisposition::Resolved { binding } => {
+                self.resolved_result_response_frame(connection_id, original, pending, binding)
+            }
+            AgentActivationResolutionDisposition::TaskSelectionRequired { .. }
+            | AgentActivationResolutionDisposition::ScopeSelectionRequired { .. }
+            | AgentActivationResolutionDisposition::ScopeAmbiguous { .. }
+            | AgentActivationResolutionDisposition::NotReady { .. }
+            | AgentActivationResolutionDisposition::StaleFence { .. }
+            | AgentActivationResolutionDisposition::FailedInternal { .. } => {
+                let reason_code = Self::activation_denial_code_for_disposition(&result.disposition)
+                    .ok_or(TransportError::SessionFenced)?;
+                self.denied_result_response_frame(connection_id, original, pending, reason_code)
+            }
+        }
+    }
+
+    /// Completes one waiting bridge exchange from a full typed result.
+    ///
+    /// A `Resolved` disposition builds the Authenticated transport binding by
+    /// copying the Governor-owned resolved fields and the exact ticket fence;
+    /// Kernel performs no semantic selection or retry interpretation. Any
+    /// other disposition revokes the connection and returns the immediate
+    /// typed denial carrying that disposition's exact denial code, without
+    /// creating a Session. The match stays exhaustive with no wildcard arm.
+    #[cfg(windows)]
+    fn activation_result_response(
         &self,
         connection_id: &str,
         frame: &Frame,
+        ticket_id: &str,
+        result: &AgentActivationResolutionResult,
     ) -> Result<Frame, TransportError> {
-        let ticket = self.enqueue_agent_bridge_activation(connection_id, frame)?;
-        loop {
-            let outcome = {
-                let pending = self
-                    .agent_activation_pending
-                    .lock()
-                    .map_err(|_| TransportError::SessionFenced)?;
-                pending
-                    .entries
-                    .get(&ticket.ticket_id)
-                    .and_then(|entry| entry.decision.clone())
-            };
-            if let Some(decision) = outcome {
-                let pending = {
-                    let pending = self
-                        .agent_activation_pending
-                        .lock()
-                        .map_err(|_| TransportError::SessionFenced)?;
-                    pending
-                        .entries
-                        .get(&ticket.ticket_id)
-                        .ok_or(TransportError::SessionFenced)?
-                        .clone()
-                };
-                let reply =
-                    self.activation_response_frame(connection_id, frame, &pending, &decision)?;
-                self.agent_activation_pending
-                    .lock()
-                    .map_err(|_| TransportError::SessionFenced)?
-                    .entries
-                    .remove(&ticket.ticket_id);
-                return Ok(reply);
-            }
-            let now = unix_ms();
-            if activation_deadline_expired(now, ticket.kernel_deadline_unix_ms) {
-                let request = {
-                    let pending = self
-                        .agent_activation_pending
-                        .lock()
-                        .map_err(|_| TransportError::SessionFenced)?;
-                    pending
-                        .entries
-                        .get(&ticket.ticket_id)
-                        .ok_or(TransportError::SessionFenced)?
-                        .request
-                        .clone()
-                };
-                self.agent_activation_pending
-                    .lock()
-                    .map_err(|_| TransportError::SessionFenced)?
-                    .entries
-                    .remove(&ticket.ticket_id);
-                self.revoke_agent_bridge(connection_id);
-                let response = AgentBridgeActivationResponse::denied(
-                    &request,
-                    AgentBridgeActivationDenialCode::SemanticResolutionUnavailable,
-                )
+        let pending = {
+            let pending = self
+                .agent_activation_pending
+                .lock()
                 .map_err(|_| TransportError::SessionFenced)?;
+            pending
+                .entries
+                .get(ticket_id)
+                .ok_or(TransportError::SessionFenced)?
+                .clone()
+        };
+        // Exhaustive per-disposition projection with no wildcard arm: a
+        // future disposition breaks compilation here instead of silently
+        // reusing another denial code. Only `Resolved` reaches the binding
+        // projector; every other disposition is revoked and denied with its
+        // exact code, creating no Session.
+        match &result.disposition {
+            AgentActivationResolutionDisposition::Resolved { binding } => {
+                let reply = self.activation_response_frame_for_resolution(
+                    connection_id,
+                    frame,
+                    &pending,
+                    result,
+                    binding,
+                )?;
+                self.agent_activation_pending
+                    .lock()
+                    .map_err(|_| TransportError::SessionFenced)?
+                    .entries
+                    .remove(ticket_id);
+                self.agent_activation_results
+                    .lock()
+                    .map_err(|_| TransportError::SessionFenced)?
+                    .remove(ticket_id);
+                Ok(reply)
+            }
+            AgentActivationResolutionDisposition::TaskSelectionRequired { .. }
+            | AgentActivationResolutionDisposition::ScopeSelectionRequired { .. }
+            | AgentActivationResolutionDisposition::ScopeAmbiguous { .. }
+            | AgentActivationResolutionDisposition::NotReady { .. }
+            | AgentActivationResolutionDisposition::StaleFence { .. }
+            | AgentActivationResolutionDisposition::FailedInternal { .. } => {
+                self.agent_activation_pending
+                    .lock()
+                    .map_err(|_| TransportError::SessionFenced)?
+                    .entries
+                    .remove(ticket_id);
+                self.agent_activation_results
+                    .lock()
+                    .map_err(|_| TransportError::SessionFenced)?
+                    .remove(ticket_id);
+                self.revoke_agent_bridge(connection_id);
+                let reason_code = Self::activation_denial_code_for_disposition(&result.disposition)
+                    .ok_or(TransportError::SessionFenced)?;
+                let response = AgentBridgeActivationResponse::denied(&pending.request, reason_code)
+                    .map_err(|_| TransportError::SessionFenced)?;
+                response
+                    .validate_request(&pending.request)
+                    .map_err(|_| TransportError::SessionFenced)?;
                 let reply = Frame {
                     protocol_version: frame.protocol_version,
                     encoding_profile: frame.encoding_profile,
@@ -721,7 +1287,303 @@ impl KernelComposition {
                     trace_context: frame.trace_context.clone(),
                 };
                 reply.validate()?;
-                return Ok(reply);
+                Ok(reply)
+            }
+        }
+    }
+
+    /// Builds the Authenticated transport binding for a `Resolved` result.
+    ///
+    /// This is the mechanical twin of [`Self::activation_response_frame`]:
+    /// the binding fields and the ticket fence come from the exact retained
+    /// ticket and Governor-owned result, and the fresh Session nonce is the
+    /// only Kernel-minted value. It is never called for a non-`Resolved`
+    /// disposition.
+    #[cfg(windows)]
+    fn activation_response_frame_for_resolution(
+        &self,
+        connection_id: &str,
+        original: &Frame,
+        pending: &AgentActivationPending,
+        result: &AgentActivationResolutionResult,
+        binding: &eliot_protocol::AgentActivationResolvedBinding,
+    ) -> Result<Frame, TransportError> {
+        result
+            .validate_against(&pending.ticket)
+            .map_err(|_| TransportError::SessionFenced)?;
+        if pending.ticket.ticket_id != result.ticket_id
+            || pending.ticket.connection_id != connection_id
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        // The ticket binding is exact on both legs here: `validate_against`
+        // above enforces `result.ticket_state_fence == pending.ticket.state_fence`,
+        // so the shared `Resolved` projector below builds the identical fence
+        // the inline P-04 construction built. This path keeps its own
+        // ticket/connection checks and performs no additional v2 bridge-leg
+        // validation.
+        self.resolved_result_response_frame(connection_id, original, pending, binding)
+    }
+    /// Creates the bridge Session for exactly one valid `Resolved` binding.
+    ///
+    /// Binding validation rechecks every Kernel-owned property: the result
+    /// binds the exact pending ticket identity, digest, and fence; the
+    /// ticket binds the exact live admission receipt, connection, and fence;
+    /// and the admission binds the current profile, candidate, and
+    /// activation receipt. Task/plan semantic currency against live Governor
+    /// state is owned by the trusted resolver read (I1.8); Kernel never
+    /// invents semantic identity here, it only projects the exact validated
+    /// binding into a transport Session.
+    #[cfg(windows)]
+    fn resolved_result_response_frame(
+        &self,
+        connection_id: &str,
+        original: &Frame,
+        pending: &AgentActivationPending,
+        binding: &AgentActivationResolvedBinding,
+    ) -> Result<Frame, TransportError> {
+        let session_nonce = fresh_activation_nonce_material()
+            .map_err(|_| TransportError::SessionFenced)?
+            .to_string();
+        let accepted = {
+            let connections = self
+                .agent_bridge_connections
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            let state = connections
+                .get(connection_id)
+                .ok_or(TransportError::SessionFenced)?;
+            state
+                .accepted_transport
+                .as_ref()
+                .ok_or(TransportError::SessionFenced)?
+                .clone()
+        };
+        let session = Session::establish_agent_bridge(
+            connection_id,
+            accepted.peer().clone(),
+            accepted.client_hello().module_generation.clone(),
+            session_nonce.clone(),
+        )?;
+        let authenticated = AgentBridgeAuthenticatedBinding {
+            principal_id: binding.principal_id.clone(),
+            session_id: binding.session_id.clone(),
+            activation_generation: pending.ticket.state_fence.resource_generation,
+            state_fence: AgentBridgeActivationFence {
+                authority_epoch: pending.ticket.state_fence.authority_epoch.clone(),
+                generation: pending.ticket.state_fence.resource_generation,
+                nonce: session_nonce,
+            },
+            task_id: binding.task_id.clone(),
+            work_unit_id: binding.work_unit_id.clone(),
+            work_scope_id: binding.work_scope_id.clone(),
+            task_revision: binding.task_revision.clone(),
+            plan_id: binding.plan_id.clone(),
+            plan_revision: binding.plan_revision.clone(),
+        };
+        let response = AgentBridgeActivationResponse {
+            wire_id: eliot_protocol::AGENT_BRIDGE_ACTIVATION_RESPONSE_WIRE_ID.to_owned(),
+            wire_version: AgentBridgeActivationResponse::CONTRACT_VERSION,
+            request_id: pending
+                .request
+                .request_identity
+                .request
+                .metadata
+                .request_id
+                .clone(),
+            request_sha256: pending.request.request_sha256.clone(),
+            disposition: eliot_protocol::AgentBridgeActivationDisposition::Authenticated {
+                binding: Box::new(authenticated),
+            },
+            response_sha256: String::new(),
+        }
+        .with_computed_digest()
+        .map_err(|_| TransportError::SessionFenced)?;
+        response
+            .validate_request(&pending.request)
+            .map_err(|_| TransportError::SessionFenced)?;
+        let reply = Frame {
+            protocol_version: original.protocol_version,
+            encoding_profile: original.encoding_profile,
+            connection_id: connection_id.to_owned(),
+            request_id: Some(response.request_id.clone()),
+            kind: FrameKind::Response,
+            message_type: MessageType::Result,
+            request_identity: None,
+            payload: ProtocolPayload::Json(
+                serde_json::to_value(response).map_err(|_| TransportError::SessionFenced)?,
+            ),
+            trace_context: original.trace_context.clone(),
+        };
+        reply.validate()?;
+        let mut connections = self
+            .agent_bridge_connections
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let state = connections
+            .get_mut(connection_id)
+            .ok_or(TransportError::SessionFenced)?;
+        if state.activation_completed || state.session.is_some() {
+            return Err(TransportError::IdentityConflict);
+        }
+        state.session = Some(session);
+        state.activation_completed = true;
+        Ok(reply)
+    }
+
+    /// Returns the immediate typed denial for one non-`Resolved` result,
+    /// carrying the exact per-disposition denial code supplied by the caller.
+    /// No Session, authority, capability, or Finish state is created on any
+    /// path through this function; the bridge leg is only marked complete.
+    #[cfg(windows)]
+    fn denied_result_response_frame(
+        &self,
+        connection_id: &str,
+        original: &Frame,
+        pending: &AgentActivationPending,
+        reason_code: AgentBridgeActivationDenialCode,
+    ) -> Result<Frame, TransportError> {
+        let response = AgentBridgeActivationResponse::denied(&pending.request, reason_code)
+            .map_err(|_| TransportError::SessionFenced)?;
+        response
+            .validate_request(&pending.request)
+            .map_err(|_| TransportError::SessionFenced)?;
+        let reply = Frame {
+            protocol_version: original.protocol_version,
+            encoding_profile: original.encoding_profile,
+            connection_id: connection_id.to_owned(),
+            request_id: Some(response.request_id.clone()),
+            kind: FrameKind::Response,
+            message_type: MessageType::Result,
+            request_identity: None,
+            payload: ProtocolPayload::Json(
+                serde_json::to_value(response).map_err(|_| TransportError::SessionFenced)?,
+            ),
+            trace_context: original.trace_context.clone(),
+        };
+        reply.validate()?;
+        let mut connections = self
+            .agent_bridge_connections
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let state = connections
+            .get_mut(connection_id)
+            .ok_or(TransportError::SessionFenced)?;
+        if state.activation_completed || state.session.is_some() {
+            return Err(TransportError::IdentityConflict);
+        }
+        state.activation_completed = true;
+        Ok(reply)
+    }
+
+    /// Queues one validated bridge request and waits for the sole eliotd
+    /// resolver result. Kernel owns the final transport Session/fence and
+    /// every deadline/cancel race: an accepted v2 result (or a legacy v1
+    /// decision) is projected even if the deadline expires while it is
+    /// retained, and only a result-less expired ticket falls back to the
+    /// typed denial. The pending entry is consumed after projecting, but the
+    /// exact v2 result record stays retained for daemon replay/reconcile.
+    ///
+    /// Queues one validated bridge request and waits for the sole eliotd
+    /// resolver outcome. Kernel owns the final transport Session/fence.
+    ///
+    /// The exchange accepts either the legacy success-only decision or one
+    /// full typed resolution result, whichever the resolver submits first for
+    /// the exact ticket. A `Resolved` result yields the same Authenticated
+    /// transport binding as a legacy decision through a mechanical field copy;
+    /// every other disposition yields the immediate typed denial carrying that
+    /// disposition's exact denial code and creates no Session. The full typed
+    /// result stays addressable under its ticket and result digests for
+    /// Governor reconciliation through the host-request route; the denial wire
+    /// carries the exact per-disposition code so the agent can distinguish
+    /// selection, ambiguity, retry, fence, and internal outcomes.
+    #[cfg(windows)]
+    pub async fn await_agent_bridge_activation_response(
+        &self,
+        connection_id: &str,
+        frame: &Frame,
+    ) -> Result<Frame, TransportError> {
+        let ticket = self.enqueue_agent_bridge_activation(connection_id, frame)?;
+        loop {
+            enum BridgeWaiterOutcome {
+                V2ResultAvailable,
+                DecisionAvailable,
+                RawResultAvailable,
+                Waiting,
+                Gone,
+            }
+            let outcome = {
+                let pending = self
+                    .agent_activation_pending
+                    .lock()
+                    .map_err(|_| TransportError::SessionFenced)?;
+                let results = self
+                    .agent_activation_results
+                    .lock()
+                    .map_err(|_| TransportError::SessionFenced)?;
+                // Priority preserves each side's relative order: the v2
+                // envelope result wins over the legacy decision (v2
+                // production path), and the legacy decision wins over the
+                // unenveloped P-04 result. An accepted result on any leg
+                // always wins the deadline race below.
+                match pending.entries.get(&ticket.ticket_id) {
+                    None => BridgeWaiterOutcome::Gone,
+                    Some(entry) => {
+                        if pending.results.contains_key(&ticket.ticket_id) {
+                            BridgeWaiterOutcome::V2ResultAvailable
+                        } else if entry.decision.is_some() {
+                            BridgeWaiterOutcome::DecisionAvailable
+                        } else if results.contains_key(&ticket.ticket_id) {
+                            BridgeWaiterOutcome::RawResultAvailable
+                        } else {
+                            BridgeWaiterOutcome::Waiting
+                        }
+                    }
+                }
+            };
+            match outcome {
+                BridgeWaiterOutcome::V2ResultAvailable => {
+                    return self.project_retained_activation_result(
+                        connection_id,
+                        frame,
+                        &ticket.ticket_id,
+                    );
+                }
+                BridgeWaiterOutcome::DecisionAvailable => {
+                    return self.project_legacy_activation_decision(
+                        connection_id,
+                        frame,
+                        &ticket.ticket_id,
+                    );
+                }
+                BridgeWaiterOutcome::RawResultAvailable => {
+                    let result = {
+                        self.agent_activation_results
+                            .lock()
+                            .map_err(|_| TransportError::SessionFenced)?
+                            .get(&ticket.ticket_id)
+                            .cloned()
+                            .ok_or(TransportError::SessionFenced)?
+                    };
+                    return self.activation_result_response(
+                        connection_id,
+                        frame,
+                        &ticket.ticket_id,
+                        &result,
+                    );
+                }
+                BridgeWaiterOutcome::Gone => {
+                    // The bridge leg was revoked (disconnect, profile
+                    // replacement, or deadline consumption). Retained v2
+                    // results still serve daemon-leg replay/reconcile; this
+                    // waiter has no connection left to answer.
+                    return Err(TransportError::SessionFenced);
+                }
+                BridgeWaiterOutcome::Waiting => {}
+            }
+            let now = unix_ms();
+            if activation_deadline_expired(now, ticket.kernel_deadline_unix_ms) {
+                return self.expire_agent_bridge_activation(connection_id, frame, &ticket);
             }
             let notified = self.agent_activation_changed.notified();
             tokio::select! {
@@ -731,18 +1593,154 @@ impl KernelComposition {
         }
     }
 
+    /// Projects one retained v2 result to its bridge connection and consumes
+    /// the pending entry. The exact result record stays retained for daemon
+    /// replay/reconcile.
+    #[cfg(windows)]
+    fn project_retained_activation_result(
+        &self,
+        connection_id: &str,
+        frame: &Frame,
+        ticket_id: &str,
+    ) -> Result<Frame, TransportError> {
+        let (pending_entry, result) = {
+            let pending = self
+                .agent_activation_pending
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            let entry = pending
+                .entries
+                .get(ticket_id)
+                .ok_or(TransportError::SessionFenced)?
+                .clone();
+            let result = pending
+                .results
+                .get(ticket_id)
+                .ok_or(TransportError::SessionFenced)?
+                .result
+                .clone();
+            (entry, result)
+        };
+        let reply =
+            self.activation_result_response_frame(connection_id, frame, &pending_entry, &result)?;
+        self.agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?
+            .entries
+            .remove(ticket_id);
+        Ok(reply)
+    }
+
+    /// Projects one legacy v1 decision to its bridge connection and consumes
+    /// the pending entry. Compatibility path only; production traffic uses
+    /// the retained v2 result above.
+    #[cfg(windows)]
+    fn project_legacy_activation_decision(
+        &self,
+        connection_id: &str,
+        frame: &Frame,
+        ticket_id: &str,
+    ) -> Result<Frame, TransportError> {
+        let pending_entry = {
+            let pending = self
+                .agent_activation_pending
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            pending
+                .entries
+                .get(ticket_id)
+                .ok_or(TransportError::SessionFenced)?
+                .clone()
+        };
+        let decision = pending_entry
+            .decision
+            .clone()
+            .ok_or(TransportError::SessionFenced)?;
+        let reply =
+            self.activation_response_frame(connection_id, frame, &pending_entry, &decision)?;
+        self.agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?
+            .entries
+            .remove(ticket_id);
+        Ok(reply)
+    }
+
+    /// Consumes one result-less expired ticket: removes the pending entry,
+    /// revokes the bridge leg, and returns the immediate typed denial. This
+    /// runs only when no v2 result and no legacy decision is retained; an
+    /// accepted result always wins the deadline race and is projected by the
+    /// waiter instead.
+    #[cfg(windows)]
+    fn expire_agent_bridge_activation(
+        &self,
+        connection_id: &str,
+        frame: &Frame,
+        ticket: &AgentActivationResolutionTicket,
+    ) -> Result<Frame, TransportError> {
+        let request = {
+            let pending = self
+                .agent_activation_pending
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            pending
+                .entries
+                .get(&ticket.ticket_id)
+                .ok_or(TransportError::SessionFenced)?
+                .request
+                .clone()
+        };
+        self.agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?
+            .entries
+            .remove(&ticket.ticket_id);
+        self.revoke_agent_bridge(connection_id);
+        // Result-less expiry has no daemon disposition to project, so it keeps
+        // the Kernel-owned no-result denial code. Mapping it to any of the six
+        // disposition codes would fabricate a daemon semantic result after the
+        // deadline, which the expiry race must never do.
+        let response = AgentBridgeActivationResponse::denied(
+            &request,
+            AgentBridgeActivationDenialCode::SemanticResolutionUnavailable,
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
+        let reply = Frame {
+            protocol_version: frame.protocol_version,
+            encoding_profile: frame.encoding_profile,
+            connection_id: connection_id.to_owned(),
+            request_id: Some(response.request_id.clone()),
+            kind: FrameKind::Response,
+            message_type: MessageType::Result,
+            request_identity: None,
+            payload: ProtocolPayload::Json(
+                serde_json::to_value(response).map_err(|_| TransportError::SessionFenced)?,
+            ),
+            trace_context: frame.trace_context.clone(),
+        };
+        reply.validate()?;
+        Ok(reply)
+    }
+
     /// Validates one closed bridge activation operation and emits the sole
     /// R13.1b typed denial. No Kernel `Session` or semantic authority is made.
     #[cfg(windows)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the activation response keeps request, receipt, and replay checks ordered with its diagnostic terminal"
+    )]
     pub fn agent_bridge_activation_response(
         &self,
         connection_id: &str,
         frame: &Frame,
     ) -> Result<Frame, TransportError> {
-        let mut connections = self
-            .agent_bridge_connections
-            .lock()
-            .map_err(|_| TransportError::SessionFenced)?;
+        observe_bridge("kernel.bridge_activation_request", "attempt");
+        let Ok(mut connections) = self.agent_bridge_connections.lock() else {
+            let err = TransportError::SessionFenced;
+            observe_bridge("kernel.bridge_activation_request", "fenced");
+            super::kernel_diagnostics::observe_terminal_error(bridge_terminal_code(&err));
+            return Err(err);
+        };
         let result = (|| {
             let state = connections
                 .get_mut(connection_id)
@@ -826,12 +1824,31 @@ impl KernelComposition {
             }
             state.accepted_transport = None;
         }
+        match &result {
+            Ok(_) => observe_bridge("kernel.bridge_activation_request", "success"),
+            Err(error) => {
+                observe_bridge("kernel.bridge_activation_request", "fenced");
+                super::kernel_diagnostics::observe_terminal_error(bridge_terminal_code(error));
+            }
+        }
         result
     }
 
     /// Revokes all retained bridge authority for one disconnected connection.
+    ///
+    /// Transport revocation is connection-scoped: the exchange is aborted,
+    /// the transport Session is fenced, and the accepted transport is dropped,
+    /// so a reconnected bridge generation never inherits this connection's
+    /// Session, capabilities, or pending activation tickets. Durable
+    /// P-04 host-request ORS records are never deleted here; records staged
+    /// through the presenting connection that are still in an uncertain
+    /// pre-terminal state are fenced to `Unknown` so a later exact replay or
+    /// reconciliation observes the disconnect honestly instead of retrying
+    /// blindly. Records that may already have produced effects, and all
+    /// terminal records, stay under their owner's continuation rules.
     #[cfg(windows)]
     pub fn revoke_agent_bridge(&self, connection_id: &str) {
+        observe_bridge("kernel.bridge_cleanup", "attempt");
         if let Ok(mut connections) = self.agent_bridge_connections.lock()
             && let Some(mut state) = connections.remove(connection_id)
         {
@@ -848,14 +1865,21 @@ impl KernelComposition {
                 .filter(|(_, entry)| entry.ticket.connection_id == connection_id)
                 .map(|(ticket_id, _)| ticket_id.clone())
                 .collect::<Vec<_>>();
-            for ticket_id in removed {
-                pending.entries.remove(&ticket_id);
+            for ticket_id in &removed {
+                pending.entries.remove(ticket_id);
+            }
+            if let Ok(mut results) = self.agent_activation_results.lock() {
+                for ticket_id in &removed {
+                    results.remove(ticket_id);
+                }
             }
             let live_ticket_ids = pending.entries.keys().cloned().collect::<BTreeSet<_>>();
             pending
                 .fifo
                 .retain(|ticket_id| live_ticket_ids.contains(ticket_id));
         }
+        self.fence_host_requests_for_connection(connection_id);
         self.agent_activation_changed.notify_waiters();
+        observe_bridge("kernel.bridge_cleanup", "complete");
     }
 }

@@ -102,6 +102,39 @@
   "process_image_proof": false,
   "receipt_schema": "eliot.antigravity-runtime-preflight-receipt.v1",
   "proof_ceiling": "ZERO_MODEL_STABLE_EXECUTABLE_PATH_AND_HELP_FINGERPRINT_ONLY",
+  "slice_b_terminal_freeze": {
+    "issue": 9,
+    "slice": "B route + projection",
+    "base_commit": "dfa3547e62544e4df311a61a8ff3c61b629f89f7",
+    "coverage": "documented_not_observed",
+    "reducer": "MGR02 handoff; this contract performs zero-model preflight only and never reduces terminal state",
+    "identity_freeze": {
+      "runtime": "antigravity.headless (antigravity exec --stdin --persistent --json) + antigravity.agy-readonly (agy); route policy crates/eliot-engine/src/provider_invocation.rs:734 (AgentHostId::Antigravity, agy plan print audit)",
+      "adapter": "target-unimplemented under I10.17; AdapterSupervisor crates/eliot-engine/src/adapter.rs:85; normalizer identity target, no live antigravity normalizer",
+      "bridge": "eliot.surfaces.agent-bridge-core/v1 transport-only (crates/surfaces/eliot-agent-bridge-core/src/lib.rs:33); EventEnvelope crates/foundation/eliot-protocol/src/lib.rs:646, AckPhase RECEIVED/DURABLE/NORMALIZED/APPLIED, EventDisposition accepted/duplicate/rejected/conflict, per-stream cursor max(sequence)",
+      "governor": "eliot.governor.session_lifecycle v1.0.0 SessionState terminal Expired/Revoked/Closed (crates/governor/eliot-session/src/lib.rs:18) + eliot.governor.task_lifecycle v1.0.0 TaskState terminal DoneVerified/Blocked/Failed/Partial (crates/governor/eliot-task/src/lib.rs:18); attempt owner eliot_agent_coordinator",
+      "protocol": "eliot-protocol CONTRACT_VERSION 1.0.0 protocol_contract_identity (crates/foundation/eliot-protocol/src/lib.rs:2424); EventIdentityKey domain eliot:event:v1",
+      "session": "SessionId plus AgentSession plus ProviderObservationLineage SessionObservation vs ExecutionUnitObservation; SessionLifecycle transition Started/Resumed/Suspended/Closed carries no attempt authority",
+      "attempt": "AgentAttemptId/AttemptId AgentAttempt crates/agent/eliot-agent-api/src/lib.rs:804; AttemptState terminal Completed/Failed/UnknownOutcome/Cancelled/Quarantined immutable (:610); event_cursor Option<EventCursor>; provider_binding #361",
+      "task": "TaskId plus TaskState above plus Finish I7.9 FinishAttemptDraft/DerivedCompletionProof/FinishDecisionOutcome VERIFIED_COMPLETE/PARTIAL/BLOCKED/FAILED_VERIFICATION/DEGRADED_NO_PROOF/UNSAFE_TO_FINISH/CANCELLED/SUPERSEDED; result_authority candidate_only_until_governed_transition",
+      "route": "profile antigravity.local.supervised-stream host_family antigravity route_class later-local-sidecar; RouteFingerprint eliot.agent.route-fingerprint.v6 (crates/agent/eliot-agent-api/src/lib.rs:227); routes antigravity.exec.persistent-ndjson + antigravity.python-sdk.sidecar + antigravity.agy.readonly-diff; per_attempt_receipt true fixed_model_id null"
+    },
+    "event_freeze": {
+      "raw": "legacy HostEventEnvelope crates/agent/eliot-agent-api/src/lib.rs:754 (event_id, sequence nonzero, cursor, kind 14 variants, route, raw_payload_digest, normalized_payload Value, lineage); quarantine boundary issue #371 T4 S6 untouched",
+      "normalized": "closed NormalizedHostEventEnvelope eliot-agent-api/host-event-v7 crates/agent/eliot-agent-api/src/host_event.rs:719 (event_id, cursor, lineage, producer_adapter_identity, adapter_contract_version, sequence nonzero, causal_predecessors, payload 14-variant family, admitted_route_digest, raw_source handle+digest, normalization receipt proof_ceiling Observation, observed_at ClockReading, delivery DurableOrdered/BestEffortOrdered/Replay)",
+      "sequences_cursors": "sequence u64 nonzero everywhere; cursor EventCursor; bridge per-stream cursor advances only on AckPhase reach; duplicate replay idempotent without advance; conflict rejected; normalized sequence/cursor must equal ExecutionUnitObservation sequence/cursor",
+      "attempt_transitions": "Admitted->Started->Running->Cancelling/Checkpointed/Completed/Failed/UnknownOutcome with Cancelling/Checkpointed/Reconciling continuations; terminal states immutable",
+      "terminal_reducer_inputs": "ProviderTerminalObserved (CompletedObserved/FailedObserved/CancelledObserved + terminal_ref) + CandidateResultAvailable (result_digest + admitted_route_digest) + Error/CancellationObserved/Usage/Checkpoint + SessionLifecycle + AdmittedRouteReceipt #369 + ProviderExecutionBinding #361 + candidate-only AgentResult disposition + I7.9 finish inputs; held independent (stale CLI sequence, earlier Error sequence, final canonical sequence are distinct) until MGR02 reduction"
+    },
+    "preflight_does_not_observe": [
+      "observed_request_event_schema",
+      "current_account_model_catalogue",
+      "provider_interrupt_and_terminal_reconciliation",
+      "process_tree_containment",
+      "descendant_closure",
+      "bounded_product_pulse"
+    ]
+  },
   "executable_stability": {
     "snapshot_stages": [
       "pre_version",

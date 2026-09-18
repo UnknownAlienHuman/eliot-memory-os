@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 mod coverage;
+mod dimensions;
 mod eligibility;
 mod error;
 mod finding;
@@ -18,6 +19,7 @@ mod result;
 mod source;
 
 pub use coverage::*;
+pub use dimensions::*;
 pub use eligibility::*;
 pub use error::*;
 pub use finding::*;

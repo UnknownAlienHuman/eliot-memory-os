@@ -1,0 +1,11 @@
+{
+  "prefix": "\\\\.\\pipe\\eliot\\",
+  "unicode_profile": "ascii-lowercase-v1",
+  "max_suffix_bytes": 240,
+  "max_name_bytes": 255,
+  "max_segment_bytes": 240,
+  "valid_segment_bytes": 240,
+  "segment_one_over_bytes": 241,
+  "full_name_one_over_module_len": 232,
+  "full_name_one_over_generation": 1
+}

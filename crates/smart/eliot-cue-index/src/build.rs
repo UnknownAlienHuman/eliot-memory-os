@@ -4,9 +4,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_contracts::StateFence;
 use eliot_cue_contracts::{
-    AdmittedCueBindingProjection, CONTRACT_REVISION, CueContractError, CueSnapshot,
-    CueSnapshotBuildCandidate, Digest, NormalizationProfile, RebuildIdentity, RelationEdge,
-    SnapshotId, SnapshotMember, WorkScopeId,
+    AdmittedCueBindingProjection, CONTRACT_REVISION, ClosedSnapshotRow, CueComparisonKey,
+    CueContractError, CueProjectionDenominator, CueSnapshot, CueSnapshotBuildCandidate, Digest,
+    NormalizationProfile, RebuildIdentity, RelationEdge, SnapshotEdgeWeight, SnapshotId,
+    SnapshotMember, WorkScopeId,
 };
 use eliot_evidence::{EpistemicStatus, EvidenceFreshness};
 
@@ -87,6 +88,110 @@ pub fn rebuild_cue_snapshot(
         return Err(CueContractError::SnapshotNotRebuildable);
     }
     Ok(rebuilt)
+}
+
+/// Builds a closed candidate: exact build plus frozen denominator, row
+/// identity, endpoint, and weight closure.
+///
+/// Each member is joined to the primary (first) comparison key of the exact
+/// admitted projection it was built from; scope comes from the build scope.
+/// Keyless projections carry no comparison material and fail closed rather
+/// than defaulting to source spelling. `weights` supplies exactly one
+/// policy-owned milli weight per edge. An explicitly partial denominator
+/// (nonzero omissions that reconcile) is accepted; use
+/// [`CueProjectionDenominator::is_empty_complete`] to classify the result.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the closed build threads the exact open-build inputs plus the frozen denominator and weights; splitting the signature would hide the closure"
+)]
+pub fn build_cue_snapshot_closed(
+    scope_id: &WorkScopeId,
+    snapshot_id: SnapshotId,
+    profile: NormalizationProfile,
+    state_fence: StateFence,
+    projections: &[AdmittedCueBindingProjection],
+    relation_edges: &[RelationEdge],
+    registry_revision: Option<&str>,
+    denominator: &CueProjectionDenominator,
+    weights: &[SnapshotEdgeWeight],
+) -> Result<CueSnapshotBuildCandidate, CueContractError> {
+    let candidate = build_cue_snapshot(
+        scope_id,
+        snapshot_id,
+        profile,
+        state_fence,
+        projections,
+        relation_edges,
+        registry_revision,
+    )?;
+    let rows = join_closed_rows(scope_id, &candidate.snapshot.members, projections)?;
+    candidate
+        .snapshot
+        .validate_closed(&rows, denominator, relation_edges, weights)?;
+    Ok(candidate)
+}
+
+/// Rebuilds a closed candidate and re-proves its closure.
+///
+/// The denominator, keys, and weights are caller inputs, not retained state:
+/// a rebuild with different closure inputs is a different claim and must be
+/// validated as one.
+pub fn rebuild_cue_snapshot_closed(
+    candidate: &CueSnapshotBuildCandidate,
+    registry_revision: Option<&str>,
+    denominator: &CueProjectionDenominator,
+    weights: &[SnapshotEdgeWeight],
+) -> Result<CueSnapshotBuildCandidate, CueContractError> {
+    let rebuilt = rebuild_cue_snapshot(candidate, registry_revision)?;
+    let rows = join_closed_rows(
+        &rebuilt.scope_id,
+        &rebuilt.snapshot.members,
+        &rebuilt.admitted_bindings,
+    )?;
+    rebuilt
+        .snapshot
+        .validate_closed(&rows, denominator, &rebuilt.relation_edges, weights)?;
+    Ok(rebuilt)
+}
+
+fn join_closed_rows(
+    scope_id: &WorkScopeId,
+    members: &[SnapshotMember],
+    projections: &[AdmittedCueBindingProjection],
+) -> Result<Vec<ClosedSnapshotRow>, CueContractError> {
+    let mut by_member = BTreeMap::new();
+    for projection in projections {
+        by_member.insert(
+            (
+                projection.candidate.canonical.canonical_cue_id.clone(),
+                projection.candidate.target.clone(),
+            ),
+            projection,
+        );
+    }
+    let mut rows = Vec::with_capacity(members.len());
+    for member in members {
+        let key = (
+            member.canonical.canonical_cue_id.clone(),
+            member.target.clone(),
+        );
+        let Some(projection) = by_member.get(&key) else {
+            return Err(CueContractError::SnapshotNotRebuildable);
+        };
+        let Some(primary) = projection.normalized.comparison_keys.first() else {
+            return Err(CueContractError::SnapshotNotRebuildable);
+        };
+        let comparison = CueComparisonKey::new(
+            scope_id.as_str().to_owned(),
+            projection.candidate.canonical.kind,
+            primary.match_mode,
+            primary.key_value.clone(),
+        );
+        let row = ClosedSnapshotRow::new(member.clone(), comparison);
+        row.validate()?;
+        rows.push(row);
+    }
+    Ok(rows)
 }
 
 fn preflight_input(

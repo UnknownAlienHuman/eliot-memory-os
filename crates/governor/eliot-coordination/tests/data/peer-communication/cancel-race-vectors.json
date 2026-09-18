@@ -1,0 +1,5 @@
+{
+  "cancel_before_id": "msg-cancel-1",
+  "race_id": "msg-cancel-2",
+  "endpoint": "route-cancel-peer"
+}

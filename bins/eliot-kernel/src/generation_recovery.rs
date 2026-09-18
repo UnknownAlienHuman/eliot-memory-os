@@ -27,6 +27,30 @@ fn is_lower_sha256(value: &str) -> bool {
     value.len() == 64 && value.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'))
 }
 
+/// F-LOG-KERNEL-4 (#903 slice B): recovery and cutover-persistence boundary
+/// observations.
+///
+/// Observation only, via #895's facade: fixed `kernel.recovery.*` event names
+/// plus a bounded stable outcome. Never carries cutover identities, digests,
+/// epochs, scopes, generations, or owner error strings (I15.4, I07.20).
+/// Terminal ownership stays with the calling gateways: a failed `recover`
+/// replay is terminal-mapped by the composition build owner, and a failed
+/// `persist_and_publish` is fenced and terminal-mapped by the cutover gateway
+/// owner in `generation_control.rs`. Subordinate phases correlate here
+/// without duplicate failure claims, and no observation mutates the router,
+/// the service epoch, the handshake policy, or the ORS record.
+fn observe_recovery(event: &'static str, outcome: &'static str) {
+    use super::kernel_diagnostics::{KERNEL_DIAGNOSTICS_TARGET, bound_field};
+    let event_bound = bound_field(event);
+    let outcome_bound = bound_field(outcome);
+    tracing::info!(
+        target: KERNEL_DIAGNOSTICS_TARGET,
+        event = event_bound.text(),
+        outcome = outcome_bound.text(),
+        "generation recovery observation"
+    );
+}
+
 pub(crate) struct OrsGenerationCoordinator {
     pub(crate) ors: Arc<RedbRecoveryStore>,
 }
@@ -42,15 +66,34 @@ impl OrsGenerationCoordinator {
         service: &mut KernelService,
         policy: &mut ServerHandshakePolicy,
     ) -> Result<(), String> {
+        observe_recovery("kernel.recovery.recover_requested", "attempt");
+        let outcome = self.recover_inner(generations, service, policy);
+        if outcome.is_ok() {
+            observe_recovery("kernel.recovery.recover_completed", "success");
+        } else {
+            observe_recovery("kernel.recovery.recover_failed", "rejected");
+        }
+        outcome
+    }
+
+    fn recover_inner(
+        &self,
+        generations: &mut GenerationRouter,
+        service: &mut KernelService,
+        policy: &mut ServerHandshakePolicy,
+    ) -> Result<(), String> {
         let _ = self
             .ors
             .reconcile_staged_generation_cutovers(eliot_ors::MAX_RECOVERY_PAGE)
             .map_err(|error| error.to_string())?;
+        observe_recovery("kernel.recovery.cutovers_reconciled", "success");
         let snapshots = self
             .ors
             .latest_generation_cutovers(eliot_ors::MAX_RECOVERY_PAGE)
             .map_err(|error| error.to_string())?;
+        observe_recovery("kernel.recovery.cutovers_loaded", "success");
         if snapshots.is_empty() {
+            observe_recovery("kernel.recovery.load_empty", "empty");
             return Ok(());
         }
         let epoch_value = snapshots
@@ -67,8 +110,21 @@ impl OrsGenerationCoordinator {
                 return Err("ORS route projection has invalid committed epochs".to_owned());
             }
         }
+        observe_recovery("kernel.recovery.cutovers_validated", "success");
+        // Lineage-aware bridge (Implements #64): the scalar ORS cutover
+        // contour carries only the sequence; the canonical service epoch keeps
+        // its current lineage and advances to the maximal committed sequence.
+        // Cross-lineage promotion never occurs here; `synchronize` fails
+        // closed on lineage mismatch or regression.
+        let current_lineage = service.authority_epoch().lineage_id.clone();
+        let canonical = eliot_contracts::EpochId::new(
+            current_lineage,
+            std::num::NonZeroU64::new(epoch_value)
+                .ok_or_else(|| "committed cutover epoch must be non-zero".to_owned())?,
+        )
+        .map_err(|error| error.to_string())?;
         service
-            .synchronize_authority_epoch(epoch)
+            .synchronize_authority_epoch(canonical)
             .map_err(|error| error.to_string())?;
         let mut recovered = GenerationRouter::at_epoch(epoch).map_err(|error| error.to_string())?;
         for snapshot in &snapshots {
@@ -83,10 +139,28 @@ impl OrsGenerationCoordinator {
         }
         update_handshake_policy(policy, &recovered)?;
         *generations = recovered;
+        observe_recovery("kernel.recovery.routes_applied", "success");
         Ok(())
     }
 
     pub(crate) fn persist_and_publish(
+        &self,
+        decision: &CutoverDecision,
+        generations: &mut GenerationRouter,
+        service: &mut KernelService,
+        policy: &mut ServerHandshakePolicy,
+    ) -> Result<(), String> {
+        observe_recovery("kernel.recovery.persist_requested", "attempt");
+        let outcome = self.persist_and_publish_inner(decision, generations, service, policy);
+        if outcome.is_ok() {
+            observe_recovery("kernel.recovery.persist_completed", "success");
+        } else {
+            observe_recovery("kernel.recovery.persist_failed", "rejected");
+        }
+        outcome
+    }
+
+    fn persist_and_publish_inner(
         &self,
         decision: &CutoverDecision,
         generations: &mut GenerationRouter,
@@ -109,6 +183,7 @@ impl OrsGenerationCoordinator {
         self.ors
             .stage_generation_cutover(staged.clone())
             .map_err(|error| error.to_string())?;
+        observe_recovery("kernel.recovery.cutover_staged", "success");
         let committed = self
             .ors
             .commit_generation_cutover_state(staged)
@@ -116,11 +191,24 @@ impl OrsGenerationCoordinator {
         if committed.record().state != GenerationCutoverState::Committed {
             return Err("ORS did not return a committed cutover".to_owned());
         }
+        observe_recovery("kernel.recovery.cutover_committed", "success");
+        // Same lineage-aware bridge as `recover`: project the scalar decision
+        // sequence onto the service's current lineage; cross-lineage or
+        // regression fails closed inside `synchronize`.
+        let decision_sequence = decision.new_epoch().value();
+        let decision_lineage = service.authority_epoch().lineage_id.clone();
+        let decision_canonical = eliot_contracts::EpochId::new(
+            decision_lineage,
+            std::num::NonZeroU64::new(decision_sequence)
+                .ok_or_else(|| "cutover epoch must be non-zero".to_owned())?,
+        )
+        .map_err(|error| error.to_string())?;
         service
-            .synchronize_authority_epoch(decision.new_epoch())
+            .synchronize_authority_epoch(decision_canonical)
             .map_err(|error| error.to_string())?;
         update_handshake_policy(policy, &candidate)?;
         *generations = candidate;
+        observe_recovery("kernel.recovery.cutover_applied", "success");
         Ok(())
     }
 }
@@ -145,8 +233,23 @@ pub(crate) fn update_handshake_policy(
             }
         }
         policy.module_generation.generation = route.active_generation();
+        // Project the scalar route sequence onto the policy's current lineage
+        // to obtain the canonical fence epoch; the scalar route contour itself
+        // stays untouched for the residual `GenerationRouter`.
+        let policy_lineage = policy
+            .module_generation
+            .state_fence
+            .authority_epoch
+            .lineage_id
+            .clone();
+        let policy_epoch = eliot_contracts::EpochId::new(
+            policy_lineage,
+            std::num::NonZeroU64::new(route.authority_epoch().value())
+                .ok_or_else(|| "route epoch must be non-zero".to_owned())?,
+        )
+        .map_err(|error| error.to_string())?;
         policy.module_generation.state_fence =
-            StateFence::new(route.authority_epoch(), route.active_generation());
+            StateFence::new(policy_epoch, route.active_generation());
         policy.config_snapshot = serde_json::json!({
             "service": SERVICE_NAME,
             "protocol": PROTOCOL_VERSION,
@@ -159,6 +262,145 @@ pub(crate) fn update_handshake_policy(
         if let Some(protected_snapshot_digest) = protected_snapshot_digest {
             policy.config_snapshot["protected_snapshot_digest"] = protected_snapshot_digest;
         }
+        observe_recovery("kernel.recovery.handshake_projected", "success");
+    } else {
+        observe_recovery("kernel.recovery.handshake_absent", "absent");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod generation_recovery_diagnostics_tests {
+    //! F-LOG-KERNEL-4 (#903 slice B) focused diagnostics proof: the
+    //! handshake-projection boundary keeps its exact owner behavior while
+    //! recording only fixed, secret-free observation names.
+
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use super::*;
+    use crate::{KernelComposition, KernelConfig, unix_ms};
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct CaptureSink {
+        bytes: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for CaptureSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.bytes
+                .lock()
+                .map_err(|_| std::io::Error::other("capture lock poisoned"))?
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn capture(run: impl FnOnce()) -> String {
+        let sink = CaptureSink::default();
+        let writer_sink = sink.clone();
+        {
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || writer_sink.clone())
+                .finish();
+            tracing::subscriber::with_default(subscriber, run);
+        }
+        String::from_utf8_lossy(&sink.bytes.lock().expect("capture lock")).into_owned()
+    }
+
+    #[test]
+    fn recovery_handshake_observation_preserves_policy_projection() {
+        // A real composition supplies the policy contour and a real router
+        // supplies the daemon route. Both legs run through the existing
+        // `update_handshake_policy` caller — never a copied projection.
+        let root = std::env::temp_dir().join(format!(
+            "eliot-kernel-recovery-diagnostics-{}-{}",
+            std::process::id(),
+            unix_ms()
+        ));
+        std::fs::create_dir_all(&root).expect("test work root");
+        let kernel = KernelComposition::new(KernelConfig::new(&root)).expect("kernel composition");
+        let baseline = kernel
+            .front_door_policy
+            .lock()
+            .expect("front-door policy lock")
+            .clone();
+
+        // Projected leg: the daemon route drives generation, fence epoch,
+        // and snapshot exactly as before; only fixed names reach the sink.
+        let epoch = AuthorityEpoch::new(7).expect("epoch");
+        let mut router = GenerationRouter::at_epoch(epoch).expect("router");
+        let scope = RouteScope::new("daemon").expect("daemon scope");
+        let generation = eliot_contracts::ResourceGeneration::new(3).expect("generation");
+        router
+            .register(GenerationRoute::new(scope, generation, epoch).expect("route"))
+            .expect("register");
+        let mut policy = baseline.clone();
+        policy.config_snapshot["artifact_digest"] =
+            serde_json::Value::String("artifact-canary-string".to_owned());
+        policy.config_snapshot["protected_snapshot_digest"] =
+            serde_json::Value::String("e".repeat(64));
+        let text = capture(|| {
+            update_handshake_policy(&mut policy, &router).expect("policy update");
+        });
+        assert!(
+            text.contains("kernel.recovery.handshake_projected"),
+            "missing diagnostics marker kernel.recovery.handshake_projected"
+        );
+        assert!(
+            !text.contains("artifact-canary-string"),
+            "policy material leaked into diagnostics"
+        );
+        assert_eq!(policy.module_generation.generation.value(), 3);
+        let fence = &policy.module_generation.state_fence;
+        assert_eq!(fence.authority_epoch.sequence.get(), 7);
+        assert_eq!(fence.resource_generation.value(), 3);
+        assert_eq!(
+            policy.config_snapshot["generation"],
+            serde_json::json!(3u64)
+        );
+        assert_eq!(
+            policy.config_snapshot["authority_epoch"],
+            serde_json::json!(7u64)
+        );
+        assert_eq!(
+            policy.config_snapshot["service"],
+            serde_json::json!(SERVICE_NAME)
+        );
+        assert_eq!(
+            policy.config_snapshot["protocol"],
+            serde_json::json!(PROTOCOL_VERSION)
+        );
+        assert_eq!(
+            policy.config_snapshot["artifact_digest"],
+            serde_json::json!("artifact-canary-string")
+        );
+        assert_eq!(
+            policy.config_snapshot["protected_snapshot_digest"],
+            serde_json::json!("e".repeat(64))
+        );
+
+        // Absent leg: without a daemon route the policy is byte-identical
+        // and the omission — not a projection — is recorded.
+        let empty = GenerationRouter::at_epoch(epoch).expect("empty router");
+        let mut policy = baseline.clone();
+        let before = policy.clone();
+        let text = capture(|| {
+            update_handshake_policy(&mut policy, &empty).expect("absent policy update");
+        });
+        assert!(
+            text.contains("kernel.recovery.handshake_absent"),
+            "missing diagnostics marker kernel.recovery.handshake_absent"
+        );
+        assert_eq!(policy, before);
+
+        drop(kernel);
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

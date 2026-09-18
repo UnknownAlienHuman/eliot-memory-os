@@ -1,6 +1,6 @@
 #![allow(clippy::unwrap_used)]
 
-use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence};
+use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
 use eliot_dreamer_contracts::{
     FailureAction, FailureActionEvidence, FailureComparator, FailureComparisonProfile,
     FailureCoverage, FailureDimension, FailureDimensionDescriptor, FailureDimensionSource,
@@ -8,9 +8,16 @@ use eliot_dreamer_contracts::{
     FailureHistoryEntry, FailureObservationState, FailureOperation, FailureOutcome,
     FailureProfileDefinition, Requester, RequesterOrigin,
 };
+use std::num::NonZeroU64;
 
 fn fence() -> StateFence {
-    StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+    let epoch = EpochId::new(
+        EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .expect("canonical test lineage-A"),
+        NonZeroU64::new(1).expect("non-zero test sequence"),
+    )
+    .expect("valid test epoch");
+    StateFence::new(epoch, ResourceGeneration::genesis())
 }
 fn operation() -> FailureOperation {
     FailureOperation {

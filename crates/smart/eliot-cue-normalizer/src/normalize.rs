@@ -3,8 +3,8 @@
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_cue_contracts::{
     CONTRACT_REVISION, CanonicalCueId, CanonicalCueIdentity, ComparisonForm, ComparisonKey,
-    ComparisonKeyId, CueKind, Digest, MatchMode, NormalizationOutcome, NormalizationProfile,
-    NormalizedCue, ObservedCue, TransformationStep,
+    ComparisonKeyId, CueComparisonKey, CueKind, CueSourceValue, Digest, MatchMode,
+    NormalizationOutcome, NormalizationProfile, NormalizedCue, ObservedCue, TransformationStep,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -119,6 +119,57 @@ impl NormalizationEnvelope {
         bounds::output_bytes(self)?;
         Ok(())
     }
+}
+
+/// Builds the lossless v2 source value for one observed cue under one policy.
+///
+/// The canonical spelling is the observed spelling verbatim: comparison policy
+/// may fold keys, but it never rewrites this record. Both references are
+/// stable `identity:revision` citations, never comparison material.
+pub(crate) fn source_value_for(
+    observed: &ObservedCue,
+    policy: &NormalizationPolicy,
+) -> Result<CueSourceValue, NormalizationError> {
+    observed.validate().map_err(NormalizationError::Contract)?;
+    policy.validate()?;
+    let value = CueSourceValue::new(
+        observed.original_value.clone(),
+        format!(
+            "{}:{}",
+            observed.source.target.as_str(),
+            observed.source.digest.as_str()
+        ),
+        format!("{}:{}", policy.policy_id, policy.policy_revision),
+    );
+    value.validate().map_err(NormalizationError::Contract)?;
+    Ok(value)
+}
+
+/// Builds the explicit v2 comparison key for one normalized cue.
+///
+/// Scope comes from the observation context; kind, mode, and normalized value
+/// come from the first comparison key. Keyless outcomes carry no comparison
+/// material and are rejected instead of defaulting to source spelling.
+pub(crate) fn comparison_key_for(
+    normalized: &NormalizedCue,
+) -> Result<CueComparisonKey, NormalizationError> {
+    normalized
+        .validate()
+        .map_err(NormalizationError::Contract)?;
+    let first = normalized
+        .comparison_keys
+        .first()
+        .ok_or(NormalizationError::InvalidField {
+            field: "comparison_keys",
+        })?;
+    let key = CueComparisonKey::new(
+        normalized.observed.context.scope_id.as_str().to_owned(),
+        normalized.observed.kind,
+        first.match_mode,
+        first.key_value.clone(),
+    );
+    key.validate().map_err(NormalizationError::Contract)?;
+    Ok(key)
 }
 
 /// Executes the common normalization implementation.

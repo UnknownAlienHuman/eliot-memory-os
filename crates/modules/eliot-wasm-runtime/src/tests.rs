@@ -15,6 +15,12 @@ use eliot_runtime_contracts::{ModuleGeneration, RuntimeLease};
 use eliot_security_contracts::{PrivacyClass, SourceAssurance};
 use serde_json::json;
 
+use crate::replacement::{
+    CallCompletion, CallDisposition, CallOutcome, CallTerminal, CandidateDescriptor, DrainSnapshot,
+    GenerationParams, GenerationRecord, LifecycleEventKind, LifecycleLogEntry,
+    MAX_DRAIN_DEADLINE_MS, PrepareRequest, RehydratedState, ReplacementError, RollbackRequest,
+    StateMigration, SwitchRequest,
+};
 use crate::*;
 
 fn must<T, E: std::fmt::Debug>(result: Result<T, E>) -> T {
@@ -83,7 +89,7 @@ fn module_generation() -> ModuleGeneration {
             "integrity": "HEALTHY", "capacity": "HEALTHY"
         },
         "state_fence": {
-            "authority_epoch": 1, "resource_generation": 1,
+            "authority_epoch": {"lineage_id": "550e8400-e29b-41d4-a716-446655440000", "sequence": 1}, "resource_generation": 1,
             "task_revision": 1, "policy_revision": 1,
             "integration_revision": null
         }
@@ -99,9 +105,9 @@ fn work_scope() -> ObservationScope {
 
 fn lease() -> RuntimeLease {
     must(serde_json::from_value(json!({
-        "lease_id": "lease-1", "scope_ref": "scope-1", "authority_epoch": 1,
+        "lease_id": "lease-1", "scope_ref": "scope-1", "authority_epoch": {"lineage_id": "550e8400-e29b-41d4-a716-446655440000", "sequence": 1},
         "state_fence": {
-            "authority_epoch": 1, "resource_generation": 1,
+            "authority_epoch": {"lineage_id": "550e8400-e29b-41d4-a716-446655440000", "sequence": 1}, "resource_generation": 1,
             "task_revision": 1, "policy_revision": 1,
             "integration_revision": null
         },
@@ -119,7 +125,7 @@ fn source_assurance() -> SourceAssurance {
         "allowed_effects": ["NO_EXTERNAL_EFFECT"],
         "required_verifier": "verifier:a12", "quarantine": "NONE",
         "state_fence": {
-            "authority_epoch": 1, "resource_generation": 1,
+            "authority_epoch": {"lineage_id": "550e8400-e29b-41d4-a716-446655440000", "sequence": 1}, "resource_generation": 1,
             "task_revision": 1, "policy_revision": 1,
             "integration_revision": null
         }
@@ -461,7 +467,7 @@ impl P03ProcessPort for ProcessMock {
                         envelope.invocation_id.as_str()
                     ))),
                     must(FencingToken::new(
-                        envelope.lease.state_fence.authority_epoch.value(),
+                        envelope.lease.state_fence.authority_epoch.clone(),
                         generation,
                         format!("fence-{}", envelope.invocation_id.as_str()),
                     )),
@@ -503,7 +509,7 @@ impl P03ProcessPort for ProcessMock {
         let context = DispatchValidationContext::new(
             clock,
             request.fence().clone(),
-            request.fence().authority_epoch(),
+            request.fence().authority_epoch().clone(),
             process_revision_heads(),
             1,
         )
@@ -622,8 +628,10 @@ impl P03ReceiptVerifierPort for ReceiptVerifierMock {
             || receipt.operation_id() != binding.operation_id()
             || receipt.request_digest() != binding.request_digest()
             || !receipt.binding().state_fence().matches(binding.fence())
-            || binding.fence().authority_epoch()
-                != envelope.lease.state_fence.authority_epoch.value()
+            || !binding
+                .fence()
+                .authority_epoch()
+                .is_same_authority(&envelope.lease.state_fence.authority_epoch)
         {
             Err(PortError::Denied)
         } else {
@@ -642,8 +650,10 @@ impl P03ReceiptVerifierPort for ReceiptVerifierMock {
             && receipt_binding.process_tree_id() == binding.process_tree_id()
             && receipt_binding.request_digest() == binding.request_digest()
             && receipt_binding.state_fence().matches(binding.fence())
-            && binding.fence().authority_epoch()
-                == envelope.lease.state_fence.authority_epoch.value();
+            && binding
+                .fence()
+                .authority_epoch()
+                .is_same_authority(&envelope.lease.state_fence.authority_epoch);
         if self.config.cancel_receipt_mismatch || self.config.reject_cancel_receipt || !exact {
             Err(PortError::Denied)
         } else {
@@ -662,8 +672,10 @@ impl P03ReceiptVerifierPort for ReceiptVerifierMock {
             && evidence_binding.process_tree_id() == binding.process_tree_id()
             && evidence_binding.request_digest() == binding.request_digest()
             && evidence_binding.state_fence().matches(binding.fence())
-            && binding.fence().authority_epoch()
-                == envelope.lease.state_fence.authority_epoch.value();
+            && binding
+                .fence()
+                .authority_epoch()
+                .is_same_authority(&envelope.lease.state_fence.authority_epoch);
         if self.config.reject_reconcile_evidence || !exact {
             Err(PortError::Denied)
         } else {
@@ -1382,4 +1394,394 @@ fn caller_cancellation_is_checked_before_any_port_effect() {
     );
     assert_eq!(lock_state(&state).process_start_calls, 0);
     assert_eq!(lock_state(&state).engine_calls, 0);
+}
+
+fn replacement_generation(number: u64, artifact: &Sha256Digest) -> ModuleGeneration {
+    must(serde_json::from_value(json!({
+        "module_id": "component-1",
+        "generation": number,
+        "artifact_id": artifact.as_str(),
+        "state": "READY",
+        "health": {
+            "liveness": "HEALTHY", "readiness": "HEALTHY",
+            "freshness": "HEALTHY", "compatibility": "HEALTHY",
+            "integrity": "HEALTHY", "capacity": "HEALTHY"
+        },
+        "state_fence": {
+            "authority_epoch": {"lineage_id": "550e8400-e29b-41d4-a716-446655440000", "sequence": 1}, "resource_generation": 1,
+            "task_revision": 1, "policy_revision": 1,
+            "integration_revision": null
+        }
+    })))
+}
+
+fn replacement_limits(artifact: &Sha256Digest) -> InvocationLimits {
+    let mut envelope = limits();
+    envelope.artifact_access.allowed_digests = [artifact.clone()].into_iter().collect();
+    envelope
+}
+
+fn replacement_record(
+    number: u64,
+    artifact_char: char,
+    predecessor: Option<u64>,
+) -> GenerationRecord {
+    replacement_record_with_extra(number, artifact_char, predecessor, None)
+}
+
+fn replacement_record_with_extra(
+    number: u64,
+    artifact_char: char,
+    predecessor: Option<u64>,
+    extra_artifact: Option<Sha256Digest>,
+) -> GenerationRecord {
+    let artifact = digest(artifact_char);
+    let mut envelope = replacement_limits(&artifact);
+    if let Some(foreign) = extra_artifact {
+        envelope.artifact_access.allowed_digests.insert(foreign);
+    }
+    must(GenerationRecord::new(GenerationParams {
+        generation: replacement_generation(number, &artifact),
+        predecessor,
+        artifact_len: 4096,
+        artifact_digest: artifact.clone(),
+        world: "eliot:test/world".to_owned(),
+        component_version: "0.2.0".to_owned(),
+        abi_digest: digest('b'),
+        kit_digest: digest('0'),
+        engine: binding(),
+        observed_imports: [must(CapabilityId::new("log"))].into_iter().collect(),
+        state_migration: StateMigration::Stateless,
+        scope: "scope-1".to_owned(),
+        limits: envelope,
+    }))
+}
+
+fn replacement_candidate(record: GenerationRecord) -> CandidateDescriptor {
+    CandidateDescriptor {
+        record,
+        probe_input_digest: digest('1'),
+        probe_deadline_ms: 500,
+        max_probe_output_bytes: 1024,
+    }
+}
+
+fn replacement_prepare(
+    operation_id: &str,
+    expected_active: u64,
+    record: GenerationRecord,
+) -> PrepareRequest {
+    PrepareRequest {
+        operation_id: operation_id.to_owned(),
+        expected_active,
+        candidate: replacement_candidate(record),
+    }
+}
+
+struct ScriptedReadiness {
+    pass: bool,
+    calls: usize,
+}
+
+impl crate::replacement::ReadinessOracle for ScriptedReadiness {
+    fn probe(
+        &mut self,
+        candidate: &CandidateDescriptor,
+    ) -> Result<crate::replacement::ReadinessEvidence, ReplacementError> {
+        self.calls += 1;
+        Ok(crate::replacement::ReadinessEvidence {
+            generation: candidate.record.generation_number(),
+            probe_output_digest: digest('1'),
+            success: self.pass,
+        })
+    }
+}
+
+fn passing_oracle() -> ScriptedReadiness {
+    ScriptedReadiness {
+        pass: true,
+        calls: 0,
+    }
+}
+
+fn failing_oracle() -> ScriptedReadiness {
+    ScriptedReadiness {
+        pass: false,
+        calls: 0,
+    }
+}
+
+fn admitted_runtime() -> WasmRuntime {
+    let facade = WasmRuntime::new(None);
+    must(facade.admit_initial_generation(&replacement_record(1, 'a', None)));
+    facade
+}
+
+fn completed_outcome(call_id: &str, generation: u64) -> CallOutcome {
+    CallOutcome {
+        call_id: call_id.to_owned(),
+        generation,
+        terminal: CallTerminal::Completed,
+    }
+}
+
+// WORK_UNIT_CASE: 760/13
+#[test]
+fn failed_preparation_leaves_old_active() {
+    let facade = admitted_runtime();
+    let mut failing = failing_oracle();
+    assert_eq!(
+        facade.prepare_replacement(
+            &replacement_prepare("op-13", 1, replacement_record(2, 'c', Some(1))),
+            &mut failing,
+        ),
+        Err(ReplacementError::ReadinessFailed)
+    );
+    assert_eq!(failing.calls, 1);
+    assert_eq!(
+        facade.generation_coordinator().active_generation_number(),
+        Some(1)
+    );
+    let mut passing = passing_oracle();
+    let summary = must(facade.prepare_replacement(
+        &replacement_prepare("op-13-retry", 1, replacement_record(2, 'c', Some(1))),
+        &mut passing,
+    ));
+    assert_eq!(summary.candidate_generation, 2);
+    assert_eq!(passing.calls, 1);
+}
+
+// WORK_UNIT_CASE: 760/14
+#[test]
+fn drain_linearization_blocks_old_and_new_acquisition() {
+    let facade = admitted_runtime();
+    let lease = must(facade.generation_coordinator().acquire_call("call-14-a"));
+    assert_eq!(lease.accepted_generation, 1);
+    assert_eq!(lease.disposition, CallDisposition::Accepted);
+    let mut oracle = passing_oracle();
+    must(facade.prepare_replacement(
+        &replacement_prepare("op-14", 1, replacement_record(2, 'c', Some(1))),
+        &mut oracle,
+    ));
+    let snapshot: DrainSnapshot =
+        must(facade.begin_replacement_drain("op-14", MAX_DRAIN_DEADLINE_MS));
+    assert_eq!(snapshot.draining_generation, 1);
+    assert_eq!(snapshot.unresolved, vec!["call-14-a".to_owned()]);
+    assert_eq!(
+        facade.generation_coordinator().acquire_call("call-14-b"),
+        Err(ReplacementError::AdmissionBlockedDraining)
+    );
+    assert_eq!(
+        must(
+            facade
+                .generation_coordinator()
+                .complete_call(&completed_outcome("call-14-a", 1))
+        ),
+        CallCompletion::RecordedTerminal
+    );
+    let status = must(facade.generation_coordinator().drain_status());
+    assert!(status.unresolved.is_empty());
+    assert!(!status.blocked);
+}
+
+// WORK_UNIT_CASE: 760/17
+#[test]
+fn atomic_switch_moves_admission_target() {
+    let facade = admitted_runtime();
+    let mut oracle = passing_oracle();
+    let widening = replacement_record_with_extra(2, 'd', Some(1), Some(digest('e')));
+    assert_eq!(
+        facade.prepare_replacement(&replacement_prepare("op-17-wide", 1, widening), &mut oracle,),
+        Err(ReplacementError::IncompatibleCandidate(
+            "limit-widening".to_owned()
+        ))
+    );
+    assert_eq!(oracle.calls, 0);
+    must(facade.prepare_replacement(
+        &replacement_prepare("op-17", 1, replacement_record(2, 'c', Some(1))),
+        &mut oracle,
+    ));
+    must(facade.begin_replacement_drain("op-17", 1_000));
+    let receipt = must(facade.switch_replacement(&SwitchRequest {
+        operation_id: "op-17".to_owned(),
+        expected_active: 1,
+    }));
+    assert_eq!(receipt.old_generation, 1);
+    assert_eq!(receipt.new_generation, 2);
+    assert_eq!(receipt.inflight_at_switch, 0);
+    assert!(!receipt.durable_published);
+    assert_eq!(
+        facade.generation_coordinator().active_generation_number(),
+        Some(2)
+    );
+    let lease = must(facade.generation_coordinator().acquire_call("call-17-new"));
+    assert_eq!(lease.accepted_generation, 2);
+    must(facade.generation_coordinator().verify_call_invariants());
+    must(
+        facade
+            .generation_coordinator()
+            .verify_switch_uniqueness("op-17"),
+    );
+    let published = must(
+        facade
+            .generation_coordinator()
+            .note_external_publication(receipt.sequence, digest('f')),
+    );
+    assert!(published.durable_published);
+    assert_eq!(published.external_evidence, Some(digest('f')));
+}
+
+// WORK_UNIT_CASE: 760/19
+#[test]
+fn stale_expected_generation_leaves_state_unchanged() {
+    let facade = admitted_runtime();
+    let mut oracle = passing_oracle();
+    assert_eq!(
+        facade.prepare_replacement(
+            &replacement_prepare("op-19", 9, replacement_record(2, 'c', Some(1))),
+            &mut oracle,
+        ),
+        Err(ReplacementError::StaleExpectedGeneration)
+    );
+    assert_eq!(oracle.calls, 0);
+    assert_eq!(
+        facade.generation_coordinator().active_generation_number(),
+        Some(1)
+    );
+    let summary = must(facade.prepare_replacement(
+        &replacement_prepare("op-19-retry", 1, replacement_record(2, 'c', Some(1))),
+        &mut oracle,
+    ));
+    assert_eq!(summary.candidate_generation, 2);
+}
+
+// WORK_UNIT_CASE: 760/22
+#[test]
+fn safe_rollback_before_new_call_admission() {
+    let facade = admitted_runtime();
+    let mut oracle = passing_oracle();
+    must(facade.prepare_replacement(
+        &replacement_prepare("op-22-fwd", 1, replacement_record(2, 'c', Some(1))),
+        &mut oracle,
+    ));
+    must(facade.begin_replacement_drain("op-22-fwd", 1_000));
+    let switched = must(facade.switch_replacement(&SwitchRequest {
+        operation_id: "op-22-fwd".to_owned(),
+        expected_active: 1,
+    }));
+    must(
+        facade
+            .generation_coordinator()
+            .note_external_publication(switched.sequence, digest('f')),
+    );
+    let armed = must(facade.arm_replacement_rollback(&RollbackRequest {
+        operation_id: "op-22-back".to_owned(),
+        expected_current: 2,
+        target_generation: 1,
+        target_artifact: digest('a'),
+    }));
+    assert_eq!(armed.current_generation, 2);
+    assert_eq!(armed.target_generation, 1);
+    must(facade.begin_replacement_drain("op-22-back", 1_000));
+    let rolled_back = must(facade.complete_replacement_rollback("op-22-back", 2));
+    assert_eq!(rolled_back.from_generation, 2);
+    assert_eq!(rolled_back.restored_generation, 1);
+    assert_eq!(rolled_back.restored_artifact, digest('a'));
+    assert_eq!(
+        facade.generation_coordinator().active_generation_number(),
+        Some(1)
+    );
+}
+
+// WORK_UNIT_CASE: 760/29
+#[test]
+fn rehydrate_derives_active_no_active_unknown() {
+    use crate::replacement::GenerationCoordinator;
+    assert_eq!(
+        must(GenerationCoordinator::rehydrate_replacement(&[])),
+        RehydratedState::NoActive
+    );
+    let active = must(GenerationCoordinator::rehydrate_replacement(&[
+        LifecycleLogEntry {
+            sequence: 2,
+            generation: 2,
+            previous_active: Some(1),
+            artifact: digest('c'),
+            kind: LifecycleEventKind::Switched,
+        },
+        LifecycleLogEntry {
+            sequence: 1,
+            generation: 1,
+            previous_active: None,
+            artifact: digest('a'),
+            kind: LifecycleEventKind::Switched,
+        },
+        LifecycleLogEntry {
+            sequence: 2,
+            generation: 2,
+            previous_active: Some(1),
+            artifact: digest('c'),
+            kind: LifecycleEventKind::Switched,
+        },
+        LifecycleLogEntry {
+            sequence: 3,
+            generation: 2,
+            previous_active: None,
+            artifact: digest('c'),
+            kind: LifecycleEventKind::ExternallyPublished,
+        },
+    ]));
+    assert_eq!(
+        active,
+        RehydratedState::Active {
+            generation: 2,
+            artifact: digest('c'),
+        }
+    );
+    let gapped = must(GenerationCoordinator::rehydrate_replacement(&[
+        LifecycleLogEntry {
+            sequence: 1,
+            generation: 1,
+            previous_active: None,
+            artifact: digest('a'),
+            kind: LifecycleEventKind::Switched,
+        },
+        LifecycleLogEntry {
+            sequence: 3,
+            generation: 2,
+            previous_active: Some(1),
+            artifact: digest('c'),
+            kind: LifecycleEventKind::Switched,
+        },
+    ]));
+    assert_eq!(gapped, RehydratedState::Unknown);
+    assert_eq!(
+        GenerationCoordinator::rehydrate_replacement(&[LifecycleLogEntry {
+            sequence: 1,
+            generation: 9,
+            previous_active: None,
+            artifact: digest('e'),
+            kind: LifecycleEventKind::ExternallyPublished,
+        }]),
+        Err(ReplacementError::FabricatedDurability)
+    );
+    assert_eq!(
+        GenerationCoordinator::rehydrate_replacement(&[
+            LifecycleLogEntry {
+                sequence: 1,
+                generation: 1,
+                previous_active: None,
+                artifact: digest('a'),
+                kind: LifecycleEventKind::Switched,
+            },
+            LifecycleLogEntry {
+                sequence: 1,
+                generation: 2,
+                previous_active: None,
+                artifact: digest('c'),
+                kind: LifecycleEventKind::Switched,
+            },
+        ]),
+        Err(ReplacementError::LogSequenceConflict)
+    );
 }

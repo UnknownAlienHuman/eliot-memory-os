@@ -1,0 +1,11 @@
+{
+  "message_bytes_max": 65536,
+  "inline_text_max": 8192,
+  "references_max": 16,
+  "stream_depth_max": 256,
+  "outstanding_per_sender_max": 64,
+  "outstanding_per_recipient_max": 64,
+  "board_entries_per_scope_max": 128,
+  "board_revisions_max": 32,
+  "page_max": 50
+}

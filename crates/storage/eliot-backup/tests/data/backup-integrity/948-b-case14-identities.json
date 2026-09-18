@@ -1,0 +1,1 @@
+{"load_bearing":["purge_ledger_revision","artifacts.config","artifacts.policy","artifacts.module","artifacts.host_dependency_build","integrity_sha256"],"note":"Worker B fixture: load-bearing identities. Purge/integrity/config/policy/module/approved-build digests and the purge ledger revision gate FullRecovery; none is defaultable."}
