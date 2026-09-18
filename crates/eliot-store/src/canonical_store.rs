@@ -1487,11 +1487,12 @@ impl CanonicalStore {
                 .await?;
         }
         let now = surreal_datetime_binding(OffsetDateTime::now_utc(), "canonical outbox time")?;
+        let envelope_value = envelope_with_text_fragments(envelope)?;
         let value = self
             .execute_value(
                 NamedSurqlOp::ApplyWriteEnvelope,
                 json!({
-                    "envelope": envelope,
+                    "envelope": envelope_value,
                     "canonical_payloads": canonical_payloads,
                     "relation_payloads": relation_payloads,
                     "memory_grant_ref_schema_version": eliot_types::ACTION_MEMORY_GRANT_REF_SCHEMA_VERSION,
@@ -4407,6 +4408,46 @@ fn string_fragments(value: &str) -> Vec<String> {
         .chars()
         .map(|character| character.to_string())
         .collect()
+}
+
+/// Attaches `<field>_fragments` char arrays next to free-text `String` fields
+/// in the envelope vars (issue #10). `SurrealDB` record-coerces bare
+/// record-shaped strings at RPC var materialization, before any query
+/// executes, so no query-side cast can recover them; the templates rejoin the
+/// fragments with ``array::join(..., '')``, the same mechanism already used for
+/// reference/handle fields. Arbitrary JSON `payload` values are out of scope:
+/// only record-shaped string leaves are affected there and they need a
+/// recursive encoding designed separately.
+pub(crate) fn envelope_with_text_fragments(
+    envelope: &MemoryWriteEnvelope,
+) -> Result<Value, StoreError> {
+    const TEXT_FIELDS: &[(&str, &[&str])] = &[
+        ("task_contracts", &["title"]),
+        ("source_snapshots", &["uri", "excerpt"]),
+        ("evidence_atoms", &["summary"]),
+        ("tool_observations", &["tool_name", "observation"]),
+        ("claims", &["statement"]),
+        ("verification_runs", &["verifier", "summary"]),
+        ("failures", &["summary"]),
+    ];
+    let mut value =
+        serde_json::to_value(envelope).map_err(|error| StoreError::Decode(error.to_string()))?;
+    for (collection, fields) in TEXT_FIELDS {
+        let Some(items) = value.get_mut(collection).and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for item in items.iter_mut() {
+            let Value::Object(map) = item else {
+                continue;
+            };
+            for field in *fields {
+                if let Some(text) = map.get(*field).and_then(Value::as_str) {
+                    map.insert(format!("{field}_fragments"), json!(string_fragments(text)));
+                }
+            }
+        }
+    }
+    Ok(value)
 }
 
 fn is_retryable_schema_conflict(error: &StoreError) -> bool {

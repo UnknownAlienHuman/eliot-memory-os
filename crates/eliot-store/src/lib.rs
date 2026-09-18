@@ -15,6 +15,8 @@ mod db_client_metrics;
 pub mod db_client_set;
 pub mod error;
 pub mod migration;
+#[cfg(test)]
+mod payload_byte_preservation;
 pub mod surql;
 mod surql_templates;
 mod surreal_rpc;
