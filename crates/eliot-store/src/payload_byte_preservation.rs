@@ -51,39 +51,70 @@
 //! encoding above, the governed L2/evidence read path, export/import
 //! round-trips, the remaining write templates listed above, and the
 //! historical-data inventory/replay disposition from #10 items 3-7.
+//!
+//! Enforced test configurations (feature `live-edge` on `eliot-store`):
+//! 1. default `cargo test -p eliot-store` — the three live tests
+//!    (`bound_var_safe_strings_survive_verbatim`,
+//!    `fragment_encoding_round_trips_record_shaped_strings`,
+//!    `canonical_envelope_free_text_survives_round_trip`) plus their
+//!    live-only helpers are not compiled; the suite stays green without a
+//!    backend.
+//! 2. live proof `cargo test -p eliot-store --features live-edge` with
+//!    `ELIOT_SURREAL_LIVE_EDGE=1`, `ELIOT_SURREAL_EXE` (surreal.exe 3.1.4),
+//!    `ELIOT_DISABLE_REAL_PROVIDER=1`, and
+//!    `ELIOT_TEST_SURREAL_PASSWORD_FILE` — backend absence or misconfig
+//!    MUST fail via the existing fail-gates (`require_live_edge` /
+//!    `canon_config`); silent skips and `#[ignore]` are forbidden.
 
 use crate::canonical_store::envelope_with_text_fragments;
+#[cfg(all(test, feature = "live-edge"))]
 use crate::{CanonicalClaimCard, CanonicalStore, CanonicalToolObservation, DbClientSet};
 use eliot_types::{
     AgentId, ClaimCardInput, ClaimId, EpistemicStatus, EvidenceAtomInput, EvidenceId,
-    FailureFingerprintInput, FetchAtomsL2Request, GovernorConfig, IdempotencyOptions,
-    LifecycleStatus, LifecycleWriteOptions, MemoryWriteEnvelope, OperationId, ProjectId,
-    ProjectSequence, ReadConsistencyMode, SemanticCommandKind, SourceSnapshotInput, TaintClass,
-    TaskContractInput, TaskContractStatus, TaskId, ToolObservationInput, VerificationId,
-    VerificationResult, VerificationRunInput, Visibility, WriteId,
+    FailureFingerprintInput, IdempotencyOptions, LifecycleStatus, LifecycleWriteOptions,
+    MemoryWriteEnvelope, OperationId, ProjectId, SemanticCommandKind, SourceSnapshotInput,
+    TaintClass, TaskContractInput, TaskContractStatus, TaskId, ToolObservationInput,
+    VerificationId, VerificationResult, VerificationRunInput, Visibility, WriteId,
 };
+#[cfg(all(test, feature = "live-edge"))]
+use eliot_types::{FetchAtomsL2Request, GovernorConfig, ProjectSequence, ReadConsistencyMode};
+#[cfg(all(test, feature = "live-edge"))]
 use secrecy::SecretString;
-use serde_json::{Map, Value, json};
+#[cfg(all(test, feature = "live-edge"))]
+use serde_json::Map;
+use serde_json::{Value, json};
 use std::error::Error;
+#[cfg(all(test, feature = "live-edge"))]
 use std::path::PathBuf;
+#[cfg(all(test, feature = "live-edge"))]
 use std::sync::Arc;
+#[cfg(all(test, feature = "live-edge"))]
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
+#[cfg(all(test, feature = "live-edge"))]
 use tokio::process::{Child, Command};
+#[cfg(all(test, feature = "live-edge"))]
 use tokio::time::sleep;
+#[cfg(all(test, feature = "live-edge"))]
 use uuid::Uuid;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
+#[cfg(all(test, feature = "live-edge"))]
 const TRANSPORT_BIND_SAFE: &str = "127.0.0.1:18097";
+#[cfg(all(test, feature = "live-edge"))]
 const TRANSPORT_BIND_FRAGMENTS: &str = "127.0.0.1:18095";
+#[cfg(all(test, feature = "live-edge"))]
 const CANON_BIND: &str = "127.0.0.1:18096";
+#[cfg(all(test, feature = "live-edge"))]
 const SCRATCH_NAMESPACE: &str = "eliot_r5_i10";
+#[cfg(all(test, feature = "live-edge"))]
 const SCRATCH_USER: &str = "root";
 
 /// Historical matrix from #10 plus adversarial record-like variants, with
 /// astral-plane and combining-mark adversaries appended (`m25`..`m28`) so the
 /// `m00`..`m24` indices pinned by `safe_suffixes` stay stable.
+#[cfg(all(test, feature = "live-edge"))]
 fn matrix() -> Vec<(String, Value)> {
     let mut cases: Vec<(String, Value)> = [
         "alpha-beta",
@@ -142,6 +173,7 @@ fn matrix() -> Vec<(String, Value)> {
 /// Matrix entries that survive the vendor boundary verbatim as bare strings
 /// (no record-shaped truncation observed): the passing subset pins the safe
 /// boundary our unprotected bindings must stay inside.
+#[cfg(all(test, feature = "live-edge"))]
 fn safe_suffixes() -> Vec<&'static str> {
     vec![
         "m00", "m01", "m06", "m07", "m09", "m10", "m12", "m14", "m15", "m16", "m17", "m18", "m21",
@@ -151,6 +183,7 @@ fn safe_suffixes() -> Vec<&'static str> {
 
 /// Entries the vendor boundary truncates as bare strings are pinned by the
 /// fragment round-trip test below, which covers the whole matrix.
+#[cfg(all(test, feature = "live-edge"))]
 fn require_live_edge() -> TestResult<String> {
     if std::env::var("ELIOT_SURREAL_LIVE_EDGE").as_deref() != Ok("1") {
         return Err("set ELIOT_SURREAL_LIVE_EDGE=1 to run this live store-edge proof".into());
@@ -161,17 +194,20 @@ fn require_live_edge() -> TestResult<String> {
 
 /// Owns a scratch `surreal.exe` child and its rocksdb directory. Killing on
 /// drop keeps a failed run from orphaning a server holding the temp data root.
+#[cfg(all(test, feature = "live-edge"))]
 struct ScratchServer {
     child: Option<Child>,
     storage_dir: PathBuf,
 }
 
+#[cfg(all(test, feature = "live-edge"))]
 impl ScratchServer {
     fn disarm(&mut self) {
         self.child.take();
     }
 }
 
+#[cfg(all(test, feature = "live-edge"))]
 impl Drop for ScratchServer {
     fn drop(&mut self) {
         if let Some(child) = self.child.as_mut() {
@@ -181,6 +217,7 @@ impl Drop for ScratchServer {
     }
 }
 
+#[cfg(all(test, feature = "live-edge"))]
 fn spawn_scratch(exe: &str, bind: &str, test_tag: &str) -> TestResult<(ScratchServer, String)> {
     let run_id = Uuid::new_v4().as_simple().to_string();
     let storage_dir = std::env::temp_dir().join(format!("eliot-{test_tag}-{run_id}"));
@@ -227,6 +264,7 @@ fn spawn_scratch(exe: &str, bind: &str, test_tag: &str) -> TestResult<(ScratchSe
     ))
 }
 
+#[cfg(all(test, feature = "live-edge"))]
 fn first_ok_result(raw: &Value) -> TestResult<&Value> {
     let responses = raw.as_array().ok_or("query response was not an array")?;
     let first = responses.first().ok_or("query response array was empty")?;
@@ -480,6 +518,7 @@ fn envelope_text_fragments_empty_fields_attach_empty_arrays() -> TestResult {
     Ok(())
 }
 
+#[cfg(all(test, feature = "live-edge"))]
 async fn transport(
     bind: &str,
 ) -> TestResult<(ScratchServer, crate::surreal_rpc::SurrealRpcTransport)> {
@@ -513,6 +552,7 @@ async fn transport(
     Ok((scratch, transport))
 }
 
+#[cfg(all(test, feature = "live-edge"))]
 async fn stop_scratch(scratch: &mut ScratchServer) {
     if let Some(child) = scratch.child.as_mut() {
         let _ = child.kill().await;
@@ -524,6 +564,9 @@ async fn stop_scratch(scratch: &mut ScratchServer) {
 // Live edge (NOT ignored): requires ELIOT_SURREAL_LIVE_EDGE=1 and
 // ELIOT_SURREAL_EXE pointing at surreal.exe. Missing prerequisites fail
 // explicitly via require_live_edge — this test never skips silently.
+// Gated behind `live-edge`: default `cargo test -p eliot-store` does not
+// compile this test; `--features live-edge` executes it against the backend.
+#[cfg(all(test, feature = "live-edge"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bound_var_safe_strings_survive_verbatim() -> TestResult {
     let (mut scratch, transport) = transport(TRANSPORT_BIND_SAFE).await?;
@@ -616,6 +659,9 @@ async fn bound_var_safe_strings_survive_verbatim() -> TestResult {
 // Live edge (NOT ignored): requires ELIOT_SURREAL_LIVE_EDGE=1 and
 // ELIOT_SURREAL_EXE pointing at surreal.exe. Missing prerequisites fail
 // explicitly via require_live_edge — this test never skips silently.
+// Gated behind `live-edge`: default `cargo test -p eliot-store` does not
+// compile this test; `--features live-edge` executes it against the backend.
+#[cfg(all(test, feature = "live-edge"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fragment_encoding_round_trips_record_shaped_strings() -> TestResult {
     let (mut scratch, transport) = transport(TRANSPORT_BIND_FRAGMENTS).await?;
@@ -665,6 +711,7 @@ async fn fragment_encoding_round_trips_record_shaped_strings() -> TestResult {
     outcome
 }
 
+#[cfg(all(test, feature = "live-edge"))]
 fn canon_config() -> TestResult<eliot_types::SurrealServerConfig> {
     if std::env::var("ELIOT_DISABLE_REAL_PROVIDER").as_deref() != Ok("1") {
         return Err(
@@ -697,6 +744,9 @@ fn canon_config() -> TestResult<eliot_types::SurrealServerConfig> {
 // ELIOT_SURREAL_EXE, ELIOT_DISABLE_REAL_PROVIDER=1 and
 // ELIOT_TEST_SURREAL_PASSWORD_FILE. Missing prerequisites fail explicitly
 // via canon_config — this test never skips silently.
+// Gated behind `live-edge`: default `cargo test -p eliot-store` does not
+// compile this test; `--features live-edge` executes it against the backend.
+#[cfg(all(test, feature = "live-edge"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn canonical_envelope_free_text_survives_round_trip() -> TestResult {
     let config = canon_config()?;
@@ -713,6 +763,7 @@ async fn canonical_envelope_free_text_survives_round_trip() -> TestResult {
 
 /// Record keys minted per canonical case envelope so packed envelopes never
 /// collide on record identity.
+#[cfg(all(test, feature = "live-edge"))]
 struct CanonCaseIds {
     task_id: TaskId,
     source_id: String,
@@ -727,6 +778,7 @@ struct CanonCaseIds {
 /// values in fixed order: title, source uri, source excerpt, evidence
 /// summary, tool name, observation, claim statement, verifier, verification
 /// summary, failure summary.
+#[cfg(all(test, feature = "live-edge"))]
 fn canon_case_envelope(
     project_id: ProjectId,
     write_id: WriteId,
@@ -825,6 +877,7 @@ fn canon_case_envelope(
 /// test can assert exact `source_snapshot` readback (`uri`, `excerpt`) — the
 /// one covered field pair with no governed by-id reader. The password comes
 /// from the same test password file the supervisor provisions.
+#[cfg(all(test, feature = "live-edge"))]
 async fn connect_canon_direct(
     config: &eliot_types::SurrealServerConfig,
 ) -> TestResult<crate::surreal_rpc::SurrealRpcTransport> {
@@ -849,6 +902,7 @@ async fn connect_canon_direct(
 
 /// Reads the test password from the `%LOCALAPPDATA%`-anchored file named by
 /// `ELIOT_TEST_SURREAL_PASSWORD_FILE`.
+#[cfg(all(test, feature = "live-edge"))]
 fn read_canon_test_password(configured: &str) -> TestResult<String> {
     let suffix = configured
         .strip_prefix("%LOCALAPPDATA%/")
@@ -873,6 +927,7 @@ fn read_canon_test_password(configured: &str) -> TestResult<String> {
 /// carries its matrix id, so a pre-fix truncation fails loudly. Reverting the
 /// fragment hunk to bare `$task.title`-style bindings makes this test fail
 /// with the historical truncation signature.
+#[cfg(all(test, feature = "live-edge"))]
 #[allow(clippy::too_many_lines)]
 async fn run_canon_cases(
     store: &CanonicalStore,
