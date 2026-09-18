@@ -2044,6 +2044,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-learning-activation-assessment"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-evidence",
+ "eliot-learning-contracts",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "eliot-learning-contracts"
 version = "0.1.0"
 dependencies = [
@@ -2055,6 +2068,40 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "eliot-learning-delta"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-evidence",
+ "eliot-instrument-api",
+ "eliot-learning-contracts",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "eliot-learning-overlay"
+version = "0.1.0"
+dependencies = [
+ "eliot-agent-contracts",
+ "eliot-contracts",
+ "eliot-evidence",
+ "eliot-learning-contracts",
+ "thiserror",
+]
+
+[[package]]
+name = "eliot-learning-state-view"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-evidence",
+ "eliot-learning-contracts",
 ]
 
 [[package]]
@@ -2567,6 +2614,17 @@ dependencies = [
  "eliot-evidence",
  "eliot-receipts",
  "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "eliot-self-quality"
+version = "0.1.0"
+dependencies = [
+ "eliot-conformance-contracts",
+ "eliot-contracts",
  "serde",
  "serde_json",
  "thiserror",
