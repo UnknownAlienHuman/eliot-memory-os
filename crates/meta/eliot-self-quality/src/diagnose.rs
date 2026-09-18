@@ -511,16 +511,15 @@ fn candidate_instrumentation_handoffs(
             continue;
         }
         let tag = format!("{:?}", rollup.dimension);
-        let observations = dimension_refs(input, rollup.dimension, None);
-        let missing = dimension_refs(
-            input,
-            rollup.dimension,
-            if rollup.status == DimensionStatus::Missing {
-                Some(DimensionStatus::Missing)
-            } else {
-                Some(DimensionStatus::Inconclusive)
-            },
-        );
+        let evidence_gap_refs = match rollup.status {
+            DimensionStatus::Missing => {
+                dimension_refs(input, rollup.dimension, Some(DimensionStatus::Missing))
+            }
+            DimensionStatus::Inconclusive => {
+                dimension_refs(input, rollup.dimension, Some(DimensionStatus::Inconclusive))
+            }
+            _ => continue,
+        };
         let priority = if rollup.priority == Priority::None {
             Priority::Low
         } else {
@@ -529,10 +528,10 @@ fn candidate_instrumentation_handoffs(
         handoffs.push(make_handoff(
             &format!("handoff-{}-{index}", tag.to_ascii_lowercase()),
             SelfQualityHandoffOwner::Instrumentation,
-            &observations,
+            &evidence_gap_refs,
             &[format!("problem:{tag}")],
-            &observations,
-            &missing,
+            &evidence_gap_refs,
+            &evidence_gap_refs,
             &[format!("applies:{tag}")],
             priority,
             &["ceiling:privacy-authority-proof".to_owned()],

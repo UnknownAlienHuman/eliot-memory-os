@@ -506,12 +506,27 @@ fn no_scalar_hides_the_worst_dimension() {
         "environment:prod",
     );
     let perf_obs = SelfQualityObservation::PerformanceResources(perf_core);
-    let prod_core = make_core(
+    let prod_pass_core = make_core(
         "obs:004:v1",
+        SelfQualityDimension::ProductOutcome,
+        DimensionStatus::Pass,
+        make_metric(
+            "metric:product-pass:v1",
+            "unit:count",
+            1.0,
+            MetricPresence::Value,
+        ),
+        "product-pass",
+        "environment:prod",
+    );
+    let prod_pass_ref = prod_pass_core.observation_ref.clone();
+    let prod_pass_obs = SelfQualityObservation::Product(prod_pass_core);
+    let prod_missing_core = make_core(
+        "obs:005:v1",
         SelfQualityDimension::ProductOutcome,
         DimensionStatus::Missing,
         make_metric(
-            "metric:product:v1",
+            "metric:product-missing:v1",
             "unit:count",
             0.0,
             MetricPresence::Unavailable,
@@ -519,9 +534,18 @@ fn no_scalar_hides_the_worst_dimension() {
         "product-missing",
         "environment:prod",
     );
-    let prod_ref = prod_core.observation_ref.clone();
-    let prod_obs = SelfQualityObservation::Product(prod_core);
-    let input = make_input(vec![conform_obs, cost_obs, perf_obs, prod_obs], Vec::new());
+    let prod_missing_ref = prod_missing_core.observation_ref.clone();
+    let prod_missing_obs = SelfQualityObservation::Product(prod_missing_core);
+    let input = make_input(
+        vec![
+            conform_obs,
+            cost_obs,
+            perf_obs,
+            prod_pass_obs,
+            prod_missing_obs,
+        ],
+        Vec::new(),
+    );
     let outcome = diagnose_self_quality(&input).expect("valid scalar-check input");
     match outcome {
         SelfQualityOutcome::Candidate(candidate) => {
@@ -530,7 +554,7 @@ fn no_scalar_hides_the_worst_dimension() {
                 eliot_self_quality::Severity::High
             );
             // Verify that the missing dimension is preserved alongside failure and
-            // routes to an inert instrumentation handoff with its missing evidence refs.
+            // routes to an inert instrumentation handoff scoped strictly to the missing evidence.
             let missing_outcome = candidate
                 .outcomes
                 .iter()
@@ -544,8 +568,22 @@ fn no_scalar_hides_the_worst_dimension() {
                 .find(|h| h.owner == SelfQualityHandoffOwner::Instrumentation)
                 .expect("missing dimension must produce an instrumentation handoff");
             assert!(
-                instr_handoff.missing_evidence_refs.contains(&prod_ref),
+                instr_handoff
+                    .missing_evidence_refs
+                    .contains(&prod_missing_ref),
                 "instrumentation handoff must reference the missing observation"
+            );
+            assert!(
+                !instr_handoff.missing_evidence_refs.contains(&prod_pass_ref),
+                "instrumentation handoff must not leak passing observation into missing refs"
+            );
+            assert!(
+                !instr_handoff.evidence_refs.contains(&prod_pass_ref),
+                "instrumentation handoff must not leak passing observation into evidence refs"
+            );
+            assert!(
+                !instr_handoff.symptom_refs.contains(&prod_pass_ref),
+                "instrumentation handoff must not leak passing observation into symptom refs"
             );
 
             let value = serde_json::to_value(&candidate).expect("candidate serializes");
