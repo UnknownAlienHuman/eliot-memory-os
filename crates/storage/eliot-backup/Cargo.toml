@@ -21,6 +21,7 @@ blake3.workspace = true
 
 [dev-dependencies]
 eliot-store-memory = { path = "../eliot-store-memory" }
+toml.workspace = true
 
 [lints]
 workspace = true

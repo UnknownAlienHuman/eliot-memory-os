@@ -37,29 +37,46 @@ fn workspace_root() -> Result<PathBuf, Box<dyn Error>> {
     }
 }
 
-fn production_dependency_lines(manifest: &std::path::Path) -> Result<Vec<String>, Box<dyn Error>> {
-    let text = std::fs::read_to_string(manifest)?;
-    let mut lines = Vec::new();
-    let mut in_dev = false;
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') {
-            in_dev = trimmed == "[dev-dependencies]"
-                || trimmed == "[build-dependencies]"
-                || trimmed.starts_with("[dev-dependencies.")
-                || trimmed.starts_with("[build-dependencies.");
-            continue;
-        }
-        if !(trimmed.starts_with(PACKAGE)
-            || trimmed.starts_with(&format!("\"{PACKAGE}\"")))
-        {
-            continue;
-        }
-        if !in_dev {
-            lines.push(trimmed.to_owned());
+fn production_dependency_selects_package(
+    manifest: &std::path::Path,
+) -> Result<Vec<String>, Box<dyn Error>> {
+    fn scan_table(
+        table: &toml::map::Map<String, toml::Value>,
+        section: &str,
+        matches: &mut Vec<String>,
+    ) {
+        for (name, spec) in table {
+            let package = spec
+                .as_table()
+                .and_then(|spec| spec.get("package"))
+                .and_then(toml::Value::as_str);
+
+            if name == PACKAGE || package == Some(PACKAGE) {
+                matches.push(format!("{section}.{name}"));
+            }
         }
     }
-    Ok(lines)
+
+    let text = std::fs::read_to_string(manifest)?;
+    let value: toml::Value = toml::from_str(&text)?;
+    let mut matches = Vec::new();
+
+    if let Some(table) = value.get("dependencies").and_then(toml::Value::as_table) {
+        scan_table(table, "dependencies", &mut matches);
+    }
+
+    if let Some(targets) = value.get("target").and_then(toml::Value::as_table) {
+        for (target, target_value) in targets {
+            if let Some(table) = target_value
+                .get("dependencies")
+                .and_then(toml::Value::as_table)
+            {
+                scan_table(table, &format!("target.{target}.dependencies"), &mut matches);
+            }
+        }
+    }
+
+    Ok(matches)
 }
 
 #[test]
@@ -84,9 +101,9 @@ fn no_production_binary_selects_the_crate() -> TestResult {
         if !manifest.is_file() {
             continue;
         }
-        for line in production_dependency_lines(&manifest)? {
+        for selection in production_dependency_selects_package(&manifest)? {
             offenders.push(format!(
-                "{}: {line}",
+                "{}: {selection}",
                 entry.file_name().to_string_lossy()
             ));
         }

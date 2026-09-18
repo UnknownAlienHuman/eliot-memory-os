@@ -22,6 +22,7 @@ eliot-epistemic-contracts = { path = "../../smart/eliot-epistemic-contracts" }
 eliot-evidence.workspace = true
 eliot-receipts.workspace = true
 eliot-contracts = { workspace = true }
+toml.workspace = true
 
 [lints]
 workspace = true
