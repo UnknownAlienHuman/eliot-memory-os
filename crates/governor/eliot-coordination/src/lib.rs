@@ -48,8 +48,10 @@ pub use work_lease_issuance::{
 };
 
 pub use swarm_plan_attachment::{
-    SWARM_PLAN_ATTACHMENT_REVISION, SwarmPlanAttachmentError, SwarmPlanAttachmentLedger,
-    SwarmPlanAttachmentOwner, SwarmPlanBinding,
+    CasOutcome, DurableAttachError, MAX_DURABLE_ATTACH_ATTEMPTS, SWARM_PLAN_ATTACHMENT_REVISION,
+    SwarmPlanAttachmentError, SwarmPlanAttachmentLedger, SwarmPlanAttachmentOwner,
+    SwarmPlanAttachmentStore, SwarmPlanAttachmentVersion, SwarmPlanBinding,
+    attach_plan_once_durable,
 };
 
 pub const CONTRACT_NAME: &str = "eliot.governor.coordination";

@@ -10,9 +10,22 @@
 //! The owner is deliberately small and dependency-light: it takes only opaque
 //! validated strings (admission digest, plan revision, job handle, fence
 //! digest) and returns an immutable [`SwarmPlanBinding`]. It performs no I/O,
-//! mints no receipts, and launches no processes. Callers persist the returned
-//! binding through the canonical write path; restart recovery rebuilds the
-//! owner from its snapshot via [`SwarmPlanAttachmentOwner::from_snapshot`].
+//! mints no receipts, and launches no processes.
+//!
+//! Durable canon boundary: the in-memory decision alone is not the durable
+//! canon across processes or restarts. [`attach_plan_once_durable`] runs the
+//! same decision through a caller-provided [`SwarmPlanAttachmentStore`] as
+//! load-then-decide-then-versioned-compare-and-swap, and no unbound-to-bound
+//! success escapes before the conditional commit reports
+//! [`CasOutcome::Committed`]. On [`CasOutcome::Contended`] the operation
+//! reloads and retries, returning the canonical winner instead of allowing
+//! two first-bind successes. Restart recovery rebuilds the owner from its
+//! snapshot via [`SwarmPlanAttachmentOwner::from_snapshot`].
+//!
+//! The store trait is a contract only: no production store implementation
+//! lives in this dependency-light crate. Binding the trait to the real
+//! Governor canonical write path (revision-head expectations, surfaced as
+//! store revision/ordering conflicts) is queued remainder.
 //!
 //! Atomicity is structural, not advisory: [`SwarmPlanAttachmentLedger`] holds
 //! the owner behind one [`std::sync::Mutex`] and performs lookup plus insert
@@ -20,6 +33,8 @@
 //! calls for the same plan key cannot both create a binding. The single-writer
 //! [`SwarmPlanAttachmentOwner::attach_plan_once`] takes `&mut self` for the
 //! same reason. There is no check-then-act split across lock boundaries.
+//! Cross-process atomicity comes only from [`attach_plan_once_durable`]
+//! plus the store's conditional commit, never from the ledger alone.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -318,6 +333,159 @@ impl SwarmPlanAttachmentLedger {
     }
 }
 
+/// Monotonic commit token pairing one loaded owner image with the durable
+/// revision it was read at.
+///
+/// The token only orders `load`/`compare_and_swap` pairs for one store; it
+/// carries no wire meaning on its own. The production binding maps it onto
+/// the Governor canonical-write revision-head expectations (whose violation
+/// the store surfaces as revision/ordering conflicts); that binding is queued
+/// remainder, so the token stays a plain counter here.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SwarmPlanAttachmentVersion(u64);
+
+impl SwarmPlanAttachmentVersion {
+    /// Version of an empty (never-committed) owner image.
+    #[must_use]
+    pub const fn initial() -> Self {
+        Self(0)
+    }
+
+    /// Creates a version from a store-assigned counter value.
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Reads the store-assigned counter value.
+    #[must_use]
+    pub const fn value(&self) -> u64 {
+        self.0
+    }
+
+    /// Successor version recorded alongside a committed replacement image.
+    #[must_use]
+    pub const fn next(&self) -> Self {
+        Self(self.0 + 1)
+    }
+}
+
+/// Outcome of one conditional durable commit attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CasOutcome {
+    /// The replacement image was durably committed over the expected version.
+    Committed,
+    /// Another writer committed first; the replacement was NOT stored.
+    Contended,
+}
+
+/// Durable canonical-write boundary for swarm plan attachment state.
+///
+/// Implementations serialize conditional commits across threads, processes,
+/// and restarts: `compare_and_swap` must commit `replacement` if and only if
+/// the canonical image is still `expected`, and report [`CasOutcome::Contended`]
+/// otherwise. No I/O happens in this crate; the trait only names the contract
+/// the production Governor write path must satisfy. There is no production
+/// implementation here: binding to the real Governor write path is queued
+/// remainder.
+pub trait SwarmPlanAttachmentStore {
+    /// Opaque store failure.
+    type Error;
+
+    /// Loads the current canonical owner image with its commit version.
+    fn load(&self) -> Result<(SwarmPlanAttachmentOwner, SwarmPlanAttachmentVersion), Self::Error>;
+
+    /// Commits `replacement` if and only if the canonical image is still
+    /// `expected`.
+    fn compare_and_swap(
+        &self,
+        expected: SwarmPlanAttachmentVersion,
+        replacement: &SwarmPlanAttachmentOwner,
+    ) -> Result<CasOutcome, Self::Error>;
+}
+
+/// Failures of [`attach_plan_once_durable`] beyond the in-process decision.
+///
+/// The store error stays opaque (`Store`) so no provider payload crosses this
+/// dependency-light crate; decision failures (including the canonical
+/// `OwnershipConflict` winner) pass through as `Decision`.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum DurableAttachError<E> {
+    /// The canonical decision itself refused the bind. A conflict carries the
+    /// canonical winner and reflects append-only per-key state, so it is
+    /// final: no commit is attempted.
+    #[error("swarm plan attachment decision failed: {0}")]
+    Decision(#[from] SwarmPlanAttachmentError),
+    /// The durable store failed underneath a load or commit attempt.
+    #[error("swarm plan attachment durable store failed")]
+    Store(E),
+    /// Every attempt contended with another committed writer. The bind was
+    /// NOT committed; retrying the whole operation reloads and observes the
+    /// canonical winner.
+    #[error("swarm plan attachment commit contended after {attempts} attempts")]
+    ContentionExhausted {
+        /// Bounded rounds actually attempted (always [`MAX_DURABLE_ATTACH_ATTEMPTS`]).
+        attempts: u32,
+    },
+}
+
+/// Upper bound on load/decide/commit rounds inside one
+/// [`attach_plan_once_durable`] call.
+///
+/// Termination is structural: every loop iteration either returns or consumes
+/// exactly one attempt on [`CasOutcome::Contended`], so a call performs at
+/// most this many loads and commits and always terminates, even under
+/// perpetual contention.
+pub const MAX_DURABLE_ATTACH_ATTEMPTS: u32 = 8;
+
+/// Attaches one admitted plan revision to one durable job through the
+/// canonical conditional-commit boundary.
+///
+/// Each round loads the durable image, revalidates it with
+/// [`SwarmPlanAttachmentOwner::from_snapshot`] (tampered images fail closed
+/// before any decision or commit), runs the canonical
+/// [`SwarmPlanAttachmentOwner::attach_plan_once`] decision, and commits the
+/// resulting image with [`SwarmPlanAttachmentStore::compare_and_swap`]. An
+/// unbound-to-bound success is returned only after the commit reports
+/// [`CasOutcome::Committed`]; contention reloads and retries, so the loser of
+/// a cross-process first-bind race observes the canonical winner as
+/// `OwnershipConflict` instead of escaping with a second success. Decision
+/// refusals (conflict, invalid input, invalid snapshot) need no commit: the
+/// winner binding for one plan key is append-only and immutable, so a
+/// conflict read from a validated durable image is already final.
+pub fn attach_plan_once_durable<S: SwarmPlanAttachmentStore>(
+    store: &S,
+    admission_digest: &str,
+    plan_revision: &str,
+    job_handle: &str,
+    fence_digest: &str,
+) -> Result<SwarmPlanBinding, DurableAttachError<S::Error>> {
+    let mut attempts = 0u32;
+    loop {
+        let (image, version) = store.load().map_err(DurableAttachError::Store)?;
+        let mut owner =
+            SwarmPlanAttachmentOwner::from_snapshot(image).map_err(DurableAttachError::Decision)?;
+        let binding =
+            match owner.attach_plan_once(admission_digest, plan_revision, job_handle, fence_digest)
+            {
+                Ok(binding) => binding,
+                Err(error) => return Err(DurableAttachError::Decision(error)),
+            };
+        match store
+            .compare_and_swap(version, &owner)
+            .map_err(DurableAttachError::Store)?
+        {
+            CasOutcome::Committed => return Ok(binding),
+            CasOutcome::Contended => {
+                attempts += 1;
+                if attempts >= MAX_DURABLE_ATTACH_ATTEMPTS {
+                    return Err(DurableAttachError::ContentionExhausted { attempts });
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
@@ -501,5 +669,284 @@ mod tests {
         assert_eq!(identical, 4);
         assert_eq!(conflicts, 4);
         assert_eq!(ledger.len(), 1);
+    }
+
+    /// Opaque test-only store failure (never produced by the happy paths).
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct TestStoreError(&'static str);
+
+    /// In-memory test-only [`SwarmPlanAttachmentStore`]: one mutex-guarded
+    /// owner image plus a version counter, with scripted contention and
+    /// failure injection. No production store implementation lives in this
+    /// crate; binding to the real Governor write path is queued remainder.
+    struct TestStore {
+        state: Mutex<TestStoreState>,
+    }
+
+    struct TestStoreState {
+        owner: SwarmPlanAttachmentOwner,
+        version: SwarmPlanAttachmentVersion,
+        load_calls: usize,
+        cas_calls: usize,
+        /// When set, the next CAS first commits this external exact binding
+        /// (modelling a concurrent writer winning the race) and then reports
+        /// `Contended` for our image.
+        inject_before_next_cas: Option<(String, String, String, String)>,
+        /// When set, every CAS reports `Contended` without committing.
+        always_contend: bool,
+        load_error: Option<TestStoreError>,
+    }
+
+    impl TestStore {
+        fn new() -> Self {
+            Self {
+                state: Mutex::new(TestStoreState {
+                    owner: SwarmPlanAttachmentOwner::new(),
+                    version: SwarmPlanAttachmentVersion::initial(),
+                    load_calls: 0,
+                    cas_calls: 0,
+                    inject_before_next_cas: None,
+                    always_contend: false,
+                    load_error: None,
+                }),
+            }
+        }
+
+        fn with_tampered_seed() -> Self {
+            let store = Self::new();
+            let mut state = state(&store);
+            let mut tampered = SwarmPlanAttachmentOwner::new();
+            tampered
+                .attach_plan_once(ADMISSION, PLAN, "job-1", FENCE)
+                .expect("seed binds");
+            let key = (ADMISSION.to_owned(), PLAN.to_owned());
+            tampered
+                .bindings
+                .get_mut(&key)
+                .expect("binding present")
+                .job_handle = "job-2".to_owned();
+            state.owner = tampered;
+            drop(state);
+            store
+        }
+
+        fn counts(store: &Self) -> (usize, usize) {
+            let state = state(store);
+            (state.load_calls, state.cas_calls)
+        }
+
+        fn committed_len(store: &Self) -> usize {
+            state(store).owner.len()
+        }
+    }
+
+    fn state(store: &TestStore) -> std::sync::MutexGuard<'_, TestStoreState> {
+        store.state.lock().expect("test store lock holds")
+    }
+
+    impl SwarmPlanAttachmentStore for TestStore {
+        type Error = TestStoreError;
+
+        fn load(
+            &self,
+        ) -> Result<(SwarmPlanAttachmentOwner, SwarmPlanAttachmentVersion), Self::Error> {
+            let mut state = state(self);
+            state.load_calls += 1;
+            if let Some(error) = &state.load_error {
+                return Err(error.clone());
+            }
+            Ok((state.owner.clone(), state.version))
+        }
+
+        fn compare_and_swap(
+            &self,
+            expected: SwarmPlanAttachmentVersion,
+            replacement: &SwarmPlanAttachmentOwner,
+        ) -> Result<CasOutcome, Self::Error> {
+            let mut state = state(self);
+            state.cas_calls += 1;
+            if let Some((admission, plan, job, fence)) = state.inject_before_next_cas.take() {
+                state
+                    .owner
+                    .attach_plan_once(&admission, &plan, &job, &fence)
+                    .expect("injected external commit is valid");
+                state.version = state.version.next();
+                return Ok(CasOutcome::Contended);
+            }
+            if state.always_contend {
+                return Ok(CasOutcome::Contended);
+            }
+            if expected != state.version {
+                return Ok(CasOutcome::Contended);
+            }
+            state.owner = replacement.clone();
+            state.version = state.version.next();
+            Ok(CasOutcome::Committed)
+        }
+    }
+
+    fn durable(
+        store: &TestStore,
+        job: &str,
+    ) -> Result<SwarmPlanBinding, DurableAttachError<TestStoreError>> {
+        attach_plan_once_durable(store, ADMISSION, PLAN, job, FENCE)
+    }
+
+    #[test]
+    fn durable_sequential_double_first_bind_has_exactly_one_winner() {
+        let store = TestStore::new();
+        let winner = durable(&store, "job-1").expect("first bind commits");
+        assert_eq!(winner.job_handle(), "job-1");
+
+        let conflict = durable(&store, "job-2");
+        match conflict {
+            Err(DurableAttachError::Decision(SwarmPlanAttachmentError::OwnershipConflict {
+                existing,
+            })) => assert_eq!(existing, winner),
+            other => panic!("second first-bind must lose with the winner, got {other:?}"),
+        }
+        assert_eq!(TestStore::committed_len(&store), 1);
+        // The losing decision needs no commit: exactly one CAS happened.
+        assert_eq!(TestStore::counts(&store), (2, 1));
+    }
+
+    #[test]
+    fn durable_concurrent_first_bind_has_exactly_one_winner() {
+        let store = Arc::new(TestStore::new());
+        let barrier = Arc::new(Barrier::new(8));
+        let mut handles = Vec::new();
+        for index in 0..8 {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                attach_plan_once_durable(&*store, ADMISSION, PLAN, &format!("job-{index}"), FENCE)
+            }));
+        }
+        let mut outcomes = Vec::new();
+        for handle in handles {
+            outcomes.push(handle.join().expect("thread joins"));
+        }
+        let mut winners = Vec::new();
+        let mut existing_seen = Vec::new();
+        for outcome in outcomes {
+            match outcome {
+                Ok(binding) => winners.push(binding),
+                Err(DurableAttachError::Decision(
+                    SwarmPlanAttachmentError::OwnershipConflict { existing },
+                )) => existing_seen.push(existing),
+                Err(other) => panic!("unexpected durable attach error: {other:?}"),
+            }
+        }
+        assert_eq!(winners.len(), 1, "exactly one first-bind may succeed");
+        assert_eq!(existing_seen.len(), 7);
+        let winner = winners.pop().expect("one winner");
+        assert!(
+            existing_seen.iter().all(|existing| existing == &winner),
+            "every loser must name the one canonical winner"
+        );
+        assert_eq!(TestStore::committed_len(&store), 1);
+    }
+
+    #[test]
+    fn durable_contended_reload_returns_canonical_winner() {
+        let store = TestStore::new();
+        // A concurrent writer binds job-2 for our key before our CAS lands.
+        state(&store).inject_before_next_cas = Some((
+            ADMISSION.to_owned(),
+            PLAN.to_owned(),
+            "job-2".to_owned(),
+            FENCE.to_owned(),
+        ));
+        let conflict = durable(&store, "job-1");
+        match conflict {
+            Err(DurableAttachError::Decision(SwarmPlanAttachmentError::OwnershipConflict {
+                existing,
+            })) => assert_eq!(existing.job_handle(), "job-2"),
+            other => panic!("contended loser must see the canonical winner, got {other:?}"),
+        }
+        assert_eq!(TestStore::committed_len(&store), 1);
+        assert_eq!(TestStore::counts(&store), (2, 1));
+    }
+
+    #[test]
+    fn durable_unrelated_contention_retries_then_commits() {
+        let store = TestStore::new();
+        // A concurrent writer binds a DIFFERENT plan key before our CAS lands.
+        state(&store).inject_before_next_cas = Some((
+            ADMISSION.to_owned(),
+            "plan-2".to_owned(),
+            "job-9".to_owned(),
+            FENCE.to_owned(),
+        ));
+        let binding = durable(&store, "job-1").expect("retry commits after reload");
+        assert_eq!(binding.job_handle(), "job-1");
+        assert_eq!(TestStore::committed_len(&store), 2);
+        assert_eq!(TestStore::counts(&store), (2, 2));
+    }
+
+    #[test]
+    fn durable_tampered_snapshot_fails_closed_without_commit() {
+        let store = TestStore::with_tampered_seed();
+        let result = durable(&store, "job-1");
+        assert_eq!(
+            result,
+            Err(DurableAttachError::Decision(
+                SwarmPlanAttachmentError::InvalidSnapshot
+            )),
+            "tampered durable image must fail closed on reload"
+        );
+        // No decision was made and no commit attempted.
+        assert_eq!(TestStore::counts(&store), (1, 0));
+    }
+
+    #[test]
+    fn durable_perpetual_contention_terminates_bounded() {
+        let store = TestStore::new();
+        state(&store).always_contend = true;
+        let result = durable(&store, "job-1");
+        assert_eq!(
+            result,
+            Err(DurableAttachError::ContentionExhausted {
+                attempts: MAX_DURABLE_ATTACH_ATTEMPTS
+            }),
+            "perpetual contention must terminate at the bound, never spin"
+        );
+        assert_eq!(TestStore::counts(&store), (8, 8));
+        assert_eq!(TestStore::committed_len(&store), 0);
+    }
+
+    #[test]
+    fn durable_identical_replay_is_idempotent() {
+        let store = TestStore::new();
+        let first = durable(&store, "job-1").expect("first bind commits");
+        let second = durable(&store, "job-1").expect("identical replay commits");
+        assert_eq!(first, second);
+        assert_eq!(TestStore::committed_len(&store), 1);
+    }
+
+    #[test]
+    fn durable_invalid_input_never_commits() {
+        let store = TestStore::new();
+        let result = attach_plan_once_durable(&store, "   ", PLAN, "job-1", FENCE);
+        assert_eq!(
+            result,
+            Err(DurableAttachError::Decision(
+                SwarmPlanAttachmentError::InvalidField("admission_digest")
+            ))
+        );
+        assert_eq!(TestStore::counts(&store), (1, 0));
+    }
+
+    #[test]
+    fn durable_load_failure_propagates_as_store_error() {
+        let store = TestStore::new();
+        state(&store).load_error = Some(TestStoreError("boom"));
+        let result = durable(&store, "job-1");
+        assert_eq!(
+            result,
+            Err(DurableAttachError::Store(TestStoreError("boom")))
+        );
+        assert_eq!(TestStore::counts(&store), (1, 0));
     }
 }
