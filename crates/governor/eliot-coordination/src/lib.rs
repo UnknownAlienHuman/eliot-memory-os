@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 mod peer_communication;
+mod swarm_plan_attachment;
 mod work_lease_issuance;
 
 pub use peer_communication::{
@@ -44,6 +45,11 @@ pub use peer_communication::{
 pub use work_lease_issuance::{
     WORK_LEASE_ISSUANCE_REVISION, WorkLeaseIssuanceDisposition, WorkLeaseIssuanceError,
     WorkLeaseIssuanceFailure, WorkLeaseIssuanceProvenance, WorkLeaseIssuanceResult,
+};
+
+pub use swarm_plan_attachment::{
+    SWARM_PLAN_ATTACHMENT_REVISION, SwarmPlanAttachmentError, SwarmPlanAttachmentLedger,
+    SwarmPlanAttachmentOwner, SwarmPlanBinding,
 };
 
 pub const CONTRACT_NAME: &str = "eliot.governor.coordination";
