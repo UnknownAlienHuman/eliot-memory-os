@@ -1683,11 +1683,12 @@ fn independent_limits_deadline_and_cancel_are_exact_with_one_over() {
     let cancelled = step_durable_job(&idle, &DurableEvent::CancelRequested).unwrap();
     assert_eq!(cancelled.disposition, DurableDisposition::Terminal);
     assert_eq!(cancelled.next_state.phase, DurablePhase::Cancelled);
-    let replayed = step_durable_job(
+    let divergent = step_durable_job(
         &cancelled.next_state,
         &DurableEvent::RequestStage(durable_stage_request(DurableStage::Bundle, "late")),
-    )
-    .unwrap();
+    );
+    assert!(matches!(divergent, Err(CycleError::PhaseViolation(_))));
+    let replayed = step_durable_job(&cancelled.next_state, &DurableEvent::CancelRequested).unwrap();
     assert_eq!(replayed.disposition, DurableDisposition::Replayed);
     let (busy_base, _) = durable_admit_orientation();
     let busy = step_durable_job(
