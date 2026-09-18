@@ -1,0 +1,106 @@
+[
+  {
+    "name": "disjoint_scopes_share_lanes",
+    "lanes": 2,
+    "queue": 8,
+    "steps": [
+      { "submit": { "id": "op-a", "order": 2, "scopes": [["scope-x", 1]] } },
+      { "submit": { "id": "op-b", "order": 1, "scopes": [["scope-y", 1]] } },
+      { "expect_ready": ["op-b", "op-a"] },
+      { "complete": { "id": "op-a", "outcome": "committed", "at_ms": 0 } },
+      { "complete": { "id": "op-b", "outcome": "committed", "at_ms": 0 } }
+    ]
+  },
+  {
+    "name": "shared_scope_serializes_by_order",
+    "lanes": 2,
+    "queue": 8,
+    "steps": [
+      { "submit": { "id": "op-late", "order": 2, "scopes": [["shared", 2]] } },
+      { "submit": { "id": "op-early", "order": 1, "scopes": [["shared", 1]] } },
+      { "expect_ready": ["op-early"] },
+      { "complete": { "id": "op-early", "outcome": "committed", "at_ms": 0 } },
+      { "expect_ready": ["op-late"] },
+      { "complete": { "id": "op-late", "outcome": "committed", "at_ms": 0 } }
+    ]
+  },
+  {
+    "name": "rejection_gaps_sequence_for_successor",
+    "lanes": 2,
+    "queue": 8,
+    "steps": [
+      { "submit": { "id": "op-doomed", "order": 1, "scopes": [["s", 1]] } },
+      { "submit": { "id": "op-next", "order": 2, "scopes": [["s", 2]] } },
+      { "expect_ready": ["op-doomed"] },
+      { "complete": { "id": "op-doomed", "outcome": "rejected", "at_ms": 0 } },
+      { "expect_ready": ["op-next"] },
+      { "complete": { "id": "op-next", "outcome": "cancelled", "at_ms": 0 } }
+    ]
+  },
+  {
+    "name": "queue_bound_and_drain_refuse_new_work",
+    "lanes": 1,
+    "queue": 1,
+    "steps": [
+      { "submit": { "id": "op-first", "order": 1, "scopes": [["s", 1]] } },
+      {
+        "submit": { "id": "op-second", "order": 2, "scopes": [["t", 1]] },
+        "expect_reject": "QueueFull"
+      },
+      { "begin_drain": true },
+      {
+        "submit": { "id": "op-third", "order": 3, "scopes": [["u", 1]] },
+        "expect_reject": "Draining"
+      },
+      { "expect_ready": ["op-first"] },
+      { "complete": { "id": "op-first", "outcome": "committed", "at_ms": 0 } }
+    ]
+  },
+  {
+    "name": "empty_projection_refuses",
+    "lanes": 2,
+    "queue": 8,
+    "steps": [
+      {
+        "submit": { "id": "op-empty", "order": 1, "scopes": [] },
+        "expect_reject": "EmptyScopes"
+      }
+    ]
+  },
+  {
+    "name": "duplicate_scope_refuses",
+    "lanes": 2,
+    "queue": 8,
+    "steps": [
+      {
+        "submit": { "id": "op-dup", "order": 1, "scopes": [["s", 1], ["s", 2]] },
+        "expect_reject": "DuplicateScope"
+      }
+    ]
+  },
+  {
+    "name": "unsorted_scopes_refuse",
+    "lanes": 2,
+    "queue": 8,
+    "steps": [
+      {
+        "submit": { "id": "op-unsorted", "order": 1, "scopes": [["b", 1], ["a", 1]] },
+        "expect_reject": "UnsortedScopes"
+      }
+    ]
+  },
+  {
+    "name": "crossed_sequences_refuse",
+    "lanes": 2,
+    "queue": 8,
+    "steps": [
+      { "submit": { "id": "op-base", "order": 1, "scopes": [["s", 1]] } },
+      { "expect_ready": ["op-base"] },
+      {
+        "submit": { "id": "op-crossed", "order": 2, "scopes": [["s", 1]] },
+        "expect_reject": "InconsistentSequences"
+      },
+      { "complete": { "id": "op-base", "outcome": "committed", "at_ms": 0 } }
+    ]
+  }
+]

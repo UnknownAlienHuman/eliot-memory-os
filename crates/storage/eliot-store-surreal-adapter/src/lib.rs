@@ -24,6 +24,7 @@ mod health;
 mod plan;
 mod readiness;
 mod schema;
+mod write_scheduler;
 
 use std::fmt;
 
@@ -44,6 +45,10 @@ use eliot_store_api::{
 pub use error::AdapterError;
 pub use health::{AdapterAvailability, AdapterHealth, ProviderHealth};
 pub use readiness::{CompiledMigration, MigrationReceipt, SemanticReadiness};
+pub use write_scheduler::{
+    CompletionOutcome, ReservationProjection, ReservedScopeProjection, ScheduleReject,
+    WriteScheduler,
+};
 
 /// The sole `SurrealDB` credential and client owner for the ELIOT canonical
 /// store.
