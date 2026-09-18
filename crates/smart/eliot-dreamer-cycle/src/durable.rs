@@ -20,6 +20,7 @@ use std::collections::BTreeSet;
 
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 use eliot_dreamer_contracts::{DreamJobInput, JobClass};
+use eliot_receipts::ProofCeiling;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -339,6 +340,16 @@ pub struct DurableJobState {
     pub bundle_digest: String,
     /// Closed job class selecting stage applicability.
     pub job_class: JobClass,
+    /// Optional task binding copied from the frozen job.
+    pub task_id: Option<String>,
+    /// Scope binding copied from the frozen job.
+    pub scope_id: String,
+    /// Requester identity copied from the frozen job.
+    pub requester: String,
+    /// Budget in abstract units copied from the frozen job.
+    pub budget_units: u64,
+    /// Proof ceiling; this candidate-only controller admits no stronger proof.
+    pub proof_ceiling: ProofCeiling,
     /// Exact state fence.
     pub fence: StateFence,
     /// Optional injected deadline in Unix milliseconds.
@@ -573,6 +584,17 @@ impl DurableJobState {
         job.state_fence.validate()?;
         let job_id = job.job_id.clone();
         validate_text(&job_id, "durable.job_id")?;
+        validate_text(&job.scope_id, "durable.scope_id")?;
+        validate_text(&job.requester, "durable.requester")?;
+        if let Some(task_id) = &job.task_id {
+            validate_text(task_id, "durable.task_id")?;
+        }
+        if job.budget_units == 0 {
+            return Err(CycleError::BindingMismatch {
+                field: "durable.budget_units",
+                reason: "budget binding copied from the frozen job is zero",
+            });
+        }
         let job_digest = job_digest(job)?;
         let mut state = Self {
             schema_version: DURABLE_SCHEMA_VERSION,
@@ -580,6 +602,11 @@ impl DurableJobState {
             job_digest,
             bundle_digest: bundle_digest.to_owned(),
             job_class: job.job_class,
+            task_id: job.task_id.clone(),
+            scope_id: job.scope_id.clone(),
+            requester: job.requester.clone(),
+            budget_units: job.budget_units,
+            proof_ceiling: ProofCeiling::CandidateArtifact,
             fence: job.state_fence.clone(),
             deadline_ms,
             phase: DurablePhase::Admitted,
@@ -633,6 +660,23 @@ impl DurableJobState {
             });
         }
         validate_text(&self.job_id, "durable.job_id")?;
+        if let Some(task_id) = &self.task_id {
+            validate_text(task_id, "durable.task_id")?;
+        }
+        validate_text(&self.scope_id, "durable.scope_id")?;
+        validate_text(&self.requester, "durable.requester")?;
+        if self.budget_units == 0 {
+            return Err(CycleError::BindingMismatch {
+                field: "durable.budget_units",
+                reason: "budget binding copied from the frozen job is zero",
+            });
+        }
+        if self.proof_ceiling != ProofCeiling::CandidateArtifact {
+            return Err(CycleError::BindingMismatch {
+                field: "durable.proof_ceiling",
+                reason: "candidate-only controller carries no stronger proof ceiling",
+            });
+        }
         if !is_digest(&self.job_digest) {
             return Err(CycleError::IncompleteOutcome("durable.job_digest"));
         }
@@ -710,10 +754,12 @@ pub fn step_durable_job(
         return finish_replay(current);
     }
     if current.phase.is_terminal() {
-        return finish_replay(current);
+        return Err(CycleError::PhaseViolation(
+            "terminal job cannot accept divergent events",
+        ));
     }
     let mut next = current.clone();
-    let (commands, disposition, streak) = match event {
+    let (mut commands, mut disposition, streak) = match event {
         DurableEvent::RequestStage(request) => apply_request_stage(current, &mut next, request),
         DurableEvent::StageReady(evidence) => apply_stage_ready(current, &mut next, evidence),
         DurableEvent::StageUnknown(evidence) => apply_stage_unknown(current, &mut next, evidence),
@@ -731,6 +777,12 @@ pub fn step_durable_job(
         }
     }?;
     apply_streak(&mut next, streak)?;
+    if streak == StreakEffect::NoChange && next.phase == DurablePhase::Blocked {
+        commands = vec![DurableCommand::EscalateBlocked(EscalateCommand {
+            reason: "maximum no-progress streak exceeded".to_owned(),
+        })];
+        disposition = DurableDisposition::Blocked;
+    }
     next.last_event_digest = Some(event_digest);
     next.revision = next
         .revision
@@ -1145,6 +1197,7 @@ fn apply_restart(
 ) -> Result<(Vec<DurableCommand>, DurableDisposition, StreakEffect), CycleError> {
     if evidence.fence != current.fence {
         return park_blocked(
+            current,
             next,
             "restart under a stale fence; persisted snapshot is foreign",
         );
@@ -1193,13 +1246,26 @@ fn apply_stale_fence(
             reason: "observed fence equals the bound fence; nothing is stale",
         });
     }
-    park_blocked(next, "stale fence observed; job cannot continue")
+    park_blocked(current, next, "stale fence observed; job cannot continue")
 }
 
 fn park_blocked(
+    current: &DurableJobState,
     next: &mut DurableJobState,
     reason: &'static str,
 ) -> Result<(Vec<DurableCommand>, DurableDisposition, StreakEffect), CycleError> {
+    if let Some(in_flight) = current.current_operation.clone() {
+        next.phase = DurablePhase::Reconciling;
+        let command = DurableCommand::ReconcileOperation(ReconcileCommand {
+            operation_id: in_flight.operation_id,
+            stage: in_flight.stage,
+        });
+        return Ok((
+            vec![command],
+            DurableDisposition::ReconciliationRequired,
+            StreakEffect::Keep,
+        ));
+    }
     next.phase = DurablePhase::Blocked;
     let command = DurableCommand::EscalateBlocked(EscalateCommand {
         reason: reason.to_owned(),
@@ -1503,6 +1569,11 @@ fn preflight_state(state: &DurableJobState) -> Result<(), CycleError> {
     }
     let mut total = 0usize;
     bounded_text(&state.job_id, &mut total, "durable.job_id")?;
+    if let Some(task_id) = &state.task_id {
+        bounded_text(task_id, &mut total, "durable.task_id")?;
+    }
+    bounded_text(&state.scope_id, &mut total, "durable.scope_id")?;
+    bounded_text(&state.requester, &mut total, "durable.requester")?;
     bounded_text(&state.job_digest, &mut total, "durable.job_digest")?;
     bounded_text(&state.bundle_digest, &mut total, "durable.bundle_digest")?;
     bounded_text(

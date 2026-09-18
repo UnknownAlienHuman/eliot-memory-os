@@ -2,7 +2,7 @@ schema = "eliot.agent-work-unit.v1"
 authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
 status = "READY_FOR_IMPLEMENTATION"
 implementation_support = "RUNTIME_CONTRACTS_PRESENT_PURE_CONTROLLER_EDGE_OPEN"
-evidence_execution_status = "ISSUE_AND_PIPELINE_ROUTING_INSPECTED_TESTS_NOT_EXECUTED"
+evidence_execution_status = "EXECUTED"
 proof_ceiling = "DREAMER_PURE_CONTROLLER_MODULE_CANDIDATE_ONLY"
 issue = 806
 dreamer_runtime_issue = 1100
@@ -130,9 +130,9 @@ criteria = [
 [verification]
 commands = [
   "cargo fmt --all -- --check",
-  "cargo check --locked -p <dreamer-controller-owner> --all-targets",
-  "cargo test --locked -p <dreamer-controller-owner> --all-targets",
-  "cargo clippy --locked -p <dreamer-controller-owner> --all-targets -- -D warnings",
+  "cargo check --locked -p eliot-dreamer-cycle --all-targets",
+  "cargo test --locked -p eliot-dreamer-cycle --all-targets",
+  "cargo clippy --locked -p eliot-dreamer-cycle --all-targets -- -D warnings",
   "git diff --check",
 ]
 edge_proof = "Compose the accepted pure controller into #1100 and inject cancellation, deadline, provider-unknown, result-submit-unknown, restart and stale-fence events at every stage without duplicate execution."
