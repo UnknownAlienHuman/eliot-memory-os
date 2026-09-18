@@ -4,7 +4,7 @@ use std::io::{self, Write};
 
 use eliot_wasm_host::{
     CliError, TypedWorld, default_experimental_limits, execute_describe_experimental, parse_args,
-    read_bounded_artifact,
+    read_bounded_artifact, resolve_kernel_port_grant,
 };
 
 const INVALID_ARGUMENT_EXIT: i32 = 2;
@@ -104,11 +104,21 @@ fn main() {
         return;
     }
 
-    let _ = config.transport;
-    let _ = config.profile;
-    emit_error(
-        "KERNEL_ADMISSION_REQUIRED",
-        "Kernel RuntimePorts, admitted artifact, authenticated request loop, and live service are not bound",
-    );
+    // The live governed path requires a Kernel-admitted RuntimePorts grant.
+    // No admission channel is bound yet, so resolution fails closed before
+    // any engine, runner, or invocation is constructed. A grant that ever
+    // resolves here still has no authenticated request loop to serve it, so
+    // holding it would invent authority: stay denied in that case too.
+    match resolve_kernel_port_grant() {
+        Ok(_grant) => {
+            emit_error(
+                "KERNEL_ADMISSION_REQUIRED",
+                "admitted request loop is not bound",
+            );
+        }
+        Err(error) => {
+            emit_error("KERNEL_ADMISSION_REQUIRED", &error.to_string());
+        }
+    }
     std::process::exit(ADMISSION_REQUIRED_EXIT);
 }
