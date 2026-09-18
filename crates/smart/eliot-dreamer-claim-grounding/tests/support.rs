@@ -595,7 +595,9 @@ pub fn support_for(
     }
 }
 
-pub fn temporal_support_for(proposition: &str) -> eliot_dreamer_contracts::grounding::canonical::SupportRecord {
+pub fn temporal_support_for(
+    proposition: &str,
+) -> eliot_dreamer_contracts::grounding::canonical::SupportRecord {
     support_for(
         proposition,
         BTreeSet::from([artifact("evidence-1")]),
