@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::too_many_lines)]
 
 use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence, sha256_hex};
 use eliot_dreamer_candidate_validation::{
@@ -241,7 +241,7 @@ fn wu595_01_router_prehandler_ownership() {
     };
     assert_eq!(
         candidate.validated.receipt.validator_contract, VALIDATOR_CONTRACT,
-        "receipt must carry the A-03 validator contract identity"
+        "receipt must carry the A-05 common validator contract identity"
     );
     assert_eq!(
         candidate.validated.receipt.proof_ceiling, PROOF_CEILING,
@@ -309,7 +309,7 @@ fn wu595_02_valid_grounded_draft_for_each_job_class() {
         .unwrap();
         assert!(
             matches!(outcome, CandidateValidationOutcome::Accepted(_)),
-            "class {class:?} must be accepted on the A-03 pre-handler path"
+            "class {class:?} must be accepted on the A-05 pre-handler path"
         );
     }
 }
@@ -504,9 +504,19 @@ fn wu595_06_duplicate_dimension_evidence_rejected_handles_deterministic() {
         &preservation,
     )
     .unwrap();
+    // Fail-closed: duplicate residues are rejected as DuplicateItem
+    // (or the reused LineageMismatch); accept either to avoid coupling to
+    // the exact code choice.
+    let CandidateValidationOutcome::Rejected(report) = outcome else {
+        panic!("duplicate claim residues must be rejected fail-closed");
+    };
     assert!(
-        matches!(outcome, CandidateValidationOutcome::Accepted(_)),
-        "duplicate claim residues are retained without deduplication"
+        matches!(
+            report.code,
+            RejectionCode::DuplicateItem | RejectionCode::LineageMismatch
+        ),
+        "duplicate claim residues must be rejected as DuplicateItem or LineageMismatch, got {:?}",
+        report.code
     );
     model.source_handles = vec!["source-1".to_owned(), "source-1".to_owned()];
     usage.source_width = 2;
@@ -533,13 +543,25 @@ fn wu595_06_duplicate_dimension_evidence_rejected_handles_deterministic() {
         &preservation,
     )
     .unwrap();
-    let (CandidateValidationOutcome::Accepted(first), CandidateValidationOutcome::Accepted(second)) =
+    let (CandidateValidationOutcome::Rejected(first), CandidateValidationOutcome::Rejected(second)) =
         (first, second)
     else {
-        panic!("duplicate source handles must replay deterministically");
+        panic!("duplicate source handles must be rejected fail-closed");
     };
+    let first_code = first.code;
+    assert!(
+        matches!(
+            first_code,
+            RejectionCode::DuplicateItem | RejectionCode::LineageMismatch
+        ),
+        "duplicate source handles must be rejected as DuplicateItem or LineageMismatch, got {first_code:?}"
+    );
     assert_eq!(
-        first.validated.receipt.input_digest, second.validated.receipt.input_digest,
+        first.code, second.code,
+        "duplicate-handle rejection must replay to the same code"
+    );
+    assert_eq!(
+        first.input_digest, second.input_digest,
         "same duplicate-handle input must replay to the same input digest"
     );
 }

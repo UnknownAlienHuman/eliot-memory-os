@@ -156,7 +156,7 @@ fn fixture() -> (
 }
 
 /// Re-derive every job-bound identity after switching the job class, so the
-/// A-03 lineage gate sees a coherent aggregate for any class.
+/// A-05 lineage gate sees a coherent aggregate for any class.
 fn fixture_with_class(
     class: JobClass,
 ) -> (
@@ -270,7 +270,7 @@ fn wu595_38_curation_kind_payload_screen_binding() {
         &usage,
         &preservation,
     ) else {
-        panic!("curation via A-03 must be accepted pre-handler");
+        panic!("curation via A-05 must be accepted pre-handler");
     };
     assert_eq!(candidate.job.job_class, JobClass::Curation);
     assert_eq!(

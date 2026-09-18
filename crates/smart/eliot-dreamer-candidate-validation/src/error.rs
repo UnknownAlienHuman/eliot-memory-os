@@ -19,6 +19,8 @@ pub enum RejectionCode {
     IdentityMismatch,
     /// A model handle or grounded lineage points outside supplied material.
     LineageMismatch,
+    /// Duplicate item, claim, evidence, receipt, or dimension identity.
+    DuplicateItem,
     /// Candidate content asks the gate to make an unsupported claim.
     UnsupportedPrecision,
     /// The supplied independent usage cannot authorize this input.

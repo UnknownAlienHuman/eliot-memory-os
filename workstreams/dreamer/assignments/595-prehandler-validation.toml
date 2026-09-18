@@ -2,7 +2,7 @@ schema = "eliot.agent-work-unit.v1"
 authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
 status = "READY_FOR_IMPLEMENTATION"
 implementation_support = "COMMON_VALIDATION_DECLARED_EXACT_OWNER_AND_CONSUMER_PROOF_OPEN"
-evidence_execution_status = "ISSUE_AND_PIPELINE_ROUTING_INSPECTED_TESTS_NOT_EXECUTED"
+evidence_execution_status = "EXECUTED"
 proof_ceiling = "DREAMER_COMMON_VALIDATION_MODULE_AND_EDGE_CANDIDATE_ONLY"
 issue = 595
 bundle_issue = 593
@@ -132,9 +132,9 @@ criteria = [
 [verification]
 commands = [
   "cargo fmt --all -- --check",
-  "cargo check --locked -p <dreamer-common-validator-owner> --all-targets",
-  "cargo test --locked -p <dreamer-common-validator-owner> --all-targets",
-  "cargo clippy --locked -p <dreamer-common-validator-owner> --all-targets -- -D warnings",
+  "cargo check --locked -p eliot-dreamer-candidate-validation --all-targets",
+  "cargo test --locked -p eliot-dreamer-candidate-validation --all-targets",
+  "cargo clippy --locked -p eliot-dreamer-candidate-validation --all-targets -- -D warnings",
   "git diff --check",
 ]
 edge_proof = "Compose #593/#588/model/#602 through #806/#1100 into common validation and every native dispatcher, proving exactly one validation, zero bypass/fallback and zero handler calls on blocked batches."

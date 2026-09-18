@@ -39,11 +39,11 @@ fn invalid_contract(
     })
 }
 
-/// Validates one supplied A-03 model/grounded pair before semantic handling.
+/// Validates one supplied A-05 model/grounded pair before semantic handling.
 ///
 /// The observation time is explicit so this function has no ambient clock.
 /// Rejected candidates are returned as inert reports retaining every supplied
-/// A-03 value; malformed contract shapes return a typed validation error.
+/// A-05 value; malformed contract shapes return a typed validation error.
 #[allow(clippy::too_many_arguments)]
 pub fn validate_grounded_dream_draft_at(
     job: &DreamJobAdmission,
@@ -82,6 +82,9 @@ pub fn validate_grounded_dream_draft_at(
     };
     let (input_digest, input_bytes) = input_digest_and_size(&preimage)?;
     let draft_digest = model_digest(model)?;
+    if let Err((code, detail)) = validate_duplicates(&inputs) {
+        return reject(&inputs, code, detail, input_digest);
+    }
     if let Err((code, detail)) = validate_lineage(&inputs, &draft_digest) {
         return reject(&inputs, code, detail, input_digest);
     }
@@ -363,6 +366,56 @@ fn reject(
     Ok(CandidateValidationOutcome::Rejected(Box::new(report)))
 }
 
+fn validate_duplicates(inputs: &ValidationInputs<'_>) -> Result<(), (RejectionCode, &'static str)> {
+    let mut seen = BTreeSet::new();
+    for handle in &inputs.model.source_handles {
+        if !seen.insert(handle.as_str()) {
+            return Err((
+                RejectionCode::DuplicateItem,
+                "duplicate model source handle",
+            ));
+        }
+    }
+    let mut seen_claims = BTreeSet::new();
+    for residue in &inputs.grounded.residues {
+        if !seen_claims.insert(residue.claim.as_str()) {
+            return Err((
+                RejectionCode::DuplicateItem,
+                "duplicate grounded claim residue",
+            ));
+        }
+    }
+    let mut seen_materials = BTreeSet::new();
+    for material in &inputs.bundle.materials {
+        if !seen_materials.insert(material.handle.as_str()) {
+            return Err((
+                RejectionCode::DuplicateItem,
+                "duplicate bundle material handle",
+            ));
+        }
+    }
+    let mut seen_omissions = BTreeSet::new();
+    for omission in &inputs.bundle.omissions {
+        if !seen_omissions.insert(omission.handle.as_str()) {
+            return Err((
+                RejectionCode::DuplicateItem,
+                "duplicate bundle omission handle",
+            ));
+        }
+    }
+    if seen_materials
+        .intersection(&seen_omissions)
+        .next()
+        .is_some()
+    {
+        return Err((
+            RejectionCode::DuplicateItem,
+            "bundle material handle duplicated in omissions",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_lineage(
     inputs: &ValidationInputs<'_>,
     draft_digest: &str,
@@ -374,7 +427,7 @@ fn validate_lineage(
     {
         return Err((
             RejectionCode::IdentityMismatch,
-            "job canonical identity differs across supplied A-03 values",
+            "job canonical identity differs across supplied A-05 values",
         ));
     }
     if inputs.job.policy_ref != inputs.policy.policy_id {

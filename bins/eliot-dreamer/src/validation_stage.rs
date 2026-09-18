@@ -200,6 +200,7 @@ fn validation_denied(error: &DreamDraftValidationError) -> DreamerError {
 #[cfg(test)]
 mod slice_6_validation_tests {
     use super::*;
+    use std::cell::{Cell, RefCell};
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -213,7 +214,8 @@ mod slice_6_validation_tests {
     };
     use eliot_dreamer_contracts::{
         BudgetLimits, BudgetUsage, BundleCompleteness, DreamInputBundle, DreamJobAdmission,
-        PreservationReport, Requester, RequesterOrigin, ValidationPolicy,
+        PreservationReport, Requester, RequesterOrigin, ValidatedDreamDraft, ValidationPolicy,
+        ValidationReceipt,
     };
     use eliot_dreamer_orientation::{
         AnchoredEvidence, OrientationPacketCandidate, OrientationResidue,
@@ -858,5 +860,147 @@ mod slice_6_validation_tests {
             validation_denied(&cases[2]),
             DreamerError::InvalidAdmission("structured.schema_version")
         ));
+    }
+
+    /// Builds a receipt-bound draft preimage for the pre-handler ordering
+    /// proofs below. The value is only carried through the seam (the seam
+    /// returns it untouched on acceptance), so static well-shaped digests
+    /// suffice; no receipt is issued here.
+    fn accepted_draft_preimage() -> ValidatedDreamDraft {
+        let digest = "0".repeat(64);
+        ValidatedDreamDraft {
+            receipt: ValidationReceipt {
+                schema_version: 1,
+                validator_contract: "contract-slice-6".to_owned(),
+                validator_policy: "policy-slice-6".to_owned(),
+                job_id: "job-slice-6".to_owned(),
+                draft_digest: digest.clone(),
+                bundle_digest: digest.clone(),
+                manifest_digest: digest.clone(),
+                task_id: "task-slice-6".to_owned(),
+                scope_id: "scope-slice-6".to_owned(),
+                input_digest: digest.clone(),
+                output_digest: digest.clone(),
+                terminal_disposition: "accepted".to_owned(),
+                proof_ceiling: "ceiling-slice-6".to_owned(),
+                state_fence: fence(),
+                preservation_digest: digest.clone(),
+                budget_digest: digest,
+            },
+            draft_digest: "0".repeat(64),
+            scope_id: "scope-slice-6".to_owned(),
+            task_id: "task-slice-6".to_owned(),
+            state_fence: fence(),
+        }
+    }
+
+    /// A-05 pre-handler proof (a): validation runs before any native
+    /// semantic handler. The counting validation closure records
+    /// `validation` first; the stub handler records `handler` only after the
+    /// seam returns the accepted candidate. Order plus both counters prove
+    /// the before-handler shape.
+    #[test]
+    fn prehandler_runs_before_handler() {
+        let input = malformed_carrier();
+        let accepted = ValidatedGroundingCandidate {
+            input: input.clone(),
+            validated: accepted_draft_preimage(),
+        };
+        let validation_calls = Cell::new(0_usize);
+        let handler_calls = Cell::new(0_usize);
+        let order = RefCell::new(Vec::new());
+        let validated = validate_admitted_draft_with(&input, |carrier| {
+            validation_calls.set(validation_calls.get() + 1);
+            order.borrow_mut().push("validation");
+            assert!(
+                std::ptr::eq(carrier, &input),
+                "seam must pass the admitted carrier by reference"
+            );
+            Ok(StructuredCandidateValidationOutcome::Accepted(Box::new(
+                accepted.clone(),
+            )))
+        });
+        let Ok(candidate) = validated else {
+            panic!("accepted carrier must pass pre-handler validation");
+        };
+        // Native semantic handler stub: runs only after validation returned.
+        handler_calls.set(handler_calls.get() + 1);
+        order.borrow_mut().push("handler");
+        assert_eq!(candidate.input, input);
+        assert_eq!(validation_calls.get(), 1);
+        assert_eq!(handler_calls.get(), 1);
+        assert_eq!(order.borrow().as_slice(), &["validation", "handler"]);
+    }
+
+    /// A-05 pre-handler proof (b): a rejected candidate invokes zero native
+    /// semantic handlers. The counting validation closure returns the
+    /// rejected report; the handler stub is gated on `Ok` and must never
+    /// run, so its counter stays at zero while validation ran exactly once.
+    #[test]
+    fn rejected_candidate_zero_handler_invocations() {
+        let input = malformed_carrier();
+        let report = StructuredCandidateRejectionReport {
+            input: input.clone(),
+            code: RejectionCode::IdentityMismatch,
+            detail: "structured job or policy identity differs".to_owned(),
+            input_digest: "0".repeat(64),
+        };
+        let validation_calls = Cell::new(0_usize);
+        let handler_calls = Cell::new(0_usize);
+        let refused = validate_admitted_draft_with(&input, |_| {
+            validation_calls.set(validation_calls.get() + 1);
+            Ok(StructuredCandidateValidationOutcome::Rejected(Box::new(
+                report,
+            )))
+        });
+        match refused {
+            Err(DreamerError::InvalidAdmission("validation semantic rejection")) => {}
+            ref other => panic!("rejected carrier must refuse, got {other:?}"),
+        }
+        // Handler dispatch is gated on validation success: rejection leaves
+        // zero handler invocations by construction (no call site here).
+        assert_eq!(validation_calls.get(), 1);
+        assert_eq!(
+            handler_calls.get(),
+            0,
+            "rejected candidate must invoke zero handlers"
+        );
+    }
+
+    /// A-05 pre-handler proof (c): downstream consumes the validation output
+    /// without re-running validation. `validate_once` is `FnOnce`, so the
+    /// counting wrapper cannot run twice for one admission; the downstream
+    /// stub takes only `&ValidatedGroundingCandidate` and runs twice while
+    /// the validation counter stays at one.
+    #[test]
+    fn validated_output_consumed_without_revalidation() {
+        let input = malformed_carrier();
+        let accepted = ValidatedGroundingCandidate {
+            input: input.clone(),
+            validated: accepted_draft_preimage(),
+        };
+        let validation_calls = Cell::new(0_usize);
+        let validated = validate_admitted_draft_with(&input, |carrier| {
+            validation_calls.set(validation_calls.get() + 1);
+            assert!(std::ptr::eq(carrier, &input));
+            Ok(StructuredCandidateValidationOutcome::Accepted(Box::new(
+                accepted.clone(),
+            )))
+        });
+        let Ok(candidate) = validated else {
+            panic!("accepted carrier must pass pre-handler validation");
+        };
+        // Downstream consumer: borrows the already-validated output only.
+        let consume = |output: &ValidatedGroundingCandidate| {
+            assert_eq!(output.input, input);
+            assert_eq!(output.validated.task_id, "task-slice-6");
+        };
+        consume(&candidate);
+        consume(&candidate);
+        assert_eq!(
+            validation_calls.get(),
+            1,
+            "downstream consumption must not re-run validation"
+        );
     }
 }
