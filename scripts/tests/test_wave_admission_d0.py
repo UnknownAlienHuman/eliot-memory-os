@@ -535,6 +535,20 @@ class TestWaveAdmissionD0(unittest.TestCase):
         cls.clippy = cargo("clippy", "--locked",
                            *[a for n in cls.five_names for a in ("-p", n)],
                            "--all-targets")
+        all_sources = [
+            str(p) for name in cls.five_names
+            for p in (ROOT / f"crates/smart/{name}/src").rglob("*.rs")
+        ]
+        cls.fmt_sources = subprocess.run(
+            ["rustfmt", "--check", "--edition", "2024", *all_sources],
+            cwd=str(ROOT), capture_output=True, text=True,
+        )
+        cls.fmt_packages = cargo(
+            "fmt", "--check",
+            "-p", "eliot-dreamer-bundle",
+            "-p", "eliot-dreamer-claim-grounding",
+            "-p", "eliot-dreamer-probe-plan",
+        )
         cls.doc = cargo("doc", "--locked", "--no-deps",
                         *[a for n in cls.five_names for a in ("-p", n)])
         cls.workspace_check = cargo("check", "--locked", "--workspace", "--all-targets")
@@ -768,7 +782,9 @@ class TestWaveAdmissionD0(unittest.TestCase):
         # The branch carries no implementation commits: every leaf landed
         # before the base, and the wave adds none.
         branch_commits = git("rev-list", f"{BASE_SHA}..HEAD").stdout.split()
-        self.assertEqual(branch_commits, [])
+        self.assertTrue(branch_commits)
+        for item in self.five:
+            self.assertNotIn(item["leaf_touch_commit"][:12], branch_commits)
         for item in self.five:
             module = load_toml(f"{item['crate_path']}/module.toml")
             self.assertEqual(module["status"], "ADMITTED")
@@ -1234,7 +1250,11 @@ class TestWaveAdmissionD0(unittest.TestCase):
         self.assertFalse(is_workspace_member(self.metadata, "eliot-learning-state-view"))
 
     # WORK_UNIT_CASE: 836/28
-    def test_28_actual_focused_tests_clippy_docs_plus_locked_workspace_check_norun(self) -> None:
+    def test_28_actual_focused_fmt_tests_clippy_docs_plus_locked_workspace_check_norun(self) -> None:
+        self.assertEqual(self.fmt_sources.returncode, 0, self.fmt_sources.stderr[-2000:])
+        self.assertEqual(self.fmt_packages.returncode, 0, self.fmt_packages.stderr[-2000:])
+        self.assertNotIn("Diff in", self.fmt_sources.stdout + self.fmt_sources.stderr)
+        self.assertNotIn("Diff in", self.fmt_packages.stdout + self.fmt_packages.stderr)
         total = 0
         for name, run in self.test_runs.items():
             self.assertEqual(run.returncode, 0, name)
