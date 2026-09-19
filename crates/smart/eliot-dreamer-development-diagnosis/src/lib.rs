@@ -51,7 +51,7 @@
 //! validation. There are no placeholder, mock, canned, or pseudo paths:
 //! every branch binds an explicit input field.
 //!
-//! Test coverage note: 23 of 51 `WORK_UNIT_CASE 675/*` cases execute here
+//! Test coverage note: 26 of 51 `WORK_UNIT_CASE 675/*` cases execute here
 //! (675/1 valid two-rival diagnosis with minimal experiment, 675/2 exact
 //! Objective/acceptance/recovery/identity binding, 675/3 wrong job/payload
 //! fails closed, 675/4 fence and receipt mismatch fails closed, 675/5
@@ -69,10 +69,13 @@
 //! mechanism not falsified by repair failure, 675/19 proxy success does not
 //! confirm Product cause, 675/20 frozen conflict analysis consumed without
 //! algorithm call, 675/21 mandatory conflict analysis missing yields
-//! insufficiency, 675/32 identical rival predictions are nondiscriminative,
-//! 675/45 exact replay is deterministic). The remaining 28 of 51 are
-//! deferred per START.md s1; #969 admission is separate. Deferred: 675/22,
-//! 675/23, 675/24, 675/25, 675/26, 675/27, 675/28, 675/29, 675/30, 675/31,
+//! insufficiency, 675/22 every rival retains its support, counterevidence,
+//! assumptions, and predictions, 675/23 shared common-mode lineage is
+//! preserved verbatim, 675/24 evidence count cannot choose a winner, 675/32
+//! identical rival predictions are nondiscriminative, 675/45 exact replay is
+//! deterministic). The remaining 25 of 51 are deferred per START.md s1; #969
+//! admission is separate. Deferred: 675/25, 675/26, 675/27, 675/28, 675/29,
+//! 675/30, 675/31,
 //! 675/33, 675/34, 675/35, 675/36, 675/37, 675/38, 675/39, 675/40, 675/41,
 //! 675/42, 675/43, 675/44, 675/46, 675/47, 675/48, 675/49, 675/50, 675/51.
 
@@ -220,6 +223,22 @@ pub const SLICE6_IMPLEMENTED_CASES: &[u8] = &[18, 19, 20];
 pub const SLICE6_REMAINDER_CASES: &[u8] = &[
     22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 46, 47,
     48, 49, 50, 51,
+];
+
+/// Cases covered by the seventh bounded implementation slice.
+///
+/// Rival-set epistemics: every rival retains its support, counterevidence,
+/// assumptions, and predictions (675/22), shared model/source/evaluator/
+/// fixture lineage with its residual uncertainty is preserved verbatim
+/// (675/23), and evidence or source count never selects a winner (675/24).
+/// Every path binds the existing `RivalMechanism`, `CommonModeDisclosure`,
+/// and strongest-current vocabulary; no new canonical contracts are required.
+pub const SLICE7_IMPLEMENTED_CASES: &[u8] = &[22, 23, 24];
+
+/// Cases deliberately left for later slices after slice 7.
+pub const SLICE7_REMAINDER_CASES: &[u8] = &[
+    25, 26, 27, 28, 29, 30, 31, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 46, 47, 48, 49, 50,
+    51,
 ];
 
 /// Canonical A03 evidence supplied to the first A40 package boundary.
@@ -2721,7 +2740,7 @@ pub fn diagnose_development_gap(
 }
 
 // ---------------------------------------------------------------------------
-// Tests (proportionate: 23 of 51 cases; remainder deferred per START.md s1).
+// Tests (proportionate: 26 of 51 cases; remainder deferred per START.md s1).
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -2754,6 +2773,8 @@ mod tests {
     use super::SLICE5_REMAINDER_CASES;
     use super::SLICE6_IMPLEMENTED_CASES;
     use super::SLICE6_REMAINDER_CASES;
+    use super::SLICE7_IMPLEMENTED_CASES;
+    use super::SLICE7_REMAINDER_CASES;
     use super::diagnose_development_gap;
     use super::is_hex64_lower;
     use super::outcome_rejection_hint;
@@ -4511,5 +4532,301 @@ mod tests {
         assert_eq!(first.outcome, DiagnosisOutcome::Complete);
         assert_eq!(first.candidate_digest, second.candidate_digest);
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn slice7_remainder_map_covers_the_declared_denominator() {
+        let mut seen = [false; 52];
+        for case in SLICE1_IMPLEMENTED_CASES
+            .iter()
+            .chain(SLICE2_IMPLEMENTED_CASES.iter())
+            .chain(SLICE3_IMPLEMENTED_CASES.iter())
+            .chain(SLICE4_IMPLEMENTED_CASES.iter())
+            .chain(SLICE5_IMPLEMENTED_CASES.iter())
+            .chain(SLICE6_IMPLEMENTED_CASES.iter())
+            .chain(SLICE7_IMPLEMENTED_CASES.iter())
+            .chain(SLICE7_REMAINDER_CASES.iter())
+        {
+            assert!((1..=51).contains(case));
+            assert!(!seen[usize::from(*case)]);
+            seen[usize::from(*case)] = true;
+        }
+        assert!(seen[1..].iter().all(|present| *present));
+    }
+
+    // WORK_UNIT_CASE: 675/22
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn case_22_every_rival_retains_its_epistemic_accounting() {
+        let job = test_job();
+        let draft = test_draft();
+        let product = test_product();
+        let discriminator = test_discriminator();
+        let repairs = test_repairs();
+        let conflict = test_conflict();
+        let common_mode = test_common_mode();
+        let experiments = [test_experiment()].to_vec();
+        let policy = test_policy();
+
+        let candidate = run_valid();
+        assert_eq!(candidate.outcome, DiagnosisOutcome::Complete);
+        assert_eq!(candidate.rivals.len(), 2);
+        assert_eq!(candidate.rivals_live, 2);
+        assert_eq!(candidate.rivals[0].rival_id, "rival-a");
+        assert_eq!(candidate.rivals[0].status, RivalStatus::Live);
+        assert_eq!(candidate.rivals[0].falsifying_evidence, None);
+        assert_eq!(candidate.rivals[1].rival_id, "rival-b");
+        assert_eq!(candidate.rivals[1].status, RivalStatus::Live);
+
+        let mut retained = test_rivals();
+        let mut eliminated = test_rival("rival-c", "confirmation stays absent under load L");
+        eliminated.status = RivalStatus::Falsified;
+        eliminated.status_reason =
+            "confirmation observed on replay under load for rival-c".to_owned();
+        eliminated.counterevidence_refs = ["ev-9".to_owned()].to_vec();
+        retained.push(eliminated);
+        let Ok(preserved) = diagnose_development_gap(
+            &job,
+            &draft,
+            &product,
+            &discriminator,
+            &repairs,
+            &conflict,
+            &retained,
+            &common_mode,
+            &experiments,
+            &policy,
+        ) else {
+            panic!("a falsified rival with counterevidence stays preserved");
+        };
+        assert_eq!(preserved.outcome, DiagnosisOutcome::Complete);
+        assert_eq!(preserved.rivals.len(), 3);
+        assert_eq!(preserved.rivals_live, 2);
+        assert_eq!(preserved.rivals_falsified, 1);
+        assert_eq!(
+            preserved.rivals[2].falsifying_evidence,
+            Some("ev-9".to_owned())
+        );
+        assert!(preserved.preservation.overall().is_ok());
+
+        let mut bare = test_rival("rival-a", "confirmation stays absent under load L");
+        bare.predicted_observations = Vec::new();
+        let Ok(rejected) = diagnose_development_gap(
+            &job,
+            &draft,
+            &product,
+            &discriminator,
+            &repairs,
+            &conflict,
+            &[bare],
+            &common_mode,
+            &experiments,
+            &policy,
+        ) else {
+            panic!("a rival without predictions stays an inert outcome");
+        };
+        assert_eq!(rejected.outcome, DiagnosisOutcome::Rejected);
+        assert_eq!(rejected.recommended_experiment, None);
+
+        let mut unsupported = test_rival("rival-a", "confirmation stays absent under load L");
+        unsupported.support_refs = Vec::new();
+        assert!(unsupported.unknown_refs.is_empty());
+        let Ok(rejected) = diagnose_development_gap(
+            &job,
+            &draft,
+            &product,
+            &discriminator,
+            &repairs,
+            &conflict,
+            &[unsupported],
+            &common_mode,
+            &experiments,
+            &policy,
+        ) else {
+            panic!("a rival without support or unknown evidence stays an inert outcome");
+        };
+        assert_eq!(rejected.outcome, DiagnosisOutcome::Rejected);
+        assert_eq!(rejected.recommended_experiment, None);
+
+        let mut unproven = test_rival("rival-a", "confirmation stays absent under load L");
+        unproven.status = RivalStatus::Falsified;
+        assert!(unproven.counterevidence_refs.is_empty());
+        let Ok(rejected) = diagnose_development_gap(
+            &job,
+            &draft,
+            &product,
+            &discriminator,
+            &repairs,
+            &conflict,
+            &[unproven],
+            &common_mode,
+            &experiments,
+            &policy,
+        ) else {
+            panic!("a falsified rival without counterevidence stays an inert outcome");
+        };
+        assert_eq!(rejected.outcome, DiagnosisOutcome::Rejected);
+        assert_eq!(rejected.recommended_experiment, None);
+
+        let mut self_falsified = test_rival("rival-a", "confirmation stays absent under load L");
+        self_falsified.falsifier = "rival-a".to_owned();
+        let Ok(rejected) = diagnose_development_gap(
+            &job,
+            &draft,
+            &product,
+            &discriminator,
+            &repairs,
+            &conflict,
+            &[self_falsified],
+            &common_mode,
+            &experiments,
+            &policy,
+        ) else {
+            panic!("a rival label as its own falsifier stays an inert outcome");
+        };
+        assert_eq!(rejected.outcome, DiagnosisOutcome::Rejected);
+        assert_eq!(rejected.recommended_experiment, None);
+    }
+
+    // WORK_UNIT_CASE: 675/23
+    #[test]
+    fn case_23_shared_common_mode_lineage_is_preserved_verbatim() {
+        let candidate = run_valid();
+        assert_eq!(candidate.outcome, DiagnosisOutcome::Complete);
+        assert_eq!(candidate.common_mode, test_common_mode());
+        assert_eq!(
+            candidate.common_mode.shared_model_note,
+            "no shared model lineage across rivals"
+        );
+        assert_eq!(
+            candidate.common_mode.shared_source_note,
+            "both rivals read run seven from source rev nine"
+        );
+        assert_eq!(
+            candidate.common_mode.shared_evaluator_note,
+            "verifier nine evaluates both rivals"
+        );
+        assert_eq!(
+            candidate.common_mode.shared_fixture_note,
+            "no shared fixture lineage across rivals"
+        );
+        assert_eq!(
+            candidate.common_mode.uncertainty_note,
+            "shared run seven keeps a common-mode observation risk"
+        );
+        assert!(candidate.preservation.overall().is_ok());
+
+        let job = test_job();
+        let draft = test_draft();
+        let product = test_product();
+        let discriminator = test_discriminator();
+        let repairs = test_repairs();
+        let conflict = test_conflict();
+        let rivals = test_rivals();
+        let experiments = [test_experiment()].to_vec();
+        let policy = test_policy();
+
+        let mut blank = test_common_mode();
+        blank.shared_evaluator_note = String::new();
+        let result = diagnose_development_gap(
+            &job,
+            &draft,
+            &product,
+            &discriminator,
+            &repairs,
+            &conflict,
+            &rivals,
+            &blank,
+            &experiments,
+            &policy,
+        );
+        let Err(err) = result else {
+            panic!("a blank common-mode lineage note must fail");
+        };
+        assert!(matches!(
+            err,
+            super::DiagnosisError::Shape {
+                field: "common-mode.evaluator",
+                ..
+            }
+        ));
+    }
+
+    // WORK_UNIT_CASE: 675/24
+    #[test]
+    fn case_24_evidence_count_cannot_choose_a_winner() {
+        let job = test_job();
+        let draft = test_draft();
+        let product = test_product();
+        let discriminator = test_discriminator();
+        let repairs = test_repairs();
+        let conflict = test_conflict();
+        let common_mode = test_common_mode();
+        let experiments = [test_experiment()].to_vec();
+        let policy = test_policy();
+
+        let mut heavy = test_rival("rival-a", "confirmation stays absent under load L");
+        heavy.support_refs = [
+            "ev-1".to_owned(),
+            "ev-2".to_owned(),
+            "ev-3".to_owned(),
+            "ev-4".to_owned(),
+            "ev-5".to_owned(),
+        ]
+        .to_vec();
+        let rivals = [
+            heavy,
+            test_rival("rival-b", "confirmation renders late under load L"),
+        ]
+        .to_vec();
+        let Ok(candidate) = diagnose_development_gap(
+            &job,
+            &draft,
+            &product,
+            &discriminator,
+            &repairs,
+            &conflict,
+            &rivals,
+            &common_mode,
+            &experiments,
+            &policy,
+        ) else {
+            panic!("count-skewed support stays an inert complete diagnosis");
+        };
+        assert_eq!(candidate.outcome, DiagnosisOutcome::Complete);
+        assert_eq!(candidate.rivals_live, 2);
+        assert_eq!(candidate.rivals_falsified, 0);
+        assert_eq!(candidate.strongest_current, None);
+        assert!(candidate.recommended_experiment.is_some());
+        assert!(candidate.preservation.overall().is_ok());
+
+        let mut decided = test_rivals();
+        decided[1].status = RivalStatus::Falsified;
+        decided[1].status_reason =
+            "confirmation observed on replay under load for rival-b".to_owned();
+        decided[1].counterevidence_refs = ["ev-9".to_owned()].to_vec();
+        let mut resolving = test_experiment();
+        resolving.resolves_assumption = Some("assumption-load-holds".to_owned());
+        let resolving = [resolving].to_vec();
+        let Ok(candidate) = diagnose_development_gap(
+            &job,
+            &draft,
+            &product,
+            &discriminator,
+            &repairs,
+            &conflict,
+            &decided,
+            &common_mode,
+            &resolving,
+            &policy,
+        ) else {
+            panic!("exact elimination evidence admits a strongest-current claim");
+        };
+        assert_eq!(candidate.outcome, DiagnosisOutcome::Complete);
+        assert_eq!(candidate.rivals_live, 1);
+        assert_eq!(candidate.rivals_falsified, 1);
+        assert_eq!(candidate.strongest_current, Some("rival-a".to_owned()));
+        assert!(!candidate.strongest_limits_note.trim().is_empty());
+        assert!(candidate.recommended_experiment.is_some());
     }
 }
