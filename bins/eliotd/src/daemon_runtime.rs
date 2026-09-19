@@ -646,8 +646,7 @@ fn start_valid_claim_step(
     let kernel_clone = Arc::clone(kernel);
     let future: Pin<Box<dyn std::future::Future<Output = ActivationCompletion>>> =
         Box::pin(async move {
-            let outcome =
-                dispatch_agent_activation_result(&kernel_clone, &ticket, result).await;
+            let outcome = dispatch_agent_activation_result(&kernel_clone, &ticket, result).await;
             ActivationCompletion::Dispatch(outcome)
         });
     Ok(Some(ActivationFlightState {
@@ -2039,7 +2038,7 @@ mod tests {
         clippy::expect_used,
         reason = "839 dispatch batch test: deterministic fixture construction only, no production path"
     )]
-    fn unknown_reconnect_reconciles_without_second_governor_read() {
+    fn unknown_reconnect_and_retained_replay_avoid_second_governor_read() {
         use std::cell::Cell;
         use std::num::NonZeroU64;
 
@@ -2106,6 +2105,22 @@ mod tests {
             }
             other => panic!("expected typed Unknown, got {other:?}"),
         }
+
+        // A durable retained record surviving the reconnect answers the same
+        // query as Reconciled. The daemon settles the original result
+        // identity verbatim; it never asks Governor to resolve the ticket a
+        // second time.
+        let reconciled = AgentActivationResultAck::reconciled(&result).expect("reconciled ack");
+        classify_reconcile_ack(
+            &ticket,
+            &result,
+            &reconciled,
+            "injected acknowledgement loss",
+        )
+        .expect("retained replay settles");
+        assert_eq!(reconciled.ticket_id, original_ticket);
+        assert_eq!(reconciled.result_sha256, original_sha);
+        assert_eq!(reconciled.result.as_ref(), Some(&result));
         assert_eq!(
             resolver_calls.get(),
             1,
