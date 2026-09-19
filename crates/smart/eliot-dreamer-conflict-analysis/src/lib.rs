@@ -39,20 +39,24 @@
 //! validation. There are no placeholder, mock, canned, or pseudo paths:
 //! every branch binds an explicit input field.
 //!
-//! Test coverage note: 10 of 68 `WORK_UNIT_CASE 673/*` cases execute here
+//! Test coverage note: 15 of 68 `WORK_UNIT_CASE 673/*` cases execute here
 //! (673/1 valid completes, 673/2 wrong job and scope fail closed, 673/3
-//! empty and single position are not conflicts, 673/10 shared lineage stays
-//! one root, 673/14 majority count cannot choose a winner, 673/19 compatible
-//! scope stays residue, 673/40 nondiscriminative probe rejected, 673/51
-//! Concilium-review recommendation carries no plan, 673/4 receipt and fence
-//! mismatch fails closed, 673/60 irrelevant order preserves digest). The
-//! remaining 58 of 68 are deferred per queue-item scope; workspace admission
-//! (#969), Product Pulse, and Edge proof remain separate. Deferred: 673/5, 673/6, 673/7, 673/8, 673/9, 673/11, 673/12, 673/13, 673/15,
+//! empty and single position are not conflicts, 673/5 duplicate and changed
+//! identities fail closed, 673/6 complete/partial/stale/blocked/withheld
+//! denominators stay explicit, 673/7 exact replay preserves digest while
+//! changed content moves it, 673/10 shared lineage stays one root, 673/14
+//! majority count cannot choose a winner, 673/19 compatible scope stays
+//! residue, 673/40 nondiscriminative probe rejected, 673/51 Concilium-review
+//! recommendation carries no plan, 673/4 receipt and fence mismatch fails
+//! closed, 673/60 irrelevant order preserves digest, 673/61 exact and one-over
+//! limits fail closed, 673/62 cancellation and deadline emit blocked/stale).
+//! The remaining 53 of 68 are deferred per queue-item scope; workspace
+//! admission (#969), Product Pulse, and Edge proof remain separate. Deferred: 673/8, 673/9, 673/11, 673/12, 673/13, 673/15,
 //! 673/16, 673/17, 673/18, 673/20, 673/21, 673/22, 673/23, 673/24, 673/25,
 //! 673/26, 673/27, 673/28, 673/29, 673/30, 673/31, 673/32, 673/33, 673/34,
 //! 673/35, 673/36, 673/37, 673/38, 673/39, 673/41, 673/42, 673/43, 673/44,
 //! 673/45, 673/46, 673/47, 673/48, 673/49, 673/50, 673/52, 673/53, 673/54,
-//! 673/55, 673/56, 673/57, 673/58, 673/59, 673/61, 673/62, 673/63, 673/64,
+//! 673/55, 673/56, 673/57, 673/58, 673/59, 673/63, 673/64,
 //! 673/65, 673/66, 673/67, 673/68.
 
 #![forbid(unsafe_code)]
@@ -3147,5 +3151,564 @@ mod tests {
             assumption_id: "assumption-1".to_owned(),
             assumption_digest: "a".repeat(64),
         };
+    }
+
+    // WORK_UNIT_CASE: 673/5
+    #[test]
+    fn case_05_duplicate_and_changed_identities_fail_closed() {
+        let item = test_item();
+        let draft = test_draft();
+        let grounded = test_grounded();
+        let receipt = test_receipt();
+        let policy = test_policy();
+        let duplicate_positions = ConflictSet::new(ConflictSetParams {
+            conflict_id: "conflict-duplicate".to_owned(),
+            kind: ConflictKind::Epistemic,
+            scope: "scope-1".to_owned(),
+            task_id: None,
+            positions: vec![
+                test_position("source-a", "cache helps tail latency", false),
+                test_position("source-a", "cache helps tail latency greatly", false),
+            ],
+            evidence_refs: BTreeSet::new(),
+            owners: BTreeSet::from([SourceId::new("source-a").expect("valid source")]),
+            common_lineage: BTreeSet::new(),
+            resolved_parts: BTreeSet::new(),
+            unresolved: BTreeSet::from(["tail latency effect".to_owned()]),
+            unresolved_owners: BTreeSet::from([SourceId::new("source-a").expect("valid source")]),
+            acceptability: ArgumentAcceptability::Contested,
+            defeated_refs: BTreeSet::new(),
+            probe: None,
+            decision_owner: SourceId::new("source-a").expect("valid source"),
+            affected_actions: vec!["decide-cache".to_owned()],
+            lifecycle: ConflictLifecycle::Open,
+            receipt_digest: receipt.bundle_digest.clone(),
+        })
+        .expect("duplicate source shape stays constructible");
+        let err = match analyze_conflict(
+            &item,
+            &draft,
+            &grounded,
+            &duplicate_positions,
+            &test_supplements(),
+            &policy,
+        ) {
+            Ok(candidate) => panic!("duplicate position must fail: {:?}", candidate.outcome),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, ConflictAnalysisError::Denominator { .. }),
+            "duplicate position source identity fails closed: {err:?}"
+        );
+        let mut duplicate_objections = test_supplements();
+        duplicate_objections.objections.push(SuppliedObjection {
+            objection_id: "obj-1".to_owned(),
+            target_source: "source-b".to_owned(),
+            statement: "changed objection meaning for the same identity".to_owned(),
+            grounded: false,
+        });
+        let err = match analyze_conflict(
+            &item,
+            &draft,
+            &grounded,
+            &test_conflict(),
+            &duplicate_objections,
+            &policy,
+        ) {
+            Ok(candidate) => panic!("duplicate objection must fail: {:?}", candidate.outcome),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, ConflictAnalysisError::Denominator { .. }),
+            "duplicate objection identity fails closed: {err:?}"
+        );
+        let mut duplicate_lineage = test_supplements();
+        duplicate_lineage.lineage.push(LineageAttribution {
+            source_handle: "source-a".to_owned(),
+            lineage_root: "root-changed".to_owned(),
+            known: true,
+        });
+        let err = match analyze_conflict(
+            &item,
+            &draft,
+            &grounded,
+            &test_conflict(),
+            &duplicate_lineage,
+            &policy,
+        ) {
+            Ok(candidate) => panic!("duplicate lineage must fail: {:?}", candidate.outcome),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, ConflictAnalysisError::Denominator { .. }),
+            "duplicate lineage source identity fails closed: {err:?}"
+        );
+    }
+
+    // WORK_UNIT_CASE: 673/6
+    #[test]
+    fn case_06_denominators_stay_explicit() {
+        let item = test_item();
+        let draft = test_draft();
+        let grounded = test_grounded();
+        let complete = match analyze_conflict(
+            &item,
+            &draft,
+            &grounded,
+            &test_conflict(),
+            &test_supplements(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("complete denominator: {err:?}"),
+        };
+        assert_eq!(complete.outcome, ConflictOutcome::Complete);
+        assert_eq!(complete.positions.len(), 2);
+        let mut withheld = test_supplements();
+        withheld
+            .lineage
+            .retain(|entry| entry.source_handle != "source-b");
+        let mut partial_policy = test_policy();
+        partial_policy.allow_partial = true;
+        let partial = match analyze_conflict(
+            &item,
+            &draft,
+            &grounded,
+            &test_conflict(),
+            &withheld,
+            &partial_policy,
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("partial denominator: {err:?}"),
+        };
+        assert_eq!(partial.outcome, ConflictOutcome::Partial);
+        assert_eq!(partial.positions.len(), 2);
+        assert!(
+            partial
+                .lineage_groups
+                .iter()
+                .any(|group| !group.known && group.member_sources.contains(&"source-b".to_owned()))
+        );
+        assert!(
+            partial
+                .common_mode_risks
+                .iter()
+                .any(|risk| risk.kind == "unknown_lineage")
+        );
+        assert!(
+            partial.independent_root_count < complete.independent_root_count
+                || partial.independent_root_count == 1
+        );
+        let mut stale_policy = test_policy();
+        stale_policy.observation_time_ms = Some(1_800_000_000_000);
+        stale_policy.deadline_ms = Some(1_800_000_000_000);
+        let stale = match analyze_conflict(
+            &item,
+            &draft,
+            &grounded,
+            &test_conflict(),
+            &test_supplements(),
+            &stale_policy,
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("stale denominator: {err:?}"),
+        };
+        assert_eq!(stale.outcome, ConflictOutcome::Stale);
+        assert_eq!(stale.positions.len(), 2);
+        let mut blocked_policy = test_policy();
+        blocked_policy.cancelled = true;
+        let blocked = match analyze_conflict(
+            &item,
+            &draft,
+            &grounded,
+            &test_conflict(),
+            &test_supplements(),
+            &blocked_policy,
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("blocked denominator: {err:?}"),
+        };
+        assert_eq!(blocked.outcome, ConflictOutcome::Blocked);
+        assert_eq!(blocked.positions.len(), 2);
+        assert!(blocked.recommended_probes.is_empty());
+    }
+
+    // WORK_UNIT_CASE: 673/7
+    #[test]
+    fn case_07_exact_replay_matches_changed_content_moves_digest() {
+        let item = test_item();
+        let draft = test_draft();
+        let grounded = test_grounded();
+        let conflict = test_conflict();
+        let supplements = test_supplements();
+        let policy = test_policy();
+        let first =
+            match analyze_conflict(&item, &draft, &grounded, &conflict, &supplements, &policy) {
+                Ok(candidate) => candidate,
+                Err(err) => panic!("first replay: {err:?}"),
+            };
+        let second =
+            match analyze_conflict(&item, &draft, &grounded, &conflict, &supplements, &policy) {
+                Ok(candidate) => candidate,
+                Err(err) => panic!("second replay: {err:?}"),
+            };
+        assert_eq!(first.candidate_digest, second.candidate_digest);
+        assert_eq!(first.outcome, second.outcome);
+        assert!(is_hex64_lower(&first.candidate_digest));
+        let receipt = test_receipt();
+        let changed = ConflictSet::new(ConflictSetParams {
+            conflict_id: "conflict-1".to_owned(),
+            kind: ConflictKind::Epistemic,
+            scope: "scope-1".to_owned(),
+            task_id: None,
+            positions: vec![
+                test_position("source-a", "cache helps tail latency greatly", false),
+                test_position("source-b", "cache harms tail latency", true),
+            ],
+            evidence_refs: BTreeSet::new(),
+            owners: BTreeSet::from([
+                SourceId::new("source-a").expect("valid source"),
+                SourceId::new("source-b").expect("valid source"),
+            ]),
+            common_lineage: BTreeSet::new(),
+            resolved_parts: BTreeSet::new(),
+            unresolved: BTreeSet::from(["tail latency effect".to_owned()]),
+            unresolved_owners: BTreeSet::from([
+                SourceId::new("source-a").expect("valid source"),
+                SourceId::new("source-b").expect("valid source"),
+            ]),
+            acceptability: ArgumentAcceptability::Contested,
+            defeated_refs: BTreeSet::new(),
+            probe: None,
+            decision_owner: SourceId::new("source-a").expect("valid source"),
+            affected_actions: vec!["decide-cache".to_owned()],
+            lifecycle: ConflictLifecycle::Open,
+            receipt_digest: receipt.bundle_digest.clone(),
+        })
+        .expect("changed stance stays valid");
+        let third =
+            match analyze_conflict(&item, &draft, &grounded, &changed, &supplements, &policy) {
+                Ok(candidate) => candidate,
+                Err(err) => panic!("changed content: {err:?}"),
+            };
+        assert_ne!(
+            first.candidate_digest, third.candidate_digest,
+            "changed operation content must move the digest"
+        );
+        assert_eq!(third.outcome, ConflictOutcome::Complete);
+    }
+
+    // WORK_UNIT_CASE: 673/61
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn case_61_exact_and_one_over_limits_fail_closed() {
+        let item = test_item();
+        let draft = test_draft();
+        let grounded = test_grounded();
+        let receipt = test_receipt();
+        let mut tight = test_policy();
+        tight.max_positions = 2;
+        tight.max_sources = 2;
+        tight.max_objections = 1;
+        tight.max_probes = 1;
+        let exact = match analyze_conflict(
+            &item,
+            &draft,
+            &grounded,
+            &test_conflict(),
+            &test_supplements(),
+            &tight,
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("exact limits: {err:?}"),
+        };
+        assert_eq!(exact.outcome, ConflictOutcome::Complete);
+        let three_positions = ConflictSet::new(ConflictSetParams {
+            conflict_id: "conflict-1".to_owned(),
+            kind: ConflictKind::Epistemic,
+            scope: "scope-1".to_owned(),
+            task_id: None,
+            positions: vec![
+                test_position("source-a", "cache helps", false),
+                test_position("source-b", "cache harms", false),
+                test_position("source-c", "cache is neutral", false),
+            ],
+            evidence_refs: BTreeSet::new(),
+            owners: BTreeSet::from([SourceId::new("source-a").expect("valid source")]),
+            common_lineage: BTreeSet::new(),
+            resolved_parts: BTreeSet::new(),
+            unresolved: BTreeSet::from(["effect".to_owned()]),
+            unresolved_owners: BTreeSet::from([SourceId::new("source-a").expect("valid source")]),
+            acceptability: ArgumentAcceptability::Contested,
+            defeated_refs: BTreeSet::new(),
+            probe: None,
+            decision_owner: SourceId::new("source-a").expect("valid source"),
+            affected_actions: vec!["decide-cache".to_owned()],
+            lifecycle: ConflictLifecycle::Open,
+            receipt_digest: receipt.bundle_digest.clone(),
+        })
+        .expect("three positions stay within the canonical ceiling");
+        let err = match analyze_conflict(
+            &item,
+            &draft,
+            &grounded,
+            &three_positions,
+            &test_supplements(),
+            &tight,
+        ) {
+            Ok(candidate) => panic!("one-over positions must fail: {:?}", candidate.outcome),
+            Err(err) => err,
+        };
+        assert!(matches!(err, ConflictAnalysisError::Bounds { phase, .. } if phase == "positions"));
+        let mut one_over_lineage = test_supplements();
+        one_over_lineage.lineage.push(LineageAttribution {
+            source_handle: "source-extra".to_owned(),
+            lineage_root: "root-extra".to_owned(),
+            known: true,
+        });
+        let err = match analyze_conflict(
+            &item,
+            &draft,
+            &grounded,
+            &test_conflict(),
+            &one_over_lineage,
+            &tight,
+        ) {
+            Ok(candidate) => panic!("one-over lineage must fail: {:?}", candidate.outcome),
+            Err(err) => err,
+        };
+        assert!(matches!(err, ConflictAnalysisError::Bounds { phase, .. } if phase == "lineage"));
+        let mut one_over_objections = test_supplements();
+        one_over_objections.objections.push(SuppliedObjection {
+            objection_id: "obj-2".to_owned(),
+            target_source: "source-b".to_owned(),
+            statement: "second objection".to_owned(),
+            grounded: true,
+        });
+        let err = match analyze_conflict(
+            &item,
+            &draft,
+            &grounded,
+            &test_conflict(),
+            &one_over_objections,
+            &tight,
+        ) {
+            Ok(candidate) => panic!("one-over objections must fail: {:?}", candidate.outcome),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, ConflictAnalysisError::Bounds { phase, .. } if phase == "objections")
+        );
+        let mut one_over_probes = test_supplements();
+        one_over_probes
+            .supplied_probes
+            .push(test_discriminative_probe("probe-2"));
+        let err = match analyze_conflict(
+            &item,
+            &draft,
+            &grounded,
+            &test_conflict(),
+            &one_over_probes,
+            &tight,
+        ) {
+            Ok(candidate) => panic!("one-over probes must fail: {:?}", candidate.outcome),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, ConflictAnalysisError::Bounds { phase, .. } if phase == "supplied-probes")
+        );
+        let mut one_over_evidence = test_supplements();
+        one_over_evidence.counterevidence = (0..65)
+            .map(|index| format!("evidence-{index:02}"))
+            .collect();
+        let err = match analyze_conflict(
+            &item,
+            &draft,
+            &grounded,
+            &test_conflict(),
+            &one_over_evidence,
+            &test_policy(),
+        ) {
+            Ok(candidate) => panic!("one-over evidence must fail: {:?}", candidate.outcome),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, ConflictAnalysisError::Bounds { phase, .. } if phase == "counterevidence")
+        );
+        let exact_text = "x".repeat(MAX_TEXT_BYTES);
+        let exact_conflict = ConflictSet::new(ConflictSetParams {
+            conflict_id: "conflict-1".to_owned(),
+            kind: ConflictKind::Epistemic,
+            scope: "scope-1".to_owned(),
+            task_id: None,
+            positions: vec![
+                ConflictPosition::new(
+                    SourceId::new("source-a").expect("valid source"),
+                    exact_text,
+                    BTreeSet::from(["assumption-1".to_owned()]),
+                    BTreeSet::new(),
+                    false,
+                )
+                .expect("exact text stays valid"),
+                test_position("source-b", "cache harms tail latency", true),
+            ],
+            evidence_refs: BTreeSet::new(),
+            owners: BTreeSet::from([
+                SourceId::new("source-a").expect("valid source"),
+                SourceId::new("source-b").expect("valid source"),
+            ]),
+            common_lineage: BTreeSet::new(),
+            resolved_parts: BTreeSet::new(),
+            unresolved: BTreeSet::from(["tail latency effect".to_owned()]),
+            unresolved_owners: BTreeSet::from([
+                SourceId::new("source-a").expect("valid source"),
+                SourceId::new("source-b").expect("valid source"),
+            ]),
+            acceptability: ArgumentAcceptability::Contested,
+            defeated_refs: BTreeSet::new(),
+            probe: None,
+            decision_owner: SourceId::new("source-a").expect("valid source"),
+            affected_actions: vec!["decide-cache".to_owned()],
+            lifecycle: ConflictLifecycle::Open,
+            receipt_digest: receipt.bundle_digest.clone(),
+        })
+        .expect("exact text conflict stays constructible");
+        assert!(
+            analyze_conflict(
+                &item,
+                &draft,
+                &grounded,
+                &exact_conflict,
+                &test_supplements(),
+                &test_policy()
+            )
+            .is_ok(),
+            "exact text ceiling admits the analysis"
+        );
+        let over_text = "x".repeat(MAX_TEXT_BYTES + 1);
+        let over_conflict = ConflictSet::new(ConflictSetParams {
+            conflict_id: "conflict-1".to_owned(),
+            kind: ConflictKind::Epistemic,
+            scope: "scope-1".to_owned(),
+            task_id: None,
+            positions: vec![
+                ConflictPosition::new(
+                    SourceId::new("source-a").expect("valid source"),
+                    over_text,
+                    BTreeSet::from(["assumption-1".to_owned()]),
+                    BTreeSet::new(),
+                    false,
+                )
+                .expect("one-over text stays within the canonical ceiling"),
+                test_position("source-b", "cache harms tail latency", true),
+            ],
+            evidence_refs: BTreeSet::new(),
+            owners: BTreeSet::from([
+                SourceId::new("source-a").expect("valid source"),
+                SourceId::new("source-b").expect("valid source"),
+            ]),
+            common_lineage: BTreeSet::new(),
+            resolved_parts: BTreeSet::new(),
+            unresolved: BTreeSet::from(["tail latency effect".to_owned()]),
+            unresolved_owners: BTreeSet::from([
+                SourceId::new("source-a").expect("valid source"),
+                SourceId::new("source-b").expect("valid source"),
+            ]),
+            acceptability: ArgumentAcceptability::Contested,
+            defeated_refs: BTreeSet::new(),
+            probe: None,
+            decision_owner: SourceId::new("source-a").expect("valid source"),
+            affected_actions: vec!["decide-cache".to_owned()],
+            lifecycle: ConflictLifecycle::Open,
+            receipt_digest: receipt.bundle_digest.clone(),
+        })
+        .expect("one-over text stays within the canonical ceiling");
+        let err = match analyze_conflict(
+            &item,
+            &draft,
+            &grounded,
+            &over_conflict,
+            &test_supplements(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => panic!("one-over text must fail: {:?}", candidate.outcome),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, ConflictAnalysisError::Shape { field, .. } if field == "position.stance")
+        );
+    }
+
+    // WORK_UNIT_CASE: 673/62
+    #[test]
+    fn case_62_cancellation_and_deadline_emit_blocked_or_stale() {
+        let item = test_item();
+        let draft = test_draft();
+        let grounded = test_grounded();
+        let conflict = test_conflict();
+        let supplements = test_supplements();
+        let mut cancelled = test_policy();
+        cancelled.cancelled = true;
+        let blocked = match analyze_conflict(
+            &item,
+            &draft,
+            &grounded,
+            &conflict,
+            &supplements,
+            &cancelled,
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("cancelled analysis: {err:?}"),
+        };
+        assert_eq!(blocked.outcome, ConflictOutcome::Blocked);
+        assert!(blocked.recommended_probes.is_empty());
+        assert_eq!(blocked.positions.len(), 2);
+        assert!(!blocked.invalidation_conditions.is_empty());
+        assert!(blocked.preservation.validate().is_ok());
+        let mut past_deadline = test_policy();
+        past_deadline.observation_time_ms = Some(1_800_000_000_001);
+        past_deadline.deadline_ms = Some(1_800_000_000_000);
+        let stale = match analyze_conflict(
+            &item,
+            &draft,
+            &grounded,
+            &conflict,
+            &supplements,
+            &past_deadline,
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("past-deadline analysis: {err:?}"),
+        };
+        assert_eq!(stale.outcome, ConflictOutcome::Stale);
+        assert!(stale.recommended_probes.is_empty());
+        assert_eq!(stale.positions.len(), 2);
+        let mut at_deadline = test_policy();
+        at_deadline.observation_time_ms = Some(1_800_000_000_000);
+        at_deadline.deadline_ms = Some(1_800_000_000_000);
+        let edge = match analyze_conflict(
+            &item,
+            &draft,
+            &grounded,
+            &conflict,
+            &supplements,
+            &at_deadline,
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("deadline-edge analysis: {err:?}"),
+        };
+        assert_eq!(edge.outcome, ConflictOutcome::Stale);
+        let live = match analyze_conflict(
+            &item,
+            &draft,
+            &grounded,
+            &conflict,
+            &supplements,
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("live analysis: {err:?}"),
+        };
+        assert_eq!(live.outcome, ConflictOutcome::Complete);
+        assert_eq!(live.recommended_probes.len(), 1);
     }
 }
