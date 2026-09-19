@@ -1,12 +1,24 @@
-//! Work-unit 610 slice 1: bounded discriminative probe planner, cases 1..5
+//! Work-unit 610 slice 2: bounded discriminative probe planner, cases 1..8
 //! (valid two-rival probe, multi-rival result matrix, exact
 //! objective/result/affordance/disposition vocabulary, bound-input
-//! mismatch, duplicate collapse).
+//! mismatch, duplicate collapse, vague/no-gain objective gating,
+//! exact evidence/verifier-gap plannability, per-descriptor scope
+//! exclusion).
 //!
 //! Cases 610/1, 610/4 and 610/5 are marked on the existing planner
-//! behaviour tests in `tests/probe_plan.rs`. Cases 610/6..42 (objective
-//! semantics, result-schema discipline, budget/dominance, replay and
-//! no-execution proof) remain QUEUED on issue #610.
+//! behaviour tests in `tests/probe_plan.rs`. Cases 610/9..42 (result-schema
+//! discipline, budget/dominance, replay and no-execution proof) remain
+//! QUEUED on issue #610.
+//!
+//! Ownership ruling 610/6-8 (planner-side descriptor gating only; no new
+//! APIs): 610/6 OWNED via `InformationDimension::has_expected_gain` false
+//! for `NoGain`/`Unavailable` and the planner `Unprobeable` gate; 610/7
+//! OWNED via the 1:1 `AffordanceTarget` -> `ProbeTarget` projection for
+//! `EvidenceGap`/`Objective` with exact result schemas; 610/8 SPLIT -
+//! per-descriptor applicability-scope exclusion OWNED via the planner scope
+//! gate, while resolved/nonmaterial materiality judgment stays with A-03
+//! `ProbeObjective` declarations (planner sees only `ProbeObjectiveRef`).
+//! Docs route=sha256:1b9bbbd8b5bb5e2de4737b4fa03e7e3672daba4394afef443dd3d8476554c7fa read=sha256:ea79ca7e06dbc95bb6ebceb4b5d904a848f265540ab58d6e82d93d5878599ec6 bundle=5ca78f97ee5f6485f6ab552d6687ade11da053a68be0cb38339167aeac0be7f3 (generic-source; verified bundle read in full plus I09-03, I09-05, I21-03, I12-18, I12-22, I13-07, I15-02, I15-04, I05-27, I05-16, I07-20 read directly).
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
@@ -56,8 +68,12 @@ fn digest(seed: &str) -> String {
 }
 
 fn bounds() -> ValidityBounds {
+    bounds_scoped("scope-1")
+}
+
+fn bounds_scoped(scope: &str) -> ValidityBounds {
     must(ValidityBounds::new(
-        "scope-1",
+        scope,
         None,
         None,
         "v1",
@@ -402,4 +418,86 @@ fn objective_result_affordance_disposition_vocabulary() {
     assert_eq!(omission_kinds.len(), 3);
     assert!(omission_kinds.windows(2).all(|pair| pair[0] != pair[1]));
     assert_ne!(omission_kinds[0], omission_kinds[2]);
+}
+
+// WORK_UNIT_CASE: 610/6
+#[test]
+fn vague_no_gain_objective_is_unprobeable() {
+    let mut vague_params = descriptor_params("aff-vague", gap_target("claim-vague"));
+    vague_params.information = InformationDimension::NoGain {
+        reason: "curiosity read with no expected gain".to_owned(),
+    };
+    let vague = must(InquiryAffordanceDescriptor::new(vague_params));
+    assert!(!vague.information.has_expected_gain());
+
+    let mut withheld_params = descriptor_params("aff-withheld", gap_target("claim-withheld"));
+    withheld_params.information = InformationDimension::Unavailable {
+        reason: "gain characterization withheld".to_owned(),
+    };
+    let withheld = must(InquiryAffordanceDescriptor::new(withheld_params));
+    assert!(!withheld.information.has_expected_gain());
+
+    let plan = plan_for(vec![vague, withheld], Some(16));
+    must(plan.validate());
+    assert!(plan.probes.is_empty());
+    assert_eq!(plan.omissions.len(), 2);
+    for omission in &plan.omissions {
+        assert_eq!(omission.kind, OmissionKind::Unprobeable);
+        must(omission.target.validate());
+        assert!(
+            omission.reason.contains("NO_GAIN") || omission.reason.contains("UNAVAILABLE"),
+            "vague objective must cite the information gate, got {}",
+            omission.reason
+        );
+    }
+}
+
+// WORK_UNIT_CASE: 610/7
+#[test]
+fn exact_evidence_verifier_gap_objective_is_plannable() {
+    let gap = descriptor("aff-exact-gap", gap_target("claim-exact"));
+    let objective_descriptor =
+        descriptor("aff-exact-objective", objective_target("objective-exact"));
+    let plan = plan_for(vec![gap, objective_descriptor], Some(16));
+    must(plan.validate());
+    assert_eq!(plan.probes.len(), 2);
+    assert!(plan.omissions.is_empty());
+
+    let mut seen_gap = false;
+    let mut seen_objective = false;
+    for probe in &plan.probes {
+        match &probe.target {
+            ProbeTarget::EvidenceUnknown { claim } => {
+                assert_eq!(claim.claim_id.as_str(), "claim-exact");
+                seen_gap = true;
+            }
+            ProbeTarget::ObjectiveUnknown { objective } => {
+                assert_eq!(objective.objective_id.as_str(), "objective-exact");
+                seen_objective = true;
+            }
+            other => panic!("exact gap probe must name a gap or objective, got {other:?}"),
+        }
+        must(probe.result_schema.validate());
+        assert_eq!(probe.probe_id, probe.affordance.affordance_id);
+        assert!(!probe.expected_discrimination.trim().is_empty());
+    }
+    assert!(seen_gap && seen_objective);
+}
+
+// WORK_UNIT_CASE: 610/8
+#[test]
+fn out_of_scope_descriptor_is_unprobeable() {
+    let mut scoped_params = descriptor_params("aff-foreign", gap_target("claim-foreign"));
+    scoped_params.applicability = bounds_scoped("scope-other");
+    let foreign = must(InquiryAffordanceDescriptor::new(scoped_params));
+    let local = descriptor("aff-local", gap_target("claim-local"));
+    let plan = plan_for(vec![foreign, local], Some(16));
+    must(plan.validate());
+    assert_eq!(plan.probes.len(), 1);
+    assert_eq!(plan.probes[0].probe_id.as_str(), "aff-local");
+    assert_eq!(plan.omissions.len(), 1);
+    let omission = &plan.omissions[0];
+    assert_eq!(omission.kind, OmissionKind::Unprobeable);
+    assert_eq!(omission.affordance.affordance_id.as_str(), "aff-foreign");
+    assert!(omission.reason.contains("applicability scope"));
 }
