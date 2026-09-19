@@ -2278,3 +2278,403 @@ fn every_load_bearing_measurement_identity_changes_canonical_digest() {
         assert_ne!(variant, &baseline, "{name} must be a distinct value");
     }
 }
+
+fn all_quality_dimensions() -> Vec<QualityDimension> {
+    vec![
+        QualityDimension::AcceptanceDecisionCoverage,
+        QualityDimension::CausalOperationalSufficiency,
+        QualityDimension::ExactAnchorProvenanceCoverage,
+        QualityDimension::FreshnessStateFenceCoherence,
+        QualityDimension::RivalsConflictsUnknownsVisibility,
+        QualityDimension::NegativeMemoryInvariantCoverage,
+        QualityDimension::VerifierActionReadiness,
+        QualityDimension::RouteAccessibilityLayoutRisk,
+        QualityDimension::InstructionSufficiency,
+        QualityDimension::PayloadHandleReconstructionCost,
+        QualityDimension::KnownOmissionsExpansionPaths,
+        QualityDimension::TelemetryMeasurementCostCoverage,
+    ]
+}
+
+fn passing_dimension_result(
+    context: &ContextBinding,
+    dimension: QualityDimension,
+    evidence: &str,
+) -> QualityDimensionResult {
+    QualityDimensionResult {
+        dimension,
+        passed: true,
+        evidence: vec![id(evidence)],
+        measurements: Vec::new(),
+        failed_invariant: None,
+        unknown_evidence: Vec::new(),
+        proof_ceiling: ProofCeiling::Observation,
+        invalidation: None,
+        binding: context.clone(),
+    }
+}
+
+fn full_quality_scorecard(context: &ContextBinding) -> QualityScorecard {
+    let dimensions = all_quality_dimensions();
+    let results = dimensions
+        .iter()
+        .enumerate()
+        .map(|(index, dimension)| {
+            passing_dimension_result(context, *dimension, &format!("quality-evidence-{index}"))
+        })
+        .collect();
+    QualityScorecard {
+        binding: context.clone(),
+        results,
+    }
+}
+
+fn assembled_view() -> (AdmittedContextSet, ActiveUnderstandingView) {
+    let admitted = admitted_single();
+    let quality = full_quality_scorecard(&admitted.binding);
+    let rendered: Vec<RenderedAtom> = admitted
+        .records
+        .iter()
+        .map(RenderedAtom::from_admitted)
+        .collect();
+    let recipe_digest = digest();
+    let fence_digest = digest();
+    let output_digest = ActiveUnderstandingView::canonical_output_digest(
+        &admitted.binding,
+        &recipe_digest,
+        &fence_digest,
+        &rendered,
+    )
+    .expect("view output digest");
+    let rendered_bytes = ActiveUnderstandingView::canonical_output_utf8_bytes(
+        &admitted.binding,
+        &recipe_digest,
+        &fence_digest,
+        &rendered,
+    )
+    .expect("view output bytes");
+    let mut measurement = exact_measurement(&admitted.binding);
+    measurement.envelope_digest.clone_from(&output_digest);
+    measurement.rendered_utf8_bytes = rendered_bytes;
+    let view = ActiveUnderstandingView::assemble(
+        &admitted,
+        quality,
+        measurement,
+        output_digest,
+        recipe_digest,
+        fence_digest,
+    )
+    .expect("exact membership assembles");
+    (admitted, view)
+}
+
+// WORK_UNIT_CASE: 584/49
+#[test]
+fn exact_twelve_normative_quality_dimension_wire_names() {
+    let expected: Vec<(QualityDimension, &str)> = vec![
+        (
+            QualityDimension::AcceptanceDecisionCoverage,
+            "ACCEPTANCE_DECISION_COVERAGE",
+        ),
+        (
+            QualityDimension::CausalOperationalSufficiency,
+            "CAUSAL_OPERATIONAL_SUFFICIENCY",
+        ),
+        (
+            QualityDimension::ExactAnchorProvenanceCoverage,
+            "EXACT_ANCHOR_PROVENANCE_COVERAGE",
+        ),
+        (
+            QualityDimension::FreshnessStateFenceCoherence,
+            "FRESHNESS_STATE_FENCE_COHERENCE",
+        ),
+        (
+            QualityDimension::RivalsConflictsUnknownsVisibility,
+            "RIVALS_CONFLICTS_UNKNOWNS_VISIBILITY",
+        ),
+        (
+            QualityDimension::NegativeMemoryInvariantCoverage,
+            "NEGATIVE_MEMORY_INVARIANT_COVERAGE",
+        ),
+        (
+            QualityDimension::VerifierActionReadiness,
+            "VERIFIER_ACTION_READINESS",
+        ),
+        (
+            QualityDimension::RouteAccessibilityLayoutRisk,
+            "ROUTE_ACCESSIBILITY_LAYOUT_RISK",
+        ),
+        (
+            QualityDimension::InstructionSufficiency,
+            "INSTRUCTION_SUFFICIENCY",
+        ),
+        (
+            QualityDimension::PayloadHandleReconstructionCost,
+            "PAYLOAD_HANDLE_RECONSTRUCTION_COST",
+        ),
+        (
+            QualityDimension::KnownOmissionsExpansionPaths,
+            "KNOWN_OMISSIONS_EXPANSION_PATHS",
+        ),
+        (
+            QualityDimension::TelemetryMeasurementCostCoverage,
+            "TELEMETRY_MEASUREMENT_COST_COVERAGE",
+        ),
+    ];
+    assert_eq!(expected.len(), 12);
+    let mut seen = std::collections::BTreeSet::new();
+    for (dimension, wire) in &expected {
+        let value = serde_json::to_value(dimension).expect("dimension value");
+        assert_eq!(value, serde_json::Value::from(*wire));
+        let decoded: QualityDimension =
+            serde_json::from_str(&format!("\"{wire}\"")).expect("dimension round-trip");
+        assert_eq!(&decoded, dimension);
+        assert!(
+            seen.insert((*wire).to_owned()),
+            "wire name must be distinct"
+        );
+    }
+    assert_eq!(all_quality_dimensions().len(), 12);
+
+    // Wrong spellings, legacy aliases, blanks and nulls are rejected.
+    for bad in [
+        "\"ACCEPTANCE_DECISION_COVERAGE \"",
+        "\"acceptance_decision_coverage\"",
+        "\"ACCEPTANCE-DECISION-COVERAGE\"",
+        "\"QUALITY_DIMENSION\"",
+        "\"Other\"",
+        "\"UNKNOWN\"",
+        "\"\"",
+        "null",
+    ] {
+        assert!(
+            serde_json::from_str::<QualityDimension>(bad).is_err(),
+            "{bad} must be rejected"
+        );
+    }
+}
+
+// WORK_UNIT_CASE: 584/50
+#[test]
+fn each_quality_dimension_fails_independently() {
+    let context = binding();
+    let baseline = full_quality_scorecard(&context);
+    baseline.validate().expect("passing scorecard validates");
+    assert!(baseline.all_pass().expect("baseline evaluated"));
+
+    let mut digests = std::collections::BTreeSet::new();
+    for dimension in all_quality_dimensions() {
+        let mut single_failure = baseline.clone();
+        let result = single_failure
+            .results
+            .iter_mut()
+            .find(|result| result.dimension == dimension)
+            .expect("dimension present");
+        result.passed = false;
+        result.failed_invariant = Some(id("failed-invariant"));
+        single_failure
+            .validate()
+            .expect("single failure stays structurally valid");
+        assert!(
+            !single_failure.all_pass().expect("single failure evaluated"),
+            "{dimension:?} failure must be visible"
+        );
+        let failed = single_failure
+            .results
+            .iter()
+            .filter(|result| !result.passed)
+            .count();
+        assert_eq!(failed, 1, "exactly one dimension fails");
+        for result in &single_failure.results {
+            if result.dimension != dimension {
+                assert!(result.passed, "sibling dimension must stay passed");
+                assert_eq!(result.failed_invariant, None);
+                assert!(result.unknown_evidence.is_empty());
+            }
+        }
+        let digest = canonical_digest(&single_failure).expect("failure digest");
+        assert!(
+            digests.insert(digest),
+            "each single-dimension failure must be distinct"
+        );
+    }
+    assert_eq!(digests.len(), 12);
+}
+
+// WORK_UNIT_CASE: 584/51
+#[test]
+fn unknown_mandatory_quality_evidence_prevents_complete_quality() {
+    let context = binding();
+    let baseline = full_quality_scorecard(&context);
+    assert!(baseline.all_pass().expect("baseline evaluated"));
+
+    // Unknown evidence on a claimed pass fails closed at validation.
+    let mut unknown_pass = baseline.clone();
+    unknown_pass.results[0].unknown_evidence = vec![id("unknown-evidence")];
+    assert_eq!(
+        unknown_pass.validate(),
+        Err(ContextError::QualityIncomplete)
+    );
+    assert_ne!(unknown_pass.all_pass(), Ok(true));
+
+    // Unknown evidence on an explicit failure validates structurally but
+    // never reports a complete valid quality outcome.
+    let mut unknown_fail = baseline.clone();
+    unknown_fail.results[0].passed = false;
+    unknown_fail.results[0].failed_invariant = None;
+    unknown_fail.results[0].unknown_evidence = vec![id("unknown-evidence")];
+    unknown_fail
+        .validate()
+        .expect("unknown failure stays structural");
+    assert!(!unknown_fail.all_pass().expect("unknown evaluated"));
+
+    // A failure with neither a failed invariant nor unknown evidence is
+    // rejected instead of silently counting as covered.
+    let mut bare_failure = baseline.clone();
+    bare_failure.results[0].passed = false;
+    bare_failure.results[0].evidence = Vec::new();
+    assert_eq!(
+        bare_failure.validate(),
+        Err(ContextError::QualityIncomplete)
+    );
+
+    // No single unknown entry anywhere can leave a complete pass.
+    for dimension in all_quality_dimensions() {
+        let mut candidate = baseline.clone();
+        let result = candidate
+            .results
+            .iter_mut()
+            .find(|result| result.dimension == dimension)
+            .expect("dimension present");
+        result.passed = false;
+        result.unknown_evidence = vec![id("unknown-evidence")];
+        assert_ne!(candidate.all_pass(), Ok(true));
+    }
+}
+
+// WORK_UNIT_CASE: 584/52
+#[test]
+fn no_scalar_weighted_or_average_quality_compensation_path() {
+    let context = binding();
+    let baseline = full_quality_scorecard(&context);
+    assert!(baseline.all_pass().expect("baseline evaluated"));
+
+    // Eleven passes cannot compensate for one explicit failure.
+    let mut one_failed = baseline.clone();
+    one_failed.results[0].passed = false;
+    one_failed.results[0].failed_invariant = Some(id("failed-invariant"));
+    assert!(!one_failed.all_pass().expect("one failure evaluated"));
+
+    // Extra evidence on the eleven passing dimensions cannot flip the failure.
+    let mut padded = one_failed.clone();
+    for result in padded.results.iter_mut().filter(|result| result.passed) {
+        result.evidence.push(id("extra-evidence"));
+    }
+    padded.validate().expect("padded evidence validates");
+    assert!(!padded.all_pass().expect("padded evaluated"));
+
+    // The closed wire surface carries no aggregate scalar to compensate with.
+    let value = serde_json::to_value(&baseline).expect("scorecard value");
+    let object = value.as_object().expect("scorecard object");
+    assert_eq!(object.len(), 2);
+    assert!(object.contains_key("binding"));
+    assert!(object.contains_key("results"));
+    for rejected in ["score", "average", "weighted", "total"] {
+        let mut injected = value.clone();
+        injected[rejected] = serde_json::Value::from(0.99);
+        assert!(
+            serde_json::from_value::<QualityScorecard>(injected).is_err(),
+            "{rejected} must be rejected"
+        );
+    }
+    let result_value = serde_json::to_value(&baseline.results[0]).expect("dimension result value");
+    let result_object = result_value.as_object().expect("result object");
+    for rejected in ["score", "average", "weight"] {
+        assert!(
+            !result_object.contains_key(rejected),
+            "{rejected} must not exist"
+        );
+    }
+
+    // A duplicated dimension cannot pad the scorecard back to twelve passes.
+    let mut duplicated = baseline.clone();
+    duplicated.results.push(duplicated.results[0].clone());
+    assert_eq!(duplicated.validate(), Err(ContextError::QualityIncomplete));
+}
+
+// WORK_UNIT_CASE: 584/53
+#[test]
+fn exact_admitted_rendered_membership_equality() {
+    let (admitted, view) = assembled_view();
+    view.validate().expect("assembled view validates");
+    view.validate_against(&admitted)
+        .expect("view matches admitted membership");
+
+    let expected_ids = vec![id("atom")];
+    assert_eq!(view.admitted_ids, expected_ids);
+    assert_eq!(view.selection.admitted_ids, expected_ids);
+    assert_eq!(view.selection.rendered_ids, expected_ids);
+    assert_eq!(view.rendered.len(), 1);
+    let expected_rendered = RenderedAtom::from_admitted(&admitted.records[0]);
+    assert_eq!(view.rendered[0], expected_rendered);
+
+    // The output digest is deterministic over the exact rendered membership.
+    let recomputed = ActiveUnderstandingView::canonical_output_digest(
+        &admitted.binding,
+        &view.recipe_digest,
+        &view.fence_digest,
+        &view.rendered,
+    )
+    .expect("recomputed output digest");
+    assert_eq!(recomputed, view.output_digest);
+    assert_eq!(recomputed, view.selection.output_digest);
+
+    let encoded = serde_json::to_string(&view).expect("view encoding");
+    let decoded: ActiveUnderstandingView = serde_json::from_str(&encoded).expect("view round-trip");
+    assert_eq!(decoded, view);
+    decoded.validate().expect("decoded view validates");
+    decoded
+        .validate_against(&admitted)
+        .expect("decoded view matches admitted membership");
+}
+
+// WORK_UNIT_CASE: 584/54
+#[test]
+fn missing_admitted_atom_fails_selection_integrity() {
+    let (admitted, view) = assembled_view();
+    view.validate().expect("baseline view validates");
+
+    // Dropping the only rendered identity breaks set equality fail-closed.
+    let missing_proof = SelectionIntegrityProof {
+        binding: admitted.binding.clone(),
+        admitted_ids: view.admitted_ids.clone(),
+        rendered_ids: Vec::new(),
+        omission_evidence: Vec::new(),
+        output_digest: view.output_digest.clone(),
+    };
+    assert_eq!(
+        missing_proof.validate(),
+        Err(ContextError::SelectionIntegrityMismatch)
+    );
+
+    // A view with its rendered atom removed cannot validate or match admission.
+    let mut missing_view = view.clone();
+    missing_view.rendered = Vec::new();
+    missing_view.selection.rendered_ids = Vec::new();
+    assert_eq!(
+        missing_view.validate(),
+        Err(ContextError::SelectionIntegrityMismatch)
+    );
+    assert_eq!(
+        missing_view.validate_against(&admitted),
+        Err(ContextError::SelectionIntegrityMismatch)
+    );
+
+    // Swapping in a non-admitted identity is equally rejected.
+    let mut swapped = view.clone();
+    swapped.selection.rendered_ids = vec![id("non-admitted")];
+    assert_eq!(
+        swapped.validate(),
+        Err(ContextError::SelectionIntegrityMismatch)
+    );
+}
