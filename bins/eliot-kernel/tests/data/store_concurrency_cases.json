@@ -1,0 +1,61 @@
+{
+  "schema": "eliot.sconc.workload/v1",
+  "issue": 994,
+  "title": "[S-CONC-ACCEPT] finite versioned workload for reference equivalence, real Store concurrency, recovery and independent-scope Product progress",
+  "base": "origin/main 3590b344",
+  "contract_version": "1.0.0",
+  "operation_catalogue": "generated",
+  "catalogue_note": "Transitions bind operation_manifest_set_digest(&generated_operation_manifests()) at runtime on the Surreal path and the admitting single generated-manifest digest on the memory reference path; both digests must derive from this same frozen generated catalogue. The manifest-digest representation differs by backend contour and is the only normalized field in case 2.",
+  "admitted_operation": "CaptureObservation",
+  "transition_class": "CaptureCandidate",
+  "effect_ceiling": "Candidate",
+  "initial_state": "empty",
+  "fence_lineage": "550e8400-e29b-41d4-a716-446655440000",
+  "fence_epoch": 1,
+  "scope_groups": {
+    "disjoint_a": ["scope-994-a", "scope-994-b"],
+    "disjoint_b": ["scope-994-c", "scope-994-d"],
+    "overlapping_ab": ["scope-994-a", "scope-994-b"],
+    "overlapping_bc": ["scope-994-b", "scope-994-c"],
+    "multiscope_chain": [["scope-994-a", "scope-994-b"], ["scope-994-b", "scope-994-c"]],
+    "poison": ["scope-994-poison"],
+    "product_pulse": ["scope-994-pulse-a", "scope-994-pulse-b"]
+  },
+  "queue_limits": {
+    "lanes": 2,
+    "max_pending": 8,
+    "note": "Mirrors store_concurrency_profile.toml [execution]; corpus declares the denominator, the profile owns the numbers."
+  },
+  "control_classes": ["cancellation", "fencing", "health", "recovery", "shutdown"],
+  "injection_points": ["tx_rendezvous_barrier", "pre_send_cancel", "post_send_timeout", "stalled_scope", "poisoned_scope"],
+  "causal_partial_order": "A+B/B+C multiscope claims share scope-994-b precedence from the single ORS coordinator; disjoint scopes carry no order edge.",
+  "timeouts_ms": {
+    "rendezvous": 30000,
+    "provider_connect": 60000,
+    "provider_bootstrap": 30000,
+    "cleanup": 15000
+  },
+  "evidence_schema": ["operation_id", "idempotency_key", "canonical_request_hash", "scope_heads_before_after", "commit_sequence", "receipt_status", "provider_session", "interval_start_ms", "interval_end_ms"],
+  "cases": [
+    {"case": 1, "suite": "reference", "name": "implementation_profile_operation_corpus_denominator", "scopes": ["scope-994-a"], "operations": [], "expectation": "Corpus declares exactly cases 1..20 once across both suites; profile carries all limits; catalogue digest computes and matches across suites."},
+    {"case": 2, "suite": "product", "name": "reference_versus_surreal_equivalence", "scopes": ["scope-994-a", "scope-994-b"], "operations": ["op-994-equiv-a", "op-994-equiv-b"], "expectation": "Identical immutable semantic operations replayed through memory reference and Surreal path yield equal semantic history; only manifest-digest representation and timing normalize."},
+    {"case": 3, "suite": "product", "name": "independent_scope_provider_overlap", "scopes": ["scope-994-a", "scope-994-b"], "operations": ["op-994-overlap-a", "op-994-overlap-b"], "expectation": "Two disjoint admitted operations overlap inside the provider seam (3-party barrier rendezvous) and both commit with valid heads and receipts."},
+    {"case": 4, "suite": "reference", "name": "overlapping_scopes_consistently_ordered", "scopes": ["scope-994-a", "scope-994-b"], "operations": ["op-994-seq-1", "op-994-seq-2"], "expectation": "Overlapping operations serialize per scope with one consistent precedence; per-scope sequences advance monotonically."},
+    {"case": 5, "suite": "reference", "name": "multiscope_claim_without_cyclic_wait", "scopes": ["scope-994-a", "scope-994-b", "scope-994-c"], "operations": ["op-994-multi-ab", "op-994-multi-bc"], "expectation": "A+B then B+C claims share scope-994-b precedence; both orders of arrival keep per-scope order consistent; no partial acquisition."},
+    {"case": 6, "suite": "reference", "name": "concurrent_exact_replay_single_effect", "scopes": ["scope-994-a"], "operations": ["op-994-replay"], "expectation": "Exact concurrent replay yields one effect set and the original receipt; snapshot identical before and after replay."},
+    {"case": 7, "suite": "reference", "name": "changed_same_operation_input_conflicts", "scopes": ["scope-994-a"], "operations": ["op-994-fork"], "expectation": "Same operation identity with changed input conflicts (IdentityConflict or digest mismatch) without mutation."},
+    {"case": 8, "suite": "reference", "name": "stale_head_fence_epoch_cannot_commit", "scopes": ["scope-994-a"], "operations": ["op-994-stale"], "expectation": "Stale revision/ordering head, foreign fence, or changed epoch cannot commit; store state unchanged."},
+    {"case": 9, "suite": "product", "name": "cancellation_before_send_no_effect", "scopes": ["scope-994-a"], "operations": ["op-994-cancel-early"], "expectation": "Cancelling before send leaves no provider effect; reconcile finds no receipt."},
+    {"case": 10, "suite": "product", "name": "cancellation_timeout_after_possible_send_scoped_uncertainty", "scopes": ["scope-994-a", "scope-994-b"], "operations": ["op-994-uncertain"], "expectation": "Timeout after possible send stays scoped uncertainty resolved only by receipt reconciliation; sibling scope keeps progressing."},
+    {"case": 11, "suite": "product", "name": "precommit_crash_reconciles_only_on_proven_absence", "scopes": ["scope-994-a"], "operations": ["op-994-absent"], "expectation": "Reconcile of a never-sent operation proves absence; only then may the same identity commit."},
+    {"case": 12, "suite": "product", "name": "postcommit_response_loss_recovers_original_receipt", "scopes": ["scope-994-a"], "operations": ["op-994-committed"], "expectation": "After commit, reconcile returns the original receipt; re-apply returns the identical receipt with no new effect."},
+    {"case": 13, "suite": "product", "name": "independent_scope_progress_under_delay_poison", "scopes": ["scope-994-a", "scope-994-poison"], "operations": ["op-994-live", "op-994-stalled"], "expectation": "While one scope is stalled/unknown/poisoned at the seam, an independent scope commits with a valid receipt."},
+    {"case": 14, "suite": "product", "name": "bounded_capacity_with_protected_recovery", "scopes": ["scope-994-a"], "operations": ["op-994-bound"], "expectation": "Client-set and execution bounds are fixed closed values; serial generation refuses reserved writes; concurrent generation advertises the capability; drained uninstall required for profile change."},
+    {"case": 15, "suite": "product", "name": "migration_drain_accounts_every_operation", "scopes": ["scope-994-a"], "operations": ["op-994-drain"], "expectation": "Quiesced generation uninstall plus recovery-snapshot accounting covers every queued, in-flight, and unknown operation; normal writes excluded while drained."},
+    {"case": 16, "suite": "product", "name": "unknown_failed_migration_stays_fenced", "scopes": ["scope-994-a"], "operations": [], "expectation": "Incompatible generation migration stays fenced; only the accepted generation reopens the path."},
+    {"case": 17, "suite": "product", "name": "restart_reconstructs_state_without_orphans", "scopes": ["scope-994-a", "scope-994-b"], "operations": ["op-994-restart-a", "op-994-restart-b"], "expectation": "A fresh adapter generation on the same provider root reconstructs identical receipts; no orphaned reservations."},
+    {"case": 18, "suite": "product", "name": "session_process_root_cleanup", "scopes": ["scope-994-a"], "operations": ["op-994-cleanup"], "expectation": "Provider session, process binding, and isolated root clean up completely; primary and cleanup errors both retained."},
+    {"case": 19, "suite": "product", "name": "product_pulse_kernel_route_progress", "scopes": ["scope-994-pulse-a", "scope-994-pulse-b"], "operations": ["op-994-pulse-a", "op-994-pulse-b", "op-994-pulse-cancel"], "expectation": "Product Pulse scenario through the admitted production EBP client route: independent-scope progress, cancellation/recovery, and receipt correctness with real EBP frames."},
+    {"case": 20, "suite": "reference", "name": "source_proof_guard", "scopes": [], "operations": [], "expectation": "Guard rejects missing scenarios, forged results, erased ordering fields, fake overlap, oracle weakening, production edits, and unowned concurrent manifest changes."}
+  ]
+}

@@ -1,0 +1,55 @@
+# S-CONC-ACCEPT finite profile for issue #994 (frozen workload binding).
+# Corpus: bins/eliot-kernel/tests/data/store_concurrency_cases.json
+# Numbers here own the denominator; tests assert these exact values.
+# Hand-parseable flat sections only: no new dependency may read this file.
+
+[sconc994]
+issue = 994
+base = "origin/main 3590b344"
+contract_version = "1.0.0"
+admitted_operation = "CaptureObservation"
+transition_class = "CaptureCandidate"
+effect_ceiling = "Candidate"
+
+[execution]
+lanes = 2
+max_pending = 8
+read_sessions = 5
+write_sessions = 2
+admin_sessions = 1
+
+[provider]
+staged_binary = "surreal.exe"
+expected_major = 3
+connect_timeout_ms = 60000
+bootstrap_timeout_ms = 30000
+query_timeout_ms = 30000
+namespace_prefix = "sconc994"
+database = "accept994"
+
+[control]
+reserve_classes = "cancellation,fencing,health,recovery,shutdown"
+normal_sheds_under_pressure = true
+recovery_lane_protected = true
+
+[injection]
+tx_rendezvous_parties = 3
+pre_send_cancel = true
+post_send_timeout = true
+stalled_scope = "scope-994-poison"
+poisoned_scope = "scope-994-poison"
+
+[timeouts]
+rendezvous_ms = 30000
+provider_connect_ms = 60000
+provider_bootstrap_ms = 30000
+cleanup_ms = 15000
+
+[evidence]
+schema = "operation_id,idempotency_key,canonical_request_hash,scope_heads_before_after,commit_sequence,receipt_status,provider_session,interval_start_ms,interval_end_ms"
+run_outside_testdata = true
+
+[migration]
+accepted_generation = "v2"
+fence_unknown_generation = true
+reopen_requires_accepted = true

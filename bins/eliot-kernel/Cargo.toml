@@ -46,6 +46,14 @@ eliot-platform-windows = { workspace = true, features = ["test-support"] }
 eliot-runtime-status.workspace = true
 eliot-installation.workspace = true
 redb.workspace = true
+# S-CONC-ACCEPT (issue #994, test-only): Store reference + real adapter edges.
+# Path edge: eliot-store-memory is a workspace member but has no
+# [workspace.dependencies] entry, so a path+version edge keeps root
+# Cargo.toml and workspace membership byte-identical. No version upgrade:
+# versions match the member manifests exactly.
+eliot-store-memory = { path = "../../crates/storage/eliot-store-memory", version = "0.1.0" }
+eliot-store-surreal-adapter.workspace = true
+secrecy.workspace = true
 
 [lints]
 workspace = true
