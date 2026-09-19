@@ -1950,6 +1950,252 @@ mod tests {
         assert_eq!(resolver_calls.get(), 1);
     }
 
+    // WORK_UNIT_CASE: 839/23
+    #[test]
+    #[allow(
+        clippy::expect_used,
+        reason = "839 dispatch batch test: deterministic fixture construction only, no production path"
+    )]
+    fn transport_failure_is_distinct_from_semantic_result() {
+        use std::num::NonZeroU64;
+
+        use eliot_contracts::{EpochId, EpochLineageId, RequestId, ResourceGeneration, StateFence};
+
+        const LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+        let epoch = EpochId::new(
+            EpochLineageId::new(LINEAGE).expect("valid lineage"),
+            NonZeroU64::new(1).expect("nonzero sequence"),
+        )
+        .expect("valid epoch");
+        let fence = StateFence::new(epoch, ResourceGeneration::new(1).expect("generation"));
+        let ticket = AgentActivationResolutionTicket {
+            wire_id: eliot_protocol::AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_ID.to_owned(),
+            wire_version: eliot_protocol::AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_VERSION,
+            ticket_id: "ticket-23".to_owned(),
+            activation_request_id: RequestId::new("activation-request-23").expect("request id"),
+            activation_request_sha256: "a".repeat(64),
+            peer_admission_receipt_sha256: "b".repeat(64),
+            connection_id: "connection-23".to_owned(),
+            state_fence: fence,
+            kernel_deadline_unix_ms: 100,
+            ticket_sha256: String::new(),
+        }
+        .with_computed_digest()
+        .expect("valid ticket");
+        let result = AgentActivationResolutionResult::new(
+            &ticket,
+            50,
+            AgentActivationResolutionDisposition::FailedInternal {
+                failure_handle: "daemon.test:recovery".to_owned(),
+            },
+        )
+        .expect("valid test result");
+        let original_ticket = ticket.ticket_id.clone();
+        let original_sha = result.result_sha256.clone();
+
+        // A lost acknowledgement reconciles from retention: the query carries
+        // only the retained ticket identity plus digest, never new semantics.
+        let query = retained_reconcile_query(&ticket, &result).expect("reconcile query");
+        assert_eq!(query.ticket_id, original_ticket);
+        assert_eq!(query.result_sha256, original_sha);
+
+        // Transport failure without retention is a typed Unknown carrying the
+        // original identity and the submit detail: never Ok, never a semantic
+        // disposition, never a recomputed result.
+        let ack = AgentActivationResultAck::unknown(&query).expect("unknown ack");
+        match classify_reconcile_ack(&ticket, &result, &ack, "injected submit transport failure") {
+            Err(ActivationDispatchError::Unknown {
+                ticket_id,
+                result_sha256,
+                detail,
+            }) => {
+                assert_eq!(ticket_id, original_ticket);
+                assert_eq!(result_sha256, original_sha);
+                assert!(detail.contains(&original_ticket));
+                assert!(detail.contains("injected submit transport failure"));
+            }
+            other => panic!("expected typed Unknown, got {other:?}"),
+        }
+        // The retained result is untouched: same digest, still bound to the
+        // exact ticket, still no binding.
+        assert_eq!(result.result_sha256, original_sha);
+        assert!(result.resolved_binding().is_none());
+        result.validate_against(&ticket).expect("valid binding");
+
+        // A mismatched acknowledgement fails closed as Hard, never coerces.
+        let accepted = AgentActivationResultAck::accepted(&result).expect("accept ack");
+        let mut other_ticket = ticket.clone();
+        other_ticket.ticket_id = "ticket-other".to_owned();
+        other_ticket.ticket_sha256 = other_ticket.compute_digest().expect("digest");
+        match classify_submit_ack(&other_ticket, &result, &accepted) {
+            Err(ActivationDispatchError::Hard(_)) => {}
+            other => panic!("expected Hard binding mismatch, got {other:?}"),
+        }
+    }
+
+    // WORK_UNIT_CASE: 839/24
+    #[test]
+    #[allow(
+        clippy::expect_used,
+        reason = "839 dispatch batch test: deterministic fixture construction only, no production path"
+    )]
+    fn unknown_reconnect_reconciles_without_second_governor_read() {
+        use std::cell::Cell;
+        use std::num::NonZeroU64;
+
+        use eliot_contracts::{EpochId, EpochLineageId, RequestId, ResourceGeneration, StateFence};
+
+        const LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+        let epoch = EpochId::new(
+            EpochLineageId::new(LINEAGE).expect("valid lineage"),
+            NonZeroU64::new(1).expect("nonzero sequence"),
+        )
+        .expect("valid epoch");
+        let fence = StateFence::new(epoch, ResourceGeneration::new(1).expect("generation"));
+        let ticket = AgentActivationResolutionTicket {
+            wire_id: eliot_protocol::AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_ID.to_owned(),
+            wire_version: eliot_protocol::AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_VERSION,
+            ticket_id: "ticket-24".to_owned(),
+            activation_request_id: RequestId::new("activation-request-24").expect("request id"),
+            activation_request_sha256: "a".repeat(64),
+            peer_admission_receipt_sha256: "b".repeat(64),
+            connection_id: "connection-24".to_owned(),
+            state_fence: fence,
+            kernel_deadline_unix_ms: 100,
+            ticket_sha256: String::new(),
+        }
+        .with_computed_digest()
+        .expect("valid ticket");
+
+        // One Governor-backed resolution only. The reconnect leg below must
+        // reuse this retained result verbatim, never resolve again.
+        let resolver_calls = Cell::new(0_u32);
+        let resolve_once = || {
+            resolver_calls.set(resolver_calls.get() + 1);
+            AgentActivationResolutionResult::new(
+                &ticket,
+                50,
+                AgentActivationResolutionDisposition::FailedInternal {
+                    failure_handle: "daemon.test:recovery".to_owned(),
+                },
+            )
+            .expect("valid test result")
+        };
+        let result = resolve_once();
+        let original_ticket = ticket.ticket_id.clone();
+        let original_sha = result.result_sha256.clone();
+
+        // The reconcile query clones the retained identity verbatim: no
+        // second Governor read and no recompute occur here.
+        let query = retained_reconcile_query(&ticket, &result).expect("reconcile query");
+        assert_eq!(query.ticket_id, original_ticket);
+        assert_eq!(query.result_sha256, original_sha);
+
+        // An unknown retention answer preserves the original identity
+        // verbatim instead of triggering a recompute under a new digest.
+        let ack = AgentActivationResultAck::unknown(&query).expect("unknown ack");
+        match classify_reconcile_ack(&ticket, &result, &ack, "injected reconnect failure") {
+            Err(ActivationDispatchError::Unknown {
+                ticket_id,
+                result_sha256,
+                detail,
+            }) => {
+                assert_eq!(ticket_id, original_ticket);
+                assert_eq!(result_sha256, original_sha);
+                assert!(detail.contains(&original_ticket));
+            }
+            other => panic!("expected typed Unknown, got {other:?}"),
+        }
+        assert_eq!(
+            resolver_calls.get(),
+            1,
+            "reconnect must not repeat the Governor read"
+        );
+        assert_eq!(result.result_sha256, original_sha);
+        result.validate_against(&ticket).expect("valid binding");
+    }
+
+    // WORK_UNIT_CASE: 839/25
+    #[test]
+    #[allow(
+        clippy::expect_used,
+        reason = "839 dispatch batch test: deterministic fixture construction only, no production path"
+    )]
+    fn acknowledgement_creates_no_session_authority_or_finish() {
+        use std::num::NonZeroU64;
+
+        use eliot_contracts::{EpochId, EpochLineageId, RequestId, ResourceGeneration, StateFence};
+
+        const LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+        let epoch = EpochId::new(
+            EpochLineageId::new(LINEAGE).expect("valid lineage"),
+            NonZeroU64::new(1).expect("nonzero sequence"),
+        )
+        .expect("valid epoch");
+        let fence = StateFence::new(epoch, ResourceGeneration::new(1).expect("generation"));
+        let ticket = AgentActivationResolutionTicket {
+            wire_id: eliot_protocol::AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_ID.to_owned(),
+            wire_version: eliot_protocol::AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_VERSION,
+            ticket_id: "ticket-25".to_owned(),
+            activation_request_id: RequestId::new("activation-request-25").expect("request id"),
+            activation_request_sha256: "a".repeat(64),
+            peer_admission_receipt_sha256: "b".repeat(64),
+            connection_id: "connection-25".to_owned(),
+            state_fence: fence,
+            kernel_deadline_unix_ms: 100,
+            ticket_sha256: String::new(),
+        }
+        .with_computed_digest()
+        .expect("valid ticket");
+        let result = AgentActivationResolutionResult::new(
+            &ticket,
+            50,
+            AgentActivationResolutionDisposition::FailedInternal {
+                failure_handle: "daemon.test:recovery".to_owned(),
+            },
+        )
+        .expect("valid test result");
+        let original_sha = result.result_sha256.clone();
+
+        // Every positive acknowledgement settles with unit and echoes the
+        // retained result verbatim. The classifier takes only the ticket,
+        // the retained result, and the ack: no composition or session
+        // handle enters, so no Session, authority, or Finish can be minted
+        // on this path.
+        for ack in [
+            AgentActivationResultAck::accepted(&result).expect("accept ack"),
+            AgentActivationResultAck::replayed(&result).expect("replay ack"),
+            AgentActivationResultAck::reconciled(&result).expect("reconcile ack"),
+        ] {
+            classify_submit_ack(&ticket, &result, &ack).expect("positive ack settles");
+            assert_eq!(ack.ticket_id, ticket.ticket_id);
+            assert_eq!(ack.result_sha256, result.result_sha256);
+            assert_eq!(ack.result.as_ref(), Some(&result));
+        }
+
+        // Unknown is not a settlement: it preserves the original identity
+        // in a typed outcome instead of minting anything.
+        let query = retained_reconcile_query(&ticket, &result).expect("reconcile query");
+        let unknown = AgentActivationResultAck::unknown(&query).expect("unknown ack");
+        match classify_submit_ack(&ticket, &result, &unknown) {
+            Err(ActivationDispatchError::Unknown {
+                ticket_id,
+                result_sha256,
+                ..
+            }) => {
+                assert_eq!(ticket_id, ticket.ticket_id);
+                assert_eq!(result_sha256, result.result_sha256);
+            }
+            other => panic!("expected typed Unknown, got {other:?}"),
+        }
+
+        // Nothing was minted: same digest, no binding, still bound to the
+        // exact ticket.
+        assert_eq!(result.result_sha256, original_sha);
+        assert!(result.resolved_binding().is_none());
+        result.validate_against(&ticket).expect("valid binding");
+    }
+
     #[test]
     #[allow(
         clippy::expect_used,
