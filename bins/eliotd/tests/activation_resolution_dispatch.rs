@@ -1,4 +1,4 @@
-//! Issue #839 dispatch matrix batch: cases 1, 2, 3, and 22.
+//! Issue #839 dispatch matrix batch: cases 1, 2, 3, 20, and 22.
 //!
 //! These tests bind the existing daemon source seams to the accepted typed
 //! protocol contracts. They do not add a transport simulator or widen a
@@ -315,5 +315,36 @@ fn every_disposition_uses_the_accepted_v2_submit_envelope() -> TestResult {
     )?;
     assert!(submit.contains("AgentActivationResultSubmit::new(result.clone())"));
     assert!(submit.contains("serde_json::json!({ \"result\": submit })"));
+    Ok(())
+}
+
+// WORK_UNIT_CASE: 839/20
+#[test]
+fn v1_compatibility_isolated_from_current_v2_resolution() -> TestResult {
+    assert_fixture_case(
+        20,
+        "explicit v1 compatibility cannot consume current v2 accidentally",
+    )?;
+
+    let library = source("src/lib.rs")?;
+    let v1 = slice_between(
+        &library,
+        "pub fn resolve_agent_activation(\n",
+        "    /// Single production resolver spine:",
+    )?;
+    assert!(v1.contains("map_activation_snapshot"));
+    assert!(v1.contains("GovernorActivationOutcome::Resolved"));
+    assert!(v1.contains("outcome => Err"));
+    assert!(!v1.contains("map_governor_outcome_to_protocol"));
+    assert!(!v1.contains("AgentActivationResolutionResult"));
+
+    let runtime = source("src/daemon_runtime.rs")?;
+    let claim_step = slice_between(
+        &runtime,
+        "fn start_valid_claim_step(\n",
+        "/// Bounded shutdown drain for one in-flight activation",
+    )?;
+    assert!(!claim_step.contains("resolve_agent_activation("));
+    assert!(claim_step.contains("resolve_agent_activation_v2"));
     Ok(())
 }

@@ -554,6 +554,7 @@ mod projection_tests {
         }
     }
 
+    // WORK_UNIT_CASE: 839/8
     #[test]
     fn stale_fence_is_not_success_and_does_not_create_session() {
         let ticket = test_ticket(100);
@@ -595,6 +596,117 @@ mod projection_tests {
             result.disposition,
             AgentActivationResolutionDisposition::TaskSelectionRequired { .. }
         ));
+    }
+
+    // WORK_UNIT_CASE: 839/13
+    #[test]
+    fn task_selection_preserves_candidates_coverage_and_recovery() {
+        let ticket = test_ticket(100);
+        let candidates = vec!["task:a".to_owned(), "task:b".to_owned()];
+        let outcome = GovernorActivationOutcome::TaskSelectionRequired {
+            selection: GovernorSelectionDirective::new(
+                candidates.clone(),
+                GovernorCandidateCoverage::Partial,
+                "governor.task-selection:recovery",
+            ),
+        };
+        let result = map_governor_outcome_to_protocol(&ticket, outcome, 50).expect("mapping");
+        match &result.disposition {
+            AgentActivationResolutionDisposition::TaskSelectionRequired { selection } => {
+                assert_eq!(selection.candidate_handles, candidates);
+                assert_eq!(
+                    selection.candidate_coverage,
+                    AgentActivationCandidateCoverage::Partial
+                );
+                assert_eq!(
+                    selection.recovery_handle,
+                    "governor.task-selection:recovery"
+                );
+            }
+            _ => panic!("expected TaskSelectionRequired"),
+        }
+        assert!(result.resolved_binding().is_none());
+        result.validate_against(&ticket).expect("valid binding");
+    }
+
+    // WORK_UNIT_CASE: 839/14
+    #[test]
+    fn scope_selection_preserves_distinct_candidates_coverage_and_recovery() {
+        let ticket = test_ticket(100);
+        let outcome = fixture_scope_selection_required(vec!["scope:candidate".to_owned()]);
+        let result = map_governor_outcome_to_protocol(&ticket, outcome, 50).expect("mapping");
+        match &result.disposition {
+            AgentActivationResolutionDisposition::ScopeSelectionRequired { selection } => {
+                assert_eq!(
+                    selection.candidate_handles,
+                    vec!["scope:candidate".to_owned()]
+                );
+                assert_eq!(
+                    selection.candidate_coverage,
+                    AgentActivationCandidateCoverage::Partial
+                );
+                assert_eq!(
+                    selection.recovery_handle,
+                    "governor.scope-selection:recovery"
+                );
+            }
+            _ => panic!("expected ScopeSelectionRequired"),
+        }
+        assert!(result.resolved_binding().is_none());
+        result.validate_against(&ticket).expect("valid binding");
+    }
+
+    // WORK_UNIT_CASE: 839/16
+    #[test]
+    fn not_ready_preserves_dependency_revision_and_due_time() {
+        let ticket = test_ticket(100);
+        let result = map_governor_outcome_to_protocol(
+            &ticket,
+            fixture_not_ready("governor.session", "revision-7", 60),
+            50,
+        )
+        .expect("mapping");
+        match &result.disposition {
+            AgentActivationResolutionDisposition::NotReady {
+                recovery_handle,
+                retry,
+            } => {
+                assert_eq!(recovery_handle, "governor.not-ready:recovery");
+                assert_eq!(retry.dependency_ref, "governor.session");
+                assert_eq!(retry.observed_dependency_revision, "revision-7");
+                assert_eq!(retry.not_before_unix_ms, 60);
+            }
+            _ => panic!("expected NotReady"),
+        }
+        assert!(result.is_transient_retry());
+        result.validate_against(&ticket).expect("valid binding");
+    }
+
+    // WORK_UNIT_CASE: 839/18
+    #[test]
+    fn failed_internal_preserves_failure_identity_without_retry_or_selection() {
+        let ticket = test_ticket(100);
+        let result = map_governor_outcome_to_protocol(
+            &ticket,
+            fixture_failed_internal("snapshot-corrupt"),
+            50,
+        )
+        .expect("mapping");
+        match &result.disposition {
+            AgentActivationResolutionDisposition::FailedInternal { failure_handle } => {
+                assert_eq!(failure_handle, "governor.internal:snapshot-corrupt");
+            }
+            _ => panic!("expected FailedInternal"),
+        }
+        assert!(result.resolved_binding().is_none());
+        assert!(!result.is_transient_retry());
+        assert!(!matches!(
+            result.disposition,
+            AgentActivationResolutionDisposition::TaskSelectionRequired { .. }
+                | AgentActivationResolutionDisposition::ScopeSelectionRequired { .. }
+                | AgentActivationResolutionDisposition::ScopeAmbiguous { .. }
+        ));
+        result.validate_against(&ticket).expect("valid binding");
     }
 
     // WORK_UNIT_CASE: 839/19

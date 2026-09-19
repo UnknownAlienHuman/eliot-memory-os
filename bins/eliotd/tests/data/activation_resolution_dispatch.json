@@ -13,6 +13,10 @@
       "name": "one resolution is retained across exact replay"
     },
     {
+      "id": 20,
+      "name": "explicit v1 compatibility cannot consume current v2 accidentally"
+    },
+    {
       "id": 22,
       "name": "all seven dispositions use the v2 submit envelope"
     }
