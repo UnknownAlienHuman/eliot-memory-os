@@ -264,9 +264,9 @@ pub enum ReconcileOutcome {
 
 /// Provider-effect seam behind the orchestration (test-fakeable transport).
 ///
-/// Production implements the #987 pooled normal-write lane, the #989
-/// bounded attempt, and durable receipt reads. Deterministic tests script
-/// gate/execute/reconcile answers and record every call, so the
+/// Production implements the existing pooled normal-write lane, bounded
+/// allocation attempt, and durable receipt reads. Deterministic tests script
+/// gate, execute, and reconcile answers and record every call, so the
 /// orchestration proofs never touch a provider.
 #[allow(async_fn_in_trait)]
 pub trait ReservedAttemptTransport: Send + Sync {
@@ -278,9 +278,8 @@ pub trait ReservedAttemptTransport: Send + Sync {
         now_ms: u64,
     ) -> ProviderGate;
 
-    /// Executes the exact immutable admitted transition once for one
-    /// permitted attempt. `Cancelled` guarantees no provider effect;
-    /// every other non-commit outcome keeps exact reconciliation ownership.
+    /// Executes the existing bounded allocation attempt for this immutable
+    /// admitted transition under the already-selected normal-write lane.
     async fn execute_attempt(
         &self,
         execution: &WriteExecution,
