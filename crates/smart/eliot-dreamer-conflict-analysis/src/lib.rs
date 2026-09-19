@@ -39,7 +39,7 @@
 //! validation. There are no placeholder, mock, canned, or pseudo paths:
 //! every branch binds an explicit input field.
 //!
-//! Test coverage note: 23 of 68 `WORK_UNIT_CASE 673/*` cases execute here
+//! Test coverage note: 27 of 68 `WORK_UNIT_CASE 673/*` cases execute here
 //! (673/1 valid completes, 673/2 wrong job and scope fail closed, 673/3
 //! empty and single position are not conflicts, 673/5 duplicate and changed
 //! identities fail closed, 673/6 complete/partial/stale/blocked/withheld
@@ -56,15 +56,19 @@
 //! 673/57 failed and unknown dimensions stay independent without borrowing,
 //! 673/60 irrelevant order preserves digest, 673/61 exact and one-over
 //! limits fail closed, 673/62 cancellation and deadline emit blocked/stale,
-//! 673/64 every expected position and objection stays visible).
-//! The remaining 45 of 68 are deferred per queue-item scope; workspace
+//! 673/64 every expected position and objection stays visible,
+//! 673/65 independent count never exceeds unique authoritative roots,
+//! 673/66 discriminative probe carries differing outcomes or an exact
+//! unknown-resolution criterion, 673/67 classification, resolution, and proof
+//! stay within grounded evidence, 673/68 bounded malformed input stays
+//! panic-free with no winner, resolution, authority, execution, or Finish).
+//! The remaining 41 of 68 are deferred per queue-item scope; workspace
 //! admission (#969), Product Pulse, and Edge proof remain separate. Deferred: 673/8, 673/15,
 //! 673/16, 673/17, 673/18, 673/20, 673/21, 673/22, 673/23, 673/24, 673/25,
 //! 673/26, 673/27, 673/28, 673/29, 673/30, 673/31, 673/32, 673/33, 673/34,
 //! 673/36, 673/37, 673/38, 673/39, 673/41, 673/42, 673/43, 673/44,
 //! 673/45, 673/46, 673/47, 673/48, 673/49, 673/50, 673/52, 673/53, 673/54,
-//! 673/55, 673/58, 673/59, 673/63,
-//! 673/65, 673/66, 673/67, 673/68.
+//! 673/55, 673/58, 673/59, 673/63.
 
 #![forbid(unsafe_code)]
 
@@ -4227,5 +4231,389 @@ mod tests {
             "unavailable stays a closed explicit denominator state"
         );
         assert_eq!(candidate.resolution_status, None);
+    }
+
+    // WORK_UNIT_CASE: 673/65
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn case_65_independent_count_never_exceeds_unique_roots() {
+        let item = test_item();
+        let draft = test_draft();
+        let grounded = test_grounded();
+        let receipt = test_receipt();
+        let distinct = match analyze_conflict(
+            &item,
+            &draft,
+            &grounded,
+            &test_conflict(),
+            &test_supplements(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("distinct-roots analysis: {err:?}"),
+        };
+        assert_eq!(distinct.independent_root_count, 2);
+        assert!(distinct.independent_root_count <= distinct.positions.len());
+        let conflict = ConflictSet::new(ConflictSetParams {
+            conflict_id: "conflict-count".to_owned(),
+            kind: ConflictKind::Epistemic,
+            scope: "scope-1".to_owned(),
+            task_id: None,
+            positions: vec![
+                test_position("source-a", "cache helps", false),
+                test_position("source-b", "cache helps slowly", false),
+                test_position("source-c", "cache harms", false),
+                test_position("source-d", "cache is neutral", true),
+            ],
+            evidence_refs: BTreeSet::new(),
+            owners: BTreeSet::from([
+                SourceId::new("source-a").expect("valid source"),
+                SourceId::new("source-c").expect("valid source"),
+            ]),
+            common_lineage: BTreeSet::new(),
+            resolved_parts: BTreeSet::new(),
+            unresolved: BTreeSet::from(["load effect".to_owned()]),
+            unresolved_owners: BTreeSet::from([SourceId::new("source-a").expect("valid source")]),
+            acceptability: ArgumentAcceptability::Contested,
+            defeated_refs: BTreeSet::new(),
+            probe: None,
+            decision_owner: SourceId::new("source-a").expect("valid source"),
+            affected_actions: vec!["decide-cache".to_owned()],
+            lifecycle: ConflictLifecycle::Open,
+            receipt_digest: receipt.bundle_digest.clone(),
+        })
+        .expect("valid count conflict");
+        let mut supplements = test_supplements();
+        supplements.lineage = vec![
+            LineageAttribution {
+                source_handle: "source-a".to_owned(),
+                lineage_root: "root-shared".to_owned(),
+                known: true,
+            },
+            LineageAttribution {
+                source_handle: "source-b".to_owned(),
+                lineage_root: "root-shared".to_owned(),
+                known: true,
+            },
+            LineageAttribution {
+                source_handle: "source-c".to_owned(),
+                lineage_root: "root-c".to_owned(),
+                known: true,
+            },
+            LineageAttribution {
+                source_handle: "source-d".to_owned(),
+                lineage_root: "root-d".to_owned(),
+                known: false,
+            },
+        ];
+        supplements.supplied_probes = vec![test_discriminative_probe("probe-count")];
+        let candidate = match analyze_conflict(
+            &item,
+            &draft,
+            &grounded,
+            &conflict,
+            &supplements,
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("shared-roots analysis: {err:?}"),
+        };
+        assert_eq!(candidate.positions.len(), 4);
+        assert_eq!(candidate.independent_root_count, 2);
+        assert!(candidate.independent_root_count <= candidate.positions.len());
+        let mut known_roots: Vec<String> = supplements
+            .lineage
+            .iter()
+            .filter(|entry| entry.known)
+            .map(|entry| entry.lineage_root.clone())
+            .collect();
+        known_roots.sort();
+        known_roots.dedup();
+        assert_eq!(candidate.independent_root_count, known_roots.len());
+        let unknown_group = candidate
+            .lineage_groups
+            .iter()
+            .find(|group| !group.known)
+            .expect("unknown lineage stays grouped without independence");
+        assert!(
+            unknown_group
+                .member_sources
+                .contains(&"source-d".to_owned())
+        );
+    }
+
+    // WORK_UNIT_CASE: 673/66
+    #[test]
+    fn case_66_discriminative_probe_needs_differing_outcomes_or_unknown_criterion() {
+        let item = test_item();
+        let draft = test_draft();
+        let grounded = test_grounded();
+        let conflict = test_conflict();
+        let policy = test_policy();
+        let mut discriminative = test_supplements();
+        discriminative.supplied_probes = vec![test_discriminative_probe("probe-66-disc")];
+        let candidate = match analyze_conflict(
+            &item,
+            &draft,
+            &grounded,
+            &conflict,
+            &discriminative,
+            &policy,
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("discriminative probe analysis: {err:?}"),
+        };
+        assert_eq!(candidate.recommended_probes.len(), 1);
+        let recommended = candidate
+            .recommended_probes
+            .first()
+            .expect("discriminative probe stays recommended");
+        assert_eq!(recommended.probe_id, "probe-66-disc");
+        let supplied = discriminative
+            .supplied_probes
+            .first()
+            .expect("supplied probe stays addressable");
+        assert_eq!(recommended.objective_digest, supplied.objective.digest);
+        assert_eq!(recommended.result_digest, supplied.schema.digest);
+        assert_eq!(recommended.owner, supplied.owner_note);
+        assert_eq!(recommended.verifier, supplied.verifier);
+        assert_eq!(recommended.cost_note, supplied.cost_note);
+        assert_eq!(recommended.risk_note, supplied.risk_note);
+        assert_eq!(recommended.privacy_note, supplied.privacy_note);
+        assert_eq!(recommended.effect_note, supplied.effect_note);
+        assert_eq!(recommended.discriminates_positions.len(), 2);
+        assert!(!branches_discriminate(
+            &test_nondiscriminative_probe().schema
+        ));
+        assert!(branches_discriminate(&supplied.schema));
+        let mut unknown_probe = test_nondiscriminative_probe();
+        unknown_probe.probe_id = String::from("probe-66-unknown");
+        unknown_probe.objective.invalidation_conditions = vec![ConditionAssumptionRef {
+            assumption_id: "hit rate under load".to_owned(),
+            assumption_digest: "a".repeat(64),
+        }];
+        unknown_probe.objective.digest = unknown_probe
+            .objective
+            .compute_digest()
+            .expect("recomputed unknown probe digest stays valid");
+        assert!(
+            resolves_unknown(&unknown_probe, &test_supplements().unknowns).is_some(),
+            "exact unknown-resolution criterion binds the load-bearing unknown"
+        );
+        let mut unknown_supplements = test_supplements();
+        unknown_supplements.supplied_probes = vec![unknown_probe];
+        let unknown_candidate = match analyze_conflict(
+            &item,
+            &draft,
+            &grounded,
+            &conflict,
+            &unknown_supplements,
+            &policy,
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("unknown-resolving probe analysis: {err:?}"),
+        };
+        assert_eq!(unknown_candidate.recommended_probes.len(), 1);
+        assert_eq!(
+            unknown_candidate
+                .recommended_probes
+                .first()
+                .expect("unknown probe stays recommended")
+                .resolves_unknown,
+            Some("hit rate under load".to_owned())
+        );
+        let mut rejected = test_supplements();
+        rejected.supplied_probes = vec![test_nondiscriminative_probe()];
+        let rejected_candidate =
+            match analyze_conflict(&item, &draft, &grounded, &conflict, &rejected, &policy) {
+                Ok(candidate) => candidate,
+                Err(err) => panic!("nondiscriminative probe analysis: {err:?}"),
+            };
+        assert!(rejected_candidate.recommended_probes.is_empty());
+    }
+
+    // WORK_UNIT_CASE: 673/67
+    #[test]
+    fn case_67_classification_resolution_and_proof_stay_within_grounded_evidence() {
+        let item = test_item();
+        let draft = test_draft();
+        let grounded = test_grounded();
+        let conflict = test_conflict();
+        let supplements = test_supplements();
+        let candidate = match analyze_conflict(
+            &item,
+            &draft,
+            &grounded,
+            &conflict,
+            &supplements,
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("grounded analysis: {err:?}"),
+        };
+        assert_eq!(candidate.outcome, ConflictOutcome::Complete);
+        for position in &candidate.positions {
+            assert!(
+                position.conflict_classes.contains(&ConflictKind::Epistemic),
+                "canonical grounded kind stays classified: {:?}",
+                position.conflict_classes
+            );
+            for class in &position.conflict_classes {
+                assert!(
+                    KIND_PRECEDENCE.contains(class),
+                    "classification never exceeds the canonical precedence table: {class:?}"
+                );
+            }
+            assert!(
+                !position.compatibility_note.trim().is_empty(),
+                "compatibility mapping stays explicit without rewriting the original"
+            );
+            assert_eq!(
+                position.stance,
+                conflict.positions[position.position_index].stance
+            );
+        }
+        assert_eq!(
+            candidate.note, CONFLICT_PROOF_NOTE,
+            "proof stays at the routing-only candidate ceiling"
+        );
+        assert_eq!(candidate.resolution_status, None);
+        assert_eq!(supplements.external_resolution, None);
+        let mut ordered_counter = supplements.counterevidence.clone();
+        ordered_counter.sort();
+        assert_eq!(candidate.counterevidence, ordered_counter);
+        let mut ordered_unknowns = supplements.unknowns.clone();
+        ordered_unknowns.sort();
+        assert_eq!(candidate.unknowns, ordered_unknowns);
+        let mut ordered_assumptions = supplements.assumptions.clone();
+        ordered_assumptions.sort();
+        assert_eq!(candidate.assumptions, ordered_assumptions);
+        assert!(
+            !candidate.invalidation_conditions.is_empty(),
+            "proof carries explicit reopening conditions instead of a verdict"
+        );
+    }
+
+    // WORK_UNIT_CASE: 673/68
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn case_68_bounded_malformed_input_stays_panic_free_without_winner_or_finish() {
+        let item = test_item();
+        let draft = test_draft();
+        let grounded = test_grounded();
+        let conflict = test_conflict();
+        let supplements = test_supplements();
+        let policy = test_policy();
+        let mut defaulted_policy = policy.clone();
+        defaulted_policy.policy_revision = 0;
+        let err = match analyze_conflict(
+            &item,
+            &draft,
+            &grounded,
+            &conflict,
+            &supplements,
+            &defaulted_policy,
+        ) {
+            Ok(candidate) => panic!("defaulted policy must fail: {:?}", candidate.outcome),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, ConflictAnalysisError::Policy { .. }),
+            "defaulted policy fails closed: {err:?}"
+        );
+        let mut blank_owner = supplements.clone();
+        blank_owner.supplied_probes = vec![{
+            let mut probe = test_discriminative_probe("probe-68");
+            probe.owner_note = String::from("   ");
+            probe
+        }];
+        let err = match analyze_conflict(&item, &draft, &grounded, &conflict, &blank_owner, &policy)
+        {
+            Ok(candidate) => panic!("blank probe owner must fail: {:?}", candidate.outcome),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, ConflictAnalysisError::Shape { ref field, .. } if field == "probe.owner"),
+            "blank probe owner fails closed: {err:?}"
+        );
+        let mut blank_objection = supplements.clone();
+        blank_objection.objections = vec![SuppliedObjection {
+            objection_id: "obj-blank".to_owned(),
+            target_source: "source-a".to_owned(),
+            statement: String::from("   "),
+            grounded: true,
+        }];
+        let err = match analyze_conflict(
+            &item,
+            &draft,
+            &grounded,
+            &conflict,
+            &blank_objection,
+            &policy,
+        ) {
+            Ok(candidate) => panic!("blank objection must fail: {:?}", candidate.outcome),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(
+                err,
+                ConflictAnalysisError::Shape { ref field, .. } if field == "objection.statement"
+            ),
+            "blank objection fails closed: {err:?}"
+        );
+        let mut duplicate_lineage = supplements.clone();
+        duplicate_lineage.lineage.push(LineageAttribution {
+            source_handle: "source-a".to_owned(),
+            lineage_root: "root-changed".to_owned(),
+            known: true,
+        });
+        let err = match analyze_conflict(
+            &item,
+            &draft,
+            &grounded,
+            &conflict,
+            &duplicate_lineage,
+            &policy,
+        ) {
+            Ok(candidate) => panic!("duplicate lineage must fail: {:?}", candidate.outcome),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, ConflictAnalysisError::Denominator { .. }),
+            "duplicate lineage fails closed: {err:?}"
+        );
+        let candidate =
+            match analyze_conflict(&item, &draft, &grounded, &conflict, &supplements, &policy) {
+                Ok(candidate) => candidate,
+                Err(err) => panic!("bounded valid analysis: {err:?}"),
+            };
+        assert_eq!(candidate.outcome, ConflictOutcome::Complete);
+        assert_eq!(candidate.resolution_status, None);
+        assert_eq!(outcome_rejection_hint(&candidate.outcome), None);
+        assert_eq!(candidate.note, CONFLICT_PROOF_NOTE);
+        assert!(
+            !candidate.note.contains("Finish"),
+            "candidate carries no terminal-completion claim"
+        );
+        for position in &candidate.positions {
+            assert!(
+                matches!(
+                    position.disposition,
+                    PositionDispositionKind::LivePreserved
+                        | PositionDispositionKind::MinorityPreserved
+                        | PositionDispositionKind::CompatibleResidue
+                        | PositionDispositionKind::SupersededHistory
+                        | PositionDispositionKind::Withheld
+                        | PositionDispositionKind::Unavailable
+                        | PositionDispositionKind::Stale
+                        | PositionDispositionKind::Refuted
+                ),
+                "disposition preserves without naming a winner"
+            );
+        }
+        for probe in &candidate.recommended_probes {
+            assert!(!probe.probe_id.trim().is_empty());
+            assert!(!probe.effect_note.trim().is_empty());
+        }
     }
 }
