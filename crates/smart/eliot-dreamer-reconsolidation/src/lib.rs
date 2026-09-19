@@ -2539,6 +2539,157 @@ mod tests {
         assert!(result.child.is_none());
     }
 
+    // WORK_UNIT_CASE: 667/44
+    #[test]
+    fn case_44_candidate_has_no_applied_dependent_or_write_receipt() {
+        let request = valid_request();
+        let frozen = request.clone();
+
+        let result = propose_reconsolidation(&request).expect("candidate remains pure");
+        let child = result
+            .child
+            .expect("complete result carries an allocation request");
+
+        assert_eq!(result.outcome, ReconsolidationOutcome::Complete);
+        assert_eq!(request, frozen);
+        assert_eq!(request.dependent_outcomes, frozen.dependent_outcomes);
+        assert!(child.request_only);
+        assert!(!child.allocates_revision);
+    }
+
+    // WORK_UNIT_CASE: 667/45
+    #[test]
+    fn case_45_all_seven_preservation_dimensions_pass() {
+        let request = valid_request();
+        let expected = [
+            PreservationDimension::Coverage,
+            PreservationDimension::Faithfulness,
+            PreservationDimension::Lineage,
+            PreservationDimension::Reversibility,
+            PreservationDimension::AuthorityCeiling,
+            PreservationDimension::DependencyClosure,
+            PreservationDimension::ProvenanceRetention,
+        ];
+
+        assert_eq!(request.preservation.verdicts.len(), expected.len());
+        for dimension in expected {
+            let verdict = request
+                .preservation
+                .verdicts
+                .iter()
+                .find(|verdict| verdict.dimension == dimension)
+                .expect("each preservation dimension is represented");
+            assert!(verdict.passed && verdict.known);
+        }
+        assert!(request.preservation.overall().is_ok());
+        assert_eq!(
+            propose_reconsolidation(&request)
+                .expect("all preservation dimensions pass")
+                .outcome,
+            ReconsolidationOutcome::Complete
+        );
+    }
+
+    // WORK_UNIT_CASE: 667/46
+    #[test]
+    fn case_46_failed_or_unknown_dimension_blocks_without_postflight() {
+        let request = valid_request();
+        let frozen_receipt = request.receipt.clone();
+
+        for index in 0..request.preservation.verdicts.len() {
+            let mut failed = request.clone();
+            failed.preservation.verdicts[index].passed = false;
+            let result = propose_reconsolidation(&failed).expect("failed dimension is semantic");
+            assert_eq!(result.outcome, ReconsolidationOutcome::Blocked);
+            assert!(result.child.is_none());
+            assert_eq!(result.admitted_new, 1);
+            assert_eq!(failed.receipt, frozen_receipt);
+
+            let mut unknown = request.clone();
+            unknown.preservation.verdicts[index].known = false;
+            let result = propose_reconsolidation(&unknown).expect("unknown dimension is semantic");
+            assert_eq!(result.outcome, ReconsolidationOutcome::Blocked);
+            assert!(result.child.is_none());
+            assert_eq!(result.admitted_new, 1);
+            assert_eq!(unknown.receipt, frozen_receipt);
+        }
+    }
+
+    // WORK_UNIT_CASE: 667/47
+    #[test]
+    fn case_47_terminal_outcomes_remain_distinct() {
+        let complete = propose_reconsolidation(&valid_request())
+            .expect("valid request is complete")
+            .outcome;
+
+        let mut partial_request = valid_request();
+        partial_request.deltas[0].disposition = PropositionDisposition::Unresolved;
+        let partial = propose_reconsolidation(&partial_request)
+            .expect("non-load-bearing unresolved material is partial")
+            .outcome;
+
+        let mut abstention_request = valid_request();
+        abstention_request.reactivation.observation_kind =
+            ReactivationObservationKind::Availability;
+        let abstention = propose_reconsolidation(&abstention_request)
+            .expect("availability is abstention")
+            .outcome;
+
+        let mut stale_request = valid_request();
+        stale_request.new_items[0].observed_at_ms = Some(1_700_000_000_001);
+        let stale = propose_reconsolidation(&stale_request)
+            .expect("pre-reactivation evidence is stale")
+            .outcome;
+
+        let mut rejected_request = valid_request();
+        rejected_request.curation_kind = CurationKind::Episode;
+        let rejected = propose_reconsolidation(&rejected_request)
+            .expect("wrong curation kind is rejected")
+            .outcome;
+
+        let outcomes = [complete, partial, abstention, stale, rejected];
+        for (index, outcome) in outcomes.iter().enumerate() {
+            assert!(
+                !outcomes[..index].contains(outcome),
+                "terminal outcome {outcome:?} must remain distinct"
+            );
+        }
+        assert_eq!(complete, ReconsolidationOutcome::Complete);
+        assert_eq!(partial, ReconsolidationOutcome::Partial);
+        assert_eq!(abstention, ReconsolidationOutcome::Abstention);
+        assert_eq!(stale, ReconsolidationOutcome::Stale);
+        assert_eq!(rejected, ReconsolidationOutcome::Rejected);
+    }
+
+    // WORK_UNIT_CASE: 667/48
+    #[test]
+    fn case_48_set_order_keeps_candidate_and_receipt_deterministic() {
+        let mut canonical = valid_request();
+        canonical.new_items.push(NewEvidenceItem {
+            handle: "obs-2".to_owned(),
+            digest: "2".repeat(64),
+            lineage: "lineage-new-2".to_owned(),
+            statement: "Warm-up run 8 shortened the next cold start further.".to_owned(),
+            source_kind: EvidenceSourceKind::ExternalObservation,
+            observed_at_ms: Some(1_700_000_000_003),
+        });
+        canonical.new_member_denominator.members = vec!["obs-1".to_owned(), "obs-2".to_owned()];
+        canonical.new_member_denominator.expected_total = 2;
+
+        let mut reordered = canonical.clone();
+        reordered.new_member_denominator.members.reverse();
+        reordered.preservation.verdicts.reverse();
+
+        let canonical_result =
+            propose_reconsolidation(&canonical).expect("canonical set order succeeds");
+        let reordered_result =
+            propose_reconsolidation(&reordered).expect("equivalent set order succeeds");
+
+        assert_eq!(canonical_result, reordered_result);
+        assert_eq!(canonical.receipt, reordered.receipt);
+        assert_eq!(canonical_result.outcome, ReconsolidationOutcome::Complete);
+    }
+
     // WORK_UNIT_CASE: 667/49
     #[test]
     fn case_49_parent_baseline_must_cover_each_proposition() {
