@@ -198,6 +198,30 @@ pub fn map_governor_outcome_to_protocol(
         })
 }
 
+/// Typed fail-closed result for a `Resolved` snapshot whose fence no longer
+/// matches the Kernel-issued ticket fence (#66).
+///
+/// The Governor owner resolved against current state, but the ticket was
+/// issued under a different fence (e.g. generation advanced between daemon
+/// admission and claim). Submitting the stale binding would create a Session
+/// under the wrong fence; dropping it as a hard daemon error would kill the
+/// loop instead of answering the ticket. Return a `StaleFence` terminal
+/// result carrying the observed fence, so the Kernel fails closed without
+/// creating a Session and the daemon stays alive for the next claim. Never
+/// produces a binding.
+pub fn stale_fence_for_resolved_mismatch(
+    ticket: &AgentActivationResolutionTicket,
+    observed_state_fence: eliot_contracts::StateFence,
+    resolved_at_unix_ms: u64,
+) -> Result<AgentActivationResolutionResult, DaemonError> {
+    let disposition = AgentActivationResolutionDisposition::StaleFence {
+        recovery_handle: "daemon.fence-mismatch:recovery".to_owned(),
+        observed_state_fence: Some(observed_state_fence),
+    };
+    AgentActivationResolutionResult::new(ticket, resolved_at_unix_ms, disposition)
+        .map_err(|error| DaemonError::Lifecycle(error.to_string()))
+}
+
 #[cfg(test)]
 mod projection_tests {
     #![allow(clippy::expect_used)] // test-only panic-acceptable (#838).
@@ -469,5 +493,40 @@ mod projection_tests {
         let outcome = fixture_scope_ambiguous(vec!["only-one".to_owned()]);
         let err = map_governor_outcome_to_protocol(&ticket, outcome, 50).expect_err("must reject");
         assert!(err.to_string().contains("SCOPE_AMBIGUOUS"));
+    }
+
+    #[test]
+    fn resolved_fence_mismatch_yields_typed_stale_fence_without_binding() {
+        // #66: a Resolved snapshot under a stale fence must surface as a
+        // typed StaleFence terminal result, never as a Session binding and
+        // never as a silent drop.
+        let ticket = test_ticket(100);
+        let observed = StateFence::new(test_epoch(1), ResourceGeneration::new(2).expect("gen"));
+        assert_ne!(observed, ticket.state_fence);
+        let result = stale_fence_for_resolved_mismatch(&ticket, observed.clone(), 50)
+            .expect("stale fence result");
+        assert!(matches!(
+            result.disposition,
+            AgentActivationResolutionDisposition::StaleFence { .. }
+        ));
+        assert!(result.resolved_binding().is_none());
+        match &result.disposition {
+            AgentActivationResolutionDisposition::StaleFence {
+                observed_state_fence: Some(fence),
+                ..
+            } => assert_eq!(fence, &observed),
+            _ => panic!("expected StaleFence with observed fence"),
+        }
+        result.validate_against(&ticket).expect("valid binding");
+    }
+
+    #[test]
+    fn resolved_fence_mismatch_with_equal_fence_is_rejected() {
+        // The helper must not hide a fence match as StaleFence: an observed
+        // fence equal to the ticket fence is rejected by protocol validation.
+        let ticket = test_ticket(100);
+        let err = stale_fence_for_resolved_mismatch(&ticket, ticket.state_fence.clone(), 50)
+            .expect_err("equal fence must reject");
+        assert!(err.to_string().contains("observed_state_fence"));
     }
 }

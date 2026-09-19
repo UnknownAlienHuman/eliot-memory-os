@@ -475,10 +475,16 @@ impl DaemonComposition {
         let outcome = match self.governor.resolve_activation_outcome(now) {
             GovernorActivationOutcome::Resolved(snapshot) => {
                 if snapshot.state_fence != ticket.state_fence {
-                    return Err(DaemonError::Lifecycle(
-                        "semantic activation ticket fence does not match the Governor snapshot"
-                            .to_owned(),
-                    ));
+                    // #66: a Resolved binding under a stale fence must not
+                    // create a Session and must not kill the daemon loop.
+                    // Submit a typed StaleFence terminal result carrying the
+                    // observed fence instead of a hard error.
+                    let observed = snapshot.state_fence.clone();
+                    return activation_projection::stale_fence_for_resolved_mismatch(
+                        ticket,
+                        observed,
+                        now.max(1),
+                    );
                 }
                 activation_projection::map_governor_outcome_to_protocol(
                     ticket,
