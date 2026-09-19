@@ -39,7 +39,7 @@
 //! validation. There are no placeholder, mock, canned, or pseudo paths:
 //! every branch binds an explicit input field.
 //!
-//! Test coverage note: 51 of 68 `WORK_UNIT_CASE 673/*` cases execute here
+//! Test coverage note: 55 of 68 `WORK_UNIT_CASE 673/*` cases execute here
 //! (673/1 valid completes, 673/2 wrong job and scope fail closed, 673/3
 //! empty and single position are not conflicts, 673/5 duplicate and changed
 //! identities fail closed, 673/6 complete/partial/stale/blocked/withheld
@@ -72,7 +72,11 @@
 //! numeric, time, version, and causal precision gains no support, 673/37 rivals
 //! and counterevidence stay live without truth selection, 673/38 a supplied
 //! probe discriminates two live positions, 673/39 a supplied probe resolves one
-//! load-bearing unknown, 673/35 shared model
+//! load-bearing unknown, 673/41 exact outcome and owner, verifier, cost,
+//! risk, privacy, and effect bounds preserved verbatim, 673/42 blocked and
+//! over-budget probes stay visible but unrecommended, 673/43 duplicate probe
+//! identity fails closed without a changed-condition exemption, 673/44
+//! supplied probe content and semantic order preserved, 673/35 shared model
 //! and evaluator limits independence, 673/40
 //! nondiscriminative probe rejected, 673/51 Concilium-review
 //! recommendation carries no plan, 673/4 receipt and fence mismatch fails
@@ -86,8 +90,8 @@
 //! unknown-resolution criterion, 673/67 classification, resolution, and proof
 //! stay within grounded evidence, 673/68 bounded malformed input stays
 //! panic-free with no winner, resolution, authority, execution, or Finish).
-//! The remaining 17 of 68 are deferred per queue-item scope; workspace
-//! admission (#969), Product Pulse, and Edge proof remain separate. Deferred: 673/41, 673/42, 673/43, 673/44,
+//! The remaining 13 of 68 are deferred per queue-item scope; workspace
+//! admission (#969), Product Pulse, and Edge proof remain separate. Deferred: 673/45,
 //! 673/45, 673/46, 673/47, 673/48, 673/49, 673/50, 673/52, 673/53, 673/54,
 //! 673/55, 673/58, 673/59, 673/63.
 
@@ -6440,5 +6444,236 @@ mod tests {
             "the load-bearing unknown stays open until the probe is executed elsewhere"
         );
         assert_eq!(candidate.resolution_status, None);
+    }
+
+    // WORK_UNIT_CASE: 673/41
+    #[test]
+    fn case_41_exact_probe_bounds_preserved_verbatim() {
+        let conflict = test_conflict();
+        let mut supplied = test_discriminative_probe("probe-41-bounds");
+        supplied.owner_note = String::from("source-b owns the follow-up under evidence authority");
+        supplied.verifier = String::from("verifier-41");
+        supplied.cost_note = String::from("two admitted reads within budget");
+        supplied.risk_note = String::from("read-only with explicit rollback");
+        supplied.privacy_note = String::from("no personal data leaves the freeze");
+        supplied.effect_note = String::from("no canonical effect or mutation");
+        assert!(
+            branches_discriminate(&supplied.schema),
+            "case 41 binds a discriminative outcome matrix"
+        );
+        let mut supplements = test_supplements();
+        supplements.supplied_probes = vec![supplied.clone()];
+        let candidate = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &conflict,
+            &supplements,
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("exact-bounds probe analysis: {err:?}"),
+        };
+        assert_eq!(candidate.outcome, ConflictOutcome::Complete);
+        assert_eq!(candidate.recommended_probes.len(), 1);
+        let recommended = candidate
+            .recommended_probes
+            .first()
+            .expect("exact-bounds probe stays recommended");
+        assert_eq!(recommended.probe_id, "probe-41-bounds");
+        assert_eq!(recommended.objective_digest, supplied.objective.digest);
+        assert_eq!(recommended.result_digest, supplied.schema.digest);
+        assert_eq!(recommended.owner, supplied.owner_note);
+        assert_eq!(recommended.verifier, supplied.verifier);
+        assert_eq!(recommended.cost_note, supplied.cost_note);
+        assert_eq!(recommended.risk_note, supplied.risk_note);
+        assert_eq!(recommended.privacy_note, supplied.privacy_note);
+        assert_eq!(recommended.effect_note, supplied.effect_note);
+        assert_eq!(recommended.discriminates_positions.len(), 2);
+        assert_eq!(candidate.resolution_status, None);
+    }
+
+    // WORK_UNIT_CASE: 673/42
+    #[test]
+    fn case_42_blocked_and_over_budget_probes_stay_visible_unrecommended() {
+        let conflict = test_conflict();
+        let valid = test_discriminative_probe("probe-42-valid");
+        let mut blocked = test_discriminative_probe("probe-42-blocked");
+        blocked.blocked = true;
+        let mut over_budget = test_discriminative_probe("probe-42-over");
+        over_budget.over_budget = true;
+        let mut supplements = test_supplements();
+        supplements.supplied_probes = vec![valid, blocked.clone(), over_budget.clone()];
+        let candidate = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &conflict,
+            &supplements,
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("blocked-probe analysis: {err:?}"),
+        };
+        assert_eq!(candidate.outcome, ConflictOutcome::Complete);
+        assert_eq!(candidate.recommended_probes.len(), 1);
+        assert_eq!(
+            candidate
+                .recommended_probes
+                .first()
+                .expect("valid probe stays recommended")
+                .probe_id,
+            "probe-42-valid"
+        );
+        assert_eq!(
+            supplements.supplied_probes.len(),
+            3,
+            "blocked and over-budget probes stay visible in the denominator"
+        );
+        let mut only_blocked = test_supplements();
+        only_blocked.supplied_probes = vec![blocked, over_budget];
+        let candidate = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &conflict,
+            &only_blocked,
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("all-blocked probe analysis: {err:?}"),
+        };
+        assert_eq!(candidate.outcome, ConflictOutcome::Complete);
+        assert!(candidate.recommended_probes.is_empty());
+        assert_eq!(candidate.positions.len(), 2);
+        assert_eq!(candidate.resolution_status, None);
+    }
+
+    // WORK_UNIT_CASE: 673/43
+    #[test]
+    fn case_43_duplicate_probe_without_changed_condition_fails_closed() {
+        let conflict = test_conflict();
+        let mut supplements = test_supplements();
+        supplements.supplied_probes = vec![
+            test_discriminative_probe("probe-dup"),
+            test_discriminative_probe("probe-dup"),
+        ];
+        let err = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &conflict,
+            &supplements,
+            &test_policy(),
+        ) {
+            Ok(candidate) => panic!("duplicate probe must fail: {:?}", candidate.outcome),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, ConflictAnalysisError::Denominator { .. }),
+            "duplicate probe identity fails closed: {err:?}"
+        );
+        let mut changed = test_nondiscriminative_probe();
+        changed.probe_id = String::from("probe-dup");
+        let mut supplements = test_supplements();
+        supplements.supplied_probes = vec![test_discriminative_probe("probe-dup"), changed];
+        let err = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &conflict,
+            &supplements,
+            &test_policy(),
+        ) {
+            Ok(candidate) => panic!("same-id changed content must fail: {:?}", candidate.outcome),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, ConflictAnalysisError::Denominator { .. }),
+            "no changed-condition exemption is invented for a duplicate probe id: {err:?}"
+        );
+        let mut supplements = test_supplements();
+        supplements.supplied_probes = vec![
+            test_discriminative_probe("probe-dup-a"),
+            test_discriminative_probe("probe-dup-b"),
+        ];
+        let candidate = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &conflict,
+            &supplements,
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("distinct probe analysis: {err:?}"),
+        };
+        assert_eq!(candidate.recommended_probes.len(), 2);
+        assert_eq!(
+            candidate
+                .recommended_probes
+                .first()
+                .expect("first probe")
+                .probe_id,
+            "probe-dup-a"
+        );
+        assert_eq!(candidate.resolution_status, None);
+    }
+
+    // WORK_UNIT_CASE: 673/44
+    #[test]
+    fn case_44_supplied_probe_content_and_semantic_order_preserved() {
+        let conflict = test_conflict();
+        let probe_a = test_discriminative_probe("probe-44-a");
+        let probe_b = test_discriminative_probe("probe-44-b");
+        assert!(branches_discriminate(&probe_a.schema));
+        assert!(branches_discriminate(&probe_b.schema));
+        let mut forward = test_supplements();
+        forward.supplied_probes = vec![probe_a.clone(), probe_b.clone()];
+        let mut reverse = test_supplements();
+        reverse.supplied_probes = vec![probe_b.clone(), probe_a.clone()];
+        let first = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &conflict,
+            &forward,
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("forward probe analysis: {err:?}"),
+        };
+        let second = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &conflict,
+            &reverse,
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("reverse probe analysis: {err:?}"),
+        };
+        assert_eq!(first.recommended_probes.len(), 2);
+        assert_eq!(first.recommended_probes[0].probe_id, "probe-44-a");
+        assert_eq!(first.recommended_probes[1].probe_id, "probe-44-b");
+        assert_eq!(
+            first.candidate_digest, second.candidate_digest,
+            "recommendation order is semantic sorted-id, not input order"
+        );
+        for recommended in &first.recommended_probes {
+            let supplied = forward
+                .supplied_probes
+                .iter()
+                .find(|probe| probe.probe_id == recommended.probe_id)
+                .expect("recommended probe binds its supplied declaration");
+            assert_eq!(recommended.objective_digest, supplied.objective.digest);
+            assert_eq!(recommended.result_digest, supplied.schema.digest);
+            assert_eq!(recommended.owner, supplied.owner_note);
+            assert_eq!(recommended.verifier, supplied.verifier);
+        }
+        assert_eq!(probe_a.schema.branches.len(), 2);
+        assert_eq!(probe_b.schema.branches.len(), 2);
+        assert_eq!(first.resolution_status, None);
     }
 }
