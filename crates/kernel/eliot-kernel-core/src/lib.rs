@@ -47,6 +47,7 @@ pub use error::{KernelError, KernelResult};
 pub use grant_activation_port::{
     CommittedReceipt, GrantActivationIntent, GrantActivationPort, GrantRevocationIntent,
     IntentDisposition, IntroductionActivationIntent, IntroductionRevocationIntent,
+    RootGrantHydration, RootGrantHydrationSource,
 };
 pub use module::control_reserve_front_door::{
     AuthorityDecision, CapacityBottleneck, CapacityClass, ControlOperationClass, ControlPermit,

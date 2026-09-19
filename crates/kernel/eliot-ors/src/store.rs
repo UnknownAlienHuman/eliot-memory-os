@@ -31,12 +31,18 @@ use crate::{
     AuthorityActivationReceipt, AuthorityHandoffBegin, AuthorityHandoffRecord,
     AuthorityHandoffState, AuthorityRevocation, AuthorityRevocationReceipt,
     AuthoritySnapshotReceipt, CanonicalDisposition, CanonicalReconciliation,
-    CapabilityGrantActivation, CapabilityGrantRevocation, CapabilityIntroductionActivation,
-    CapabilityIntroductionFence, CapabilityIntroductionReceipt, DeliveryAcknowledgement,
-    DeliveryCursorReceipt, DeliveryCursorState, EpochIdentity, EpochLineage,
-    GenerationCutoverReceipt, GenerationCutoverRecord, GenerationCutoverSnapshot,
-    GenerationTransition, GenerationTransitionReceipt, HostRequestRecord, HostRequestState,
-    JobCheckpoint, KernelAuthoritySnapshot, NativeWorkerClaimAdmission, NativeWorkerClaimRecord,
+    ActivationResultRetentionRecord, ActiveSessionBinding, AdmissionReservation,
+    AdmissionReservationActivation, AdmissionReservationReceipt, AdmissionReservationRelease,
+    AuthorityActivationReceipt, AuthorityHandoffBegin, AuthorityHandoffRecord,
+    AuthorityHandoffState, AuthorityRevocation, AuthorityRevocationReceipt,
+    AuthoritySnapshotReceipt, CanonicalDisposition, CanonicalReconciliation,
+    CapabilityGrantActivation, CapabilityGrantProjection, CapabilityGrantRevocation,
+    CapabilityIntroductionActivation, CapabilityIntroductionFence,
+    CapabilityIntroductionReceipt, DeliveryAcknowledgement, DeliveryCursorReceipt,
+    DeliveryCursorState, EpochIdentity, EpochLineage, GenerationCutoverReceipt,
+    GenerationCutoverRecord, GenerationCutoverSnapshot, GenerationTransition,
+    GenerationTransitionReceipt, HostRequestRecord, HostRequestState, JobCheckpoint,
+    KernelAuthoritySnapshot, NativeWorkerClaimAdmission, NativeWorkerClaimRecord,
     NativeWorkerClaimStageOutcome, NativeWorkerClaimState, OpaqueLabel, OperationalMutationReceipt,
     OperationalPhase, OperationalRecordContext, OperationalRecordInput, OrsError,
     OrsSnapshotReceipt, OrsSnapshotRequest, PendingOperationPage, ProcessEvidenceRecord,
@@ -283,6 +289,12 @@ pub trait OperationalRecoveryStore: Send + Sync {
         &self,
         revocation: CapabilityGrantRevocation,
     ) -> Result<AuthorityRevocationReceipt, OrsError>;
+    /// Reads one current capability-grant row after validating its opaque
+    /// record, key, kind, subject, phase, and store-issued receipt.
+    fn load_capability_grant(
+        &self,
+        subject_id: &crate::OperationIdentity,
+    ) -> Result<Option<CapabilityGrantProjection>, OrsError>;
     fn activate_capability_introduction(
         &self,
         activation: CapabilityIntroductionActivation,
@@ -6042,6 +6054,39 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             OperationalPhase::Fenced,
         )
         .map(AuthorityRevocationReceipt::from_receipt)
+    }
+
+    fn load_capability_grant(
+        &self,
+        subject_id: &crate::OperationIdentity,
+    ) -> Result<Option<CapabilityGrantProjection>, OrsError> {
+        let key = Self::operational_key(OperationalKind::CapabilityGrant, subject_id);
+        let read = self.database.begin_read().map_err(storage)?;
+        let current = read.open_table(OPERATIONAL_CURRENT).map_err(storage)?;
+        let Some(value) = current.get(key.as_str()).map_err(storage)? else {
+            return Ok(None);
+        };
+        let record: DurableOperationalRecord = decode_named(value.value(), "operational_current")?;
+        if record.kind != OperationalKind::CapabilityGrant
+            || record.input.subject_id != *subject_id
+            || !matches!(
+                record.phase,
+                OperationalPhase::Active | OperationalPhase::Fenced
+            )
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "capability_grant",
+                reason: "current capability-grant key, kind, subject, or phase mismatch".to_owned(),
+            });
+        }
+        record.input.validate()?;
+        let receipt = Self::receipt_for(&record)?;
+        Ok(Some(CapabilityGrantProjection::from_store(
+            record.input,
+            record.phase,
+            record.operation_order,
+            receipt,
+        )))
     }
 
     fn activate_capability_introduction(
