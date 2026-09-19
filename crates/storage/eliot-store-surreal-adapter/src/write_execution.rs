@@ -1205,7 +1205,7 @@ impl WriteExecution {
             }
             Presubmit::Proceed => {}
         }
-        if self.is_cancelled(&operation_id) {
+        if self.is_cancelled(&operation_id) || self.is_draining() {
             return Some(self.complete_cancelled(&operation_id, now_ms));
         }
         let attempt = executable_attempt(&operation_id, &marked.queued.request);
