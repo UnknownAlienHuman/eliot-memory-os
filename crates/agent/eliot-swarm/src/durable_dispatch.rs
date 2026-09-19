@@ -8,12 +8,11 @@
 //! through the existing ports; it constructs no provider clients, owns no
 //! second job/task/session/authority record, and performs no process launch.
 //!
-//! This module is NOT the production swarm-consumption attachment path: no
-//! production Governor-vended attachment-owner port exists yet, and no swarm
-//! production caller is wired to this helper as the authoritative consumption
-//! path. Singularity here holds only within the single owner instance the
-//! caller supplies. The production Governor port/store/composition work is
-//! tracked as follow-up issue #2017.
+//! This module is an in-crate composition primitive, not the production
+//! swarm-consumption attachment path: the production path is
+//! [`super::swarm_plan_attachment_consumer`] over a Governor-vended consumer
+//! port (issue #2017). Singularity here holds only within the single owner
+//! instance the caller supplies.
 //!
 //! The cell stays stateless: an attachment is an inert validated value, and a
 //! dispatched launch still requires the owner-side persist-before-launch path
@@ -132,8 +131,9 @@ pub enum ReplayVerdict {
 /// Governor canonical owner.
 ///
 /// This helper is crate-private and is NOT the production swarm-consumption
-/// attachment path. It performs validation plus attach-once delegation only
-/// against the owner instance the caller supplies: the canonical
+/// attachment path (that path is [`super::swarm_plan_attachment_consumer`]
+/// over a Governor-vended port). It performs validation plus attach-once
+/// delegation only against the owner instance the caller supplies: the canonical
 /// [`SwarmPlanAttachmentLedger::attach_plan_once`] decision runs BEFORE the
 /// attachment value is constructed, so two calls for the same plan revision
 /// with different job handles cannot both succeed against the same owner. An
@@ -141,11 +141,10 @@ pub enum ReplayVerdict {
 /// replays idempotently; a key bound to a different job or fence digest is
 /// [`SwarmError::OwnershipConflict`], naming the canonical winner.
 ///
-/// No production Governor-vended attachment-owner port exists yet, and no
-/// swarm production caller is wired to this helper as the authoritative
-/// consumption path; singularity across independently acquired production
-/// consumers is therefore out of scope here and is tracked as follow-up
-/// issue #2017 (production Governor port/store/composition).
+/// The production swarm-consumption path is
+/// [`super::swarm_plan_attachment_consumer`] over a Governor-vended port
+/// (issue #2017 items 3+4+6); singularity across independently acquired
+/// production consumers is proved there, not by this helper.
 ///
 /// Fail-closed: a blank handle never attaches, a missing verifier is
 /// [`SwarmError::PlanGap`], a non-Governor or plan/fence-mismatched receipt is
@@ -153,20 +152,21 @@ pub enum ReplayVerdict {
 /// not echo the requested job/fence is refused as an internal contract
 /// violation.
 ///
-/// Durable-binding remainder (BLOCKED on #2017): the ledger above is the
-/// Governor-owned in-memory canon for this process. Cross-process and restart
-/// durability needs a production `SwarmPlanAttachmentStore` behind
-/// `attach_plan_once_durable`; no production store implementation exists yet,
-/// and binding the trait to the real Governor canonical-write path is queued
-/// remainder in the canon crate
-/// (`crates/governor/eliot-coordination/src/swarm_plan_attachment.rs`: store
-/// contract plus durable entry point). This function does not fake durability:
-/// it enforces attach-once against the Governor owner it is given.
+/// Durable-binding note: the ledger above is the Governor-owned in-memory
+/// canon for this process. The production store
+/// (`CanonicalSwarmPlanAttachmentStore` in `eliot-governor`, issue #2017
+/// slices 1+2) implements `SwarmPlanAttachmentStore` behind
+/// `attach_plan_once_durable`, and the production swarm consumer
+/// ([`super::swarm_plan_attachment_consumer`]) attaches through it.
+/// Cross-process envelope wiring (composing the mapped revision/ordering
+/// expectations into a real `CanonicalWriteEnvelope`) remains deferred. This
+/// function does not fake durability: it enforces attach-once against the
+/// Governor owner it is given.
 //
-// NOTE: no non-test caller exists by design (no production consumption path
-// yet; see the module docs and follow-up #2017). The helper is retained as
-// the in-crate composition primitive that #2017 will wire to a vended owner
-// port, and is exercised by the unit tests below.
+// NOTE: no non-test caller exists by design (the production consumption path
+// is [`super::swarm_plan_attachment_consumer`]). The helper is retained as
+// the in-crate composition primitive over a caller-supplied ledger, and is
+// exercised by the unit tests below.
 #[allow(dead_code)]
 pub(crate) fn attach_plan_job(
     plan: &AdmittedSwarmPlan,
@@ -819,8 +819,8 @@ mod tests {
         assert!(assert_single_attachment(Some(&first), &same).is_ok());
         // A second job for the same plan revision loses at the canon: without
         // the Governor call both attaches would succeed. This proof holds
-        // only within the single owner instance supplied above; independent
-        // owners are out of scope (production owner port: follow-up #2017).
+        // only within the single owner instance supplied above; cross-owner
+        // production singularity is proved by `swarm_plan_attachment_consumer`.
         let request = attach_request(plan.provider_binding(), "job-2")?;
         let receipt = receipt_for(JOB_OWNER, &request, None)?;
         assert_eq!(

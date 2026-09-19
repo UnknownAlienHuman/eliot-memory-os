@@ -486,6 +486,173 @@ pub fn attach_plan_once_durable<S: SwarmPlanAttachmentStore>(
     }
 }
 
+/// Opaque consumer identity vended by the Governor attachment owner.
+///
+/// The three identities are pinned at construction and exposed only through
+/// getters: there are no setters and the fields are private, so a caller
+/// holding a consumer cannot swap the admission digest, plan revision, or
+/// fence digest between acquisition and attach. The only caller-supplied
+/// value at attach time is the opaque durable job handle, which the canonical
+/// decision then binds or refuses with `OwnershipConflict`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SwarmPlanAttachmentConsumer {
+    admission_digest: String,
+    plan_revision: String,
+    fence_digest: String,
+}
+
+impl SwarmPlanAttachmentConsumer {
+    /// Vends one consumer handle after validating the pinned identities.
+    ///
+    /// Construction is crate-internal: external callers vend handles through
+    /// [`SwarmPlanAttachmentConsumerPort::vend_consumer`].
+    pub(crate) fn new(
+        admission_digest: &str,
+        plan_revision: &str,
+        fence_digest: &str,
+    ) -> Result<Self, SwarmPlanAttachmentError> {
+        text(admission_digest, "admission_digest")?;
+        text(plan_revision, "plan_revision")?;
+        text(fence_digest, "fence_digest")?;
+        Ok(Self {
+            admission_digest: admission_digest.to_owned(),
+            plan_revision: plan_revision.to_owned(),
+            fence_digest: fence_digest.to_owned(),
+        })
+    }
+
+    /// Opaque admission identity pinned by this consumer.
+    #[must_use]
+    pub fn admission_digest(&self) -> &str {
+        &self.admission_digest
+    }
+
+    /// Plan revision pinned by this consumer.
+    #[must_use]
+    pub fn plan_revision(&self) -> &str {
+        &self.plan_revision
+    }
+
+    /// State-fence digest pinned by this consumer.
+    #[must_use]
+    pub fn fence_digest(&self) -> &str {
+        &self.fence_digest
+    }
+}
+
+/// Consumer-facing attach port vended by the Governor attachment owner.
+///
+/// Callers never supply the plan identity at attach time: they present a
+/// previously vended [`SwarmPlanAttachmentConsumer`] plus the candidate job
+/// handle. The port resolves the pinned `(admission_digest, plan_revision,
+/// fence_digest)` tuple itself, so a caller cannot swap identities across
+/// calls to manufacture a second binding.
+///
+/// The port is bound to the canonical-write path: implementations run the
+/// canonical [`SwarmPlanAttachmentOwner::attach_plan_once`] decision through
+/// the conditional-commit boundary (`load` then versioned
+/// `compare_and_swap`, see [`attach_plan_once_durable`]). The production
+/// Governor store maps [`SwarmPlanAttachmentVersion`] onto the
+/// `CanonicalWriteEnvelope` revision-head protocol
+/// (`expected_revision_heads` / `expected_ordering_heads`): a violated
+/// revision-head or ordering-head expectation surfaces as a store
+/// revision/ordering conflict, which the store reports as
+/// [`CasOutcome::Contended`]. Contention reloads and retries, so the loser of
+/// a first-bind race observes `OwnershipConflict` naming the canonical
+/// winner instead of escaping with a second success. No unbound-to-bound
+/// success escapes before [`CasOutcome::Committed`].
+pub trait SwarmPlanAttachmentConsumerPort {
+    /// Opaque store failure underneath the canonical-write path.
+    type Error;
+
+    /// Vends one opaque consumer handle pinned to the given identities.
+    ///
+    /// This is the only construction path outside the defining crate:
+    /// validation is fail-closed (blank identities are refused with
+    /// [`SwarmPlanAttachmentError::InvalidField`] and no handle is issued),
+    /// so swarm callers cannot mint identity-bearing capabilities themselves.
+    /// The default body constructs the handle.
+    fn vend_consumer(
+        &self,
+        admission_digest: &str,
+        plan_revision: &str,
+        fence_digest: &str,
+    ) -> Result<SwarmPlanAttachmentConsumer, SwarmPlanAttachmentError> {
+        SwarmPlanAttachmentConsumer::new(admission_digest, plan_revision, fence_digest)
+    }
+
+    /// Attaches the pinned consumer plan to one durable job handle.
+    fn attach(
+        &self,
+        consumer: &SwarmPlanAttachmentConsumer,
+        job_handle: &str,
+    ) -> Result<SwarmPlanBinding, DurableAttachError<Self::Error>>;
+}
+
+/// Durable consumer port over one [`SwarmPlanAttachmentStore`].
+///
+/// This is the canonical-write binding of [`SwarmPlanAttachmentConsumerPort`]:
+/// every `attach` runs [`attach_plan_once_durable`] against the wrapped
+/// store, so cross-process atomicity comes from the store's conditional
+/// commit (revision-head CAS), never from the caller. The Governor production
+/// store implements the wrapped trait with the `CanonicalWriteEnvelope`
+/// `expected_revision_heads` / `expected_ordering_heads` expectations.
+pub struct SwarmPlanAttachmentDurablePort<'a, S: SwarmPlanAttachmentStore> {
+    store: &'a S,
+}
+
+impl<'a, S: SwarmPlanAttachmentStore> SwarmPlanAttachmentDurablePort<'a, S> {
+    /// Borrows the canonical-write store behind this consumer port.
+    #[must_use]
+    pub fn new(store: &'a S) -> Self {
+        Self { store }
+    }
+}
+
+impl<S: SwarmPlanAttachmentStore> SwarmPlanAttachmentConsumerPort
+    for SwarmPlanAttachmentDurablePort<'_, S>
+{
+    type Error = S::Error;
+
+    fn attach(
+        &self,
+        consumer: &SwarmPlanAttachmentConsumer,
+        job_handle: &str,
+    ) -> Result<SwarmPlanBinding, DurableAttachError<Self::Error>> {
+        attach_plan_once_durable(
+            self.store,
+            consumer.admission_digest(),
+            consumer.plan_revision(),
+            job_handle,
+            consumer.fence_digest(),
+        )
+    }
+}
+
+impl SwarmPlanAttachmentConsumerPort for SwarmPlanAttachmentLedger {
+    type Error = std::convert::Infallible;
+
+    /// Attaches through the in-process canonical ledger.
+    ///
+    /// Identity still comes only from the vended consumer: the caller
+    /// supplies just the job handle. Decision failures (including the
+    /// canonical `OwnershipConflict` winner) pass through as `Decision`;
+    /// the in-memory ledger never produces a `Store` error.
+    fn attach(
+        &self,
+        consumer: &SwarmPlanAttachmentConsumer,
+        job_handle: &str,
+    ) -> Result<SwarmPlanBinding, DurableAttachError<Self::Error>> {
+        self.attach_plan_once(
+            consumer.admission_digest(),
+            consumer.plan_revision(),
+            job_handle,
+            consumer.fence_digest(),
+        )
+        .map_err(DurableAttachError::Decision)
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
@@ -948,5 +1115,88 @@ mod tests {
             Err(DurableAttachError::Store(TestStoreError("boom")))
         );
         assert_eq!(TestStore::counts(&store), (1, 0));
+    }
+
+    fn consumer() -> SwarmPlanAttachmentConsumer {
+        SwarmPlanAttachmentConsumer::new(ADMISSION, PLAN, FENCE).expect("consumer vends")
+    }
+
+    #[test]
+    fn consumer_handle_pins_identity_and_rejects_blanks() {
+        let valid = consumer();
+        assert_eq!(valid.admission_digest(), ADMISSION);
+        assert_eq!(valid.plan_revision(), PLAN);
+        assert_eq!(valid.fence_digest(), FENCE);
+        assert_eq!(
+            SwarmPlanAttachmentConsumer::new("   ", PLAN, FENCE),
+            Err(SwarmPlanAttachmentError::InvalidField("admission_digest"))
+        );
+        assert_eq!(
+            SwarmPlanAttachmentConsumer::new(ADMISSION, "   ", FENCE),
+            Err(SwarmPlanAttachmentError::InvalidField("plan_revision"))
+        );
+        assert_eq!(
+            SwarmPlanAttachmentConsumer::new(ADMISSION, PLAN, "   "),
+            Err(SwarmPlanAttachmentError::InvalidField("fence_digest"))
+        );
+    }
+
+    #[test]
+    fn ledger_port_independently_acquired_handles_converge_second_job_conflicts() {
+        let ledger = SwarmPlanAttachmentLedger::new();
+        // Independently vended handles carry the same pinned identity; the
+        // caller supplies only the job handle, so no identity swap is possible.
+        let first_handle = consumer();
+        let second_handle = consumer();
+        assert_eq!(first_handle, second_handle);
+        let winner = SwarmPlanAttachmentConsumerPort::attach(&ledger, &first_handle, "job-1")
+            .expect("first bind wins");
+        assert_eq!(winner.job_handle(), "job-1");
+        let replay = SwarmPlanAttachmentConsumerPort::attach(&ledger, &second_handle, "job-1")
+            .expect("identical replay is idempotent");
+        assert_eq!(replay, winner);
+        match SwarmPlanAttachmentConsumerPort::attach(&ledger, &second_handle, "job-2") {
+            Err(DurableAttachError::Decision(SwarmPlanAttachmentError::OwnershipConflict {
+                existing,
+            })) => assert_eq!(existing, winner),
+            other => panic!("second job must conflict with the winner, got {other:?}"),
+        }
+        assert_eq!(ledger.len(), 1);
+    }
+
+    #[test]
+    fn ledger_port_blank_job_handle_fails_closed() {
+        let ledger = SwarmPlanAttachmentLedger::new();
+        let handle = consumer();
+        assert_eq!(
+            SwarmPlanAttachmentConsumerPort::attach(&ledger, &handle, "   "),
+            Err(DurableAttachError::Decision(
+                SwarmPlanAttachmentError::InvalidField("job_handle")
+            ))
+        );
+        assert!(ledger.is_empty());
+    }
+
+    #[test]
+    fn durable_port_independently_acquired_handles_converge_second_job_conflicts() {
+        let store = TestStore::new();
+        let port = SwarmPlanAttachmentDurablePort::new(&store);
+        let first_handle = consumer();
+        let second_handle = consumer();
+        let winner = port
+            .attach(&first_handle, "job-1")
+            .expect("first bind commits");
+        assert_eq!(winner.job_handle(), "job-1");
+        let replay = port
+            .attach(&second_handle, "job-1")
+            .expect("identical replay commits");
+        assert_eq!(replay, winner);
+        match port.attach(&second_handle, "job-2") {
+            Err(DurableAttachError::Decision(SwarmPlanAttachmentError::OwnershipConflict {
+                existing,
+            })) => assert_eq!(existing, winner),
+            other => panic!("second job must conflict with the winner, got {other:?}"),
+        }
+        assert_eq!(TestStore::committed_len(&store), 1);
     }
 }
