@@ -448,3 +448,321 @@ fn measurement_bound_to_exact_bytes_schema_route() {
         Err(ContextError::InvalidField(_))
     ));
 }
+
+// WORK_UNIT_CASE: 584/13
+#[test]
+fn missing_mismatched_measurement_rejected() {
+    candidate()
+        .measurement
+        .validate()
+        .expect("valid measurement");
+
+    let mut short = candidate();
+    short.measurement.digest = "abc123".to_owned();
+    assert_eq!(
+        short.validate(),
+        Err(ContextError::InvalidDigest("measurement.digest"))
+    );
+
+    let mut uppercase = candidate();
+    uppercase.measurement.digest = "A".repeat(64);
+    assert_eq!(
+        uppercase.validate(),
+        Err(ContextError::InvalidDigest("measurement.digest"))
+    );
+
+    let mut unnamed = candidate();
+    unnamed.measurement.serializer.clear();
+    assert_eq!(
+        unnamed.validate(),
+        Err(ContextError::InvalidField("measurement.serializer"))
+    );
+
+    // A PresentCurrent floor member without measurement cannot prove currency.
+    let context = binding();
+    let floor = DecisionSafetyFloor {
+        binding: context,
+        mandatory_atoms: vec![id("atom")],
+        mandatory_roles: vec![SemanticRole::Goal],
+        providers: denominator(),
+        members: vec![SafetyFloorMember {
+            atom_id: id("atom"),
+            role: SemanticRole::Goal,
+            availability: AtomAvailability::PresentCurrent,
+            measurement: None,
+            required_dependencies: Vec::new(),
+        }],
+        interpretation_dependencies: Vec::new(),
+        rule_evidence: id("floor-rule"),
+        capacity: CapacityLimits {
+            route_capacity: 100_000,
+            fixed_overhead: 2,
+            output_reserve: 3,
+            review_reserve: 4,
+        },
+    };
+    assert_eq!(
+        floor.validate(),
+        Err(ContextError::MissingField("floor.member.measurement"))
+    );
+
+    // A retargeted digest is still well-formed, so it validates here;
+    // identity conservation against the floor/admitted payload is owned
+    // by the admitted-set equality proof, not by digest syntax.
+    let mut retargeted = candidate();
+    retargeted.measurement.digest = "b".repeat(64);
+    retargeted
+        .validate()
+        .expect("well-formed retargeted digest validates");
+}
+
+// WORK_UNIT_CASE: 584/14
+#[test]
+fn no_split_merge_into_new_semantic_members() {
+    let context = binding();
+    let closed = ContextCandidateSet {
+        binding: context.clone(),
+        candidates: vec![candidate()],
+        denominator: denominator(),
+    };
+    closed.validate().expect("closed single member");
+
+    // A fragment that depends on an absent atom is not a closed semantic
+    // member: strict validation rejects it while the partial admission path
+    // stays explicit instead of silently merging it.
+    let mut fragment = candidate();
+    fragment.dependencies = vec![id("absent-parent")];
+    let partial = ContextCandidateSet {
+        binding: context,
+        candidates: vec![fragment],
+        denominator: denominator(),
+    };
+    assert_eq!(
+        partial.validate(),
+        Err(ContextError::MissingField("candidate.dependencies"))
+    );
+    partial
+        .validate_for_admission()
+        .expect("partial set stays explicit at admission");
+}
+
+// WORK_UNIT_CASE: 584/15
+#[test]
+fn loss_policy_cannot_be_inferred_from_size_role_recency_or_confidence() {
+    #[derive(serde::Deserialize)]
+    struct PolicyHolder {
+        policy: LossPolicy,
+    }
+    assert!(serde_json::from_str::<PolicyHolder>(r"{}").is_err());
+    let holder: PolicyHolder =
+        serde_json::from_str(r#"{"policy":"EXTRACTIVE"}"#).expect("explicit policy");
+    assert_eq!(holder.policy, LossPolicy::Extractive);
+    assert!(serde_json::from_str::<LossPolicy>("\"NON DROPPABLE\"").is_err());
+    assert!(serde_json::from_str::<LossPolicy>("\"non_droppable\"").is_err());
+
+    // Size does not select the policy: tiny and large whole units share it.
+    let mut tiny = candidate();
+    tiny.representation = AtomRepresentation::Whole {
+        content: "x".to_owned(),
+    };
+    tiny.loss_policy = LossPolicy::NonDroppable;
+    tiny.validate().expect("tiny whole unit");
+
+    let mut large = candidate();
+    large.representation = AtomRepresentation::Whole {
+        content: "x".repeat(10_000),
+    };
+    large.loss_policy = LossPolicy::NonDroppable;
+    large.validate().expect("large whole unit");
+
+    // Role does not select the policy either: the same handle policy holds
+    // for another role, while the wrong policy/representation pair fails.
+    let mut handle = candidate();
+    handle.provider_role.role = SemanticRole::Source;
+    handle.loss_policy = LossPolicy::HandleOnly;
+    handle.representation = AtomRepresentation::Handle { handle: id("h") };
+    handle.validate().expect("explicit handle-only");
+
+    let mut inferred = candidate();
+    inferred.loss_policy = LossPolicy::NonDroppable;
+    inferred.representation = AtomRepresentation::Handle { handle: id("h") };
+    assert_eq!(inferred.validate(), Err(ContextError::WholeUnitRequired));
+}
+
+// WORK_UNIT_CASE: 584/16
+#[test]
+fn incompatible_required_protected_representation_rejected() {
+    let mut summary = candidate();
+    summary.representation = AtomRepresentation::Summary {
+        content: "lossy".to_owned(),
+        source_digest: digest(),
+    };
+    assert_eq!(summary.validate(), Err(ContextError::WholeUnitRequired));
+
+    let mut extractive = candidate();
+    extractive.representation = AtomRepresentation::Extractive {
+        content: "kept".to_owned(),
+        manifest: vec!["field".to_owned()],
+    };
+    assert_eq!(extractive.validate(), Err(ContextError::WholeUnitRequired));
+
+    let mut whole_as_handle_only = candidate();
+    whole_as_handle_only.loss_policy = LossPolicy::HandleOnly;
+    assert_eq!(
+        whole_as_handle_only.validate(),
+        Err(ContextError::WholeUnitRequired)
+    );
+
+    // Whole is no more lossy than a summarizable policy, so it is allowed.
+    let mut whole_as_summarizable = candidate();
+    whole_as_summarizable.loss_policy = LossPolicy::Summarizable;
+    whole_as_summarizable
+        .validate()
+        .expect("whole under summarizable");
+
+    let mut handle_as_summarizable = candidate();
+    handle_as_summarizable.loss_policy = LossPolicy::Summarizable;
+    handle_as_summarizable.representation = AtomRepresentation::Handle { handle: id("h") };
+    assert_eq!(
+        handle_as_summarizable.validate(),
+        Err(ContextError::WholeUnitRequired)
+    );
+
+    let rule = RoleLossRule {
+        role: SemanticRole::Goal,
+        loss_policy: LossPolicy::NonDroppable,
+        required: true,
+        allowed_representations: vec![RepresentationKind::Summary],
+    };
+    assert_eq!(rule.validate(), Err(ContextError::WholeUnitRequired));
+}
+
+// WORK_UNIT_CASE: 584/17
+#[test]
+fn bounded_interpretation_dependencies_cannot_disappear() {
+    let mut duplicate = candidate();
+    duplicate.dependencies = vec![id("dep"), id("dep")];
+    assert_eq!(
+        duplicate.validate(),
+        Err(ContextError::Duplicate("candidate.dependencies"))
+    );
+
+    let mut oversized = candidate();
+    oversized.dependencies = vec![id("dep"); 257];
+    assert!(matches!(
+        oversized.validate(),
+        Err(ContextError::Bounds { .. })
+    ));
+
+    // Strict membership keeps the dependency closure closed: a dangling
+    // reference fails instead of silently disappearing.
+    let context = binding();
+    let mut dangling = candidate();
+    dangling.dependencies = vec![id("absent")];
+    let set = ContextCandidateSet {
+        binding: context.clone(),
+        candidates: vec![dangling],
+        denominator: denominator(),
+    };
+    assert_eq!(
+        set.validate(),
+        Err(ContextError::MissingField("candidate.dependencies"))
+    );
+
+    // Floor dependency closure is exact: self-reference and non-member
+    // references both fail closed.
+    let member = SafetyFloorMember {
+        atom_id: id("atom"),
+        role: SemanticRole::Goal,
+        availability: AtomAvailability::Missing,
+        measurement: None,
+        required_dependencies: vec![id("atom")],
+    };
+    let floor = DecisionSafetyFloor {
+        binding: context.clone(),
+        mandatory_atoms: vec![id("atom")],
+        mandatory_roles: vec![SemanticRole::Goal],
+        providers: ProviderRoleDenominator {
+            requested: vec![provider_role()],
+            dispositions: vec![ProviderDisposition {
+                slot: provider_role(),
+                state: AtomAvailability::Missing,
+                evidence: None,
+            }],
+        },
+        members: vec![member],
+        interpretation_dependencies: Vec::new(),
+        rule_evidence: id("floor-rule"),
+        capacity: CapacityLimits {
+            route_capacity: 100,
+            fixed_overhead: 1,
+            output_reserve: 1,
+            review_reserve: 1,
+        },
+    };
+    assert_eq!(
+        floor.validate(),
+        Err(ContextError::Duplicate("floor.required_dependencies"))
+    );
+
+    let mut foreign = floor.clone();
+    foreign.members[0].required_dependencies = vec![id("elsewhere")];
+    assert_eq!(foreign.validate(), Err(ContextError::MissingFloor));
+
+    let mut interpretation = floor.clone();
+    interpretation.members[0].required_dependencies = Vec::new();
+    interpretation.interpretation_dependencies = vec![id("elsewhere")];
+    assert_eq!(interpretation.validate(), Err(ContextError::MissingFloor));
+}
+
+// WORK_UNIT_CASE: 584/18
+#[test]
+fn freshness_privacy_authority_evidence_proof_cannot_widen() {
+    let mut stale = candidate();
+    stale.status = EpistemicStatus::Stale;
+    assert_eq!(
+        stale.validate(),
+        Err(ContextError::InvalidField("candidate.availability"))
+    );
+
+    let mut superseded = candidate();
+    superseded.status = EpistemicStatus::Superseded;
+    assert_eq!(
+        superseded.validate(),
+        Err(ContextError::InvalidField("candidate.availability"))
+    );
+
+    // Availability must track the denominator slot: a present candidate
+    // against a missing slot is an identity conflict, not a widening.
+    let context = binding();
+    let missing_denominator = ProviderRoleDenominator {
+        requested: vec![provider_role()],
+        dispositions: vec![ProviderDisposition {
+            slot: provider_role(),
+            state: AtomAvailability::Missing,
+            evidence: None,
+        }],
+    };
+    let widened = ContextCandidateSet {
+        binding: context,
+        candidates: vec![candidate()],
+        denominator: missing_denominator,
+    };
+    assert_eq!(
+        widened.validate_for_admission(),
+        Err(ContextError::IdentityConflict)
+    );
+
+    // Blocked/unavailable slots need named evidence; absence fails closed.
+    let blocked = ProviderDisposition {
+        slot: provider_role(),
+        state: AtomAvailability::Blocked,
+        evidence: None,
+    };
+    assert_eq!(
+        blocked.validate(),
+        Err(ContextError::MissingField(
+            "denominator.dispositions.evidence"
+        ))
+    );
+}
