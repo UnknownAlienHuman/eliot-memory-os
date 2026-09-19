@@ -1864,3 +1864,417 @@ fn stu_estimate_and_exact_tokenizer_evidence_stay_distinct() {
             .expect("tokenizer over-budget still evaluates"),
     );
 }
+
+// WORK_UNIT_CASE: 584/43
+#[test]
+fn serializer_schema_envelope_route_model_tokenizer_mismatch_rejected() {
+    let context = binding();
+    let baseline = exact_measurement(&context);
+    baseline.validate().expect("baseline measurement validates");
+    let baseline_digest = canonical_digest(&baseline).expect("baseline digest");
+
+    // Every load-bearing text identity fails closed when blank.
+    for (field, mut mutated) in [
+        ("serializer_id", baseline.clone()),
+        ("serializer_version", baseline.clone()),
+        ("route_id", baseline.clone()),
+        ("model_id", baseline.clone()),
+    ] {
+        match field {
+            "serializer_id" => mutated.serializer_id.clear(),
+            "serializer_version" => mutated.serializer_version.clear(),
+            "route_id" => mutated.route_id.clear(),
+            _ => mutated.model_id.clear(),
+        }
+        assert!(
+            mutated.validate().is_err(),
+            "blank {field} must fail closed"
+        );
+    }
+
+    // Envelope and serializer-options digests must stay exact lowercase SHA-256.
+    let mut bad_envelope = baseline.clone();
+    bad_envelope.envelope_digest = "short".to_owned();
+    assert!(matches!(
+        bad_envelope.validate(),
+        Err(ContextError::InvalidDigest(_))
+    ));
+    let mut bad_options = baseline.clone();
+    bad_options.serializer_options_digest = "A".repeat(64);
+    assert!(matches!(
+        bad_options.validate(),
+        Err(ContextError::InvalidDigest(_))
+    ));
+
+    // Tokenizer identities are independently bound when present.
+    let mut observed = baseline.clone();
+    observed.status = MeasurementStatus::ExactTokenizer;
+    observed.tokenizer = Some(TokenizerObservation {
+        tokenizer_id: "fixture-tokenizer".to_owned(),
+        tokenizer_version: "v1".to_owned(),
+        tokenizer_hash: digest(),
+        tokens: 13,
+    });
+    observed
+        .validate()
+        .expect("tokenizer observation validates");
+    let mut bad_tokenizer_id = observed.clone();
+    bad_tokenizer_id
+        .tokenizer
+        .as_mut()
+        .expect("tokenizer")
+        .tokenizer_id
+        .clear();
+    assert!(bad_tokenizer_id.validate().is_err());
+    let mut bad_tokenizer_version = observed.clone();
+    bad_tokenizer_version
+        .tokenizer
+        .as_mut()
+        .expect("tokenizer")
+        .tokenizer_version
+        .clear();
+    assert!(bad_tokenizer_version.validate().is_err());
+    let mut bad_tokenizer_hash = observed.clone();
+    bad_tokenizer_hash
+        .tokenizer
+        .as_mut()
+        .expect("tokenizer")
+        .tokenizer_hash = "short".to_owned();
+    assert!(matches!(
+        bad_tokenizer_hash.validate(),
+        Err(ContextError::InvalidDigest(_))
+    ));
+
+    // A substituted identity is a distinct value, never a silent match.
+    let mut reserialized = baseline.clone();
+    reserialized.serializer_id = "other-serializer".to_owned();
+    assert_ne!(reserialized, baseline);
+    assert_ne!(
+        canonical_digest(&reserialized).expect("reserialized digest"),
+        baseline_digest
+    );
+    let mut rerouted = baseline.clone();
+    rerouted.route_id = "other-route".to_owned();
+    assert_ne!(
+        canonical_digest(&rerouted).expect("rerouted digest"),
+        baseline_digest
+    );
+    let mut remodeled = baseline.clone();
+    remodeled.model_id = "other-model".to_owned();
+    assert_ne!(
+        canonical_digest(&remodeled).expect("remodeled digest"),
+        baseline_digest
+    );
+    let mut reschema = baseline.clone();
+    reschema.schema_version = eliot_contracts::ContractVersion::new(1, 0, 1);
+    assert_ne!(
+        canonical_digest(&reschema).expect("reschema digest"),
+        baseline_digest
+    );
+
+    // Unknown wire fields are rejected at the measurement boundary.
+    let mut value = serde_json::to_value(&baseline).expect("measurement value");
+    value["unknown_field"] = serde_json::Value::from("boom");
+    assert!(serde_json::from_value::<SerializedContextMeasurement>(value).is_err());
+}
+
+// WORK_UNIT_CASE: 584/44
+#[test]
+fn unknown_tokenizer_accounting_cannot_prove_fit_or_known_empty() {
+    let context = binding();
+
+    // Unknown and unavailable validate as measurements but never prove fit,
+    // even against a huge route or an empty route.
+    for status in [MeasurementStatus::Unknown, MeasurementStatus::Unavailable] {
+        let mut measurement = exact_measurement(&context);
+        measurement.status = status;
+        measurement.validate().expect("unknown status validates");
+        assert_eq!(
+            measurement.proves_fit(100_000),
+            Err(ContextError::UnknownMeasurement)
+        );
+        assert_eq!(
+            measurement.proves_fit(0),
+            Err(ContextError::UnknownMeasurement)
+        );
+    }
+
+    // A conservative STU estimate validates but stays unknown for fit.
+    let mut stu = exact_measurement(&context);
+    stu.status = MeasurementStatus::ConservativeStu;
+    stu.stu_estimate = Some(StuEstimate {
+        value: 0,
+        empirical: true,
+    });
+    stu.validate().expect("zero STU validates");
+    assert_eq!(
+        stu.proves_fit(100_000),
+        Err(ContextError::UnknownMeasurement)
+    );
+    assert_eq!(stu.proves_fit(0), Err(ContextError::UnknownMeasurement));
+
+    // Exact-tokenizer status without an observation fails closed instead of
+    // proving a known-empty fit.
+    let mut missing = exact_measurement(&context);
+    missing.status = MeasurementStatus::ExactTokenizer;
+    missing.tokenizer = None;
+    assert_eq!(missing.validate(), Err(ContextError::UnknownMeasurement));
+    assert_eq!(
+        missing.proves_fit(100_000),
+        Err(ContextError::UnknownMeasurement)
+    );
+
+    // An unnamed tokenizer observation cannot prove fit either.
+    let mut unnamed = exact_measurement(&context);
+    unnamed.status = MeasurementStatus::ExactTokenizer;
+    unnamed.tokenizer = Some(TokenizerObservation {
+        tokenizer_id: String::new(),
+        tokenizer_version: "v1".to_owned(),
+        tokenizer_hash: digest(),
+        tokens: 0,
+    });
+    assert!(unnamed.validate().is_err());
+}
+
+// WORK_UNIT_CASE: 584/45
+#[test]
+fn false_safe_overflow_independently_represented_and_evidence_bound() {
+    let context = binding();
+    let baseline = exact_measurement(&context);
+    assert_eq!(baseline.false_safe_overflow, None);
+    baseline.validate().expect("baseline validates");
+    let baseline_digest = canonical_digest(&baseline).expect("baseline digest");
+    let baseline_fit = baseline.proves_fit(22).expect("baseline fit");
+
+    // Recording a false-safe overflow is an explicit evidence-bound value.
+    let mut flagged = baseline.clone();
+    flagged.false_safe_overflow = Some(id("overflow-evidence"));
+    flagged.validate().expect("flagged overflow validates");
+    assert_eq!(flagged.false_safe_overflow, Some(id("overflow-evidence")));
+    assert_ne!(
+        canonical_digest(&flagged).expect("flagged digest"),
+        baseline_digest
+    );
+
+    // The flag is independent: fit evaluation is unchanged and the sibling
+    // false-rejection flag stays unset.
+    assert_eq!(flagged.proves_fit(22).expect("flagged fit"), baseline_fit);
+    assert_eq!(flagged.false_rejection_or_decomposition, None);
+
+    // Distinct evidence identities are distinct values.
+    let mut other = baseline.clone();
+    other.false_safe_overflow = Some(id("other-overflow"));
+    assert_ne!(
+        canonical_digest(&other).expect("other digest"),
+        canonical_digest(&flagged).expect("flagged digest")
+    );
+
+    // The flag round-trips as its own wire field.
+    let encoded = serde_json::to_string(&flagged).expect("flagged encoding");
+    let decoded: SerializedContextMeasurement =
+        serde_json::from_str(&encoded).expect("flagged round-trip");
+    assert_eq!(decoded, flagged);
+    decoded.validate().expect("decoded flagged validates");
+}
+
+// WORK_UNIT_CASE: 584/46
+#[test]
+fn false_rejection_decomposition_independently_represented_and_evidence_bound() {
+    let context = binding();
+    let baseline = exact_measurement(&context);
+    assert_eq!(baseline.false_rejection_or_decomposition, None);
+    baseline.validate().expect("baseline validates");
+    let baseline_digest = canonical_digest(&baseline).expect("baseline digest");
+    let baseline_fit = baseline.proves_fit(22).expect("baseline fit");
+
+    // Recording a false rejection / unnecessary decomposition is explicit evidence.
+    let mut flagged = baseline.clone();
+    flagged.false_rejection_or_decomposition = Some(id("rejection-evidence"));
+    flagged.validate().expect("flagged rejection validates");
+    assert_eq!(
+        flagged.false_rejection_or_decomposition,
+        Some(id("rejection-evidence"))
+    );
+    assert_ne!(
+        canonical_digest(&flagged).expect("flagged digest"),
+        baseline_digest
+    );
+
+    // The flag is independent: fit evaluation is unchanged and the sibling
+    // false-safe-overflow flag stays unset.
+    assert_eq!(flagged.proves_fit(22).expect("flagged fit"), baseline_fit);
+    assert_eq!(flagged.false_safe_overflow, None);
+
+    // Distinct evidence identities are distinct values.
+    let mut other = baseline.clone();
+    other.false_rejection_or_decomposition = Some(id("other-rejection"));
+    assert_ne!(
+        canonical_digest(&other).expect("other digest"),
+        canonical_digest(&flagged).expect("flagged digest")
+    );
+
+    // Both flags together remain explicit and distinct from either alone.
+    let mut both = flagged.clone();
+    both.false_safe_overflow = Some(id("overflow-evidence"));
+    both.validate().expect("both flags validate");
+    assert_ne!(
+        canonical_digest(&both).expect("both digest"),
+        canonical_digest(&flagged).expect("flagged digest")
+    );
+    assert_ne!(
+        canonical_digest(&both).expect("both digest"),
+        baseline_digest
+    );
+
+    // The flag round-trips as its own wire field.
+    let encoded = serde_json::to_string(&flagged).expect("flagged encoding");
+    let decoded: SerializedContextMeasurement =
+        serde_json::from_str(&encoded).expect("flagged round-trip");
+    assert_eq!(decoded, flagged);
+    decoded.validate().expect("decoded flagged validates");
+}
+
+// WORK_UNIT_CASE: 584/47
+#[test]
+fn exact_capacity_boundary_succeeds_one_byte_or_stu_over_fails() {
+    let context = binding();
+
+    // Exact UTF-8 bytes: reserves (2+3+4) + 13 bytes = 22.
+    let exact = exact_measurement(&context);
+    exact.validate().expect("exact validates");
+    assert!(exact.proves_fit(22).expect("boundary fits"));
+    assert!(exact.proves_fit(23).expect("larger capacity fits"));
+    assert!(
+        !exact.proves_fit(21).expect("one byte over evaluates"),
+        "one byte over the boundary must not fit"
+    );
+
+    // Exact tokenizer tokens use the same boundary shape independently of bytes.
+    let mut observed = exact_measurement(&context);
+    observed.status = MeasurementStatus::ExactTokenizer;
+    observed.rendered_utf8_bytes = 9999;
+    observed.tokenizer = Some(TokenizerObservation {
+        tokenizer_id: "fixture-tokenizer".to_owned(),
+        tokenizer_version: "v1".to_owned(),
+        tokenizer_hash: digest(),
+        tokens: 13,
+    });
+    observed.validate().expect("observed validates");
+    assert!(observed.proves_fit(22).expect("tokenizer boundary fits"));
+    assert!(
+        !observed
+            .proves_fit(21)
+            .expect("tokenizer one over evaluates"),
+        "one token over the boundary must not fit"
+    );
+
+    // A conservative STU estimate never proves fit: boundary and over both
+    // fail closed as unknown instead of succeeding.
+    let mut stu = exact_measurement(&context);
+    stu.status = MeasurementStatus::ConservativeStu;
+    stu.stu_estimate = Some(StuEstimate {
+        value: 13,
+        empirical: true,
+    });
+    stu.validate().expect("STU validates");
+    assert_eq!(stu.proves_fit(22), Err(ContextError::UnknownMeasurement));
+    assert_eq!(stu.proves_fit(21), Err(ContextError::UnknownMeasurement));
+}
+
+// WORK_UNIT_CASE: 584/48
+#[test]
+fn every_load_bearing_measurement_identity_changes_canonical_digest() {
+    let context = binding();
+    let baseline = exact_measurement(&context);
+    baseline.validate().expect("baseline validates");
+    let baseline_digest = canonical_digest(&baseline).expect("baseline digest");
+
+    let mut variants: Vec<(&str, SerializedContextMeasurement)> = Vec::new();
+    let mut push = |name: &'static str, value: SerializedContextMeasurement| {
+        let _ = name;
+        variants.push((name, value));
+    };
+
+    let mut measurement_id = baseline.clone();
+    measurement_id.measurement_id = id("other-measurement");
+    push("measurement_id", measurement_id);
+
+    let mut task = baseline.clone();
+    task.context.task_id = TaskId::new("other-task").expect("fixture task");
+    push("context.task_id", task);
+
+    let mut schema = baseline.clone();
+    schema.schema_version = eliot_contracts::ContractVersion::new(1, 0, 1);
+    push("schema_version", schema);
+
+    let mut envelope = baseline.clone();
+    envelope.envelope_digest = "b".repeat(64);
+    push("envelope_digest", envelope);
+
+    let mut serializer = baseline.clone();
+    serializer.serializer_id = "other-serializer".to_owned();
+    push("serializer_id", serializer);
+
+    let mut serializer_version = baseline.clone();
+    serializer_version.serializer_version = "2".to_owned();
+    push("serializer_version", serializer_version);
+
+    let mut options = baseline.clone();
+    options.serializer_options_digest = "b".repeat(64);
+    push("serializer_options_digest", options);
+
+    let mut route = baseline.clone();
+    route.route_id = "other-route".to_owned();
+    push("route_id", route);
+
+    let mut model = baseline.clone();
+    model.model_id = "other-model".to_owned();
+    push("model_id", model);
+
+    let mut bytes = baseline.clone();
+    bytes.rendered_utf8_bytes = 14;
+    push("rendered_utf8_bytes", bytes);
+
+    let mut status = baseline.clone();
+    status.status = MeasurementStatus::Unknown;
+    push("status", status);
+
+    let mut fixed = baseline.clone();
+    fixed.fixed_overhead = 3;
+    push("fixed_overhead", fixed);
+
+    let mut output = baseline.clone();
+    output.output_reserve = 4;
+    push("output_reserve", output);
+
+    let mut review = baseline.clone();
+    review.review_reserve = 5;
+    push("review_reserve", review);
+
+    let mut stu = baseline.clone();
+    stu.stu_estimate = Some(StuEstimate {
+        value: 1,
+        empirical: true,
+    });
+    push("stu_estimate", stu);
+
+    let mut overflow = baseline.clone();
+    overflow.false_safe_overflow = Some(id("overflow-evidence"));
+    push("false_safe_overflow", overflow);
+
+    let mut rejection = baseline.clone();
+    rejection.false_rejection_or_decomposition = Some(id("rejection-evidence"));
+    push("false_rejection", rejection);
+
+    assert!(!variants.is_empty());
+    let mut seen = std::collections::BTreeSet::new();
+    for (name, variant) in &variants {
+        let digest = canonical_digest(variant).expect("variant digest");
+        assert_ne!(digest, baseline_digest, "{name} must change the digest");
+        assert!(
+            seen.insert(digest.clone()),
+            "{name} digest must be distinct"
+        );
+        assert_ne!(variant, &baseline, "{name} must be a distinct value");
+    }
+}
