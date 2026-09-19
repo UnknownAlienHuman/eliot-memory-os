@@ -405,6 +405,7 @@ fn activation_kernel_with_ticket(
             pending.retain_activation_result(AgentActivationResultRecord {
                 result,
                 phase: AgentActivationResultPhase::AcceptedTerminal,
+                ticket_connection: ticket.connection_id.clone(),
             });
         }
     }
@@ -534,6 +535,78 @@ fn activation_host_request_wrong_connection_fails_closed() {
 // retained result against its exact pending ticket before mutating anything.
 // A tampered negative result is rejected with the pending evidence preserved.
 // ---------------------------------------------------------------------------
+// #203 slice 2: a projected-then-retried ticket answers from the known
+// retained result instead of falling back, fail-closed on any mismatch.
+// ---------------------------------------------------------------------------
+
+#[cfg(windows)]
+#[test]
+fn activation_host_request_projected_retry_answers_from_retained_result() {
+    let ticket = activation_v2_ticket("activation-ticket-projected-retry-203", 2_000);
+    let result = activation_v2_resolved(&ticket, 1_000);
+    let (root, kernel) =
+        activation_kernel_with_ticket("projected-retry-203", &ticket, Some(result.clone()), None);
+    // Project the bridge leg: the pending entry is consumed but the exact
+    // v2 record stays retained for replay/reconcile.
+    {
+        let mut pending = kernel
+            .agent_activation_pending
+            .lock()
+            .expect("pending lock");
+        pending.entries.remove(&ticket.ticket_id);
+        assert!(
+            pending.results.contains_key(&ticket.ticket_id),
+            "projected result must stay retained"
+        );
+    }
+    {
+        let pending = kernel
+            .agent_activation_pending
+            .lock()
+            .expect("pending lock");
+        assert!(
+            !pending.entries.contains_key(&ticket.ticket_id),
+            "projected entry must be consumed"
+        );
+        assert!(
+            pending.results.contains_key(&ticket.ticket_id),
+            "projected result must stay retained"
+        );
+    }
+    let envelope = activation_host_envelope(&ticket, &result.result_sha256, &ticket.connection_id);
+    let resolved = kernel
+        .host_request_activation_resolution(&envelope)
+        .expect("projected-then-retried ticket must answer from the known result");
+    assert_eq!(resolved.result_sha256, result.result_sha256);
+    drop(kernel);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(windows)]
+#[test]
+fn activation_host_request_projected_retry_wrong_connection_fails_closed() {
+    let ticket = activation_v2_ticket("activation-ticket-projected-conn-203", 2_000);
+    let result = activation_v2_resolved(&ticket, 1_000);
+    let (root, kernel) =
+        activation_kernel_with_ticket("projected-conn-203", &ticket, Some(result.clone()), None);
+    {
+        let mut pending = kernel
+            .agent_activation_pending
+            .lock()
+            .expect("pending lock");
+        pending.entries.remove(&ticket.ticket_id);
+    }
+    let envelope = activation_host_envelope(&ticket, &result.result_sha256, "other-connection");
+    let error = kernel
+        .host_request_activation_resolution(&envelope)
+        .expect_err("cross-connection retry after projection must fail closed");
+    assert!(
+        matches!(error, TransportError::SessionFenced),
+        "unexpected error: {error:?}"
+    );
+    drop(kernel);
+    let _ = std::fs::remove_dir_all(root);
+}
 
 #[cfg(windows)]
 #[test]

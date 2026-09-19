@@ -590,12 +590,17 @@ enum AgentActivationResultPhase {
 }
 
 /// Exact retained semantic result for one Kernel-issued ticket: result
-/// identity, payload digest, full typed disposition, and submission phase.
+/// identity, payload digest, full typed disposition, submission phase, and
+/// the exact transport connection that owns the ticket. The connection is
+/// retained so a projected-then-retried host-request envelope still
+/// fail-closes on cross-connection replay after the pending entry is
+/// consumed.
 #[cfg(windows)]
 #[derive(Clone)]
 struct AgentActivationResultRecord {
     result: AgentActivationResolutionResult,
     phase: AgentActivationResultPhase,
+    ticket_connection: String,
 }
 
 /// Pure replay classifier for v2 results, mirroring the v1 decision

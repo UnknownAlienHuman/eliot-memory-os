@@ -697,10 +697,14 @@ impl KernelComposition {
     /// read first; the unenveloped P-04 raw map is a compatibility fallback.
     /// This matches the bridge waiter priority (v2 envelope wins over the raw
     /// leg), so one ticket exposes one result identity on both the daemon and
-    /// host-request legs. A missing ticket or a ticket without a retained
-    /// result is an unknown operation; a result bound to another connection
-    /// fails closed; a digest or fence mismatch is an identity conflict; a
-    /// non-resolved disposition fails closed without yielding any binding.
+    /// host-request legs. A projected entry stays answerable: the pending
+    /// entry is consumed after bridge projection but the retained record keeps
+    /// the exact ticket connection, so a retried envelope for the same ticket
+    /// answers from the known result instead of falling back to unknown. A
+    /// missing ticket or a ticket without a retained result is an unknown
+    /// operation; a result bound to another connection fails closed; a digest
+    /// or fence mismatch is an identity conflict; a non-resolved disposition
+    /// fails closed without yielding any binding.
     pub(super) fn host_request_activation_resolution(
         &self,
         envelope: &HostRequestEnvelope,
@@ -709,26 +713,36 @@ impl KernelComposition {
             .activation_binding
             .as_ref()
             .ok_or(TransportError::SessionFenced)?;
-        let retained = {
+        let (entry_connection, retained) = {
             let pending = self
                 .agent_activation_pending
                 .lock()
                 .map_err(|_| TransportError::SessionFenced)?;
-            let ticket_connection = pending
+            let entry_connection = pending
                 .entries
                 .get(&activation_binding.ticket_id)
-                .map(|entry| entry.ticket.connection_id.clone())
-                .ok_or(TransportError::UnknownRequest)?;
+                .map(|entry| entry.ticket.connection_id.clone());
+            let retained = pending.results.get(&activation_binding.ticket_id).cloned();
+            (entry_connection, retained)
+        };
+        if let Some(ticket_connection) = entry_connection {
             if ticket_connection != envelope.connection_id {
                 return Err(TransportError::SessionFenced);
             }
-            pending
-                .results
-                .get(&activation_binding.ticket_id)
-                .map(|record| record.result.clone())
-        };
-        let result: AgentActivationResolutionResult = if let Some(result) = retained {
-            result
+        } else if let Some(record) = retained.as_ref() {
+            // Projected entry consumed: fail closed on the retained ticket
+            // connection before answering from the known result.
+            if record.ticket_connection != envelope.connection_id {
+                return Err(TransportError::SessionFenced);
+            }
+        } else {
+            // No pending entry and no canonical retention: the raw
+            // compatibility leg stays entry-gated so a cross-connection
+            // replay cannot fabricate a result.
+            return Err(TransportError::UnknownRequest);
+        }
+        let result: AgentActivationResolutionResult = if let Some(record) = retained {
+            record.result
         } else {
             let results = self
                 .agent_activation_results
