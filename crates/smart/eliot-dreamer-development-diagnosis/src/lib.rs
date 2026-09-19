@@ -51,22 +51,24 @@
 //! validation. There are no placeholder, mock, canned, or pseudo paths:
 //! every branch binds an explicit input field.
 //!
-//! Test coverage note: 11 of 51 `WORK_UNIT_CASE 675/*` cases execute here
+//! Test coverage note: 14 of 51 `WORK_UNIT_CASE 675/*` cases execute here
 //! (675/1 valid two-rival diagnosis with minimal experiment, 675/2 exact
 //! Objective/acceptance/recovery/identity binding, 675/3 wrong job/payload
 //! fails closed, 675/4 fence and receipt mismatch fails closed, 675/5
-//! wrong/stale source context fails closed, 675/8 proxy metric cannot prove
-//! Product delta, 675/11 current-pass discriminator cannot prove failure,
-//! 675/15 unchanged equivalent retry requires mechanism review, 675/21
-//! mandatory conflict analysis missing yields insufficiency, 675/32
-//! identical rival predictions are nondiscriminative, 675/45 exact replay is
-//! deterministic). The remaining 40 of 51 are deferred per START.md s1;
-//! #969 admission is separate. Deferred: 675/6, 675/7,
-//! 675/9, 675/10, 675/12, 675/13, 675/14, 675/16, 675/17, 675/18, 675/19,
-//! 675/20, 675/22, 675/23, 675/24, 675/25, 675/26, 675/27, 675/28, 675/29,
-//! 675/30, 675/31, 675/33, 675/34, 675/35, 675/36, 675/37, 675/38, 675/39,
-//! 675/40, 675/41, 675/42, 675/43, 675/44, 675/46, 675/47, 675/48, 675/49,
-//! 675/50, 675/51.
+//! wrong/stale source context fails closed, 675/6 product failure despite
+//! local green stays complete, 675/7 local/infrastructure failure without
+//! product delta stays insufficient, 675/8 proxy metric cannot prove
+//! Product delta, 675/9 missing instrumentation stays unknown, 675/11
+//! current-pass discriminator cannot prove failure, 675/15 unchanged
+//! equivalent retry requires mechanism review, 675/21 mandatory conflict
+//! analysis missing yields insufficiency, 675/32 identical rival predictions
+//! are nondiscriminative, 675/45 exact replay is deterministic). The
+//! remaining 37 of 51 are deferred per START.md s1; #969 admission is
+//! separate. Deferred: 675/10, 675/12, 675/13, 675/14, 675/16, 675/17, 675/18,
+//! 675/19, 675/20, 675/22, 675/23, 675/24, 675/25, 675/26, 675/27, 675/28,
+//! 675/29, 675/30, 675/31, 675/33, 675/34, 675/35, 675/36, 675/37, 675/38,
+//! 675/39, 675/40, 675/41, 675/42, 675/43, 675/44, 675/46, 675/47, 675/48,
+//! 675/49, 675/50, 675/51.
 
 #![forbid(unsafe_code)]
 
@@ -148,6 +150,21 @@ pub const SLICE2_IMPLEMENTED_CASES: &[u8] = &[2, 3, 5];
 pub const SLICE2_REMAINDER_CASES: &[u8] = &[
     6, 7, 9, 10, 12, 13, 14, 16, 17, 18, 19, 20, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 33, 34,
     35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 46, 47, 48, 49, 50, 51,
+];
+
+/// Cases covered by the third bounded implementation slice.
+///
+/// Product-versus-local gap semantics: product failure despite local green
+/// (675/6), local/infrastructure failure without product delta (675/7), and
+/// missing instrumentation staying unknown (675/9). Every path binds the
+/// existing `ProductGapKind` and hub `CurrentObservation` vocabulary; no new
+/// canonical contracts are required.
+pub const SLICE3_IMPLEMENTED_CASES: &[u8] = &[6, 7, 9];
+
+/// Cases deliberately left for later slices after slice 3.
+pub const SLICE3_REMAINDER_CASES: &[u8] = &[
+    10, 12, 13, 14, 16, 17, 18, 19, 20, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 33, 34, 35, 36, 37,
+    38, 39, 40, 41, 42, 43, 44, 46, 47, 48, 49, 50, 51,
 ];
 
 /// Canonical A03 evidence supplied to the first A40 package boundary.
@@ -2649,7 +2666,7 @@ pub fn diagnose_development_gap(
 }
 
 // ---------------------------------------------------------------------------
-// Tests (proportionate: 11 of 51 cases; remainder deferred per START.md s1).
+// Tests (proportionate: 14 of 51 cases; remainder deferred per START.md s1).
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -2674,6 +2691,8 @@ mod tests {
     use super::SLICE1_REMAINDER_CASES;
     use super::SLICE2_IMPLEMENTED_CASES;
     use super::SLICE2_REMAINDER_CASES;
+    use super::SLICE3_IMPLEMENTED_CASES;
+    use super::SLICE3_REMAINDER_CASES;
     use super::diagnose_development_gap;
     use super::is_hex64_lower;
     use super::outcome_rejection_hint;
@@ -3043,6 +3062,22 @@ mod tests {
         assert!(seen[1..].iter().all(|present| *present));
     }
 
+    #[test]
+    fn slice3_remainder_map_covers_the_declared_denominator() {
+        let mut seen = [false; 52];
+        for case in SLICE1_IMPLEMENTED_CASES
+            .iter()
+            .chain(SLICE2_IMPLEMENTED_CASES.iter())
+            .chain(SLICE3_IMPLEMENTED_CASES.iter())
+            .chain(SLICE3_REMAINDER_CASES.iter())
+        {
+            assert!((1..=51).contains(case));
+            assert!(!seen[usize::from(*case)]);
+            seen[usize::from(*case)] = true;
+        }
+        assert!(seen[1..].iter().all(|present| *present));
+    }
+
     // WORK_UNIT_CASE: 675/1
     #[test]
     fn case_01_valid_two_rival_diagnosis_recommends_minimal_experiment() {
@@ -3336,6 +3371,81 @@ mod tests {
         ));
     }
 
+    // WORK_UNIT_CASE: 675/6
+    #[test]
+    fn case_06_product_failure_despite_local_green_stays_complete() {
+        let job = test_job();
+        let draft = test_draft();
+        let product = test_product();
+        let discriminator = test_discriminator();
+        let mut repairs = test_repairs();
+        let mut green = test_attempt("att-3", &"c".repeat(64));
+        green.outcome = RepairEventOutcome::Succeeded {
+            summary: "local replay green while the product gap persists".to_owned(),
+        };
+        repairs.expected_attempt_ids.push("att-3".to_owned());
+        repairs.attempts.push(green);
+        let conflict = test_conflict();
+        let rivals = test_rivals();
+        let common_mode = test_common_mode();
+        let experiments = [test_experiment()].to_vec();
+        let policy = test_policy();
+        let Ok(candidate) = diagnose_development_gap(
+            &job,
+            &draft,
+            &product,
+            &discriminator,
+            &repairs,
+            &conflict,
+            &rivals,
+            &common_mode,
+            &experiments,
+            &policy,
+        ) else {
+            panic!("product failure despite local green stays complete");
+        };
+        assert_eq!(candidate.outcome, DiagnosisOutcome::Complete);
+        assert_eq!(candidate.gap_kind, "product_failure");
+        assert_eq!(candidate.rivals_live, 2);
+        assert!(candidate.recommended_experiment.is_some());
+        assert!(candidate.preservation.overall().is_ok());
+    }
+
+    // WORK_UNIT_CASE: 675/7
+    #[test]
+    fn case_07_local_failure_without_product_gap_stays_insufficient() {
+        let job = test_job();
+        let draft = test_draft();
+        let product = test_product();
+        let mut discriminator = test_discriminator();
+        discriminator.observation = CurrentObservation::InfrastructureFailure {
+            reason: "runner host lost power before product observation".to_owned(),
+        };
+        let repairs = test_repairs();
+        let conflict = test_conflict();
+        let rivals = test_rivals();
+        let common_mode = test_common_mode();
+        let experiments = [test_experiment()].to_vec();
+        let policy = test_policy();
+        let Ok(candidate) = diagnose_development_gap(
+            &job,
+            &draft,
+            &product,
+            &discriminator,
+            &repairs,
+            &conflict,
+            &rivals,
+            &common_mode,
+            &experiments,
+            &policy,
+        ) else {
+            panic!("infrastructure failure stays an inert outcome");
+        };
+        assert_eq!(candidate.outcome, DiagnosisOutcome::Insufficient);
+        assert_eq!(candidate.recommended_experiment, None);
+        assert!(candidate.preservation.overall().is_ok());
+    }
+
     // WORK_UNIT_CASE: 675/8
     #[test]
     fn case_08_proxy_metric_cannot_prove_product_delta() {
@@ -3366,6 +3476,62 @@ mod tests {
             panic!("proxy gap stays an inert outcome");
         };
         assert_eq!(candidate.outcome, DiagnosisOutcome::Rejected);
+        assert_eq!(candidate.recommended_experiment, None);
+        assert!(candidate.preservation.overall().is_ok());
+    }
+
+    // WORK_UNIT_CASE: 675/9
+    #[test]
+    fn case_09_missing_instrumentation_stays_unknown() {
+        let job = test_job();
+        let draft = test_draft();
+        let product = test_product();
+        let mut unknown_discriminator = test_discriminator();
+        unknown_discriminator.observation = CurrentObservation::Unknown {
+            reason: "no instrument recorded the confirmation signal".to_owned(),
+        };
+        let repairs = test_repairs();
+        let conflict = test_conflict();
+        let rivals = test_rivals();
+        let common_mode = test_common_mode();
+        let experiments = [test_experiment()].to_vec();
+        let policy = test_policy();
+        let Ok(candidate) = diagnose_development_gap(
+            &job,
+            &draft,
+            &product,
+            &unknown_discriminator,
+            &repairs,
+            &conflict,
+            &rivals,
+            &common_mode,
+            &experiments,
+            &policy,
+        ) else {
+            panic!("unknown discriminator stays an inert outcome");
+        };
+        assert_eq!(candidate.outcome, DiagnosisOutcome::Insufficient);
+        assert_eq!(candidate.recommended_experiment, None);
+        assert!(candidate.preservation.overall().is_ok());
+
+        let mut unknown_product = test_product();
+        unknown_product.kind = ProductGapKind::Unknown;
+        let discriminator = test_discriminator();
+        let Ok(candidate) = diagnose_development_gap(
+            &job,
+            &draft,
+            &unknown_product,
+            &discriminator,
+            &repairs,
+            &conflict,
+            &rivals,
+            &common_mode,
+            &experiments,
+            &policy,
+        ) else {
+            panic!("unknown gap stays an inert outcome");
+        };
+        assert_eq!(candidate.outcome, DiagnosisOutcome::Insufficient);
         assert_eq!(candidate.recommended_experiment, None);
         assert!(candidate.preservation.overall().is_ok());
     }
