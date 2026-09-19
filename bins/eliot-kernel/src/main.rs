@@ -175,7 +175,7 @@ async fn main() {
         // startup binding (the installation identity — never a
         // request-envelope value). This answers the #1467 residual of zero
         // production callers: the testd/native admit sides go live here.
-        // The 22-value contour now carries the installed
+        // The 24-value contour now carries the installed
         // doctor/testd/native-worker digests (fail-closed above, threaded
         // through `KernelConfig` with no defaults), so all three sides
         // compose here: the Doctor side through
