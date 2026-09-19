@@ -15,7 +15,7 @@ use eliot_dreamer_contracts::{
     ConsentDimension, ContextDimension, ContractViolation, CostDimension, DreamInputBundle,
     EffectDimension, FeasibilityDimension, HumanAttentionDimension, InformationDimension,
     InquiryAffordanceSet, LatencyDimension, MaterialClaimRef, PossibleResultSchema,
-    PrivacyDimension, ProbeAffordanceRef, ProbeObjectiveRef, ResourceDimension,
+    PrivacyDimension, ProbeAffordanceRef, ProbeObjectiveRef, ProbeOwnerRef, ResourceDimension,
     ReversibilityDimension, RivalModelSet, RivalPredictionRef, ValidatedDreamDraft,
     error::len_i64,
     grounding::canonical::{ArtifactId, StateFence, TaskId},
@@ -274,6 +274,9 @@ pub struct ProbeProposal {
     pub target: ProbeTarget,
     /// Binding to the primary source descriptor.
     pub affordance: ProbeAffordanceRef,
+    /// Typed owner reference copied verbatim from the primary source
+    /// descriptor; never an authority claim and never substituted.
+    pub owner: ProbeOwnerRef,
     /// Collapsed duplicate affordance identities, excluding the primary.
     pub merged_affordances: BTreeSet<ArtifactId>,
     /// Bounded discrimination statement derived from target identity.
@@ -362,6 +365,9 @@ pub struct ProbeOmission {
     pub target: ProbeTarget,
     /// Binding to the primary source descriptor.
     pub affordance: ProbeAffordanceRef,
+    /// Typed owner reference copied verbatim from the primary source
+    /// descriptor; never an authority claim and never substituted.
+    pub owner: ProbeOwnerRef,
     /// Collapsed duplicate affordance identities, excluding the primary.
     pub merged_affordances: BTreeSet<ArtifactId>,
     /// Bounded reason citing the blocking dimension or bound.

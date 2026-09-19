@@ -157,13 +157,16 @@ struct BoundContext {
 }
 
 /// One classified descriptor group; duplicates collapse onto the lowest
-/// affordance identity within the same class and collapse key.
+/// affordance identity within the same class and collapse key. The preserved
+/// owner follows the primary identity verbatim; merged lineage stays in
+/// `merged_affordances` so no owner is ever substituted.
 struct DescriptorGroup {
     order: u8,
     kind: eliot_dreamer_contracts::AffordanceKind,
     target: ProbeTarget,
     primary: ArtifactId,
     primary_digest: String,
+    owner: eliot_dreamer_contracts::ProbeOwnerRef,
     merged: Vec<ArtifactId>,
     result_schema: eliot_dreamer_contracts::PossibleResultSchema,
     dimensions: ProbeDimensions,
@@ -222,6 +225,7 @@ fn classify_one(
         target,
         primary: descriptor.affordance_id.clone(),
         primary_digest: descriptor.digest.clone(),
+        owner: descriptor.owner.clone(),
         merged: Vec::new(),
         result_schema: descriptor.result_schema.clone(),
         dimensions,
@@ -240,6 +244,7 @@ fn merge_group(
         existing.merged.push(existing.primary.clone());
         existing.primary = incoming.primary;
         existing.primary_digest = incoming.primary_digest;
+        existing.owner = incoming.owner;
     } else {
         existing.merged.push(incoming.primary);
     }
@@ -392,6 +397,7 @@ fn proposal_for(group: &DescriptorGroup, rank: u32) -> Result<ProbeProposal, Con
             affordance_id: group.primary.clone(),
             affordance_digest: group.primary_digest.clone(),
         },
+        owner: group.owner.clone(),
         merged_affordances: group.merged.iter().cloned().collect(),
         expected_discrimination: discrimination,
         result_schema: group.result_schema.clone(),
@@ -426,6 +432,7 @@ fn omission_for(
             affordance_id: group.primary.clone(),
             affordance_digest: group.primary_digest.clone(),
         },
+        owner: group.owner.clone(),
         merged_affordances: group.merged.iter().cloned().collect(),
         reason: reason.to_owned(),
         dimensions: group.dimensions.clone(),
@@ -469,6 +476,7 @@ fn admit_against_budget(
             kind: OmissionKind::OverBudget,
             target: probe.target.clone(),
             affordance: probe.affordance.clone(),
+            owner: probe.owner.clone(),
             merged_affordances: probe.merged_affordances.clone(),
             reason,
             dimensions: probe.dimensions.clone(),
