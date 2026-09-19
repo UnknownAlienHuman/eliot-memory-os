@@ -27,6 +27,26 @@
     {
       "id": 22,
       "name": "all seven dispositions use the v2 submit envelope"
+    },
+    {
+      "id": 26,
+      "name": "protected and credential canaries are absent from diagnostics"
+    },
+    {
+      "id": 27,
+      "name": "module-wide dead_code suppression is absent"
+    },
+    {
+      "id": 28,
+      "name": "required activation functions have production callers"
+    },
+    {
+      "id": 29,
+      "name": "an unrelated new dead function fails the actual package lint"
+    },
+    {
+      "id": 30,
+      "name": "activation source excludes Store writes, Session allocation, authority, effects, and duplicate paths"
     }
   ]
 }
