@@ -647,7 +647,7 @@ async fn independent_scope_provider_overlap() {
         tokio::pin!(writer_a);
         tokio::pin!(writer_b);
 
-        let _witness = tokio::time::timeout(
+        tokio::time::timeout(
             Duration::from_millis(profile_u64("rendezvous_ms")),
             async {
                 tokio::select! {
