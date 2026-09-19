@@ -747,7 +747,7 @@ async fn cancellation_timeout_after_possible_send_scoped_uncertainty() {
             });
             rendezvous.wait().await;
             adapter.disarm_tx_rendezvous();
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
             writer.abort();
             let _ = writer.await;
         })
