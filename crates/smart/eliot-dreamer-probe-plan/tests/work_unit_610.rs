@@ -1,11 +1,12 @@
-//! Work-unit 610 slices 1-7: bounded discriminative probe planner, cases
-//! 1..10 plus 610/17, 610/21, 610/32, 610/36, 610/18-19 and 610/26, 610/28
-//! (typed affordance Unknown/Unavailable gating, safe read-only
+//! Work-unit 610 slices 1-8: bounded discriminative probe planner, cases
+//! 1..10 plus 610/17, 610/21, 610/32, 610/36, 610/18-19, 610/26, 610/28 and
+//! 610/30-31 (typed affordance Unknown/Unavailable gating, safe read-only
 //! candidate-only admission, explicit lexicographic order with stable
 //! tie-break, input-order-independent plan/digest stability, no
 //! shell/Value/SDK payload, no live route/credential/lease handle, unknown
-//! cost/capacity never reading as zero, and exact-equivalent merge with
-//! retained lineage).
+//! cost/capacity never reading as zero, exact-equivalent merge with retained
+//! lineage, cheaper-but-riskier trade-off retention with no scalar-averaged
+//! risk).
 //!
 //! Cases 610/1, 610/4 and 610/5 are marked on the existing planner
 //! behaviour tests in `tests/probe_plan.rs`. Cases 610/11..16, 610/38
@@ -16,9 +17,9 @@
 //! contains zero `ResultUpdate`/`RivalUpdateMeaning` inspections, so no
 //! planner-only implementation exists without inventing APIs (slice-4 Opus
 //! audit ruling on 610/11 applies identically). Cases 610/22,
-//! 610/27, 610/30-31, 610/34-35, 610/37, 610/41-42 (effect-policy,
-//! budget/dominance/disposition/replay/no-execution) are QUEUED and out of
-//! this batch; 610/20 needs `src/` owner preservation, 610/23-25 need policy
+//! 610/27, 610/34-35, 610/37, 610/41-42 (effect-policy,
+//! budget/disposition/replay/no-execution) are QUEUED and out of
+//! this batch; 610/20 needs `src/` owner preservation, 610/23-25,29 need policy,
 //! or budget enforcement the planner explicitly declines (`plan.rs`: effect,
 //! privacy, reversibility and non-candidate budgets stay advisory).
 //!
@@ -78,6 +79,15 @@
 //! the lowest affordance identity as primary while recording every collapsed
 //! identity in `merged_affordances`, so exact equivalents merge with full
 //! lineage and distinct targets stay separate).
+//! Ownership ruling 610/30-31 (this slice, planner-side preservation only;
+//! no new APIs, zero `src/` changes): 610/30 OWNED via the existing
+//! no-removal path (`plan.rs` never drops a plannable descriptor except by
+//! exact-duplicate collapse or the explicit `candidates` bound, so a
+//! cheaper-but-riskier trade-off stays admitted with every vector preserved);
+//! 610/31 OWNED via the existing vector-preserving order (`model.rs`
+//! `order_key` ranks per dimension with no scalar, `rank` records plan
+//! position only, and the canonical wire carries the twelve dimensions with
+//! no score/average key).
 //! Queue note: 610/27 stays queued — its per-dimension enforcement reading
 //! overlaps need-src 610/25 (the planner enforces only the `candidates`
 //! bound; every other budget stays advisory per `plan.rs`), so no test-only
@@ -1352,5 +1362,191 @@ fn exact_equivalent_merge_retains_lineage() {
     assert_eq!(single.probe_id.as_str(), "aff-merge-solo");
     assert_eq!(single.rank, 1);
     assert!(single.merged_affordances.is_empty());
+    assert_eq!(must(plan.compute_digest()), plan.digest);
+}
+
+// WORK_UNIT_CASE: 610/30
+#[test]
+fn cheaper_riskier_alternative_is_retained() {
+    let mut cheap_params =
+        descriptor_params("aff-tradeoff-cheap", gap_target("claim-tradeoff-cheap"));
+    cheap_params.information = InformationDimension::High {
+        detail: "splits the named disagreement".to_owned(),
+    };
+    cheap_params.cost = CostDimension::Negligible {
+        detail: "trivial retained read".to_owned(),
+    };
+    cheap_params.effect = EffectDimension::StateChanging {
+        detail: "touches scratch state".to_owned(),
+    };
+    cheap_params.reversibility = ReversibilityDimension::Irreversible {
+        reason: "scratch write cannot be undone".to_owned(),
+    };
+    cheap_params.privacy = PrivacyDimension::Elevated {
+        reason: "names a principal".to_owned(),
+    };
+    let cheap_risky = must(InquiryAffordanceDescriptor::new(cheap_params));
+
+    let mut safe_params = descriptor_params("aff-tradeoff-safe", gap_target("claim-tradeoff-safe"));
+    safe_params.information = InformationDimension::High {
+        detail: "splits the named disagreement".to_owned(),
+    };
+    safe_params.cost = CostDimension::High {
+        detail: "wide retained scan".to_owned(),
+    };
+    safe_params.effect = EffectDimension::SideEffectFree {
+        detail: "reads retained bytes only".to_owned(),
+    };
+    safe_params.reversibility = ReversibilityDimension::Reversible {
+        detail: "no state touched".to_owned(),
+    };
+    safe_params.privacy = PrivacyDimension::Contained {
+        detail: "retained material only".to_owned(),
+    };
+    let safe_costly = must(InquiryAffordanceDescriptor::new(safe_params));
+
+    let plan = plan_for(vec![safe_costly, cheap_risky], Some(16));
+    must(plan.validate());
+    assert_eq!(plan.probes.len(), 2);
+    assert!(plan.omissions.is_empty());
+
+    let order: Vec<&str> = plan
+        .probes
+        .iter()
+        .map(|probe| probe.probe_id.as_str())
+        .collect();
+    assert_eq!(order, vec!["aff-tradeoff-cheap", "aff-tradeoff-safe"]);
+
+    let cheap = &plan.probes[0];
+    assert_eq!(cheap.rank, 0);
+    assert!(cheap.merged_affordances.is_empty());
+    match &cheap.dimensions.cost {
+        CostDimension::Negligible { detail } => {
+            assert_eq!(detail.as_str(), "trivial retained read");
+        }
+        other => panic!("cheap trade-off must preserve its cost vector, got {other:?}"),
+    }
+    match &cheap.dimensions.effect {
+        EffectDimension::StateChanging { detail } => {
+            assert_eq!(detail.as_str(), "touches scratch state");
+        }
+        other => panic!("cheap trade-off must preserve its effect vector, got {other:?}"),
+    }
+    match &cheap.dimensions.reversibility {
+        ReversibilityDimension::Irreversible { reason } => {
+            assert_eq!(reason.as_str(), "scratch write cannot be undone");
+        }
+        other => panic!("cheap trade-off must preserve its reversibility vector, got {other:?}"),
+    }
+    match &cheap.dimensions.privacy {
+        PrivacyDimension::Elevated { reason } => {
+            assert_eq!(reason.as_str(), "names a principal");
+        }
+        other => panic!("cheap trade-off must preserve its privacy vector, got {other:?}"),
+    }
+    must(cheap.target.validate());
+    must(cheap.result_schema.validate());
+    must(cheap.dimensions.validate());
+
+    let safe = &plan.probes[1];
+    assert_eq!(safe.rank, 1);
+    assert!(safe.merged_affordances.is_empty());
+    match &safe.dimensions.cost {
+        CostDimension::High { detail } => assert_eq!(detail.as_str(), "wide retained scan"),
+        other => panic!("safe trade-off must preserve its cost vector, got {other:?}"),
+    }
+    match &safe.dimensions.effect {
+        EffectDimension::SideEffectFree { detail } => {
+            assert_eq!(detail.as_str(), "reads retained bytes only");
+        }
+        other => panic!("safe trade-off must preserve its effect vector, got {other:?}"),
+    }
+    must(safe.target.validate());
+    must(safe.result_schema.validate());
+    must(safe.dimensions.validate());
+    assert_eq!(must(plan.compute_digest()), plan.digest);
+}
+
+// WORK_UNIT_CASE: 610/31
+#[test]
+fn no_scalar_averaged_risk() {
+    let mut high_params = descriptor_params("aff-noscalar-high", gap_target("claim-noscalar-high"));
+    high_params.information = InformationDimension::High {
+        detail: "splits the named disagreement".to_owned(),
+    };
+    high_params.cost = CostDimension::High {
+        detail: "wide retained scan".to_owned(),
+    };
+    let high = must(InquiryAffordanceDescriptor::new(high_params));
+
+    let mut mid_params = descriptor_params("aff-noscalar-mid", gap_target("claim-noscalar-mid"));
+    mid_params.information = InformationDimension::Moderate {
+        detail: "partial split of the gap".to_owned(),
+    };
+    mid_params.cost = CostDimension::Moderate {
+        detail: "one retained read".to_owned(),
+    };
+    let mid = must(InquiryAffordanceDescriptor::new(mid_params));
+
+    let mut low_params = descriptor_params("aff-noscalar-low", gap_target("claim-noscalar-low"));
+    low_params.information = InformationDimension::Low {
+        detail: "weak split of the gap".to_owned(),
+    };
+    low_params.cost = CostDimension::Negligible {
+        detail: "trivial retained read".to_owned(),
+    };
+    let low = must(InquiryAffordanceDescriptor::new(low_params));
+
+    let plan = plan_for(vec![low, mid, high], Some(16));
+    must(plan.validate());
+    assert_eq!(plan.probes.len(), 3);
+    assert!(plan.omissions.is_empty());
+
+    let order: Vec<&str> = plan
+        .probes
+        .iter()
+        .map(|probe| probe.probe_id.as_str())
+        .collect();
+    assert_eq!(
+        order,
+        vec!["aff-noscalar-high", "aff-noscalar-mid", "aff-noscalar-low"]
+    );
+    for (index, probe) in plan.probes.iter().enumerate() {
+        let rank = u32::try_from(index).expect("rank must fit u32");
+        assert_eq!(probe.rank, rank);
+        must(probe.target.validate());
+        must(probe.result_schema.validate());
+        must(probe.dimensions.validate());
+        assert!(probe.merged_affordances.is_empty());
+        let rendered = format!("{probe:?}");
+        for token in ["score", "Score", "average", "Average", "utility", "Utility"] {
+            assert!(
+                !rendered.contains(token),
+                "ranked probe must carry no scalar {token}, got {rendered}"
+            );
+        }
+    }
+
+    let wire = must(canonical_bytes(&plan));
+    let text = String::from_utf8(wire).expect("canonical plan wire must be UTF-8");
+    let folded = text.to_lowercase();
+    for key in [
+        "\"score\"",
+        "\"risk_score\"",
+        "\"average\"",
+        "\"utility\"",
+        "\"expected_value\"",
+    ] {
+        assert!(
+            !folded.contains(key),
+            "canonical plan wire must carry no scalar {key} key"
+        );
+    }
+    for key in ["\"information\"", "\"cost\"", "\"effect\""] {
+        assert!(
+            folded.contains(key),
+            "canonical plan wire must preserve the {key} dimension vector"
+        );
+    }
     assert_eq!(must(plan.compute_digest()), plan.digest);
 }
