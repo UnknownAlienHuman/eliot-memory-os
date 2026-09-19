@@ -823,6 +823,7 @@ impl KernelComposition {
             pending.retain_activation_result(AgentActivationResultRecord {
                 result: incoming,
                 phase,
+                ticket_connection: entry_ticket.connection_id.clone(),
             });
         }
         self.agent_activation_changed.notify_waiters();
@@ -900,6 +901,7 @@ impl KernelComposition {
             pending.retain_activation_result(AgentActivationResultRecord {
                 result: incoming,
                 phase,
+                ticket_connection: entry_ticket.connection_id.clone(),
             });
         }
         self.agent_activation_changed.notify_waiters();
