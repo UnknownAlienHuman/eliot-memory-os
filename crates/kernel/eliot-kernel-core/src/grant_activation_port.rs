@@ -1738,4 +1738,187 @@ mod tests {
         ));
         Ok(())
     }
+
+    fn restart_test_binding(epoch: &EpochId) -> Result<AuthorityBinding, KernelError> {
+        use eliot_contracts::{ContractId, ResourceGeneration};
+        let fence = eliot_contracts::StateFence::new(epoch.clone(), ResourceGeneration::new(1)?);
+        Ok(AuthorityBinding {
+            authority_id: ContractId::new("authority:test")?,
+            authority_owner: "test-owner".to_owned(),
+            authority_epoch: epoch.clone(),
+            state_fence: fence,
+            allowed_effect: EffectClass::ExternalEffect,
+            proof_ceiling: ProofCeiling::ObservedExternalEffect,
+        })
+    }
+
+    fn restart_root_intent(binding: &AuthorityBinding) -> GrantActivationIntent {
+        GrantActivationIntent {
+            operation_id: "op-activate-root".to_owned(),
+            grant_id: "grant-restart-root".to_owned(),
+            parent_grant_id: None,
+            authority_root_ref: "root-test".to_owned(),
+            snapshot_id: "snap-1".to_owned(),
+            grant_graph_revision: 2,
+            holder_principal: "holder-1".to_owned(),
+            session_id: "session-1".to_owned(),
+            scope_id: "scope-1".to_owned(),
+            binding: binding.clone(),
+            allowed_effect: EffectClass::Read,
+            proof_ceiling: ProofCeiling::ScopedVerification,
+            issued_at_ms: 1_000,
+            expires_at_ms: None,
+            receipt_obligations: vec!["obligation-1".to_owned()],
+        }
+    }
+
+    #[test]
+    fn rich_activation_replay_conflict_and_stale_revision_fail_closed() -> Result<(), KernelError> {
+        let epoch = canonical_epoch("550e8400-e29b-41d4-a716-446655440000", 7)?;
+        let binding = restart_test_binding(&epoch)?;
+        let port = GrantActivationPort::new();
+        let intent = restart_root_intent(&binding);
+
+        let first = port.activate_grant(&intent, epoch.clone(), 1_000)?;
+        assert!(matches!(
+            first.state,
+            eliot_runtime_contracts::AuthorityState::Active
+        ));
+        assert_eq!(first.activation_id, "activation-op-activate-root");
+        // Exact replay returns the same receipt without a second activation.
+        let replay = port.activate_grant(&intent, epoch.clone(), 1_000)?;
+        assert_eq!(replay, first);
+        // Changed payload under one operation identity conflicts.
+        let mut changed = intent.clone();
+        changed.holder_principal = "holder-2".to_owned();
+        assert!(matches!(
+            port.activate_grant(&changed, epoch.clone(), 1_000),
+            Err(KernelError::IdempotencyConflict)
+        ));
+        // A recorded grant identity cannot activate again under a fresh
+        // identity: restore never reactivates a path.
+        let mut second = intent.clone();
+        second.operation_id = "op-activate-root-again".to_owned();
+        assert!(matches!(
+            port.activate_grant(&second, epoch.clone(), 1_000),
+            Err(KernelError::InvalidField { .. })
+        ));
+        // A revision older than the greatest observed for this root is stale.
+        let stale_revoke = GrantRevocationIntent {
+            operation_id: "op-revoke-stale".to_owned(),
+            grant_id: "grant-restart-root".to_owned(),
+            authority_root_ref: "root-test".to_owned(),
+            snapshot_id: "snap-1".to_owned(),
+            grant_graph_revision: 1,
+            binding: binding.clone(),
+            unknown_outcome_operations: Vec::new(),
+            receipt_obligations: Vec::new(),
+        };
+        assert!(matches!(
+            port.revoke_grant(&stale_revoke, epoch.clone()),
+            Err(KernelError::InvalidField { .. })
+        ));
+        // Current-revision revocation fences the grant and commits one receipt.
+        let revoke = GrantRevocationIntent {
+            operation_id: "op-revoke-root".to_owned(),
+            grant_graph_revision: 2,
+            ..stale_revoke
+        };
+        let receipt = port.revoke_grant(&revoke, epoch.clone())?;
+        assert!(matches!(
+            receipt.state,
+            eliot_runtime_contracts::AuthorityState::Revoked
+        ));
+        assert!(port.grant_revoked("grant-restart-root"));
+        assert_eq!(
+            port.revocation_closure("op-revoke-root"),
+            Some(vec!["grant-restart-root".to_owned()])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn restart_hydrates_nothing_and_reconciles_by_representation() -> Result<(), KernelError> {
+        use eliot_authority::{
+            GrantId, GrantRevocationRequest, P07AuthorityPort, P07PortError, SnapshotId,
+        };
+
+        fn thin_grant_id(value: &str) -> Result<GrantId, KernelError> {
+            GrantId::new(value).map_err(|_| KernelError::InvalidField {
+                field: "grant_id",
+                reason: "test grant identity must validate",
+            })
+        }
+        fn thin_snapshot_id(value: &str) -> Result<SnapshotId, KernelError> {
+            SnapshotId::new(value).map_err(|_| KernelError::InvalidField {
+                field: "snapshot_id",
+                reason: "test snapshot identity must validate",
+            })
+        }
+
+        let epoch = canonical_epoch("550e8400-e29b-41d4-a716-446655440000", 7)?;
+        let binding = restart_test_binding(&epoch)?;
+        let intent = restart_root_intent(&binding);
+
+        // Simulated restart: a fresh port holds no ledger lineage.
+        let restarted = GrantActivationPort::new();
+        assert!(!restarted.grant_revoked("grant-restart-root"));
+        // Thin revocation of unhydrated lineage fail-closes without
+        // fabricating a fence.
+        let thin_unknown = GrantRevocationRequest {
+            grant_id: thin_grant_id("grant-restart-root")?,
+            snapshot_id: thin_snapshot_id("snap-1")?,
+            binding: binding.clone(),
+        };
+        assert!(matches!(
+            P07AuthorityPort::revoke_grant(&restarted, &thin_unknown),
+            Err(P07PortError::Unavailable)
+        ));
+        // Rich revocation of an unknown grant records a reconciling intent
+        // instead of assuming a fence.
+        let unknown_revoke = GrantRevocationIntent {
+            operation_id: "op-revoke-unknown".to_owned(),
+            grant_id: "grant-restart-root".to_owned(),
+            authority_root_ref: "root-test".to_owned(),
+            snapshot_id: "snap-1".to_owned(),
+            grant_graph_revision: 2,
+            binding: binding.clone(),
+            unknown_outcome_operations: Vec::new(),
+            receipt_obligations: Vec::new(),
+        };
+        assert!(matches!(
+            restarted.revoke_grant(&unknown_revoke, epoch.clone()),
+            Err(KernelError::InvalidField { .. })
+        ));
+        assert!(
+            restarted
+                .reconciling_operations()
+                .contains(&"op-revoke-unknown".to_owned())
+        );
+        // Re-presenting the exact intent restores the same receipt root, and
+        // the thin revocation path hydrates from that lineage.
+        let restored = restarted.activate_grant(&intent, epoch.clone(), 1_000)?;
+        assert_eq!(restored.activation_id, "activation-op-activate-root");
+        assert!(matches!(
+            restarted.disposition("op-activate-root"),
+            Some(IntentDisposition::Committed(_))
+        ));
+        let thin_revoke = GrantRevocationRequest {
+            grant_id: thin_grant_id("grant-restart-root")?,
+            snapshot_id: thin_snapshot_id("snap-1")?,
+            binding,
+        };
+        let fenced = P07AuthorityPort::revoke_grant(&restarted, &thin_revoke).map_err(|_| {
+            KernelError::InvalidField {
+                field: "binding",
+                reason: "re-presented lineage must hydrate the thin revocation",
+            }
+        })?;
+        assert!(matches!(
+            fenced.state,
+            eliot_runtime_contracts::AuthorityState::Revoked
+        ));
+        assert!(restarted.grant_revoked("grant-restart-root"));
+        Ok(())
+    }
 }
