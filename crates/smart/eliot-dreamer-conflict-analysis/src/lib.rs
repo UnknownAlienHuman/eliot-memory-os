@@ -39,7 +39,7 @@
 //! validation. There are no placeholder, mock, canned, or pseudo paths:
 //! every branch binds an explicit input field.
 //!
-//! Test coverage note: 32 of 68 `WORK_UNIT_CASE 673/*` cases execute here
+//! Test coverage note: 36 of 68 `WORK_UNIT_CASE 673/*` cases execute here
 //! (673/1 valid completes, 673/2 wrong job and scope fail closed, 673/3
 //! empty and single position are not conflicts, 673/5 duplicate and changed
 //! identities fail closed, 673/6 complete/partial/stale/blocked/withheld
@@ -53,7 +53,12 @@
 //! 673/16 every objection, counterexample, and unknown retained, 673/17
 //! stale, refuted, and superseded history stays addressable, 673/18
 //! contradiction under equal conditions, 673/19 compatible scope stays
-//! residue, 673/35 shared model and evaluator limits independence, 673/40
+//! residue, 673/20 owner-proved supersession retained while timestamp alone
+//! is not supersession, 673/21 definition, unit, and denominator mismatch
+//! stays compatible residue, 673/22 objective and value disagreement routes
+//! to the Human and Task Controller owner, 673/23 policy, authority, and
+//! effect disagreement routes to the Governor owner, 673/35 shared model
+//! and evaluator limits independence, 673/40
 //! nondiscriminative probe rejected, 673/51 Concilium-review
 //! recommendation carries no plan, 673/4 receipt and fence mismatch fails
 //! closed, 673/56 exact pre-handler receipt plus seven preservation dimensions,
@@ -66,9 +71,9 @@
 //! unknown-resolution criterion, 673/67 classification, resolution, and proof
 //! stay within grounded evidence, 673/68 bounded malformed input stays
 //! panic-free with no winner, resolution, authority, execution, or Finish).
-//! The remaining 36 of 68 are deferred per queue-item scope; workspace
-//! admission (#969), Product Pulse, and Edge proof remain separate. Deferred: 673/20,
-//! 673/21, 673/22, 673/23, 673/24, 673/25,
+//! The remaining 32 of 68 are deferred per queue-item scope; workspace
+//! admission (#969), Product Pulse, and Edge proof remain separate. Deferred: 673/24,
+//! 673/25,
 //! 673/26, 673/27, 673/28, 673/29, 673/30, 673/31, 673/32, 673/33, 673/34,
 //! 673/36, 673/37, 673/38, 673/39, 673/41, 673/42, 673/43, 673/44,
 //! 673/45, 673/46, 673/47, 673/48, 673/49, 673/50, 673/52, 673/53, 673/54,
@@ -5011,6 +5016,301 @@ mod tests {
                 conflict.positions[position.position_index].stance
             );
         }
+        assert_eq!(candidate.resolution_status, None);
+    }
+
+    // WORK_UNIT_CASE: 673/20
+    #[test]
+    fn case_20_owner_proved_supersession_versus_timestamp_only() {
+        let receipt = test_receipt();
+        let proved = ConflictSet::new(ConflictSetParams {
+            conflict_id: "conflict-supersession-proved".to_owned(),
+            kind: ConflictKind::Epistemic,
+            scope: "scope-1".to_owned(),
+            task_id: None,
+            positions: vec![
+                test_position("source-a", "cache helps tail latency", false),
+                test_position("source-b", "cache harms tail latency", false),
+            ],
+            evidence_refs: BTreeSet::new(),
+            owners: BTreeSet::from([
+                SourceId::new("source-a").expect("valid source"),
+                SourceId::new("source-b").expect("valid source"),
+            ]),
+            common_lineage: BTreeSet::new(),
+            resolved_parts: BTreeSet::from(["warm key effect".to_owned()]),
+            unresolved: BTreeSet::from(["burst load effect".to_owned()]),
+            unresolved_owners: BTreeSet::from([SourceId::new("source-b").expect("valid source")]),
+            acceptability: ArgumentAcceptability::Contested,
+            defeated_refs: BTreeSet::new(),
+            probe: None,
+            decision_owner: SourceId::new("source-a").expect("valid source"),
+            affected_actions: vec!["decide-cache".to_owned()],
+            lifecycle: ConflictLifecycle::Superseded,
+            receipt_digest: receipt.bundle_digest.clone(),
+        })
+        .expect("owner-proved supersession stays valid");
+        let proved_candidate = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &proved,
+            &test_supplements(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("supersession analysis: {err:?}"),
+        };
+        assert_eq!(proved_candidate.outcome, ConflictOutcome::Complete);
+        assert!(
+            proved_candidate
+                .positions
+                .iter()
+                .all(|position| position.disposition == PositionDispositionKind::SupersededHistory)
+        );
+        assert_eq!(proved_candidate.resolution_status, None);
+        let timestamp_only = ConflictSet::new(ConflictSetParams {
+            conflict_id: "conflict-timestamp-only".to_owned(),
+            kind: ConflictKind::Epistemic,
+            scope: "scope-1".to_owned(),
+            task_id: None,
+            positions: vec![
+                test_position("source-a", "rate 5 per 100 measured monday", false),
+                test_position(
+                    "source-b",
+                    "rate 7 per 100 measured friday, newer run",
+                    false,
+                ),
+            ],
+            evidence_refs: BTreeSet::new(),
+            owners: BTreeSet::from([
+                SourceId::new("source-a").expect("valid source"),
+                SourceId::new("source-b").expect("valid source"),
+            ]),
+            common_lineage: BTreeSet::new(),
+            resolved_parts: BTreeSet::new(),
+            unresolved: BTreeSet::from(["tail latency effect".to_owned()]),
+            unresolved_owners: BTreeSet::from([SourceId::new("source-b").expect("valid source")]),
+            acceptability: ArgumentAcceptability::Contested,
+            defeated_refs: BTreeSet::new(),
+            probe: None,
+            decision_owner: SourceId::new("source-a").expect("valid source"),
+            affected_actions: vec!["decide-cache".to_owned()],
+            lifecycle: ConflictLifecycle::Open,
+            receipt_digest: receipt.bundle_digest.clone(),
+        })
+        .expect("timestamp-only conflict stays valid");
+        let timestamp_candidate = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &timestamp_only,
+            &test_supplements(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("timestamp analysis: {err:?}"),
+        };
+        assert_eq!(timestamp_candidate.outcome, ConflictOutcome::Complete);
+        assert!(
+            timestamp_candidate
+                .positions
+                .iter()
+                .all(|position| position.disposition == PositionDispositionKind::LivePreserved),
+            "a newer timestamp alone is not owner-proved supersession"
+        );
+        assert_eq!(timestamp_candidate.resolution_status, None);
+    }
+
+    // WORK_UNIT_CASE: 673/21
+    #[test]
+    fn case_21_definition_unit_and_denominator_mismatch() {
+        let receipt = test_receipt();
+        let conflict = ConflictSet::new(ConflictSetParams {
+            conflict_id: "conflict-definition".to_owned(),
+            kind: ConflictKind::Epistemic,
+            scope: "scope-1".to_owned(),
+            task_id: None,
+            positions: vec![
+                ConflictPosition::new(
+                    SourceId::new("source-a").expect("valid source"),
+                    "rate 5 per 100 warm keys under definition D1".to_owned(),
+                    BTreeSet::from(["definition D1 per 100 warm keys".to_owned()]),
+                    BTreeSet::new(),
+                    false,
+                )
+                .expect("valid position"),
+                ConflictPosition::new(
+                    SourceId::new("source-b").expect("valid source"),
+                    "rate 7 per 1000 cold starts under definition D2".to_owned(),
+                    BTreeSet::from(["definition D2 per 1000 cold starts".to_owned()]),
+                    BTreeSet::new(),
+                    false,
+                )
+                .expect("valid position"),
+            ],
+            evidence_refs: BTreeSet::new(),
+            owners: BTreeSet::from([
+                SourceId::new("source-a").expect("valid source"),
+                SourceId::new("source-b").expect("valid source"),
+            ]),
+            common_lineage: BTreeSet::new(),
+            resolved_parts: BTreeSet::new(),
+            unresolved: BTreeSet::from(["rate comparison".to_owned()]),
+            unresolved_owners: BTreeSet::from([SourceId::new("source-a").expect("valid source")]),
+            acceptability: ArgumentAcceptability::Contested,
+            defeated_refs: BTreeSet::new(),
+            probe: None,
+            decision_owner: SourceId::new("source-a").expect("valid source"),
+            affected_actions: vec!["decide-cache".to_owned()],
+            lifecycle: ConflictLifecycle::Open,
+            receipt_digest: receipt.bundle_digest.clone(),
+        })
+        .expect("definition conflict stays valid");
+        let candidate = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &conflict,
+            &test_supplements(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("definition analysis: {err:?}"),
+        };
+        assert_eq!(candidate.outcome, ConflictOutcome::Complete);
+        assert!(
+            candidate
+                .positions
+                .iter()
+                .any(|position| position.disposition == PositionDispositionKind::CompatibleResidue)
+        );
+        for position in &candidate.positions {
+            assert_eq!(
+                position.stance, conflict.positions[position.position_index].stance,
+                "original propositions stay preserved"
+            );
+        }
+        assert_eq!(candidate.resolution_status, None);
+    }
+
+    // WORK_UNIT_CASE: 673/22
+    #[test]
+    fn case_22_objective_value_disagreement_routes_to_human_controller() {
+        let receipt = test_receipt();
+        let conflict = ConflictSet::new(ConflictSetParams {
+            conflict_id: "conflict-objective".to_owned(),
+            kind: ConflictKind::Instruction,
+            scope: "scope-1".to_owned(),
+            task_id: None,
+            positions: vec![
+                test_position(
+                    "source-a",
+                    "prefer latency objective under human constraint",
+                    false,
+                ),
+                test_position(
+                    "source-b",
+                    "prefer cost objective under human constraint",
+                    false,
+                ),
+            ],
+            evidence_refs: BTreeSet::new(),
+            owners: BTreeSet::from([SourceId::new("source-a").expect("valid source")]),
+            common_lineage: BTreeSet::new(),
+            resolved_parts: BTreeSet::new(),
+            unresolved: BTreeSet::from(["objective trade-off".to_owned()]),
+            unresolved_owners: BTreeSet::from([SourceId::new("source-a").expect("valid source")]),
+            acceptability: ArgumentAcceptability::Contested,
+            defeated_refs: BTreeSet::new(),
+            probe: None,
+            decision_owner: SourceId::new("source-a").expect("valid source"),
+            affected_actions: vec!["decide-objective".to_owned()],
+            lifecycle: ConflictLifecycle::Open,
+            receipt_digest: receipt.bundle_digest.clone(),
+        })
+        .expect("objective conflict stays valid");
+        let candidate = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &conflict,
+            &test_supplements(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("objective analysis: {err:?}"),
+        };
+        assert_eq!(candidate.outcome, ConflictOutcome::Complete);
+        assert_eq!(
+            candidate.recommended_owner.kind,
+            DecisionOwnerKind::HumanTaskController
+        );
+        assert!(!candidate.recommended_owner.rationale.trim().is_empty());
+        assert!(
+            !candidate
+                .recommended_owner
+                .contract_needed
+                .trim()
+                .is_empty()
+        );
+        assert_eq!(candidate.positions.len(), 2);
+        assert_eq!(candidate.resolution_status, None);
+    }
+
+    // WORK_UNIT_CASE: 673/23
+    #[test]
+    fn case_23_policy_authority_effect_routes_to_governor() {
+        let receipt = test_receipt();
+        let conflict = ConflictSet::new(ConflictSetParams {
+            conflict_id: "conflict-authority".to_owned(),
+            kind: ConflictKind::Authority,
+            scope: "scope-1".to_owned(),
+            task_id: None,
+            positions: vec![
+                test_position("source-a", "allow effect under permission policy A", false),
+                test_position("source-b", "deny effect under permission policy B", false),
+            ],
+            evidence_refs: BTreeSet::new(),
+            owners: BTreeSet::from([SourceId::new("source-a").expect("valid source")]),
+            common_lineage: BTreeSet::new(),
+            resolved_parts: BTreeSet::new(),
+            unresolved: BTreeSet::from(["effect permission".to_owned()]),
+            unresolved_owners: BTreeSet::from([SourceId::new("source-a").expect("valid source")]),
+            acceptability: ArgumentAcceptability::Contested,
+            defeated_refs: BTreeSet::new(),
+            probe: None,
+            decision_owner: SourceId::new("source-a").expect("valid source"),
+            affected_actions: vec!["decide-effect".to_owned()],
+            lifecycle: ConflictLifecycle::Open,
+            receipt_digest: receipt.bundle_digest.clone(),
+        })
+        .expect("authority conflict stays valid");
+        let candidate = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &conflict,
+            &test_supplements(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("authority analysis: {err:?}"),
+        };
+        assert_eq!(candidate.outcome, ConflictOutcome::Complete);
+        assert_eq!(
+            candidate.recommended_owner.kind,
+            DecisionOwnerKind::Governor
+        );
+        assert!(!candidate.recommended_owner.rationale.trim().is_empty());
+        assert!(
+            !candidate
+                .recommended_owner
+                .contract_needed
+                .trim()
+                .is_empty()
+        );
+        assert_eq!(candidate.positions.len(), 2);
         assert_eq!(candidate.resolution_status, None);
     }
 }
