@@ -39,7 +39,7 @@
 //! validation. There are no placeholder, mock, canned, or pseudo paths:
 //! every branch binds an explicit input field.
 //!
-//! Test coverage note: 64 of 68 `WORK_UNIT_CASE 673/*` cases execute here
+//! Test coverage note: 65 of 68 `WORK_UNIT_CASE 673/*` cases execute here
 //! (673/1 valid completes, 673/2 wrong job and scope fail closed, 673/3
 //! empty and single position are not conflicts, 673/5 duplicate and changed
 //! identities fail closed, 673/6 complete/partial/stale/blocked/withheld
@@ -100,10 +100,11 @@
 //! privacy handling names the security and privacy owner, 673/54 owner
 //! recommendation carries a naming-only rationale and contract with no
 //! assignment or authority, 673/55 complete analysis stays unresolved
-//! without an external receipt and retains a supplied receipt verbatim).
-//! The remaining 4 of 68 are deferred per queue-item scope; workspace
+//! without an external receipt and retains a supplied receipt verbatim,
+//! 673/63 diagnostics stay bounded and redacted).
+//! The remaining 3 of 68 are deferred per queue-item scope; workspace
 //! admission (#969), Product Pulse, and Edge proof remain separate. Deferred: 673/53,
-//! 673/58, 673/59, 673/63.
+//! 673/58, 673/59.
 
 #![forbid(unsafe_code)]
 
@@ -7352,5 +7353,67 @@ mod tests {
             Err(err) => err,
         };
         assert!(matches!(err, ConflictAnalysisError::Digest { .. }));
+    }
+
+    // WORK_UNIT_CASE: 673/63
+    #[test]
+    fn case_63_diagnostics_stay_bounded_and_redacted() {
+        let long = "x".repeat(MAX_REDACTED_CHARS + 20);
+        let truncated = redact(&long);
+        assert_eq!(truncated.len(), MAX_REDACTED_CHARS + 3);
+        assert!(truncated.ends_with("..."));
+        assert_eq!(
+            &truncated[..MAX_REDACTED_CHARS],
+            &long[..MAX_REDACTED_CHARS]
+        );
+        let cleaned = redact("ab\x00cd\x1bEF\x7f");
+        assert!(
+            !cleaned.chars().any(char::is_control),
+            "control characters never leak into diagnostics"
+        );
+        assert!(cleaned.contains('?'));
+        assert_eq!(redact("plain diagnostic"), "plain diagnostic");
+        let rendered = ConflictAnalysisError::Denominator {
+            detail: redact(&long),
+        }
+        .to_string();
+        assert!(!rendered.chars().any(char::is_control));
+        assert!(rendered.len() <= "denominator: ".len() + MAX_REDACTED_CHARS + 3);
+        let candidate = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &test_conflict(),
+            &test_supplements(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("redaction-path analysis: {err:?}"),
+        };
+        assert_eq!(candidate.note, CONFLICT_PROOF_NOTE);
+        assert!(!candidate.note.chars().any(char::is_control));
+        for condition in &candidate.invalidation_conditions {
+            assert!(
+                !condition.chars().any(char::is_control),
+                "invalidation condition stays printable: {condition:?}"
+            );
+        }
+        let mut drifted_grounded = test_grounded();
+        drifted_grounded.job_id = String::from("job-9");
+        let err = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &drifted_grounded,
+            &test_conflict(),
+            &test_supplements(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => panic!("drifted job must fail: {:?}", candidate.outcome),
+            Err(err) => err,
+        };
+        assert!(
+            !err.to_string().chars().any(char::is_control),
+            "error diagnostics stay printable: {err:?}"
+        );
     }
 }
