@@ -72,9 +72,10 @@ use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_dreamer_contracts::CurationRejectionCode;
 use eliot_dreamer_contracts::candidate::DimensionVerdict;
 use eliot_dreamer_contracts::{
-    CurrentObservation, DreamJobAdmission, JobClass, MechanismExercise, PreservationDimension,
-    PreservationReport, RepairEventOutcome, RepairHistoryPresence, RepeatReason,
-    ValidatedDreamDraft, check_fence, is_hex64_lower,
+    CurrentDiscriminator, CurrentObservation, DreamJobAdmission, JobClass, MechanismExercise,
+    PreservationDimension, PreservationReport, ProductContext, RepairEventOutcome,
+    RepairHistoryPresence, RepairLineage, RepeatReason, ValidatedDreamDraft, check_fence,
+    is_hex64_lower,
 };
 
 // ---------------------------------------------------------------------------
@@ -118,6 +119,101 @@ pub const EXPECTED_PRESERVATION_DIMENSIONS: usize = 7;
 pub const DIAGNOSIS_PROOF_NOTE: &str = "a-40 candidate-only aggregation: inert falsifiable diagnosis preserved without screening, grounding, common validation, conflict recomputation, canonical mutation, authority, effect, store, governor, model, clock, or finish";
 /// Product Pulse that remains external to this candidate-only cell.
 pub const NEXT_EVIDENCE_PULSE: &str = "D3A_ADVISORY_DIAGNOSIS_PLANNING_PULSE_01";
+
+/// Cases covered by the first bounded implementation slice.
+///
+/// This slice adds the package boundary for the canonical A03 evidence
+/// records. The existing candidate algorithm remains independently bounded
+/// below until the rival, `ConflictAnalysis`, finite-experiment and recipe
+/// contracts are available to replace its transitional normalized inputs.
+pub const SLICE1_IMPLEMENTED_CASES: &[u8] = &[1, 4, 8, 11, 15, 21, 32, 45];
+
+/// Cases deliberately left for later contract and edge slices.
+pub const SLICE1_REMAINDER_CASES: &[u8] = &[
+    2, 3, 5, 6, 7, 9, 10, 12, 13, 14, 16, 17, 18, 19, 20, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
+    33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 46, 47, 48, 49, 50, 51,
+];
+
+/// Canonical A03 evidence supplied to the first A40 package boundary.
+///
+/// The records remain owned by `eliot-dreamer-contracts`; this view carries
+/// references only and performs no conversion into handler-local DTOs.
+#[derive(Clone, Copy, Debug)]
+pub struct CanonicalDiagnosisEvidence<'a> {
+    /// Exact product objective, identity, environment and evidence envelope.
+    pub product_context: &'a ProductContext,
+    /// Current-path discriminator and its replay/verifier evidence.
+    pub current_discriminator: &'a CurrentDiscriminator,
+    /// Ordered, denominator-bearing repair lineage.
+    pub repair_lineage: &'a RepairLineage,
+}
+
+impl CanonicalDiagnosisEvidence<'_> {
+    /// Validates the three canonical A03 records and their product join.
+    ///
+    /// The canonical owners perform intrinsic bounds, digest and nested
+    /// binding checks. A40 adds only the cross-record join that the
+    /// discriminator names the exact product-context digest supplied here.
+    pub fn validate(&self) -> Result<(), DiagnosisError> {
+        self.product_context
+            .validate()
+            .map_err(|error| canonical_evidence_error("canonical.product_context", error))?;
+        self.current_discriminator
+            .validate()
+            .map_err(|error| canonical_evidence_error("canonical.current_discriminator", error))?;
+        self.repair_lineage
+            .validate()
+            .map_err(|error| canonical_evidence_error("canonical.repair_lineage", error))?;
+        if self.current_discriminator.product_context_digest != self.product_context.digest {
+            return Err(DiagnosisError::Binding {
+                field: "canonical.current_discriminator.product_context_digest",
+                detail: "current discriminator is bound to a different product context digest"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Returns a deterministic digest for the validated canonical evidence
+    /// tuple without promoting it to product or runtime proof.
+    pub fn canonical_digest(&self) -> Result<String, DiagnosisError> {
+        self.validate()?;
+        let parts = [
+            self.product_context.digest.clone(),
+            self.current_discriminator.digest.clone(),
+            self.repair_lineage.digest.clone(),
+        ];
+        canonical_json_bytes(&parts).map_or_else(
+            |error| {
+                Err(DiagnosisError::Digest {
+                    detail: redact(&error.to_string()),
+                })
+            },
+            |bytes| Ok(sha256_hex(&bytes)),
+        )
+    }
+}
+
+/// Validates the canonical A03 evidence boundary and returns its tuple digest.
+pub fn canonical_diagnosis_evidence_digest(
+    product_context: &ProductContext,
+    current_discriminator: &CurrentDiscriminator,
+    repair_lineage: &RepairLineage,
+) -> Result<String, DiagnosisError> {
+    CanonicalDiagnosisEvidence {
+        product_context,
+        current_discriminator,
+        repair_lineage,
+    }
+    .canonical_digest()
+}
+
+fn canonical_evidence_error(field: &'static str, error: impl core::fmt::Display) -> DiagnosisError {
+    DiagnosisError::Binding {
+        field,
+        detail: redact(&error.to_string()),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Small pure helpers (no ambient clock, no allocation of authority).
@@ -2550,6 +2646,8 @@ mod tests {
     use super::RepairHistory;
     use super::RivalMechanism;
     use super::RivalStatus;
+    use super::SLICE1_IMPLEMENTED_CASES;
+    use super::SLICE1_REMAINDER_CASES;
     use super::diagnose_development_gap;
     use super::is_hex64_lower;
     use super::outcome_rejection_hint;
@@ -2888,6 +2986,20 @@ mod tests {
             panic!("valid diagnosis must complete");
         };
         candidate
+    }
+
+    #[test]
+    fn slice1_remainder_map_covers_the_declared_denominator() {
+        let mut seen = [false; 52];
+        for case in SLICE1_IMPLEMENTED_CASES
+            .iter()
+            .chain(SLICE1_REMAINDER_CASES.iter())
+        {
+            assert!((1..=51).contains(case));
+            assert!(!seen[usize::from(*case)]);
+            seen[usize::from(*case)] = true;
+        }
+        assert!(seen[1..].iter().all(|present| *present));
     }
 
     // WORK_UNIT_CASE: 675/1
