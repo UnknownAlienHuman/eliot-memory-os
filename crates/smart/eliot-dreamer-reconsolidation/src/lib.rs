@@ -2036,6 +2036,84 @@ mod tests {
         assert!(result.child.is_none());
     }
 
+    // WORK_UNIT_CASE: 667/25
+    #[test]
+    fn case_25_unsupported_precision_or_grade_escalation_is_rejected() {
+        for revised_statement in [
+            "Cold starts stay slow within 250 ms.",
+            "Cold starts are always slow except after the observed warm-up.",
+        ] {
+            let mut request = valid_request();
+            request.deltas[1].revised_statement = Some(revised_statement.to_owned());
+            let result = propose_reconsolidation(&request)
+                .expect("unsupported precision and strength are semantic outcomes");
+            assert_eq!(result.outcome, ReconsolidationOutcome::NoSafeRevision);
+            assert!(result.child.is_none());
+            assert!(result.note.contains("unsupported precision"));
+        }
+    }
+
+    // WORK_UNIT_CASE: 667/26
+    #[test]
+    fn case_26_every_parent_proposition_is_accounted_once() {
+        let mut request = valid_request();
+        request.parent_propositions.push(ParentProposition {
+            id: "p3".to_owned(),
+            statement: "Warm keys remain addressable.".to_owned(),
+            support_handle: "src-c".to_owned(),
+            lineage: "lineage-c".to_owned(),
+            is_load_bearing: false,
+        });
+        request.parent_baseline_handles.push("src-c".to_owned());
+        request
+            .parent_baseline_lineages
+            .push("lineage-c".to_owned());
+
+        let result = propose_reconsolidation(&request).expect("missing accounting is semantic");
+        assert_eq!(result.outcome, ReconsolidationOutcome::Blocked);
+        assert!(result.child.is_none());
+        assert!(result.note.contains("every parent proposition"));
+    }
+
+    // WORK_UNIT_CASE: 667/27
+    #[test]
+    fn case_27_missing_duplicate_or_unmapped_proposition_is_rejected() {
+        let mut missing = valid_request();
+        missing.deltas.pop();
+        let result = propose_reconsolidation(&missing).expect("missing delta is semantic");
+        assert_eq!(result.outcome, ReconsolidationOutcome::Blocked);
+        assert!(result.child.is_none());
+
+        let mut duplicate = valid_request();
+        duplicate.deltas[1].proposition_id = "p1".to_owned();
+        let error = propose_reconsolidation(&duplicate).expect_err("duplicate delta is malformed");
+        assert!(matches!(error, ReconsolidationError::Order { phase, .. } if phase == "deltas"));
+
+        let mut unmapped = valid_request();
+        unmapped.deltas[1].proposition_id = "p3".to_owned();
+        let result = propose_reconsolidation(&unmapped).expect("unmapped delta is semantic");
+        assert_eq!(result.outcome, ReconsolidationOutcome::Blocked);
+        assert!(result.child.is_none());
+        assert!(result.note.contains("unknown parent proposition"));
+    }
+
+    // WORK_UNIT_CASE: 667/28
+    #[test]
+    fn case_28_cosmetic_or_reordered_only_delta_is_rejected() {
+        let mut cosmetic = valid_request();
+        cosmetic.deltas[1].revised_statement = Some("  cold STARTS stay slow.  ".to_owned());
+        let result = propose_reconsolidation(&cosmetic)
+            .expect("cosmetic wording changes are semantic outcomes");
+        assert_eq!(result.outcome, ReconsolidationOutcome::NoSafeRevision);
+        assert!(result.child.is_none());
+        assert!(result.note.contains("cosmetic-only"));
+
+        let mut reordered = valid_request();
+        reordered.deltas.reverse();
+        let error = propose_reconsolidation(&reordered).expect_err("delta order is deterministic");
+        assert!(matches!(error, ReconsolidationError::Order { phase, .. } if phase == "deltas"));
+    }
+
     // WORK_UNIT_CASE: 667/39
     #[test]
     fn case_39_unaffected_dependent_keeps_an_explicit_note() {
