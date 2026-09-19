@@ -1,12 +1,13 @@
-//! Work-unit 610 slice 3: bounded discriminative probe planner, cases 1..10
+//! Work-unit 610 slice 4: bounded discriminative probe planner, cases 1..11
 //! (valid two-rival probe, multi-rival result matrix, exact
 //! objective/result/affordance/disposition vocabulary, bound-input
 //! mismatch, duplicate collapse, vague/no-gain objective gating,
 //! exact evidence/verifier-gap plannability, per-descriptor scope
-//! exclusion, bounded closed result schema, open/unbounded rejection).
+//! exclusion, bounded closed result schema, open/unbounded rejection,
+//! identical-updates rejection).
 //!
 //! Cases 610/1, 610/4 and 610/5 are marked on the existing planner
-//! behaviour tests in `tests/probe_plan.rs`. Cases 610/11..42 (discrimination,
+//! behaviour tests in `tests/probe_plan.rs`. Cases 610/12..42 (confirmation,
 //! affordance/execution, safety, budget/dominance, replay and no-execution
 //! proof) remain QUEUED on issue #610.
 //!
@@ -23,7 +24,9 @@
 //! keeps the exact two-branch cover); 610/10 OWNED via the A-03
 //! `PossibleResultSchema::new` fail-closed boundary (empty targets/branches,
 //! incomplete cover, duplicate identity, undeclared target all rejected
-//! before any descriptor can plan).
+//! before any descriptor can plan); 610/11 OWNED via the planner
+//! identical-updates gate (multi-branch matrices with the same update set on
+//! every branch are Unprobeable; single-branch defers to 610/38 readiness).
 //! Docs route=sha256:1b9bbbd8b5bb5e2de4737b4fa03e7e3672daba4394afef443dd3d8476554c7fa read=sha256:ea79ca7e06dbc95bb6ebceb4b5d904a848f265540ab58d6e82d93d5878599ec6 bundle=5ca78f97ee5f6485f6ab552d6687ade11da053a68be0cb38339167aeac0be7f3 (generic-source; verified bundle read in full plus I09-03, I09-05, I21-03, I12-18, I12-22, I13-07, I15-02, I15-04, I05-27, I05-16, I07-20 read directly).
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
@@ -638,5 +641,94 @@ fn open_unbounded_result_space_is_rejected() {
         )
         .is_err(),
         "update to an undeclared target must fail closed"
+    );
+}
+
+// WORK_UNIT_CASE: 610/11
+#[test]
+fn identical_updates_for_all_outcomes_are_unprobeable() {
+    fn two_branch_schema(
+        id: &str,
+        objective_id: &str,
+        first: GapUpdateMeaning,
+        second: GapUpdateMeaning,
+    ) -> PossibleResultSchema {
+        let target = objective(objective_id);
+        must(PossibleResultSchema::new(
+            artifact(id),
+            vec![ResultTarget::Gap {
+                objective: target.clone(),
+            }],
+            vec![
+                ResultBranch {
+                    result_id: artifact(&format!("{id}-a")),
+                    value: PossibleResultValue::Unknown {
+                        reason: "outcome not yet observed".to_owned(),
+                    },
+                    updates: vec![ResultUpdate::Gap {
+                        objective: target.clone(),
+                        meaning: first,
+                    }],
+                },
+                ResultBranch {
+                    result_id: artifact(&format!("{id}-b")),
+                    value: PossibleResultValue::Unknown {
+                        reason: "outcome not yet observed".to_owned(),
+                    },
+                    updates: vec![ResultUpdate::Gap {
+                        objective: target,
+                        meaning: second,
+                    }],
+                },
+            ],
+        ))
+    }
+
+    let identical_schema = two_branch_schema(
+        "identical-schema",
+        "objective-identical",
+        GapUpdateMeaning::RemainsOpen,
+        GapUpdateMeaning::RemainsOpen,
+    );
+    must(identical_schema.validate());
+    let mut identical_params = descriptor_params("aff-identical", gap_target("claim-identical"));
+    identical_params.result_schema = identical_schema;
+    let identical = must(InquiryAffordanceDescriptor::new(identical_params));
+
+    let identical_plan = plan_for(vec![identical], Some(16));
+    must(identical_plan.validate());
+    assert!(
+        identical_plan.probes.is_empty(),
+        "identical updates cannot plan a probe"
+    );
+    assert_eq!(identical_plan.omissions.len(), 1);
+    assert_eq!(identical_plan.omissions[0].kind, OmissionKind::Unprobeable);
+    assert!(
+        identical_plan.omissions[0].reason.contains("identical"),
+        "identical-updates gap must cite the discrimination gate, got {}",
+        identical_plan.omissions[0].reason
+    );
+
+    let split_schema = two_branch_schema(
+        "split-schema",
+        "objective-split",
+        GapUpdateMeaning::Addressed,
+        GapUpdateMeaning::RemainsOpen,
+    );
+    must(split_schema.validate());
+    let mut split_params = descriptor_params("aff-split", gap_target("claim-split"));
+    split_params.result_schema = split_schema;
+    let split = must(InquiryAffordanceDescriptor::new(split_params));
+
+    let split_plan = plan_for(vec![split], Some(16));
+    must(split_plan.validate());
+    assert_eq!(split_plan.probes.len(), 1);
+    assert!(split_plan.omissions.is_empty());
+    let probe = &split_plan.probes[0];
+    must(probe.result_schema.validate());
+    assert_eq!(probe.result_schema.branches.len(), 2);
+    assert_ne!(
+        probe.result_schema.branches[0].updates, probe.result_schema.branches[1].updates,
+        "discriminative probe must keep two differently updating outcomes"
     );
 }

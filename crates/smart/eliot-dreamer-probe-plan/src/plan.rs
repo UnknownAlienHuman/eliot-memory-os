@@ -208,7 +208,15 @@ fn classify_one(
         feasibility: descriptor.feasibility.clone(),
         attention: descriptor.attention.clone(),
     };
-    let class = classify_dimensions(&dimensions, &descriptor.applicability.scope, scope);
+    let mut class = classify_dimensions(&dimensions, &descriptor.applicability.scope, scope);
+    if matches!(class, DescriptorClass::Plannable)
+        && schema_has_identical_updates(&descriptor.result_schema)
+    {
+        class = DescriptorClass::Gap(
+            OmissionKind::Unprobeable,
+            "result matrix declares identical updates across all outcomes".to_owned(),
+        );
+    }
     let order = match &class {
         DescriptorClass::Plannable => 0,
         DescriptorClass::Gap(OmissionKind::Unprobeable, _) => 1,
@@ -257,6 +265,33 @@ fn merge_group(
         });
     }
     Ok(())
+}
+
+/// Closed discrimination gate for case 610/11: a multi-branch result matrix
+/// whose every branch declares the same update set cannot discriminate.
+/// Single-branch schemas defer to case 610/38 (two-outcome readiness) so
+/// prior single-branch fixtures stay plannable. Comparison is order-
+/// insensitive over the branch update sets; debug order is deterministic
+/// for these closed enums so the check is infallible and fail-closed.
+fn schema_has_identical_updates(schema: &eliot_dreamer_contracts::PossibleResultSchema) -> bool {
+    if schema.branches.len() < 2 {
+        return false;
+    }
+    let mut first: Vec<String> = schema.branches[0]
+        .updates
+        .iter()
+        .map(|update| format!("{update:?}"))
+        .collect();
+    first.sort();
+    schema.branches[1..].iter().all(|branch| {
+        let mut updates: Vec<String> = branch
+            .updates
+            .iter()
+            .map(|update| format!("{update:?}"))
+            .collect();
+        updates.sort();
+        updates == first
+    })
 }
 
 /// Closed gating policy over feasibility, information, authority, consent,
