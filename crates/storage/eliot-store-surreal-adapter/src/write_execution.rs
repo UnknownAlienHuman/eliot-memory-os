@@ -691,15 +691,16 @@ impl WriteExecution {
     /// Currently accepted but not completed operations.
     #[must_use]
     pub fn pending_count(&self) -> usize {
-        self.with_inner(|inner| inner.scheduler.pending_count())
-            .unwrap_or(0)
+        self.with_inner(|inner| {
+            inner.scheduler.pending_count() + inner.executing.len()
+        })
+        .unwrap_or(0)
     }
 
     /// Currently executing operations.
     #[must_use]
     pub fn in_flight_count(&self) -> usize {
-        self.with_inner(|inner| inner.scheduler.in_flight_count())
-            .unwrap_or(0)
+        self.with_inner(|inner| inner.executing.len()).unwrap_or(0)
     }
 
     /// Free normal-write permits (evidence that waiting work holds none).
