@@ -39,7 +39,7 @@
 //! validation. There are no placeholder, mock, canned, or pseudo paths:
 //! every branch binds an explicit input field.
 //!
-//! Test coverage note: 20 of 68 `WORK_UNIT_CASE 673/*` cases execute here
+//! Test coverage note: 23 of 68 `WORK_UNIT_CASE 673/*` cases execute here
 //! (673/1 valid completes, 673/2 wrong job and scope fail closed, 673/3
 //! empty and single position are not conflicts, 673/5 duplicate and changed
 //! identities fail closed, 673/6 complete/partial/stale/blocked/withheld
@@ -52,15 +52,18 @@
 //! residue, 673/35 shared model and evaluator limits independence, 673/40
 //! nondiscriminative probe rejected, 673/51 Concilium-review
 //! recommendation carries no plan, 673/4 receipt and fence mismatch fails
-//! closed, 673/60 irrelevant order preserves digest, 673/61 exact and one-over
-//! limits fail closed, 673/62 cancellation and deadline emit blocked/stale).
-//! The remaining 48 of 68 are deferred per queue-item scope; workspace
+//! closed, 673/56 exact pre-handler receipt plus seven preservation dimensions,
+//! 673/57 failed and unknown dimensions stay independent without borrowing,
+//! 673/60 irrelevant order preserves digest, 673/61 exact and one-over
+//! limits fail closed, 673/62 cancellation and deadline emit blocked/stale,
+//! 673/64 every expected position and objection stays visible).
+//! The remaining 45 of 68 are deferred per queue-item scope; workspace
 //! admission (#969), Product Pulse, and Edge proof remain separate. Deferred: 673/8, 673/15,
 //! 673/16, 673/17, 673/18, 673/20, 673/21, 673/22, 673/23, 673/24, 673/25,
 //! 673/26, 673/27, 673/28, 673/29, 673/30, 673/31, 673/32, 673/33, 673/34,
 //! 673/36, 673/37, 673/38, 673/39, 673/41, 673/42, 673/43, 673/44,
 //! 673/45, 673/46, 673/47, 673/48, 673/49, 673/50, 673/52, 673/53, 673/54,
-//! 673/55, 673/56, 673/57, 673/58, 673/59, 673/63, 673/64,
+//! 673/55, 673/58, 673/59, 673/63,
 //! 673/65, 673/66, 673/67, 673/68.
 
 #![forbid(unsafe_code)]
@@ -4040,5 +4043,189 @@ mod tests {
             DecisionOwnerKind::EvaluatorVerifier
         );
         assert_eq!(candidate.positions.len(), 2);
+    }
+
+    // WORK_UNIT_CASE: 673/56
+    #[test]
+    fn case_56_exact_prehandler_receipt_plus_seven_preservation_dimensions() {
+        let item = test_item();
+        let draft = test_draft();
+        let grounded = test_grounded();
+        let conflict = test_conflict();
+        let supplements = test_supplements();
+        let policy = test_policy();
+        assert_eq!(
+            supplements.expected_receipt.job_id, item.receipt.job_id,
+            "pre-handler receipt binds the exact job"
+        );
+        assert_eq!(
+            supplements.frozen_bundle_digest, item.receipt.bundle_digest,
+            "frozen bundle replays the receipt binding"
+        );
+        assert_eq!(
+            supplements.frozen_manifest_digest, item.receipt.manifest_digest,
+            "frozen manifest replays the receipt binding"
+        );
+        assert_eq!(
+            policy.policy_id, item.receipt.validator_policy,
+            "policy stays on the receipt validator policy"
+        );
+        let candidate =
+            match analyze_conflict(&item, &draft, &grounded, &conflict, &supplements, &policy) {
+                Ok(candidate) => candidate,
+                Err(err) => panic!("pre-handler receipt analysis: {err:?}"),
+            };
+        assert_eq!(candidate.outcome, ConflictOutcome::Complete);
+        assert_eq!(candidate.resolution_status, None);
+        assert_eq!(
+            candidate.preservation.verdicts.len(),
+            EXPECTED_PRESERVATION_DIMENSIONS
+        );
+        for dimension in [
+            PreservationDimension::Coverage,
+            PreservationDimension::Faithfulness,
+            PreservationDimension::Lineage,
+            PreservationDimension::Reversibility,
+            PreservationDimension::AuthorityCeiling,
+            PreservationDimension::DependencyClosure,
+            PreservationDimension::ProvenanceRetention,
+        ] {
+            let verdict = candidate
+                .preservation
+                .verdicts
+                .iter()
+                .find(|verdict| verdict.dimension == dimension)
+                .unwrap_or_else(|| panic!("missing preservation dimension {dimension:?}"));
+            assert!(verdict.known, "dimension {dimension:?} is judged");
+            assert!(verdict.passed, "dimension {dimension:?} passes");
+            assert!(!verdict.note.trim().is_empty());
+        }
+        assert!(candidate.preservation.validate().is_ok());
+        assert!(candidate.preservation.overall().is_ok());
+        let mut drifted = supplements.clone();
+        drifted.expected_receipt.job_id = String::from("job-9");
+        let err = match analyze_conflict(&item, &draft, &grounded, &conflict, &drifted, &policy) {
+            Ok(candidate) => panic!(
+                "drifted pre-handler receipt must fail: {:?}",
+                candidate.outcome
+            ),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, ConflictAnalysisError::Receipt { .. }),
+            "exact pre-handler receipt binding fails closed without re-invoking the validator: {err:?}"
+        );
+    }
+
+    // WORK_UNIT_CASE: 673/57
+    #[test]
+    fn case_57_failed_unknown_dimensions_stay_independent_without_borrowing() {
+        let candidate = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &test_conflict(),
+            &test_supplements(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("baseline preservation analysis: {err:?}"),
+        };
+        assert!(candidate.preservation.overall().is_ok());
+        let mut failed = candidate.preservation.clone();
+        let coverage = failed
+            .verdicts
+            .iter_mut()
+            .find(|verdict| verdict.dimension == PreservationDimension::Coverage)
+            .expect("coverage verdict stays addressable");
+        coverage.passed = false;
+        coverage.note = String::from("coverage shortfall: expected members missing");
+        assert!(failed.validate().is_ok());
+        let err = match failed.overall() {
+            Ok(()) => panic!("one failed dimension must fail overall"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, ConflictAnalysisError::Denominator { .. }),
+            "failed coverage fails overall without averaging: {err:?}"
+        );
+        assert!(
+            failed
+                .verdicts
+                .iter()
+                .filter(|verdict| verdict.dimension != PreservationDimension::Coverage)
+                .all(|verdict| verdict.known && verdict.passed),
+            "sibling dimensions stay passed while coverage fails"
+        );
+        let mut unknown = candidate.preservation.clone();
+        let lineage = unknown
+            .verdicts
+            .iter_mut()
+            .find(|verdict| verdict.dimension == PreservationDimension::Lineage)
+            .expect("lineage verdict stays addressable");
+        lineage.known = false;
+        lineage.passed = false;
+        lineage.note = String::from("lineage unknown: unattributed source stays open");
+        assert!(unknown.validate().is_ok());
+        assert!(
+            matches!(
+                unknown.overall(),
+                Err(ConflictAnalysisError::Denominator { .. })
+            ),
+            "unknown lineage cannot borrow the valid input receipt"
+        );
+    }
+
+    // WORK_UNIT_CASE: 673/64
+    #[test]
+    fn case_64_every_expected_position_and_objection_stays_visible() {
+        let conflict = test_conflict();
+        let supplements = test_supplements();
+        let candidate = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &conflict,
+            &supplements,
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("denominator visibility analysis: {err:?}"),
+        };
+        assert_eq!(candidate.outcome, ConflictOutcome::Complete);
+        assert_eq!(candidate.positions.len(), conflict.positions.len());
+        for (index, original) in conflict.positions.iter().enumerate() {
+            let analyzed = candidate
+                .positions
+                .iter()
+                .find(|position| position.position_index == index)
+                .unwrap_or_else(|| panic!("expected position {index} stays visible"));
+            assert_eq!(analyzed.source_handle, original.source.as_str());
+            assert_eq!(analyzed.stance, original.stance);
+            assert_eq!(analyzed.minority, original.minority);
+        }
+        assert_eq!(candidate.objections.len(), supplements.objections.len());
+        for expected in &supplements.objections {
+            let kept = candidate
+                .objections
+                .iter()
+                .find(|objection| objection.objection_id == expected.objection_id)
+                .unwrap_or_else(|| {
+                    panic!("expected objection {} stays visible", expected.objection_id)
+                });
+            assert_eq!(kept.target_source, expected.target_source);
+            assert_eq!(kept.statement, expected.statement);
+        }
+        assert_eq!(
+            PositionDispositionKind::Withheld.as_str(),
+            "withheld",
+            "withheld stays a closed explicit denominator state"
+        );
+        assert_eq!(
+            PositionDispositionKind::Unavailable.as_str(),
+            "unavailable",
+            "unavailable stays a closed explicit denominator state"
+        );
+        assert_eq!(candidate.resolution_status, None);
     }
 }
