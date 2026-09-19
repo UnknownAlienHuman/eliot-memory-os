@@ -896,3 +896,226 @@ fn omitted_mandatory_member_cannot_be_complete() {
     assert!(incomplete.oversized.is_empty());
     incomplete.validate().expect("incomplete outcome validates");
 }
+
+// WORK_UNIT_CASE: 584/25
+#[test]
+fn exhausted_mandatory_member_cannot_be_complete() {
+    let floor = safety_floor_with(AtomAvailability::Exhausted);
+    floor.validate().expect("exhausted floor shape validates");
+    let incomplete = floor
+        .incomplete()
+        .expect("exhausted floor rechecks")
+        .expect("exhausted member cannot be complete");
+    assert_eq!(incomplete.exhausted, vec![id("atom")]);
+    assert!(incomplete.missing.is_empty());
+    assert!(incomplete.stale.is_empty());
+    assert!(incomplete.blocked.is_empty());
+    assert!(incomplete.unavailable.is_empty());
+    assert!(incomplete.omitted.is_empty());
+    assert!(incomplete.unknown.is_empty());
+    assert!(incomplete.known_empty.is_empty());
+    assert!(incomplete.partial.is_empty());
+    assert!(incomplete.oversized.is_empty());
+    incomplete.validate().expect("incomplete outcome validates");
+}
+
+// WORK_UNIT_CASE: 584/26
+#[test]
+fn partial_provider_coverage_cannot_make_complete_floor() {
+    let partial_providers = ProviderRoleDenominator {
+        requested: vec![provider_role()],
+        dispositions: vec![ProviderDisposition {
+            slot: provider_role(),
+            state: AtomAvailability::Partial,
+            evidence: None,
+        }],
+    };
+    partial_providers
+        .validate()
+        .expect("partial denominator shape validates");
+    let mut floor = safety_floor_with(AtomAvailability::Partial);
+    floor.providers = partial_providers;
+    floor.validate().expect("partial floor shape validates");
+    let incomplete = floor
+        .incomplete()
+        .expect("partial floor rechecks")
+        .expect("partial coverage cannot be complete");
+    assert_eq!(incomplete.partial, vec![id("atom")]);
+    assert_eq!(incomplete.provider_gaps.len(), 1);
+    assert_eq!(incomplete.provider_gaps[0].slot, provider_role());
+    assert_eq!(incomplete.provider_gaps[0].state, AtomAvailability::Partial);
+    assert!(incomplete.missing.is_empty());
+    assert!(incomplete.stale.is_empty());
+    assert!(incomplete.blocked.is_empty());
+    assert!(incomplete.oversized.is_empty());
+    incomplete.validate().expect("incomplete outcome validates");
+}
+
+// WORK_UNIT_CASE: 584/27
+#[test]
+fn known_empty_requires_complete_authoritative_denominator() {
+    let floor = safety_floor_with(AtomAvailability::KnownEmpty);
+    floor.validate().expect("known-empty floor shape validates");
+    let incomplete = floor
+        .incomplete()
+        .expect("known-empty floor rechecks")
+        .expect("known-empty cannot be complete");
+    assert_eq!(incomplete.known_empty, vec![id("atom")]);
+    assert!(incomplete.missing.is_empty());
+    assert!(incomplete.partial.is_empty());
+    assert!(incomplete.oversized.is_empty());
+    incomplete.validate().expect("incomplete outcome validates");
+
+    // Without a complete authoritative denominator the claim fails closed.
+    let empty = ProviderRoleDenominator {
+        requested: Vec::new(),
+        dispositions: Vec::new(),
+    };
+    assert_eq!(
+        empty.validate(),
+        Err(ContextError::MissingField("denominator.requested"))
+    );
+    let truncated = ProviderRoleDenominator {
+        requested: vec![provider_role()],
+        dispositions: Vec::new(),
+    };
+    assert_eq!(truncated.validate(), Err(ContextError::DenominatorMismatch));
+    let mut unauthoritative = safety_floor_with(AtomAvailability::KnownEmpty);
+    unauthoritative.providers = truncated;
+    assert_eq!(
+        unauthoritative.validate(),
+        Err(ContextError::DenominatorMismatch)
+    );
+}
+
+// WORK_UNIT_CASE: 584/28
+#[test]
+fn decision_context_incomplete_distinct_from_contract_error() {
+    let floor = safety_floor_with(AtomAvailability::Missing);
+    let incomplete = floor
+        .incomplete()
+        .expect("missing floor rechecks")
+        .expect("missing member cannot be complete");
+    assert_eq!(incomplete.code, ContextErrorCode::DecisionContextIncomplete);
+    let wire = serde_json::to_string(&incomplete.code).expect("code wire encoding");
+    assert_eq!(wire, "\"DECISION_CONTEXT_INCOMPLETE\"");
+    incomplete
+        .validate()
+        .expect("incomplete is a valid outcome, not an error");
+
+    // Contract/shape failures are Err values, never an incomplete outcome.
+    let mut empty_floor = safety_floor_with(AtomAvailability::Missing);
+    empty_floor.mandatory_atoms.clear();
+    empty_floor.members.clear();
+    assert_eq!(empty_floor.validate(), Err(ContextError::MissingFloor));
+
+    let mut wrong_code = incomplete.clone();
+    wrong_code.code = ContextErrorCode::InvalidIdentity;
+    assert_eq!(
+        wrong_code.validate(),
+        Err(ContextError::InvalidField("incomplete.code"))
+    );
+
+    let outcome: ContextOutcome<AdmittedContextSet> =
+        ContextOutcome::Incomplete(incomplete.clone());
+    assert!(matches!(outcome, ContextOutcome::Incomplete(_)));
+    assert!(!matches!(outcome, ContextOutcome::Complete(_)));
+}
+
+// WORK_UNIT_CASE: 584/29
+#[test]
+fn incomplete_preserves_gap_sets_and_reopening_requirements() {
+    let oversized_capacity = CapacityLimits {
+        route_capacity: 2,
+        fixed_overhead: 1,
+        output_reserve: 1,
+        review_reserve: 1,
+    };
+    let floor = DecisionSafetyFloor {
+        binding: binding(),
+        mandatory_atoms: vec![id("missing-atom"), id("stale-atom"), id("blocked-atom")],
+        mandatory_roles: vec![SemanticRole::Goal],
+        providers: denominator(),
+        members: vec![
+            SafetyFloorMember {
+                atom_id: id("missing-atom"),
+                role: SemanticRole::Goal,
+                availability: AtomAvailability::Missing,
+                measurement: None,
+                required_dependencies: Vec::new(),
+            },
+            SafetyFloorMember {
+                atom_id: id("stale-atom"),
+                role: SemanticRole::Goal,
+                availability: AtomAvailability::Stale,
+                measurement: None,
+                required_dependencies: Vec::new(),
+            },
+            SafetyFloorMember {
+                atom_id: id("blocked-atom"),
+                role: SemanticRole::Goal,
+                availability: AtomAvailability::Blocked,
+                measurement: None,
+                required_dependencies: Vec::new(),
+            },
+        ],
+        interpretation_dependencies: Vec::new(),
+        rule_evidence: id("floor-rule"),
+        capacity: oversized_capacity,
+    };
+    floor.validate().expect("multi-gap floor shape validates");
+    let mut incomplete = floor
+        .incomplete()
+        .expect("multi-gap floor rechecks")
+        .expect("multi-gap floor cannot be complete");
+    assert_eq!(incomplete.missing, vec![id("missing-atom")]);
+    assert_eq!(incomplete.stale, vec![id("stale-atom")]);
+    assert_eq!(incomplete.blocked, vec![id("blocked-atom")]);
+    assert_eq!(
+        incomplete.oversized,
+        vec![id("missing-atom"), id("stale-atom"), id("blocked-atom")]
+    );
+    assert!(incomplete.unavailable.is_empty());
+    assert!(incomplete.omitted.is_empty());
+
+    incomplete
+        .reopening_requirements
+        .push("reopen blocked-atom with fresh evidence".to_owned());
+    incomplete.measurements.push(id("measurement"));
+    incomplete.validate().expect("gaps plus reopening validate");
+    let encoded = serde_json::to_string(&incomplete).expect("incomplete encoding");
+    let decoded: DecisionContextIncomplete =
+        serde_json::from_str(&encoded).expect("incomplete round-trip");
+    assert_eq!(decoded, incomplete);
+    assert_eq!(decoded.missing, vec![id("missing-atom")]);
+    assert_eq!(decoded.stale, vec![id("stale-atom")]);
+    assert_eq!(decoded.blocked, vec![id("blocked-atom")]);
+}
+
+// WORK_UNIT_CASE: 584/30
+#[test]
+fn incomplete_cannot_decode_to_thinner_complete_success() {
+    let floor = safety_floor_with(AtomAvailability::Missing);
+    let incomplete = floor
+        .incomplete()
+        .expect("missing floor rechecks")
+        .expect("missing member cannot be complete");
+    let encoded = serde_json::to_string(&incomplete).expect("incomplete encoding");
+    assert!(serde_json::from_str::<ContextCandidateSet>(&encoded).is_err());
+    assert!(serde_json::from_str::<AdmittedContextSet>(&encoded).is_err());
+    assert!(serde_json::from_str::<ContextRecipe>(&encoded).is_err());
+
+    let outcome: ContextOutcome<AdmittedContextSet> =
+        ContextOutcome::Incomplete(incomplete.clone());
+    match outcome {
+        ContextOutcome::Incomplete(result) => {
+            assert_eq!(result.missing, vec![id("atom")]);
+            result.validate().expect("incomplete stays incomplete");
+        }
+        ContextOutcome::Complete(_) => panic!("incomplete must not convert to success"),
+    }
+
+    // An empty gap set is not a valid incomplete and cannot stand in for success.
+    let empty = DecisionContextIncomplete::new(id("floor-rule"));
+    assert_eq!(empty.validate(), Err(ContextError::MissingFloor));
+}
