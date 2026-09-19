@@ -39,7 +39,7 @@
 //! validation. There are no placeholder, mock, canned, or pseudo paths:
 //! every branch binds an explicit input field.
 //!
-//! Test coverage note: 62 of 68 `WORK_UNIT_CASE 673/*` cases execute here
+//! Test coverage note: 64 of 68 `WORK_UNIT_CASE 673/*` cases execute here
 //! (673/1 valid completes, 673/2 wrong job and scope fail closed, 673/3
 //! empty and single position are not conflicts, 673/5 duplicate and changed
 //! identities fail closed, 673/6 complete/partial/stale/blocked/withheld
@@ -97,10 +97,13 @@
 //! names the Human and Task Controller owner, 673/49 authority and effect
 //! disagreement names the Governor owner, 673/50 intent-satisfiability
 //! disagreement names the Architecture and Implementation owner, 673/52
-//! privacy handling names the security and privacy owner).
-//! The remaining 6 of 68 are deferred per queue-item scope; workspace
+//! privacy handling names the security and privacy owner, 673/54 owner
+//! recommendation carries a naming-only rationale and contract with no
+//! assignment or authority, 673/55 complete analysis stays unresolved
+//! without an external receipt and retains a supplied receipt verbatim).
+//! The remaining 4 of 68 are deferred per queue-item scope; workspace
 //! admission (#969), Product Pulse, and Edge proof remain separate. Deferred: 673/53,
-//! 673/54, 673/55, 673/58, 673/59, 673/63.
+//! 673/58, 673/59, 673/63.
 
 #![forbid(unsafe_code)]
 
@@ -7220,5 +7223,134 @@ mod tests {
         );
         assert_eq!(candidate.positions.len(), 2);
         assert_eq!(candidate.resolution_status, None);
+    }
+
+    // WORK_UNIT_CASE: 673/54
+    #[test]
+    fn case_54_owner_recommendation_is_naming_only_contract() {
+        let candidate = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &test_conflict(),
+            &test_supplements(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("recommendation-contract analysis: {err:?}"),
+        };
+        assert_eq!(candidate.outcome, ConflictOutcome::Complete);
+        assert!(
+            !candidate.recommended_owner.owner_handle.trim().is_empty(),
+            "recommendation names the owner handle"
+        );
+        assert!(
+            !candidate.recommended_owner.rationale.trim().is_empty(),
+            "recommendation carries a boundary rationale"
+        );
+        assert!(
+            !candidate
+                .recommended_owner
+                .contract_needed
+                .trim()
+                .is_empty(),
+            "recommendation names the contract the owner needs"
+        );
+        let contract = format!(
+            "{} {} {}",
+            candidate.recommended_owner.owner_handle,
+            candidate.recommended_owner.rationale,
+            candidate.recommended_owner.contract_needed
+        );
+        let low = contract.to_lowercase();
+        for forbidden in ["assign", "authoriz", "launch", "execut"] {
+            assert!(
+                !low.contains(forbidden),
+                "recommendation names without {forbidden}: {contract}"
+            );
+        }
+        assert_eq!(candidate.resolution_status, None);
+        assert_eq!(candidate.note, CONFLICT_PROOF_NOTE);
+        assert!(
+            !candidate.invalidation_conditions.is_empty(),
+            "reopening conditions stay explicit instead of an assignment receipt"
+        );
+    }
+
+    // WORK_UNIT_CASE: 673/55
+    #[test]
+    fn case_55_complete_without_receipt_unresolved_with_receipt_verbatim() {
+        let plain = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &test_conflict(),
+            &test_supplements(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("unresolved analysis: {err:?}"),
+        };
+        assert_eq!(plain.outcome, ConflictOutcome::Complete);
+        assert_eq!(
+            plain.resolution_status, None,
+            "complete analysis stays unresolved without an external receipt"
+        );
+        assert_eq!(plain.positions.len(), 2);
+        let mut resolved_supplements = test_supplements();
+        resolved_supplements.external_resolution = Some(ExternalResolution {
+            decision_digest: "c".repeat(64),
+            decided_by: "human-owner".to_owned(),
+            note: "external decision retained with dissent".to_owned(),
+        });
+        let retained = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &test_conflict(),
+            &resolved_supplements,
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("retained-resolution analysis: {err:?}"),
+        };
+        assert_eq!(retained.outcome, ConflictOutcome::Complete);
+        let status = retained
+            .resolution_status
+            .expect("supplied receipt stays retained");
+        assert_eq!(status.decision_digest, "c".repeat(64));
+        assert_eq!(status.decided_by, "human-owner");
+        assert_eq!(status.note, "external decision retained with dissent");
+        assert_eq!(
+            retained.positions.len(),
+            2,
+            "a retained receipt never resolves the preserved rivals here"
+        );
+        assert!(
+            retained
+                .invalidation_conditions
+                .iter()
+                .any(|condition| condition.contains("external resolution receipt")),
+            "arrival of an external receipt reopens review: {:?}",
+            retained.invalidation_conditions
+        );
+        let mut malformed = test_supplements();
+        malformed.external_resolution = Some(ExternalResolution {
+            decision_digest: "not-a-digest".to_owned(),
+            decided_by: "human-owner".to_owned(),
+            note: "malformed receipt".to_owned(),
+        });
+        let err = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &test_conflict(),
+            &malformed,
+            &test_policy(),
+        ) {
+            Ok(candidate) => panic!("malformed receipt must fail: {:?}", candidate.outcome),
+            Err(err) => err,
+        };
+        assert!(matches!(err, ConflictAnalysisError::Digest { .. }));
     }
 }
