@@ -38,18 +38,18 @@
 //! validation. There are no placeholder, mock, canned, or pseudo paths:
 //! every branch binds an explicit input field.
 //!
-//! Test coverage note: 36 of 50 numbered 661 work-unit markers execute here;
-//! 38 tests run because two supporting regression tests are not numbered
+//! Test coverage note: 37 of 50 numbered 661 work-unit markers execute here;
+//! 39 tests run because two supporting regression tests are not numbered
 //! work-unit cases.
 //! Executed cases: 661/1, 661/2, 661/3, 661/4, 661/5, 661/6, 661/7, 661/8,
 //! 661/9, 661/10, 661/11, 661/12, 661/13, 661/14, 661/15, 661/16, 661/17,
 //! 661/18, 661/19, 661/20, 661/21, 661/22, 661/23, 661/25, 661/26,
 //! 661/27, 661/28, 661/29, 661/30, 661/31, 661/32, 661/33, 661/34,
-//! 661/40, 661/41, and 661/42. The remaining 14 of 50 are deferred per
+//! 661/40, 661/41, 661/42, and 661/43. The remaining 13 of 50 are deferred per
 //! START.md s1; #965 admission is separate. Deferred: 661/24 (pending
 //! candidate-visible causal receipt design - `ProcedureCandidate` currently
 //! exposes only `candidate_digest`, no typed causal receipt field), 661/35,
-//! 661/36, 661/37, 661/38, 661/39, 661/43, 661/44, 661/45, 661/46, 661/47,
+//! 661/36, 661/37, 661/38, 661/39, 661/44, 661/45, 661/46, 661/47,
 //! 661/48, 661/49, and 661/50.
 
 #![forbid(unsafe_code)]
@@ -3253,6 +3253,84 @@ mod tests {
             ),
             Err(ProcedureError::Bounds { phase, .. }) if phase == "total-bytes"
         ));
+    }
+
+    // WORK_UNIT_CASE: 661/43
+    #[test]
+    fn case_43_set_order_is_deterministic_while_step_order_stays_semantic() {
+        let mut item = test_item();
+        if let eliot_dreamer_contracts::CurationPayload::Procedure(payload) = &mut item.payload {
+            payload.steps = 5;
+        }
+
+        let mut evidence = test_evidence();
+        let mut episode_refs = BTreeSet::new();
+        episode_refs.extend(["e-3", "e-1", "e-2"].map(str::to_owned));
+        evidence.episode_refs = episode_refs.into_iter().collect();
+        let mut verifier_refs = BTreeSet::new();
+        verifier_refs.extend(["verifier-9", "verifier-7"].map(str::to_owned));
+        evidence.verifier_refs = verifier_refs.into_iter().collect();
+        let mut negative_refs = BTreeSet::new();
+        negative_refs.extend(["neg-2", "neg-1"].map(str::to_owned));
+        evidence.negative_refs = negative_refs.into_iter().collect();
+        let mut unknown_refs = BTreeSet::new();
+        unknown_refs.extend(["unk-2", "unk-1"].map(str::to_owned));
+        evidence.unknown_refs = unknown_refs.into_iter().collect();
+
+        let candidate = match propose_procedure(
+            &item,
+            &test_grounded(),
+            &evidence,
+            &test_capability(),
+            &test_existing(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(error) => panic!("ordered set projection must remain admissible: {error:?}"),
+        };
+
+        let expected_ids: Vec<String> = (1..=5).map(|index| format!("step-{index:02}")).collect();
+        let actual_ids: Vec<String> = candidate
+            .steps
+            .iter()
+            .map(|step| step.step_id.clone())
+            .collect();
+        assert_eq!(actual_ids, expected_ids);
+        for (index, step) in candidate.steps.iter().enumerate() {
+            let expected_dependencies = if index == 0 {
+                Vec::new()
+            } else {
+                vec![format!("step-{index:02}")]
+            };
+            assert_eq!(step.dependencies, expected_dependencies);
+        }
+        assert!(is_sorted_unique(&evidence.episode_refs));
+        assert!(is_sorted_unique(&evidence.verifier_refs));
+        assert!(is_sorted_unique(
+            &candidate.transfer.preserved_negative_refs
+        ));
+        assert!(is_sorted_unique(&candidate.transfer.preserved_unknown_refs));
+        assert_eq!(
+            candidate.transfer.preserved_negative_refs,
+            evidence.negative_refs
+        );
+        assert_eq!(
+            candidate.transfer.preserved_unknown_refs,
+            evidence.unknown_refs
+        );
+
+        let replay = match propose_procedure(
+            &item,
+            &test_grounded(),
+            &evidence,
+            &test_capability(),
+            &test_existing(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(error) => panic!("ordered set replay must remain admissible: {error:?}"),
+        };
+        assert_eq!(candidate, replay);
     }
 
     // WORK_UNIT_CASE: 661/17
