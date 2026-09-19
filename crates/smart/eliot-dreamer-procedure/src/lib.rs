@@ -38,7 +38,7 @@
 //! validation. There are no placeholder, mock, canned, or pseudo paths:
 //! every branch binds an explicit input field.
 //!
-//! Test coverage note: 17 of 50 `WORK_UNIT_CASE 661/*` cases execute here
+//! Test coverage note: 19 of 50 `WORK_UNIT_CASE 661/*` cases execute here
 //! (661/1 valid completes, 661/2 exact vocabulary, 661/3 wrong subtype fails
 //! closed, 661/4 bundle mismatch fails closed, 661/5
 //! duplicate identity disposition, 661/6 success and failure evidence,
@@ -46,11 +46,13 @@
 //! success, 661/9 empirical unknown mechanism, 661/10 exact trigger versus
 //! near-match false activation, 661/11 scope/environment/version leakage
 //! blocked, 661/13 valid acyclic graph
-//! completes, 661/17 raw shell rejected, 661/21 valid semantic verifier,
+//! completes, 661/17 raw shell rejected, 661/18 credential and handle
+//! rejected, 661/19 capability present is not authority,
+//! 661/21 valid semantic verifier,
 //! 661/22 missing verifier blocks completeness,
 //! 661/25 exact idempotent replay, 661/26 unknown-effect blocks retry). The
-//! remaining 33 of 50 are deferred per START.md s1; #965 admission is
-//! separate. Deferred: 661/12, 661/14, 661/15, 661/16, 661/18, 661/19, 661/20,
+//! remaining 31 of 50 are deferred per START.md s1; #965 admission is
+//! separate. Deferred: 661/12, 661/14, 661/15, 661/16, 661/20,
 //! 661/23, 661/24, 661/27, 661/28, 661/29, 661/30, 661/31,
 //! 661/32, 661/33, 661/34, 661/35, 661/36, 661/37, 661/38, 661/39, 661/40,
 //! 661/41, 661/42, 661/43, 661/44, 661/45, 661/46, 661/47, 661/48, 661/49,
@@ -3258,5 +3260,90 @@ mod tests {
             assert_eq!(disposition.kind, StepDispositionKind::MissingVerifier);
         }
         assert_eq!(candidate.transfer.target_env_id, "env-1");
+    }
+
+    // WORK_UNIT_CASE: 661/18
+    #[test]
+    fn case_18_credential_permit_lease_handle_rejected_without_execution() {
+        let grounded = test_grounded();
+        let evidence = test_evidence();
+        let capability = test_capability();
+        let existing = test_existing();
+        let policy = test_policy();
+        let handles = [
+            "api_key rotate",
+            "secret rotate",
+            "bearer token rotate",
+            "lease acquire rotate",
+            "permit acquire rotate",
+            "process handle rotate",
+        ];
+        for handle in handles {
+            let mut item = test_item();
+            if let eliot_dreamer_contracts::CurationPayload::Procedure(payload) = &mut item.payload
+            {
+                payload.procedure = handle.to_owned();
+            }
+            let err = match propose_procedure(
+                &item,
+                &grounded,
+                &evidence,
+                &capability,
+                &existing,
+                &policy,
+            ) {
+                Ok(candidate) => panic!("credential handle must fail: {:?}", candidate.outcome),
+                Err(err) => err,
+            };
+            assert!(
+                matches!(&err, ProcedureError::Shape { field, .. } if field == "step.operation"),
+                "handle {handle} must fail as step.operation, got {err:?}"
+            );
+        }
+    }
+
+    // WORK_UNIT_CASE: 661/19
+    #[test]
+    fn case_19_capability_present_is_not_execution_authority() {
+        let item = test_item();
+        let grounded = test_grounded();
+        let evidence = test_evidence();
+        let capability = test_capability();
+        let existing = test_existing();
+        let policy = test_policy();
+        let candidate =
+            match propose_procedure(&item, &grounded, &evidence, &capability, &existing, &policy) {
+                Ok(candidate) => candidate,
+                Err(err) => panic!("capability-present request: {err:?}"),
+            };
+        assert_eq!(candidate.outcome, ProcedureOutcome::Complete);
+        assert_eq!(candidate.note, PROCEDURE_PROOF_NOTE);
+        assert!(candidate.note.contains("without"));
+        assert!(candidate.note.contains("authority"));
+        assert!(candidate.transfer.reground_note.contains("re-grounds"));
+        assert_eq!(candidate.transfer.target_env_id, "env-1");
+        assert_eq!(candidate.transfer.target_scope_id, "scope-1");
+        for step in &candidate.steps {
+            assert_ne!(step.effect, EffectClass::Unknown);
+            assert!(!step.owner.trim().is_empty());
+            assert!(!step.rollback_note.trim().is_empty());
+        }
+        let mut extended = test_capability();
+        extended.capability_refs = vec!["cap-1".to_owned(), "cap-2".to_owned()];
+        extended.version_pins = vec!["cap-1@v3".to_owned(), "cap-2@v1".to_owned()];
+        let widened =
+            match propose_procedure(&item, &grounded, &evidence, &extended, &existing, &policy) {
+                Ok(candidate) => candidate,
+                Err(err) => panic!("extended capability stays inert: {err:?}"),
+            };
+        assert_eq!(widened.outcome, ProcedureOutcome::Complete);
+        assert_eq!(widened.note, PROCEDURE_PROOF_NOTE);
+        assert!(widened.transfer.reground_note.contains("re-grounds"));
+        assert_eq!(
+            widened.transfer.preserved_version_pins,
+            vec!["cap-1@v3".to_owned(), "cap-2@v1".to_owned()]
+        );
+        assert_eq!(widened.transfer.target_env_id, "env-1");
+        assert_eq!(widened.transfer.target_scope_id, "scope-1");
     }
 }
