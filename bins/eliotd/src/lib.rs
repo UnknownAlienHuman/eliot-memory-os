@@ -486,14 +486,27 @@ impl DaemonComposition {
                         now.max(1),
                     );
                 }
-                activation_projection::map_governor_outcome_to_protocol(
+                match activation_projection::map_governor_outcome_to_protocol(
                     ticket,
                     GovernorActivationOutcome::Resolved(snapshot),
                     now.max(1),
-                )
+                ) {
+                    Ok(result) => Ok(result),
+                    Err(error) => {
+                        failed_internal_or_mapping_error(ticket, "RESOLVED", now.max(1), error)
+                    }
+                }
             }
             outcome => {
-                activation_projection::map_governor_outcome_to_protocol(ticket, outcome, now.max(1))
+                let kind = outcome.kind_str();
+                match activation_projection::map_governor_outcome_to_protocol(
+                    ticket,
+                    outcome,
+                    now.max(1),
+                ) {
+                    Ok(result) => Ok(result),
+                    Err(error) => failed_internal_or_mapping_error(ticket, kind, now.max(1), error),
+                }
             }
         };
         match &outcome {
@@ -911,6 +924,36 @@ impl DaemonComposition {
 
 fn activation_deadline_expired(now: u64, deadline: u64) -> bool {
     now >= deadline
+}
+
+/// Falls back to a typed `FailedInternal` terminal result when the
+/// Governor→protocol mapping rejects a classified outcome (#202).
+///
+/// A mapping rejection means the Governor classified the ticket but the data
+/// cannot bind it (e.g. a `NotReady` window at or past the Kernel deadline).
+/// Killing the daemon loop would leave the ticket unanswered; answering with
+/// `FailedInternal` keeps the failure terminal for the ticket revision and
+/// the daemon alive for the next claim. The original mapping error is
+/// preserved as diagnostics evidence when the fallback binds. If the fallback
+/// itself cannot bind, the original mapping error returns unchanged: fail
+/// closed, never silence.
+fn failed_internal_or_mapping_error(
+    ticket: &AgentActivationResolutionTicket,
+    outcome_kind: &str,
+    resolved_at_unix_ms: u64,
+    error: DaemonError,
+) -> Result<AgentActivationResolutionResult, DaemonError> {
+    match activation_projection::failed_internal_for_mapping_failure(
+        ticket,
+        outcome_kind,
+        resolved_at_unix_ms,
+    ) {
+        Ok(result) => {
+            let _ = crate::diagnostics::ErrorRecord::of_daemon_error(&error).emit();
+            Ok(result)
+        }
+        Err(_) => Err(error),
+    }
 }
 
 impl AgentActivationResolver for DaemonComposition {
