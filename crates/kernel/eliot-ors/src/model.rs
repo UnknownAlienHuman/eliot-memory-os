@@ -2231,8 +2231,10 @@ pub enum ActivationResultRetentionPhase {
 ///
 /// ORS validates identity shape and bounds only. It does not deserialize either
 /// payload, create a Session, or restore authority, transport, or connection
-/// state. `order` is assigned by the ORS write transaction when a new record is
-/// retained; zero is therefore valid only before persistence.
+/// state. `connection_id` and `state_fence` are retained as opaque identity
+/// evidence; they are never restored as live connection or authority state.
+/// `retention_order` is assigned by the ORS write transaction when a new record
+/// is retained; zero is therefore valid only before persistence.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ActivationResultRetentionRecord {
@@ -2241,9 +2243,11 @@ pub struct ActivationResultRetentionRecord {
     pub ticket_payload: String,
     pub result_sha256: String,
     pub result_payload: String,
+    pub connection_id: String,
+    pub state_fence: String,
     pub phase: ActivationResultRetentionPhase,
     #[serde(default)]
-    pub order: u64,
+    pub retention_order: u64,
 }
 
 impl ActivationResultRetentionRecord {
@@ -2252,6 +2256,8 @@ impl ActivationResultRetentionRecord {
         validate_text(&self.ticket_id, "activation_result_ticket_id")?;
         validate_digest(&self.ticket_sha256, "activation_result_ticket_sha256")?;
         validate_digest(&self.result_sha256, "activation_result_result_sha256")?;
+        validate_text(&self.connection_id, "activation_result_connection_id")?;
+        validate_text(&self.state_fence, "activation_result_state_fence")?;
         if self.payload_bytes() > MAX_ACTIVATION_RESULT_PAYLOAD_BYTES {
             return Err(OrsError::InvalidField {
                 field: "activation_result_payload",
@@ -2283,6 +2289,8 @@ impl ActivationResultRetentionRecord {
             && self.ticket_payload == other.ticket_payload
             && self.result_sha256 == other.result_sha256
             && self.result_payload == other.result_payload
+            && self.connection_id == other.connection_id
+            && self.state_fence == other.state_fence
             && self.phase == other.phase
     }
 }

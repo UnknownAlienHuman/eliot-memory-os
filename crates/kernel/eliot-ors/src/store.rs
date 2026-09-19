@@ -403,14 +403,8 @@ pub trait OperationalRecoveryStore: Send + Sync {
         &self,
         record: &ActivationResultRetentionRecord,
     ) -> Result<ActivationResultRetentionRecord, OrsError>;
-    /// Loads one retained activation result by exact ticket identity.
+    /// Loads one retained activation result by exact ticket and result identity.
     fn load_activation_result(
-        &self,
-        ticket_id: &str,
-    ) -> Result<Option<ActivationResultRetentionRecord>, OrsError>;
-    /// Reads one retained activation result only when its result digest binds
-    /// exactly to the retained ticket.
-    fn readback_activation_result(
         &self,
         ticket_id: &str,
         result_sha256: &str,
@@ -577,10 +571,10 @@ impl persistence_codec::PersistedValue for ActivationResultRetentionRecord {
 
     fn validate_persisted(&self) -> Result<(), OrsError> {
         self.validate()?;
-        if self.order == 0 {
+        if self.retention_order == 0 {
             return Err(OrsError::IntegrityProblem {
                 record_type: Self::RECORD_TYPE,
-                reason: "retained activation result has no ORS order".to_owned(),
+                reason: "retained activation result has no ORS retention order".to_owned(),
             });
         }
         Ok(())
@@ -1498,7 +1492,7 @@ impl RedbRecoveryStore {
         }
 
         let mut next = record.clone();
-        next.order = Self::next_operational_order(&write)?;
+        next.retention_order = Self::next_operational_order(&write)?;
         next.validate()?;
         let payload = encode(&next)?;
         {
@@ -1514,33 +1508,23 @@ impl RedbRecoveryStore {
         Ok(next)
     }
 
-    /// Loads one retained activation result by exact ticket identity.
+    /// Loads one retained activation result by exact ticket and result identity.
     pub fn load_activation_result(
-        &self,
-        ticket_id: &str,
-    ) -> Result<Option<ActivationResultRetentionRecord>, OrsError> {
-        crate::model::validate_text(ticket_id, "activation_result_ticket_id")?;
-        let read = self.database.begin_read().map_err(storage)?;
-        let table = read
-            .open_table(ACTIVATION_RESULT_RETENTION)
-            .map_err(storage)?;
-        table
-            .get(ticket_id)
-            .map_err(storage)?
-            .map(|value| decode(value.value()))
-            .transpose()
-    }
-
-    /// Reads one retained result only when the caller presents the exact
-    /// result digest bound to that ticket.
-    pub fn readback_activation_result(
         &self,
         ticket_id: &str,
         result_sha256: &str,
     ) -> Result<Option<ActivationResultRetentionRecord>, OrsError> {
         crate::model::validate_text(ticket_id, "activation_result_ticket_id")?;
         crate::model::validate_digest(result_sha256, "activation_result_result_sha256")?;
-        let retained = self.load_activation_result(ticket_id)?;
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read
+            .open_table(ACTIVATION_RESULT_RETENTION)
+            .map_err(storage)?;
+        let retained: Option<ActivationResultRetentionRecord> = table
+            .get(ticket_id)
+            .map_err(storage)?
+            .map(|value| decode(value.value()))
+            .transpose()?;
         let Some(retained) = retained else {
             return Ok(None);
         };
@@ -1580,9 +1564,9 @@ impl RedbRecoveryStore {
             }
             rows
         };
-        rows.sort_by_key(|(_, record)| record.order);
+        rows.sort_by_key(|(_, record)| record.retention_order);
         for pair in rows.windows(2) {
-            if pair[0].1.order == pair[1].1.order {
+            if pair[0].1.retention_order == pair[1].1.retention_order {
                 return Err(OrsError::IntegrityProblem {
                     record_type: "activation_result_retention",
                     reason: "retention order is not unique".to_owned(),
@@ -4628,7 +4612,7 @@ impl RedbRecoveryStore {
             }
             rows.push(record);
         }
-        rows.sort_by_key(|record| record.order);
+        rows.sort_by_key(|record| record.retention_order);
         if rows.len() > crate::MAX_ACTIVATION_RESULT_RETENTION_RECORDS {
             return Err(OrsError::IntegrityProblem {
                 record_type: "activation_result_retention",
@@ -4636,7 +4620,7 @@ impl RedbRecoveryStore {
             });
         }
         for pair in rows.windows(2) {
-            if pair[0].order == pair[1].order {
+            if pair[0].retention_order == pair[1].retention_order {
                 return Err(OrsError::IntegrityProblem {
                     record_type: "activation_result_retention",
                     reason: "retention order is not unique".to_owned(),
@@ -6808,16 +6792,9 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
     fn load_activation_result(
         &self,
         ticket_id: &str,
-    ) -> Result<Option<ActivationResultRetentionRecord>, OrsError> {
-        RedbRecoveryStore::load_activation_result(self, ticket_id)
-    }
-
-    fn readback_activation_result(
-        &self,
-        ticket_id: &str,
         result_sha256: &str,
     ) -> Result<Option<ActivationResultRetentionRecord>, OrsError> {
-        RedbRecoveryStore::readback_activation_result(self, ticket_id, result_sha256)
+        RedbRecoveryStore::load_activation_result(self, ticket_id, result_sha256)
     }
 
     fn prune_activation_results(&self) -> Result<u64, OrsError> {
@@ -7123,22 +7100,13 @@ impl<S: OperationalRecoveryStore> OrsCoordinator<S> {
         self.store.retain_activation_result(record)
     }
 
-    /// Loads one retained activation result by ticket identity.
+    /// Loads one retained activation result by exact ticket and result identity.
     pub fn load_activation_result(
-        &self,
-        ticket_id: &str,
-    ) -> Result<Option<ActivationResultRetentionRecord>, OrsError> {
-        self.store.load_activation_result(ticket_id)
-    }
-
-    /// Reads one retained activation result by ticket and result digest.
-    pub fn readback_activation_result(
         &self,
         ticket_id: &str,
         result_sha256: &str,
     ) -> Result<Option<ActivationResultRetentionRecord>, OrsError> {
-        self.store
-            .readback_activation_result(ticket_id, result_sha256)
+        self.store.load_activation_result(ticket_id, result_sha256)
     }
 
     /// Prunes oldest activation results under the hard retention bounds.

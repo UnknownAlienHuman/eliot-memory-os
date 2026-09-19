@@ -170,8 +170,10 @@ fn activation_result_record(
         ticket_payload: ticket_payload.to_owned(),
         result_sha256: result_sha256.to_owned(),
         result_payload: result_payload.to_owned(),
+        connection_id: "connection-1".to_owned(),
+        state_fence: "state-fence-1".to_owned(),
         phase,
-        order: 0,
+        retention_order: 0,
     }
 }
 
@@ -187,18 +189,26 @@ fn activation_result_retention_round_trips_replays_conflicts_and_reopens() -> Te
         ActivationResultRetentionPhase::AcceptedTerminal,
     );
     let retained = store.retain_activation_result(&record)?;
-    assert!(retained.order > 0);
+    assert!(retained.retention_order > 0);
     assert_eq!(store.retain_activation_result(&record)?, retained);
+    let mut changed_connection = record.clone();
+    changed_connection.connection_id = "connection-2".to_owned();
+    assert!(matches!(
+        store.retain_activation_result(&changed_connection),
+        Err(OrsError::ActivationResultRetentionIdentityConflict { .. })
+    ));
+    let mut changed_fence = record.clone();
+    changed_fence.state_fence = "state-fence-2".to_owned();
+    assert!(matches!(
+        store.retain_activation_result(&changed_fence),
+        Err(OrsError::ActivationResultRetentionIdentityConflict { .. })
+    ));
     assert_eq!(
-        store.load_activation_result("ticket-1")?,
-        Some(retained.clone())
-    );
-    assert_eq!(
-        store.readback_activation_result("ticket-1", &"b".repeat(64))?,
+        store.load_activation_result("ticket-1", &"b".repeat(64))?,
         Some(retained.clone())
     );
     assert!(matches!(
-        store.readback_activation_result("ticket-1", &"c".repeat(64)),
+        store.load_activation_result("ticket-1", &"c".repeat(64)),
         Err(OrsError::ActivationResultRetentionIdentityConflict { .. })
     ));
 
@@ -211,12 +221,54 @@ fn activation_result_retention_round_trips_replays_conflicts_and_reopens() -> Te
     drop(store);
 
     let reopened = RedbRecoveryStore::open(&path)?;
-    assert_eq!(reopened.load_activation_result("ticket-1")?, Some(retained));
-    assert!(
-        reopened
-            .readback_activation_result("ticket-1", &"b".repeat(64))?
-            .is_some()
+    assert_eq!(
+        reopened.load_activation_result("ticket-1", &"b".repeat(64))?,
+        Some(retained)
     );
+    cleanup(&path);
+    Ok(())
+}
+
+#[test]
+fn activation_result_retention_defaults_unpersisted_order_but_rejects_zero_persisted_order()
+-> TestResult {
+    let record = activation_result_record(
+        "ticket-default-order",
+        &"b".repeat(64),
+        "opaque-ticket-payload",
+        "opaque-result-payload",
+        ActivationResultRetentionPhase::AcceptedTerminal,
+    );
+    let mut serialized = serde_json::to_value(&record)?;
+    let object = serialized
+        .as_object_mut()
+        .ok_or_else(|| std::io::Error::other("retention record is not an object"))?;
+    object.remove("retention_order");
+    let restored: ActivationResultRetentionRecord = serde_json::from_value(serialized)?;
+    assert_eq!(restored, record);
+
+    let path = database_path("activation-result-retention-zero-order");
+    let store = RedbRecoveryStore::open(&path)?;
+    drop(store);
+    let database = redb::Database::create(&path)?;
+    let write = database.begin_write()?;
+    let table_definition: redb::TableDefinition<&str, &str> =
+        redb::TableDefinition::new("ors_agent_activation_results_v1");
+    let mut table = write.open_table(table_definition)?;
+    let mut persisted = serde_json::to_value(&record)?;
+    persisted["retention_order"] = json!(0);
+    table.insert(
+        "ticket-default-order",
+        serde_json::to_string(&persisted)?.as_str(),
+    )?;
+    drop(table);
+    write.commit()?;
+    drop(database);
+
+    assert!(matches!(
+        RedbRecoveryStore::open(&path),
+        Err(OrsError::IntegrityProblem { .. })
+    ));
     cleanup(&path);
     Ok(())
 }
@@ -261,16 +313,30 @@ fn activation_result_retention_prunes_count_and_payload_bounds() -> TestResult {
         store.retain_activation_result(&record)?;
     }
     assert!(
-        store.load_activation_result("ticket-0")?.is_none(),
+        store
+            .load_activation_result("ticket-0", &format!("{0:064x}", 0))?
+            .is_none(),
         "oldest record must be pruned"
     );
-    assert!(store.load_activation_result("ticket-64")?.is_some());
+    assert!(
+        store
+            .load_activation_result("ticket-64", &format!("{:064x}", 64))?
+            .is_some()
+    );
     assert_eq!(store.prune_activation_results()?, 0);
     drop(store);
 
     let reopened = RedbRecoveryStore::open(&path)?;
-    assert!(reopened.load_activation_result("ticket-0")?.is_none());
-    assert!(reopened.load_activation_result("ticket-64")?.is_some());
+    assert!(
+        reopened
+            .load_activation_result("ticket-0", &format!("{:064x}", 0))?
+            .is_none()
+    );
+    assert!(
+        reopened
+            .load_activation_result("ticket-64", &format!("{:064x}", 64))?
+            .is_some()
+    );
     cleanup(&path);
     Ok(())
 }
