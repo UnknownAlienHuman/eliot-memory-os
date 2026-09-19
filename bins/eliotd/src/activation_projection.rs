@@ -222,6 +222,30 @@ pub fn stale_fence_for_resolved_mismatch(
         .map_err(|error| DaemonError::Lifecycle(error.to_string()))
 }
 
+/// Typed fail-closed result when the Governor is not ready to classify the
+/// exact ticket (#204).
+///
+/// The ticket is already validated at this point, but no Governor outcome
+/// exists to map: returning a hard error would kill the daemon loop and leave
+/// the claimed ticket unanswered, so the bridge waiter would observe a
+/// result-less expiry (a timeout-like outcome) instead of the distinct
+/// internal failure. Answer with a `FailedInternal` terminal result instead,
+/// so the Kernel records a typed disposition that stays distinct from every
+/// other negative and from the deadline outcome, and the daemon stays alive
+/// for the next claim. Never produces a binding and never retries the ticket.
+/// If the fallback itself cannot bind (e.g. the deadline passed under the
+/// resolver), the caller keeps the original readiness error unchanged.
+pub fn failed_internal_for_unready_governor(
+    ticket: &AgentActivationResolutionTicket,
+    resolved_at_unix_ms: u64,
+) -> Result<AgentActivationResolutionResult, DaemonError> {
+    let disposition = AgentActivationResolutionDisposition::FailedInternal {
+        failure_handle: "daemon.governor-not-ready:recovery".to_owned(),
+    };
+    AgentActivationResolutionResult::new(ticket, resolved_at_unix_ms, disposition)
+        .map_err(|error| DaemonError::Lifecycle(error.to_string()))
+}
+
 /// Typed fail-closed result when the Governor→protocol mapping rejects a
 /// classified outcome for the exact ticket (#202).
 ///
@@ -591,5 +615,37 @@ mod projection_tests {
         }
         assert!(result.resolved_binding().is_none());
         result.validate_against(&ticket).expect("valid binding");
+    }
+
+    #[test]
+    fn unready_governor_yields_typed_failed_internal_without_binding() {
+        // #204: an unready Governor answers the exact valid ticket with a
+        // typed FailedInternal terminal result instead of a hard loop-fatal
+        // error: distinct from every other negative, never transient, and
+        // never a binding.
+        let ticket = test_ticket(100);
+        let result =
+            failed_internal_for_unready_governor(&ticket, 50).expect("unready fallback result");
+        match &result.disposition {
+            AgentActivationResolutionDisposition::FailedInternal { failure_handle } => {
+                assert!(failure_handle.contains("governor-not-ready"));
+            }
+            _ => panic!("expected FailedInternal"),
+        }
+        assert!(result.resolved_binding().is_none());
+        assert!(!result.is_transient_retry());
+        assert_eq!(result.ticket_id, ticket.ticket_id);
+        result.validate_against(&ticket).expect("valid binding");
+    }
+
+    #[test]
+    fn unready_governor_fallback_at_deadline_fails_closed() {
+        // #204: the fallback never fabricates a result past the Kernel
+        // deadline; a ticket that expired under the resolver stays an error.
+        let ticket = test_ticket(100);
+        assert!(
+            failed_internal_for_unready_governor(&ticket, 100).is_err(),
+            "resolved_at at the deadline must not bind"
+        );
     }
 }

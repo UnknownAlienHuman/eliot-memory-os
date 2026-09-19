@@ -463,9 +463,27 @@ impl DaemonComposition {
             .validate()
             .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
         if self.readiness() != CompositionReadiness::Ready {
-            return Err(DaemonError::Lifecycle(
+            // #204: an unready Governor is an internal failure for this exact
+            // ticket, not a loop-fatal error. Answer with a typed
+            // FailedInternal terminal result so the Kernel records a
+            // disposition that stays distinct from every other negative and
+            // from the result-less deadline outcome, and the daemon stays
+            // alive for the next claim. The ticket is already validated
+            // above, so the fallback binds; if it cannot bind, the original
+            // readiness error returns unchanged: fail closed, never silence.
+            let unready = DaemonError::Lifecycle(
                 "semantic activation resolution requires a ready Governor".to_owned(),
-            ));
+            );
+            return match activation_projection::failed_internal_for_unready_governor(
+                ticket,
+                now.max(1),
+            ) {
+                Ok(result) => {
+                    let _ = crate::diagnostics::ErrorRecord::of_daemon_error(&unready).emit();
+                    Ok(result)
+                }
+                Err(_) => Err(unready),
+            };
         }
         if activation_deadline_expired(now, ticket.kernel_deadline_unix_ms) {
             return Err(DaemonError::Lifecycle(
