@@ -38,7 +38,7 @@
 //! validation. There are no placeholder, mock, canned, or pseudo paths:
 //! every branch binds an explicit input field.
 //!
-//! Test coverage note: 21 of 50 `WORK_UNIT_CASE 661/*` cases execute here
+//! Test coverage note: 22 of 50 `WORK_UNIT_CASE 661/*` cases execute here
 //! (661/1 valid completes, 661/2 exact vocabulary, 661/3 wrong subtype fails
 //! closed, 661/4 bundle mismatch fails closed, 661/5
 //! duplicate identity disposition, 661/6 success and failure evidence,
@@ -50,11 +50,12 @@
 //! completes, 661/14 missing predecessor/cycle/unbounded/fan-out rejected,
 //! 661/17 raw shell rejected, 661/18 credential and handle
 //! rejected, 661/19 capability present is not authority,
+//! 661/20 missing or unknown capability fails closed,
 //! 661/21 valid semantic verifier,
 //! 661/22 missing verifier blocks completeness,
 //! 661/25 exact idempotent replay, 661/26 unknown-effect blocks retry). The
-//! remaining 29 of 50 are deferred per START.md s1; #965 admission is
-//! separate. Deferred: 661/15, 661/16, 661/20,
+//! remaining 28 of 50 are deferred per START.md s1; #965 admission is
+//! separate. Deferred: 661/15, 661/16,
 //! 661/23, 661/24, 661/27, 661/28, 661/29, 661/30, 661/31,
 //! 661/32, 661/33, 661/34, 661/35, 661/36, 661/37, 661/38, 661/39, 661/40,
 //! 661/41, 661/42, 661/43, 661/44, 661/45, 661/46, 661/47, 661/48, 661/49,
@@ -1046,6 +1047,12 @@ fn validate_evidence_shapes(evidence: &ProcedureEvidence) -> Result<(), Procedur
 /// Validates capability snapshot text shapes and ref orderings.
 fn validate_capability_shapes(capability: &CapabilityEnvSnapshot) -> Result<(), ProcedureError> {
     check_sorted_refs(&capability.capability_refs, "capability.refs")?;
+    if capability.capability_refs.is_empty() {
+        return Err(ProcedureError::Shape {
+            field: "capability.refs".to_owned(),
+            detail: "missing or unknown capability availability is not admitted".to_owned(),
+        });
+    }
     check_handle(&capability.env_id, "capability.env")?;
     check_bounded_text(
         &capability.env_revision,
@@ -3347,6 +3354,35 @@ mod tests {
         );
         assert_eq!(widened.transfer.target_env_id, "env-1");
         assert_eq!(widened.transfer.target_scope_id, "scope-1");
+    }
+
+    // WORK_UNIT_CASE: 661/20
+    #[test]
+    fn case_20_missing_capability_stays_fail_closed() {
+        let item = test_item();
+        let grounded = test_grounded();
+        let evidence = test_evidence();
+        let mut missing = test_capability();
+        missing.capability_refs.clear();
+        missing.capability_note = "capability availability is unknown".to_owned();
+        let existing = test_existing();
+        let policy = test_policy();
+
+        let error =
+            match propose_procedure(&item, &grounded, &evidence, &missing, &existing, &policy) {
+                Ok(candidate) => panic!(
+                    "missing or unknown capability must not complete: {:?}",
+                    candidate.outcome
+                ),
+                Err(error) => error,
+            };
+        assert!(
+            matches!(
+                error,
+                ProcedureError::Shape { ref field, .. } if field == "capability.refs"
+            ),
+            "missing capability must fail closed at the capability boundary: {error:?}"
+        );
     }
 
     /// Proposes with shared fixtures and returns the rejection.
