@@ -38,14 +38,15 @@
 //! validation. There are no placeholder, mock, canned, or pseudo paths:
 //! every branch binds an explicit input field.
 //!
-//! Test coverage note: 6 of 50 `WORK_UNIT_CASE 661/*` cases execute here
-//! (661/1 valid completes, 661/4 bundle mismatch fails closed, 661/5
+//! Test coverage note: 9 of 50 `WORK_UNIT_CASE 661/*` cases execute here
+//! (661/1 valid completes, 661/2 exact vocabulary, 661/3 wrong subtype fails
+//! closed, 661/4 bundle mismatch fails closed, 661/5
 //! duplicate identity disposition, 661/13 valid acyclic graph completes,
-//! 661/17 raw shell rejected, 661/26 unknown-effect blocks retry). The
-//! remaining 44 of 50 are deferred per START.md s1; #965 admission is
-//! separate. Deferred: 661/2, 661/3, 661/6, 661/7, 661/8, 661/9, 661/10,
+//! 661/17 raw shell rejected, 661/25 exact idempotent replay, 661/26 unknown-effect blocks retry). The
+//! remaining 41 of 50 are deferred per START.md s1; #965 admission is
+//! separate. Deferred: 661/6, 661/7, 661/8, 661/9, 661/10,
 //! 661/11, 661/12, 661/14, 661/15, 661/16, 661/18, 661/19, 661/20, 661/21,
-//! 661/22, 661/23, 661/24, 661/25, 661/27, 661/28, 661/29, 661/30, 661/31,
+//! 661/22, 661/23, 661/24, 661/27, 661/28, 661/29, 661/30, 661/31,
 //! 661/32, 661/33, 661/34, 661/35, 661/36, 661/37, 661/38, 661/39, 661/40,
 //! 661/41, 661/42, 661/43, 661/44, 661/45, 661/46, 661/47, 661/48, 661/49,
 //! 661/50.
@@ -2500,6 +2501,123 @@ mod tests {
         assert_eq!(outcome_rejection_hint(&candidate.outcome), None);
     }
 
+    // WORK_UNIT_CASE: 661/2
+    #[test]
+    fn case_02_exact_trigger_step_operation_failure_retry_transfer_vocabulary() {
+        let effects = [
+            (EffectClass::ReadOnly, "read_only"),
+            (EffectClass::OwnerDirected, "owner_directed"),
+            (EffectClass::Compensatable, "compensatable"),
+            (EffectClass::Unknown, "unknown"),
+        ];
+        for (effect, spelling) in effects {
+            assert_eq!(effect.as_str(), spelling);
+            assert_eq!(EffectClass::parse(spelling), Ok(effect));
+        }
+        assert!(matches!(
+            EffectClass::parse("execute_anything"),
+            Err(ProcedureError::Shape { field, .. }) if field == "step.effect"
+        ));
+        let outcomes = [
+            (ProcedureOutcome::Complete, "complete"),
+            (ProcedureOutcome::Partial, "partial"),
+            (ProcedureOutcome::Duplicate, "duplicate"),
+            (ProcedureOutcome::Refinement, "refinement"),
+            (ProcedureOutcome::Conflict, "conflict"),
+            (ProcedureOutcome::Empirical, "empirical"),
+            (ProcedureOutcome::MissingVerifier, "missing_verifier"),
+            (ProcedureOutcome::Unsafe, "unsafe"),
+            (
+                ProcedureOutcome::BlockedUnknownEffect,
+                "blocked_unknown_effect",
+            ),
+            (ProcedureOutcome::Stale, "stale"),
+            (ProcedureOutcome::Rejected, "rejected"),
+        ];
+        let mut outcome_spellings: Vec<String> = Vec::with_capacity(outcomes.len());
+        for (outcome, spelling) in outcomes {
+            assert_eq!(outcome.as_str(), spelling);
+            outcome_spellings.push(spelling.to_owned());
+        }
+        outcome_spellings.sort();
+        assert!(is_sorted_unique(&outcome_spellings));
+        let dispositions = [
+            (StepDispositionKind::Grounded, "grounded"),
+            (StepDispositionKind::Refinement, "refinement"),
+            (StepDispositionKind::Conflict, "conflict"),
+            (StepDispositionKind::Empirical, "empirical"),
+            (StepDispositionKind::MissingVerifier, "missing_verifier"),
+            (StepDispositionKind::Unsafe, "unsafe"),
+            (
+                StepDispositionKind::BlockedUnknownEffect,
+                "blocked_unknown_effect",
+            ),
+            (
+                StepDispositionKind::UnchangedWithEvidence,
+                "unchanged_with_evidence",
+            ),
+        ];
+        let mut disposition_spellings: Vec<String> = Vec::with_capacity(dispositions.len());
+        for (kind, spelling) in dispositions {
+            assert_eq!(kind.as_str(), spelling);
+            disposition_spellings.push(spelling.to_owned());
+        }
+        disposition_spellings.sort();
+        assert!(is_sorted_unique(&disposition_spellings));
+    }
+
+    // WORK_UNIT_CASE: 661/3
+    #[test]
+    fn case_03_wrong_curation_subtype_fails_closed_without_effect() {
+        let grounded = test_grounded();
+        let evidence = test_evidence();
+        let capability = test_capability();
+        let existing = test_existing();
+        let policy = test_policy();
+        let mut concept_item = test_item();
+        concept_item.kind_spelling = "concept".to_owned();
+        concept_item.family_spelling = "concept".to_owned();
+        concept_item.payload = eliot_dreamer_contracts::CurationPayload::Concept(
+            eliot_dreamer_contracts::curation::ConceptPayload {
+                concept: "caption-style".to_owned(),
+                definition: "short caption state dependency".to_owned(),
+                target_evidence: TargetEvidence {
+                    targets: vec!["mem-1".to_owned()],
+                    evidence_refs: vec!["e-1".to_owned()],
+                },
+            },
+        );
+        let err = match propose_procedure(
+            &concept_item,
+            &grounded,
+            &evidence,
+            &capability,
+            &existing,
+            &policy,
+        ) {
+            Ok(candidate) => panic!("concept payload must fail: {:?}", candidate.outcome),
+            Err(err) => err,
+        };
+        assert!(matches!(
+            err,
+            ProcedureError::Shape { field, .. } if field == "procedure.handle"
+        ));
+        let mut drifted_kind = test_item();
+        drifted_kind.kind_spelling = "concept".to_owned();
+        let err = match propose_procedure(
+            &drifted_kind,
+            &grounded,
+            &evidence,
+            &capability,
+            &existing,
+            &policy,
+        ) {
+            Ok(candidate) => panic!("kind drift must fail: {:?}", candidate.outcome),
+            Err(err) => err,
+        };
+        assert!(matches!(err, ProcedureError::Receipt { .. }));
+    }
+
     // WORK_UNIT_CASE: 661/4
     #[test]
     fn case_04_bundle_mismatch_fails_closed_without_effect() {
@@ -2627,6 +2745,44 @@ mod tests {
             Err(err) => err,
         };
         assert!(matches!(err, ProcedureError::Shape { field, .. } if field == "step.operation"));
+    }
+
+    // WORK_UNIT_CASE: 661/25
+    #[test]
+    fn case_25_exact_idempotent_replay_binds_policy_revision() {
+        let item = test_item();
+        let grounded = test_grounded();
+        let evidence = test_evidence();
+        let capability = test_capability();
+        let existing = test_existing();
+        let policy = test_policy();
+        let first =
+            match propose_procedure(&item, &grounded, &evidence, &capability, &existing, &policy) {
+                Ok(candidate) => candidate,
+                Err(err) => panic!("first replay: {err:?}"),
+            };
+        let second =
+            match propose_procedure(&item, &grounded, &evidence, &capability, &existing, &policy) {
+                Ok(candidate) => candidate,
+                Err(err) => panic!("second replay: {err:?}"),
+            };
+        assert_eq!(first, second);
+        assert_eq!(first.candidate_digest, second.candidate_digest);
+        let mut reved_policy = test_policy();
+        reved_policy.policy_revision = 3;
+        let reved = match propose_procedure(
+            &item,
+            &grounded,
+            &evidence,
+            &capability,
+            &existing,
+            &reved_policy,
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("reved replay: {err:?}"),
+        };
+        assert_eq!(reved.outcome, ProcedureOutcome::Complete);
+        assert_ne!(reved.candidate_digest, first.candidate_digest);
     }
 
     // WORK_UNIT_CASE: 661/26
