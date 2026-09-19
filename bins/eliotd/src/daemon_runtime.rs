@@ -546,6 +546,25 @@ async fn run_loop(
                             flight = ActivationFlight::Idle;
                             continue;
                         }
+                        if is_malformed_activation_ticket(&ticket) {
+                            // #202 remainder: a malformed/tampered ticket fails
+                            // closed before Governor access. No typed
+                            // digest-bound result can bind it, so there is no
+                            // disposition to submit or reconcile; drop the
+                            // ticket and stay alive for the next claim instead
+                            // of killing the loop. The ticket is never retried.
+                            let _ = eliotd::diagnostics::ErrorRecord::of(
+                                eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                                "malformed-ticket",
+                                &format!(
+                                    "daemon activation ticket failed validation ticket {}",
+                                    ticket.ticket_id
+                                ),
+                            )
+                            .emit();
+                            flight = ActivationFlight::Idle;
+                            continue;
+                        }
                         // Single v2 resolution per newly admitted ticket.  The v2
                         // resolver maps all seven Governor outcomes to typed
                         // results; any Err is a real validation/readiness failure
@@ -980,6 +999,17 @@ fn unix_ms(now: SystemTime) -> Result<u64, String> {
 
 fn activation_deadline_expired(now: u64, deadline: u64) -> bool {
     now >= deadline
+}
+
+/// Fail-closed gate for malformed/tampered activation tickets (#202 remainder).
+///
+/// A ticket that fails protocol validation cannot bind any typed
+/// digest-bound result (`AgentActivationResolutionResult::new` rejects an
+/// invalid ticket), so there is no disposition to submit or reconcile. The
+/// caller drops the ticket before Governor access and stays alive for the
+/// next claim; the ticket is never retried and the Governor is never read.
+fn is_malformed_activation_ticket(ticket: &AgentActivationResolutionTicket) -> bool {
+    ticket.validate().is_err()
 }
 
 /// Plans one closed T11.1 `GetEvidencePack` read for the daemon query path.
@@ -1712,6 +1742,46 @@ mod tests {
             .expect("one second before Unix epoch must be representable");
         let error = unix_ms(observed).expect_err("pre-epoch clock must fail closed");
         assert!(error.contains("precedes Unix epoch"));
+    }
+
+    fn valid_activation_ticket_for_gate(
+    ) -> Result<AgentActivationResolutionTicket, Box<dyn std::error::Error>> {
+        let epoch = eliot_contracts::EpochId::new(
+            eliot_contracts::EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")?,
+            std::num::NonZeroU64::new(1).ok_or("nonzero test sequence")?,
+        )?;
+        let fence = eliot_contracts::StateFence::new(
+            epoch,
+            eliot_contracts::ResourceGeneration::new(1)?,
+        );
+        eliot_protocol::AgentActivationResolutionTicket {
+            wire_id: eliot_protocol::AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_ID.to_owned(),
+            wire_version: eliot_protocol::AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_VERSION,
+            ticket_id: "ticket-gate-1".to_owned(),
+            activation_request_id: eliot_contracts::RequestId::new("activation-request-1")?,
+            activation_request_sha256: "a".repeat(64),
+            peer_admission_receipt_sha256: "b".repeat(64),
+            connection_id: "connection-1".to_owned(),
+            state_fence: fence,
+            kernel_deadline_unix_ms: 100,
+            ticket_sha256: String::new(),
+        }
+        .with_computed_digest()
+        .map_err(Into::into)
+    }
+
+    #[test]
+    fn malformed_ticket_gate_drops_tampered_ticket_before_governor_access(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // #202 remainder: a valid ticket passes the gate, while a tampered
+        // digest fails it, so the loop drops the ticket before Governor
+        // access instead of killing the loop.
+        let ticket = valid_activation_ticket_for_gate()?;
+        assert!(!is_malformed_activation_ticket(&ticket));
+        let mut tampered = ticket;
+        tampered.ticket_sha256 = "0".repeat(64);
+        assert!(is_malformed_activation_ticket(&tampered));
+        Ok(())
     }
 
     #[test]
