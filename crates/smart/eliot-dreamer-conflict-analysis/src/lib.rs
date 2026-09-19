@@ -39,7 +39,7 @@
 //! validation. There are no placeholder, mock, canned, or pseudo paths:
 //! every branch binds an explicit input field.
 //!
-//! Test coverage note: 44 of 68 `WORK_UNIT_CASE 673/*` cases execute here
+//! Test coverage note: 47 of 68 `WORK_UNIT_CASE 673/*` cases execute here
 //! (673/1 valid completes, 673/2 wrong job and scope fail closed, 673/3
 //! empty and single position are not conflicts, 673/5 duplicate and changed
 //! identities fail closed, 673/6 complete/partial/stale/blocked/withheld
@@ -65,7 +65,10 @@
 //! required primary follows canonical precedence rather than first match,
 //! 673/29 normalization preserves original propositions verbatim, 673/30
 //! ambiguous prose gains no invented class, 673/31 chronology and correlation
-//! stay non-causal without a winner, 673/35 shared model
+//! stay non-causal without a winner, 673/32 bare causal hypotheses stay live
+//! until mechanism, falsifier, and confounders are grounded, 673/33 prediction
+//! support stays defeasible without intervention support, 673/34 missing matched
+//! control and evaluator verdicts limit the causal claim, 673/35 shared model
 //! and evaluator limits independence, 673/40
 //! nondiscriminative probe rejected, 673/51 Concilium-review
 //! recommendation carries no plan, 673/4 receipt and fence mismatch fails
@@ -79,9 +82,8 @@
 //! unknown-resolution criterion, 673/67 classification, resolution, and proof
 //! stay within grounded evidence, 673/68 bounded malformed input stays
 //! panic-free with no winner, resolution, authority, execution, or Finish).
-//! The remaining 24 of 68 are deferred per queue-item scope; workspace
-//! admission (#969), Product Pulse, and Edge proof remain separate. Deferred: 673/32, 673/33, 673/34,
-//! 673/36, 673/37, 673/38, 673/39, 673/41, 673/42, 673/43, 673/44,
+//! The remaining 21 of 68 are deferred per queue-item scope; workspace
+//! admission (#969), Product Pulse, and Edge proof remain separate. Deferred: 673/36, 673/37, 673/38, 673/39, 673/41, 673/42, 673/43, 673/44,
 //! 673/45, 673/46, 673/47, 673/48, 673/49, 673/50, 673/52, 673/53, 673/54,
 //! 673/55, 673/58, 673/59, 673/63.
 
@@ -5882,6 +5884,274 @@ mod tests {
                 .iter()
                 .all(|position| position.disposition == PositionDispositionKind::LivePreserved),
             "topology and co-change keep both positions live with no winner"
+        );
+        assert_eq!(candidate.resolution_status, None);
+    }
+
+    // WORK_UNIT_CASE: 673/32
+    #[test]
+    fn case_32_causal_hypothesis_requires_mechanism_falsifier_confounders() {
+        let receipt = test_receipt();
+        let conflict = ConflictSet::new(ConflictSetParams {
+            conflict_id: "conflict-causal-hypothesis-needs-grounds".to_owned(),
+            kind: ConflictKind::Epistemic,
+            scope: "scope-1".to_owned(),
+            task_id: None,
+            positions: vec![
+                test_position(
+                    "source-a",
+                    "warming the cache causes the latency drop through mechanism M with no stated falsifier",
+                    false,
+                ),
+                test_position(
+                    "source-b",
+                    "warming the cache moves with the latency drop while rival confounders stay open",
+                    false,
+                ),
+            ],
+            evidence_refs: BTreeSet::new(),
+            owners: BTreeSet::from([
+                SourceId::new("source-a").expect("valid source"),
+                SourceId::new("source-b").expect("valid source"),
+            ]),
+            common_lineage: BTreeSet::new(),
+            resolved_parts: BTreeSet::new(),
+            unresolved: BTreeSet::from([
+                "causal mechanism".to_owned(),
+                "falsifier".to_owned(),
+                "confounders".to_owned(),
+            ]),
+            unresolved_owners: BTreeSet::from([SourceId::new("source-a").expect("valid source")]),
+            acceptability: ArgumentAcceptability::Contested,
+            defeated_refs: BTreeSet::new(),
+            probe: None,
+            decision_owner: SourceId::new("source-a").expect("valid source"),
+            affected_actions: vec!["decide-cache".to_owned()],
+            lifecycle: ConflictLifecycle::Open,
+            receipt_digest: receipt.bundle_digest.clone(),
+        })
+        .expect("causal-hypothesis conflict stays valid");
+        let mut supplements = test_supplements();
+        supplements.unknowns = vec![
+            "falsifier for mechanism M is unstated".to_owned(),
+            "mechanism M carries no measured evidence".to_owned(),
+            "rival confounder disposition is unknown".to_owned(),
+        ];
+        let candidate = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &conflict,
+            &supplements,
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("causal-hypothesis analysis: {err:?}"),
+        };
+        assert_eq!(candidate.outcome, ConflictOutcome::Complete);
+        assert!(
+            candidate
+                .positions
+                .iter()
+                .all(|position| position.disposition == PositionDispositionKind::LivePreserved),
+            "a bare causal hypothesis stays live until mechanism, falsifier, and confounders are grounded"
+        );
+        for position in &candidate.positions {
+            assert!(
+                position.conflict_classes.contains(&ConflictKind::Epistemic),
+                "causal-hypothesis disagreement stays epistemic: {:?}",
+                position.conflict_classes
+            );
+            assert!(
+                !position.compatibility_note.trim().is_empty(),
+                "every causal position carries a compatibility note"
+            );
+            assert_eq!(
+                position.stance, conflict.positions[position.position_index].stance,
+                "original causal propositions stay preserved verbatim"
+            );
+        }
+        for unknown in &supplements.unknowns {
+            assert!(
+                candidate.unknowns.contains(unknown),
+                "load-bearing causal unknown stays open: {unknown}"
+            );
+        }
+        assert_eq!(candidate.resolution_status, None);
+    }
+
+    // WORK_UNIT_CASE: 673/33
+    #[test]
+    fn case_33_prediction_support_stays_defeasible_without_intervention() {
+        let receipt = test_receipt();
+        let conflict = ConflictSet::new(ConflictSetParams {
+            conflict_id: "conflict-prediction-versus-intervention".to_owned(),
+            kind: ConflictKind::Epistemic,
+            scope: "scope-1".to_owned(),
+            task_id: None,
+            positions: vec![
+                test_position(
+                    "source-a",
+                    "model M predicts the warm-key outcome under predeclared prediction Q",
+                    false,
+                ),
+                test_position(
+                    "source-b",
+                    "the warm-key causal claim needs an intervention trial which is still missing",
+                    false,
+                ),
+            ],
+            evidence_refs: BTreeSet::new(),
+            owners: BTreeSet::from([
+                SourceId::new("source-a").expect("valid source"),
+                SourceId::new("source-b").expect("valid source"),
+            ]),
+            common_lineage: BTreeSet::new(),
+            resolved_parts: BTreeSet::new(),
+            unresolved: BTreeSet::from(["prediction versus intervention support".to_owned()]),
+            unresolved_owners: BTreeSet::from([SourceId::new("source-b").expect("valid source")]),
+            acceptability: ArgumentAcceptability::Contested,
+            defeated_refs: BTreeSet::new(),
+            probe: None,
+            decision_owner: SourceId::new("source-a").expect("valid source"),
+            affected_actions: vec!["decide-cache".to_owned()],
+            lifecycle: ConflictLifecycle::Open,
+            receipt_digest: receipt.bundle_digest.clone(),
+        })
+        .expect("prediction-intervention conflict stays valid");
+        let mut supplements = test_supplements();
+        supplements.unknowns =
+            vec!["intervention discriminator for the warm-key claim is missing".to_owned()];
+        let candidate = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &conflict,
+            &supplements,
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("prediction-intervention analysis: {err:?}"),
+        };
+        assert_eq!(candidate.outcome, ConflictOutcome::Complete);
+        assert!(
+            candidate
+                .positions
+                .iter()
+                .all(|position| position.disposition == PositionDispositionKind::LivePreserved),
+            "prediction support stays defeasible without intervention support; no winner is issued"
+        );
+        for position in &candidate.positions {
+            assert!(
+                position.conflict_classes.contains(&ConflictKind::Epistemic),
+                "prediction and intervention positions stay epistemic: {:?}",
+                position.conflict_classes
+            );
+            assert!(
+                !position.compatibility_note.trim().is_empty(),
+                "every prediction position carries a compatibility note"
+            );
+            assert_eq!(
+                position.stance, conflict.positions[position.position_index].stance,
+                "original prediction propositions stay preserved verbatim"
+            );
+        }
+        for unknown in &supplements.unknowns {
+            assert!(
+                candidate.unknowns.contains(unknown),
+                "missing intervention support stays an open unknown: {unknown}"
+            );
+        }
+        assert_eq!(candidate.resolution_status, None);
+    }
+
+    // WORK_UNIT_CASE: 673/34
+    #[test]
+    fn case_34_missing_matched_control_and_evaluator_limits_claim() {
+        let receipt = test_receipt();
+        let conflict = ConflictSet::new(ConflictSetParams {
+            conflict_id: "conflict-missing-control-evaluator".to_owned(),
+            kind: ConflictKind::Epistemic,
+            scope: "scope-1".to_owned(),
+            task_id: None,
+            positions: vec![
+                test_position(
+                    "source-a",
+                    "the treated group shows lower latency so the cache change improves warm keys",
+                    false,
+                ),
+                test_position(
+                    "source-b",
+                    "no matched control group or separate evaluator verdict backs the cache change claim",
+                    false,
+                ),
+            ],
+            evidence_refs: BTreeSet::new(),
+            owners: BTreeSet::from([
+                SourceId::new("source-a").expect("valid source"),
+                SourceId::new("source-b").expect("valid source"),
+            ]),
+            common_lineage: BTreeSet::new(),
+            resolved_parts: BTreeSet::new(),
+            unresolved: BTreeSet::from([
+                "matched control".to_owned(),
+                "evaluator verdict".to_owned(),
+            ]),
+            unresolved_owners: BTreeSet::from([SourceId::new("source-b").expect("valid source")]),
+            acceptability: ArgumentAcceptability::Contested,
+            defeated_refs: BTreeSet::new(),
+            probe: None,
+            decision_owner: SourceId::new("source-a").expect("valid source"),
+            affected_actions: vec!["decide-cache".to_owned()],
+            lifecycle: ConflictLifecycle::Open,
+            receipt_digest: receipt.bundle_digest.clone(),
+        })
+        .expect("missing-control conflict stays valid");
+        let mut supplements = test_supplements();
+        supplements.unknowns = vec![
+            "independent evaluator verdict is missing".to_owned(),
+            "matched control group is missing".to_owned(),
+        ];
+        let candidate = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &conflict,
+            &supplements,
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("missing-control analysis: {err:?}"),
+        };
+        assert_eq!(candidate.outcome, ConflictOutcome::Complete);
+        assert!(
+            candidate
+                .positions
+                .iter()
+                .all(|position| position.disposition == PositionDispositionKind::LivePreserved),
+            "a claim without matched control or evaluator evidence stays live and limited, never proven"
+        );
+        for position in &candidate.positions {
+            assert!(
+                position.conflict_classes.contains(&ConflictKind::Epistemic),
+                "control-limited disagreement stays epistemic: {:?}",
+                position.conflict_classes
+            );
+            assert_eq!(
+                position.stance, conflict.positions[position.position_index].stance,
+                "original control-limited propositions stay preserved verbatim"
+            );
+        }
+        for unknown in &supplements.unknowns {
+            assert!(
+                candidate.unknowns.contains(unknown),
+                "missing control and evaluator gaps stay open: {unknown}"
+            );
+        }
+        assert_eq!(
+            candidate.recommended_owner.kind,
+            DecisionOwnerKind::EvidenceSource,
+            "the evidence-source owner must supply the missing control evidence"
         );
         assert_eq!(candidate.resolution_status, None);
     }
