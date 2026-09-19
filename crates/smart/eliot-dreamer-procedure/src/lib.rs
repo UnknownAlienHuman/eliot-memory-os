@@ -3360,7 +3360,7 @@ mod tests {
         );
     }
 
-    // WORK_UNIT_CASE: 661/24
+    // Causal plumbing regression (not a 661 work-unit case: 24 deferred).
     #[test]
     fn causal_claim_validates_and_commits_digest_without_candidate_receipt() {
         let claim = match test_causal_claim() {
