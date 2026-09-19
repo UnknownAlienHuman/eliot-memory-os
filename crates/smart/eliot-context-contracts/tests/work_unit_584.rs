@@ -2678,3 +2678,571 @@ fn missing_admitted_atom_fails_selection_integrity() {
         Err(ContextError::SelectionIntegrityMismatch)
     );
 }
+
+fn closed_surface_base_value(target: &str) -> serde_json::Value {
+    match target {
+        "ContextCandidate" => {
+            let atom = candidate();
+            serde_json::to_value(&atom).expect("candidate value")
+        }
+        "SerializedContextMeasurement" => {
+            let context = binding();
+            let measurement = exact_measurement(&context);
+            serde_json::to_value(&measurement).expect("measurement value")
+        }
+        "AdmittedContextSet" => {
+            let admitted = admitted_single();
+            serde_json::to_value(&admitted).expect("admitted value")
+        }
+        "ActiveUnderstandingView" => {
+            let (_, view) = assembled_view();
+            serde_json::to_value(&view).expect("view value")
+        }
+        "ContextRecipe" => {
+            let policy = recipe();
+            serde_json::to_value(&policy).expect("recipe value")
+        }
+        _ => {
+            let gap = safety_floor_with(AtomAvailability::Missing)
+                .incomplete()
+                .expect("recheck")
+                .expect("gap");
+            serde_json::to_value(&gap).expect("incomplete value")
+        }
+    }
+}
+
+fn closed_surface_rejects_unknown(target: &str, value: serde_json::Value) -> bool {
+    match target {
+        "ContextCandidate" => serde_json::from_value::<ContextCandidate>(value).is_err(),
+        "SerializedContextMeasurement" => {
+            serde_json::from_value::<SerializedContextMeasurement>(value).is_err()
+        }
+        "AdmittedContextSet" => serde_json::from_value::<AdmittedContextSet>(value).is_err(),
+        "ActiveUnderstandingView" => {
+            serde_json::from_value::<ActiveUnderstandingView>(value).is_err()
+        }
+        "ContextRecipe" => serde_json::from_value::<ContextRecipe>(value).is_err(),
+        _ => serde_json::from_value::<DecisionContextIncomplete>(value).is_err(),
+    }
+}
+
+fn classify_outcome(outcome: &ContextOutcome<AdmittedContextSet>) -> &'static str {
+    match outcome {
+        ContextOutcome::Complete(_) => "complete",
+        ContextOutcome::Incomplete(_) => "incomplete",
+    }
+}
+
+const CONTRACTS_LIB_SRC: &str = include_str!("../src/lib.rs");
+const CONTRACTS_ATOM_SRC: &str = include_str!("../src/atom.rs");
+const CONTRACTS_VIEW_SRC: &str = include_str!("../src/view.rs");
+const CONTRACTS_ECONOMY_SRC: &str = include_str!("../src/economy.rs");
+const CONTRACTS_OMISSION_SRC: &str = include_str!("../src/omission.rs");
+const CONTRACTS_ADMISSION_SRC: &str = include_str!("../src/admission.rs");
+const CONTRACTS_MEASUREMENT_SRC: &str = include_str!("../src/measurement.rs");
+const CONTRACTS_ERROR_SRC: &str = include_str!("../src/error.rs");
+
+// WORK_UNIT_CASE: 584/55
+#[test]
+fn added_non_admitted_content_fails_selection_integrity() {
+    let (admitted, view) = assembled_view();
+    view.validate().expect("baseline view validates");
+
+    // Proof-level: one extra rendered identity breaks exact set equality.
+    let extra_proof = SelectionIntegrityProof {
+        binding: admitted.binding.clone(),
+        admitted_ids: view.admitted_ids.clone(),
+        rendered_ids: vec![id("atom"), id("extra-atom")],
+        omission_evidence: Vec::new(),
+        output_digest: view.output_digest.clone(),
+    };
+    assert_eq!(
+        extra_proof.validate(),
+        Err(ContextError::SelectionIntegrityMismatch)
+    );
+
+    // View-level: appending a non-admitted rendered atom breaks both the
+    // intrinsic digest check and the admitted-membership equality proof.
+    let mut extra_atom = view.rendered[0].clone();
+    extra_atom.atom_id = id("extra-atom");
+    let mut injected = view.clone();
+    injected.rendered.push(extra_atom);
+    injected.selection.rendered_ids.push(id("extra-atom"));
+    assert_eq!(
+        injected.validate(),
+        Err(ContextError::SelectionIntegrityMismatch)
+    );
+    assert_eq!(
+        injected.validate_against(&admitted),
+        Err(ContextError::SelectionIntegrityMismatch)
+    );
+}
+
+// WORK_UNIT_CASE: 584/56
+#[test]
+fn role_source_protection_privacy_authority_alteration_rejected() {
+    let (admitted, view) = assembled_view();
+    view.validate_against(&admitted)
+        .expect("baseline membership matches");
+
+    let mut role = view.clone();
+    role.rendered[0].role = SemanticRole::Source;
+    assert_eq!(
+        role.validate_against(&admitted),
+        Err(ContextError::SelectionIntegrityMismatch)
+    );
+
+    let mut provider = view.clone();
+    provider.rendered[0].provider = ProviderId::new("other-provider").expect("fixture provider");
+    assert_eq!(
+        provider.validate_against(&admitted),
+        Err(ContextError::SelectionIntegrityMismatch)
+    );
+
+    let mut revision = view.clone();
+    revision.rendered[0].source_revision = "r2".to_owned();
+    assert_eq!(
+        revision.validate_against(&admitted),
+        Err(ContextError::SelectionIntegrityMismatch)
+    );
+
+    let mut source_digest = view.clone();
+    source_digest.rendered[0].source_digest = "b".repeat(64);
+    assert_eq!(
+        source_digest.validate_against(&admitted),
+        Err(ContextError::SelectionIntegrityMismatch)
+    );
+
+    let mut protection = view.clone();
+    protection.rendered[0].protected = !protection.rendered[0].protected;
+    assert_eq!(
+        protection.validate_against(&admitted),
+        Err(ContextError::SelectionIntegrityMismatch)
+    );
+
+    let mut privacy = view.clone();
+    privacy.rendered[0].privacy = PrivacyClass::Restricted;
+    assert_eq!(
+        privacy.validate_against(&admitted),
+        Err(ContextError::SelectionIntegrityMismatch)
+    );
+
+    let mut authority = view.clone();
+    authority.rendered[0].authority = AuthorityClass::Governing;
+    assert_eq!(
+        authority.validate_against(&admitted),
+        Err(ContextError::SelectionIntegrityMismatch)
+    );
+}
+
+// WORK_UNIT_CASE: 584/57
+#[test]
+fn duplicate_rendered_atom_rejected() {
+    let (admitted, view) = assembled_view();
+    view.validate().expect("baseline view validates");
+
+    // Proof-level: the same rendered identity twice is not one occurrence.
+    let duplicated_proof = SelectionIntegrityProof {
+        binding: admitted.binding.clone(),
+        admitted_ids: view.admitted_ids.clone(),
+        rendered_ids: vec![id("atom"), id("atom")],
+        omission_evidence: Vec::new(),
+        output_digest: view.output_digest.clone(),
+    };
+    assert_eq!(
+        duplicated_proof.validate(),
+        Err(ContextError::SelectionIntegrityMismatch)
+    );
+
+    // View-level: duplicating the only rendered atom breaks set equality.
+    let mut duplicated = view.clone();
+    let copy = duplicated.rendered[0].clone();
+    duplicated.rendered.push(copy);
+    duplicated.selection.rendered_ids.push(id("atom"));
+    assert_eq!(
+        duplicated.validate(),
+        Err(ContextError::SelectionIntegrityMismatch)
+    );
+    assert_eq!(
+        duplicated.validate_against(&admitted),
+        Err(ContextError::SelectionIntegrityMismatch)
+    );
+}
+
+// WORK_UNIT_CASE: 584/58
+#[test]
+fn missing_changed_required_omission_evidence_rejected() {
+    let (admitted, view) = assembled_view();
+    view.validate_against(&admitted)
+        .expect("baseline omission evidence matches");
+
+    // Changed: baseline carries no displacement, so any injected evidence
+    // breaks the admitted/rendered omission-equality proof.
+    let mut extra_evidence = view.clone();
+    extra_evidence.selection.omission_evidence = vec![id("extra-evidence")];
+    assert_eq!(
+        extra_evidence.validate_against(&admitted),
+        Err(ContextError::SelectionIntegrityMismatch)
+    );
+
+    // Missing: admitted displacement without matching view evidence fails
+    // closed at the receipt boundary instead of validating as complete.
+    let mut undisclosed = admitted.clone();
+    undisclosed.economy.displaced = vec![id("displaced-atom")];
+    assert!(undisclosed.validate().is_err());
+    assert!(
+        view.validate_against(&undisclosed).is_err(),
+        "view without the displaced evidence must not match"
+    );
+}
+
+// WORK_UNIT_CASE: 584/59
+#[test]
+fn closed_surface_rejects_unknown_legacy_future_fields_and_redacts_canaries() {
+    let atom = candidate();
+    let atom_value = serde_json::to_value(&atom).expect("candidate value");
+
+    // Unknown current fields are rejected at every closed boundary.
+    for target in [
+        "ContextCandidate",
+        "SerializedContextMeasurement",
+        "AdmittedContextSet",
+        "ActiveUnderstandingView",
+        "ContextRecipe",
+        "DecisionContextIncomplete",
+    ] {
+        let mut injected = closed_surface_base_value(target);
+        injected["unknown_field"] = serde_json::Value::from("boom");
+        assert!(
+            closed_surface_rejects_unknown(target, injected),
+            "{target} must reject unknown fields"
+        );
+    }
+
+    // Unknown enum variants and legacy aliases are rejected on the wire.
+    for bad in [
+        "\"Other\"",
+        "\"UNKNOWN\"",
+        "\"NonDroppable\"",
+        "\"non_droppable\"",
+        "\"NON DROPPABLE\"",
+        "\"acceptance_decision_coverage\"",
+        "\"include\"",
+        "\"OTHER\"",
+        "null",
+    ] {
+        assert!(
+            serde_json::from_str::<LossPolicy>(bad).is_err(),
+            "{bad} must not decode as LossPolicy"
+        );
+    }
+    assert!(serde_json::from_str::<SemanticRole>("\"UNKNOWN\"").is_err());
+    assert!(serde_json::from_str::<QualityDimension>("\"Other\"").is_err());
+    assert!(serde_json::from_str::<AdmissionDisposition>("\"OTHER\"").is_err());
+    assert!(serde_json::from_str::<MeasurementStatus>("\"other\"").is_err());
+
+    // Protected identities have no silent defaults: a missing loss policy or
+    // atom identity fails instead of defaulting.
+    let mut missing_policy = atom_value.clone();
+    missing_policy
+        .as_object_mut()
+        .expect("candidate object")
+        .remove("loss_policy");
+    assert!(serde_json::from_value::<ContextCandidate>(missing_policy).is_err());
+    let mut null_policy = atom_value.clone();
+    null_policy["loss_policy"] = serde_json::Value::Null;
+    assert!(serde_json::from_value::<ContextCandidate>(null_policy).is_err());
+
+    // Later delivery/use/benefit/Finish stages are not Context members.
+    for field in [
+        "delivery",
+        "delivered",
+        "acknowledged",
+        "visible",
+        "used",
+        "benefit",
+        "finish",
+    ] {
+        let mut future = atom_value.clone();
+        future[field] = serde_json::Value::from("boom");
+        assert!(
+            serde_json::from_value::<ContextCandidate>(future).is_err(),
+            "{field} must be rejected"
+        );
+    }
+
+    // Sensitive diagnostics never enter the typed error: the bounded detail
+    // carries a field path, never the payload canary.
+    let canary = "CANARY-SENSITIVE-DIAGNOSTIC-584-59";
+    let mut leaky = candidate();
+    leaky.representation = AtomRepresentation::Whole {
+        content: canary.to_owned(),
+    };
+    leaky.measurement.digest = "short".to_owned();
+    let error = leaky.validate().expect_err("bad digest fails");
+    assert!(!format!("{error}").contains(canary));
+    assert!(!format!("{}", ContextError::IdentityConflict).contains(canary));
+}
+
+// WORK_UNIT_CASE: 584/60
+#[test]
+fn malformed_fuzz_never_panics_and_source_guards_no_implementation() {
+    // Malformed and fuzzed wire inputs decode as Err, never panic.
+    let long = "x".repeat(4096);
+    let fuzz: Vec<&str> = vec![
+        "",
+        "{",
+        "null",
+        "[]",
+        "123",
+        "{\"atom_id\":123}",
+        "{\"kind\":\"COMPLETE\"}",
+        "{\"binding\":null,\"rendered\":[]}",
+        &long,
+    ];
+    for input in &fuzz {
+        assert!(serde_json::from_str::<ContextCandidate>(input).is_err());
+        assert!(serde_json::from_str::<AdmittedContextSet>(input).is_err());
+        assert!(serde_json::from_str::<ActiveUnderstandingView>(input).is_err());
+        assert!(serde_json::from_str::<SerializedContextMeasurement>(input).is_err());
+        assert!(serde_json::from_str::<DecisionContextIncomplete>(input).is_err());
+        assert!(serde_json::from_str::<ContextRecipe>(input).is_err());
+    }
+    // Truncated otherwise-valid payloads also fail closed.
+    let atom = candidate();
+    let valid = serde_json::to_string(&atom).expect("candidate encoding");
+    for end in [0, 1, 8, valid.len() / 2] {
+        assert!(serde_json::from_str::<ContextCandidate>(&valid[..end]).is_err());
+    }
+
+    // Source guard: the contract cell owns schemas and intrinsic validation
+    // only. No filesystem/network/runtime, interior mutability, Store or
+    // unsafe implementation may exist in the package sources.
+    assert!(CONTRACTS_LIB_SRC.contains("forbid(unsafe_code)"));
+    assert!(CONTRACTS_LIB_SRC.contains("performs no provider I/O"));
+    for source in [
+        CONTRACTS_LIB_SRC,
+        CONTRACTS_ATOM_SRC,
+        CONTRACTS_VIEW_SRC,
+        CONTRACTS_ECONOMY_SRC,
+        CONTRACTS_OMISSION_SRC,
+        CONTRACTS_ADMISSION_SRC,
+        CONTRACTS_MEASUREMENT_SRC,
+        CONTRACTS_ERROR_SRC,
+    ] {
+        for forbidden in [
+            "std::fs",
+            "std::net",
+            "std::process",
+            "tokio",
+            "reqwest",
+            "rusqlite",
+            "sqlx",
+            "TcpStream",
+            "UdpSocket",
+            "Mutex",
+            "RwLock",
+            "RefCell",
+            "Store",
+            "async fn",
+            "unsafe {",
+            "static mut",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "{forbidden} must not appear in context-contracts sources"
+            );
+        }
+    }
+}
+
+// WORK_UNIT_CASE: 584/61
+#[test]
+fn public_atom_requires_loss_policy_and_rejects_boolean_legacy() {
+    let atom = candidate();
+    atom.validate().expect("explicit policy validates");
+
+    // Missing or null policy fails instead of defaulting.
+    let value = serde_json::to_value(&atom).expect("candidate value");
+    let mut missing = value.clone();
+    missing
+        .as_object_mut()
+        .expect("candidate object")
+        .remove("loss_policy");
+    assert!(serde_json::from_value::<ContextCandidate>(missing).is_err());
+    let mut nulled = value.clone();
+    nulled["loss_policy"] = serde_json::Value::Null;
+    assert!(serde_json::from_value::<ContextCandidate>(nulled).is_err());
+
+    // A Boolean-only legacy shape cannot decode as the current atom: the
+    // four-way policy is required and `required: true` is not a substitute.
+    for required in [true, false] {
+        let mut legacy = value.clone();
+        legacy
+            .as_object_mut()
+            .expect("candidate object")
+            .remove("loss_policy");
+        legacy["required"] = serde_json::Value::from(required);
+        assert!(
+            serde_json::from_value::<ContextCandidate>(legacy).is_err(),
+            "Boolean required={required} must not substitute for LossPolicy"
+        );
+    }
+
+    // Each normative policy round-trips explicitly on the same atom shape.
+    for policy in [
+        LossPolicy::NonDroppable,
+        LossPolicy::HandleOnly,
+        LossPolicy::Extractive,
+        LossPolicy::Summarizable,
+    ] {
+        let mut atom = candidate();
+        atom.loss_policy = policy;
+        atom.representation = match policy {
+            LossPolicy::NonDroppable => AtomRepresentation::Whole {
+                content: "whole".to_owned(),
+            },
+            LossPolicy::HandleOnly => AtomRepresentation::Handle { handle: id("h") },
+            LossPolicy::Extractive => AtomRepresentation::Extractive {
+                content: "kept".to_owned(),
+                manifest: vec!["field".to_owned()],
+            },
+            LossPolicy::Summarizable => AtomRepresentation::Summary {
+                content: "summary".to_owned(),
+                source_digest: digest(),
+            },
+        };
+        atom.validate()
+            .unwrap_or_else(|_| panic!("explicit {policy:?} representation validates"));
+        let encoded = serde_json::to_string(&atom).expect("atom encoding");
+        let decoded: ContextCandidate = serde_json::from_str(&encoded).expect("atom round-trip");
+        assert_eq!(decoded.loss_policy, policy);
+    }
+}
+
+// WORK_UNIT_CASE: 584/62
+#[test]
+fn canonical_external_incomplete_code_and_exhaustive_consumer() {
+    let floor = safety_floor_with(AtomAvailability::Missing);
+    let incomplete = floor
+        .incomplete()
+        .expect("missing floor rechecks")
+        .expect("missing member cannot be complete");
+
+    // The canonical external code has exactly one wire spelling.
+    let wire = serde_json::to_string(&incomplete.code).expect("code encoding");
+    assert_eq!(wire, "\"DECISION_CONTEXT_INCOMPLETE\"");
+    assert_eq!(
+        serde_json::from_str::<ContextErrorCode>(&wire).expect("code round-trip"),
+        ContextErrorCode::DecisionContextIncomplete
+    );
+    for (code, expected) in [
+        (ContextErrorCode::InvalidIdentity, "\"INVALID_IDENTITY\""),
+        (
+            ContextErrorCode::DenominatorMismatch,
+            "\"DENOMINATOR_MISMATCH\"",
+        ),
+    ] {
+        let encoded = serde_json::to_string(&code).expect("other code encoding");
+        assert_eq!(encoded, expected);
+        assert_ne!(code, ContextErrorCode::DecisionContextIncomplete);
+    }
+
+    // An exhaustive consumer cannot mistake the incomplete outcome for
+    // success: both sum-type variants are branched explicitly.
+    let incomplete_outcome: ContextOutcome<AdmittedContextSet> =
+        ContextOutcome::Incomplete(incomplete.clone());
+    let complete_outcome: ContextOutcome<AdmittedContextSet> =
+        ContextOutcome::Complete(admitted_single());
+    assert_eq!(classify_outcome(&incomplete_outcome), "incomplete");
+    assert_eq!(classify_outcome(&complete_outcome), "complete");
+    assert!(matches!(incomplete_outcome, ContextOutcome::Incomplete(_)));
+    assert!(!matches!(incomplete_outcome, ContextOutcome::Complete(_)));
+
+    // A retargeted code fails closed instead of validating as incomplete.
+    let mut wrong_code = incomplete.clone();
+    wrong_code.code = ContextErrorCode::InvalidIdentity;
+    assert_eq!(
+        wrong_code.validate(),
+        Err(ContextError::InvalidField("incomplete.code"))
+    );
+}
+
+// WORK_UNIT_CASE: 584/63
+#[test]
+fn displacement_conservation_rejects_bare_claims_and_accepts_complete_receipt() {
+    // Empty displacement against an established denominator conserves.
+    admitted_single()
+        .economy
+        .validate()
+        .expect("empty-displacement conservation validates");
+
+    // Nonempty displacement without requested identities is rejected.
+    let mut no_requested = admitted_single();
+    no_requested.economy.requested.clear();
+    no_requested.economy.displaced = vec![id("displaced-atom")];
+    assert_eq!(
+        no_requested.economy.validate(),
+        Err(ContextError::EconomyMismatch)
+    );
+
+    // Displaced material outside the requested denominator is rejected.
+    let mut outside = admitted_single();
+    outside.economy.displaced = vec![id("outside-atom")];
+    assert_eq!(
+        outside.economy.validate(),
+        Err(ContextError::EconomyMismatch)
+    );
+
+    // Nonempty displacement without the complete omission evidence is
+    // rejected: the omission set must equal the displaced set exactly.
+    let mut bare = admitted_single();
+    bare.economy.requested.push(id("displaced-atom"));
+    bare.economy.displaced = vec![id("displaced-atom")];
+    assert_eq!(bare.economy.validate(), Err(ContextError::EconomyMismatch));
+
+    // Complete conservation receipt with fully evidenced displacement
+    // succeeds: requested == admitted + displaced with the applied rule.
+    let context = omission_binding();
+    let (_, template) = reversible_omission();
+    let mut displaced_record = template.clone();
+    displaced_record.atom_id = id("displaced-atom");
+    if let Some(handle) = displaced_record.expansion.as_mut() {
+        handle.atom_id = id("displaced-atom");
+    }
+    displaced_record
+        .validate(&context)
+        .expect("displaced omission validates");
+    let allocations = EconomyAllocations {
+        fixed_overhead: 2,
+        output_reserve: 3,
+        review_reserve: 4,
+        admitted_required: 10,
+        admitted_optional: 0,
+        remaining_headroom: 99_981,
+        route_capacity: 100_000,
+    };
+    let mut receipt = ContextEconomyReceipt {
+        binding: context.clone(),
+        decision_id: context.decision_id.clone(),
+        measurement: MeasurementRef {
+            digest: digest(),
+            serializer: "fixture-serde-v1".to_owned(),
+        },
+        requested: vec![id("atom"), id("displaced-atom")],
+        admitted: vec![id("atom")],
+        displaced: vec![id("displaced-atom")],
+        omissions: vec![displaced_record],
+        applied_rule: id("economy-rule"),
+        allocations,
+        recipe_digest: digest(),
+        receipt_digest: "0".repeat(64),
+    };
+    let mut unsigned = receipt.clone();
+    unsigned.receipt_digest = "0".repeat(64);
+    receipt.receipt_digest = canonical_digest(&unsigned).expect("receipt digest");
+    receipt
+        .validate()
+        .expect("evidenced displacement conserves");
+}
