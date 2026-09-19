@@ -38,8 +38,10 @@
 
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 use eliot_dreamer_contracts::{
-    CurationKind, CurationRejectionCode, GroundedDreamDraft, PreservationReport, TargetDenominator,
-    ValidatedCurationItem, ValidationReceipt, is_hex64_lower,
+    BoundCurationCall, CandidateDisposition, ContractViolation, CurationFamily,
+    CurationHandlerDescriptor, CurationHandlerPort, CurationKind, CurationRejectionCode,
+    GroundedDreamDraft, NativeCurationHandler, PreservationReport, ProducedCurationContent,
+    TargetDenominator, ValidatedCurationItem, ValidationReceipt, is_hex64_lower,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -968,6 +970,137 @@ pub struct MemoryRepairCandidate {
     pub candidate_digest: String,
     /// Bounded machine-readable note.
     pub note: String,
+}
+
+/// Canonical A-03 handler identity for the memory-repair family.
+pub const MEMORY_REPAIR_HANDLER_ID: &str = "eliot-dreamer-memory-repair";
+/// Stable injected-port identity used by package-local handler fixtures.
+pub const MEMORY_REPAIR_PORT_ID: &str = "memory-repair-port";
+
+/// Returns the exact A-03 descriptor for the `Repair` wire kind.
+///
+/// The descriptor carries no dispatch authority and does not register itself;
+/// A-31 supplies the closed registry and injected port at invocation time.
+#[must_use]
+pub fn memory_repair_handler_port() -> CurationHandlerPort {
+    CurationHandlerPort {
+        port_id: MEMORY_REPAIR_PORT_ID.to_owned(),
+        descriptor: CurationHandlerDescriptor {
+            family: CurationFamily::MemoryRepair,
+            handler_id: MEMORY_REPAIR_HANDLER_ID.to_owned(),
+            accepted_kinds: vec![CurationKind::Repair],
+        },
+    }
+}
+
+/// Immutable native handler adapter for the A-03 typed invocation seam.
+///
+/// The caller supplies the already-frozen semantic repair request. The
+/// adapter only checks that the injected A-03 call is the same item and
+/// identity projection, delegates to [`propose_memory_repair`], and returns
+/// inert A-03 content. It performs no handler discovery, registry mutation,
+/// persistence, or post-handler validation pass.
+#[derive(Clone, Debug)]
+pub struct MemoryRepairHandler {
+    request: MemoryRepairRequest,
+}
+
+impl MemoryRepairHandler {
+    /// Binds one immutable semantic repair request to this handler instance.
+    #[must_use]
+    pub fn new(request: MemoryRepairRequest) -> Self {
+        Self { request }
+    }
+
+    /// Returns the frozen semantic request used by this handler.
+    #[must_use]
+    pub const fn request(&self) -> &MemoryRepairRequest {
+        &self.request
+    }
+
+    fn bind_call(&self, call: &BoundCurationCall) -> Result<(), ContractViolation> {
+        call.validate()?;
+        let expected = memory_repair_handler_port().descriptor;
+        if call.port.descriptor != expected {
+            return Err(ContractViolation::BindingMismatch {
+                field: "handler_descriptor",
+                reason: "memory-repair call is bound to a different handler descriptor".to_owned(),
+            });
+        }
+        if call.request.kind != CurationKind::Repair
+            || call.request.family != CurationFamily::MemoryRepair
+        {
+            return Err(ContractViolation::KindPayload(
+                "memory-repair handler accepts only the Repair wire kind".to_owned(),
+            ));
+        }
+        if self.request.item != call.item {
+            return Err(ContractViolation::BindingMismatch {
+                field: "item",
+                reason: "handler request is not bound to the accepted item".to_owned(),
+            });
+        }
+        if self.request.projection.task_id != call.request.task_id
+            || self.request.projection.scope_id != call.request.scope_id
+            || self.request.projection.state_fence != call.request.state_fence
+        {
+            return Err(ContractViolation::BindingMismatch {
+                field: "task_scope_fence",
+                reason: "repair projection is not bound to the typed request".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+fn candidate_disposition(outcome: RepairOutcome) -> CandidateDisposition {
+    match outcome {
+        RepairOutcome::Complete => CandidateDisposition::Candidate,
+        RepairOutcome::Partial | RepairOutcome::Review => CandidateDisposition::Partial,
+        RepairOutcome::Abstention | RepairOutcome::NoSafeRepair => CandidateDisposition::Abstention,
+        RepairOutcome::Stale => CandidateDisposition::Conflict,
+        RepairOutcome::Blocked => CandidateDisposition::Blocked,
+        RepairOutcome::Rejected => CandidateDisposition::Unsupported,
+    }
+}
+
+fn repair_error_as_contract(error: RepairError) -> ContractViolation {
+    let reason = match error {
+        RepairError::Bounds { phase, detail }
+        | RepairError::Order { phase, detail }
+        | RepairError::Member {
+            handle: phase,
+            detail,
+        } => format!("{phase}: {detail}"),
+        RepairError::Receipt { detail } => detail,
+    };
+    ContractViolation::Malformed {
+        field: "memory_repair",
+        reason: redact(&reason),
+    }
+}
+
+impl NativeCurationHandler for MemoryRepairHandler {
+    fn handle(
+        &self,
+        call: &BoundCurationCall,
+    ) -> Result<ProducedCurationContent, ContractViolation> {
+        self.bind_call(call)?;
+        let candidate = propose_memory_repair(&self.request).map_err(repair_error_as_contract)?;
+        let content = ProducedCurationContent {
+            payload: call.item.payload.clone(),
+            disposition: candidate_disposition(candidate.outcome),
+            preservation: self.request.preservation.clone(),
+            support_note: format!(
+                "memory repair candidate: {}",
+                redact(&candidate.expected_observable)
+            ),
+            rollback_note: redact(&candidate.inverse_note),
+            counterevidence_refs: self.request.projection.counterevidence_refs.clone(),
+        };
+        content.validate_for(call)?;
+        Ok(content)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2444,13 +2577,15 @@ pub fn outcome_rejection_hint(outcome: &RepairOutcome) -> Option<CurationRejecti
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
-    use std::num::NonZeroU64;
+    use eliot_contracts::{EpochId, EpochLineageId, ReceiptId, RequestId, ResourceGeneration};
     use eliot_dreamer_contracts::candidate::{DimensionVerdict, PreservationDimension};
     use eliot_dreamer_contracts::curation::{RepairPayload, TargetEvidence};
     use eliot_dreamer_contracts::{
-        AtomicityMode, ClaimResidue, Requester, RequesterOrigin, SupportState, kind_family,
+        AtomicityMode, BoundCurationCall, ClaimResidue, CurationFamily, CurationHandlerDescriptor,
+        CurationHandlerPort, CurationKind, Requester, RequesterOrigin, ScreenBinding, ScreenState,
+        SupportState, TypedCurationHandlerRequest, kind_family,
     };
+    use std::num::NonZeroU64;
 
     fn test_fence() -> StateFence {
         let epoch = EpochId::new(
@@ -2550,6 +2685,61 @@ mod tests {
                 session: None,
             },
             budget_note: "within budget".to_owned(),
+        }
+    }
+
+    fn bound_call(item: &ValidatedCurationItem) -> BoundCurationCall {
+        let fence = item.state_fence.clone();
+        let request_id = match RequestId::new("request-1") {
+            Ok(value) => value,
+            Err(error) => panic!("request id fixture must be valid: {error:?}"),
+        };
+        let receipt_id = match ReceiptId::new("receipt-1") {
+            Ok(value) => value,
+            Err(error) => panic!("receipt id fixture must be valid: {error:?}"),
+        };
+        let targets = item.payload.facets().targets.clone();
+        let request = TypedCurationHandlerRequest {
+            request_id: request_id.clone().into_string(),
+            receipt_id: receipt_id.clone().into_string(),
+            source_snapshot: "snapshot-1".to_owned(),
+            source_revision: "revision-1".to_owned(),
+            profile: "repair-profile".to_owned(),
+            kind: CurationKind::Repair,
+            family: CurationFamily::MemoryRepair,
+            job_id: "job-1".to_owned(),
+            scope_id: item.scope_id.clone(),
+            task_id: item.task_id.clone(),
+            state_fence: fence.clone(),
+            payload: item.payload.clone(),
+            denominator: item.denominator.clone(),
+            screen_binding: Some(ScreenBinding {
+                request_id,
+                receipt_id,
+                screened_targets: targets,
+                source_snapshot: "snapshot-1".to_owned(),
+                source_revision: "revision-1".to_owned(),
+                profile: "repair-profile".to_owned(),
+                task_id: item.task_id.clone(),
+                scope_id: item.scope_id.clone(),
+                state_fence: fence,
+                state: ScreenState::Eligible,
+                result_digest: "1".repeat(64),
+                item_digest: "2".repeat(64),
+            }),
+        };
+        BoundCurationCall {
+            port: CurationHandlerPort {
+                port_id: MEMORY_REPAIR_PORT_ID.to_owned(),
+                descriptor: CurationHandlerDescriptor {
+                    family: CurationFamily::MemoryRepair,
+                    handler_id: MEMORY_REPAIR_HANDLER_ID.to_owned(),
+                    accepted_kinds: vec![CurationKind::Repair],
+                },
+            },
+            item: item.clone(),
+            request,
+            registry_digest: "3".repeat(64),
         }
     }
 
@@ -2803,6 +2993,51 @@ mod tests {
             closure_denominator: test_denominator(),
             policy: test_policy(),
         }
+    }
+
+    #[test]
+    fn a03_port_binds_repair_wire_kind_and_preserves_candidate_content() {
+        let mut request = base_request("provenance-link", RepairDefectKind::MissingProvenance);
+        request.provenance = Some(provenance_spec());
+        request.dispositions = test_disposition(MemberDispositionKind::ProvenanceLink);
+        let call = bound_call(&request.item);
+        let handler = MemoryRepairHandler::new(request);
+
+        let content = match handler.handle(&call) {
+            Ok(content) => content,
+            Err(error) => panic!("bound repair content: {error:?}"),
+        };
+
+        assert_eq!(
+            memory_repair_handler_port().descriptor.family,
+            CurationFamily::MemoryRepair
+        );
+        assert_eq!(
+            memory_repair_handler_port().descriptor.accepted_kinds,
+            vec![CurationKind::Repair]
+        );
+        assert_eq!(content.payload, call.item.payload);
+        assert_eq!(content.disposition, CandidateDisposition::Candidate);
+        if let Err(error) = content.validate_for(&call) {
+            panic!("A-03 content remains bound to the call: {error:?}");
+        }
+    }
+
+    #[test]
+    fn a03_handler_rejects_a_rebound_item_before_proposal() {
+        let mut request = base_request("provenance-link", RepairDefectKind::MissingProvenance);
+        request.provenance = Some(provenance_spec());
+        request.dispositions = test_disposition(MemberDispositionKind::ProvenanceLink);
+        let mut call = bound_call(&request.item);
+        call.item.budget_note = "rebound budget note".to_owned();
+
+        let Err(err) = MemoryRepairHandler::new(request).handle(&call) else {
+            panic!("changed accepted item must fail closed");
+        };
+        assert!(matches!(
+            err,
+            ContractViolation::BindingMismatch { field: "item", .. }
+        ));
     }
 
     // WORK_UNIT_CASE: 671/1
