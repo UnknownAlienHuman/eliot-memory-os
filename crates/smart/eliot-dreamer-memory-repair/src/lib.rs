@@ -37,6 +37,7 @@
 #![forbid(unsafe_code)]
 
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
+use eliot_dreamer_contracts::curation::{CurationPayload, RepairPayload};
 use eliot_dreamer_contracts::{
     BoundCurationCall, CandidateDisposition, ContractViolation, CurationFamily,
     CurationHandlerDescriptor, CurationHandlerPort, CurationKind, CurationRejectionCode,
@@ -1018,7 +1019,7 @@ impl MemoryRepairHandler {
         &self.request
     }
 
-    fn bind_call(&self, call: &BoundCurationCall) -> Result<(), ContractViolation> {
+    fn bind_call(&self, call: &BoundCurationCall) -> Result<RepairPayload, ContractViolation> {
         call.validate()?;
         let expected = memory_repair_handler_port().descriptor;
         if call.port.descriptor != expected {
@@ -1033,6 +1034,25 @@ impl MemoryRepairHandler {
             return Err(ContractViolation::KindPayload(
                 "memory-repair handler accepts only the Repair wire kind".to_owned(),
             ));
+        }
+        let item_payload = match &call.item.payload {
+            CurationPayload::Repair(payload) => payload.clone(),
+            _ => {
+                return Err(ContractViolation::KindPayload(
+                    "memory-repair handler requires the closed RepairPayload subtype".to_owned(),
+                ));
+            }
+        };
+        let CurationPayload::Repair(request_payload) = &call.request.payload else {
+            return Err(ContractViolation::KindPayload(
+                "memory-repair request requires the closed RepairPayload subtype".to_owned(),
+            ));
+        };
+        if item_payload != *request_payload {
+            return Err(ContractViolation::BindingMismatch {
+                field: "payload",
+                reason: "accepted item payload must equal typed request payload".to_owned(),
+            });
         }
         if self.request.item != call.item {
             return Err(ContractViolation::BindingMismatch {
@@ -1049,7 +1069,7 @@ impl MemoryRepairHandler {
                 reason: "repair projection is not bound to the typed request".to_owned(),
             });
         }
-        Ok(())
+        Ok(item_payload)
     }
 }
 
@@ -1065,18 +1085,23 @@ fn candidate_disposition(outcome: RepairOutcome) -> CandidateDisposition {
 }
 
 fn repair_error_as_contract(error: RepairError) -> ContractViolation {
-    let reason = match error {
-        RepairError::Bounds { phase, detail }
-        | RepairError::Order { phase, detail }
-        | RepairError::Member {
-            handle: phase,
-            detail,
-        } => format!("{phase}: {detail}"),
-        RepairError::Receipt { detail } => detail,
-    };
-    ContractViolation::Malformed {
-        field: "memory_repair",
-        reason: redact(&reason),
+    match error {
+        RepairError::Bounds { phase, detail } => ContractViolation::Malformed {
+            field: "memory_repair.bounds",
+            reason: redact(&format!("{phase}: {detail}")),
+        },
+        RepairError::Order { phase, detail } => ContractViolation::BindingMismatch {
+            field: "memory_repair.order",
+            reason: redact(&format!("{phase}: {detail}")),
+        },
+        RepairError::Member { handle, detail } => ContractViolation::BindingMismatch {
+            field: "memory_repair.member",
+            reason: redact(&format!("{handle}: {detail}")),
+        },
+        RepairError::Receipt { detail } => ContractViolation::BindingMismatch {
+            field: "memory_repair.receipt",
+            reason: redact(&detail),
+        },
     }
 }
 
@@ -1085,10 +1110,10 @@ impl NativeCurationHandler for MemoryRepairHandler {
         &self,
         call: &BoundCurationCall,
     ) -> Result<ProducedCurationContent, ContractViolation> {
-        self.bind_call(call)?;
+        let payload = self.bind_call(call)?;
         let candidate = propose_memory_repair(&self.request).map_err(repair_error_as_contract)?;
         let content = ProducedCurationContent {
-            payload: call.item.payload.clone(),
+            payload: CurationPayload::Repair(payload),
             disposition: candidate_disposition(candidate.outcome),
             preservation: self.request.preservation.clone(),
             support_note: format!(
@@ -1098,7 +1123,6 @@ impl NativeCurationHandler for MemoryRepairHandler {
             rollback_note: redact(&candidate.inverse_note),
             counterevidence_refs: self.request.projection.counterevidence_refs.clone(),
         };
-        content.validate_for(call)?;
         Ok(content)
     }
 }
@@ -3016,11 +3040,11 @@ mod tests {
             memory_repair_handler_port().descriptor.accepted_kinds,
             vec![CurationKind::Repair]
         );
-        assert_eq!(content.payload, call.item.payload);
+        assert!(matches!(
+            content.payload,
+            CurationPayload::Repair(RepairPayload { .. })
+        ));
         assert_eq!(content.disposition, CandidateDisposition::Candidate);
-        if let Err(error) = content.validate_for(&call) {
-            panic!("A-03 content remains bound to the call: {error:?}");
-        }
     }
 
     #[test]
@@ -3037,6 +3061,93 @@ mod tests {
         assert!(matches!(
             err,
             ContractViolation::BindingMismatch { field: "item", .. }
+        ));
+    }
+
+    #[test]
+    fn a03_handler_rejects_a_payload_rebinding_before_proposal() {
+        let mut request = base_request("provenance-link", RepairDefectKind::MissingProvenance);
+        request.provenance = Some(provenance_spec());
+        request.dispositions = test_disposition(MemberDispositionKind::ProvenanceLink);
+        let mut call = bound_call(&request.item);
+        let CurationPayload::Repair(payload) = &mut call.request.payload else {
+            panic!("repair fixture must carry RepairPayload");
+        };
+        payload.repair = "provenance-quarantine".to_owned();
+
+        let Err(err) = MemoryRepairHandler::new(request).handle(&call) else {
+            panic!("rebound typed request payload must fail closed");
+        };
+        assert!(matches!(
+            err,
+            ContractViolation::BindingMismatch {
+                field: "payload",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a03_repair_outcome_mapping_covers_every_closed_outcome() {
+        let mappings = [
+            (RepairOutcome::Complete, CandidateDisposition::Candidate),
+            (RepairOutcome::Partial, CandidateDisposition::Partial),
+            (RepairOutcome::Abstention, CandidateDisposition::Abstention),
+            (
+                RepairOutcome::NoSafeRepair,
+                CandidateDisposition::Abstention,
+            ),
+            (RepairOutcome::Stale, CandidateDisposition::Conflict),
+            (RepairOutcome::Blocked, CandidateDisposition::Blocked),
+            (RepairOutcome::Review, CandidateDisposition::Partial),
+            (RepairOutcome::Rejected, CandidateDisposition::Unsupported),
+        ];
+        assert_eq!(mappings.len(), 8);
+        for (outcome, expected) in mappings {
+            assert_eq!(candidate_disposition(outcome), expected);
+        }
+    }
+
+    #[test]
+    fn a03_repair_error_mapping_preserves_contract_violation_categories() {
+        assert!(matches!(
+            repair_error_as_contract(RepairError::Bounds {
+                phase: "shape".to_owned(),
+                detail: "bad bound".to_owned(),
+            }),
+            ContractViolation::Malformed {
+                field: "memory_repair.bounds",
+                ..
+            }
+        ));
+        assert!(matches!(
+            repair_error_as_contract(RepairError::Order {
+                phase: "refs".to_owned(),
+                detail: "not sorted".to_owned(),
+            }),
+            ContractViolation::BindingMismatch {
+                field: "memory_repair.order",
+                ..
+            }
+        ));
+        assert!(matches!(
+            repair_error_as_contract(RepairError::Member {
+                handle: "member-1".to_owned(),
+                detail: "not bound".to_owned(),
+            }),
+            ContractViolation::BindingMismatch {
+                field: "memory_repair.member",
+                ..
+            }
+        ));
+        assert!(matches!(
+            repair_error_as_contract(RepairError::Receipt {
+                detail: "receipt drift".to_owned(),
+            }),
+            ContractViolation::BindingMismatch {
+                field: "memory_repair.receipt",
+                ..
+            }
         ));
     }
 
