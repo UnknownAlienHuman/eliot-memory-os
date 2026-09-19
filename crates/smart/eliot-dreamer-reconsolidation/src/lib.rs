@@ -2114,6 +2114,150 @@ mod tests {
         assert!(matches!(error, ReconsolidationError::Order { phase, .. } if phase == "deltas"));
     }
 
+    // WORK_UNIT_CASE: 667/29
+    #[test]
+    fn case_29_independent_memory_axis_owners_are_preserved() {
+        let mut request = valid_request();
+        let frozen_owners = request.axis_owners.clone();
+        let frozen_preservation = request.preservation.clone();
+        request.deltas[1].rationale =
+            "new evidence changes content only; every independent axis remains caller-owned"
+                .to_owned();
+
+        let result = propose_reconsolidation(&request).expect("axis-preserving candidate succeeds");
+
+        assert_eq!(result.outcome, ReconsolidationOutcome::Complete);
+        assert_eq!(request.axis_owners, frozen_owners);
+        assert_eq!(request.preservation, frozen_preservation);
+        let child = result.child.expect("complete result carries a request");
+        assert!(child.request_only);
+        assert!(!child.allocates_revision);
+    }
+
+    // WORK_UNIT_CASE: 667/30
+    #[test]
+    fn case_30_contradiction_preserves_old_support_without_axis_demotion() {
+        let mut request = valid_request();
+        let frozen_parent = request.parent_propositions.clone();
+        let frozen_owners = request.axis_owners.clone();
+        request.deltas[1].disposition = PropositionDisposition::Contradicted;
+        request.deltas[1].revised_statement =
+            Some("Cold starts can be fast after the observed warm-up.".to_owned());
+        request.deltas[1].rationale =
+            "obs-1 is a counterexample; retain the prior proposition and support".to_owned();
+        request.deltas[1].evidence_refs = vec!["obs-1".to_owned()];
+
+        let result = propose_reconsolidation(&request).expect("supported contradiction is safe");
+
+        assert_eq!(result.outcome, ReconsolidationOutcome::Complete);
+        assert_eq!(request.parent_propositions, frozen_parent);
+        assert_eq!(request.axis_owners, frozen_owners);
+        assert_eq!(request.parent_propositions[1].support_handle, "src-b");
+        assert_eq!(request.new_items[0].handle, "obs-1");
+    }
+
+    // WORK_UNIT_CASE: 667/31
+    #[test]
+    fn case_31_low_use_does_not_reduce_support_or_trigger_revision() {
+        let mut request = valid_request();
+        let frozen_support = request.parent_propositions[1].support_handle.clone();
+        let frozen_support_owner = request.axis_owners.support_owner.clone();
+        request.deltas[1].rationale =
+            "low use is an ecology observation, not evidence to reduce support".to_owned();
+        request.dependent_outcomes[0].note =
+            "low retrieval use leaves the supported proposition unchanged".to_owned();
+
+        let result = propose_reconsolidation(&request).expect("low-use candidate remains bounded");
+
+        assert_eq!(result.outcome, ReconsolidationOutcome::Complete);
+        assert_eq!(
+            request.parent_propositions[1].support_handle,
+            frozen_support
+        );
+        assert_eq!(request.axis_owners.support_owner, frozen_support_owner);
+        assert_eq!(result.admitted_new, 1);
+    }
+
+    // WORK_UNIT_CASE: 667/32
+    #[test]
+    fn case_32_new_support_cannot_widen_influence() {
+        let mut request = valid_request();
+        let frozen_influence_owner = request.axis_owners.influence_owner.clone();
+        request.deltas[1].rationale =
+            "obs-1 adds local support without widening the influence owner or scope".to_owned();
+
+        let result = propose_reconsolidation(&request).expect("support-bounded candidate succeeds");
+
+        assert_eq!(result.outcome, ReconsolidationOutcome::Complete);
+        assert_eq!(request.axis_owners.influence_owner, frozen_influence_owner);
+        let child = result.child.expect("complete result carries a request");
+        assert_eq!(child.parent_handle, "derived-1");
+        assert_eq!(child.parent_revision, "rev-2");
+    }
+
+    // WORK_UNIT_CASE: 667/33
+    #[test]
+    fn case_33_raw_evidence_identity_and_parent_bytes_remain_unchanged() {
+        let request = valid_request();
+        let frozen = request.clone();
+
+        let result =
+            propose_reconsolidation(&request).expect("candidate preserves source identity");
+
+        assert_eq!(result.outcome, ReconsolidationOutcome::Complete);
+        assert_eq!(request.parent, frozen.parent);
+        assert_eq!(request.parent_propositions, frozen.parent_propositions);
+        assert_eq!(request.new_items, frozen.new_items);
+        assert_eq!(request.new_items[0].digest, "1".repeat(64));
+    }
+
+    // WORK_UNIT_CASE: 667/34
+    #[test]
+    fn case_34_parent_history_and_change_reason_remain_addressable() {
+        let mut request = valid_request();
+        request.deltas[1].rationale =
+            "change reason: observed warm-up outcome qualified the parent claim".to_owned();
+        let frozen_parent = request.parent.clone();
+        let frozen_reason = request.deltas[1].rationale.clone();
+
+        let result =
+            propose_reconsolidation(&request).expect("history-addressable candidate succeeds");
+        let child = result.child.expect("complete result carries a request");
+
+        assert_eq!(result.outcome, ReconsolidationOutcome::Complete);
+        assert_eq!(child.parent_handle, frozen_parent.handle);
+        assert_eq!(child.parent_revision, frozen_parent.revision);
+        assert_eq!(
+            request.parent.predecessor_chain,
+            frozen_parent.predecessor_chain
+        );
+        assert_eq!(request.deltas[1].rationale, frozen_reason);
+        assert_ne!(child.proposed_child_handle, child.parent_revision);
+    }
+
+    // WORK_UNIT_CASE: 667/35
+    #[test]
+    fn case_35_counterexample_minority_conflict_and_provenance_are_retained() {
+        let mut request = valid_request();
+        request.new_items[0].lineage = "minority-lineage-1".to_owned();
+        request.new_items[0].statement =
+            "Counterexample: one warm-up run shortened the next cold start.".to_owned();
+        request.deltas[1].rationale =
+            "preserve the minority counterexample and conflict provenance from obs-1".to_owned();
+        let frozen_parent = request.parent_propositions[1].clone();
+        let frozen_evidence = request.new_items[0].clone();
+
+        let result =
+            propose_reconsolidation(&request).expect("provenance-preserving candidate succeeds");
+
+        assert_eq!(result.outcome, ReconsolidationOutcome::Complete);
+        assert_eq!(request.parent_propositions[1], frozen_parent);
+        assert_eq!(request.new_items[0], frozen_evidence);
+        assert_eq!(request.new_items[0].lineage, "minority-lineage-1");
+        assert!(request.deltas[1].rationale.contains("counterexample"));
+        assert!(request.deltas[1].rationale.contains("provenance"));
+    }
+
     // WORK_UNIT_CASE: 667/39
     #[test]
     fn case_39_unaffected_dependent_keeps_an_explicit_note() {
