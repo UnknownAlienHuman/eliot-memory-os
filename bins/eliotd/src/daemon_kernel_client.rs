@@ -16,9 +16,8 @@ use std::time::Duration;
 use eliot_contracts::{ClockReading, ProductId, RequestId, RequestMetadata, SourceId};
 use eliot_governor::{GovernorLaunchConfig, KernelGenerationSnapshot, KernelPortError};
 use eliot_protocol::{
-    AgentActivationResolutionDecision, AgentActivationResolutionResult,
-    AgentActivationResolutionTicket, AgentActivationResultAck, AgentActivationResultReconcile,
-    AgentActivationResultSubmit, EncodingProfile, Frame, FrameKind,
+    AgentActivationResolutionDecision, AgentActivationResolutionResult, AgentActivationResultAck,
+    AgentActivationResultReconcile, AgentActivationResultSubmit, EncodingProfile, Frame, FrameKind,
     HOST_REQUEST_INVOKE_READ_WIRE_ID, HostRequestEnvelope, HostRequestInvokeReadPayload,
     HostRequestResultBody, LocalReadAttempt, MessageType, ProtocolPayload, ProtocolVersion,
     RequestIdentity, host_request_operation_id,
@@ -235,7 +234,7 @@ impl DaemonKernelClient {
     #[cfg(windows)]
     pub async fn claim_agent_activation_ticket(
         &self,
-    ) -> Result<Option<AgentActivationResolutionTicket>, super::DaemonError> {
+    ) -> Result<super::ActivationClaim, super::DaemonError> {
         let value = self
             .transact_async("agent_activation_claim", serde_json::json!({}))
             .await
@@ -243,12 +242,14 @@ impl DaemonKernelClient {
         let ticket = value.get("ticket").cloned().ok_or_else(|| {
             super::DaemonError::Kernel("Kernel claim response omitted ticket".to_owned())
         })?;
-        match ticket {
-            serde_json::Value::Null => Ok(None),
-            value => serde_json::from_value(value)
-                .map(Some)
-                .map_err(|error| super::DaemonError::Kernel(error.to_string())),
-        }
+        // Thread the raw claim bytes before any typed decode: the classifier
+        // decodes inside and carries these exact bytes verbatim on Invalid.
+        // Encoding here fails closed through the existing Kernel error; no
+        // fallback bytes are ever fabricated. `b"null"` still classifies to
+        // the Empty null-poll backoff inside.
+        let ticket_bytes = serde_json::to_vec(&ticket)
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        Ok(super::classify_claimed_ticket_value(&ticket_bytes))
     }
 
     #[cfg(windows)]
@@ -1083,7 +1084,8 @@ mod tests {
         capability: &str,
         fence: &StateFence,
         payload_sha256: &str,
-    ) -> Result<HostRequestEnvelope, Box<dyn std::error::Error>> {        HostRequestEnvelope {
+    ) -> Result<HostRequestEnvelope, Box<dyn std::error::Error>> {
+        HostRequestEnvelope {
             wire_id: HOST_REQUEST_WIRE_ID.to_owned(),
             wire_version: HostRequestEnvelope::CONTRACT_VERSION,
             kind: HostRequestKind::Invocation,
@@ -1448,8 +1450,9 @@ mod tests {
         // the pair all fail closed — never Ok-empty, never invented.
         let mut foreign_attempt = serde_json::to_value(&attempt)
             .map_err(|error| format!("attempt must encode: {error}"))?;
-        foreign_attempt["operation_id"] =
-            serde_json::json!("hostreq:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        foreign_attempt["operation_id"] = serde_json::json!(
+            "hostreq:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        );
         for bad in [
             serde_json::json!({ "pair": { "tool": tool.clone(), "attempt": attempt.clone() } }),
             serde_json::json!({ "pair": { "envelope": envelope.clone(), "tool": tool.clone() } }),

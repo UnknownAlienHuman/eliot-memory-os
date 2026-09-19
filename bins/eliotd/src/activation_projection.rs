@@ -28,6 +28,161 @@ use eliot_protocol::{
 
 use crate::DaemonError;
 
+/// Validate-first outcome for one Kernel-claimed activation ticket value.
+///
+/// Pure claim-arm classification (issue #202, owner decision ii): no Governor
+/// handle enters and none is read. `Empty` is the null-poll backoff;
+/// `Valid` carries the ticket that may proceed to the deadline gate and the
+/// Governor-backed v2 resolver; `Invalid` preserves the exact claimed bytes
+/// plus a bounded reason for the terminal artifact. Decoding or validating
+/// here never constructs a digest-bound result and never schedules a retry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ActivationClaim {
+    /// Null claim: empty queue, back off until the next tick.
+    Empty,
+    /// Claimed bytes decoded and validated; may proceed down the claim arm.
+    /// Boxed: the ticket is the large variant next to the small
+    /// empty/invalid shapes.
+    Valid(Box<AgentActivationResolutionTicket>),
+    /// Claimed bytes failed closed validation before any Governor read.
+    /// The holder must construct the terminal artifact, idle the flight,
+    /// and continue the loop: no typed-result submit, no reconcile of typed
+    /// results, no retry of the rejected revision.
+    Invalid {
+        /// Raw claimed ticket bytes preserved verbatim.
+        ticket_bytes: Vec<u8>,
+        /// Bounded validation-failure reason (never a semantic digest).
+        reason: String,
+    },
+}
+
+/// Rejects a caller-supplied reason fail-closed into the terminal-artifact
+/// shape (no surrounding whitespace, no control characters, no replacement
+/// characters). Only trimming is applied; empty or oversize input stays that
+/// way so the protocol constructor fails closed instead of inventing or
+/// silently trimming a reason. Control-containing or replacement-char input
+/// is refused here (existing [`DaemonError::Lifecycle`]), never accepted.
+fn sanitize_invalid_ticket_reason(raw: &str) -> Result<String, DaemonError> {
+    if raw.chars().any(char::is_control) || raw.contains('\u{FFFD}') {
+        return Err(DaemonError::Lifecycle(
+            "invalid ticket reason contains control or replacement characters".to_owned(),
+        ));
+    }
+    Ok(raw.trim().to_owned())
+}
+
+/// Bounds one owner error for embedding in a classified-claim reason so the
+/// resulting `ticket invalid: …` / `ticket unparseable: …` reason always fits
+/// the 512-byte terminal wire bound. Truncation applies only to the embedded
+/// owner error text on the classification path, never to a direct
+/// `terminal_for_invalid_ticket` caller reason.
+fn bound_claim_error_text(raw: &str) -> String {
+    let cleaned = raw
+        .trim()
+        .chars()
+        .map(|cell| {
+            if cell.is_control() || cell == '\u{FFFD}' {
+                '?'
+            } else {
+                cell
+            }
+        })
+        .collect::<String>()
+        .trim()
+        .to_owned();
+    if cleaned.is_empty() {
+        return "unclassified validation failure".to_owned();
+    }
+    let mut bounded = String::new();
+    for cell in cleaned.chars() {
+        if bounded.len() + cell.len_utf8() > 400 {
+            break;
+        }
+        bounded.push(cell);
+    }
+    bounded.trim().to_owned()
+}
+
+/// Classifies one Kernel-claimed ticket from its raw transport bytes,
+/// validate-first.
+///
+/// The caller threads the exact claimed bytes observed on the transport
+/// (encoded before any typed decode at the claim call site); decoding happens
+/// inside, first to a value for the null-poll check, then to the typed
+/// ticket. `Null` (`b"null"`) is the empty-queue backoff (`Empty`). Any
+/// present ticket decodes and validates from the same bytes: a decode or
+/// validation failure yields `Invalid` carrying those bytes verbatim and a
+/// bounded reason. Bytes are only ever copied verbatim; no fallback bytes are
+/// fabricated on any path. No Governor is read, no digest-bound result is
+/// constructed, and no retry is scheduled on this path.
+#[must_use]
+pub fn classify_claimed_ticket_value(ticket_bytes: &[u8]) -> ActivationClaim {
+    let value: serde_json::Value = match serde_json::from_slice(ticket_bytes) {
+        Ok(value) => value,
+        Err(error) => {
+            return ActivationClaim::Invalid {
+                ticket_bytes: ticket_bytes.to_vec(),
+                reason: format!(
+                    "ticket unparseable: {}",
+                    bound_claim_error_text(&error.to_string())
+                ),
+            };
+        }
+    };
+    if value.is_null() {
+        return ActivationClaim::Empty;
+    }
+    let ticket: AgentActivationResolutionTicket = match serde_json::from_slice(ticket_bytes) {
+        Ok(ticket) => ticket,
+        Err(error) => {
+            return ActivationClaim::Invalid {
+                ticket_bytes: ticket_bytes.to_vec(),
+                reason: format!(
+                    "ticket unparseable: {}",
+                    bound_claim_error_text(&error.to_string())
+                ),
+            };
+        }
+    };
+    match ticket.validate() {
+        Ok(()) => ActivationClaim::Valid(Box::new(ticket)),
+        Err(error) => ActivationClaim::Invalid {
+            ticket_bytes: ticket_bytes.to_vec(),
+            reason: format!(
+                "ticket invalid: {}",
+                bound_claim_error_text(&error.to_string())
+            ),
+        },
+    }
+}
+
+/// Constructs the terminal artifact for one invalid claim (issue #202).
+///
+/// Takes only the preserved bytes, the bounded reason, and the observation
+/// clock. No Governor handle is taken or read, no digest-bound result is
+/// constructed, and no retry is scheduled: the artifact `is_terminal` always
+/// holds, so holders idle the flight and continue the loop instead of
+/// retrying the rejected revision.
+///
+/// # Errors
+///
+/// Returns [`DaemonError::Lifecycle`] when the bytes, reason, or clock fail
+/// the closed terminal shape.
+pub fn terminal_for_invalid_ticket(
+    ticket_bytes: Vec<u8>,
+    reason: &str,
+    observed_at_unix_ms: u64,
+) -> Result<eliot_protocol::AgentActivationInvalidTicket, DaemonError> {
+    let artifact = eliot_protocol::AgentActivationInvalidTicket::rejected(
+        ticket_bytes,
+        sanitize_invalid_ticket_reason(reason)?,
+        observed_at_unix_ms,
+    )
+    .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
+    debug_assert!(artifact.is_terminal());
+    Ok(artifact)
+}
+
 /// Read-only semantic-resolution boundary owned by eliotd.
 ///
 /// The boundary accepts only a Kernel-issued correlation ticket. It does not

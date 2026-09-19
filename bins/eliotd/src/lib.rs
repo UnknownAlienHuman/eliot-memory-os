@@ -55,6 +55,9 @@ mod store_failure_projection;
 mod task_lifecycle_adapters;
 
 pub use activation_projection::AgentActivationResolver;
+pub use activation_projection::{
+    ActivationClaim, classify_claimed_ticket_value, terminal_for_invalid_ticket,
+};
 pub use agent_fabric::{
     ActivationAuthorityPort, ActivationEvidence, AdmissionAuthorityPort, AgentFabric,
     AgentFabricDescriptor, AttemptLifecycle, AttemptResultRecord, COORDINATOR_CRATE,
