@@ -89,6 +89,18 @@
 //! `order_key` ranks per dimension with no scalar, `rank` records plan
 //! position only, and the canonical wire carries the twelve dimensions with
 //! no score/average key).
+//! Ownership ruling 610/37,41-42 (this slice, planner-side observation only;
+//! no new APIs, zero `src/` changes): 610/37 OWNED via the existing
+//! fail-closed boundaries (every malformed identity/schema/binding/digest
+//! shape returns `Err`, never panics; empty denominators plan empty);
+//! 610/41 OWNED via the existing frozen identity (`compute_digest` binds
+//! plan id, task, scope, fence, draft/rival/affordance/manifest digests and
+//! both tables, so any changed rival, affordance or policy alters the digest
+//! and any replayed foreign digest fails closed); 610/42 OWNED via the
+//! candidate-only binding observed through the plan value and canonical wire
+//! (every probe binds only `ProbeAffordanceRef` id/digest with lineage and
+//! carries no provider/tool/agent/process/network/store/execution/
+//! reservation/promotion/Finish path).
 //! Queue note: 610/27 stays queued — its per-dimension enforcement reading
 //! overlaps need-src 610/25 (the planner enforces only the `candidates`
 //! bound; every other budget stays advisory per `plan.rs`), so no test-only
@@ -1713,4 +1725,411 @@ fn replay_and_changed_input_policy_conflict() {
         "a replay with a blanked digest must fail closed"
     );
     assert_eq!(must(base.compute_digest()), base.digest);
+}
+
+// WORK_UNIT_CASE: 610/37
+#[test]
+fn bounded_malformed_inputs_fail_closed_without_panic() {
+    malformed_identities_fail_closed();
+    malformed_schema_inputs_fail_closed();
+    malformed_plan_bindings_fail_closed();
+    tampered_and_empty_plans_stay_bounded();
+}
+
+fn malformed_identities_fail_closed() {
+    for seed in ["", "   ", "bad\u{0}id"] {
+        assert!(
+            ArtifactId::new(seed).is_err(),
+            "malformed artifact identity must fail closed"
+        );
+        assert!(
+            TaskId::new(seed).is_err(),
+            "malformed task identity must fail closed"
+        );
+    }
+    assert!(EpochLineageId::new("not-a-uuid").is_err());
+    assert!(EpochLineageId::new("").is_err());
+}
+
+fn malformed_schema_inputs_fail_closed() {
+    assert!(
+        ValidityBounds::new("", None, None, "v1", Precision("file".to_owned())).is_err(),
+        "blank validity scope must fail closed"
+    );
+    assert!(
+        ValidityBounds::new(
+            "scope-1",
+            Some(10),
+            Some(5),
+            "v1",
+            Precision("file".to_owned())
+        )
+        .is_err(),
+        "an inverted validity window must fail closed"
+    );
+
+    let target_objective = objective("objective-malformed");
+    let targets = vec![ResultTarget::Gap {
+        objective: target_objective.clone(),
+    }];
+    let branch = ResultBranch {
+        result_id: artifact("malformed-branch"),
+        value: PossibleResultValue::Unknown {
+            reason: "outcome not yet observed".to_owned(),
+        },
+        updates: vec![ResultUpdate::Gap {
+            objective: target_objective.clone(),
+            meaning: GapUpdateMeaning::RemainsOpen,
+        }],
+    };
+    assert!(
+        PossibleResultSchema::new(
+            artifact("malformed-empty-targets"),
+            Vec::new(),
+            vec![branch.clone()]
+        )
+        .is_err(),
+        "empty target denominator must fail closed"
+    );
+    assert!(
+        PossibleResultSchema::new(
+            artifact("malformed-empty-branches"),
+            targets.clone(),
+            Vec::new()
+        )
+        .is_err(),
+        "empty branch set must fail closed"
+    );
+}
+
+fn malformed_plan_bindings_fail_closed() {
+    let bundle = bundle();
+    let bound_draft = draft();
+    let rivals = rivals();
+    let bound_limits = limits(Some(16));
+    let descriptors = vec![descriptor("aff-malformed", gap_target("claim-malformed"))];
+
+    let wrong_scope = must(InquiryAffordanceSet::new(InquiryAffordanceSetParams {
+        set_id: artifact("affordance-set-1"),
+        task_id: task(),
+        scope: "scope-other".to_owned(),
+        state_fence: fence(),
+        descriptors: descriptors.clone(),
+    }));
+    assert!(
+        ProbePlan::new(ProbePlanParams {
+            plan_id: artifact("plan-1"),
+            bundle: &bundle,
+            draft: &bound_draft,
+            rivals: &rivals,
+            affordances: &wrong_scope,
+            limits: &bound_limits,
+        })
+        .is_err(),
+        "scope disagreement must fail the planner closed"
+    );
+
+    let lineage = must(EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000"));
+    let sequence = must(NonZeroU64::new(2).ok_or("sequence must be non-zero"));
+    let drifted_epoch = must(EpochId::new(lineage, sequence));
+    let mut drifted = bound_draft.clone();
+    drifted.state_fence = StateFence::new(drifted_epoch, ResourceGeneration::genesis());
+    let affordances = affordance_set(descriptors);
+    assert!(
+        ProbePlan::new(ProbePlanParams {
+            plan_id: artifact("plan-1"),
+            bundle: &bundle,
+            draft: &drifted,
+            rivals: &rivals,
+            affordances: &affordances,
+            limits: &bound_limits,
+        })
+        .is_err(),
+        "fence disagreement must fail the planner closed"
+    );
+
+    let mut over = bound_limits;
+    over.candidates = Some(17);
+    assert!(
+        ProbePlan::new(ProbePlanParams {
+            plan_id: artifact("plan-1"),
+            bundle: &bundle,
+            draft: &bound_draft,
+            rivals: &rivals,
+            affordances: &affordances,
+            limits: &over,
+        })
+        .is_err(),
+        "an over-ceiling candidate bound must fail the planner closed"
+    );
+}
+
+fn tampered_and_empty_plans_stay_bounded() {
+    let plan = plan_for(
+        vec![descriptor(
+            "aff-malformed-ok",
+            gap_target("claim-malformed-ok"),
+        )],
+        Some(16),
+    );
+    must(plan.validate());
+    let mut blanked = plan.clone();
+    blanked.digest = "0".repeat(64);
+    assert!(blanked.validate().is_err());
+    let mut reranked = plan.clone();
+    reranked.probes[0].rank = reranked.probes[0].rank.saturating_add(1);
+    assert!(reranked.validate().is_err());
+    assert_eq!(must(plan.compute_digest()), plan.digest);
+
+    let empty = plan_for(Vec::new(), Some(16));
+    must(empty.validate());
+    assert!(empty.probes.is_empty());
+    assert!(empty.omissions.is_empty());
+}
+
+fn rivals_with(set_id: &str, policy_digest_seed: &str) -> RivalModelSet {
+    must(RivalModelSet::new(RivalModelSetParams {
+        set_id: artifact(set_id),
+        task_id: task(),
+        scope: "scope-1".to_owned(),
+        state_fence: fence(),
+        bundle_digest: digest("bundle"),
+        validated_input_digest: digest("validated"),
+        declaration_set: RivalDeclarationSetRef {
+            set_id: artifact("rival-decl-1"),
+            digest: digest("decl"),
+        },
+        policy_id: "policy-1".to_owned(),
+        policy_digest: digest(policy_digest_seed),
+        discriminators: Vec::new(),
+        unresolved: Vec::new(),
+        model_coverage: RivalCoverageSummary {
+            status: RivalCoverageStatus::Unknown,
+            denominator_digest: None,
+        },
+        source_coverage: RivalCoverageSummary {
+            status: RivalCoverageStatus::Unknown,
+            denominator_digest: None,
+        },
+        omission_frontier: Vec::new(),
+    }))
+}
+
+fn plan_for_with(
+    descriptors: Vec<InquiryAffordanceDescriptor>,
+    rivals: &RivalModelSet,
+    candidates: Option<u64>,
+) -> ProbePlan {
+    let bundle = bundle();
+    let draft = draft();
+    let affordances = affordance_set(descriptors);
+    let limits = limits(candidates);
+    must(ProbePlan::new(ProbePlanParams {
+        plan_id: artifact("plan-1"),
+        bundle: &bundle,
+        draft: &draft,
+        rivals,
+        affordances: &affordances,
+        limits: &limits,
+    }))
+}
+
+// WORK_UNIT_CASE: 610/41
+#[test]
+fn changed_rival_affordance_policy_invalidates_identity() {
+    let base = plan_for(
+        vec![descriptor("aff-identity-a", gap_target("claim-identity-a"))],
+        Some(16),
+    );
+    must(base.validate());
+    assert_eq!(base.probes.len(), 1);
+    assert!(!base.rival_digest.trim().is_empty());
+    assert!(!base.affordance_digest.trim().is_empty());
+
+    let rival_set_changed = plan_for_with(
+        vec![descriptor("aff-identity-a", gap_target("claim-identity-a"))],
+        &rivals_with("rival-set-2", "policy"),
+        Some(16),
+    );
+    must(rival_set_changed.validate());
+    assert_ne!(
+        rival_set_changed.rival_digest, base.rival_digest,
+        "a changed rival set must invalidate the bound rival identity"
+    );
+    assert_eq!(rival_set_changed.affordance_digest, base.affordance_digest);
+    assert_ne!(rival_set_changed.digest, base.digest);
+    assert_ne!(rival_set_changed, base);
+
+    let rival_policy_changed = plan_for_with(
+        vec![descriptor("aff-identity-a", gap_target("claim-identity-a"))],
+        &rivals_with("rival-set-1", "policy-rotated"),
+        Some(16),
+    );
+    must(rival_policy_changed.validate());
+    assert_ne!(
+        rival_policy_changed.rival_digest, base.rival_digest,
+        "a changed rival policy must invalidate the bound rival identity"
+    );
+    assert_ne!(rival_policy_changed.digest, base.digest);
+    assert_ne!(rival_policy_changed, base);
+
+    let affordance_changed = plan_for(
+        vec![descriptor("aff-identity-b", gap_target("claim-identity-b"))],
+        Some(16),
+    );
+    must(affordance_changed.validate());
+    assert_ne!(
+        affordance_changed.affordance_digest, base.affordance_digest,
+        "a changed affordance denominator must invalidate the bound affordance identity"
+    );
+    assert_eq!(affordance_changed.rival_digest, base.rival_digest);
+    assert_ne!(affordance_changed.digest, base.digest);
+    assert_ne!(affordance_changed, base);
+
+    let tight = plan_for(
+        vec![
+            descriptor("aff-identity-a", gap_target("claim-identity-a")),
+            descriptor("aff-identity-c", gap_target("claim-identity-c")),
+        ],
+        Some(1),
+    );
+    let loose = plan_for(
+        vec![
+            descriptor("aff-identity-a", gap_target("claim-identity-a")),
+            descriptor("aff-identity-c", gap_target("claim-identity-c")),
+        ],
+        Some(16),
+    );
+    must(tight.validate());
+    must(loose.validate());
+    assert_eq!(tight.probes.len(), 1);
+    assert_eq!(tight.omissions.len(), 1);
+    assert_eq!(tight.omissions[0].kind, OmissionKind::OverBudget);
+    assert_ne!(
+        tight.digest, loose.digest,
+        "a changed candidate policy must invalidate the plan identity"
+    );
+    assert_ne!(tight, loose);
+
+    let mut foreign = base.clone();
+    foreign.digest.clone_from(&rival_set_changed.digest);
+    assert!(
+        foreign.validate().is_err(),
+        "replaying a foreign rival-bound digest against unchanged tables must fail closed"
+    );
+    let mut foreign_affordance = base.clone();
+    foreign_affordance
+        .digest
+        .clone_from(&affordance_changed.digest);
+    assert!(
+        foreign_affordance.validate().is_err(),
+        "replaying a foreign affordance-bound digest against unchanged tables must fail closed"
+    );
+    assert_eq!(must(base.compute_digest()), base.digest);
+}
+
+// WORK_UNIT_CASE: 610/42
+#[test]
+fn no_execution_reservation_promotion_finish_path() {
+    let plan = plan_for(
+        vec![
+            descriptor(
+                "aff-noexec-a",
+                rival_target("pred-ne-left", "pred-ne-right"),
+            ),
+            descriptor("aff-noexec-b", gap_target("claim-noexec")),
+        ],
+        Some(16),
+    );
+    must(plan.validate());
+    assert_eq!(plan.probes.len(), 2);
+    assert!(plan.omissions.is_empty());
+
+    for probe in &plan.probes {
+        must(probe.target.validate());
+        must(probe.affordance.validate());
+        must(probe.result_schema.validate());
+        must(probe.dimensions.validate());
+        assert_eq!(probe.probe_id, probe.affordance.affordance_id);
+        assert!(!probe.affordance.affordance_digest.trim().is_empty());
+        for merged in &probe.merged_affordances {
+            assert_ne!(*merged, probe.probe_id);
+        }
+        assert!(!probe.expected_discrimination.trim().is_empty());
+        assert_rendered_has_no_execution_path(&format!("{probe:?}"));
+    }
+
+    assert_rendered_has_no_execution_path(&format!("{plan:?}"));
+    assert_wire_has_no_execution_key(&plan);
+    assert_eq!(must(plan.compute_digest()), plan.digest);
+}
+
+fn assert_rendered_has_no_execution_path(rendered: &str) {
+    for token in [
+        "provider",
+        "Provider",
+        "execution",
+        "Execution",
+        "reservation",
+        "Reservation",
+        "promotion",
+        "Promotion",
+        "Finish",
+        "schedule",
+        "Schedule",
+        "process::Command",
+        "std::process",
+        "tokio",
+        "reqwest",
+        "hyper",
+        "Agent::",
+        "Network",
+        "Store::",
+    ] {
+        assert!(
+            !rendered.contains(token),
+            "candidate plan must carry no {token} execution path, got {rendered}"
+        );
+    }
+}
+
+fn assert_wire_has_no_execution_key(plan: &ProbePlan) {
+    let wire = must(canonical_bytes(plan));
+    let text = String::from_utf8(wire).expect("canonical plan wire must be UTF-8");
+    let folded = text.to_lowercase();
+    for key in [
+        "\"provider\"",
+        "\"tool\"",
+        "\"agent\"",
+        "\"process\"",
+        "\"network\"",
+        "\"store\"",
+        "\"execution\"",
+        "\"reservation\"",
+        "\"promotion\"",
+        "\"finish\"",
+        "\"schedule\"",
+        "\"route\"",
+        "\"credential\"",
+        "\"lease\"",
+        "\"secret\"",
+        "\"token\"",
+        "\"handle\"",
+    ] {
+        assert!(
+            !folded.contains(key),
+            "canonical plan wire must carry no {key} execution key"
+        );
+    }
+    for key in [
+        "\"probes\"",
+        "\"omissions\"",
+        "\"result_schema\"",
+        "\"expected_discrimination\"",
+    ] {
+        assert!(
+            folded.contains(key),
+            "canonical plan wire must preserve the candidate-only {key} shape"
+        );
+    }
 }
