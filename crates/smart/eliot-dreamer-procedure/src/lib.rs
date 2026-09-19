@@ -38,18 +38,18 @@
 //! validation. There are no placeholder, mock, canned, or pseudo paths:
 //! every branch binds an explicit input field.
 //!
-//! Test coverage note: 38 of 50 numbered 661 work-unit markers execute here;
-//! 40 tests run because two supporting regression tests are not numbered
+//! Test coverage note: 39 of 50 numbered 661 work-unit markers execute here;
+//! 41 tests run because two supporting regression tests are not numbered
 //! work-unit cases.
 //! Executed cases: 661/1, 661/2, 661/3, 661/4, 661/5, 661/6, 661/7, 661/8,
 //! 661/9, 661/10, 661/11, 661/12, 661/13, 661/14, 661/15, 661/16, 661/17,
 //! 661/18, 661/19, 661/20, 661/21, 661/22, 661/23, 661/25, 661/26,
 //! 661/27, 661/28, 661/29, 661/30, 661/31, 661/32, 661/33, 661/34,
-//! 661/40, 661/41, 661/42, 661/43, and 661/44. The remaining 12 of 50 are deferred per
+//! 661/40, 661/41, 661/42, 661/43, 661/44, and 661/45. The remaining 11 of 50 are deferred per
 //! START.md s1; #965 admission is separate. Deferred: 661/24 (pending
 //! candidate-visible causal receipt design - `ProcedureCandidate` currently
 //! exposes only `candidate_digest`, no typed causal receipt field), 661/35,
-//! 661/36, 661/37, 661/38, 661/39, 661/45, 661/46, 661/47,
+//! 661/36, 661/37, 661/38, 661/39, 661/46, 661/47,
 //! 661/48, 661/49, and 661/50.
 
 #![forbid(unsafe_code)]
@@ -3457,6 +3457,79 @@ mod tests {
             changed_policy_candidate.candidate_digest,
             first.candidate_digest
         );
+    }
+
+    // WORK_UNIT_CASE: 661/45
+    #[test]
+    fn case_45_bounded_malformed_property_inputs_never_panic() {
+        fn assert_malformed<F>(label: &str, mutate: F)
+        where
+            F: FnOnce(
+                &mut ValidatedCurationItem,
+                &mut GroundedDreamDraft,
+                &mut ProcedureEvidence,
+                &mut CapabilityEnvSnapshot,
+                &mut ExistingProcedureSnapshot,
+                &mut ProcedurePolicy,
+            ),
+        {
+            let mut item = test_item();
+            let mut grounded = test_grounded();
+            let mut evidence = test_evidence();
+            let mut capability = test_capability();
+            let mut existing = test_existing();
+            let mut policy = test_policy();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                mutate(
+                    &mut item,
+                    &mut grounded,
+                    &mut evidence,
+                    &mut capability,
+                    &mut existing,
+                    &mut policy,
+                );
+                propose_procedure(&item, &grounded, &evidence, &capability, &existing, &policy)
+                    .is_err()
+            }));
+            assert!(result.is_ok(), "{label} panicked");
+            assert!(result.unwrap_or(false), "{label} did not fail closed");
+        }
+
+        assert_malformed("blank procedure handle", |item, _, _, _, _, _| {
+            if let eliot_dreamer_contracts::CurationPayload::Procedure(payload) = &mut item.payload
+            {
+                payload.procedure.clear();
+            }
+        });
+        assert_malformed("oversized declared step count", |item, _, _, _, _, _| {
+            if let eliot_dreamer_contracts::CurationPayload::Procedure(payload) = &mut item.payload
+            {
+                payload.steps = u32::MAX;
+            }
+        });
+        assert_malformed("invalid bundle digest", |_, _, evidence, _, _, _| {
+            evidence.frozen_bundle_digest = "not-a-digest".to_owned();
+        });
+        assert_malformed("unsorted episode refs", |_, _, evidence, _, _, _| {
+            evidence.episode_refs = vec!["e-2".to_owned(), "e-1".to_owned()];
+        });
+        assert_malformed("missing capability refs", |_, _, _, capability, _, _| {
+            capability.capability_refs.clear();
+        });
+        assert_malformed("zero policy step ceiling", |_, _, _, _, _, policy| {
+            policy.max_steps = 0;
+        });
+        assert_malformed(
+            "control character in policy note",
+            |_, _, _, _, _, policy| {
+                policy.transfer_note = "transfer\nwithout effect".to_owned();
+            },
+        );
+        assert_malformed("oversized predecessor list", |_, _, _, _, existing, _| {
+            existing.existing_ids = (0..=MAX_PREDECESSORS)
+                .map(|index| format!("existing-{index:03}"))
+                .collect();
+        });
     }
 
     // WORK_UNIT_CASE: 661/26
