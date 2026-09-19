@@ -222,6 +222,31 @@ pub fn stale_fence_for_resolved_mismatch(
         .map_err(|error| DaemonError::Lifecycle(error.to_string()))
 }
 
+/// Typed fail-closed result when the Governor→protocol mapping rejects a
+/// classified outcome for the exact ticket (#202).
+///
+/// The Governor classified the ticket, but the classified data cannot bind it
+/// (e.g. a `NotReady` retry window at or past the Kernel deadline, an
+/// ambiguity finding with fewer than two candidates, or a stale-fence
+/// observation equal to the ticket fence). Returning the mapping error would
+/// kill the daemon loop and leave the ticket unanswered; a `FailedInternal`
+/// terminal result answers the ticket instead, so the Kernel records a typed
+/// disposition and the daemon stays alive for the next claim. The failed
+/// outcome kind is carried in the bounded failure handle; the full mapping
+/// error stays in daemon diagnostics. Never produces a binding and never
+/// retries the same ticket.
+pub fn failed_internal_for_mapping_failure(
+    ticket: &AgentActivationResolutionTicket,
+    outcome_kind: &str,
+    resolved_at_unix_ms: u64,
+) -> Result<AgentActivationResolutionResult, DaemonError> {
+    let disposition = AgentActivationResolutionDisposition::FailedInternal {
+        failure_handle: format!("daemon.mapping-failure:{outcome_kind}:recovery"),
+    };
+    AgentActivationResolutionResult::new(ticket, resolved_at_unix_ms, disposition)
+        .map_err(|error| DaemonError::Lifecycle(error.to_string()))
+}
+
 #[cfg(test)]
 mod projection_tests {
     #![allow(clippy::expect_used)] // test-only panic-acceptable (#838).
@@ -528,5 +553,43 @@ mod projection_tests {
         let err = stale_fence_for_resolved_mismatch(&ticket, ticket.state_fence.clone(), 50)
             .expect_err("equal fence must reject");
         assert!(err.to_string().contains("observed_state_fence"));
+    }
+
+    #[test]
+    fn not_ready_past_deadline_falls_back_to_failed_internal() {
+        // #202: a Governor NotReady whose retry window reaches the Kernel
+        // deadline cannot bind the ticket, so the mapping rejects it. The
+        // fallback answers the same ticket with a typed FailedInternal
+        // terminal result instead of leaving it unanswered.
+        let ticket = test_ticket(100);
+        let outcome = fixture_not_ready("dep", "rev", 100);
+        let err = map_governor_outcome_to_protocol(&ticket, outcome, 50).expect_err("must reject");
+        assert!(err.to_string().contains("not_before_unix_ms"));
+        let result =
+            failed_internal_for_mapping_failure(&ticket, "NOT_READY", 50).expect("fallback result");
+        assert!(matches!(
+            result.disposition,
+            AgentActivationResolutionDisposition::FailedInternal { .. }
+        ));
+        assert!(result.resolved_binding().is_none());
+        assert!(!result.is_transient_retry());
+        result.validate_against(&ticket).expect("valid binding");
+    }
+
+    #[test]
+    fn failed_internal_fallback_carries_kind_and_no_binding() {
+        // #202: the fallback carries the failed outcome kind in its bounded
+        // failure handle and never produces a binding.
+        let ticket = test_ticket(100);
+        let result = failed_internal_for_mapping_failure(&ticket, "SCOPE_AMBIGUOUS", 50)
+            .expect("fallback result");
+        match &result.disposition {
+            AgentActivationResolutionDisposition::FailedInternal { failure_handle } => {
+                assert!(failure_handle.contains("SCOPE_AMBIGUOUS"));
+            }
+            _ => panic!("expected FailedInternal"),
+        }
+        assert!(result.resolved_binding().is_none());
+        result.validate_against(&ticket).expect("valid binding");
     }
 }
