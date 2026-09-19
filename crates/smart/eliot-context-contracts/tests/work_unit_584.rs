@@ -1539,3 +1539,328 @@ fn non_recoverable_omission_needs_typed_reason_and_no_reversibility() {
     assert_eq!(reversible.non_recoverable_reason, None);
     assert!(reversible.expansion.is_some());
 }
+
+// WORK_UNIT_CASE: 584/37
+#[test]
+fn exact_route_capacity_arithmetic() {
+    let balanced = EconomyAllocations {
+        fixed_overhead: 2,
+        output_reserve: 3,
+        review_reserve: 4,
+        admitted_required: 10,
+        admitted_optional: 0,
+        remaining_headroom: 99_981,
+        route_capacity: 100_000,
+    };
+    balanced.reconcile().expect("exact sum reconciles");
+    let encoded = serde_json::to_string(&balanced).expect("allocations encoding");
+    let decoded: EconomyAllocations =
+        serde_json::from_str(&encoded).expect("allocations round-trip");
+    assert_eq!(decoded, balanced);
+
+    // One byte of headroom removed breaks exact equality.
+    let short_headroom = EconomyAllocations {
+        remaining_headroom: 99_980,
+        ..balanced
+    };
+    assert_eq!(
+        short_headroom.reconcile(),
+        Err(ContextError::EconomyMismatch)
+    );
+
+    // One byte of capacity removed breaks exact equality.
+    let short_capacity = EconomyAllocations {
+        route_capacity: 99_999,
+        ..balanced
+    };
+    assert_eq!(
+        short_capacity.reconcile(),
+        Err(ContextError::EconomyMismatch)
+    );
+
+    // Overflow cannot fabricate a valid receipt.
+    let overflowing = EconomyAllocations {
+        fixed_overhead: u64::MAX,
+        output_reserve: 1,
+        review_reserve: 0,
+        admitted_required: 0,
+        admitted_optional: 0,
+        remaining_headroom: 0,
+        route_capacity: u64::MAX,
+    };
+    assert_eq!(overflowing.reconcile(), Err(ContextError::Overflow));
+}
+
+// WORK_UNIT_CASE: 584/38
+#[test]
+fn fixed_overhead_output_review_reserves_stay_independent() {
+    let limits = CapacityLimits {
+        route_capacity: 100_000,
+        fixed_overhead: 2,
+        output_reserve: 3,
+        review_reserve: 4,
+    };
+    limits.validate().expect("independent reserves validate");
+
+    // Each reserve alone can exhaust a small route; none is folded away.
+    let fixed_heavy = CapacityLimits {
+        route_capacity: 10,
+        fixed_overhead: 11,
+        output_reserve: 0,
+        review_reserve: 0,
+    };
+    assert_eq!(fixed_heavy.validate(), Err(ContextError::CapacityExceeded));
+    let output_heavy = CapacityLimits {
+        route_capacity: 10,
+        fixed_overhead: 0,
+        output_reserve: 11,
+        review_reserve: 0,
+    };
+    assert_eq!(output_heavy.validate(), Err(ContextError::CapacityExceeded));
+    let review_heavy = CapacityLimits {
+        route_capacity: 10,
+        fixed_overhead: 0,
+        output_reserve: 0,
+        review_reserve: 11,
+    };
+    assert_eq!(review_heavy.validate(), Err(ContextError::CapacityExceeded));
+
+    // Same total with a folded distribution is a distinct value, not a silent merge.
+    let folded = EconomyAllocations {
+        fixed_overhead: 9,
+        output_reserve: 0,
+        review_reserve: 0,
+        admitted_required: 10,
+        admitted_optional: 0,
+        remaining_headroom: 99_981,
+        route_capacity: 100_000,
+    };
+    let split = EconomyAllocations {
+        fixed_overhead: 2,
+        output_reserve: 3,
+        review_reserve: 4,
+        admitted_required: 10,
+        admitted_optional: 0,
+        remaining_headroom: 99_981,
+        route_capacity: 100_000,
+    };
+    split.reconcile().expect("split reserves reconcile");
+    folded.reconcile().expect("folded reserves reconcile");
+    assert_ne!(split, folded);
+    assert_ne!(
+        canonical_digest(&split).expect("split digest"),
+        canonical_digest(&folded).expect("folded digest")
+    );
+}
+
+// WORK_UNIT_CASE: 584/39
+#[test]
+fn required_optional_provider_allocations_reconcile_with_membership() {
+    admitted_single()
+        .validate()
+        .expect("baseline admitted set reconciles");
+
+    // Required/optional split is tracked separately: same total, distinct values.
+    let required_heavy = EconomyAllocations {
+        fixed_overhead: 2,
+        output_reserve: 3,
+        review_reserve: 4,
+        admitted_required: 10,
+        admitted_optional: 0,
+        remaining_headroom: 99_981,
+        route_capacity: 100_000,
+    };
+    let optional_heavy = EconomyAllocations {
+        admitted_required: 0,
+        admitted_optional: 10,
+        ..required_heavy
+    };
+    required_heavy
+        .reconcile()
+        .expect("required-heavy reconciles");
+    optional_heavy
+        .reconcile()
+        .expect("optional-heavy reconciles");
+    assert_ne!(required_heavy, optional_heavy);
+
+    // Dropping the admitted identity breaks conservation at the receipt boundary.
+    let mut unadmitted = admitted_single();
+    unadmitted.economy.admitted.clear();
+    assert_eq!(
+        unadmitted.economy.validate(),
+        Err(ContextError::EconomyMismatch)
+    );
+    assert!(unadmitted.validate().is_err());
+
+    // Inflating required allocation without headroom compensation breaks arithmetic.
+    let mut over_allocated = admitted_single();
+    over_allocated.economy.allocations.admitted_required += 1;
+    assert_eq!(
+        over_allocated.economy.validate(),
+        Err(ContextError::EconomyMismatch)
+    );
+}
+
+// WORK_UNIT_CASE: 584/40
+#[test]
+fn unknown_overflow_accounting_cannot_become_known_zero_or_valid() {
+    // Overflow is a typed failure, never a valid receipt.
+    let overflowing = EconomyAllocations {
+        fixed_overhead: u64::MAX,
+        output_reserve: 1,
+        review_reserve: 0,
+        admitted_required: 0,
+        admitted_optional: 0,
+        remaining_headroom: 0,
+        route_capacity: u64::MAX,
+    };
+    assert_eq!(overflowing.reconcile(), Err(ContextError::Overflow));
+
+    // Zeroed components against a nonzero route do not reconcile.
+    let zeroed = EconomyAllocations {
+        fixed_overhead: 0,
+        output_reserve: 0,
+        review_reserve: 0,
+        admitted_required: 0,
+        admitted_optional: 0,
+        remaining_headroom: 0,
+        route_capacity: 100,
+    };
+    assert_eq!(zeroed.reconcile(), Err(ContextError::EconomyMismatch));
+
+    // An empty denominator cannot validate as a complete receipt.
+    let mut empty_denominator = admitted_single();
+    empty_denominator.economy.requested.clear();
+    empty_denominator.economy.admitted.clear();
+    assert_eq!(
+        empty_denominator.economy.validate(),
+        Err(ContextError::EconomyMismatch)
+    );
+
+    // Unknown/unavailable/STU observations validate as measurements but never
+    // prove fit; they stay unknown instead of becoming known-zero.
+    let context = binding();
+    for status in [MeasurementStatus::Unknown, MeasurementStatus::Unavailable] {
+        let mut measurement = exact_measurement(&context);
+        measurement.status = status;
+        measurement.validate().expect("unknown status validates");
+        assert_eq!(
+            measurement.proves_fit(100_000),
+            Err(ContextError::UnknownMeasurement)
+        );
+    }
+    let mut stu_only = exact_measurement(&context);
+    stu_only.status = MeasurementStatus::ConservativeStu;
+    stu_only.stu_estimate = Some(StuEstimate {
+        value: 13,
+        empirical: true,
+    });
+    stu_only.validate().expect("STU estimate validates");
+    assert_eq!(
+        stu_only.proves_fit(100_000),
+        Err(ContextError::UnknownMeasurement)
+    );
+}
+
+// WORK_UNIT_CASE: 584/41
+#[test]
+fn serialized_utf8_byte_measurement_including_non_ascii() {
+    assert_eq!(SerializedContextMeasurement::utf8_bytes("hello"), 5);
+    assert_eq!(SerializedContextMeasurement::utf8_bytes(""), 0);
+    // "é" is one char but two UTF-8 bytes.
+    assert_eq!("é".chars().count(), 1);
+    assert_eq!(SerializedContextMeasurement::utf8_bytes("é"), 2);
+    assert_eq!(SerializedContextMeasurement::utf8_bytes("héllo"), 6);
+    // Emoji and CJK characters are multibyte.
+    assert_eq!(SerializedContextMeasurement::utf8_bytes("a😀"), 5);
+    assert_eq!(SerializedContextMeasurement::utf8_bytes("日本"), 6);
+
+    // Exact bytes drive the capacity proof: reserves (2+3+4) + 13 bytes = 22.
+    let context = binding();
+    let measurement = exact_measurement(&context);
+    assert_eq!(measurement.rendered_utf8_bytes, 13);
+    measurement.validate().expect("exact measurement validates");
+    assert!(measurement.proves_fit(22).expect("boundary proves fit"),);
+    assert!(
+        !measurement
+            .proves_fit(21)
+            .expect("one byte over still evaluates"),
+    );
+}
+
+// WORK_UNIT_CASE: 584/42
+#[test]
+fn stu_estimate_and_exact_tokenizer_evidence_stay_distinct() {
+    let context = binding();
+
+    // Each status has a distinct wire spelling.
+    let wires = [
+        (MeasurementStatus::ExactUtf8, "\"EXACT_UTF8\""),
+        (MeasurementStatus::ConservativeStu, "\"CONSERVATIVE_STU\""),
+        (MeasurementStatus::ExactTokenizer, "\"EXACT_TOKENIZER\""),
+        (MeasurementStatus::Unknown, "\"UNKNOWN\""),
+        (MeasurementStatus::Unavailable, "\"UNAVAILABLE\""),
+    ];
+    for (status, wire) in wires {
+        let encoded = serde_json::to_string(&status).expect("status encoding");
+        assert_eq!(encoded, wire);
+        assert_eq!(
+            serde_json::from_str::<MeasurementStatus>(&encoded).expect("status round-trip"),
+            status
+        );
+    }
+
+    // STU without an estimate and tokenizer status without an observation fail closed.
+    let mut stu_missing = exact_measurement(&context);
+    stu_missing.status = MeasurementStatus::ConservativeStu;
+    stu_missing.stu_estimate = None;
+    assert_eq!(
+        stu_missing.validate(),
+        Err(ContextError::UnknownMeasurement)
+    );
+    let mut tokenizer_missing = exact_measurement(&context);
+    tokenizer_missing.status = MeasurementStatus::ExactTokenizer;
+    tokenizer_missing.tokenizer = None;
+    assert_eq!(
+        tokenizer_missing.validate(),
+        Err(ContextError::UnknownMeasurement)
+    );
+
+    // A conservative STU estimate validates but never proves fit.
+    let mut stu = exact_measurement(&context);
+    stu.status = MeasurementStatus::ConservativeStu;
+    stu.stu_estimate = Some(StuEstimate {
+        value: 13,
+        empirical: true,
+    });
+    stu.validate().expect("STU with estimate validates");
+    assert_eq!(
+        stu.proves_fit(100_000),
+        Err(ContextError::UnknownMeasurement)
+    );
+
+    // An exact tokenizer observation validates and proves fit from tokens,
+    // independently of the byte count.
+    let mut observed = exact_measurement(&context);
+    observed.status = MeasurementStatus::ExactTokenizer;
+    observed.rendered_utf8_bytes = 9999;
+    observed.tokenizer = Some(TokenizerObservation {
+        tokenizer_id: "fixture-tokenizer".to_owned(),
+        tokenizer_version: "v1".to_owned(),
+        tokenizer_hash: digest(),
+        tokens: 13,
+    });
+    observed
+        .validate()
+        .expect("tokenizer observation validates");
+    assert!(
+        observed
+            .proves_fit(22)
+            .expect("tokenizer boundary proves fit"),
+    );
+    assert!(
+        !observed
+            .proves_fit(21)
+            .expect("tokenizer over-budget still evaluates"),
+    );
+}
