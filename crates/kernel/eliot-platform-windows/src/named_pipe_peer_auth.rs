@@ -494,10 +494,27 @@ impl Drop for ImpersonationGuard {
         // this attempt happens exactly once and execution continues without
         // termination or a second restore. Failure keeps the fail-stop
         // abort: a privileged server thread must not continue under an
-        // untrusted client token (accepted least-privilege boundary), and
-        // no bounded containment-evidence owner exists to
-        // report-and-continue, so none is invented here.
+        // untrusted client token (accepted least-privilege boundary,
+        // A00-03: hidden expansion of authority), so none is invented here.
+        // Before termination the raw Win32 code is recorded through the
+        // bounded stderr evidence channel
+        // (`crate::installer_root::emit_abort_boundary_evidence`):
+        // fixed-shape bytes, no allocation, no reentrancy, no token or
+        // principal values.
+        // ABORT_BOUNDARY site="peer-auth/impersonation-drop" invariant="untrusted-client-token"
         if unsafe { windows_sys::Win32::Security::RevertToSelf() } == 0 {
+            // Safe immediate read of the failed-call code: no OS call sits
+            // between RevertToSelf and this probe, so no new unsafe block is
+            // introduced on the emergency path.
+            let code = std::io::Error::last_os_error()
+                .raw_os_error()
+                .and_then(|code| u32::try_from(code).ok())
+                .unwrap_or(u32::MAX);
+            crate::installer_root::emit_abort_boundary_evidence(
+                "peer-auth/impersonation-drop",
+                "RevertToSelf",
+                code,
+            );
             std::process::abort();
         }
         self.active = false;
