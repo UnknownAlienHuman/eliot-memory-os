@@ -2688,6 +2688,37 @@ mod tests {
         assert!(is_hex64_lower(&candidate.candidate_digest));
     }
 
+    // WORK_UNIT_CASE: 661/34
+    #[test]
+    fn case_34_duplicate_existing_procedure_identity_stays_inert() {
+        let item = test_item();
+        let grounded = test_grounded();
+        let evidence = test_evidence();
+        let capability = test_capability();
+        let mut existing = test_existing();
+        existing.duplicate_of = Some("rotate-caption".to_owned());
+        let policy = test_policy();
+        let candidate = match propose_procedure(
+            &item,
+            &grounded,
+            &evidence,
+            &capability,
+            &existing,
+            &policy,
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("duplicate existing procedure stays inert: {err:?}"),
+        };
+
+        assert_eq!(candidate.outcome, ProcedureOutcome::Duplicate);
+        assert_eq!(candidate.procedure_handle, "rotate-caption");
+        assert_eq!(
+            outcome_rejection_hint(&candidate.outcome),
+            Some(CurationRejectionCode::IdentityMismatch)
+        );
+        assert!(is_hex64_lower(&candidate.candidate_digest));
+    }
+
     // WORK_UNIT_CASE: 661/13
     #[test]
     fn case_13_valid_acyclic_graph_completes_deterministically() {
