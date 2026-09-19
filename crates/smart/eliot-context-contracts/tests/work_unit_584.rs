@@ -766,3 +766,133 @@ fn freshness_privacy_authority_evidence_proof_cannot_widen() {
         ))
     );
 }
+
+fn safety_floor_with(availability: AtomAvailability) -> DecisionSafetyFloor {
+    let measurement = (availability == AtomAvailability::PresentCurrent).then(|| MeasurementRef {
+        digest: digest(),
+        serializer: "fixture-serde-v1".to_owned(),
+    });
+    DecisionSafetyFloor {
+        binding: binding(),
+        mandatory_atoms: vec![id("atom")],
+        mandatory_roles: vec![SemanticRole::Goal],
+        providers: denominator(),
+        members: vec![SafetyFloorMember {
+            atom_id: id("atom"),
+            role: SemanticRole::Goal,
+            availability,
+            measurement,
+            required_dependencies: Vec::new(),
+        }],
+        interpretation_dependencies: Vec::new(),
+        rule_evidence: id("floor-rule"),
+        capacity: CapacityLimits {
+            route_capacity: 100,
+            fixed_overhead: 1,
+            output_reserve: 1,
+            review_reserve: 1,
+        },
+    }
+}
+
+// WORK_UNIT_CASE: 584/19
+#[test]
+fn exact_complete_safety_floor_succeeds() {
+    let floor = safety_floor_with(AtomAvailability::PresentCurrent);
+    floor.validate().expect("complete floor validates");
+    assert_eq!(
+        floor.incomplete().expect("complete floor rechecks"),
+        None,
+        "a fully present-current floor has no gaps"
+    );
+}
+
+// WORK_UNIT_CASE: 584/20
+#[test]
+fn missing_mandatory_member_stays_missing() {
+    let floor = safety_floor_with(AtomAvailability::Missing);
+    floor.validate().expect("missing floor shape validates");
+    let incomplete = floor
+        .incomplete()
+        .expect("missing floor rechecks")
+        .expect("missing member cannot be complete");
+    assert_eq!(incomplete.missing, vec![id("atom")]);
+    assert!(incomplete.stale.is_empty());
+    assert!(incomplete.blocked.is_empty());
+    assert!(incomplete.unavailable.is_empty());
+    assert!(incomplete.omitted.is_empty());
+    assert!(incomplete.oversized.is_empty());
+    incomplete.validate().expect("incomplete outcome validates");
+}
+
+// WORK_UNIT_CASE: 584/21
+#[test]
+fn stale_mandatory_member_stays_stale() {
+    let floor = safety_floor_with(AtomAvailability::Stale);
+    floor.validate().expect("stale floor shape validates");
+    let incomplete = floor
+        .incomplete()
+        .expect("stale floor rechecks")
+        .expect("stale member cannot be complete");
+    assert_eq!(incomplete.stale, vec![id("atom")]);
+    assert!(incomplete.missing.is_empty());
+    assert!(incomplete.blocked.is_empty());
+    assert!(incomplete.unavailable.is_empty());
+    assert!(incomplete.omitted.is_empty());
+    assert!(incomplete.oversized.is_empty());
+    incomplete.validate().expect("incomplete outcome validates");
+}
+
+// WORK_UNIT_CASE: 584/22
+#[test]
+fn blocked_mandatory_member_stays_blocked() {
+    let floor = safety_floor_with(AtomAvailability::Blocked);
+    floor.validate().expect("blocked floor shape validates");
+    let incomplete = floor
+        .incomplete()
+        .expect("blocked floor rechecks")
+        .expect("blocked member cannot be complete");
+    assert_eq!(incomplete.blocked, vec![id("atom")]);
+    assert!(incomplete.missing.is_empty());
+    assert!(incomplete.stale.is_empty());
+    assert!(incomplete.unavailable.is_empty());
+    assert!(incomplete.omitted.is_empty());
+    assert!(incomplete.oversized.is_empty());
+    incomplete.validate().expect("incomplete outcome validates");
+}
+
+// WORK_UNIT_CASE: 584/23
+#[test]
+fn unavailable_mandatory_member_stays_unavailable() {
+    let floor = safety_floor_with(AtomAvailability::Unavailable);
+    floor.validate().expect("unavailable floor shape validates");
+    let incomplete = floor
+        .incomplete()
+        .expect("unavailable floor rechecks")
+        .expect("unavailable member cannot be complete");
+    assert_eq!(incomplete.unavailable, vec![id("atom")]);
+    assert!(incomplete.missing.is_empty());
+    assert!(incomplete.stale.is_empty());
+    assert!(incomplete.blocked.is_empty());
+    assert!(incomplete.omitted.is_empty());
+    assert!(incomplete.oversized.is_empty());
+    incomplete.validate().expect("incomplete outcome validates");
+}
+
+// WORK_UNIT_CASE: 584/24
+#[test]
+fn omitted_mandatory_member_cannot_be_complete() {
+    let floor = safety_floor_with(AtomAvailability::Omitted);
+    floor.validate().expect("omitted floor shape validates");
+    let incomplete = floor
+        .incomplete()
+        .expect("omitted floor rechecks")
+        .expect("omitted member cannot be complete");
+    assert_eq!(incomplete.omitted, vec![id("atom")]);
+    assert!(incomplete.missing.is_empty());
+    assert!(incomplete.stale.is_empty());
+    assert!(incomplete.blocked.is_empty());
+    assert!(incomplete.unavailable.is_empty());
+    assert!(incomplete.oversized.is_empty());
+    incomplete.validate().expect("incomplete outcome validates");
+}
