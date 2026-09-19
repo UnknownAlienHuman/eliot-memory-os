@@ -38,7 +38,7 @@
 //! validation. There are no placeholder, mock, canned, or pseudo paths:
 //! every branch binds an explicit input field.
 //!
-//! Test coverage note: 22 of 50 `WORK_UNIT_CASE 661/*` cases execute here
+//! Test coverage note: 23 of 50 `WORK_UNIT_CASE 661/*` cases execute here
 //! (661/1 valid completes, 661/2 exact vocabulary, 661/3 wrong subtype fails
 //! closed, 661/4 bundle mismatch fails closed, 661/5
 //! duplicate identity disposition, 661/6 success and failure evidence,
@@ -54,9 +54,9 @@
 //! 661/21 valid semantic verifier,
 //! 661/22 missing verifier blocks completeness,
 //! 661/25 exact idempotent replay, 661/26 unknown-effect blocks retry). The
-//! remaining 28 of 50 are deferred per START.md s1; #965 admission is
+//! remaining 27 of 50 are deferred per START.md s1; #965 admission is
 //! separate. Deferred: 661/15, 661/16,
-//! 661/23, 661/24, 661/27, 661/28, 661/29, 661/30, 661/31,
+//! 661/24, 661/27, 661/28, 661/29, 661/30, 661/31,
 //! 661/32, 661/33, 661/34, 661/35, 661/36, 661/37, 661/38, 661/39, 661/40,
 //! 661/41, 661/42, 661/43, 661/44, 661/45, 661/46, 661/47, 661/48, 661/49,
 //! 661/50.
@@ -1707,6 +1707,9 @@ fn select_evidence_disposition(
     if claims_success_is_mechanism(&evidence.mechanism_note) {
         return Some(ProcedureOutcome::Empirical);
     }
+    if claims_chronology_is_causality(&evidence.mechanism_note) {
+        return Some(ProcedureOutcome::Empirical);
+    }
     if evidence.mechanism_note.trim().is_empty() {
         return Some(ProcedureOutcome::Empirical);
     }
@@ -3049,6 +3052,35 @@ mod tests {
         for disposition in &candidate.step_dispositions {
             assert_eq!(disposition.kind, StepDispositionKind::Empirical);
         }
+        assert_eq!(
+            candidate.transfer.preserved_counterevidence_refs,
+            vec!["ce-1".to_owned()]
+        );
+    }
+
+    // WORK_UNIT_CASE: 661/23
+    #[test]
+    fn case_23_chronology_does_not_prove_causality() {
+        let item = test_item();
+        let grounded = test_grounded();
+        let capability = test_capability();
+        let existing = test_existing();
+        let policy = test_policy();
+        let mut evidence = test_evidence();
+        evidence.mechanism_note =
+            "the observed sequence came before and therefore causes the result".to_owned();
+
+        let candidate =
+            match propose_procedure(&item, &grounded, &evidence, &capability, &existing, &policy) {
+                Ok(candidate) => candidate,
+                Err(err) => panic!("chronology-causality claim stays inert: {err:?}"),
+            };
+
+        assert_eq!(candidate.outcome, ProcedureOutcome::Empirical);
+        assert_eq!(
+            outcome_rejection_hint(&candidate.outcome),
+            Some(CurationRejectionCode::UnsupportedPrecision)
+        );
         assert_eq!(
             candidate.transfer.preserved_counterevidence_refs,
             vec!["ce-1".to_owned()]
