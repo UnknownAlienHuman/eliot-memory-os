@@ -51,24 +51,26 @@
 //! validation. There are no placeholder, mock, canned, or pseudo paths:
 //! every branch binds an explicit input field.
 //!
-//! Test coverage note: 14 of 51 `WORK_UNIT_CASE 675/*` cases execute here
+//! Test coverage note: 17 of 51 `WORK_UNIT_CASE 675/*` cases execute here
 //! (675/1 valid two-rival diagnosis with minimal experiment, 675/2 exact
 //! Objective/acceptance/recovery/identity binding, 675/3 wrong job/payload
 //! fails closed, 675/4 fence and receipt mismatch fails closed, 675/5
 //! wrong/stale source context fails closed, 675/6 product failure despite
 //! local green stays complete, 675/7 local/infrastructure failure without
 //! product delta stays insufficient, 675/8 proxy metric cannot prove
-//! Product delta, 675/9 missing instrumentation stays unknown, 675/11
-//! current-pass discriminator cannot prove failure, 675/15 unchanged
-//! equivalent retry requires mechanism review, 675/21 mandatory conflict
-//! analysis missing yields insufficiency, 675/32 identical rival predictions
-//! are nondiscriminative, 675/45 exact replay is deterministic). The
-//! remaining 37 of 51 are deferred per START.md s1; #969 admission is
-//! separate. Deferred: 675/10, 675/12, 675/13, 675/14, 675/16, 675/17, 675/18,
-//! 675/19, 675/20, 675/22, 675/23, 675/24, 675/25, 675/26, 675/27, 675/28,
-//! 675/29, 675/30, 675/31, 675/33, 675/34, 675/35, 675/36, 675/37, 675/38,
-//! 675/39, 675/40, 675/41, 675/42, 675/43, 675/44, 675/46, 675/47, 675/48,
-//! 675/49, 675/50, 675/51.
+//! Product delta, 675/9 missing instrumentation stays unknown, 675/10 exact
+//! currently failing discriminator grounds diagnosis, 675/11
+//! current-pass discriminator cannot prove failure, 675/12 nonreplayable
+//! discriminator proves nothing, 675/13 post-hoc evidence needs independent
+//! confirmation, 675/15 unchanged equivalent retry requires mechanism
+//! review, 675/21 mandatory conflict analysis missing yields insufficiency,
+//! 675/32 identical rival predictions are nondiscriminative, 675/45 exact
+//! replay is deterministic). The remaining 34 of 51 are deferred per
+//! START.md s1; #969 admission is separate. Deferred: 675/14, 675/16,
+//! 675/17, 675/18, 675/19, 675/20, 675/22, 675/23, 675/24, 675/25, 675/26,
+//! 675/27, 675/28, 675/29, 675/30, 675/31, 675/33, 675/34, 675/35, 675/36,
+//! 675/37, 675/38, 675/39, 675/40, 675/41, 675/42, 675/43, 675/44, 675/46,
+//! 675/47, 675/48, 675/49, 675/50, 675/51.
 
 #![forbid(unsafe_code)]
 
@@ -165,6 +167,21 @@ pub const SLICE3_IMPLEMENTED_CASES: &[u8] = &[6, 7, 9];
 pub const SLICE3_REMAINDER_CASES: &[u8] = &[
     10, 12, 13, 14, 16, 17, 18, 19, 20, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 33, 34, 35, 36, 37,
     38, 39, 40, 41, 42, 43, 44, 46, 47, 48, 49, 50, 51,
+];
+
+/// Cases covered by the fourth bounded implementation slice.
+///
+/// Discriminator qualification: exact currently failing discriminator
+/// (675/10), nonreplayable discriminator proving nothing (675/12), and
+/// post-hoc evidence requiring independent confirmation (675/13). Every
+/// path binds the existing `DiscriminatorEvidence` and hub
+/// `CurrentObservation` vocabulary; no new canonical contracts are required.
+pub const SLICE4_IMPLEMENTED_CASES: &[u8] = &[10, 12, 13];
+
+/// Cases deliberately left for later slices after slice 4.
+pub const SLICE4_REMAINDER_CASES: &[u8] = &[
+    14, 16, 17, 18, 19, 20, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 33, 34, 35, 36, 37, 38, 39, 40,
+    41, 42, 43, 44, 46, 47, 48, 49, 50, 51,
 ];
 
 /// Canonical A03 evidence supplied to the first A40 package boundary.
@@ -2666,7 +2683,7 @@ pub fn diagnose_development_gap(
 }
 
 // ---------------------------------------------------------------------------
-// Tests (proportionate: 14 of 51 cases; remainder deferred per START.md s1).
+// Tests (proportionate: 17 of 51 cases; remainder deferred per START.md s1).
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -2693,6 +2710,8 @@ mod tests {
     use super::SLICE2_REMAINDER_CASES;
     use super::SLICE3_IMPLEMENTED_CASES;
     use super::SLICE3_REMAINDER_CASES;
+    use super::SLICE4_IMPLEMENTED_CASES;
+    use super::SLICE4_REMAINDER_CASES;
     use super::diagnose_development_gap;
     use super::is_hex64_lower;
     use super::outcome_rejection_hint;
@@ -3070,6 +3089,23 @@ mod tests {
             .chain(SLICE2_IMPLEMENTED_CASES.iter())
             .chain(SLICE3_IMPLEMENTED_CASES.iter())
             .chain(SLICE3_REMAINDER_CASES.iter())
+        {
+            assert!((1..=51).contains(case));
+            assert!(!seen[usize::from(*case)]);
+            seen[usize::from(*case)] = true;
+        }
+        assert!(seen[1..].iter().all(|present| *present));
+    }
+
+    #[test]
+    fn slice4_remainder_map_covers_the_declared_denominator() {
+        let mut seen = [false; 52];
+        for case in SLICE1_IMPLEMENTED_CASES
+            .iter()
+            .chain(SLICE2_IMPLEMENTED_CASES.iter())
+            .chain(SLICE3_IMPLEMENTED_CASES.iter())
+            .chain(SLICE4_IMPLEMENTED_CASES.iter())
+            .chain(SLICE4_REMAINDER_CASES.iter())
         {
             assert!((1..=51).contains(case));
             assert!(!seen[usize::from(*case)]);
@@ -3536,6 +3572,48 @@ mod tests {
         assert!(candidate.preservation.overall().is_ok());
     }
 
+    // WORK_UNIT_CASE: 675/10
+    #[test]
+    fn case_10_exact_currently_failing_discriminator_grounds_diagnosis() {
+        let discriminator = test_discriminator();
+        assert!(discriminator.predeclared);
+        assert!(discriminator.preconditions_satisfied);
+        assert!(discriminator.replayable);
+        assert!(discriminator.replay_input_digest.is_some());
+        let candidate = run_valid();
+        assert_eq!(candidate.outcome, DiagnosisOutcome::Complete);
+        assert!(candidate.recommended_experiment.is_some());
+        assert!(candidate.preservation.overall().is_ok());
+
+        let job = test_job();
+        let draft = test_draft();
+        let product = test_product();
+        let mut unsatisfied = test_discriminator();
+        unsatisfied.preconditions_satisfied = false;
+        let repairs = test_repairs();
+        let conflict = test_conflict();
+        let rivals = test_rivals();
+        let common_mode = test_common_mode();
+        let experiments = [test_experiment()].to_vec();
+        let policy = test_policy();
+        let Ok(rejected) = diagnose_development_gap(
+            &job,
+            &draft,
+            &product,
+            &unsatisfied,
+            &repairs,
+            &conflict,
+            &rivals,
+            &common_mode,
+            &experiments,
+            &policy,
+        ) else {
+            panic!("unsatisfied preconditions stay an inert outcome");
+        };
+        assert_eq!(rejected.outcome, DiagnosisOutcome::Rejected);
+        assert_eq!(rejected.recommended_experiment, None);
+    }
+
     // WORK_UNIT_CASE: 675/11
     #[test]
     fn case_11_current_pass_discriminator_cannot_prove_failure() {
@@ -3573,6 +3651,114 @@ mod tests {
         };
         assert_eq!(candidate.outcome, DiagnosisOutcome::Rejected);
         assert_eq!(candidate.recommended_experiment, None);
+    }
+
+    // WORK_UNIT_CASE: 675/12
+    #[test]
+    fn case_12_nonreplayable_discriminator_proves_nothing() {
+        let job = test_job();
+        let draft = test_draft();
+        let product = test_product();
+        let repairs = test_repairs();
+        let conflict = test_conflict();
+        let rivals = test_rivals();
+        let common_mode = test_common_mode();
+        let experiments = [test_experiment()].to_vec();
+        let policy = test_policy();
+
+        let mut nonreplayable = test_discriminator();
+        nonreplayable.replayable = false;
+        let Ok(rejected) = diagnose_development_gap(
+            &job,
+            &draft,
+            &product,
+            &nonreplayable,
+            &repairs,
+            &conflict,
+            &rivals,
+            &common_mode,
+            &experiments,
+            &policy,
+        ) else {
+            panic!("nonreplayable discriminator stays an inert outcome");
+        };
+        assert_eq!(rejected.outcome, DiagnosisOutcome::Rejected);
+        assert_eq!(rejected.recommended_experiment, None);
+        assert!(rejected.preservation.overall().is_ok());
+
+        let mut missing_pin = test_discriminator();
+        missing_pin.replay_input_digest = None;
+        let Ok(unpinned) = diagnose_development_gap(
+            &job,
+            &draft,
+            &product,
+            &missing_pin,
+            &repairs,
+            &conflict,
+            &rivals,
+            &common_mode,
+            &experiments,
+            &policy,
+        ) else {
+            panic!("missing replay pin stays an inert outcome");
+        };
+        assert_eq!(unpinned.outcome, DiagnosisOutcome::Rejected);
+        assert_eq!(unpinned.recommended_experiment, None);
+    }
+
+    // WORK_UNIT_CASE: 675/13
+    #[test]
+    fn case_13_post_hoc_evidence_needs_independent_confirmation() {
+        let job = test_job();
+        let draft = test_draft();
+        let product = test_product();
+        let repairs = test_repairs();
+        let conflict = test_conflict();
+        let rivals = test_rivals();
+        let common_mode = test_common_mode();
+        let experiments = [test_experiment()].to_vec();
+        let policy = test_policy();
+
+        let mut post_hoc = test_discriminator();
+        post_hoc.predeclared = false;
+        post_hoc.independently_confirmed = false;
+        let Ok(unconfirmed) = diagnose_development_gap(
+            &job,
+            &draft,
+            &product,
+            &post_hoc,
+            &repairs,
+            &conflict,
+            &rivals,
+            &common_mode,
+            &experiments,
+            &policy,
+        ) else {
+            panic!("unconfirmed post-hoc evidence stays an inert outcome");
+        };
+        assert_eq!(unconfirmed.outcome, DiagnosisOutcome::Insufficient);
+        assert_eq!(unconfirmed.recommended_experiment, None);
+        assert!(unconfirmed.preservation.overall().is_ok());
+
+        let mut confirmed = test_discriminator();
+        confirmed.predeclared = false;
+        confirmed.independently_confirmed = true;
+        let Ok(grounded) = diagnose_development_gap(
+            &job,
+            &draft,
+            &product,
+            &confirmed,
+            &repairs,
+            &conflict,
+            &rivals,
+            &common_mode,
+            &experiments,
+            &policy,
+        ) else {
+            panic!("independently confirmed evidence stays admissible");
+        };
+        assert_eq!(grounded.outcome, DiagnosisOutcome::Complete);
+        assert!(grounded.recommended_experiment.is_some());
     }
 
     // WORK_UNIT_CASE: 675/15
