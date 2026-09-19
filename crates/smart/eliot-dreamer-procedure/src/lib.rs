@@ -1704,9 +1704,10 @@ fn select_evidence_disposition(
             return Some(ProcedureOutcome::MissingVerifier);
         }
     }
-    if claims_success_is_mechanism(&evidence.mechanism_note)
-        || claims_chronology_is_causality(&evidence.mechanism_note)
-    {
+    if claims_success_is_mechanism(&evidence.mechanism_note) {
+        return Some(ProcedureOutcome::Empirical);
+    }
+    if claims_chronology_is_causality(&evidence.mechanism_note) {
         return Some(ProcedureOutcome::Empirical);
     }
     if evidence.mechanism_note.trim().is_empty() {
@@ -3059,7 +3060,7 @@ mod tests {
 
     // WORK_UNIT_CASE: 661/23
     #[test]
-    fn case_23_observed_sequence_does_not_prove_mechanism() {
+    fn case_23_chronology_does_not_prove_causality() {
         let item = test_item();
         let grounded = test_grounded();
         let capability = test_capability();
@@ -3072,7 +3073,7 @@ mod tests {
         let candidate =
             match propose_procedure(&item, &grounded, &evidence, &capability, &existing, &policy) {
                 Ok(candidate) => candidate,
-                Err(err) => panic!("unsupported mechanism claim stays inert: {err:?}"),
+                Err(err) => panic!("chronology-causality claim stays inert: {err:?}"),
             };
 
         assert_eq!(candidate.outcome, ProcedureOutcome::Empirical);
