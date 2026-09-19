@@ -17,12 +17,14 @@
 //! causal/material relevance is an A-03 materiality judgment, and `src/plan.rs`
 //! contains zero `ResultUpdate`/`RivalUpdateMeaning` inspections, so no
 //! planner-only implementation exists without inventing APIs (slice-4 Opus
-//! audit ruling on 610/11 applies identically). Cases 610/22,
-//! 610/27, 610/37, 610/41-42 (effect-policy,
-//! budget/malformed/identity/no-execution) are QUEUED and out of
+//! audit ruling on 610/11 applies identically). Cases 610/27, 610/37, 610/41-42
+//! (budget/malformed/identity/no-execution) are QUEUED and out of
 //! this batch; 610/20 needs `src/` owner preservation, 610/23-25,29 need policy,
 //! or budget enforcement the planner explicitly declines (`plan.rs`: effect,
-//! privacy, reversibility and non-candidate budgets stay advisory).
+//! privacy, reversibility and non-candidate budgets stay advisory — the 610/22
+//! slice below proves the candidate-only/external-admission mechanics test-only
+//! and files the `StateChanging`-as-blocked reading as a Contract Challenge
+//! against landed 610/30 instead of inventing the gate).
 //!
 //! Ownership ruling 610/6-10 (planner-side descriptor gating only; no new
 //! APIs): 610/6 OWNED via `InformationDimension::has_expected_gain` false
@@ -105,6 +107,22 @@
 //! overlaps need-src 610/25 (the planner enforces only the `candidates`
 //! bound; every other budget stays advisory per `plan.rs`), so no test-only
 //! proof is claimed here.
+//! Ownership ruling 610/22 (this slice, planner-side observation only; no new
+//! APIs, zero `src/` changes): 610/22 SPLIT — candidate-only admission
+//! mechanics OWNED via the existing plan shape (a `StateChanging` probe with
+//! `Permitted` standing plans with probe identity equal to its affordance
+//! identity, every vector preserved verbatim, and the canonical wire carrying
+//! no execution key, so nothing reserves or addresses execution; the same
+//! effectful descriptor with `RequiresApproval` standing lands in the existing
+//! `AuthorityBlocked` gap citing the approval gate). The `StateChanging`-as-
+//! blocked reading stays OPEN as a Contract Challenge: it contradicts landed
+//! 610/30 (cheaper-riskier `StateChanging` probe retained, PR 2057) and the
+//! issue dominance clause preserving cheaper-but-riskier trade-offs, and no
+//! planner-only gate exists that blocks it without editing landed proof
+//! (banned test loosening) or judging inquiry worth (A-03 materiality).
+//! Cases 610/23-24,39 stay queued — their privacy/consent/reversibility
+//! mandatory set and cleanup/rollback reconciliation vocabulary need a further
+//! normative policy citation per dimension, not invented here.
 //! Ownership ruling 610/34-35 (this slice, planner-side integrity only;
 //! no new APIs, zero `src/` changes): 610/34 OWNED via the existing
 //! declaration-only result path (every branch value stays one of the six
@@ -2168,6 +2186,81 @@ fn exact_external_owner_preserved_verbatim() {
         "owner withheld: gamma"
     );
     assert_eq!(must(tight.compute_digest()), tight.digest);
+}
+
+// WORK_UNIT_CASE: 610/22
+#[test]
+fn effectful_candidate_stays_candidate_only_pending_external_admission() {
+    // SPLIT: candidate-only admission mechanics are OWNED and observed here
+    // with zero `src/` changes; a `StateChanging`-as-blocked gate stays OPEN
+    // pending an owner ruling against landed 610/30 (cheaper-riskier
+    // `StateChanging` probe retained) and the issue dominance clause, which
+    // requires preserving cheaper-but-riskier trade-offs.
+    let mut permitted_params =
+        descriptor_params("aff-effect-permitted", gap_target("claim-effect-permitted"));
+    permitted_params.effect = EffectDimension::StateChanging {
+        detail: "touches scratch state".to_owned(),
+    };
+    let permitted = must(InquiryAffordanceDescriptor::new(permitted_params));
+
+    let mut unapproved_params = descriptor_params(
+        "aff-effect-unapproved",
+        gap_target("claim-effect-unapproved"),
+    );
+    unapproved_params.effect = EffectDimension::StateChanging {
+        detail: "touches scratch state".to_owned(),
+    };
+    unapproved_params.authority = AuthorityDimension::RequiresApproval {
+        reason: "standing needs a governor grant".to_owned(),
+    };
+    let unapproved = must(InquiryAffordanceDescriptor::new(unapproved_params));
+    assert!(!unapproved.authority.is_permitted());
+
+    let plan = plan_for(vec![permitted, unapproved], Some(16));
+    must(plan.validate());
+    assert_eq!(plan.probes.len(), 1);
+    assert_eq!(plan.omissions.len(), 1);
+
+    let probe = &plan.probes[0];
+    assert_eq!(probe.probe_id.as_str(), "aff-effect-permitted");
+    assert_eq!(probe.probe_id, probe.affordance.affordance_id);
+    assert!(probe.merged_affordances.is_empty());
+    match &probe.dimensions.effect {
+        EffectDimension::StateChanging { detail } => {
+            assert_eq!(detail.as_str(), "touches scratch state");
+        }
+        other => panic!("effect vector must stay visible, got {other:?}"),
+    }
+    match &probe.dimensions.authority {
+        AuthorityDimension::Permitted { detail } => {
+            assert_eq!(detail.as_str(), "standing supplied");
+        }
+        other => panic!("authority vector must stay visible, got {other:?}"),
+    }
+    must(probe.target.validate());
+    must(probe.result_schema.validate());
+    assert_wire_has_no_execution_key(&plan);
+
+    let omission = &plan.omissions[0];
+    assert_eq!(omission.kind, OmissionKind::AuthorityBlocked);
+    assert_eq!(
+        omission.affordance.affordance_id.as_str(),
+        "aff-effect-unapproved"
+    );
+    assert!(
+        omission.reason.contains("REQUIRES_APPROVAL"),
+        "unapproved effectful gap must cite the approval gate, got {}",
+        omission.reason
+    );
+    match &omission.dimensions.effect {
+        EffectDimension::StateChanging { detail } => {
+            assert_eq!(detail.as_str(), "touches scratch state");
+        }
+        other => panic!("blocked effect vector must stay visible, got {other:?}"),
+    }
+    must(omission.target.validate());
+    must(omission.dimensions.validate());
+    assert_eq!(must(plan.compute_digest()), plan.digest);
 }
 
 fn assert_rendered_has_no_execution_path(rendered: &str) {
