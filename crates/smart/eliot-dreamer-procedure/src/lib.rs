@@ -38,17 +38,17 @@
 //! validation. There are no placeholder, mock, canned, or pseudo paths:
 //! every branch binds an explicit input field.
 //!
-//! Test coverage note: 30 of 50 `WORK_UNIT_CASE 661/*` cases execute here.
+//! Test coverage note: 33 of 50 `WORK_UNIT_CASE 661/*` cases execute here.
 //! Executed cases: 661/1, 661/2, 661/3, 661/4, 661/5, 661/6, 661/7, 661/8,
 //! 661/9, 661/10, 661/11, 661/12, 661/13, 661/14, 661/15, 661/16, 661/17,
 //! 661/18, 661/19, 661/20, 661/21, 661/22, 661/23, 661/25, 661/26,
-//! 661/27, 661/28, 661/29, 661/30, and 661/34. The remaining 20 of 50 are
-//! deferred per START.md s1; #965 admission is separate. Deferred: 661/24
+//! 661/27, 661/28, 661/29, 661/30, 661/31, 661/32, 661/33, and 661/34. The
+//! remaining 17 of 50 are deferred per START.md s1; #965 admission is
+//! separate. Deferred: 661/24
 //! (pending candidate-visible causal receipt design - `ProcedureCandidate`
 //! currently exposes only `candidate_digest`, no typed causal receipt field),
-//! 661/31, 661/32, 661/33, 661/35, 661/36, 661/37, 661/38, 661/39, 661/40,
-//! 661/41, 661/42, 661/43, 661/44, 661/45, 661/46, 661/47, 661/48, 661/49,
-//! 661/50.
+//! 661/35, 661/36, 661/37, 661/38, 661/39, 661/40, 661/41, 661/42, 661/43,
+//! 661/44, 661/45, 661/46, 661/47, 661/48, 661/49, and 661/50.
 
 #![forbid(unsafe_code)]
 
@@ -2767,6 +2767,127 @@ mod tests {
             Some(CurationRejectionCode::IdentityMismatch)
         );
         assert!(is_hex64_lower(&candidate.candidate_digest));
+    }
+
+    // WORK_UNIT_CASE: 661/31
+    #[test]
+    fn case_31_valid_transfer_stays_bounded_to_source_snapshot() {
+        let item = test_item();
+        let grounded = test_grounded();
+        let evidence = test_evidence();
+        let capability = test_capability();
+        let existing = test_existing();
+        let policy = test_policy();
+        let candidate =
+            match propose_procedure(&item, &grounded, &evidence, &capability, &existing, &policy) {
+                Ok(candidate) => candidate,
+                Err(err) => panic!("bounded transfer request: {err:?}"),
+            };
+
+        assert_eq!(candidate.outcome, ProcedureOutcome::Complete);
+        assert_eq!(candidate.transfer.target_env_id, capability.env_id);
+        assert_eq!(
+            candidate.transfer.target_env_revision,
+            capability.env_revision
+        );
+        assert_eq!(candidate.transfer.target_scope_id, capability.scope_id);
+        assert_eq!(candidate.transfer.target_task_id, capability.task_id);
+        assert_eq!(
+            candidate.transfer.preserved_version_pins,
+            capability.version_pins
+        );
+        assert_eq!(
+            candidate.transfer.preserved_negative_refs,
+            evidence.negative_refs
+        );
+        assert_eq!(
+            candidate.transfer.preserved_counterevidence_refs,
+            evidence.counterexample_refs
+        );
+        assert_eq!(
+            candidate.transfer.preserved_unknown_refs,
+            evidence.unknown_refs
+        );
+        assert!(candidate.transfer.reground_note.contains("re-grounds"));
+    }
+
+    // WORK_UNIT_CASE: 661/32
+    #[test]
+    fn case_32_one_source_success_stays_empirical_and_source_scoped() {
+        let item = test_item();
+        let grounded = test_grounded();
+        let mut evidence = test_evidence();
+        evidence.failure_refs.clear();
+        evidence.counterexample_refs.clear();
+        evidence.mechanism_note =
+            "one source-domain success is not proof of broad transfer".to_owned();
+        evidence.portability_note =
+            "source-domain observation only; target outcome is not observed".to_owned();
+        let capability = test_capability();
+        let existing = test_existing();
+        let policy = test_policy();
+        let candidate =
+            match propose_procedure(&item, &grounded, &evidence, &capability, &existing, &policy) {
+                Ok(candidate) => candidate,
+                Err(err) => panic!("source-only transfer request: {err:?}"),
+            };
+
+        assert_eq!(candidate.outcome, ProcedureOutcome::Empirical);
+        assert_eq!(
+            outcome_rejection_hint(&candidate.outcome),
+            Some(CurationRejectionCode::UnsupportedPrecision)
+        );
+        assert!(candidate.applicability_note.contains("env-1@rev-4"));
+        assert!(candidate.applicability_note.contains("scope-1"));
+        assert!(
+            candidate
+                .applicability_note
+                .contains("target outcome is not observed")
+        );
+        assert_eq!(candidate.transfer.target_env_id, "env-1");
+        assert_eq!(candidate.transfer.target_scope_id, "scope-1");
+    }
+
+    // WORK_UNIT_CASE: 661/33
+    #[test]
+    fn case_33_negative_transfer_and_unknown_target_outcome_remain_visible() {
+        let item = test_item();
+        let grounded = test_grounded();
+        let mut evidence = test_evidence();
+        evidence.negative_refs = vec!["negative-transfer-env-2".to_owned()];
+        evidence.unknown_refs = vec!["target-outcome-unobserved".to_owned()];
+        evidence.portability_note =
+            "source-domain negative transfer is retained; target outcome remains unobserved"
+                .to_owned();
+        let capability = test_capability();
+        let existing = test_existing();
+        let policy = test_policy();
+        let candidate =
+            match propose_procedure(&item, &grounded, &evidence, &capability, &existing, &policy) {
+                Ok(candidate) => candidate,
+                Err(err) => panic!("negative transfer request: {err:?}"),
+            };
+
+        assert_eq!(candidate.outcome, ProcedureOutcome::Complete);
+        assert_eq!(
+            candidate.transfer.preserved_negative_refs,
+            vec!["negative-transfer-env-2".to_owned()]
+        );
+        assert_eq!(
+            candidate.transfer.preserved_counterevidence_refs,
+            vec!["ce-1".to_owned()]
+        );
+        assert_eq!(
+            candidate.transfer.preserved_unknown_refs,
+            vec!["target-outcome-unobserved".to_owned()]
+        );
+        assert_eq!(candidate.transfer.target_env_id, "env-1");
+        assert_eq!(candidate.transfer.target_scope_id, "scope-1");
+        assert!(
+            candidate
+                .applicability_note
+                .contains("target outcome remains unobserved")
+        );
     }
 
     // WORK_UNIT_CASE: 661/13
