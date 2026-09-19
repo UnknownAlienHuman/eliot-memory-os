@@ -3565,4 +3565,51 @@ mod tests {
         over_retry.fanout = 1;
         assert!(validate_one_step_shape(&over_retry).is_ok());
     }
+
+    // WORK_UNIT_CASE: 661/16
+    #[test]
+    fn case_16_missing_owner_precondition_postcondition_or_verifier_fails_closed() {
+        let baseline = match propose_procedure(
+            &test_item(),
+            &test_grounded(),
+            &test_evidence(),
+            &test_capability(),
+            &test_existing(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("baseline step graph: {err:?}"),
+        };
+        let mut missing_owner = baseline.steps[0].clone();
+        missing_owner.owner.clear();
+        assert!(matches!(
+            validate_one_step_shape(&missing_owner),
+            Err(ProcedureError::Shape { field, .. }) if field == "step.owner"
+        ));
+
+        let mut missing_precondition = baseline.steps[0].clone();
+        missing_precondition.precondition.clear();
+        assert!(matches!(
+            validate_one_step_shape(&missing_precondition),
+            Err(ProcedureError::Shape { field, .. }) if field == "step.precondition"
+        ));
+
+        let mut missing_postcondition = baseline.steps[0].clone();
+        missing_postcondition.postcondition.clear();
+        assert!(matches!(
+            validate_one_step_shape(&missing_postcondition),
+            Err(ProcedureError::Shape { field, .. }) if field == "step.postcondition"
+        ));
+
+        let mut missing_verifier = baseline.steps[0].clone();
+        missing_verifier.verifier.clear();
+        assert!(matches!(
+            validate_one_step_shape(&missing_verifier),
+            Err(ProcedureError::Shape { field, .. }) if field == "step.verifier"
+        ));
+        assert!(matches!(
+            check_rollback_owned(std::slice::from_ref(&missing_verifier)),
+            Err(ProcedureError::Shape { field, .. }) if field == "step.owner"
+        ));
+    }
 }
