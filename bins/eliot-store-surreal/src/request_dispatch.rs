@@ -988,11 +988,10 @@ mod dreamer_dispatch_tests {
 
     #[tokio::test]
     async fn dreamer_unsupported_operation_rejected_without_provider_write() {
-        // `Renew` is a well-shaped K0 operation with a permitting role, but
-        // S1 explicitly leaves it unadvertised. The adapter rejects it before
-        // any provider I/O; the endpoint here has no listener, so any
-        // attempted write would surface as `Unavailable` instead of the
-        // asserted `Unsupported`.
+        // This stale expectation dates to e2502d6c. Commit 06be4e269 (#775)
+        // advertises and implements `Renew`; as a supported, admitted,
+        // well-shaped K0 permitting operation, it reaches the unconnected
+        // provider boundary and reports `Unavailable`.
         let fence = test_fence();
         let ctx = test_ctx(&fence);
         let request = make_request(
@@ -1017,13 +1016,16 @@ mod dreamer_dispatch_tests {
                     failure.operation_id,
                     Some(OperationId::new("op-renew-s2").expect("operation id"))
                 );
-                assert_eq!(failure.disposition, StoreFailureDisposition::Unsupported);
+                assert_eq!(failure.disposition, StoreFailureDisposition::Unavailable);
                 assert_eq!(
                     failure.mutation_disposition,
                     StoreMutationDisposition::NotAttempted
                 );
-                assert_eq!(failure.retry_directive, StoreRetryDirective::DoNotRetry);
-                failure.validate().expect("typed unsupported validates");
+                assert_eq!(
+                    failure.retry_directive,
+                    StoreRetryDirective::RetrySameIdentityAfterBackoff
+                );
+                failure.validate().expect("typed unavailable validates");
             }
             other => panic!("unadvertised operation must not write: {other:?}"),
         }
