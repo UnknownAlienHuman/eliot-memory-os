@@ -38,14 +38,17 @@
 //! validation. There are no placeholder, mock, canned, or pseudo paths:
 //! every branch binds an explicit input field.
 //!
-//! Test coverage note: 31 of 50 `WORK_UNIT_CASE 661/*` cases execute here.
+//! Test coverage note: 30 of 50 `WORK_UNIT_CASE 661/*` cases execute here.
 //! Executed cases: 661/1, 661/2, 661/3, 661/4, 661/5, 661/6, 661/7, 661/8,
 //! 661/9, 661/10, 661/11, 661/12, 661/13, 661/14, 661/15, 661/16, 661/17,
-//! 661/18, 661/19, 661/20, 661/21, 661/22, 661/23, 661/24, 661/25, 661/26,
-//! 661/27, 661/28, 661/29, 661/30, and 661/34. The remaining 19 of 50 are
-//! deferred per START.md s1; #965 admission is separate. Deferred: 661/31,
-//! 661/32, 661/33, 661/35, 661/36, 661/37, 661/38, 661/39, 661/40, 661/41,
-//! 661/42, 661/43, 661/44, 661/45, 661/46, 661/47, 661/48, 661/49, 661/50.
+//! 661/18, 661/19, 661/20, 661/21, 661/22, 661/23, 661/25, 661/26,
+//! 661/27, 661/28, 661/29, 661/30, and 661/34. The remaining 20 of 50 are
+//! deferred per START.md s1; #965 admission is separate. Deferred: 661/24
+//! (pending candidate-visible causal receipt design - `ProcedureCandidate`
+//! currently exposes only `candidate_digest`, no typed causal receipt field),
+//! 661/31, 661/32, 661/33, 661/35, 661/36, 661/37, 661/38, 661/39, 661/40,
+//! 661/41, 661/42, 661/43, 661/44, 661/45, 661/46, 661/47, 661/48, 661/49,
+//! 661/50.
 
 #![forbid(unsafe_code)]
 
@@ -3359,7 +3362,7 @@ mod tests {
 
     // WORK_UNIT_CASE: 661/24
     #[test]
-    fn case_24_valid_causal_evidence_preserves_rivals_and_confounders() {
+    fn causal_claim_validates_and_commits_digest_without_candidate_receipt() {
         let claim = match test_causal_claim() {
             Ok(claim) => claim,
             Err(err) => panic!("causal claim fixture: {err}"),
