@@ -175,7 +175,11 @@ impl CanonicalDiagnosisEvidence<'_> {
     }
 
     /// Returns a deterministic digest for the validated canonical evidence
-    /// tuple without promoting it to product or runtime proof.
+    /// tuple.
+    ///
+    /// This digest is an evidence-boundary identifier only. It must never be
+    /// consumed as input to diagnosis recommendation, experiment selection,
+    /// or any Product-facing decision.
     pub fn canonical_digest(&self) -> Result<String, DiagnosisError> {
         self.validate()?;
         let parts = [
@@ -195,6 +199,10 @@ impl CanonicalDiagnosisEvidence<'_> {
 }
 
 /// Validates the canonical A03 evidence boundary and returns its tuple digest.
+///
+/// The returned digest is an evidence-boundary identifier only. It must never
+/// be consumed as input to diagnosis recommendation, experiment selection, or
+/// any Product-facing decision.
 pub fn canonical_diagnosis_evidence_digest(
     product_context: &ProductContext,
     current_discriminator: &CurrentDiscriminator,

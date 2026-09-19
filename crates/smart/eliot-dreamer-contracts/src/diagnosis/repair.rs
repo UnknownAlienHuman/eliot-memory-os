@@ -1101,6 +1101,13 @@ fn check_optional_artifact(
 }
 
 /// Digest-bearing, multi-attempt repair history.
+///
+/// This lineage is intentionally context-free at its record boundary: it does
+/// not carry a top-level [`ProductContext`] or define a lineage-to-product
+/// join. Retained event endpoints validate their own product contexts, and
+/// adjacent known endpoints enforce identity continuity; an owner that has a
+/// separate product context must perform any cross-record join at that owner
+/// boundary.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RepairLineage {
@@ -1151,6 +1158,13 @@ impl RepairLineage {
     /// Performs bounded aggregate checks without imposing stage or causal
     /// continuity rules.
     pub fn validate(&self) -> Result<(), ContractViolation> {
+        // Product-context binding is already enforced for retained event
+        // endpoints by `RepairEvent::validate` (lines 495-519) and for
+        // adjacent known endpoints by `check_adjacent_known_identity`
+        // (lines 793-808), including product identity and scope checks in
+        // `check_adjacent_required_identity`/`check_adjacent_scope`
+        // (lines 811-1058). This record intentionally has no external
+        // lineage-to-product join to enforce here.
         self.validate_shape()?;
         bounded_digest(&self.digest, "repair.lineage.digest")?;
         let expected = self.canonical_digest()?;
