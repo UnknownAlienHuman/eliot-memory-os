@@ -1250,6 +1250,72 @@ impl PrivilegeApi for NativePrivilegeApi {
     }
 }
 
+/// Bounded abort-boundary evidence record for issue #860 guard fail-stops.
+///
+/// Writes one fixed-shape record to the existing process stderr handle:
+/// static site/detail bytes plus the decimal Win32 code. No heap allocation,
+/// no formatting machinery, no logging framework, no panic path; the write
+/// result is intentionally ignored because this runs on the emergency
+/// termination path. No secret, token, or principal value is ever emitted:
+/// only the static site identifier, the restoration stage name, and the
+/// numeric code.
+#[cfg(windows)]
+pub(crate) fn emit_abort_boundary_evidence(site: &'static str, detail: &'static str, code: u32) {
+    use std::io::Write as _;
+
+    let stderr = std::io::stderr();
+    let mut stderr = stderr.lock();
+    let _ = stderr.write_all(b"eliot-abort-boundary site=");
+    let _ = stderr.write_all(site.as_bytes());
+    let _ = stderr.write_all(b" detail=");
+    let _ = stderr.write_all(detail.as_bytes());
+    let _ = stderr.write_all(b" code=");
+    let mut digits = [b'0'; 10];
+    let mut remaining = code;
+    let mut start = digits.len();
+    if remaining == 0 {
+        start -= 1;
+    } else {
+        while remaining > 0 && start > 0 {
+            start -= 1;
+            digits[start] = b'0' + u8::try_from(remaining % 10).unwrap_or(9);
+            remaining /= 10;
+        }
+    }
+    let _ = stderr.write_all(&digits[start..]);
+    let _ = stderr.write_all(b"\n");
+}
+
+/// Maps a typed restoration error to its bounded evidence detail without
+/// losing the exact stage/code. Used only on retained fail-stop paths.
+#[cfg(windows)]
+fn restoration_evidence(error: InstallerRootError) -> (&'static str, u32) {
+    match error {
+        InstallerRootError::Win32 { stage, code } => (installer_root_stage_name(stage), code),
+        _ => ("non-win32-restoration", 0),
+    }
+}
+
+/// Static stage name for bounded evidence records. Mirrors
+/// [`InstallerRootStage`] without allocating.
+#[cfg(windows)]
+fn installer_root_stage_name(stage: InstallerRootStage) -> &'static str {
+    match stage {
+        InstallerRootStage::OpenThreadToken => "OpenThreadToken",
+        InstallerRootStage::OpenProcessToken => "OpenProcessToken",
+        InstallerRootStage::DuplicateToken => "DuplicateToken",
+        InstallerRootStage::QueryPrivilege => "QueryPrivilege",
+        InstallerRootStage::EnablePrivilege => "EnablePrivilege",
+        InstallerRootStage::BindThreadToken => "BindThreadToken",
+        InstallerRootStage::RestorePrivilege => "RestorePrivilege",
+        InstallerRootStage::RestoreThreadToken => "RestoreThreadToken",
+        InstallerRootStage::CreateDirectory => "CreateDirectory",
+        InstallerRootStage::CreateProtectedFile => "CreateProtectedFile",
+        InstallerRootStage::OpenReadback => "OpenReadback",
+        InstallerRootStage::Readback => "Readback",
+    }
+}
+
 #[cfg(windows)]
 struct ScopedRestorePrivilege<'a, A: PrivilegeApi + ?Sized> {
     api: &'a mut A,
@@ -1345,6 +1411,7 @@ impl<'a, A: PrivilegeApi + ?Sized> ScopedRestorePrivilege<'a, A> {
             // restore is reported with its exact RestorePrivilege
             // stage/code, otherwise the primary BindThreadToken failure is
             // preserved. Never success after a failed restoration.
+            // ABORT_BOUNDARY_CONVERTED site="installer-root/construct-compensating-restore" outcome="InstallerRootError::Win32(stage=RestorePrivilege,code)"
             if let Err(restore_code) = restore {
                 return Err(InstallerRootError::Win32 {
                     stage: InstallerRootStage::RestorePrivilege,
@@ -1385,6 +1452,7 @@ impl<'a, A: PrivilegeApi + ?Sized> ScopedRestorePrivilege<'a, A> {
                 .api
                 .restore_restore_privilege(self.duplicate, self.prior_privilege)
         {
+            // ABORT_BOUNDARY_CONVERTED site="installer-root/restore-privilege" outcome="InstallerRootError::Win32(stage=RestorePrivilege,code)"
             failure = Some(InstallerRootError::Win32 {
                 stage: InstallerRootStage::RestorePrivilege,
                 code,
@@ -1393,6 +1461,7 @@ impl<'a, A: PrivilegeApi + ?Sized> ScopedRestorePrivilege<'a, A> {
         if let Err(code) = self.api.bind_thread_token(self.prior_thread)
             && failure.is_none()
         {
+            // ABORT_BOUNDARY_CONVERTED site="installer-root/restore-thread-token" outcome="InstallerRootError::Win32(stage=RestoreThreadToken,code)"
             failure = Some(InstallerRootError::Win32 {
                 stage: InstallerRootStage::RestoreThreadToken,
                 code,
@@ -1410,15 +1479,22 @@ impl<'a, A: PrivilegeApi + ?Sized> ScopedRestorePrivilege<'a, A> {
         }
     }
 
-    /// Drop/test shape only; the normal path must use [`Self::restore_typed`].
+    /// Emergency Drop path only; the normal path must use
+    /// [`Self::restore_typed`] and handle its typed outcome.
     ///
-    /// Drop cannot report a typed error and no bounded containment-evidence
-    /// channel exists in this crate, so a failed emergency restoration while
-    /// the thread may still be bound to the elevated duplicate
-    /// (`SeRestorePrivilege`) retains fail-stop rather than continuing
-    /// under uncertain OS privilege.
-    fn restore(&mut self) {
-        if self.restore_typed().is_err() {
+    /// Attempts the exact restoration once. Success disarms once. A failed
+    /// emergency restoration while the thread may still be bound to the
+    /// elevated duplicate (`SeRestorePrivilege`) retains fail-stop rather
+    /// than continuing under uncertain OS privilege (A00-03: hidden
+    /// expansion of authority). Before termination the exact typed
+    /// stage/code is recorded through the bounded stderr evidence channel
+    /// ([`emit_abort_boundary_evidence`]): fixed-shape bytes, no allocation,
+    /// no reentrancy, no secrets.
+    // ABORT_BOUNDARY site="installer-root/scoped-restore-drop" invariant="token-bound-elevation"
+    fn emergency_restore(&mut self) {
+        if let Err(error) = self.restore_typed() {
+            let (detail, code) = restoration_evidence(error);
+            emit_abort_boundary_evidence("installer-root/scoped-restore-drop", detail, code);
             std::process::abort();
         }
     }
@@ -1429,9 +1505,10 @@ impl<A: PrivilegeApi + ?Sized> Drop for ScopedRestorePrivilege<'_, A> {
     fn drop(&mut self) {
         // Sole emergency path: explicit restore_typed() always disarms, so
         // an armed Drop means the normal path never completed. Exactly one
-        // restoration attempt; restore() retains fail-stop only on failure.
+        // restoration attempt; emergency_restore() retains fail-stop only on
+        // failure, after recording bounded containment evidence.
         if self.armed {
-            self.restore();
+            self.emergency_restore();
         }
     }
 }
@@ -1465,13 +1542,20 @@ where
         (Ok(value), Ok(())) => Ok(value),
         (Ok(_), Err(restoration)) => Err(map(restoration)),
         (Err(primary), Ok(())) => Err(primary),
-        (Err(_primary), Err(_restoration)) => {
+        (Err(_primary), Err(restoration)) => {
             // No honest single-slot outcome exists here: reporting the
             // primary would silently ignore the failed restoration, and
             // reporting the restoration would overwrite the primary
             // failure, while the thread remains bound to the elevated
             // impersonation token. Hidden authority confusion must fail
-            // closed, so fail-stop rather than continue impersonated.
+            // closed (A00-03), so fail-stop rather than continue
+            // impersonated. The exact restoration stage/code is recorded
+            // first through the bounded stderr evidence channel; the
+            // already-mapped primary outcome is opaque here and is never
+            // emitted, so no caller effect leaks into diagnostics.
+            // ABORT_BOUNDARY site="installer-root/dual-failure" invariant="token-bound-elevation"
+            let (detail, code) = restoration_evidence(restoration);
+            emit_abort_boundary_evidence("installer-root/dual-failure", detail, code);
             std::process::abort();
         }
     }
@@ -2540,7 +2624,11 @@ mod primitive_tests {
         let mut api = fake_api();
         {
             let mut guard = ScopedRestorePrivilege::enter(&mut api)?;
-            guard.restore();
+            guard.restore_typed()?;
+            assert!(
+                !guard.armed,
+                "explicit typed restore must disarm before Drop"
+            );
         }
         assert_eq!(api.adjusted, 1);
         assert_eq!(api.bound, vec![Some(22), None]);
@@ -2557,7 +2645,11 @@ mod primitive_tests {
         api.process = Err(99);
         {
             let mut guard = ScopedRestorePrivilege::enter(&mut api)?;
-            guard.restore();
+            guard.restore_typed()?;
+            assert!(
+                !guard.armed,
+                "explicit typed restore must disarm before Drop"
+            );
         }
         assert_eq!(api.bound, vec![Some(22), Some(33)]);
         assert_eq!(api.closed, vec![22, 33]);
@@ -2595,6 +2687,51 @@ mod primitive_tests {
         ));
         assert!(api.bound.is_empty());
         assert!(api.closed.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn explicit_restore_failure_returns_typed_stage_and_code_before_drop() {
+        let mut api = fake_api();
+        api.restore = Err(5);
+        {
+            let mut guard = ScopedRestorePrivilege::enter(&mut api)
+                .unwrap_or_else(|error| panic!("restore privilege setup must succeed: {error}"));
+            assert_eq!(
+                guard.restore_typed(),
+                Err(InstallerRootError::Win32 {
+                    stage: InstallerRootStage::RestorePrivilege,
+                    code: 5,
+                }),
+                "failed privilege restore must keep its exact typed stage/code"
+            );
+            assert!(
+                !guard.armed,
+                "explicit typed failure must disarm before Drop"
+            );
+        }
+        // The rebind is still attempted after the failed privilege restore so
+        // the duplicate is unbound, and owned handles close exactly once.
+        assert_eq!(api.bound, vec![Some(22), None]);
+        assert_eq!(api.closed, vec![11, 22]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn successful_primary_with_failed_restore_never_reports_success() {
+        let mut api = fake_api();
+        api.restore = Err(7);
+        let result = with_restore_privilege_api(&mut api, || Ok(41_u32));
+        assert_eq!(
+            result,
+            Err(InstallerRootError::Win32 {
+                stage: InstallerRootStage::RestorePrivilege,
+                code: 7,
+            }),
+            "success must never be reported after a failed restoration"
+        );
+        assert_eq!(api.bound, vec![Some(22), None]);
+        assert_eq!(api.closed, vec![11, 22]);
     }
 
     #[cfg(windows)]

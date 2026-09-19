@@ -1,0 +1,58 @@
+{
+  "schema": "eliot.abort-boundary-cases.v2",
+  "issue": 860,
+  "note": "Finite nonsecret fixtures for the four historical issue-860 abort sites. Stages are symbolic InstallerRootStage names and codes are numeric Win32 values only; no tokens, SIDs, principals, or secrets appear here or in bounded stderr evidence.",
+  "historical_sites": [
+    {
+      "id": "installer-root/construct-compensating-restore",
+      "file": "src/installer_root.rs",
+      "disposition": "typed-outcome",
+      "proof": "return Err(InstallerRootError::Win32 {",
+      "typed_outcome": "stage: InstallerRootStage::RestorePrivilege"
+    },
+    {
+      "id": "installer-root/restore-privilege",
+      "file": "src/installer_root.rs",
+      "disposition": "typed-outcome",
+      "proof": "failure = Some(InstallerRootError::Win32 {",
+      "typed_outcome": "stage: InstallerRootStage::RestorePrivilege"
+    },
+    {
+      "id": "installer-root/restore-thread-token",
+      "file": "src/installer_root.rs",
+      "disposition": "typed-outcome",
+      "proof": "failure = Some(InstallerRootError::Win32 {",
+      "typed_outcome": "stage: InstallerRootStage::RestoreThreadToken"
+    },
+    {
+      "id": "peer-auth/impersonation-drop",
+      "file": "src/named_pipe_peer_auth.rs",
+      "disposition": "retained-fail-stop",
+      "proof": "crate::installer_root::emit_abort_boundary_evidence",
+      "invariant": "untrusted-client-token",
+      "evidence": "emit_abort_boundary_evidence"
+    }
+  ],
+  "fault_cases": [
+    {
+      "id": "restore-privilege-failure",
+      "stage": "RestorePrivilege",
+      "code": 5
+    },
+    {
+      "id": "restore-thread-token-failure",
+      "stage": "RestoreThreadToken",
+      "code": 2
+    },
+    {
+      "id": "bind-thread-token-failure",
+      "stage": "BindThreadToken",
+      "code": 1300
+    },
+    {
+      "id": "enable-privilege-failure",
+      "stage": "EnablePrivilege",
+      "code": 1314
+    }
+  ]
+}
