@@ -492,27 +492,32 @@ impl DaemonComposition {
         }
         let outcome = match self.governor.resolve_activation_outcome(now) {
             GovernorActivationOutcome::Resolved(snapshot) => {
-                if snapshot.state_fence != ticket.state_fence {
+                if snapshot.state_fence == ticket.state_fence {
+                    match activation_projection::map_governor_outcome_to_protocol(
+                        ticket,
+                        GovernorActivationOutcome::Resolved(snapshot),
+                        now.max(1),
+                    ) {
+                        Ok(result) => Ok(result),
+                        Err(error) => {
+                            failed_internal_or_mapping_error(ticket, "RESOLVED", now.max(1), error)
+                        }
+                    }
+                } else {
                     // #66: a Resolved binding under a stale fence must not
                     // create a Session and must not kill the daemon loop.
                     // Submit a typed StaleFence terminal result carrying the
                     // observed fence instead of a hard error.
+                    // #839: value flows through the shared outcome tail below
+                    // so this terminal result emits the same admission/error
+                    // diagnostics as every other v2 resolution instead of
+                    // returning silently; the Ok/Err value is unchanged.
                     let observed = snapshot.state_fence.clone();
-                    return activation_projection::stale_fence_for_resolved_mismatch(
+                    activation_projection::stale_fence_for_resolved_mismatch(
                         ticket,
                         observed,
                         now.max(1),
-                    );
-                }
-                match activation_projection::map_governor_outcome_to_protocol(
-                    ticket,
-                    GovernorActivationOutcome::Resolved(snapshot),
-                    now.max(1),
-                ) {
-                    Ok(result) => Ok(result),
-                    Err(error) => {
-                        failed_internal_or_mapping_error(ticket, "RESOLVED", now.max(1), error)
-                    }
+                    )
                 }
             }
             outcome => {
