@@ -1225,6 +1225,20 @@ impl GrantActivationPort {
                 ledger
                     .revoked_grants
                     .insert(request.grant_id.as_str().to_owned());
+                let digest = fenced_root_revocation_digest(&operation_id, request, &projection)
+                    .map_err(|error| map_thin_error(&error))?;
+                ledger.intents.insert(
+                    operation_id.clone(),
+                    PortIntentRecord {
+                        operation_id: operation_id.clone(),
+                        digest,
+                        kind: IntentKind::GrantRevocation,
+                        disposition: IntentDisposition::Committed(CommittedReceipt::Revocation(
+                            receipt.clone(),
+                        )),
+                        fenced: vec![request.grant_id.as_str().to_owned()],
+                    },
+                );
             }
             Ok(receipt)
         })();
@@ -1296,6 +1310,26 @@ fn root_revocation_digest(
     .digest()
     .map(Some)
     .map_err(|error| map_thin_error(&error))
+}
+
+/// Reconstructs the live idempotency key for a revocation whose Fenced ORS
+/// projection is the only durable semantic evidence available after restart.
+/// The store projection and receipt are included so a changed opaque record
+/// cannot be treated as the same recovered intent.
+fn fenced_root_revocation_digest(
+    operation_id: &str,
+    request: &eliot_authority::GrantRevocationRequest,
+    projection: &CapabilityGrantProjection,
+) -> Result<String, KernelError> {
+    finalize_digest(&(
+        "grant-revocation",
+        operation_id,
+        request.grant_id.as_str(),
+        request.snapshot_id.as_str(),
+        &request.binding,
+        projection.record(),
+        projection.receipt(),
+    ))
 }
 
 /// Boundary crossed by one recorded operation identity.
