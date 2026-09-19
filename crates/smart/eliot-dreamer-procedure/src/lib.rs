@@ -38,21 +38,23 @@
 //! validation. There are no placeholder, mock, canned, or pseudo paths:
 //! every branch binds an explicit input field.
 //!
-//! Test coverage note: 19 of 50 `WORK_UNIT_CASE 661/*` cases execute here
+//! Test coverage note: 21 of 50 `WORK_UNIT_CASE 661/*` cases execute here
 //! (661/1 valid completes, 661/2 exact vocabulary, 661/3 wrong subtype fails
 //! closed, 661/4 bundle mismatch fails closed, 661/5
 //! duplicate identity disposition, 661/6 success and failure evidence,
 //! 661/7 lucky success stays empirical, 661/8 exit/confidence not semantic
 //! success, 661/9 empirical unknown mechanism, 661/10 exact trigger versus
 //! near-match false activation, 661/11 scope/environment/version leakage
-//! blocked, 661/13 valid acyclic graph
-//! completes, 661/17 raw shell rejected, 661/18 credential and handle
+//! blocked, 661/12 typed input/output with invalid schema fail-closed,
+//! 661/13 valid acyclic graph
+//! completes, 661/14 missing predecessor/cycle/unbounded/fan-out rejected,
+//! 661/17 raw shell rejected, 661/18 credential and handle
 //! rejected, 661/19 capability present is not authority,
 //! 661/21 valid semantic verifier,
 //! 661/22 missing verifier blocks completeness,
 //! 661/25 exact idempotent replay, 661/26 unknown-effect blocks retry). The
-//! remaining 31 of 50 are deferred per START.md s1; #965 admission is
-//! separate. Deferred: 661/12, 661/14, 661/15, 661/16, 661/20,
+//! remaining 29 of 50 are deferred per START.md s1; #965 admission is
+//! separate. Deferred: 661/15, 661/16, 661/20,
 //! 661/23, 661/24, 661/27, 661/28, 661/29, 661/30, 661/31,
 //! 661/32, 661/33, 661/34, 661/35, 661/36, 661/37, 661/38, 661/39, 661/40,
 //! 661/41, 661/42, 661/43, 661/44, 661/45, 661/46, 661/47, 661/48, 661/49,
@@ -3345,5 +3347,186 @@ mod tests {
         );
         assert_eq!(widened.transfer.target_env_id, "env-1");
         assert_eq!(widened.transfer.target_scope_id, "scope-1");
+    }
+
+    /// Proposes with shared fixtures and returns the rejection.
+    ///
+    /// Panics when the proposal is admitted, so every invalid schema below
+    /// stays fail-closed without effect.
+    fn expect_rejection(
+        label: &str,
+        item: &ValidatedCurationItem,
+        evidence: &ProcedureEvidence,
+    ) -> ProcedureError {
+        match propose_procedure(
+            item,
+            &test_grounded(),
+            evidence,
+            &test_capability(),
+            &test_existing(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => panic!("{label} must fail: {:?}", candidate.outcome),
+            Err(err) => err,
+        }
+    }
+
+    // WORK_UNIT_CASE: 661/12
+    #[test]
+    fn case_12_typed_input_output_bound_to_evidence_and_invalid_schema_fails_closed() {
+        let item = test_item();
+        let grounded = test_grounded();
+        let evidence = test_evidence();
+        let capability = test_capability();
+        let existing = test_existing();
+        let policy = test_policy();
+        let candidate =
+            match propose_procedure(&item, &grounded, &evidence, &capability, &existing, &policy) {
+                Ok(candidate) => candidate,
+                Err(err) => panic!("typed input/output baseline: {err:?}"),
+            };
+        assert_eq!(candidate.outcome, ProcedureOutcome::Complete);
+        for step in &candidate.steps {
+            assert_eq!(step.inputs, vec!["e-1".to_owned()]);
+            assert!(!step.operation.trim().is_empty());
+            assert!(!step.contract_ref.trim().is_empty());
+            assert!(!step.precondition.trim().is_empty());
+            assert!(!step.postcondition.trim().is_empty());
+            assert!(!step.verifier.trim().is_empty());
+        }
+        let operations: Vec<String> = candidate
+            .steps
+            .iter()
+            .map(|step| step.operation.clone())
+            .collect();
+        assert!(is_sorted_unique(&operations));
+        assert_eq!(candidate.verifier, "verifier-7");
+        assert!(is_hex64_lower(&candidate.candidate_digest));
+        let mut zero_steps = test_item();
+        if let eliot_dreamer_contracts::CurationPayload::Procedure(payload) =
+            &mut zero_steps.payload
+        {
+            payload.steps = 0;
+        }
+        let err = expect_rejection("zero steps", &zero_steps, &evidence);
+        assert!(matches!(err, ProcedureError::Bounds { phase, .. } if phase == "procedure.steps"));
+        let mut blank_handle = test_item();
+        if let eliot_dreamer_contracts::CurationPayload::Procedure(payload) =
+            &mut blank_handle.payload
+        {
+            payload.procedure = String::new();
+        }
+        let err = expect_rejection("blank handle", &blank_handle, &evidence);
+        assert!(matches!(err, ProcedureError::Shape { field, .. } if field == "procedure.handle"));
+        let mut bad_denominator = test_item();
+        bad_denominator.denominator.expected_total = 2;
+        let err = expect_rejection("denominator drift", &bad_denominator, &evidence);
+        assert!(matches!(err, ProcedureError::Receipt { .. }));
+        let mut shuffled = test_evidence();
+        shuffled.episode_refs = vec!["e-2".to_owned(), "e-1".to_owned()];
+        let err = expect_rejection("shuffled inputs", &item, &shuffled);
+        assert!(matches!(err, ProcedureError::Order { phase, .. } if phase == "evidence.episodes"));
+        let mut malformed_digest = test_evidence();
+        malformed_digest.frozen_bundle_digest = "not-a-digest".to_owned();
+        let err = expect_rejection("malformed digest", &item, &malformed_digest);
+        assert!(matches!(err, ProcedureError::Digest { .. }));
+        let mut no_episodes = test_evidence();
+        no_episodes.episode_refs = Vec::new();
+        let err = expect_rejection("missing episodes", &item, &no_episodes);
+        assert!(matches!(err, ProcedureError::Shape { field, .. } if field == "evidence.episodes"));
+    }
+
+    // WORK_UNIT_CASE: 661/14
+    #[test]
+    fn case_14_missing_predecessor_cycle_unbounded_loop_and_fanout_rejected() {
+        let item = test_item();
+        let grounded = test_grounded();
+        let evidence = test_evidence();
+        let capability = test_capability();
+        let existing = test_existing();
+        let policy = test_policy();
+        let baseline =
+            match propose_procedure(&item, &grounded, &evidence, &capability, &existing, &policy) {
+                Ok(candidate) => candidate,
+                Err(err) => panic!("graph baseline: {err:?}"),
+            };
+        assert_eq!(baseline.outcome, ProcedureOutcome::Complete);
+        assert!(check_dependency_closure(&baseline.steps).is_ok());
+        assert!(check_graph_acyclic(&baseline.steps).is_ok());
+        let mut dangling = baseline.steps.clone();
+        match dangling.get_mut(1) {
+            Some(step) => step.dependencies = vec!["step-99".to_owned()],
+            None => panic!("fixture must carry at least two steps"),
+        }
+        let err = match check_dependency_closure(&dangling) {
+            Ok(()) => panic!("dangling dependency must fail"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, ProcedureError::Binding { field, .. } if field == "step.dependency"));
+        let mut self_dependent = baseline.steps.clone();
+        match self_dependent.first_mut() {
+            Some(step) => {
+                let own = step.step_id.clone();
+                step.dependencies = vec![own];
+            }
+            None => panic!("fixture must carry at least one step"),
+        }
+        let err = match check_dependency_closure(&self_dependent) {
+            Ok(()) => panic!("self-dependency must fail"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, ProcedureError::Binding { field, .. } if field == "step.dependency"));
+        let mut cyclic = baseline.steps.clone();
+        match cyclic.get_mut(0) {
+            Some(step) => step.dependencies = vec!["step-02".to_owned()],
+            None => panic!("fixture must carry at least one step"),
+        }
+        match cyclic.get_mut(1) {
+            Some(step) => step.dependencies = vec!["step-01".to_owned()],
+            None => panic!("fixture must carry at least two steps"),
+        }
+        assert!(check_dependency_closure(&cyclic).is_ok());
+        let err = match check_graph_acyclic(&cyclic) {
+            Ok(()) => panic!("cycle must fail"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, ProcedureError::Binding { field, .. } if field == "steps"));
+        let mut unbounded_item = test_item();
+        if let eliot_dreamer_contracts::CurationPayload::Procedure(payload) =
+            &mut unbounded_item.payload
+        {
+            payload.procedure = "retry forever rotate".to_owned();
+        }
+        let err = match propose_procedure(
+            &unbounded_item,
+            &grounded,
+            &evidence,
+            &capability,
+            &existing,
+            &policy,
+        ) {
+            Ok(candidate) => panic!("unbounded retry must fail: {:?}", candidate.outcome),
+            Err(err) => err,
+        };
+        assert!(matches!(err, ProcedureError::Shape { field, .. } if field == "step.budget"));
+        let mut over_retry = match baseline.steps.first() {
+            Some(step) => step.clone(),
+            None => panic!("fixture must carry at least one step"),
+        };
+        over_retry.max_retries = MAX_RETRIES.saturating_add(1);
+        let err = match validate_one_step_shape(&over_retry) {
+            Ok(()) => panic!("over-retry step must fail"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, ProcedureError::Bounds { phase, .. } if phase == "step.retries"));
+        over_retry.max_retries = 1;
+        over_retry.fanout = MAX_FANOUT.saturating_add(1);
+        let err = match validate_one_step_shape(&over_retry) {
+            Ok(()) => panic!("over-fanout step must fail"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, ProcedureError::Bounds { phase, .. } if phase == "step.fanout"));
+        over_retry.fanout = 1;
+        assert!(validate_one_step_shape(&over_retry).is_ok());
     }
 }
