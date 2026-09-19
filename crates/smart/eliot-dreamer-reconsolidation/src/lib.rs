@@ -114,6 +114,20 @@ fn contains_handle(values: &[String], handle: &str) -> bool {
     values.iter().any(|v| v == handle)
 }
 
+fn contains_baseline_pair(
+    handles: &[String],
+    lineages: &[String],
+    support_handle: &str,
+    lineage: &str,
+) -> bool {
+    handles
+        .iter()
+        .zip(lineages)
+        .any(|(baseline_handle, baseline_lineage)| {
+            baseline_handle == support_handle && baseline_lineage == lineage
+        })
+}
+
 fn same_sorted_set(left: &[String], right: &[String]) -> bool {
     let mut left = left.to_vec();
     let mut right = right.to_vec();
@@ -493,9 +507,11 @@ pub struct ReconsolidationRequest {
     pub deltas: Vec<PropositionDelta>,
     /// Candidate new evidence items (sorted by handle, unique).
     pub new_items: Vec<NewEvidenceItem>,
-    /// Baseline handles the parent already covers (sorted, unique).
+    /// Baseline handles the parent already covers (sorted, unique), positionally
+    /// paired with [`Self::parent_baseline_lineages`].
     pub parent_baseline_handles: Vec<String>,
-    /// Baseline lineages the parent already covers (sorted, unique).
+    /// Baseline lineages the parent already covers (sorted, unique), positionally
+    /// paired with [`Self::parent_baseline_handles`].
     pub parent_baseline_lineages: Vec<String>,
     /// Exact externally observed reactivation.
     pub reactivation: ReactivationEvidence,
@@ -1046,12 +1062,22 @@ pub fn propose_reconsolidation(
         );
     };
 
+    if request.parent_baseline_handles.len() != request.parent_baseline_lineages.len() {
+        return ok_result(
+            ReconsolidationOutcome::Blocked,
+            None,
+            request.parent_propositions.len(),
+            0,
+            "parent baseline handles and lineages are not positionally aligned",
+        );
+    }
     for proposition in &request.parent_propositions {
-        if !contains_handle(
+        if !contains_baseline_pair(
             &request.parent_baseline_handles,
+            &request.parent_baseline_lineages,
             &proposition.support_handle,
-        ) || !contains_handle(&request.parent_baseline_lineages, &proposition.lineage)
-        {
+            &proposition.lineage,
+        ) {
             return ok_result(
                 ReconsolidationOutcome::Blocked,
                 None,
@@ -1904,5 +1930,23 @@ mod tests {
         let result = propose_reconsolidation(&request).expect("baseline gap is semantic");
         assert_eq!(result.outcome, ReconsolidationOutcome::Blocked);
         assert!(result.child.is_none());
+    }
+
+    #[test]
+    fn parent_baseline_cross_product_mismatch_is_blocked() {
+        let mut request = valid_request();
+        request.parent_propositions[0].lineage = "lineage-b".to_owned();
+        request.parent_propositions[1].lineage = "lineage-a".to_owned();
+
+        let result = propose_reconsolidation(&request).expect("cross-pair mismatch is semantic");
+        assert_eq!(result.outcome, ReconsolidationOutcome::Blocked);
+        assert!(result.child.is_none());
+    }
+
+    #[test]
+    fn parent_baseline_aligned_pair_passes() {
+        let result = propose_reconsolidation(&valid_request()).expect("aligned pairs are valid");
+        assert_eq!(result.outcome, ReconsolidationOutcome::Complete);
+        assert!(result.child.is_some());
     }
 }
