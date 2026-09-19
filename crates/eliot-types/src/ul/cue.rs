@@ -6,11 +6,22 @@ use std::collections::BTreeMap;
 
 use super::normalize::{normalize_path, normalize_symbol};
 
+/// Explicit legacy V1 cue vocabulary, frozen for migration (issue #706).
+///
+/// `LegacyCueKindV1` is the historical `eliot-types` cue-kind enum with its
+/// closed historical variants and wire identity preserved byte-for-byte.
+/// Valid historical bytes and hashes keep verifying. New code must use the
+/// current A-10 vocabulary owned by `smart.cue.contracts`
+/// (`eliot-cue-contracts`; revision pinned in
+/// [`LegacyCueKindV1MigrationDescriptor`]).
+///
+/// Migration owners: #831 (internal/root consumers), #832 (context donor),
+/// #833 (cues facade), #834 (memory donor). Transitional alias removal: #835.
 #[derive(
     Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
 )]
 #[serde(rename_all = "snake_case")]
-pub enum CueKind {
+pub enum LegacyCueKindV1 {
     FilePath,
     DirPath,
     Symbol,
@@ -23,7 +34,7 @@ pub enum CueKind {
     Concept,
 }
 
-impl CueKind {
+impl LegacyCueKindV1 {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -39,6 +50,109 @@ impl CueKind {
             Self::Concept => "concept",
         }
     }
+}
+
+/// Transitional source-compatible alias for frozen consumers (issue #706).
+///
+/// Only frozen external consumers migrating under #831 (internal/root), #832
+/// (context donor), #833 (cues facade) or #834 (memory donor) may use this
+/// alias temporarily. Removal issue: #835. New code must use
+/// [`LegacyCueKindV1`]. The alias adds no new wire representation or current
+/// authority and is unused by `cue.rs` production code.
+#[deprecated(
+    note = "transitional V1 alias for frozen consumers migrating under #831 (internal/root), #832 (context donor), #833 (cues facade), #834 (memory donor); removal issue #835; new code must use LegacyCueKindV1"
+)]
+pub type CueKind = LegacyCueKindV1;
+
+/// Inert bounded V1 to A-10 migration descriptor (issue #706).
+///
+/// Descriptive data only. This lower-level crate neither imports nor constructs
+/// the A-10 current vocabulary: equal spelling alone is not semantic or
+/// current-type equivalence, and ambiguous, unknown, empty, or legacy-only
+/// input must never silently become current. Any change to the pinned target
+/// revision or digest invalidates this descriptor; revalidate against
+/// `smart.cue.contracts` before any migration use.
+pub struct LegacyCueKindV1MigrationDescriptor {
+    _sealed: (),
+}
+
+impl LegacyCueKindV1MigrationDescriptor {
+    /// Exact source schema frozen by this seam.
+    pub const SOURCE_SCHEMA: &str = "eliot-types.ul.cue.LegacyCueKindV1";
+    /// Source schema generation. Only `v1` is valid in this type.
+    pub const SOURCE_GENERATION: &str = "v1";
+    /// Base commit whose bytes this seam froze.
+    pub const SOURCE_BASE_SHA: &str = "e80611de30878aa6ab521418da23bbfe4570af13";
+    /// Owning issue of this legacy seam.
+    pub const SOURCE_SEAM_ISSUE: u32 = 706;
+    /// Current vocabulary owner module.
+    pub const TARGET_MODULE: &str = "smart.cue.contracts";
+    /// Current vocabulary owner crate.
+    pub const TARGET_CRATE: &str = "eliot-cue-contracts";
+    /// Pinned target file carrying the current `CueKind` definition.
+    pub const TARGET_FILE: &str = "crates/smart/eliot-cue-contracts/src/normalization.rs";
+    /// Pinned target contract revision (`CONTRACT_REVISION` on the base SHA).
+    pub const TARGET_REVISION: &str = "2.0.0";
+    /// Digest algorithm for [`Self::TARGET_DIGEST`].
+    pub const TARGET_DIGEST_ALGO: &str = "blake3";
+    /// Pinned digest of the target file on the base SHA. Any change
+    /// invalidates this descriptor.
+    pub const TARGET_DIGEST: &str =
+        "a5412833fde7b3cb1e214774061d04e21ab6773870180ffeff5959a8242ff850";
+    /// Exact historical variant count.
+    pub const VARIANT_COUNT: usize = 10;
+    /// Exact historical wire spellings in variant order.
+    pub const WIRE_SPELLINGS: [&str; 10] = [
+        "file_path",
+        "dir_path",
+        "symbol",
+        "error_signature",
+        "command_pattern",
+        "dependency",
+        "api_surface",
+        "task_class",
+        "subsystem",
+        "concept",
+    ];
+    /// Exact safe correspondences as `(v1_spelling, current_spelling)` pairs.
+    /// Every safe correspondence is byte-exact; anything else is unsupported.
+    pub const EXACT_CORRESPONDENCES: [(&str, &str); 10] = [
+        ("file_path", "file_path"),
+        ("dir_path", "dir_path"),
+        ("symbol", "symbol"),
+        ("error_signature", "error_signature"),
+        ("command_pattern", "command_pattern"),
+        ("dependency", "dependency"),
+        ("api_surface", "api_surface"),
+        ("task_class", "task_class"),
+        ("subsystem", "subsystem"),
+        ("concept", "concept"),
+    ];
+    /// Inputs that must never claim conversion to current.
+    pub const UNSUPPORTED_INPUTS: [&str; 12] = [
+        "",
+        "unknown",
+        "FilePath",
+        "FILE_PATH",
+        "file-path",
+        "file path",
+        "cue",
+        "null",
+        "relation_edge",
+        "binding_candidate",
+        "comparison_key",
+        "none",
+    ];
+    /// Frozen denominator manifest bound to this seam.
+    pub const MANIFEST: &str = "crates/eliot-types/tests/data/cue_kind_migration.toml";
+    /// Raw and golden fixtures bound to this seam.
+    pub const FIXTURE_DIR: &str = "crates/eliot-types/tests/data/cue-kind-legacy";
+    /// Boundary oracle proving this seam.
+    pub const ORACLE: &str = "crates/eliot-types/tests/cue_kind_legacy_boundary.rs";
+    /// Invalidation rule for this descriptor.
+    pub const INVALIDATION: &str = "any change to the pinned target revision or digest, or to the frozen variant/spelling/serialization rows, invalidates this descriptor; revalidate against smart.cue.contracts before migration use";
+    /// Limited proof bound to this descriptor.
+    pub const PROOF: &str = "cue_kind_legacy_boundary 35 WORK_UNIT_CASE 706/1..35 over frozen source, wire, golden, consumer, duplicate and oracle rows";
 }
 
 #[derive(
@@ -73,7 +187,7 @@ pub enum CueStrength {
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 pub struct CueBinding {
-    pub cue_kind: CueKind,
+    pub cue_kind: LegacyCueKindV1,
     pub cue_value: String,
     pub match_mode: CueMatchMode,
     pub strength: CueStrength,
@@ -148,25 +262,25 @@ pub fn normalize_binding(
         return Err(CueBindingError::InvalidEncoding);
     }
     binding.cue_value = match binding.cue_kind {
-        CueKind::FilePath => {
+        LegacyCueKindV1::FilePath => {
             if binding.match_mode != CueMatchMode::Exact {
                 return Err(CueBindingError::InvalidMatchMode("file_path"));
             }
             normalize_path(&binding.cue_value, project_root)
         }
-        CueKind::DirPath => {
+        LegacyCueKindV1::DirPath => {
             if binding.match_mode != CueMatchMode::Prefix {
                 return Err(CueBindingError::InvalidMatchMode("dir_path"));
             }
             normalize_path(&binding.cue_value, project_root)
         }
-        CueKind::Symbol => {
+        LegacyCueKindV1::Symbol => {
             if binding.match_mode != CueMatchMode::Exact {
                 return Err(CueBindingError::InvalidMatchMode("symbol"));
             }
             normalize_symbol(&binding.cue_value)
         }
-        CueKind::ErrorSignature => {
+        LegacyCueKindV1::ErrorSignature => {
             if binding.match_mode != CueMatchMode::Signature
                 || binding.cue_value.len() != 68
                 || !binding.cue_value.starts_with("sig:")
@@ -178,17 +292,17 @@ pub fn normalize_binding(
             }
             binding.cue_value
         }
-        CueKind::CommandPattern => {
+        LegacyCueKindV1::CommandPattern => {
             if binding.match_mode != CueMatchMode::Exact {
                 return Err(CueBindingError::InvalidMatchMode("command_pattern"));
             }
             unicode_lower(binding.cue_value.trim())
         }
-        CueKind::Dependency
-        | CueKind::ApiSurface
-        | CueKind::TaskClass
-        | CueKind::Subsystem
-        | CueKind::Concept => unicode_lower(binding.cue_value.trim()),
+        LegacyCueKindV1::Dependency
+        | LegacyCueKindV1::ApiSurface
+        | LegacyCueKindV1::TaskClass
+        | LegacyCueKindV1::Subsystem
+        | LegacyCueKindV1::Concept => unicode_lower(binding.cue_value.trim()),
     };
     if binding.cue_value.is_empty() {
         return Err(CueBindingError::EmptyValue);
@@ -441,7 +555,7 @@ pub fn cue_binding_page_set_hash(pages: &[CueBindingPage]) -> String {
 pub struct CueIndexRow {
     pub row_id: String,
     pub project_id: ProjectId,
-    pub cue_kind: CueKind,
+    pub cue_kind: LegacyCueKindV1,
     pub cue_value_norm: String,
     pub match_mode: CueMatchMode,
     pub record_ref: String,
@@ -467,7 +581,7 @@ pub struct CueRecordSource {
 #[must_use]
 pub fn cue_row_id(
     project_id: ProjectId,
-    cue_kind: CueKind,
+    cue_kind: LegacyCueKindV1,
     match_mode: CueMatchMode,
     cue_value: &str,
     record_ref: &str,
@@ -490,7 +604,7 @@ pub fn ul_token_estimate(text: &str) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        CueBinding, CueBindingError, CueKind, CueMatchMode, CueStrength,
+        CueBinding, CueBindingError, CueMatchMode, CueStrength, LegacyCueKindV1,
         MAX_CUE_BINDING_PAGE_BYTES, cue_row_id, normalize_binding_pages,
     };
 
@@ -499,7 +613,7 @@ mod tests {
     {
         let bindings = (0..29)
             .map(|index| CueBinding {
-                cue_kind: CueKind::Concept,
+                cue_kind: LegacyCueKindV1::Concept,
                 cue_value: format!("concept-{index:02}"),
                 match_mode: CueMatchMode::Exact,
                 strength: if index == 0 {
@@ -556,7 +670,7 @@ mod tests {
         let bindings = [true, false]
             .into_iter()
             .map(|primary| CueBinding {
-                cue_kind: CueKind::Concept,
+                cue_kind: LegacyCueKindV1::Concept,
                 cue_value: if primary {
                     format!("primary-{}", "x".repeat(60_000))
                 } else {
@@ -579,7 +693,7 @@ mod tests {
         }));
 
         let oversized = vec![CueBinding {
-            cue_kind: CueKind::Concept,
+            cue_kind: LegacyCueKindV1::Concept,
             cue_value: format!("too-large-{}", "z".repeat(MAX_CUE_BINDING_PAGE_BYTES)),
             match_mode: CueMatchMode::Exact,
             strength: CueStrength::Primary,
@@ -597,14 +711,14 @@ mod tests {
         let project_id = crate::ProjectId::new_v7();
         let exact = cue_row_id(
             project_id,
-            CueKind::Concept,
+            LegacyCueKindV1::Concept,
             CueMatchMode::Exact,
             "capacity",
             "memory:one",
         );
         let prefix = cue_row_id(
             project_id,
-            CueKind::Concept,
+            LegacyCueKindV1::Concept,
             CueMatchMode::Prefix,
             "capacity",
             "memory:one",

@@ -1,0 +1,734 @@
+# Frozen migration denominator for issue #706 ([F-CUE-L0]).
+#
+# `eliot-types::ul::cue::CueKind` is explicit legacy V1 (`LegacyCueKindV1`).
+# Every variant/spelling/serialization/hash row, every import/alias/reexport/
+# field/constructor/match/fixture row, and every duplicate definition is frozen
+# below with source, digest, compatibility class, owner, migration issue and
+# expiry/invalidation. Missing owner stays uncovered, never a wildcard.
+#
+# Base SHA: e80611de30878aa6ab521418da23bbfe4570af13
+# Digest algorithm for every digest in this file: blake3 hex.
+# Row digests cover the matched lines (in file order, joined with "\n") for the
+# stated match lens: `type` = lines containing "CueKind", `field` = lines
+# containing "cue_kind". The boundary oracle
+# (crates/eliot-types/tests/cue_kind_legacy_boundary.rs) recomputes every row.
+
+[meta]
+issue = 706
+base_sha = "e80611de30878aa6ab521418da23bbfe4570af13"
+source_schema = "eliot-types.ul.cue.LegacyCueKindV1"
+source_generation = "v1"
+variant_count = 10
+target_module = "smart.cue.contracts"
+target_crate = "eliot-cue-contracts"
+target_file = "crates/smart/eliot-cue-contracts/src/normalization.rs"
+target_revision = "2.0.0"
+target_digest_algo = "blake3"
+target_digest = "a5412833fde7b3cb1e214774061d04e21ab6773870180ffeff5959a8242ff850"
+oracle = "crates/eliot-types/tests/cue_kind_legacy_boundary.rs"
+manifest_self = "crates/eliot-types/tests/data/cue_kind_migration.toml"
+fixture_dir = "crates/eliot-types/tests/data/cue-kind-legacy"
+invalidation = "any change to the pinned target revision or digest, or to the frozen variant/spelling/serialization rows, invalidates this descriptor; revalidate against smart.cue.contracts before migration use"
+proof = "cue_kind_legacy_boundary 35 WORK_UNIT_CASE 706/1..35 over frozen source, wire, golden, consumer, duplicate and oracle rows"
+
+[wire]
+rename_all = "snake_case"
+deny_unknown_fields = false
+aliases = []
+untagged = false
+default_impl = false
+catch_all_variant = false
+schema_title = "LegacyCueKindV1"
+schema_type = "string"
+
+[variant.file_path]
+name = "FilePath"
+position = 1
+
+[variant.dir_path]
+name = "DirPath"
+position = 2
+
+[variant.symbol]
+name = "Symbol"
+position = 3
+
+[variant.error_signature]
+name = "ErrorSignature"
+position = 4
+
+[variant.command_pattern]
+name = "CommandPattern"
+position = 5
+
+[variant.dependency]
+name = "Dependency"
+position = 6
+
+[variant.api_surface]
+name = "ApiSurface"
+position = 7
+
+[variant.task_class]
+name = "TaskClass"
+position = 8
+
+[variant.subsystem]
+name = "Subsystem"
+position = 9
+
+[variant.concept]
+name = "Concept"
+position = 10
+
+[correspondence]
+file_path = "file_path"
+dir_path = "dir_path"
+symbol = "symbol"
+error_signature = "error_signature"
+command_pattern = "command_pattern"
+dependency = "dependency"
+api_surface = "api_surface"
+task_class = "task_class"
+subsystem = "subsystem"
+concept = "concept"
+
+[unsupported]
+inputs = ["", "unknown", "FilePath", "FILE_PATH", "file-path", "file path", "cue", "null", "relation_edge", "binding_candidate", "comparison_key", "none"]
+
+[wire_strings]
+files = ["crates/eliot-app/src/mcp_stdio/verification.rs", "crates/eliot-app/src/ul_cross_agent_runner.rs", "crates/eliot-app/tests/ul_contract_errors.rs", "crates/eliot-app/tests/ul_mvp_done.rs", "crates/eliot-store/src/canonical_store.rs", "crates/eliot-types/tests/cue_kind_legacy_boundary.rs", "crates/eliot-types/tests/ul_cue_normalize.rs"]
+
+[api]
+pub_types = ["CueBinding", "CueBindingError", "CueBindingPage", "CueIndexRow", "CueKind", "CueMatchMode", "CueRecordSource", "CueStrength", "LegacyCueKindV1", "LegacyCueKindV1MigrationDescriptor"]
+pub_fns = ["as_str", "cue_binding_page_id", "cue_binding_page_set_hash", "cue_row_id", "normalize_binding", "normalize_binding_pages", "normalize_bindings", "ul_token_estimate"]
+pub_consts = ["CUE_BINDING_PAGE_SCHEMA_VERSION_V1", "CUE_BINDING_PAGE_SCHEMA_VERSION_V2", "MAX_CUE_BINDINGS_PER_PAGE", "MAX_CUE_BINDING_PAGE_BYTES"]
+
+[schema_changes]
+count = 0
+
+[type_row."crates/eliot-types/src/ul/cue.rs"]
+role = "source"
+owner = "#706"
+migration = 706
+expiry = "frozen-seam; alias removal tracked by #835 which re-derives this row"
+risk = "none"
+match_count = 30
+matched_digest = "b54722106b4306e947c3acde0c0d4bac03a48de7a316109a2d78715b4daa75bd"
+variants = ["FilePath", "DirPath", "Symbol", "ErrorSignature", "CommandPattern", "Dependency", "ApiSurface", "TaskClass", "Subsystem", "Concept"]
+
+[type_row."crates/eliot-types/src/lib.rs"]
+role = "internal"
+owner = "#831"
+migration = 831
+expiry = "migrate-to-LegacyCueKindV1-under-#831; alias removal #835"
+risk = "none"
+match_count = 1
+matched_digest = "5c98fe57b0a0d8c014617b4e804e126fefd76ea397a82cb53ed189f115a44a1f"
+variants = []
+
+[type_row."crates/eliot-types/src/ul/injection.rs"]
+role = "internal"
+owner = "#831"
+migration = 831
+expiry = "migrate-to-LegacyCueKindV1-under-#831; alias removal #835"
+risk = "none"
+match_count = 2
+matched_digest = "be215b67102c2036cc2582e9497c7d3a430f5a62932d595ab1a6165a7f8ad663"
+variants = []
+
+[type_row."crates/eliot-types/tests/ul_cue_normalize.rs"]
+role = "test"
+owner = "#831"
+migration = 831
+expiry = "migrate-to-LegacyCueKindV1-under-#831; alias removal #835"
+risk = "none"
+match_count = 2
+matched_digest = "a1fa86c70350ebf90871f7e21c1ead0f1ed5728ca037cd16e3c112cc24a0fca7"
+variants = []
+
+[type_row."crates/eliot-app/src/mcp_stdio/protocol_tests.rs"]
+role = "root"
+owner = "#831"
+migration = 831
+expiry = "migrate-under-#831; alias removal #835"
+risk = "none"
+match_count = 3
+matched_digest = "307d3dfbd88cc64fa845d0aba7b10cca3a9256f3ab3162aeee0dd8b156598613"
+variants = []
+
+[type_row."crates/eliot-app/src/mcp_stdio/ul.rs"]
+role = "root"
+owner = "#831"
+migration = 831
+expiry = "migrate-under-#831; alias removal #835"
+risk = "none"
+match_count = 1
+matched_digest = "f3d44dadc183328934c8210a7f38c2808f574cc1a37adc11a9b81ecefbbe13e9"
+variants = []
+
+[type_row."crates/eliot-app/src/mcp_stdio/verification.rs"]
+role = "root"
+owner = "#831"
+migration = 831
+expiry = "migrate-under-#831; alias removal #835"
+risk = "none"
+match_count = 6
+matched_digest = "5dea9685657ca69b890c6daa05c504ecbe7950400ca988f55c34fd297d773098"
+variants = []
+
+[type_row."crates/eliot-app/tests/ul_behavior_cli.rs"]
+role = "test"
+owner = "#831"
+migration = 831
+expiry = "migrate-under-#831; alias removal #835"
+risk = "none"
+match_count = 3
+matched_digest = "f534ea8bfb81fe1c916b0802460c99e0b56bd0c7ed3d22de2feb5cb842e3b5bd"
+variants = []
+
+[type_row."crates/eliot-app/tests/ul_control_treatment.rs"]
+role = "test"
+owner = "#831"
+migration = 831
+expiry = "migrate-under-#831; alias removal #835"
+risk = "none"
+match_count = 5
+matched_digest = "fd4a054c77693a30da562ca0bd594e7303cc756e9d634ddaf3e5f38d476e2113"
+variants = []
+
+[type_row."crates/eliot-app/tests/ul_cue_candidate.rs"]
+role = "test"
+owner = "#831"
+migration = 831
+expiry = "migrate-under-#831; alias removal #835"
+risk = "none"
+match_count = 2
+matched_digest = "08765d0ef9b4da5e1c3cf5cb0ec47c0ec1863b91896fcd21df5bb7fc3269fa75"
+variants = []
+
+[type_row."crates/eliot-app/tests/ul_mvp_done.rs"]
+role = "test"
+owner = "#831"
+migration = 831
+expiry = "migrate-under-#831; alias removal #835"
+risk = "none"
+match_count = 2
+matched_digest = "79a162fbcedbe9aa23d8489fa7d82ba8198947968ee09aab9cc57fa33344e29d"
+variants = []
+
+[type_row."crates/eliot-app/tests/ul_push_first_value.rs"]
+role = "test"
+owner = "#831"
+migration = 831
+expiry = "migrate-under-#831; alias removal #835"
+risk = "none"
+match_count = 2
+matched_digest = "ee45915d99249c8e6f27b5471c3d7a768ca490822a5a14a02f64f567305f1807"
+variants = []
+
+[type_row."crates/eliot-app/tests/ul_pyramid_delivery.rs"]
+role = "test"
+owner = "#831"
+migration = 831
+expiry = "migrate-under-#831; alias removal #835"
+risk = "none"
+match_count = 2
+matched_digest = "30dee0e64c1c4088d5efc2ffa933db870d851bf65047fdbf1f80edc7df4a483c"
+variants = []
+
+[type_row."crates/eliot-engine/src/cognitive_projection.rs"]
+role = "internal"
+owner = "#831"
+migration = 831
+expiry = "migrate-under-#831; alias removal #835"
+risk = "none"
+match_count = 4
+matched_digest = "a33b8ddefc2b667e5bbaf7ccb96ad76587c647d32be633ee5ebaf22f5db6c8ec"
+variants = []
+
+[type_row."crates/eliot-engine/src/ul/capsule.rs"]
+role = "internal"
+owner = "#831"
+migration = 831
+expiry = "migrate-under-#831; alias removal #835"
+risk = "none"
+match_count = 2
+matched_digest = "d8ada3fc99053dd07ed65f2137ec5fe17298509420c9ce384c0fa8151950c8bc"
+variants = []
+
+[type_row."crates/eliot-engine/src/ul/cards.rs"]
+role = "internal"
+owner = "#831"
+migration = 831
+expiry = "migrate-under-#831; alias removal #835"
+risk = "none"
+match_count = 3
+matched_digest = "eaa73bdf9c10bf3ccd4daa05ff0bd94716f4a5da9b16d2d8d264117c6f2e2aa3"
+variants = []
+
+[type_row."crates/eliot-engine/src/ul/cue_index.rs"]
+role = "internal"
+owner = "#831"
+migration = 831
+expiry = "migrate-under-#831; alias removal #835"
+risk = "none"
+match_count = 14
+matched_digest = "dbb5641e4ac4ea18207b2b6c9e405536526b7d3d875c39620b88526241047128"
+variants = []
+
+[type_row."crates/eliot-engine/src/ul/injection.rs"]
+role = "internal"
+owner = "#831"
+migration = 831
+expiry = "migrate-under-#831; alias removal #835"
+risk = "none"
+match_count = 11
+matched_digest = "664bfd77034bebcc03abd5a28720c66c4b9441fc4ccc9197ac1536c110b4d39b"
+variants = []
+
+[type_row."crates/eliot-engine/src/ul/maintenance.rs"]
+role = "internal"
+owner = "#831"
+migration = 831
+expiry = "migrate-under-#831; alias removal #835"
+risk = "none"
+match_count = 2
+matched_digest = "b8203bbc840ec2f7dac86981ac271cce3e049c0c5d6f0c8b4ac2bc65df879abe"
+variants = []
+
+[type_row."crates/eliot-engine/src/ul/metacog.rs"]
+role = "internal"
+owner = "#831"
+migration = 831
+expiry = "migrate-under-#831; alias removal #835"
+risk = "none"
+match_count = 3
+matched_digest = "3a340752a5a27c457f91082d3961003db535c58ec64c9266e95b6280df860687"
+variants = []
+
+[type_row."crates/eliot-engine/src/ul/onboarding.rs"]
+role = "internal"
+owner = "#831"
+migration = 831
+expiry = "migrate-under-#831; alias removal #835"
+risk = "none"
+match_count = 6
+matched_digest = "6b36deb1b4dcd5a3f38377d2040e092a129c8ced3259f6e03b688c3cdf2a50da"
+variants = []
+
+[type_row."crates/eliot-engine/src/ul/touched.rs"]
+role = "internal"
+owner = "#831"
+migration = 831
+expiry = "migrate-under-#831; alias removal #835"
+risk = "none"
+match_count = 9
+matched_digest = "572fe6d4809b03470f402243cd1c1bfad35441edc0cc660c292941bf9df7ae82"
+variants = []
+
+[type_row."crates/eliot-engine/tests/ul_cue_firing.rs"]
+role = "test"
+owner = "#831"
+migration = 831
+expiry = "migrate-under-#831; alias removal #835"
+risk = "none"
+match_count = 4
+matched_digest = "534ff5513112a95680435b5f612f39e6d4e3558649e9b8a3b8a77a47b140941b"
+variants = []
+
+[type_row."crates/eliot-engine/tests/ul_measurement.rs"]
+role = "test"
+owner = "#831"
+migration = 831
+expiry = "migrate-under-#831; alias removal #835"
+risk = "none"
+match_count = 2
+matched_digest = "032a5d52648a4e46660984d8b10cd66b70604830525fcb596700b6a9e0ac90a1"
+variants = []
+
+[type_row."crates/eliot-engine/tests/ul_pyramid.rs"]
+role = "test"
+owner = "#831"
+migration = 831
+expiry = "migrate-under-#831; alias removal #835"
+risk = "none"
+match_count = 2
+matched_digest = "1e33bdcda504ff877b1f19f6c9342e8dcb215ffd1ae0e0950d36f5a385c6caef"
+variants = []
+
+[type_row."crates/eliot-engine/tests/ul_touched_injection.rs"]
+role = "test"
+owner = "#831"
+migration = 831
+expiry = "migrate-under-#831; alias removal #835"
+risk = "none"
+match_count = 5
+matched_digest = "c7145cd0a63504b3f9adc838d6825ee0df416380a5884b382a37017b25dcee1c"
+variants = []
+
+[type_row."crates/eliot-store/src/blob_store.rs"]
+role = "internal"
+owner = "#831"
+migration = 831
+expiry = "migrate-under-#831; alias removal #835"
+risk = "none"
+match_count = 4
+matched_digest = "9124a7d8f5b2770f1510b023240453b1b30c9420896dd9f1aa63b5d1f3689208"
+variants = []
+
+[type_row."crates/eliot-store/tests/memory_retrieval.rs"]
+role = "test"
+owner = "#831"
+migration = 831
+expiry = "migrate-under-#831; alias removal #835"
+risk = "none"
+match_count = 2
+matched_digest = "675c7fb10deda3e99646a64efb863342425b3bd96ac0e71a44a9c6277d46bfe1"
+variants = []
+
+[type_row."crates/eliot-types/tests/cue_kind_legacy_boundary.rs"]
+role = "oracle"
+owner = "#706"
+migration = 706
+expiry = "frozen-seam-oracle; invalid-on-any-oracle-edit; alias removal tracked by #835"
+risk = "none"
+match_count = 67
+matched_digest = "beab00982b1362b02327a05a771235c982a881518cb4d0837958ad8f3e258402"
+variants = []
+
+[type_row."crates/smart/eliot-context/src/lib.rs"]
+role = "duplicate"
+owner = "#832"
+migration = 832
+expiry = "donor-disposition-under-#832; invalid-on-definition-change"
+risk = "duplicate-definition"
+match_count = 15
+matched_digest = "00e4138427f35573bb5df6f08920f629c89b8cb2c435fed8c36ef980f78bc980"
+variants = ["Path", "Symbol", "Error", "Command", "Service", "TaskClass", "Concept", "Problem"]
+
+[type_row."crates/smart/eliot-cues/src/lib.rs"]
+role = "duplicate"
+owner = "#833"
+migration = 833
+expiry = "facade-disposition-under-#833; invalid-on-definition-change"
+risk = "duplicate-definition"
+match_count = 31
+matched_digest = "0f68bf9376d910077de177ad6d54fc2a4ee803ba933c8135f288294ee7505b7e"
+variants = ["FilePath", "DirPath", "Symbol", "ErrorSignature", "CommandPattern", "Dependency", "ApiSurface", "TaskClass", "Subsystem", "Concept"]
+
+[type_row."crates/smart/eliot-cues/tests/integrity.rs"]
+role = "duplicate-test"
+owner = "#833"
+migration = 833
+expiry = "facade-disposition-under-#833; invalid-on-definition-change"
+risk = "duplicate-definition"
+match_count = 13
+matched_digest = "b47b4bd650e62d5cf1798c436b423fc22e0aa1f3c3ec610a17b7ac5dcfd5932c"
+variants = []
+
+[type_row."crates/smart/eliot-cue-contracts/src/normalization.rs"]
+role = "current-definition"
+owner = "#804"
+migration = 804
+expiry = "none-current-authority; descriptor-pinned-digest-invalidates-on-change"
+risk = "current-authority"
+match_count = 8
+matched_digest = "8669c70e25a0c837d42a2a35db24e0c36e9ad3f2652175b55dc97c58a7023e97"
+variants = ["FilePath", "DirPath", "Symbol", "ErrorSignature", "CommandPattern", "Dependency", "ApiSurface", "TaskClass", "Subsystem", "Concept"]
+
+[type_row."crates/smart/eliot-cue-contracts/tests/acceptance_804.rs"]
+role = "current-test"
+owner = "#804"
+migration = 804
+expiry = "none-current-authority-owned-by-#804"
+risk = "current-authority"
+match_count = 50
+matched_digest = "d0783444dc7596bee1c6ebf5590eb448972d0b8143276dedd282ad62e1768dcf"
+variants = []
+
+[type_row."crates/foundation/eliot-contracts/tests/data/shipped_serde_boundaries.toml"]
+role = "inventory"
+owner = "#929/#710"
+migration = 929
+expiry = "retain-both-current-and-legacy-rows-per-#929-and-#710; invalid-on-row-loss"
+risk = "inventory-drift"
+match_count = 12
+matched_digest = "ba7b8d98a987ad1978b6652abbea3eec95b9de90f4fdde4da62dc59a9b62816f"
+variants = []
+
+[field_row."crates/eliot-types/src/ul/cue.rs"]
+role = "source"
+owner = "#706"
+migration = 706
+expiry = "frozen-seam; alias removal tracked by #835 which re-derives this row"
+risk = "none"
+match_count = 14
+matched_digest = "7b7be9dbdbe48b70d0272c29013d14e9d8cd87e3d91ee761859c964e6973b7dc"
+
+[field_row."crates/eliot-types/tests/ul_cue_normalize.rs"]
+role = "test"
+owner = "#831"
+migration = 831
+expiry = "migrate-under-#831; alias removal #835"
+risk = "none"
+match_count = 2
+matched_digest = "20e476c182acadd174bd14aa72f58e55ac3d425bf97821b334fca64401c758f7"
+
+[field_row."crates/eliot-app/src/mcp_stdio/protocol_tests.rs"]
+role = "root"
+owner = "#831"
+migration = 831
+expiry = "migrate-under-#831; alias removal #835"
+risk = "none"
+match_count = 3
+matched_digest = "307d3dfbd88cc64fa845d0aba7b10cca3a9256f3ab3162aeee0dd8b156598613"
+
+[field_row."crates/eliot-app/src/mcp_stdio/verification.rs"]
+role = "root"
+owner = "#831"
+migration = 831
+expiry = "migrate-under-#831; alias removal #835"
+risk = "fixture-wire"
+match_count = 6
+matched_digest = "2889102adff4e728ba742f6db365b71a99872ee57b5ee35a9d61b7985b620ad3"
+
+[field_row."crates/eliot-app/src/ul_cross_agent_runner.rs"]
+role = "root"
+owner = "#831"
+migration = 831
+expiry = "migrate-under-#831; alias removal #835"
+risk = "wire-reader"
+match_count = 2
+matched_digest = "b4209df454d8e2faa01b7b3b3488fb859ddf24716166eb9cf2a540fd491d3c27"
+
+[field_row."crates/eliot-app/tests/ul_behavior_cli.rs"]
+role = "test"
+owner = "#831"
+migration = 831
+expiry = "migrate-under-#831; alias removal #835"
+risk = "none"
+match_count = 2
+matched_digest = "3d069775d67fc25b6c00864c18496dc19aeade38d84dd0d96f5661a6d79f6361"
+
+[field_row."crates/eliot-app/tests/ul_control_treatment.rs"]
+role = "test"
+owner = "#831"
+migration = 831
+expiry = "migrate-under-#831; alias removal #835"
+risk = "none"
+match_count = 4
+matched_digest = "5628d15392ff00d842c7271618e7d206f537ebcebd2de320f1a880efff225fb6"
+
+[field_row."crates/eliot-app/tests/ul_cue_candidate.rs"]
+role = "test"
+owner = "#831"
+migration = 831
+expiry = "migrate-under-#831; alias removal #835"
+risk = "none"
+match_count = 1
+matched_digest = "91530971aa846770ce08d69369c3a2c34c73bdc3f3fbb04df2cb72376dbab412"
+
+[field_row."crates/eliot-app/tests/ul_contract_errors.rs"]
+role = "test"
+owner = "#831"
+migration = 831
+expiry = "migrate-under-#831; alias removal #835"
+risk = "fixture-wire"
+match_count = 1
+matched_digest = "dda4c4f1dce8d6832eee22d972f554db2ffa504783e91e379b79e7bf7b640fb0"
+
+[field_row."crates/eliot-app/tests/ul_mvp_done.rs"]
+role = "test"
+owner = "#831"
+migration = 831
+expiry = "migrate-under-#831; alias removal #835"
+risk = "none"
+match_count = 2
+matched_digest = "0ab2be9e8db56592c9fc4c428eb2a8069528694162f659e2665d0645615f7bbf"
+
+[field_row."crates/eliot-app/tests/ul_push_first_value.rs"]
+role = "test"
+owner = "#831"
+migration = 831
+expiry = "migrate-under-#831; alias removal #835"
+risk = "none"
+match_count = 1
+matched_digest = "8ca565ccb203276f0dfa78c1adbd081da80c260a1baf872c68514b99a2f643fe"
+
+[field_row."crates/eliot-app/tests/ul_pyramid_delivery.rs"]
+role = "test"
+owner = "#831"
+migration = 831
+expiry = "migrate-under-#831; alias removal #835"
+risk = "none"
+match_count = 1
+matched_digest = "de3d280659a5fa57b6f8fba3467e79e91628972bf7d2d20229c0eaa18a039712"
+
+[field_row."crates/eliot-engine/src/cognitive_projection.rs"]
+role = "internal"
+owner = "#831"
+migration = 831
+expiry = "migrate-under-#831; alias removal #835"
+risk = "none"
+match_count = 2
+matched_digest = "56614c111c363f1bad957e039c0799f0f00033feebd737e69f07fd1f41f87b8f"
+
+[field_row."crates/eliot-engine/src/ul/capsule.rs"]
+role = "internal"
+owner = "#831"
+migration = 831
+expiry = "migrate-under-#831; alias removal #835"
+risk = "none"
+match_count = 1
+matched_digest = "fa9d32c53c866d5789246aaf136a3ee5ad5da0a2280ba3af287e916131141d7d"
+
+[field_row."crates/eliot-engine/src/ul/cards.rs"]
+role = "internal"
+owner = "#831"
+migration = 831
+expiry = "migrate-under-#831; alias removal #835"
+risk = "none"
+match_count = 2
+matched_digest = "d193f2088c432d10ec60b41ac13e10d3c27a2f28e95873db260525115b6217fb"
+
+[field_row."crates/eliot-engine/src/ul/cue_index.rs"]
+role = "internal"
+owner = "#831"
+migration = 831
+expiry = "migrate-under-#831; alias removal #835"
+risk = "none"
+match_count = 5
+matched_digest = "5d5862756e401173486a738a38653f84a78a13da59b83a2d8da457cd945c843f"
+
+[field_row."crates/eliot-engine/src/ul/injection.rs"]
+role = "internal"
+owner = "#831"
+migration = 831
+expiry = "migrate-under-#831; alias removal #835"
+risk = "none"
+match_count = 2
+matched_digest = "805fce49913f375d3b55f8c09998792570c425b8e577a07b8bc0dd8036093577"
+
+[field_row."crates/eliot-engine/src/ul/maintenance.rs"]
+role = "internal"
+owner = "#831"
+migration = 831
+expiry = "migrate-under-#831; alias removal #835"
+risk = "none"
+match_count = 1
+matched_digest = "81b4415d880bd8ced981c8619950961abcc8d1c16ef8ca02c488f54bd577728b"
+
+[field_row."crates/eliot-engine/src/ul/metacog.rs"]
+role = "internal"
+owner = "#831"
+migration = 831
+expiry = "migrate-under-#831; alias removal #835"
+risk = "none"
+match_count = 2
+matched_digest = "97cf525c82407c6935a499da41a9f56368ead03d56130c4148984680cc9d2f47"
+
+[field_row."crates/eliot-engine/src/ul/onboarding.rs"]
+role = "internal"
+owner = "#831"
+migration = 831
+expiry = "migrate-under-#831; alias removal #835"
+risk = "none"
+match_count = 5
+matched_digest = "78b32fc890b50762dee5f744481e125bffda70834d3ec5c28022b786b12ea00b"
+
+[field_row."crates/eliot-engine/tests/ul_cue_firing.rs"]
+role = "test"
+owner = "#831"
+migration = 831
+expiry = "migrate-under-#831; alias removal #835"
+risk = "none"
+match_count = 1
+matched_digest = "444a82b489064a3dfcc88d779ad11b5c7b1a973f5d08cee2e5f858b85090221e"
+
+[field_row."crates/eliot-engine/tests/ul_measurement.rs"]
+role = "test"
+owner = "#831"
+migration = 831
+expiry = "migrate-under-#831; alias removal #835"
+risk = "none"
+match_count = 1
+matched_digest = "91530971aa846770ce08d69369c3a2c34c73bdc3f3fbb04df2cb72376dbab412"
+
+[field_row."crates/eliot-engine/tests/ul_pyramid.rs"]
+role = "test"
+owner = "#831"
+migration = 831
+expiry = "migrate-under-#831; alias removal #835"
+risk = "none"
+match_count = 1
+matched_digest = "9763369e37561590e7f802341bab6bc57451aa4b0ea88aaf16ac0dcc6b908d9b"
+
+[field_row."crates/eliot-store/src/blob_store.rs"]
+role = "internal"
+owner = "#831"
+migration = 831
+expiry = "migrate-under-#831; alias removal #835"
+risk = "none"
+match_count = 3
+matched_digest = "1fa8b829eaf446354cbe17b5776714f1dac4cfebbe72caac57f4691c56eadf0e"
+
+[field_row."crates/eliot-store/src/canonical_store.rs"]
+role = "internal"
+owner = "#831"
+migration = 831
+expiry = "migrate-under-#831; alias removal #835"
+risk = "durable-wire"
+match_count = 1
+matched_digest = "951ce58ed087c0f3b93b863a5612779498d83ca3235ca0afbf4060257c9f9b2f"
+
+[field_row."crates/eliot-store/tests/memory_retrieval.rs"]
+role = "test"
+owner = "#831"
+migration = 831
+expiry = "migrate-under-#831; alias removal #835"
+risk = "none"
+match_count = 1
+matched_digest = "fa9d32c53c866d5789246aaf136a3ee5ad5da0a2280ba3af287e916131141d7d"
+
+[field_row."crates/eliot-types/tests/cue_kind_legacy_boundary.rs"]
+role = "oracle"
+owner = "#706"
+migration = 706
+expiry = "frozen-seam-oracle; invalid-on-any-oracle-edit; alias removal tracked by #835"
+risk = "none"
+match_count = 11
+matched_digest = "3cc6054f0d8b45947527416c3ff1bd4c530695a29de4f79d595b6bd9b06d56d7"
+
+[field_row."crates/smart/eliot-context/src/lib.rs"]
+role = "duplicate"
+owner = "#832"
+migration = 832
+expiry = "donor-disposition-under-#832; invalid-on-definition-change"
+risk = "duplicate-definition"
+match_count = 1
+matched_digest = "fa63c0e734e76e9d643a9342a1964c4d9886483827b2d3369372d1dc115bf240"
+
+[field_row."crates/smart/eliot-cue-contracts/tests/acceptance_804.rs"]
+role = "current-test"
+owner = "#804"
+migration = 804
+expiry = "none-current-authority-owned-by-#804"
+risk = "current-authority"
+match_count = 2
+matched_digest = "e17afd70369dbf10ef4322808bc988b824f49103491517fa54cfb4de13a14b24"
+
+[field_row."crates/foundation/eliot-contracts/tests/data/shipped_serde_boundaries.toml"]
+role = "inventory"
+owner = "#929/#710"
+migration = 929
+expiry = "retain-both-current-and-legacy-rows-per-#929-and-#710; invalid-on-row-loss"
+risk = "inventory-drift"
+match_count = 3
+matched_digest = "9be7717a8eb1231ef3c5ba4fd17307a79ded1cf125abf844d9a3ab4fda84d128"
+
+[notes]
+memory_donor = "no memory-donor duplicate CueKind definition exists on base e80611de; #834 scope resolves at its own inventory, not as an unlisted row here"
+reservation = "no issue-owned reservation file for #706 exists on base; nothing to remove"
+queue_risk = "#804 is queue-HOLD-SUPERSEDED while #706 pins its accepted vocabulary at revision 2.0.0 digest a5412833; revalidate at integration"
+schema_title_note = "JsonSchema title moves CueKind to LegacyCueKindV1 as a rename artifact; the frozen wire enum values are unchanged"
