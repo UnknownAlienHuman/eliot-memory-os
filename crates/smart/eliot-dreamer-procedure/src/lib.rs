@@ -38,13 +38,15 @@
 //! validation. There are no placeholder, mock, canned, or pseudo paths:
 //! every branch binds an explicit input field.
 //!
-//! Test coverage note: 9 of 50 `WORK_UNIT_CASE 661/*` cases execute here
+//! Test coverage note: 12 of 50 `WORK_UNIT_CASE 661/*` cases execute here
 //! (661/1 valid completes, 661/2 exact vocabulary, 661/3 wrong subtype fails
 //! closed, 661/4 bundle mismatch fails closed, 661/5
-//! duplicate identity disposition, 661/13 valid acyclic graph completes,
+//! duplicate identity disposition, 661/6 success and failure evidence,
+//! 661/7 lucky success stays empirical, 661/8 exit/confidence not semantic
+//! success, 661/13 valid acyclic graph completes,
 //! 661/17 raw shell rejected, 661/25 exact idempotent replay, 661/26 unknown-effect blocks retry). The
-//! remaining 41 of 50 are deferred per START.md s1; #965 admission is
-//! separate. Deferred: 661/6, 661/7, 661/8, 661/9, 661/10,
+//! remaining 38 of 50 are deferred per START.md s1; #965 admission is
+//! separate. Deferred: 661/9, 661/10,
 //! 661/11, 661/12, 661/14, 661/15, 661/16, 661/18, 661/19, 661/20, 661/21,
 //! 661/22, 661/23, 661/24, 661/27, 661/28, 661/29, 661/30, 661/31,
 //! 661/32, 661/33, 661/34, 661/35, 661/36, 661/37, 661/38, 661/39, 661/40,
@@ -2829,5 +2831,168 @@ mod tests {
         };
         assert_eq!(baseline.outcome, ProcedureOutcome::Complete);
         assert_ne!(baseline.candidate_digest, candidate.candidate_digest);
+    }
+
+    // WORK_UNIT_CASE: 661/6
+    #[test]
+    fn case_06_success_and_failure_episode_evidence_preserved() {
+        let item = test_item();
+        let grounded = test_grounded();
+        let capability = test_capability();
+        let existing = test_existing();
+        let policy = test_policy();
+        let full = match propose_procedure(
+            &item,
+            &grounded,
+            &test_evidence(),
+            &capability,
+            &existing,
+            &policy,
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("full success and failure evidence: {err:?}"),
+        };
+        assert_eq!(full.outcome, ProcedureOutcome::Complete);
+        assert_eq!(outcome_rejection_hint(&full.outcome), None);
+        let mut only_failure_dropped = test_evidence();
+        only_failure_dropped.failure_refs = Vec::new();
+        let kept_counter = match propose_procedure(
+            &item,
+            &grounded,
+            &only_failure_dropped,
+            &capability,
+            &existing,
+            &policy,
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("counterexample keeps counterevidence: {err:?}"),
+        };
+        assert_eq!(kept_counter.outcome, ProcedureOutcome::Complete);
+        let mut bare_success = test_evidence();
+        bare_success.failure_refs = Vec::new();
+        bare_success.counterexample_refs = Vec::new();
+        let empirical = match propose_procedure(
+            &item,
+            &grounded,
+            &bare_success,
+            &capability,
+            &existing,
+            &policy,
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("bare success without counterevidence: {err:?}"),
+        };
+        assert_eq!(empirical.outcome, ProcedureOutcome::Empirical);
+        assert_eq!(
+            outcome_rejection_hint(&empirical.outcome),
+            Some(CurationRejectionCode::UnsupportedPrecision)
+        );
+        assert_ne!(empirical.candidate_digest, full.candidate_digest);
+        assert_eq!(
+            empirical.transfer.preserved_counterevidence_refs,
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            full.transfer.preserved_counterevidence_refs,
+            vec!["ce-1".to_owned()]
+        );
+    }
+
+    // WORK_UNIT_CASE: 661/7
+    #[test]
+    fn case_07_lucky_success_without_controls_stays_empirical() {
+        let item = test_item();
+        let grounded = test_grounded();
+        let capability = test_capability();
+        let existing = test_existing();
+        let policy = test_policy();
+        let baseline = match propose_procedure(
+            &item,
+            &grounded,
+            &test_evidence(),
+            &capability,
+            &existing,
+            &policy,
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("controlled baseline: {err:?}"),
+        };
+        assert_eq!(baseline.outcome, ProcedureOutcome::Complete);
+        let mut lucky = test_evidence();
+        lucky.mechanism_note = "one success proves mechanism for rotate-caption".to_owned();
+        let candidate =
+            match propose_procedure(&item, &grounded, &lucky, &capability, &existing, &policy) {
+                Ok(candidate) => candidate,
+                Err(err) => panic!("lucky success stays inert: {err:?}"),
+            };
+        assert_eq!(candidate.outcome, ProcedureOutcome::Empirical);
+        assert_eq!(
+            outcome_rejection_hint(&candidate.outcome),
+            Some(CurationRejectionCode::UnsupportedPrecision)
+        );
+        assert!(is_hex64_lower(&candidate.candidate_digest));
+        assert_ne!(candidate.candidate_digest, baseline.candidate_digest);
+        let mut single = test_evidence();
+        single.mechanism_note = "single episode proves portability everywhere".to_owned();
+        let single_candidate =
+            match propose_procedure(&item, &grounded, &single, &capability, &existing, &policy) {
+                Ok(candidate) => candidate,
+                Err(err) => panic!("single episode stays inert: {err:?}"),
+            };
+        assert_eq!(single_candidate.outcome, ProcedureOutcome::Empirical);
+    }
+
+    // WORK_UNIT_CASE: 661/8
+    #[test]
+    fn case_08_exit_confidence_not_semantic_success() {
+        let item = test_item();
+        let grounded = test_grounded();
+        let capability = test_capability();
+        let existing = test_existing();
+        let policy = test_policy();
+        let mut exit_claim = test_evidence();
+        exit_claim.mechanism_note =
+            "exit zero proves semantic success for rotate-caption".to_owned();
+        let exit_candidate = match propose_procedure(
+            &item,
+            &grounded,
+            &exit_claim,
+            &capability,
+            &existing,
+            &policy,
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("exit-zero claim stays inert: {err:?}"),
+        };
+        assert_eq!(exit_candidate.outcome, ProcedureOutcome::Empirical);
+        assert_eq!(
+            outcome_rejection_hint(&exit_candidate.outcome),
+            Some(CurationRejectionCode::UnsupportedPrecision)
+        );
+        let mut confidence_claim = test_evidence();
+        confidence_claim.mechanism_note =
+            "confidence proves mechanism for rotate-caption".to_owned();
+        let confidence_candidate = match propose_procedure(
+            &item,
+            &grounded,
+            &confidence_claim,
+            &capability,
+            &existing,
+            &policy,
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("confidence claim stays inert: {err:?}"),
+        };
+        assert_eq!(confidence_candidate.outcome, ProcedureOutcome::Empirical);
+        assert_eq!(
+            outcome_rejection_hint(&confidence_candidate.outcome),
+            Some(CurationRejectionCode::UnsupportedPrecision)
+        );
+        assert!(is_hex64_lower(&exit_candidate.candidate_digest));
+        assert!(is_hex64_lower(&confidence_candidate.candidate_digest));
+        assert_ne!(
+            exit_candidate.candidate_digest,
+            confidence_candidate.candidate_digest
+        );
     }
 }
