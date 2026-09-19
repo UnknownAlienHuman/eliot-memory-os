@@ -136,6 +136,13 @@ fn same_sorted_set(left: &[String], right: &[String]) -> bool {
     left == right
 }
 
+fn has_repeated_handle(values: &[String]) -> bool {
+    values
+        .iter()
+        .enumerate()
+        .any(|(index, value)| values[..index].iter().any(|previous| previous == value))
+}
+
 fn digits_of(value: &str) -> Vec<char> {
     value.chars().filter(char::is_ascii_digit).collect()
 }
@@ -933,6 +940,25 @@ pub fn propose_reconsolidation(
     request: &ReconsolidationRequest,
 ) -> Result<ReconsolidationResult, ReconsolidationError> {
     preflight_bounds(request)?;
+    let dependent_handles: Vec<String> = request
+        .dependents
+        .iter()
+        .map(|dependent| dependent.handle.clone())
+        .collect();
+    let outcome_handles: Vec<String> = request
+        .dependent_outcomes
+        .iter()
+        .map(|outcome| outcome.handle.clone())
+        .collect();
+    if has_repeated_handle(&dependent_handles) || has_repeated_handle(&outcome_handles) {
+        return ok_result(
+            ReconsolidationOutcome::Blocked,
+            None,
+            request.parent_propositions.len(),
+            0,
+            "dependent coverage requires one-to-one handles",
+        );
+    }
     validate_shapes(request)?;
 
     request
@@ -1399,6 +1425,18 @@ pub fn propose_reconsolidation(
             request.parent_propositions.len(),
             genuine.len(),
             "every affected dependent needs exactly one disposition",
+        );
+    }
+    if has_repeated_handle(&dependent_handles)
+        || has_repeated_handle(&outcome_handles)
+        || !same_sorted_set(&dependent_handles, &outcome_handles)
+    {
+        return ok_result(
+            ReconsolidationOutcome::Blocked,
+            None,
+            request.parent_propositions.len(),
+            genuine.len(),
+            "dependent outcomes must exactly cover affected dependents",
         );
     }
     for dependent in &request.dependents {
@@ -2256,6 +2294,183 @@ mod tests {
         assert_eq!(request.new_items[0].lineage, "minority-lineage-1");
         assert!(request.deltas[1].rationale.contains("counterexample"));
         assert!(request.deltas[1].rationale.contains("provenance"));
+    }
+
+    // WORK_UNIT_CASE: 667/37
+    #[allow(clippy::too_many_lines)]
+    #[test]
+    fn case_37_every_affected_dependent_has_an_exact_disposition() {
+        let mut request = valid_request();
+        request.dependents = vec![
+            DependentRecord {
+                handle: "dep-01".to_owned(),
+                required: true,
+                kind: "relation".to_owned(),
+            },
+            DependentRecord {
+                handle: "dep-02".to_owned(),
+                required: true,
+                kind: "view".to_owned(),
+            },
+            DependentRecord {
+                handle: "dep-03".to_owned(),
+                required: true,
+                kind: "procedure".to_owned(),
+            },
+            DependentRecord {
+                handle: "dep-04".to_owned(),
+                required: true,
+                kind: "cue".to_owned(),
+            },
+            DependentRecord {
+                handle: "dep-05".to_owned(),
+                required: true,
+                kind: "index".to_owned(),
+            },
+            DependentRecord {
+                handle: "dep-06".to_owned(),
+                required: true,
+                kind: "decision".to_owned(),
+            },
+            DependentRecord {
+                handle: "dep-07".to_owned(),
+                required: true,
+                kind: "claim".to_owned(),
+            },
+            DependentRecord {
+                handle: "dep-08".to_owned(),
+                required: true,
+                kind: "axis".to_owned(),
+            },
+            DependentRecord {
+                handle: "dep-09".to_owned(),
+                required: true,
+                kind: "negative-memory".to_owned(),
+            },
+        ];
+        request.dependent_outcomes = vec![
+            DependentOutcome {
+                handle: "dep-01".to_owned(),
+                disposition: DependentDisposition::Retain,
+                note: "relation remains valid under the proposed child".to_owned(),
+            },
+            DependentOutcome {
+                handle: "dep-02".to_owned(),
+                disposition: DependentDisposition::UnaffectedWithEvidence,
+                note: "view remains unaffected with evidence".to_owned(),
+            },
+            DependentOutcome {
+                handle: "dep-03".to_owned(),
+                disposition: DependentDisposition::Revalidate,
+                note: "procedure requires child validation".to_owned(),
+            },
+            DependentOutcome {
+                handle: "dep-04".to_owned(),
+                disposition: DependentDisposition::Rebuild,
+                note: "cue is rebuilt from the proposed child".to_owned(),
+            },
+            DependentOutcome {
+                handle: "dep-05".to_owned(),
+                disposition: DependentDisposition::Invalidate,
+                note: "index entry is invalidated pending rebuild".to_owned(),
+            },
+            DependentOutcome {
+                handle: "dep-06".to_owned(),
+                disposition: DependentDisposition::Retarget,
+                note: "decision points at the proposed child".to_owned(),
+            },
+            DependentOutcome {
+                handle: "dep-07".to_owned(),
+                disposition: DependentDisposition::Reconcile,
+                note: "claim reconciles parent and child evidence".to_owned(),
+            },
+            DependentOutcome {
+                handle: "dep-08".to_owned(),
+                disposition: DependentDisposition::Retain,
+                note: "axis owner remains caller-owned".to_owned(),
+            },
+            DependentOutcome {
+                handle: "dep-09".to_owned(),
+                disposition: DependentDisposition::UnaffectedWithEvidence,
+                note: "negative memory remains addressable".to_owned(),
+            },
+        ];
+        let frozen = request.clone();
+
+        let result = propose_reconsolidation(&request).expect("complete dependency closure passes");
+
+        assert_eq!(result.outcome, ReconsolidationOutcome::Complete);
+        assert_eq!(result.accounted_parents, 2);
+        assert_eq!(result.admitted_new, 1);
+        assert_eq!(request, frozen);
+    }
+
+    // WORK_UNIT_CASE: 667/38
+    #[test]
+    fn case_38_missing_or_unknown_dependent_blocks_completeness() {
+        let mut missing = valid_request();
+        missing.dependents.push(DependentRecord {
+            handle: "dep-2".to_owned(),
+            required: true,
+            kind: "view".to_owned(),
+        });
+        let result = propose_reconsolidation(&missing).expect("missing outcome is semantic");
+        assert_eq!(result.outcome, ReconsolidationOutcome::Blocked);
+        assert!(result.child.is_none());
+
+        let mut unknown = valid_request();
+        unknown.dependents.push(DependentRecord {
+            handle: "dep-2".to_owned(),
+            required: false,
+            kind: "view".to_owned(),
+        });
+        unknown.dependent_outcomes.push(DependentOutcome {
+            handle: "dep-3".to_owned(),
+            disposition: DependentDisposition::Retain,
+            note: "not an affected dependent".to_owned(),
+        });
+        let result = propose_reconsolidation(&unknown).expect("unknown outcome is semantic");
+        assert_eq!(result.outcome, ReconsolidationOutcome::Blocked);
+        assert!(result.child.is_none());
+        assert!(result.note.contains("exactly cover"));
+    }
+
+    #[test]
+    fn duplicate_dependent_handle_is_blocked() {
+        let mut request = valid_request();
+        request.dependents.push(DependentRecord {
+            handle: "dep-1".to_owned(),
+            required: false,
+            kind: "secondary-summary".to_owned(),
+        });
+        request.dependent_outcomes.push(DependentOutcome {
+            handle: "dep-1".to_owned(),
+            disposition: DependentDisposition::Retain,
+            note: "second disposition must not be reused".to_owned(),
+        });
+
+        let result = propose_reconsolidation(&request).expect("duplicate dependent is semantic");
+        assert_eq!(result.outcome, ReconsolidationOutcome::Blocked);
+        assert!(result.child.is_none());
+    }
+
+    #[test]
+    fn duplicate_outcome_handle_is_blocked() {
+        let mut request = valid_request();
+        request.dependents.push(DependentRecord {
+            handle: "dep-1".to_owned(),
+            required: true,
+            kind: "secondary-summary".to_owned(),
+        });
+        request.dependent_outcomes.push(DependentOutcome {
+            handle: "dep-1".to_owned(),
+            disposition: DependentDisposition::Blocked,
+            note: "second disposition must not be silently usable".to_owned(),
+        });
+
+        let result = propose_reconsolidation(&request).expect("duplicate outcome is semantic");
+        assert_eq!(result.outcome, ReconsolidationOutcome::Blocked);
+        assert!(result.child.is_none());
     }
 
     // WORK_UNIT_CASE: 667/39
