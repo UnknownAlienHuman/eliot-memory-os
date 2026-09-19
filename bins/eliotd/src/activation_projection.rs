@@ -433,9 +433,9 @@ mod projection_tests {
     use eliot_contracts::RequestId;
     use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
     use eliot_governor::{
-        GovernorActivationSnapshot, fixture_failed_internal, fixture_not_ready,
-        fixture_scope_ambiguous, fixture_scope_selection_required, fixture_stale_fence,
-        fixture_task_selection_required,
+        GovernorActivationSnapshot, GovernorCandidateCoverage, GovernorSelectionDirective,
+        fixture_failed_internal, fixture_not_ready, fixture_scope_ambiguous,
+        fixture_scope_selection_required, fixture_stale_fence, fixture_task_selection_required,
     };
     use eliot_protocol::AgentActivationResolutionTicket;
     use std::num::NonZeroU64;
@@ -597,6 +597,7 @@ mod projection_tests {
         ));
     }
 
+    // WORK_UNIT_CASE: 839/19
     #[test]
     fn every_governor_outcome_maps_to_distinct_protocol_kind() {
         let ticket = test_ticket(100);
@@ -975,5 +976,153 @@ mod projection_tests {
             result.validate_against(&other).is_err(),
             "result bound to one ticket must not validate against another"
         );
+    }
+
+    // WORK_UNIT_CASE: 839/12
+    #[test]
+    fn resolved_preserves_all_binding_fields() {
+        // Every field of the Governor snapshot survives the v2 mapping
+        // verbatim: principal/session/task/work-unit/scope/plan identities
+        // plus task and plan revisions. Drives the actual production mapper
+        // (`map_governor_outcome_to_protocol`); no Governor read is stubbed.
+        let ticket = test_ticket(100);
+        let snapshot = test_snapshot();
+        let result = map_governor_outcome_to_protocol(
+            &ticket,
+            GovernorActivationOutcome::Resolved(snapshot.clone()),
+            50,
+        )
+        .expect("resolved mapping");
+        match &result.disposition {
+            AgentActivationResolutionDisposition::Resolved { binding } => {
+                assert_eq!(binding.principal_id, snapshot.principal_id);
+                assert_eq!(binding.session_id, snapshot.session_id);
+                assert_eq!(binding.task_id, snapshot.task_id.to_string());
+                assert_eq!(binding.work_unit_id, snapshot.work_unit_id);
+                assert_eq!(binding.work_scope_id, snapshot.work_scope_id);
+                assert_eq!(binding.task_revision, snapshot.task_revision.to_string());
+                assert_eq!(binding.plan_id, snapshot.plan_id);
+                assert_eq!(binding.plan_revision, snapshot.plan_revision);
+            }
+            _ => panic!("expected Resolved"),
+        }
+        assert_eq!(result.ticket_id, ticket.ticket_id);
+        assert_eq!(result.ticket_sha256, ticket.ticket_sha256);
+        assert!(result.resolved_binding().is_some());
+        result.validate_against(&ticket).expect("valid binding");
+    }
+
+    // WORK_UNIT_CASE: 839/15
+    #[test]
+    fn scope_ambiguous_preserves_candidates_and_coverage() {
+        // ScopeAmbiguous keeps the exact candidate handles, coverage, and
+        // recovery handle through the v2 mapping. Complete and Partial
+        // coverage both bind; Unknown and single-candidate findings stay
+        // fail-closed rejections instead of being coerced.
+        let ticket = test_ticket(100);
+        let candidates = vec!["scope:a".to_owned(), "scope:b".to_owned()];
+        let outcome = fixture_scope_ambiguous(candidates.clone());
+        let result = map_governor_outcome_to_protocol(&ticket, outcome, 50).expect("mapping");
+        match &result.disposition {
+            AgentActivationResolutionDisposition::ScopeAmbiguous { selection } => {
+                assert_eq!(selection.candidate_handles, candidates);
+                assert_eq!(
+                    selection.candidate_coverage,
+                    AgentActivationCandidateCoverage::Complete
+                );
+                assert_eq!(
+                    selection.recovery_handle,
+                    "governor.scope-ambiguous:recovery"
+                );
+            }
+            _ => panic!("expected ScopeAmbiguous"),
+        }
+        assert!(result.resolved_binding().is_none());
+        result.validate_against(&ticket).expect("valid");
+        // Partial coverage with two exact candidates also binds verbatim.
+        let partial = GovernorActivationOutcome::ScopeAmbiguous {
+            selection: GovernorSelectionDirective::new(
+                candidates.clone(),
+                GovernorCandidateCoverage::Partial,
+                "governor.scope-ambiguous:recovery",
+            ),
+        };
+        let partial_result =
+            map_governor_outcome_to_protocol(&ticket, partial, 50).expect("partial mapping");
+        match &partial_result.disposition {
+            AgentActivationResolutionDisposition::ScopeAmbiguous { selection } => {
+                assert_eq!(selection.candidate_handles, candidates);
+                assert_eq!(
+                    selection.candidate_coverage,
+                    AgentActivationCandidateCoverage::Partial
+                );
+            }
+            _ => panic!("expected ScopeAmbiguous for partial coverage"),
+        }
+        partial_result.validate_against(&ticket).expect("valid");
+        // Unknown coverage and single-candidate findings never coerce.
+        let unknown = GovernorActivationOutcome::ScopeAmbiguous {
+            selection: GovernorSelectionDirective::new(
+                candidates,
+                GovernorCandidateCoverage::Unknown,
+                "governor.scope-ambiguous:recovery",
+            ),
+        };
+        assert!(
+            map_governor_outcome_to_protocol(&ticket, unknown, 50).is_err(),
+            "ambiguous with UNKNOWN coverage must be rejected, not coerced"
+        );
+        assert!(
+            map_governor_outcome_to_protocol(
+                &ticket,
+                fixture_scope_ambiguous(vec!["only-one".to_owned()]),
+                50,
+            )
+            .is_err(),
+            "ambiguous with one candidate must be rejected, not coerced"
+        );
+    }
+
+    // WORK_UNIT_CASE: 839/17
+    #[test]
+    fn stale_fence_preserves_observed_fence_and_recovery() {
+        // StaleFence carries the available observed fence and the
+        // owner-issued recovery handle through the v2 mapping without ever
+        // producing a Session binding. Absent observation (None) also binds
+        // as a typed terminal result.
+        let ticket = test_ticket(100);
+        let observed = StateFence::new(test_epoch(1), ResourceGeneration::new(2).expect("gen"));
+        let result = map_governor_outcome_to_protocol(
+            &ticket,
+            fixture_stale_fence(Some(observed.clone())),
+            50,
+        )
+        .expect("mapping");
+        match &result.disposition {
+            AgentActivationResolutionDisposition::StaleFence {
+                recovery_handle,
+                observed_state_fence: Some(fence),
+            } => {
+                assert_eq!(fence, &observed);
+                assert_ne!(fence, &ticket.state_fence);
+                assert_eq!(recovery_handle, "governor.stale-fence:recovery");
+            }
+            _ => panic!("expected StaleFence with observed fence"),
+        }
+        assert!(result.resolved_binding().is_none());
+        assert!(!result.is_transient_retry());
+        result.validate_against(&ticket).expect("valid");
+        // No observed fence is still a typed terminal result, never Resolved.
+        let none_result = map_governor_outcome_to_protocol(&ticket, fixture_stale_fence(None), 50)
+            .expect("none mapping");
+        match &none_result.disposition {
+            AgentActivationResolutionDisposition::StaleFence {
+                observed_state_fence: None,
+                ..
+            } => {}
+            _ => panic!("expected StaleFence without observed fence"),
+        }
+        assert!(none_result.resolved_binding().is_none());
+        none_result.validate_against(&ticket).expect("valid");
     }
 }
