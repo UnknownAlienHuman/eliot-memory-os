@@ -373,4 +373,85 @@ impl PossibleResultSchema {
         }
         Ok(())
     }
+
+    /// Authoritative A-03 discriminability of this schema's branch update
+    /// sets, declared for issue 610/11 (case 610/11 needs).
+    ///
+    /// The planner (A-17b `dreamer-probe-plan`) owns only admission gating on
+    /// already-owned descriptor dimensions and must not decide
+    /// discriminability or materiality; it consumes this predeclared value
+    /// instead of inferring its own. `Debug` text is never equality: the
+    /// comparison below is canonical target-indexed equality, with each
+    /// [`ResultTarget`] indexing its typed [`ResultUpdate`] value, so every
+    /// owner-supplied digest, meaning, and unknown reason participates.
+    ///
+    /// Set-vs-multiset policy: one branch update list is a set. Construction
+    /// ([`PossibleResultSchema::new`]) rejects a branch that names a target
+    /// twice, so a valid branch carries each target exactly once and set
+    /// equality coincides with multiset equality on valid inputs; the free
+    /// [`update_sets_equal`] comparison still uses set semantics (order
+    /// insensitive, duplicates collapsed) so repetition alone can never
+    /// manufacture a distinction. Across branches the schema is a multiset of
+    /// update sets: branch identity and repetition are significant, which is
+    /// why two branches with equivalent update sets classify as
+    /// [`ResultUpdateDiscriminability::NonDiscriminating`] rather than as one
+    /// branch.
+    pub fn update_discriminability(&self) -> ResultUpdateDiscriminability {
+        let mut branches = self.branches.iter();
+        let Some(first) = branches.next() else {
+            return ResultUpdateDiscriminability::NonDiscriminating;
+        };
+        for branch in branches {
+            if !update_sets_equal(&first.updates, &branch.updates) {
+                return ResultUpdateDiscriminability::Discriminating;
+            }
+        }
+        ResultUpdateDiscriminability::NonDiscriminating
+    }
+}
+
+/// Authoritative A-03 equivalence over one branch update set, declared for
+/// issue 610/11 (case 610/11 needs).
+///
+/// Canonical target-indexed equality over [`ResultUpdate`], order insensitive
+/// with set semantics: each [`ResultTarget`] indexes one typed update value,
+/// and the resulting target-to-update maps must be equal. Duplicate targets
+/// collapse to the last entry (duplicates are impossible in a valid branch
+/// because [`PossibleResultSchema::new`] fails closed on a repeated target, so
+/// this agrees with valid branch semantics). `Debug` rendering is never
+/// consulted: two updates with the same target but different typed fields —
+/// including owner-supplied digests, meanings, or unknown reasons — are
+/// distinct.
+pub fn update_sets_equal(left: &[ResultUpdate], right: &[ResultUpdate]) -> bool {
+    let left_by_target: BTreeMap<_, _> = left
+        .iter()
+        .map(|update| (update.target(), update))
+        .collect();
+    let right_by_target: BTreeMap<_, _> = right
+        .iter()
+        .map(|update| (update.target(), update))
+        .collect();
+    left_by_target == right_by_target
+}
+
+/// Authoritative A-03 discriminability classification over a
+/// [`PossibleResultSchema`]'s branch update sets, declared for issue 610/11.
+///
+/// This is the predeclared value the A-17b planner consumes: the planner
+/// compares these classifications verbatim and performs no update, meaning,
+/// or materiality inference of its own. [`ResultUpdateDiscriminability`] is
+/// vocabulary owned by A-03 (`dreamer-contracts`); the planner owns only
+/// admission gating on already-owned descriptor dimensions.
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ResultUpdateDiscriminability {
+    /// Fewer than two branches, or every branch carries an update set
+    /// equivalent (per [`update_sets_equal`]) to the first: no branch pair
+    /// separates on declared updates.
+    NonDiscriminating,
+    /// At least two branches carry update sets that differ in at least one
+    /// typed [`ResultUpdate`]: the outcome matrix separates on declaration.
+    Discriminating,
 }
