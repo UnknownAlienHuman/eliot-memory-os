@@ -15,7 +15,7 @@ use eliot_dreamer_contracts::{
     ConsentDimension, ContextDimension, ContractViolation, CostDimension, DreamInputBundle,
     EffectDimension, FeasibilityDimension, HumanAttentionDimension, InformationDimension,
     InquiryAffordanceSet, LatencyDimension, MaterialClaimRef, PossibleResultSchema,
-    PrivacyDimension, ProbeAffordanceRef, ProbeObjectiveRef, ResourceDimension,
+    PrivacyDimension, ProbeAffordanceRef, ProbeObjectiveRef, ProbeOwnerRef, ResourceDimension,
     ReversibilityDimension, RivalModelSet, RivalPredictionRef, ValidatedDreamDraft,
     error::len_i64,
     grounding::canonical::{ArtifactId, StateFence, TaskId},
@@ -255,6 +255,16 @@ impl ProbeDimensions {
     }
 }
 
+/// Validates a preserved owner reference without granting authority: the
+/// planner copies the descriptor owner verbatim and never substitutes it.
+fn validate_owner(owner: &ProbeOwnerRef, field: &'static str) -> Result<(), ContractViolation> {
+    match owner {
+        ProbeOwnerRef::Source { owner } => bounds::text(owner.as_str(), field),
+        ProbeOwnerRef::Verifier { verifier_id } => bounds::text(verifier_id.as_str(), field),
+        ProbeOwnerRef::Unavailable { reason } => bounds::text(reason, field),
+    }
+}
+
 /// One ranked candidate probe proposal.
 ///
 /// Candidate-only: the proposal carries no execution handle, reserves no
@@ -274,6 +284,9 @@ pub struct ProbeProposal {
     pub target: ProbeTarget,
     /// Binding to the primary source descriptor.
     pub affordance: ProbeAffordanceRef,
+    /// Typed owner reference copied verbatim from the primary source
+    /// descriptor; never an authority claim and never substituted.
+    pub owner: ProbeOwnerRef,
     /// Collapsed duplicate affordance identities, excluding the primary.
     pub merged_affordances: BTreeSet<ArtifactId>,
     /// Bounded discrimination statement derived from target identity.
@@ -291,6 +304,7 @@ impl ProbeProposal {
         bounds::text(self.probe_id.as_str(), "probe_plan.probe.probe_id")?;
         self.target.validate()?;
         self.affordance.validate()?;
+        validate_owner(&self.owner, "probe_plan.probe.owner")?;
         if self.probe_id != self.affordance.affordance_id {
             return Err(ContractViolation::BindingMismatch {
                 field: "probe_plan.probe.probe_id",
@@ -362,6 +376,9 @@ pub struct ProbeOmission {
     pub target: ProbeTarget,
     /// Binding to the primary source descriptor.
     pub affordance: ProbeAffordanceRef,
+    /// Typed owner reference copied verbatim from the primary source
+    /// descriptor; never an authority claim and never substituted.
+    pub owner: ProbeOwnerRef,
     /// Collapsed duplicate affordance identities, excluding the primary.
     pub merged_affordances: BTreeSet<ArtifactId>,
     /// Bounded reason citing the blocking dimension or bound.
@@ -376,6 +393,7 @@ impl ProbeOmission {
         preflight(self)?;
         self.target.validate()?;
         self.affordance.validate()?;
+        validate_owner(&self.owner, "probe_plan.omission.owner")?;
         bounds::sequence(
             self.merged_affordances.len(),
             "probe_plan.omission.merged_affordances",

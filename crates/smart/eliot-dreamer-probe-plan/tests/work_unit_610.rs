@@ -2064,6 +2064,109 @@ fn no_execution_reservation_promotion_finish_path() {
     assert_eq!(must(plan.compute_digest()), plan.digest);
 }
 
+// WORK_UNIT_CASE: 610/20
+#[test]
+fn exact_external_owner_preserved_verbatim() {
+    fn owned(id: &str, target: AffordanceTarget, reason: &str) -> InquiryAffordanceDescriptor {
+        let mut params = descriptor_params(id, target);
+        params.owner = ProbeOwnerRef::Unavailable {
+            reason: reason.to_owned(),
+        };
+        must(InquiryAffordanceDescriptor::new(params))
+    }
+    fn owner_reason(owner: &ProbeOwnerRef) -> &str {
+        match owner {
+            ProbeOwnerRef::Unavailable { reason } => reason.as_str(),
+            other => panic!("owner must be preserved verbatim, got {other:?}"),
+        }
+    }
+
+    let alpha = owned(
+        "aff-owner-alpha",
+        gap_target("claim-owner-alpha"),
+        "owner withheld: alpha",
+    );
+    let beta = owned(
+        "aff-owner-beta",
+        gap_target("claim-owner-beta"),
+        "owner withheld: beta",
+    );
+    let plan = plan_for(vec![alpha, beta], Some(16));
+    must(plan.validate());
+    assert_eq!(plan.probes.len(), 2);
+    assert!(plan.omissions.is_empty());
+    for probe in &plan.probes {
+        must(probe.target.validate());
+        must(probe.result_schema.validate());
+        must(probe.dimensions.validate());
+        assert_eq!(probe.probe_id, probe.affordance.affordance_id);
+        let expected = if probe.probe_id.as_str() == "aff-owner-alpha" {
+            "owner withheld: alpha"
+        } else if probe.probe_id.as_str() == "aff-owner-beta" {
+            "owner withheld: beta"
+        } else {
+            panic!("unexpected probe {}", probe.probe_id.as_str());
+        };
+        assert_eq!(owner_reason(&probe.owner), expected);
+    }
+    assert_eq!(must(plan.compute_digest()), plan.digest);
+
+    let dup_alpha = owned(
+        "aff-owner-dup-a",
+        rival_target("pred-dup-left", "pred-dup-right"),
+        "owner withheld: alpha",
+    );
+    let dup_beta = owned(
+        "aff-owner-dup-b",
+        rival_target("pred-dup-left", "pred-dup-right"),
+        "owner withheld: beta",
+    );
+    let dup = plan_for(vec![dup_alpha, dup_beta], Some(16));
+    must(dup.validate());
+    assert_eq!(
+        dup.probes.len(),
+        2,
+        "descriptors with different owners are not exact equivalents"
+    );
+    assert!(dup.omissions.is_empty());
+    for probe in &dup.probes {
+        must(probe.target.validate());
+        assert!(probe.merged_affordances.is_empty());
+    }
+    assert_eq!(owner_reason(&dup.probes[0].owner), "owner withheld: alpha");
+    assert_eq!(owner_reason(&dup.probes[1].owner), "owner withheld: beta");
+
+    let gamma = owned(
+        "aff-owner-gamma",
+        gap_target("claim-owner-gamma"),
+        "owner withheld: gamma",
+    );
+    let delta = owned(
+        "aff-owner-delta",
+        gap_target("claim-owner-delta"),
+        "owner withheld: delta",
+    );
+    let tight = plan_for(vec![gamma, delta], Some(1));
+    must(tight.validate());
+    assert_eq!(tight.probes.len(), 1);
+    assert_eq!(tight.omissions.len(), 1);
+    assert_eq!(tight.omissions[0].kind, OmissionKind::OverBudget);
+    assert_eq!(tight.probes[0].probe_id.as_str(), "aff-owner-delta");
+    assert_eq!(
+        owner_reason(&tight.probes[0].owner),
+        "owner withheld: delta"
+    );
+    assert_eq!(
+        tight.omissions[0].affordance.affordance_id.as_str(),
+        "aff-owner-gamma"
+    );
+    assert_eq!(
+        owner_reason(&tight.omissions[0].owner),
+        "owner withheld: gamma"
+    );
+    assert_eq!(must(tight.compute_digest()), tight.digest);
+}
+
 fn assert_rendered_has_no_execution_path(rendered: &str) {
     for token in [
         "provider",
