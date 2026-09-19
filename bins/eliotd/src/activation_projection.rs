@@ -554,7 +554,6 @@ mod projection_tests {
         }
     }
 
-    // WORK_UNIT_CASE: 839/8
     #[test]
     fn stale_fence_is_not_success_and_does_not_create_session() {
         let ticket = test_ticket(100);
@@ -812,6 +811,7 @@ mod projection_tests {
         assert!(err.to_string().contains("SCOPE_AMBIGUOUS"));
     }
 
+    // WORK_UNIT_CASE: 839/8
     #[test]
     fn resolved_fence_mismatch_yields_typed_stale_fence_without_binding() {
         // #66: a Resolved snapshot under a stale fence must surface as a
