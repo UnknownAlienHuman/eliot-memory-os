@@ -1199,6 +1199,9 @@ impl KernelComposition {
 
     /// Completes one waiting bridge exchange from a full typed result.
     ///
+    /// The retained result is re-validated against its exact pending ticket
+    /// before anything is consumed; a tampered, wrong-ticket, or wrong-fence
+    /// result is rejected with the pending evidence preserved.
     /// A `Resolved` disposition builds the Authenticated transport binding by
     /// copying the Governor-owned resolved fields and the exact ticket fence;
     /// Kernel performs no semantic selection or retry interpretation. Any
@@ -1206,7 +1209,7 @@ impl KernelComposition {
     /// typed denial carrying that disposition's exact denial code, without
     /// creating a Session. The match stays exhaustive with no wildcard arm.
     #[cfg(windows)]
-    fn activation_result_response(
+    pub(super) fn activation_result_response(
         &self,
         connection_id: &str,
         frame: &Frame,
@@ -1224,6 +1227,15 @@ impl KernelComposition {
                 .ok_or(TransportError::SessionFenced)?
                 .clone()
         };
+        // #203: reject a tampered, wrong-ticket, or wrong-fence retained
+        // result before mutating any ledger. The submit path validates before
+        // retaining, so this is defense-in-depth; a failure here preserves
+        // both the pending entry and the retained result verbatim. This
+        // closes the negative-disposition arm, which otherwise projects
+        // without any ticket binding check.
+        result
+            .validate_against(&pending.ticket)
+            .map_err(|_| TransportError::SessionFenced)?;
         // Exhaustive per-disposition projection with no wildcard arm: a
         // future disposition breaks compilation here instead of silently
         // reusing another denial code. Only `Resolved` reaches the binding

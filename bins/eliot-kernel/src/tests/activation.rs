@@ -528,3 +528,64 @@ fn activation_host_request_wrong_connection_fails_closed() {
     drop(kernel);
     let _ = std::fs::remove_dir_all(root);
 }
+
+// ---------------------------------------------------------------------------
+// #203 smallest slice: the legacy raw P-04 projection leg re-validates the
+// retained result against its exact pending ticket before mutating anything.
+// A tampered negative result is rejected with the pending evidence preserved.
+// ---------------------------------------------------------------------------
+
+#[cfg(windows)]
+#[test]
+fn activation_raw_negative_projection_rejects_tampered_result_with_pending_preserved() {
+    use eliot_protocol::{EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload};
+
+    let ticket = activation_v2_ticket("activation-ticket-raw-tamper-203", 2_000);
+    let valid = activation_v2_failed(&ticket, 1_000);
+    let (root, kernel) =
+        activation_kernel_with_ticket("raw-tamper-203", &ticket, None, Some(valid.clone()));
+    let mut tampered = valid.clone();
+    tampered.ticket_sha256 = "0".repeat(64);
+    let frame = Frame {
+        protocol_version: eliot_protocol::ProtocolVersion::CURRENT,
+        encoding_profile: EncodingProfile::JsonV1,
+        connection_id: ticket.connection_id.clone(),
+        request_id: None,
+        kind: FrameKind::Request,
+        message_type: MessageType::Execute,
+        request_identity: None,
+        payload: ProtocolPayload::Json(serde_json::Value::Null),
+        trace_context: std::collections::BTreeMap::new(),
+    };
+    let error = kernel
+        .activation_result_response(&ticket.connection_id, &frame, &ticket.ticket_id, &tampered)
+        .expect_err("tampered negative result must be rejected before mutation");
+    assert!(
+        matches!(error, TransportError::SessionFenced),
+        "unexpected error: {error:?}"
+    );
+    // Pending evidence is preserved: the exact ticket entry and the retained
+    // raw result survive the rejected projection verbatim.
+    {
+        let pending = kernel
+            .agent_activation_pending
+            .lock()
+            .expect("pending lock");
+        assert!(
+            pending.entries.contains_key(&ticket.ticket_id),
+            "rejected projection must preserve the pending entry"
+        );
+    }
+    {
+        let results = kernel
+            .agent_activation_results
+            .lock()
+            .expect("raw result lock");
+        let retained = results
+            .get(&ticket.ticket_id)
+            .expect("rejected projection must preserve the retained result");
+        assert_eq!(retained.result_sha256, valid.result_sha256);
+    }
+    drop(kernel);
+    let _ = std::fs::remove_dir_all(root);
+}
