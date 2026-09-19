@@ -1329,8 +1329,11 @@ impl IntroductionRevocationIntent {
 //   unavailable (A13.2: a minimally live Kernel withholds unsupported
 //   authority).
 //
-// Every `P07PortError::Unavailable` site below names the missing owner.
-// Receipts on the valid path are computed by the Wave A rich calls from
+// Every `P07PortError::Unavailable` site below names the missing hydration or
+// durability owner. Caller-material rejections surface as `InvalidBinding`
+// and Kernel fence/epoch/expiry refusals as `NotAdmitted`, matching the
+// `P07PortError` contract and the `eliotd` transport adapter; only genuinely
+// missing owners stay `Unavailable`. Receipts on the valid path are computed by the Wave A rich calls from
 // validated inputs plus ledger plus revision, and each passes `validate()`
 // before it is returned: no canned receipt value exists here. Durable
 // write-ahead intent persistence, restart rehydration, descendant closure
@@ -1358,6 +1361,33 @@ fn thin_operation_id(kind: &str, target_id: &str, snapshot_id: &str, epoch: &Epo
     )
 }
 
+/// Maps a rich-call rejection to the thin-port typed error.
+///
+/// `NotAdmitted` is a Kernel-side admission refusal (fenced/epoch-gated
+/// authority, expiry, or reserve exhaustion — never a receipt).
+/// `InvalidBinding` is caller-side material that is internally inconsistent
+/// (owner/fence/epoch/ceiling/lineage/identity mismatch). `Unavailable` is
+/// reserved for a genuinely missing hydration or durability owner (ORS,
+/// recovery view, dependency). The mapping is fail-closed: no branch grants
+/// authority and no secret or provider detail crosses the error surface.
+fn map_thin_error(error: &KernelError) -> eliot_authority::P07PortError {
+    use eliot_authority::P07PortError;
+    match error {
+        KernelError::FenceMismatch
+        | KernelError::StaleEpoch { .. }
+        | KernelError::Expired { .. }
+        | KernelError::ControlReserveExhausted
+        | KernelError::NormalCapacityExhausted { .. }
+        | KernelError::ProtectedReserveExhausted { .. }
+        | KernelError::EmergencySlotUnavailable { .. }
+        | KernelError::ControlGuaranteeLost { .. } => P07PortError::NotAdmitted,
+        KernelError::DependencyUnavailable(_)
+        | KernelError::RecoveryUnavailable(_)
+        | KernelError::RecoveryState(_) => P07PortError::Unavailable,
+        _ => P07PortError::InvalidBinding,
+    }
+}
+
 impl eliot_authority::P07AuthorityPort for GrantActivationPort {
     fn activate_grant(
         &self,
@@ -1365,20 +1395,20 @@ impl eliot_authority::P07AuthorityPort for GrantActivationPort {
     ) -> Result<AuthorityActivationReceipt, eliot_authority::P07PortError> {
         use eliot_authority::P07PortError;
         let active_epoch = request.binding.authority_epoch.clone();
-        if check_binding(&request.binding, &active_epoch).is_err() {
-            // Missing owner: valid caller binding material. The presented
-            // binding is internally inconsistent (owner/fence/epoch), and no
-            // owner in Slice A repairs caller material; the caller
-            // re-presents through a current Governor snapshot.
-            return Err(P07PortError::Unavailable);
+        if let Err(error) = check_binding(&request.binding, &active_epoch) {
+            // Caller-material rejection: the presented binding is internally
+            // inconsistent or stale against the presented epoch. No owner
+            // repairs caller material; the caller re-presents through a
+            // current Governor snapshot.
+            return Err(map_thin_error(&error));
         }
         {
             let ledger = self.lock_ledger();
             if ledger.grants.contains_key(request.grant_id.as_str()) {
-                // Missing owner: second-activation issuer. Restore never
-                // reactivates a path (I14.20), so a recorded grant identity
-                // cannot activate again and no owner exists here to issue it.
-                return Err(P07PortError::Unavailable);
+                // Caller lifecycle violation: restore never reactivates a
+                // path (I14.20), so a recorded grant identity cannot
+                // activate again.
+                return Err(P07PortError::InvalidBinding);
             }
         }
         // Missing owners: durable GrantGraph CAS plus the thin-request
@@ -1447,13 +1477,12 @@ impl eliot_authority::P07AuthorityPort for GrantActivationPort {
         // validated inputs plus ledger plus revision. A racing fence between
         // the hydration read above and this call can only fail closed, never
         // grant, because validation re-runs under the mutation lock.
-        self.revoke_grant(&rich, active_epoch).map_err(|_| {
-            // Missing owner: valid caller material for this identity. The
-            // rich validation rejected the fence, epoch, ceiling, revision or
-            // identity (or a racing fence landed first); no owner here repairs
-            // caller material, so the caller re-presents through a current
-            // Governor snapshot.
-            P07PortError::Unavailable
+        self.revoke_grant(&rich, active_epoch).map_err(|error| {
+            // Typed refusal: fence/epoch/expiry is a Kernel admission
+            // refusal, inconsistent caller material is a binding failure, and
+            // only a missing durable owner stays unavailable. The caller
+            // re-presents through a current Governor snapshot.
+            map_thin_error(&error)
         })
     }
 
@@ -1463,12 +1492,12 @@ impl eliot_authority::P07AuthorityPort for GrantActivationPort {
     ) -> Result<AuthorityActivationReceipt, eliot_authority::P07PortError> {
         use eliot_authority::P07PortError;
         let active_epoch = request.binding.authority_epoch.clone();
-        if check_binding(&request.binding, &active_epoch).is_err() {
-            // Missing owner: valid caller binding material. The presented
-            // binding is internally inconsistent (owner/fence/epoch), and no
-            // owner in Slice A repairs caller material; the caller
-            // re-presents through a current Governor snapshot.
-            return Err(P07PortError::Unavailable);
+        if let Err(error) = check_binding(&request.binding, &active_epoch) {
+            // Caller-material rejection: the presented binding is internally
+            // inconsistent or stale against the presented epoch. No owner
+            // repairs caller material; the caller re-presents through a
+            // current Governor snapshot.
+            return Err(map_thin_error(&error));
         }
         {
             let ledger = self.lock_ledger();
@@ -1476,10 +1505,9 @@ impl eliot_authority::P07AuthorityPort for GrantActivationPort {
                 .introductions
                 .contains_key(request.introduction_id.as_str())
             {
-                // Missing owner: second-activation issuer. A recorded
-                // introduction identity cannot activate again and no owner
-                // exists here to issue it.
-                return Err(P07PortError::Unavailable);
+                // Caller lifecycle violation: a recorded introduction
+                // identity cannot activate again.
+                return Err(P07PortError::InvalidBinding);
             }
         }
         // Missing owners: durable GrantGraph CAS plus the thin-request
@@ -1550,14 +1578,14 @@ impl eliot_authority::P07AuthorityPort for GrantActivationPort {
         // ledger plus revision. A racing fence between the hydration read
         // above and this call can only fail closed, never grant, because
         // validation re-runs under the mutation lock.
-        self.revoke_introduction(&rich, active_epoch).map_err(|_| {
-            // Missing owner: valid caller material for this identity. The
-            // rich validation rejected the fence, epoch, revision or identity
-            // (or a racing fence landed first); no owner here repairs caller
-            // material, so the caller re-presents through a current Governor
-            // snapshot.
-            P07PortError::Unavailable
-        })
+        self.revoke_introduction(&rich, active_epoch)
+            .map_err(|error| {
+                // Typed refusal: fence/epoch/expiry is a Kernel admission
+                // refusal, inconsistent caller material is a binding failure, and
+                // only a missing durable owner stays unavailable. The caller
+                // re-presents through a current Governor snapshot.
+                map_thin_error(&error)
+            })
     }
 }
 
@@ -1592,6 +1620,121 @@ mod tests {
         assert!(matches!(
             check_canonical_epoch_binding(&cross_lineage_same_sequence, &active),
             Err(KernelError::FenceMismatch)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn thin_error_mapping_keeps_typed_refusal() {
+        use eliot_authority::P07PortError;
+        assert!(matches!(
+            map_thin_error(&KernelError::FenceMismatch),
+            P07PortError::NotAdmitted
+        ));
+        assert!(matches!(
+            map_thin_error(&KernelError::Expired { expires_at_ms: 1 }),
+            P07PortError::NotAdmitted
+        ));
+        assert!(matches!(
+            map_thin_error(&KernelError::InvalidField {
+                field: "binding.authority_owner",
+                reason: "must be non-blank",
+            }),
+            P07PortError::InvalidBinding
+        ));
+        assert!(matches!(
+            map_thin_error(&KernelError::IdempotencyConflict),
+            P07PortError::InvalidBinding
+        ));
+        assert!(matches!(
+            map_thin_error(&KernelError::DependencyUnavailable("ors".to_owned())),
+            P07PortError::Unavailable
+        ));
+        assert!(matches!(
+            map_thin_error(&KernelError::RecoveryUnavailable("view".to_owned())),
+            P07PortError::Unavailable
+        ));
+    }
+
+    #[test]
+    fn thin_port_types_caller_and_missing_owner_failures() -> Result<(), KernelError> {
+        use eliot_authority::{
+            GrantActivationRequest, GrantRevocationRequest, P07AuthorityPort, P07PortError,
+        };
+        use eliot_contracts::{ContractId, ResourceGeneration};
+        use eliot_receipts::{EffectClass, ProofCeiling};
+
+        fn grant_id(value: &str) -> Result<eliot_authority::GrantId, KernelError> {
+            eliot_authority::GrantId::new(value).map_err(|_| KernelError::InvalidField {
+                field: "grant_id",
+                reason: "test grant identity must validate",
+            })
+        }
+        fn snapshot_id(value: &str) -> Result<eliot_authority::SnapshotId, KernelError> {
+            eliot_authority::SnapshotId::new(value).map_err(|_| KernelError::InvalidField {
+                field: "snapshot_id",
+                reason: "test snapshot identity must validate",
+            })
+        }
+
+        let epoch = canonical_epoch("550e8400-e29b-41d4-a716-446655440000", 7)?;
+        let fence = eliot_contracts::StateFence::new(epoch.clone(), ResourceGeneration::new(1)?);
+        let binding = AuthorityBinding {
+            authority_id: ContractId::new("authority:test")?,
+            authority_owner: "test-owner".to_owned(),
+            authority_epoch: epoch.clone(),
+            state_fence: fence,
+            allowed_effect: EffectClass::ExternalEffect,
+            proof_ceiling: ProofCeiling::ObservedExternalEffect,
+        };
+        let port = GrantActivationPort::new();
+
+        // Split binding epoch: fenced against the presented fence epoch, so
+        // the Kernel refuses admission rather than reporting unavailable.
+        let mut split = binding.clone();
+        split.authority_epoch = canonical_epoch("550e8400-e29b-41d4-a716-446655440000", 8)?;
+        let split_request = GrantActivationRequest {
+            grant_id: grant_id("grant-split")?,
+            snapshot_id: snapshot_id("snap-1")?,
+            binding: split,
+        };
+        assert!(matches!(
+            P07AuthorityPort::activate_grant(&port, &split_request),
+            Err(P07PortError::NotAdmitted)
+        ));
+
+        // Blank owner: caller-material failure, never Unavailable.
+        let mut blank = binding.clone();
+        blank.authority_owner = "  ".to_owned();
+        let blank_request = GrantActivationRequest {
+            grant_id: grant_id("grant-blank")?,
+            snapshot_id: snapshot_id("snap-1")?,
+            binding: blank,
+        };
+        assert!(matches!(
+            P07AuthorityPort::activate_grant(&port, &blank_request),
+            Err(P07PortError::InvalidBinding)
+        ));
+
+        // Valid binding but no hydration owner: activation stays Unavailable,
+        // unknown revocation stays Unavailable (no lineage is fabricated).
+        let activation = GrantActivationRequest {
+            grant_id: grant_id("grant-new")?,
+            snapshot_id: snapshot_id("snap-1")?,
+            binding: binding.clone(),
+        };
+        assert!(matches!(
+            P07AuthorityPort::activate_grant(&port, &activation),
+            Err(P07PortError::Unavailable)
+        ));
+        let revocation = GrantRevocationRequest {
+            grant_id: grant_id("grant-unknown")?,
+            snapshot_id: snapshot_id("snap-1")?,
+            binding,
+        };
+        assert!(matches!(
+            P07AuthorityPort::revoke_grant(&port, &revocation),
+            Err(P07PortError::Unavailable)
         ));
         Ok(())
     }
