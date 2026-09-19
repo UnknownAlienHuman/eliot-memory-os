@@ -25,8 +25,9 @@ use eliot_protocol::{
     AgentActivationResultReconcile,
 };
 use eliotd::{
-    DaemonComposition, DaemonConfig, DaemonKernelClient, DaemonStatus, LocalReadSubmitOutcome,
-    PROTOCOL_VERSION, SERVICE_NAME, forward_admitted_local_read,
+    ActivationClaim, DaemonComposition, DaemonConfig, DaemonKernelClient, DaemonStatus,
+    LocalReadSubmitOutcome, PROTOCOL_VERSION, SERVICE_NAME, forward_admitted_local_read,
+    terminal_for_invalid_ticket,
 };
 use serde::Serialize;
 use tokio::time::{Instant, Interval, MissedTickBehavior};
@@ -82,7 +83,7 @@ struct RetainedActivationIdentity {
 /// flight branch so health and shutdown stay pollable while either is
 /// outstanding.
 enum ActivationCompletion {
-    Claim(Result<Option<AgentActivationResolutionTicket>, String>),
+    Claim(Result<ActivationClaim, String>),
     Dispatch(Result<(), ActivationDispatchError>),
 }
 
@@ -120,12 +121,31 @@ fn start_activation_claim(
 ) -> Pin<Box<dyn std::future::Future<Output = ActivationCompletion>>> {
     let kernel_clone = Arc::clone(kernel);
     Box::pin(async move {
-        let outcome: Result<Option<AgentActivationResolutionTicket>, String> = kernel_clone
+        let outcome: Result<ActivationClaim, String> = kernel_clone
             .claim_agent_activation_ticket()
             .await
             .map_err(|error| format!("Kernel activation ticket claim: {error}"));
         ActivationCompletion::Claim(outcome)
     })
+}
+
+/// Settles one invalid activation claim (issue #202, owner decision ii).
+///
+/// Constructs the terminal artifact with no Governor read. The caller idles
+/// the flight and continues the loop: no typed-result submit, no reconcile
+/// of typed results, no retry of the rejected revision.
+fn settle_invalid_claim(ticket_bytes: Vec<u8>, reason: &str) -> Result<(), String> {
+    let now = unix_ms(SystemTime::now())?;
+    let artifact = terminal_for_invalid_ticket(ticket_bytes, reason, now.max(1))
+        .map_err(|error| format!("daemon invalid ticket terminal: {error}"))?;
+    debug_assert!(artifact.is_terminal());
+    let _ = eliotd::diagnostics::ErrorRecord::of(
+        eliotd::diagnostics::OwningComponent::DaemonRuntime,
+        "invalid-ticket",
+        reason,
+    )
+    .emit();
+    Ok(())
 }
 
 /// Settled outcome of one local-read poll step (Implements #18: the eliotd
@@ -530,55 +550,40 @@ async fn run_loop(
             } => {
                 match completion {
                     ActivationCompletion::Claim(claim_outcome) => {
-                        let ticket = match claim_outcome {
+                        let claim = match claim_outcome {
                             Err(error) => return Err(error),
-                            Ok(None) => {
+                            Ok(claim) => claim,
+                        };
+                        // Issue #202 (owner decision ii), validate-first: an
+                        // invalid ticket constructs the terminal artifact with
+                        // no Governor read, then idles the flight and
+                        // continues the loop. No typed-result submit, no
+                        // reconcile of typed results, no retry of the rejected
+                        // revision.
+                        let ticket = match claim {
+                            ActivationClaim::Empty => {
                                 flight = ActivationFlight::Idle;
                                 continue;
                             }
-                            Ok(Some(ticket)) => ticket,
+                            ActivationClaim::Invalid {
+                                ticket_bytes,
+                                reason,
+                            } => {
+                                settle_invalid_claim(ticket_bytes, &reason)?;
+                                flight = ActivationFlight::Idle;
+                                continue;
+                            }
+                            ActivationClaim::Valid(ticket) => *ticket,
                         };
                         let now = unix_ms(SystemTime::now())?;
-                        if activation_deadline_expired(now, ticket.kernel_deadline_unix_ms) {
-                            // Kernel owns the typed expiry outcome.  Do not call
-                            // the resolver at or after its exact deadline, and do
-                            // not submit or reconcile an expired ticket.
-                            flight = ActivationFlight::Idle;
-                            continue;
+                        match start_valid_claim_step(&kernel, composition, ticket, now)? {
+                            Some(state) => {
+                                flight = ActivationFlight::InFlight(state);
+                            }
+                            None => {
+                                flight = ActivationFlight::Idle;
+                            }
                         }
-                        // Single v2 resolution per newly admitted ticket.  The v2
-                        // resolver maps all seven Governor outcomes to typed
-                        // results; any Err is a real validation/readiness failure
-                        // and must fail closed rather than silently discarding a
-                        // disposition.
-                        let result = composition
-                            .resolve_agent_activation_v2(&ticket, now)
-                            .map_err(|error| {
-                                format!(
-                                    "daemon activation resolve ticket {}: {error}",
-                                    ticket.ticket_id
-                                )
-                            })?;
-                        let retained = RetainedActivationIdentity {
-                            ticket_id: ticket.ticket_id.clone(),
-                            result_sha256: result.result_sha256.clone(),
-                        };
-                        let kernel_clone = Arc::clone(&kernel);
-                        let future: Pin<
-                            Box<dyn std::future::Future<Output = ActivationCompletion>>,
-                        > = Box::pin(async move {
-                            let outcome = dispatch_agent_activation_result(
-                                &kernel_clone,
-                                &ticket,
-                                result,
-                            )
-                            .await;
-                            ActivationCompletion::Dispatch(outcome)
-                        });
-                        flight = ActivationFlight::InFlight(ActivationFlightState {
-                            future,
-                            retained: Some(retained),
-                        });
                     }
                     ActivationCompletion::Dispatch(dispatch_outcome) => match dispatch_outcome {
                         Ok(()) => {
@@ -603,6 +608,54 @@ async fn run_loop(
     }
 }
 
+/// Starts the dispatch step for one validated ticket, or idles on
+/// Kernel-owned expiry.
+///
+/// Returns `None` when the ticket expired at or after the Kernel deadline:
+/// the resolver is never called and nothing is submitted or reconciled for
+/// an expired ticket. Otherwise resolves once through the v2 spine and
+/// returns the in-flight dispatch state carrying the retained identity.
+fn start_valid_claim_step(
+    kernel: &Arc<DaemonKernelClient>,
+    composition: &DaemonComposition,
+    ticket: AgentActivationResolutionTicket,
+    now: u64,
+) -> Result<Option<ActivationFlightState>, String> {
+    if activation_deadline_expired(now, ticket.kernel_deadline_unix_ms) {
+        // Kernel owns the typed expiry outcome.  Do not call the resolver
+        // at or after its exact deadline, and do not submit or reconcile an
+        // expired ticket.
+        return Ok(None);
+    }
+    // Single v2 resolution per newly admitted ticket.  The v2 resolver maps
+    // all seven Governor outcomes to typed results; any Err is a real
+    // validation/readiness failure and must fail closed rather than silently
+    // discarding a disposition.
+    let result = composition
+        .resolve_agent_activation_v2(&ticket, now)
+        .map_err(|error| {
+            format!(
+                "daemon activation resolve ticket {}: {error}",
+                ticket.ticket_id
+            )
+        })?;
+    let retained = RetainedActivationIdentity {
+        ticket_id: ticket.ticket_id.clone(),
+        result_sha256: result.result_sha256.clone(),
+    };
+    let kernel_clone = Arc::clone(kernel);
+    let future: Pin<Box<dyn std::future::Future<Output = ActivationCompletion>>> =
+        Box::pin(async move {
+            let outcome =
+                dispatch_agent_activation_result(&kernel_clone, &ticket, result).await;
+            ActivationCompletion::Dispatch(outcome)
+        });
+    Ok(Some(ActivationFlightState {
+        future,
+        retained: Some(retained),
+    }))
+}
+
 /// Bounded shutdown drain for one in-flight activation. Never starts new
 /// work, never recomputes under a new id, and never silently drops an
 /// ambiguous submit: the original ticket/result identity is retained and a
@@ -621,8 +674,11 @@ async fn drain_activation_on_shutdown(
     let retained = state.retained;
     match tokio::time::timeout(SHUTDOWN_ACTIVATION_DRAIN, state.future).await {
         Ok(ActivationCompletion::Claim(claim_outcome)) => match claim_outcome {
-            Ok(None) => Ok(RunLoopExit::Shutdown),
-            Ok(Some(_)) => Ok(RunLoopExit::Shutdown),
+            Ok(
+                ActivationClaim::Empty
+                | ActivationClaim::Valid(_)
+                | ActivationClaim::Invalid { .. },
+            ) => Ok(RunLoopExit::Shutdown),
             Err(error) => Err(error),
         },
         Ok(ActivationCompletion::Dispatch(dispatch_outcome)) => match dispatch_outcome {
