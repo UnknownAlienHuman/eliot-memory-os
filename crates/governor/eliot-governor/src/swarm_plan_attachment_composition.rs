@@ -42,16 +42,15 @@ use super::{
 ///
 /// Owns exactly one [`SwarmPlanAttachmentService`] (hence one canonical store
 /// image). Share by reference; never construct a second instance per daemon.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SwarmAttachmentComposition {
     service: SwarmPlanAttachmentService,
 }
 
 impl SwarmAttachmentComposition {
-    /// Creates one composition over an empty canonical attachment image.
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub const fn new(service: SwarmPlanAttachmentService) -> Self {
+        Self { service }
     }
 
     /// Borrows the composed Governor attachment service.
@@ -157,14 +156,14 @@ mod tests {
 
     #[test]
     fn composition_covers_single_service_scope() {
-        let composition = SwarmAttachmentComposition::new();
+        let composition = SwarmAttachmentComposition::new(SwarmPlanAttachmentService::new());
         assert_eq!(composition.ownership_scope().services(), 1);
         assert!(composition.store().is_empty().expect("store state is readable"));
     }
 
     #[test]
     fn independently_acquired_handles_converge_second_job_conflicts() {
-        let composition = SwarmAttachmentComposition::new();
+        let composition = SwarmAttachmentComposition::new(SwarmPlanAttachmentService::new());
         // Two handles vended independently from the one composition pin the
         // same identity; neither carries the job, so no swap is possible
         // between acquisition and attach.
@@ -197,7 +196,7 @@ mod tests {
 
     #[test]
     fn port_trait_converges_through_composition_reference() {
-        let composition = SwarmAttachmentComposition::new();
+        let composition = SwarmAttachmentComposition::new(SwarmPlanAttachmentService::new());
         let port: &dyn SwarmPlanAttachmentConsumerPort<Error = CanonicalAttachmentStoreError> =
             &composition;
         let first_handle = composition
@@ -217,7 +216,9 @@ mod tests {
 
     #[test]
     fn concurrent_first_bind_has_exactly_one_winner() {
-        let composition = Arc::new(SwarmAttachmentComposition::new());
+        let composition = Arc::new(SwarmAttachmentComposition::new(
+            SwarmPlanAttachmentService::new(),
+        ));
         let barrier = Arc::new(Barrier::new(8));
         let mut handles = Vec::new();
         for index in 0..8 {
@@ -257,7 +258,7 @@ mod tests {
         .expect("initial heads map");
         assert!(initial.is_empty());
 
-        let composition = SwarmAttachmentComposition::new();
+        let composition = SwarmAttachmentComposition::new(SwarmPlanAttachmentService::new());
         let handle = composition
             .vend_consumer(ADMISSION, PLAN, FENCE_DIGEST)
             .expect("consumer vends");
@@ -276,7 +277,7 @@ mod tests {
 
     #[test]
     fn vend_consumer_rejects_blank_identities() {
-        let composition = SwarmAttachmentComposition::new();
+        let composition = SwarmAttachmentComposition::new(SwarmPlanAttachmentService::new());
         assert_eq!(
             composition.vend_consumer("   ", PLAN, FENCE_DIGEST),
             Err(SwarmPlanAttachmentError::InvalidField("admission_digest"))
