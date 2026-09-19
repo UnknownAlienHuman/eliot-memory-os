@@ -39,15 +39,15 @@
 //! validation. There are no placeholder, mock, canned, or pseudo paths:
 //! every branch binds an explicit input field.
 //!
-//! Test coverage note: 8 of 68 `WORK_UNIT_CASE 673/*` cases execute here
-//! (673/1 valid completes, 673/10 shared lineage stays one root,
-//! 673/14 majority count cannot choose a winner, 673/19 compatible scope
-//! stays residue, 673/40 nondiscriminative probe rejected, 673/51
+//! Test coverage note: 10 of 68 `WORK_UNIT_CASE 673/*` cases execute here
+//! (673/1 valid completes, 673/2 wrong job and scope fail closed, 673/3
+//! empty and single position are not conflicts, 673/10 shared lineage stays
+//! one root, 673/14 majority count cannot choose a winner, 673/19 compatible
+//! scope stays residue, 673/40 nondiscriminative probe rejected, 673/51
 //! Concilium-review recommendation carries no plan, 673/4 receipt and fence
 //! mismatch fails closed, 673/60 irrelevant order preserves digest). The
-//! remaining 60 of 68 are deferred per queue-item scope; workspace admission
-//! (#969), Product Pulse, and Edge proof remain separate. Deferred: 673/2,
-//! 673/3, 673/5, 673/6, 673/7, 673/8, 673/9, 673/11, 673/12, 673/13, 673/15,
+//! remaining 58 of 68 are deferred per queue-item scope; workspace admission
+//! (#969), Product Pulse, and Edge proof remain separate. Deferred: 673/5, 673/6, 673/7, 673/8, 673/9, 673/11, 673/12, 673/13, 673/15,
 //! 673/16, 673/17, 673/18, 673/20, 673/21, 673/22, 673/23, 673/24, 673/25,
 //! 673/26, 673/27, 673/28, 673/29, 673/30, 673/31, 673/32, 673/33, 673/34,
 //! 673/35, 673/36, 673/37, 673/38, 673/39, 673/41, 673/42, 673/43, 673/44,
@@ -2259,7 +2259,8 @@ mod tests {
         curation::{ProcedurePayload, TargetEvidence},
     };
     use eliot_epistemic_contracts::{
-        ConflictPosition, ConflictSetParams, LineageRootId, Precision, ValidityBounds,
+        ConflictPosition, ConflictSetParams, ContractError, LineageRootId, Precision,
+        ValidityBounds,
     };
     use std::collections::BTreeSet;
     use std::num::NonZeroU64;
@@ -2607,6 +2608,142 @@ mod tests {
         assert!(candidate.preservation.validate().is_ok());
         assert!(candidate.preservation.overall().is_ok());
         assert!(!candidate.invalidation_conditions.is_empty());
+    }
+
+    // WORK_UNIT_CASE: 673/2
+    #[test]
+    fn case_02_wrong_job_and_scope_input_fails_closed() {
+        let item = test_item();
+        let draft = test_draft();
+        let conflict = test_conflict();
+        let supplements = test_supplements();
+        let policy = test_policy();
+        let mut drifted_grounded = test_grounded();
+        drifted_grounded.job_id = String::from("job-9");
+        let err = match analyze_conflict(
+            &item,
+            &draft,
+            &drifted_grounded,
+            &conflict,
+            &supplements,
+            &policy,
+        ) {
+            Ok(candidate) => panic!("drifted job must fail: {:?}", candidate.outcome),
+            Err(err) => err,
+        };
+        assert!(matches!(
+            err,
+            ConflictAnalysisError::Binding { field, .. } if field == "job_id"
+        ));
+        let receipt = test_receipt();
+        let scoped_conflict = ConflictSet::new(ConflictSetParams {
+            conflict_id: "conflict-wrong-scope".to_owned(),
+            kind: ConflictKind::Epistemic,
+            scope: "scope-9".to_owned(),
+            task_id: None,
+            positions: vec![
+                test_position("source-a", "cache helps tail latency", false),
+                test_position("source-b", "cache harms tail latency", true),
+            ],
+            evidence_refs: BTreeSet::new(),
+            owners: BTreeSet::from([
+                SourceId::new("source-a").expect("valid source"),
+                SourceId::new("source-b").expect("valid source"),
+            ]),
+            common_lineage: BTreeSet::new(),
+            resolved_parts: BTreeSet::new(),
+            unresolved: BTreeSet::from(["tail latency effect".to_owned()]),
+            unresolved_owners: BTreeSet::from([
+                SourceId::new("source-a").expect("valid source"),
+                SourceId::new("source-b").expect("valid source"),
+            ]),
+            acceptability: ArgumentAcceptability::Contested,
+            defeated_refs: BTreeSet::new(),
+            probe: None,
+            decision_owner: SourceId::new("source-a").expect("valid source"),
+            affected_actions: vec!["decide-cache".to_owned()],
+            lifecycle: ConflictLifecycle::Open,
+            receipt_digest: receipt.bundle_digest.clone(),
+        })
+        .expect("scoped conflict shape stays valid");
+        let err = match analyze_conflict(
+            &item,
+            &draft,
+            &test_grounded(),
+            &scoped_conflict,
+            &supplements,
+            &policy,
+        ) {
+            Ok(candidate) => panic!("drifted scope must fail: {:?}", candidate.outcome),
+            Err(err) => err,
+        };
+        assert!(matches!(
+            err,
+            ConflictAnalysisError::Binding { field, .. } if field == "conflict_scope"
+        ));
+    }
+
+    // WORK_UNIT_CASE: 673/3
+    #[test]
+    fn case_03_empty_and_single_position_are_not_conflicts() {
+        let receipt = test_receipt();
+        let owners = BTreeSet::from([SourceId::new("source-a").expect("valid source")]);
+        let empty = ConflictSet::new(ConflictSetParams {
+            conflict_id: "conflict-empty".to_owned(),
+            kind: ConflictKind::Epistemic,
+            scope: "scope-1".to_owned(),
+            task_id: None,
+            positions: Vec::new(),
+            evidence_refs: BTreeSet::new(),
+            owners: owners.clone(),
+            common_lineage: BTreeSet::new(),
+            resolved_parts: BTreeSet::new(),
+            unresolved: BTreeSet::from(["tail latency effect".to_owned()]),
+            unresolved_owners: owners.clone(),
+            acceptability: ArgumentAcceptability::Contested,
+            defeated_refs: BTreeSet::new(),
+            probe: None,
+            decision_owner: SourceId::new("source-a").expect("valid source"),
+            affected_actions: vec!["decide-cache".to_owned()],
+            lifecycle: ConflictLifecycle::Open,
+            receipt_digest: receipt.bundle_digest.clone(),
+        });
+        assert!(
+            matches!(
+                empty,
+                Err(ContractError::EmptyCollection { field })
+                if field == "conflict.positions"
+            ),
+            "empty positions are rejected before analysis"
+        );
+        let single = ConflictSet::new(ConflictSetParams {
+            conflict_id: "conflict-single".to_owned(),
+            kind: ConflictKind::Epistemic,
+            scope: "scope-1".to_owned(),
+            task_id: None,
+            positions: vec![test_position("source-a", "cache helps tail latency", false)],
+            evidence_refs: BTreeSet::new(),
+            owners: owners.clone(),
+            common_lineage: BTreeSet::new(),
+            resolved_parts: BTreeSet::new(),
+            unresolved: BTreeSet::from(["tail latency effect".to_owned()]),
+            unresolved_owners: owners,
+            acceptability: ArgumentAcceptability::Contested,
+            defeated_refs: BTreeSet::new(),
+            probe: None,
+            decision_owner: SourceId::new("source-a").expect("valid source"),
+            affected_actions: vec!["decide-cache".to_owned()],
+            lifecycle: ConflictLifecycle::Open,
+            receipt_digest: receipt.bundle_digest.clone(),
+        });
+        assert!(
+            matches!(
+                single,
+                Err(ContractError::EmptyCollection { field })
+                if field == "conflict.positions"
+            ),
+            "one position without a qualified missing-rival denominator is not a conflict"
+        );
     }
 
     // WORK_UNIT_CASE: 673/10
