@@ -13,6 +13,14 @@
       "name": "one resolution is retained across exact replay"
     },
     {
+      "id": 6,
+      "name": "activation request identity and digest mismatch"
+    },
+    {
+      "id": 7,
+      "name": "peer-admission and connection binding mismatch"
+    },
+    {
       "id": 20,
       "name": "explicit v1 compatibility cannot consume current v2 accidentally"
     },

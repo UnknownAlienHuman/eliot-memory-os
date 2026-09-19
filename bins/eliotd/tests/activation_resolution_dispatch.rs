@@ -1,4 +1,4 @@
-//! Issue #839 dispatch matrix batch: cases 1, 2, 3, 20, and 22.
+//! Issue #839 dispatch matrix batch: cases 1, 2, 3, 6, 7, 20, and 22.
 //!
 //! These tests bind the existing daemon source seams to the accepted typed
 //! protocol contracts. They do not add a transport simulator or widen a
@@ -13,7 +13,8 @@ use eliot_protocol::{
     AgentActivationCandidateCoverage, AgentActivationResolutionDisposition,
     AgentActivationResolutionResult, AgentActivationResolutionTicket,
     AgentActivationResolvedBinding, AgentActivationResultAck, AgentActivationResultSubmit,
-    AgentActivationRetryDirective, AgentActivationSelectionDirective,
+    AgentActivationRetryDirective, AgentActivationSelectionDirective, AgentBridgeActivationRequest,
+    AgentBridgePeerAdmissionReceipt,
 };
 use serde::Deserialize;
 
@@ -104,6 +105,93 @@ fn valid_ticket(id: &str) -> TestResult<AgentActivationResolutionTicket> {
     }
     .with_computed_digest()
     .map_err(Into::into)
+}
+
+fn valid_admission() -> TestResult<(
+    AgentBridgeActivationRequest,
+    AgentBridgePeerAdmissionReceipt,
+)> {
+    let state_fence = test_fence(1)?;
+    let receipt = AgentBridgePeerAdmissionReceipt {
+        wire_id: eliot_protocol::AGENT_BRIDGE_PEER_ADMISSION_RECEIPT_WIRE_ID.to_owned(),
+        wire_version: AgentBridgePeerAdmissionReceipt::CONTRACT_VERSION,
+        module_id: "eliot-agent-bridge".to_owned(),
+        connection_id: "ticket-binding:connection".to_owned(),
+        profile_id: "SPINE_FUNCTIONAL".to_owned(),
+        descriptor_sha256: "c".repeat(64),
+        client_declaration_sha256: "d".repeat(64),
+        bridge_generation: ResourceGeneration::new(1)?,
+        state_fence: state_fence.clone(),
+        activation_deadline_unix_ms: 100,
+        challenge_nonce: "ticket-binding:challenge".to_owned(),
+        challenge_sha256: "e".repeat(64),
+        client_hello_sha256: "f".repeat(64),
+        observed_sid: "S-1-5-21-1000".to_owned(),
+        observed_session_id: 1,
+        observed_process_id: 123,
+        observed_process_start_time_100ns: 456,
+        observed_image_path: "C:\\bridge.exe".to_owned(),
+        observed_image_volume_serial: 1,
+        observed_image_file_index: 2,
+        receipt_sha256: String::new(),
+    }
+    .with_computed_digest()?;
+    let request_id = RequestId::new("ticket-binding:request")?;
+    let request = serde_json::from_value::<AgentBridgeActivationRequest>(serde_json::json!({
+        "wire_id": eliot_protocol::AGENT_BRIDGE_ACTIVATION_REQUEST_WIRE_ID,
+        "wire_version": AgentBridgeActivationRequest::CONTRACT_VERSION,
+        "operation": eliot_protocol::AGENT_BRIDGE_ACTIVATION_OPERATION,
+        "demand_id": "ticket-binding:demand",
+        "connection_id": receipt.connection_id,
+        "attach_kind": "MANAGED",
+        "pre_attach_blind_interval": null,
+        "request_identity": {
+            "request": {
+                "metadata": {
+                    "request_id": request_id.as_str(),
+                    "session_id": null,
+                    "task_id": null,
+                    "product_id": "eliot-agent-bridge",
+                    "source_id": "ticket-binding-test",
+                    "state_fence": state_fence,
+                    "clock": {
+                        "valid_time_ms": null,
+                        "known_time_ms": null,
+                        "transaction_sequence": null,
+                        "monotonic_ns": null
+                    }
+                },
+                "state_fence": state_fence
+            },
+            "idempotency_key": "ticket-binding:idempotency",
+            "deadline_unix_ms": 100,
+            "cancellation_id": "ticket-binding:cancellation"
+        },
+        "peer_admission_receipt_sha256": receipt.receipt_sha256,
+        "request_sha256": ""
+    }))?
+    .with_computed_digest()?;
+    request.validate_admission(&receipt)?;
+    Ok((request, receipt))
+}
+
+fn ticket_bound_to_admission(
+    request: &AgentBridgeActivationRequest,
+    receipt: &AgentBridgePeerAdmissionReceipt,
+) -> TestResult<AgentActivationResolutionTicket> {
+    Ok(AgentActivationResolutionTicket {
+        wire_id: eliot_protocol::AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_ID.to_owned(),
+        wire_version: eliot_protocol::AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_VERSION,
+        ticket_id: "ticket-binding:ticket".to_owned(),
+        activation_request_id: request.request_identity.request.metadata.request_id.clone(),
+        activation_request_sha256: request.request_sha256.clone(),
+        peer_admission_receipt_sha256: receipt.receipt_sha256.clone(),
+        connection_id: receipt.connection_id.clone(),
+        state_fence: receipt.state_fence.clone(),
+        kernel_deadline_unix_ms: receipt.activation_deadline_unix_ms,
+        ticket_sha256: String::new(),
+    }
+    .with_computed_digest()?)
 }
 
 fn selection(
@@ -315,6 +403,60 @@ fn every_disposition_uses_the_accepted_v2_submit_envelope() -> TestResult {
     )?;
     assert!(submit.contains("AgentActivationResultSubmit::new(result.clone())"));
     assert!(submit.contains("serde_json::json!({ \"result\": submit })"));
+    Ok(())
+}
+
+// WORK_UNIT_CASE: 839/6
+#[test]
+fn ticket_request_identity_and_digest_mismatch_fails_closed() -> TestResult {
+    assert_fixture_case(6, "activation request identity and digest mismatch")?;
+    let (request, receipt) = valid_admission()?;
+    let ticket = ticket_bound_to_admission(&request, &receipt)?;
+    ticket.validate_against(&request, &receipt)?;
+
+    let mut wrong_identity = ticket.clone();
+    wrong_identity.activation_request_id = RequestId::new("ticket-binding:other-request")?;
+    wrong_identity.ticket_sha256 = wrong_identity.compute_digest()?;
+    assert!(
+        wrong_identity.validate_against(&request, &receipt).is_err(),
+        "a ticket with a different request identity must fail closed"
+    );
+
+    let mut wrong_digest = ticket;
+    wrong_digest.activation_request_sha256 = "0".repeat(64);
+    wrong_digest.ticket_sha256 = wrong_digest.compute_digest()?;
+    assert!(
+        wrong_digest.validate_against(&request, &receipt).is_err(),
+        "a ticket with a different request digest must fail closed"
+    );
+    Ok(())
+}
+
+// WORK_UNIT_CASE: 839/7
+#[test]
+fn ticket_peer_admission_and_connection_mismatch_fails_closed() -> TestResult {
+    assert_fixture_case(7, "peer-admission and connection binding mismatch")?;
+    let (request, receipt) = valid_admission()?;
+    let ticket = ticket_bound_to_admission(&request, &receipt)?;
+    ticket.validate_against(&request, &receipt)?;
+
+    let mut wrong_receipt = ticket.clone();
+    wrong_receipt.peer_admission_receipt_sha256 = "0".repeat(64);
+    wrong_receipt.ticket_sha256 = wrong_receipt.compute_digest()?;
+    assert!(
+        wrong_receipt.validate_against(&request, &receipt).is_err(),
+        "a ticket with a different admission receipt must fail closed"
+    );
+
+    let mut wrong_connection = ticket;
+    wrong_connection.connection_id = "ticket-binding:other-connection".to_owned();
+    wrong_connection.ticket_sha256 = wrong_connection.compute_digest()?;
+    assert!(
+        wrong_connection
+            .validate_against(&request, &receipt)
+            .is_err(),
+        "a ticket with a different connection must fail closed"
+    );
     Ok(())
 }
 
