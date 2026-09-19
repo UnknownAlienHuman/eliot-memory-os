@@ -649,6 +649,7 @@ mod projection_tests {
         );
     }
 
+    // WORK_UNIT_CASE: 839/5
     #[test]
     fn tampered_ticket_is_rejected_by_every_fail_closed_constructor() {
         // #204 scenario 10: a tampered/wrong ticket (digest mismatch) binds
@@ -683,6 +684,100 @@ mod projection_tests {
         );
     }
 
+    // WORK_UNIT_CASE: 839/4
+    #[test]
+    fn malformed_wire_rejected_before_semantic_resolution() {
+        // Malformed wire identity with a fresh digest: the shape defect is
+        // reported, never a digest mismatch. The production resolver
+        // (`DaemonComposition::resolve_agent_activation_v2`) invokes
+        // `ticket.validate()` before readiness/deadline/Governor access, so
+        // this rejection provably precedes any Governor read.
+        let mut ticket = test_ticket(100);
+        ticket.wire_id = "eliot.agent.activation.resolution.ticket.malformed".to_owned();
+        ticket.ticket_sha256 = ticket.compute_digest().expect("digest");
+        let error = match ticket.validate() {
+            Ok(()) => panic!("malformed wire id validated"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("agent_activation_resolution_ticket.wire"),
+            "malformed wire reported the wrong field: {error}"
+        );
+        // Zero wire version is equally malformed.
+        let mut zeroed = test_ticket(100);
+        zeroed.wire_version = 0;
+        zeroed.ticket_sha256 = zeroed.compute_digest().expect("digest");
+        assert!(zeroed.validate().is_err(), "zero wire version validated");
+        // No fail-closed constructor may consume either malformed ticket.
+        let observed = StateFence::new(test_epoch(1), ResourceGeneration::new(2).expect("gen"));
+        for bad in [&ticket, &zeroed] {
+            assert!(
+                map_governor_outcome_to_protocol(
+                    bad,
+                    GovernorActivationOutcome::Resolved(test_snapshot()),
+                    50,
+                )
+                .is_err(),
+                "typed mapping consumed a malformed-wire ticket"
+            );
+            assert!(
+                stale_fence_for_resolved_mismatch(bad, observed.clone(), 50).is_err(),
+                "stale-fence fallback consumed a malformed-wire ticket"
+            );
+            assert!(
+                failed_internal_for_unready_governor(bad, 50).is_err(),
+                "unready-Governor fallback consumed a malformed-wire ticket"
+            );
+            assert!(
+                failed_internal_for_mapping_failure(bad, "NOT_READY", 50).is_err(),
+                "mapping-failure fallback consumed a malformed-wire ticket"
+            );
+        }
+    }
+
+    // WORK_UNIT_CASE: 839/21
+    #[test]
+    fn unknown_wire_version_rejected_before_semantic_resolution() {
+        // Well-formed ticket on a future version with a matching digest: an
+        // unknown version, not a malformed shape and not a digest mismatch.
+        // Rejected by the same `ticket.validate()` the production resolver
+        // runs before any Governor read, so no v2 data is ever decoded.
+        let mut ticket = test_ticket(100);
+        ticket.wire_version = AgentActivationResolutionTicket::CONTRACT_VERSION + 1;
+        ticket.ticket_sha256 = ticket.compute_digest().expect("digest");
+        let error = match ticket.validate() {
+            Ok(()) => panic!("unknown wire version validated"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("agent_activation_resolution_ticket.wire"),
+            "unknown version reported the wrong field: {error}"
+        );
+        assert!(
+            map_governor_outcome_to_protocol(
+                &ticket,
+                GovernorActivationOutcome::Resolved(test_snapshot()),
+                50,
+            )
+            .is_err(),
+            "typed mapping consumed an unknown-version ticket"
+        );
+        let observed = StateFence::new(test_epoch(1), ResourceGeneration::new(2).expect("gen"));
+        assert!(
+            stale_fence_for_resolved_mismatch(&ticket, observed, 50).is_err(),
+            "stale-fence fallback consumed an unknown-version ticket"
+        );
+        assert!(
+            failed_internal_for_unready_governor(&ticket, 50).is_err(),
+            "unready-Governor fallback consumed an unknown-version ticket"
+        );
+        assert!(
+            failed_internal_for_mapping_failure(&ticket, "NOT_READY", 50).is_err(),
+            "mapping-failure fallback consumed an unknown-version ticket"
+        );
+    }
+
+    // WORK_UNIT_CASE: 839/9
     #[test]
     fn post_deadline_resolved_at_is_rejected_by_every_fail_closed_constructor() {
         // #204 scenario 11: no valid terminal result at or past the Kernel
