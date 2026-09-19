@@ -109,15 +109,21 @@ impl CanonicalSwarmPlanAttachmentStore {
     }
 
     /// Returns the number of canonical bindings in the committed image.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.state.lock().map_or(0, |state| state.owner.len())
+    pub fn len(&self) -> Result<usize, CanonicalAttachmentStoreError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| CanonicalAttachmentStoreError::Poisoned)?;
+        Ok(state.owner.len())
     }
 
     /// Returns whether the committed image records no bindings.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.state.lock().is_ok_and(|state| state.owner.is_empty())
+    pub fn is_empty(&self) -> Result<bool, CanonicalAttachmentStoreError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| CanonicalAttachmentStoreError::Poisoned)?;
+        Ok(state.owner.is_empty())
     }
 
     /// Maps one loaded version onto the envelope's `expected_revision_heads`.
@@ -325,7 +331,7 @@ mod tests {
             service.vend_consumer(ADMISSION, PLAN, "   "),
             Err(SwarmPlanAttachmentError::InvalidField("fence_digest"))
         );
-        assert!(service.store().is_empty());
+        assert!(service.store().is_empty().expect("store state is readable"));
     }
 
     #[test]
@@ -354,7 +360,7 @@ mod tests {
             })) => assert_eq!(existing, winner),
             other => panic!("second job must conflict with the winner, got {other:?}"),
         }
-        assert_eq!(service.store().len(), 1);
+        assert_eq!(service.store().len().expect("store state is readable"), 1);
     }
 
     #[test]
@@ -402,7 +408,7 @@ mod tests {
         }
         assert_eq!(winners.len(), 1, "exactly one first-bind may succeed");
         assert_eq!(conflicts, 7);
-        assert_eq!(service.store().len(), 1);
+        assert_eq!(service.store().len().expect("store state is readable"), 1);
     }
 
     #[test]
