@@ -77,6 +77,15 @@ fn assert_ordered(source: &str, markers: &[&str]) -> TestResult {
     Ok(())
 }
 
+fn assert_source_excludes(source: &str, forbidden: &[&str]) -> TestResult {
+    for marker in forbidden {
+        if source.contains(marker) {
+            return Err(format!("source unexpectedly contains forbidden marker {marker:?}").into());
+        }
+    }
+    Ok(())
+}
+
 fn test_epoch(sequence: u64) -> TestResult<EpochId> {
     let lineage = EpochLineageId::new(TEST_LINEAGE)?;
     let sequence = NonZeroU64::new(sequence).ok_or("test epoch sequence must be non-zero")?;
@@ -488,5 +497,223 @@ fn v1_compatibility_isolated_from_current_v2_resolution() -> TestResult {
     )?;
     assert!(!claim_step.contains("resolve_agent_activation("));
     assert!(claim_step.contains("resolve_agent_activation_v2"));
+    Ok(())
+}
+
+// WORK_UNIT_CASE: 839/26
+#[test]
+fn protected_activation_canaries_are_redacted_before_diagnostics() -> TestResult {
+    assert_fixture_case(
+        26,
+        "protected and credential canaries are absent from diagnostics",
+    )?;
+    for canary in [
+        "password=839-canary",
+        "secret=839-canary",
+        "credential=839-canary",
+        "Bearer 839-canary",
+        "model-text=839-canary",
+    ] {
+        assert!(eliotd::diagnostics::carries_denied_content(canary));
+        assert_eq!(
+            eliotd::diagnostics::sanitize_identity(canary),
+            eliotd::diagnostics::REDACTED
+        );
+        assert_eq!(
+            eliotd::diagnostics::sanitize_detail(canary),
+            eliotd::diagnostics::REDACTED
+        );
+    }
+
+    let runtime = source("src/daemon_runtime.rs")?;
+    let dispatch = slice_between(
+        &runtime,
+        "async fn dispatch_agent_activation_result(",
+        "/// Builds the lost-acknowledgement reconcile query",
+    )?;
+    assert!(dispatch.contains("sanitize_identity(&ticket.ticket_id)"));
+    assert!(!dispatch.contains("serde_json::to_string(&result)"));
+    assert!(!dispatch.contains("format!(\"{result:?}\""));
+    Ok(())
+}
+
+// WORK_UNIT_CASE: 839/27
+#[test]
+fn activation_modules_have_no_module_wide_dead_code_suppression() -> TestResult {
+    assert_fixture_case(27, "module-wide dead_code suppression is absent")?;
+    for path in [
+        "src/activation_projection.rs",
+        "src/lib.rs",
+        "src/daemon_runtime.rs",
+        "src/daemon_kernel_client.rs",
+    ] {
+        let source = source(path)?;
+        let module_header: String = source.lines().take(80).collect::<Vec<_>>().join("\n");
+        assert!(
+            !module_header.contains("dead_code"),
+            "activation module header must not suppress dead_code: {path}"
+        );
+    }
+    Ok(())
+}
+
+// WORK_UNIT_CASE: 839/28
+#[test]
+fn required_activation_functions_are_production_reachable() -> TestResult {
+    assert_fixture_case(28, "required activation functions have production callers")?;
+    let projection = source("src/activation_projection.rs")?;
+    let projection_production = projection
+        .split("\n#[cfg(test)]\nmod tests")
+        .next()
+        .ok_or("activation projection test boundary is missing")?;
+    for marker in [
+        "map_coverage(selection.candidate_coverage)",
+        "selection: map_selection(selection)",
+        "retry: map_retry(retry)",
+    ] {
+        assert!(
+            projection_production.contains(marker),
+            "production projection must call {marker}"
+        );
+    }
+
+    let library = source("src/lib.rs")?;
+    let library_production = library
+        .split("\n#[cfg(test)]\nmod tests;")
+        .next()
+        .ok_or("daemon library test boundary is missing")?;
+    for marker in [
+        "activation_projection::map_governor_outcome_to_protocol(",
+        "activation_projection::stale_fence_for_resolved_mismatch(",
+        "activation_projection::failed_internal_for_unready_governor(",
+        "activation_projection::failed_internal_for_mapping_failure(",
+        "DaemonComposition::resolve_agent_activation_v2(self, ticket, now)",
+    ] {
+        assert!(
+            library_production.contains(marker),
+            "production daemon path must call {marker}"
+        );
+    }
+
+    let runtime = source("src/daemon_runtime.rs")?;
+    let claim_step = slice_between(
+        &runtime,
+        "fn start_valid_claim_step(",
+        "/// Bounded shutdown drain for one in-flight activation",
+    )?;
+    assert!(claim_step.contains(".resolve_agent_activation_v2(&ticket, now)"));
+    let dispatch = slice_between(
+        &runtime,
+        "async fn dispatch_agent_activation_result(",
+        "/// Builds the lost-acknowledgement reconcile query",
+    )?;
+    assert!(dispatch.contains("kernel.submit_agent_activation_result(&result)"));
+    assert!(dispatch.contains("reconcile_agent_activation_result(&query)"));
+    Ok(())
+}
+
+// WORK_UNIT_CASE: 839/29
+#[test]
+fn unrelated_dead_functions_are_exposed_to_package_lint() -> TestResult {
+    assert_fixture_case(
+        29,
+        "an unrelated new dead function fails the actual package lint",
+    )?;
+    let package = source("Cargo.toml")?;
+    let workspace = source("../../Cargo.toml")?;
+    assert!(package.contains("[lints]\nworkspace = true"));
+    assert!(workspace.contains("[workspace.lints.clippy]"));
+    assert!(workspace.contains("all = { level = \"warn\", priority = -1 }"));
+    assert!(workspace.contains("pedantic = { level = \"warn\", priority = -1 }"));
+    assert!(!package.contains("dead_code = \"allow\""));
+    assert!(!workspace.contains("dead_code = \"allow\""));
+    Ok(())
+}
+
+// WORK_UNIT_CASE: 839/30
+#[test]
+fn activation_source_excludes_unowned_effects_and_duplicate_paths() -> TestResult {
+    assert_fixture_case(
+        30,
+        "activation source excludes Store writes, Session allocation, authority, effects, and duplicate paths",
+    )?;
+    let projection = source("src/activation_projection.rs")?;
+    let projection_production = projection
+        .split("\n#[cfg(test)]\nmod tests")
+        .next()
+        .ok_or("activation projection test boundary is missing")?;
+    assert_source_excludes(
+        projection_production,
+        &[
+            "NamedWrite",
+            "Store::",
+            "Session::new",
+            "P07AuthorityPort",
+            "transact_async",
+            "tokio::spawn",
+            "ProcessExecutor",
+        ],
+    )?;
+
+    let library = source("src/lib.rs")?;
+    let resolver = slice_between(
+        &library,
+        "pub fn resolve_agent_activation_v2(",
+        "/// Records the already-validated Kernel-issued owner session facts",
+    )?;
+    assert_source_excludes(
+        resolver,
+        &[
+            "Session::new",
+            "P07AuthorityPort",
+            "transact_async",
+            "tokio::spawn",
+            "ProcessExecutor",
+            "store_named",
+        ],
+    )?;
+
+    let client = source("src/daemon_kernel_client.rs")?;
+    let submit = slice_between(
+        &client,
+        "pub async fn submit_agent_activation_result(",
+        "pub async fn reconcile_agent_activation_result(",
+    )?;
+    assert_eq!(submit.matches("transact_async(").count(), 1);
+    assert_source_excludes(
+        submit,
+        &[
+            "resolve_agent_activation_v2",
+            "Session::new",
+            "Store::",
+            "P07AuthorityPort",
+            "tokio::spawn",
+        ],
+    )?;
+
+    let runtime = source("src/daemon_runtime.rs")?;
+    let claim_step = slice_between(
+        &runtime,
+        "fn start_valid_claim_step(",
+        "/// Bounded shutdown drain for one in-flight activation",
+    )?;
+    assert!(!claim_step.contains("resolve_agent_activation("));
+    let dispatch = slice_between(
+        &runtime,
+        "async fn dispatch_agent_activation_result(",
+        "/// Builds the lost-acknowledgement reconcile query",
+    )?;
+    assert_eq!(
+        dispatch.matches("submit_agent_activation_result").count(),
+        1
+    );
+    assert_eq!(
+        dispatch
+            .matches("reconcile_agent_activation_result")
+            .count(),
+        1
+    );
+    assert!(!dispatch.contains("resolve_agent_activation_v2"));
+    assert!(!dispatch.contains("transact_async"));
     Ok(())
 }
