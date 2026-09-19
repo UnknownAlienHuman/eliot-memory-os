@@ -38,18 +38,18 @@
 //! validation. There are no placeholder, mock, canned, or pseudo paths:
 //! every branch binds an explicit input field.
 //!
-//! Test coverage note: 37 of 50 numbered 661 work-unit markers execute here;
-//! 39 tests run because two supporting regression tests are not numbered
+//! Test coverage note: 38 of 50 numbered 661 work-unit markers execute here;
+//! 40 tests run because two supporting regression tests are not numbered
 //! work-unit cases.
 //! Executed cases: 661/1, 661/2, 661/3, 661/4, 661/5, 661/6, 661/7, 661/8,
 //! 661/9, 661/10, 661/11, 661/12, 661/13, 661/14, 661/15, 661/16, 661/17,
 //! 661/18, 661/19, 661/20, 661/21, 661/22, 661/23, 661/25, 661/26,
 //! 661/27, 661/28, 661/29, 661/30, 661/31, 661/32, 661/33, 661/34,
-//! 661/40, 661/41, 661/42, and 661/43. The remaining 13 of 50 are deferred per
+//! 661/40, 661/41, 661/42, 661/43, and 661/44. The remaining 12 of 50 are deferred per
 //! START.md s1; #965 admission is separate. Deferred: 661/24 (pending
 //! candidate-visible causal receipt design - `ProcedureCandidate` currently
 //! exposes only `candidate_digest`, no typed causal receipt field), 661/35,
-//! 661/36, 661/37, 661/38, 661/39, 661/44, 661/45, 661/46, 661/47,
+//! 661/36, 661/37, 661/38, 661/39, 661/45, 661/46, 661/47,
 //! 661/48, 661/49, and 661/50.
 
 #![forbid(unsafe_code)]
@@ -3389,6 +3389,74 @@ mod tests {
         };
         assert_eq!(reved.outcome, ProcedureOutcome::Complete);
         assert_ne!(reved.candidate_digest, first.candidate_digest);
+    }
+
+    // WORK_UNIT_CASE: 661/44
+    #[test]
+    fn case_44_exact_replay_and_same_id_request_or_policy_drift_are_distinct() {
+        let item = test_item();
+        let grounded = test_grounded();
+        let evidence = test_evidence();
+        let capability = test_capability();
+        let existing = test_existing();
+        let policy = test_policy();
+        let first =
+            match propose_procedure(&item, &grounded, &evidence, &capability, &existing, &policy) {
+                Ok(candidate) => candidate,
+                Err(error) => panic!("initial request must be admissible: {error:?}"),
+            };
+        let replay =
+            match propose_procedure(&item, &grounded, &evidence, &capability, &existing, &policy) {
+                Ok(candidate) => candidate,
+                Err(error) => panic!("exact replay must remain admissible: {error:?}"),
+            };
+        assert_eq!(first, replay);
+
+        let mut changed_request = item.clone();
+        if let eliot_dreamer_contracts::CurationPayload::Procedure(payload) =
+            &mut changed_request.payload
+        {
+            payload.steps = payload.steps.saturating_add(1);
+        }
+        assert_eq!(changed_request.receipt.job_id, item.receipt.job_id);
+        let changed_request_candidate = match propose_procedure(
+            &changed_request,
+            &grounded,
+            &evidence,
+            &capability,
+            &existing,
+            &policy,
+        ) {
+            Ok(candidate) => candidate,
+            Err(error) => panic!("same-id request drift must remain admissible: {error:?}"),
+        };
+        assert_eq!(
+            changed_request_candidate.procedure_handle,
+            first.procedure_handle
+        );
+        assert_ne!(
+            changed_request_candidate.candidate_digest,
+            first.candidate_digest
+        );
+
+        let mut changed_policy = policy.clone();
+        assert_eq!(changed_policy.policy_id, policy.policy_id);
+        changed_policy.policy_revision = changed_policy.policy_revision.saturating_add(1);
+        let changed_policy_candidate = match propose_procedure(
+            &item,
+            &grounded,
+            &evidence,
+            &capability,
+            &existing,
+            &changed_policy,
+        ) {
+            Ok(candidate) => candidate,
+            Err(error) => panic!("same-id policy revision drift must remain admissible: {error:?}"),
+        };
+        assert_ne!(
+            changed_policy_candidate.candidate_digest,
+            first.candidate_digest
+        );
     }
 
     // WORK_UNIT_CASE: 661/26
