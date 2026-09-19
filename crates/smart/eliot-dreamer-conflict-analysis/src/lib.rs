@@ -39,7 +39,7 @@
 //! validation. There are no placeholder, mock, canned, or pseudo paths:
 //! every branch binds an explicit input field.
 //!
-//! Test coverage note: 55 of 68 `WORK_UNIT_CASE 673/*` cases execute here
+//! Test coverage note: 59 of 68 `WORK_UNIT_CASE 673/*` cases execute here
 //! (673/1 valid completes, 673/2 wrong job and scope fail closed, 673/3
 //! empty and single position are not conflicts, 673/5 duplicate and changed
 //! identities fail closed, 673/6 complete/partial/stale/blocked/withheld
@@ -89,11 +89,15 @@
 //! 673/66 discriminative probe carries differing outcomes or an exact
 //! unknown-resolution criterion, 673/67 classification, resolution, and proof
 //! stay within grounded evidence, 673/68 bounded malformed input stays
-//! panic-free with no winner, resolution, authority, execution, or Finish).
-//! The remaining 13 of 68 are deferred per queue-item scope; workspace
-//! admission (#969), Product Pulse, and Edge proof remain separate. Deferred: 673/45,
-//! 673/45, 673/46, 673/47, 673/48, 673/49, 673/50, 673/52, 673/53, 673/54,
-//! 673/55, 673/58, 673/59, 673/63.
+//! panic-free with no winner, resolution, authority, execution, or Finish,
+//! 673/45 recommended probes carry declarations only with no execution, route,
+//! budget, or effect receipt, 673/46 epistemic disagreement names the
+//! evidence-source owner with its evidence contract, 673/47 shared evaluator
+//! lineage names the evaluator-verifier owner, 673/48 plan value disagreement
+//! names the Human and Task Controller owner).
+//! The remaining 9 of 68 are deferred per queue-item scope; workspace
+//! admission (#969), Product Pulse, and Edge proof remain separate. Deferred: 673/49,
+//! 673/50, 673/52, 673/53, 673/54, 673/55, 673/58, 673/59, 673/63.
 
 #![forbid(unsafe_code)]
 
@@ -6675,5 +6679,297 @@ mod tests {
         assert_eq!(probe_a.schema.branches.len(), 2);
         assert_eq!(probe_b.schema.branches.len(), 2);
         assert_eq!(first.resolution_status, None);
+    }
+
+    // WORK_UNIT_CASE: 673/45
+    #[test]
+    fn case_45_recommended_probe_carries_no_execution_or_receipt() {
+        let conflict = test_conflict();
+        let mut supplements = test_supplements();
+        supplements.supplied_probes = vec![test_discriminative_probe("probe-45-decl")];
+        let candidate = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &conflict,
+            &supplements,
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("declaration-only probe analysis: {err:?}"),
+        };
+        assert_eq!(candidate.outcome, ConflictOutcome::Complete);
+        assert_eq!(candidate.recommended_probes.len(), 1);
+        let recommended = candidate
+            .recommended_probes
+            .first()
+            .expect("discriminative probe stays recommended");
+        assert_eq!(recommended.probe_id, "probe-45-decl");
+        assert!(!recommended.owner.trim().is_empty());
+        assert!(!recommended.verifier.trim().is_empty());
+        assert!(!recommended.cost_note.trim().is_empty());
+        assert!(!recommended.risk_note.trim().is_empty());
+        assert!(!recommended.privacy_note.trim().is_empty());
+        assert!(!recommended.effect_note.trim().is_empty());
+        let debug = format!("{candidate:?}");
+        let probe_debug = format!("{recommended:?}");
+        assert!(
+            !debug.contains("ConciliumPlan"),
+            "recommendation carries no Concilium plan: {debug}"
+        );
+        assert!(
+            !debug.contains("Finish"),
+            "recommendation carries no Finish signal: {debug}"
+        );
+        assert!(
+            !probe_debug.to_lowercase().contains("executed"),
+            "recommended probe carries no execution receipt: {probe_debug}"
+        );
+        assert!(
+            !probe_debug.to_lowercase().contains("route reservation")
+                && !probe_debug.to_lowercase().contains("budget receipt"),
+            "recommended probe reserves no route and carries no budget receipt: {probe_debug}"
+        );
+        assert_eq!(candidate.note, CONFLICT_PROOF_NOTE);
+        assert!(
+            candidate.note.contains("probe execution"),
+            "proof ceiling names probe execution as absent: {}",
+            candidate.note
+        );
+        assert_eq!(candidate.resolution_status, None);
+        assert!(
+            !candidate.invalidation_conditions.is_empty(),
+            "reopening conditions stay explicit instead of an execution receipt"
+        );
+    }
+
+    // WORK_UNIT_CASE: 673/46
+    #[test]
+    fn case_46_epistemic_disagreement_names_evidence_source_owner() {
+        let receipt = test_receipt();
+        let conflict = ConflictSet::new(ConflictSetParams {
+            conflict_id: "conflict-46-evidence-owner".to_owned(),
+            kind: ConflictKind::Epistemic,
+            scope: "scope-1".to_owned(),
+            task_id: None,
+            positions: vec![
+                test_position(
+                    "source-a",
+                    "warm-key coverage supports the cache finding",
+                    false,
+                ),
+                test_position(
+                    "source-b",
+                    "narrow coverage disputes the cache finding",
+                    false,
+                ),
+            ],
+            evidence_refs: BTreeSet::new(),
+            owners: BTreeSet::from([SourceId::new("source-a").expect("valid source")]),
+            common_lineage: BTreeSet::new(),
+            resolved_parts: BTreeSet::new(),
+            unresolved: BTreeSet::from(["coverage sufficiency".to_owned()]),
+            unresolved_owners: BTreeSet::from([SourceId::new("source-a").expect("valid source")]),
+            acceptability: ArgumentAcceptability::Contested,
+            defeated_refs: BTreeSet::new(),
+            probe: None,
+            decision_owner: SourceId::new("source-a").expect("valid source"),
+            affected_actions: vec!["decide-cache".to_owned()],
+            lifecycle: ConflictLifecycle::Open,
+            receipt_digest: receipt.bundle_digest.clone(),
+        })
+        .expect("evidence-owner conflict stays valid");
+        let candidate = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &conflict,
+            &test_supplements(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("evidence-owner analysis: {err:?}"),
+        };
+        assert_eq!(candidate.outcome, ConflictOutcome::Complete);
+        assert_eq!(
+            candidate.recommended_owner.kind,
+            DecisionOwnerKind::EvidenceSource
+        );
+        assert_eq!(candidate.recommended_owner.owner_handle, "source-a");
+        assert!(
+            !candidate.recommended_owner.rationale.trim().is_empty(),
+            "evidence owner carries a boundary rationale"
+        );
+        assert!(
+            candidate
+                .recommended_owner
+                .contract_needed
+                .to_lowercase()
+                .contains("evidence"),
+            "evidence owner names its evidence contract: {}",
+            candidate.recommended_owner.contract_needed
+        );
+        assert!(
+            !candidate
+                .recommended_owner
+                .contract_needed
+                .to_lowercase()
+                .contains("assign"),
+            "recommendation names the owner without assigning: {}",
+            candidate.recommended_owner.contract_needed
+        );
+        assert_eq!(candidate.positions.len(), 2);
+        assert_eq!(candidate.resolution_status, None);
+    }
+
+    // WORK_UNIT_CASE: 673/47
+    #[test]
+    fn case_47_shared_evaluator_names_evaluator_verifier_owner() {
+        let receipt = test_receipt();
+        let conflict = ConflictSet::new(ConflictSetParams {
+            conflict_id: "conflict-47-evaluator-owner".to_owned(),
+            kind: ConflictKind::Epistemic,
+            scope: "scope-1".to_owned(),
+            task_id: None,
+            positions: vec![
+                test_position("source-a", "cache helps tail latency", false),
+                test_position("source-b", "cache harms tail latency", true),
+            ],
+            evidence_refs: BTreeSet::new(),
+            owners: BTreeSet::from([
+                SourceId::new("source-a").expect("valid source"),
+                SourceId::new("source-b").expect("valid source"),
+            ]),
+            common_lineage: BTreeSet::new(),
+            resolved_parts: BTreeSet::new(),
+            unresolved: BTreeSet::from(["tail latency effect".to_owned()]),
+            unresolved_owners: BTreeSet::from([
+                SourceId::new("source-a").expect("valid source"),
+                SourceId::new("source-b").expect("valid source"),
+            ]),
+            acceptability: ArgumentAcceptability::Contested,
+            defeated_refs: BTreeSet::new(),
+            probe: None,
+            decision_owner: SourceId::new("source-a").expect("valid source"),
+            affected_actions: vec!["decide-cache".to_owned()],
+            lifecycle: ConflictLifecycle::Open,
+            receipt_digest: receipt.bundle_digest.clone(),
+        })
+        .expect("evaluator-owner conflict stays valid");
+        let mut supplements = test_supplements();
+        supplements.lineage = vec![
+            LineageAttribution {
+                source_handle: "source-a".to_owned(),
+                lineage_root: "evaluator-holdout-shared".to_owned(),
+                known: true,
+            },
+            LineageAttribution {
+                source_handle: "source-b".to_owned(),
+                lineage_root: "evaluator-holdout-shared".to_owned(),
+                known: true,
+            },
+        ];
+        let candidate = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &conflict,
+            &supplements,
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("evaluator-owner analysis: {err:?}"),
+        };
+        assert_eq!(candidate.outcome, ConflictOutcome::Complete);
+        assert_eq!(
+            candidate.recommended_owner.kind,
+            DecisionOwnerKind::EvaluatorVerifier
+        );
+        assert_eq!(candidate.recommended_owner.owner_handle, "source-a");
+        assert!(
+            candidate
+                .recommended_owner
+                .rationale
+                .to_lowercase()
+                .contains("evaluator"),
+            "evaluator owner names the independence limit: {}",
+            candidate.recommended_owner.rationale
+        );
+        assert!(
+            candidate
+                .recommended_owner
+                .contract_needed
+                .to_lowercase()
+                .contains("evaluator"),
+            "evaluator owner names its verifier contract: {}",
+            candidate.recommended_owner.contract_needed
+        );
+        assert_eq!(candidate.independent_root_count, 1);
+        assert_eq!(candidate.resolution_status, None);
+    }
+
+    // WORK_UNIT_CASE: 673/48
+    #[test]
+    fn case_48_plan_value_disagreement_names_human_controller_owner() {
+        let receipt = test_receipt();
+        let conflict = ConflictSet::new(ConflictSetParams {
+            conflict_id: "conflict-48-plan-value".to_owned(),
+            kind: ConflictKind::Plan,
+            scope: "scope-1".to_owned(),
+            task_id: None,
+            positions: vec![
+                test_position(
+                    "source-a",
+                    "prefer the latency-optimal plan under human value trade-off",
+                    false,
+                ),
+                test_position(
+                    "source-b",
+                    "prefer the cost-optimal plan under human value trade-off",
+                    false,
+                ),
+            ],
+            evidence_refs: BTreeSet::new(),
+            owners: BTreeSet::from([SourceId::new("source-a").expect("valid source")]),
+            common_lineage: BTreeSet::new(),
+            resolved_parts: BTreeSet::new(),
+            unresolved: BTreeSet::from(["plan value trade-off".to_owned()]),
+            unresolved_owners: BTreeSet::from([SourceId::new("source-a").expect("valid source")]),
+            acceptability: ArgumentAcceptability::Contested,
+            defeated_refs: BTreeSet::new(),
+            probe: None,
+            decision_owner: SourceId::new("source-a").expect("valid source"),
+            affected_actions: vec!["decide-plan".to_owned()],
+            lifecycle: ConflictLifecycle::Open,
+            receipt_digest: receipt.bundle_digest.clone(),
+        })
+        .expect("plan-value conflict stays valid");
+        let candidate = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &conflict,
+            &test_supplements(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("plan-value analysis: {err:?}"),
+        };
+        assert_eq!(candidate.outcome, ConflictOutcome::Complete);
+        assert_eq!(
+            candidate.recommended_owner.kind,
+            DecisionOwnerKind::HumanTaskController
+        );
+        assert_eq!(candidate.recommended_owner.owner_handle, "source-a");
+        assert!(!candidate.recommended_owner.rationale.trim().is_empty());
+        assert!(
+            !candidate
+                .recommended_owner
+                .contract_needed
+                .trim()
+                .is_empty()
+        );
+        assert_eq!(candidate.positions.len(), 2);
+        assert_eq!(candidate.resolution_status, None);
     }
 }
