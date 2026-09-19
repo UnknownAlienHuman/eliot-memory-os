@@ -39,22 +39,26 @@
 //! validation. There are no placeholder, mock, canned, or pseudo paths:
 //! every branch binds an explicit input field.
 //!
-//! Test coverage note: 15 of 68 `WORK_UNIT_CASE 673/*` cases execute here
+//! Test coverage note: 20 of 68 `WORK_UNIT_CASE 673/*` cases execute here
 //! (673/1 valid completes, 673/2 wrong job and scope fail closed, 673/3
 //! empty and single position are not conflicts, 673/5 duplicate and changed
 //! identities fail closed, 673/6 complete/partial/stale/blocked/withheld
 //! denominators stay explicit, 673/7 exact replay preserves digest while
-//! changed content moves it, 673/10 shared lineage stays one root, 673/14
+//! changed content moves it, 673/9 independent families stay two roots,
+//! 673/10 shared lineage stays one root, 673/11 derived citation chain stays
+//! one root, 673/12 shared context and route stays a common-mode risk,
+//! 673/13 unknown lineage is not independent, 673/14
 //! majority count cannot choose a winner, 673/19 compatible scope stays
-//! residue, 673/40 nondiscriminative probe rejected, 673/51 Concilium-review
+//! residue, 673/35 shared model and evaluator limits independence, 673/40
+//! nondiscriminative probe rejected, 673/51 Concilium-review
 //! recommendation carries no plan, 673/4 receipt and fence mismatch fails
 //! closed, 673/60 irrelevant order preserves digest, 673/61 exact and one-over
 //! limits fail closed, 673/62 cancellation and deadline emit blocked/stale).
-//! The remaining 53 of 68 are deferred per queue-item scope; workspace
-//! admission (#969), Product Pulse, and Edge proof remain separate. Deferred: 673/8, 673/9, 673/11, 673/12, 673/13, 673/15,
+//! The remaining 48 of 68 are deferred per queue-item scope; workspace
+//! admission (#969), Product Pulse, and Edge proof remain separate. Deferred: 673/8, 673/15,
 //! 673/16, 673/17, 673/18, 673/20, 673/21, 673/22, 673/23, 673/24, 673/25,
 //! 673/26, 673/27, 673/28, 673/29, 673/30, 673/31, 673/32, 673/33, 673/34,
-//! 673/35, 673/36, 673/37, 673/38, 673/39, 673/41, 673/42, 673/43, 673/44,
+//! 673/36, 673/37, 673/38, 673/39, 673/41, 673/42, 673/43, 673/44,
 //! 673/45, 673/46, 673/47, 673/48, 673/49, 673/50, 673/52, 673/53, 673/54,
 //! 673/55, 673/56, 673/57, 673/58, 673/59, 673/63, 673/64,
 //! 673/65, 673/66, 673/67, 673/68.
@@ -3710,5 +3714,331 @@ mod tests {
         };
         assert_eq!(live.outcome, ConflictOutcome::Complete);
         assert_eq!(live.recommended_probes.len(), 1);
+    }
+
+    // WORK_UNIT_CASE: 673/9
+    #[test]
+    fn case_09_independent_source_families_stay_two_roots() {
+        let candidate = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &test_conflict(),
+            &test_supplements(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("independent families analysis: {err:?}"),
+        };
+        assert_eq!(candidate.outcome, ConflictOutcome::Complete);
+        assert_eq!(candidate.independent_root_count, 2);
+        assert_eq!(candidate.lineage_groups.len(), 2);
+        assert!(candidate.lineage_groups.iter().all(|group| group.known));
+        assert!(
+            !candidate
+                .common_mode_risks
+                .iter()
+                .any(|risk| risk.kind == "shared_primary_source"),
+            "distinct families carry no shared-source risk: {:?}",
+            candidate.common_mode_risks
+        );
+        assert_eq!(candidate.positions.len(), 2);
+        assert_eq!(candidate.resolution_status, None);
+    }
+
+    // WORK_UNIT_CASE: 673/11
+    #[test]
+    fn case_11_derived_citation_chain_stays_one_root() {
+        let receipt = test_receipt();
+        let conflict = ConflictSet::new(ConflictSetParams {
+            conflict_id: "conflict-citation".to_owned(),
+            kind: ConflictKind::Epistemic,
+            scope: "scope-1".to_owned(),
+            task_id: None,
+            positions: vec![
+                test_position("source-a", "cache helps tail latency", false),
+                test_position("source-b", "cache helps tail latency per summary", false),
+                test_position("source-c", "cache harms tail latency", true),
+            ],
+            evidence_refs: BTreeSet::new(),
+            owners: BTreeSet::from([
+                SourceId::new("source-a").expect("valid source"),
+                SourceId::new("source-c").expect("valid source"),
+            ]),
+            common_lineage: BTreeSet::new(),
+            resolved_parts: BTreeSet::new(),
+            unresolved: BTreeSet::from(["tail latency effect".to_owned()]),
+            unresolved_owners: BTreeSet::from([
+                SourceId::new("source-a").expect("valid source"),
+                SourceId::new("source-c").expect("valid source"),
+            ]),
+            acceptability: ArgumentAcceptability::Contested,
+            defeated_refs: BTreeSet::new(),
+            probe: None,
+            decision_owner: SourceId::new("source-a").expect("valid source"),
+            affected_actions: vec!["decide-cache".to_owned()],
+            lifecycle: ConflictLifecycle::Open,
+            receipt_digest: receipt.bundle_digest.clone(),
+        })
+        .expect("citation chain conflict stays valid");
+        let mut supplements = test_supplements();
+        supplements.lineage = vec![
+            LineageAttribution {
+                source_handle: "source-a".to_owned(),
+                lineage_root: "root-primary".to_owned(),
+                known: true,
+            },
+            LineageAttribution {
+                source_handle: "source-b".to_owned(),
+                lineage_root: "root-primary".to_owned(),
+                known: true,
+            },
+            LineageAttribution {
+                source_handle: "source-c".to_owned(),
+                lineage_root: "root-rival".to_owned(),
+                known: true,
+            },
+        ];
+        let candidate = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &conflict,
+            &supplements,
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("citation chain analysis: {err:?}"),
+        };
+        assert_eq!(candidate.outcome, ConflictOutcome::Complete);
+        assert_eq!(candidate.independent_root_count, 2);
+        let primary = candidate
+            .lineage_groups
+            .iter()
+            .find(|group| group.lineage_root == "root-primary")
+            .expect("primary root group stays visible");
+        assert_eq!(
+            primary.member_sources,
+            vec!["source-a".to_owned(), "source-b".to_owned()]
+        );
+        assert!(
+            candidate
+                .common_mode_risks
+                .iter()
+                .any(|risk| risk.kind == "shared_primary_source"
+                    && risk.affected_sources.contains(&"source-a".to_owned())
+                    && risk.affected_sources.contains(&"source-b".to_owned())),
+            "restated primary work is one family, not two votes: {:?}",
+            candidate.common_mode_risks
+        );
+        assert_eq!(candidate.positions.len(), 3);
+    }
+
+    // WORK_UNIT_CASE: 673/12
+    #[test]
+    fn case_12_shared_context_route_stays_common_mode_risk() {
+        let receipt = test_receipt();
+        let conflict = ConflictSet::new(ConflictSetParams {
+            conflict_id: "conflict-context-route".to_owned(),
+            kind: ConflictKind::Epistemic,
+            scope: "scope-1".to_owned(),
+            task_id: None,
+            positions: vec![
+                test_position("source-a", "cache helps tail latency", false),
+                test_position("source-b", "cache harms tail latency", true),
+            ],
+            evidence_refs: BTreeSet::new(),
+            owners: BTreeSet::from([
+                SourceId::new("source-a").expect("valid source"),
+                SourceId::new("source-b").expect("valid source"),
+            ]),
+            common_lineage: BTreeSet::new(),
+            resolved_parts: BTreeSet::new(),
+            unresolved: BTreeSet::from(["tail latency effect".to_owned()]),
+            unresolved_owners: BTreeSet::from([
+                SourceId::new("source-a").expect("valid source"),
+                SourceId::new("source-b").expect("valid source"),
+            ]),
+            acceptability: ArgumentAcceptability::Contested,
+            defeated_refs: BTreeSet::new(),
+            probe: None,
+            decision_owner: SourceId::new("source-a").expect("valid source"),
+            affected_actions: vec!["decide-cache".to_owned()],
+            lifecycle: ConflictLifecycle::Open,
+            receipt_digest: receipt.bundle_digest.clone(),
+        })
+        .expect("shared route conflict stays valid");
+        let mut supplements = test_supplements();
+        supplements.lineage = vec![
+            LineageAttribution {
+                source_handle: "source-a".to_owned(),
+                lineage_root: "shared-context-route".to_owned(),
+                known: true,
+            },
+            LineageAttribution {
+                source_handle: "source-b".to_owned(),
+                lineage_root: "shared-context-route".to_owned(),
+                known: true,
+            },
+        ];
+        let candidate = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &conflict,
+            &supplements,
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("shared route analysis: {err:?}"),
+        };
+        assert_eq!(candidate.outcome, ConflictOutcome::Complete);
+        assert_eq!(candidate.independent_root_count, 1);
+        assert!(
+            candidate
+                .common_mode_risks
+                .iter()
+                .any(|risk| risk.kind == "shared_model_evaluator_context_route"
+                    && risk.affected_sources.contains(&"source-a".to_owned())
+                    && risk.affected_sources.contains(&"source-b".to_owned())),
+            "shared context and route limits independence: {:?}",
+            candidate.common_mode_risks
+        );
+        assert_eq!(
+            candidate.recommended_owner.kind,
+            DecisionOwnerKind::Multiple,
+            "two unresolved owners stay multiple while the route risk stays explicit"
+        );
+        assert_eq!(candidate.positions.len(), 2);
+    }
+
+    // WORK_UNIT_CASE: 673/13
+    #[test]
+    fn case_13_unknown_lineage_is_not_independent() {
+        let mut supplements = test_supplements();
+        supplements.lineage = vec![
+            LineageAttribution {
+                source_handle: "source-a".to_owned(),
+                lineage_root: "root-primary".to_owned(),
+                known: true,
+            },
+            LineageAttribution {
+                source_handle: "source-b".to_owned(),
+                lineage_root: "root-rival".to_owned(),
+                known: false,
+            },
+        ];
+        let candidate = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &test_conflict(),
+            &supplements,
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("unknown lineage analysis: {err:?}"),
+        };
+        assert_eq!(candidate.outcome, ConflictOutcome::Complete);
+        assert_eq!(
+            candidate.independent_root_count, 1,
+            "unknown lineage contributes no independent root"
+        );
+        let unknown = candidate
+            .lineage_groups
+            .iter()
+            .find(|group| !group.known)
+            .expect("unknown lineage group stays visible");
+        assert!(unknown.member_sources.contains(&"source-b".to_owned()));
+        assert!(
+            candidate
+                .common_mode_risks
+                .iter()
+                .any(|risk| risk.kind == "unknown_lineage"
+                    && risk.affected_sources.contains(&"source-b".to_owned())),
+            "unknown lineage is unknown independence: {:?}",
+            candidate.common_mode_risks
+        );
+        assert_eq!(candidate.positions.len(), 2);
+    }
+
+    // WORK_UNIT_CASE: 673/35
+    #[test]
+    fn case_35_shared_model_evaluator_limits_independence() {
+        let receipt = test_receipt();
+        let conflict = ConflictSet::new(ConflictSetParams {
+            conflict_id: "conflict-model-evaluator".to_owned(),
+            kind: ConflictKind::Epistemic,
+            scope: "scope-1".to_owned(),
+            task_id: None,
+            positions: vec![
+                test_position("source-a", "cache helps tail latency", false),
+                test_position("source-b", "cache harms tail latency", true),
+            ],
+            evidence_refs: BTreeSet::new(),
+            owners: BTreeSet::from([
+                SourceId::new("source-a").expect("valid source"),
+                SourceId::new("source-b").expect("valid source"),
+            ]),
+            common_lineage: BTreeSet::new(),
+            resolved_parts: BTreeSet::new(),
+            unresolved: BTreeSet::from(["tail latency effect".to_owned()]),
+            unresolved_owners: BTreeSet::from([
+                SourceId::new("source-a").expect("valid source"),
+                SourceId::new("source-b").expect("valid source"),
+            ]),
+            acceptability: ArgumentAcceptability::Contested,
+            defeated_refs: BTreeSet::new(),
+            probe: None,
+            decision_owner: SourceId::new("source-a").expect("valid source"),
+            affected_actions: vec!["decide-cache".to_owned()],
+            lifecycle: ConflictLifecycle::Open,
+            receipt_digest: receipt.bundle_digest.clone(),
+        })
+        .expect("shared model conflict stays valid");
+        let mut supplements = test_supplements();
+        supplements.lineage = vec![
+            LineageAttribution {
+                source_handle: "source-a".to_owned(),
+                lineage_root: "model-evaluator-shared".to_owned(),
+                known: true,
+            },
+            LineageAttribution {
+                source_handle: "source-b".to_owned(),
+                lineage_root: "model-evaluator-shared".to_owned(),
+                known: true,
+            },
+        ];
+        let candidate = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &conflict,
+            &supplements,
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("shared model analysis: {err:?}"),
+        };
+        assert_eq!(candidate.outcome, ConflictOutcome::Complete);
+        assert_eq!(
+            candidate.independent_root_count, 1,
+            "one shared model root is one family, not two votes"
+        );
+        assert!(
+            candidate
+                .common_mode_risks
+                .iter()
+                .any(|risk| risk.kind == "shared_model_evaluator_context_route"
+                    && risk.affected_sources.contains(&"source-a".to_owned())
+                    && risk.affected_sources.contains(&"source-b".to_owned())),
+            "shared model and evaluator limits independence: {:?}",
+            candidate.common_mode_risks
+        );
+        assert_eq!(
+            candidate.recommended_owner.kind,
+            DecisionOwnerKind::EvaluatorVerifier
+        );
+        assert_eq!(candidate.positions.len(), 2);
     }
 }
