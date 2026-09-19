@@ -330,7 +330,7 @@ async fn reconcile_genesis_receipt(
     Ok(receipt)
 }
 
-pub(crate) async fn initialize_genesis(
+pub(crate) async fn initialize_genesis_direct(
     adapter: &SurrealStoreAdapter,
     context: &RequestMeta,
     request: StoreGenesisRequest,

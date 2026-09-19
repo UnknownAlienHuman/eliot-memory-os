@@ -209,9 +209,9 @@ impl RpcTransport {
     /// Fixed dispatch (S-CONC-CLIENTS, issue #987): pure-read operations run
     /// on a pooled read-lane session so independent reads no longer
     /// serialize on the facade socket. Every other operation keeps the
-    /// facade session: canonical writes stay under the process-global write
-    /// mutex until the separate complete-scope runtime integration (#993)
-    /// replaces it, and migrations keep their explicit entrypoints.
+    /// facade session: the compatibility write path is unchanged, reserved
+    /// writes run on the pooled normal-write lane through the #993
+    /// execution, and migrations keep their explicit entrypoints.
     pub(crate) async fn query(
         &self,
         operation: &'static str,
@@ -287,10 +287,9 @@ impl RpcTransport {
 
     /// Executes one closed named normal-write operation on a pooled
     /// write-lane session. Store transaction semantics are unchanged; the
-    /// process-global write mutex still governs canonical allocation until
-    /// the separate complete-scope runtime integration (#993) replaces it.
-    /// Staged for that child; test-only until it arrives.
-    #[cfg(test)]
+    /// reserved-write execution (#993) runs canonical transactions here so
+    /// concurrent tasks execute on separate sessions, while the
+    /// compatibility path keeps the facade session.
     pub(crate) async fn query_write(
         &self,
         operation: &'static str,

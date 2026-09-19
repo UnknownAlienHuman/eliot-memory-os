@@ -8,6 +8,7 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::num::NonZeroUsize;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -363,6 +364,36 @@ impl ClientSetLimits {
     pub const fn total_sessions(self) -> u16 {
         self.read_sessions as u16 + self.write_sessions as u16 + self.admin_sessions as u16
     }
+}
+
+/// Validates write-execution lanes against the fixed bounded session set
+/// (S-CONC-EXECUTE, issue #993).
+///
+/// The execution generation may schedule at most one ready operation per
+/// lane, and every executing operation holds one `#987` normal-write
+/// session. More lanes than normal-write sessions would oversubscribe the
+/// pool: an admitted operation could hold a scheduler lane while waiting
+/// for a session that never frees. The serial compatibility profile runs
+/// exactly one lane, which always fits the one-session compatibility
+/// limits. Queue depth stays an explicit caller bound (fixed at execution
+/// install, shed with `QueueFull`); this check owns only the
+/// lanes-versus-sessions cross-check, never an invented queue formula.
+pub fn validate_execution_profile(
+    limits: ClientSetLimits,
+    lanes: NonZeroUsize,
+    serial: bool,
+) -> Result<(), ConfigError> {
+    if serial && lanes.get() != 1 {
+        return Err(ConfigError::InvalidField {
+            field: "execution.lanes",
+        });
+    }
+    if lanes.get() > usize::from(limits.write_sessions()) {
+        return Err(ConfigError::InvalidField {
+            field: "execution.lanes",
+        });
+    }
+    Ok(())
 }
 
 /// Windows reparse-point attribute flag used to reject symlinked data roots.
@@ -846,6 +877,37 @@ mod tests {
         assert!(cfg.validate().is_ok());
         cfg.expected_schema_generation = SchemaGeneration::new("2.0.1").expect("valid");
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn execution_lanes_fit_the_bounded_write_sessions() {
+        use std::num::NonZeroUsize;
+
+        let limits = ClientSetLimits::new(2, 3, 1).expect("limits");
+        let lanes = |count: usize| NonZeroUsize::new(count).expect("lanes");
+        // Lanes up to the write-session bound are admitted in both profiles.
+        assert!(validate_execution_profile(limits, lanes(1), false).is_ok());
+        assert!(validate_execution_profile(limits, lanes(3), false).is_ok());
+        assert!(validate_execution_profile(limits, lanes(1), true).is_ok());
+        // Oversubscription is rejected: more lanes than normal-write
+        // sessions would let admitted work wait on sessions that never free.
+        assert_eq!(
+            validate_execution_profile(limits, lanes(4), false),
+            Err(ConfigError::InvalidField {
+                field: "execution.lanes"
+            })
+        );
+        // The serial compatibility profile runs exactly one lane.
+        assert_eq!(
+            validate_execution_profile(limits, lanes(2), true),
+            Err(ConfigError::InvalidField {
+                field: "execution.lanes"
+            })
+        );
+        // The compatibility limits admit exactly the serial profile.
+        let compatibility = ClientSetLimits::compatibility();
+        assert!(validate_execution_profile(compatibility, lanes(1), true).is_ok());
+        assert!(validate_execution_profile(compatibility, lanes(2), false).is_err());
     }
 
     #[test]
