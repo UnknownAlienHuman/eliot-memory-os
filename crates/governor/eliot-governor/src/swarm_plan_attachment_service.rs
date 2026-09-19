@@ -126,12 +126,11 @@ impl CanonicalSwarmPlanAttachmentStore {
         Ok(state.owner.is_empty())
     }
 
-    /// Maps one loaded version onto the envelope's `expected_revision_heads`.
+    /// Maps one loaded version onto the envelope's expected revision head.
     ///
-    /// The initial (never-committed) version carries no prior head, so the
-    /// genesis write composes an empty expectation set; every later version
-    /// expects the exact committed revision under
-    /// [`ATTACHMENT_REVISION_KEY`].
+    /// The returned expectation is suitable only for an existing committed
+    /// attachment image; genesis must instead be represented by a canonical
+    /// create-if-absent expectation in the durable canonical-write path.
     pub fn revision_expectations(
         version: SwarmPlanAttachmentVersion,
         fence: &StateFence,
@@ -146,11 +145,11 @@ impl CanonicalSwarmPlanAttachmentStore {
         }])
     }
 
-    /// Maps one loaded version onto the envelope's `expected_ordering_heads`.
+    /// Maps one loaded version onto the envelope's expected ordering head.
     ///
-    /// Like [`Self::revision_expectations`], the initial version composes an
-    /// empty set; later versions expect the exact commit sequence under
-    /// [`ATTACHMENT_ORDERING_SCOPE`].
+    /// The returned expectation is suitable only for an existing committed
+    /// attachment image; genesis must instead be represented by a canonical
+    /// create-if-absent expectation in the durable canonical-write path.
     pub fn ordering_expectations(
         version: SwarmPlanAttachmentVersion,
         fence: &StateFence,
