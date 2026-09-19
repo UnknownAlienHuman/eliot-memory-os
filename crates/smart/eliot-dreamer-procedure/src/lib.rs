@@ -38,17 +38,19 @@
 //! validation. There are no placeholder, mock, canned, or pseudo paths:
 //! every branch binds an explicit input field.
 //!
-//! Test coverage note: 12 of 50 `WORK_UNIT_CASE 661/*` cases execute here
+//! Test coverage note: 15 of 50 `WORK_UNIT_CASE 661/*` cases execute here
 //! (661/1 valid completes, 661/2 exact vocabulary, 661/3 wrong subtype fails
 //! closed, 661/4 bundle mismatch fails closed, 661/5
 //! duplicate identity disposition, 661/6 success and failure evidence,
 //! 661/7 lucky success stays empirical, 661/8 exit/confidence not semantic
-//! success, 661/13 valid acyclic graph completes,
-//! 661/17 raw shell rejected, 661/25 exact idempotent replay, 661/26 unknown-effect blocks retry). The
-//! remaining 38 of 50 are deferred per START.md s1; #965 admission is
-//! separate. Deferred: 661/9, 661/10,
-//! 661/11, 661/12, 661/14, 661/15, 661/16, 661/18, 661/19, 661/20, 661/21,
-//! 661/22, 661/23, 661/24, 661/27, 661/28, 661/29, 661/30, 661/31,
+//! success, 661/9 empirical unknown mechanism, 661/13 valid acyclic graph
+//! completes, 661/17 raw shell rejected, 661/21 valid semantic verifier,
+//! 661/22 missing verifier blocks completeness,
+//! 661/25 exact idempotent replay, 661/26 unknown-effect blocks retry). The
+//! remaining 35 of 50 are deferred per START.md s1; #965 admission is
+//! separate. Deferred: 661/10,
+//! 661/11, 661/12, 661/14, 661/15, 661/16, 661/18, 661/19, 661/20,
+//! 661/23, 661/24, 661/27, 661/28, 661/29, 661/30, 661/31,
 //! 661/32, 661/33, 661/34, 661/35, 661/36, 661/37, 661/38, 661/39, 661/40,
 //! 661/41, 661/42, 661/43, 661/44, 661/45, 661/46, 661/47, 661/48, 661/49,
 //! 661/50.
@@ -2994,5 +2996,117 @@ mod tests {
             exit_candidate.candidate_digest,
             confidence_candidate.candidate_digest
         );
+    }
+
+    // WORK_UNIT_CASE: 661/9
+    #[test]
+    fn case_09_empirical_unknown_mechanism_lower_ceiling() {
+        let item = test_item();
+        let grounded = test_grounded();
+        let capability = test_capability();
+        let existing = test_existing();
+        let policy = test_policy();
+        let baseline = match propose_procedure(
+            &item,
+            &grounded,
+            &test_evidence(),
+            &capability,
+            &existing,
+            &policy,
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("mechanism baseline: {err:?}"),
+        };
+        assert_eq!(baseline.outcome, ProcedureOutcome::Complete);
+        let mut unknown = test_evidence();
+        unknown.mechanism_note =
+            "repeatable safe sequence with unknown mechanism; one success proves mechanism for rotate-caption"
+                .to_owned();
+        let candidate =
+            match propose_procedure(&item, &grounded, &unknown, &capability, &existing, &policy) {
+                Ok(candidate) => candidate,
+                Err(err) => panic!("unknown mechanism stays inert: {err:?}"),
+            };
+        assert_eq!(candidate.outcome, ProcedureOutcome::Empirical);
+        assert_eq!(
+            outcome_rejection_hint(&candidate.outcome),
+            Some(CurationRejectionCode::UnsupportedPrecision)
+        );
+        assert!(is_hex64_lower(&candidate.candidate_digest));
+        assert_ne!(candidate.candidate_digest, baseline.candidate_digest);
+        for disposition in &candidate.step_dispositions {
+            assert_eq!(disposition.kind, StepDispositionKind::Empirical);
+        }
+        assert_eq!(
+            candidate.transfer.preserved_counterevidence_refs,
+            vec!["ce-1".to_owned()]
+        );
+    }
+
+    // WORK_UNIT_CASE: 661/21
+    #[test]
+    fn case_21_valid_semantic_verifier_completes() {
+        let item = test_item();
+        let grounded = test_grounded();
+        let evidence = test_evidence();
+        let capability = test_capability();
+        let existing = test_existing();
+        let policy = test_policy();
+        let candidate =
+            match propose_procedure(&item, &grounded, &evidence, &capability, &existing, &policy) {
+                Ok(candidate) => candidate,
+                Err(err) => panic!("semantic verifier request: {err:?}"),
+            };
+        assert_eq!(candidate.outcome, ProcedureOutcome::Complete);
+        assert_eq!(candidate.verifier, "verifier-7");
+        assert_eq!(candidate.steps.len(), 3);
+        for step in &candidate.steps {
+            assert_eq!(step.verifier, "verifier-7");
+        }
+        for disposition in &candidate.step_dispositions {
+            assert_eq!(disposition.kind, StepDispositionKind::Grounded);
+            assert_eq!(disposition.verifier, "verifier-7");
+        }
+        assert!(is_hex64_lower(&candidate.candidate_digest));
+        assert_eq!(outcome_rejection_hint(&candidate.outcome), None);
+    }
+
+    // WORK_UNIT_CASE: 661/22
+    #[test]
+    fn case_22_missing_verifier_blocks_completeness() {
+        let item = test_item();
+        let grounded = test_grounded();
+        let capability = test_capability();
+        let existing = test_existing();
+        let policy = test_policy();
+        let baseline = match propose_procedure(
+            &item,
+            &grounded,
+            &test_evidence(),
+            &capability,
+            &existing,
+            &policy,
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("verifier baseline: {err:?}"),
+        };
+        assert_eq!(baseline.outcome, ProcedureOutcome::Complete);
+        let mut missing = test_evidence();
+        missing.verifier_refs = Vec::new();
+        let candidate =
+            match propose_procedure(&item, &grounded, &missing, &capability, &existing, &policy) {
+                Ok(candidate) => candidate,
+                Err(err) => panic!("missing verifier stays inert: {err:?}"),
+            };
+        assert_eq!(candidate.outcome, ProcedureOutcome::MissingVerifier);
+        assert_eq!(
+            outcome_rejection_hint(&candidate.outcome),
+            Some(CurationRejectionCode::LineageMismatch)
+        );
+        assert!(is_hex64_lower(&candidate.candidate_digest));
+        for disposition in &candidate.step_dispositions {
+            assert_eq!(disposition.kind, StepDispositionKind::MissingVerifier);
+        }
+        assert_eq!(candidate.transfer.target_env_id, "env-1");
     }
 }
