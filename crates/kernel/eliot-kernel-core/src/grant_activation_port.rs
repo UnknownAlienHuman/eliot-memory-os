@@ -3020,7 +3020,7 @@ mod tests {
             OperationalPhase::Fenced
         );
 
-        let revoked_state = revoked.state.clone();
+        let revoked_state = revoked.state;
         let fenced_projection = store
             .load_capability_grant(&subject)?
             .ok_or("fenced capability projection missing after revoke")?;
