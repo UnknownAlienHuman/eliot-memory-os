@@ -3074,6 +3074,14 @@ mod tests {
         assert_eq!(restarted_projection.record(), &fenced_record);
         assert_eq!(restarted_projection.receipt(), &fenced_receipt);
         assert_eq!(fenced_closure, vec!["grant-root".to_owned()]);
+        assert_eq!(
+            reopened_port.revocation_closure(&revoke_operation_id),
+            Some(fenced_closure.clone())
+        );
+        assert_eq!(
+            reopened_port.disposition(&revoke_operation_id),
+            Some(fenced_disposition.clone())
+        );
         assert!(reopened_port.reconciling_operations().is_empty());
 
         drop(reopened_port);
