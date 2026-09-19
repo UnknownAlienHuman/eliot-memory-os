@@ -89,19 +89,18 @@ pub struct SwarmAttachmentConsumer<'a, P: SwarmPlanAttachmentConsumerPort + ?Siz
 }
 
 impl<'a, P: SwarmPlanAttachmentConsumerPort + ?Sized> SwarmAttachmentConsumer<'a, P> {
-    /// Acquires one opaque consumer handle pinned to the given identities.
+    /// Acquires one opaque consumer handle from the Governor-vended owner port.
     ///
-    /// Acquisition is pure validation: blank identities fail closed with
-    /// [`SwarmPlanAttachmentError::InvalidField`] and no handle is issued. No
-    /// owner state is touched until [`attach`](Self::attach).
+    /// Acquisition delegates to the port so the Governor, rather than swarm,
+    /// vends the identity-bearing capability. Blank identities fail closed with
+    /// [`SwarmPlanAttachmentError::InvalidField`] and no handle is issued.
     pub fn acquire(
         port: &'a P,
         admission_digest: &str,
         plan_revision: &str,
         fence_digest: &str,
     ) -> Result<Self, SwarmPlanAttachmentError> {
-        let handle =
-            SwarmPlanAttachmentConsumer::new(admission_digest, plan_revision, fence_digest)?;
+        let handle = port.vend_consumer(admission_digest, plan_revision, fence_digest)?;
         Ok(Self { port, handle })
     }
 

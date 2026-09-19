@@ -503,7 +503,10 @@ pub struct SwarmPlanAttachmentConsumer {
 
 impl SwarmPlanAttachmentConsumer {
     /// Vends one consumer handle after validating the pinned identities.
-    pub fn new(
+    ///
+    /// Construction is crate-internal: external callers vend handles through
+    /// [`SwarmPlanAttachmentConsumerPort::vend_consumer`].
+    pub(crate) fn new(
         admission_digest: &str,
         plan_revision: &str,
         fence_digest: &str,
@@ -561,6 +564,22 @@ impl SwarmPlanAttachmentConsumer {
 pub trait SwarmPlanAttachmentConsumerPort {
     /// Opaque store failure underneath the canonical-write path.
     type Error;
+
+    /// Vends one opaque consumer handle pinned to the given identities.
+    ///
+    /// This is the only construction path outside the defining crate:
+    /// validation is fail-closed (blank identities are refused with
+    /// [`SwarmPlanAttachmentError::InvalidField`] and no handle is issued),
+    /// so swarm callers cannot mint identity-bearing capabilities themselves.
+    /// The default body constructs the handle.
+    fn vend_consumer(
+        &self,
+        admission_digest: &str,
+        plan_revision: &str,
+        fence_digest: &str,
+    ) -> Result<SwarmPlanAttachmentConsumer, SwarmPlanAttachmentError> {
+        SwarmPlanAttachmentConsumer::new(admission_digest, plan_revision, fence_digest)
+    }
 
     /// Attaches the pinned consumer plan to one durable job handle.
     fn attach(

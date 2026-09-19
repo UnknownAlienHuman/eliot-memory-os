@@ -238,14 +238,20 @@ impl SwarmPlanAttachmentService {
     /// Vends one opaque consumer handle pinned to the given identities.
     ///
     /// Validation is fail-closed: blank identities are refused and no handle
-    /// is issued.
+    /// is issued. Construction runs through the port's vended path, so the
+    /// Governor (not the caller) vends the identity-bearing capability.
     pub fn vend_consumer(
         &self,
         admission_digest: &str,
         plan_revision: &str,
         fence_digest: &str,
     ) -> Result<SwarmPlanAttachmentConsumer, SwarmPlanAttachmentError> {
-        SwarmPlanAttachmentConsumer::new(admission_digest, plan_revision, fence_digest)
+        SwarmPlanAttachmentConsumerPort::vend_consumer(
+            self,
+            admission_digest,
+            plan_revision,
+            fence_digest,
+        )
     }
 
     /// Attaches one vended consumer plan to one durable job handle.
