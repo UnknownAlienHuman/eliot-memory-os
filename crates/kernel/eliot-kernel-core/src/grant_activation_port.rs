@@ -2866,6 +2866,172 @@ mod tests {
     #[test]
     #[allow(
         clippy::too_many_lines,
+        reason = "the mismatch, absence, and exact single-grant fence proof keeps its sequence visible"
+    )]
+    fn durable_root_revocation_refuses_mismatch_without_live_mutation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use eliot_authority::{P07AuthorityPort, P07PortError};
+        use std::sync::{Arc, Mutex};
+
+        struct MutableRootHydration {
+            value: Mutex<RootGrantHydration>,
+        }
+
+        impl MutableRootHydration {
+            fn replace(&self, value: RootGrantHydration) {
+                *self
+                    .value
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = value;
+            }
+        }
+
+        impl RootGrantHydrationSource for MutableRootHydration {
+            fn hydrate_root_grant(
+                &self,
+                _request: &eliot_authority::GrantActivationRequest,
+            ) -> Result<RootGrantHydration, KernelError> {
+                Ok(self
+                    .value
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone())
+            }
+
+            fn rehydrate_root_grant(
+                &self,
+                _projection: &CapabilityGrantProjection,
+            ) -> Result<RootGrantHydration, KernelError> {
+                Ok(self
+                    .value
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone())
+            }
+        }
+
+        let epoch = canonical_epoch("550e8400-e29b-41d4-a716-446655440000", 7)?;
+        let binding = restart_test_binding(&epoch)?;
+        let (request, hydration) = durable_root_fixture(&epoch, &binding)?;
+        let revoke = eliot_authority::GrantRevocationRequest {
+            grant_id: request.grant_id.clone(),
+            snapshot_id: request.snapshot_id.clone(),
+            binding: request.binding.clone(),
+        };
+        let revoke_operation_id = thin_operation_id(
+            "revoke-grant",
+            revoke.grant_id.as_str(),
+            revoke.snapshot_id.as_str(),
+            &epoch,
+        );
+        let path = std::env::temp_dir().join(format!(
+            "eliot-kernel-root-grant-revoke-mismatch-{}-{}.redb",
+            std::process::id(),
+            epoch.sequence
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = Arc::new(eliot_ors::RedbRecoveryStore::open(&path)?);
+        let hydration_source = Arc::new(MutableRootHydration {
+            value: Mutex::new(hydration.clone()),
+        });
+        let port =
+            GrantActivationPort::with_durable_root_grant(hydration_source.clone(), store.clone());
+
+        P07AuthorityPort::activate_grant(&port, &request)
+            .map_err(|error| format!("durable activation failed: {error:?}"))?;
+        let subject = eliot_ors::OperationIdentity::new("grant-root")?;
+        let active = store
+            .load_capability_grant(&subject)?
+            .ok_or("active capability projection missing")?;
+        assert_eq!(active.phase(), OperationalPhase::Active);
+
+        let mut tampered = hydration.clone();
+        let key = match &tampered.durable_record.record().payload {
+            eliot_ors::RecoveryPayload::Encrypted { key, .. } => key.clone(),
+            eliot_ors::RecoveryPayload::ImmutableLocator { .. } => {
+                return Err("fixture must use an encrypted root-grant payload".into());
+            }
+        };
+        let ciphertext = b"changed-root-grant-revocation-record".to_vec();
+        let mut record = tampered.durable_record.record().clone();
+        record.payload = eliot_ors::RecoveryPayload::Encrypted {
+            key,
+            ciphertext: ciphertext.clone(),
+        };
+        record.payload_length = ciphertext.len() as u64;
+        record.payload_sha256 = eliot_contracts::sha256_hex(&ciphertext);
+        tampered.durable_record = CapabilityGrantActivation::new(record)?;
+        hydration_source.replace(tampered);
+
+        assert!(matches!(
+            P07AuthorityPort::revoke_grant(&port, &revoke),
+            Err(P07PortError::Unavailable | P07PortError::InvalidBinding)
+        ));
+        assert!(!port.grant_revoked("grant-root"));
+        assert!(port.disposition(&revoke_operation_id).is_none());
+        assert!(port.revocation_closure(&revoke_operation_id).is_none());
+        assert!(port.reconciling_operations().is_empty());
+        let active_after_mismatch = store
+            .load_capability_grant(&subject)?
+            .ok_or("mismatch refusal removed the capability projection")?;
+        assert_eq!(active_after_mismatch.phase(), OperationalPhase::Active);
+        assert_eq!(active_after_mismatch.record(), active.record());
+        assert_eq!(active_after_mismatch.receipt(), active.receipt());
+
+        let missing_path = std::env::temp_dir().join(format!(
+            "eliot-kernel-root-grant-revoke-missing-{}-{}.redb",
+            std::process::id(),
+            epoch.sequence
+        ));
+        let _ = std::fs::remove_file(&missing_path);
+        let missing_store = Arc::new(eliot_ors::RedbRecoveryStore::open(&missing_path)?);
+        let missing_port = GrantActivationPort::with_durable_root_grant(
+            hydration_source.clone(),
+            missing_store.clone(),
+        );
+        assert!(matches!(
+            P07AuthorityPort::revoke_grant(&missing_port, &revoke),
+            Err(P07PortError::Unavailable)
+        ));
+        assert!(!missing_port.grant_revoked("grant-root"));
+        assert!(missing_port.disposition(&revoke_operation_id).is_none());
+        assert!(
+            missing_port
+                .revocation_closure(&revoke_operation_id)
+                .is_none()
+        );
+        assert!(missing_port.reconciling_operations().is_empty());
+        assert!(missing_store.load_capability_grant(&subject)?.is_none());
+
+        hydration_source.replace(hydration);
+        let revoked = P07AuthorityPort::revoke_grant(&port, &revoke)
+            .map_err(|error| format!("durable revoke failed: {error:?}"))?;
+        assert!(matches!(revoked.state, AuthorityState::Revoked));
+        assert!(port.grant_revoked("grant-root"));
+        assert_eq!(
+            port.revocation_closure(&revoke_operation_id),
+            Some(vec!["grant-root".to_owned()])
+        );
+        assert_eq!(
+            store
+                .load_capability_grant(&subject)?
+                .ok_or("successful revoke removed the capability projection")?
+                .phase(),
+            OperationalPhase::Fenced
+        );
+
+        drop(missing_port);
+        drop(missing_store);
+        drop(port);
+        drop(store);
+        let _ = std::fs::remove_file(missing_path);
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
         reason = "the restart/replay/revocation edge proof keeps its exact sequence visible"
     )]
     fn durable_root_activation_replay_recovery_and_revoke_are_exact()
