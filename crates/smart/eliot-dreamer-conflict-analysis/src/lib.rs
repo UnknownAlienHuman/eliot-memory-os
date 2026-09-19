@@ -39,7 +39,7 @@
 //! validation. There are no placeholder, mock, canned, or pseudo paths:
 //! every branch binds an explicit input field.
 //!
-//! Test coverage note: 40 of 68 `WORK_UNIT_CASE 673/*` cases execute here
+//! Test coverage note: 44 of 68 `WORK_UNIT_CASE 673/*` cases execute here
 //! (673/1 valid completes, 673/2 wrong job and scope fail closed, 673/3
 //! empty and single position are not conflicts, 673/5 duplicate and changed
 //! identities fail closed, 673/6 complete/partial/stale/blocked/withheld
@@ -61,7 +61,11 @@
 //! coverage, and measurement disagreement stays live with the evidence-source
 //! owner, 673/25 predictive and causal mechanism disagreement stays live
 //! without a winner, 673/26 partial overlap retains a compatible residue,
-//! 673/27 multiple canonical classes retained in precedence order, 673/35 shared model
+//! 673/27 multiple canonical classes retained in precedence order, 673/28
+//! required primary follows canonical precedence rather than first match,
+//! 673/29 normalization preserves original propositions verbatim, 673/30
+//! ambiguous prose gains no invented class, 673/31 chronology and correlation
+//! stay non-causal without a winner, 673/35 shared model
 //! and evaluator limits independence, 673/40
 //! nondiscriminative probe rejected, 673/51 Concilium-review
 //! recommendation carries no plan, 673/4 receipt and fence mismatch fails
@@ -75,8 +79,8 @@
 //! unknown-resolution criterion, 673/67 classification, resolution, and proof
 //! stay within grounded evidence, 673/68 bounded malformed input stays
 //! panic-free with no winner, resolution, authority, execution, or Finish).
-//! The remaining 28 of 68 are deferred per queue-item scope; workspace
-//! admission (#969), Product Pulse, and Edge proof remain separate. Deferred: 673/28, 673/29, 673/30, 673/31, 673/32, 673/33, 673/34,
+//! The remaining 24 of 68 are deferred per queue-item scope; workspace
+//! admission (#969), Product Pulse, and Edge proof remain separate. Deferred: 673/32, 673/33, 673/34,
 //! 673/36, 673/37, 673/38, 673/39, 673/41, 673/42, 673/43, 673/44,
 //! 673/45, 673/46, 673/47, 673/48, 673/49, 673/50, 673/52, 673/53, 673/54,
 //! 673/55, 673/58, 673/59, 673/63.
@@ -5604,6 +5608,281 @@ mod tests {
             );
         }
         assert_eq!(candidate.positions.len(), 2);
+        assert_eq!(candidate.resolution_status, None);
+    }
+
+    // WORK_UNIT_CASE: 673/28
+    #[test]
+    fn case_28_required_primary_follows_canonical_precedence_not_first_match() {
+        let receipt = test_receipt();
+        let conflict = ConflictSet::new(ConflictSetParams {
+            conflict_id: "conflict-precedence-primary".to_owned(),
+            kind: ConflictKind::Architecture,
+            scope: "scope-1".to_owned(),
+            task_id: None,
+            positions: vec![
+                test_position(
+                    "source-a",
+                    "evidence supports the rival causal mechanism claim for warm-key behavior",
+                    false,
+                ),
+                test_position(
+                    "source-b",
+                    "evidence disputes the rival causal mechanism claim for warm-key behavior",
+                    false,
+                ),
+            ],
+            evidence_refs: BTreeSet::new(),
+            owners: BTreeSet::from([
+                SourceId::new("source-a").expect("valid source"),
+                SourceId::new("source-b").expect("valid source"),
+            ]),
+            common_lineage: BTreeSet::new(),
+            resolved_parts: BTreeSet::new(),
+            unresolved: BTreeSet::from(["mechanism support".to_owned()]),
+            unresolved_owners: BTreeSet::from([SourceId::new("source-a").expect("valid source")]),
+            acceptability: ArgumentAcceptability::Contested,
+            defeated_refs: BTreeSet::new(),
+            probe: None,
+            decision_owner: SourceId::new("source-a").expect("valid source"),
+            affected_actions: vec!["decide-cache".to_owned()],
+            lifecycle: ConflictLifecycle::Open,
+            receipt_digest: receipt.bundle_digest.clone(),
+        })
+        .expect("precedence-primary conflict stays valid");
+        let candidate = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &conflict,
+            &test_supplements(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("precedence-primary analysis: {err:?}"),
+        };
+        assert_eq!(candidate.outcome, ConflictOutcome::Complete);
+        let expected = vec![ConflictKind::Epistemic, ConflictKind::Architecture];
+        for position in &candidate.positions {
+            assert_eq!(
+                position.conflict_classes, expected,
+                "canonical precedence names the primary even when declared last"
+            );
+        }
+        assert_eq!(
+            candidate.positions[0].conflict_classes[0],
+            ConflictKind::Epistemic,
+            "first match in declaration order must not win the primary"
+        );
+        assert_eq!(candidate.resolution_status, None);
+    }
+
+    // WORK_UNIT_CASE: 673/29
+    #[test]
+    fn case_29_normalization_preserves_original_propositions_verbatim() {
+        let receipt = test_receipt();
+        let stance_a = "p99 latency 120ms over 1000 warm-key requests under definition D1";
+        let stance_b = "p50 latency 80ms over 10000 mixed requests under definition D2";
+        let conflict = ConflictSet::new(ConflictSetParams {
+            conflict_id: "conflict-normalization-preserves".to_owned(),
+            kind: ConflictKind::Epistemic,
+            scope: "scope-1".to_owned(),
+            task_id: None,
+            positions: vec![
+                test_position("source-a", stance_a, false),
+                test_position("source-b", stance_b, false),
+            ],
+            evidence_refs: BTreeSet::new(),
+            owners: BTreeSet::from([
+                SourceId::new("source-a").expect("valid source"),
+                SourceId::new("source-b").expect("valid source"),
+            ]),
+            common_lineage: BTreeSet::new(),
+            resolved_parts: BTreeSet::new(),
+            unresolved: BTreeSet::from(["latency definition".to_owned()]),
+            unresolved_owners: BTreeSet::from([SourceId::new("source-a").expect("valid source")]),
+            acceptability: ArgumentAcceptability::Contested,
+            defeated_refs: BTreeSet::new(),
+            probe: None,
+            decision_owner: SourceId::new("source-a").expect("valid source"),
+            affected_actions: vec!["decide-cache".to_owned()],
+            lifecycle: ConflictLifecycle::Open,
+            receipt_digest: receipt.bundle_digest.clone(),
+        })
+        .expect("normalization conflict stays valid");
+        let run_once = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &conflict,
+            &test_supplements(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("normalization analysis: {err:?}"),
+        };
+        let run_twice = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &conflict,
+            &test_supplements(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("normalization replay: {err:?}"),
+        };
+        assert_eq!(run_once.outcome, ConflictOutcome::Complete);
+        for position in &run_once.positions {
+            let original = &conflict.positions[position.position_index].stance;
+            assert_eq!(
+                &position.stance, original,
+                "typed comparison must not rewrite either original proposition"
+            );
+            assert_eq!(
+                position.disposition,
+                PositionDispositionKind::LivePreserved,
+                "differing units stay live, never smoothed into agreement"
+            );
+        }
+        assert_eq!(
+            run_once.candidate_digest, run_twice.candidate_digest,
+            "normalization is deterministic and preserves the originals"
+        );
+        let provenance = run_once
+            .preservation
+            .verdicts
+            .iter()
+            .find(|verdict| verdict.dimension == PreservationDimension::ProvenanceRetention)
+            .expect("provenance verdict present");
+        assert!(provenance.passed, "originals retained verbatim");
+        assert_eq!(run_once.resolution_status, None);
+    }
+
+    // WORK_UNIT_CASE: 673/30
+    #[test]
+    fn case_30_ambiguous_prose_gains_no_invented_class() {
+        let receipt = test_receipt();
+        let conflict = ConflictSet::new(ConflictSetParams {
+            conflict_id: "conflict-ambiguous-class".to_owned(),
+            kind: ConflictKind::Epistemic,
+            scope: "scope-1".to_owned(),
+            task_id: None,
+            positions: vec![
+                test_position("source-a", "cache feels faster on some mornings", false),
+                test_position("source-b", "cache feels slower on some mornings", false),
+            ],
+            evidence_refs: BTreeSet::new(),
+            owners: BTreeSet::from([
+                SourceId::new("source-a").expect("valid source"),
+                SourceId::new("source-b").expect("valid source"),
+            ]),
+            common_lineage: BTreeSet::new(),
+            resolved_parts: BTreeSet::new(),
+            unresolved: BTreeSet::from(["felt speed".to_owned()]),
+            unresolved_owners: BTreeSet::from([SourceId::new("source-a").expect("valid source")]),
+            acceptability: ArgumentAcceptability::Contested,
+            defeated_refs: BTreeSet::new(),
+            probe: None,
+            decision_owner: SourceId::new("source-a").expect("valid source"),
+            affected_actions: vec!["decide-cache".to_owned()],
+            lifecycle: ConflictLifecycle::Open,
+            receipt_digest: receipt.bundle_digest.clone(),
+        })
+        .expect("ambiguous conflict stays valid");
+        let candidate = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &conflict,
+            &test_supplements(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("ambiguous analysis: {err:?}"),
+        };
+        assert_eq!(candidate.outcome, ConflictOutcome::Complete);
+        for position in &candidate.positions {
+            assert_eq!(
+                position.conflict_classes,
+                vec![ConflictKind::Epistemic],
+                "unsupported or ambiguous prose gains no invented class"
+            );
+            assert_eq!(
+                position.disposition,
+                PositionDispositionKind::LivePreserved,
+                "ambiguity stays live, never resolved by prose smoothing"
+            );
+        }
+        assert_eq!(candidate.positions.len(), 2);
+        assert_eq!(candidate.resolution_status, None);
+    }
+
+    // WORK_UNIT_CASE: 673/31
+    #[test]
+    fn case_31_chronology_and_correlation_are_not_causal_proof() {
+        let receipt = test_receipt();
+        let conflict = ConflictSet::new(ConflictSetParams {
+            conflict_id: "conflict-chronology-not-causal".to_owned(),
+            kind: ConflictKind::Epistemic,
+            scope: "scope-1".to_owned(),
+            task_id: None,
+            positions: vec![
+                test_position(
+                    "source-a",
+                    "cache deploy preceded the latency drop and therefore causes the improvement",
+                    false,
+                ),
+                test_position(
+                    "source-b",
+                    "cache deploy preceded the latency drop yet the cause remains unknown",
+                    false,
+                ),
+            ],
+            evidence_refs: BTreeSet::new(),
+            owners: BTreeSet::from([
+                SourceId::new("source-a").expect("valid source"),
+                SourceId::new("source-b").expect("valid source"),
+            ]),
+            common_lineage: BTreeSet::new(),
+            resolved_parts: BTreeSet::new(),
+            unresolved: BTreeSet::from(["latency cause".to_owned()]),
+            unresolved_owners: BTreeSet::from([SourceId::new("source-a").expect("valid source")]),
+            acceptability: ArgumentAcceptability::Contested,
+            defeated_refs: BTreeSet::new(),
+            probe: None,
+            decision_owner: SourceId::new("source-a").expect("valid source"),
+            affected_actions: vec!["decide-cache".to_owned()],
+            lifecycle: ConflictLifecycle::Open,
+            receipt_digest: receipt.bundle_digest.clone(),
+        })
+        .expect("chronology conflict stays valid");
+        let candidate = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &conflict,
+            &test_supplements(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("chronology analysis: {err:?}"),
+        };
+        assert_eq!(candidate.outcome, ConflictOutcome::Complete);
+        assert!(
+            candidate
+                .positions
+                .iter()
+                .any(|position| position.compatibility_note.contains("not causal")),
+            "bare order must be marked as non-causal evidence"
+        );
+        assert!(
+            candidate
+                .positions
+                .iter()
+                .all(|position| position.disposition == PositionDispositionKind::LivePreserved),
+            "topology and co-change keep both positions live with no winner"
+        );
         assert_eq!(candidate.resolution_status, None);
     }
 }
