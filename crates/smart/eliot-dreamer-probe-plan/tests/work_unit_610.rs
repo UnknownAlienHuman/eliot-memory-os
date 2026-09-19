@@ -1,9 +1,11 @@
-//! Work-unit 610 slices 1-5 plus slice 6: bounded discriminative probe
-//! planner, cases 1..10 plus 610/17, 610/21, 610/32, 610/36 and 610/18-19
+//! Work-unit 610 slices 1-7: bounded discriminative probe planner, cases
+//! 1..10 plus 610/17, 610/21, 610/32, 610/36, 610/18-19 and 610/26, 610/28
 //! (typed affordance Unknown/Unavailable gating, safe read-only
 //! candidate-only admission, explicit lexicographic order with stable
 //! tie-break, input-order-independent plan/digest stability, no
-//! shell/Value/SDK payload, and no live route/credential/lease handle).
+//! shell/Value/SDK payload, no live route/credential/lease handle, unknown
+//! cost/capacity never reading as zero, and exact-equivalent merge with
+//! retained lineage).
 //!
 //! Cases 610/1, 610/4 and 610/5 are marked on the existing planner
 //! behaviour tests in `tests/probe_plan.rs`. Cases 610/11..16, 610/38
@@ -14,7 +16,7 @@
 //! contains zero `ResultUpdate`/`RivalUpdateMeaning` inspections, so no
 //! planner-only implementation exists without inventing APIs (slice-4 Opus
 //! audit ruling on 610/11 applies identically). Cases 610/22,
-//! 610/26-28, 610/30-31, 610/34-35, 610/37, 610/41-42 (effect-policy,
+//! 610/27, 610/30-31, 610/34-35, 610/37, 610/41-42 (effect-policy,
 //! budget/dominance/disposition/replay/no-execution) are QUEUED and out of
 //! this batch; 610/20 needs `src/` owner preservation, 610/23-25 need policy
 //! or budget enforcement the planner explicitly declines (`plan.rs`: effect,
@@ -63,7 +65,24 @@
 //! value (every probe binds only `ProbeAffordanceRef` id/digest with lineage,
 //! and the canonical wire contains no live route/credential/lease/permit-handle
 //! keys, so nothing reserves or addresses execution).
-//! Docs route=sha256:1b9bbbd8b5bb5e2de4737b4fa03e7e3672daba4394afef443dd3d8476554c7fa read=sha256:ea79ca7e06dbc95bb6ebceb4b5d904a848f265540ab58d6e82d93d5878599ec6 bundle=5ca78f97ee5f6485f6ab552d6687ade11da053a68be0cb38339167aeac0be7f3 (generic-source; verified bundle read in full; plan.rs/model.rs plus contracts affordance/result/objective/budget sources read directly).
+//! Ownership ruling 610/26,28 (this slice, planner-side preservation only;
+//! no new APIs, zero `src/` changes): 610/26 OWNED via the existing
+//! advisory-cost/capacity path (`classify_dimensions` gates only
+//! feasibility/information/authority/consent/scope, so Unknown cost/capacity
+//! stays plannable) combined with the existing rank/bound behavior
+//! (`order_key` sorts Unknown after every known determination inside its own
+//! dimension, so Unknown never reads as zero/Negligible; an unknown
+//! `candidates` bound admits nothing, so Unknown never reads as unlimited);
+//! 610/28 OWNED via the existing collapse path (`classify_descriptors`
+//! groups by the canonical `(kind, target)` digest and `merge_group` keeps
+//! the lowest affordance identity as primary while recording every collapsed
+//! identity in `merged_affordances`, so exact equivalents merge with full
+//! lineage and distinct targets stay separate).
+//! Queue note: 610/27 stays queued — its per-dimension enforcement reading
+//! overlaps need-src 610/25 (the planner enforces only the `candidates`
+//! bound; every other budget stays advisory per `plan.rs`), so no test-only
+//! proof is claimed here.
+//! Docs route=sha256:85f37ee369e03cd596b78cd1df66f54251977516efbed6d25bfbabbd3f35ca72 read=sha256:e09e5c56aeb2eac5eb65e09f877c726c83e19799f6801c91dcb021062033b46f bundle=1a37628b59897cfa21ebec2555cf05b7e45ae3be332293ec64f85b98ef4471af (generic-source; verified bundle read in full; plan.rs/model.rs plus contracts affordance/result/objective/budget sources read directly).
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
@@ -1176,5 +1195,162 @@ fn no_live_route_credential_lease_handle() {
             "canonical plan wire must carry no live {key} handle key"
         );
     }
+    assert_eq!(must(plan.compute_digest()), plan.digest);
+}
+
+// WORK_UNIT_CASE: 610/26
+#[test]
+fn unknown_cost_capacity_is_not_zero() {
+    let mut unknown_cost_params =
+        descriptor_params("aff-unknown-cost", gap_target("claim-unknown-cost"));
+    unknown_cost_params.cost = CostDimension::Unknown {
+        reason: "cost not yet characterized".to_owned(),
+    };
+    let unknown_cost = must(InquiryAffordanceDescriptor::new(unknown_cost_params));
+    assert!(!unknown_cost.cost.is_known());
+    assert!(!unknown_cost.cost.is_negligible());
+
+    let mut unknown_resource_params =
+        descriptor_params("aff-unknown-resource", gap_target("claim-unknown-resource"));
+    unknown_resource_params.resource = ResourceDimension::Unknown {
+        reason: "capacity not yet characterized".to_owned(),
+    };
+    let unknown_resource = must(InquiryAffordanceDescriptor::new(unknown_resource_params));
+    assert!(!unknown_resource.resource.is_known());
+
+    let mut negligible_params =
+        descriptor_params("aff-known-cheap", gap_target("claim-known-cheap"));
+    negligible_params.cost = CostDimension::Negligible {
+        detail: "trivial retained read".to_owned(),
+    };
+    let negligible = must(InquiryAffordanceDescriptor::new(negligible_params));
+    assert!(negligible.cost.is_known());
+    assert!(negligible.cost.is_negligible());
+
+    let bounded = descriptor("aff-known-bounded", gap_target("claim-known-bounded"));
+
+    let plan = plan_for(
+        vec![unknown_cost, unknown_resource, negligible, bounded],
+        Some(16),
+    );
+    must(plan.validate());
+    assert_eq!(plan.probes.len(), 4);
+    assert!(plan.omissions.is_empty());
+
+    let order: Vec<&str> = plan
+        .probes
+        .iter()
+        .map(|probe| probe.probe_id.as_str())
+        .collect();
+    assert_eq!(
+        order,
+        vec![
+            "aff-known-cheap",
+            "aff-known-bounded",
+            "aff-unknown-resource",
+            "aff-unknown-cost",
+        ]
+    );
+    for (index, probe) in plan.probes.iter().enumerate() {
+        let rank = u32::try_from(index).expect("rank must fit u32");
+        assert_eq!(probe.rank, rank);
+        must(probe.target.validate());
+        must(probe.result_schema.validate());
+        must(probe.dimensions.validate());
+    }
+
+    let unknown_probe = &plan.probes[3];
+    assert_eq!(unknown_probe.probe_id.as_str(), "aff-unknown-cost");
+    match &unknown_probe.dimensions.cost {
+        CostDimension::Unknown { reason } => {
+            assert_eq!(reason.as_str(), "cost not yet characterized");
+        }
+        other => panic!("unknown cost must stay visible, got {other:?}"),
+    }
+    let resource_probe = &plan.probes[2];
+    assert_eq!(resource_probe.probe_id.as_str(), "aff-unknown-resource");
+    match &resource_probe.dimensions.resource {
+        ResourceDimension::Unknown { reason } => {
+            assert_eq!(reason.as_str(), "capacity not yet characterized");
+        }
+        other => panic!("unknown capacity must stay visible, got {other:?}"),
+    }
+    assert_eq!(must(plan.compute_digest()), plan.digest);
+
+    let mut unbudgeted_params = descriptor_params("aff-unbudgeted", gap_target("claim-unbudgeted"));
+    unbudgeted_params.cost = CostDimension::Unknown {
+        reason: "cost not yet characterized".to_owned(),
+    };
+    let unbudgeted = plan_for(
+        vec![must(InquiryAffordanceDescriptor::new(unbudgeted_params))],
+        None,
+    );
+    must(unbudgeted.validate());
+    assert!(unbudgeted.probes.is_empty());
+    assert_eq!(unbudgeted.omissions.len(), 1);
+    let gap = &unbudgeted.omissions[0];
+    assert_eq!(gap.kind, OmissionKind::OverBudget);
+    assert!(
+        gap.reason.contains("unknown"),
+        "unknown bound must cite the missing limit, got {}",
+        gap.reason
+    );
+    match &gap.dimensions.cost {
+        CostDimension::Unknown { .. } => {}
+        other => panic!("over-budget gap must preserve the unknown cost, got {other:?}"),
+    }
+}
+
+// WORK_UNIT_CASE: 610/28
+#[test]
+fn exact_equivalent_merge_retains_lineage() {
+    let later = descriptor(
+        "aff-merge-b",
+        rival_target("pred-merge-left", "pred-merge-right"),
+    );
+    let earlier = descriptor(
+        "aff-merge-a",
+        rival_target("pred-merge-left", "pred-merge-right"),
+    );
+    let solo = descriptor("aff-merge-solo", gap_target("claim-merge-solo"));
+    let plan = plan_for(vec![later, earlier, solo], Some(16));
+    must(plan.validate());
+    assert_eq!(plan.probes.len(), 2);
+    assert!(plan.omissions.is_empty());
+
+    let order: Vec<&str> = plan
+        .probes
+        .iter()
+        .map(|probe| probe.probe_id.as_str())
+        .collect();
+    assert_eq!(order, vec!["aff-merge-a", "aff-merge-solo"]);
+
+    let merged = &plan.probes[0];
+    assert_eq!(merged.probe_id.as_str(), "aff-merge-a");
+    assert_eq!(merged.rank, 0);
+    assert_eq!(merged.affordance.affordance_id.as_str(), "aff-merge-a");
+    assert!(!merged.affordance.affordance_digest.trim().is_empty());
+    assert_eq!(merged.merged_affordances.len(), 1);
+    assert!(
+        merged.merged_affordances.contains(&artifact("aff-merge-b")),
+        "merge must retain the collapsed lineage, got {:?}",
+        merged.merged_affordances
+    );
+    match &merged.target {
+        ProbeTarget::RivalDisagreement { left, right } => {
+            assert_eq!(left.prediction_id.as_str(), "pred-merge-left");
+            assert_eq!(right.prediction_id.as_str(), "pred-merge-right");
+        }
+        other => panic!("merged probe must name the shared disagreement, got {other:?}"),
+    }
+    must(merged.target.validate());
+    must(merged.result_schema.validate());
+    must(merged.dimensions.validate());
+    assert!(!merged.expected_discrimination.trim().is_empty());
+
+    let single = &plan.probes[1];
+    assert_eq!(single.probe_id.as_str(), "aff-merge-solo");
+    assert_eq!(single.rank, 1);
+    assert!(single.merged_affordances.is_empty());
     assert_eq!(must(plan.compute_digest()), plan.digest);
 }
