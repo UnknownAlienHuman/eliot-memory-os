@@ -623,42 +623,51 @@ async fn independent_scope_provider_overlap() {
     let harness = Harness::fresh("03").await;
     let (ctx_a, transition_a) = admitted("op-994-overlap-a", "scope-994-a", "subject-994-03-a");
     let (ctx_b, transition_b) = admitted("op-994-overlap-b", "scope-994-b", "subject-994-03-b");
-    let adapter = harness.adapter();
-    // Overlap witness: a three-party barrier with a test-side third party.
-    // It releases only after BOTH production writers block inside the
-    // post-admission attempt rendezvous, so the observer completing proves
-    // both writers were concurrently in flight inside the provider seam. A
-    // single serialized lane would leave the first writer waiting for a
-    // second writer that can never arrive and the bound below would fire.
-    let rendezvous = Arc::new(tokio::sync::Barrier::new(3));
-    adapter.arm_tx_rendezvous(Arc::clone(&rendezvous));
-    let started_ms = unix_ms_now();
-    let (receipt_a, receipt_b, _) =
-        tokio::time::timeout(Duration::from_millis(profile_u64("rendezvous_ms")), async {
-            tokio::join!(
-                CanonicalStoreClient::apply_prepared(
-                    adapter,
-                    &ctx_a,
-                    transition_a.clone(),
-                    vec![],
-                    vec![]
-                ),
-                CanonicalStoreClient::apply_prepared(
-                    adapter,
-                    &ctx_b,
-                    transition_b.clone(),
-                    vec![],
-                    vec![]
-                ),
-                rendezvous.wait(),
-            )
-        })
+    let (receipt_a, receipt_b, started_ms, ended_ms) = {
+        let adapter = harness.adapter();
+        let rendezvous = Arc::new(tokio::sync::Barrier::new(3));
+        adapter.arm_tx_rendezvous(Arc::clone(&rendezvous));
+        let started_ms = unix_ms_now();
+
+        let writer_a = CanonicalStoreClient::apply_prepared(
+            adapter,
+            &ctx_a,
+            transition_a.clone(),
+            vec![],
+            vec![],
+        );
+        let writer_b = CanonicalStoreClient::apply_prepared(
+            adapter,
+            &ctx_b,
+            transition_b.clone(),
+            vec![],
+            vec![],
+        );
+
+        tokio::pin!(writer_a);
+        tokio::pin!(writer_b);
+
+        let _witness = tokio::time::timeout(
+            Duration::from_millis(profile_u64("rendezvous_ms")),
+            async {
+                tokio::select! {
+                    result = &mut writer_a => panic!("writer A completed before both transaction attempts rendezvoused: {result:?}"),
+                    result = &mut writer_b => panic!("writer B completed before both transaction attempts rendezvoused: {result:?}"),
+                    _ = rendezvous.wait() => {}
+                }
+            },
+        )
         .await
-        .expect("both disjoint writers must rendezvous inside the provider seam");
-    let ended_ms = unix_ms_now();
-    adapter.disarm_tx_rendezvous();
-    let receipt_a = receipt_a.expect("writer A commits");
-    let receipt_b = receipt_b.expect("writer B commits");
+        .expect("both production writers must reach the post-admission transaction-attempt rendezvous");
+
+        let (receipt_a, receipt_b) = tokio::join!(writer_a, writer_b);
+        let ended_ms = unix_ms_now();
+        adapter.disarm_tx_rendezvous();
+
+        let receipt_a = receipt_a.expect("writer A commits");
+        let receipt_b = receipt_b.expect("writer B commits");
+        (receipt_a, receipt_b, started_ms, ended_ms)
+    };
     validate_store_receipt_envelope(&ctx_a, &transition_a, &receipt_a).expect("envelope A");
     validate_store_receipt_envelope(&ctx_b, &transition_b, &receipt_b).expect("envelope B");
     assert_committed("op-994-overlap-a", &receipt_a);
