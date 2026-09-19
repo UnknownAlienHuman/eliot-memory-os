@@ -51,7 +51,7 @@
 //! validation. There are no placeholder, mock, canned, or pseudo paths:
 //! every branch binds an explicit input field.
 //!
-//! Test coverage note: 20 of 51 `WORK_UNIT_CASE 675/*` cases execute here
+//! Test coverage note: 23 of 51 `WORK_UNIT_CASE 675/*` cases execute here
 //! (675/1 valid two-rival diagnosis with minimal experiment, 675/2 exact
 //! Objective/acceptance/recovery/identity binding, 675/3 wrong job/payload
 //! fails closed, 675/4 fence and receipt mismatch fails closed, 675/5
@@ -65,14 +65,16 @@
 //! confirmation, 675/14 complete repair-history denominator, 675/15
 //! unchanged equivalent retry requires mechanism review, 675/16 cosmetic
 //! patch with the same mechanism remains equivalent, 675/17 controlled
-//! repetition with new evidence or justification, 675/21 mandatory conflict
-//! analysis missing yields insufficiency, 675/32 identical rival predictions
-//! are nondiscriminative, 675/45 exact replay is deterministic). The
-//! remaining 31 of 51 are deferred per START.md s1; #969 admission is
-//! separate. Deferred: 675/18, 675/19, 675/20, 675/22, 675/23, 675/24,
-//! 675/25, 675/26, 675/27, 675/28, 675/29, 675/30, 675/31, 675/33, 675/34,
-//! 675/35, 675/36, 675/37, 675/38, 675/39, 675/40, 675/41, 675/42, 675/43,
-//! 675/44, 675/46, 675/47, 675/48, 675/49, 675/50, 675/51.
+//! repetition with new evidence or justification, 675/18 unimplemented
+//! mechanism not falsified by repair failure, 675/19 proxy success does not
+//! confirm Product cause, 675/20 frozen conflict analysis consumed without
+//! algorithm call, 675/21 mandatory conflict analysis missing yields
+//! insufficiency, 675/32 identical rival predictions are nondiscriminative,
+//! 675/45 exact replay is deterministic). The remaining 28 of 51 are
+//! deferred per START.md s1; #969 admission is separate. Deferred: 675/22,
+//! 675/23, 675/24, 675/25, 675/26, 675/27, 675/28, 675/29, 675/30, 675/31,
+//! 675/33, 675/34, 675/35, 675/36, 675/37, 675/38, 675/39, 675/40, 675/41,
+//! 675/42, 675/43, 675/44, 675/46, 675/47, 675/48, 675/49, 675/50, 675/51.
 
 #![forbid(unsafe_code)]
 
@@ -201,6 +203,23 @@ pub const SLICE5_IMPLEMENTED_CASES: &[u8] = &[14, 16, 17];
 pub const SLICE5_REMAINDER_CASES: &[u8] = &[
     18, 19, 20, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43,
     44, 46, 47, 48, 49, 50, 51,
+];
+
+/// Cases covered by the sixth bounded implementation slice.
+///
+/// Repair-outcome non-inference and frozen conflict consumption: a failed
+/// repair that did not exercise a mechanism falsifies nothing (675/18), a
+/// proxy success confirms no Product cause (675/19), and a supplied frozen
+/// conflict projection is consumed immutably without any algorithm call
+/// (675/20). Every path binds the existing `RepairHistory`,
+/// `MechanismExercise`, `RepairEventOutcome`, and `FrozenConflictAnalysis`
+/// vocabulary; no new canonical contracts are required.
+pub const SLICE6_IMPLEMENTED_CASES: &[u8] = &[18, 19, 20];
+
+/// Cases deliberately left for later slices after slice 6.
+pub const SLICE6_REMAINDER_CASES: &[u8] = &[
+    22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 46, 47,
+    48, 49, 50, 51,
 ];
 
 /// Canonical A03 evidence supplied to the first A40 package boundary.
@@ -2702,7 +2721,7 @@ pub fn diagnose_development_gap(
 }
 
 // ---------------------------------------------------------------------------
-// Tests (proportionate: 20 of 51 cases; remainder deferred per START.md s1).
+// Tests (proportionate: 23 of 51 cases; remainder deferred per START.md s1).
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -2733,6 +2752,8 @@ mod tests {
     use super::SLICE4_REMAINDER_CASES;
     use super::SLICE5_IMPLEMENTED_CASES;
     use super::SLICE5_REMAINDER_CASES;
+    use super::SLICE6_IMPLEMENTED_CASES;
+    use super::SLICE6_REMAINDER_CASES;
     use super::diagnose_development_gap;
     use super::is_hex64_lower;
     use super::outcome_rejection_hint;
@@ -4205,6 +4226,209 @@ mod tests {
             panic!("controlled repeat stays admissible");
         };
         assert_eq!(controlled.outcome, DiagnosisOutcome::Complete);
+    }
+
+    #[test]
+    fn slice6_remainder_map_covers_the_declared_denominator() {
+        let mut seen = [false; 52];
+        for case in SLICE1_IMPLEMENTED_CASES
+            .iter()
+            .chain(SLICE2_IMPLEMENTED_CASES.iter())
+            .chain(SLICE3_IMPLEMENTED_CASES.iter())
+            .chain(SLICE4_IMPLEMENTED_CASES.iter())
+            .chain(SLICE5_IMPLEMENTED_CASES.iter())
+            .chain(SLICE6_IMPLEMENTED_CASES.iter())
+            .chain(SLICE6_REMAINDER_CASES.iter())
+        {
+            assert!((1..=51).contains(case));
+            assert!(!seen[usize::from(*case)]);
+            seen[usize::from(*case)] = true;
+        }
+        assert!(seen[1..].iter().all(|present| *present));
+    }
+
+    // WORK_UNIT_CASE: 675/18
+    #[test]
+    fn case_18_unimplemented_mechanism_not_falsified_by_repair_failure() {
+        let job = test_job();
+        let draft = test_draft();
+        let product = test_product();
+        let discriminator = test_discriminator();
+        let mut repairs = test_repairs();
+        let mut unexercised = test_attempt("att-3", &"c".repeat(64));
+        unexercised.mechanism_id = "mech-rival-a".to_owned();
+        unexercised.mechanism_note =
+            "repair att-3 targeted rival-a without exercising its mechanism".to_owned();
+        unexercised.exercise = MechanismExercise::NotExercised {
+            reason: "the repair ran before the rival-a fix landed, so its mechanism never ran"
+                .to_owned(),
+        };
+        unexercised.outcome = RepairEventOutcome::Failed {
+            summary: "repair att-3 failed without exercising the rival-a mechanism".to_owned(),
+        };
+        repairs.expected_attempt_ids.push("att-3".to_owned());
+        repairs.attempts.push(unexercised);
+        let conflict = test_conflict();
+        let rivals = test_rivals();
+        let common_mode = test_common_mode();
+        let experiments = [test_experiment()].to_vec();
+        let policy = test_policy();
+        let Ok(candidate) = diagnose_development_gap(
+            &job,
+            &draft,
+            &product,
+            &discriminator,
+            &repairs,
+            &conflict,
+            &rivals,
+            &common_mode,
+            &experiments,
+            &policy,
+        ) else {
+            panic!("a failed repair without mechanism exercise falsifies nothing");
+        };
+        assert_eq!(candidate.outcome, DiagnosisOutcome::Complete);
+        assert_eq!(candidate.rivals_live, 2);
+        assert_eq!(candidate.rivals_falsified, 0);
+        assert!(candidate.recommended_experiment.is_some());
+        for assessment in &candidate.rivals {
+            assert_eq!(assessment.status, RivalStatus::Live);
+            assert_eq!(assessment.falsifying_evidence, None);
+        }
+        assert!(candidate.preservation.overall().is_ok());
+    }
+
+    // WORK_UNIT_CASE: 675/19
+    #[test]
+    fn case_19_proxy_success_does_not_confirm_product_cause() {
+        let job = test_job();
+        let draft = test_draft();
+        let product = test_product();
+        let discriminator = test_discriminator();
+        let mut repairs = test_repairs();
+        let mut proxy_green = test_attempt("att-3", &"c".repeat(64));
+        proxy_green.mechanism_note =
+            "local proxy replay green for att-3; product causality unconfirmed".to_owned();
+        proxy_green.exercise = MechanismExercise::Exercised;
+        proxy_green.outcome = RepairEventOutcome::Succeeded {
+            summary: "local proxy replay green while the product gap persists".to_owned(),
+        };
+        repairs.expected_attempt_ids.push("att-3".to_owned());
+        repairs.attempts.push(proxy_green);
+        let conflict = test_conflict();
+        let rivals = test_rivals();
+        let common_mode = test_common_mode();
+        let experiments = [test_experiment()].to_vec();
+        let policy = test_policy();
+        let Ok(candidate) = diagnose_development_gap(
+            &job,
+            &draft,
+            &product,
+            &discriminator,
+            &repairs,
+            &conflict,
+            &rivals,
+            &common_mode,
+            &experiments,
+            &policy,
+        ) else {
+            panic!("proxy success confirms no product cause");
+        };
+        assert_eq!(candidate.outcome, DiagnosisOutcome::Complete);
+        assert_eq!(candidate.rivals_live, 2);
+        assert_eq!(candidate.rivals_falsified, 0);
+        assert_eq!(candidate.strongest_current, None);
+        assert!(candidate.recommended_experiment.is_some());
+        assert!(candidate.preservation.overall().is_ok());
+    }
+
+    // WORK_UNIT_CASE: 675/20
+    #[test]
+    fn case_20_frozen_conflict_consumed_without_algorithm_call() {
+        let job = test_job();
+        let draft = test_draft();
+        let product = test_product();
+        let discriminator = test_discriminator();
+        let repairs = test_repairs();
+        let rivals = test_rivals();
+        let common_mode = test_common_mode();
+        let experiments = [test_experiment()].to_vec();
+        let policy = test_policy();
+
+        let absent = test_conflict();
+        let Ok(absent_candidate) = diagnose_development_gap(
+            &job,
+            &draft,
+            &product,
+            &discriminator,
+            &repairs,
+            &absent,
+            &rivals,
+            &common_mode,
+            &experiments,
+            &policy,
+        ) else {
+            panic!("optional absent conflict stays admissible");
+        };
+        assert_eq!(absent_candidate.outcome, DiagnosisOutcome::Complete);
+        assert!(absent_candidate.recommended_experiment.is_some());
+
+        let present = FrozenConflictAnalysis {
+            required: false,
+            present: true,
+            digest: "6".repeat(64),
+            scope_note: "frozen projection covers rivals rival-a and rival-b".to_owned(),
+            coverage_note: "both live rivals retain their objections verbatim".to_owned(),
+        };
+        let Ok(present_candidate) = diagnose_development_gap(
+            &job,
+            &draft,
+            &product,
+            &discriminator,
+            &repairs,
+            &present,
+            &rivals,
+            &common_mode,
+            &experiments,
+            &policy,
+        ) else {
+            panic!("supplied frozen conflict stays admissible");
+        };
+        assert_eq!(present_candidate.outcome, DiagnosisOutcome::Complete);
+        assert_eq!(present_candidate.rivals_live, 2);
+        assert!(present_candidate.recommended_experiment.is_some());
+        assert!(present_candidate.preservation.overall().is_ok());
+        assert_ne!(
+            absent_candidate.candidate_digest,
+            present_candidate.candidate_digest
+        );
+
+        let reworded = FrozenConflictAnalysis {
+            required: false,
+            present: true,
+            digest: "7".repeat(64),
+            scope_note: "frozen projection covers rivals rival-a and rival-b".to_owned(),
+            coverage_note: "both live rivals retain their objections verbatim".to_owned(),
+        };
+        let Ok(reworded_candidate) = diagnose_development_gap(
+            &job,
+            &draft,
+            &product,
+            &discriminator,
+            &repairs,
+            &reworded,
+            &rivals,
+            &common_mode,
+            &experiments,
+            &policy,
+        ) else {
+            panic!("frozen conflict bytes bind the candidate digest");
+        };
+        assert_ne!(
+            present_candidate.candidate_digest,
+            reworded_candidate.candidate_digest
+        );
+        assert_eq!(present_candidate.rivals, reworded_candidate.rivals);
     }
 
     // WORK_UNIT_CASE: 675/21
