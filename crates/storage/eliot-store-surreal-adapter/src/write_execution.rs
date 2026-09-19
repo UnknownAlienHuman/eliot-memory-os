@@ -691,16 +691,15 @@ impl WriteExecution {
     /// Currently accepted but not completed operations.
     #[must_use]
     pub fn pending_count(&self) -> usize {
-        self.with_inner(|inner| {
-            inner.scheduler.pending_count() + inner.executing.len()
-        })
-        .unwrap_or(0)
+        self.with_inner(|inner| inner.scheduler.pending_count())
+            .unwrap_or(0)
     }
 
     /// Currently executing operations.
     #[must_use]
     pub fn in_flight_count(&self) -> usize {
-        self.with_inner(|inner| inner.executing.len()).unwrap_or(0)
+        self.with_inner(|inner| inner.scheduler.in_flight_count())
+            .unwrap_or(0)
     }
 
     /// Free normal-write permits (evidence that waiting work holds none).
@@ -1058,7 +1057,7 @@ impl WriteExecution {
             Ok::<(), AdapterError>(())
         })??;
         let blocked = execution
-            .with_inner(|inner| !inner.scheduler.uncertain_operations().is_empty())
+            .with_inner(|inner| !inner.recovered_pending.is_empty())
             .unwrap_or(true);
         execution.recovery_blocked.store(blocked, Ordering::SeqCst);
         Ok(execution)
@@ -1104,7 +1103,7 @@ impl WriteExecution {
             Ok(())
         })??;
         let blocked = self
-            .with_inner(|inner| !inner.scheduler.uncertain_operations().is_empty())
+            .with_inner(|inner| !inner.recovered_pending.is_empty())
             .unwrap_or(true);
         self.recovery_blocked.store(blocked, Ordering::SeqCst);
         Ok(())
