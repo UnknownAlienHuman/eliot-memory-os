@@ -25,6 +25,7 @@ use eliot_store_api::StoreGenesisRequest;
 use eliot_store_api::StoreRecoveryRequest;
 use eliot_store_api::StoreRecoverySnapshot;
 use eliot_store_api::WriteReceipt;
+use eliot_store_api::{canonical_json_bytes, sha256_hex};
 
 use crate::Request;
 use crate::Response;
@@ -130,6 +131,17 @@ fn failure_context_for_fence(
     }
 }
 
+fn failure_context_for_recovery(request: &StoreRecoveryRequest) -> StoreFailureIdentityContext {
+    let idempotency_key_ref_or_digest = canonical_json_bytes(request)
+        .ok()
+        .map(|bytes| sha256_hex(&bytes));
+    StoreFailureIdentityContext {
+        idempotency_key_ref_or_digest,
+        state_fence_ref_or_exact_safe_projection: Some(request.state_fence.clone()),
+        ..StoreFailureIdentityContext::default()
+    }
+}
+
 fn failure_context_for_operation(
     context: &eliot_store_api::RequestMeta,
     operation_id: eliot_store_api::OperationId,
@@ -204,10 +216,7 @@ pub(crate) fn map_recovery_dispatch_result(
 ) -> Response {
     match result {
         Ok(snapshot) => Response::Recovery { snapshot },
-        Err(error) => map_store_error(
-            error,
-            failure_context_for_fence(request.state_fence.clone()),
-        ),
+        Err(error) => map_store_error(error, failure_context_for_recovery(request)),
     }
 }
 
