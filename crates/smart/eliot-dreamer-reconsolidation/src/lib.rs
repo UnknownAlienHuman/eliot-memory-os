@@ -1788,6 +1788,34 @@ mod tests {
         assert_eq!(result.outcome, ReconsolidationOutcome::Abstention);
     }
 
+    // WORK_UNIT_CASE: 667/10
+    #[test]
+    fn case_10_availability_and_index_membership_are_insufficient() {
+        for observation_kind in [
+            ReactivationObservationKind::Availability,
+            ReactivationObservationKind::IndexMembership,
+        ] {
+            let mut request = valid_request();
+            request.reactivation.observation_kind = observation_kind;
+            let result = propose_reconsolidation(&request)
+                .expect("availability and index membership are semantic shortfalls");
+            assert_eq!(result.outcome, ReconsolidationOutcome::Abstention);
+            assert!(result.child.is_none());
+        }
+    }
+
+    // WORK_UNIT_CASE: 667/14
+    #[test]
+    fn case_14_partial_observation_denominator_is_unknown() {
+        let mut request = valid_request();
+        request.reactivation.observation_kind = ReactivationObservationKind::PartialObservation;
+        request.reactivation.exact_match = false;
+        let result = propose_reconsolidation(&request).expect("partial observation is an outcome");
+        assert_eq!(result.outcome, ReconsolidationOutcome::Abstention);
+        assert!(result.child.is_none());
+        assert!(result.note.contains("partial observation"));
+    }
+
     // WORK_UNIT_CASE: 667/15
     #[test]
     fn case_15_reactivation_without_new_evidence_yields_no_candidate() {
