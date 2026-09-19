@@ -5126,6 +5126,16 @@ impl RedbRecoveryStore {
                 .transpose()?
         };
         if let Some(existing) = existing {
+            if existing.input.subject_id == input.subject_id
+                && existing.input.record_id == input.record_id
+                && existing.input != input
+            {
+                // The subject key plus operation identity is immutable.  This
+                // check must precede every lifecycle transition so a changed
+                // opaque payload cannot replace an Applying, Active, Fenced,
+                // or Released row.
+                return Err(OrsError::DuplicateConflict);
+            }
             if existing.input.record_id == input.record_id {
                 if existing.input == input && existing.phase == next_phase {
                     return Self::receipt_for(&existing);
@@ -7896,6 +7906,110 @@ mod unknown_commit_recovery_tests {
                 )?
                 .is_none()
         );
+        drop(store);
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod capability_grant_identity_tests {
+    use super::*;
+    use crate::{EpochIdentity, OpaqueLabel, OperationIdentity};
+    use eliot_platform::SecretReference;
+    use serde_json::json;
+
+    const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn grant_input(
+        record_id: &str,
+        subject_id: &str,
+        payload: &[u8],
+    ) -> Result<OperationalRecordInput, OrsError> {
+        let epoch = EpochLineage {
+            current: EpochIdentity {
+                lineage_id: OpaqueLabel::new(TEST_LINEAGE)?,
+                epoch: 1,
+            },
+            predecessor: None,
+        };
+        let fence = StateFenceSnapshot::capture(
+            &json!({
+                "authority_epoch": {
+                    "lineage_id": TEST_LINEAGE,
+                    "sequence": 1
+                },
+                "generation": 1,
+                "nonce": "grant-identity-test"
+            }),
+            1,
+        )?;
+        OperationalRecordInput::encrypted(
+            OperationalRecordContext {
+                record_id: OperationIdentity::new(record_id)?,
+                subject_id: OperationIdentity::new(subject_id)?,
+                authority_epoch: epoch,
+                state_fence: fence,
+                created_at_ms: 1,
+                cleanup_after_ms: None,
+            },
+            SecretReference::new("test-provider", "grant-identity-key").map_err(|_error| {
+                OrsError::InvalidField {
+                    field: "test_secret_reference",
+                    reason: "fixture secret reference must validate",
+                }
+            })?,
+            payload.to_vec(),
+        )
+    }
+
+    #[test]
+    fn changed_payload_is_typed_conflict_and_preserves_every_grant_phase() -> Result<(), OrsError> {
+        let path = std::env::temp_dir().join(format!(
+            "eliot-ors-grant-identity-{}-{}.redb",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos())
+        ));
+        let store = RedbRecoveryStore::open(&path)?;
+        for (suffix, phase) in [
+            ("applying", OperationalPhase::Applying),
+            ("active", OperationalPhase::Active),
+            ("fenced", OperationalPhase::Fenced),
+            ("released", OperationalPhase::Released),
+        ] {
+            let subject = format!("grant-{suffix}");
+            let record = format!("operation-{suffix}");
+            let original = grant_input(&record, &subject, b"original")?;
+            store.mutate_operational(
+                OperationalKind::CapabilityGrant,
+                original.clone(),
+                false,
+                &[],
+                phase,
+            )?;
+            let before = store
+                .load_capability_grant(&OperationIdentity::new(&subject)?)?
+                .ok_or(OrsError::IntegrityProblem {
+                    record_type: "test",
+                    reason: "grant identity fixture was not persisted".to_owned(),
+                })?;
+            let changed = grant_input(&record, &subject, b"changed")?;
+            assert!(matches!(
+                store.activate_capability_grant(CapabilityGrantActivation::new(changed)?),
+                Err(OrsError::DuplicateConflict)
+            ));
+            assert_eq!(
+                store
+                    .load_capability_grant(&OperationIdentity::new(&subject)?)?
+                    .ok_or(OrsError::IntegrityProblem {
+                        record_type: "test",
+                        reason: "grant identity row disappeared".to_owned(),
+                    })?,
+                before
+            );
+        }
         drop(store);
         let _ = std::fs::remove_file(path);
         Ok(())

@@ -933,13 +933,14 @@ impl GrantActivationPort {
             .load_capability_grant(&subject_id)
             .map_err(KernelError::RecoveryState)?
             .ok_or_else(|| {
-                KernelError::RecoveryUnavailable(
-                    "active root-grant projection is absent".to_owned(),
-                )
+                KernelError::RecoveryUnavailable("root-grant projection is absent".to_owned())
             })?;
-        if projection.phase() != OperationalPhase::Active {
+        if !matches!(
+            projection.phase(),
+            OperationalPhase::Applying | OperationalPhase::Active
+        ) {
             return Err(KernelError::RecoveryUnavailable(
-                "root-grant projection is not active".to_owned(),
+                "root-grant projection is not pending or active".to_owned(),
             ));
         }
         let hydration = boundary.hydration.rehydrate_root_grant(&projection)?;
@@ -950,8 +951,36 @@ impl GrantActivationPort {
             ));
         }
 
+        // APPLYING is the durable pending state and ACTIVE is the durable
+        // committed-but-installable state.  Presenting the exact record to
+        // ORS on every restart makes both states deterministic: APPLYING is
+        // promoted to ACTIVE, while ACTIVE is an exact receipt replay.  The
+        // live ledger is populated only after this fresh ORS read-back.
+        let durable_receipt = boundary
+            .store
+            .activate_capability_grant(hydration.durable_record.clone())
+            .map_err(|error| map_ors_recovery_error(&error))?;
+        let projection = boundary
+            .store
+            .load_capability_grant(&subject_id)
+            .map_err(|error| map_ors_recovery_error(&error))?
+            .ok_or_else(|| {
+                KernelError::RecoveryUnavailable(
+                    "root-grant projection disappeared during recovery".to_owned(),
+                )
+            })?;
+        if projection.phase() != OperationalPhase::Active
+            || projection.record() != hydration.durable_record.record()
+            || projection.receipt() != durable_receipt.receipt()
+        {
+            return Err(KernelError::RecoveryUnavailable(
+                "root-grant recovery ORS receipt/read-back disagreed".to_owned(),
+            ));
+        }
+        validate_rehydrated_root_grant(&hydration, &projection, active_epoch)?;
+
         let mut ledger = self.lock_ledger();
-        let digest = hydration.intent.digest()?;
+        let digest = hydrated_root_grant_digest(&hydration)?;
         match ledger.resolve(&hydration.intent.operation_id, &digest) {
             IntentResolve::Conflict => return Err(KernelError::IdempotencyConflict),
             IntentResolve::Replay(disposition) => {
@@ -986,10 +1015,8 @@ impl GrantActivationPort {
             .map_err(|error| map_thin_error(&error))?;
 
         let mut ledger = self.lock_ledger();
-        let digest = hydration
-            .intent
-            .digest()
-            .map_err(|error| map_thin_error(&error))?;
+        let digest =
+            hydrated_root_grant_digest(&hydration).map_err(|error| map_thin_error(&error))?;
         match ledger.resolve(&operation_id, &digest) {
             IntentResolve::Conflict => return Err(eliot_authority::P07PortError::InvalidBinding),
             IntentResolve::Replay(disposition) => {
@@ -1728,6 +1755,16 @@ struct GrantActivationDigestView<'a> {
     receipt_obligations: BTreeSet<&'a str>,
 }
 
+/// The durable root replay identity includes the exact opaque ORS input in
+/// addition to the semantic grant intent.  This keeps a changed encrypted
+/// payload, epoch lineage contour, or captured State Fence from becoming an
+/// in-process replay after restart.
+#[derive(Serialize)]
+struct RootGrantDurableDigestView<'a> {
+    intent: GrantActivationDigestView<'a>,
+    durable_record: &'a OperationalRecordInput,
+}
+
 /// Canonical digest bytes for one grant-revocation payload.
 #[derive(Serialize)]
 struct GrantRevocationDigestView<'a> {
@@ -1789,8 +1826,8 @@ fn finalize_digest(view: &impl Serialize) -> Result<String, KernelError> {
 }
 
 impl GrantActivationIntent {
-    fn digest(&self) -> Result<String, KernelError> {
-        finalize_digest(&GrantActivationDigestView {
+    fn digest_view(&self) -> GrantActivationDigestView<'_> {
+        GrantActivationDigestView {
             kind: "grant-activation",
             operation_id: &self.operation_id,
             grant_id: &self.grant_id,
@@ -1811,8 +1848,19 @@ impl GrantActivationIntent {
                 .iter()
                 .map(String::as_str)
                 .collect(),
-        })
+        }
     }
+
+    fn digest(&self) -> Result<String, KernelError> {
+        finalize_digest(&self.digest_view())
+    }
+}
+
+fn hydrated_root_grant_digest(hydration: &RootGrantHydration) -> Result<String, KernelError> {
+    finalize_digest(&RootGrantDurableDigestView {
+        intent: hydration.intent.digest_view(),
+        durable_record: hydration.durable_record.record(),
+    })
 }
 
 impl GrantRevocationIntent {
@@ -2057,15 +2105,41 @@ fn check_opaque_record_binding(
     binding: &AuthorityBinding,
     active_epoch: &EpochId,
 ) -> Result<(), KernelError> {
-    if input.authority_epoch.current.lineage_id.as_str() != active_epoch.lineage_id.as_str()
-        || input.authority_epoch.current.epoch != active_epoch.sequence.get()
-    {
-        return Err(KernelError::FenceMismatch);
-    }
+    check_exact_epoch_lineage(
+        &input.authority_epoch,
+        &binding.authority_epoch,
+        active_epoch,
+    )?;
+    input
+        .authority_epoch
+        .validate()
+        .map_err(|_| KernelError::FenceMismatch)?;
+    input
+        .state_fence
+        .validate_against_lineage(&input.authority_epoch)
+        .map_err(|_| KernelError::FenceMismatch)?;
     input.state_fence.validate_against_epoch(active_epoch)?;
     let expected_fence =
         StateFenceSnapshot::capture(&binding.state_fence, active_epoch.sequence.get())?;
     if input.state_fence != expected_fence {
+        return Err(KernelError::FenceMismatch);
+    }
+    Ok(())
+}
+
+/// Binds the persisted ORS lineage contour to both the canonical binding and
+/// the caller's current epoch.  The predecessor is validated as part of the
+/// same structured lineage; comparing only the current string/sequence pair
+/// would allow a changed lineage edge to survive replay.
+fn check_exact_epoch_lineage(
+    record_lineage: &eliot_ors::EpochLineage,
+    binding_epoch: &EpochId,
+    active_epoch: &EpochId,
+) -> Result<(), KernelError> {
+    if record_lineage.current.lineage_id.as_str() != binding_epoch.lineage_id.as_str()
+        || record_lineage.current.epoch != binding_epoch.sequence.get()
+        || !binding_epoch.is_same_authority(active_epoch)
+    {
         return Err(KernelError::FenceMismatch);
     }
     Ok(())
@@ -2108,6 +2182,16 @@ fn map_ors_error(error: &eliot_ors::OrsError) -> eliot_authority::P07PortError {
         | eliot_ors::OrsError::FenceMismatch => eliot_authority::P07PortError::NotAdmitted,
         eliot_ors::OrsError::DuplicateConflict => eliot_authority::P07PortError::InvalidBinding,
         _ => eliot_authority::P07PortError::Unavailable,
+    }
+}
+
+fn map_ors_recovery_error(error: &eliot_ors::OrsError) -> KernelError {
+    match error {
+        eliot_ors::OrsError::InvalidEpochLineage | eliot_ors::OrsError::FenceMismatch => {
+            KernelError::FenceMismatch
+        }
+        eliot_ors::OrsError::DuplicateConflict => KernelError::IdempotencyConflict,
+        _ => KernelError::RecoveryUnavailable(error.to_string()),
     }
 }
 
@@ -2839,7 +2923,9 @@ mod tests {
         );
         drop(incomplete_port);
 
-        let hydration_source = Arc::new(TestRootHydration { value: hydration });
+        let hydration_source = Arc::new(TestRootHydration {
+            value: hydration.clone(),
+        });
         let port =
             GrantActivationPort::with_durable_root_grant(hydration_source.clone(), store.clone());
         let first = P07AuthorityPort::activate_grant(&port, &request)
@@ -2867,6 +2953,60 @@ mod tests {
         let restarted_replay = P07AuthorityPort::activate_grant(&restarted, &request)
             .map_err(|error| format!("restart replay failed: {error:?}"))?;
         assert_eq!(restarted_replay, first);
+
+        // A changed opaque payload under the same durable operation/subject
+        // identity is a conflict after restart and leaves the ORS row intact.
+        let mut changed_payload = hydration.clone();
+        let mut changed_record = changed_payload.durable_record.record().clone();
+        let key = match &changed_record.payload {
+            eliot_ors::RecoveryPayload::Encrypted { key, .. } => key.clone(),
+            eliot_ors::RecoveryPayload::ImmutableLocator { .. } => {
+                return Err("fixture must use an encrypted root-grant payload".into());
+            }
+        };
+        let ciphertext = b"changed-root-grant-record".to_vec();
+        changed_record.payload = eliot_ors::RecoveryPayload::Encrypted {
+            key,
+            ciphertext: ciphertext.clone(),
+        };
+        changed_record.payload_length = ciphertext.len() as u64;
+        changed_record.payload_sha256 = eliot_contracts::sha256_hex(&ciphertext);
+        changed_payload.durable_record = CapabilityGrantActivation::new(changed_record)?;
+        let changed_port = GrantActivationPort::with_durable_root_grant(
+            Arc::new(TestRootHydration {
+                value: changed_payload,
+            }),
+            reopened.clone(),
+        );
+        assert!(matches!(
+            P07AuthorityPort::activate_grant(&changed_port, &request),
+            Err(P07PortError::InvalidBinding)
+        ));
+        assert_eq!(
+            reopened
+                .load_capability_grant(&subject)?
+                .ok_or("changed replay removed the active projection")?
+                .record(),
+            hydration.durable_record.record()
+        );
+
+        // Expiry remains a semantic admission refusal after restart; it does
+        // not become an unavailable/no-result recovery outcome and does not
+        // mutate the committed ORS projection.
+        let expired_port = GrantActivationPort::with_durable_root_grant(
+            Arc::new(TestRootHydration {
+                value: hydration.clone(),
+            }),
+            reopened.clone(),
+        );
+        assert!(matches!(
+            expired_port.recover_root_grant("grant-root", &epoch, 10_000),
+            Err(KernelError::Expired {
+                expires_at_ms: 10_000
+            })
+        ));
+        drop(changed_port);
+        drop(expired_port);
 
         let revoke = eliot_authority::GrantRevocationRequest {
             grant_id: request.grant_id.clone(),
