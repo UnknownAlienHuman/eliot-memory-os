@@ -114,6 +114,28 @@ fn contains_handle(values: &[String], handle: &str) -> bool {
     values.iter().any(|v| v == handle)
 }
 
+fn contains_baseline_pair(
+    handles: &[String],
+    lineages: &[String],
+    support_handle: &str,
+    lineage: &str,
+) -> bool {
+    handles
+        .iter()
+        .zip(lineages)
+        .any(|(baseline_handle, baseline_lineage)| {
+            baseline_handle == support_handle && baseline_lineage == lineage
+        })
+}
+
+fn same_sorted_set(left: &[String], right: &[String]) -> bool {
+    let mut left = left.to_vec();
+    let mut right = right.to_vec();
+    left.sort();
+    right.sort();
+    left == right
+}
+
 fn digits_of(value: &str) -> Vec<char> {
     value.chars().filter(char::is_ascii_digit).collect()
 }
@@ -485,9 +507,11 @@ pub struct ReconsolidationRequest {
     pub deltas: Vec<PropositionDelta>,
     /// Candidate new evidence items (sorted by handle, unique).
     pub new_items: Vec<NewEvidenceItem>,
-    /// Baseline handles the parent already covers (sorted, unique).
+    /// Baseline handles the parent already covers (sorted, unique), positionally
+    /// paired with [`Self::parent_baseline_lineages`].
     pub parent_baseline_handles: Vec<String>,
-    /// Baseline lineages the parent already covers (sorted, unique).
+    /// Baseline lineages the parent already covers (sorted, unique), positionally
+    /// paired with [`Self::parent_baseline_handles`].
     pub parent_baseline_lineages: Vec<String>,
     /// Exact externally observed reactivation.
     pub reactivation: ReactivationEvidence,
@@ -751,6 +775,7 @@ fn validate_shapes(request: &ReconsolidationRequest) -> Result<(), Reconsolidati
         });
     }
     let mut item_handles: Vec<String> = Vec::new();
+    let mut item_digests: Vec<String> = Vec::new();
     for n in &request.new_items {
         check_handle(&n.handle, "source.handle")?;
         if !is_hex64_lower(&n.digest) {
@@ -762,6 +787,13 @@ fn validate_shapes(request: &ReconsolidationRequest) -> Result<(), Reconsolidati
         check_bounded_text(&n.lineage, "source.lineage", MAX_HANDLE_BYTES)?;
         check_bounded_text(&n.statement, "source.statement", MAX_TEXT_BYTES)?;
         item_handles.push(n.handle.clone());
+        if item_digests.contains(&n.digest) {
+            return Err(ReconsolidationError::Source {
+                handle: redact(&n.handle),
+                detail: "duplicate evidence digest is not a new identity".to_owned(),
+            });
+        }
+        item_digests.push(n.digest.clone());
     }
     if !is_sorted_unique(&item_handles) {
         return Err(ReconsolidationError::Order {
@@ -968,6 +1000,7 @@ pub fn propose_reconsolidation(
         );
     }
     if contains_handle(&request.parent.predecessor_chain, &request.parent.handle)
+        || contains_handle(&request.parent.predecessor_chain, &request.parent.revision)
         || contains_handle(
             &request.parent.predecessor_chain,
             &request.proposed_child_handle,
@@ -1019,6 +1052,41 @@ pub fn propose_reconsolidation(
             "availability, index, model mention, or partial observation never qualifies",
         );
     }
+    let Some(reactivation_at) = request.reactivation.observed_at_ms else {
+        return ok_result(
+            ReconsolidationOutcome::Abstention,
+            None,
+            request.parent_propositions.len(),
+            0,
+            "reactivation order is unknown and no wall-clock fill is admitted",
+        );
+    };
+
+    if request.parent_baseline_handles.len() != request.parent_baseline_lineages.len() {
+        return ok_result(
+            ReconsolidationOutcome::Blocked,
+            None,
+            request.parent_propositions.len(),
+            0,
+            "parent baseline handles and lineages are not positionally aligned",
+        );
+    }
+    for proposition in &request.parent_propositions {
+        if !contains_baseline_pair(
+            &request.parent_baseline_handles,
+            &request.parent_baseline_lineages,
+            &proposition.support_handle,
+            &proposition.lineage,
+        ) {
+            return ok_result(
+                ReconsolidationOutcome::Blocked,
+                None,
+                request.parent_propositions.len(),
+                0,
+                "parent proposition support and lineage are outside its declared baseline",
+            );
+        }
+    }
 
     let parent_statements: Vec<String> = request
         .parent_propositions
@@ -1027,6 +1095,7 @@ pub fn propose_reconsolidation(
         .collect();
     let mut genuine: Vec<&NewEvidenceItem> = Vec::new();
     let mut unknown_temporal = 0usize;
+    let mut stale_temporal = 0usize;
     for item in &request.new_items {
         if item.source_kind != EvidenceSourceKind::ExternalObservation {
             continue;
@@ -1041,22 +1110,37 @@ pub fn propose_reconsolidation(
         if parent_statements.contains(&normalized) {
             continue;
         }
-        if item.observed_at_ms.is_none() {
+        let Some(observed_at) = item.observed_at_ms else {
             unknown_temporal = unknown_temporal.saturating_add(1);
             continue;
+        };
+        if observed_at <= reactivation_at {
+            stale_temporal = stale_temporal.saturating_add(1);
+            continue;
         }
+        // Lineage groups provenance; the handle and canonical digest identify the item.
         genuine.push(item);
     }
+    // Unknown temporal order abstains first; stale material then outranks every other result.
+    if unknown_temporal > 0 {
+        return ok_result(
+            ReconsolidationOutcome::Abstention,
+            None,
+            request.parent_propositions.len(),
+            0,
+            "temporal order is unknown and no wall-clock fill is admitted",
+        );
+    }
+    if stale_temporal > 0 {
+        return ok_result(
+            ReconsolidationOutcome::Stale,
+            None,
+            request.parent_propositions.len(),
+            0,
+            "new evidence does not follow the exact reactivation checkpoint",
+        );
+    }
     if genuine.is_empty() {
-        if unknown_temporal > 0 {
-            return ok_result(
-                ReconsolidationOutcome::Abstention,
-                None,
-                request.parent_propositions.len(),
-                0,
-                "temporal order is unknown and no wall-clock fill is admitted",
-            );
-        }
         return ok_result(
             ReconsolidationOutcome::NoMaterialNewEvidence,
             None,
@@ -1134,6 +1218,19 @@ pub fn propose_reconsolidation(
                         "free-text replacement without evidence is not a revision",
                     );
                 }
+                if !delta
+                    .evidence_refs
+                    .iter()
+                    .any(|handle| genuine.iter().any(|item| &item.handle == handle))
+                {
+                    return ok_result(
+                        ReconsolidationOutcome::NoSafeRevision,
+                        None,
+                        request.parent_propositions.len(),
+                        genuine.len(),
+                        "changed propositions require genuinely new evidence",
+                    );
+                }
                 if normalize_statement(revised) == normalize_statement(&parent.statement) {
                     return ok_result(
                         ReconsolidationOutcome::NoSafeRevision,
@@ -1205,6 +1302,19 @@ pub fn propose_reconsolidation(
                         "withdrawal removes only from the child view",
                     );
                 }
+                if !delta
+                    .evidence_refs
+                    .iter()
+                    .any(|handle| genuine.iter().any(|item| &item.handle == handle))
+                {
+                    return ok_result(
+                        ReconsolidationOutcome::NoSafeRevision,
+                        None,
+                        request.parent_propositions.len(),
+                        genuine.len(),
+                        "withdrawal requires genuinely new evidence",
+                    );
+                }
             }
             PropositionDisposition::Unresolved => {
                 if delta.revised_statement.is_some() {
@@ -1254,20 +1364,21 @@ pub fn propose_reconsolidation(
         .map_err(|err| ReconsolidationError::Denominator {
             detail: redact(&err.to_string()),
         })?;
-    for item in &genuine {
-        if !request
-            .new_member_denominator
-            .members
-            .contains(&item.handle)
-        {
-            return ok_result(
-                ReconsolidationOutcome::Blocked,
-                None,
-                request.parent_propositions.len(),
-                genuine.len(),
-                "admitted additions must sit in the separate new-member denominator",
-            );
-        }
+    let genuine_handles: Vec<String> = genuine.iter().map(|item| item.handle.clone()).collect();
+    let genuine_count = u32::try_from(genuine.len()).map_err(|_| ReconsolidationError::Bounds {
+        phase: "new_members".to_owned(),
+        detail: "admitted additions do not fit the result envelope".to_owned(),
+    })?;
+    if !same_sorted_set(&request.new_member_denominator.members, &genuine_handles)
+        || request.new_member_denominator.expected_total != genuine_count
+    {
+        return ok_result(
+            ReconsolidationOutcome::Blocked,
+            None,
+            request.parent_propositions.len(),
+            genuine.len(),
+            "new-member denominator must exactly cover admitted additions",
+        );
     }
     for handle in &request.parent_baseline_handles {
         if request.new_member_denominator.members.contains(handle) {
@@ -1387,9 +1498,9 @@ pub fn outcome_rejection_hint(outcome: &ReconsolidationOutcome) -> Option<Curati
 mod tests {
     use super::*;
     use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
-    use std::num::NonZeroU64;
     use eliot_dreamer_contracts::candidate::{DimensionVerdict, PreservationDimension};
     use eliot_dreamer_contracts::{AtomicityMode, PreservationReport};
+    use std::num::NonZeroU64;
 
     fn test_fence() -> StateFence {
         let epoch = EpochId::new(
@@ -1509,7 +1620,7 @@ mod tests {
                 lineage: "lineage-new-1".to_owned(),
                 statement: "Warm-up run 7 shortened the next cold start.".to_owned(),
                 source_kind: EvidenceSourceKind::ExternalObservation,
-                observed_at_ms: Some(1_700_000_000_000),
+                observed_at_ms: Some(1_700_000_000_002),
             }],
             parent_baseline_handles: vec!["src-a".to_owned(), "src-b".to_owned()],
             parent_baseline_lineages: vec!["lineage-a".to_owned(), "lineage-b".to_owned()],
@@ -1637,5 +1748,205 @@ mod tests {
         assert!(!child.inverse_note.trim().is_empty());
         assert!(!child.forward_correction.trim().is_empty());
         assert!(!child.reopen_condition.trim().is_empty());
+    }
+
+    // WORK_UNIT_CASE: 667/16
+    #[test]
+    fn case_16_material_evidence_must_follow_reactivation() {
+        let mut request = valid_request();
+        request.new_items[0].observed_at_ms = Some(1_700_000_000_000);
+        let result = propose_reconsolidation(&request).expect("stale ordering is semantic");
+        assert_eq!(result.outcome, ReconsolidationOutcome::Stale);
+        assert!(result.child.is_none());
+    }
+
+    // WORK_UNIT_CASE: 667/17
+    #[test]
+    fn case_17_duplicate_evidence_digest_is_rejected() {
+        let mut request = valid_request();
+        request.new_items.push(NewEvidenceItem {
+            handle: "obs-2".to_owned(),
+            digest: request.new_items[0].digest.clone(),
+            lineage: "lineage-new-2".to_owned(),
+            statement: "A distinct handle repeats the same bytes.".to_owned(),
+            source_kind: EvidenceSourceKind::ExternalObservation,
+            observed_at_ms: Some(1_700_000_000_003),
+        });
+        request
+            .new_items
+            .sort_by(|left, right| left.handle.cmp(&right.handle));
+        let error = propose_reconsolidation(&request).expect_err("same digest is not new");
+        assert!(matches!(error, ReconsolidationError::Source { .. }));
+    }
+
+    // WORK_UNIT_CASE: 667/18
+    #[test]
+    fn case_18_distinct_evidence_under_one_lineage_is_admitted() {
+        let mut request = valid_request();
+        request.new_items.push(NewEvidenceItem {
+            handle: "obs-2".to_owned(),
+            digest: "2".repeat(64),
+            lineage: request.new_items[0].lineage.clone(),
+            statement: "Warm-up run 8 shortened another cold start.".to_owned(),
+            source_kind: EvidenceSourceKind::ExternalObservation,
+            observed_at_ms: Some(1_700_000_000_003),
+        });
+        request
+            .new_items
+            .sort_by(|left, right| left.handle.cmp(&right.handle));
+        request.new_member_denominator.members = vec!["obs-1".to_owned(), "obs-2".to_owned()];
+        request.new_member_denominator.expected_total = 2;
+        let result = propose_reconsolidation(&request).expect("distinct evidence is material");
+        assert_eq!(result.outcome, ReconsolidationOutcome::Complete);
+        assert_eq!(result.admitted_new, 2);
+    }
+
+    // WORK_UNIT_CASE: 667/19
+    #[test]
+    fn case_19_stale_material_precedes_surviving_material() {
+        let mut request = valid_request();
+        request.new_items.push(NewEvidenceItem {
+            handle: "obs-0".to_owned(),
+            digest: "0".repeat(64),
+            lineage: "lineage-new-0".to_owned(),
+            statement: "Stale warm-up observation.".to_owned(),
+            source_kind: EvidenceSourceKind::ExternalObservation,
+            observed_at_ms: Some(1_700_000_000_001),
+        });
+        request
+            .new_items
+            .sort_by(|left, right| left.handle.cmp(&right.handle));
+        let result = propose_reconsolidation(&request).expect("stale order is semantic");
+        assert_eq!(result.outcome, ReconsolidationOutcome::Stale);
+        assert!(result.child.is_none());
+    }
+
+    // WORK_UNIT_CASE: 667/43
+    #[test]
+    fn case_43_unknown_temporal_precedes_stale_material() {
+        let mut request = valid_request();
+        request.new_items.extend([
+            NewEvidenceItem {
+                handle: "obs-0".to_owned(),
+                digest: "0".repeat(64),
+                lineage: "lineage-new-0".to_owned(),
+                statement: "Stale warm-up observation.".to_owned(),
+                source_kind: EvidenceSourceKind::ExternalObservation,
+                observed_at_ms: Some(1_700_000_000_001),
+            },
+            NewEvidenceItem {
+                handle: "obs-2".to_owned(),
+                digest: "2".repeat(64),
+                lineage: "lineage-new-2".to_owned(),
+                statement: "Unknown-time warm-up observation.".to_owned(),
+                source_kind: EvidenceSourceKind::ExternalObservation,
+                observed_at_ms: None,
+            },
+        ]);
+        request
+            .new_items
+            .sort_by(|left, right| left.handle.cmp(&right.handle));
+        let result = propose_reconsolidation(&request).expect("unknown order abstains");
+        assert_eq!(result.outcome, ReconsolidationOutcome::Abstention);
+        assert!(result.child.is_none());
+    }
+
+    // WORK_UNIT_CASE: 667/20
+    #[test]
+    fn case_20_new_member_denominator_is_exact() {
+        let mut request = valid_request();
+        request
+            .new_member_denominator
+            .members
+            .push("extra".to_owned());
+        request.new_member_denominator.expected_total = 2;
+        let result = propose_reconsolidation(&request).expect("denominator mismatch is semantic");
+        assert_eq!(result.outcome, ReconsolidationOutcome::Blocked);
+        assert!(result.child.is_none());
+    }
+
+    // WORK_UNIT_CASE: 667/22
+    #[test]
+    fn case_22_contradiction_requires_new_evidence_reference() {
+        let mut request = valid_request();
+        request.deltas[1].disposition = PropositionDisposition::Contradicted;
+        request.deltas[1].evidence_refs = vec!["src-b".to_owned()];
+        let result =
+            propose_reconsolidation(&request).expect("unsupported contradiction is semantic");
+        assert_eq!(result.outcome, ReconsolidationOutcome::NoSafeRevision);
+        assert!(result.child.is_none());
+    }
+
+    // WORK_UNIT_CASE: 667/23
+    #[test]
+    fn case_23_withdrawal_requires_new_evidence_reference() {
+        let mut request = valid_request();
+        request.deltas[1].disposition = PropositionDisposition::Withdrawn;
+        request.deltas[1].revised_statement = None;
+        request.deltas[1].evidence_refs.clear();
+        let result = propose_reconsolidation(&request).expect("unsupported withdrawal is semantic");
+        assert_eq!(result.outcome, ReconsolidationOutcome::NoSafeRevision);
+        assert!(result.child.is_none());
+    }
+
+    // WORK_UNIT_CASE: 667/24
+    #[test]
+    fn case_24_load_bearing_unresolved_material_blocks() {
+        let mut request = valid_request();
+        request.parent_propositions[1].is_load_bearing = true;
+        request.deltas[1].disposition = PropositionDisposition::Unresolved;
+        request.deltas[1].revised_statement = None;
+        let result = propose_reconsolidation(&request).expect("unresolved is semantic");
+        assert_eq!(result.outcome, ReconsolidationOutcome::Blocked);
+        assert!(result.child.is_none());
+    }
+
+    // WORK_UNIT_CASE: 667/39
+    #[test]
+    fn case_39_unaffected_dependent_keeps_an_explicit_note() {
+        let mut request = valid_request();
+        request.dependent_outcomes[0].disposition = DependentDisposition::UnaffectedWithEvidence;
+        request.dependent_outcomes[0].note =
+            "new evidence leaves this summary unaffected".to_owned();
+        let result = propose_reconsolidation(&request).expect("explicit dependent note is valid");
+        assert_eq!(result.outcome, ReconsolidationOutcome::Complete);
+    }
+
+    // WORK_UNIT_CASE: 667/42
+    #[test]
+    fn case_42_unknown_reactivation_order_abstains() {
+        let mut request = valid_request();
+        request.reactivation.observed_at_ms = None;
+        let result = propose_reconsolidation(&request).expect("unknown order abstains");
+        assert_eq!(result.outcome, ReconsolidationOutcome::Abstention);
+        assert!(result.child.is_none());
+    }
+
+    // WORK_UNIT_CASE: 667/49
+    #[test]
+    fn case_49_parent_baseline_must_cover_each_proposition() {
+        let mut request = valid_request();
+        request.parent_baseline_lineages.pop();
+        let result = propose_reconsolidation(&request).expect("baseline gap is semantic");
+        assert_eq!(result.outcome, ReconsolidationOutcome::Blocked);
+        assert!(result.child.is_none());
+    }
+
+    #[test]
+    fn parent_baseline_cross_product_mismatch_is_blocked() {
+        let mut request = valid_request();
+        request.parent_propositions[0].lineage = "lineage-b".to_owned();
+        request.parent_propositions[1].lineage = "lineage-a".to_owned();
+
+        let result = propose_reconsolidation(&request).expect("cross-pair mismatch is semantic");
+        assert_eq!(result.outcome, ReconsolidationOutcome::Blocked);
+        assert!(result.child.is_none());
+    }
+
+    #[test]
+    fn parent_baseline_aligned_pair_passes() {
+        let result = propose_reconsolidation(&valid_request()).expect("aligned pairs are valid");
+        assert_eq!(result.outcome, ReconsolidationOutcome::Complete);
+        assert!(result.child.is_some());
     }
 }
