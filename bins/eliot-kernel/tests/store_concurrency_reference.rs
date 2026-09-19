@@ -17,18 +17,19 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU64;
 use std::path::PathBuf;
-use std::sync::{Arc, Barrier};
+use std::sync::Arc;
 
 use eliot_contracts::{
     ClockReading, EpochId, EpochLineageId, OperationId, ProductId, RequestId, ResourceGeneration,
     SourceId, StateFence,
 };
 use eliot_store_api::{
-    CanonicalRequestView, EffectClass, EventProjectionRelationIntents, NamedMutationOperation,
-    NamedMutationRequest, NamedOperationManifest, OperationIdentity, OrderingHeadExpectation,
-    OrderingScopeId, PreparedTransition, RequestMeta, RevisionHeadExpectation, RevisionKey,
-    ScopeId, SecurityContext, StoreError, TransitionClass, canonical_request_hash,
-    generated_operation_manifests, operation_manifest_set_digest, validate_store_receipt_envelope,
+    CanonicalRequestView, CanonicalStoreClient, EffectClass, EventProjectionRelationIntents,
+    NamedMutationOperation, NamedMutationRequest, NamedOperationManifest, OperationIdentity,
+    OrderingHeadExpectation, OrderingScopeId, PreparedTransition, RequestMeta,
+    RevisionHeadExpectation, RevisionKey, ScopeId, SecurityContext, StoreError, TransitionClass,
+    canonical_request_hash, generated_operation_manifests, operation_manifest_set_digest,
+    validate_store_receipt_envelope,
 };
 use eliot_store_memory::{MemorySnapshot, MemoryStore};
 use serde_json::Value;
@@ -709,15 +710,18 @@ fn multiscope_claim_without_cyclic_wait() {
 }
 
 // WORK_UNIT_CASE: 994/6
-#[test]
-fn concurrent_exact_replay_single_effect() {
+#[tokio::test]
+async fn concurrent_exact_replay_single_effect() {
     // One frozen catalogue construction binds the concurrent store and its
     // admitting manifest: exact replay must prove identity against the same
     // registered instance, never two independent generations.
     let (store, manifest) = reference_store();
     let store = Arc::new(store);
     let fence = fence();
-    let barrier = Arc::new(Barrier::new(3));
+    // Admitted-route concurrency (#990 public admission): both replays meet
+    // at a rendezvous before entering the same `CanonicalStoreClient` entry
+    // the product suite replays through, never the raw inherent method.
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
     let before = store.snapshot().expect("snapshot");
     let mut handles = Vec::new();
     for _ in 0..2 {
@@ -725,7 +729,7 @@ fn concurrent_exact_replay_single_effect() {
         let manifest = manifest.clone();
         let fence = fence.clone();
         let barrier = Arc::clone(&barrier);
-        handles.push(std::thread::spawn(move || {
+        handles.push(tokio::spawn(async move {
             let ctx = ctx_for("op-994-replay", &fence);
             let transition = build_transition(
                 "op-994-replay",
@@ -738,14 +742,14 @@ fn concurrent_exact_replay_single_effect() {
                 &[],
                 &[],
             );
-            barrier.wait();
-            store.apply_transaction(&ctx, transition, &[], &[])
+            barrier.wait().await;
+            store.apply_prepared(&ctx, transition, vec![], vec![]).await
         }));
     }
-    barrier.wait();
+    barrier.wait().await;
     let mut receipts = Vec::new();
     for handle in handles {
-        receipts.push(handle.join().expect("thread").expect("replay commits"));
+        receipts.push(handle.await.expect("task").expect("replay commits"));
     }
     assert_eq!(
         receipts[0], receipts[1],
@@ -769,7 +773,8 @@ fn concurrent_exact_replay_single_effect() {
         &manifest,
     );
     let third = store
-        .apply_transaction(&ctx, transition, &[], &[])
+        .apply_prepared(&ctx, transition, vec![], vec![])
+        .await
         .expect("replay");
     assert_eq!(third, receipts[0]);
     assert_eq!(store.snapshot().expect("snapshot"), after);
