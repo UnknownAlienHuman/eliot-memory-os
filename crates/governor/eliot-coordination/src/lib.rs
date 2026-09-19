@@ -49,6 +49,7 @@ pub use work_lease_issuance::{
 
 pub use swarm_plan_attachment::{
     CasOutcome, DurableAttachError, MAX_DURABLE_ATTACH_ATTEMPTS, SWARM_PLAN_ATTACHMENT_REVISION,
+    SwarmPlanAttachmentConsumer, SwarmPlanAttachmentConsumerPort, SwarmPlanAttachmentDurablePort,
     SwarmPlanAttachmentError, SwarmPlanAttachmentLedger, SwarmPlanAttachmentOwner,
     SwarmPlanAttachmentStore, SwarmPlanAttachmentVersion, SwarmPlanBinding,
     attach_plan_once_durable,
