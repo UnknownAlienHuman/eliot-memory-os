@@ -1125,4 +1125,75 @@ mod projection_tests {
         assert!(none_result.resolved_binding().is_none());
         none_result.validate_against(&ticket).expect("valid");
     }
+
+    // WORK_UNIT_CASE: 839/10
+    #[test]
+    fn exact_replay_preserves_semantic_result_and_digest() {
+        // Exact replay under the same ticket preserves the full semantic
+        // result and its digest: mapping the same Governor outcome twice
+        // yields the identical typed result, so a resubmission replays
+        // instead of diverging. Drives the actual production mapper twice;
+        // no Governor read is stubbed.
+        let ticket = test_ticket(100);
+        let first =
+            map_governor_outcome_to_protocol(&ticket, fixture_task_selection_required(), 50)
+                .expect("first mapping");
+        let second =
+            map_governor_outcome_to_protocol(&ticket, fixture_task_selection_required(), 50)
+                .expect("second mapping");
+        assert_eq!(first, second);
+        assert_eq!(first.result_sha256, second.result_sha256);
+        assert_eq!(
+            first.canonical_unsigned_bytes().expect("canonical bytes"),
+            second.canonical_unsigned_bytes().expect("canonical bytes"),
+        );
+        first.validate_against(&ticket).expect("valid binding");
+        second.validate_against(&ticket).expect("valid binding");
+        // The retained acknowledgement echoes the exact result verbatim,
+        // so the replay leg carries the full disposition without coercion.
+        let ack = eliot_protocol::AgentActivationResultAck::replayed(&first).expect("replay ack");
+        assert_eq!(
+            ack.outcome,
+            eliot_protocol::AgentActivationResultAckOutcome::ExactReplay
+        );
+        assert_eq!(ack.result.as_ref(), Some(&second));
+        ack.validate().expect("valid ack");
+    }
+
+    // WORK_UNIT_CASE: 839/11
+    #[test]
+    fn changed_result_under_same_ticket_conflicts_on_digest() {
+        // A changed semantic result under the same ticket is never an exact
+        // replay: both results bind the exact ticket, but their digests
+        // differ, so the Kernel reconcile leg (which matches on ticket plus
+        // digest) distinguishes conflict from replay. The daemon preserves
+        // the distinguishing identity; the Kernel owns the conflict decision.
+        let ticket = test_ticket(100);
+        let resolved = map_governor_outcome_to_protocol(
+            &ticket,
+            GovernorActivationOutcome::Resolved(test_snapshot()),
+            50,
+        )
+        .expect("resolved mapping");
+        let selection =
+            map_governor_outcome_to_protocol(&ticket, fixture_task_selection_required(), 50)
+                .expect("selection mapping");
+        assert_ne!(
+            resolved.result_sha256, selection.result_sha256,
+            "changed disposition must change the result digest"
+        );
+        resolved.validate_against(&ticket).expect("valid binding");
+        selection.validate_against(&ticket).expect("valid binding");
+        let query = eliot_protocol::AgentActivationResultReconcile::new(
+            ticket.ticket_id.clone(),
+            resolved.result_sha256.clone(),
+        )
+        .expect("reconcile query");
+        assert_ne!(query.result_sha256, selection.result_sha256);
+        let ack =
+            eliot_protocol::AgentActivationResultAck::accepted(&resolved).expect("accept ack");
+        assert_ne!(ack.result_sha256, selection.result_sha256);
+        assert_ne!(ack.result.as_ref(), Some(&selection));
+        ack.validate().expect("valid ack");
+    }
 }
