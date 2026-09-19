@@ -39,7 +39,7 @@
 //! validation. There are no placeholder, mock, canned, or pseudo paths:
 //! every branch binds an explicit input field.
 //!
-//! Test coverage note: 59 of 68 `WORK_UNIT_CASE 673/*` cases execute here
+//! Test coverage note: 62 of 68 `WORK_UNIT_CASE 673/*` cases execute here
 //! (673/1 valid completes, 673/2 wrong job and scope fail closed, 673/3
 //! empty and single position are not conflicts, 673/5 duplicate and changed
 //! identities fail closed, 673/6 complete/partial/stale/blocked/withheld
@@ -94,10 +94,13 @@
 //! budget, or effect receipt, 673/46 epistemic disagreement names the
 //! evidence-source owner with its evidence contract, 673/47 shared evaluator
 //! lineage names the evaluator-verifier owner, 673/48 plan value disagreement
-//! names the Human and Task Controller owner).
-//! The remaining 9 of 68 are deferred per queue-item scope; workspace
-//! admission (#969), Product Pulse, and Edge proof remain separate. Deferred: 673/49,
-//! 673/50, 673/52, 673/53, 673/54, 673/55, 673/58, 673/59, 673/63.
+//! names the Human and Task Controller owner, 673/49 authority and effect
+//! disagreement names the Governor owner, 673/50 intent-satisfiability
+//! disagreement names the Architecture and Implementation owner, 673/52
+//! privacy handling names the security and privacy owner).
+//! The remaining 6 of 68 are deferred per queue-item scope; workspace
+//! admission (#969), Product Pulse, and Edge proof remain separate. Deferred: 673/53,
+//! 673/54, 673/55, 673/58, 673/59, 673/63.
 
 #![forbid(unsafe_code)]
 
@@ -6968,6 +6971,252 @@ mod tests {
                 .contract_needed
                 .trim()
                 .is_empty()
+        );
+        assert_eq!(candidate.positions.len(), 2);
+        assert_eq!(candidate.resolution_status, None);
+    }
+
+    // WORK_UNIT_CASE: 673/49
+    #[test]
+    fn case_49_authority_effect_disagreement_names_governor_owner() {
+        let receipt = test_receipt();
+        let conflict = ConflictSet::new(ConflictSetParams {
+            conflict_id: "conflict-49-governor-effect".to_owned(),
+            kind: ConflictKind::Authority,
+            scope: "scope-1".to_owned(),
+            task_id: None,
+            positions: vec![
+                test_position(
+                    "source-a",
+                    "grant the cache effect under governor permission P",
+                    false,
+                ),
+                test_position(
+                    "source-b",
+                    "withhold the cache effect under governor permission Q",
+                    false,
+                ),
+            ],
+            evidence_refs: BTreeSet::new(),
+            owners: BTreeSet::from([SourceId::new("source-a").expect("valid source")]),
+            common_lineage: BTreeSet::new(),
+            resolved_parts: BTreeSet::new(),
+            unresolved: BTreeSet::from(["effect permission".to_owned()]),
+            unresolved_owners: BTreeSet::from([SourceId::new("source-a").expect("valid source")]),
+            acceptability: ArgumentAcceptability::Contested,
+            defeated_refs: BTreeSet::new(),
+            probe: None,
+            decision_owner: SourceId::new("source-a").expect("valid source"),
+            affected_actions: vec!["decide-effect".to_owned()],
+            lifecycle: ConflictLifecycle::Open,
+            receipt_digest: receipt.bundle_digest.clone(),
+        })
+        .expect("governor-effect conflict stays valid");
+        let candidate = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &conflict,
+            &test_supplements(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("governor-effect analysis: {err:?}"),
+        };
+        assert_eq!(candidate.outcome, ConflictOutcome::Complete);
+        assert_eq!(
+            candidate.recommended_owner.kind,
+            DecisionOwnerKind::Governor
+        );
+        assert_eq!(candidate.recommended_owner.owner_handle, "source-a");
+        assert!(
+            !candidate.recommended_owner.rationale.trim().is_empty(),
+            "governor owner carries a boundary rationale"
+        );
+        assert!(
+            candidate
+                .recommended_owner
+                .contract_needed
+                .to_lowercase()
+                .contains("evidence"),
+            "governor owner names its decision contract: {}",
+            candidate.recommended_owner.contract_needed
+        );
+        assert!(
+            !candidate
+                .recommended_owner
+                .contract_needed
+                .to_lowercase()
+                .contains("assign"),
+            "recommendation names the owner without assigning: {}",
+            candidate.recommended_owner.contract_needed
+        );
+        assert_eq!(candidate.positions.len(), 2);
+        assert_eq!(candidate.resolution_status, None);
+    }
+
+    // WORK_UNIT_CASE: 673/50
+    #[test]
+    fn case_50_intent_satisfiability_names_architecture_owner() {
+        let receipt = test_receipt();
+        let conflict = ConflictSet::new(ConflictSetParams {
+            conflict_id: "conflict-50-architecture-intent".to_owned(),
+            kind: ConflictKind::Architecture,
+            scope: "scope-1".to_owned(),
+            task_id: None,
+            positions: vec![
+                test_position(
+                    "source-a",
+                    "the implementation satisfies the stated cache intent under the current build",
+                    false,
+                ),
+                test_position(
+                    "source-b",
+                    "the implementation cannot satisfy the stated cache intent under the current build",
+                    false,
+                ),
+            ],
+            evidence_refs: BTreeSet::new(),
+            owners: BTreeSet::from([SourceId::new("source-a").expect("valid source")]),
+            common_lineage: BTreeSet::new(),
+            resolved_parts: BTreeSet::new(),
+            unresolved: BTreeSet::from(["intent satisfiability".to_owned()]),
+            unresolved_owners: BTreeSet::from([SourceId::new("source-a").expect("valid source")]),
+            acceptability: ArgumentAcceptability::Contested,
+            defeated_refs: BTreeSet::new(),
+            probe: None,
+            decision_owner: SourceId::new("source-a").expect("valid source"),
+            affected_actions: vec!["decide-build".to_owned()],
+            lifecycle: ConflictLifecycle::Open,
+            receipt_digest: receipt.bundle_digest.clone(),
+        })
+        .expect("architecture-intent conflict stays valid");
+        let candidate = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &conflict,
+            &test_supplements(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("architecture-intent analysis: {err:?}"),
+        };
+        assert_eq!(candidate.outcome, ConflictOutcome::Complete);
+        assert_eq!(
+            candidate.recommended_owner.kind,
+            DecisionOwnerKind::ArchitectureImplementation
+        );
+        assert_eq!(candidate.recommended_owner.owner_handle, "source-a");
+        assert!(
+            !candidate.recommended_owner.rationale.trim().is_empty(),
+            "architecture owner carries a boundary rationale"
+        );
+        assert!(
+            candidate
+                .recommended_owner
+                .contract_needed
+                .to_lowercase()
+                .contains("evidence"),
+            "architecture owner names its decision contract: {}",
+            candidate.recommended_owner.contract_needed
+        );
+        assert!(
+            !candidate
+                .recommended_owner
+                .contract_needed
+                .to_lowercase()
+                .contains("assign"),
+            "recommendation names the owner without assigning: {}",
+            candidate.recommended_owner.contract_needed
+        );
+        assert_eq!(candidate.positions.len(), 2);
+        assert_eq!(candidate.resolution_status, None);
+    }
+
+    // WORK_UNIT_CASE: 673/52
+    #[test]
+    fn case_52_privacy_handling_names_security_privacy_owner() {
+        let receipt = test_receipt();
+        let conflict = ConflictSet::new(ConflictSetParams {
+            conflict_id: "conflict-52-privacy-owner".to_owned(),
+            kind: ConflictKind::Epistemic,
+            scope: "scope-1".to_owned(),
+            task_id: None,
+            positions: vec![
+                test_position(
+                    "source-a",
+                    "warm-key coverage supports the cache finding",
+                    false,
+                ),
+                test_position(
+                    "source-b",
+                    "narrow coverage disputes the cache finding",
+                    false,
+                ),
+            ],
+            evidence_refs: BTreeSet::new(),
+            owners: BTreeSet::from([SourceId::new("source-a").expect("valid source")]),
+            common_lineage: BTreeSet::new(),
+            resolved_parts: BTreeSet::new(),
+            unresolved: BTreeSet::from(["coverage sufficiency".to_owned()]),
+            unresolved_owners: BTreeSet::from([SourceId::new("source-a").expect("valid source")]),
+            acceptability: ArgumentAcceptability::Contested,
+            defeated_refs: BTreeSet::new(),
+            probe: None,
+            decision_owner: SourceId::new("source-a").expect("valid source"),
+            affected_actions: vec!["decide-cache".to_owned()],
+            lifecycle: ConflictLifecycle::Open,
+            receipt_digest: receipt.bundle_digest.clone(),
+        })
+        .expect("privacy-owner conflict stays valid");
+        let mut supplements = test_supplements();
+        supplements.unknowns = vec![
+            "privacy handling boundary for the warm-key evidence requires clearance".to_owned(),
+        ];
+        let candidate = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &conflict,
+            &supplements,
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("privacy-owner analysis: {err:?}"),
+        };
+        assert_eq!(candidate.outcome, ConflictOutcome::Complete);
+        assert_eq!(
+            candidate.recommended_owner.kind,
+            DecisionOwnerKind::SecurityPrivacy
+        );
+        assert_eq!(candidate.recommended_owner.owner_handle, "source-a");
+        assert!(
+            candidate
+                .recommended_owner
+                .rationale
+                .to_lowercase()
+                .contains("privacy"),
+            "security owner names the handling boundary: {}",
+            candidate.recommended_owner.rationale
+        );
+        assert!(
+            candidate
+                .recommended_owner
+                .contract_needed
+                .to_lowercase()
+                .contains("privacy"),
+            "security owner names its handling contract: {}",
+            candidate.recommended_owner.contract_needed
+        );
+        assert!(
+            !candidate
+                .recommended_owner
+                .contract_needed
+                .to_lowercase()
+                .contains("assign"),
+            "recommendation names the owner without assigning: {}",
+            candidate.recommended_owner.contract_needed
         );
         assert_eq!(candidate.positions.len(), 2);
         assert_eq!(candidate.resolution_status, None);
