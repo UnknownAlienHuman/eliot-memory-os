@@ -227,6 +227,14 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
             StoreRequest::Apply { transition, .. } => {
                 Some(transition.identity.operation_id.clone())
             }
+            // Issue #991: the reserved-write family carries its stable
+            // admitted identity in the sealed transition. Extracting it here
+            // binds every unknown/transport arm below to the admitted
+            // operation, so an uncertain send reconciles the same operation
+            // with no retry instead of surfacing a contract defect.
+            StoreRequest::ReservedWrite { request } => {
+                Some(request.transition.identity.operation_id.clone())
+            }
             StoreRequest::InitializeGenesis { request, .. } => Some(request.operation_id.clone()),
             StoreRequest::Receipt { operation_id } => Some(operation_id.clone()),
             // T12-04 K1 (owner #779): the Dreamer ledger family carries its
@@ -312,7 +320,6 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
             response => Ok(response),
         }
     }
-
 
     /// Verifies a typed failure against the admitted identity without parsing
     /// prose. `StoreFailure::validate` already checked the wire shape and

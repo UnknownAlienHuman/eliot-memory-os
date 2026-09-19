@@ -350,6 +350,83 @@ pub struct ExperienceRecallResponse {
     pub experience_priors: Vec<ExperienceBrief>,
     pub no_useful_memory: bool,
     pub reason: String,
+    /// Content-addressed handle resolving to exactly [`Self::fused_rank_traces`].
+    ///
+    /// Delivery must propagate the rank traces behind this handle: a response
+    /// carrying traces with a missing or mismatched handle fails
+    /// [`Self::validate_delivery`].
+    pub rank_trace_handle: String,
+    /// Delivered priors; always equals `experience_priors.len()`.
+    pub visible_count: u32,
+    /// Ranked but undelivered candidates; always equals
+    /// `fused_rank_traces.len() - visible_count`.
+    pub suppressed_count: u32,
+}
+
+impl ExperienceRecallResponse {
+    /// Derive the deterministic delivery handle for one rank-trace set.
+    ///
+    /// The handle is content-addressed (`rank-trace:<blake3>`) over the sorted
+    /// per-trace identity, feature routes, scores, and admission flags, so it
+    /// resolves to exactly the delivered trace set regardless of order.
+    pub fn rank_trace_handle_for(traces: &[FusedRankTrace]) -> String {
+        let mut material: Vec<String> = traces
+            .iter()
+            .map(|trace| {
+                let mut routes: Vec<String> = trace
+                    .routes
+                    .iter()
+                    .map(|route| format!("{}|{}|{}", route.route, route.cue, route.score))
+                    .collect();
+                routes.sort();
+                format!(
+                    "{}|{}|{}|{}|{}",
+                    trace.task_frame_ref,
+                    trace.candidate_ref,
+                    trace.total_score,
+                    trace.admitted_for_applicability_review,
+                    routes.join(",")
+                )
+            })
+            .collect();
+        material.sort();
+        let mut hasher = blake3::Hasher::new();
+        for entry in &material {
+            hasher.update(entry.as_bytes());
+            hasher.update(&[0]);
+        }
+        format!("rank-trace:{}", hasher.finalize().to_hex())
+    }
+
+    /// Fail-closed delivery check for the bound rank-trace handle and counts.
+    ///
+    /// Rejects a delivery whose handle does not resolve to the carried traces,
+    /// whose visible count disagrees with the delivered priors, or whose
+    /// suppressed count disagrees with the ranked-but-undelivered remainder.
+    pub fn validate_delivery(&self) -> Result<(), String> {
+        let expected = Self::rank_trace_handle_for(&self.fused_rank_traces);
+        if self.rank_trace_handle != expected {
+            return Err(
+                "rank_trace_handle does not resolve to the delivered fused_rank_traces".to_owned(),
+            );
+        }
+        let visible = u32::try_from(self.experience_priors.len())
+            .map_err(|_| "visible_count overflows u32".to_owned())?;
+        if self.visible_count != visible {
+            return Err("visible_count does not match the delivered experience_priors".to_owned());
+        }
+        let total = u32::try_from(self.fused_rank_traces.len())
+            .map_err(|_| "suppressed_count overflows u32".to_owned())?;
+        let suppressed = total
+            .checked_sub(visible)
+            .ok_or_else(|| "fused_rank_traces is smaller than the delivered priors".to_owned())?;
+        if self.suppressed_count != suppressed {
+            return Err(
+                "suppressed_count does not match the ranked-but-undelivered remainder".to_owned(),
+            );
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

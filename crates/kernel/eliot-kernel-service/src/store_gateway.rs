@@ -17,16 +17,22 @@ use std::time::Duration;
 use eliot_contracts::{EpochId, OperationId, RequestMetadata, StateFence};
 use eliot_ipc::NamedPipeTransport;
 use eliot_kernel_core::GenerationRoute;
-use eliot_ors::RedbRecoveryStore;
+use eliot_ors::{RedbRecoveryStore, ReservationRecord, WriterReservationToken};
 use eliot_protocol::dreamer_job::{DurableJobRequest, DurableJobResponse};
 use eliot_store_api::{
     CanonicalRequestView, CanonicalStoreClient, CanonicalValidationSnapshot, NamedReadRequest,
     NamedReadResponse, OrderingHeadExpectation, PreparedTransition, RequestMeta,
-    RevisionHeadExpectation, StoreGenesisRequest, StoreHealth, StoreRecoveryRequest,
-    StoreRecoverySnapshot, WriteReceipt, verify_canonical_request_hash,
+    ReservedWriteRequest, RevisionHeadExpectation, StoreError, StoreGenesisRequest, StoreHealth,
+    StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt, verify_canonical_request_hash,
 };
 
 use crate::commit_recovery::recover_commit;
+use crate::store_write_reservation::{
+    CompositionReservation, ReservationSeed, ResolvedSendOutcome, begin_execute_after_send,
+    cancel_before_send, ensure_eligible, finalize_reservation, mark_unknown_outcome,
+    project_reserved_write, reconcile_receipt, reserve_for_transition, writer_epoch_for_fence,
+    writer_epoch_for_fence_from_epoch,
+};
 use crate::{EbpCanonicalStoreClient, EbpStoreTransport, KernelService};
 
 const ACTIVE_DAEMON_CALLER: &str = "eliotd";
@@ -194,6 +200,19 @@ impl KernelStoreGateway {
         self.flight.fence();
     }
 
+    /// Observes the protected-control reserve through the gateway (issue #992).
+    ///
+    /// Diagnostic seam for the reserved-write path: normal admission never
+    /// moves this counter, while protected cancellation consumes exactly one
+    /// permit while held and returns it on release.
+    #[doc(hidden)]
+    pub fn available_control(&self) -> Result<usize, String> {
+        self.service
+            .lock()
+            .map(|service| service.available_control())
+            .map_err(|_| "Kernel service lock poisoned".to_owned())
+    }
+
     #[doc(hidden)]
     pub fn is_fenced(&self) -> bool {
         self.flight.is_fenced()
@@ -336,6 +355,325 @@ impl KernelStoreGateway {
             &self.paused_scopes,
             self.commit_ors.as_deref(),
         )
+    }
+
+    /// Applies one already prepared transition through a durable ORS
+    /// reservation and the exact #990/#991 reserved-write contract (issue
+    /// #992).
+    ///
+    /// Admission mirrors [`Self::apply`] (flight, fence, validation, active
+    /// daemon caller, fence equality, canonical request-hash recompute, live
+    /// route/epoch binding) with one addition: the composition-bound ORS must
+    /// be present. A missing ORS or a backend without reserved-write support
+    /// fails with an explicit unsupported error; there is deliberately no
+    /// fallback to unreserved `Apply`, and legacy/reference use stays on
+    /// [`Self::apply`].
+    ///
+    /// Lifecycle ordering (no orphaned tokens):
+    ///
+    /// ```text
+    /// reserve (no lease held) -> eligible (no lease held) ->
+    /// normal admission lease -> revalidate generation/fence ->
+    /// project -> single send ->
+    ///   Ok(Committed)   -> begin_execute_after_send -> reconcile -> Finalized
+    ///   Ok(not-applied) -> begin_execute_after_send -> reconcile -> Released (+gap)
+    ///   Err(unknown)    -> begin_execute_after_send -> mark_unknown -> Reconciling
+    ///   Err(refused)    -> release the still-Eligible token
+    /// ```
+    ///
+    /// Queued work holds no admission lease, Kernel lock, provider permit, or
+    /// protected-control resource while awaiting eligibility: the lease is
+    /// acquired only for the bounded send window, and the service lock is
+    /// never held across ORS or network work. Cancellation after execution
+    /// starts is rejected by the owner (see [`Self::cancel_reserved`]);
+    /// `begin_execute_after_send` runs only after the single send resolves
+    /// with the typed [`ResolvedSendOutcome`] evidence, so a refused
+    /// backend never strands an `Executing` reservation without receipt
+    /// evidence.
+    pub async fn apply_reserved(
+        &self,
+        context: &RequestMetadata,
+        transition: PreparedTransition,
+        expected_revision_heads: Vec<RevisionHeadExpectation>,
+        expected_ordering_heads: Vec<OrderingHeadExpectation>,
+        seed: ReservationSeed,
+    ) -> Result<WriteReceipt, String> {
+        let _flight = self.flight.enter()?;
+        if self.is_fenced() {
+            return Err("canonical-store gateway is fenced for rebind".to_owned());
+        }
+        apply_reserved_admission(context, &transition)?;
+        {
+            let view = CanonicalRequestView::from_apply(
+                context,
+                &transition,
+                &expected_revision_heads,
+                &expected_ordering_heads,
+            );
+            verify_canonical_request_hash(&view, &transition.identity.canonical_request_hash)
+                .map_err(|error| error.to_string())?;
+        }
+        let commit_ors = self.commit_ors.clone().ok_or_else(|| {
+            "reserved writes require the composition-bound ORS; refusing without unreserved Apply fallback"
+                .to_owned()
+        })?;
+        let owner = self.bind_reservation_owner(&commit_ors, context, &transition)?;
+        // Reservation and eligibility run without any admission lease: queued
+        // normal work holds no provider permit, Kernel lock, or
+        // protected-control resource while awaiting a predecessor (I14.3).
+        let sealed = reserve_for_transition(
+            &owner,
+            &seed,
+            context,
+            &transition,
+            &expected_revision_heads,
+            &expected_ordering_heads,
+        )
+        .map_err(|error| error.to_string())?;
+        ensure_eligible(&owner, &sealed.token).map_err(|error| error.to_string())?;
+        // Bounded send window: one normal admission lease, mirroring `apply`
+        // (Slices A+B, #65). Cancellation and reconciliation stay on the
+        // protected reserve and never consume this lease.
+        let lease = self.acquire_send_lease(&transition)?;
+        if self.is_fenced() {
+            return Err("canonical-store gateway is fenced for rebind".to_owned());
+        }
+        let operation_id = transition.identity.operation_id.as_str().to_owned();
+        let request = project_reserved_write(
+            &sealed,
+            context,
+            &transition,
+            expected_revision_heads,
+            expected_ordering_heads,
+        )
+        .map_err(|error| error.to_string())?;
+        let outcome = self.store.apply_reserved_write(request).await;
+        match outcome {
+            Ok(receipt) => {
+                // Execution starts only now that the single send resolved: a
+                // refused backend can never strand an `Executing` reservation.
+                // A stale epoch here preserves the committed operation id for
+                // exact-receipt recovery under the current epoch instead of
+                // finalizing under the wrong one.
+                let post_send = ResolvedSendOutcome::after_resolved_send(&sealed.token);
+                begin_execute_after_send(&owner, &sealed.token, &post_send).map_err(|error| {
+                    format!(
+                        "reserved write committed for operation {operation_id} but the reservation cannot execute ({error}); reconcile by exact receipt once the writer epoch is current"
+                    )
+                })?;
+                let reconciliation = reconcile_receipt(&sealed.token, &receipt)
+                    .map_err(|error| error.to_string())?;
+                finalize_reservation(&owner, &reconciliation).map_err(|error| error.to_string())?;
+                drop(lease);
+                Ok(receipt)
+            }
+            Err(StoreError::MissingReceiptEnvelope) => {
+                // Still unknown after possible submission: preserve
+                // `Executing`/`Reconciling` identity until exact Store receipt
+                // reconciliation. Never a blind retry, never a release.
+                let post_send = ResolvedSendOutcome::after_resolved_send(&sealed.token);
+                begin_execute_after_send(&owner, &sealed.token, &post_send)
+                    .map_err(|error| error.to_string())?;
+                mark_unknown_outcome(&owner, &sealed.token).map_err(|error| error.to_string())?;
+                drop(lease);
+                Err(format!(
+                    "reserved write outcome unknown for operation {operation_id}: reconciling; reconcile by exact Store receipt"
+                ))
+            }
+            Err(error) => {
+                // Deterministic refusal: the Store owner proves no effect, so
+                // the still-`Eligible` token releases cleanly and nothing
+                // orphans. `UnknownOperation` is explicit unsupported behavior
+                // from a backend without reserved capability, never a reason
+                // to fall back to unreserved `Apply`.
+                let _ = cancel_before_send(&owner, &sealed.token);
+                drop(lease);
+                if matches!(error, StoreError::UnknownOperation) {
+                    return Err(format!(
+                        "reserved write unsupported for operation {operation_id}: Store backend has no reserved-write capability; refusing without unreserved Apply fallback"
+                    ));
+                }
+                Err(error.to_string())
+            }
+        }
+    }
+
+    /// Binds the reservation owner from the live composition fence tuple.
+    ///
+    /// Staging step shared by the reserved-write entry points so each stays a
+    /// composition of audited gates: the service lock below is short and is
+    /// never held across ORS or network work.
+    fn bind_reservation_owner(
+        &self,
+        commit_ors: &Arc<RedbRecoveryStore>,
+        context: &RequestMetadata,
+        transition: &PreparedTransition,
+    ) -> Result<CompositionReservation, String> {
+        let service = self
+            .service
+            .lock()
+            .map_err(|_| "Kernel service lock poisoned".to_owned())?;
+        if service.generation_fenced() {
+            return Err("Kernel generation is fenced".to_owned());
+        }
+        if self.is_fenced() {
+            return Err("canonical-store gateway is fenced for rebind".to_owned());
+        }
+        let live_epoch = service.authority_epoch();
+        if self
+            .route_epoch
+            .as_ref()
+            .is_none_or(|bound| !bound.is_same_authority(&live_epoch))
+            || self.route.active_generation() != transition.state_fence.resource_generation
+            || !live_epoch.is_same_authority(&context.state_fence.authority_epoch)
+        {
+            return Err("canonical-store route is outside the active Kernel generation".to_owned());
+        }
+        let writer_epoch = writer_epoch_for_fence(context).map_err(|error| error.to_string())?;
+        CompositionReservation::bind(Arc::clone(commit_ors), writer_epoch)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Acquires the one normal admission lease for the bounded send window.
+    ///
+    /// Staging step mirroring `apply`: the lease draws from the normal
+    /// partition only, so normal saturation backpressures here while the
+    /// protected reserve stays untouched.
+    fn acquire_send_lease(
+        &self,
+        transition: &PreparedTransition,
+    ) -> Result<crate::AdmissionLease, String> {
+        let service = self
+            .service
+            .lock()
+            .map_err(|_| "Kernel service lock poisoned".to_owned())?;
+        if service.generation_fenced() {
+            return Err("Kernel generation is fenced".to_owned());
+        }
+        let lease = service
+            .acquire_admission()
+            .map_err(|error| error.to_string())?;
+        if !lease
+            .authority_epoch()
+            .is_same_authority(&transition.state_fence.authority_epoch)
+        {
+            return Err("canonical-store route authority epoch is stale".to_owned());
+        }
+        Ok(lease)
+    }
+
+    /// Cancels one reserved write before possible submission (issue #992).
+    ///
+    /// Cancellation is protected-control work (I14.3): it holds one
+    /// `cancellation` protected lease across the bounded ORS write only, so a
+    /// normal queue can neither consume the cancellation reserve nor be
+    /// consumed by it. Only `Reserved`/`Eligible` tokens release; from
+    /// `Executing`/`Reconciling` the owner rejects with `InvalidTransition`
+    /// and identity is preserved until exact receipt reconciliation.
+    /// Cancellation, timeout, or socket replacement can never finalize or
+    /// free such a reservation.
+    pub fn cancel_reserved(
+        &self,
+        token: &WriterReservationToken,
+    ) -> Result<ReservationRecord, String> {
+        let _flight = self.flight.enter()?;
+        if self.is_fenced() {
+            return Err("canonical-store gateway is fenced for rebind".to_owned());
+        }
+        let commit_ors = self.commit_ors.clone().ok_or_else(|| {
+            "reserved writes require the composition-bound ORS; nothing to cancel".to_owned()
+        })?;
+        // The protected lease is acquired inside the lock scope and returned
+        // alongside the owner, so it stays alive across the bounded ORS write
+        // below while the service lock itself is released first.
+        let (owner, _lease) = {
+            let service = self
+                .service
+                .lock()
+                .map_err(|_| "Kernel service lock poisoned".to_owned())?;
+            if service.generation_fenced() {
+                return Err("Kernel generation is fenced".to_owned());
+            }
+            let lease = service
+                .acquire_protected_control("cancellation")
+                .map_err(|error| error.to_string())?;
+            let live_epoch = lease.authority_epoch();
+            let writer_epoch =
+                crate::store_write_reservation::writer_epoch_for_fence_from_epoch(&live_epoch)
+                    .map_err(|error| error.to_string())?;
+            let owner = CompositionReservation::bind(commit_ors, writer_epoch)
+                .map_err(|error| error.to_string())?;
+
+            (owner, lease)
+        };
+        cancel_before_send(&owner, token).map_err(|error| error.to_string())
+    }
+
+    /// Reconciles one reserved write by its exact admitted request and
+    /// observed receipt (issue #992).
+    ///
+    /// Delegates to the exact-receipt reconciliation path shared with the
+    /// unknown-commit recovery surface; see
+    /// `store_receipt_gateway::reconcile_reserved`. Synchronous: every check
+    /// below is a bounded local validation or ORS write, never a network
+    /// wait, so reconciliation never holds the gateway across I/O.
+    pub fn reconcile_reserved(
+        &self,
+        token: &WriterReservationToken,
+        request: &ReservedWriteRequest,
+        receipt: &WriteReceipt,
+    ) -> Result<ReservationRecord, String> {
+        store_receipt_gateway::reconcile_reserved(self, token, request, receipt)
+    }
+
+    /// Drains reserved work before migration exclusivity (issue #992).
+    ///
+    /// Fences the gateway, waits out in-flight operations, then accounts for
+    /// every unresolved reservation in the composition-bound ORS. An exact
+    /// non-zero count fails with the honest pending count; a truncated
+    /// recovery page fails with a distinct truncated-scan report whose shown
+    /// count is explicitly incomplete: migration must reconcile first, and
+    /// nothing is force-released to make the count zero. Without a bound ORS
+    /// this degrades to the flight fence only, and says so.
+    pub async fn drain_reserved(&self, timeout: Duration) -> Result<(), String> {
+        self.flight.fence_and_drain(timeout).await?;
+        let Some(commit_ors) = self.commit_ors.as_ref() else {
+            return Ok(());
+        };
+        let live_epoch = {
+            let service = self
+                .service
+                .lock()
+                .map_err(|_| "Kernel service lock poisoned".to_owned())?;
+            service.authority_epoch()
+        };
+        let writer_epoch =
+            writer_epoch_for_fence_from_epoch(&live_epoch).map_err(|error| error.to_string())?;
+        let owner = CompositionReservation::bind(Arc::clone(commit_ors), writer_epoch)
+            .map_err(|error| error.to_string())?;
+        let page = crate::store_write_reservation::recovery_page(&owner, 256)
+            .map_err(|error| error.to_string())?;
+        let pending = page
+            .records
+            .iter()
+            .filter(|record| {
+                !matches!(
+                    record.state,
+                    eliot_ors::ReservationState::Finalized | eliot_ors::ReservationState::Released
+                )
+            })
+            .count();
+        if page.next_after_order.is_some() {
+            return Err(format!(
+                "migration drain blocked: recovery scan truncated after {pending} pending reservations in the first page; full unresolved count unknown; reconcile by exact receipt before exclusivity (no forced release)"
+            ));
+        }
+        if pending > 0 {
+            return Err(format!(
+                "migration drain blocked: {pending} unresolved reservations remain; reconcile by exact receipt before exclusivity (no forced release)"
+            ));
+        }
+        Ok(())
     }
 
     /// Reads one bounded, opaque Store recovery snapshot through the active
@@ -598,6 +936,27 @@ fn validate_route(
     }
     if route.active_generation() != state_fence.resource_generation {
         return Err("canonical-store route is outside the active Kernel generation".to_owned());
+    }
+    Ok(())
+}
+
+/// Reserved-write admission gates shared by the gateway entry point.
+///
+/// Mirrors the `apply` gates (context/transition validation, active daemon
+/// caller, fence equality): the caller rule lives at this boundary while the
+/// binding rules live in the reservation module. Staging step so the entry
+/// point stays a composition of audited gates.
+fn apply_reserved_admission(
+    context: &RequestMetadata,
+    transition: &PreparedTransition,
+) -> Result<(), String> {
+    context.validate().map_err(|error| error.to_string())?;
+    transition.validate().map_err(|error| error.to_string())?;
+    if context.source_id.as_str() != ACTIVE_DAEMON_CALLER {
+        return Err("transition caller is not the active daemon".to_owned());
+    }
+    if transition.state_fence != context.state_fence {
+        return Err("transition state fence does not match request metadata".to_owned());
     }
     Ok(())
 }
