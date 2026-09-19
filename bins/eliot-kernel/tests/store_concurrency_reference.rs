@@ -851,7 +851,9 @@ fn source_proof_guard() {
         committed.push(entry.file_name().to_string_lossy().into_owned());
     }
     for name in &committed {
-        let extension = std::path::Path::new(name).extension().and_then(|ext| ext.to_str());
+        let extension = std::path::Path::new(name)
+            .extension()
+            .and_then(|ext| ext.to_str());
         assert!(
             extension == Some("json") || extension == Some("toml"),
             "testdata carries fixtures only, found: {name}"
