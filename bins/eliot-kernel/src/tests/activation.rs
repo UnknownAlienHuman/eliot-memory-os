@@ -808,3 +808,100 @@ fn activation_raw_negative_projection_rejects_tampered_result_with_pending_prese
     drop(kernel);
     let _ = std::fs::remove_dir_all(root);
 }
+
+#[cfg(windows)]
+#[test]
+fn activation_terminal_negative_replay_survives_restart_without_pending_entry() {
+    let no_result_ticket = activation_v2_ticket("activation-ticket-no-result-deadline", 2_000);
+    let no_result = activation_v2_failed(&no_result_ticket, 1_000);
+    let (no_result_root, no_result_kernel) =
+        activation_kernel_with_ticket("no-result-deadline", &no_result_ticket, None, None);
+
+    let timeout = no_result_kernel
+        .submit_agent_activation_resolution_result(no_result.clone())
+        .expect_err("a result-less expired ticket must return Timeout");
+    assert!(
+        matches!(timeout, TransportError::Timeout),
+        "unexpected no-result deadline error: {timeout:?}"
+    );
+    drop(no_result_kernel);
+    let restarted_no_result = KernelComposition::new(KernelConfig::new(&no_result_root))
+        .expect("restart without a retained result");
+    let unknown_after_restart = restarted_no_result
+        .submit_agent_activation_resolution_result(no_result.clone())
+        .expect_err("a result-less ticket is not restored as a pending entry");
+    assert!(
+        matches!(unknown_after_restart, TransportError::UnknownRequest),
+        "unexpected result-less restart error: {unknown_after_restart:?}"
+    );
+    drop(restarted_no_result);
+    let _ = std::fs::remove_dir_all(no_result_root);
+
+    let ticket = activation_v2_ticket("activation-ticket-negative-restart", 2_000);
+    let failed = activation_v2_failed(&ticket, 1_000);
+    let retained_root = std::env::temp_dir().join(format!(
+        "eliot-kernel-activation-negative-restart-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(retained_root.join(".eliot")).expect("retained test root");
+    let ors_path = retained_root.join(".eliot").join("kernel-ors.redb");
+    let ors = eliot_ors::RedbRecoveryStore::open(&ors_path).expect("open retained ORS");
+    ors.retain_activation_result(&activation_retention_record(&ticket, &failed))
+        .expect("retain terminal negative");
+    drop(ors);
+
+    let kernel = KernelComposition::new(KernelConfig::new(&retained_root))
+        .expect("rehydrate terminal negative");
+    assert!(
+        kernel
+            .agent_activation_pending
+            .lock()
+            .expect("pending lock")
+            .entries
+            .is_empty(),
+        "restart must not restore a live pending entry"
+    );
+
+    let exact_submit = eliot_protocol::AgentActivationResultSubmit::new(failed.clone())
+        .expect("exact result submit");
+    let replay = kernel
+        .submit_agent_activation_result(exact_submit)
+        .expect("exact terminal negative replay after restart");
+    assert_eq!(
+        replay.outcome,
+        eliot_protocol::AgentActivationResultAckOutcome::ExactReplay
+    );
+    assert_eq!(replay.result, Some(failed.clone()));
+
+    let changed = eliot_protocol::AgentActivationResolutionResult::new(
+        &ticket,
+        1_000,
+        eliot_protocol::AgentActivationResolutionDisposition::FailedInternal {
+            failure_handle: "changed-failure".to_owned(),
+        },
+    )
+    .expect("changed terminal negative");
+    let changed_submit = eliot_protocol::AgentActivationResultSubmit::new(changed.clone())
+        .expect("changed result submit");
+    let conflict = kernel
+        .submit_agent_activation_result(changed_submit)
+        .expect_err("changed replay after restart must conflict");
+    assert!(
+        matches!(conflict, TransportError::IdentityConflict),
+        "unexpected changed replay error: {conflict:?}"
+    );
+
+    kernel
+        .submit_agent_activation_resolution_result(failed)
+        .expect("raw exact terminal negative replay after restart");
+    let raw_conflict = kernel
+        .submit_agent_activation_resolution_result(changed)
+        .expect_err("raw changed replay after restart must conflict");
+    assert!(
+        matches!(raw_conflict, TransportError::IdentityConflict),
+        "unexpected raw changed replay error: {raw_conflict:?}"
+    );
+
+    drop(kernel);
+    let _ = std::fs::remove_dir_all(retained_root);
+}

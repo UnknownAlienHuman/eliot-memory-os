@@ -993,7 +993,7 @@ impl KernelComposition {
             .map_err(|_| TransportError::SessionFenced)?;
         let incoming = submit.result;
         let ticket_id = incoming.ticket_id.clone();
-        let (entry_ticket, retained) = {
+        let (entry_ticket, pending_retained) = {
             let pending = self
                 .agent_activation_pending
                 .lock()
@@ -1004,6 +1004,18 @@ impl KernelComposition {
                 .map(|entry| entry.ticket.clone());
             let retained = pending.results.get(&ticket_id).cloned();
             (entry_ticket, retained)
+        };
+        // Restart rehydrates the durable result ledger, while pending tickets
+        // remain fresh-process state. Classify that retained identity before
+        // requiring a live pending entry or consulting the deadline.
+        let retained = match pending_retained {
+            Some(retained) => Some(retained),
+            None => self
+                .agent_activation_results
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?
+                .get(&ticket_id)
+                .cloned(),
         };
         if let Some(retained) = retained {
             return self.submit_against_retained_result(entry_ticket, &retained, incoming);
@@ -1120,6 +1132,22 @@ impl KernelComposition {
         result
             .validate()
             .map_err(|_| TransportError::SessionFenced)?;
+        // The durable result ledger is rehydrated before any fresh pending
+        // tickets are admitted. Classify replay/conflict first so a retained
+        // terminal negative cannot be laundered into Timeout after restart.
+        let existing = self
+            .agent_activation_results
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?
+            .get(&result.ticket_id)
+            .map(|record| record.result.clone());
+        match Self::classify_activation_result_for_entry(existing.as_ref(), &result) {
+            ActivationDecisionDisposition::ExactReplay => return Ok(()),
+            ActivationDecisionDisposition::Conflict => {
+                return Err(TransportError::IdentityConflict);
+            }
+            ActivationDecisionDisposition::Commit => {}
+        }
         let entry_ticket = self
             .agent_activation_pending
             .lock()
@@ -1131,12 +1159,6 @@ impl KernelComposition {
         result
             .validate_against(&entry_ticket)
             .map_err(|_| TransportError::SessionFenced)?;
-        let existing = self
-            .agent_activation_results
-            .lock()
-            .map_err(|_| TransportError::SessionFenced)?
-            .get(&result.ticket_id)
-            .map(|record| record.result.clone());
         match Self::classify_activation_result_for_entry(existing.as_ref(), &result) {
             ActivationDecisionDisposition::ExactReplay => return Ok(()),
             ActivationDecisionDisposition::Conflict => {
