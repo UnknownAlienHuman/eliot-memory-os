@@ -3020,10 +3020,64 @@ mod tests {
             OperationalPhase::Fenced
         );
 
+        let revoked_state = revoked.state.clone();
+        let fenced_projection = store
+            .load_capability_grant(&subject)?
+            .ok_or("fenced capability projection missing after revoke")?;
+        let fenced_record = fenced_projection.record().clone();
+        let fenced_receipt = fenced_projection.receipt().clone();
+        let fenced_closure = port
+            .revocation_closure(&revoke_operation_id)
+            .ok_or("successful revoke closure missing")?;
+        let fenced_disposition = port
+            .disposition(&revoke_operation_id)
+            .ok_or("successful revoke disposition missing")?;
+
+        let revoke_replay = P07AuthorityPort::revoke_grant(&port, &revoke)
+            .map_err(|error| format!("in-process revoke replay failed: {error:?}"))?;
+        assert_eq!(revoke_replay, revoked);
+        assert_eq!(revoke_replay.state, revoked_state);
+        let replayed_projection = store
+            .load_capability_grant(&subject)?
+            .ok_or("revoke replay removed the capability projection")?;
+        assert_eq!(replayed_projection, fenced_projection);
+        assert_eq!(replayed_projection.record(), &fenced_record);
+        assert_eq!(replayed_projection.receipt(), &fenced_receipt);
+        assert_eq!(
+            port.revocation_closure(&revoke_operation_id),
+            Some(fenced_closure.clone())
+        );
+        assert_eq!(
+            port.disposition(&revoke_operation_id),
+            Some(fenced_disposition.clone())
+        );
+        assert!(port.reconciling_operations().is_empty());
+
         drop(missing_port);
         drop(missing_store);
         drop(port);
         drop(store);
+
+        let reopened_store = Arc::new(eliot_ors::RedbRecoveryStore::open(&path)?);
+        let reopened_port =
+            GrantActivationPort::with_durable_root_grant(hydration_source, reopened_store.clone());
+        let restart_replay = P07AuthorityPort::revoke_grant(&reopened_port, &revoke)
+            .map_err(|error| format!("restart revoke replay failed: {error:?}"))?;
+        assert_eq!(restart_replay, revoked);
+        assert!(matches!(restart_replay.state, AuthorityState::Revoked));
+        assert!(reopened_port.grant_revoked("grant-root"));
+        let restarted_projection = reopened_store
+            .load_capability_grant(&subject)?
+            .ok_or("restart revoke replay removed the capability projection")?;
+        assert_eq!(restarted_projection, fenced_projection);
+        assert_eq!(restarted_projection.phase(), OperationalPhase::Fenced);
+        assert_eq!(restarted_projection.record(), &fenced_record);
+        assert_eq!(restarted_projection.receipt(), &fenced_receipt);
+        assert_eq!(fenced_closure, vec!["grant-root".to_owned()]);
+        assert!(reopened_port.reconciling_operations().is_empty());
+
+        drop(reopened_port);
+        drop(reopened_store);
         let _ = std::fs::remove_file(missing_path);
         let _ = std::fs::remove_file(path);
         Ok(())
