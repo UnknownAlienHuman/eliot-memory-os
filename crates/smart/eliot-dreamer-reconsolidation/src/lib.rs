@@ -1974,6 +1974,32 @@ mod tests {
         assert!(result.child.is_none());
     }
 
+    // WORK_UNIT_CASE: 667/21
+    #[test]
+    fn case_21_narrowed_and_qualified_propositions_use_new_evidence() {
+        for (disposition, revised_statement) in [
+            (
+                PropositionDisposition::Narrowed,
+                "Cold starts stay slow when no warm-up was observed.",
+            ),
+            (
+                PropositionDisposition::Qualified,
+                "Cold starts stay slow except after the observed warm-up.",
+            ),
+        ] {
+            let mut request = valid_request();
+            request.deltas[1].disposition = disposition;
+            request.deltas[1].revised_statement = Some(revised_statement.to_owned());
+            request.deltas[1].evidence_refs = vec!["obs-1".to_owned()];
+
+            let result = propose_reconsolidation(&request)
+                .expect("narrowed and qualified deltas are well-formed");
+            assert_eq!(result.outcome, ReconsolidationOutcome::Complete);
+            assert_eq!(result.accounted_parents, 2);
+            assert_eq!(result.admitted_new, 1);
+        }
+    }
+
     // WORK_UNIT_CASE: 667/22
     #[test]
     fn case_22_contradiction_requires_new_evidence_reference() {
