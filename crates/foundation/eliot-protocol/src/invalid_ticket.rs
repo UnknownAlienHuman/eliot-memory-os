@@ -76,9 +76,9 @@ fn lowercase_sha256(value: &str, field: &'static str) -> Result<(), ProtocolErro
 
 /// Best-effort ticket identity extraction from untrusted raw bytes.
 ///
-/// Returns the `ticket_id` string carried by the bytes when it is present and
-/// bounded, else [`UNKNOWN_INVALID_TICKET_ID`]. The raw bytes are always
-/// preserved verbatim regardless of the outcome.
+/// Returns the `ticket_id` string carried by the bytes verbatim when it is
+/// present and non-empty, else [`UNKNOWN_INVALID_TICKET_ID`]. The raw bytes
+/// are always preserved verbatim regardless of the outcome.
 fn extract_ticket_id(ticket_bytes: &[u8]) -> String {
     serde_json::from_slice::<serde_json::Value>(ticket_bytes)
         .ok()
@@ -88,12 +88,7 @@ fn extract_ticket_id(ticket_bytes: &[u8]) -> String {
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned)
         })
-        .filter(|candidate| {
-            !candidate.is_empty()
-                && candidate.trim() == candidate.as_str()
-                && !candidate.chars().any(char::is_control)
-                && candidate.len() <= MAX_INVALID_TICKET_TEXT_BYTES
-        })
+        .filter(|candidate| !candidate.is_empty())
         .unwrap_or_else(|| UNKNOWN_INVALID_TICKET_ID.to_owned())
 }
 
@@ -202,7 +197,12 @@ impl AgentActivationInvalidTicket {
                 reason: "unsupported invalid-ticket terminal artifact",
             });
         }
-        bounded_text(&self.ticket_id, "agent_activation_invalid_ticket.ticket_id")?;
+        if self.ticket_id.is_empty() {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_activation_invalid_ticket.ticket_id",
+                reason: "must carry the preserved ticket identity",
+            });
+        }
         if self.ticket_bytes.is_empty() {
             return Err(ProtocolError::InvalidField {
                 field: "agent_activation_invalid_ticket.ticket_bytes",
