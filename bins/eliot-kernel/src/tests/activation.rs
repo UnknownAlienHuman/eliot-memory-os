@@ -406,6 +406,7 @@ fn activation_kernel_with_ticket(
                 result,
                 phase: AgentActivationResultPhase::AcceptedTerminal,
                 ticket_connection: ticket.connection_id.clone(),
+                retention_order: 0,
             });
         }
     }
@@ -414,9 +415,443 @@ fn activation_kernel_with_ticket(
             .agent_activation_results
             .lock()
             .expect("raw result lock")
-            .insert(ticket.ticket_id.clone(), result);
+            .insert(
+                ticket.ticket_id.clone(),
+                AgentActivationResultRecord {
+                    result,
+                    phase: AgentActivationResultPhase::AcceptedTerminal,
+                    ticket_connection: ticket.connection_id.clone(),
+                    retention_order: 0,
+                },
+            );
     }
     (root, kernel)
+}
+
+#[cfg(windows)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the live bridge fixture keeps the production admission lifecycle in one test helper"
+)]
+fn activation_kernel_with_live_bridge_ticket(
+    name: &str,
+) -> (
+    std::path::PathBuf,
+    KernelComposition,
+    AgentActivationResolutionTicket,
+) {
+    let root = std::env::temp_dir().join(format!(
+        "eliot-kernel-activation-v2-live-{name}-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root).expect("test work root");
+    let kernel_artifact_sha256 = "a".repeat(64);
+    let kernel = KernelComposition::new(
+        KernelConfig::new(&root).with_kernel_artifact_sha256(kernel_artifact_sha256.clone()),
+    )
+    .expect("kernel composition");
+    let kernel_policy = kernel
+        .front_door_policy
+        .lock()
+        .expect("front-door policy")
+        .clone();
+    let kernel_config_snapshot_sha256 =
+        sha256_json(&kernel_policy.config_snapshot).expect("config snapshot digest");
+    let bridge_generation = ResourceGeneration::new(1).expect("bridge generation");
+    let bridge_authority_epoch = test_epoch(1);
+    let bridge_state_fence = StateFence::new(bridge_authority_epoch.clone(), bridge_generation);
+    let profile_id = "f".repeat(64);
+    let executable = eliot_platform_windows::observe_named_pipe_peer_process(std::process::id())
+        .expect("current process binding");
+    let executable_identity = executable
+        .executable_file_identity()
+        .expect("current process executable identity");
+    let bridge_sid = eliot_platform_windows::current_process_named_pipe_expectation()
+        .expect("current process expectation")
+        .expected_sid()
+        .to_owned();
+    let executable_sha256 = "b".repeat(64);
+    let capabilities = vec!["agent.bridge.activate".to_owned()];
+    let privacy_classes = vec!["PUBLIC".to_owned()];
+    let module_id = ContractId::new(AGENT_BRIDGE_MODULE_ID).expect("bridge module id");
+    let artifact_id = ArtifactId::new(executable_sha256.clone()).expect("bridge artifact id");
+    let declaration = AgentBridgeClientDeclaration {
+        wire_id: eliot_protocol::AGENT_BRIDGE_CLIENT_DECLARATION_WIRE_ID.to_owned(),
+        wire_version: eliot_protocol::AGENT_BRIDGE_CLIENT_DECLARATION_WIRE_VERSION,
+        module_id: AGENT_BRIDGE_MODULE_ID.to_owned(),
+        profile_id: profile_id.clone(),
+        protocol_range: eliot_protocol::ProtocolRange {
+            minimum: eliot_protocol::ProtocolVersion::CURRENT,
+            maximum: eliot_protocol::ProtocolVersion::CURRENT,
+        },
+        module_contract: ModuleContract {
+            module_id: module_id.clone(),
+            version: ContractVersion::new(1, 0, 0),
+            artifact_id: artifact_id.clone(),
+            protocols: vec!["eliot.agent-bridge.v1".to_owned()],
+            required_capabilities: capabilities.clone(),
+            optional_capabilities: Vec::new(),
+            advisory_capabilities: Vec::new(),
+            state_owner: "eliot-host".to_owned(),
+            failure_domain: "agent-bridge".to_owned(),
+            hot_replace: false,
+        },
+        module_generation: ModuleGeneration {
+            module_id,
+            generation: bridge_generation,
+            artifact_id,
+            state: ModuleGenerationState::Ready,
+            health: HealthVector::healthy(),
+            state_fence: bridge_state_fence.clone(),
+        },
+        capabilities: capabilities.clone(),
+        privacy_classes: privacy_classes.clone(),
+        max_frame: u32::try_from(eliot_protocol::MAX_FRAME_BYTES).expect("frame ceiling"),
+        expected_kernel_sid: bridge_sid.clone(),
+        expected_kernel_session_id: 0,
+        expected_kernel_principal_binding: kernel_policy.session_principal_binding.clone(),
+        expected_kernel_authority_epoch: kernel_policy
+            .module_generation
+            .state_fence
+            .authority_epoch
+            .clone(),
+        expected_kernel_generation: kernel_policy.module_generation.generation,
+        expected_kernel_artifact_sha256: kernel_artifact_sha256,
+        expected_kernel_config_snapshot_sha256: kernel_config_snapshot_sha256.clone(),
+        declaration_sha256: String::new(),
+    }
+    .with_computed_digest()
+    .expect("declaration digest");
+    let admission = AgentBridgeAdmissionDescriptor {
+        wire_id: eliot_kernel_service::AGENT_BRIDGE_ADMISSION_DESCRIPTOR_WIRE_ID.to_owned(),
+        wire_version: eliot_kernel_service::AGENT_BRIDGE_ADMISSION_DESCRIPTOR_WIRE_VERSION,
+        module_id: AGENT_BRIDGE_MODULE_ID.to_owned(),
+        profile_id: PlatformHandle::new(profile_id.clone()).expect("profile handle"),
+        profile_sha256: "c".repeat(64),
+        executable: PlatformHandle::new(executable.image_path()).expect("executable path"),
+        executable_sha256,
+        executable_identity: eliot_kernel_service::HostFileIdentity {
+            volume_serial_number: executable_identity.volume_serial_number,
+            file_index: executable_identity.file_index,
+        },
+        generation: bridge_generation,
+        authority_epoch: bridge_authority_epoch.clone(),
+        state_fence: bridge_state_fence.clone(),
+        approved_user_sid: bridge_sid.clone(),
+        caller_session_policy:
+            eliot_kernel_service::AgentBridgeCallerSessionPolicy::AnyInteractiveSessionForApprovedSid,
+        process_policy: eliot_kernel_service::AgentBridgeProcessPolicy::ExactProcessPerConnection,
+        allowed_capabilities: capabilities,
+        allowed_privacy_classes: privacy_classes,
+        max_frame: u32::try_from(eliot_protocol::MAX_FRAME_BYTES).expect("frame ceiling"),
+        allowed_effects: vec!["REVERSIBLE_MUTATION".to_owned()],
+        expected_kernel_principal_binding: kernel_policy.session_principal_binding,
+        expected_kernel_config_snapshot_sha256: kernel_config_snapshot_sha256,
+        client_declaration_path: PlatformHandle::new(
+            r"C:\eliot\agent-bridge\client-declaration.json",
+        )
+        .expect("declaration path"),
+        client_declaration_sha256: declaration.declaration_sha256.clone(),
+        descriptor_sha256: String::new(),
+    }
+    .with_computed_digest()
+    .expect("admission descriptor digest");
+    admission.validate().expect("admission descriptor");
+    admission
+        .validate_client_declaration(&declaration)
+        .expect("descriptor/declaration binding");
+
+    let candidate = HostKernelCandidateBinding {
+        installation_id: PlatformHandle::new("installation-1").expect("installation"),
+        host_epoch: AuthorityEpoch::new(1).expect("host epoch"),
+        kernel_epoch: bridge_authority_epoch,
+        activation_id: PlatformHandle::new("activation-1").expect("activation"),
+        artifact_hash: PlatformHandle::new("artifact-1").expect("artifact"),
+        config_hash: PlatformHandle::new("config-1").expect("config"),
+        job_object_id: PlatformHandle::new("Local\\Eliot-Host-Kernel-test").expect("job"),
+        pipe_identity: PlatformHandle::new(KERNEL_CONTROL_PIPE).expect("pipe"),
+        host_process: eliot_kernel_service::HostProcessBinding {
+            process_id: 7,
+            start_time_100ns: 9,
+            image_path: r"C:\eliot\host.exe".to_owned(),
+        },
+        job_binding: eliot_kernel_service::HostJobBinding {
+            job: eliot_kernel_service::HostJobIdentity {
+                name: "Local\\Eliot-Host-Kernel-test".to_owned(),
+            },
+            root: eliot_kernel_service::HostJobRoot {
+                process: eliot_kernel_service::HostProcessBinding {
+                    process_id: 42,
+                    start_time_100ns: 10,
+                    image_path: r"C:\eliot\kernel.exe".to_owned(),
+                },
+                executable: eliot_kernel_service::HostFileIdentity {
+                    volume_serial_number: 1,
+                    file_index: 2,
+                },
+            },
+        },
+        supervision_incarnation: supervision_incarnation(),
+        restart_budget: eliot_kernel_service::RestartBudget::new(1, 1).expect("restart budget"),
+        agent_bridge_admission: Some(admission.clone()),
+        containment_action: None,
+    };
+    {
+        let mut service = kernel.service.lock().expect("service lock");
+        service
+            .reconcile(candidate.clone())
+            .expect("candidate reconcile");
+        service
+            .apply(KernelControlCommand::Shadow)
+            .expect("shadow transition");
+        service
+            .apply(KernelControlCommand::PrepareHandoff)
+            .expect("handoff transition");
+        let permit = KernelActivationPermit {
+            operation_id: PlatformHandle::new("activation-operation-test").expect("operation"),
+            candidate_binding_digest: candidate.compute_digest().expect("candidate digest"),
+            prior_kernel_disposition_digest: "d".repeat(64),
+            journal_transaction_id: PlatformHandle::new("activation-transaction-test")
+                .expect("transaction"),
+            journal_sequence: 1,
+            generation: bridge_generation,
+            authority_epoch: candidate.kernel_epoch.clone(),
+            activation_nonce: eliot_platform::KernelActivationNonce::new(
+                PlatformHandle::new("e".repeat(64)).expect("activation nonce"),
+            )
+            .expect("activation nonce"),
+        };
+        service
+            .activate_permit(&permit, bridge_generation, "e".repeat(64))
+            .expect("activate candidate");
+        let activation_nonce_digest = service
+            .activation_receipt()
+            .expect("activation receipt")
+            .activation_nonce_digest
+            .clone();
+        service
+            .publish_ready(KernelReadyReceipt {
+                activation_id: candidate.activation_id.clone(),
+                activation_operation_id: permit.operation_id,
+                activation_nonce_digest,
+                process: eliot_kernel_service::ProcessObservation {
+                    process_id: PlatformHandle::new("pid:42:start:10").expect("process"),
+                    job_object_id: candidate.job_object_id.clone(),
+                    state: eliot_runtime_contracts::ServiceProcessState::Ready,
+                    health: HealthVector::healthy(),
+                    evidence_refs: vec![
+                        PlatformHandle::new("ev-activation-test").expect("evidence"),
+                    ],
+                },
+                health: HealthVector::healthy(),
+                evidence_refs: vec![PlatformHandle::new("ev-activation-test").expect("evidence")],
+            })
+            .expect("publish Ready state");
+    }
+    *kernel
+        .agent_bridge_profile
+        .lock()
+        .expect("bridge profile lock") = Some(AgentBridgeProfile {
+        admission: admission.clone(),
+        declaration: declaration.clone(),
+    });
+
+    let deadline = unix_ms().saturating_add(60_000);
+    let pipe_name = format!(r"\\.\pipe\eliot\activation-v2-live-{}", std::process::id());
+    let (receipt_sha256, connection_id) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("bridge fixture runtime")
+        .block_on(async {
+            let bridge_expectation =
+                eliot_platform_windows::NamedPipePeerExpectation::new_for_dynamic_process(
+                    bridge_sid,
+                    executable.image_path().to_owned(),
+                    executable_identity,
+                )
+                .expect("bridge expectation");
+            let peers = eliot_platform_windows::NamedPipePeerSet::new(vec![
+                eliot_platform_windows::NamedPipePeerProfile::new(
+                    eliot_platform_windows::NamedPipePeerKind::AgentBridge,
+                    bridge_expectation,
+                    Some(admission.profile_id.as_str().to_owned()),
+                )
+                .expect("bridge peer profile"),
+            ])
+            .expect("bridge peer set");
+            let mut server = eliot_ipc::NamedPipeServer::create_with_peer_set(&pipe_name, &peers)
+                .expect("bridge fixture server");
+            let (selection, (mut client, client_selection)) = tokio::try_join!(
+                server.wait_for_authenticated_client_with_peer_set(
+                    std::time::Duration::from_secs(5),
+                    &peers,
+                ),
+                eliot_ipc::NamedPipeTransport::connect_authenticated_with_peer_set(
+                    &pipe_name,
+                    std::time::Duration::from_secs(5),
+                    &peers,
+                ),
+            )
+            .expect("bridge fixture connection");
+            assert_eq!(selection, client_selection);
+            let handshake = kernel
+                .begin_agent_bridge(&selection, server.peer_identity().clone())
+                .expect("server-first bridge challenge");
+            server
+                .send_frame(&handshake.challenge_frame, kernel.ipc_limits())
+                .await
+                .expect("send bridge challenge");
+            let challenge = client
+                .receive_frame(kernel.ipc_limits())
+                .await
+                .expect("receive bridge challenge");
+            let hello = declaration
+                .client_hello(handshake.challenge.challenge_nonce.clone())
+                .expect("bridge hello");
+            let hello_frame = eliot_ipc::client_hello_frame(&handshake.connection_id, &hello)
+                .expect("bridge hello frame");
+            assert_eq!(challenge, handshake.challenge_frame);
+            client
+                .send_frame(&hello_frame, kernel.ipc_limits())
+                .await
+                .expect("send bridge hello");
+            let received_hello = server
+                .receive_frame(kernel.ipc_limits())
+                .await
+                .expect("receive bridge hello");
+            let receipt = kernel
+                .accept_agent_bridge_hello(&handshake.connection_id, &received_hello)
+                .expect("accept bridge hello");
+            (receipt.receipt_sha256, handshake.connection_id)
+        });
+
+    let mut ticket = activation_v2_ticket(name, deadline);
+    ticket.connection_id = connection_id;
+    ticket.peer_admission_receipt_sha256 = receipt_sha256;
+    let ticket = ticket
+        .with_computed_digest()
+        .expect("live bridge ticket digest");
+    kernel
+        .agent_activation_pending
+        .lock()
+        .expect("pending lock")
+        .entries
+        .insert(ticket.ticket_id.clone(), activation_v2_entry(&ticket));
+    (root, kernel, ticket)
+}
+
+#[cfg(windows)]
+fn activation_retention_record(
+    ticket: &AgentActivationResolutionTicket,
+    result: &eliot_protocol::AgentActivationResolutionResult,
+) -> eliot_ors::ActivationResultRetentionRecord {
+    eliot_ors::ActivationResultRetentionRecord {
+        ticket_id: ticket.ticket_id.clone(),
+        ticket_sha256: ticket.ticket_sha256.clone(),
+        ticket_payload: serde_json::to_string(ticket).expect("ticket payload"),
+        result_sha256: result.result_sha256.clone(),
+        result_payload: serde_json::to_string(result).expect("result payload"),
+        connection_id: ticket.connection_id.clone(),
+        state_fence: sha256_json(&ticket.state_fence).expect("fence digest"),
+        phase: eliot_ors::ActivationResultRetentionPhase::AcceptedTerminal,
+        retention_order: 0,
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn activation_result_ledger_rehydrates_without_bridge_state_or_session() {
+    let root = std::env::temp_dir().join(format!(
+        "eliot-kernel-activation-rehydrate-{}-{}",
+        std::process::id(),
+        unix_ms()
+    ));
+    std::fs::create_dir_all(root.join(".eliot")).expect("test ORS directory");
+    let ticket = activation_v2_ticket("activation-ticket-rehydrate", 2_000);
+    let result = activation_v2_resolved(&ticket, 1_000);
+    let ors_path = root.join(".eliot").join("kernel-ors.redb");
+    let ors = eliot_ors::RedbRecoveryStore::open(&ors_path).expect("open ORS");
+    ors.retain_activation_result(&activation_retention_record(&ticket, &result))
+        .expect("retain activation result");
+    drop(ors);
+
+    let kernel = KernelComposition::new(KernelConfig::new(&root)).expect("rehydrate kernel");
+    let ledger = kernel
+        .agent_activation_results
+        .lock()
+        .expect("result ledger lock");
+    assert_eq!(ledger.len(), 1);
+    assert_eq!(
+        ledger
+            .get(&ticket.ticket_id)
+            .expect("rehydrated ticket")
+            .result,
+        result
+    );
+    drop(ledger);
+    assert!(
+        kernel
+            .agent_activation_pending
+            .lock()
+            .expect("pending lock")
+            .entries
+            .is_empty()
+    );
+    assert!(
+        kernel
+            .agent_bridge_connections
+            .lock()
+            .expect("connection lock")
+            .is_empty()
+    );
+    let query =
+        AgentActivationResultReconcile::new(ticket.ticket_id.clone(), result.result_sha256.clone())
+            .expect("reconcile query");
+    let ack = kernel
+        .reconcile_agent_activation_result(&query)
+        .expect("rehydrated result reconciles");
+    assert_eq!(
+        ack.outcome,
+        eliot_protocol::AgentActivationResultAckOutcome::Reconciled
+    );
+    let missing =
+        AgentActivationResultReconcile::new("activation-ticket-missing".to_owned(), "f".repeat(64))
+            .expect("missing reconcile query");
+    let missing_ack = kernel
+        .reconcile_agent_activation_result(&missing)
+        .expect("missing result reconciles as unknown");
+    assert_eq!(
+        missing_ack.outcome,
+        eliot_protocol::AgentActivationResultAckOutcome::Unknown
+    );
+
+    drop(kernel);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(windows)]
+#[test]
+fn activation_result_ledger_typed_corruption_fences_startup() {
+    let root = std::env::temp_dir().join(format!(
+        "eliot-kernel-activation-corrupt-{}-{}",
+        std::process::id(),
+        unix_ms()
+    ));
+    std::fs::create_dir_all(root.join(".eliot")).expect("test ORS directory");
+    let ticket = activation_v2_ticket("activation-ticket-corrupt", 2_000);
+    let mut result = activation_v2_resolved(&ticket, 1_000);
+    result.ticket_sha256 = "e".repeat(64);
+    let ors_path = root.join(".eliot").join("kernel-ors.redb");
+    let ors = eliot_ors::RedbRecoveryStore::open(&ors_path).expect("open ORS");
+    ors.retain_activation_result(&activation_retention_record(&ticket, &result))
+        .expect("retain typed-corrupt result");
+    drop(ors);
+
+    let Err(error) = KernelComposition::new(KernelConfig::new(&root)) else {
+        panic!("typed-corrupt retention must fence startup");
+    };
+    assert!(matches!(error, KernelBuildError::Ors(_)));
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[cfg(windows)]
@@ -680,8 +1115,169 @@ fn activation_raw_negative_projection_rejects_tampered_result_with_pending_prese
         let retained = results
             .get(&ticket.ticket_id)
             .expect("rejected projection must preserve the retained result");
-        assert_eq!(retained.result_sha256, valid.result_sha256);
+        assert_eq!(retained.result.result_sha256, valid.result_sha256);
     }
     drop(kernel);
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(windows)]
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the restart test keeps direct-seed and live-bridge routes side by side"
+)]
+fn activation_terminal_negative_replay_survives_restart_without_pending_entry() {
+    let no_result_ticket = activation_v2_ticket("activation-ticket-no-result-deadline", 2_000);
+    let no_result = activation_v2_failed(&no_result_ticket, 1_000);
+    let (no_result_root, no_result_kernel) =
+        activation_kernel_with_ticket("no-result-deadline", &no_result_ticket, None, None);
+
+    let timeout = no_result_kernel
+        .submit_agent_activation_resolution_result(no_result.clone())
+        .expect_err("a result-less expired ticket must return Timeout");
+    assert!(
+        matches!(timeout, TransportError::Timeout),
+        "unexpected no-result deadline error: {timeout:?}"
+    );
+    drop(no_result_kernel);
+    let restarted_no_result = KernelComposition::new(KernelConfig::new(&no_result_root))
+        .expect("restart without a retained result");
+    let unknown_after_restart = restarted_no_result
+        .submit_agent_activation_resolution_result(no_result.clone())
+        .expect_err("a result-less ticket is not restored as a pending entry");
+    assert!(
+        matches!(unknown_after_restart, TransportError::UnknownRequest),
+        "unexpected result-less restart error: {unknown_after_restart:?}"
+    );
+    drop(restarted_no_result);
+    let _ = std::fs::remove_dir_all(no_result_root);
+
+    let (commit_root, commit_kernel, commit_ticket) =
+        activation_kernel_with_live_bridge_ticket("activation-ticket-negative-commit-restart");
+    let commit_failed = activation_v2_failed(&commit_ticket, 1_000);
+    let commit_ack = commit_kernel
+        .submit_agent_activation_result(
+            eliot_protocol::AgentActivationResultSubmit::new(commit_failed.clone())
+                .expect("commit-route result submit"),
+        )
+        .expect("live bridge terminal negative submit");
+    assert_eq!(
+        commit_ack.outcome,
+        eliot_protocol::AgentActivationResultAckOutcome::Accepted
+    );
+    assert_eq!(commit_ack.result, Some(commit_failed.clone()));
+    drop(commit_kernel);
+
+    let restarted_commit = KernelComposition::new(KernelConfig::new(&commit_root))
+        .expect("restart after a live bridge terminal negative submit");
+    assert!(
+        restarted_commit
+            .agent_activation_pending
+            .lock()
+            .expect("pending lock")
+            .entries
+            .is_empty(),
+        "commit-route restart must not restore a live pending entry"
+    );
+    let commit_replay = restarted_commit
+        .submit_agent_activation_result(
+            eliot_protocol::AgentActivationResultSubmit::new(commit_failed.clone())
+                .expect("exact commit-route replay submit"),
+        )
+        .expect("exact commit-route terminal negative replay after restart");
+    assert_eq!(
+        commit_replay.outcome,
+        eliot_protocol::AgentActivationResultAckOutcome::ExactReplay
+    );
+    assert_eq!(commit_replay.result, Some(commit_failed.clone()));
+
+    let commit_changed = eliot_protocol::AgentActivationResolutionResult::new(
+        &commit_ticket,
+        1_000,
+        eliot_protocol::AgentActivationResolutionDisposition::FailedInternal {
+            failure_handle: "changed-commit-failure".to_owned(),
+        },
+    )
+    .expect("changed commit-route terminal negative");
+    let commit_conflict = restarted_commit
+        .submit_agent_activation_result(
+            eliot_protocol::AgentActivationResultSubmit::new(commit_changed)
+                .expect("changed commit-route replay submit"),
+        )
+        .expect_err("changed commit-route replay after restart must conflict");
+    assert!(
+        matches!(commit_conflict, TransportError::IdentityConflict),
+        "unexpected commit-route changed replay error: {commit_conflict:?}"
+    );
+    drop(restarted_commit);
+    let _ = std::fs::remove_dir_all(commit_root);
+
+    let ticket = activation_v2_ticket("activation-ticket-negative-restart", 2_000);
+    let failed = activation_v2_failed(&ticket, 1_000);
+    let retained_root = std::env::temp_dir().join(format!(
+        "eliot-kernel-activation-negative-restart-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(retained_root.join(".eliot")).expect("retained test root");
+    let ors_path = retained_root.join(".eliot").join("kernel-ors.redb");
+    let ors = eliot_ors::RedbRecoveryStore::open(&ors_path).expect("open retained ORS");
+    ors.retain_activation_result(&activation_retention_record(&ticket, &failed))
+        .expect("retain terminal negative");
+    drop(ors);
+
+    let kernel = KernelComposition::new(KernelConfig::new(&retained_root))
+        .expect("rehydrate terminal negative");
+    assert!(
+        kernel
+            .agent_activation_pending
+            .lock()
+            .expect("pending lock")
+            .entries
+            .is_empty(),
+        "restart must not restore a live pending entry"
+    );
+
+    let exact_submit = eliot_protocol::AgentActivationResultSubmit::new(failed.clone())
+        .expect("exact result submit");
+    let replay = kernel
+        .submit_agent_activation_result(exact_submit)
+        .expect("exact terminal negative replay after restart");
+    assert_eq!(
+        replay.outcome,
+        eliot_protocol::AgentActivationResultAckOutcome::ExactReplay
+    );
+    assert_eq!(replay.result, Some(failed.clone()));
+
+    let changed = eliot_protocol::AgentActivationResolutionResult::new(
+        &ticket,
+        1_000,
+        eliot_protocol::AgentActivationResolutionDisposition::FailedInternal {
+            failure_handle: "changed-failure".to_owned(),
+        },
+    )
+    .expect("changed terminal negative");
+    let changed_submit = eliot_protocol::AgentActivationResultSubmit::new(changed.clone())
+        .expect("changed result submit");
+    let conflict = kernel
+        .submit_agent_activation_result(changed_submit)
+        .expect_err("changed replay after restart must conflict");
+    assert!(
+        matches!(conflict, TransportError::IdentityConflict),
+        "unexpected changed replay error: {conflict:?}"
+    );
+
+    kernel
+        .submit_agent_activation_resolution_result(failed)
+        .expect("raw exact terminal negative replay after restart");
+    let raw_conflict = kernel
+        .submit_agent_activation_resolution_result(changed)
+        .expect_err("raw changed replay after restart must conflict");
+    assert!(
+        matches!(raw_conflict, TransportError::IdentityConflict),
+        "unexpected raw changed replay error: {raw_conflict:?}"
+    );
+
+    drop(kernel);
+    let _ = std::fs::remove_dir_all(retained_root);
 }

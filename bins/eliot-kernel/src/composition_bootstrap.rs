@@ -1021,6 +1021,8 @@ impl KernelComposition {
         };
         #[cfg(not(windows))]
         let store_handoff_init = None;
+        #[cfg(windows)]
+        let agent_activation_results = Self::rehydrate_agent_activation_results(&ors)?;
         // F-LOG-KERNEL-2 (#899): constructed composition is not ready. The
         // service starts Cold, the daemon is NotLaunched, and no Store
         // gateway is claimed; readiness requires separate Host handoffs.
@@ -1086,7 +1088,7 @@ impl KernelComposition {
             #[cfg(windows)]
             agent_activation_changed: tokio::sync::Notify::new(),
             #[cfg(windows)]
-            agent_activation_results: Mutex::new(BTreeMap::new()),
+            agent_activation_results: Mutex::new(agent_activation_results),
             #[cfg(windows)]
             host_request_connection_index: Mutex::new(BTreeMap::new()),
             #[cfg(windows)]

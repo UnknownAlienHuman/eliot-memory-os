@@ -755,7 +755,7 @@ impl KernelComposition {
                     .map_err(|_| TransportError::SessionFenced)?;
                 results
                     .get(&activation_binding.ticket_id)
-                    .is_some_and(|raw| raw.result_sha256 != record.result.result_sha256)
+                    .is_some_and(|raw| raw.result.result_sha256 != record.result.result_sha256)
             };
             if raw_conflicts {
                 return Err(TransportError::IdentityConflict);
@@ -769,6 +769,7 @@ impl KernelComposition {
             results
                 .get(&activation_binding.ticket_id)
                 .cloned()
+                .map(|record| record.result)
                 .ok_or(TransportError::UnknownRequest)?
         };
         if result.resolved_binding().is_none() {

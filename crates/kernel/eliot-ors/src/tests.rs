@@ -207,6 +207,7 @@ fn activation_result_retention_round_trips_replays_conflicts_and_reopens() -> Te
         store.load_activation_result("ticket-1", &"b".repeat(64))?,
         Some(retained.clone())
     );
+    assert_eq!(store.load_all_activation_results()?, vec![retained.clone()]);
     assert!(matches!(
         store.load_activation_result("ticket-1", &"c".repeat(64)),
         Err(OrsError::ActivationResultRetentionIdentityConflict { .. })
