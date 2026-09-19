@@ -381,8 +381,9 @@ impl PossibleResultSchema {
     /// already-owned descriptor dimensions and must not decide
     /// discriminability or materiality; it consumes this predeclared value
     /// instead of inferring its own. `Debug` text is never equality: the
-    /// comparison below is canonical typed `PartialEq` over [`ResultUpdate`],
-    /// so every owner-supplied digest and meaning field participates.
+    /// comparison below is canonical target-indexed equality, with each
+    /// [`ResultTarget`] indexing its typed [`ResultUpdate`] value, so every
+    /// owner-supplied digest, meaning, and unknown reason participates.
     ///
     /// Set-vs-multiset policy: one branch update list is a set. Construction
     /// ([`PossibleResultSchema::new`]) rejects a branch that names a target
@@ -412,17 +413,25 @@ impl PossibleResultSchema {
 /// Authoritative A-03 equivalence over one branch update set, declared for
 /// issue 610/11 (case 610/11 needs).
 ///
-/// Canonical typed equality over [`ResultUpdate`], order insensitive with set
-/// semantics: every update in `left` must be typed-equal to some update in
-/// `right` and vice versa. Update order never distinguishes, and duplicate
-/// entries collapse (duplicates are impossible in a valid branch because
-/// [`PossibleResultSchema::new`] fails closed on a repeated target, so set
-/// equality coincides with multiset equality on valid inputs). `Debug`
-/// rendering is never consulted: two updates that render alike but differ in
-/// any typed field — including owner-supplied digests — are distinct.
+/// Canonical target-indexed equality over [`ResultUpdate`], order insensitive
+/// with set semantics: each [`ResultTarget`] indexes one typed update value,
+/// and the resulting target-to-update maps must be equal. Duplicate targets
+/// collapse to the last entry (duplicates are impossible in a valid branch
+/// because [`PossibleResultSchema::new`] fails closed on a repeated target, so
+/// this agrees with valid branch semantics). `Debug` rendering is never
+/// consulted: two updates with the same target but different typed fields —
+/// including owner-supplied digests, meanings, or unknown reasons — are
+/// distinct.
 pub fn update_sets_equal(left: &[ResultUpdate], right: &[ResultUpdate]) -> bool {
-    left.iter().all(|update| right.contains(update))
-        && right.iter().all(|update| left.contains(update))
+    let left_by_target: BTreeMap<_, _> = left
+        .iter()
+        .map(|update| (update.target(), update))
+        .collect();
+    let right_by_target: BTreeMap<_, _> = right
+        .iter()
+        .map(|update| (update.target(), update))
+        .collect();
+    left_by_target == right_by_target
 }
 
 /// Authoritative A-03 discriminability classification over a
