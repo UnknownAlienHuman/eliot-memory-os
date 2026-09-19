@@ -1,23 +1,29 @@
-//! Work-unit 610 slice 2: bounded discriminative probe planner, cases 1..8
+//! Work-unit 610 slice 3: bounded discriminative probe planner, cases 1..10
 //! (valid two-rival probe, multi-rival result matrix, exact
 //! objective/result/affordance/disposition vocabulary, bound-input
 //! mismatch, duplicate collapse, vague/no-gain objective gating,
 //! exact evidence/verifier-gap plannability, per-descriptor scope
-//! exclusion).
+//! exclusion, bounded closed result schema, open/unbounded rejection).
 //!
 //! Cases 610/1, 610/4 and 610/5 are marked on the existing planner
-//! behaviour tests in `tests/probe_plan.rs`. Cases 610/9..42 (result-schema
-//! discipline, budget/dominance, replay and no-execution proof) remain
-//! QUEUED on issue #610.
+//! behaviour tests in `tests/probe_plan.rs`. Cases 610/11..42 (discrimination,
+//! affordance/execution, safety, budget/dominance, replay and no-execution
+//! proof) remain QUEUED on issue #610.
 //!
-//! Ownership ruling 610/6-8 (planner-side descriptor gating only; no new
+//! Ownership ruling 610/6-10 (planner-side descriptor gating only; no new
 //! APIs): 610/6 OWNED via `InformationDimension::has_expected_gain` false
 //! for `NoGain`/`Unavailable` and the planner `Unprobeable` gate; 610/7
 //! OWNED via the 1:1 `AffordanceTarget` -> `ProbeTarget` projection for
 //! `EvidenceGap`/`Objective` with exact result schemas; 610/8 SPLIT -
 //! per-descriptor applicability-scope exclusion OWNED via the planner scope
 //! gate, while resolved/nonmaterial materiality judgment stays with A-03
-//! `ProbeObjective` declarations (planner sees only `ProbeObjectiveRef`).
+//! `ProbeObjective` declarations (planner sees only `ProbeObjectiveRef`);
+//! 610/9 OWNED via the A-03 `PossibleResultSchema` closed denominator
+//! preserved verbatim by the planner (`probe.result_schema` validates and
+//! keeps the exact two-branch cover); 610/10 OWNED via the A-03
+//! `PossibleResultSchema::new` fail-closed boundary (empty targets/branches,
+//! incomplete cover, duplicate identity, undeclared target all rejected
+//! before any descriptor can plan).
 //! Docs route=sha256:1b9bbbd8b5bb5e2de4737b4fa03e7e3672daba4394afef443dd3d8476554c7fa read=sha256:ea79ca7e06dbc95bb6ebceb4b5d904a848f265540ab58d6e82d93d5878599ec6 bundle=5ca78f97ee5f6485f6ab552d6687ade11da053a68be0cb38339167aeac0be7f3 (generic-source; verified bundle read in full plus I09-03, I09-05, I21-03, I12-18, I12-22, I13-07, I15-02, I15-04, I05-27, I05-16, I07-20 read directly).
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
@@ -500,4 +506,137 @@ fn out_of_scope_descriptor_is_unprobeable() {
     assert_eq!(omission.kind, OmissionKind::Unprobeable);
     assert_eq!(omission.affordance.affordance_id.as_str(), "aff-foreign");
     assert!(omission.reason.contains("applicability scope"));
+}
+
+// WORK_UNIT_CASE: 610/9
+#[test]
+fn bounded_closed_result_schema_is_plannable() {
+    let target_objective = objective("objective-closed");
+    let targets = vec![ResultTarget::Gap {
+        objective: target_objective.clone(),
+    }];
+    let branches = vec![
+        ResultBranch {
+            result_id: artifact("closed-branch-addressed"),
+            value: PossibleResultValue::Unknown {
+                reason: "outcome not yet observed".to_owned(),
+            },
+            updates: vec![ResultUpdate::Gap {
+                objective: target_objective.clone(),
+                meaning: GapUpdateMeaning::Addressed,
+            }],
+        },
+        ResultBranch {
+            result_id: artifact("closed-branch-open"),
+            value: PossibleResultValue::Unknown {
+                reason: "outcome not yet observed".to_owned(),
+            },
+            updates: vec![ResultUpdate::Gap {
+                objective: target_objective.clone(),
+                meaning: GapUpdateMeaning::RemainsOpen,
+            }],
+        },
+    ];
+    let schema = must(PossibleResultSchema::new(
+        artifact("closed-schema"),
+        targets,
+        branches,
+    ));
+    must(schema.validate());
+    assert_eq!(schema.targets.len(), 1);
+    assert_eq!(schema.branches.len(), 2);
+    assert!(!schema.digest.trim().is_empty());
+
+    let mut params = descriptor_params("aff-closed", gap_target("claim-closed"));
+    params.result_schema = schema.clone();
+    let closed = must(InquiryAffordanceDescriptor::new(params));
+    let plan = plan_for(vec![closed], Some(16));
+    must(plan.validate());
+    assert_eq!(plan.probes.len(), 1);
+    assert!(plan.omissions.is_empty());
+    let probe = &plan.probes[0];
+    must(probe.result_schema.validate());
+    assert_eq!(probe.result_schema.digest, schema.digest);
+    assert_eq!(probe.result_schema.branches.len(), 2);
+    assert_ne!(
+        probe.result_schema.branches[0].result_id,
+        probe.result_schema.branches[1].result_id
+    );
+}
+
+// WORK_UNIT_CASE: 610/10
+#[test]
+fn open_unbounded_result_space_is_rejected() {
+    let target_objective = objective("objective-open");
+    let targets = vec![ResultTarget::Gap {
+        objective: target_objective.clone(),
+    }];
+    let closed_branch = ResultBranch {
+        result_id: artifact("open-branch"),
+        value: PossibleResultValue::Unknown {
+            reason: "outcome not yet observed".to_owned(),
+        },
+        updates: vec![ResultUpdate::Gap {
+            objective: target_objective.clone(),
+            meaning: GapUpdateMeaning::RemainsOpen,
+        }],
+    };
+
+    assert!(
+        PossibleResultSchema::new(
+            artifact("open-empty-targets"),
+            Vec::new(),
+            vec![closed_branch.clone()]
+        )
+        .is_err(),
+        "empty target denominator must fail closed"
+    );
+    assert!(
+        PossibleResultSchema::new(artifact("open-empty-branches"), targets.clone(), Vec::new())
+            .is_err(),
+        "empty branch set must fail closed"
+    );
+    assert!(
+        PossibleResultSchema::new(
+            artifact("open-incomplete-cover"),
+            targets.clone(),
+            vec![ResultBranch {
+                result_id: artifact("open-incomplete"),
+                value: PossibleResultValue::Unknown {
+                    reason: "outcome not yet observed".to_owned(),
+                },
+                updates: Vec::new(),
+            }],
+        )
+        .is_err(),
+        "branch without full target cover must fail closed"
+    );
+    assert!(
+        PossibleResultSchema::new(
+            artifact("open-duplicate-id"),
+            targets.clone(),
+            vec![closed_branch.clone(), closed_branch.clone()],
+        )
+        .is_err(),
+        "duplicate result identity must fail closed"
+    );
+    let foreign_objective = objective("objective-foreign");
+    assert!(
+        PossibleResultSchema::new(
+            artifact("open-undeclared-target"),
+            targets.clone(),
+            vec![ResultBranch {
+                result_id: artifact("open-foreign"),
+                value: PossibleResultValue::Unknown {
+                    reason: "outcome not yet observed".to_owned(),
+                },
+                updates: vec![ResultUpdate::Gap {
+                    objective: foreign_objective,
+                    meaning: GapUpdateMeaning::RemainsOpen,
+                }],
+            }],
+        )
+        .is_err(),
+        "update to an undeclared target must fail closed"
+    );
 }
