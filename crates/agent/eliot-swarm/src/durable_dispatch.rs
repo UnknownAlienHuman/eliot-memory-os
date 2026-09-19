@@ -22,14 +22,17 @@
 
 use eliot_agent_api::WorkLeaseId;
 use eliot_agent_contracts::{AgentAttemptId, RevisionId, WorkItem, WorkItemId};
-use eliot_coordination::{SwarmPlanAttachmentError, SwarmPlanAttachmentLedger};
+use eliot_coordination::{
+    DurableAttachError, SwarmPlanAttachmentConsumerPort, SwarmPlanAttachmentError,
+    SwarmPlanAttachmentLedger,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::{
     AdmittedSwarmPlan, ProviderBinding, ProviderRequest, ReceiptEnvelope, ReceiptVerificationPort,
     SwarmError, digest,
-    durable_work::{LaunchIntent, RouteGrant, WorkUnitId},
+    durable_work::{ChildDisposition, LaunchIntent, RouteGrant, TerminalKind, WorkUnitId},
     validate_receipt, validate_text,
 };
 
@@ -219,6 +222,282 @@ pub(crate) fn attach_plan_job(
     })
 }
 
+/// Maps a canonical attach refusal onto the cell's fail-closed [`SwarmError`].
+///
+/// A canonical conflict becomes [`SwarmError::OwnershipConflict`]; snapshot
+/// and serialization failures keep their exact variants; invalid input and
+/// every store/contention failure becomes [`SwarmError::Contract`], matching
+/// [`super::swarm_plan_attachment_consumer::SwarmAttachmentConsumer::to_swarm_error`]:
+/// the consumer presented a validated handle to the owner port and the owner
+/// refused it for a reason outside the singularity contract.
+fn map_attach_error<E>(error: &DurableAttachError<E>) -> SwarmError {
+    match error {
+        DurableAttachError::Decision(SwarmPlanAttachmentError::OwnershipConflict { .. }) => {
+            SwarmError::OwnershipConflict
+        }
+        DurableAttachError::Decision(SwarmPlanAttachmentError::InvalidSnapshot) => {
+            SwarmError::InvalidSnapshot
+        }
+        DurableAttachError::Decision(SwarmPlanAttachmentError::Serialization) => {
+            SwarmError::Serialization
+        }
+        DurableAttachError::Decision(SwarmPlanAttachmentError::InvalidField(_))
+        | DurableAttachError::Store(_)
+        | DurableAttachError::ContentionExhausted { .. } => SwarmError::Contract,
+    }
+}
+
+/// Maps a consumer-vend refusal onto the cell's fail-closed [`SwarmError`].
+fn map_vend_error(error: &SwarmPlanAttachmentError) -> SwarmError {
+    match error {
+        SwarmPlanAttachmentError::OwnershipConflict { .. } => SwarmError::OwnershipConflict,
+        SwarmPlanAttachmentError::InvalidSnapshot => SwarmError::InvalidSnapshot,
+        SwarmPlanAttachmentError::Serialization => SwarmError::Serialization,
+        SwarmPlanAttachmentError::InvalidField(_) => SwarmError::Contract,
+    }
+}
+
+/// Seals one canon-bound job/fence tuple into a [`DurableJobAttachment`].
+///
+/// The caller has already committed the tuple through the Governor canonical
+/// owner (ledger or durable port); this helper only re-checks that the canon
+/// echoed the requested job/fence and then validates the Governor attachment
+/// receipt before constructing the value.
+fn seal_attachment(
+    plan: &AdmittedSwarmPlan,
+    canon_job_handle: &str,
+    canon_fence_digest: &str,
+    job_handle: &str,
+    fence_digest: &str,
+    attachment_receipt: ReceiptEnvelope,
+    verifier: Option<&dyn ReceiptVerificationPort>,
+) -> Result<DurableJobAttachment, SwarmError> {
+    // The canon echoes the requested tuple on success; refuse anything else
+    // rather than sealing a binding the owner did not decide.
+    if canon_job_handle != job_handle || canon_fence_digest != fence_digest {
+        return Err(SwarmError::Contract);
+    }
+    let binding: &ProviderBinding = plan.provider_binding();
+    let request = ProviderRequest {
+        operation_kind: JOB_ATTACH_OPERATION.to_owned(),
+        artifact_digest: digest(&(
+            job_handle,
+            plan.revision().as_str(),
+            binding.state_fence_digest.as_str(),
+        ))?,
+        binding: binding.clone(),
+        replay: None,
+    };
+    validate_receipt(&attachment_receipt, verifier, JOB_OWNER, &request)?;
+    Ok(DurableJobAttachment {
+        job_handle: job_handle.to_owned(),
+        plan_revision: plan.revision().clone(),
+        state_fence_digest: binding.state_fence_digest.clone(),
+        attachment_receipt_digest: attachment_receipt.identity.canonical_sha256.clone(),
+        attachment_receipt,
+    })
+}
+
+/// Validates one admitted plan and attaches it to one durable job through a
+/// Governor-vended consumer port.
+///
+/// This is the smallest production binding of the swarm consumption path to
+/// the Governor-owned canonical store (issue #1126 item 1 via the #2017 port):
+/// plan identity travels only inside the vended consumer handle, so a caller
+/// cannot swap the admission digest, plan revision, or fence digest between
+/// acquisition and attach. The only caller-supplied value at attach time is
+/// the candidate job handle, which the canonical decision then binds or
+/// refuses with [`SwarmError::OwnershipConflict`] naming the canonical winner
+/// (surfaced through the port's decision error).
+///
+/// The port is generic so the swarm cell stays a consumer without depending
+/// on the Governor implementation crate: production binds
+/// `CanonicalSwarmPlanAttachmentStore` (via `SwarmPlanAttachmentService` /
+/// `SwarmAttachmentComposition` in `eliot-governor`); tests bind the
+/// in-memory ledger or a `SwarmPlanAttachmentStore`-backed durable port.
+/// Receipt validation and [`DurableJobAttachment`] construction are identical
+/// to [`attach_plan_job`]; only the owner behind the decision changes.
+///
+/// Fail-closed: a blank handle never attaches, a missing verifier is
+/// [`SwarmError::PlanGap`], a non-Governor or plan/fence-mismatched receipt is
+/// rejected by the shared receipt validation, store/contention failures are
+/// [`SwarmError::Contract`], and a canon binding that does not echo the
+/// requested job/fence is refused as an internal contract violation.
+pub fn attach_plan_job_through_port<P: SwarmPlanAttachmentConsumerPort>(
+    plan: &AdmittedSwarmPlan,
+    port: &P,
+    job_handle: &str,
+    attachment_receipt: ReceiptEnvelope,
+    verifier: Option<&dyn ReceiptVerificationPort>,
+) -> Result<DurableJobAttachment, SwarmError> {
+    validate_text(job_handle, "job_handle")?;
+    let binding: &ProviderBinding = plan.provider_binding();
+    let fence_digest = binding.state_fence_digest.as_str();
+    let consumer = port
+        .vend_consumer(
+            plan.admission_receipt().identity.canonical_sha256.as_str(),
+            plan.revision().as_str(),
+            fence_digest,
+        )
+        .map_err(|error| map_vend_error(&error))?;
+    let canon = port
+        .attach(&consumer, job_handle)
+        .map_err(|error| map_attach_error(&error))?;
+    seal_attachment(
+        plan,
+        canon.job_handle(),
+        canon.fence_digest(),
+        job_handle,
+        fence_digest,
+        attachment_receipt,
+        verifier,
+    )
+}
+
+/// Rehydrates one sealed plan binding from the Governor-owned canonical store
+/// after a restart, through the same vended consumer port as
+/// [`attach_plan_job_through_port`].
+///
+/// The caller drops every in-memory attachment on restart, reloads its prior
+/// sealed [`DurableJobAttachment`] from its own durable record, and presents
+/// it as `expected` with the stored Governor attachment receipt. This helper
+/// re-vends the consumer from the admitted plan identity and re-attaches with
+/// the expected job handle, so the canonical decision (not process memory) is
+/// the source of truth: an identical replay returns the canonical binding, a
+/// canon bound to a different job or fence refuses with
+/// [`SwarmError::OwnershipConflict`] naming the canonical winner, and
+/// store/contention failures stay [`SwarmError::Contract`]. The rebuilt value
+/// must equal `expected` exactly (job, revision, fence, receipt digest);
+/// anything else — including a receipt that validates but is not the sealed
+/// one — is refused as an internal contract violation, so an unknown outcome
+/// can never become absent, failed, or safe-to-repeat by timeout alone.
+///
+/// Fail-closed: a plan revision or fence digest that drifted from `expected`
+/// is [`SwarmError::StaleLineage`] before the owner is contacted; receipt
+/// rules match [`attach_plan_job_through_port`].
+pub fn rehydrate_attachment_through_port<P: SwarmPlanAttachmentConsumerPort>(
+    plan: &AdmittedSwarmPlan,
+    port: &P,
+    expected: &DurableJobAttachment,
+    attachment_receipt: ReceiptEnvelope,
+    verifier: Option<&dyn ReceiptVerificationPort>,
+) -> Result<DurableJobAttachment, SwarmError> {
+    if plan.revision() != expected.plan_revision() {
+        return Err(SwarmError::StaleLineage);
+    }
+    if plan.provider_binding().state_fence_digest.as_str() != expected.state_fence_digest() {
+        return Err(SwarmError::StaleLineage);
+    }
+    let rebuilt = attach_plan_job_through_port(
+        plan,
+        port,
+        expected.job_handle(),
+        attachment_receipt,
+        verifier,
+    )?;
+    if rebuilt != *expected {
+        return Err(SwarmError::Contract);
+    }
+    Ok(rebuilt)
+}
+
+/// Upper bound on exact active children named for cancellation in one
+/// [`plan_cancellation_drain`] pass.
+///
+/// Termination is structural: one pass names at most this many cancels, and
+/// any further active child waits in `pending` for the next pass, so a drain
+/// always terminates even when the child denominator is large.
+pub const MAX_PLAN_DRAIN_CANCELS: usize = 16;
+
+/// Bounded drain decision for one attached swarm plan.
+///
+/// The input is the finite closed child denominator of the attached plan: one
+/// ([`WorkItemId`] slot, [`ChildDisposition`]) pair per admitted child, using
+/// the existing [`super::durable_work`] lifecycle contracts. The decision is
+/// pure: it mints no dispatch, performs no process launch, and calls no
+/// executor. The caller executes each named cancel through the existing
+/// owner-side cancellation path
+/// ([`super::durable_work::DurableWorkMachine::request_cancel`]) and re-runs
+/// the drain on the re-observed dispositions until `terminal_ready`.
+///
+/// Rules, in order:
+/// - stop new admission by construction: the decision emits no dispatch, only
+///   cancels for exact active ([`ChildDisposition::Running`]) children;
+/// - cancel at most `max_cancels` (capped at [`MAX_PLAN_DRAIN_CANCELS`])
+///   running children per pass; any further running child waits in `pending`;
+/// - preserve the unknown: [`ChildDisposition::UnknownBlocked`] and
+///   [`ChildDisposition::Stale`] children are listed in `unknown` and block
+///   the terminal aggregate — they never become absent, failed, or
+///   safe-to-repeat;
+/// - terminal children pass through with their exact [`TerminalKind`];
+/// - `terminal_ready` holds only when `cancel`, `pending`, and `unknown` are
+///   all empty, so a terminal aggregate may publish only after every child is
+///   accounted for.
+///
+/// Fail-closed: an empty denominator is [`SwarmError::Empty`], and a repeated
+/// child slot is [`SwarmError::Duplicate`].
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanDrain {
+    /// Exact active children to cancel through the owner-side path this pass.
+    pub cancel: Vec<WorkItemId>,
+    /// Active children beyond this pass's bound; cancel them on later passes.
+    pub pending: Vec<WorkItemId>,
+    /// Unknown or stale children that block the terminal aggregate.
+    pub unknown: Vec<WorkItemId>,
+    /// Accounted terminal children with their exact terminal kinds.
+    pub terminal: Vec<(WorkItemId, TerminalKind)>,
+    /// Whether a terminal aggregate may publish: every child accounted and
+    /// no cancel outstanding or unknown.
+    pub terminal_ready: bool,
+}
+
+/// Computes the bounded drain decision for one attached plan denominator.
+///
+/// See [`PlanDrain`] for the accounting rules; see
+/// [`MAX_PLAN_DRAIN_CANCELS`] for the structural bound.
+pub fn plan_cancellation_drain(
+    children: &[(WorkItemId, ChildDisposition)],
+    max_cancels: usize,
+) -> Result<PlanDrain, SwarmError> {
+    if children.is_empty() {
+        return Err(SwarmError::Empty("children"));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for (slot, _) in children {
+        if !seen.insert(slot.as_str().to_owned()) {
+            return Err(SwarmError::Duplicate("child_slot"));
+        }
+    }
+    let bound = max_cancels.min(MAX_PLAN_DRAIN_CANCELS);
+    let mut drain = PlanDrain {
+        cancel: Vec::new(),
+        pending: Vec::new(),
+        unknown: Vec::new(),
+        terminal: Vec::new(),
+        terminal_ready: false,
+    };
+    for (slot, disposition) in children {
+        match disposition {
+            ChildDisposition::Running => {
+                if drain.cancel.len() < bound {
+                    drain.cancel.push(slot.clone());
+                } else {
+                    drain.pending.push(slot.clone());
+                }
+            }
+            ChildDisposition::UnknownBlocked | ChildDisposition::Stale => {
+                drain.unknown.push(slot.clone());
+            }
+            ChildDisposition::Terminal(kind) => {
+                drain.terminal.push((slot.clone(), *kind));
+            }
+        }
+    }
+    drain.terminal_ready =
+        drain.cancel.is_empty() && drain.pending.is_empty() && drain.unknown.is_empty();
+    Ok(drain)
+}
 /// Defense-in-depth re-check for one job per plan revision.
 ///
 /// Enforcement lives in the Governor canonical attach-once decision consulted
@@ -338,7 +617,7 @@ mod tests {
     use std::error::Error;
 
     use eliot_agent_contracts::WorkItemState;
-    use eliot_coordination::SwarmPlanAttachmentLedger;
+    use eliot_coordination::{SwarmPlanAttachmentConsumerPort, SwarmPlanAttachmentLedger};
     use eliot_receipts::{ReceiptCore, WorkScopeBinding};
     use serde_json::{Value, json};
 
@@ -844,6 +1123,399 @@ mod tests {
         assert_eq!(
             assert_single_attachment(Some(&first), &second),
             Err(SwarmError::OwnershipConflict)
+        );
+        Ok(())
+    }
+
+    fn attached_through_port<P: SwarmPlanAttachmentConsumerPort>(
+        plan: &AdmittedSwarmPlan,
+        port: &P,
+        job_handle: &str,
+    ) -> Result<DurableJobAttachment, Box<dyn Error>> {
+        let request = attach_request(plan.provider_binding(), job_handle)?;
+        let receipt = receipt_for(JOB_OWNER, &request, None)?;
+        Ok(attach_plan_job_through_port(
+            plan,
+            port,
+            job_handle,
+            receipt,
+            Some(&Trusted),
+        )?)
+    }
+
+    #[test]
+    fn port_path_first_bind_wins_replay_idempotent_second_conflicts() -> TestResult {
+        // Production binding: the admitted plan consumes the Governor-owned
+        // canon through the vended consumer port. Identity travels inside the
+        // vended handle; the caller supplies only the job handle.
+        let plan = admitted_plan()?;
+        let owner = SwarmPlanAttachmentLedger::new();
+        let first = attached_through_port(&plan, &owner, "job-1")?;
+        let same = attached_through_port(&plan, &owner, "job-1")?;
+        assert_eq!(first, same);
+        assert_eq!(first.job_handle(), "job-1");
+        let request = attach_request(plan.provider_binding(), "job-2")?;
+        let receipt = receipt_for(JOB_OWNER, &request, None)?;
+        assert_eq!(
+            attach_plan_job_through_port(&plan, &owner, "job-2", receipt, Some(&Trusted)),
+            Err(SwarmError::OwnershipConflict)
+        );
+        // The port-path winner matches the ledger-path winner for the same
+        // owner: both consume one canonical decision.
+        let ledger_first = attached(&plan, &SwarmPlanAttachmentLedger::new(), "job-1")?;
+        assert_eq!(first.plan_revision(), ledger_first.plan_revision());
+        assert_eq!(
+            first.state_fence_digest(),
+            ledger_first.state_fence_digest()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn port_path_rejects_blank_job_handle_before_owner_contact() -> TestResult {
+        let plan = admitted_plan()?;
+        let owner = SwarmPlanAttachmentLedger::new();
+        let request = attach_request(plan.provider_binding(), "job-1")?;
+        let receipt = receipt_for(JOB_OWNER, &request, None)?;
+        assert_eq!(
+            attach_plan_job_through_port(&plan, &owner, "   ", receipt, Some(&Trusted)),
+            Err(SwarmError::Blank("job_handle"))
+        );
+        assert!(owner.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn port_path_rejects_foreign_owner_receipt() -> TestResult {
+        let plan = admitted_plan()?;
+        let owner = SwarmPlanAttachmentLedger::new();
+        let request = attach_request(plan.provider_binding(), "job-1")?;
+        let receipt = receipt_for("A-02", &request, None)?;
+        assert_eq!(
+            attach_plan_job_through_port(&plan, &owner, "job-1", receipt, Some(&Trusted)),
+            Err(SwarmError::InvalidReceipt)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn port_path_requires_verifier_fail_closed() -> TestResult {
+        let plan = admitted_plan()?;
+        let owner = SwarmPlanAttachmentLedger::new();
+        let request = attach_request(plan.provider_binding(), "job-1")?;
+        let receipt = receipt_for(JOB_OWNER, &request, None)?;
+        assert_eq!(
+            attach_plan_job_through_port(&plan, &owner, "job-1", receipt, None),
+            Err(SwarmError::PlanGap(RequiredProvider::ReceiptVerifier))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn port_path_consumes_durable_store_backed_port() -> TestResult {
+        use eliot_coordination::{
+            CasOutcome, SwarmPlanAttachmentDurablePort, SwarmPlanAttachmentOwner,
+            SwarmPlanAttachmentStore, SwarmPlanAttachmentVersion,
+        };
+        use std::sync::Mutex;
+
+        /// Test-only durable store: one mutex-guarded owner image plus a
+        /// version counter. The Governor production store
+        /// (`CanonicalSwarmPlanAttachmentStore`) implements the same trait
+        /// behind the same port, so this proves the consumption shape without
+        /// a Governor implementation dependency.
+        struct TestStore {
+            state: Mutex<(SwarmPlanAttachmentOwner, SwarmPlanAttachmentVersion)>,
+        }
+
+        impl TestStore {
+            fn committed_len(&self) -> Result<usize, &'static str> {
+                let state = self.state.lock().map_err(|_| "poisoned")?;
+                Ok(state.0.len())
+            }
+        }
+
+        impl SwarmPlanAttachmentStore for TestStore {
+            type Error = &'static str;
+
+            fn load(
+                &self,
+            ) -> Result<(SwarmPlanAttachmentOwner, SwarmPlanAttachmentVersion), Self::Error>
+            {
+                let state = self.state.lock().map_err(|_| "poisoned")?;
+                Ok(state.clone())
+            }
+
+            fn compare_and_swap(
+                &self,
+                expected: SwarmPlanAttachmentVersion,
+                replacement: &SwarmPlanAttachmentOwner,
+            ) -> Result<CasOutcome, Self::Error> {
+                let mut state = self.state.lock().map_err(|_| "poisoned")?;
+                if expected != state.1 {
+                    return Ok(CasOutcome::Contended);
+                }
+                state.0 = replacement.clone();
+                state.1 = state.1.next();
+                Ok(CasOutcome::Committed)
+            }
+        }
+
+        let plan = admitted_plan()?;
+        let store = TestStore {
+            state: Mutex::new((
+                SwarmPlanAttachmentOwner::new(),
+                SwarmPlanAttachmentVersion::initial(),
+            )),
+        };
+        let port = SwarmPlanAttachmentDurablePort::new(&store);
+        let first = attached_through_port(&plan, &port, "job-1")?;
+        let same = attached_through_port(&plan, &port, "job-1")?;
+        assert_eq!(first, same);
+        let request = attach_request(plan.provider_binding(), "job-2")?;
+        let receipt = receipt_for(JOB_OWNER, &request, None)?;
+        assert_eq!(
+            attach_plan_job_through_port(&plan, &port, "job-2", receipt, Some(&Trusted)),
+            Err(SwarmError::OwnershipConflict)
+        );
+        assert_eq!(store.committed_len()?, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn rehydrate_replays_identical_attachment_through_port() -> TestResult {
+        // Restart shape: the in-memory attachment is dropped and only the
+        // sealed prior plus the stored Governor receipt survive. Rehydration
+        // re-vends the consumer and re-attaches the expected job through the
+        // same canonical owner, returning the identical value.
+        let plan = admitted_plan()?;
+        let owner = SwarmPlanAttachmentLedger::new();
+        let expected = attached_through_port(&plan, &owner, "job-1")?;
+        let request = attach_request(plan.provider_binding(), "job-1")?;
+        let receipt = receipt_for(JOB_OWNER, &request, None)?;
+        let rebuilt =
+            rehydrate_attachment_through_port(&plan, &owner, &expected, receipt, Some(&Trusted))?;
+        assert_eq!(rebuilt, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn rehydrate_across_restart_reads_canonical_store_not_process_memory() -> TestResult {
+        use eliot_coordination::{
+            CasOutcome, SwarmPlanAttachmentDurablePort, SwarmPlanAttachmentOwner,
+            SwarmPlanAttachmentStore, SwarmPlanAttachmentVersion,
+        };
+        use std::sync::Mutex;
+
+        /// Shared Governor-owned durable image: both ports below commit to
+        /// this one store, so the second port observes the first port's bind
+        /// exactly as a restarted process would.
+        struct TestStore {
+            state: Mutex<(SwarmPlanAttachmentOwner, SwarmPlanAttachmentVersion)>,
+        }
+
+        impl SwarmPlanAttachmentStore for TestStore {
+            type Error = &'static str;
+
+            fn load(
+                &self,
+            ) -> Result<(SwarmPlanAttachmentOwner, SwarmPlanAttachmentVersion), Self::Error>
+            {
+                let state = self.state.lock().map_err(|_| "poisoned")?;
+                Ok(state.clone())
+            }
+
+            fn compare_and_swap(
+                &self,
+                expected: SwarmPlanAttachmentVersion,
+                replacement: &SwarmPlanAttachmentOwner,
+            ) -> Result<CasOutcome, Self::Error> {
+                let mut state = self.state.lock().map_err(|_| "poisoned")?;
+                if expected != state.1 {
+                    return Ok(CasOutcome::Contended);
+                }
+                state.0 = replacement.clone();
+                state.1 = state.1.next();
+                Ok(CasOutcome::Committed)
+            }
+        }
+
+        let plan = admitted_plan()?;
+        let store = TestStore {
+            state: Mutex::new((
+                SwarmPlanAttachmentOwner::new(),
+                SwarmPlanAttachmentVersion::initial(),
+            )),
+        };
+        // First process image binds the plan; the block ends its borrow so
+        // the restarted image below observes only canonical store state.
+        let expected = {
+            let first_port = SwarmPlanAttachmentDurablePort::new(&store);
+            attached_through_port(&plan, &first_port, "job-1")?
+        };
+        // Restarted process image holds no attachment state of its own; the
+        // canonical store is the only source of truth.
+        let second_port = SwarmPlanAttachmentDurablePort::new(&store);
+        let request = attach_request(plan.provider_binding(), "job-1")?;
+        let receipt = receipt_for(JOB_OWNER, &request, None)?;
+        let rebuilt = rehydrate_attachment_through_port(
+            &plan,
+            &second_port,
+            &expected,
+            receipt,
+            Some(&Trusted),
+        )?;
+        assert_eq!(rebuilt, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn rehydrate_conflicts_when_canon_bound_elsewhere() -> TestResult {
+        // The canon already binds this plan key to job-1. Rehydrating an
+        // expectation for job-2 (bound through an independent owner) must
+        // surface the canonical winner, never a second success.
+        let plan = admitted_plan()?;
+        let owner = SwarmPlanAttachmentLedger::new();
+        let _winner = attached_through_port(&plan, &owner, "job-1")?;
+        let foreign = attached(&plan, &SwarmPlanAttachmentLedger::new(), "job-2")?;
+        let receipt = foreign.attachment_receipt().clone();
+        assert_eq!(
+            rehydrate_attachment_through_port(&plan, &owner, &foreign, receipt, Some(&Trusted)),
+            Err(SwarmError::OwnershipConflict)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rehydrate_rejects_revision_or_fence_drift_before_owner_contact() -> TestResult {
+        let plan = admitted_plan()?;
+        let owner = SwarmPlanAttachmentLedger::new();
+        let expected = attached_through_port(&plan, &owner, "job-1")?;
+        let request = attach_request(plan.provider_binding(), "job-1")?;
+        let receipt = receipt_for(JOB_OWNER, &request, None)?;
+
+        // Revision drift: the caller presents a prior sealed against plan-2.
+        let mut revision_drifted = expected.clone();
+        revision_drifted.plan_revision = RevisionId::new("plan-2")?;
+        assert_eq!(
+            rehydrate_attachment_through_port(
+                &plan,
+                &owner,
+                &revision_drifted,
+                receipt.clone(),
+                Some(&Trusted)
+            ),
+            Err(SwarmError::StaleLineage)
+        );
+
+        // Fence drift: same revision, rotated fence the plan never admitted.
+        let mut fence_drifted = expected.clone();
+        fence_drifted.state_fence_digest = "fence-drift".to_owned();
+        assert_eq!(
+            rehydrate_attachment_through_port(
+                &plan,
+                &owner,
+                &fence_drifted,
+                receipt,
+                Some(&Trusted)
+            ),
+            Err(SwarmError::StaleLineage)
+        );
+        // Neither drift attempt touched the canonical binding.
+        assert_eq!(owner.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn rehydrate_refuses_receipt_mismatch_fail_closed() -> TestResult {
+        // The canon echoes the expected job/fence, but the presented receipt
+        // is sealed for a different job handle: rehydration must not seal a
+        // binding the Governor receipt does not pin (artifact mismatch
+        // rejects before binding comparison).
+        let plan = admitted_plan()?;
+        let owner = SwarmPlanAttachmentLedger::new();
+        let expected = attached_through_port(&plan, &owner, "job-1")?;
+        let request = attach_request(plan.provider_binding(), "job-2")?;
+        let receipt = receipt_for(JOB_OWNER, &request, None)?;
+        assert_eq!(
+            rehydrate_attachment_through_port(&plan, &owner, &expected, receipt, Some(&Trusted)),
+            Err(SwarmError::InvalidReceipt)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn drain_all_terminal_is_ready_with_exact_kinds() -> TestResult {
+        use super::super::durable_work::{ChildDisposition, TerminalKind};
+
+        let children = vec![
+            (
+                WorkItemId::new("item-1")?,
+                ChildDisposition::Terminal(TerminalKind::Completed),
+            ),
+            (
+                WorkItemId::new("item-2")?,
+                ChildDisposition::Terminal(TerminalKind::CancelledAfterEffect),
+            ),
+        ];
+        let drain = plan_cancellation_drain(&children, 4)?;
+        assert!(drain.cancel.is_empty());
+        assert!(drain.pending.is_empty());
+        assert!(drain.unknown.is_empty());
+        assert_eq!(drain.terminal.len(), 2);
+        assert!(drain.terminal_ready);
+        Ok(())
+    }
+
+    #[test]
+    fn drain_cancels_running_bounded_and_preserves_unknown() -> TestResult {
+        use super::super::durable_work::{ChildDisposition, TerminalKind};
+
+        let children = vec![
+            (WorkItemId::new("item-1")?, ChildDisposition::Running),
+            (WorkItemId::new("item-2")?, ChildDisposition::Running),
+            (
+                WorkItemId::new("item-3")?,
+                ChildDisposition::Terminal(TerminalKind::Completed),
+            ),
+            (WorkItemId::new("item-4")?, ChildDisposition::UnknownBlocked),
+            (WorkItemId::new("item-5")?, ChildDisposition::Stale),
+        ];
+        // One pass names at most one cancel; the second running child waits.
+        let drain = plan_cancellation_drain(&children, 1)?;
+        assert_eq!(drain.cancel, vec![WorkItemId::new("item-1")?]);
+        assert_eq!(drain.pending, vec![WorkItemId::new("item-2")?]);
+        assert_eq!(
+            drain.unknown,
+            vec![WorkItemId::new("item-4")?, WorkItemId::new("item-5")?]
+        );
+        assert_eq!(drain.terminal.len(), 1);
+        // Outstanding cancels plus unknown descendants block the terminal
+        // aggregate: no false terminal success.
+        assert!(!drain.terminal_ready);
+        // Unknown alone still blocks readiness with no cancel to execute.
+        let unknown_only = plan_cancellation_drain(&children[3..4], 4)?;
+        assert!(unknown_only.cancel.is_empty());
+        assert_eq!(unknown_only.unknown.len(), 1);
+        assert!(!unknown_only.terminal_ready);
+        Ok(())
+    }
+
+    #[test]
+    fn drain_rejects_empty_or_duplicate_denominator() -> TestResult {
+        use super::super::durable_work::ChildDisposition;
+
+        assert_eq!(
+            plan_cancellation_drain(&[], 4),
+            Err(SwarmError::Empty("children"))
+        );
+        let duplicated = vec![
+            (WorkItemId::new("item-1")?, ChildDisposition::Running),
+            (WorkItemId::new("item-1")?, ChildDisposition::Running),
+        ];
+        assert_eq!(
+            plan_cancellation_drain(&duplicated, 4),
+            Err(SwarmError::Duplicate("child_slot"))
         );
         Ok(())
     }
