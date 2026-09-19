@@ -6032,12 +6032,42 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         &self,
         activation: CapabilityGrantActivation,
     ) -> Result<AuthorityActivationReceipt, OrsError> {
+        let input = activation.0;
+        if let Some(existing) = self.load_capability_grant(&input.subject_id)? {
+            if existing.record() == &input && existing.phase() == OperationalPhase::Active {
+                return Ok(AuthorityActivationReceipt::from_receipt(
+                    existing.receipt().clone(),
+                ));
+            }
+            if existing.record() == &input && existing.phase() == OperationalPhase::Applying {
+                return self
+                    .transition_existing_operational(
+                        OperationalKind::CapabilityGrant,
+                        &input.subject_id,
+                        &[OperationalPhase::Applying],
+                        OperationalPhase::Active,
+                        None,
+                    )
+                    .map(AuthorityActivationReceipt::from_receipt);
+            }
+        }
+
+        // `APPLYING` is the durable PendingActivation record. A crash after
+        // this commit leaves an opaque, non-active row that a later exact
+        // presentation can finish; it can never be recovered as live state.
         self.mutate_operational(
             OperationalKind::CapabilityGrant,
-            activation.0,
+            input.clone(),
             false,
             &[OperationalPhase::Fenced, OperationalPhase::Released],
+            OperationalPhase::Applying,
+        )?;
+        self.transition_existing_operational(
+            OperationalKind::CapabilityGrant,
+            &input.subject_id,
+            &[OperationalPhase::Applying],
             OperationalPhase::Active,
+            None,
         )
         .map(AuthorityActivationReceipt::from_receipt)
     }
@@ -6071,7 +6101,10 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             || record.input.subject_id != *subject_id
             || !matches!(
                 record.phase,
-                OperationalPhase::Active | OperationalPhase::Fenced
+                OperationalPhase::Applying
+                    | OperationalPhase::Active
+                    | OperationalPhase::Fenced
+                    | OperationalPhase::Released
             )
         {
             return Err(OrsError::IntegrityProblem {
