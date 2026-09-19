@@ -3418,18 +3418,25 @@ fn appendix_p4_operational_surface_projects_rollover_and_retains_snapshot() -> T
         old.clone(),
         "opaque-revocation",
     )?)?)?;
-    store.activate_capability_grant(CapabilityGrantActivation::new(operational_input(
-        "grant-active-1",
-        "grant-1",
-        old.clone(),
-        "opaque-grant",
-    )?)?)?;
+    let grant_input = operational_input("grant-active-1", "grant-1", old.clone(), "opaque-grant")?;
+    store.activate_capability_grant(CapabilityGrantActivation::new(grant_input.clone())?)?;
+    let grant_subject = label("grant-1")?;
+    let active_grant = store
+        .load_capability_grant(&grant_subject)?
+        .ok_or("active capability grant read-back is missing")?;
+    assert_eq!(active_grant.phase(), OperationalPhase::Active);
+    assert_eq!(active_grant.record(), &grant_input);
+    assert!(active_grant.operation_order() > 0);
     store.revoke_capability_grant(CapabilityGrantRevocation::new(operational_input(
         "grant-revoke-1",
         "grant-1",
         old.clone(),
         "opaque-grant-revoke",
     )?)?)?;
+    let fenced_grant = store
+        .load_capability_grant(&grant_subject)?
+        .ok_or("fenced capability grant read-back is missing")?;
+    assert_eq!(fenced_grant.phase(), OperationalPhase::Fenced);
     store.activate_capability_introduction(CapabilityIntroductionActivation::new(
         operational_input(
             "capability-intro-1",

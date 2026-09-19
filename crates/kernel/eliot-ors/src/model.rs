@@ -1984,6 +1984,55 @@ impl OperationalMutationReceipt {
     }
 }
 
+/// Read-only projection of one capability-grant row in ORS.
+///
+/// The record remains opaque to ORS. The phase, ordering, and store-issued
+/// receipt are operational evidence only; this projection grants no
+/// capability and does not interpret the payload.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CapabilityGrantProjection {
+    record: OperationalRecordInput,
+    phase: OperationalPhase,
+    operation_order: u64,
+    receipt: OperationalMutationReceipt,
+}
+
+impl CapabilityGrantProjection {
+    pub(crate) fn from_store(
+        record: OperationalRecordInput,
+        phase: OperationalPhase,
+        operation_order: u64,
+        receipt: OperationalMutationReceipt,
+    ) -> Self {
+        Self {
+            record,
+            phase,
+            operation_order,
+            receipt,
+        }
+    }
+
+    /// Returns the exact opaque operational input read from ORS.
+    pub const fn record(&self) -> &OperationalRecordInput {
+        &self.record
+    }
+
+    /// Returns the non-semantic ORS lifecycle phase.
+    pub const fn phase(&self) -> OperationalPhase {
+        self.phase
+    }
+
+    /// Returns the monotonic ORS order of this row.
+    pub const fn operation_order(&self) -> u64 {
+        self.operation_order
+    }
+
+    /// Returns the store-issued integrity receipt for this row.
+    pub const fn receipt(&self) -> &OperationalMutationReceipt {
+        &self.receipt
+    }
+}
+
 macro_rules! operational_receipt {
     ($name:ident) => {
         #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
