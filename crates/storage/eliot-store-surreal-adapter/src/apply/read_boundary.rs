@@ -340,7 +340,9 @@ async fn named_read_payload(
         }
         NamedReadOperation::GetEvidencePack => {
             let rows = read_evidence_records(db, &adapter.config).await?;
-            evidence_pack_payload(query, state_fence, &rows).map_err(AdapterError::Store)
+            let suppression = read_erasure_suppression(db, &adapter.config).await?;
+            evidence_pack_payload(query, state_fence, &rows, &suppression)
+                .map_err(AdapterError::Store)
         }
         NamedReadOperation::GetTaskState => {
             let rows = read_authority_records(db, &adapter.config).await?;
@@ -419,6 +421,209 @@ async fn read_epistemic_position(
         return Err(StoreError::InvalidReceipt.into());
     }
     to_value(&commit.readback(&row.body)?)
+}
+
+/// One sealed erasure-intent row: the exact `(operation_id, subject,
+/// scope_id)` triple named by a recorded intent (see the
+/// `TX_ERASURE_INTENT` binding shape in `atomic_write`, owned there — never
+/// re-declared here).
+#[derive(Clone, Debug, Deserialize)]
+struct ErasureIntentRow {
+    operation_id: String,
+    subject: String,
+    scope_id: String,
+}
+
+/// One sealed erasure-outcome row: the exact per-surface outcome strings
+/// bound by the atomic writer (`PURGED:<Surface>`, `INCOMPLETE:<Surface>`,
+/// `UNKNOWN:<Surface>`, `NOT_ATTEMPTED:<Surface>`), keyed by the same
+/// `operation_id` as the intent row above.
+#[derive(Clone, Debug, Deserialize)]
+struct ErasureOutcomeRow {
+    operation_id: String,
+    outcomes: Vec<String>,
+}
+
+/// Evidence-backed erased `(scope_id, subject)` pairs for `GetEvidencePack`.
+///
+/// `Known` carries the sealed suppression set. `Unknown` means the lookup is
+/// unavailable or unparsable; the pack returns an exact empty payload so an
+/// undecidable lookup never serves rows that could include erased records.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ErasureSuppression {
+    Known(std::collections::BTreeSet<(String, String)>),
+    Unknown,
+}
+
+impl ErasureSuppression {
+    /// Returns the fail-closed suppression verdict for one exact pair.
+    ///
+    /// `Unknown` suppresses the whole pack: an undecidable lookup must never
+    /// admit a possibly-erased row, and it must not turn a read into a
+    /// provider-availability error.
+    fn check(&self, scope_id: &str, subject: &str) -> bool {
+        match self {
+            Self::Known(erased) => erased.contains(&(scope_id.to_owned(), subject.to_owned())),
+            Self::Unknown => true,
+        }
+    }
+}
+
+/// Collects the evidence-backed suppressed `(scope_id, subject)` pairs.
+///
+/// One pair suppresses only when its sealed intent row names a non-blank
+/// scope and subject and a `PURGED` store-owned surface (`CanonicalPayload`,
+/// `Projection`, `Index`) seals the outcome for the same `operation_id`.
+/// `Unknown`/`Incomplete`/`NotAttempted` outcomes, foreign surfaces, and
+/// malformed rows never suppress — exactly the reference handler's rule that
+/// suppression requires a recorded intent plus dispatched store-owned
+/// removal.
+fn suppressed_pairs(
+    intents: &[ErasureIntentRow],
+    outcomes: &[ErasureOutcomeRow],
+) -> std::collections::BTreeSet<(String, String)> {
+    let mut purged_by_operation = std::collections::BTreeSet::new();
+    for outcome in outcomes {
+        if outcome.outcomes.iter().any(|cell| {
+            cell.split_once(':').is_some_and(|(state, surface)| {
+                state == "PURGED"
+                    && matches!(surface, "CanonicalPayload" | "Projection" | "Index")
+            })
+        }) {
+            purged_by_operation.insert(outcome.operation_id.clone());
+        }
+    }
+    let mut suppressed = std::collections::BTreeSet::new();
+    for intent in intents {
+        if !purged_by_operation.contains(&intent.operation_id) {
+            continue;
+        }
+        if intent.scope_id.trim().is_empty()
+            || intent.scope_id.chars().any(char::is_control)
+            || intent.subject.trim().is_empty()
+            || intent.subject.chars().any(char::is_control)
+        {
+            continue;
+        }
+        suppressed.insert((intent.scope_id.clone(), intent.subject.clone()));
+    }
+    suppressed
+}
+
+/// Closed erasure-intent read: one `(operation_id, subject, scope_id)` row
+/// per recorded intent (see the `TX_ERASURE_INTENT` binding shape in
+/// `atomic_write`, owned there — never re-declared here). Defined here (not
+/// in `schema.rs`) because only the `GetEvidencePack` read boundary consumes
+/// it on this slice.
+const READ_ERASURE_INTENTS: &str =
+    "SELECT VALUE { operation_id: operation_id, subject: subject, scope_id: scope_id } FROM erasure_intent;";
+
+/// Closed erasure-outcome read: one `(operation_id, outcomes)` row per sealed
+/// outcome (see `READ_ERASURE_OUTCOME` in `atomic_write`, owned there).
+/// Joined in Rust by exact `operation_id` — never by caller scope.
+const READ_ALL_ERASURE_OUTCOMES: &str =
+    "SELECT VALUE { operation_id: operation_id, outcomes: outcomes } FROM erasure_outcome;";
+
+/// One side of the sealed erasure join: the observed state of one
+/// never-vs-defined erasure table.
+enum ErasureTable<T> {
+    /// The table is defined; carries its decoded sealed rows.
+    Rows(Vec<T>),
+    /// The table was never defined on this pre-erasure store: the exact
+    /// absent-table signal, an empty side of the join.
+    Absent,
+    /// Any other provider error or malformed envelope: the pack must refuse
+    /// fail-closed.
+    Unknown,
+}
+
+/// Reads one sealed erasure table through its closed single-statement SELECT,
+/// never inside `BEGIN TRANSACTION`: a missing table aborts the whole
+/// transaction, so the absent-table signal is only observable outside one.
+/// Live provider observation for the transactional form was
+/// `"The table 'erasure_intent' does not exist"` plus
+/// `"The query was not executed due to a cancelled transaction"` and
+/// `"Cannot COMMIT: the transaction was aborted due to a prior error"` for
+/// the cancelled remainder — which the old `all(is_absent_table)` check
+/// (correctly, but fatally) refused to call absent.
+///
+/// Only the exact absent-table signal naming `table` maps to `Absent`;
+/// every other error class — including those transaction-cancellation
+/// artifacts — maps to `Unknown` so the pack returns an exact empty payload
+/// instead of silently including erased records. Transport and other query
+/// failures likewise map to `Unknown` on this optional suppression lookup;
+/// they must not surface as `StoreError::Unavailable` from the pack read.
+async fn read_erasure_table<T: serde::de::DeserializeOwned>(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    operation: &'static str,
+    sql: &str,
+    table: &str,
+) -> Result<ErasureTable<T>, AdapterError> {
+    let Ok(mut response) = client::query(db, config, operation, sql, Map::new()).await else {
+        return Ok(ErasureTable::Unknown);
+    };
+    let errors = response.take_errors();
+    if !errors.is_empty() {
+        if errors
+            .iter()
+            .all(|error| client::is_absent_table(error) && error.contains(table))
+        {
+            return Ok(ErasureTable::Absent);
+        }
+        return Ok(ErasureTable::Unknown);
+    }
+    match response.take::<Vec<T>>(0) {
+        Ok(rows) => Ok(ErasureTable::Rows(rows)),
+        Err(_) => Ok(ErasureTable::Unknown),
+    }
+}
+
+/// Reads the sealed erasure-suppression set for `GetEvidencePack`.
+///
+/// Sealed intent rows plus their sealed outcome rows, each through its own
+/// closed non-transactional SELECT and joined in Rust by exact
+/// `operation_id`. Only pairs with a `PURGED` store-owned surface outcome
+/// suppress — the reference handler's evidence-backed `erased_subjects`
+/// rule. Never-defined erasure tables on a pre-erasure store observe the
+/// exact absent-table signal and read as the empty side of the join,
+/// matching the reference handler's empty suppression on a fresh store.
+/// Any other provider error or malformed envelope returns `Unknown` so the
+/// pack read returns exact empty fail-closed instead of silently including
+/// erased records.
+async fn read_erasure_suppression(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+) -> Result<ErasureSuppression, AdapterError> {
+    let intents = match read_erasure_table::<ErasureIntentRow>(
+        db,
+        config,
+        "read.erasure_suppression_intents",
+        READ_ERASURE_INTENTS,
+        "erasure_intent",
+    )
+    .await?
+    {
+        ErasureTable::Rows(intents) => intents,
+        ErasureTable::Absent => Vec::new(),
+        ErasureTable::Unknown => return Ok(ErasureSuppression::Unknown),
+    };
+    let outcomes = match read_erasure_table::<ErasureOutcomeRow>(
+        db,
+        config,
+        "read.erasure_suppression_outcomes",
+        READ_ALL_ERASURE_OUTCOMES,
+        "erasure_outcome",
+    )
+    .await?
+    {
+        ErasureTable::Rows(outcomes) => outcomes,
+        ErasureTable::Absent => Vec::new(),
+        ErasureTable::Unknown => return Ok(ErasureSuppression::Unknown),
+    };
+    Ok(ErasureSuppression::Known(
+        suppressed_pairs(&intents, &outcomes),
+    ))
 }
 
 /// Reads all persisted capture-evidence rows through the closed SELECT.
@@ -541,10 +746,22 @@ fn validate_evidence_record(
 /// `named_operations` vector does. Pre-change receipts (no evidence array)
 /// contribute zero to the walk and serve nothing; on a fresh store the walk
 /// starts at zero and matches the reference exactly.
+///
+/// 688-STORE-2: an evidence-backed erased `(scope_id, subject)` pair
+/// suppresses its records — the pack returns exact empty with
+/// `matched_total = 0` — even if rows remain in the log. `Unknown` lookup
+/// state returns the same exact empty payload fail-closed instead of
+/// surfacing `StoreError::Unavailable` or serving rows that may include
+/// erased records.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the pack payload validates shape, bound, suppression, fence, walk, and provenance in one closed unit"
+)]
 fn evidence_pack_payload(
     query: &NamedReadRequest,
     state_fence: &StateFence,
     rows: &[EvidenceReceiptRow],
+    suppression: &ErasureSuppression,
 ) -> Result<Value, StoreError> {
     let scope_id = query.scope_id.clone().ok_or(StoreError::InvalidField {
         field: "scope_id",
@@ -592,7 +809,25 @@ fn evidence_pack_payload(
     if query.state_fence != *state_fence {
         return Err(StoreError::FenceMismatch);
     }
-
+    // Evidence-backed suppression (688-STORE-2, memory parity): a sealed
+    // erased pair returns exact empty even when capture rows remain.
+    // `Unknown` lookup state takes the same fail-closed empty path, so the
+    // pack never silently includes erased records or emits Unavailable.
+    if suppression.check(scope_id.as_str(), subject) {
+        return Ok(json!({
+            "version": EVIDENCE_PACK_PAYLOAD_VERSION,
+            "subject": subject,
+            "scope_id": scope_id,
+            "records": Vec::<Value>::new(),
+            "provenance": {
+                "state_fence": state_fence,
+                "matched_total": 0,
+                "returned": 0,
+                "max_records": max_records,
+                "truncated": false,
+            },
+        }));
+    }
     // Durable capture order: receipts by commit_sequence (pre-change rows
     // without a sequence sort first and contribute zero), evidence within a
     // receipt by operation_index.
@@ -1491,22 +1726,28 @@ mod admitted_read_tests {
     fn evidence_pack_requires_receipt_scope_and_current_read_fence() {
         let fence = test_fence();
         let query = evidence_query("shared-subject", "1");
+        let no_suppression = ErasureSuppression::Known(std::collections::BTreeSet::new());
         let row = evidence_row_for("scope-provenance", "shared-subject", 1);
         let mut wrong_scope_query = query.clone();
         wrong_scope_query.scope_id = Some(ScopeId::new("other").expect("scope"));
-        let absent = evidence_pack_payload(&wrong_scope_query, &fence, std::slice::from_ref(&row))
-            .expect("empty");
+        let absent = evidence_pack_payload(
+            &wrong_scope_query,
+            &fence,
+            std::slice::from_ref(&row),
+            &no_suppression,
+        )
+        .expect("empty");
         assert_eq!(absent["provenance"]["matched_total"], json!(0));
         let mut no_receipt = row.clone();
         no_receipt.receipt = None;
         assert_eq!(
-            evidence_pack_payload(&query, &fence, &[no_receipt]),
+            evidence_pack_payload(&query, &fence, &[no_receipt], &no_suppression),
             Err(StoreError::InvalidReceipt)
         );
         let mut no_envelope = row.clone();
         no_envelope.receipt.as_mut().expect("receipt").envelope = None;
         assert_eq!(
-            evidence_pack_payload(&query, &fence, &[no_envelope]),
+            evidence_pack_payload(&query, &fence, &[no_envelope], &no_suppression),
             Err(StoreError::MissingReceiptEnvelope)
         );
         let mut other_fence = fence.clone();
@@ -1514,9 +1755,13 @@ mod admitted_read_tests {
             eliot_contracts::ResourceGeneration::new(2).expect("generation");
         let mut newer_query = query.clone();
         newer_query.state_fence = other_fence.clone();
-        let historical =
-            evidence_pack_payload(&newer_query, &other_fence, std::slice::from_ref(&row))
-                .expect("historical captures remain visible under a current read fence");
+        let historical = evidence_pack_payload(
+            &newer_query,
+            &other_fence,
+            std::slice::from_ref(&row),
+            &no_suppression,
+        )
+        .expect("historical captures remain visible under a current read fence");
         assert_eq!(historical["provenance"]["matched_total"], json!(1));
         assert_eq!(historical["provenance"]["state_fence"], json!(other_fence));
         assert_eq!(
@@ -1524,10 +1769,16 @@ mod admitted_read_tests {
             json!("shared-subject")
         );
         assert_eq!(
-            evidence_pack_payload(&query, &other_fence, &[row]),
+            evidence_pack_payload(&query, &other_fence, &[row], &no_suppression),
             Err(StoreError::FenceMismatch),
             "a historical record cannot authorize a stale read request",
         );
+    }
+
+    /// Builds the empty sealed suppression set shared by the pre-erasure pack
+    /// tests below: no sealed erasure rows, so no pair suppresses.
+    fn empty_suppression() -> ErasureSuppression {
+        ErasureSuppression::Known(std::collections::BTreeSet::new())
     }
 
     pub(super) fn evidence_query(subject: &str, max_records: &str) -> NamedReadRequest {
@@ -1550,7 +1801,9 @@ mod admitted_read_tests {
             validate_named_against_active_catalogue(&query).is_ok(),
             "activated pack passes the gate"
         );
-        let payload = evidence_pack_payload(&query, &fence, &rows).expect("pack builds");
+        let payload =
+            evidence_pack_payload(&query, &fence, &rows, &empty_suppression())
+                .expect("pack builds");
         assert_eq!(
             payload.get("version").and_then(Value::as_u64),
             Some(u64::from(EVIDENCE_PACK_PAYLOAD_VERSION))
@@ -1607,7 +1860,9 @@ mod admitted_read_tests {
         let fence = test_fence();
         let rows = vec![evidence_row_for("op-evidence-2", "evidence-alpha", 1)];
         let query = evidence_query("evidence-missing", "10");
-        let payload = evidence_pack_payload(&query, &fence, &rows).expect("empty pack builds");
+        let payload =
+            evidence_pack_payload(&query, &fence, &rows, &empty_suppression())
+                .expect("empty pack builds");
         let records = payload
             .get("records")
             .and_then(Value::as_array)
@@ -1667,14 +1922,14 @@ mod admitted_read_tests {
         ] {
             let query = evidence_query("evidence-alpha", &bound);
             assert_eq!(
-                evidence_pack_payload(&query, &fence, &rows),
+                evidence_pack_payload(&query, &fence, &rows, &empty_suppression()),
                 Err(StoreError::PayloadTooLarge),
                 "bound {bound} exceeds the declared maximum"
             );
         }
         let query = evidence_query("evidence-alpha", &format!("{EVIDENCE_PACK_MAX_RECORDS}"));
         assert!(
-            evidence_pack_payload(&query, &fence, &rows).is_ok(),
+            evidence_pack_payload(&query, &fence, &rows, &empty_suppression()).is_ok(),
             "the exact maximum stays admissible"
         );
     }
@@ -1687,7 +1942,9 @@ mod admitted_read_tests {
         // successful view of a neighbouring subject.
         for selector in ["observation", "observation-1-extra", "OBSERVATION-1"] {
             let query = evidence_query(selector, "10");
-            let payload = evidence_pack_payload(&query, &fence, &rows).expect("non-match builds");
+            let payload =
+                evidence_pack_payload(&query, &fence, &rows, &empty_suppression())
+                    .expect("non-match builds");
             assert!(
                 payload
                     .get("records")
@@ -1697,7 +1954,8 @@ mod admitted_read_tests {
             );
         }
         let query = evidence_query("observation-1", "10");
-        let payload = evidence_pack_payload(&query, &fence, &rows).expect("exact builds");
+        let payload =
+            evidence_pack_payload(&query, &fence, &rows, &empty_suppression()).expect("exact builds");
         assert_eq!(
             payload
                 .get("records")
@@ -1716,7 +1974,9 @@ mod admitted_read_tests {
             evidence_row_for("op-bulk-3", "evidence-bulk", 3),
         ];
         let query = evidence_query("evidence-bulk", "2");
-        let payload = evidence_pack_payload(&query, &fence, &rows).expect("bounded pack builds");
+        let payload =
+            evidence_pack_payload(&query, &fence, &rows, &empty_suppression())
+                .expect("bounded pack builds");
         let records = payload
             .get("records")
             .and_then(Value::as_array)
@@ -1744,7 +2004,9 @@ mod admitted_read_tests {
             Some(true)
         );
         let query = evidence_query("evidence-bulk", "3");
-        let payload = evidence_pack_payload(&query, &fence, &rows).expect("full pack builds");
+        let payload =
+            evidence_pack_payload(&query, &fence, &rows, &empty_suppression())
+                .expect("full pack builds");
         assert_eq!(
             payload
                 .get("provenance")
@@ -1769,7 +2031,7 @@ mod admitted_read_tests {
             ]),
         );
         assert!(matches!(
-            evidence_pack_payload(&query, &fence, &rows),
+            evidence_pack_payload(&query, &fence, &rows, &empty_suppression()),
             Err(StoreError::InvalidField {
                 field: "scope_id",
                 ..
@@ -1782,7 +2044,7 @@ mod admitted_read_tests {
             BTreeMap::from([("max_records".to_owned(), json!("10"))]),
         );
         assert!(matches!(
-            evidence_pack_payload(&query, &fence, &rows),
+            evidence_pack_payload(&query, &fence, &rows, &empty_suppression()),
             Err(StoreError::InvalidField { .. })
         ));
         // Zero and non-decimal bounds fail the bound shape.
@@ -1790,12 +2052,98 @@ mod admitted_read_tests {
             let query = evidence_query("evidence-alpha", bound);
             assert!(
                 matches!(
-                    evidence_pack_payload(&query, &fence, &rows),
+                    evidence_pack_payload(&query, &fence, &rows, &empty_suppression()),
                     Err(StoreError::InvalidField { .. })
                 ),
                 "bound {bound} must fail closed"
             );
         }
+    }
+
+    #[test]
+    fn evidence_pack_excludes_sealed_erased_subject_scope_pair() {
+        // 688-STORE-2: sealed intent + sealed `PURGED` store-owned outcome
+        // suppress the exact pair (memory `erased_subjects` parity), even
+        // though the capture row remains. A neighbouring subject in the same
+        // scope still reads — suppression is exact-pair, never whole-scope.
+        let fence = test_fence();
+        let rows = vec![
+            evidence_row_for("op-erased-1", "evidence-erased", 1),
+            evidence_row_for("op-kept-1", "evidence-kept", 2),
+        ];
+        let intents = vec![ErasureIntentRow {
+            operation_id: "erasure-op-1".to_owned(),
+            subject: "evidence-erased".to_owned(),
+            scope_id: "scope-1".to_owned(),
+        }];
+        let outcomes = vec![ErasureOutcomeRow {
+            operation_id: "erasure-op-1".to_owned(),
+            outcomes: vec!["PURGED:CanonicalPayload".to_owned()],
+        }];
+        let suppression = ErasureSuppression::Known(suppressed_pairs(&intents, &outcomes));
+        let erased = evidence_pack_payload(
+            &evidence_query("evidence-erased", "10"),
+            &fence,
+            &rows,
+            &suppression,
+        )
+        .expect("erased pack builds exact empty");
+        assert!(
+            erased
+                .get("records")
+                .and_then(Value::as_array)
+                .is_some_and(Vec::is_empty),
+            "sealed erased pair serves no records"
+        );
+        assert_eq!(erased["provenance"]["matched_total"], json!(0));
+        assert_eq!(erased["provenance"]["returned"], json!(0));
+        assert_eq!(erased["provenance"]["truncated"], json!(false));
+        let kept = evidence_pack_payload(
+            &evidence_query("evidence-kept", "10"),
+            &fence,
+            &rows,
+            &suppression,
+        )
+        .expect("neighbouring subject still reads");
+        assert_eq!(
+            kept.get("records")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
+        // An `UNKNOWN`-only outcome never suppresses: the row stays visible
+        // and the pack still serves it (reconciliation owns the ambiguity,
+        // never silent hiding).
+        let unknown_outcomes = vec![ErasureOutcomeRow {
+            operation_id: "erasure-op-1".to_owned(),
+            outcomes: vec!["UNKNOWN:CanonicalPayload".to_owned()],
+        }];
+        let unknown_suppression =
+            ErasureSuppression::Known(suppressed_pairs(&intents, &unknown_outcomes));
+        let visible = evidence_pack_payload(
+            &evidence_query("evidence-erased", "10"),
+            &fence,
+            &rows,
+            &unknown_suppression,
+        )
+        .expect("unknown outcome keeps the row visible");
+        assert_eq!(visible["provenance"]["matched_total"], json!(1));
+    }
+
+    #[test]
+    fn evidence_pack_returns_empty_fail_closed_when_erasure_lookup_is_unknown() {
+        // 688-STORE-2: an unavailable/unparsable erasure-outcome lookup
+        // returns an exact empty pack instead of surfacing `Unavailable` or
+        // silently including records that may have been erased.
+        let fence = test_fence();
+        let rows = vec![evidence_row_for("op-unknown-1", "evidence-alpha", 1)];
+        let query = evidence_query("evidence-alpha", "10");
+        let payload = evidence_pack_payload(&query, &fence, &rows, &ErasureSuppression::Unknown)
+            .expect("unknown suppression state returns a closed empty pack");
+        assert!(payload["records"].as_array().is_some_and(Vec::is_empty));
+        assert_eq!(payload["provenance"]["matched_total"], json!(0));
+        assert_eq!(payload["provenance"]["returned"], json!(0));
+        assert_eq!(payload["provenance"]["truncated"], json!(false));
     }
 
     // --- T11.3 cognitive reads (real plan outputs, no canned rows) ---
