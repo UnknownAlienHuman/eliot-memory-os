@@ -1,12 +1,13 @@
-//! Work-unit 610 slices 1-8: bounded discriminative probe planner, cases
-//! 1..10 plus 610/17, 610/21, 610/32, 610/36, 610/18-19, 610/26, 610/28 and
-//! 610/30-31 (typed affordance Unknown/Unavailable gating, safe read-only
-//! candidate-only admission, explicit lexicographic order with stable
-//! tie-break, input-order-independent plan/digest stability, no
-//! shell/Value/SDK payload, no live route/credential/lease handle, unknown
-//! cost/capacity never reading as zero, exact-equivalent merge with retained
-//! lineage, cheaper-but-riskier trade-off retention with no scalar-averaged
-//! risk).
+//! Work-unit 610 slices 1-9: bounded discriminative probe planner, cases
+//! 1..10 plus 610/17, 610/21, 610/32, 610/36, 610/18-19, 610/26, 610/28,
+//! 610/30-31 and 610/34-35 (observed-result/evidence/resolution injection
+//! rejection, replay stability with changed input/policy conflict; typed
+//! affordance Unknown/Unavailable gating, safe read-only candidate-only
+//! admission, explicit lexicographic order with stable tie-break,
+//! input-order-independent plan/digest stability, no shell/Value/SDK payload,
+//! no live route/credential/lease handle, unknown cost/capacity never reading
+//! as zero, exact-equivalent merge with retained lineage, cheaper-but-riskier
+//! trade-off retention with no scalar-averaged risk).
 //!
 //! Cases 610/1, 610/4 and 610/5 are marked on the existing planner
 //! behaviour tests in `tests/probe_plan.rs`. Cases 610/11..16, 610/38
@@ -17,8 +18,8 @@
 //! contains zero `ResultUpdate`/`RivalUpdateMeaning` inspections, so no
 //! planner-only implementation exists without inventing APIs (slice-4 Opus
 //! audit ruling on 610/11 applies identically). Cases 610/22,
-//! 610/27, 610/34-35, 610/37, 610/41-42 (effect-policy,
-//! budget/disposition/replay/no-execution) are QUEUED and out of
+//! 610/27, 610/37, 610/41-42 (effect-policy,
+//! budget/malformed/identity/no-execution) are QUEUED and out of
 //! this batch; 610/20 needs `src/` owner preservation, 610/23-25,29 need policy,
 //! or budget enforcement the planner explicitly declines (`plan.rs`: effect,
 //! privacy, reversibility and non-candidate budgets stay advisory).
@@ -92,7 +93,18 @@
 //! overlaps need-src 610/25 (the planner enforces only the `candidates`
 //! bound; every other budget stays advisory per `plan.rs`), so no test-only
 //! proof is claimed here.
-//! Docs route=sha256:85f37ee369e03cd596b78cd1df66f54251977516efbed6d25bfbabbd3f35ca72 read=sha256:e09e5c56aeb2eac5eb65e09f877c726c83e19799f6801c91dcb021062033b46f bundle=1a37628b59897cfa21ebec2555cf05b7e45ae3be332293ec64f85b98ef4471af (generic-source; verified bundle read in full; plan.rs/model.rs plus contracts affordance/result/objective/budget sources read directly).
+//! Ownership ruling 610/34-35 (this slice, planner-side integrity only;
+//! no new APIs, zero `src/` changes): 610/34 OWNED via the existing
+//! declaration-only result path (every branch value stays one of the six
+//! `PossibleResultValue` declaration variants, never an acquired observation;
+//! the canonical wire carries no observed/acquired/grade/resolution keys, and
+//! any injected branch rewrite fails the frozen plan digest); 610/35 OWNED
+//! via the existing frozen digest (`compute_digest`/`validate` bind plan id,
+//! task, scope, fence, draft/rival/affordance/manifest digests and both
+//! tables, so identical replay is stable while any changed input or policy
+//! conflicts by digest and any replayed foreign/tampered digest fails
+//! closed).
+//! Docs route=sha256:f8c3f60af1d322675f95502a9658c2698b1bf3d428bbeeb69f248e9383713253 read=sha256:9d604d711c0b532312008db83874ef555f0adc633ac6e90e33f04aa5f3bd3359 bundle=fa26e0c3e33827f6d942694109535a72f7607056b2dbc5503e67df9c56ab1ee4 (generic-source; verified bundle read in full; plan.rs/model.rs plus contracts affordance/result/objective/budget sources read directly).
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
@@ -1549,4 +1561,156 @@ fn no_scalar_averaged_risk() {
         );
     }
     assert_eq!(must(plan.compute_digest()), plan.digest);
+}
+
+// WORK_UNIT_CASE: 610/34
+#[test]
+fn observed_result_evidence_resolution_injection_is_rejected() {
+    let plan = plan_for(
+        vec![
+            descriptor(
+                "aff-inject-a",
+                rival_target("pred-inj-left", "pred-inj-right"),
+            ),
+            descriptor("aff-inject-b", gap_target("claim-inject")),
+        ],
+        Some(16),
+    );
+    must(plan.validate());
+    assert_eq!(plan.probes.len(), 2);
+    assert!(plan.omissions.is_empty());
+
+    for probe in &plan.probes {
+        must(probe.target.validate());
+        must(probe.result_schema.validate());
+        must(probe.dimensions.validate());
+        assert_eq!(probe.probe_id, probe.affordance.affordance_id);
+        assert!(!probe.result_schema.branches.is_empty());
+        for branch in &probe.result_schema.branches {
+            match &branch.value {
+                PossibleResultValue::Unknown { reason }
+                | PossibleResultValue::Unavailable { reason }
+                | PossibleResultValue::InstrumentationFailure { reason } => {
+                    assert!(!reason.trim().is_empty());
+                }
+                PossibleResultValue::Observable { .. }
+                | PossibleResultValue::Coverage { .. }
+                | PossibleResultValue::Verifier { .. } => {
+                    must(branch.value.validate());
+                }
+            }
+            assert!(
+                !branch.updates.is_empty(),
+                "every possible-result branch must carry its update matrix, never a resolution"
+            );
+        }
+    }
+
+    let wire = must(canonical_bytes(&plan));
+    let text = String::from_utf8(wire).expect("canonical plan wire must be UTF-8");
+    let folded = text.to_lowercase();
+    for key in [
+        "\"observed_result\"",
+        "\"observed\"",
+        "\"acquired\"",
+        "\"evidence_grade\"",
+        "\"resolved\"",
+        "\"resolution\"",
+    ] {
+        assert!(
+            !folded.contains(key),
+            "canonical plan wire must carry no injected {key} evidence key"
+        );
+    }
+
+    let mut tampered = plan.clone();
+    let branch = &mut tampered.probes[0].result_schema.branches[0];
+    branch.value = PossibleResultValue::Unknown {
+        reason: "injected observed outcome".to_owned(),
+    };
+    if let Ok(redigest) = tampered.compute_digest() {
+        assert_ne!(
+            redigest, plan.digest,
+            "an injected observed-result rewrite must not preserve the frozen plan digest"
+        );
+    }
+    assert!(
+        tampered.validate().is_err(),
+        "an injected observed-result rewrite must fail the frozen plan digest"
+    );
+    assert_eq!(must(plan.compute_digest()), plan.digest);
+}
+
+// WORK_UNIT_CASE: 610/35
+#[test]
+fn replay_and_changed_input_policy_conflict() {
+    let base = plan_for(
+        vec![
+            descriptor("aff-replay-a", gap_target("claim-replay-a")),
+            descriptor("aff-replay-b", gap_target("claim-replay-b")),
+        ],
+        Some(16),
+    );
+    must(base.validate());
+    assert_eq!(base.probes.len(), 2);
+    assert!(base.omissions.is_empty());
+
+    let replay = plan_for(
+        vec![
+            descriptor("aff-replay-a", gap_target("claim-replay-a")),
+            descriptor("aff-replay-b", gap_target("claim-replay-b")),
+        ],
+        Some(16),
+    );
+    must(replay.validate());
+    assert_eq!(base, replay);
+    assert_eq!(base.digest, replay.digest);
+    assert_eq!(must(replay.compute_digest()), base.digest);
+
+    let tight = plan_for(
+        vec![
+            descriptor("aff-replay-a", gap_target("claim-replay-a")),
+            descriptor("aff-replay-b", gap_target("claim-replay-b")),
+        ],
+        Some(1),
+    );
+    must(tight.validate());
+    assert_eq!(tight.probes.len(), 1);
+    assert_eq!(tight.omissions.len(), 1);
+    assert_eq!(tight.omissions[0].kind, OmissionKind::OverBudget);
+    assert_ne!(tight.digest, base.digest);
+    assert_ne!(tight, base);
+
+    let altered = plan_for(
+        vec![
+            descriptor("aff-replay-a", gap_target("claim-replay-a")),
+            descriptor("aff-replay-c", gap_target("claim-replay-c")),
+        ],
+        Some(16),
+    );
+    must(altered.validate());
+    assert_ne!(altered.digest, base.digest);
+    assert_ne!(altered, base);
+
+    let mut foreign = base.clone();
+    foreign.digest.clone_from(&tight.digest);
+    assert!(
+        foreign.validate().is_err(),
+        "replaying a foreign policy digest against unchanged tables must fail closed"
+    );
+
+    let mut reranked = base.clone();
+    reranked.probes[0].rank = reranked.probes[0].rank.saturating_add(1);
+    assert!(
+        reranked.validate().is_err(),
+        "a tampered replay with a rewritten rank must fail closed"
+    );
+
+    let mut blanked = base.clone();
+    blanked.digest = "0".repeat(64);
+    assert!(
+        blanked.validate().is_err(),
+        "a replay with a blanked digest must fail closed"
+    );
+    assert_eq!(must(base.compute_digest()), base.digest);
 }
