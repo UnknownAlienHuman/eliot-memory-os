@@ -312,56 +312,132 @@ fn overlapping_scopes_consistently_ordered() {
         .find(|c| c["case"].as_u64() == Some(4))
         .expect("case 4");
     assert_eq!(case["suite"].as_str().expect("suite"), "reference");
+    let scopes: Vec<&str> = case["scopes"]
+        .as_array()
+        .expect("scopes")
+        .iter()
+        .map(|scope| scope.as_str().expect("scope"))
+        .collect();
+    assert_eq!(scopes, vec!["scope-994-a", "scope-994-b"]);
+    let operations: Vec<&str> = case["operations"]
+        .as_array()
+        .expect("operations")
+        .iter()
+        .map(|operation| operation.as_str().expect("operation"))
+        .collect();
+    assert_eq!(operations, vec!["op-994-seq-1", "op-994-seq-2"]);
     let (store, manifest) = reference_store();
     let fence = fence();
-    let (ctx1, first) = admitted(
+    // Corpus-faithful overlap: both transitions declare the overlapping
+    // ordering-scope set, each applied on its own corpus scope.
+    let overlap = ["scope-994-a", "scope-994-b"];
+    let ctx1 = ctx_for("op-994-seq-1", &fence);
+    let first = build_transition(
         "op-994-seq-1",
         "scope-994-a",
+        &overlap,
         "subject-994-04-1",
         &fence,
+        &ctx1,
         &manifest,
+        &[],
+        &[],
     );
     let receipt1 = store
         .apply_transaction(&ctx1, first.clone(), &[], &[])
         .expect("first commits");
     validate_store_receipt_envelope(&ctx1, &first, &receipt1).expect("envelope");
-    let (ctx2, second) = admitted(
+    let ctx2 = ctx_for("op-994-seq-2", &fence);
+    let second = build_transition(
         "op-994-seq-2",
-        "scope-994-a",
+        "scope-994-b",
+        &overlap,
         "subject-994-04-2",
         &fence,
+        &ctx2,
         &manifest,
+        &[],
+        &[],
     );
     let receipt2 = store
         .apply_transaction(&ctx2, second.clone(), &[], &[])
         .expect("second commits");
     validate_store_receipt_envelope(&ctx2, &second, &receipt2).expect("envelope");
-    // Ordering fields are preserved on both receipts, never erased.
-    assert_eq!(receipt1.ordering_sequences.len(), 1);
-    assert_eq!(receipt2.ordering_sequences.len(), 1);
-    assert_eq!(receipt1.ordering_sequences[0].scope.as_str(), "scope-994-a");
-    assert!(receipt2.ordering_sequences[0].sequence > receipt1.ordering_sequences[0].sequence);
+    // Both receipts carry both ordering heads in canonical order, never erased.
+    let heads1: Vec<&str> = receipt1
+        .ordering_sequences
+        .iter()
+        .map(|head| head.scope.as_str())
+        .collect();
+    assert_eq!(heads1, vec!["scope-994-a", "scope-994-b"]);
+    let heads2: Vec<&str> = receipt2
+        .ordering_sequences
+        .iter()
+        .map(|head| head.scope.as_str())
+        .collect();
+    assert_eq!(heads2, vec!["scope-994-a", "scope-994-b"]);
+    // One consistent precedence: the second arrival follows the first on
+    // every overlapping scope.
+    for scope in overlap {
+        let first_sequence = receipt1
+            .ordering_sequences
+            .iter()
+            .find(|head| head.scope.as_str() == scope)
+            .expect("scope in first receipt")
+            .sequence;
+        let second_sequence = receipt2
+            .ordering_sequences
+            .iter()
+            .find(|head| head.scope.as_str() == scope)
+            .expect("scope in second receipt")
+            .sequence;
+        assert!(
+            second_sequence > first_sequence,
+            "consistent precedence on {scope}"
+        );
+    }
     assert_eq!(receipt1.revision_before_after.len(), 1);
     assert_eq!(receipt2.revision_before_after.len(), 1);
-    assert!(receipt2.revision_before_after[0].after > receipt1.revision_before_after[0].after);
+    // Each receipt advances its own primary-scope revision key 1 -> 2; the
+    // keys differ, so cross-receipt ordering is proved on ordering heads.
+    assert_eq!(
+        receipt1.revision_before_after[0].key.as_str(),
+        "scope:scope-994-a"
+    );
+    assert_eq!(
+        receipt2.revision_before_after[0].key.as_str(),
+        "scope:scope-994-b"
+    );
     let snapshot = store.snapshot().expect("snapshot");
     assert!(ordering_of(&snapshot, "scope-994-a") >= 2);
+    assert!(ordering_of(&snapshot, "scope-994-b") >= 2);
     assert!(revision_of(&snapshot, "scope:scope-994-a") >= 2);
+    assert!(revision_of(&snapshot, "scope:scope-994-b") >= 2);
     // Deterministic: the same arrival order replays to the identical snapshot.
-    let (replay, _) = reference_store();
-    let (rctx1, rfirst) = admitted(
+    let (replay, replay_manifest) = reference_store();
+    let rctx1 = ctx_for("op-994-seq-1", &fence);
+    let rfirst = build_transition(
         "op-994-seq-1",
         "scope-994-a",
+        &overlap,
         "subject-994-04-1",
         &fence,
-        &manifest,
+        &rctx1,
+        &replay_manifest,
+        &[],
+        &[],
     );
-    let (rctx2, rsecond) = admitted(
+    let rctx2 = ctx_for("op-994-seq-2", &fence);
+    let rsecond = build_transition(
         "op-994-seq-2",
-        "scope-994-a",
+        "scope-994-b",
+        &overlap,
         "subject-994-04-2",
         &fence,
-        &manifest,
+        &rctx2,
+        &replay_manifest,
+        &[],
+        &[],
     );
     let first_receipt = replay
         .apply_transaction(&rctx1, rfirst, &[], &[])
