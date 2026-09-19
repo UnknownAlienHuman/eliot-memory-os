@@ -22,3 +22,9 @@ pub use activation_resolution::{
     AgentActivationRetryDirective, AgentActivationSelectionDirective,
     MAX_AGENT_ACTIVATION_CANDIDATES,
 };
+
+mod invalid_ticket;
+pub use invalid_ticket::{
+    AGENT_ACTIVATION_INVALID_TICKET_WIRE_ID, AGENT_ACTIVATION_INVALID_TICKET_WIRE_VERSION,
+    AgentActivationInvalidTicket, MAX_INVALID_TICKET_BYTES, UNKNOWN_INVALID_TICKET_ID,
+};
