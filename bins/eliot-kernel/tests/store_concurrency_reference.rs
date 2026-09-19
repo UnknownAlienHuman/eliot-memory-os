@@ -34,6 +34,7 @@ use eliot_store_memory::{MemorySnapshot, MemoryStore};
 use serde_json::Value;
 
 const LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+const FOREIGN_LINEAGE: &str = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
 const REFERENCE_CASES: [u64; 7] = [1, 4, 5, 6, 7, 8, 20];
 const PRODUCT_CASES: [u64; 13] = [2, 3, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19];
 
@@ -85,6 +86,20 @@ fn fence() -> StateFence {
 }
 
 fn foreign_fence() -> StateFence {
+    // A genuinely foreign fence: distinct lineage, so the rejection proves
+    // lineage mismatch, never an epoch transition on the owning lineage.
+    StateFence::new(
+        EpochId::new(
+            EpochLineageId::new(FOREIGN_LINEAGE).expect("lineage"),
+            NonZeroU64::new(1).expect("non-zero"),
+        )
+        .expect("epoch"),
+        ResourceGeneration::genesis(),
+    )
+}
+
+fn changed_epoch_fence() -> StateFence {
+    // Same owning lineage, distinct epoch: the corpus changed-epoch fence.
     StateFence::new(epoch(2), ResourceGeneration::genesis())
 }
 
@@ -224,6 +239,17 @@ fn admitted(
         &[],
     );
     (ctx, transition)
+}
+
+/// Canonical ordering-scope acquisition order for multiscope claims. The
+/// single ORS coordinator requires lexicographic scope order (corpus
+/// `causal_partial_order`), so overlapping claims serialize with no partial
+/// acquisition and no cyclic wait.
+fn canonical_ordering<'a>(scopes: &[&'a str]) -> Vec<&'a str> {
+    let mut canonical = scopes.to_vec();
+    canonical.sort_unstable();
+    canonical.dedup();
+    canonical
 }
 
 fn revision_of(snapshot: &MemorySnapshot, key: &str) -> u64 {
@@ -453,13 +479,42 @@ fn overlapping_scopes_consistently_ordered() {
 // WORK_UNIT_CASE: 994/5
 #[test]
 fn multiscope_claim_without_cyclic_wait() {
+    let fx = corpus();
+    let case = fx["cases"]
+        .as_array()
+        .expect("cases")
+        .iter()
+        .find(|c| c["case"].as_u64() == Some(5))
+        .expect("case 5");
+    assert_eq!(case["suite"].as_str().expect("suite"), "reference");
+    let scopes: Vec<&str> = case["scopes"]
+        .as_array()
+        .expect("scopes")
+        .iter()
+        .map(|scope| scope.as_str().expect("scope"))
+        .collect();
+    assert_eq!(scopes, vec!["scope-994-a", "scope-994-b", "scope-994-c"]);
+    let operations: Vec<&str> = case["operations"]
+        .as_array()
+        .expect("operations")
+        .iter()
+        .map(|operation| operation.as_str().expect("operation"))
+        .collect();
+    assert_eq!(operations, vec!["op-994-multi-ab", "op-994-multi-bc"]);
     let (store, manifest) = reference_store();
     let fence = fence();
+    // Each multiscope transition declares its ordering scopes in the
+    // coordinator's canonical acquisition order: no partial acquisition, no
+    // cyclic wait.
+    let ab_scopes = canonical_ordering(&["scope-994-a", "scope-994-b"]);
+    let bc_scopes = canonical_ordering(&["scope-994-b", "scope-994-c"]);
+    assert_eq!(ab_scopes, vec!["scope-994-a", "scope-994-b"]);
+    assert_eq!(bc_scopes, vec!["scope-994-b", "scope-994-c"]);
     let ctx_ab = ctx_for("op-994-multi-ab", &fence);
     let claim_ab = build_transition(
         "op-994-multi-ab",
         "scope-994-a",
-        &["scope-994-a", "scope-994-b"],
+        &ab_scopes,
         "subject-994-05-ab",
         &fence,
         &ctx_ab,
@@ -467,11 +522,18 @@ fn multiscope_claim_without_cyclic_wait() {
         &[],
         &[],
     );
+    assert!(
+        claim_ab
+            .ordering_scopes
+            .windows(2)
+            .all(|pair| pair[0] < pair[1]),
+        "A+B declares canonical acquisition order"
+    );
     let ctx_bc = ctx_for("op-994-multi-bc", &fence);
     let claim_bc = build_transition(
         "op-994-multi-bc",
         "scope-994-b",
-        &["scope-994-b", "scope-994-c"],
+        &bc_scopes,
         "subject-994-05-bc",
         &fence,
         &ctx_bc,
@@ -479,12 +541,34 @@ fn multiscope_claim_without_cyclic_wait() {
         &[],
         &[],
     );
+    assert!(
+        claim_bc
+            .ordering_scopes
+            .windows(2)
+            .all(|pair| pair[0] < pair[1]),
+        "B+C declares canonical acquisition order"
+    );
     let receipt_ab = store
-        .apply_transaction(&ctx_ab, claim_ab, &[], &[])
+        .apply_transaction(&ctx_ab, claim_ab.clone(), &[], &[])
         .expect("A+B commits");
+    validate_store_receipt_envelope(&ctx_ab, &claim_ab, &receipt_ab).expect("envelope");
     let receipt_bc = store
-        .apply_transaction(&ctx_bc, claim_bc, &[], &[])
+        .apply_transaction(&ctx_bc, claim_bc.clone(), &[], &[])
         .expect("B+C commits");
+    validate_store_receipt_envelope(&ctx_bc, &claim_bc, &receipt_bc).expect("envelope");
+    // Each receipt carries exactly its declared canonical ordering scopes.
+    let ab_heads: Vec<&str> = receipt_ab
+        .ordering_sequences
+        .iter()
+        .map(|head| head.scope.as_str())
+        .collect();
+    assert_eq!(ab_heads, vec!["scope-994-a", "scope-994-b"]);
+    let bc_heads: Vec<&str> = receipt_bc
+        .ordering_sequences
+        .iter()
+        .map(|head| head.scope.as_str())
+        .collect();
+    assert_eq!(bc_heads, vec!["scope-994-b", "scope-994-c"]);
     // Shared scope-994-b carries one consistent precedence edge, no gap.
     let seq_ab = receipt_ab
         .ordering_sequences
@@ -499,6 +583,28 @@ fn multiscope_claim_without_cyclic_wait() {
         .expect("b in B+C")
         .sequence;
     assert!(seq_bc > seq_ab, "shared scope keeps arrival precedence");
+    // Exact forward structure: first arrival takes 2 on both its scopes, the
+    // shared scope advances to 3 on the second arrival.
+    assert_eq!(
+        receipt_ab
+            .ordering_sequences
+            .iter()
+            .find(|h| h.scope.as_str() == "scope-994-a")
+            .expect("a in A+B")
+            .sequence,
+        2
+    );
+    assert_eq!(seq_ab, 2);
+    assert_eq!(seq_bc, 3);
+    assert_eq!(
+        receipt_bc
+            .ordering_sequences
+            .iter()
+            .find(|h| h.scope.as_str() == "scope-994-c")
+            .expect("c in B+C")
+            .sequence,
+        2
+    );
     // No partial acquisition: every declared scope advanced contiguously.
     // Reference head convention: a fresh scope implies head 1, so the first
     // commit stores 2 and the shared scope stores 3 after both claims.
@@ -507,13 +613,15 @@ fn multiscope_claim_without_cyclic_wait() {
     assert_eq!(ordering_of(&snapshot, "scope-994-b"), 3);
     assert_eq!(ordering_of(&snapshot, "scope-994-c"), 2);
     // Reverse arrival order keeps per-scope contiguity too (precedence follows arrival, never cycles).
+    // Same canonical declarations, same semantic structure apart from arrival
+    // precedence: first arrival takes 2, the shared scope advances to 3.
     let (reversed, _) = reference_store();
     let (cbc, tbc) = {
         let ctx = ctx_for("op-994-multi-bc", &fence);
         let transition = build_transition(
             "op-994-multi-bc",
             "scope-994-b",
-            &["scope-994-b", "scope-994-c"],
+            &bc_scopes,
             "subject-994-05-bc",
             &fence,
             &ctx,
@@ -528,7 +636,7 @@ fn multiscope_claim_without_cyclic_wait() {
         let transition = build_transition(
             "op-994-multi-ab",
             "scope-994-a",
-            &["scope-994-a", "scope-994-b"],
+            &ab_scopes,
             "subject-994-05-ab",
             &fence,
             &ctx,
@@ -544,6 +652,18 @@ fn multiscope_claim_without_cyclic_wait() {
     let receipt_ab_second = reversed
         .apply_transaction(&cab, tab, &[], &[])
         .expect("A+B second");
+    let bc_first_heads: Vec<&str> = receipt_bc_first
+        .ordering_sequences
+        .iter()
+        .map(|head| head.scope.as_str())
+        .collect();
+    assert_eq!(bc_first_heads, vec!["scope-994-b", "scope-994-c"]);
+    let ab_second_heads: Vec<&str> = receipt_ab_second
+        .ordering_sequences
+        .iter()
+        .map(|head| head.scope.as_str())
+        .collect();
+    assert_eq!(ab_second_heads, vec!["scope-994-a", "scope-994-b"]);
     let first_b = receipt_bc_first
         .ordering_sequences
         .iter()
@@ -557,20 +677,45 @@ fn multiscope_claim_without_cyclic_wait() {
         .expect("b")
         .sequence;
     assert!(second_b > first_b);
+    assert_eq!(first_b, 2);
+    assert_eq!(second_b, 3);
+    assert_eq!(
+        receipt_bc_first
+            .ordering_sequences
+            .iter()
+            .find(|h| h.scope.as_str() == "scope-994-c")
+            .expect("c")
+            .sequence,
+        2
+    );
+    assert_eq!(
+        receipt_ab_second
+            .ordering_sequences
+            .iter()
+            .find(|h| h.scope.as_str() == "scope-994-a")
+            .expect("a")
+            .sequence,
+        2
+    );
     let reversed_snapshot = reversed.snapshot().expect("snapshot");
     assert_eq!(ordering_of(&reversed_snapshot, "scope-994-a"), 2);
     assert_eq!(ordering_of(&reversed_snapshot, "scope-994-b"), 3);
     assert_eq!(ordering_of(&reversed_snapshot, "scope-994-c"), 2);
+    // Both arrival orders converge on identical per-scope heads.
+    assert_eq!(
+        reversed_snapshot.ordering_heads, snapshot.ordering_heads,
+        "arrival order changes precedence, never the per-scope mapping"
+    );
 }
 
 // WORK_UNIT_CASE: 994/6
 #[test]
 fn concurrent_exact_replay_single_effect() {
-    let store = Arc::new({
-        let (store, _) = reference_store();
-        store
-    });
-    let (_, manifest) = reference_store();
+    // One frozen catalogue construction binds the concurrent store and its
+    // admitting manifest: exact replay must prove identity against the same
+    // registered instance, never two independent generations.
+    let (store, manifest) = reference_store();
+    let store = Arc::new(store);
     let fence = fence();
     let barrier = Arc::new(Barrier::new(3));
     let before = store.snapshot().expect("snapshot");
@@ -663,9 +808,15 @@ fn changed_same_operation_input_conflicts() {
         forked.identity.canonical_request_hash,
         receipt.canonical_request_hash
     );
-    assert_eq!(
-        store.apply_transaction(&fork_ctx, forked, &[], &[]),
-        Err(StoreError::IdentityConflict)
+    // Corpus case 7 permits IdentityConflict or digest mismatch for changed
+    // same-operation input; the oracle must accept the family, never a single
+    // implementation-specific variant. No mutation either way.
+    assert!(
+        matches!(
+            store.apply_transaction(&fork_ctx, forked, &[], &[]),
+            Err(StoreError::IdentityConflict | StoreError::TransitionDigestMismatch { .. })
+        ),
+        "changed same-operation input must conflict without mutation"
     );
     assert_eq!(store.snapshot().expect("snapshot"), before);
     // Same identity, tampered bytes under the original claim: digest mismatch, no mutation.
@@ -696,6 +847,21 @@ fn changed_same_operation_input_conflicts() {
 // WORK_UNIT_CASE: 994/8
 #[test]
 fn stale_head_fence_epoch_cannot_commit() {
+    let fx = corpus();
+    let case = fx["cases"]
+        .as_array()
+        .expect("cases")
+        .iter()
+        .find(|c| c["case"].as_u64() == Some(8))
+        .expect("case 8");
+    assert_eq!(case["suite"].as_str().expect("suite"), "reference");
+    let scopes: Vec<&str> = case["scopes"]
+        .as_array()
+        .expect("scopes")
+        .iter()
+        .map(|scope| scope.as_str().expect("scope"))
+        .collect();
+    assert_eq!(scopes, vec!["scope-994-a"]);
     let (store, manifest) = reference_store();
     let fence = fence();
     let (ctx, first) = admitted(
@@ -763,6 +929,46 @@ fn stale_head_fence_epoch_cannot_commit() {
     assert_eq!(
         store.apply_transaction(&stale_ctx2, stale_ord, &current_revision, &stale_ordering),
         Err(StoreError::OrderingConflict)
+    );
+    // Changed epoch on the owning lineage cannot commit, even with
+    // otherwise-current revision and ordering expectations: the epoch alone
+    // is the rejector, distinct from stale-head and foreign-lineage fences.
+    let changed = changed_epoch_fence();
+    let current_revision = vec![RevisionHeadExpectation {
+        key: RevisionKey::new("scope:scope-994-a").expect("key"),
+        expected_revision: revision_of(&before, "scope:scope-994-a"),
+        state_fence: changed.clone(),
+    }];
+    let current_ordering = vec![OrderingHeadExpectation {
+        scope: OrderingScopeId::new("scope-994-a").expect("ordering"),
+        expected_sequence: ordering_of(&before, "scope-994-a"),
+        state_fence: changed.clone(),
+    }];
+    let changed_ctx = ctx_for("op-994-epoch", &changed);
+    let changed_transition = build_transition(
+        "op-994-epoch",
+        "scope-994-a",
+        &["scope-994-a"],
+        "subject-994-08-epoch",
+        &changed,
+        &changed_ctx,
+        &manifest,
+        &current_revision,
+        &current_ordering,
+    );
+    assert_eq!(
+        store.apply_transaction(
+            &changed_ctx,
+            changed_transition,
+            &current_revision,
+            &current_ordering
+        ),
+        Err(StoreError::FenceMismatch)
+    );
+    assert_eq!(
+        store.snapshot().expect("snapshot"),
+        before,
+        "changed-epoch rejection changes nothing"
     );
     // Foreign fence cannot commit.
     let foreign = foreign_fence();
@@ -847,29 +1053,29 @@ fn source_proof_guard() {
         markers,
         REFERENCE_CASES.into_iter().collect::<BTreeSet<_>>()
     );
-    // Product suite, when present, must bind exactly the frozen product
-    // allocation; the corpus freezes that allocation before the suite lands.
+    // Product suite must bind exactly the frozen product allocation; the
+    // corpus freezes that allocation before the suite lands. The read is
+    // unconditional: a missing product half must fail the guard, never pass
+    // it by assuming complete corpus realization.
     let product_path =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/store_concurrency_product.rs");
-    if product_path.exists() {
-        let product = std::fs::read_to_string(&product_path).expect("product source");
-        let mut product_markers = BTreeSet::new();
-        for line in product.lines() {
-            if let Some(rest) = line.trim().strip_prefix("// WORK_UNIT_CASE: 994/") {
-                product_markers.insert(rest.trim().parse::<u64>().expect("marker"));
-            }
+    let product = std::fs::read_to_string(&product_path).expect("product source required");
+    let mut product_markers = BTreeSet::new();
+    for line in product.lines() {
+        if let Some(rest) = line.trim().strip_prefix("// WORK_UNIT_CASE: 994/") {
+            product_markers.insert(rest.trim().parse::<u64>().expect("marker"));
         }
-        assert_eq!(
-            product_markers,
-            PRODUCT_CASES.into_iter().collect::<BTreeSet<_>>()
-        );
-        let union: BTreeSet<u64> = markers.union(&product_markers).copied().collect();
-        assert_eq!(
-            union,
-            (1u64..=20u64).collect::<BTreeSet<_>>(),
-            "cases allocated exactly once"
-        );
     }
+    assert_eq!(
+        product_markers,
+        PRODUCT_CASES.into_iter().collect::<BTreeSet<_>>()
+    );
+    let union: BTreeSet<u64> = markers.union(&product_markers).copied().collect();
+    assert_eq!(
+        union,
+        (1u64..=20u64).collect::<BTreeSet<_>>(),
+        "cases allocated exactly once"
+    );
     // Manifest guard: Store reference/adapter edges must be test-only.
     // The production dependency table must not carry them; they must be
     // declared in the member-local test dependency table instead.
@@ -894,27 +1100,26 @@ fn source_proof_guard() {
                 || trimmed.starts_with("eliot-store-surreal-adapter")
                 || trimmed.starts_with("secrecy"))
         {
-            let raw = trimmed
-                .split_once('=')
-                .expect("dependency assignment")
-                .0
-                .trim();
-            let normalized = raw.strip_suffix(".workspace").unwrap_or(raw);
-            test_edges.insert(normalized.to_owned());
+            test_edges.insert(trimmed.to_owned());
         }
     }
     assert!(
         production_hits.is_empty(),
         "production deps must not carry test-only edges: {production_hits:?}"
     );
+    // Exact pinned forms: the memory edge stays a member-local path+version
+    // edge (no root workspace entry, no version upgrade), the adapter and
+    // secrecy edges stay workspace-inherited. Name presence alone is not
+    // enough; the representation is the test-only contract.
     assert_eq!(
         test_edges,
         BTreeSet::from([
-            "eliot-store-memory".to_owned(),
-            "eliot-store-surreal-adapter".to_owned(),
-            "secrecy".to_owned(),
+            "eliot-store-memory = { path = \"../../crates/storage/eliot-store-memory\", version = \"0.1.0\" }"
+                .to_owned(),
+            "eliot-store-surreal-adapter.workspace = true".to_owned(),
+            "secrecy.workspace = true".to_owned(),
         ]),
-        "all Store reference/adapter test-only edges must be member-local dev-dependencies"
+        "all Store reference/adapter test-only edges must be member-local dev-dependencies in exact pinned form"
     );
     let root =
         std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.toml"))
