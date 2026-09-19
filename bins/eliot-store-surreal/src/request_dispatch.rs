@@ -25,6 +25,7 @@ use eliot_store_api::StoreGenesisRequest;
 use eliot_store_api::StoreRecoveryRequest;
 use eliot_store_api::StoreRecoverySnapshot;
 use eliot_store_api::WriteReceipt;
+use eliot_store_api::{canonical_json_bytes, sha256_hex};
 
 use crate::Request;
 use crate::Response;
@@ -130,6 +131,17 @@ fn failure_context_for_fence(
     }
 }
 
+fn failure_context_for_recovery(request: &StoreRecoveryRequest) -> StoreFailureIdentityContext {
+    let idempotency_key_ref_or_digest = canonical_json_bytes(request)
+        .ok()
+        .map(|bytes| sha256_hex(&bytes));
+    StoreFailureIdentityContext {
+        idempotency_key_ref_or_digest,
+        state_fence_ref_or_exact_safe_projection: Some(request.state_fence.clone()),
+        ..StoreFailureIdentityContext::default()
+    }
+}
+
 fn failure_context_for_operation(
     context: &eliot_store_api::RequestMeta,
     operation_id: eliot_store_api::OperationId,
@@ -204,10 +216,7 @@ pub(crate) fn map_recovery_dispatch_result(
 ) -> Response {
     match result {
         Ok(snapshot) => Response::Recovery { snapshot },
-        Err(error) => map_store_error(
-            error,
-            failure_context_for_fence(request.state_fence.clone()),
-        ),
+        Err(error) => map_store_error(error, failure_context_for_recovery(request)),
     }
 }
 
@@ -979,11 +988,10 @@ mod dreamer_dispatch_tests {
 
     #[tokio::test]
     async fn dreamer_unsupported_operation_rejected_without_provider_write() {
-        // `Renew` is a well-shaped K0 operation with a permitting role, but
-        // S1 explicitly leaves it unadvertised. The adapter rejects it before
-        // any provider I/O; the endpoint here has no listener, so any
-        // attempted write would surface as `Unavailable` instead of the
-        // asserted `Unsupported`.
+        // This stale expectation dates to e2502d6c. Commit 06be4e269 (#775)
+        // advertises and implements `Renew`; as a supported, admitted,
+        // well-shaped K0 permitting operation, it reaches the unconnected
+        // provider boundary and reports `Unavailable`.
         let fence = test_fence();
         let ctx = test_ctx(&fence);
         let request = make_request(
@@ -1008,13 +1016,16 @@ mod dreamer_dispatch_tests {
                     failure.operation_id,
                     Some(OperationId::new("op-renew-s2").expect("operation id"))
                 );
-                assert_eq!(failure.disposition, StoreFailureDisposition::Unsupported);
+                assert_eq!(failure.disposition, StoreFailureDisposition::Unavailable);
                 assert_eq!(
                     failure.mutation_disposition,
                     StoreMutationDisposition::NotAttempted
                 );
-                assert_eq!(failure.retry_directive, StoreRetryDirective::DoNotRetry);
-                failure.validate().expect("typed unsupported validates");
+                assert_eq!(
+                    failure.retry_directive,
+                    StoreRetryDirective::RetrySameIdentityAfterBackoff
+                );
+                failure.validate().expect("typed unavailable validates");
             }
             other => panic!("unadvertised operation must not write: {other:?}"),
         }
