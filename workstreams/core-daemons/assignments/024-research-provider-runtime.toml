@@ -12,8 +12,8 @@ normative_pair_ref = "docs/normative-pair.toml"
 
 [documentation]
 architecture = [
-  "docs/architecture/A05-07-two-lanes-and-evidence-discipline.md#a57-two-lanes-and-evidence-discipline",
-  "docs/architecture/A09-02-dreamer-researcher-and-memory-curator.md#a92-dreamer-researcher-and-memory-curator",
+  "docs/architecture/A05-07-confirmatory-and-exploratory-lanes.md#a57-confirmatory-and-exploratory-lanes",
+  "docs/architecture/A09-02-primary-modes.md#a92-primary-modes",
   "docs/architecture/A12-security-provenance-and-bounded-influence.md#a12-security-provenance-and-bounded-influence",
 ]
 implementation = [

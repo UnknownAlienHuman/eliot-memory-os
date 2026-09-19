@@ -23,6 +23,7 @@ pub use commit_recovery::{
     CommitRecoveryClass, CommitRecoveryError, classify_commit_receipt, paused_ordering_scope_view,
     paused_scopes_snapshot, receipt_evidence_digest, recover_commit,
 };
+mod capacity_evidence;
 mod doctor;
 mod doctor_front_door;
 mod host_request_binding;
@@ -32,8 +33,16 @@ mod protocol;
 mod store_client;
 #[cfg(windows)]
 mod store_gateway;
+mod store_write_reservation;
+#[cfg(test)]
+mod store_write_reservation_tests;
 mod testd_front_door;
 
+pub use capacity_evidence::{
+    BoundaryOptimizationProposal, CAPACITY_EVIDENCE_SCHEMA_VERSION, CanonicalWriteLatencyProfile,
+    CapacityEnvelope, CapacityEvidenceError, CorpusScaleProfile, EvidenceClass,
+    LatencyDistribution, MIN_PERCENTILE_SAMPLES, OptimizationQualification, UnqualifiedReason,
+};
 pub use doctor::{
     ComposedDoctorFrontDoor, DOCTOR_CONFLICT_MAX_FIELDS, DOCTOR_MAX_ENVELOPE_BYTES,
     DOCTOR_MAX_LEASE_DURATION_NANOS, DOCTOR_RECOVERY_LEASE_OWNER, DOCTOR_REPAIR_ADVERTISED,
@@ -97,6 +106,14 @@ pub use protocol::{
 pub use store_client::{EbpCanonicalStoreClient, EbpStoreTransport, StoreClientError};
 #[cfg(windows)]
 pub use store_gateway::KernelStoreGateway;
+pub use store_write_reservation::{
+    CompositionReservation, ObservedHead, RESERVATION_KEY_NAME, RESERVATION_KEY_PROVIDER,
+    RESERVATION_VISIBILITY, ReservationSeed, ReservationWriteError, ResolvedSendOutcome,
+    SealedReservation, UNKNOWN_OUTCOME_REASON, begin_execute_after_send, cancel_before_send,
+    ensure_eligible, finalize_reservation, gateway_seed, mark_unknown_outcome,
+    project_reserved_write, reconcile_receipt, recovery_page, reserve_for_transition,
+    unresolved_reservations, writer_epoch_for_fence, writer_epoch_for_fence_from_epoch,
+};
 pub use testd_front_door::{
     AuthenticatedTestdSession, TESTD_ADMISSION_ADVERTISED, TESTD_ADMISSION_WIRE_ID,
     TESTD_ADMISSION_WIRE_VERSION, TESTD_CONFLICT_MAX_FIELDS, TESTD_MAX_ENVELOPE_BYTES,

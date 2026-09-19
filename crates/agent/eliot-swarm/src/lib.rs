@@ -688,6 +688,18 @@ impl AdmittedSwarmPlan {
         &self.proposal.plan_revision
     }
 
+    /// Sealed Governor coordination binding carried by the admission.
+    #[must_use]
+    pub fn provider_binding(&self) -> &ProviderBinding {
+        &self.provider_binding
+    }
+
+    /// Governor admission receipt that admitted this exact revision.
+    #[must_use]
+    pub fn admission_receipt(&self) -> &ReceiptEnvelope {
+        &self.admission_receipt
+    }
+
     /// Frozen work graph.
     #[must_use]
     pub fn work_items(&self) -> &[WorkItem] {
@@ -2585,6 +2597,9 @@ pub fn restore_controller(
 /// Consumer: `tests/durable_work.rs` (deterministic fake owners) and, later,
 /// the #872 durable control wire.
 ///
+/// Durable-job attachment and admitted child-dispatch lineage (issue #1126).
+/// See [`durable_dispatch`] for the binding rules.
+pub mod durable_dispatch;
 /// The cell stays stateless: [`durable_work::DurableWorkMachine`] is a
 /// transient interpreter over records owned by the injected
 /// [`durable_work::DurableWorkStore`]. It owns no process, route, task,

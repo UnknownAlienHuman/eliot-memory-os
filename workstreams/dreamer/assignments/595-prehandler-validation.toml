@@ -30,7 +30,7 @@ implementation = [
   "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I09-03-job-classes.md#i93-job-classes",
   "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I09-04-dreamer-input-bundle.md#i94-dreamer-input-bundle",
   "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I09-05-dream-packet.md#i95-dream-packet",
-  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I09-06-candidate-kinds.md#i96-candidate-kinds",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I09-06-curation-candidate.md#i96-curation-candidate",
   "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I09-07-memory-transformation-validation.md#i97-memory-transformation-validation",
   "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I12-26-memory-admission-and-retrieval-trace.md#i1226-memory-admission-and-retrieval-trace",
   "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",

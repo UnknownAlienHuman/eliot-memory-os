@@ -35,9 +35,9 @@ mod read_boundary;
 mod receipt_reconciliation;
 mod recovery;
 mod schema_contract;
+use atomic_write::{TxLane, to_value, write_transaction};
 #[cfg(test)]
 use atomic_write::{ordering_write_template, revision_write_template};
-use atomic_write::{to_value, write_transaction};
 use empty_migration::handle_empty_migration;
 pub(crate) use genesis::initialize_genesis;
 #[cfg(test)]
@@ -574,6 +574,24 @@ pub(crate) async fn apply_prepared(
 /// through the authority-carrying path, all-`None` entries keep the legacy
 /// path. The admitted-operation gate ([`validate_transition`]) runs before
 /// any provider I/O in both cases.
+/// Bounded allocation attempts for one admitted operation (S-CONC-TX, #989).
+///
+/// One initial canonical transaction plus this many allocation-contention
+/// retries. The bound absorbs racing disjoint-scope writers without an
+/// unbounded CAS spin; exhaustion reports exact allocation contention, never
+/// a false semantic conflict and never an unknown outcome.
+///
+/// S-CONC-TX rework: this production entry holds no process-global write
+/// guard across the allocation loop below. Independent transitions overlap
+/// their fence/head reads, allocation attempts, and bounded retries; the
+/// canonical transaction's fence CAS plus its revision and ordering head
+/// predicates arbitrate shared sequence allocation, so disjoint scopes
+/// commit concurrently while genuine conflicts fail closed. Each provider
+/// RPC stays atomic on its own session socket. The process-global write
+/// lock now guards only the migration and erasure-dispatch entrypoints,
+/// never normal-write allocation network I/O.
+const MAX_ALLOCATION_RETRIES: u32 = 7;
+
 pub(crate) async fn apply_prepared_with_authority(
     adapter: &SurrealStoreAdapter,
     ctx: &eliot_store_api::RequestMeta,
@@ -587,80 +605,237 @@ pub(crate) async fn apply_prepared_with_authority(
     let db = client(adapter).await?;
     ensure_ready(adapter, db).await?;
 
-    let _guard = adapter.write_lock.lock().await;
-
-    match read_idempotency(db, &adapter.config, ctx, &transition).await? {
-        Idempotency::Replay(receipt) => {
-            validate_receipt_identity(&receipt, ctx, &transition)?;
-            return Ok(receipt);
-        }
-        Idempotency::Conflict => return Err(AdapterError::Store(StoreError::IdentityConflict)),
-        Idempotency::None => {}
-    }
-
-    let fence = read_fence(db, &adapter.config).await?;
-    if let Some(fence) = &fence
-        && fence.state_fence != transition.state_fence
-    {
-        return Err(AdapterError::Store(StoreError::FenceMismatch));
-    }
-    let next_commit_sequence = fence.as_ref().map_or(1, |fence| fence.next_commit_sequence);
-    let next_outbox_sequence = fence.as_ref().map_or(1, |fence| fence.next_outbox_sequence);
-
-    let revision_keys = union_revision_keys(&expected_revision_heads, &transition);
-    let ordering_scopes = union_ordering_scopes(&expected_ordering_heads, &transition);
-    let current_revisions = read_revision_heads_inner(db, &adapter.config, &revision_keys).await?;
-    let current_orderings =
-        read_ordering_heads_inner(db, &adapter.config, &ordering_scopes).await?;
-
-    check_expected_revisions(
-        &current_revisions,
-        &expected_revision_heads,
-        &transition.state_fence,
-    )?;
-    check_expected_orderings(
-        &current_orderings,
-        &expected_ordering_heads,
-        &transition.state_fence,
-    )?;
-
-    // Issue #1712: the admitted erasure operation dispatches its recorded
-    // intent-before-delete plan here, after every fallible precondition and
-    // before receipt planning. Same-operation replay returns the sealed
-    // outcomes without duplicate destructive work; a lost commit response
-    // reconciles by same-operation retry through the receipt path above,
-    // never by blind retry.
-    if transition.transition_class == TransitionClass::Erasure {
-        let intent = surreal_intent_from_transition(&transition)?;
-        apply_surreal_erasure(adapter, &intent).await?;
-    }
-
-    let plan = plan::select_apply_plan(
-        &transition,
-        authorities,
-        &current_revisions,
-        &current_orderings,
-        next_commit_sequence,
-        next_outbox_sequence,
-    )?;
-    let receipt = build_receipt(ctx, &transition, &plan)?;
-
-    write_transaction(
+    apply_with_retry(
+        adapter,
         db,
-        &adapter.config,
-        &transition,
-        &plan,
-        &receipt,
-        fence.is_none(),
-        fence.as_ref().map_or(1, |value| value.next_commit_sequence),
-        fence.as_ref().map_or(1, |value| value.next_outbox_sequence),
-        &current_revisions,
-        &current_orderings,
+        ctx,
+        transition,
+        expected_revision_heads,
+        expected_ordering_heads,
+        authorities,
+        TxLane::Facade,
     )
-    .await?;
+    .await
+}
 
-    validate_receipt_identity(&receipt, ctx, &transition)?;
-    Ok(receipt)
+/// Explicit test/private allocation seam (S-CONC-TX, issue #989).
+///
+/// Runs the exact production attempt loop over the admitted #987 pooled
+/// read lane for pre-transaction reads and the pooled normal-write lane
+/// for the canonical transaction (one checked-out session per concurrent
+/// task). Since the rework, the production entry above is equally
+/// unguarded and arbitrates through the same fence CAS and head
+/// predicates; this seam never disables safety globally, never compiles
+/// outside `#[cfg(test)]`, and remains as additional pooled-lane
+/// coverage — never as the only concurrent path.
+#[cfg(test)]
+pub(crate) async fn apply_prepared_without_write_guard(
+    adapter: &SurrealStoreAdapter,
+    ctx: &eliot_store_api::RequestMeta,
+    transition: eliot_store_api::PreparedTransition,
+    expected_revision_heads: Vec<eliot_store_api::RevisionHeadExpectation>,
+    expected_ordering_heads: Vec<eliot_store_api::OrderingHeadExpectation>,
+    authorities: &[Option<ExactJsonBytes>],
+) -> Result<WriteReceipt, AdapterError> {
+    validate_transition(ctx, &transition)?;
+
+    let db = client(adapter).await?;
+    ensure_ready(adapter, db).await?;
+
+    apply_with_retry(
+        adapter,
+        db,
+        ctx,
+        transition,
+        expected_revision_heads,
+        expected_ordering_heads,
+        authorities,
+        TxLane::PooledWrite,
+    )
+    .await
+}
+
+/// Production-path transaction-attempt rendezvous (S-CONC-TX, issue #989).
+///
+/// When the adapter's rendezvous is armed (only the
+/// `production_path_disjoint_writers_overlap_and_conflicts_fail_closed`
+/// integration test arms it), the first allocation attempt of each writer
+/// blocks here — after admission, the idempotency/fence/head reads, and the
+/// plan build, before the canonical transaction is sent — until every party
+/// has arrived. Both public production calls therefore reach the same
+/// post-admission transaction-attempt rendezvous before either is allowed to
+/// continue, so a single serialized production write lane (for example the
+/// removed process-global write guard re-added over this loop) deadlocks
+/// here instead: the first writer waits for a second writer that can never
+/// arrive, and the bounded wait below fails the attempt rather than hanging
+/// the suite.
+///
+/// Production-safe when unarmed (the only state reachable outside that
+/// test: no production caller arms it): one uncontended `std` mutex lock
+/// plus an `is_none` check, then return — no await, no allocation, no
+/// provider I/O, no error-taxonomy change. The mutex is never held across an
+/// await and never contended in production, so unarmed writers neither block
+/// nor serialize on it.
+///
+/// First-attempt only (callers invoke this solely while `semantic_plan` is
+/// still `None`): allocation-contention retries re-enter alone after the
+/// partner has moved on, so a second wait would stall until the bound below.
+async fn rendezvous_before_transaction(adapter: &SurrealStoreAdapter) -> Result<(), AdapterError> {
+    let Some(barrier) = adapter.tx_rendezvous_barrier() else {
+        return Ok(());
+    };
+    tokio::time::timeout(std::time::Duration::from_mins(1), barrier.wait())
+        .await
+        .map_err(|_| AdapterError::ProviderUnavailable)?;
+    Ok(())
+}
+
+/// Bounded in-transaction allocation loop (S-CONC-TX, issue #989).
+///
+/// Allocation lives in the canonical transaction: every attempt re-reads the
+/// fence and the union heads, re-verifies every declared expected revision
+/// and ordering head plus the fence, recomputes only the allocation-derived
+/// plan values through [`plan::recompute_allocation`] under the unchanged
+/// semantic input/scope/fence/expected-head contract, and commits
+/// event/projection/relation/head/outbox/idempotency/receipt effects
+/// atomically with the fence CAS.
+///
+/// Retry discipline: only a provider-classified allocation contention
+/// (`AllocationContention`, proved-not-committed: the fence CAS precedes the
+/// receipt create) re-enters the loop, and only after the next iteration
+/// re-proves absence through the idempotency read — a concurrent same-op
+/// winner observed there replays its original receipt instead of
+/// re-committing. Deterministic semantic conflicts, fence mismatches, and
+/// every unknown outcome return immediately: a transport timeout,
+/// cancellation, missing/malformed response, or possibly committed provider
+/// error is never retried and never allocates another operation; it requires
+/// exact same-operation receipt reconciliation before replay.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the apply attempt carries the exact admitted contract: context, transition, both head sets, authorities, lane"
+)]
+async fn apply_with_retry(
+    adapter: &SurrealStoreAdapter,
+    db: &client::RpcTransport,
+    ctx: &eliot_store_api::RequestMeta,
+    transition: eliot_store_api::PreparedTransition,
+    expected_revision_heads: Vec<eliot_store_api::RevisionHeadExpectation>,
+    expected_ordering_heads: Vec<eliot_store_api::OrderingHeadExpectation>,
+    authorities: &[Option<ExactJsonBytes>],
+    lane: TxLane,
+) -> Result<WriteReceipt, AdapterError> {
+    let mut retries = 0u32;
+    let mut erasure_dispatched = false;
+    // The full semantic plan is established once, on the first attempt.
+    // Allocation-contention retries re-enter ONLY through
+    // `plan::recompute_allocation` below, never through the full planner,
+    // so retry planning owns allocation-derived values alone and cannot
+    // duplicate or drift from semantic logic by construction.
+    let mut semantic_plan: Option<plan::ApplyPlan> = None;
+    loop {
+        match read_idempotency(db, &adapter.config, ctx, &transition).await? {
+            Idempotency::Replay(receipt) => {
+                validate_receipt_identity(&receipt, ctx, &transition)?;
+                return Ok(receipt);
+            }
+            Idempotency::Conflict => {
+                return Err(AdapterError::Store(StoreError::IdentityConflict));
+            }
+            Idempotency::None => {}
+        }
+
+        let fence = read_fence(db, &adapter.config).await?;
+        if let Some(fence) = &fence
+            && fence.state_fence != transition.state_fence
+        {
+            return Err(AdapterError::Store(StoreError::FenceMismatch));
+        }
+        let next_commit_sequence = fence.as_ref().map_or(1, |fence| fence.next_commit_sequence);
+        let next_outbox_sequence = fence.as_ref().map_or(1, |fence| fence.next_outbox_sequence);
+
+        let revision_keys = union_revision_keys(&expected_revision_heads, &transition);
+        let ordering_scopes = union_ordering_scopes(&expected_ordering_heads, &transition);
+        let current_revisions =
+            read_revision_heads_inner(db, &adapter.config, &revision_keys).await?;
+        let current_orderings =
+            read_ordering_heads_inner(db, &adapter.config, &ordering_scopes).await?;
+
+        check_expected_revisions(
+            &current_revisions,
+            &expected_revision_heads,
+            &transition.state_fence,
+        )?;
+        check_expected_orderings(
+            &current_orderings,
+            &expected_ordering_heads,
+            &transition.state_fence,
+        )?;
+
+        // Issue #1712: the admitted erasure operation dispatches its recorded
+        // intent-before-delete plan here, after every fallible precondition
+        // and before receipt planning. Dispatched once per operation: the
+        // sealed intent/outcome rows make a same-operation re-dispatch replay
+        // without duplicate destructive work, but allocation retries must not
+        // re-dispatch what the first attempt already sealed. Same-operation
+        // replay returns the sealed outcomes without duplicate destructive
+        // work; a lost commit response reconciles by same-operation retry
+        // through the receipt path above, never by blind retry.
+        if transition.transition_class == TransitionClass::Erasure && !erasure_dispatched {
+            let intent = surreal_intent_from_transition(&transition)?;
+            apply_surreal_erasure(adapter, &intent).await?;
+            erasure_dispatched = true;
+        }
+
+        let first_attempt = semantic_plan.is_none();
+        let plan = if let Some(semantic) = &semantic_plan {
+            plan::recompute_allocation(semantic, next_commit_sequence, next_outbox_sequence)?
+        } else {
+            let full = plan::select_apply_plan(
+                &transition,
+                authorities,
+                &current_revisions,
+                &current_orderings,
+                next_commit_sequence,
+                next_outbox_sequence,
+            )?;
+            semantic_plan = Some(full.clone());
+            full
+        };
+        let receipt = build_receipt(ctx, &transition, &plan)?;
+
+        // S-CONC-TX production-path rendezvous (issue #989): first attempt
+        // only, after every pre-transaction read and the plan build, before
+        // the canonical transaction is sent. See
+        // `rendezvous_before_transaction`.
+        if first_attempt {
+            rendezvous_before_transaction(adapter).await?;
+        }
+
+        match write_transaction(
+            db,
+            &adapter.config,
+            &transition,
+            &plan,
+            &receipt,
+            fence.is_none(),
+            fence.as_ref().map_or(1, |value| value.next_commit_sequence),
+            fence.as_ref().map_or(1, |value| value.next_outbox_sequence),
+            &current_revisions,
+            &current_orderings,
+            lane,
+        )
+        .await
+        {
+            Ok(()) => {
+                validate_receipt_identity(&receipt, ctx, &transition)?;
+                return Ok(receipt);
+            }
+            Err(AdapterError::AllocationContention { .. }) if retries < MAX_ALLOCATION_RETRIES => {
+                retries += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 /// 688-B: the adapter's apply-path erasure execution.
@@ -1713,5 +1888,715 @@ mod erasure_execution_tests {
         missing.operation_id.clear();
         assert!(record_surreal_erasure_intent(missing).is_err());
         Ok(())
+    }
+}
+
+/// S-CONC-TX (issue #989) allocation tests.
+///
+/// Pure pins cover the bounded retry contract; live proofs exercise the
+/// production entry (facade lane, no process-global guard) alongside the
+/// explicit test/private seam against real provider sessions on an
+/// isolated provider. No production database, no user credentials.
+#[cfg(test)]
+mod concurrent_allocation_tests {
+    #![allow(clippy::expect_used)]
+
+    use super::*;
+
+    /// Compile-time pin: the retry absorbs racing writers without an
+    /// unbounded CAS spin. The behavioral counterpart (loop re-enters only
+    /// on classified contention, every other outcome returns without retry)
+    /// is proven live beside the seam and guarded in the
+    /// `concurrent_transaction_allocation` integration target.
+    const _: () = assert!(MAX_ALLOCATION_RETRIES > 0 && MAX_ALLOCATION_RETRIES <= 8);
+
+    #[cfg(windows)]
+    mod live_seam_tests {
+        #![allow(clippy::expect_used, clippy::print_stdout)]
+        // Live allocation proofs necessarily hold admitted transitions
+        // across awaits while concurrent writers overlap; same rationale as
+        // the `concurrent_transaction_allocation` target allowance.
+        #![allow(clippy::large_futures)]
+
+        use super::super::{
+            apply_prepared_with_authority, apply_prepared_without_write_guard, atomic_write,
+            build_receipt, client, read_fence, validate_receipt_identity,
+        };
+        use crate::client::session_pool::SessionRole;
+        use crate::config::{ClientSetLimits, SurrealAdapterConfig};
+        use crate::error::AdapterError;
+        use crate::plan;
+        use crate::{SchemaGeneration, SurrealStoreAdapter};
+        use eliot_platform_windows::WindowsPlatform;
+        use eliot_store_api::{
+            CONTRACT_VERSION, CanonicalRequestView, CanonicalStoreClient, EffectClass,
+            EventProjectionRelationIntents, ExactJsonBytes, GENESIS_MANIFEST_NAME,
+            NamedMutationOperation, NamedMutationRequest, OperationIdentity,
+            OperationManifestDigest, OrderingScopeId, ScopeId, SecurityContext, StateFence,
+            StoreRecoveryRequest, TransitionClass, WriteReceipt, canonical_request_hash,
+            generated_operation_manifests, operation_manifest_set_digest,
+        };
+        use secrecy::{ExposeSecret, SecretString};
+        use serde_json::json;
+        use std::collections::BTreeMap;
+        use std::path::{Path, PathBuf};
+        use std::process::Stdio;
+        use std::time::Duration;
+        use tokio::net::TcpStream;
+        use tokio::process::Command;
+        use tokio::time::{Instant, sleep, timeout};
+
+        const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+        fn fence() -> StateFence {
+            use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
+            use std::num::NonZeroU64;
+            let lineage = EpochLineageId::new(TEST_LINEAGE).expect("lineage");
+            let epoch =
+                EpochId::new(lineage, NonZeroU64::new(1).expect("non-zero")).expect("epoch");
+            StateFence::new(epoch, ResourceGeneration::genesis())
+        }
+
+        fn fixture_ctx() -> eliot_store_api::RequestMeta {
+            use eliot_contracts::{ClockReading, ProductId, RequestId, SourceId};
+            eliot_store_api::RequestMeta {
+                request_id: RequestId::new("request-989-seam").expect("request"),
+                session_id: None,
+                task_id: None,
+                product_id: ProductId::new("product-989-seam").expect("product"),
+                source_id: SourceId::new("source-989-seam").expect("source"),
+                state_fence: fence(),
+                clock: ClockReading {
+                    valid_time_ms: Some(1000),
+                    known_time_ms: Some(1001),
+                    ..ClockReading::default()
+                },
+            }
+        }
+
+        /// One admitted disjoint-scope capture: valid catalogue digest and
+        /// recomputed request hash, so only allocation can fail.
+        fn admitted(operation: &str, scope: &str, subject: &str) -> PreparedTransitionForTest {
+            let ctx = fixture_ctx();
+            let mut transition = eliot_store_api::PreparedTransition {
+                identity: OperationIdentity {
+                    operation_id: eliot_store_api::OperationId::new(operation).expect("operation"),
+                    idempotency_key: format!("idem-{operation}"),
+                    canonical_request_hash: "a".repeat(64),
+                },
+                state_fence: fence(),
+                scope_id: ScopeId::new(scope).expect("scope"),
+                task_id: None,
+                ordering_scopes: vec![OrderingScopeId::new(scope).expect("ordering")],
+                transition_class: TransitionClass::CaptureCandidate,
+                requested_effect_ceiling: EffectClass::Candidate,
+                admission_contract_set_digest: "b".repeat(64),
+                operation_manifest_digest: OperationManifestDigest::new("manifest-1")
+                    .expect("manifest"),
+                named_operations: vec![NamedMutationRequest {
+                    operation: NamedMutationOperation::CaptureObservation,
+                    parameters: BTreeMap::from([("subject".to_owned(), json!(subject))]),
+                }],
+                event_projection_relation_intents: EventProjectionRelationIntents {
+                    event_ids: Vec::new(),
+                    projection_kinds: Vec::new(),
+                    relation_kinds: Vec::new(),
+                },
+                security: SecurityContext::default(),
+                required_proof_and_approval_refs: Vec::new(),
+            };
+            transition.operation_manifest_digest =
+                operation_manifest_set_digest(&generated_operation_manifests().expect("catalogue"))
+                    .expect("manifest digest");
+            transition.identity.canonical_request_hash = canonical_request_hash(
+                &CanonicalRequestView::from_apply(&ctx, &transition, &[], &[]),
+            )
+            .expect("request hash");
+            PreparedTransitionForTest { ctx, transition }
+        }
+
+        struct PreparedTransitionForTest {
+            ctx: eliot_store_api::RequestMeta,
+            transition: eliot_store_api::PreparedTransition,
+        }
+
+        struct Harness {
+            root: PathBuf,
+            config: SurrealAdapterConfig,
+            adapter: Option<SurrealStoreAdapter>,
+        }
+
+        impl Harness {
+            async fn start() -> Self {
+                let port = std::net::TcpListener::bind("127.0.0.1:0")
+                    .expect("loopback")
+                    .local_addr()
+                    .expect("address")
+                    .port();
+                let root =
+                    std::env::temp_dir().join(format!("eliot-sconc-989-{}", uuid::Uuid::new_v4()));
+                let exe = root.join("bin/surreal.exe");
+                let data = root.join("store/data");
+                let work = root.join("store/work");
+                let tmp = root.join("store/tmp");
+                for path in [root.join("bin"), data.clone(), work.clone(), tmp.clone()] {
+                    std::fs::create_dir_all(path).expect("isolated root");
+                }
+                let provider = std::env::var_os("ELIOT_TEST_SURREAL_EXE").map_or_else(
+                    || PathBuf::from(r"C:\Tools\SurrealDB\surreal.exe"),
+                    PathBuf::from,
+                );
+                std::fs::copy(provider, &exe).expect("stage provider");
+                let digest =
+                    eliot_store_api::sha256_hex(&std::fs::read(&exe).expect("provider bytes"));
+                let bind = format!("127.0.0.1:{port}");
+                let mut config = SurrealAdapterConfig {
+                    endpoint: format!("ws://{bind}/rpc"),
+                    namespace: "sconc989".into(),
+                    database: "alloc989".into(),
+                    username: "sconc989-user".into(),
+                    password: SecretString::new(format!("test-{}", uuid::Uuid::new_v4()).into()),
+                    provider_bind_address: bind,
+                    installation_id: "sconc989-test".into(),
+                    installation_profile: "portable_dev".into(),
+                    runtime_state_roots_digest: "a".repeat(64),
+                    provider_executable_path: exe.to_string_lossy().into_owned(),
+                    provider_artifact_digest: digest,
+                    provider_arguments: Vec::new(),
+                    store_data_root: data.to_string_lossy().into_owned(),
+                    store_work_root: work.to_string_lossy().into_owned(),
+                    store_temp_root: tmp.to_string_lossy().into_owned(),
+                    connect_timeout_ms: 30_000,
+                    query_timeout_ms: 30_000,
+                    expected_provider_major: crate::PINNED_SURREALDB_MAJOR,
+                    expected_schema_generation: SchemaGeneration::v2(),
+                };
+                config.provider_arguments = config.expected_provider_arguments();
+                let mut harness = Self {
+                    root,
+                    config,
+                    adapter: None,
+                };
+                println!(
+                    "SCONC-989 provider={} sha256={} root={}",
+                    exe.display(),
+                    harness.config.provider_artifact_digest,
+                    harness.root.display()
+                );
+                let system_root = std::env::var_os("SystemRoot").expect("SystemRoot");
+                let mut child = Command::new(&exe)
+                    .args(&harness.config.provider_arguments)
+                    .current_dir(&work)
+                    .env_clear()
+                    .env("SystemRoot", &system_root)
+                    .env("WINDIR", &system_root)
+                    .env("TEMP", &tmp)
+                    .env("TMP", &tmp)
+                    .env("SURREAL_USER", &harness.config.username)
+                    .env("SURREAL_PASS", harness.config.password.expose_secret())
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .creation_flags(0x0800_0000)
+                    .kill_on_drop(true)
+                    .spawn()
+                    .expect("bootstrap provider");
+                let deadline = Instant::now() + Duration::from_secs(30);
+                loop {
+                    assert!(
+                        child.try_wait().expect("child status").is_none(),
+                        "bootstrap exited"
+                    );
+                    if TcpStream::connect(&harness.config.provider_bind_address)
+                        .await
+                        .is_ok()
+                    {
+                        break;
+                    }
+                    assert!(Instant::now() < deadline, "bootstrap bind timeout");
+                    sleep(Duration::from_millis(50)).await;
+                }
+                child.kill().await.expect("stop bootstrap");
+                child.wait().await.expect("reap bootstrap");
+                harness.open().await;
+                harness
+            }
+
+            async fn open(&mut self) {
+                let platform = WindowsPlatform::new(self.root.clone()).expect("platform");
+                let deadline = Instant::now() + Duration::from_secs(30);
+                let mut last_error = None;
+                let limits = ClientSetLimits::new(2, 2, 1).expect("concurrent profile");
+                loop {
+                    let lease = platform
+                        .retain_process_path_lease(
+                            Path::new(&self.config.provider_executable_path),
+                            Path::new(&self.config.store_work_root),
+                            &self.config.provider_artifact_digest,
+                        )
+                        .expect("process lease");
+                    let manifest = generated_operation_manifests()
+                        .expect("catalogue")
+                        .into_iter()
+                        .find(|entry| entry.name == GENESIS_MANIFEST_NAME)
+                        .expect("genesis manifest");
+                    self.adapter = Some(
+                        SurrealStoreAdapter::new_with_client_set(
+                            self.config.clone(),
+                            lease,
+                            manifest,
+                            limits,
+                        )
+                        .expect("adapter"),
+                    );
+                    match tokio::time::timeout_at(deadline, self.adapter().connect()).await {
+                        Ok(Ok(())) => return,
+                        Ok(Err(error)) => last_error = Some(error),
+                        Err(_) => {
+                            self.adapter = None;
+                            panic!(
+                                "authenticated provider readiness timed out; last error: {last_error:?}"
+                            );
+                        }
+                    }
+                    self.adapter = None;
+                    assert!(
+                        Instant::now() < deadline,
+                        "authenticated provider readiness timed out; last error: {last_error:?}"
+                    );
+                    sleep(
+                        Duration::from_millis(100)
+                            .min(deadline.saturating_duration_since(Instant::now())),
+                    )
+                    .await;
+                }
+            }
+
+            fn adapter(&self) -> &SurrealStoreAdapter {
+                self.adapter.as_ref().expect("live adapter")
+            }
+
+            async fn migrate(&self) {
+                let ctx = fixture_ctx();
+                self.adapter()
+                    .apply_migration(
+                        &SurrealStoreAdapter::v2_baseline_migration(),
+                        &ctx.clock,
+                        &ctx.state_fence,
+                    )
+                    .await
+                    .expect("baseline migration");
+            }
+
+            async fn close(&mut self) {
+                self.adapter = None;
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while TcpStream::connect(&self.config.provider_bind_address)
+                    .await
+                    .is_ok()
+                {
+                    assert!(
+                        Instant::now() < deadline,
+                        "provider did not release endpoint"
+                    );
+                    sleep(Duration::from_millis(50)).await;
+                }
+            }
+
+            async fn cleanup(&mut self) {
+                self.close().await;
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while let Err(error) = std::fs::remove_dir_all(&self.root) {
+                    assert!(
+                        Instant::now() < deadline,
+                        "test root cleanup failed: {error}"
+                    );
+                    sleep(Duration::from_millis(50)).await;
+                }
+                assert!(!self.root.exists(), "test root removed");
+            }
+        }
+
+        impl Drop for Harness {
+            fn drop(&mut self) {
+                self.adapter = None;
+                let _ = std::fs::remove_dir_all(&self.root);
+            }
+        }
+
+        struct PlannedPair {
+            authorities_b: Vec<Option<ExactJsonBytes>>,
+            plan_a: plan::ApplyPlan,
+            receipt_a: WriteReceipt,
+            plan_b: plan::ApplyPlan,
+            receipt_b: WriteReceipt,
+        }
+
+        /// Plans both writers against one observed allocation (pure): the
+        /// deterministic shared-counter race setup without timing flakes.
+        fn planned_pair(
+            a: &PreparedTransitionForTest,
+            b: &PreparedTransitionForTest,
+            commit: u64,
+            outbox: u64,
+        ) -> PlannedPair {
+            let authorities_a = vec![None; a.transition.named_operations.len()];
+            let authorities_b = vec![None; b.transition.named_operations.len()];
+            let plan_a =
+                plan::select_apply_plan(&a.transition, &authorities_a, &[], &[], commit, outbox)
+                    .expect("plan A applies");
+            let receipt_a = build_receipt(&a.ctx, &a.transition, &plan_a).expect("receipt A");
+            let plan_b =
+                plan::select_apply_plan(&b.transition, &authorities_b, &[], &[], commit, outbox)
+                    .expect("plan B applies against the same observed allocation");
+            let receipt_b = build_receipt(&b.ctx, &b.transition, &plan_b).expect("receipt B");
+            PlannedPair {
+                authorities_b,
+                plan_a,
+                receipt_a,
+                plan_b,
+                receipt_b,
+            }
+        }
+
+        #[tokio::test]
+        async fn stale_allocation_contends_then_bounded_retry_commits() {
+            let mut harness = Harness::start().await;
+            harness.migrate().await;
+            let adapter = harness.adapter();
+            let db = client(adapter).await.expect("transport");
+            let prepared_a = admitted("op-989-stale-a", "scope-989-a", "subject-989-a");
+            let prepared_b = admitted("op-989-stale-b", "scope-989-b", "subject-989-b");
+            // Both writers observe the same initial fence through separate
+            // sessions: the disjoint semantic scopes share one global
+            // allocation, which is the original race.
+            let fence_opt = read_fence(db, &adapter.config).await.expect("fence read");
+            let fence = fence_opt.as_ref().expect("fence row");
+            assert_eq!(
+                (fence.next_commit_sequence, fence.next_outbox_sequence),
+                (1, 1),
+                "isolated database starts at the genesis allocation"
+            );
+            let initial = fence_opt.is_none();
+            let planned = planned_pair(&prepared_a, &prepared_b, 1, 1);
+            atomic_write::write_transaction(
+                db,
+                &adapter.config,
+                &prepared_a.transition,
+                &planned.plan_a,
+                &planned.receipt_a,
+                initial,
+                1,
+                1,
+                &[],
+                &[],
+                atomic_write::TxLane::PooledWrite,
+            )
+            .await
+            .expect("first writer commits");
+            // The second writer's pre-read allocation is now stale. Its
+            // disjoint semantic scopes are fresh, so this must surface as
+            // transient allocation contention — never a false semantic
+            // conflict and never an unknown outcome.
+            match atomic_write::write_transaction(
+                db,
+                &adapter.config,
+                &prepared_b.transition,
+                &planned.plan_b,
+                &planned.receipt_b,
+                false,
+                1,
+                1,
+                &[],
+                &[],
+                atomic_write::TxLane::PooledWrite,
+            )
+            .await
+            {
+                Err(AdapterError::AllocationContention { operation_id }) => {
+                    assert_eq!(operation_id, "op-989-stale-b");
+                }
+                unexpected => panic!("stale allocation must contend, got {unexpected:?}"),
+            }
+            // Bounded retry under the unchanged semantic contract: fresh
+            // allocation, same scopes, same expected heads.
+            let moved = read_fence(db, &adapter.config)
+                .await
+                .expect("fence re-read")
+                .expect("fence row");
+            assert_eq!(
+                (moved.next_commit_sequence, moved.next_outbox_sequence),
+                (2, 2),
+                "exactly one allocation was consumed"
+            );
+            let plan_b2 = plan::select_apply_plan(
+                &prepared_b.transition,
+                &planned.authorities_b,
+                &[],
+                &[],
+                moved.next_commit_sequence,
+                moved.next_outbox_sequence,
+            )
+            .expect("replan applies");
+            let receipt_b2 = build_receipt(&prepared_b.ctx, &prepared_b.transition, &plan_b2)
+                .expect("receipt B2");
+            atomic_write::write_transaction(
+                db,
+                &adapter.config,
+                &prepared_b.transition,
+                &plan_b2,
+                &receipt_b2,
+                false,
+                moved.next_commit_sequence,
+                moved.next_outbox_sequence,
+                &[],
+                &[],
+                atomic_write::TxLane::PooledWrite,
+            )
+            .await
+            .expect("bounded retry commits");
+            validate_receipt_identity(&receipt_b2, &prepared_b.ctx, &prepared_b.transition)
+                .expect("retried receipt identity validates");
+            assert_eq!(
+                receipt_b2.committed_at.as_deref(),
+                Some("commit-sequence-0000000000000002"),
+                "retry consumed exactly the next allocation"
+            );
+            harness.cleanup().await;
+        }
+
+        #[tokio::test]
+        async fn concurrent_disjoint_commits_share_no_allocation() {
+            let mut harness = Harness::start().await;
+            harness.migrate().await;
+            let adapter = harness.adapter();
+            // Overlap precondition: the write lane admits two sessions under
+            // one provider generation; the facade session is untouched.
+            let db = client(adapter).await.expect("transport");
+            assert_eq!(
+                db.session_pool().slot_count(SessionRole::NormalWrite),
+                2,
+                "seam test needs two write-lane sessions"
+            );
+            let prepared_a = admitted("op-989-live-a", "scope-989-a", "subject-989-a");
+            let prepared_b = admitted("op-989-live-b", "scope-989-b", "subject-989-b");
+            let authorities_a = vec![None; prepared_a.transition.named_operations.len()];
+            let authorities_b = vec![None; prepared_b.transition.named_operations.len()];
+            let (receipt_a, receipt_b) = tokio::join!(
+                apply_prepared_without_write_guard(
+                    adapter,
+                    &prepared_a.ctx,
+                    prepared_a.transition.clone(),
+                    Vec::new(),
+                    Vec::new(),
+                    &authorities_a,
+                ),
+                apply_prepared_without_write_guard(
+                    adapter,
+                    &prepared_b.ctx,
+                    prepared_b.transition.clone(),
+                    Vec::new(),
+                    Vec::new(),
+                    &authorities_b,
+                )
+            );
+            let receipt_a = receipt_a.expect("disjoint writer A commits");
+            let receipt_b = receipt_b.expect("disjoint writer B commits");
+            // Interleaving-insensitive: the allocated pair is exactly {1,2}
+            // whatever the commit order was.
+            let mut committed: Vec<_> = [
+                receipt_a.committed_at.clone(),
+                receipt_b.committed_at.clone(),
+            ]
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .expect("both receipts carry commit instants");
+            committed.sort();
+            assert_eq!(
+                committed,
+                vec![
+                    "commit-sequence-0000000000000001".to_owned(),
+                    "commit-sequence-0000000000000002".to_owned(),
+                ],
+                "disjoint commits hold unique valid allocations"
+            );
+            assert_ne!(
+                receipt_a.outbox_refs, receipt_b.outbox_refs,
+                "outbox allocation is unique per commit"
+            );
+            for receipt in [&receipt_a, &receipt_b] {
+                validate_store_receipt_envelope_for_test(receipt);
+            }
+            let snapshot = adapter
+                .recovery(StoreRecoveryRequest {
+                    contract_version: CONTRACT_VERSION,
+                    state_fence: fence(),
+                    records: Vec::new(),
+                    include_receipts: true,
+                    include_jobs: false,
+                })
+                .await
+                .expect("recovery snapshot");
+            snapshot.validate().expect("snapshot validates");
+            assert_eq!(
+                snapshot.receipts.len(),
+                2,
+                "exactly the two effect sets are durable"
+            );
+            let heads: std::collections::BTreeMap<_, _> = snapshot
+                .canonical_scope
+                .ordering_heads
+                .iter()
+                .map(|head| (head.scope.to_string(), head.sequence))
+                .collect();
+            assert_eq!(
+                heads.get("scope-989-a"),
+                heads.get("scope-989-b"),
+                "symmetric disjoint commits advance symmetric per-scope heads"
+            );
+            harness.cleanup().await;
+        }
+
+        #[tokio::test]
+        async fn production_apply_commits_while_global_guard_is_held() {
+            let mut harness = Harness::start().await;
+            harness.migrate().await;
+            let adapter = harness.adapter();
+            // Discriminator: hold the process-global write guard for the
+            // whole concurrent section. If production allocation still rode
+            // under it, both writers below would block until this guard
+            // drops and the bounded wait would time out; with fence-CAS
+            // plus head-predicate arbitration they commit while it is held.
+            let held = adapter.write_lock.lock().await;
+            let prepared_a = admitted("op-989-prod-a", "scope-989-a", "subject-989-a");
+            let prepared_b = admitted("op-989-prod-b", "scope-989-b", "subject-989-b");
+            let authorities_a = vec![None; prepared_a.transition.named_operations.len()];
+            let authorities_b = vec![None; prepared_b.transition.named_operations.len()];
+            let (receipt_a, receipt_b) = timeout(Duration::from_mins(2), async {
+                tokio::join!(
+                    apply_prepared_with_authority(
+                        adapter,
+                        &prepared_a.ctx,
+                        prepared_a.transition.clone(),
+                        Vec::new(),
+                        Vec::new(),
+                        &authorities_a,
+                    ),
+                    apply_prepared_with_authority(
+                        adapter,
+                        &prepared_b.ctx,
+                        prepared_b.transition.clone(),
+                        Vec::new(),
+                        Vec::new(),
+                        &authorities_b,
+                    )
+                )
+            })
+            .await
+            .expect("production writers commit while the global guard is held elsewhere");
+            let receipt_a = receipt_a.expect("production writer A commits");
+            let receipt_b = receipt_b.expect("production writer B commits");
+            // Interleaving-insensitive: the allocated pair is exactly {1,2}
+            // whatever the commit order was.
+            let mut committed: Vec<_> = [
+                receipt_a.committed_at.clone(),
+                receipt_b.committed_at.clone(),
+            ]
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .expect("both receipts carry commit instants");
+            committed.sort();
+            assert_eq!(
+                committed,
+                vec![
+                    "commit-sequence-0000000000000001".to_owned(),
+                    "commit-sequence-0000000000000002".to_owned(),
+                ],
+                "production disjoint commits hold unique valid allocations"
+            );
+            assert_ne!(
+                receipt_a.outbox_refs, receipt_b.outbox_refs,
+                "outbox allocation is unique per commit"
+            );
+            for receipt in [&receipt_a, &receipt_b] {
+                validate_store_receipt_envelope_for_test(receipt);
+            }
+            drop(held);
+            let snapshot = adapter
+                .recovery(StoreRecoveryRequest {
+                    contract_version: CONTRACT_VERSION,
+                    state_fence: fence(),
+                    records: Vec::new(),
+                    include_receipts: true,
+                    include_jobs: false,
+                })
+                .await
+                .expect("recovery snapshot");
+            snapshot.validate().expect("snapshot validates");
+            assert_eq!(
+                snapshot.receipts.len(),
+                2,
+                "exactly the two production effect sets are durable"
+            );
+            println!("SCONC-989 production-guard-held committed={committed:?} receipts=2");
+            harness.cleanup().await;
+        }
+
+        #[tokio::test]
+        async fn concurrent_same_operation_yields_one_effect_set() {
+            let mut harness = Harness::start().await;
+            harness.migrate().await;
+            let adapter = harness.adapter();
+            let prepared = admitted("op-989-same", "scope-989-same", "subject-989-same");
+            let authorities = vec![None; prepared.transition.named_operations.len()];
+            let (first, second) = tokio::join!(
+                apply_prepared_without_write_guard(
+                    adapter,
+                    &prepared.ctx,
+                    prepared.transition.clone(),
+                    Vec::new(),
+                    Vec::new(),
+                    &authorities,
+                ),
+                apply_prepared_without_write_guard(
+                    adapter,
+                    &prepared.ctx,
+                    prepared.transition.clone(),
+                    Vec::new(),
+                    Vec::new(),
+                    &authorities,
+                )
+            );
+            let first = first.expect("same-op writer commits");
+            let second = second.expect("same-op writer resolves");
+            assert_eq!(
+                first, second,
+                "exact duplicate submission returns the original receipt"
+            );
+            let snapshot = adapter
+                .recovery(StoreRecoveryRequest {
+                    contract_version: CONTRACT_VERSION,
+                    state_fence: fence(),
+                    records: Vec::new(),
+                    include_receipts: true,
+                    include_jobs: false,
+                })
+                .await
+                .expect("recovery snapshot");
+            assert_eq!(
+                snapshot.receipts.len(),
+                1,
+                "concurrent duplicates persist one effect set"
+            );
+            assert_eq!(snapshot.receipts[0], first);
+            harness.cleanup().await;
+        }
+
+        fn validate_store_receipt_envelope_for_test(receipt: &eliot_store_api::WriteReceipt) {
+            receipt.validate().expect("receipt validates");
+            receipt
+                .require_reconciliation_envelope()
+                .expect("reconciliation envelope travels");
+        }
     }
 }

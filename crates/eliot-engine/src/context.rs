@@ -676,7 +676,8 @@ fn attach_packet_plan_sources<'a>(
                 exposure_policy,
             },
             &deduplicate_experience_cases(cases.clone()),
-        );
+        )
+        .map_err(|overflow| invalid_plan(overflow.to_string()))?;
         packet.memory_need_decision = Some(memory_need);
         packet.experience_priors = experience.experience_priors;
     }

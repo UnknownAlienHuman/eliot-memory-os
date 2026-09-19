@@ -26,6 +26,19 @@ pub enum AdapterError {
     PartialOutcome,
     #[error("provider-side compare-and-set conflict")]
     ProviderConflict,
+    /// Canonical allocation contention (S-CONC-TX, issue #989).
+    ///
+    /// The canonical transaction aborted on the shared fence/sequence
+    /// compare-and-set while carrying no semantic revision/ordering conflict
+    /// marker. The fence CAS precedes the receipt create in statement order,
+    /// so this outcome is proved-not-committed for this operation identity:
+    /// the bounded allocation retry may re-read the fence and recompute only
+    /// allocation-dependent values under the unchanged semantic contract. It
+    /// is never a semantic stale-head conflict and never an unknown outcome.
+    #[error(
+        "canonical allocation contention; re-read allocation by operation identity {operation_id}"
+    )]
+    AllocationContention { operation_id: String },
     #[error("named operation is unavailable: {operation}")]
     NamedOperationUnavailable { operation: String },
     #[error("configuration error: {0}")]
@@ -41,14 +54,16 @@ impl AdapterError {
     /// Each provider observation keeps a distinct typed `StoreError` so
     /// `StoreFailure::from_store_error` preserves its disposition:
     /// transport loss stays retryable `Unavailable`; provider
-    /// compare-and-set conflict stays `RevisionConflict`; unknown or partial
-    /// provider outcomes stay reconciling `MissingReceiptEnvelope` (the
-    /// admitted operation identity at the dispatch boundary is the
-    /// reconciliation key; this variant itself carries no identity);
-    /// unavailable named operations stay unsupported `UnknownOperation`;
-    /// configuration defects stay deterministic `InvalidField` and
-    /// serialization defects stay `Serialization`, both with provider prose
-    /// dropped in favour of bounded static text.
+    /// compare-and-set conflict stays `RevisionConflict`; transient canonical
+    /// allocation contention (S-CONC-TX, issue #989) stays retryable
+    /// `Unavailable` and never a false semantic `RevisionConflict`; unknown
+    /// or partial provider outcomes stay reconciling
+    /// `MissingReceiptEnvelope` (the admitted operation identity at the
+    /// dispatch boundary is the reconciliation key; this variant itself
+    /// carries no identity); unavailable named operations stay unsupported
+    /// `UnknownOperation`; configuration defects stay deterministic
+    /// `InvalidField` and serialization defects stay `Serialization`, both
+    /// with provider prose dropped in favour of bounded static text.
     /// Contract ceiling (honest stop; extending it needs a Contract Challenge
     /// owned outside Wave A): `StoreError` has no Backpressure, Deadline,
     /// `MigrationRequired` or `Partial` variants, so `MigrationRequired` and
@@ -59,7 +74,7 @@ impl AdapterError {
     pub fn into_store_error(self) -> StoreError {
         match self {
             Self::Store(error) => error,
-            Self::ProviderUnavailable => StoreError::Unavailable,
+            Self::ProviderUnavailable | Self::AllocationContention { .. } => StoreError::Unavailable,
             Self::ProviderConflict => StoreError::RevisionConflict,
             Self::UnknownOutcome { .. } | Self::PartialOutcome => {
                 StoreError::MissingReceiptEnvelope
@@ -95,5 +110,34 @@ mod tests {
             operation_id: "op-1".to_owned(),
         };
         assert_eq!(error.into_store_error(), StoreError::MissingReceiptEnvelope);
+    }
+
+    #[test]
+    fn allocation_contention_is_transient_never_a_semantic_conflict() {
+        let error = AdapterError::AllocationContention {
+            operation_id: "op-alloc-1".to_owned(),
+        };
+        assert_eq!(error.clone().into_store_error(), StoreError::Unavailable);
+        assert_ne!(
+            error.clone().into_store_error(),
+            StoreError::RevisionConflict
+        );
+        assert_ne!(error.into_store_error(), StoreError::MissingReceiptEnvelope);
+    }
+
+    #[test]
+    fn deterministic_conflict_mapping_is_preserved() {
+        assert_eq!(
+            AdapterError::ProviderConflict.into_store_error(),
+            StoreError::RevisionConflict
+        );
+        assert_eq!(
+            AdapterError::ProviderUnavailable.into_store_error(),
+            StoreError::Unavailable
+        );
+        assert_eq!(
+            AdapterError::PartialOutcome.into_store_error(),
+            StoreError::MissingReceiptEnvelope
+        );
     }
 }

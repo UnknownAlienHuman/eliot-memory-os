@@ -2792,6 +2792,7 @@ version = "0.1.0"
 dependencies = [
  "eliot-agent-api",
  "eliot-agent-contracts",
+ "eliot-coordination",
  "eliot-evidence",
  "eliot-receipts",
  "eliot-security-contracts",
