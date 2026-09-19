@@ -218,7 +218,7 @@ fn classify_one(
         DescriptorClass::Gap(OmissionKind::OverBudget, _) => 2,
         DescriptorClass::Gap(OmissionKind::AuthorityBlocked, _) => 3,
     };
-    let collapse = bounds::canonical_digest(&(&descriptor.kind, &target, &descriptor.owner))?;
+    let collapse = bounds::canonical_digest(&(&descriptor.kind, &target))?;
     Ok(DescriptorGroup {
         order,
         kind: descriptor.kind,

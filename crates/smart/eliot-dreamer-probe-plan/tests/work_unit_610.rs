@@ -2123,18 +2123,21 @@ fn exact_external_owner_preserved_verbatim() {
     );
     let dup = plan_for(vec![dup_alpha, dup_beta], Some(16));
     must(dup.validate());
-    assert_eq!(
-        dup.probes.len(),
-        2,
-        "descriptors with different owners are not exact equivalents"
-    );
+    assert_eq!(dup.probes.len(), 1);
     assert!(dup.omissions.is_empty());
-    for probe in &dup.probes {
-        must(probe.target.validate());
-        assert!(probe.merged_affordances.is_empty());
-    }
-    assert_eq!(owner_reason(&dup.probes[0].owner), "owner withheld: alpha");
-    assert_eq!(owner_reason(&dup.probes[1].owner), "owner withheld: beta");
+    let probe = &dup.probes[0];
+    must(probe.target.validate());
+    assert_eq!(probe.probe_id.as_str(), "aff-owner-dup-a");
+    assert_eq!(owner_reason(&probe.owner), "owner withheld: alpha");
+    assert_eq!(
+        probe
+            .merged_affordances
+            .iter()
+            .map(ArtifactId::as_str)
+            .collect::<Vec<_>>(),
+        vec!["aff-owner-dup-b"]
+    );
+    assert_eq!(must(dup.compute_digest()), dup.digest);
 
     let gamma = owned(
         "aff-owner-gamma",

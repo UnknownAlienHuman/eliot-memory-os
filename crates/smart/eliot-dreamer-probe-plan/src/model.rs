@@ -255,16 +255,6 @@ impl ProbeDimensions {
     }
 }
 
-/// Validates a preserved owner reference without granting authority: the
-/// planner copies the descriptor owner verbatim and never substitutes it.
-fn validate_owner(owner: &ProbeOwnerRef, field: &'static str) -> Result<(), ContractViolation> {
-    match owner {
-        ProbeOwnerRef::Source { owner } => bounds::text(owner.as_str(), field),
-        ProbeOwnerRef::Verifier { verifier_id } => bounds::text(verifier_id.as_str(), field),
-        ProbeOwnerRef::Unavailable { reason } => bounds::text(reason, field),
-    }
-}
-
 /// One ranked candidate probe proposal.
 ///
 /// Candidate-only: the proposal carries no execution handle, reserves no
@@ -304,7 +294,6 @@ impl ProbeProposal {
         bounds::text(self.probe_id.as_str(), "probe_plan.probe.probe_id")?;
         self.target.validate()?;
         self.affordance.validate()?;
-        validate_owner(&self.owner, "probe_plan.probe.owner")?;
         if self.probe_id != self.affordance.affordance_id {
             return Err(ContractViolation::BindingMismatch {
                 field: "probe_plan.probe.probe_id",
@@ -393,7 +382,6 @@ impl ProbeOmission {
         preflight(self)?;
         self.target.validate()?;
         self.affordance.validate()?;
-        validate_owner(&self.owner, "probe_plan.omission.owner")?;
         bounds::sequence(
             self.merged_affordances.len(),
             "probe_plan.omission.merged_affordances",
