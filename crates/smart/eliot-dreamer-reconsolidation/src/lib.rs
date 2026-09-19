@@ -136,6 +136,13 @@ fn same_sorted_set(left: &[String], right: &[String]) -> bool {
     left == right
 }
 
+fn has_repeated_handle(values: &[String]) -> bool {
+    values
+        .iter()
+        .enumerate()
+        .any(|(index, value)| values[..index].iter().any(|previous| previous == value))
+}
+
 fn digits_of(value: &str) -> Vec<char> {
     value.chars().filter(char::is_ascii_digit).collect()
 }
@@ -933,6 +940,25 @@ pub fn propose_reconsolidation(
     request: &ReconsolidationRequest,
 ) -> Result<ReconsolidationResult, ReconsolidationError> {
     preflight_bounds(request)?;
+    let dependent_handles: Vec<String> = request
+        .dependents
+        .iter()
+        .map(|dependent| dependent.handle.clone())
+        .collect();
+    let outcome_handles: Vec<String> = request
+        .dependent_outcomes
+        .iter()
+        .map(|outcome| outcome.handle.clone())
+        .collect();
+    if has_repeated_handle(&dependent_handles) || has_repeated_handle(&outcome_handles) {
+        return ok_result(
+            ReconsolidationOutcome::Blocked,
+            None,
+            request.parent_propositions.len(),
+            0,
+            "dependent coverage requires one-to-one handles",
+        );
+    }
     validate_shapes(request)?;
 
     request
@@ -1401,17 +1427,10 @@ pub fn propose_reconsolidation(
             "every affected dependent needs exactly one disposition",
         );
     }
-    let dependent_handles: Vec<String> = request
-        .dependents
-        .iter()
-        .map(|dependent| dependent.handle.clone())
-        .collect();
-    let outcome_handles: Vec<String> = request
-        .dependent_outcomes
-        .iter()
-        .map(|outcome| outcome.handle.clone())
-        .collect();
-    if !same_sorted_set(&dependent_handles, &outcome_handles) {
+    if has_repeated_handle(&dependent_handles)
+        || has_repeated_handle(&outcome_handles)
+        || !same_sorted_set(&dependent_handles, &outcome_handles)
+    {
         return ok_result(
             ReconsolidationOutcome::Blocked,
             None,
@@ -2414,6 +2433,44 @@ mod tests {
         assert_eq!(result.outcome, ReconsolidationOutcome::Blocked);
         assert!(result.child.is_none());
         assert!(result.note.contains("exactly cover"));
+    }
+
+    #[test]
+    fn duplicate_dependent_handle_is_blocked() {
+        let mut request = valid_request();
+        request.dependents.push(DependentRecord {
+            handle: "dep-1".to_owned(),
+            required: false,
+            kind: "secondary-summary".to_owned(),
+        });
+        request.dependent_outcomes.push(DependentOutcome {
+            handle: "dep-1".to_owned(),
+            disposition: DependentDisposition::Retain,
+            note: "second disposition must not be reused".to_owned(),
+        });
+
+        let result = propose_reconsolidation(&request).expect("duplicate dependent is semantic");
+        assert_eq!(result.outcome, ReconsolidationOutcome::Blocked);
+        assert!(result.child.is_none());
+    }
+
+    #[test]
+    fn duplicate_outcome_handle_is_blocked() {
+        let mut request = valid_request();
+        request.dependents.push(DependentRecord {
+            handle: "dep-1".to_owned(),
+            required: true,
+            kind: "secondary-summary".to_owned(),
+        });
+        request.dependent_outcomes.push(DependentOutcome {
+            handle: "dep-1".to_owned(),
+            disposition: DependentDisposition::Blocked,
+            note: "second disposition must not be silently usable".to_owned(),
+        });
+
+        let result = propose_reconsolidation(&request).expect("duplicate outcome is semantic");
+        assert_eq!(result.outcome, ReconsolidationOutcome::Blocked);
+        assert!(result.child.is_none());
     }
 
     // WORK_UNIT_CASE: 667/39
