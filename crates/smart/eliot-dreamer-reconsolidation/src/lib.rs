@@ -1092,30 +1092,29 @@ pub fn propose_reconsolidation(
             stale_temporal = stale_temporal.saturating_add(1);
             continue;
         }
-        if genuine.iter().any(|g| g.lineage == item.lineage) {
-            continue;
-        }
+        // Lineage groups provenance; the handle and canonical digest identify the item.
         genuine.push(item);
     }
+    // Unknown temporal order abstains first; stale material then outranks every other result.
+    if unknown_temporal > 0 {
+        return ok_result(
+            ReconsolidationOutcome::Abstention,
+            None,
+            request.parent_propositions.len(),
+            0,
+            "temporal order is unknown and no wall-clock fill is admitted",
+        );
+    }
+    if stale_temporal > 0 {
+        return ok_result(
+            ReconsolidationOutcome::Stale,
+            None,
+            request.parent_propositions.len(),
+            0,
+            "new evidence does not follow the exact reactivation checkpoint",
+        );
+    }
     if genuine.is_empty() {
-        if unknown_temporal > 0 {
-            return ok_result(
-                ReconsolidationOutcome::Abstention,
-                None,
-                request.parent_propositions.len(),
-                0,
-                "temporal order is unknown and no wall-clock fill is admitted",
-            );
-        }
-        if stale_temporal > 0 {
-            return ok_result(
-                ReconsolidationOutcome::Stale,
-                None,
-                request.parent_propositions.len(),
-                0,
-                "new evidence does not follow the exact reactivation checkpoint",
-            );
-        }
         return ok_result(
             ReconsolidationOutcome::NoMaterialNewEvidence,
             None,
@@ -1752,6 +1751,78 @@ mod tests {
             .sort_by(|left, right| left.handle.cmp(&right.handle));
         let error = propose_reconsolidation(&request).expect_err("same digest is not new");
         assert!(matches!(error, ReconsolidationError::Source { .. }));
+    }
+
+    // WORK_UNIT_CASE: 667/18
+    #[test]
+    fn case_18_distinct_evidence_under_one_lineage_is_admitted() {
+        let mut request = valid_request();
+        request.new_items.push(NewEvidenceItem {
+            handle: "obs-2".to_owned(),
+            digest: "2".repeat(64),
+            lineage: request.new_items[0].lineage.clone(),
+            statement: "Warm-up run 8 shortened another cold start.".to_owned(),
+            source_kind: EvidenceSourceKind::ExternalObservation,
+            observed_at_ms: Some(1_700_000_000_003),
+        });
+        request
+            .new_items
+            .sort_by(|left, right| left.handle.cmp(&right.handle));
+        request.new_member_denominator.members = vec!["obs-1".to_owned(), "obs-2".to_owned()];
+        request.new_member_denominator.expected_total = 2;
+        let result = propose_reconsolidation(&request).expect("distinct evidence is material");
+        assert_eq!(result.outcome, ReconsolidationOutcome::Complete);
+        assert_eq!(result.admitted_new, 2);
+    }
+
+    // WORK_UNIT_CASE: 667/19
+    #[test]
+    fn case_19_stale_material_precedes_surviving_material() {
+        let mut request = valid_request();
+        request.new_items.push(NewEvidenceItem {
+            handle: "obs-0".to_owned(),
+            digest: "0".repeat(64),
+            lineage: "lineage-new-0".to_owned(),
+            statement: "Stale warm-up observation.".to_owned(),
+            source_kind: EvidenceSourceKind::ExternalObservation,
+            observed_at_ms: Some(1_700_000_000_001),
+        });
+        request
+            .new_items
+            .sort_by(|left, right| left.handle.cmp(&right.handle));
+        let result = propose_reconsolidation(&request).expect("stale order is semantic");
+        assert_eq!(result.outcome, ReconsolidationOutcome::Stale);
+        assert!(result.child.is_none());
+    }
+
+    // WORK_UNIT_CASE: 667/43
+    #[test]
+    fn case_43_unknown_temporal_precedes_stale_material() {
+        let mut request = valid_request();
+        request.new_items.extend([
+            NewEvidenceItem {
+                handle: "obs-0".to_owned(),
+                digest: "0".repeat(64),
+                lineage: "lineage-new-0".to_owned(),
+                statement: "Stale warm-up observation.".to_owned(),
+                source_kind: EvidenceSourceKind::ExternalObservation,
+                observed_at_ms: Some(1_700_000_000_001),
+            },
+            NewEvidenceItem {
+                handle: "obs-2".to_owned(),
+                digest: "2".repeat(64),
+                lineage: "lineage-new-2".to_owned(),
+                statement: "Unknown-time warm-up observation.".to_owned(),
+                source_kind: EvidenceSourceKind::ExternalObservation,
+                observed_at_ms: None,
+            },
+        ]);
+        request
+            .new_items
+            .sort_by(|left, right| left.handle.cmp(&right.handle));
+        let result = propose_reconsolidation(&request).expect("unknown order abstains");
+        assert_eq!(result.outcome, ReconsolidationOutcome::Abstention);
+        assert!(result.child.is_none());
     }
 
     // WORK_UNIT_CASE: 667/20
