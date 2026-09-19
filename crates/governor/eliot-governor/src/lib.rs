@@ -53,6 +53,8 @@ mod observation_reconciliation;
 mod operator_reconciliation;
 mod owner_projection_refresh;
 mod skill_lifecycle;
+mod swarm_plan_attachment_composition;
+mod swarm_plan_attachment_ownership;
 mod swarm_plan_attachment_service;
 mod task_lifecycle;
 
@@ -77,6 +79,10 @@ pub use observation_reconciliation::{
 };
 pub use operator_reconciliation::{GovernorOperatorReconciliation, operator_command_envelope};
 pub use skill_lifecycle::GovernorSkillLifecycle;
+pub use swarm_plan_attachment_composition::SwarmAttachmentComposition;
+pub use swarm_plan_attachment_ownership::{
+    AttachmentOwnershipDomain, AttachmentOwnershipScope, OwnershipOutcome,
+};
 pub use swarm_plan_attachment_service::{
     ATTACHMENT_ORDERING_SCOPE, ATTACHMENT_REVISION_KEY, CanonicalAttachmentStoreError,
     CanonicalSwarmPlanAttachmentStore, SwarmPlanAttachmentService,

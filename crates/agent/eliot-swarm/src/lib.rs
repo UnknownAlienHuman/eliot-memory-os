@@ -2600,6 +2600,12 @@ pub fn restore_controller(
 /// Durable-job attachment and admitted child-dispatch lineage (issue #1126).
 /// See [`durable_dispatch`] for the binding rules.
 pub mod durable_dispatch;
+/// Production swarm consumption of Governor-owned plan attachment (issue
+/// #2017 item 6). New production callers attach through
+/// [`swarm_plan_attachment_consumer`] over a Governor-vended consumer port;
+/// [`durable_dispatch`] remains the in-crate primitive over a caller-supplied
+/// ledger.
+pub mod swarm_plan_attachment_consumer;
 /// The cell stays stateless: [`durable_work::DurableWorkMachine`] is a
 /// transient interpreter over records owned by the injected
 /// [`durable_work::DurableWorkStore`]. It owns no process, route, task,
