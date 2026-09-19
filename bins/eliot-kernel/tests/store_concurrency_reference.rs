@@ -794,14 +794,15 @@ fn source_proof_guard() {
             "cases allocated exactly once"
         );
     }
-    // Manifest guard: Store reference/adapter edges are test-only. The
-    // production [dependencies] table must not carry them, and the workspace
-    // root must not gain a member entry for them.
+    // Manifest guard: Store reference/adapter edges must be test-only.
+    // The production dependency table must not carry them; they must be
+    // declared in the member-local test dependency table instead.
     let manifest =
         std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
             .expect("member manifest");
     let mut section = String::new();
     let mut production_hits = Vec::new();
+    let mut test_edges = BTreeSet::new();
     for line in manifest.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with('[') {
@@ -812,15 +813,32 @@ fn source_proof_guard() {
                 || trimmed.starts_with("secrecy"))
         {
             production_hits.push(trimmed.to_owned());
+        } else if section == "[dev-dependencies]"
+            && (trimmed.starts_with("eliot-store-memory")
+                || trimmed.starts_with("eliot-store-surreal-adapter")
+                || trimmed.starts_with("secrecy"))
+        {
+            let raw = trimmed
+                .split_once('=')
+                .expect("dependency assignment")
+                .0
+                .trim();
+            let normalized = raw.strip_suffix(".workspace").unwrap_or(raw);
+            test_edges.insert(normalized.to_owned());
         }
     }
     assert!(
         production_hits.is_empty(),
         "production deps must not carry test-only edges: {production_hits:?}"
     );
-    assert!(
-        manifest.contains("eliot-store-memory"),
-        "test-only reference edge must exist"
+    assert_eq!(
+        test_edges,
+        BTreeSet::from([
+            "eliot-store-memory".to_owned(),
+            "eliot-store-surreal-adapter".to_owned(),
+            "secrecy".to_owned(),
+        ]),
+        "all Store reference/adapter test-only edges must be member-local dev-dependencies"
     );
     let root =
         std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.toml"))
