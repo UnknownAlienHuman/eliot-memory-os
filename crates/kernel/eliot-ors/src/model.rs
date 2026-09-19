@@ -2210,6 +2210,83 @@ pub struct OperationalControlProjection {
     pub recovery_inbox_refs: Vec<String>,
 }
 
+/// Maximum number of Kernel activation results retained by ORS.
+pub const MAX_ACTIVATION_RESULT_RETENTION_RECORDS: usize = 64;
+/// Maximum combined ticket/result payload size for one retained activation result.
+pub const MAX_ACTIVATION_RESULT_PAYLOAD_BYTES: usize = 128 * 1024;
+/// Maximum combined ticket/result payload size for the retention table.
+pub const MAX_ACTIVATION_RESULT_TOTAL_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
+
+/// Mechanical phase of one retained Kernel activation result.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ActivationResultRetentionPhase {
+    /// The activation reached a terminal accepted/negative result.
+    AcceptedTerminal,
+    /// The activation was deferred because the named dependency was not ready.
+    DeferredNotReady,
+}
+
+/// Opaque Kernel activation result retained by ORS for restart and exact replay.
+///
+/// ORS validates identity shape and bounds only. It does not deserialize either
+/// payload, create a Session, or restore authority, transport, or connection
+/// state. `order` is assigned by the ORS write transaction when a new record is
+/// retained; zero is therefore valid only before persistence.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActivationResultRetentionRecord {
+    pub ticket_id: String,
+    pub ticket_sha256: String,
+    pub ticket_payload: String,
+    pub result_sha256: String,
+    pub result_payload: String,
+    pub phase: ActivationResultRetentionPhase,
+    #[serde(default)]
+    pub order: u64,
+}
+
+impl ActivationResultRetentionRecord {
+    /// Validates one incoming or persisted record without interpreting payloads.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        validate_text(&self.ticket_id, "activation_result_ticket_id")?;
+        validate_digest(&self.ticket_sha256, "activation_result_ticket_sha256")?;
+        validate_digest(&self.result_sha256, "activation_result_result_sha256")?;
+        if self.payload_bytes() > MAX_ACTIVATION_RESULT_PAYLOAD_BYTES {
+            return Err(OrsError::InvalidField {
+                field: "activation_result_payload",
+                reason: "ticket and result payloads exceed the per-record bound",
+            });
+        }
+        Ok(())
+    }
+
+    /// Returns the exact durable key for this ticket.
+    pub fn record_key(&self) -> &str {
+        &self.ticket_id
+    }
+
+    /// Returns the payload bytes counted against retention bounds.
+    pub fn payload_bytes(&self) -> usize {
+        self.ticket_payload
+            .len()
+            .saturating_add(self.result_payload.len())
+    }
+
+    /// Compares the immutable ticket/result identity and payload binding.
+    ///
+    /// ORS order is progression assigned by the store, so it is deliberately
+    /// excluded from exact-replay comparison.
+    pub fn same_identity(&self, other: &Self) -> bool {
+        self.ticket_id == other.ticket_id
+            && self.ticket_sha256 == other.ticket_sha256
+            && self.ticket_payload == other.ticket_payload
+            && self.result_sha256 == other.result_sha256
+            && self.result_payload == other.result_payload
+            && self.phase == other.phase
+    }
+}
+
 /// Typed ORS failures. None grants semantic or completion authority.
 #[derive(Debug, Error)]
 pub enum OrsError {
@@ -2306,6 +2383,10 @@ pub enum OrsError {
         operation_id: String,
         request_digest: String,
     },
+    #[error(
+        "activation result ticket {ticket_id} conflicts with durable ORS state: IDENTITY_CONFLICT"
+    )]
+    ActivationResultRetentionIdentityConflict { ticket_id: String },
     #[error("native-worker claim {claim_id} conflicts with durable ORS state: IDENTITY_CONFLICT")]
     NativeWorkerClaimIdentityConflict { claim_id: String },
     #[error(

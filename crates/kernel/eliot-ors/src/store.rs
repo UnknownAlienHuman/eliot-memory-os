@@ -26,14 +26,15 @@ use persistence_models::{
 mod recovery_projection;
 
 use crate::{
-    ActiveSessionBinding, AdmissionReservation, AdmissionReservationActivation,
-    AdmissionReservationReceipt, AdmissionReservationRelease, AuthorityActivationReceipt,
-    AuthorityHandoffBegin, AuthorityHandoffRecord, AuthorityHandoffState, AuthorityRevocation,
-    AuthorityRevocationReceipt, AuthoritySnapshotReceipt, CanonicalDisposition,
-    CanonicalReconciliation, CapabilityGrantActivation, CapabilityGrantRevocation,
-    CapabilityIntroductionActivation, CapabilityIntroductionFence, CapabilityIntroductionReceipt,
-    DeliveryAcknowledgement, DeliveryCursorReceipt, DeliveryCursorState, EpochIdentity,
-    EpochLineage, GenerationCutoverReceipt, GenerationCutoverRecord, GenerationCutoverSnapshot,
+    ActivationResultRetentionRecord, ActiveSessionBinding, AdmissionReservation,
+    AdmissionReservationActivation, AdmissionReservationReceipt, AdmissionReservationRelease,
+    AuthorityActivationReceipt, AuthorityHandoffBegin, AuthorityHandoffRecord,
+    AuthorityHandoffState, AuthorityRevocation, AuthorityRevocationReceipt,
+    AuthoritySnapshotReceipt, CanonicalDisposition, CanonicalReconciliation,
+    CapabilityGrantActivation, CapabilityGrantRevocation, CapabilityIntroductionActivation,
+    CapabilityIntroductionFence, CapabilityIntroductionReceipt, DeliveryAcknowledgement,
+    DeliveryCursorReceipt, DeliveryCursorState, EpochIdentity, EpochLineage,
+    GenerationCutoverReceipt, GenerationCutoverRecord, GenerationCutoverSnapshot,
     GenerationTransition, GenerationTransitionReceipt, HostRequestRecord, HostRequestState,
     JobCheckpoint, KernelAuthoritySnapshot, NativeWorkerClaimAdmission, NativeWorkerClaimRecord,
     NativeWorkerClaimStageOutcome, NativeWorkerClaimState, OpaqueLabel, OperationalMutationReceipt,
@@ -95,6 +96,8 @@ const STORE_FAILURE_RETENTION: TableDefinition<&str, &str> =
 const UNKNOWN_COMMIT_RECOVERY: TableDefinition<&str, &str> =
     TableDefinition::new("ors_unknown_commit_recovery_v1");
 const HOST_REQUESTS: TableDefinition<&str, &str> = TableDefinition::new("ors_host_requests_v1");
+const ACTIVATION_RESULT_RETENTION: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_agent_activation_results_v1");
 const NATIVE_WORKER_CLAIMS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_native_worker_claims_v1");
 const REPLAY_STREAMS: TableDefinition<&str, &str> = TableDefinition::new("ors_replay_streams_v1");
@@ -393,6 +396,28 @@ pub trait OperationalRecoveryStore: Send + Sync {
         operation_id: &crate::OperationIdentity,
         request_digest: &str,
     ) -> Result<Option<crate::HostRequestRecord>, OrsError>;
+    /// Atomically retains one opaque Kernel activation result before its
+    /// acknowledgement may be emitted. An exact replay returns the durable
+    /// record; a changed ticket/result identity conflicts and never overwrites.
+    fn retain_activation_result(
+        &self,
+        record: &ActivationResultRetentionRecord,
+    ) -> Result<ActivationResultRetentionRecord, OrsError>;
+    /// Loads one retained activation result by exact ticket identity.
+    fn load_activation_result(
+        &self,
+        ticket_id: &str,
+    ) -> Result<Option<ActivationResultRetentionRecord>, OrsError>;
+    /// Reads one retained activation result only when its result digest binds
+    /// exactly to the retained ticket.
+    fn readback_activation_result(
+        &self,
+        ticket_id: &str,
+        result_sha256: &str,
+    ) -> Result<Option<ActivationResultRetentionRecord>, OrsError>;
+    /// Prunes the oldest retained activation results until both hard bounds
+    /// are satisfied. Pruning is atomic and does not interpret payloads.
+    fn prune_activation_results(&self) -> Result<u64, OrsError>;
     /// Stages one native-worker claim intent before any acknowledgement.
     ///
     /// An exact replay under the same claim identity returns
@@ -544,6 +569,21 @@ impl persistence_codec::PersistedValue for HostRequestRecord {
 
     fn validate_persisted(&self) -> Result<(), OrsError> {
         self.validate()
+    }
+}
+
+impl persistence_codec::PersistedValue for ActivationResultRetentionRecord {
+    const RECORD_TYPE: &'static str = "activation_result_retention";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()?;
+        if self.order == 0 {
+            return Err(OrsError::IntegrityProblem {
+                record_type: Self::RECORD_TYPE,
+                reason: "retained activation result has no ORS order".to_owned(),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -1427,6 +1467,158 @@ impl RedbRecoveryStore {
                 Ok(record)
             })
             .transpose()
+    }
+
+    /// Atomically retains one opaque Kernel activation result before its
+    /// acknowledgement may be emitted. The ORS transaction assigns order and
+    /// prunes only after the new row is durable within the same transaction.
+    pub fn retain_activation_result(
+        &self,
+        record: &ActivationResultRetentionRecord,
+    ) -> Result<ActivationResultRetentionRecord, OrsError> {
+        record.validate()?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let key = record.record_key().to_owned();
+        let existing: Option<ActivationResultRetentionRecord> = {
+            let table = write
+                .open_table(ACTIVATION_RESULT_RETENTION)
+                .map_err(storage)?;
+            table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+        };
+        if let Some(existing) = existing {
+            if !existing.same_identity(record) {
+                return Err(OrsError::ActivationResultRetentionIdentityConflict { ticket_id: key });
+            }
+            write.commit().map_err(storage)?;
+            return Ok(existing);
+        }
+
+        let mut next = record.clone();
+        next.order = Self::next_operational_order(&write)?;
+        next.validate()?;
+        let payload = encode(&next)?;
+        {
+            let mut table = write
+                .open_table(ACTIVATION_RESULT_RETENTION)
+                .map_err(storage)?;
+            table
+                .insert(key.as_str(), payload.as_str())
+                .map_err(storage)?;
+        }
+        Self::prune_activation_results_in_write(&write)?;
+        write.commit().map_err(storage)?;
+        Ok(next)
+    }
+
+    /// Loads one retained activation result by exact ticket identity.
+    pub fn load_activation_result(
+        &self,
+        ticket_id: &str,
+    ) -> Result<Option<ActivationResultRetentionRecord>, OrsError> {
+        crate::model::validate_text(ticket_id, "activation_result_ticket_id")?;
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read
+            .open_table(ACTIVATION_RESULT_RETENTION)
+            .map_err(storage)?;
+        table
+            .get(ticket_id)
+            .map_err(storage)?
+            .map(|value| decode(value.value()))
+            .transpose()
+    }
+
+    /// Reads one retained result only when the caller presents the exact
+    /// result digest bound to that ticket.
+    pub fn readback_activation_result(
+        &self,
+        ticket_id: &str,
+        result_sha256: &str,
+    ) -> Result<Option<ActivationResultRetentionRecord>, OrsError> {
+        crate::model::validate_text(ticket_id, "activation_result_ticket_id")?;
+        crate::model::validate_digest(result_sha256, "activation_result_result_sha256")?;
+        let retained = self.load_activation_result(ticket_id)?;
+        let Some(retained) = retained else {
+            return Ok(None);
+        };
+        if retained.result_sha256 != result_sha256 {
+            return Err(OrsError::ActivationResultRetentionIdentityConflict {
+                ticket_id: ticket_id.to_owned(),
+            });
+        }
+        Ok(Some(retained))
+    }
+
+    /// Prunes the oldest retained activation results until the count and
+    /// aggregate payload bounds are both satisfied.
+    pub fn prune_activation_results(&self) -> Result<u64, OrsError> {
+        let write = self.database.begin_write().map_err(storage)?;
+        let removed = Self::prune_activation_results_in_write(&write)?;
+        write.commit().map_err(storage)?;
+        Ok(removed)
+    }
+
+    fn prune_activation_results_in_write(write: &redb::WriteTransaction) -> Result<u64, OrsError> {
+        let mut rows = {
+            let table = write
+                .open_table(ACTIVATION_RESULT_RETENTION)
+                .map_err(storage)?;
+            let mut rows = Vec::new();
+            for entry in table.iter().map_err(storage)? {
+                let (key, value) = entry.map_err(storage)?;
+                let record: ActivationResultRetentionRecord = decode(value.value())?;
+                if key.value() != record.record_key() {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "activation_result_retention",
+                        reason: "table key does not match ticket identity".to_owned(),
+                    });
+                }
+                rows.push((key.value().to_owned(), record));
+            }
+            rows
+        };
+        rows.sort_by_key(|(_, record)| record.order);
+        for pair in rows.windows(2) {
+            if pair[0].1.order == pair[1].1.order {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "activation_result_retention",
+                    reason: "retention order is not unique".to_owned(),
+                });
+            }
+        }
+        let mut total_payload_bytes = rows.iter().try_fold(0usize, |total, (_, record)| {
+            total
+                .checked_add(record.payload_bytes())
+                .ok_or_else(|| OrsError::IntegrityProblem {
+                    record_type: "activation_result_retention",
+                    reason: "retention payload size overflow".to_owned(),
+                })
+        })?;
+        let mut remove_count = 0usize;
+        while rows.len().saturating_sub(remove_count)
+            > crate::MAX_ACTIVATION_RESULT_RETENTION_RECORDS
+            || total_payload_bytes > crate::MAX_ACTIVATION_RESULT_TOTAL_PAYLOAD_BYTES
+        {
+            let (_, oldest) = &rows[remove_count];
+            total_payload_bytes = total_payload_bytes.saturating_sub(oldest.payload_bytes());
+            remove_count += 1;
+        }
+        if remove_count == 0 {
+            return Ok(0);
+        }
+        let mut table = write
+            .open_table(ACTIVATION_RESULT_RETENTION)
+            .map_err(storage)?;
+        for (key, _) in rows.into_iter().take(remove_count) {
+            table.remove(key.as_str()).map_err(storage)?;
+        }
+        u64::try_from(remove_count).map_err(|_| OrsError::IntegrityProblem {
+            record_type: "activation_result_retention",
+            reason: "pruned record count exceeds counter".to_owned(),
+        })
     }
 
     /// Advances one staged host-request operation to its next mechanical state.
@@ -4393,6 +4585,11 @@ impl RedbRecoveryStore {
             drop(write.open_table(STORE_REBIND_REPLAY).map_err(storage)?);
             drop(write.open_table(UNKNOWN_COMMIT_RECOVERY).map_err(storage)?);
             drop(write.open_table(NATIVE_WORKER_CLAIMS).map_err(storage)?);
+            drop(
+                write
+                    .open_table(ACTIVATION_RESULT_RETENTION)
+                    .map_err(storage)?,
+            );
             drop(write.open_table(REPLAY_STREAMS).map_err(storage)?);
             drop(write.open_table(REPLAY_REQUESTS).map_err(storage)?);
             drop(write.open_table(REPLAY_EVENTS).map_err(storage)?);
@@ -4409,7 +4606,58 @@ impl RedbRecoveryStore {
                 .map_err(storage)?;
             }
         }
+        Self::validate_activation_result_retention_table(&write)?;
         write.commit().map_err(storage)
+    }
+
+    fn validate_activation_result_retention_table(
+        write: &redb::WriteTransaction,
+    ) -> Result<(), OrsError> {
+        let table = write
+            .open_table(ACTIVATION_RESULT_RETENTION)
+            .map_err(storage)?;
+        let mut rows = Vec::new();
+        for entry in table.iter().map_err(storage)? {
+            let (key, value) = entry.map_err(storage)?;
+            let record: ActivationResultRetentionRecord = decode(value.value())?;
+            if key.value() != record.record_key() {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "activation_result_retention",
+                    reason: "table key does not match ticket identity".to_owned(),
+                });
+            }
+            rows.push(record);
+        }
+        rows.sort_by_key(|record| record.order);
+        if rows.len() > crate::MAX_ACTIVATION_RESULT_RETENTION_RECORDS {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "activation_result_retention",
+                reason: "retention record bound exceeded".to_owned(),
+            });
+        }
+        for pair in rows.windows(2) {
+            if pair[0].order == pair[1].order {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "activation_result_retention",
+                    reason: "retention order is not unique".to_owned(),
+                });
+            }
+        }
+        let total_payload_bytes = rows.iter().try_fold(0usize, |total, record| {
+            total
+                .checked_add(record.payload_bytes())
+                .ok_or_else(|| OrsError::IntegrityProblem {
+                    record_type: "activation_result_retention",
+                    reason: "retention payload size overflow".to_owned(),
+                })
+        })?;
+        if total_payload_bytes > crate::MAX_ACTIVATION_RESULT_TOTAL_PAYLOAD_BYTES {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "activation_result_retention",
+                reason: "retention payload bound exceeded".to_owned(),
+            });
+        }
+        Ok(())
     }
 
     fn recover_interrupted_execution(&self) -> Result<(), OrsError> {
@@ -6550,6 +6798,32 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         RedbRecoveryStore::load_host_request(self, operation_id, request_digest)
     }
 
+    fn retain_activation_result(
+        &self,
+        record: &ActivationResultRetentionRecord,
+    ) -> Result<ActivationResultRetentionRecord, OrsError> {
+        RedbRecoveryStore::retain_activation_result(self, record)
+    }
+
+    fn load_activation_result(
+        &self,
+        ticket_id: &str,
+    ) -> Result<Option<ActivationResultRetentionRecord>, OrsError> {
+        RedbRecoveryStore::load_activation_result(self, ticket_id)
+    }
+
+    fn readback_activation_result(
+        &self,
+        ticket_id: &str,
+        result_sha256: &str,
+    ) -> Result<Option<ActivationResultRetentionRecord>, OrsError> {
+        RedbRecoveryStore::readback_activation_result(self, ticket_id, result_sha256)
+    }
+
+    fn prune_activation_results(&self) -> Result<u64, OrsError> {
+        RedbRecoveryStore::prune_activation_results(self)
+    }
+
     fn stage_native_worker_claim(
         &self,
         record: &crate::NativeWorkerClaimRecord,
@@ -6839,6 +7113,37 @@ impl<S: OperationalRecoveryStore> OrsCoordinator<S> {
         request_digest: &str,
     ) -> Result<Option<HostRequestRecord>, OrsError> {
         self.store.load_host_request(operation_id, request_digest)
+    }
+
+    /// Retains one opaque Kernel activation result before acknowledgement.
+    pub fn retain_activation_result(
+        &self,
+        record: &ActivationResultRetentionRecord,
+    ) -> Result<ActivationResultRetentionRecord, OrsError> {
+        self.store.retain_activation_result(record)
+    }
+
+    /// Loads one retained activation result by ticket identity.
+    pub fn load_activation_result(
+        &self,
+        ticket_id: &str,
+    ) -> Result<Option<ActivationResultRetentionRecord>, OrsError> {
+        self.store.load_activation_result(ticket_id)
+    }
+
+    /// Reads one retained activation result by ticket and result digest.
+    pub fn readback_activation_result(
+        &self,
+        ticket_id: &str,
+        result_sha256: &str,
+    ) -> Result<Option<ActivationResultRetentionRecord>, OrsError> {
+        self.store
+            .readback_activation_result(ticket_id, result_sha256)
+    }
+
+    /// Prunes oldest activation results under the hard retention bounds.
+    pub fn prune_activation_results(&self) -> Result<u64, OrsError> {
+        self.store.prune_activation_results()
     }
 
     /// Stages one native-worker claim intent before any acknowledgement.

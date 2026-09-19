@@ -157,6 +157,124 @@ fn cleanup(path: &PathBuf) {
     let _ignored = std::fs::remove_file(path);
 }
 
+fn activation_result_record(
+    ticket_id: &str,
+    result_sha256: &str,
+    ticket_payload: &str,
+    result_payload: &str,
+    phase: ActivationResultRetentionPhase,
+) -> ActivationResultRetentionRecord {
+    ActivationResultRetentionRecord {
+        ticket_id: ticket_id.to_owned(),
+        ticket_sha256: "a".repeat(64),
+        ticket_payload: ticket_payload.to_owned(),
+        result_sha256: result_sha256.to_owned(),
+        result_payload: result_payload.to_owned(),
+        phase,
+        order: 0,
+    }
+}
+
+#[test]
+fn activation_result_retention_round_trips_replays_conflicts_and_reopens() -> TestResult {
+    let path = database_path("activation-result-retention-round-trip");
+    let store = RedbRecoveryStore::open(&path)?;
+    let record = activation_result_record(
+        "ticket-1",
+        &"b".repeat(64),
+        "opaque-ticket-payload",
+        "opaque-result-payload",
+        ActivationResultRetentionPhase::AcceptedTerminal,
+    );
+    let retained = store.retain_activation_result(&record)?;
+    assert!(retained.order > 0);
+    assert_eq!(store.retain_activation_result(&record)?, retained);
+    assert_eq!(
+        store.load_activation_result("ticket-1")?,
+        Some(retained.clone())
+    );
+    assert_eq!(
+        store.readback_activation_result("ticket-1", &"b".repeat(64))?,
+        Some(retained.clone())
+    );
+    assert!(matches!(
+        store.readback_activation_result("ticket-1", &"c".repeat(64)),
+        Err(OrsError::ActivationResultRetentionIdentityConflict { .. })
+    ));
+
+    let mut conflict = record.clone();
+    conflict.result_payload = "changed-result".to_owned();
+    assert!(matches!(
+        store.retain_activation_result(&conflict),
+        Err(OrsError::ActivationResultRetentionIdentityConflict { .. })
+    ));
+    drop(store);
+
+    let reopened = RedbRecoveryStore::open(&path)?;
+    assert_eq!(reopened.load_activation_result("ticket-1")?, Some(retained));
+    assert!(
+        reopened
+            .readback_activation_result("ticket-1", &"b".repeat(64))?
+            .is_some()
+    );
+    cleanup(&path);
+    Ok(())
+}
+
+#[test]
+fn activation_result_retention_rejects_corruption_on_reopen() -> TestResult {
+    let path = database_path("activation-result-retention-corrupt");
+    let store = RedbRecoveryStore::open(&path)?;
+    drop(store);
+
+    let database = redb::Database::create(&path)?;
+    let write = database.begin_write()?;
+    let table_definition: redb::TableDefinition<&str, &str> =
+        redb::TableDefinition::new("ors_agent_activation_results_v1");
+    let mut table = write.open_table(table_definition)?;
+    table.insert("ticket-corrupt", "{\"ticket_id\":\"ticket-corrupt\"}")?;
+    drop(table);
+    write.commit()?;
+    drop(database);
+
+    assert!(matches!(
+        RedbRecoveryStore::open(&path),
+        Err(OrsError::IntegrityProblem { .. })
+    ));
+    cleanup(&path);
+    Ok(())
+}
+
+#[test]
+fn activation_result_retention_prunes_count_and_payload_bounds() -> TestResult {
+    let path = database_path("activation-result-retention-prune");
+    let store = RedbRecoveryStore::open(&path)?;
+    let payload = "p".repeat(64 * 1024);
+    for index in 0..65 {
+        let record = activation_result_record(
+            &format!("ticket-{index}"),
+            &format!("{index:064x}"),
+            &payload[..32 * 1024],
+            &payload[..32 * 1024],
+            ActivationResultRetentionPhase::DeferredNotReady,
+        );
+        store.retain_activation_result(&record)?;
+    }
+    assert!(
+        store.load_activation_result("ticket-0")?.is_none(),
+        "oldest record must be pruned"
+    );
+    assert!(store.load_activation_result("ticket-64")?.is_some());
+    assert_eq!(store.prune_activation_results()?, 0);
+    drop(store);
+
+    let reopened = RedbRecoveryStore::open(&path)?;
+    assert!(reopened.load_activation_result("ticket-0")?.is_none());
+    assert!(reopened.load_activation_result("ticket-64")?.is_some());
+    cleanup(&path);
+    Ok(())
+}
+
 #[test]
 fn store_rebind_commit_order_is_durable_and_idempotent() -> TestResult {
     let path = database_path("store-rebind-order");
