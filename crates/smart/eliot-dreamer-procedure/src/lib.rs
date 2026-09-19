@@ -38,18 +38,19 @@
 //! validation. There are no placeholder, mock, canned, or pseudo paths:
 //! every branch binds an explicit input field.
 //!
-//! Test coverage note: 15 of 50 `WORK_UNIT_CASE 661/*` cases execute here
+//! Test coverage note: 17 of 50 `WORK_UNIT_CASE 661/*` cases execute here
 //! (661/1 valid completes, 661/2 exact vocabulary, 661/3 wrong subtype fails
 //! closed, 661/4 bundle mismatch fails closed, 661/5
 //! duplicate identity disposition, 661/6 success and failure evidence,
 //! 661/7 lucky success stays empirical, 661/8 exit/confidence not semantic
-//! success, 661/9 empirical unknown mechanism, 661/13 valid acyclic graph
+//! success, 661/9 empirical unknown mechanism, 661/10 exact trigger versus
+//! near-match false activation, 661/11 scope/environment/version leakage
+//! blocked, 661/13 valid acyclic graph
 //! completes, 661/17 raw shell rejected, 661/21 valid semantic verifier,
 //! 661/22 missing verifier blocks completeness,
 //! 661/25 exact idempotent replay, 661/26 unknown-effect blocks retry). The
-//! remaining 35 of 50 are deferred per START.md s1; #965 admission is
-//! separate. Deferred: 661/10,
-//! 661/11, 661/12, 661/14, 661/15, 661/16, 661/18, 661/19, 661/20,
+//! remaining 33 of 50 are deferred per START.md s1; #965 admission is
+//! separate. Deferred: 661/12, 661/14, 661/15, 661/16, 661/18, 661/19, 661/20,
 //! 661/23, 661/24, 661/27, 661/28, 661/29, 661/30, 661/31,
 //! 661/32, 661/33, 661/34, 661/35, 661/36, 661/37, 661/38, 661/39, 661/40,
 //! 661/41, 661/42, 661/43, 661/44, 661/45, 661/46, 661/47, 661/48, 661/49,
@@ -3037,6 +3038,155 @@ mod tests {
         for disposition in &candidate.step_dispositions {
             assert_eq!(disposition.kind, StepDispositionKind::Empirical);
         }
+        assert_eq!(
+            candidate.transfer.preserved_counterevidence_refs,
+            vec!["ce-1".to_owned()]
+        );
+    }
+
+    // WORK_UNIT_CASE: 661/10
+    #[test]
+    fn case_10_exact_trigger_completes_while_near_match_never_activates() {
+        let item = test_item();
+        let grounded = test_grounded();
+        let capability = test_capability();
+        let existing = test_existing();
+        let policy = test_policy();
+        let exact = match propose_procedure(
+            &item,
+            &grounded,
+            &test_evidence(),
+            &capability,
+            &existing,
+            &policy,
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("exact trigger request: {err:?}"),
+        };
+        assert_eq!(exact.outcome, ProcedureOutcome::Complete);
+        assert!(exact.trigger_note.contains("env-1"));
+        assert!(exact.trigger_note.contains("scope-1"));
+        assert!(exact.trigger_note.contains("fp-1"));
+        assert!(exact.applicability_note.contains("env-1"));
+        assert!(exact.applicability_note.contains("rev-4"));
+        assert!(exact.applicability_note.contains("scope-1"));
+        assert!(exact.applicability_note.contains("task-1"));
+        assert!(is_hex64_lower(&exact.candidate_digest));
+        let mut near_portability = test_evidence();
+        near_portability.portability_note = "similar to env-9 scope-9, looks like fp-1".to_owned();
+        let err = match propose_procedure(
+            &item,
+            &grounded,
+            &near_portability,
+            &capability,
+            &existing,
+            &policy,
+        ) {
+            Ok(candidate) => panic!("near-match portability must fail: {:?}", candidate.outcome),
+            Err(err) => err,
+        };
+        assert!(matches!(err, ProcedureError::Shape { field, .. } if field == "trigger"));
+        let mut near_fingerprint = test_evidence();
+        near_fingerprint.failure_fingerprint = "similar-fp-9".to_owned();
+        let err = match propose_procedure(
+            &item,
+            &grounded,
+            &near_fingerprint,
+            &capability,
+            &existing,
+            &policy,
+        ) {
+            Ok(candidate) => panic!("near-match fingerprint must fail: {:?}", candidate.outcome),
+            Err(err) => err,
+        };
+        assert!(matches!(err, ProcedureError::Shape { field, .. } if field == "trigger"));
+        let mut near_identity = test_existing();
+        near_identity.existing_ids = vec!["rotate-caption-near-match".to_owned()];
+        near_identity.existing_digests = vec!["0".repeat(64)];
+        let candidate = match propose_procedure(
+            &item,
+            &grounded,
+            &test_evidence(),
+            &capability,
+            &near_identity,
+            &policy,
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("near-match identity stays inert: {err:?}"),
+        };
+        assert_eq!(candidate.outcome, ProcedureOutcome::Complete);
+        assert_eq!(candidate.candidate_digest, exact.candidate_digest);
+    }
+
+    // WORK_UNIT_CASE: 661/11
+    #[test]
+    fn case_11_trigger_applicability_transfer_stay_inside_evidenced_bounds() {
+        let item = test_item();
+        let grounded = test_grounded();
+        let evidence = test_evidence();
+        let capability = test_capability();
+        let existing = test_existing();
+        let policy = test_policy();
+        let bounded =
+            match propose_procedure(&item, &grounded, &evidence, &capability, &existing, &policy) {
+                Ok(candidate) => candidate,
+                Err(err) => panic!("bounded scope request: {err:?}"),
+            };
+        assert_eq!(bounded.outcome, ProcedureOutcome::Complete);
+        assert!(bounded.trigger_note.contains("env-1"));
+        assert!(bounded.trigger_note.contains("scope-1"));
+        assert!(bounded.applicability_note.contains("rev-4"));
+        assert_eq!(bounded.transfer.target_env_id, "env-1");
+        assert_eq!(bounded.transfer.target_env_revision, "rev-4");
+        assert_eq!(bounded.transfer.target_scope_id, "scope-1");
+        assert_eq!(bounded.transfer.target_task_id, "task-1");
+        assert_eq!(
+            bounded.transfer.preserved_version_pins,
+            vec!["cap-1@v3".to_owned()]
+        );
+        assert_eq!(
+            bounded.transfer.preserved_negative_refs,
+            vec!["neg-1".to_owned()]
+        );
+        assert!(is_hex64_lower(&bounded.candidate_digest));
+        let mut scope_drift = test_capability();
+        scope_drift.scope_id = "scope-9".to_owned();
+        let err = match propose_procedure(
+            &item,
+            &grounded,
+            &evidence,
+            &scope_drift,
+            &existing,
+            &policy,
+        ) {
+            Ok(candidate) => panic!("scope drift must fail: {:?}", candidate.outcome),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, ProcedureError::Binding { field, .. } if field == "capability_task_scope")
+        );
+        let mut task_drift = test_capability();
+        task_drift.task_id = "task-9".to_owned();
+        let err =
+            match propose_procedure(&item, &grounded, &evidence, &task_drift, &existing, &policy) {
+                Ok(candidate) => panic!("task drift must fail: {:?}", candidate.outcome),
+                Err(err) => err,
+            };
+        assert!(
+            matches!(err, ProcedureError::Binding { field, .. } if field == "capability_task_scope")
+        );
+        let mut pinned = test_capability();
+        pinned.version_pins = vec!["cap-1@v3".to_owned(), "cap-2@v1".to_owned()];
+        let candidate =
+            match propose_procedure(&item, &grounded, &evidence, &pinned, &existing, &policy) {
+                Ok(candidate) => candidate,
+                Err(err) => panic!("pinned versions stay inert: {err:?}"),
+            };
+        assert_eq!(candidate.outcome, ProcedureOutcome::Complete);
+        assert_eq!(
+            candidate.transfer.preserved_version_pins,
+            vec!["cap-1@v3".to_owned(), "cap-2@v1".to_owned()]
+        );
         assert_eq!(
             candidate.transfer.preserved_counterevidence_refs,
             vec!["ce-1".to_owned()]
