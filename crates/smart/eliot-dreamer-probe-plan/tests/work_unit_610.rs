@@ -1,6 +1,8 @@
-//! Work-unit 610 slices 1-4b: bounded discriminative probe planner, cases 1..10
-//! plus 610/17 and 610/21 (typed affordance Unknown/Unavailable gating,
-//! safe read-only candidate-only admission).
+//! Work-unit 610 slices 1-4b plus slice 5: bounded discriminative probe
+//! planner, cases 1..10 plus 610/17, 610/21, 610/32 and 610/36 (typed
+//! affordance Unknown/Unavailable gating, safe read-only candidate-only
+//! admission, explicit lexicographic order with stable tie-break, and
+//! input-order-independent plan/digest stability).
 //!
 //! Cases 610/1, 610/4 and 610/5 are marked on the existing planner
 //! behaviour tests in `tests/probe_plan.rs`. Cases 610/11..16, 610/38
@@ -10,8 +12,9 @@
 //! causal/material relevance is an A-03 materiality judgment, and `src/plan.rs`
 //! contains zero `ResultUpdate`/`RivalUpdateMeaning` inspections, so no
 //! planner-only implementation exists without inventing APIs (slice-4 Opus
-//! audit ruling on 610/11 applies identically). Cases 610/18-20, 610/22-42
-//! (negative execution-absence proofs, owner preservation, effect-policy,
+//! audit ruling on 610/11 applies identically). Cases 610/18-19, 610/22,
+//! 610/26-28, 610/30-31, 610/34-35, 610/37, 610/41-42 (negative
+//! execution-absence proofs, owner preservation, effect-policy,
 //! budget/dominance/disposition/replay/no-execution) are QUEUED and out of
 //! this batch; 610/20 needs `src/` owner preservation, 610/23-25 need policy
 //! or budget enforcement the planner explicitly declines (`plan.rs`: effect,
@@ -40,7 +43,17 @@
 //! admission (SideEffectFree/Permitted/Granted/Feasible/Contained/Reversible
 //! plans to a ranked candidate-only probe with all vectors preserved and no
 //! execution handle).
-//! Docs route=sha256:1b9bbbd8b5bb5e2de4737b4fa03e7e3672daba4394afef443dd3d8476554c7fa read=sha256:ea79ca7e06dbc95bb6ebceb4b5d904a848f265540ab58d6e82d93d5878599ec6 bundle=5ca78f97ee5f6485f6ab552d6687ade11da053a68be0cb38339167aeac0be7f3 (generic-source; verified bundle read in full; plan.rs/model.rs plus contracts affordance/result/objective/budget sources read directly).
+//! Ownership ruling 610/32,36 (this slice, planner-side order/digest only;
+//! no new APIs, zero `src/` changes): 610/32 OWNED via the existing
+//! vector-preserving lexicographic order observed through plan order
+//! (information rank dominates cost rank, so High-information/High-cost
+//! precedes Low-information/Negligible-cost; Unknown information sorts after
+//! every known gain inside its dimension; equal vectors break ties by stable
+//! affordance identity); 610/36 OWNED via canonical construction (affordance
+//! set sorts by identity, groups collapse deterministically, probes rank by
+//! vector key then identity, omissions sort canonically), so set-only input
+//! permutations preserve the plan value and frozen digest.
+//! Docs route=sha256:5fafc9324417043a5a62d000cde2b0f4cb4fbeb740fa142190dacc7b7aefd80d read=sha256:2448896b553a2951a33b237f8a98721acdffa54c6b49d8061b77cd89c2a39c37 bundle=893f5d6140c41f5591e16f7d9f0f656cc3b6fbbb64a3216b800eada52c26aea9 (generic-source; verified bundle read in full; plan.rs/model.rs plus contracts affordance/result/objective/budget sources read directly).
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
@@ -834,4 +847,178 @@ fn safe_read_only_candidate_plans_candidate_only() {
         other => panic!("safe probe must preserve its privacy vector, got {other:?}"),
     }
     assert_eq!(must(plan.compute_digest()), plan.digest);
+}
+
+// WORK_UNIT_CASE: 610/32
+#[test]
+fn explicit_lexicographic_order_with_stable_tie_break() {
+    let mut costly_params = descriptor_params("aff-lex-costly", gap_target("claim-lex-costly"));
+    costly_params.information = InformationDimension::High {
+        detail: "splits the named disagreement".to_owned(),
+    };
+    costly_params.cost = CostDimension::High {
+        detail: "wide retained scan".to_owned(),
+    };
+    let costly = must(InquiryAffordanceDescriptor::new(costly_params));
+
+    let mut cheap_params = descriptor_params("aff-lex-cheap", gap_target("claim-lex-cheap"));
+    cheap_params.information = InformationDimension::Low {
+        detail: "weak split of the gap".to_owned(),
+    };
+    cheap_params.cost = CostDimension::Negligible {
+        detail: "trivial retained read".to_owned(),
+    };
+    let cheap = must(InquiryAffordanceDescriptor::new(cheap_params));
+
+    let mut unknown_params = descriptor_params("aff-lex-unknown", gap_target("claim-lex-unknown"));
+    unknown_params.information = InformationDimension::Unknown {
+        reason: "gain not yet characterized".to_owned(),
+    };
+    unknown_params.cost = CostDimension::Negligible {
+        detail: "trivial retained read".to_owned(),
+    };
+    let unknown = must(InquiryAffordanceDescriptor::new(unknown_params));
+    assert!(!unknown.information.has_expected_gain());
+    let plan = plan_for(
+        vec![
+            cheap,
+            unknown,
+            descriptor("aff-lex-tie-b", gap_target("claim-lex-tie-b")),
+            costly,
+            descriptor("aff-lex-tie-a", gap_target("claim-lex-tie-a")),
+        ],
+        Some(16),
+    );
+    must(plan.validate());
+    assert_eq!(plan.probes.len(), 5);
+    assert!(plan.omissions.is_empty());
+
+    let order: Vec<&str> = plan
+        .probes
+        .iter()
+        .map(|probe| probe.probe_id.as_str())
+        .collect();
+    assert_eq!(
+        order,
+        vec![
+            "aff-lex-tie-a",
+            "aff-lex-tie-b",
+            "aff-lex-costly",
+            "aff-lex-cheap",
+            "aff-lex-unknown",
+        ]
+    );
+    for (index, probe) in plan.probes.iter().enumerate() {
+        let rank = u32::try_from(index).expect("rank must fit u32");
+        assert_eq!(probe.rank, rank);
+        must(probe.target.validate());
+        must(probe.result_schema.validate());
+        must(probe.dimensions.validate());
+    }
+
+    let pos = |id: &str| {
+        order
+            .iter()
+            .position(|probe| *probe == id)
+            .expect("probe planned")
+    };
+    let costly_pos = pos("aff-lex-costly");
+    let cheap_pos = pos("aff-lex-cheap");
+    assert!(
+        costly_pos < cheap_pos,
+        "information rank must dominate cost rank: High-information/High-cost precedes Low-information/Negligible-cost, proving no scalar averaging"
+    );
+
+    let unknown_pos = pos("aff-lex-unknown");
+    assert_eq!(unknown_pos, order.len() - 1);
+    assert!(
+        cheap_pos < unknown_pos,
+        "unknown information must sort after every known gain inside its dimension even with the cheapest cost"
+    );
+
+    let tie_a_pos = pos("aff-lex-tie-a");
+    let tie_peer_pos = pos("aff-lex-tie-b");
+    assert_eq!(tie_peer_pos, tie_a_pos + 1);
+    assert!(
+        tie_a_pos < tie_peer_pos,
+        "equal vectors must break ties by stable affordance identity"
+    );
+
+    let costly_probe = &plan.probes[costly_pos];
+    match &costly_probe.dimensions.cost {
+        CostDimension::High { detail } => assert_eq!(detail.as_str(), "wide retained scan"),
+        other => panic!("cost vector must stay visible, got {other:?}"),
+    }
+    let unknown_probe = &plan.probes[unknown_pos];
+    match &unknown_probe.dimensions.information {
+        InformationDimension::Unknown { reason } => {
+            assert_eq!(reason.as_str(), "gain not yet characterized");
+        }
+        other => panic!("unknown vector must stay visible, got {other:?}"),
+    }
+    assert_eq!(must(plan.compute_digest()), plan.digest);
+}
+
+// WORK_UNIT_CASE: 610/36
+#[test]
+fn irrelevant_input_order_preserves_plan_and_digest() {
+    let first = descriptor("aff-order-a", gap_target("claim-order-a"));
+    let mut second_params = descriptor_params("aff-order-b", gap_target("claim-order-b"));
+    second_params.information = InformationDimension::Low {
+        detail: "weak split of the gap".to_owned(),
+    };
+    let second = must(InquiryAffordanceDescriptor::new(second_params));
+    let mut third_params = descriptor_params("aff-order-c", gap_target("claim-order-c"));
+    third_params.information = InformationDimension::Moderate {
+        detail: "partial split of the gap".to_owned(),
+    };
+    let third = must(InquiryAffordanceDescriptor::new(third_params));
+    let mut fourth_params = descriptor_params("aff-order-d", gap_target("claim-order-d"));
+    fourth_params.information = InformationDimension::Unknown {
+        reason: "gain not yet characterized".to_owned(),
+    };
+    let fourth = must(InquiryAffordanceDescriptor::new(fourth_params));
+
+    let forward = plan_for(
+        vec![first.clone(), second.clone(), third.clone(), fourth.clone()],
+        Some(16),
+    );
+    let backward = plan_for(
+        vec![fourth.clone(), third.clone(), second.clone(), first.clone()],
+        Some(16),
+    );
+    let rotated = plan_for(
+        vec![third.clone(), first.clone(), fourth.clone(), second.clone()],
+        Some(16),
+    );
+    must(forward.validate());
+    must(backward.validate());
+    must(rotated.validate());
+
+    assert_eq!(forward, backward);
+    assert_eq!(forward, rotated);
+    assert_eq!(forward.digest, backward.digest);
+    assert_eq!(forward.digest, rotated.digest);
+    assert_eq!(must(forward.compute_digest()), forward.digest);
+
+    let order: Vec<&str> = forward
+        .probes
+        .iter()
+        .map(|probe| probe.probe_id.as_str())
+        .collect();
+    assert_eq!(
+        order,
+        vec!["aff-order-a", "aff-order-c", "aff-order-b", "aff-order-d"]
+    );
+    let orders: Vec<Vec<&str>> = [&backward, &rotated]
+        .iter()
+        .map(|plan| {
+            plan.probes
+                .iter()
+                .map(|probe| probe.probe_id.as_str())
+                .collect()
+        })
+        .collect();
+    assert_eq!(orders, vec![order.clone(), order]);
+    assert!(forward.omissions.is_empty());
 }
