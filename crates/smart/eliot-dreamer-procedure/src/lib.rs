@@ -38,16 +38,16 @@
 //! validation. There are no placeholder, mock, canned, or pseudo paths:
 //! every branch binds an explicit input field.
 //!
-//! Test coverage note: 33 of 50 `WORK_UNIT_CASE 661/*` cases execute here.
+//! Test coverage note: 34 of 50 `WORK_UNIT_CASE 661/*` cases execute here.
 //! Executed cases: 661/1, 661/2, 661/3, 661/4, 661/5, 661/6, 661/7, 661/8,
 //! 661/9, 661/10, 661/11, 661/12, 661/13, 661/14, 661/15, 661/16, 661/17,
 //! 661/18, 661/19, 661/20, 661/21, 661/22, 661/23, 661/25, 661/26,
 //! 661/27, 661/28, 661/29, 661/30, 661/31, 661/32, 661/33, and 661/34. The
-//! remaining 17 of 50 are deferred per START.md s1; #965 admission is
+//! remaining 16 of 50 are deferred per START.md s1; #965 admission is
 //! separate. Deferred: 661/24
 //! (pending candidate-visible causal receipt design - `ProcedureCandidate`
 //! currently exposes only `candidate_digest`, no typed causal receipt field),
-//! 661/35, 661/36, 661/37, 661/38, 661/39, 661/40, 661/41, 661/42, 661/43,
+//! 661/35, 661/36, 661/37, 661/38, 661/39, 661/41, 661/42, 661/43,
 //! 661/44, 661/45, 661/46, 661/47, 661/48, 661/49, and 661/50.
 
 #![forbid(unsafe_code)]
@@ -2888,6 +2888,85 @@ mod tests {
                 .applicability_note
                 .contains("target outcome remains unobserved")
         );
+    }
+
+    // WORK_UNIT_CASE: 661/40
+    #[test]
+    fn case_40_partial_budget_deadline_and_cancellation_stay_bounded() {
+        let item = test_item();
+        let grounded = test_grounded();
+        let capability = test_capability();
+        let existing = test_existing();
+
+        let mut partial_evidence = test_evidence();
+        partial_evidence.unknown_refs = (0..=32)
+            .map(|index| format!("unknown-{index:02}"))
+            .collect();
+        let mut partial_policy = test_policy();
+        partial_policy.allow_partial = true;
+        let partial = match propose_procedure(
+            &item,
+            &grounded,
+            &partial_evidence,
+            &capability,
+            &existing,
+            &partial_policy,
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("open unknowns should remain a partial candidate: {err:?}"),
+        };
+        assert_eq!(partial.outcome, ProcedureOutcome::Partial);
+        assert!(partial.note.contains("partial coverage"));
+        assert_eq!(
+            partial.transfer.preserved_unknown_refs,
+            partial_evidence.unknown_refs
+        );
+
+        let mut over_budget = test_policy();
+        over_budget.max_steps = MAX_STEPS.saturating_add(1);
+        let budget_error = match propose_procedure(
+            &item,
+            &grounded,
+            &test_evidence(),
+            &capability,
+            &existing,
+            &over_budget,
+        ) {
+            Ok(candidate) => panic!("over-budget policy must fail closed: {candidate:?}"),
+            Err(error) => error,
+        };
+        assert!(matches!(budget_error, ProcedureError::Policy { .. }));
+
+        let mut expired = test_policy();
+        expired.observation_time_ms = expired.deadline_ms;
+        let deadline_error = match propose_procedure(
+            &item,
+            &grounded,
+            &test_evidence(),
+            &capability,
+            &existing,
+            &expired,
+        ) {
+            Ok(candidate) => panic!("at-deadline policy must fail closed: {candidate:?}"),
+            Err(error) => error,
+        };
+        assert!(matches!(deadline_error, ProcedureError::Policy { .. }));
+
+        let mut cancelled = test_policy();
+        cancelled.cancelled = true;
+        let cancelled_candidate = match propose_procedure(
+            &item,
+            &grounded,
+            &test_evidence(),
+            &capability,
+            &existing,
+            &cancelled,
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("cancelled request should stay inert: {err:?}"),
+        };
+        assert_eq!(cancelled_candidate.outcome, ProcedureOutcome::Rejected);
+        assert!(cancelled_candidate.note.contains("no effect"));
     }
 
     // WORK_UNIT_CASE: 661/13
