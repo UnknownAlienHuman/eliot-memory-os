@@ -648,4 +648,82 @@ mod projection_tests {
             "resolved_at at the deadline must not bind"
         );
     }
+
+    #[test]
+    fn tampered_ticket_is_rejected_by_every_fail_closed_constructor() {
+        // #204 scenario 10: a tampered/wrong ticket (digest mismatch) binds
+        // nothing. Every fail-closed constructor validates the ticket first
+        // via `AgentActivationResolutionResult::new`, so each stays Err with
+        // no binding and no new mapping.
+        let mut ticket = test_ticket(100);
+        ticket.ticket_id = "ticket-tampered".to_owned();
+        // Digest still covers the original id: tampered by construction.
+        assert!(ticket.validate().is_err());
+        let observed = StateFence::new(test_epoch(1), ResourceGeneration::new(2).expect("gen"));
+        assert!(
+            map_governor_outcome_to_protocol(
+                &ticket,
+                GovernorActivationOutcome::Resolved(test_snapshot()),
+                50,
+            )
+            .is_err(),
+            "tampered ticket must not map"
+        );
+        assert!(
+            stale_fence_for_resolved_mismatch(&ticket, observed, 50).is_err(),
+            "tampered ticket must not yield StaleFence"
+        );
+        assert!(
+            failed_internal_for_mapping_failure(&ticket, "NOT_READY", 50).is_err(),
+            "tampered ticket must not yield mapping-failure FailedInternal"
+        );
+        assert!(
+            failed_internal_for_unready_governor(&ticket, 50).is_err(),
+            "tampered ticket must not yield unready FailedInternal"
+        );
+    }
+
+    #[test]
+    fn post_deadline_resolved_at_is_rejected_by_every_fail_closed_constructor() {
+        // #204 scenario 11: no valid terminal result at or past the Kernel
+        // deadline. `Result::new` requires resolved_at strictly earlier than
+        // the deadline, so each constructor stays Err and never fabricates a
+        // typed negative past expiry. (Unready past-deadline covered above.)
+        let ticket = test_ticket(100);
+        let observed = StateFence::new(test_epoch(1), ResourceGeneration::new(2).expect("gen"));
+        assert!(
+            map_governor_outcome_to_protocol(
+                &ticket,
+                GovernorActivationOutcome::Resolved(test_snapshot()),
+                100,
+            )
+            .is_err(),
+            "resolved_at at the deadline must not bind"
+        );
+        assert!(
+            stale_fence_for_resolved_mismatch(&ticket, observed, 100).is_err(),
+            "stale-fence fallback at the deadline must not bind"
+        );
+        assert!(
+            failed_internal_for_mapping_failure(&ticket, "NOT_READY", 100).is_err(),
+            "mapping-failure fallback at the deadline must not bind"
+        );
+    }
+
+    #[test]
+    fn wrong_ticket_result_binding_is_rejected() {
+        // #204 scenario 10 (wrong-ticket half): a result bound to one ticket
+        // never validates against another ticket identity.
+        let ticket = test_ticket(100);
+        let result = failed_internal_for_unready_governor(&ticket, 50).expect("fallback result");
+        result.validate_against(&ticket).expect("valid binding");
+        let mut other = test_ticket(100);
+        other.ticket_id = "ticket-other".to_owned();
+        other.ticket_sha256 = other.compute_digest().expect("digest");
+        assert!(other.validate().is_ok());
+        assert!(
+            result.validate_against(&other).is_err(),
+            "result bound to one ticket must not validate against another"
+        );
+    }
 }
