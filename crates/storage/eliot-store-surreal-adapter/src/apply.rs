@@ -827,12 +827,12 @@ impl ReservedAttemptTransport for ProviderReservedTransport<'_> {
         let Ok(fence) = read_fence(db, &self.adapter.config).await else {
             return ProviderGate::closed();
         };
-        // An absent fence contradicts nothing yet: the attempt path's own
-        // readiness and head checks still decide. A present fence must
-        // match the admitted transition fence exactly.
+        // An absent fence admits nothing: the reserved path requires a
+        // verified admission condition before provider execution. A present
+        // fence must match the admitted transition fence exactly.
         let fence_matches = fence
             .as_ref()
-            .is_none_or(|fence| fence.state_fence == attempt.transition.state_fence);
+            .is_some_and(|fence| fence.state_fence == attempt.transition.state_fence);
         let not_expired =
             u64::try_from(attempt.expires_at_ms).is_ok_and(|expires| now_ms < expires);
         ProviderGate {

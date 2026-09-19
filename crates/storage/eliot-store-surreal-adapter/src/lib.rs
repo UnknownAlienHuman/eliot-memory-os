@@ -287,12 +287,12 @@ impl SurrealStoreAdapter {
     /// accepted scheduler advertises it.
     #[must_use]
     pub fn reserved_write_capability(&self) -> Option<&'static str> {
-        self.execution
-            .lock()
-            .ok()
-            .and_then(|slot| slot.clone())
-            .filter(|execution| execution.is_concurrent())
-            .map(|_| CAPABILITY_RESERVED_WRITE)
+        let slot = self.execution.lock().ok()?;
+        if slot.as_ref().is_some_and(|execution| execution.is_concurrent()) {
+            Some(CAPABILITY_RESERVED_WRITE)
+        } else {
+            None
+        }
     }
 
     /// Returns the installed execution generation, if any.
