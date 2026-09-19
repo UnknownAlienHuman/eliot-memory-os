@@ -38,26 +38,15 @@
 //! validation. There are no placeholder, mock, canned, or pseudo paths:
 //! every branch binds an explicit input field.
 //!
-//! Test coverage note: 23 of 50 `WORK_UNIT_CASE 661/*` cases execute here
-//! (661/1 valid completes, 661/2 exact vocabulary, 661/3 wrong subtype fails
-//! closed, 661/4 bundle mismatch fails closed, 661/5
-//! duplicate identity disposition, 661/6 success and failure evidence,
-//! 661/7 lucky success stays empirical, 661/8 exit/confidence not semantic
-//! success, 661/9 empirical unknown mechanism, 661/10 exact trigger versus
-//! near-match false activation, 661/11 scope/environment/version leakage
-//! blocked, 661/12 typed input/output with invalid schema fail-closed,
-//! 661/13 valid acyclic graph
-//! completes, 661/14 missing predecessor/cycle/unbounded/fan-out rejected,
-//! 661/17 raw shell rejected, 661/18 credential and handle
-//! rejected, 661/19 capability present is not authority,
-//! 661/20 missing or unknown capability fails closed,
-//! 661/21 valid semantic verifier,
-//! 661/22 missing verifier blocks completeness,
-//! 661/25 exact idempotent replay, 661/26 unknown-effect blocks retry). The
-//! remaining 27 of 50 are deferred per START.md s1; #965 admission is
-//! separate. Deferred: 661/15, 661/16,
-//! 661/24, 661/27, 661/28, 661/29, 661/30, 661/31,
-//! 661/32, 661/33, 661/34, 661/35, 661/36, 661/37, 661/38, 661/39, 661/40,
+//! Test coverage note: 30 of 50 `WORK_UNIT_CASE 661/*` cases execute here.
+//! Executed cases: 661/1, 661/2, 661/3, 661/4, 661/5, 661/6, 661/7, 661/8,
+//! 661/9, 661/10, 661/11, 661/12, 661/13, 661/14, 661/15, 661/16, 661/17,
+//! 661/18, 661/19, 661/20, 661/21, 661/22, 661/23, 661/25, 661/26,
+//! 661/27, 661/28, 661/29, 661/30, and 661/34. The remaining 20 of 50 are
+//! deferred per START.md s1; #965 admission is separate. Deferred: 661/24
+//! (pending candidate-visible causal receipt design - `ProcedureCandidate`
+//! currently exposes only `candidate_digest`, no typed causal receipt field),
+//! 661/31, 661/32, 661/33, 661/35, 661/36, 661/37, 661/38, 661/39, 661/40,
 //! 661/41, 661/42, 661/43, 661/44, 661/45, 661/46, 661/47, 661/48, 661/49,
 //! 661/50.
 
@@ -65,6 +54,7 @@
 
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_dreamer_contracts::CurationRejectionCode;
+use eliot_dreamer_contracts::grounding::CausalClaim;
 use eliot_dreamer_contracts::{
     CurationKind, GroundedDreamDraft, ValidatedCurationItem, ValidationReceipt, check_fence,
     is_hex64_lower,
@@ -536,6 +526,8 @@ pub struct ProcedureEvidence {
     pub failure_refs: Vec<String>,
     /// Counterexample refs that the procedure must keep answering.
     pub counterexample_refs: Vec<String>,
+    /// Validated causal rival and confounder evidence, when supplied.
+    pub causal_claim: Option<CausalClaim>,
     /// Negative-memory trigger refs retained until qualified extinction.
     pub negative_refs: Vec<String>,
     /// Unknown-branch refs that remain open.
@@ -1041,6 +1033,14 @@ fn validate_evidence_shapes(evidence: &ProcedureEvidence) -> Result<(), Procedur
         "evidence.fingerprint",
         MAX_HANDLE_BYTES,
     )?;
+    if let Some(causal_claim) = &evidence.causal_claim {
+        causal_claim
+            .validate()
+            .map_err(|err| ProcedureError::Shape {
+                field: "evidence.causal_claim".to_owned(),
+                detail: redact(&err.to_string()),
+            })?;
+    }
     Ok(())
 }
 
@@ -1835,6 +1835,9 @@ pub fn compute_candidate_digest(
     parts.push(format!("manifest:{}", evidence.frozen_manifest_digest));
     parts.push(format!("fingerprint:{}", evidence.failure_fingerprint));
     parts.push(format!("mechanism:{}", evidence.mechanism_note));
+    if let Some(causal_claim) = &evidence.causal_claim {
+        parts.push(format!("causal-claim:{}", causal_claim.digest));
+    }
     parts.push(format!("outcome:{outcome_spelling}"));
     let mut index = 0usize;
     while index < steps.len() {
@@ -2334,12 +2337,17 @@ fn collect_candidate_steps(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
-    use std::num::NonZeroU64;
+    use eliot_contracts::{ArtifactId, EpochId, EpochLineageId, ResourceGeneration};
+    use eliot_dreamer_contracts::grounding::canonical::{
+        CausalClaimParams, CausalStatus, EvidenceGrade, LineageRootId, PropositionId,
+        SourceAssurance, SourceId, SourceLineage, SourceRevisionId, TemporalRecord,
+    };
     use eliot_dreamer_contracts::{
         AtomicityMode, ClaimResidue, Requester, RequesterOrigin, SupportState, TargetDenominator,
         curation::{ProcedurePayload, TargetEvidence},
     };
+    use std::collections::BTreeSet;
+    use std::num::NonZeroU64;
 
     /// Returns the test state fence at genesis.
     fn test_fence() -> eliot_contracts::StateFence {
@@ -2436,6 +2444,7 @@ mod tests {
             success_refs: vec!["run-1".to_owned()],
             failure_refs: vec!["run-9".to_owned()],
             counterexample_refs: vec!["ce-1".to_owned()],
+            causal_claim: None,
             negative_refs: vec!["neg-1".to_owned()],
             unknown_refs: vec!["unk-1".to_owned()],
             extinction_refs: Vec::new(),
@@ -2444,6 +2453,47 @@ mod tests {
             portability_note: "portable inside env-1 scope-1 only".to_owned(),
             failure_fingerprint: "fp-1".to_owned(),
         }
+    }
+
+    /// Returns a causal claim using the existing rival and confounder contracts.
+    fn test_causal_claim() -> Result<CausalClaim, String> {
+        let source = SourceId::new("source-causal").map_err(|err| err.to_string())?;
+        let revision = SourceRevisionId::new("rev-causal").map_err(|err| err.to_string())?;
+        let subject = PropositionId::new("prop-causal").map_err(|err| err.to_string())?;
+        let evidence_id = ArtifactId::new("e-causal").map_err(|err| err.to_string())?;
+        let rival_evidence_id = ArtifactId::new("e-rival").map_err(|err| err.to_string())?;
+        let source_lineage = SourceLineage::new(
+            source.clone(),
+            revision.clone(),
+            "b".repeat(64),
+            None,
+            BTreeSet::new(),
+            None,
+        )
+        .map_err(|err| err.to_string())?;
+        let proof_digest = "c".repeat(64);
+        let assurance = SourceAssurance::new(source.clone(), revision, proof_digest.clone())
+            .map_err(|err| err.to_string())?;
+        CausalClaim::new(CausalClaimParams {
+            subject,
+            status: CausalStatus::InterventionSupported,
+            mechanism: "mechanism under controlled intervention".to_owned(),
+            rivals: ["rival explanation".to_owned()].into_iter().collect(),
+            confounders: ["confounder disposition".to_owned()].into_iter().collect(),
+            evidence_refs: BTreeSet::from([evidence_id, rival_evidence_id]),
+            outcome: "observable outcome delta".to_owned(),
+            control: "matched control observation".to_owned(),
+            source,
+            source_lineage,
+            assurance,
+            lineage: LineageRootId::new("lineage-causal").map_err(|err| err.to_string())?,
+            fence: test_fence(),
+            temporal: TemporalRecord::new(10, 11, 12, 13, 14).map_err(|err| err.to_string())?,
+            proof_digest,
+            ceiling: EvidenceGrade::Grounded,
+            scope: "scope-1".to_owned(),
+        })
+        .map_err(|err| err.to_string())
     }
 
     /// Returns a valid capability and environment snapshot.
@@ -2881,6 +2931,198 @@ mod tests {
         assert_ne!(baseline.candidate_digest, candidate.candidate_digest);
     }
 
+    #[test]
+    fn no_causal_claim_digest_matches_legacy_golden() {
+        let candidate = match propose_procedure(
+            &test_item(),
+            &test_grounded(),
+            &test_evidence(),
+            &test_capability(),
+            &test_existing(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("legacy no-claim fixture: {err:?}"),
+        };
+        assert!(test_evidence().causal_claim.is_none());
+        assert_eq!(
+            candidate.candidate_digest,
+            "8f5ac35ef3276794453ddf44684afea4301184816e621fcdb348fc8cc0975adb"
+        );
+    }
+
+    // WORK_UNIT_CASE: 661/27
+    #[test]
+    fn case_27_cancellation_boundaries_preserve_inert_recovery_paths() {
+        let item = test_item();
+        let grounded = test_grounded();
+        let evidence = test_evidence();
+        let capability = test_capability();
+        let existing = test_existing();
+        let mut cancelled = test_policy();
+        cancelled.cancelled = true;
+        let candidate = match propose_procedure(
+            &item,
+            &grounded,
+            &evidence,
+            &capability,
+            &existing,
+            &cancelled,
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("pre-admission cancellation stays inert: {err:?}"),
+        };
+        assert_eq!(candidate.outcome, ProcedureOutcome::Rejected);
+        assert!(candidate.note.contains("no effect"));
+        for step in &candidate.steps {
+            assert!(step.cancel_note.contains("on cancel"));
+            assert!(step.rollback_note.contains("before state"));
+        }
+
+        let mut possible_effect = test_evidence();
+        possible_effect.mechanism_note =
+            "exercised mechanism m-2 with unknown possible effect on ext-9".to_owned();
+        let candidate = match propose_procedure(
+            &item,
+            &grounded,
+            &possible_effect,
+            &capability,
+            &existing,
+            &cancelled,
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("cancellation after possible effect stays inert: {err:?}"),
+        };
+        assert_eq!(candidate.outcome, ProcedureOutcome::Rejected);
+        assert!(has_unknown_effect(&candidate.steps));
+        assert!(candidate.unknown_handling_note.contains("reconcile"));
+        assert!(candidate.steps.iter().all(|step| {
+            step.cancel_note.contains("on cancel") && step.reconcile_note.contains("reconcile")
+        }));
+    }
+
+    // WORK_UNIT_CASE: 661/28
+    #[test]
+    fn case_28_cleanup_failure_and_unknown_paths_keep_exact_owners() {
+        let candidate = match propose_procedure(
+            &test_item(),
+            &test_grounded(),
+            &test_evidence(),
+            &test_capability(),
+            &test_existing(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("cleanup baseline: {err:?}"),
+        };
+        assert_eq!(candidate.outcome, ProcedureOutcome::Complete);
+        for step in &candidate.steps {
+            assert!(!step.owner.trim().is_empty());
+            assert!(step.failure_note.contains("owner review"));
+            assert!(step.rollback_note.contains("rollback"));
+        }
+        assert!(check_rollback_owned(&candidate.steps).is_ok());
+
+        let mut missing_cleanup = candidate.steps[0].clone();
+        missing_cleanup.rollback_note.clear();
+        assert!(matches!(
+            check_rollback_owned(std::slice::from_ref(&missing_cleanup)),
+            Err(ProcedureError::Shape { field, .. }) if field == "step.rollback"
+        ));
+
+        let mut missing_reconciliation = candidate.steps[0].clone();
+        missing_reconciliation.effect = EffectClass::Unknown;
+        missing_reconciliation.reconcile_note.clear();
+        assert!(matches!(
+            check_unknown_reconcile_owned(std::slice::from_ref(&missing_reconciliation)),
+            Err(ProcedureError::Shape { field, .. }) if field == "step.reconcile"
+        ));
+    }
+
+    // WORK_UNIT_CASE: 661/29
+    #[test]
+    fn case_29_effect_classes_keep_reversible_and_compensation_boundaries() {
+        for spelling in ["read_only", "owner_directed", "compensatable", "unknown"] {
+            assert!(EffectClass::parse(spelling).is_ok());
+        }
+        assert!(matches!(
+            EffectClass::parse("irreversible"),
+            Err(ProcedureError::Shape { field, .. }) if field == "step.effect"
+        ));
+
+        let candidate = match propose_procedure(
+            &test_item(),
+            &test_grounded(),
+            &test_evidence(),
+            &test_capability(),
+            &test_existing(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("effect-class baseline: {err:?}"),
+        };
+        assert!(
+            candidate
+                .steps
+                .iter()
+                .any(|step| step.effect == EffectClass::Compensatable)
+        );
+        assert!(candidate.steps.iter().all(|step| {
+            step.effect != EffectClass::Compensatable || step.rollback_note.contains("rollback")
+        }));
+
+        let mut unknown_evidence = test_evidence();
+        unknown_evidence.mechanism_note =
+            "exercised mechanism m-2 with unknown possible effect on ext-9".to_owned();
+        let unknown = match propose_procedure(
+            &test_item(),
+            &test_grounded(),
+            &unknown_evidence,
+            &test_capability(),
+            &test_existing(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("unknown effect remains candidate-only: {err:?}"),
+        };
+        assert_eq!(unknown.outcome, ProcedureOutcome::BlockedUnknownEffect);
+        assert!(unknown.steps.iter().any(|step| {
+            step.effect == EffectClass::Unknown && step.reconcile_note.contains("reconcile")
+        }));
+    }
+
+    // WORK_UNIT_CASE: 661/30
+    #[test]
+    fn case_30_rollback_and_forward_repair_keep_current_preconditions_visible() {
+        let candidate = match propose_procedure(
+            &test_item(),
+            &test_grounded(),
+            &test_evidence(),
+            &test_capability(),
+            &test_existing(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("rollback baseline: {err:?}"),
+        };
+        assert!(candidate.inverse_note.contains("before state"));
+        assert!(
+            candidate
+                .forward_correction_note
+                .contains("before state is unreachable")
+        );
+        for step in &candidate.steps {
+            assert!(!step.precondition.trim().is_empty());
+            assert!(!step.rollback_note.trim().is_empty());
+        }
+        assert!(
+            candidate
+                .step_dispositions
+                .iter()
+                .all(|disposition| !disposition.inverse_note.trim().is_empty())
+        );
+    }
+
     // WORK_UNIT_CASE: 661/6
     #[test]
     fn case_06_success_and_failure_episode_evidence_preserved() {
@@ -3116,6 +3358,57 @@ mod tests {
             candidate.transfer.preserved_counterevidence_refs,
             vec!["ce-1".to_owned()]
         );
+    }
+
+    // Causal plumbing regression (not a 661 work-unit case: 24 deferred).
+    #[test]
+    fn causal_claim_validates_and_commits_digest_without_candidate_receipt() {
+        let claim = match test_causal_claim() {
+            Ok(claim) => claim,
+            Err(err) => panic!("causal claim fixture: {err}"),
+        };
+        assert!(!claim.rivals.is_empty());
+        assert!(!claim.confounders.is_empty());
+        assert!(claim.validate().is_ok());
+
+        let item = test_item();
+        let grounded = test_grounded();
+        let capability = test_capability();
+        let existing = test_existing();
+        let policy = test_policy();
+        let mut evidence = test_evidence();
+        evidence.causal_claim = Some(claim.clone());
+        let candidate =
+            match propose_procedure(&item, &grounded, &evidence, &capability, &existing, &policy) {
+                Ok(candidate) => candidate,
+                Err(err) => panic!("causal evidence stays inert: {err:?}"),
+            };
+        assert_eq!(candidate.outcome, ProcedureOutcome::Complete);
+        let baseline = match propose_procedure(
+            &item,
+            &grounded,
+            &test_evidence(),
+            &capability,
+            &existing,
+            &policy,
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("causal baseline: {err:?}"),
+        };
+        assert_ne!(candidate.candidate_digest, baseline.candidate_digest);
+
+        let mut missing_rival = claim;
+        missing_rival.rivals.clear();
+        evidence.causal_claim = Some(missing_rival);
+        let err =
+            match propose_procedure(&item, &grounded, &evidence, &capability, &existing, &policy) {
+                Ok(candidate) => panic!("missing rival must fail closed: {:?}", candidate.outcome),
+                Err(err) => err,
+            };
+        assert!(matches!(
+            err,
+            ProcedureError::Shape { field, .. } if field == "evidence.causal_claim"
+        ));
     }
 
     // WORK_UNIT_CASE: 661/10
