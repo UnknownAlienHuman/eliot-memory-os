@@ -14,10 +14,10 @@ normative_pair_ref = "docs/normative-pair.toml"
 [documentation]
 architecture = [
   "docs/architecture/A12-03-one-governed-write-path.md#a123-one-governed-write-path",
-  "docs/architecture/A13-06-data-durability-and-recovery.md#a136-data-durability-and-recovery",
+  "docs/architecture/A13-06-operational-recovery-state.md#a136-operational-recovery-state",
 ]
 implementation = [
-  "docs/architecture/I05-09-blobstore.md#i59-blobstore",
+  "docs/architecture/I05-12-blob-store.md#i512-blob-store",
   "docs/architecture/I05-19-write-submission-execution-and-receipts.md#i519-write-submission-execution-and-receipts",
   "docs/architecture/I05-20-read-model-consistency-and-cache.md#i520-read-model-consistency-and-cache",
   "docs/architecture/I06-15-capability-grant-lineage-introductions-and-resource-facets.md#i615-capability-grant-lineage-introductions-and-resource-facets",

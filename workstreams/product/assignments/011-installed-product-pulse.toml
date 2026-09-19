@@ -31,10 +31,10 @@ primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues
 [documentation]
 architecture = [
   "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A13-02-kernel-and-failure-domains.md#a132-kernel-and-failure-domains",
-  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A13-08-restart-and-recovery.md#a138-restart-and-recovery",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A13-08-integrity.md#a138-integrity",
 ]
 implementation = [
-  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I00-05-current-system-evidence-and-source-support-model.md#i05-current-system-evidence-and-source-support-model",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I00-05-conformance-support-and-evidence-status.md#i05-conformance-support-and-evidence-status",
   "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I00-10-user-outcome-recovery-invariants-and-anti-proxy-development-contract.md#i010-user-outcome-recovery-invariants-and-anti-proxy-development-contract",
   "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I00-13-current-support-conformance-and-product-status.md#i013-current-support-conformance-and-product-status",
   "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I05-19-write-submission-execution-and-receipts.md#i519-write-submission-execution-and-receipts",
