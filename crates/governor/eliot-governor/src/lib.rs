@@ -53,6 +53,7 @@ mod observation_reconciliation;
 mod operator_reconciliation;
 mod owner_projection_refresh;
 mod skill_lifecycle;
+mod swarm_plan_attachment_service;
 mod task_lifecycle;
 
 pub use activation_outcome::*;
@@ -76,6 +77,10 @@ pub use observation_reconciliation::{
 };
 pub use operator_reconciliation::{GovernorOperatorReconciliation, operator_command_envelope};
 pub use skill_lifecycle::GovernorSkillLifecycle;
+pub use swarm_plan_attachment_service::{
+    ATTACHMENT_ORDERING_SCOPE, ATTACHMENT_REVISION_KEY, CanonicalAttachmentStoreError,
+    CanonicalSwarmPlanAttachmentStore, SwarmPlanAttachmentService,
+};
 /// Task lifecycle domain types re-exported so the daemon composition root
 /// can name the exact task-command types without a second task dependency
 /// path (same reason as the [`CanonicalWriteEnvelope`] re-export below).
