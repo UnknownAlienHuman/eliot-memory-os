@@ -1,8 +1,9 @@
-//! Work-unit 610 slices 1-4b plus slice 5: bounded discriminative probe
-//! planner, cases 1..10 plus 610/17, 610/21, 610/32 and 610/36 (typed
-//! affordance Unknown/Unavailable gating, safe read-only candidate-only
-//! admission, explicit lexicographic order with stable tie-break, and
-//! input-order-independent plan/digest stability).
+//! Work-unit 610 slices 1-5 plus slice 6: bounded discriminative probe
+//! planner, cases 1..10 plus 610/17, 610/21, 610/32, 610/36 and 610/18-19
+//! (typed affordance Unknown/Unavailable gating, safe read-only
+//! candidate-only admission, explicit lexicographic order with stable
+//! tie-break, input-order-independent plan/digest stability, no
+//! shell/Value/SDK payload, and no live route/credential/lease handle).
 //!
 //! Cases 610/1, 610/4 and 610/5 are marked on the existing planner
 //! behaviour tests in `tests/probe_plan.rs`. Cases 610/11..16, 610/38
@@ -12,9 +13,8 @@
 //! causal/material relevance is an A-03 materiality judgment, and `src/plan.rs`
 //! contains zero `ResultUpdate`/`RivalUpdateMeaning` inspections, so no
 //! planner-only implementation exists without inventing APIs (slice-4 Opus
-//! audit ruling on 610/11 applies identically). Cases 610/18-19, 610/22,
-//! 610/26-28, 610/30-31, 610/34-35, 610/37, 610/41-42 (negative
-//! execution-absence proofs, owner preservation, effect-policy,
+//! audit ruling on 610/11 applies identically). Cases 610/22,
+//! 610/26-28, 610/30-31, 610/34-35, 610/37, 610/41-42 (effect-policy,
 //! budget/dominance/disposition/replay/no-execution) are QUEUED and out of
 //! this batch; 610/20 needs `src/` owner preservation, 610/23-25 need policy
 //! or budget enforcement the planner explicitly declines (`plan.rs`: effect,
@@ -53,7 +53,17 @@
 //! set sorts by identity, groups collapse deterministically, probes rank by
 //! vector key then identity, omissions sort canonically), so set-only input
 //! permutations preserve the plan value and frozen digest.
-//! Docs route=sha256:5fafc9324417043a5a62d000cde2b0f4cb4fbeb740fa142190dacc7b7aefd80d read=sha256:2448896b553a2951a33b237f8a98721acdffa54c6b49d8061b77cd89c2a39c37 bundle=893f5d6140c41f5591e16f7d9f0f656cc3b6fbbb64a3216b800eada52c26aea9 (generic-source; verified bundle read in full; plan.rs/model.rs plus contracts affordance/result/objective/budget sources read directly).
+//! Ownership ruling 610/18-19 (this slice, planner-side absence only;
+//! no new APIs, zero `src/` changes): 610/18 OWNED via the closed typed
+//! plan shape observed through `canonical_bytes` (every probe carries only
+//! `kind`/`target`/`result_schema`/`dimensions` plus the id/digest binding;
+//! every result branch stays `PossibleResultValue::Unknown` with exact cover,
+//! and the canonical wire contains no shell/Value/SDK payload keys);
+//! 610/19 OWNED via the candidate-only binding observed through the plan
+//! value (every probe binds only `ProbeAffordanceRef` id/digest with lineage,
+//! and the canonical wire contains no live route/credential/lease/permit-handle
+//! keys, so nothing reserves or addresses execution).
+//! Docs route=sha256:1b9bbbd8b5bb5e2de4737b4fa03e7e3672daba4394afef443dd3d8476554c7fa read=sha256:ea79ca7e06dbc95bb6ebceb4b5d904a848f265540ab58d6e82d93d5878599ec6 bundle=5ca78f97ee5f6485f6ab552d6687ade11da053a68be0cb38339167aeac0be7f3 (generic-source; verified bundle read in full; plan.rs/model.rs plus contracts affordance/result/objective/budget sources read directly).
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
@@ -69,6 +79,7 @@ use eliot_dreamer_contracts::{
     ResourceDimension, ResultBranch, ResultTarget, ResultUpdate, ReversibilityDimension,
     RivalCoverageStatus, RivalCoverageSummary, RivalDeclarationSetRef, RivalModelSet,
     RivalModelSetParams, RivalPredictionRef, ValidatedDreamDraft, ValidationReceipt,
+    canonical_bytes,
     grounding::canonical::{
         ArtifactId, EpochId, EpochLineageId, Precision, PropositionId, ResourceGeneration,
         StateFence, TaskId, ValidityBounds, sha256_hex,
@@ -1021,4 +1032,149 @@ fn irrelevant_input_order_preserves_plan_and_digest() {
         .collect();
     assert_eq!(orders, vec![order.clone(), order]);
     assert!(forward.omissions.is_empty());
+}
+
+// WORK_UNIT_CASE: 610/18
+#[test]
+fn no_shell_value_sdk_payload() {
+    let plan = plan_for(
+        vec![
+            descriptor("aff-typed-a", rival_target("pred-ns-left", "pred-ns-right")),
+            descriptor("aff-typed-b", gap_target("claim-typed")),
+        ],
+        Some(16),
+    );
+    must(plan.validate());
+    assert_eq!(plan.probes.len(), 2);
+    assert!(plan.omissions.is_empty());
+
+    for probe in &plan.probes {
+        must(probe.target.validate());
+        must(probe.result_schema.validate());
+        must(probe.dimensions.validate());
+        assert_eq!(probe.probe_id, probe.affordance.affordance_id);
+        assert!(!probe.affordance.affordance_digest.trim().is_empty());
+        assert!(!probe.expected_discrimination.trim().is_empty());
+        for branch in &probe.result_schema.branches {
+            match &branch.value {
+                PossibleResultValue::Unknown { reason }
+                | PossibleResultValue::Unavailable { reason }
+                | PossibleResultValue::InstrumentationFailure { reason } => {
+                    assert!(!reason.trim().is_empty());
+                }
+                PossibleResultValue::Observable { .. }
+                | PossibleResultValue::Coverage { .. }
+                | PossibleResultValue::Verifier { .. } => {
+                    must(branch.value.validate());
+                }
+            }
+            assert!(!branch.updates.is_empty());
+        }
+        let rendered = format!("{probe:?}");
+        for token in [
+            "shell",
+            "Shell",
+            "SDK",
+            "Sdk",
+            "serde_json",
+            "Value(",
+            "Command",
+            "exec(",
+        ] {
+            assert!(
+                !rendered.contains(token),
+                "candidate probe must carry no {token} payload, got {rendered}"
+            );
+        }
+    }
+
+    let wire = must(canonical_bytes(&plan));
+    let text = String::from_utf8(wire).expect("canonical plan wire must be UTF-8");
+    let folded = text.to_lowercase();
+    for key in [
+        "\"shell\"",
+        "\"sdk\"",
+        "\"command\"",
+        "\"payload\"",
+        "\"argv\"",
+        "\"serde_json\"",
+    ] {
+        assert!(
+            !folded.contains(key),
+            "canonical plan wire must carry no {key} payload key"
+        );
+    }
+    assert_eq!(must(plan.compute_digest()), plan.digest);
+}
+
+// WORK_UNIT_CASE: 610/19
+#[test]
+fn no_live_route_credential_lease_handle() {
+    let plan = plan_for(
+        vec![
+            descriptor(
+                "aff-nolive-a",
+                rival_target("pred-nl-left", "pred-nl-right"),
+            ),
+            descriptor("aff-nolive-b", gap_target("claim-nolive")),
+        ],
+        Some(16),
+    );
+    must(plan.validate());
+    assert_eq!(plan.probes.len(), 2);
+    assert!(plan.omissions.is_empty());
+
+    for probe in &plan.probes {
+        must(probe.target.validate());
+        must(probe.affordance.validate());
+        assert_eq!(probe.probe_id, probe.affordance.affordance_id);
+        assert!(!probe.affordance.affordance_digest.trim().is_empty());
+        for merged in &probe.merged_affordances {
+            assert_ne!(*merged, probe.probe_id);
+        }
+        must(probe.result_schema.validate());
+        must(probe.dimensions.validate());
+        let rendered = format!("{probe:?}");
+        for token in [
+            "route",
+            "credential",
+            "Credential",
+            "lease",
+            "Lease",
+            "secret",
+            "reservation",
+            "Reservation",
+            "std::process",
+            "process::Command",
+        ] {
+            // `Permitted`/`RequiresGrant` authority spellings are legitimate
+            // candidate-only standing descriptions, not live handles; the
+            // lowercase `permit` substring is therefore excluded here.
+            assert!(
+                !rendered.contains(token),
+                "candidate probe must carry no live {token} handle, got {rendered}"
+            );
+        }
+    }
+
+    let wire = must(canonical_bytes(&plan));
+    let text = String::from_utf8(wire).expect("canonical plan wire must be UTF-8");
+    let folded = text.to_lowercase();
+    for key in [
+        "\"route\"",
+        "\"credential\"",
+        "\"lease\"",
+        "\"secret\"",
+        "\"token\"",
+        "\"password\"",
+        "\"reservation\"",
+        "\"process\"",
+        "\"handle\"",
+    ] {
+        assert!(
+            !folded.contains(key),
+            "canonical plan wire must carry no live {key} handle key"
+        );
+    }
+    assert_eq!(must(plan.compute_digest()), plan.digest);
 }
