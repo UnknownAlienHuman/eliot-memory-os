@@ -1677,6 +1677,40 @@ mod tests {
         assert_eq!(outcome_rejection_hint(&result.outcome), None);
     }
 
+    // WORK_UNIT_CASE: 667/2
+    #[test]
+    fn case_02_wrong_subtype_or_raw_target_is_rejected() {
+        let mut request = valid_request();
+        request.curation_kind = CurationKind::Episode;
+        let result = propose_reconsolidation(&request).expect("wrong subtype is semantic");
+        assert_eq!(result.outcome, ReconsolidationOutcome::Rejected);
+        assert!(result.child.is_none());
+
+        for target_kind in [TargetKind::RawEpisode, TargetKind::RawArtifact] {
+            let mut request = valid_request();
+            request.parent.target_kind = target_kind;
+            let result = propose_reconsolidation(&request).expect("raw target is semantic");
+            assert_eq!(result.outcome, ReconsolidationOutcome::Rejected);
+            assert!(result.child.is_none());
+        }
+    }
+
+    // WORK_UNIT_CASE: 667/3
+    #[test]
+    fn case_03_structure_and_repair_routes_are_rejected() {
+        for curation_kind in [
+            CurationKind::Merge,
+            CurationKind::Split,
+            CurationKind::Repair,
+        ] {
+            let mut request = valid_request();
+            request.curation_kind = curation_kind;
+            let result = propose_reconsolidation(&request).expect("sibling route is semantic");
+            assert_eq!(result.outcome, ReconsolidationOutcome::Rejected);
+            assert!(result.child.is_none());
+        }
+    }
+
     // WORK_UNIT_CASE: 667/4
     #[test]
     fn case_04_stale_frontier_blocks_single_parent_identity() {
@@ -1688,6 +1722,53 @@ mod tests {
         let mut request = valid_request();
         request.parent.predecessor_chain = vec!["rev-1".to_owned(), "rev-1".to_owned()];
         assert!(propose_reconsolidation(&request).is_err());
+    }
+
+    // WORK_UNIT_CASE: 667/5
+    #[test]
+    fn case_05_parent_identity_rejects_self_parent_forks_and_mixed_revisions() {
+        let mut self_parent = valid_request();
+        self_parent.proposed_child_handle = self_parent.parent.handle.clone();
+        let result = propose_reconsolidation(&self_parent).expect("self-parenting is semantic");
+        assert_eq!(result.outcome, ReconsolidationOutcome::Rejected);
+
+        for repeated in [
+            "derived-1".to_owned(),
+            "rev-2".to_owned(),
+            "derived-1-rev-3".to_owned(),
+        ] {
+            let mut fork = valid_request();
+            fork.parent.predecessor_chain.push(repeated);
+            let result = propose_reconsolidation(&fork).expect("fork identity is semantic");
+            assert_eq!(result.outcome, ReconsolidationOutcome::Rejected);
+        }
+
+        let mut mixed_frontier = valid_request();
+        mixed_frontier.parent.frontier_revision = "rev-1".to_owned();
+        let result = propose_reconsolidation(&mixed_frontier)
+            .expect("mixed frontier is a stale semantic outcome");
+        assert_eq!(result.outcome, ReconsolidationOutcome::Stale);
+
+        let mut mixed_reactivation = valid_request();
+        mixed_reactivation.reactivation.checkpoint = "rev-1".to_owned();
+        let result = propose_reconsolidation(&mixed_reactivation)
+            .expect("mixed reactivation revision is a stale semantic outcome");
+        assert_eq!(result.outcome, ReconsolidationOutcome::Stale);
+    }
+
+    // WORK_UNIT_CASE: 667/8
+    #[test]
+    fn case_08_proposal_is_pure_and_does_not_mutate_or_issue() {
+        let request = valid_request();
+        let frozen = request.clone();
+        let first = propose_reconsolidation(&request).expect("pure proposal succeeds");
+        let second = propose_reconsolidation(&request).expect("repeat proposal succeeds");
+
+        assert_eq!(request, frozen);
+        assert_eq!(first, second);
+        let child = first.child.expect("complete result has a request");
+        assert!(child.request_only);
+        assert!(!child.allocates_revision);
     }
 
     // WORK_UNIT_CASE: 667/9
