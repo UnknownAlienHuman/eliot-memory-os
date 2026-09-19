@@ -1536,6 +1536,33 @@ impl RedbRecoveryStore {
         Ok(Some(retained))
     }
 
+    /// Loads every retained activation result in ORS retention order.
+    ///
+    /// The projection is opaque to ORS callers; Kernel performs the typed
+    /// ticket/result validation before restoring its result ledger.
+    pub fn load_all_activation_results(
+        &self,
+    ) -> Result<Vec<ActivationResultRetentionRecord>, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read
+            .open_table(ACTIVATION_RESULT_RETENTION)
+            .map_err(storage)?;
+        let mut records = Vec::new();
+        for entry in table.iter().map_err(storage)? {
+            let (key, value) = entry.map_err(storage)?;
+            let record: ActivationResultRetentionRecord = decode(value.value())?;
+            if key.value() != record.record_key() {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "activation_result_retention",
+                    reason: "table key does not match ticket identity".to_owned(),
+                });
+            }
+            records.push(record);
+        }
+        records.sort_by_key(|record| record.retention_order);
+        Ok(records)
+    }
+
     /// Prunes the oldest retained activation results until the count and
     /// aggregate payload bounds are both satisfied.
     pub fn prune_activation_results(&self) -> Result<u64, OrsError> {

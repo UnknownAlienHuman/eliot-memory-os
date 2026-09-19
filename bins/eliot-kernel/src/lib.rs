@@ -475,7 +475,8 @@ pub struct KernelComposition {
     #[cfg(windows)]
     agent_activation_changed: tokio::sync::Notify,
     /// Full typed semantic resolution results retained verbatim under their
-    /// exact ticket identities, keyed by ticket id.
+    /// exact ticket identities, keyed by ticket id. This is the rehydrated
+    /// result ledger only; it never contains pending entries or live bindings.
     ///
     /// Every one of the seven closed dispositions shares one
     /// exact-replay/conflict ledger here, independent of the legacy
@@ -485,7 +486,7 @@ pub struct KernelComposition {
     /// beside the pending table (rather than inside its entries) so the
     /// ticket ledger shape stays additive.
     #[cfg(windows)]
-    agent_activation_results: Mutex<BTreeMap<String, AgentActivationResolutionResult>>,
+    agent_activation_results: Mutex<BTreeMap<String, AgentActivationResultRecord>>,
     /// Connection-scoped index of staged P-04 host-request operations. The
     /// durable ORS record is the owner; this index only lets disconnect revoke
     /// fence the presenting connection's still-uncertain operations to
@@ -601,6 +602,7 @@ struct AgentActivationResultRecord {
     result: AgentActivationResolutionResult,
     phase: AgentActivationResultPhase,
     ticket_connection: String,
+    retention_order: u64,
 }
 
 /// Pure replay classifier for v2 results, mirroring the v1 decision

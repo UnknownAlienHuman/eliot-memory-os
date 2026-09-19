@@ -406,6 +406,7 @@ fn activation_kernel_with_ticket(
                 result,
                 phase: AgentActivationResultPhase::AcceptedTerminal,
                 ticket_connection: ticket.connection_id.clone(),
+                retention_order: 0,
             });
         }
     }
@@ -414,9 +415,131 @@ fn activation_kernel_with_ticket(
             .agent_activation_results
             .lock()
             .expect("raw result lock")
-            .insert(ticket.ticket_id.clone(), result);
+            .insert(
+                ticket.ticket_id.clone(),
+                AgentActivationResultRecord {
+                    result,
+                    phase: AgentActivationResultPhase::AcceptedTerminal,
+                    ticket_connection: ticket.connection_id.clone(),
+                    retention_order: 0,
+                },
+            );
     }
     (root, kernel)
+}
+
+#[cfg(windows)]
+fn activation_retention_record(
+    ticket: &AgentActivationResolutionTicket,
+    result: &eliot_protocol::AgentActivationResolutionResult,
+) -> eliot_ors::ActivationResultRetentionRecord {
+    eliot_ors::ActivationResultRetentionRecord {
+        ticket_id: ticket.ticket_id.clone(),
+        ticket_sha256: ticket.ticket_sha256.clone(),
+        ticket_payload: serde_json::to_string(ticket).expect("ticket payload"),
+        result_sha256: result.result_sha256.clone(),
+        result_payload: serde_json::to_string(result).expect("result payload"),
+        connection_id: ticket.connection_id.clone(),
+        state_fence: sha256_json(&ticket.state_fence).expect("fence digest"),
+        phase: eliot_ors::ActivationResultRetentionPhase::AcceptedTerminal,
+        retention_order: 0,
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn activation_result_ledger_rehydrates_without_bridge_state_or_session() {
+    let root = std::env::temp_dir().join(format!(
+        "eliot-kernel-activation-rehydrate-{}-{}",
+        std::process::id(),
+        unix_ms()
+    ));
+    std::fs::create_dir_all(root.join(".eliot")).expect("test ORS directory");
+    let ticket = activation_v2_ticket("activation-ticket-rehydrate", 2_000);
+    let result = activation_v2_resolved(&ticket, 1_000);
+    let ors_path = root.join(".eliot").join("kernel-ors.redb");
+    let ors = eliot_ors::RedbRecoveryStore::open(&ors_path).expect("open ORS");
+    ors.retain_activation_result(&activation_retention_record(&ticket, &result))
+        .expect("retain activation result");
+    drop(ors);
+
+    let kernel = KernelComposition::new(KernelConfig::new(&root)).expect("rehydrate kernel");
+    let ledger = kernel
+        .agent_activation_results
+        .lock()
+        .expect("result ledger lock");
+    assert_eq!(ledger.len(), 1);
+    assert_eq!(
+        ledger
+            .get(&ticket.ticket_id)
+            .expect("rehydrated ticket")
+            .result,
+        result
+    );
+    drop(ledger);
+    assert!(
+        kernel
+            .agent_activation_pending
+            .lock()
+            .expect("pending lock")
+            .entries
+            .is_empty()
+    );
+    assert!(
+        kernel
+            .agent_bridge_connections
+            .lock()
+            .expect("connection lock")
+            .is_empty()
+    );
+    let query =
+        AgentActivationResultReconcile::new(ticket.ticket_id.clone(), result.result_sha256.clone())
+            .expect("reconcile query");
+    let ack = kernel
+        .reconcile_agent_activation_result(&query)
+        .expect("rehydrated result reconciles");
+    assert_eq!(
+        ack.outcome,
+        eliot_protocol::AgentActivationResultAckOutcome::Reconciled
+    );
+    let missing =
+        AgentActivationResultReconcile::new("activation-ticket-missing".to_owned(), "f".repeat(64))
+            .expect("missing reconcile query");
+    let missing_ack = kernel
+        .reconcile_agent_activation_result(&missing)
+        .expect("missing result reconciles as unknown");
+    assert_eq!(
+        missing_ack.outcome,
+        eliot_protocol::AgentActivationResultAckOutcome::Unknown
+    );
+
+    drop(kernel);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(windows)]
+#[test]
+fn activation_result_ledger_typed_corruption_fences_startup() {
+    let root = std::env::temp_dir().join(format!(
+        "eliot-kernel-activation-corrupt-{}-{}",
+        std::process::id(),
+        unix_ms()
+    ));
+    std::fs::create_dir_all(root.join(".eliot")).expect("test ORS directory");
+    let ticket = activation_v2_ticket("activation-ticket-corrupt", 2_000);
+    let mut result = activation_v2_resolved(&ticket, 1_000);
+    result.ticket_sha256 = "e".repeat(64);
+    let ors_path = root.join(".eliot").join("kernel-ors.redb");
+    let ors = eliot_ors::RedbRecoveryStore::open(&ors_path).expect("open ORS");
+    ors.retain_activation_result(&activation_retention_record(&ticket, &result))
+        .expect("retain typed-corrupt result");
+    drop(ors);
+
+    let Err(error) = KernelComposition::new(KernelConfig::new(&root)) else {
+        panic!("typed-corrupt retention must fence startup");
+    };
+    assert!(matches!(error, KernelBuildError::Ors(_)));
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[cfg(windows)]
@@ -680,7 +803,7 @@ fn activation_raw_negative_projection_rejects_tampered_result_with_pending_prese
         let retained = results
             .get(&ticket.ticket_id)
             .expect("rejected projection must preserve the retained result");
-        assert_eq!(retained.result_sha256, valid.result_sha256);
+        assert_eq!(retained.result.result_sha256, valid.result_sha256);
     }
     drop(kernel);
     let _ = std::fs::remove_dir_all(root);
