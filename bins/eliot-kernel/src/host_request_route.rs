@@ -695,9 +695,10 @@ impl KernelComposition {
     /// The canonical v2 envelope ledger (`pending.results`, retained with its
     /// submission phase by the production submit path) is authoritative and is
     /// read first; the unenveloped P-04 raw map is a compatibility fallback.
-    /// This matches the bridge waiter priority (v2 envelope wins over the raw
-    /// leg), so one ticket exposes one result identity on both the daemon and
-    /// host-request legs. A projected entry stays answerable: the pending
+    /// A changed same-ticket entry across the two ledgers is an identity
+    /// conflict instead of a silent preference: one ticket owns at most one
+    /// result identity. An exact digest match across both legs stays
+    /// idempotent. A projected entry stays answerable: the pending
     /// entry is consumed after bridge projection but the retained record keeps
     /// the exact ticket connection, so a retried envelope for the same ticket
     /// answers from the known result instead of falling back to unknown. A
@@ -742,6 +743,23 @@ impl KernelComposition {
             return Err(TransportError::UnknownRequest);
         }
         let result: AgentActivationResolutionResult = if let Some(record) = retained {
+            // Cross-ledger conflict check: one ticket owns at most one
+            // result identity across the canonical v2 retention and the raw
+            // P-04 compatibility leg. A changed same-ticket entry in the raw
+            // leg conflicts instead of double-applying by silent preference;
+            // an exact digest match across both legs stays idempotent.
+            let raw_conflicts = {
+                let results = self
+                    .agent_activation_results
+                    .lock()
+                    .map_err(|_| TransportError::SessionFenced)?;
+                results
+                    .get(&activation_binding.ticket_id)
+                    .is_some_and(|raw| raw.result_sha256 != record.result.result_sha256)
+            };
+            if raw_conflicts {
+                return Err(TransportError::IdentityConflict);
+            }
             record.result
         } else {
             let results = self

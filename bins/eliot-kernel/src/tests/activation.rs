@@ -454,7 +454,7 @@ fn activation_host_request_falls_back_to_raw_result_map() {
 
 #[cfg(windows)]
 #[test]
-fn activation_host_request_prefers_canonical_v2_over_raw_result() {
+fn activation_host_request_conflicting_ledgers_fail_closed() {
     let ticket = activation_v2_ticket("activation-ticket-priority", 2_000);
     let canonical = activation_v2_resolved(&ticket, 1_000);
     let raw = activation_v2_resolved(&ticket, 1_001);
@@ -466,10 +466,33 @@ fn activation_host_request_prefers_canonical_v2_over_raw_result() {
         activation_kernel_with_ticket("priority", &ticket, Some(canonical.clone()), Some(raw));
     let envelope =
         activation_host_envelope(&ticket, &canonical.result_sha256, &ticket.connection_id);
+    let error = kernel
+        .host_request_activation_resolution(&envelope)
+        .expect_err("conflicting ledger entries for one ticket must conflict");
+    assert!(
+        matches!(error, TransportError::IdentityConflict),
+        "unexpected error: {error:?}"
+    );
+    drop(kernel);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(windows)]
+#[test]
+fn activation_host_request_matching_ledgers_stay_idempotent() {
+    let ticket = activation_v2_ticket("activation-ticket-dual-match", 2_000);
+    let result = activation_v2_resolved(&ticket, 1_000);
+    let (root, kernel) = activation_kernel_with_ticket(
+        "dual-match",
+        &ticket,
+        Some(result.clone()),
+        Some(result.clone()),
+    );
+    let envelope = activation_host_envelope(&ticket, &result.result_sha256, &ticket.connection_id);
     let resolved = kernel
         .host_request_activation_resolution(&envelope)
-        .expect("canonical v2 result wins over the raw leg");
-    assert_eq!(resolved.result_sha256, canonical.result_sha256);
+        .expect("exact digest match across both ledgers stays idempotent");
+    assert_eq!(resolved.result_sha256, result.result_sha256);
     drop(kernel);
     let _ = std::fs::remove_dir_all(root);
 }
