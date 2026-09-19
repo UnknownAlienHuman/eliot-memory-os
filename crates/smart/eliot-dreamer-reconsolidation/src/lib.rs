@@ -2473,6 +2473,51 @@ mod tests {
         assert!(result.child.is_none());
     }
 
+    // WORK_UNIT_CASE: 667/40
+    #[test]
+    fn case_40_inverse_path_is_ready_before_external_effects() {
+        let mut request = valid_request();
+        request.child_inverse_note =
+            "set aside derived-1-rev-3 before external effects and restore derived-1 rev-2"
+                .to_owned();
+        let frozen = request.clone();
+
+        let result = propose_reconsolidation(&request).expect("inverse path is eligible");
+        let child = result
+            .child
+            .expect("complete result carries an allocation request");
+
+        assert_eq!(result.outcome, ReconsolidationOutcome::Complete);
+        assert_eq!(child.parent_handle, request.parent.handle);
+        assert_eq!(child.parent_revision, request.parent.revision);
+        assert_eq!(child.inverse_note, request.child_inverse_note);
+        assert!(child.request_only);
+        assert!(!child.allocates_revision);
+        assert_eq!(request, frozen);
+    }
+
+    // WORK_UNIT_CASE: 667/41
+    #[test]
+    fn case_41_forward_correction_is_bound_to_the_proposed_child() {
+        let mut request = valid_request();
+        request.child_forward_correction =
+            "if the later write is rejected, issue a forward correction for derived-1-rev-3"
+                .to_owned();
+
+        let result = propose_reconsolidation(&request).expect("forward correction is carried");
+        let child = result
+            .child
+            .expect("complete result carries an allocation request");
+
+        assert_eq!(result.outcome, ReconsolidationOutcome::Complete);
+        assert_eq!(child.proposed_child_handle, request.proposed_child_handle);
+        assert_eq!(child.forward_correction, request.child_forward_correction);
+        assert_eq!(child.expiry_ms, request.child_expiry_ms);
+        assert_eq!(child.reopen_condition, request.child_reopen_condition);
+        assert!(child.request_only);
+        assert!(!child.allocates_revision);
+    }
+
     // WORK_UNIT_CASE: 667/39
     #[test]
     fn case_39_unaffected_dependent_keeps_an_explicit_note() {
