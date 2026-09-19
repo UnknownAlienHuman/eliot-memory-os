@@ -38,17 +38,18 @@
 //! validation. There are no placeholder, mock, canned, or pseudo paths:
 //! every branch binds an explicit input field.
 //!
-//! Test coverage note: 34 of 50 `WORK_UNIT_CASE 661/*` cases execute here.
+//! Test coverage note: 36 of 50 `WORK_UNIT_CASE 661/*` cases execute here.
 //! Executed cases: 661/1, 661/2, 661/3, 661/4, 661/5, 661/6, 661/7, 661/8,
 //! 661/9, 661/10, 661/11, 661/12, 661/13, 661/14, 661/15, 661/16, 661/17,
 //! 661/18, 661/19, 661/20, 661/21, 661/22, 661/23, 661/25, 661/26,
 //! 661/27, 661/28, 661/29, 661/30, 661/31, 661/32, 661/33, and 661/34. The
-//! remaining 16 of 50 are deferred per START.md s1; #965 admission is
+//! 661/40, 661/41, and 661/42. The remaining 14 of 50 are deferred per START.md
+//! s1; #965 admission is
 //! separate. Deferred: 661/24
 //! (pending candidate-visible causal receipt design - `ProcedureCandidate`
 //! currently exposes only `candidate_digest`, no typed causal receipt field),
-//! 661/35, 661/36, 661/37, 661/38, 661/39, 661/41, 661/42, 661/43,
-//! 661/44, 661/45, 661/46, 661/47, 661/48, 661/49, and 661/50.
+//! 661/35, 661/36, 661/37, 661/38, 661/39, 661/43, 661/44, 661/45, 661/46,
+//! 661/47, 661/48, 661/49, and 661/50.
 
 #![forbid(unsafe_code)]
 
@@ -100,6 +101,9 @@ pub const MAX_RETRIES: u32 = 5;
 pub const MAX_FANOUT: u32 = 8;
 /// Expected preservation dimensions attested through the receipt digest.
 pub const EXPECTED_PRESERVATION_DIMENSIONS: usize = 7;
+
+/// The procedure cell may carry only the validator's candidate proof ceiling.
+const PROCEDURE_PROOF_CEILING: &str = "candidate-only";
 
 /// Routing-only proof ceiling carried by every emitted candidate.
 pub const PROCEDURE_PROOF_NOTE: &str = "a-25 candidate-only aggregation: inert typed step graph preserved without screening, grounding, common validation, canonical mutation, authority, effect, store, governor, model, clock, or finish";
@@ -261,8 +265,9 @@ fn mentions_any(lowered_haystack: &str, markers: &[&str]) -> bool {
 /// Returns true when the text claims chronology proves causality.
 fn claims_chronology_is_causality(note: &str) -> bool {
     let low = lowered(note);
-    let time_word =
-        contains_marker(&low, "before") || contains_marker(&low, "earlier") || contains_marker(&low, "preceded");
+    let time_word = contains_marker(&low, "before")
+        || contains_marker(&low, "earlier")
+        || contains_marker(&low, "preceded");
     let cause_word = contains_marker(&low, "therefore causes")
         || contains_marker(&low, "hence causes")
         || contains_marker(&low, "proves caus")
@@ -888,11 +893,7 @@ fn preflight_evidence_bounds(
     )?;
     bound_list_length("negative-refs", evidence.negative_refs.len(), ceiling)?;
     bound_list_length("unknown-refs", evidence.unknown_refs.len(), ceiling)?;
-    bound_list_length(
-        "extinction-refs",
-        evidence.extinction_refs.len(),
-        ceiling,
-    )?;
+    bound_list_length("extinction-refs", evidence.extinction_refs.len(), ceiling)?;
     Ok(())
 }
 
@@ -903,11 +904,7 @@ fn preflight_snapshot_bounds(
     policy: &ProcedurePolicy,
 ) -> Result<(), ProcedureError> {
     let ceiling = policy.max_evidence_items.min(MAX_EVIDENCE_ITEMS);
-    bound_list_length(
-        "capability-refs",
-        capability.capability_refs.len(),
-        ceiling,
-    )?;
+    bound_list_length("capability-refs", capability.capability_refs.len(), ceiling)?;
     bound_list_length(
         "version-pins",
         capability.version_pins.len(),
@@ -1006,10 +1003,7 @@ fn validate_evidence_shapes(evidence: &ProcedureEvidence) -> Result<(), Procedur
     check_sorted_refs(&evidence.verifier_refs, "evidence.verifiers")?;
     check_sorted_refs(&evidence.success_refs, "evidence.successes")?;
     check_sorted_refs(&evidence.failure_refs, "evidence.failures")?;
-    check_sorted_refs(
-        &evidence.counterexample_refs,
-        "evidence.counterexamples",
-    )?;
+    check_sorted_refs(&evidence.counterexample_refs, "evidence.counterexamples")?;
     check_sorted_refs(&evidence.negative_refs, "evidence.negatives")?;
     check_sorted_refs(&evidence.unknown_refs, "evidence.unknowns")?;
     check_sorted_refs(&evidence.extinction_refs, "evidence.extinctions")?;
@@ -1109,11 +1103,7 @@ fn validate_policy_shapes(policy: &ProcedurePolicy) -> Result<(), ProcedureError
             detail: format!("max_evidence_items must cover 1..={MAX_EVIDENCE_ITEMS}"),
         });
     }
-    check_bounded_text(
-        &policy.transfer_note,
-        "policy.transfer",
-        MAX_NOTE_BYTES,
-    )?;
+    check_bounded_text(&policy.transfer_note, "policy.transfer", MAX_NOTE_BYTES)?;
     Ok(())
 }
 
@@ -1235,6 +1225,11 @@ fn intrinsic_receipt_checks(
     item.receipt
         .validate_binding(&evidence.expected_receipt)
         .map_err(|err| receipt_err(&err.to_string()))?;
+    if item.receipt.proof_ceiling != PROCEDURE_PROOF_CEILING {
+        return Err(ProcedureError::Policy {
+            detail: "procedure candidates cannot escalate beyond candidate-only proof".to_owned(),
+        });
+    }
     item.validate()
         .map_err(|err| receipt_err(&err.to_string()))?;
     grounded
@@ -1394,7 +1389,9 @@ fn check_dependency_closure(steps: &[ProcedureStep]) -> Result<(), ProcedureErro
 /// The walk visits each edge at most once and aborts above a fixed visit
 /// ceiling derived from the step bound, so no unbounded loop can occur.
 fn check_graph_acyclic(steps: &[ProcedureStep]) -> Result<(), ProcedureError> {
-    let ceiling = MAX_STEPS.saturating_mul(MAX_STEPS).saturating_add(MAX_STEPS);
+    let ceiling = MAX_STEPS
+        .saturating_mul(MAX_STEPS)
+        .saturating_add(MAX_STEPS);
     let mut visit_count = 0usize;
     let mut index = 0usize;
     while index < steps.len() {
@@ -1621,7 +1618,8 @@ fn check_trigger_bounded(
     }
     let low_trigger = lowered(trigger_note);
     let low_apply = lowered(applicability_note);
-    if mentions_any(&low_trigger, SIMILARITY_MARKERS) || mentions_any(&low_apply, SIMILARITY_MARKERS)
+    if mentions_any(&low_trigger, SIMILARITY_MARKERS)
+        || mentions_any(&low_apply, SIMILARITY_MARKERS)
     {
         return Err(ProcedureError::Shape {
             field: "trigger".to_owned(),
@@ -1674,10 +1672,18 @@ fn select_identity_disposition(
     {
         return Some(ProcedureOutcome::Duplicate);
     }
-    if existing.existing_ids.iter().any(|id| id == procedure_handle) {
+    if existing
+        .existing_ids
+        .iter()
+        .any(|id| id == procedure_handle)
+    {
         return Some(ProcedureOutcome::Duplicate);
     }
-    if existing.existing_digests.iter().any(|d| d == candidate_digest) {
+    if existing
+        .existing_digests
+        .iter()
+        .any(|d| d == candidate_digest)
+    {
         return Some(ProcedureOutcome::Duplicate);
     }
     if let Some(refined) = &existing.refinement_of
@@ -1736,8 +1742,7 @@ fn build_transfer(
         preserved_version_pins: capability.version_pins.clone(),
         reground_note: format!(
             "receiver re-grounds every step under {} before any use; {}",
-            capability.env_id,
-            policy.transfer_note
+            capability.env_id, policy.transfer_note
         ),
     }
 }
@@ -1826,11 +1831,17 @@ pub fn compute_candidate_digest(
     parts.push(format!("objective:{objective}"));
     parts.push(format!("trigger:{trigger_note}"));
     parts.push(format!("applicability:{applicability_note}"));
-    parts.push(format!("env:{}@{}", capability.env_id, capability.env_revision));
+    parts.push(format!(
+        "env:{}@{}",
+        capability.env_id, capability.env_revision
+    ));
     parts.push(format!("env-digest:{}", capability.env_digest));
     parts.push(format!("scope:{}", capability.scope_id));
     parts.push(format!("task:{}", capability.task_id));
-    parts.push(format!("policy:{}@{}", policy.policy_id, policy.policy_revision));
+    parts.push(format!(
+        "policy:{}@{}",
+        policy.policy_id, policy.policy_revision
+    ));
     parts.push(format!("bundle:{}", evidence.frozen_bundle_digest));
     parts.push(format!("manifest:{}", evidence.frozen_manifest_digest));
     parts.push(format!("fingerprint:{}", evidence.failure_fingerprint));
@@ -2145,8 +2156,7 @@ pub fn propose_procedure(
             note,
         );
     }
-    if policy.allow_partial
-        && (evidence.unknown_refs.len() > MAX_EVIDENCE_ITEMS.saturating_div(2))
+    if policy.allow_partial && (evidence.unknown_refs.len() > MAX_EVIDENCE_ITEMS.saturating_div(2))
     {
         return emit_candidate(
             ProcedureOutcome::Partial,
@@ -2351,12 +2361,11 @@ mod tests {
 
     /// Returns the test state fence at genesis.
     fn test_fence() -> eliot_contracts::StateFence {
-        let epoch = EpochId::new(
-            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
-                .expect("canonical test lineage-A"),
-            NonZeroU64::new(1).expect("non-zero test sequence"),
-        )
-        .expect("valid test epoch");
+        let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .unwrap_or_else(|error| panic!("canonical test lineage-A: {error}"));
+        let sequence = NonZeroU64::new(1).unwrap_or_else(|| unreachable!("one is non-zero"));
+        let epoch = EpochId::new(lineage, sequence)
+            .unwrap_or_else(|error| panic!("valid test epoch: {error}"));
         eliot_contracts::StateFence::new(epoch, ResourceGeneration::genesis())
     }
 
@@ -2399,15 +2408,14 @@ mod tests {
 
     /// Returns a procedure curation item bound to the test receipt.
     fn test_item() -> ValidatedCurationItem {
-        let payload =
-            eliot_dreamer_contracts::CurationPayload::Procedure(ProcedurePayload {
-                procedure: "rotate-caption".to_owned(),
-                steps: 3,
-                target_evidence: TargetEvidence {
-                    targets: vec!["mem-1".to_owned()],
-                    evidence_refs: vec!["e-1".to_owned()],
-                },
-            });
+        let payload = eliot_dreamer_contracts::CurationPayload::Procedure(ProcedurePayload {
+            procedure: "rotate-caption".to_owned(),
+            steps: 3,
+            target_evidence: TargetEvidence {
+                targets: vec!["mem-1".to_owned()],
+                evidence_refs: vec!["e-1".to_owned()],
+            },
+        });
         ValidatedCurationItem {
             receipt: test_receipt(),
             kind_spelling: "procedure".to_owned(),
@@ -2548,24 +2556,21 @@ mod tests {
         let capability = test_capability();
         let existing = test_existing();
         let policy = test_policy();
-        let candidate = match propose_procedure(
-            &item,
-            &grounded,
-            &evidence,
-            &capability,
-            &existing,
-            &policy,
-        ) {
-            Ok(candidate) => candidate,
-            Err(err) => panic!("valid procedure request: {err:?}"),
-        };
+        let candidate =
+            match propose_procedure(&item, &grounded, &evidence, &capability, &existing, &policy) {
+                Ok(candidate) => candidate,
+                Err(err) => panic!("valid procedure request: {err:?}"),
+            };
         assert_eq!(candidate.outcome, ProcedureOutcome::Complete);
         assert_eq!(candidate.procedure_handle, "rotate-caption");
         assert_eq!(candidate.steps.len(), 3);
         assert_eq!(candidate.step_dispositions.len(), 3);
         assert_eq!(candidate.transfer.target_env_id, "env-1");
         assert_eq!(candidate.transfer.target_scope_id, "scope-1");
-        assert_eq!(candidate.transfer.preserved_negative_refs, vec!["neg-1".to_owned()]);
+        assert_eq!(
+            candidate.transfer.preserved_negative_refs,
+            vec!["neg-1".to_owned()]
+        );
         assert!(is_hex64_lower(&candidate.candidate_digest));
         assert_eq!(outcome_rejection_hint(&candidate.outcome), None);
     }
@@ -2697,17 +2702,11 @@ mod tests {
         let capability = test_capability();
         let existing = test_existing();
         let policy = test_policy();
-        let err = match propose_procedure(
-            &item,
-            &grounded,
-            &evidence,
-            &capability,
-            &existing,
-            &policy,
-        ) {
-            Ok(candidate) => panic!("mismatched bundle must fail: {:?}", candidate.outcome),
-            Err(err) => err,
-        };
+        let err =
+            match propose_procedure(&item, &grounded, &evidence, &capability, &existing, &policy) {
+                Ok(candidate) => panic!("mismatched bundle must fail: {:?}", candidate.outcome),
+                Err(err) => err,
+            };
         assert!(matches!(err, ProcedureError::Binding { field, .. } if field == "bundle_digest"));
     }
 
@@ -2721,17 +2720,11 @@ mod tests {
         let mut existing = test_existing();
         existing.existing_ids = vec!["rotate-caption".to_owned()];
         let policy = test_policy();
-        let candidate = match propose_procedure(
-            &item,
-            &grounded,
-            &evidence,
-            &capability,
-            &existing,
-            &policy,
-        ) {
-            Ok(candidate) => candidate,
-            Err(err) => panic!("duplicate request stays inert: {err:?}"),
-        };
+        let candidate =
+            match propose_procedure(&item, &grounded, &evidence, &capability, &existing, &policy) {
+                Ok(candidate) => candidate,
+                Err(err) => panic!("duplicate request stays inert: {err:?}"),
+            };
         assert_eq!(candidate.outcome, ProcedureOutcome::Duplicate);
         assert_eq!(candidate.procedure_handle, "rotate-caption");
         assert_eq!(candidate.steps.len(), 3);
@@ -2748,17 +2741,11 @@ mod tests {
         let mut existing = test_existing();
         existing.duplicate_of = Some("rotate-caption".to_owned());
         let policy = test_policy();
-        let candidate = match propose_procedure(
-            &item,
-            &grounded,
-            &evidence,
-            &capability,
-            &existing,
-            &policy,
-        ) {
-            Ok(candidate) => candidate,
-            Err(err) => panic!("duplicate existing procedure stays inert: {err:?}"),
-        };
+        let candidate =
+            match propose_procedure(&item, &grounded, &evidence, &capability, &existing, &policy) {
+                Ok(candidate) => candidate,
+                Err(err) => panic!("duplicate existing procedure stays inert: {err:?}"),
+            };
 
         assert_eq!(candidate.outcome, ProcedureOutcome::Duplicate);
         assert_eq!(candidate.procedure_handle, "rotate-caption");
@@ -2969,6 +2956,209 @@ mod tests {
         assert!(cancelled_candidate.note.contains("no effect"));
     }
 
+    // WORK_UNIT_CASE: 661/41
+    #[test]
+    fn case_41_privacy_authority_effect_proof_support_and_lifecycle_do_not_escalate() {
+        let item = test_item();
+        let grounded = test_grounded();
+        let evidence = test_evidence();
+        let capability = test_capability();
+        let existing = test_existing();
+        let policy = test_policy();
+        let candidate =
+            match propose_procedure(&item, &grounded, &evidence, &capability, &existing, &policy) {
+                Ok(candidate) => candidate,
+                Err(error) => panic!("candidate-only proposal: {error:?}"),
+            };
+
+        assert_eq!(candidate.outcome, ProcedureOutcome::Complete);
+        assert_eq!(candidate.note, PROCEDURE_PROOF_NOTE);
+        assert_eq!(candidate.reopen_note, evidence.reopen_condition);
+        assert_eq!(
+            candidate.unknown_handling_note,
+            "unknown outcomes stay open and block retry until reconciled"
+        );
+        assert_eq!(
+            candidate.transfer.preserved_negative_refs,
+            evidence.negative_refs
+        );
+        for step in &candidate.steps {
+            assert!(matches!(
+                step.effect,
+                EffectClass::ReadOnly | EffectClass::Compensatable
+            ));
+            assert!(!step.owner.is_empty());
+            assert!(!step.rollback_note.is_empty());
+        }
+
+        let mut escalated_item = test_item();
+        let mut escalated_evidence = test_evidence();
+        escalated_item.receipt.proof_ceiling = "scoped-verification".to_owned();
+        escalated_evidence.expected_receipt.proof_ceiling = "scoped-verification".to_owned();
+        let error = match propose_procedure(
+            &escalated_item,
+            &grounded,
+            &escalated_evidence,
+            &capability,
+            &existing,
+            &policy,
+        ) {
+            Ok(candidate) => panic!("proof escalation must fail: {candidate:?}"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ProcedureError::Policy { detail }
+                if detail == "procedure candidates cannot escalate beyond candidate-only proof"
+        ));
+
+        let mut unsupported = test_evidence();
+        unsupported.failure_refs.clear();
+        unsupported.counterexample_refs.clear();
+        let empirical = match propose_procedure(
+            &item,
+            &grounded,
+            &unsupported,
+            &capability,
+            &existing,
+            &policy,
+        ) {
+            Ok(candidate) => candidate,
+            Err(error) => panic!("support shortfall should remain inert: {error:?}"),
+        };
+        assert_eq!(empirical.outcome, ProcedureOutcome::Empirical);
+        assert!(empirical.note.contains("empirical"));
+    }
+
+    // WORK_UNIT_CASE: 661/42
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn case_42_independent_step_evidence_failure_transfer_output_and_work_bounds() {
+        let mut exact_item = test_item();
+        if let eliot_dreamer_contracts::CurationPayload::Procedure(payload) =
+            &mut exact_item.payload
+        {
+            payload.steps =
+                u32::try_from(MAX_STEPS).unwrap_or_else(|_| unreachable!("MAX_STEPS fits u32"));
+        }
+        let exact = match propose_procedure(
+            &exact_item,
+            &test_grounded(),
+            &test_evidence(),
+            &test_capability(),
+            &test_existing(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(error) => panic!("the exact step ceiling is admitted: {error:?}"),
+        };
+        assert_eq!(exact.steps.len(), MAX_STEPS);
+        assert_eq!(exact.step_dispositions.len(), MAX_STEPS);
+        assert_eq!(exact.candidate_digest.len(), 64);
+        assert_eq!(
+            exact.transfer.preserved_negative_refs,
+            test_evidence().negative_refs
+        );
+
+        let mut over_item = test_item();
+        if let eliot_dreamer_contracts::CurationPayload::Procedure(payload) = &mut over_item.payload
+        {
+            payload.steps = u32::try_from(MAX_STEPS + 1)
+                .unwrap_or_else(|_| unreachable!("MAX_STEPS + 1 fits u32"));
+        }
+        let over_steps = match propose_procedure(
+            &over_item,
+            &test_grounded(),
+            &test_evidence(),
+            &test_capability(),
+            &test_existing(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => panic!("one step over the graph ceiling must fail: {candidate:?}"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            over_steps,
+            ProcedureError::Bounds { phase, .. } if phase == "procedure.steps"
+        ));
+
+        let mut step = exact.steps[0].clone();
+        step.inputs = (0..MAX_STEP_INPUTS)
+            .map(|index| format!("input-{index:02}"))
+            .collect();
+        assert!(validate_one_step_shape(&step).is_ok());
+        step.inputs.push("input-99".to_owned());
+        assert!(matches!(
+            validate_one_step_shape(&step),
+            Err(ProcedureError::Bounds { phase, .. }) if phase == "step.inputs"
+        ));
+
+        let mut dependency_step = exact.steps[0].clone();
+        dependency_step.dependencies = (0..MAX_STEP_DEPS)
+            .map(|index| format!("dep-{index:02}"))
+            .collect();
+        assert!(validate_one_step_shape(&dependency_step).is_ok());
+        dependency_step.dependencies.push("dep-99".to_owned());
+        assert!(matches!(
+            validate_one_step_shape(&dependency_step),
+            Err(ProcedureError::Bounds { phase, .. }) if phase == "step.dependencies"
+        ));
+
+        let refs: Vec<String> = (0..MAX_EVIDENCE_ITEMS)
+            .map(|index| format!("ref-{index:03}"))
+            .collect();
+        let mut evidence = test_evidence();
+        evidence.episode_refs = refs.clone();
+        evidence.verifier_refs = refs.clone();
+        evidence.success_refs = refs.clone();
+        evidence.failure_refs = refs.clone();
+        evidence.counterexample_refs = refs.clone();
+        evidence.negative_refs = refs.clone();
+        evidence.unknown_refs = refs.clone();
+        evidence.extinction_refs = refs;
+        assert!(preflight_evidence_bounds(&evidence, &test_policy()).is_ok());
+        evidence.failure_refs.push("ref-064".to_owned());
+        assert!(matches!(
+            preflight_evidence_bounds(&evidence, &test_policy()),
+            Err(ProcedureError::Bounds { phase, .. }) if phase == "failure-refs"
+        ));
+
+        let mut capability = test_capability();
+        capability.version_pins = (0..MAX_CLOSURE_REFS)
+            .map(|index| format!("cap-{index:03}@v1"))
+            .collect();
+        let mut existing = test_existing();
+        existing.existing_ids = (0..MAX_PREDECESSORS)
+            .map(|index| format!("procedure-{index:03}"))
+            .collect();
+        assert!(preflight_snapshot_bounds(&capability, &existing, &test_policy()).is_ok());
+        existing.existing_ids.push("procedure-032".to_owned());
+        assert!(matches!(
+            preflight_snapshot_bounds(&capability, &existing, &test_policy()),
+            Err(ProcedureError::Bounds { phase, .. }) if phase == "existing-ids"
+        ));
+
+        let exact_note = "x".repeat(MAX_NOTE_BYTES);
+        assert!(check_bounded_text(&exact_note, "output", MAX_NOTE_BYTES).is_ok());
+        let over_note = "x".repeat(MAX_NOTE_BYTES + 1);
+        assert!(matches!(
+            check_bounded_text(&over_note, "output", MAX_NOTE_BYTES),
+            Err(ProcedureError::Shape { field, .. }) if field == "output"
+        ));
+
+        let mut oversized = exact.steps[0].clone();
+        oversized.precondition = "x".repeat(MAX_TOTAL_BYTES + 1);
+        assert!(matches!(
+            preflight_total_bytes(
+                &test_evidence(),
+                &test_capability(),
+                &test_policy(),
+                &[oversized]
+            ),
+            Err(ProcedureError::Bounds { phase, .. }) if phase == "total-bytes"
+        ));
+    }
+
     // WORK_UNIT_CASE: 661/13
     #[test]
     fn case_13_valid_acyclic_graph_completes_deterministically() {
@@ -2978,28 +3168,16 @@ mod tests {
         let capability = test_capability();
         let existing = test_existing();
         let policy = test_policy();
-        let first = match propose_procedure(
-            &item,
-            &grounded,
-            &evidence,
-            &capability,
-            &existing,
-            &policy,
-        ) {
-            Ok(candidate) => candidate,
-            Err(err) => panic!("first acyclic replay: {err:?}"),
-        };
-        let second = match propose_procedure(
-            &item,
-            &grounded,
-            &evidence,
-            &capability,
-            &existing,
-            &policy,
-        ) {
-            Ok(candidate) => candidate,
-            Err(err) => panic!("second acyclic replay: {err:?}"),
-        };
+        let first =
+            match propose_procedure(&item, &grounded, &evidence, &capability, &existing, &policy) {
+                Ok(candidate) => candidate,
+                Err(err) => panic!("first acyclic replay: {err:?}"),
+            };
+        let second =
+            match propose_procedure(&item, &grounded, &evidence, &capability, &existing, &policy) {
+                Ok(candidate) => candidate,
+                Err(err) => panic!("second acyclic replay: {err:?}"),
+            };
         assert_eq!(first.outcome, ProcedureOutcome::Complete);
         assert_eq!(first.candidate_digest, second.candidate_digest);
         let ids: Vec<String> = first.steps.iter().map(|s| s.step_id.clone()).collect();
@@ -3033,17 +3211,11 @@ mod tests {
         let capability = test_capability();
         let existing = test_existing();
         let policy = test_policy();
-        let err = match propose_procedure(
-            &item,
-            &grounded,
-            &evidence,
-            &capability,
-            &existing,
-            &policy,
-        ) {
-            Ok(candidate) => panic!("raw shell must fail: {:?}", candidate.outcome),
-            Err(err) => err,
-        };
+        let err =
+            match propose_procedure(&item, &grounded, &evidence, &capability, &existing, &policy) {
+                Ok(candidate) => panic!("raw shell must fail: {:?}", candidate.outcome),
+                Err(err) => err,
+            };
         assert!(matches!(err, ProcedureError::Shape { field, .. } if field == "step.operation"));
     }
 
@@ -3096,17 +3268,11 @@ mod tests {
         let capability = test_capability();
         let existing = test_existing();
         let policy = test_policy();
-        let candidate = match propose_procedure(
-            &item,
-            &grounded,
-            &evidence,
-            &capability,
-            &existing,
-            &policy,
-        ) {
-            Ok(candidate) => candidate,
-            Err(err) => panic!("unknown-effect request stays inert: {err:?}"),
-        };
+        let candidate =
+            match propose_procedure(&item, &grounded, &evidence, &capability, &existing, &policy) {
+                Ok(candidate) => candidate,
+                Err(err) => panic!("unknown-effect request stays inert: {err:?}"),
+            };
         assert_eq!(candidate.outcome, ProcedureOutcome::BlockedUnknownEffect);
         assert_eq!(candidate.procedure_handle, "rotate-caption");
         assert!(has_unknown_effect(&candidate.steps));
