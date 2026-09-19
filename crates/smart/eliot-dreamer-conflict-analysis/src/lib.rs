@@ -39,7 +39,7 @@
 //! validation. There are no placeholder, mock, canned, or pseudo paths:
 //! every branch binds an explicit input field.
 //!
-//! Test coverage note: 36 of 68 `WORK_UNIT_CASE 673/*` cases execute here
+//! Test coverage note: 40 of 68 `WORK_UNIT_CASE 673/*` cases execute here
 //! (673/1 valid completes, 673/2 wrong job and scope fail closed, 673/3
 //! empty and single position are not conflicts, 673/5 duplicate and changed
 //! identities fail closed, 673/6 complete/partial/stale/blocked/withheld
@@ -57,7 +57,11 @@
 //! is not supersession, 673/21 definition, unit, and denominator mismatch
 //! stays compatible residue, 673/22 objective and value disagreement routes
 //! to the Human and Task Controller owner, 673/23 policy, authority, and
-//! effect disagreement routes to the Governor owner, 673/35 shared model
+//! effect disagreement routes to the Governor owner, 673/24 evidence quality,
+//! coverage, and measurement disagreement stays live with the evidence-source
+//! owner, 673/25 predictive and causal mechanism disagreement stays live
+//! without a winner, 673/26 partial overlap retains a compatible residue,
+//! 673/27 multiple canonical classes retained in precedence order, 673/35 shared model
 //! and evaluator limits independence, 673/40
 //! nondiscriminative probe rejected, 673/51 Concilium-review
 //! recommendation carries no plan, 673/4 receipt and fence mismatch fails
@@ -71,10 +75,8 @@
 //! unknown-resolution criterion, 673/67 classification, resolution, and proof
 //! stay within grounded evidence, 673/68 bounded malformed input stays
 //! panic-free with no winner, resolution, authority, execution, or Finish).
-//! The remaining 32 of 68 are deferred per queue-item scope; workspace
-//! admission (#969), Product Pulse, and Edge proof remain separate. Deferred: 673/24,
-//! 673/25,
-//! 673/26, 673/27, 673/28, 673/29, 673/30, 673/31, 673/32, 673/33, 673/34,
+//! The remaining 28 of 68 are deferred per queue-item scope; workspace
+//! admission (#969), Product Pulse, and Edge proof remain separate. Deferred: 673/28, 673/29, 673/30, 673/31, 673/32, 673/33, 673/34,
 //! 673/36, 673/37, 673/38, 673/39, 673/41, 673/42, 673/43, 673/44,
 //! 673/45, 673/46, 673/47, 673/48, 673/49, 673/50, 673/52, 673/53, 673/54,
 //! 673/55, 673/58, 673/59, 673/63.
@@ -5310,6 +5312,297 @@ mod tests {
                 .trim()
                 .is_empty()
         );
+        assert_eq!(candidate.positions.len(), 2);
+        assert_eq!(candidate.resolution_status, None);
+    }
+
+    // WORK_UNIT_CASE: 673/24
+    #[test]
+    fn case_24_evidence_quality_coverage_measurement_disagreement() {
+        let receipt = test_receipt();
+        let conflict = ConflictSet::new(ConflictSetParams {
+            conflict_id: "conflict-evidence-quality".to_owned(),
+            kind: ConflictKind::Epistemic,
+            scope: "scope-1".to_owned(),
+            task_id: None,
+            positions: vec![
+                test_position(
+                    "source-a",
+                    "coverage 80 percent under method M1 supports the warm-key finding",
+                    false,
+                ),
+                test_position(
+                    "source-b",
+                    "coverage 40 percent under method M2 disputes the warm-key finding",
+                    false,
+                ),
+            ],
+            evidence_refs: BTreeSet::new(),
+            owners: BTreeSet::from([
+                SourceId::new("source-a").expect("valid source"),
+                SourceId::new("source-b").expect("valid source"),
+            ]),
+            common_lineage: BTreeSet::new(),
+            resolved_parts: BTreeSet::new(),
+            unresolved: BTreeSet::from(["measurement coverage".to_owned()]),
+            unresolved_owners: BTreeSet::from([SourceId::new("source-a").expect("valid source")]),
+            acceptability: ArgumentAcceptability::Contested,
+            defeated_refs: BTreeSet::new(),
+            probe: None,
+            decision_owner: SourceId::new("source-a").expect("valid source"),
+            affected_actions: vec!["decide-cache".to_owned()],
+            lifecycle: ConflictLifecycle::Open,
+            receipt_digest: receipt.bundle_digest.clone(),
+        })
+        .expect("evidence-quality conflict stays valid");
+        let candidate = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &conflict,
+            &test_supplements(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("evidence-quality analysis: {err:?}"),
+        };
+        assert_eq!(candidate.outcome, ConflictOutcome::Complete);
+        assert_eq!(
+            candidate.recommended_owner.kind,
+            DecisionOwnerKind::EvidenceSource
+        );
+        assert!(
+            candidate
+                .positions
+                .iter()
+                .all(|position| position.disposition == PositionDispositionKind::LivePreserved),
+            "measurement disagreement stays live; no winner is issued"
+        );
+        for position in &candidate.positions {
+            assert!(
+                position.conflict_classes.contains(&ConflictKind::Epistemic),
+                "evidence disagreement stays epistemic: {:?}",
+                position.conflict_classes
+            );
+            assert_eq!(
+                position.stance,
+                conflict.positions[position.position_index].stance
+            );
+        }
+        assert_eq!(candidate.resolution_status, None);
+    }
+
+    // WORK_UNIT_CASE: 673/25
+    #[test]
+    fn case_25_predictive_causal_mechanism_disagreement() {
+        let receipt = test_receipt();
+        let conflict = ConflictSet::new(ConflictSetParams {
+            conflict_id: "conflict-causal-mechanism".to_owned(),
+            kind: ConflictKind::Epistemic,
+            scope: "scope-1".to_owned(),
+            task_id: None,
+            positions: vec![
+                test_position(
+                    "source-a",
+                    "mechanism M predicts the warm-key outcome through causal path P",
+                    false,
+                ),
+                test_position(
+                    "source-b",
+                    "rival mechanism N predicts the same outcome through a different causal path",
+                    false,
+                ),
+            ],
+            evidence_refs: BTreeSet::new(),
+            owners: BTreeSet::from([
+                SourceId::new("source-a").expect("valid source"),
+                SourceId::new("source-b").expect("valid source"),
+            ]),
+            common_lineage: BTreeSet::new(),
+            resolved_parts: BTreeSet::new(),
+            unresolved: BTreeSet::from(["causal mechanism".to_owned()]),
+            unresolved_owners: BTreeSet::from([SourceId::new("source-b").expect("valid source")]),
+            acceptability: ArgumentAcceptability::Contested,
+            defeated_refs: BTreeSet::new(),
+            probe: None,
+            decision_owner: SourceId::new("source-a").expect("valid source"),
+            affected_actions: vec!["decide-cache".to_owned()],
+            lifecycle: ConflictLifecycle::Open,
+            receipt_digest: receipt.bundle_digest.clone(),
+        })
+        .expect("causal-mechanism conflict stays valid");
+        let candidate = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &conflict,
+            &test_supplements(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("causal-mechanism analysis: {err:?}"),
+        };
+        assert_eq!(candidate.outcome, ConflictOutcome::Complete);
+        assert!(
+            candidate
+                .positions
+                .iter()
+                .all(|position| position.disposition == PositionDispositionKind::LivePreserved),
+            "rival mechanisms stay live; prediction alone is not causal proof"
+        );
+        for position in &candidate.positions {
+            assert!(
+                position.conflict_classes.contains(&ConflictKind::Epistemic),
+                "mechanism disagreement stays epistemic: {:?}",
+                position.conflict_classes
+            );
+            assert!(
+                !position.compatibility_note.trim().is_empty(),
+                "every mechanism position carries a compatibility note"
+            );
+            assert_eq!(
+                position.stance,
+                conflict.positions[position.position_index].stance
+            );
+        }
+        assert_eq!(candidate.resolution_status, None);
+    }
+
+    // WORK_UNIT_CASE: 673/26
+    #[test]
+    fn case_26_partial_overlap_retains_compatible_residue() {
+        let receipt = test_receipt();
+        let conflict = ConflictSet::new(ConflictSetParams {
+            conflict_id: "conflict-partial-overlap".to_owned(),
+            kind: ConflictKind::Epistemic,
+            scope: "scope-1".to_owned(),
+            task_id: None,
+            positions: vec![
+                ConflictPosition::new(
+                    SourceId::new("source-a").expect("valid source"),
+                    "cache helps warm-key reads in scope S1".to_owned(),
+                    BTreeSet::from(["scope warm keys".to_owned()]),
+                    BTreeSet::new(),
+                    false,
+                )
+                .expect("valid position"),
+                ConflictPosition::new(
+                    SourceId::new("source-b").expect("valid source"),
+                    "cache helps warm-key reads in scope S2".to_owned(),
+                    BTreeSet::from(["scope cold starts".to_owned()]),
+                    BTreeSet::new(),
+                    false,
+                )
+                .expect("valid position"),
+            ],
+            evidence_refs: BTreeSet::new(),
+            owners: BTreeSet::from([
+                SourceId::new("source-a").expect("valid source"),
+                SourceId::new("source-b").expect("valid source"),
+            ]),
+            common_lineage: BTreeSet::new(),
+            resolved_parts: BTreeSet::new(),
+            unresolved: BTreeSet::from(["scope overlap".to_owned()]),
+            unresolved_owners: BTreeSet::from([SourceId::new("source-a").expect("valid source")]),
+            acceptability: ArgumentAcceptability::Contested,
+            defeated_refs: BTreeSet::new(),
+            probe: None,
+            decision_owner: SourceId::new("source-a").expect("valid source"),
+            affected_actions: vec!["decide-cache".to_owned()],
+            lifecycle: ConflictLifecycle::Open,
+            receipt_digest: receipt.bundle_digest.clone(),
+        })
+        .expect("partial-overlap conflict stays valid");
+        let candidate = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &conflict,
+            &test_supplements(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("partial-overlap analysis: {err:?}"),
+        };
+        assert_eq!(candidate.outcome, ConflictOutcome::Complete);
+        assert!(
+            candidate
+                .positions
+                .iter()
+                .any(|position| position.disposition == PositionDispositionKind::CompatibleResidue),
+            "partial overlap keeps a compatible residue"
+        );
+        for position in &candidate.positions {
+            assert_eq!(
+                position.stance, conflict.positions[position.position_index].stance,
+                "original propositions stay preserved"
+            );
+        }
+        assert_eq!(candidate.resolution_status, None);
+    }
+
+    // WORK_UNIT_CASE: 673/27
+    #[test]
+    fn case_27_multiple_conflict_classes_retained_without_first_match_loss() {
+        let receipt = test_receipt();
+        let conflict = ConflictSet::new(ConflictSetParams {
+            conflict_id: "conflict-multiple-classes".to_owned(),
+            kind: ConflictKind::Epistemic,
+            scope: "scope-1".to_owned(),
+            task_id: None,
+            positions: vec![
+                test_position(
+                    "source-a",
+                    "allow effect under permission policy alpha while implementation intent stays satisfied",
+                    false,
+                ),
+                test_position(
+                    "source-b",
+                    "deny effect under permission policy beta while implementation architecture diverges",
+                    false,
+                ),
+            ],
+            evidence_refs: BTreeSet::new(),
+            owners: BTreeSet::from([
+                SourceId::new("source-a").expect("valid source"),
+                SourceId::new("source-b").expect("valid source"),
+            ]),
+            common_lineage: BTreeSet::new(),
+            resolved_parts: BTreeSet::new(),
+            unresolved: BTreeSet::from(["permission and intent".to_owned()]),
+            unresolved_owners: BTreeSet::from([SourceId::new("source-a").expect("valid source")]),
+            acceptability: ArgumentAcceptability::Contested,
+            defeated_refs: BTreeSet::new(),
+            probe: None,
+            decision_owner: SourceId::new("source-a").expect("valid source"),
+            affected_actions: vec!["decide-effect".to_owned()],
+            lifecycle: ConflictLifecycle::Open,
+            receipt_digest: receipt.bundle_digest.clone(),
+        })
+        .expect("multi-class conflict stays valid");
+        let candidate = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &conflict,
+            &test_supplements(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("multi-class analysis: {err:?}"),
+        };
+        assert_eq!(candidate.outcome, ConflictOutcome::Complete);
+        let expected = vec![
+            ConflictKind::Epistemic,
+            ConflictKind::Authority,
+            ConflictKind::Architecture,
+        ];
+        for position in &candidate.positions {
+            assert_eq!(
+                position.conflict_classes, expected,
+                "every position retains all applicable classes in precedence order"
+            );
+        }
         assert_eq!(candidate.positions.len(), 2);
         assert_eq!(candidate.resolution_status, None);
     }
