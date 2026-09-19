@@ -3598,6 +3598,64 @@ mod tests {
         assert!(validate_one_step_shape(&over_retry).is_ok());
     }
 
+    // WORK_UNIT_CASE: 661/15
+    #[test]
+    fn case_15_bounded_step_generation_has_explicit_progress() {
+        let mut bounded_item = test_item();
+        if let eliot_dreamer_contracts::CurationPayload::Procedure(payload) =
+            &mut bounded_item.payload
+        {
+            payload.steps =
+                u32::try_from(MAX_STEPS).unwrap_or_else(|_| unreachable!("MAX_STEPS fits u32"));
+        }
+        let bounded = match propose_procedure(
+            &bounded_item,
+            &test_grounded(),
+            &test_evidence(),
+            &test_capability(),
+            &test_existing(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("maximum bounded step graph must pass: {err:?}"),
+        };
+        assert_eq!(bounded.outcome, ProcedureOutcome::Complete);
+        assert_eq!(bounded.steps.len(), MAX_STEPS);
+        for (index, step) in bounded.steps.iter().enumerate() {
+            assert_eq!(step.step_id, format!("step-{:02}", index + 1));
+            assert!(step.max_retries <= MAX_RETRIES);
+            assert!(step.fanout <= MAX_FANOUT);
+            if index == 0 {
+                assert!(step.dependencies.is_empty());
+            } else {
+                assert_eq!(step.dependencies, vec![format!("step-{index:02}")]);
+            }
+        }
+
+        let mut over_bound_item = test_item();
+        if let eliot_dreamer_contracts::CurationPayload::Procedure(payload) =
+            &mut over_bound_item.payload
+        {
+            payload.steps = u32::try_from(MAX_STEPS + 1)
+                .unwrap_or_else(|_| unreachable!("MAX_STEPS + 1 fits u32"));
+        }
+        let err = match propose_procedure(
+            &over_bound_item,
+            &test_grounded(),
+            &test_evidence(),
+            &test_capability(),
+            &test_existing(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => panic!("step generation above the ceiling must fail: {candidate:?}"),
+            Err(err) => err,
+        };
+        assert!(matches!(
+            err,
+            ProcedureError::Bounds { phase, .. } if phase == "procedure.steps"
+        ));
+    }
+
     // WORK_UNIT_CASE: 661/16
     #[test]
     fn case_16_missing_owner_precondition_postcondition_or_verifier_fails_closed() {
