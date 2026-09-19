@@ -56,18 +56,19 @@ pub enum ActivationClaim {
     },
 }
 
-/// Sanitizes a caller-supplied reason into the terminal-artifact shape (no
-/// surrounding whitespace, no control characters). Bounds are enforced by
-/// the protocol constructor: empty or oversize input stays that way so
-/// construction fails closed instead of inventing or silently trimming a
-/// reason.
-fn sanitize_invalid_ticket_reason(raw: &str) -> String {
-    raw.trim()
-        .chars()
-        .map(|cell| if cell.is_control() { '?' } else { cell })
-        .collect::<String>()
-        .trim()
-        .to_owned()
+/// Rejects a caller-supplied reason fail-closed into the terminal-artifact
+/// shape (no surrounding whitespace, no control characters, no replacement
+/// characters). Only trimming is applied; empty or oversize input stays that
+/// way so the protocol constructor fails closed instead of inventing or
+/// silently trimming a reason. Control-containing or replacement-char input
+/// is refused here (existing [`DaemonError::Lifecycle`]), never accepted.
+fn sanitize_invalid_ticket_reason(raw: &str) -> Result<String, DaemonError> {
+    if raw.chars().any(char::is_control) || raw.contains('\u{FFFD}') {
+        return Err(DaemonError::Lifecycle(
+            "invalid ticket reason contains control or replacement characters".to_owned(),
+        ));
+    }
+    Ok(raw.trim().to_owned())
 }
 
 /// Bounds one owner error for embedding in a classified-claim reason so the
@@ -76,7 +77,19 @@ fn sanitize_invalid_ticket_reason(raw: &str) -> String {
 /// owner error text on the classification path, never to a direct
 /// `terminal_for_invalid_ticket` caller reason.
 fn bound_claim_error_text(raw: &str) -> String {
-    let cleaned = sanitize_invalid_ticket_reason(raw);
+    let cleaned = raw
+        .trim()
+        .chars()
+        .map(|cell| {
+            if cell.is_control() || cell == '\u{FFFD}' {
+                '?'
+            } else {
+                cell
+            }
+        })
+        .collect::<String>()
+        .trim()
+        .to_owned();
     if cleaned.is_empty() {
         return "unclassified validation failure".to_owned();
     }
@@ -90,24 +103,40 @@ fn bound_claim_error_text(raw: &str) -> String {
     bounded.trim().to_owned()
 }
 
-/// Classifies one Kernel-claimed `ticket` JSON value validate-first.
+/// Classifies one Kernel-claimed ticket from its raw transport bytes,
+/// validate-first.
 ///
-/// `Null` is the empty-queue backoff (`Empty`). Any present value has its raw
-/// bytes preserved verbatim first then decoded and validated: a decode or
-/// validation failure yields `Invalid` with the verbatim bytes and a bounded
-/// reason. No Governor is read, no digest-bound result is constructed, and no
-/// retry is scheduled on this path.
+/// The caller threads the exact claimed bytes observed on the transport
+/// (encoded before any typed decode at the claim call site); decoding happens
+/// inside, first to a value for the null-poll check, then to the typed
+/// ticket. `Null` (`b"null"`) is the empty-queue backoff (`Empty`). Any
+/// present ticket decodes and validates from the same bytes: a decode or
+/// validation failure yields `Invalid` carrying those bytes verbatim and a
+/// bounded reason. Bytes are only ever copied verbatim; no fallback bytes are
+/// fabricated on any path. No Governor is read, no digest-bound result is
+/// constructed, and no retry is scheduled on this path.
 #[must_use]
-pub fn classify_claimed_ticket_value(value: &serde_json::Value) -> ActivationClaim {
+pub fn classify_claimed_ticket_value(ticket_bytes: &[u8]) -> ActivationClaim {
+    let value: serde_json::Value = match serde_json::from_slice(ticket_bytes) {
+        Ok(value) => value,
+        Err(error) => {
+            return ActivationClaim::Invalid {
+                ticket_bytes: ticket_bytes.to_vec(),
+                reason: format!(
+                    "ticket unparseable: {}",
+                    bound_claim_error_text(&error.to_string())
+                ),
+            };
+        }
+    };
     if value.is_null() {
         return ActivationClaim::Empty;
     }
-    let ticket_bytes = serde_json::to_vec(value).unwrap_or_else(|_| b"{}".to_vec());
-    let ticket: AgentActivationResolutionTicket = match serde_json::from_value(value.clone()) {
+    let ticket: AgentActivationResolutionTicket = match serde_json::from_slice(ticket_bytes) {
         Ok(ticket) => ticket,
         Err(error) => {
             return ActivationClaim::Invalid {
-                ticket_bytes,
+                ticket_bytes: ticket_bytes.to_vec(),
                 reason: format!(
                     "ticket unparseable: {}",
                     bound_claim_error_text(&error.to_string())
@@ -118,7 +147,7 @@ pub fn classify_claimed_ticket_value(value: &serde_json::Value) -> ActivationCla
     match ticket.validate() {
         Ok(()) => ActivationClaim::Valid(Box::new(ticket)),
         Err(error) => ActivationClaim::Invalid {
-            ticket_bytes,
+            ticket_bytes: ticket_bytes.to_vec(),
             reason: format!(
                 "ticket invalid: {}",
                 bound_claim_error_text(&error.to_string())
@@ -146,7 +175,7 @@ pub fn terminal_for_invalid_ticket(
 ) -> Result<eliot_protocol::AgentActivationInvalidTicket, DaemonError> {
     let artifact = eliot_protocol::AgentActivationInvalidTicket::rejected(
         ticket_bytes,
-        sanitize_invalid_ticket_reason(reason),
+        sanitize_invalid_ticket_reason(reason)?,
         observed_at_unix_ms,
     )
     .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;

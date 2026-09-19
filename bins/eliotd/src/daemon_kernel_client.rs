@@ -242,7 +242,14 @@ impl DaemonKernelClient {
         let ticket = value.get("ticket").cloned().ok_or_else(|| {
             super::DaemonError::Kernel("Kernel claim response omitted ticket".to_owned())
         })?;
-        Ok(super::classify_claimed_ticket_value(&ticket))
+        // Thread the raw claim bytes before any typed decode: the classifier
+        // decodes inside and carries these exact bytes verbatim on Invalid.
+        // Encoding here fails closed through the existing Kernel error; no
+        // fallback bytes are ever fabricated. `b"null"` still classifies to
+        // the Empty null-poll backoff inside.
+        let ticket_bytes = serde_json::to_vec(&ticket)
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        Ok(super::classify_claimed_ticket_value(&ticket_bytes))
     }
 
     #[cfg(windows)]

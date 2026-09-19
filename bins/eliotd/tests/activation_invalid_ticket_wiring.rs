@@ -70,7 +70,7 @@ fn manifest_source(relative: &str) -> TestResult<String> {
 
 #[test]
 fn empty_null_claim_idles_without_artifact() -> TestResult {
-    match classify_claimed_ticket_value(&serde_json::Value::Null) {
+    match classify_claimed_ticket_value(b"null") {
         ActivationClaim::Empty => Ok(()),
         other => Err(format!("null claim must be Empty, got {other:?}").into()),
     }
@@ -79,8 +79,8 @@ fn empty_null_claim_idles_without_artifact() -> TestResult {
 #[test]
 fn valid_claim_passes_through_validated() -> TestResult {
     let ticket = valid_ticket()?;
-    let value = serde_json::to_value(&ticket).map_err(|error| format!("encode: {error}"))?;
-    match classify_claimed_ticket_value(&value) {
+    let raw = serde_json::to_vec(&ticket).map_err(|error| format!("encode: {error}"))?;
+    match classify_claimed_ticket_value(&raw) {
         ActivationClaim::Valid(decoded) => {
             assert_eq!(decoded.ticket_id, ticket.ticket_id);
             decoded
@@ -96,7 +96,7 @@ fn valid_claim_passes_through_validated() -> TestResult {
 fn digest_corrupted_claim_is_invalid_with_verbatim_bytes() -> TestResult {
     let value = digest_corrupted_value()?;
     let raw = serde_json::to_vec(&value).map_err(|error| format!("raw: {error}"))?;
-    match classify_claimed_ticket_value(&value) {
+    match classify_claimed_ticket_value(&raw) {
         ActivationClaim::Invalid {
             ticket_bytes,
             reason,
@@ -119,7 +119,8 @@ fn invalid_terminal_constructs_pre_governor_and_validates() -> TestResult {
     // No Governor object exists in this test: construction takes only the
     // preserved bytes, the bounded reason, and the observation clock.
     let value = digest_corrupted_value()?;
-    let (raw, reason) = match classify_claimed_ticket_value(&value) {
+    let raw = serde_json::to_vec(&value).map_err(|error| format!("raw: {error}"))?;
+    let (raw, reason) = match classify_claimed_ticket_value(&raw) {
         ActivationClaim::Invalid {
             ticket_bytes,
             reason,
@@ -144,7 +145,8 @@ fn invalid_terminal_constructs_pre_governor_and_validates() -> TestResult {
 #[test]
 fn invalid_terminal_carries_no_retry_or_digest_surface() -> TestResult {
     let value = digest_corrupted_value()?;
-    let (raw, reason) = match classify_claimed_ticket_value(&value) {
+    let raw = serde_json::to_vec(&value).map_err(|error| format!("raw: {error}"))?;
+    let (raw, reason) = match classify_claimed_ticket_value(&raw) {
         ActivationClaim::Invalid {
             ticket_bytes,
             reason,
@@ -198,7 +200,7 @@ fn digest_bound_result_never_binds_an_invalid_ticket() -> TestResult {
         attempt.is_err(),
         "no digest-bound result may be built from the invalid ticket"
     );
-    let (bytes, reason) = match classify_claimed_ticket_value(&value) {
+    let (bytes, reason) = match classify_claimed_ticket_value(&raw) {
         ActivationClaim::Invalid {
             ticket_bytes,
             reason,
@@ -215,15 +217,13 @@ fn digest_bound_result_never_binds_an_invalid_ticket() -> TestResult {
 #[test]
 fn wrong_shape_claim_is_invalid_without_governor() -> TestResult {
     let value = serde_json::json!({"ticket_id": 7});
-    match classify_claimed_ticket_value(&value) {
+    let raw = serde_json::to_vec(&value).map_err(|error| format!("raw: {error}"))?;
+    match classify_claimed_ticket_value(&raw) {
         ActivationClaim::Invalid {
             ticket_bytes,
             reason,
         } => {
-            assert_eq!(
-                ticket_bytes,
-                serde_json::to_vec(&value).map_err(|error| format!("raw: {error}"))?
-            );
+            assert_eq!(ticket_bytes, raw);
             assert!(reason.contains("unparseable"));
             let artifact = terminal_for_invalid_ticket(ticket_bytes, &reason, OBSERVED_AT_UNIX_MS)
                 .map_err(|error| format!("terminal: {error}"))?;
@@ -260,9 +260,9 @@ fn malformed_wire_and_unknown_version_rejected_before_governor() -> TestResult {
     malformed.ticket_sha256 = malformed
         .compute_digest()
         .map_err(|error| format!("digest: {error}"))?;
-    let malformed_value =
-        serde_json::to_value(&malformed).map_err(|error| format!("encode: {error}"))?;
-    match classify_claimed_ticket_value(&malformed_value) {
+    let malformed_raw =
+        serde_json::to_vec(&malformed).map_err(|error| format!("encode: {error}"))?;
+    match classify_claimed_ticket_value(&malformed_raw) {
         ActivationClaim::Invalid { reason, .. } => assert!(reason.contains("invalid")),
         other => return Err(format!("malformed wire must be Invalid, got {other:?}").into()),
     }
@@ -272,8 +272,8 @@ fn malformed_wire_and_unknown_version_rejected_before_governor() -> TestResult {
     future.ticket_sha256 = future
         .compute_digest()
         .map_err(|error| format!("digest: {error}"))?;
-    let future_value = serde_json::to_value(&future).map_err(|error| format!("encode: {error}"))?;
-    match classify_claimed_ticket_value(&future_value) {
+    let future_raw = serde_json::to_vec(&future).map_err(|error| format!("encode: {error}"))?;
+    match classify_claimed_ticket_value(&future_raw) {
         ActivationClaim::Invalid { reason, .. } => assert!(reason.contains("invalid")),
         other => {
             return Err(format!("unknown version must be Invalid, got {other:?}").into());
@@ -290,8 +290,8 @@ fn tampered_ticket_identity_never_rebinds() -> TestResult {
         ticket.validate().is_err(),
         "tampered ticket must not validate"
     );
-    let value = serde_json::to_value(&ticket).map_err(|error| format!("encode: {error}"))?;
-    match classify_claimed_ticket_value(&value) {
+    let raw = serde_json::to_vec(&ticket).map_err(|error| format!("encode: {error}"))?;
+    match classify_claimed_ticket_value(&raw) {
         ActivationClaim::Invalid {
             ticket_bytes,
             reason,
@@ -330,6 +330,56 @@ fn fail_closed_terminal_inputs_are_rejected() -> TestResult {
     assert!(
         terminal_for_invalid_ticket(oversize, "ticket invalid", OBSERVED_AT_UNIX_MS).is_err(),
         "oversize bytes must not yield a terminal"
+    );
+    Ok(())
+}
+
+#[test]
+fn non_canonical_wire_bytes_are_preserved_verbatim() -> TestResult {
+    // The classifier threads the exact input bytes: pretty-printed wire bytes
+    // (whitespace/key order the compact re-encoder would not reproduce) must
+    // round-trip byte-identical on Invalid instead of being rebuilt.
+    let value = digest_corrupted_value()?;
+    let raw = serde_json::to_vec_pretty(&value).map_err(|error| format!("raw: {error}"))?;
+    assert!(
+        raw.contains(&b'\n'),
+        "pretty wire bytes must carry formatting the compact form drops"
+    );
+    match classify_claimed_ticket_value(&raw) {
+        ActivationClaim::Invalid {
+            ticket_bytes,
+            reason,
+        } => {
+            assert_eq!(ticket_bytes, raw, "original wire bytes must be verbatim");
+            assert!(reason.contains("invalid"));
+            Ok(())
+        }
+        other => Err(format!("corrupted claim must be Invalid, got {other:?}").into()),
+    }
+}
+
+#[test]
+fn caller_reasons_with_controls_or_replacement_chars_are_refused() -> TestResult {
+    let value = digest_corrupted_value()?;
+    let raw = serde_json::to_vec(&value).map_err(|error| format!("raw: {error}"))?;
+    assert!(
+        terminal_for_invalid_ticket(raw.clone(), "ticket invalid\ninjected", OBSERVED_AT_UNIX_MS)
+            .is_err(),
+        "control-containing caller reasons must be refused, not accepted"
+    );
+    assert!(
+        terminal_for_invalid_ticket(
+            raw.clone(),
+            "ticket invalid \u{FFFD} injected",
+            OBSERVED_AT_UNIX_MS
+        )
+        .is_err(),
+        "replacement-char caller reasons must be refused, not accepted"
+    );
+    assert!(
+        terminal_for_invalid_ticket(raw, "ticket invalid: digest mismatch", OBSERVED_AT_UNIX_MS)
+            .is_ok(),
+        "clean caller reasons must still construct"
     );
     Ok(())
 }
@@ -424,7 +474,8 @@ fn invalid_path_wiring_is_terminal_without_submit_reconcile_retry_or_governor() 
     // bytes, reason, and clock -- exercised above with no Governor object in
     // scope -- and stays terminal with no retry directive.
     let value = digest_corrupted_value()?;
-    let (raw, reason) = match classify_claimed_ticket_value(&value) {
+    let raw = serde_json::to_vec(&value).map_err(|error| format!("raw: {error}"))?;
+    let (raw, reason) = match classify_claimed_ticket_value(&raw) {
         ActivationClaim::Invalid {
             ticket_bytes,
             reason,
