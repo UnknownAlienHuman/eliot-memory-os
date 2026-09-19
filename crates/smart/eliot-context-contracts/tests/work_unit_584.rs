@@ -1119,3 +1119,423 @@ fn incomplete_cannot_decode_to_thinner_complete_success() {
     let empty = DecisionContextIncomplete::new(id("floor-rule"));
     assert_eq!(empty.validate(), Err(ContextError::MissingFloor));
 }
+
+fn admitted_single() -> AdmittedContextSet {
+    let context = binding();
+    let cand = candidate();
+    let atom_id = cand.atom_id.clone();
+    let measurement = cand.measurement.clone();
+    let floor = DecisionSafetyFloor {
+        binding: context.clone(),
+        mandatory_atoms: vec![atom_id.clone()],
+        mandatory_roles: vec![SemanticRole::Goal],
+        providers: denominator(),
+        members: vec![SafetyFloorMember {
+            atom_id: atom_id.clone(),
+            role: SemanticRole::Goal,
+            availability: AtomAvailability::PresentCurrent,
+            measurement: Some(measurement.clone()),
+            required_dependencies: Vec::new(),
+        }],
+        interpretation_dependencies: Vec::new(),
+        rule_evidence: id("floor-rule"),
+        capacity: CapacityLimits {
+            route_capacity: 100_000,
+            fixed_overhead: 2,
+            output_reserve: 3,
+            review_reserve: 4,
+        },
+    };
+    let economy = ContextEconomyReceipt {
+        binding: context.clone(),
+        decision_id: context.decision_id.clone(),
+        measurement,
+        requested: vec![atom_id.clone()],
+        admitted: vec![atom_id.clone()],
+        displaced: Vec::new(),
+        omissions: Vec::new(),
+        applied_rule: id("economy-rule"),
+        allocations: EconomyAllocations {
+            fixed_overhead: 2,
+            output_reserve: 3,
+            review_reserve: 4,
+            admitted_required: 10,
+            admitted_optional: 0,
+            remaining_headroom: 99_981,
+            route_capacity: 100_000,
+        },
+        recipe_digest: digest(),
+        receipt_digest: digest(),
+    };
+    let mut admitted = AdmittedContextSet {
+        binding: context,
+        records: vec![AdmittedAtom {
+            candidate: cand,
+            disposition: AdmissionDisposition::Include,
+            rule_evidence: id("admission-rule"),
+        }],
+        admissions: vec![AdmissionRecord {
+            atom_id,
+            provider_role: provider_role(),
+            disposition: AdmissionDisposition::Include,
+            rule_evidence: id("admission-rule"),
+        }],
+        floor,
+        economy,
+    };
+    let mut unsigned = admitted.economy.clone();
+    unsigned.receipt_digest = "0".repeat(64);
+    admitted.economy.receipt_digest =
+        canonical_digest(&unsigned).expect("admitted economy receipt digest");
+    admitted
+}
+
+fn omission_binding() -> ContextBinding {
+    let mut context = binding();
+    context.state_fence.task_revision = Some(TaskRevision::new(1).expect("omission task revision"));
+    context
+}
+
+fn omission_decision() -> DecisionRevision {
+    DecisionRevision {
+        decision_id: omission_binding().decision_id.clone(),
+        recipe_revision: TaskRevision::new(1).expect("omission task revision"),
+        policy_sha256: digest(),
+    }
+}
+
+fn reversible_omission() -> (ContextBinding, OmissionRecord) {
+    let context = omission_binding();
+    let decision = omission_decision();
+    let handle = ExpansionHandle {
+        handle_id: id("handle"),
+        atom_id: id("atom"),
+        source_id: id("source"),
+        source_revision: "r1".to_owned(),
+        context: context.clone(),
+        decision: decision.clone(),
+        policy: LossPolicy::NonDroppable,
+        provider_role: provider_role(),
+        handle_digest: "c".repeat(64),
+        expires: None,
+        invalidation: None,
+    };
+    let record = OmissionRecord {
+        atom_id: id("atom"),
+        source_id: id("source"),
+        provider_role: provider_role(),
+        decision,
+        task_revision: TaskRevision::new(1).expect("omission task revision"),
+        reason: OmissionReason::Capacity,
+        competing_constraint: "route capacity".to_owned(),
+        measured_cost: Some(4),
+        allowed_representation: LossPolicy::NonDroppable,
+        expansion: Some(handle),
+        non_recoverable_reason: None,
+        authorization_requirement: "decision owner".to_owned(),
+        privacy_requirement: "restricted".to_owned(),
+        proof_requirement: "observation".to_owned(),
+        expires: None,
+        invalidation: None,
+        digest: digest(),
+    };
+    (context, record)
+}
+
+// WORK_UNIT_CASE: 584/31
+#[test]
+fn candidate_admitted_membership_identity_binding() {
+    let admitted = admitted_single();
+    admitted.validate().expect("bound admitted set validates");
+    let encoded = serde_json::to_string(&admitted).expect("admitted encoding");
+    let decoded: AdmittedContextSet = serde_json::from_str(&encoded).expect("admitted round-trip");
+    assert_eq!(decoded, admitted);
+    decoded.validate().expect("decoded admitted set validates");
+
+    let mut retargeted_atom = admitted.clone();
+    retargeted_atom.admissions[0].atom_id = id("other-atom");
+    assert_eq!(
+        retargeted_atom.validate(),
+        Err(ContextError::DenominatorMismatch)
+    );
+
+    let mut retargeted_role = admitted.clone();
+    retargeted_role.admissions[0].provider_role = ProviderRole {
+        provider: ProviderId::new("other-provider").expect("fixture provider"),
+        role: SemanticRole::Source,
+    };
+    assert_eq!(
+        retargeted_role.validate(),
+        Err(ContextError::IdentityConflict)
+    );
+
+    let mut rebound = admitted.clone();
+    rebound.records[0].candidate.binding.task_id = TaskId::new("other-task").expect("fixture task");
+    assert!(rebound.validate().is_err());
+
+    let mut refloor = admitted.clone();
+    refloor.floor.binding.task_id = TaskId::new("other-task").expect("fixture task");
+    assert_eq!(refloor.validate(), Err(ContextError::InvalidFence));
+
+    let mut reeconomy = admitted.clone();
+    reeconomy.economy.binding.task_id = TaskId::new("other-task").expect("fixture task");
+    assert_eq!(reeconomy.validate(), Err(ContextError::InvalidFence));
+}
+
+// WORK_UNIT_CASE: 584/32
+#[test]
+fn admission_dispositions_remain_distinct() {
+    let expected = [
+        (AdmissionDisposition::Include, "INCLUDE"),
+        (AdmissionDisposition::HandleOnly, "HANDLE_ONLY"),
+        (AdmissionDisposition::Revalidate, "REVALIDATE"),
+        (AdmissionDisposition::Suppress, "SUPPRESS"),
+        (AdmissionDisposition::Quarantine, "QUARANTINE"),
+        (AdmissionDisposition::Unavailable, "UNAVAILABLE"),
+        (AdmissionDisposition::Blocked, "BLOCKED"),
+        (AdmissionDisposition::OverBudget, "OVER_BUDGET"),
+    ];
+    assert_eq!(expected.len(), 8);
+    let mut wires = std::collections::BTreeSet::new();
+    for (disposition, wire) in expected {
+        let encoded = serde_json::to_string(&disposition).expect("disposition encoding");
+        assert_eq!(encoded, format!("\"{wire}\""));
+        assert_eq!(
+            serde_json::from_str::<AdmissionDisposition>(&encoded).expect("disposition round-trip"),
+            disposition
+        );
+        assert!(wires.insert(wire));
+    }
+    assert!(serde_json::from_str::<AdmissionDisposition>("\"OTHER\"").is_err());
+    assert!(serde_json::from_str::<AdmissionDisposition>("\"include\"").is_err());
+
+    // Only admitted outcomes carry Include/HandleOnly; every other explicit
+    // disposition is rejected at the admitted-set boundary, never coerced.
+    for disposition in [
+        AdmissionDisposition::Revalidate,
+        AdmissionDisposition::Suppress,
+        AdmissionDisposition::Quarantine,
+        AdmissionDisposition::Unavailable,
+        AdmissionDisposition::Blocked,
+        AdmissionDisposition::OverBudget,
+    ] {
+        let mut admitted = admitted_single();
+        admitted.records[0].disposition = disposition;
+        admitted.admissions[0].disposition = disposition;
+        assert_eq!(
+            admitted.validate(),
+            Err(ContextError::DenominatorMismatch),
+            "non-admitted disposition {disposition:?} cannot validate as admitted"
+        );
+    }
+    let mut handle_only = admitted_single();
+    handle_only.records[0].disposition = AdmissionDisposition::HandleOnly;
+    handle_only.admissions[0].disposition = AdmissionDisposition::HandleOnly;
+    handle_only
+        .validate()
+        .expect("handle-only stays a distinct admitted outcome");
+}
+
+// WORK_UNIT_CASE: 584/33
+#[test]
+fn exactly_one_disposition_per_candidate_provider() {
+    admitted_single()
+        .validate()
+        .expect("one admission per record validates");
+
+    let mut duplicated = admitted_single();
+    duplicated.admissions.push(duplicated.admissions[0].clone());
+    assert_eq!(
+        duplicated.validate(),
+        Err(ContextError::DenominatorMismatch)
+    );
+
+    let mut missing = admitted_single();
+    missing.admissions.clear();
+    assert_eq!(missing.validate(), Err(ContextError::DenominatorMismatch));
+
+    let mut extra = admitted_single();
+    extra.admissions.push(AdmissionRecord {
+        atom_id: id("unknown-atom"),
+        provider_role: provider_role(),
+        disposition: AdmissionDisposition::Suppress,
+        rule_evidence: id("extra-rule"),
+    });
+    assert_eq!(extra.validate(), Err(ContextError::DenominatorMismatch));
+
+    let mut mismatched_role = admitted_single();
+    mismatched_role.admissions[0].provider_role = ProviderRole {
+        provider: ProviderId::new("other-provider").expect("fixture provider"),
+        role: SemanticRole::Source,
+    };
+    assert_eq!(
+        mismatched_role.validate(),
+        Err(ContextError::IdentityConflict)
+    );
+
+    let mut mismatched_disposition = admitted_single();
+    mismatched_disposition.admissions[0].disposition = AdmissionDisposition::HandleOnly;
+    assert_eq!(
+        mismatched_disposition.validate(),
+        Err(ContextError::IdentityConflict)
+    );
+}
+
+// WORK_UNIT_CASE: 584/34
+#[test]
+fn valid_reversible_omission_handle() {
+    let (context, record) = reversible_omission();
+    let handle = record.expansion.clone().expect("reversible handle");
+    handle.validate().expect("expansion handle validates");
+    record
+        .validate(&context)
+        .expect("reversible omission validates");
+    assert_eq!(record.non_recoverable_reason, None);
+
+    let encoded = serde_json::to_string(&record).expect("omission encoding");
+    let decoded: OmissionRecord = serde_json::from_str(&encoded).expect("omission round-trip");
+    assert_eq!(decoded, record);
+    decoded
+        .validate(&context)
+        .expect("decoded reversible omission validates");
+
+    let handle_encoded = serde_json::to_string(&handle).expect("handle encoding");
+    let decoded_handle: ExpansionHandle =
+        serde_json::from_str(&handle_encoded).expect("handle round-trip");
+    assert_eq!(decoded_handle, handle);
+}
+
+// WORK_UNIT_CASE: 584/35
+#[test]
+fn wrong_omission_handle_binding_rejected() {
+    let (context, record) = reversible_omission();
+    record
+        .validate(&context)
+        .expect("baseline omission validates");
+
+    let mut wrong_atom = record.clone();
+    wrong_atom.atom_id = id("other-atom");
+    assert_eq!(
+        wrong_atom.validate(&context),
+        Err(ContextError::OmissionHandleInvalid)
+    );
+
+    let mut wrong_source = record.clone();
+    wrong_source.source_id = id("other-source");
+    assert_eq!(
+        wrong_source.validate(&context),
+        Err(ContextError::OmissionHandleInvalid)
+    );
+
+    let mut wrong_decision = record.clone();
+    wrong_decision
+        .expansion
+        .as_mut()
+        .expect("expansion handle")
+        .context
+        .decision_id = DecisionId::new("other-decision").expect("fixture decision");
+    assert_eq!(
+        wrong_decision.validate(&context),
+        Err(ContextError::OmissionHandleInvalid)
+    );
+
+    let mut wrong_task = record.clone();
+    wrong_task
+        .expansion
+        .as_mut()
+        .expect("expansion handle")
+        .context
+        .task_id = TaskId::new("other-task").expect("fixture task");
+    assert_eq!(
+        wrong_task.validate(&context),
+        Err(ContextError::OmissionHandleInvalid)
+    );
+
+    let mut wrong_scope = record.clone();
+    wrong_scope
+        .expansion
+        .as_mut()
+        .expect("expansion handle")
+        .context
+        .scope_id = WorkScopeId::new("other-scope").expect("fixture scope");
+    assert_eq!(
+        wrong_scope.validate(&context),
+        Err(ContextError::OmissionHandleInvalid)
+    );
+
+    let mut wrong_fence = record.clone();
+    wrong_fence
+        .expansion
+        .as_mut()
+        .expect("expansion handle")
+        .context
+        .state_fence = StateFence::new(
+        test_epoch(),
+        ResourceGeneration::new(2).expect("fixture generation"),
+    );
+    wrong_fence
+        .expansion
+        .as_mut()
+        .expect("expansion handle")
+        .context
+        .state_fence
+        .task_revision = Some(TaskRevision::new(1).expect("omission task revision"));
+    assert_eq!(
+        wrong_fence.validate(&context),
+        Err(ContextError::OmissionHandleInvalid)
+    );
+
+    let mut wrong_revision = record.clone();
+    wrong_revision.task_revision = TaskRevision::new(2).expect("other revision");
+    assert_eq!(
+        wrong_revision.validate(&context),
+        Err(ContextError::OmissionHandleInvalid)
+    );
+
+    let mut wrong_policy_revision = record.clone();
+    wrong_policy_revision.decision.recipe_revision = TaskRevision::new(2).expect("other revision");
+    assert_eq!(
+        wrong_policy_revision.validate(&context),
+        Err(ContextError::OmissionHandleInvalid)
+    );
+}
+
+// WORK_UNIT_CASE: 584/36
+#[test]
+fn non_recoverable_omission_needs_typed_reason_and_no_reversibility() {
+    let (context, mut record) = reversible_omission();
+    record.expansion = None;
+    record.non_recoverable_reason = Some(NonRecoverableReason::PolicyDisallows);
+    record
+        .validate(&context)
+        .expect("typed non-recoverable omission validates");
+    let encoded = serde_json::to_string(&record).expect("omission encoding");
+    let decoded: OmissionRecord = serde_json::from_str(&encoded).expect("omission round-trip");
+    assert_eq!(
+        decoded.non_recoverable_reason,
+        Some(NonRecoverableReason::PolicyDisallows)
+    );
+    assert_eq!(decoded.expansion, None);
+
+    // Both halves present claims reversibility and non-recoverability at once.
+    let (context, mut both) = reversible_omission();
+    both.non_recoverable_reason = Some(NonRecoverableReason::Privacy);
+    assert_eq!(
+        both.validate(&context),
+        Err(ContextError::OmissionHandleInvalid)
+    );
+
+    // Neither half present claims neither recovery path.
+    let (context, mut neither) = reversible_omission();
+    neither.expansion = None;
+    neither.non_recoverable_reason = None;
+    assert_eq!(
+        neither.validate(&context),
+        Err(ContextError::OmissionHandleInvalid)
+    );
+
+    // A reversible handle must not smuggle a non-recoverable reason.
+    let (_context, reversible) = reversible_omission();
+    assert_eq!(reversible.non_recoverable_reason, None);
+    assert!(reversible.expansion.is_some());
+}
