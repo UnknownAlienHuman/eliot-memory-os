@@ -1,14 +1,21 @@
-//! Work-unit 610 slice 3: bounded discriminative probe planner, cases 1..10
-//! (valid two-rival probe, multi-rival result matrix, exact
-//! objective/result/affordance/disposition vocabulary, bound-input
-//! mismatch, duplicate collapse, vague/no-gain objective gating,
-//! exact evidence/verifier-gap plannability, per-descriptor scope
-//! exclusion, bounded closed result schema, open/unbounded rejection).
+//! Work-unit 610 slices 1-4b: bounded discriminative probe planner, cases 1..10
+//! plus 610/17 and 610/21 (typed affordance Unknown/Unavailable gating,
+//! safe read-only candidate-only admission).
 //!
 //! Cases 610/1, 610/4 and 610/5 are marked on the existing planner
-//! behaviour tests in `tests/probe_plan.rs`. Cases 610/11..42 (discrimination,
-//! affordance/execution, safety, budget/dominance, replay and no-execution
-//! proof) remain QUEUED on issue #610.
+//! behaviour tests in `tests/probe_plan.rs`. Cases 610/11..16, 610/38
+//! (identical-updates / confirmation-only / tautology / proxy /
+//! correlation-causality / causal-controls / two-outcome readiness) remain
+//! UPSTREAM-BLOCKED on issue #610: deciding branch-update equivalence or
+//! causal/material relevance is an A-03 materiality judgment, and `src/plan.rs`
+//! contains zero `ResultUpdate`/`RivalUpdateMeaning` inspections, so no
+//! planner-only implementation exists without inventing APIs (slice-4 Opus
+//! audit ruling on 610/11 applies identically). Cases 610/18-20, 610/22-42
+//! (negative execution-absence proofs, owner preservation, effect-policy,
+//! budget/dominance/disposition/replay/no-execution) are QUEUED and out of
+//! this batch; 610/20 needs `src/` owner preservation, 610/23-25 need policy
+//! or budget enforcement the planner explicitly declines (`plan.rs`: effect,
+//! privacy, reversibility and non-candidate budgets stay advisory).
 //!
 //! Ownership ruling 610/6-10 (planner-side descriptor gating only; no new
 //! APIs): 610/6 OWNED via `InformationDimension::has_expected_gain` false
@@ -24,7 +31,16 @@
 //! `PossibleResultSchema::new` fail-closed boundary (empty targets/branches,
 //! incomplete cover, duplicate identity, undeclared target all rejected
 //! before any descriptor can plan).
-//! Docs route=sha256:1b9bbbd8b5bb5e2de4737b4fa03e7e3672daba4394afef443dd3d8476554c7fa read=sha256:ea79ca7e06dbc95bb6ebceb4b5d904a848f265540ab58d6e82d93d5878599ec6 bundle=5ca78f97ee5f6485f6ab552d6687ade11da053a68be0cb38339167aeac0be7f3 (generic-source; verified bundle read in full plus I09-03, I09-05, I21-03, I12-18, I12-22, I13-07, I15-02, I15-04, I05-27, I05-16, I07-20 read directly).
+//! Ownership ruling 610/17,21 (this slice, planner-side gating/admission
+//! only; no new APIs, zero `src/` changes): 610/17 OWNED via the existing
+//! `classify_dimensions` closed gates (feasibility UNKNOWN/UNAVAILABLE and
+//! information UNAVAILABLE map to `Unprobeable`; authority
+//! UNKNOWN/UNAVAILABLE maps to `AuthorityBlocked`; consent UNKNOWN stays
+//! plannable but never reads as granted); 610/21 OWNED via safe-descriptor
+//! admission (SideEffectFree/Permitted/Granted/Feasible/Contained/Reversible
+//! plans to a ranked candidate-only probe with all vectors preserved and no
+//! execution handle).
+//! Docs route=sha256:1b9bbbd8b5bb5e2de4737b4fa03e7e3672daba4394afef443dd3d8476554c7fa read=sha256:ea79ca7e06dbc95bb6ebceb4b5d904a848f265540ab58d6e82d93d5878599ec6 bundle=5ca78f97ee5f6485f6ab552d6687ade11da053a68be0cb38339167aeac0be7f3 (generic-source; verified bundle read in full; plan.rs/model.rs plus contracts affordance/result/objective/budget sources read directly).
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
@@ -639,4 +655,183 @@ fn open_unbounded_result_space_is_rejected() {
         .is_err(),
         "update to an undeclared target must fail closed"
     );
+}
+
+// WORK_UNIT_CASE: 610/17
+#[test]
+fn typed_affordance_unknown_unavailable_states_gate_closed() {
+    let kinds = [
+        AffordanceKind::EvidenceInspection,
+        AffordanceKind::RecordLookup,
+        AffordanceKind::ConsistencyCheck,
+        AffordanceKind::HumanConsultation,
+        AffordanceKind::CrossReference,
+    ];
+    assert_eq!(kinds.len(), 5);
+
+    let mut unknown_feas_params =
+        descriptor_params("aff-unknown-feas", gap_target("claim-unk-feas"));
+    unknown_feas_params.feasibility = FeasibilityDimension::Unknown {
+        reason: "channel state not yet characterized".to_owned(),
+    };
+    let unknown_feas = must(InquiryAffordanceDescriptor::new(unknown_feas_params));
+    assert!(!unknown_feas.feasibility.is_feasible());
+    assert!(!unknown_feas.feasibility.is_known());
+
+    let mut unavailable_feas_params =
+        descriptor_params("aff-unavail-feas", gap_target("claim-unavail-feas"));
+    unavailable_feas_params.feasibility = FeasibilityDimension::Unavailable {
+        reason: "channel retired".to_owned(),
+    };
+    let unavailable_feas = must(InquiryAffordanceDescriptor::new(unavailable_feas_params));
+    assert!(!unavailable_feas.feasibility.is_feasible());
+
+    let mut unavailable_info_params =
+        descriptor_params("aff-unavail-info", gap_target("claim-unavail-info"));
+    unavailable_info_params.information = InformationDimension::Unavailable {
+        reason: "gain characterization withheld".to_owned(),
+    };
+    let unavailable_info = must(InquiryAffordanceDescriptor::new(unavailable_info_params));
+    assert!(!unavailable_info.information.has_expected_gain());
+
+    let mut unknown_auth_params =
+        descriptor_params("aff-unknown-auth", gap_target("claim-unknown-auth"));
+    unknown_auth_params.authority = AuthorityDimension::Unknown {
+        reason: "standing not yet attested".to_owned(),
+    };
+    let unknown_auth = must(InquiryAffordanceDescriptor::new(unknown_auth_params));
+    assert!(!unknown_auth.authority.is_permitted());
+    assert!(!unknown_auth.authority.is_known());
+
+    let mut unavailable_auth_params =
+        descriptor_params("aff-unavail-auth", gap_target("claim-unavail-auth"));
+    unavailable_auth_params.authority = AuthorityDimension::Unavailable {
+        reason: "standing source withheld".to_owned(),
+    };
+    let unavailable_auth = must(InquiryAffordanceDescriptor::new(unavailable_auth_params));
+    assert!(!unavailable_auth.authority.is_permitted());
+
+    let mut unknown_consent_params =
+        descriptor_params("aff-unknown-consent", gap_target("claim-unknown-consent"));
+    unknown_consent_params.consent = ConsentDimension::Unknown {
+        reason: "consent state not yet supplied".to_owned(),
+    };
+    let unknown_consent = must(InquiryAffordanceDescriptor::new(unknown_consent_params));
+    assert!(!unknown_consent.consent.is_granted());
+    assert!(!unknown_consent.consent.is_known());
+
+    let plan = plan_for(
+        vec![
+            unknown_feas,
+            unavailable_feas,
+            unavailable_info,
+            unknown_auth,
+            unavailable_auth,
+            unknown_consent,
+        ],
+        Some(16),
+    );
+    must(plan.validate());
+    assert_eq!(plan.probes.len(), 1);
+    assert_eq!(plan.omissions.len(), 5);
+
+    let probe = &plan.probes[0];
+    assert_eq!(probe.probe_id.as_str(), "aff-unknown-consent");
+    assert!(!probe.dimensions.consent.is_granted());
+    must(probe.target.validate());
+    must(probe.result_schema.validate());
+
+    let mut unprobeable = 0;
+    let mut blocked = 0;
+    for omission in &plan.omissions {
+        must(omission.target.validate());
+        match omission.kind {
+            OmissionKind::Unprobeable => {
+                unprobeable += 1;
+                assert!(
+                    omission.reason.contains("UNKNOWN") || omission.reason.contains("UNAVAILABLE"),
+                    "unprobeable gap must cite the unknown/unavailable gate, got {}",
+                    omission.reason
+                );
+            }
+            OmissionKind::AuthorityBlocked => {
+                blocked += 1;
+                assert!(
+                    omission.reason.contains("UNKNOWN") || omission.reason.contains("UNAVAILABLE"),
+                    "authority gap must cite the unknown/unavailable gate, got {}",
+                    omission.reason
+                );
+            }
+            OmissionKind::OverBudget => {
+                panic!("unknown/unavailable gating must not mint over-budget gaps");
+            }
+        }
+    }
+    assert_eq!(unprobeable, 3);
+    assert_eq!(blocked, 2);
+}
+
+// WORK_UNIT_CASE: 610/21
+#[test]
+fn safe_read_only_candidate_plans_candidate_only() {
+    let mut safe_params = descriptor_params("aff-safe-read", gap_target("claim-safe"));
+    safe_params.effect = EffectDimension::SideEffectFree {
+        detail: "reads retained bytes only".to_owned(),
+    };
+    safe_params.reversibility = ReversibilityDimension::Reversible {
+        detail: "no state touched".to_owned(),
+    };
+    safe_params.privacy = PrivacyDimension::Contained {
+        detail: "retained material only".to_owned(),
+    };
+    safe_params.authority = AuthorityDimension::Permitted {
+        detail: "standing supplied".to_owned(),
+    };
+    safe_params.consent = ConsentDimension::Granted {
+        detail: "planning consent supplied".to_owned(),
+    };
+    safe_params.feasibility = FeasibilityDimension::Feasible {
+        detail: "channel available".to_owned(),
+    };
+    let safe = must(InquiryAffordanceDescriptor::new(safe_params));
+    assert!(safe.effect.is_side_effect_free());
+    assert!(safe.privacy.is_contained());
+    assert!(safe.reversibility.is_reversible());
+    assert!(safe.authority.is_permitted());
+    assert!(safe.consent.is_granted());
+    assert!(safe.feasibility.is_feasible());
+
+    let plan = plan_for(vec![safe], Some(16));
+    must(plan.validate());
+    assert_eq!(plan.probes.len(), 1);
+    assert!(plan.omissions.is_empty());
+
+    let probe = &plan.probes[0];
+    assert_eq!(probe.probe_id.as_str(), "aff-safe-read");
+    assert_eq!(probe.rank, 0);
+    assert_eq!(probe.probe_id, probe.affordance.affordance_id);
+    assert!(probe.merged_affordances.is_empty());
+    assert!(!probe.expected_discrimination.trim().is_empty());
+    assert!(probe.expected_discrimination.contains("claim-safe"));
+    must(probe.result_schema.validate());
+    must(probe.dimensions.validate());
+    match &probe.dimensions.effect {
+        EffectDimension::SideEffectFree { detail } => {
+            assert_eq!(detail.as_str(), "reads retained bytes only");
+        }
+        other => panic!("safe probe must preserve its effect vector, got {other:?}"),
+    }
+    match &probe.dimensions.authority {
+        AuthorityDimension::Permitted { detail } => {
+            assert_eq!(detail.as_str(), "standing supplied");
+        }
+        other => panic!("safe probe must preserve its authority vector, got {other:?}"),
+    }
+    match &probe.dimensions.privacy {
+        PrivacyDimension::Contained { detail } => {
+            assert_eq!(detail.as_str(), "retained material only");
+        }
+        other => panic!("safe probe must preserve its privacy vector, got {other:?}"),
+    }
+    assert_eq!(must(plan.compute_digest()), plan.digest);
 }
