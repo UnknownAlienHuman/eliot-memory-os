@@ -1,0 +1,20 @@
+{
+  "cases": [
+    {
+      "id": 1,
+      "name": "current ingress, typed resolution, submission, and receiver contract"
+    },
+    {
+      "id": 2,
+      "name": "valid ticket reaches the daemon v2 dispatch path"
+    },
+    {
+      "id": 3,
+      "name": "one resolution is retained across exact replay"
+    },
+    {
+      "id": 22,
+      "name": "all seven dispositions use the v2 submit envelope"
+    }
+  ]
+}
