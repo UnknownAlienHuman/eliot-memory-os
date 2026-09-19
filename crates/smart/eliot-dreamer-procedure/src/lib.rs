@@ -38,11 +38,14 @@
 //! validation. There are no placeholder, mock, canned, or pseudo paths:
 //! every branch binds an explicit input field.
 //!
-//! Test coverage note: 27 of 50 `WORK_UNIT_CASE 661/*` cases execute here
-//! Executed cases: 661/1..26 and 661/34. The remaining 23 of 50 are deferred
-//! per START.md s1; #965 admission is separate. Deferred: 661/31, 661/32,
-//! 661/33, 661/35, 661/36, 661/37, 661/38, 661/39, 661/40, 661/41, 661/42,
-//! 661/43, 661/44, 661/45, 661/46, 661/47, 661/48, 661/49, 661/50.
+//! Test coverage note: 31 of 50 `WORK_UNIT_CASE 661/*` cases execute here.
+//! Executed cases: 661/1, 661/2, 661/3, 661/4, 661/5, 661/6, 661/7, 661/8,
+//! 661/9, 661/10, 661/11, 661/12, 661/13, 661/14, 661/15, 661/16, 661/17,
+//! 661/18, 661/19, 661/20, 661/21, 661/22, 661/23, 661/24, 661/25, 661/26,
+//! 661/27, 661/28, 661/29, 661/30, and 661/34. The remaining 19 of 50 are
+//! deferred per START.md s1; #965 admission is separate. Deferred: 661/31,
+//! 661/32, 661/33, 661/35, 661/36, 661/37, 661/38, 661/39, 661/40, 661/41,
+//! 661/42, 661/43, 661/44, 661/45, 661/46, 661/47, 661/48, 661/49, 661/50.
 
 #![forbid(unsafe_code)]
 
@@ -1829,13 +1832,9 @@ pub fn compute_candidate_digest(
     parts.push(format!("manifest:{}", evidence.frozen_manifest_digest));
     parts.push(format!("fingerprint:{}", evidence.failure_fingerprint));
     parts.push(format!("mechanism:{}", evidence.mechanism_note));
-    parts.push(format!(
-        "causal-claim:{}",
-        evidence
-            .causal_claim
-            .as_ref()
-            .map_or_else(|| "none".to_owned(), |claim| claim.digest.clone())
-    ));
+    if let Some(causal_claim) = &evidence.causal_claim {
+        parts.push(format!("causal-claim:{}", causal_claim.digest));
+    }
     parts.push(format!("outcome:{outcome_spelling}"));
     let mut index = 0usize;
     while index < steps.len() {
@@ -2927,6 +2926,198 @@ mod tests {
         };
         assert_eq!(baseline.outcome, ProcedureOutcome::Complete);
         assert_ne!(baseline.candidate_digest, candidate.candidate_digest);
+    }
+
+    #[test]
+    fn no_causal_claim_digest_matches_legacy_golden() {
+        let candidate = match propose_procedure(
+            &test_item(),
+            &test_grounded(),
+            &test_evidence(),
+            &test_capability(),
+            &test_existing(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("legacy no-claim fixture: {err:?}"),
+        };
+        assert!(test_evidence().causal_claim.is_none());
+        assert_eq!(
+            candidate.candidate_digest,
+            "8f5ac35ef3276794453ddf44684afea4301184816e621fcdb348fc8cc0975adb"
+        );
+    }
+
+    // WORK_UNIT_CASE: 661/27
+    #[test]
+    fn case_27_cancellation_boundaries_preserve_inert_recovery_paths() {
+        let item = test_item();
+        let grounded = test_grounded();
+        let evidence = test_evidence();
+        let capability = test_capability();
+        let existing = test_existing();
+        let mut cancelled = test_policy();
+        cancelled.cancelled = true;
+        let candidate = match propose_procedure(
+            &item,
+            &grounded,
+            &evidence,
+            &capability,
+            &existing,
+            &cancelled,
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("pre-admission cancellation stays inert: {err:?}"),
+        };
+        assert_eq!(candidate.outcome, ProcedureOutcome::Rejected);
+        assert!(candidate.note.contains("no effect"));
+        for step in &candidate.steps {
+            assert!(step.cancel_note.contains("on cancel"));
+            assert!(step.rollback_note.contains("before state"));
+        }
+
+        let mut possible_effect = test_evidence();
+        possible_effect.mechanism_note =
+            "exercised mechanism m-2 with unknown possible effect on ext-9".to_owned();
+        let candidate = match propose_procedure(
+            &item,
+            &grounded,
+            &possible_effect,
+            &capability,
+            &existing,
+            &cancelled,
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("cancellation after possible effect stays inert: {err:?}"),
+        };
+        assert_eq!(candidate.outcome, ProcedureOutcome::Rejected);
+        assert!(has_unknown_effect(&candidate.steps));
+        assert!(candidate.unknown_handling_note.contains("reconcile"));
+        assert!(candidate.steps.iter().all(|step| {
+            step.cancel_note.contains("on cancel") && step.reconcile_note.contains("reconcile")
+        }));
+    }
+
+    // WORK_UNIT_CASE: 661/28
+    #[test]
+    fn case_28_cleanup_failure_and_unknown_paths_keep_exact_owners() {
+        let candidate = match propose_procedure(
+            &test_item(),
+            &test_grounded(),
+            &test_evidence(),
+            &test_capability(),
+            &test_existing(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("cleanup baseline: {err:?}"),
+        };
+        assert_eq!(candidate.outcome, ProcedureOutcome::Complete);
+        for step in &candidate.steps {
+            assert!(!step.owner.trim().is_empty());
+            assert!(step.failure_note.contains("owner review"));
+            assert!(step.rollback_note.contains("rollback"));
+        }
+        assert!(check_rollback_owned(&candidate.steps).is_ok());
+
+        let mut missing_cleanup = candidate.steps[0].clone();
+        missing_cleanup.rollback_note.clear();
+        assert!(matches!(
+            check_rollback_owned(std::slice::from_ref(&missing_cleanup)),
+            Err(ProcedureError::Shape { field, .. }) if field == "step.rollback"
+        ));
+
+        let mut missing_reconciliation = candidate.steps[0].clone();
+        missing_reconciliation.effect = EffectClass::Unknown;
+        missing_reconciliation.reconcile_note.clear();
+        assert!(matches!(
+            check_unknown_reconcile_owned(std::slice::from_ref(&missing_reconciliation)),
+            Err(ProcedureError::Shape { field, .. }) if field == "step.reconcile"
+        ));
+    }
+
+    // WORK_UNIT_CASE: 661/29
+    #[test]
+    fn case_29_effect_classes_keep_reversible_and_compensation_boundaries() {
+        for spelling in ["read_only", "owner_directed", "compensatable", "unknown"] {
+            assert!(EffectClass::parse(spelling).is_ok());
+        }
+        assert!(matches!(
+            EffectClass::parse("irreversible"),
+            Err(ProcedureError::Shape { field, .. }) if field == "step.effect"
+        ));
+
+        let candidate = match propose_procedure(
+            &test_item(),
+            &test_grounded(),
+            &test_evidence(),
+            &test_capability(),
+            &test_existing(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("effect-class baseline: {err:?}"),
+        };
+        assert!(
+            candidate
+                .steps
+                .iter()
+                .any(|step| step.effect == EffectClass::Compensatable)
+        );
+        assert!(candidate.steps.iter().all(|step| {
+            step.effect != EffectClass::Compensatable || step.rollback_note.contains("rollback")
+        }));
+
+        let mut unknown_evidence = test_evidence();
+        unknown_evidence.mechanism_note =
+            "exercised mechanism m-2 with unknown possible effect on ext-9".to_owned();
+        let unknown = match propose_procedure(
+            &test_item(),
+            &test_grounded(),
+            &unknown_evidence,
+            &test_capability(),
+            &test_existing(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("unknown effect remains candidate-only: {err:?}"),
+        };
+        assert_eq!(unknown.outcome, ProcedureOutcome::BlockedUnknownEffect);
+        assert!(unknown.steps.iter().any(|step| {
+            step.effect == EffectClass::Unknown && step.reconcile_note.contains("reconcile")
+        }));
+    }
+
+    // WORK_UNIT_CASE: 661/30
+    #[test]
+    fn case_30_rollback_and_forward_repair_keep_current_preconditions_visible() {
+        let candidate = match propose_procedure(
+            &test_item(),
+            &test_grounded(),
+            &test_evidence(),
+            &test_capability(),
+            &test_existing(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("rollback baseline: {err:?}"),
+        };
+        assert!(candidate.inverse_note.contains("before state"));
+        assert!(
+            candidate
+                .forward_correction_note
+                .contains("before state is unreachable")
+        );
+        for step in &candidate.steps {
+            assert!(!step.precondition.trim().is_empty());
+            assert!(!step.rollback_note.trim().is_empty());
+        }
+        assert!(
+            candidate
+                .step_dispositions
+                .iter()
+                .all(|disposition| !disposition.inverse_note.trim().is_empty())
+        );
     }
 
     // WORK_UNIT_CASE: 661/6
