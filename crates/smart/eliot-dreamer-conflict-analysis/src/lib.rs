@@ -39,16 +39,20 @@
 //! validation. There are no placeholder, mock, canned, or pseudo paths:
 //! every branch binds an explicit input field.
 //!
-//! Test coverage note: 27 of 68 `WORK_UNIT_CASE 673/*` cases execute here
+//! Test coverage note: 32 of 68 `WORK_UNIT_CASE 673/*` cases execute here
 //! (673/1 valid completes, 673/2 wrong job and scope fail closed, 673/3
 //! empty and single position are not conflicts, 673/5 duplicate and changed
 //! identities fail closed, 673/6 complete/partial/stale/blocked/withheld
 //! denominators stay explicit, 673/7 exact replay preserves digest while
-//! changed content moves it, 673/9 independent families stay two roots,
+//! changed content moves it, 673/8 no model, tool, store, peer, Concilium,
+//! or decision mutation, 673/9 independent families stay two roots,
 //! 673/10 shared lineage stays one root, 673/11 derived citation chain stays
 //! one root, 673/12 shared context and route stays a common-mode risk,
 //! 673/13 unknown lineage is not independent, 673/14
-//! majority count cannot choose a winner, 673/19 compatible scope stays
+//! majority count cannot choose a winner, 673/15 minority position retained,
+//! 673/16 every objection, counterexample, and unknown retained, 673/17
+//! stale, refuted, and superseded history stays addressable, 673/18
+//! contradiction under equal conditions, 673/19 compatible scope stays
 //! residue, 673/35 shared model and evaluator limits independence, 673/40
 //! nondiscriminative probe rejected, 673/51 Concilium-review
 //! recommendation carries no plan, 673/4 receipt and fence mismatch fails
@@ -62,9 +66,9 @@
 //! unknown-resolution criterion, 673/67 classification, resolution, and proof
 //! stay within grounded evidence, 673/68 bounded malformed input stays
 //! panic-free with no winner, resolution, authority, execution, or Finish).
-//! The remaining 41 of 68 are deferred per queue-item scope; workspace
-//! admission (#969), Product Pulse, and Edge proof remain separate. Deferred: 673/8, 673/15,
-//! 673/16, 673/17, 673/18, 673/20, 673/21, 673/22, 673/23, 673/24, 673/25,
+//! The remaining 36 of 68 are deferred per queue-item scope; workspace
+//! admission (#969), Product Pulse, and Edge proof remain separate. Deferred: 673/20,
+//! 673/21, 673/22, 673/23, 673/24, 673/25,
 //! 673/26, 673/27, 673/28, 673/29, 673/30, 673/31, 673/32, 673/33, 673/34,
 //! 673/36, 673/37, 673/38, 673/39, 673/41, 673/42, 673/43, 673/44,
 //! 673/45, 673/46, 673/47, 673/48, 673/49, 673/50, 673/52, 673/53, 673/54,
@@ -4615,5 +4619,398 @@ mod tests {
             assert!(!probe.probe_id.trim().is_empty());
             assert!(!probe.effect_note.trim().is_empty());
         }
+    }
+
+    // WORK_UNIT_CASE: 673/8
+    #[test]
+    fn case_08_no_mutation_effect_or_execution() {
+        let item = test_item();
+        let draft = test_draft();
+        let grounded = test_grounded();
+        let conflict = test_conflict();
+        let supplements = test_supplements();
+        let policy = test_policy();
+        let candidate =
+            match analyze_conflict(&item, &draft, &grounded, &conflict, &supplements, &policy) {
+                Ok(candidate) => candidate,
+                Err(err) => panic!("bounded analysis: {err:?}"),
+            };
+        assert_eq!(candidate.outcome, ConflictOutcome::Complete);
+        assert_eq!(
+            candidate.resolution_status, None,
+            "no decision is issued by the analyzer"
+        );
+        assert_eq!(candidate.note, CONFLICT_PROOF_NOTE);
+        assert!(!candidate.note.contains("Finish"));
+        assert!(!candidate.note.contains("ConciliumPlan"));
+        for probe in &candidate.recommended_probes {
+            assert!(!probe.probe_id.trim().is_empty());
+            assert!(!probe.owner.trim().is_empty());
+            assert!(!probe.verifier.trim().is_empty());
+            assert!(!probe.cost_note.trim().is_empty());
+            assert!(!probe.risk_note.trim().is_empty());
+            assert!(!probe.privacy_note.trim().is_empty());
+            assert!(!probe.effect_note.trim().is_empty());
+        }
+        let replay =
+            match analyze_conflict(&item, &draft, &grounded, &conflict, &supplements, &policy) {
+                Ok(candidate) => candidate,
+                Err(err) => panic!("replay analysis: {err:?}"),
+            };
+        assert_eq!(candidate.candidate_digest, replay.candidate_digest);
+        assert_eq!(
+            candidate.positions.len(),
+            conflict.positions.len(),
+            "analysis preserves without mutating the input set"
+        );
+        assert!(
+            !candidate.invalidation_conditions.is_empty(),
+            "reopening conditions stay explicit instead of an execution receipt"
+        );
+    }
+
+    // WORK_UNIT_CASE: 673/15
+    #[test]
+    fn case_15_minority_position_retained() {
+        let item = test_item();
+        let draft = test_draft();
+        let grounded = test_grounded();
+        let receipt = test_receipt();
+        let conflict = ConflictSet::new(ConflictSetParams {
+            conflict_id: "conflict-minority".to_owned(),
+            kind: ConflictKind::Epistemic,
+            scope: "scope-1".to_owned(),
+            task_id: None,
+            positions: vec![
+                test_position("source-a", "cache helps tail latency", false),
+                ConflictPosition::new(
+                    SourceId::new("source-b").expect("valid source"),
+                    "cache harms tail latency under burst load".to_owned(),
+                    BTreeSet::from(["assumption-burst".to_owned()]),
+                    BTreeSet::new(),
+                    true,
+                )
+                .expect("valid minority"),
+            ],
+            evidence_refs: BTreeSet::new(),
+            owners: BTreeSet::from([
+                SourceId::new("source-a").expect("valid source"),
+                SourceId::new("source-b").expect("valid source"),
+            ]),
+            common_lineage: BTreeSet::new(),
+            resolved_parts: BTreeSet::new(),
+            unresolved: BTreeSet::from(["tail latency effect".to_owned()]),
+            unresolved_owners: BTreeSet::from([
+                SourceId::new("source-a").expect("valid source"),
+                SourceId::new("source-b").expect("valid source"),
+            ]),
+            acceptability: ArgumentAcceptability::Contested,
+            defeated_refs: BTreeSet::new(),
+            probe: None,
+            decision_owner: SourceId::new("source-a").expect("valid source"),
+            affected_actions: vec!["decide-cache".to_owned()],
+            lifecycle: ConflictLifecycle::Open,
+            receipt_digest: receipt.bundle_digest.clone(),
+        })
+        .expect("minority conflict stays valid");
+        let candidate = match analyze_conflict(
+            &item,
+            &draft,
+            &grounded,
+            &conflict,
+            &test_supplements(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("minority analysis: {err:?}"),
+        };
+        assert_eq!(candidate.outcome, ConflictOutcome::Complete);
+        assert_eq!(candidate.positions.len(), 2);
+        let minority = candidate
+            .positions
+            .iter()
+            .find(|position| position.source_handle == "source-b")
+            .expect("minority position stays visible");
+        assert!(minority.minority);
+        assert_eq!(
+            minority.disposition,
+            PositionDispositionKind::MinorityPreserved
+        );
+        assert_eq!(minority.stance, "cache harms tail latency under burst load");
+        assert_eq!(minority.assumptions, vec!["assumption-burst".to_owned()]);
+        assert_eq!(candidate.resolution_status, None);
+    }
+
+    // WORK_UNIT_CASE: 673/16
+    #[test]
+    fn case_16_every_objection_counterexample_and_unknown_retained() {
+        let mut supplements = test_supplements();
+        supplements.objections = vec![
+            SuppliedObjection {
+                objection_id: "obj-1".to_owned(),
+                target_source: "source-a".to_owned(),
+                statement: "cold start unaffected".to_owned(),
+                grounded: true,
+            },
+            SuppliedObjection {
+                objection_id: "obj-2".to_owned(),
+                target_source: "source-b".to_owned(),
+                statement: "burst load reverses the effect".to_owned(),
+                grounded: false,
+            },
+        ];
+        supplements.counterevidence = vec![
+            "burst load reverses the effect".to_owned(),
+            "cold start unaffected".to_owned(),
+        ];
+        supplements.unknowns = vec![
+            "burst load threshold".to_owned(),
+            "hit rate under load".to_owned(),
+        ];
+        supplements.assumptions = vec!["assumption-1".to_owned()];
+        let candidate = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &test_conflict(),
+            &supplements,
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("objection retention analysis: {err:?}"),
+        };
+        assert_eq!(candidate.outcome, ConflictOutcome::Complete);
+        assert_eq!(candidate.objections.len(), 2);
+        for expected in &supplements.objections {
+            let kept = candidate
+                .objections
+                .iter()
+                .find(|objection| objection.objection_id == expected.objection_id)
+                .unwrap_or_else(|| panic!("objection {} stays visible", expected.objection_id));
+            assert_eq!(kept.target_source, expected.target_source);
+            assert_eq!(kept.statement, expected.statement);
+            assert_eq!(kept.grounded, expected.grounded);
+        }
+        let mut ordered_counters = supplements.counterevidence.clone();
+        ordered_counters.sort();
+        assert_eq!(candidate.counterevidence, ordered_counters);
+        let mut ordered_unknowns = supplements.unknowns.clone();
+        ordered_unknowns.sort();
+        assert_eq!(candidate.unknowns, ordered_unknowns);
+        assert!(!candidate.invalidation_conditions.is_empty());
+        assert_eq!(candidate.resolution_status, None);
+    }
+
+    // WORK_UNIT_CASE: 673/17
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn case_17_stale_refuted_and_superseded_history_stays_addressable() {
+        let receipt = test_receipt();
+        let superseded = ConflictSet::new(ConflictSetParams {
+            conflict_id: "conflict-superseded".to_owned(),
+            kind: ConflictKind::Epistemic,
+            scope: "scope-1".to_owned(),
+            task_id: None,
+            positions: vec![
+                test_position("source-a", "cache helps tail latency", false),
+                test_position("source-b", "cache harms tail latency", true),
+            ],
+            evidence_refs: BTreeSet::new(),
+            owners: BTreeSet::from([
+                SourceId::new("source-a").expect("valid source"),
+                SourceId::new("source-b").expect("valid source"),
+            ]),
+            common_lineage: BTreeSet::new(),
+            resolved_parts: BTreeSet::from(["warm key effect".to_owned()]),
+            unresolved: BTreeSet::from(["burst load effect".to_owned()]),
+            unresolved_owners: BTreeSet::from([SourceId::new("source-b").expect("valid source")]),
+            acceptability: ArgumentAcceptability::Contested,
+            defeated_refs: BTreeSet::new(),
+            probe: None,
+            decision_owner: SourceId::new("source-a").expect("valid source"),
+            affected_actions: vec!["decide-cache".to_owned()],
+            lifecycle: ConflictLifecycle::Superseded,
+            receipt_digest: receipt.bundle_digest.clone(),
+        })
+        .expect("superseded conflict stays valid");
+        let superseded_candidate = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &superseded,
+            &test_supplements(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("superseded analysis: {err:?}"),
+        };
+        assert_eq!(superseded_candidate.positions.len(), 2);
+        assert!(
+            superseded_candidate
+                .positions
+                .iter()
+                .all(|position| position.disposition == PositionDispositionKind::SupersededHistory)
+        );
+        let refuted_position = ConflictPosition::new(
+            SourceId::new("source-a").expect("valid source"),
+            "cache helps tail latency".to_owned(),
+            BTreeSet::from(["assumption-1".to_owned()]),
+            BTreeSet::from([ArtifactId::new("ctr-1").expect("valid artifact")]),
+            false,
+        )
+        .expect("refuted position stays valid");
+        let refuted = ConflictSet::new(ConflictSetParams {
+            conflict_id: "conflict-refuted".to_owned(),
+            kind: ConflictKind::Epistemic,
+            scope: "scope-1".to_owned(),
+            task_id: None,
+            positions: vec![
+                refuted_position,
+                test_position("source-b", "cache harms tail latency", false),
+            ],
+            evidence_refs: BTreeSet::new(),
+            owners: BTreeSet::from([
+                SourceId::new("source-a").expect("valid source"),
+                SourceId::new("source-b").expect("valid source"),
+            ]),
+            common_lineage: BTreeSet::new(),
+            resolved_parts: BTreeSet::new(),
+            unresolved: BTreeSet::from(["tail latency effect".to_owned()]),
+            unresolved_owners: BTreeSet::from([SourceId::new("source-b").expect("valid source")]),
+            acceptability: ArgumentAcceptability::Contested,
+            defeated_refs: BTreeSet::from([ArtifactId::new("ctr-1").expect("valid artifact")]),
+            probe: None,
+            decision_owner: SourceId::new("source-a").expect("valid source"),
+            affected_actions: vec!["decide-cache".to_owned()],
+            lifecycle: ConflictLifecycle::Open,
+            receipt_digest: receipt.bundle_digest.clone(),
+        })
+        .expect("refuted conflict stays valid");
+        let refuted_candidate = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &refuted,
+            &test_supplements(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("refuted analysis: {err:?}"),
+        };
+        let refuted_entry = refuted_candidate
+            .positions
+            .iter()
+            .find(|position| position.source_handle == "source-a")
+            .expect("refuted position stays addressable");
+        assert_eq!(refuted_entry.disposition, PositionDispositionKind::Refuted);
+        assert_eq!(refuted_entry.counters, vec!["ctr-1".to_owned()]);
+        let mut stale_policy = test_policy();
+        stale_policy.observation_time_ms = Some(1_800_000_000_000);
+        stale_policy.deadline_ms = Some(1_800_000_000_000);
+        let stale = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &superseded,
+            &test_supplements(),
+            &stale_policy,
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("stale history analysis: {err:?}"),
+        };
+        assert_eq!(stale.outcome, ConflictOutcome::Stale);
+        assert_eq!(stale.positions.len(), 2);
+        assert!(
+            stale
+                .positions
+                .iter()
+                .all(|position| position.disposition == PositionDispositionKind::SupersededHistory)
+        );
+    }
+
+    // WORK_UNIT_CASE: 673/18
+    #[test]
+    fn case_18_contradiction_under_equal_conditions() {
+        let item = test_item();
+        let draft = test_draft();
+        let grounded = test_grounded();
+        let receipt = test_receipt();
+        let conflict = ConflictSet::new(ConflictSetParams {
+            conflict_id: "conflict-contradiction".to_owned(),
+            kind: ConflictKind::Epistemic,
+            scope: "scope-1".to_owned(),
+            task_id: None,
+            positions: vec![
+                ConflictPosition::new(
+                    SourceId::new("source-a").expect("valid source"),
+                    "cache helps tail latency".to_owned(),
+                    BTreeSet::from(["assumption-1".to_owned()]),
+                    BTreeSet::new(),
+                    false,
+                )
+                .expect("valid position"),
+                ConflictPosition::new(
+                    SourceId::new("source-b").expect("valid source"),
+                    "cache harms tail latency".to_owned(),
+                    BTreeSet::from(["assumption-1".to_owned()]),
+                    BTreeSet::new(),
+                    false,
+                )
+                .expect("valid position"),
+            ],
+            evidence_refs: BTreeSet::new(),
+            owners: BTreeSet::from([
+                SourceId::new("source-a").expect("valid source"),
+                SourceId::new("source-b").expect("valid source"),
+            ]),
+            common_lineage: BTreeSet::new(),
+            resolved_parts: BTreeSet::new(),
+            unresolved: BTreeSet::from(["tail latency effect".to_owned()]),
+            unresolved_owners: BTreeSet::from([
+                SourceId::new("source-a").expect("valid source"),
+                SourceId::new("source-b").expect("valid source"),
+            ]),
+            acceptability: ArgumentAcceptability::Contested,
+            defeated_refs: BTreeSet::new(),
+            probe: None,
+            decision_owner: SourceId::new("source-a").expect("valid source"),
+            affected_actions: vec!["decide-cache".to_owned()],
+            lifecycle: ConflictLifecycle::Open,
+            receipt_digest: receipt.bundle_digest.clone(),
+        })
+        .expect("contradiction conflict stays valid");
+        let candidate = match analyze_conflict(
+            &item,
+            &draft,
+            &grounded,
+            &conflict,
+            &test_supplements(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("contradiction analysis: {err:?}"),
+        };
+        assert_eq!(candidate.outcome, ConflictOutcome::Complete);
+        assert_eq!(candidate.positions.len(), 2);
+        for position in &candidate.positions {
+            assert_eq!(position.disposition, PositionDispositionKind::LivePreserved);
+            assert!(
+                position
+                    .compatibility_note
+                    .contains("contradiction under equal"),
+                "equal-condition contradiction stays explicit: {}",
+                position.compatibility_note
+            );
+            assert!(
+                position.conflict_classes.contains(&ConflictKind::Epistemic),
+                "canonical kind stays classified: {:?}",
+                position.conflict_classes
+            );
+            assert_eq!(
+                position.stance,
+                conflict.positions[position.position_index].stance
+            );
+        }
+        assert_eq!(candidate.resolution_status, None);
     }
 }
