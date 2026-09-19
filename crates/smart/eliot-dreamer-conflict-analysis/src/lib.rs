@@ -39,7 +39,7 @@
 //! validation. There are no placeholder, mock, canned, or pseudo paths:
 //! every branch binds an explicit input field.
 //!
-//! Test coverage note: 47 of 68 `WORK_UNIT_CASE 673/*` cases execute here
+//! Test coverage note: 51 of 68 `WORK_UNIT_CASE 673/*` cases execute here
 //! (673/1 valid completes, 673/2 wrong job and scope fail closed, 673/3
 //! empty and single position are not conflicts, 673/5 duplicate and changed
 //! identities fail closed, 673/6 complete/partial/stale/blocked/withheld
@@ -68,7 +68,11 @@
 //! stay non-causal without a winner, 673/32 bare causal hypotheses stay live
 //! until mechanism, falsifier, and confounders are grounded, 673/33 prediction
 //! support stays defeasible without intervention support, 673/34 missing matched
-//! control and evaluator verdicts limit the causal claim, 673/35 shared model
+//! control and evaluator verdicts limit the causal claim, 673/36 unsupported
+//! numeric, time, version, and causal precision gains no support, 673/37 rivals
+//! and counterevidence stay live without truth selection, 673/38 a supplied
+//! probe discriminates two live positions, 673/39 a supplied probe resolves one
+//! load-bearing unknown, 673/35 shared model
 //! and evaluator limits independence, 673/40
 //! nondiscriminative probe rejected, 673/51 Concilium-review
 //! recommendation carries no plan, 673/4 receipt and fence mismatch fails
@@ -82,8 +86,8 @@
 //! unknown-resolution criterion, 673/67 classification, resolution, and proof
 //! stay within grounded evidence, 673/68 bounded malformed input stays
 //! panic-free with no winner, resolution, authority, execution, or Finish).
-//! The remaining 21 of 68 are deferred per queue-item scope; workspace
-//! admission (#969), Product Pulse, and Edge proof remain separate. Deferred: 673/36, 673/37, 673/38, 673/39, 673/41, 673/42, 673/43, 673/44,
+//! The remaining 17 of 68 are deferred per queue-item scope; workspace
+//! admission (#969), Product Pulse, and Edge proof remain separate. Deferred: 673/41, 673/42, 673/43, 673/44,
 //! 673/45, 673/46, 673/47, 673/48, 673/49, 673/50, 673/52, 673/53, 673/54,
 //! 673/55, 673/58, 673/59, 673/63.
 
@@ -6152,6 +6156,288 @@ mod tests {
             candidate.recommended_owner.kind,
             DecisionOwnerKind::EvidenceSource,
             "the evidence-source owner must supply the missing control evidence"
+        );
+        assert_eq!(candidate.resolution_status, None);
+    }
+
+    // WORK_UNIT_CASE: 673/36
+    #[test]
+    fn case_36_unsupported_precision_gains_no_support() {
+        let receipt = test_receipt();
+        let conflict = ConflictSet::new(ConflictSetParams {
+            conflict_id: "conflict-unsupported-precision".to_owned(),
+            kind: ConflictKind::Epistemic,
+            scope: "scope-1".to_owned(),
+            task_id: None,
+            positions: vec![
+                test_position(
+                    "source-a",
+                    "the cache cuts p99 latency by exactly 42.7 percent at line 118 since v2.3.1 through mechanism M",
+                    false,
+                ),
+                test_position(
+                    "source-b",
+                    "the cache effect is file-level only with no supported line, version, or causal precision",
+                    false,
+                ),
+            ],
+            evidence_refs: BTreeSet::new(),
+            owners: BTreeSet::from([
+                SourceId::new("source-a").expect("valid source"),
+                SourceId::new("source-b").expect("valid source"),
+            ]),
+            common_lineage: BTreeSet::new(),
+            resolved_parts: BTreeSet::new(),
+            unresolved: BTreeSet::from(["supported precision ceiling".to_owned()]),
+            unresolved_owners: BTreeSet::from([SourceId::new("source-a").expect("valid source")]),
+            acceptability: ArgumentAcceptability::Contested,
+            defeated_refs: BTreeSet::new(),
+            probe: None,
+            decision_owner: SourceId::new("source-a").expect("valid source"),
+            affected_actions: vec!["decide-cache".to_owned()],
+            lifecycle: ConflictLifecycle::Open,
+            receipt_digest: receipt.bundle_digest.clone(),
+        })
+        .expect("unsupported-precision conflict stays valid");
+        let mut supplements = test_supplements();
+        supplements.unknowns = vec![
+            "highest supported precision is file level only".to_owned(),
+            "numeric, time, version, and causal precision lack grounded support".to_owned(),
+        ];
+        supplements.supplied_probes = Vec::new();
+        let candidate = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &conflict,
+            &supplements,
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("unsupported-precision analysis: {err:?}"),
+        };
+        assert_eq!(candidate.outcome, ConflictOutcome::Complete);
+        assert!(
+            candidate
+                .positions
+                .iter()
+                .all(|position| position.disposition == PositionDispositionKind::LivePreserved),
+            "unsupported precision stays live without invented support"
+        );
+        for position in &candidate.positions {
+            assert_eq!(
+                position.conflict_classes,
+                vec![ConflictKind::Epistemic],
+                "unsupported precision gains no invented class: {:?}",
+                position.conflict_classes
+            );
+            assert_eq!(
+                position.stance, conflict.positions[position.position_index].stance,
+                "original precision-claimed propositions stay preserved verbatim"
+            );
+            assert!(
+                !position.compatibility_note.trim().is_empty(),
+                "every precision-limited position carries a compatibility note"
+            );
+        }
+        for unknown in &supplements.unknowns {
+            assert!(
+                candidate.unknowns.contains(unknown),
+                "unsupported precision gap stays an open unknown: {unknown}"
+            );
+        }
+        assert_eq!(candidate.resolution_status, None);
+    }
+
+    // WORK_UNIT_CASE: 673/37
+    #[test]
+    fn case_37_rivals_and_counterevidence_stay_live_without_truth_selection() {
+        let receipt = test_receipt();
+        let conflict = ConflictSet::new(ConflictSetParams {
+            conflict_id: "conflict-rivals-without-selection".to_owned(),
+            kind: ConflictKind::Epistemic,
+            scope: "scope-1".to_owned(),
+            task_id: None,
+            positions: vec![
+                test_position("source-a", "cache helps tail latency", false),
+                test_position("source-b", "cache harms tail latency", true),
+            ],
+            evidence_refs: BTreeSet::new(),
+            owners: BTreeSet::from([
+                SourceId::new("source-a").expect("valid source"),
+                SourceId::new("source-b").expect("valid source"),
+            ]),
+            common_lineage: BTreeSet::new(),
+            resolved_parts: BTreeSet::new(),
+            unresolved: BTreeSet::from(["tail latency effect".to_owned()]),
+            unresolved_owners: BTreeSet::from([
+                SourceId::new("source-a").expect("valid source"),
+                SourceId::new("source-b").expect("valid source"),
+            ]),
+            acceptability: ArgumentAcceptability::Contested,
+            defeated_refs: BTreeSet::new(),
+            probe: None,
+            decision_owner: SourceId::new("source-a").expect("valid source"),
+            affected_actions: vec!["decide-cache".to_owned()],
+            lifecycle: ConflictLifecycle::Open,
+            receipt_digest: receipt.bundle_digest.clone(),
+        })
+        .expect("rival conflict stays valid");
+        let mut supplements = test_supplements();
+        supplements.counterevidence = vec![
+            "cold start unaffected".to_owned(),
+            "rival warm-key trial contradicts the tail claim".to_owned(),
+        ];
+        supplements.assumptions = vec!["assumption-1".to_owned()];
+        supplements.unknowns = vec!["hit rate under load".to_owned()];
+        supplements.supplied_probes = Vec::new();
+        let candidate = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &conflict,
+            &supplements,
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("rival-preservation analysis: {err:?}"),
+        };
+        assert_eq!(candidate.outcome, ConflictOutcome::Complete);
+        assert!(
+            candidate
+                .positions
+                .iter()
+                .any(|position| position.disposition == PositionDispositionKind::LivePreserved),
+            "rival positions stay live without truth selection"
+        );
+        assert!(
+            candidate.positions.iter().any(|position| position.minority
+                && position.disposition == PositionDispositionKind::MinorityPreserved),
+            "minority rival evidence stays explicitly preserved"
+        );
+        for position in &candidate.positions {
+            assert_eq!(
+                position.stance, conflict.positions[position.position_index].stance,
+                "original rival propositions stay preserved verbatim"
+            );
+        }
+        let mut ordered_counter = supplements.counterevidence.clone();
+        ordered_counter.sort();
+        assert_eq!(candidate.counterevidence, ordered_counter);
+        assert_eq!(candidate.objections.len(), 1);
+        assert_eq!(candidate.unknowns, supplements.unknowns);
+        assert_eq!(candidate.assumptions, supplements.assumptions);
+        assert_eq!(candidate.resolution_status, None);
+    }
+
+    // WORK_UNIT_CASE: 673/38
+    #[test]
+    fn case_38_supplied_probe_discriminates_two_live_positions() {
+        let conflict = test_conflict();
+        let mut supplements = test_supplements();
+        supplements.supplied_probes = vec![test_discriminative_probe("probe-38-disc")];
+        let candidate = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &conflict,
+            &supplements,
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("discriminative-probe analysis: {err:?}"),
+        };
+        assert_eq!(candidate.outcome, ConflictOutcome::Complete);
+        assert!(
+            candidate
+                .positions
+                .iter()
+                .all(
+                    |position| position.disposition == PositionDispositionKind::LivePreserved
+                        || position.disposition == PositionDispositionKind::MinorityPreserved
+                ),
+            "discriminated positions stay live; the probe recommends, never resolves"
+        );
+        assert_eq!(candidate.recommended_probes.len(), 1);
+        let recommended = candidate
+            .recommended_probes
+            .first()
+            .expect("discriminative probe stays recommended");
+        let supplied = supplements
+            .supplied_probes
+            .first()
+            .expect("supplied probe stays addressable");
+        assert_eq!(recommended.probe_id, "probe-38-disc");
+        assert_eq!(recommended.objective_digest, supplied.objective.digest);
+        assert_eq!(recommended.result_digest, supplied.schema.digest);
+        assert_eq!(recommended.owner, supplied.owner_note);
+        assert_eq!(recommended.verifier, supplied.verifier);
+        assert_eq!(recommended.cost_note, supplied.cost_note);
+        assert_eq!(recommended.risk_note, supplied.risk_note);
+        assert_eq!(recommended.privacy_note, supplied.privacy_note);
+        assert_eq!(recommended.effect_note, supplied.effect_note);
+        assert_eq!(recommended.discriminates_positions.len(), 2);
+        assert!(
+            recommended
+                .discriminates_positions
+                .contains(&"source-a".to_owned())
+        );
+        assert!(
+            recommended
+                .discriminates_positions
+                .contains(&"source-b".to_owned())
+        );
+        assert!(branches_discriminate(&supplied.schema));
+        assert_eq!(candidate.resolution_status, None);
+    }
+
+    // WORK_UNIT_CASE: 673/39
+    #[test]
+    fn case_39_supplied_probe_resolves_one_load_bearing_unknown() {
+        let conflict = test_conflict();
+        let mut probe = test_nondiscriminative_probe();
+        probe.probe_id = String::from("probe-39-unknown");
+        probe.objective.invalidation_conditions = vec![ConditionAssumptionRef {
+            assumption_id: "hit rate under load".to_owned(),
+            assumption_digest: "a".repeat(64),
+        }];
+        probe.objective.digest = probe
+            .objective
+            .compute_digest()
+            .expect("recomputed unknown probe digest stays valid");
+        assert!(
+            resolves_unknown(&probe, &test_supplements().unknowns).is_some(),
+            "probe declaration binds the load-bearing unknown before analysis"
+        );
+        let mut supplements = test_supplements();
+        supplements.supplied_probes = vec![probe];
+        let candidate = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &conflict,
+            &supplements,
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("unknown-resolving probe analysis: {err:?}"),
+        };
+        assert_eq!(candidate.outcome, ConflictOutcome::Complete);
+        assert_eq!(candidate.recommended_probes.len(), 1);
+        let recommended = candidate
+            .recommended_probes
+            .first()
+            .expect("unknown-resolving probe stays recommended");
+        assert_eq!(recommended.probe_id, "probe-39-unknown");
+        assert_eq!(
+            recommended.resolves_unknown,
+            Some("hit rate under load".to_owned())
+        );
+        assert!(
+            candidate
+                .unknowns
+                .contains(&"hit rate under load".to_owned()),
+            "the load-bearing unknown stays open until the probe is executed elsewhere"
         );
         assert_eq!(candidate.resolution_status, None);
     }
