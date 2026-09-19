@@ -28,7 +28,7 @@ use std::collections::BTreeMap;
 use eliot_dreamer_contracts::{
     AuthorityDimension, BudgetLimits, ConsentDimension, ContractViolation, DreamInputBundle,
     FeasibilityDimension, InformationDimension, InquiryAffordanceDescriptor, InquiryAffordanceSet,
-    ProbeAffordanceRef, RivalModelSet, ValidatedDreamDraft,
+    ProbeAffordanceRef, ResultUpdateDiscriminability, RivalModelSet, ValidatedDreamDraft,
     error::len_i64,
     grounding::canonical::{ArtifactId, TaskId},
 };
@@ -175,17 +175,33 @@ struct DescriptorGroup {
 }
 
 /// Classifies every descriptor and collapses duplicates deterministically.
+///
+/// Duplicate collapse consumes only the A-03 predeclared update-set
+/// classification (issue 610/11): two descriptors collapse onto one group
+/// only when they share the planner-owned `(kind, target)` collapse key,
+/// the planner-owned admission class, and the A-03 predeclared
+/// [`ResultUpdateDiscriminability`] of their result schemas. Descriptors
+/// whose schemas the A-03 vocabulary classifies differently stay split, so
+/// the planner never merges across a declared discriminability boundary and
+/// performs zero update, meaning, or materiality inference of its own.
 fn classify_descriptors(
     affordances: &InquiryAffordanceSet,
     scope: &BoundContext,
 ) -> Result<Vec<DescriptorGroup>, ContractViolation> {
-    let mut groups: BTreeMap<(u8, String), DescriptorGroup> = BTreeMap::new();
+    let mut groups: BTreeMap<(u8, String, ResultUpdateDiscriminability), DescriptorGroup> =
+        BTreeMap::new();
     for descriptor in &affordances.descriptors {
         let group = classify_one(descriptor, &scope.scope)?;
-        match groups.get_mut(&(group.order, group.collapse.clone())) {
+        // The A-03 classification is predeclared on the validated descriptor
+        // schema; comparing it verbatim is admission gating, not a judgment.
+        let discriminability = group.result_schema.update_discriminability();
+        match groups.get_mut(&(group.order, group.collapse.clone(), discriminability)) {
             Some(existing) => merge_group(existing, group)?,
             None => {
-                groups.insert((group.order, group.collapse.clone()), group);
+                groups.insert(
+                    (group.order, group.collapse.clone(), discriminability),
+                    group,
+                );
             }
         }
     }
@@ -235,7 +251,9 @@ fn classify_one(
 }
 
 /// Merges a duplicate onto the lowest affordance identity; fails closed when
-/// the merged table would exceed its bound.
+/// the merged table would exceed its bound. The caller admits only groups
+/// whose A-03 predeclared discriminability already agrees, so this merge
+/// never crosses a declared update-set boundary.
 fn merge_group(
     existing: &mut DescriptorGroup,
     incoming: DescriptorGroup,

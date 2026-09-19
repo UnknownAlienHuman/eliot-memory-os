@@ -30,5 +30,5 @@ pub use objective::{
 };
 pub use result::{
     GapUpdateMeaning, PossibleResultSchema, PossibleResultValue, ResultBranch, ResultTarget,
-    ResultUpdate, RivalUpdateMeaning,
+    ResultUpdate, ResultUpdateDiscriminability, RivalUpdateMeaning, update_sets_equal,
 };

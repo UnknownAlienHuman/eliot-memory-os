@@ -130,7 +130,7 @@ pub use probe::{
     ProbeGroundingRef, ProbeInput, ProbeInputParams, ProbeInputRef, ProbeLifecycle, ProbeObjective,
     ProbeObjectiveOrigin, ProbeObjectiveRef, ProbeObjectiveTarget, ProbeOwnerRef, ProbeParam,
     ProbeRepeatRef, ProbeSourceRef, ResourceDimension, ResultBranch, ResultTarget, ResultUpdate,
-    ReversibilityDimension, RivalUpdateMeaning,
+    ResultUpdateDiscriminability, ReversibilityDimension, RivalUpdateMeaning, update_sets_equal,
 };
 pub use registry::{
     AtomicityMode, CURATION_FAMILIES, CurationFamily, CurationHandlerDescriptor,

@@ -373,4 +373,76 @@ impl PossibleResultSchema {
         }
         Ok(())
     }
+
+    /// Authoritative A-03 discriminability of this schema's branch update
+    /// sets, declared for issue 610/11 (case 610/11 needs).
+    ///
+    /// The planner (A-17b `dreamer-probe-plan`) owns only admission gating on
+    /// already-owned descriptor dimensions and must not decide
+    /// discriminability or materiality; it consumes this predeclared value
+    /// instead of inferring its own. `Debug` text is never equality: the
+    /// comparison below is canonical typed `PartialEq` over [`ResultUpdate`],
+    /// so every owner-supplied digest and meaning field participates.
+    ///
+    /// Set-vs-multiset policy: one branch update list is a set. Construction
+    /// ([`PossibleResultSchema::new`]) rejects a branch that names a target
+    /// twice, so a valid branch carries each target exactly once and set
+    /// equality coincides with multiset equality on valid inputs; the free
+    /// [`update_sets_equal`] comparison still uses set semantics (order
+    /// insensitive, duplicates collapsed) so repetition alone can never
+    /// manufacture a distinction. Across branches the schema is a multiset of
+    /// update sets: branch identity and repetition are significant, which is
+    /// why two branches with equivalent update sets classify as
+    /// [`ResultUpdateDiscriminability::NonDiscriminating`] rather than as one
+    /// branch.
+    pub fn update_discriminability(&self) -> ResultUpdateDiscriminability {
+        let mut branches = self.branches.iter();
+        let Some(first) = branches.next() else {
+            return ResultUpdateDiscriminability::NonDiscriminating;
+        };
+        for branch in branches {
+            if !update_sets_equal(&first.updates, &branch.updates) {
+                return ResultUpdateDiscriminability::Discriminating;
+            }
+        }
+        ResultUpdateDiscriminability::NonDiscriminating
+    }
+}
+
+/// Authoritative A-03 equivalence over one branch update set, declared for
+/// issue 610/11 (case 610/11 needs).
+///
+/// Canonical typed equality over [`ResultUpdate`], order insensitive with set
+/// semantics: every update in `left` must be typed-equal to some update in
+/// `right` and vice versa. Update order never distinguishes, and duplicate
+/// entries collapse (duplicates are impossible in a valid branch because
+/// [`PossibleResultSchema::new`] fails closed on a repeated target, so set
+/// equality coincides with multiset equality on valid inputs). `Debug`
+/// rendering is never consulted: two updates that render alike but differ in
+/// any typed field — including owner-supplied digests — are distinct.
+pub fn update_sets_equal(left: &[ResultUpdate], right: &[ResultUpdate]) -> bool {
+    left.iter().all(|update| right.contains(update))
+        && right.iter().all(|update| left.contains(update))
+}
+
+/// Authoritative A-03 discriminability classification over a
+/// [`PossibleResultSchema`]'s branch update sets, declared for issue 610/11.
+///
+/// This is the predeclared value the A-17b planner consumes: the planner
+/// compares these classifications verbatim and performs no update, meaning,
+/// or materiality inference of its own. [`ResultUpdateDiscriminability`] is
+/// vocabulary owned by A-03 (`dreamer-contracts`); the planner owns only
+/// admission gating on already-owned descriptor dimensions.
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ResultUpdateDiscriminability {
+    /// Fewer than two branches, or every branch carries an update set
+    /// equivalent (per [`update_sets_equal`]) to the first: no branch pair
+    /// separates on declared updates.
+    NonDiscriminating,
+    /// At least two branches carry update sets that differ in at least one
+    /// typed [`ResultUpdate`]: the outcome matrix separates on declaration.
+    Discriminating,
 }
