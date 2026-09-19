@@ -17,8 +17,8 @@ use eliot_contracts::{
     TaskId, TaskRevision, TransactionSequence, canonical_json_bytes, sha256_hex,
 };
 use eliot_dreamer_contracts::{
-    BudgetLimits, BudgetUsage, DreamJobAdmission, JobClass, Requester, RequesterOrigin, ScreenBinding,
-    ScreenState,
+    BudgetLimits, BudgetUsage, DreamJobAdmission, JobClass, Requester, RequesterOrigin,
+    ScreenBinding, ScreenState,
 };
 use eliot_dreamer_cycle::{
     CYCLE_SCHEMA_VERSION, CycleError, CyclePhase, CyclePolicy, DreamerCycleState, ExpectedArtifact,
@@ -169,7 +169,11 @@ fn pending(policy: &CyclePolicy, job: &DreamJobAdmission) -> PendingRequest {
     }
 }
 
-fn state(policy: &CyclePolicy, job: &DreamJobAdmission, request: PendingRequest) -> DreamerCycleState {
+fn state(
+    policy: &CyclePolicy,
+    job: &DreamJobAdmission,
+    request: PendingRequest,
+) -> DreamerCycleState {
     let mut state = DreamerCycleState {
         schema_version: 1,
         cycle_id: ArtifactId::new("cycle-1").unwrap(),
