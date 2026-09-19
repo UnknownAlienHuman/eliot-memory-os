@@ -51,15 +51,17 @@
 //! validation. There are no placeholder, mock, canned, or pseudo paths:
 //! every branch binds an explicit input field.
 //!
-//! Test coverage note: 8 of 51 `WORK_UNIT_CASE 675/*` cases execute here
-//! (675/1 valid two-rival diagnosis with minimal experiment, 675/4
-//! fence and receipt mismatch fails closed, 675/8 proxy metric cannot prove
+//! Test coverage note: 11 of 51 `WORK_UNIT_CASE 675/*` cases execute here
+//! (675/1 valid two-rival diagnosis with minimal experiment, 675/2 exact
+//! Objective/acceptance/recovery/identity binding, 675/3 wrong job/payload
+//! fails closed, 675/4 fence and receipt mismatch fails closed, 675/5
+//! wrong/stale source context fails closed, 675/8 proxy metric cannot prove
 //! Product delta, 675/11 current-pass discriminator cannot prove failure,
 //! 675/15 unchanged equivalent retry requires mechanism review, 675/21
 //! mandatory conflict analysis missing yields insufficiency, 675/32
 //! identical rival predictions are nondiscriminative, 675/45 exact replay is
-//! deterministic). The remaining 43 of 51 are deferred per START.md s1;
-//! #969 admission is separate. Deferred: 675/2, 675/3, 675/5, 675/6, 675/7,
+//! deterministic). The remaining 40 of 51 are deferred per START.md s1;
+//! #969 admission is separate. Deferred: 675/6, 675/7,
 //! 675/9, 675/10, 675/12, 675/13, 675/14, 675/16, 675/17, 675/18, 675/19,
 //! 675/20, 675/22, 675/23, 675/24, 675/25, 675/26, 675/27, 675/28, 675/29,
 //! 675/30, 675/31, 675/33, 675/34, 675/35, 675/36, 675/37, 675/38, 675/39,
@@ -132,6 +134,20 @@ pub const SLICE1_IMPLEMENTED_CASES: &[u8] = &[1, 4, 8, 11, 15, 21, 32, 45];
 pub const SLICE1_REMAINDER_CASES: &[u8] = &[
     2, 3, 5, 6, 7, 9, 10, 12, 13, 14, 16, 17, 18, 19, 20, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
     33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 46, 47, 48, 49, 50, 51,
+];
+
+/// Cases covered by the second bounded implementation slice.
+///
+/// Step-1 input and binding identity: exact Objective/acceptance/recovery
+/// identity (675/2), wrong job/payload rejection (675/3), and wrong/stale
+/// source-context rejection (675/5). Every path binds existing transitional
+/// inputs; no new canonical contracts are required.
+pub const SLICE2_IMPLEMENTED_CASES: &[u8] = &[2, 3, 5];
+
+/// Cases deliberately left for later slices after slice 2.
+pub const SLICE2_REMAINDER_CASES: &[u8] = &[
+    6, 7, 9, 10, 12, 13, 14, 16, 17, 18, 19, 20, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 33, 34,
+    35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 46, 47, 48, 49, 50, 51,
 ];
 
 /// Canonical A03 evidence supplied to the first A40 package boundary.
@@ -2633,7 +2649,7 @@ pub fn diagnose_development_gap(
 }
 
 // ---------------------------------------------------------------------------
-// Tests (proportionate: 8 of 51 cases; remainder deferred per START.md s1).
+// Tests (proportionate: 11 of 51 cases; remainder deferred per START.md s1).
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -2656,6 +2672,8 @@ mod tests {
     use super::RivalStatus;
     use super::SLICE1_IMPLEMENTED_CASES;
     use super::SLICE1_REMAINDER_CASES;
+    use super::SLICE2_IMPLEMENTED_CASES;
+    use super::SLICE2_REMAINDER_CASES;
     use super::diagnose_development_gap;
     use super::is_hex64_lower;
     use super::outcome_rejection_hint;
@@ -3010,6 +3028,21 @@ mod tests {
         assert!(seen[1..].iter().all(|present| *present));
     }
 
+    #[test]
+    fn slice2_remainder_map_covers_the_declared_denominator() {
+        let mut seen = [false; 52];
+        for case in SLICE1_IMPLEMENTED_CASES
+            .iter()
+            .chain(SLICE2_IMPLEMENTED_CASES.iter())
+            .chain(SLICE2_REMAINDER_CASES.iter())
+        {
+            assert!((1..=51).contains(case));
+            assert!(!seen[usize::from(*case)]);
+            seen[usize::from(*case)] = true;
+        }
+        assert!(seen[1..].iter().all(|present| *present));
+    }
+
     // WORK_UNIT_CASE: 675/1
     #[test]
     fn case_01_valid_two_rival_diagnosis_recommends_minimal_experiment() {
@@ -3032,6 +3065,178 @@ mod tests {
         assert_eq!(selected.outcome_matrix.len(), 6);
         assert_eq!(candidate.recommendation.owner, "owner-9");
         assert_eq!(outcome_rejection_hint(&candidate.outcome), None);
+    }
+
+    // WORK_UNIT_CASE: 675/2
+    #[test]
+    fn case_02_exact_objective_acceptance_recovery_identity_binds() {
+        let candidate = run_valid();
+        assert_eq!(candidate.objective_id, "obj-1");
+        assert_eq!(candidate.product_id, "product-1");
+        assert_eq!(candidate.source_revision, "rev-9");
+        assert_eq!(candidate.gap_kind, "product_failure");
+
+        let job = test_job();
+        let draft = test_draft();
+        let discriminator = test_discriminator();
+        let repairs = test_repairs();
+        let conflict = test_conflict();
+        let rivals = test_rivals();
+        let common_mode = test_common_mode();
+        let experiments = [test_experiment()].to_vec();
+        let policy = test_policy();
+
+        let mut defaulted = test_product();
+        defaulted.objective_revision = 0;
+        let result = diagnose_development_gap(
+            &job,
+            &draft,
+            &defaulted,
+            &discriminator,
+            &repairs,
+            &conflict,
+            &rivals,
+            &common_mode,
+            &experiments,
+            &policy,
+        );
+        let Err(err) = result else {
+            panic!("defaulted objective revision must fail");
+        };
+        assert!(matches!(
+            err,
+            super::DiagnosisError::Shape {
+                field: "product.objective-revision",
+                ..
+            }
+        ));
+
+        let mut bad_acceptance = test_product();
+        bad_acceptance.acceptance_digest = "not-a-digest".to_owned();
+        let result = diagnose_development_gap(
+            &job,
+            &draft,
+            &bad_acceptance,
+            &discriminator,
+            &repairs,
+            &conflict,
+            &rivals,
+            &common_mode,
+            &experiments,
+            &policy,
+        );
+        let Err(err) = result else {
+            panic!("inexact acceptance digest must fail");
+        };
+        assert!(matches!(err, super::DiagnosisError::Digest { .. }));
+
+        let mut bad_recovery = test_product();
+        bad_recovery.recovery_digest = "Z".repeat(64);
+        let result = diagnose_development_gap(
+            &job,
+            &draft,
+            &bad_recovery,
+            &discriminator,
+            &repairs,
+            &conflict,
+            &rivals,
+            &common_mode,
+            &experiments,
+            &policy,
+        );
+        let Err(err) = result else {
+            panic!("inexact recovery digest must fail");
+        };
+        assert!(matches!(err, super::DiagnosisError::Digest { .. }));
+    }
+
+    // WORK_UNIT_CASE: 675/3
+    #[test]
+    fn case_03_wrong_job_payload_fails_closed() {
+        let draft = test_draft();
+        let product = test_product();
+        let discriminator = test_discriminator();
+        let repairs = test_repairs();
+        let conflict = test_conflict();
+        let rivals = test_rivals();
+        let common_mode = test_common_mode();
+        let experiments = [test_experiment()].to_vec();
+        let policy = test_policy();
+
+        let mut wrong_class = test_job();
+        wrong_class.job_class = JobClass::Curation;
+        let result = diagnose_development_gap(
+            &wrong_class,
+            &draft,
+            &product,
+            &discriminator,
+            &repairs,
+            &conflict,
+            &rivals,
+            &common_mode,
+            &experiments,
+            &policy,
+        );
+        let Err(err) = result else {
+            panic!("non-diagnosis job class must fail");
+        };
+        assert!(matches!(
+            err,
+            super::DiagnosisError::Binding {
+                field: "job_class",
+                ..
+            }
+        ));
+
+        let mut task_drift = test_job();
+        task_drift.task_id = "task-other".to_owned();
+        let result = diagnose_development_gap(
+            &task_drift,
+            &draft,
+            &product,
+            &discriminator,
+            &repairs,
+            &conflict,
+            &rivals,
+            &common_mode,
+            &experiments,
+            &policy,
+        );
+        let Err(err) = result else {
+            panic!("task drift between job and draft must fail");
+        };
+        assert!(matches!(
+            err,
+            super::DiagnosisError::Binding {
+                field: "task_id",
+                ..
+            }
+        ));
+
+        let mut scope_drift = test_job();
+        scope_drift.scope_id = "scope-other".to_owned();
+        let result = diagnose_development_gap(
+            &scope_drift,
+            &draft,
+            &product,
+            &discriminator,
+            &repairs,
+            &conflict,
+            &rivals,
+            &common_mode,
+            &experiments,
+            &policy,
+        );
+        let Err(err) = result else {
+            panic!("scope drift between job and draft must fail");
+        };
+        assert!(matches!(
+            err,
+            super::DiagnosisError::Binding {
+                field: "scope_id",
+                ..
+            }
+        ));
     }
 
     // WORK_UNIT_CASE: 675/4
@@ -3064,6 +3269,71 @@ mod tests {
             panic!("policy drift must fail");
         };
         assert!(matches!(err, super::DiagnosisError::Policy { .. }));
+    }
+
+    // WORK_UNIT_CASE: 675/5
+    #[test]
+    fn case_05_stale_source_context_drift_fails_closed() {
+        let job = test_job();
+        let draft = test_draft();
+        let product = test_product();
+        let repairs = test_repairs();
+        let conflict = test_conflict();
+        let rivals = test_rivals();
+        let common_mode = test_common_mode();
+        let experiments = [test_experiment()].to_vec();
+        let policy = test_policy();
+
+        let mut stale_discriminator = test_discriminator();
+        stale_discriminator.context_digest = "9".repeat(64);
+        let result = diagnose_development_gap(
+            &job,
+            &draft,
+            &product,
+            &stale_discriminator,
+            &repairs,
+            &conflict,
+            &rivals,
+            &common_mode,
+            &experiments,
+            &policy,
+        );
+        let Err(err) = result else {
+            panic!("discriminator context drift must fail");
+        };
+        assert!(matches!(
+            err,
+            super::DiagnosisError::Binding {
+                field: "discriminator.context",
+                ..
+            }
+        ));
+
+        let mut stale_product = test_product();
+        stale_product.context_digest = "8".repeat(64);
+        let discriminator = test_discriminator();
+        let result = diagnose_development_gap(
+            &job,
+            &draft,
+            &stale_product,
+            &discriminator,
+            &repairs,
+            &conflict,
+            &rivals,
+            &common_mode,
+            &experiments,
+            &policy,
+        );
+        let Err(err) = result else {
+            panic!("product context drift must fail");
+        };
+        assert!(matches!(
+            err,
+            super::DiagnosisError::Binding {
+                field: "discriminator.context",
+                ..
+            }
+        ));
     }
 
     // WORK_UNIT_CASE: 675/8
