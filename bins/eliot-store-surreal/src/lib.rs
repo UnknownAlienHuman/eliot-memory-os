@@ -138,10 +138,12 @@ fn map_adapter_error(error: AdapterError) -> StoreCompositionError {
         )),
         // Contract ceiling (honest stop; see `into_store_error`):
         // `StoreError` has no Backpressure, Deadline, MigrationRequired or
-        // Partial variants, so transport loss, required migrations and
-        // unknown migration outcomes share `Unavailable` here. Live migration
-        // paths keep their exact outcome via `map_schema_bootstrap_error`.
+        // Partial variants, so transport loss, transient allocation
+        // contention, required migrations and unknown migration outcomes
+        // share `Unavailable` here. Live migration paths keep their exact
+        // outcome via `map_schema_bootstrap_error`.
         AdapterError::ProviderUnavailable
+        | AdapterError::AllocationContention { .. }
         | AdapterError::MigrationRequired
         | AdapterError::UnknownMigrationOutcome { .. } => {
             StoreCompositionError::Store(error.into_store_error())
@@ -1475,6 +1477,17 @@ mod tests {
             error,
             StoreCompositionError::UnknownOutcome { operation_id, .. }
                 if operation_id.as_str() == "operation-test"
+        ));
+    }
+
+    #[test]
+    fn allocation_contention_stays_transient_unavailable() {
+        let error = map_adapter_error(AdapterError::AllocationContention {
+            operation_id: "operation-test".to_owned(),
+        });
+        assert!(matches!(
+            error,
+            StoreCompositionError::Store(StoreError::Unavailable)
         ));
     }
 
