@@ -18,8 +18,14 @@ use eliot_runtime_contracts::{HealthDimension, ModuleGeneration, ModuleGeneratio
 use thiserror::Error;
 
 mod frame_codec;
+mod host_conformance;
 
 pub use frame_codec::{FrameDecoder, decode_frame, encode_frame};
+pub use host_conformance::{
+    AdmissionCoverage, AttemptGate, AttemptPhase, AttemptRouteOutcome, CapabilityEvidence,
+    ConformanceError, EvidenceTier, FingerprintQuarantine, HostFingerprint,
+    RouteMismatchDisposition, admit_coverage, reconcile_attempt_route, require_verified_capability,
+};
 
 /// A provider-neutral peer result. A PID or pipe name is not an identity proof.
 #[derive(Clone, Debug, Eq, PartialEq)]
