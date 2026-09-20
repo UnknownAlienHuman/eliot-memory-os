@@ -26,8 +26,9 @@ use super::{
     PROTOCOL_VERSION, PreparedAuthorityMaterial, ProcessAuthorityHandoffDescriptor,
     ProcessDispatchAuthorityController, ProcessExecutionAuthorityConfig, ProcessExecutionGateway,
     RedbRecoveryStore, RouteScope, Runtime, RuntimeConfig, SERVICE_NAME, ServerHandshakePolicy,
-    StateFence, UserOwnedPathLease, UserOwnedRootLease, WindowsDispatchSnapshotCodec,
-    WindowsPlatform, is_lower_sha256, sha256_hex, sha256_json, unix_ms,
+    StartupCoordinator, StateFence, UserOwnedPathLease, UserOwnedRootLease,
+    WindowsDispatchSnapshotCodec, WindowsPlatform, is_lower_sha256, sha256_hex, sha256_json,
+    unix_ms,
 };
 #[cfg(test)]
 use super::{CanonicalEvidenceProvider, DispatchValidationPort};
@@ -1023,6 +1024,25 @@ impl KernelComposition {
         let store_handoff_init = None;
         #[cfg(windows)]
         let agent_activation_results = Self::rehydrate_agent_activation_results(&ors)?;
+        // Implements #1967: seed the ordered I1.11 startup coordinator.
+        // Composition construction proves steps 1-4 (Host binding validated,
+        // Kernel started, ORS opened with Generation Registry recovery, blob
+        // manifest validated). Steps 5-11 stay open until their live probes,
+        // reconciliations, handshakes, and supervision evidence complete, so
+        // normal writes and Material authority remain capped at low-impact.
+        let startup_coordinator = {
+            let mut coordinator = StartupCoordinator::new();
+            for step in 1..=4_u8 {
+                coordinator
+                    .complete_step(step)
+                    .map_err(KernelBuildError::Service)?;
+            }
+            observe_entrypoint_with_detail(
+                EntrypointStage::Composition,
+                "kernel.composition.startup_sequence_initiated:step=4",
+            );
+            Mutex::new(coordinator)
+        };
         // F-LOG-KERNEL-2 (#899): constructed composition is not ready. The
         // service starts Cold, the daemon is NotLaunched, and no Store
         // gateway is claimed; readiness requires separate Host handoffs.
@@ -1107,6 +1127,7 @@ impl KernelComposition {
                 // Zero is reserved as "no boot nonce"; remap without biasing.
                 if nonce == 0 { 1 } else { nonce }
             },
+            startup_coordinator,
         })
     }
 }

@@ -71,6 +71,11 @@ use process_execution::{
     authorize_process_owner, project_store_snapshot, run_process_start,
 };
 pub use process_execution_client::process_execution_client;
+pub use startup_coordinator::{
+    AuthorityCeiling, GovernanceEnforcement, GovernanceObservation, GovernanceProfile,
+    GovernanceSupervision, StartupCoordinator, StartupPrerequisite, StartupRejection, StartupStatus,
+    STARTUP_FINAL_STEP, STARTUP_FIRST_STEP, startup_step_name,
+};
 pub(crate) use shutdown_drain::{
     DRAIN_RECEIPT_DEADLINE, DrainCommitDecision, DrainHalt, DrainWakeDisposition,
     ShutdownDrainCoordinator, ShutdownPhase, ShutdownTerminal, coordinator_for,
@@ -115,6 +120,7 @@ mod front_door_session;
 mod generation_control;
 mod generation_recovery;
 mod health_view;
+mod startup_coordinator;
 #[cfg(windows)]
 mod host_request_route;
 mod native_worker_lifecycle_route;
@@ -499,6 +505,11 @@ pub struct KernelComposition {
     /// it, even when the fencing generation restarts at 1.
     #[cfg(windows)]
     local_read_claim_boot_nonce: u64,
+    /// Canonical startup sequence coordinator (I1.11 steps 1-11). The single
+    /// ordered readiness/authority-ceiling gate consulted by normal-write and
+    /// Material/Critical admission paths instead of inferring readiness from
+    /// process liveness or pipe availability.
+    startup_coordinator: Mutex<StartupCoordinator>,
 }
 
 #[cfg(windows)]
@@ -1093,6 +1104,17 @@ impl KernelComposition {
         permit: &KernelActivationPermit,
         expected_config_snapshot_sha256: &str,
     ) -> Result<KernelActivationReceipt, String> {
+        // Implements #1967: Material authority issuance consults the startup
+        // coordinator. The rejection names the unmet I1.11 prerequisite.
+        {
+            let coordinator = self
+                .startup_coordinator
+                .lock()
+                .map_err(|_| "startup gate lock poisoned".to_owned())?;
+            coordinator
+                .admit_normal_write()
+                .map_err(|rejection| rejection.to_string())?;
+        }
         let mut service = self
             .service
             .lock()
@@ -1213,6 +1235,13 @@ impl KernelComposition {
         handoff: eliot_kernel_service::StoreRebindHandoff,
         request_digest: String,
     ) -> Result<eliot_kernel_service::StoreRebindReceipt, KernelBuildError> {
+        // Implements #1967: normal canonical writes consult the startup
+        // coordinator rather than inferring readiness from liveness. The
+        // rejection names the unmet I1.11 prerequisite; inspection paths
+        // never consult this gate.
+        if let Err(error) = self.admit_normal_write() {
+            return Err(KernelBuildError::Service(error.to_string()));
+        }
         handoff
             .validate()
             .map_err(|e| KernelBuildError::Service(e.to_string()))?;
@@ -1907,6 +1936,107 @@ impl KernelComposition {
     #[must_use]
     pub fn platform(&self) -> &WindowsPlatform {
         &self.platform
+    }
+
+    /// Structured startup status for one Governance Profile (Implements
+    /// #1967). Reports the completed I1.11 step, the blocking prerequisite,
+    /// degraded optional capabilities, and the current authority ceiling.
+    /// Inspection views use this; they never gate on it.
+    #[must_use]
+    pub fn startup_status(&self, profile: GovernanceProfile) -> StartupStatus {
+        self.startup_coordinator.lock().map_or_else(
+            |poison| poison.into_inner().startup_status(profile),
+            |coordinator| coordinator.startup_status(profile),
+        )
+    }
+
+    /// Current authority ceiling for one Governance Profile. Incomplete ORS
+    /// reconciliation, store schema probe, epoch recovery, or supervision
+    /// evidence caps the ceiling at low-impact regardless of profile.
+    #[must_use]
+    pub fn startup_authority_ceiling(&self, profile: GovernanceProfile) -> AuthorityCeiling {
+        self.startup_coordinator.lock().map_or(
+            AuthorityCeiling::LowImpact,
+            |coordinator| coordinator.authority_ceiling(profile),
+        )
+    }
+
+    /// Normal canonical-write admission through the startup coordinator.
+    /// Inspection remains allowed; a blocked write fails with the named
+    /// unmet startup prerequisite.
+    ///
+    /// # Errors
+    ///
+    /// Returns the blocking [`StartupRejection`] naming the unmet
+    /// prerequisite, or a lock-poison platform error.
+    pub fn admit_normal_write(&self) -> Result<(), KernelServiceError> {
+        let coordinator = self
+            .startup_coordinator
+            .lock()
+            .map_err(|_| KernelServiceError::Platform("startup gate lock poisoned".to_owned()))?;
+        coordinator
+            .admit_normal_write()
+            .map_err(|rejection| KernelServiceError::Platform(rejection.to_string()))
+    }
+
+    /// Material/Critical authority admission for one Governance Profile.
+    /// Startup completeness is checked first with its named prerequisite;
+    /// the profile ceiling alone decides once startup is complete.
+    ///
+    /// # Errors
+    ///
+    /// Returns the blocking [`StartupRejection`] or the profile-ceiling
+    /// rejection as a platform error carrying the named prerequisite.
+    pub fn admit_material_authority(
+        &self,
+        profile: GovernanceProfile,
+    ) -> Result<(), KernelServiceError> {
+        let coordinator = self
+            .startup_coordinator
+            .lock()
+            .map_err(|_| KernelServiceError::Platform("startup gate lock poisoned".to_owned()))?;
+        coordinator
+            .admit_material_authority(profile)
+            .map_err(|rejection| KernelServiceError::Platform(rejection.to_string()))
+    }
+
+    /// Advances one I1.11 startup step in order. Production calls this as
+    /// each probe/handshake actually completes; out-of-order steps fail.
+    ///
+    /// # Errors
+    ///
+    /// Returns the ordering error when `step` is not the next expected step
+    /// or lies outside 1-11, or a lock-poison platform error.
+    pub fn complete_startup_step(&self, step: u8) -> Result<(), KernelServiceError> {
+        let mut coordinator = self
+            .startup_coordinator
+            .lock()
+            .map_err(|_| KernelServiceError::Platform("startup gate lock poisoned".to_owned()))?;
+        coordinator
+            .complete_step(step)
+            .map_err(KernelServiceError::Platform)
+    }
+
+    /// Records blob large-payload degradation (I1.11 step 4). Never blocks
+    /// Material by itself; it is reported in startup status.
+    pub fn note_startup_blob_degraded(&self) -> Result<(), KernelServiceError> {
+        let mut coordinator = self
+            .startup_coordinator
+            .lock()
+            .map_err(|_| KernelServiceError::Platform("startup gate lock poisoned".to_owned()))?;
+        coordinator.note_blob_degraded();
+        Ok(())
+    }
+
+    /// Records optional-capability degradation (I1.11 step 9). Never blocks
+    /// Material by itself; it is reported in startup status.
+    pub fn note_startup_capability_degraded(&self) -> Result<(), KernelServiceError> {
+        let mut coordinator = self
+            .startup_coordinator
+            .lock()
+            .map_err(|_| KernelServiceError::Platform("startup gate lock poisoned".to_owned()))?;
+        coordinator.note_capability_degraded();
+        Ok(())
     }
 
     #[cfg(test)]
