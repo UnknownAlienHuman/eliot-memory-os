@@ -10,6 +10,8 @@
 
 use std::path::Path;
 
+use eliot_platform_windows::ServiceBootstrapArguments;
+
 use super::super::{
     ApprovedGenerationRegistry, CandidateManifest, ELIOT_HOST_SERVICE_NAME,
     ELIOT_WATCHDOG_SERVICE_NAME, HostError, InstallationProfile,
@@ -253,6 +255,6 @@ pub fn verify_running_watchdog(
         wait_hint_ms,
         approved_plan_generation: registration
             .bootstrap()
-            .map(|bootstrap| bootstrap.transaction_plan_generation()),
+            .map(ServiceBootstrapArguments::transaction_plan_generation),
     })
 }
