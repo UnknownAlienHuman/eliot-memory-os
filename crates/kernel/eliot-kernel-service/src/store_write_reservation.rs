@@ -86,10 +86,11 @@ use eliot_platform::SecretReference;
 use eliot_receipts::ReceiptDispositionKind;
 use eliot_security_contracts::PrivacyClass;
 use eliot_store_api::{
-    CanonicalRequestView, OrderingHeadExpectation, OrderingScopeId, PreparedTransition,
-    ReceiptEnvelope, ReservedScopeBinding, ReservedWriteRequest, RevisionHeadExpectation,
-    WriteAdmissionParams, WriteAdmissionProjection, WriteReceipt, WriteReceiptStatus,
-    WriterEpochBinding, prepared_transition_digest, verify_canonical_request_hash,
+    CAPABILITY_RESERVED_WRITE, CanonicalRequestView, OrderingHeadExpectation, OrderingScopeId,
+    PreparedTransition, ReceiptEnvelope, ReservedScopeBinding, ReservedWriteRequest,
+    RevisionHeadExpectation, WriteAdmissionParams, WriteAdmissionProjection, WriteReceipt,
+    WriteReceiptStatus, WriterEpochBinding, prepared_transition_digest,
+    verify_canonical_request_hash,
 };
 
 /// Composition-owned key reference under which the Kernel stages reservation
@@ -1110,4 +1111,99 @@ pub fn gateway_seed(
         expires_at_ms,
         heads,
     })
+}
+
+/// Exact Store capability carried by every Kernel reserved submission (issue
+/// #2031).
+///
+/// Mirrors the Store declaration: API presence is not readiness, and the
+/// capability stays unadvertised until a backend with an accepted scheduler
+/// advertises it. Kernel submissions always name it, so a session without the
+/// admitted capability refuses before dispatch while ordinary operations keep
+/// flowing.
+pub const RESERVED_SUBMISSION_CAPABILITY: &str = CAPABILITY_RESERVED_WRITE;
+
+/// Returns the exact reserved-write capability every Kernel reserved
+/// submission carries.
+pub fn reserved_submission_capability() -> &'static str {
+    RESERVED_SUBMISSION_CAPABILITY
+}
+
+/// Kernel-visible reserved submission: one validated closed reserved-write
+/// request plus the explicit Store capability it selects (issue #2031).
+///
+/// Carries the `#990` sealed admission binding across the Kernel-to-Store
+/// boundary together with the `#991` capability identity, so capability gates
+/// (wire `StoreRequest::capability`, session admission, scheduler profile)
+/// observe the same value the Store backend enforces. The request is validated
+/// at construction; no second serializer exists and no fallback to unreserved
+/// `Apply` is possible through this type.
+#[derive(Clone, Debug)]
+pub struct ReservedSubmission {
+    request: ReservedWriteRequest,
+    capability: &'static str,
+}
+
+impl ReservedSubmission {
+    /// Wraps one closed reserved-write request after validating its shape.
+    ///
+    /// Shape failures preserve the owner `StoreError`; nothing is staged,
+    /// sent, or reconciled here.
+    pub fn new(request: ReservedWriteRequest) -> Result<Self, ReservationWriteError> {
+        request.validate()?;
+        Ok(Self {
+            request,
+            capability: RESERVED_SUBMISSION_CAPABILITY,
+        })
+    }
+
+    /// Projects one sealed reservation into a submission carrying the reserved
+    /// capability.
+    ///
+    /// Runs the exact `#990` projection shared with the gateway path, then
+    /// validates once more at the boundary. A transition mutated after
+    /// reservation fails here with a digest mismatch.
+    pub fn from_sealed(
+        sealed: &SealedReservation,
+        context: &RequestMetadata,
+        transition: &PreparedTransition,
+        expected_revision_heads: Vec<RevisionHeadExpectation>,
+        expected_ordering_heads: Vec<OrderingHeadExpectation>,
+    ) -> Result<Self, ReservationWriteError> {
+        Self::new(project_reserved_write(
+            sealed,
+            context,
+            transition,
+            expected_revision_heads,
+            expected_ordering_heads,
+        )?)
+    }
+
+    /// Exact Store capability this submission selects (`store.reserved_write`).
+    pub fn capability(&self) -> &'static str {
+        self.capability
+    }
+
+    /// Borrows the closed reserved-write request.
+    pub fn request(&self) -> &ReservedWriteRequest {
+        &self.request
+    }
+
+    /// Releases the owned closed request for the single authenticated send.
+    pub fn into_request(self) -> ReservedWriteRequest {
+        self.request
+    }
+}
+
+#[cfg(test)]
+mod reserved_submission_tests {
+    use super::{RESERVED_SUBMISSION_CAPABILITY, reserved_submission_capability};
+    use eliot_store_api::CAPABILITY_RESERVED_WRITE;
+
+    #[test]
+    fn reserved_submission_capability_is_the_store_declaration() {
+        assert_eq!(RESERVED_SUBMISSION_CAPABILITY, CAPABILITY_RESERVED_WRITE);
+        assert_eq!(RESERVED_SUBMISSION_CAPABILITY, "store.reserved_write");
+        assert_eq!(reserved_submission_capability(), CAPABILITY_RESERVED_WRITE);
+    }
 }

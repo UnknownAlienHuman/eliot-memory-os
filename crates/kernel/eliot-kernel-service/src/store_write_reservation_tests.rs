@@ -72,10 +72,10 @@ use std::sync::Arc;
 
 use crate::{
     CompositionReservation, ObservedHead, RESERVATION_KEY_NAME, RESERVATION_KEY_PROVIDER,
-    RESERVATION_VISIBILITY, ReservationSeed, ReservationWriteError, ResolvedSendOutcome,
-    SealedReservation, begin_execute_after_send, cancel_before_send, ensure_eligible,
-    finalize_reservation, mark_unknown_outcome, project_reserved_write, reconcile_receipt,
-    reserve_for_transition,
+    RESERVATION_VISIBILITY, ReservationSeed, ReservationWriteError, ReservedSubmission,
+    ResolvedSendOutcome, SealedReservation, begin_execute_after_send, cancel_before_send,
+    ensure_eligible, finalize_reservation, mark_unknown_outcome, project_reserved_write,
+    reconcile_receipt, reserve_for_transition,
 };
 use eliot_contracts::{
     ClockReading, EpochId, EpochLineageId, OperationId, ProductId, RequestId, ResourceGeneration,
@@ -86,12 +86,12 @@ use eliot_ors::{
     RedbRecoveryStore, ReservationState,
 };
 use eliot_store_api::{
-    CanonicalRequestView, CommitId, EffectClass, EventProjectionRelationIntents,
-    NamedMutationOperation, NamedMutationRequest, OperationIdentity, OperationManifestDigest,
-    OrderingHead, OrderingHeadExpectation, OrderingScopeId, PreparedTransition, RequestMeta,
-    ReservedWriteRequest, Resubmission, RevisionHeadExpectation, RevisionKey, ScopeId,
-    SecurityContext, StoreError, TransitionClass, WriteReceipt, WriteReceiptStatus,
-    canonical_request_hash,
+    CAPABILITY_RESERVED_WRITE, CanonicalRequestView, CommitId, EffectClass,
+    EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
+    OperationIdentity, OperationManifestDigest, OrderingHead, OrderingHeadExpectation,
+    OrderingScopeId, PreparedTransition, RequestMeta, ReservedWriteRequest, Resubmission,
+    RevisionHeadExpectation, RevisionKey, ScopeId, SecurityContext, StoreError, TransitionClass,
+    WriteReceipt, WriteReceiptStatus, canonical_request_hash,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -3526,4 +3526,42 @@ mod gateway_cases {
         );
         finish(setup).await;
     }
+}
+
+// WORK_UNIT_CASE: 2031/1
+#[test]
+fn reserved_submission_carries_reserved_capability_end_to_end() {
+    // The Kernel-visible reserved submission wraps the exact #990 projection
+    // of a real sealed reservation and names the exact #991 Store capability,
+    // so session admission and the scheduler profile observe the same value
+    // the Store backend enforces.
+    let (ors, dir) = temp_ors("2031-submission", Arc::new(BindingEvidence));
+    let owner = owner_for(&ors);
+    let (context, transition, revision, ordering, sealed) =
+        reserve_one(&owner, "2031a", &["scope-992-a"]);
+    let submission =
+        ReservedSubmission::from_sealed(&sealed, &context, &transition, revision, ordering)
+            .expect("2031 sealed projection must submit");
+    assert_eq!(
+        submission.capability(),
+        CAPABILITY_RESERVED_WRITE,
+        "2031 submission carries the Store reserved-write capability"
+    );
+    assert_eq!(
+        submission.request().admission.reservation_order,
+        sealed.token.reservation_order,
+        "2031 submission preserves the sealed reservation order"
+    );
+    assert_eq!(
+        submission.request().admission.reservation_id,
+        sealed.token.reservation_id.as_str(),
+        "2031 submission preserves the sealed reservation identity"
+    );
+    let owned_request = submission.into_request();
+    assert_eq!(
+        owned_request.admission.reservation_order, sealed.token.reservation_order,
+        "2031 owned request preserves the sealed reservation order"
+    );
+    let _ = (context, transition);
+    let _ = std::fs::remove_dir_all(dir);
 }

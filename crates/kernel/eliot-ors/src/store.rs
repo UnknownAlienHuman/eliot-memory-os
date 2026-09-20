@@ -4530,6 +4530,19 @@ impl RedbRecoveryStore {
         Ok(store)
     }
 
+    /// Opens a Kernel-route test store with the structural Kernel-route evidence.
+    ///
+    /// Test-only composition seam (issue #2031): binds
+    /// [`crate::test_support::KernelRouteEvidence`] so Kernel-route tests share
+    /// one evidence binding instead of vendoring their own. Production
+    /// composition keeps binding its own provider through
+    /// [`Self::open_with_evidence`]. Compiled only with the `test-support`
+    /// feature and never linked into production builds.
+    #[cfg(feature = "test-support")]
+    pub fn open_kernel_route_for_test(path: impl AsRef<Path>) -> Result<Self, OrsError> {
+        Self::open_with_evidence(path, Arc::new(crate::test_support::KernelRouteEvidence))
+    }
+
     fn initialize(&self) -> Result<(), OrsError> {
         let write = self.database.begin_write().map_err(storage)?;
         let table_names = write
@@ -7064,6 +7077,24 @@ impl OrsCoordinator<RedbRecoveryStore> {
             store: RedbRecoveryStore::open(path)?,
         })
     }
+
+    /// Opens one isolated Kernel-route coordinator fixture for tests (issue #2031).
+    ///
+    /// Test-only (compiled under `test-support`): creates a unique temp-root
+    /// `redb` file bound to the fixture accept-all evidence and returns the
+    /// coordinator plus its temp directory. The caller owns cleanup of the
+    /// returned directory; the store file itself is never shared between
+    /// fixtures, so no second evidence owner is minted. See
+    /// `crate::test_support::KernelOrsFixture` for the store-level equivalent.
+    #[cfg(feature = "test-support")]
+    pub fn open_kernel_fixture(label: &str) -> Result<(Self, std::path::PathBuf), OrsError> {
+        let dir = crate::test_support::kernel_fixture_dir(label)?;
+        let store = RedbRecoveryStore::open_with_evidence(
+            dir.join("ors.redb"),
+            std::sync::Arc::new(crate::test_support::AcceptAllCanonicalEvidence),
+        )?;
+        Ok((Self::new(store), dir))
+    }
 }
 
 impl<S: OperationalRecoveryStore> OrsCoordinator<S> {
@@ -8040,5 +8071,26 @@ mod capability_grant_identity_tests {
         drop(store);
         let _ = std::fs::remove_file(path);
         Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "test-support"))]
+mod kernel_fixture_coordinator_tests {
+    use super::OrsCoordinator;
+    use super::RedbRecoveryStore;
+
+    #[test]
+    fn coordinator_fixture_opens_empty_isolated_store() {
+        let (coordinator, dir) =
+            match OrsCoordinator::<RedbRecoveryStore>::open_kernel_fixture("2031-coordinator") {
+                Ok(opened) => opened,
+                Err(error) => panic!("2031 coordinator fixture must open: {error}"),
+            };
+        assert!(dir.exists());
+        match coordinator.store().list_open_unknown_commits() {
+            Ok(open) => assert!(open.is_empty()),
+            Err(error) => panic!("2031 coordinator fixture must list empty: {error}"),
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

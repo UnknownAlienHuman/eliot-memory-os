@@ -47,7 +47,12 @@ pub struct ReservationRequest {
 }
 
 impl ReservationRequest {
-    pub(crate) fn validate(&self) -> Result<(), OrsError> {
+    /// Checks the envelope, epoch binding, digest shape, scope set, and expiry.
+    ///
+    /// Public so test-usable Kernel-route fixtures and downstream proof harnesses
+    /// can validate a request with the exact owner check before staging.
+    /// Ordering authority itself is never granted here.
+    pub fn validate(&self) -> Result<(), OrsError> {
         self.envelope.validate()?;
         self.writer_epoch.validate()?;
         validate_digest(
@@ -114,7 +119,12 @@ pub enum ReservationState {
 }
 
 impl ReservationState {
-    pub(crate) const fn is_terminal(self) -> bool {
+    /// Reports whether the lifecycle state is terminal.
+    ///
+    /// Public so test-usable Kernel-route fixtures can assert drain/retention
+    /// without a second local definition of terminality. Terminal states never
+    /// become executable again.
+    pub const fn is_terminal(self) -> bool {
         matches!(self, Self::Finalized | Self::Released)
     }
 }
@@ -127,4 +137,19 @@ pub struct ReservationRecord {
     pub state: ReservationState,
     pub unknown_reason: Option<OpaqueLabel>,
     pub terminal_receipt_id: Option<OpaqueLabel>,
+}
+
+#[cfg(test)]
+mod reservation_terminal_tests {
+    use super::ReservationState;
+
+    #[test]
+    fn only_finalized_and_released_are_terminal() {
+        assert!(ReservationState::Finalized.is_terminal());
+        assert!(ReservationState::Released.is_terminal());
+        assert!(!ReservationState::Reserved.is_terminal());
+        assert!(!ReservationState::Eligible.is_terminal());
+        assert!(!ReservationState::Executing.is_terminal());
+        assert!(!ReservationState::Reconciling.is_terminal());
+    }
 }
