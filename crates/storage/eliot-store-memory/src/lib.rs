@@ -333,6 +333,10 @@ fn record_erasure_intent_state(
     state: &mut MemoryState,
     intent: StoreErasureIntent,
 ) -> Result<Vec<StoreSurfaceOutcome>, StoreError> {
+    // 688-B freezes the admitted intent before any surface dispatch. The
+    // registry is the single replay identity: byte-identical re-records
+    // return its current outcomes, while divergent content is an identity
+    // conflict rather than a replacement.
     if let Some(existing) = state.erasure_intents.get(intent.operation_id.as_str()) {
         if existing.intent == intent {
             return Ok(existing.outcomes.clone());
@@ -364,6 +368,8 @@ fn apply_erasure_state(
     state: &mut MemoryState,
     operation_id: &str,
 ) -> Result<Vec<StoreSurfaceOutcome>, StoreError> {
+    // 688-B sealed outcomes replay verbatim. Destructive work is reachable
+    // only after the intent exists and is still unsealed.
     // Replay: a sealed entry returns its original outcomes verbatim.
     if let Some(existing) = state.erasure_intents.get(operation_id)
         && existing.dispatched
@@ -1013,6 +1019,10 @@ impl MemoryStore {
         query: &NamedReadRequest,
     ) -> Result<NamedReadResponse, StoreError> {
         query.validate()?;
+        // 688-B keeps the memory reference contour aligned with the adapter:
+        // the generated named-read catalogue gates the evidence pack before
+        // state access, and evidence-backed erased pairs suppress exact
+        // `(scope_id, subject)` reads without guessing.
         // The older reads keep their legacy reference-contour behavior below.
         // 688-B: the pack handler also suppresses evidence-backed erased pairs
         // (see `evidence_pack_payload`); suppression never guesses.

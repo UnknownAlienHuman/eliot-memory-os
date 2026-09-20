@@ -203,6 +203,9 @@ pub(super) async fn write_transaction(
         current_revisions,
         current_orderings,
     )?;
+    // 688-B classifies provider replies after the atomic RPC: deterministic
+    // fence/head markers are conflicts, while an unavailable or unclassified
+    // reply remains an unknown outcome for identity-based reconciliation.
     let mut response = match send_transaction(db, config, &sql, bindings, lane).await {
         Ok(response) => response,
         Err(AdapterError::ProviderUnavailable) => {
