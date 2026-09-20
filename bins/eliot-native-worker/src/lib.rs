@@ -28,6 +28,11 @@ mod kernel_admission_client;
 /// would fork the types and void the proof.
 pub mod adapter_registry;
 
+/// Governed action envelope for declared external-adapter operations
+/// (issue #1911, A10.1/A10.2/A10.3/A10.8). Added here so the `tests/`
+/// contract proof addresses the identical gate the contour drives.
+pub mod governed_action;
+
 pub use dispatch_authority::{
     NativeWorkerDispatchAuthority, ValidatedDispatchGrant, now_unix_ms as dispatch_now_unix_ms,
 };
