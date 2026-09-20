@@ -1,0 +1,20 @@
+[package]
+name = "eliot-sim-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Pure deterministic simulation boundary: commands, events, state, seeded scheduler, fault injection, seed artifacts, mandatory scenarios"
+
+[package.metadata.eliot]
+work_id = "go39-1916"
+functional_cell = "sim-core"
+lifecycle_owner = "go39-1916"
+source_layer = "C1"
+proof_entrypoint = "cargo test -p eliot-sim-core"
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true
