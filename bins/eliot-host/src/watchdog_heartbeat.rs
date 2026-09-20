@@ -550,25 +550,49 @@ impl TransportDescriptorLock {
     ///
     /// # Errors
     ///
-    /// Returns an error when the lock file cannot be opened or the
-    /// exclusive lock cannot be acquired in the bounded window. Rotation
-    /// never proceeds unlocked.
+    /// Returns an error when the lock file cannot be opened, repaired, or
+    /// contour-verified, or the exclusive lock cannot be acquired in the
+    /// bounded window. Rotation never proceeds unlocked.
     fn acquire(host_state_root: &Path) -> Result<Self, HostError> {
+        Self::acquire_with_budget(
+            host_state_root,
+            TRANSPORT_LOCK_ATTEMPTS,
+            TRANSPORT_LOCK_RETRY_WAIT_MS,
+        )
+    }
+
+    /// Acquires the exclusive descriptor lock with an explicit attempt
+    /// budget, retrying contention for the bounded window before failing
+    /// closed. Production rotations pass [`TRANSPORT_LOCK_ATTEMPTS`] by
+    /// [`TRANSPORT_LOCK_RETRY_WAIT_MS`]; tests pass their own visible
+    /// budget so the contention proof never waits on the production
+    /// two-second window.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the lock file cannot be opened, repaired, or
+    /// contour-verified, or the exclusive lock cannot be acquired in the
+    /// bounded window. Rotation never proceeds unlocked.
+    fn acquire_with_budget(
+        host_state_root: &Path,
+        attempts: u32,
+        wait_ms: u64,
+    ) -> Result<Self, HostError> {
         // The crate forbids unsafe, so the OS primitive is reached through
         // the safe std wrapper: File::try_lock issues an exclusive
         // non-blocking LockFileEx on this handle. No rotation proceeds
         // without holding it.
         let lock_path = host_state_root.join(TRANSPORT_LOCK_FILE_NAME);
         let mut last_error = String::from("lock was never attempted");
-        for attempt in 0..TRANSPORT_LOCK_ATTEMPTS {
+        for attempt in 0..attempts {
             match Self::try_acquire_once(&lock_path) {
                 Ok(guard) => return Ok(guard),
                 Err(error) => {
                     last_error = error;
-                    if attempt + 1 >= TRANSPORT_LOCK_ATTEMPTS {
+                    if attempt + 1 >= attempts {
                         break;
                     }
-                    std::thread::sleep(Duration::from_millis(TRANSPORT_LOCK_RETRY_WAIT_MS));
+                    std::thread::sleep(Duration::from_millis(wait_ms));
                 }
             }
         }
@@ -577,17 +601,85 @@ impl TransportDescriptorLock {
         )))
     }
 
-    /// Opens the sibling lock file and takes the exclusive OS lock once,
-    /// returning the held guard. Any failure (open contention or lock
-    /// contention) reports a detail string for the bounded retry loop.
+    /// Opens the sibling lock file, enforces and verifies its contour, and
+    /// takes the exclusive OS lock once, returning the held guard. Any
+    /// failure (open, contour, or lock contention) reports a detail string
+    /// for the bounded retry loop.
+    ///
+    /// The lock file carries the same owner-plus-DACL contour as the
+    /// descriptor it guards: an unowned mutex proves no mutual exclusion.
+    /// A freshly created file inherits its contour from the parent, so the
+    /// first acquire enforces it; a noncompliant file takes the
+    /// deterministic repair path below instead of being trusted.
     fn try_acquire_once(lock_path: &Path) -> Result<Self, String> {
-        let file = std::fs::OpenOptions::new()
+        let file = match Self::open_lock_file(lock_path) {
+            Ok(file) => file,
+            Err(open_error) => {
+                // Unopenable lock file, same fail-closed direction as the
+                // descriptor rotation: it cannot prove exclusive Host
+                // ownership, so repair (remove, recreate, enforce, verify)
+                // and retry the open once inside this attempt.
+                Self::repair_lock_file(lock_path).map_err(|repair_error| {
+                    format!("{open_error}; lock repair failed: {repair_error}")
+                })?;
+                Self::open_lock_file(lock_path)?
+            }
+        };
+        if eliot_windows_ipc::verify_file_owner_and_dacl(lock_path).is_err() {
+            // Contour-noncompliant lock file: never trust it, never silently
+            // keep it. Drop the handle, repair through the same
+            // remove-recreate-enforce-verify path, then re-open and re-verify
+            // before the exclusive lock is taken.
+            drop(file);
+            Self::repair_lock_file(lock_path)?;
+            let file = Self::open_lock_file(lock_path)?;
+            eliot_windows_ipc::verify_file_owner_and_dacl(lock_path).map_err(|error| {
+                format!("lock contour is not intact after repair: {error}")
+            })?;
+            return Self::take_exclusive(file);
+        }
+        Self::take_exclusive(file)
+    }
+
+    /// Opens (creating) the sibling lock file without trusting it. The
+    /// caller enforces the contour before the exclusive lock is taken.
+    fn open_lock_file(lock_path: &Path) -> Result<std::fs::File, String> {
+        std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .open(lock_path)
-            .map_err(|error| format!("lock open failed: {error}"))?;
+            .map_err(|error| format!("lock open failed: {error}"))
+    }
+
+    /// Deterministically repairs an unopenable or contour-noncompliant lock
+    /// file: remove the stale file, recreate it, enforce the
+    /// current-user-plus-System contour, and verify it back. This mirrors
+    /// the descriptor rotation (`atomic_replace_transport_file` plus
+    /// `verify_transport_file`): rotation, never silent retention.
+    ///
+    /// The repair removes files only, never directories: a directory at the
+    /// lock path fails closed instead of deleting user data. A repair that
+    /// races a live holder fails on remove or on the exclusive lock, so the
+    /// bounded retry either acquires a verified contour or fails closed.
+    fn repair_lock_file(lock_path: &Path) -> Result<(), String> {
+        match std::fs::remove_file(lock_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("lock repair remove failed: {error}")),
+        }
+        drop(Self::open_lock_file(lock_path)?);
+        eliot_windows_ipc::restrict_file_to_current_user_and_system(lock_path)
+            .map_err(|error| format!("lock contour enforcement failed: {error}"))?;
+        eliot_windows_ipc::verify_file_owner_and_dacl(lock_path)
+            .map_err(|error| format!("lock contour verification failed: {error}"))?;
+        Ok(())
+    }
+
+    /// Takes the exclusive OS lock on a contour-verified handle, returning
+    /// the held guard.
+    fn take_exclusive(file: std::fs::File) -> Result<Self, String> {
         file.try_lock()
             .map_err(|error| format!("exclusive lock failed: {error}"))?;
         Ok(Self { file })
@@ -1795,6 +1887,29 @@ mod tests {
         }
     }
 
+    /// Test-visible lock budget for the contention proof: production
+    /// rotations retry [`TRANSPORT_LOCK_ATTEMPTS`] by
+    /// [`TRANSPORT_LOCK_RETRY_WAIT_MS`] (near two seconds), while this proof
+    /// only needs to observe one failed acquisition plus one success.
+    const CONTENTION_ATTEMPTS: u32 = 8;
+    const CONTENTION_WAIT_MS: u64 = 5;
+
+    /// Test-only bind that acquires the descriptor lock with the visible
+    /// [`CONTENTION_ATTEMPTS`]-by-[`CONTENTION_WAIT_MS`] budget instead of
+    /// the production window, then runs the same locked bind rotation.
+    fn bind_incarnation_with_budget(
+        dir: &Path,
+        pid: u32,
+        start: u64,
+    ) -> Result<PathBuf, HostError> {
+        let _lock = TransportDescriptorLock::acquire_with_budget(
+            dir,
+            CONTENTION_ATTEMPTS,
+            CONTENTION_WAIT_MS,
+        )?;
+        HeartbeatTransportDescriptor::bind_incarnation_locked(dir, pid, start)
+    }
+
     #[test]
     fn issue_publish_load_round_trip() {
         let dir = test_dir();
@@ -2281,7 +2396,7 @@ mod tests {
         let issued = test_descriptor();
         issued.publish(&dir).unwrap_or_else(|_| panic!("descriptor must publish"));
         let barrier = Arc::new(Barrier::new(WRITERS));
-        let winners: Vec<(u32, u64)> = std::thread::scope(|scope| {
+        let outcomes: Vec<Result<(u32, u64), String>> = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..WRITERS)
                 .map(|index| {
                     let barrier = Arc::clone(&barrier);
@@ -2293,23 +2408,36 @@ mod tests {
                             .wrapping_add(1000);
                         let start = index as u64 + 5000;
                         match HeartbeatTransportDescriptor::bind_incarnation(&dir, pid, start) {
-                            Ok(_) => Some((pid, start)),
-                            Err(_) => None,
+                            Ok(_) => Ok((pid, start)),
+                            Err(error) => Err(format!("{error:?}")),
                         }
                     })
                 })
                 .collect();
             handles
                 .into_iter()
-                .filter_map(|handle| {
-                    handle.join().unwrap_or_else(|_| panic!("writer must join"))
-                })
+                .map(|handle| handle.join().unwrap_or_else(|_| panic!("writer must join")))
                 .collect()
         });
         // Serialization means exactly one binder observes unbound and wins;
-        // every other concurrent attempt fails closed on the already-bound
-        // conflict instead of clobbering the winner.
+        // every other concurrent attempt fails closed on the exact
+        // already-bound conflict instead of clobbering the winner.
+        let mut winners = Vec::new();
+        let mut losers = 0_usize;
+        for outcome in outcomes {
+            match outcome {
+                Ok(binding) => winners.push(binding),
+                Err(detail) => {
+                    assert!(
+                        detail.contains(ALREADY_BOUND_CONFLICT),
+                        "concurrent bind loser must fail on the already-bound conflict, got: {detail}"
+                    );
+                    losers += 1;
+                }
+            }
+        }
         assert_eq!(winners.len(), 1, "exactly one concurrent bind must win");
+        assert_eq!(losers, WRITERS - 1, "every other concurrent bind must lose closed");
         let (pid, start) = winners
             .into_iter()
             .next()
@@ -2365,19 +2493,25 @@ mod tests {
                 .collect()
         });
         // Serialization means every concurrent publisher completes and the
-        // durable file equals exactly one of them: no torn write, no
-        // half-published mix of two challenges, no staging leak.
+        // durable file equals any one of the eight publishers (any-of-eight
+        // durable equality): no torn write, no half-published mix of two
+        // challenges, no staging leak. The match is exactly one: every
+        // publisher mints a distinct challenge, so the stored bytes prove a
+        // single winner rather than a blend of two publishers.
         let stored = HeartbeatTransportDescriptor::load(&dir)
             .unwrap_or_else(|_| panic!("descriptor must load"))
             .unwrap_or_else(|| panic!("descriptor must be present"));
-        let matched = published.iter().any(|candidate| {
-            candidate.host_challenge_nonce == stored.host_challenge_nonce
-                && candidate.service_instance_guid == stored.service_instance_guid
-                && candidate.pipe_name == stored.pipe_name
-        });
-        assert!(
-            matched,
-            "stored descriptor must equal one concurrent publisher"
+        let matched = published
+            .iter()
+            .filter(|candidate| {
+                candidate.host_challenge_nonce == stored.host_challenge_nonce
+                    && candidate.service_instance_guid == stored.service_instance_guid
+                    && candidate.pipe_name == stored.pipe_name
+            })
+            .count();
+        assert_eq!(
+            matched, 1,
+            "stored descriptor must equal exactly one of the eight concurrent publishers"
         );
         let staged: Vec<_> = std::fs::read_dir(&dir)
             .unwrap_or_else(|_| panic!("test dir must list"))
@@ -2401,6 +2535,9 @@ mod tests {
         issued.publish(&dir).unwrap_or_else(|_| panic!("descriptor must publish"));
         // Hold the sibling lock file's exclusive OS lock on a second handle:
         // a rotation that proceeded unlocked would silently clobber here.
+        // The contended bind runs on the test-visible CONTENTION_ATTEMPTS by
+        // CONTENTION_WAIT_MS budget, not the production 80-by-25ms window:
+        // the proof only needs one failed acquisition plus one success.
         let lock_path = dir.join(TRANSPORT_LOCK_FILE_NAME);
         let holder = std::fs::OpenOptions::new()
             .read(true)
@@ -2412,9 +2549,8 @@ mod tests {
         holder
             .try_lock()
             .unwrap_or_else(|_| panic!("external lock must hold"));
-        let error = match HeartbeatTransportDescriptor::bind_incarnation(&dir, 4321, 8765) {
-            Ok(_) => panic!("bind must fail closed while the lock is held elsewhere"),
-            Err(error) => error,
+        let Err(error) = bind_incarnation_with_budget(&dir, 4321, 8765) else {
+            panic!("bind must fail closed while the lock is held elsewhere")
         };
         let detail = format!("{error:?}");
         assert!(
@@ -2463,6 +2599,36 @@ mod tests {
         assert_eq!(rotated.host_challenge_nonce, fresh.host_challenge_nonce);
         eliot_windows_ipc::verify_file_owner_and_dacl(&path)
             .unwrap_or_else(|_| panic!("replacement must carry the contour"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lock_file_contour_violation_repairs_on_acquire() {
+        let dir = test_dir();
+        std::fs::create_dir_all(&dir).unwrap_or_else(|_| panic!("test dir must build"));
+        // Plant a contour-violating lock file: raw bytes with the inherited
+        // DACL prove nothing about exclusive Host ownership, so the next
+        // acquire must repair it, never trust it.
+        let lock_path = dir.join(TRANSPORT_LOCK_FILE_NAME);
+        std::fs::write(&lock_path, b"stale lock bytes")
+            .unwrap_or_else(|_| panic!("stale lock file must write"));
+        assert!(
+            eliot_windows_ipc::verify_file_owner_and_dacl(&lock_path).is_err(),
+            "raw-written lock file must miss the contour"
+        );
+        // The rotation repairs the lock file through the deterministic
+        // remove-recreate-enforce-verify path and publishes under the held
+        // guard: the descriptor and the lock file both carry the contour.
+        let issued = test_descriptor();
+        issued
+            .publish(&dir)
+            .unwrap_or_else(|_| panic!("publish must repair the lock file"));
+        eliot_windows_ipc::verify_file_owner_and_dacl(&lock_path)
+            .unwrap_or_else(|_| panic!("repaired lock file must carry the contour"));
+        let stored = HeartbeatTransportDescriptor::load(&dir)
+            .unwrap_or_else(|_| panic!("descriptor must load"))
+            .unwrap_or_else(|| panic!("descriptor must be present"));
+        assert_eq!(stored.host_challenge_nonce, issued.host_challenge_nonce);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
