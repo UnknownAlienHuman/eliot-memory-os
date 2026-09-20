@@ -2,11 +2,11 @@
 
 use eliot_contracts::RequestId;
 use eliot_store_api::{
-    MAX_STORE_FAILURE_EVIDENCE_HANDLES, OperationId,
+    LegacyStoreFailureV1, MAX_STORE_FAILURE_EVIDENCE_HANDLES, OperationId,
     StoreConflictObservation, StoreError, StoreEvidenceHandles, StoreFailure,
     StoreFailureContractError, StoreFailureDisposition, StoreFailureIdentityContext,
     StoreMutationDisposition, StoreReasonCode, StoreRecoveryAction, StoreResponse,
-    StoreRetryDirective, decode_response_frame, response_frame,
+    StoreRetryDirective, decode_legacy_store_failure_v1, decode_response_frame, response_frame,
 };
 
 fn context() -> StoreFailureIdentityContext {
@@ -112,9 +112,47 @@ fn unknown_outcome_requires_exact_identity_and_reconciliation() {
     );
 }
 
+#[test]
+fn legacy_unknown_and_error_remain_compatible_without_text_parsing() {
+    let unknown_value = serde_json::json!({
+        "status": "unknown",
+        "operation_id": "legacy-operation",
+        "reason": "provider response was interrupted"
+    });
+    let failure = decode_legacy_store_failure_v1(&unknown_value, &context()).unwrap();
+    assert_eq!(failure.reason_code.as_str(), "PROVIDER_OUTCOME_UNKNOWN");
+    assert_eq!(failure.disposition, StoreFailureDisposition::UnknownOutcome);
+
+    let error_value = serde_json::json!({
+        "status": "error",
+        "error": "provider is unavailable but this is only human detail"
+    });
+    let error = decode_legacy_store_failure_v1(&error_value, &context()).unwrap();
+    assert_eq!(error.disposition, StoreFailureDisposition::InternalDefect);
+    let mut unavailable_context = context();
+    unavailable_context.transport_unavailable = true;
+    let unavailable = decode_legacy_store_failure_v1(&error_value, &unavailable_context).unwrap();
+    assert_eq!(
+        unavailable.disposition,
+        StoreFailureDisposition::Unavailable
+    );
+}
 
 #[test]
-fn typed_failure_frame_remains_decodable() {
+fn legacy_store_response_variants_and_v2_frame_remain_decodable() {
+    let error: StoreResponse = serde_json::from_value(serde_json::json!({
+        "status": "error", "error": "legacy failure"
+    }))
+    .unwrap();
+    let unknown: StoreResponse = serde_json::from_value(serde_json::json!({
+        "status": "unknown", "operation_id": "operation-1", "reason": "legacy unknown"
+    }))
+    .unwrap();
+    assert!(matches!(error, StoreResponse::Error { .. }));
+    assert!(matches!(unknown, StoreResponse::Unknown { .. }));
+    error.validate().unwrap();
+    unknown.validate().unwrap();
+
     let response = StoreResponse::Failure {
         failure: StoreFailure::from_store_error(StoreError::Unavailable, context()).unwrap(),
     };
@@ -135,7 +173,26 @@ fn typed_failure_frame_remains_decodable() {
     assert!(matches!(decoded, StoreResponse::Failure { .. }));
 }
 
+#[test]
+fn legacy_enum_rejects_unknown_fields() {
+    let value = serde_json::json!({
+        "status": "error",
+        "error": "legacy failure",
+        "future": true
+    });
+    assert!(serde_json::from_value::<LegacyStoreFailureV1>(value).is_err());
+}
 
+#[test]
+fn legacy_wire_detail_is_bounded_before_ebp_crossing() {
+    let oversized = "x".repeat(eliot_store_api::MAX_STORE_FAILURE_DETAIL_LEN + 1);
+    let error: StoreResponse = serde_json::from_value(serde_json::json!({
+        "status": "error",
+        "error": oversized
+    }))
+    .unwrap();
+    assert!(error.validate().is_err());
+}
 
 #[test]
 fn semantic_digest_is_stable_under_human_rewording() {

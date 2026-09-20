@@ -28,21 +28,34 @@ use eliot_contracts::ProductId;
 use eliot_contracts::RequestId;
 use eliot_contracts::SourceId;
 use eliot_ipc::DeliveryOutcome;
+use eliot_protocol::ProtocolVersion;
 use eliot_protocol::RequestIdentity;
 use eliot_receipts::RequestBinding;
+use eliot_store_api::LegacyStoreFailureV1;
 use eliot_store_api::OperationId;
 use eliot_store_api::RequestMeta;
 use eliot_store_api::StoreError;
 use eliot_store_api::StoreFailure;
 use eliot_store_api::StoreFailureDisposition;
+use eliot_store_api::StoreFailureIdentityContext;
 use eliot_store_api::StoreMutationDisposition;
 use eliot_store_api::StoreRequest;
 use eliot_store_api::StoreResponse;
 use eliot_store_api::WriteReceipt;
+use eliot_store_api::decode_legacy_store_failure_v1;
 
 use super::EbpCanonicalStoreClient;
 use super::EbpStoreTransport;
 use super::StoreClientError;
+
+/// Minimum admitted EBP session version whose store contract carries typed
+/// failures. This client admits only `ProtocolVersion::CURRENT` sessions (see
+/// the `decode_server_hello` pinning in `store_client.rs`), and current
+/// sessions carry typed `StoreResponse::Failure` payloads, so legacy v1
+/// string shapes stay on the defect path today. The constant keeps the
+/// version gate explicit: any future admitted older session takes the single
+/// conservative decode path instead of a prose collapse.
+const TYPED_FAILURE_MIN_PROTOCOL: ProtocolVersion = ProtocolVersion::CURRENT;
 
 #[derive(Debug)]
 pub(super) enum RequestFailure {
@@ -313,11 +326,74 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
             StoreResponse::Failure { failure } => {
                 Err(self.bind_failure(failure, request_id, admitted_operation, idempotency_key))
             }
-            // The peer's untyped prose and its operation identity are never adopted:
-            // an admitted write keeps the unknown outcome for the admitted operation and
-            // a read stays fail-closed.
-            StoreResponse::Unknown { .. } => Err(failure_defect(admitted_operation)),
+            // Legacy v1 string shapes decode only through the single versioned
+            // compatibility path. On a current typed-failure session they are
+            // protocol defects: peer prose is discarded and peer operation
+            // identity is never adopted. Older declared sessions decode
+            // conservatively through the typed contract and still pass
+            // `bind_failure` pinning before adoption.
+            StoreResponse::Error { error } => Err(self.decode_legacy_compat(
+                &LegacyStoreFailureV1::Error { error },
+                request_id,
+                admitted_operation,
+                idempotency_key,
+            )),
+            StoreResponse::Unknown {
+                operation_id,
+                reason,
+            } => Err(self.decode_legacy_compat(
+                &LegacyStoreFailureV1::Unknown {
+                    operation_id,
+                    reason,
+                },
+                request_id,
+                admitted_operation,
+                idempotency_key,
+            )),
             response => Ok(response),
+        }
+    }
+
+    /// Sole versioned compatibility decoder for legacy v1 string failure
+    /// shapes. This is the only live caller of
+    /// `decode_legacy_store_failure_v1`: legacy `Error`/`Unknown` variants
+    /// decode through the typed failure contract ONLY when the admitted
+    /// session declares a protocol version older than
+    /// `TYPED_FAILURE_MIN_PROTOCOL`. On current sessions they are protocol
+    /// defects, so an admitted write keeps its unknown outcome for the
+    /// admitted operation and a read stays fail-closed, with peer prose
+    /// discarded and peer operation identity never adopted. Pre-floor
+    /// sessions decode conservatively: every identity comes from the admitted
+    /// call, `transport_unavailable` is always false because this frame
+    /// arrived intact (availability is an observation, never inferred from
+    /// prose), legacy detail survives only as bounded `human_detail`, and the
+    /// decoded failure still passes `bind_failure` pinning before adoption.
+    fn decode_legacy_compat(
+        &self,
+        legacy: &LegacyStoreFailureV1,
+        request_id: &RequestId,
+        admitted_operation: Option<&OperationId>,
+        idempotency_key: &str,
+    ) -> RequestFailure {
+        if self.protocol_version >= TYPED_FAILURE_MIN_PROTOCOL {
+            return failure_defect(admitted_operation);
+        }
+        let context = StoreFailureIdentityContext {
+            request_id: Some(request_id.clone()),
+            operation_id: admitted_operation.cloned(),
+            idempotency_key_ref_or_digest: Some(idempotency_key.to_owned()),
+            state_fence_ref_or_exact_safe_projection: Some(self.requirement.state_fence.clone()),
+            evidence_ref: None,
+            transport_unavailable: false,
+        };
+        let Ok(legacy_value) = serde_json::to_value(legacy) else {
+            return failure_defect(admitted_operation);
+        };
+        match decode_legacy_store_failure_v1(&legacy_value, &context) {
+            Ok(failure) => {
+                self.bind_failure(failure, request_id, admitted_operation, idempotency_key)
+            }
+            Err(_) => failure_defect(admitted_operation),
         }
     }
 
