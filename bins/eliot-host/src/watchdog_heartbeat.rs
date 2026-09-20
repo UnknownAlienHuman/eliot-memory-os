@@ -282,22 +282,10 @@ impl HeartbeatTransportDescriptor {
     /// Returns an error when this descriptor is not canonical or the
     /// atomic publish or its readback proof fails.
     ///
-    /// The replace plus verified reload holds the cross-process descriptor
-    /// lock; contention fails closed, never unlocked.
-    fn publish_force(&self, host_state_root: &Path) -> Result<PathBuf, HostError> {
-        let _lock = TransportDescriptorLock::acquire(host_state_root)?;
-        self.publish_force_locked(host_state_root)
-    }
-
-    /// Locked half of `publish_force`: the caller already holds the
-    /// descriptor lock across the replace plus verified reload, so this
-    /// never acquires (exclusive byte locks are not reentrant across
-    /// handles of one process).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when this descriptor is not canonical or the
-    /// atomic publish or its readback proof fails.
+    /// The caller holds the cross-process descriptor lock across the
+    /// replace plus verified reload (exclusive OS byte locks are not
+    /// reentrant across handles of one process, so this never acquires);
+    /// contention fails closed before reaching this point, never unlocked.
     fn publish_force_locked(&self, host_state_root: &Path) -> Result<PathBuf, HostError> {
         self.validate().map_err(|error| match error {
             HostError::Platform(detail) => HostError::RecoveryRequired(detail),
@@ -2346,6 +2334,111 @@ mod tests {
             })
             .collect();
         assert!(staged.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_publish_serializes_under_lock() {
+        use std::sync::{Arc, Barrier};
+        const WRITERS: usize = 8;
+        let dir = test_dir();
+        std::fs::create_dir_all(&dir).unwrap_or_else(|_| panic!("test dir must build"));
+        let barrier = Arc::new(Barrier::new(WRITERS));
+        let published: Vec<HeartbeatTransportDescriptor> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..WRITERS)
+                .map(|_| {
+                    let barrier = Arc::clone(&barrier);
+                    let dir = dir.clone();
+                    scope.spawn(move || {
+                        let _ = barrier.wait();
+                        let descriptor = test_descriptor();
+                        descriptor
+                            .publish(&dir)
+                            .unwrap_or_else(|_| panic!("concurrent publish must succeed"));
+                        descriptor
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap_or_else(|_| panic!("writer must join")))
+                .collect()
+        });
+        // Serialization means every concurrent publisher completes and the
+        // durable file equals exactly one of them: no torn write, no
+        // half-published mix of two challenges, no staging leak.
+        let stored = HeartbeatTransportDescriptor::load(&dir)
+            .unwrap_or_else(|_| panic!("descriptor must load"))
+            .unwrap_or_else(|| panic!("descriptor must be present"));
+        let matched = published.iter().any(|candidate| {
+            candidate.host_challenge_nonce == stored.host_challenge_nonce
+                && candidate.service_instance_guid == stored.service_instance_guid
+                && candidate.pipe_name == stored.pipe_name
+        });
+        assert!(
+            matched,
+            "stored descriptor must equal one concurrent publisher"
+        );
+        let staged: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|_| panic!("test dir must list"))
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.contains(".tmp-"))
+            })
+            .collect();
+        assert!(staged.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lock_contention_fails_closed_never_unlocked() {
+        let dir = test_dir();
+        std::fs::create_dir_all(&dir).unwrap_or_else(|_| panic!("test dir must build"));
+        let issued = test_descriptor();
+        issued.publish(&dir).unwrap_or_else(|_| panic!("descriptor must publish"));
+        // Hold the sibling lock file's exclusive OS lock on a second handle:
+        // a rotation that proceeded unlocked would silently clobber here.
+        let lock_path = dir.join(TRANSPORT_LOCK_FILE_NAME);
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap_or_else(|_| panic!("lock file must open"));
+        holder
+            .try_lock()
+            .unwrap_or_else(|_| panic!("external lock must hold"));
+        let error = match HeartbeatTransportDescriptor::bind_incarnation(&dir, 4321, 8765) {
+            Ok(_) => panic!("bind must fail closed while the lock is held elsewhere"),
+            Err(error) => error,
+        };
+        let detail = format!("{error:?}");
+        assert!(
+            detail.contains("lock contention"),
+            "contention must fail closed, got: {detail}"
+        );
+        // The failed rotation must not have touched the descriptor.
+        let current = HeartbeatTransportDescriptor::load(&dir)
+            .unwrap_or_else(|_| panic!("descriptor must load"))
+            .unwrap_or_else(|| panic!("descriptor must be present"));
+        assert!(!current.is_bound());
+        assert_eq!(current.host_challenge_nonce, issued.host_challenge_nonce);
+        // Releasing the external guard lets the same rotation proceed.
+        holder
+            .unlock()
+            .unwrap_or_else(|_| panic!("external lock must release"));
+        drop(holder);
+        HeartbeatTransportDescriptor::bind_incarnation(&dir, 4321, 8765)
+            .unwrap_or_else(|_| panic!("bind must succeed after lock release"));
+        let bound = HeartbeatTransportDescriptor::load(&dir)
+            .unwrap_or_else(|_| panic!("descriptor must load"))
+            .unwrap_or_else(|| panic!("descriptor must be present"));
+        assert_eq!(bound.watchdog_incarnation_pid, 4321);
+        assert_eq!(bound.watchdog_incarnation_start_100ns, 8765);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
