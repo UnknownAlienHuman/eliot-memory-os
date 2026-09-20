@@ -17,6 +17,9 @@ use eliot_skills::RegistrationIdentity;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod catalogue;
+pub use catalogue::*;
+
 pub const CONTRACT_NAME: &str = "eliot.governor.skill";
 pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);
 
