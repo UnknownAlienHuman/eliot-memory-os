@@ -105,6 +105,7 @@ pub use protocol::{
 };
 pub use store_client::{
     EbpCanonicalStoreClient, EbpStoreTransport, StoreClientError, StoreClientFault,
+    StoreClientFaultHarness,
 };
 #[cfg(windows)]
 pub use store_gateway::KernelStoreGateway;
