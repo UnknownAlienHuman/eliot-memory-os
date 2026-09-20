@@ -187,6 +187,18 @@ members = [
 # from `exclude` to `members`. Self-quality (#820) was a standalone
 # nonmember and joins `members` directly; it was never in `exclude`.
 # Leaves never self-promote. See I2.3 and I2.11.
+#
+# Supply-chain blind-spot rule (#1811): crates carrying their own `[workspace]`
+# table are outside `members`/`exclude` and invisible to workspace-wide cargo
+# and the root Cargo.lock. Each one has a checked-in disposition verb
+# (KEEP/WRAP/EXTRACT/REWORK/REPLACE/RETIRE/UNKNOWN) plus named owner in
+# workstreams/security/standalone-crate-dispositions.toml. Any build or release
+# consumption of an inventoried package without provenance, lock, toolchain,
+# license, and SBOM evidence is rejected by
+# scripts/verify-excluded-dispositions-1811.py (release: Test-ExcludedDispositions
+# in scripts/build-eliot-windows-x64-release.ps1). A future `exclude` entry
+# without a matching disposition row is an undeclared excluded input and fails
+# the same gate.
 exclude = []
 default-members = [
   "bins/eliot",

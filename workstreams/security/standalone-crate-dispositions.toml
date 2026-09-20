@@ -1,4 +1,20 @@
-# Standalone-workspace crate disposition and owner inventory (issue #1811, slice 1).
+# Standalone-workspace crate disposition and owner inventory (issue #1811, slices 1-2).
+#
+# Slice 2 (go15) adds a checked-in supply-chain disposition verb plus explicit
+# owner per package. Allowed verbs: KEEP, WRAP, EXTRACT, REWORK, REPLACE,
+# RETIRE, UNKNOWN. Semantics follow docs/DEPENDENCY_POLICY.md preference order
+# (WRAP = thin typed adapter over an admitted native owner; EXTRACT = role
+# separation boundary; REWORK = prototype needing implementation+proof before
+# any admission; REPLACE/RETIRE = do not promote; UNKNOWN = fail-closed
+# placeholder, never a promotion claim; KEEP = retain standalone with owner).
+# No row confers workspace, runtime, state, authority, or production support
+# admission. Release/build consumption of any inventoried package without
+# provenance, lock, toolchain, license, and SBOM evidence is rejected by
+# scripts/verify-excluded-dispositions-1811.py, wired into
+# scripts/build-eliot-windows-x64-release.ps1 (Test-ExcludedDispositions).
+# Root Cargo.toml workspace `exclude` stays empty at this base; any future
+# `exclude` entry without a matching disposition row is an undeclared excluded
+# input and fails the same gate.
 #
 # Scope: checked-in disposition + named owner per standalone-workspace package
 # crate. A standalone-workspace crate carries its own `[workspace]` table and is
@@ -38,12 +54,16 @@ schema = "eliot.standalone-crate-dispositions.v1"
 issue = 1811
 base_sha = "f74c20e5652b12beabe60dc19f57ed197646a781"
 discovery = "python scripts/verify-standalone-crates.py --root . --list"
+gate = "python scripts/verify-excluded-dispositions-1811.py --root ."
 root_exclude_at_base = []
 standalone_package_count = 11
+allowed_dispositions = ["KEEP", "WRAP", "EXTRACT", "REWORK", "REPLACE", "RETIRE", "UNKNOWN"]
 
 [[crate]]
 path = "crates/foundation/eliot-memory-projection-contracts"
 package = "eliot-memory-projection-contracts"
+disposition = "REWORK"
+owner = "foundation.memory.projection-contracts"
 standalone = "own [workspace] table; absent from root members and root exclude"
 prototype = true
 source_status = "IMPLEMENTED_PROTOTYPE"
@@ -60,6 +80,8 @@ remainder = "SBOM, per-crate lock/provenance evidence, and release gating are RE
 [[crate]]
 path = "crates/governor/eliot-memory-projection-provider"
 package = "eliot-memory-projection-provider"
+disposition = "REWORK"
+owner = "governor.memory.projection-provider"
 standalone = "own [workspace] table; absent from root members and root exclude"
 prototype = true
 source_status = "IMPLEMENTED_PROTOTYPE"
@@ -76,6 +98,8 @@ remainder = "SBOM, per-crate lock/provenance evidence, and release gating are RE
 [[crate]]
 path = "crates/research/eliot-dreamer-source-assurance"
 package = "eliot-dreamer-source-assurance"
+disposition = "EXTRACT"
+owner = "research.source-assurance-role-separation (#692 cell)"
 standalone = "own [workspace] table; absent from root members and root exclude"
 prototype = true
 source_status = "IMPLEMENTED"
@@ -90,6 +114,8 @@ remainder = "SBOM, per-crate lock/provenance evidence, and release gating are RE
 [[crate]]
 path = "crates/smart/eliot-context-compiler-wasm"
 package = "eliot-context-compiler-wasm"
+disposition = "WRAP"
+owner = "smart.context.compiler-wasm"
 standalone = "own [workspace] table; absent from root members and root exclude"
 prototype = true
 source_status = "IMPLEMENTED"
@@ -107,6 +133,8 @@ remainder = "SBOM, per-crate lock/provenance evidence, and release gating are RE
 [[crate]]
 path = "crates/smart/eliot-cue-activation-wasm"
 package = "eliot-cue-activation-wasm"
+disposition = "WRAP"
+owner = "smart.cue.activation-wasm"
 standalone = "own [workspace] table; absent from root members and root exclude"
 prototype = true
 source_status = "IMPLEMENTED"
@@ -124,6 +152,8 @@ remainder = "SBOM, per-crate lock/provenance evidence, and release gating are RE
 [[crate]]
 path = "crates/smart/eliot-dreamer-curation-wasm"
 package = "eliot-dreamer-curation-wasm"
+disposition = "WRAP"
+owner = "smart.dreamer.curation-wasm"
 standalone = "own [workspace] table; absent from root members and root exclude"
 prototype = true
 source_status = "IMPLEMENTED"
@@ -141,6 +171,8 @@ remainder = "SBOM, per-crate lock/provenance evidence, and release gating are RE
 [[crate]]
 path = "crates/smart/eliot-dreamer-cycle-wasm"
 package = "eliot-dreamer-cycle-wasm"
+disposition = "WRAP"
+owner = "smart.dreamer.cycle-wasm"
 standalone = "own [workspace] table; absent from root members and root exclude"
 prototype = true
 source_status = "IMPLEMENTED"
@@ -158,6 +190,8 @@ remainder = "SBOM, per-crate lock/provenance evidence, and release gating are RE
 [[crate]]
 path = "crates/smart/eliot-dreamer-orientation-wasm"
 package = "eliot-dreamer-orientation-wasm"
+disposition = "WRAP"
+owner = "smart.dreamer.orientation-wasm"
 standalone = "own [workspace] table; absent from root members and root exclude"
 prototype = true
 source_status = "IMPLEMENTED"
@@ -175,6 +209,8 @@ remainder = "SBOM, per-crate lock/provenance evidence, and release gating are RE
 [[crate]]
 path = "crates/smart/eliot-dreamer-research-wasm"
 package = "eliot-dreamer-research-wasm"
+disposition = "WRAP"
+owner = "smart.dreamer.research-wasm"
 standalone = "own [workspace] table; absent from root members and root exclude"
 prototype = true
 source_status = "IMPLEMENTED"
@@ -192,6 +228,8 @@ remainder = "SBOM, per-crate lock/provenance evidence, and release gating are RE
 [[crate]]
 path = "crates/smart/eliot-memory-applicability"
 package = "eliot-memory-applicability"
+disposition = "REWORK"
+owner = "smart.memory.applicability"
 standalone = "own [workspace] table; absent from root members and root exclude"
 prototype = true
 source_status = "IMPLEMENTED_PROTOTYPE"
@@ -209,6 +247,8 @@ remainder = "SBOM, per-crate lock/provenance evidence, and release gating are RE
 [[crate]]
 path = "crates/smart/eliot-memory-curation-screen-wasm"
 package = "eliot-memory-curation-screen-wasm"
+disposition = "WRAP"
+owner = "smart.memory.curation-screen-wasm"
 standalone = "own [workspace] table; absent from root members and root exclude"
 prototype = true
 source_status = "IMPLEMENTED"
