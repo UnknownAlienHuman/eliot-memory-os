@@ -22,6 +22,13 @@ use crate::{SERVICE_NAME, SpoolError, WatchdogRuntimeBinding, current_unix_ms};
 
 mod codec;
 pub mod export_driver;
+/// Spool-local intent records (I8.1 `problem_intent` / `incident_intent`).
+/// Case-(b): the shared export kinds are not extended; intents persist as
+/// codec variants and are excluded from export batches until Governor-side
+/// admission lands (the MGR02 handoff), so no Recovery-disposition path can
+/// accept, compact, or terminally dispose of an intent before Governor
+/// reconciliation.
+pub(crate) mod intent;
 
 pub use codec::{WatchdogSpoolEntry, WatchdogSpoolPayload};
 pub(crate) use codec::{WatchdogSpoolHeader, encode_entry, encode_high_water, validate_header};
@@ -629,8 +636,14 @@ impl WatchdogSpool {
     /// or the cursor. It covers only the consecutive window starting just
     /// past the predecessor cursor, capped by both `limits` bounds, and an
     /// empty spool (`acknowledged == high-water`) yields the explicit empty
-    /// batch. Digest material carries no timestamps, so an exact retry of the
-    /// same cursor, high-water, and identities is digest-equivalent.
+    /// batch. Spool-local intents (`ProblemIntent`, `IncidentIntent`) are
+    /// never covered: the window stops before the first intent, and when the
+    /// head of the window is itself an intent the export yields the parked
+    /// empty batch (high-water pinned to the acknowledged sequence) so the
+    /// sink is never submitted to and the parked intents stay retained for
+    /// Governor reconciliation. Digest material carries no timestamps, so an
+    /// exact retry of the same cursor, high-water, and identities is
+    /// digest-equivalent.
     ///
     /// # Errors
     ///
@@ -661,15 +674,33 @@ impl WatchdogSpool {
             validate_batch(&batch, high_water)?;
             return Ok((batch, Vec::new()));
         }
-        let selected = select_export_window(
+        match select_export_window(
             &entries,
             predecessor.acknowledged_sequence,
             high_water,
             &limits,
-        )?;
-        let (batch, raws) = build_export_batch(predecessor, high_water, &selected)?;
-        validate_batch(&batch, high_water)?;
-        Ok((batch, raws))
+        )? {
+            ExportWindow::IntentParked => {
+                // The export frontier is parked at a spool-local intent: no
+                // batch can form past the cursor until Governor-side
+                // admission lands. The parked empty batch pins its
+                // high-water to the acknowledged sequence so the core
+                // empty-batch shape validates (it requires
+                // `acknowledged == high-water`); the live high-water is
+                // untouched, `export_once` short-circuits on
+                // `is_empty_batch` without touching the sink, and the
+                // parked intents stay retained for later reconciliation.
+                let batch =
+                    build_empty_export_batch(predecessor, predecessor.acknowledged_sequence)?;
+                validate_batch(&batch, high_water)?;
+                Ok((batch, Vec::new()))
+            }
+            ExportWindow::Ready(selected) => {
+                let (batch, raws) = build_export_batch(predecessor, high_water, &selected)?;
+                validate_batch(&batch, high_water)?;
+                Ok((batch, raws))
+            }
+        }
     }
 
     /// Applies an exact authenticated sink acknowledgement to the cursor.
@@ -1114,11 +1145,22 @@ fn store_export_cursor_bytes(write: &WriteTransaction, bytes: &[u8]) -> Result<(
 }
 
 /// Maps one spool codec payload to its owner-neutral export class.
+///
+/// Spool-local intents (`ProblemIntent`, `IncidentIntent`) keep the existing
+/// `Recovery` (gap-like) class here for retention/compaction classification
+/// only: the shared `WatchdogSpoolPayloadKind` is intentionally not extended
+/// (out-of-lane exhaustive matches would break; Governor-side kind admission
+/// is the MGR02 handoff). Export never emits intents — the export window
+/// stops before the first intent — so ordering is preserved, the compaction
+/// gap boundary keeps parked intents retained, and no Recovery disposition
+/// path can touch an intent before Governor reconciliation.
 fn export_payload_kind(payload: &WatchdogSpoolPayload) -> WatchdogSpoolPayloadKind {
     match payload {
         WatchdogSpoolPayload::Heartbeat { .. } => WatchdogSpoolPayloadKind::Heartbeat,
         WatchdogSpoolPayload::Gap { .. } => WatchdogSpoolPayloadKind::Gap,
-        WatchdogSpoolPayload::Recovery { .. } => WatchdogSpoolPayloadKind::Recovery,
+        WatchdogSpoolPayload::Recovery { .. }
+        | WatchdogSpoolPayload::ProblemIntent { .. }
+        | WatchdogSpoolPayload::IncidentIntent { .. } => WatchdogSpoolPayloadKind::Recovery,
     }
 }
 
@@ -1171,19 +1213,31 @@ fn check_acknowledged_cursor_binding(
     check_export_predecessor(stored, &batch.predecessor_cursor)
 }
 
+/// Outcome of the export window selection past the cursor.
+///
+/// `IntentParked` means the head-of-window record is a spool-local intent:
+/// intents are stored and retained but never exported until Governor-side
+/// admission lands, so no batch can form past the cursor and the caller must
+/// return the parked empty batch instead of submitting anything to the sink.
+enum ExportWindow {
+    Ready(Vec<(WatchdogSpoolEntry, Vec<u8>)>),
+    IntentParked,
+}
 /// Selects the consecutive export window past the cursor under both caps.
 ///
 /// The window starts exactly at `acknowledged + 1` and extends through the
 /// smaller of the caller high-water and the item cap, stopping early at the
-/// byte cap. At least one record is always selected so a non-empty spool
-/// makes progress. Any retention hole inside the window fails closed instead
-/// of skipping a sequence.
+/// byte cap — or before the first spool-local intent, which is never exported
+/// until Governor-side admission lands. At least one exportable record is
+/// always selected unless the head of the window is itself an intent (see
+/// [`ExportWindow::IntentParked`]). Any retention hole inside the window
+/// fails closed instead of skipping a sequence.
 fn select_export_window(
     entries: &[WatchdogSpoolEntry],
     acknowledged: u64,
     high_water: u64,
     limits: &WatchdogSpoolExportLimits,
-) -> Result<Vec<(WatchdogSpoolEntry, Vec<u8>)>, SpoolError> {
+) -> Result<ExportWindow, SpoolError> {
     let first_needed = acknowledged
         .checked_add(1)
         .ok_or(WatchdogSpoolReconciliationError::PredecessorMismatch)?;
@@ -1193,6 +1247,7 @@ fn select_export_window(
     let mut selected = Vec::new();
     let mut bytes_total: u64 = 0;
     let mut expected = first_needed;
+    let mut parked_at_intent = false;
     for entry in entries
         .iter()
         .filter(|entry| entry.sequence >= first_needed && entry.sequence <= item_cap_end)
@@ -1202,6 +1257,10 @@ fn select_export_window(
                 "watchdog spool retention no longer covers the export cursor; refusing to skip sequences"
                     .to_owned(),
             ));
+        }
+        if intent::is_intent_payload(&entry.payload) {
+            parked_at_intent = true;
+            break;
         }
         let raw = encode_entry(entry)?;
         if !selected.is_empty()
@@ -1218,12 +1277,15 @@ fn select_export_window(
         selected.push((entry.clone(), raw));
     }
     if selected.is_empty() {
+        if parked_at_intent {
+            return Ok(ExportWindow::IntentParked);
+        }
         return Err(SpoolError::Corrupt(
             "watchdog spool retention no longer covers the export cursor; refusing to skip sequences"
                 .to_owned(),
         ));
     }
-    Ok(selected)
+    Ok(ExportWindow::Ready(selected))
 }
 
 /// Derives the opaque per-entry digests from the canonical entry encoding.
