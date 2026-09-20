@@ -239,6 +239,19 @@ impl PeerIdentity {
 
 /// Transport limits.  A queue item is admitted only when both item and byte
 /// limits fit; the reserved control lane remains available during saturation.
+///
+/// Bounded in-flight (issue #1881, contract I7.2): `queue_capacity` bounds
+/// per-connection in-flight items and `queue_bytes` bounds in-flight bytes.
+/// `control_reserve` (always `>= 1` and `< queue_capacity`) reserves item and
+/// proportional byte capacity for `Cancel` / heartbeat / `Control` recovery
+/// traffic while ordinary request capacity is exhausted.
+///
+/// Inline size tiers enforced at this boundary: 4 MiB default frame maximum
+/// (`FRAME_MAX_BYTES`), 64 KiB hot-response default (`HOT_RESPONSE_MAX_BYTES`)
+/// for the control-recovery lane, and 256 KiB hard ceiling
+/// (`STRUCTURED_RESPONSE_MAX_BYTES`) for structured `Response` / `Event`
+/// bodies. Payloads above their applicable inline ceiling must be represented
+/// by an immutable Blob/Resource handle, never by a giant inline frame.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TransportLimits {
     pub max_frame_bytes: usize,
@@ -260,12 +273,29 @@ impl Default for TransportLimits {
     }
 }
 
+/// Default maximum encoded body size: four mebibytes (I7.2 Frame).
+pub const FRAME_MAX_BYTES: usize = eliot_protocol::MAX_FRAME_BYTES;
+/// Default bounded body size for hot-path control-recovery responses: 64 KiB.
+///
+/// `Cancel`, heartbeat, and `Control` frames admitted through the reserved
+/// lane must fit this ceiling; larger control bodies are a size disposition,
+/// never silent truncation.
+pub const HOT_RESPONSE_MAX_BYTES: usize = eliot_protocol::HOT_RESPONSE_BYTES;
+/// Hard maximum for structured `Response` / `Event` bodies: 256 KiB.
+///
+/// A structured body above this ceiling is not emitted inline; the caller
+/// must return the applicable immutable Blob/Resource handle instead. The
+/// violation surfaces as `OversizeFrame` with this maximum.
+pub const STRUCTURED_RESPONSE_MAX_BYTES: usize =
+    eliot_protocol::HARD_STRUCTURED_RESPONSE_BYTES;
+
 impl TransportLimits {
     fn validate(self) -> Result<Self, TransportError> {
         if self.max_frame_bytes == 0
             || self.max_frame_bytes > eliot_protocol::MAX_FRAME_BYTES
             || self.queue_capacity == 0
             || self.queue_bytes < self.max_frame_bytes
+            || self.control_reserve == 0
             || self.control_reserve >= self.queue_capacity
             || self.operation_timeout.is_zero()
         {
@@ -273,6 +303,59 @@ impl TransportLimits {
         }
         Ok(self)
     }
+}
+
+/// Returns whether a frame travels on the reserved control-recovery lane.
+///
+/// `Cancel`, heartbeat, and `Control` frames must remain sendable while
+/// ordinary request capacity is exhausted (issue #1881). Callers that admit
+/// by raw byte count must classify through this predicate (see
+/// [`AdmissionQueue::admit_frame`]) instead of inventing their own lane.
+#[must_use]
+pub const fn is_control_capacity_frame(frame: &Frame) -> bool {
+    matches!(
+        frame.kind,
+        FrameKind::Cancel | FrameKind::Heartbeat | FrameKind::Control
+    )
+}
+
+/// Enforces the applicable inline body ceiling for one validated frame.
+///
+/// - Control-recovery lane (`Cancel` / heartbeat / `Control`): the body must
+///   fit `HOT_RESPONSE_MAX_BYTES` (64 KiB).
+/// - Structured `Response` / `Event` bodies: the body must fit
+///   `STRUCTURED_RESPONSE_MAX_BYTES` (256 KiB hard ceiling); larger payloads
+///   must use an immutable Blob/Resource handle.
+/// - All other kinds (notably `Request`): the body must fit `max_frame_bytes`
+///   (default 4 MiB).
+///
+/// Violations surface as `OversizeFrame` with the applicable maximum through
+/// the existing transport error vocabulary; saturation remains `Backpressure`.
+/// Used by `encode_frame` before inline emission and by `decode_frame` on the
+/// receive path.
+///
+/// # Errors
+///
+/// Returns `OversizeFrame` when `body_len` exceeds the applicable ceiling.
+pub fn check_inline_response_ceiling(
+    frame: &Frame,
+    body_len: usize,
+    max_frame_bytes: usize,
+) -> Result<(), TransportError> {
+    let maximum = if is_control_capacity_frame(frame) {
+        HOT_RESPONSE_MAX_BYTES.min(max_frame_bytes)
+    } else if matches!(frame.kind, FrameKind::Response | FrameKind::Event) {
+        STRUCTURED_RESPONSE_MAX_BYTES.min(max_frame_bytes)
+    } else {
+        max_frame_bytes
+    };
+    if body_len > maximum {
+        return Err(TransportError::Protocol(ProtocolError::OversizeFrame {
+            actual: body_len,
+            maximum,
+        }));
+    }
+    Ok(())
 }
 
 /// Transport failures are deliberately distinct from application outcomes.
@@ -621,6 +704,13 @@ pub struct ServerFirstConnection {
 /// Reusable accepted bridge transport state.  It retains every transport
 /// binding needed by later Kernel routing; it does not contain semantic
 /// Session, task, scope, or plan state.
+///
+/// Bridge boundary wiring (issue #1881): the challenge, hello, and admission
+/// frames on this transport are [`FrameKind::Control`] frames on the reserved
+/// control-recovery lane (see [`is_control_capacity_frame`]). They admit via
+/// the `control_reserve` while ordinary request capacity is exhausted and
+/// must fit the 64 KiB hot-response inline ceiling; larger bridge payloads
+/// use immutable handles, never giant inline frames.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AcceptedAgentBridgeTransport {
     connection_id: String,
@@ -1191,13 +1281,25 @@ impl AdmissionQueue {
     }
 
     /// Reserves capacity without silently dropping or unboundedly buffering.
+    ///
+    /// Size violations surface precisely: zero bytes yield `ZeroLengthFrame`,
+    /// bytes above `max_frame_bytes` yield `OversizeFrame`; only genuine
+    /// saturation yields `Backpressure`. Prefer [`Self::admit_frame`] so the
+    /// control-recovery lane (`Cancel` / heartbeat / `Control`) is classified
+    /// by [`is_control_capacity_frame`] instead of by the caller.
     pub fn admit(
         &mut self,
         encoded_bytes: usize,
         control: bool,
     ) -> Result<QueueReservation, TransportError> {
-        if encoded_bytes == 0 || encoded_bytes > self.limits.max_frame_bytes {
-            return Err(TransportError::Backpressure);
+        if encoded_bytes == 0 {
+            return Err(TransportError::Protocol(ProtocolError::ZeroLengthFrame));
+        }
+        if encoded_bytes > self.limits.max_frame_bytes {
+            return Err(TransportError::Protocol(ProtocolError::OversizeFrame {
+                actual: encoded_bytes,
+                maximum: self.limits.max_frame_bytes,
+            }));
         }
         let items = self
             .normal_items
@@ -1241,6 +1343,27 @@ impl AdmissionQueue {
             encoded_bytes,
             control,
         })
+    }
+
+    /// Reserves capacity for one frame, classifying the control-recovery lane
+    /// by [`is_control_capacity_frame`].
+    ///
+    /// When ordinary in-flight capacity is exhausted, an ordinary request is
+    /// rejected with `Backpressure` while a `Cancel`, heartbeat, or `Control`
+    /// frame is still admitted from the reserved `control_reserve`. This is
+    /// the per-connection admission bound the agent-bridge transport uses so a
+    /// saturated data plane can still recover or stop work.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ZeroLengthFrame` / `OversizeFrame` for size violations and
+    /// `Backpressure` when the applicable in-flight bound is exhausted.
+    pub fn admit_frame(
+        &mut self,
+        frame: &Frame,
+        encoded_bytes: usize,
+    ) -> Result<QueueReservation, TransportError> {
+        self.admit(encoded_bytes, is_control_capacity_frame(frame))
     }
 
     /// Releases one previously admitted item.

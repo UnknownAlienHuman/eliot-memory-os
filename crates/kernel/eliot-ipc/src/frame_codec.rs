@@ -2,7 +2,13 @@
 //!
 //! The wire boundary follows Implementation `I7.2`: a four-byte little-endian
 //! body length precedes the encoded body; zero and oversized lengths are
-//! rejected before body allocation. Implementation `I7.3` keeps handshake
+//! rejected before body allocation. Inline size tiers enforced here (issue
+//! #1881): 4 MiB default frame maximum, 64 KiB hot-response default for the
+//! `Cancel` / heartbeat / `Control` recovery lane, and 256 KiB hard ceiling
+//! for structured `Response` / `Event` bodies. Payloads above their
+//! applicable inline ceiling must use an immutable Blob/Resource handle;
+//! oversized inline bodies surface as `OversizeFrame` and are never emitted.
+//! Implementation `I7.3` keeps handshake
 //! fields and session binding above this byte cell.
 //!
 //! This private module follows Implementation `I2.23`: a small group used by one
@@ -35,7 +41,9 @@
 //!   (`ZeroLengthFrame`) vs oversize (`OversizeFrame`) vs trailing
 //!   (`Backpressure` here, `TrailingBytes` in `decode_frame`) are never fused.
 
-use super::{TransportError, TransportLimits};
+use super::{
+    TransportError, TransportLimits, check_inline_response_ceiling,
+};
 use eliot_protocol::{Frame, JsonCodec, ProtocolError};
 
 /// Wire prefix length: four-byte little-endian body length (Implementation `I7.2`).
@@ -200,11 +208,21 @@ impl Default for FrameDecoder {
 /// `write_all` reaches its terminal observation (`Delivered` vs
 /// `UnknownOutcome` / `Timeout`); the exact transferred range is the whole
 /// buffer.
+///
+/// Inline ceilings (issue #1881) are enforced before the wire is returned:
+/// the control-recovery lane defaults to 64 KiB and structured
+/// `Response` / `Event` bodies are hard-capped at 256 KiB, all under the
+/// 4 MiB frame default. A body above its applicable ceiling yields
+/// `OversizeFrame` and is never emitted inline; the caller must use an
+/// immutable Blob/Resource handle instead.
 pub fn encode_frame(frame: &Frame, limits: TransportLimits) -> Result<Vec<u8>, TransportError> {
     let limits = limits.validate()?;
-    JsonCodec::with_max_frame_bytes(limits.max_frame_bytes)
+    let wire = JsonCodec::with_max_frame_bytes(limits.max_frame_bytes)
         .encode(frame)
-        .map_err(TransportError::Protocol)
+        .map_err(TransportError::Protocol)?;
+    let body_len = wire.len().saturating_sub(FRAME_PREFIX_LEN);
+    check_inline_response_ceiling(frame, body_len, limits.max_frame_bytes)?;
+    Ok(wire)
 }
 
 /// Decodes one complete frame and rejects trailing or partial bytes.
@@ -214,9 +232,16 @@ pub fn encode_frame(frame: &Frame, limits: TransportLimits) -> Result<Vec<u8>, T
 /// `TrailingBytes`, zero body yields `ZeroLengthFrame`, and an over-limit body
 /// yields `OversizeFrame`; these terminal observations stay distinct and are
 /// enforced by the bounded codec without panicking on malformed input.
+///
+/// The applicable inline ceiling (64 KiB control-recovery default, 256 KiB
+/// structured hard ceiling, 4 MiB frame default) is re-checked after decoding
+/// so an oversized inline body is rejected on receipt as well as on emission.
 pub fn decode_frame(wire: &[u8], limits: TransportLimits) -> Result<Frame, TransportError> {
     let limits = limits.validate()?;
-    JsonCodec::with_max_frame_bytes(limits.max_frame_bytes)
+    let frame = JsonCodec::with_max_frame_bytes(limits.max_frame_bytes)
         .decode(wire)
-        .map_err(TransportError::Protocol)
+        .map_err(TransportError::Protocol)?;
+    let body_len = wire.len().saturating_sub(FRAME_PREFIX_LEN);
+    check_inline_response_ceiling(&frame, body_len, limits.max_frame_bytes)?;
+    Ok(frame)
 }
