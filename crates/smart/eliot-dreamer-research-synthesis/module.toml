@@ -1,7 +1,7 @@
 schema_version = 4
 module_id = "smart.dreamer.research-synthesis"
 crate = "eliot-dreamer-research-synthesis"
-status = "ADMITTED"
+status = "PROTOTYPE"
 wave = "cognitive-micromodules-wave-01"
 agent_order = 6
 plane = "Smart"
@@ -48,7 +48,7 @@ integration_owner = "cognitive-wave-integrator"
 implementation_language = "Rust 2024"
 required_verification = ["standalone fmt/test/clippy/doc via --manifest-path", "all 24 Issue #995 cases discovered and passed", "workspace admission remains separate under this issue's controller"]
 writeback = "return implementation artifact, exact proof evidence, donor disposition, unresolved ContractChallenges and merge/remove recommendation"
-workspace_admission = "admitted via #995 (A-RESEARCH-SYNTHESIS) root workspace membership"
+workspace_admission = "forbidden until implementation, package proof, affected Edge proof, current-main ancestry and integration-owner review"
 
 [acceptance]
 require_deny_unknown_fields = true
