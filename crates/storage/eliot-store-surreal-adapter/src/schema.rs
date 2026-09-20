@@ -23,6 +23,13 @@ pub(crate) mod table {
     /// versioned Dreamer namespace plus discriminated keys separate it from
     /// other recovery users without a new table or migration.
     pub(crate) const RECOVERY_JOB: &str = "recovery_job";
+    /// Durable erasure-intent row per operation, recorded before any
+    /// destructive dispatch (688-B). One row per `operation_id`; the intent
+    /// upsert refuses when the same id already names a different intent.
+    pub(crate) const ERASURE_INTENT: &str = "erasure_intent";
+    /// Sealed per-surface erasure outcomes per operation. The single
+    /// completion marker for the intent row above — never a second ledger.
+    pub(crate) const ERASURE_OUTCOME: &str = "erasure_outcome";
 }
 
 /// Record key of the single canonical fence/sequence row.
@@ -35,6 +42,15 @@ pub(crate) const GENERATION_V2: &str = "2.0.0";
 pub(crate) const MIGRATION_ID_V1: &str = "eliot.store.surreal.schema.v1";
 pub(crate) const MIGRATION_ID_V2: &str = "eliot.store.surreal.schema.v2";
 pub(crate) const MIGRATION_ID_V1_TO_V2: &str = "eliot.store.surreal.schema.v1_to_v2";
+/// Additive erasure-table migration: creates only `erasure_intent` and
+/// `erasure_outcome` on top of a v2 baseline (688-B).
+#[allow(dead_code)]
+pub(crate) const MIGRATION_ID_V2_TO_V3: &str = "eliot.store.surreal.schema.v2_to_v3";
+/// Schema generation reached by the erasure-table migration. The tables are
+/// additive, so v3 contains every v2 table verbatim plus the two erasure
+/// tables below.
+#[allow(dead_code)]
+pub(crate) const GENERATION_V3: &str = "3.0.0";
 pub(crate) const SCHEMA_DDL_V1_SHA256: &str =
     "783d3207ab39fc0471e32f893302eedd579ae4980ee95f9f883f92a5f7ba705b";
 
@@ -110,6 +126,35 @@ DEFINE INDEX rj_namespace_key ON recovery_job FIELDS namespace, key UNIQUE;
 
 pub(crate) const SCHEMA_MIGRATION_V1_TO_V2_DDL: &str = RECOVERY_TABLES_DDL;
 
+/// Erasure intent/outcome tables (688-B). Additive delta applied on top of a
+/// v2 baseline: `erasure_intent` carries the exact durable intent row bound by
+/// `erasure_transaction_bindings` (`operation_id`, `subject`, `scope_id`,
+/// `surfaces`, `state_fence`, `operation_count`), and `erasure_outcome`
+/// carries the sealed per-surface outcomes (`operation_id`, `outcomes`).
+/// `operation_id` is unique in each table; one intent row plus its single
+/// outcome seal per operation — never a second ledger.
+#[allow(dead_code)]
+pub(crate) const ERASURE_TABLES_DDL: &str = r"
+DEFINE TABLE erasure_intent SCHEMALESS;
+DEFINE FIELD operation_id ON erasure_intent TYPE string;
+DEFINE FIELD subject ON erasure_intent TYPE string;
+DEFINE FIELD scope_id ON erasure_intent TYPE string;
+DEFINE FIELD surfaces ON erasure_intent TYPE array;
+DEFINE FIELD state_fence ON erasure_intent TYPE object;
+DEFINE FIELD operation_count ON erasure_intent TYPE int;
+DEFINE INDEX ei_operation ON erasure_intent FIELDS operation_id UNIQUE;
+
+DEFINE TABLE erasure_outcome SCHEMALESS;
+DEFINE FIELD operation_id ON erasure_outcome TYPE string;
+DEFINE FIELD outcomes ON erasure_outcome TYPE array;
+DEFINE INDEX eo_operation ON erasure_outcome FIELDS operation_id UNIQUE;
+";
+
+/// Forward-migration body for the v2-to-v3 erasure step. Like the v1-to-v2
+/// body it is a delta: no `schema_meta` redefinition, no data statements.
+#[allow(dead_code)]
+pub(crate) const SCHEMA_MIGRATION_V2_TO_V3_DDL: &str = ERASURE_TABLES_DDL;
+
 pub(crate) const SCHEMA_DDL_V2: &str = r"
 DEFINE TABLE schema_meta SCHEMALESS;
 DEFINE FIELD generation ON schema_meta TYPE string;
@@ -175,6 +220,91 @@ DEFINE FIELD value_digest ON recovery_job TYPE string;
 DEFINE INDEX rj_namespace_key ON recovery_job FIELDS namespace, key UNIQUE;
 ";
 
+/// Third-generation full schema: every v2 table verbatim plus the two
+/// additive erasure tables (688-B). A fresh database reaches v3 by applying
+/// v1, then the v1-to-v2 delta, then the v2-to-v3 delta below, in order; the
+/// assembled body here is the checksum-level proof that the chain stays
+/// exactly additive.
+#[allow(dead_code)]
+pub(crate) const SCHEMA_DDL_V3: &str = r"
+DEFINE TABLE schema_meta SCHEMALESS;
+DEFINE FIELD generation ON schema_meta TYPE string;
+DEFINE FIELD migrations ON schema_meta TYPE array;
+DEFINE FIELD compatible_bridge_range ON schema_meta TYPE string;
+DEFINE FIELD migration_state ON schema_meta TYPE string;
+DEFINE FIELD migration_id ON schema_meta TYPE string;
+DEFINE FIELD migration_checksum_sha256 ON schema_meta TYPE string;
+DEFINE FIELD updated_at ON schema_meta TYPE string;
+
+DEFINE TABLE write_receipt SCHEMALESS;
+DEFINE FIELD operation_id ON write_receipt TYPE string;
+DEFINE FIELD idempotency_key ON write_receipt TYPE string;
+DEFINE INDEX wr_operation ON write_receipt FIELDS operation_id UNIQUE;
+DEFINE INDEX wr_idempotency ON write_receipt FIELDS idempotency_key UNIQUE;
+
+DEFINE TABLE revision_head SCHEMALESS;
+DEFINE FIELD revision_key ON revision_head TYPE string;
+DEFINE INDEX rh_key ON revision_head FIELDS revision_key UNIQUE;
+
+DEFINE TABLE ordering_head SCHEMALESS;
+DEFINE FIELD ordering_scope ON ordering_head TYPE string;
+DEFINE INDEX oh_scope ON ordering_head FIELDS ordering_scope UNIQUE;
+
+DEFINE TABLE canonical_event SCHEMALESS;
+DEFINE FIELD event_id ON canonical_event TYPE string;
+DEFINE INDEX ce_id ON canonical_event FIELDS event_id UNIQUE;
+
+DEFINE TABLE projection_record SCHEMALESS;
+DEFINE FIELD publication_id ON projection_record TYPE string;
+DEFINE INDEX pr_id ON projection_record FIELDS publication_id UNIQUE;
+
+DEFINE TABLE relation_record SCHEMALESS;
+DEFINE FIELD relation_id ON relation_record TYPE string;
+DEFINE INDEX rr_id ON relation_record FIELDS relation_id UNIQUE;
+
+DEFINE TABLE outbox_event SCHEMALESS;
+DEFINE FIELD outbox_id ON outbox_event TYPE string;
+DEFINE INDEX oe_id ON outbox_event FIELDS outbox_id UNIQUE;
+
+DEFINE TABLE canonical_fence SCHEMALESS;
+DEFINE FIELD id ON canonical_fence TYPE string;
+DEFINE INDEX fence_id ON canonical_fence FIELDS id UNIQUE;
+
+DEFINE TABLE recovery_owner SCHEMALESS;
+DEFINE FIELD namespace ON recovery_owner TYPE string;
+DEFINE FIELD key ON recovery_owner TYPE string;
+DEFINE FIELD state_fence ON recovery_owner TYPE object;
+DEFINE FIELD revision ON recovery_owner TYPE int;
+DEFINE FIELD schema ON recovery_owner TYPE string;
+DEFINE FIELD payload ON recovery_owner TYPE bytes;
+DEFINE FIELD value_digest ON recovery_owner TYPE string;
+DEFINE INDEX ro_namespace_key ON recovery_owner FIELDS namespace, key UNIQUE;
+
+DEFINE TABLE recovery_job SCHEMALESS;
+DEFINE FIELD namespace ON recovery_job TYPE string;
+DEFINE FIELD key ON recovery_job TYPE string;
+DEFINE FIELD state_fence ON recovery_job TYPE object;
+DEFINE FIELD revision ON recovery_job TYPE int;
+DEFINE FIELD schema ON recovery_job TYPE string;
+DEFINE FIELD payload ON recovery_job TYPE bytes;
+DEFINE FIELD value_digest ON recovery_job TYPE string;
+DEFINE INDEX rj_namespace_key ON recovery_job FIELDS namespace, key UNIQUE;
+
+DEFINE TABLE erasure_intent SCHEMALESS;
+DEFINE FIELD operation_id ON erasure_intent TYPE string;
+DEFINE FIELD subject ON erasure_intent TYPE string;
+DEFINE FIELD scope_id ON erasure_intent TYPE string;
+DEFINE FIELD surfaces ON erasure_intent TYPE array;
+DEFINE FIELD state_fence ON erasure_intent TYPE object;
+DEFINE FIELD operation_count ON erasure_intent TYPE int;
+DEFINE INDEX ei_operation ON erasure_intent FIELDS operation_id UNIQUE;
+
+DEFINE TABLE erasure_outcome SCHEMALESS;
+DEFINE FIELD operation_id ON erasure_outcome TYPE string;
+DEFINE FIELD outcomes ON erasure_outcome TYPE array;
+DEFINE INDEX eo_operation ON erasure_outcome FIELDS operation_id UNIQUE;
+";
+
 /// Transaction delimiters for a single atomic apply.
 pub(crate) const TX_BEGIN: &str = "BEGIN TRANSACTION;";
 pub(crate) const TX_COMMIT: &str = "COMMIT TRANSACTION;";
@@ -227,6 +357,24 @@ pub(crate) fn forward_migration_sql() -> String {
         TX_BEGIN,
         TX_GUARD_FENCE,
         RECOVERY_TABLES_DDL.trim(),
+        TX_GUARD_SCHEMA_PREDECESSOR,
+        TX_UPDATE_SCHEMA_META_CAS,
+        TX_COMMIT
+    )
+}
+
+/// Forward migration from a v2 baseline to the v3 erasure schema: creates
+/// only the `erasure_intent` and `erasure_outcome` tables under exactly the
+/// same fence plus predecessor (`migrations[0]`) guards as the v1-to-v2
+/// forward migration above. The caller supplies the v2 predecessor bindings
+/// through the same `forward_migration_expected_bindings` shape.
+#[allow(dead_code)]
+pub(crate) fn erasure_forward_migration_sql() -> String {
+    format!(
+        "{} {} {} {} {} {}",
+        TX_BEGIN,
+        TX_GUARD_FENCE,
+        ERASURE_TABLES_DDL.trim(),
         TX_GUARD_SCHEMA_PREDECESSOR,
         TX_UPDATE_SCHEMA_META_CAS,
         TX_COMMIT
