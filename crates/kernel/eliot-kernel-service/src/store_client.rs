@@ -146,19 +146,23 @@ impl StoreClientFault {
 /// Capability token authorizing fault-hook arming (issue #2030 rework).
 ///
 /// Arming the one-shot production fault hook requires this token, and the
-/// only constructor is test-gated: production builds cannot construct it,
-/// so production code cannot arm faults. Constructing a `StoreClientFault`
-/// value alone arms nothing; only [`EbpCanonicalStoreClient::arm_fault`] with
-/// this token arms the hook, and only the 994 test/harness path holds it.
+/// only constructor is gated on `test` or the `test-support` cargo feature
+/// (repo precedent: `eliot-ors --features test-support`): production builds
+/// (neither) cannot construct it, so production code cannot arm faults.
+/// Constructing a `StoreClientFault` value alone arms nothing; only
+/// [`EbpCanonicalStoreClient::arm_fault`] with this token arms the hook, and
+/// only the 994 test/harness path holds it.
 #[derive(Clone, Copy, Debug)]
 pub struct StoreClientFaultHarness {
     _private: (),
 }
 
 impl StoreClientFaultHarness {
-    /// Test/harness-only constructor. Unavailable in production builds, so
+    /// Test/harness-only constructor, available to in-crate unit tests and
+    /// to downstream integration-test or external harness builds compiled
+    /// with `--features test-support`. Unavailable in production builds, so
     /// production code has no value to present to `arm_fault`.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn test_harness() -> Self {
         Self { _private: () }
@@ -227,9 +231,10 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
 
     /// Arms the one-shot production fault hook (issue #2030).
     ///
-    /// Capability-gated by [`StoreClientFaultHarness`]: only the test/harness
-    /// path can construct the token, so production builds cannot arm
-    /// faults. The next admitted apply consumes the hook; `StoreClientFault`
+    /// Capability-gated by [`StoreClientFaultHarness`]: only `test` or
+    /// `--features test-support` builds can construct the token, so
+    /// production builds cannot arm faults. The next admitted apply consumes
+    /// the hook; `StoreClientFault`
     /// None disarms. Validation failures leave the armed fault in place
     /// for the next admissible attempt.
     pub fn arm_fault(&self, _harness: &StoreClientFaultHarness, fault: StoreClientFault) {

@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 description = "Governed Kernel service lifecycle, Host handoff and readiness boundary"
 
+[features]
+test-support = []
+
 [package.metadata.eliot]
 work_id = "P-07"
 functional_cell = "kernel-service"

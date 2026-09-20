@@ -477,6 +477,9 @@ impl SessionPool {
     /// deterministically with `ProviderUnavailable` (boundary: `Unavailable`)
     /// so saturated normal workload cannot pile up behind a lane. Only an
     /// admitted-but-cold lane warms one slot through the blocking checkout.
+    /// A failed non-blocking attempt re-checks admission first (issue #2030
+    /// rework2030b): the entry verdict can lose the last permit to a racer,
+    /// so a now-saturated lane sheds instead of blocking behind it.
     pub async fn query(
         &self,
         role: SessionRole,
@@ -492,6 +495,15 @@ impl SessionPool {
         }
         if let Some(session) = self.try_checkout(role) {
             return session.query(operation, statement, bindings).await;
+        }
+        // Rework2030b: the entry admission verdict is a point observation,
+        // not a reservation — a racer can take the last permit before the
+        // non-blocking attempt runs. Re-check admission instead of falling
+        // through to the blocking checkout: a now-saturated lane sheds with
+        // backpressure, and only a still-admitted (cold) lane warms one slot
+        // through the blocking checkout below.
+        if !self.admission(role).admitted() {
+            return Err(AdapterError::ProviderUnavailable);
         }
         let session = self.checkout(role).await?;
         session.query(operation, statement, bindings).await
@@ -1006,6 +1018,76 @@ mod pool_behavior_tests {
         );
         // Release the owner before teardown (see cleanup discipline).
         drop(held);
+        drop(pool);
+        h.cleanup().await;
+    }
+
+    // WORK_UNIT_CASE: 2030b — an admitted observation can lose the last
+    // permit to a racer before try_checkout runs: the losers must shed fast
+    // with ProviderUnavailable instead of queueing behind the lane in the
+    // blocking checkout. Eight barrier-synced queries against one warm slot
+    // admit exactly one winner; every loser re-checks a still-held
+    // (saturated) lane and sheds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn admitted_query_losing_permit_race_sheds_without_blocking() {
+        const WORKERS: usize = 8;
+        let mut h = PoolHarness::provision().await;
+        h.start(ClientSetLimits::new(1, 1, 1).expect("valid limits"))
+            .await;
+        let pool = h.transport().session_pool().clone();
+        // Warm the single read slot so a failed try_checkout means "lost the
+        // permit race", never "cold slot".
+        let warmed = pool
+            .checkout(SessionRole::Read)
+            .await
+            .expect("warm single slot");
+        drop(warmed);
+        assert!(
+            pool.admission(SessionRole::Read).admitted(),
+            "warmed single slot idles admitted"
+        );
+        let barrier = Arc::new(tokio::sync::Barrier::new(WORKERS + 1));
+        let mut handles = Vec::new();
+        for _ in 0..WORKERS {
+            let task_pool = pool.clone();
+            let gate = barrier.clone();
+            handles.push(tokio::spawn(async move {
+                gate.wait().await;
+                task_pool
+                    .query(
+                        SessionRole::Read,
+                        "proof.2030b.race",
+                        "RETURN 1;",
+                        Map::new(),
+                    )
+                    .await
+            }));
+        }
+        barrier.wait().await;
+        let mut successes = 0usize;
+        let mut sheds = 0usize;
+        let mut unexpected = Vec::new();
+        for handle in handles {
+            let outcome = tokio::time::timeout(Duration::from_secs(30), handle)
+                .await
+                .expect("raced query must not block behind the lane")
+                .expect("query task joins");
+            match outcome {
+                Ok(_) => successes += 1,
+                Err(AdapterError::ProviderUnavailable) => sheds += 1,
+                Err(error) => unexpected.push(format!("{error:?}")),
+            }
+        }
+        assert!(
+            unexpected.is_empty(),
+            "raced queries failed unexpectedly: {unexpected:?}"
+        );
+        assert!(successes >= 1, "one racer wins the single slot");
+        assert!(
+            sheds >= 1,
+            "permit-race losers shed instead of queueing behind the lane"
+        );
+        // Release the owner before teardown (see cleanup discipline).
         drop(pool);
         h.cleanup().await;
     }
