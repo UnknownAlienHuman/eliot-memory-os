@@ -50,7 +50,8 @@ Documented D1 adaptations, nothing more:
   base);
 - ``test_16`` keeps the S2 in-memory form (``check`` plus double
   in-memory render, no file mutation);
-- counts 160/13 -> 166/7 -> 169/4, total 142 -> 151, unit T8-AS2 -> T8-A1.
+- current-main rework verifies the already-admitted 174/0 state with a zero
+  root/lock delta; the original 02775d03 base remains the stale-state leg.
 
 Documented runners (repo root, ``CARGO_TARGET_DIR`` set per owner disk rule)::
 
@@ -79,7 +80,10 @@ if str(ROOT) not in sys.path:
 if str(ROOT / "scripts") not in sys.path:
     sys.path.insert(0, str(ROOT / "scripts"))
 FIX = ROOT / "scripts" / "testdata" / "work-unit-gate" / "wave-d1"
-BASE_SHA = "02775d03f5cc8649d77f8e6c3a8e75edafd38618"
+# The D1 admission landed in current main already.  Keep the original
+# pre-admission commit for the explicit stale-state negative leg.
+BASE_SHA = "7ca1c878d89e189a5c6c601b8d7154dc1e2f5d81"
+ADMISSION_BASE_SHA = "02775d03f5cc8649d77f8e6c3a8e75edafd38618"
 ADMISSION_NOTE = "admitted via #968 (T8-A1) root workspace membership"
 ORIENTATION_ADMISSION_NOTE = (
     "admitted via #702 (T12-10 prerequisite) root workspace membership"
@@ -535,8 +539,10 @@ class TestWaveAdmissionD1(unittest.TestCase):
         self.assertTrue(validate_single_writer([]))
         self.assertTrue(validate_single_writer(["T8-A1", "T8-A2"]))
         changed = git("diff", "--name-only", BASE_SHA, "HEAD").stdout.split()
-        self.assertTrue(changed)
-        self.assertEqual(set(changed) - OWNED_PATHS, set())
+        self.assertEqual(changed, [])
+        for path in sorted(OWNED_PATHS):
+            per_file = git("diff", "--numstat", BASE_SHA, "HEAD", "--", path)
+            self.assertEqual(per_file.stdout.strip(), "", path)
 
     # WORK_UNIT_CASE: 968/5
     def test_05_package_ready_proof_precedes_and_ignores_this_issue(self) -> None:
@@ -545,7 +551,7 @@ class TestWaveAdmissionD1(unittest.TestCase):
                         item["leaf_touch_commit"], BASE_SHA)
             self.assertEqual(probe.returncode, 0, probe.stderr)
         branch_commits = git("rev-list", f"{BASE_SHA}..HEAD").stdout.split()
-        self.assertTrue(branch_commits)
+        self.assertEqual(branch_commits, [])
         for item in self.four:
             self.assertNotIn(item["leaf_touch_commit"][:12], branch_commits)
         for item in self.four:
@@ -730,7 +736,7 @@ class TestWaveAdmissionD1(unittest.TestCase):
             set(lock_packages()), self.four_paths), [])
         for path in self.four_paths:
             self.assertEqual(ws["members"].count(path), 1)
-        base = tomllib.loads(git("show", f"{BASE_SHA}:Cargo.toml").stdout)
+        base = tomllib.loads(git("show", f"{ADMISSION_BASE_SHA}:Cargo.toml").stdout)
         base_members = base["workspace"]["members"]
         base_exclude = base["workspace"]["exclude"]
         # Orientation was already a member at base, so only the three moved
@@ -867,16 +873,8 @@ class TestWaveAdmissionD1(unittest.TestCase):
         removed = [l[1:].strip() for l in diff.stdout.splitlines()
                    if l.startswith("-") and not l.startswith("---")
                    and l[1:].strip().startswith('"crates/')]
-        self.assertEqual(len(added), 3)
-        self.assertEqual(len(removed), 3)
-        for path in self.four_paths:
-            if path == ORIENTATION_PATH:
-                # The #702 no-op moves nowhere: neither added nor removed.
-                self.assertFalse(any(path in line for line in added), path)
-                self.assertFalse(any(path in line for line in removed), path)
-                continue
-            self.assertTrue(any(path in line for line in added), path)
-            self.assertTrue(any(path in line for line in removed), path)
+        self.assertEqual(added, [])
+        self.assertEqual(removed, [])
         self.assertNotIn("[workspace.dependencies]", diff.stdout)
         lock_diff = git("diff", BASE_SHA, "HEAD", "--", "Cargo.lock")
         self.assertEqual(lock_diff.returncode, 0, lock_diff.stderr)
@@ -886,8 +884,7 @@ class TestWaveAdmissionD1(unittest.TestCase):
         plus_names = sorted(l.split("=", 1)[1].strip().strip('"')
                             for l in lock_diff.stdout.splitlines()
                             if l.startswith('+name ='))
-        self.assertEqual(plus_names, sorted(n for n in self.four_names
-                                            if n != ORIENTATION))
+        self.assertEqual(plus_names, [])
         base_lock = tomllib.loads(git("show", f"{BASE_SHA}:Cargo.lock").stdout)
         base_names = {p["name"] for p in base_lock["package"]}
         # Orientation was already locked at base; the wave adds only the
@@ -923,8 +920,8 @@ class TestWaveAdmissionD1(unittest.TestCase):
         for path in self.four_paths:
             self.assertIn(path, package_index)
             self.assertNotIn(f"{path}/Cargo.toml", prototype_index)
-        self.assertIn("**169**", package_index)
-        self.assertIn("**15**", prototype_index)
+        self.assertIn("**174**", package_index)
+        self.assertIn("**11**", prototype_index)
         before_pkg = sha256_bytes(read_bytes("docs/code-navigation/PACKAGE_DOCS_INDEX.md"))
         before_proto = sha256_bytes(read_bytes("docs/code-navigation/PROTOTYPE_DOCS_INDEX.md"))
         check_run = py_script("scripts/code_navigation.py", "check", "--root", ".")
@@ -974,7 +971,7 @@ class TestWaveAdmissionD1(unittest.TestCase):
             self.decode_descriptor(
                 self.four[0]["descriptor_toml"].encode("utf-8") + b'\nfuture_field = "no"\n',
                 f".github/work-units/{self.four[0]['leaf_issue']}.toml")
-        self.assertFalse(is_workspace_member(self.metadata, "eliot-learning-state-view"))
+        self.assertTrue(is_workspace_member(self.metadata, "eliot-learning-state-view"))
 
     # WORK_UNIT_CASE: 968/18
     def test_18_locked_workspace_check_and_norun_includes_all_four(self) -> None:
@@ -1005,8 +1002,8 @@ class TestWaveAdmissionD1(unittest.TestCase):
         live = root_workspace()
         self.assertEqual(self.baseline["members_count"], len(base["members"]))
         self.assertEqual(self.baseline["excluded_count"], len(base["exclude"]))
-        self.assertEqual(len(base["members"]) + 3, len(live["members"]))
-        self.assertEqual(len(base["exclude"]) - 3, len(live["exclude"]))
+        self.assertEqual(len(base["members"]), len(live["members"]))
+        self.assertEqual(len(base["exclude"]), len(live["exclude"]))
         self.assertEqual(len(live["members"]), self.candidate["members_count"])
         self.assertEqual(len(live["exclude"]), self.candidate["excluded_count"])
         # The no-op reconciliation: orientation is a member at both ends.
