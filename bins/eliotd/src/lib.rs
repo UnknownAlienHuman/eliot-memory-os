@@ -43,6 +43,7 @@ pub mod diagnostics;
 mod dreamer_admission;
 mod dreamer_materials;
 mod dreamer_model_adapter;
+mod first_run_wiring;
 mod governor_local_read;
 mod kernel_authority_client;
 mod kernel_context_read_client;
@@ -99,6 +100,10 @@ pub use dreamer_materials::{
 };
 pub use dreamer_model_adapter::{
     DreamerModelExecution, GovernedDreamerModelAdapter, ModelInvokeInput,
+};
+pub use first_run_wiring::{
+    DisabledAutomationOutcome, FirstRunWiringError, inspect_first_run_defaults,
+    recommend_for_disabled_automation, resolve_first_run_routes,
 };
 pub use governor_local_read::{
     answer_evidence_query, answer_projection_inputs, forward_admitted_local_read,

@@ -43,6 +43,7 @@ use std::{
 use tracing_subscriber::EnvFilter;
 
 mod bootstrap_draft;
+mod first_run_flow;
 mod source_bundle_materializer;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -88,6 +89,13 @@ enum Command {
     Runtime {
         #[command(subcommand)]
         command: RuntimeCommand,
+    },
+    /// Governor-backed first-run setup: typed per-role routes, visible
+    /// defaults, and Human-board recommendations. Replaces the retired
+    /// legacy `governor.toml` path, which is never adopted as authority.
+    Setup {
+        #[command(subcommand)]
+        command: SetupCommand,
     },
     Version,
     /// Start or reuse the authenticated User Broker and launch Operator.
@@ -336,6 +344,66 @@ enum CatalogueCommand {
     Validate,
 }
 
+/// Governor-backed first-run setup commands (issue #1962).
+#[derive(Debug, Subcommand)]
+enum SetupCommand {
+    /// Decide typed per-role route state. Omitted roles stay `UNASSIGNED`;
+    /// paid routes require explicit consent flags.
+    Apply {
+        /// Dreamer route kind: `unassigned`, `local`, `economy`, or `paid`.
+        #[arg(long)]
+        dreamer_route: Option<String>,
+        /// Watchdog route kind: `unassigned`, `local`, `economy`, or `paid`.
+        #[arg(long)]
+        watchdog_route: Option<String>,
+        /// The setup screen displayed the Dreamer local/economy default.
+        #[arg(long, default_value = "false")]
+        dreamer_displayed: bool,
+        /// The setup screen displayed the Watchdog local/economy default.
+        #[arg(long, default_value = "false")]
+        watchdog_displayed: bool,
+        /// Explicit paid-route consent for Dreamer.
+        #[arg(long, default_value = "false")]
+        dreamer_explicit: bool,
+        /// Explicit paid-route consent for Watchdog.
+        #[arg(long, default_value = "false")]
+        watchdog_explicit: bool,
+    },
+    /// Inspect every default through the same typed path (reversible).
+    Show,
+    /// Update one role through the same typed path used by `apply`.
+    Set {
+        /// Role key: `main`, `worker`, `auditor`, `verifier`, `watchdog`,
+        /// `dreamer`, or `research`.
+        #[arg(long)]
+        role: String,
+        /// Route kind: `unassigned`, `local`, `economy`, or `paid`. Omitted
+        /// clears the role back to `UNASSIGNED`.
+        #[arg(long)]
+        route: Option<String>,
+        /// The setup screen displayed the local/economy default.
+        #[arg(long, default_value = "false")]
+        displayed: bool,
+        /// Explicit paid-route consent.
+        #[arg(long, default_value = "false")]
+        explicit_consent: bool,
+    },
+    /// With automation disabled, record one deduplicated Human-board
+    /// recommendation for a needed action; no job starts.
+    Recommend {
+        /// Automation mode: `suggest_only`, `manual`, `idle_only`,
+        /// `scheduled`, `continuous_bounded`, or `off`.
+        #[arg(long)]
+        automation: String,
+        /// Maintenance family, e.g. `RESEARCH_EXCHANGE_CLEANUP`.
+        #[arg(long)]
+        family: String,
+        /// Affected scope reference.
+        #[arg(long)]
+        scope: String,
+    },
+}
+
 fn main() -> Result<()> {
     let exit_code = std::thread::Builder::new()
         .name("eliot-cli-main".to_owned())
@@ -366,8 +434,50 @@ fn run() -> Result<i32> {
         Command::Bootstrap { command } => Ok(run_bootstrap(command)),
         Command::Installation { command } => run_installation(command),
         Command::Runtime { command } => run_runtime(command),
+        Command::Setup { command } => run_setup(command),
         Command::Dispatch => run_dispatch(),
         Command::Ui => run_ui(),
+    }
+}
+
+fn run_setup(command: SetupCommand) -> Result<i32> {
+    match command {
+        SetupCommand::Apply {
+            dreamer_route,
+            watchdog_route,
+            dreamer_displayed,
+            watchdog_displayed,
+            dreamer_explicit,
+            watchdog_explicit,
+        } => first_run_flow::run_setup_apply(&first_run_flow::SetupApplyArgs {
+            dreamer_route,
+            watchdog_route,
+            dreamer_displayed,
+            watchdog_displayed,
+            dreamer_explicit,
+            watchdog_explicit,
+        }),
+        SetupCommand::Show => first_run_flow::run_setup_show(),
+        SetupCommand::Set {
+            role,
+            route,
+            displayed,
+            explicit_consent,
+        } => first_run_flow::run_setup_set(&first_run_flow::SetupSetArgs {
+            role,
+            route,
+            displayed,
+            explicit_consent,
+        }),
+        SetupCommand::Recommend {
+            automation,
+            family,
+            scope,
+        } => first_run_flow::run_setup_recommend(&first_run_flow::SetupRecommendArgs {
+            automation,
+            family,
+            scope,
+        }),
     }
 }
 
