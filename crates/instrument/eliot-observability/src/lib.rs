@@ -7,6 +7,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod field_policy;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_contracts::{
@@ -146,6 +148,11 @@ fn validate_labels(labels: &BTreeMap<String, String>) -> Result<(), Observabilit
         .iter()
         .any(|forbidden| normalized.contains(forbidden))
         {
+            return Err(ObservabilityError::SensitiveLabel);
+        }
+        // Content and secrets are replaced with immutable redacted evidence
+        // handles before span labels or metrics; a raw value here is rejected.
+        if field_policy::requires_evidence_handle(value) {
             return Err(ObservabilityError::SensitiveLabel);
         }
     }
