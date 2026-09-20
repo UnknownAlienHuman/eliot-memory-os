@@ -447,8 +447,8 @@ struct ErasureOutcomeRow {
 /// Evidence-backed erased `(scope_id, subject)` pairs for `GetEvidencePack`.
 ///
 /// `Known` carries the sealed suppression set. `Unknown` means the lookup is
-/// unavailable or unparsable; the pack returns an exact empty payload so an
-/// undecidable lookup never serves rows that could include erased records.
+/// unavailable or unparsable and the pack read must refuse fail-closed — it
+/// must never serve rows that could include erased records.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ErasureSuppression {
     Known(std::collections::BTreeSet<(String, String)>),
@@ -458,13 +458,12 @@ enum ErasureSuppression {
 impl ErasureSuppression {
     /// Returns the fail-closed suppression verdict for one exact pair.
     ///
-    /// `Unknown` suppresses the whole pack: an undecidable lookup must never
-    /// admit a possibly-erased row, and it must not turn a read into a
-    /// provider-availability error.
-    fn check(&self, scope_id: &str, subject: &str) -> bool {
+    /// `Unknown` refuses with [`StoreError::Unavailable`] even before
+    /// matching: an undecidable lookup must never admit a possibly-erased row.
+    fn check(&self, scope_id: &str, subject: &str) -> Result<bool, StoreError> {
         match self {
-            Self::Known(erased) => erased.contains(&(scope_id.to_owned(), subject.to_owned())),
-            Self::Unknown => true,
+            Self::Known(erased) => Ok(erased.contains(&(scope_id.to_owned(), subject.to_owned()))),
+            Self::Unknown => Err(StoreError::Unavailable),
         }
     }
 }
@@ -549,10 +548,10 @@ enum ErasureTable<T> {
 ///
 /// Only the exact absent-table signal naming `table` maps to `Absent`;
 /// every other error class — including those transaction-cancellation
-/// artifacts — maps to `Unknown` so the pack returns an exact empty payload
-/// instead of silently including erased records. Transport and other query
-/// failures likewise map to `Unknown` on this optional suppression lookup;
-/// they must not surface as `StoreError::Unavailable` from the pack read.
+/// artifacts — maps to `Unknown` so the pack refuses fail-closed instead of
+/// silently including erased records. Transport loss
+/// (`ProviderUnavailable`) likewise maps to `Unknown`; any other transport
+/// error propagates.
 async fn read_erasure_table<T: serde::de::DeserializeOwned>(
     db: &client::RpcTransport,
     config: &SurrealAdapterConfig,
@@ -560,8 +559,10 @@ async fn read_erasure_table<T: serde::de::DeserializeOwned>(
     sql: &str,
     table: &str,
 ) -> Result<ErasureTable<T>, AdapterError> {
-    let Ok(mut response) = client::query(db, config, operation, sql, Map::new()).await else {
-        return Ok(ErasureTable::Unknown);
+    let mut response = match client::query(db, config, operation, sql, Map::new()).await {
+        Ok(response) => response,
+        Err(AdapterError::ProviderUnavailable) => return Ok(ErasureTable::Unknown),
+        Err(error) => return Err(error),
     };
     let errors = response.take_errors();
     if !errors.is_empty() {
@@ -589,8 +590,8 @@ async fn read_erasure_table<T: serde::de::DeserializeOwned>(
 /// exact absent-table signal and read as the empty side of the join,
 /// matching the reference handler's empty suppression on a fresh store.
 /// Any other provider error or malformed envelope returns `Unknown` so the
-/// pack read returns exact empty fail-closed instead of silently including
-/// erased records.
+/// pack read refuses fail-closed instead of silently including erased
+/// records.
 async fn read_erasure_suppression(
     db: &client::RpcTransport,
     config: &SurrealAdapterConfig,
@@ -750,9 +751,8 @@ fn validate_evidence_record(
 /// 688-STORE-2: an evidence-backed erased `(scope_id, subject)` pair
 /// suppresses its records — the pack returns exact empty with
 /// `matched_total = 0` — even if rows remain in the log. `Unknown` lookup
-/// state returns the same exact empty payload fail-closed instead of
-/// surfacing `StoreError::Unavailable` or serving rows that may include
-/// erased records.
+/// state refuses fail-closed with [`StoreError::Unavailable`] instead of
+/// serving rows that may include erased records.
 #[allow(
     clippy::too_many_lines,
     reason = "the pack payload validates shape, bound, suppression, fence, walk, and provenance in one closed unit"
@@ -806,14 +806,11 @@ fn evidence_pack_payload(
         return Err(StoreError::PayloadTooLarge);
     }
     let limit = usize::try_from(max_records).map_err(|_| StoreError::PayloadTooLarge)?;
-    if query.state_fence != *state_fence {
-        return Err(StoreError::FenceMismatch);
-    }
     // Evidence-backed suppression (688-STORE-2, memory parity): a sealed
     // erased pair returns exact empty even when capture rows remain.
-    // `Unknown` lookup state takes the same fail-closed empty path, so the
-    // pack never silently includes erased records or emits Unavailable.
-    if suppression.check(scope_id.as_str(), subject) {
+    // `Unknown` lookup state refuses here — before any row is admitted —
+    // so the pack never silently includes erased records.
+    if suppression.check(scope_id.as_str(), subject)? {
         return Ok(json!({
             "version": EVIDENCE_PACK_PAYLOAD_VERSION,
             "subject": subject,
@@ -828,6 +825,10 @@ fn evidence_pack_payload(
             },
         }));
     }
+    if query.state_fence != *state_fence {
+        return Err(StoreError::FenceMismatch);
+    }
+
     // Durable capture order: receipts by commit_sequence (pre-change rows
     // without a sequence sort first and contribute zero), evidence within a
     // receipt by operation_index.
@@ -2131,19 +2132,18 @@ mod admitted_read_tests {
     }
 
     #[test]
-    fn evidence_pack_returns_empty_fail_closed_when_erasure_lookup_is_unknown() {
+    fn evidence_pack_refuses_fail_closed_when_erasure_lookup_is_unknown() {
         // 688-STORE-2: an unavailable/unparsable erasure-outcome lookup
-        // returns an exact empty pack instead of surfacing `Unavailable` or
-        // silently including records that may have been erased.
+        // refuses with `Unavailable` instead of silently including records
+        // that may have been erased.
         let fence = test_fence();
         let rows = vec![evidence_row_for("op-unknown-1", "evidence-alpha", 1)];
         let query = evidence_query("evidence-alpha", "10");
-        let payload = evidence_pack_payload(&query, &fence, &rows, &ErasureSuppression::Unknown)
-            .expect("unknown suppression state returns a closed empty pack");
-        assert!(payload["records"].as_array().is_some_and(Vec::is_empty));
-        assert_eq!(payload["provenance"]["matched_total"], json!(0));
-        assert_eq!(payload["provenance"]["returned"], json!(0));
-        assert_eq!(payload["provenance"]["truncated"], json!(false));
+        assert_eq!(
+            evidence_pack_payload(&query, &fence, &rows, &ErasureSuppression::Unknown),
+            Err(StoreError::Unavailable),
+            "unknown suppression state must refuse the pack read"
+        );
     }
 
     // --- T11.3 cognitive reads (real plan outputs, no canned rows) ---
