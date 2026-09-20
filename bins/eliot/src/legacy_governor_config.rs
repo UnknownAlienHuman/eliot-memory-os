@@ -33,6 +33,16 @@
 //! No `runtime.toml` exists in-tree; the Appendix C candidate is FORBIDDEN to
 //! load or create here (handoff to the Kernel owner).
 //!
+//! Canonical replacement (#1966, I3.9): the Governor-owned typed precedence
+//! surface `eliotd::canonical_config_precedence` resolves the proven
+//! `task.budget.per_job` chain across all seven canonical layers
+//! (compiled defaults → installation → System Owner → `WorkScope` Profile →
+//! task → session token → exact human approval) from typed TOML/JSON with a
+//! published schema. Lower layers narrow only; expansion needs an explicit
+//! higher-layer delegation, and scripts are invalid policy input. This module
+//! adopts nothing from the legacy file; it only names that surface while the
+//! S9 integrator owns final removal.
+//!
 //! Lifecycle note (not duplicated here):
 //! `workstreams/legacy/retirement-1189.toml` owns this file's lifecycle
 //! (T7-S1 ledger; final removal is S9 integrator-owned) and #1219 owns the
@@ -48,7 +58,7 @@ use std::path::Path;
 /// Kernel canonical surface.
 #[must_use]
 pub(super) fn migration_action() -> &'static str {
-    "Migration action: delete LocalAppData\\Eliot\\config\\governor.toml and configure queue/admission/durable state only through the Kernel canonical configuration surface (Host-managed StoreLaunchConfig bound to the installation manifest / durable transaction store; Governor operates only as outbound-only eliotd polling Kernel). delegation_calibration policy has no Kernel surface yet (handoff to the Kernel owner, #1687 follow-up); no runtime.toml exists in-tree and must not be created or loaded (Appendix C candidate FORBIDDEN). File lifecycle: workstreams/legacy/retirement-1189.toml (T7-S1 ledger, S9 integrator-owned); adjacent root config/: #1219. Remove the legacy file and retry with no legacy config."
+    "Migration action: delete LocalAppData\\Eliot\\config\\governor.toml and configure queue/admission/durable state only through the Kernel canonical configuration surface (Host-managed StoreLaunchConfig bound to the installation manifest / durable transaction store; Governor operates only as outbound-only eliotd polling Kernel). Typed Governor policy resolves only through eliotd::canonical_config_precedence (seven-layer TOML/JSON precedence with generated schema; lower layers narrow unless a higher layer delegates the exact expansion; scripts are invalid policy). delegation_calibration policy has no Kernel surface yet (handoff to the Kernel owner, #1687 follow-up); no runtime.toml exists in-tree and must not be created or loaded (Appendix C candidate FORBIDDEN). File lifecycle: workstreams/legacy/retirement-1189.toml (T7-S1 ledger, S9 integrator-owned); adjacent root config/: #1219. Remove the legacy file and retry with no legacy config."
 }
 
 /// Detects which retired legacy sections/keys a decoded text mentions, in
@@ -214,5 +224,18 @@ mod tests {
     #[test]
     fn absent_legacy_config_allows_canary_install_path() {
         assert!(gate_legacy_config_observation(None).is_ok());
+    }
+
+    #[test]
+    fn migration_action_names_canonical_precedence_surface() {
+        let action = super::migration_action();
+        assert!(
+            action.contains("eliotd::canonical_config_precedence"),
+            "must name canonical surface: {action}"
+        );
+        assert!(
+            action.contains("seven-layer"),
+            "must name seven-layer precedence: {action}"
+        );
     }
 }

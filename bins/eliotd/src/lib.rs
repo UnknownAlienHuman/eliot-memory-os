@@ -35,6 +35,7 @@ use std::sync::atomic::Ordering;
 
 mod activation_projection;
 pub mod agent_fabric;
+pub mod canonical_config_precedence;
 mod controlboard_adapters;
 mod daemon_config;
 mod daemon_kernel_client;
@@ -74,6 +75,12 @@ use controlboard_adapters::SharedOperatorReplay;
 #[cfg(test)]
 use activation_projection::map_activation_snapshot;
 
+pub use canonical_config_precedence::{
+    ALL_LAYERS, CANONICAL_SETTING_KEY, ConfigLayer, LayerInput, PrecedenceError, ResolvedChain,
+    ResolvedContribution, canonical_layer_json_schema, canonical_layer_json_schema_pretty,
+    classify_policy_input, parse_canonical_layer_json, parse_canonical_layer_toml,
+    resolve_canonical_chain,
+};
 pub use daemon_config::DaemonConfig;
 pub(crate) use daemon_kernel_client::kernel_port_error;
 pub use daemon_kernel_client::{DaemonKernelClient, LocalReadSubmitOutcome, OwnerSessionFacts};
