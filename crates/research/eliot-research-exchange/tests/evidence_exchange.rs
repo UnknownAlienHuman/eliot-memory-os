@@ -21,9 +21,9 @@ use eliot_research_exchange::{
     },
 };
 use eliot_research_exchange_api::{
-    AllowedReferenceManifest, AnchorPrecision, CompletionDisposition, DisclosureClass,
-    ExactCitation, ResearchClaim, ResearchEvidenceBundle, ResearchQueryRequest, SourceClass,
-    SourceSnapshot,
+    AllowedReferenceManifest, AnchorPrecision, CompletionDisposition, CoverageGap, CoverageGapKind,
+    DisclosureClass, ExactCitation, ResearchClaim, ResearchEvidenceBundle, ResearchQueryRequest,
+    SourceClass, SourceSnapshot,
 };
 
 const GOLDEN: &str = include_str!("data/evidence_exchange.json");
@@ -128,6 +128,7 @@ fn bundle(job_id: &str) -> ResearchEvidenceBundle {
         artifact_handles: Vec::new(),
         coverage_unknowns: Vec::new(),
         failed_acquisition: Vec::new(),
+        coverage_gaps: Vec::new(),
         disposition: CompletionDisposition::AnsweredWithSupportedResult,
         synthesis_is_candidate: true,
         disclosure: DisclosureClass::ProjectBound,
@@ -453,4 +454,256 @@ fn terminal_partial_cancel_unknown_never_decode_as_complete() {
     assert!(GOLDEN.contains("evidence_exchange"));
     assert!(GOLDEN.contains("work_unit_case"));
     assert!(GOLDEN.lines().count() > 30);
+}
+
+fn gap(handle: &str, kind: CoverageGapKind) -> CoverageGap {
+    CoverageGap {
+        source_handle: handle.to_owned(),
+        kind,
+        detail: format!("{handle} unavailable under test"),
+    }
+}
+
+/// Bridge that refuses to mint a second provider job: any resumed
+/// idempotency key must be served from the durable snapshot, never by
+/// duplicating the acquisition.
+struct RejectResubmitBridge;
+
+impl ResearchBridge for RejectResubmitBridge {
+    type Error = ExchangeError;
+
+    fn submit(&mut self, _request: &ResearchQueryRequest) -> Result<String, Self::Error> {
+        Err(ExchangeError::InvalidTransition)
+    }
+
+    fn cancel(&mut self, _job_id: &str) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+// WORK_UNIT_CASE: 1766/1
+#[test]
+fn interrupted_exchange_resumes_by_idempotency_with_partial_progress() {
+    let req = request();
+    let mut exchange = GovernedExchange::new(TestBridge {
+        issued: Vec::new(),
+        cancelled: Vec::new(),
+    });
+    let job = exchange.submit(req.clone()).expect("submit");
+    let job_id = job.job_id.clone();
+    exchange.mark_running(&job_id, &fence()).expect("running");
+    exchange
+        .record_progress(&job_id, &fence(), 3)
+        .expect("progress 3");
+    exchange
+        .record_progress(&job_id, &fence(), 2)
+        .expect("progress 2");
+    let snapshot = exchange.snapshot().clone();
+    assert_eq!(
+        snapshot
+            .jobs
+            .get(&job_id)
+            .expect("durable job")
+            .progress_units,
+        5
+    );
+    // Interrupt: rebuild over a bridge that refuses new submissions.
+    let mut restored = GovernedExchange::from_snapshot(RejectResubmitBridge, snapshot);
+    let resumed = restored.resume("idem-700", &req).expect("resume");
+    assert_eq!(resumed.job_id, job_id);
+    assert_eq!(resumed.progress_units, 5);
+    assert_eq!(resumed.status, ExchangeStatus::Partial);
+    assert!(resumed.result.is_none());
+    // The mutating resume path is served from the snapshot as well.
+    let resubmitted = restored.submit(req.clone()).expect("resubmit");
+    assert_eq!(resubmitted.job_id, job_id);
+    assert_eq!(resubmitted.progress_units, 5);
+    // The same key bound to different content conflicts instead of forking.
+    let mut forked = req.clone();
+    forked.question = "a different question".to_owned();
+    assert_eq!(
+        restored.resume("idem-700", &forked),
+        Err(ExchangeError::IdempotencyConflict)
+    );
+    assert_eq!(
+        restored.submit(forked),
+        Err(ExchangeError::IdempotencyConflict)
+    );
+    assert!(matches!(
+        restored.resume("idem-unknown", &req),
+        Err(ExchangeError::NotFound)
+    ));
+    // Progress continues after resume, then a supported close completes.
+    restored
+        .mark_running(&job_id, &fence())
+        .expect("running again");
+    restored
+        .record_progress(&job_id, &fence(), 1)
+        .expect("more progress");
+    assert_eq!(
+        restored
+            .snapshot()
+            .jobs
+            .get(&job_id)
+            .expect("job")
+            .progress_units,
+        6
+    );
+    let result = bundle(&job_id);
+    result.validate_against(&req).expect("valid close");
+    restored.import_bundle(result).expect("import");
+    assert_eq!(
+        restored.snapshot().jobs.get(&job_id).expect("job").status,
+        ExchangeStatus::Completed
+    );
+}
+
+// WORK_UNIT_CASE: 1766/2
+#[test]
+fn unavailable_sources_yield_typed_coverage_gaps() {
+    use eliot_research_exchange_api::ResearchContractError;
+
+    let req = request();
+    // Degradation without typed gaps is rejected at the contract.
+    let mut bare = bundle("job-gaps");
+    bare.sources = vec![snapshot("src-a")];
+    bare.claims = vec![claim("src-a", "a partial finding")];
+    bare.disposition = CompletionDisposition::SourceUnavailable;
+    assert!(matches!(
+        bare.validate_against(&req),
+        Err(ResearchContractError::InvalidDisposition)
+    ));
+    let mut incomplete_bare = bare.clone();
+    incomplete_bare.disposition = CompletionDisposition::IncompleteCoverage;
+    assert!(matches!(
+        incomplete_bare.validate_against(&req),
+        Err(ResearchContractError::InvalidDisposition)
+    ));
+    // A typed gap carries the unavailable source distinctly from lineage.
+    let mut degraded = bare.clone();
+    degraded.coverage_gaps = vec![gap("src-b", CoverageGapKind::SourceUnavailable)];
+    degraded
+        .validate_against(&req)
+        .expect("typed gaps validate");
+    assert!(degraded.has_typed_coverage_gaps());
+    assert_eq!(degraded.typed_gap_handles(), vec!["src-b"]);
+    // A gap colliding with delivered lineage is rejected.
+    let mut colliding = bare.clone();
+    colliding.coverage_gaps = vec![gap("src-a", CoverageGapKind::Timeout)];
+    assert!(matches!(
+        colliding.validate_against(&req),
+        Err(ResearchContractError::InvalidDisposition)
+    ));
+    // Duplicate gap identities are rejected.
+    let mut duplicated = bare.clone();
+    duplicated.coverage_gaps = vec![
+        gap("src-b", CoverageGapKind::SourceUnavailable),
+        gap("src-b", CoverageGapKind::Timeout),
+    ];
+    assert!(matches!(
+        duplicated.validate_against(&req),
+        Err(ResearchContractError::DuplicateIdentity { .. })
+    ));
+    // A supported answer cannot carry gaps.
+    let mut answered_with_gaps = bundle("job-gaps");
+    answered_with_gaps.coverage_gaps = vec![gap("src-b", CoverageGapKind::SourceUnavailable)];
+    assert!(matches!(
+        answered_with_gaps.validate_against(&req),
+        Err(ResearchContractError::InvalidDisposition)
+    ));
+    // The exchange persists the degraded close durably: completed but open.
+    let (mut exchange, job_id) = submitted_job();
+    let mut closing = bundle(&job_id);
+    closing.sources = vec![snapshot("src-a")];
+    closing.claims = vec![claim("src-a", "a partial finding")];
+    closing.disposition = CompletionDisposition::SourceUnavailable;
+    closing.coverage_gaps = vec![gap("src-b", CoverageGapKind::SourceUnavailable)];
+    let job = exchange
+        .import_bundle(closing.clone())
+        .expect("import degraded");
+    assert_eq!(job.status, ExchangeStatus::Completed);
+    assert_eq!(
+        handoff::terminal_of(closing.disposition, job.status),
+        HandoffTerminal::PartialOpen
+    );
+    assert_eq!(
+        exchange.audit_handoff(&job_id, REVISION, EXPIRES_MS),
+        Err(HandoffError::InvalidTerminal)
+    );
+    let sealed = handoff::seal_handoff(&closing, &req, REVISION, EXPIRES_MS).expect("seal gaps");
+    assert_eq!(sealed.coverage_gap_handles, vec!["src-b".to_owned()]);
+    let mut other_kind = closing.clone();
+    other_kind.coverage_gaps = vec![gap("src-b", CoverageGapKind::Timeout)];
+    let resealed = handoff::seal_handoff(&other_kind, &req, REVISION, EXPIRES_MS).expect("reseal");
+    assert_ne!(sealed.seal_digest, resealed.seal_digest);
+}
+
+// WORK_UNIT_CASE: 1766/3
+#[test]
+fn empty_exchanges_cannot_close_as_supported_answers() {
+    use eliot_research_exchange_api::ResearchContractError;
+
+    let req = request();
+    // No sources and no claims.
+    let mut no_sources = bundle("job-empty");
+    no_sources.sources = Vec::new();
+    no_sources.claims = Vec::new();
+    assert!(matches!(
+        no_sources.validate_against(&req),
+        Err(ResearchContractError::InvalidDisposition)
+    ));
+    // Sources present but no claims.
+    let mut no_claims = bundle("job-empty");
+    no_claims.claims = Vec::new();
+    assert!(matches!(
+        no_claims.validate_against(&req),
+        Err(ResearchContractError::InvalidDisposition)
+    ));
+    // A claim without citations cannot support an answer.
+    let mut bare_claim = bundle("job-empty");
+    bare_claim.claims = vec![ResearchClaim {
+        claim_id: "claim-lonely".to_owned(),
+        statement: "an unsupported statement".to_owned(),
+        citations: Vec::new(),
+        counterclaim_ids: Vec::new(),
+        confidence_note: "low confidence".to_owned(),
+    }];
+    assert!(matches!(
+        bare_claim.validate_against(&req),
+        Err(ResearchContractError::CitationNotAllowed)
+    ));
+    // Untyped unknowns also block a supported close.
+    let mut with_unknowns = bundle("job-empty");
+    with_unknowns.coverage_unknowns = vec!["something unknown".to_owned()];
+    assert!(matches!(
+        with_unknowns.validate_against(&req),
+        Err(ResearchContractError::InvalidDisposition)
+    ));
+    // Honest absence under a complete-scope disposition still validates.
+    let mut no_match = bundle("job-empty");
+    no_match.sources = Vec::new();
+    no_match.claims = Vec::new();
+    no_match.disposition = CompletionDisposition::NoMatchInCompleteScope;
+    no_match
+        .validate_against(&req)
+        .expect("honest no-match validates");
+    // The exchange enforces the same boundary on import.
+    let (mut exchange, job_id) = submitted_job();
+    let mut empty_supported = bundle(&job_id);
+    empty_supported.sources = Vec::new();
+    empty_supported.claims = Vec::new();
+    assert!(matches!(
+        exchange.import_bundle(empty_supported),
+        Err(ExchangeError::Contract(_))
+    ));
+    let mut honest = bundle(&job_id);
+    honest.sources = Vec::new();
+    honest.claims = Vec::new();
+    honest.disposition = CompletionDisposition::NoMatchInCompleteScope;
+    let job = exchange.import_bundle(honest).expect("honest import");
+    assert_eq!(job.status, ExchangeStatus::Completed);
+    assert_eq!(
+        handoff::terminal_of(CompletionDisposition::NoMatchInCompleteScope, job.status),
+        HandoffTerminal::Finished
+    );
 }

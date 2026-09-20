@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub const CONTRACT_NAME: &str = "eliot.research.exchange-api";
-pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);
+pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 1, 0);
 
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
 pub enum ResearchContractError {
@@ -113,6 +113,49 @@ impl CompletionDisposition {
             self,
             Self::AnsweredWithSupportedResult | Self::NoMatchInCompleteScope
         )
+    }
+
+    #[must_use]
+    pub const fn requires_typed_coverage_gaps(self) -> bool {
+        matches!(
+            self,
+            Self::SourceUnavailable | Self::StaleSourceOrIndex | Self::IncompleteCoverage
+        )
+    }
+}
+
+/// Typed reason one source contributes no evidence. Timeout, cancellation,
+/// crash-adjacent unavailability, stale indexes, policy denial and unknown
+/// provider outcomes remain distinct: an unavailable source never decodes as
+/// an empty-but-complete scope.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CoverageGapKind {
+    SourceUnavailable,
+    StaleSourceOrIndex,
+    PolicyOrDisclosureDenied,
+    BudgetExhausted,
+    Timeout,
+    Cancelled,
+    Unknown,
+}
+
+/// One typed coverage gap: an unavailable source identity plus the distinct
+/// reason it yields no evidence. Gaps are degradation evidence, not
+/// absence/completeness claims.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CoverageGap {
+    pub source_handle: String,
+    pub kind: CoverageGapKind,
+    pub detail: String,
+}
+
+impl CoverageGap {
+    pub fn validate(&self) -> Result<(), ResearchContractError> {
+        text(&self.source_handle, "gap.source_handle")?;
+        text(&self.detail, "gap.detail")?;
+        Ok(())
     }
 }
 
@@ -280,6 +323,8 @@ pub struct ResearchEvidenceBundle {
     pub artifact_handles: Vec<String>,
     pub coverage_unknowns: Vec<String>,
     pub failed_acquisition: Vec<String>,
+    #[serde(default)]
+    pub coverage_gaps: Vec<CoverageGap>,
     pub disposition: CompletionDisposition,
     pub synthesis_is_candidate: bool,
     pub disclosure: DisclosureClass,
@@ -304,9 +349,40 @@ impl ResearchEvidenceBundle {
         text(&self.job_id, "bundle.job_id")?;
         text(&self.system_generation, "bundle.system_generation")?;
         text(&self.origin_authentication, "bundle.origin_authentication")?;
-        if self.sources.is_empty()
-            && self.disposition == CompletionDisposition::AnsweredWithSupportedResult
-        {
+        for unknown in &self.coverage_unknowns {
+            text(unknown, "bundle.coverage_unknowns")?;
+        }
+        for failed in &self.failed_acquisition {
+            text(failed, "bundle.failed_acquisition")?;
+        }
+        let mut seen_gaps = BTreeSet::new();
+        for gap in &self.coverage_gaps {
+            gap.validate()?;
+            if !seen_gaps.insert(&gap.source_handle) {
+                return Err(ResearchContractError::DuplicateIdentity {
+                    field: "bundle.coverage_gaps",
+                });
+            }
+        }
+        if self.coverage_gaps.iter().any(|gap| {
+            self.sources
+                .iter()
+                .any(|s| s.source_handle == gap.source_handle)
+        }) {
+            return Err(ResearchContractError::InvalidDisposition);
+        }
+        if self.disposition == CompletionDisposition::AnsweredWithSupportedResult {
+            if self.sources.is_empty() || self.claims.is_empty() {
+                return Err(ResearchContractError::InvalidDisposition);
+            }
+            if !self.coverage_gaps.is_empty()
+                || !self.coverage_unknowns.is_empty()
+                || !self.failed_acquisition.is_empty()
+            {
+                return Err(ResearchContractError::InvalidDisposition);
+            }
+        }
+        if self.disposition.requires_typed_coverage_gaps() && self.coverage_gaps.is_empty() {
             return Err(ResearchContractError::InvalidDisposition);
         }
         for source in &self.sources {
@@ -343,6 +419,22 @@ impl ResearchEvidenceBundle {
             }
         }
         Ok(())
+    }
+
+    #[must_use]
+    pub fn has_typed_coverage_gaps(&self) -> bool {
+        !self.coverage_gaps.is_empty()
+    }
+
+    #[must_use]
+    pub fn typed_gap_handles(&self) -> Vec<&str> {
+        let mut handles: Vec<&str> = self
+            .coverage_gaps
+            .iter()
+            .map(|gap| gap.source_handle.as_str())
+            .collect();
+        handles.sort_unstable();
+        handles
     }
 }
 

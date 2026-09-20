@@ -89,9 +89,45 @@ impl<B> GovernedExchange<B> {
     pub fn into_parts(self) -> (B, ExchangeSnapshot) {
         (self.bridge, self.snapshot)
     }
+
+    /// Read-only resume lookup: returns the durable job bound to one
+    /// idempotency key, preserving partial progress across restarts.
+    /// Returns `None` when the key was never accepted.
+    #[must_use]
+    pub fn job_by_idempotency(&self, idempotency_key: &str) -> Option<ExchangeJob> {
+        self.snapshot
+            .idempotency
+            .get(idempotency_key)
+            .and_then(|job_id| self.snapshot.jobs.get(job_id))
+            .cloned()
+    }
+
+    /// Resumes an interrupted exchange by idempotency identity without
+    /// contacting the bridge: the stored request must equal the supplied
+    /// request, otherwise the key is bound to different content. Partial
+    /// progress (`status`, `progress_units`, delivered `result`) is preserved
+    /// exactly as captured in the snapshot.
+    pub fn resume(
+        &self,
+        idempotency_key: &str,
+        request: &ResearchQueryRequest,
+    ) -> Result<ExchangeJob, ExchangeError> {
+        request.validate()?;
+        let job = self
+            .job_by_idempotency(idempotency_key)
+            .ok_or(ExchangeError::NotFound)?;
+        if job.request != *request {
+            return Err(ExchangeError::IdempotencyConflict);
+        }
+        Ok(job)
+    }
 }
 
 impl<B: ResearchBridge> GovernedExchange<B> {
+    /// Accepts one query, or resumes the interrupted exchange already bound
+    /// to its idempotency key with partial progress preserved. A resumed
+    /// key never re-contacts the bridge, so at most one provider job exists
+    /// per identity.
     pub fn submit(&mut self, request: ResearchQueryRequest) -> Result<ExchangeJob, ExchangeError> {
         request.validate()?;
         if let Some(job_id) = self.snapshot.idempotency.get(&request.idempotency_key) {

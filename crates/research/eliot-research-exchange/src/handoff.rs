@@ -15,8 +15,8 @@ use std::collections::BTreeMap;
 
 use eliot_contracts::sha256_hex;
 use eliot_research_exchange_api::{
-    CompletionDisposition, DisclosureClass, ResearchContractError, ResearchEvidenceBundle,
-    ResearchQueryRequest,
+    CompletionDisposition, CoverageGapKind, DisclosureClass, ResearchContractError,
+    ResearchEvidenceBundle, ResearchQueryRequest,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -307,6 +307,10 @@ pub struct HandoffSeal {
     pub manifest_revision: String,
     /// Cited source handles in frozen sorted order.
     pub cited_handles: Vec<String>,
+    /// Typed coverage-gap source handles in frozen sorted order: degradation
+    /// omissions are sealed evidence and cannot be silently dropped.
+    #[serde(default)]
+    pub coverage_gap_handles: Vec<String>,
     /// Statement digests in frozen sorted order: statements stay
     /// tamper-evident data and are never interpreted.
     pub statement_digests: Vec<String>,
@@ -336,6 +340,18 @@ fn disclosure_wire(class: DisclosureClass) -> &'static str {
         DisclosureClass::ProjectBound => "project_bound",
         DisclosureClass::ExportableRedacted => "exportable_redacted",
         DisclosureClass::Public => "public",
+    }
+}
+
+fn gap_kind_wire(kind: CoverageGapKind) -> &'static str {
+    match kind {
+        CoverageGapKind::SourceUnavailable => "source_unavailable",
+        CoverageGapKind::StaleSourceOrIndex => "stale_source_or_index",
+        CoverageGapKind::PolicyOrDisclosureDenied => "policy_or_disclosure_denied",
+        CoverageGapKind::BudgetExhausted => "budget_exhausted",
+        CoverageGapKind::Timeout => "timeout",
+        CoverageGapKind::Cancelled => "cancelled",
+        CoverageGapKind::Unknown => "unknown",
     }
 }
 
@@ -406,6 +422,16 @@ fn seal_preimage(
     for handle in &cited {
         push_field(&mut preimage, "cited", handle);
     }
+    let mut gaps: Vec<String> = bundle
+        .coverage_gaps
+        .iter()
+        .map(|gap| format!("{}:{}", gap.source_handle, gap_kind_wire(gap.kind)))
+        .collect();
+    gaps.sort();
+    push_count(&mut preimage, "gaps", gaps.len());
+    for gap in &gaps {
+        push_field(&mut preimage, "gap", gap);
+    }
     push_count(&mut preimage, "sources", source_digests.len());
     for digest in &source_digests {
         push_field(&mut preimage, "source_digest", digest);
@@ -422,7 +448,8 @@ fn seal_preimage(
 /// request. Checks exact manifest membership through the existing bundle
 /// validation, requires delivered source lineage behind every citation (a
 /// provider summary without raw lineage never replaces evidence), preserves
-/// the admitted disclosure class without widening, and binds the frozen
+/// the admitted disclosure class without widening, binds typed coverage gaps
+/// so degradation omissions cannot be silently dropped, and binds the frozen
 /// manifest digest and revision. Source statements enter the seal only as
 /// digests: instruction-like content stays inert data.
 pub fn seal_handoff(
@@ -470,6 +497,13 @@ pub fn seal_handoff(
         .collect();
     cited.sort();
     cited.dedup();
+    let mut gap_handles: Vec<String> = bundle
+        .coverage_gaps
+        .iter()
+        .map(|gap| gap.source_handle.clone())
+        .collect();
+    gap_handles.sort();
+    gap_handles.dedup();
     let mut statement_digests: Vec<String> = bundle
         .claims
         .iter()
@@ -486,6 +520,7 @@ pub fn seal_handoff(
         manifest_digest: request.allowed_references.digest.clone(),
         manifest_revision: manifest_revision.to_owned(),
         cited_handles: cited,
+        coverage_gap_handles: gap_handles,
         statement_digests,
         expires_ms,
         seal_digest: sha256_hex(preimage.as_bytes()),
