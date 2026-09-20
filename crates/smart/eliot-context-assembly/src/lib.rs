@@ -10,14 +10,17 @@ mod assemble;
 mod bounds;
 mod error;
 mod measurement;
+mod readback;
 mod render;
 
 pub use assemble::{
     ASSEMBLY_ORDERING_REVISION, ActiveUnderstandingViewResult, AssemblyPolicy, assemble_active_view,
 };
 pub use error::AssemblyError;
+pub use readback::{ReopenedSource, gate_citation};
 
 pub use eliot_context_contracts::{
-    ActiveUnderstandingView, AdmittedContextSet, ContextError, ContextOutcome, QualityScorecard,
-    RenderedAtom, SelectionIntegrityProof, SerializedContextMeasurement,
+    ActiveUnderstandingView, AdmittedContextSet, ContextError, ContextOutcome, IndexPreview,
+    PreviewAuthority, ProjectedCitation, QualityScorecard, ReadbackRefusal, ReadbackRefusalKind,
+    ReadbackRequest, RenderedAtom, SelectionIntegrityProof, SerializedContextMeasurement,
 };
