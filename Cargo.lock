@@ -1628,6 +1628,7 @@ dependencies = [
  "eliot-evidence",
  "schemars",
  "serde",
+ "serde_json",
  "thiserror",
 ]
 
@@ -2165,9 +2166,11 @@ name = "eliot-memory-curation"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "eliot-contracts",
+ "eliot-epistemic",
+ "eliot-evidence",
  "schemars",
  "serde",
- "serde_json",
  "thiserror",
 ]
 

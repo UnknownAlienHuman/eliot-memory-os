@@ -1,6 +1,6 @@
 //! Explicit lifecycle receipts for semantic-state transitions (#1905).
 //!
-//! One raw observation stays an [`SemanticRole::ObservationCandidate`] until an
+//! One raw observation stays a [`LifecycleRole::ObservationCandidate`] until an
 //! explicit, receipted transition moves it. Every role/status change carries
 //! immutable inputs, source anchors, actor authority, scope/fence, evidence,
 //! outcome, and an `AppendAuditEvent` linkage. Corrections are forward
@@ -27,6 +27,9 @@ pub enum LifecycleError {
     /// The same input handle was named twice.
     #[error("lifecycle receipt names a duplicate handle")]
     DuplicateInput,
+    /// Handles are present but not in sorted order.
+    #[error("lifecycle handles must be in sorted order")]
+    UnsortedInputs,
     /// A digest is not lowercase SHA-256 hex.
     #[error("{field} must be a lowercase SHA-256 digest")]
     InvalidDigest { field: &'static str },
@@ -45,6 +48,9 @@ pub enum LifecycleError {
     /// A correction names no superseded handle.
     #[error("correction requires a forward supersession link")]
     NotForwardRevision,
+    /// A refused promotion changes standing or mints a supersession.
+    #[error("refused promotion must hold prior role and status with no supersession")]
+    RefusedPromotionMustHold,
     /// A superseded handle is not among the transition inputs.
     #[error("superseded handle is outside the transition inputs")]
     SupersededOutsideInputs,
@@ -98,11 +104,15 @@ fn digest(value: &str, field: &'static str) -> Result<(), LifecycleError> {
 ///
 /// `ObservationCandidate` is the only standing a raw capture holds by
 /// itself. Every other role needs an explicit, receipted transition.
+///
+/// Named `LifecycleRole` (not `SemanticRole`) to avoid collision with the
+/// context-unit `SemanticRole` in `eliot-context-contracts`, which classifies
+/// whole context units rather than lifecycle standing.
 #[derive(
     Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize, JsonSchema,
 )]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum SemanticRole {
+pub enum LifecycleRole {
     /// Retained capture; no claim, instruction, or proof standing.
     ObservationCandidate,
     /// Governed proposition with support and counterevidence.
@@ -119,7 +129,7 @@ pub enum SemanticRole {
     VerifierBacked,
 }
 
-impl SemanticRole {
+impl LifecycleRole {
     /// Elevated roles a bare paraphrase must never inherit.
     pub const fn is_elevated(self) -> bool {
         matches!(
@@ -272,9 +282,9 @@ pub struct LifecycleReceiptParams {
     /// Exact source anchor behind the inputs.
     pub source_anchor: SourceAnchor,
     /// Semantic role before the transition.
-    pub prior_role: SemanticRole,
+    pub prior_role: LifecycleRole,
     /// Semantic role proposed by the transition.
-    pub proposed_role: SemanticRole,
+    pub proposed_role: LifecycleRole,
     /// Epistemic status before the transition.
     pub prior_status: EpistemicStatus,
     /// Epistemic status proposed by the transition.
@@ -306,8 +316,12 @@ pub struct LifecycleReceiptParams {
 }
 
 /// One explicit semantic-state transition with its stable receipt.
+///
+/// Deserialization is gated through [`LifecycleReceipt::new`] via the checked
+/// wire mirror below, so JSON input cannot bypass sorted-unique ordering,
+/// basis validation, or the frozen digest.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, try_from = "LifecycleReceiptWire")]
 pub struct LifecycleReceipt {
     /// Stable receipt identity.
     pub receipt_id: ArtifactId,
@@ -316,9 +330,9 @@ pub struct LifecycleReceipt {
     /// Exact source anchor behind the inputs.
     pub source_anchor: SourceAnchor,
     /// Semantic role before the transition.
-    pub prior_role: SemanticRole,
+    pub prior_role: LifecycleRole,
     /// Semantic role proposed by the transition.
-    pub proposed_role: SemanticRole,
+    pub proposed_role: LifecycleRole,
     /// Epistemic status before the transition.
     pub prior_status: EpistemicStatus,
     /// Epistemic status proposed by the transition.
@@ -357,8 +371,8 @@ struct ReceiptDigestShape<'a> {
     receipt_id: &'a ArtifactId,
     input_record_ids: &'a [ArtifactId],
     source_anchor: &'a SourceAnchor,
-    prior_role: &'a SemanticRole,
-    proposed_role: &'a SemanticRole,
+    prior_role: &'a LifecycleRole,
+    proposed_role: &'a LifecycleRole,
     prior_status: &'a EpistemicStatus,
     proposed_status: &'a EpistemicStatus,
     actor: &'a ActorIdentity,
@@ -382,6 +396,81 @@ fn sorted_unique(handles: Vec<ArtifactId>) -> Result<Vec<ArtifactId>, LifecycleE
         return Err(LifecycleError::DuplicateInput);
     }
     Ok(ordered)
+}
+
+/// Re-checks sorted-unique ordering on the read path, so `validate` enforces
+/// what `new` normalizes even for receipts built outside the constructor.
+fn check_sorted_unique(handles: &[ArtifactId]) -> Result<(), LifecycleError> {
+    if handles.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(LifecycleError::DuplicateInput);
+    }
+    if handles
+        .windows(2)
+        .any(|pair| pair[0].as_str() >= pair[1].as_str())
+    {
+        return Err(LifecycleError::UnsortedInputs);
+    }
+    Ok(())
+}
+
+/// Checked wire mirror of [`LifecycleReceipt`]: deserialization validates via `new`.
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct LifecycleReceiptWire {
+    receipt_id: ArtifactId,
+    input_record_ids: Vec<ArtifactId>,
+    source_anchor: SourceAnchor,
+    prior_role: LifecycleRole,
+    proposed_role: LifecycleRole,
+    prior_status: EpistemicStatus,
+    proposed_status: EpistemicStatus,
+    actor: ActorIdentity,
+    scope: String,
+    clock: ClockReading,
+    state_fence: StateFence,
+    evidence_refs: Vec<ArtifactId>,
+    counterevidence_refs: Vec<ArtifactId>,
+    outcome: AdmissionOutcome,
+    qualifying_basis: Option<QualifyingBasis>,
+    supersedes: Vec<ArtifactId>,
+    output_record_id: ArtifactId,
+    audit_event_id: Option<ArtifactId>,
+    proof_digest: String,
+    digest: String,
+}
+
+impl TryFrom<LifecycleReceiptWire> for LifecycleReceipt {
+    type Error = LifecycleError;
+
+    fn try_from(wire: LifecycleReceiptWire) -> Result<Self, LifecycleError> {
+        let receipt = Self::new(LifecycleReceiptParams {
+            receipt_id: wire.receipt_id,
+            input_record_ids: wire.input_record_ids,
+            source_anchor: wire.source_anchor,
+            prior_role: wire.prior_role,
+            proposed_role: wire.proposed_role,
+            prior_status: wire.prior_status,
+            proposed_status: wire.proposed_status,
+            actor: wire.actor,
+            scope: wire.scope,
+            clock: wire.clock,
+            state_fence: wire.state_fence,
+            evidence_refs: wire.evidence_refs,
+            counterevidence_refs: wire.counterevidence_refs,
+            outcome: wire.outcome,
+            qualifying_basis: wire.qualifying_basis,
+            supersedes: wire.supersedes,
+            output_record_id: wire.output_record_id,
+            audit_event_id: wire.audit_event_id,
+            proof_digest: wire.proof_digest,
+        })?;
+        if receipt.digest != wire.digest {
+            return Err(LifecycleError::InvalidDigest {
+                field: "lifecycle.digest",
+            });
+        }
+        Ok(receipt)
+    }
 }
 
 impl LifecycleReceipt {
@@ -489,6 +578,18 @@ impl LifecycleReceipt {
         if self.input_record_ids.is_empty() {
             return Err(LifecycleError::EmptyInputs);
         }
+        for handles in [
+            &self.input_record_ids,
+            &self.evidence_refs,
+            &self.counterevidence_refs,
+            &self.supersedes,
+        ] {
+            check_sorted_unique(handles)?;
+        }
+        if let Some(basis) = &self.qualifying_basis {
+            basis.validate()?;
+            check_sorted_unique(&basis.independent_evidence)?;
+        }
         self.source_anchor.validate()?;
         self.actor.validate()?;
         text(&self.scope, "lifecycle.scope")?;
@@ -516,6 +617,13 @@ impl LifecycleReceipt {
         if self.is_correction() && self.supersedes.is_empty() {
             return Err(LifecycleError::NotForwardRevision);
         }
+        if self.outcome == AdmissionOutcome::RefusedPromotion
+            && (self.proposed_role != self.prior_role
+                || self.proposed_status != self.prior_status
+                || !self.supersedes.is_empty())
+        {
+            return Err(LifecycleError::RefusedPromotionMustHold);
+        }
         self.check_paraphrase_guard()?;
         Ok(())
     }
@@ -523,11 +631,14 @@ impl LifecycleReceipt {
     /// Rejects model paraphrases that claim elevated or verified standing
     /// without an independent qualifying basis.
     fn check_paraphrase_guard(&self) -> Result<(), LifecycleError> {
+        // A present verifier run is independent of the paraphrase by
+        // construction (`QualifyingBasis::is_independent`), so verified
+        // standing needs only the run itself.
         if self.proposed_status == EpistemicStatus::Verified
-            && !self
+            && self
                 .qualifying_basis
                 .as_ref()
-                .is_some_and(|basis| basis.verifier_run_id.is_some() && basis.is_independent())
+                .is_none_or(|basis| basis.verifier_run_id.is_none())
         {
             return Err(LifecycleError::VerifiedRequiresVerifierRun);
         }
@@ -560,11 +671,14 @@ pub struct LifecycleChainView {
 /// Verifies that receipts form one inspectable chain from a raw observation.
 ///
 /// The first receipt must be a genesis capture, every hop must consume the
-/// prior output, every superseded handle must resolve to earlier history
+/// prior output and continue the prior proposed role/status as its own prior
+/// state, every superseded handle must resolve to earlier history
 /// (so the original stays reconstructible), and every receipt must carry
 /// its `AppendAuditEvent` linkage.
 pub fn verify_chain(receipts: &[LifecycleReceipt]) -> Result<LifecycleChainView, LifecycleError> {
-    let first = receipts.first().ok_or(LifecycleError::EmptyChain)?;
+    let [first, .., last] = receipts else {
+        return Err(LifecycleError::EmptyChain);
+    };
     for receipt in receipts {
         receipt.validate()?;
         if !receipt.is_audit_linked() {
@@ -589,6 +703,11 @@ pub fn verify_chain(receipts: &[LifecycleReceipt]) -> Result<LifecycleChainView,
                 reason: "chain scope must not change silently".to_owned(),
             });
         }
+        if next.prior_role != prior.proposed_role || next.prior_status != prior.proposed_status {
+            return Err(LifecycleError::BrokenChain {
+                reason: "hop prior state does not continue the prior proposal".to_owned(),
+            });
+        }
         if !next.input_record_ids.contains(&prior.output_record_id) {
             return Err(LifecycleError::BrokenChain {
                 reason: "hop does not consume the prior output".to_owned(),
@@ -606,12 +725,12 @@ pub fn verify_chain(receipts: &[LifecycleReceipt]) -> Result<LifecycleChainView,
         }
         known.insert(&next.output_record_id);
     }
-    let Some(last) = receipts.last() else {
-        return Err(LifecycleError::EmptyChain);
-    };
-    let Some(original) = first.input_record_ids.first() else {
-        return Err(LifecycleError::EmptyChain);
-    };
+    // Defensive only: `validate` above rejects empty inputs on every receipt,
+    // including the first, so this fallback is unreachable on valid input.
+    let original = first
+        .input_record_ids
+        .first()
+        .ok_or(LifecycleError::EmptyChain)?;
     Ok(LifecycleChainView {
         ordered: receipts.to_vec(),
         original_input: original.clone(),
@@ -682,8 +801,8 @@ mod tests {
             receipt_id: id("receipt:capture"),
             input_record_ids: vec![id("obs:raw-1")],
             source_anchor: anchor(),
-            prior_role: SemanticRole::ObservationCandidate,
-            proposed_role: SemanticRole::ObservationCandidate,
+            prior_role: LifecycleRole::ObservationCandidate,
+            proposed_role: LifecycleRole::ObservationCandidate,
             prior_status: EpistemicStatus::Observed,
             proposed_status: EpistemicStatus::Observed,
             actor: actor(ActorKind::DeterministicTransformer),
@@ -711,8 +830,8 @@ mod tests {
             receipt_id: id("receipt:claim"),
             input_record_ids: vec![id("obs:raw-1")],
             source_anchor: anchor(),
-            prior_role: SemanticRole::ObservationCandidate,
-            proposed_role: SemanticRole::Claim,
+            prior_role: LifecycleRole::ObservationCandidate,
+            proposed_role: LifecycleRole::Claim,
             prior_status: EpistemicStatus::Observed,
             proposed_status: EpistemicStatus::Supported,
             actor: actor(ActorKind::HumanOperator),
@@ -743,7 +862,7 @@ mod tests {
         assert_eq!(view.original_input, id("obs:raw-1"));
         assert_eq!(view.current_output, id("claim:1"));
         assert_eq!(view.ordered.len(), 2);
-        assert_eq!(view.ordered[1].proposed_role, SemanticRole::Claim);
+        assert_eq!(view.ordered[1].proposed_role, LifecycleRole::Claim);
         assert!(view.ordered.iter().all(LifecycleReceipt::is_audit_linked));
     }
 
@@ -756,8 +875,8 @@ mod tests {
             receipt_id: id("receipt:correction"),
             input_record_ids: vec![id("obs:raw-1")],
             source_anchor: anchor(),
-            prior_role: SemanticRole::ObservationCandidate,
-            proposed_role: SemanticRole::ObservationCandidate,
+            prior_role: LifecycleRole::ObservationCandidate,
+            proposed_role: LifecycleRole::ObservationCandidate,
             prior_status: EpistemicStatus::Observed,
             proposed_status: EpistemicStatus::Observed,
             actor: actor(ActorKind::HumanOperator),
@@ -789,8 +908,8 @@ mod tests {
             receipt_id: id("receipt:paraphrase"),
             input_record_ids: vec![id("obs:raw-1")],
             source_anchor: anchor(),
-            prior_role: SemanticRole::ObservationCandidate,
-            proposed_role: SemanticRole::Proof,
+            prior_role: LifecycleRole::ObservationCandidate,
+            proposed_role: LifecycleRole::Proof,
             prior_status: EpistemicStatus::Observed,
             proposed_status: EpistemicStatus::Supported,
             actor: actor(ActorKind::ModelTransformer),
@@ -814,8 +933,8 @@ mod tests {
             receipt_id: id("receipt:paraphrase-q"),
             input_record_ids: vec![id("obs:raw-1")],
             source_anchor: anchor(),
-            prior_role: SemanticRole::ObservationCandidate,
-            proposed_role: SemanticRole::Proof,
+            prior_role: LifecycleRole::ObservationCandidate,
+            proposed_role: LifecycleRole::Proof,
             prior_status: EpistemicStatus::Observed,
             proposed_status: EpistemicStatus::Supported,
             actor: actor(ActorKind::ModelTransformer),
@@ -836,6 +955,118 @@ mod tests {
             proof_digest: digest_of("paraphrase-proof"),
         })
         .expect("independently qualified paraphrase is admitted");
-        assert_eq!(qualified.proposed_role, SemanticRole::Proof);
+        assert_eq!(qualified.proposed_role, LifecycleRole::Proof);
+    }
+
+    #[test]
+    fn refused_promotion_holds_prior_standing() {
+        let changed = LifecycleReceipt::new(LifecycleReceiptParams {
+            receipt_id: id("receipt:refused"),
+            input_record_ids: vec![id("obs:raw-1")],
+            source_anchor: anchor(),
+            prior_role: LifecycleRole::ObservationCandidate,
+            proposed_role: LifecycleRole::Claim,
+            prior_status: EpistemicStatus::Observed,
+            proposed_status: EpistemicStatus::Observed,
+            actor: actor(ActorKind::HumanOperator),
+            scope: "scope".to_owned(),
+            clock: clock(),
+            state_fence: fence(),
+            evidence_refs: vec![id("obs:raw-1")],
+            counterevidence_refs: Vec::new(),
+            outcome: AdmissionOutcome::RefusedPromotion,
+            qualifying_basis: None,
+            supersedes: Vec::new(),
+            output_record_id: id("obs:raw-1"),
+            audit_event_id: None,
+            proof_digest: digest_of("refused-proof"),
+        });
+        assert!(matches!(
+            changed,
+            Err(LifecycleError::RefusedPromotionMustHold)
+        ));
+        let held = LifecycleReceipt::new(LifecycleReceiptParams {
+            receipt_id: id("receipt:held"),
+            input_record_ids: vec![id("obs:raw-1")],
+            source_anchor: anchor(),
+            prior_role: LifecycleRole::ObservationCandidate,
+            proposed_role: LifecycleRole::ObservationCandidate,
+            prior_status: EpistemicStatus::Observed,
+            proposed_status: EpistemicStatus::Observed,
+            actor: actor(ActorKind::HumanOperator),
+            scope: "scope".to_owned(),
+            clock: clock(),
+            state_fence: fence(),
+            evidence_refs: vec![id("obs:raw-1")],
+            counterevidence_refs: Vec::new(),
+            outcome: AdmissionOutcome::RefusedPromotion,
+            qualifying_basis: None,
+            supersedes: Vec::new(),
+            output_record_id: id("obs:raw-1"),
+            audit_event_id: None,
+            proof_digest: digest_of("held-proof"),
+        })
+        .expect("refusal holding prior standing is admitted");
+        assert_eq!(held.outcome, AdmissionOutcome::RefusedPromotion);
+    }
+
+    #[test]
+    fn chain_rejects_discontinuous_prior_state() {
+        let capture = capture_receipt()
+            .link_audit(id("audit:capture"))
+            .expect("audit linkage");
+        let disjoint = LifecycleReceipt::new(LifecycleReceiptParams {
+            receipt_id: id("receipt:disjoint"),
+            input_record_ids: vec![id("obs:raw-1")],
+            source_anchor: anchor(),
+            prior_role: LifecycleRole::Claim,
+            proposed_role: LifecycleRole::Claim,
+            prior_status: EpistemicStatus::Supported,
+            proposed_status: EpistemicStatus::Supported,
+            actor: actor(ActorKind::HumanOperator),
+            scope: "scope".to_owned(),
+            clock: clock(),
+            state_fence: fence(),
+            evidence_refs: vec![id("obs:raw-1")],
+            counterevidence_refs: Vec::new(),
+            outcome: AdmissionOutcome::Admitted,
+            qualifying_basis: None,
+            supersedes: Vec::new(),
+            output_record_id: id("claim:9"),
+            audit_event_id: None,
+            proof_digest: digest_of("disjoint-proof"),
+        })
+        .expect("individually valid receipt")
+        .link_audit(id("audit:disjoint"))
+        .expect("audit linkage");
+        assert!(matches!(
+            verify_chain(&[capture, disjoint]),
+            Err(LifecycleError::BrokenChain { .. })
+        ));
+    }
+
+    #[test]
+    fn serde_round_trip_preserves_valid_receipt() {
+        let receipt = capture_receipt()
+            .link_audit(id("audit:capture"))
+            .expect("audit linkage");
+        let json = serde_json::to_string(&receipt).expect("serializable receipt");
+        let decoded: LifecycleReceipt =
+            serde_json::from_str(&json).expect("wire-valid receipt decodes");
+        assert_eq!(decoded, receipt);
+    }
+
+    #[test]
+    fn serde_rejects_tampered_digest_and_duplicate_inputs() {
+        let receipt = capture_receipt();
+        let mut tampered = serde_json::to_value(&receipt).expect("serializable receipt");
+        tampered["digest"] = serde_json::json!("0".repeat(64));
+        assert!(serde_json::from_value::<LifecycleReceipt>(tampered).is_err());
+        let mut duplicated = serde_json::to_value(&receipt).expect("serializable receipt");
+        duplicated["input_record_ids"]
+            .as_array_mut()
+            .expect("inputs array")
+            .push(serde_json::json!("obs:raw-1"));
+        assert!(serde_json::from_value::<LifecycleReceipt>(duplicated).is_err());
     }
 }

@@ -7,7 +7,7 @@
 
 #![forbid(unsafe_code)]
 
-pub mod mutation_link;
+pub mod admission;
 
 use std::collections::{BTreeMap, BTreeSet};
 
