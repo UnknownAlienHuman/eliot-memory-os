@@ -27,6 +27,12 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod contract_rejection;
+pub use contract_rejection::{
+    AdmissionDecision, AdmissionRejection, CORRECTED_RETRY_IDENTITY_RULE, ContractAdmissionJournal,
+    ContractRejectionError, SafeCaptureFallback, StageState, WriteMutationStatus,
+    collect_contract_errors, derive_rejection_id,
+};
 pub mod epistemic_revision;
 
 /// Stable identity of this Governor contract surface.
