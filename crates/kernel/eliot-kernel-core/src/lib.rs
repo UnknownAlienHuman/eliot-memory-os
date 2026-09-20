@@ -10,6 +10,8 @@
 //!   and epoch activation ([`EpochActivation`]);
 //! - the runtime generation route table and cutover decisions
 //!   ([`GenerationRouter`], [`CutoverDecision`]);
+//! - the I1.10 process-health projection kept separate from generation and
+//!   cutover state ([`ProcessHealthStatus`], [`CapabilityReadiness`]);
 //! - the bounded control reserve and synchronous front door
 //!   ([`ControlReserve`], [`FrontDoor`]);
 //! - the role-filtered recovery view ([`RecoveryViewBuilder`]).
@@ -57,6 +59,9 @@ pub use module::control_reserve_front_door::{
 };
 pub use module::epoch_and_fence::{EpochActivation, RouteFence, RouteScope};
 pub use module::generation_routing::{CutoverDecision, GenerationRoute, GenerationRouter};
+pub use module::process_health::{
+    CapabilityReadiness, HealthDimensionKind, ProcessHealthStatus, ProcessHealthVector,
+};
 pub use module::recovery_state_view::{RecoveryViewBuilder, project_operational_state};
 
 /// Result of releasing a pre-effect process-start replay reservation.
