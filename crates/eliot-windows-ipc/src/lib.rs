@@ -515,9 +515,14 @@ fn sid_to_string(sid: PSID) -> io::Result<String> {
     }
     // SAFETY: `wide` holds `len` live units; freed exactly once below.
     let slice = unsafe { std::slice::from_raw_parts(wide, len) };
-    let sid = OsString::from_wide(slice)
-        .into_string()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "process SID is not UTF-8"))?;
+    let sid = OsString::from_wide(slice).into_string().map_err(|_| {
+        // SAFETY: `wide` is the live `LocalAlloc` string from the conversion
+        // above; it must be freed on this early return exactly as below.
+        unsafe {
+            LocalFree(wide.cast());
+        }
+        io::Error::new(io::ErrorKind::InvalidData, "process SID is not UTF-8")
+    })?;
     // SAFETY: `wide` is the live `LocalAlloc` string from the conversion above.
     unsafe {
         LocalFree(wide.cast());
@@ -2232,7 +2237,10 @@ pub fn verify_file_owner_and_dacl(path: &Path) -> io::Result<()> {
 
 /// Checks one queried security descriptor against the transport contour.
 /// The owner `SID` must equal the current token user and the `DACL` must grant
-/// exactly the transport peer class (token user plus `LocalSystem`).
+/// exactly the transport peer class (token user plus `LocalSystem`). When the
+/// token user IS `LocalSystem`, owner and `System` coincide: the `System`
+/// grant is checked first and proves both halves at once, keeping the
+/// contour satisfiable for a System service token.
 fn verify_transport_file_descriptor(
     descriptor: PSECURITY_DESCRIPTOR,
     dacl: *mut ACL,
@@ -2334,21 +2342,43 @@ fn verify_transport_file_descriptor(
             ));
         }
         let sid = sid_to_string(std::ptr::from_ref(&allowed.SidStart).cast_mut().cast())?;
-        if sid == expected_owner {
-            seen_owner = true;
-        } else if sid == TRANSPORT_FILE_SYSTEM_SID {
-            seen_system = true;
-        } else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "transport file DACL admits an unexpected principal",
-            ));
-        }
+        note_contour_grant(&sid, expected_owner, &mut seen_owner, &mut seen_system)?;
     }
     if !seen_owner || !seen_system {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "transport file DACL does not grant the transport peer class",
+        ));
+    }
+    Ok(())
+}
+
+/// Credits one DACL ACE SID against the transport peer class. The `System`
+/// grant is checked before the owner grant so the contour stays satisfiable
+/// when the token user IS `LocalSystem`: owner and `System` coincide, so
+/// that one grant proves both peer halves at once.
+///
+/// # Errors
+///
+/// Returns an error when the ACE admits a principal outside the transport
+/// peer class.
+fn note_contour_grant(
+    sid: &str,
+    expected_owner: &str,
+    seen_owner: &mut bool,
+    seen_system: &mut bool,
+) -> io::Result<()> {
+    if sid == TRANSPORT_FILE_SYSTEM_SID {
+        *seen_system = true;
+        if sid == expected_owner {
+            *seen_owner = true;
+        }
+    } else if sid == expected_owner {
+        *seen_owner = true;
+    } else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "transport file DACL admits an unexpected principal",
         ));
     }
     Ok(())
@@ -3962,8 +3992,10 @@ mod tests {
 #[cfg(test)]
 mod heartbeat_transport_file_tests {
     use super::{
+        ACL, GetSecurityDescriptorDacl, SecurityDescriptor, TRANSPORT_FILE_SYSTEM_SID,
         current_process_creation_ticks, process_creation_ticks,
         restrict_file_to_current_user_and_system, verify_file_owner_and_dacl,
+        verify_transport_file_descriptor,
     };
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -4007,5 +4039,31 @@ mod heartbeat_transport_file_tests {
         verify_file_owner_and_dacl(&path)
             .unwrap_or_else(|_| panic!("restricted file must still verify"));
         std::fs::remove_file(&path).unwrap_or_else(|_| panic!("fixture must clean"));
+    }
+
+    #[test]
+    fn system_token_contour_is_satisfiable() {
+        // On-disk shape of a transport file restricted while running as
+        // LocalSystem: owner SY plus two SY allow ACEs (the SDDL template
+        // grants SY twice when the token user IS System). The verifier must
+        // accept it: the System grant proves both peer halves at once.
+        let descriptor =
+            SecurityDescriptor::from_sddl("O:SYD:P(A;;GA;;;SY)(A;;GA;;;SY)")
+                .unwrap_or_else(|_| panic!("system contour descriptor must build"));
+        let mut present = 0;
+        let mut acl: *mut ACL = std::ptr::null_mut();
+        let mut defaulted = 0;
+        // SAFETY: the descriptor is live; the out-pointers are live stack slots.
+        let fetched = unsafe {
+            GetSecurityDescriptorDacl(
+                descriptor.raw,
+                &raw mut present,
+                &raw mut acl,
+                &raw mut defaulted,
+            )
+        };
+        assert!(fetched != 0 && present != 0 && !acl.is_null());
+        verify_transport_file_descriptor(descriptor.raw, acl, TRANSPORT_FILE_SYSTEM_SID)
+            .unwrap_or_else(|_| panic!("system-token contour must verify"));
     }
 }

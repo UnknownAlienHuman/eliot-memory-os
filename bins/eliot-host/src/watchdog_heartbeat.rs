@@ -44,6 +44,11 @@ const INSTALLATION_ID_LIMIT: usize = 128;
 const FRESHNESS_TICK_MULTIPLE: u64 = 3;
 /// Bounded Host listen window per admission: four default watchdog ticks.
 const ADMISSION_READ_TIMEOUT: Duration = Duration::from_secs(8);
+/// Beats that close the admission window early: two accepts already prove a
+/// continuous chain (first `PARTIAL`, second `CONTINUOUS`), so waiting out
+/// the full eight-second window would only age the banked beats past the
+/// six-second freshness bound (three default ticks) without new evidence.
+const ADMISSION_MIN_BEATS: usize = 2;
 /// Sanity bounds for a writer-advertised tick (50 ms through one hour).
 const TICK_MIN_MS: u64 = 50;
 const TICK_MAX_MS: u64 = 3_600_000;
@@ -1679,6 +1684,51 @@ pub fn admit_heartbeat_observation(
     })
 }
 
+/// Binds the listener and collects one admission window of accepted beats
+/// before the deadline.
+///
+/// One failed accept never discards the beats already banked: it is
+/// skipped and polling continues. Enough banked beats close the window
+/// early ([`ADMISSION_MIN_BEATS`] already prove a continuous chain), so
+/// the window cannot age its own evidence out past the freshness bound.
+///
+/// # Errors
+///
+/// Returns an error when the listener cannot bind; per-accept failures are
+/// skipped, never fatal.
+async fn collect_window_accepts(
+    descriptor: &HeartbeatTransportDescriptor,
+    deadline: Instant,
+) -> Result<Vec<AcceptedHeartbeat>, HostError> {
+    // The listener binds inside the runtime: pipe creation registers with
+    // the reactor.
+    let mut listener = HeartbeatListener::bind(
+        descriptor.pipe_name.as_str(),
+        descriptor.watchdog_incarnation_pid,
+        descriptor.watchdog_incarnation_start_100ns,
+    )?;
+    let mut out = Vec::new();
+    loop {
+        if Instant::now() >= deadline {
+            break;
+        }
+        match listener.accept_one(deadline).await {
+            Ok(accept) => {
+                out.push(accept);
+                if out.len() >= ADMISSION_MIN_BEATS {
+                    break;
+                }
+            }
+            Err(_) => {
+                if Instant::now() >= deadline {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Observes one armed heartbeat admission window: binds the listener,
 /// reads every heartbeat before the deadline, derives the chained
 /// observations, admits the freshest against the supervision incarnation
@@ -1722,31 +1772,7 @@ pub fn observe_armed_heartbeat(
         .build()
         .map_err(|error| HostError::Platform(error.to_string()))?;
     let deadline = Instant::now() + ADMISSION_READ_TIMEOUT;
-    let accepted = runtime.block_on(async {
-        // The listener binds inside the runtime: pipe creation registers
-        // with the reactor.
-        let mut listener = HeartbeatListener::bind(
-            descriptor.pipe_name.as_str(),
-            descriptor.watchdog_incarnation_pid,
-            descriptor.watchdog_incarnation_start_100ns,
-        )?;
-        let mut out = Vec::new();
-        loop {
-            if Instant::now() >= deadline {
-                break;
-            }
-            match listener.accept_one(deadline).await {
-                Ok(accept) => out.push(accept),
-                Err(error) => {
-                    if Instant::now() >= deadline {
-                        break;
-                    }
-                    return Err(error);
-                }
-            }
-        }
-        Ok(out)
-    });
+    let accepted = runtime.block_on(collect_window_accepts(&descriptor, deadline));
     let accepted: Vec<AcceptedHeartbeat> = accepted?;
     if accepted.is_empty() {
         return Err(HostError::RecoveryRequired(
@@ -1759,16 +1785,21 @@ pub fn observe_armed_heartbeat(
         let handshake_index = u64::try_from(index + 1).map_err(|_| {
             HostError::RecoveryRequired("heartbeat handshake count overflows".to_owned())
         })?;
-        let observed = derive_heartbeat_observation(
+        // One bad message skips instead of discarding the window: the next
+        // good message derives against the last good prior, downgrading to
+        // PARTIAL on the gap, and the handshake count still bounds every
+        // derived message inside the observed accepts.
+        if let Ok(observed) = derive_heartbeat_observation(
             accept.raw.as_slice(),
             &descriptor,
             previous.as_ref(),
             accept.receive_monotonic,
             accept.receive_wall_ms,
             handshake_index,
-        )?;
-        previous = Some(observed.persisted_view());
-        last_observed = Some(observed);
+        ) {
+            previous = Some(observed.persisted_view());
+            last_observed = Some(observed);
+        }
     }
     let observed = last_observed.ok_or_else(|| {
         HostError::RecoveryRequired("armed heartbeat transport delivered no fresh heartbeat".to_owned())

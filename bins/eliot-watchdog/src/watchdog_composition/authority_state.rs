@@ -61,7 +61,9 @@ use std::sync::{Arc, RwLock};
 ///   unresponsive, never as current coverage.
 /// - `service_instance_guid` / `host_challenge_nonce`: the Host-issued pipe
 ///   instance identity echoed verbatim. The Host requires byte equality
-///   with its per-instance rendezvous; a mismatch fails closed.
+///   with its per-instance rendezvous; a mismatch fails closed. The nonce
+///   rides the pipe wire message only and is never serialized below: the
+///   readiness log stream carries no challenge material.
 /// - `watchdog_readiness_sequence`: zero for fence announces, strictly
 ///   increasing across admitted emissions. The Host requires continuity
 ///   against its persisted observation and treats a gap as PARTIAL.
@@ -87,6 +89,10 @@ pub struct WatchdogReadiness {
     pub watchdog_epoch: u64,
     pub tick_interval_ms: u128,
     pub service_instance_guid: String,
+    /// Host-issued 256-bit challenge echo for the pipe wire message the
+    /// Host byte-compares. Skipped on serialization so the 256-bit secret
+    /// never reaches the readiness log stream (`runtime_loop` stdout JSON).
+    #[serde(skip_serializing)]
     pub host_challenge_nonce: String,
     pub watchdog_readiness_sequence: u64,
 }
