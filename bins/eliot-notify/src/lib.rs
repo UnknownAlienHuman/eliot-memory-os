@@ -654,6 +654,7 @@ const DELIVERY_OWNER: &str = "delivery-receipt-verifier";
 
 mod fallback_verification;
 pub mod operation_identity;
+pub mod quiet_hours;
 #[cfg(test)]
 use fallback_verification::sha256_hex;
 use fallback_verification::{

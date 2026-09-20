@@ -57,6 +57,10 @@ pub use module::control_reserve_front_door::{
 };
 pub use module::epoch_and_fence::{EpochActivation, RouteFence, RouteScope};
 pub use module::generation_routing::{CutoverDecision, GenerationRoute, GenerationRouter};
+pub use module::notification_state::{
+    Acknowledgement, DeliveryState, Notification, NotificationError, NotificationSeverity,
+    NotificationStore, Resolution,
+};
 pub use module::recovery_state_view::{RecoveryViewBuilder, project_operational_state};
 
 /// Result of releasing a pre-effect process-start replay reservation.
