@@ -41,8 +41,10 @@
 //!   (`ZeroLengthFrame`) vs oversize (`OversizeFrame`) vs trailing
 //!   (`Backpressure` here, `TrailingBytes` in `decode_frame`) are never fused.
 
-use super::{TransportError, TransportLimits, check_inline_response_ceiling};
-use eliot_protocol::{Frame, JsonCodec, ProtocolError};
+use super::{
+    TransportError, TransportLimits, check_inline_response_ceiling, inline_ceiling_for_kind,
+};
+use eliot_protocol::{Frame, FrameKind, JsonCodec, ProtocolError};
 
 /// Wire prefix length: four-byte little-endian body length (Implementation `I7.2`).
 const FRAME_PREFIX_LEN: usize = 4;
@@ -232,14 +234,78 @@ pub fn encode_frame(frame: &Frame, limits: TransportLimits) -> Result<Vec<u8>, T
 /// enforced by the bounded codec without panicking on malformed input.
 ///
 /// The applicable inline ceiling (64 KiB control-recovery default, 256 KiB
-/// structured hard ceiling, 4 MiB frame default) is re-checked after decoding
-/// so an oversized inline body is rejected on receipt as well as on emission.
+/// structured hard ceiling, 4 MiB frame default) is selected from the length
+/// prefix plus a kind probe of the staged body, then enforced by the bounded
+/// codec itself: an over-tier body is rejected from its declared length
+/// before the body is allocated or decoded, with the 4 MiB frame bound as
+/// the outer cap. The ceiling is re-checked after decoding as the
+/// post-decode invariant, so an oversized inline body is rejected on receipt
+/// as well as on emission.
+///
+/// Wire staging in `FrameDecoder::push` remains bounded by the outer 4 MiB
+/// cap (the kind lives inside the body, so no tier can be selected before
+/// the frame is staged); decoded-body allocation and parsing are bounded by
+/// the tier ceiling selected here.
 pub fn decode_frame(wire: &[u8], limits: TransportLimits) -> Result<Frame, TransportError> {
     let limits = limits.validate()?;
-    let frame = JsonCodec::with_max_frame_bytes(limits.max_frame_bytes)
+    let ceiling = tier_ceiling_for_wire(wire, limits.max_frame_bytes);
+    let frame = JsonCodec::with_max_frame_bytes(ceiling)
         .decode(wire)
         .map_err(TransportError::Protocol)?;
     let body_len = wire.len().saturating_sub(FRAME_PREFIX_LEN);
     check_inline_response_ceiling(&frame, body_len, limits.max_frame_bytes)?;
     Ok(frame)
+}
+
+/// Minimal kind probe decoded from the staged body before the full frame.
+///
+/// Reuses the protocol `FrameKind` wire shape, so the tier lookup cannot
+/// drift from the negotiated encoding. Unparseable bodies yield `None` and
+/// fall back to the outer frame bound with the codec's canonical error
+/// disposition.
+#[derive(serde::Deserialize)]
+struct KindProbe {
+    kind: Option<FrameKind>,
+}
+
+/// Probes the frame kind carried by one staged body without decoding it.
+fn peek_frame_kind(body: &[u8]) -> Option<FrameKind> {
+    serde_json::from_slice::<KindProbe>(body).ok()?.kind
+}
+
+/// Selects the decode cap for one wire image before the body is decoded.
+///
+/// When `wire` is exactly one `4 + declared` frame within the outer bound,
+/// the applicable inline tier (64 KiB control-recovery, 256 KiB structured,
+/// outer bound otherwise) becomes the codec cap, so the codec rejects an
+/// over-tier body from its length prefix before allocating or parsing the
+/// body. Any other shape (short prefix, zero, outer-oversize, partial,
+/// trailing) keeps the outer cap, preserving the codec's canonical
+/// `PartialFrame` / `ZeroLengthFrame` / `OversizeFrame` / `TrailingBytes`
+/// dispositions unchanged.
+fn tier_ceiling_for_wire(wire: &[u8], max_frame_bytes: usize) -> usize {
+    let Some(prefix_slice) = wire.get(..FRAME_PREFIX_LEN) else {
+        return max_frame_bytes;
+    };
+    let prefix: [u8; FRAME_PREFIX_LEN] = match prefix_slice.try_into() {
+        Ok(prefix) => prefix,
+        Err(_) => return max_frame_bytes,
+    };
+    let declared = u32::from_le_bytes(prefix);
+    let Ok(declared) = usize::try_from(declared) else {
+        return max_frame_bytes;
+    };
+    if declared == 0 || declared > max_frame_bytes {
+        return max_frame_bytes;
+    }
+    let Some(total) = FRAME_PREFIX_LEN.checked_add(declared) else {
+        return max_frame_bytes;
+    };
+    if wire.len() != total {
+        return max_frame_bytes;
+    }
+    match peek_frame_kind(&wire[FRAME_PREFIX_LEN..]) {
+        Some(kind) => inline_ceiling_for_kind(kind, max_frame_bytes),
+        None => max_frame_bytes,
+    }
 }

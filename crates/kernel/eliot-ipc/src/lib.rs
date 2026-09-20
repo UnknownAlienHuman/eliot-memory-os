@@ -307,15 +307,37 @@ impl TransportLimits {
 /// Returns whether a frame travels on the reserved control-recovery lane.
 ///
 /// `Cancel`, heartbeat, and `Control` frames must remain sendable while
-/// ordinary request capacity is exhausted (issue #1881). Callers that admit
-/// by raw byte count must classify through this predicate (see
-/// [`AdmissionQueue::admit_frame`]) instead of inventing their own lane.
+/// ordinary request capacity is exhausted (issue #1881). Lane classification
+/// is enforced inside [`AdmissionQueue::admit_frame`], which derives the lane
+/// from the frame kind through this predicate; no caller supplies it.
 #[must_use]
 pub const fn is_control_capacity_frame(frame: &Frame) -> bool {
     matches!(
         frame.kind,
         FrameKind::Cancel | FrameKind::Heartbeat | FrameKind::Control
     )
+}
+
+/// Returns the inline body ceiling for one frame kind under the frame bound.
+///
+/// Control-recovery lane (`Cancel` / heartbeat / `Control`) defaults to
+/// `HOT_RESPONSE_MAX_BYTES` (64 KiB); structured `Response` / `Event` bodies
+/// are hard-capped at `STRUCTURED_RESPONSE_MAX_BYTES` (256 KiB); all other
+/// kinds (notably `Request`) use `max_frame_bytes` (default 4 MiB). Each tier
+/// is additionally clamped by `max_frame_bytes`, so a tightened connection
+/// bound can only narrow a ceiling, never widen one.
+#[must_use]
+pub const fn inline_ceiling_for_kind(kind: FrameKind, max_frame_bytes: usize) -> usize {
+    let tier = match kind {
+        FrameKind::Cancel | FrameKind::Heartbeat | FrameKind::Control => HOT_RESPONSE_MAX_BYTES,
+        FrameKind::Response | FrameKind::Event => STRUCTURED_RESPONSE_MAX_BYTES,
+        FrameKind::Request => return max_frame_bytes,
+    };
+    if tier < max_frame_bytes {
+        tier
+    } else {
+        max_frame_bytes
+    }
 }
 
 /// Enforces the applicable inline body ceiling for one validated frame.
@@ -331,7 +353,9 @@ pub const fn is_control_capacity_frame(frame: &Frame) -> bool {
 /// Violations surface as `OversizeFrame` with the applicable maximum through
 /// the existing transport error vocabulary; saturation remains `Backpressure`.
 /// Used by `encode_frame` before inline emission and by `decode_frame` on the
-/// receive path.
+/// receive path. On receipt the primary enforcement is the tier-capped decode
+/// in `decode_frame`, which rejects from the length prefix before the body is
+/// decoded; this check remains as the post-decode invariant.
 ///
 /// # Errors
 ///
@@ -341,13 +365,7 @@ pub fn check_inline_response_ceiling(
     body_len: usize,
     max_frame_bytes: usize,
 ) -> Result<(), TransportError> {
-    let maximum = if is_control_capacity_frame(frame) {
-        HOT_RESPONSE_MAX_BYTES.min(max_frame_bytes)
-    } else if matches!(frame.kind, FrameKind::Response | FrameKind::Event) {
-        STRUCTURED_RESPONSE_MAX_BYTES.min(max_frame_bytes)
-    } else {
-        max_frame_bytes
-    };
+    let maximum = inline_ceiling_for_kind(frame.kind, max_frame_bytes);
     if body_len > maximum {
         return Err(TransportError::Protocol(ProtocolError::OversizeFrame {
             actual: body_len,
@@ -1279,14 +1297,15 @@ impl AdmissionQueue {
         })
     }
 
-    /// Reserves capacity without silently dropping or unboundedly buffering.
+    /// Lane-internal item and byte accounting shared by every admission.
     ///
     /// Size violations surface precisely: zero bytes yield `ZeroLengthFrame`,
     /// bytes above `max_frame_bytes` yield `OversizeFrame`; only genuine
-    /// saturation yields `Backpressure`. Prefer [`Self::admit_frame`] so the
-    /// control-recovery lane (`Cancel` / heartbeat / `Control`) is classified
-    /// by [`is_control_capacity_frame`] instead of by the caller.
-    pub fn admit(
+    /// saturation yields `Backpressure`. Lane classification is owned by
+    /// [`Self::admit_frame`], which derives `control` from the frame kind via
+    /// [`is_control_capacity_frame`]; no caller supplies the lane, so ordinary
+    /// traffic cannot claim the reserved control items or bytes.
+    fn admit(
         &mut self,
         encoded_bytes: usize,
         control: bool,
@@ -1310,11 +1329,17 @@ impl AdmissionQueue {
             .checked_add(self.control_bytes)
             .and_then(|bytes| bytes.checked_add(encoded_bytes))
             .ok_or(TransportError::Backpressure)?;
-        let control_reserve_bytes = self
+        // Proportional byte reserve for the control lane: the same
+        // `control_reserve / queue_capacity` share of `queue_bytes` stays
+        // available to control traffic while ordinary traffic saturates the
+        // normal budget. The one-byte floor keeps the reserve non-empty when
+        // integer division would otherwise truncate it away on tiny bounds.
+        let control_reserve_bytes = (self
             .limits
             .queue_bytes
             .saturating_mul(self.limits.control_reserve)
-            / self.limits.queue_capacity;
+            / self.limits.queue_capacity)
+            .max(1);
         let normal_byte_limit = self
             .limits
             .queue_bytes
@@ -1344,8 +1369,9 @@ impl AdmissionQueue {
         })
     }
 
-    /// Reserves capacity for one frame, classifying the control-recovery lane
-    /// by [`is_control_capacity_frame`].
+    /// Reserves capacity for one frame. This is the sole admission entry
+    /// point: the control-recovery lane is classified from the frame kind by
+    /// [`is_control_capacity_frame`], never from caller input.
     ///
     /// When ordinary in-flight capacity is exhausted, an ordinary request is
     /// rejected with `Backpressure` while a `Cancel`, heartbeat, or `Control`
@@ -3070,14 +3096,20 @@ mod tests {
     #[test]
     fn queue_preserves_control_reserve() -> TestResult {
         let mut queue = AdmissionQueue::new(limits())?;
-        let first = queue.admit(8, false)?;
-        queue.admit(8, false)?;
-        queue.admit(8, false)?;
+        let mut request = heartbeat();
+        request.kind = FrameKind::Request;
+        request.message_type = MessageType::Execute;
+        assert!(!is_control_capacity_frame(&request));
+        let first = queue.admit_frame(&request, 8)?;
+        queue.admit_frame(&request, 8)?;
+        queue.admit_frame(&request, 8)?;
         assert!(matches!(
-            queue.admit(8, false),
+            queue.admit_frame(&request, 8),
             Err(TransportError::Backpressure)
         ));
-        queue.admit(8, true)?;
+        let recovery = heartbeat();
+        assert!(is_control_capacity_frame(&recovery));
+        queue.admit_frame(&recovery, 8)?;
         queue.release(first)?;
         assert_eq!(queue.usage(), (3, 24));
         Ok(())
