@@ -28,6 +28,7 @@ use eliot_runtime::{Runtime, RuntimeConfig};
 mod cli_contract;
 mod kernel_activation_client;
 mod kernel_host_request_client;
+mod understanding_bootstrap;
 pub(crate) use cli_contract::validate_client_declaration_path;
 pub use cli_contract::{CliConfig, CliError, Profile, Transport, parse_args};
 use kernel_activation_client::KernelHostActivationPort;
@@ -37,6 +38,12 @@ use kernel_activation_client::{
     denial_reason_code,
 };
 use kernel_host_request_client::{KernelHostRequestClient, ReplayCacheEntry};
+pub use understanding_bootstrap::{
+    AuthoritativeSelection, BootstrapContext, BootstrapError, BootstrapSession,
+    BootstrapTaskInputs, CurrentAssessment, GovernanceEvidence, ReadinessDisposition, ScopeLevel,
+    SelectedTask, TaskCandidate, TaskSelectionDisposition, TaskSelectionView,
+    UnderstandingBootstrap, get_understanding_bootstrap,
+};
 
 fn decode_declaration_bytes(bytes: &[u8]) -> Result<AgentBridgeClientDeclaration, String> {
     let declaration: AgentBridgeClientDeclaration =
@@ -280,6 +287,8 @@ pub struct BridgeRunner {
     profile: Profile,
     runtime: Runtime,
     core: AgentBridgeCore,
+    bootstrap_session: BootstrapSession,
+    bootstrap_context: Option<BootstrapContext>,
 }
 
 impl BridgeRunner {
@@ -313,6 +322,8 @@ impl BridgeRunner {
             profile,
             runtime,
             core: AgentBridgeCore::new(readiness, host_activation, mcp_forwarding, cursor_policy),
+            bootstrap_session: BootstrapSession::default(),
+            bootstrap_context: None,
         })
     }
     #[must_use]
@@ -356,6 +367,56 @@ impl BridgeRunner {
     #[must_use]
     pub fn attach_view(&self) -> Option<AttachView> {
         self.core.attach_view()
+    }
+    /// Notes the owner-supplied bootstrap context for this session.
+    ///
+    /// Validates fail-closed without composing authority: an invalid context
+    /// is rejected and never stored. Noting context never delivers the
+    /// once-per-session auto-boot; delivery happens only through
+    /// [`Self::take_first_response_bootstrap`].
+    pub fn note_bootstrap_context(
+        &mut self,
+        context: BootstrapContext,
+    ) -> Result<(), BootstrapError> {
+        let empty_tasks = BootstrapTaskInputs {
+            scope_level: ScopeLevel::Session,
+            candidates: Vec::new(),
+            authoritative_selection: None,
+        };
+        get_understanding_bootstrap(&context, &empty_tasks, CurrentAssessment::NotOnboarded)?;
+        self.bootstrap_context = Some(context);
+        Ok(())
+    }
+    /// Bounded explicit retrieval of the canonical `UnderstandingBootstrap`.
+    ///
+    /// Always available, including after the once-per-session auto-boot was
+    /// delivered. Requires a noted context; fails closed otherwise.
+    pub fn get_understanding_bootstrap(
+        &self,
+        tasks: &BootstrapTaskInputs,
+        requested_assessment: CurrentAssessment,
+    ) -> Result<UnderstandingBootstrap, BootstrapError> {
+        let Some(context) = &self.bootstrap_context else {
+            return Err(BootstrapError {
+                code: "BOOTSTRAP_CONTEXT_MISSING",
+                detail: "no bootstrap context noted for this session".to_owned(),
+            });
+        };
+        get_understanding_bootstrap(context, tasks, requested_assessment)
+    }
+    /// Takes the once-per-session auto-boot for the first successful response.
+    ///
+    /// Returns `None` after the first delivery or when no valid context is
+    /// noted; composition failures also yield `None` without marking delivery
+    /// so a later response with complete inputs can still carry the bootstrap.
+    pub fn take_first_response_bootstrap(
+        &mut self,
+        tasks: &BootstrapTaskInputs,
+        requested_assessment: CurrentAssessment,
+    ) -> Option<UnderstandingBootstrap> {
+        let context = self.bootstrap_context.clone()?;
+        self.bootstrap_session
+            .take_auto_boot(&context, tasks, requested_assessment)
     }
     /// Read-only view of durable in-flight deliveries for bounded Stop accounting.
     ///

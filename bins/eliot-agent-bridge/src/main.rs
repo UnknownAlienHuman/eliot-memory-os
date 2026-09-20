@@ -3,7 +3,8 @@
 mod request_input;
 
 use eliot_agent_bridge::{
-    BridgeRunner, CliError, Profile, kernel_ports_with_declaration, parse_args,
+    BootstrapContext, BootstrapTaskInputs, BridgeRunner, CliError, CurrentAssessment, Profile,
+    ScopeLevel, UnderstandingBootstrap, kernel_ports_with_declaration, parse_args,
 };
 use eliot_agent_bridge_core::{
     AttachRequest, BridgeError, ConnectionId, FencingToken, Generation, HostEventEnvelope,
@@ -96,6 +97,11 @@ enum Request {
         event: EventEnvelope,
     },
     ReconcileExternal {},
+    Bootstrap {
+        context: Option<BootstrapContext>,
+        tasks: BootstrapTaskInputs,
+        requested_assessment: CurrentAssessment,
+    },
     Reconnect {
         expected_connection_id: ConnectionId,
         new_connection_id: ConnectionId,
@@ -124,29 +130,51 @@ enum Response {
         host_request_port: &'static str,
         observation_forwarding_port: &'static str,
         recovery: &'static str,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bootstrap: Option<UnderstandingBootstrap>,
     },
-    Attached,
+    Attached {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bootstrap: Option<UnderstandingBootstrap>,
+    },
     Reconnected {
         previous_connection_id: String,
         connection_id: String,
         session_id: String,
         activation_generation: u64,
         authority_epoch: EpochId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bootstrap: Option<UnderstandingBootstrap>,
     },
     Invocation {
         result: HostInvocationResult,
         completion: HostCorrelationReceipt,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bootstrap: Option<UnderstandingBootstrap>,
     },
     Cancellation {
         result: HostCancellationResult,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bootstrap: Option<UnderstandingBootstrap>,
     },
-    Forwarded,
-    Reconciled,
+    Forwarded {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bootstrap: Option<UnderstandingBootstrap>,
+    },
+    Reconciled {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bootstrap: Option<UnderstandingBootstrap>,
+    },
+    Bootstrap {
+        bootstrap: UnderstandingBootstrap,
+    },
     Stopped {
         outstanding: usize,
         drained: usize,
         truncated: bool,
         pending: Vec<StopPendingIdentity>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bootstrap: Option<UnderstandingBootstrap>,
     },
     Error {
         code: &'static str,
@@ -359,9 +387,9 @@ fn main() {
             break;
         };
         total_records = next_total;
-        let response = match serde_json::from_str::<Request>(text) {
+        let mut response = match serde_json::from_str::<Request>(text) {
             Ok(Request::Attach { request }) => match runner.attach(request) {
-                Ok(_) => Response::Attached,
+                Ok(_) => Response::Attached { bootstrap: None },
                 Err(error) => {
                     provider_failure |= matches!(error, BridgeError::PlanGap(_));
                     bridge_error(&error)
@@ -374,26 +402,31 @@ fn main() {
                 handle_cancellation(&host_gateway, &mut *host_request_port, &request)
             }
             Ok(Request::ForwardHook { event }) => match runner.forward_hook(&event) {
-                Ok(()) => Response::Forwarded,
+                Ok(()) => Response::Forwarded { bootstrap: None },
                 Err(error) => {
                     provider_failure |= is_provider_failure(&error);
                     bridge_error(&error)
                 }
             },
             Ok(Request::ForwardEvent { event }) => match runner.forward_event(&event) {
-                Ok(_) => Response::Forwarded,
+                Ok(_) => Response::Forwarded { bootstrap: None },
                 Err(error) => {
                     provider_failure |= is_provider_failure(&error);
                     bridge_error(&error)
                 }
             },
             Ok(Request::ReconcileExternal {}) => match runner.reconcile_external() {
-                Ok(_) => Response::Reconciled,
+                Ok(_) => Response::Reconciled { bootstrap: None },
                 Err(error) => {
                     provider_failure |= is_provider_failure(&error);
                     bridge_error(&error)
                 }
             },
+            Ok(Request::Bootstrap {
+                context,
+                tasks,
+                requested_assessment,
+            }) => handle_bootstrap(&mut runner, context, &tasks, requested_assessment),
             Ok(Request::Reconnect {
                 expected_connection_id,
                 new_connection_id,
@@ -417,6 +450,10 @@ fn main() {
                 detail: error.to_string(),
             },
         };
+        // I7.17 auto-boot: the first successful ELIOT response in a session
+        // carries the bounded bootstrap exactly once. Explicit retrieval
+        // through the bootstrap operation stays available afterwards.
+        attach_auto_bootstrap(&mut runner, &mut response);
         // Only the deserialization-failure arm above produces REQUEST_INVALID:
         // every handler, gateway, and runner error path uses a distinct code,
         // so this flag exactly tracks whether a request was dispatched. Valid
@@ -455,13 +492,75 @@ fn main() {
     }
 }
 
+/// Serves one bounded `GetUnderstandingBootstrap` retrieval.
+///
+/// An optional context establishes the session inputs first; invalid context
+/// fails closed and stores nothing. The first successful retrieval in a
+/// session also satisfies the once-per-session auto-boot; later retrievals
+/// use the explicit path so they stay available after auto-boot delivery.
+fn handle_bootstrap(
+    runner: &mut BridgeRunner,
+    context: Option<BootstrapContext>,
+    tasks: &BootstrapTaskInputs,
+    requested_assessment: CurrentAssessment,
+) -> Response {
+    if let Some(context) = context {
+        if let Err(error) = runner.note_bootstrap_context(context) {
+            return Response::Error {
+                code: "BOOTSTRAP_CONTEXT_REJECTED",
+                detail: error.to_string(),
+            };
+        }
+    }
+    if let Some(bootstrap) = runner.take_first_response_bootstrap(tasks, requested_assessment) {
+        return Response::Bootstrap { bootstrap };
+    }
+    match runner.get_understanding_bootstrap(tasks, requested_assessment) {
+        Ok(bootstrap) => Response::Bootstrap { bootstrap },
+        Err(error) => Response::Error {
+            code: "BOOTSTRAP_REJECTED",
+            detail: error.to_string(),
+        },
+    }
+}
+
+/// Injects the once-per-session auto-boot into the first successful response.
+///
+/// Error responses never carry a bootstrap. When no valid context is noted
+/// the response is left untouched rather than carrying invented authority.
+fn attach_auto_bootstrap(runner: &mut BridgeRunner, response: &mut Response) {
+    let slot = match response {
+        Response::Status { bootstrap, .. }
+        | Response::Attached { bootstrap }
+        | Response::Reconnected { bootstrap, .. }
+        | Response::Invocation { bootstrap, .. }
+        | Response::Cancellation { bootstrap, .. }
+        | Response::Forwarded { bootstrap }
+        | Response::Reconciled { bootstrap }
+        | Response::Stopped { bootstrap, .. } => bootstrap,
+        Response::Bootstrap { .. } | Response::Error { .. } => return,
+    };
+    if slot.is_none() {
+        let tasks = BootstrapTaskInputs {
+            scope_level: ScopeLevel::Session,
+            candidates: Vec::new(),
+            authoritative_selection: None,
+        };
+        *slot = runner.take_first_response_bootstrap(&tasks, CurrentAssessment::Ready);
+    }
+}
+
 fn handle_invocation<P: KernelHostRequestPort + ?Sized>(
     gateway: &HostRequestGateway,
     port: &mut P,
     request: &HostInvocationRequest,
 ) -> Response {
     match gateway.invoke_with_receipt(port, request) {
-        Ok((result, completion)) => Response::Invocation { result, completion },
+        Ok((result, completion)) => Response::Invocation {
+            result,
+            completion,
+            bootstrap: None,
+        },
         Err(error) => host_gateway_error(&error),
     }
 }
@@ -472,7 +571,10 @@ fn handle_cancellation<P: KernelHostRequestPort + ?Sized>(
     request: &HostCancellationRequest,
 ) -> Response {
     match gateway.cancel(port, request) {
-        Ok(result) => Response::Cancellation { result },
+        Ok(result) => Response::Cancellation {
+            result,
+            bootstrap: None,
+        },
         Err(error) => host_gateway_error(&error),
     }
 }
@@ -563,6 +665,7 @@ fn handle_reconnect(
             session_id: view.binding().session_id().as_str().to_owned(),
             activation_generation: view.binding().activation_generation().get(),
             authority_epoch: view.binding().state_fence().authority_epoch().clone(),
+            bootstrap: None,
         },
         Err(BridgeError::StaleAuthority) => Response::Error {
             code: "RECONNECT_STALE_AUTHORITY",
@@ -604,6 +707,7 @@ fn build_stop_response(pending_all: Vec<StopPendingIdentity>) -> Response {
         drained: 0,
         truncated,
         pending,
+        bootstrap: None,
     }
 }
 
@@ -651,6 +755,7 @@ fn status_response(profile: Profile, runner: &BridgeRunner) -> Response {
             host_request_port: "no-session: attach and activate before host-request dispatch",
             observation_forwarding_port: "unavailable: Kernel observation route not admitted",
             recovery: "attach and activate before host requests; reconnect requires a live attach",
+            bootstrap: None,
         },
         Some(view) => Response::Status {
             profile: Profile::as_str(profile),
@@ -665,6 +770,7 @@ fn status_response(profile: Profile, runner: &BridgeRunner) -> Response {
             host_request_port: "session-bound: dispatch joins the admitted Kernel session",
             observation_forwarding_port: "unavailable: Kernel observation route not admitted",
             recovery: "reconnect with the live connection, session, generation, epoch, and fence nonce from this status; stale targets fail closed",
+            bootstrap: None,
         },
     }
 }
