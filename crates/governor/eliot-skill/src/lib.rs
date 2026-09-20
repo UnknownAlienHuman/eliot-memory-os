@@ -20,7 +20,17 @@ use thiserror::Error;
 pub const CONTRACT_NAME: &str = "eliot.governor.skill";
 pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);
 
-fn text(value: &str, field: &'static str) -> Result<(), SkillError> {
+pub mod activation;
+
+pub use activation::{
+    AdherenceCheckpoints, AttemptLifecycleSummary, InstructionConflict, OrderingBasis,
+    SkillActivationStatus, SkillAdherenceStatus, SkillDeliveryStatus,
+    SkillHarnessActivationReceipt, SkillRetrievalStatus, changed_dependency_names,
+    derive_attempt_summary, detect_dependency_staleness, material_use_allowed,
+    record_instruction_conflict,
+};
+
+pub(crate) fn text(value: &str, field: &'static str) -> Result<(), SkillError> {
     if value.trim().is_empty() || value.chars().any(char::is_control) {
         return Err(SkillError::InvalidField {
             field,
@@ -30,7 +40,7 @@ fn text(value: &str, field: &'static str) -> Result<(), SkillError> {
     Ok(())
 }
 
-fn digest(value: &str, field: &'static str) -> Result<(), SkillError> {
+pub(crate) fn digest(value: &str, field: &'static str) -> Result<(), SkillError> {
     if value.len() != 64
         || value
             .bytes()
@@ -52,7 +62,7 @@ fn value_digest<T: Serialize>(value: &T) -> Result<String, SkillError> {
     Ok(sha256_hex(&canonical(value)?))
 }
 
-fn unique<T: Ord>(
+pub(crate) fn unique<T: Ord>(
     values: impl IntoIterator<Item = T>,
     field: &'static str,
 ) -> Result<(), SkillError> {
