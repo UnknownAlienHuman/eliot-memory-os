@@ -116,20 +116,25 @@ impl IntentLineage {
 
 /// Proof that the Governor admission path is unavailable, gating intent append.
 ///
-/// The type has no "available" state by construction: the only constructor
-/// accepts the bounded unavailability reasons the gap path already owns and
-/// rejects [`GapRecoveryReason::SpoolPressure`], which is retention pressure,
-/// not Governor unavailability. A caller holding a live Governor admission
-/// has no value of this type to pass.
+/// The type has no "available" state by construction: both constructors
+/// accept exactly the observed lease rejections that demonstrate a Governor
+/// admission failure and fail closed on every other error, so retention
+/// pressure ([`GapRecoveryReason::SpoolPressure`]) can never mint. A caller
+/// holding a live Governor admission has no value of this type to pass.
 ///
 /// Unlike a bare [`GapRecoveryReason`], the proof cannot be minted from a
 /// caller-chosen reason: both public constructors require a genuinely
 /// observed admission-path failure value. A caller holding a live Governor
 /// admission has no failure value to pass, so it cannot mint this proof.
-/// The carried reason is always one the lane's own admission-gap rules
-/// produce (`AdmissionUnavailable`, `LeaseStale`, `LeaseFenced`,
-/// `LeaseInvalid`); retention pressure (`SpoolPressure`) and host-identity
-/// observations (`Host*`) are never Governor unavailability and never mint.
+/// The carried reason is always a lease rejection the lane's own admission
+/// path observed (`LeaseStale`, `LeaseFenced`, `LeaseInvalid`). Only those
+/// exact observed values mint: every other spool or kernel error fails
+/// closed, so a non-admission failure can never be converted into a proof.
+/// Retention pressure (`SpoolPressure`) and host-identity observations
+/// (`Host*`) are never Governor unavailability and never mint. The stored
+/// allowlist additionally re-admits `AdmissionUnavailable` for rows minted
+/// before this strictness, but no constructor mints it from a fresh
+/// observation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct GovernorUnavailability {
     reason: GapRecoveryReason,
@@ -138,45 +143,69 @@ pub(crate) struct GovernorUnavailability {
 impl GovernorUnavailability {
     /// Mints the proof from an observed watchdog admission failure.
     ///
-    /// Mirrors the lane's admission-gap rule field-for-field: lease failures
-    /// keep their lease reason, every other spool error is the
-    /// admission-unavailable condition itself. Infallible by construction —
-    /// any admission reload failure is the observed Governor-admission
-    /// failure this proof stands for.
+    /// Accepts exactly the lease rejections that demonstrate a Governor
+    /// admission failure (`LeaseStale`, `LeaseFenced`, `InvalidLease`); any
+    /// other spool error (I/O, database, serialization, corruption, root)
+    /// fails closed because it is not an observed Governor admission
+    /// failure. The match is deliberately exhaustive with no wildcard: a
+    /// future `SpoolError` variant fails the build here instead of
+    /// silently minting.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError::Corrupt`] when `error` is not one of the exact
+    /// lease-failure variants above.
     // Slice-2 Governor-admission minter: no production caller until the MGR02 handoff lands.
     #[allow(dead_code)]
-    pub(crate) fn from_admission_error(error: &SpoolError) -> Self {
+    pub(crate) fn from_admission_error(error: &SpoolError) -> Result<Self, SpoolError> {
         let reason = match error {
             SpoolError::LeaseStale(_) => GapRecoveryReason::LeaseStale,
             SpoolError::LeaseFenced(_) => GapRecoveryReason::LeaseFenced,
             SpoolError::InvalidLease(_) => GapRecoveryReason::LeaseInvalid,
-            _ => GapRecoveryReason::AdmissionUnavailable,
+            SpoolError::Io(_)
+            | SpoolError::InvalidProtectedRoot
+            | SpoolError::Serialization(_)
+            | SpoolError::Database(_)
+            | SpoolError::Corrupt(_) => {
+                return Err(SpoolError::Corrupt(
+                    "watchdog admission error is not an observed Governor admission failure; refusing to mint an intent"
+                        .to_owned(),
+                ));
+            }
         };
-        Self { reason }
+        Ok(Self { reason })
     }
 
     /// Mints the proof from an observed Kernel supervision failure.
     ///
-    /// Mirrors the lane's kernel-gap rule field-for-field, except retention
-    /// pressure, which must never mint an intent.
+    /// Accepts exactly the kernel lease rejections that demonstrate a
+    /// Governor admission failure (`LeaseStale`, `LeaseFenced`,
+    /// `LeaseInvalid`); endpoint-unavailable, generic failures, detailed
+    /// failures, and retention pressure fail closed because they are not
+    /// observed Governor admission failures. The match is deliberately
+    /// exhaustive with no wildcard: a future `KernelWatchdogError` variant
+    /// fails the build here instead of silently minting.
     ///
     /// # Errors
     ///
-    /// Returns [`SpoolError::Corrupt`] when `error` is
-    /// [`KernelWatchdogError::SpoolPressure`].
+    /// Returns [`SpoolError::Corrupt`] when `error` is not one of the exact
+    /// lease-failure variants above.
     // Slice-2 Governor-admission minter: no production caller until the MGR02 handoff lands.
     #[allow(dead_code)]
     pub(crate) fn from_kernel_error(error: &KernelWatchdogError) -> Result<Self, SpoolError> {
         let reason = match error {
             KernelWatchdogError::LeaseStale => GapRecoveryReason::LeaseStale,
             KernelWatchdogError::LeaseFenced => GapRecoveryReason::LeaseFenced,
-            KernelWatchdogError::SpoolPressure => {
+            KernelWatchdogError::LeaseInvalid => GapRecoveryReason::LeaseInvalid,
+            KernelWatchdogError::Unavailable
+            | KernelWatchdogError::Failed
+            | KernelWatchdogError::FailedWithDetail(_)
+            | KernelWatchdogError::SpoolPressure => {
                 return Err(SpoolError::Corrupt(
-                    "watchdog spool pressure is not Governor unavailability; refusing to mint an intent"
+                    "watchdog kernel error is not an observed Governor admission failure; refusing to mint an intent"
                         .to_owned(),
                 ));
             }
-            _ => GapRecoveryReason::LeaseInvalid,
         };
         Ok(Self { reason })
     }
@@ -449,6 +478,7 @@ mod tests {
         GovernorUnavailability::from_admission_error(&SpoolError::InvalidLease(
             "test-lease".to_owned(),
         ))
+        .expect("test lease proof")
     }
 
     fn test_lineage() -> IntentLineage {
@@ -570,26 +600,36 @@ mod tests {
 
     #[test]
     fn governor_unavailability_binds_to_observed_admission_failure() {
-        // Admission-path observations mint with their own reason.
+        // Only exact lease rejections mint, each with its own reason.
         assert_eq!(
-            GovernorUnavailability::from_admission_error(&SpoolError::InvalidLease("test-lease".to_owned())).reason(),
+            GovernorUnavailability::from_admission_error(&SpoolError::InvalidLease("test-lease".to_owned())).expect("admission invalid-lease proof").reason(),
             GapRecoveryReason::LeaseInvalid
         );
         assert_eq!(
-            GovernorUnavailability::from_admission_error(&SpoolError::LeaseStale("test-stale".to_owned())).reason(),
+            GovernorUnavailability::from_admission_error(&SpoolError::LeaseStale("test-stale".to_owned())).expect("admission stale proof").reason(),
             GapRecoveryReason::LeaseStale
         );
         assert_eq!(
-            GovernorUnavailability::from_admission_error(&SpoolError::LeaseFenced("test-fenced".to_owned())).reason(),
+            GovernorUnavailability::from_admission_error(&SpoolError::LeaseFenced("test-fenced".to_owned())).expect("admission fenced proof").reason(),
             GapRecoveryReason::LeaseFenced
         );
+        // Any other spool error fails closed: it is not an observed
+        // Governor admission failure and must never convert into a proof.
+        for error in [
+            SpoolError::Io(std::io::Error::other("test-io")),
+            SpoolError::InvalidProtectedRoot,
+            SpoolError::Serialization("test-serialization".to_owned()),
+            SpoolError::Database("test-database".to_owned()),
+            SpoolError::Corrupt("test-corrupt".to_owned()),
+        ] {
+            assert!(
+                GovernorUnavailability::from_admission_error(&error).is_err(),
+                "non-admission spool error must never mint: {error:?}"
+            );
+        }
+        // Only exact kernel lease rejections mint, each with its own reason.
         assert_eq!(
-            GovernorUnavailability::from_admission_error(&SpoolError::Corrupt("test-corrupt".to_owned())).reason(),
-            GapRecoveryReason::AdmissionUnavailable
-        );
-        // Kernel supervision observations mint, except retention pressure.
-        assert_eq!(
-            GovernorUnavailability::from_kernel_error(&KernelWatchdogError::Unavailable).expect("kernel unavailable proof").reason(),
+            GovernorUnavailability::from_kernel_error(&KernelWatchdogError::LeaseInvalid).expect("kernel invalid-lease proof").reason(),
             GapRecoveryReason::LeaseInvalid
         );
         assert_eq!(
@@ -597,10 +637,23 @@ mod tests {
             GapRecoveryReason::LeaseStale
         );
         assert_eq!(
-            GovernorUnavailability::from_kernel_error(&KernelWatchdogError::Failed).expect("kernel failed proof").reason(),
-            GapRecoveryReason::LeaseInvalid
+            GovernorUnavailability::from_kernel_error(&KernelWatchdogError::LeaseFenced).expect("kernel fenced proof").reason(),
+            GapRecoveryReason::LeaseFenced
         );
-        assert!(GovernorUnavailability::from_kernel_error(&KernelWatchdogError::SpoolPressure).is_err());
+        // Endpoint-unavailable, generic and detailed failures, and retention
+        // pressure fail closed: none of them is an observed Governor
+        // admission failure.
+        for error in [
+            KernelWatchdogError::Unavailable,
+            KernelWatchdogError::Failed,
+            KernelWatchdogError::FailedWithDetail("test-detail".to_owned()),
+            KernelWatchdogError::SpoolPressure,
+        ] {
+            assert!(
+                GovernorUnavailability::from_kernel_error(&error).is_err(),
+                "non-admission kernel error must never mint: {error:?}"
+            );
+        }
         // No caller-chosen reason mints: retention pressure and host-identity
         // observations fail closed at the persistence boundary.
         for reason in [
