@@ -936,11 +936,14 @@ impl RecoveryDirective {
 
 /// Backpressure dispositions from I14.4.
 ///
-/// Every admission rejection or degradation response names exactly one of
-/// these dispositions and attaches a [`RecoveryDirective`]. Wire names are
-/// frozen; an unknown wire value fails closed at deserialization. The full
-/// fourteen-field `RecoveryDirective` shape and the reserve accounting that
-/// produces these responses stay later slices.
+/// Vocabulary freeze only: this enum fixes the seven frozen wire names an
+/// admission rejection or degradation response must carry once the wiring
+/// slice lands; an unknown wire value fails closed at deserialization. No
+/// rejection path wires a [`RecoveryDirective`] into its response yet and
+/// none claims directive conformance until that wiring slice, so no
+/// current response emits a directive-less payload under false
+/// conformance. The full fourteen-field `RecoveryDirective` shape and the
+/// reserve accounting that produces these responses stay later slices.
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum BackpressureDisposition {
@@ -984,32 +987,37 @@ impl fmt::Display for BackpressureDisposition {
 
 /// Commit status from I14.5 (`RecoveryDirective.commit_status`).
 ///
-/// Frozen four-value vocabulary: `none | staged | committed | unknown`.
-/// This enum only freezes the values that disposition responses must use;
-/// the complete fourteen-field `RecoveryDirective` shape stays a later
-/// slice.
+/// Frozen four-value vocabulary with exact lowercase wire names:
+/// `none | staged | committed | unknown`. Vocabulary freeze only: this
+/// enum fixes the values disposition responses must use; it does not wire
+/// [`RecoveryDirective`] into any rejection path, and no rejection path
+/// claims directive conformance until the wiring slice. The complete
+/// fourteen-field `RecoveryDirective` shape stays a later slice.
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum RecoveryCommitStatus {
     /// No durable commit exists.
+    #[serde(rename = "none")]
     None,
     /// Staged but not committed; do not retry blindly, poll or reconcile.
+    #[serde(rename = "staged")]
     Staged,
     /// Durably committed under its receipt.
+    #[serde(rename = "committed")]
     Committed,
     /// Commit outcome is unknown; reconcile before acting.
+    #[serde(rename = "unknown")]
     Unknown,
 }
 
 impl RecoveryCommitStatus {
-    /// Returns the frozen I14.5 wire name.
+    /// Returns the frozen lowercase I14.5 wire name.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::None => "NONE",
-            Self::Staged => "STAGED",
-            Self::Committed => "COMMITTED",
-            Self::Unknown => "UNKNOWN",
+            Self::None => "none",
+            Self::Staged => "staged",
+            Self::Committed => "committed",
+            Self::Unknown => "unknown",
         }
     }
 }
@@ -1250,11 +1258,12 @@ mod tests {
     fn recovery_commit_status_covers_none_staged_committed_unknown()
     -> Result<(), Box<dyn std::error::Error>> {
         let cases = [
-            (RecoveryCommitStatus::None, "NONE"),
-            (RecoveryCommitStatus::Staged, "STAGED"),
-            (RecoveryCommitStatus::Committed, "COMMITTED"),
-            (RecoveryCommitStatus::Unknown, "UNKNOWN"),
+            (RecoveryCommitStatus::None, "none"),
+            (RecoveryCommitStatus::Staged, "staged"),
+            (RecoveryCommitStatus::Committed, "committed"),
+            (RecoveryCommitStatus::Unknown, "unknown"),
         ];
+        assert_eq!(cases.len(), 4, "I14.5 freezes exactly four commit states");
         for (status, wire) in cases {
             assert_eq!(status.as_str(), wire);
             assert_eq!(status.to_string(), wire);
@@ -1263,6 +1272,38 @@ mod tests {
             assert_eq!(
                 serde_json::from_str::<RecoveryCommitStatus>(&encoded)?,
                 status
+            );
+        }
+        Ok(())
+    }
+
+    /// I14.5 wire-exactness: the frozen vocabulary serializes as the exact
+    /// lowercase strings `none`/`staged`/`committed`/`unknown`, and the
+    /// `SCREAMING_SNAKE_CASE` spellings fail closed at deserialization.
+    #[test]
+    fn recovery_commit_status_wire_names_are_lowercase_i14_5()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(
+            serde_json::to_string(&RecoveryCommitStatus::None)?,
+            "\"none\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RecoveryCommitStatus::Staged)?,
+            "\"staged\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RecoveryCommitStatus::Committed)?,
+            "\"committed\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RecoveryCommitStatus::Unknown)?,
+            "\"unknown\""
+        );
+        for rejected in ["NONE", "STAGED", "COMMITTED", "UNKNOWN"] {
+            assert!(
+                serde_json::from_value::<RecoveryCommitStatus>(serde_json::json!(rejected))
+                    .is_err(),
+                "{rejected} must fail closed: the I14.5 wire name is lowercase"
             );
         }
         Ok(())
