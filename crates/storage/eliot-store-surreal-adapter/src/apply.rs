@@ -1164,6 +1164,9 @@ pub(crate) async fn apply_surreal_erasure(
     adapter: &SurrealStoreAdapter,
     intent: &atomic_write::SurrealErasureIntent,
 ) -> Result<Vec<atomic_write::SurrealSurfaceOutcome>, AdapterError> {
+    // 688-FIX keeps the verifier boundary explicit: a terminal outcome is
+    // replayed by identity, and no destructive transaction is reachable
+    // unless the intent has first passed this validation gate.
     let intent = record_surreal_erasure_intent(intent.clone())?;
     let db = client(adapter).await?;
     ensure_ready(adapter, db).await?;

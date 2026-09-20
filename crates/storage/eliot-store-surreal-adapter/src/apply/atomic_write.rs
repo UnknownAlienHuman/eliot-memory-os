@@ -914,6 +914,9 @@ pub(super) async fn write_erasure_transaction(
     }
     let prior: Vec<SurrealSurfaceOutcome> = Vec::new();
     let (bindings, outcomes) = erasure_transaction_bindings(intent, &prior)?;
+    // 688-FIX derives the DELETE count from emitted bindings. This keeps the
+    // transaction empty of destructive statements when a terminal surface is
+    // preserved during same-operation replay.
     // 688-FIX: render the template from the emitted `erasure_subject{i}`
     // bindings (not from the intent denominator), so a replayed terminal
     // outcome — preserved verbatim above with no bindings — contributes zero
