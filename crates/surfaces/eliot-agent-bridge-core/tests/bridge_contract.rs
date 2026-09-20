@@ -1308,3 +1308,141 @@ fn event_fixture_has_only_expected_trace_shape() -> Result<(), Box<dyn std::erro
     assert!(trace.is_empty());
     Ok(())
 }
+#[test]
+fn recall_projection_is_bounded_handles_first_with_receipt_and_trace_handle()
+-> Result<(), Box<dyn std::error::Error>> {
+    use eliot_agent_bridge_core::{MAX_AGENT_RECALL_HANDLES, project_recall_for_agent};
+    use eliot_types::{
+        CognitiveProjectionReadState, L0FeatureScore, L0RankTrace, MemoryConfidence,
+        MemoryHandlePreview, MemoryRevision, ProjectId, RecallL0Response, ServerRecallVerdict,
+        TruncationInfo,
+    };
+    let mut handles = Vec::new();
+    let mut scores = Vec::new();
+    for index in 0..12 {
+        let handle = format!("claim:recall-{index}");
+        handles.push(MemoryHandlePreview {
+            handle: handle.clone(),
+            record_type: "claim".to_owned(),
+            preview: format!("preview {index}"),
+            lifecycle_state: None,
+            lifecycle_badge: None,
+        });
+        scores.push(L0FeatureScore {
+            handle,
+            total: 250,
+            reasons: vec!["all_query_tokens".to_owned()],
+            ..Default::default()
+        });
+    }
+    let response = RecallL0Response {
+        project_id: ProjectId::new_v7(),
+        at_revision: MemoryRevision::new(9),
+        projection_revision: Some(MemoryRevision::new(9)),
+        projection_state: CognitiveProjectionReadState::Published,
+        handles,
+        memory_confidence: MemoryConfidence::Found,
+        query_mode: "test".to_owned(),
+        rank_trace: L0RankTrace {
+            query: "recall".to_owned(),
+            normalized_query: "recall".to_owned(),
+            candidates_considered: 12,
+            candidates_returned: 12,
+            feature_scores: scores,
+            ..Default::default()
+        },
+        truncation: TruncationInfo {
+            truncated: false,
+            limit: 12,
+            returned: 12,
+        },
+    };
+    let verdict = ServerRecallVerdict::issue_for_l0_response(
+        &response,
+        "project/a",
+        "fence-1",
+        false,
+        true,
+        false,
+    )?;
+    assert_eq!(
+        verdict.disposition,
+        eliot_types::RecallDisposition::AdmittedStrong
+    );
+    let projected = project_recall_for_agent(&response, &verdict, false)?;
+    assert_eq!(projected.handles.len(), MAX_AGENT_RECALL_HANDLES);
+    assert!(projected.debug_rank_trace.is_none());
+    assert_eq!(projected.rank_trace_handle, verdict.rank_trace_handle);
+    assert_eq!(projected.receipt.visible_count, 12);
+    assert_eq!(projected.receipt.suppressed_count, 0);
+    assert_eq!(projected.receipt.scope, "project/a");
+    let expanded = project_recall_for_agent(&response, &verdict, true)?;
+    assert_eq!(
+        expanded
+            .debug_rank_trace
+            .as_ref()
+            .map(|trace| trace.feature_scores.len()),
+        Some(12)
+    );
+    Ok(())
+}
+
+#[test]
+fn recall_projection_rejects_forged_disposition_and_hides_suppressed_content()
+-> Result<(), Box<dyn std::error::Error>> {
+    use eliot_agent_bridge_core::project_recall_for_agent;
+    use eliot_types::{
+        CognitiveProjectionReadState, L0RankTrace, L0SuppressionTrace, MemoryConfidence,
+        MemoryRevision, ProjectId, RecallL0Response, ServerRecallVerdict, TruncationInfo,
+    };
+    let response = RecallL0Response {
+        project_id: ProjectId::new_v7(),
+        at_revision: MemoryRevision::new(4),
+        projection_revision: Some(MemoryRevision::new(4)),
+        projection_state: CognitiveProjectionReadState::Published,
+        handles: Vec::new(),
+        memory_confidence: MemoryConfidence::None,
+        query_mode: "test".to_owned(),
+        rank_trace: L0RankTrace {
+            query: "recall".to_owned(),
+            normalized_query: "recall".to_owned(),
+            candidates_considered: 2,
+            scope_suppressions: vec![
+                L0SuppressionTrace {
+                    handle: "claim:a".to_owned(),
+                    reason: "scope_mismatch".to_owned(),
+                },
+                L0SuppressionTrace {
+                    handle: "claim:b".to_owned(),
+                    reason: "scope_mismatch".to_owned(),
+                },
+            ],
+            ..Default::default()
+        },
+        truncation: TruncationInfo {
+            truncated: false,
+            limit: 12,
+            returned: 0,
+        },
+    };
+    let verdict = ServerRecallVerdict::issue_for_l0_response(
+        &response,
+        "project/a",
+        "fence-1",
+        false,
+        true,
+        false,
+    )?;
+    assert_eq!(
+        verdict.disposition,
+        eliot_types::RecallDisposition::ScopeSuppressed
+    );
+    let projected = project_recall_for_agent(&response, &verdict, false)?;
+    assert!(projected.handles.is_empty());
+    assert_eq!(projected.receipt.suppressed_count, 2);
+    assert!(projected.debug_rank_trace.is_none());
+    let mut forged = verdict;
+    forged.disposition = eliot_types::RecallDisposition::AdmittedWeak;
+    assert!(project_recall_for_agent(&response, &forged, false).is_err());
+    Ok(())
+}

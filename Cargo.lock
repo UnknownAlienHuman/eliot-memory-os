@@ -657,6 +657,7 @@ dependencies = [
  "eliot-process",
  "eliot-protocol",
  "eliot-skill",
+ "eliot-types",
  "serde",
  "serde_json",
  "thiserror",
