@@ -20,7 +20,7 @@ use eliot_doctor::admitted_effect::{
     admission_required_line, decode_bootstrap_args, help_text, version_line,
 };
 use eliot_doctor::{
-    dispatch_authority, dispatched_material,
+    dispatch_authority, dispatched_material, integration,
     kernel_client::{self, GateDecision, gate_after_advertise},
 };
 use eliot_doctor_core::KernelDoctorClient;
@@ -32,6 +32,9 @@ fn main() {
 }
 
 fn run(argv: &[String]) -> i32 {
+    if argv.get(1).is_some_and(|first| first == "integration") {
+        return run_integration(argv);
+    }
     match decode_bootstrap_args(argv) {
         Ok(BootstrapAction::Help) => emit_text(&help_text()),
         Ok(BootstrapAction::Version) => emit_text(&version_line()),
@@ -58,6 +61,103 @@ fn deny(detail: &str) -> i32 {
     let line = admission_required_line(detail);
     let _ = writeln!(std::io::stderr(), "{line}");
     EXIT_KERNEL_ADMISSION_REQUIRED
+}
+
+/// Exit code for a malformed `integration` invocation. Verification
+/// mismatches are reported inside the JSON report with exit 0; only input
+/// errors take this code.
+const INTEGRATION_INPUT_EXIT: i32 = 2;
+
+/// Read-only integration coverage check (I3.7):
+/// `eliot-doctor integration <profile> --expectation <abs> --observation <abs>`.
+///
+/// Inspects expected file hashes, active registrations, observed hook
+/// events, and the handshake result, then reports installed separately from
+/// live. Executes no repair, mints no authority, and mutates nothing.
+fn run_integration(argv: &[String]) -> i32 {
+    let Some(profile) = argv.get(2).cloned() else {
+        let _ = writeln!(
+            std::io::stderr(),
+            "integration requires a profile: integration <profile> --expectation <abs> --observation <abs>"
+        );
+        return INTEGRATION_INPUT_EXIT;
+    };
+    if profile.trim().is_empty() || profile.starts_with("--") {
+        let _ = writeln!(
+            std::io::stderr(),
+            "integration requires a non-empty profile: integration <profile> --expectation <abs> --observation <abs>"
+        );
+        return INTEGRATION_INPUT_EXIT;
+    }
+    let mut expectation: Option<String> = None;
+    let mut observation: Option<String> = None;
+    let mut rest = argv.iter().skip(3).peekable();
+    while let Some(arg) = rest.next() {
+        if arg == "--expectation" {
+            let Some(value) = rest.next() else {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "integration --expectation requires a value"
+                );
+                return INTEGRATION_INPUT_EXIT;
+            };
+            expectation = Some(value.clone());
+        } else if arg == "--observation" {
+            let Some(value) = rest.next() else {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "integration --observation requires a value"
+                );
+                return INTEGRATION_INPUT_EXIT;
+            };
+            observation = Some(value.clone());
+        } else {
+            let _ = writeln!(
+                std::io::stderr(),
+                "unrecognized integration argument: {arg}"
+            );
+            return INTEGRATION_INPUT_EXIT;
+        }
+    }
+    let (Some(expectation_path), Some(observation_path)) = (expectation, observation) else {
+        let _ = writeln!(
+            std::io::stderr(),
+            "integration requires --expectation <abs> and --observation <abs>"
+        );
+        return INTEGRATION_INPUT_EXIT;
+    };
+    let expected = match integration::load_expectation(std::path::Path::new(&expectation_path)) {
+        Ok(expected) => expected,
+        Err(error) => {
+            let _ = writeln!(std::io::stderr(), "integration input invalid: {error}");
+            return INTEGRATION_INPUT_EXIT;
+        }
+    };
+    if expected.profile != profile {
+        let _ = writeln!(
+            std::io::stderr(),
+            "integration profile mismatch: requested {profile} but expectation carries {}",
+            expected.profile
+        );
+        return INTEGRATION_INPUT_EXIT;
+    }
+    let observed = match integration::load_observation(std::path::Path::new(&observation_path)) {
+        Ok(observed) => observed,
+        Err(error) => {
+            let _ = writeln!(std::io::stderr(), "integration input invalid: {error}");
+            return INTEGRATION_INPUT_EXIT;
+        }
+    };
+    let report = integration::evaluate(&profile, &expected, &observed);
+    let text = integration::report_json(&report).to_string();
+    let mut stdout = std::io::stdout().lock();
+    match writeln!(stdout, "{text}") {
+        Ok(()) => match stdout.flush() {
+            Ok(()) => 0,
+            Err(_) => EXIT_EVIDENCE_FLUSH_FAILED,
+        },
+        Err(_) => EXIT_EVIDENCE_FLUSH_FAILED,
+    }
 }
 
 // Post-probe composition decision for one one-shot invocation lives in
@@ -231,5 +331,39 @@ mod tests {
     #[test]
     fn deny_exits_kernel_admission_required() {
         assert_eq!(deny("test detail"), EXIT_KERNEL_ADMISSION_REQUIRED);
+    }
+
+    #[test]
+    fn integration_requires_profile_and_inputs() {
+        let program = "eliot-doctor".to_owned();
+        let integration = "integration".to_owned();
+        assert_eq!(run_integration(&[program.clone()]), INTEGRATION_INPUT_EXIT);
+        assert_eq!(
+            run_integration(&[program.clone(), integration.clone()]),
+            INTEGRATION_INPUT_EXIT
+        );
+        assert_eq!(
+            run_integration(&[program.clone(), integration.clone(), "demo".to_owned(),]),
+            INTEGRATION_INPUT_EXIT
+        );
+        assert_eq!(
+            run_integration(&[
+                program.clone(),
+                integration.clone(),
+                "demo".to_owned(),
+                "--unknown".to_owned(),
+                "value".to_owned(),
+            ]),
+            INTEGRATION_INPUT_EXIT
+        );
+        assert_eq!(
+            run_integration(&[
+                program,
+                integration,
+                "--expectation".to_owned(),
+                "value".to_owned(),
+            ]),
+            INTEGRATION_INPUT_EXIT
+        );
     }
 }

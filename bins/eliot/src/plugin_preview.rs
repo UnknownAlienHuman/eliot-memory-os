@@ -1,0 +1,409 @@
+#![forbid(unsafe_code)]
+
+//! Plugin/bridge install preview and rollback front door (I3.7).
+//!
+//! Bins-local composition helper for the `eliot` operator CLI: before any
+//! installation mutation it renders the exact required preview fields and
+//! preserves a rollback artifact. The Governor integration-record shape is
+//! consumed as-is (read-only projection into the preview); this module mints
+//! no Governor authority and mutates nothing outside the caller-selected
+//! rollback directory plus a single install receipt written there.
+//!
+//! Required preview fields (I3.7): files to modify, exact config block,
+//! installed hooks, registered MCP server, tool/skill count, rollback copy,
+//! expected `IntegrationCoverageProfile`.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+/// Expected integration coverage consumed as-is from the Governor-side
+/// record shape. This struct is a read-only projection; it never writes
+/// back to the Governor.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ExpectedCoverageProfile {
+    /// Integration profile name checked later by
+    /// `eliot doctor integration <profile>`.
+    pub profile: String,
+    /// Expected SHA-256 (lowercase hex) per file path named in
+    /// `files_to_modify`.
+    #[serde(default)]
+    pub expected_file_hashes: BTreeMap<String, String>,
+    /// Registrations expected to be active after installation.
+    #[serde(default)]
+    pub expected_registrations: Vec<String>,
+    /// Hook events expected to be observed after installation.
+    #[serde(default)]
+    pub expected_hook_events: Vec<String>,
+}
+
+/// Caller-supplied plugin/bridge install proposal. Deserialized from the
+/// `--manifest` JSON file; never inferred from the current directory.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct PluginManifest {
+    /// Stable plugin/bridge identity (non-empty).
+    pub plugin_id: String,
+    /// Integration profile name (non-empty).
+    pub profile: String,
+    /// Files the install would modify (non-empty).
+    pub files_to_modify: Vec<String>,
+    /// Exact config block the install would write (non-empty).
+    pub config_block: String,
+    /// Hooks the install would register.
+    #[serde(default)]
+    pub hooks: Vec<String>,
+    /// MCP server registration name (non-empty).
+    pub mcp_server: String,
+    /// Tool count exposed by the plugin/bridge.
+    #[serde(default)]
+    pub tool_count: u32,
+    /// Skill count exposed by the plugin/bridge.
+    #[serde(default)]
+    pub skill_count: u32,
+    /// Expected coverage consumed as-is from the integration record.
+    pub expected_coverage: ExpectedCoverageProfile,
+}
+
+/// Rendered preview: every required I3.7 field plus the rollback copy path.
+/// No filesystem mutation has happened when this value is produced.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct PluginPreview {
+    /// Stable plugin/bridge identity.
+    pub plugin_id: String,
+    /// Integration profile name.
+    pub profile: String,
+    /// Files the install would modify.
+    pub files_to_modify: Vec<String>,
+    /// Exact config block the install would write.
+    pub config_block: String,
+    /// Hooks the install would register.
+    pub hooks: Vec<String>,
+    /// MCP server registration name.
+    pub mcp_server: String,
+    /// Tool count.
+    pub tool_count: u32,
+    /// Skill count.
+    pub skill_count: u32,
+    /// Rollback copy location preserved before mutation.
+    pub rollback_copy: String,
+    /// Expected coverage profile (Governor record consumed as-is).
+    pub expected_coverage: ExpectedCoverageProfile,
+}
+
+/// Typed preview/install failure. All variants are caller-actionable and
+/// perform no hidden mutation.
+#[derive(Debug, thiserror::Error)]
+pub enum PluginPreviewError {
+    /// The manifest file could not be read.
+    #[error("read plugin manifest {path}: {detail}")]
+    ManifestRead {
+        /// Manifest path that failed.
+        path: String,
+        /// Underlying detail.
+        detail: String,
+    },
+    /// The manifest JSON is malformed or violates a field contract.
+    #[error("invalid plugin manifest: {0}")]
+    ManifestInvalid(String),
+    /// The rollback directory or artifact could not be prepared.
+    #[error("prepare rollback artifact: {0}")]
+    Rollback(String),
+    /// The install receipt could not be recorded.
+    #[error("record install receipt: {0}")]
+    Receipt(String),
+}
+
+/// Loads and validates a manifest. The path must be absolute.
+pub fn load_manifest(path: &Path) -> Result<PluginManifest, PluginPreviewError> {
+    if !path.is_absolute() {
+        return Err(PluginPreviewError::ManifestInvalid(
+            "manifest path must be absolute".to_owned(),
+        ));
+    }
+    let bytes = std::fs::read(path).map_err(|error| PluginPreviewError::ManifestRead {
+        path: path.display().to_string(),
+        detail: error.to_string(),
+    })?;
+    let manifest: PluginManifest = serde_json::from_slice(&bytes)
+        .map_err(|error| PluginPreviewError::ManifestInvalid(error.to_string()))?;
+    validate_manifest(&manifest)?;
+    Ok(manifest)
+}
+
+fn validate_manifest(manifest: &PluginManifest) -> Result<(), PluginPreviewError> {
+    if manifest.plugin_id.trim().is_empty() {
+        return Err(PluginPreviewError::ManifestInvalid(
+            "plugin_id must be non-empty".to_owned(),
+        ));
+    }
+    if manifest.profile.trim().is_empty() {
+        return Err(PluginPreviewError::ManifestInvalid(
+            "profile must be non-empty".to_owned(),
+        ));
+    }
+    if manifest.files_to_modify.is_empty() {
+        return Err(PluginPreviewError::ManifestInvalid(
+            "files_to_modify must be non-empty".to_owned(),
+        ));
+    }
+    if manifest.config_block.trim().is_empty() {
+        return Err(PluginPreviewError::ManifestInvalid(
+            "config_block must be non-empty".to_owned(),
+        ));
+    }
+    if manifest.mcp_server.trim().is_empty() {
+        return Err(PluginPreviewError::ManifestInvalid(
+            "mcp_server must be non-empty".to_owned(),
+        ));
+    }
+    if manifest.expected_coverage.profile.trim().is_empty() {
+        return Err(PluginPreviewError::ManifestInvalid(
+            "expected_coverage.profile must be non-empty".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Renders the full preview, binding the rollback copy path without touching
+/// the filesystem.
+#[must_use]
+pub fn render_preview(manifest: &PluginManifest, rollback_dir: &Path) -> PluginPreview {
+    let rollback_copy = rollback_dir
+        .join(format!("{}.rollback.json", manifest.plugin_id))
+        .display()
+        .to_string();
+    PluginPreview {
+        plugin_id: manifest.plugin_id.clone(),
+        files_to_modify: manifest.files_to_modify.clone(),
+        config_block: manifest.config_block.clone(),
+        hooks: manifest.hooks.clone(),
+        mcp_server: manifest.mcp_server.clone(),
+        tool_count: manifest.tool_count,
+        skill_count: manifest.skill_count,
+        profile: manifest.profile.clone(),
+        rollback_copy,
+        expected_coverage: manifest.expected_coverage.clone(),
+    }
+}
+
+/// Projects the preview to the machine-readable contract JSON. Contains all
+/// seven required I3.7 fields.
+#[must_use]
+pub fn preview_json(preview: &PluginPreview) -> serde_json::Value {
+    serde_json::json!({
+        "contract": "eliot.plugin.preview",
+        "contract_version": "1.0.0",
+        "plugin_id": preview.plugin_id,
+        "profile": preview.profile,
+        "files_to_modify": preview.files_to_modify,
+        "config_block": preview.config_block,
+        "hooks": preview.hooks,
+        "mcp_server": preview.mcp_server,
+        "tool_count": preview.tool_count,
+        "skill_count": preview.skill_count,
+        "rollback_copy": preview.rollback_copy,
+        "expected_coverage_profile": preview.expected_coverage,
+        "completed": false,
+        "note": "preview only; no mutation was attempted",
+    })
+}
+
+/// Preserves the rollback artifact before any mutation. Creates the rollback
+/// directory, copies any already-existing target files beside the artifact
+/// (recording per-file `copied`/`absent`/`error`), and writes the
+/// `<plugin_id>.rollback.json` artifact. Returns the artifact path.
+pub fn ensure_rollback_artifact(
+    manifest: &PluginManifest,
+    preview: &PluginPreview,
+    rollback_dir: &Path,
+) -> Result<PathBuf, PluginPreviewError> {
+    if !rollback_dir.is_absolute() {
+        return Err(PluginPreviewError::Rollback(
+            "rollback directory must be absolute".to_owned(),
+        ));
+    }
+    std::fs::create_dir_all(rollback_dir)
+        .map_err(|error| PluginPreviewError::Rollback(error.to_string()))?;
+    let mut per_file: BTreeMap<String, String> = BTreeMap::new();
+    for target in &manifest.files_to_modify {
+        let target_path = PathBuf::from(target);
+        if !target_path.is_absolute() {
+            per_file.insert(target.clone(), "skipped_non_absolute".to_owned());
+            continue;
+        }
+        if !target_path.exists() {
+            per_file.insert(target.clone(), "absent".to_owned());
+            continue;
+        }
+        let bytes = match std::fs::read(&target_path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                per_file.insert(target.clone(), format!("error:{error}"));
+                continue;
+            }
+        };
+        let file_name = target_path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "file".to_owned());
+        let backup_path = rollback_dir.join(format!("{}.{}.bak", manifest.plugin_id, file_name));
+        match std::fs::write(&backup_path, &bytes) {
+            Ok(()) => {
+                per_file.insert(target.clone(), backup_path.display().to_string());
+            }
+            Err(error) => {
+                per_file.insert(target.clone(), format!("error:{error}"));
+            }
+        }
+    }
+    let artifact_path = PathBuf::from(preview.rollback_copy.clone());
+    let artifact = serde_json::json!({
+        "contract": "eliot.plugin.rollback",
+        "contract_version": "1.0.0",
+        "plugin_id": manifest.plugin_id,
+        "profile": manifest.profile,
+        "preview": preview_json(preview),
+        "per_file": per_file,
+        "note": "rollback preserved before mutation; restore these bytes to roll back",
+    });
+    let bytes = serde_json::to_vec_pretty(&artifact)
+        .map_err(|error| PluginPreviewError::Rollback(error.to_string()))?;
+    std::fs::write(&artifact_path, &bytes)
+        .map_err(|error| PluginPreviewError::Rollback(error.to_string()))?;
+    Ok(artifact_path)
+}
+
+/// Install outcome: the rollback path plus the install receipt path. The
+/// receipt records installation only; runtime liveness is never claimed here
+/// (see `eliot doctor integration <profile>`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PluginInstallOutcome {
+    /// Rollback artifact preserved before mutation.
+    pub rollback_artifact: PathBuf,
+    /// Install receipt written inside the rollback directory.
+    pub receipt_path: PathBuf,
+}
+
+/// Performs the governed install: renders the preview, preserves the
+/// rollback artifact first, then records an install receipt scoped to the
+/// rollback directory. Never modifies the target files themselves.
+pub fn install_with_rollback(
+    manifest: &PluginManifest,
+    rollback_dir: &Path,
+) -> Result<(PluginPreview, PluginInstallOutcome), PluginPreviewError> {
+    let preview = render_preview(manifest, rollback_dir);
+    let rollback_artifact = ensure_rollback_artifact(manifest, &preview, rollback_dir)?;
+    let receipt_path = rollback_dir.join(format!("{}.installed.json", manifest.plugin_id));
+    let receipt = serde_json::json!({
+        "contract": "eliot.plugin.install",
+        "contract_version": "1.0.0",
+        "plugin_id": manifest.plugin_id,
+        "profile": manifest.profile,
+        "status": "INSTALLED_NOT_LIVE",
+        "completed": true,
+        "rollback_copy": preview.rollback_copy,
+        "preview": preview_json(&preview),
+        "note": "installation recorded; runtime liveness requires eliot doctor integration <profile> handshake",
+    });
+    let bytes = serde_json::to_vec_pretty(&receipt)
+        .map_err(|error| PluginPreviewError::Receipt(error.to_string()))?;
+    std::fs::write(&receipt_path, &bytes)
+        .map_err(|error| PluginPreviewError::Receipt(error.to_string()))?;
+    Ok((
+        preview,
+        PluginInstallOutcome {
+            rollback_artifact,
+            receipt_path,
+        },
+    ))
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    reason = "small pure preview tests use explicit fixtures with absolute temp paths"
+)]
+mod tests {
+    use super::*;
+
+    fn fixture_manifest() -> PluginManifest {
+        PluginManifest {
+            plugin_id: "demo-bridge".to_owned(),
+            profile: "demo".to_owned(),
+            files_to_modify: vec!["C:\\eliot\\demo\\config.json".to_owned()],
+            config_block: "{\"bridge\":\"demo\"}".to_owned(),
+            hooks: vec!["on_task".to_owned()],
+            mcp_server: "demo-mcp".to_owned(),
+            tool_count: 3,
+            skill_count: 2,
+            expected_coverage: ExpectedCoverageProfile {
+                profile: "demo".to_owned(),
+                expected_file_hashes: BTreeMap::from([(
+                    "C:\\eliot\\demo\\config.json".to_owned(),
+                    "ab".repeat(32),
+                )]),
+                expected_registrations: vec!["demo-mcp".to_owned()],
+                expected_hook_events: vec!["on_task".to_owned()],
+            },
+        }
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("eliot-go19-1964-{tag}"));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    #[test]
+    fn preview_renders_all_required_fields() {
+        let manifest = fixture_manifest();
+        let rollback_dir = temp_dir("preview");
+        let preview = render_preview(&manifest, &rollback_dir);
+        let value = preview_json(&preview);
+        for field in [
+            "files_to_modify",
+            "config_block",
+            "hooks",
+            "mcp_server",
+            "tool_count",
+            "skill_count",
+            "rollback_copy",
+            "expected_coverage_profile",
+        ] {
+            assert!(value.get(field).is_some(), "preview must carry {field}");
+        }
+        assert_eq!(value["plugin_id"], "demo-bridge");
+        assert_eq!(value["tool_count"], 3);
+        assert_eq!(value["skill_count"], 2);
+        let _ = std::fs::remove_dir_all(&rollback_dir);
+    }
+
+    #[test]
+    fn install_preserves_rollback_before_mutation() {
+        let manifest = fixture_manifest();
+        let rollback_dir = temp_dir("install");
+        let (preview, outcome) =
+            install_with_rollback(&manifest, &rollback_dir).expect("install with rollback");
+        assert!(outcome.rollback_artifact.exists());
+        assert!(outcome.receipt_path.exists());
+        assert_eq!(
+            outcome.rollback_artifact.display().to_string(),
+            preview.rollback_copy
+        );
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&outcome.receipt_path).expect("read receipt"))
+                .expect("parse receipt");
+        assert_eq!(receipt["status"], "INSTALLED_NOT_LIVE");
+        assert!(receipt.get("preview").is_some());
+        let _ = std::fs::remove_dir_all(&rollback_dir);
+    }
+
+    #[test]
+    fn empty_plugin_id_is_rejected() {
+        let mut manifest = fixture_manifest();
+        manifest.plugin_id = "  ".to_owned();
+        assert!(validate_manifest(&manifest).is_err());
+    }
+}

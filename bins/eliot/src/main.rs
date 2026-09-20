@@ -43,6 +43,7 @@ use std::{
 use tracing_subscriber::EnvFilter;
 
 mod bootstrap_draft;
+mod plugin_preview;
 mod source_bundle_materializer;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -88,6 +89,11 @@ enum Command {
     Runtime {
         #[command(subcommand)]
         command: RuntimeCommand,
+    },
+    /// Preview or install a plugin/bridge with rollback (I3.7).
+    Plugin {
+        #[command(subcommand)]
+        command: PluginCommand,
     },
     Version,
     /// Start or reuse the authenticated User Broker and launch Operator.
@@ -314,6 +320,30 @@ enum RuntimeCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum PluginCommand {
+    /// Render the exact I3.7 preview fields without mutating anything.
+    Preview {
+        /// Absolute path to the plugin proposal manifest JSON.
+        #[arg(long, value_parser = absolute_path)]
+        manifest: PathBuf,
+        /// Absolute rollback directory bound into the preview.
+        #[arg(long, value_parser = absolute_path)]
+        rollback_dir: PathBuf,
+    },
+    /// Preserve the rollback artifact before mutation, then record an
+    /// install receipt scoped to the rollback directory. Never claims
+    /// runtime liveness.
+    Install {
+        /// Absolute path to the plugin proposal manifest JSON.
+        #[arg(long, value_parser = absolute_path)]
+        manifest: PathBuf,
+        /// Absolute rollback directory receiving the artifact and receipt.
+        #[arg(long, value_parser = absolute_path)]
+        rollback_dir: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum SystemCommand {
     /// Capture source/build/runtime/store/integration evidence.
     Snapshot {
@@ -366,8 +396,69 @@ fn run() -> Result<i32> {
         Command::Bootstrap { command } => Ok(run_bootstrap(command)),
         Command::Installation { command } => run_installation(command),
         Command::Runtime { command } => run_runtime(command),
+        Command::Plugin { command } => run_plugin(command),
         Command::Dispatch => run_dispatch(),
         Command::Ui => run_ui(),
+    }
+}
+
+fn run_plugin(command: PluginCommand) -> Result<i32> {
+    match command {
+        PluginCommand::Preview {
+            manifest,
+            rollback_dir,
+        } => {
+            let proposal = match plugin_preview::load_manifest(&manifest) {
+                Ok(proposal) => proposal,
+                Err(error) => {
+                    write_installation_error("PLUGIN_PREVIEW_INVALID", &error.to_string());
+                    return Ok(INVALID_REQUEST_EXIT);
+                }
+            };
+            let preview = plugin_preview::render_preview(&proposal, &rollback_dir);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&plugin_preview::preview_json(&preview))?
+            );
+            Ok(0)
+        }
+        PluginCommand::Install {
+            manifest,
+            rollback_dir,
+        } => {
+            let proposal = match plugin_preview::load_manifest(&manifest) {
+                Ok(proposal) => proposal,
+                Err(error) => {
+                    write_installation_error("PLUGIN_INSTALL_INVALID", &error.to_string());
+                    return Ok(INVALID_REQUEST_EXIT);
+                }
+            };
+            match plugin_preview::install_with_rollback(&proposal, &rollback_dir) {
+                Ok((preview, outcome)) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&json!({
+                            "contract": "eliot.plugin.install",
+                            "contract_version": "1.0.0",
+                            "status": "INSTALLED_NOT_LIVE",
+                            "completed": true,
+                            "plugin_id": preview.plugin_id,
+                            "profile": preview.profile,
+                            "preview": plugin_preview::preview_json(&preview),
+                            "rollback_copy": outcome.rollback_artifact.display().to_string(),
+                            "receipt": outcome.receipt_path.display().to_string(),
+                            "scope": INSTALLATION_SCOPE,
+                            "note": "installation recorded; runtime liveness requires eliot doctor integration <profile> handshake",
+                        }))?
+                    );
+                    Ok(0)
+                }
+                Err(error) => {
+                    write_installation_error("PLUGIN_INSTALL_FAILED", &error.to_string());
+                    Ok(INVALID_REQUEST_EXIT)
+                }
+            }
+        }
     }
 }
 
@@ -3121,6 +3212,44 @@ mod tests {
     #[test]
     fn committed_unknown_materialization_uses_reconciliation_exit() {
         assert_eq!(UNKNOWN_OUTCOME_EXIT, 75);
+    }
+
+    #[test]
+    fn plugin_preview_and_install_parse() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+        let parsed = Cli::try_parse_from([
+            "eliot",
+            "plugin",
+            "preview",
+            "--manifest",
+            "C:\\eliot\\manifest.json",
+            "--rollback-dir",
+            "C:\\eliot\\rollback",
+        ])
+        .expect("plugin preview parses");
+        assert!(matches!(
+            parsed.command,
+            Command::Plugin {
+                command: PluginCommand::Preview { .. }
+            }
+        ));
+        let parsed = Cli::try_parse_from([
+            "eliot",
+            "plugin",
+            "install",
+            "--manifest",
+            "C:\\eliot\\manifest.json",
+            "--rollback-dir",
+            "C:\\eliot\\rollback",
+        ])
+        .expect("plugin install parses");
+        assert!(matches!(
+            parsed.command,
+            Command::Plugin {
+                command: PluginCommand::Install { .. }
+            }
+        ));
     }
 
     fn applied_outcome() -> InstallationStepOutcome {
