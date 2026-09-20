@@ -1364,6 +1364,16 @@ struct AcceptedHeartbeat {
     receive_wall_ms: u64,
 }
 
+/// One admission window: banked accepts plus rejected-peer evidence.
+/// Rejected connects never reach admission, but their count rides the
+/// readiness record beside the handshakes ref so foreign connects stay
+/// visible.
+struct WindowAccepts {
+    accepted: Vec<AcceptedHeartbeat>,
+    /// Connects refused before the peer proved the bound incarnation.
+    rejected_peers: u64,
+}
+
 /// ACL-restricted Host listener for one pipe instance. The DACL grants
 /// only the current process token user plus `LocalSystem` (shared,
 /// NUL-guarded server factory); every accepted peer is still bound by
@@ -1417,8 +1427,17 @@ impl HeartbeatListener {
     /// # Errors
     ///
     /// Returns an error on expiry, an unbindable peer, or a malformed
-    /// line. Callers fail the armed admission closed on any error.
-    async fn accept_one(&mut self, deadline: Instant) -> Result<AcceptedHeartbeat, HostError> {
+    /// line. Connects refused before the peer proves the bound incarnation
+    /// bump `rejected_peers` (foreign-connect evidence for the readiness
+    /// record); read faults from the verified peer do not. Callers drop
+    /// the failed instance and recreate the listener before re-polling:
+    /// a pre-rotation failure leaves this instance pinned to a dead or
+    /// foreign peer, so re-polling it would wedge the window.
+    async fn accept_one(
+        &mut self,
+        deadline: Instant,
+        rejected_peers: &mut u64,
+    ) -> Result<AcceptedHeartbeat, HostError> {
         use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, BufReader};
         let budget = deadline.saturating_duration_since(Instant::now());
         if budget.is_zero() {
@@ -1432,23 +1451,34 @@ impl HeartbeatListener {
                 HostError::RecoveryRequired("heartbeat listen window expired".to_owned())
             })?
             .map_err(|error| HostError::Platform(error.to_string()))?;
-        let peer = eliot_windows_ipc::named_pipe_client_process(&self.server).map_err(|error| {
-            HostError::RecoveryRequired(format!("heartbeat peer is not bound: {error}"))
-        })?;
+        // Rejected peers: connects refused before the peer proves the bound
+        // incarnation never reach admission, but they stay counted in the
+        // readiness record.
+        let peer = eliot_windows_ipc::named_pipe_client_process(&self.server)
+            .map_err(|error| {
+                *rejected_peers += 1;
+                HostError::RecoveryRequired(format!("heartbeat peer is not bound: {error}"))
+            })?;
         // Incarnation check at connect: the kernel-bound peer must be the
         // exact SCM-verified process the descriptor names. PID equality
         // alone cannot distinguish reuse, so the creation time is compared
         // too; a restarted or substituted writer fails here even when it
         // knows the challenge and the sequence.
         if peer.pid != self.expected_incarnation_pid {
+            *rejected_peers += 1;
             return Err(HostError::RecoveryRequired(
                 "heartbeat peer is not the bound watchdog incarnation".to_owned(),
             ));
         }
-        let peer_start = eliot_windows_ipc::process_creation_ticks(peer.pid).map_err(|error| {
-            HostError::RecoveryRequired(format!("heartbeat peer incarnation is unknown: {error}"))
-        })?;
+        let peer_start = eliot_windows_ipc::process_creation_ticks(peer.pid)
+            .map_err(|error| {
+                *rejected_peers += 1;
+                HostError::RecoveryRequired(format!(
+                    "heartbeat peer incarnation is unknown: {error}"
+                ))
+            })?;
         if peer_start != self.expected_incarnation_start_100ns {
+            *rejected_peers += 1;
             return Err(HostError::RecoveryRequired(
                 "heartbeat peer is not the bound watchdog incarnation".to_owned(),
             ));
@@ -1493,6 +1523,37 @@ impl HeartbeatListener {
             receive_monotonic: Instant::now(),
             receive_wall_ms: wall_now_ms()?,
         })
+    }
+
+    /// Drops the failed pipe instance and installs a fresh listening server
+    /// after an accept failure, so the window re-polls instead of wedging.
+    ///
+    /// A pre-rotation failure leaves this instance pinned to a dead or
+    /// foreign peer (rotation happens only after verification): re-polling
+    /// it would spin on that same connection while a restarted Watchdog
+    /// waits on the name. The stale pin is released first, then a fresh
+    /// server takes over the name (a non-first instance: the name is
+    /// already owned, and a first-instance claim would conflict with the
+    /// still-live stale handle being replaced).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the fresh server cannot be created; callers
+    /// break the window fail-closed.
+    fn recreate_after_failure(&mut self) -> Result<(), HostError> {
+        // Best effort: a never-connected instance reports not-connected
+        // here, which is benign because the fresh server below replaces it
+        // either way.
+        let _ = self.server.disconnect();
+        let next = eliot_windows_ipc::create_current_user_server(
+            &self.pipe_name,
+            &self.allowed_sid,
+            false,
+        )
+        .map_err(|error| HostError::Platform(error.to_string()))?;
+        let stale = std::mem::replace(&mut self.server, next);
+        drop(stale);
+        Ok(())
     }
 }
 /// Admitted heartbeat: the validated observation plus the evidence refs
@@ -1685,21 +1746,24 @@ pub fn admit_heartbeat_observation(
 }
 
 /// Binds the listener and collects one admission window of accepted beats
-/// before the deadline.
+/// before the deadline, counting rejected peers on the way.
 ///
-/// One failed accept never discards the beats already banked: it is
-/// skipped and polling continues. Enough banked beats close the window
-/// early ([`ADMISSION_MIN_BEATS`] already prove a continuous chain), so
-/// the window cannot age its own evidence out past the freshness bound.
+/// One failed accept never discards the beats already banked: the failed
+/// instance is dropped and recreated, then polling continues on the fresh
+/// listener, so a restarted Watchdog can still reach this window. Enough
+/// banked beats close the window early ([`ADMISSION_MIN_BEATS`] already
+/// prove a continuous chain). That no-aging guarantee holds only for
+/// windows reaching two accepts: a single-beat window still idles to the
+/// deadline and fails closed on stale or missing beats.
 ///
 /// # Errors
 ///
-/// Returns an error when the listener cannot bind; per-accept failures are
-/// skipped, never fatal.
+/// Returns an error when the listener cannot bind or a failed instance
+/// cannot be recreated; per-accept failures are skipped, never fatal.
 async fn collect_window_accepts(
     descriptor: &HeartbeatTransportDescriptor,
     deadline: Instant,
-) -> Result<Vec<AcceptedHeartbeat>, HostError> {
+) -> Result<WindowAccepts, HostError> {
     // The listener binds inside the runtime: pipe creation registers with
     // the reactor.
     let mut listener = HeartbeatListener::bind(
@@ -1707,26 +1771,38 @@ async fn collect_window_accepts(
         descriptor.watchdog_incarnation_pid,
         descriptor.watchdog_incarnation_start_100ns,
     )?;
-    let mut out = Vec::new();
+    let mut accepted = Vec::new();
+    let mut rejected_peers = 0u64;
     loop {
         if Instant::now() >= deadline {
             break;
         }
-        match listener.accept_one(deadline).await {
-            Ok(accept) => {
-                out.push(accept);
-                if out.len() >= ADMISSION_MIN_BEATS {
-                    break;
-                }
+        if let Ok(accept) = listener
+            .accept_one(deadline, &mut rejected_peers)
+            .await
+        {
+            accepted.push(accept);
+            if accepted.len() >= ADMISSION_MIN_BEATS {
+                break;
             }
-            Err(_) => {
-                if Instant::now() >= deadline {
-                    break;
-                }
+        } else {
+            if Instant::now() >= deadline {
+                break;
+            }
+            // The failed instance may still pin a dead or foreign peer
+            // (rotation happens only after verification): re-polling it
+            // would wedge the window on that same connection, so drop
+            // it and continue on a fresh listener. A failed recreation
+            // breaks fail-closed.
+            if listener.recreate_after_failure().is_err() {
+                break;
             }
         }
     }
-    Ok(out)
+    Ok(WindowAccepts {
+        accepted,
+        rejected_peers,
+    })
 }
 
 /// Observes one armed heartbeat admission window: binds the listener,
@@ -1772,8 +1848,10 @@ pub fn observe_armed_heartbeat(
         .build()
         .map_err(|error| HostError::Platform(error.to_string()))?;
     let deadline = Instant::now() + ADMISSION_READ_TIMEOUT;
-    let accepted = runtime.block_on(collect_window_accepts(&descriptor, deadline));
-    let accepted: Vec<AcceptedHeartbeat> = accepted?;
+    let window = runtime.block_on(collect_window_accepts(&descriptor, deadline));
+    let window: WindowAccepts = window?;
+    let rejected_peers = window.rejected_peers;
+    let accepted: Vec<AcceptedHeartbeat> = window.accepted;
     if accepted.is_empty() {
         return Err(HostError::RecoveryRequired(
             "armed heartbeat transport delivered no fresh heartbeat".to_owned(),
@@ -1824,7 +1902,7 @@ pub fn observe_armed_heartbeat(
         })?,
         distinct_peer_pids,
     };
-    let admitted = admit_heartbeat_observation(
+    let mut admitted = admit_heartbeat_observation(
         observed,
         &descriptor,
         expected_kernel_epoch,
@@ -1833,6 +1911,14 @@ pub fn observe_armed_heartbeat(
         &peer,
         &handshake,
     )?;
+    // Rejected-peer evidence: connects refused before proving the bound
+    // incarnation stay visible in the readiness record without admitting
+    // anything. The counter rides beside the handshakes ref above, never
+    // inside the admission check, so a second SYSTEM-context connect is
+    // recorded instead of erased.
+    admitted.evidence_refs.push(heartbeat_evidence_ref(format!(
+        "host-heartbeat-rejected-peers:{rejected_peers}"
+    ))?);
     persist_heartbeat_observation(host_state_root, &admitted.observation)?;
     Ok(admitted.evidence_refs)
 }
@@ -2177,6 +2263,74 @@ mod tests {
         assert!(refs.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn rejected_peer_mismatch_recovers_on_fresh_listener() {
+        // A listener bound to a foreign incarnation rejects every real
+        // connect at verification: the peer can never be the bound
+        // watchdog, so each connect counts one rejected peer without
+        // admitting anything.
+        let mut descriptor = test_bound_descriptor();
+        descriptor.watchdog_incarnation_pid = 4242;
+        descriptor.watchdog_incarnation_start_100ns = 999;
+        let pipe_name = descriptor.pipe_name.clone();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap_or_else(|_| panic!("test runtime must build"));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        runtime.block_on(async {
+            let mut listener = HeartbeatListener::bind(
+                pipe_name.as_str(),
+                descriptor.watchdog_incarnation_pid,
+                descriptor.watchdog_incarnation_start_100ns,
+            )
+            .unwrap_or_else(|_| panic!("foreign listener must bind"));
+            let mut rejected_peers = 0u64;
+            // First foreign connect pins the instance, then fails
+            // verification: counted, never admitted.
+            let held_a = tokio::net::windows::named_pipe::ClientOptions::new()
+                .open(pipe_name.as_str())
+                .unwrap_or_else(|_| panic!("foreign client must open"));
+            let Err(error) = listener.accept_one(deadline, &mut rejected_peers).await
+            else {
+                panic!("foreign connect must be rejected")
+            };
+            assert!(
+                format!("{error:?}").contains("not the bound watchdog incarnation"),
+                "foreign connect must fail verification"
+            );
+            assert_eq!(
+                rejected_peers, 1,
+                "one foreign connect must count one rejection"
+            );
+            // The stale pin would wedge re-polling on this same instance:
+            // drop it (the old watchdog going away) and recreate, so the
+            // window re-polls fresh instead of spinning on the dead pin.
+            drop(held_a);
+            listener
+                .recreate_after_failure()
+                .unwrap_or_else(|_| panic!("recreate must succeed"));
+            // A second foreign connect reaches the fresh listener and is
+            // rejected again: recovery happened, and the count accumulates
+            // instead of erasing the signal.
+            let _held_b = tokio::net::windows::named_pipe::ClientOptions::new()
+                .open(pipe_name.as_str())
+                .unwrap_or_else(|_| panic!("second client must open"));
+            let Err(error) = listener.accept_one(deadline, &mut rejected_peers).await
+            else {
+                panic!("second connect must be rejected")
+            };
+            assert!(
+                format!("{error:?}").contains("not the bound watchdog incarnation"),
+                "second connect must reach fresh verification"
+            );
+            assert_eq!(
+                rejected_peers, 2,
+                "rejections must accumulate across recreation"
+            );
+        });
+    }
     #[test]
     fn loopback_accept_derives_and_admits() {
         use tokio::io::AsyncWriteExt as _;
@@ -2188,6 +2342,7 @@ mod tests {
         let first_bytes = test_message(&descriptor, 1);
         let second_bytes = test_message(&descriptor, 2);
         let deadline = Instant::now() + Duration::from_secs(10);
+        let mut rejected_peers = 0u64;
         let accepted: Vec<AcceptedHeartbeat> = runtime.block_on(async {
             let mut listener = HeartbeatListener::bind(
                 descriptor.pipe_name.as_str(),
@@ -2198,7 +2353,7 @@ mod tests {
             let mut out = Vec::new();
             for message in [&first_bytes, &second_bytes] {
                 let (accept, ()) = tokio::join!(
-                    listener.accept_one(deadline),
+                    listener.accept_one(deadline, &mut rejected_peers),
                     async {
                         let mut client =
                             tokio::net::windows::named_pipe::ClientOptions::new()
@@ -2224,6 +2379,11 @@ mod tests {
         });
         assert_eq!(accepted.len(), 2);
         assert_eq!(accepted[0].peer.process_id, std::process::id());
+        // Two legit accepts from the bound incarnation reject nothing.
+        assert_eq!(
+            rejected_peers, 0,
+            "legit loopback accepts must not count rejected peers"
+        );
         // The first windowed read is PARTIAL (no prior chain); the second
         // chains to the first through Host-observed handshakes and the
         // bound incarnation, proving CONTINUOUS over a real pipe.
