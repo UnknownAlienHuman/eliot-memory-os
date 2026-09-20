@@ -307,3 +307,998 @@ fn discard_through_terminator<R: std::io::BufRead>(
         discarded_bytes = next;
     }
 }
+
+/// Complete limit/source/version/stage table for the private input profile.
+///
+/// Every row is either an inherited public limit (reused unchanged through the
+/// real owner contract) or a new Bridge-local acquisition decision made for
+/// this stdin boundary in issue #977. I7.2's 4 MiB frame default, 64 KiB
+/// hot-response figure, and 256 KiB structured-response ceiling are NOT reused
+/// as request limits: a transport frame, a JSON outer record, and a decoded
+/// body are distinct budgets.
+///
+/// ```text
+/// limit                          value        unit    source owner / revision          stage
+/// ------------------------------ ------------ ------- ------------------------------- ----------------
+/// max_record_bytes               1_048_576    bytes   NEW Bridge-local (#977, v1)      acquisition
+/// max_buffered_bytes             2_097_152    bytes   NEW Bridge-local (#977, v1)      acquisition
+/// max_json_string_bytes          524_288      bytes   NEW Bridge-local (#977, v1)      decode pre-scan
+/// max_container_items            4_096        items   NEW Bridge-local (#977, v1)      decode pre-scan
+/// max_scalar_values              16_384       values  NEW Bridge-local (#977, v1)      decode pre-scan
+/// max_nesting_depth              64           levels  NEW Bridge-local (#977, v1)      decode pre-scan
+/// max_requests_per_process       65_536       records NEW Bridge-local (#977, v1)      dispatch loop
+/// max_consecutive_invalid_records 8           records NEW Bridge-local (#977, v1)      dispatch loop
+/// max_oversize_discard_bytes     4_194_304    bytes   NEW Bridge-local (#977, v1)      resynchronization
+/// idle_timeout_ms                300_000      ms      NEW declared, NOT enforced       (no transport
+/// lifetime_timeout_ms            86_400_000   ms      NEW declared, NOT enforced        mechanism yet)
+/// oversize_disposition           discard-     policy  NEW Bridge-local (#977, v1)      resynchronization
+///                                through-
+///                                terminator
+/// host.correlation_id            512          bytes   eliot-mcp host.rs rev 1.0.0      typed contracts
+/// host.operation_handle          2_048        bytes   eliot-mcp host.rs rev 1.0.0      typed contracts
+/// host observed resource refs    32 x 2_048   items   eliot-mcp host.rs rev 1.0.0      typed contracts
+/// host event cursors             16           items   eliot-mcp host.rs rev 1.0.0      typed contracts
+/// host trace entries             16           items   eliot-mcp host.rs rev 1.0.0      typed contracts
+/// host deadline preference       1..86.4M     ms      eliot-mcp host.rs rev 1.0.0      gateway validation
+/// admitted tool variants         8 names      enum    eliot-mcp contract.rs            typed contracts
+/// attach/event/fence shapes      owner rules  typed   agent-bridge-core / protocol     typed contracts
+/// ```
+///
+/// A byte/work bound on returned chunks does not prove a wall-clock deadline
+/// on blocking stdin: the two timeout rows are declared so the profile is
+/// complete, but they are NOT enforced on blocking stdin by this module and no
+/// slow-reader interruption is claimed without a separately supported
+/// transport mechanism.
+pub(crate) const REQUEST_INPUT_LIMIT_TABLE: &str = "eliot.agent-bridge.request-input.v1 limits";
+
+/// Maximum decoded control-name characters echoed in a redacted diagnostic.
+///
+/// Longer names are truncated so diagnostics never echo protected bodies,
+/// credentials, or oversized variant strings wholesale.
+const MAX_CONTROL_NAME_CHARS: usize = 64;
+
+/// Fail-closed rejection of one decoded record before typed construction.
+///
+/// Diagnostics carry only static reasons and bounded control names; they never
+/// echo raw request bytes, unknown-key text, variant strings, body content, or
+/// credentials.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum DecodeReject {
+    /// Bytes are not well-formed JSON for this boundary.
+    Malformed {
+        /// Static redacted reason.
+        reason: &'static str,
+    },
+    /// A duplicate object key was observed, comparing fully decoded key
+    /// strings so escape-equivalent spellings conflict.
+    DuplicateKey {
+        /// Bounded decoded duplicate key name.
+        key: String,
+    },
+    /// An explicitly unsupported operation or tool variant was observed.
+    UnknownVariant {
+        /// Bounded variant name.
+        variant: String,
+    },
+    /// JSON nesting exceeds `max_nesting_depth`.
+    DepthExceeded,
+    /// One array/object exceeds `max_container_items`.
+    TooManyMembers,
+    /// The record exceeds `max_scalar_values` scalar values.
+    TooManyScalars,
+    /// One decoded string exceeds `max_json_string_bytes`.
+    StringTooLong,
+    /// Trailing bytes follow the single top-level JSON value.
+    TrailingBytes,
+    /// The encoded record exceeds `max_record_bytes` for direct callers.
+    OversizeRecord,
+    /// The presented profile identity is not the accepted profile.
+    ProfileMismatch,
+}
+
+impl std::fmt::Display for DecodeReject {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Malformed { reason } => {
+                write!(
+                    formatter,
+                    "record is not a well-formed request ({REQUEST_INPUT_PROFILE_ID}): {reason}"
+                )
+            }
+            Self::DuplicateKey { key } => {
+                write!(
+                    formatter,
+                    "record carries a duplicate protected key ({REQUEST_INPUT_PROFILE_ID}): {key}"
+                )
+            }
+            Self::UnknownVariant { variant } => {
+                write!(
+                    formatter,
+                    "record carries an unsupported operation variant ({REQUEST_INPUT_PROFILE_ID}): {variant}"
+                )
+            }
+            Self::DepthExceeded => {
+                write!(
+                    formatter,
+                    "record nesting exceeds the admitted depth ({REQUEST_INPUT_PROFILE_ID})"
+                )
+            }
+            Self::TooManyMembers => {
+                write!(
+                    formatter,
+                    "record container exceeds the admitted member bound ({REQUEST_INPUT_PROFILE_ID})"
+                )
+            }
+            Self::TooManyScalars => {
+                write!(
+                    formatter,
+                    "record exceeds the admitted scalar bound ({REQUEST_INPUT_PROFILE_ID})"
+                )
+            }
+            Self::StringTooLong => {
+                write!(
+                    formatter,
+                    "record string exceeds the admitted decoded bound ({REQUEST_INPUT_PROFILE_ID})"
+                )
+            }
+            Self::TrailingBytes => {
+                write!(
+                    formatter,
+                    "record has trailing bytes after the request ({REQUEST_INPUT_PROFILE_ID})"
+                )
+            }
+            Self::OversizeRecord => {
+                write!(
+                    formatter,
+                    "record exceeds the admitted encoded bound ({REQUEST_INPUT_PROFILE_ID})"
+                )
+            }
+            Self::ProfileMismatch => {
+                write!(
+                    formatter,
+                    "input profile is not the accepted profile ({REQUEST_INPUT_PROFILE_ID})"
+                )
+            }
+        }
+    }
+}
+
+/// Requires the presented profile identity to be the accepted profile.
+///
+/// Any missing, unsupported, or stale profile identity fails closed without a
+/// fallback, a default, or an unlimited mode.
+pub(crate) fn check_profile_id(provided: &str) -> Result<(), DecodeReject> {
+    if provided == REQUEST_INPUT_PROFILE_ID {
+        Ok(())
+    } else {
+        Err(DecodeReject::ProfileMismatch)
+    }
+}
+
+/// Bounded retained-scratch budget for acquisition plus one decoded record.
+///
+/// Returns the checked sum of the outer-record, buffered, and decoded-string
+/// ceilings, or `None` when the checked arithmetic overflows. The `None` case
+/// fails closed: no allocation size is derived from wrapping arithmetic.
+#[must_use]
+pub(crate) fn scratch_budget(profile: RequestInputProfile) -> Option<usize> {
+    profile
+        .max_record_bytes
+        .checked_add(profile.max_buffered_bytes)?
+        .checked_add(profile.max_json_string_bytes)
+}
+
+/// Truncates one decoded control name for redacted diagnostics.
+fn bound_control_name(value: &str) -> String {
+    value.chars().take(MAX_CONTROL_NAME_CHARS).collect()
+}
+
+/// Validates one complete framed record against the accepted profile before
+/// typed `Request` construction.
+///
+/// Enforces, in order: profile internal consistency, presented-profile
+/// binding, the encoded byte ceiling (for direct callers; acquisition already
+/// enforces it incrementally), single-value JSON shape, nesting depth,
+/// per-container member counts, total scalar counts, per-string decoded
+/// bounds, and duplicate-key rejection with escape-equivalent comparison.
+/// Opaque observation strings are measured but never interpreted: they stay
+/// inert bounded data. This function grants no authority and performs no
+/// dispatch.
+pub(crate) fn prevalidate_record(
+    text: &str,
+    profile: RequestInputProfile,
+) -> Result<(), DecodeReject> {
+    if profile.validate().is_err() {
+        return Err(DecodeReject::Malformed {
+            reason: "input profile is internally inconsistent",
+        });
+    }
+    if text.len() > profile.max_record_bytes {
+        return Err(DecodeReject::OversizeRecord);
+    }
+    let bytes = text.as_bytes();
+    let mut scanner = BoundsScanner {
+        profile,
+        depth: 0,
+        scalars: 0,
+    };
+    let mut pos = skip_whitespace(bytes, 0);
+    pos = scanner.parse_value(bytes, pos)?;
+    pos = skip_whitespace(bytes, pos);
+    if pos != bytes.len() {
+        return Err(DecodeReject::TrailingBytes);
+    }
+    Ok(())
+}
+
+/// Maps one typed-construction failure to a redacted rejection.
+///
+/// Only static reasons and bounded control names cross into diagnostics; raw
+/// unknown keys, variant strings, body content, and credentials are never
+/// echoed wholesale through Serde errors.
+pub(crate) fn classify_serde_error(error: &serde_json::Error) -> DecodeReject {
+    let message = error.to_string();
+    if message.starts_with("duplicate field") {
+        DecodeReject::DuplicateKey {
+            key: bound_control_name(&field_between_backticks(&message)),
+        }
+    } else if message.starts_with("unknown variant") {
+        DecodeReject::UnknownVariant {
+            variant: bound_control_name(&field_between_backticks(&message)),
+        }
+    } else if message.contains("unknown field") {
+        DecodeReject::Malformed {
+            reason: "request carries an unknown protected field",
+        }
+    } else if message.contains("missing field") {
+        DecodeReject::Malformed {
+            reason: "request is missing a required protected field",
+        }
+    } else if message.contains("invalid type") || message.contains("invalid value") {
+        DecodeReject::Malformed {
+            reason: "request carries a mistyped protected field",
+        }
+    } else {
+        DecodeReject::Malformed {
+            reason: "request is not a supported operation shape",
+        }
+    }
+}
+
+fn field_between_backticks(message: &str) -> String {
+    let Some(start) = message.find('`') else {
+        return "request".to_owned();
+    };
+    let rest = &message[start + 1..];
+    let Some(end) = rest.find('`') else {
+        return "request".to_owned();
+    };
+    bound_control_name(&rest[..end])
+}
+
+/// Every top-level envelope key admitted by the binary-private `Request`
+/// contract: the discriminant plus every payload member across all variants.
+///
+/// Derived read-only from `bins/eliot-agent-bridge/src/main.rs` `Request`;
+/// this table moves with that enum when its owner changes the operation set.
+const GLOBAL_ENVELOPE_KEYS: [&str; 9] = [
+    "op",
+    "request",
+    "event",
+    "expected_connection_id",
+    "new_connection_id",
+    "session_id",
+    "activation_generation",
+    "authority_epoch",
+    "fence_nonce",
+];
+
+/// Validates the top-level operation envelope before typed construction.
+///
+/// Serde unit variants (`status`, `stop`, `reconcile_external`) would silently
+/// ignore extra members, so the exact key set is enforced here per operation:
+/// attach/invoke/cancel carry exactly `request`; forward_hook/forward_event
+/// carry exactly `event`; reconnect carries exactly its seven authority-claim
+/// members; the terminal operations carry only `op`. Keys outside the global
+/// allowlist are unknown protected fields; known keys on the wrong operation
+/// are mismatched payloads. Unknown operation names are rejected with a
+/// bounded control name following the shared-contract precedent, never with
+/// raw body text.
+pub(crate) fn check_request_envelope(
+    text: &str,
+    profile: RequestInputProfile,
+) -> Result<(), DecodeReject> {
+    let bytes = text.as_bytes();
+    let mut pos = skip_whitespace(bytes, 0);
+    if bytes.get(pos) != Some(&b'{') {
+        return Err(DecodeReject::Malformed {
+            reason: "request envelope must be an object",
+        });
+    }
+    pos = skip_whitespace(bytes, pos + 1);
+    if bytes.get(pos) == Some(&b'}') {
+        return Err(DecodeReject::Malformed {
+            reason: "request is missing its operation",
+        });
+    }
+    let mut keys: Vec<String> = Vec::new();
+    let mut operation: Option<String> = None;
+    loop {
+        let key_pos = skip_whitespace(bytes, pos);
+        if bytes.get(key_pos) != Some(&b'"') {
+            return Err(DecodeReject::Malformed {
+                reason: "object keys must be strings",
+            });
+        }
+        let (key, _, after_key) = parse_key(bytes, key_pos)?;
+        if keys.contains(&key) {
+            return Err(DecodeReject::DuplicateKey {
+                key: bound_control_name(&key),
+            });
+        }
+        let separator = skip_whitespace(bytes, after_key);
+        if bytes.get(separator) != Some(&b':') {
+            return Err(DecodeReject::Malformed {
+                reason: "object key is missing its separator",
+            });
+        }
+        let value_pos = separator + 1;
+        let mut next = if key == "op" {
+            let string_pos = skip_whitespace(bytes, value_pos);
+            if bytes.get(string_pos) != Some(&b'"') {
+                return Err(DecodeReject::Malformed {
+                    reason: "request operation must be a string",
+                });
+            }
+            let (name, after) = decode_string(bytes, string_pos)?;
+            operation = Some(name);
+            after
+        } else {
+            skip_json_value(bytes, value_pos, 1, profile.max_nesting_depth)?
+        };
+        keys.push(key);
+        next = skip_whitespace(bytes, next);
+        match bytes.get(next) {
+            Some(b',') => {
+                pos = skip_whitespace(bytes, next + 1);
+                if bytes.get(pos) == Some(&b'}') {
+                    return Err(DecodeReject::Malformed {
+                        reason: "object has a trailing separator",
+                    });
+                }
+            }
+            Some(b'}') => {
+                pos = skip_whitespace(bytes, next + 1);
+                break;
+            }
+            _ => {
+                return Err(DecodeReject::Malformed {
+                    reason: "object is not closed",
+                });
+            }
+        }
+    }
+    if pos != bytes.len() {
+        return Err(DecodeReject::TrailingBytes);
+    }
+    let Some(operation) = operation else {
+        return Err(DecodeReject::Malformed {
+            reason: "request is missing its operation",
+        });
+    };
+    check_operation_shape(&operation, &keys)
+}
+
+fn check_operation_shape(operation: &str, keys: &[String]) -> Result<(), DecodeReject> {
+    let expected: &[&str] = match operation {
+        "attach" | "invoke" | "cancel" => &["op", "request"],
+        "forward_hook" | "forward_event" => &["op", "event"],
+        "reconcile_external" | "status" | "stop" => &["op"],
+        "reconnect" => &[
+            "op",
+            "expected_connection_id",
+            "new_connection_id",
+            "session_id",
+            "activation_generation",
+            "authority_epoch",
+            "fence_nonce",
+        ],
+        _ => {
+            return Err(DecodeReject::UnknownVariant {
+                variant: bound_control_name(operation),
+            });
+        }
+    };
+    if keys.len() == expected.len()
+        && expected
+            .iter()
+            .all(|want| keys.iter().any(|got| got.as_str() == *want))
+    {
+        return Ok(());
+    }
+    if keys
+        .iter()
+        .all(|key| GLOBAL_ENVELOPE_KEYS.contains(&key.as_str()))
+    {
+        return Err(DecodeReject::Malformed {
+            reason: "request operation and payload shape do not match",
+        });
+    }
+    Err(DecodeReject::Malformed {
+        reason: "request carries an unknown protected field",
+    })
+}
+
+/// Skips one JSON value without interpreting it.
+///
+/// The envelope check runs after the bounded pre-scan, so this only walks
+/// already-validated structure to the next top-level member boundary.
+fn skip_json_value(
+    input: &[u8],
+    pos: usize,
+    depth: usize,
+    max_depth: usize,
+) -> Result<usize, DecodeReject> {
+    if depth > max_depth {
+        return Err(DecodeReject::DepthExceeded);
+    }
+    let pos = skip_whitespace(input, pos);
+    let byte = input.get(pos).ok_or(DecodeReject::Malformed {
+        reason: "record ends inside a value",
+    })?;
+    match byte {
+        b'{' => skip_object(input, pos, depth, max_depth),
+        b'[' => skip_array(input, pos, depth, max_depth),
+        b'"' => {
+            let (_, next) = decode_string(input, pos)?;
+            Ok(next)
+        }
+        b't' => parse_literal(input, pos, "true"),
+        b'f' => parse_literal(input, pos, "false"),
+        b'n' => parse_literal(input, pos, "null"),
+        b'-' | b'0'..=b'9' => parse_number(input, pos),
+        _ => Err(DecodeReject::Malformed {
+            reason: "record contains an unexpected value",
+        }),
+    }
+}
+
+fn skip_object(
+    input: &[u8],
+    pos: usize,
+    depth: usize,
+    max_depth: usize,
+) -> Result<usize, DecodeReject> {
+    let mut pos = skip_whitespace(input, pos + 1);
+    if input.get(pos) == Some(&b'}') {
+        return Ok(pos + 1);
+    }
+    loop {
+        let key_pos = skip_whitespace(input, pos);
+        if input.get(key_pos) != Some(&b'"') {
+            return Err(DecodeReject::Malformed {
+                reason: "object keys must be strings",
+            });
+        }
+        let (_, after_key) = decode_string(input, key_pos)?;
+        let separator = skip_whitespace(input, after_key);
+        if input.get(separator) != Some(&b':') {
+            return Err(DecodeReject::Malformed {
+                reason: "object key is missing its separator",
+            });
+        }
+        pos = skip_json_value(input, separator + 1, depth + 1, max_depth)?;
+        pos = skip_whitespace(input, pos);
+        match input.get(pos) {
+            Some(b',') => {
+                pos = skip_whitespace(input, pos + 1);
+            }
+            Some(b'}') => return Ok(pos + 1),
+            _ => {
+                return Err(DecodeReject::Malformed {
+                    reason: "object is not closed",
+                });
+            }
+        }
+    }
+}
+
+fn skip_array(
+    input: &[u8],
+    pos: usize,
+    depth: usize,
+    max_depth: usize,
+) -> Result<usize, DecodeReject> {
+    let mut pos = skip_whitespace(input, pos + 1);
+    if input.get(pos) == Some(&b']') {
+        return Ok(pos + 1);
+    }
+    loop {
+        pos = skip_json_value(input, pos, depth + 1, max_depth)?;
+        pos = skip_whitespace(input, pos);
+        match input.get(pos) {
+            Some(b',') => {
+                pos = skip_whitespace(input, pos + 1);
+            }
+            Some(b']') => return Ok(pos + 1),
+            _ => {
+                return Err(DecodeReject::Malformed {
+                    reason: "array is not closed",
+                });
+            }
+        }
+    }
+}
+
+/// Bounded structural scanner enforcing the decode-stage profile rows.
+struct BoundsScanner {
+    profile: RequestInputProfile,
+    depth: usize,
+    scalars: usize,
+}
+
+impl BoundsScanner {
+    fn count_scalar(&mut self) -> Result<(), DecodeReject> {
+        let Some(next) = self.scalars.checked_add(1) else {
+            return Err(DecodeReject::TooManyScalars);
+        };
+        if next > self.profile.max_scalar_values {
+            return Err(DecodeReject::TooManyScalars);
+        }
+        self.scalars = next;
+        Ok(())
+    }
+
+    fn check_string(&self, decoded_len: usize) -> Result<(), DecodeReject> {
+        if decoded_len > self.profile.max_json_string_bytes {
+            return Err(DecodeReject::StringTooLong);
+        }
+        Ok(())
+    }
+
+    fn enter_container(&mut self) -> Result<(), DecodeReject> {
+        let Some(next) = self.depth.checked_add(1) else {
+            return Err(DecodeReject::DepthExceeded);
+        };
+        if next > self.profile.max_nesting_depth {
+            return Err(DecodeReject::DepthExceeded);
+        }
+        self.depth = next;
+        Ok(())
+    }
+
+    fn leave_container(&mut self) {
+        self.depth = self.depth.saturating_sub(1);
+    }
+
+    fn parse_value(&mut self, input: &[u8], pos: usize) -> Result<usize, DecodeReject> {
+        let pos = skip_whitespace(input, pos);
+        let byte = input.get(pos).ok_or(DecodeReject::Malformed {
+            reason: "record ends inside a value",
+        })?;
+        match byte {
+            b'{' => self.parse_object(input, pos),
+            b'[' => self.parse_array(input, pos),
+            b'"' => {
+                let (decoded_len, next) = parse_string_decoded_len(input, pos)?;
+                self.check_string(decoded_len)?;
+                self.count_scalar()?;
+                Ok(next)
+            }
+            b't' => {
+                let next = parse_literal(input, pos, "true")?;
+                self.count_scalar()?;
+                Ok(next)
+            }
+            b'f' => {
+                let next = parse_literal(input, pos, "false")?;
+                self.count_scalar()?;
+                Ok(next)
+            }
+            b'n' => {
+                let next = parse_literal(input, pos, "null")?;
+                self.count_scalar()?;
+                Ok(next)
+            }
+            b'-' | b'0'..=b'9' => {
+                let next = parse_number(input, pos)?;
+                self.count_scalar()?;
+                Ok(next)
+            }
+            _ => Err(DecodeReject::Malformed {
+                reason: "record contains an unexpected value",
+            }),
+        }
+    }
+
+    fn parse_object(&mut self, input: &[u8], pos: usize) -> Result<usize, DecodeReject> {
+        self.enter_container()?;
+        let mut pos = skip_whitespace(input, pos + 1);
+        if input.get(pos) == Some(&b'}') {
+            self.leave_container();
+            return Ok(pos + 1);
+        }
+        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut members: usize = 0;
+        loop {
+            let key_pos = skip_whitespace(input, pos);
+            if input.get(key_pos) != Some(&b'"') {
+                self.leave_container();
+                return Err(DecodeReject::Malformed {
+                    reason: "object keys must be strings",
+                });
+            }
+            let (key, decoded_len, next) = parse_key(input, key_pos)?;
+            self.check_string(decoded_len)?;
+            if !seen.insert(key.clone()) {
+                self.leave_container();
+                return Err(DecodeReject::DuplicateKey {
+                    key: bound_control_name(&key),
+                });
+            }
+            let Some(next_members) = members.checked_add(1) else {
+                self.leave_container();
+                return Err(DecodeReject::TooManyMembers);
+            };
+            if next_members > self.profile.max_container_items {
+                self.leave_container();
+                return Err(DecodeReject::TooManyMembers);
+            }
+            members = next_members;
+            pos = skip_whitespace(input, next);
+            if input.get(pos) != Some(&b':') {
+                self.leave_container();
+                return Err(DecodeReject::Malformed {
+                    reason: "object key is missing its separator",
+                });
+            }
+            let after_value = self.parse_value(input, pos + 1);
+            match after_value {
+                Ok(next_pos) => pos = skip_whitespace(input, next_pos),
+                Err(error) => {
+                    self.leave_container();
+                    return Err(error);
+                }
+            }
+            match input.get(pos) {
+                Some(b',') => {
+                    pos = skip_whitespace(input, pos + 1);
+                    if input.get(pos) == Some(&b'}') {
+                        self.leave_container();
+                        return Err(DecodeReject::Malformed {
+                            reason: "object has a trailing separator",
+                        });
+                    }
+                }
+                Some(b'}') => {
+                    self.leave_container();
+                    return Ok(pos + 1);
+                }
+                _ => {
+                    self.leave_container();
+                    return Err(DecodeReject::Malformed {
+                        reason: "object is not closed",
+                    });
+                }
+            }
+        }
+    }
+
+    fn parse_array(&mut self, input: &[u8], pos: usize) -> Result<usize, DecodeReject> {
+        self.enter_container()?;
+        let mut pos = skip_whitespace(input, pos + 1);
+        if input.get(pos) == Some(&b']') {
+            self.leave_container();
+            return Ok(pos + 1);
+        }
+        let mut items: usize = 0;
+        loop {
+            let next_pos = match self.parse_value(input, pos) {
+                Ok(next_pos) => next_pos,
+                Err(error) => {
+                    self.leave_container();
+                    return Err(error);
+                }
+            };
+            let Some(next_items) = items.checked_add(1) else {
+                self.leave_container();
+                return Err(DecodeReject::TooManyMembers);
+            };
+            if next_items > self.profile.max_container_items {
+                self.leave_container();
+                return Err(DecodeReject::TooManyMembers);
+            }
+            items = next_items;
+            pos = skip_whitespace(input, next_pos);
+            match input.get(pos) {
+                Some(b',') => {
+                    pos = skip_whitespace(input, pos + 1);
+                    if input.get(pos) == Some(&b']') {
+                        self.leave_container();
+                        return Err(DecodeReject::Malformed {
+                            reason: "array has a trailing separator",
+                        });
+                    }
+                }
+                Some(b']') => {
+                    self.leave_container();
+                    return Ok(pos + 1);
+                }
+                _ => {
+                    self.leave_container();
+                    return Err(DecodeReject::Malformed {
+                        reason: "array is not closed",
+                    });
+                }
+            }
+        }
+    }
+}
+
+fn skip_whitespace(input: &[u8], mut pos: usize) -> usize {
+    while pos < input.len() && matches!(input[pos], b' ' | b'\n' | b'\r' | b'\t') {
+        pos += 1;
+    }
+    pos
+}
+
+/// Parses one JSON string key, returning its decoded form, decoded UTF-8 byte
+/// length, and the offset past its closing quote.
+///
+/// Decoding compares fully decoded key strings, so escape-equivalent spellings
+/// such as `"op"` and `"\u006f\u0070"` conflict as duplicates.
+fn parse_key(input: &[u8], pos: usize) -> Result<(String, usize, usize), DecodeReject> {
+    let (decoded, next) = decode_string(input, pos)?;
+    let len = decoded.len();
+    Ok((decoded, len, next))
+}
+
+/// Parses one JSON string value, returning its decoded UTF-8 byte length and
+/// the offset past its closing quote.
+fn parse_string_decoded_len(input: &[u8], pos: usize) -> Result<(usize, usize), DecodeReject> {
+    let (decoded, next) = decode_string(input, pos)?;
+    Ok((decoded.len(), next))
+}
+
+fn decode_string(input: &[u8], pos: usize) -> Result<(String, usize), DecodeReject> {
+    if input.get(pos) != Some(&b'"') {
+        return Err(DecodeReject::Malformed {
+            reason: "string is not opened",
+        });
+    }
+    let mut out = String::new();
+    let mut pos = pos + 1;
+    while let Some(byte) = input.get(pos) {
+        match byte {
+            b'"' => return Ok((out, pos + 1)),
+            b'\\' => {
+                let (ch, next) = decode_escape(input, pos)?;
+                out.push(ch);
+                pos = next;
+            }
+            0x00..=0x1F => {
+                return Err(DecodeReject::Malformed {
+                    reason: "string contains an unescaped control character",
+                });
+            }
+            _ => {
+                let start = pos;
+                while pos < input.len()
+                    && input[pos] >= 0x20
+                    && input[pos] != b'"'
+                    && input[pos] != b'\\'
+                {
+                    pos += 1;
+                }
+                let chunk = std::str::from_utf8(&input[start..pos]).map_err(|_| {
+                    DecodeReject::Malformed {
+                        reason: "string is not valid UTF-8",
+                    }
+                })?;
+                out.push_str(chunk);
+            }
+        }
+    }
+    Err(DecodeReject::Malformed {
+        reason: "string is not terminated",
+    })
+}
+
+fn decode_escape(input: &[u8], pos: usize) -> Result<(char, usize), DecodeReject> {
+    let esc = *input.get(pos + 1).ok_or(DecodeReject::Malformed {
+        reason: "escape sequence is truncated",
+    })?;
+    match esc {
+        b'"' => Ok(('"', pos + 2)),
+        b'\\' => Ok(('\\', pos + 2)),
+        b'/' => Ok(('/', pos + 2)),
+        b'b' => Ok(('\u{0008}', pos + 2)),
+        b'f' => Ok(('\u{000C}', pos + 2)),
+        b'n' => Ok(('\n', pos + 2)),
+        b'r' => Ok(('\r', pos + 2)),
+        b't' => Ok(('\t', pos + 2)),
+        b'u' => decode_unicode_escape(input, pos),
+        _ => Err(DecodeReject::Malformed {
+            reason: "escape sequence is not supported",
+        }),
+    }
+}
+
+fn decode_unicode_escape(input: &[u8], pos: usize) -> Result<(char, usize), DecodeReject> {
+    let first = decode_hex4(input, pos + 2)?;
+    let mut next = pos + 6;
+    let code = if (0xD800..0xDC00).contains(&first) {
+        if input.get(next) == Some(&b'\\') && input.get(next + 1) == Some(&b'u') {
+            let second = decode_hex4(input, next + 2)?;
+            if !(0xDC00..0xE000).contains(&second) {
+                return Err(DecodeReject::Malformed {
+                    reason: "lone surrogate escape is not allowed",
+                });
+            }
+            next += 6;
+            0x10000 + ((u32::from(first - 0xD800) << 10) | u32::from(second - 0xDC00))
+        } else {
+            return Err(DecodeReject::Malformed {
+                reason: "lone surrogate escape is not allowed",
+            });
+        }
+    } else {
+        if (0xDC00..0xE000).contains(&first) {
+            return Err(DecodeReject::Malformed {
+                reason: "lone surrogate escape is not allowed",
+            });
+        }
+        u32::from(first)
+    };
+    char::from_u32(code).map_or(
+        Err(DecodeReject::Malformed {
+            reason: "unicode escape is not a valid character",
+        }),
+        |ch| Ok((ch, next)),
+    )
+}
+
+fn decode_hex4(input: &[u8], pos: usize) -> Result<u16, DecodeReject> {
+    if pos + 4 > input.len() {
+        return Err(DecodeReject::Malformed {
+            reason: "unicode escape is truncated",
+        });
+    }
+    let mut value: u16 = 0;
+    for byte in &input[pos..pos + 4] {
+        let digit = match byte {
+            b'0'..=b'9' => u16::from(byte - b'0'),
+            b'a'..=b'f' => u16::from(byte - b'a') + 10,
+            b'A'..=b'F' => u16::from(byte - b'A') + 10,
+            _ => {
+                return Err(DecodeReject::Malformed {
+                    reason: "unicode escape is not hexadecimal",
+                });
+            }
+        };
+        value = value.saturating_mul(16).saturating_add(digit);
+    }
+    Ok(value)
+}
+
+fn parse_literal(input: &[u8], pos: usize, expected: &'static str) -> Result<usize, DecodeReject> {
+    if input.len() >= pos + expected.len()
+        && &input[pos..pos + expected.len()] == expected.as_bytes()
+    {
+        Ok(pos + expected.len())
+    } else {
+        Err(DecodeReject::Malformed {
+            reason: "literal is not well-formed",
+        })
+    }
+}
+
+fn parse_number(input: &[u8], mut pos: usize) -> Result<usize, DecodeReject> {
+    if input.get(pos) == Some(&b'-') {
+        pos += 1;
+    }
+    match input.get(pos) {
+        Some(b'0') => {
+            pos += 1;
+        }
+        Some(b'1'..=b'9') => {
+            while matches!(input.get(pos), Some(b'0'..=b'9')) {
+                pos += 1;
+            }
+        }
+        _ => {
+            return Err(DecodeReject::Malformed {
+                reason: "number is not well-formed",
+            });
+        }
+    }
+    if input.get(pos) == Some(&b'.') {
+        pos += 1;
+        if !matches!(input.get(pos), Some(b'0'..=b'9')) {
+            return Err(DecodeReject::Malformed {
+                reason: "number is not well-formed",
+            });
+        }
+        while matches!(input.get(pos), Some(b'0'..=b'9')) {
+            pos += 1;
+        }
+    }
+    if matches!(input.get(pos), Some(b'e' | b'E')) {
+        pos += 1;
+        if matches!(input.get(pos), Some(b'+' | b'-')) {
+            pos += 1;
+        }
+        if !matches!(input.get(pos), Some(b'0'..=b'9')) {
+            return Err(DecodeReject::Malformed {
+                reason: "number is not well-formed",
+            });
+        }
+        while matches!(input.get(pos), Some(b'0'..=b'9')) {
+            pos += 1;
+        }
+    }
+    Ok(pos)
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    const SMALL: RequestInputProfile = RequestInputProfile {
+        max_record_bytes: 256,
+        max_buffered_bytes: 512,
+        max_json_string_bytes: 32,
+        max_container_items: 4,
+        max_scalar_values: 16,
+        max_nesting_depth: 4,
+        max_requests_per_process: 16,
+        max_consecutive_invalid_records: 2,
+        max_oversize_discard_bytes: 256,
+        idle_timeout_ms: 1_000,
+        lifetime_timeout_ms: 60_000,
+        oversize_disposition: OversizeDisposition::DiscardThroughTerminator,
+    };
+
+    #[test]
+    fn profile_table_identity_is_stable() {
+        assert_eq!(
+            REQUEST_INPUT_PROFILE_ID,
+            "eliot.agent-bridge.request-input.v1"
+        );
+        assert!(REQUEST_INPUT_PROFILE.validate().is_ok());
+        assert!(scratch_budget(REQUEST_INPUT_PROFILE).is_some());
+        assert!(REQUEST_INPUT_LIMIT_TABLE.contains("request-input"));
+    }
+
+    #[test]
+    fn duplicate_and_escape_equivalent_keys_rejected() {
+        assert!(matches!(
+            prevalidate_record(r#"{"a":1,"a":2}"#, SMALL),
+            Err(DecodeReject::DuplicateKey { .. })
+        ));
+        assert!(matches!(
+            prevalidate_record("{\"\\u0061\":1,\"a\":2}", SMALL),
+            Err(DecodeReject::DuplicateKey { .. })
+        ));
+        assert!(prevalidate_record(r#"{"a":1,"b":2}"#, SMALL).is_ok());
+    }
+
+    #[test]
+    fn independent_bounds_reject_without_large_allocation() {
+        assert!(matches!(
+            prevalidate_record("[[[[[]]]]]", SMALL),
+            Err(DecodeReject::DepthExceeded)
+        ));
+        assert!(matches!(
+            prevalidate_record(r#"{"a":1,"b":2,"c":3,"d":4,"e":5}"#, SMALL),
+            Err(DecodeReject::TooManyMembers)
+        ));
+        assert!(matches!(
+            prevalidate_record(r#"{"s":"0123456789abcdef0123456789abcdefX"}"#, SMALL),
+            Err(DecodeReject::StringTooLong)
+        ));
+        assert!(check_profile_id("stale-profile").is_err());
+        assert!(check_profile_id(REQUEST_INPUT_PROFILE_ID).is_ok());
+    }
+}

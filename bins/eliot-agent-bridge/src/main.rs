@@ -18,7 +18,9 @@ use eliot_mcp::{
 };
 use eliot_protocol::EventEnvelope;
 use request_input::{
-    REQUEST_INPUT_PROFILE, REQUEST_INPUT_PROFILE_ID, ReadOutcome, read_bounded_record,
+    REQUEST_INPUT_LIMIT_TABLE, REQUEST_INPUT_PROFILE, REQUEST_INPUT_PROFILE_ID, ReadOutcome,
+    check_profile_id, check_request_envelope, classify_serde_error, prevalidate_record,
+    read_bounded_record, scratch_budget,
 };
 use serde::{Deserialize, Serialize};
 use std::io::{self, Write};
@@ -50,6 +52,9 @@ const _: () = assert!(
     MAX_OUTSTANDING_RESPONSES == 1,
     "stdio stays synchronous with one outstanding frame"
 );
+/// Links the reviewed limit/source/version/stage table into the binary so the
+/// documented table cannot drift from the enforced profile unnoticed.
+const _: &str = REQUEST_INPUT_LIMIT_TABLE;
 /// Bounded wall-clock for one stdout write plus flush.
 ///
 /// A blocking stdio pipe offers no deadline of its own, so the emission runs
@@ -246,7 +251,10 @@ fn main() {
     };
     let host_gateway = HostRequestGateway;
     let mut provider_failure = false;
-    if REQUEST_INPUT_PROFILE.validate().is_err() {
+    if REQUEST_INPUT_PROFILE.validate().is_err()
+        || check_profile_id(REQUEST_INPUT_PROFILE_ID).is_err()
+        || scratch_budget(REQUEST_INPUT_PROFILE).is_none()
+    {
         let detail =
             format!("request input profile {REQUEST_INPUT_PROFILE_ID} is internally inconsistent");
         emit_error("BRIDGE_COMPOSITION_REJECTED", &detail);
@@ -359,7 +367,7 @@ fn main() {
             break;
         };
         total_records = next_total;
-        let response = match serde_json::from_str::<Request>(text) {
+        let response = match decode_bounded_request(text) {
             Ok(Request::Attach { request }) => match runner.attach(request) {
                 Ok(_) => Response::Attached,
                 Err(error) => {
@@ -412,9 +420,9 @@ fn main() {
             ),
             Ok(Request::Status) => status_response(config.profile, &runner),
             Ok(Request::Stop) => handle_stop(&runner),
-            Err(error) => Response::Error {
+            Err(detail) => Response::Error {
                 code: "REQUEST_INVALID",
-                detail: error.to_string(),
+                detail,
             },
         };
         // Only the deserialization-failure arm above produces REQUEST_INVALID:
@@ -453,6 +461,28 @@ fn main() {
     if provider_failure {
         std::process::exit(PROVIDER_PORT_EXIT);
     }
+}
+
+/// Fail-closed bounded decode bound to the accepted input profile.
+///
+/// Runs, in order: the decode pre-scan (single-value shape, nesting depth,
+/// per-container member counts, total scalar counts, per-string decoded
+/// bounds, and duplicate-key rejection with escape-equivalent comparison),
+/// the top-level operation-envelope check (exact key set per operation, so
+/// Serde unit variants cannot silently ignore extra members), then typed
+/// `Request` construction with failures mapped to redacted diagnostics.
+/// Diagnostics carry only static reasons and bounded control names; raw
+/// request bytes, unknown-key text beyond the bound, body content, and
+/// credentials never cross into responses. This function grants no authority
+/// and performs no dispatch.
+fn decode_bounded_request(text: &str) -> Result<Request, String> {
+    if let Err(reject) = prevalidate_record(text, REQUEST_INPUT_PROFILE) {
+        return Err(reject.to_string());
+    }
+    if let Err(reject) = check_request_envelope(text, REQUEST_INPUT_PROFILE) {
+        return Err(reject.to_string());
+    }
+    serde_json::from_str::<Request>(text).map_err(|error| classify_serde_error(&error).to_string())
 }
 
 fn handle_invocation<P: KernelHostRequestPort + ?Sized>(
@@ -1093,5 +1123,178 @@ mod tests {
         );
         let framed = frame_response(&response).expect("bounded drain report must fit");
         assert!(framed.len() <= MAX_OUTPUT_FRAME_BYTES);
+    }
+
+    /// Bounded-decoder proof over the versioned JSON corpus.
+    ///
+    /// Drives every `tests/data/request_input_cases.json` entry through the
+    /// exact production pipeline (`prevalidate_record` →
+    /// `check_request_envelope` → typed `Request` construction with
+    /// redacted classification, or `read_bounded_record` framing for the
+    /// non-UTF-8 entry). Accepts assert the operation discriminant;
+    /// rejections assert the profile citation, the bound-specific reason,
+    /// and — for the secret canary — that the sensitive body never crosses
+    /// into the diagnostic.
+    #[test]
+    fn bounded_decoder_fixture_covers_accept_skip_and_reject() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/data/request_input_cases.json"))
+                .expect("decoder fixture must parse");
+        assert_eq!(
+            fixture["profile_id"],
+            Value::String(REQUEST_INPUT_PROFILE_ID.to_owned())
+        );
+        let cases = fixture["cases"]
+            .as_array()
+            .expect("fixture must list cases");
+        assert!(
+            cases.len() >= 20,
+            "proof suite needs at least 20 cases, found {}",
+            cases.len()
+        );
+        let mut covered: usize = 0;
+        for case in cases {
+            let id = case["id"].as_str().expect("case needs an id");
+            let expect = case["expect"].as_str().expect("case needs an expect");
+            if expect == "reject" && id == "invalid-utf8-bytes" {
+                let bytes: Vec<u8> = case["raw_bytes"]
+                    .as_array()
+                    .expect("raw_bytes must list")
+                    .iter()
+                    .map(|byte| {
+                        u8::try_from(byte.as_u64().expect("byte must fit")).expect("byte must fit")
+                    })
+                    .collect();
+                let mut cursor = std::io::BufReader::new(bytes.as_slice());
+                assert!(
+                    matches!(
+                        read_bounded_record(&mut cursor, REQUEST_INPUT_PROFILE),
+                        Ok(ReadOutcome::InvalidUtf8)
+                    ),
+                    "{id} must fail closed at framing"
+                );
+                covered += 1;
+                continue;
+            }
+            let text: String = if let Some(raw) = case.get("raw").and_then(Value::as_str) {
+                raw.to_owned()
+            } else if let Some(generator) = case.get("raw_is").and_then(Value::as_str) {
+                match generator {
+                    "generated-object-5000-members" => {
+                        let mut generated = String::from("{");
+                        for index in 0..5000_usize {
+                            if index > 0 {
+                                generated.push(',');
+                            }
+                            generated.push_str(&format!("\"k{index:05}\":{index}"));
+                        }
+                        generated.push('}');
+                        generated
+                    }
+                    "generated-nested-20000-scalars" => {
+                        let chunk = (0..2500_usize)
+                            .map(|index| index.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        let chunks = (0..8_usize)
+                            .map(|_| format!("[{chunk}]"))
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        format!("[{chunks}]")
+                    }
+                    "generated-long-string-600k" => {
+                        format!("{{\"s\":\"{}\"}}", "x".repeat(600_000))
+                    }
+                    _ => panic!("case {id} names an unknown generator"),
+                }
+            } else {
+                panic!("case {id} needs raw, raw_is, or raw_bytes");
+            };
+            match expect {
+                "skip" => {
+                    assert!(text.trim().is_empty(), "{id} must be a blank line");
+                    covered += 1;
+                }
+                "accept" => {
+                    let request = match decode_bounded_request(&text) {
+                        Ok(request) => request,
+                        Err(detail) => panic!("{id} must decode: {detail}"),
+                    };
+                    let seen = match request {
+                        Request::Attach { .. } => "attach",
+                        Request::Invoke { .. } => "invoke",
+                        Request::Cancel { .. } => "cancel",
+                        Request::ForwardHook { .. } => "forward_hook",
+                        Request::ForwardEvent { .. } => "forward_event",
+                        Request::ReconcileExternal {} => "reconcile_external",
+                        Request::Reconnect { .. } => "reconnect",
+                        Request::Status => "status",
+                        Request::Stop => "stop",
+                    };
+                    if let Some(op) = case.get("op").and_then(Value::as_str) {
+                        assert_eq!(seen, op, "{id} decoded the wrong operation");
+                    }
+                    covered += 1;
+                }
+                "reject" => {
+                    let reason = case["reason"].as_str().expect("reject needs a reason");
+                    let detail = match decode_bounded_request(&text) {
+                        Ok(_) => panic!("{id} must reject"),
+                        Err(detail) => detail,
+                    };
+                    assert!(
+                        detail.contains(REQUEST_INPUT_PROFILE_ID),
+                        "{id} rejection must cite the profile"
+                    );
+                    match reason {
+                        "trailing-bytes" => assert!(
+                            detail.contains("trailing bytes"),
+                            "{id} must report trailing bytes"
+                        ),
+                        "unknown-variant" => assert!(
+                            detail.contains("unsupported operation variant"),
+                            "{id} must report the unknown variant"
+                        ),
+                        "duplicate-key" => assert!(
+                            detail.contains("duplicate protected key"),
+                            "{id} must report the duplicate key"
+                        ),
+                        "depth-exceeded" => assert!(
+                            detail.contains("admitted depth"),
+                            "{id} must report the depth bound"
+                        ),
+                        "too-many-members" => assert!(
+                            detail.contains("admitted member bound"),
+                            "{id} must report the member bound"
+                        ),
+                        "too-many-scalars" => assert!(
+                            detail.contains("admitted scalar bound"),
+                            "{id} must report the scalar bound"
+                        ),
+                        "string-too-long" => assert!(
+                            detail.contains("admitted decoded bound"),
+                            "{id} must report the string bound"
+                        ),
+                        "redacted" => assert!(
+                            !detail.contains("canary-marker-7f3a-secret-body"),
+                            "{id} must not echo the canary body"
+                        ),
+                        _ => {}
+                    }
+                    if id == "secret-canary" {
+                        assert!(
+                            !detail.contains("canary-marker-7f3a-secret-body"),
+                            "canary body must never cross into diagnostics"
+                        );
+                    }
+                    covered += 1;
+                }
+                _ => panic!("case {id} names an unknown expectation"),
+            }
+        }
+        assert!(
+            covered >= 20,
+            "proof suite must cover at least 20 cases, covered {covered}"
+        );
     }
 }
