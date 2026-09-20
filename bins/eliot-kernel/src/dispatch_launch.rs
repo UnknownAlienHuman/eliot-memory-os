@@ -1731,6 +1731,50 @@ fn release_launch(contour: &'static ComposedDispatchContour, identity: &str) {
     }
 }
 
+/// Requires the live Kernel activation receipt for one Doctor launch
+/// (slice of #1678, I14.6/I10.15).
+///
+/// A prepared admission alone never authorizes spawn: the launch boundary
+/// re-reads the live Kernel activation receipt and binds it to the prepared
+/// epoch and generation. A missing receipt, or a receipt that no longer
+/// agrees with the prepared admission (stale epoch, generation cutover,
+/// fence), fails closed before any child effect.
+///
+/// Scope is receipt-match only: the gate compares the live receipt's
+/// authority epoch and generation against the prepared admission and
+/// verifies nothing else. Attempt-budget verification, cooldown
+/// enforcement, and receipt linkage stay remainder work, as do crash/retry
+/// reuse, the canonical `ADMITTED`/outbox linkage, staged-reservation
+/// claims, and the testd/native-worker/Dreamer/`eliotd` launch paths.
+fn require_live_activation_for_doctor_launch(
+    kernel: &KernelComposition,
+    ready: &ReadyDoctorLaunch,
+) -> Result<(), DispatchLaunchError> {
+    let service = kernel
+        .service
+        .lock()
+        .map_err(|_| DispatchLaunchError::Gate("kernel service lock poisoned".to_owned()))?;
+    let receipt = service.activation_receipt().ok_or_else(|| {
+        DispatchLaunchError::Gate(
+            "doctor launch requires a live Kernel activation receipt".to_owned(),
+        )
+    })?;
+    if !receipt
+        .authority_epoch
+        .is_same_authority(&ready.authority_epoch)
+    {
+        return Err(DispatchLaunchError::Gate(
+            "doctor launch activation does not match the prepared admission".to_owned(),
+        ));
+    }
+    if receipt.generation.value() != ready.generation.get() {
+        return Err(DispatchLaunchError::Gate(
+            "doctor launch activation does not match the prepared admission".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// Spawns one prepared Doctor launch through the admitted process gateway.
 ///
 /// The child admission carries an empty argv — the attempt material travels
@@ -1747,6 +1791,7 @@ pub async fn start_ready_doctor_launch(
     kernel: &KernelComposition,
     ready: &ReadyDoctorLaunch,
 ) -> Result<ChildStartOutcome, DispatchLaunchError> {
+    require_live_activation_for_doctor_launch(kernel, ready)?;
     match spawn_ready_child(
         kernel,
         &SpawnInputs {
@@ -5653,6 +5698,144 @@ mod tests {
             "refused doctor prepare writes no dispatch material"
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Slice of #1678 (I14.6): the Doctor launch boundary requires the live
+    /// Kernel activation receipt. A prepared admission presented to a Kernel
+    /// without one — or with a receipt that no longer matches the prepared
+    /// epoch/generation — is rejected before any child effect. Removing the
+    /// gate lets the same calls fall through to the executor error instead.
+    /// Gate scope is receipt-match only (prepared epoch/generation against
+    /// the live receipt); attempt-budget, cooldown, and receipt linkage
+    /// stay remainder. Every rejection — and the executor-boundary
+    /// fall-through — is asserted effect-free: no material artifact is
+    /// created and no child handle exists.
+    #[tokio::test]
+    async fn doctor_launch_requires_live_activation_receipt() {
+        use std::collections::BTreeSet;
+
+        fn ready_for(epoch: &EpochId, generation: Generation) -> ReadyDoctorLaunch {
+            ReadyDoctorLaunch {
+                admission: Box::new(DoctorRepairAdmission {
+                    wire_id: eliot_kernel_service::DOCTOR_REPAIR_WIRE_ID.to_owned(),
+                    wire_version: DoctorRepairAdmission::CONTRACT_VERSION,
+                    attempt_id: "attempt-gate-1".to_owned(),
+                    attempt_digest: "a".repeat(64),
+                    effect_digest: None,
+                    recipe_digest: "b".repeat(64),
+                    manifest_digest: "c".repeat(64),
+                    operation_id: "op-gate-1".to_owned(),
+                    lease_id: "lease-gate-1".to_owned(),
+                    lease_owner: "kernel-recovery".to_owned(),
+                    lease_expires_unix_nanos: 1_750_000_200_000_000_000,
+                    allowed_effects: BTreeSet::new(),
+                    budget_units: 1,
+                    deadline_unix_nanos: 1_750_000_100_000_000_000,
+                    approval_present: false,
+                    cancelled: false,
+                    admitted_at_unix_nanos: 1_750_000_000_000_000_000,
+                    admission_digest: "d".repeat(64),
+                }),
+                nonce: "nonce-gate-1".to_owned(),
+                operation_id: OperationId::new("doctor-1-gate0001").expect("test operation id"),
+                material_path: PathBuf::from("doctor-gate.material.json"),
+                executable: PathBuf::from("eliot-doctor.exe"),
+                executable_sha256: "e".repeat(64),
+                working_directory: PathBuf::from("."),
+                authority_epoch: epoch.clone(),
+                generation,
+            }
+        }
+
+        fn is_activation_gate(error: &DispatchLaunchError) -> bool {
+            matches!(
+                error,
+                DispatchLaunchError::Gate(detail) if detail.contains("activation")
+            )
+        }
+
+        // 1. No activation receipt: a fresh composition rejects before spawn.
+        let cold_root = temp_root("doctor-gate-cold");
+        let cold =
+            KernelComposition::new(KernelConfig::new(&cold_root)).expect("kernel composition");
+        let mut cold_ready =
+            ready_for(&test_epoch(1), Generation::new(1).expect("test generation"));
+        cold_ready.material_path = cold_root.join("doctor-gate-cold.material.json");
+        let Err(cold_error) = start_ready_doctor_launch(&cold, &cold_ready).await else {
+            panic!("doctor launch without an activation receipt must not spawn");
+        };
+        assert!(
+            is_activation_gate(&cold_error),
+            "missing activation must fail at the launch gate, got: {cold_error}"
+        );
+        assert!(
+            !cold_ready.material_path.exists(),
+            "gate rejection must leave no material artifact: no child effect occurred"
+        );
+
+        // 2. Live matching activation: the gate passes and the call reaches
+        // the (unconfigured in tests) executor boundary instead.
+        let live_root = temp_root("doctor-gate-live");
+        let live = ready_kernel(&live_root);
+        let live_epoch_value = live_epoch(&live);
+        let live_generation_value = live
+            .service
+            .lock()
+            .expect("service lock")
+            .activation_receipt()
+            .expect("activation receipt")
+            .generation
+            .value();
+        let mut live_ready = ready_for(
+            &live_epoch_value,
+            Generation::new(live_generation_value).expect("live generation"),
+        );
+        live_ready.material_path = live_root.join("doctor-gate-live.material.json");
+        assert!(
+            live.process_gateway.is_none(),
+            "test contour configures no executor, so no child handle can exist"
+        );
+        assert!(
+            !live_ready.material_path.exists(),
+            "launch must not pre-create dispatch material"
+        );
+        let Err(live_error) = start_ready_doctor_launch(&live, &live_ready).await else {
+            panic!("test contour configures no executor; spawn must fail closed");
+        };
+        assert!(
+            !is_activation_gate(&live_error),
+            "matching activation must pass the launch gate, got: {live_error}"
+        );
+        assert!(
+            matches!(live_error, DispatchLaunchError::ExecutorUnavailable),
+            "matching activation must reach the executor boundary, got: {live_error}"
+        );
+        assert!(
+            !live_ready.material_path.exists(),
+            "matching activation reached the executor boundary but left no material artifact: no child effect occurred"
+        );
+
+        // 3. Stale generation: a receipt that no longer matches the prepared
+        // admission is rejected at the gate.
+        let mut stale_ready = ready_for(
+            &live_epoch_value,
+            Generation::new(live_generation_value + 1).expect("stale generation"),
+        );
+        stale_ready.material_path = live_root.join("doctor-gate-stale.material.json");
+        let Err(stale_error) = start_ready_doctor_launch(&live, &stale_ready).await else {
+            panic!("doctor launch with a mismatched activation must not spawn");
+        };
+        assert!(
+            is_activation_gate(&stale_error),
+            "mismatched activation must fail at the launch gate, got: {stale_error}"
+        );
+        assert!(
+            !stale_ready.material_path.exists(),
+            "gate rejection must leave no material artifact: no child effect occurred"
+        );
+
+        let _ = std::fs::remove_dir_all(cold_root);
+        let _ = std::fs::remove_dir_all(live_root);
     }
 
     /// Resolves the real `eliot-native-worker` image beside this test

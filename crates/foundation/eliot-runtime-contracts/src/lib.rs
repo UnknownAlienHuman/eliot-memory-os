@@ -934,6 +934,100 @@ impl RecoveryDirective {
     }
 }
 
+/// Backpressure dispositions from I14.4.
+///
+/// Vocabulary freeze only: this enum fixes the seven frozen wire names an
+/// admission rejection or degradation response must carry once the wiring
+/// slice lands; an unknown wire value fails closed at deserialization. No
+/// rejection path wires a [`RecoveryDirective`] into its response yet and
+/// none claims directive conformance until that wiring slice, so no
+/// current response emits a directive-less payload under false
+/// conformance. The full fourteen-field `RecoveryDirective` shape and the
+/// reserve accounting that produces these responses stay later slices.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum BackpressureDisposition {
+    /// Request not accepted; retry directive.
+    Busy,
+    /// No durable staging available.
+    StorageBackpressure,
+    /// Staged; do not retry, poll operation.
+    AcceptedPending,
+    /// Canonical-sensitive action blocked.
+    DbUnavailable,
+    /// Checkpoint and ask for route/scope/budget decision.
+    BudgetExhausted,
+    /// Packet/read could not stabilize.
+    StateChurn,
+    /// Requested operation unavailable, alternatives shown.
+    CapabilityDegraded,
+}
+
+impl BackpressureDisposition {
+    /// Returns the frozen I14.4 wire name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Busy => "BUSY",
+            Self::StorageBackpressure => "STORAGE_BACKPRESSURE",
+            Self::AcceptedPending => "ACCEPTED_PENDING",
+            Self::DbUnavailable => "DB_UNAVAILABLE",
+            Self::BudgetExhausted => "BUDGET_EXHAUSTED",
+            Self::StateChurn => "STATE_CHURN",
+            Self::CapabilityDegraded => "CAPABILITY_DEGRADED",
+        }
+    }
+}
+
+impl fmt::Display for BackpressureDisposition {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Commit status from I14.5 (`RecoveryDirective.commit_status`).
+///
+/// Frozen four-value vocabulary with exact lowercase wire names:
+/// `none | staged | committed | unknown`. Vocabulary freeze only: this
+/// enum fixes the values disposition responses must use; it does not wire
+/// [`RecoveryDirective`] into any rejection path, and no rejection path
+/// claims directive conformance until the wiring slice. The complete
+/// fourteen-field `RecoveryDirective` shape stays a later slice.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+pub enum RecoveryCommitStatus {
+    /// No durable commit exists.
+    #[serde(rename = "none")]
+    None,
+    /// Staged but not committed; do not retry blindly, poll or reconcile.
+    #[serde(rename = "staged")]
+    Staged,
+    /// Durably committed under its receipt.
+    #[serde(rename = "committed")]
+    Committed,
+    /// Commit outcome is unknown; reconcile before acting.
+    #[serde(rename = "unknown")]
+    Unknown,
+}
+
+impl RecoveryCommitStatus {
+    /// Returns the frozen lowercase I14.5 wire name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Staged => "staged",
+            Self::Committed => "committed",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl fmt::Display for RecoveryCommitStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Role-filtered non-semantic recovery inspection surface.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1126,5 +1220,100 @@ mod tests {
             state: AuthorityState::PendingKernelActivation,
         };
         assert!(receipt.validate().is_err());
+    }
+
+    #[test]
+    fn backpressure_dispositions_carry_stable_i14_4_wire_names()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let cases = [
+            (BackpressureDisposition::Busy, "BUSY"),
+            (
+                BackpressureDisposition::StorageBackpressure,
+                "STORAGE_BACKPRESSURE",
+            ),
+            (BackpressureDisposition::AcceptedPending, "ACCEPTED_PENDING"),
+            (BackpressureDisposition::DbUnavailable, "DB_UNAVAILABLE"),
+            (BackpressureDisposition::BudgetExhausted, "BUDGET_EXHAUSTED"),
+            (BackpressureDisposition::StateChurn, "STATE_CHURN"),
+            (
+                BackpressureDisposition::CapabilityDegraded,
+                "CAPABILITY_DEGRADED",
+            ),
+        ];
+        assert_eq!(cases.len(), 7, "I14.4 freezes exactly seven dispositions");
+        for (disposition, wire) in cases {
+            assert_eq!(disposition.as_str(), wire);
+            assert_eq!(disposition.to_string(), wire);
+            let encoded = serde_json::to_string(&disposition)?;
+            assert_eq!(encoded, format!("\"{wire}\""));
+            assert_eq!(
+                serde_json::from_str::<BackpressureDisposition>(&encoded)?,
+                disposition
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_commit_status_covers_none_staged_committed_unknown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let cases = [
+            (RecoveryCommitStatus::None, "none"),
+            (RecoveryCommitStatus::Staged, "staged"),
+            (RecoveryCommitStatus::Committed, "committed"),
+            (RecoveryCommitStatus::Unknown, "unknown"),
+        ];
+        assert_eq!(cases.len(), 4, "I14.5 freezes exactly four commit states");
+        for (status, wire) in cases {
+            assert_eq!(status.as_str(), wire);
+            assert_eq!(status.to_string(), wire);
+            let encoded = serde_json::to_string(&status)?;
+            assert_eq!(encoded, format!("\"{wire}\""));
+            assert_eq!(
+                serde_json::from_str::<RecoveryCommitStatus>(&encoded)?,
+                status
+            );
+        }
+        Ok(())
+    }
+
+    /// I14.5 wire-exactness: the frozen vocabulary serializes as the exact
+    /// lowercase strings `none`/`staged`/`committed`/`unknown`, and the
+    /// `SCREAMING_SNAKE_CASE` spellings fail closed at deserialization.
+    #[test]
+    fn recovery_commit_status_wire_names_are_lowercase_i14_5()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(
+            serde_json::to_string(&RecoveryCommitStatus::None)?,
+            "\"none\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RecoveryCommitStatus::Staged)?,
+            "\"staged\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RecoveryCommitStatus::Committed)?,
+            "\"committed\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RecoveryCommitStatus::Unknown)?,
+            "\"unknown\""
+        );
+        for rejected in ["NONE", "STAGED", "COMMITTED", "UNKNOWN"] {
+            assert!(
+                serde_json::from_value::<RecoveryCommitStatus>(serde_json::json!(rejected))
+                    .is_err(),
+                "{rejected} must fail closed: the I14.5 wire name is lowercase"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_backpressure_and_commit_wire_names_fail_closed() {
+        let unknown_disposition = serde_json::json!("RETRY_LATER");
+        assert!(serde_json::from_value::<BackpressureDisposition>(unknown_disposition).is_err());
+        let unknown_commit = serde_json::json!("partial");
+        assert!(serde_json::from_value::<RecoveryCommitStatus>(unknown_commit).is_err());
     }
 }
