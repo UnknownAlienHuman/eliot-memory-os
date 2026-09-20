@@ -41,6 +41,19 @@
 //! [`GovernedKernelAuthority::decide_forward`] (exclusive authority) ->
 //! [`KernelAuthorization`] (proof token for the port call).
 //!
+//! Rework rework1960b (re-audit of 076ae935, CHANGES x3):
+//! (1) issuance is exclusive to Governor/Kernel authority in code via
+//! [`KernelChallengeKey`] (no public raw-secret constructor) plus the
+//! crate-confined [`OwnershipChallengeIssuer::kernel_minted`] mint path and
+//! the public [`GovernedKernelAuthority::bootstrap`] gate; there is no public
+//! constructor taking a caller-chosen secret. (2) the receipt is an
+//! in-memory bearer capability with no Serialize and a crate-confined tag
+//! accessor; it authorizes only through the governed path against the live
+//! protected registry. (3) the gate bodies (`gate_process_control`,
+//! `prepare_kernel_forward`, `decide_forward`, `authorize_shutdown`,
+//! [`KernelAuthorization`]) all live in this same file with the port
+//! boundary; no hidden authority logic exists elsewhere.
+//!
 //! This module performs no I/O and retains no threads. The issuer and the
 //! authority retain only the Governor/Kernel-owned challenge store; receipts
 //! themselves stay dumb capabilities validated field-for-field before use.
@@ -169,13 +182,25 @@ impl ProcessControlOperation {
 /// contains `now`). Only [`OwnershipChallengeIssuer::issue`] can mint it:
 /// all fields are private, there is no public constructor, and there is no
 /// `Deserialize` implementation, so callers can neither write a struct
-/// literal nor rehydrate one from JSON. The `issuer_tag` binds every field
-/// to the issuer secret, and the issuer store records every mint; both are
-/// checked by [`OwnershipChallengeIssuer::verify`].
+/// literal nor rehydrate one from JSON. There is also no `Serialize`
+/// implementation: the receipt is an in-memory bearer capability and must
+/// never be serialized to JSON for storage or transport. The `issuer_tag`
+/// binds every field to the issuer secret, and the issuer store records
+/// every mint; both are checked by [`OwnershipChallengeIssuer::verify`].
 ///
 /// The `receipt_digest` is a plain content binding (reproducible by design)
 /// and carries no authority on its own.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+///
+/// Bearer and transport boundary (explicit): possession of a receipt proves
+/// nothing on its own. A receipt authorizes only when presented through the
+/// in-process governed path and verified against the live protected issuer
+/// registry (exact origin and fence bind, secret-bound tag recomputed with the
+/// Kernel-held key, live window at now, no revocation). Replay outside that
+/// boundary is bounded by the one-hour window, the exact origin and fence
+/// bind, and Kernel-owned revocation; the tag itself is never publicly
+/// extractable (crate-confined accessor only) and the receipt is never
+/// serialized, logged, or rehydrated.
+#[derive(Clone, PartialEq, Eq)]
 pub struct OwnershipChallengeReceipt {
     /// Issuer-assigned challenge identity (`issuer_id` plus sequence).
     challenge_id: String,
@@ -191,6 +216,21 @@ pub struct OwnershipChallengeReceipt {
     receipt_digest: String,
     /// Secret-bound issuer tag over every field above. Authority lives here.
     issuer_tag: String,
+}
+
+impl std::fmt::Debug for OwnershipChallengeReceipt {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter
+            .debug_struct("OwnershipChallengeReceipt")
+            .field("challenge_id", &self.challenge_id)
+            .field("origin_digest", &self.origin_digest)
+            .field("state_fence", &self.state_fence)
+            .field("issued_at_unix_ms", &self.issued_at_unix_ms)
+            .field("expires_at_unix_ms", &self.expires_at_unix_ms)
+            .field("receipt_digest", &self.receipt_digest)
+            .field("issuer_tag", &"REDACTED")
+            .finish()
+    }
 }
 
 impl OwnershipChallengeReceipt {
@@ -231,8 +271,12 @@ impl OwnershipChallengeReceipt {
     }
 
     /// Returns the secret-bound issuer tag (the authority proof).
+    ///
+    /// Crate-confined: only the governed Kernel authority path in this
+    /// crate may extract the tag (verification and decision mint). It is
+    /// never part of the public bearer surface and never serialized.
     #[must_use]
-    pub fn issuer_tag(&self) -> &str {
+    pub(crate) fn issuer_tag(&self) -> &str {
         &self.issuer_tag
     }
 
@@ -583,6 +627,68 @@ struct IssuedChallenge {
 /// so verification needs issuer-bound proof: a reproduced digest alone fails.
 /// The secret never leaves this object (Debug redacts it) and the store
 /// never leaves Governor/Kernel ownership.
+///
+/// Issuance is exclusive to Governor/Kernel authority in code (not docs):
+/// there is no public constructor taking a caller-chosen secret. An issuer
+/// can only be minted from a [`KernelChallengeKey`], whose secret bytes are
+/// never publicly constructible outside this crate. External callers cannot
+/// mint an issuer, so they cannot mint challenges that verify.
+///
+/// Kernel-held challenge key: the sole authority to mint an issuer.
+///
+/// The secret bytes are private with no public raw-secret constructor, no
+/// Serialize, and no Deserialize, so only crate-internal Kernel wiring
+/// (which holds the provisioned secret) can produce a key. A key proves
+/// nothing on its own; it only authorizes [`OwnershipChallengeIssuer`]
+/// construction through the crate-confined mint path below.
+pub struct KernelChallengeKey {
+    secret: [u8; 32],
+}
+
+impl std::fmt::Debug for KernelChallengeKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter
+            .debug_struct("KernelChallengeKey")
+            .field("secret", &"REDACTED")
+            .finish()
+    }
+}
+
+impl KernelChallengeKey {
+    /// Wraps a Kernel-provisioned secret (crate-internal wiring only).
+    ///
+    /// Rejects the all-zero secret so a null-secret deployment fails
+    /// closed at key provisioning, before any issuer exists.
+    // Production Kernel front-door wiring entry point; exercised in tests
+    // until the grant route lands. Visibility stays crate-confined so no
+    // external caller can provision a key with a chosen secret.
+    #[allow(dead_code)]
+    pub(crate) fn from_secret(secret: [u8; 32]) -> Result<Self, ProcessOriginError> {
+        if secret == [0_u8; 32] {
+            return Err(ProcessOriginError::Contract(
+                "issuer secret must not be all zeros".to_owned(),
+            ));
+        }
+        Ok(Self { secret })
+    }
+
+    /// Test-only key with a fixed non-zero secret.
+    #[cfg(test)]
+    pub(crate) fn test_key() -> Self {
+        Self { secret: [9_u8; 32] }
+    }
+
+    /// Test-only key with a caller-chosen non-zero fill byte.
+    #[cfg(test)]
+    pub(crate) fn test_key_with(fill: u8) -> Result<Self, ProcessOriginError> {
+        let secret = [fill; 32];
+        Self::from_secret(secret)
+    }
+
+    fn secret(&self) -> &[u8; 32] {
+        &self.secret
+    }
+}
 #[derive(Clone)]
 pub struct OwnershipChallengeIssuer {
     /// Stable issuer identity, stamped into every challenge identity.
@@ -607,11 +713,18 @@ impl std::fmt::Debug for OwnershipChallengeIssuer {
     }
 }
 impl OwnershipChallengeIssuer {
-    /// Creates an issuer for the given identity holding the given secret.
+    /// Mints an issuer from a Kernel-held key (crate-internal authority only).
     ///
-    /// Rejects blank or unbounded identities and the all-zero secret, so a
-    /// null-secret deployment fails closed at construction.
-    pub fn new(issuer_id: String, secret: [u8; 32]) -> Result<Self, ProcessOriginError> {
+    /// There is deliberately no public constructor taking a caller-chosen
+    /// secret: only crate-internal Kernel wiring holding a
+    /// [`KernelChallengeKey`] can call this. Rejects blank or unbounded
+    /// identities so a malformed issuer identity fails closed at mint time.
+    /// Key validation (non-zero secret) already happened at
+    /// [`KernelChallengeKey::from_secret`].
+    pub(crate) fn kernel_minted(
+        issuer_id: String,
+        key: &KernelChallengeKey,
+    ) -> Result<Self, ProcessOriginError> {
         let id_ok = !issuer_id.trim().is_empty()
             && issuer_id.len() <= MAX_ISSUER_ID_LEN
             && issuer_id
@@ -622,14 +735,9 @@ impl OwnershipChallengeIssuer {
                 "issuer_id must be a bounded alphanumeric token".to_owned(),
             ));
         }
-        if secret == [0_u8; 32] {
-            return Err(ProcessOriginError::Contract(
-                "issuer secret must not be all zeros".to_owned(),
-            ));
-        }
         Ok(Self {
             issuer_id,
-            secret,
+            secret: *key.secret(),
             next_sequence: 1,
             issued: HashMap::new(),
         })
@@ -986,9 +1094,28 @@ pub struct GovernedKernelAuthority {
 }
 
 impl GovernedKernelAuthority {
-    /// Creates the authority over a Kernel-owned issuer.
-    #[must_use]
-    pub const fn new(issuer: OwnershipChallengeIssuer) -> Self {
+    /// Bootstraps the exclusive control-authority path from a Kernel-held key.
+    ///
+    /// The only public authority constructor: callers must present a
+    /// [`KernelChallengeKey`], which has no public raw-secret constructor, so
+    /// only crate-internal Kernel wiring can bootstrap. The gate bodies
+    /// (`decide_forward`, `authorize_shutdown`) and the port proof token
+    /// ([`KernelAuthorization`]) live in this same file; no hidden authority
+    /// logic exists elsewhere.
+    pub fn bootstrap(
+        issuer_id: String,
+        key: &KernelChallengeKey,
+    ) -> Result<Self, ProcessOriginError> {
+        Ok(Self {
+            issuer: OwnershipChallengeIssuer::kernel_minted(issuer_id, key)?,
+        })
+    }
+
+    /// Wraps an already-minted issuer (crate-internal wiring and tests only).
+    // Test and wiring constructor; the public path is `bootstrap`, which
+    // requires the Kernel-held key.
+    #[allow(dead_code)]
+    pub(crate) const fn from_issuer(issuer: OwnershipChallengeIssuer) -> Self {
         Self { issuer }
     }
 
@@ -1101,7 +1228,11 @@ mod tests {
     }
 
     fn test_issuer() -> OwnershipChallengeIssuer {
-        OwnershipChallengeIssuer::new("governor-test".to_owned(), [9_u8; 32]).expect("test issuer")
+        OwnershipChallengeIssuer::kernel_minted(
+            "governor-test".to_owned(),
+            &KernelChallengeKey::test_key(),
+        )
+        .expect("test issuer")
     }
 
     fn status_receipt(fence: &StateFence, origin_digest: &str) -> ProcessStatusReceipt {
@@ -1158,7 +1289,7 @@ mod tests {
     fn kernel_authority_alone_decides_control() {
         let fence = test_fence(1);
         let observed = evidence(&fence);
-        let mut authority = GovernedKernelAuthority::new(test_issuer());
+        let mut authority = GovernedKernelAuthority::from_issuer(test_issuer());
         let receipt = authority
             .issue_challenge(&observed, ISSUED_AT, EXPIRES_AT)
             .expect("kernel issues the challenge");
@@ -1193,7 +1324,7 @@ mod tests {
         let observed = evidence(&fence);
         let issuer = test_issuer();
         assert_eq!(issuer.issued_count(), 0);
-        let authority = GovernedKernelAuthority::new(issuer);
+        let authority = GovernedKernelAuthority::from_issuer(issuer);
 
         // Attacker replays the exact reproducible content binding but cannot
         // mint the secret-bound tag and has no registry entry. In-module
@@ -1238,9 +1369,12 @@ mod tests {
         let receipt = first
             .issue(&observed, ISSUED_AT, EXPIRES_AT)
             .expect("first issuer mints");
-        let other_issuer = OwnershipChallengeIssuer::new("other-kernel".to_owned(), [4_u8; 32])
-            .expect("second issuer");
-        let other_authority = GovernedKernelAuthority::new(other_issuer);
+        let other_issuer = OwnershipChallengeIssuer::kernel_minted(
+            "other-kernel".to_owned(),
+            &KernelChallengeKey::test_key_with(4).expect("second key"),
+        )
+        .expect("second issuer");
+        let other_authority = GovernedKernelAuthority::from_issuer(other_issuer);
         // Same shape, different secret and store: must fail issuer binding.
         assert!(matches!(
             other_authority.issuer.verify(&receipt, &observed, NOW),
@@ -1259,7 +1393,7 @@ mod tests {
     fn stale_mismatched_or_revoked_challenges_never_authorize() {
         let fence = test_fence(1);
         let observed = evidence(&fence);
-        let mut authority = GovernedKernelAuthority::new(test_issuer());
+        let mut authority = GovernedKernelAuthority::from_issuer(test_issuer());
         let receipt = authority
             .issue_challenge(&observed, ISSUED_AT, EXPIRES_AT)
             .expect("kernel issues the challenge");
@@ -1309,7 +1443,7 @@ mod tests {
     fn read_status_never_authorizes_and_probes_never_forward() {
         let fence = test_fence(1);
         let observed = evidence(&fence);
-        let mut authority = GovernedKernelAuthority::new(test_issuer());
+        let mut authority = GovernedKernelAuthority::from_issuer(test_issuer());
         let receipt = authority
             .issue_challenge(&observed, ISSUED_AT, EXPIRES_AT)
             .expect("kernel issues the challenge");
@@ -1376,10 +1510,19 @@ mod tests {
     fn issuer_rejects_weak_parameters() {
         let fence = test_fence(1);
         let observed = evidence(&fence);
-        assert!(OwnershipChallengeIssuer::new(String::new(), [9_u8; 32]).is_err());
-        assert!(OwnershipChallengeIssuer::new("bad id!".to_owned(), [9_u8; 32]).is_err());
-        assert!(OwnershipChallengeIssuer::new("x".repeat(65), [9_u8; 32]).is_err());
-        assert!(OwnershipChallengeIssuer::new("governor-test".to_owned(), [0_u8; 32]).is_err());
+        let good_key = KernelChallengeKey::test_key();
+        assert!(OwnershipChallengeIssuer::kernel_minted(String::new(), &good_key).is_err());
+        assert!(OwnershipChallengeIssuer::kernel_minted("bad id!".to_owned(), &good_key).is_err());
+        assert!(OwnershipChallengeIssuer::kernel_minted("x".repeat(65), &good_key).is_err());
+        assert!(KernelChallengeKey::from_secret([0_u8; 32]).is_err());
+        assert!(GovernedKernelAuthority::bootstrap(String::new(), &good_key).is_err());
+        // Public bootstrap path mints a working authority from the Kernel key.
+        let mut bootstrapped =
+            GovernedKernelAuthority::bootstrap("governor-test".to_owned(), &good_key)
+                .expect("bootstrap from Kernel key");
+        bootstrapped
+            .issue_challenge(&observed, ISSUED_AT, EXPIRES_AT)
+            .expect("bootstrapped authority issues");
 
         let mut issuer = test_issuer();
         assert!(issuer.issue(&observed, ISSUED_AT, ISSUED_AT - 1).is_err());

@@ -109,10 +109,10 @@ pub(crate) use kernel_authority_client::KernelAuthorityClient;
 pub use kernel_context_read_client::{KernelContextReadClient, ReconstructionReadComposition};
 pub use process_origin::{
     CapabilityEvidenceSource, CapabilityEvidenceStatus, GovernedKernelAuthority,
-    KernelAuthorization, KernelForwardRequest, OperationDisposition, OwnershipChallengeIssuer,
-    OwnershipChallengeReceipt, PROCESS_ORIGIN_CAPABILITY, ProcessCapabilityEvidence,
-    ProcessControlOperation, ProcessOriginError, ProcessOriginEvidence, ProcessStatusReceipt,
-    canonical_origin_digest, gate_process_control, prepare_kernel_forward,
+    KernelAuthorization, KernelChallengeKey, KernelForwardRequest, OperationDisposition,
+    OwnershipChallengeIssuer, OwnershipChallengeReceipt, PROCESS_ORIGIN_CAPABILITY,
+    ProcessCapabilityEvidence, ProcessControlOperation, ProcessOriginError, ProcessOriginEvidence,
+    ProcessStatusReceipt, canonical_origin_digest, gate_process_control, prepare_kernel_forward,
 };
 pub use store_failure_projection::{GovernorStoreFailureProjection, GovernorStoreProjectionError};
 
