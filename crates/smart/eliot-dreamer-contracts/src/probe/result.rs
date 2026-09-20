@@ -414,24 +414,35 @@ impl PossibleResultSchema {
 /// issue 610/11 (case 610/11 needs).
 ///
 /// Canonical target-indexed equality over [`ResultUpdate`], order insensitive
-/// with set semantics: each [`ResultTarget`] indexes one typed update value,
-/// and the resulting target-to-update maps must be equal. Duplicate targets
-/// collapse to the last entry (duplicates are impossible in a valid branch
-/// because [`PossibleResultSchema::new`] fails closed on a repeated target, so
-/// this agrees with valid branch semantics). `Debug` rendering is never
-/// consulted: two updates with the same target but different typed fields —
-/// including owner-supplied digests, meanings, or unknown reasons — are
-/// distinct.
+/// with set semantics: each [`ResultTarget`] indexes its distinct typed update
+/// values, and the resulting target-to-update-set maps must be equal. Exact
+/// duplicate entries collapse, while distinct updates sharing a target remain
+/// distinct; valid branches contain one update per target because
+/// [`PossibleResultSchema::new`] fails closed on repeated targets. `Debug`
+/// rendering is never consulted: updates with the same target but different
+/// typed fields — including owner-supplied digests, meanings, or unknown
+/// reasons — are distinct.
 pub fn update_sets_equal(left: &[ResultUpdate], right: &[ResultUpdate]) -> bool {
-    let left_by_target: BTreeMap<_, _> = left
-        .iter()
-        .map(|update| (update.target(), update))
-        .collect();
-    let right_by_target: BTreeMap<_, _> = right
-        .iter()
-        .map(|update| (update.target(), update))
-        .collect();
-    left_by_target == right_by_target
+    fn index(updates: &[ResultUpdate]) -> BTreeMap<ResultTarget, Vec<&ResultUpdate>> {
+        let mut by_target: BTreeMap<ResultTarget, Vec<&ResultUpdate>> = BTreeMap::new();
+        for update in updates {
+            let values = by_target.entry(update.target()).or_default();
+            if !values.contains(&update) {
+                values.push(update);
+            }
+        }
+        by_target
+    }
+
+    let left_by_target = index(left);
+    let right_by_target = index(right);
+    left_by_target.len() == right_by_target.len()
+        && left_by_target.iter().all(|(target, left_values)| {
+            right_by_target.get(target).is_some_and(|right_values| {
+                left_values.len() == right_values.len()
+                    && left_values.iter().all(|value| right_values.contains(value))
+            })
+        })
 }
 
 /// Authoritative A-03 discriminability classification over a
