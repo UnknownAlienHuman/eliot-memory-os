@@ -69,10 +69,14 @@ pub mod legacy_d01 {
          invocation residue; never migrate into a current trust path";
 }
 
-/// Deprecated historical plan identity alias; use [`legacy_d01::LEGACY_D01_PLAN_ID`].
-#[deprecated(note = "frozen historical D-01 plan identity; use legacy_d01::LEGACY_D01_PLAN_ID")]
-pub const PLAN_ID: &str = legacy_d01::LEGACY_D01_PLAN_ID;
-
+/// Historical plan identity retired from the current import path (#1195).
+///
+/// The frozen D-01 plan identity lives only at
+/// [`legacy_d01::LEGACY_D01_PLAN_ID`]. The former top-level `PLAN_ID` alias
+/// was removed so no current-path import can bind the fixed D-01 pin by its
+/// old name; legacy receipts keep spelling the frozen value explicitly.
+//
+// Historical note only (no `PLAN_ID` item remains in the current import path).
 /// Pre-allocation bounds for the legacy D-01 verifier (#1223 req 2).
 ///
 /// Every bound is enforced BEFORE the corresponding read/allocation in the
@@ -136,6 +140,14 @@ pub enum CompilerError {
         bytes: usize,
         max_bytes: usize,
     },
+    /// A current sealed-bundle producer/installation/runtime consumer was
+    /// requested, but none exists in-repo (#1195 disposition (b)).
+    ///
+    /// The retained verifier is read-only historical `LEGACY_D01` only: it
+    /// admits no artifact into any installation or runtime. Any current-path
+    /// attempt to resolve a live producer, installation consumer, or runtime
+    /// admission consumer fails closed with this variant, never `Ok`.
+    NoCurrentBundle { detail: &'static str },
 }
 
 impl std::fmt::Display for CompilerError {
@@ -181,11 +193,54 @@ impl std::fmt::Display for CompilerError {
                 f,
                 "repository tool output too large: {program} emitted {bytes} bytes (max {max_bytes})"
             ),
+            Self::NoCurrentBundle { detail } => {
+                write!(f, "no current sealed bundle producer or consumer: {detail}")
+            }
         }
     }
 }
 
 impl std::error::Error for CompilerError {}
+
+/// Current sealed-bundle producer/consumer wiring status (#1195).
+///
+/// Disposition (b) is an explicit read-only historical `LEGACY_D01` verifier:
+/// there is zero current in-repo producer of `Eliot_Runtime_BundleManifest.json`
+/// / `Eliot_Runtime_BootstrapSeed.json`, zero installation consumer, and zero
+/// runtime admission consumer. This module is the single current-path witness
+/// for that gap: every accessor fails closed with
+/// [`CompilerError::NoCurrentBundle`], so a verifier PASS can never be mistaken
+/// for current bundle support. When a real owner lands (assignment waves B-C),
+/// this module is where the one producer receipt and the one
+/// installation/runtime admission binding get introduced — never by reviving a
+/// fixed D-01 literal.
+pub mod current_bundle {
+    use super::CompilerError;
+
+    /// Bundle contract member names the current owner must produce/consume.
+    pub const BUNDLE_MANIFEST_FILE: &str = "Eliot_Runtime_BundleManifest.json";
+    /// Bootstrap contract member name the current owner must produce/consume.
+    pub const BOOTSTRAP_SEED_FILE: &str = "Eliot_Runtime_BootstrapSeed.json";
+
+    /// Resolve the current sealed-bundle producer receipt.
+    ///
+    /// Always fails closed: no current producer exists in-repo.
+    pub fn require_current_producer() -> Result<&'static str, CompilerError> {
+        Err(CompilerError::NoCurrentBundle {
+            detail: "zero current producers: LEGACY_D01 verifier only",
+        })
+    }
+
+    /// Resolve the current installation/runtime admission consumer.
+    ///
+    /// Always fails closed: no installation or runtime admission consumer
+    /// binds the sealed-bundle identity in-repo.
+    pub fn require_admission_consumer() -> Result<&'static str, CompilerError> {
+        Err(CompilerError::NoCurrentBundle {
+            detail: "zero installation/runtime admission consumers: LEGACY_D01 verifier only",
+        })
+    }
+}
 
 /// Fixed read-only repository-tool boundary (#1223 req 3).
 ///
@@ -5710,5 +5765,28 @@ mod tests {
             check_total_payload_bytes(bounds::MAX_TOTAL_PAYLOAD_BYTES + 1),
             Err(CompilerError::BoundExceeded { .. })
         ));
+    }
+
+    #[test]
+    fn current_bundle_wiring_is_typed_fail_closed() {
+        assert_eq!(
+            current_bundle::BUNDLE_MANIFEST_FILE,
+            "Eliot_Runtime_BundleManifest.json"
+        );
+        assert_eq!(
+            current_bundle::BOOTSTRAP_SEED_FILE,
+            "Eliot_Runtime_BootstrapSeed.json"
+        );
+        assert!(matches!(
+            current_bundle::require_current_producer(),
+            Err(CompilerError::NoCurrentBundle { .. })
+        ));
+        assert!(matches!(
+            current_bundle::require_admission_consumer(),
+            Err(CompilerError::NoCurrentBundle { .. })
+        ));
+        // Display must render the typed detail, never an empty or Ok path.
+        let rendered = format!("{}", CompilerError::NoCurrentBundle { detail: "probe" });
+        assert!(rendered.contains("no current sealed bundle"));
     }
 }
