@@ -8,6 +8,9 @@
 //! remains below the `<10k LOC` split invariant; this is an implementation
 //! invariant for maintainability, not a claimed Architecture numeric rule.
 
+use super::kernel_unavailability::{
+    KernelAvailability, RecoveryDeferral, RecoveryView, semantic_task_recovery_deferral,
+};
 use super::*;
 
 /// F-LOG-KERNEL-4 (#903 slice B): health-view boundary observations.
@@ -137,5 +140,31 @@ impl KernelComposition {
         let state = service.state();
         observe_health("kernel.health.service_state_observed", "success");
         Ok(state)
+    }
+
+    /// Projects the restricted Recovery View for surviving Host/Watchdog
+    /// interactions while the Kernel is unavailable (I1.13).
+    ///
+    /// The projection carries only build, generation, ORS, and incident
+    /// state. Semantic task recovery is never projected here; callers use
+    /// [`Self::deferred_semantic_recovery`] instead, which waits for
+    /// canonical access.
+    pub fn recovery_view_response(view: &RecoveryView) -> serde_json::Value {
+        observe_health("kernel.health.recovery_view_projected", "known");
+        view.to_json()
+    }
+
+    /// Defers semantic task recovery pending canonical access (I1.13).
+    ///
+    /// Reachable from the Recovery View path so no route can imply that a
+    /// semantic action completed without canonical access. The Kernel
+    /// argument keeps the deferral tied to the shared availability guard:
+    /// while the Kernel is unavailable the deferral always applies, and the
+    /// observation records it.
+    pub fn deferred_semantic_recovery(kernel: KernelAvailability) -> RecoveryDeferral {
+        if kernel == KernelAvailability::Unavailable {
+            observe_health("kernel.health.semantic_recovery_deferred", "known");
+        }
+        semantic_task_recovery_deferral()
     }
 }
