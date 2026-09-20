@@ -58,12 +58,13 @@ pub use request_hash::{
 };
 
 pub use store_failure::{
-    ErasureFailureKind, MAX_STORE_FAILURE_DETAIL_LEN, MAX_STORE_FAILURE_EVIDENCE_HANDLES,
-    MAX_STORE_FAILURE_REFERENCE_LEN, MAX_STORE_FAILURE_RETRY_AFTER_MS, MAX_STORE_REASON_CODE_LEN,
-    STORE_FAILURE_CONTRACT_REVISION, StoreConflictObservation, StoreEvidenceHandles, StoreFailure,
-    StoreFailureContractError, StoreFailureDisposition, StoreFailureIdentityContext,
-    StoreFailureRequestContext, StoreMutationDisposition, StoreReasonCode, StoreRecoveryAction,
-    StoreRetryDirective, erasure_store_failure,
+    ErasureFailureKind, LegacyStoreFailureV1, MAX_STORE_FAILURE_DETAIL_LEN,
+    MAX_STORE_FAILURE_EVIDENCE_HANDLES, MAX_STORE_FAILURE_REFERENCE_LEN,
+    MAX_STORE_FAILURE_RETRY_AFTER_MS, MAX_STORE_REASON_CODE_LEN, STORE_FAILURE_CONTRACT_REVISION,
+    StoreConflictObservation, StoreEvidenceHandles, StoreFailure, StoreFailureContractError,
+    StoreFailureDisposition, StoreFailureIdentityContext, StoreFailureRequestContext,
+    StoreMutationDisposition, StoreReasonCode, StoreRecoveryAction, StoreRetryDirective,
+    decode_legacy_store_failure_v1, erasure_store_failure,
 };
 
 pub use wire::{
