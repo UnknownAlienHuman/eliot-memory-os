@@ -210,10 +210,13 @@ where
 /// until a proven-ready transition. No Host-side heartbeat validator exists:
 /// the admitted ORS snapshot carries lease currency (epoch pair, validity
 /// window) but no heartbeat recency (no authority state, coverage flag,
-/// tick interval, or last-beat timestamp), and no Host-to-Watchdog transport
-/// delivers the Watchdog-owned `WatchdogReadiness` projection (remainder
-/// specified in `watchdog_composition::authority_state`). SCM `Running`
-/// therefore never implies a fresh heartbeat. `approved_plan_generation` is the
+/// tick interval, or last-beat timestamp). Heartbeat recency arrives only
+/// through the Host-to-Watchdog pipe transport: the Watchdog-owned
+/// `WatchdogReadiness` projection plus the Host-recorded receive time,
+/// consumed exclusively as the derived `HostObservedWatchdogHeartbeat`
+/// (see `watchdog_heartbeat`), with the admission failing closed without
+/// a fresh admitted beat. SCM `Running` therefore never implies a fresh
+/// heartbeat. `approved_plan_generation` is the
 /// approval binding only (the immutable transaction-plan generation that
 /// authorized this exact registration), never a supervision epoch. `None`
 /// only for bootstrap-less registrations, which the production approval path

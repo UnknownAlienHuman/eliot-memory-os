@@ -28,24 +28,24 @@ use std::sync::{Arc, RwLock};
 /// Watchdog heartbeat, so no such check is claimed.
 ///
 /// Heartbeat-transport remainder (not implemented in this slice). When a
-/// Host-to-Watchdog transport lands, it must deliver this exact projection
-/// shape plus an emission timestamp (the current shape has no timestamp, so
-/// no freshness bound is expressible yet):
-/// - type: one `WatchdogReadiness` projection per supervision contour —
-///   `authority_state`, `coverage_claimed`, the admitted epoch pair, and
-///   `tick_interval_ms`, plus the new emission timestamp;
-/// - writer: the Watchdog process entrypoint, publishing from this
-///   authority-state cell after the Kernel accepts the corresponding
-///   heartbeat;
-/// - reader: the Host readiness/SCM admission path, which must require
-///   `AdmittedHeartbeat` with `coverage_claimed == true`, the exact
-///   admitted epoch pair, and an emission timestamp within a small multiple
-///   of `tick_interval_ms` — anything else fails closed into the
-///   gap-only signal. Until that transport exists, every supervision claim
-///   that would need it must fail closed.
+/// Host-to-Watchdog heartbeat transport (transport1750, landed). The writer
+/// side lives in `crate::heartbeat_transport`: the Watchdog process
+/// entrypoint loads the Host-issued rendezvous (per-instance pipe name plus
+/// 256-bit challenge, bound to the installer-approved bootstrap contour),
+/// writes one fence announce at sequence zero, and emits one
+/// `AdmittedHeartbeat` message per admitted Kernel heartbeat at the tick
+/// cadence with a strictly increasing sequence. The Host listener records
+/// its own receive time per read and the admission path consumes only the
+/// derived Host observation (epochs, receive time, freshness deadline,
+/// coverage, guid). Until a fresh admitted heartbeat is observed, every
+/// supervision claim that would need it still fails closed (A0.3).
+///
+/// The current shape carries no emission timestamp, so the freshness bound
+/// is expressed by the Host receive time against `tick_interval_ms` (see
+/// the reader contract below), not by a writer clock.
 ///
 /// Field contract the future reader must apply before treating a delivered
-/// projection as coverage:
+/// projection as coverage (enforced by the Host admission validator):
 /// - `authority_state` / `coverage_claimed`: require `AdmittedHeartbeat` with
 ///   `coverage_claimed == true`. `RunningNoAuthority` is an explicit gap-only
 ///   signal (the SCM sibling is alive but no current Host-issued lease has
@@ -59,6 +59,12 @@ use std::sync::{Arc, RwLock};
 ///   responsiveness bound. A projection older than a small multiple of this
 ///   interval without a fresh admitted heartbeat must be treated as
 ///   unresponsive, never as current coverage.
+/// - `service_instance_guid` / `host_challenge_nonce`: the Host-issued pipe
+///   instance identity echoed verbatim. The Host requires byte equality
+///   with its per-instance rendezvous; a mismatch fails closed.
+/// - `watchdog_readiness_sequence`: zero for fence announces, strictly
+///   increasing across admitted emissions. The Host requires continuity
+///   against its persisted observation and treats a gap as PARTIAL.
 ///
 /// Binding a projection to its exact lease (lease identity plus ORS receipt
 /// digest) is owned by the supervision-claim path, not by this shape: the
@@ -80,6 +86,9 @@ pub struct WatchdogReadiness {
     pub kernel_epoch: u64,
     pub watchdog_epoch: u64,
     pub tick_interval_ms: u128,
+    pub service_instance_guid: String,
+    pub host_challenge_nonce: String,
+    pub watchdog_readiness_sequence: u64,
 }
 
 /// Separates SCM/process liveness from admitted heartbeat authority.

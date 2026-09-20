@@ -162,6 +162,30 @@ pub(crate) fn append_authenticated_kernel_readiness<B: JournalBackend>(
     approved_config: &PlatformHandle,
     watchdog_template: &WatchdogAdmissionTemplate,
 ) -> Result<(AppendReceipt, PublishedSupervisionIdentity), HostError> {
+    append_authenticated_kernel_readiness_with_heartbeat(
+        journal,
+        proof,
+        approved_kernel_artifact,
+        approved_config,
+        watchdog_template,
+        &[],
+    )
+}
+
+/// Appends the authenticated kernel readiness observation with the Host
+/// heartbeat evidence refs stored alongside kernel readiness and the
+/// watchdog-branch ref (transport1750 step 8). Empty refs preserve the
+/// pre-transport record exactly; callers pass refs admitted from a fresh
+/// derived Host observation, never raw pipe material.
+#[cfg(windows)]
+pub(crate) fn append_authenticated_kernel_readiness_with_heartbeat<B: JournalBackend>(
+    journal: &HostStateJournalService<B>,
+    proof: &AuthenticatedKernelReadiness,
+    approved_kernel_artifact: &PlatformHandle,
+    approved_config: &PlatformHandle,
+    watchdog_template: &WatchdogAdmissionTemplate,
+    heartbeat_refs: &[PlatformHandle],
+) -> Result<(AppendReceipt, PublishedSupervisionIdentity), HostError> {
     host_readiness_append_observe("host.readiness authenticated requested");
     let snapshot = journal.snapshot()?;
     let active = snapshot.kernel.as_ref().ok_or_else(|| {
@@ -214,6 +238,9 @@ pub(crate) fn append_authenticated_kernel_readiness<B: JournalBackend>(
         watchdog_branch_evidence_ref(watchdog_template, &proof.supervision_lease)?;
     evidence_refs.extend(supervision.evidence_refs()?);
     evidence_refs.push(watchdog_branch_ref);
+    // Transport1750 step 8: Host observation digest, coverage, and receive
+    // time admitted from a fresh derived heartbeat ride the same record.
+    evidence_refs.extend(heartbeat_refs.iter().cloned());
     let expected = ReadinessApprovedContour {
         config_digest: approved_config.clone(),
         store_fence: proof.store_fence.clone(),

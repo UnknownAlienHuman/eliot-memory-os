@@ -1,6 +1,8 @@
 mod readiness_append;
 #[cfg(windows)]
-pub(super) use readiness_append::append_authenticated_kernel_readiness;
+pub(super) use readiness_append::{
+    append_authenticated_kernel_readiness, append_authenticated_kernel_readiness_with_heartbeat,
+};
 
 use super::{HostError, fresh_identity, fresh_lineage_id, operation, record_fence, sha256_json};
 use eliot_host_state::{

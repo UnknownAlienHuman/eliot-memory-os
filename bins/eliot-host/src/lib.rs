@@ -3326,14 +3326,14 @@ fn epoch_contract_error(error: &EpochContractError) -> JournalError {
 mod watchdog_service_start;
 #[cfg(all(test, windows))]
 use watchdog_service_start::{
-    InstalledWatchdogControl, InstalledWatchdogRuntimeInspection, InstalledWatchdogStartControl,
-    WATCHDOG_START_TIMEOUT_MS, WatchdogStartClock, require_running_watchdog,
-    start_installed_watchdog_with_clock, watchdog_start_wait,
+    InstalledWatchdogStartControl, WATCHDOG_START_TIMEOUT_MS, WatchdogStartClock,
+    require_running_watchdog, start_installed_watchdog_with_clock, watchdog_start_wait,
 };
 #[cfg(windows)]
 use watchdog_service_start::{
+    InstalledWatchdogControl, InstalledWatchdogRuntimeInspection,
     approved_service_registration_request, select_watchdog_approval_for_inspection,
-    start_installed_watchdog,
+    start_installed_watchdog, verify_watchdog_scm_running,
 };
 
 fn sha256_json(value: &impl serde::Serialize) -> Result<String, HostError> {
@@ -3350,6 +3350,8 @@ use watchdog_publication::{
     read_manifest_current_supervision_lease, supervision_publication_identity,
     verify_exact_current_watchdog_publication,
 };
+#[cfg(windows)]
+mod watchdog_heartbeat;
 
 #[cfg(windows)]
 fn host_owned_store_recovery_request(
@@ -3437,9 +3439,15 @@ fn record_fence(
 mod journal_append;
 #[cfg(windows)]
 use journal_append::{
-    append_authenticated_kernel_readiness, append_store_rebind_terminal,
+    append_authenticated_kernel_readiness_with_heartbeat,
+    append_store_rebind_terminal,
     persist_store_rebind_disposition,
 };
+// The pre-transport append stays covered by journal tests through the
+// glob import below them; outside tests nothing else calls it.
+#[cfg(windows)]
+#[cfg_attr(not(test), allow(unused_imports))]
+use journal_append::append_authenticated_kernel_readiness;
 #[cfg(test)]
 use journal_append::{append_clean_marker, exact_termination_binding_matches};
 use journal_append::{
@@ -5265,6 +5273,22 @@ impl HostComposition {
             &launch.watchdog_executable_path,
         )?;
         debug_assert_eq!(registration.binary_path(), image.as_path());
+        // Transport1750 step 1: mint the per-instance heartbeat rendezvous
+        // (ACL-restricted pipe plus 256-bit challenge) and publish it
+        // through the trusted contour the Watchdog already reads (the
+        // installer-approved Host state root, bound to the exact approved
+        // registration bootstrap). Any issuance failure fails this start
+        // closed: no descriptor, no supervised claim later.
+        let heartbeat_bootstrap = registration.bootstrap().ok_or_else(|| {
+            HostError::ProcessContour("Watchdog registration has no typed bootstrap".to_owned())
+        })?;
+        watchdog_heartbeat::HeartbeatTransportDescriptor::issue(
+            heartbeat_bootstrap.installation_id(),
+            heartbeat_bootstrap.transaction_plan_generation(),
+        )?
+        .publish(Path::new(
+            launch.runtime_state_roots.host_state_root.as_str(),
+        ))?;
         start_installed_watchdog(&mut platform, &registration, context)
     }
 
@@ -6324,6 +6348,66 @@ impl HostComposition {
     }
 
     #[cfg(windows)]
+    /// Re-verifies the SCM-bound Watchdog incarnation and consumes one
+    /// armed heartbeat admission window for this readiness proof.
+    ///
+    /// Transport1750 steps 5-7: a disarmed contour (no descriptor file)
+    /// returns no refs and preserves current behavior exactly; an armed
+    /// contour with no fresh admitted heartbeat fails closed. The SCM
+    /// re-verification is read-only and introduces no Job, kill-handle, or
+    /// SCM stop capability.
+    #[cfg(windows)]
+    fn observe_watchdog_heartbeat_for_admission(
+        &self,
+        manifest: &CandidateManifest,
+        proof: &AuthenticatedKernelReadiness,
+    ) -> Result<Vec<PlatformHandle>, HostError> {
+        let scm_launch = &manifest.runtime_launch;
+        let Some(approval) = select_watchdog_approval_for_inspection(&self.registry, manifest)?
+        else {
+            return Ok(Vec::new());
+        };
+        let registration = approved_service_registration_request(
+            scm_launch,
+            &approval,
+            InstallerServiceRole::Watchdog,
+            &scm_launch.watchdog_executable_path,
+        )?;
+        let mut platform = WindowsPlatform::new(PathBuf::from(scm_launch.kernel_work_root.as_str()))
+            .map_err(|error| HostError::Platform(error.to_string()))?;
+        let scm = match platform.inspect_registration_runtime(&registration) {
+            InstalledWatchdogRuntimeInspection::Matching {
+                state,
+                wait_hint_ms,
+                process,
+            } => verify_watchdog_scm_running(&registration, state, wait_hint_ms, process.as_ref())?,
+            _ => {
+                return Err(HostError::RecoveryRequired(
+                    "Watchdog is not Running for heartbeat admission".to_owned(),
+                ));
+            }
+        };
+        let expected_kernel_epoch = proof
+            .supervision_lease
+            .record
+            .binding
+            .kernel_epoch
+            .sequence
+            .get();
+        let expected_watchdog_epoch = proof
+            .supervision_lease
+            .record
+            .binding
+            .watchdog_epoch
+            .value();
+        watchdog_heartbeat::observe_armed_heartbeat(
+            self.launch_options.host_state_root(),
+            expected_kernel_epoch,
+            expected_watchdog_epoch,
+            &scm,
+        )
+    }
+    #[cfg(windows)]
     #[allow(
         clippy::too_many_lines,
         reason = "fresh readiness keeps probe, exact supervision publication, final ORS fence, journal append, and readback in causal order"
@@ -6419,12 +6503,20 @@ impl HostComposition {
                 proof.supervision_lease.record.lease_id.as_str(),
             )
         })?;
-        let (_, admitted_supervision) = append_authenticated_kernel_readiness(
+        // Transport1750 steps 7-8: the admitted readiness stores the Host
+        // observation digest, coverage, and receive time alongside kernel
+        // readiness and the watchdog-branch ref. Disarmed contours
+        // contribute no refs; armed contours fail closed without a fresh
+        // admitted heartbeat.
+        let heartbeat_refs =
+            self.observe_watchdog_heartbeat_for_admission(&active.manifest, &proof)?;
+        let (_, admitted_supervision) = append_authenticated_kernel_readiness_with_heartbeat(
             &self.journal,
             &proof,
             kernel_artifact,
             materialized_config_digest,
             &watchdog_template,
+            &heartbeat_refs,
         )?;
         debug_assert_eq!(
             published_supervision, admitted_supervision,

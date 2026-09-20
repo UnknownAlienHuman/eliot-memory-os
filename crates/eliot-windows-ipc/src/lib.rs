@@ -25,13 +25,16 @@ use windows_sys::Win32::Foundation::{
     SetHandleInformation, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
 use windows_sys::Win32::Security::Credentials::{
     CRED_MAX_CREDENTIAL_BLOB_SIZE, CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC, CREDENTIALW,
     CredDeleteW, CredEnumerateW, CredFree, CredReadW, CredWriteW,
 };
-use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+use windows_sys::Win32::Security::{
+    GetTokenInformation, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
+    TokenUser,
+};
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
     FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_OVERLAPPED, FILE_NOTIFY_CHANGE_ATTRIBUTES,
@@ -61,7 +64,8 @@ use windows_sys::Win32::System::Pipes::{CreatePipe, GetNamedPipeClientProcessId}
 use windows_sys::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateEventW, CreateProcessW,
     DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess,
-    GetProcessTimes, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcess,
+    GetCurrentProcess,
+    GetProcessTimes, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcess, OpenProcessToken,
     PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
     PROCESS_SET_QUOTA, PROCESS_TERMINATE, QueryFullProcessImageNameW, ResumeThread,
     STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
@@ -405,6 +409,113 @@ pub fn named_pipe_client_process(pipe: &NamedPipeServer) -> io::Result<ProcessIm
         return Err(io::Error::last_os_error());
     }
     Ok(open_process_identity(pid)?.identity)
+}
+/// Resolves the current process token-user SID (`S-...` text) for pipe
+// (blank line kept by patch body below)
+/// DACL construction. A service and its sibling watchdog run under the
+/// same account in every supported contour, so granting this SID admits
+/// exactly the sibling peer class; per-connection peer binding still
+/// applies on top.
+///
+/// # Errors
+///
+/// Returns an error when the process token cannot be opened, queried, or
+/// converted to SID text.
+pub fn current_process_token_sid() -> io::Result<String> {
+    struct TokenGuard(HANDLE);
+    impl Drop for TokenGuard {
+        fn drop(&mut self) {
+            // SAFETY: the handle came from OpenProcessToken and closes once here.
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+    let mut token: HANDLE = ptr::null_mut();
+    // SAFETY: `token` is a valid out-pointer; the current-process
+    // pseudo-handle needs no close.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) } == 0
+        || token.is_null()
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let _guard = TokenGuard(token);
+    let mut needed: u32 = 0;
+    // SAFETY: probing the required size with a null buffer; the length
+    // out-pointer is live for the call.
+    unsafe {
+        GetTokenInformation(token, TokenUser, ptr::null_mut(), 0, &raw mut needed);
+    }
+    if needed == 0 || needed > 4096 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "process token size is invalid",
+        ));
+    }
+    // The query writes a TOKEN_USER (8-byte aligned), so the buffer is
+    // 8-byte aligned u64 storage sized up from the reported byte count.
+    let mut buffer = vec![0u64; (needed as usize).div_ceil(std::mem::size_of::<u64>())];
+    let capacity = u32::try_from(buffer.len() * std::mem::size_of::<u64>()).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidData, "process token size is invalid")
+    })?;
+    // SAFETY: the buffer is live for `capacity` bytes; the length
+    // out-pointer is live for the call.
+    if unsafe {
+        GetTokenInformation(
+            token,
+            TokenUser,
+            buffer.as_mut_ptr().cast(),
+            capacity,
+            &raw mut needed,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the successful query wrote a TOKEN_USER at the aligned
+    // buffer start.
+    let user = unsafe { &*(buffer.as_ptr().cast::<TOKEN_USER>()) };
+    let mut wide: *mut u16 = ptr::null_mut();
+    // SAFETY: `Sid` is the live token-user SID; `wide` receives a
+    // `LocalAlloc` string owned by this frame.
+    if unsafe { ConvertSidToStringSidW(user.User.Sid, &raw mut wide) } == 0 || wide.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let mut len = 0usize;
+    while len < 512 {
+        // SAFETY: `wide` is a live NUL-terminated string; reads stop at
+        // the terminator or the bound.
+        if unsafe { *wide.add(len) } == 0 {
+            break;
+        }
+        len += 1;
+    }
+    if len == 0 || len >= 512 {
+        // SAFETY: `wide` is the live `LocalAlloc` string from the conversion.
+        unsafe {
+            LocalFree(wide.cast());
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "process SID text is invalid",
+        ));
+    }
+    // SAFETY: `wide` holds `len` live units; freed exactly once below.
+    let slice = unsafe { std::slice::from_raw_parts(wide, len) };
+    let sid = OsString::from_wide(slice)
+        .into_string()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "process SID is not UTF-8"))?;
+    // SAFETY: `wide` is the live `LocalAlloc` string from the conversion above.
+    unsafe {
+        LocalFree(wide.cast());
+    }
+    if !sid.starts_with("S-") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "process SID text is invalid",
+        ));
+    }
+    Ok(sid)
 }
 
 /// Returns the full executable image path for `pid` using limited query access.
@@ -3094,6 +3205,13 @@ mod tests {
     fn sid_validation_rejects_sddl_injection() {
         assert!(validate_sid("S-1-5-21-1234").is_ok());
         assert!(validate_sid("S-1-5-21)(A;;GA;;;WD").is_err());
+    }
+    #[test]
+    fn current_process_token_sid_is_canonical() -> Result<(), Box<dyn std::error::Error>> {
+        let sid = super::current_process_token_sid()?;
+        assert!(sid.starts_with("S-"));
+        assert!(validate_sid(&sid).is_ok());
+        Ok(())
     }
 
     #[test]
