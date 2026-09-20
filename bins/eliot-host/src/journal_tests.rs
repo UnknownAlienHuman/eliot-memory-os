@@ -592,12 +592,50 @@ fn authenticated_proof(
 }
 
 #[cfg(windows)]
-fn test_published_supervision_identity() -> Result<PublishedSupervisionIdentity, TestError> {
-    Ok(PublishedSupervisionIdentity {
-        lease_id: PlatformHandle::new("supervision-lease:test-readiness")?,
-        ors_receipt_digest: PlatformHandle::new("a".repeat(64))?,
-        publication_digest: PlatformHandle::new("b".repeat(64))?,
-    })
+fn test_watchdog_admission_template_with_scope(
+    installation_id: &str,
+    lease_scope_id: &str,
+) -> Result<eliot_runtime_contracts::WatchdogAdmissionTemplate, TestError> {
+    use eliot_runtime_contracts::SupervisionLeaseSigner as _;
+    let signer = eliot_runtime_contracts::Ed25519SupervisionLeaseSigner::from_secret_key(
+        "readiness-kernel",
+        "readiness-key",
+        [7; 32],
+    )?;
+    let anchor = eliot_runtime_contracts::SupervisionTrustAnchor::new(
+        installation_id,
+        signer.signer_id(),
+        signer.key_id(),
+        signer.public_key().to_vec(),
+    )?;
+    Ok(eliot_runtime_contracts::WatchdogAdmissionTemplate::new(
+        installation_id,
+        "readiness-generation",
+        lease_scope_id,
+        anchor,
+    )?)
+}
+
+#[cfg(windows)]
+fn test_watchdog_admission_template(
+    installation_id: &str,
+) -> Result<eliot_runtime_contracts::WatchdogAdmissionTemplate, TestError> {
+    // Matches the scope the readiness supervision snapshots are committed
+    // under; any other scope must fail the admission cross-check.
+    test_watchdog_admission_template_with_scope(installation_id, "scope-readiness")
+}
+
+#[cfg(windows)]
+fn contour_evidence_digest(
+    evidence_refs: &[PlatformHandle],
+    prefix: &str,
+) -> Result<Option<PlatformHandle>, TestError> {
+    for candidate in evidence_refs {
+        if let Some(stripped) = candidate.as_str().strip_prefix(prefix) {
+            return Ok(Some(PlatformHandle::new(stripped)?));
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(windows)]
@@ -608,16 +646,25 @@ fn readiness_contour(fixture: &ReadinessFixture) -> Result<ReadinessContourIdent
         .ok_or_else(|| std::io::Error::other("test option invariant"))?;
     let active_kernel_record_checksum =
         PlatformHandle::new(record_checksum(&HostStateRecord::Kernel(active))?)?;
-    let supervision = test_published_supervision_identity()?;
-    let store_proof_fence = match state.readiness_observations.last() {
-        Some(observation)
-            if observation.active_kernel_record_checksum == active_kernel_record_checksum
-                && supervision.is_bound_by(&observation.evidence_refs)? =>
-        {
-            Some(observation.store_fence.clone())
-        }
-        _ => None,
-    };
+    // The supervision triple is read back from the journaled observation
+    // itself: after the single-snapshot boundary there is no independent
+    // test identity to match against.
+    let last = state.readiness_observations.last().filter(|observation| {
+        observation.active_kernel_record_checksum == active_kernel_record_checksum
+    });
+    let mut store_proof_fence = None;
+    let mut supervision_lease_id = None;
+    let mut supervision_ors_receipt_digest = None;
+    let mut watchdog_publication_digest = None;
+    if let Some(observation) = last {
+        store_proof_fence = Some(observation.store_fence.clone());
+        supervision_lease_id =
+            contour_evidence_digest(&observation.evidence_refs, "supervision-lease:")?;
+        supervision_ors_receipt_digest =
+            contour_evidence_digest(&observation.evidence_refs, "supervision-ors-receipt:")?;
+        watchdog_publication_digest =
+            contour_evidence_digest(&observation.evidence_refs, "watchdog-publication:")?;
+    }
     Ok(ReadinessContourIdentity {
         approved_generation: PlatformHandle::new("approved-generation")?,
         approved_kernel_artifact: fixture.kernel_artifact.clone(),
@@ -627,9 +674,9 @@ fn readiness_contour(fixture: &ReadinessFixture) -> Result<ReadinessContourIdent
         candidate_binding_digest: PlatformHandle::new(fixture.candidate.compute_digest()?)?,
         store_requirement_digest: PlatformHandle::new(sha256_json(&fixture.requirement)?)?,
         store_proof_fence,
-        supervision_lease_id: Some(supervision.lease_id),
-        supervision_ors_receipt_digest: Some(supervision.ors_receipt_digest),
-        watchdog_publication_digest: Some(supervision.publication_digest),
+        supervision_lease_id,
+        supervision_ors_receipt_digest,
+        watchdog_publication_digest,
     })
 }
 
@@ -1686,7 +1733,7 @@ fn ready_repeat_appends_fresh_proofs_without_mutating_activation_authority() -> 
         &first,
         &fixture.kernel_artifact,
         &fixture.config,
-        &test_published_supervision_identity()?,
+        &test_watchdog_admission_template(fixture.candidate.installation_id.as_str())?,
     )
     .map(|_| HostBranchDisposition::Healthy)?;
     let second = authenticated_proof(&fixture, 8)?;
@@ -1695,7 +1742,7 @@ fn ready_repeat_appends_fresh_proofs_without_mutating_activation_authority() -> 
         &second,
         &fixture.kernel_artifact,
         &fixture.config,
-        &test_published_supervision_identity()?,
+        &test_watchdog_admission_template(fixture.candidate.installation_id.as_str())?,
     )
     .map(|_| HostBranchDisposition::Healthy)?;
     let state = fixture.journal.snapshot()?;
@@ -1753,7 +1800,7 @@ fn readiness_lease_separates_cheap_polling_from_expired_repeat() -> TestResult {
             &proof,
             &fixture.kernel_artifact,
             &fixture.config,
-            &test_published_supervision_identity()
+            &test_watchdog_admission_template(fixture.candidate.installation_id.as_str())
                 .map_err(|error| HostError::Platform(error.to_string()))?,
         )?;
         readiness_contour(&fixture).map_err(|error| HostError::Platform(error.to_string()))
@@ -1809,6 +1856,11 @@ fn production_fast_path_invalidates_every_exact_contour_field() -> TestResult {
     let fixture = active_readiness_fixture()?;
     let mut exact = readiness_contour(&fixture)?;
     exact.store_proof_fence = Some(PlatformHandle::new("store-proof-exact")?);
+    // Gate-equality exercise only: the empty journal carries no journaled
+    // supervision triple, so the exact contour is completed by hand here.
+    exact.supervision_lease_id = Some(PlatformHandle::new("supervision-lease:test-exact")?);
+    exact.supervision_ors_receipt_digest = Some(PlatformHandle::new("a".repeat(64))?);
+    exact.watchdog_publication_digest = Some(PlatformHandle::new("b".repeat(64))?);
     let changed = |label: &str| -> Result<PlatformHandle, TestError> {
         Ok(PlatformHandle::new(format!("changed-{label}"))?)
     };
@@ -1907,13 +1959,16 @@ fn production_readiness_supervision_fence_rejects_substitution_and_post_publish_
 -> TestResult {
     let fixture = active_readiness_fixture()?;
     let proof = authenticated_proof(&fixture, 44)?;
-    let exact = test_published_supervision_identity()?;
-    append_authenticated_kernel_readiness(
+    let template = test_watchdog_admission_template(fixture.candidate.installation_id.as_str())?;
+    // Single-snapshot boundary: the journaled identity is derived from the
+    // proof snapshot itself; the test captures that derived value instead of
+    // supplying an independent identity.
+    let (_, admitted) = append_authenticated_kernel_readiness(
         &fixture.journal,
         &proof,
         &fixture.kernel_artifact,
         &fixture.config,
-        &exact,
+        &template,
     )?;
     let observation = fixture
         .journal
@@ -1922,16 +1977,16 @@ fn production_readiness_supervision_fence_rejects_substitution_and_post_publish_
         .pop()
         .ok_or_else(|| std::io::Error::other("test option invariant"))?;
     assert!(readiness_supervision_fence_matches(
-        &exact,
+        &admitted,
         true,
         &observation.evidence_refs,
     ));
     assert!(!readiness_supervision_fence_matches(
-        &exact,
+        &admitted,
         false,
         &observation.evidence_refs,
     ));
-    let mut substituted = exact.clone();
+    let mut substituted = admitted.clone();
     substituted.publication_digest = PlatformHandle::new("c".repeat(64))?;
     assert!(!readiness_supervision_fence_matches(
         &substituted,
@@ -1941,6 +1996,38 @@ fn production_readiness_supervision_fence_rejects_substitution_and_post_publish_
     let mut renewed = proof.supervision_lease.clone();
     renewed.receipt.receipt_sha256 = "d".repeat(64);
     assert!(require_exact_supervision_head(&proof.supervision_lease, || Ok(renewed)).is_err());
+    Ok(())
+}
+
+#[cfg(windows)]
+#[test]
+fn readiness_append_rejects_foreign_admission_scope() -> TestResult {
+    // Re-audit of 0f127a50, blocker 1: the evidence ref derives from the
+    // single Kernel-renewed snapshot, so a provisioned template from a
+    // foreign lease scope must fail closed and persist nothing.
+    let fixture = active_readiness_fixture()?;
+    let proof = authenticated_proof(&fixture, 45)?;
+    let foreign = test_watchdog_admission_template_with_scope(
+        fixture.candidate.installation_id.as_str(),
+        "foreign-scope",
+    )?;
+    assert!(
+        append_authenticated_kernel_readiness(
+            &fixture.journal,
+            &proof,
+            &fixture.kernel_artifact,
+            &fixture.config,
+            &foreign,
+        )
+        .is_err()
+    );
+    assert!(
+        fixture
+            .journal
+            .snapshot()?
+            .readiness_observations
+            .is_empty()
+    );
     Ok(())
 }
 
@@ -1966,7 +2053,7 @@ fn degraded_recovery_becomes_healthy_only_after_journaled_probe() -> TestResult 
                 &proof,
                 &fixture.kernel_artifact,
                 &fixture.config,
-                &test_published_supervision_identity()
+                &test_watchdog_admission_template(fixture.candidate.installation_id.as_str())
                     .map_err(|error| HostError::Platform(error.to_string()))?,
             )?;
             readiness_contour(&fixture).map_err(|error| HostError::Platform(error.to_string()))
@@ -2040,7 +2127,7 @@ fn unknown_readiness_journal_outcome_remains_non_healthy() -> TestResult {
         &proof,
         &fixture.kernel_artifact,
         &fixture.config,
-        &test_published_supervision_identity()?,
+        &test_watchdog_admission_template(fixture.candidate.installation_id.as_str())?,
     );
     assert!(matches!(
         outcome,
@@ -2064,7 +2151,7 @@ fn activation_reopen_starts_a_fresh_child_after_historical_active() -> TestResul
         &proof,
         &fixture.kernel_artifact,
         &fixture.config,
-        &test_published_supervision_identity()?,
+        &test_watchdog_admission_template(fixture.candidate.installation_id.as_str())?,
     )?;
     let snapshot = fixture.journal.snapshot()?;
     let control_ready = transition_activation_record(
@@ -2809,7 +2896,7 @@ fn reconciled_active_readiness_failure_preserves_contour_then_recovers() -> Test
                 &proof,
                 &fixture.kernel_artifact,
                 &fixture.config,
-                &test_published_supervision_identity()
+                &test_watchdog_admission_template(fixture.candidate.installation_id.as_str())
                     .map_err(|error| HostError::Platform(error.to_string()))?,
             )?;
             readiness_contour(&fixture).map_err(|error| HostError::Platform(error.to_string()))

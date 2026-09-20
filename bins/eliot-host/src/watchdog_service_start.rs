@@ -129,7 +129,9 @@ where
             // approved-identity binding and live-process responsiveness verify.
             // SCM liveness only: this proves the approved image is Running,
             // never independent supervision (no heartbeat is read, no admitted
-            // epoch is validated). This gate is read-only and introduces no
+            // epoch is validated, and no heartbeat transport exists yet — see
+            // the remainder in watchdog_composition::authority_state). This
+            // gate is read-only and introduces no
             // Job, kill-handle, or SCM stop capability.
             verify_watchdog_scm_running(registration, state, wait_hint_ms, process.as_ref())?;
             return Ok(());

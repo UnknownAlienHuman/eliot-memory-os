@@ -207,7 +207,13 @@ where
 /// supervised coverage; supervision is proven only by the Kernel `ProbeReady`
 /// watchdog-branch gate (exact admitted-epoch equality on the renewed ORS
 /// head) plus the exact-lease evidence ref, with governance held degraded
-/// until a proven-ready transition. `approved_plan_generation` is the
+/// until a proven-ready transition. No Host-side heartbeat validator exists:
+/// the admitted ORS snapshot carries lease currency (epoch pair, validity
+/// window) but no heartbeat recency (no authority state, coverage flag,
+/// tick interval, or last-beat timestamp), and no Host-to-Watchdog transport
+/// delivers the Watchdog-owned `WatchdogReadiness` projection (remainder
+/// specified in `watchdog_composition::authority_state`). SCM `Running`
+/// therefore never implies a fresh heartbeat. `approved_plan_generation` is the
 /// approval binding only (the immutable transaction-plan generation that
 /// authorized this exact registration), never a supervision epoch. `None`
 /// only for bootstrap-less registrations, which the production approval path
@@ -217,27 +223,6 @@ pub struct VerifiedWatchdogScmRunning {
     pub process: ProcessIdentity,
     pub wait_hint_ms: u32,
     pub approved_plan_generation: Option<u64>,
-}
-
-#[cfg(windows)]
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "no Host-to-Watchdog heartbeat transport exists yet; the heartbeat validator is specified and unit-proven now so the SCM start path cannot over-claim supervision meanwhile"
-    )
-)]
-/// Host-side view of one Watchdog-owned heartbeat projection: the coverage
-/// flag plus the admitted epoch pair the watchdog published after the Kernel
-/// accepted its heartbeat. Populated from the Watchdog-owned `WatchdogReadiness`
-/// projection once a heartbeat transport delivers it; until then, no value of
-/// this type exists on the Host side and every supervision claim must fail
-/// closed (see `verify_watchdog_supervision_heartbeat`).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct WatchdogSupervisionHeartbeat {
-    pub coverage_claimed: bool,
-    pub kernel_epoch: u64,
-    pub watchdog_epoch: u64,
 }
 
 #[cfg(windows)]
@@ -285,107 +270,4 @@ pub fn verify_watchdog_scm_running(
             .bootstrap()
             .map(ServiceBootstrapArguments::transaction_plan_generation),
     })
-}
-
-#[cfg(windows)]
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "no Host-to-Watchdog heartbeat transport exists yet; the heartbeat validator is specified and unit-proven now so the SCM start path cannot over-claim supervision meanwhile"
-    )
-)]
-/// Verifies a Watchdog-owned heartbeat observation against the exact admitted
-/// supervision epochs for one readiness contour: the heartbeat must be present
-/// (fail closed without it), must claim coverage, must carry nonzero epochs,
-/// and both epochs must equal the admitted pair the caller extracted from the
-/// validated admitted supervision snapshot. Any other input fails closed; the
-/// returned pair is the verified admitted epoch pair.
-pub fn verify_watchdog_supervision_heartbeat(
-    heartbeat: Option<&WatchdogSupervisionHeartbeat>,
-    admitted_kernel_epoch: u64,
-    admitted_watchdog_epoch: u64,
-) -> Result<(u64, u64), HostError> {
-    let observed = heartbeat.ok_or_else(|| {
-        HostError::RecoveryRequired(
-            "no Watchdog-owned heartbeat observation; SCM Running alone never proves supervision"
-                .to_owned(),
-        )
-    })?;
-    if !observed.coverage_claimed {
-        return Err(HostError::RecoveryRequired(
-            "Watchdog heartbeat claims no coverage; treating it as supervised is refused".to_owned(),
-        ));
-    }
-    if observed.kernel_epoch == 0 || observed.watchdog_epoch == 0 {
-        return Err(HostError::RecoveryRequired(
-            "Watchdog heartbeat carries no admitted epoch pair".to_owned(),
-        ));
-    }
-    if admitted_kernel_epoch == 0 || admitted_watchdog_epoch == 0 {
-        return Err(HostError::RecoveryRequired(
-            "admitted supervision contour carries no watchdog branch".to_owned(),
-        ));
-    }
-    if observed.kernel_epoch != admitted_kernel_epoch
-        || observed.watchdog_epoch != admitted_watchdog_epoch
-    {
-        return Err(HostError::RecoveryRequired(
-            "Watchdog heartbeat is not the exact admitted supervision lease".to_owned(),
-        ));
-    }
-    Ok((observed.kernel_epoch, observed.watchdog_epoch))
-}
-
-#[cfg(test)]
-mod watchdog_supervision_heartbeat_tests {
-    use super::*;
-
-    fn heartbeat(
-        coverage: bool,
-        kernel_epoch: u64,
-        watchdog_epoch: u64,
-    ) -> WatchdogSupervisionHeartbeat {
-        WatchdogSupervisionHeartbeat {
-            coverage_claimed: coverage,
-            kernel_epoch,
-            watchdog_epoch,
-        }
-    }
-
-    #[test]
-    fn absent_heartbeat_fails_closed() {
-        assert!(verify_watchdog_supervision_heartbeat(None, 7, 11).is_err());
-    }
-
-    #[test]
-    fn heartbeat_without_coverage_fails_closed() {
-        assert!(verify_watchdog_supervision_heartbeat(Some(&heartbeat(false, 7, 11)), 7, 11).is_err());
-    }
-
-    #[test]
-    fn heartbeat_without_epochs_fails_closed() {
-        assert!(verify_watchdog_supervision_heartbeat(Some(&heartbeat(true, 0, 11)), 7, 11).is_err());
-        assert!(verify_watchdog_supervision_heartbeat(Some(&heartbeat(true, 7, 0)), 7, 11).is_err());
-    }
-
-    #[test]
-    fn admitted_contour_without_branch_fails_closed() {
-        assert!(verify_watchdog_supervision_heartbeat(Some(&heartbeat(true, 7, 11)), 0, 11).is_err());
-        assert!(verify_watchdog_supervision_heartbeat(Some(&heartbeat(true, 7, 11)), 7, 0).is_err());
-    }
-
-    #[test]
-    fn foreign_heartbeat_epoch_pair_fails_closed() {
-        assert!(verify_watchdog_supervision_heartbeat(Some(&heartbeat(true, 7, 11)), 7, 12).is_err());
-        assert!(verify_watchdog_supervision_heartbeat(Some(&heartbeat(true, 7, 11)), 8, 11).is_err());
-    }
-
-    #[test]
-    fn exact_admitted_pair_verifies() {
-        let verified =
-            verify_watchdog_supervision_heartbeat(Some(&heartbeat(true, 7, 11)), 7, 11)
-                .unwrap_or_else(|_| unreachable!());
-        assert_eq!(verified, (7, 11));
-    }
 }

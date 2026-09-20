@@ -18,9 +18,34 @@ use std::sync::{Arc, RwLock};
 /// I1.5 (#1750) verification contract for every field. This cell is
 /// Watchdog-local state: the Host has no transport that reads it, so no Host
 /// path may treat SCM `Running` — or any projection it cannot observe —
-/// as supervised coverage. Once a Host-to-Watchdog heartbeat transport
-/// delivers a projection, the Host must apply all of these checks before
-/// treating it as coverage:
+/// as supervised coverage. There is deliberately no Host-side heartbeat
+/// validator: an uncalled validator would be dead code, and the admitted ORS
+/// snapshot cannot substitute for heartbeat recency — it carries lease
+/// currency (the epoch pair plus the `issued/expires/renew-before` validity
+/// window) but no heartbeat observation (no authority state, no coverage
+/// flag, no tick interval, no last-beat timestamp). Liveness from the
+/// snapshot alone would conflate Kernel-renewal currency with a fresh
+/// Watchdog heartbeat, so no such check is claimed.
+///
+/// Heartbeat-transport remainder (not implemented in this slice). When a
+/// Host-to-Watchdog transport lands, it must deliver this exact projection
+/// shape plus an emission timestamp (the current shape has no timestamp, so
+/// no freshness bound is expressible yet):
+/// - type: one `WatchdogReadiness` projection per supervision contour —
+///   `authority_state`, `coverage_claimed`, the admitted epoch pair, and
+///   `tick_interval_ms`, plus the new emission timestamp;
+/// - writer: the Watchdog process entrypoint, publishing from this
+///   authority-state cell after the Kernel accepts the corresponding
+///   heartbeat;
+/// - reader: the Host readiness/SCM admission path, which must require
+///   `AdmittedHeartbeat` with `coverage_claimed == true`, the exact
+///   admitted epoch pair, and an emission timestamp within a small multiple
+///   of `tick_interval_ms` — anything else fails closed into the
+///   gap-only signal. Until that transport exists, every supervision claim
+///   that would need it must fail closed.
+///
+/// Field contract the future reader must apply before treating a delivered
+/// projection as coverage:
 /// - `authority_state` / `coverage_claimed`: require `AdmittedHeartbeat` with
 ///   `coverage_claimed == true`. `RunningNoAuthority` is an explicit gap-only
 ///   signal (the SCM sibling is alive but no current Host-issued lease has
@@ -38,7 +63,9 @@ use std::sync::{Arc, RwLock};
 /// Binding a projection to its exact lease (lease identity plus ORS receipt
 /// digest) is owned by the supervision-claim path, not by this shape: the
 /// Host persists a watchdog-branch evidence ref naming the exact admitted
-/// lease id, receipt digest, and epoch from the Kernel-renewed `ORS` snapshot,
+/// lease id, receipt digest, publication digest, and epoch, all derived from
+/// the single Kernel-renewed `ORS` snapshot via the provisioned admission
+/// template (no caller-supplied identity),
 /// the Kernel `ProbeReady` gate enforces exact epoch equality against the
 /// renewed ORS head, publication exactness against the ORS head is verified
 /// at publish time, and governance stays degraded until a proven-ready

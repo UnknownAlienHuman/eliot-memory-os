@@ -6402,6 +6402,10 @@ impl HostComposition {
         let watchdog_template = registry_authority
             .watchdog_admission_template()
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        // The publication bundle is published for its durable side effect
+        // (exact current bundle plus trust-anchor signature verification);
+        // the admitted identity below is derived single-source from the same
+        // Kernel-renewed snapshot, never from this return value.
         let published_supervision = publish_current_watchdog_supervision_bundle(
             self.launch_options.host_state_root(),
             &active.manifest,
@@ -6415,13 +6419,17 @@ impl HostComposition {
                 proof.supervision_lease.record.lease_id.as_str(),
             )
         })?;
-        append_authenticated_kernel_readiness(
+        let (_, admitted_supervision) = append_authenticated_kernel_readiness(
             &self.journal,
             &proof,
             kernel_artifact,
             materialized_config_digest,
-            &published_supervision,
+            &watchdog_template,
         )?;
+        debug_assert_eq!(
+            published_supervision, admitted_supervision,
+            "single-snapshot supervision identity diverged between publication and journal admission"
+        );
         let confirmed = self.current_readiness_contour(
             generation,
             kernel_artifact,
@@ -6430,11 +6438,11 @@ impl HostComposition {
         )?;
         if !confirmed.same_probe_input_contour(&contour)
             || confirmed.store_proof_fence.as_ref() != Some(&proof.store_fence)
-            || confirmed.supervision_lease_id.as_ref() != Some(&published_supervision.lease_id)
+            || confirmed.supervision_lease_id.as_ref() != Some(&admitted_supervision.lease_id)
             || confirmed.supervision_ors_receipt_digest.as_ref()
-                != Some(&published_supervision.ors_receipt_digest)
+                != Some(&admitted_supervision.ors_receipt_digest)
             || confirmed.watchdog_publication_digest.as_ref()
-                != Some(&published_supervision.publication_digest)
+                != Some(&admitted_supervision.publication_digest)
         {
             return Err(HostError::ProcessContour(
                 "readiness contour changed while admitting the proof".to_owned(),
