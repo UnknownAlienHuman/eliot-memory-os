@@ -5285,17 +5285,19 @@ impl HostComposition {
             HostError::ProcessContour("Watchdog registration has no typed bootstrap".to_owned())
         })?;
         let heartbeat_state_root = Path::new(launch.runtime_state_roots.host_state_root.as_str());
-        watchdog_heartbeat::HeartbeatTransportDescriptor::issue(
+        let heartbeat_issued = watchdog_heartbeat::HeartbeatTransportDescriptor::issue(
             heartbeat_bootstrap.installation_id(),
             heartbeat_bootstrap.transaction_plan_generation(),
-        )?
-        .publish(heartbeat_state_root)?;
+        )?;
+        heartbeat_issued.publish(heartbeat_state_root)?;
         start_installed_watchdog(&mut platform, &registration, context)?;
         // Transport1750 step 2: bind the rendezvous to the SCM-verified
         // incarnation now Running. Admission and the writer both pin this
-        // pair, so an unbound start admits nothing and a conflicting bind
-        // fails closed (retry heals: a stopped prior rotates on the next
-        // start).
+        // pair, so an unbound start admits nothing. When publish retained a
+        // live bound prior and this start brought a new SCM process, the
+        // heal path re-resolves: a provably stopped prior rotates to the
+        // issued challenge and binds the new process, while a still-live
+        // owner keeps the rendezvous and the conflict fails closed.
         let scm = match platform.inspect_registration_runtime(&registration) {
             InstalledWatchdogRuntimeInspection::Matching {
                 state,
@@ -5313,7 +5315,8 @@ impl HostComposition {
                 ));
             }
         };
-        watchdog_heartbeat::HeartbeatTransportDescriptor::bind_incarnation(
+        watchdog_heartbeat::HeartbeatTransportDescriptor::bind_incarnation_or_heal(
+            &heartbeat_issued,
             heartbeat_state_root,
             scm.process.process_id,
             scm.process.start_time_100ns,
