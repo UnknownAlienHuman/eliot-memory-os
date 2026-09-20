@@ -1213,8 +1213,7 @@ mod named_read_gateway_tests {
                         },
                     );
                 };
-                let Some(position) =
-                    request.parameters.get("position").and_then(Value::as_str)
+                let Some(position) = request.parameters.get("position").and_then(Value::as_str)
                 else {
                     return self.typed_failure(
                         request_id,
@@ -1594,10 +1593,8 @@ mod named_read_gateway_tests {
     #[tokio::test]
     async fn execute_named_get_current_epistemic_position_proves_identity_and_fence() {
         let position = format!("position-{}", std::process::id());
-        let scratch = std::env::temp_dir().join(format!(
-            "eliot-t11-2-daemon-gateway-{}",
-            std::process::id()
-        ));
+        let scratch =
+            std::env::temp_dir().join(format!("eliot-t11-2-daemon-gateway-{}", std::process::id()));
         std::fs::create_dir_all(&scratch).expect("scratch root creates");
         let captured_path = scratch.join("captured_subjects");
         std::fs::write(&captured_path, "unused\n").expect("capture stages");
@@ -1687,9 +1684,16 @@ mod named_read_gateway_tests {
             parameters: BTreeMap::from([("position".to_owned(), Value::String(position.clone()))]),
         };
         assert!(
-            execute_named_via(&flight, &service, &route, route_epoch.as_ref(), &store, eventual)
-                .await
-                .is_err(),
+            execute_named_via(
+                &flight,
+                &service,
+                &route,
+                route_epoch.as_ref(),
+                &store,
+                eventual
+            )
+            .await
+            .is_err(),
             "non-ExactFence position read must fail closed"
         );
 
@@ -1701,9 +1705,16 @@ mod named_read_gateway_tests {
             parameters: BTreeMap::new(),
         };
         assert!(
-            execute_named_via(&flight, &service, &route, route_epoch.as_ref(), &store, missing)
-                .await
-                .is_err(),
+            execute_named_via(
+                &flight,
+                &service,
+                &route,
+                route_epoch.as_ref(),
+                &store,
+                missing
+            )
+            .await
+            .is_err(),
             "missing position selector must fail closed"
         );
 
@@ -1776,10 +1787,10 @@ mod live_surreal_evidence_pack_e2e {
         StoreReadFailure, TimeScope,
     };
     use eliot_store_api::{
-        EVIDENCE_PACK_MAX_RECORDS, EffectClass,
-        EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
-        NamedReadOperation, OperationId, OperationIdentity, PreparedTransition, ReadConsistency,
-        ScopeId, OrderingScopeId, TransitionClass, WriteReceiptStatus, generated_operation_manifests,
+        EVIDENCE_PACK_MAX_RECORDS, EffectClass, EventProjectionRelationIntents,
+        NamedMutationOperation, NamedMutationRequest, NamedReadOperation, OperationId,
+        OperationIdentity, OrderingScopeId, PreparedTransition, ReadConsistency, ScopeId,
+        TransitionClass, WriteReceiptStatus, generated_operation_manifests,
         operation_manifest_set_digest, sha256_hex,
     };
     use eliot_store_surreal_adapter::{
@@ -1793,10 +1804,8 @@ mod live_surreal_evidence_pack_e2e {
     const PROVIDER_EXE_OVERRIDE_ENV: &str = "ELIOT_T11_SURREAL_EXE";
 
     fn provider_exe() -> PathBuf {
-        std::env::var_os(PROVIDER_EXE_OVERRIDE_ENV).map_or_else(
-            || PathBuf::from(DEFAULT_PROVIDER_EXE),
-            PathBuf::from,
-        )
+        std::env::var_os(PROVIDER_EXE_OVERRIDE_ENV)
+            .map_or_else(|| PathBuf::from(DEFAULT_PROVIDER_EXE), PathBuf::from)
     }
 
     fn live_fence() -> StateFence {
@@ -1918,8 +1927,10 @@ mod live_surreal_evidence_pack_e2e {
         // The suffix keeps parallel tests in one process (same pid) on
         // disjoint roots: sharing a root would let one test's cleanup
         // remove another test's live provider files mid-run.
-        let root = std::env::temp_dir()
-            .join(format!("eliot-t11-live-surreal-{}-{suffix}", std::process::id()));
+        let root = std::env::temp_dir().join(format!(
+            "eliot-t11-live-surreal-{}-{suffix}",
+            std::process::id()
+        ));
         let data = root.join("data");
         let work = root.join("work");
         let tmp = root.join("tmp");
@@ -1977,13 +1988,10 @@ mod live_surreal_evidence_pack_e2e {
             .expect("bootstrap provider spawns");
         let mut bound = false;
         for _ in 0..300 {
-            if child
-                .try_wait()
-                .expect("bootstrap child polls")
-                .is_some()
-            {
-                panic!("bootstrap provider exited before binding {bind}");
-            }
+            assert!(
+                child.try_wait().expect("bootstrap child polls").is_none(),
+                "bootstrap provider exited before binding {bind}"
+            );
             if matches!(
                 tokio::time::timeout(
                     Duration::from_millis(200),
@@ -2227,7 +2235,10 @@ mod live_surreal_evidence_pack_e2e {
             .expect("v2 baseline migrates");
         assert!(
             matches!(
-                adapter.probe_readiness().await.expect("readiness re-probes"),
+                adapter
+                    .probe_readiness()
+                    .await
+                    .expect("readiness re-probes"),
                 SemanticReadiness::Ready { .. }
             ),
             "the migrated provider must observe Ready before capture"
@@ -2307,9 +2318,7 @@ mod live_surreal_evidence_pack_e2e {
             .await;
         match fenced {
             Err(ReadError::Store(StoreReadFailure::FenceMismatch)) => {}
-            other => panic!(
-                "wrong fence must fail closed with FenceMismatch, observed: {other:?}"
-            ),
+            other => panic!("wrong fence must fail closed with FenceMismatch, observed: {other:?}"),
         }
 
         // Acceptance negative: exceeding the declared bound must not return
@@ -2317,7 +2326,11 @@ mod live_surreal_evidence_pack_e2e {
         let over_bound = service
             .query(
                 &live_context(&fence, &format!("query-over-bound-{tag}")),
-                live_query(&scope, &subject, &(EVIDENCE_PACK_MAX_RECORDS + 1).to_string()),
+                live_query(
+                    &scope,
+                    &subject,
+                    &(EVIDENCE_PACK_MAX_RECORDS + 1).to_string(),
+                ),
             )
             .await;
         match over_bound {
