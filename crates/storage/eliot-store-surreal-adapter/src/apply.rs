@@ -701,6 +701,9 @@ pub(crate) async fn apply_prepared_without_write_guard(
     expected_ordering_heads: Vec<eliot_store_api::OrderingHeadExpectation>,
     authorities: &[Option<ExactJsonBytes>],
 ) -> Result<WriteReceipt, AdapterError> {
+    // 688-B's pooled proof path deliberately leaves normal allocation
+    // unguarded; fence and head predicates in the canonical transaction
+    // remain the concurrency authority.
     validate_transition(ctx, &transition)?;
 
     let db = client(adapter).await?;
