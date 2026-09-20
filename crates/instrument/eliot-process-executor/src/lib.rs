@@ -13,10 +13,10 @@
 use eliot_instrument_api::EvidenceAxes;
 use eliot_process::{
     CancellationReceipt, CancellationRequest, ContractError, DescendantEvidence,
-    EnvironmentInheritance, EnvironmentProjection, ExitDisposition, ExitStatus, ImageId, JobId, OperationId, PhysicalProcessBinding, ProcessEvidence,
-    ProcessEvidenceSink, ProcessExecutionBinding, ProcessExecutionError, ProcessExecutionView,
-    ProcessExecutor, ProcessHealth, ProcessHealthStatus, ProcessId, ProcessIntent,
-    ProcessLaunchAdmission,
+    EnvironmentInheritance, EnvironmentProjection, ExitDisposition, ExitStatus, ImageId, JobId,
+    OperationId, PhysicalProcessBinding, ProcessEvidence, ProcessEvidenceSink,
+    ProcessExecutionBinding, ProcessExecutionError, ProcessExecutionView, ProcessExecutor,
+    ProcessHealth, ProcessHealthStatus, ProcessId, ProcessIntent, ProcessLaunchAdmission,
     ProcessLifecycle, ProcessRequest, ProcessStartReceipt, ProcessState,
     ProcessStreamDigestAlgorithm, ProcessStreamEvidence, ProcessStreamKind,
     ProcessStreamPolicyBinding, ProcessStreamPrefixPreview, ProcessStreamSinkAbortReason,
@@ -3948,9 +3948,8 @@ impl std::error::Error for ExecutableIdentityError {}
 impl From<ExecutableIdentityError> for ProcessExecutionError {
     fn from(error: ExecutableIdentityError) -> Self {
         match error {
-            ExecutableIdentityError::Missing { .. } | ExecutableIdentityError::Unreadable { .. } => {
-                Self::Unavailable(error.to_string())
-            }
+            ExecutableIdentityError::Missing { .. }
+            | ExecutableIdentityError::Unreadable { .. } => Self::Unavailable(error.to_string()),
             _ => Self::UnknownOutcome,
         }
     }
@@ -3981,7 +3980,9 @@ impl ExecutableObservation {
         }
         let canonical = std::fs::canonicalize(path).map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
-                ExecutableIdentityError::Missing { path: display.clone() }
+                ExecutableIdentityError::Missing {
+                    path: display.clone(),
+                }
             } else {
                 ExecutableIdentityError::Unreadable {
                     path: display.clone(),
@@ -3991,7 +3992,9 @@ impl ExecutableObservation {
         })?;
         let content_digest = sha256_file(&canonical).map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
-                ExecutableIdentityError::Missing { path: display.clone() }
+                ExecutableIdentityError::Missing {
+                    path: display.clone(),
+                }
             } else {
                 ExecutableIdentityError::Unreadable {
                     path: display.clone(),

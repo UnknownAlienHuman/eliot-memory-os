@@ -570,10 +570,7 @@ impl RegistryEntry {
             } else {
                 ExecutableIdentityCause::InvalidPath
             };
-            return Err(RegistryError::UnresolvedExecutable {
-                instrument,
-                reason,
-            });
+            return Err(RegistryError::UnresolvedExecutable { instrument, reason });
         }
         let Some(expected) = self.executable.executable.as_deref() else {
             return Err(RegistryError::UnresolvedExecutable {
@@ -1194,10 +1191,7 @@ mod tests {
         let mut after = before.clone();
         after.content_digest = "c".repeat(64);
         assert_ne!(before.identity_digest(), after.identity_digest());
-        assert_eq!(
-            before.identity_digest(),
-            before.clone().identity_digest()
-        );
+        assert_eq!(before.identity_digest(), before.clone().identity_digest());
         assert!(before.is_complete());
     }
 
@@ -1244,10 +1238,11 @@ mod tests {
             "normative".to_owned(),
             &fingerprints,
         ));
-        let invocation = test_invocation(RUSTC_INSTRUMENT, InstrumentKind::Build, vec![
-            "--crate-name".to_owned(),
-            "foo".to_owned(),
-        ]);
+        let invocation = test_invocation(
+            RUSTC_INSTRUMENT,
+            InstrumentKind::Build,
+            vec!["--crate-name".to_owned(), "foo".to_owned()],
+        );
         let Ok(entry) = registry.resolve(&invocation) else {
             unreachable!()
         };

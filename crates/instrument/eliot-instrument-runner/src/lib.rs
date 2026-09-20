@@ -187,17 +187,19 @@ impl InstrumentBinding {
                 "registry entry does not support the invocation kind".to_owned(),
             ));
         }
-        entry.check_resolved_executable(resolved).map_err(|error| match error {
-            RegistryError::UnresolvedExecutable { reason, .. } => {
-                RunnerError::UnresolvedExecutable(reason.to_string())
-            }
-            RegistryError::ExecutableMismatch {
-                expected, observed, ..
-            } => RunnerError::ExecutableMismatch(format!(
-                "expected '{expected}', observed '{observed}'"
-            )),
-            other => RunnerError::EntryMismatch(other.to_string()),
-        })?;
+        entry
+            .check_resolved_executable(resolved)
+            .map_err(|error| match error {
+                RegistryError::UnresolvedExecutable { reason, .. } => {
+                    RunnerError::UnresolvedExecutable(reason.to_string())
+                }
+                RegistryError::ExecutableMismatch {
+                    expected, observed, ..
+                } => RunnerError::ExecutableMismatch(format!(
+                    "expected '{expected}', observed '{observed}'"
+                )),
+                other => RunnerError::EntryMismatch(other.to_string()),
+            })?;
         if resolved.is_some_and(|observation| !observation.binds_invocation(&self.invocation)) {
             return Err(RunnerError::ExecutableMismatch(
                 "observed arguments do not match the admitted invocation".to_owned(),
@@ -566,8 +568,11 @@ mod tests {
             profile: "profile".to_owned(),
             parser: "parser".to_owned(),
         };
-        let registry =
-            unreachable_value(ProviderRegistry::ready(7, "normative".to_owned(), &fingerprints));
+        let registry = unreachable_value(ProviderRegistry::ready(
+            7,
+            "normative".to_owned(),
+            &fingerprints,
+        ));
         let invocation = test_invocation(vec!["--crate-name".to_owned(), "foo".to_owned()]);
         match registry.resolve(&invocation) {
             Ok(entry) => entry.clone(),
