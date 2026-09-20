@@ -12,10 +12,11 @@
 
 use eliot_instrument_api::EvidenceAxes;
 use eliot_process::{
-    CancellationReceipt, CancellationRequest, ContractError, DescendantEvidence, ExitDisposition,
-    ExitStatus, ImageId, JobId, OperationId, PhysicalProcessBinding, ProcessEvidence,
+    CancellationReceipt, CancellationRequest, ContractError, DescendantEvidence,
+    EnvironmentInheritance, EnvironmentProjection, ExitDisposition, ExitStatus, ImageId, JobId, OperationId, PhysicalProcessBinding, ProcessEvidence,
     ProcessEvidenceSink, ProcessExecutionBinding, ProcessExecutionError, ProcessExecutionView,
-    ProcessExecutor, ProcessHealth, ProcessHealthStatus, ProcessId, ProcessLaunchAdmission,
+    ProcessExecutor, ProcessHealth, ProcessHealthStatus, ProcessId, ProcessIntent,
+    ProcessLaunchAdmission,
     ProcessLifecycle, ProcessRequest, ProcessStartReceipt, ProcessState,
     ProcessStreamDigestAlgorithm, ProcessStreamEvidence, ProcessStreamKind,
     ProcessStreamPolicyBinding, ProcessStreamPrefixPreview, ProcessStreamSinkAbortReason,
@@ -31,7 +32,7 @@ use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::io::Read as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
@@ -3858,6 +3859,364 @@ pub fn empty_sha256_hex() -> String {
     short_digest(&[])
 }
 
+/// Machine-derived executable observation bound to one launch (issue #1805).
+///
+/// This is the executor-side counterpart of the runner's
+/// `ResolvedExecutableIdentity`: canonical path, content digest, tool
+/// version, environment projection digest, and exact arguments, all resolved
+/// from the machine instead of caller attestation. A result that carries no
+/// complete observation stays `UNKNOWN` and can never take authoritative
+/// PASS; a replaced executable changes the content digest, so an earlier
+/// result is never silently rebound.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutableObservation {
+    /// Canonical filesystem path of the observed executable.
+    pub canonical_path: String,
+    /// Lowercase SHA-256 hex over the exact executable bytes.
+    pub content_digest: String,
+    /// Observed tool version text, or `None` when unobservable.
+    pub tool_version: Option<String>,
+    /// Lowercase SHA-256 hex over the resolved environment projection.
+    pub environment_digest: String,
+    /// Exact arguments handed to the executable.
+    pub arguments: Vec<String>,
+}
+
+/// Failures resolving or verifying a machine-derived executable observation.
+///
+/// Every variant fails closed: the launch or the authoritative verdict is
+/// refused instead of degrading into an unattributed success.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExecutableIdentityError {
+    /// The executable path does not exist.
+    Missing {
+        /// Requested executable path.
+        path: String,
+    },
+    /// The executable path cannot be canonicalized or read.
+    Unreadable {
+        /// Requested executable path.
+        path: String,
+        /// Operating-system reason text (evidence, never control flow).
+        reason: String,
+    },
+    /// A digest value is not a lowercase SHA-256 digest.
+    InvalidDigest {
+        /// Rejected digest text.
+        value: String,
+    },
+    /// The file digest no longer equals the admitted intent digest: the
+    /// executable was replaced after admission and must not be rebound.
+    DigestMismatch {
+        /// Digest sealed in the admitted intent.
+        expected: String,
+        /// Digest observed on the machine.
+        observed: String,
+    },
+    /// No tool version was observed for the executable.
+    MissingVersion,
+    /// The environment projection identity is missing or malformed.
+    UnknownEnvironment,
+    /// The canonical path is blank or carries control characters.
+    InvalidPath {
+        /// Rejected path text.
+        value: String,
+    },
+}
+
+impl std::fmt::Display for ExecutableIdentityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing { path } => write!(f, "executable not found: {path}"),
+            Self::Unreadable { path, reason } => {
+                write!(f, "executable unreadable: {path}: {reason}")
+            }
+            Self::InvalidDigest { value } => write!(f, "invalid executable digest: {value}"),
+            Self::DigestMismatch { expected, observed } => write!(
+                f,
+                "executable digest mismatch: expected {expected}, observed {observed}"
+            ),
+            Self::MissingVersion => f.write_str("missing executable tool version"),
+            Self::UnknownEnvironment => f.write_str("unknown environment projection"),
+            Self::InvalidPath { value } => write!(f, "invalid executable path: {value}"),
+        }
+    }
+}
+
+impl std::error::Error for ExecutableIdentityError {}
+
+impl From<ExecutableIdentityError> for ProcessExecutionError {
+    fn from(error: ExecutableIdentityError) -> Self {
+        match error {
+            ExecutableIdentityError::Missing { .. } | ExecutableIdentityError::Unreadable { .. } => {
+                Self::Unavailable(error.to_string())
+            }
+            _ => Self::UnknownOutcome,
+        }
+    }
+}
+
+impl ExecutableObservation {
+    /// Resolves one observation from a filesystem path.
+    ///
+    /// The path is canonicalized, the file bytes are hashed, and the exact
+    /// arguments, environment digest, and tool version are recorded. A
+    /// missing or unreadable file, a malformed digest, or a blank version
+    /// fails closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecutableIdentityError`] when the path is missing,
+    /// unreadable, or malformed, or when the environment digest or version
+    /// is not usable.
+    pub fn observe_at_path(
+        path: &Path,
+        arguments: Vec<String>,
+        environment_digest: String,
+        tool_version: Option<String>,
+    ) -> Result<Self, ExecutableIdentityError> {
+        let display = path.to_string_lossy().into_owned();
+        if display.trim().is_empty() || display.chars().any(char::is_control) {
+            return Err(ExecutableIdentityError::InvalidPath { value: display });
+        }
+        let canonical = std::fs::canonicalize(path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                ExecutableIdentityError::Missing { path: display.clone() }
+            } else {
+                ExecutableIdentityError::Unreadable {
+                    path: display.clone(),
+                    reason: error.to_string(),
+                }
+            }
+        })?;
+        let content_digest = sha256_file(&canonical).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                ExecutableIdentityError::Missing { path: display.clone() }
+            } else {
+                ExecutableIdentityError::Unreadable {
+                    path: display.clone(),
+                    reason: error.to_string(),
+                }
+            }
+        })?;
+        Self::from_parts(
+            canonical.to_string_lossy().into_owned(),
+            content_digest,
+            tool_version,
+            environment_digest,
+            arguments,
+        )
+    }
+
+    /// Resolves one observation from an admitted intent plus an observed
+    /// tool version.
+    ///
+    /// The executable file is re-hashed from the machine and must equal the
+    /// digest sealed in the intent; a replacement between admission and
+    /// launch fails closed with [`ExecutableIdentityError::DigestMismatch`]
+    /// instead of silently rebinding the earlier admission.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecutableIdentityError`] when the file is missing,
+    /// unreadable, replaced, or when the version is absent.
+    pub fn observe_from_intent(
+        intent: &ProcessIntent,
+        tool_version: Option<String>,
+    ) -> Result<Self, ExecutableIdentityError> {
+        let observation = Self::observe_at_path(
+            Path::new(intent.executable()),
+            intent.argv().to_vec(),
+            environment_projection_digest(intent.environment()),
+            tool_version,
+        )?;
+        if observation.content_digest != intent.executable_sha256() {
+            return Err(ExecutableIdentityError::DigestMismatch {
+                expected: intent.executable_sha256().to_owned(),
+                observed: observation.content_digest,
+            });
+        }
+        Ok(observation)
+    }
+
+    /// Re-verifies this observation against an admitted intent at evidence
+    /// time.
+    ///
+    /// The executable file is re-hashed: a replacement after launch fails
+    /// closed instead of rebinding the earlier result. Arguments and the
+    /// environment projection must still match exactly.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecutableIdentityError`] when the file moved, changed, or
+    /// no longer matches the intent.
+    pub fn verify_against_intent(
+        &self,
+        intent: &ProcessIntent,
+    ) -> Result<(), ExecutableIdentityError> {
+        let current = Self::observe_at_path(
+            Path::new(&self.canonical_path),
+            self.arguments.clone(),
+            self.environment_digest.clone(),
+            self.tool_version.clone(),
+        )?;
+        if current.content_digest != intent.executable_sha256()
+            || self.content_digest != intent.executable_sha256()
+        {
+            return Err(ExecutableIdentityError::DigestMismatch {
+                expected: intent.executable_sha256().to_owned(),
+                observed: current.content_digest,
+            });
+        }
+        if self.arguments != intent.argv() {
+            return Err(ExecutableIdentityError::Unreadable {
+                path: self.canonical_path.clone(),
+                reason: "arguments no longer match the admitted intent".to_owned(),
+            });
+        }
+        if self.environment_digest != environment_projection_digest(intent.environment()) {
+            return Err(ExecutableIdentityError::UnknownEnvironment);
+        }
+        Ok(())
+    }
+
+    /// Whether the observation is complete enough for authoritative PASS.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        !self.canonical_path.trim().is_empty()
+            && is_executable_digest(&self.content_digest)
+            && self
+                .tool_version
+                .as_ref()
+                .is_some_and(|version| !version.trim().is_empty())
+            && is_executable_digest(&self.environment_digest)
+    }
+
+    /// Deterministic identity over path, digest, version, environment, and
+    /// arguments.
+    ///
+    /// Replacing the tool executable between two otherwise identical
+    /// invocations changes the content digest and therefore this identity.
+    #[must_use]
+    pub fn identity_key(&self) -> String {
+        let version = self.tool_version.as_deref().unwrap_or("");
+        let material = format!(
+            "{}\0{}\0{}\0{}\0{}",
+            self.canonical_path,
+            self.content_digest,
+            version,
+            self.environment_digest,
+            self.arguments.join("\0")
+        );
+        short_digest(material.as_bytes())
+    }
+
+    fn from_parts(
+        canonical_path: String,
+        content_digest: String,
+        tool_version: Option<String>,
+        environment_digest: String,
+        arguments: Vec<String>,
+    ) -> Result<Self, ExecutableIdentityError> {
+        if canonical_path.trim().is_empty() || canonical_path.chars().any(char::is_control) {
+            return Err(ExecutableIdentityError::InvalidPath {
+                value: canonical_path,
+            });
+        }
+        if !is_executable_digest(&content_digest) {
+            return Err(ExecutableIdentityError::InvalidDigest {
+                value: content_digest,
+            });
+        }
+        if !is_executable_digest(&environment_digest) {
+            return Err(ExecutableIdentityError::UnknownEnvironment);
+        }
+        if tool_version.as_ref().is_some_and(|version| {
+            version.trim().is_empty() || version.chars().any(char::is_control)
+        }) {
+            return Err(ExecutableIdentityError::MissingVersion);
+        }
+        if arguments
+            .iter()
+            .any(|argument| argument.chars().any(char::is_control))
+        {
+            return Err(ExecutableIdentityError::InvalidPath {
+                value: arguments.join(" "),
+            });
+        }
+        Ok(Self {
+            canonical_path,
+            content_digest,
+            tool_version,
+            environment_digest,
+            arguments,
+        })
+    }
+}
+
+/// Whether `value` is a lowercase SHA-256 hex digest.
+fn is_executable_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Deterministic machine-derived identity over a resolved environment
+/// projection.
+///
+/// The non-secret map iterates in sorted key order, followed by the
+/// inheritance policy and the opaque secret references (provider/key only,
+/// never secret material), hashed to lowercase SHA-256 hex.
+#[must_use]
+pub fn environment_projection_digest(environment: &EnvironmentProjection) -> String {
+    let mut material = String::new();
+    for (name, value) in environment.non_secret() {
+        material.push_str(name);
+        material.push('\0');
+        material.push_str(value);
+        material.push('\0');
+    }
+    material.push_str(match environment.inheritance() {
+        EnvironmentInheritance::None => "none",
+        EnvironmentInheritance::Allowlisted => "allowlisted",
+    });
+    material.push('\0');
+    for reference in environment.secret_refs() {
+        material.push_str(reference.provider());
+        material.push('\0');
+        material.push_str(reference.key());
+        material.push('\0');
+    }
+    short_digest(material.as_bytes())
+}
+
+/// Resolves an executable name through the process `PATH`.
+///
+/// A value containing a path separator is returned as-is; otherwise each
+/// `PATH` entry is probed for the name (plus the `.exe` extension on
+/// Windows). Returns `None` when no candidate exists.
+#[must_use]
+pub fn resolve_executable_in_path(name: &str) -> Option<PathBuf> {
+    if name.trim().is_empty() || name.chars().any(char::is_control) {
+        return None;
+    }
+    if name.contains('/') || name.contains('\\') {
+        return Some(PathBuf::from(name));
+    }
+    let mut candidates = vec![name.to_owned()];
+    #[cfg(windows)]
+    candidates.push(format!("{name}.exe"));
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths).find_map(|directory| {
+            candidates.iter().find_map(|candidate| {
+                let probe = directory.join(candidate);
+                probe.is_file().then_some(probe)
+            })
+        })
+    })
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -7477,6 +7836,73 @@ mod tests {
             terminal_sha.as_str()
         );
         assert_eq!(fake.terminal_count(), 1);
+        Ok(())
+    }
+
+    /// Issue #1805: machine-derived observation detects executable
+    /// replacement. Two otherwise identical resolutions yield different
+    /// digests and identity keys, so an earlier result is never silently
+    /// rebound to later bytes.
+    #[test]
+    fn observed_executable_replacement_changes_identity() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let dir = std::env::temp_dir().join(format!("eliot-exec-identity-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let tool = dir.join("tool-observed-replacement.bin");
+        std::fs::write(&tool, b"tool-bytes-v1")?;
+        let environment = "a".repeat(64);
+        let before = super::ExecutableObservation::observe_at_path(
+            &tool,
+            vec!["--locked".to_owned()],
+            environment.clone(),
+            Some("1.2.3".to_owned()),
+        )?;
+        assert!(before.is_complete());
+        std::fs::write(&tool, b"tool-bytes-v2")?;
+        let after = super::ExecutableObservation::observe_at_path(
+            &tool,
+            vec!["--locked".to_owned()],
+            environment,
+            Some("1.2.3".to_owned()),
+        )?;
+        assert_ne!(before.content_digest, after.content_digest);
+        assert_ne!(before.identity_key(), after.identity_key());
+        std::fs::remove_file(&tool)?;
+        Ok(())
+    }
+
+    /// Issue #1805: executor-side identity gaps fail closed. A missing file
+    /// reports `Missing`, a malformed environment digest reports
+    /// `UnknownEnvironment`, and an unobserved version keeps the observation
+    /// incomplete, so no authoritative PASS can follow.
+    #[test]
+    fn observed_executable_gaps_fail_closed() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = std::env::temp_dir().join(format!("eliot-exec-identity-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        assert!(matches!(
+            super::ExecutableObservation::observe_at_path(
+                &dir.join("absent-observed-tool.bin"),
+                Vec::new(),
+                "b".repeat(64),
+                Some("1.0.0".to_owned()),
+            ),
+            Err(super::ExecutableIdentityError::Missing { .. })
+        ));
+        let tool = dir.join("tool-observed-gaps.bin");
+        std::fs::write(&tool, b"tool-bytes-gap")?;
+        assert!(matches!(
+            super::ExecutableObservation::observe_at_path(
+                &tool,
+                Vec::new(),
+                "not-a-digest".to_owned(),
+                Some("1.0.0".to_owned()),
+            ),
+            Err(super::ExecutableIdentityError::UnknownEnvironment)
+        ));
+        let unversioned =
+            super::ExecutableObservation::observe_at_path(&tool, Vec::new(), "c".repeat(64), None)?;
+        assert!(!unversioned.is_complete());
+        std::fs::remove_file(&tool)?;
         Ok(())
     }
 }

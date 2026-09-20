@@ -10,10 +10,11 @@
 //! The registry composes behind the Testd admission boundary owned by issue
 //! #20. It never spawns a process, admits work to Testd, schedules a task,
 //! writes canonical state, or decides verification. Raw evidence retention,
-//! live dispatch, real fixtures, timeout/cancel/cleanup behavior, live cache
-//! binding, and per-executable digest pinning are follow-up work owned by
-//! later slices; this slice records identities and rejects stale,
-//! unsupported, missing, duplicate, and ambiguous mappings.
+//! live dispatch, real fixtures, timeout/cancel/cleanup behavior, and live
+//! cache binding are follow-up work owned by later slices; this slice records
+//! identities, pins machine-derived per-executable observations through
+//! [`ResolvedExecutableIdentity`], and rejects stale, unsupported, missing,
+//! duplicate, ambiguous, and identity-mismatched mappings.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -111,6 +112,33 @@ pub enum RegistryError {
     /// a successful resolution.
     #[error(transparent)]
     Contract(#[from] ContractError),
+    /// No machine-derived executable observation is bound to a process entry.
+    ///
+    /// A process result without a complete [`ResolvedExecutableIdentity`]
+    /// can never take authoritative PASS; it stays `UNKNOWN`.
+    #[error("no machine-derived executable identity for instrument '{instrument}': {reason}")]
+    UnresolvedExecutable {
+        /// Instrument contract name of the entry that requires an identity.
+        instrument: String,
+        /// Exact cause of the missing identity.
+        reason: ExecutableIdentityCause,
+    },
+    /// A machine-derived observation does not match the registry binding.
+    ///
+    /// A replaced executable (or a decoder-only entry handed a launch
+    /// identity) produces a different identity; the earlier result is never
+    /// silently rebound and authoritative PASS is refused.
+    #[error(
+        "executable identity mismatch for instrument '{instrument}': expected '{expected}', observed '{observed}'"
+    )]
+    ExecutableMismatch {
+        /// Instrument contract name of the entry that was checked.
+        instrument: String,
+        /// Registry-bound expectation.
+        expected: String,
+        /// Machine-derived observation.
+        observed: String,
+    },
 }
 
 /// Exact cause of a [`RegistryError::Stale`] rejection.
@@ -133,6 +161,30 @@ pub enum StaleReason {
         /// Fingerprint slot that moved.
         field: FingerprintField,
     },
+}
+
+/// Exact cause of a missing machine-derived executable identity.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum ExecutableIdentityCause {
+    /// No resolved observation was supplied for a process entry.
+    #[error("missing resolved executable observation")]
+    Missing,
+    /// The canonical path is blank or carries control characters.
+    #[error("invalid canonical path")]
+    InvalidPath,
+    /// The content digest is not a lowercase SHA-256 digest.
+    #[error("invalid content digest")]
+    InvalidDigest,
+    /// No tool version was observed for the executable.
+    #[error("missing tool version")]
+    MissingVersion,
+    /// The environment projection identity is blank or not a digest.
+    #[error("unknown environment projection")]
+    UnknownEnvironment,
+    /// A decoder-only entry was handed an executable observation and must
+    /// never launch a process.
+    #[error("decoder-only entry must not resolve an executable")]
+    DecoderMustNotResolve,
 }
 
 /// One slot of the [`InvalidationSet`] that can force a stale rejection.
@@ -172,9 +224,10 @@ impl fmt::Display for FingerprintField {
 ///
 /// Values are attested by the composition root and passed in; the registry
 /// never reads files at runtime. Any slot that moves afterwards makes the
-/// entry stale through [`ProviderRegistry::resolve_current`]. Per-executable
-/// digest pinning keeps placeholder values until the owning environment
-/// authority publishes exact digests (follow-up work).
+/// entry stale through [`ProviderRegistry::resolve_current`]. Exact
+/// per-executable digests are additionally pinned per result through
+/// [`ResolvedExecutableIdentity`], so a replaced executable yields a
+/// different identity instead of silently rebinding an earlier result.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InvalidationSet {
     /// Source snapshot fingerprint.
@@ -270,6 +323,146 @@ impl ExecutableIdentity {
     }
 }
 
+/// Machine-derived executable observation bound to one instrument result.
+///
+/// Unlike [`ExecutableIdentity`], which records the admission-time
+/// acquisition rule, this record is resolved from the machine at launch:
+/// canonical path, content digest, tool version, environment projection
+/// identity, and exact invocation arguments. Every governed profile result
+/// carries one; a result without a complete observation can never take
+/// authoritative PASS, and a replaced executable yields a different
+/// [`ResolvedExecutableIdentity::identity_digest`] so the earlier result is
+/// never silently rebound.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedExecutableIdentity {
+    /// Canonical filesystem path of the launched executable.
+    pub canonical_path: String,
+    /// Lowercase SHA-256 hex over the exact executable bytes.
+    pub content_digest: String,
+    /// Observed tool version text, or `None` when unobservable.
+    pub tool_version: Option<String>,
+    /// Lowercase SHA-256 hex over the resolved environment projection.
+    pub environment_digest: String,
+    /// Exact invocation arguments handed to the executable.
+    pub arguments: Vec<String>,
+}
+
+impl ResolvedExecutableIdentity {
+    /// Records one machine-derived observation, validating every field.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError::UnresolvedExecutable`] when the path, digest,
+    /// environment identity, version text, or an argument is malformed.
+    pub fn new(
+        canonical_path: String,
+        content_digest: String,
+        tool_version: Option<String>,
+        environment_digest: String,
+        arguments: Vec<String>,
+    ) -> Result<Self, RegistryError> {
+        if canonical_path.trim().is_empty() || canonical_path.chars().any(char::is_control) {
+            return Err(RegistryError::UnresolvedExecutable {
+                instrument: String::new(),
+                reason: ExecutableIdentityCause::InvalidPath,
+            });
+        }
+        if !is_lower_hex_digest(&content_digest) {
+            return Err(RegistryError::UnresolvedExecutable {
+                instrument: String::new(),
+                reason: ExecutableIdentityCause::InvalidDigest,
+            });
+        }
+        if !is_lower_hex_digest(&environment_digest) {
+            return Err(RegistryError::UnresolvedExecutable {
+                instrument: String::new(),
+                reason: ExecutableIdentityCause::UnknownEnvironment,
+            });
+        }
+        if tool_version.as_ref().is_some_and(|version| {
+            version.trim().is_empty() || version.chars().any(char::is_control)
+        }) {
+            return Err(RegistryError::UnresolvedExecutable {
+                instrument: String::new(),
+                reason: ExecutableIdentityCause::MissingVersion,
+            });
+        }
+        if arguments
+            .iter()
+            .any(|argument| argument.chars().any(char::is_control))
+        {
+            return Err(RegistryError::UnresolvedExecutable {
+                instrument: String::new(),
+                reason: ExecutableIdentityCause::InvalidPath,
+            });
+        }
+        Ok(Self {
+            canonical_path,
+            content_digest,
+            tool_version,
+            environment_digest,
+            arguments,
+        })
+    }
+
+    /// Whether the observation is complete enough for authoritative PASS.
+    ///
+    /// Completeness requires a non-blank path, a valid content digest, an
+    /// observed (non-blank) tool version, and a valid environment digest.
+    /// A missing version keeps the result `UNKNOWN`, never PASS.
+    pub fn is_complete(&self) -> bool {
+        !self.canonical_path.trim().is_empty()
+            && is_lower_hex_digest(&self.content_digest)
+            && self
+                .tool_version
+                .as_ref()
+                .is_some_and(|version| !version.trim().is_empty())
+            && is_lower_hex_digest(&self.environment_digest)
+    }
+
+    /// Deterministic identity over path, digest, version, environment, and
+    /// arguments.
+    ///
+    /// Replacing the tool executable between two otherwise identical
+    /// invocations changes the content digest and therefore this identity.
+    pub fn identity_digest(&self) -> String {
+        let version = self.tool_version.as_deref().unwrap_or("");
+        let material = format!(
+            "{}\0{}\0{}\0{}\0{}",
+            self.canonical_path,
+            self.content_digest,
+            version,
+            self.environment_digest,
+            self.arguments.join("\0")
+        );
+        eliot_contracts::sha256_hex(material.as_bytes())
+    }
+
+    /// Whether the observed arguments equal the admitted invocation arguments.
+    pub fn binds_invocation(&self, invocation: &InstrumentInvocation) -> bool {
+        self.arguments == invocation.arguments
+    }
+
+    /// File name of the canonical path, lowercased without an `.exe` suffix.
+    pub fn executable_file_name(&self) -> String {
+        let tail = self
+            .canonical_path
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(self.canonical_path.as_str());
+        let lower = tail.to_ascii_lowercase();
+        lower.strip_suffix(".exe").unwrap_or(&lower).to_owned()
+    }
+}
+
+/// Whether `value` is a lowercase SHA-256 hex digest.
+fn is_lower_hex_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 /// One immutable provider binding: profile to adapter, executable,
 /// environment, evidence pipeline, and invalidation set.
 ///
@@ -327,6 +520,75 @@ impl RegistryEntry {
     /// Registry key: the admitted instrument contract name.
     pub fn instrument_key(&self) -> &str {
         self.instrument.as_str()
+    }
+
+    /// Pins a machine-derived observation to this entry before launch.
+    ///
+    /// Decoder-only entries reject any observation (they must never launch
+    /// a process). Process entries require a complete observation whose
+    /// executable file name matches the registry-bound executable; a missing,
+    /// incomplete, or renamed executable fails closed so the result can never
+    /// take authoritative PASS.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError::UnresolvedExecutable`] when the observation
+    /// is missing or incomplete, or [`RegistryError::ExecutableMismatch`]
+    /// when it names a different executable or reaches a decoder-only entry.
+    pub fn check_resolved_executable(
+        &self,
+        resolved: Option<&ResolvedExecutableIdentity>,
+    ) -> Result<(), RegistryError> {
+        let instrument = self.instrument.as_str().to_owned();
+        if self.executable.is_decoder_only() {
+            if let Some(observation) = resolved {
+                return Err(RegistryError::ExecutableMismatch {
+                    instrument,
+                    expected: "decoder-only: no executable".to_owned(),
+                    observed: observation.canonical_path.clone(),
+                });
+            }
+            return Ok(());
+        }
+        let Some(observation) = resolved else {
+            return Err(RegistryError::UnresolvedExecutable {
+                instrument,
+                reason: ExecutableIdentityCause::Missing,
+            });
+        };
+        if !observation.is_complete() {
+            let reason = if !is_lower_hex_digest(&observation.content_digest) {
+                ExecutableIdentityCause::InvalidDigest
+            } else if observation
+                .tool_version
+                .as_ref()
+                .is_none_or(|version| version.trim().is_empty())
+            {
+                ExecutableIdentityCause::MissingVersion
+            } else if !is_lower_hex_digest(&observation.environment_digest) {
+                ExecutableIdentityCause::UnknownEnvironment
+            } else {
+                ExecutableIdentityCause::InvalidPath
+            };
+            return Err(RegistryError::UnresolvedExecutable {
+                instrument,
+                reason,
+            });
+        }
+        let Some(expected) = self.executable.executable.as_deref() else {
+            return Err(RegistryError::UnresolvedExecutable {
+                instrument,
+                reason: ExecutableIdentityCause::Missing,
+            });
+        };
+        if observation.executable_file_name() != expected.to_ascii_lowercase() {
+            return Err(RegistryError::ExecutableMismatch {
+                instrument,
+                expected: expected.to_owned(),
+                observed: observation.canonical_path.clone(),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -847,4 +1109,197 @@ fn dotnet_entry(
         invalidation: fingerprints.clone(),
         generation,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eliot_contracts::{
+        ClockReading, EpochId, EpochLineageId, ProductId, RequestId, RequestMetadata, SourceId,
+        StateFence,
+    };
+    use std::num::NonZeroU64;
+
+    const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn unreachable_id<T>(result: Result<T, impl std::fmt::Debug>) -> T {
+        match result {
+            Ok(value) => value,
+            Err(_) => unreachable!(),
+        }
+    }
+
+    fn test_invocation(
+        instrument: &str,
+        kind: InstrumentKind,
+        arguments: Vec<String>,
+    ) -> InstrumentInvocation {
+        let lineage = unreachable_id(EpochLineageId::new(TEST_LINEAGE_A));
+        let epoch = unreachable_id(EpochId::new(
+            lineage,
+            NonZeroU64::new(1).unwrap_or_else(|| unreachable!()),
+        ));
+        let clock = ClockReading {
+            valid_time_ms: Some(10),
+            known_time_ms: Some(11),
+            transaction_sequence: None,
+            monotonic_ns: Some(1),
+        };
+        InstrumentInvocation {
+            request: RequestMetadata {
+                request_id: unreachable_id(RequestId::new("instrument-request-1")),
+                session_id: None,
+                task_id: None,
+                product_id: unreachable_id(ProductId::new("product-1")),
+                source_id: unreachable_id(SourceId::new("source-1")),
+                state_fence: StateFence::new(epoch, eliot_contracts::ResourceGeneration::genesis()),
+                clock,
+            },
+            instrument: unreachable_id(ContractId::new(instrument)),
+            kind,
+            profile: "dev-fast".to_owned(),
+            target: "worktree:a04".to_owned(),
+            arguments,
+            input_artifacts: Vec::new(),
+            declared_scope: "workspace".to_owned(),
+            requested_at: clock,
+        }
+    }
+
+    fn test_fingerprints() -> InvalidationSet {
+        InvalidationSet {
+            source: "source".to_owned(),
+            lock: "lock".to_owned(),
+            toolchain: "toolchain".to_owned(),
+            env: "env".to_owned(),
+            exe: "exe".to_owned(),
+            profile: "profile".to_owned(),
+            parser: "parser".to_owned(),
+        }
+    }
+
+    fn rustc_observation(arguments: Vec<String>) -> ResolvedExecutableIdentity {
+        unreachable_id(ResolvedExecutableIdentity::new(
+            "/usr/bin/rustc".to_owned(),
+            "a".repeat(64),
+            Some("rustc 1.89.0".to_owned()),
+            "b".repeat(64),
+            arguments,
+        ))
+    }
+
+    #[test]
+    fn replaced_executable_yields_different_identity() {
+        let before = rustc_observation(vec!["--crate-name".to_owned(), "foo".to_owned()]);
+        let mut after = before.clone();
+        after.content_digest = "c".repeat(64);
+        assert_ne!(before.identity_digest(), after.identity_digest());
+        assert_eq!(
+            before.identity_digest(),
+            before.clone().identity_digest()
+        );
+        assert!(before.is_complete());
+    }
+
+    #[test]
+    fn observation_without_version_is_never_complete() {
+        let mut observation = rustc_observation(Vec::new());
+        observation.tool_version = None;
+        assert!(!observation.is_complete());
+        assert_ne!(
+            observation.identity_digest(),
+            rustc_observation(Vec::new()).identity_digest()
+        );
+    }
+
+    #[test]
+    fn malformed_observations_are_rejected() {
+        assert!(
+            ResolvedExecutableIdentity::new(
+                "/usr/bin/rustc".to_owned(),
+                "not-a-digest".to_owned(),
+                Some("rustc 1.89.0".to_owned()),
+                "b".repeat(64),
+                Vec::new(),
+            )
+            .is_err()
+        );
+        assert!(
+            ResolvedExecutableIdentity::new(
+                "/usr/bin/rustc".to_owned(),
+                "a".repeat(64),
+                Some("rustc 1.89.0".to_owned()),
+                String::new(),
+                Vec::new(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn process_entry_requires_complete_matching_identity() {
+        let fingerprints = test_fingerprints();
+        let registry = unreachable_id(ProviderRegistry::ready(
+            7,
+            "normative".to_owned(),
+            &fingerprints,
+        ));
+        let invocation = test_invocation(RUSTC_INSTRUMENT, InstrumentKind::Build, vec![
+            "--crate-name".to_owned(),
+            "foo".to_owned(),
+        ]);
+        let Ok(entry) = registry.resolve(&invocation) else {
+            unreachable!()
+        };
+        assert!(matches!(
+            entry.check_resolved_executable(None),
+            Err(RegistryError::UnresolvedExecutable {
+                reason: ExecutableIdentityCause::Missing,
+                ..
+            })
+        ));
+        let mut unversioned = rustc_observation(invocation.arguments.clone());
+        unversioned.tool_version = None;
+        assert!(matches!(
+            entry.check_resolved_executable(Some(&unversioned)),
+            Err(RegistryError::UnresolvedExecutable {
+                reason: ExecutableIdentityCause::MissingVersion,
+                ..
+            })
+        ));
+        let renamed = unreachable_id(ResolvedExecutableIdentity::new(
+            "/usr/bin/other-tool".to_owned(),
+            "a".repeat(64),
+            Some("other 1.0".to_owned()),
+            "b".repeat(64),
+            invocation.arguments.clone(),
+        ));
+        assert!(matches!(
+            entry.check_resolved_executable(Some(&renamed)),
+            Err(RegistryError::ExecutableMismatch { .. })
+        ));
+        let matching = rustc_observation(invocation.arguments.clone());
+        assert!(entry.check_resolved_executable(Some(&matching)).is_ok());
+        assert!(matching.binds_invocation(&invocation));
+    }
+
+    #[test]
+    fn decoder_only_entry_rejects_any_executable() {
+        let fingerprints = test_fingerprints();
+        let registry = unreachable_id(ProviderRegistry::ready(
+            7,
+            "normative".to_owned(),
+            &fingerprints,
+        ));
+        let invocation = test_invocation(SCIP_INSTRUMENT, InstrumentKind::Inspect, Vec::new());
+        let Ok(entry) = registry.resolve(&invocation) else {
+            unreachable!()
+        };
+        assert!(entry.check_resolved_executable(None).is_ok());
+        let observation = rustc_observation(Vec::new());
+        assert!(matches!(
+            entry.check_resolved_executable(Some(&observation)),
+            Err(RegistryError::ExecutableMismatch { .. })
+        ));
+    }
 }
