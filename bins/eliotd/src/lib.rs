@@ -43,6 +43,7 @@ pub mod diagnostics;
 mod dreamer_admission;
 mod dreamer_materials;
 mod dreamer_model_adapter;
+mod freshness_admission;
 mod governor_local_read;
 mod kernel_authority_client;
 mod kernel_context_read_client;
@@ -99,6 +100,13 @@ pub use dreamer_materials::{
 };
 pub use dreamer_model_adapter::{
     DreamerModelExecution, GovernedDreamerModelAdapter, ModelInvokeInput,
+};
+pub use freshness_admission::{
+    CANDIDATE_COMMITTED_PROJECTION_PENDING, CandidateFetchOutcome, CommittedCandidate,
+    FreshnessAdmission, FreshnessDisposition, FreshnessError, FreshnessEvaluation,
+    ProjectionPublicationRecord, ProjectionPublicationStatus, ProvenanceStanding, PublicationMode,
+    RequestedEffect, ReusableCandidateView, RevisionHead, TaskCompatibility,
+    evaluate_freshness_admission, fetch_committed_candidate, normalize_heads,
 };
 pub use governor_local_read::{
     answer_evidence_query, answer_projection_inputs, forward_admitted_local_read,
