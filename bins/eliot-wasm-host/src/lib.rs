@@ -22,6 +22,7 @@ use eliot_wasm_runtime::{
 mod admission;
 mod artifact_preflight;
 mod cli_contract;
+mod contour;
 mod shadow;
 mod typed_bindings;
 mod typed_execution;
@@ -32,6 +33,12 @@ pub use artifact_preflight::{
     MAX_ARTIFACT_BYTES, Preflight, PreflightError, preflight_bytes, read_bounded_artifact,
 };
 pub use cli_contract::{CliConfig, CliError, Profile, Transport, parse_args};
+pub use contour::{
+    AdmittedPrototype, AuthorizedHostCall, Contour, ContourGateError, FS_CAPABILITY,
+    GenerationManifest, GovernorGrant, HostCallProposal, NET_CAPABILITY, PINNED_WASMTIME_VERSION,
+    PrototypeContourDecision, SELF_CONTAINED_GUEST_TARGET, STANDARD_GUEST_TARGET, admit_prototype,
+    authorize_host_call, check_activation_imports,
+};
 pub use shadow::{ShadowError, enforce_shadow_no_effect, shadow_port_error};
 pub use typed_bindings::{
     LEGACY_EXPORT, LEGACY_WORLD, TYPED_PACKAGE_ID, TYPED_WIT_VERSION, TypedWorld,
