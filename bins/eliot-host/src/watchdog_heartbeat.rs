@@ -52,6 +52,17 @@ const TICK_MAX_MS: u64 = 3_600_000;
 /// else. The literal is the whole contract: keep it unchanged.
 const ALREADY_BOUND_CONFLICT: &str =
     "heartbeat descriptor is already bound to another incarnation";
+/// Lock-file name beside the transport descriptor. The descriptor file
+/// itself cannot carry the mutex (readers open it lock-free and renames
+/// replace it), so one stable sibling file owns the critical section for
+/// every publish and bind rotation.
+const TRANSPORT_LOCK_FILE_NAME: &str = "watchdog-heartbeat-transport.lock";
+/// Bounded exclusive-lock acquisition attempts before failing closed.
+/// Eighty attempts at a 25 ms backoff bound contention near two seconds;
+/// writers never proceed unlocked.
+const TRANSPORT_LOCK_ATTEMPTS: u32 = 80;
+/// Backoff between exclusive-lock acquisition attempts.
+const TRANSPORT_LOCK_RETRY_WAIT_MS: u64 = 25;
 /// Host-issued rendezvous: per-instance pipe name plus 256-bit challenge,
 /// bound to the installer-approved contour the Watchdog validates.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -239,6 +250,10 @@ impl HeartbeatTransportDescriptor {
     /// new descriptor cannot be durably published under its file contour.
     pub fn publish(&self, host_state_root: &Path) -> Result<PathBuf, HostError> {
         let path = host_state_root.join(WATCHDOG_HEARTBEAT_TRANSPORT_FILE_NAME);
+        // Serialize with concurrent Host-instance writers: the keep-prior
+        // decision plus rotation holds the descriptor lock, so two
+        // publishers cannot interleave decide-then-replace.
+        let _lock = TransportDescriptorLock::acquire(host_state_root)?;
         // Retain only a fully trusted live binding: try_load proves the
         // bytes, the liveness probe proves the owner still runs, and the
         // contour check inside try_load proves exclusive Host ownership.
@@ -252,7 +267,7 @@ impl HeartbeatTransportDescriptor {
         if keep_prior {
             return Ok(path);
         }
-        self.publish_force(host_state_root)
+        self.publish_force_locked(host_state_root)
     }
 
     /// Unconditionally (re)publishes this descriptor through the atomic
@@ -266,7 +281,24 @@ impl HeartbeatTransportDescriptor {
     ///
     /// Returns an error when this descriptor is not canonical or the
     /// atomic publish or its readback proof fails.
+    ///
+    /// The replace plus verified reload holds the cross-process descriptor
+    /// lock; contention fails closed, never unlocked.
     fn publish_force(&self, host_state_root: &Path) -> Result<PathBuf, HostError> {
+        let _lock = TransportDescriptorLock::acquire(host_state_root)?;
+        self.publish_force_locked(host_state_root)
+    }
+
+    /// Locked half of `publish_force`: the caller already holds the
+    /// descriptor lock across the replace plus verified reload, so this
+    /// never acquires (exclusive byte locks are not reentrant across
+    /// handles of one process).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this descriptor is not canonical or the
+    /// atomic publish or its readback proof fails.
+    fn publish_force_locked(&self, host_state_root: &Path) -> Result<PathBuf, HostError> {
         self.validate().map_err(|error| match error {
             HostError::Platform(detail) => HostError::RecoveryRequired(detail),
             other => other,
@@ -390,6 +422,27 @@ impl HeartbeatTransportDescriptor {
         watchdog_pid: u32,
         watchdog_start_100ns: u64,
     ) -> Result<PathBuf, HostError> {
+        // Serialize with concurrent Host-instance writers: the full
+        // load-derive-replace-reload holds the descriptor lock, so two
+        // binders cannot both observe unbound and last-writer-wins.
+        let _lock = TransportDescriptorLock::acquire(host_state_root)?;
+        Self::bind_incarnation_locked(host_state_root, watchdog_pid, watchdog_start_100ns)
+    }
+
+    /// Locked half of `bind_incarnation`: the caller already holds the
+    /// descriptor lock across load-verify-replace-reload, so this never
+    /// acquires (exclusive byte locks are not reentrant across handles
+    /// of one process).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unusable incarnation, an absent descriptor,
+    /// a conflicting bound incarnation, or a failed rewrite.
+    fn bind_incarnation_locked(
+        host_state_root: &Path,
+        watchdog_pid: u32,
+        watchdog_start_100ns: u64,
+    ) -> Result<PathBuf, HostError> {
         if watchdog_pid == 0 || watchdog_start_100ns == 0 {
             return Err(HostError::Platform(
                 "heartbeat incarnation binding is not usable".to_owned(),
@@ -457,7 +510,11 @@ impl HeartbeatTransportDescriptor {
         watchdog_pid: u32,
         watchdog_start_100ns: u64,
     ) -> Result<PathBuf, HostError> {
-        match Self::bind_incarnation(host_state_root, watchdog_pid, watchdog_start_100ns) {
+        // One lock across the whole heal rotation (bind, liveness recheck,
+        // fresh publish, rebind): the steps are a single critical section,
+        // never separately raced windows.
+        let _lock = TransportDescriptorLock::acquire(host_state_root)?;
+        match Self::bind_incarnation_locked(host_state_root, watchdog_pid, watchdog_start_100ns) {
             Ok(path) => Ok(path),
             Err(error) if is_already_bound_conflict(&error) => {
                 let path = host_state_root.join(WATCHDOG_HEARTBEAT_TRANSPORT_FILE_NAME);
@@ -470,7 +527,7 @@ impl HeartbeatTransportDescriptor {
                     return Ok(path);
                 }
                 if !current.is_bound() {
-                    return Self::bind_incarnation(
+                    return Self::bind_incarnation_locked(
                         host_state_root,
                         watchdog_pid,
                         watchdog_start_100ns,
@@ -479,13 +536,84 @@ impl HeartbeatTransportDescriptor {
                 if prior_incarnation_live(&current) {
                     return Err(error);
                 }
-                fresh.publish_force(host_state_root)?;
-                Self::bind_incarnation(host_state_root, watchdog_pid, watchdog_start_100ns)
+                fresh.publish_force_locked(host_state_root)?;
+                Self::bind_incarnation_locked(host_state_root, watchdog_pid, watchdog_start_100ns)
             }
             Err(error) => Err(error),
         }
     }
 }
+/// Cross-process exclusive guard for descriptor publish and bind rotation.
+///
+/// Atomic rename alone does not serialize concurrent Host-instance writers:
+/// two processes can both load an unbound descriptor, derive a replacement,
+/// and rename over each other, so the last writer silently clobbers the
+/// first (the verified-reload check detects the damage only after it is
+/// durable). Every rotation therefore holds this `LockFileEx` guard across
+/// its full load-verify-replace-reload sequence; contention fails closed
+/// after a bounded retry, never unlocked.
+struct TransportDescriptorLock {
+    file: std::fs::File,
+}
+
+impl TransportDescriptorLock {
+    /// Acquires the exclusive descriptor lock for the state root, retrying
+    /// contention for a bounded window before failing closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the lock file cannot be opened or the
+    /// exclusive lock cannot be acquired in the bounded window. Rotation
+    /// never proceeds unlocked.
+    fn acquire(host_state_root: &Path) -> Result<Self, HostError> {
+        // The crate forbids unsafe, so the OS primitive is reached through
+        // the safe std wrapper: File::try_lock issues an exclusive
+        // non-blocking LockFileEx on this handle. No rotation proceeds
+        // without holding it.
+        let lock_path = host_state_root.join(TRANSPORT_LOCK_FILE_NAME);
+        let mut last_error = String::from("lock was never attempted");
+        for attempt in 0..TRANSPORT_LOCK_ATTEMPTS {
+            match Self::try_acquire_once(&lock_path) {
+                Ok(guard) => return Ok(guard),
+                Err(error) => {
+                    last_error = error;
+                    if attempt + 1 >= TRANSPORT_LOCK_ATTEMPTS {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(TRANSPORT_LOCK_RETRY_WAIT_MS));
+                }
+            }
+        }
+        Err(HostError::RecoveryRequired(format!(
+            "heartbeat transport lock contention: {last_error}"
+        )))
+    }
+
+    /// Opens the sibling lock file and takes the exclusive OS lock once,
+    /// returning the held guard. Any failure (open contention or lock
+    /// contention) reports a detail string for the bounded retry loop.
+    fn try_acquire_once(lock_path: &Path) -> Result<Self, String> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)
+            .map_err(|error| format!("lock open failed: {error}"))?;
+        file.try_lock()
+            .map_err(|error| format!("exclusive lock failed: {error}"))?;
+        Ok(Self { file })
+    }
+}
+
+impl Drop for TransportDescriptorLock {
+    fn drop(&mut self) {
+        // Best effort: the OS releases the exclusive lock on handle close
+        // regardless, so an unlock failure cannot leave the mutex held.
+        let _ = self.file.unlock();
+    }
+}
+
 /// Atomically stages descriptor bytes beside the target and renames over
 /// it, so the rendezvous is never absent or half-written. The staging
 /// file is contour-enforced before the rename (the DACL travels with the
@@ -2153,6 +2281,71 @@ mod tests {
             .unwrap_or_else(|_| panic!("descriptor must load"))
             .unwrap_or_else(|| panic!("descriptor must be present"));
         assert_eq!(intact, healed);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_bind_incarnation_serializes_under_lock() {
+        use std::sync::{Arc, Barrier};
+        const WRITERS: usize = 8;
+        let dir = test_dir();
+        std::fs::create_dir_all(&dir).unwrap_or_else(|_| panic!("test dir must build"));
+        let issued = test_descriptor();
+        issued.publish(&dir).unwrap_or_else(|_| panic!("descriptor must publish"));
+        let barrier = Arc::new(Barrier::new(WRITERS));
+        let winners: Vec<(u32, u64)> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..WRITERS)
+                .map(|index| {
+                    let barrier = Arc::clone(&barrier);
+                    let dir = dir.clone();
+                    scope.spawn(move || {
+                        let _ = barrier.wait();
+                        let pid = u32::try_from(index)
+                            .unwrap_or_else(|_| panic!("writer index must fit u32"))
+                            .wrapping_add(1000);
+                        let start = index as u64 + 5000;
+                        match HeartbeatTransportDescriptor::bind_incarnation(&dir, pid, start) {
+                            Ok(_) => Some((pid, start)),
+                            Err(_) => None,
+                        }
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .filter_map(|handle| {
+                    handle.join().unwrap_or_else(|_| panic!("writer must join"))
+                })
+                .collect()
+        });
+        // Serialization means exactly one binder observes unbound and wins;
+        // every other concurrent attempt fails closed on the already-bound
+        // conflict instead of clobbering the winner.
+        assert_eq!(winners.len(), 1, "exactly one concurrent bind must win");
+        let (pid, start) = winners
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("one winner must exist"));
+        let bound = HeartbeatTransportDescriptor::load(&dir)
+            .unwrap_or_else(|_| panic!("descriptor must load"))
+            .unwrap_or_else(|| panic!("descriptor must be present"));
+        assert_eq!(bound.watchdog_incarnation_pid, pid);
+        assert_eq!(bound.watchdog_incarnation_start_100ns, start);
+        assert_eq!(bound.host_challenge_nonce, issued.host_challenge_nonce);
+        assert_eq!(bound.service_instance_guid, issued.service_instance_guid);
+        assert_eq!(bound.pipe_name, issued.pipe_name);
+        // No half-written staging file leaks beside the descriptor.
+        let staged: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|_| panic!("test dir must list"))
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.contains(".tmp-"))
+            })
+            .collect();
+        assert!(staged.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
