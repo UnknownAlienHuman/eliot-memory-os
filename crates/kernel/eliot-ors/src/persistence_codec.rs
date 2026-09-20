@@ -30,6 +30,7 @@ use crate::SupervisionLeaseSnapshot;
 use crate::SupervisionLeaseStageReceipt;
 use crate::SupervisionLeaseStageResolution;
 use crate::UnknownCommitRecord;
+use crate::cutover_ownership::StoredCutoverOwnership;
 use eliot_runtime_contracts::GenerationCutoverState;
 
 pub(super) fn encode<T: Serialize>(value: &T) -> Result<String, OrsError> {
@@ -299,6 +300,14 @@ impl PersistedValue for crate::StoreRebindReplayRecord {
 
     fn validate_persisted(&self) -> Result<(), OrsError> {
         self.validate()
+    }
+}
+
+impl PersistedValue for StoredCutoverOwnership {
+    const RECORD_TYPE: &'static str = "cutover_ownership";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate_persisted()
     }
 }
 

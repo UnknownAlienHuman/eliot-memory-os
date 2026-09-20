@@ -2742,6 +2742,237 @@ fn persisted_invalid_label_and_envelope_digest_fail_closed() -> TestResult {
     Ok(())
 }
 
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one focused fixture covers commit, restart recovery, admission pinning, and receipt fields"
+)]
+fn cutover_ownership_commit_is_durable_linearization_point() -> TestResult {
+    // I14.14 acceptance (issue #1950): after a committed module cutover and a
+    // forced restart, a new request in the affected route scope is admitted
+    // only to the recorded candidate generation with the recorded new epoch;
+    // an old-generation request not named in the committed in-flight
+    // disposition set is rejected as stale; a candidate crash before commit
+    // leaves new admission routed away from the candidate.
+    let path = database_path("cutover-ownership-acceptance");
+    cleanup(&path);
+    let scope = CapabilityRouteScope::declare("mod-a", "serve", "work", "effects")?;
+    let hash = scope.route_scope_hash.clone();
+    let candidate = ModuleArtifactIdentity {
+        module_id: "mod-a".to_owned(),
+        semver: "1.2.0".to_owned(),
+        artifact_hash: "a".repeat(64),
+        manifest_digest: "c".repeat(64),
+        layout_root: format!("modules/mod-a/1.2.0/{}", "a".repeat(64)),
+    };
+    let incumbent = ModuleArtifactIdentity {
+        module_id: "mod-a".to_owned(),
+        semver: "1.1.0".to_owned(),
+        artifact_hash: "b".repeat(64),
+        manifest_digest: "d".repeat(64),
+        layout_root: format!("modules/mod-a/1.1.0/{}", "b".repeat(64)),
+    };
+    let genesis = GenerationCutoverOwnership {
+        cutover_id: "cutover-ownership-genesis".to_owned(),
+        candidate_artifact: incumbent.clone(),
+        incumbent_artifact: None,
+        scope: scope.clone(),
+        old_generation: None,
+        new_generation: ResourceGeneration::new(1)?,
+        old_epoch: AuthorityEpoch::new(1)?,
+        new_epoch: AuthorityEpoch::new(2)?,
+        in_flight: Vec::new(),
+        migration: StateMigrationDecision::RetainCompatible,
+        health_proof_ref: "health-proof-genesis".to_owned(),
+        rollback_boundary: "forward-only".to_owned(),
+        unresolved_scopes: Vec::new(),
+        linearization_record_id: None,
+        state: GenerationCutoverState::Armed,
+    };
+    let cutover = GenerationCutoverOwnership {
+        cutover_id: "cutover-ownership-1".to_owned(),
+        candidate_artifact: candidate.clone(),
+        incumbent_artifact: Some(incumbent.clone()),
+        scope: scope.clone(),
+        old_generation: Some(ResourceGeneration::new(1)?),
+        new_generation: ResourceGeneration::new(2)?,
+        old_epoch: AuthorityEpoch::new(2)?,
+        new_epoch: AuthorityEpoch::new(3)?,
+        in_flight: vec![InFlightDisposition {
+            operation_id: "op-drain".to_owned(),
+            kind: InFlightDispositionKind::DrainRead,
+        }],
+        migration: StateMigrationDecision::CheckpointTransfer,
+        health_proof_ref: "health-proof-1".to_owned(),
+        rollback_boundary: incumbent.layout_root.clone(),
+        unresolved_scopes: vec!["op-unknown".to_owned()],
+        linearization_record_id: None,
+        state: GenerationCutoverState::Armed,
+    };
+    // A second scope stages a candidate that never commits: the pre-commit
+    // crash case. It must never become active.
+    let staged_only = GenerationCutoverOwnership {
+        cutover_id: "cutover-ownership-staged-only".to_owned(),
+        candidate_artifact: candidate.clone(),
+        incumbent_artifact: None,
+        scope: CapabilityRouteScope::declare("mod-b", "serve", "work", "effects")?,
+        old_generation: None,
+        new_generation: ResourceGeneration::new(4)?,
+        old_epoch: AuthorityEpoch::new(3)?,
+        new_epoch: AuthorityEpoch::new(4)?,
+        in_flight: Vec::new(),
+        migration: StateMigrationDecision::RetainCompatible,
+        health_proof_ref: "health-proof-staged".to_owned(),
+        rollback_boundary: "forward-only".to_owned(),
+        unresolved_scopes: Vec::new(),
+        linearization_record_id: None,
+        state: GenerationCutoverState::Armed,
+    };
+    let staged_hash = staged_only.scope.route_scope_hash.clone();
+
+    let (committed, receipt) = {
+        let store = RedbRecoveryStore::open(&path)?;
+        store.stage_cutover_ownership(genesis)?;
+        store.commit_cutover_ownership("cutover-ownership-genesis")?;
+        store.stage_cutover_ownership(cutover)?;
+        // While staged, the candidate is durable but inactive: no committed
+        // row exists for the scope, so the snapshot admits nothing there.
+        let snapshot = CutoverRouteSnapshot::rebuild(
+            &store.latest_committed_cutover_ownership(MAX_RECOVERY_PAGE)?,
+        )?;
+        assert_eq!(
+            snapshot.admit(
+                &hash,
+                ResourceGeneration::new(2)?,
+                AuthorityEpoch::new(3)?,
+                "op-new"
+            ),
+            CutoverAdmission::RejectStale
+        );
+        store.stage_cutover_ownership(staged_only)?;
+        store.commit_cutover_ownership("cutover-ownership-1")
+    }?;
+    assert_eq!(committed.state, GenerationCutoverState::Committed);
+    assert!(
+        committed
+            .linearization_record_id
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("ors:cutover-ownership:cutover-ownership-1#")
+    );
+    // The receipt records every required I14.14 field from the commit.
+    assert_eq!(receipt.cutover_id, "cutover-ownership-1");
+    assert_eq!(receipt.old_generation, Some(ResourceGeneration::new(1)?));
+    assert_eq!(receipt.new_generation, ResourceGeneration::new(2)?);
+    assert_eq!(receipt.old_epoch, AuthorityEpoch::new(2)?);
+    assert_eq!(receipt.new_epoch, AuthorityEpoch::new(3)?);
+    assert_eq!(receipt.route_scope_hash, hash);
+    assert_eq!(
+        receipt.migration,
+        StateMigrationDecision::CheckpointTransfer
+    );
+    assert_eq!(receipt.in_flight.len(), 1);
+    assert_eq!(receipt.in_flight[0].operation_id, "op-drain");
+    assert_eq!(
+        receipt.in_flight[0].kind,
+        InFlightDispositionKind::DrainRead
+    );
+    assert_eq!(
+        receipt.linearization_record_id,
+        committed
+            .linearization_record_id
+            .clone()
+            .ok_or("linearization")?
+    );
+    assert_eq!(receipt.health_proof_ref, "health-proof-1");
+    assert_eq!(receipt.rollback_boundary, incumbent.layout_root);
+    assert_eq!(receipt.unresolved_scopes, vec!["op-unknown".to_owned()]);
+    assert_eq!(receipt.state, GenerationCutoverState::Committed);
+
+    // Forced restart: drop the store, reopen the same database, and rebuild
+    // the route snapshot solely from committed ORS state.
+    drop(receipt);
+    let table = CutoverRouteTable::new();
+    {
+        let store = RedbRecoveryStore::open(&path)?;
+        let committed_rows = store.latest_committed_cutover_ownership(MAX_RECOVERY_PAGE)?;
+        assert_eq!(committed_rows.len(), 2);
+        table.swap_committed(CutoverRouteSnapshot::rebuild(&committed_rows)?);
+        // The never-committed candidate reconciles to fenced evidence and
+        // still cannot activate its scope.
+        let fenced = store.reconcile_staged_cutover_ownership(MAX_RECOVERY_PAGE)?;
+        assert_eq!(fenced.len(), 1);
+        assert_eq!(
+            fenced[0].state,
+            GenerationCutoverState::FailedRequiresForwardCutover
+        );
+    }
+    // New requests reach the recorded candidate generation and epoch only.
+    assert_eq!(
+        table.admit(
+            &hash,
+            ResourceGeneration::new(2)?,
+            AuthorityEpoch::new(3)?,
+            "op-new"
+        ),
+        CutoverAdmission::AdmitCandidate
+    );
+    assert_eq!(
+        table.admit(
+            &hash,
+            ResourceGeneration::new(2)?,
+            AuthorityEpoch::new(2)?,
+            "op-new"
+        ),
+        CutoverAdmission::RejectStale
+    );
+    // The allowlisted pre-cutover operation finishes under its disposition.
+    assert_eq!(
+        table.admit(
+            &hash,
+            ResourceGeneration::new(1)?,
+            AuthorityEpoch::new(2)?,
+            "op-drain"
+        ),
+        CutoverAdmission::AdmitAllowlistedOld {
+            kind: InFlightDispositionKind::DrainRead
+        }
+    );
+    // Old-generation requests outside the committed disposition set are
+    // stale, including unresolved scopes, which stay blocked.
+    assert_eq!(
+        table.admit(
+            &hash,
+            ResourceGeneration::new(1)?,
+            AuthorityEpoch::new(2)?,
+            "op-other"
+        ),
+        CutoverAdmission::RejectStale
+    );
+    assert_eq!(
+        table.admit(
+            &hash,
+            ResourceGeneration::new(1)?,
+            AuthorityEpoch::new(2)?,
+            "op-unknown"
+        ),
+        CutoverAdmission::RejectStale
+    );
+    // The pre-commit candidate never owned new admission for its scope.
+    assert_eq!(
+        table.admit(
+            &staged_hash,
+            ResourceGeneration::new(4)?,
+            AuthorityEpoch::new(4)?,
+            "op-new"
+        ),
+        CutoverAdmission::RejectStale
+    );
+
+    cleanup(&path);
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // T9-03 owner-backed durable replay stream (issue #22, M3).
 // ---------------------------------------------------------------------------
