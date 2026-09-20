@@ -25,7 +25,8 @@
 //! 22-case matrix rows.
 
 use eliot_ipc::{
-    FrameDecoder, TransportError, TransportLimits, decode_frame, encode_frame, validate_pipe_name,
+    AdmissionQueue, FrameDecoder, TransportError, TransportLimits, decode_frame, encode_frame,
+    is_control_capacity_frame, validate_pipe_name,
 };
 use eliot_protocol::{
     EncodingProfile, Frame, FrameKind, MessageType, ProtocolError, ProtocolPayload, ProtocolVersion,
@@ -240,6 +241,227 @@ fn bounded_malformed_input_never_panics_nor_reports_full_success() {
     }
     let invalid_empty = err(validate_pipe_name(""));
     assert_eq!(invalid_empty, TransportError::InvalidPipeName);
+}
+
+// WORK_UNIT_CASE: 1881/1
+#[test]
+fn in_flight_saturation_preserves_cancel_heartbeat_control_capacity() {
+    let limits = TransportLimits {
+        max_frame_bytes: 2048,
+        queue_capacity: 4,
+        queue_bytes: 8192,
+        control_reserve: 1,
+        operation_timeout: Duration::from_secs(1),
+    };
+    let mut queue = ok(AdmissionQueue::new(limits));
+    let mut request = heartbeat_frame();
+    request.kind = FrameKind::Request;
+    request.message_type = MessageType::Execute;
+    assert!(!is_control_capacity_frame(&request));
+    let held = [
+        ok(queue.admit_frame(&request, 8)),
+        ok(queue.admit_frame(&request, 8)),
+        ok(queue.admit_frame(&request, 8)),
+    ];
+    assert!(
+        matches!(
+            queue.admit_frame(&request, 8),
+            Err(TransportError::Backpressure)
+        ),
+        "ordinary request must reject once normal in-flight capacity is exhausted"
+    );
+    for (kind, message_type) in [
+        (FrameKind::Cancel, MessageType::Cancel),
+        (FrameKind::Heartbeat, MessageType::Health),
+        (FrameKind::Control, MessageType::Challenge),
+    ] {
+        let mut recovery = heartbeat_frame();
+        recovery.kind = kind;
+        recovery.message_type = message_type;
+        assert!(
+            is_control_capacity_frame(&recovery),
+            "recovery lane must classify {kind:?}"
+        );
+        let reservation = ok(queue.admit_frame(&recovery, 8));
+        ok(queue.release(reservation));
+    }
+    for reservation in held {
+        ok(queue.release(reservation));
+    }
+    assert_eq!(queue.usage(), (0, 0));
+
+    // Byte saturation (issue #1881): fill the ordinary byte budget with
+    // ordinary traffic while item slots remain, then prove the reserved
+    // control lane still admits a Cancel, heartbeat, and recovery frame.
+    let byte_limits = TransportLimits {
+        max_frame_bytes: 512,
+        queue_capacity: 8,
+        queue_bytes: 1024,
+        control_reserve: 2,
+        operation_timeout: Duration::from_secs(1),
+    };
+    // Proportional byte reserve: 1024 * 2 / 8 = 256 bytes stay reserved for
+    // the control lane, so ordinary traffic saturates at 768 bytes with only
+    // 3 of 8 item slots consumed.
+    let mut bytes_queue = ok(AdmissionQueue::new(byte_limits));
+    let held_bytes = [
+        ok(bytes_queue.admit_frame(&request, 256)),
+        ok(bytes_queue.admit_frame(&request, 256)),
+        ok(bytes_queue.admit_frame(&request, 256)),
+    ];
+    assert_eq!(bytes_queue.usage(), (3, 768));
+    assert!(
+        matches!(
+            bytes_queue.admit_frame(&request, 256),
+            Err(TransportError::Backpressure)
+        ),
+        "ordinary traffic must reject once the normal byte budget is exhausted even though item slots remain"
+    );
+    for (kind, message_type) in [
+        (FrameKind::Cancel, MessageType::Cancel),
+        (FrameKind::Heartbeat, MessageType::Health),
+        (FrameKind::Control, MessageType::Challenge),
+    ] {
+        let mut recovery = heartbeat_frame();
+        recovery.kind = kind;
+        recovery.message_type = message_type;
+        assert!(is_control_capacity_frame(&recovery));
+        let reservation = ok(bytes_queue.admit_frame(&recovery, 8));
+        ok(bytes_queue.release(reservation));
+    }
+    for reservation in held_bytes {
+        ok(bytes_queue.release(reservation));
+    }
+    assert_eq!(bytes_queue.usage(), (0, 0));
+}
+
+// WORK_UNIT_CASE: 1881/2
+#[test]
+fn inline_ceilings_reject_before_emit_and_prefix_rejects_before_alloc() {
+    let limits = TransportLimits::default();
+    assert_eq!(
+        limits.max_frame_bytes,
+        eliot_protocol::MAX_FRAME_BYTES,
+        "default frame maximum must be 4 MiB"
+    );
+    assert_eq!(eliot_protocol::MAX_FRAME_BYTES, 4 * 1024 * 1024);
+    assert_eq!(eliot_protocol::HOT_RESPONSE_BYTES, 64 * 1024);
+    assert_eq!(eliot_protocol::HARD_STRUCTURED_RESPONSE_BYTES, 256 * 1024);
+
+    let mut big_response = heartbeat_frame();
+    big_response.kind = FrameKind::Response;
+    big_response.message_type = MessageType::Result;
+    big_response.payload =
+        ProtocolPayload::Json(serde_json::json!({"blob": "x".repeat(257 * 1024)}));
+    assert!(matches!(
+        encode_frame(&big_response, limits),
+        Err(TransportError::Protocol(ProtocolError::OversizeFrame {
+            maximum,
+            ..
+        })) if maximum == 256 * 1024
+    ));
+
+    let mut hot = heartbeat_frame();
+    hot.kind = FrameKind::Control;
+    hot.message_type = MessageType::Challenge;
+    hot.payload = ProtocolPayload::Json(serde_json::json!({"blob": "x".repeat(65 * 1024)}));
+    assert!(matches!(
+        encode_frame(&hot, limits),
+        Err(TransportError::Protocol(ProtocolError::OversizeFrame {
+            maximum,
+            ..
+        })) if maximum == 64 * 1024
+    ));
+
+    assert!(matches!(
+        decode_frame(&[0, 0, 0, 0], limits),
+        Err(TransportError::Protocol(ProtocolError::ZeroLengthFrame))
+    ));
+    let mut decoder = FrameDecoder::new();
+    let over_4mib = ok(u32::try_from(eliot_protocol::MAX_FRAME_BYTES + 1));
+    let mut prefix = over_4mib.to_le_bytes().to_vec();
+    prefix.extend_from_slice(&[0_u8; 10]);
+    assert!(matches!(
+        decoder.push(&prefix, limits),
+        Err(TransportError::Protocol(ProtocolError::OversizeFrame { .. }))
+    ));
+    let frame = heartbeat_frame();
+    let wire = ok(encode_frame(&frame, limits));
+    assert_eq!(decoder.push(&wire, limits), Ok(Some(frame)));
+}
+
+// WORK_UNIT_CASE: 1881/2 (receive-path tier enforcement)
+#[test]
+fn tier_ceilings_reject_from_prefix_before_decode() {
+    // The 256 KiB structured and 64 KiB hot-response ceilings reject from
+    // the length prefix before the body is decoded, with the 4 MiB codec
+    // cap as the outer bound. These wires are hand-framed because
+    // `encode_frame` already refuses to emit them.
+    let limits = TransportLimits::default();
+    let wire_for = |kind: FrameKind, message_type: MessageType, payload: serde_json::Value| {
+        let mut frame = heartbeat_frame();
+        frame.kind = kind;
+        frame.message_type = message_type;
+        frame.payload = ProtocolPayload::Json(payload);
+        let body = ok(serde_json::to_vec(&frame));
+        let mut wire = ok(u32::try_from(body.len())).to_le_bytes().to_vec();
+        wire.extend_from_slice(&body);
+        wire
+    };
+    let mut decoder = FrameDecoder::new();
+    let big_response_wire = wire_for(
+        FrameKind::Response,
+        MessageType::Result,
+        serde_json::json!({"blob": "x".repeat(257 * 1024)}),
+    );
+    assert!(big_response_wire.len() - 4 < eliot_protocol::MAX_FRAME_BYTES);
+    assert!(matches!(
+        decode_frame(&big_response_wire, limits),
+        Err(TransportError::Protocol(ProtocolError::OversizeFrame {
+            maximum,
+            ..
+        })) if maximum == 256 * 1024
+    ));
+    assert!(matches!(
+        decoder.push(&big_response_wire, limits),
+        Err(TransportError::Protocol(ProtocolError::OversizeFrame {
+            maximum,
+            ..
+        })) if maximum == 256 * 1024
+    ));
+    let big_control_wire = wire_for(
+        FrameKind::Control,
+        MessageType::Challenge,
+        serde_json::json!({"blob": "x".repeat(65 * 1024)}),
+    );
+    assert!(big_control_wire.len() - 4 < eliot_protocol::MAX_FRAME_BYTES);
+    assert!(matches!(
+        decode_frame(&big_control_wire, limits),
+        Err(TransportError::Protocol(ProtocolError::OversizeFrame {
+            maximum,
+            ..
+        })) if maximum == 64 * 1024
+    ));
+    assert!(matches!(
+        decoder.push(&big_control_wire, limits),
+        Err(TransportError::Protocol(ProtocolError::OversizeFrame {
+            maximum,
+            ..
+        })) if maximum == 64 * 1024
+    ));
+    // Under-tier bodies still decode on receipt: the tier cap must not
+    // over-restrict legitimate traffic below its ceiling.
+    let small_response_wire = wire_for(
+        FrameKind::Response,
+        MessageType::Result,
+        serde_json::json!({"blob": "x".repeat(200 * 1024)}),
+    );
+    let accepted = ok(decode_frame(&small_response_wire, limits));
+    assert_eq!(accepted.kind, FrameKind::Response);
+    assert_eq!(
+        decoder.push(&small_response_wire, limits),
+        Ok(Some(accepted))
+    );
 }
 
 // WORK_UNIT_CASE: 791/6
