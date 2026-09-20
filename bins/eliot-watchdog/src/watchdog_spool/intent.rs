@@ -24,7 +24,18 @@
 //! kind admission and any new named mutation are slice 2 (MGR02 handoff).
 
 use super::codec::WatchdogSpoolPayload;
-use crate::{GapRecoveryReason, SERVICE_NAME, SpoolError};
+use crate::{GapRecoveryReason, KernelWatchdogError, SERVICE_NAME, SpoolError};
+
+/// True for the spool-local intent payloads, which are stored and retained
+/// but never exported until Governor-side admission lands (see
+/// `super::select_export_window`, which stops the export window before the
+/// first intent instead of emitting it under another class).
+pub(crate) fn is_intent_payload(payload: &WatchdogSpoolPayload) -> bool {
+    matches!(
+        payload,
+        WatchdogSpoolPayload::ProblemIntent { .. } | WatchdogSpoolPayload::IncidentIntent { .. }
+    )
+}
 
 /// Schema revision of the spool-local intent record shape.
 ///
@@ -110,27 +121,90 @@ impl IntentLineage {
 /// rejects [`GapRecoveryReason::SpoolPressure`], which is retention pressure,
 /// not Governor unavailability. A caller holding a live Governor admission
 /// has no value of this type to pass.
+///
+/// Unlike a bare [`GapRecoveryReason`], the proof cannot be minted from a
+/// caller-chosen reason: both public constructors require a genuinely
+/// observed admission-path failure value. A caller holding a live Governor
+/// admission has no failure value to pass, so it cannot mint this proof.
+/// The carried reason is always one the lane's own admission-gap rules
+/// produce (`AdmissionUnavailable`, `LeaseStale`, `LeaseFenced`,
+/// `LeaseInvalid`); retention pressure (`SpoolPressure`) and host-identity
+/// observations (`Host*`) are never Governor unavailability and never mint.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct GovernorUnavailability {
     reason: GapRecoveryReason,
 }
 
 impl GovernorUnavailability {
-    /// Admits one Governor-unavailable reason; fails closed on retention
+    /// Mints the proof from an observed watchdog admission failure.
+    ///
+    /// Mirrors the lane's admission-gap rule field-for-field: lease failures
+    /// keep their lease reason, every other spool error is the
+    /// admission-unavailable condition itself. Infallible by construction —
+    /// any admission reload failure is the observed Governor-admission
+    /// failure this proof stands for.
+    // Slice-2 Governor-admission minter: no production caller until the MGR02 handoff lands.
+    #[allow(dead_code)]
+    pub(crate) fn from_admission_error(error: &SpoolError) -> Self {
+        let reason = match error {
+            SpoolError::LeaseStale(_) => GapRecoveryReason::LeaseStale,
+            SpoolError::LeaseFenced(_) => GapRecoveryReason::LeaseFenced,
+            SpoolError::InvalidLease(_) => GapRecoveryReason::LeaseInvalid,
+            _ => GapRecoveryReason::AdmissionUnavailable,
+        };
+        Self { reason }
+    }
+
+    /// Mints the proof from an observed Kernel supervision failure.
+    ///
+    /// Mirrors the lane's kernel-gap rule field-for-field, except retention
     /// pressure, which must never mint an intent.
     ///
     /// # Errors
     ///
-    /// Returns [`SpoolError::Corrupt`] when `reason` is
-    /// [`GapRecoveryReason::SpoolPressure`].
-    pub(crate) fn admission_unavailable(reason: GapRecoveryReason) -> Result<Self, SpoolError> {
-        if reason == GapRecoveryReason::SpoolPressure {
-            return Err(SpoolError::Corrupt(
-                "watchdog spool pressure is not Governor unavailability; refusing to mint an intent"
-                    .to_owned(),
-            ));
-        }
+    /// Returns [`SpoolError::Corrupt`] when `error` is
+    /// [`KernelWatchdogError::SpoolPressure`].
+    // Slice-2 Governor-admission minter: no production caller until the MGR02 handoff lands.
+    #[allow(dead_code)]
+    pub(crate) fn from_kernel_error(error: &KernelWatchdogError) -> Result<Self, SpoolError> {
+        let reason = match error {
+            KernelWatchdogError::LeaseStale => GapRecoveryReason::LeaseStale,
+            KernelWatchdogError::LeaseFenced => GapRecoveryReason::LeaseFenced,
+            KernelWatchdogError::SpoolPressure => {
+                return Err(SpoolError::Corrupt(
+                    "watchdog spool pressure is not Governor unavailability; refusing to mint an intent"
+                        .to_owned(),
+                ));
+            }
+            _ => GapRecoveryReason::LeaseInvalid,
+        };
         Ok(Self { reason })
+    }
+
+    /// Re-admits a stored intent reason at the persistence boundary.
+    ///
+    /// Accepts exactly the admission-gap codomain the two observed-error
+    /// constructors produce; retention pressure and host-identity
+    /// observations fail closed here, so a forged or non-canonical row
+    /// carrying them never enters the spool. The match is deliberately
+    /// exhaustive with no wildcard: a future reason variant fails the build
+    /// here instead of silently minting.
+    fn from_stored_reason(reason: GapRecoveryReason) -> Result<Self, SpoolError> {
+        match reason {
+            GapRecoveryReason::AdmissionUnavailable
+            | GapRecoveryReason::LeaseStale
+            | GapRecoveryReason::LeaseFenced
+            | GapRecoveryReason::LeaseInvalid => Ok(Self { reason }),
+            GapRecoveryReason::SpoolPressure
+            | GapRecoveryReason::HostAbsentOrStopped
+            | GapRecoveryReason::HostPidReused
+            | GapRecoveryReason::HostImageSubstituted
+            | GapRecoveryReason::HostIdentityChanged
+            | GapRecoveryReason::HostUnknown => Err(SpoolError::Corrupt(
+                "watchdog intent reason is not an observed Governor admission failure; refusing the stored row"
+                    .to_owned(),
+            )),
+        }
     }
 
     /// Returns the bounded unavailability reason carried by this proof.
@@ -308,7 +382,7 @@ pub(crate) fn check_stored_intent_payload(
             lineage_epoch,
             governor_unavailable_reason,
         } => {
-            let proof = GovernorUnavailability::admission_unavailable(*governor_unavailable_reason)?;
+            let proof = GovernorUnavailability::from_stored_reason(*governor_unavailable_reason)?;
             let lineage = IntentLineage::new(
                 lineage_installation_id.clone(),
                 *lineage_generation,
@@ -336,7 +410,7 @@ pub(crate) fn check_stored_intent_payload(
             lineage_epoch,
             governor_unavailable_reason,
         } => {
-            let proof = GovernorUnavailability::admission_unavailable(*governor_unavailable_reason)?;
+            let proof = GovernorUnavailability::from_stored_reason(*governor_unavailable_reason)?;
             let lineage = IntentLineage::new(
                 lineage_installation_id.clone(),
                 *lineage_generation,
@@ -364,7 +438,7 @@ pub(crate) fn check_stored_intent_payload(
 mod tests {
     use super::super::{WatchdogSpool, watchdog_spool_path};
     use super::*;
-    use crate::{SpoolAppendOutcome, WatchdogSpoolExportLimits};
+    use crate::{KernelWatchdogError, SpoolAppendOutcome, WatchdogSpoolExportLimits};
     use eliot_watchdog_core::{WatchdogSpoolCursor, WatchdogSpoolPayloadKind};
 
     fn evidence_ref(byte: u8) -> String {
@@ -372,8 +446,9 @@ mod tests {
     }
 
     fn test_proof() -> GovernorUnavailability {
-        GovernorUnavailability::admission_unavailable(GapRecoveryReason::AdmissionUnavailable)
-            .expect("Governor-unavailable proof")
+        GovernorUnavailability::from_admission_error(&SpoolError::InvalidLease(
+            "test-lease".to_owned(),
+        ))
     }
 
     fn test_lineage() -> IntentLineage {
@@ -388,9 +463,17 @@ mod tests {
     }
 
     #[test]
-    fn intent_rows_land_in_watchdog_redb_and_export_as_recovery() {
+    fn intent_rows_land_in_watchdog_redb_and_wait_for_governor_admission() {
         let dir = temp_root("intent-rows");
         let spool = WatchdogSpool::open_test(&dir.join("watchdog.redb")).expect("open intent spool");
+        assert!(matches!(
+            spool.append(500, WatchdogSpoolPayload::Gap {
+                service: SERVICE_NAME.to_owned(),
+                reason: GapRecoveryReason::AdmissionUnavailable,
+                coverage_claimed: false,
+            }).expect("append leading gap"),
+            SpoolAppendOutcome::Stored
+        ));
         let proof = test_proof();
         let observed_problem = 1_000;
         let problem = ProblemIntentRecord::new(
@@ -410,29 +493,134 @@ mod tests {
             SpoolAppendOutcome::Stored
         ));
         let entries = spool.readback().expect("intent readback");
-        assert_eq!(entries.len(), 2);
-        assert!(matches!(&entries[0].payload, WatchdogSpoolPayload::ProblemIntent {
+        assert_eq!(entries.len(), 3);
+        assert!(matches!(&entries[0].payload, WatchdogSpoolPayload::Gap { .. }));
+        assert!(matches!(&entries[1].payload, WatchdogSpoolPayload::ProblemIntent {
             evidence_refs, lineage_installation_id, lineage_generation, lineage_epoch,
             governor_unavailable_reason, ..
         } if evidence_refs.len() == 2 && lineage_installation_id == "installation-test"
             && *lineage_generation == 7 && *lineage_epoch == 3
-            && *governor_unavailable_reason == GapRecoveryReason::AdmissionUnavailable));
-        assert_eq!(entries[0].observed_at_ms, observed_problem);
-        assert!(matches!(&entries[1].payload, WatchdogSpoolPayload::IncidentIntent { .. }));
-        assert_eq!(entries[1].observed_at_ms, observed_incident);
+            && *governor_unavailable_reason == GapRecoveryReason::LeaseInvalid));
+        assert_eq!(entries[1].observed_at_ms, observed_problem);
+        assert!(matches!(&entries[2].payload, WatchdogSpoolPayload::IncidentIntent { .. }));
+        assert_eq!(entries[2].observed_at_ms, observed_incident);
+        // The export window stops before the first intent: only the leading
+        // gap ships, and no Recovery-disposition path can touch an intent
+        // before Governor reconciliation.
         let predecessor = WatchdogSpoolCursor {
             schema_version: 1, acknowledged_sequence: 0, watchdog_generation: 7,
             watchdog_epoch: 3, installation_id: "installation-test".to_owned(),
             sink_id: "sink-test".to_owned(),
         };
         let high_water = spool.high_water_sequence().expect("intent high-water");
-        let (batch, _) = spool.export_batch(&predecessor, high_water, WatchdogSpoolExportLimits::default())
-            .expect("export intents");
-        assert_eq!(batch.entries.len(), 2);
-        assert!(batch.entries.iter().all(|entry| entry.payload_kind == WatchdogSpoolPayloadKind::Recovery));
-        assert!(GovernorUnavailability::admission_unavailable(GapRecoveryReason::SpoolPressure).is_err());
+        assert_eq!(high_water, 3);
+        let (batch, raws) = spool.export_batch(&predecessor, high_water, WatchdogSpoolExportLimits::default())
+            .expect("export stops before intents");
+        assert_eq!(batch.entries.len(), 1);
+        assert_eq!(batch.first_sequence, 1);
+        assert_eq!(batch.last_sequence, 1);
+        assert_eq!(batch.entries[0].payload_kind, WatchdogSpoolPayloadKind::Gap);
+        assert_eq!(raws.len(), 1);
         drop(spool);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn intent_head_parks_export_with_empty_batch() {
+        let dir = temp_root("intent-parked");
+        let spool = WatchdogSpool::open_test(&dir.join("watchdog.redb")).expect("open parked spool");
+        let problem = ProblemIntentRecord::new(
+            test_proof(), SERVICE_NAME.to_owned(), vec![evidence_ref(0x0c)], test_lineage(), 1_000,
+        ).expect("parked problem intent");
+        assert!(matches!(
+            spool.append(1_000, problem.to_payload()).expect("append parked problem intent"),
+            SpoolAppendOutcome::Stored
+        ));
+        let incident = IncidentIntentRecord::new(
+            test_proof(), SERVICE_NAME.to_owned(), vec![evidence_ref(0x0d)], test_lineage(), 2_000,
+        ).expect("parked incident intent");
+        assert!(matches!(
+            spool.append(2_000, incident.to_payload()).expect("append parked incident intent"),
+            SpoolAppendOutcome::Stored
+        ));
+        let predecessor = WatchdogSpoolCursor {
+            schema_version: 1, acknowledged_sequence: 0, watchdog_generation: 7,
+            watchdog_epoch: 3, installation_id: "installation-test".to_owned(),
+            sink_id: "sink-test".to_owned(),
+        };
+        let high_water = spool.high_water_sequence().expect("parked high-water");
+        assert_eq!(high_water, 2);
+        // Head of the window is an intent: no batch can form, so the spool
+        // owner returns the parked empty batch and the sink is never
+        // submitted to (`export_once` short-circuits on `is_empty_batch`).
+        let (batch, raws) = spool.export_batch(&predecessor, high_water, WatchdogSpoolExportLimits::default())
+            .expect("parked export");
+        assert!(batch.is_empty_batch);
+        assert!(batch.entries.is_empty());
+        assert!(raws.is_empty());
+        assert_eq!(batch.high_water_sequence, predecessor.acknowledged_sequence);
+        assert_eq!(batch.first_sequence, 1);
+        assert_eq!(batch.last_sequence, 0);
+        // Parked intents stay retained for Governor reconciliation.
+        let entries = spool.readback().expect("parked readback");
+        assert_eq!(entries.len(), 2);
+        drop(spool);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn governor_unavailability_binds_to_observed_admission_failure() {
+        // Admission-path observations mint with their own reason.
+        assert_eq!(
+            GovernorUnavailability::from_admission_error(&SpoolError::InvalidLease("test-lease".to_owned())).reason(),
+            GapRecoveryReason::LeaseInvalid
+        );
+        assert_eq!(
+            GovernorUnavailability::from_admission_error(&SpoolError::LeaseStale("test-stale".to_owned())).reason(),
+            GapRecoveryReason::LeaseStale
+        );
+        assert_eq!(
+            GovernorUnavailability::from_admission_error(&SpoolError::LeaseFenced("test-fenced".to_owned())).reason(),
+            GapRecoveryReason::LeaseFenced
+        );
+        assert_eq!(
+            GovernorUnavailability::from_admission_error(&SpoolError::Corrupt("test-corrupt".to_owned())).reason(),
+            GapRecoveryReason::AdmissionUnavailable
+        );
+        // Kernel supervision observations mint, except retention pressure.
+        assert_eq!(
+            GovernorUnavailability::from_kernel_error(&KernelWatchdogError::Unavailable).expect("kernel unavailable proof").reason(),
+            GapRecoveryReason::LeaseInvalid
+        );
+        assert_eq!(
+            GovernorUnavailability::from_kernel_error(&KernelWatchdogError::LeaseStale).expect("kernel stale proof").reason(),
+            GapRecoveryReason::LeaseStale
+        );
+        assert_eq!(
+            GovernorUnavailability::from_kernel_error(&KernelWatchdogError::Failed).expect("kernel failed proof").reason(),
+            GapRecoveryReason::LeaseInvalid
+        );
+        assert!(GovernorUnavailability::from_kernel_error(&KernelWatchdogError::SpoolPressure).is_err());
+        // No caller-chosen reason mints: retention pressure and host-identity
+        // observations fail closed at the persistence boundary.
+        for reason in [
+            GapRecoveryReason::SpoolPressure,
+            GapRecoveryReason::HostAbsentOrStopped,
+            GapRecoveryReason::HostPidReused,
+            GapRecoveryReason::HostImageSubstituted,
+            GapRecoveryReason::HostIdentityChanged,
+            GapRecoveryReason::HostUnknown,
+        ] {
+            let forged = WatchdogSpoolPayload::ProblemIntent {
+                service: SERVICE_NAME.to_owned(),
+                evidence_refs: vec![evidence_ref(0xaa)],
+                lineage_installation_id: "installation-test".to_owned(),
+                lineage_generation: 7,
+                lineage_epoch: 3,
+                governor_unavailable_reason: reason,
+            };
+            assert!(check_stored_intent_payload(1_000, &forged).is_err(), "forged intent reason must fail: {reason:?}");
+        }
     }
 
     #[test]

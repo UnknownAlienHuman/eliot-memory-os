@@ -117,7 +117,9 @@ pub fn export_once(
 /// record digest, payload digest, observed timestamp. The projection carries
 /// no sink identity and performs no I/O; the Governor-lane adapter maps each
 /// view onto its admission entry and each canonical outcome back onto the
-/// terminal sink disposition for its payload kind.
+/// terminal sink disposition for its payload kind. Spool-local intents never
+/// reach this projection: the spool owner stops the export window before the
+/// first intent until Governor-side admission lands.
 #[must_use]
 pub fn watchdog_entry_views(batch: &WatchdogSpoolExportBatch) -> Vec<WatchdogEntryView> {
     batch

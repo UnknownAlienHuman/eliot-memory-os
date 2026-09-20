@@ -60,10 +60,12 @@ pub enum WatchdogSpoolPayload {
         corrupt_digest: String,
     },
     /// Watchdog-owned problem intent for Governor-unavailable reconciliation
-    /// (I8.1, case-(b) spool-local kind: exports under the existing `Recovery`
-    /// class, never as a new shared kind). Evidence refs are 64-hex digests;
+    /// (I8.1, case-(b) spool-local kind: stored and retained, never exported
+    /// until Governor-side admission lands, and never as a new shared kind).
+    /// Evidence refs are 64-hex digests;
     /// lineage mirrors the export cursor identities; the reason proves
-    /// Governor unavailability (never `SpoolPressure`).
+    /// an observed Governor admission failure (an admission/lease reason only;
+    /// never `SpoolPressure` or a host-identity observation).
     ProblemIntent {
         service: String,
         evidence_refs: Vec<String>,
@@ -72,8 +74,8 @@ pub enum WatchdogSpoolPayload {
         lineage_epoch: u64,
         governor_unavailable_reason: GapRecoveryReason,
     },
-    /// Watchdog-owned incident intent, same spool-local shape and export class
-    /// as [`WatchdogSpoolPayload::ProblemIntent`].
+    /// Watchdog-owned incident intent, same spool-local shape and export
+    /// exclusion as [`WatchdogSpoolPayload::ProblemIntent`].
     IncidentIntent {
         service: String,
         evidence_refs: Vec<String>,
