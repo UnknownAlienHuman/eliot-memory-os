@@ -1,7 +1,7 @@
-//! Owner-neutral rival projection consumed by discriminative-probe planning.
+//! Derived rival probe-input view consumed by discriminative-probe planning.
 //!
 //! The rich rival-structuring implementation may retain additional packing and
-//! diagnostic state. This projection carries only the immutable identities,
+//! diagnostic state. This derived view carries only the immutable identities,
 //! discriminative objectives, and explicit omissions required by consumers.
 //!
 //! Divergence from [`super::projection::RivalModelSet`]: that canonical
@@ -10,13 +10,14 @@
 //! coverage summaries, omission frontier). This module seals a different,
 //! probe-input preimage (retained [`ProbeObjective`] rows, explicit
 //! [`RivalObjectiveOmission`] accounting, declared counts, coverage digests,
-//! [`RivalModelSetDisposition`]). The two shapes serve different consumers
+//! [`RivalProbeInputSetDisposition`]). The two shapes serve different consumers
 //! and hash different preimages, so they cannot share one digest input:
-//! merging them would alter a frozen canonical digest. Each module therefore
-//! owns its wire revision under its own path, and only the projection
+//! merging them would alter a frozen canonical digest. Only the projection
 //! revision is re-exported at the `rival::` level, keeping a single canonical
-//! crate-level definition. Long-term consolidation is an auditor decision;
-//! this module intentionally stays separate and keeps its own preimage.
+//! crate-level definition. This module is a derived consumer view: its digest
+//! is its own first encoding and never the canonical model-set digest.
+//! Long-term consolidation is an auditor decision; this module intentionally
+//! stays separate and keeps its own preimage.
 
 use eliot_contracts::{ArtifactId, StateFence, TaskId};
 use serde::{Deserialize, Serialize};
@@ -25,13 +26,13 @@ use crate::{ContractViolation, probe::ProbeObjective};
 
 use super::validation;
 
-/// Wire revision for the owner-neutral rival projection.
-pub const RIVAL_MODEL_SET_SCHEMA_VERSION: u32 = 1;
+/// Encoding version for the derived rival probe-input view (not the canonical model-set wire revision).
+pub const RIVAL_PROBE_INPUT_SET_SCHEMA_VERSION: u32 = 1;
 
-/// Projection completeness. No variant is a truth or winner verdict.
+/// Derived-view completeness. No variant is a truth or winner verdict.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum RivalModelSetDisposition {
+pub enum RivalProbeInputSetDisposition {
     Complete,
     Partial,
     InsufficientRivals,
@@ -66,25 +67,25 @@ impl RivalObjectiveOmission {
     pub fn validate(&self) -> Result<(), ContractViolation> {
         validation::preflight(self)?;
         for (value, field) in [
-            (&self.model_id, "rival.projection.omission.model_id"),
-            (&self.prediction_id, "rival.projection.omission.prediction_id"),
-            (&self.peer_model_id, "rival.projection.omission.peer_model_id"),
+            (&self.model_id, "rival.probe_input_set.omission.model_id"),
+            (&self.prediction_id, "rival.probe_input_set.omission.prediction_id"),
+            (&self.peer_model_id, "rival.probe_input_set.omission.peer_model_id"),
             (
                 &self.peer_prediction_id,
-                "rival.projection.omission.peer_prediction_id",
+                "rival.probe_input_set.omission.peer_prediction_id",
             ),
         ] {
             if let Some(value) = value {
                 validation::artifact(value, field)?;
             }
         }
-        validation::text(&self.detail, "rival.projection.omission.detail")
+        validation::text(&self.detail, "rival.probe_input_set.omission.detail")
     }
 }
 
-/// Named constructor input for [`RivalModelSet`].
+/// Named constructor input for [`RivalProbeInputSet`] (derived view; never the canonical model set).
 #[derive(Clone, Debug)]
-pub struct RivalModelSetParams {
+pub struct RivalProbeInputSetParams {
     pub set_id: ArtifactId,
     pub task_id: TaskId,
     pub scope: String,
@@ -101,13 +102,13 @@ pub struct RivalModelSetParams {
     pub source_coverage_digest: String,
     pub objectives: Vec<ProbeObjective>,
     pub omissions: Vec<RivalObjectiveOmission>,
-    pub disposition: RivalModelSetDisposition,
+    pub disposition: RivalProbeInputSetDisposition,
 }
 
-/// Immutable, bounded rival projection used by later contract-only consumers.
+/// Immutable, bounded derived rival probe-input view used by later contract-only consumers.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct RivalModelSet {
+pub struct RivalProbeInputSet {
     pub schema_version: u32,
     pub set_id: ArtifactId,
     pub task_id: TaskId,
@@ -129,22 +130,22 @@ pub struct RivalModelSet {
     pub objectives: Vec<ProbeObjective>,
     /// Canonically ordered explicit omission accounting.
     pub omissions: Vec<RivalObjectiveOmission>,
-    pub disposition: RivalModelSetDisposition,
+    pub disposition: RivalProbeInputSetDisposition,
     pub digest: String,
 }
 
-/// Canonical digest preimage for [`RivalModelSet`], excluding the digest field.
+/// Digest preimage for [`RivalProbeInputSet`], excluding the digest field.
 ///
 /// A named struct is required because serde implements `Serialize` for tuples
 /// only up to 16 elements, while this preimage carries 19 fields. Field names
-/// and declaration order mirror the [`RivalModelSet`] content fields in their
+/// and declaration order mirror the [`RivalProbeInputSet`] content fields in their
 /// original tuple order; canonical bytes sort object keys, so the digest is
 /// stable regardless of declaration order. This preimage never compiled as a
-/// tuple, so no prior digest value exists: this struct establishes the first
-/// canonical encoding, and any field addition, removal, reorder, or rename
-/// alters the digest.
+/// tuple, so no prior digest value exists: this struct establishes this derived
+/// view's own first encoding (never the canonical model-set digest), and any
+/// field addition, removal, reorder, or rename alters the digest.
 #[derive(Serialize)]
-struct RivalModelSetDigestPreimage<'a> {
+struct RivalProbeInputSetDigestPreimage<'a> {
     schema_version: u32,
     set_id: &'a ArtifactId,
     task_id: &'a TaskId,
@@ -163,12 +164,12 @@ struct RivalModelSetDigestPreimage<'a> {
     objective_denominator: u32,
     objectives: &'a Vec<ProbeObjective>,
     omissions: &'a Vec<RivalObjectiveOmission>,
-    disposition: RivalModelSetDisposition,
+    disposition: RivalProbeInputSetDisposition,
 }
 
-impl RivalModelSet {
-    /// Constructs and seals one canonical owner-neutral projection.
-    pub fn new(mut params: RivalModelSetParams) -> Result<Self, ContractViolation> {
+impl RivalProbeInputSet {
+    /// Constructs and seals one derived probe-input view.
+    pub fn new(mut params: RivalProbeInputSetParams) -> Result<Self, ContractViolation> {
         params
             .objectives
             .sort_by(|left, right| left.objective_id.cmp(&right.objective_id));
@@ -178,20 +179,20 @@ impl RivalModelSet {
             .len()
             .checked_add(params.omissions.len())
             .ok_or(ContractViolation::OutOfBounds {
-                field: "rival.projection.objective_denominator",
+                field: "rival.probe_input_set.objective_denominator",
                 min: 0,
                 max: i64::from(u32::MAX),
                 got: i64::MAX,
             })?;
         let objective_denominator =
             u32::try_from(denominator).map_err(|_| ContractViolation::OutOfBounds {
-                field: "rival.projection.objective_denominator",
+                field: "rival.probe_input_set.objective_denominator",
                 min: 0,
                 max: i64::from(u32::MAX),
                 got: crate::error::len_i64(denominator),
             })?;
         let mut value = Self {
-            schema_version: RIVAL_MODEL_SET_SCHEMA_VERSION,
+            schema_version: RIVAL_PROBE_INPUT_SET_SCHEMA_VERSION,
             set_id: params.set_id,
             task_id: params.task_id,
             scope: params.scope,
@@ -217,26 +218,26 @@ impl RivalModelSet {
         Ok(value)
     }
 
-    /// Validates intrinsic shape and canonical digest.
+    /// Validates intrinsic shape and derived-view digest.
     pub fn validate(&self) -> Result<(), ContractViolation> {
         validation::preflight(self)?;
         self.validate_shape()?;
-        validation::digest(&self.digest, "rival.projection.digest")?;
+        validation::digest(&self.digest, "rival.probe_input_set.digest")?;
         if self.digest != self.compute_digest()? {
             return binding(
-                "rival.projection.digest",
-                "digest does not match the rival projection",
+                "rival.probe_input_set.digest",
+                "digest does not match the rival probe-input view",
             );
         }
         Ok(())
     }
 
-    /// Computes the canonical digest excluding the digest field.
+    /// Computes the derived-view digest excluding the digest field.
     ///
-    /// The preimage is [`RivalModelSetDigestPreimage`]: the same 19 content
+    /// The preimage is [`RivalProbeInputSetDigestPreimage`]: the same 19 content
     /// fields, in the same order, under their struct field names.
     pub fn compute_digest(&self) -> Result<String, ContractViolation> {
-        validation::canonical_digest(&RivalModelSetDigestPreimage {
+        validation::canonical_digest(&RivalProbeInputSetDigestPreimage {
             schema_version: self.schema_version,
             set_id: &self.set_id,
             task_id: &self.task_id,
@@ -261,47 +262,47 @@ impl RivalModelSet {
 
     #[allow(clippy::too_many_lines)] // Sequential per-field shape checks stay contiguous.
     fn validate_shape(&self) -> Result<(), ContractViolation> {
-        if self.schema_version != RIVAL_MODEL_SET_SCHEMA_VERSION {
+        if self.schema_version != RIVAL_PROBE_INPUT_SET_SCHEMA_VERSION {
             return binding(
-                "rival.projection.schema_version",
-                "unsupported projection schema version",
+                "rival.probe_input_set.schema_version",
+                "unsupported probe-input view schema version",
             );
         }
-        validation::artifact(&self.set_id, "rival.projection.set_id")?;
-        validation::text(self.task_id.as_str(), "rival.projection.task_id")?;
-        validation::text(&self.scope, "rival.projection.scope")?;
+        validation::artifact(&self.set_id, "rival.probe_input_set.set_id")?;
+        validation::text(self.task_id.as_str(), "rival.probe_input_set.task_id")?;
+        validation::text(&self.scope, "rival.probe_input_set.scope")?;
         self.state_fence
             .validate()
             .map_err(|error| ContractViolation::BindingMismatch {
-                field: "rival.projection.state_fence",
+                field: "rival.probe_input_set.state_fence",
                 reason: error.to_string(),
             })?;
         for (digest, field) in [
-            (&self.bundle_digest, "rival.projection.bundle_digest"),
+            (&self.bundle_digest, "rival.probe_input_set.bundle_digest"),
             (
                 &self.validated_input_digest,
-                "rival.projection.validated_input_digest",
+                "rival.probe_input_set.validated_input_digest",
             ),
-            (&self.source_set_digest, "rival.projection.source_set_digest"),
-            (&self.policy_digest, "rival.projection.policy_digest"),
+            (&self.source_set_digest, "rival.probe_input_set.source_set_digest"),
+            (&self.policy_digest, "rival.probe_input_set.policy_digest"),
             (
                 &self.model_coverage_digest,
-                "rival.projection.model_coverage_digest",
+                "rival.probe_input_set.model_coverage_digest",
             ),
             (
                 &self.source_coverage_digest,
-                "rival.projection.source_coverage_digest",
+                "rival.probe_input_set.source_coverage_digest",
             ),
         ] {
             validation::digest(digest, field)?;
         }
-        validation::artifact(&self.source_set_id, "rival.projection.source_set_id")?;
-        validation::text(&self.policy_id, "rival.projection.policy_id")?;
+        validation::artifact(&self.source_set_id, "rival.probe_input_set.source_set_id")?;
+        validation::text(&self.policy_id, "rival.probe_input_set.policy_id")?;
         for (count, field) in [
-            (self.declared_model_count, "rival.projection.declared_model_count"),
+            (self.declared_model_count, "rival.probe_input_set.declared_model_count"),
             (
                 self.declared_source_count,
-                "rival.projection.declared_source_count",
+                "rival.probe_input_set.declared_source_count",
             ),
         ] {
             if usize::try_from(count).map_or(true, |count| count > validation::MAX_RIVAL_ITEMS) {
@@ -313,21 +314,21 @@ impl RivalModelSet {
                 });
             }
         }
-        validation::sequence(self.objectives.len(), "rival.projection.objectives")?;
-        validation::sequence(self.omissions.len(), "rival.projection.omissions")?;
+        validation::sequence(self.objectives.len(), "rival.probe_input_set.objectives")?;
+        validation::sequence(self.omissions.len(), "rival.probe_input_set.omissions")?;
         let actual_denominator = self
             .objectives
             .len()
             .checked_add(self.omissions.len())
             .ok_or(ContractViolation::OutOfBounds {
-                field: "rival.projection.objective_denominator",
+                field: "rival.probe_input_set.objective_denominator",
                 min: 0,
                 max: i64::from(u32::MAX),
                 got: i64::MAX,
             })?;
         if usize::try_from(self.objective_denominator).ok() != Some(actual_denominator) {
             return binding(
-                "rival.projection.objective_denominator",
+                "rival.probe_input_set.objective_denominator",
                 "denominator differs from retained plus omitted rows",
             );
         }
@@ -336,7 +337,7 @@ impl RivalModelSet {
             objective.validate()?;
             if previous_objective.is_some_and(|prior| prior >= &objective.objective_id) {
                 return binding(
-                    "rival.projection.objectives",
+                    "rival.probe_input_set.objectives",
                     "objective identities must be unique and canonically ordered",
                 );
             }
@@ -347,24 +348,24 @@ impl RivalModelSet {
             omission.validate()?;
             if previous_omission.is_some_and(|prior| prior >= omission) {
                 return binding(
-                    "rival.projection.omissions",
+                    "rival.probe_input_set.omissions",
                     "omissions must be unique and canonically ordered",
                 );
             }
             previous_omission = Some(omission);
         }
         match self.disposition {
-            RivalModelSetDisposition::Complete
+            RivalProbeInputSetDisposition::Complete
                 if self.objectives.is_empty() || !self.omissions.is_empty() =>
             {
                 return binding(
-                    "rival.projection.disposition",
-                    "complete projection requires objectives and no omissions",
+                    "rival.probe_input_set.disposition",
+                    "complete probe-input view requires objectives and no omissions",
                 );
             }
-            RivalModelSetDisposition::InsufficientRivals if self.declared_model_count >= 2 => {
+            RivalProbeInputSetDisposition::InsufficientRivals if self.declared_model_count >= 2 => {
                 return binding(
-                    "rival.projection.disposition",
+                    "rival.probe_input_set.disposition",
                     "insufficient-rivals requires fewer than two declared models",
                 );
             }
