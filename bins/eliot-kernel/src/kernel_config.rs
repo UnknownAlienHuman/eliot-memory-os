@@ -15,7 +15,7 @@
 #[cfg(windows)]
 use super::SupervisionLeaseAuthorityConfig;
 use super::{
-    AgentBridgeAdmissionDescriptor, DEFAULT_PIPE_NAME, EliotdLaunchDescriptor,
+    AgentBridgeAdmissionDescriptor, BlobStoreManifest, DEFAULT_PIPE_NAME, EliotdLaunchDescriptor,
     EliotdReceiptRootBinding, HostStoreBootstrapRequirement, PathBuf,
 };
 use crate::kernel_diagnostics::{EntrypointStage, observe_entrypoint_with_detail};
@@ -30,6 +30,10 @@ pub struct KernelConfig {
     /// Host-approved canonical-store binding. No store gateway is admitted
     /// until this requirement is injected explicitly.
     pub store_bootstrap: Option<HostStoreBootstrapRequirement>,
+    /// Host-approved Blob Store manifest (I1.11 step 4). Validated at
+    /// startup without starting the blob generation; `None` keeps large
+    /// payloads degraded while inline work stays available.
+    pub blob_manifest: Option<BlobStoreManifest>,
     /// Host/installer-approved `eliotd` child launch contour.  Integrated
     /// startup must inject this explicitly; there is no path or argv default.
     pub daemon_launch: Option<EliotdLaunchDescriptor>,
@@ -83,6 +87,7 @@ impl KernelConfig {
             work_root: work_root.into(),
             pipe_name: DEFAULT_PIPE_NAME.to_owned(),
             store_bootstrap: None,
+            blob_manifest: None,
             daemon_launch: None,
             kernel_artifact_sha256: None,
             eliotd_descriptor_artifact_sha256: None,
@@ -110,6 +115,19 @@ impl KernelConfig {
             "kernel.config.store_bootstrap_injected",
         );
         self.store_bootstrap = Some(requirement);
+        self
+    }
+
+    /// Injects the Host-approved Blob Store manifest (I1.11 step 4).
+    /// Validation happens at composition assembly without starting the
+    /// blob generation; only fixed phase labels are emitted.
+    #[must_use]
+    pub fn with_blob_manifest(mut self, manifest: BlobStoreManifest) -> Self {
+        observe_entrypoint_with_detail(
+            EntrypointStage::StoreBootstrap,
+            "kernel.config.blob_manifest_injected",
+        );
+        self.blob_manifest = Some(manifest);
         self
     }
 
