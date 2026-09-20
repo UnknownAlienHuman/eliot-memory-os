@@ -28,6 +28,7 @@ use eliot_runtime::{Runtime, RuntimeConfig};
 mod cli_contract;
 mod kernel_activation_client;
 mod kernel_host_request_client;
+pub mod reactive_injection_receipts;
 pub(crate) use cli_contract::validate_client_declaration_path;
 pub use cli_contract::{CliConfig, CliError, Profile, Transport, parse_args};
 use kernel_activation_client::KernelHostActivationPort;
