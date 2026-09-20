@@ -286,8 +286,7 @@ pub const HOT_RESPONSE_MAX_BYTES: usize = eliot_protocol::HOT_RESPONSE_BYTES;
 /// A structured body above this ceiling is not emitted inline; the caller
 /// must return the applicable immutable Blob/Resource handle instead. The
 /// violation surfaces as `OversizeFrame` with this maximum.
-pub const STRUCTURED_RESPONSE_MAX_BYTES: usize =
-    eliot_protocol::HARD_STRUCTURED_RESPONSE_BYTES;
+pub const STRUCTURED_RESPONSE_MAX_BYTES: usize = eliot_protocol::HARD_STRUCTURED_RESPONSE_BYTES;
 
 impl TransportLimits {
     fn validate(self) -> Result<Self, TransportError> {

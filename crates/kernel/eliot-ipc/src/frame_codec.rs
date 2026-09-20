@@ -41,9 +41,7 @@
 //!   (`ZeroLengthFrame`) vs oversize (`OversizeFrame`) vs trailing
 //!   (`Backpressure` here, `TrailingBytes` in `decode_frame`) are never fused.
 
-use super::{
-    TransportError, TransportLimits, check_inline_response_ceiling,
-};
+use super::{TransportError, TransportLimits, check_inline_response_ceiling};
 use eliot_protocol::{Frame, JsonCodec, ProtocolError};
 
 /// Wire prefix length: four-byte little-endian body length (Implementation `I7.2`).
