@@ -2329,6 +2329,7 @@ name = "eliot-ors"
 version = "0.1.0"
 dependencies = [
  "eliot-contracts",
+ "eliot-ors",
  "eliot-platform",
  "eliot-process",
  "eliot-receipts",

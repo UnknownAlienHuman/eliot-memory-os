@@ -9,8 +9,8 @@
 //! authority, only a test-owned store handle with automatic cleanup.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::{
     CanonicalEvidenceProvider, CanonicalReconciliation, EpochIdentity, EpochLineage, OpaqueLabel,
@@ -119,9 +119,11 @@ impl CanonicalEvidenceProvider for KernelRouteEvidence {
 /// `open` creates a unique temp directory, opens `ors.redb` inside it through
 /// [`RedbRecoveryStore::open_kernel_route_for_test`], and hands out the store
 /// handle. Dropping the fixture removes the temp directory best-effort; the
-/// database files stay durable until then, so crash/restart shapes can reopen
-/// the same path through [`KernelRouteStoreFixture::reopen`] while the fixture
-/// is alive.
+/// database files stay durable until then. There is no reopen seam: redb takes
+/// an exclusive file lock, so a second handle cannot open while the fixture's
+/// store is alive, and dropping the fixture removes the path. Restart shapes
+/// reopen through [`RedbRecoveryStore::open`] on a persisted (non-fixture)
+/// path instead.
 pub struct KernelRouteStoreFixture {
     store: Arc<RedbRecoveryStore>,
     dir: PathBuf,
@@ -150,15 +152,6 @@ impl KernelRouteStoreFixture {
     /// Returns the fixture temp directory holding `ors.redb`.
     pub fn path(&self) -> &Path {
         &self.dir
-    }
-
-    /// Reopens the same database path with fresh Kernel-route evidence.
-    ///
-    /// The caller must have released every prior handle to this path first:
-    /// redb takes an exclusive file lock, so a second live handle fails with
-    /// a storage error instead of forking the database.
-    pub fn reopen(&self) -> Result<RedbRecoveryStore, OrsError> {
-        RedbRecoveryStore::open_kernel_route_for_test(self.dir.join("ors.redb"))
     }
 }
 
@@ -193,14 +186,18 @@ pub fn kernel_route_writer_epoch(lineage_id: &str, epoch: u64) -> Result<EpochLi
 /// label validation, and sanitization stay identical: the label names the
 /// directory only, grants nothing, and is never stored. A blank label or one
 /// containing control characters fails before any filesystem work; all other
-/// non-filename characters are flattened to `-`.
+/// non-filename characters are flattened to `-`. Uniqueness is monotonic, not
+/// clock-derived: a process-wide counter disambiguates two same-label fixtures
+/// even when the wall clock repeats.
 pub fn kernel_fixture_dir(label: &str) -> Result<PathBuf, OrsError> {
+    static NEXT_KERNEL_FIXTURE: AtomicU64 = AtomicU64::new(1);
     if label.trim().is_empty() || label.chars().any(char::is_control) {
         return Err(OrsError::InvalidField {
             field: "fixture_label",
             reason: "must be non-blank text without control characters",
         });
     }
+    let serial = NEXT_KERNEL_FIXTURE.fetch_add(1, Ordering::Relaxed);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |duration| duration.as_nanos());
@@ -215,90 +212,13 @@ pub fn kernel_fixture_dir(label: &str) -> Result<PathBuf, OrsError> {
         })
         .collect();
     let dir = std::env::temp_dir().join(format!(
-        "eliot-kernel-ors-{safe_label}-{}-{nanos}",
+        "eliot-kernel-ors-{safe_label}-{}-{serial}-{nanos}",
         std::process::id()
     ));
     std::fs::create_dir_all(&dir).map_err(|error| {
         OrsError::Storage(format!("kernel fixture temp root is not writable: {error}"))
     })?;
     Ok(dir)
-}
-
-/// Fixture evidence that accepts every canonical check (issue #2031).
-///
-/// Test-only shortcut for open/empty-state proofs that never exercise
-/// lifecycle authority: coordinator and store open paths, empty recovery
-/// scans, and isolation checks. Lifecycle proofs that stage, execute, or
-/// reconcile reservations must use [`KernelRouteEvidence`], which
-/// authenticates structure instead of accepting by fiat.
-#[derive(Debug, Default)]
-pub struct AcceptAllCanonicalEvidence;
-
-impl CanonicalEvidenceProvider for AcceptAllCanonicalEvidence {
-    fn verify_ordering_heads(&self, _scopes: &[ScopeReservationRequest]) -> Result<(), OrsError> {
-        Ok(())
-    }
-
-    fn verify_reconciliation(
-        &self,
-        _token: &crate::WriterReservationToken,
-        _reconciliation: &CanonicalReconciliation,
-    ) -> Result<(), OrsError> {
-        Ok(())
-    }
-
-    fn verify_receipt(&self, _receipt: &eliot_receipts::ReceiptEnvelope) -> Result<(), OrsError> {
-        Ok(())
-    }
-
-    fn verify_recovery_inbox(&self, _item: &RecoveryInboxItem) -> Result<(), OrsError> {
-        Ok(())
-    }
-}
-
-/// Store-level Kernel ORS fixture: one temp redb database opened with the
-/// [`AcceptAllCanonicalEvidence`] provider (issue #2031).
-///
-/// The store-level equivalent of
-/// [`OrsCoordinator::open_kernel_fixture`][crate::OrsCoordinator]: minimal
-/// open/empty-state proofs share this handle instead of vendoring their own
-/// temp-root setup. Lifecycle proofs that need structural authentication use
-/// [`KernelRouteStoreFixture`]. Dropping the fixture removes the temp
-/// directory best-effort.
-pub struct KernelOrsFixture {
-    store: Arc<RedbRecoveryStore>,
-    dir: PathBuf,
-}
-
-impl KernelOrsFixture {
-    /// Opens one isolated store fixture tagged for diagnosis.
-    pub fn open(label: &str) -> Result<Self, OrsError> {
-        let dir = kernel_fixture_dir(label)?;
-        let store = RedbRecoveryStore::open_with_evidence(
-            dir.join("ors.redb"),
-            Arc::new(AcceptAllCanonicalEvidence),
-        )?;
-        Ok(Self {
-            store: Arc::new(store),
-            dir,
-        })
-    }
-
-    /// Returns the test-owned store handle.
-    pub fn store(&self) -> &Arc<RedbRecoveryStore> {
-        &self.store
-    }
-
-    /// Returns the fixture temp directory holding `ors.redb`.
-    pub fn path(&self) -> &Path {
-        &self.dir
-    }
-}
-
-impl Drop for KernelOrsFixture {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
-    }
 }
 
 /// Installs one typed handoff persistence failpoint on a test-owned store.
@@ -316,58 +236,4 @@ pub fn substitute_authority_snapshot_metadata(
     substitution: AuthoritySnapshotMetadataSubstitution,
 ) -> Result<(), OrsError> {
     store.substitute_authority_snapshot_metadata_for_test(substitution)
-}
-
-#[cfg(test)]
-mod kernel_ors_fixture_tests {
-    use super::{AcceptAllCanonicalEvidence, KernelOrsFixture};
-    use crate::{CanonicalEvidenceProvider as _, OperationIdentity, UnknownCommitRecord};
-
-    fn unknown_record(operation: &str) -> UnknownCommitRecord {
-        let operation_id = match OperationIdentity::new(operation) {
-            Ok(identity) => identity,
-            Err(error) => panic!("2031 fixture operation identity must build: {error}"),
-        };
-        UnknownCommitRecord {
-            idempotency_key: "key-2031".to_owned(),
-            operation_id,
-            canonical_request_hash: "a".repeat(64),
-            ordering_scopes: vec!["scope-2031".to_owned()],
-            outcome: None,
-            evidence_receipt_digest: None,
-        }
-    }
-
-    #[test]
-    fn fixture_vends_usable_isolated_store() {
-        let evidence = AcceptAllCanonicalEvidence;
-        assert!(evidence.verify_ordering_heads(&[]).is_ok());
-        let home = match KernelOrsFixture::open("2031-home") {
-            Ok(fixture) => fixture,
-            Err(error) => panic!("2031 home fixture must open: {error}"),
-        };
-        assert!(home.path().exists());
-        match home.store().list_open_unknown_commits() {
-            Ok(open) => assert!(open.is_empty()),
-            Err(error) => panic!("2031 fresh fixture must list empty: {error}"),
-        }
-        let record = unknown_record("op-2031-1");
-        match home.store().stage_unknown_commit(&record) {
-            Ok(staged) => assert!(staged.is_none()),
-            Err(error) => panic!("2031 fixture must stage: {error}"),
-        }
-        match home.store().list_open_unknown_commits() {
-            Ok(open) => assert_eq!(open.len(), 1),
-            Err(error) => panic!("2031 fixture must list staged: {error}"),
-        }
-        let away = match KernelOrsFixture::open("2031-away") {
-            Ok(fixture) => fixture,
-            Err(error) => panic!("2031 away fixture must open: {error}"),
-        };
-        assert_ne!(away.path(), home.path());
-        match away.store().list_open_unknown_commits() {
-            Ok(open) => assert!(open.is_empty()),
-            Err(error) => panic!("2031 away fixture stays isolated: {error}"),
-        }
-    }
 }

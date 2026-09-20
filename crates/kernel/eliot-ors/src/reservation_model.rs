@@ -12,8 +12,9 @@
 //! Source parity: `ScopeReservationRequest`, `ReservationRequest` + `validate`,
 //! `ReservedScope`, `WriterReservationToken`, `ReservationState` + `is_terminal`,
 //! `ReservationRecord` moved verbatim (derives, `serde` attrs, variants, fields,
-//! `pub(crate)` seams unchanged); `serde` shape and public API preserved via
-//! `lib.rs` re-export.
+//! `pub(crate)` seams unchanged except `ReservationState::is_terminal`, widened
+//! to `pub` for Kernel-route fixture drain/retention assertions, issue #2031);
+//! `serde` shape and public API otherwise preserved via `lib.rs` re-export.
 
 use std::collections::BTreeSet;
 
@@ -47,12 +48,7 @@ pub struct ReservationRequest {
 }
 
 impl ReservationRequest {
-    /// Checks the envelope, epoch binding, digest shape, scope set, and expiry.
-    ///
-    /// Public so test-usable Kernel-route fixtures and downstream proof harnesses
-    /// can validate a request with the exact owner check before staging.
-    /// Ordering authority itself is never granted here.
-    pub fn validate(&self) -> Result<(), OrsError> {
+    pub(crate) fn validate(&self) -> Result<(), OrsError> {
         self.envelope.validate()?;
         self.writer_epoch.validate()?;
         validate_digest(

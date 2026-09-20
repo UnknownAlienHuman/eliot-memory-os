@@ -1769,8 +1769,7 @@ impl RedbRecoveryStore {
             // matching digest proves the same result, so binding the missing
             // body is monotonic completion, not an overwrite. Anything else
             // under the same identity stays a conflict.
-            let completes_legacy =
-                same_digest && existing.result_response.is_none();
+            let completes_legacy = same_digest && existing.result_response.is_none();
             if !completes_legacy {
                 return Err(OrsError::HostRequestIdentityConflict {
                     operation_id: operation_id.as_str().to_owned(),
@@ -7077,24 +7076,6 @@ impl OrsCoordinator<RedbRecoveryStore> {
             store: RedbRecoveryStore::open(path)?,
         })
     }
-
-    /// Opens one isolated Kernel-route coordinator fixture for tests (issue #2031).
-    ///
-    /// Test-only (compiled under `test-support`): creates a unique temp-root
-    /// `redb` file bound to the fixture accept-all evidence and returns the
-    /// coordinator plus its temp directory. The caller owns cleanup of the
-    /// returned directory; the store file itself is never shared between
-    /// fixtures, so no second evidence owner is minted. See
-    /// `crate::test_support::KernelOrsFixture` for the store-level equivalent.
-    #[cfg(feature = "test-support")]
-    pub fn open_kernel_fixture(label: &str) -> Result<(Self, std::path::PathBuf), OrsError> {
-        let dir = crate::test_support::kernel_fixture_dir(label)?;
-        let store = RedbRecoveryStore::open_with_evidence(
-            dir.join("ors.redb"),
-            std::sync::Arc::new(crate::test_support::AcceptAllCanonicalEvidence),
-        )?;
-        Ok((Self::new(store), dir))
-    }
 }
 
 impl<S: OperationalRecoveryStore> OrsCoordinator<S> {
@@ -7767,8 +7748,7 @@ mod host_request_result_tests {
         let early_digest = "e".repeat(64);
         let early_op =
             OperationIdentity::new(format!("hostreq:{early_digest}")).expect("valid operation");
-        early_store
-            .stage_host_request(&requested_fixture(early_op.as_str(), &early_digest))?;
+        early_store.stage_host_request(&requested_fixture(early_op.as_str(), &early_digest))?;
         assert!(matches!(
             early_store.persist_host_request_result(
                 &early_op,
@@ -7790,9 +7770,8 @@ mod host_request_result_tests {
                 "revision_heads": [{"key": "scope:scope-1", "revision": 3}],
             },
         });
-        let result_digest = crate::model::sha256_hex(
-            &serde_json::to_vec(&body).expect("test body must serialize"),
-        );
+        let result_digest =
+            crate::model::sha256_hex(&serde_json::to_vec(&body).expect("test body must serialize"));
         let received = store
             .persist_host_request_result(&operation, &digest, &result_digest, &body)?
             .expect("resulted record must load");
@@ -7885,7 +7864,10 @@ mod host_request_result_tests {
         let completed = store
             .persist_host_request_result(&operation, &digest, &result_digest, &body)?
             .expect("exact-digest completion must store");
-        assert_eq!(completed.result_digest.as_deref(), Some(result_digest.as_str()));
+        assert_eq!(
+            completed.result_digest.as_deref(),
+            Some(result_digest.as_str())
+        );
         assert_eq!(completed.result_response.as_ref(), Some(&body));
         assert!(matches!(
             store.persist_host_request_result(&operation, &digest, &"0".repeat(64), &body,),
@@ -8071,26 +8053,5 @@ mod capability_grant_identity_tests {
         drop(store);
         let _ = std::fs::remove_file(path);
         Ok(())
-    }
-}
-
-#[cfg(all(test, feature = "test-support"))]
-mod kernel_fixture_coordinator_tests {
-    use super::OrsCoordinator;
-    use super::RedbRecoveryStore;
-
-    #[test]
-    fn coordinator_fixture_opens_empty_isolated_store() {
-        let (coordinator, dir) =
-            match OrsCoordinator::<RedbRecoveryStore>::open_kernel_fixture("2031-coordinator") {
-                Ok(opened) => opened,
-                Err(error) => panic!("2031 coordinator fixture must open: {error}"),
-            };
-        assert!(dir.exists());
-        match coordinator.store().list_open_unknown_commits() {
-            Ok(open) => assert!(open.is_empty()),
-            Err(error) => panic!("2031 coordinator fixture must list empty: {error}"),
-        }
-        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -46,23 +46,30 @@ fn test_epoch(sequence: u64) -> EpochId {
 
 static NEXT_DATABASE: AtomicU64 = AtomicU64::new(1);
 
-struct TestCanonicalEvidence;
+/// Provider for operational-surface projection tests (appendix P4).
+///
+/// Delegates every shared check to the single [`crate::test_support::KernelRouteEvidence`]
+/// binding instead of redefining it: only recovery-inbox import diverges, which
+/// the Kernel route never authenticates by design but the surface projection
+/// must stage as data. Receipt disposition on those staged items still runs
+/// through the shared structural receipt check.
+struct SurfaceProjectionEvidence;
 
-impl CanonicalEvidenceProvider for TestCanonicalEvidence {
-    fn verify_ordering_heads(&self, _scopes: &[ScopeReservationRequest]) -> Result<(), OrsError> {
-        Ok(())
+impl CanonicalEvidenceProvider for SurfaceProjectionEvidence {
+    fn verify_ordering_heads(&self, scopes: &[ScopeReservationRequest]) -> Result<(), OrsError> {
+        crate::test_support::KernelRouteEvidence.verify_ordering_heads(scopes)
     }
 
     fn verify_reconciliation(
         &self,
-        _token: &WriterReservationToken,
-        _reconciliation: &CanonicalReconciliation,
+        token: &WriterReservationToken,
+        reconciliation: &CanonicalReconciliation,
     ) -> Result<(), OrsError> {
-        Ok(())
+        crate::test_support::KernelRouteEvidence.verify_reconciliation(token, reconciliation)
     }
 
-    fn verify_receipt(&self, _receipt: &ReceiptEnvelope) -> Result<(), OrsError> {
-        Ok(())
+    fn verify_receipt(&self, receipt: &ReceiptEnvelope) -> Result<(), OrsError> {
+        crate::test_support::KernelRouteEvidence.verify_receipt(receipt)
     }
 
     fn verify_recovery_inbox(&self, _item: &RecoveryInboxItem) -> Result<(), OrsError> {
@@ -142,7 +149,7 @@ fn coordinator_with_evidence(
 }
 
 fn coordinator(path: &PathBuf) -> Result<OrsCoordinator, OrsError> {
-    coordinator_with_evidence(path, Arc::new(TestCanonicalEvidence))
+    coordinator_with_evidence(path, Arc::new(crate::test_support::KernelRouteEvidence))
 }
 
 fn database_path(label: &str) -> PathBuf {
@@ -3301,7 +3308,10 @@ fn worker_replay_ack_advances_only_its_phase_cursor() -> TestResult {
 fn appendix_p4_operational_surface_projects_rollover_and_retains_snapshot() -> TestResult {
     let path = database_path("p4-surface");
     cleanup(&path);
-    let coordinator = coordinator(&path)?;
+    // Surface projection stages recovery-inbox items as data, which the
+    // Kernel-route binding never authenticates: every other check still runs
+    // through the single shared binding via `SurfaceProjectionEvidence`.
+    let coordinator = coordinator_with_evidence(&path, Arc::new(SurfaceProjectionEvidence))?;
     let store = coordinator.store();
     let old = epoch(TEST_LINEAGE_C, 7)?;
     let token = coordinator.reserve(request(

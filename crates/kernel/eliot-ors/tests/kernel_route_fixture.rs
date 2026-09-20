@@ -5,8 +5,8 @@
 //! isolated temp redb store bound to the structural Kernel-route evidence and
 //! drives a real reserve-to-eligible lifecycle through it. A store opened
 //! without evidence rejects the same reservation, and two fixtures stay
-//! isolated. Compiled only with the `test-support` feature:
-//! `cargo test -p eliot-ors --features test-support`.
+//! isolated. Compiled only with the `test-support` feature, enabled for every
+//! `cargo test -p eliot-ors` invocation through the crate's dev-dependency.
 
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::expect_used)]
@@ -16,10 +16,10 @@ use std::num::NonZeroU64;
 
 use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
 use eliot_ors::{
-    test_support::{kernel_fixture_dir, kernel_route_writer_epoch, KernelRouteStoreFixture},
     ExpectedOrderingHead, OpaqueLabel, OperationalRecoveryStore, OrsError, RecoveryAccessClass,
     RecoveryCursor, RecoveryEnvelopeContext, RecoveryPayloadEnvelope, RedbRecoveryStore,
     ReservationRequest, ReservationState, ScopeReservationRequest, StateFenceSnapshot,
+    test_support::{KernelRouteStoreFixture, kernel_fixture_dir, kernel_route_writer_epoch},
 };
 use eliot_platform::SecretReference;
 use eliot_security_contracts::PrivacyClass;
@@ -143,9 +143,8 @@ fn store_without_evidence_rejects_reservation() {
 
 #[test]
 fn fixture_rejects_blank_labels_before_filesystem_work() {
-    let error = match KernelRouteStoreFixture::open("") {
-        Ok(_) => panic!("2031 blank tag must fail"),
-        Err(error) => error,
+    let Err(error) = KernelRouteStoreFixture::open("") else {
+        panic!("2031 blank tag must fail")
     };
     assert!(
         matches!(error, OrsError::InvalidField { .. }),

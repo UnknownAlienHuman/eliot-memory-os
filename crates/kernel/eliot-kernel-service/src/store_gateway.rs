@@ -30,8 +30,8 @@ use crate::commit_recovery::recover_commit;
 use crate::store_write_reservation::{
     CompositionReservation, ReservationSeed, ReservedSubmission, ResolvedSendOutcome,
     begin_execute_after_send, cancel_before_send, ensure_eligible, finalize_reservation,
-    mark_unknown_outcome, project_reserved_write, reconcile_receipt, reserve_for_transition,
-    writer_epoch_for_fence, writer_epoch_for_fence_from_epoch,
+    mark_unknown_outcome, reconcile_receipt, reserve_for_transition, writer_epoch_for_fence,
+    writer_epoch_for_fence_from_epoch,
 };
 use crate::{EbpCanonicalStoreClient, EbpStoreTransport, KernelService};
 
@@ -439,7 +439,11 @@ impl KernelStoreGateway {
             return Err("canonical-store gateway is fenced for rebind".to_owned());
         }
         let operation_id = transition.identity.operation_id.as_str().to_owned();
-        let request = project_reserved_write(
+        // The single authenticated send goes through the Kernel-visible
+        // reserved submission (issue #2031): the exact `#990` projection plus
+        // the boundary validation, so the production path and the tested
+        // projection share one constructor and one serializer.
+        let submission = ReservedSubmission::from_sealed(
             &sealed,
             context,
             &transition,
@@ -447,7 +451,10 @@ impl KernelStoreGateway {
             expected_ordering_heads,
         )
         .map_err(|error| error.to_string())?;
-        let outcome = self.store.apply_reserved_write(request).await;
+        let outcome = self
+            .store
+            .apply_reserved_write(submission.into_request())
+            .await;
         match outcome {
             Ok(receipt) => {
                 // Execution starts only now that the single send resolved: a
@@ -626,24 +633,15 @@ impl KernelStoreGateway {
         store_receipt_gateway::reconcile_reserved(self, token, request, receipt)
     }
 
-    /// Exact reserved-write capability this Kernel route's submissions carry
-    /// (issue #2031).
-    ///
-    /// Kernel-visible projection of the Store declaration: every
-    /// [`ReservedSubmission`][crate::ReservedSubmission] built from this
-    /// route's reservations names this capability, so session admission and
-    /// the scheduler profile refuse before dispatch when it is not admitted.
-    pub fn reserved_submission_capability(&self) -> &'static str {
-        crate::reserved_submission_capability()
-    }
-
     /// Projects one sealed reservation into a Kernel-visible reserved
     /// submission carrying the reserved capability (issue #2031).
     ///
     /// Runs the exact `#990` projection shared with [`Self::apply_reserved`]
     /// without sending: the returned submission is validated and ready for the
-    /// single authenticated send. Synchronous: projection is bounded local
-    /// validation only, never ORS or network work.
+    /// single authenticated send. A fenced gateway refuses the projection, so
+    /// no new submission is minted while migration exclusivity holds.
+    /// Synchronous: projection is bounded local validation only, never ORS or
+    /// network work.
     pub fn project_reserved_submission(
         &self,
         sealed: &crate::SealedReservation,
@@ -652,6 +650,12 @@ impl KernelStoreGateway {
         expected_revision_heads: Vec<RevisionHeadExpectation>,
         expected_ordering_heads: Vec<OrderingHeadExpectation>,
     ) -> Result<ReservedSubmission, String> {
+        if self.is_fenced() {
+            return Err(
+                "canonical-store gateway is fenced for rebind; refusing reserved projection"
+                    .to_owned(),
+            );
+        }
         ReservedSubmission::from_sealed(
             sealed,
             context,
@@ -1047,18 +1051,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn kernel_route_reserved_submissions_carry_the_store_capability() {
-        assert_eq!(
-            crate::reserved_submission_capability(),
-            eliot_store_api::CAPABILITY_RESERVED_WRITE
-        );
-        assert_eq!(
-            crate::RESERVED_SUBMISSION_CAPABILITY,
-            "store.reserved_write"
-        );
-    }
 
     #[test]
     fn store_gateway_fence_waits_for_in_flight_work_before_replacement() {
