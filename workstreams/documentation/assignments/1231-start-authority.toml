@@ -26,7 +26,7 @@ repository = [
   "docs/architecture/READING_PROTOCOL.md",
 ]
 implementation = [
-  "docs/architecture/I02-20-local-source-and-test-projections.md#i220-local-source-and-test-projections",
+  "docs/architecture/I02-20-module-contract-kit-crate-context-capsule-and-module-test-capsule.md#i220-module-contract-kit-crate-context-capsule-and-module-test-capsule",
   "docs/architecture/I18-21-local-and-ci-parity.md#i1821-local-and-ci-parity",
   "docs/architecture/I18-27-oracle-ownership-and-test-change-governance.md#i1827-oracle-ownership-and-test-change-governance",
 ]
