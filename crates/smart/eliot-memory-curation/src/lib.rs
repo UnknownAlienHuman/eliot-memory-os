@@ -7,6 +7,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod mutation_link;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use blake3::Hasher;
