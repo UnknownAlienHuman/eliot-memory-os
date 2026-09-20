@@ -52,6 +52,7 @@ mod observation_adapters;
 mod skill_lifecycle_adapters;
 mod skill_surface_adapters;
 mod store_failure_projection;
+pub mod task_binding_admission;
 mod task_lifecycle_adapters;
 
 pub use activation_projection::AgentActivationResolver;

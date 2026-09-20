@@ -74,6 +74,7 @@ pub use schema_bootstrap_contract::{
 mod request_dispatch;
 pub use request_dispatch::StoreDispatchBackend;
 pub use request_dispatch::dispatch;
+pub mod task_binding_gate;
 #[cfg(test)]
 use request_dispatch::map_recovery_dispatch_result;
 #[cfg(test)]
@@ -440,6 +441,21 @@ impl StoreComposition {
         transition
             .validate_against_catalogue(&entries)
             .map_err(StoreCompositionError::Store)?;
+        // Issue #1929: task-binding gate before any provider I/O. Cold unbound
+        // capture passes through; missing/incompatible task binding fails
+        // closed with the stable TASK_SELECTION_REQUIRED /
+        // TASK_SCOPE_INCOMPATIBLE code preserved in the typed reason.
+        if let Err(rejection) = crate::task_binding_gate::gate_apply(context, &transition) {
+            let reason = if rejection.code() == crate::task_binding_gate::TASK_SCOPE_INCOMPATIBLE {
+                crate::task_binding_gate::TASK_SCOPE_INCOMPATIBLE
+            } else {
+                crate::task_binding_gate::TASK_SELECTION_REQUIRED
+            };
+            return Err(StoreCompositionError::Store(StoreError::InvalidField {
+                field: "task_binding",
+                reason,
+            }));
+        }
         self.store
             .apply_prepared_with_authority(
                 context,
