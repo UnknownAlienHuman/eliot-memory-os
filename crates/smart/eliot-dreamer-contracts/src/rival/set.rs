@@ -3,6 +3,20 @@
 //! The rich rival-structuring implementation may retain additional packing and
 //! diagnostic state. This projection carries only the immutable identities,
 //! discriminative objectives, and explicit omissions required by consumers.
+//!
+//! Divergence from [`super::projection::RivalModelSet`]: that canonical
+//! projection (re-exported at the `rival::` level since #1502) seals a
+//! discriminator preimage (retained discriminators, unresolved requirements,
+//! coverage summaries, omission frontier). This module seals a different,
+//! probe-input preimage (retained [`ProbeObjective`] rows, explicit
+//! [`RivalObjectiveOmission`] accounting, declared counts, coverage digests,
+//! [`RivalModelSetDisposition`]). The two shapes serve different consumers
+//! and hash different preimages, so they cannot share one digest input:
+//! merging them would alter a frozen canonical digest. Each module therefore
+//! owns its wire revision under its own path, and only the projection
+//! revision is re-exported at the `rival::` level, keeping a single canonical
+//! crate-level definition. Long-term consolidation is an auditor decision;
+//! this module intentionally stays separate and keeps its own preimage.
 
 use eliot_contracts::{ArtifactId, StateFence, TaskId};
 use serde::{Deserialize, Serialize};
@@ -119,6 +133,39 @@ pub struct RivalModelSet {
     pub digest: String,
 }
 
+/// Canonical digest preimage for [`RivalModelSet`], excluding the digest field.
+///
+/// A named struct is required because serde implements `Serialize` for tuples
+/// only up to 16 elements, while this preimage carries 19 fields. Field names
+/// and declaration order mirror the [`RivalModelSet`] content fields in their
+/// original tuple order; canonical bytes sort object keys, so the digest is
+/// stable regardless of declaration order. This preimage never compiled as a
+/// tuple, so no prior digest value exists: this struct establishes the first
+/// canonical encoding, and any field addition, removal, reorder, or rename
+/// alters the digest.
+#[derive(Serialize)]
+struct RivalModelSetDigestPreimage<'a> {
+    schema_version: u32,
+    set_id: &'a ArtifactId,
+    task_id: &'a TaskId,
+    scope: &'a String,
+    state_fence: &'a StateFence,
+    bundle_digest: &'a String,
+    validated_input_digest: &'a String,
+    source_set_id: &'a ArtifactId,
+    source_set_digest: &'a String,
+    policy_id: &'a String,
+    policy_digest: &'a String,
+    declared_model_count: u32,
+    declared_source_count: u32,
+    model_coverage_digest: &'a String,
+    source_coverage_digest: &'a String,
+    objective_denominator: u32,
+    objectives: &'a Vec<ProbeObjective>,
+    omissions: &'a Vec<RivalObjectiveOmission>,
+    disposition: RivalModelSetDisposition,
+}
+
 impl RivalModelSet {
     /// Constructs and seals one canonical owner-neutral projection.
     pub fn new(mut params: RivalModelSetParams) -> Result<Self, ContractViolation> {
@@ -185,30 +232,34 @@ impl RivalModelSet {
     }
 
     /// Computes the canonical digest excluding the digest field.
+    ///
+    /// The preimage is [`RivalModelSetDigestPreimage`]: the same 19 content
+    /// fields, in the same order, under their struct field names.
     pub fn compute_digest(&self) -> Result<String, ContractViolation> {
-        validation::canonical_digest(&(
-            self.schema_version,
-            &self.set_id,
-            &self.task_id,
-            &self.scope,
-            &self.state_fence,
-            &self.bundle_digest,
-            &self.validated_input_digest,
-            &self.source_set_id,
-            &self.source_set_digest,
-            &self.policy_id,
-            &self.policy_digest,
-            self.declared_model_count,
-            self.declared_source_count,
-            &self.model_coverage_digest,
-            &self.source_coverage_digest,
-            self.objective_denominator,
-            &self.objectives,
-            &self.omissions,
-            self.disposition,
-        ))
+        validation::canonical_digest(&RivalModelSetDigestPreimage {
+            schema_version: self.schema_version,
+            set_id: &self.set_id,
+            task_id: &self.task_id,
+            scope: &self.scope,
+            state_fence: &self.state_fence,
+            bundle_digest: &self.bundle_digest,
+            validated_input_digest: &self.validated_input_digest,
+            source_set_id: &self.source_set_id,
+            source_set_digest: &self.source_set_digest,
+            policy_id: &self.policy_id,
+            policy_digest: &self.policy_digest,
+            declared_model_count: self.declared_model_count,
+            declared_source_count: self.declared_source_count,
+            model_coverage_digest: &self.model_coverage_digest,
+            source_coverage_digest: &self.source_coverage_digest,
+            objective_denominator: self.objective_denominator,
+            objectives: &self.objectives,
+            omissions: &self.omissions,
+            disposition: self.disposition,
+        })
     }
 
+    #[allow(clippy::too_many_lines)] // Sequential per-field shape checks stay contiguous.
     fn validate_shape(&self) -> Result<(), ContractViolation> {
         if self.schema_version != RIVAL_MODEL_SET_SCHEMA_VERSION {
             return binding(
