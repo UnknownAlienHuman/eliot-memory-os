@@ -21,7 +21,8 @@ use std::sync::OnceLock;
 use tracing_subscriber::EnvFilter;
 
 use crate::{
-    HostObservationState, WatchdogRuntimeReadback, WatchdogRuntimeState, WatchdogSelfAdmissionError,
+    HostObservationState, SpoolError, WatchdogRuntimeReadback, WatchdogRuntimeState,
+    WatchdogSelfAdmissionError,
 };
 
 /// Target for every event emitted by this facade.
@@ -47,13 +48,50 @@ static SUBSCRIBER_INSTALLED: OnceLock<bool> = OnceLock::new();
 /// panics, takes a recovery action, or logs recursively.
 pub fn install_subscriber() {
     let _ = SUBSCRIBER_INSTALLED.get_or_init(|| {
-        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+        let filter = EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new("info"));
         let _ = tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_writer(std::io::stderr)
             .try_init();
         true
     });
+}
+
+/// Per-field ceiling for free-text diagnostic detail (port of #738).
+///
+/// Mirrors `watchdog_service_status::START_FAILURE_DETAIL_MAX_CHARS` so the
+/// typed class stays stable while the cause survives truncation secret-free.
+pub(crate) const DIAGNOSTIC_DETAIL_MAX_CHARS: usize = 512;
+/// Per-field ceiling for installation identity echoes (port of #738).
+pub(crate) const DIAGNOSTIC_IDENTITY_MAX_CHARS: usize = 128;
+
+/// Truncates free-text diagnostic detail to [`DIAGNOSTIC_DETAIL_MAX_CHARS`]
+/// characters (port of #738).
+///
+/// The input is already secret-free (the registration nonce never enters
+/// `SpoolError` or the start-failure detail); truncation only bounds bytes.
+#[must_use]
+#[allow(dead_code, reason = "port of #738 truncation helper; wiring blocked on root-lock preparation")]
+pub(crate) fn truncate_diagnostic_detail(value: &str) -> String {
+    truncate_chars(value, DIAGNOSTIC_DETAIL_MAX_CHARS)
+}
+
+/// Truncates an installation identity echo to
+/// [`DIAGNOSTIC_IDENTITY_MAX_CHARS`] characters (port of #738).
+#[must_use]
+#[allow(dead_code, reason = "port of #738 truncation helper; wiring blocked on root-lock preparation")]
+pub(crate) fn truncate_diagnostic_identity(value: &str) -> String {
+    truncate_chars(value, DIAGNOSTIC_IDENTITY_MAX_CHARS)
+}
+
+#[allow(dead_code, reason = "port of #738 truncation helper; wiring blocked on root-lock preparation")]
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    if value.chars().count() > max_chars {
+        value.chars().take(max_chars).collect()
+    } else {
+        value.to_owned()
+    }
 }
 
 /// Stable diagnostic name for a [`HostObservationState`].
@@ -69,6 +107,27 @@ pub(crate) const fn host_observation_diagnostic(state: HostObservationState) -> 
         HostObservationState::ImageSubstituted => "image_substituted",
         HostObservationState::IdentityChanged => "identity_changed",
         HostObservationState::Unknown => "unknown",
+    }
+}
+
+/// Stable diagnostic observation for a [`SpoolError`] without its free-text
+/// (port of #738).
+///
+/// The inner string is never emitted (nested errors may contain protected
+/// data); only the variant class is returned. `InvalidLease` (unavailable or
+/// invalid) stays distinct from `LeaseStale` (stale) and `LeaseFenced`.
+#[must_use]
+#[allow(dead_code, reason = "port of #738 observation helper; wiring blocked on root-lock preparation")]
+pub(crate) const fn spool_error_observation(error: &SpoolError) -> &'static str {
+    match error {
+        SpoolError::Io(_) => "spool_io",
+        SpoolError::InvalidProtectedRoot => "invalid_protected_root",
+        SpoolError::Serialization(_) => "serialization",
+        SpoolError::Database(_) => "database",
+        SpoolError::Corrupt(_) => "corrupt",
+        SpoolError::InvalidLease(_) => "unavailable_or_invalid",
+        SpoolError::LeaseStale(_) => "stale",
+        SpoolError::LeaseFenced(_) => "fenced",
     }
 }
 
@@ -423,6 +482,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn diagnostic_detail_truncation_is_bounded() {
+        let long = "x".repeat(DIAGNOSTIC_DETAIL_MAX_CHARS + 16);
+        assert_eq!(
+            truncate_diagnostic_detail(&long).chars().count(),
+            DIAGNOSTIC_DETAIL_MAX_CHARS
+        );
+        assert_eq!(truncate_diagnostic_detail("short"), "short");
+    }
+
+    #[test]
+    fn diagnostic_identity_truncation_is_bounded() {
+        let long = "y".repeat(DIAGNOSTIC_IDENTITY_MAX_CHARS + 8);
+        assert_eq!(
+            truncate_diagnostic_identity(&long).chars().count(),
+            DIAGNOSTIC_IDENTITY_MAX_CHARS
+        );
+    }
+
+    #[test]
     fn observation_names_preserve_unknown_and_stale() {
         assert_eq!(
             host_observation_diagnostic(HostObservationState::Unknown),
@@ -431,6 +509,17 @@ mod tests {
         assert_ne!(
             host_observation_diagnostic(HostObservationState::Unknown),
             host_observation_diagnostic(HostObservationState::AbsentOrStopped)
+        );
+        let stale = SpoolError::LeaseStale("stale-cause".to_owned());
+        let unavailable = SpoolError::InvalidLease("missing".to_owned());
+        assert_eq!(spool_error_observation(&stale), "stale");
+        assert_eq!(
+            spool_error_observation(&unavailable),
+            "unavailable_or_invalid"
+        );
+        assert_ne!(
+            spool_error_observation(&stale),
+            spool_error_observation(&unavailable)
         );
     }
 
