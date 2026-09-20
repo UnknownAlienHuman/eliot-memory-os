@@ -426,6 +426,17 @@ impl ResearchEvidenceBundle {
         !self.coverage_gaps.is_empty()
     }
 
+    /// Whether the bundle carries an explicit budget-exhaustion gap entry.
+    /// A13.11 keeps verified partial work AND the coverage gap on budget
+    /// exhaustion; a close that hides exhaustion behind other gap kinds
+    /// violates ARCH-RES-04 (degradation visible and local).
+    #[must_use]
+    pub fn has_budget_exhausted_gap(&self) -> bool {
+        self.coverage_gaps
+            .iter()
+            .any(|gap| gap.kind == CoverageGapKind::BudgetExhausted)
+    }
+
     #[must_use]
     pub fn typed_gap_handles(&self) -> Vec<&str> {
         let mut handles: Vec<&str> = self

@@ -207,6 +207,17 @@ impl<B: ResearchBridge> GovernedExchange<B> {
             .get_mut(&bundle.job_id)
             .ok_or(ExchangeError::NotFound)?;
         bundle.validate_against(&job.request)?;
+        // A13.11: on budget exhaustion paid jobs stop while verified partial
+        // work AND the coverage gap remain. Fail closed: an exhausted bundle
+        // (spent progress reached the admitted budget) must carry an explicit
+        // BudgetExhausted gap entry; other gap kinds alone hide exhaustion
+        // and violate ARCH-RES-04 (degradation visible and local).
+        let exhausted = job.progress_units >= job.request.budget_units;
+        if exhausted && !bundle.has_budget_exhausted_gap() {
+            return Err(ExchangeError::Contract(
+                ResearchContractError::InvalidDisposition,
+            ));
+        }
         if !matches!(
             job.status,
             ExchangeStatus::Accepted | ExchangeStatus::Running | ExchangeStatus::Partial

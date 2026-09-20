@@ -707,3 +707,85 @@ fn empty_exchanges_cannot_close_as_supported_answers() {
         HandoffTerminal::Finished
     );
 }
+
+// WORK_UNIT_CASE: 1766/4
+#[test]
+fn exhausted_bundle_must_carry_budget_exhausted_gap() {
+    use eliot_research_exchange_api::ResearchContractError;
+
+    fn degraded_close(job_id: &str, gaps: Vec<CoverageGap>) -> ResearchEvidenceBundle {
+        let mut closing = bundle(job_id);
+        closing.sources = vec![snapshot("src-a")];
+        closing.claims = vec![claim("src-a", "a partial finding")];
+        closing.disposition = CompletionDisposition::IncompleteCoverage;
+        closing.coverage_gaps = gaps;
+        closing
+    }
+
+    // Below budget the same non-budget gaps still close: the gate keys off
+    // exhaustion, not off the degraded disposition.
+    let (mut fresh, fresh_job) = submitted_job();
+    let unexhausted = degraded_close(
+        &fresh_job,
+        vec![gap("src-b", CoverageGapKind::Timeout)],
+    );
+    unexhausted
+        .validate_against(&request())
+        .expect("valid below budget");
+    fresh
+        .import_bundle(unexhausted)
+        .expect("import below budget");
+
+    // At budget exhaustion a close carrying only non-budget gaps fails
+    // closed instead of hiding the exhaustion.
+    let req = request();
+    let (mut exchange, job_id) = submitted_job();
+    exchange
+        .mark_running(&job_id, &fence())
+        .expect("running");
+    exchange
+        .record_progress(&job_id, &fence(), req.budget_units)
+        .expect("spend reaches budget");
+    assert_eq!(
+        exchange
+            .snapshot()
+            .jobs
+            .get(&job_id)
+            .expect("job")
+            .progress_units,
+        req.budget_units
+    );
+    let hiding = degraded_close(&job_id, vec![gap("src-b", CoverageGapKind::Timeout)]);
+    hiding.validate_against(&req).expect("contract-valid gaps");
+    assert!(matches!(
+        exchange.import_bundle(hiding),
+        Err(ExchangeError::Contract(
+            ResearchContractError::InvalidDisposition
+        ))
+    ));
+    let hiding_unknown =
+        degraded_close(&job_id, vec![gap("src-b", CoverageGapKind::Unknown)]);
+    assert!(matches!(
+        exchange.import_bundle(hiding_unknown),
+        Err(ExchangeError::Contract(
+            ResearchContractError::InvalidDisposition
+        ))
+    ));
+
+    // With the BudgetExhausted gap entry the exhausted close is accepted
+    // and the gap stays visible in the sealed handoff.
+    let honest = degraded_close(
+        &job_id,
+        vec![gap("src-b", CoverageGapKind::BudgetExhausted)],
+    );
+    assert!(honest.has_budget_exhausted_gap());
+    let job = exchange.import_bundle(honest.clone()).expect("import");
+    assert_eq!(job.status, ExchangeStatus::Completed);
+    assert_eq!(
+        handoff::terminal_of(honest.disposition, job.status),
+        HandoffTerminal::PartialOpen
+    );
+    let sealed = handoff::seal_handoff(&honest, &req, REVISION, EXPIRES_MS).expect("seal");
+    assert_eq!(sealed.coverage_gap_handles, vec!["src-b".to_owned()]);
+    assert_eq!(sealed.seal_digest.len(), 64);
+}
