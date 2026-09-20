@@ -1,0 +1,128 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
+status = "READY_FOR_IMPLEMENTATION"
+implementation_support = "SOURCE_ASSURANCE_ROLE_BOUNDARY_OPEN"
+evidence_execution_status = "ISSUE_AND_SOURCE_ROUTING_INSPECTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "SOURCE_ASSURANCE_MODULE_AND_EDGE_CANDIDATE_ONLY"
+issue = 692
+research_issue = 24
+dreamer_runtime_issue = 1100
+governor_issue = 18
+evidence_issue = 216
+parent_product_issue = 11
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "dreamer.source-assurance-and-coverage-assessment"
+causal_property = "Source assurance evaluates the exact supplied source portfolio, provenance, independence, freshness, coverage and blind boundaries without acquiring sources, interpreting claims, selecting truth, admitting candidates, changing influence or finishing tasks."
+current_discriminator = "The repository separates Researcher, Dreamer and Governor in documentation, but the source-assurance contour still requires an exact implementation/consumer boundary proving that acquisition, assurance, interpretation, validation and admission cannot collapse into one model- or count-driven decision."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/692"
+rule = "Researcher acquires; source assurance evaluates the supplied portfolio; Dreamer interprets; Governor governs."
+
+[documentation]
+architecture = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A09-dreamer.md#a9-dreamer",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A10-02-impact-and-authority.md#a102-impact-and-authority",
+]
+implementation = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I00-05-current-system-evidence-and-source-support-model.md#i05-current-system-evidence-and-source-support-model",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I09-04-dreamer-input-bundle.md#i94-dreamer-input-bundle",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I09-07-memory-transformation-validation.md#i97-memory-transformation-validation",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I10-11-external-model-bridges.md#i1011-external-model-bridges",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I12-26-memory-admission-and-retrieval-trace.md#i1226-memory-admission-and-retrieval-trace",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I21-06-source-portfolio-coverage-denominator-and-coveragereceipt.md#i216-source-portfolio-coverage-denominator-and-coveragereceipt",
+]
+anchors = ["ARCH-DRM-02", "ARCH-DRM-04", "ARCH-GROUND-01", "ARCH-OBS-01", "ARCH-AUTH-01"]
+
+[current_source]
+confirmed = [
+  "Research acquisition, Dreamer interpretation and Governor admission are distinct declared owners.",
+  "Source count, citation count, agent count, model count and successful retrieval cannot independently prove source independence, coverage or support.",
+  "Unknown source lineage and unavailable portfolio members must remain explicit rather than being treated as independent or absent.",
+  "A source-assurance result is evidentiary and candidate-only; it cannot select truth, causal influence or admission.",
+]
+
+[scope]
+primary_paths = [
+  "the exact source-assurance package/cell identified by issue #692",
+  "shared source portfolio and coverage contracts only where an owner defect is proven",
+  "exact Researcher/Dreamer/Governor adapter boundaries",
+  "directly relevant tests and finite source-portfolio fixtures",
+]
+serialized_dependencies = [
+  "#24 Research acquisition",
+  "#216 five-domain evidence",
+  "#1100 Dreamer runtime",
+  "#18 Governor admission",
+  "#11 Product proof",
+]
+forbidden = [
+  "network/provider/source acquisition",
+  "claim interpretation or entailment generation",
+  "majority, citation or model-count truth selection",
+  "candidate admission, canonical writes or influence changes",
+  "authority, external effects or task Finish",
+  "automatic GitHub workflow triggers",
+]
+
+[[waves]]
+id = "A"
+what = "Freeze one exact source-portfolio and denominator contract."
+how = [
+  "Bind portfolio identity to request/task/scope/fence, acquisition operation, source identities/revisions, expected denominator, omissions, unavailable/withheld members, privacy constraints and freshness/invalidation set.",
+  "Require every expected portfolio member to have one exact terminal disposition.",
+  "Reject duplicate source identity, same-ID changed bytes/metadata and incomplete hidden denominators.",
+]
+
+[[waves]]
+id = "B"
+what = "Evaluate provenance, independence, quality and coverage as separate axes."
+how = [
+  "Group sources by authoritative lineage root and common acquisition/model/provider/context dependencies rather than citation or message count.",
+  "Keep provenance known/unknown, source accessibility, independence, freshness, coverage, relevance and evidentiary quality independent.",
+  "Unknown lineage is unknown independence; shared syndication/model summaries do not become multiple independent sources.",
+]
+
+[[waves]]
+id = "C"
+what = "Preserve conflicts, omissions and blind boundaries."
+how = [
+  "Retain every conflicting source, minority source, unavailable member, withheld reason, search limitation and unexamined denominator branch.",
+  "Do not infer absence from retrieval failure or coverage from query success.",
+  "Emit exact coverage gaps and next owner-directed acquisition requests without performing acquisition.",
+]
+
+[[waves]]
+id = "D"
+what = "Enforce candidate-only consumption and replay."
+how = [
+  "Dreamer may consume the assurance result as one bounded evidence input while preserving its proof ceiling and unknowns.",
+  "Governor may use it during admission but must not treat assurance alone as support, truth or causal influence.",
+  "Exact replay is deterministic; changed portfolio, lineage, denominator, policy, freshness or omission evidence changes identity or conflicts.",
+]
+
+[acceptance]
+criteria = [
+  "Every expected source has exactly one disposition: acquired, unavailable, withheld, excluded with owner reason, stale, conflicted or unknown.",
+  "Source, citation, agent and model counts cannot inflate independent-source counts.",
+  "Independence is computed by authoritative lineage/common-mode roots; unknown lineage remains unknown.",
+  "Provenance, accessibility, freshness, independence, relevance, quality and coverage remain separate axes.",
+  "Retrieval failure cannot prove source absence and successful retrieval cannot prove denominator completeness.",
+  "Conflicting and minority sources remain visible and cannot be discarded by majority/confidence/recency.",
+  "Coverage gaps and blind boundaries remain exact and prevent false complete assurance.",
+  "The result performs no source acquisition, claim interpretation, truth selection, candidate admission, canonical write or influence mutation.",
+  "Exact replay is stable; changed same-identity portfolio/lineage/denominator/policy/freshness conflicts.",
+  "Dreamer and Governor retain the assurance proof ceiling and cannot promote it to support, authority or VERIFIED_COMPLETE.",
+  "Fixtures cover shared syndication, model-generated summaries, unknown lineage, partial denominator, stale source, withheld source and conflicting evidence.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p <source-assurance-package> --all-targets",
+  "cargo test --locked -p <source-assurance-package> --all-targets",
+  "cargo clippy --locked -p <source-assurance-package> --all-targets -- -D warnings",
+  "git diff --check",
+]
+edge_proof = "Run one acquired, one partial, one common-mode, one unknown-lineage and one conflicted portfolio through Researcher -> assurance -> Dreamer/Governor adapters and prove no role collapse."
+product_proof = "Issue #11 remains open; assurance cannot prove the Product behavior or truth of the claims it describes."
