@@ -15,6 +15,7 @@ members = [
   "crates/agent/eliot-agent-codex",
   "crates/agent/eliot-agent-opencode",
   "crates/agent/eliot-swarm",
+  "crates/bridges/eliot-lsp-bridge",
   "crates/foundation/eliot-bootstrap",
   "crates/foundation/eliot-conformance-contracts",
   "crates/foundation/eliot-contracts",
@@ -251,6 +252,7 @@ eliot-blob-api = { path = "crates/storage/eliot-blob-api", version = "0.1.0" }
 eliot-blob = { path = "crates/storage/eliot-blob", version = "0.1.0" }
 eliot-graph-api = { path = "crates/instrument/eliot-graph-api", version = "0.1.0" }
 eliot-instrument-api = { path = "crates/instrument/eliot-instrument-api", version = "0.1.0" }
+eliot-instrument-scip = { path = "crates/instrument/eliot-instrument-scip", version = "0.1.0" }
 eliot-process-executor = { path = "crates/instrument/eliot-process-executor", version = "0.1.0" }
 eliot-host-state = { path = "crates/kernel/eliot-host-state", version = "0.1.0" }
 eliot-host-control-endpoint = { path = "crates/kernel/eliot-host-control-endpoint", version = "0.1.0" }

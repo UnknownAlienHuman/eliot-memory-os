@@ -64,6 +64,7 @@ responsibility = "Instrument execution, Code Cortex/Code Graph, build-test graph
 route_topic = "instrument verifier code graph code intelligence impact test selection diagnostics"
 path_globs = [
   "crates/instrument/**",
+  "crates/bridges/**",
   "bins/eliot-testd/**",
 ]
 documentation_handles = ["I10.8.17", "I18.18"]
