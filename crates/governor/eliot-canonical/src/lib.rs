@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub mod epistemic_revision;
+pub mod write_envelope;
 
 /// Stable identity of this Governor contract surface.
 pub const CONTRACT_NAME: &str = "eliot.governor.canonical";
