@@ -1955,6 +1955,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-integration-coverage"
+version = "0.1.0"
+dependencies = [
+ "schemars",
+ "serde",
+ "thiserror",
+]
+
+[[package]]
 name = "eliot-ipc"
 version = "0.1.0"
 dependencies = [

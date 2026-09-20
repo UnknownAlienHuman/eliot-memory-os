@@ -69,6 +69,7 @@ members = [
   "crates/governor/eliot-coordination",
   "crates/governor/eliot-finish",
   "crates/governor/eliot-governor",
+  "crates/governor/eliot-integration-coverage",
   "crates/governor/eliot-maintenance",
   "crates/governor/eliot-module-registry",
   "crates/governor/eliot-observation",
@@ -279,6 +280,7 @@ eliot-change-monitor = { path = "crates/governor/eliot-change-monitor", version 
 eliot-coordination = { path = "crates/governor/eliot-coordination", version = "0.1.0" }
 eliot-finish = { path = "crates/governor/eliot-finish", version = "0.1.0" }
 eliot-governor = { path = "crates/governor/eliot-governor", version = "0.1.0" }
+eliot-integration-coverage = { path = "crates/governor/eliot-integration-coverage", version = "0.1.0" }
 eliot-maintenance = { path = "crates/governor/eliot-maintenance", version = "0.1.0" }
 eliot-module-registry = { path = "crates/governor/eliot-module-registry", version = "0.1.0" }
 eliot-observation = { path = "crates/governor/eliot-observation", version = "0.1.0" }
