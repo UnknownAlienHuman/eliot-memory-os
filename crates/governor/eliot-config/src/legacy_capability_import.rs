@@ -6,6 +6,10 @@
 //! fingerprint where unavailable fields stay `None` (unknown, never inferred).
 //! Imported records never satisfy production admission; that decision lives in
 //! the Governor-owned capability registry (`eliot-governor`).
+//!
+//! Keying: the declaration carries the `skill_id` the canonical evidence
+//! read (`GetCapabilityEvidenceState`) selects on, so an imported record
+//! joins the same key space as verified probe and observation evidence.
 
 #![forbid(unsafe_code)]
 
@@ -16,8 +20,8 @@ use thiserror::Error;
 /// Errors raised while normalizing a legacy capability declaration.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum LegacyImportError {
-    /// The legacy capability name is blank or carries control characters.
-    #[error("legacy capability name must be non-blank")]
+    /// The legacy skill identity is blank or carries control characters.
+    #[error("legacy skill identity must be non-blank and free of control characters")]
     BlankCapability,
 }
 
@@ -55,7 +59,7 @@ pub struct LegacyScopeFingerprint {
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LegacyCapabilityDeclaration {
-    pub capability: String,
+    pub skill_id: String,
     pub scope: LegacyScopeFingerprint,
 }
 
@@ -63,7 +67,7 @@ pub struct LegacyCapabilityDeclaration {
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ImportedLegacyEvidence {
-    pub capability: String,
+    pub skill_id: String,
     pub status: ImportedCapabilityStatus,
     pub source: ImportedCapabilitySource,
     pub scope: LegacyScopeFingerprint,
@@ -77,7 +81,7 @@ impl ImportedLegacyEvidence {
     }
 }
 
-fn non_blank_capability(value: &str) -> Result<(), LegacyImportError> {
+fn non_blank_skill_id(value: &str) -> Result<(), LegacyImportError> {
     if value.trim().is_empty() || value.chars().any(char::is_control) {
         return Err(LegacyImportError::BlankCapability);
     }
@@ -88,14 +92,14 @@ fn non_blank_capability(value: &str) -> Result<(), LegacyImportError> {
 ///
 /// # Errors
 ///
-/// Returns [`LegacyImportError::BlankCapability`] when the capability name is
-/// blank.
+/// Returns [`LegacyImportError::BlankCapability`] when the skill identity is
+/// blank or carries control characters.
 pub fn import_legacy_declaration(
     declaration: &LegacyCapabilityDeclaration,
 ) -> Result<ImportedLegacyEvidence, LegacyImportError> {
-    non_blank_capability(&declaration.capability)?;
+    non_blank_skill_id(&declaration.skill_id)?;
     Ok(ImportedLegacyEvidence {
-        capability: declaration.capability.clone(),
+        skill_id: declaration.skill_id.clone(),
         status: ImportedCapabilityStatus::Declared,
         source: ImportedCapabilitySource::ImportedLegacyDeclaration,
         scope: declaration.scope.clone(),
@@ -103,13 +107,14 @@ pub fn import_legacy_declaration(
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 
     #[test]
     fn legacy_import_is_declared_and_never_production_admissible() {
         let declaration = LegacyCapabilityDeclaration {
-            capability: "route.execute".into(),
+            skill_id: "route.execute".into(),
             scope: LegacyScopeFingerprint {
                 adapter_hash: Some("adapter-hash-1".into()),
                 ..LegacyScopeFingerprint::default()
@@ -127,14 +132,30 @@ mod tests {
     }
 
     #[test]
-    fn blank_legacy_capability_is_rejected() {
+    fn blank_legacy_skill_id_is_rejected() {
         let declaration = LegacyCapabilityDeclaration {
-            capability: "  ".into(),
+            skill_id: "  ".into(),
             scope: LegacyScopeFingerprint::default(),
         };
         assert_eq!(
             import_legacy_declaration(&declaration),
             Err(LegacyImportError::BlankCapability)
+        );
+    }
+
+    #[test]
+    fn control_bearing_legacy_skill_id_is_rejected() {
+        let declaration = LegacyCapabilityDeclaration {
+            skill_id: "skill-\u{7}execute".into(),
+            scope: LegacyScopeFingerprint::default(),
+        };
+        assert_eq!(
+            import_legacy_declaration(&declaration),
+            Err(LegacyImportError::BlankCapability)
+        );
+        assert_eq!(
+            LegacyImportError::BlankCapability.to_string(),
+            "legacy skill identity must be non-blank and free of control characters"
         );
     }
 }

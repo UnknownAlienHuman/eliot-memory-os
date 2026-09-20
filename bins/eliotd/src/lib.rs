@@ -76,10 +76,7 @@ use controlboard_adapters::SharedOperatorReplay;
 use activation_projection::map_activation_snapshot;
 
 pub use capability_evidence_wiring::{
-    GovernorCapabilityAdmission, GovernorCapabilityEvidenceRecord, GovernorCapabilityRegistry,
-    GovernorCapabilitySource, GovernorCapabilityStatus, GovernorRouteScopeFingerprint,
-    ImportedLegacyEvidence, LegacyCapabilityDeclaration, LegacyImportError, LegacyScopeFingerprint,
-    import_legacy_declaration,
+    EvidenceBridgeError, GovernorCapabilityAdmission, ObservedLifecycleSummary,
 };
 pub use daemon_config::DaemonConfig;
 pub(crate) use daemon_kernel_client::kernel_port_error;
@@ -242,6 +239,14 @@ pub struct DaemonComposition {
     /// binding from them. `None` until the runtime notes a live session, so
     /// boards keep the empty (unadmitted) behaviour without one.
     owner_session: Option<OwnerSessionFacts>,
+    /// Daemon-held Governor capability admission view (issue #1957).
+    ///
+    /// Constructed empty at [`DaemonComposition::start`], hydrated from the
+    /// canonical `GetCapabilityEvidenceState` read and the legacy importer,
+    /// and consulted by the daemon route gate before a resolved route may
+    /// execute. Semantics stay in the Governor registry; this is the
+    /// composition root's handle on that view.
+    capability_admission: GovernorCapabilityAdmission,
 }
 
 impl DaemonComposition {
@@ -297,6 +302,7 @@ impl DaemonComposition {
             view_stale: false,
             operator_replay: SharedOperatorReplay::new(),
             owner_session: None,
+            capability_admission: GovernorCapabilityAdmission::new(),
         })
     }
 
@@ -896,6 +902,57 @@ impl DaemonComposition {
         let config = daemon_coordinator_config()
             .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
         plan_candidate(&config, request).map_err(|error| DaemonError::Lifecycle(error.to_string()))
+    }
+
+    /// Borrows the daemon-held Governor capability admission view (#1957).
+    ///
+    /// Post-`start` attach-style accessor, mirroring
+    /// [`Self::context_read_client`]: readiness is checked first so callers
+    /// observe the view only on the admitted path. Hydration (evidence
+    /// inserts, legacy imports, scope changes) goes through the mutable
+    /// accessor; route execution gates through
+    /// [`Self::admit_production_route`].
+    pub fn capability_admission(&self) -> Result<&GovernorCapabilityAdmission, DaemonError> {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        Ok(&self.capability_admission)
+    }
+
+    /// Mutably borrows the daemon-held capability admission view (#1957).
+    ///
+    /// Mirrors [`Self::capability_admission`]: readiness is checked first.
+    /// Callers hydrate the held view from the closed
+    /// `GetCapabilityEvidenceState` read (see
+    /// [`GovernorCapabilityAdmission::plan_evidence_read`] and
+    /// [`GovernorCapabilityAdmission::ingest_evidence_response`]) and the
+    /// legacy importer; admission semantics stay in the Governor registry.
+    pub fn capability_admission_mut(
+        &mut self,
+    ) -> Result<&mut GovernorCapabilityAdmission, DaemonError> {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        Ok(&mut self.capability_admission)
+    }
+
+    /// Consults the held capability admission before route execution (#1957).
+    ///
+    /// Returns whether `skill_id` holds fresh exact-fingerprint
+    /// `probe_passed` or `observed` evidence from an admissible source at
+    /// `now`, with no restricting `broken`/`unsupported`/`degraded`
+    /// evidence. Declared/imported records alone never admit. Callers gate
+    /// route execution on `Ok(true)`; `Ok(false)` and `Err` both fail
+    /// closed.
+    pub fn admit_production_route(
+        &self,
+        skill_id: &str,
+        scope: &eliot_governor::RouteScopeFingerprint,
+        now: u64,
+    ) -> Result<bool, DaemonError> {
+        Ok(self
+            .capability_admission()?
+            .admit_production_route(skill_id, scope, now))
     }
 
     /// Borrows the Governor reconstruction read composition over the retained
