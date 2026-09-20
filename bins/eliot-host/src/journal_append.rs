@@ -220,9 +220,13 @@ pub(super) fn transition_activation_record(
     );
     next.readiness.control_ready = ready;
     next.readiness.supervision_ready = ready;
-    // I1.5 (#1750): governance turns live only on a proven-ready transition,
-    // which runs after the Watchdog start verification. Any other transition
-    // preserves the current profile instead of rewriting history.
+    // I1.5 (#1750): governance turns live only on a proven-ready transition.
+    // On Windows that transition runs after the Watchdog SCM verification and
+    // the ProbeReady watchdog-branch gate; other platforms have no
+    // independently-supervised readiness (ProbeReady fails closed, I1.7), so
+    // the live profile must never be read as an independent-supervision claim
+    // there. Any other transition preserves the current profile instead of
+    // rewriting history.
     if ready {
         next.governance_profile = PlatformHandle::new("runtime-live-v3")
             .map_err(|error| HostError::Platform(error.to_string()))?;

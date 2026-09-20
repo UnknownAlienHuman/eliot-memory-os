@@ -28,7 +28,7 @@ use eliot_host_state::{HostStateRecord, NonceState, record_checksum};
 use eliot_platform::PlatformHandle;
 #[cfg(windows)]
 use eliot_runtime_contracts::{
-    KernelActivationState, ServiceProcessRecord, ServiceProcessState,
+    KernelActivationState, LeaseState, ServiceProcessRecord, ServiceProcessState,
     SupervisionLeasePredecessorIdentity,
 };
 
@@ -90,25 +90,54 @@ fn append_reconciled_readiness<B: JournalBackend>(
     }
 }
 
-/// Binds the exact watchdog supervision branch behind one readiness proof
-/// into the persisted observation evidence: the content-addressed Watchdog
-/// publication digest joined to the admitted watchdog epoch from the
-/// Kernel-renewed supervision head. A missing epoch (no admitted watchdog
-/// branch) fails closed instead of persisting a readiness observation that
-/// would read as independently supervised (I1.5).
+/// Binds the exact admitted watchdog supervision branch behind one readiness
+/// proof into the persisted observation evidence: the content-addressed
+/// `Watchdog` publication digest joined to the admitted lease identity, the
+/// canonical `ORS` receipt digest, and the admitted watchdog epoch, all read
+/// from the same Kernel-renewed supervision snapshot.
+///
+/// A foreign or stale branch cannot produce a verified-coverage claim here:
+/// the ref names the exact lease (record lease id) and receipt (receipt
+/// `sha256`) the epoch was admitted under, so any verifier can detect
+/// substitution. The snapshot itself is authenticated (`validate`), must be
+/// `Active`/`Active`, and must carry a nonzero watchdog epoch; anything else
+/// fails closed instead of persisting a readiness observation that would
+/// read as independently supervised (I1.5, Windows-only path).
+///
+/// The publication digest comes from the caller-supplied supervision
+/// identity, which production builds from this same snapshot via
+/// `supervision_publication_identity` (marker over the exact lease bytes,
+/// revision, record id, and `ORS` receipt digest); publication exactness
+/// against the `ORS` head is verified at publish time by
+/// `verify_exact_current_watchdog_publication`, head currency by
+/// `require_exact_supervision_head`, and epoch equality by the Kernel
+/// `ProbeReady` watchdog-branch gate.
 #[cfg(windows)]
 pub(crate) fn watchdog_branch_evidence_ref(
     supervision: &PublishedSupervisionIdentity,
-    watchdog_epoch: u64,
+    admitted_lease: &eliot_ors::SupervisionLeaseSnapshot,
 ) -> Result<PlatformHandle, HostError> {
+    admitted_lease
+        .validate()
+        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+    if admitted_lease.record.state != LeaseState::Active
+        || admitted_lease.record.projection != eliot_ors::SupervisionLeaseProjection::Active
+    {
+        return Err(HostError::RecoveryRequired(
+            "Kernel supervision snapshot is not an admitted Active watchdog branch".to_owned(),
+        ));
+    }
+    let watchdog_epoch = admitted_lease.record.binding.watchdog_epoch.value();
     if watchdog_epoch == 0 {
         return Err(HostError::RecoveryRequired(
             "Kernel supervision snapshot carries no admitted watchdog epoch".to_owned(),
         ));
     }
     PlatformHandle::new(format!(
-        "watchdog-branch:{}:epoch:{watchdog_epoch}",
-        supervision.publication_digest.as_str()
+        "watchdog-branch:{}:lease:{}:receipt:{}:epoch:{watchdog_epoch}",
+        supervision.publication_digest.as_str(),
+        admitted_lease.record.lease_id.as_str(),
+        admitted_lease.receipt.receipt_sha256,
     ))
     .map_err(|error| HostError::Platform(error.to_string()))
 }
@@ -169,7 +198,7 @@ pub(crate) fn append_authenticated_kernel_readiness<B: JournalBackend>(
     evidence_refs.extend(supervision.evidence_refs()?);
     evidence_refs.push(watchdog_branch_evidence_ref(
         supervision,
-        proof.supervision_lease.record.binding.watchdog_epoch.value(),
+        &proof.supervision_lease,
     )?);
     let expected = ReadinessApprovedContour {
         config_digest: approved_config.clone(),

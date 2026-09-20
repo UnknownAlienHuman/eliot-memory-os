@@ -99,17 +99,20 @@ fn observe_control_capacity(capacity: usize) {
     );
 }
 
-/// Verifies the independent-supervision (watchdog) branch backing one
+/// Verifies the independent-supervision (watchdog) branch backing one Windows
 /// `ProbeReady` admission: the candidate's supervision incarnation must carry
 /// a usable watchdog epoch, and the renewed ORS head behind this probe's
 /// supervision lease must carry that exact same epoch.
 ///
-/// Fail-closed `SessionFenced` otherwise: Kernel never
-/// authors a ready receipt — and never returns a supervision lease — as
+/// Fail-closed `SessionFenced` otherwise: on Windows the Kernel never authors
+/// a ready receipt — and never returns a supervision lease — as
 /// independently supervised when the watchdog branch is missing or foreign.
 /// Per I1.5, Material work requiring independent supervision is then paused
 /// (Host degrades the readiness contour into a human-visible coverage gap)
-/// instead of being admitted as supervised.
+/// instead of being admitted as supervised. Non-Windows builds have no
+/// equivalent gate yet (Linux supervision port, I1.7) and therefore emit no
+/// supervised readiness at all: `ProbeReady` fails closed below before any
+/// receipt or supervision lease is produced.
 #[cfg_attr(
     not(windows),
     allow(
@@ -483,12 +486,13 @@ impl KernelComposition {
         let supervision_lease = None;
         #[cfg(windows)]
         if let Some((renewed_head, _)) = supervision_publication.as_ref() {
-            // I1.5 (#1750): the ProbeReady admission never proceeds as
-            // independently supervised without the verified watchdog branch.
-            // This runs before any ready receipt is authored, and the
-            // readbacks below confirm the gated head is still current, so a
-            // refusal surfaces as degraded readiness instead of supervised
-            // health.
+            // I1.5 (#1750, Windows-only gate): the ProbeReady admission never
+            // proceeds as independently supervised without the verified
+            // watchdog branch. This runs before any ready receipt is authored,
+            // and the readbacks below confirm the gated head is still current,
+            // so a refusal surfaces as degraded readiness instead of
+            // supervised health. Non-Windows builds never reach a supervised
+            // admission: ProbeReady fails closed below (I1.7).
             verify_probe_watchdog_branch(
                 request
                     .candidate
@@ -509,6 +513,10 @@ impl KernelComposition {
             }
             #[cfg(not(windows))]
             {
+                // Containment (I1.7): without the verified watchdog-branch gate
+                // there is no equivalent supervision proof on this platform, so
+                // no ready receipt — and no supervised-readiness claim of any
+                // kind — may be emitted here.
                 return Err(TransportError::SessionFenced);
             }
         } else {

@@ -15,15 +15,19 @@ use std::sync::{Arc, RwLock};
 
 /// Readiness data emitted by the process entrypoint.
 ///
-/// I1.5 (#1750) Host-verification contract for every field. Host must apply
-/// all of these checks before treating a projection as supervised coverage:
+/// I1.5 (#1750) verification contract for every field. This cell is
+/// Watchdog-local state: the Host has no transport that reads it, so no Host
+/// path may treat SCM `Running` — or any projection it cannot observe —
+/// as supervised coverage. Once a Host-to-Watchdog heartbeat transport
+/// delivers a projection, the Host must apply all of these checks before
+/// treating it as coverage:
 /// - `authority_state` / `coverage_claimed`: require `AdmittedHeartbeat` with
 ///   `coverage_claimed == true`. `RunningNoAuthority` is an explicit gap-only
 ///   signal (the SCM sibling is alive but no current Host-issued lease has
 ///   been admitted for heartbeat authority), never coverage.
 /// - `kernel_epoch` / `watchdog_epoch`: the exact admitted lease pair,
 ///   rotated atomically under one lock so a reader can never combine epochs
-///   from different leases. Host verifies them against the current
+///   from different leases. The Host verifies them against the current
 ///   activation's supervision incarnation. A zero epoch is never published as
 ///   coverage: the cell below fails closed into the no-authority projection.
 /// - `tick_interval_ms`: the bounded supervision tick, i.e. the
@@ -31,9 +35,15 @@ use std::sync::{Arc, RwLock};
 ///   interval without a fresh admitted heartbeat must be treated as
 ///   unresponsive, never as current coverage.
 ///
-/// Residual: binding a projection to its exact lease (lease identity, receipt
-/// digest, lineage) needs a new authenticated field on this shape and is out
-/// of scope for this slice; the live-install proof owns that evidence.
+/// Binding a projection to its exact lease (lease identity plus ORS receipt
+/// digest) is owned by the supervision-claim path, not by this shape: the
+/// Host persists a watchdog-branch evidence ref naming the exact admitted
+/// lease id, receipt digest, and epoch from the Kernel-renewed `ORS` snapshot,
+/// the Kernel `ProbeReady` gate enforces exact epoch equality against the
+/// renewed ORS head, publication exactness against the ORS head is verified
+/// at publish time, and governance stays degraded until a proven-ready
+/// transition. SCM liveness alone (this projection unread, or
+/// `RunningNoAuthority`) never satisfies that path.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct WatchdogReadiness {
     pub service: &'static str,

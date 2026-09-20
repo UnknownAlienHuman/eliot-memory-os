@@ -71,10 +71,10 @@ pub(crate) struct ReadinessContourIdentity {
 
 #[cfg(windows)]
 impl ReadinessContourIdentity {
-    /// Returns whether this contour carries a verified watchdog branch: the
-    /// content-addressed Watchdog publication digest bound at proof time.
-    /// Absence means independent supervision is unavailable, and the
-    /// governance profile must stay degraded (I1.5).
+    /// Returns whether this contour carries a verified watchdog branch
+    /// (Windows-only): the content-addressed Watchdog publication digest
+    /// bound at proof time. Absence means independent supervision is
+    /// unavailable, and the governance profile must stay degraded (I1.5).
     pub(crate) fn watchdog_available(&self) -> bool {
         self.watchdog_publication_digest.is_some()
     }

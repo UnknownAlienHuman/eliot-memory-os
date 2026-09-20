@@ -21,9 +21,9 @@ mod inspection;
 #[cfg(windows)]
 #[allow(unused_imports)]
 pub(super) use inspection::{
-    InstalledWatchdogControl, InstalledWatchdogRuntimeInspection, VerifiedWatchdogRunning,
+    InstalledWatchdogControl, InstalledWatchdogRuntimeInspection, VerifiedWatchdogScmRunning,
     approved_service_registration_request, require_running_watchdog,
-    select_watchdog_approval_for_inspection, verify_running_watchdog,
+    select_watchdog_approval_for_inspection, verify_watchdog_scm_running,
 };
 
 #[cfg(windows)]
@@ -125,11 +125,13 @@ where
             ..
         } if state == ServiceState::Running => {
             bind_watchdog_process(registration, &mut bound_process, process.as_ref(), state)?;
-            // I1.5 (#1750): a Running sibling is trusted only after the
+            // I1.5 (#1750): a Running sibling proceeds only after the
             // approved-identity binding and live-process responsiveness verify.
-            // This gate is read-only and introduces no Job, kill-handle, or
-            // SCM stop capability.
-            verify_running_watchdog(registration, state, wait_hint_ms, process.as_ref())?;
+            // SCM liveness only: this proves the approved image is Running,
+            // never independent supervision (no heartbeat is read, no admitted
+            // epoch is validated). This gate is read-only and introduces no
+            // Job, kill-handle, or SCM stop capability.
+            verify_watchdog_scm_running(registration, state, wait_hint_ms, process.as_ref())?;
             return Ok(());
         }
         InstalledWatchdogRuntimeInspection::Matching {
@@ -223,11 +225,12 @@ where
                         process.as_ref(),
                         state,
                     )?;
-                    // I1.5 (#1750): converged Running is admitted only with a
-                    // verified epoch anchor and live-process responsiveness;
-                    // an unverifiable branch fails closed here. Read-only:
-                    // no Job, kill-handle, or SCM stop is introduced.
-                    verify_running_watchdog(registration, state, wait_hint_ms, process.as_ref())?;
+                    // I1.5 (#1750): converged Running proceeds only with the
+                    // approval binding and live-process responsiveness verified;
+                    // an unverifiable branch fails closed here. SCM liveness
+                    // only, never a supervision proof. Read-only: no Job,
+                    // kill-handle, or SCM stop is introduced.
+                    verify_watchdog_scm_running(registration, state, wait_hint_ms, process.as_ref())?;
                     return Ok(());
                 }
                 ServiceState::Starting => {
