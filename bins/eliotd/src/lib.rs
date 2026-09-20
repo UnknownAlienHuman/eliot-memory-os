@@ -49,6 +49,7 @@ mod kernel_context_read_client;
 mod kernel_recovery_client;
 mod kernel_transition_client;
 mod observation_adapters;
+mod process_origin;
 mod skill_lifecycle_adapters;
 mod skill_surface_adapters;
 mod store_failure_projection;
@@ -106,6 +107,11 @@ pub use governor_local_read::{
 };
 pub(crate) use kernel_authority_client::KernelAuthorityClient;
 pub use kernel_context_read_client::{KernelContextReadClient, ReconstructionReadComposition};
+pub use process_origin::{
+    OperationDisposition, OwnershipChallengeReceipt, ProcessControlOperation, ProcessOriginError,
+    ProcessOriginEvidence, ProcessStatusReceipt, canonical_challenge_digest,
+    canonical_origin_digest, check_kernel_forward, check_shutdown_authorized, gate_process_control,
+};
 pub use store_failure_projection::{GovernorStoreFailureProjection, GovernorStoreProjectionError};
 
 /// Builds the production P-07 authority adapter over an already-connected
