@@ -124,7 +124,6 @@ members = [
   "bins/eliot-watchdog",
   "bins/eliotd",
   "workspace/tools/eliot-runtime-compiler",
-  "workspace/tools/eliot-campaign-executor",
   "workspace/tools/eliot-live-canary",
   "crates/smart/eliot-context-contracts",
   "crates/smart/eliot-cue-contracts",
