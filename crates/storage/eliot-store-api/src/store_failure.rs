@@ -986,6 +986,74 @@ fn validate_optional_reference(
     Ok(())
 }
 
+/// The exact legacy string-shaped failure variants accepted at the boundary.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum LegacyStoreFailureV1 {
+    Unknown {
+        operation_id: OperationId,
+        reason: String,
+    },
+    Error {
+        error: String,
+    },
+}
+
+/// Imports the current v1 string response shape without parsing human text.
+pub fn decode_legacy_store_failure_v1(
+    value: &serde_json::Value,
+    context: &StoreFailureIdentityContext,
+) -> Result<StoreFailure, StoreFailureContractError> {
+    let legacy: LegacyStoreFailureV1 = serde_json::from_value(value.clone())
+        .map_err(|_| invalid("legacy_failure", "not a supported v1 store failure shape"))?;
+    match legacy {
+        LegacyStoreFailureV1::Unknown {
+            operation_id,
+            reason,
+        } => {
+            let mut failure = StoreFailure::base(context);
+            failure.disposition = StoreFailureDisposition::UnknownOutcome;
+            failure.reason_code = StoreReasonCode::new("PROVIDER_OUTCOME_UNKNOWN")?;
+            failure.operation_id = Some(operation_id);
+            failure.mutation_disposition = StoreMutationDisposition::Unknown;
+            failure.retry_directive = StoreRetryDirective::ReconcileExactOperation;
+            failure.recovery_action = StoreRecoveryAction::ReconcileUnknownOutcome;
+            failure.human_detail = bounded_legacy_detail(reason)?;
+            failure.validate()?;
+            Ok(failure)
+        }
+        LegacyStoreFailureV1::Error { error } => {
+            let mut failure = StoreFailure::base(context);
+            if context.transport_unavailable {
+                failure.disposition = StoreFailureDisposition::Unavailable;
+                failure.reason_code = StoreReasonCode::new("STORE_UNAVAILABLE")?;
+                failure.retry_directive = StoreRetryDirective::RetrySameIdentityAfterBackoff;
+                failure.recovery_action = StoreRecoveryAction::RestoreStoreConnectivity;
+            } else {
+                failure.disposition = StoreFailureDisposition::InternalDefect;
+                failure.reason_code = StoreReasonCode::new("INTERNAL_STORE_FAILURE")?;
+                failure.retry_directive = StoreRetryDirective::ManualRecovery;
+                failure.recovery_action = StoreRecoveryAction::EscalateInternalDefect;
+            }
+            failure.human_detail = bounded_legacy_detail(error)?;
+            failure.validate()?;
+            Ok(failure)
+        }
+    }
+}
+
+fn bounded_legacy_detail(value: String) -> Result<Option<String>, StoreFailureContractError> {
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value.len() > MAX_STORE_FAILURE_DETAIL_LEN || value.chars().any(char::is_control) {
+        return Err(invalid(
+            "human_detail",
+            "legacy detail exceeds the bounded safe surface",
+        ));
+    }
+    Ok(Some(value))
+}
 
 /// Errors raised while constructing or validating the typed failure contract.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]

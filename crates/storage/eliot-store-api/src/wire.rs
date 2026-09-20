@@ -610,6 +610,10 @@ pub enum StoreResponse {
     Failure {
         failure: crate::StoreFailure,
     },
+    /// Legacy v1 string failure retained for a bounded compatibility window.
+    Error {
+        error: String,
+    },
     /// Explicitly unknown/rejected reconciliation outcome; never a success.
     Unknown {
         operation_id: OperationId,
@@ -720,6 +724,7 @@ impl StoreResponse {
             Self::Failure { failure } => failure
                 .validate()
                 .map_err(|error| StoreWireError::Invalid(error.to_string())),
+            Self::Error { error } => validate_legacy_failure_text(error, "error"),
             Self::Unknown { reason, .. } => validate_legacy_failure_text(reason, "unknown.reason"),
         }
     }
