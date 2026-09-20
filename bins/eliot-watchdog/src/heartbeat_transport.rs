@@ -39,6 +39,13 @@ const GUID_HEX_LEN: usize = 32;
 pub const FENCE_SEQUENCE: u64 = 0;
 /// Transport-local bound for the installation identity echo.
 const INSTALLATION_ID_LIMIT: usize = 128;
+/// Sanity bounds for the emitted tick (50 ms through one hour, mirroring
+/// the Host admission validator). The tick sizes the Host freshness
+/// window, so an insane tick must never ride an admitted message: the
+/// writer fails the emission instead of letting the window stretch or
+/// collapse.
+const TICK_MIN_MS: u128 = 50;
+const TICK_MAX_MS: u128 = 3_600_000;
 
 /// Writer-side heartbeat transport failure. Every variant degrades to
 /// stdout-only operation; none of them fails the supervision tick.
@@ -64,6 +71,8 @@ pub struct HeartbeatTransportDescriptor {
     service_instance_guid: String,
     installation_id: String,
     transaction_plan_generation: u64,
+    watchdog_incarnation_pid: u32,
+    watchdog_incarnation_start_100ns: u64,
 }
 
 impl HeartbeatTransportDescriptor {
@@ -84,6 +93,31 @@ impl HeartbeatTransportDescriptor {
     pub fn service_instance_guid(&self) -> &str {
         &self.service_instance_guid
     }
+
+    /// Returns true once the Host bound this rendezvous to the SCM-verified
+    /// watchdog incarnation. An unbound descriptor arms fence-only: no
+    /// admitted-state message may ride it.
+    #[must_use]
+    pub fn is_bound(&self) -> bool {
+        self.watchdog_incarnation_pid != 0 && self.watchdog_incarnation_start_100ns != 0
+    }
+
+    /// Canonical descriptor bytes. Field order is the wire contract shared
+    /// with the Host issuer: both sides serialize this exact shape and hash
+    /// it into the descriptor digest.
+    fn canonical_bytes(&self) -> Result<Vec<u8>, HeartbeatTransportError> {
+        serde_json::to_vec(&HeartbeatDescriptorCanonical {
+            schema: WATCHDOG_HEARTBEAT_TRANSPORT_SCHEMA,
+            pipe_name: self.pipe_name.as_str(),
+            host_challenge_nonce: self.host_challenge_nonce.as_str(),
+            service_instance_guid: self.service_instance_guid.as_str(),
+            installation_id: self.installation_id.as_str(),
+            transaction_plan_generation: self.transaction_plan_generation,
+            watchdog_incarnation_pid: self.watchdog_incarnation_pid,
+            watchdog_incarnation_start_100ns: self.watchdog_incarnation_start_100ns,
+        })
+        .map_err(|error| HeartbeatTransportError::InvalidDescriptor(error.to_string()))
+    }
 }
 
 /// Canonical descriptor bytes. Field order is the wire contract shared with
@@ -97,6 +131,8 @@ struct HeartbeatDescriptorCanonical<'a> {
     service_instance_guid: &'a str,
     installation_id: &'a str,
     transaction_plan_generation: u64,
+    watchdog_incarnation_pid: u32,
+    watchdog_incarnation_start_100ns: u64,
 }
 
 /// Parsed descriptor wire shape. Unknown fields are tolerated so a
@@ -110,6 +146,8 @@ struct HeartbeatDescriptorWire {
     service_instance_guid: String,
     installation_id: String,
     transaction_plan_generation: u64,
+    watchdog_incarnation_pid: u32,
+    watchdog_incarnation_start_100ns: u64,
     descriptor_digest: String,
 }
 
@@ -125,25 +163,6 @@ fn valid_pipe_name(value: &str) -> bool {
         && value
             .strip_prefix(WATCHDOG_HEARTBEAT_PIPE_PREFIX)
             .is_some_and(|suffix| is_lower_hex(suffix, GUID_HEX_LEN))
-}
-
-fn canonical_descriptor_bytes(
-    schema: &str,
-    pipe_name: &str,
-    host_challenge_nonce: &str,
-    service_instance_guid: &str,
-    installation_id: &str,
-    transaction_plan_generation: u64,
-) -> Result<Vec<u8>, HeartbeatTransportError> {
-    serde_json::to_vec(&HeartbeatDescriptorCanonical {
-        schema,
-        pipe_name,
-        host_challenge_nonce,
-        service_instance_guid,
-        installation_id,
-        transaction_plan_generation,
-    })
-    .map_err(|error| HeartbeatTransportError::InvalidDescriptor(error.to_string()))
 }
 
 fn descriptor_digest(bytes: &[u8]) -> String {
@@ -195,6 +214,11 @@ fn parse_descriptor(
             "heartbeat descriptor bootstrap binding is not canonical".to_owned(),
         ));
     }
+    if (wire.watchdog_incarnation_pid == 0) != (wire.watchdog_incarnation_start_100ns == 0) {
+        return Err(HeartbeatTransportError::InvalidDescriptor(
+            "heartbeat descriptor incarnation is half-bound".to_owned(),
+        ));
+    }
     if wire.installation_id != installation_id
         || wire.transaction_plan_generation != transaction_plan_generation
     {
@@ -202,26 +226,42 @@ fn parse_descriptor(
             "heartbeat descriptor does not bind this bootstrap contour".to_owned(),
         ));
     }
-    let canonical = canonical_descriptor_bytes(
-        &wire.schema,
-        &wire.pipe_name,
-        &wire.host_challenge_nonce,
-        &wire.service_instance_guid,
-        &wire.installation_id,
-        wire.transaction_plan_generation,
-    )?;
-    if descriptor_digest(&canonical) != wire.descriptor_digest {
-        return Err(HeartbeatTransportError::InvalidDescriptor(
-            "heartbeat descriptor digest does not match its canonical bytes".to_owned(),
-        ));
-    }
-    Ok(HeartbeatTransportDescriptor {
+    let descriptor = HeartbeatTransportDescriptor {
         pipe_name: wire.pipe_name,
         host_challenge_nonce: wire.host_challenge_nonce,
         service_instance_guid: wire.service_instance_guid,
         installation_id: wire.installation_id,
         transaction_plan_generation: wire.transaction_plan_generation,
-    })
+        watchdog_incarnation_pid: wire.watchdog_incarnation_pid,
+        watchdog_incarnation_start_100ns: wire.watchdog_incarnation_start_100ns,
+    };
+    let canonical = descriptor.canonical_bytes()?;
+    if descriptor_digest(&canonical) != wire.descriptor_digest {
+        return Err(HeartbeatTransportError::InvalidDescriptor(
+            "heartbeat descriptor digest does not match its canonical bytes".to_owned(),
+        ));
+    }
+    Ok(descriptor)
+}
+
+/// Pipe wire message: the admitted or fence projection plus the
+/// SCM-verified incarnation this writer proved at arm time. The incarnation
+/// pair is load-bearing on the Host side (descriptor match, then SCM
+/// match); a message without it is writer self-report, never evidence.
+#[derive(serde::Serialize)]
+struct HeartbeatWireMessage {
+    service: &'static str,
+    protocol: &'static str,
+    authority_state: WatchdogAuthorityState,
+    coverage_claimed: bool,
+    kernel_epoch: u64,
+    watchdog_epoch: u64,
+    tick_interval_ms: u128,
+    service_instance_guid: String,
+    host_challenge_nonce: String,
+    watchdog_readiness_sequence: u64,
+    watchdog_incarnation_pid: u32,
+    watchdog_incarnation_start_100ns: u64,
 }
 
 /// Armed writer state: validated rendezvous plus the admitted sequence.
@@ -329,6 +369,23 @@ impl HeartbeatTransport {
         }
     }
 
+    /// Returns the bound watchdog incarnation when the transport is armed
+    /// on one. Diagnostics and tests use this to prove the sequence is
+    /// bound without reading the pipe.
+    #[must_use]
+    pub fn bound_incarnation(&self) -> Option<(u32, u64)> {
+        match self.state.lock() {
+            Ok(state) => match state.as_ref() {
+                Some(armed) if armed.descriptor.is_bound() => Some((
+                    armed.descriptor.watchdog_incarnation_pid,
+                    armed.descriptor.watchdog_incarnation_start_100ns,
+                )),
+                _ => None,
+            },
+            Err(_) => None,
+        }
+    }
+
     /// Arms the transport from the Host-issued descriptor file. A missing
     /// file is disarmed-unavailable (the normal pre-Phase-B state), never
     /// an error that could fail supervision.
@@ -372,6 +429,15 @@ impl HeartbeatTransport {
             }
             let descriptor =
                 parse_descriptor(&bytes, &self.installation_id, self.transaction_plan_generation)?;
+            // Incarnation self-check at arm time: a bound rendezvous names
+            // exactly one verified process. A writer that is not that
+            // process (stale incarnation after a rotation, or a substituted
+            // binary) must never arm admitted emissions on it.
+            if descriptor.is_bound() && !Self::self_incarnation_matches(&descriptor) {
+                return Err(HeartbeatTransportError::InvalidDescriptor(
+                    "heartbeat descriptor is not bound to this watchdog incarnation".to_owned(),
+                ));
+            }
             match self.state.lock() {
                 Ok(mut state) => {
                     if state.is_none() {
@@ -390,27 +456,105 @@ impl HeartbeatTransport {
         }
     }
 
+    /// Returns true only when the armed rendezvous is either unbound (no
+    /// incarnation claimed yet) or bound to this exact process (PID plus
+    /// creation time, so PID reuse never confuses the check).
+    #[cfg(windows)]
+    fn self_incarnation_matches(descriptor: &HeartbeatTransportDescriptor) -> bool {
+        if !descriptor.is_bound() {
+            return true;
+        }
+        if descriptor.watchdog_incarnation_pid != std::process::id() {
+            return false;
+        }
+        match eliot_windows_ipc::current_process_creation_ticks() {
+            Ok(start) => start == descriptor.watchdog_incarnation_start_100ns,
+            Err(_) => false,
+        }
+    }
+
+    /// Re-reads the Host-issued descriptor so a Host bind or rotation that
+    /// landed after arming takes effect before the next emission. A missing
+    /// or unloadable file keeps the armed state (the Host fails closed on
+    /// its side); a changed rendezvous re-arms from sequence zero so the
+    /// Host never sees one sequence chain span two bindings.
+    #[cfg(windows)]
+    fn refresh_binding(&self) -> Result<(), HeartbeatTransportError> {
+        let path = self.host_state_root.join(WATCHDOG_HEARTBEAT_TRANSPORT_FILE_NAME);
+        let Ok(bytes) = std::fs::read(&path) else {
+            return Ok(());
+        };
+        if bytes.len() as u64 > DESCRIPTOR_FILE_LIMIT {
+            return Ok(());
+        }
+        let Ok(fresh) = parse_descriptor(
+            &bytes,
+            &self.installation_id,
+            self.transaction_plan_generation,
+        ) else {
+            return Ok(());
+        };
+        match self.state.lock() {
+            Ok(mut state) => {
+                match state.as_mut() {
+                    Some(armed) if armed.descriptor != fresh => {
+                        if fresh.is_bound() && !Self::self_incarnation_matches(&fresh) {
+                            return Err(HeartbeatTransportError::InvalidDescriptor(
+                                "heartbeat descriptor is not bound to this watchdog incarnation"
+                                    .to_owned(),
+                            ));
+                        }
+                        *armed = ArmedHeartbeat {
+                            descriptor: fresh,
+                            sequence: FENCE_SEQUENCE,
+                            last_emit: None,
+                        };
+                    }
+                    _ => {}
+                }
+                Ok(())
+            }
+            Err(_) => Err(HeartbeatTransportError::Emit(
+                "heartbeat state is poisoned".to_owned(),
+            )),
+        }
+    }
+
+    /// Non-Windows containment (I1.7): there is no descriptor to refresh.
+    #[cfg(not(windows))]
+    fn refresh_binding(&self) -> Result<(), HeartbeatTransportError> {
+        Ok(())
+    }
+
     /// Emits one fence announce (sequence zero, `RunningNoAuthority` only).
     /// Best-effort: failures degrade to stdout-only and are traced.
     pub async fn emit_fence(&self, fence: &WatchdogReadiness) {
         if fence.authority_state != WatchdogAuthorityState::RunningNoAuthority {
             return;
         }
+        if !(TICK_MIN_MS..=TICK_MAX_MS).contains(&fence.tick_interval_ms) {
+            return;
+        }
         if self.ensure_armed().is_err() {
             return;
         }
-        let (pipe_name, guid, nonce) = match self.state.lock() {
+        if self.refresh_binding().is_err() {
+            return;
+        }
+        let (pipe_name, guid, nonce, incarnation_pid, incarnation_start) = match self.state.lock() {
             Ok(state) => match state.as_ref() {
                 Some(armed) => (
                     armed.descriptor.pipe_name.clone(),
                     armed.descriptor.service_instance_guid.clone(),
                     armed.descriptor.host_challenge_nonce.clone(),
+                    armed.descriptor.watchdog_incarnation_pid,
+                    armed.descriptor.watchdog_incarnation_start_100ns,
                 ),
                 None => return,
             },
             Err(_) => return,
         };
-        let message = WatchdogReadiness {
+        let message = HeartbeatWireMessage {
             service: SERVICE_NAME,
             protocol: PROTOCOL_VERSION,
             authority_state: WatchdogAuthorityState::RunningNoAuthority,
@@ -421,6 +565,8 @@ impl HeartbeatTransport {
             service_instance_guid: guid,
             host_challenge_nonce: nonce,
             watchdog_readiness_sequence: FENCE_SEQUENCE,
+            watchdog_incarnation_pid: incarnation_pid,
+            watchdog_incarnation_start_100ns: incarnation_start,
         };
         let bytes = serde_json::to_vec(&message).unwrap_or_default();
         if bytes.is_empty() || bytes.len() > MESSAGE_LIMIT {
@@ -446,9 +592,10 @@ impl HeartbeatTransport {
     /// # Errors
     ///
     /// Returns a typed error for zero epochs, a disarmed contour, poisoned
-    /// sequence state, an oversize message, or a failed pipe write. Callers
-    /// trace and continue supervision; they never fail the tick for
-    /// transport backpressure.
+    /// sequence state, an unbound or foreign incarnation, an insane tick,
+    /// an oversize message, or a failed pipe write. Callers trace and
+    /// continue supervision; they never fail the tick for transport
+    /// backpressure.
     pub async fn emit_admitted(
         &self,
         kernel_epoch: u64,
@@ -460,10 +607,38 @@ impl HeartbeatTransport {
                 "admitted heartbeat carries a zero epoch".to_owned(),
             ));
         }
+        // The tick sizes the Host freshness window: an insane tick must
+        // never ride an admitted message, or the window would stretch or
+        // collapse under writer control.
+        if !(TICK_MIN_MS..=TICK_MAX_MS).contains(&tick_interval_ms) {
+            return Err(HeartbeatTransportError::Emit(
+                "admitted heartbeat tick is outside its sanity bounds".to_owned(),
+            ));
+        }
         self.ensure_armed()?;
-        let (pipe_name, guid, nonce, sequence) = match self.state.lock() {
+        self.refresh_binding()?;
+        let (pipe_name, guid, nonce, incarnation_pid, incarnation_start, sequence) =
+            match self.state.lock() {
             Ok(state) => match state.as_ref() {
                 Some(armed) => {
+                    // The emitted sequence is bound to the verified SCM
+                    // incarnation: an unbound rendezvous (the Host has not
+                    // completed the post-start bind) or a binding naming
+                    // another process emits no admitted state. Admitted
+                    // emissions additionally happen only after the Kernel
+                    // port accepted the heartbeat (caller gate in the
+                    // composition tick).
+                    #[cfg(windows)]
+                    {
+                        if !armed.descriptor.is_bound()
+                            || !Self::self_incarnation_matches(&armed.descriptor)
+                        {
+                            return Err(HeartbeatTransportError::Emit(
+                                "heartbeat transport is not bound to this watchdog incarnation"
+                                    .to_owned(),
+                            ));
+                        }
+                    }
                     if armed.last_emit.is_some_and(|at| at.elapsed() < self.tick_interval) {
                         tracing::debug!(
                             event = "watchdog.heartbeat.cadence_guarded",
@@ -477,6 +652,8 @@ impl HeartbeatTransport {
                             armed.descriptor.pipe_name.clone(),
                             armed.descriptor.service_instance_guid.clone(),
                             armed.descriptor.host_challenge_nonce.clone(),
+                            armed.descriptor.watchdog_incarnation_pid,
+                            armed.descriptor.watchdog_incarnation_start_100ns,
                             next,
                         ),
                         None => {
@@ -498,7 +675,7 @@ impl HeartbeatTransport {
                 ));
             }
         };
-        let message = WatchdogReadiness {
+        let message = HeartbeatWireMessage {
             service: SERVICE_NAME,
             protocol: PROTOCOL_VERSION,
             authority_state: WatchdogAuthorityState::AdmittedHeartbeat,
@@ -509,6 +686,8 @@ impl HeartbeatTransport {
             service_instance_guid: guid,
             host_challenge_nonce: nonce,
             watchdog_readiness_sequence: sequence,
+            watchdog_incarnation_pid: incarnation_pid,
+            watchdog_incarnation_start_100ns: incarnation_start,
         };
         let bytes = serde_json::to_vec(&message)
             .map_err(|error| HeartbeatTransportError::Emit(error.to_string()))?;
@@ -573,12 +752,15 @@ mod tests {
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+    #[derive(Clone)]
     struct Fixture {
         installation_id: String,
         generation: u64,
         pipe_name: String,
         nonce: String,
         guid: String,
+        incarnation_pid: u32,
+        incarnation_start: u64,
     }
 
     fn fixture() -> Fixture {
@@ -589,19 +771,27 @@ mod tests {
             pipe_name: format!("{WATCHDOG_HEARTBEAT_PIPE_PREFIX}{guid}"),
             nonce: "ab".repeat(32),
             guid,
+            incarnation_pid: 4242,
+            incarnation_start: 987_654_321,
+        }
+    }
+
+    fn fixture_descriptor(fixture: &Fixture) -> HeartbeatTransportDescriptor {
+        HeartbeatTransportDescriptor {
+            pipe_name: fixture.pipe_name.clone(),
+            host_challenge_nonce: fixture.nonce.clone(),
+            service_instance_guid: fixture.guid.clone(),
+            installation_id: fixture.installation_id.clone(),
+            transaction_plan_generation: fixture.generation,
+            watchdog_incarnation_pid: fixture.incarnation_pid,
+            watchdog_incarnation_start_100ns: fixture.incarnation_start,
         }
     }
 
     fn fixture_bytes(fixture: &Fixture) -> Vec<u8> {
-        let canonical = canonical_descriptor_bytes(
-            WATCHDOG_HEARTBEAT_TRANSPORT_SCHEMA,
-            &fixture.pipe_name,
-            &fixture.nonce,
-            &fixture.guid,
-            &fixture.installation_id,
-            fixture.generation,
-        )
-        .unwrap_or_else(|_| panic!("canonical fixture bytes must encode"));
+        let canonical = fixture_descriptor(fixture)
+            .canonical_bytes()
+            .unwrap_or_else(|_| panic!("canonical fixture bytes must encode"));
         let digest = descriptor_digest(&canonical);
         serde_json::to_vec(&serde_json::json!({
             "schema": WATCHDOG_HEARTBEAT_TRANSPORT_SCHEMA,
@@ -610,6 +800,8 @@ mod tests {
             "service_instance_guid": fixture.guid,
             "installation_id": fixture.installation_id,
             "transaction_plan_generation": fixture.generation,
+            "watchdog_incarnation_pid": fixture.incarnation_pid,
+            "watchdog_incarnation_start_100ns": fixture.incarnation_start,
             "descriptor_digest": digest,
         }))
         .unwrap_or_else(|_| panic!("fixture descriptor must encode"))
@@ -621,7 +813,12 @@ mod tests {
     }
 
     fn armed_transport(dir: &Path, tick: Duration) -> HeartbeatTransport {
-        let fixture = fixture();
+        // The arming self-check requires the filed descriptor to name this
+        // process on Windows; other platforms never read the file.
+        let mut fixture = fixture();
+        let (pid, start) = self_incarnation();
+        fixture.incarnation_pid = pid;
+        fixture.incarnation_start = start;
         std::fs::create_dir_all(dir).unwrap_or_else(|_| panic!("test dir must build"));
         std::fs::write(
             dir.join(WATCHDOG_HEARTBEAT_TRANSPORT_FILE_NAME),
@@ -634,6 +831,20 @@ mod tests {
             fixture.generation,
             tick,
         )
+    }
+
+    fn self_incarnation() -> (u32, u64) {
+        #[cfg(windows)]
+        {
+            let pid = std::process::id();
+            let start = eliot_windows_ipc::current_process_creation_ticks()
+                .unwrap_or_else(|_| panic!("own creation ticks must query"));
+            (pid, start)
+        }
+        #[cfg(not(windows))]
+        {
+            (4242, 987_654_321)
+        }
     }
 
     #[test]
@@ -653,15 +864,9 @@ mod tests {
     #[test]
     fn canonical_field_order_is_pinned() {
         let fixture = fixture();
-        let canonical = canonical_descriptor_bytes(
-            WATCHDOG_HEARTBEAT_TRANSPORT_SCHEMA,
-            &fixture.pipe_name,
-            &fixture.nonce,
-            &fixture.guid,
-            &fixture.installation_id,
-            fixture.generation,
-        )
-        .unwrap_or_else(|_| panic!("canonical fixture bytes must encode"));
+        let canonical = fixture_descriptor(&fixture)
+            .canonical_bytes()
+            .unwrap_or_else(|_| panic!("canonical fixture bytes must encode"));
         let text = String::from_utf8(canonical).unwrap_or_else(|_| panic!("canonical is UTF-8"));
         let mut cursor = 0;
         for key in [
@@ -671,6 +876,8 @@ mod tests {
             "service_instance_guid",
             "installation_id",
             "transaction_plan_generation",
+            "watchdog_incarnation_pid",
+            "watchdog_incarnation_start_100ns",
         ] {
             let needle = format!("\"{key}\":");
             let at = text[cursor..]
@@ -736,18 +943,12 @@ mod tests {
     #[test]
     fn golden_descriptor_digest_is_pinned() {
         let fixture = fixture();
-        let canonical = canonical_descriptor_bytes(
-            WATCHDOG_HEARTBEAT_TRANSPORT_SCHEMA,
-            &fixture.pipe_name,
-            &fixture.nonce,
-            &fixture.guid,
-            &fixture.installation_id,
-            fixture.generation,
-        )
-        .unwrap_or_else(|_| panic!("canonical fixture bytes must encode"));
+        let canonical = fixture_descriptor(&fixture)
+            .canonical_bytes()
+            .unwrap_or_else(|_| panic!("canonical fixture bytes must encode"));
         assert_eq!(
             descriptor_digest(&canonical),
-            "bb49f196da03bcc23d553e29068cdb0ad04ed12304a907c0b8271ffd03e024f1"
+            "37e86fc8c03877774c8ffe6c0f2de36db3fec230b0d9faf3448ba6a14ed9a411"
         );
     }
 
@@ -796,6 +997,7 @@ mod tests {
 
     #[cfg(windows)]
     fn loopback_transport(pipe_name: &str) -> HeartbeatTransport {
+        let (pid, start) = self_incarnation();
         HeartbeatTransport {
             host_state_root: PathBuf::from("loopback-root"),
             installation_id: "loopback".to_owned(),
@@ -808,6 +1010,8 @@ mod tests {
                     service_instance_guid: "ef".repeat(16),
                     installation_id: "loopback".to_owned(),
                     transaction_plan_generation: 3,
+                    watchdog_incarnation_pid: pid,
+                    watchdog_incarnation_start_100ns: start,
                 },
                 sequence: FENCE_SEQUENCE,
                 last_emit: None,
@@ -862,6 +1066,16 @@ mod tests {
         assert_eq!(message["service_instance_guid"], serde_json::Value::String("ef".repeat(16)));
         assert_eq!(message["host_challenge_nonce"], serde_json::Value::String("12".repeat(32)));
         assert_eq!(message["watchdog_readiness_sequence"], serde_json::Value::Number(1.into()));
+        let (pid, start) = self_incarnation();
+        assert_eq!(
+            message["watchdog_incarnation_pid"],
+            serde_json::Value::Number(pid.into())
+        );
+        assert_eq!(
+            message["watchdog_incarnation_start_100ns"],
+            serde_json::Value::Number(start.into())
+        );
+        assert_eq!(transport.bound_incarnation(), Some((pid, start)));
         assert_eq!(transport.last_sequence(), 1);
         drop(server);
     }
@@ -927,5 +1141,135 @@ mod tests {
         .await;
         assert!(skipped.is_err(), "admitted state must never ride a fence announce");
         assert_eq!(skip_transport.last_sequence(), FENCE_SEQUENCE);
+    }
+
+    #[test]
+    fn descriptor_rejects_half_bound_incarnation() {
+        let fixture = fixture();
+        // Unbound (zero pair) parses: it arms fence-only.
+        let mut unbound = fixture.clone();
+        unbound.incarnation_pid = 0;
+        unbound.incarnation_start = 0;
+        assert!(
+            parse_descriptor(
+                &fixture_bytes(&unbound),
+                &fixture.installation_id,
+                fixture.generation
+            )
+            .is_ok()
+        );
+        // A half-bound pair never validates.
+        let good = fixture_bytes(&fixture);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&good).unwrap_or_else(|_| panic!("fixture must be JSON"));
+        value["watchdog_incarnation_start_100ns"] = serde_json::Value::Number(0.into());
+        let bytes =
+            serde_json::to_vec(&value).unwrap_or_else(|_| panic!("mutated fixture must encode"));
+        assert!(
+            parse_descriptor(&bytes, &fixture.installation_id, fixture.generation).is_err()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn arming_rejects_foreign_bound_descriptor() {
+        let dir = test_dir();
+        let fixture = fixture();
+        std::fs::create_dir_all(&dir).unwrap_or_else(|_| panic!("test dir must build"));
+        std::fs::write(
+            dir.join(WATCHDOG_HEARTBEAT_TRANSPORT_FILE_NAME),
+            fixture_bytes(&fixture),
+        )
+        .unwrap_or_else(|_| panic!("fixture descriptor must write"));
+        let transport = HeartbeatTransport::for_bootstrap(
+            &dir,
+            &fixture.installation_id,
+            fixture.generation,
+            Duration::from_secs(2),
+        );
+        // The filed descriptor names incarnation (4242, ...) while this
+        // process is another: arming admitted emissions on it must fail.
+        assert!(matches!(
+            transport.ensure_armed(),
+            Err(HeartbeatTransportError::InvalidDescriptor(_))
+        ));
+        assert_eq!(transport.bound_incarnation(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn admitted_refused_while_unbound_and_on_insane_tick() {
+        let dir = test_dir();
+        let mut fixture = fixture();
+        fixture.incarnation_pid = 0;
+        fixture.incarnation_start = 0;
+        std::fs::create_dir_all(&dir).unwrap_or_else(|_| panic!("test dir must build"));
+        std::fs::write(
+            dir.join(WATCHDOG_HEARTBEAT_TRANSPORT_FILE_NAME),
+            fixture_bytes(&fixture),
+        )
+        .unwrap_or_else(|_| panic!("fixture descriptor must write"));
+        let transport = HeartbeatTransport::for_bootstrap(
+            &dir,
+            &fixture.installation_id,
+            fixture.generation,
+            Duration::from_secs(2),
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap_or_else(|_| panic!("test runtime must build"));
+        // No verified incarnation: no admitted state, sequence unburned.
+        assert!(runtime.block_on(transport.emit_admitted(7, 11, 2000)).is_err());
+        assert_eq!(transport.last_sequence(), FENCE_SEQUENCE);
+        // An insane tick must never size the Host freshness window.
+        assert!(runtime.block_on(transport.emit_admitted(7, 11, 1)).is_err());
+        assert!(
+            runtime
+                .block_on(transport.emit_admitted(7, 11, 3_600_000_001))
+                .is_err()
+        );
+        assert_eq!(transport.last_sequence(), FENCE_SEQUENCE);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn refresh_adopts_host_bind_without_sequence_reset() {
+        let dir = test_dir();
+        let mut fixture = fixture();
+        fixture.incarnation_pid = 0;
+        fixture.incarnation_start = 0;
+        std::fs::create_dir_all(&dir).unwrap_or_else(|_| panic!("test dir must build"));
+        std::fs::write(
+            dir.join(WATCHDOG_HEARTBEAT_TRANSPORT_FILE_NAME),
+            fixture_bytes(&fixture),
+        )
+        .unwrap_or_else(|_| panic!("fixture descriptor must write"));
+        let transport = HeartbeatTransport::for_bootstrap(
+            &dir,
+            &fixture.installation_id,
+            fixture.generation,
+            Duration::from_secs(2),
+        );
+        transport
+            .ensure_armed()
+            .unwrap_or_else(|_| panic!("unbound transport must arm"));
+        assert_eq!(transport.bound_incarnation(), None);
+        // The Host completes the post-start bind on the same challenge.
+        let (pid, start) = self_incarnation();
+        fixture.incarnation_pid = pid;
+        fixture.incarnation_start = start;
+        std::fs::write(
+            dir.join(WATCHDOG_HEARTBEAT_TRANSPORT_FILE_NAME),
+            fixture_bytes(&fixture),
+        )
+        .unwrap_or_else(|_| panic!("bound descriptor must write"));
+        transport
+            .refresh_binding()
+            .unwrap_or_else(|_| panic!("refresh must adopt the bind"));
+        assert_eq!(transport.bound_incarnation(), Some((pid, start)));
+        assert_eq!(transport.last_sequence(), FENCE_SEQUENCE);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

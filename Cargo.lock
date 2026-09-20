@@ -2977,6 +2977,7 @@ dependencies = [
  "eliot-runtime",
  "eliot-runtime-contracts",
  "eliot-watchdog-core",
+ "eliot-windows-ipc",
  "redb",
  "serde",
  "serde_json",

@@ -20,6 +20,7 @@ eliot-installation.workspace = true
 eliot-ors.workspace = true
 eliot-platform-windows.workspace = true
 eliot-watchdog-core.workspace = true
+eliot-windows-ipc.workspace = true
 eliot-runtime.workspace = true
 eliot-runtime-contracts.workspace = true
 redb.workspace = true

@@ -5278,18 +5278,47 @@ impl HostComposition {
         // through the trusted contour the Watchdog already reads (the
         // installer-approved Host state root, bound to the exact approved
         // registration bootstrap). Any issuance failure fails this start
-        // closed: no descriptor, no supervised claim later.
+        // closed: no descriptor, no supervised claim later. A live bound
+        // prior is kept, never rotated: the rendezvous belongs to the
+        // running incarnation until it provably stops.
         let heartbeat_bootstrap = registration.bootstrap().ok_or_else(|| {
             HostError::ProcessContour("Watchdog registration has no typed bootstrap".to_owned())
         })?;
+        let heartbeat_state_root = Path::new(launch.runtime_state_roots.host_state_root.as_str());
         watchdog_heartbeat::HeartbeatTransportDescriptor::issue(
             heartbeat_bootstrap.installation_id(),
             heartbeat_bootstrap.transaction_plan_generation(),
         )?
-        .publish(Path::new(
-            launch.runtime_state_roots.host_state_root.as_str(),
-        ))?;
-        start_installed_watchdog(&mut platform, &registration, context)
+        .publish(heartbeat_state_root)?;
+        start_installed_watchdog(&mut platform, &registration, context)?;
+        // Transport1750 step 2: bind the rendezvous to the SCM-verified
+        // incarnation now Running. Admission and the writer both pin this
+        // pair, so an unbound start admits nothing and a conflicting bind
+        // fails closed (retry heals: a stopped prior rotates on the next
+        // start).
+        let scm = match platform.inspect_registration_runtime(&registration) {
+            InstalledWatchdogRuntimeInspection::Matching {
+                state,
+                wait_hint_ms,
+                process,
+            } => verify_watchdog_scm_running(
+                &registration,
+                state,
+                wait_hint_ms,
+                process.as_ref(),
+            )?,
+            _ => {
+                return Err(HostError::RecoveryRequired(
+                    "Watchdog is not Running for heartbeat incarnation bind".to_owned(),
+                ));
+            }
+        };
+        watchdog_heartbeat::HeartbeatTransportDescriptor::bind_incarnation(
+            heartbeat_state_root,
+            scm.process.process_id,
+            scm.process.start_time_100ns,
+        )?;
+        Ok(())
     }
 
     #[cfg(windows)]
