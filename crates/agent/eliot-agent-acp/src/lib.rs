@@ -10,6 +10,14 @@
 
 #![forbid(unsafe_code)]
 
+mod durable_host_event_ingest;
+pub use durable_host_event_ingest::{
+    DURABLE_INGEST_TRANSFORMATION_VERSION, DurableHostEventJournal, DurableHostEventRecord,
+    EventKey, IngestError, REDACTED_PROJECTION_MARKER, RecordDisposition, RedactionReason,
+    RedactionReceipt, ReplayItem, StageAllowed, StageOutcome, StageRedacted, StoredPayload,
+    StreamCursorState, contains_forbidden_content, deterministic_redacted_bytes,
+};
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use eliot_agent_api::{
