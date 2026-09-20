@@ -1920,6 +1920,7 @@ dependencies = [
  "eliot-instrument-rustfmt",
  "eliot-instrument-scip",
  "eliot-process",
+ "eliot-process-executor",
  "serde_json",
  "thiserror",
 ]

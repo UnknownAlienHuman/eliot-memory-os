@@ -12,9 +12,14 @@
 //! writes canonical state, or decides verification. Raw evidence retention,
 //! live dispatch, real fixtures, timeout/cancel/cleanup behavior, and live
 //! cache binding are follow-up work owned by later slices; this slice records
-//! identities, pins machine-derived per-executable observations through
-//! [`ResolvedExecutableIdentity`], and rejects stale, unsupported, missing,
-//! duplicate, ambiguous, and identity-mismatched mappings.
+//! per-result machine-derived observations through
+//! [`ResolvedExecutableIdentity`] and rejects stale, unsupported, missing,
+//! duplicate, ambiguous, and identity-mismatched mappings. The registry pins
+//! no per-executable digest expectation of its own: the executable digest is
+//! compared against the intent-sealed `executable_sha256` at launch (see
+//! `eliot-process-executor`), and registry-pinned per-executable digests
+//! remain follow-up work with the environment owner (see
+//! [`ProviderRegistry::ready`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -175,6 +180,9 @@ pub enum ExecutableIdentityCause {
     /// The content digest is not a lowercase SHA-256 digest.
     #[error("invalid content digest")]
     InvalidDigest,
+    /// An invocation argument carries control characters.
+    #[error("invalid invocation arguments")]
+    InvalidArguments,
     /// No tool version was observed for the executable.
     #[error("missing tool version")]
     MissingVersion,
@@ -224,10 +232,11 @@ impl fmt::Display for FingerprintField {
 ///
 /// Values are attested by the composition root and passed in; the registry
 /// never reads files at runtime. Any slot that moves afterwards makes the
-/// entry stale through [`ProviderRegistry::resolve_current`]. Exact
-/// per-executable digests are additionally pinned per result through
-/// [`ResolvedExecutableIdentity`], so a replaced executable yields a
-/// different identity instead of silently rebinding an earlier result.
+/// entry stale through [`ProviderRegistry::resolve_current`]. A replaced
+/// executable yields a different [`ResolvedExecutableIdentity::identity_digest`]
+/// between two observations instead of silently rebinding an earlier result,
+/// but the registry pins no per-executable digest expectation: exact
+/// per-executable digests remain follow-up work with the environment owner.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InvalidationSet {
     /// Source snapshot fingerprint.
@@ -326,13 +335,23 @@ impl ExecutableIdentity {
 /// Machine-derived executable observation bound to one instrument result.
 ///
 /// Unlike [`ExecutableIdentity`], which records the admission-time
-/// acquisition rule, this record is resolved from the machine at launch:
-/// canonical path, content digest, tool version, environment projection
-/// identity, and exact invocation arguments. Every governed profile result
-/// carries one; a result without a complete observation can never take
-/// authoritative PASS, and a replaced executable yields a different
-/// [`ResolvedExecutableIdentity::identity_digest`] so the earlier result is
-/// never silently rebound.
+/// acquisition rule, this record carries the launch observation: canonical
+/// path, content digest, tool version, environment projection identity, and
+/// the exact argv handed to the executable. Only path and content digest are
+/// hashed from the machine by the executor; version and environment digest
+/// arrive caller-supplied and stay attested, never independently observed.
+/// Every governed process result carries one; a process result without a
+/// complete observation can never take authoritative PASS (decoder-only
+/// entries never launch and legitimately carry none), and a replaced
+/// executable yields a different [`ResolvedExecutableIdentity::identity_digest`]
+/// so the earlier result is never silently rebound.
+///
+/// Argument contract: `arguments` is the exact process argv, compared only
+/// against argv (the sealed [`ProcessRequest`](eliot_process::ProcessRequest)
+/// argv through [`ResolvedExecutableIdentity::binds_argv`]). The admitted
+/// [`InstrumentInvocation`](eliot_instrument_api::InstrumentInvocation)
+/// arguments are instrument-level filters (e.g. nextest `-E` filters), never
+/// argv, and are never compared here.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedExecutableIdentity {
     /// Canonical filesystem path of the launched executable.
@@ -350,32 +369,44 @@ pub struct ResolvedExecutableIdentity {
 impl ResolvedExecutableIdentity {
     /// Records one machine-derived observation, validating every field.
     ///
+    /// `instrument` names the registry-bound instrument contract and is
+    /// carried into every rejection so errors never render `for instrument
+    /// ''`.
+    ///
     /// # Errors
     ///
-    /// Returns [`RegistryError::UnresolvedExecutable`] when the path, digest,
-    /// environment identity, version text, or an argument is malformed.
+    /// Returns [`RegistryError::UnresolvedExecutable`] when the instrument
+    /// name, path, digest, environment identity, version text, or an argument
+    /// is malformed.
     pub fn new(
+        instrument: &str,
         canonical_path: String,
         content_digest: String,
         tool_version: Option<String>,
         environment_digest: String,
         arguments: Vec<String>,
     ) -> Result<Self, RegistryError> {
+        if instrument.trim().is_empty() || instrument.chars().any(char::is_control) {
+            return Err(RegistryError::UnresolvedExecutable {
+                instrument: instrument.to_owned(),
+                reason: ExecutableIdentityCause::Missing,
+            });
+        }
         if canonical_path.trim().is_empty() || canonical_path.chars().any(char::is_control) {
             return Err(RegistryError::UnresolvedExecutable {
-                instrument: String::new(),
+                instrument: instrument.to_owned(),
                 reason: ExecutableIdentityCause::InvalidPath,
             });
         }
         if !is_lower_hex_digest(&content_digest) {
             return Err(RegistryError::UnresolvedExecutable {
-                instrument: String::new(),
+                instrument: instrument.to_owned(),
                 reason: ExecutableIdentityCause::InvalidDigest,
             });
         }
         if !is_lower_hex_digest(&environment_digest) {
             return Err(RegistryError::UnresolvedExecutable {
-                instrument: String::new(),
+                instrument: instrument.to_owned(),
                 reason: ExecutableIdentityCause::UnknownEnvironment,
             });
         }
@@ -383,7 +414,7 @@ impl ResolvedExecutableIdentity {
             version.trim().is_empty() || version.chars().any(char::is_control)
         }) {
             return Err(RegistryError::UnresolvedExecutable {
-                instrument: String::new(),
+                instrument: instrument.to_owned(),
                 reason: ExecutableIdentityCause::MissingVersion,
             });
         }
@@ -392,8 +423,8 @@ impl ResolvedExecutableIdentity {
             .any(|argument| argument.chars().any(char::is_control))
         {
             return Err(RegistryError::UnresolvedExecutable {
-                instrument: String::new(),
-                reason: ExecutableIdentityCause::InvalidPath,
+                instrument: instrument.to_owned(),
+                reason: ExecutableIdentityCause::InvalidArguments,
             });
         }
         Ok(Self {
@@ -438,9 +469,14 @@ impl ResolvedExecutableIdentity {
         eliot_contracts::sha256_hex(material.as_bytes())
     }
 
-    /// Whether the observed arguments equal the admitted invocation arguments.
-    pub fn binds_invocation(&self, invocation: &InstrumentInvocation) -> bool {
-        self.arguments == invocation.arguments
+    /// Whether the observed argv equals the sealed process-request argv.
+    ///
+    /// Both sides are exact process argv (executable arguments as handed to
+    /// the executable). The admitted invocation arguments are
+    /// instrument-level filters and are never compared here; comparing argv
+    /// to filters would refuse every genuine run.
+    pub fn binds_argv(&self, argv: &[String]) -> bool {
+        self.arguments == argv
     }
 
     /// File name of the canonical path, lowercased without an `.exe` suffix.
@@ -522,13 +558,17 @@ impl RegistryEntry {
         self.instrument.as_str()
     }
 
-    /// Pins a machine-derived observation to this entry before launch.
+    /// Checks a machine-derived observation against this entry before launch.
     ///
     /// Decoder-only entries reject any observation (they must never launch
-    /// a process). Process entries require a complete observation whose
-    /// executable file name matches the registry-bound executable; a missing,
-    /// incomplete, or renamed executable fails closed so the result can never
-    /// take authoritative PASS.
+    /// a process) and accept `None`. Process entries require a complete
+    /// observation whose executable file name matches the registry-bound
+    /// executable; a missing, incomplete, or renamed executable fails closed
+    /// so the result can never take authoritative PASS. This check pins the
+    /// executable *name*; the content digest is compared against the
+    /// intent-sealed `executable_sha256` at launch by the executor, and
+    /// argv is compared against the sealed request argv by the binding (argv
+    /// to argv, never argv to invocation filters).
     ///
     /// # Errors
     ///
@@ -1177,6 +1217,7 @@ mod tests {
 
     fn rustc_observation(arguments: Vec<String>) -> ResolvedExecutableIdentity {
         unreachable_id(ResolvedExecutableIdentity::new(
+            RUSTC_INSTRUMENT,
             "/usr/bin/rustc".to_owned(),
             "a".repeat(64),
             Some("rustc 1.89.0".to_owned()),
@@ -1210,6 +1251,7 @@ mod tests {
     fn malformed_observations_are_rejected() {
         assert!(
             ResolvedExecutableIdentity::new(
+                RUSTC_INSTRUMENT,
                 "/usr/bin/rustc".to_owned(),
                 "not-a-digest".to_owned(),
                 Some("rustc 1.89.0".to_owned()),
@@ -1220,6 +1262,7 @@ mod tests {
         );
         assert!(
             ResolvedExecutableIdentity::new(
+                RUSTC_INSTRUMENT,
                 "/usr/bin/rustc".to_owned(),
                 "a".repeat(64),
                 Some("rustc 1.89.0".to_owned()),
@@ -1228,6 +1271,31 @@ mod tests {
             )
             .is_err()
         );
+        assert!(matches!(
+            ResolvedExecutableIdentity::new(
+                RUSTC_INSTRUMENT,
+                "/usr/bin/rustc".to_owned(),
+                "a".repeat(64),
+                Some("rustc 1.89.0".to_owned()),
+                "b".repeat(64),
+                vec!["--crate-name\u{0}foo".to_owned()],
+            ),
+            Err(RegistryError::UnresolvedExecutable {
+                reason: ExecutableIdentityCause::InvalidArguments,
+                ..
+            })
+        ));
+        assert!(matches!(
+            ResolvedExecutableIdentity::new(
+                "",
+                "/usr/bin/rustc".to_owned(),
+                "a".repeat(64),
+                Some("rustc 1.89.0".to_owned()),
+                "b".repeat(64),
+                Vec::new(),
+            ),
+            Err(RegistryError::UnresolvedExecutable { .. })
+        ));
     }
 
     #[test]
@@ -1263,6 +1331,7 @@ mod tests {
             })
         ));
         let renamed = unreachable_id(ResolvedExecutableIdentity::new(
+            RUSTC_INSTRUMENT,
             "/usr/bin/other-tool".to_owned(),
             "a".repeat(64),
             Some("other 1.0".to_owned()),
@@ -1275,7 +1344,7 @@ mod tests {
         ));
         let matching = rustc_observation(invocation.arguments.clone());
         assert!(entry.check_resolved_executable(Some(&matching)).is_ok());
-        assert!(matching.binds_invocation(&invocation));
+        assert!(matching.binds_argv(&invocation.arguments));
     }
 
     #[test]

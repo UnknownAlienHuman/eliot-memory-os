@@ -3830,7 +3830,7 @@ fn retention(limit: u64, ceiling: usize) -> usize {
 }
 
 fn sha256_file(path: &Path) -> Result<String, std::io::Error> {
-    let mut file = std::fs::File::open(path)?;
+    let mut file = open_executable_for_hash(path)?;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; STREAM_CHUNK_BYTES];
     loop {
@@ -3841,6 +3841,50 @@ fn sha256_file(path: &Path) -> Result<String, std::io::Error> {
         hasher.update(&buffer[..read]);
     }
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Opens an executable for hashing with the same deny-write posture as the
+/// retained launch lease
+/// ([`WindowsPlatform::retain_process_path_lease`](eliot_platform_windows::WindowsPlatform::retain_process_path_lease)):
+/// writers are denied while the bytes are read, and reparse points are
+/// refused so a symlink can never stand in for the executable.
+///
+/// This narrows the hash race to the observation instant only. It is not a
+/// retained cross-launch pin: only the kernel lease (held across the
+/// suspended-launch/resume boundary at the real launch path) proves the
+/// launched bytes equal the hashed bytes. Observations here bind evidence to
+/// the intent-sealed digest; they never replace the lease.
+#[cfg(windows)]
+fn open_executable_for_hash(path: &Path) -> Result<std::fs::File, std::io::Error> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    // Win32 constants (stable ABI): FILE_SHARE_READ denies writers while the
+    // bytes are read; FILE_FLAG_OPEN_REPARSE_POINT opens the link itself so
+    // the symlink check below sees it. Same posture as the retained launch
+    // lease; no new dependency for two stable flags.
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "executable is not a plain file",
+        ));
+    }
+    Ok(file)
+}
+
+/// Opens an executable for hashing on non-Windows platforms (plain open:
+/// no deny-write share semantics exist here; the retained cross-launch pin
+/// remains the kernel lease on its owning platform).
+#[cfg(not(windows))]
+fn open_executable_for_hash(path: &Path) -> Result<std::fs::File, std::io::Error> {
+    std::fs::File::open(path)
 }
 
 fn short_digest(bytes: &[u8]) -> String {
@@ -3863,11 +3907,16 @@ pub fn empty_sha256_hex() -> String {
 ///
 /// This is the executor-side counterpart of the runner's
 /// `ResolvedExecutableIdentity`: canonical path, content digest, tool
-/// version, environment projection digest, and exact arguments, all resolved
-/// from the machine instead of caller attestation. A result that carries no
-/// complete observation stays `UNKNOWN` and can never take authoritative
-/// PASS; a replaced executable changes the content digest, so an earlier
-/// result is never silently rebound.
+/// version, environment projection digest, and exact arguments. Only the
+/// canonical path and content digest are hashed from the machine here; the
+/// tool version and environment digest are caller-supplied (no `--version`
+/// is executed, and the digest covers the declared projection, not the
+/// inherited platform environment) and must be treated as attested, not
+/// observed. A result that carries no complete observation stays `UNKNOWN`
+/// and can never take authoritative PASS; a replaced executable changes the
+/// content digest, so an earlier result is never silently rebound.
+/// Convert into the registry-bound form with the runner's
+/// `bridge_executor_observation` (which re-validates every field).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutableObservation {
     /// Canonical filesystem path of the observed executable.
@@ -3913,6 +3962,19 @@ pub enum ExecutableIdentityError {
         /// Digest observed on the machine.
         observed: String,
     },
+    /// The observed argv no longer equals the admitted intent argv: a
+    /// binding violation, never a transient I/O fault.
+    ArgvMismatch {
+        /// Argv sealed in the admitted intent.
+        expected: Vec<String>,
+        /// Argv carried by the observation.
+        observed: Vec<String>,
+    },
+    /// An invocation argument carries control characters.
+    InvalidArguments {
+        /// Rejected argument text.
+        value: String,
+    },
     /// No tool version was observed for the executable.
     MissingVersion,
     /// The environment projection identity is missing or malformed.
@@ -3936,6 +3998,12 @@ impl std::fmt::Display for ExecutableIdentityError {
                 f,
                 "executable digest mismatch: expected {expected}, observed {observed}"
             ),
+            Self::ArgvMismatch { .. } => {
+                f.write_str("executable arguments do not match the admitted intent")
+            }
+            Self::InvalidArguments { value } => {
+                write!(f, "invalid executable argument: {value}")
+            }
             Self::MissingVersion => f.write_str("missing executable tool version"),
             Self::UnknownEnvironment => f.write_str("unknown environment projection"),
             Self::InvalidPath { value } => write!(f, "invalid executable path: {value}"),
@@ -3948,6 +4016,10 @@ impl std::error::Error for ExecutableIdentityError {}
 impl From<ExecutableIdentityError> for ProcessExecutionError {
     fn from(error: ExecutableIdentityError) -> Self {
         match error {
+            // Missing/unreadable files are transient I/O faults. Every other
+            // identity failure is a binding verdict (never retryable): a
+            // replaced executable, diverged argv, or malformed identity must
+            // not be retried into a success.
             ExecutableIdentityError::Missing { .. }
             | ExecutableIdentityError::Unreadable { .. } => Self::Unavailable(error.to_string()),
             _ => Self::UnknownOutcome,
@@ -3958,10 +4030,18 @@ impl From<ExecutableIdentityError> for ProcessExecutionError {
 impl ExecutableObservation {
     /// Resolves one observation from a filesystem path.
     ///
-    /// The path is canonicalized, the file bytes are hashed, and the exact
-    /// arguments, environment digest, and tool version are recorded. A
+    /// The path is canonicalized, the file bytes are hashed with writers
+    /// denied on Windows (same posture as the retained launch lease), and the
+    /// exact argv, environment digest, and tool version are recorded. A
     /// missing or unreadable file, a malformed digest, or a blank version
     /// fails closed.
+    ///
+    /// This is a best-effort evidence binding at the observation instant, not
+    /// a retained cross-launch pin: only the kernel launch lease (held across
+    /// the suspended-launch/resume boundary) proves the launched bytes equal
+    /// the hashed bytes. Callers must compare the observed digest against the
+    /// intent-sealed `executable_sha256` (see
+    /// [`ExecutableObservation::observe_from_intent`]).
     ///
     /// # Errors
     ///
@@ -4072,9 +4152,9 @@ impl ExecutableObservation {
             });
         }
         if self.arguments != intent.argv() {
-            return Err(ExecutableIdentityError::Unreadable {
-                path: self.canonical_path.clone(),
-                reason: "arguments no longer match the admitted intent".to_owned(),
+            return Err(ExecutableIdentityError::ArgvMismatch {
+                expected: intent.argv().to_vec(),
+                observed: self.arguments.clone(),
             });
         }
         if self.environment_digest != environment_projection_digest(intent.environment()) {
@@ -4143,7 +4223,7 @@ impl ExecutableObservation {
             .iter()
             .any(|argument| argument.chars().any(char::is_control))
         {
-            return Err(ExecutableIdentityError::InvalidPath {
+            return Err(ExecutableIdentityError::InvalidArguments {
                 value: arguments.join(" "),
             });
         }
@@ -4196,28 +4276,78 @@ pub fn environment_projection_digest(environment: &EnvironmentProjection) -> Str
 
 /// Resolves an executable name through the process `PATH`.
 ///
-/// A value containing a path separator is returned as-is; otherwise each
-/// `PATH` entry is probed for the name (plus the `.exe` extension on
-/// Windows). Returns `None` when no candidate exists.
+/// A value containing a path separator must name an existing file and is
+/// returned as-is only then (`None` otherwise). Otherwise each `PATH` entry
+/// is probed for the name; on Windows every `PATHEXT` extension is probed in
+/// order (falling back to `.EXE` when `PATHEXT` is unset), and on Unix a
+/// candidate must carry an execute bit. Returns `None` when no candidate
+/// exists or the name is malformed.
 #[must_use]
 pub fn resolve_executable_in_path(name: &str) -> Option<PathBuf> {
     if name.trim().is_empty() || name.chars().any(char::is_control) {
         return None;
     }
     if name.contains('/') || name.contains('\\') {
-        return Some(PathBuf::from(name));
+        let candidate = PathBuf::from(name);
+        return is_launchable_file(&candidate).then_some(candidate);
     }
-    let mut candidates = vec![name.to_owned()];
-    #[cfg(windows)]
-    candidates.push(format!("{name}.exe"));
+    let extensions = path_extensions();
     std::env::var_os("PATH").and_then(|paths| {
         std::env::split_paths(&paths).find_map(|directory| {
-            candidates.iter().find_map(|candidate| {
-                let probe = directory.join(candidate);
-                probe.is_file().then_some(probe)
+            extensions.iter().find_map(|extension| {
+                let file_name = match extension {
+                    Some(extension) => format!("{name}.{extension}"),
+                    None => name.to_owned(),
+                };
+                let probe = directory.join(file_name);
+                is_launchable_file(&probe).then_some(probe)
             })
         })
     })
+}
+
+/// Candidate extensions for a bare executable name, in probe order.
+///
+/// Bare names probe as-is first; on Windows `PATHEXT` supplies the
+/// executable extensions (defaulting to `EXE` when unset or empty).
+fn path_extensions() -> Vec<Option<String>> {
+    #[cfg(windows)]
+    {
+        let mut extensions = vec![None];
+        let raw = std::env::var("PATHEXT").unwrap_or_else(|_| ".EXE".to_owned());
+        extensions.extend(
+            raw.split(';')
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+                .map(|part| part.strip_prefix('.').unwrap_or(part).to_owned())
+                .map(Some),
+        );
+        extensions
+    }
+    #[cfg(not(windows))]
+    {
+        vec![None]
+    }
+}
+
+/// Whether `candidate` names an existing regular file that the platform
+/// would execute (execute bit set on Unix).
+fn is_launchable_file(candidate: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(candidate) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 fn now_ms() -> u64 {
@@ -7842,6 +7972,53 @@ mod tests {
         Ok(())
     }
 
+    /// Scoped temporary directory removed on drop, so an assert failure can
+    /// never leak the directory or strand a later run on stale bytes.
+    struct TempScope {
+        dir: std::path::PathBuf,
+    }
+
+    impl TempScope {
+        fn create(tag: &str) -> Result<Self, Box<dyn std::error::Error>> {
+            let dir = std::env::temp_dir()
+                .join(format!("eliot-exec-identity-{}-{tag}", std::process::id()));
+            std::fs::create_dir_all(&dir)?;
+            Ok(Self { dir })
+        }
+
+        fn tool(&self, name: &str) -> std::path::PathBuf {
+            self.dir.join(name)
+        }
+    }
+
+    impl Drop for TempScope {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn test_intent(
+        tag: &str,
+        executable: &str,
+        digest: &str,
+        argv: Vec<String>,
+    ) -> Result<ProcessIntent, Box<dyn std::error::Error>> {
+        Ok(ProcessIntent::new(
+            OperationId::new(format!("op-exec-identity-{tag}"))?,
+            ProcessTreeId::new(format!("tree-exec-identity-{tag}"))?,
+            JobId::new(format!("job-exec-identity-{tag}"))?,
+            ImageId::new(format!("image-exec-identity-{tag}"))?,
+            SessionId::new(format!("session-exec-identity-{tag}"))?,
+            Generation::new(1)?,
+            executable,
+            digest,
+            argv,
+            std::env::temp_dir().to_string_lossy().into_owned(),
+            EnvironmentProjection::default(),
+            ResourceLimits::new(30_000, Some(10_000), Some(512_000_000), 4_096, 4_096, 4)?,
+        )?)
+    }
+
     /// Issue #1805: machine-derived observation detects executable
     /// replacement. Two otherwise identical resolutions yield different
     /// digests and identity keys, so an earlier result is never silently
@@ -7849,9 +8026,8 @@ mod tests {
     #[test]
     fn observed_executable_replacement_changes_identity() -> Result<(), Box<dyn std::error::Error>>
     {
-        let dir = std::env::temp_dir().join(format!("eliot-exec-identity-{}", std::process::id()));
-        std::fs::create_dir_all(&dir)?;
-        let tool = dir.join("tool-observed-replacement.bin");
+        let scope = TempScope::create("replacement")?;
+        let tool = scope.tool("tool-observed-replacement.bin");
         std::fs::write(&tool, b"tool-bytes-v1")?;
         let environment = "a".repeat(64);
         let before = super::ExecutableObservation::observe_at_path(
@@ -7870,28 +8046,27 @@ mod tests {
         )?;
         assert_ne!(before.content_digest, after.content_digest);
         assert_ne!(before.identity_key(), after.identity_key());
-        std::fs::remove_file(&tool)?;
         Ok(())
     }
 
     /// Issue #1805: executor-side identity gaps fail closed. A missing file
     /// reports `Missing`, a malformed environment digest reports
-    /// `UnknownEnvironment`, and an unobserved version keeps the observation
-    /// incomplete, so no authoritative PASS can follow.
+    /// `UnknownEnvironment`, a control character in an argument reports
+    /// `InvalidArguments` (never `InvalidPath`), and an unobserved version
+    /// keeps the observation incomplete, so no authoritative PASS can follow.
     #[test]
     fn observed_executable_gaps_fail_closed() -> Result<(), Box<dyn std::error::Error>> {
-        let dir = std::env::temp_dir().join(format!("eliot-exec-identity-{}", std::process::id()));
-        std::fs::create_dir_all(&dir)?;
+        let scope = TempScope::create("gaps")?;
         assert!(matches!(
             super::ExecutableObservation::observe_at_path(
-                &dir.join("absent-observed-tool.bin"),
+                &scope.tool("absent-observed-tool.bin"),
                 Vec::new(),
                 "b".repeat(64),
                 Some("1.0.0".to_owned()),
             ),
             Err(super::ExecutableIdentityError::Missing { .. })
         ));
-        let tool = dir.join("tool-observed-gaps.bin");
+        let tool = scope.tool("tool-observed-gaps.bin");
         std::fs::write(&tool, b"tool-bytes-gap")?;
         assert!(matches!(
             super::ExecutableObservation::observe_at_path(
@@ -7902,10 +8077,95 @@ mod tests {
             ),
             Err(super::ExecutableIdentityError::UnknownEnvironment)
         ));
+        assert!(matches!(
+            super::ExecutableObservation::observe_at_path(
+                &tool,
+                vec!["--locked\u{0}".to_owned()],
+                "b".repeat(64),
+                Some("1.0.0".to_owned()),
+            ),
+            Err(super::ExecutableIdentityError::InvalidArguments { .. })
+        ));
         let unversioned =
             super::ExecutableObservation::observe_at_path(&tool, Vec::new(), "c".repeat(64), None)?;
         assert!(!unversioned.is_complete());
-        std::fs::remove_file(&tool)?;
+        Ok(())
+    }
+
+    /// Issue #1805: intent binding fails closed on replacement and argv
+    /// drift. `observe_from_intent` refuses bytes that no longer match the
+    /// intent-sealed digest, and `verify_against_intent` reports argv drift
+    /// as `ArgvMismatch` (a binding verdict, never a transient `Unreadable`).
+    #[test]
+    fn intent_binding_detects_replacement_and_argv_drift() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let scope = TempScope::create("intent")?;
+        let tool = scope.tool("tool-intent-bound.bin");
+        std::fs::write(&tool, b"intent-bytes-v1")?;
+        let path = tool.to_string_lossy().into_owned();
+        let digest = super::sha256_file(&tool)?;
+        let argv = vec!["--locked".to_owned()];
+        let intent = test_intent("bound", &path, &digest, argv.clone())?;
+        let observation =
+            super::ExecutableObservation::observe_from_intent(&intent, Some("1.0.0".to_owned()))?;
+        assert!(observation.is_complete());
+        assert!(observation.verify_against_intent(&intent).is_ok());
+
+        std::fs::write(&tool, b"intent-bytes-v2")?;
+        assert!(matches!(
+            super::ExecutableObservation::observe_from_intent(&intent, Some("1.0.0".to_owned())),
+            Err(super::ExecutableIdentityError::DigestMismatch { .. })
+        ));
+        std::fs::write(&tool, b"intent-bytes-v1")?;
+
+        let drifted = test_intent("drifted", &path, &digest, vec!["--different".to_owned()])?;
+        assert!(matches!(
+            observation.verify_against_intent(&drifted),
+            Err(super::ExecutableIdentityError::ArgvMismatch { .. })
+        ));
+        let Err(drifted_error) = observation.verify_against_intent(&drifted) else {
+            return Err("argv drift must fail closed".into());
+        };
+        assert!(matches!(
+            ProcessExecutionError::from(drifted_error),
+            ProcessExecutionError::UnknownOutcome
+        ));
+        Ok(())
+    }
+
+    /// `resolve_executable_in_path` honors `PATHEXT` on Windows, requires
+    /// the executable bit on Unix, and never vouches for a separator name
+    /// that names no file.
+    #[test]
+    fn path_resolution_probes_launchable_candidates() -> Result<(), Box<dyn std::error::Error>> {
+        assert!(
+            super::resolve_executable_in_path("definitely-absent-eliot-tool-28475208").is_none()
+        );
+        assert!(
+            super::resolve_executable_in_path("has space separators/no-such-file.bin").is_none()
+        );
+        let scope = TempScope::create("path")?;
+        let tool = scope.tool("probe-tool.bin");
+        std::fs::write(&tool, b"probe")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mut permissions = std::fs::metadata(&tool)?.permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&tool, permissions)?;
+        }
+        assert_eq!(
+            super::resolve_executable_in_path(&tool.to_string_lossy()),
+            Some(tool.clone())
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mut permissions = std::fs::metadata(&tool)?.permissions();
+            permissions.set_mode(0o644);
+            std::fs::set_permissions(&tool, permissions)?;
+            assert!(super::resolve_executable_in_path(&tool.to_string_lossy()).is_none());
+        }
         Ok(())
     }
 }

@@ -163,50 +163,73 @@ impl InstrumentBinding {
     /// `entry` before launch.
     ///
     /// The entry must claim the binding invocation, the observation must be
-    /// complete and name the registry-bound executable, and the observed
-    /// arguments must equal the admitted invocation arguments. A missing,
-    /// incomplete, or mismatched identity fails closed so the later result
-    /// can never take authoritative PASS.
+    /// complete and name the registry-bound executable, and the observed argv
+    /// must equal the sealed process-request argv (argv to argv: the admitted
+    /// invocation arguments are instrument-level filters, never argv). A
+    /// missing, incomplete, or mismatched identity fails closed so the later
+    /// result can never take authoritative PASS.
     ///
     /// # Errors
     ///
     /// Returns [`RunnerError::EntryMismatch`], [`RunnerError::UnresolvedExecutable`],
-    /// or [`RunnerError::ExecutableMismatch`] when the binding is not pinned.
+    /// [`RunnerError::ExecutableMismatch`], or [`RunnerError::ReceiptMismatch`]
+    /// when the binding is already consumed and the sealed argv is gone.
     pub fn verify_executable(
         &self,
         entry: &RegistryEntry,
         resolved: Option<&ResolvedExecutableIdentity>,
     ) -> Result<(), RunnerError> {
-        if entry.instrument.as_str() != self.invocation.instrument.as_str() {
-            return Err(RunnerError::EntryMismatch(
-                "registry entry claims a different instrument".to_owned(),
-            ));
-        }
-        if !entry.supports(self.invocation.kind) {
-            return Err(RunnerError::EntryMismatch(
-                "registry entry does not support the invocation kind".to_owned(),
-            ));
-        }
-        entry
-            .check_resolved_executable(resolved)
-            .map_err(|error| match error {
-                RegistryError::UnresolvedExecutable { reason, .. } => {
-                    RunnerError::UnresolvedExecutable(reason.to_string())
-                }
-                RegistryError::ExecutableMismatch {
-                    expected, observed, ..
-                } => RunnerError::ExecutableMismatch(format!(
-                    "expected '{expected}', observed '{observed}'"
-                )),
-                other => RunnerError::EntryMismatch(other.to_string()),
-            })?;
-        if resolved.is_some_and(|observation| !observation.binds_invocation(&self.invocation)) {
-            return Err(RunnerError::ExecutableMismatch(
-                "observed arguments do not match the admitted invocation".to_owned(),
-            ));
+        check_governed_binding(entry, &self.invocation, resolved)?;
+        if let Some(observation) = resolved {
+            let Some(request) = self.process_request.as_ref() else {
+                return Err(RunnerError::ReceiptMismatch);
+            };
+            if !observation.binds_argv(request.argv()) {
+                return Err(RunnerError::ExecutableMismatch(
+                    "observed argv does not match the sealed process request".to_owned(),
+                ));
+            }
         }
         Ok(())
     }
+}
+
+/// Checks the entry/invocation/observation triple shared by pre-launch
+/// binding verification and authoritative-PASS verdicts.
+///
+/// The entry must claim the invocation instrument and kind, and the
+/// observation must satisfy
+/// [`RegistryEntry::check_resolved_executable`]. Argv is *not* compared here:
+/// pre-launch verification compares against the live sealed request argv,
+/// while verdicts compare against the argv sealed into the result at launch.
+fn check_governed_binding(
+    entry: &RegistryEntry,
+    invocation: &InstrumentInvocation,
+    resolved: Option<&ResolvedExecutableIdentity>,
+) -> Result<(), RunnerError> {
+    if entry.instrument.as_str() != invocation.instrument.as_str() {
+        return Err(RunnerError::EntryMismatch(
+            "registry entry claims a different instrument".to_owned(),
+        ));
+    }
+    if !entry.supports(invocation.kind) {
+        return Err(RunnerError::EntryMismatch(
+            "registry entry does not support the invocation kind".to_owned(),
+        ));
+    }
+    entry
+        .check_resolved_executable(resolved)
+        .map_err(|error| match error {
+            RegistryError::UnresolvedExecutable { reason, .. } => {
+                RunnerError::UnresolvedExecutable(reason.to_string())
+            }
+            RegistryError::ExecutableMismatch {
+                expected, observed, ..
+            } => RunnerError::ExecutableMismatch(format!(
+                "expected '{expected}', observed '{observed}'"
+            )),
+            other => RunnerError::EntryMismatch(other.to_string()),
+        })
 }
 
 /// Receipt returned after the physical executor accepts an instrument.
@@ -232,16 +255,22 @@ pub struct InstrumentObservation {
 /// Governed profile result bound to its exact executable identity.
 ///
 /// Every field is admission-sealed or machine-derived: the invocation
-/// (candidate/profile/worktree identity plus arguments), the
+/// (candidate/profile/worktree identity plus instrument-level arguments), the
 /// registry-selected adapter and generation, the resolved executable
-/// observation, the raw output handle, and the execution axis. The
-/// authoritative verdict comes only from
+/// observation, the process argv sealed at launch, the raw output handle, and
+/// the execution axis. The authoritative verdict comes only from
 /// [`GovernedInstrumentResult::require_authoritative_pass`]: a changed or
-/// missing identity, unretained raw output, or non-success execution refuses
-/// PASS instead of degrading into one. A replaced executable yields a
-/// different [`ResolvedExecutableIdentity::identity_digest`], so comparing
-/// stored identities exposes the swap instead of silently rebinding the
-/// earlier result.
+/// missing identity, diverged argv, unretained raw output, or non-success
+/// execution refuses PASS instead of degrading into one. A replaced
+/// executable yields a different
+/// [`ResolvedExecutableIdentity::identity_digest`], so comparing stored
+/// identities exposes the swap instead of silently rebinding the earlier
+/// result.
+///
+/// Decoder-only entries never launch a process and legitimately carry no
+/// observation: for them, `executable` is `None` and the verdict still
+/// applies to the retained decode output. Every process entry requires a
+/// complete observation.
 #[derive(Clone, Debug)]
 pub struct GovernedInstrumentResult {
     /// Original provider-neutral invocation.
@@ -252,6 +281,8 @@ pub struct GovernedInstrumentResult {
     pub registry_generation: u64,
     /// Machine-derived executable observation, if one was resolved.
     pub executable: Option<ResolvedExecutableIdentity>,
+    /// Exact process argv sealed at launch; the observation must match it.
+    pub argv: Vec<String>,
     /// Raw output handle retained before any reduction.
     pub raw: RawEvidence,
     /// Execution axis only; no semantic verifier result is inferred.
@@ -265,6 +296,7 @@ impl GovernedInstrumentResult {
         adapter: String,
         registry_generation: u64,
         executable: Option<ResolvedExecutableIdentity>,
+        argv: Vec<String>,
         raw: RawEvidence,
         execution: ExecutionStatus,
     ) -> Self {
@@ -273,6 +305,7 @@ impl GovernedInstrumentResult {
             adapter,
             registry_generation,
             executable,
+            argv,
             raw,
             execution,
         }
@@ -297,8 +330,9 @@ impl GovernedInstrumentResult {
     ///
     /// PASS requires all of: the entry claims this invocation instrument and
     /// kind, a complete machine-derived executable observation naming the
-    /// registry-bound executable with arguments equal to the invocation, a
-    /// retained raw output handle, and successful execution.
+    /// registry-bound executable (decoder-only entries legitimately carry
+    /// none and never launch), observed argv equal to the argv sealed at
+    /// launch, a retained raw output handle, and successful execution.
     ///
     /// # Errors
     ///
@@ -307,36 +341,14 @@ impl GovernedInstrumentResult {
     /// [`RunnerError::ExecutableMismatch`], [`RunnerError::RawOutputMissing`],
     /// or [`RunnerError::NotAuthoritative`] for the first failing requirement.
     pub fn require_authoritative_pass(&self, entry: &RegistryEntry) -> Result<(), RunnerError> {
-        if entry.instrument.as_str() != self.invocation.instrument.as_str() {
-            return Err(RunnerError::EntryMismatch(
-                "registry entry claims a different instrument".to_owned(),
-            ));
-        }
-        if !entry.supports(self.invocation.kind) {
-            return Err(RunnerError::EntryMismatch(
-                "registry entry does not support the invocation kind".to_owned(),
-            ));
-        }
-        entry
-            .check_resolved_executable(self.executable.as_ref())
-            .map_err(|error| match error {
-                RegistryError::UnresolvedExecutable { reason, .. } => {
-                    RunnerError::UnresolvedExecutable(reason.to_string())
-                }
-                RegistryError::ExecutableMismatch {
-                    expected, observed, ..
-                } => RunnerError::ExecutableMismatch(format!(
-                    "expected '{expected}', observed '{observed}'"
-                )),
-                other => RunnerError::EntryMismatch(other.to_string()),
-            })?;
+        check_governed_binding(entry, &self.invocation, self.executable.as_ref())?;
         if self
             .executable
             .as_ref()
-            .is_some_and(|observation| !observation.binds_invocation(&self.invocation))
+            .is_some_and(|observation| !observation.binds_argv(&self.argv))
         {
             return Err(RunnerError::ExecutableMismatch(
-                "observed arguments do not match the admitted invocation".to_owned(),
+                "observed argv does not match the argv sealed at launch".to_owned(),
             ));
         }
         if !matches!(self.raw, RawEvidence::Retained { .. }) {
@@ -378,6 +390,33 @@ impl<E: ProcessExecutor + 'static> InstrumentRunner<E> {
         sink: Arc<dyn ProcessEvidenceSink>,
     ) -> Result<InstrumentStartReceipt, RunnerError> {
         let mut binding = InstrumentBinding::bind(invocation, port)?;
+        self.launch(&mut binding, sink).await
+    }
+
+    /// Binds an invocation, pins its executable identity, and launches it.
+    ///
+    /// The machine-derived `resolved` observation is checked against `entry`
+    /// and the sealed request argv *before* the process starts, so a swapped
+    /// executable fails closed here instead of producing evidence that could
+    /// later take authoritative PASS. Composition roots that need
+    /// authoritative evidence must use this path; [`InstrumentRunner::launch`]
+    /// performs no identity check.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when binding, identity pinning, or process launch
+    /// fails, or when the returned receipt does not preserve the binding
+    /// identity.
+    pub async fn launch_verified(
+        &self,
+        invocation: InstrumentInvocation,
+        port: &dyn InstrumentRequestPort,
+        entry: &RegistryEntry,
+        resolved: Option<&ResolvedExecutableIdentity>,
+        sink: Arc<dyn ProcessEvidenceSink>,
+    ) -> Result<InstrumentStartReceipt, RunnerError> {
+        let mut binding = InstrumentBinding::bind(invocation, port)?;
+        binding.verify_executable(entry, resolved)?;
         self.launch(&mut binding, sink).await
     }
 
@@ -462,6 +501,51 @@ impl<E: ProcessExecutor + 'static> InstrumentRunner<E> {
         }
         Ok(evidence)
     }
+}
+
+/// Converts an executor-side machine observation into the registry-bound
+/// identity form.
+///
+/// Both records carry the same five machine-derived fields (canonical path,
+/// content digest, tool version, environment digest, exact argv); the
+/// executor resolves them from the machine at launch while the registry
+/// checks them before launch and at verdict time. Validation is re-applied
+/// under the claiming `instrument` so a bridged observation can never carry
+/// an empty instrument label.
+impl From<eliot_process_executor::ExecutableObservation> for ResolvedExecutableIdentity {
+    fn from(observation: eliot_process_executor::ExecutableObservation) -> Self {
+        Self {
+            canonical_path: observation.canonical_path,
+            content_digest: observation.content_digest,
+            tool_version: observation.tool_version,
+            environment_digest: observation.environment_digest,
+            arguments: observation.arguments,
+        }
+    }
+}
+
+/// Bridges an executor-side observation into a checked registry identity.
+///
+/// Unlike the infallible [`From`] bridge (which moves already-shaped fields),
+/// this re-validates every field under the claiming `instrument` and fails
+/// closed on any malformed value.
+///
+/// # Errors
+///
+/// Returns [`RegistryError::UnresolvedExecutable`] when any field is
+/// malformed.
+pub fn bridge_executor_observation(
+    instrument: &str,
+    observation: eliot_process_executor::ExecutableObservation,
+) -> Result<ResolvedExecutableIdentity, RegistryError> {
+    ResolvedExecutableIdentity::new(
+        instrument,
+        observation.canonical_path,
+        observation.content_digest,
+        observation.tool_version,
+        observation.environment_digest,
+        observation.arguments,
+    )
 }
 
 /// Compatibility name for composition roots using the bounded terminology.
@@ -582,6 +666,7 @@ mod tests {
 
     fn test_observation(arguments: Vec<String>) -> ResolvedExecutableIdentity {
         unreachable_value(ResolvedExecutableIdentity::new(
+            RUSTC_INSTRUMENT,
             "/usr/bin/rustc".to_owned(),
             "a".repeat(64),
             Some("rustc 1.89.0".to_owned()),
@@ -620,6 +705,7 @@ mod tests {
             entry.adapter.clone(),
             entry.generation,
             None,
+            Vec::new(),
             retained_raw(),
             ExecutionStatus::Succeeded,
         );
@@ -638,7 +724,8 @@ mod tests {
             test_invocation(arguments.clone()),
             entry.adapter.clone(),
             entry.generation,
-            Some(test_observation(arguments)),
+            Some(test_observation(arguments.clone())),
+            arguments,
             RawEvidence::Omitted {
                 reason: OmissionReason::Omitted {
                     reason: "policy withheld output".to_owned(),
@@ -662,6 +749,7 @@ mod tests {
             entry.adapter.clone(),
             entry.generation,
             Some(observation.clone()),
+            arguments.clone(),
             retained_raw(),
             ExecutionStatus::Succeeded,
         );
@@ -672,10 +760,11 @@ mod tests {
         let mut replaced = observation;
         replaced.content_digest = "c".repeat(64);
         let swapped = GovernedInstrumentResult::new(
-            test_invocation(arguments),
+            test_invocation(arguments.clone()),
             entry.adapter.clone(),
             entry.generation,
             Some(replaced),
+            arguments,
             retained_raw(),
             ExecutionStatus::Succeeded,
         );
@@ -695,6 +784,7 @@ mod tests {
             entry.adapter.clone(),
             entry.generation,
             swapped.executable.clone(),
+            vec!["--sealed-at-launch".to_owned()],
             retained_raw(),
             ExecutionStatus::Succeeded,
         );
@@ -702,5 +792,44 @@ mod tests {
             diverged.require_authoritative_pass(&entry),
             Err(RunnerError::ExecutableMismatch(_))
         ));
+    }
+
+    #[test]
+    fn executor_observation_bridges_into_registry_identity() {
+        use std::path::PathBuf;
+
+        struct TempFile {
+            path: PathBuf,
+        }
+
+        impl Drop for TempFile {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
+
+        let path = std::env::temp_dir().join(format!(
+            "eliot-runner-bridge-{}-{}.bin",
+            std::process::id(),
+            "observation"
+        ));
+        std::fs::write(&path, b"bridge-bytes").unwrap_or_else(|_| unreachable!());
+        let guard = TempFile { path: path.clone() };
+        let arguments = vec!["--crate-name".to_owned(), "foo".to_owned()];
+        let observed = eliot_process_executor::ExecutableObservation::observe_at_path(
+            &guard.path,
+            arguments.clone(),
+            "b".repeat(64),
+            Some("rustc 1.89.0".to_owned()),
+        )
+        .unwrap_or_else(|_| unreachable!());
+        assert!(observed.is_complete());
+        let bridged = bridge_executor_observation(RUSTC_INSTRUMENT, observed.clone());
+        match bridged {
+            Ok(identity) => assert!(identity.binds_argv(&arguments)),
+            Err(_) => unreachable!(),
+        }
+        let converted: ResolvedExecutableIdentity = observed.into();
+        assert!(converted.binds_argv(&arguments));
     }
 }
