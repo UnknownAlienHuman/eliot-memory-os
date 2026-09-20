@@ -16,7 +16,7 @@ use super::super::{
     InstallerServiceRegistrationApproval, InstallerServiceRole, PlatformHandle, ProcessIdentity,
     RuntimeLaunchDescriptor, ServiceAccount, ServiceRegistrationRequest,
     ServiceRegistrationRuntimeInspection, ServiceStartMode, ServiceState, WindowsPlatform,
-    phase_b_scm_selector,
+    phase_b_scm_selector, windows_paths_equal,
 };
 
 #[cfg(windows)]
@@ -188,4 +188,71 @@ where
                 .to_owned(),
         )),
     }
+}
+
+#[cfg(windows)]
+/// Verified live incarnation of the independently SCM-managed Watchdog sibling.
+///
+/// Returned only after the approval path bound the registration to the
+/// approved generation/image/bootstrap and the readback path observed that
+/// same registration `Running` with a handle-bound, image-matched process.
+/// `approved_plan_generation` is the epoch anchor the approval path binds:
+/// SCM cannot observe ELIOT's semantic watchdog supervision epoch, so this is
+/// the strongest epoch binding the start path can verify — the immutable
+/// transaction-plan generation that authorized this exact registration,
+/// joined to the live `Running` process observation. The semantic watchdog
+/// epoch itself is minted in the activation lineage and verified out-of-band
+/// by the Watchdog's own content-addressed lease load (I1.5 startup order).
+/// `None` only for bootstrap-less registrations, which the production
+/// approval path never produces.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedWatchdogRunning {
+    pub process: ProcessIdentity,
+    pub wait_hint_ms: u32,
+    pub approved_plan_generation: Option<u64>,
+}
+
+#[cfg(windows)]
+/// Verifies one already-observed SCM readback as a live, approved Watchdog
+/// incarnation, returning the verified epoch anchor plus `Running`
+/// responsiveness evidence.
+///
+/// Read-only: performs no SCM inspection itself and owns no start/stop,
+/// registration, Job, or kill-handle capability — it only classifies the
+/// approval/readback pair the caller already holds. Any unverifiable branch
+/// (non-`Running` state, absent process identity, unusable PID/start handle,
+/// or substituted image) fails closed with the same typed vocabulary as
+/// [`require_running_watchdog`].
+pub fn verify_running_watchdog(
+    registration: &ServiceRegistrationRequest,
+    state: ServiceState,
+    wait_hint_ms: u32,
+    process: Option<&ProcessIdentity>,
+) -> Result<VerifiedWatchdogRunning, HostError> {
+    if state != ServiceState::Running {
+        return Err(HostError::RecoveryRequired(format!(
+            "canonical EliotWatchdog service is not Running (observed {state:?})"
+        )));
+    }
+    let Some(observed) = process else {
+        return Err(HostError::RecoveryRequired(
+            "Watchdog reached Running without a handle-bound process identity".to_owned(),
+        ));
+    };
+    if observed.process_id == 0
+        || observed.start_time_100ns == 0
+        || !windows_paths_equal(Path::new(&observed.image_path), registration.binary_path())
+    {
+        return Err(HostError::RecoveryRequired(
+            "Watchdog process identity is unusable or its image is not the approved image"
+                .to_owned(),
+        ));
+    }
+    Ok(VerifiedWatchdogRunning {
+        process: observed.clone(),
+        wait_hint_ms,
+        approved_plan_generation: registration
+            .bootstrap()
+            .map(|bootstrap| bootstrap.transaction_plan_generation()),
+    })
 }

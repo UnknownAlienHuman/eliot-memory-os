@@ -90,6 +90,29 @@ fn append_reconciled_readiness<B: JournalBackend>(
     }
 }
 
+/// Binds the exact watchdog supervision branch behind one readiness proof
+/// into the persisted observation evidence: the content-addressed Watchdog
+/// publication digest joined to the admitted watchdog epoch from the
+/// Kernel-renewed supervision head. A missing epoch (no admitted watchdog
+/// branch) fails closed instead of persisting a readiness observation that
+/// would read as independently supervised (I1.5).
+#[cfg(windows)]
+pub(crate) fn watchdog_branch_evidence_ref(
+    supervision: &PublishedSupervisionIdentity,
+    watchdog_epoch: u64,
+) -> Result<PlatformHandle, HostError> {
+    if watchdog_epoch == 0 {
+        return Err(HostError::RecoveryRequired(
+            "Kernel supervision snapshot carries no admitted watchdog epoch".to_owned(),
+        ));
+    }
+    PlatformHandle::new(format!(
+        "watchdog-branch:{}:epoch:{watchdog_epoch}",
+        supervision.publication_digest.as_str()
+    ))
+    .map_err(|error| HostError::Platform(error.to_string()))
+}
+
 #[cfg(windows)]
 pub(crate) fn append_authenticated_kernel_readiness<B: JournalBackend>(
     journal: &HostStateJournalService<B>,
@@ -144,6 +167,10 @@ pub(crate) fn append_authenticated_kernel_readiness<B: JournalBackend>(
             .map_err(|error| HostError::Platform(error.to_string()))?,
     );
     evidence_refs.extend(supervision.evidence_refs()?);
+    evidence_refs.push(watchdog_branch_evidence_ref(
+        supervision,
+        proof.supervision_lease.record.binding.watchdog_epoch.value(),
+    )?);
     let expected = ReadinessApprovedContour {
         config_digest: approved_config.clone(),
         store_fence: proof.store_fence.clone(),

@@ -71,6 +71,14 @@ pub(crate) struct ReadinessContourIdentity {
 
 #[cfg(windows)]
 impl ReadinessContourIdentity {
+    /// Returns whether this contour carries a verified watchdog branch: the
+    /// content-addressed Watchdog publication digest bound at proof time.
+    /// Absence means independent supervision is unavailable, and the
+    /// governance profile must stay degraded (I1.5).
+    pub(crate) fn watchdog_available(&self) -> bool {
+        self.watchdog_publication_digest.is_some()
+    }
+
     pub(crate) fn same_probe_input_contour(&self, other: &Self) -> bool {
         self.approved_generation == other.approved_generation
             && self.approved_kernel_artifact == other.approved_kernel_artifact
@@ -80,6 +88,12 @@ impl ReadinessContourIdentity {
             && self.candidate_binding_digest == other.candidate_binding_digest
             && self.store_requirement_digest == other.store_requirement_digest
             && self.supervision_lease_id == other.supervision_lease_id
+            // I1.5 (#1750): probe-input sameness crosses no
+            // watchdog-availability boundary. Digest VALUES stay
+            // renewal-tolerant (a renewed ORS receipt re-publishes under a
+            // new digest without forcing a re-probe), but losing the
+            // watchdog branch always forces one.
+            && self.watchdog_available() == other.watchdog_available()
     }
 }
 

@@ -14,6 +14,26 @@
 use std::sync::{Arc, RwLock};
 
 /// Readiness data emitted by the process entrypoint.
+///
+/// I1.5 (#1750) Host-verification contract for every field. Host must apply
+/// all of these checks before treating a projection as supervised coverage:
+/// - `authority_state` / `coverage_claimed`: require `AdmittedHeartbeat` with
+///   `coverage_claimed == true`. `RunningNoAuthority` is an explicit gap-only
+///   signal (the SCM sibling is alive but no current Host-issued lease has
+///   been admitted for heartbeat authority), never coverage.
+/// - `kernel_epoch` / `watchdog_epoch`: the exact admitted lease pair,
+///   rotated atomically under one lock so a reader can never combine epochs
+///   from different leases. Host verifies them against the current
+///   activation's supervision incarnation. A zero epoch is never published as
+///   coverage: the cell below fails closed into the no-authority projection.
+/// - `tick_interval_ms`: the bounded supervision tick, i.e. the
+///   responsiveness bound. A projection older than a small multiple of this
+///   interval without a fresh admitted heartbeat must be treated as
+///   unresponsive, never as current coverage.
+///
+/// Residual: binding a projection to its exact lease (lease identity, receipt
+/// digest, lineage) needs a new authenticated field on this shape and is out
+/// of scope for this slice; the live-install proof owns that evidence.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct WatchdogReadiness {
     pub service: &'static str,

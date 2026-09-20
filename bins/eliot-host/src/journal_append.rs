@@ -170,8 +170,16 @@ pub(super) fn initial_activation_record(
                 .map_err(|error| HostError::Platform(error.to_string()))?,
             ],
         },
-        governance_profile: PlatformHandle::new("runtime-live-v3")
-            .map_err(|error| HostError::Platform(error.to_string()))?,
+        governance_profile: PlatformHandle::new(if ready {
+            "runtime-live-v3"
+        } else {
+            // I1.5 (#1750): a fresh activation has no verified Watchdog
+            // branch yet, so it persists the degraded profile instead of
+            // claiming independently supervised live governance. The profile
+            // turns live only on a proven-ready transition below.
+            "runtime-degraded-v3"
+        })
+        .map_err(|error| HostError::Platform(error.to_string()))?,
         runtime_lease_refs: Vec::new(),
         supervision_lease_refs: Vec::new(),
         wake_intent_refs: Vec::new(),
@@ -212,6 +220,13 @@ pub(super) fn transition_activation_record(
     );
     next.readiness.control_ready = ready;
     next.readiness.supervision_ready = ready;
+    // I1.5 (#1750): governance turns live only on a proven-ready transition,
+    // which runs after the Watchdog start verification. Any other transition
+    // preserves the current profile instead of rewriting history.
+    if ready {
+        next.governance_profile = PlatformHandle::new("runtime-live-v3")
+            .map_err(|error| HostError::Platform(error.to_string()))?;
+    }
     if ready {
         next.readiness.evidence_refs = vec![
             PlatformHandle::new("kernel-ready-receipt-validated")
@@ -546,4 +561,33 @@ pub(super) fn pending_activation_binding(
     ))?;
     PlatformHandle::new(format!("pending-activation-binding:{digest}"))
         .map_err(|error| HostError::Platform(error.to_string()))
+}
+
+#[cfg(test)]
+mod governance_profile_tests {
+    use super::super::{fresh_host_epoch, root_epoch};
+    use super::*;
+
+    #[test]
+    fn fresh_activation_stays_degraded_until_ready_is_proven() -> Result<(), HostError> {
+        let installation = PlatformHandle::new("installation:test")
+            .map_err(|error| HostError::Platform(error.to_string()))?;
+        let host = fresh_host_epoch(installation, None)?;
+        let activation_id = fresh_identity("governance-activation")?;
+        let activation_generation = root_epoch(fresh_lineage_id()?);
+        let starting = initial_activation_record(
+            &host,
+            &activation_id,
+            &activation_generation,
+            ActivationState::Starting,
+            "host-open",
+        )?;
+        assert_eq!(
+            starting.governance_profile.as_str(),
+            "runtime-degraded-v3"
+        );
+        let active = transition_activation_record(&starting, ActivationState::Active, "host-active")?;
+        assert_eq!(active.governance_profile.as_str(), "runtime-live-v3");
+        Ok(())
+    }
 }
