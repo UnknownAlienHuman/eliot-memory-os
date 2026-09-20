@@ -14,6 +14,7 @@ mod snapshot_model;
 mod status;
 mod status_projection;
 mod store;
+mod versioned_artifact;
 
 #[cfg(feature = "test-support")]
 pub mod test_support;
@@ -34,6 +35,10 @@ pub use status_projection::{
 };
 pub use store::{
     CanonicalEvidenceProvider, OperationalRecoveryStore, OrsCoordinator, RedbRecoveryStore,
+};
+pub use versioned_artifact::{
+    ArtifactGenerationState, CompatibilityEvidence, VersionedArtifact,
+    VersionedArtifactCutoverRecord, VersionedArtifactRegistry, VersionedArtifactStatus,
 };
 
 /// Stable wire/storage contract version for this crate.
