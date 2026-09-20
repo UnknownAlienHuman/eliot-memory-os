@@ -35,6 +35,7 @@ use std::sync::atomic::Ordering;
 
 mod activation_projection;
 pub mod agent_fabric;
+mod capability_evidence_wiring;
 mod controlboard_adapters;
 mod daemon_config;
 mod daemon_kernel_client;
@@ -74,6 +75,12 @@ use controlboard_adapters::SharedOperatorReplay;
 #[cfg(test)]
 use activation_projection::map_activation_snapshot;
 
+pub use capability_evidence_wiring::{
+    GovernorCapabilityAdmission, GovernorCapabilityEvidenceRecord, GovernorCapabilityRegistry,
+    GovernorCapabilitySource, GovernorCapabilityStatus, GovernorRouteScopeFingerprint,
+    ImportedLegacyEvidence, LegacyCapabilityDeclaration, LegacyImportError, LegacyScopeFingerprint,
+    import_legacy_declaration,
+};
 pub use daemon_config::DaemonConfig;
 pub(crate) use daemon_kernel_client::kernel_port_error;
 pub use daemon_kernel_client::{DaemonKernelClient, LocalReadSubmitOutcome, OwnerSessionFacts};
