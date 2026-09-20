@@ -103,7 +103,9 @@ pub use protocol::{
     control_response_frame, decode_control_request_frame, decode_control_response_frame,
     replay_stream_id, semantic_store_config_hash_from_json, verify_provider_capability,
 };
-pub use store_client::{EbpCanonicalStoreClient, EbpStoreTransport, StoreClientError};
+pub use store_client::{
+    EbpCanonicalStoreClient, EbpStoreTransport, StoreClientError, StoreClientFault,
+};
 #[cfg(windows)]
 pub use store_gateway::KernelStoreGateway;
 pub use store_write_reservation::{

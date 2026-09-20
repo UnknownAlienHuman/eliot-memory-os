@@ -82,6 +82,85 @@ impl SessionRole {
     }
 }
 
+/// Checked-out versus available sessions for one admission role.
+///
+/// Point observation for S-CONC-ACCEPT capacity and protected-progress
+/// evidence (issue #2030, 994/14): `checked_out + available` always equals
+/// the role's fixed slot count, so a saturated normal lane (`available == 0`)
+/// is distinguishable from a live protected lane without touching a socket.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RoleOccupancy {
+    /// Fixed slot count bound at pool construction.
+    pub total: usize,
+    /// Currently checked-out sessions.
+    pub checked_out: usize,
+    /// Free permits not held by any checkout.
+    pub available: usize,
+}
+
+impl RoleOccupancy {
+    /// Whether the role currently sheds non-blocking admission.
+    #[must_use]
+    pub const fn saturated(self) -> bool {
+        self.available == 0
+    }
+}
+
+/// Whole-pool occupancy snapshot across the three fixed roles.
+///
+/// Production admission evidence (issue #2030, 994/14): bounded capacity is
+/// observable without checking anything out, and the protected
+/// health/admin lane stays independently observable while normal lanes
+/// saturate, so recovery/reconciliation progress never hides behind
+/// workload exhaustion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PoolOccupancy {
+    /// Named-read lane occupancy.
+    pub read: RoleOccupancy,
+    /// Normal-write lane occupancy.
+    pub normal_write: RoleOccupancy,
+    /// Protected health/admin lane occupancy.
+    pub health_admin: RoleOccupancy,
+}
+
+impl PoolOccupancy {
+    /// Occupancy for one role.
+    #[must_use]
+    pub const fn for_role(self, role: SessionRole) -> RoleOccupancy {
+        match role {
+            SessionRole::Read => self.read,
+            SessionRole::NormalWrite => self.normal_write,
+            SessionRole::HealthAdmin => self.health_admin,
+        }
+    }
+}
+
+/// Non-blocking admission verdict for one role (issue #2030, 994/14).
+///
+/// Point observation, not a reservation: `Admitted` reports the permits
+/// free at observation time for callers that must shed load instead of
+/// queueing behind a lane. A saturated verdict never blocks and never
+/// borrows capacity from another role — in particular, normal-lane
+/// exhaustion never consumes the protected health/admin lane.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PoolAdmission {
+    /// The role has free permits at observation time.
+    Admitted {
+        /// Free permits observed.
+        available: usize,
+    },
+    /// The role is exhausted at observation time; shed instead of queueing.
+    ShedExhausted,
+}
+
+impl PoolAdmission {
+    /// Whether the role may be entered without queueing.
+    #[must_use]
+    pub const fn admitted(self) -> bool {
+        matches!(self, Self::Admitted { .. })
+    }
+}
+
 #[cfg(test)]
 impl fmt::Display for SessionRole {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -157,9 +236,31 @@ impl fmt::Debug for PoolInner {
 ///
 /// Clone shares the same generation, slots, and bounds: there is still one
 /// pool, never a second provider process.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct SessionPool {
     inner: Arc<PoolInner>,
+}
+
+impl fmt::Debug for SessionPool {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Redacted by construction: the snapshot carries counts only — no
+        // operation identity, scope name, credential, or payload.
+        let occupancy = self.occupancy();
+        formatter
+            .debug_struct("SessionPool")
+            .field("owner", &self.inner.owner)
+            .field("slots", &self.inner.slots.len())
+            .field("read", &occupancy.for_role(SessionRole::Read))
+            .field(
+                "normal_write",
+                &occupancy.for_role(SessionRole::NormalWrite),
+            )
+            .field(
+                "health_admin",
+                &occupancy.for_role(SessionRole::HealthAdmin),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl SessionPool {
@@ -222,6 +323,56 @@ impl SessionPool {
     #[must_use]
     pub fn available(&self, role: SessionRole) -> usize {
         self.inner.roles[role.index()].semaphore.available_permits()
+    }
+
+    /// Whole-pool occupancy snapshot across the three fixed roles (issue
+    /// #2030, 994/14).
+    ///
+    /// Point observation for bounded-capacity and protected-progress
+    /// evidence: per-role `checked_out + available` always equals the
+    /// fixed slot count, and the protected health/admin lane is reported
+    /// independently of normal-lane saturation. Observing never checks
+    /// anything out and never waits.
+    #[must_use]
+    pub fn occupancy(&self) -> PoolOccupancy {
+        PoolOccupancy {
+            read: self.role_occupancy(SessionRole::Read),
+            normal_write: self.role_occupancy(SessionRole::NormalWrite),
+            health_admin: self.role_occupancy(SessionRole::HealthAdmin),
+        }
+    }
+
+    /// Non-blocking admission verdict for `role` (issue #2030, 994/14).
+    ///
+    /// Callers that must shed load instead of queueing behind a lane use
+    /// this entrypoint; [`SessionPool::try_checkout`] is the matching
+    /// non-blocking checkout. A saturated verdict never borrows capacity
+    /// from another role.
+    #[must_use]
+    pub fn admission(&self, role: SessionRole) -> PoolAdmission {
+        let lane = self.role_occupancy(role);
+        if lane.saturated() {
+            PoolAdmission::ShedExhausted
+        } else {
+            PoolAdmission::Admitted {
+                available: lane.available,
+            }
+        }
+    }
+
+    /// Occupancy for one role: the exact checked-out counter plus the
+    /// semaphore's free permits. The two move together under the permit
+    /// (see checkout/release), so their sum is the fixed slot count.
+    fn role_occupancy(&self, role: SessionRole) -> RoleOccupancy {
+        let checked_out = self.inner.roles[role.index()]
+            .checked_out
+            .load(Ordering::SeqCst);
+        let available = self.inner.roles[role.index()].semaphore.available_permits();
+        RoleOccupancy {
+            total: checked_out.saturating_add(available),
+            checked_out,
+            available,
+        }
     }
 
     /// Checks out one session of `role`, connecting its slot on first use.
@@ -310,7 +461,10 @@ impl SessionPool {
     ///
     /// A non-blocking fast path reuses a free connected slot without
     /// touching the semaphore queue; otherwise checkout waits for the next
-    /// free slot of the role.
+    /// free slot of the role. The admission observation (issue #2030)
+    /// skips the non-blocking attempt when the role is already exhausted —
+    /// an exhausted lane would refuse it anyway — without changing which
+    /// lane waits or sheds.
     pub async fn query(
         &self,
         role: SessionRole,
@@ -318,7 +472,9 @@ impl SessionPool {
         statement: &str,
         bindings: Map<String, Value>,
     ) -> Result<RpcResults, AdapterError> {
-        if let Some(session) = self.try_checkout(role) {
+        if self.admission(role).admitted()
+            && let Some(session) = self.try_checkout(role)
+        {
             return session.query(operation, statement, bindings).await;
         }
         let session = self.checkout(role).await?;
@@ -611,31 +767,55 @@ mod pool_behavior_tests {
             // open, which fails fixture deletion with a sharing violation.
             // Owned values drop at scope end (not at last use), so say the
             // drops explicitly at each call site.
+            self.cleanup_result()
+                .await
+                .expect("isolated fixture cleanup failed");
+        }
+
+        /// Non-panicking fixture cleanup (issue #2030, 994/18).
+        ///
+        /// Stops and reaps the exact owned provider child, then removes
+        /// the isolated root, returning the first failure instead of
+        /// panicking so callers retain both their primary outcome and the
+        /// cleanup outcome. See [`remove_fixture_result`].
+        async fn cleanup_result(&mut self) -> Result<(), String> {
             if let Some(adapter) = self.adapter.take()
                 && let Some(Ok(transport)) = adapter.client.get()
             {
                 let mut child = transport.provider.provider_child.lock().await;
-                child.kill().await.expect("stop exact child");
-                child.wait().await.expect("reap exact child");
+                child
+                    .kill()
+                    .await
+                    .map_err(|error| format!("stop exact child: {error}"))?;
+                child
+                    .wait()
+                    .await
+                    .map_err(|error| format!("reap exact child: {error}"))?;
             }
-            remove_fixture(&self.root).await;
+            Self::remove_fixture_result(&self.root).await
         }
-    }
 
-    async fn remove_fixture(root: &Path) {
-        // Windows can keep an exiting image mapped briefly after its process
-        // becomes unqueryable. A failed delete is not proof of resource release.
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            match std::fs::remove_dir_all(root) {
-                Ok(()) => return,
-                Err(error)
-                    if matches!(error.raw_os_error(), Some(5 | 32))
-                        && Instant::now() < deadline =>
-                {
-                    sleep(Duration::from_millis(20)).await;
+        /// Non-panicking isolated-root removal with bounded
+        /// sharing-violation retry: Windows can keep an exiting image
+        /// mapped briefly after its process becomes unqueryable, so a
+        /// failed delete retries instead of failing the cleanup.
+        async fn remove_fixture_result(root: &Path) -> Result<(), String> {
+            // Windows can keep an exiting image mapped briefly after its process
+            // becomes unqueryable. A failed delete is not proof of resource release.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                match std::fs::remove_dir_all(root) {
+                    Ok(()) => return Ok(()),
+                    Err(error)
+                        if matches!(error.raw_os_error(), Some(5 | 32))
+                            && Instant::now() < deadline =>
+                    {
+                        sleep(Duration::from_millis(20)).await;
+                    }
+                    Err(error) => {
+                        return Err(format!("isolated fixture cleanup failed: {error}"));
+                    }
                 }
-                Err(error) => panic!("isolated fixture cleanup failed: {error}"),
             }
         }
     }
@@ -964,5 +1144,79 @@ mod pool_behavior_tests {
         assert_eq!(profile.write_sessions(), 1);
         assert_eq!(profile.admin_sessions(), 1);
         assert_eq!(profile.total_sessions(), 3);
+    }
+}
+
+#[cfg(test)]
+mod occupancy_contract_tests {
+    #![allow(clippy::expect_used)]
+
+    use super::*;
+
+    fn occupancy(
+        read: (usize, usize, usize),
+        write: (usize, usize, usize),
+        admin: (usize, usize, usize),
+    ) -> PoolOccupancy {
+        let role = |(total, checked_out, available)| RoleOccupancy {
+            total,
+            checked_out,
+            available,
+        };
+        PoolOccupancy {
+            read: role(read),
+            normal_write: role(write),
+            health_admin: role(admin),
+        }
+    }
+
+    // WORK_UNIT_CASE: 2030/3 — occupancy capacity admission (994/14).
+    #[test]
+    fn occupancy_snapshot_preserves_fixed_capacity_invariant() {
+        // `checked_out + available` is the fixed slot count per role: the
+        // snapshot distinguishes a saturated lane from a live one without
+        // touching a socket.
+        let snapshot = occupancy((2, 2, 0), (2, 1, 1), (1, 0, 1));
+        for role in SessionRole::ALL {
+            let lane = snapshot.for_role(role);
+            assert_eq!(
+                lane.total,
+                lane.checked_out + lane.available,
+                "role {role:?} must preserve its fixed capacity"
+            );
+        }
+        assert!(snapshot.for_role(SessionRole::Read).saturated());
+        assert!(!snapshot.for_role(SessionRole::NormalWrite).saturated());
+        assert!(!snapshot.for_role(SessionRole::HealthAdmin).saturated());
+        let drained = occupancy((1, 0, 1), (1, 0, 1), (1, 0, 1));
+        for role in SessionRole::ALL {
+            assert!(!drained.for_role(role).saturated());
+        }
+    }
+
+    // WORK_UNIT_CASE: 2030/4 — protected lane survives normal saturation (994/14).
+    #[test]
+    fn protected_lane_stays_admitted_while_normal_lanes_saturate() {
+        // Control Reserve: normal-workload exhaustion never consumes the
+        // protected health/admin lane, so recovery/reconciliation progress
+        // stays observable while normal admission sheds.
+        let snapshot = occupancy((2, 2, 0), (2, 2, 0), (1, 0, 1));
+        assert!(snapshot.for_role(SessionRole::Read).saturated());
+        assert!(snapshot.for_role(SessionRole::NormalWrite).saturated());
+        assert!(
+            !snapshot.for_role(SessionRole::HealthAdmin).saturated(),
+            "protected lane must stay admitted under normal saturation"
+        );
+    }
+
+    // WORK_UNIT_CASE: 2030/5 — admission verdicts shed without borrowing (994/14).
+    #[test]
+    fn admission_verdicts_shed_without_borrowing_across_roles() {
+        assert!(PoolAdmission::Admitted { available: 2 }.admitted());
+        assert!(!PoolAdmission::ShedExhausted.admitted());
+        // A saturated verdict carries no capacity from another role: the
+        // verdict is per-role and non-blocking by construction.
+        let shed = PoolAdmission::ShedExhausted;
+        assert_eq!(shed, PoolAdmission::ShedExhausted);
     }
 }

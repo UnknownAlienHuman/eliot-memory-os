@@ -444,6 +444,121 @@ pub struct ExecutionMetrics {
     pub permit_waited_events: u64,
 }
 
+/// Point capacity snapshot of one execution generation (issue #2030, 994/14).
+///
+/// Observation for bounded-capacity and protected-progress evidence: queue
+/// fill against its fixed bound, free normal-write and protected permits,
+/// and the recovery/drain/fence gates. Counts and gates only — no
+/// operation identity, digest, scope name, or payload — so the snapshot is
+/// safe to render into diagnostics and failure output like
+/// [`ExecutionMetrics`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExecutionCapacity {
+    /// Currently accepted but not completed operations.
+    pub pending: usize,
+    /// Fixed queue bound for this generation.
+    pub max_pending: usize,
+    /// Free normal-write permits.
+    pub normal_available: usize,
+    /// Free protected permits (recovery/reconciliation lane).
+    pub protected_available: usize,
+    /// Whether restart recovery still blocks normal readiness.
+    pub recovery_blocked: bool,
+    /// Whether the exclusive drain gate is draining or fenced.
+    pub draining: bool,
+    /// Whether a failed or incomplete drain fenced this execution.
+    pub fenced: bool,
+}
+
+impl ExecutionCapacity {
+    /// Whether a reserved submit may proceed at observation time: open,
+    /// unblocked, unfenced, and with queue capacity. Point observation,
+    /// not a reservation — [`WriteExecution::submit_reserved`] rechecks
+    /// under its guard.
+    #[must_use]
+    pub const fn accepts_submits(self) -> bool {
+        !self.recovery_blocked && !self.draining && !self.fenced && self.pending < self.max_pending
+    }
+
+    /// Whether protected recovery/reconciliation work may proceed even
+    /// when normal capacity sheds: the protected lane is independent of
+    /// the normal-write permits and the queue bound.
+    #[must_use]
+    pub const fn protected_progress_open(self) -> bool {
+        !self.fenced && self.protected_available > 0
+    }
+}
+
+/// Non-panicking cleanup outcome joining one primary result with its
+/// fixture/migration cleanup result (issue #2030, 994/18).
+///
+/// 994/18 requires complete session/process/root cleanup or explicit
+/// nonpassing reconciliation, retaining both primary and cleanup errors:
+/// a passing primary with a failed cleanup is still a failure, and a
+/// failed cleanup never discards the primary error. [`join_cleanup_result`]
+/// is the single constructor, so the invariant holds by construction and
+/// no caller panics on a cleanup path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CleanupError<E> {
+    /// The primary error, when the primary outcome failed.
+    pub primary: Option<E>,
+    /// The cleanup error, when cleanup failed.
+    pub cleanup: Option<E>,
+}
+
+impl<E> CleanupError<E> {
+    /// Whether cleanup itself failed (regardless of the primary outcome).
+    #[must_use]
+    pub const fn has_cleanup_failure(&self) -> bool {
+        self.cleanup.is_some()
+    }
+
+    /// Whether the primary outcome failed (regardless of cleanup).
+    #[must_use]
+    pub const fn has_primary_failure(&self) -> bool {
+        self.primary.is_some()
+    }
+}
+
+impl<E: fmt::Display> fmt::Display for CleanupError<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match (&self.primary, &self.cleanup) {
+            (Some(primary), Some(cleanup)) => write!(
+                formatter,
+                "primary failed ({primary}) and cleanup failed ({cleanup})"
+            ),
+            (Some(primary), None) => write!(formatter, "primary failed ({primary})"),
+            (None, Some(cleanup)) => write!(formatter, "cleanup failed ({cleanup})"),
+            (None, None) => write!(formatter, "cleanup join produced no error"),
+        }
+    }
+}
+
+/// Joins one primary outcome with its cleanup outcome without panicking.
+///
+/// `Ok` only when both succeed; otherwise the single error retains both
+/// sides, so evidence keeps the primary failure and the cleanup failure
+/// together for the 994/18 reconciliation record.
+pub fn join_cleanup_result<T, E>(
+    primary: Result<T, E>,
+    cleanup: Result<(), E>,
+) -> Result<T, CleanupError<E>> {
+    match (primary, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(cleanup)) => Err(CleanupError {
+            primary: None,
+            cleanup: Some(cleanup),
+        }),
+        (Err(primary), Ok(())) => Err(CleanupError {
+            primary: Some(primary),
+            cleanup: None,
+        }),
+        (Err(primary), Err(cleanup)) => Err(CleanupError {
+            primary: Some(primary),
+            cleanup: Some(cleanup),
+        }),
+    }
+}
 /// RAII guard for one protected (health/admin/reconciliation) permit.
 ///
 /// Dropping the guard releases the bound permit. Release never implies
@@ -741,6 +856,29 @@ impl WriteExecution {
     #[must_use]
     pub fn metrics_snapshot(&self) -> ExecutionMetrics {
         self.with_inner(|inner| inner.metrics).unwrap_or_default()
+    }
+
+    /// Point capacity snapshot of this generation (issue #2030, 994/14).
+    ///
+    /// Observation for bounded-capacity and protected-progress evidence:
+    /// queue fill against its fixed bound, free normal-write and
+    /// protected permits, and the recovery/drain/fence gates. Observing
+    /// never checks anything out and never waits; a poisoned lock
+    /// reports the fully-gated snapshot instead of blocking.
+    #[must_use]
+    pub fn capacity(&self) -> ExecutionCapacity {
+        let (pending, drain) = self
+            .with_inner(|inner| (inner.scheduler.pending_count(), inner.drain))
+            .unwrap_or((usize::MAX, DrainState::Fenced));
+        ExecutionCapacity {
+            pending,
+            max_pending: self.max_pending.get(),
+            normal_available: self.available_normal_permits(),
+            protected_available: self.available_protected_permits(),
+            recovery_blocked: self.recovery_blocked(),
+            draining: drain != DrainState::Open,
+            fenced: drain == DrainState::Fenced,
+        }
     }
 
     /// Acquires one protected permit without touching normal-write
@@ -1774,5 +1912,95 @@ mod tests {
         assert!(execution.unreserved_apply_admission().allowed());
         assert_eq!(execution.available_normal_permits(), 1);
         assert_eq!(execution.available_protected_permits(), 1);
+    }
+
+    // WORK_UNIT_CASE: 2030/8 — execution capacity snapshot (994/14).
+    #[test]
+    fn capacity_snapshot_gates_submits_and_keeps_protected_progress_open() {
+        use std::num::NonZeroUsize;
+
+        let execution = WriteExecution::install_serial(
+            ClientSetLimits::compatibility(),
+            NonZeroUsize::new(4).expect("queue"),
+        )
+        .expect("serial installs");
+        // A fresh generation is open with real bounded capacity: the
+        // snapshot reports the fixed queue bound, both permit lanes, and
+        // no recovery/drain/fence gate.
+        let capacity = execution.capacity();
+        assert_eq!(capacity.pending, 0);
+        assert_eq!(capacity.max_pending, 4);
+        assert_eq!(capacity.normal_available, 1);
+        assert_eq!(capacity.protected_available, 1);
+        assert!(!capacity.recovery_blocked);
+        assert!(!capacity.draining);
+        assert!(!capacity.fenced);
+        assert!(capacity.accepts_submits());
+        // Protected recovery work stays open even when the normal lane
+        // sheds: the protected lane is independent of normal permits.
+        let shed_normal = ExecutionCapacity {
+            normal_available: 0,
+            ..capacity
+        };
+        assert!(shed_normal.protected_progress_open());
+        let fenced = ExecutionCapacity {
+            fenced: true,
+            ..capacity
+        };
+        assert!(!fenced.accepts_submits());
+        assert!(!fenced.protected_progress_open());
+        let full = ExecutionCapacity {
+            pending: 4,
+            ..capacity
+        };
+        assert!(!full.accepts_submits());
+        // The protected permit itself is independent: acquiring one never
+        // touches normal-write capacity.
+        let guard = execution
+            .try_acquire_protected_permit()
+            .expect("protected lane is free");
+        assert_eq!(execution.available_normal_permits(), 1);
+        drop(guard);
+        assert_eq!(execution.capacity().protected_available, 1);
+    }
+
+    // WORK_UNIT_CASE: 2030/9 — non-panicking cleanup join (994/18).
+    #[test]
+    fn join_cleanup_result_retains_both_errors_without_panicking() {
+        // Both succeed: the primary value passes through unchanged.
+        assert_eq!(
+            join_cleanup_result::<u8, String>(Ok(7), Ok(())),
+            Ok(7),
+            "clean primary with clean cleanup succeeds"
+        );
+        // Clean primary with failed cleanup still fails: a passing case
+        // with a leaked root is never reported as success.
+        assert_eq!(
+            join_cleanup_result::<u8, String>(Ok(7), Err("root busy".to_owned())),
+            Err(CleanupError {
+                primary: None,
+                cleanup: Some("root busy".to_owned()),
+            })
+        );
+        // Failed primary with clean cleanup retains the primary error.
+        let joined = join_cleanup_result::<u8, String>(Err("apply failed".to_owned()), Ok(()))
+            .expect_err("failed primary stays failed");
+        assert!(joined.has_primary_failure());
+        assert!(!joined.has_cleanup_failure());
+        assert_eq!(joined.primary.as_deref(), Some("apply failed"));
+        // Both fail: both errors are retained for the reconciliation
+        // record — the cleanup failure never discards the primary one.
+        let joined = join_cleanup_result::<u8, String>(
+            Err("apply failed".to_owned()),
+            Err("root busy".to_owned()),
+        )
+        .expect_err("double failure stays failed");
+        assert!(joined.has_primary_failure());
+        assert!(joined.has_cleanup_failure());
+        assert_eq!(joined.primary.as_deref(), Some("apply failed"));
+        assert_eq!(joined.cleanup.as_deref(), Some("root busy"));
+        let rendered = format!("{joined}");
+        assert!(rendered.contains("apply failed"));
+        assert!(rendered.contains("root busy"));
     }
 }

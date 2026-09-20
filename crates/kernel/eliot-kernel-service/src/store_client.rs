@@ -6,7 +6,10 @@
 //! by the exact operation identity carried by the prepared transition.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, atomic::AtomicU64};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU8, AtomicU64, Ordering},
+};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eliot_contracts::{ArtifactId, ContractId, ContractVersion, StateFence};
@@ -83,6 +86,60 @@ impl From<StoreWireError> for StoreClientError {
     }
 }
 
+/// Production fault-injection hook for the S-CONC-ACCEPT crash and
+/// response-loss phases (issue #2030; S-CONC-ACCEPT #994 cases 11-12).
+///
+/// The hook is one-shot and explicit: the 994 harness arms exactly one fault
+/// before one admitted write, and the client consumes it on that write.
+/// Disarmed production traffic never observes it.
+///
+/// Contract:
+/// - [`StoreClientFault::PreCommitCrash`] (994/11) fires before any provider
+///   effect: the write returns [`StoreError::MissingReceiptEnvelope`]
+///   (unknown — never success, never `Unavailable`, which would invite a
+///   same-identity retry) with zero transport sends, so the caller
+///   reconciles the exact admitted identity and proves absence before any
+///   resubmission.
+/// - [`StoreClientFault::PostCommitResponseLoss`] (994/12) fires after the
+///   provider durably committed: the observed receipt is discarded and the
+///   write returns [`StoreError::MissingReceiptEnvelope`] instead of
+///   success, so the caller reconciles the exact admitted identity and
+///   recovers the original receipt without a replay under any identity.
+/// - Validation failures still precede the hook: an inadmissible request
+///   fails with its typed error and leaves the armed fault in place.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum StoreClientFault {
+    /// No fault armed: production behavior.
+    #[default]
+    None,
+    /// Drop the response after a durable provider commit (994/12).
+    PostCommitResponseLoss,
+    /// Crash precisely before any durable commit (994/11).
+    PreCommitCrash,
+}
+
+impl StoreClientFault {
+    const NONE: u8 = 0;
+    const POST_COMMIT_RESPONSE_LOSS: u8 = 1;
+    const PRE_COMMIT_CRASH: u8 = 2;
+
+    const fn encode(self) -> u8 {
+        match self {
+            Self::None => Self::NONE,
+            Self::PostCommitResponseLoss => Self::POST_COMMIT_RESPONSE_LOSS,
+            Self::PreCommitCrash => Self::PRE_COMMIT_CRASH,
+        }
+    }
+
+    const fn decode(value: u8) -> Self {
+        match value {
+            Self::POST_COMMIT_RESPONSE_LOSS => Self::PostCommitResponseLoss,
+            Self::PRE_COMMIT_CRASH => Self::PreCommitCrash,
+            _ => Self::None,
+        }
+    }
+}
+
 /// Authenticated neutral S-03 EBP client implementing the canonical store API.
 pub struct EbpCanonicalStoreClient<T> {
     transport: Arc<Mutex<T>>,
@@ -90,6 +147,10 @@ pub struct EbpCanonicalStoreClient<T> {
     protocol_version: ProtocolVersion,
     limits: TransportLimits,
     request_counter: AtomicU64,
+    /// One-shot production fault hook (issue #2030). `&self` methods arm,
+    /// observe, and consume it through this atomic; the transport path never
+    /// invents faults on its own.
+    fault: AtomicU8,
 }
 
 impl<T> std::fmt::Debug for EbpCanonicalStoreClient<T> {
@@ -132,9 +193,32 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
             protocol_version: server.selected_protocol,
             limits,
             request_counter: AtomicU64::new(1),
+            fault: AtomicU8::new(StoreClientFault::NONE),
         };
         client.verify_readiness().await?;
         Ok(client)
+    }
+
+    /// Arms the one-shot production fault hook (issue #2030).
+    ///
+    /// The next admitted [`Self::apply_prepared`] or
+    /// [`CanonicalStoreClient::apply_reserved_write`] consumes it;
+    /// [`StoreClientFault::None`] disarms. Validation failures leave the
+    /// armed fault in place for the next admissible attempt.
+    pub fn arm_fault(&self, fault: StoreClientFault) {
+        self.fault.store(fault.encode(), Ordering::SeqCst);
+    }
+
+    /// Currently armed production fault, if any. Observation only: reading
+    /// never consumes the hook.
+    #[must_use]
+    pub fn armed_fault(&self) -> StoreClientFault {
+        StoreClientFault::decode(self.fault.load(Ordering::SeqCst))
+    }
+
+    /// Consumes the armed production fault, returning the disarmed state.
+    fn take_fault(&self) -> StoreClientFault {
+        StoreClientFault::decode(self.fault.swap(StoreClientFault::NONE, Ordering::SeqCst))
     }
 
     /// Returns the exact Host-approved bootstrap binding.
@@ -351,6 +435,14 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
             );
             verify_canonical_request_hash(&view, &transition.identity.canonical_request_hash)?;
         }
+        // Production fault hook (issue #2030): consumed only after the
+        // request validated, so inadmissible input keeps its typed error
+        // and the armed fault. A pre-commit crash returns unknown with
+        // zero provider effects; a post-commit loss is applied below.
+        let fault = self.take_fault();
+        if fault == StoreClientFault::PreCommitCrash {
+            return Err(StoreError::MissingReceiptEnvelope);
+        }
         let operation_id = transition.identity.operation_id.clone();
         let idempotency_key = transition.identity.idempotency_key.clone();
         let canonical_request_hash = transition.identity.canonical_request_hash.clone();
@@ -368,6 +460,14 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
             .await;
         match result {
             Ok(StoreResponse::Transaction { receipt }) if receipt.operation_id == operation_id => {
+                // Post-commit response loss (issue #2030, 994/12): the
+                // provider durably committed, but the response is dropped
+                // here. Unknown — never success — so the caller reconciles
+                // the exact admitted identity and recovers this same
+                // receipt without a replay.
+                if fault == StoreClientFault::PostCommitResponseLoss {
+                    return Err(StoreError::MissingReceiptEnvelope);
+                }
                 Ok(receipt)
             }
             // Once Apply has crossed the transport boundary, a valid response
@@ -425,6 +525,14 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
         self.validate_requirement_fence(&request.context.state_fence)?;
         self.validate_requirement_fence(&request.transition.state_fence)?;
         self.validate_requirement_fence(&request.admission.state_fence)?;
+        // Production fault hook (issue #2030): same contract as
+        // `apply_prepared` — validation first, pre-commit crash with zero
+        // provider effects, post-commit loss discarding the observed
+        // receipt into unknown.
+        let fault = self.take_fault();
+        if fault == StoreClientFault::PreCommitCrash {
+            return Err(StoreError::MissingReceiptEnvelope);
+        }
         let idempotency_key = request.transition.identity.idempotency_key.clone();
         let result = self
             .execute_raw(
@@ -442,6 +550,13 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
                 // to reconcile — never success, never an adopted peer
                 // identity, and never a second wire operation.
                 self.validate_reserved_write_receipt(&request, &receipt)?;
+                // Post-commit response loss (issue #2030, 994/12): the
+                // commit is durable, but the answer is dropped into
+                // unknown so the caller reconciles the exact admitted
+                // identity instead of observing success.
+                if fault == StoreClientFault::PostCommitResponseLoss {
+                    return Err(StoreError::MissingReceiptEnvelope);
+                }
                 Ok(receipt)
             }
             // Once the reserved write has crossed the transport boundary, a
@@ -1753,6 +1868,130 @@ mod tests {
         assert!(snapshot.revision_heads.is_empty());
         let transport = client.transport.lock().await;
         assert_eq!(transport.validation_calls, 1);
+    }
+
+    // WORK_UNIT_CASE: 2030/1 — production pre-commit crash (994/11).
+    #[tokio::test]
+    async fn production_fault_pre_commit_crash_has_no_provider_effect_and_stays_unknown() {
+        let requirement = requirement();
+        let (context, transition, revision_heads, ordering_heads) =
+            apply_parts(&requirement.state_fence);
+        let receipt = apply_receipt(&context, &transition);
+        let client = EbpCanonicalStoreClient::connect(
+            FakeEbpStoreTransport::new(requirement.clone(), SnapshotFault::Valid)
+                .with_apply_response(StoreResponse::Transaction {
+                    receipt: receipt.clone(),
+                }),
+            requirement.clone(),
+        )
+        .await
+        .expect("fake handshake and readiness");
+        client.arm_fault(StoreClientFault::PreCommitCrash);
+        assert_eq!(
+            client.armed_fault(),
+            StoreClientFault::PreCommitCrash,
+            "hook observes without consuming"
+        );
+        let error = client
+            .apply_prepared(&context, transition, revision_heads, ordering_heads)
+            .await
+            .expect_err("pre-commit crash stays unknown");
+        assert_eq!(
+            error,
+            StoreError::MissingReceiptEnvelope,
+            "crash before commit is unknown — never success, never retryable Unavailable"
+        );
+        let transport = client.transport.lock().await;
+        assert_eq!(
+            transport.apply_calls, 0,
+            "pre-commit crash crosses no provider effect boundary"
+        );
+        assert!(
+            transport.receipt_requests.is_empty(),
+            "no reconciliation identity is adopted by the crash itself"
+        );
+        drop(transport);
+        assert_eq!(
+            client.armed_fault(),
+            StoreClientFault::None,
+            "one-shot hook is consumed by the crashed write"
+        );
+
+        // Validation still precedes the hook: an inadmissible request keeps
+        // its typed error and leaves the armed fault for the next attempt.
+        let (context, transition, mut revision_heads, ordering_heads) =
+            apply_parts(&requirement.state_fence);
+        revision_heads[0].expected_revision = 2;
+        client.arm_fault(StoreClientFault::PreCommitCrash);
+        match client
+            .apply_prepared(&context, transition, revision_heads, ordering_heads)
+            .await
+        {
+            Err(StoreError::TransitionDigestMismatch { .. }) => {}
+            other => panic!("tampered apply must keep its typed mismatch: {other:?}"),
+        }
+        assert_eq!(client.transport.lock().await.apply_calls, 0);
+        assert_eq!(
+            client.armed_fault(),
+            StoreClientFault::PreCommitCrash,
+            "validation failure must not consume the hook"
+        );
+    }
+
+    // WORK_UNIT_CASE: 2030/2 — production post-commit response loss (994/12).
+    #[tokio::test]
+    async fn production_fault_post_commit_response_loss_recovers_original_receipt_without_replay() {
+        let requirement = requirement();
+        let (context, transition, revision_heads, ordering_heads) =
+            apply_parts(&requirement.state_fence);
+        let receipt = apply_receipt(&context, &transition);
+        let operation_id = transition.identity.operation_id.clone();
+        let admitted_hash = transition.identity.canonical_request_hash.clone();
+        let client = EbpCanonicalStoreClient::connect(
+            FakeEbpStoreTransport::new(requirement.clone(), SnapshotFault::Valid)
+                .with_apply_response(StoreResponse::Transaction {
+                    receipt: receipt.clone(),
+                })
+                .with_reconciliation_receipt(receipt.clone()),
+            requirement,
+        )
+        .await
+        .expect("fake handshake and readiness");
+        client.arm_fault(StoreClientFault::PostCommitResponseLoss);
+        let error = client
+            .apply_prepared(&context, transition, revision_heads, ordering_heads)
+            .await
+            .expect_err("dropped response stays unknown");
+        assert_eq!(
+            error,
+            StoreError::MissingReceiptEnvelope,
+            "committed-but-unobserved is unknown — never success"
+        );
+        assert_eq!(
+            client.transport.lock().await.apply_calls,
+            1,
+            "the commit reached the provider exactly once"
+        );
+        // Exact-identity reconciliation recovers the original receipt: no
+        // replay under any identity, no adopted peer identity.
+        let recovered = client
+            .receipt_exact(operation_id.clone(), &admitted_hash)
+            .await
+            .expect("exact reconciliation recovers the committed receipt");
+        assert_eq!(
+            recovered, receipt,
+            "response loss recovers the original receipt"
+        );
+        let transport = client.transport.lock().await;
+        assert_eq!(
+            transport.receipt_requests,
+            vec![operation_id],
+            "reconciliation binds the admitted operation only"
+        );
+        assert_eq!(
+            transport.apply_calls, 1,
+            "reconciliation issues no second Apply"
+        );
     }
 }
 

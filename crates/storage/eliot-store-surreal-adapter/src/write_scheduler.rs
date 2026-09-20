@@ -124,6 +124,59 @@ pub enum ScheduleReject {
     NotUncertain,
 }
 
+/// Point occupancy snapshot of the bounded scheduler (issue #2030, 994/14).
+///
+/// Observation for capacity and protected-progress evidence: how many
+/// operations are accepted but not completed, how many execute, how many
+/// hold their scopes uncertain, and whether the scheduler drains. The
+/// snapshot never mutates and never waits; uncertain work keeps its entry,
+/// so a drain with an open outcome cannot observe quiescence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SchedulerOccupancy {
+    /// Accepted but not completed operations.
+    pub pending: usize,
+    /// Currently executing operations.
+    pub in_flight: usize,
+    /// Operations holding their scopes uncertain.
+    pub uncertain: usize,
+    /// Whether a drain started and new submissions refuse.
+    pub draining: bool,
+    /// Fixed executor lane bound.
+    pub lanes: usize,
+    /// Fixed pending-queue bound.
+    pub max_pending: usize,
+}
+
+/// Non-blocking scheduler admission verdict (issue #2030, 994/14).
+///
+/// Point observation matching [`WriteScheduler::submit`] without mutating:
+/// a full queue sheds with [`ScheduleReject::QueueFull`], a draining
+/// scheduler refuses with [`ScheduleReject::Draining`], and only open
+/// capacity admits. Callers that must shed load instead of queueing use
+/// this entrypoint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SchedulerAdmission {
+    /// Open capacity at observation time.
+    Admitted {
+        /// Lanes not currently in flight.
+        free_lanes: usize,
+        /// Queue slots not currently pending.
+        free_queue: usize,
+    },
+    /// The bounded queue is full; shed instead of queueing.
+    ShedQueueFull,
+    /// A drain started; no new submissions while it runs.
+    RefusedDraining,
+}
+
+impl SchedulerAdmission {
+    /// Whether a submission may proceed without queueing behind the bound.
+    #[must_use]
+    pub const fn admitted(self) -> bool {
+        matches!(self, Self::Admitted { .. })
+    }
+}
+
 /// Per-scope head state: at most one in-flight operation, one optional
 /// retry gate, and one optional uncertainty holder.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -195,6 +248,43 @@ impl WriteScheduler {
     #[must_use]
     pub fn in_flight_count(&self) -> usize {
         self.pending.values().filter(|op| op.in_flight).count()
+    }
+
+    /// Point occupancy snapshot of this scheduler (issue #2030, 994/14).
+    ///
+    /// Observation only: counts pending, in-flight, and uncertain
+    /// operations plus the drain state and the fixed bounds. Never
+    /// mutates, never waits.
+    #[must_use]
+    pub fn occupancy(&self) -> SchedulerOccupancy {
+        SchedulerOccupancy {
+            pending: self.pending.len(),
+            in_flight: self.in_flight_count(),
+            uncertain: self
+                .pending
+                .values()
+                .filter(|operation| operation.uncertain)
+                .count(),
+            draining: self.draining,
+            lanes: self.lanes.get(),
+            max_pending: self.max_pending.get(),
+        }
+    }
+
+    /// Non-blocking admission verdict matching [`WriteScheduler::submit`]
+    /// without mutating (issue #2030, 994/14).
+    #[must_use]
+    pub fn admission(&self) -> SchedulerAdmission {
+        if self.draining {
+            return SchedulerAdmission::RefusedDraining;
+        }
+        if self.pending.len() >= self.max_pending.get() {
+            return SchedulerAdmission::ShedQueueFull;
+        }
+        SchedulerAdmission::Admitted {
+            free_lanes: self.lanes.get().saturating_sub(self.in_flight_count()),
+            free_queue: self.max_pending.get().saturating_sub(self.pending.len()),
+        }
     }
 
     /// Oldest accepted operation by (`reservation_order`, operation id):
@@ -876,6 +966,86 @@ mod tests {
             .mark_in_flight(&operation("one"), 0)
             .expect("one runs");
         assert!(scheduler.ready(0).is_empty());
+    }
+
+    // WORK_UNIT_CASE: 2030/6 — scheduler occupancy snapshot (994/14).
+    #[test]
+    fn occupancy_snapshot_tracks_pending_in_flight_and_uncertain() {
+        let mut scheduler = scheduler();
+        let empty = scheduler.occupancy();
+        assert_eq!(
+            empty,
+            SchedulerOccupancy {
+                pending: 0,
+                in_flight: 0,
+                uncertain: 0,
+                draining: false,
+                lanes: LANES,
+                max_pending: QUEUE,
+            }
+        );
+        assert!(scheduler.admission().admitted());
+        scheduler
+            .submit(projection("risky", 1, &[("shared", 1)]))
+            .expect("risky");
+        scheduler
+            .submit(projection("next", 2, &[("shared", 2)]))
+            .expect("next");
+        scheduler
+            .mark_in_flight(&operation("risky"), 0)
+            .expect("risky runs");
+        scheduler
+            .complete(
+                &operation("risky"),
+                CompletionOutcome::Unknown { retry_after_ms: 0 },
+                0,
+            )
+            .expect("risky unknown");
+        // Uncertain work keeps its entry and its scope hold: the snapshot
+        // reports it instead of observing quiescence.
+        let snapshot = scheduler.occupancy();
+        assert_eq!(snapshot.pending, 2);
+        assert_eq!(snapshot.in_flight, 1);
+        assert_eq!(snapshot.uncertain, 1);
+        assert!(!snapshot.draining);
+        scheduler
+            .resolve_uncertain(&operation("risky"), CompletionOutcome::Committed, 10)
+            .expect("risky resolves");
+        let resolved = scheduler.occupancy();
+        assert_eq!(resolved.pending, 1);
+        assert_eq!(resolved.uncertain, 0);
+    }
+
+    // WORK_UNIT_CASE: 2030/7 — scheduler admission sheds and refuses (994/14).
+    #[test]
+    fn saturated_queue_sheds_while_drain_refuses_new_work() {
+        let mut scheduler = WriteScheduler::new(
+            NonZeroUsize::new(1).expect("lanes"),
+            NonZeroUsize::new(1).expect("queue"),
+        );
+        assert_eq!(
+            scheduler.admission(),
+            SchedulerAdmission::Admitted {
+                free_lanes: 1,
+                free_queue: 1,
+            }
+        );
+        scheduler
+            .submit(projection("first", 1, &[("s", 1)]))
+            .expect("first");
+        // The verdict matches `submit` without mutating: a full queue
+        // sheds, and the failed submit leaves the snapshot unchanged.
+        assert_eq!(scheduler.admission(), SchedulerAdmission::ShedQueueFull);
+        assert_eq!(
+            scheduler.submit(projection("second", 2, &[("t", 1)])),
+            Err(ScheduleReject::QueueFull)
+        );
+        assert_eq!(scheduler.occupancy().pending, 1);
+        let blockers = scheduler.begin_drain();
+        assert!(blockers.is_empty());
+        assert_eq!(scheduler.admission(), SchedulerAdmission::RefusedDraining);
+        assert!(!scheduler.admission().admitted());
+        assert!(scheduler.occupancy().draining);
     }
 
     /// Corpus-driven replay: finite event/invariant sequences from

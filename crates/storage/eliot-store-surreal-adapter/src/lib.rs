@@ -49,14 +49,15 @@ pub use error::AdapterError;
 pub use health::{AdapterAvailability, AdapterHealth, ProviderHealth};
 pub use readiness::{CompiledMigration, MigrationReceipt, SemanticReadiness};
 pub use write_execution::{
-    AttemptOutcome, ConcurrentEvidence, DrainReport, DurableOpOutcome, DurableRecoverySet,
-    ExclusiveOpKind, ExecutableAttempt, ExecutionMetrics, ExecutionProfile, OpExecution,
-    ProtectedPermit, ProviderGate, ReconcileOutcome, ReservedAttemptTransport, SubmitDisposition,
-    UnreservedAdmission, WriteExecution,
+    AttemptOutcome, CleanupError, ConcurrentEvidence, DrainReport, DurableOpOutcome,
+    DurableRecoverySet, ExclusiveOpKind, ExecutableAttempt, ExecutionCapacity, ExecutionMetrics,
+    ExecutionProfile, OpExecution, ProtectedPermit, ProviderGate, ReconcileOutcome,
+    ReservedAttemptTransport, SubmitDisposition, UnreservedAdmission, WriteExecution,
+    join_cleanup_result,
 };
 pub use write_scheduler::{
     CompletionOutcome, ReservationProjection, ReservedScopeProjection, ScheduleReject,
-    WriteScheduler,
+    SchedulerAdmission, SchedulerOccupancy, WriteScheduler,
 };
 
 /// The sole `SurrealDB` credential and client owner for the ELIOT canonical
