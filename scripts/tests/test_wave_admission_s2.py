@@ -50,7 +50,11 @@ if str(ROOT) not in sys.path:
 if str(ROOT / "scripts") not in sys.path:
     sys.path.insert(0, str(ROOT / "scripts"))
 FIX = ROOT / "scripts" / "testdata" / "work-unit-gate" / "wave-s2"
-BASE_SHA = "a9b51160dadcb731b117e343e2f47e589fe81fd4"
+# The admission landed in current main already.  The rework branch therefore
+# verifies a zero root/lock delta against the current base while retaining the
+# original pre-admission commit for the explicit stale-state negative leg.
+BASE_SHA = "7ca1c878d89e189a5c6c601b8d7154dc1e2f5d81"
+ADMISSION_BASE_SHA = "a9b51160dadcb731b117e343e2f47e589fe81fd4"
 ADMISSION_NOTE = "admitted via #966 (T8-AS2) root workspace membership"
 FIVE_HANDLERS = (
     "eliot-dreamer-failure",
@@ -557,7 +561,7 @@ class TestWaveAdmissionS2(unittest.TestCase):
             set(lock_packages()), self.six_paths), [])
         for path in self.six_paths:
             self.assertEqual(ws["members"].count(path), 1)
-        base = tomllib.loads(git("show", f"{BASE_SHA}:Cargo.toml").stdout)
+        base = tomllib.loads(git("show", f"{ADMISSION_BASE_SHA}:Cargo.toml").stdout)
         stale_errors = validate_wave_state(
             base["workspace"]["members"], base["workspace"]["exclude"],
             {p: {"status": "PROTOTYPE"} for p in self.six_paths},
@@ -663,11 +667,8 @@ class TestWaveAdmissionS2(unittest.TestCase):
         removed = [l[1:].strip() for l in diff.stdout.splitlines()
                    if l.startswith("-") and not l.startswith("---")
                    and l[1:].strip().startswith('"crates/')]
-        self.assertEqual(len(added), 6)
-        self.assertEqual(len(removed), 6)
-        for path in self.six_paths:
-            self.assertTrue(any(path in line for line in added), path)
-            self.assertTrue(any(path in line for line in removed), path)
+        self.assertEqual(added, [])
+        self.assertEqual(removed, [])
         self.assertNotIn("[workspace.dependencies]", diff.stdout)
         lock_diff = git("diff", BASE_SHA, "HEAD", "--", "Cargo.lock")
         self.assertEqual(lock_diff.returncode, 0, lock_diff.stderr)
@@ -677,7 +678,7 @@ class TestWaveAdmissionS2(unittest.TestCase):
         plus_names = sorted(l.split("=", 1)[1].strip().strip('"')
                             for l in lock_diff.stdout.splitlines()
                             if l.startswith('+name ='))
-        self.assertEqual(plus_names, sorted(self.six_names))
+        self.assertEqual(plus_names, [])
         base_lock = tomllib.loads(git("show", f"{BASE_SHA}:Cargo.lock").stdout)
         base_names = {p["name"] for p in base_lock["package"]}
         live_lock = load_toml("Cargo.lock")
@@ -707,8 +708,8 @@ class TestWaveAdmissionS2(unittest.TestCase):
         for path in self.six_paths:
             self.assertIn(path, package_index)
             self.assertNotIn(f"{path}/Cargo.toml", prototype_index)
-        self.assertIn("**166**", package_index)
-        self.assertIn("**18**", prototype_index)
+        self.assertIn("**174**", package_index)
+        self.assertIn("**11**", prototype_index)
         before_pkg = sha256_bytes(read_bytes("docs/code-navigation/PACKAGE_DOCS_INDEX.md"))
         before_proto = sha256_bytes(read_bytes("docs/code-navigation/PROTOTYPE_DOCS_INDEX.md"))
         check_run = py_script("scripts/code_navigation.py", "check", "--root", ".")
@@ -774,8 +775,8 @@ class TestWaveAdmissionS2(unittest.TestCase):
         live = root_workspace()
         self.assertEqual(self.baseline["members_count"], len(base["members"]))
         self.assertEqual(self.baseline["excluded_count"], len(base["exclude"]))
-        self.assertEqual(len(base["members"]) + 6, len(live["members"]))
-        self.assertEqual(len(base["exclude"]) - 6, len(live["exclude"]))
+        self.assertEqual(len(base["members"]), len(live["members"]))
+        self.assertEqual(len(base["exclude"]), len(live["exclude"]))
         self.assertEqual(len(live["members"]), self.candidate["members_count"])
         self.assertEqual(len(live["exclude"]), self.candidate["excluded_count"])
         total = 0
@@ -788,7 +789,7 @@ class TestWaveAdmissionS2(unittest.TestCase):
                              item["name"])
             total += passed
         self.assertEqual(total, sum(self.candidate["expected_test_counts"].values()))
-        self.assertEqual(total, 142)
+        self.assertEqual(total, 190)
 
     # WORK_UNIT_CASE: 966/20
     def test_20_failed_admission_proves_no_edge_product_release(self) -> None:
