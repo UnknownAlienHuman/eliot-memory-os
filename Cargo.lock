@@ -2596,13 +2596,18 @@ name = "eliot-runtime-status"
 version = "0.1.0"
 dependencies = [
  "eliot-contracts",
+ "eliot-controlboard",
+ "eliot-evaluation-contracts",
+ "eliot-evidence",
  "eliot-host-state",
  "eliot-installation",
+ "eliot-observation-contracts",
  "eliot-ors",
  "eliot-platform",
  "eliot-platform-windows",
  "eliot-process",
  "eliot-runtime-contracts",
+ "eliot-security-contracts",
  "eliot-store-api",
  "redb",
  "serde",

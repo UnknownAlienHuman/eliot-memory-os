@@ -68,6 +68,13 @@ pub use capability_cell_readback::{
     CellReadbackError, GenerationCellResolution, resolve_generation_via_registry,
 };
 
+mod controlboard_projection;
+pub use controlboard_projection::{
+    CONTROLBOARD_CONTOUR_CONTRACT, ControlBoardContour, ControlBoardEntryKind,
+    ControlBoardProjectionBindings, ControlBoardProjectionError, ControlBoardStatusRow,
+    ControlBoardSupport, project_controlboard_contour, read_controlboard_contour,
+};
+
 const WATCHDOG_PUBLICATION_CHILD_LIMIT: u64 = 1024 * 1024;
 const HOST_JOURNAL_FILE_NAME: &str = "host-state-journal.redb";
 const WIN32_ERROR_FILE_NOT_FOUND: u32 = 2;
