@@ -807,7 +807,7 @@ pub fn project_references(index: &ScipIndex, symbol: &str) -> Result<Vec<Referen
     Ok(items)
 }
 
-/// Projects symbol-table entries having at least one occurrence under
+/// Projects symbol-table entries whose repository-relative path starts with
 /// `path_scope` (empty scope selects the whole index).
 pub fn project_symbols(
     index: &ScipIndex,
@@ -818,7 +818,7 @@ pub fn project_symbols(
     }
     let mut items = Vec::new();
     for document in &index.documents {
-        if !path_scope.is_empty() && !document.relative_path.contains(path_scope) {
+        if !path_scope.is_empty() && !document.relative_path.starts_with(path_scope) {
             continue;
         }
         for symbol in &document.symbols {
@@ -882,6 +882,10 @@ pub fn rename_candidate(
 }
 
 /// Reads a bridge-named SCIP sidecar index with a byte bound.
+///
+/// The size pre-check rejects obviously oversized sidecars early; the bound
+/// is enforced again after the read so a sidecar that grows mid-read still
+/// cannot pass an over-limit payload to the decoder.
 pub fn read_scip_sidecar(path: &str) -> Result<Vec<u8>, BridgeError> {
     checked_text(path, "scip_output_path")?;
     let metadata = std::fs::metadata(path).map_err(|error| BridgeError::SidecarUnreadable {
@@ -890,9 +894,13 @@ pub fn read_scip_sidecar(path: &str) -> Result<Vec<u8>, BridgeError> {
     if metadata.len() > MAX_SCIP_SIDECAR_BYTES {
         return Err(BridgeError::OutputTooLarge);
     }
-    std::fs::read(path).map_err(|error| BridgeError::SidecarUnreadable {
+    let bytes = std::fs::read(path).map_err(|error| BridgeError::SidecarUnreadable {
         detail: error.to_string(),
-    })
+    })?;
+    if bytes.len() as u64 > MAX_SCIP_SIDECAR_BYTES {
+        return Err(BridgeError::OutputTooLarge);
+    }
+    Ok(bytes)
 }
 
 /// Builds a stable output handle for a captured stream.
@@ -913,6 +921,75 @@ pub fn sidecar_handle(path: &str, bytes: &[u8]) -> String {
         hex_bytes(Sha256::digest(bytes).as_slice()),
         bytes.len()
     )
+}
+
+/// Maps a normalization failure to receipt freshness and disposition.
+///
+/// Bound-exceeded input is truncation (the tool emitted more than the bridge
+/// normalizes), never a parse failure; only genuinely malformed input is
+/// `ParseFailed`. The detail of a bound-exceeded run is the stable truncation
+/// reason, so consumers can rely on the disposition discriminant.
+fn normalize_failure(reason: &str, error: &BridgeError) -> (Freshness, FailureDisposition) {
+    if matches!(
+        error,
+        BridgeError::OutputTooLarge | BridgeError::DiagnosticTooLarge | BridgeError::TooManyRecords
+    ) {
+        (
+            Freshness::Stale {
+                reason: "tool output exceeded the bounded capture limit".to_owned(),
+            },
+            FailureDisposition::OutputTruncated,
+        )
+    } else {
+        (
+            Freshness::Stale {
+                reason: reason.to_owned(),
+            },
+            FailureDisposition::ParseFailed {
+                detail: error.to_string(),
+            },
+        )
+    }
+}
+
+/// Builds the shape-correct empty result for an operation whose SCIP input
+/// could not be served or normalized. Failure travels on the receipt; the
+/// envelope always matches the requested operation.
+fn empty_scip_result(
+    operation: &SemanticOperation,
+    receipt: ObservationReceipt,
+) -> NormalizedResult {
+    match operation {
+        SemanticOperation::Definitions { .. } => NormalizedResult::Definitions {
+            items: Vec::new(),
+            receipt,
+        },
+        SemanticOperation::References { .. } => NormalizedResult::References {
+            items: Vec::new(),
+            receipt,
+        },
+        SemanticOperation::Symbols { .. } => NormalizedResult::Symbols {
+            items: Vec::new(),
+            receipt,
+        },
+        SemanticOperation::Diagnostics => NormalizedResult::Diagnostics {
+            observations: Vec::new(),
+            receipt,
+        },
+        SemanticOperation::Rename { symbol, new_name } => NormalizedResult::Rename {
+            candidate: RenameCandidate {
+                symbol: symbol.clone(),
+                new_name: new_name.clone(),
+                edits: Vec::new(),
+                applied: false,
+            },
+            receipt,
+        },
+        SemanticOperation::ProbeVersion => NormalizedResult::Version {
+            version: String::new(),
+            receipt,
+        },
+    }
 }
 
 /// Finalizes one-shot diagnostics evidence into observations plus receipt.
@@ -963,12 +1040,10 @@ pub fn finalize_diagnostics(
         },
         Err(error) => {
             let mut receipt = receipt_base();
-            receipt.disposition = FailureDisposition::ParseFailed {
-                detail: error.to_string(),
-            };
-            receipt.freshness = Freshness::Stale {
-                reason: "diagnostics output did not normalize".to_owned(),
-            };
+            let (freshness, disposition) =
+                normalize_failure("diagnostics output did not normalize", &error);
+            receipt.disposition = disposition;
+            receipt.freshness = freshness;
             NormalizedResult::Diagnostics {
                 observations: Vec::new(),
                 receipt,
@@ -1012,12 +1087,10 @@ pub fn finalize_version(
             NormalizedResult::Version { version, receipt }
         }
         Err(error) => {
-            receipt.disposition = FailureDisposition::ParseFailed {
-                detail: error.to_string(),
-            };
-            receipt.freshness = Freshness::Stale {
-                reason: "version output did not normalize".to_owned(),
-            };
+            let (freshness, disposition) =
+                normalize_failure("version output did not normalize", &error);
+            receipt.disposition = disposition;
+            receipt.freshness = freshness;
             NormalizedResult::Version {
                 version: String::new(),
                 receipt,
@@ -1067,10 +1140,7 @@ pub fn finalize_scip(
             receipt.freshness = Freshness::Stale {
                 reason: "operation is not served by the SCIP analyzer path".to_owned(),
             };
-            return NormalizedResult::Symbols {
-                items: Vec::new(),
-                receipt,
-            };
+            return empty_scip_result(operation, receipt);
         }
     };
     let ok_receipt = || {
@@ -1087,33 +1157,19 @@ pub fn finalize_scip(
             false,
         )
     };
-    let parse_failed = |detail: String| {
+    let parse_failed = |error: &BridgeError| {
         let mut receipt = ok_receipt();
-        receipt.disposition = FailureDisposition::ParseFailed { detail };
-        receipt.freshness = Freshness::Stale {
-            reason: "SCIP index did not normalize".to_owned(),
-        };
+        let (freshness, disposition) = normalize_failure("SCIP index did not normalize", error);
+        receipt.disposition = disposition;
+        receipt.freshness = freshness;
         receipt
     };
     let index = match ScipIndex::decode(index_bytes) {
         Ok(index) => index,
         Err(error) => {
-            let receipt = parse_failed(error.to_string());
-            return match operation {
-                SemanticOperation::Rename { symbol, new_name } => NormalizedResult::Rename {
-                    candidate: RenameCandidate {
-                        symbol: symbol.clone(),
-                        new_name: new_name.clone(),
-                        edits: Vec::new(),
-                        applied: false,
-                    },
-                    receipt,
-                },
-                _ => NormalizedResult::Symbols {
-                    items: Vec::new(),
-                    receipt,
-                },
-            };
+            let bridge_error = BridgeError::from(error);
+            let receipt = parse_failed(&bridge_error);
+            return empty_scip_result(operation, receipt);
         }
     };
     match operation {
@@ -1124,7 +1180,7 @@ pub fn finalize_scip(
             },
             Err(error) => NormalizedResult::Definitions {
                 items: Vec::new(),
-                receipt: parse_failed(error.to_string()),
+                receipt: parse_failed(&error),
             },
         },
         SemanticOperation::References { symbol } => match project_references(&index, symbol) {
@@ -1134,7 +1190,7 @@ pub fn finalize_scip(
             },
             Err(error) => NormalizedResult::References {
                 items: Vec::new(),
-                receipt: parse_failed(error.to_string()),
+                receipt: parse_failed(&error),
             },
         },
         SemanticOperation::Symbols { path_scope } => match project_symbols(&index, path_scope) {
@@ -1144,7 +1200,7 @@ pub fn finalize_scip(
             },
             Err(error) => NormalizedResult::Symbols {
                 items: Vec::new(),
-                receipt: parse_failed(error.to_string()),
+                receipt: parse_failed(&error),
             },
         },
         SemanticOperation::Rename { symbol, new_name } => {
@@ -1160,15 +1216,15 @@ pub fn finalize_scip(
                         edits: Vec::new(),
                         applied: false,
                     },
-                    receipt: parse_failed(error.to_string()),
+                    receipt: parse_failed(&error),
                 },
             }
         }
+        // Defensive: diagnostics and version probes return before decode, so
+        // this arm is unreachable; it still yields a shape-correct failure.
         SemanticOperation::Diagnostics | SemanticOperation::ProbeVersion => {
-            NormalizedResult::Symbols {
-                items: Vec::new(),
-                receipt: parse_failed("unreachable SCIP operation".to_owned()),
-            }
+            let receipt = parse_failed(&BridgeError::UnsupportedOperation);
+            empty_scip_result(operation, receipt)
         }
     }
 }
@@ -1376,6 +1432,7 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
+    use std::fmt::Write as _;
 
     const VERSION_LINE: &str = "rust-analyzer 1.97.1 (8bab26f4 2026-07-14)\n";
 
@@ -1504,6 +1561,239 @@ mod tests {
         assert!(
             rename_candidate(&index, "rust-analyzer cargo ra_probe 0.1.0 main()", "0bad").is_err()
         );
+    }
+
+    fn scip_test_config() -> AnalyzerConfig {
+        AnalyzerConfig {
+            scip_output_path: Some("C:/Temp/ra-probe/index.scip".to_owned()),
+            ..test_config()
+        }
+    }
+
+    /// A lone continuation byte is a truncated varint, so the SCIP decoder
+    /// deterministically rejects it.
+    const TRUNCATED_SCIP: &[u8] = b"\xff";
+
+    #[test]
+    fn scip_decode_failure_preserves_operation_envelope() {
+        let config = scip_test_config();
+        let owner = test_candidate();
+        let result = finalize_scip(
+            &config,
+            &owner,
+            &SemanticOperation::Definitions {
+                symbol: "sym".to_owned(),
+            },
+            TRUNCATED_SCIP,
+            "sidecar",
+            7,
+        );
+        let NormalizedResult::Definitions { items, receipt } = result else {
+            panic!("decode failure must keep the definitions envelope");
+        };
+        assert!(items.is_empty());
+        assert!(matches!(
+            receipt.disposition,
+            FailureDisposition::ParseFailed { .. }
+        ));
+        assert!(matches!(receipt.freshness, Freshness::Stale { .. }));
+
+        let result = finalize_scip(
+            &config,
+            &owner,
+            &SemanticOperation::References {
+                symbol: "sym".to_owned(),
+            },
+            TRUNCATED_SCIP,
+            "sidecar",
+            7,
+        );
+        let NormalizedResult::References { items, receipt } = result else {
+            panic!("decode failure must keep the references envelope");
+        };
+        assert!(items.is_empty());
+        assert!(matches!(
+            receipt.disposition,
+            FailureDisposition::ParseFailed { .. }
+        ));
+
+        let result = finalize_scip(
+            &config,
+            &owner,
+            &SemanticOperation::Rename {
+                symbol: "sym".to_owned(),
+                new_name: "renamed".to_owned(),
+            },
+            TRUNCATED_SCIP,
+            "sidecar",
+            7,
+        );
+        let NormalizedResult::Rename { candidate, receipt } = result else {
+            panic!("decode failure must keep the rename envelope");
+        };
+        assert!(candidate.is_unapplied());
+        assert!(candidate.edits.is_empty());
+        assert!(matches!(
+            receipt.disposition,
+            FailureDisposition::ParseFailed { .. }
+        ));
+    }
+
+    #[test]
+    fn scip_unsupported_operation_preserves_operation_envelope() {
+        let config = scip_test_config();
+        let owner = test_candidate();
+        let result = finalize_scip(
+            &config,
+            &owner,
+            &SemanticOperation::Diagnostics,
+            &[],
+            "sidecar",
+            7,
+        );
+        let NormalizedResult::Diagnostics {
+            observations,
+            receipt,
+        } = result
+        else {
+            panic!("unsupported diagnostics must keep the diagnostics envelope");
+        };
+        assert!(observations.is_empty());
+        assert_eq!(
+            receipt.disposition,
+            FailureDisposition::UnsupportedOperation
+        );
+        assert!(matches!(receipt.freshness, Freshness::Stale { .. }));
+
+        let result = finalize_scip(
+            &config,
+            &owner,
+            &SemanticOperation::ProbeVersion,
+            &[],
+            "sidecar",
+            7,
+        );
+        let NormalizedResult::Version { version, receipt } = result else {
+            panic!("unsupported probe must keep the version envelope");
+        };
+        assert!(version.is_empty());
+        assert_eq!(
+            receipt.disposition,
+            FailureDisposition::UnsupportedOperation
+        );
+    }
+
+    #[test]
+    fn bound_exceeded_reports_truncation_not_parse_failure() {
+        for error in [
+            BridgeError::OutputTooLarge,
+            BridgeError::DiagnosticTooLarge,
+            BridgeError::TooManyRecords,
+        ] {
+            let (freshness, disposition) = normalize_failure("unused", &error);
+            assert_eq!(disposition, FailureDisposition::OutputTruncated);
+            assert!(matches!(freshness, Freshness::Stale { .. }));
+        }
+        let (_, disposition) = normalize_failure("reason", &BridgeError::MalformedVersion);
+        assert!(matches!(
+            disposition,
+            FailureDisposition::ParseFailed { .. }
+        ));
+
+        // End to end: more diagnostic lines than the record bound finalize as
+        // truncation with an empty observation set.
+        let mut big = String::new();
+        for i in 0..=MAX_NORMALIZED_RECORDS {
+            let _ = writeln!(
+                big,
+                "at crate c, file f.rs: Error \"E{i:05}\" from LineCol {{ line: 0, col: 0 }} to LineCol {{ line: 0, col: 1 }}: message {i}"
+            );
+        }
+        let config = test_config();
+        let owner = test_candidate();
+        let result = finalize_diagnostics(
+            &config,
+            &owner,
+            None,
+            big.as_bytes(),
+            false,
+            Some(0),
+            true,
+            7,
+        );
+        let NormalizedResult::Diagnostics {
+            observations,
+            receipt,
+        } = result
+        else {
+            panic!("expected diagnostics result");
+        };
+        assert!(observations.is_empty());
+        assert_eq!(receipt.disposition, FailureDisposition::OutputTruncated);
+        assert!(matches!(receipt.freshness, Freshness::Stale { .. }));
+    }
+
+    #[test]
+    fn symbol_scope_is_a_path_prefix() {
+        let index = eliot_instrument_scip::ScipIndex {
+            documents: vec![
+                eliot_instrument_scip::ScipDocument {
+                    relative_path: "src/main.rs".to_owned(),
+                    symbols: vec![eliot_instrument_scip::ScipSymbol {
+                        symbol: "sym-a".to_owned(),
+                        kind: 6,
+                        display_name: None,
+                        enclosing_symbol: None,
+                        relationships: Vec::new(),
+                    }],
+                    occurrences: vec![eliot_instrument_scip::ScipOccurrence {
+                        symbol: "sym-a".to_owned(),
+                        line: 0,
+                        column: 0,
+                        roles: SCIP_ROLE_DEFINITION,
+                    }],
+                },
+                eliot_instrument_scip::ScipDocument {
+                    relative_path: "other/main.rs".to_owned(),
+                    symbols: vec![eliot_instrument_scip::ScipSymbol {
+                        symbol: "sym-b".to_owned(),
+                        kind: 6,
+                        display_name: None,
+                        enclosing_symbol: None,
+                        relationships: Vec::new(),
+                    }],
+                    occurrences: vec![eliot_instrument_scip::ScipOccurrence {
+                        symbol: "sym-b".to_owned(),
+                        line: 0,
+                        column: 0,
+                        roles: SCIP_ROLE_DEFINITION,
+                    }],
+                },
+            ],
+        };
+        // A bare file name is contained in both paths but prefixes neither.
+        let scoped = project_symbols(&index, "main.rs").expect("prefix scope");
+        assert!(scoped.is_empty());
+        let scoped = project_symbols(&index, "src/").expect("prefix scope");
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].symbol, "sym-a");
+    }
+
+    #[test]
+    fn sidecar_read_round_trips_and_rejects_missing() {
+        let dir = std::env::temp_dir().join("eliot-lsp-bridge-sidecar-proof");
+        std::fs::create_dir_all(&dir).expect("sidecar dir");
+        let path = dir.join("index.scip");
+        let bytes = vec![0x12u8, 0x00];
+        std::fs::write(&path, &bytes).expect("sidecar write");
+        let path_text = path.to_str().expect("utf8 sidecar path");
+        let read = read_scip_sidecar(path_text).expect("sidecar read");
+        assert_eq!(read, bytes);
+        std::fs::remove_file(&path).expect("sidecar cleanup");
+        assert!(matches!(
+            read_scip_sidecar(path_text),
+            Err(BridgeError::SidecarUnreadable { .. })
+        ));
     }
 
     #[test]
