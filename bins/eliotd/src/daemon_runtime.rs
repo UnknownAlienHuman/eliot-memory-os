@@ -291,6 +291,35 @@ pub(super) fn run() -> Result<(), String> {
             .emit();
         }
     }
+    // #1882: non-gating startup reconciliation of installed Skill entries
+    // against the live canonical tool view. A fresh startup catalogue is
+    // empty, so this marks nothing today; the call binds the reconciliation
+    // path into the startup sequence and proves the live hook edge
+    // executes in the production binary. Once installs land, entries
+    // installed under an older registry whose tools left the canonical set
+    // are marked stale here, so a restart never revives a
+    // generally-delivered display for a removed tool without any display
+    // call reaching it. Skill delivery stays optional (A2.3):
+    // reconciliation failure degrades only the skill path, never daemon
+    // readiness. No thread, no transport, no `start()` contour or run-loop
+    // change.
+    match composition.skill_reconcile_tool_basis() {
+        Ok(marked) => {
+            tracing::info!(
+                target: "eliotd::diagnostics",
+                event = "eliotd.skill_tool_basis_reconciled",
+                marked_stale = marked,
+            );
+        }
+        Err(reason) => {
+            let _ = eliotd::diagnostics::ErrorRecord::of(
+                eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                "skill-tool-basis",
+                &reason.to_string(),
+            )
+            .emit();
+        }
+    }
     kernel.report_ready().map_err(|error| error.to_string())?;
     // I1.11 steps 8/9 (issue #1967): publish Governor startup evidence on
     // the authenticated daemon channel for the Kernel consumer. The producer

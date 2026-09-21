@@ -666,6 +666,7 @@ dependencies = [
  "eliot-observation-contracts",
  "eliot-process",
  "eliot-protocol",
+ "eliot-receipts",
  "eliot-skill",
  "eliot-types",
  "serde",
@@ -1748,6 +1749,7 @@ dependencies = [
  "eliot-skill",
  "eliot-store-api",
  "eliot-task",
+ "eliot-wasm-runtime",
  "eliot-workscope",
  "schemars",
  "serde",
@@ -2476,6 +2478,8 @@ dependencies = [
  "eliot-platform",
  "eliot-platform-windows",
  "eliot-process",
+ "eliot-wasm-runtime",
+ "serde_json",
  "sha2 0.10.9",
 ]
 
@@ -3025,7 +3029,16 @@ dependencies = [
 name = "eliot-wasm-host"
 version = "0.1.0"
 dependencies = [
+ "eliot-contracts",
+ "eliot-governor",
+ "eliot-observation-contracts",
+ "eliot-platform",
+ "eliot-process",
+ "eliot-process-executor",
+ "eliot-receipts",
  "eliot-runtime",
+ "eliot-runtime-contracts",
+ "eliot-security-contracts",
  "eliot-wasm-runtime",
  "thiserror",
  "wasmtime",

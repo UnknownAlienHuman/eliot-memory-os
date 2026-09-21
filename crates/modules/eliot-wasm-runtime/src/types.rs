@@ -461,7 +461,14 @@ pub struct ProcessBinding {
 }
 
 impl ProcessBinding {
-    pub(crate) fn from_request(request: &ProcessRequest) -> Self {
+    /// Derives the pipeline binding from a prepared request.
+    ///
+    /// The sealed pipeline calls this after `validate_process_binding`; the
+    /// P-03 owner lane calls the identical derivation in its independent
+    /// proof to obtain the binding its `cancel`/`reconcile`/verifier ports
+    /// consume. Deriving a binding grants nothing by itself: every use is
+    /// re-checked against the executor-minted receipt and the envelope.
+    pub fn from_request(request: &ProcessRequest) -> Self {
         Self {
             operation_id: request.operation_id().clone(),
             process_tree_id: request.process_tree_id().clone(),
