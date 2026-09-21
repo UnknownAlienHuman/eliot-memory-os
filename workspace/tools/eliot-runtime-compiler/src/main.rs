@@ -1,5 +1,5 @@
 use clap::Parser;
-use eliot_runtime_compiler::{CompileOptions, compile};
+use eliot_runtime_compiler::{CompileOptions, verify_legacy_d01};
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
@@ -34,8 +34,9 @@ fn main() {
         .or(args.bundle)
         .unwrap_or_else(|| PathBuf::from("."));
     let normative_root = args.normative_root.unwrap_or_else(|| runtime_root.clone());
-    // LEGACY_D01: compile() is the deprecated alias of verify_legacy_d01 (other half of this slice).
-    let receipt = compile(&CompileOptions {
+    // LEGACY_D01: the live CLI binds verify_legacy_d01 directly; `compile`
+    // remains only as the deprecated lib alias (retired from the live path).
+    let receipt = verify_legacy_d01(&CompileOptions {
         runtime_root,
         normative_root,
         repository: args.repository,
