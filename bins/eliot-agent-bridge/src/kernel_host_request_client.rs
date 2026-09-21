@@ -1081,6 +1081,95 @@ mod tests {
     }
 
     #[test]
+    fn user_automation_route_binds_capability_digest_and_reconcile_selector() {
+        let (base, facts, _) = test_envelope();
+        let mut value = serde_json::to_value(&base).expect("base request must serialize");
+        value["correlation_id"] = serde_json::json!("host-user-automation-1");
+        value["tool"] = serde_json::json!({
+            "name": "eliot_user_automation",
+            "arguments": {
+                "operation": {"kind": "list", "include_retired": false},
+                "idempotency_key": "operator-retry-1"
+            }
+        });
+        let request: HostInvocationRequest =
+            serde_json::from_value(value).expect("UserAutomation request must deserialize");
+        request
+            .validate()
+            .expect("UserAutomation request must validate");
+        assert_eq!(request.tool.canonical_name(), "eliot_user_automation");
+
+        let payload_digest = canonical_payload_digest(&request.tool)
+            .expect("UserAutomation payload digest must compute");
+        let envelope = build_invocation_envelope(
+            &request,
+            &facts,
+            "kernel-session-1",
+            &payload_digest,
+            1_000_000,
+        )
+        .expect("UserAutomation envelope must build");
+        assert_eq!(envelope.identity.capability, "eliot_user_automation");
+        assert_eq!(envelope.identity.payload_sha256, payload_digest);
+
+        let submit =
+            host_request_frame_for_envelope(AGENT_HOST_REQUEST_SUBMIT_OPERATION, &envelope, &facts)
+                .expect("UserAutomation submit frame must build");
+        let submit_payload = match &submit.payload {
+            ProtocolPayload::Json(payload) => payload,
+            _ => panic!("submit frame must carry JSON"),
+        };
+        assert_eq!(
+            submit_payload
+                .get("operation")
+                .and_then(|value| value.as_str()),
+            Some(AGENT_HOST_REQUEST_SUBMIT_OPERATION)
+        );
+        assert_eq!(
+            submit_payload
+                .pointer("/envelope/identity/capability")
+                .and_then(|value| value.as_str()),
+            Some("eliot_user_automation")
+        );
+        assert_eq!(
+            submit_payload
+                .pointer("/envelope/identity/payload_sha256")
+                .and_then(|value| value.as_str()),
+            Some(payload_digest.as_str())
+        );
+
+        let parent = ParentLink::of(&envelope);
+        let reconcile =
+            build_reconciliation_envelope(&facts, "kernel-session-1", &parent, 1_000_001)
+                .expect("UserAutomation reconciliation envelope must build");
+        assert_eq!(reconcile.identity.capability, "eliot_user_automation");
+        assert_eq!(
+            reconcile.identity.payload_sha256,
+            envelope.identity.payload_sha256
+        );
+        let reconcile_frame = host_request_frame_for_envelope(
+            AGENT_HOST_REQUEST_RECONCILE_OPERATION,
+            &reconcile,
+            &facts,
+        )
+        .expect("UserAutomation reconciliation frame must build");
+        let reconcile_payload = match &reconcile_frame.payload {
+            ProtocolPayload::Json(payload) => payload,
+            _ => panic!("reconciliation frame must carry JSON"),
+        };
+        assert_eq!(
+            reconcile_payload
+                .get("operation")
+                .and_then(|value| value.as_str()),
+            Some(AGENT_HOST_REQUEST_RECONCILE_OPERATION)
+        );
+        assert_eq!(
+            reconcile.identity.parent_operation_id.as_deref(),
+            Some(parent.handle.as_str())
+        );
+    }
+
+    #[test]
     fn foreign_or_malformed_cancel_handle_rejected_without_wire() {
         let (_, _, envelope) = test_envelope();
         let handle = host_request_operation_id(&envelope);

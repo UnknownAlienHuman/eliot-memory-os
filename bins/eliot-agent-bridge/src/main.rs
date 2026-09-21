@@ -823,7 +823,8 @@ fn dry_run_invoke_plan(tool: &ToolRequest) -> (&'static str, &'static str, &'sta
         | ToolRequest::Act(_)
         | ToolRequest::Verify(_)
         | ToolRequest::Coordinate(_)
-        | ToolRequest::Finish(_) => (
+        | ToolRequest::Finish(_)
+        | ToolRequest::UserAutomation(_) => (
             "effectful",
             DRY_RUN_ROUTE_WITHHELD,
             DRY_RUN_UNSUPPORTED_DISPOSITION,
