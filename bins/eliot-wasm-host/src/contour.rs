@@ -21,6 +21,12 @@
 //! - [`admit_prototype`] is the prototype-admission gate: a prototype without
 //!   a contour decision is rejected before anything else. [`check_activation_imports`]
 //!   rejects undeclared imports pre-activation, before any instantiation.
+//! - [`admit_generation`] composes the full pre-activation sequence into one
+//!   actual admission, binding the admitted contour, world, target, and
+//!   digests into an [`AdmittedGeneration`] that dispatch sites match
+//!   against. The WASM host serves only [`Contour::WasmComponent`]; any
+//!   other admitted contour is refused with
+//!   [`ContourGateError::ContourNotServedHere`], never executed here.
 //!
 //! Baseline identities: pinned Wasmtime generation
 //! ([`PINNED_WASMTIME_VERSION`]), production guest target
@@ -294,6 +300,10 @@ pub enum ContourGateError {
     GovernorAuthorizationRequired(String),
     /// Proposal exceeds the generation limit envelope.
     HostCallLimitExceeded(String),
+    /// Admitted non-WASM contour presented to this host. `eliot-wasm-host`
+    /// serves only the WASM component contour; any other admitted contour
+    /// must be refused at dispatch, never executed here.
+    ContourNotServedHere(String),
 }
 
 impl fmt::Display for ContourGateError {
@@ -317,6 +327,9 @@ impl fmt::Display for ContourGateError {
             }
             Self::HostCallLimitExceeded(reason) => {
                 write!(formatter, "HOST_CALL_LIMIT_EXCEEDED:{reason}")
+            }
+            Self::ContourNotServedHere(contour) => {
+                write!(formatter, "CONTOUR_NOT_SERVED_HERE:{contour}")
             }
         }
     }
@@ -409,6 +422,79 @@ pub fn check_activation_imports(
         }
     }
     Ok(())
+}
+
+/// Bound admission evidence for one prototype generation.
+///
+/// Constructible only through [`admit_generation`], which runs the full
+/// pre-activation sequence (decision presence, contour rationale and
+/// first-contour rule, manifest baseline validation, actual-import
+/// declaration and grant checks) before binding. Field privacy means a
+/// value of this type proves the sequence ran; callers read the bound
+/// identities through the accessors below.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdmittedGeneration {
+    contour: Contour,
+    world: String,
+    target: String,
+    artifact_digest: Sha256Digest,
+    wit_digest: Sha256Digest,
+}
+
+impl AdmittedGeneration {
+    /// Admitted execution contour. Only [`Contour::WasmComponent`] is
+    /// served by this host; any other value must be refused at dispatch.
+    #[must_use]
+    pub const fn contour(&self) -> &Contour {
+        &self.contour
+    }
+
+    /// Admitted world name bound from the validated manifest.
+    #[must_use]
+    pub fn world(&self) -> &str {
+        &self.world
+    }
+
+    /// Admitted guest target bound from the validated manifest.
+    #[must_use]
+    pub fn target(&self) -> &str {
+        &self.target
+    }
+
+    /// Artifact digest bound from the validated manifest.
+    #[must_use]
+    pub const fn artifact_digest(&self) -> &Sha256Digest {
+        &self.artifact_digest
+    }
+
+    /// WIT digest bound from the validated manifest.
+    #[must_use]
+    pub const fn wit_digest(&self) -> &Sha256Digest {
+        &self.wit_digest
+    }
+}
+
+/// Actual contour admission: the full pre-activation sequence in one entry
+/// point. A prototype without a contour decision is rejected before
+/// anything else is inspected; the contour rationale and first-contour rule
+/// apply next; then the manifest baseline; then every actual component
+/// import observed before instantiation. Success binds the admitted
+/// contour, world, target, and digests into an [`AdmittedGeneration`] that
+/// dispatch sites match against before serving.
+pub fn admit_generation(
+    decision: Option<&PrototypeContourDecision>,
+    manifest: &GenerationManifest,
+    actual_imports: &[String],
+) -> Result<AdmittedGeneration, ContourGateError> {
+    let admitted = admit_prototype(decision, manifest)?;
+    check_activation_imports(manifest, actual_imports)?;
+    Ok(AdmittedGeneration {
+        contour: admitted.contour,
+        world: admitted.world,
+        target: admitted.target,
+        artifact_digest: manifest.artifact_digest.clone(),
+        wit_digest: manifest.wit_digest.clone(),
+    })
 }
 
 /// Authorizes one host-call proposal under the manifest grant and Governor
@@ -705,5 +791,80 @@ mod tests {
                 "input-bytes".to_owned()
             ))
         );
+    }
+
+    #[test]
+    fn admission_binds_contour_world_target_and_digests() {
+        let decision = PrototypeContourDecision::default();
+        let manifest = closed_manifest();
+        let admitted = match admit_generation(Some(&decision), &manifest, &[]) {
+            Ok(admitted) => admitted,
+            Err(error) => panic!("admission failed: {error:?}"),
+        };
+        assert_eq!(admitted.contour(), &Contour::WasmComponent);
+        assert_eq!(admitted.world(), "context-admission");
+        assert_eq!(admitted.target(), STANDARD_GUEST_TARGET);
+        assert_eq!(
+            admitted.artifact_digest(),
+            &Sha256Digest::of_bytes(b"fixture-component")
+        );
+        assert_eq!(admitted.wit_digest(), &typed_wit_digest());
+    }
+
+    #[test]
+    fn admission_rejects_in_gate_order() {
+        let manifest = closed_manifest();
+        // Missing decision wins over every other defect.
+        let mut broken = manifest.clone();
+        broken.target = "wasm32-wasip1".to_owned();
+        assert_eq!(
+            admit_generation(None, &broken, &[]),
+            Err(ContourGateError::MissingDecision)
+        );
+        // Static native is rejected even with a valid manifest.
+        let decision = PrototypeContourDecision::default();
+        let static_native = PrototypeContourDecision {
+            contour: Contour::StaticNative,
+            rationale: Some("hot path".to_owned()),
+        };
+        assert_eq!(
+            admit_generation(Some(&static_native), &manifest, &[]),
+            Err(ContourGateError::StaticNativeNotFirstContour)
+        );
+        // Undeclared actual imports fail the composed admission.
+        assert_eq!(
+            admit_generation(
+                Some(&decision),
+                &manifest,
+                &["wasi:filesystem/types".to_owned()]
+            ),
+            Err(ContourGateError::UndeclaredImport(
+                "wasi:filesystem/types".to_owned()
+            ))
+        );
+        // A bare native decision without rationale fails the composer.
+        let bare_native = PrototypeContourDecision {
+            contour: Contour::IsolatedNativeProcess,
+            rationale: None,
+        };
+        assert_eq!(
+            admit_generation(Some(&bare_native), &manifest, &[]),
+            Err(ContourGateError::NativeReasonRequired)
+        );
+    }
+
+    #[test]
+    fn native_admission_records_reason_for_dispatch() {
+        let manifest = closed_manifest();
+        let native = match PrototypeContourDecision::select_native_process("needs raw USB scan") {
+            Ok(decision) => decision,
+            Err(error) => panic!("native decision failed: {error:?}"),
+        };
+        let admitted = match admit_generation(Some(&native), &manifest, &[]) {
+            Ok(admitted) => admitted,
+            Err(error) => panic!("native admission failed: {error:?}"),
+        };
+        assert_eq!(admitted.contour(), &Contour::IsolatedNativeProcess);
+        assert_eq!(admitted.world(), "context-admission");
     }
 }
