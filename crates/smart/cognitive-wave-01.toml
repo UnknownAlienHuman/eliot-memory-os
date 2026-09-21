@@ -331,3 +331,297 @@ activation = "Researcher-owned ResearchPack, Evidence Grade, evidence freeze, pr
 [[deferred]]
 capability = "D3c structural/causal depth"
 activation = "accepted exact code, behavioral and causal projections plus demonstrated Product Pulse value"
+
+# Issue #816 topology reconciliation.  These rows are an additive, stable
+# identity layer over the historical assignment table above.  They preserve
+# the existing order numbers while making the A-19 Context/Curation collision
+# explicit through assignment_id + track.
+[topology]
+issue = 816
+schema_version = 1
+authority_base = "9e3562df010fb0c0aa9bceebb7db2245cf181ca1"
+status = "STATIC_METADATA_ONLY"
+proof_ceiling = "TOPOLOGY_METADATA_AND_REGRESSION_GUARD"
+metadata_only = true
+runtime_completion = false
+product_acceptance = false
+write_authority = "NONE"
+wire_source = "I09.6"
+existing_wave_assignment_rows = 31
+existing_decision_rows = 43
+
+[[topology_assignment]]
+assignment_id = "A-03"
+track = "Dreamer"
+agent_order = 3
+issue = 578
+issue_refs = [578, 1292]
+crate = "eliot-dreamer-contracts"
+module_id = "smart.dreamer.contracts"
+manifest = "crates/smart/eliot-dreamer-contracts/module.toml"
+role = "provider_neutral_contract_hub"
+kind = "support_contract"
+
+[[topology_assignment]]
+assignment_id = "A-05"
+track = "Dreamer"
+agent_order = 5
+issue = 595
+issue_refs = [595]
+crate = "eliot-dreamer-candidate-validation"
+module_id = "smart.dreamer.candidate_validation"
+manifest = "crates/smart/eliot-dreamer-candidate-validation/module.toml"
+role = "single_pre_handler_validation_gate"
+kind = "support_gate"
+
+[[topology_assignment]]
+assignment_id = "A-06e"
+track = "Epistemic"
+agent_order = 6
+issue = 580
+issue_refs = [580]
+crate = "eliot-epistemic-contracts"
+module_id = "smart.epistemic.contracts"
+manifest = "crates/smart/eliot-epistemic-contracts/module.toml"
+role = "current_epistemic_position_contract"
+kind = "support_contract"
+
+[[topology_assignment]]
+assignment_id = "A-10"
+track = "Cue"
+agent_order = 10
+issue = 804
+issue_refs = [804]
+crate = "eliot-cue-contracts"
+module_id = "smart.cue.contracts"
+manifest = "crates/smart/eliot-cue-contracts/module.toml"
+role = "provider_neutral_cue_contract"
+kind = "support_contract"
+
+[[topology_assignment]]
+assignment_id = "A-14a"
+track = "Cue"
+agent_order = 14
+issue = 600
+issue_refs = [600]
+crate = "eliot-cue-activation"
+module_id = "smart.cue.activation"
+manifest = "crates/smart/eliot-cue-activation/module.toml"
+role = "bounded_cue_activation_producer"
+kind = "support_producer"
+
+[[topology_assignment]]
+assignment_id = "A-15"
+track = "Context"
+agent_order = 15
+issue = 584
+issue_refs = [584]
+crate = "eliot-context-contracts"
+module_id = "smart.context.contracts"
+manifest = "crates/smart/eliot-context-contracts/module.toml"
+role = "context_contract_and_measurement_port"
+kind = "context_stage"
+
+[[topology_assignment]]
+assignment_id = "A-16a"
+track = "Context"
+agent_order = 16
+issue = 604
+issue_refs = [604]
+crate = "eliot-context-candidates"
+module_id = "smart.context.candidates"
+manifest = "crates/smart/eliot-context-candidates/module.toml"
+role = "whole_context_candidate_projection"
+kind = "context_stage"
+
+[[topology_assignment]]
+assignment_id = "A-17a"
+track = "Context"
+agent_order = 17
+issue = 608
+issue_refs = [608]
+crate = "eliot-context-admission"
+module_id = "smart.context.admission"
+manifest = "crates/smart/eliot-context-admission/module.toml"
+role = "sole_context_membership_admission"
+kind = "context_stage"
+
+[[topology_assignment]]
+assignment_id = "A-18"
+track = "Context"
+agent_order = 18
+issue = 626
+issue_refs = [626]
+crate = "eliot-context-assembly"
+module_id = "smart.context.assembly"
+manifest = "crates/smart/eliot-context-assembly/module.toml"
+role = "admitted_context_view_assembly"
+kind = "context_stage"
+
+[[topology_assignment]]
+assignment_id = "A-19r"
+track = "Context"
+agent_order = 19
+issue = 612
+issue_refs = [612]
+crate = "eliot-reactive-context-plan"
+module_id = "smart.context.reactive_delivery_plan"
+manifest = "crates/smart/eliot-reactive-context-plan/module.toml"
+role = "session_bound_reactive_context_plan"
+kind = "context_stage"
+
+[[topology_assignment]]
+assignment_id = "A-19c"
+track = "Curation"
+agent_order = 19
+issue = 586
+issue_refs = [586]
+crate = "eliot-memory-curation-contracts"
+module_id = "smart.memory.curation_contracts"
+manifest = "crates/smart/eliot-memory-curation-contracts/module.toml"
+role = "read_only_curation_screen_contract"
+kind = "curation_stage"
+
+[[topology_assignment]]
+assignment_id = "A-20"
+track = "Curation"
+agent_order = 20
+issue = 588
+issue_refs = [588]
+crate = "eliot-memory-curation-screen"
+module_id = "smart.memory.curation_screen"
+manifest = "crates/smart/eliot-memory-curation-screen/module.toml"
+role = "protection_first_curation_screen"
+kind = "curation_stage"
+
+[[topology_assignment]]
+assignment_id = "A-21"
+track = "Curation"
+agent_order = 21
+issue = 653
+issue_refs = [653]
+crate = "eliot-dreamer-classification"
+module_id = "smart.dreamer.classification"
+manifest = "crates/smart/eliot-dreamer-classification/module.toml"
+role = "classification_candidate_handler"
+kind = "curation_handler"
+
+[[topology_assignment]]
+assignment_id = "A-22"
+track = "Curation"
+agent_order = 22
+issue = 655
+issue_refs = [655]
+crate = "eliot-dreamer-relation"
+module_id = "smart.dreamer.relation"
+manifest = "crates/smart/eliot-dreamer-relation/module.toml"
+role = "relation_candidate_handler"
+kind = "curation_handler"
+
+[[topology_assignment]]
+assignment_id = "A-23"
+track = "Curation"
+agent_order = 23
+issue = 657
+issue_refs = [657]
+crate = "eliot-dreamer-episode"
+module_id = "smart.dreamer.episode"
+manifest = "crates/smart/eliot-dreamer-episode/module.toml"
+role = "episode_candidate_handler"
+kind = "curation_handler"
+
+[[topology_assignment]]
+assignment_id = "A-24"
+track = "Curation"
+agent_order = 24
+issue = 659
+issue_refs = [659]
+crate = "eliot-dreamer-concept"
+module_id = "smart.dreamer.concept"
+manifest = "crates/smart/eliot-dreamer-concept/module.toml"
+role = "concept_candidate_handler"
+kind = "curation_handler"
+
+[[topology_assignment]]
+assignment_id = "A-25"
+track = "Curation"
+agent_order = 25
+issue = 661
+issue_refs = [661]
+crate = "eliot-dreamer-procedure"
+module_id = "smart.dreamer.procedure"
+manifest = "crates/smart/eliot-dreamer-procedure/module.toml"
+role = "procedure_candidate_handler"
+kind = "curation_handler"
+
+[[topology_assignment]]
+assignment_id = "A-26"
+track = "Curation"
+agent_order = 26
+issue = 663
+issue_refs = [663]
+crate = "eliot-dreamer-failure"
+module_id = "smart.dreamer.failure"
+manifest = "crates/smart/eliot-dreamer-failure/module.toml"
+role = "failure_candidate_handler"
+kind = "curation_handler"
+
+[[topology_assignment]]
+assignment_id = "A-27"
+track = "Curation"
+agent_order = 27
+issue = 665
+issue_refs = [665]
+crate = "eliot-dreamer-structure-repair"
+module_id = "smart.dreamer.structure_repair"
+manifest = "crates/smart/eliot-dreamer-structure-repair/module.toml"
+role = "merge_split_structure_repair_handler"
+kind = "curation_handler"
+
+[[topology_assignment]]
+assignment_id = "A-28"
+track = "Curation"
+agent_order = 28
+issue = 667
+issue_refs = [667]
+crate = "eliot-dreamer-reconsolidation"
+module_id = "smart.dreamer.reconsolidation"
+manifest = "crates/smart/eliot-dreamer-reconsolidation/module.toml"
+role = "reconsolidation_candidate_handler"
+kind = "curation_handler"
+
+[[topology_assignment]]
+assignment_id = "A-29"
+track = "Curation"
+agent_order = 29
+issue = 669
+issue_refs = [669]
+crate = "eliot-dreamer-accessibility"
+module_id = "smart.dreamer.accessibility"
+manifest = "crates/smart/eliot-dreamer-accessibility/module.toml"
+role = "accessibility_candidate_handler"
+kind = "curation_handler"
+
+[[topology_assignment]]
+assignment_id = "A-30"
+track = "Curation"
+agent_order = 30
+issue = 671
+issue_refs = [671]
+crate = "eliot-dreamer-memory-repair"
+module_id = "smart.dreamer.memory_repair"
+manifest = "crates/smart/eliot-dreamer-memory-repair/module.toml"
+role = "memory_repair_candidate_handler"
+kind = "curation_handler"
+
+[[topology_assignment]]
+assignment_id = "A-31"
+track = "Curation"
+agent_order = 31
+issue = 684
+issue_refs = [684]
+crate = "eliot-dreamer-curation"
+module_id = "smart.dreamer.curation"
+manifest = "crates/smart/eliot-dreamer-curation/module.toml"
+role = "screened_exact_one_handler_fan_in"
+kind = "curation_stage"
