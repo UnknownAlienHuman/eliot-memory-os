@@ -42,6 +42,23 @@
 //! - quarantine, recovery, and re-publication directives stay with their
 //!   owners; this cell only names the disposition, it never executes recovery.
 //!
+//! Caller integration (exact owner handoff; no runtime path yet):
+//!
+//! - `evaluate_freshness_admission` is owned for the `eliotd` semantic
+//!   admission path that promotes reusable candidates. The owning caller must
+//!   thread one [`ReusableCandidateView`] per candidate and grant hot/reusable
+//!   promotion only when the verdict carries `CURRENT` with
+//!   `reusable_promotion_allowed`; any other disposition refuses promotion
+//!   while the permitted safe raw observation stays cold.
+//! - `fetch_committed_candidate` is owned for the exact-handle fetch path and
+//!   its hot-path / Material-decision gates. The owning caller must thread
+//!   the known committed identities plus the observed
+//!   [`ProjectionPublicationRecord`] values and refuse hot firing and
+//!   Material support unless the outcome is `CommittedCurrent`.
+//! - No such callers exist in `eliotd` yet. Until the owning admission/fetch
+//!   paths thread these values, this cell proves the gate logic only and
+//!   claims no runtime admission, persistence, or publication behavior.
+//!
 //! Like the neighboring admission joins, this helper never mints admission:
 //! it evaluates presented values and returns a disposition.
 
@@ -113,7 +130,16 @@ impl RevisionHead {
 /// Normalizes heads into scope-sorted, deduplicated order.
 ///
 /// Normalization is structural: the same observed set always yields the same
-/// sequence, so admission compares values instead of arrival order.
+/// sequence, so admission compares values instead of arrival order. Identical
+/// records collapse deterministically; conflicting revisions for one scope are
+/// rejected, because a scope with two simultaneous revisions is ambiguous
+/// evidence that must fail closed instead of silently overwriting in a
+/// scope map.
+///
+/// # Errors
+///
+/// Returns [`FreshnessError`] when any head is malformed or when one scope
+/// carries two different revisions.
 pub fn normalize_heads(heads: &[RevisionHead]) -> Result<Vec<RevisionHead>, FreshnessError> {
     for head in heads {
         head.validate()?;
@@ -121,6 +147,16 @@ pub fn normalize_heads(heads: &[RevisionHead]) -> Result<Vec<RevisionHead>, Fres
     let mut normalized: Vec<RevisionHead> = heads.to_vec();
     normalized.sort();
     normalized.dedup();
+    let mut prior_scope: Option<&str> = None;
+    for head in &normalized {
+        if prior_scope == Some(head.scope.as_str()) {
+            return Err(invalid(format!(
+                "conflicting revisions for scope '{}'",
+                head.scope
+            )));
+        }
+        prior_scope = Some(head.scope.as_str());
+    }
     Ok(normalized)
 }
 
@@ -260,18 +296,41 @@ fn heads_by_scope(heads: &[RevisionHead]) -> BTreeMap<&str, &str> {
     map
 }
 
+/// Builds a scope map that refuses conflicting revisions.
+///
+/// Normalized inputs (see [`normalize_heads`]) never conflict; this checked
+/// form guards boolean currency decisions taken over raw threaded slices, so
+/// a conflict fails closed to "not current" instead of silently overwriting.
+fn heads_by_scope_checked(heads: &[RevisionHead]) -> Option<BTreeMap<&str, &str>> {
+    let mut map = BTreeMap::new();
+    for head in heads {
+        match map.insert(head.scope.as_str(), head.revision.as_str()) {
+            Some(prior) if prior != head.revision.as_str() => return None,
+            _ => {}
+        }
+    }
+    Some(map)
+}
+
 /// Evaluates normalized freshness admission for one reusable candidate.
 ///
 /// Order is load-bearing and fail-closed: unresolved provenance or task
-/// mismatch yields `INCOMPLETE` before any revision comparison; a pinned
-/// scope moved by the candidate's own commit yields `SELF_INVALIDATING`; a
-/// pinned scope the candidate does not advance but observed moved yields
-/// `EXTERNAL_REVISION_RACE`; otherwise the candidate is `CURRENT`.
+/// mismatch yields `INCOMPLETE` before any revision comparison; an empty
+/// pinned denominator yields `INCOMPLETE` because it cannot prove the
+/// predicate is independent of source revisions; a pinned scope without
+/// complete unambiguous base, expected, and observed evidence yields
+/// `INCOMPLETE` (a missing head is not agreement); a pinned scope moved by
+/// the candidate's own commit yields `SELF_INVALIDATING`; a pinned scope the
+/// candidate does not advance but observed moved yields
+/// `EXTERNAL_REVISION_RACE`; otherwise the candidate is `CURRENT`. Rejected
+/// promotion keeps the permitted safe raw observation cold via
+/// `cold_raw_retained`.
 ///
 /// # Errors
 ///
 /// Returns [`FreshnessError`] when any identity, fence, predicate form, or
-/// head is malformed. Malformed input admits nothing and promotes nothing.
+/// head is malformed, or when one scope carries conflicting revisions.
+/// Malformed input admits nothing and promotes nothing.
 pub fn evaluate_freshness_admission(
     candidate: &ReusableCandidateView,
 ) -> Result<FreshnessEvaluation, FreshnessError> {
@@ -292,6 +351,10 @@ pub fn evaluate_freshness_admission(
         || candidate.task != TaskCompatibility::Compatible
     {
         FreshnessDisposition::Incomplete
+    } else if candidate.predicate_pinned_scopes.is_empty() {
+        // No declared pinned dependency can prove the predicate needs none,
+        // so freshness is unestablished: vacuous promotion is forbidden.
+        FreshnessDisposition::Incomplete
     } else {
         let base_map = heads_by_scope(&base);
         let expected_map = heads_by_scope(&expected);
@@ -299,14 +362,19 @@ pub fn evaluate_freshness_admission(
         let mut disposition = FreshnessDisposition::Current;
         for scope in &candidate.predicate_pinned_scopes {
             let scope = scope.as_str();
-            let base_revision = base_map.get(scope).copied();
-            let expected_revision = expected_map.get(scope).copied();
-            let observed_revision = observed_map.get(scope).copied();
+            let (Some(base_revision), Some(expected_revision), Some(observed_revision)) = (
+                base_map.get(scope).copied(),
+                expected_map.get(scope).copied(),
+                observed_map.get(scope).copied(),
+            ) else {
+                disposition = FreshnessDisposition::Incomplete;
+                break;
+            };
             if expected_revision != base_revision {
                 disposition = FreshnessDisposition::SelfInvalidating;
                 break;
             }
-            if observed_revision.is_some() && observed_revision != base_revision {
+            if observed_revision != base_revision {
                 disposition = FreshnessDisposition::ExternalRevisionRace;
                 break;
             }
@@ -439,15 +507,19 @@ impl ProjectionPublicationRecord {
     /// True when this record makes the candidate's projection current.
     ///
     /// Currency requires all of: status `CURRENT`, exact projection kind,
-    /// exact definition digest, exact source fence, coverage of every
-    /// candidate source head at the same revision, and a non-blank atomic
-    /// data/provenance receipt. Partial provenance, a stale definition, or a
-    /// mismatched fence leaves the projection pending/stale.
+    /// exact projection definition digest, exact dependency definition digest,
+    /// exact source fence, a non-empty candidate head set with no conflicting
+    /// revisions, coverage of every candidate source head at the same
+    /// revision, and a non-blank atomic data/provenance receipt. Partial
+    /// provenance, a stale definition, rebuilt dependencies, a mismatched
+    /// fence, or an empty/conflicting head set leaves the projection
+    /// pending/stale. An empty head set never counts as coverage.
     #[must_use]
     pub fn is_current_for(
         &self,
         candidate_kind: &str,
         candidate_definition_digest: &str,
+        candidate_dependency_digest: &str,
         candidate_source_fence: &str,
         candidate_source_heads: &[RevisionHead],
     ) -> bool {
@@ -460,13 +532,24 @@ impl ProjectionPublicationRecord {
         if self.projection_definition_digest != candidate_definition_digest {
             return false;
         }
+        if self.dependency_definition_digest != candidate_dependency_digest {
+            return false;
+        }
         if self.source_fence != candidate_source_fence {
             return false;
         }
         if self.atomic_data_provenance_receipt.trim().is_empty() {
             return false;
         }
-        let published = heads_by_scope(&self.source_revision_heads);
+        if candidate_source_heads.is_empty() {
+            return false;
+        }
+        let Some(published) = heads_by_scope_checked(&self.source_revision_heads) else {
+            return false;
+        };
+        if heads_by_scope_checked(candidate_source_heads).is_none() {
+            return false;
+        }
         candidate_source_heads.iter().all(|head| {
             published
                 .get(head.scope.as_str())
@@ -490,6 +573,10 @@ pub struct CommittedCandidate {
     pub projection_kind: String,
     /// Projection definition digest the candidate was committed against.
     pub projection_definition_digest: String,
+    /// Digest of the dependency definitions the candidate was committed
+    /// against. Currency requires the publication to be built from the same
+    /// dependencies (I5.8); a bare definition match is not enough.
+    pub dependency_definition_digest: String,
     /// Source fence the candidate was committed at.
     pub source_fence: String,
     /// Source revision heads the candidate was committed at.
@@ -501,7 +588,7 @@ impl CommittedCandidate {
     ///
     /// # Errors
     ///
-    /// Returns [`FreshnessError`] when the handle, receipt, kind, digest,
+    /// Returns [`FreshnessError`] when the handle, receipt, kind, digests,
     /// fence, or any head is malformed.
     pub fn validate(&self) -> Result<(), FreshnessError> {
         check_identity("candidate handle", &self.handle, 512)?;
@@ -510,6 +597,11 @@ impl CommittedCandidate {
         check_identity(
             "projection definition digest",
             &self.projection_definition_digest,
+            512,
+        )?;
+        check_identity(
+            "dependency definition digest",
+            &self.dependency_definition_digest,
             512,
         )?;
         check_identity("source fence", &self.source_fence, 512)?;
@@ -583,6 +675,7 @@ pub fn fetch_committed_candidate(
         publication.is_current_for(
             &candidate.projection_kind,
             &candidate.projection_definition_digest,
+            &candidate.dependency_definition_digest,
             &candidate.source_fence,
             &candidate.source_revision_heads,
         )
@@ -629,6 +722,7 @@ mod tests {
             durability_receipt: "receipt-commit-1".to_owned(),
             projection_kind: "cue-index".to_owned(),
             projection_definition_digest: "def-digest-1".to_owned(),
+            dependency_definition_digest: "dep-digest-1".to_owned(),
             source_fence: "fence-epoch-1/gen-1".to_owned(),
             source_revision_heads: vec![head("cue-index", "rev-7")],
         }
@@ -671,6 +765,112 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn normalize_heads_rejects_conflicting_scope_revisions() -> Result<(), FreshnessError> {
+        // Identical records collapse deterministically.
+        let normalized = normalize_heads(&[
+            head("cue-index", "rev-7"),
+            head("context-graph", "rev-3"),
+            head("cue-index", "rev-7"),
+        ])?;
+        assert_eq!(
+            normalized,
+            vec![head("context-graph", "rev-3"), head("cue-index", "rev-7")]
+        );
+        // Conflicting revisions for one scope fail closed instead of
+        // silently overwriting in a scope map.
+        assert!(
+            normalize_heads(&[head("cue-index", "rev-7"), head("cue-index", "rev-8")]).is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn missing_pinned_evidence_is_incomplete_without_promotion() -> Result<(), FreshnessError> {
+        // Observed head missing for the pinned scope: not agreement, INCOMPLETE.
+        let mut view = candidate_view();
+        view.observed_source_heads = vec![head("context-graph", "rev-3")];
+        let evaluation = evaluate_freshness_admission(&view)?;
+        assert_eq!(
+            evaluation.admission.disposition,
+            FreshnessDisposition::Incomplete
+        );
+        assert!(!evaluation.reusable_promotion_allowed);
+        assert!(evaluation.cold_raw_retained);
+
+        // Base head missing for the pinned scope: INCOMPLETE, never CURRENT.
+        let mut view = candidate_view();
+        view.base_revision_heads = vec![head("context-graph", "rev-3")];
+        let evaluation = evaluate_freshness_admission(&view)?;
+        assert_eq!(
+            evaluation.admission.disposition,
+            FreshnessDisposition::Incomplete
+        );
+        assert!(!evaluation.reusable_promotion_allowed);
+
+        // Expected head missing for the pinned scope: INCOMPLETE.
+        let mut view = candidate_view();
+        view.expected_post_commit_revision_heads = vec![head("context-graph", "rev-3")];
+        let evaluation = evaluate_freshness_admission(&view)?;
+        assert_eq!(
+            evaluation.admission.disposition,
+            FreshnessDisposition::Incomplete
+        );
+        assert!(!evaluation.reusable_promotion_allowed);
+        Ok(())
+    }
+
+    #[test]
+    fn empty_pinned_denominator_is_incomplete_not_current() -> Result<(), FreshnessError> {
+        // No declared pinned dependency can prove the predicate needs none:
+        // vacuous CURRENT is forbidden.
+        let mut view = candidate_view();
+        view.predicate_pinned_scopes = Vec::new();
+        let evaluation = evaluate_freshness_admission(&view)?;
+        assert_eq!(
+            evaluation.admission.disposition,
+            FreshnessDisposition::Incomplete
+        );
+        assert_eq!(evaluation.admission.disposition.as_str(), "INCOMPLETE");
+        assert!(!evaluation.reusable_promotion_allowed);
+        assert!(evaluation.cold_raw_retained);
+        Ok(())
+    }
+
+    #[test]
+    fn dependency_digest_mismatch_stays_pending() -> Result<(), FreshnessError> {
+        // Definition matches but dependencies were rebuilt: no current or
+        // Material support through a bare definition match.
+        let committed = vec![committed_candidate()];
+        let mut publication = current_publication();
+        publication.dependency_definition_digest = "dep-digest-2".to_owned();
+        let outcome = fetch_committed_candidate("candidate-1", &committed, &[publication])?;
+        assert_eq!(outcome, CandidateFetchOutcome::CommittedProjectionPending);
+        assert_eq!(outcome.as_str(), CANDIDATE_COMMITTED_PROJECTION_PENDING);
+        assert!(!outcome.supports_material_decision());
+        assert!(!outcome.hot_path_activatable());
+        Ok(())
+    }
+
+    #[test]
+    fn empty_or_conflicting_candidate_heads_never_current() -> Result<(), FreshnessError> {
+        let publications = vec![current_publication()];
+        // Empty head set is not coverage: vacuous all() must not promote.
+        let mut candidate = committed_candidate();
+        candidate.source_revision_heads = Vec::new();
+        let outcome = fetch_committed_candidate("candidate-1", &[candidate], &publications)?;
+        assert_eq!(outcome, CandidateFetchOutcome::CommittedProjectionPending);
+        assert!(!outcome.supports_material_decision());
+
+        // Conflicting candidate heads are malformed evidence: the fetch fails
+        // closed with an error, which likewise can never obtain current or
+        // Material support.
+        let mut candidate = committed_candidate();
+        candidate.source_revision_heads =
+            vec![head("cue-index", "rev-7"), head("cue-index", "rev-8")];
+        assert!(fetch_committed_candidate("candidate-1", &[candidate], &publications).is_err());
+        Ok(())
+    }
     #[test]
     fn committed_candidate_before_publication_returns_pending_and_cannot_support_material()
     -> Result<(), FreshnessError> {
