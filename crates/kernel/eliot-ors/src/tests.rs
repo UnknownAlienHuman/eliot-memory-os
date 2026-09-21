@@ -46,23 +46,30 @@ fn test_epoch(sequence: u64) -> EpochId {
 
 static NEXT_DATABASE: AtomicU64 = AtomicU64::new(1);
 
-struct TestCanonicalEvidence;
+/// Provider for operational-surface projection tests (appendix P4).
+///
+/// Delegates every shared check to the single [`crate::test_support::KernelRouteEvidence`]
+/// binding instead of redefining it: only recovery-inbox import diverges, which
+/// the Kernel route never authenticates by design but the surface projection
+/// must stage as data. Receipt disposition on those staged items still runs
+/// through the shared structural receipt check.
+struct SurfaceProjectionEvidence;
 
-impl CanonicalEvidenceProvider for TestCanonicalEvidence {
-    fn verify_ordering_heads(&self, _scopes: &[ScopeReservationRequest]) -> Result<(), OrsError> {
-        Ok(())
+impl CanonicalEvidenceProvider for SurfaceProjectionEvidence {
+    fn verify_ordering_heads(&self, scopes: &[ScopeReservationRequest]) -> Result<(), OrsError> {
+        crate::test_support::KernelRouteEvidence.verify_ordering_heads(scopes)
     }
 
     fn verify_reconciliation(
         &self,
-        _token: &WriterReservationToken,
-        _reconciliation: &CanonicalReconciliation,
+        token: &WriterReservationToken,
+        reconciliation: &CanonicalReconciliation,
     ) -> Result<(), OrsError> {
-        Ok(())
+        crate::test_support::KernelRouteEvidence.verify_reconciliation(token, reconciliation)
     }
 
-    fn verify_receipt(&self, _receipt: &ReceiptEnvelope) -> Result<(), OrsError> {
-        Ok(())
+    fn verify_receipt(&self, receipt: &ReceiptEnvelope) -> Result<(), OrsError> {
+        crate::test_support::KernelRouteEvidence.verify_receipt(receipt)
     }
 
     fn verify_recovery_inbox(&self, _item: &RecoveryInboxItem) -> Result<(), OrsError> {
@@ -142,7 +149,7 @@ fn coordinator_with_evidence(
 }
 
 fn coordinator(path: &PathBuf) -> Result<OrsCoordinator, OrsError> {
-    coordinator_with_evidence(path, Arc::new(TestCanonicalEvidence))
+    coordinator_with_evidence(path, Arc::new(crate::test_support::KernelRouteEvidence))
 }
 
 fn database_path(label: &str) -> PathBuf {
@@ -2742,6 +2749,430 @@ fn persisted_invalid_label_and_envelope_digest_fail_closed() -> TestResult {
     Ok(())
 }
 
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one focused fixture covers commit, restart recovery, admission pinning, and receipt fields"
+)]
+fn cutover_ownership_commit_is_durable_linearization_point() -> TestResult {
+    // I14.14 acceptance (issue #1950): after a committed module cutover and a
+    // forced restart, a new request in the affected route scope is admitted
+    // only to the recorded candidate generation with the recorded new epoch;
+    // an old-generation request not named in the committed in-flight
+    // disposition set is rejected as stale; a candidate crash before commit
+    // leaves new admission routed away from the candidate.
+    let path = database_path("cutover-ownership-acceptance");
+    cleanup(&path);
+    let scope = CapabilityRouteScope::declare("mod-a", "serve", "work", "effects")?;
+    let hash = scope.route_scope_hash.clone();
+    let candidate = ModuleArtifactIdentity {
+        module_id: "mod-a".to_owned(),
+        semver: "1.2.0".to_owned(),
+        artifact_hash: "a".repeat(64),
+        manifest_digest: "c".repeat(64),
+        layout_root: format!("modules/mod-a/1.2.0/{}", "a".repeat(64)),
+    };
+    let incumbent = ModuleArtifactIdentity {
+        module_id: "mod-a".to_owned(),
+        semver: "1.1.0".to_owned(),
+        artifact_hash: "b".repeat(64),
+        manifest_digest: "d".repeat(64),
+        layout_root: format!("modules/mod-a/1.1.0/{}", "b".repeat(64)),
+    };
+    let genesis = GenerationCutoverOwnership {
+        cutover_id: "cutover-ownership-genesis".to_owned(),
+        candidate_artifact: incumbent.clone(),
+        incumbent_artifact: None,
+        scope: scope.clone(),
+        old_generation: None,
+        new_generation: ResourceGeneration::new(1)?,
+        old_epoch: AuthorityEpoch::new(1)?,
+        new_epoch: AuthorityEpoch::new(2)?,
+        in_flight: Vec::new(),
+        migration: StateMigrationDecision::RetainCompatible,
+        health_proof_ref: "health-proof-genesis".to_owned(),
+        rollback_boundary: "forward-only".to_owned(),
+        unresolved_scopes: Vec::new(),
+        linearization_record_id: None,
+        state: GenerationCutoverState::Armed,
+    };
+    let cutover = GenerationCutoverOwnership {
+        cutover_id: "cutover-ownership-1".to_owned(),
+        candidate_artifact: candidate.clone(),
+        incumbent_artifact: Some(incumbent.clone()),
+        scope: scope.clone(),
+        old_generation: Some(ResourceGeneration::new(1)?),
+        new_generation: ResourceGeneration::new(2)?,
+        old_epoch: AuthorityEpoch::new(2)?,
+        new_epoch: AuthorityEpoch::new(3)?,
+        in_flight: vec![InFlightDisposition {
+            operation_id: "op-drain".to_owned(),
+            kind: InFlightDispositionKind::DrainRead,
+        }],
+        migration: StateMigrationDecision::CheckpointTransfer,
+        health_proof_ref: "health-proof-1".to_owned(),
+        rollback_boundary: incumbent.layout_root.clone(),
+        unresolved_scopes: vec!["op-unknown".to_owned()],
+        linearization_record_id: None,
+        state: GenerationCutoverState::Armed,
+    };
+    // A second scope stages a candidate that never commits: the pre-commit
+    // crash case. It must never become active.
+    let staged_only = GenerationCutoverOwnership {
+        cutover_id: "cutover-ownership-staged-only".to_owned(),
+        candidate_artifact: candidate.clone(),
+        incumbent_artifact: None,
+        scope: CapabilityRouteScope::declare("mod-b", "serve", "work", "effects")?,
+        old_generation: None,
+        new_generation: ResourceGeneration::new(4)?,
+        old_epoch: AuthorityEpoch::new(3)?,
+        new_epoch: AuthorityEpoch::new(4)?,
+        in_flight: Vec::new(),
+        migration: StateMigrationDecision::RetainCompatible,
+        health_proof_ref: "health-proof-staged".to_owned(),
+        rollback_boundary: "forward-only".to_owned(),
+        unresolved_scopes: Vec::new(),
+        linearization_record_id: None,
+        state: GenerationCutoverState::Armed,
+    };
+    let staged_hash = staged_only.scope.route_scope_hash.clone();
+
+    let (committed, receipt) = {
+        let store = RedbRecoveryStore::open(&path)?;
+        store.stage_cutover_ownership(genesis)?;
+        store.commit_cutover_ownership("cutover-ownership-genesis")?;
+        store.stage_cutover_ownership(cutover)?;
+        // While staged, the candidate is durable but inactive: no committed
+        // row exists for the scope, so the snapshot admits nothing there.
+        let snapshot = CutoverRouteSnapshot::rebuild(
+            &store.latest_committed_cutover_ownership(MAX_RECOVERY_PAGE)?,
+        )?;
+        assert_eq!(
+            snapshot.admit(
+                &hash,
+                ResourceGeneration::new(2)?,
+                AuthorityEpoch::new(3)?,
+                "op-new"
+            ),
+            CutoverAdmission::RejectStale
+        );
+        store.stage_cutover_ownership(staged_only)?;
+        store.commit_cutover_ownership("cutover-ownership-1")
+    }?;
+    assert_eq!(committed.state, GenerationCutoverState::Committed);
+    assert!(
+        committed
+            .linearization_record_id
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("ors:cutover-ownership:cutover-ownership-1#")
+    );
+    // The receipt records every required I14.14 field from the commit.
+    assert_eq!(receipt.cutover_id, "cutover-ownership-1");
+    assert_eq!(receipt.old_generation, Some(ResourceGeneration::new(1)?));
+    assert_eq!(receipt.new_generation, ResourceGeneration::new(2)?);
+    assert_eq!(receipt.old_epoch, AuthorityEpoch::new(2)?);
+    assert_eq!(receipt.new_epoch, AuthorityEpoch::new(3)?);
+    assert_eq!(receipt.route_scope_hash, hash);
+    assert_eq!(
+        receipt.migration,
+        StateMigrationDecision::CheckpointTransfer
+    );
+    assert_eq!(receipt.in_flight.len(), 1);
+    assert_eq!(receipt.in_flight[0].operation_id, "op-drain");
+    assert_eq!(
+        receipt.in_flight[0].kind,
+        InFlightDispositionKind::DrainRead
+    );
+    assert_eq!(
+        receipt.linearization_record_id,
+        committed
+            .linearization_record_id
+            .clone()
+            .ok_or("linearization")?
+    );
+    assert_eq!(receipt.health_proof_ref, "health-proof-1");
+    assert_eq!(receipt.rollback_boundary, incumbent.layout_root);
+    assert_eq!(receipt.unresolved_scopes, vec!["op-unknown".to_owned()]);
+    assert_eq!(receipt.state, GenerationCutoverState::Committed);
+
+    // Forced restart: drop the store, reopen the same database, and rebuild
+    // the route snapshot solely from committed ORS state.
+    drop(receipt);
+    let table = CutoverRouteTable::new();
+    {
+        let store = RedbRecoveryStore::open(&path)?;
+        let committed_rows = store.latest_committed_cutover_ownership(MAX_RECOVERY_PAGE)?;
+        assert_eq!(committed_rows.len(), 2);
+        table.swap_committed(CutoverRouteSnapshot::rebuild(&committed_rows)?);
+        // The never-committed candidate reconciles to fenced evidence and
+        // still cannot activate its scope.
+        let fenced = store.reconcile_staged_cutover_ownership(MAX_RECOVERY_PAGE)?;
+        assert_eq!(fenced.len(), 1);
+        assert_eq!(
+            fenced[0].state,
+            GenerationCutoverState::FailedRequiresForwardCutover
+        );
+    }
+    // New requests reach the recorded candidate generation and epoch only.
+    assert_eq!(
+        table.admit(
+            &hash,
+            ResourceGeneration::new(2)?,
+            AuthorityEpoch::new(3)?,
+            "op-new"
+        ),
+        CutoverAdmission::AdmitCandidate
+    );
+    assert_eq!(
+        table.admit(
+            &hash,
+            ResourceGeneration::new(2)?,
+            AuthorityEpoch::new(2)?,
+            "op-new"
+        ),
+        CutoverAdmission::RejectStale
+    );
+    // The allowlisted pre-cutover operation finishes under its disposition.
+    assert_eq!(
+        table.admit(
+            &hash,
+            ResourceGeneration::new(1)?,
+            AuthorityEpoch::new(2)?,
+            "op-drain"
+        ),
+        CutoverAdmission::AdmitAllowlistedOld {
+            kind: InFlightDispositionKind::DrainRead
+        }
+    );
+    // Old-generation requests outside the committed disposition set are
+    // stale, including unresolved scopes, which stay blocked.
+    assert_eq!(
+        table.admit(
+            &hash,
+            ResourceGeneration::new(1)?,
+            AuthorityEpoch::new(2)?,
+            "op-other"
+        ),
+        CutoverAdmission::RejectStale
+    );
+    assert_eq!(
+        table.admit(
+            &hash,
+            ResourceGeneration::new(1)?,
+            AuthorityEpoch::new(2)?,
+            "op-unknown"
+        ),
+        CutoverAdmission::RejectStale
+    );
+    // The pre-commit candidate never owned new admission for its scope.
+    assert_eq!(
+        table.admit(
+            &staged_hash,
+            ResourceGeneration::new(4)?,
+            AuthorityEpoch::new(4)?,
+            "op-new"
+        ),
+        CutoverAdmission::RejectStale
+    );
+
+    cleanup(&path);
+    Ok(())
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one acceptance proof exercises the complete stage, restart, reconcile, and Recovery Problem surface of issue #1925"
+)]
+fn accept_after_stage_stages_envelope_and_corruption_becomes_recovery_problem() -> TestResult {
+    // ACCEPTED_PENDING is observed only after atomic durable staging plus
+    // read-back, hash validation, and operation-identity indexing. After a
+    // restart the record enumerates, validates, and reconciles by operation
+    // identity into its canonical receipt.
+    let path = database_path("accept-after-stage");
+    cleanup(&path);
+    let writer_epoch = epoch(TEST_LINEAGE_A, 7)?;
+    let accepted = {
+        let coordinator = coordinator(&path)?;
+        let accepted = coordinator.accept_after_stage(request(
+            "reservation-accepted",
+            "operation-accepted",
+            writer_epoch.clone(),
+            &["scope-accepted"],
+        )?)?;
+        assert_eq!(AcceptedPending::outcome_label(), "ACCEPTED_PENDING");
+        assert!(accepted.reservation_order > 0);
+        assert_eq!(
+            accepted.prepared_transition_sha256,
+            "11".repeat(32),
+            "acceptance must stage the complete opaque prepared operation digest"
+        );
+        accepted
+    };
+    {
+        let coordinator = coordinator(&path)?;
+        let page = coordinator
+            .store()
+            .recover_page(RecoveryCursor::new(0, 8)?)?;
+        let staged = page
+            .records
+            .iter()
+            .find(|record| record.token.reservation_id == accepted.reservation_id)
+            .ok_or("staged reservation must enumerate after restart")?;
+        let envelope = coordinator
+            .store()
+            .verify_staged_envelope(&accepted.operation_id)?;
+        assert_eq!(envelope.operation_or_checkpoint_id, accepted.operation_id);
+        coordinator.eligible(&staged.token)?;
+        coordinator.execute(&staged.token, &writer_epoch.current)?;
+        let canonical_receipt = receipt(&staged.token, &success_disposition())?;
+        let exact = reconciliation(
+            &staged.token,
+            canonical_receipt,
+            CanonicalDisposition::Committed,
+        )?;
+        let finalized = coordinator.reconcile(&exact)?;
+        assert_eq!(finalized.state, ReservationState::Finalized);
+        assert!(
+            coordinator
+                .store()
+                .load_recovery_problem(&accepted.operation_id)?
+                .is_none(),
+            "a cleanly staged operation must not carry a Recovery Problem"
+        );
+    }
+    cleanup(&path);
+
+    // A deliberately corrupted staged payload produces a visible durable
+    // Recovery Problem and remains available for disposition across restarts
+    // instead of being silently dropped.
+    let corrupt_path = database_path("accept-after-stage-corrupt");
+    cleanup(&corrupt_path);
+    let operation_id = {
+        let coordinator = coordinator(&corrupt_path)?;
+        let accepted = coordinator.accept_after_stage(request(
+            "reservation-corrupt",
+            "operation-corrupt",
+            epoch(TEST_LINEAGE_A, 7)?,
+            &["scope-corrupt"],
+        )?)?;
+        accepted.operation_id
+    };
+    {
+        let database = redb::Database::create(&corrupt_path)?;
+        let write = database.begin_write()?;
+        {
+            let definition: redb::TableDefinition<&str, &str> =
+                redb::TableDefinition::new("ors_envelopes_v1");
+            let mut table = write.open_table(definition)?;
+            let value = table
+                .get(operation_id.as_str())?
+                .ok_or("missing staged envelope")?;
+            let mut invalid: Value = serde_json::from_str(value.value())?;
+            drop(value);
+            invalid["payload_sha256"] = json!("00".repeat(32));
+            let encoded = serde_json::to_string(&invalid)?;
+            table.insert(operation_id.as_str(), encoded.as_str())?;
+        }
+        write.commit()?;
+        drop(database);
+    }
+    {
+        let coordinator = coordinator(&corrupt_path)?;
+        assert!(matches!(
+            coordinator.store().verify_staged_envelope(&operation_id),
+            Err(OrsError::RecoveryProblemRetained { .. })
+        ));
+        let problem = coordinator
+            .store()
+            .load_recovery_problem(&operation_id)?
+            .ok_or("corrupted payload must retain a Recovery Problem")?;
+        assert_eq!(problem.kind, RecoveryProblemKind::HashMismatch);
+        assert!(!problem.is_resolved());
+        let serialized = serde_json::to_value(&problem)?;
+        assert!(serialized.get("ciphertext").is_none());
+        assert!(serialized.get("payload").is_none());
+    }
+    {
+        let coordinator = coordinator(&corrupt_path)?;
+        let retained = coordinator
+            .store()
+            .load_recovery_problem(&operation_id)?
+            .ok_or("Recovery Problem must survive restart")?;
+        let owner = retained.recovery_owner.clone();
+        assert!(matches!(
+            coordinator.store().resolve_recovery_problem(
+                &operation_id,
+                &label("receipt-terminal-1")?,
+                &label("other-recovery-owner")?
+            ),
+            Err(OrsError::RecoveryOwnerMismatch)
+        ));
+        let resolved = coordinator.store().resolve_recovery_problem(
+            &operation_id,
+            &label("receipt-terminal-1")?,
+            &owner,
+        )?;
+        assert!(resolved.is_resolved());
+        let replayed = coordinator.store().resolve_recovery_problem(
+            &operation_id,
+            &label("receipt-terminal-1")?,
+            &owner,
+        )?;
+        assert_eq!(replayed, resolved);
+        assert!(
+            coordinator
+                .store()
+                .load_recovery_problem(&operation_id)?
+                .is_some(),
+            "a disposed problem must remain loadable, never silently deleted"
+        );
+    }
+    cleanup(&corrupt_path);
+
+    // An undecryptable staged payload (missing key) is reported digest-only
+    // and retained until explicit disposition. Plaintext fallback is
+    // forbidden by construction: the report carries digests, never bytes.
+    let undecryptable_path = database_path("accept-after-stage-undecryptable");
+    cleanup(&undecryptable_path);
+    {
+        let coordinator = coordinator(&undecryptable_path)?;
+        let authority_epoch = epoch(TEST_LINEAGE_A, 7)?;
+        let problem = RecoveryProblem::new(
+            label("operation-undecryptable")?,
+            None,
+            RecoveryProblemKind::MissingKey,
+            label("installation key is unavailable")?,
+            Some("33".repeat(32)),
+            Some("22".repeat(32)),
+            authority_epoch.clone(),
+            fence(&authority_epoch)?,
+            label("kernel-recovery-owner")?,
+            10,
+        )?;
+        let reported = coordinator.store().report_recovery_problem(problem)?;
+        assert!(!reported.is_resolved());
+        assert_eq!(
+            coordinator
+                .store()
+                .report_recovery_problem(reported.clone())?,
+            reported,
+            "an exact replay must return the durable problem unchanged"
+        );
+        let listed = coordinator.store().list_recovery_problems(8)?;
+        assert_eq!(listed, vec![reported.clone()]);
+        let resolved = coordinator.store().resolve_recovery_problem(
+            &reported.operation_or_checkpoint_id,
+            &label("receipt-terminal-2")?,
+            &reported.recovery_owner,
+        )?;
+        assert!(resolved.is_resolved());
+    }
+    cleanup(&undecryptable_path);
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // T9-03 owner-backed durable replay stream (issue #22, M3).
 // ---------------------------------------------------------------------------
@@ -3301,7 +3732,10 @@ fn worker_replay_ack_advances_only_its_phase_cursor() -> TestResult {
 fn appendix_p4_operational_surface_projects_rollover_and_retains_snapshot() -> TestResult {
     let path = database_path("p4-surface");
     cleanup(&path);
-    let coordinator = coordinator(&path)?;
+    // Surface projection stages recovery-inbox items as data, which the
+    // Kernel-route binding never authenticates: every other check still runs
+    // through the single shared binding via `SurfaceProjectionEvidence`.
+    let coordinator = coordinator_with_evidence(&path, Arc::new(SurfaceProjectionEvidence))?;
     let store = coordinator.store();
     let old = epoch(TEST_LINEAGE_C, 7)?;
     let token = coordinator.reserve(request(

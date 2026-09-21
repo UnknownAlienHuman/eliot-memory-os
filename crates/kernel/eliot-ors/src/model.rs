@@ -2182,6 +2182,133 @@ impl RecoveryInboxReceipt {
     }
 }
 
+/// Durable cause for one staged opaque operation that cannot be decoded or
+/// trusted (issue #1925, I5.2/I5.6).
+///
+/// ORS owns neither keys nor locator contents, so it never attempts
+/// decryption and never stores plaintext or ciphertext here: the problem
+/// carries only integrity digests plus the epoch/fence/owner binding needed
+/// to reconcile or dispose the staged operation by identity. A retained
+/// problem is visible until an explicit canonical receipt or owner
+/// disposition resolves it; silent deletion and plaintext fallback are
+/// forbidden, and unresolved problems never expire automatically.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum RecoveryProblemKind {
+    HashMismatch,
+    EnvelopeIntegrity,
+    MissingKey,
+    DecryptionFailure,
+}
+
+/// Visible durable Recovery Problem for one staged opaque operation.
+///
+/// The record is keyed by `operation_or_checkpoint_id` and reconciled by that
+/// same identity into either the canonical receipt (via the reservation path)
+/// or an explicit problem disposition. It carries no payload bytes.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryProblem {
+    pub contract_version: u16,
+    pub operation_or_checkpoint_id: OperationIdentity,
+    pub reservation_id: Option<OperationIdentity>,
+    pub kind: RecoveryProblemKind,
+    /// Bounded operator-visible cause. Never carries payload plaintext.
+    pub detail: OpaqueLabel,
+    pub envelope_sha256: Option<String>,
+    pub payload_sha256: Option<String>,
+    pub authority_epoch: EpochLineage,
+    pub state_fence: StateFenceSnapshot,
+    pub recovery_owner: RecoveryOwner,
+    pub created_at_ms: i64,
+    pub terminal_receipt_id: Option<OpaqueLabel>,
+}
+
+impl RecoveryProblem {
+    /// Binds a new unresolved problem to its authority epoch and state fence.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        operation_or_checkpoint_id: OperationIdentity,
+        reservation_id: Option<OperationIdentity>,
+        kind: RecoveryProblemKind,
+        detail: OpaqueLabel,
+        envelope_sha256: Option<String>,
+        payload_sha256: Option<String>,
+        authority_epoch: EpochLineage,
+        state_fence: StateFenceSnapshot,
+        recovery_owner: RecoveryOwner,
+        created_at_ms: i64,
+    ) -> Result<Self, OrsError> {
+        let value = Self {
+            contract_version: CONTRACT_VERSION,
+            operation_or_checkpoint_id,
+            reservation_id,
+            kind,
+            detail,
+            envelope_sha256,
+            payload_sha256,
+            authority_epoch,
+            state_fence,
+            recovery_owner,
+            created_at_ms,
+            terminal_receipt_id: None,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    /// Returns true once an explicit canonical receipt or owner disposition
+    /// has closed the problem. Only resolved problems may be dispositioned;
+    /// unresolved problems never expire automatically.
+    pub const fn is_resolved(&self) -> bool {
+        self.terminal_receipt_id.is_some()
+    }
+
+    /// Validates version, digest bindings, epoch/fence agreement, and the
+    /// resolved marker. Never touches payload semantics.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        if self.contract_version != CONTRACT_VERSION {
+            return Err(OrsError::UnsupportedContractVersion(self.contract_version));
+        }
+        if let Some(digest) = &self.envelope_sha256 {
+            validate_digest(digest, "recovery_problem_envelope_sha256")?;
+        }
+        if let Some(digest) = &self.payload_sha256 {
+            validate_digest(digest, "recovery_problem_payload_sha256")?;
+        }
+        self.authority_epoch.validate()?;
+        self.state_fence.validate()?;
+        if self.state_fence.observed_authority_epoch != self.authority_epoch.current.epoch {
+            return Err(OrsError::FenceMismatch);
+        }
+        Ok(())
+    }
+}
+
+/// Durable-staging gate outcome for one `accept_after_stage` request
+/// (issue #1925, I5.5/I5.6).
+///
+/// `ACCEPTED_PENDING` proves only that the complete opaque operation was
+/// durably staged under the same operation identity: the envelope was
+/// committed atomically with the Ordering Scope reservations, read back,
+/// hash-validated, and enumerated by identity. It never implies canonical
+/// commit or exactly-once external effect; the caller must poll/subscribe
+/// and must not retry under a duplicate identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AcceptedPending {
+    pub operation_id: OperationIdentity,
+    pub reservation_id: OperationIdentity,
+    pub reservation_order: u64,
+    pub prepared_transition_sha256: String,
+}
+
+impl AcceptedPending {
+    /// Response-mode label emitted alongside this outcome.
+    pub const fn outcome_label() -> &'static str {
+        "ACCEPTED_PENDING"
+    }
+}
+
 /// Exact terminal reservation sequence disposition retained for gap/readback proof.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2472,6 +2599,12 @@ pub enum OrsError {
     Storage(String),
     #[error("durable ORS encoding failed: {0}")]
     Encoding(String),
+    #[error("opaque operation could not be durably staged, ACCEPTED_PENDING is forbidden: {0}")]
+    StagingNotDurable(String),
+    #[error(
+        "staged opaque payload for operation {operation_id} failed validation; a durable Recovery Problem is retained for disposition, plaintext fallback and silent deletion are forbidden"
+    )]
+    RecoveryProblemRetained { operation_id: String },
 }
 
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
