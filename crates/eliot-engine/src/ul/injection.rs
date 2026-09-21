@@ -2,7 +2,7 @@ use super::{ActivationEngine, CueIndexService, TouchedSetRegistry, capsule_fresh
 use crate::{EngineError, WriterHandle};
 use eliot_store::CanonicalStore;
 use eliot_types::{
-    ActivationTrace, CapsuleFreshness, ConceptNode, CueKind, CueRecordSource, InjectionReceipt,
+    ActivationTrace, CapsuleFreshness, ConceptNode, LegacyCueKindV1, CueRecordSource, InjectionReceipt,
     OBSERVABILITY_SCHEMA_VERSION, ObservabilityKind, ObservabilityWriteEnvelope,
     ObservabilityWriteStatus, ObservedCue, PendingInjectionItem, ProjectCharter, ProjectId,
     SessionId, SubsystemCapsule, SystemMap, TaskId, UlFiredBlock, UlFiredItem, UlInjectionMode,
@@ -702,14 +702,14 @@ fn compare_pending(left: &PendingInjectionItem, right: &PendingInjectionItem) ->
 
 fn canonical_cue_ref(cue: &ObservedCue) -> Option<String> {
     match cue.kind {
-        CueKind::FilePath => Some(format!("file:{}", cue.value)),
-        CueKind::DirPath => Some(format!("dir:{}", cue.value)),
-        CueKind::Symbol => Some(format!("symbol:{}", cue.value)),
-        CueKind::Dependency => Some(format!("dependency:{}", cue.value)),
-        CueKind::ApiSurface => Some(format!("api:{}", cue.value)),
-        CueKind::Subsystem => Some(format!("subsystem:{}", cue.value)),
-        CueKind::Concept => Some(format!("concept:{}", cue.value)),
-        CueKind::CommandPattern | CueKind::ErrorSignature | CueKind::TaskClass => None,
+        LegacyCueKindV1::FilePath => Some(format!("file:{}", cue.value)),
+        LegacyCueKindV1::DirPath => Some(format!("dir:{}", cue.value)),
+        LegacyCueKindV1::Symbol => Some(format!("symbol:{}", cue.value)),
+        LegacyCueKindV1::Dependency => Some(format!("dependency:{}", cue.value)),
+        LegacyCueKindV1::ApiSurface => Some(format!("api:{}", cue.value)),
+        LegacyCueKindV1::Subsystem => Some(format!("subsystem:{}", cue.value)),
+        LegacyCueKindV1::Concept => Some(format!("concept:{}", cue.value)),
+        LegacyCueKindV1::CommandPattern | LegacyCueKindV1::ErrorSignature | LegacyCueKindV1::TaskClass => None,
     }
 }
 
@@ -773,7 +773,7 @@ fn activation_sources<'a>(
     if let Some(path) = node_ref.strip_prefix("file:") {
         matches.extend(sources.values().filter(|source| {
             source.cue_bindings.iter().any(|binding| {
-                binding.cue_kind == CueKind::FilePath
+                binding.cue_kind == LegacyCueKindV1::FilePath
                     && eliot_types::normalize_path(&binding.cue_value, None) == path
             })
         }));
@@ -901,7 +901,7 @@ mod tests {
             preview_text: "partner card".to_owned(),
             payload: Some(json!({"must_not": "flow"})),
             cue_bindings: vec![CueBinding {
-                cue_kind: CueKind::FilePath,
+                cue_kind: LegacyCueKindV1::FilePath,
                 cue_value: "b.rs".to_owned(),
                 match_mode: CueMatchMode::Exact,
                 strength: CueStrength::Primary,

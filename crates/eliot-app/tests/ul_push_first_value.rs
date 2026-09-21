@@ -2,7 +2,7 @@
 mod support;
 
 use eliot_types::{
-    AgentId, CommandContext, CueBinding, CueKind, CueMatchMode, CueStrength, InjectionReceipt,
+    AgentId, CommandContext, CueBinding, LegacyCueKindV1, CueMatchMode, CueStrength, InjectionReceipt,
     LifecycleStatus, ObservabilityKind, ProjectId, SemanticCommand, TaintClass, Visibility,
     WriteId, WriteStatus,
 };
@@ -154,7 +154,7 @@ fn failure_command(
         payload: json!({
             "source_revision": source_revision,
             "cue_bindings": [CueBinding {
-                cue_kind: CueKind::FilePath,
+                cue_kind: LegacyCueKindV1::FilePath,
                 cue_value: "src/net/session.rs".to_owned(),
                 match_mode: CueMatchMode::Exact,
                 strength: CueStrength::Primary,
