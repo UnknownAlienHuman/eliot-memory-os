@@ -74,24 +74,27 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use eliot_contracts::{EpochId, RequestMetadata};
+use eliot_contracts::{EpochId, RequestMetadata, StateFence};
 use eliot_ors::{
     CanonicalDisposition, CanonicalReconciliation, CanonicalScopeObservation, EpochIdentity,
     EpochLineage, ExpectedOrderingHead, OpaqueLabel, OperationIdentity as OrsOperationIdentity,
     OperationalRecoveryStore, RecoveryAccessClass, RecoveryCursor, RecoveryEnvelopeContext,
     RecoveryOwner, RecoveryPage, RecoveryPayloadEnvelope, RedbRecoveryStore, ReservationRecord,
-    ReservationRequest, ScopeReservationRequest, StateFenceSnapshot, WriterReservationToken,
+    ReservationRequest, ReservationState, ScopeReservationRequest, StateFenceSnapshot,
+    WriterReservationToken,
 };
 use eliot_platform::SecretReference;
 use eliot_receipts::ReceiptDispositionKind;
 use eliot_security_contracts::PrivacyClass;
 use eliot_store_api::{
-    CAPABILITY_RESERVED_WRITE, CanonicalRequestView, OrderingHeadExpectation, OrderingScopeId,
-    PreparedTransition, ReceiptEnvelope, ReservedScopeBinding, ReservedWriteRequest,
-    RevisionHeadExpectation, WriteAdmissionParams, WriteAdmissionProjection, WriteReceipt,
-    WriteReceiptStatus, WriterEpochBinding, prepared_transition_digest,
-    verify_canonical_request_hash,
+    CAPABILITY_RESERVED_WRITE, CanonicalRequestView, CanonicalStoreClient, OperationId,
+    OrderingHeadExpectation, OrderingScopeId, PreparedTransition, ReceiptEnvelope,
+    ReservedScopeBinding, ReservedWriteRequest, RevisionHeadExpectation, WriteAdmissionParams,
+    WriteAdmissionProjection, WriteReceipt, WriteReceiptStatus, WriterEpochBinding,
+    prepared_transition_digest, sha256_hex, verify_canonical_request_hash,
 };
+
+use crate::{EbpCanonicalStoreClient, EbpStoreTransport};
 
 /// Composition-owned key reference under which the Kernel stages reservation
 /// envelopes. Labels only; no secret bytes live here or cross this boundary.
@@ -1183,4 +1186,277 @@ impl ReservedSubmission {
     pub fn into_request(self) -> ReservedWriteRequest {
         self.request
     }
+}
+
+/// One persisted reservation still unresolved at startup (I1.11 step 6).
+///
+/// A reference, never authority: identity, scopes, lifecycle state and
+/// recovery owner are restated so the Kernel can gate step 6 without
+/// reading ORS itself. The `reason` uses fixed vocabulary
+/// (`awaiting store receipt`, `fence mismatch`) so the report stays a
+/// bounded diagnostic, not an error log.
+#[derive(Clone, Debug)]
+pub struct StartupPendingOperation {
+    /// Store operation identity.
+    pub operation_id: String,
+    /// ORS-assigned reservation order.
+    pub reservation_order: u64,
+    /// Reserved scope identities, sorted.
+    pub scopes: Vec<String>,
+    /// Lifecycle state observed during the scan.
+    pub state: ReservationState,
+    /// Recovery owner preserved from the token.
+    pub recovery_owner: String,
+    /// Fixed-vocabulary blocking reason.
+    pub reason: String,
+}
+
+/// One persisted reservation whose outcome is ambiguous at startup.
+///
+/// Unknown covers `Reconciling` tokens and any token whose Store receipt
+/// observation is absent or refuses reconciliation: the outcome stays
+/// unresolved, never retried, never replayed, never force-released.
+#[derive(Clone, Debug)]
+pub struct StartupUnknownOperation {
+    /// Store operation identity.
+    pub operation_id: String,
+    /// ORS-assigned reservation order.
+    pub reservation_order: u64,
+    /// Reserved scope identities, sorted.
+    pub scopes: Vec<String>,
+    /// Lifecycle state observed during the scan.
+    pub state: ReservationState,
+    /// Recovery owner preserved from the token.
+    pub recovery_owner: String,
+    /// Fixed-vocabulary ambiguity reason (`no store receipt`,
+    /// `reconciliation refused`).
+    pub reason: String,
+}
+
+/// Step-6 readiness verdict over a startup reconciliation report.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StartupReconciliationReadiness {
+    /// No pending, no unknown, scan complete: Kernel may record step 6.
+    Ready,
+    /// Remainder exists or the scan truncated: step 6 stays absent and
+    /// ordinary admission stays fenced.
+    Blocked,
+}
+
+/// Bounded startup reconciliation report (I1.11 step 6).
+///
+/// Produced by [`reconcile_pending_at_startup`] from the persisted ORS
+/// recovery projection plus exact canonical Store receipt observations.
+/// A missing or ambiguous receipt leaves its token unresolved and
+/// reported; nothing is synthesized, retried, or released to pass.
+#[derive(Clone, Debug)]
+pub struct StartupReconciliation {
+    /// Live fence the scan ran under; Kernel matches it exactly.
+    pub fence: StateFence,
+    /// Digest over fence, counts and sorted reported identities.
+    pub digest: String,
+    /// Reservations examined (bounded by the caller limit).
+    pub scanned: u64,
+    /// Unresolved non-unknown operations.
+    pub pending: Vec<StartupPendingOperation>,
+    /// Ambiguous operations that must stay unresolved.
+    pub unknown: Vec<StartupUnknownOperation>,
+    /// True when the recovery scan truncated: the report is partial and
+    /// step 6 is blocked regardless of the listed sets.
+    pub truncated: bool,
+}
+
+impl StartupReconciliation {
+    /// Step-6 verdict: `Ready` only on a complete scan with empty pending
+    /// and unknown sets; anything else (including truncation) is `Blocked`.
+    pub fn readiness(&self) -> StartupReconciliationReadiness {
+        if !self.truncated && self.pending.is_empty() && self.unknown.is_empty() {
+            StartupReconciliationReadiness::Ready
+        } else {
+            StartupReconciliationReadiness::Blocked
+        }
+    }
+}
+
+/// Per-record outcome of one startup reconciliation step.
+enum StartupRecordOutcome {
+    /// Exact receipt observed, reconciled and finalized: no report entry.
+    Resolved,
+    /// Unresolved, non-unknown: reported pending with a fixed reason.
+    Pending { reason: String },
+    /// Ambiguous: reported unknown with a fixed reason.
+    Unknown { reason: String },
+}
+
+/// Observes the exact Store receipt for one persisted reservation and
+/// reconciles it where the receipt resolves. Records minted under a
+/// different writer epoch than the bound owner are never touched. A
+/// failed check (transport/ORS) is an error, never a guessed outcome.
+async fn reconcile_one_record<T: EbpStoreTransport + 'static>(
+    owner: &CompositionReservation,
+    store: &EbpCanonicalStoreClient<T>,
+    record: &ReservationRecord,
+) -> Result<StartupRecordOutcome, ReservationWriteError> {
+    let token = &record.token;
+    // Same-authority rule: only tokens minted under the bound writer
+    // epoch are eligible here. Anything else (restart under a new
+    // epoch, foreign writer) is reported pending and never touched.
+    if token.writer_epoch.current.lineage_id.as_str()
+        != owner.writer_epoch().current.lineage_id.as_str()
+        || token.writer_epoch.current.epoch != owner.writer_epoch().current.epoch
+    {
+        return Ok(StartupRecordOutcome::Pending {
+            reason: "fence mismatch".to_owned(),
+        });
+    }
+    let operation_id = OperationId::new(token.operation_id.as_str()).map_err(|error| {
+        ReservationWriteError::Binding {
+            operation_id: token.operation_id.as_str().to_owned(),
+            detail: format!("startup scan cannot address the reservation: {error}"),
+        }
+    })?;
+    let observed = CanonicalStoreClient::receipt(store, operation_id)
+        .await
+        .map_err(ReservationWriteError::Store)?;
+    let Some(receipt) = observed else {
+        if record.state == ReservationState::Reconciling {
+            return Ok(StartupRecordOutcome::Unknown {
+                reason: "no store receipt".to_owned(),
+            });
+        }
+        return Ok(StartupRecordOutcome::Pending {
+            reason: "awaiting store receipt".to_owned(),
+        });
+    };
+    match reconcile_receipt(token, &receipt)
+        .and_then(|reconciliation| finalize_reservation(owner, &reconciliation))
+    {
+        Ok(_) => Ok(StartupRecordOutcome::Resolved),
+        Err(_) => {
+            if record.state == ReservationState::Reconciling {
+                Ok(StartupRecordOutcome::Unknown {
+                    reason: "reconciliation refused".to_owned(),
+                })
+            } else {
+                Ok(StartupRecordOutcome::Pending {
+                    reason: "reconciliation refused".to_owned(),
+                })
+            }
+        }
+    }
+}
+
+fn reservation_state_name(state: ReservationState) -> &'static str {
+    match state {
+        ReservationState::Reserved => "reserved",
+        ReservationState::Eligible => "eligible",
+        ReservationState::Executing => "executing",
+        ReservationState::Reconciling => "reconciling",
+        ReservationState::Finalized => "finalized",
+        ReservationState::Released => "released",
+    }
+}
+
+/// Reconciles persisted pending/unknown ORS reservations against exact
+/// canonical Store receipts at startup (I1.11 step 6).
+///
+/// For every non-terminal reservation in one bounded recovery page, this
+/// observes the exact Store receipt by operation identity: a committed
+/// (or terminally not-applied, receipt-proven) answer reconciles and
+/// finalizes through the real receipt path, so resolved work leaves no
+/// trace in the report. Records minted under a different writer epoch
+/// than the bound owner are reported pending with `fence mismatch` and
+/// never touched — cross-epoch disposition belongs to the
+/// cutover/rebind owner, not to startup. A missing receipt, a refused
+/// reconciliation, or a transport/ORS failure of the check itself is
+/// reported honestly: unknown outcomes stay unresolved, and a failed
+/// check is an error, never a synthetic empty report.
+///
+/// Bounds: at most `limit` reservations are examined and at most one
+/// Store receipt is observed per examined reservation. A truncated scan
+/// sets `truncated` and blocks regardless of the listed sets.
+pub async fn reconcile_pending_at_startup<T: EbpStoreTransport + 'static>(
+    owner: &CompositionReservation,
+    fence: &StateFence,
+    store: &EbpCanonicalStoreClient<T>,
+    limit: u16,
+) -> Result<StartupReconciliation, ReservationWriteError> {
+    let page = recovery_page(owner, limit)?;
+    let truncated = page.next_after_order.is_some();
+    let mut pending = Vec::new();
+    let mut unknown = Vec::new();
+    for record in &page.records {
+        let token = &record.token;
+        let operation_id = token.operation_id.as_str().to_owned();
+        let mut scopes: Vec<String> = token
+            .scopes
+            .iter()
+            .map(|scope| scope.scope.as_str().to_owned())
+            .collect();
+        scopes.sort_unstable();
+        let recovery_owner = token.recovery_owner.as_str().to_owned();
+        let entry = reconcile_one_record(owner, store, record).await?;
+        match entry {
+            StartupRecordOutcome::Resolved => {}
+            StartupRecordOutcome::Pending { reason } => pending.push(StartupPendingOperation {
+                operation_id,
+                reservation_order: token.reservation_order,
+                scopes,
+                state: record.state,
+                recovery_owner,
+                reason,
+            }),
+            StartupRecordOutcome::Unknown { reason } => unknown.push(StartupUnknownOperation {
+                operation_id,
+                reservation_order: token.reservation_order,
+                scopes,
+                state: record.state,
+                recovery_owner,
+                reason,
+            }),
+        }
+    }
+    let scanned = page.records.len() as u64;
+    let mut entries: Vec<String> = pending
+        .iter()
+        .map(|item| {
+            format!(
+                "{}|{}|{}|{}",
+                item.operation_id,
+                item.reservation_order,
+                reservation_state_name(item.state),
+                item.recovery_owner
+            )
+        })
+        .chain(unknown.iter().map(|item| {
+            format!(
+                "{}|{}|{}|{}",
+                item.operation_id,
+                item.reservation_order,
+                reservation_state_name(item.state),
+                item.recovery_owner
+            )
+        }))
+        .collect();
+    entries.sort_unstable();
+    let digest = sha256_hex(
+        format!(
+            "{}|{}|{}|{}|{}|{}",
+            fence.authority_epoch.lineage_id.as_str(),
+            fence.authority_epoch.sequence.get(),
+            fence.resource_generation.value(),
+            scanned,
+            truncated,
+            entries.join(","),
+        )
+        .as_bytes(),
+    );
+    Ok(StartupReconciliation {
+        fence: fence.clone(),
+        digest,
+        scanned,
+        pending,
+        unknown,
+        truncated,
+    })
 }
