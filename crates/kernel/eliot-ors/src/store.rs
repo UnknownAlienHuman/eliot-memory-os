@@ -29,7 +29,7 @@ use crate::cutover_ownership::{
     GenerationCutoverOwnership, GenerationCutoverOwnershipReceipt, StoredCutoverOwnership,
 };
 use crate::{
-    ActivationResultRetentionRecord, ActiveSessionBinding, AdmissionReservation,
+    AcceptedPending, ActivationResultRetentionRecord, ActiveSessionBinding, AdmissionReservation,
     AdmissionReservationActivation, AdmissionReservationReceipt, AdmissionReservationRelease,
     AuthorityActivationReceipt, AuthorityHandoffBegin, AuthorityHandoffRecord,
     AuthorityHandoffState, AuthorityRevocation, AuthorityRevocationReceipt,
@@ -45,20 +45,20 @@ use crate::{
     OrsSnapshotReceipt, OrsSnapshotRequest, PendingOperationPage, ProcessEvidenceRecord,
     ProcessStartReplayAbort, ProcessStartReplayRecord, ProcessStartReplayState,
     RecoveredAuthoritySnapshot, RecoveryCursor, RecoveryInboxDisposition, RecoveryInboxItem,
-    RecoveryInboxReceipt, RecoveryPage, RecoveryPayloadEnvelope, ReservationRecord,
-    ReservationRequest, ReservationState, ReservedScope, RetryState, ScopeTerminalReceipt,
-    ScopeTerminalView, SessionBindingReceipt, SessionDetach, StageReceipt, StagedOperation,
-    StateFenceSnapshot, SupervisionLeaseCommitTicket, SupervisionLeasePrepareRequest,
-    SupervisionLeaseProjection, SupervisionLeaseReceipt, SupervisionLeaseReceiptInput,
-    SupervisionLeaseRecord, SupervisionLeaseSnapshot, SupervisionLeaseStageReceipt,
-    SupervisionLeaseStageResolution, SupervisionLeaseStageResolutionDisposition,
-    SupervisionLeaseTicketReconciliation, UnknownCommitOutcome, UnknownCommitRecord,
-    UserBrokerFence, UserBrokerRegistration, UserBrokerRegistrationReceipt, WorkerReplayAck,
-    WorkerReplayAckRecord, WorkerReplayBegin, WorkerReplayCursors, WorkerReplayDraft,
-    WorkerReplayEvent, WorkerReplayRequestDecision, WorkerReplayRequestRecord,
-    WorkerReplayStreamRecord, WriterReservationToken, is_replay_terminal_phase,
-    parse_replay_stream_id, require_replay_claim_binding, signed_supervision_lease_from_verified,
-    signed_terminal_supervision_lease_from_verified,
+    RecoveryInboxReceipt, RecoveryPage, RecoveryPayloadEnvelope, RecoveryProblem,
+    RecoveryProblemKind, ReservationRecord, ReservationRequest, ReservationState, ReservedScope,
+    RetryState, ScopeTerminalReceipt, ScopeTerminalView, SessionBindingReceipt, SessionDetach,
+    StageReceipt, StagedOperation, StateFenceSnapshot, SupervisionLeaseCommitTicket,
+    SupervisionLeasePrepareRequest, SupervisionLeaseProjection, SupervisionLeaseReceipt,
+    SupervisionLeaseReceiptInput, SupervisionLeaseRecord, SupervisionLeaseSnapshot,
+    SupervisionLeaseStageReceipt, SupervisionLeaseStageResolution,
+    SupervisionLeaseStageResolutionDisposition, SupervisionLeaseTicketReconciliation,
+    UnknownCommitOutcome, UnknownCommitRecord, UserBrokerFence, UserBrokerRegistration,
+    UserBrokerRegistrationReceipt, WorkerReplayAck, WorkerReplayAckRecord, WorkerReplayBegin,
+    WorkerReplayCursors, WorkerReplayDraft, WorkerReplayEvent, WorkerReplayRequestDecision,
+    WorkerReplayRequestRecord, WorkerReplayStreamRecord, WriterReservationToken,
+    is_replay_terminal_phase, parse_replay_stream_id, require_replay_claim_binding,
+    signed_supervision_lease_from_verified, signed_terminal_supervision_lease_from_verified,
 };
 
 const META: TableDefinition<&str, &str> = TableDefinition::new("ors_meta_v1");
@@ -112,6 +112,11 @@ const REPLAY_ACKS: TableDefinition<&str, &str> = TableDefinition::new("ors_repla
 const DOCTOR_ATTEMPTS: TableDefinition<&str, &str> = TableDefinition::new("ors_doctor_attempts_v1");
 const DOCTOR_EFFECTS: TableDefinition<&str, &str> = TableDefinition::new("ors_doctor_effects_v1");
 const DOCTOR_BUDGETS: TableDefinition<&str, &str> = TableDefinition::new("ors_doctor_budgets_v1");
+/// Visible durable Recovery Problems for staged opaque operations whose
+/// payload cannot be decoded or trusted (issue #1925). Keyed by the staged
+/// operation/checkpoint identity; retained until explicit disposition.
+const RECOVERY_PROBLEMS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_recovery_problems_v1");
 const NEXT_GLOBAL_ORDER: &str = "next_global_order";
 const SUPERVISION_STAGE_RESOLUTION_SCHEMA_KEY: &str = "supervision_stage_resolution_schema";
 const SUPERVISION_STAGE_RESOLUTION_SCHEMA_V1: &str = "eliot.ors.supervision-stage-resolution.v1";
@@ -355,6 +360,63 @@ pub trait OperationalRecoveryStore: Send + Sync {
         &self,
         operation_id: &crate::OperationIdentity,
     ) -> Result<Option<RecoveryPayloadEnvelope>, OrsError>;
+    /// Durably stages one complete opaque operation and reserves every
+    /// declared Ordering Scope in one atomic ORS transaction, then proves the
+    /// staging before returning `ACCEPTED_PENDING` (issue #1925, I5.5/I5.6).
+    ///
+    /// The returned [`AcceptedPending`] proves only that the full envelope
+    /// was committed, read back, hash-validated, and indexed by operation
+    /// identity. When the envelope cannot be durably staged this fails with
+    /// [`OrsError::StagingNotDurable`] and no `ACCEPTED_PENDING` is emitted;
+    /// when the staged bytes fail read-back validation a durable
+    /// [`RecoveryProblem`] is retained and this fails with
+    /// [`OrsError::RecoveryProblemRetained`]. Neither path deletes the staged
+    /// record nor falls back to plaintext.
+    fn accept_after_stage(&self, request: ReservationRequest) -> Result<AcceptedPending, OrsError>;
+    /// Revalidates one staged envelope by identity without interpreting its
+    /// payload (issue #1925).
+    ///
+    /// On hash mismatch, missing record bindings, or envelope corruption this
+    /// retains a visible durable [`RecoveryProblem`] for disposition and fails
+    /// with [`OrsError::RecoveryProblemRetained`]; the staged record remains
+    /// available and is never silently dropped.
+    fn verify_staged_envelope(
+        &self,
+        operation_id: &crate::OperationIdentity,
+    ) -> Result<RecoveryPayloadEnvelope, OrsError>;
+    /// Retains one caller-reported undecryptable-payload problem (missing key
+    /// or decryption failure) without storing or returning payload bytes
+    /// (issue #1925, I5.2).
+    ///
+    /// An exact replay under the same operation identity returns the durable
+    /// record unchanged; a changed binding under the same identity fails with
+    /// [`OrsError::DuplicateConflict`] and never overwrites. Plaintext
+    /// fallback is forbidden by construction: this API accepts digests only.
+    fn report_recovery_problem(
+        &self,
+        problem: RecoveryProblem,
+    ) -> Result<RecoveryProblem, OrsError>;
+    /// Loads one durable Recovery Problem by staged operation identity.
+    fn load_recovery_problem(
+        &self,
+        operation_id: &crate::OperationIdentity,
+    ) -> Result<Option<RecoveryProblem>, OrsError>;
+    /// Lists retained Recovery Problems in operation-identity order, bounded
+    /// by [`crate::MAX_RECOVERY_PAGE`].
+    fn list_recovery_problems(&self, limit: u16) -> Result<Vec<RecoveryProblem>, OrsError>;
+    /// Closes one retained Recovery Problem only from an explicit terminal
+    /// receipt under the exact recovery owner (issue #1925).
+    ///
+    /// An exact replay of a resolved problem returns the durable record
+    /// unchanged; resolving with a different receipt fails with
+    /// [`OrsError::DuplicateConflict`]. Unresolved problems have no expiry
+    /// path and are never cleaned up automatically.
+    fn resolve_recovery_problem(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        receipt_id: &OpaqueLabel,
+        recovery_owner: &crate::RecoveryOwner,
+    ) -> Result<RecoveryProblem, OrsError>;
     fn fence_writer_epoch(
         &self,
         scopes: &[crate::OrderingScope],
@@ -1774,8 +1836,7 @@ impl RedbRecoveryStore {
             // matching digest proves the same result, so binding the missing
             // body is monotonic completion, not an overwrite. Anything else
             // under the same identity stays a conflict.
-            let completes_legacy =
-                same_digest && existing.result_response.is_none();
+            let completes_legacy = same_digest && existing.result_response.is_none();
             if !completes_legacy {
                 return Err(OrsError::HostRequestIdentityConflict {
                     operation_id: operation_id.as_str().to_owned(),
@@ -2181,8 +2242,7 @@ impl RedbRecoveryStore {
                 // unchanged, so an at-least-once retry of an applied
                 // non-admission advance stays idempotent. Conflicting
                 // evidence below still fails without overwriting.
-                (Some(..), Some(..), None) => true,
-                (None, None, None) => true,
+                (Some(..), Some(..), None) | (None, None, None) => true,
                 _ => false,
             };
             if !replayed {
@@ -4535,6 +4595,19 @@ impl RedbRecoveryStore {
         Ok(store)
     }
 
+    /// Opens a Kernel-route test store with the structural Kernel-route evidence.
+    ///
+    /// Test-only composition seam (issue #2031): binds
+    /// [`crate::test_support::KernelRouteEvidence`] so Kernel-route tests share
+    /// one evidence binding instead of vendoring their own. Production
+    /// composition keeps binding its own provider through
+    /// [`Self::open_with_evidence`]. Compiled only with the `test-support`
+    /// feature and never linked into production builds.
+    #[cfg(feature = "test-support")]
+    pub fn open_kernel_route_for_test(path: impl AsRef<Path>) -> Result<Self, OrsError> {
+        Self::open_with_evidence(path, Arc::new(crate::test_support::KernelRouteEvidence))
+    }
+
     fn initialize(&self) -> Result<(), OrsError> {
         let write = self.database.begin_write().map_err(storage)?;
         let table_names = write
@@ -4619,6 +4692,7 @@ impl RedbRecoveryStore {
             drop(write.open_table(DOCTOR_ATTEMPTS).map_err(storage)?);
             drop(write.open_table(DOCTOR_EFFECTS).map_err(storage)?);
             drop(write.open_table(DOCTOR_BUDGETS).map_err(storage)?);
+            drop(write.open_table(RECOVERY_PROBLEMS).map_err(storage)?);
             if initialize_resolution_schema {
                 let mut meta = write.open_table(META).map_err(storage)?;
                 meta.insert(
@@ -4914,6 +4988,108 @@ impl RedbRecoveryStore {
                 .map_err(storage)?;
         }
         Ok(())
+    }
+
+    /// Loads the durable reservation token bound to one staged operation
+    /// identity. Used to bind a Recovery Problem to its epoch, fence, and
+    /// recovery owner when the staged envelope itself cannot be decoded.
+    fn staging_context(
+        &self,
+        operation_id: &crate::OperationIdentity,
+    ) -> Result<WriterReservationToken, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let reservation_id = {
+            let operations = read.open_table(OPERATIONS).map_err(storage)?;
+            operations
+                .get(operation_id.as_str())
+                .map_err(storage)?
+                .map(|value| value.value().to_owned())
+                .ok_or(OrsError::ReservationNotFound)?
+        };
+        let reservation_id =
+            OpaqueLabel::new(reservation_id).map_err(|error| OrsError::IntegrityProblem {
+                record_type: "operation_index",
+                reason: error.to_string(),
+            })?;
+        let reservations = read.open_table(RESERVATIONS).map_err(storage)?;
+        let value = reservations
+            .get(reservation_id.as_str())
+            .map_err(storage)?
+            .ok_or_else(|| OrsError::Storage("operation index is dangling".to_owned()))?;
+        Ok(decode::<ReservationRecord>(value.value())?.token)
+    }
+
+    /// Retains one visible durable Recovery Problem for a staged operation
+    /// whose envelope failed validation (issue #1925, I5.2).
+    ///
+    /// The problem carries digests only — never payload bytes — and the
+    /// staged envelope and reservation rows are left untouched so the
+    /// operation remains available for reconciliation or explicit disposition.
+    /// An identical retained problem is returned unchanged; a conflicting
+    /// binding under the same identity fails without overwriting.
+    fn retain_staging_problem(
+        &self,
+        token: &WriterReservationToken,
+        error: &OrsError,
+        fingerprint: Option<(String, Option<String>)>,
+    ) -> Result<RecoveryProblem, OrsError> {
+        let (envelope_sha256, payload_sha256) = fingerprint.unwrap_or((String::new(), None));
+        let kind = if payload_sha256.is_some() {
+            RecoveryProblemKind::HashMismatch
+        } else {
+            RecoveryProblemKind::EnvelopeIntegrity
+        };
+        let problem = RecoveryProblem::new(
+            token.operation_id.clone(),
+            Some(token.reservation_id.clone()),
+            kind,
+            staging_problem_detail(error)?,
+            (!envelope_sha256.is_empty()).then_some(envelope_sha256),
+            payload_sha256,
+            token.writer_epoch.clone(),
+            token.state_fence.clone(),
+            token.recovery_owner.clone(),
+            current_unix_ms()?,
+        )?;
+        let write = self.database.begin_write().map_err(storage)?;
+        {
+            let problems = write.open_table(RECOVERY_PROBLEMS).map_err(storage)?;
+            let key = problem.operation_or_checkpoint_id.as_str();
+            if let Some(existing) = problems
+                .get(key)
+                .map_err(storage)?
+                .map(|value| decode::<RecoveryProblem>(value.value()))
+                .transpose()?
+            {
+                if existing.terminal_receipt_id.is_some() {
+                    return Ok(existing);
+                }
+                if existing.kind == problem.kind
+                    && existing.detail == problem.detail
+                    && existing.envelope_sha256 == problem.envelope_sha256
+                    && existing.payload_sha256 == problem.payload_sha256
+                    && existing.authority_epoch == problem.authority_epoch
+                    && existing.state_fence == problem.state_fence
+                    && existing.recovery_owner == problem.recovery_owner
+                    && existing.reservation_id == problem.reservation_id
+                {
+                    return Ok(existing);
+                }
+                return Err(OrsError::DuplicateConflict);
+            }
+        }
+        let payload = encode(&problem)?;
+        {
+            let mut problems = write.open_table(RECOVERY_PROBLEMS).map_err(storage)?;
+            problems
+                .insert(
+                    problem.operation_or_checkpoint_id.as_str(),
+                    payload.as_str(),
+                )
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(problem)
     }
 
     fn existing_token(
@@ -6986,6 +7162,230 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             .transpose()
     }
 
+    fn accept_after_stage(&self, request: ReservationRequest) -> Result<AcceptedPending, OrsError> {
+        request
+            .validate()
+            .map_err(|error| OrsError::StagingNotDurable(error.to_string()))?;
+        let token = self
+            .stage_and_reserve(request)
+            .map_err(|error| OrsError::StagingNotDurable(error.to_string()))?;
+        // Read-back proof: the committed envelope must decode and validate,
+        // and the operation index must resolve to this reservation. Only then
+        // may ACCEPTED_PENDING be observed. A read-back validation failure
+        // retains a durable Recovery Problem instead of deleting or
+        // fabricating the staged payload.
+        match self.get_envelope(&token.operation_id) {
+            Ok(Some(envelope)) => {
+                if envelope.operation_or_checkpoint_id != token.operation_id {
+                    return Err(OrsError::StagingNotDurable(
+                        "staged envelope identity does not match the reservation".to_owned(),
+                    ));
+                }
+                let read = self.database.begin_read().map_err(storage)?;
+                let indexed = {
+                    let operations = read.open_table(OPERATIONS).map_err(storage)?;
+                    operations
+                        .get(token.operation_id.as_str())
+                        .map_err(storage)?
+                        .map(|value| value.value().to_owned())
+                };
+                if indexed.as_deref() != Some(token.reservation_id.as_str()) {
+                    return Err(OrsError::StagingNotDurable(
+                        "staged operation index is missing on read-back".to_owned(),
+                    ));
+                }
+                Ok(AcceptedPending {
+                    operation_id: token.operation_id.clone(),
+                    reservation_id: token.reservation_id.clone(),
+                    reservation_order: token.reservation_order,
+                    prepared_transition_sha256: token.prepared_transition_sha256.clone(),
+                })
+            }
+            Ok(None) => Err(OrsError::StagingNotDurable(
+                "staged envelope is missing on read-back".to_owned(),
+            )),
+            Err(error) => {
+                let fingerprint = {
+                    let read = self.database.begin_read().map_err(storage)?;
+                    let table = read.open_table(ENVELOPES).map_err(storage)?;
+                    table
+                        .get(token.operation_id.as_str())
+                        .map_err(storage)?
+                        .map(|value| raw_fingerprint(value.value()))
+                };
+                let retained = self.retain_staging_problem(&token, &error, fingerprint)?;
+                Err(OrsError::RecoveryProblemRetained {
+                    operation_id: retained.operation_or_checkpoint_id.as_str().to_owned(),
+                })
+            }
+        }
+    }
+
+    fn verify_staged_envelope(
+        &self,
+        operation_id: &crate::OperationIdentity,
+    ) -> Result<RecoveryPayloadEnvelope, OrsError> {
+        let raw = {
+            let read = self.database.begin_read().map_err(storage)?;
+            let table = read.open_table(ENVELOPES).map_err(storage)?;
+            table
+                .get(operation_id.as_str())
+                .map_err(storage)?
+                .map(|value| value.value().to_owned())
+        };
+        let Some(raw) = raw else {
+            return Err(OrsError::ReservationNotFound);
+        };
+        match decode::<RecoveryPayloadEnvelope>(raw.as_str()) {
+            Ok(envelope) => {
+                if envelope.operation_or_checkpoint_id != *operation_id {
+                    let context = self.staging_context(operation_id)?;
+                    let retained = self.retain_staging_problem(
+                        &context,
+                        &OrsError::IntegrityProblem {
+                            record_type: "recovery_envelope",
+                            reason: "envelope identity does not match its operation key".to_owned(),
+                        },
+                        Some(raw_fingerprint(&raw)),
+                    )?;
+                    return Err(OrsError::RecoveryProblemRetained {
+                        operation_id: retained.operation_or_checkpoint_id.as_str().to_owned(),
+                    });
+                }
+                Ok(envelope)
+            }
+            Err(error) => {
+                let fingerprint = Some(raw_fingerprint(&raw));
+                let context = self.staging_context(operation_id)?;
+                let retained = self.retain_staging_problem(&context, &error, fingerprint)?;
+                Err(OrsError::RecoveryProblemRetained {
+                    operation_id: retained.operation_or_checkpoint_id.as_str().to_owned(),
+                })
+            }
+        }
+    }
+
+    fn report_recovery_problem(
+        &self,
+        problem: RecoveryProblem,
+    ) -> Result<RecoveryProblem, OrsError> {
+        problem.validate()?;
+        if !matches!(
+            problem.kind,
+            RecoveryProblemKind::MissingKey | RecoveryProblemKind::DecryptionFailure
+        ) {
+            return Err(OrsError::InvalidField {
+                field: "recovery_problem_kind",
+                reason: "external reports are limited to missing-key and decryption-failure causes",
+            });
+        }
+        let write = self.database.begin_write().map_err(storage)?;
+        {
+            let problems = write.open_table(RECOVERY_PROBLEMS).map_err(storage)?;
+            let key = problem.operation_or_checkpoint_id.as_str();
+            if let Some(existing) = problems
+                .get(key)
+                .map_err(storage)?
+                .map(|value| decode::<RecoveryProblem>(value.value()))
+                .transpose()?
+            {
+                if existing == problem
+                    || (existing.operation_or_checkpoint_id == problem.operation_or_checkpoint_id
+                        && existing.kind == problem.kind
+                        && existing.detail == problem.detail
+                        && existing.envelope_sha256 == problem.envelope_sha256
+                        && existing.payload_sha256 == problem.payload_sha256
+                        && existing.authority_epoch == problem.authority_epoch
+                        && existing.state_fence == problem.state_fence
+                        && existing.recovery_owner == problem.recovery_owner
+                        && existing.terminal_receipt_id == problem.terminal_receipt_id)
+                {
+                    return Ok(existing);
+                }
+                return Err(OrsError::DuplicateConflict);
+            }
+        }
+        let payload = encode(&problem)?;
+        {
+            let mut problems = write.open_table(RECOVERY_PROBLEMS).map_err(storage)?;
+            problems
+                .insert(
+                    problem.operation_or_checkpoint_id.as_str(),
+                    payload.as_str(),
+                )
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(problem)
+    }
+
+    fn load_recovery_problem(
+        &self,
+        operation_id: &crate::OperationIdentity,
+    ) -> Result<Option<RecoveryProblem>, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read.open_table(RECOVERY_PROBLEMS).map_err(storage)?;
+        table
+            .get(operation_id.as_str())
+            .map_err(storage)?
+            .map(|value| decode(value.value()))
+            .transpose()
+    }
+
+    fn list_recovery_problems(&self, limit: u16) -> Result<Vec<RecoveryProblem>, OrsError> {
+        if limit == 0 || limit > crate::MAX_RECOVERY_PAGE {
+            return Err(OrsError::InvalidCursorLimit);
+        }
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read.open_table(RECOVERY_PROBLEMS).map_err(storage)?;
+        let mut problems = Vec::new();
+        for row in table.iter().map_err(storage)? {
+            let (_, value) = row.map_err(storage)?;
+            problems.push(decode::<RecoveryProblem>(value.value())?);
+            if problems.len() == usize::from(limit) {
+                break;
+            }
+        }
+        Ok(problems)
+    }
+
+    fn resolve_recovery_problem(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        receipt_id: &OpaqueLabel,
+        recovery_owner: &crate::RecoveryOwner,
+    ) -> Result<RecoveryProblem, OrsError> {
+        let write = self.database.begin_write().map_err(storage)?;
+        let mut problem = {
+            let table = write.open_table(RECOVERY_PROBLEMS).map_err(storage)?;
+            table
+                .get(operation_id.as_str())
+                .map_err(storage)?
+                .map(|value| decode::<RecoveryProblem>(value.value()))
+                .transpose()?
+                .ok_or(OrsError::ReservationNotFound)?
+        };
+        if &problem.recovery_owner != recovery_owner {
+            return Err(OrsError::RecoveryOwnerMismatch);
+        }
+        if let Some(terminal) = &problem.terminal_receipt_id {
+            if terminal == receipt_id {
+                return Ok(problem);
+            }
+            return Err(OrsError::DuplicateConflict);
+        }
+        problem.terminal_receipt_id = Some(receipt_id.clone());
+        let payload = encode(&problem)?;
+        {
+            let mut table = write.open_table(RECOVERY_PROBLEMS).map_err(storage)?;
+            table
+                .insert(operation_id.as_str(), payload.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(problem)
+    }
+
     fn fence_writer_epoch(
         &self,
         scopes: &[crate::OrderingScope],
@@ -7395,6 +7795,59 @@ impl<S: OperationalRecoveryStore> OrsCoordinator<S> {
         self.store.release(token, writer_epoch)
     }
 
+    /// Durably stages one complete opaque operation and returns
+    /// `ACCEPTED_PENDING` only after the commit, read-back, hash validation,
+    /// and operation-identity indexing are proven (issue #1925).
+    pub fn accept_after_stage(
+        &self,
+        request: ReservationRequest,
+    ) -> Result<AcceptedPending, OrsError> {
+        self.store.accept_after_stage(request)
+    }
+
+    /// Revalidates one staged envelope by operation identity, retaining a
+    /// durable Recovery Problem instead of deleting on failure (issue #1925).
+    pub fn verify_staged_envelope(
+        &self,
+        operation_id: &crate::OperationIdentity,
+    ) -> Result<RecoveryPayloadEnvelope, OrsError> {
+        self.store.verify_staged_envelope(operation_id)
+    }
+
+    /// Retains one caller-reported missing-key/decryption-failure problem.
+    /// Digest-only: no payload bytes are accepted or stored.
+    pub fn report_recovery_problem(
+        &self,
+        problem: RecoveryProblem,
+    ) -> Result<RecoveryProblem, OrsError> {
+        self.store.report_recovery_problem(problem)
+    }
+
+    /// Loads one durable Recovery Problem by staged operation identity.
+    pub fn load_recovery_problem(
+        &self,
+        operation_id: &crate::OperationIdentity,
+    ) -> Result<Option<RecoveryProblem>, OrsError> {
+        self.store.load_recovery_problem(operation_id)
+    }
+
+    /// Lists retained Recovery Problems in operation-identity order.
+    pub fn list_recovery_problems(&self, limit: u16) -> Result<Vec<RecoveryProblem>, OrsError> {
+        self.store.list_recovery_problems(limit)
+    }
+
+    /// Closes one retained Recovery Problem from an explicit terminal receipt
+    /// under the exact recovery owner.
+    pub fn resolve_recovery_problem(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        receipt_id: &OpaqueLabel,
+        recovery_owner: &crate::RecoveryOwner,
+    ) -> Result<RecoveryProblem, OrsError> {
+        self.store
+            .resolve_recovery_problem(operation_id, receipt_id, recovery_owner)
+    }
+
     /// Stages one P-04 host-request operation before any acknowledgement.
     pub fn stage_host_request(
         &self,
@@ -7591,6 +8044,54 @@ fn require_writer_epoch(
         return Err(OrsError::StaleWriterEpoch);
     }
     Ok(())
+}
+
+/// Fingerprints one raw staged-envelope row without trusting it: the SHA-256
+/// of the exact stored bytes plus the declared payload digest when it is
+/// digest-shaped. Used only to bind a Recovery Problem to the corrupted row;
+/// the bytes themselves are never interpreted.
+fn raw_fingerprint(raw: &str) -> (String, Option<String>) {
+    let envelope_sha256 = crate::model::sha256_hex(raw.as_bytes());
+    let payload_sha256 = serde_json::from_str::<serde_json::Value>(raw)
+        .ok()
+        .and_then(|value| Some(value.get("payload_sha256")?.as_str()?.to_owned()))
+        .filter(|digest| {
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        });
+    (envelope_sha256, payload_sha256)
+}
+
+/// Builds the bounded operator-visible cause for a staging validation
+/// failure. Control characters are neutralized and the text is truncated so
+/// the label bound always holds; no payload bytes are ever included.
+fn staging_problem_detail(error: &OrsError) -> Result<OpaqueLabel, OrsError> {
+    let collapsed: String = error
+        .to_string()
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    let mut detail = collapsed.split_whitespace().collect::<Vec<_>>().join(" ");
+    while detail.len() > 512 {
+        detail.pop();
+    }
+    let trimmed = detail.trim();
+    if trimmed.is_empty() {
+        return Err(OrsError::StagingNotDurable(
+            "staging failure has no reportable cause".to_owned(),
+        ));
+    }
+    OpaqueLabel::new(trimmed).map_err(|_| {
+        OrsError::StagingNotDurable("staging failure has no reportable cause".to_owned())
+    })
 }
 
 fn shares_scope(left: &WriterReservationToken, right: &WriterReservationToken) -> bool {
@@ -7975,8 +8476,7 @@ mod host_request_result_tests {
         let early_digest = "e".repeat(64);
         let early_op =
             OperationIdentity::new(format!("hostreq:{early_digest}")).expect("valid operation");
-        early_store
-            .stage_host_request(&requested_fixture(early_op.as_str(), &early_digest))?;
+        early_store.stage_host_request(&requested_fixture(early_op.as_str(), &early_digest))?;
         assert!(matches!(
             early_store.persist_host_request_result(
                 &early_op,
@@ -7998,9 +8498,8 @@ mod host_request_result_tests {
                 "revision_heads": [{"key": "scope:scope-1", "revision": 3}],
             },
         });
-        let result_digest = crate::model::sha256_hex(
-            &serde_json::to_vec(&body).expect("test body must serialize"),
-        );
+        let result_digest =
+            crate::model::sha256_hex(&serde_json::to_vec(&body).expect("test body must serialize"));
         let received = store
             .persist_host_request_result(&operation, &digest, &result_digest, &body)?
             .expect("resulted record must load");
@@ -8093,7 +8592,10 @@ mod host_request_result_tests {
         let completed = store
             .persist_host_request_result(&operation, &digest, &result_digest, &body)?
             .expect("exact-digest completion must store");
-        assert_eq!(completed.result_digest.as_deref(), Some(result_digest.as_str()));
+        assert_eq!(
+            completed.result_digest.as_deref(),
+            Some(result_digest.as_str())
+        );
         assert_eq!(completed.result_response.as_ref(), Some(&body));
         assert!(matches!(
             store.persist_host_request_result(&operation, &digest, &"0".repeat(64), &body,),
