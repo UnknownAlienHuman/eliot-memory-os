@@ -428,6 +428,16 @@ def self_test() -> None:
             raise AssertionError("worker-fetch fixture did not fail")
         start_path.write_text(good_start, encoding="utf-8")
 
+        start_path.write_text(good_start + "\ngit pull --ff-only\n", encoding="utf-8")
+        if not any(item.code == "onboarding_worker_sync" for item in verify_onboarding(root)):
+            raise AssertionError("worker-pull fixture did not fail")
+        start_path.write_text(good_start, encoding="utf-8")
+
+        start_path.write_text(good_start + "\ngit reset --hard origin/main\n", encoding="utf-8")
+        if not any(item.code == "onboarding_worker_sync" for item in verify_onboarding(root)):
+            raise AssertionError("worker-reset fixture did not fail")
+        start_path.write_text(good_start, encoding="utf-8")
+
         ref_bad = good_start + (
             "\ngit rev-list --count HEAD..origin/main\n"
             "git ls-tree -r --name-only origin/main\n"
@@ -442,6 +452,11 @@ def self_test() -> None:
         if not any(item.code == "onboarding_self_merge" for item in verify_onboarding(root)):
             raise AssertionError("self-merge fixture did not fail")
         start_path.write_text(good_start, encoding="utf-8")
+
+        readme_path.write_text(good_readme + "\ngh pr merge 12 --squash --delete-branch\n", encoding="utf-8")
+        if not any(item.code == "onboarding_self_merge" for item in verify_onboarding(root)):
+            raise AssertionError("readme self-merge fixture did not fail")
+        readme_path.write_text(good_readme, encoding="utf-8")
 
         start_path.write_text(good_start + "\ncargo check -p foo --all-targets\n", encoding="utf-8")
         if not any(item.code == "onboarding_unlocked_cargo" for item in verify_onboarding(root)):
@@ -476,7 +491,7 @@ def self_test() -> None:
         if final:
             raise AssertionError(f"restored onboarding fixture failed: {final}")
 
-    print("AGENT_GUARDRAILS_SELF_TEST: PASS cases=14")
+    print("AGENT_GUARDRAILS_SELF_TEST: PASS cases=17")
 
 
 def parse_args() -> argparse.Namespace:

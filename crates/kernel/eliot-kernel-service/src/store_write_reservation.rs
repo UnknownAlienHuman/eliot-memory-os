@@ -86,10 +86,11 @@ use eliot_platform::SecretReference;
 use eliot_receipts::ReceiptDispositionKind;
 use eliot_security_contracts::PrivacyClass;
 use eliot_store_api::{
-    CanonicalRequestView, OrderingHeadExpectation, OrderingScopeId, PreparedTransition,
-    ReceiptEnvelope, ReservedScopeBinding, ReservedWriteRequest, RevisionHeadExpectation,
-    WriteAdmissionParams, WriteAdmissionProjection, WriteReceipt, WriteReceiptStatus,
-    WriterEpochBinding, prepared_transition_digest, verify_canonical_request_hash,
+    CAPABILITY_RESERVED_WRITE, CanonicalRequestView, OrderingHeadExpectation, OrderingScopeId,
+    PreparedTransition, ReceiptEnvelope, ReservedScopeBinding, ReservedWriteRequest,
+    RevisionHeadExpectation, WriteAdmissionParams, WriteAdmissionProjection, WriteReceipt,
+    WriteReceiptStatus, WriterEpochBinding, prepared_transition_digest,
+    verify_canonical_request_hash,
 };
 
 /// Composition-owned key reference under which the Kernel stages reservation
@@ -974,13 +975,18 @@ fn check_receipt_token_binding(
             return Err(binding("Store receipt misses a reserved scope sequence"));
         }
     }
-    if token.scopes.len() == 1
-        && envelope.core.causal.transaction_sequence.value() != token.scopes[0].reserved_sequence
-    {
-        return Err(binding(
-            "receipt causal sequence does not match the reserved sequence",
-        ));
-    }
+    // No envelope-causal restatement is demanded here, deliberately. The
+    // reserved-order binding is established above on the receipt body
+    // (scope set plus per-scope sequences), and the envelope operation,
+    // fence and structural validity are checked by the caller chain.
+    // A single-scope causal equality against the reserved sequence would
+    // require the producer to state a non-genesis chain position, but the
+    // canonical causal model admits non-genesis positions only with a
+    // parent link (`CausalBinding::validate`: "non-genesis receipt
+    // requires a parent"), the closed store issuance carries genesis, and
+    // no consumer reads the envelope causal. Demanding the restatement
+    // therefore rejects every live receipt while proving nothing the body
+    // checks do not already prove (issue #2031 native cases 15/19).
     Ok(())
 }
 
@@ -1110,4 +1116,71 @@ pub fn gateway_seed(
         expires_at_ms,
         heads,
     })
+}
+
+/// Kernel-visible reserved submission: one validated closed reserved-write
+/// request selecting the exact Store reserved-write capability (issue #2031).
+///
+/// Carries the `#990` sealed admission binding across the Kernel-to-Store
+/// boundary together with the `#991` capability identity, so capability gates
+/// (wire `StoreRequest::capability`, session admission, scheduler profile)
+/// observe the same value the Store backend enforces. The request is validated
+/// at construction; no second serializer exists and no fallback to unreserved
+/// `Apply` is possible through this type. The capability is the Store
+/// declaration itself ([`CAPABILITY_RESERVED_WRITE`]): API presence is not
+/// readiness, and the capability stays unadvertised until a backend with an
+/// accepted scheduler advertises it. Kernel submissions always name it, so a
+/// session without the admitted capability refuses before dispatch while
+/// ordinary operations keep flowing.
+#[derive(Clone, Debug)]
+pub struct ReservedSubmission {
+    request: ReservedWriteRequest,
+}
+
+impl ReservedSubmission {
+    /// Wraps one closed reserved-write request after validating its shape.
+    ///
+    /// Shape failures preserve the owner `StoreError`; nothing is staged,
+    /// sent, or reconciled here.
+    pub fn new(request: ReservedWriteRequest) -> Result<Self, ReservationWriteError> {
+        request.validate()?;
+        Ok(Self { request })
+    }
+
+    /// Projects one sealed reservation into a submission carrying the reserved
+    /// capability.
+    ///
+    /// Runs the exact `#990` projection shared with the gateway path, then
+    /// validates once more at the boundary. A transition mutated after
+    /// reservation fails here.
+    pub fn from_sealed(
+        sealed: &SealedReservation,
+        context: &RequestMetadata,
+        transition: &PreparedTransition,
+        expected_revision_heads: Vec<RevisionHeadExpectation>,
+        expected_ordering_heads: Vec<OrderingHeadExpectation>,
+    ) -> Result<Self, ReservationWriteError> {
+        Self::new(project_reserved_write(
+            sealed,
+            context,
+            transition,
+            expected_revision_heads,
+            expected_ordering_heads,
+        )?)
+    }
+
+    /// Exact Store capability this submission selects.
+    pub fn capability(&self) -> &'static str {
+        CAPABILITY_RESERVED_WRITE
+    }
+
+    /// Borrows the closed reserved-write request.
+    pub fn request(&self) -> &ReservedWriteRequest {
+        &self.request
+    }
+
+    /// Releases the owned closed request for the single authenticated send.
+    pub fn into_request(self) -> ReservedWriteRequest {
+        self.request
+    }
 }

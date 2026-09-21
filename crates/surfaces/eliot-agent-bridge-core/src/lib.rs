@@ -1463,6 +1463,58 @@ const fn phase_reaches(required: AckPhase, observed: AckPhase) -> bool {
     }
 }
 
+/// I7.17 default bound for agent-facing recall handles.
+///
+/// Agent output is handles-first: at most this many top admissible handles
+/// plus the rank-trace handle travel by default, regardless of how many the
+/// server admitted.
+pub const MAX_AGENT_RECALL_HANDLES: usize = 8;
+
+/// I7.17 bounded agent-facing recall projection.
+///
+/// Default output carries the server-derived disposition, the binding
+/// receipt, bounded top handles, and the rank-trace handle. Full ranking and
+/// suppression traces travel only behind explicit debug expansion
+/// (`debug_rank_trace`). The projection never accepts a disposition from
+/// bridge/model output: both inputs are server-issued and the verdict is
+/// re-validated against the response before anything is projected.
+#[derive(Clone, Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentRecallProjection {
+    pub disposition: eliot_types::RecallDisposition,
+    pub receipt: eliot_types::RecallReceipt,
+    pub rank_trace_handle: String,
+    pub handles: Vec<eliot_types::MemoryHandlePreview>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub debug_rank_trace: Option<eliot_types::L0RankTrace>,
+}
+
+/// Projects one server-issued recall response for the agent.
+///
+/// Fails closed when the verdict does not bind the response, including any
+/// forged or agent-invented disposition, which invalidates the rank-trace
+/// handle. Handles are truncated to [`MAX_AGENT_RECALL_HANDLES`] without
+/// touching the receipt counts, which continue to describe the full
+/// server-side visible/suppressed totals.
+pub fn project_recall_for_agent(
+    response: &eliot_types::RecallL0Response,
+    verdict: &eliot_types::ServerRecallVerdict,
+    debug_expand_ranking: bool,
+) -> Result<AgentRecallProjection, BridgeError> {
+    verdict
+        .validate_for_l0_response(response)
+        .map_err(BridgeError::ProviderContract)?;
+    let mut handles = response.handles.clone();
+    handles.truncate(MAX_AGENT_RECALL_HANDLES);
+    Ok(AgentRecallProjection {
+        disposition: verdict.disposition,
+        receipt: verdict.receipt.clone(),
+        rank_trace_handle: verdict.rank_trace_handle.clone(),
+        handles,
+        debug_rank_trace: debug_expand_ranking.then(|| response.rank_trace.clone()),
+    })
+}
+
 /// Typed Skill candidate submission. Fields are private and deserialization
 /// re-runs the constructor, so malformed digests, blank references, or
 /// duplicate evidence cannot be created. The admission fence travels in the
