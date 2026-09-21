@@ -122,6 +122,15 @@ fn canonical_digest<T: Serialize>(value: &T, field: &'static str) -> Result<Stri
     Ok(sha256_hex(&bytes))
 }
 
+/// Read-only view over the tool owner's registry, implemented by the tool
+/// owner and passed at installation and activation boundaries. This crate
+/// mints no registry and ships no default set: an unknown name fails closed
+/// here, so absent tools or capabilities cannot pass via nonempty strings.
+pub trait KnownTools {
+    /// Returns `true` only for an exact known tool or capability name.
+    fn knows_tool(&self, name: &str) -> bool;
+}
+
 /// Index row of one catalogue Skill (`I7.12`): name plus one-line trigger.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -178,6 +187,22 @@ impl SkillBody {
 
     pub fn expected_digest(&self) -> Result<String, SkillError> {
         canonical_digest(&self.digest_input(), "body.digest")
+    }
+
+    /// Rejects tool references the tool owner does not know. Structural
+    /// [`validate`](Self::validate) stays total; this boundary check runs at
+    /// installation and activation, where a caller-supplied [`KnownTools`]
+    /// view is available.
+    pub fn validate_tools(&self, tools: &impl KnownTools) -> Result<(), SkillError> {
+        for tool in &self.tool_refs {
+            if !tools.knows_tool(tool) {
+                return Err(SkillError::InvalidField {
+                    field: "body.tool_refs",
+                    reason: "unknown tool reference",
+                });
+            }
+        }
+        Ok(())
     }
 
     pub fn validate(&self) -> Result<(), SkillError> {
@@ -437,16 +462,25 @@ pub struct SkillCatalogue {
 impl SkillCatalogue {
     pub fn from_snapshot(
         entries: impl IntoIterator<Item = SkillCatalogueEntry>,
+        tools: &impl KnownTools,
     ) -> Result<Self, SkillError> {
         let mut catalogue = Self::default();
         for entry in entries {
-            catalogue.insert(entry)?;
+            catalogue.insert(entry, tools)?;
         }
         Ok(catalogue)
     }
 
-    pub fn insert(&mut self, entry: SkillCatalogueEntry) -> Result<(), SkillError> {
+    /// Installs one validated entry. Structural validation plus the tool
+    /// owner's existence check both run: unknown tool references fail closed
+    /// here, never at first activation.
+    pub fn insert(
+        &mut self,
+        entry: SkillCatalogueEntry,
+        tools: &impl KnownTools,
+    ) -> Result<(), SkillError> {
         entry.validate()?;
+        entry.body.validate_tools(tools)?;
         self.entries.insert(entry.index.skill_id.clone(), entry);
         Ok(())
     }
@@ -485,7 +519,10 @@ impl SkillCatalogue {
 
     /// Records an observed dependency set. A change marks the entry stale
     /// with a reason and blocks use before Material work (`I7.13`).
-    /// Returns `true` when the entry became stale.
+    /// Quarantined entries are left untouched: quarantine is governed state
+    /// and its reason changes only through review (mirrors
+    /// `activation::apply_dependency_staleness`). Returns `true` when the
+    /// entry became stale.
     pub fn note_dependency_change(
         &mut self,
         skill_id: &str,
@@ -497,6 +534,9 @@ impl SkillCatalogue {
         }
         check_text(&reason, "entry.stale_reason")?;
         let entry = self.entries.get_mut(skill_id).ok_or(SkillError::NotFound)?;
+        if entry.status == SkillStatus::Quarantined {
+            return Ok(false);
+        }
         entry.validate()?;
         let mut current = entry.dependencies.clone();
         let mut next = observed;
@@ -562,13 +602,17 @@ impl SkillCatalogue {
     /// trigger, the validated body version and digest, budget accounting,
     /// dependency versions, route/profile eligibility, and the binding
     /// Hotset delivery receipt. The receipt must bind this exact catalogue
-    /// state: a receipt issued against an older revision is rejected with
-    /// [`SkillError::IdentityMismatch`] rather than displaying an
-    /// undelivered body beside a stale receipt.
+    /// state, and only an applied receiver ack for that exact receipt
+    /// establishes delivery: a receipt issued against an older revision, or
+    /// presented without its ack, is rejected rather than displaying an
+    /// undelivered body. Named tools are rechecked against the tool owner's
+    /// view at this boundary.
     pub fn activation_display(
         &self,
         skill_id: &str,
         receipt: &HotsetDeliveryReceipt,
+        ack: &HotsetDeliveryAck,
+        tools: &impl KnownTools,
     ) -> Result<ActivatedSkillDisplay, SkillError> {
         let entry = self.entries.get(skill_id).ok_or(SkillError::NotFound)?;
         entry.validate()?;
@@ -582,6 +626,17 @@ impl SkillCatalogue {
         if receipt.catalogue_digest != self.catalogue_digest()? {
             return Err(SkillError::IdentityMismatch);
         }
+        ack.validate()?;
+        if ack.hotset_id != receipt.hotset_id || ack.receipt_digest != receipt.receipt_digest {
+            return Err(SkillError::IdentityMismatch);
+        }
+        if ack.disposition != HotsetAckDisposition::Applied {
+            return Err(SkillError::InvalidField {
+                field: "delivery.ack",
+                reason: "activation requires an applied receiver ack for this receipt",
+            });
+        }
+        entry.body.validate_tools(tools)?;
         if !receipt.confirms_delivery(skill_id) {
             return Err(SkillError::InvalidField {
                 field: "delivery.receipt",
@@ -606,6 +661,63 @@ impl SkillCatalogue {
             profile_version: entry.profile_version.clone(),
             delivery_receipt_digest: receipt.receipt_digest.clone(),
         })
+    }
+}
+
+/// Receiver acknowledgement of a Hotset delivery (`I7.13`).
+///
+/// Issuing a [`HotsetDeliveryReceipt`] records what the Hotset carried; it
+/// is never observer acknowledgement. Only a real receiver ack establishes
+/// delivery: the receiver validates the receipt, applies or rejects the
+/// bodies, and returns this ack binding the exact receipt digest it acted
+/// on. Activation requires an applied ack, never a bare issued receipt.
+///
+/// This is the catalogue-to-runtime handoff layer. Per-attempt observation
+/// (retrieval, delivery status, adherence) lives in `activation.rs` and is
+/// orthogonal: an applied ack here does not claim attempt usefulness.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HotsetDeliveryAck {
+    /// Hotset the receiver acted on. Must equal the receipt's hotset.
+    pub hotset_id: String,
+    /// Digest of the exact receipt the receiver acted on.
+    pub receipt_digest: String,
+    /// Receiver identity (runtime Hotset injector). Must be non-blank.
+    pub receiver_id: String,
+    /// Whether the receiver applied or rejected the delivered bodies.
+    pub disposition: HotsetAckDisposition,
+}
+
+/// Receiver disposition for one Hotset delivery.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HotsetAckDisposition {
+    /// The receiver applied every delivered body.
+    Applied,
+    /// The receiver rejected the delivery with a bounded reason.
+    Rejected { reason: String },
+}
+
+impl HotsetDeliveryAck {
+    /// Validates the ack shape. Binding to a receipt is checked by the
+    /// caller against the exact receipt digest (`activation_display`).
+    pub fn validate(&self) -> Result<(), SkillError> {
+        check_text(&self.hotset_id, "delivery_ack.hotset_id")?;
+        check_digest(&self.receipt_digest, "delivery_ack.receipt_digest")?;
+        check_text(&self.receiver_id, "delivery_ack.receiver_id")?;
+        if let HotsetAckDisposition::Rejected { reason } = &self.disposition {
+            check_text(reason, "delivery_ack.reason")?;
+        }
+        Ok(())
+    }
+
+    /// Returns `true` only for an applied ack binding exactly this receipt:
+    /// same Hotset identity and same receipt digest.
+    #[must_use]
+    pub fn confirms_applied(&self, receipt: &HotsetDeliveryReceipt) -> bool {
+        self.disposition == HotsetAckDisposition::Applied
+            && self.hotset_id == receipt.hotset_id
+            && self.receipt_digest == receipt.receipt_digest
     }
 }
 
@@ -643,6 +755,7 @@ impl HotsetDeliveryReceipt {
         hotset_id: String,
         catalogue: &SkillCatalogue,
         delivered_skill_ids: Vec<String>,
+        tools: &impl KnownTools,
     ) -> Result<Self, SkillError> {
         check_text(&hotset_id, "delivery.hotset_id")?;
         if delivered_skill_ids.is_empty() {
@@ -665,6 +778,7 @@ impl HotsetDeliveryReceipt {
         for skill_id in &ordered_ids {
             let entry = catalogue.get(skill_id).ok_or(SkillError::NotFound)?;
             entry.validate()?;
+            entry.body.validate_tools(tools)?;
             if !entry.is_usable() {
                 return Err(SkillError::InvalidField {
                     field: "delivery.delivered_skill_ids",
@@ -829,6 +943,26 @@ mod tests {
 
     const BODY_DIGEST_A: &str = "a";
 
+    struct TestTools;
+
+    impl KnownTools for TestTools {
+        fn knows_tool(&self, name: &str) -> bool {
+            name == "eliot.finish"
+        }
+    }
+
+    struct EmptyTools;
+
+    impl KnownTools for EmptyTools {
+        fn knows_tool(&self, _name: &str) -> bool {
+            false
+        }
+    }
+
+    fn tools() -> TestTools {
+        TestTools
+    }
+
     fn digest_for(body: &SkillBody) -> String {
         body.expected_digest().expect("test digest")
     }
@@ -898,8 +1032,17 @@ mod tests {
     }
 
     fn catalogue_two() -> SkillCatalogue {
-        SkillCatalogue::from_snapshot([entry("skill-alpha"), entry("skill-beta")])
+        SkillCatalogue::from_snapshot([entry("skill-alpha"), entry("skill-beta")], &tools())
             .expect("test catalogue")
+    }
+
+    fn applied_ack(receipt: &HotsetDeliveryReceipt) -> HotsetDeliveryAck {
+        HotsetDeliveryAck {
+            hotset_id: receipt.hotset_id.clone(),
+            receipt_digest: receipt.receipt_digest.clone(),
+            receiver_id: "runtime-hotset-1".to_owned(),
+            disposition: HotsetAckDisposition::Applied,
+        }
     }
 
     fn promote_current(catalogue: &mut SkillCatalogue, skill_id: &str) {
@@ -925,10 +1068,13 @@ mod tests {
             "hotset-1".to_owned(),
             &catalogue,
             vec!["skill-alpha".to_owned()],
+            &tools(),
         )
         .expect("delivery receipt");
+        let ack = applied_ack(&receipt);
+        ack.validate().expect("ack validates");
         let display = catalogue
-            .activation_display("skill-alpha", &receipt)
+            .activation_display("skill-alpha", &receipt, &ack, &tools())
             .expect("activation display");
         display.validate().expect("display validates");
         let rendered = display.render();
@@ -999,6 +1145,7 @@ mod tests {
             "hotset-stale".to_owned(),
             &catalogue,
             vec!["skill-alpha".to_owned()],
+            &tools(),
         );
         assert!(matches!(
             receipt,
@@ -1009,14 +1156,15 @@ mod tests {
             "hotset-fresh".to_owned(),
             &catalogue,
             vec!["skill-alpha".to_owned()],
+            &tools(),
         );
         assert!(fresh.is_err());
     }
 
     #[test]
     fn promotion_depth_requires_independent_routes_and_approval_for_shared() {
-        let mut catalogue =
-            SkillCatalogue::from_snapshot([entry("skill-shared")]).expect("test catalogue");
+        let mut catalogue = SkillCatalogue::from_snapshot([entry("skill-shared")], &tools())
+            .expect("test catalogue");
         let shallow = catalogue.promote(
             "skill-shared",
             &PromotionEvidence {
@@ -1060,27 +1208,29 @@ mod tests {
             "hotset-old".to_owned(),
             &catalogue,
             vec!["skill-alpha".to_owned()],
+            &tools(),
         )
         .expect("old receipt");
         catalogue
-            .activation_display("skill-alpha", &stale)
+            .activation_display("skill-alpha", &stale, &applied_ack(&stale), &tools())
             .expect("display with current receipt");
         let mut revised = entry("skill-alpha");
         revised.body = body("skill-alpha", "2.0.0");
         revised.runtime = runtime("skill-alpha", "2.0.0");
-        catalogue.insert(revised).expect("revised entry");
+        catalogue.insert(revised, &tools()).expect("revised entry");
         assert!(matches!(
-            catalogue.activation_display("skill-alpha", &stale),
+            catalogue.activation_display("skill-alpha", &stale, &applied_ack(&stale), &tools()),
             Err(SkillError::IdentityMismatch)
         ));
         let fresh = HotsetDeliveryReceipt::issue(
             "hotset-new".to_owned(),
             &catalogue,
             vec!["skill-alpha".to_owned()],
+            &tools(),
         )
         .expect("fresh receipt");
         let display = catalogue
-            .activation_display("skill-alpha", &fresh)
+            .activation_display("skill-alpha", &fresh, &applied_ack(&fresh), &tools())
             .expect("display with fresh receipt");
         assert_eq!(display.body_version, "2.0.0");
     }
@@ -1092,6 +1242,7 @@ mod tests {
             "hotset-order".to_owned(),
             &catalogue,
             vec!["skill-beta".to_owned(), "skill-alpha".to_owned()],
+            &tools(),
         )
         .expect("unordered delivery");
         assert_eq!(
@@ -1102,9 +1253,117 @@ mod tests {
             "hotset-order".to_owned(),
             &catalogue,
             vec!["skill-alpha".to_owned(), "skill-beta".to_owned()],
+            &tools(),
         )
         .expect("ordered delivery");
         assert_eq!(first.receipt_digest, second.receipt_digest);
+    }
+
+    #[test]
+    fn unknown_tool_reference_fails_closed_at_install_and_activation() {
+        let mut unknown = entry("skill-unknown-tool");
+        unknown.body.tool_refs = vec!["phantom.missing".to_owned()];
+        unknown.body.body_digest = digest_for(&unknown.body);
+        let mut catalogue = catalogue_two();
+        assert!(matches!(
+            catalogue.insert(unknown, &tools()),
+            Err(SkillError::InvalidField { field, .. }) if field == "body.tool_refs"
+        ));
+
+        let mut catalogue = catalogue_two();
+        promote_current(&mut catalogue, "skill-alpha");
+        let receipt = HotsetDeliveryReceipt::issue(
+            "hotset-tools".to_owned(),
+            &catalogue,
+            vec!["skill-alpha".to_owned()],
+            &tools(),
+        )
+        .expect("delivery receipt");
+        assert!(matches!(
+            catalogue.activation_display(
+                "skill-alpha",
+                &receipt,
+                &applied_ack(&receipt),
+                &EmptyTools
+            ),
+            Err(SkillError::InvalidField { field, .. }) if field == "body.tool_refs"
+        ));
+    }
+
+    #[test]
+    fn activation_requires_applied_ack_for_the_exact_receipt() {
+        let mut catalogue = catalogue_two();
+        promote_current(&mut catalogue, "skill-alpha");
+        let receipt = HotsetDeliveryReceipt::issue(
+            "hotset-ack".to_owned(),
+            &catalogue,
+            vec!["skill-alpha".to_owned()],
+            &tools(),
+        )
+        .expect("delivery receipt");
+        let missing_ack = HotsetDeliveryAck {
+            hotset_id: "other-hotset".to_owned(),
+            receipt_digest: receipt.receipt_digest.clone(),
+            receiver_id: "runtime-hotset-1".to_owned(),
+            disposition: HotsetAckDisposition::Applied,
+        };
+        assert!(!missing_ack.confirms_applied(&receipt));
+        assert!(matches!(
+            catalogue.activation_display("skill-alpha", &receipt, &missing_ack, &tools()),
+            Err(SkillError::IdentityMismatch)
+        ));
+        let tampered = HotsetDeliveryAck {
+            hotset_id: receipt.hotset_id.clone(),
+            receipt_digest: "0".repeat(64),
+            receiver_id: "runtime-hotset-1".to_owned(),
+            disposition: HotsetAckDisposition::Applied,
+        };
+        assert!(matches!(
+            catalogue.activation_display("skill-alpha", &receipt, &tampered, &tools()),
+            Err(SkillError::IdentityMismatch)
+        ));
+        let rejected = HotsetDeliveryAck {
+            disposition: HotsetAckDisposition::Rejected {
+                reason: "receiver refused the bodies".to_owned(),
+            },
+            ..applied_ack(&receipt)
+        };
+        assert!(matches!(
+            catalogue.activation_display("skill-alpha", &receipt, &rejected, &tools()),
+            Err(SkillError::InvalidField { field, .. }) if field == "delivery.ack"
+        ));
+        let anonymous = HotsetDeliveryAck {
+            receiver_id: "   ".to_owned(),
+            ..applied_ack(&receipt)
+        };
+        assert!(matches!(
+            catalogue.activation_display("skill-alpha", &receipt, &anonymous, &tools()),
+            Err(SkillError::InvalidField { field, .. }) if field == "delivery_ack.receiver_id"
+        ));
+    }
+
+    #[test]
+    fn quarantined_entries_keep_governed_reason_on_dependency_drift() {
+        let mut quarantined = entry("skill-quarantined");
+        quarantined.status = SkillStatus::Quarantined;
+        quarantined.stale_reason = Some("governed review hold".to_owned());
+        let mut catalogue =
+            SkillCatalogue::from_snapshot([quarantined], &tools()).expect("test catalogue");
+        let mut drifted = vec![dependency("tool-def-1")];
+        drifted[0].version = "9.9.9".to_owned();
+        assert!(
+            !catalogue
+                .note_dependency_change(
+                    "skill-quarantined",
+                    drifted,
+                    "tool-def-1 moved to 9.9.9".to_owned(),
+                )
+                .expect("quarantine preserved")
+        );
+        let stored = catalogue.get("skill-quarantined").expect("stored entry");
+        assert_eq!(stored.status, SkillStatus::Quarantined);
+        assert_eq!(stored.stale_reason.as_deref(), Some("governed review hold"));
+        assert!(!catalogue.is_usable("skill-quarantined"));
     }
 
     #[test]
@@ -1116,6 +1375,7 @@ mod tests {
             "hotset-2".to_owned(),
             &catalogue,
             vec!["skill-alpha".to_owned()],
+            &tools(),
         )
         .expect("delivery receipt");
         receipt.validate().expect("receipt validates");
@@ -1123,7 +1383,8 @@ mod tests {
         assert!(!receipt.confirms_delivery("skill-beta"));
         assert_eq!(catalogue.installed_ids().len(), 2);
         assert_eq!(receipt.delivered_skill_ids.len(), 1);
-        let blocked = catalogue.activation_display("skill-beta", &receipt);
+        let blocked =
+            catalogue.activation_display("skill-beta", &receipt, &applied_ack(&receipt), &tools());
         assert!(matches!(
             blocked,
             Err(SkillError::InvalidField { field, .. }) if field == "delivery.receipt"
