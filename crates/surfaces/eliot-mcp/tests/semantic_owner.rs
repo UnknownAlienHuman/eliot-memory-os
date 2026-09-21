@@ -146,20 +146,21 @@ fn canonical_registry_value_answers_version_bound_skill_membership() {
 }
 
 #[test]
-fn user_automation_route_has_one_semantic_owner() {
+fn user_automation_route_is_typed_but_not_a_hot_tool_owner() {
     let request = ToolRequest::UserAutomation(UserAutomationInput {
         operation: eliot_kernel_core::UserAutomationOperation::List {
             include_retired: false,
         },
         idempotency_key: "operator-retry-1".to_owned(),
     });
-    let profile = validate_tool_request_owner(&request).expect("UserAutomation route is owned");
-    assert_eq!(profile.method.canonical_name, "eliot_user_automation");
-    assert!(!routing_decision(&profile).read_only);
-    assert!(!routing_decision(&profile).retry_safe);
+    assert!(
+        validate_tool_request_owner(&request).is_err(),
+        "cold operator route must not resolve through the hot-tool registry"
+    );
+    assert!(!CANONICAL_TOOL_NAMES.contains(&request.canonical_name()));
     let surface = published_mcp_tool_surface().expect("material surface builds");
     assert!(
-        surface
+        !surface
             .iter()
             .any(|descriptor| descriptor.name == "eliot_user_automation")
     );

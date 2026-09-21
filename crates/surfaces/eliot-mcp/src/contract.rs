@@ -62,7 +62,13 @@ pub struct ApplicationRequest {
 /// Authenticated Kernel selector for the UserAutomation operator route.
 pub const USER_AUTOMATION_ROUTE: &str = "eliot_user_automation";
 
-/// Exact canonical tool requests.
+/// Closed typed requests used by the MCP hot surface and the authenticated
+/// Host/operator bridge.
+///
+/// `UserAutomation` is deliberately a cold/operator route. It remains typed
+/// here so the Host bridge and CLI share one payload contract, but it is not
+/// admitted by [`ADMITTED_TOOL_NAMES`], published by the canonical MCP schema,
+/// or assigned a semantic hot-tool profile.
 #[derive(Clone, Debug, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "name", content = "arguments", deny_unknown_fields)]
 pub enum ToolRequest {
@@ -90,7 +96,7 @@ pub enum ToolRequest {
     /// Candidate finish attempt.
     #[serde(rename = "eliot.finish")]
     Finish(FinishAttemptDraft),
-    /// Authenticated UserAutomation operator operation.
+    /// Authenticated UserAutomation operator operation carried by Host/CLI.
     #[serde(rename = "eliot_user_automation")]
     UserAutomation(UserAutomationInput),
 }
@@ -822,7 +828,7 @@ pub const PROTECTED_ENVELOPE_KEYS: [&str; 6] = [
 
 /// Explicitly admitted tool variants.
 /// Unknown variants are rejected before collapse; no trial decoding is used.
-pub const ADMITTED_TOOL_NAMES: [&str; 9] = [
+pub const ADMITTED_TOOL_NAMES: [&str; 8] = [
     "eliot.state",
     "eliot.packet",
     "eliot.observe",
@@ -831,7 +837,6 @@ pub const ADMITTED_TOOL_NAMES: [&str; 9] = [
     "eliot.verify",
     "eliot.coordinate",
     "eliot.finish",
-    "eliot_user_automation",
 ];
 
 /// Maximum decoded control-name length echoed in diagnostics. Longer names
