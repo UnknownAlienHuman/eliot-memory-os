@@ -569,13 +569,18 @@ fn host_request_user_automation_frame(
 ///
 /// `eliot.query` and `eliot.packet` ride the invoke-read entry so the kernel
 /// can check tool linkage before reading and serve the exact bounded result
-/// with its revision; every other tool keeps the admission-only submit entry.
-/// `eliot.packet` parity falls out of the same op because the tool bytes are
-/// opaque here: the kernel, not the pipe, owns their meaning.
+/// with its revision; skill carriers (`skill.inject`, `skill.display`) ride
+/// it so the daemon can claim and serve Hotset pairs through the same
+/// linkage-checked leg; every other tool keeps the admission-only submit
+/// entry. `eliot.packet` parity falls out of the same op because the tool
+/// bytes are opaque here: the kernel, not the pipe, owns their meaning.
 fn invokes_local_read(request: &HostInvocationRequest) -> bool {
     matches!(
         request.tool,
-        ToolRequest::Query(_) | ToolRequest::Packet(_)
+        ToolRequest::Query(_)
+            | ToolRequest::Packet(_)
+            | ToolRequest::SkillInject(_)
+            | ToolRequest::SkillDisplay(_)
     )
 }
 
@@ -1447,6 +1452,61 @@ mod tests {
             assert_eq!(
                 tool.get("name").and_then(|name| name.as_str()),
                 Some(read_request.tool.canonical_name())
+            );
+        }
+    }
+
+    #[test]
+    fn skill_carriers_ride_invoke_read_with_canonical_names() {
+        // Skill carriers are non-hot (no semantic profile, never advertised)
+        // but ride the same linkage-checked invoke-read entry so the daemon
+        // can claim and serve Hotset pairs; the tool name doubles as the
+        // session capability the envelope binds.
+        let (request, facts, envelope) = test_envelope();
+        for (tool_json, canonical) in [
+            (
+                serde_json::json!({"name":"skill.inject","arguments":{
+                    "contract_version": 1
+                }}),
+                "skill.inject",
+            ),
+            (
+                serde_json::json!({"name":"skill.display","arguments":{
+                    "contract_version": 1
+                }}),
+                "skill.display",
+            ),
+        ] {
+            let mut value = serde_json::to_value(&request).expect("request must serialize");
+            value["tool"] = tool_json;
+            let skill_request: HostInvocationRequest =
+                serde_json::from_value(value).expect("skill request must deserialize");
+            skill_request
+                .validate()
+                .expect("skill request must validate");
+            assert_eq!(skill_request.tool.canonical_name(), canonical);
+            assert!(
+                invokes_local_read(&skill_request),
+                "skill carriers ride the invoke-read entry"
+            );
+            let frame = host_request_invoke_read_frame(&skill_request, &envelope, &facts)
+                .expect("invoke-read frame must build");
+            let payload = match &frame.payload {
+                ProtocolPayload::Json(payload) => payload.clone(),
+                _ => panic!("invoke-read frame must carry JSON"),
+            };
+            assert_eq!(
+                payload
+                    .get("operation")
+                    .and_then(|operation| operation.as_str()),
+                Some(AGENT_HOST_REQUEST_INVOKE_READ_OPERATION)
+            );
+            let tool = payload
+                .get("tool")
+                .expect("invoke-read frame must carry tool bytes");
+            assert_eq!(
+                tool.get("name").and_then(|name| name.as_str()),
+                Some(canonical)
             );
         }
     }
