@@ -268,6 +268,29 @@ pub(super) fn run() -> Result<(), String> {
     // durable swarm-control composition before readiness is reported; no
     // thread, no transport, no start() contour or run-loop change.
     attach_agent_fabric(&composition)?;
+    // #1882: non-gating skill tool-source proof at the same attach site. The
+    // Governor hook builds the production canonical registry and pins the
+    // admitted definition version with no skill inputs consumed and nothing
+    // delivered (I1.5 starts only admitted capabilities). A hook failure
+    // degrades only the skill path: it emits an error record and the daemon
+    // continues, never failing readiness for an optional Module (A2.3).
+    match attach_skill_tool_source() {
+        Ok(admitted) => {
+            tracing::info!(
+                target: "eliotd::diagnostics",
+                event = "eliotd.skill_tool_source_attached",
+                admitted_definition_version = %admitted,
+            );
+        }
+        Err(reason) => {
+            let _ = eliotd::diagnostics::ErrorRecord::of(
+                eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                "skill-tool-source",
+                &reason,
+            )
+            .emit();
+        }
+    }
     kernel.report_ready().map_err(|error| error.to_string())?;
     // I1.11 steps 8/9 (issue #1967): publish Governor startup evidence on
     // the authenticated daemon channel for the Kernel consumer. The producer
@@ -421,6 +444,27 @@ fn attach_agent_fabric(composition: &DaemonComposition) -> Result<(), String> {
         descriptor.authority_epoch,
     );
     Ok(())
+}
+
+/// Proves the live canonical tool-source path before readiness (issue #1882,
+/// no lifecycle change).
+///
+/// Post-`start` attach-style check needing no composition handle: builds the
+/// production canonical tool source through the Governor hook
+/// (`eliot_governor::canonical_skill_tool_source`) and pins the admitted
+/// definition version the Skill delivery driver runs under. I1.5 starts only
+/// capabilities an admitted request requires, so nothing is installed,
+/// issued, or displayed here — this only proves the real tools-owner edge
+/// executes in the production binary and records which definition version
+/// the skill path is bound to. Skill delivery stays an optional capability
+/// (A2.3): a hook failure emits an error record and degrades only the skill
+/// path, never daemon readiness. No thread, no transport, no `start()`
+/// contour or run-loop change.
+fn attach_skill_tool_source() -> Result<String, String> {
+    let _span = tracing::info_span!("eliotd.skill_tool_source_attach").entered();
+    eliot_governor::canonical_skill_tool_source()
+        .map(|(_, admitted)| admitted)
+        .map_err(|error| format!("skill tool source unavailable: {error}"))
 }
 
 fn report_terminal_failure(kernel: &DaemonKernelClient, reason: String) -> String {
@@ -1784,6 +1828,16 @@ mod tests {
             .expect("one second before Unix epoch must be representable");
         let error = unix_ms(observed).expect_err("pre-epoch clock must fail closed");
         assert!(error.contains("precedes Unix epoch"));
+    }
+
+    #[test]
+    fn skill_tool_source_attach_proves_the_live_registry_edge() {
+        // Real tools owner through the Governor hook, executed in the
+        // production binary target: the attach pins a non-blank admitted
+        // definition version with no skill inputs consumed and nothing
+        // delivered.
+        let admitted = attach_skill_tool_source().expect("live canonical tool source must attach");
+        assert!(!admitted.trim().is_empty());
     }
 
     #[test]
