@@ -38,6 +38,7 @@ use thiserror::Error;
 
 pub mod catalogue;
 pub mod preflight;
+pub mod route_tokenizer;
 
 pub const CODEX_ADAPTER_ID: &str = "eliot-agent-codex";
 pub const CODEX_HOST_FAMILY: &str = "codex";
@@ -102,6 +103,12 @@ pub enum CodexAdapterError {
     ModelNotInCatalogue,
     #[error("Codex host-event normalization input is invalid: {0}")]
     InvalidInput(&'static str),
+    #[error("Codex model has no owner-published tokenizer mapping: {model_id}")]
+    UnknownTokenizerModel { model_id: String },
+    #[error("Codex result bytes are not countable text for the route tokenizer")]
+    UncountableBytes,
+    #[error("Codex tokenizer unavailable: {0}")]
+    TokenizerUnavailable(&'static str),
 }
 
 /// Exact route constructor.  The resulting value is still the A-01 route
