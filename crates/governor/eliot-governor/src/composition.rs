@@ -34,6 +34,7 @@ use eliot_authority::{
 use eliot_budget::{BudgetLedger, BudgetLedgerRecoverySnapshot};
 use eliot_canonical::{CanonicalError, CanonicalWriteEnvelope};
 use eliot_change_monitor::ChangeMonitor;
+use eliot_config::ConfigPolicySnapshot;
 use eliot_contracts::{
     EpochId, OperationId, ResourceGeneration, SessionId, StateFence, TaskId, canonical_json_bytes,
     sha256_hex,
@@ -377,6 +378,8 @@ pub enum RecoveryOwner {
     Budget,
     /// Config projection.
     Config,
+    /// Policy projection (optional; served independently of [`RecoveryOwner::ALL`]).
+    Policy,
     /// Coordination projection.
     Coordination,
     /// Finish projection.
@@ -429,6 +432,7 @@ impl RecoveryOwner {
             Self::Authority => "authority",
             Self::Budget => "budget",
             Self::Config => "config",
+            Self::Policy => "policy",
             Self::Coordination => "coordination",
             Self::Finish => "finish",
             Self::Problem => "problem",
@@ -1051,6 +1055,177 @@ impl ConfigOwner {
     #[must_use]
     pub const fn state_fence(&self) -> &StateFence {
         &self.state_fence
+    }
+}
+
+/// Policy owner payload bound to the exact protected policy digest.
+///
+/// Unlike [`ConfigOwnerSnapshot`], the full normative [`ConfigPolicySnapshot`]
+/// travels in the payload: policy-gated paths consume actual admitted settings
+/// (required settings stay fail-closed while no Configured snapshot exists),
+/// never a bare digest. The digest binds the exact snapshot bytes; it is never
+/// a relabeled Config digest.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyOwnerSnapshot {
+    /// Exact owner fence.
+    pub state_fence: StateFence,
+    /// Durable policy revision; must equal the embedded snapshot revision.
+    pub revision: u64,
+    /// Digest of the canonical embedded snapshot bytes.
+    pub policy_digest: String,
+    /// The admitted immutable Config/Policy snapshot content.
+    pub snapshot: ConfigPolicySnapshot,
+}
+
+/// Policy projection bound to the Host-approved generation.
+///
+/// `None` at the owner set means the Kernel does not serve the Policy named
+/// read yet: policy-gated evidence stays explicitly absent (fail-closed),
+/// never defaulted. A present owner is always a fully correlated recovery.
+#[derive(Clone, Debug)]
+pub struct PolicyOwner {
+    state_fence: StateFence,
+    revision: u64,
+    canonical_digest: String,
+    snapshot_digest: String,
+    snapshot: ConfigPolicySnapshot,
+}
+
+impl PolicyOwner {
+    /// Recovers the Policy owner from one Kernel named-read reply, correlating
+    /// owner, fence, revision, and digest against the actual canonical bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompositionError::Recovery`] for a foreign owner, stale fence,
+    /// zero revision, out-of-bound or digest-mismatched payload, a rejected
+    /// snapshot schema, or any fence/revision/digest disagreement between the
+    /// reply, the wire envelope, and the embedded snapshot.
+    pub fn recover(
+        reply: &KernelNamedReadReply,
+        expected_fence: &StateFence,
+    ) -> Result<Self, CompositionError> {
+        if reply.owner != RecoveryOwner::Policy {
+            return Err(CompositionError::Recovery(
+                "policy named read carries a foreign owner".to_owned(),
+            ));
+        }
+        if reply.state_fence != *expected_fence
+            || reply.revision == 0
+            || reply.schema != OWNER_SNAPSHOT_SCHEMA
+            || reply.payload.is_empty()
+            || reply.payload.len() > MAX_OWNER_SNAPSHOT_BYTES
+            || !is_sha256(&reply.value_digest)
+            || sha256_hex(&reply.payload) != reply.value_digest
+        {
+            return Err(CompositionError::Recovery(
+                "policy named read has invalid fence, revision, or payload digest".to_owned(),
+            ));
+        }
+        let wire: PolicyOwnerSnapshot =
+            serde_json::from_slice(&reply.payload).map_err(|error| {
+                CompositionError::Recovery(format!(
+                    "owner {} payload schema rejected: {error}",
+                    RecoveryOwner::Policy.as_str()
+                ))
+            })?;
+        let canonical = canonical_json_bytes(&wire).map_err(|error| {
+            CompositionError::Recovery(format!(
+                "owner {} payload could not be canonicalized: {error}",
+                RecoveryOwner::Policy.as_str()
+            ))
+        })?;
+        if canonical != reply.payload {
+            return Err(CompositionError::Recovery(format!(
+                "owner {} payload is not canonical JSON",
+                RecoveryOwner::Policy.as_str()
+            )));
+        }
+        if wire.revision != reply.revision {
+            return Err(CompositionError::Recovery(
+                "policy snapshot revision does not match its named-read revision".to_owned(),
+            ));
+        }
+        wire.snapshot
+            .validate()
+            .map_err(|error| CompositionError::Recovery(format!("policy snapshot: {error}")))?;
+        if wire.snapshot.state_fence != *expected_fence {
+            return Err(CompositionError::Recovery(
+                "policy snapshot has a stale state fence".to_owned(),
+            ));
+        }
+        if wire.snapshot.revision.value() != wire.revision {
+            return Err(CompositionError::Recovery(
+                "policy snapshot revision does not match its envelope revision".to_owned(),
+            ));
+        }
+        let snapshot_bytes = canonical_json_bytes(&wire.snapshot).map_err(|error| {
+            CompositionError::Recovery(format!(
+                "policy snapshot could not be canonicalized: {error}"
+            ))
+        })?;
+        if wire.policy_digest != sha256_hex(&snapshot_bytes) {
+            return Err(CompositionError::Recovery(
+                "policy digest does not match the canonical snapshot bytes".to_owned(),
+            ));
+        }
+        Ok(Self {
+            state_fence: expected_fence.clone(),
+            revision: wire.revision,
+            canonical_digest: reply.value_digest.clone(),
+            snapshot_digest: wire.policy_digest,
+            snapshot: wire.snapshot,
+        })
+    }
+
+    /// Returns the fence of the recovered policy projection.
+    #[must_use]
+    pub const fn state_fence(&self) -> &StateFence {
+        &self.state_fence
+    }
+
+    /// Returns the durable policy revision.
+    #[must_use]
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Returns the Kernel-observed canonical payload digest retained at recovery.
+    #[must_use]
+    pub fn canonical_digest(&self) -> &str {
+        &self.canonical_digest
+    }
+
+    /// Returns the digest bound to the canonical snapshot bytes at recovery.
+    #[must_use]
+    pub fn snapshot_digest(&self) -> &str {
+        &self.snapshot_digest
+    }
+
+    /// Returns the admitted snapshot content policy-gated paths consume.
+    #[must_use]
+    pub const fn snapshot(&self) -> &ConfigPolicySnapshot {
+        &self.snapshot
+    }
+
+    /// Recomputes the snapshot digest from the live retained snapshot.
+    ///
+    /// The mirror comparison at publish time uses this live recomputation
+    /// against [`Self::canonical_digest`]: equality holds while the retained
+    /// canonical state is intact, without ever substituting a Config digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompositionError::Recovery`] when the snapshot cannot be
+    /// canonicalized (fail-closed, never a default digest).
+    pub fn rebuilt_digest(&self) -> Result<String, CompositionError> {
+        let bytes = canonical_json_bytes(&self.snapshot).map_err(|error| {
+            CompositionError::Recovery(format!(
+                "retained policy snapshot could not be canonicalized: {error}"
+            ))
+        })?;
+        Ok(sha256_hex(&bytes))
     }
 }
 
