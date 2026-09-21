@@ -235,7 +235,7 @@ use eliot_runtime_contracts::{
 use sha2::{Digest as _, Sha256};
 
 #[cfg(windows)]
-use eliot_ipc::{DeliveryOutcome, TransportLimits};
+use eliot_ipc::{DeliveryOutcome, NamedPipeTransport, TransportLimits};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -391,6 +391,8 @@ use kernel_activation_driver::DurableKernelActivationDriver;
 
 #[cfg(windows)]
 mod kernel_front_door_client;
+#[cfg(windows)]
+mod host_startup_evidence;
 #[cfg(all(windows, test))]
 use kernel_front_door_client::kernel_front_door_acl_mode;
 #[cfg(windows)]
@@ -1199,6 +1201,88 @@ impl HostJobBranches {
         )
     }
 
+    /// Sends one closed Host startup evidence payload (I1.11 steps 1, 2, 4) on
+    /// the live authenticated control connection and checks the exact
+    /// response binding.
+    ///
+    /// The Kernel records steps only from validated fields; any rejection —
+    /// including the not-yet-landed consumer arms — fails this start closed
+    /// instead of proceeding to `ProbeReady` without evidence. The sequence
+    /// continues the caller's per-connection numbering.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the evidence cannot be built, delivered, or
+    /// exactly bound to its response.
+    #[cfg(windows)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the evidence send binds journal, manifest, candidate, fence, roots, and sequence explicitly so no binding is inferred"
+    )]
+    async fn send_host_startup_evidence<B: JournalBackend>(
+        transport: &mut NamedPipeTransport,
+        journal: &HostStateJournalService<B>,
+        active_manifest: &CandidateManifest,
+        candidate: &HostKernelCandidateBinding,
+        generation_handle: &PlatformHandle,
+        authority_generation: ResourceGeneration,
+        host_state_root: &Path,
+        store_data_root: &Path,
+        sequence: u64,
+    ) -> Result<(), HostError> {
+        let evidence = host_startup_evidence::build_host_startup_evidence(
+            journal,
+            active_manifest,
+            candidate,
+            authority_generation,
+            candidate.kernel_epoch.clone(),
+            host_state_root,
+            store_data_root,
+        )?;
+        let request = kernel_control_request(
+            candidate,
+            authority_generation,
+            KernelControlCommand::ReportHostStartupEvidence(evidence),
+            sequence,
+        )?;
+        let frame = control_request_frame(
+            format!(
+                "host-control:{}:{}",
+                generation_handle.as_str(),
+                candidate.activation_id.as_str()
+            ),
+            &request,
+        )
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        match transport
+            .send_frame(&frame, TransportLimits::default())
+            .await
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?
+        {
+            DeliveryOutcome::Delivered => {}
+            DeliveryOutcome::UnknownOutcome => {
+                return Err(HostError::RecoveryRequired(
+                    "Kernel startup-evidence delivery outcome is unknown".to_owned(),
+                ));
+            }
+        }
+        let response = transport
+            .receive_frame(TransportLimits::default())
+            .await
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let response = decode_control_response_frame(&response)
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        if response.message_id != request.message_id
+            || response.request_digest != request.payload_digest
+            || response.error.is_some()
+        {
+            return Err(HostError::ProcessContour(
+                "Kernel startup-evidence response binding failed".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Completes the authenticated Host↔Kernel lifecycle before Host
     /// publishes any successful contour observation.
     #[allow(
@@ -1216,6 +1300,7 @@ impl HostJobBranches {
         prior_kernel_disposition: PriorKernelDisposition,
         kernel_generation: EpochTransition,
         kernel_authority_epoch: EpochId,
+        active_manifest: &CandidateManifest,
     ) -> Result<(KernelActivationReceipt, KernelReadyReceipt), HostError> {
         let launch = self.launch.as_ref().ok_or_else(|| {
             HostError::ProcessContour("runtime launch descriptor is missing".to_owned())
@@ -1666,11 +1751,26 @@ impl HostJobBranches {
             activation_receipt
                 .validate(&permit)
                 .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+            // I1.11 steps 1, 2, 4: closed Host startup evidence rides this
+            // connection after Activate and before ProbeReady, continuing the
+            // strict per-connection sequence. Any rejection fails closed.
+            Self::send_host_startup_evidence(
+                &mut transport,
+                journal,
+                active_manifest,
+                &candidate,
+                generation,
+                launch.authority_generation,
+                Path::new(launch.runtime_state_roots.host_state_root.as_str()),
+                Path::new(launch.runtime_state_roots.store_data_root.as_str()),
+                probe_sequence,
+            )
+            .await?;
             let probe_request = kernel_control_request(
                 &candidate,
                 launch.authority_generation,
                 KernelControlCommand::ProbeReady,
-                probe_sequence,
+                probe_sequence + 1,
             )?;
             let probe_frame = control_request_frame(
                 format!(
@@ -5042,6 +5142,7 @@ impl HostComposition {
             prior_kernel,
             kernel_generation.clone(),
             kernel_authority_epoch,
+            &active_manifest,
         );
         let (activation_receipt, ready_receipt) = match complete_result {
             Ok(v) => v,
@@ -5410,6 +5511,10 @@ impl HostComposition {
     ) -> Result<KernelReadyReceipt, HostError> {
         let (prior_kernel, kernel_generation, kernel_authority_epoch) =
             self.next_kernel_activation_context(manifest_authority_epoch, None)?;
+        let active_manifest = self
+            .registry
+            .active()
+            .ok_or_else(|| HostError::ProcessContour("no approved active generation".to_owned()))?;
         let (_, receipt) = self.jobs.complete_kernel_control(
             generation,
             &self.host,
@@ -5419,6 +5524,7 @@ impl HostComposition {
             prior_kernel,
             kernel_generation,
             kernel_authority_epoch,
+            &active_manifest.manifest,
         )?;
         if let Err(error) = self.accept_kernel_ready(&receipt) {
             let durable = self.fail_current_kernel_record("kernel-ready-accept-failed");
@@ -5670,6 +5776,7 @@ impl HostComposition {
             prior_kernel,
             kernel_generation,
             kernel_authority_epoch,
+            manifest,
         ) {
             Ok(value) => value,
             Err(error) => return self.cleanup_launched_contour(error),
@@ -6099,6 +6206,7 @@ impl HostComposition {
                 prior_kernel,
                 kernel_generation,
                 kernel_authority_epoch,
+                &active.manifest,
             ) {
                 let cleanup = self.jobs.terminate_kernel();
                 return Err(match cleanup {

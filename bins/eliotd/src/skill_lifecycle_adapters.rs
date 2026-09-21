@@ -20,8 +20,9 @@
 //! - `install_package` populates the shared catalogue from a canonical
 //!   package source (production population caller): project, validate, and
 //!   insert under the tool-owner existence check. It runs on whichever handle
-//!   the adapter holds; the composition switches to the shared handle per the
-//!   reported central hunk so installs are visible to the promote gate.
+//!   the adapter holds; the composition drives it on the shared handle
+//!   ([`DaemonComposition::skill_install_package`](super::DaemonComposition::skill_install_package))
+//!   so installs are visible to the promote gate.
 //! - `install_package_versioned` is the same population caller behind the
 //!   versioned canonical view: the tool source reports the definition version
 //!   it binds, the composition states the version it admits, and drift fails
@@ -117,12 +118,6 @@ impl<T> ForwardingSkillLifecycle<T> {
 
     /// Wraps the single Governor lifecycle owner plus the shared catalogue
     /// handle for guarded forwarding (see the module contract).
-    ///
-    /// No in-tree caller wires the shared handle yet: `DaemonComposition`
-    /// keeps calling [`new`](Self::new) until catalogue installation wiring
-    /// lands (reported central hunk). The dead-code allowance covers exactly
-    /// that pending adoption; it expires when the hunk lands.
-    #[allow(dead_code)]
     pub(crate) fn with_catalogue(inner: T, catalogue: CatalogueHandle) -> Self {
         Self { inner, catalogue }
     }
@@ -147,10 +142,12 @@ impl<T> ForwardingSkillLifecycle<T> {
     /// existence check. Synchronous: the guard is taken and dropped in a
     /// closed scope and never crosses an await.
     ///
-    /// No in-tree production caller drives the runtime population path yet:
-    /// the Governor owner wires it with the shared handle (reported central
-    /// hunk). The allowance covers exactly that pending adoption; it expires
-    /// when the hunk lands. Tests drive all three runtime callers.
+    /// No in-tree production flow drives the runtime population path yet:
+    /// the composition seam
+    /// ([`DaemonComposition::skill_install_package`](super::DaemonComposition::skill_install_package))
+    /// carries the exact call for the Governor-owned driver. The allowance
+    /// covers exactly that pending adoption; it expires when the driver
+    /// lands. Tests drive all three runtime callers.
     #[allow(dead_code)]
     pub(crate) fn install_package(
         &self,
@@ -174,9 +171,10 @@ impl<T> ForwardingSkillLifecycle<T> {
     /// alias table resolves provider renames to canonical names first.
     /// Synchronous: the guard is taken and dropped in a closed scope.
     ///
-    /// No in-tree production caller drives the versioned population path yet
-    /// (reported central hunk carries the exact call). The allowance covers
-    /// exactly that pending adoption; it expires when the hunk lands.
+    /// No in-tree production flow drives the versioned population path yet
+    /// (the versioned composition seam is carried in the delivery report for
+    /// Governor serialization). The allowance covers exactly that pending
+    /// adoption; it expires when the seam lands.
     #[allow(dead_code)]
     pub(crate) fn install_package_versioned(
         &self,
@@ -213,9 +211,10 @@ impl<T> ForwardingSkillLifecycle<T> {
     /// [`acknowledge_and_display`](Self::acknowledge_and_display).
     /// Synchronous: each step takes and drops the guard in a closed scope.
     ///
-    /// No in-tree production caller drives the composed delivery act yet
-    /// (reported central hunk carries the exact call). The allowance covers
-    /// exactly that pending adoption; it expires when the hunk lands.
+    /// No in-tree production flow drives the composed delivery act yet
+    /// (the versioned composition seam is carried in the delivery report for
+    /// Governor serialization). The allowance covers exactly that pending
+    /// adoption; it expires when the seam lands.
     #[allow(dead_code)]
     pub(crate) fn run_install_to_receipt(
         &self,

@@ -36,6 +36,8 @@ use std::sync::atomic::Ordering;
 mod activation_projection;
 pub mod agent_fabric;
 pub mod canonical_config_precedence;
+mod capability_admission;
+mod capability_evidence_wiring;
 pub mod capability_outcome;
 mod controlboard_adapters;
 mod daemon_config;
@@ -53,9 +55,11 @@ mod kernel_context_read_client;
 mod kernel_recovery_client;
 mod kernel_transition_client;
 mod observation_adapters;
+mod route_receipts;
 mod skill_lifecycle_adapters;
 mod skill_surface_adapters;
 pub mod staffing_policy;
+pub mod startup_evidence_producer;
 mod store_failure_projection;
 mod task_lifecycle_adapters;
 
@@ -85,6 +89,15 @@ pub use canonical_config_precedence::{
     classify_policy_input, parse_canonical_layer_json, parse_canonical_layer_toml,
     resolve_canonical_chain,
 };
+pub use capability_admission::{
+    AdmissionDisposition, AdmissionOutcome, CapabilityEvidenceRecord, CapabilityEvidenceStatus,
+    DynamicCapabilityPulse, ProductionAdmissionRequest, ProductionEvidenceBundle,
+    RouteAdmissionDecision, StaticCapabilityAttestation, admit_production_route,
+    canonical_required_set, evaluate_production_admission,
+};
+pub use capability_evidence_wiring::{
+    EvidenceBridgeError, GovernorCapabilityAdmission, ObservedLifecycleSummary,
+};
 pub use capability_outcome::{
     AttemptReceipt, CapabilityOutcome, CapabilityRegistryView, DegradationScope,
     FallbackOutcomeRequest, OutcomeDisposition, OutcomeError, fallback_outcome,
@@ -113,7 +126,8 @@ pub use dreamer_materials::{
     verify_resolved_bytes,
 };
 pub use dreamer_model_adapter::{
-    DreamerModelExecution, GovernedDreamerModelAdapter, ModelInvokeInput,
+    DAEMON_GENERATION_PROJECTION_OPERATION, DreamerModelExecution, GovernedDreamerModelAdapter,
+    KernelGenerationProjection, ModelInvokeInput, query_kernel_generation,
 };
 pub use first_run_wiring::{
     DisabledAutomationOutcome, FirstRunWiringError, inspect_first_run_defaults,
@@ -132,6 +146,16 @@ pub use governor_local_read::{
 };
 pub(crate) use kernel_authority_client::KernelAuthorityClient;
 pub use kernel_context_read_client::{KernelContextReadClient, ReconstructionReadComposition};
+pub use route_receipts::{
+    ActualRouteReceipt, GovernorRouteAttempt, RouteCapabilityIndex, RouteReceiptError,
+    RuntimeObservedFacts, UNKNOWN_ROUTE_FACT, effective_route_key,
+};
+pub use startup_evidence_producer::{
+    DAEMON_STARTUP_EVIDENCE_OPERATION, EliotdStartupEvidence, MAX_CAPABILITY_OUTCOMES,
+    MAX_EVIDENCE_REFS, MAX_REQUIRED_CAPABILITIES, MirrorObservation, RetainedCapabilitySummary,
+    StartupEvidenceError, StartupEvidenceRequest, build_startup_evidence,
+    publish_daemon_startup_evidence, summarize_retained_capabilities,
+};
 pub use store_failure_projection::{GovernorStoreFailureProjection, GovernorStoreProjectionError};
 
 /// Builds the production P-07 authority adapter over an already-connected
@@ -261,6 +285,18 @@ pub struct DaemonComposition {
     /// binding from them. `None` until the runtime notes a live session, so
     /// boards keep the empty (unadmitted) behaviour without one.
     owner_session: Option<OwnerSessionFacts>,
+    /// Shared Governor Skill catalogue handle for catalogue-guarded skill
+    /// promotion. Empty until catalogue installation wiring lands; absent
+    /// entries forward open-world.
+    skill_catalogue: skill_lifecycle_adapters::CatalogueHandle,
+    /// Daemon-held Governor capability admission view (issue #1957).
+    ///
+    /// Constructed empty at [`DaemonComposition::start`], hydrated from the
+    /// canonical `GetCapabilityEvidenceState` read and the legacy importer,
+    /// and consulted by the daemon route gate before a resolved route may
+    /// execute. Semantics stay in the Governor registry; this is the
+    /// composition root's handle on that view.
+    capability_admission: GovernorCapabilityAdmission,
 }
 
 impl DaemonComposition {
@@ -316,6 +352,10 @@ impl DaemonComposition {
             view_stale: false,
             operator_replay: SharedOperatorReplay::new(),
             owner_session: None,
+            skill_catalogue: Arc::new(
+                std::sync::Mutex::new(eliot_skill::SkillCatalogue::default()),
+            ),
+            capability_admission: GovernorCapabilityAdmission::new(),
         })
     }
 
@@ -370,6 +410,25 @@ impl DaemonComposition {
     #[must_use]
     pub fn config_path(&self) -> &Path {
         &self.config_path
+    }
+
+    /// Returns the recovered Config projection digest admitted at Governor
+    /// construction (I1.11 step 8 input). Read-only over the retained owner:
+    /// the digest was bound to the protected launch digest by recovery and
+    /// never recomputed here.
+    #[must_use]
+    pub fn config_snapshot_digest(&self) -> &str {
+        self.governor.owners().config.snapshot_digest()
+    }
+
+    /// Returns the recovered Policy projection owner admitted at Governor
+    /// construction (I1.11 step 8 input), or `None` while the Kernel does
+    /// not serve the Policy named read. Read-only over the retained owner:
+    /// policy content is consumed from the actual canonical snapshot, never
+    /// defaulted and never a relabeled Config digest.
+    #[must_use]
+    pub fn policy_owner(&self) -> Option<&eliot_governor::PolicyOwner> {
+        self.governor.owners().policy.as_ref()
     }
 
     /// Returns the retained protected daemon state root.
@@ -641,9 +700,85 @@ impl DaemonComposition {
                 eliot_governor::CompositionError::NotReady,
             ));
         }
-        Ok(skill_lifecycle_adapters::ForwardingSkillLifecycle::new(
+        Ok(self.shared_skill_adapter())
+    }
+
+    /// Builds the shared-catalogue skill adapter driven by the runtime
+    /// population callers below.
+    ///
+    /// Single construction site for every composition-held adapter: the
+    /// shared handle (not a fresh catalogue per call) is what makes
+    /// installation visible to later promotion/delivery/display through any
+    /// accessor. `skill_lifecycle()` above shares it.
+    fn shared_skill_adapter(
+        &self,
+    ) -> skill_lifecycle_adapters::ForwardingSkillLifecycle<
+        eliot_governor::GovernorSkillLifecycle<'_, dyn eliot_governor::KernelGenerationPort>,
+    > {
+        skill_lifecycle_adapters::ForwardingSkillLifecycle::with_catalogue(
             self.governor.skill_lifecycle(),
-        ))
+            Arc::clone(&self.skill_catalogue),
+        )
+    }
+
+    /// Installs one canonical package source into the shared Governor Skill
+    /// catalogue (population caller, issue #1882).
+    ///
+    /// Composition seam for the runtime population driver: the Governor
+    /// owner hands over a validated package claim, its actual materialization
+    /// inputs, the explicit install context, and the tool-owner view; the
+    /// shared handle records the projected entry. No readiness gate: this
+    /// operates purely on daemon-held catalogue state (validated insert),
+    /// never on Governor recovery owners; promotion keeps the Governor
+    /// canonical gates, and drivers call post-admission. Returns the
+    /// installed Skill identity.
+    pub fn skill_install_package(
+        &self,
+        package: &eliot_skill::SkillPackage,
+        inputs: &eliot_skill::MaterializationInputs,
+        context: &eliot_skill::CatalogueInstallContext,
+        tools: &dyn eliot_skill::KnownTools,
+    ) -> Result<String, eliot_skill::SkillError> {
+        self.shared_skill_adapter()
+            .install_package(package, inputs, context, tools)
+    }
+
+    /// Issues the Hotset delivery receipt the runtime injector carries
+    /// (issue #1882).
+    ///
+    /// Same seam discipline as [`Self::skill_install_package`]: driven by the
+    /// runtime Hotset injector caller with its own approval handle; operates
+    /// on the shared catalogue only.
+    pub fn skill_deliver_hotset(
+        &self,
+        hotset_id: String,
+        skill_ids: Vec<String>,
+        approval_ref: String,
+        tools: &dyn eliot_skill::KnownTools,
+    ) -> Result<eliot_skill::HotsetDeliveryReceipt, eliot_skill::SkillError> {
+        self.shared_skill_adapter()
+            .deliver_hotset(hotset_id, skill_ids, approval_ref, tools)
+    }
+
+    /// Binds the runtime receiver's ack to its exact receipt, then displays
+    /// (issue #1882).
+    ///
+    /// Same seam discipline as [`Self::skill_install_package`]: only an
+    /// applied ack for the exact receipt reaches the catalogue boundary.
+    /// Receipt and ack travel by value, mirroring the owned display boundary.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "receipt/ack cross by value like the owned display boundary"
+    )]
+    pub fn skill_acknowledge_and_display(
+        &self,
+        skill_id: &str,
+        receipt: eliot_skill::HotsetDeliveryReceipt,
+        ack: eliot_skill::HotsetDeliveryAck,
+        tools: &dyn eliot_skill::KnownTools,
+    ) -> Result<eliot_skill::ActivatedSkillDisplay, eliot_skill::SkillError> {
+        self.shared_skill_adapter()
+            .acknowledge_and_display(skill_id, receipt, ack, tools)
     }
 
     /// Borrows the single Governor task lifecycle owner as a forwarding
@@ -915,6 +1050,57 @@ impl DaemonComposition {
         let config = daemon_coordinator_config()
             .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
         plan_candidate(&config, request).map_err(|error| DaemonError::Lifecycle(error.to_string()))
+    }
+
+    /// Borrows the daemon-held Governor capability admission view (#1957).
+    ///
+    /// Post-`start` attach-style accessor, mirroring
+    /// [`Self::context_read_client`]: readiness is checked first so callers
+    /// observe the view only on the admitted path. Hydration (evidence
+    /// inserts, legacy imports, scope changes) goes through the mutable
+    /// accessor; route execution gates through
+    /// [`Self::admit_production_route`].
+    pub fn capability_admission(&self) -> Result<&GovernorCapabilityAdmission, DaemonError> {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        Ok(&self.capability_admission)
+    }
+
+    /// Mutably borrows the daemon-held capability admission view (#1957).
+    ///
+    /// Mirrors [`Self::capability_admission`]: readiness is checked first.
+    /// Callers hydrate the held view from the closed
+    /// `GetCapabilityEvidenceState` read (see
+    /// [`GovernorCapabilityAdmission::plan_evidence_read`] and
+    /// [`GovernorCapabilityAdmission::ingest_evidence_response`]) and the
+    /// legacy importer; admission semantics stay in the Governor registry.
+    pub fn capability_admission_mut(
+        &mut self,
+    ) -> Result<&mut GovernorCapabilityAdmission, DaemonError> {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        Ok(&mut self.capability_admission)
+    }
+
+    /// Consults the held capability admission before route execution (#1957).
+    ///
+    /// Returns whether `skill_id` holds fresh exact-fingerprint
+    /// `probe_passed` or `observed` evidence from an admissible source at
+    /// `now`, with no restricting `broken`/`unsupported`/`degraded`
+    /// evidence. Declared/imported records alone never admit. Callers gate
+    /// route execution on `Ok(true)`; `Ok(false)` and `Err` both fail
+    /// closed.
+    pub fn admit_production_route(
+        &self,
+        skill_id: &str,
+        scope: &eliot_governor::RouteScopeFingerprint,
+        now: u64,
+    ) -> Result<bool, DaemonError> {
+        Ok(self
+            .capability_admission()?
+            .admit_production_route(skill_id, scope, now))
     }
 
     /// Borrows the Governor reconstruction read composition over the retained

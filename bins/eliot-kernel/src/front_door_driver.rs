@@ -345,9 +345,10 @@ async fn serve_connection(
                 // them) and any handler failure fences the session instead
                 // of silently dropping the submit. No process is spawned
                 // here.
-                let reply = kernel
-                    .execute_dreamer_request(&session, request_id, &operation, payload)
-                    .await?;
+                let reply = Box::pin(
+                    kernel.execute_dreamer_request(&session, request_id, &operation, payload),
+                )
+                .await?;
                 if let Err(error) = send_checked(&mut front_door, &reply, limits).await {
                     session.fence();
                     return Err(error);

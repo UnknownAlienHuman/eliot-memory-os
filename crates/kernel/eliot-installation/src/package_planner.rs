@@ -188,6 +188,12 @@ struct PlannerStoreLaunchConfig {
     username: String,
     connect_timeout_ms: u64,
     query_timeout_ms: u64,
+    /// Kernel-configured store transaction limit. Exact typed mirror of the
+    /// bridge `StoreLaunchConfig` field: absent in legacy files means default
+    /// (serde default), and the installer projection must encode it
+    /// identically to the bridge `OperationalConfig` or approvals split.
+    #[serde(default)]
+    store_transaction_limit: Option<usize>,
     schema_generation: String,
     blob_root: String,
     instance_id: String,
@@ -209,6 +215,11 @@ struct PlannerOperationalConfig<'a> {
     username: &'a str,
     connect_timeout_ms: u64,
     query_timeout_ms: u64,
+    // Encoded identically to the bridge `OperationalConfig`: omitted when
+    // unset so legacy approved bytes stay unchanged; an explicit limit is
+    // part of the approval either way.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    store_transaction_limit: Option<usize>,
     schema_generation: &'a str,
     blob_root: &'a str,
     instance_id: &'a str,
@@ -246,6 +257,7 @@ fn validate_source_store_config(
         || config.approved_config_hash.len() != 64
         || config.connect_timeout_ms == 0
         || config.query_timeout_ms == 0
+        || config.store_transaction_limit == Some(0)
     {
         return Err(InstallationError::IdentityConflict);
     }
@@ -270,6 +282,7 @@ fn validate_source_store_config(
         username: &config.username,
         connect_timeout_ms: config.connect_timeout_ms,
         query_timeout_ms: config.query_timeout_ms,
+        store_transaction_limit: config.store_transaction_limit,
         schema_generation: &config.schema_generation,
         blob_root: &config.blob_root,
         instance_id: &config.instance_id,
@@ -3351,6 +3364,7 @@ mod tests {
             username: &config.username,
             connect_timeout_ms: config.connect_timeout_ms,
             query_timeout_ms: config.query_timeout_ms,
+            store_transaction_limit: config.store_transaction_limit,
             schema_generation: &config.schema_generation,
             blob_root: &config.blob_root,
             instance_id: &config.instance_id,
@@ -3361,7 +3375,9 @@ mod tests {
     }
 
     fn planner_store_config_json(config: &PlannerStoreLaunchConfig) -> serde_json::Value {
-        serde_json::json!({
+        // Mirrors the canonical issuer encoding: the knob is omitted when
+        // unset so fixtures stay byte-identical to real legacy files.
+        let mut value = serde_json::json!({
             "store_pipe": &config.store_pipe,
             "launch_nonce": &config.launch_nonce,
             "expected_client_sid": &config.expected_client_sid,
@@ -3380,7 +3396,11 @@ mod tests {
             "instance_id": &config.instance_id,
             "credential_ref": &config.credential_ref,
             "runtime_launch": &config.runtime_launch,
-        })
+        });
+        if let Some(limit) = config.store_transaction_limit {
+            value["store_transaction_limit"] = serde_json::json!(limit);
+        }
+        value
     }
 
     #[test]
@@ -3410,6 +3430,7 @@ mod tests {
             username: "store".to_owned(),
             connect_timeout_ms: 10_000,
             query_timeout_ms: 10_000,
+            store_transaction_limit: None,
             schema_generation: "1.0.0".to_owned(),
             blob_root: Path::new(launch.runtime_state_roots.store_data_root.as_str())
                 .join("blob")
@@ -3454,6 +3475,88 @@ mod tests {
                 altered_binding.files,
                 altered_binding.evidence_digest,
             ),
+            Err(InstallationError::IdentityConflict)
+        ));
+    }
+
+    #[test]
+    fn store_transaction_limit_binds_identically_in_approved_digest() {
+        let (_tmp, portable, _roots) = temp_portable_root();
+        let source_dir = tempfile::TempDir::new().unwrap();
+        populate_source_with_roles(source_dir.path());
+        let input = production_input(source_dir.path(), portable);
+        let baseline = GenerationPackagePlanner::plan_unbound_for_test(input)
+            .expect("planner fixture should produce a launch descriptor");
+        let launch = baseline.candidate_manifest.runtime_launch.clone();
+        let expected_path = Path::new(launch.store_config_path.as_str()).to_path_buf();
+        let mut config = PlannerStoreLaunchConfig {
+            store_pipe: r"\\.\pipe\eliot\store-test".to_owned(),
+            launch_nonce: "store:test".to_owned(),
+            expected_client_sid: "S-1-5-19".to_owned(),
+            expected_client_session_id: 0,
+            approved_artifact_hash: launch.store_bridge_artifact_digest.as_str().to_owned(),
+            approved_config_hash: String::new(),
+            endpoint: eliot_runtime_contracts::RUNTIME_LIVE_STORE_ENDPOINT.to_owned(),
+            provider_bind_address: eliot_runtime_contracts::RUNTIME_LIVE_STORE_BIND.to_owned(),
+            namespace: eliot_runtime_contracts::RUNTIME_LIVE_STORE_NAMESPACE.to_owned(),
+            database: "eliot".to_owned(),
+            username: "store".to_owned(),
+            connect_timeout_ms: 10_000,
+            query_timeout_ms: 10_000,
+            store_transaction_limit: None,
+            schema_generation: "1.0.0".to_owned(),
+            blob_root: Path::new(launch.runtime_state_roots.store_data_root.as_str())
+                .join("blob")
+                .to_string_lossy()
+                .into_owned(),
+            instance_id: "store-candidate".to_owned(),
+            credential_ref: launch.store_credential_target.as_str().to_owned(),
+            runtime_launch: launch,
+        };
+        // Legacy: an unset knob is omitted on the wire, parses to default,
+        // and validates under its recomputed approval — existing approvals
+        // stay byte-stable.
+        config.approved_config_hash = planner_store_config_digest(&config);
+        let legacy_json = planner_store_config_json(&config);
+        assert!(legacy_json.get("store_transaction_limit").is_none());
+        let legacy_bytes = serde_json::to_vec(&legacy_json).unwrap();
+        let parsed: PlannerStoreLaunchConfig = serde_json::from_slice(&legacy_bytes).unwrap();
+        assert_eq!(parsed.store_transaction_limit, None);
+        validate_source_store_config(&legacy_bytes, &expected_path)
+            .expect("legacy approval still valid");
+        // Explicit: the knob changes the approval and rides the file.
+        config.store_transaction_limit = Some(2);
+        let explicit_digest = planner_store_config_digest(&config);
+        assert_ne!(
+            explicit_digest, config.approved_config_hash,
+            "an explicit limit must affect the approval"
+        );
+        config.approved_config_hash = explicit_digest;
+        let explicit_json = planner_store_config_json(&config);
+        assert_eq!(
+            explicit_json
+                .get("store_transaction_limit")
+                .and_then(|value| value.as_u64()),
+            Some(2)
+        );
+        let explicit_bytes = serde_json::to_vec(&explicit_json).unwrap();
+        validate_source_store_config(&explicit_bytes, &expected_path)
+            .expect("explicit issuer/validator parity");
+        // Tampered: an explicit limit with a stale approval fails closed.
+        let mut tampered = explicit_json;
+        tampered["store_transaction_limit"] = serde_json::json!(9);
+        let tampered_bytes = serde_json::to_vec(&tampered).unwrap();
+        assert!(matches!(
+            validate_source_store_config(&tampered_bytes, &expected_path),
+            Err(InstallationError::IdentityConflict)
+        ));
+        // Malformed: a zero limit is refused even with a matching approval.
+        config.store_transaction_limit = Some(0);
+        config.approved_config_hash = planner_store_config_digest(&config);
+        let zero_json = planner_store_config_json(&config);
+        let zero_bytes = serde_json::to_vec(&zero_json).unwrap();
+        assert!(matches!(
+            validate_source_store_config(&zero_bytes, &expected_path),
             Err(InstallationError::IdentityConflict)
         ));
     }
