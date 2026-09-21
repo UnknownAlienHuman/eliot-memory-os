@@ -724,8 +724,9 @@ pub enum RunRequestError {
 /// public edge imports it as the canonical receipt (verified zero hits at
 /// this base). Conversion of its model/session/endpoint fields and
 /// unknown-field loss into the shared `PhysicalRouteObservationReceipt` is
-/// deferred until `eliot-agent-api` lands that owner; this crate must not
-/// duplicate the canonical type.
+/// total and versioned via [`OpenCodeWireRouteReceipt::to_physical_observation`]
+/// below; this crate never duplicates the canonical type and no adapter
+/// gains route authority from this projection.
 ///
 /// Loss visibility: `extra` preserves every unknown wire field through the
 /// flattened round-trip (never silently dropped). An unavailable record
