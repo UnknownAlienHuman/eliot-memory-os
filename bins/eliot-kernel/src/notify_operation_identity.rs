@@ -117,10 +117,7 @@ pub fn reject_cross_operation_reuse(
 /// carrying a reserve digest is a lineage link, never an identity reuse: the
 /// selectors must differ even when the claim digest matches.
 #[must_use]
-pub fn reserve_and_commit_are_distinct(
-    reserve_operation: &str,
-    commit_operation: &str,
-) -> bool {
+pub fn reserve_and_commit_are_distinct(reserve_operation: &str, commit_operation: &str) -> bool {
     reserve_operation != commit_operation
         && is_notify_operation(reserve_operation)
         && is_notify_operation(commit_operation)
@@ -134,7 +131,12 @@ mod tests {
     #[test]
     fn exact_replay_is_not_a_conflict() {
         assert_eq!(
-            classify_notify_reuse("eliot.notify.g08.verify", "aa", "eliot.notify.g08.verify", "aa"),
+            classify_notify_reuse(
+                "eliot.notify.g08.verify",
+                "aa",
+                "eliot.notify.g08.verify",
+                "aa"
+            ),
             NotifyReuseDisposition::ExactReplay
         );
         assert!(
@@ -165,7 +167,7 @@ mod tests {
             "eliot.notify.ledger.reserve",
             "aa",
         )
-        .expect_err("cross-step reuse must conflict");
+        .unwrap_err();
         assert!(error.to_string().contains(IDENTITY_CONFLICT));
     }
 

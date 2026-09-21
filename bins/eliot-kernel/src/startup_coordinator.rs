@@ -212,19 +212,14 @@ impl GovernanceProfile {
     /// separately by [`StartupCoordinator::authority_ceiling`].
     #[must_use]
     pub const fn ceiling(self) -> AuthorityCeiling {
-        match (
-            self.observation,
-            self.enforcement,
-            self.supervision,
-        ) {
+        match (self.observation, self.enforcement, self.supervision) {
             (
                 GovernanceObservation::IndependentlyObserved,
                 GovernanceEnforcement::Enforced,
                 GovernanceSupervision::IndependentlySupervised,
             ) => AuthorityCeiling::Critical,
             (
-                GovernanceObservation::HostObserved
-                | GovernanceObservation::IndependentlyObserved,
+                GovernanceObservation::HostObserved | GovernanceObservation::IndependentlyObserved,
                 GovernanceEnforcement::Interceptable | GovernanceEnforcement::Enforced,
                 GovernanceSupervision::WatchdogObserved
                 | GovernanceSupervision::IndependentlySupervised,

@@ -71,15 +71,15 @@ use process_execution::{
     authorize_process_owner, project_store_snapshot, run_process_start,
 };
 pub use process_execution_client::process_execution_client;
-pub use startup_coordinator::{
-    AuthorityCeiling, GovernanceEnforcement, GovernanceObservation, GovernanceProfile,
-    GovernanceSupervision, StartupCoordinator, StartupPrerequisite, StartupRejection, StartupStatus,
-    STARTUP_FINAL_STEP, STARTUP_FIRST_STEP, startup_step_name,
-};
 pub(crate) use shutdown_drain::{
     DRAIN_RECEIPT_DEADLINE, DrainCommitDecision, DrainHalt, DrainWakeDisposition,
     ShutdownDrainCoordinator, ShutdownPhase, ShutdownTerminal, coordinator_for,
     reverse_quiescence_order,
+};
+pub use startup_coordinator::{
+    AuthorityCeiling, GovernanceEnforcement, GovernanceObservation, GovernanceProfile,
+    GovernanceSupervision, STARTUP_FINAL_STEP, STARTUP_FIRST_STEP, StartupCoordinator,
+    StartupPrerequisite, StartupRejection, StartupStatus, startup_step_name,
 };
 #[cfg(windows)]
 pub use supervision_lease_authority::{
@@ -120,7 +120,6 @@ mod front_door_session;
 mod generation_control;
 mod generation_recovery;
 mod health_view;
-mod startup_coordinator;
 #[cfg(windows)]
 mod host_request_route;
 mod native_worker_lifecycle_route;
@@ -130,6 +129,7 @@ pub mod notify_operation_identity;
 mod provider_capability_route;
 mod runtime_identity;
 mod shutdown_drain;
+mod startup_coordinator;
 use daemon_session_guard::caller_binding;
 #[cfg(all(windows, test))]
 use daemon_supervision::EliotdSupervisionSuccessorEvidence;
@@ -1955,10 +1955,11 @@ impl KernelComposition {
     /// evidence caps the ceiling at low-impact regardless of profile.
     #[must_use]
     pub fn startup_authority_ceiling(&self, profile: GovernanceProfile) -> AuthorityCeiling {
-        self.startup_coordinator.lock().map_or(
-            AuthorityCeiling::LowImpact,
-            |coordinator| coordinator.authority_ceiling(profile),
-        )
+        self.startup_coordinator
+            .lock()
+            .map_or(AuthorityCeiling::LowImpact, |coordinator| {
+                coordinator.authority_ceiling(profile)
+            })
     }
 
     /// Normal canonical-write admission through the startup coordinator.

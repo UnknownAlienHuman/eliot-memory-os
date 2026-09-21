@@ -18,8 +18,9 @@ use std::collections::BTreeMap;
 
 use eliot_contracts::StateFence;
 use eliot_kernel_service::AuthenticatedHostSession;
-use eliot_protocol::{HostRequestEnvelope, HostRequestResultBody, LocalReadAttempt,
-    host_request_operation_id};
+use eliot_protocol::{
+    HostRequestEnvelope, HostRequestResultBody, LocalReadAttempt, host_request_operation_id,
+};
 use eliot_store_api::{
     CanonicalRequestView, NamedReadOperation, NamedReadRequest, NamedReadResponse,
     OrderingHeadExpectation, PreparedTransition, ReadConsistency, RequestMeta,
@@ -1206,10 +1207,9 @@ mod local_read_dispatch_tests {
         let tool = query_tool();
         let envelope = test_envelope("eliot.query", &tool_digest(&tool));
         let operation_id = eliot_protocol::host_request_operation_id(&envelope);
-        let authority_epoch =
-            serde_json::to_value(envelope.state_fence.clone()).expect("fence encodes")
-                ["authority_epoch"]
-                .clone();
+        let authority_epoch = serde_json::to_value(envelope.state_fence.clone())
+            .expect("fence encodes")["authority_epoch"]
+            .clone();
         let attempt = serde_json::json!({
             "wire_id": eliot_protocol::LOCAL_READ_ATTEMPT_WIRE_ID,
             "wire_version": eliot_protocol::LocalReadAttempt::CONTRACT_VERSION,

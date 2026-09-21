@@ -164,10 +164,7 @@ impl KernelComposition {
         expected_sequence: u64,
     ) -> Result<KernelControlResponse, TransportError> {
         observe_control("kernel.control.request_received", "attempt");
-        match self
-            .apply_control_request_inner(request, peer, expected_sequence)
-            .await
-        {
+        match Box::pin(self.apply_control_request_inner(request, peer, expected_sequence)).await {
             Ok(response) => {
                 observe_control("kernel.control.request_admitted", "success");
                 Ok(response)
@@ -242,16 +239,10 @@ impl KernelComposition {
             let policy_epoch = policy.module_generation.state_fence.authority_epoch.clone();
             let epoch_mismatch = {
                 let candidate = &request.candidate.kernel_epoch;
-                if candidate.is_same_authority(&policy_epoch) {
-                    false
-                } else if reconcile
-                    && candidate.lineage_id == policy_epoch.lineage_id
-                    && candidate.sequence.get() > policy_epoch.sequence.get()
-                {
-                    false
-                } else {
-                    true
-                }
+                !(candidate.is_same_authority(&policy_epoch)
+                    || (reconcile
+                        && candidate.lineage_id == policy_epoch.lineage_id
+                        && candidate.sequence.get() > policy_epoch.sequence.get()))
             };
             if request.generation != policy.module_generation.generation
                 || epoch_mismatch
