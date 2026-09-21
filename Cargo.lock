@@ -2088,6 +2088,7 @@ dependencies = [
  "eliot-runtime-contracts",
  "eliot-security-contracts",
  "eliot-store-api",
+ "eliot-store-memory",
  "eliot-store-surreal-adapter",
  "schemars",
  "secrecy",
