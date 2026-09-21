@@ -182,6 +182,31 @@ impl CapabilityOutcome {
     }
 }
 
+/// Inputs for one call-scoped fallback emission.
+///
+/// Grouped so the emission constructor keeps a reviewable arity instead of a
+/// long positional parameter list. Every field is validated through
+/// [`CapabilityOutcome::validate`] when the outcome is emitted.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FallbackOutcomeRequest {
+    /// Capability under test, e.g. `provider.dispatch`.
+    pub capability: String,
+    /// Mode the caller requested, e.g. `route-a`.
+    pub requested_mode: String,
+    /// Mode actually executed, e.g. `fallback-route-b`.
+    pub effective_mode: String,
+    /// Bounded human-readable reason for the degradation.
+    pub reason: String,
+    /// Outputs or operations affected by the degraded execution.
+    pub affected_outputs_or_operations: Vec<String>,
+    /// Highest proof this degraded execution may still satisfy.
+    pub proof_ceiling: String,
+    /// Recovery, requalification, or expiry condition.
+    pub recovery_requalification_or_expiry: String,
+    /// Attempt the fallback ran under; becomes the outcome scope owner.
+    pub attempt_id: String,
+}
+
 /// Emits the call-scoped outcome for one fallback selection.
 ///
 /// The requested mode failed for this call and the effective fallback mode
@@ -192,26 +217,19 @@ impl CapabilityOutcome {
 ///
 /// Returns [`OutcomeError::Contract`] when any bound field is malformed.
 pub fn fallback_outcome(
-    capability: &str,
-    requested_mode: &str,
-    effective_mode: &str,
-    reason: &str,
-    affected_outputs_or_operations: Vec<String>,
-    proof_ceiling: &str,
-    recovery_requalification_or_expiry: &str,
-    attempt_id: &str,
+    request: FallbackOutcomeRequest,
 ) -> Result<CapabilityOutcome, OutcomeError> {
     let outcome = CapabilityOutcome {
-        capability: capability.to_owned(),
-        requested_mode: requested_mode.to_owned(),
-        effective_mode: effective_mode.to_owned(),
+        capability: request.capability,
+        requested_mode: request.requested_mode,
+        effective_mode: request.effective_mode,
         degradation_scope: DegradationScope::Call,
-        reason: reason.to_owned(),
+        reason: request.reason,
         evidence_refs: Vec::new(),
-        affected_outputs_or_operations,
-        proof_ceiling: proof_ceiling.to_owned(),
-        recovery_requalification_or_expiry: recovery_requalification_or_expiry.to_owned(),
-        scope_owner: attempt_id.to_owned(),
+        affected_outputs_or_operations: request.affected_outputs_or_operations,
+        proof_ceiling: request.proof_ceiling,
+        recovery_requalification_or_expiry: request.recovery_requalification_or_expiry,
+        scope_owner: request.attempt_id,
         generation_fingerprint: String::new(),
         valid_until_unix_ms: None,
     };
@@ -277,9 +295,9 @@ impl AttemptReceipt {
 /// attempt-visible through [`AttemptReceipt`].
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CapabilityRegistryView {
-    installation_blocks: Vec<CapabilityOutcome>,
-    generation_blocks: Vec<CapabilityOutcome>,
-    session_blocks: Vec<CapabilityOutcome>,
+    installation: Vec<CapabilityOutcome>,
+    generation: Vec<CapabilityOutcome>,
+    session: Vec<CapabilityOutcome>,
 }
 
 impl CapabilityRegistryView {
@@ -323,64 +341,73 @@ impl CapabilityRegistryView {
 
     fn apply_validated_broad(&mut self, outcome: CapabilityOutcome) {
         match outcome.degradation_scope {
-            DegradationScope::Installation => self.installation_blocks.push(outcome),
-            DegradationScope::Generation => self.generation_blocks.push(outcome),
-            DegradationScope::Session => self.session_blocks.push(outcome),
+            DegradationScope::Installation => self.installation.push(outcome),
+            DegradationScope::Generation => self.generation.push(outcome),
+            DegradationScope::Session => self.session.push(outcome),
             DegradationScope::Item | DegradationScope::Call | DegradationScope::Attempt => {}
         }
     }
 
     /// Drops expired broad blocks. Expiry is one defined recovery path.
     pub fn clear_expired(&mut self, now_unix_ms: u64) {
-        self.installation_blocks
-            .retain(|item| item.is_live(now_unix_ms));
-        self.generation_blocks
-            .retain(|item| item.is_live(now_unix_ms));
-        self.session_blocks.retain(|item| item.is_live(now_unix_ms));
+        self.installation.retain(|item| item.is_live(now_unix_ms));
+        self.generation.retain(|item| item.is_live(now_unix_ms));
+        self.session.retain(|item| item.is_live(now_unix_ms));
     }
 
     /// Removes generation blocks for one exact fingerprint: explicit
     /// requalification/recovery for that generation.
     pub fn requalify_generation(&mut self, generation_fingerprint: &str) {
-        self.generation_blocks
+        self.generation
             .retain(|item| item.generation_fingerprint != generation_fingerprint);
+    }
+
+    /// Drops all installation blocks: explicit recovery for installation
+    /// scope. Expiry alone cannot recover a block without a time bound, so
+    /// installation scope needs this named recovery path like generation
+    /// scope has.
+    pub fn requalify_installation(&mut self) {
+        self.installation.clear();
+    }
+
+    /// Drops session blocks for one exact session owner: explicit recovery
+    /// for session scope.
+    pub fn requalify_session(&mut self, session_id: &str) {
+        self.session.retain(|item| item.scope_owner != session_id);
     }
 
     /// Reports whether a route remains eligible for admission.
     ///
     /// Live installation blocks stop every route. Live generation blocks stop
-    /// only routes presenting the same exact generation fingerprint. Narrow
-    /// outcomes never reach this view, so past call failures cannot block
-    /// later attempts.
+    /// only routes presenting the same exact generation fingerprint. Live
+    /// session blocks stop only the owning session. Narrow outcomes never
+    /// reach this view, so past call failures cannot block later attempts.
     #[must_use]
     pub fn is_route_eligible(
         &self,
-        route_fingerprint: &str,
         generation_fingerprint: &str,
         session_id: Option<&str>,
         now_unix_ms: u64,
     ) -> bool {
-        let _ = route_fingerprint;
         if self
-            .installation_blocks
+            .installation
             .iter()
             .any(|item| item.is_live(now_unix_ms))
         {
             return false;
         }
-        if self.generation_blocks.iter().any(|item| {
+        if self.generation.iter().any(|item| {
             item.is_live(now_unix_ms) && item.generation_fingerprint == generation_fingerprint
         }) {
             return false;
         }
-        if let Some(session) = session_id {
-            if self
-                .session_blocks
+        if let Some(session) = session_id
+            && self
+                .session
                 .iter()
                 .any(|item| item.is_live(now_unix_ms) && item.scope_owner == session)
-            {
-                return false;
-            }
+        {
+            return false;
         }
         true
     }
@@ -388,7 +415,7 @@ impl CapabilityRegistryView {
     /// Counts live installation-global blocks (narrow outcomes never land here).
     #[must_use]
     pub fn live_installation_blocks(&self, now_unix_ms: u64) -> usize {
-        self.installation_blocks
+        self.installation
             .iter()
             .filter(|item| item.is_live(now_unix_ms))
             .count()
@@ -400,16 +427,51 @@ mod tests {
     use super::*;
 
     fn call_failure(attempt: &str) -> Result<CapabilityOutcome, OutcomeError> {
-        fallback_outcome(
-            "provider.dispatch",
-            "route-a",
-            "fallback-route-b",
-            "route-a timed out once",
-            vec!["attempt-output-1".to_owned()],
-            "candidate-only",
-            "no sticky block; each attempt re-admits on its own evidence",
-            attempt,
-        )
+        fallback_outcome(FallbackOutcomeRequest {
+            capability: "provider.dispatch".to_owned(),
+            requested_mode: "route-a".to_owned(),
+            effective_mode: "fallback-route-b".to_owned(),
+            reason: "route-a timed out once".to_owned(),
+            affected_outputs_or_operations: vec!["attempt-output-1".to_owned()],
+            proof_ceiling: "candidate-only".to_owned(),
+            recovery_requalification_or_expiry:
+                "no sticky block; each attempt re-admits on its own evidence".to_owned(),
+            attempt_id: attempt.to_owned(),
+        })
+    }
+
+    fn session_failure(owner: &str) -> CapabilityOutcome {
+        CapabilityOutcome {
+            capability: "provider.dispatch".to_owned(),
+            requested_mode: "route-a".to_owned(),
+            effective_mode: "degraded".to_owned(),
+            degradation_scope: DegradationScope::Session,
+            reason: "session evidence shows repeated degraded execution".to_owned(),
+            evidence_refs: vec!["session-evidence-7-1".to_owned()],
+            affected_outputs_or_operations: vec!["dispatch".to_owned()],
+            proof_ceiling: "candidate-only".to_owned(),
+            recovery_requalification_or_expiry: "requalify-session session-7".to_owned(),
+            scope_owner: owner.to_owned(),
+            generation_fingerprint: String::new(),
+            valid_until_unix_ms: None,
+        }
+    }
+
+    fn installation_failure() -> CapabilityOutcome {
+        CapabilityOutcome {
+            capability: "provider.dispatch".to_owned(),
+            requested_mode: "route-a".to_owned(),
+            effective_mode: "blocked".to_owned(),
+            degradation_scope: DegradationScope::Installation,
+            reason: "installation evidence shows a broken provider contract".to_owned(),
+            evidence_refs: vec!["installation-evidence-1".to_owned()],
+            affected_outputs_or_operations: vec!["dispatch".to_owned()],
+            proof_ceiling: "none".to_owned(),
+            recovery_requalification_or_expiry: "requalify-installation".to_owned(),
+            scope_owner: "installation-1".to_owned(),
+            generation_fingerprint: String::new(),
+            valid_until_unix_ms: None,
+        }
     }
 
     fn generation_failure(fingerprint: &str) -> CapabilityOutcome {
@@ -456,8 +518,8 @@ mod tests {
             ));
         }
         if view.live_installation_blocks(1_000) != 0
-            || !view.is_route_eligible("route-a", "gen-a", None, 1_000)
-            || !view.is_route_eligible("fallback-route-b", "gen-a", None, 1_000)
+            || !view.is_route_eligible("gen-a", None, 1_000)
+            || !view.is_route_eligible("gen-b", None, 1_000)
         {
             return Err(OutcomeError::Contract(
                 "single failed call blocked a later attempt".to_owned(),
@@ -477,8 +539,8 @@ mod tests {
                 "evidenced generation record must apply globally".to_owned(),
             ));
         }
-        if view.is_route_eligible("route-a", "gen-a", None, 1_000)
-            || !view.is_route_eligible("route-a", "gen-b", None, 1_000)
+        if view.is_route_eligible("gen-a", None, 1_000)
+            || !view.is_route_eligible("gen-b", None, 1_000)
         {
             return Err(OutcomeError::Contract(
                 "generation block did not match only its fingerprint".to_owned(),
@@ -497,9 +559,96 @@ mod tests {
         }
 
         view.requalify_generation("gen-a");
-        if !view.is_route_eligible("route-a", "gen-a", None, 1_000) {
+        if !view.is_route_eligible("gen-a", None, 1_000) {
             return Err(OutcomeError::Contract(
                 "requalified generation still blocks its routes".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn installation_and_session_scopes_recover_through_defined_paths() -> Result<(), OutcomeError> {
+        let mut view = CapabilityRegistryView::default();
+        let mut bare = installation_failure();
+        bare.evidence_refs.clear();
+        if !matches!(
+            view.record(&bare),
+            Err(OutcomeError::BroadScopeRequiresEvidence(_))
+        ) {
+            return Err(OutcomeError::Contract(
+                "unevidenced installation scope was admitted".to_owned(),
+            ));
+        }
+
+        let installation = installation_failure();
+        if view.record(&installation)? != OutcomeDisposition::GlobalApplied {
+            return Err(OutcomeError::Contract(
+                "evidenced installation record must apply globally".to_owned(),
+            ));
+        }
+        if view.is_route_eligible("gen-a", None, 1_000) || view.live_installation_blocks(1_000) != 1
+        {
+            return Err(OutcomeError::Contract(
+                "installation block did not stop every route".to_owned(),
+            ));
+        }
+        view.requalify_installation();
+        if !view.is_route_eligible("gen-a", None, 1_000) {
+            return Err(OutcomeError::Contract(
+                "requalified installation still blocks routes".to_owned(),
+            ));
+        }
+
+        let session = session_failure("session-7");
+        if view.record(&session)? != OutcomeDisposition::GlobalApplied {
+            return Err(OutcomeError::Contract(
+                "evidenced session record must apply globally".to_owned(),
+            ));
+        }
+        if view.is_route_eligible("gen-b", Some("session-7"), 1_000)
+            || !view.is_route_eligible("gen-b", Some("session-9"), 1_000)
+            || !view.is_route_eligible("gen-b", None, 1_000)
+        {
+            return Err(OutcomeError::Contract(
+                "session block did not match only its session".to_owned(),
+            ));
+        }
+        view.requalify_session("session-7");
+        if !view.is_route_eligible("gen-b", Some("session-7"), 1_000) {
+            return Err(OutcomeError::Contract(
+                "requalified session still blocks its routes".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn degradation_outcomes_round_trip_in_contract_vocabulary() -> Result<(), OutcomeError> {
+        let outcome = call_failure("attempt-9")?;
+        let json =
+            serde_json::to_string(&outcome).map_err(|e| OutcomeError::Contract(e.to_string()))?;
+        if !json.contains("\"CALL\"") {
+            return Err(OutcomeError::Contract(
+                "degradation scope left the contract vocabulary".to_owned(),
+            ));
+        }
+        let back: CapabilityOutcome =
+            serde_json::from_str(&json).map_err(|e| OutcomeError::Contract(e.to_string()))?;
+        if back != outcome {
+            return Err(OutcomeError::Contract(
+                "capability outcome did not survive its wire round trip".to_owned(),
+            ));
+        }
+        let mut receipt = AttemptReceipt::new("attempt-9")?;
+        receipt.attach(outcome)?;
+        let receipt_json =
+            serde_json::to_string(&receipt).map_err(|e| OutcomeError::Contract(e.to_string()))?;
+        let receipt_back: AttemptReceipt = serde_json::from_str(&receipt_json)
+            .map_err(|e| OutcomeError::Contract(e.to_string()))?;
+        if receipt_back != receipt {
+            return Err(OutcomeError::Contract(
+                "attempt receipt did not survive its wire round trip".to_owned(),
             ));
         }
         Ok(())

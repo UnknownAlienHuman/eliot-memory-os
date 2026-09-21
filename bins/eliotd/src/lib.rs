@@ -77,7 +77,7 @@ use activation_projection::map_activation_snapshot;
 
 pub use capability_outcome::{
     AttemptReceipt, CapabilityOutcome, CapabilityRegistryView, DegradationScope,
-    OutcomeDisposition, OutcomeError, fallback_outcome,
+    FallbackOutcomeRequest, OutcomeDisposition, OutcomeError, fallback_outcome,
 };
 pub use daemon_config::DaemonConfig;
 pub(crate) use daemon_kernel_client::kernel_port_error;
