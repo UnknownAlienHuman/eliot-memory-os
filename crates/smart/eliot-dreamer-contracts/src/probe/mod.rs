@@ -4,6 +4,7 @@ pub mod affordance;
 pub mod bounds;
 pub mod input;
 pub mod objective;
+pub mod policy;
 pub mod result;
 pub(crate) mod validation;
 
@@ -12,8 +13,8 @@ pub use affordance::{
     CostDimension, EffectDimension, FeasibilityDimension, HumanAttentionDimension,
     INQUIRY_AFFORDANCE_SCHEMA_VERSION, INQUIRY_AFFORDANCE_SET_SCHEMA_VERSION, InformationDimension,
     InquiryAffordanceDescriptor, InquiryAffordanceDescriptorParams, InquiryAffordanceSet,
-    InquiryAffordanceSetParams, LatencyDimension, PrivacyDimension, ResourceDimension,
-    ReversibilityDimension,
+    InquiryAffordanceSetParams, LatencyDimension, PrivacyDimension, ProbeAffordanceSemantics,
+    ResourceDimension, ReversibilityDimension,
 };
 
 pub use bounds::{
@@ -21,14 +22,21 @@ pub use bounds::{
     MAX_PROBE_WIRE_BYTES, PROBE_OBJECTIVE_SCHEMA_VERSION, PROBE_RESULT_SCHEMA_VERSION,
 };
 pub use input::{
-    PROBE_INPUT_SCHEMA_VERSION, ProbeAffordanceRef, ProbeCapabilityAvailability, ProbeExternalOwners,
-    ProbeGroundingRef, ProbeInput, ProbeInputParams, ProbeInputRef, ProbeLifecycle, ProbeParam,
-    ProbeRepeatRef, ProbeSourceRef,
+    PROBE_INPUT_SCHEMA_VERSION, ProbeAffordanceRef, ProbeCapabilityAvailability,
+    ProbeExternalOwners, ProbeGroundingRef, ProbeInput, ProbeInputParams, ProbeInputRef,
+    ProbeLifecycle, ProbeParam, ProbeRepeatRef, ProbeSourceRef,
 };
 pub use objective::{
-    ProbeObjective, ProbeObjectiveOrigin, ProbeObjectiveRef, ProbeObjectiveTarget, ProbeOwnerRef,
+    CausalProbeRequirements, ProbeObjective, ProbeObjectiveBinding, ProbeObjectiveMateriality,
+    ProbeObjectiveOrigin, ProbeObjectiveRef, ProbeObjectiveResolution, ProbeObjectiveTarget,
+    ProbeOwnerRef,
+};
+pub use policy::{
+    PROBE_ORDERING_POLICY_SCHEMA_VERSION, ProbeOrderingDimension, ProbeOrderingPolicy,
+    ProbeOrderingTieBreak,
 };
 pub use result::{
-    GapUpdateMeaning, PossibleResultSchema, PossibleResultValue, ResultBranch, ResultTarget,
-    ResultUpdate, ResultUpdateDiscriminability, RivalUpdateMeaning, update_sets_equal,
+    BranchEvidenceAcceptance, GapUpdateMeaning, PossibleResultSchema, PossibleResultValue,
+    ResultBranch, ResultBranchAcceptance, ResultTarget, ResultUpdate, ResultUpdateDiscriminability,
+    RivalUpdateMeaning, update_sets_equal,
 };

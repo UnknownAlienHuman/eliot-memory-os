@@ -46,6 +46,7 @@ use tracing_subscriber::EnvFilter;
 
 mod bootstrap_draft;
 mod controlboard_status;
+mod first_run_flow;
 mod plugin_preview;
 mod source_bundle_materializer;
 
@@ -92,6 +93,13 @@ enum Command {
     Runtime {
         #[command(subcommand)]
         command: RuntimeCommand,
+    },
+    /// Governor-backed first-run setup: typed per-role routes, visible
+    /// defaults, and Human-board recommendations. Replaces the retired
+    /// legacy `governor.toml` path, which is never adopted as authority.
+    Setup {
+        #[command(subcommand)]
+        command: SetupCommand,
     },
     /// Preview or install a plugin/bridge with rollback (I3.7).
     Plugin {
@@ -412,6 +420,85 @@ enum CatalogueCommand {
     Validate,
 }
 
+/// Governor-backed first-run setup commands (issue #1962).
+#[derive(Debug, Subcommand)]
+enum SetupCommand {
+    /// Decide typed per-role route state. Omitted roles stay `UNASSIGNED`;
+    /// paid routes require explicit consent flags.
+    Apply {
+        /// Dreamer route kind: `unassigned`, `local`, `economy`, or `paid`.
+        #[arg(long)]
+        dreamer_route: Option<String>,
+        /// Watchdog route kind: `unassigned`, `local`, `economy`, or `paid`.
+        #[arg(long)]
+        watchdog_route: Option<String>,
+        /// The setup screen displayed the Dreamer local/economy default.
+        #[arg(long, default_value = "false")]
+        dreamer_displayed: bool,
+        /// The setup screen displayed the Watchdog local/economy default.
+        #[arg(long, default_value = "false")]
+        watchdog_displayed: bool,
+        /// Explicit paid-route consent for Dreamer.
+        #[arg(long, default_value = "false")]
+        dreamer_explicit: bool,
+        /// Explicit paid-route consent for Watchdog.
+        #[arg(long, default_value = "false")]
+        watchdog_explicit: bool,
+        /// Automation mode: `suggest_only`, `manual`, `idle_only`,
+        /// `scheduled`, `continuous_bounded`, or `off`. Omitted keeps the
+        /// visible `SUGGEST_ONLY` default.
+        #[arg(long)]
+        automation: Option<String>,
+        /// Human owner ref recorded on every persisted setting. Required:
+        /// no identity is invented by the CLI.
+        #[arg(long)]
+        owner_ref: String,
+    },
+    /// Inspect every default through the same typed path (reversible).
+    Show,
+    /// Update one role and/or the automation mode through the same typed
+    /// path used by `apply`.
+    Set {
+        /// Role key: `main`, `worker`, `auditor`, `verifier`, `watchdog`,
+        /// `dreamer`, or `research`. Required with `--route`.
+        #[arg(long)]
+        role: Option<String>,
+        /// Route kind: `unassigned`, `local`, `economy`, or `paid`. Omitted
+        /// clears the role back to `UNASSIGNED`.
+        #[arg(long)]
+        route: Option<String>,
+        /// The setup screen displayed the local/economy default.
+        #[arg(long, default_value = "false")]
+        displayed: bool,
+        /// Explicit paid-route consent.
+        #[arg(long, default_value = "false")]
+        explicit_consent: bool,
+        /// Automation mode update: `suggest_only`, `manual`, `idle_only`,
+        /// `scheduled`, `continuous_bounded`, or `off`. At least one of
+        /// `--route` or `--automation` is required.
+        #[arg(long)]
+        automation: Option<String>,
+        /// Human owner ref recorded on every persisted setting. Required:
+        /// no identity is invented by the CLI.
+        #[arg(long)]
+        owner_ref: String,
+    },
+    /// With automation disabled, record one deduplicated Human-board
+    /// recommendation for a needed action; no job starts.
+    Recommend {
+        /// Automation mode: `suggest_only`, `manual`, `idle_only`,
+        /// `scheduled`, `continuous_bounded`, or `off`.
+        #[arg(long)]
+        automation: String,
+        /// Maintenance family, e.g. `RESEARCH_EXCHANGE_CLEANUP`.
+        #[arg(long)]
+        family: String,
+        /// Affected scope reference.
+        #[arg(long)]
+        scope: String,
+    },
+}
+
 fn main() -> Result<()> {
     let exit_code = std::thread::Builder::new()
         .name("eliot-cli-main".to_owned())
@@ -442,12 +529,75 @@ fn run() -> Result<i32> {
         Command::Bootstrap { command } => Ok(run_bootstrap(command)),
         Command::Installation { command } => run_installation(command),
         Command::Runtime { command } => run_runtime(command),
+        Command::Setup { command } => run_setup(command),
         Command::Plugin { command } => run_plugin(command),
         Command::Doctor { command } => run_doctor(command),
         Command::ControlBoard { command } => run_controlboard(command),
         Command::Backup { command } => backup_entry::run_backup(command),
         Command::Dispatch => run_dispatch(),
         Command::Ui => run_ui(),
+    }
+}
+
+#[cfg(windows)]
+fn reject_present_legacy_governor_config() -> Result<()> {
+    observe_legacy_governor_config()
+}
+
+#[cfg(not(windows))]
+fn reject_present_legacy_governor_config() -> Result<()> {
+    Ok(())
+}
+
+fn run_setup(command: SetupCommand) -> Result<i32> {
+    // #1962: reject a present legacy Governor file before any setup
+    // decision; absent proceeds with no legacy config adopted.
+    reject_present_legacy_governor_config()?;
+    match command {
+        SetupCommand::Apply {
+            dreamer_route,
+            watchdog_route,
+            dreamer_displayed,
+            watchdog_displayed,
+            dreamer_explicit,
+            watchdog_explicit,
+            automation,
+            owner_ref,
+        } => first_run_flow::run_setup_apply(&first_run_flow::SetupApplyArgs {
+            dreamer_route,
+            watchdog_route,
+            dreamer_displayed,
+            watchdog_displayed,
+            dreamer_explicit,
+            watchdog_explicit,
+            automation,
+            owner_ref,
+        }),
+        SetupCommand::Show => first_run_flow::run_setup_show(),
+        SetupCommand::Set {
+            role,
+            route,
+            displayed,
+            explicit_consent,
+            automation,
+            owner_ref,
+        } => first_run_flow::run_setup_set(&first_run_flow::SetupSetArgs {
+            role,
+            route,
+            displayed,
+            explicit_consent,
+            automation,
+            owner_ref,
+        }),
+        SetupCommand::Recommend {
+            automation,
+            family,
+            scope,
+        } => first_run_flow::run_setup_recommend(&first_run_flow::SetupRecommendArgs {
+            automation,
+            family,
+            scope,
+        }),
     }
 }
 

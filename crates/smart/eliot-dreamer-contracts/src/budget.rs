@@ -244,6 +244,154 @@ pub struct BudgetUsage {
     pub stu_used: u64,
 }
 
+/// Independent demand declared by one candidate before any execution.
+///
+/// A demand is deliberately distinct from [`BudgetUsage`]: it is a bounded
+/// forecast, not an observation. `None` means the candidate owner did not
+/// establish that dimension. The planner must therefore reject it for
+/// readiness instead of treating it as zero or unlimited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetDemand {
+    /// Declared input bytes for this candidate.
+    pub input_bytes: Option<u64>,
+    /// Declared output bytes for this candidate.
+    pub output_bytes: Option<u64>,
+    /// Declared source width for this candidate.
+    pub source_width: Option<u64>,
+    /// Declared reference width for this candidate.
+    pub reference_width: Option<u64>,
+    /// Declared provider model calls for this candidate.
+    pub model_calls: Option<u64>,
+    /// Declared attempts for this candidate.
+    pub attempts: Option<u64>,
+    /// Declared candidate count contribution; normally one for a candidate.
+    pub candidates: Option<u64>,
+    /// Declared wall-clock milliseconds for this candidate.
+    pub wall_ms: Option<u64>,
+    /// Declared work fan-out for this candidate.
+    pub work_fan_out: Option<u64>,
+    /// Declared report bytes for this candidate.
+    pub report_bytes: Option<u64>,
+    /// Declared synthetic throttle units for this candidate.
+    pub max_stu: Option<u64>,
+}
+
+impl BudgetDemand {
+    /// A demand with every dimension explicitly zero.
+    pub const fn zero() -> Self {
+        Self {
+            input_bytes: Some(0),
+            output_bytes: Some(0),
+            source_width: Some(0),
+            reference_width: Some(0),
+            model_calls: Some(0),
+            attempts: Some(0),
+            candidates: Some(0),
+            wall_ms: Some(0),
+            work_fan_out: Some(0),
+            report_bytes: Some(0),
+            max_stu: Some(0),
+        }
+    }
+
+    /// Converts observed usage into an exact demand snapshot.
+    pub const fn from_usage(usage: BudgetUsage) -> Self {
+        Self {
+            input_bytes: Some(usage.input_bytes),
+            output_bytes: Some(usage.output_bytes),
+            source_width: Some(usage.source_width),
+            reference_width: Some(usage.reference_width),
+            model_calls: Some(usage.model_calls),
+            attempts: Some(usage.attempts),
+            candidates: Some(usage.candidates),
+            wall_ms: Some(usage.wall_ms),
+            work_fan_out: Some(usage.work_fan_out),
+            report_bytes: Some(usage.report_bytes),
+            max_stu: Some(usage.stu_used),
+        }
+    }
+
+    /// Validates only the candidate declaration and class ceilings.
+    pub fn validate(&self) -> Result<(), ContractViolation> {
+        for (value, dimension, ceiling) in [
+            (self.input_bytes, "input_bytes", INPUT_BYTES_CEILING),
+            (self.output_bytes, "output_bytes", OUTPUT_BYTES_CEILING),
+            (self.source_width, "source_width", SOURCE_WIDTH_CEILING),
+            (
+                self.reference_width,
+                "reference_width",
+                REFERENCE_WIDTH_CEILING,
+            ),
+            (self.model_calls, "model_calls", MODEL_CALLS_CEILING),
+            (self.attempts, "attempts", ATTEMPTS_CEILING),
+            (self.candidates, "candidates", CANDIDATES_CEILING),
+            (self.wall_ms, "wall_ms", WALL_MS_CEILING),
+            (self.work_fan_out, "work_fan_out", WORK_FAN_OUT_CEILING),
+            (self.report_bytes, "report_bytes", REPORT_BYTES_CEILING),
+            (self.max_stu, "max_stu", STU_CEILING),
+        ] {
+            if let Some(value) = value
+                && value > ceiling
+            {
+                return Err(ContractViolation::Budget {
+                    dimension,
+                    reason: format!("candidate demand {value} exceeds class ceiling {ceiling}"),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Checks this candidate independently against every matching limit.
+    ///
+    /// No dimension can compensate for another. Both an unknown demand and
+    /// an unknown limit fail closed because neither can authorize work.
+    pub fn fits(&self, limits: &BudgetLimits) -> Result<(), ContractViolation> {
+        self.validate()?;
+        let rows = [
+            ("input_bytes", self.input_bytes, limits.input_bytes),
+            ("output_bytes", self.output_bytes, limits.output_bytes),
+            ("source_width", self.source_width, limits.source_width),
+            (
+                "reference_width",
+                self.reference_width,
+                limits.reference_width,
+            ),
+            ("model_calls", self.model_calls, limits.model_calls),
+            ("attempts", self.attempts, limits.attempts),
+            ("candidates", self.candidates, limits.candidates),
+            ("wall_ms", self.wall_ms, limits.wall_ms),
+            ("work_fan_out", self.work_fan_out, limits.work_fan_out),
+            ("report_bytes", self.report_bytes, limits.report_bytes),
+            ("max_stu", self.max_stu, limits.max_stu),
+        ];
+        for (dimension, demand, limit) in rows {
+            let Some(demand) = demand else {
+                return Err(ContractViolation::Budget {
+                    dimension,
+                    reason: "unknown candidate demand cannot authorize readiness".to_owned(),
+                });
+            };
+            let Some(limit) = limit else {
+                return Err(ContractViolation::Budget {
+                    dimension,
+                    reason: "unknown limit cannot authorize candidate demand".to_owned(),
+                });
+            };
+            if demand > limit {
+                return Err(ContractViolation::Budget {
+                    dimension,
+                    reason: format!(
+                        "candidate demand {demand} exceeds limit {limit}; under-use elsewhere cannot compensate"
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
 impl BudgetUsage {
     /// Returns `Ok` exactly when every consumed dimension fits inside its
     /// corresponding `Some` limit. Fails when any usage exceeds its limit or

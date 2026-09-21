@@ -578,6 +578,7 @@ dependencies = [
  "eliot-backup",
  "eliot-bootstrap",
  "eliot-cli",
+ "eliot-config",
  "eliot-contracts",
  "eliot-doctor",
  "eliot-governor",
@@ -1480,6 +1481,7 @@ dependencies = [
  "eliot-contracts",
  "eliot-dreamer-contracts",
  "eliot-evidence",
+ "eliot-security-contracts",
  "schemars",
  "serde",
 ]
@@ -1511,7 +1513,10 @@ dependencies = [
 name = "eliot-dreamer-probe-plan"
 version = "0.1.0"
 dependencies = [
+ "eliot-contracts",
  "eliot-dreamer-contracts",
+ "eliot-evaluation-contracts",
+ "eliot-receipts",
  "schemars",
  "serde",
 ]
@@ -3075,6 +3080,7 @@ dependencies = [
  "eliot-agent-contracts",
  "eliot-agent-coordinator",
  "eliot-authority",
+ "eliot-config",
  "eliot-contracts",
  "eliot-controlboard",
  "eliot-doctor-core",
