@@ -16,11 +16,13 @@ use std::time::Duration;
 use eliot_runtime::RuntimeConfig;
 use eliot_runtime::{Runtime, ShutdownHandle, ShutdownOutcome};
 use eliot_wasm_runtime::{
-    InvocationId, InvocationRequest, InvocationResult, RuntimeError, RuntimePorts, WasmRuntime,
+    ComponentEnginePort, InvocationId, InvocationRequest, InvocationResult, RuntimeError,
+    RuntimePorts, WasmRuntime,
 };
 
 mod admission;
 mod artifact_preflight;
+mod child_engine;
 mod cli_contract;
 mod contour;
 mod guest_exec;
@@ -33,6 +35,7 @@ pub use admission::{PortGrantError, resolve_kernel_port_grant};
 pub use artifact_preflight::{
     MAX_ARTIFACT_BYTES, Preflight, PreflightError, preflight_bytes, read_bounded_artifact,
 };
+pub use child_engine::{ISOLATED_CHILD_IMPLEMENTATION_ID, IsolatedChildEngine};
 pub use cli_contract::{CliConfig, CliError, GuestExecArgs, Profile, Transport, parse_args};
 pub use contour::{
     AdmittedGeneration, AdmittedPrototype, AuthorizedHostCall, Contour, ContourGateError,
@@ -42,8 +45,9 @@ pub use contour::{
     authorize_host_call, check_activation_imports, check_admitted_request,
 };
 pub use guest_exec::{
-    EXIT_COMPLETED, EXIT_DENIED, EXIT_ENGINE_FAILED, EXIT_NOT_COMPLETED, GuestExecRejection,
-    GuestExecRequest, run_guest_exec, validate_request,
+    ChildMetering, EXIT_COMPLETED, EXIT_DENIED, EXIT_ENGINE_FAILED, EXIT_NOT_COMPLETED,
+    GuestExecRejection, GuestExecRequest, metering_line, parse_metering_line, run_guest_exec,
+    validate_request,
 };
 pub use shadow::{ShadowError, enforce_shadow_no_effect, shadow_port_error};
 pub use typed_bindings::{
@@ -99,18 +103,20 @@ impl WasmHostRunner {
         Self::new(profile, runtime, wasm_runtime)
     }
 
-    /// Binds the concrete Wasmtime provider to the existing authority ports.
+    /// Binds the concrete engine provider to the existing authority ports.
     ///
     /// The supplied ports remain the owners of admission, generation, fencing,
     /// process authority, and promotion. This method only replaces the engine
-    /// slot with the provider-specific adapter.
+    /// slot with the provider-specific adapter: either the in-process
+    /// Wasmtime provider or the isolated-child engine (never both — pairing
+    /// them would execute the guest twice).
     pub fn with_wasmtime_engine(
         profile: Profile,
         runtime: Runtime,
         mut ports: RuntimePorts,
-        engine: WasmtimeComponentEngine,
+        engine: Box<dyn ComponentEnginePort>,
     ) -> Result<Self, RuntimeBuildError> {
-        ports.engine = Box::new(engine);
+        ports.engine = engine;
         Self::new(profile, runtime, WasmRuntime::new(Some(ports)))
     }
 

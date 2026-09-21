@@ -102,9 +102,9 @@ use eliot_security_contracts::{
     InstructionTaint, IntegrityStatus, PrivacyClass, QuarantineState, SourceAssurance,
 };
 use eliot_wasm_host::{
-    AdmittedGeneration, ContourGateError, GenerationManifest, Profile, PrototypeContourDecision,
-    STANDARD_GUEST_TARGET, WasmHostRunner, WasmtimeComponentEngine, admit_generation,
-    provider_configuration_digest,
+    AdmittedGeneration, ContourGateError, GenerationManifest, ISOLATED_CHILD_IMPLEMENTATION_ID,
+    IsolatedChildEngine, Profile, PrototypeContourDecision, STANDARD_GUEST_TARGET, WasmHostRunner,
+    WasmtimeComponentEngine, admit_generation, provider_configuration_digest,
 };
 use eliot_wasm_runtime::lifecycle::{DeterministicEchoCore, SemanticCore};
 use eliot_wasm_runtime::{
@@ -349,6 +349,21 @@ fn joined_engine_binding() -> EngineBinding {
     }
 }
 
+/// Engine binding for the isolated-child contour: identical digests to
+/// [`joined_engine_binding`], but the isolated implementation identity the
+/// runtime's engine-binding gate matches against the admitted manifest.
+/// Seating this binding (instead of the in-process one) selects child-only
+/// execution: the guest runs exactly once, inside the reaped child.
+fn joined_isolated_binding() -> EngineBinding {
+    EngineBinding {
+        implementation_id: ISOLATED_CHILD_IMPLEMENTATION_ID.to_owned(),
+        exact_version: "47.0.4".to_owned(),
+        engine_artifact_digest: Sha256Digest::of_bytes(JOINED_ENGINE_FIXTURE_ID),
+        engine_configuration_digest: provider_configuration_digest(),
+        wit_interface_digest: Sha256Digest::of_bytes(GUEST_WIT),
+    }
+}
+
 fn snapshot_fixture() -> KernelGenerationSnapshot {
     KernelGenerationSnapshot {
         service: "eliot-kernel".to_owned(),
@@ -470,6 +485,7 @@ fn admitted_request(
             "echo".to_owned(),
             "joined-1955-proof".to_owned(),
         ],
+        limits.max_output_bytes,
     )
 }
 
@@ -515,6 +531,7 @@ fn admitted_guest_request(
             "--guest-exec-epoch-ticks".to_owned(),
             "100".to_owned(),
         ],
+        4_096,
     )
 }
 
@@ -525,6 +542,7 @@ fn issue_request(
     limits: &InvocationLimits,
     executable: &str,
     argv: Vec<String>,
+    stderr_cap_bytes: u64,
 ) -> ProcessRequest {
     let executable_digest = match std::fs::read(executable) {
         Ok(bytes) => eliot_contracts::sha256_hex(&bytes),
@@ -552,7 +570,7 @@ fn issue_request(
             Some(10_000),
             Some(limits.max_memory_bytes),
             limits.max_output_bytes,
-            limits.max_output_bytes,
+            stderr_cap_bytes,
             4,
         )),
     ));
@@ -624,7 +642,11 @@ fn admitted_execution_succeeds_through_real_wasmtime() {
     let component = component_bytes();
     let component_digest = Sha256Digest::of_bytes(&component);
     let configuration_digest = Sha256Digest::of_bytes(JOINED_COMPONENT_CONFIGURATION);
-    let engine_binding = joined_engine_binding();
+    // Isolated contour: this binding (not the in-process one) selects
+    // child-only execution — the guest runs exactly once, inside the
+    // reaped child. The in-process provider stays covered by its own unit
+    // edge and never runs in this composition.
+    let engine_binding = joined_isolated_binding();
     let limits = joined_limits(&component_digest);
     let manifest = joined_manifest(&component_digest, &engine_binding, &configuration_digest);
     let framed = framed_input();
@@ -730,14 +752,12 @@ fn admitted_execution_succeeds_through_real_wasmtime() {
     let process_port = WasmP03ProcessAdapter::new(Arc::clone(&executor), Arc::clone(&sink_dyn));
     must(process_port.stage_admitted_request(staged));
     let verify_port = WasmP03ProcessAdapter::new(Arc::clone(&executor), Arc::clone(&sink_dyn));
-    let slotted_engine = must(
-        WasmtimeComponentEngine::new(
-            engine_binding.clone(),
-            component_digest.clone(),
-            &component,
-            JOINED_COMPONENT_CONFIGURATION,
-        )
-        .map_err(|error| format!("{error:?}")),
+    let slotted_engine = IsolatedChildEngine::new(
+        Arc::clone(&executor),
+        Arc::clone(&sink_dyn),
+        engine_binding.clone(),
+        component_digest.clone(),
+        configuration_digest.clone(),
     );
     let ports = RuntimePorts::new(
         Box::new(admission.clone()),
@@ -748,21 +768,22 @@ fn admitted_execution_succeeds_through_real_wasmtime() {
         Box::new(verify_port),
         Box::new(slotted_engine),
     );
-    let invoked_engine = must(
-        WasmtimeComponentEngine::new(
-            engine_binding.clone(),
-            component_digest.clone(),
-            &component,
-            JOINED_COMPONENT_CONFIGURATION,
+    let invoked_engine = IsolatedChildEngine::new(
+        Arc::clone(&executor),
+        Arc::clone(&sink_dyn),
+        engine_binding.clone(),
+        component_digest.clone(),
+        configuration_digest.clone(),
+    );
+    let mut runner = must(
+        WasmHostRunner::with_wasmtime_engine(
+            test_profile(),
+            test_runtime(),
+            ports,
+            Box::new(invoked_engine),
         )
         .map_err(|error| format!("{error:?}")),
     );
-    let mut runner = must(WasmHostRunner::with_wasmtime_engine(
-        test_profile(),
-        test_runtime(),
-        ports,
-        invoked_engine,
-    ));
     let request = attempt_request(operation_id, ExecutionContour::Conformance, framed.clone());
     let result = match runner.execute_admitted(&admitted_gen, request) {
         Ok(result) => result,
@@ -796,7 +817,7 @@ fn admitted_execution_succeeds_through_real_wasmtime() {
             .as_ref()
             .ok_or("success binds the engine identity"),
     );
-    assert_eq!(bound.implementation_id, "wasmtime-component");
+    assert_eq!(bound.implementation_id, ISOLATED_CHILD_IMPLEMENTATION_ID);
     assert_eq!(bound.exact_version, "47.0.4");
     // Fixture-scoped engine identity (see JOINED_ENGINE_FIXTURE_ID): names
     // the pinned implementation for this proof — not a measured production
@@ -815,8 +836,12 @@ fn admitted_execution_succeeds_through_real_wasmtime() {
         provider_configuration_digest()
     );
     assert_eq!(bound, &engine_binding);
-    // Real loaded-artifact binding from the engine's own usage report:
-    // exactly the component bytes compiled above were read and executed.
+    // Metering honesty: peak/table/ticks/fuel below are the CHILD Store's
+    // own observations, parsed strictly from its captured stderr metering
+    // line — the contract-validity presence the neutral Completed gate
+    // demands, with no parent estimates. Artifact reads stay zero with an
+    // empty digest set: the component bytes were read by the child, whose
+    // loaded-artifact proof is the capture differential above.
     let usage = must(
         result
             .receipt
@@ -824,9 +849,17 @@ fn admitted_execution_succeeds_through_real_wasmtime() {
             .as_ref()
             .ok_or("success carries engine usage"),
     );
-    assert_eq!(usage.accessed_artifact_digests, vec![component_digest]);
-    assert_eq!(usage.artifact_bytes, component.len() as u64);
-    assert_eq!(usage.artifact_reads, 1);
+    assert!(usage.peak_memory_bytes.is_some());
+    assert!(usage.table_elements.is_some());
+    assert!(usage.epoch_ticks.is_some());
+    assert!(usage.fuel_consumed <= limits.max_fuel);
+    assert_eq!(usage.artifact_reads, 0);
+    assert!(usage.accessed_artifact_digests.is_empty());
+    assert!(usage.elapsed_ms > 0);
+    assert_eq!(
+        usage.enforced_stack_limit_bytes,
+        Some(limits.max_stack_bytes)
+    );
     // Same-operation native process boundary for the companion child: a
     // second adapter handle over the SAME executor re-observes the SAME
     // operation — no new invocation, permit, or child. The tree exited,
@@ -854,11 +887,14 @@ fn admitted_execution_succeeds_through_real_wasmtime() {
             .ok_or("reaped evidence carries descendant proof"),
     );
     assert!(descendants.complete() && descendants.tree_terminated());
-    // The guest ran INSIDE that child: P03-captured stdout must equal the
-    // oracle reference byte for byte — the same bytes as the in-process
-    // run above. Triple agreement (child, in-process engine, oracle) with
-    // complete, untruncated capture is the isolation proof; a trapped or
-    // limited guest leaves stdout empty and fails here, never as success.
+    // The guest ran INSIDE that child — exactly once, since no in-process
+    // engine exists in this composition: P03-captured stdout must equal
+    // the oracle reference byte for byte. Double agreement (child output,
+    // oracle image) with complete, untruncated capture is the isolation
+    // proof; the in-process provider stays covered by its own unit edge,
+    // and byte equality is transitive across the two contours. A trapped
+    // or limited guest leaves stdout empty and fails here, never as
+    // success.
     let operation = must(OperationId::new(operation_id));
     let (child_stdout, _) = must(
         executor
@@ -878,7 +914,10 @@ fn admitted_execution_succeeds_through_real_wasmtime() {
 
 /// Composes one full runner for negative proofs: the admission (and optional
 /// foreign authority override) plus an optionally staged P03 slot and two
-/// real engines (slotted, then rebound — both compiled from real bytes).
+/// real engines (slotted, then rebound — both compiled from real bytes for
+/// the in-process contour). Pass an isolated binding to seat the
+/// child-only contour instead: the engines then share this composition's
+/// executor and observe (never launch).
 #[allow(clippy::too_many_arguments)]
 fn compose_negative(
     admission: GovernorWasmAdmission,
@@ -888,6 +927,7 @@ fn compose_negative(
     invoked_artifact: &[u8],
     limits: &InvocationLimits,
     engine_binding: &EngineBinding,
+    isolated: bool,
 ) -> (WasmHostRunner, AdmittedGeneration) {
     let (executor, staged) = if let Some(operation_id) = stage_operation_id {
         let mut authority = test_authority();
@@ -919,45 +959,72 @@ fn compose_negative(
     if let Some(staged) = staged {
         must(process_port.stage_admitted_request(staged));
     }
-    let verify_port = WasmP03ProcessAdapter::new(executor, sink_dyn);
+    let verify_port = WasmP03ProcessAdapter::new(Arc::clone(&executor), Arc::clone(&sink_dyn));
     let slot_digest = Sha256Digest::of_bytes(slot_artifact);
-    let slot_engine = must(
-        WasmtimeComponentEngine::new(
-            engine_binding.clone(),
-            slot_digest,
-            slot_artifact,
-            JOINED_COMPONENT_CONFIGURATION,
-        )
-        .map_err(|error| format!("{error:?}")),
-    );
     let invoked_digest = Sha256Digest::of_bytes(invoked_artifact);
-    let invoked_engine = must(
-        WasmtimeComponentEngine::new(
-            engine_binding.clone(),
-            invoked_digest,
-            invoked_artifact,
-            JOINED_COMPONENT_CONFIGURATION,
-        )
-        .map_err(|error| format!("{error:?}")),
-    );
     let authority_box = authority_admission.unwrap_or_else(|| admission.clone());
     let source = admission.clone();
     let promotion = admission.clone();
-    let ports = RuntimePorts::new(
-        Box::new(admission),
-        Box::new(authority_box),
-        Box::new(source),
-        Box::new(promotion),
-        Box::new(process_port),
-        Box::new(verify_port),
-        Box::new(slot_engine),
+    let ports = if isolated {
+        let slot_engine = IsolatedChildEngine::new(
+            Arc::clone(&executor),
+            Arc::clone(&sink_dyn),
+            engine_binding.clone(),
+            slot_digest,
+            Sha256Digest::of_bytes(JOINED_COMPONENT_CONFIGURATION),
+        );
+        RuntimePorts::new(
+            Box::new(admission),
+            Box::new(authority_box),
+            Box::new(source),
+            Box::new(promotion),
+            Box::new(process_port),
+            Box::new(verify_port),
+            Box::new(slot_engine),
+        )
+    } else {
+        let slot_engine = must(
+            WasmtimeComponentEngine::new(
+                engine_binding.clone(),
+                slot_digest,
+                slot_artifact,
+                JOINED_COMPONENT_CONFIGURATION,
+            )
+            .map_err(|error| format!("{error:?}")),
+        );
+        RuntimePorts::new(
+            Box::new(admission),
+            Box::new(authority_box),
+            Box::new(source),
+            Box::new(promotion),
+            Box::new(process_port),
+            Box::new(verify_port),
+            Box::new(slot_engine),
+        )
+    };
+    let invoked: Box<dyn eliot_wasm_runtime::ComponentEnginePort> = if isolated {
+        Box::new(IsolatedChildEngine::new(
+            executor,
+            sink_dyn,
+            engine_binding.clone(),
+            invoked_digest,
+            Sha256Digest::of_bytes(JOINED_COMPONENT_CONFIGURATION),
+        ))
+    } else {
+        Box::new(must(
+            WasmtimeComponentEngine::new(
+                engine_binding.clone(),
+                invoked_digest,
+                invoked_artifact,
+                JOINED_COMPONENT_CONFIGURATION,
+            )
+            .map_err(|error| format!("{error:?}")),
+        ))
+    };
+    let runner = must(
+        WasmHostRunner::with_wasmtime_engine(test_profile(), test_runtime(), ports, invoked)
+            .map_err(|error| format!("{error:?}")),
     );
-    let runner = must(WasmHostRunner::with_wasmtime_engine(
-        test_profile(),
-        test_runtime(),
-        ports,
-        invoked_engine,
-    ));
     let admitted = host_admission_for(slot_artifact, limits);
     (runner, admitted)
 }
@@ -1102,6 +1169,7 @@ fn divergent_fixture_is_denied_before_effects() {
         &component,
         &limits,
         &parts.engine_binding,
+        false,
     );
     let request = attempt_request(
         "join-1956-divergent",
@@ -1134,6 +1202,7 @@ fn foreign_authority_is_rejected_before_process_or_engine() {
         &component_bytes(),
         &parts.limits,
         &parts.engine_binding,
+        false,
     );
     let request = attempt_request(
         "join-1956-foreign-authority",
@@ -1233,6 +1302,7 @@ fn rotated_fence_is_denied_before_engine() {
         &component_bytes(),
         &parts.limits,
         &parts.engine_binding,
+        false,
     );
     let mut request = attempt_request(
         "join-1956-tampered",
@@ -1299,6 +1369,7 @@ fn active_contour_denies_rejected_lifecycle_verdicts() {
         &component_bytes(),
         &parts.limits,
         &parts.engine_binding,
+        false,
     );
     let request = attempt_request("join-1956-active", ExecutionContour::Active, framed_input());
     let result = must(
@@ -1353,6 +1424,7 @@ fn bare_corpus_against_framed_execution_is_rejected() {
         &component_bytes(),
         &parts.limits,
         &parts.engine_binding,
+        false,
     );
     let request = attempt_request(
         "join-1956-bare-corpus",
@@ -1417,6 +1489,7 @@ fn foreign_component_admission_denies_before_a12() {
         component.as_slice(),
         &parts.limits,
         &parts.engine_binding,
+        false,
     );
     let request = attempt_request(
         "join-1956-foreign-component",
@@ -1452,6 +1525,7 @@ fn oversized_input_denies_before_a12() {
         component.as_slice(),
         &parts.limits,
         &parts.engine_binding,
+        false,
     );
     let request = attempt_request(
         "join-1956-oversized-input",
@@ -1465,4 +1539,49 @@ fn oversized_input_denies_before_a12() {
         error,
         ContourGateError::InputLimitExceeded("input-bytes".to_owned())
     );
+}
+
+#[test]
+fn isolated_manifest_mismatch_denied_before_reap() {
+    // Isolated contour with a divergent manifest: the child engine's own
+    // manifest gate (artifact identity) denies before any observation is
+    // read — the staged child is never even reaped for output. This is
+    // the isolated engine's causal denial proof, mirroring the port gate
+    // the divergent test covers for the in-process provider.
+    let component = component_bytes();
+    let divergent = divergent_bytes();
+    let divergent_digest = Sha256Digest::of_bytes(&divergent);
+    assert_ne!(
+        divergent_digest,
+        Sha256Digest::of_bytes(&component),
+        "fixtures must genuinely differ"
+    );
+    let isolated_binding = joined_isolated_binding();
+    let configuration_digest = Sha256Digest::of_bytes(JOINED_COMPONENT_CONFIGURATION);
+    let mut parts = negative_parts(&divergent);
+    parts.manifest = joined_manifest(&divergent_digest, &isolated_binding, &configuration_digest);
+    let admission = admit_negative(&parts);
+    let (mut runner, admitted) = compose_negative(
+        admission,
+        None,
+        Some("join-1956-isolated-divergent".to_owned()),
+        component.as_slice(),
+        component.as_slice(),
+        &parts.limits,
+        &isolated_binding,
+        true,
+    );
+    let request = attempt_request(
+        "join-1956-isolated-divergent",
+        ExecutionContour::Conformance,
+        framed_input(),
+    );
+    let result = must(
+        runner
+            .execute_admitted(&admitted, request)
+            .map_err(|error| format!("contour gate fired instead of engine denial: {error}")),
+    );
+    assert_eq!(result.receipt.disposition, InvocationDisposition::Unknown);
+    assert_eq!(result.receipt.error, Some(RuntimeError::UnknownOutcome));
+    assert_eq!(result.output, None);
 }
