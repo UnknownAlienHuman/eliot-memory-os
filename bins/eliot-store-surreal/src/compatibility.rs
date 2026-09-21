@@ -211,6 +211,38 @@ pub fn require_compatibility_for_writer(
     }
 }
 
+/// Requires the recorded decision to match the LIVE observed provider
+/// identity before canonical writes (issue #1932, backend handoff §3).
+///
+/// `observed_version` is the exact `major.minor.patch` triple from the live
+/// `provider.version` RPC answered over the ownership-verified channel;
+/// `observed_digest` is the spawn-validated artifact digest. Both must equal
+/// the record: a rotated binary or a drifted record fails closed here, never
+/// at the first canonical write. Record echo alone never satisfies this
+/// gate. Returns the startup report when bound.
+pub fn require_observed_identity_match(
+    record: &SurrealCompatibility,
+    observed_version: &str,
+    observed_digest: &str,
+) -> Result<String, String> {
+    if record.active_version != observed_version {
+        return Err(format!(
+            "recorded active_version {} does not match the observed provider version {observed_version}; canonical writes are not admitted",
+            record.active_version,
+        ));
+    }
+    if normalize_digest(&record.artifact_sha256) != normalize_digest(observed_digest) {
+        return Err(
+            "recorded artifact digest does not match the observed provider artifact; canonical writes are not admitted".to_owned(),
+        );
+    }
+    Ok(startup_report(
+        record,
+        "writer-admitted",
+        "observed provider identity bound",
+    ))
+}
+
 /// Renders the startup-visible report binding the exact active version to its
 /// compatibility decision. The line always carries `active_version` and
 /// `decision`; it never carries credentials.
@@ -552,5 +584,52 @@ evidence_snapshots = ["snapshot-2026-09-12-r1"]
         // The pinned line still admits with fresh matching evidence.
         let record = qualified_record();
         assert!(evaluate_compatibility(&record, OBSERVED_DIGEST, "2.0.0").is_writer_admitted());
+    }
+
+    // Observed-identity binding (issue #1932, backend handoff §3): the
+    // record echo binds to the live provider observation, never alone.
+    #[test]
+    fn observed_identity_match_admits_bound_record() {
+        let record = qualified_record();
+        let report =
+            require_observed_identity_match(&record, "3.1.4", OBSERVED_DIGEST).expect("bound");
+        assert!(report.contains("active_version=3.1.4"));
+        assert!(report.contains("observed provider identity bound"));
+    }
+
+    #[test]
+    fn observed_version_drift_refuses_before_any_write() {
+        let record = qualified_record();
+        for drifted in ["3.1.5", "3.2.0", "4.0.0"] {
+            let refusal = require_observed_identity_match(&record, drifted, OBSERVED_DIGEST)
+                .expect_err("drift must refuse");
+            assert!(
+                refusal.contains("does not match the observed provider version"),
+                "version drift refuses: {refusal}"
+            );
+        }
+    }
+
+    #[test]
+    fn observed_digest_drift_refuses_before_any_write() {
+        let record = qualified_record();
+        let refusal =
+            require_observed_identity_match(&record, "3.1.4", &"f".repeat(64)).expect_err("drift");
+        assert!(
+            refusal.contains("does not match the observed provider artifact"),
+            "digest drift refuses: {refusal}"
+        );
+        // Case-insensitive record form still binds the same artifact.
+        let mut upper = record.clone();
+        upper.artifact_sha256 = OBSERVED_DIGEST.to_ascii_uppercase();
+        assert!(
+            parse_compatibility_bytes(
+                QUALIFIED_TOML
+                    .replace(OBSERVED_DIGEST, &upper.artifact_sha256)
+                    .as_bytes()
+            )
+            .is_err()
+        );
+        require_observed_identity_match(&upper, "3.1.4", OBSERVED_DIGEST).expect("case-bound");
     }
 }

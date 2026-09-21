@@ -26,7 +26,7 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
 use eliot_store_api::{
-    NamedReadOperation, OperationId, StoreError, WriteReceipt, WriteReceiptStatus,
+    NamedReadOperation, OperationId, Resubmission, StoreError, WriteReceipt, WriteReceiptStatus,
     activated_read_operations,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -132,6 +132,9 @@ struct ManagerState {
     read_broken: bool,
     write_broken: bool,
     health_broken: bool,
+    read_reconnect_attempts: u32,
+    write_reconnect_attempts: u32,
+    health_reconnect_attempts: u32,
 }
 
 /// I5.7 desktop default for the Kernel's configured store transaction limit:
@@ -154,6 +157,13 @@ pub fn default_store_transaction_limit() -> NonZeroUsize {
         // keeps the loosest safe lane instead of panicking.
         None => NonZeroUsize::MIN,
     }
+}
+
+/// `default_store_transaction_limit` as a plain bound for configured
+/// composition (issue #1933 H1).
+#[must_use]
+pub fn default_store_transaction_limit_usize() -> usize {
+    default_store_transaction_limit().get()
 }
 
 /// Fixed bounded read pool for named Q0–Q4 reads.
@@ -185,6 +195,9 @@ impl StoreConnectionManager {
                 read_broken: false,
                 write_broken: false,
                 health_broken: false,
+                read_reconnect_attempts: 0,
+                write_reconnect_attempts: 0,
+                health_reconnect_attempts: 0,
             })),
         })
     }
@@ -224,6 +237,30 @@ impl StoreConnectionManager {
                 max_backoff_ms: 5_000,
             },
         })
+    }
+
+    /// Builds the manager from plain validated bounds: read slots plus the
+    /// Kernel-configured store transaction limit for writes (issue #1933 H1).
+    ///
+    /// Both bounds fail closed on zero — no `expect` remains on this path —
+    /// and deadlines follow the validated launch timeouts exactly like
+    /// [`Self::from_timeouts`].
+    pub fn from_configured_limits(
+        read_bound: usize,
+        store_transaction_limit: usize,
+        connect_timeout_ms: u64,
+        query_timeout_ms: u64,
+    ) -> Result<Self, String> {
+        let read_bound = NonZeroUsize::new(read_bound)
+            .ok_or_else(|| "read client bound must be non-zero".to_owned())?;
+        let write_bound = NonZeroUsize::new(store_transaction_limit)
+            .ok_or_else(|| "store transaction limit must be non-zero".to_owned())?;
+        Self::from_timeouts(
+            read_bound,
+            write_bound,
+            connect_timeout_ms,
+            query_timeout_ms,
+        )
     }
 
     /// Per-class policy bound at composition time.
@@ -320,6 +357,24 @@ impl StoreConnectionManager {
         }
     }
 
+    /// Validates that a lease still belongs to the set's current generation
+    /// and returns the [`LeaseAccess`] proof for this provider touch
+    /// (issue #1933 H4).
+    ///
+    /// Sealed-generation and fabricated handles refuse with
+    /// [`StoreError::Unavailable`]: a poisoned set reports generation 0,
+    /// which is never issued, and lease fields are module-private so no
+    /// caller can fabricate a current handle.
+    pub fn validate_lease<'a>(
+        &'a self,
+        lease: &'a ClientLease,
+    ) -> Result<LeaseAccess<'a>, StoreError> {
+        if !lease.is_current(self) {
+            return Err(StoreError::Unavailable);
+        }
+        Ok(LeaseAccess { lease })
+    }
+
     /// Explicitly replaces a broken generation and returns the new one.
     /// Fails closed when the set was not marked broken: generations advance
     /// only as declared recovery, never silently.
@@ -337,6 +392,7 @@ impl StoreConnectionManager {
                 }
                 state.read_generation = state.read_generation.saturating_add(1).max(1);
                 state.read_broken = false;
+                state.read_reconnect_attempts = 0;
                 Ok(state.read_generation)
             }
             ClientClass::Write => {
@@ -345,6 +401,7 @@ impl StoreConnectionManager {
                 }
                 state.write_generation = state.write_generation.saturating_add(1).max(1);
                 state.write_broken = false;
+                state.write_reconnect_attempts = 0;
                 Ok(state.write_generation)
             }
             ClientClass::Health => {
@@ -353,9 +410,40 @@ impl StoreConnectionManager {
                 }
                 state.health_generation = state.health_generation.saturating_add(1).max(1);
                 state.health_broken = false;
+                state.health_reconnect_attempts = 0;
                 Ok(state.health_generation)
             }
         }
+    }
+
+    /// Records one reconnect attempt for a client set and returns the policy
+    /// backoff the caller waits before dialing the transport (issue #1933 H2).
+    ///
+    /// The attempt is recorded BEFORE the dial so the budget is enforced even
+    /// if the dial hangs. Attempts past the policy budget refuse with
+    /// escalation instead of a silent replace. Budgets reset on
+    /// [`Self::replace_generation`]: a fresh generation earns a fresh budget.
+    pub fn note_reconnect_attempt(&self, class: ClientClass) -> Result<u64, String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "connection state is poisoned".to_owned())?;
+        let policy = self.policy(class);
+        let attempts = match class {
+            ClientClass::Read => &mut state.read_reconnect_attempts,
+            ClientClass::Write => &mut state.write_reconnect_attempts,
+            ClientClass::Health => &mut state.health_reconnect_attempts,
+        };
+        let next = attempts.saturating_add(1);
+        if next > policy.max_reconnect_attempts {
+            return Err(format!(
+                "client set {} exceeded its reconnect budget of {} attempts; escalate instead of replacing silently",
+                class.as_str(),
+                policy.max_reconnect_attempts
+            ));
+        }
+        *attempts = next;
+        Ok(policy.backoff_for_attempt(next))
     }
 
     /// Restricts bridge reads to the activated named Q0–Q4 catalogue.
@@ -418,6 +506,33 @@ impl ClientLease {
     }
 }
 
+/// Proof that a client lease was validated current at a provider touch
+/// (issue #1933 H4).
+///
+/// A `LeaseAccess` only exists after [`StoreConnectionManager::validate_lease`]
+/// confirms the lease still belongs to the set's admitted generation:
+/// sealed-generation and fabricated handles refuse with `Unavailable`
+/// instead of reaching the provider. Generations fence CLIENTS, never
+/// canonical data: replacement changes handle admission only.
+#[derive(Debug)]
+pub struct LeaseAccess<'a> {
+    lease: &'a ClientLease,
+}
+
+impl LeaseAccess<'_> {
+    /// Class admitted by this access proof.
+    #[must_use]
+    pub const fn class(&self) -> ClientClass {
+        self.lease.class()
+    }
+
+    /// Generation admitted by this access proof.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.lease.generation()
+    }
+}
+
 /// Error for a generation replacement requested without a marked failure.
 fn not_broken(class: ClientClass) -> String {
     format!(
@@ -457,6 +572,11 @@ pub enum ReplayVerdict {
     /// The original mutation provably did not apply; only a newly admitted
     /// operation may proceed, never a blind same-identity replay.
     NewIdentityOnly,
+    /// The original mutation provably did not apply AND its receipt forbids
+    /// even new-identity admission: route to canonical `SequenceDisposition`,
+    /// never re-admit the same work under any identity (I5.19 dead-letter
+    /// gap; issue #1933 H3).
+    RequiresGapDisposition,
 }
 
 /// Classifies one receipt lookup for the exact operation that went unknown.
@@ -485,6 +605,11 @@ pub fn classify_receipt_lookup(
 /// Decides whether any new transaction attempt is permissible after receipt
 /// resolution. Unknown stays unknown: only a proven terminal outcome moves
 /// the gate, and no arm permits a blind same-identity replay.
+///
+/// A proven non-application admits only a new identity here; the stricter
+/// gap-disposition routing (receipt forbids even new-identity admission)
+/// lives in [`UnknownWriteGate::verdict`], which sees the resolved receipt's
+/// resubmission rule.
 #[must_use]
 pub const fn decide_replay(outcome: &ResolvedWriteOutcome) -> ReplayVerdict {
     match outcome {
@@ -496,6 +621,17 @@ pub const fn decide_replay(outcome: &ResolvedWriteOutcome) -> ReplayVerdict {
     }
 }
 
+/// Routes a proven non-application through the resolved receipt's
+/// resubmission rule: `NewIdentityAfterCondition` opens a newly admitted
+/// operation, while `None` (or no proven receipt at all) routes to canonical
+/// `SequenceDisposition` instead of any re-admission.
+fn proven_not_applied_verdict(resubmission: Option<Resubmission>) -> ReplayVerdict {
+    match resubmission {
+        Some(Resubmission::NewIdentityAfterCondition) => ReplayVerdict::NewIdentityOnly,
+        Some(Resubmission::None) | None => ReplayVerdict::RequiresGapDisposition,
+    }
+}
+
 /// Tracks one ambiguous write from transport failure through exact receipt
 /// resolution. The gate opens only for the reconciled verdict; it never
 /// authorizes a replay while the outcome is unknown.
@@ -503,6 +639,7 @@ pub const fn decide_replay(outcome: &ResolvedWriteOutcome) -> ReplayVerdict {
 pub struct UnknownWriteGate {
     operation_id: OperationId,
     outcome: Option<ResolvedWriteOutcome>,
+    resubmission: Option<Resubmission>,
 }
 
 impl UnknownWriteGate {
@@ -512,6 +649,7 @@ impl UnknownWriteGate {
         Self {
             operation_id,
             outcome: None,
+            resubmission: None,
         }
     }
 
@@ -536,17 +674,47 @@ impl UnknownWriteGate {
     /// A lookup that answered for another identity, or an invalid or
     /// envelope-less receipt, records as foreign and keeps the gate
     /// unknown: [`Self::verdict`] stays [`ReplayVerdict::MustReconcile`].
+    /// The receipt's resubmission rule is recorded only from a proven
+    /// receipt for the exact identity: foreign or invalid answers never
+    /// contribute admission rules.
     pub fn resolve_lookup(&mut self, receipt: Option<&WriteReceipt>) {
-        self.outcome = Some(classify_receipt_lookup(&self.operation_id, receipt));
+        let outcome = classify_receipt_lookup(&self.operation_id, receipt);
+        self.resubmission = match &outcome {
+            ResolvedWriteOutcome::Committed | ResolvedWriteOutcome::ProvenNotApplied => {
+                receipt.map(|resolved| resolved.resubmission)
+            }
+            ResolvedWriteOutcome::Absent | ResolvedWriteOutcome::ForeignOrInvalid => None,
+        };
+        self.outcome = Some(outcome);
     }
 
     /// Current verdict: [`ReplayVerdict::MustReconcile`] until a proven
     /// terminal outcome for the exact identity is recorded.
+    ///
+    /// A proven non-application consults the recorded resubmission rule:
+    /// only `NewIdentityAfterCondition` opens a newly admitted operation;
+    /// anything else routes to canonical gap disposition, never re-admission.
     #[must_use]
     pub fn verdict(&self) -> ReplayVerdict {
-        self.outcome
-            .as_ref()
-            .map_or(ReplayVerdict::MustReconcile, decide_replay)
+        match &self.outcome {
+            None | Some(ResolvedWriteOutcome::Absent | ResolvedWriteOutcome::ForeignOrInvalid) => {
+                ReplayVerdict::MustReconcile
+            }
+            Some(ResolvedWriteOutcome::Committed) => ReplayVerdict::UseExistingReceipt,
+            Some(ResolvedWriteOutcome::ProvenNotApplied) => {
+                proven_not_applied_verdict(self.resubmission)
+            }
+        }
+    }
+
+    /// The resolved receipt's resubmission rule, if a proven terminal receipt
+    /// for the exact identity was recorded.
+    ///
+    /// Feeds the catalogue resubmission check at the new-identity admission
+    /// site (enforced there, read here).
+    #[must_use]
+    pub const fn resubmission(&self) -> Option<Resubmission> {
+        self.resubmission
     }
 
     /// Whether the unknown outcome is resolved to a proven terminal
@@ -688,6 +856,102 @@ mod tests {
         assert_eq!(
             admission.require_admitted("store.recovery.other"),
             Err(StoreError::UnknownOperation)
+        );
+    }
+
+    #[test]
+    fn configured_limits_apply_without_expect_and_refuse_zero() {
+        let manager =
+            StoreConnectionManager::from_configured_limits(4, 2, 1_000, 1_000).expect("limits");
+        assert_eq!(manager.policy(ClientClass::Read).bound.get(), 4);
+        assert_eq!(manager.policy(ClientClass::Write).bound.get(), 2);
+        assert_eq!(manager.policy(ClientClass::Health).bound.get(), 1);
+        assert!(StoreConnectionManager::from_configured_limits(0, 2, 1_000, 1_000).is_err());
+        assert!(StoreConnectionManager::from_configured_limits(4, 0, 1_000, 1_000).is_err());
+        assert_eq!(
+            default_store_transaction_limit_usize(),
+            default_store_transaction_limit().get()
+        );
+    }
+
+    #[test]
+    fn reconnect_attempts_enforce_budget_and_reset_on_replace() {
+        let manager = StoreConnectionManager::new(policies()).expect("manager");
+        assert_eq!(
+            manager
+                .note_reconnect_attempt(ClientClass::Write)
+                .expect("attempt 1"),
+            100
+        );
+        assert_eq!(
+            manager
+                .note_reconnect_attempt(ClientClass::Write)
+                .expect("attempt 2"),
+            200
+        );
+        assert_eq!(
+            manager
+                .note_reconnect_attempt(ClientClass::Write)
+                .expect("attempt 3"),
+            400
+        );
+        assert!(manager.note_reconnect_attempt(ClientClass::Write).is_err());
+        manager.mark_broken(ClientClass::Write);
+        manager
+            .replace_generation(ClientClass::Write)
+            .expect("replace");
+        assert_eq!(
+            manager
+                .note_reconnect_attempt(ClientClass::Write)
+                .expect("fresh budget"),
+            100
+        );
+    }
+
+    #[test]
+    fn lease_validation_accepts_current_and_refuses_stale() {
+        let manager = StoreConnectionManager::new(policies()).expect("manager");
+        let lease = manager.try_acquire(ClientClass::Write).expect("lease");
+        let access = manager.validate_lease(&lease).expect("current lease");
+        assert_eq!(access.class(), ClientClass::Write);
+        assert_eq!(access.generation(), 1);
+        drop(lease);
+        manager.mark_broken(ClientClass::Write);
+        manager
+            .replace_generation(ClientClass::Write)
+            .expect("replace");
+        // A lease issued under the sealed generation no longer validates,
+        // even while its slot is still held: use a fresh acquire-then-seal
+        // sequence to prove staleness without fabricating handles.
+        let held = manager.try_acquire(ClientClass::Write).expect("held lease");
+        manager.mark_broken(ClientClass::Write);
+        manager
+            .replace_generation(ClientClass::Write)
+            .expect("replace again");
+        assert_eq!(
+            manager.validate_lease(&held).unwrap_err(),
+            StoreError::Unavailable
+        );
+        drop(held);
+        let fresh = manager
+            .try_acquire(ClientClass::Write)
+            .expect("fresh lease");
+        assert!(manager.validate_lease(&fresh).is_ok());
+    }
+
+    #[test]
+    fn proven_terminal_verdict_follows_the_resubmission_rule() {
+        assert_eq!(
+            proven_not_applied_verdict(Some(Resubmission::NewIdentityAfterCondition)),
+            ReplayVerdict::NewIdentityOnly
+        );
+        assert_eq!(
+            proven_not_applied_verdict(Some(Resubmission::None)),
+            ReplayVerdict::RequiresGapDisposition
+        );
+        assert_eq!(
+            proven_not_applied_verdict(None),
+            ReplayVerdict::RequiresGapDisposition
         );
     }
 }

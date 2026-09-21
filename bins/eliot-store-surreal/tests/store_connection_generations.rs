@@ -196,6 +196,14 @@ fn unknown_write_resolves_by_operation_id_before_any_new_attempt() {
     gate.resolve(ResolvedWriteOutcome::Committed);
     assert!(gate.is_resolved());
     assert_eq!(gate.verdict(), ReplayVerdict::UseExistingReceipt);
+    // A manually recorded proven non-application with no bound receipt
+    // cannot open re-admission: without a resubmission rule the gate routes
+    // to canonical gap disposition.
+    let mut manual = UnknownWriteGate::unknown(operation.clone());
+    manual.resolve(ResolvedWriteOutcome::ProvenNotApplied);
+    assert!(manual.is_resolved());
+    assert_eq!(manual.verdict(), ReplayVerdict::RequiresGapDisposition);
+    assert_eq!(manual.resubmission(), None);
 }
 
 // WORK_UNIT_CASE: 1933/3 — health stays isolated without consuming a write slot.

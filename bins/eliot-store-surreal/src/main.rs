@@ -9,7 +9,8 @@ use eliot_protocol::MessageType;
 use eliot_store_surreal::{
     SERVICE_NAME, StoreComposition, StoreHandshakeIdentity, admit_handshake, dispatch,
     load_compatibility_for_config, load_config, require_compatibility_for_writer,
-    require_semantic_ready_for_pipe, store_bootstrap_descriptor, validate_request_frame,
+    require_observed_identity_match, require_semantic_ready_for_pipe, store_bootstrap_descriptor,
+    validate_request_frame,
 };
 
 mod launch_mode;
@@ -148,6 +149,26 @@ async fn run() -> Result<(), String> {
     // across the provider-startup window must fail closed here, never at the
     // first canonical write.
     enforce_store_compatibility(&config)?;
+    // Observed-identity binding (issue #1932, backend handoff §3): the
+    // adapter proved the live version and spawn-validated digest over its
+    // ownership-verified channel during connect. Bind the record echo to
+    // that observation before serving: a rotated binary or drifted record
+    // fails closed here, never at the first canonical write.
+    let observed = composition
+        .observed_provider_identity()
+        .ok_or_else(|| "provider identity was not proved by connect".to_owned())?;
+    let observed_version = format!(
+        "{}.{}.{}",
+        observed.version_major, observed.version_minor, observed.version_patch
+    );
+    let compat_path = std::path::Path::new(config.runtime_launch.store_config_path.as_str());
+    let compat_file = load_compatibility_for_config(compat_path)?;
+    let bound_report = require_observed_identity_match(
+        &compat_file.surrealdb,
+        &observed_version,
+        &observed.artifact_digest,
+    )?;
+    eprintln!("{SERVICE_NAME}: {bound_report}");
     let readiness = composition
         .readiness()
         .await
