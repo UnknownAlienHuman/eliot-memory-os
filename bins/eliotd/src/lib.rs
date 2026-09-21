@@ -62,6 +62,7 @@ mod skill_surface_adapters;
 pub mod staffing_policy;
 pub mod startup_evidence_producer;
 mod store_failure_projection;
+pub mod task_binding_admission;
 mod task_lifecycle_adapters;
 
 pub use activation_projection::AgentActivationResolver;
