@@ -450,7 +450,7 @@ def validate_manifest(
 
 
 def history_matches(root: Path, path: Path, expected_sha256: str) -> list[dict[str, str]]:
-    commits = git(root, "log", "--format=%H", "--all", "--", path.as_posix()).decode(
+    commits = git(root, "log", "--format=%H", "--all", "--full-history", "--", path.as_posix()).decode(
         "ascii", errors="replace"
     ).splitlines()
     matches: list[dict[str, str]] = []

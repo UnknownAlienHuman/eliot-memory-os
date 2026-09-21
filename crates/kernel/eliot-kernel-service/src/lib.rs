@@ -37,6 +37,7 @@ mod store_write_reservation;
 #[cfg(test)]
 mod store_write_reservation_tests;
 mod testd_front_door;
+mod write_coordinator;
 
 pub use capacity_evidence::{
     BoundaryOptimizationProposal, CAPACITY_EVIDENCE_SCHEMA_VERSION, CanonicalWriteLatencyProfile,
@@ -111,9 +112,9 @@ pub use store_client::{
 pub use store_gateway::KernelStoreGateway;
 pub use store_write_reservation::{
     CompositionReservation, ObservedHead, RESERVATION_KEY_NAME, RESERVATION_KEY_PROVIDER,
-    RESERVATION_VISIBILITY, ReservationSeed, ReservationWriteError, ResolvedSendOutcome,
-    SealedReservation, UNKNOWN_OUTCOME_REASON, begin_execute_after_send, cancel_before_send,
-    ensure_eligible, finalize_reservation, gateway_seed, mark_unknown_outcome,
+    RESERVATION_VISIBILITY, ReservationSeed, ReservationWriteError, ReservedSubmission,
+    ResolvedSendOutcome, SealedReservation, UNKNOWN_OUTCOME_REASON, begin_execute_after_send,
+    cancel_before_send, ensure_eligible, finalize_reservation, gateway_seed, mark_unknown_outcome,
     project_reserved_write, reconcile_receipt, recovery_page, reserve_for_transition,
     unresolved_reservations, writer_epoch_for_fence, writer_epoch_for_fence_from_epoch,
 };
@@ -125,6 +126,10 @@ pub use testd_front_door::{
     TestdAdmissionResponse, advertise_testd_admission, advertise_testd_admission_when_composed,
     handle_testd_admission_attempt, handle_testd_cancellation, is_testd_diagnosis_only_envelope,
     reconcile_testd_admission, reconcile_testd_delivery, route_testd_admission,
+};
+pub use write_coordinator::{
+    CoordinatorError, ScopeExecutionGuard, WriteCoordinator, WriteCoordinatorConfig,
+    default_executor_lanes,
 };
 
 /// Boxed future for provider-neutral Kernel process operations.

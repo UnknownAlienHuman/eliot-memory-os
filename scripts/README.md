@@ -37,7 +37,10 @@ committed as repository authority.
 | `verify-agent-bridge-protocol.py` | Reject raw canonical Frame ingress, host-minted authority fields, validation bypass, correlation loss, and mandatory cancellation prose | Static protocol/source-policy evidence only |
 | `verify-wasm-toolchain.py` | Check the declared WASI component target without installing or executing external binaries | Offline toolchain declaration evidence only |
 | `verify-workstream-routing.py` | Verify workstream routing, assignment boundaries, non-overlapping mutable scopes, and owner projections | Static workstream routing and control-plane evidence only |
-| `verify-github-workflows.py` | Verify GitHub workflows, action SHA pinning, minimal permissions, hash-locked dependencies, and test execution | Static workflow and dependency-input evidence only |
+| `verify-github-workflows.py` | Verify GitHub workflows, action SHA pinning, minimal permissions, hash-locked Python/NuGet dependencies (including the Operator harness lock), pip hash discipline, and test execution | Static workflow and dependency-input evidence only |
+| `verify-agent-host-surfaces.py` | One manual verification entrypoint for all agent host surfaces (issue #250) | Manual source and fake-runtime integration evidence only |
+| `verify-release-claim-boundary.py` | Verify the build-success claim boundary stays bound to source and build identity (issue #1855) | Static release-claim policy evidence only |
+| `migration_inventory_1860.py` | Publish required migration inventory, dispositions, impact graph, and Product Proof plan (issue #1860) | Static migration inventory evidence only |
 | `verify-dependency-policy.py` | Verify multi-ecosystem dependency admission, scanner tool pinning, inventory completeness, lockfiles, and advisory evidence | Static and advisory admission evidence only |
 | `crate_reachability_inventory.py` | Generate deterministic support-neutral Cargo package reachability and source-shape inventory | Reachability and source-shape evidence only |
 | `audit-work-unit-assignments.py` | Deterministic fail-closed assignment-integrity oracle over a frozen complete repository/GitHub snapshot (#818) | Assignment integrity oracle evidence only |
