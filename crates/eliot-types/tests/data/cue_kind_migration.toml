@@ -154,7 +154,7 @@ migration = 831
 expiry = "migrate-under-#831; alias removal #835"
 risk = "none"
 match_count = 3
-matched_digest = "307d3dfbd88cc64fa845d0aba7b10cca3a9256f3ab3162aeee0dd8b156598613"
+matched_digest = "36a4e7a675098d5f89f3eb297d5036a6b84a54c88c9d999f288277649f5d9037"
 variants = []
 
 [type_row."crates/eliot-app/src/mcp_stdio/ul.rs"]
@@ -164,7 +164,7 @@ migration = 831
 expiry = "migrate-under-#831; alias removal #835"
 risk = "none"
 match_count = 1
-matched_digest = "f3d44dadc183328934c8210a7f38c2808f574cc1a37adc11a9b81ecefbbe13e9"
+matched_digest = "1d0b30f95a6d5ec985dab4f6d5fe36b6da6ae9e1489b11cbbbab83805cef786d"
 variants = []
 
 [type_row."crates/eliot-app/src/mcp_stdio/verification.rs"]
@@ -174,7 +174,7 @@ migration = 831
 expiry = "migrate-under-#831; alias removal #835"
 risk = "none"
 match_count = 6
-matched_digest = "5dea9685657ca69b890c6daa05c504ecbe7950400ca988f55c34fd297d773098"
+matched_digest = "bfe8bd27d88c43e479082edc2f07cc6875ed053c874fbb1bcbf79a8b238da011"
 variants = []
 
 [type_row."crates/eliot-app/tests/ul_behavior_cli.rs"]
@@ -364,7 +364,7 @@ migration = 831
 expiry = "migrate-under-#831; alias removal #835"
 risk = "none"
 match_count = 5
-matched_digest = "c7145cd0a63504b3f9adc838d6825ee0df416380a5884b382a37017b25dcee1c"
+matched_digest = "2841507d111ef32b461f837977cb514f7d3557ad419e9573336b4fd5ae71d07f"
 variants = []
 
 [type_row."crates/eliot-store/src/blob_store.rs"]
@@ -482,7 +482,7 @@ migration = 831
 expiry = "migrate-under-#831; alias removal #835"
 risk = "none"
 match_count = 3
-matched_digest = "307d3dfbd88cc64fa845d0aba7b10cca3a9256f3ab3162aeee0dd8b156598613"
+matched_digest = "36a4e7a675098d5f89f3eb297d5036a6b84a54c88c9d999f288277649f5d9037"
 
 [field_row."crates/eliot-app/src/mcp_stdio/verification.rs"]
 role = "root"
@@ -491,7 +491,7 @@ migration = 831
 expiry = "migrate-under-#831; alias removal #835"
 risk = "fixture-wire"
 match_count = 6
-matched_digest = "2889102adff4e728ba742f6db365b71a99872ee57b5ee35a9d61b7985b620ad3"
+matched_digest = "037b928baf5290a16682c64308dfbc4f2de3f23ccd6c518b417f2652db15878f"
 
 [field_row."crates/eliot-app/src/ul_cross_agent_runner.rs"]
 role = "root"
