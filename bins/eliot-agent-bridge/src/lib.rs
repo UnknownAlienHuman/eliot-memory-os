@@ -63,8 +63,8 @@ pub use reactive_injection_receipts::{
     ReactiveInjectionLedger, RiskTier, Severity, UseOutcome,
 };
 pub use settled_plan_transport::{
-    AdmittedPlanItem, MAX_TRANSPORT_REPLAY_KEYS, PlanAdmissionError, PlanAdmissionReport,
-    SettledPlanAdmission, render_admission_fence,
+    AdmittedPlanItem, GovernorAssessmentView, MAX_TRANSPORT_REPLAY_KEYS, PlanAdmissionError,
+    PlanAdmissionReport, SettledPlanAdmission, WithheldPlanItem, render_admission_fence,
 };
 pub use understanding_bootstrap::{
     AuthoritativeSelection, BootstrapContext, BootstrapError, BootstrapSession,

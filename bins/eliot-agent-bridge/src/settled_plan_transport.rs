@@ -7,8 +7,9 @@
 //! [`BridgeRunner::admit_reactive_injection`] calls, in the exact join order:
 //!
 //! ```text
-//! produce batch → session-equality gate → Governor risk per item →
-//! invalidations first → admit each item in order (replay-deduped)
+//! produce batch → session-equality gate → Governor assessment per item →
+//! invalidations first → admit each item in order (replay-deduped,
+//! withholds never admitted)
 //! ```
 //!
 //! Authority boundaries (the transport invents nothing):
@@ -19,8 +20,9 @@
 //!               dedup keys, skip accounting.
 //! bridge owns:  session binding (live attach), ledger mutation, receipts,
 //!               stickiness, normal dedup, representation checks.
-//! governor owns (the one genuinely missing input, supplied by the caller):
-//!               per-item risk tier and any attestation beyond the policy digest.
+//! governor owns (supplied by the caller, never defaulted here): per-item
+//!               risk assessment over the same critical bit, with the
+//!               attested fence echo; withholds on missing evidence.
 //! ```
 //!
 //! The risk assessor is a caller-supplied function because no plan source
@@ -59,6 +61,37 @@ pub struct AdmittedPlanItem {
     pub item_id: String,
 }
 
+/// What the transport needs from the risk owner for one item.
+///
+/// Transport-owned minimal vocabulary (bridge-lane): the assessed tier, and
+/// the ATTESTED fence echo the assessment was evaluated under. The post-freeze
+/// Governor adapter fills this from `ReactiveRiskAssessment` (`tier` rendered
+/// 1:1, `fence_epoch_text()` / `fence_generation_value()`); the transport
+/// never renders fences from raw plan text on the governed path, so an
+/// assessment cannot be mixed across fence rotations.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GovernorAssessmentView {
+    /// Governor-assessed tier for this item.
+    pub risk: RiskTier,
+    /// Attested fence-epoch spelling (`<lineage-uuid>:<sequence>`).
+    pub fence_epoch: String,
+    /// Attested fence generation (non-zero).
+    pub fence_generation: u64,
+}
+
+/// One item withheld for missing Governor evidence.
+///
+/// Withhold is an honest outcome, not a failure: the item is never admitted,
+/// never defaulted, and its reason travels with the report so the owner can
+/// buffer bounded owner-side or drop WITH a receipt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WithheldPlanItem {
+    /// Stable replay key (`<plan result digest>:<item id>`).
+    pub dedup_key: String,
+    /// Owner-readable withhold reason (Governor evidence gap).
+    pub reason: String,
+}
+
 /// Outcome of driving one batch into the live bridge ledger.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlanAdmissionReport {
@@ -72,6 +105,8 @@ pub struct PlanAdmissionReport {
     pub replay_suppressed: u64,
     /// Normal items the bridge refused as already-delivered duplicates.
     pub duplicate_suppressed: u64,
+    /// Items withheld for missing Governor evidence, in batch order.
+    pub withheld: Vec<WithheldPlanItem>,
     /// Producer skip counts, passed through so no drop is silent.
     pub skipped_sticky: u64,
     /// Producer skip counts, passed through so no drop is silent.
@@ -204,30 +239,33 @@ impl SettledPlanAdmission {
     /// Produces the batch with
     /// [`plan_bridge_admissions`](eliot_reactive_context_plan::plan_bridge_admissions)
     /// (aborting the batch on producer error), then admits it with
-    /// [`Self::admit_batch`]. `assess_risk` is the Governor risk owner:
-    /// one tier per instruction, never defaulted by the transport.
+    /// [`Self::admit_batch`]. `assess` is the Governor risk owner: one
+    /// assessment per instruction over the SAME critical bit the transport
+    /// derives from owner stickiness, never defaulted by the transport.
+    /// Withheld items are skipped with their reason, never admitted.
     pub fn admit_settled_plan(
         &mut self,
         runner: &mut BridgeRunner,
         plan: &PendingContextInjectionPlan,
-        assess_risk: impl Fn(&BridgeAdmissionInstruction) -> RiskTier,
+        assess: impl Fn(&BridgeAdmissionInstruction, bool) -> Result<GovernorAssessmentView, String>,
     ) -> Result<PlanAdmissionReport, PlanAdmissionError> {
-        let batch =
-            plan_bridge_admissions(plan).map_err(PlanAdmissionError::Producer)?;
-        self.admit_batch(runner, &batch, assess_risk)
+        let batch = plan_bridge_admissions(plan).map_err(PlanAdmissionError::Producer)?;
+        self.admit_batch(runner, &batch, assess)
     }
 
     /// Drives one already-produced batch into the live bridge ledger.
     ///
     /// In order: verifies the batch session equals the live attach session;
-    /// applies invalidations first (invalidation-aware dedup); admits each
-    /// item in order with the Governor-supplied risk tier, collapsing
-    /// transport-side replays of the same plan before calling.
+    /// applies invalidations first (invalidation-aware dedup); assesses each
+    /// item in order with the Governor-supplied assessment over the same
+    /// critical bit used for severity, collapsing transport-side replays of
+    /// the same plan before calling. A withhold (`Err`) records the item
+    /// with its reason and never admits it.
     pub fn admit_batch(
         &mut self,
         runner: &mut BridgeRunner,
         batch: &BridgeAdmissionBatch,
-        assess_risk: impl Fn(&BridgeAdmissionInstruction) -> RiskTier,
+        assess: impl Fn(&BridgeAdmissionInstruction, bool) -> Result<GovernorAssessmentView, String>,
     ) -> Result<PlanAdmissionReport, PlanAdmissionError> {
         let live_session = runner
             .attach_view()
@@ -249,6 +287,7 @@ impl SettledPlanAdmission {
             admitted: Vec::with_capacity(batch.items.len()),
             replay_suppressed: 0,
             duplicate_suppressed: 0,
+            withheld: Vec::new(),
             skipped_sticky: batch.skipped_sticky,
             skipped_ineligible: batch.skipped_ineligible,
         };
@@ -257,11 +296,23 @@ impl SettledPlanAdmission {
                 report.replay_suppressed += 1;
                 continue;
             }
-            let risk = assess_risk(item);
-            let (fence_epoch, fence_generation) = render_admission_fence(&item.fence);
-            let admitted_severity = match item.severity {
-                BridgeAdmissionSeverity::Critical => Severity::Critical,
-                BridgeAdmissionSeverity::Normal => Severity::Normal,
+            // The SAME owner-stickiness bit feeds assessment and severity:
+            // the tier and the stickiness can never disagree about an item.
+            let critical = item.severity == BridgeAdmissionSeverity::Critical;
+            let view = match assess(item, critical) {
+                Ok(view) => view,
+                Err(reason) => {
+                    report.withheld.push(WithheldPlanItem {
+                        dedup_key: item.dedup_key.clone(),
+                        reason,
+                    });
+                    continue;
+                }
+            };
+            let admitted_severity = if critical {
+                Severity::Critical
+            } else {
+                Severity::Normal
             };
             let outcome = runner.admit_reactive_injection(
                 NormalizedCue {
@@ -280,10 +331,10 @@ impl SettledPlanAdmission {
                 AdmissionBasis {
                     scope_id: item.scope_id.clone(),
                     status: item.status.clone(),
-                    risk,
+                    risk: view.risk,
                     governance_profile_rev: item.governance_profile_rev.clone(),
-                    fence_epoch,
-                    fence_generation,
+                    fence_epoch: view.fence_epoch,
+                    fence_generation: view.fence_generation,
                     admitted_severity,
                 },
             );
@@ -471,6 +522,30 @@ mod tests {
         }
     }
 
+    /// Stand-in for the post-freeze Governor adapter: tiers by the SAME
+    /// critical bit the transport passes in and echoes the item fence
+    /// through the canonical rendering (mirroring the attested-echo
+    /// contract, where the assessment echoes its input fence). Pins the
+    /// transport contract — echo use, same-bit severity, withhold
+    /// semantics — never Governor tier logic, which the Governor lane owns.
+    fn stub_assess(
+        item: &BridgeAdmissionInstruction,
+        critical: bool,
+        risk: RiskTier,
+    ) -> Result<GovernorAssessmentView, String> {
+        assert_eq!(
+            critical,
+            item.severity == BridgeAdmissionSeverity::Critical,
+            "assessor must see the owner-stickiness bit"
+        );
+        let (fence_epoch, fence_generation) = render_admission_fence(&item.fence);
+        Ok(GovernorAssessmentView {
+            risk,
+            fence_epoch,
+            fence_generation,
+        })
+    }
+
     #[test]
     fn fence_rendering_carries_lineage_and_generation() {
         let (epoch, generation) = render_admission_fence(&test_fence());
@@ -499,14 +574,16 @@ mod tests {
                 ),
             ],
         );
-        // Governor risk owner assesses per item: no plan source, no default.
+        // Governor risk owner assesses per item over the same critical bit:
+        // no plan source, no default.
         let report = driver
-            .admit_batch(&mut runner, &batch, |item| {
-                if item.severity == BridgeAdmissionSeverity::Critical {
+            .admit_batch(&mut runner, &batch, |item, critical| {
+                let risk = if critical {
                     RiskTier::Severe
                 } else {
                     RiskTier::Low
-                }
+                };
+                stub_assess(item, critical, risk)
             })
             .expect("matching session admits");
         assert_eq!(report.session_id, TEST_SESSION);
@@ -514,6 +591,7 @@ mod tests {
         assert_eq!(report.admitted.len(), 2);
         assert_eq!(report.replay_suppressed, 0);
         assert_eq!(report.duplicate_suppressed, 0);
+        assert!(report.withheld.is_empty());
         assert_eq!(report.skipped_sticky, 1);
         assert_eq!(report.skipped_ineligible, 2);
         assert_eq!(runner.reactive_pending_count(), 2);
@@ -558,6 +636,8 @@ mod tests {
 
     #[test]
     fn session_mismatch_calls_nothing() {
+        use std::cell::Cell;
+
         let mut runner = attached_runner(TEST_SESSION);
         let mut driver = SettledPlanAdmission::new();
         let batch = batch(
@@ -569,19 +649,26 @@ mod tests {
                 BridgeAdmissionSeverity::Normal,
             )],
         );
+        let calls = Cell::new(0);
         let error = driver
-            .admit_batch(&mut runner, &batch, |_| RiskTier::Low)
+            .admit_batch(&mut runner, &batch, |item, critical| {
+                calls.set(calls.get() + 1);
+                stub_assess(item, critical, RiskTier::Low)
+            })
             .expect_err("mismatched session must fail closed");
         assert!(
             matches!(error, PlanAdmissionError::SessionMismatch { .. }),
             "unexpected error {error:?}"
         );
+        assert_eq!(calls.get(), 0, "session gate precedes any assessment");
         assert_eq!(runner.reactive_pending_count(), 0);
         assert_eq!(driver.replay_len(), 0);
     }
 
     #[test]
     fn detached_bridge_admits_nothing() {
+        use std::cell::Cell;
+
         let mut runner = detached_runner();
         let mut driver = SettledPlanAdmission::new();
         let batch = batch(
@@ -593,10 +680,15 @@ mod tests {
                 BridgeAdmissionSeverity::Normal,
             )],
         );
+        let calls = Cell::new(0);
         let error = driver
-            .admit_batch(&mut runner, &batch, |_| RiskTier::Low)
+            .admit_batch(&mut runner, &batch, |item, critical| {
+                calls.set(calls.get() + 1);
+                stub_assess(item, critical, RiskTier::Low)
+            })
             .expect_err("detached bridge must fail closed");
         assert_eq!(error, PlanAdmissionError::NotAttached);
+        assert_eq!(calls.get(), 0, "attach gate precedes any assessment");
     }
 
     #[test]
@@ -614,7 +706,9 @@ mod tests {
             )],
         );
         driver
-            .admit_batch(&mut runner, &first, |_| RiskTier::Low)
+            .admit_batch(&mut runner, &first, |item, critical| {
+                stub_assess(item, critical, RiskTier::Low)
+            })
             .expect("first admission");
         runner
             .deliver_reactive_pending_via_response("resp-transport-1")
@@ -630,7 +724,9 @@ mod tests {
             )],
         );
         let suppressed = driver
-            .admit_batch(&mut runner, &replay_same_source, |_| RiskTier::Low)
+            .admit_batch(&mut runner, &replay_same_source, |item, critical| {
+                stub_assess(item, critical, RiskTier::Low)
+            })
             .expect("duplicate suppression is an honest outcome, not a failure");
         assert_eq!(suppressed.admitted.len(), 0);
         assert_eq!(suppressed.duplicate_suppressed, 1);
@@ -647,7 +743,9 @@ mod tests {
         );
         reopened.invalidations.push("tool-surface-9".to_owned());
         let report = driver
-            .admit_batch(&mut runner, &reopened, |_| RiskTier::Low)
+            .admit_batch(&mut runner, &reopened, |item, critical| {
+                stub_assess(item, critical, RiskTier::Low)
+            })
             .expect("invalidation must reopen the source");
         assert_eq!(report.invalidations_applied, 1);
         assert_eq!(report.admitted.len(), 1);
@@ -668,17 +766,123 @@ mod tests {
             )],
         );
         let first = driver
-            .admit_batch(&mut runner, &batch_value, |_| RiskTier::Low)
+            .admit_batch(&mut runner, &batch_value, |item, critical| {
+                stub_assess(item, critical, RiskTier::Low)
+            })
             .expect("first presentation admits");
         assert_eq!(first.admitted.len(), 1);
         assert_eq!(driver.replay_len(), 1);
         let second = driver
-            .admit_batch(&mut runner, &batch_value, |_| RiskTier::Elevated)
+            .admit_batch(&mut runner, &batch_value, |item, critical| {
+                stub_assess(item, critical, RiskTier::Elevated)
+            })
             .expect("replay collapses without calling");
         assert_eq!(second.admitted.len(), 0);
         assert_eq!(second.replay_suppressed, 1);
         // No second ledger item: the replay never reached the bridge.
         assert_eq!(runner.reactive_pending_count(), 1);
+    }
+
+    #[test]
+    fn withhold_never_admits_and_records_reason() {
+        let mut runner = attached_runner(TEST_SESSION);
+        let mut driver = SettledPlanAdmission::new();
+        let batch_value = batch(
+            TEST_SESSION,
+            vec![
+                instruction(
+                    "item-withheld-1",
+                    "tool-surface-1",
+                    "rev-1",
+                    BridgeAdmissionSeverity::Normal,
+                ),
+                instruction(
+                    "item-admitted-1",
+                    "tool-surface-2",
+                    "rev-1",
+                    BridgeAdmissionSeverity::Critical,
+                ),
+            ],
+        );
+        // Missing Governor evidence withholds the normal item; the critical
+        // item under live evidence still admits in the same batch.
+        let report = driver
+            .admit_batch(&mut runner, &batch_value, |item, critical| {
+                if item.cue_id == "item-withheld-1" {
+                    Err("no current GovernanceProfile derived: risk cannot be assessed".to_owned())
+                } else {
+                    stub_assess(item, critical, RiskTier::Severe)
+                }
+            })
+            .expect("withhold is an honest outcome, not a failure");
+        assert_eq!(report.admitted.len(), 1);
+        assert_eq!(
+            report.admitted[0].dedup_key,
+            "plan-digest-1:item-admitted-1"
+        );
+        assert_eq!(report.withheld.len(), 1);
+        assert_eq!(
+            report.withheld[0].dedup_key,
+            "plan-digest-1:item-withheld-1"
+        );
+        assert!(
+            report.withheld[0].reason.contains("GovernanceProfile"),
+            "withhold reason must name the evidence gap"
+        );
+        assert_eq!(runner.reactive_pending_count(), 1);
+        // A withheld key is NOT marked presented: once evidence arrives the
+        // same item admits instead of collapsing as a replay.
+        assert!(!driver.replay_contains("plan-digest-1:item-withheld-1"));
+        let retry = batch(
+            TEST_SESSION,
+            vec![instruction(
+                "item-withheld-1",
+                "tool-surface-1",
+                "rev-1",
+                BridgeAdmissionSeverity::Normal,
+            )],
+        );
+        let second = driver
+            .admit_batch(&mut runner, &retry, |item, critical| {
+                stub_assess(item, critical, RiskTier::Low)
+            })
+            .expect("evidence arrival admits the withheld item");
+        assert_eq!(second.admitted.len(), 1);
+        assert_eq!(second.replay_suppressed, 0);
+        assert!(second.withheld.is_empty());
+    }
+
+    #[test]
+    fn assessor_echo_fence_is_used_verbatim() {
+        let mut runner = attached_runner(TEST_SESSION);
+        let mut driver = SettledPlanAdmission::new();
+        let batch_value = batch(
+            TEST_SESSION,
+            vec![instruction(
+                "item-1",
+                "tool-surface-1",
+                "rev-1",
+                BridgeAdmissionSeverity::Normal,
+            )],
+        );
+        // The echo deliberately differs from the plan-fence rendering: the
+        // receipt must carry the attested echo, never raw plan text.
+        driver
+            .admit_batch(&mut runner, &batch_value, |_, _| {
+                Ok(GovernorAssessmentView {
+                    risk: RiskTier::Elevated,
+                    fence_epoch: "echo-lineage-9:9".to_owned(),
+                    fence_generation: 9,
+                })
+            })
+            .expect("echo assessment admits");
+        let receipts = runner
+            .deliver_reactive_pending_via_response("resp-echo-1")
+            .expect("pending drains");
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].admission.risk, RiskTier::Elevated);
+        assert_eq!(receipts[0].admission.fence_epoch, "echo-lineage-9:9");
+        assert_eq!(receipts[0].admission.fence_generation, 9);
     }
 
     #[test]
@@ -697,8 +901,15 @@ mod tests {
                 )],
             );
             driver
-                .admit_batch(&mut first_runner, &made, |_| RiskTier::Low)
+                .admit_batch(&mut first_runner, &made, |item, critical| {
+                    stub_assess(item, critical, RiskTier::Low)
+                })
                 .expect("distinct critical items admit");
+            // Drain through the real delivery path so the ledger pending
+            // bound never interferes with the transport window proof.
+            first_runner
+                .deliver_reactive_pending_via_response(&format!("resp-a-{index}"))
+                .expect("pending drains");
             // Drain through the real delivery path so the ledger pending
             // bound never interferes with the transport window proof.
             first_runner
@@ -721,8 +932,13 @@ mod tests {
                 )],
             );
             driver
-                .admit_batch(&mut second_runner, &made, |_| RiskTier::Low)
+                .admit_batch(&mut second_runner, &made, |item, critical| {
+                    stub_assess(item, critical, RiskTier::Low)
+                })
                 .expect("distinct critical items admit");
+            second_runner
+                .deliver_reactive_pending_via_response(&format!("resp-b-{index}"))
+                .expect("pending drains");
             second_runner
                 .deliver_reactive_pending_via_response(&format!("resp-b-{index}"))
                 .expect("pending drains");
@@ -764,7 +980,9 @@ mod tests {
             ],
         );
         let error = driver
-            .admit_batch(&mut runner, &made, |_| RiskTier::Low)
+            .admit_batch(&mut runner, &made, |item, critical| {
+                stub_assess(item, critical, RiskTier::Low)
+            })
             .expect_err("over-bound relations must fail closed");
         match error {
             PlanAdmissionError::BridgeRejected {
