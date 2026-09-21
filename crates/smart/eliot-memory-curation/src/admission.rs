@@ -56,6 +56,9 @@ pub enum AdmissionError {
     /// Audit linkage is missing where the operation requires it.
     #[error("admission is not linked through AppendAuditEvent")]
     AuditUnlinked,
+    /// A Store-emitted audit event does not match the receipt preset.
+    #[error("emitted audit event does not match the receipt preset for {receipt}")]
+    AuditEventMismatch { receipt: String },
     /// A chain holds no admissions.
     #[error("admission chain is empty")]
     EmptyChain,

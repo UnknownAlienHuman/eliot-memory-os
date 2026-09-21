@@ -175,32 +175,75 @@ pub fn admit_forward_revision(
     verify_admission_chain(&chain)
 }
 
-/// Binds Store-emitted audit event ids back onto an admission chain.
+/// Binds Store-emitted audit linkage back onto an admission chain.
 ///
-/// The Store consumer persists each admission through its named mutation,
-/// then returns the real emitted audit event per stable receipt id. This
-/// re-links every receipt via `link_audit` (digest recompute) and
-/// re-verifies the full chain, so only a completely audit-linked,
-/// original-preserving chain returns. A receipt with no emitted event
-/// fails with `AuditUnlinked`: curation never invents audit identity.
+/// Input mirrors the Store consumer's `LinkAuditBinding` exactly
+/// (`curation_receipt_id`, `audit_operation_id`, `emitted_event_ids` from
+/// the real `WriteReceipt`): one entry per hop, matched by stable receipt
+/// id. The Store consumer persists each admission through its named
+/// mutation, then returns these bindings. This re-links every receipt via
+/// `link_audit` (digest recompute) and re-verifies the full chain, so only
+/// a completely audit-linked, original-preserving chain returns.
+///
+/// Exact rules, no invented identity:
+/// - a receipt with no binding entry fails with `AuditUnlinked`;
+/// - a receipt with no preset fails with `AuditUnlinked` (nothing to
+///   check the appointed identity against);
+/// - a preset disagreeing with the appointed `audit_operation_id` fails
+///   with `AuditEventMismatch` (mirrors the consumer's exact
+///   preset==appointed check on the returned bindings);
+/// - an entry with no emitted events fails with `AuditUnlinked` (a leg
+///   that emitted nothing recorded no linkable emission);
+/// - re-linking the preset event is digest-stable by construction.
+///
+/// Curation never invents audit identity and never silently re-points a
+/// preset linkage.
 pub fn bind_emitted_audit_events(
     chain: &[CurationAdmission],
-    emitted: &[(ArtifactId, ArtifactId)],
+    links: &[EmittedAuditLink],
 ) -> Result<AdmissionChainView, crate::admission::AdmissionError> {
     use crate::admission::AdmissionError;
     let mut linked = Vec::with_capacity(chain.len());
     for admission in chain {
-        let event = emitted
+        let link = links
             .iter()
-            .find(|(receipt_id, _)| *receipt_id == admission.receipt.receipt_id)
-            .map(|(_, event)| event.clone())
+            .find(|entry| entry.curation_receipt_id == admission.receipt.receipt_id.as_str())
             .ok_or(AdmissionError::AuditUnlinked)?;
+        let preset = admission
+            .receipt
+            .audit_event_id
+            .clone()
+            .ok_or(AdmissionError::AuditUnlinked)?;
+        if preset.as_str() != link.audit_operation_id {
+            return Err(AdmissionError::AuditEventMismatch {
+                receipt: admission.receipt.receipt_id.as_str().to_owned(),
+            });
+        }
+        if link.emitted_event_ids.is_empty() {
+            return Err(AdmissionError::AuditUnlinked);
+        }
         linked.push(CurationAdmission {
             operation: admission.operation,
-            receipt: admission.receipt.link_audit(event)?,
+            receipt: admission.receipt.link_audit(preset)?,
         });
     }
     verify_admission_chain(&linked)
+}
+
+/// Store-emitted audit linkage for one admission, mirroring the
+/// persistence consumer's `LinkAuditBinding` field-for-field
+/// (`curation_receipt_id`, `audit_operation_id`, `emitted_event_ids`).
+/// `emitted_event_ids` carries the real `WriteReceipt.emitted_event_ids`
+/// of the committed leg; the appointed `audit_operation_id` is the
+/// operation identity the receipt preset must equal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EmittedAuditLink {
+    /// Stable curation receipt identity linked by this entry.
+    pub curation_receipt_id: String,
+    /// Appointed audit operation identity the preset must equal.
+    pub audit_operation_id: String,
+    /// Real emitted event ids of the committed leg; non-empty.
+    pub emitted_event_ids: Vec<String>,
 }
 
 /// Exact Store-persist projection of one admission.
@@ -343,6 +386,14 @@ mod tests {
         use crate::admission::AdmissionError;
         use eliot_epistemic::lifecycle::LifecycleError;
 
+        fn link(receipt: &str, appointed: &str, emitted: &[&str]) -> EmittedAuditLink {
+            EmittedAuditLink {
+                curation_receipt_id: receipt.to_owned(),
+                audit_operation_id: appointed.to_owned(),
+                emitted_event_ids: emitted.iter().map(ToString::to_string).collect(),
+            }
+        }
+
         let genesis = admit_observation_genesis(ObservationGenesisParams {
             receipt_id: id("receipt:capture"),
             raw_handle: id("obs:raw-1"),
@@ -362,8 +413,10 @@ mod tests {
         let genesis_projected = project_for_store(&genesis);
 
         // Link-back round-trip: an unlinked genesis constructs but never
-        // verifies; only the Store-emitted event completes the chain, and
-        // a missing event fails instead of inventing audit identity.
+        // verifies; only a Store binding whose appointed identity equals
+        // the preset, carrying real emitted events, completes the chain.
+        // A missing entry, a missing preset, a divergent appointment, or
+        // an empty emission all fail instead of inventing audit identity.
         let bare = admit_observation_genesis(ObservationGenesisParams {
             receipt_id: id("receipt:bare"),
             raw_handle: id("obs:raw-1"),
@@ -384,8 +437,25 @@ mod tests {
             bind_emitted_audit_events(std::slice::from_ref(&bare), &[]),
             Err(AdmissionError::AuditUnlinked)
         ));
-        let bound = bind_emitted_audit_events(&[bare], &[(id("receipt:bare"), id("audit:bare"))])
-            .expect("emitted link-back verifies");
+        let bound = {
+            let preset = admit_observation_genesis(ObservationGenesisParams {
+                receipt_id: id("receipt:preset"),
+                raw_handle: id("obs:raw-1"),
+                source_anchor: anchor(),
+                actor: actor(ActorKind::DeterministicTransformer),
+                scope: "scope".to_owned(),
+                clock: clock(),
+                state_fence: fence(),
+                proof_digest: sha256_hex(b"preset-proof"),
+                audit_event_id: Some(id("audit:preset")),
+            })
+            .expect("preset genesis constructs");
+            bind_emitted_audit_events(
+                &[preset],
+                &[link("receipt:preset", "audit:preset", &["evt:preset-1"])],
+            )
+            .expect("preset link-back verifies")
+        };
         assert_eq!(bound.original_input, id("obs:raw-1"));
         assert_eq!(bound.current_output, id("obs:raw-1"));
         assert!(bound.ordered.iter().all(CurationAdmission::is_audit_linked));
@@ -467,6 +537,53 @@ mod tests {
             ),
             "revision projects as Store-minted linkage evidence, never fake fields"
         );
+
+        // Preset guard: re-linking the appointed preset event is
+        // digest-stable, while a divergent appointment, an empty emission,
+        // or a missing entry is refused instead of silently re-pointing
+        // the linkage.
+        let digest_before = view.ordered[2].receipt.digest.clone();
+        let rebound = bind_emitted_audit_events(
+            &view.ordered,
+            &[
+                link("receipt:capture", "audit:capture", &["evt:capture-1"]),
+                link(
+                    "receipt:correction",
+                    "audit:correction",
+                    &["evt:correction-1"],
+                ),
+                link(
+                    "receipt:claim",
+                    "audit:claim",
+                    &["evt:claim-1", "evt:claim-2"],
+                ),
+            ],
+        )
+        .expect("preset re-link verifies");
+        assert_eq!(rebound.ordered[2].receipt.digest, digest_before);
+        assert_eq!(rebound.original_input, id("obs:raw-1"));
+        assert!(matches!(
+            bind_emitted_audit_events(
+                &view.ordered,
+                &[
+                    link("receipt:capture", "audit:capture", &["evt:capture-1"]),
+                    link("receipt:correction", "audit:WRONG", &["evt:correction-1"]),
+                    link("receipt:claim", "audit:claim", &["evt:claim-1"]),
+                ],
+            ),
+            Err(AdmissionError::AuditEventMismatch { .. })
+        ));
+        assert!(matches!(
+            bind_emitted_audit_events(
+                &view.ordered,
+                &[
+                    link("receipt:capture", "audit:capture", &["evt:capture-1"]),
+                    link("receipt:correction", "audit:correction", &[]),
+                    link("receipt:claim", "audit:claim", &["evt:claim-1"]),
+                ],
+            ),
+            Err(AdmissionError::AuditUnlinked)
+        ));
 
         let refused = admit_forward_revision(
             &view.ordered[..1],
