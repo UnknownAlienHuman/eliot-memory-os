@@ -2175,8 +2175,7 @@ impl RedbRecoveryStore {
                 // unchanged, so an at-least-once retry of an applied
                 // non-admission advance stays idempotent. Conflicting
                 // evidence below still fails without overwriting.
-                (Some(..), Some(..), None) => true,
-                (None, None, None) => true,
+                (Some(..), Some(..), None) | (None, None, None) => true,
                 _ => false,
             };
             if !replayed {
