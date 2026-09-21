@@ -185,18 +185,17 @@ fn validate_controlboard_frame(
     Ok(())
 }
 
-/// Frames one reconciled board as a correlated `Response`/`Result` message.
+/// Builds the correlated `Response`/`Result` frame for one reconciled board.
 ///
-/// The board `contract` must be the reconciled consumer lineage; anything else
-/// fails closed before any byte is emitted. The structured inline ceiling is
-/// enforced by `encode_frame`: an over-ceiling board is refused, never
-/// truncated.
-pub fn encode_controlboard_response(
+/// This is the frame the runtime-status-owning serving process hands to its
+/// `NamedPipeTransport::send_frame`. The board `contract` must be the
+/// reconciled consumer lineage; anything else fails closed before any frame
+/// exists.
+pub fn build_controlboard_frame(
     board: &RenderedControlBoard,
     connection_id: &str,
     request_id: &RequestId,
-    limits: TransportLimits,
-) -> Result<Vec<u8>, ControlBoardTransportError> {
+) -> Result<Frame, ControlBoardTransportError> {
     if board.contract != CONTROLBOARD_CONSUMER_CONTRACT {
         return Err(ControlBoardTransportError::ContractMismatch {
             actual: board.contract.clone(),
@@ -212,7 +211,7 @@ pub fn encode_controlboard_response(
             detail: error.to_string(),
         }
     })?;
-    let frame = Frame {
+    Ok(Frame {
         protocol_version: ProtocolVersion::CURRENT,
         encoding_profile: EncodingProfile::JsonV1,
         connection_id: connection_id.to_owned(),
@@ -222,26 +221,24 @@ pub fn encode_controlboard_response(
         request_identity: None,
         payload: ProtocolPayload::Json(payload),
         trace_context: trace_context(board),
-    };
-    encode_frame(&frame, limits).map_err(ControlBoardTransportError::Transport)
+    })
 }
 
-/// Decodes one wire image into the reconciled board it carries, or refuses it.
+/// Opens a received frame into the reconciled board it carries, or refuses it.
 ///
-/// Every handshake line is re-checked: wire shape and ceilings via
-/// `decode_frame`, frame validity, version line, correlation, payload shape,
-/// transport contract, and consumer lineage. The returned board equals the
-/// produced board exactly; decode never adjusts a disposition, summary, typed
-/// field, or digest.
-pub fn decode_controlboard_response(
-    wire: &[u8],
+/// This is the frame the surface owner hands over after its own
+/// `NamedPipeTransport::receive_frame`. Every handshake line is re-checked:
+/// frame validity, version line, correlation, payload shape, transport
+/// contract, and consumer lineage. The returned board equals the produced
+/// board exactly; open never adjusts a disposition, summary, typed field, or
+/// digest.
+pub fn open_controlboard_frame(
+    frame: &Frame,
     connection_id: &str,
     request_id: &RequestId,
-    limits: TransportLimits,
 ) -> Result<RenderedControlBoard, ControlBoardTransportError> {
     bound_connection_id(connection_id)?;
-    let frame = decode_frame(wire, limits).map_err(ControlBoardTransportError::Transport)?;
-    validate_controlboard_frame(&frame, connection_id, request_id)?;
+    validate_controlboard_frame(frame, connection_id, request_id)?;
     let value = match &frame.payload {
         ProtocolPayload::Json(value) => value.clone(),
         _ => return Err(ControlBoardTransportError::NotJsonPayload),
@@ -264,6 +261,40 @@ pub fn decode_controlboard_response(
     Ok(message.board)
 }
 
+/// Frames one reconciled board as length-delimited wire bytes.
+///
+/// Composes [`build_controlboard_frame`] with `encode_frame`, so the
+/// structured inline ceiling is enforced before any byte is emitted: an
+/// over-ceiling board is refused, never truncated. For serving processes that
+/// send through `NamedPipeTransport::send_frame`, use
+/// [`build_controlboard_frame`] directly.
+pub fn encode_controlboard_response(
+    board: &RenderedControlBoard,
+    connection_id: &str,
+    request_id: &RequestId,
+    limits: TransportLimits,
+) -> Result<Vec<u8>, ControlBoardTransportError> {
+    let frame = build_controlboard_frame(board, connection_id, request_id)?;
+    encode_frame(&frame, limits).map_err(ControlBoardTransportError::Transport)
+}
+
+/// Decodes one wire image into the reconciled board it carries, or refuses it.
+///
+/// Composes `decode_frame` with [`open_controlboard_frame`]: wire shape and
+/// ceilings first, then every handshake line. The returned board equals the
+/// produced board exactly; decode never adjusts a disposition, summary, typed
+/// field, or digest.
+pub fn decode_controlboard_response(
+    wire: &[u8],
+    connection_id: &str,
+    request_id: &RequestId,
+    limits: TransportLimits,
+) -> Result<RenderedControlBoard, ControlBoardTransportError> {
+    bound_connection_id(connection_id)?;
+    let frame = decode_frame(wire, limits).map_err(ControlBoardTransportError::Transport)?;
+    open_controlboard_frame(&frame, connection_id, request_id)
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
@@ -271,7 +302,7 @@ mod tests {
 
     use eliot_contracts::{EpochId, EpochLineageId, RequestId, ResourceGeneration, StateFence};
     use eliot_ipc::TransportLimits;
-    use eliot_protocol::ProtocolError;
+    use eliot_protocol::{FrameKind, MessageType, ProtocolError};
 
     use super::super::controlboard_consumer::{
         CONTROLBOARD_CONSUMER_CONTRACT, ControlBoardInstallation, ControlBoardObservationTime,
@@ -419,6 +450,37 @@ mod tests {
             .find(|row| row.entry_id == "ghost-component")
             .expect("ghost row");
         assert_eq!(ghost.summary, None);
+    }
+
+    #[test]
+    fn frame_level_build_open_round_trip_matches_wire() {
+        // The NamedPipeTransport path exchanges Frames, not wire: build/open
+        // must agree exactly with the wire-level encode/decode over the same
+        // handshake.
+        let sent = board();
+        let frame =
+            build_controlboard_frame(&sent, &connection_id(), &request_id()).expect("frame");
+        assert_eq!(frame.kind, FrameKind::Response);
+        assert_eq!(frame.message_type, MessageType::Result);
+        assert_eq!(frame.request_id, Some(request_id()));
+        let via_frame =
+            open_controlboard_frame(&frame, &connection_id(), &request_id()).expect("open board");
+        assert_eq!(via_frame, sent);
+        let wire = encode_controlboard_response(
+            &sent,
+            &connection_id(),
+            &request_id(),
+            TransportLimits::default(),
+        )
+        .expect("wire");
+        let via_wire = decode_controlboard_response(
+            &wire,
+            &connection_id(),
+            &request_id(),
+            TransportLimits::default(),
+        )
+        .expect("wire board");
+        assert_eq!(via_wire, via_frame);
     }
 
     #[test]

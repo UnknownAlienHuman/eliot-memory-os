@@ -87,7 +87,8 @@ pub use controlboard_consumer::{
 mod controlboard_transport;
 pub use controlboard_transport::{
     CONTROLBOARD_STATUS_OPERATION, CONTROLBOARD_TRANSPORT_CONTRACT, ControlBoardTransportError,
-    ControlBoardTransportMessage, decode_controlboard_response, encode_controlboard_response,
+    ControlBoardTransportMessage, build_controlboard_frame, decode_controlboard_response,
+    encode_controlboard_response, open_controlboard_frame,
 };
 
 const WATCHDOG_PUBLICATION_CHILD_LIMIT: u64 = 1024 * 1024;
