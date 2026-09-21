@@ -16,6 +16,16 @@
 //!   do. The staged request mirrors the runtime-derived envelope field for
 //!   field (operation/tree/generation/fence-epoch+generation/wall/memory/
 //!   stdout ceilings).
+//! - In-child contour: the positive proof stages the guest-runner child
+//!   (this binary in one-shot `--guest-exec` mode over the real
+//!   artifact/input files) instead of a shell echo. Wasmtime compiles and
+//!   runs the guest INSIDE the reaped Job-contained child; its raw stdout
+//!   — observed through P03 capture — must equal the oracle reference byte
+//!   for byte (triple agreement: child, in-process engine, oracle). The
+//!   in-process run remains as the differential counterpart (I1.1: pure
+//!   computation stays a legitimate in-process task); production contour
+//!   selection (child-only execution) needs a neutral skip-engine path
+//!   owned by the runtime lane and is an explicit residual, not claimed.
 //! - Engine lane: the real [`WasmtimeComponentEngine`] compiled from the
 //!   checked-in `guest-conformance.wat` bytes, digest-bound end to end.
 //!
@@ -92,7 +102,7 @@ use eliot_security_contracts::{
     InstructionTaint, IntegrityStatus, PrivacyClass, QuarantineState, SourceAssurance,
 };
 use eliot_wasm_host::{
-    AdmittedGeneration, GenerationManifest, Profile, PrototypeContourDecision,
+    AdmittedGeneration, ContourGateError, GenerationManifest, Profile, PrototypeContourDecision,
     STANDARD_GUEST_TARGET, WasmHostRunner, WasmtimeComponentEngine, admit_generation,
     provider_configuration_digest,
 };
@@ -274,14 +284,17 @@ impl ProcessEvidenceSink for RecordingSink {
 
 /// Limits admitted for the joined vector: engine-exact (stack 8192, epoch
 /// ceiling, artifact bound) and P03-mirrored (wall/memory/stdout ceilings
-/// re-checked against the staged request).
+/// re-checked against the staged request). The memory ceiling budgets the
+/// WHOLE operation: the guest Store uses kilobytes, but the reaped child
+/// itself runs Wasmtime (tens of megabytes for compile plus execution), so
+/// the Job limit must clear the child runtime — not just the guest.
 fn joined_limits(component_digest: &Sha256Digest) -> InvocationLimits {
     InvocationLimits {
         max_input_bytes: 64,
         max_output_bytes: 64,
         max_host_calls: 1,
         max_fuel: 100_000,
-        max_memory_bytes: 1_048_576,
+        max_memory_bytes: 536_870_912,
         max_table_elements: 64,
         max_instances: 2,
         max_stack_bytes: 8_192,
@@ -401,14 +414,16 @@ fn assurance_fixture(fence: &eliot_contracts::StateFence) -> SourceAssurance {
 }
 
 /// Host contour admission over the real fixture: default WASM decision,
-/// closed manifest, no actual imports.
+/// closed manifest, no actual imports. Digests are recomputed from the
+/// supplied bytes — the admission never trusts a pasted claim.
 fn host_admission(
-    component_digest: &Sha256Digest,
+    component: &[u8],
     limits: &InvocationLimits,
 ) -> eliot_wasm_host::AdmittedGeneration {
     let manifest = GenerationManifest {
+        component_id: COMPONENT.to_owned(),
         target: STANDARD_GUEST_TARGET.to_owned(),
-        artifact_digest: component_digest.clone(),
+        artifact_digest: Sha256Digest::of_bytes(component),
         wit_digest: Sha256Digest::of_bytes(GUEST_WIT),
         world: "eliot:wasm/guest".to_owned(),
         allowed_imports: Vec::new(),
@@ -422,7 +437,16 @@ fn host_admission(
         rollback_generation: None,
     };
     let decision = PrototypeContourDecision::default();
-    must(admit_generation(Some(&decision), &manifest, &[]))
+    must(
+        eliot_wasm_host::admit_generation_with_bytes(
+            Some(&decision),
+            &manifest,
+            &[],
+            component,
+            GUEST_WIT,
+        )
+        .map_err(|error| format!("byte-verified admission failed: {error}")),
+    )
 }
 
 /// Kernel-admitted P03 request mirroring the runtime-derived envelope field
@@ -435,6 +459,73 @@ fn admitted_request(
     limits: &InvocationLimits,
 ) -> ProcessRequest {
     let executable = r"C:\Windows\System32\cmd.exe";
+    issue_request(
+        authority,
+        operation_id,
+        fence,
+        limits,
+        executable,
+        vec![
+            "/c".to_owned(),
+            "echo".to_owned(),
+            "joined-1955-proof".to_owned(),
+        ],
+    )
+}
+
+/// Kernel-admitted P03 request launching the guest-runner child: this
+/// binary in one-shot guest mode over the given artifact/input files. The
+/// guest genuinely executes inside this reaped child (Job-contained), and
+/// its raw output bytes return through P03-captured stdout.
+#[allow(clippy::too_many_arguments)]
+fn admitted_guest_request(
+    authority: &mut DispatchPermitAuthority,
+    operation_id: &str,
+    fence: FencingToken,
+    limits: &InvocationLimits,
+    executable: &str,
+    artifact_file: &std::path::Path,
+    input_file: &std::path::Path,
+    artifact_digest_hex: &str,
+) -> ProcessRequest {
+    issue_request(
+        authority,
+        operation_id,
+        fence,
+        limits,
+        executable,
+        vec![
+            "--profile".to_owned(),
+            "D2_OPERATIONAL".to_owned(),
+            "--guest-exec".to_owned(),
+            "--guest-exec-artifact".to_owned(),
+            artifact_file.to_string_lossy().into_owned(),
+            "--guest-exec-input".to_owned(),
+            input_file.to_string_lossy().into_owned(),
+            "--guest-exec-artifact-digest".to_owned(),
+            artifact_digest_hex.to_owned(),
+            "--guest-exec-max-output".to_owned(),
+            limits.max_output_bytes.to_string(),
+            "--guest-exec-max-fuel".to_owned(),
+            limits.max_fuel.to_string(),
+            "--guest-exec-max-memory".to_owned(),
+            limits.max_memory_bytes.to_string(),
+            "--guest-exec-wall-ms".to_owned(),
+            "10000".to_owned(),
+            "--guest-exec-epoch-ticks".to_owned(),
+            "100".to_owned(),
+        ],
+    )
+}
+
+fn issue_request(
+    authority: &mut DispatchPermitAuthority,
+    operation_id: &str,
+    fence: FencingToken,
+    limits: &InvocationLimits,
+    executable: &str,
+    argv: Vec<String>,
+) -> ProcessRequest {
     let executable_digest = match std::fs::read(executable) {
         Ok(bytes) => eliot_contracts::sha256_hex(&bytes),
         Err(error) => panic!("joined proof executable unreadable: {error}"),
@@ -453,11 +544,7 @@ fn admitted_request(
         generation,
         executable,
         executable_digest,
-        vec![
-            "/c".to_owned(),
-            "echo".to_owned(),
-            "joined-1955-proof".to_owned(),
-        ],
+        argv,
         working_directory,
         EnvironmentProjection::default(),
         must(ResourceLimits::new(
@@ -481,6 +568,36 @@ fn admitted_request(
         )),
     ));
     must(ProcessRequest::new(intent, permit))
+}
+
+/// Locates the built host binary that the guest child runs: the isolated
+/// cargo target when the gate exports it, else the workspace debug target
+/// relative to this package. Production uses the installed binary path
+/// (installer-owned); this derivation is proof-only and fails closed when
+/// no binary exists — a missing child can never pass as success.
+fn host_binary_path() -> std::path::PathBuf {
+    use std::path::Path;
+    let exe = if cfg!(windows) {
+        "eliot-wasm-host.exe"
+    } else {
+        "eliot-wasm-host"
+    };
+    if let Ok(dir) = std::env::var("CARGO_TARGET_DIR") {
+        let candidate = Path::new(&dir).join("debug").join(exe);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    let fallback = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("target")
+        .join("debug")
+        .join(exe);
+    if fallback.is_file() {
+        return fallback;
+    }
+    panic!("joined proof host binary missing: build the eliot-wasm-host binary first");
 }
 
 /// Sealed caller request for one attempt.
@@ -516,7 +633,7 @@ fn admitted_execution_succeeds_through_real_wasmtime() {
 
     let snapshot = snapshot_fixture();
     let fence = snapshot.state_fence();
-    let admitted_gen = host_admission(&component_digest, &limits);
+    let admitted_gen = host_admission(&component, &limits);
     let contour = ContourAdmission {
         artifact_bytes: component.clone(),
         wit_bytes: GUEST_WIT.to_vec(),
@@ -565,14 +682,44 @@ fn admitted_execution_succeeds_through_real_wasmtime() {
     // adapter's same-operation observed reap settles this handle inside the
     // single `execute`, so no second invocation exists and no retry of the
     // effect occurs. Any non-success verdict fails the test outright.
+    //
+    // The child IS the guest execution: this binary in one-shot guest mode
+    // over the real artifact/input files. Its raw stdout — observed through
+    // P03 capture — is compared against the oracle reference below, so the
+    // proof shows Wasmtime running inside the reaped Job-contained child,
+    // not beside it.
     let operation_id = "join-1956-succeed";
+    let artifact_file = std::env::temp_dir().join("eliot-join-1956-guest-artifact.bin");
+    let input_file = std::env::temp_dir().join("eliot-join-1956-guest-input.bin");
+    must(
+        std::fs::write(&artifact_file, &component)
+            .map_err(|error| format!("guest artifact file unwritable: {error}")),
+    );
+    must(
+        std::fs::write(&input_file, &framed)
+            .map_err(|error| format!("guest input file unwritable: {error}")),
+    );
+    let host_binary = host_binary_path();
+    let host_binary_str = match host_binary.to_str() {
+        Some(path) => path.to_owned(),
+        None => panic!("joined proof host binary path is not valid unicode"),
+    };
     let mut authority = test_authority();
     let request_fence = must(FencingToken::new(
         test_epoch(),
         must(Generation::new(1)),
         format!("fence-{operation_id}"),
     ));
-    let staged = admitted_request(&mut authority, operation_id, request_fence.clone(), &limits);
+    let staged = admitted_guest_request(
+        &mut authority,
+        operation_id,
+        request_fence.clone(),
+        &limits,
+        &host_binary_str,
+        &artifact_file,
+        &input_file,
+        &eliot_contracts::sha256_hex(&component),
+    );
     let binding = ProcessBinding::from_request(&staged);
     let executor = Arc::new(WindowsProcessExecutor::new(Arc::new(FakePort::new(
         authority,
@@ -707,6 +854,22 @@ fn admitted_execution_succeeds_through_real_wasmtime() {
             .ok_or("reaped evidence carries descendant proof"),
     );
     assert!(descendants.complete() && descendants.tree_terminated());
+    // The guest ran INSIDE that child: P03-captured stdout must equal the
+    // oracle reference byte for byte — the same bytes as the in-process
+    // run above. Triple agreement (child, in-process engine, oracle) with
+    // complete, untruncated capture is the isolation proof; a trapped or
+    // limited guest leaves stdout empty and fails here, never as success.
+    let operation = must(OperationId::new(operation_id));
+    let (child_stdout, _) = must(
+        executor
+            .captured_output(&operation)
+            .map_err(|error| format!("captured child output unreadable: {error:?}")),
+    );
+    assert!(child_stdout.captured);
+    assert!(child_stdout.complete);
+    assert!(!child_stdout.truncated);
+    assert_eq!(child_stdout.total_bytes, reference.result.len() as u64);
+    assert_eq!(child_stdout.bytes, reference.result);
     assert!(
         sink.recorded_len() >= 2,
         "start plus reaps must be recorded"
@@ -799,11 +962,10 @@ fn compose_negative(
     (runner, admitted)
 }
 
-/// Host admission binding exactly the given artifact digest (no hashing
-/// here — the Governor factory re-hashes the bytes itself).
+/// Host admission binding exactly the given artifact bytes (re-hashed at
+/// admission — the Governor factory re-hashes the bytes itself too).
 fn host_admission_for(artifact: &[u8], limits: &InvocationLimits) -> AdmittedGeneration {
-    let digest = Sha256Digest::of_bytes(artifact);
-    host_admission(&digest, limits)
+    host_admission(artifact, limits)
 }
 
 /// Standard joined admission parts: snapshot fence shared by generation,
@@ -994,6 +1156,7 @@ fn non_wasm_admission_is_refused_before_a12() {
         "needs raw USB scan",
     ));
     let manifest = GenerationManifest {
+        component_id: COMPONENT.to_owned(),
         target: STANDARD_GUEST_TARGET.to_owned(),
         artifact_digest: Sha256Digest::of_bytes(&component_bytes()),
         wit_digest: Sha256Digest::of_bytes(GUEST_WIT),
@@ -1205,5 +1368,101 @@ fn bare_corpus_against_framed_execution_is_rejected() {
     assert_eq!(
         result.receipt.error,
         Some(RuntimeError::DifferentialMismatch)
+    );
+}
+
+#[test]
+fn foreign_component_admission_denies_before_a12() {
+    // Host admission bound to another component, ports resolving the
+    // genuine one: the host gate must deny before A-12 is contacted. The
+    // positive proof (same ports/request shape, matched component)
+    // establishes A-12 would otherwise proceed — so this denial is the
+    // host boundary's own work. No P03 staging: reaching `prepare` would
+    // surface `Unavailable`, not the component denial.
+    let component = component_bytes();
+    let parts = negative_parts(&component);
+    let admission = admit_negative(&parts);
+    let foreign_manifest = GenerationManifest {
+        component_id: "other-component".to_owned(),
+        target: STANDARD_GUEST_TARGET.to_owned(),
+        artifact_digest: Sha256Digest::of_bytes(&component),
+        wit_digest: Sha256Digest::of_bytes(GUEST_WIT),
+        world: "eliot:wasm/guest".to_owned(),
+        allowed_imports: Vec::new(),
+        allowed_exports: vec!["run".to_owned()],
+        capability_grants: Vec::new(),
+        limits: parts.limits.clone(),
+        state_class: "stateless".to_owned(),
+        migration_contract: "none".to_owned(),
+        privacy_policy: "project_code".to_owned(),
+        comparator: "shadow-exact".to_owned(),
+        rollback_generation: None,
+    };
+    let decision = PrototypeContourDecision::default();
+    let foreign_admitted = must(
+        eliot_wasm_host::admit_generation_with_bytes(
+            Some(&decision),
+            &foreign_manifest,
+            &[],
+            &component,
+            GUEST_WIT,
+        )
+        .map_err(|error| format!("foreign admission failed: {error}")),
+    );
+    let (mut runner, _) = compose_negative(
+        admission,
+        None,
+        None,
+        component.as_slice(),
+        component.as_slice(),
+        &parts.limits,
+        &parts.engine_binding,
+    );
+    let request = attempt_request(
+        "join-1956-foreign-component",
+        ExecutionContour::Conformance,
+        framed_input(),
+    );
+    let Err(error) = runner.execute_admitted(&foreign_admitted, request) else {
+        panic!("foreign-component admission executed")
+    };
+    assert_eq!(
+        error,
+        ContourGateError::ComponentNotAdmitted(COMPONENT.to_owned())
+    );
+    assert_eq!(error.to_string(), "COMPONENT_NOT_ADMITTED:component-1956");
+}
+
+#[test]
+fn oversized_input_denies_before_a12() {
+    // Admitted input envelope (8 bytes) below the request input (20
+    // framed bytes): the host gate denies before A-12 contact. Empty P03
+    // slot again proves `prepare` is never reached.
+    let component = component_bytes();
+    let parts = negative_parts(&component);
+    let admission = admit_negative(&parts);
+    let mut tight_limits = parts.limits.clone();
+    tight_limits.max_input_bytes = 8;
+    let tight_admitted = host_admission(&component, &tight_limits);
+    let (mut runner, _) = compose_negative(
+        admission,
+        None,
+        None,
+        component.as_slice(),
+        component.as_slice(),
+        &parts.limits,
+        &parts.engine_binding,
+    );
+    let request = attempt_request(
+        "join-1956-oversized-input",
+        ExecutionContour::Conformance,
+        framed_input(),
+    );
+    let Err(error) = runner.execute_admitted(&tight_admitted, request) else {
+        panic!("oversized input executed")
+    };
+    assert_eq!(
+        error,
+        ContourGateError::InputLimitExceeded("input-bytes".to_owned())
     );
 }

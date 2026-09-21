@@ -19,6 +19,12 @@ const WASMTIME_VERSION: &str = "47.0.4";
 const WIT_VERSION: &str = "1.0.0";
 const WIT_WORLD: &str = "eliot:wasm/guest";
 const RUN_EXPORT: &str = "run";
+/// Fixture-scoped engine identity bytes (NOT a measured production engine
+/// artifact: Wasmtime links statically). Names the exact pinned
+/// implementation wherever a binding must carry an engine artifact digest;
+/// recomputed, never pasted; production engine-artifact provenance is not
+/// claimed by carrying it.
+const ENGINE_FIXTURE_IDENTITY: &[u8] = b"wasmtime-component/47.0.4";
 const PROVIDER_STACK_SIZE: usize = 8 * 1024;
 const EPOCH_DRIVER_THREAD_PREFIX: &str = "eliot-wasm-epoch";
 #[cfg(test)]
@@ -237,6 +243,47 @@ impl WasmtimeComponentEngine {
             component_configuration_digest,
             artifact_bytes: artifact.len() as u64,
         })
+    }
+
+    /// Builds the engine for P03-admitted component bytes with a
+    /// provider-derived binding: exact pinned implementation and version,
+    /// configuration digest recomputed from the supplied configuration,
+    /// and WIT digest recomputed from the checked-in world. The caller
+    /// supplies the artifact digest it verified (TOCTOU-checked by the
+    /// guest-runner child against the bytes it actually read).
+    pub fn new_for_admitted_bytes(
+        artifact: &[u8],
+        component_configuration: &[u8],
+    ) -> Result<Self, WasmtimeBuildError> {
+        let binding = EngineBinding {
+            implementation_id: "wasmtime-component".to_owned(),
+            exact_version: WASMTIME_VERSION.to_owned(),
+            engine_artifact_digest: Sha256Digest::of_bytes(ENGINE_FIXTURE_IDENTITY),
+            engine_configuration_digest: configuration_digest(),
+            wit_interface_digest: Sha256Digest::of_bytes(include_bytes!("../wit/guest.wit")),
+        };
+        Self::new(
+            binding,
+            Sha256Digest::of_bytes(artifact),
+            artifact,
+            component_configuration,
+        )
+    }
+
+    /// Executes raw input through the admitted component without the port
+    /// manifest gate. The only caller is the P03-admitted guest-runner
+    /// child: the artifact was digest-bound at build, the limits arrive via
+    /// the admitted intent argv and are enforced by the Store, and the
+    /// closed world admits no host calls. The admitted port path
+    /// (`ComponentEnginePort::invoke`) remains the sole manifest-bound
+    /// entry; this convenience adds no semantics over `invoke_component`.
+    pub fn invoke_bytes(
+        &self,
+        request_digest: &Sha256Digest,
+        limits: &InvocationLimits,
+        input: &[u8],
+    ) -> Result<EngineReport, PortError> {
+        self.invoke_component(request_digest, limits, input, true)
     }
 
     fn invoke_component(
