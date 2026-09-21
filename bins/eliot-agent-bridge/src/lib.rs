@@ -35,7 +35,7 @@ pub use eliot_agent_bridge_core::{
     DeliveryStatus, HotResourceView, MAX_CONTENT_BYTES, MAX_PREVIEW_BYTES, MAX_REGISTRY_ENTRIES,
     MAX_URI_BYTES, ResourceHandle, ResourceKind, ResourceRegistry, ResourceUri, ToolResultReceipt,
 };
-use eliot_mcp::{HostInvocationOutcome, KernelHostRequestPort, ResponseKind};
+use eliot_mcp::{HostInvocationOutcome, KernelHostRequestPort, ResponseKind, ToolRequest};
 use eliot_protocol::{
     AckPhase, AgentBridgeClientDeclaration, AgentBridgePeerAdmissionReceipt,
     AgentBridgePeerChallenge, EventEnvelope,
@@ -652,6 +652,17 @@ impl BridgeRunner {
     /// WITHOUT affecting forwarding: the emitted response stays authoritative and this
     /// substrate is purely auxiliary delivery-record augmentation.
     ///
+    /// Exact-URI queries (`eliot.query` with `exact_resource_uri`) publish
+    /// canonically instead: the served bytes land at the requested I7.18 URI
+    /// via `publish_canonical_resource` (grammar, ceilings, and immutable
+    /// conflicts enforced there), so the returned view names the exact
+    /// served resource. The URI arrives inside the admitted tool request and
+    /// the bytes through the linkage-checked invoke-read leg — the bridge
+    /// mints neither. Unlike overflow evidence, addressability does not
+    /// depend on preview size, so small results publish too. A
+    /// non-canonical URI falls back to the evidence path; a refused
+    /// canonical publish yields `None` (never a masking second URI).
+    ///
     /// Evidence content-addressing is NOT admission authority: the URI is a pure function
     /// of the exact delivered bytes, grants nothing, admits nothing, and resolves nothing.
     /// The bytes were already delivered inline to the host in the same response, so no new
@@ -660,6 +671,7 @@ impl BridgeRunner {
     /// route owner's job (`project_tool_result_receipt`).
     pub fn record_tool_result_delivery(
         &mut self,
+        tool: &ToolRequest,
         outcome: &HostInvocationOutcome,
     ) -> Option<HotResourceView> {
         let HostInvocationOutcome::Responded { response, .. } = outcome else {
@@ -670,6 +682,15 @@ impl BridgeRunner {
             ResponseKind::PlanGap | ResponseKind::Unsupported => return None,
         }
         let bytes = serde_json::to_vec(&response.content).ok()?;
+        // Exact-URI branch: a query directly addressing an immutable
+        // resource resolves its served bytes at that URI. Non-canonical
+        // URI text falls through to the evidence path below.
+        if let ToolRequest::Query(input) = tool
+            && let Some(uri) = input.exact_resource_uri.as_deref()
+            && let Ok(parsed) = ResourceUri::parse(uri)
+        {
+            return self.publish_canonical_resource(&parsed, bytes).ok();
+        }
         if bytes.len() <= MAX_PREVIEW_BYTES {
             return None;
         }
