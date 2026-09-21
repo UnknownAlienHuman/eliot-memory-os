@@ -72,7 +72,7 @@ impl RpcSession {
             owner: Arc::downgrade(owner),
         };
         let remaining = deadline.saturating_duration_since(Instant::now());
-        timeout(remaining, authenticate_provider(&session, &owner.config))
+        let version = timeout(remaining, authenticate_provider(&session, &owner.config))
             .await
             .map_err(|_| AdapterError::ProviderUnavailable)??;
         owner.validate_owned().await?;
@@ -81,6 +81,7 @@ impl RpcSession {
             &owner.provider_process_identity,
             "authentication",
         )?;
+        owner.record_authenticated_version(version);
         Ok(session)
     }
     async fn signin(&self, username: &str, password: &SecretString) -> Result<(), AdapterError> {
@@ -231,7 +232,7 @@ impl ProviderAuthentication for RpcSession {
 pub(super) async fn authenticate_provider<T: ProviderAuthentication>(
     transport: &T,
     config: &SurrealAdapterConfig,
-) -> Result<(), AdapterError> {
+) -> Result<super::rpc_parse::ProviderVersion, AdapterError> {
     let version = provider_version_from_rpc(&transport.version().await?)?;
     if version.major != config.expected_provider_major {
         return Err(AdapterError::Config(format!(
@@ -242,7 +243,8 @@ pub(super) async fn authenticate_provider<T: ProviderAuthentication>(
     transport.signin(&config.username, &config.password).await?;
     transport
         .select_namespace_database(&config.namespace, &config.database)
-        .await
+        .await?;
+    Ok(version)
 }
 
 async fn connect_started_provider(
