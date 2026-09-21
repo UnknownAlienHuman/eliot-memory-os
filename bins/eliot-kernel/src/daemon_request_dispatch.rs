@@ -14,12 +14,14 @@
 use super::*;
 #[path = "store_receipt_dispatch.rs"]
 mod store_receipt_dispatch;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use eliot_contracts::StateFence;
+use eliot_contracts::{StateFence, sha256_hex};
 use eliot_kernel_service::AuthenticatedHostSession;
-use eliot_protocol::{HostRequestEnvelope, HostRequestResultBody, LocalReadAttempt,
-    host_request_operation_id};
+use eliot_protocol::{
+    HostRequestEnvelope, HostRequestResultBody, LocalReadAttempt, RequestIdentity,
+    host_request_operation_id,
+};
 use eliot_store_api::{
     CanonicalRequestView, NamedReadOperation, NamedReadRequest, NamedReadResponse,
     OrderingHeadExpectation, PreparedTransition, ReadConsistency, RequestMeta,
@@ -27,6 +29,261 @@ use eliot_store_api::{
     StoreRecoverySnapshot, WriteReceipt, verify_canonical_request_hash,
 };
 use serde::Deserialize;
+
+use super::generation_control::{
+    ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION, ActiveGenerationRegistryProjection,
+    ActiveGenerationRegistryQuery,
+};
+
+/// Governor's existing authenticated publish operation. The semantic
+/// `EliotdStartupEvidence` carrier remains bin-owned; Kernel consumes its
+/// canonical JSON mechanically and never imports `bins/eliotd`.
+pub(crate) const DAEMON_STARTUP_EVIDENCE_OPERATION: &str = "daemon_startup_evidence";
+
+const STARTUP_EVIDENCE_FIELDS: [&str; 8] = [
+    "transport_binding",
+    "state_fence",
+    "config_mirror_digest",
+    "policy_mirror_digest",
+    "capability_registry_digest",
+    "required_capabilities",
+    "capability_outcomes",
+    "evidence_refs",
+];
+
+const CAPABILITY_OUTCOME_FIELDS: [&str; 12] = [
+    "capability",
+    "requested_mode",
+    "effective_mode",
+    "degradation_scope",
+    "reason",
+    "evidence_refs",
+    "affected_outputs_or_operations",
+    "proof_ceiling",
+    "recovery_requalification_or_expiry",
+    "scope_owner",
+    "generation_fingerprint",
+    "valid_until_unix_ms",
+];
+
+/// Mechanical view of the Governor-owned startup carrier.
+///
+/// This is deliberately not `CapabilityOutcome` or `EliotdStartupEvidence`:
+/// those semantic types remain in their owning binary. The view only retains
+/// fields needed for Kernel authentication, exact fence binding, and the
+/// documented registry-digest comparison.
+#[derive(Debug)]
+struct StartupEvidenceView {
+    transport_binding: RequestIdentity,
+    state_fence: StateFence,
+    config_mirror_digest: PlatformHandle,
+    policy_mirror_digest: Option<PlatformHandle>,
+    capability_registry_digest: Option<String>,
+    required_capabilities: Option<Vec<String>>,
+    capability_outcomes: Option<Vec<serde_json::Value>>,
+}
+
+fn exact_object_fields(
+    object: &serde_json::Map<String, serde_json::Value>,
+    expected: &[&str],
+) -> Result<(), TransportError> {
+    if object.len() != expected.len() || expected.iter().any(|field| !object.contains_key(*field)) {
+        return Err(TransportError::SessionFenced);
+    }
+    Ok(())
+}
+
+fn required_text(value: &serde_json::Value) -> Result<&str, TransportError> {
+    value
+        .as_str()
+        .filter(|text| !text.trim().is_empty())
+        .ok_or(TransportError::SessionFenced)
+}
+
+fn platform_handle(value: &serde_json::Value) -> Result<PlatformHandle, TransportError> {
+    PlatformHandle::new(required_text(value)?.to_owned()).map_err(|_| TransportError::SessionFenced)
+}
+
+fn optional_platform_handle(
+    value: &serde_json::Value,
+) -> Result<Option<PlatformHandle>, TransportError> {
+    if value.is_null() {
+        Ok(None)
+    } else {
+        platform_handle(value).map(Some)
+    }
+}
+
+fn lower_hex_digest(value: &serde_json::Value) -> Result<String, TransportError> {
+    let digest = required_text(value)?;
+    if digest.len() != 64
+        || !digest.bytes().all(|byte| {
+            byte.is_ascii_digit() || byte.is_ascii_lowercase() && byte.is_ascii_hexdigit()
+        })
+    {
+        return Err(TransportError::SessionFenced);
+    }
+    Ok(digest.to_owned())
+}
+
+fn optional_registry_digest(value: &serde_json::Value) -> Result<Option<String>, TransportError> {
+    if value.is_null() {
+        Ok(None)
+    } else {
+        lower_hex_digest(value).map(Some)
+    }
+}
+
+fn optional_string_set(value: &serde_json::Value) -> Result<Option<Vec<String>>, TransportError> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    let values = value.as_array().ok_or(TransportError::SessionFenced)?;
+    let mut unique = BTreeSet::new();
+    let mut result = Vec::with_capacity(values.len());
+    for value in values {
+        let text = required_text(value)?.to_owned();
+        if !unique.insert(text.clone()) {
+            return Err(TransportError::SessionFenced);
+        }
+        result.push(text);
+    }
+    Ok(Some(result))
+}
+
+fn string_array(value: &serde_json::Value) -> Result<(), TransportError> {
+    let values = value.as_array().ok_or(TransportError::SessionFenced)?;
+    if values.iter().any(|value| required_text(value).is_err()) {
+        return Err(TransportError::SessionFenced);
+    }
+    Ok(())
+}
+
+fn validate_capability_outcome_shape(value: &serde_json::Value) -> Result<(), TransportError> {
+    let object = value.as_object().ok_or(TransportError::SessionFenced)?;
+    exact_object_fields(object, &CAPABILITY_OUTCOME_FIELDS)?;
+    for field in [
+        "capability",
+        "requested_mode",
+        "effective_mode",
+        "degradation_scope",
+        "reason",
+        "proof_ceiling",
+        "recovery_requalification_or_expiry",
+        "scope_owner",
+        "generation_fingerprint",
+    ] {
+        let _ = required_text(object.get(field).ok_or(TransportError::SessionFenced)?)?;
+    }
+    string_array(
+        object
+            .get("evidence_refs")
+            .ok_or(TransportError::SessionFenced)?,
+    )?;
+    string_array(
+        object
+            .get("affected_outputs_or_operations")
+            .ok_or(TransportError::SessionFenced)?,
+    )?;
+    let valid_until = object
+        .get("valid_until_unix_ms")
+        .ok_or(TransportError::SessionFenced)?;
+    if !valid_until.is_null() && valid_until.as_u64().is_none() {
+        return Err(TransportError::SessionFenced);
+    }
+    Ok(())
+}
+
+fn parse_startup_evidence(
+    payload: &serde_json::Value,
+) -> Result<StartupEvidenceView, TransportError> {
+    let object = payload.as_object().ok_or(TransportError::SessionFenced)?;
+    exact_object_fields(object, &STARTUP_EVIDENCE_FIELDS)?;
+
+    let transport_binding: RequestIdentity = serde_json::from_value(
+        object
+            .get("transport_binding")
+            .cloned()
+            .ok_or(TransportError::SessionFenced)?,
+    )
+    .map_err(|_| TransportError::SessionFenced)?;
+    transport_binding
+        .validate()
+        .map_err(|_| TransportError::SessionFenced)?;
+
+    let state_fence: StateFence = serde_json::from_value(
+        object
+            .get("state_fence")
+            .cloned()
+            .ok_or(TransportError::SessionFenced)?,
+    )
+    .map_err(|_| TransportError::SessionFenced)?;
+    state_fence
+        .validate()
+        .map_err(|_| TransportError::SessionFenced)?;
+
+    let required_capabilities = optional_string_set(
+        object
+            .get("required_capabilities")
+            .ok_or(TransportError::SessionFenced)?,
+    )?;
+    let capability_outcomes = match object
+        .get("capability_outcomes")
+        .ok_or(TransportError::SessionFenced)?
+    {
+        value if value.is_null() => None,
+        value => {
+            let outcomes = value.as_array().ok_or(TransportError::SessionFenced)?;
+            for outcome in outcomes {
+                validate_capability_outcome_shape(outcome)?;
+            }
+            Some(outcomes.clone())
+        }
+    };
+
+    let evidence_refs_value = object
+        .get("evidence_refs")
+        .ok_or(TransportError::SessionFenced)?;
+    for evidence_ref in evidence_refs_value
+        .as_array()
+        .ok_or(TransportError::SessionFenced)?
+    {
+        platform_handle(evidence_ref)?;
+    }
+
+    Ok(StartupEvidenceView {
+        transport_binding,
+        state_fence,
+        config_mirror_digest: platform_handle(
+            object
+                .get("config_mirror_digest")
+                .ok_or(TransportError::SessionFenced)?,
+        )?,
+        policy_mirror_digest: optional_platform_handle(
+            object
+                .get("policy_mirror_digest")
+                .ok_or(TransportError::SessionFenced)?,
+        )?,
+        capability_registry_digest: optional_registry_digest(
+            object
+                .get("capability_registry_digest")
+                .ok_or(TransportError::SessionFenced)?,
+        )?,
+        required_capabilities,
+        capability_outcomes,
+    })
+}
+
+fn daemon_capability_registry_digest(
+    outcomes: &[serde_json::Value],
+) -> Result<String, TransportError> {
+    let mut serialized = outcomes
+        .iter()
+        .map(|outcome| serde_json::to_string(outcome).map_err(|_| TransportError::SessionFenced))
+        .collect::<Result<Vec<_>, _>>()?;
+    serialized.sort_unstable();
+    Ok(sha256_hex(serialized.concat().as_bytes()))
+}
 
 fn observe_daemon_request(event: &'static str, outcome: &'static str) {
     use super::kernel_diagnostics::{KERNEL_DIAGNOSTICS_TARGET, bound_field};
@@ -77,6 +334,8 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
     match operation {
         "snapshot" => "snapshot",
         "daemon_ready" => "daemon_ready",
+        ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION => ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION,
+        DAEMON_STARTUP_EVIDENCE_OPERATION => DAEMON_STARTUP_EVIDENCE_OPERATION,
         "health" => "health",
         "store_recovery" => "store_recovery",
         "store_initialize_genesis" => "store_initialize_genesis",
@@ -259,7 +518,17 @@ impl KernelComposition {
                 }
                 self.mark_daemon_ready()
                     .map_err(|_| TransportError::SessionFenced)
-                    .map(|()| Self::accepted_daemon_response())
+                    .and_then(|()| {
+                        self.record_startup_evidence(7)
+                            .map_err(|_| TransportError::SessionFenced)?;
+                        Ok(Self::accepted_daemon_response())
+                    })
+            }
+            ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION => {
+                self.generation_registry_active_query_operation(session, payload.clone())
+            }
+            DAEMON_STARTUP_EVIDENCE_OPERATION => {
+                self.daemon_startup_evidence_operation(session, &request_id, payload)
             }
             "health" => self
                 .daemon_health()
@@ -572,6 +841,165 @@ impl KernelComposition {
         })
     }
 
+    fn generation_registry_active_query_operation(
+        &self,
+        session: &Session,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        let query: ActiveGenerationRegistryQuery =
+            serde_json::from_value(payload).map_err(|_| TransportError::SessionFenced)?;
+        let projection = self
+            .active_generation_registry_query(&query, &session.module_generation.state_fence)
+            .map_err(|_| TransportError::SessionFenced)?;
+        Ok(Self::generation_registry_projection_response(&projection))
+    }
+
+    fn generation_registry_projection_response(
+        projection: &ActiveGenerationRegistryProjection,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "status": "known",
+            "value": projection.response(),
+            "recovery": null,
+        })
+    }
+
+    /// Consumes the authenticated Governor startup receipt without importing
+    /// the bin-owned `CapabilityOutcome`. The carrier is only a mechanical
+    /// evidence boundary: missing canonical Policy/R2 semantic owner reads
+    /// leave steps 8/9 absent and never become a local success default.
+    fn daemon_startup_evidence_operation(
+        &self,
+        session: &Session,
+        request_id: &RequestId,
+        payload: &serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        let evidence = parse_startup_evidence(payload)?;
+
+        let session_fence = &session.module_generation.state_fence;
+        let binding = &evidence.transport_binding;
+        if evidence.state_fence != *session_fence
+            || binding.request.state_fence != *session_fence
+            || &binding.request.metadata.request_id != request_id
+            || binding.request.metadata.product_id.as_str() != ACTIVE_DAEMON_CALLER
+            || binding.request.metadata.source_id.as_str() != ACTIVE_DAEMON_CALLER
+        {
+            return Err(TransportError::SessionFenced);
+        }
+
+        let projection = self
+            .active_generation_registry_projection("daemon")
+            .map_err(|_| TransportError::SessionFenced)?;
+        if projection.state_fence() != session_fence {
+            return Err(TransportError::SessionFenced);
+        }
+
+        self.validate_daemon_config_mirror(&evidence.config_mirror_digest)?;
+        let capabilities_complete = match (
+            &evidence.required_capabilities,
+            &evidence.capability_outcomes,
+            &evidence.capability_registry_digest,
+        ) {
+            (None, None, None) => false,
+            (Some(required), Some(outcomes), Some(registry)) => {
+                Self::validate_daemon_capability_evidence(
+                    required,
+                    outcomes,
+                    registry,
+                    projection.generation_fingerprint(),
+                )?;
+                true
+            }
+            _ => return Err(TransportError::SessionFenced),
+        };
+
+        // There is no Kernel-owned PolicyOwnerSnapshot or Governor semantic
+        // eligibility result in this checkout. A present self-reported policy
+        // digest is therefore still insufficient for step 8; the active R1
+        // owner must supply the authenticated canonical read before these
+        // steps can advance. Likewise, mechanical R4/capability checks do not
+        // replace the Governor's R2/R3 attestation for step 9.
+        let reason = if evidence.policy_mirror_digest.is_none() {
+            "policy_owner_snapshot_absent"
+        } else if !capabilities_complete {
+            "required_capability_owner_snapshot_absent"
+        } else {
+            "governor_semantic_attestation_unavailable"
+        };
+        Ok(Self::incomplete_startup_evidence_response(reason))
+    }
+
+    fn validate_daemon_config_mirror(
+        &self,
+        config_mirror_digest: &PlatformHandle,
+    ) -> Result<(), TransportError> {
+        let policy = self
+            .front_door_policy
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let protected_snapshot_digest = policy
+            .config_snapshot
+            .get("protected_snapshot_digest")
+            .and_then(serde_json::Value::as_str)
+            .filter(|digest| !digest.trim().is_empty())
+            .ok_or(TransportError::SessionFenced)?;
+        if protected_snapshot_digest != config_mirror_digest.as_str() {
+            return Err(TransportError::SessionFenced);
+        }
+        Ok(())
+    }
+
+    fn validate_daemon_capability_evidence(
+        required: &[String],
+        outcomes: &[serde_json::Value],
+        registry: &str,
+        expected_generation_fingerprint: &str,
+    ) -> Result<(), TransportError> {
+        let mut required_names = BTreeSet::new();
+        for name in required {
+            if name.trim().is_empty() || !required_names.insert(name.as_str()) {
+                return Err(TransportError::SessionFenced);
+            }
+        }
+        let mut observed_names = BTreeSet::new();
+        for outcome in outcomes {
+            let object = outcome.as_object().ok_or(TransportError::SessionFenced)?;
+            let capability = object
+                .get("capability")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or(TransportError::SessionFenced)?;
+            let fingerprint = object
+                .get("generation_fingerprint")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or(TransportError::SessionFenced)?;
+            if fingerprint != expected_generation_fingerprint {
+                return Err(TransportError::SessionFenced);
+            }
+            observed_names.insert(capability);
+        }
+        if !required_names.is_subset(&observed_names)
+            || daemon_capability_registry_digest(outcomes)? != registry
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        Ok(())
+    }
+
+    fn incomplete_startup_evidence_response(reason: &'static str) -> serde_json::Value {
+        serde_json::json!({
+            "status": "known",
+            "value": {
+                "accepted": false,
+                "recorded": false,
+                "steps_recorded": [],
+                "reason": reason,
+            },
+            "recovery": null,
+        })
+    }
+
     fn expired_activation_daemon_response() -> serde_json::Value {
         serde_json::json!({
             "status": "known",
@@ -773,6 +1201,9 @@ impl KernelComposition {
                     &error.to_string(),
                 ));
             }
+        }
+        if let Some(rejection) = self.normal_write_admission_response() {
+            return Ok(rejection);
         }
         let gateway = self.retained_store_gateway()?;
         match gateway
@@ -998,6 +1429,16 @@ impl KernelComposition {
             .ok_or(TransportError::SessionFenced)
     }
 
+    /// Returns the existing store-error projection when startup has not
+    /// admitted normal canonical writes. This is deliberately kept directly
+    /// before the retained gateway call in `apply_prepared`, so a fenced
+    /// request cannot enter the Store backend.
+    fn normal_write_admission_response(&self) -> Option<serde_json::Value> {
+        self.admit_normal_write()
+            .err()
+            .map(|error| Self::store_error_response_text("write_receipt", &error.to_string()))
+    }
+
     fn store_error_response_text(kind: &str, error: &str) -> serde_json::Value {
         let status = if error == StoreError::MissingReceiptEnvelope.to_string() {
             "unknown"
@@ -1009,6 +1450,45 @@ impl KernelComposition {
             "value": { "kind": kind, "value": null },
             "recovery": null,
         })
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apply_prepared_admission_rejects_before_backend_entry() {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-kernel-apply-prepared-gate-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("test work root");
+        let kernel = KernelComposition::new(KernelConfig::new(&root)).expect("kernel composition");
+        let mut backend_called = false;
+        let response = if let Some(response) = kernel.normal_write_admission_response() {
+            response
+        } else {
+            backend_called = true;
+            serde_json::Value::Null
+        };
+
+        assert!(
+            !backend_called,
+            "startup gate must fence before Store entry"
+        );
+        assert_eq!(response["status"], "error");
+        assert_eq!(response["value"]["kind"], "write_receipt");
+        assert_eq!(
+            kernel
+                .startup_status(GovernanceProfile::minimal())
+                .blocking_prerequisite,
+            Some("epoch-recovery")
+        );
+
+        drop(kernel);
+        let _ = std::fs::remove_dir_all(root);
     }
 }
 
@@ -1206,10 +1686,9 @@ mod local_read_dispatch_tests {
         let tool = query_tool();
         let envelope = test_envelope("eliot.query", &tool_digest(&tool));
         let operation_id = eliot_protocol::host_request_operation_id(&envelope);
-        let authority_epoch =
-            serde_json::to_value(envelope.state_fence.clone()).expect("fence encodes")
-                ["authority_epoch"]
-                .clone();
+        let authority_epoch = serde_json::to_value(envelope.state_fence.clone())
+            .expect("fence encodes")["authority_epoch"]
+            .clone();
         let attempt = serde_json::json!({
             "wire_id": eliot_protocol::LOCAL_READ_ATTEMPT_WIRE_ID,
             "wire_version": eliot_protocol::LocalReadAttempt::CONTRACT_VERSION,

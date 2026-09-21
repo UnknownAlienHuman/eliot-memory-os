@@ -232,6 +232,7 @@ fn config() -> StoreLaunchConfig {
         username: "store".to_owned(),
         connect_timeout_ms: 1_000,
         query_timeout_ms: 1_000,
+        store_transaction_limit: None,
         schema_generation: "1.0.0".to_owned(),
         blob_root: r"C:\ProgramData\Eliot\blob".to_owned(),
         instance_id: "store-test".to_owned(),

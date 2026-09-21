@@ -16,7 +16,7 @@ use eliot_contracts::{AuthorityEpoch, StateFence};
 use eliot_ipc::ServerHandshakePolicy;
 use eliot_kernel_core::{CutoverDecision, GenerationRoute, GenerationRouter, RouteScope};
 use eliot_kernel_service::KernelService;
-use eliot_ors::RedbRecoveryStore;
+use eliot_ors::{CutoverRouteSnapshot, CutoverRouteTable, OrsError, RedbRecoveryStore};
 use eliot_runtime_contracts::{
     GenerationCutoverRecord as RuntimeGenerationCutoverRecord, GenerationCutoverState,
 };
@@ -53,11 +53,54 @@ fn observe_recovery(event: &'static str, outcome: &'static str) {
 
 pub(crate) struct OrsGenerationCoordinator {
     pub(crate) ors: Arc<RedbRecoveryStore>,
+    /// Committed I14.14 route ownership rebuilt during startup recovery.
+    /// Admission consumers must supply the canonical route-scope hash; this
+    /// table never derives one from a request's partial route fields.
+    pub(crate) cutover_routes: CutoverRouteTable,
 }
 
 impl OrsGenerationCoordinator {
     pub(crate) fn new(ors: Arc<RedbRecoveryStore>) -> Self {
-        Self { ors }
+        Self {
+            ors,
+            cutover_routes: CutoverRouteTable::new(),
+        }
+    }
+
+    /// Restores the committed I14.14 ownership projection before the Kernel
+    /// can accept work. Staged candidates are fenced first, and only the
+    /// durable committed rows are allowed into the immutable route snapshot.
+    /// No route identity is inferred here: the snapshot retains each
+    /// record's canonical ORS route-scope hash for a later typed admission
+    /// boundary.
+    pub(crate) fn recover_cutover_ownership(&self) -> Result<(), String> {
+        observe_recovery("kernel.recovery.cutover_ownership_requested", "attempt");
+        let outcome = (|| {
+            if let Err(error) = self
+                .ors
+                .reconcile_staged_cutover_ownership(eliot_ors::MAX_RECOVERY_PAGE)
+            {
+                if is_absent_cutover_ownership_table(&error) {
+                    observe_recovery("kernel.recovery.cutover_ownership_absent", "empty");
+                    return Ok(());
+                }
+                return Err(error.to_string());
+            }
+            observe_recovery("kernel.recovery.cutover_ownership_reconciled", "success");
+            let committed = self
+                .ors
+                .latest_committed_cutover_ownership(eliot_ors::MAX_RECOVERY_PAGE)
+                .map_err(|error| error.to_string())?;
+            let snapshot =
+                CutoverRouteSnapshot::rebuild(&committed).map_err(|error| error.to_string())?;
+            self.cutover_routes.swap_committed(snapshot);
+            observe_recovery("kernel.recovery.cutover_ownership_restored", "success");
+            Ok(())
+        })();
+        if outcome.is_err() {
+            observe_recovery("kernel.recovery.cutover_ownership_failed", "rejected");
+        }
+        outcome
     }
 
     pub(crate) fn recover(
@@ -213,6 +256,20 @@ impl OrsGenerationCoordinator {
     }
 }
 
+/// Older ORS databases predate the optional I14.14 ownership table. An absent
+/// table means there are no committed cutover rows to restore; it is distinct
+/// from a present table whose contents fail validation and must remain
+/// terminal. The ORS crate currently exposes the redb absence only through
+/// its typed storage message, so keep this compatibility test local to the
+/// Kernel recovery boundary.
+fn is_absent_cutover_ownership_table(error: &OrsError) -> bool {
+    matches!(
+        error,
+        OrsError::Storage(message)
+            if message.contains("Table 'ors_cutover_ownership_v1' does not exist")
+    )
+}
+
 pub(crate) fn update_handshake_policy(
     policy: &mut ServerHandshakePolicy,
     generations: &GenerationRouter,
@@ -312,6 +369,77 @@ mod generation_recovery_diagnostics_tests {
             tracing::subscriber::with_default(subscriber, run);
         }
         String::from_utf8_lossy(&sink.bytes.lock().expect("capture lock")).into_owned()
+    }
+
+    #[test]
+    fn startup_restores_committed_cutover_routes_only() {
+        let path = std::env::temp_dir().join(format!(
+            "eliot-kernel-cutover-recovery-{}-{}.redb",
+            std::process::id(),
+            unix_ms()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = Arc::new(RedbRecoveryStore::open(&path).expect("open ORS"));
+        let scope =
+            eliot_ors::CapabilityRouteScope::declare("mod-startup", "serve", "work", "effects")
+                .expect("route scope");
+        let route_scope_hash = scope.route_scope_hash.clone();
+        let record = eliot_ors::GenerationCutoverOwnership {
+            cutover_id: "cutover-startup-recovery".to_owned(),
+            candidate_artifact: eliot_ors::ModuleArtifactIdentity {
+                module_id: "mod-startup".to_owned(),
+                semver: "1.0.0".to_owned(),
+                artifact_hash: "a".repeat(64),
+                manifest_digest: "b".repeat(64),
+                layout_root: format!("modules/mod-startup/1.0.0/{}", "a".repeat(64)),
+            },
+            incumbent_artifact: None,
+            scope,
+            old_generation: None,
+            new_generation: eliot_contracts::ResourceGeneration::new(2).expect("generation"),
+            old_epoch: AuthorityEpoch::new(1).expect("epoch"),
+            new_epoch: AuthorityEpoch::new(2).expect("epoch"),
+            in_flight: Vec::new(),
+            migration: eliot_ors::StateMigrationDecision::RetainCompatible,
+            health_proof_ref: "health-proof-startup".to_owned(),
+            rollback_boundary: "forward-only".to_owned(),
+            unresolved_scopes: Vec::new(),
+            linearization_record_id: None,
+            state: GenerationCutoverState::Armed,
+        };
+        store
+            .stage_cutover_ownership(record)
+            .expect("stage cutover ownership");
+        store
+            .commit_cutover_ownership("cutover-startup-recovery")
+            .expect("commit cutover ownership");
+
+        let coordinator = OrsGenerationCoordinator::new(Arc::clone(&store));
+        coordinator
+            .recover_cutover_ownership()
+            .expect("restore committed cutover ownership");
+        assert_eq!(
+            coordinator.cutover_routes.admit(
+                &route_scope_hash,
+                eliot_contracts::ResourceGeneration::new(2).expect("generation"),
+                AuthorityEpoch::new(2).expect("epoch"),
+                "new-operation",
+            ),
+            eliot_ors::CutoverAdmission::AdmitCandidate
+        );
+        assert_eq!(
+            coordinator.cutover_routes.admit(
+                "unrecorded-route-scope",
+                eliot_contracts::ResourceGeneration::new(2).expect("generation"),
+                AuthorityEpoch::new(2).expect("epoch"),
+                "new-operation",
+            ),
+            eliot_ors::CutoverAdmission::RejectStale
+        );
+
+        drop(coordinator);
+        drop(store);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

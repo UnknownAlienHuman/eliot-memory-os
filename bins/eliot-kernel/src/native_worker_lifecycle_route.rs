@@ -445,6 +445,164 @@ fn check_split_epoch_agreement(
     Ok(())
 }
 
+struct SingleShapeResources {
+    installation_id: String,
+    worker_artifact_digest: String,
+    worker_config_digest: String,
+    protocol_version: String,
+    execution_unit_schema_version: u16,
+}
+
+fn single_shape_budget(
+    claim: &serde_json::Value,
+) -> Result<NativeWorkerClaimBudget, NativeWorkerRouteError> {
+    let budget_value = claim
+        .get("budget")
+        .filter(|budget| budget.is_object())
+        .ok_or(NativeWorkerRouteError::Shape { field: "budget" })?;
+    Ok(NativeWorkerClaimBudget {
+        context_tokens: require_nonzero_u64(budget_value, "context_tokens")?,
+        wall_time_ms: require_nonzero_u64(budget_value, "wall_time_ms")?,
+        output_bytes: require_nonzero_u64(budget_value, "output_bytes")?,
+        cost_microunits: require_nonzero_u64(budget_value, "cost_microunits")?,
+        max_depth: native_worker_json_u16(budget_value, "max_depth").and_then(|depth| {
+            if depth == 0 {
+                Err(NativeWorkerRouteError::Shape { field: "max_depth" })
+            } else {
+                Ok(depth)
+            }
+        })?,
+        max_descendants: native_worker_json_u32(budget_value, "max_descendants")?,
+    })
+}
+
+fn single_shape_fence_and_epoch(
+    claim: &serde_json::Value,
+) -> Result<(StateFence, EpochId), NativeWorkerRouteError> {
+    let fence_value = claim
+        .get("state_fence")
+        .cloned()
+        .ok_or(NativeWorkerRouteError::Shape {
+            field: "state_fence",
+        })?;
+    let fence: StateFence =
+        serde_json::from_value(fence_value).map_err(|_| NativeWorkerRouteError::Shape {
+            field: "state_fence",
+        })?;
+    check_authority_epoch_against_fence(claim, "authority_epoch", &fence)?;
+    let authority_epoch = match claim.get("authority_epoch") {
+        Some(value) if value.is_object() => {
+            serde_json::from_value(value.clone()).map_err(|_| NativeWorkerRouteError::Shape {
+                field: "authority_epoch",
+            })?
+        }
+        _ => fence.authority_epoch.clone(),
+    };
+    Ok((fence, authority_epoch))
+}
+
+fn single_shape_wire_and_executable(
+    claim: &serde_json::Value,
+) -> Result<(String, u16, Option<NativeWorkerExecutableBinding>), NativeWorkerRouteError> {
+    let wire_version = native_worker_json_u16(claim, "wire_version")?;
+    let executable_binding = match claim.get("executable_binding") {
+        None | Some(serde_json::Value::Null) => {
+            if wire_version == NATIVE_WORKER_CLAIM_WIRE_VERSION_V1 {
+                None
+            } else {
+                return Err(NativeWorkerRouteError::Shape {
+                    field: "executable_binding",
+                });
+            }
+        }
+        Some(join_value) => {
+            if wire_version == NATIVE_WORKER_CLAIM_WIRE_VERSION_V1 {
+                return Err(NativeWorkerRouteError::Shape {
+                    field: "executable_binding",
+                });
+            }
+            let join: NativeWorkerExecutableBinding = serde_json::from_value(join_value.clone())
+                .map_err(|_| NativeWorkerRouteError::Shape {
+                    field: "executable_binding",
+                })?;
+            Some(join)
+        }
+    };
+    let wire_id = match claim.get("wire_id").and_then(serde_json::Value::as_str) {
+        Some(wire) => {
+            if wire != NATIVE_WORKER_CLAIM_WIRE_ID {
+                return Err(NativeWorkerRouteError::Shape { field: "wire" });
+            }
+            wire.to_owned()
+        }
+        None => NATIVE_WORKER_CLAIM_WIRE_ID.to_owned(),
+    };
+    Ok((wire_id, wire_version, executable_binding))
+}
+
+fn single_shape_resources(
+    claim: &serde_json::Value,
+    registration: &serde_json::Value,
+) -> Result<SingleShapeResources, NativeWorkerRouteError> {
+    let installation_id = require_claim_text(registration, "installation_id")?;
+    if let Some(presented) = claim
+        .get("installation_id")
+        .and_then(serde_json::Value::as_str)
+        && presented != installation_id
+    {
+        return Err(NativeWorkerRouteError::Fence {
+            field: "installation_binding",
+        });
+    }
+    let worker_artifact_digest = require_digest(registration, "worker_artifact_digest")?;
+    if let Some(presented) = claim
+        .get("worker_artifact_digest")
+        .and_then(serde_json::Value::as_str)
+        && presented != worker_artifact_digest
+    {
+        return Err(NativeWorkerRouteError::Fence {
+            field: "artifact_binding",
+        });
+    }
+    let worker_config_digest = require_digest(registration, "worker_config_digest")?;
+    if let Some(presented) = claim
+        .get("worker_config_digest")
+        .and_then(serde_json::Value::as_str)
+        && presented != worker_config_digest
+    {
+        return Err(NativeWorkerRouteError::Fence {
+            field: "config_binding",
+        });
+    }
+    let protocol_version = require_claim_text(registration, "protocol_version")?;
+    if let Some(presented) = claim
+        .get("protocol_version")
+        .and_then(serde_json::Value::as_str)
+        && presented != protocol_version
+    {
+        return Err(NativeWorkerRouteError::Shape {
+            field: "protocol_version",
+        });
+    }
+    let execution_unit_schema_version =
+        native_worker_json_u16(registration, "execution_unit_schema_version")?;
+    if claim.get("execution_unit_schema_version").is_some() {
+        let presented = native_worker_json_u16(claim, "execution_unit_schema_version")?;
+        if presented != execution_unit_schema_version {
+            return Err(NativeWorkerRouteError::Shape {
+                field: "execution_unit_schema_version",
+            });
+        }
+    }
+    Ok(SingleShapeResources {
+        installation_id,
+        worker_artifact_digest,
+        worker_config_digest,
+        protocol_version,
+        execution_unit_schema_version,
+    })
+}
+
 /// Exact lifecycle binding every heartbeat/checkpoint/result/cancel message
 /// must carry (Wave-A `NativeLifecycleBinding` projection).
 #[derive(Clone, Debug)]
@@ -861,10 +1019,10 @@ impl KernelComposition {
     ) -> Result<(String, String, u64), NativeWorkerRouteError> {
         // `wire_id` is required on the old wire and implicit on the single
         // shape (worker-core carries no wire id; the route pins it).
-        if let Some(wire) = payload.get("wire_id").and_then(serde_json::Value::as_str) {
-            if wire != NATIVE_WORKER_CLAIM_WIRE_ID {
-                return Err(NativeWorkerRouteError::Shape { field: "wire" });
-            }
+        if let Some(wire) = payload.get("wire_id").and_then(serde_json::Value::as_str)
+            && wire != NATIVE_WORKER_CLAIM_WIRE_ID
+        {
+            return Err(NativeWorkerRouteError::Shape { field: "wire" });
         }
         let wire_version = native_worker_json_u16(payload, "wire_version")?;
         if wire_version != NATIVE_WORKER_CLAIM_WIRE_VERSION
@@ -877,12 +1035,11 @@ impl KernelComposition {
         if let Some(protocol) = payload
             .get("protocol_version")
             .and_then(serde_json::Value::as_str)
+            && protocol != NATIVE_WORKER_PROTOCOL_VERSION
         {
-            if protocol != NATIVE_WORKER_PROTOCOL_VERSION {
-                return Err(NativeWorkerRouteError::Shape {
-                    field: "protocol_version",
-                });
-            }
+            return Err(NativeWorkerRouteError::Shape {
+                field: "protocol_version",
+            });
         }
         if let Some(schema) = payload.get("execution_unit_schema_version") {
             let version = native_worker_json_u16(payload, "execution_unit_schema_version")?;
@@ -1019,151 +1176,21 @@ impl KernelComposition {
         claim: &serde_json::Value,
         registration: &serde_json::Value,
     ) -> Result<NativeWorkerClaimRequest, NativeWorkerRouteError> {
-        let budget_value = claim
-            .get("budget")
-            .filter(|budget| budget.is_object())
-            .ok_or(NativeWorkerRouteError::Shape { field: "budget" })?;
-        let budget = NativeWorkerClaimBudget {
-            context_tokens: require_nonzero_u64(budget_value, "context_tokens")?,
-            wall_time_ms: require_nonzero_u64(budget_value, "wall_time_ms")?,
-            output_bytes: require_nonzero_u64(budget_value, "output_bytes")?,
-            cost_microunits: require_nonzero_u64(budget_value, "cost_microunits")?,
-            max_depth: native_worker_json_u16(budget_value, "max_depth").and_then(|depth| {
-                if depth == 0 {
-                    Err(NativeWorkerRouteError::Shape { field: "max_depth" })
-                } else {
-                    Ok(depth)
-                }
-            })?,
-            max_descendants: native_worker_json_u32(budget_value, "max_descendants")?,
-        };
-        let fence_value =
-            claim
-                .get("state_fence")
-                .cloned()
-                .ok_or(NativeWorkerRouteError::Shape {
-                    field: "state_fence",
-                })?;
-        let fence: StateFence =
-            serde_json::from_value(fence_value).map_err(|_| NativeWorkerRouteError::Shape {
-                field: "state_fence",
-            })?;
-        check_authority_epoch_against_fence(claim, "authority_epoch", &fence)?;
-        // Exact-tuple authority: object contour carries the full `EpochId`;
-        // scalar contour carries only the sequence (lineage via the fence).
-        let authority_epoch = match claim.get("authority_epoch") {
-            Some(value) if value.is_object() => {
-                serde_json::from_value(value.clone()).map_err(|_| {
-                    NativeWorkerRouteError::Shape {
-                        field: "authority_epoch",
-                    }
-                })?
-            }
-            _ => fence.authority_epoch.clone(),
-        };
-        let wire_version = native_worker_json_u16(claim, "wire_version")?;
-        let executable_binding = match claim.get("executable_binding") {
-            None | Some(serde_json::Value::Null) => {
-                if wire_version == NATIVE_WORKER_CLAIM_WIRE_VERSION_V1 {
-                    None
-                } else {
-                    return Err(NativeWorkerRouteError::Shape {
-                        field: "executable_binding",
-                    });
-                }
-            }
-            Some(join_value) => {
-                if wire_version == NATIVE_WORKER_CLAIM_WIRE_VERSION_V1 {
-                    return Err(NativeWorkerRouteError::Shape {
-                        field: "executable_binding",
-                    });
-                }
-                let join: NativeWorkerExecutableBinding =
-                    serde_json::from_value(join_value.clone()).map_err(|_| {
-                        NativeWorkerRouteError::Shape {
-                            field: "executable_binding",
-                        }
-                    })?;
-                Some(join)
-            }
-        };
-        // Wire id: pinned on the single shape, checked on the old wire.
-        let wire_id = match claim.get("wire_id").and_then(serde_json::Value::as_str) {
-            Some(wire) => {
-                if wire != NATIVE_WORKER_CLAIM_WIRE_ID {
-                    return Err(NativeWorkerRouteError::Shape { field: "wire" });
-                }
-                wire.to_owned()
-            }
-            None => NATIVE_WORKER_CLAIM_WIRE_ID.to_owned(),
-        };
-        // Resource envelope: projected from the registration on the single
-        // shape; on the old wire the claim duplicates it and must agree.
-        let installation_id = require_claim_text(registration, "installation_id")?;
-        if let Some(presented) = claim
-            .get("installation_id")
-            .and_then(serde_json::Value::as_str)
-        {
-            if presented != installation_id {
-                return Err(NativeWorkerRouteError::Fence {
-                    field: "installation_binding",
-                });
-            }
-        }
-        let worker_artifact_digest = require_digest(registration, "worker_artifact_digest")?;
-        if let Some(presented) = claim
-            .get("worker_artifact_digest")
-            .and_then(serde_json::Value::as_str)
-        {
-            if presented != worker_artifact_digest {
-                return Err(NativeWorkerRouteError::Fence {
-                    field: "artifact_binding",
-                });
-            }
-        }
-        let worker_config_digest = require_digest(registration, "worker_config_digest")?;
-        if let Some(presented) = claim
-            .get("worker_config_digest")
-            .and_then(serde_json::Value::as_str)
-        {
-            if presented != worker_config_digest {
-                return Err(NativeWorkerRouteError::Fence {
-                    field: "config_binding",
-                });
-            }
-        }
-        let protocol_version = require_claim_text(registration, "protocol_version")?;
-        if let Some(presented) = claim
-            .get("protocol_version")
-            .and_then(serde_json::Value::as_str)
-        {
-            if presented != protocol_version {
-                return Err(NativeWorkerRouteError::Shape {
-                    field: "protocol_version",
-                });
-            }
-        }
-        let execution_unit_schema_version =
-            native_worker_json_u16(registration, "execution_unit_schema_version")?;
-        if claim.get("execution_unit_schema_version").is_some() {
-            let presented = native_worker_json_u16(claim, "execution_unit_schema_version")?;
-            if presented != execution_unit_schema_version {
-                return Err(NativeWorkerRouteError::Shape {
-                    field: "execution_unit_schema_version",
-                });
-            }
-        }
+        let budget = single_shape_budget(claim)?;
+        let (fence, authority_epoch) = single_shape_fence_and_epoch(claim)?;
+        let (wire_id, wire_version, executable_binding) = single_shape_wire_and_executable(claim)?;
+        let resources = single_shape_resources(claim, registration)?;
         let mut request = NativeWorkerClaimRequest {
             wire_id,
             wire_version,
             claim_id: require_op_id(claim, "claim_id")?,
             registration_id: require_op_id(claim, "registration_id")?,
             worker_generation: require_nonzero_u64(claim, "worker_generation")?,
-            installation_id,
-            worker_artifact_digest,
-            worker_config_digest,
-            protocol_version,
-            execution_unit_schema_version,
+            installation_id: resources.installation_id,
+            worker_artifact_digest: resources.worker_artifact_digest,
+            worker_config_digest: resources.worker_config_digest,
+            protocol_version: resources.protocol_version,
+            execution_unit_schema_version: resources.execution_unit_schema_version,
             parent_job_id: require_claim_text(claim, "parent_job_id")?,
             task_id: require_claim_text(claim, "task_id")?,
             work_scope_id: require_claim_text(claim, "work_scope_id")?,
@@ -1192,18 +1219,14 @@ impl KernelComposition {
                 .map_err(|_| NativeWorkerRouteError::Shape {
                     field: "request_digest",
                 })?;
-        // Old wire carries its own envelope digest: it must equal the
-        // recomputed canonical digest, otherwise a tampered presentation
-        // fails here before any owner sees it.
         if let Some(presented) = claim
             .get("request_digest")
             .and_then(serde_json::Value::as_str)
+            && presented != computed
         {
-            if presented != computed {
-                return Err(NativeWorkerRouteError::Shape {
-                    field: "request_digest",
-                });
-            }
+            return Err(NativeWorkerRouteError::Shape {
+                field: "request_digest",
+            });
         }
         request.request_digest = computed;
         Ok(request)
@@ -1436,9 +1459,8 @@ impl KernelComposition {
                         });
                     }
                 }
-                (None, None) => {}
                 // Single shape: claim omits the envelope by construction.
-                (None, Some(_)) => {}
+                (None, None | Some(_)) => {}
                 (Some(_), None) => {
                     return Err(NativeWorkerRouteError::Fence {
                         field: "installation_binding",
@@ -1456,9 +1478,8 @@ impl KernelComposition {
                         return Err(NativeWorkerRouteError::Fence { field: fence_field });
                     }
                 }
-                (None, None) => {}
                 // Single shape: claim omits the envelope by construction.
-                (None, Some(_)) => {}
+                (None, None | Some(_)) => {}
                 (Some(_), None) => {
                     return Err(NativeWorkerRouteError::Fence { field: fence_field });
                 }
@@ -2511,12 +2532,8 @@ mod single_shape_proof {
     /// executable gate reaches its typed currentness arm instead of stopping
     /// at a stale envelope digest.
     fn r1_rebind(request: &mut NativeWorkerClaimRequest) {
-        request.binding_digest = request
-            .compute_binding_digest()
-            .expect("rebind binding");
-        request.request_digest = request
-            .canonical_request_digest()
-            .expect("rebind envelope");
+        request.binding_digest = request.compute_binding_digest().expect("rebind binding");
+        request.request_digest = request.canonical_request_digest().expect("rebind envelope");
     }
 
     /// R1 Governor-sourced digest feed, admit path (Implements #22): the
@@ -2599,8 +2616,9 @@ mod single_shape_proof {
             .process_invocation_digest = mutated_digest;
         r1_rebind(&mut mutated);
         mutated.validate().expect("mutated stays shape-valid");
-        let error = KernelComposition::enforce_claim_executable_binding(&mutated, &expectation, now)
-            .expect_err("mutated digest must not dispatch");
+        let error =
+            KernelComposition::enforce_claim_executable_binding(&mutated, &expectation, now)
+                .expect_err("mutated digest must not dispatch");
         match error {
             NativeWorkerRouteError::Conflict(conflict) => {
                 assert_eq!(conflict.identity, "claim-r1-gate-1");
@@ -2629,7 +2647,10 @@ mod single_shape_proof {
         )
         .expect("None expectation builds by construction");
         assert!(
-            none_expectation.current.process_invocation_digest.is_empty(),
+            none_expectation
+                .current
+                .process_invocation_digest
+                .is_empty(),
             "wire-v1 placeholders stay empty by construction"
         );
         assert!(
@@ -2643,12 +2664,9 @@ mod single_shape_proof {
         old_wire.wire_version = NATIVE_WORKER_CLAIM_WIRE_VERSION_V1;
         old_wire.executable_binding = None;
         r1_rebind(&mut old_wire);
-        let old_error = KernelComposition::enforce_claim_executable_binding(
-            &old_wire,
-            &none_expectation,
-            now,
-        )
-        .expect_err("old wire must not dispatch");
+        let old_error =
+            KernelComposition::enforce_claim_executable_binding(&old_wire, &none_expectation, now)
+                .expect_err("old wire must not dispatch");
         assert!(
             matches!(
                 old_error,

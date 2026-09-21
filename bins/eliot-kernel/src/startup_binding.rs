@@ -330,9 +330,12 @@ where
             && testd_artifact_flag == "--testd-artifact-sha256"
             && native_worker_artifact_flag == "--native-worker-artifact-sha256"
             && daemon_flag == "--eliotd-descriptor"
-            && daemon_digest_flag == "--eliotd-descriptor-sha256" => Err(invalid_input(
-            "Host launch must inject the exact Doctor executable path bound to the digested doctor role",
-        )),
+            && daemon_digest_flag == "--eliotd-descriptor-sha256" =>
+        {
+            Err(invalid_input(
+                "Host launch must inject the exact Doctor executable path bound to the digested doctor role",
+            ))
+        }
         _ => Err(invalid_input(
             "expected the exact mandatory 24-value Host launch contour",
         )),

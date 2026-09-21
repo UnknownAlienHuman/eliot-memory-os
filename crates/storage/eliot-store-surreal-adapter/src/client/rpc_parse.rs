@@ -24,10 +24,10 @@ struct RpcErrorBody {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct ProviderVersion {
-    pub(super) major: u16,
-    pub(super) minor: u16,
-    pub(super) patch: u16,
+pub(crate) struct ProviderVersion {
+    pub(crate) major: u16,
+    pub(crate) minor: u16,
+    pub(crate) patch: u16,
 }
 
 #[derive(Deserialize)]
@@ -38,7 +38,7 @@ struct ProviderVersionObject {
     timestamp: String,
 }
 
-pub(super) fn provider_version_from_rpc(value: &Value) -> Result<ProviderVersion, AdapterError> {
+pub(crate) fn provider_version_from_rpc(value: &Value) -> Result<ProviderVersion, AdapterError> {
     match value {
         Value::String(version) => {
             let numeric = version
