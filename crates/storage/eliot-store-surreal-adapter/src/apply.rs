@@ -32,6 +32,7 @@ use serde_json::{Map, Value, json};
 mod atomic_write;
 mod empty_migration;
 mod genesis;
+pub(crate) mod surreal_notification;
 #[path = "health_probe.rs"]
 mod health_probe;
 mod read_boundary;
@@ -1057,6 +1058,16 @@ async fn apply_with_retry(
             erasure_dispatched = true;
         }
 
+        // Issue #1780: admitted notification-state legs compute their record
+        // writes here, after every fallible precondition and before receipt
+        // planning. Each attempt recomputes from fresh rows (no dispatched
+        // flag): the in-transaction revision compare-and-set arbitrates
+        // concurrent writers, and drift retries through allocation
+        // contention, never as a semantic conflict.
+        let notification_writes =
+            surreal_notification::prepare_notification_writes(db, &adapter.config, &transition)
+                .await?;
+
         let first_attempt = semantic_plan.is_none();
         let plan = if let Some(semantic) = &semantic_plan {
             plan::recompute_allocation(semantic, next_commit_sequence, next_outbox_sequence)?
@@ -1094,6 +1105,7 @@ async fn apply_with_retry(
             &current_revisions,
             &current_orderings,
             lane,
+            &notification_writes,
         )
         .await
         {
@@ -2565,6 +2577,7 @@ mod concurrent_allocation_tests {
                 &[],
                 &[],
                 atomic_write::TxLane::PooledWrite,
+                &[],
             )
             .await
             .expect("first writer commits");
@@ -2584,6 +2597,7 @@ mod concurrent_allocation_tests {
                 &[],
                 &[],
                 atomic_write::TxLane::PooledWrite,
+                &[],
             )
             .await
             {
@@ -2626,6 +2640,7 @@ mod concurrent_allocation_tests {
                 &[],
                 &[],
                 atomic_write::TxLane::PooledWrite,
+                &[],
             )
             .await
             .expect("bounded retry commits");

@@ -16,9 +16,11 @@
 
 #![forbid(unsafe_code)]
 
+mod notification_projection;
 mod swarm_command;
 mod swarm_read;
 
+pub use notification_projection::*;
 pub use swarm_command::*;
 pub use swarm_read::*;
 

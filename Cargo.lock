@@ -575,8 +575,10 @@ dependencies = [
  "anyhow",
  "clap",
  "eliot-agent-api",
+ "eliot-backup",
  "eliot-bootstrap",
  "eliot-cli",
+ "eliot-config",
  "eliot-contracts",
  "eliot-doctor",
  "eliot-governor",
@@ -658,6 +660,7 @@ dependencies = [
  "eliot-process",
  "eliot-protocol",
  "eliot-skill",
+ "eliot-types",
  "serde",
  "serde_json",
  "thiserror",
@@ -1007,6 +1010,7 @@ dependencies = [
  "eliot-context-contracts",
  "eliot-contracts",
  "eliot-evidence",
+ "eliot-observation-contracts",
  "eliot-receipts",
  "serde",
  "thiserror",
@@ -1036,6 +1040,7 @@ dependencies = [
  "eliot-agent-contracts",
  "eliot-contracts",
  "eliot-evidence",
+ "eliot-observation-contracts",
  "eliot-protocol",
  "eliot-receipts",
  "schemars",
@@ -1075,6 +1080,7 @@ dependencies = [
  "eliot-contracts",
  "eliot-evaluation-contracts",
  "eliot-evidence",
+ "eliot-kernel-core",
  "eliot-observation-contracts",
  "eliot-protocol",
  "eliot-receipts",
@@ -1479,6 +1485,7 @@ dependencies = [
  "eliot-contracts",
  "eliot-dreamer-contracts",
  "eliot-evidence",
+ "eliot-security-contracts",
  "schemars",
  "serde",
 ]
@@ -1510,7 +1517,10 @@ dependencies = [
 name = "eliot-dreamer-probe-plan"
 version = "0.1.0"
 dependencies = [
+ "eliot-contracts",
  "eliot-dreamer-contracts",
+ "eliot-evaluation-contracts",
+ "eliot-receipts",
  "schemars",
  "serde",
 ]
@@ -1935,6 +1945,7 @@ dependencies = [
  "eliot-instrument-rustfmt",
  "eliot-instrument-scip",
  "eliot-process",
+ "eliot-process-executor",
  "serde_json",
  "thiserror",
 ]
@@ -2317,6 +2328,8 @@ dependencies = [
 name = "eliot-notify-core"
 version = "0.1.0"
 dependencies = [
+ "eliot-contracts",
+ "eliot-kernel-core",
  "eliot-observation-contracts",
  "eliot-platform",
  "eliot-receipts",
@@ -2785,6 +2798,7 @@ dependencies = [
  "eliot-contracts",
  "eliot-epistemic-contracts",
  "eliot-evidence",
+ "eliot-kernel-core",
  "eliot-receipts",
  "eliot-store-api",
  "schemars",
@@ -2826,6 +2840,7 @@ dependencies = [
  "eliot-contracts",
  "eliot-epistemic-contracts",
  "eliot-evidence",
+ "eliot-kernel-core",
  "eliot-platform",
  "eliot-platform-windows",
  "eliot-protocol",
@@ -3074,6 +3089,7 @@ dependencies = [
  "eliot-agent-contracts",
  "eliot-agent-coordinator",
  "eliot-authority",
+ "eliot-config",
  "eliot-contracts",
  "eliot-controlboard",
  "eliot-doctor-core",

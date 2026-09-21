@@ -59,11 +59,20 @@ pub enum DeliveryState {
     /// Latest attempt was delivered without resolving the record.
     Delivered,
     /// Latest attempt failed and remains visible to the operator.
-    Failed { reason: String },
+    Failed {
+        /// Provider-reported failure explanation.
+        reason: String,
+    },
     /// Some delivery evidence is known while named gaps remain.
-    Partial { reason: String },
+    Partial {
+        /// Explanation of the delivery evidence that remains missing.
+        reason: String,
+    },
     /// Delivery crossed an uncertain boundary and needs reconciliation.
-    Unknown { reason: String },
+    Unknown {
+        /// Explanation of the boundary whose outcome remains uncertain.
+        reason: String,
+    },
 }
 
 impl DeliveryState {
@@ -159,17 +168,29 @@ pub struct ResolutionAuthorization {
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NotificationDraft {
+    /// Stable identity of the notification event.
     pub notification_id: PlatformHandle,
+    /// Human-control severity assigned by the producing owner.
     pub severity: NotificationSeverity,
+    /// Short operator-facing subject.
     pub subject: String,
+    /// Operator-facing summary of the required attention.
     pub summary: String,
+    /// Stable evidence handles supporting the notification.
     pub evidence_handles: Vec<String>,
+    /// Work or resource scope affected by the notification.
     pub affected_scope: String,
+    /// Canonical lifecycle owner responsible for the attention item.
     pub owner: String,
+    /// Action the operator is required to take.
     pub required_action: String,
+    /// Optional bounded deadline or review reference.
     pub deadline_or_review: Option<DeadlineOrReview>,
+    /// Stable deduplication key for coalescing repeated events.
     pub dedup_key: String,
+    /// Channels on which the owner may deliver the notification.
     pub delivery_channels: Vec<DeliveryChannel>,
+    /// Full state fence under which the draft was admitted.
     pub state_fence: StateFence,
 }
 
@@ -208,23 +229,37 @@ impl NotificationDraft {
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Notification {
+    /// Stable identity of the canonical notification event.
     pub notification_id: PlatformHandle,
+    /// Human-control severity retained from the admitted draft.
     pub severity: NotificationSeverity,
+    /// Short operator-facing subject.
     pub subject: String,
+    /// Operator-facing summary of the required attention.
     pub summary: String,
+    /// Stable evidence handles supporting the notification.
     pub evidence_handles: Vec<String>,
+    /// Work or resource scope affected by the notification.
     pub affected_scope: String,
+    /// Canonical lifecycle owner responsible for the attention item.
     pub owner: String,
+    /// Action the operator is required to take.
     pub required_action: String,
+    /// Optional bounded deadline or review reference.
     pub deadline_or_review: Option<DeadlineOrReview>,
     /// Stable key owning exactly one canonical record.
     pub dedup_key: String,
+    /// Channels on which delivery has been requested or attempted.
     pub delivery_channels: Vec<DeliveryChannel>,
     /// Count of events coalesced under the dedup key.
     pub occurrences: u64,
+    /// Latest canonical delivery observation.
     pub delivery: DeliveryState,
+    /// Optional operator acknowledgement that suppresses repeated toasts.
     pub acknowledgement: Option<Acknowledgement>,
+    /// Optional protected evidence-backed terminal disposition.
     pub resolution_ref: Option<ResolutionRef>,
+    /// Full state fence under which the record is current.
     pub state_fence: StateFence,
     /// Monotonic owner revision, also used for projection/readback cursors.
     pub revision: u64,
@@ -304,24 +339,34 @@ impl Notification {
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum NotificationError {
     #[error("invalid field: {0}")]
+    /// A bounded field or shape validation failed.
     InvalidField(&'static str),
     #[error("unknown notification")]
+    /// A lifecycle mutation addressed no canonical record.
     UnknownNotification,
     #[error("notification identity conflicts with the existing dedup record")]
+    /// The notification ID or draft conflicts with an existing dedup record.
     IdentityConflict,
     #[error("resolution requires evidence")]
+    /// A resolution omitted supporting evidence handles.
     ResolutionRequiresEvidence,
     #[error("resolution requires a protected authority receipt")]
+    /// A resolution omitted its protected authority receipt.
     ResolutionRequiresAuthorization,
     #[error("resolution receipt is invalid or misbound")]
+    /// The supplied resolution receipt failed structural or fence validation.
     InvalidResolutionReceipt,
     #[error("resolution authority cannot perform a reversible mutation")]
+    /// The supplied authority cannot authorize this lifecycle transition.
     ResolutionAuthorityInsufficient,
     #[error("resolution evidence is not bound by the authority receipt")]
+    /// Resolution evidence is absent from the receipt's artifact bindings.
     ResolutionEvidenceUnbound,
     #[error("resolution fence does not match the canonical record")]
+    /// The resolution receipt is from a different state fence.
     ResolutionFenceMismatch,
     #[error("record is already resolved")]
+    /// A terminal record cannot be resolved a second time.
     AlreadyResolved,
 }
 
