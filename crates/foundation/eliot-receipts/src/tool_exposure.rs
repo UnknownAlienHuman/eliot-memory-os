@@ -119,6 +119,11 @@ pub struct ToolCallIntent {
 impl ToolCallIntent {
     /// Validates every intent field without executing anything.
     ///
+    /// Text fields are stored trimmed so materially identical deltas with
+    /// stray surrounding whitespace still compare equal in
+    /// [`detect_repeat_without_progress`] instead of evading the
+    /// loop/no-progress signal.
+    ///
     /// # Errors
     ///
     /// Returns an error when any required field is blank, carries control
@@ -132,12 +137,12 @@ impl ToolCallIntent {
         operation_identity: Option<String>,
     ) -> Result<Self, ToolExposureError> {
         let intent = Self {
-            expected_delta: expected_delta.into(),
-            cheaper_route_insufficient: cheaper_route_insufficient.into(),
-            budget: budget.into(),
-            stop_conditions: stop_conditions.into(),
-            retry_conditions: retry_conditions.into(),
-            operation_identity,
+            expected_delta: expected_delta.into().trim().to_owned(),
+            cheaper_route_insufficient: cheaper_route_insufficient.into().trim().to_owned(),
+            budget: budget.into().trim().to_owned(),
+            stop_conditions: stop_conditions.into().trim().to_owned(),
+            retry_conditions: retry_conditions.into().trim().to_owned(),
+            operation_identity: operation_identity.map(|identity| identity.trim().to_owned()),
         };
         intent.validate()?;
         Ok(intent)
@@ -489,6 +494,18 @@ mod tests {
             Some(intent("a new decision delta")?),
         );
         assert_eq!(detect_repeat_without_progress(&first, &fresh_delta), None);
+
+        // Stray surrounding whitespace does not evade the loop signal:
+        // deltas are stored trimmed at construction.
+        let padded_delta = request(
+            ToolCallClass::BroadSearch,
+            &inputs,
+            Some(intent("  candidate evidence delta\n")?),
+        );
+        assert_eq!(
+            detect_repeat_without_progress(&first, &padded_delta),
+            Some(LoopSignal::Loop)
+        );
 
         let changed_inputs = request(
             ToolCallClass::BroadSearch,
