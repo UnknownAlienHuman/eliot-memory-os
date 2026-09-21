@@ -24,6 +24,23 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+mod isolated_restore;
+mod portable_recovery;
+mod product_command;
+
+pub use isolated_restore::{
+    CutoverAuthorization, CutoverReceipt, IsolatedRestorePlan, IsolatedRoot, authorize_cutover,
+    plan_isolated_restore,
+};
+pub use portable_recovery::{
+    BlobRestorationReceipt, FullRecoveryPackage, MAX_WRAPPED_KEY_BYTES, WrappedKeyEntry,
+    WrappedKeyManifest, issue_full_recovery, issue_restoration_receipts, verify_key_coverage,
+};
+pub use product_command::{
+    BackupCreateArgs, BackupCreatePreview, RestorePreview, parse_backup_class,
+    preview_backup_create, preview_restore,
+};
+
 /// Stable identity of the exchange-format contract.
 pub const CONTRACT_NAME: &str = "eliot.storage.backup";
 /// Current logical exchange format.
