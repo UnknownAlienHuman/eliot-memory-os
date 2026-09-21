@@ -41,6 +41,7 @@ mod store_write_reservation;
 #[cfg(test)]
 mod store_write_reservation_tests;
 mod testd_front_door;
+mod user_automation;
 mod write_coordinator;
 
 pub use capacity_evidence::{
@@ -146,6 +147,12 @@ pub use testd_front_door::{
     TestdAdmissionResponse, advertise_testd_admission, advertise_testd_admission_when_composed,
     handle_testd_admission_attempt, handle_testd_cancellation, is_testd_diagnosis_only_envelope,
     reconcile_testd_admission, reconcile_testd_delivery, route_testd_admission,
+};
+pub use user_automation::{
+    USER_AUTOMATION_SERVICE_CONTRACT_NAME, USER_AUTOMATION_SERVICE_CONTRACT_VERSION,
+    UserAutomationMutationResult, UserAutomationReadResult, UserAutomationService,
+    UserAutomationServiceError, UserAutomationServiceRequest, UserAutomationStoreOutcome,
+    UserAutomationStorePort, UserAutomationStoreRequest, UserAutomationStoreResponse,
 };
 pub use write_coordinator::{
     CoordinatorError, ScopeExecutionGuard, WriteCoordinator, WriteCoordinatorConfig,

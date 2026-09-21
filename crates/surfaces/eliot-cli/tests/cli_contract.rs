@@ -22,6 +22,10 @@ fn request_json(command: &str) -> Value {
             "repo_root": "C:\\Development\\Rust\\projects\\eliot-memory-os"
         }),
         "doctor-integration" => json!({"kind": "doctor_integration", "profile": "default"}),
+        "user-automation" => json!({
+            "kind": "user_automation",
+            "operation": {"kind": "list", "include_retired": false}
+        }),
         _ => json!({
             "kind": "system_snapshot",
             "repo_root": "C:\\Development\\Rust\\projects\\eliot-memory-os",
@@ -82,14 +86,16 @@ fn request(command: &str) -> CommandRequest {
 fn help_and_schema_are_deterministic_projections_of_one_catalogue() {
     let catalogue = CommandCatalogue::current();
     must(catalogue.validate());
-    assert_eq!(catalogue.commands().len(), 25);
+    assert_eq!(catalogue.commands().len(), 26);
     assert_eq!(
         catalogue.commands().first().map(|spec| spec.usage),
         Some("eliot system snapshot --repo-root <ABSOLUTE> --output <ABSOLUTE>")
     );
     assert_eq!(
         catalogue.commands().last().map(|spec| spec.usage),
-        Some("eliot maintenance run")
+        Some(
+            "eliot user-automation <create|list|status|history|pause|resume|edit|run-now|remove|inspect-last-failure>",
+        )
     );
     assert!(
         catalogue
@@ -178,6 +184,24 @@ fn bootstrap_brief_is_admitted_with_candidate_ceiling_and_explicit_roots() {
     assert!(matches!(
         request.arguments,
         CommandArguments::BootstrapBrief { .. }
+    ));
+}
+
+#[test]
+fn user_automation_operation_is_typed_and_remains_plan_gap_until_kernel_route() {
+    let catalogue = CommandCatalogue::current();
+    let request = request("user-automation");
+    assert!(request.validate().is_ok());
+    assert!(matches!(
+        request.arguments,
+        CommandArguments::UserAutomation { .. }
+    ));
+    let response = must(catalogue.execute(&request));
+    assert!(matches!(
+        response.result,
+        CommandResult::Unavailable {
+            reason: UnavailableReason::PlanGap { .. }
+        }
     ));
 }
 
