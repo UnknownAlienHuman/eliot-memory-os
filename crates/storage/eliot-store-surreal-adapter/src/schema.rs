@@ -48,6 +48,19 @@ pub(crate) mod table {
     /// bytes, the owner revision, and the admission fence. Rewrites with
     /// different bytes fail closed; create races converge through retry.
     pub(crate) const RESOURCE_SNAPSHOT: &str = "resource_snapshot";
+    /// Immutable automation revision row per automation + revision
+    /// (issue #1779). One row per joined `(automation_id, revision)` key
+    /// carrying the verbatim Kernel-owned revision document. Create-only;
+    /// divergent rewrites fail closed.
+    pub(crate) const AUTOMATION_REVISION: &str = "automation_revision";
+    /// Current automation pointer per automation (issue #1779). One row
+    /// per `automation_id` carrying the current revision plus the closed
+    /// admission state. Compare-and-set on the observed revision.
+    pub(crate) const AUTOMATION_CURRENT: &str = "automation_current";
+    /// Automation invocation row per stable occurrence (issue #1779). One
+    /// row per `occurrence_id` carrying the verbatim invocation document.
+    /// Create-only; divergent rewrites fail closed.
+    pub(crate) const AUTOMATION_INVOCATION: &str = "automation_invocation";
 }
 
 /// Record key of the single canonical fence/sequence row.
@@ -217,6 +230,44 @@ DEFINE FIELD state_fence ON resource_snapshot TYPE object;
 DEFINE FIELD scope_id ON resource_snapshot TYPE string;
 DEFINE FIELD task_id ON resource_snapshot TYPE option<string>;
 DEFINE INDEX snapshot_uri ON resource_snapshot FIELDS uri UNIQUE;
+";
+
+/// Automation revision, pointer, and invocation tables (issue #1779).
+/// Additive delta in the notification style: `automation_revision`
+/// carries one immutable row per joined automation/revision key with the
+/// verbatim revision document; `automation_current` carries one
+/// compare-and-set pointer per automation with the current revision and
+/// the closed admission state; `automation_invocation` carries one
+/// create-only row per occurrence identity with the verbatim invocation
+/// document. Applied explicitly where the owning slice proves it; never
+/// executed implicitly by the adapter.
+#[allow(dead_code)]
+pub(crate) const AUTOMATION_TABLES_DDL: &str = r"
+DEFINE TABLE automation_revision SCHEMALESS;
+DEFINE FIELD automation_id ON automation_revision TYPE string;
+DEFINE FIELD revision ON automation_revision TYPE string;
+DEFINE FIELD revision_json ON automation_revision TYPE string;
+DEFINE FIELD state_fence ON automation_revision TYPE object;
+DEFINE FIELD scope_id ON automation_revision TYPE string;
+DEFINE FIELD task_id ON automation_revision TYPE option<string>;
+
+DEFINE TABLE automation_current SCHEMALESS;
+DEFINE FIELD automation_id ON automation_current TYPE string;
+DEFINE FIELD revision ON automation_current TYPE string;
+DEFINE FIELD configuration_state ON automation_current TYPE string;
+DEFINE FIELD state_fence ON automation_current TYPE object;
+DEFINE FIELD scope_id ON automation_current TYPE string;
+DEFINE FIELD task_id ON automation_current TYPE option<string>;
+DEFINE INDEX automation_pointer ON automation_current FIELDS automation_id UNIQUE;
+
+DEFINE TABLE automation_invocation SCHEMALESS;
+DEFINE FIELD occurrence_id ON automation_invocation TYPE string;
+DEFINE FIELD automation_id ON automation_invocation TYPE string;
+DEFINE FIELD invocation_json ON automation_invocation TYPE string;
+DEFINE FIELD state_fence ON automation_invocation TYPE object;
+DEFINE FIELD scope_id ON automation_invocation TYPE string;
+DEFINE FIELD task_id ON automation_invocation TYPE option<string>;
+DEFINE INDEX invocation_occurrence ON automation_invocation FIELDS occurrence_id UNIQUE;
 ";
 
 pub(crate) const SCHEMA_DDL_V2: &str = r"
