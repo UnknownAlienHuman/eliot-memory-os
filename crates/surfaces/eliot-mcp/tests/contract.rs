@@ -12,8 +12,8 @@ use eliot_mcp::{
     CANONICAL_TOOL_NAMES, CoordinateInput, DurableJobHandle, FinishAttemptDraft, InitializeRequest,
     JobPresentation, KernelGovernorPort, LoopbackProfile, McpCore, NoProviderPort, ObserveInput,
     PacketInput, PortFailure, PortProjection, ProjectionKind, QueryInput, ResponseKind, StateInput,
-    ToolRequest, TransportProfile, TransportRequestContext, VerifyInput, canonical_schema,
-    canonical_tool_schemas,
+    ToolRequest, TransportProfile, TransportRequestContext, VerifyInput, canonical_known_tools,
+    canonical_schema, canonical_tool_schemas, known_tool_profile, routing_decision,
 };
 use eliot_protocol::HARD_STRUCTURED_RESPONSE_BYTES;
 use eliot_receipts::{ProofCeiling, SessionBinding};
@@ -27,9 +27,18 @@ use eliot_source_assurance::{
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+/// Structured lineage-aware authority epoch (post-#1657 wire shape; the
+/// scalar-epoch import boundary is deleted, so fixtures carry the tuple).
+fn epoch() -> Value {
+    json!({
+        "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+        "sequence": 1
+    })
+}
+
 fn fence(task_revision: u64) -> Value {
     json!({
-        "authority_epoch": 1,
+        "authority_epoch": epoch(),
         "resource_generation": 1,
         "task_revision": task_revision,
         "policy_revision": 1,
@@ -42,7 +51,7 @@ fn request_value(request_id: &str, idempotency_key: &str, tasks: bool, tool: Val
         "protocol_version": "2026-07-28",
         "session": {
             "session_id": "session-1",
-            "authority_epoch": 1,
+            "authority_epoch": epoch(),
             "state_fence": fence(7)
         },
         "identity": {
@@ -1019,6 +1028,38 @@ fn primary_path_admits_final_without_hint_and_rejects_legacy() -> Result<(), Box
             Err(BridgeError::InvalidArgument { .. })
         ),
         "explicit session binding remains required on the single path"
+    );
+    Ok(())
+}
+
+/// Production-path proof for #1944: every request admitted through the normal
+/// `McpCore::execute` entry joins its tool to the single versioned semantic
+/// owner before dispatch, and the advertised surface count is owner-derived.
+#[test]
+fn admitted_request_joins_single_semantic_owner_before_dispatch() -> Result<(), Box<dyn Error>> {
+    let port = CapturePort::default();
+    let request = parse_request(request_value("request-1", "idem-1", false, state_tool()))?;
+    let response = McpCore.execute(&port, stdio_transport("connection-1", 1), request)?;
+    assert_eq!(response.canonical_tool_name, "eliot.state");
+
+    // The admitted tool reached semantic dispatch (past the owner join).
+    let dispatched = port.tools.borrow();
+    assert_eq!(dispatched.len(), 1);
+    assert_eq!(dispatched[0].canonical_name(), "eliot.state");
+
+    // ...and the same method identity resolves to exactly one versioned owner
+    // whose routing bits govern it (read-only here; never name-inferred).
+    let owner = known_tool_profile(dispatched[0].canonical_name())?;
+    assert_eq!(owner.method.canonical_name, "eliot.state");
+    assert!(routing_decision(&owner).read_only);
+
+    // The advertised surface count follows the owner, not a name list: it
+    // must equal the registered profile set and the canonical catalogue.
+    let tools = canonical_known_tools()?;
+    assert_eq!(tools.len(), CANONICAL_TOOL_NAMES.len());
+    assert_eq!(
+        McpCore::initialize(InitializeRequest::default()).canonical_tool_count,
+        tools.len()
     );
     Ok(())
 }

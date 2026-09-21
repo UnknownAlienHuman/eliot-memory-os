@@ -72,10 +72,10 @@ use std::sync::Arc;
 
 use crate::{
     CompositionReservation, ObservedHead, RESERVATION_KEY_NAME, RESERVATION_KEY_PROVIDER,
-    RESERVATION_VISIBILITY, ReservationSeed, ReservationWriteError, ResolvedSendOutcome,
-    SealedReservation, begin_execute_after_send, cancel_before_send, ensure_eligible,
-    finalize_reservation, mark_unknown_outcome, project_reserved_write, reconcile_receipt,
-    reserve_for_transition,
+    RESERVATION_VISIBILITY, ReservationSeed, ReservationWriteError, ReservedSubmission,
+    ResolvedSendOutcome, SealedReservation, begin_execute_after_send, cancel_before_send,
+    ensure_eligible, finalize_reservation, mark_unknown_outcome, project_reserved_write,
+    reconcile_receipt, reserve_for_transition,
 };
 use eliot_contracts::{
     ClockReading, EpochId, EpochLineageId, OperationId, ProductId, RequestId, ResourceGeneration,
@@ -84,14 +84,15 @@ use eliot_contracts::{
 use eliot_ors::{
     CanonicalEvidenceProvider, EpochIdentity, EpochLineage, OpaqueLabel, OrsError,
     RedbRecoveryStore, ReservationState,
+    test_support::{KernelRouteEvidence, KernelRouteStoreFixture},
 };
 use eliot_store_api::{
-    CanonicalRequestView, CommitId, EffectClass, EventProjectionRelationIntents,
-    NamedMutationOperation, NamedMutationRequest, OperationIdentity, OperationManifestDigest,
-    OrderingHead, OrderingHeadExpectation, OrderingScopeId, PreparedTransition, RequestMeta,
-    ReservedWriteRequest, Resubmission, RevisionHeadExpectation, RevisionKey, ScopeId,
-    SecurityContext, StoreError, TransitionClass, WriteReceipt, WriteReceiptStatus,
-    canonical_request_hash,
+    CAPABILITY_RESERVED_WRITE, CanonicalRequestView, CommitId, EffectClass,
+    EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
+    OperationIdentity, OperationManifestDigest, OrderingHead, OrderingHeadExpectation,
+    OrderingScopeId, PreparedTransition, RequestMeta, ReservedWriteRequest, Resubmission,
+    RevisionHeadExpectation, RevisionKey, ScopeId, SecurityContext, StoreError, TransitionClass,
+    WriteReceipt, WriteReceiptStatus, canonical_request_hash,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -632,72 +633,11 @@ fn owner_for(ors: &Arc<RedbRecoveryStore>) -> CompositionReservation {
     CompositionReservation::bind(Arc::clone(ors), writer_epoch()).expect("992 owner binds")
 }
 
-/// Composition-owned verifier used by every positive lifecycle below.
-///
-/// It authenticates structure, never identity-by-fiat: empty scopes,
-/// malformed digests, mismatched reservation bindings, and invalid envelopes
-/// all fail closed. A separate rejecting provider proves the negative path in
-/// `992/14`.
-struct BindingEvidence;
-
-impl CanonicalEvidenceProvider for BindingEvidence {
-    fn verify_ordering_heads(
-        &self,
-        scopes: &[eliot_ors::ScopeReservationRequest],
-    ) -> Result<(), OrsError> {
-        if scopes.is_empty() {
-            return Err(OrsError::CanonicalEvidence(
-                "992 evidence rejects an empty scope set".to_owned(),
-            ));
-        }
-        for scope in scopes {
-            if scope.scope.as_str().trim().is_empty()
-                || scope.expected_head.head_sha256.len() != 64
-                || scope
-                    .expected_head
-                    .head_sha256
-                    .bytes()
-                    .any(|byte| !matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
-            {
-                return Err(OrsError::CanonicalEvidence(
-                    "992 evidence rejects a malformed ordering head".to_owned(),
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    fn verify_reconciliation(
-        &self,
-        token: &eliot_ors::WriterReservationToken,
-        reconciliation: &eliot_ors::CanonicalReconciliation,
-    ) -> Result<(), OrsError> {
-        if reconciliation.reservation_id != token.reservation_id
-            || reconciliation.reservation_order != token.reservation_order
-            || reconciliation.scopes.len() != token.scopes.len()
-        {
-            return Err(OrsError::CanonicalEvidence(
-                "992 evidence rejects a misbound reconciliation".to_owned(),
-            ));
-        }
-        self.verify_receipt(&reconciliation.receipt)
-    }
-
-    fn verify_receipt(&self, receipt: &eliot_receipts::ReceiptEnvelope) -> Result<(), OrsError> {
-        receipt
-            .validate()
-            .map_err(|error| OrsError::CanonicalEvidence(format!("992 bad envelope: {error}")))
-    }
-
-    fn verify_recovery_inbox(&self, _item: &eliot_ors::RecoveryInboxItem) -> Result<(), OrsError> {
-        Err(OrsError::CanonicalEvidence(
-            "992 evidence never authenticates inbox items".to_owned(),
-        ))
-    }
-}
-
 /// Composition-owned verifier that rejects every reconciliation readback,
 /// proving the provider is consulted rather than bypassed (`992/14`).
+/// This is the one intentionally-divergent provider: every positive lifecycle
+/// shares the single [`KernelRouteEvidence`] binding instead of vendoring its
+/// own.
 struct RejectReadbackEvidence;
 
 impl CanonicalEvidenceProvider for RejectReadbackEvidence {
@@ -975,11 +915,11 @@ fn unbound_or_foreign_verifier_or_owner_is_rejected() {
         "992/2 unbound verifier fails as canonical-evidence, got {error:?}"
     );
 
-    let (foreign_ors, _foreign_dir) = temp_ors("02foreign", Arc::new(BindingEvidence));
+    let (foreign_ors, _foreign_dir) = temp_ors("02foreign", Arc::new(KernelRouteEvidence));
     let foreign_owner = owner_for(&foreign_ors);
     let (f_context, f_transition, f_revision, f_ordering, foreign) =
         reserve_one(&foreign_owner, "02b", &["scope-992-a"]);
-    let (home_ors, _home_dir) = temp_ors("02home", Arc::new(BindingEvidence));
+    let (home_ors, _home_dir) = temp_ors("02home", Arc::new(KernelRouteEvidence));
     let home_owner = owner_for(&home_ors);
     let error = ensure_eligible(&home_owner, &foreign.token)
         .expect_err("992 foreign token must be unknown here");
@@ -1018,7 +958,7 @@ fn multi_scope_reservation_is_atomic_or_none() {
     // A two-scope reservation either assigns both sequences in one ORS
     // transaction or assigns none: a mismatched second head rolls back the
     // first scope's sequence, and the failed id leaves no record.
-    let (ors, _dir) = temp_ors("03", Arc::new(BindingEvidence));
+    let (ors, _dir) = temp_ors("03", Arc::new(KernelRouteEvidence));
     let owner = owner_for(&ors);
     let sequence = fixture_992().expected_sequence;
     let (_ctx_a, _tr_a, _rev_a, _ord_a, sealed_a) =
@@ -1090,7 +1030,7 @@ fn projection_carries_the_exact_operation_admission_scope_head_token_binding() {
     let expected = fixture_992();
     // The lineage is validated generically where it is consumed: `epoch()`
     // parses it through `EpochLineageId::new` on the reserve path below.
-    let (ors, _dir) = temp_ors("04", Arc::new(BindingEvidence));
+    let (ors, _dir) = temp_ors("04", Arc::new(KernelRouteEvidence));
     let owner = owner_for(&ors);
     let (context, transition, revision, ordering, sealed) =
         reserve_one(&owner, "04", &["scope-992-a"]);
@@ -1196,7 +1136,7 @@ fn overlapping_scopes_share_one_canonical_reservation_order() {
     // One coordinator assigns one monotonic order across overlapping scopes:
     // disjoint work proceeds concurrently while the shared scope serializes
     // with advancing sequences.
-    let (ors, _dir) = temp_ors("05", Arc::new(BindingEvidence));
+    let (ors, _dir) = temp_ors("05", Arc::new(KernelRouteEvidence));
     let owner = owner_for(&ors);
     let (_ctx_a, _tr_a, _rev_a, _ord_a, sealed_a) = reserve_one(&owner, "05a", &["scope-992-a"]);
     let (_ctx_b, _tr_b, _rev_b, _ord_b, sealed_b) =
@@ -1250,7 +1190,7 @@ fn stale_epoch_fence_expiry_or_changed_digest_cannot_dispatch() {
     // transition boundaries: a stale writer epoch cannot execute, a changed
     // fence cannot project, an inverted owner time pair cannot reserve, and a
     // mutated transition cannot project under an old digest.
-    let (ors, _dir) = temp_ors("07", Arc::new(BindingEvidence));
+    let (ors, _dir) = temp_ors("07", Arc::new(KernelRouteEvidence));
     let owner = owner_for(&ors);
     let (context, transition, revision, ordering, sealed) =
         reserve_one(&owner, "07", &["scope-992-a"]);
@@ -1327,7 +1267,7 @@ fn cancellation_or_timeout_after_possible_submission_retains_reconciliation() {
     // `Reconciling` on the unknown outcome, and only exact receipt evidence
     // finalizes it. Cancellation, timeout, and socket replacement can neither
     // finalize nor free it.
-    let (ors, _dir) = temp_ors("11", Arc::new(BindingEvidence));
+    let (ors, _dir) = temp_ors("11", Arc::new(KernelRouteEvidence));
     let owner = owner_for(&ors);
     let (context, transition, revision, ordering, sealed) =
         reserve_one(&owner, "11", &["scope-992-a"]);
@@ -1384,7 +1324,7 @@ fn proved_not_applied_release_stays_distinct_from_still_unknown() {
     // A terminally-not-applied receipt releases with its terminal receipt
     // bound; a receipt without an envelope stays unknown with no terminal and
     // no state change. The two are never confused.
-    let (ors, _dir) = temp_ors("13", Arc::new(BindingEvidence));
+    let (ors, _dir) = temp_ors("13", Arc::new(KernelRouteEvidence));
     let owner = owner_for(&ors);
     let (context, transition, revision, ordering, sealed) =
         reserve_one(&owner, "13a", &["scope-992-a"]);
@@ -1453,7 +1393,7 @@ fn forged_foreign_partial_or_stale_receipt_cannot_release_or_finalize() {
     // another operation, a receipt covering a partial scope set, a stale
     // fence, and a rejecting evidence provider all fail with the token state
     // unchanged.
-    let (ors, _dir) = temp_ors("14", Arc::new(BindingEvidence));
+    let (ors, _dir) = temp_ors("14", Arc::new(KernelRouteEvidence));
     let owner = owner_for(&ors);
     let (context, transition, revision, ordering, sealed) =
         reserve_one(&owner, "14a", &["scope-992-a", "scope-992-b"]);
@@ -1578,7 +1518,7 @@ fn old_executor_cannot_finalize_another_generations_token() {
     // The writer epoch is checked at every step: an executor bound to a later
     // epoch cannot execute, release, or finalize a token minted under the
     // current one, and the token stays eligible for its own generation.
-    let (ors, _dir) = temp_ors("15", Arc::new(BindingEvidence));
+    let (ors, _dir) = temp_ors("15", Arc::new(KernelRouteEvidence));
     let owner = owner_for(&ors);
     let (_context, _transition, _revision, _ordering, sealed) =
         reserve_one(&owner, "15", &["scope-992-a"]);
@@ -1622,7 +1562,7 @@ fn exact_replay_returns_the_token_while_changed_content_is_rejected() {
     // Reservation is idempotent under the same identity and exact content;
     // changed content under a taken identity replays the durable token and
     // then refuses projection instead of silently rebinding.
-    let (ors, _dir) = temp_ors("16", Arc::new(BindingEvidence));
+    let (ors, _dir) = temp_ors("16", Arc::new(KernelRouteEvidence));
     let owner = owner_for(&ors);
     let (context, transition, revision, ordering, first) =
         reserve_one(&owner, "16", &["scope-992-a"]);
@@ -1688,7 +1628,7 @@ fn ors_reopen_recovers_unresolved_reservations_before_new_allocation() {
     // path recovers the unresolved token with its order and state, the next
     // overlapping reservation takes a higher order, and it waits until the
     // recovered token is reconciled.
-    let (ors, dir) = temp_ors("17", Arc::new(BindingEvidence));
+    let (ors, dir) = temp_ors("17", Arc::new(KernelRouteEvidence));
     let owner = owner_for(&ors);
     let (_context, _transition, _revision, _ordering, sealed) =
         reserve_one(&owner, "17a", &["scope-992-a"]);
@@ -1697,7 +1637,7 @@ fn ors_reopen_recovers_unresolved_reservations_before_new_allocation() {
     drop(owner);
     drop(ors);
     let reopened =
-        RedbRecoveryStore::open_with_evidence(dir.join("ors.redb"), Arc::new(BindingEvidence))
+        RedbRecoveryStore::open_with_evidence(dir.join("ors.redb"), Arc::new(KernelRouteEvidence))
             .expect("992/17 ors reopens");
     let reopened = Arc::new(reopened);
     let recovered_owner = owner_for(&reopened);
@@ -1739,7 +1679,7 @@ fn recovery_pagination_reports_every_unresolved_token() {
     // in canonical order, not just the first page. Revert check: with the
     // old single-page read only two tokens return and the length assertion
     // fails.
-    let (ors, _dir) = temp_ors("21", Arc::new(BindingEvidence));
+    let (ors, _dir) = temp_ors("21", Arc::new(KernelRouteEvidence));
     let owner = owner_for(&ors);
     for index in 0..5 {
         let tag = format!("21p{index}");
@@ -1785,7 +1725,7 @@ fn cancel_before_send_releases_and_unblocks_the_same_scope_successor() {
     // successor that waited on it becomes eligible. Revert check: without the
     // release the successor stays `PredecessorPending` and the eligibility
     // assertion fails.
-    let (ors, _dir) = temp_ors("22", Arc::new(BindingEvidence));
+    let (ors, _dir) = temp_ors("22", Arc::new(KernelRouteEvidence));
     let owner = owner_for(&ors);
     let (_ctx_a, _tr_a, _rev_a, _ord_a, sealed_a) = reserve_one(&owner, "22a", &["scope-992-a"]);
     let (_ctx_b, _tr_b, _rev_b, _ord_b, sealed_b) = reserve_one(&owner, "22b", &["scope-992-a"]);
@@ -1837,7 +1777,7 @@ fn ordinary_committed_lifecycle_finalizes_without_ambiguity() {
     // Revert check: skipping any step (e.g. executing without post-send
     // evidence, or finalizing without the receipt) fails to compile or fails
     // closed, and the `Finalized` assertion fails.
-    let (ors, _dir) = temp_ors("23", Arc::new(BindingEvidence));
+    let (ors, _dir) = temp_ors("23", Arc::new(KernelRouteEvidence));
     let owner = owner_for(&ors);
     let (context, transition, revision, ordering, sealed) =
         reserve_one(&owner, "23a", &["scope-992-a"]);
@@ -1937,7 +1877,7 @@ fn durable_rebind_recovers_identity_and_fences_stale_writers() {
     // finalization. Revert check: rebinding under a fresh store loses the
     // token (length assertion fails), and a stale writer that could execute
     // would break the fencing assertion.
-    let (ors, dir) = temp_ors("24", Arc::new(BindingEvidence));
+    let (ors, dir) = temp_ors("24", Arc::new(KernelRouteEvidence));
     let owner = owner_for(&ors);
     let (_context, _transition, _revision, _ordering, sealed) =
         reserve_one(&owner, "24a", &["scope-992-a"]);
@@ -1948,7 +1888,7 @@ fn durable_rebind_recovers_identity_and_fences_stale_writers() {
     drop(owner);
     drop(ors);
     let reopened =
-        RedbRecoveryStore::open_with_evidence(dir.join("ors.redb"), Arc::new(BindingEvidence))
+        RedbRecoveryStore::open_with_evidence(dir.join("ors.redb"), Arc::new(KernelRouteEvidence))
             .expect("992/24 ors reopens");
     let reopened = Arc::new(reopened);
     let recovered = owner_for(&reopened);
@@ -2057,7 +1997,7 @@ fn terminal_status_without_not_applied_proof_stays_unknown() {
     // prove not-applied and release. Revert check: with the old
     // label-only mapping the mismatched receipt constructs a release and the
     // `Unknown` assertion fails.
-    let (ors, _dir) = temp_ors("25", Arc::new(BindingEvidence));
+    let (ors, _dir) = temp_ors("25", Arc::new(KernelRouteEvidence));
     let owner = owner_for(&ors);
     let (context, transition, revision, ordering, sealed) =
         reserve_one(&owner, "25a", &["scope-992-a"]);
@@ -2142,7 +2082,7 @@ fn errors_preserve_identity_and_redaction_without_a_second_owner() {
     // Every refusal carries the operation identity and never the payload: no
     // error text leaks canonical bytes, key labels, or digests, and a refused
     // reservation leaves no durable record behind.
-    let (ors, _dir) = temp_ors("19", Arc::new(BindingEvidence));
+    let (ors, _dir) = temp_ors("19", Arc::new(KernelRouteEvidence));
     let owner = owner_for(&ors);
     let fixture = fixture_992();
     let context = context_for("19");
@@ -2246,7 +2186,7 @@ fn queued_normal_work_holds_no_provider_lock_or_protected_resource() {
     // lock; a reconciling scope blocks only its own scopes while disjoint
     // work runs its full lifecycle; and the round trip consumes nothing
     // observable from the protected reserve.
-    let (ors, _dir) = temp_ors("09", Arc::new(BindingEvidence));
+    let (ors, _dir) = temp_ors("09", Arc::new(KernelRouteEvidence));
     let owner = Arc::new(owner_for(&ors));
     let first = {
         let owner = Arc::clone(&owner);
@@ -2318,7 +2258,7 @@ fn holder_of_only_owner_and_token_never_reaches_executing() {
     // Revert check (see work report): with the pre-fix public `for_token`
     // constructor restored, a pre-send mint for this token reaches
     // `Executing`, so the negative property fails pre-fix and holds post-fix.
-    let (ors, _dir) = temp_ors("28", Arc::new(BindingEvidence));
+    let (ors, _dir) = temp_ors("28", Arc::new(KernelRouteEvidence));
     let owner = owner_for(&ors);
     let fixture = fixture_992();
     let (_ctx, _tr, _rev, _ord, sealed) = reserve_one(&owner, "28", &[fixture.scope_a.as_str()]);
@@ -2390,7 +2330,7 @@ fn mutated_fixture_prefix_controls_generated_reservation_identity() {
         mutated.reservation_id_prefix, file_prefix,
         "992/29 mutation differs from the file value"
     );
-    let (ors, _dir) = temp_ors("29", Arc::new(BindingEvidence));
+    let (ors, _dir) = temp_ors("29", Arc::new(KernelRouteEvidence));
     let owner = owner_for(&ors);
     let tag = "29a";
     let context = context_for_with(&mutated, tag);
@@ -2905,7 +2845,7 @@ mod gateway_cases {
         // the ORS-backed gateway stages durable state and dispatches through
         // the Store exactly once, while the ORS-less gateway refuses before
         // any send with no fallback.
-        let (ors, _dir) = temp_ors("01", Arc::new(BindingEvidence));
+        let (ors, _dir) = temp_ors("01", Arc::new(KernelRouteEvidence));
         let bound = loopback(
             ServerMode::UnknownOutcome,
             "01bound",
@@ -2969,7 +2909,7 @@ mod gateway_cases {
         // overlapping successor reserves fine, then is refused with the owner
         // predecessor error before any lease or send. The shared counters
         // prove nothing dispatched for the waiter.
-        let (ors, _dir) = temp_ors("06", Arc::new(BindingEvidence));
+        let (ors, _dir) = temp_ors("06", Arc::new(KernelRouteEvidence));
         let owner = owner_for(&ors);
         let (_ctx_h, _tr_h, _rev_h, _ord_h, head) = reserve_one(&owner, "06head", &["scope-992-a"]);
         ensure_eligible(&owner, &head.token).expect("992/6 head is eligible");
@@ -3034,7 +2974,7 @@ mod gateway_cases {
         );
         finish(unbound).await;
 
-        let (ors, _dir) = temp_ors("08b", Arc::new(BindingEvidence));
+        let (ors, _dir) = temp_ors("08b", Arc::new(KernelRouteEvidence));
         let refusing = loopback(
             ServerMode::RefuseUnknownOperation,
             "08b",
@@ -3076,7 +3016,7 @@ mod gateway_cases {
         // Before-send cancellation releases exactly its token through the
         // protected reserve: the sibling reservation is untouched and stays
         // dispatchable, and the protected accounting balances.
-        let (ors, _dir) = temp_ors("10", Arc::new(BindingEvidence));
+        let (ors, _dir) = temp_ors("10", Arc::new(KernelRouteEvidence));
         let owner = owner_for(&ors);
         let (_ctx_a, _tr_a, _rev_a, _ord_a, sealed_a) =
             reserve_one(&owner, "10a", &["scope-992-a"]);
@@ -3126,7 +3066,7 @@ mod gateway_cases {
         // The full gateway path commits through the Store once and finalizes
         // every reserved scope atomically; the released admission lease lets
         // the next write through.
-        let (ors, _dir) = temp_ors("12", Arc::new(BindingEvidence));
+        let (ors, _dir) = temp_ors("12", Arc::new(KernelRouteEvidence));
         let setup = loopback(ServerMode::CommitSuccess, "12", Some(Arc::clone(&ors))).await;
         let (context, transition, revision, ordering, seed) =
             apply_inputs("12a", &["scope-992-a", "scope-992-b"]);
@@ -3189,7 +3129,7 @@ mod gateway_cases {
         // One reconciling scope blocks only its own scopes; migration drain
         // reports the honest pending count without forced release, and goes
         // quiet once the token reconciles.
-        let (ors, _dir) = temp_ors("18", Arc::new(BindingEvidence));
+        let (ors, _dir) = temp_ors("18", Arc::new(KernelRouteEvidence));
         let owner = owner_for(&ors);
         let (_ctx_a, tr_a, _rev_a, _ord_a, sealed_a) = reserve_one(&owner, "18a", &["scope-992-a"]);
         ensure_eligible(&owner, &sealed_a.token).expect("992/18a eligible");
@@ -3317,7 +3257,7 @@ mod gateway_cases {
         // One unknown send reconciles to exactly one finalized token: a
         // single Store send, zero receipt queries, zero retries, the
         // transition bytes bit-identical, and every scope terminal together.
-        let (ors, _dir) = temp_ors("20", Arc::new(BindingEvidence));
+        let (ors, _dir) = temp_ors("20", Arc::new(KernelRouteEvidence));
         let setup = loopback(ServerMode::UnknownOutcome, "20", Some(Arc::clone(&ors))).await;
         let (context, transition, revision, ordering, seed) =
             apply_inputs("20a", &["scope-992-a", "scope-992-b"]);
@@ -3392,7 +3332,7 @@ mod gateway_cases {
         // and the unresolved set is identical before and after. Zero records
         // are force-released. Revert check: a drain that released or mutated
         // anything breaks the before/after equality.
-        let (ors, _dir) = temp_ors("26", Arc::new(BindingEvidence));
+        let (ors, _dir) = temp_ors("26", Arc::new(KernelRouteEvidence));
         let owner = owner_for(&ors);
         let (_ctx_a, _tr_a, _rev_a, _ord_a, sealed_a) =
             reserve_one(&owner, "26a", &["scope-992-a"]);
@@ -3454,7 +3394,7 @@ mod gateway_cases {
         // also proves every planted token is reported. Revert check: a drain
         // that accepted the partial page would return `Ok` and break the
         // error assertion.
-        let (ors, _dir) = temp_ors("27", Arc::new(BindingEvidence));
+        let (ors, _dir) = temp_ors("27", Arc::new(KernelRouteEvidence));
         let owner = owner_for(&ors);
         let fixture = fixture_992();
         for index in 0..260u32 {
@@ -3526,4 +3466,775 @@ mod gateway_cases {
         );
         finish(setup).await;
     }
+
+    // WORK_UNIT_CASE: 2031/3
+    #[tokio::test]
+    async fn fenced_gateway_refuses_reserved_projection() {
+        // `project_reserved_submission` is gateway-bound, not a free
+        // projection: the unfenced route projects the exact submission the
+        // send path uses, while a fenced gateway refuses new projections for
+        // the whole migration exclusivity window.
+        let fixture = KernelRouteStoreFixture::open("2031-gateway").expect("2031 fixture opens");
+        let ors = Arc::clone(fixture.store());
+        let setup = loopback(ServerMode::NoSend, "31", Some(Arc::clone(&ors))).await;
+        let owner = owner_for(&ors);
+        let (context, transition, revision, ordering, sealed) =
+            reserve_one(&owner, "2031g", &["scope-992-a"]);
+        let projected = setup
+            .gateway
+            .project_reserved_submission(
+                &sealed,
+                &context,
+                &transition,
+                revision.clone(),
+                ordering.clone(),
+            )
+            .expect("2031 unfenced gateway projects");
+        assert_eq!(
+            projected.capability(),
+            CAPABILITY_RESERVED_WRITE,
+            "2031 gateway projection carries the Store reserved-write capability"
+        );
+        assert_eq!(
+            projected.request().admission.reservation_order,
+            sealed.token.reservation_order,
+            "2031 gateway projection preserves the sealed reservation order"
+        );
+        setup.gateway.fence();
+        let refused = setup
+            .gateway
+            .project_reserved_submission(&sealed, &context, &transition, revision, ordering)
+            .expect_err("2031 fenced gateway must refuse new projections");
+        assert!(
+            refused.contains("fenced"),
+            "2031 refusal names the fence: {refused}"
+        );
+        finish(setup).await;
+    }
+}
+
+// WORK_UNIT_CASE: 2031/1
+#[test]
+fn reserved_submission_carries_reserved_capability_end_to_end() {
+    // The Kernel-visible reserved submission wraps the exact #990 projection
+    // of a real sealed reservation staged through the shared Kernel-route
+    // fixture, and names the exact #991 Store capability, so session admission
+    // and the scheduler profile observe the same value the Store backend
+    // enforces.
+    let fixture = KernelRouteStoreFixture::open("2031-submission").expect("2031 fixture opens");
+    let owner = owner_for(fixture.store());
+    let (context, transition, revision, ordering, sealed) =
+        reserve_one(&owner, "2031a", &["scope-992-a"]);
+    let submission =
+        ReservedSubmission::from_sealed(&sealed, &context, &transition, revision, ordering)
+            .expect("2031 sealed projection must submit");
+    assert_eq!(
+        submission.capability(),
+        CAPABILITY_RESERVED_WRITE,
+        "2031 submission carries the Store reserved-write capability"
+    );
+    assert_eq!(
+        submission.request().admission.reservation_order,
+        sealed.token.reservation_order,
+        "2031 submission preserves the sealed reservation order"
+    );
+    assert_eq!(
+        submission.request().admission.reservation_id,
+        sealed.token.reservation_id.as_str(),
+        "2031 submission preserves the sealed reservation identity"
+    );
+    assert_eq!(
+        submission
+            .request()
+            .transition
+            .identity
+            .operation_id
+            .as_str(),
+        transition.identity.operation_id.as_str(),
+        "2031 submission carries the admitted transition bytes"
+    );
+    assert_eq!(
+        submission.request().context.request_id,
+        context.request_id,
+        "2031 submission carries the admitted transport context"
+    );
+    let owned_request = submission.into_request();
+    assert_eq!(
+        owned_request.admission.reservation_order, sealed.token.reservation_order,
+        "2031 owned request preserves the sealed reservation order"
+    );
+}
+
+// WORK_UNIT_CASE: 2031/2
+#[test]
+fn reserved_submission_rejects_post_reservation_mutation() {
+    // A transition mutated after reservation never becomes a submission: the
+    // projection refuses it before any send. A tampered closed request is
+    // refused at construction with the owner digest mismatch.
+    let fixture = KernelRouteStoreFixture::open("2031-mutation").expect("2031 fixture opens");
+    let owner = owner_for(fixture.store());
+    let (context, mut transition, revision, ordering, sealed) =
+        reserve_one(&owner, "2031b", &["scope-992-a"]);
+    transition.operation_manifest_digest =
+        OperationManifestDigest::new("tampered-2031-manifest").expect("2031 digest builds");
+    let mutated =
+        ReservedSubmission::from_sealed(&sealed, &context, &transition, revision, ordering)
+            .expect_err("2031 mutated transition must not submit");
+    assert!(
+        matches!(
+            mutated,
+            ReservationWriteError::Admission { .. } | ReservationWriteError::Binding { .. }
+        ),
+        "2031 mutated transition fails closed before any send: {mutated:?}"
+    );
+
+    let (context, transition, revision, ordering, sealed) =
+        reserve_one(&owner, "2031c", &["scope-992-a"]);
+    let mut tampered = project_reserved_write(&sealed, &context, &transition, revision, ordering)
+        .expect("2031 sealed projection must build");
+    tampered.transition.operation_manifest_digest =
+        OperationManifestDigest::new("tampered-2031-manifest").expect("2031 digest builds");
+    let refused =
+        ReservedSubmission::new(tampered).expect_err("2031 tampered request must not submit");
+    assert!(
+        matches!(
+            refused,
+            ReservationWriteError::Store(StoreError::TransitionDigestMismatch { .. })
+        ),
+        "2031 tampered request fails with the owner digest mismatch: {refused:?}"
+    );
+}
+
+use crate::store_write_reservation::{
+    StartupReconciliationReadiness, reconcile_pending_at_startup, unresolved_reservations,
+};
+use crate::{EbpCanonicalStoreClient, HostStoreBootstrapRequirement};
+
+/// Startup-reconciliation proof harness (I1.11 step 6): a real named-pipe
+/// EBP connection to a scripted responder. The responder answers
+/// `ReservedWrite` ONLY via panic (the producer under test never sends;
+/// any send is a harness failure), `Receipt` from a per-operation answer
+/// map (`committed` = exact enveloped receipt for a staged op, `missing`
+/// = absent receipt), and counts receipt observations to prove bounded
+/// queries. All commits below execute against the fixture ORS plus these
+/// exact answers — never against a second store, and the producer never
+/// manufactures a receipt.
+struct StartupAnswers {
+    committed: std::sync::Mutex<std::collections::BTreeMap<String, Option<WriteReceipt>>>,
+    receipt_queries: std::sync::atomic::AtomicUsize,
+}
+
+/// Builds the exactly enveloped committed receipt answering one staged
+/// operation: identity, fence and the real reserved sequence mirror the
+/// admission. Same issuance the closed store uses
+/// (`issue_store_receipt_envelope`), so reconciliation validates it
+/// through the real receipt path.
+fn startup_receipt(
+    context: &RequestMeta,
+    transition: &PreparedTransition,
+    reserved_sequence: u64,
+) -> WriteReceipt {
+    let scope = transition.ordering_scopes[0].clone();
+    let mut receipt = WriteReceipt {
+        operation_id: transition.identity.operation_id.clone(),
+        idempotency_key: transition.identity.idempotency_key.clone(),
+        canonical_request_hash: transition.identity.canonical_request_hash.clone(),
+        transition_class: transition.transition_class,
+        status: WriteReceiptStatus::Committed,
+        commit_id: Some(CommitId::new("commit-992-startup").expect("startup commit id")),
+        state_fence: context.state_fence.clone(),
+        ordering_sequences: vec![OrderingHead {
+            scope,
+            sequence: reserved_sequence,
+            state_fence: context.state_fence.clone(),
+        }],
+        revision_before_after: Vec::new(),
+        applied_command_ids: vec!["capture-observation".to_owned()],
+        emitted_event_ids: Vec::new(),
+        projection_refs: Vec::new(),
+        outbox_refs: Vec::new(),
+        operation_manifest_digest: transition.operation_manifest_digest.clone(),
+        error_code: None,
+        resubmission: Resubmission::None,
+        committed_at: Some("commit-sequence-0000000000000001".to_owned()),
+        envelope: None,
+    };
+    receipt.envelope = Some(
+        eliot_store_api::issue_store_receipt_envelope(context, transition, &receipt, 1)
+            .expect("startup envelope issues"),
+    );
+    receipt.validate().expect("startup receipt validates");
+    receipt
+}
+
+async fn serve_startup(
+    mut server: eliot_ipc::NamedPipeServer,
+    connection_id: String,
+    artifact_hash: String,
+    config_hash: String,
+    answers: std::sync::Arc<StartupAnswers>,
+) {
+    let limits = eliot_ipc::TransportLimits::default();
+    let frame = server
+        .receive_frame(limits)
+        .await
+        .expect("startup hello arrives");
+    assert_eq!(
+        frame.kind,
+        eliot_protocol::FrameKind::Control,
+        "startup expects EBP hello"
+    );
+    let hello = eliot_protocol::ServerHello {
+        selected_protocol: eliot_protocol::ProtocolVersion::CURRENT,
+        session_principal_binding: "startup-992-store-session".to_owned(),
+        allowed_capabilities: eliot_store_api::CAPABILITIES
+            .iter()
+            .map(|value| (*value).to_owned())
+            .collect(),
+        allowed_effects: eliot_store_api::EFFECTS
+            .iter()
+            .map(|value| (*value).to_owned())
+            .collect(),
+        config_snapshot: serde_json::json!({
+            "config_hash": config_hash,
+            "artifact_hash": artifact_hash,
+        }),
+        heartbeat_ms: 1_000,
+        control_channel: "startup-992-control".to_owned(),
+        rejection_reason: None,
+        authority_epoch: epoch(fixture_992().authority_sequence),
+    };
+    server
+        .send_frame(
+            &eliot_ipc::server_hello_frame(&connection_id, &hello).expect("startup hello encodes"),
+            limits,
+        )
+        .await
+        .expect("startup hello sends");
+    let frame = server
+        .receive_frame(limits)
+        .await
+        .expect("startup readiness arrives");
+    let (request_id, _, store_request) =
+        eliot_store_api::decode_request_frame(&frame).expect("startup readiness decodes");
+    assert!(
+        matches!(store_request, eliot_store_api::StoreRequest::Readiness),
+        "startup expects readiness"
+    );
+    server
+        .send_frame(
+            &eliot_store_api::response_frame(
+                connection_id.clone(),
+                eliot_protocol::ProtocolVersion::CURRENT,
+                Some(request_id),
+                eliot_store_api::StoreResponse::Readiness {
+                    receipt: eliot_store_api::ReadinessReceipt::ready("startup-992".to_owned()),
+                },
+            )
+            .expect("startup readiness encodes"),
+            limits,
+        )
+        .await
+        .expect("startup readiness sends");
+    loop {
+        let next = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            server.receive_frame(limits),
+        )
+        .await;
+        let Ok(Ok(frame)) = next else {
+            break;
+        };
+        let Ok((request_id, _, store_request)) = eliot_store_api::decode_request_frame(&frame)
+        else {
+            break;
+        };
+        let answer = match store_request {
+            eliot_store_api::StoreRequest::Receipt { operation_id } => {
+                answers
+                    .receipt_queries
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let receipt = answers
+                    .committed
+                    .lock()
+                    .unwrap()
+                    .get(operation_id.as_str())
+                    .cloned()
+                    .unwrap_or_else(|| panic!("startup store queried for an unstaged operation"));
+                eliot_store_api::StoreResponse::Receipt { receipt }
+            }
+            eliot_store_api::StoreRequest::ReservedWrite { .. } => {
+                panic!("startup producer never sends; unexpected ReservedWrite on the wire");
+            }
+            eliot_store_api::StoreRequest::Apply { .. } => {
+                panic!("startup producer must never fall back to unreserved Apply");
+            }
+            _ => break,
+        };
+        let Ok(frame) = eliot_store_api::response_frame(
+            connection_id.clone(),
+            eliot_protocol::ProtocolVersion::CURRENT,
+            Some(request_id),
+            answer,
+        ) else {
+            break;
+        };
+        if server.send_frame(&frame, limits).await.is_err() {
+            break;
+        }
+    }
+}
+
+struct StartupRoute {
+    client: EbpCanonicalStoreClient<eliot_ipc::NamedPipeTransport>,
+    server_task: tokio::task::JoinHandle<()>,
+    dir: std::path::PathBuf,
+}
+
+/// Connects the producer's store port over a real named-pipe EBP
+/// connection: the client speaks production frames; the responder answers
+/// from the staged answer map. Returns the client plus the join/cleanup
+/// handles and the shared answers (populated by staging before the run).
+async fn startup_route(tag: &str) -> (StartupRoute, std::sync::Arc<StartupAnswers>) {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("startup clock")
+        .as_nanos();
+    let dir =
+        std::env::temp_dir().join(format!("eliot-992-su-{tag}-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("startup temp root");
+    let pipe = format!(
+        r"\\.\pipe\eliot\store-992-su-{tag}-{}-{nanos}",
+        std::process::id()
+    );
+    let expectation = eliot_platform_windows::current_process_named_pipe_expectation()
+        .expect("startup loopback expectation");
+    let server = eliot_ipc::NamedPipeServer::create(&pipe, &expectation).expect("startup server");
+    let client_pipe = pipe.clone();
+    let client_expectation = expectation.clone();
+    let client_task = tokio::spawn(async move {
+        eliot_ipc::NamedPipeTransport::connect_authenticated(
+            &client_pipe,
+            std::time::Duration::from_secs(10),
+            &client_expectation,
+        )
+        .await
+        .expect("startup loopback connects")
+    });
+    let mut server = server;
+    server
+        .wait_for_authenticated_client(std::time::Duration::from_secs(10), &expectation)
+        .await
+        .expect("startup loopback admits its own process");
+    let transport = client_task.await.expect("startup client task");
+    let (peer_sid, peer_session) = match transport.peer_identity() {
+        eliot_ipc::PeerIdentity::Authenticated {
+            user_identity,
+            session_identity,
+            ..
+        } => (user_identity.clone(), session_identity.clone()),
+        eliot_ipc::PeerIdentity::Unavailable { .. } => {
+            panic!("startup loopback peer is not authenticated")
+        }
+    };
+    let requirement = HostStoreBootstrapRequirement {
+        route_identity: eliot_platform::PlatformHandle::new("store_bridge").expect("route"),
+        canonical_pipe_identity: eliot_platform::PlatformHandle::new(&pipe).expect("pipe"),
+        store_generation: ResourceGeneration::genesis(),
+        state_fence: fence(),
+        launch_nonce: eliot_platform::PlatformHandle::new(format!("launch-992-su-{tag}"))
+            .expect("nonce"),
+        connection_id: eliot_platform::PlatformHandle::new(format!("conn-992-su-{tag}"))
+            .expect("conn"),
+        expected_peer_sid: eliot_platform::PlatformHandle::new(&peer_sid).expect("sid"),
+        expected_peer_session_id: peer_session.parse().expect("session"),
+        approved_artifact_hash: eliot_platform::PlatformHandle::new("a".repeat(64))
+            .expect("artifact"),
+        approved_config_hash: eliot_platform::PlatformHandle::new("b".repeat(64)).expect("config"),
+        timeout_ms: 30_000,
+    };
+    let artifact = requirement.approved_artifact_hash.as_str().to_owned();
+    let config = requirement.approved_config_hash.as_str().to_owned();
+    let connection_id = requirement.connection_id.as_str().to_owned();
+    let answers = std::sync::Arc::new(StartupAnswers {
+        committed: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+        receipt_queries: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let server_task = tokio::spawn(serve_startup(
+        server,
+        connection_id,
+        artifact,
+        config,
+        std::sync::Arc::clone(&answers),
+    ));
+    let client = EbpCanonicalStoreClient::connect(transport, requirement)
+        .await
+        .unwrap_or_else(|error| panic!("startup EBP handshake failed: {error:?}"));
+    (
+        StartupRoute {
+            client,
+            server_task,
+            dir,
+        },
+        answers,
+    )
+}
+
+async fn finish_startup_route(route: StartupRoute) {
+    let StartupRoute {
+        server_task, dir, ..
+    } = route;
+    if tokio::time::timeout(std::time::Duration::from_secs(15), server_task)
+        .await
+        .is_err()
+    {
+        panic!("startup responder did not join");
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Stages one operation through reserve → eligible → executing against
+/// the given owner, exactly as a pre-restart send would leave it, and
+/// returns the sealed token plus the responder answer inputs.
+fn stage_executing(
+    owner: &CompositionReservation,
+    tag: &str,
+    scope: &str,
+) -> (RequestMeta, PreparedTransition, SealedReservation) {
+    let fixture = fixture_992();
+    // Known scopes resolve through the fixture table (empty digest selects
+    // it); scopes outside the frozen pair observe the frozen fresh-scope
+    // digest explicitly — the same rule as `observed_seq_with`.
+    let digest = if scope == fixture.scope_a || scope == fixture.scope_b {
+        String::new()
+    } else {
+        fixture.head_digest_fresh.clone()
+    };
+    let context = context_for(tag);
+    let mut transition = transition_for(tag, &[scope]);
+    let (revision, ordering) = heads_for(tag, &[scope]);
+    seal(&context, &mut transition, &revision, &ordering);
+    let heads = observed_seq(&[scope], fixture.expected_sequence, &digest);
+    let seed = seed_with_heads(tag, transition.identity.operation_id.as_str(), heads);
+    let sealed = reserve_for_transition(owner, &seed, &context, &transition, &revision, &ordering)
+        .expect("startup staging reserves");
+    ensure_eligible(owner, &sealed.token).expect("startup staging is eligible");
+    let post_send = ResolvedSendOutcome::after_resolved_send(&sealed.token);
+    begin_execute_after_send(owner, &sealed.token, &post_send).expect("startup send started");
+    (context, transition, sealed)
+}
+
+// WORK_UNIT_CASE: 1967/step6-committed
+#[tokio::test]
+async fn startup_reconciliation_finalizes_resolved_pending_work() {
+    // Two pre-restart Executing operations with exact committed receipts
+    // observed: the producer reconciles and finalizes both through the
+    // real receipt path and reports Ready with an empty remainder.
+    let fixture = KernelRouteStoreFixture::open("1967-su-ready").expect("startup fixture opens");
+    let owner = owner_for(fixture.store());
+    let fixture_992 = fixture_992();
+    let (a_context, a_transition, a_sealed) = stage_executing(&owner, "su1a", &fixture_992.scope_a);
+    let (b_context, b_transition, b_sealed) = stage_executing(&owner, "su1b", &fixture_992.scope_b);
+    let (route, answers) = startup_route("ready").await;
+    let mut committed = std::collections::BTreeMap::new();
+    for (context, transition, sealed) in [
+        (&a_context, &a_transition, &a_sealed),
+        (&b_context, &b_transition, &b_sealed),
+    ] {
+        committed.insert(
+            transition.identity.operation_id.as_str().to_owned(),
+            Some(startup_receipt(
+                context,
+                transition,
+                sealed.token.scopes[0].reserved_sequence,
+            )),
+        );
+    }
+    {
+        let mut guard = answers.committed.lock().unwrap();
+        *guard = committed;
+    }
+    let report = reconcile_pending_at_startup(&owner, &fence(), &route.client, 64)
+        .await
+        .expect("startup scan completes");
+    assert_eq!(report.scanned, 2);
+    assert!(!report.truncated);
+    assert!(report.pending.is_empty() && report.unknown.is_empty());
+    assert_eq!(
+        report.readiness(),
+        StartupReconciliationReadiness::Ready,
+        "resolved remainder admits step 6"
+    );
+    assert_eq!(report.fence, fence());
+    assert!(!report.digest.is_empty());
+    let rest = unresolved_reservations(&owner, 64).expect("post-scan reads");
+    assert!(rest.is_empty(), "finalized work leaves no remainder");
+    finish_startup_route(route).await;
+}
+
+// WORK_UNIT_CASE: 1967/step6-unknown
+#[tokio::test]
+async fn startup_reconciliation_keeps_unknown_outcome_unresolved() {
+    // A Reconciling token with no Store receipt observed stays unresolved:
+    // the producer reports it unknown with its identity instead of
+    // retrying, replaying, or releasing it.
+    let fixture = KernelRouteStoreFixture::open("1967-su-unknown").expect("startup fixture opens");
+    let owner = owner_for(fixture.store());
+    let fixture_992 = fixture_992();
+    let (_context, _transition, sealed) = stage_executing(&owner, "su2", &fixture_992.scope_a);
+    mark_unknown_outcome(&owner, &sealed.token).expect("startup marks unknown");
+    let (route, answers) = startup_route("unknown").await;
+    answers
+        .committed
+        .lock()
+        .unwrap()
+        .insert(sealed.token.operation_id.as_str().to_owned(), None);
+    let report = reconcile_pending_at_startup(&owner, &fence(), &route.client, 64)
+        .await
+        .expect("startup scan completes");
+    assert_eq!(report.scanned, 1);
+    assert!(!report.truncated);
+    assert!(report.pending.is_empty());
+    assert_eq!(report.unknown.len(), 1);
+    assert_eq!(
+        report.unknown[0].operation_id.as_str(),
+        sealed.token.operation_id.as_str()
+    );
+    assert_eq!(report.unknown[0].reason, "no store receipt");
+    assert_eq!(
+        report.unknown[0].scopes,
+        vec![fixture_992.scope_a.clone()],
+        "unknown entry preserves the reserved scope"
+    );
+    assert_eq!(
+        report.readiness(),
+        StartupReconciliationReadiness::Blocked,
+        "unknown outcome blocks step 6"
+    );
+    let rest = unresolved_reservations(&owner, 64).expect("post-scan reads");
+    assert_eq!(rest.len(), 1, "unknown token stays unresolved");
+    assert_eq!(rest[0].state, ReservationState::Reconciling);
+    finish_startup_route(route).await;
+}
+
+// WORK_UNIT_CASE: 1967/step6-fence
+#[tokio::test]
+async fn startup_reconciliation_refuses_foreign_epoch_tokens() {
+    // A token minted under a different writer epoch than the bound owner
+    // is reported pending with fence mismatch and never touched: cross-
+    // epoch disposition belongs to the cutover/rebind owner, and the live
+    // fence in the report is the one Kernel must match exactly.
+    let fixture = KernelRouteStoreFixture::open("1967-su-fence").expect("startup fixture opens");
+    let owner = owner_for(fixture.store());
+    let fixture_992 = fixture_992();
+    let (_context, _transition, _sealed) = stage_executing(&owner, "su3", &fixture_992.scope_a);
+    let stale_owner =
+        CompositionReservation::bind(std::sync::Arc::clone(fixture.store()), stale_writer_epoch())
+            .expect("startup stale owner binds");
+    let stale_fence = stale_fence_with(&fixture_992);
+    let (route, _answers) = startup_route("fence").await;
+    let report = reconcile_pending_at_startup(&stale_owner, &stale_fence, &route.client, 64)
+        .await
+        .expect("startup scan completes");
+    assert_eq!(report.scanned, 1);
+    assert_eq!(report.fence, stale_fence);
+    assert_eq!(report.pending.len(), 1);
+    assert!(report.unknown.is_empty());
+    assert_eq!(report.pending[0].reason, "fence mismatch");
+    assert_eq!(
+        report.pending[0].scopes,
+        vec![fixture_992.scope_a.clone()],
+        "pending entry preserves the reserved scope"
+    );
+    assert_eq!(
+        report.readiness(),
+        StartupReconciliationReadiness::Blocked,
+        "fence mismatch blocks step 6"
+    );
+    let rest = unresolved_reservations(&owner, 64).expect("post-scan reads");
+    assert_eq!(rest.len(), 1, "foreign token untouched");
+    assert_eq!(rest[0].state, ReservationState::Executing);
+    finish_startup_route(route).await;
+}
+
+// WORK_UNIT_CASE: 1967/step6-bounded
+#[tokio::test]
+async fn startup_reconciliation_reports_truncation_bounded() {
+    // Three staged tokens with a bound of two: the scan examines exactly
+    // two, observes exactly two receipts, reports truncation, and stays
+    // blocked. No synthetic empty report is possible under a cut bound.
+    let fixture = KernelRouteStoreFixture::open("1967-su-bounded").expect("startup fixture opens");
+    let owner = owner_for(fixture.store());
+    let fixture_992 = fixture_992();
+    let (_a_context, a_transition, _a_sealed) =
+        stage_executing(&owner, "su4a", &fixture_992.scope_a);
+    let (_b_context, b_transition, _b_sealed) =
+        stage_executing(&owner, "su4b", &fixture_992.scope_b);
+    let (_c_context, c_transition, _c_sealed) = stage_executing(&owner, "su4c", "scope-992-c");
+    let (route, answers) = startup_route("bounded").await;
+    // All three staged tokens answer "missing": nothing may finalize, so
+    // the cut bound is the only thing being proved.
+    for transition in [&a_transition, &b_transition, &c_transition] {
+        answers
+            .committed
+            .lock()
+            .unwrap()
+            .insert(transition.identity.operation_id.as_str().to_owned(), None);
+    }
+    let report = reconcile_pending_at_startup(&owner, &fence(), &route.client, 2)
+        .await
+        .expect("startup scan completes");
+    assert_eq!(report.scanned, 2);
+    assert!(report.truncated, "cut bound reports truncation");
+    assert_eq!(
+        report.pending.len(),
+        2,
+        "examined tokens reported pending on missing receipts"
+    );
+    let mut pending_scopes: Vec<String> = report
+        .pending
+        .iter()
+        .flat_map(|item| item.scopes.clone())
+        .collect();
+    pending_scopes.sort_unstable();
+    assert_eq!(
+        pending_scopes,
+        vec![fixture_992.scope_a.clone(), fixture_992.scope_b.clone()],
+        "pending entries preserve both reserved scopes"
+    );
+    assert_eq!(
+        report.readiness(),
+        StartupReconciliationReadiness::Blocked,
+        "truncation blocks step 6"
+    );
+    assert_eq!(
+        answers
+            .receipt_queries
+            .load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "receipt observations bounded by the scan limit"
+    );
+    finish_startup_route(route).await;
+}
+
+// WORK_UNIT_CASE: 1967/step6-substituted
+#[tokio::test]
+async fn startup_reconciliation_rejects_substituted_receipt_identity() {
+    // A store answer carrying another operation's receipt fails the whole
+    // scan with the owner identity conflict: a substituted answer is an
+    // integrity violation, not an ambiguity to report past. Both staged
+    // tokens stay unresolved and no synthetic outcome is produced.
+    let fixture =
+        KernelRouteStoreFixture::open("1967-su-substituted").expect("startup fixture opens");
+    let owner = owner_for(fixture.store());
+    let fixture_992 = fixture_992();
+    let (x_context, x_transition, x_sealed) = stage_executing(&owner, "su5x", &fixture_992.scope_a);
+    let (y_context, y_transition, y_sealed) = stage_executing(&owner, "su5y", &fixture_992.scope_b);
+    let (route, answers) = startup_route("substituted").await;
+    // Cross the answers: each operation observes the other's committed
+    // receipt, so the client identity check fails the scan.
+    {
+        let mut guard = answers.committed.lock().unwrap();
+        guard.insert(
+            x_transition.identity.operation_id.as_str().to_owned(),
+            Some(startup_receipt(
+                &y_context,
+                &y_transition,
+                y_sealed.token.scopes[0].reserved_sequence,
+            )),
+        );
+        guard.insert(
+            y_transition.identity.operation_id.as_str().to_owned(),
+            Some(startup_receipt(
+                &x_context,
+                &x_transition,
+                x_sealed.token.scopes[0].reserved_sequence,
+            )),
+        );
+    }
+    let error = reconcile_pending_at_startup(&owner, &fence(), &route.client, 64)
+        .await
+        .expect_err("substituted answers fail the scan");
+    assert!(
+        matches!(
+            error,
+            ReservationWriteError::Store(StoreError::IdentityConflict)
+        ),
+        "substitution fails closed with identity conflict, got {error:?}"
+    );
+    let rest = unresolved_reservations(&owner, 64).expect("post-scan reads");
+    assert_eq!(rest.len(), 2, "substituted tokens stay unresolved");
+    finish_startup_route(route).await;
+}
+
+// WORK_UNIT_CASE: 1967/step6-mismatch
+#[tokio::test]
+async fn startup_reconciliation_refuses_mismatched_receipts() {
+    // Receipts that pass the client identity check but cover the wrong
+    // scope must not resolve anything: an Executing token stays pending
+    // and a Reconciling token stays unknown, both with the refusal reason
+    // and both still unresolved. This covers the reconcile-error arms no
+    // honest receipt can reach.
+    let fixture = KernelRouteStoreFixture::open("1967-su-mismatch").expect("startup fixture opens");
+    let owner = owner_for(fixture.store());
+    let fixture_992 = fixture_992();
+    let (x_context, x_transition, x_sealed) = stage_executing(&owner, "su6x", &fixture_992.scope_a);
+    let (y_context, y_transition, y_sealed) = stage_executing(&owner, "su6y", &fixture_992.scope_b);
+    mark_unknown_outcome(&owner, &y_sealed.token).expect("startup marks unknown");
+    let (route, answers) = startup_route("mismatch").await;
+    // Mismatch the scope coverage while keeping every identity and the
+    // envelope valid: the wire and client layers accept the answer, but
+    // reconciliation must refuse the uncovered scope. (Content that
+    // breaks envelope/body consistency never reaches reconcile at all:
+    // `response_frame` refuses to transmit it, which the substituted
+    // test above proves fail-closed at the scan level.)
+    {
+        let mut guard = answers.committed.lock().unwrap();
+        let mut x_receipt = startup_receipt(
+            &x_context,
+            &x_transition,
+            x_sealed.token.scopes[0].reserved_sequence,
+        );
+        x_receipt.ordering_sequences[0].scope =
+            eliot_store_api::OrderingScopeId::new("scope-992-b").expect("mismatch scope");
+        guard.insert(
+            x_transition.identity.operation_id.as_str().to_owned(),
+            Some(x_receipt),
+        );
+        let mut y_receipt = startup_receipt(
+            &y_context,
+            &y_transition,
+            y_sealed.token.scopes[0].reserved_sequence,
+        );
+        y_receipt.ordering_sequences[0].scope =
+            eliot_store_api::OrderingScopeId::new("scope-992-a").expect("mismatch scope");
+        guard.insert(
+            y_transition.identity.operation_id.as_str().to_owned(),
+            Some(y_receipt),
+        );
+    }
+    let report = reconcile_pending_at_startup(&owner, &fence(), &route.client, 64)
+        .await
+        .unwrap_or_else(|error| panic!("startup mismatch scan failed: {error:?}"));
+    assert_eq!(report.scanned, 2);
+    assert_eq!(
+        report.pending.len(),
+        1,
+        "mismatched Executing token stays pending"
+    );
+    assert_eq!(report.pending[0].reason, "reconciliation refused");
+    assert_eq!(
+        report.unknown.len(),
+        1,
+        "mismatched Reconciling token stays unknown"
+    );
+    assert_eq!(report.unknown[0].reason, "reconciliation refused");
+    assert_eq!(
+        report.readiness(),
+        StartupReconciliationReadiness::Blocked,
+        "refusals block step 6"
+    );
+    let rest = unresolved_reservations(&owner, 64).expect("post-scan reads");
+    assert_eq!(rest.len(), 2, "refused tokens stay unresolved");
+    finish_startup_route(route).await;
 }

@@ -200,8 +200,10 @@ struct ActivatedReadDescriptor {
 /// `GetCapabilityEvidenceState` via exact `skill_id` + `max_records`). The
 /// head and receipt reads address no scope;
 /// the receipt read addresses its receipt through the declared
-/// `operation_id` parameter.
-const ACTIVATED_READS: [ActivatedReadDescriptor; 10] = [
+/// `operation_id` parameter; `GetNotificationState` addresses no scope and
+/// filters through the declared `scope`/`include_resolved`/`page_limit`/
+/// `cursor` parameters.
+const ACTIVATED_READS: [ActivatedReadDescriptor; 11] = [
     ActivatedReadDescriptor {
         operation: NamedReadOperation::GetCurrentEpistemicPosition,
         requires_scope_id: true,
@@ -252,11 +254,16 @@ const ACTIVATED_READS: [ActivatedReadDescriptor; 10] = [
         requires_scope_id: true,
         scope_kind: SCOPE_KIND_SCOPE,
     },
+    ActivatedReadDescriptor {
+        operation: NamedReadOperation::GetNotificationState,
+        requires_scope_id: false,
+        scope_kind: SCOPE_KIND_NONE,
+    },
 ];
 
 /// Returns the activated read operations in canonical declaration order.
 #[must_use]
-pub const fn activated_read_operations() -> [NamedReadOperation; 10] {
+pub const fn activated_read_operations() -> [NamedReadOperation; 11] {
     [
         ACTIVATED_READS[0].operation,
         ACTIVATED_READS[1].operation,
@@ -268,6 +275,7 @@ pub const fn activated_read_operations() -> [NamedReadOperation; 10] {
         ACTIVATED_READS[7].operation,
         ACTIVATED_READS[8].operation,
         ACTIVATED_READS[9].operation,
+        ACTIVATED_READS[10].operation,
     ]
 }
 
@@ -289,10 +297,12 @@ struct ActivatedMutationDescriptor {
 /// `ReversibleMutation` through the `Epistemic` family; `ApplyErasure`
 /// persists `ReversibleMutation` through the `Erasure` family (issue #1712:
 /// explicit user request ONLY, with the closed five-field erasure typed
-/// contract). All
-/// seven address no scope, mirroring the scope-free read descriptors. Every
+/// contract); `ApplyNotificationState` persists `ReversibleMutation` through
+/// the `NotificationState` family (issue #1780: Kernel-admitted notification
+/// lifecycle with the closed leg-discriminated typed contract). All
+/// eight address no scope, mirroring the scope-free read descriptors. Every
 /// other mutation stays known-but-unsupported.
-const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 7] = [
+const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 8] = [
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::ApplyEpistemicRevision,
         transition_classes: &[TransitionClass::Epistemic],
@@ -327,6 +337,11 @@ const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 7] = [
         operation: NamedMutationOperation::ApplyErasure,
         transition_classes: &[TransitionClass::Erasure],
         maximum_effect: TransitionClass::Erasure.maximum_effect(),
+    },
+    ActivatedMutationDescriptor {
+        operation: NamedMutationOperation::ApplyNotificationState,
+        transition_classes: &[TransitionClass::NotificationState],
+        maximum_effect: EffectClass::ReversibleMutation,
     },
 ];
 
@@ -391,8 +406,8 @@ fn genesis_entry_spec() -> OperationManifestSpec {
 
 /// Generates the per-operation manifest descriptors from the declaration table.
 ///
-/// Declaration order is the canonical order: the ten activated reads, the
-/// seven activated mutations, then the genesis bootstrap entry. Generation is
+/// Declaration order is the canonical order: the eleven activated reads, the
+/// eight activated mutations, then the genesis bootstrap entry. Generation is
 /// pure over crate constants, so the same source always yields byte-identical
 /// entries.
 pub fn generated_operation_manifests() -> Result<Vec<NamedOperationManifest>, StoreError> {
@@ -626,6 +641,10 @@ pub fn validate_transition_against_catalogue(
             | NamedMutationOperation::ApplyEpistemicRevision
             | NamedMutationOperation::ApplyErasure => {
                 validate_typed_mutation_parameters(command.operation, &command.parameters)?;
+            }
+            NamedMutationOperation::ApplyNotificationState => {
+                validate_typed_mutation_parameters(command.operation, &command.parameters)?;
+                crate::validate_notification_mutation_params(&command.parameters)?;
             }
             NamedMutationOperation::RecordAuthorityRevocation => {
                 return Err(StoreError::UnknownOperation);

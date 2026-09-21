@@ -1,0 +1,15 @@
+[package]
+name = "eliot-integration-coverage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Governor-owned host integration coverage and Governance Profile derivation (I7.16)"
+
+[dependencies]
+schemars.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

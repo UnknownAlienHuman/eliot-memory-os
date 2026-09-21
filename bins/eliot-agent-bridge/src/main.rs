@@ -3,7 +3,9 @@
 mod request_input;
 
 use eliot_agent_bridge::{
-    BridgeRunner, CliError, Profile, kernel_ports_with_declaration, parse_args,
+    BootstrapContext, BootstrapTaskInputs, BridgeRunner, CliError, CurrentAssessment,
+    InjectionReceipt, Profile, ScopeLevel, UnderstandingBootstrap, kernel_ports_with_declaration,
+    parse_args,
 };
 use eliot_agent_bridge_core::{
     AttachRequest, BridgeError, ConnectionId, FencingToken, Generation, HostEventEnvelope,
@@ -19,7 +21,9 @@ use eliot_mcp::{
 };
 use eliot_protocol::EventEnvelope;
 use request_input::{
-    REQUEST_INPUT_PROFILE, REQUEST_INPUT_PROFILE_ID, ReadOutcome, read_bounded_record,
+    REQUEST_INPUT_LIMIT_TABLE, REQUEST_INPUT_PROFILE, REQUEST_INPUT_PROFILE_ID, ReadOutcome,
+    check_profile_id, check_request_envelope, classify_serde_error, prevalidate_record,
+    read_bounded_record, scratch_budget,
 };
 use serde::{Deserialize, Serialize};
 use std::io::{self, Write};
@@ -51,6 +55,9 @@ const _: () = assert!(
     MAX_OUTSTANDING_RESPONSES == 1,
     "stdio stays synchronous with one outstanding frame"
 );
+/// Links the reviewed limit/source/version/stage table into the binary so the
+/// documented table cannot drift from the enforced profile unnoticed.
+const _: &str = REQUEST_INPUT_LIMIT_TABLE;
 /// Bounded wall-clock for one stdout write plus flush.
 ///
 /// A blocking stdio pipe offers no deadline of its own, so the emission runs
@@ -65,6 +72,13 @@ const STDOUT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// original order and the remainder is counted as truncated rather than
 /// dropped silently.
 const MAX_STOP_DRAIN_ITEMS: usize = 32;
+/// Maximum sticky attention identities projected inside one Status frame.
+///
+/// The attention projection itself is unbounded in ledger terms (up to
+/// `MAX_LEDGER_ITEMS` records); the status frame carries only the first
+/// identities in ledger order and counts the remainder as truncated rather
+/// than dropping them silently.
+const MAX_STATUS_ATTENTION_ITEMS: usize = 64;
 
 /// Closed kernel entry that rehydrates one exact operation from the durable record.
 ///
@@ -117,6 +131,11 @@ enum Request {
         event: EventEnvelope,
     },
     ReconcileExternal {},
+    Bootstrap {
+        context: Option<BootstrapContext>,
+        tasks: BootstrapTaskInputs,
+        requested_assessment: CurrentAssessment,
+    },
     Reconnect {
         expected_connection_id: ConnectionId,
         new_connection_id: ConnectionId,
@@ -145,21 +164,49 @@ enum Response {
         host_request_port: &'static str,
         observation_forwarding_port: &'static str,
         recovery: &'static str,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reactive: Option<ReactiveStatusView>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bootstrap: Option<UnderstandingBootstrap>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resources: Option<ResourceRegistryView>,
     },
-    Attached,
+    Attached {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bootstrap: Option<UnderstandingBootstrap>,
+    },
     Reconnected {
         previous_connection_id: String,
         connection_id: String,
         session_id: String,
         activation_generation: u64,
         authority_epoch: EpochId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bootstrap: Option<UnderstandingBootstrap>,
     },
     Invocation {
         result: HostInvocationResult,
         completion: HostCorrelationReceipt,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bootstrap: Option<UnderstandingBootstrap>,
     },
     Cancellation {
         result: HostCancellationResult,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bootstrap: Option<UnderstandingBootstrap>,
+    },
+    Forwarded {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bootstrap: Option<UnderstandingBootstrap>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        reactive_receipts: Vec<InjectionReceipt>,
+    },
+    Reconciled {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bootstrap: Option<UnderstandingBootstrap>,
+    },
+    Bootstrap {
+        bootstrap: UnderstandingBootstrap,
     },
     /// Typed dry-run envelope (I7.17).
     ///
@@ -178,18 +225,44 @@ enum Response {
         evidence: DryRunEvidence,
         binding: DryRunBinding,
     },
-    Forwarded,
-    Reconciled,
     Stopped {
         outstanding: usize,
         drained: usize,
         truncated: bool,
         pending: Vec<StopPendingIdentity>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bootstrap: Option<UnderstandingBootstrap>,
     },
     Error {
         code: &'static str,
         detail: String,
     },
+}
+
+/// Bounded sticky-attention projection for the Status frame.
+///
+/// `pending` counts undelivered injections for the live session;
+/// `attention_item_ids` carries the first sticky attention identities in
+/// ledger order with `attention_truncated` marking a remainder. Facts come
+/// from the runner's delivery-record ledger; nothing here admits, delivers,
+/// or resolves.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ReactiveStatusView {
+    pending: usize,
+    attention_item_ids: Vec<String>,
+    attention_truncated: bool,
+}
+
+/// Attach-scoped resource projection summary for the Status frame.
+///
+/// `entries` counts the immutable snapshots retained for the live attach;
+/// content bytes are never carried here — previews ride hot responses and
+/// full bytes require explicit expansion through the owning reader.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ResourceRegistryView {
+    entries: usize,
 }
 
 /// Original identity of one durable in-flight delivery pending at Stop.
@@ -346,7 +419,10 @@ fn main() {
     };
     let host_gateway = HostRequestGateway;
     let mut provider_failure = false;
-    if REQUEST_INPUT_PROFILE.validate().is_err() {
+    if REQUEST_INPUT_PROFILE.validate().is_err()
+        || check_profile_id(REQUEST_INPUT_PROFILE_ID).is_err()
+        || scratch_budget(REQUEST_INPUT_PROFILE).is_none()
+    {
         let detail =
             format!("request input profile {REQUEST_INPUT_PROFILE_ID} is internally inconsistent");
         emit_error("BRIDGE_COMPOSITION_REJECTED", &detail);
@@ -459,9 +535,9 @@ fn main() {
             break;
         };
         total_records = next_total;
-        let response = match serde_json::from_str::<Request>(text) {
+        let mut response = match decode_bounded_request(text) {
             Ok(Request::Attach { request }) => match runner.attach(request) {
-                Ok(_) => Response::Attached,
+                Ok(_) => Response::Attached { bootstrap: None },
                 Err(error) => {
                     provider_failure |= matches!(error, BridgeError::PlanGap(_));
                     bridge_error(&error)
@@ -476,26 +552,52 @@ fn main() {
             Ok(Request::DryRunInvoke { request }) => dry_run_invocation(&runner, &request),
             Ok(Request::DryRunCancel { request }) => dry_run_cancellation(&runner, &request),
             Ok(Request::ForwardHook { event }) => match runner.forward_hook(&event) {
-                Ok(()) => Response::Forwarded,
+                Ok(()) => match runner.deliver_reactive_pending_via_hook(event.event_id.as_str()) {
+                    Ok(receipts) => Response::Forwarded {
+                        bootstrap: None,
+                        reactive_receipts: receipts,
+                    },
+                    Err(error) => Response::Error {
+                        code: "REACTIVE_RECEIPT_REJECTED",
+                        detail: error.to_string(),
+                    },
+                },
                 Err(error) => {
                     provider_failure |= is_provider_failure(&error);
                     bridge_error(&error)
                 }
             },
             Ok(Request::ForwardEvent { event }) => match runner.forward_event(&event) {
-                Ok(_) => Response::Forwarded,
+                Ok(_) => {
+                    let response_id = format!("forward-event:{}", event.event_id);
+                    match runner.deliver_reactive_pending_via_response(&response_id) {
+                        Ok(receipts) => Response::Forwarded {
+                            bootstrap: None,
+                            reactive_receipts: receipts,
+                        },
+                        Err(error) => Response::Error {
+                            code: "REACTIVE_RECEIPT_REJECTED",
+                            detail: error.to_string(),
+                        },
+                    }
+                }
                 Err(error) => {
                     provider_failure |= is_provider_failure(&error);
                     bridge_error(&error)
                 }
             },
             Ok(Request::ReconcileExternal {}) => match runner.reconcile_external() {
-                Ok(_) => Response::Reconciled,
+                Ok(_) => Response::Reconciled { bootstrap: None },
                 Err(error) => {
                     provider_failure |= is_provider_failure(&error);
                     bridge_error(&error)
                 }
             },
+            Ok(Request::Bootstrap {
+                context,
+                tasks,
+                requested_assessment,
+            }) => handle_bootstrap(&mut runner, context, &tasks, requested_assessment),
             Ok(Request::Reconnect {
                 expected_connection_id,
                 new_connection_id,
@@ -514,11 +616,15 @@ fn main() {
             ),
             Ok(Request::Status) => status_response(config.profile, &runner),
             Ok(Request::Stop) => handle_stop(&runner),
-            Err(error) => Response::Error {
+            Err(detail) => Response::Error {
                 code: "REQUEST_INVALID",
-                detail: error.to_string(),
+                detail,
             },
         };
+        // I7.17 auto-boot: the first successful ELIOT response in a session
+        // carries the bounded bootstrap exactly once. Explicit retrieval
+        // through the bootstrap operation stays available afterwards.
+        attach_auto_bootstrap(&mut runner, &mut response);
         // Only the deserialization-failure arm above produces REQUEST_INVALID:
         // every handler, gateway, and runner error path uses a distinct code,
         // so this flag exactly tracks whether a request was dispatched. Valid
@@ -557,13 +663,100 @@ fn main() {
     }
 }
 
+/// Serves one bounded `GetUnderstandingBootstrap` retrieval.
+///
+/// An optional context establishes the session inputs first; invalid context
+/// fails closed and stores nothing. The first successful retrieval in a
+/// session also satisfies the once-per-session auto-boot; later retrievals
+/// use the explicit path so they stay available after auto-boot delivery.
+fn handle_bootstrap(
+    runner: &mut BridgeRunner,
+    context: Option<BootstrapContext>,
+    tasks: &BootstrapTaskInputs,
+    requested_assessment: CurrentAssessment,
+) -> Response {
+    if let Some(context) = context {
+        if let Err(error) = runner.note_bootstrap_context(context) {
+            return Response::Error {
+                code: "BOOTSTRAP_CONTEXT_REJECTED",
+                detail: error.to_string(),
+            };
+        }
+    }
+    if let Some(bootstrap) = runner.take_first_response_bootstrap(tasks, requested_assessment) {
+        return Response::Bootstrap { bootstrap };
+    }
+    match runner.get_understanding_bootstrap(tasks, requested_assessment) {
+        Ok(bootstrap) => Response::Bootstrap { bootstrap },
+        Err(error) => Response::Error {
+            code: "BOOTSTRAP_REJECTED",
+            detail: error.to_string(),
+        },
+    }
+}
+
+/// Injects the once-per-session auto-boot into the first successful response.
+///
+/// Error and dry-run responses never carry a bootstrap: a dry run is a
+/// zero-side-effect preview, not a successful ELIOT response, and its
+/// envelope has no bootstrap slot. When no valid context is noted
+/// the response is left untouched rather than carrying invented authority.
+fn attach_auto_bootstrap(runner: &mut BridgeRunner, response: &mut Response) {
+    let slot = match response {
+        Response::Status { bootstrap, .. }
+        | Response::Attached { bootstrap }
+        | Response::Reconnected { bootstrap, .. }
+        | Response::Invocation { bootstrap, .. }
+        | Response::Cancellation { bootstrap, .. }
+        | Response::Forwarded { bootstrap, .. }
+        | Response::Reconciled { bootstrap }
+        | Response::Stopped { bootstrap, .. } => bootstrap,
+        Response::Bootstrap { .. } | Response::Error { .. } | Response::DryRun { .. } => {
+            return;
+        }
+    };
+    if slot.is_none() {
+        let tasks = BootstrapTaskInputs {
+            scope_level: ScopeLevel::Session,
+            candidates: Vec::new(),
+            authoritative_selection: None,
+        };
+        *slot = runner.take_first_response_bootstrap(&tasks, CurrentAssessment::Ready);
+    }
+}
+/// Fail-closed bounded decode bound to the accepted input profile.
+///
+/// Runs, in order: the decode pre-scan (single-value shape, nesting depth,
+/// per-container member counts, total scalar counts, per-string decoded
+/// bounds, and duplicate-key rejection with escape-equivalent comparison),
+/// the top-level operation-envelope check (exact key set per operation, so
+/// Serde unit variants cannot silently ignore extra members), then typed
+/// `Request` construction with failures mapped to redacted diagnostics.
+/// Diagnostics carry only static reasons and bounded control names; raw
+/// request bytes, unknown-key text beyond the bound, body content, and
+/// credentials never cross into responses. This function grants no authority
+/// and performs no dispatch.
+fn decode_bounded_request(text: &str) -> Result<Request, String> {
+    if let Err(reject) = prevalidate_record(text, REQUEST_INPUT_PROFILE) {
+        return Err(reject.to_string());
+    }
+    if let Err(reject) = check_request_envelope(text, REQUEST_INPUT_PROFILE) {
+        return Err(reject.to_string());
+    }
+    serde_json::from_str::<Request>(text).map_err(|error| classify_serde_error(&error).to_string())
+}
+
 fn handle_invocation<P: KernelHostRequestPort + ?Sized>(
     gateway: &HostRequestGateway,
     port: &mut P,
     request: &HostInvocationRequest,
 ) -> Response {
     match gateway.invoke_with_receipt(port, request) {
-        Ok((result, completion)) => Response::Invocation { result, completion },
+        Ok((result, completion)) => Response::Invocation {
+            result,
+            completion,
+            bootstrap: None,
+        },
         Err(error) => host_gateway_error(&error),
     }
 }
@@ -574,7 +767,10 @@ fn handle_cancellation<P: KernelHostRequestPort + ?Sized>(
     request: &HostCancellationRequest,
 ) -> Response {
     match gateway.cancel(port, request) {
-        Ok(result) => Response::Cancellation { result },
+        Ok(result) => Response::Cancellation {
+            result,
+            bootstrap: None,
+        },
         Err(error) => host_gateway_error(&error),
     }
 }
@@ -801,6 +997,7 @@ fn handle_reconnect(
             session_id: view.binding().session_id().as_str().to_owned(),
             activation_generation: view.binding().activation_generation().get(),
             authority_epoch: view.binding().state_fence().authority_epoch().clone(),
+            bootstrap: None,
         },
         Err(BridgeError::StaleAuthority) => Response::Error {
             code: "RECONNECT_STALE_AUTHORITY",
@@ -842,6 +1039,7 @@ fn build_stop_response(pending_all: Vec<StopPendingIdentity>) -> Response {
         drained: 0,
         truncated,
         pending,
+        bootstrap: None,
     }
 }
 
@@ -889,6 +1087,9 @@ fn status_response(profile: Profile, runner: &BridgeRunner) -> Response {
             host_request_port: "no-session: attach and activate before host-request dispatch",
             observation_forwarding_port: "unavailable: Kernel observation route not admitted",
             recovery: "attach and activate before host requests; reconnect requires a live attach",
+            reactive: None,
+            bootstrap: None,
+            resources: None,
         },
         Some(view) => Response::Status {
             profile: Profile::as_str(profile),
@@ -903,7 +1104,39 @@ fn status_response(profile: Profile, runner: &BridgeRunner) -> Response {
             host_request_port: "session-bound: dispatch joins the admitted Kernel session",
             observation_forwarding_port: "unavailable: Kernel observation route not admitted",
             recovery: "reconnect with the live connection, session, generation, epoch, and fence nonce from this status; stale targets fail closed",
+            reactive: Some(reactive_status_view(runner)),
+            bootstrap: None,
+            resources: Some(resource_status_view(runner)),
         },
+    }
+}
+
+/// Projects the bounded reactive delivery-record summary for Status.
+///
+/// Read-only: counts live-session pending injections and lists the first
+/// sticky attention identities. The caller selects absence for the detached
+/// arm. Never touches dispatch, activation, transport, or ledger state.
+fn reactive_status_view(runner: &BridgeRunner) -> ReactiveStatusView {
+    let attention = runner.reactive_attention();
+    let truncated = attention.len() > MAX_STATUS_ATTENTION_ITEMS;
+    ReactiveStatusView {
+        pending: runner.reactive_pending_count(),
+        attention_item_ids: attention
+            .iter()
+            .take(MAX_STATUS_ATTENTION_ITEMS)
+            .map(|item| item.item_id.clone())
+            .collect(),
+        attention_truncated: truncated,
+    }
+}
+
+/// Projects the attach-scoped resource projection summary for Status.
+///
+/// Read-only: counts retained immutable snapshots. Never touches dispatch,
+/// activation, transport, or registry state.
+fn resource_status_view(runner: &BridgeRunner) -> ResourceRegistryView {
+    ResourceRegistryView {
+        entries: runner.resource_registry_len(),
     }
 }
 
@@ -1230,6 +1463,7 @@ mod tests {
         .expect("test runner must compose without a kernel port")
     }
 
+    // WORK_UNIT_CASE: 977/11
     #[test]
     fn raw_forward_frame_is_not_a_public_operation() {
         let error = serde_json::from_str::<Request>(r#"{"op":"forward_frame","frame":{}}"#)
@@ -1237,6 +1471,7 @@ mod tests {
         assert!(error.to_string().contains("unknown variant"));
     }
 
+    // WORK_UNIT_CASE: 977/2
     #[test]
     fn dry_run_ops_deserialize_and_real_ops_take_no_dry_run_flag() {
         assert!(matches!(
@@ -1262,6 +1497,31 @@ mod tests {
         let error = serde_json::from_str::<Request>(&bogus)
             .expect_err("dry-run invoke must reject unknown fields");
         assert!(error.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn dry_run_ops_pass_production_decode_gate_to_dispatch() {
+        // The production stdio loop decodes through decode_bounded_request
+        // (pre-scan + envelope shape + typed Request), not raw serde: dry-run
+        // wire ingress must survive that exact pipeline to reach the
+        // implementation, and foreign members must fail closed there.
+        assert!(matches!(
+            decode_bounded_request(DRY_RUN_INVOKE).expect("dry-run invoke must pass the gate"),
+            Request::DryRunInvoke { .. }
+        ));
+        assert!(matches!(
+            decode_bounded_request(DRY_RUN_CANCEL).expect("dry-run cancel must pass the gate"),
+            Request::DryRunCancel { .. }
+        ));
+        let bogus = DRY_RUN_INVOKE.replace(
+            "\"op\":\"dry_run_invoke\",",
+            "\"op\":\"dry_run_invoke\",\"bogus\":1,",
+        );
+        let detail = decode_bounded_request(&bogus).expect_err("gate must reject foreign members");
+        assert!(
+            detail.contains(REQUEST_INPUT_PROFILE_ID),
+            "gate rejection must cite the profile, got: {detail}"
+        );
     }
 
     #[test]
@@ -1423,6 +1683,8 @@ mod tests {
         ));
     }
 
+    // WORK_UNIT_CASE: 977/9
+    // WORK_UNIT_CASE: 977/13
     #[test]
     fn forged_kernel_identity_field_is_rejected() {
         let forged = INVOKE.replace(
@@ -1434,6 +1696,7 @@ mod tests {
         assert!(error.to_string().contains("unknown field"));
     }
 
+    // WORK_UNIT_CASE: 977/17
     #[test]
     fn unavailable_kernel_binding_returns_correlated_typed_rejection() {
         let Request::Invoke { request } =
@@ -1459,6 +1722,8 @@ mod tests {
         );
     }
 
+    // WORK_UNIT_CASE: 977/2
+    // WORK_UNIT_CASE: 977/15
     #[test]
     fn cancellation_needs_no_prose_and_preserves_exact_target() {
         let Request::Cancel { request } =
@@ -1485,6 +1750,7 @@ mod tests {
         );
     }
 
+    // WORK_UNIT_CASE: 977/18
     #[test]
     fn output_bound_refuses_oversize_and_timeout_is_explicit() {
         let small = Response::Error {
@@ -1529,6 +1795,7 @@ mod tests {
         assert_eq!(fast, 7_u8);
     }
 
+    // WORK_UNIT_CASE: 977/16
     #[test]
     fn stop_reports_bounded_drain_with_original_identity() {
         let clean = build_stop_response(Vec::new());
@@ -1566,5 +1833,456 @@ mod tests {
         );
         let framed = frame_response(&response).expect("bounded drain report must fit");
         assert!(framed.len() <= MAX_OUTPUT_FRAME_BYTES);
+    }
+
+    /// I7.19 stdio-shape proof: issued Delivery/Injection Receipts ride the
+    /// `Forwarded` frame that carried them, the key stays absent when no
+    /// receipt was issued, and Status projects the bounded reactive summary.
+    #[test]
+    fn forwarded_response_carries_receipts_only_when_issued() {
+        use eliot_agent_bridge::{
+            AdmissionBasis, DeliveryPoint, FiringEvidence, RiskTier, Severity, UseOutcome,
+        };
+
+        const DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let receipt = InjectionReceipt {
+            receipt_id: "injection-receipt-1".to_owned(),
+            item_id: "reactive-item-1".to_owned(),
+            session_id: "session-reactive-1".to_owned(),
+            firing: FiringEvidence {
+                rule_id: "exact-rule-reactive-7".to_owned(),
+                cue_id: "cue-reactive-1".to_owned(),
+                cue_digest: DIGEST.to_owned(),
+            },
+            admission: AdmissionBasis {
+                scope_id: "scope-reactive-1".to_owned(),
+                status: "active".to_owned(),
+                risk: RiskTier::Severe,
+                governance_profile_rev: "gov-reactive-3".to_owned(),
+                fence_epoch: "epoch-reactive-1".to_owned(),
+                fence_generation: 2,
+                admitted_severity: Severity::Critical,
+            },
+            delivery: DeliveryPoint::HostHook {
+                hook_id: "hook-reactive-1".to_owned(),
+            },
+            use_status: UseOutcome::Unknown,
+        };
+        let empty = Response::Forwarded {
+            bootstrap: None,
+            reactive_receipts: Vec::new(),
+        };
+        let empty_value = serde_json::to_value(&empty).expect("forwarded must serialize");
+        assert_eq!(empty_value["status"], Value::String("forwarded".to_owned()));
+        assert!(
+            empty_value.get("reactive_receipts").is_none(),
+            "no receipts means no key on the wire"
+        );
+        let carried = Response::Forwarded {
+            bootstrap: None,
+            reactive_receipts: vec![receipt],
+        };
+        let value = serde_json::to_value(&carried).expect("carried must serialize");
+        let receipts = value["reactive_receipts"]
+            .as_array()
+            .expect("receipts must list");
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(
+            receipts[0]["receipt_id"],
+            Value::String("injection-receipt-1".to_owned())
+        );
+        assert_eq!(
+            receipts[0]["firing"]["rule_id"],
+            Value::String("exact-rule-reactive-7".to_owned())
+        );
+        assert_eq!(
+            receipts[0]["admission"]["scope_id"],
+            Value::String("scope-reactive-1".to_owned())
+        );
+        assert_eq!(
+            receipts[0]["delivery"]["kind"],
+            Value::String("HOST_HOOK".to_owned())
+        );
+        assert!(receipts[0].get("use_status").is_some());
+        let framed = frame_response(&carried).expect("receipt frame must fit");
+        assert!(framed.len() <= MAX_OUTPUT_FRAME_BYTES);
+    }
+
+    #[test]
+    fn detached_status_omits_reactive_summary_and_view_is_empty() {
+        let runner = fixture_runner();
+        let view = reactive_status_view(&runner);
+        assert_eq!(view.pending, 0);
+        assert!(view.attention_item_ids.is_empty());
+        assert!(!view.attention_truncated);
+        let resources = resource_status_view(&runner);
+        assert_eq!(resources.entries, 0);
+        let response = status_response(Profile::SpineFunctional, &runner);
+        let value = serde_json::to_value(&response).expect("status must serialize");
+        assert_eq!(value["attached"], Value::Bool(false));
+        assert!(
+            value.get("reactive").is_none(),
+            "detached status carries no reactive key"
+        );
+        assert!(
+            value.get("resources").is_none(),
+            "detached status carries no resources key"
+        );
+    }
+
+    /// Bounded-decoder proof over the versioned JSON corpus.
+    ///
+    /// Drives every `tests/data/request_input_cases.json` entry through the
+    /// exact production pipeline (`prevalidate_record` →
+    /// `check_request_envelope` → typed `Request` construction with
+    /// redacted classification, or `read_bounded_record` framing for the
+    /// non-UTF-8 entry). Accepts assert the operation discriminant;
+    /// rejections assert the profile citation, the bound-specific reason,
+    /// and — for the secret canary — that the sensitive body never crosses
+    /// into the diagnostic.
+    ///
+    /// Case 977/14 holds by construction here: every rejection below is
+    /// produced by the pure `decode_bounded_request` stage (`&str` in,
+    /// `Result` out), which takes no handler, gateway, port, or runner
+    /// handle, so a rejected record cannot have dispatched before the
+    /// `Err` is observed. Startup failures stay on the separate
+    /// `emit_error` + process-exit path and never enter this pipeline.
+    // WORK_UNIT_CASE: 977/2
+    // WORK_UNIT_CASE: 977/4
+    // WORK_UNIT_CASE: 977/5
+    // WORK_UNIT_CASE: 977/9
+    // WORK_UNIT_CASE: 977/12
+    // WORK_UNIT_CASE: 977/13
+    // WORK_UNIT_CASE: 977/14
+    // WORK_UNIT_CASE: 977/15
+    // WORK_UNIT_CASE: 977/18
+    // WORK_UNIT_CASE: 977/19
+    #[test]
+    fn bounded_decoder_fixture_covers_accept_skip_and_reject() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/data/request_input_cases.json"))
+                .expect("decoder fixture must parse");
+        assert_eq!(
+            fixture["profile_id"],
+            Value::String(REQUEST_INPUT_PROFILE_ID.to_owned())
+        );
+        let cases = fixture["cases"]
+            .as_array()
+            .expect("fixture must list cases");
+        assert!(
+            cases.len() >= 20,
+            "proof suite needs at least 20 cases, found {}",
+            cases.len()
+        );
+        let mut covered: usize = 0;
+        for case in cases {
+            let id = case["id"].as_str().expect("case needs an id");
+            let expect = case["expect"].as_str().expect("case needs an expect");
+            if expect == "reject" && id == "invalid-utf8-bytes" {
+                let bytes: Vec<u8> = case["raw_bytes"]
+                    .as_array()
+                    .expect("raw_bytes must list")
+                    .iter()
+                    .map(|byte| {
+                        u8::try_from(byte.as_u64().expect("byte must fit")).expect("byte must fit")
+                    })
+                    .collect();
+                let mut cursor = std::io::BufReader::new(bytes.as_slice());
+                assert!(
+                    matches!(
+                        read_bounded_record(&mut cursor, REQUEST_INPUT_PROFILE),
+                        Ok(ReadOutcome::InvalidUtf8)
+                    ),
+                    "{id} must fail closed at framing"
+                );
+                covered += 1;
+                continue;
+            }
+            let text: String = if let Some(raw) = case.get("raw").and_then(Value::as_str) {
+                raw.to_owned()
+            } else if let Some(generator) = case.get("raw_is").and_then(Value::as_str) {
+                match generator {
+                    "generated-object-5000-members" => {
+                        let mut generated = String::from("{");
+                        for index in 0..5000_usize {
+                            if index > 0 {
+                                generated.push(',');
+                            }
+                            generated.push_str(&format!("\"k{index:05}\":{index}"));
+                        }
+                        generated.push('}');
+                        generated
+                    }
+                    "generated-nested-20000-scalars" => {
+                        let chunk = (0..2500_usize)
+                            .map(|index| index.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        let chunks = (0..8_usize)
+                            .map(|_| format!("[{chunk}]"))
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        format!("[{chunks}]")
+                    }
+                    "generated-long-string-600k" => {
+                        format!("{{\"s\":\"{}\"}}", "x".repeat(600_000))
+                    }
+                    _ => panic!("case {id} names an unknown generator"),
+                }
+            } else {
+                panic!("case {id} needs raw, raw_is, or raw_bytes");
+            };
+            match expect {
+                "skip" => {
+                    assert!(text.trim().is_empty(), "{id} must be a blank line");
+                    covered += 1;
+                }
+                "accept" => {
+                    let request = match decode_bounded_request(&text) {
+                        Ok(request) => request,
+                        Err(detail) => panic!("{id} must decode: {detail}"),
+                    };
+                    let seen = match request {
+                        Request::Attach { .. } => "attach",
+                        Request::Invoke { .. } => "invoke",
+                        Request::Cancel { .. } => "cancel",
+                        Request::DryRunInvoke { .. } => "dry_run_invoke",
+                        Request::DryRunCancel { .. } => "dry_run_cancel",
+                        Request::ForwardHook { .. } => "forward_hook",
+                        Request::ForwardEvent { .. } => "forward_event",
+                        Request::ReconcileExternal {} => "reconcile_external",
+                        Request::Reconnect { .. } => "reconnect",
+                        Request::Status => "status",
+                        Request::Stop => "stop",
+                        Request::Bootstrap { .. } => "bootstrap",
+                    };
+                    if let Some(op) = case.get("op").and_then(Value::as_str) {
+                        assert_eq!(seen, op, "{id} decoded the wrong operation");
+                    }
+                    covered += 1;
+                }
+                "reject" => {
+                    let reason = case["reason"].as_str().expect("reject needs a reason");
+                    let detail = match decode_bounded_request(&text) {
+                        Ok(_) => panic!("{id} must reject"),
+                        Err(detail) => detail,
+                    };
+                    assert!(
+                        detail.contains(REQUEST_INPUT_PROFILE_ID),
+                        "{id} rejection must cite the profile"
+                    );
+                    match reason {
+                        "trailing-bytes" => assert!(
+                            detail.contains("trailing bytes"),
+                            "{id} must report trailing bytes"
+                        ),
+                        "unknown-variant" => assert!(
+                            detail.contains("unsupported operation variant"),
+                            "{id} must report the unknown variant"
+                        ),
+                        "duplicate-key" => assert!(
+                            detail.contains("duplicate protected key"),
+                            "{id} must report the duplicate key"
+                        ),
+                        "depth-exceeded" => assert!(
+                            detail.contains("admitted depth"),
+                            "{id} must report the depth bound"
+                        ),
+                        "too-many-members" => assert!(
+                            detail.contains("admitted member bound"),
+                            "{id} must report the member bound"
+                        ),
+                        "too-many-scalars" => assert!(
+                            detail.contains("admitted scalar bound"),
+                            "{id} must report the scalar bound"
+                        ),
+                        "string-too-long" => assert!(
+                            detail.contains("admitted decoded bound"),
+                            "{id} must report the string bound"
+                        ),
+                        "redacted" => assert!(
+                            !detail.contains("canary-marker-7f3a-secret-body"),
+                            "{id} must not echo the canary body"
+                        ),
+                        _ => {}
+                    }
+                    if id == "secret-canary" {
+                        assert!(
+                            !detail.contains("canary-marker-7f3a-secret-body"),
+                            "canary body must never cross into diagnostics"
+                        );
+                    }
+                    covered += 1;
+                }
+                _ => panic!("case {id} names an unknown expectation"),
+            }
+        }
+        assert!(
+            covered >= 20,
+            "proof suite must cover at least 20 cases, covered {covered}"
+        );
+    }
+
+    const BOOTSTRAP_OP: &str = r#"{
+        "op":"bootstrap",
+        "context":{
+            "principal_ref":"principal-1",
+            "profile_ref":"SPINE_FUNCTIONAL",
+            "workscope_ref":"workscope-1",
+            "onboarding_readiness_ref":"readiness-receipt-1",
+            "onboarding_disposition":"READY_MATERIAL",
+            "revision_refs":["source-gen-9"],
+            "orientation_handles":[],
+            "attention_handles":[],
+            "problem_handles":[],
+            "role_lease_ref":"role-lease-1",
+            "state_fence_ref":"fence-epoch-3-gen-7",
+            "governance":{
+                "profile_ref":"governance-profile-1",
+                "profile_revision":"rev-7",
+                "limiting_integration_evidence":["coverage:PreToolUse:ENFORCED"]
+            },
+            "supported_count":4,
+            "verified_count":3,
+            "candidate_count":1,
+            "conflicts_unknowns":[],
+            "next_safe_expansion":"bind task before material effects"
+        },
+        "tasks":{"scope_level":"session"},
+        "requested_assessment":"READY"
+    }"#;
+
+    const BOOTSTRAP_CONTEXT_JSON: &str = r#"{        "principal_ref":"principal-1",
+        "profile_ref":"SPINE_FUNCTIONAL",
+        "workscope_ref":"workscope-1",
+        "onboarding_readiness_ref":"readiness-receipt-1",
+        "onboarding_disposition":"READY_MATERIAL",
+        "revision_refs":["source-gen-9"],
+        "orientation_handles":[],
+        "attention_handles":[],
+        "problem_handles":[],
+        "role_lease_ref":"role-lease-1",
+        "state_fence_ref":"fence-epoch-3-gen-7",
+        "governance":{
+            "profile_ref":"governance-profile-1",
+            "profile_revision":"rev-7",
+            "limiting_integration_evidence":["coverage:PreToolUse:ENFORCED"]
+        },
+        "supported_count":4,
+        "verified_count":3,
+        "candidate_count":1,
+        "conflicts_unknowns":[],
+        "next_safe_expansion":"bind task before material effects"
+    }"#;
+
+    fn empty_tasks() -> BootstrapTaskInputs {
+        BootstrapTaskInputs {
+            scope_level: ScopeLevel::Session,
+            candidates: Vec::new(),
+            authoritative_selection: None,
+        }
+    }
+
+    fn fixture_runner() -> BridgeRunner {
+        use eliot_agent_bridge_core::ProviderReadiness;
+        BridgeRunner::new(
+            Profile::SpineFunctional,
+            ProviderReadiness::unprobed(),
+            None,
+            None,
+        )
+        .expect("test runner composes")
+    }
+
+    #[test]
+    fn merged_decode_path_and_first_response_bootstrap_composition() {
+        // Main-side bounded decode dispatches known operations — including
+        // the bridge-side bootstrap op through the admitted envelope shape —
+        // and rejects malformed input without dispatch.
+        let decoded =
+            decode_bounded_request(r#"{"op":"status"}"#).expect("status op must decode");
+        assert!(
+            matches!(decoded, Request::Status),
+            "status op must decode to its own request"
+        );
+        let bootstrap_decoded =
+            decode_bounded_request(BOOTSTRAP_OP).expect("valid bootstrap op must decode");
+        assert!(
+            matches!(bootstrap_decoded, Request::Bootstrap { .. }),
+            "explicit bootstrap retrieval must survive the envelope gate"
+        );
+        assert!(
+            decode_bounded_request("{not json").is_err(),
+            "malformed input must reject"
+        );
+        // An unknown op, an extra member on the bootstrap shape, and an
+        // oversized bootstrap record stay rejected: the envelope gate is
+        // not bypassed for the new row.
+        assert!(
+            decode_bounded_request(r#"{"op":"bootstrap_unknown"}"#).is_err(),
+            "unknown operations must reject"
+        );
+        assert!(
+            decode_bounded_request(
+                &BOOTSTRAP_OP.replace(
+                    "\"requested_assessment\":\"READY\"",
+                    "\"requested_assessment\":\"READY\",\"extra\":1"
+                )
+            )
+            .is_err(),
+            "extra envelope members must reject"
+        );
+        assert!(
+            decode_bounded_request(
+                &BOOTSTRAP_OP.replace("source-gen-9", &"g".repeat(600_000))
+            )
+            .is_err(),
+            "oversized records must reject"
+        );
+        // Bridge-side bootstrap injection: the first successful response
+        // carries the bounded bootstrap with the actual governance
+        // evidence; the second carries none, while explicit retrieval
+        // stays available (including via the admitted stdio op above).
+        let mut runner = fixture_runner();
+        let context: BootstrapContext =
+            serde_json::from_str(BOOTSTRAP_CONTEXT_JSON).unwrap();
+        runner
+            .note_bootstrap_context(context)
+            .expect("valid context must note");
+        let mut first = Response::Forwarded {
+            bootstrap: None,
+            reactive_receipts: Vec::new(),
+        };
+        attach_auto_bootstrap(&mut runner, &mut first);
+        let carried = match first {
+            Response::Forwarded {
+                bootstrap: Some(ref bootstrap),
+                ..
+            } => bootstrap,
+            _ => panic!("first successful response must carry the bootstrap"),
+        };
+        assert!(
+            !carried.governance.limiting_integration_evidence.is_empty(),
+            "bootstrap must carry limiting integration evidence"
+        );
+        let mut second = Response::Forwarded {
+            bootstrap: None,
+            reactive_receipts: Vec::new(),
+        };
+        attach_auto_bootstrap(&mut runner, &mut second);
+        assert!(
+            matches!(
+                second,
+                Response::Forwarded {
+                    bootstrap: None,
+                    reactive_receipts: _
+                }
+            ),
+            "bootstrap must be injected exactly once"
+        );
+        let explicit = runner
+            .get_understanding_bootstrap(&empty_tasks(), CurrentAssessment::Ready)
+            .expect("explicit retrieval stays available");
+        assert_eq!(explicit.governance.profile_ref, "governance-profile-1");
     }
 }
