@@ -25,6 +25,16 @@ use eliot_agent_bridge_core::{
 pub use eliot_agent_bridge_core::{
     AgentRecallProjection, MAX_AGENT_RECALL_HANDLES, project_recall_for_agent,
 };
+/// I7.18/I7.24 revisioned-resource read surface: canonical `eliot://`
+/// identities, bounded hot-response projections (preview plus handle), and
+/// tool-result delivery receipts. The bridge publishes only owner-supplied
+/// snapshots into its attach-scoped transport projection and never estimates
+/// tokens or delivery completeness: `tokens_rendered` and `delivery` arrive
+/// from the projecting route owner.
+pub use eliot_agent_bridge_core::{
+    DeliveryStatus, HotResourceView, MAX_CONTENT_BYTES, MAX_PREVIEW_BYTES, MAX_REGISTRY_ENTRIES,
+    MAX_URI_BYTES, ResourceHandle, ResourceKind, ResourceRegistry, ResourceUri, ToolResultReceipt,
+};
 use eliot_mcp::KernelHostRequestPort;
 use eliot_protocol::{
     AckPhase, AgentBridgeClientDeclaration, AgentBridgePeerAdmissionReceipt,
@@ -35,6 +45,7 @@ use eliot_runtime::{Runtime, RuntimeConfig};
 mod cli_contract;
 mod kernel_activation_client;
 mod kernel_host_request_client;
+pub mod reactive_injection_receipts;
 mod understanding_bootstrap;
 pub(crate) use cli_contract::validate_client_declaration_path;
 pub use cli_contract::{CliConfig, CliError, Profile, Transport, parse_args};
@@ -45,6 +56,11 @@ use kernel_activation_client::{
     denial_reason_code,
 };
 use kernel_host_request_client::{KernelHostRequestClient, ReplayCacheEntry};
+pub use reactive_injection_receipts::{
+    AdmissionBasis, AttentionItem, CueKind, DeliveryPoint, FiringEvidence, InjectionReceipt,
+    ItemDisposition, NormalizedCue, REACTIVE_INJECTION_CONTRACT, ReactiveInjectionError,
+    ReactiveInjectionLedger, RiskTier, Severity, UseOutcome,
+};
 pub use understanding_bootstrap::{
     AuthoritativeSelection, BootstrapContext, BootstrapError, BootstrapSession,
     BootstrapTaskInputs, CurrentAssessment, GovernanceEvidence, ReadinessDisposition, ScopeLevel,
@@ -290,10 +306,18 @@ pub fn kernel_ports_with_declaration(
     Ok((host, host_request, fwd))
 }
 
+/// Projects a reactive delivery-record failure onto the closed bridge error
+/// set without inventing a new variant: the ledger owns the reason text,
+/// the bridge owns only the transport-facing classification.
+fn reactive_ledger_error(error: &ReactiveInjectionError) -> BridgeError {
+    BridgeError::ProviderContract(error.to_string())
+}
+
 pub struct BridgeRunner {
     profile: Profile,
     runtime: Runtime,
     core: AgentBridgeCore,
+    reactive_ledger: ReactiveInjectionLedger,
     bootstrap_session: BootstrapSession,
     bootstrap_context: Option<BootstrapContext>,
 }
@@ -329,6 +353,7 @@ impl BridgeRunner {
             profile,
             runtime,
             core: AgentBridgeCore::new(readiness, host_activation, mcp_forwarding, cursor_policy),
+            reactive_ledger: ReactiveInjectionLedger::new(),
             bootstrap_session: BootstrapSession::default(),
             bootstrap_context: None,
         })
@@ -374,6 +399,237 @@ impl BridgeRunner {
     #[must_use]
     pub fn attach_view(&self) -> Option<AttachView> {
         self.core.attach_view()
+    }
+    /// Live kernel-owned session identity for reactive delivery records.
+    ///
+    /// The session is read from the activation-sealed attach binding, never
+    /// from caller text, so ledger items bind the same session the transport
+    /// enforces (I7.7: no durable session is derived from a connection).
+    fn live_reactive_session(&self) -> Result<String, BridgeError> {
+        self.attach_view()
+            .map(|view| view.binding().session_id().as_str().to_owned())
+            .ok_or(BridgeError::NotAttached)
+    }
+    /// Admits one caller-supplied reactive-context injection as pending for
+    /// the live session (I7.19 admit step).
+    ///
+    /// Cue normalization, exact firing evaluation, relation activation, and
+    /// the admission decision itself stay with their owners (cue owners, the
+    /// reactive planning cell, Governor/Context Compiler): the caller
+    /// supplies the normalized cue, exact firing evidence, bounded relations,
+    /// and admission basis, and this method only records them against the
+    /// live attach session. Returns the minted item identity.
+    pub fn admit_reactive_injection(
+        &mut self,
+        cue: NormalizedCue,
+        firing: Option<FiringEvidence>,
+        relations: Vec<String>,
+        admission: AdmissionBasis,
+    ) -> Result<String, BridgeError> {
+        let session_id = self.live_reactive_session()?;
+        self.reactive_ledger
+            .admit(&session_id, cue, firing, relations, admission)
+            .map_err(|error| reactive_ledger_error(&error))
+    }
+    /// Delivers every pending injection for the live session through a host
+    /// hook invocation, issuing one Delivery/Injection Receipt per item.
+    ///
+    /// `hook_event_id` must be the exact identity of the forwarded
+    /// [`HostEventEnvelope`] that carries the delivery (`event_id`), so each
+    /// receipt names a real owner-observed delivery point. An empty pending
+    /// set drains to an empty receipt list without error.
+    pub fn deliver_reactive_pending_via_hook(
+        &mut self,
+        hook_event_id: &str,
+    ) -> Result<Vec<InjectionReceipt>, BridgeError> {
+        let session_id = self.live_reactive_session()?;
+        let pending = self.reactive_ledger.pending_item_ids(&session_id);
+        let mut receipts = Vec::with_capacity(pending.len());
+        for item_id in pending {
+            let receipt = self
+                .reactive_ledger
+                .deliver(
+                    &item_id,
+                    DeliveryPoint::HostHook {
+                        hook_id: hook_event_id.to_owned(),
+                    },
+                )
+                .map_err(|error| reactive_ledger_error(&error))?;
+            receipts.push(receipt);
+        }
+        Ok(receipts)
+    }
+    /// Delivers every pending injection for the live session inside the next
+    /// bridge response (I7.10 tool-only piggyback), issuing one
+    /// Delivery/Injection Receipt per item.
+    ///
+    /// `response_id` names the exact response frame that carries the
+    /// delivery. An empty pending set drains to an empty receipt list
+    /// without error.
+    pub fn deliver_reactive_pending_via_response(
+        &mut self,
+        response_id: &str,
+    ) -> Result<Vec<InjectionReceipt>, BridgeError> {
+        let session_id = self.live_reactive_session()?;
+        let pending = self.reactive_ledger.pending_item_ids(&session_id);
+        let mut receipts = Vec::with_capacity(pending.len());
+        for item_id in pending {
+            let receipt = self
+                .reactive_ledger
+                .deliver(
+                    &item_id,
+                    DeliveryPoint::NextBridgeResponse {
+                        response_id: response_id.to_owned(),
+                    },
+                )
+                .map_err(|error| reactive_ledger_error(&error))?;
+            receipts.push(receipt);
+        }
+        Ok(receipts)
+    }
+    /// Projects sticky attention output for the live session.
+    ///
+    /// Every open critical item stays present (pending or delivered) until a
+    /// durable resolved, waived, or superseded disposition is recorded;
+    /// delivered normal items appear only after invalidation re-admits them.
+    /// Empty while detached.
+    #[must_use]
+    pub fn reactive_attention(&self) -> Vec<AttentionItem> {
+        match self.attach_view() {
+            Some(view) => self
+                .reactive_ledger
+                .attention_output(view.binding().session_id().as_str()),
+            None => Vec::new(),
+        }
+    }
+    /// Number of pending (undelivered) injections for the live session.
+    /// Zero while detached.
+    #[must_use]
+    pub fn reactive_pending_count(&self) -> usize {
+        match self.attach_view() {
+            Some(view) => self
+                .reactive_ledger
+                .pending_item_ids(view.binding().session_id().as_str())
+                .len(),
+            None => 0,
+        }
+    }
+    /// Looks up one issued Delivery/Injection Receipt by identity.
+    #[must_use]
+    pub fn reactive_receipt(&self, receipt_id: &str) -> Option<InjectionReceipt> {
+        self.reactive_ledger.receipt(receipt_id).cloned()
+    }
+    /// Records a later observable use, influence, or outcome update for a
+    /// delivered item (I7.6 `influence_ack` side: delivery, acknowledgement,
+    /// use, and causal benefit stay separate; absence stays unknown).
+    ///
+    /// Addressed by ledger item identity, so the owning observer (host hook
+    /// outcome or `eliot.observe`) can report without a live attach.
+    pub fn record_reactive_use(
+        &mut self,
+        item_id: &str,
+        update: UseOutcome,
+    ) -> Result<(), BridgeError> {
+        self.reactive_ledger
+            .record_use(item_id, update)
+            .map_err(|error| reactive_ledger_error(&error))
+    }
+    /// Records a durable resolved, waived, or superseded disposition. Only a
+    /// terminal disposition clears critical stickiness; the disposition
+    /// record itself is owned by the resolving owner, only referenced here.
+    pub fn record_reactive_disposition(
+        &mut self,
+        item_id: &str,
+        disposition: ItemDisposition,
+    ) -> Result<(), BridgeError> {
+        self.reactive_ledger
+            .record_disposition(item_id, disposition)
+            .map_err(|error| reactive_ledger_error(&error))
+    }
+    /// Invalidates session deduplication for a source whose revision or risk
+    /// condition changed. Returns the number of delivered items reopened for
+    /// re-admission; critical stickiness is unaffected.
+    pub fn invalidate_reactive_source(&mut self, source: &str) -> usize {
+        self.reactive_ledger.invalidate_source(source)
+    }
+    /// Exports the ledger bytes for durable persistence by the Store owner.
+    ///
+    /// The bridge holds delivery records only for the life of this process;
+    /// crash-safe persistence is the Store owner's handoff (A1780
+    /// notification-state backend). Bytes are bounded canonical JSON stamped
+    /// with [`REACTIVE_INJECTION_CONTRACT`].
+    pub fn reactive_ledger_snapshot(&self) -> Result<Vec<u8>, BridgeError> {
+        self.reactive_ledger
+            .to_json_bytes()
+            .map_err(|error| reactive_ledger_error(&error))
+    }
+    /// Restores a previously exported ledger, replacing in-memory state.
+    /// Fails closed on wrong contract, oversize, or undecodable bytes.
+    pub fn restore_reactive_ledger(&mut self, bytes: &[u8]) -> Result<(), BridgeError> {
+        self.reactive_ledger = ReactiveInjectionLedger::from_json_bytes(bytes)
+            .map_err(|error| reactive_ledger_error(&error))?;
+        Ok(())
+    }
+    /// Publishes one owner-supplied evidence snapshot and returns its bounded
+    /// hot-response projection: a preview plus an immutable
+    /// `eliot://evidence/<id>` handle (I7.18 acceptance shape).
+    ///
+    /// Content bytes arrive from the owning provider (evidence, Store, task
+    /// owner); the bridge only snapshots them into its attach-scoped
+    /// transport projection. Requires the live attach, which is the scope
+    /// authorization on resolution: detached callers fail closed.
+    pub fn publish_evidence_resource(
+        &mut self,
+        content: Vec<u8>,
+    ) -> Result<HotResourceView, BridgeError> {
+        self.core.publish_evidence(content)
+    }
+    /// Publishes one owner-supplied canonical resource snapshot at its exact
+    /// I7.18 URI and returns its bounded hot-response projection.
+    ///
+    /// Fails closed on non-canonical URIs and on republishing an immutable
+    /// URI with different bytes, so a handle always resolves to the exact
+    /// bytes its digest names.
+    pub fn publish_canonical_resource(
+        &mut self,
+        uri: &ResourceUri,
+        content: Vec<u8>,
+    ) -> Result<HotResourceView, BridgeError> {
+        self.core.publish_resource(uri, content)
+    }
+    /// Explicitly expands one previously published handle to its immutable
+    /// referenced content.
+    ///
+    /// Full evidence, audit, and large-report content is available only
+    /// through this call, never inline in a hot response. Unknown handles
+    /// and digest mismatches fail closed.
+    pub fn expand_resource(&self, handle: &ResourceHandle) -> Result<Vec<u8>, BridgeError> {
+        self.core.expand_resource(handle)
+    }
+    /// Projects one tool result into its delivery receipt (I7.24): exact
+    /// result digest, admissible source handle, rendered bytes, tokens
+    /// rendered under the actual route tokenizer, and delivery completeness.
+    ///
+    /// The bridge never estimates tokens or completeness: `tokens_rendered`
+    /// is measured by the projecting route owner with the actual tokenizer,
+    /// and `delivery` is the owner's observed delivery state. Only a `FULL`
+    /// delivery satisfies a complete-evidence prerequisite (see
+    /// [`ToolResultReceipt::check_complete_evidence`]).
+    pub fn project_tool_result_receipt(
+        &self,
+        result_bytes: &[u8],
+        source_handle: ResourceUri,
+        tokens_rendered: u64,
+        delivery: DeliveryStatus,
+    ) -> Result<ToolResultReceipt, BridgeError> {
+        self.core
+            .project_tool_result(result_bytes, source_handle, tokens_rendered, delivery)
+    }
+    /// Number of immutable snapshots retained in the attach-scoped resource
+    /// projection. Zero while detached; cleared by the core on every attach.
+    #[must_use]
+    pub fn resource_registry_len(&self) -> usize {
+        self.core.resource_registry_len()
     }
     /// Notes the owner-supplied bootstrap context for this session.
     ///
@@ -1264,5 +1520,568 @@ mod tests {
         let mut wrong_order = hello_frame.clone();
         wrong_order.connection_id = "other".to_owned();
         assert!(eliot_ipc::decode_client_hello_frame(&wrong_order, "conn-1").is_err());
+    }
+
+    /// I7.19 caller proof through the production [`BridgeRunner`] path.
+    ///
+    /// The runner is the real caller of the delivery-record ledger: it binds
+    /// every item to the live activation-sealed session, drains pending
+    /// injections at the host-hook and next-response boundaries, and projects
+    /// sticky attention. These tests drive admit → forward → drain → receipt
+    /// → attention → use/disposition exactly as the stdio loop does.
+    mod reactive_runner_tests {
+        use super::super::{
+            AdmissionBasis, AttachBinding, AttachRequest, BridgeError, BridgeRunner, ConnectionId,
+            CueKind, DeliveryPoint, DemandId, FiringEvidence, HostActivationPort,
+            HostEventEnvelope, ItemDisposition, McpForwardingPort, NormalizedCue, Profile,
+            ProviderFailure, ProviderReadiness, ReactiveInjectionLedger, RiskTier, Severity,
+            UseOutcome,
+        };
+        use super::test_epoch;
+        use eliot_agent_bridge_core::{
+            ActivationPortOutcome, ActivationPortResult, CoverageGap, EventEnvelope,
+            EventPortOutcome, FencingToken, Generation, PrincipalId, ReconciliationPortOutcome,
+            SessionId, TaskId, WorkUnitId,
+        };
+
+        const REACTIVE_DIGEST: &str =
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        struct StubActivation {
+            result: ActivationPortResult,
+        }
+
+        impl HostActivationPort for StubActivation {
+            fn activate(
+                &mut self,
+                _request: &AttachRequest,
+            ) -> Result<ActivationPortOutcome, ProviderFailure> {
+                Ok(ActivationPortOutcome::Authenticated(self.result.clone()))
+            }
+        }
+
+        struct StubForwarder;
+
+        impl McpForwardingPort for StubForwarder {
+            fn forward_hook(
+                &mut self,
+                _binding: &AttachBinding,
+                _event: &HostEventEnvelope,
+            ) -> Result<(), ProviderFailure> {
+                Ok(())
+            }
+            fn forward_event(
+                &mut self,
+                _binding: &AttachBinding,
+                _event: &EventEnvelope,
+            ) -> Result<EventPortOutcome, ProviderFailure> {
+                Ok(EventPortOutcome::BestEffortForwarded)
+            }
+            fn forward_gap(
+                &mut self,
+                _binding: &AttachBinding,
+                _gap: &CoverageGap,
+            ) -> Result<(), ProviderFailure> {
+                Err(ProviderFailure::new("test-forwarder", "gap not exercised"))
+            }
+            fn reconcile_external(
+                &mut self,
+                _binding: &AttachBinding,
+            ) -> Result<ReconciliationPortOutcome, ProviderFailure> {
+                Err(ProviderFailure::new(
+                    "test-forwarder",
+                    "reconciliation not exercised",
+                ))
+            }
+        }
+
+        fn reactive_runner(attached: bool) -> BridgeRunner {
+            let generation = Generation::new(7).expect("non-zero test generation");
+            let fence = FencingToken::new(test_epoch(3), generation, "fence-reactive-7")
+                .expect("valid test fence");
+            let result = ActivationPortResult::authenticated(
+                PrincipalId::new("principal-reactive-1").expect("valid principal"),
+                SessionId::new("session-reactive-1").expect("valid session"),
+                generation,
+                fence,
+                TaskId::new("task-reactive-1").expect("valid task"),
+                WorkUnitId::new("work-unit-reactive-1").expect("valid work unit"),
+                "scope-reactive-1",
+                "task-revision-1",
+                "plan-reactive-1",
+                "plan-revision-1",
+            )
+            .expect("valid activation result");
+            let mut runner = BridgeRunner::new(
+                Profile::SpineFunctional,
+                ProviderReadiness::all_admitted(),
+                Some(Box::new(StubActivation { result })),
+                Some(Box::new(StubForwarder)),
+            )
+            .expect("runner composes");
+            if attached {
+                let attach = AttachRequest::managed(
+                    DemandId::new("demand-reactive-1").expect("valid demand"),
+                    ConnectionId::new("conn-reactive-1").expect("valid connection"),
+                );
+                runner.attach(attach).expect("managed attach admits");
+            }
+            runner
+        }
+
+        fn reactive_cue(revision: &str) -> NormalizedCue {
+            NormalizedCue {
+                cue_id: "cue-reactive-1".to_owned(),
+                kind: CueKind::ToolObservation,
+                source: "tool-surface-1".to_owned(),
+                source_revision: revision.to_owned(),
+                cue_digest: REACTIVE_DIGEST.to_owned(),
+            }
+        }
+
+        fn reactive_firing() -> FiringEvidence {
+            FiringEvidence {
+                rule_id: "exact-rule-reactive-7".to_owned(),
+                cue_id: "cue-reactive-1".to_owned(),
+                cue_digest: REACTIVE_DIGEST.to_owned(),
+            }
+        }
+
+        fn reactive_admission(severity: Severity, risk: RiskTier) -> AdmissionBasis {
+            AdmissionBasis {
+                scope_id: "scope-reactive-1".to_owned(),
+                status: "active".to_owned(),
+                risk,
+                governance_profile_rev: "gov-reactive-3".to_owned(),
+                fence_epoch: "epoch-reactive-1".to_owned(),
+                fence_generation: 2,
+                admitted_severity: severity,
+            }
+        }
+
+        fn hook_event(hook_id: &str, sequence: u64) -> HostEventEnvelope {
+            serde_json::from_value(serde_json::json!({
+                "event_id": hook_id,
+                "attempt_id": "attempt-reactive-1",
+                "sequence": sequence,
+                "cursor": "cursor-reactive-1",
+                "kind": "tool_result",
+                "route": {
+                    "host_family": "test",
+                    "adapter": "test",
+                    "protocol_transport": "stdio",
+                    "runtime_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "adapter_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "provider": "provider",
+                    "model": "model",
+                    "auth_billing": "test",
+                    "serializer_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                    "tool_semantics_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                    "reasoning_mode": "test",
+                    "continuation_behavior": "fresh",
+                    "feature_flags_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                },
+                "raw_payload_digest": "digest-reactive-1",
+                "normalized_payload": {},
+                "parent_event_id": null,
+                "observed_at": "2026-09-21T00:00:00Z"
+            }))
+            .expect("valid hook fixture")
+        }
+
+        fn attention_ids(runner: &BridgeRunner) -> Vec<String> {
+            runner
+                .reactive_attention()
+                .iter()
+                .map(|item| item.item_id.clone())
+                .collect()
+        }
+
+        #[test]
+        fn critical_admitted_before_response_stays_sticky_until_resolved() {
+            let mut runner = reactive_runner(true);
+            assert_eq!(runner.reactive_pending_count(), 0);
+            assert!(runner.reactive_attention().is_empty());
+            let item = runner
+                .admit_reactive_injection(
+                    reactive_cue("rev-1"),
+                    Some(reactive_firing()),
+                    vec!["rel-reactive-a".to_owned()],
+                    reactive_admission(Severity::Critical, RiskTier::Severe),
+                )
+                .expect("admit critical binds the live session");
+            assert_eq!(runner.reactive_pending_count(), 1);
+            assert!(attention_ids(&runner).contains(&item));
+            // The host-hook delivery boundary drains the pending injection
+            // and issues the receipt against the real forwarded event.
+            runner
+                .forward_hook(&hook_event("hook-reactive-1", 1))
+                .expect("hook forwards");
+            let receipts = runner
+                .deliver_reactive_pending_via_hook("hook-reactive-1")
+                .expect("hook drain issues receipts");
+            assert_eq!(receipts.len(), 1);
+            let receipt = &receipts[0];
+            assert_eq!(receipt.item_id, item);
+            assert_eq!(receipt.session_id, "session-reactive-1");
+            assert_eq!(receipt.firing.rule_id, "exact-rule-reactive-7");
+            assert_eq!(receipt.firing.cue_digest, REACTIVE_DIGEST);
+            assert_eq!(receipt.admission.scope_id, "scope-reactive-1");
+            assert_eq!(receipt.admission.risk, RiskTier::Severe);
+            assert_eq!(receipt.admission.fence_generation, 2);
+            assert!(matches!(
+                receipt.delivery,
+                DeliveryPoint::HostHook { ref hook_id } if hook_id == "hook-reactive-1"
+            ));
+            assert_eq!(receipt.use_status, UseOutcome::Unknown);
+            assert_eq!(runner.reactive_pending_count(), 0);
+            // Later attention output still carries the critical item.
+            assert!(attention_ids(&runner).contains(&item));
+            // Observable use does not clear stickiness.
+            runner
+                .record_reactive_use(
+                    &item,
+                    UseOutcome::ObservedInfluence {
+                        detail: "shaped retry".to_owned(),
+                    },
+                )
+                .expect("record use");
+            assert!(attention_ids(&runner).contains(&item));
+            let stored = runner
+                .reactive_receipt(&receipt.receipt_id)
+                .expect("receipt retained");
+            assert!(matches!(
+                stored.use_status,
+                UseOutcome::ObservedInfluence { .. }
+            ));
+            // Only a durable terminal disposition clears it.
+            runner
+                .record_reactive_disposition(
+                    &item,
+                    ItemDisposition::Resolved {
+                        record: "owner-fix-reactive-9".to_owned(),
+                    },
+                )
+                .expect("resolve");
+            assert!(!attention_ids(&runner).contains(&item));
+        }
+
+        #[test]
+        fn normal_injected_once_not_reinjected_until_invalidated() {
+            let mut runner = reactive_runner(true);
+            let first = runner
+                .admit_reactive_injection(
+                    reactive_cue("rev-1"),
+                    Some(reactive_firing()),
+                    Vec::new(),
+                    reactive_admission(Severity::Normal, RiskTier::Low),
+                )
+                .expect("admit normal");
+            // The next-response delivery boundary (tool-only piggyback)
+            // issues the receipt against the exact response frame.
+            let receipts = runner
+                .deliver_reactive_pending_via_response("forward-event:evt-reactive-1")
+                .expect("response drain issues receipts");
+            assert_eq!(receipts.len(), 1);
+            assert_eq!(receipts[0].item_id, first);
+            assert!(matches!(
+                receipts[0].delivery,
+                DeliveryPoint::NextBridgeResponse { .. }
+            ));
+            assert!(!attention_ids(&runner).contains(&first));
+            let duplicate = runner.admit_reactive_injection(
+                reactive_cue("rev-1"),
+                Some(reactive_firing()),
+                Vec::new(),
+                reactive_admission(Severity::Normal, RiskTier::Low),
+            );
+            match duplicate {
+                Err(BridgeError::ProviderContract(detail)) => assert!(
+                    detail.contains("already delivered"),
+                    "dedup must name the delivered state, got: {detail}"
+                ),
+                other => panic!("expected dedup rejection, got {other:?}"),
+            }
+            assert_eq!(runner.invalidate_reactive_source("tool-surface-1"), 1);
+            let second = runner
+                .admit_reactive_injection(
+                    reactive_cue("rev-2"),
+                    Some(reactive_firing()),
+                    Vec::new(),
+                    reactive_admission(Severity::Normal, RiskTier::Low),
+                )
+                .expect("re-admit after invalidation");
+            assert_ne!(first, second);
+            let second_receipts = runner
+                .deliver_reactive_pending_via_response("forward-event:evt-reactive-2")
+                .expect("second drain issues receipts");
+            assert_eq!(second_receipts.len(), 1);
+            assert_ne!(
+                second_receipts[0].receipt_id, receipts[0].receipt_id,
+                "second delivery mints a distinct receipt"
+            );
+        }
+
+        #[test]
+        fn ledger_snapshot_restores_across_processes_fail_closed() {
+            let mut runner = reactive_runner(true);
+            runner
+                .admit_reactive_injection(
+                    reactive_cue("rev-1"),
+                    Some(reactive_firing()),
+                    vec!["rel-reactive-a".to_owned()],
+                    reactive_admission(Severity::Critical, RiskTier::High),
+                )
+                .expect("admit");
+            runner
+                .deliver_reactive_pending_via_hook("hook-reactive-9")
+                .expect("drain");
+            let bytes = runner.reactive_ledger_snapshot().expect("snapshot");
+            assert!(!bytes.is_empty());
+            // A fresh detached process restores the exact ledger bytes; the
+            // restored state carries the delivered critical item.
+            let mut restored = reactive_runner(false);
+            restored
+                .restore_reactive_ledger(&bytes)
+                .expect("restore accepts own contract");
+            let again = restored.reactive_ledger_snapshot().expect("re-snapshot");
+            assert_eq!(again, bytes);
+            assert_eq!(
+                ReactiveInjectionLedger::from_json_bytes(&bytes).expect("decode"),
+                ReactiveInjectionLedger::from_json_bytes(&again).expect("decode again")
+            );
+            assert!(
+                restored
+                    .restore_reactive_ledger(b"{\"contract\":\"wrong\"}")
+                    .is_err()
+            );
+            assert!(restored.restore_reactive_ledger(&[]).is_err());
+        }
+
+        #[test]
+        fn detached_runner_admits_nothing_and_projects_nothing() {
+            let mut runner = reactive_runner(false);
+            assert!(matches!(
+                runner.admit_reactive_injection(
+                    reactive_cue("rev-1"),
+                    Some(reactive_firing()),
+                    Vec::new(),
+                    reactive_admission(Severity::Critical, RiskTier::Severe),
+                ),
+                Err(BridgeError::NotAttached)
+            ));
+            assert!(matches!(
+                runner.deliver_reactive_pending_via_hook("hook-reactive-1"),
+                Err(BridgeError::NotAttached)
+            ));
+            assert!(matches!(
+                runner.deliver_reactive_pending_via_response("resp-1"),
+                Err(BridgeError::NotAttached)
+            ));
+            assert!(runner.reactive_attention().is_empty());
+            assert_eq!(runner.reactive_pending_count(), 0);
+        }
+    }
+
+    /// I7.18/I7.24 caller proof through the production [`BridgeRunner`] path.
+    ///
+    /// The runner is the production caller of the core resource projection:
+    /// it publishes owner-supplied snapshots, expands handles, and projects
+    /// tool-result receipts with route-measured tokens and delivery. These
+    /// tests drive publish → preview/handle → expand → receipt → evidence
+    /// gate exactly as an owning producer would, plus detached fail-closed
+    /// behavior.
+    mod resource_runner_tests {
+        use super::super::{
+            AttachBinding, AttachRequest, BridgeError, BridgeRunner, ConnectionId, DeliveryStatus,
+            DemandId, EventEnvelope, HostActivationPort, HostEventEnvelope, McpForwardingPort,
+            Profile, ProviderFailure, ProviderReadiness, ResourceUri,
+        };
+        use super::test_epoch;
+        use eliot_agent_bridge_core::{
+            ActivationPortOutcome, ActivationPortResult, CoverageGap, EventPortOutcome,
+            FencingToken, Generation, PrincipalId, ReconciliationPortOutcome, SessionId, TaskId,
+            WorkUnitId,
+        };
+
+        struct StubActivation {
+            result: ActivationPortResult,
+        }
+
+        impl HostActivationPort for StubActivation {
+            fn activate(
+                &mut self,
+                _request: &AttachRequest,
+            ) -> Result<ActivationPortOutcome, ProviderFailure> {
+                Ok(ActivationPortOutcome::Authenticated(self.result.clone()))
+            }
+        }
+
+        struct StubForwarder;
+
+        impl McpForwardingPort for StubForwarder {
+            fn forward_hook(
+                &mut self,
+                _binding: &AttachBinding,
+                _event: &HostEventEnvelope,
+            ) -> Result<(), ProviderFailure> {
+                Ok(())
+            }
+            fn forward_event(
+                &mut self,
+                _binding: &AttachBinding,
+                _event: &EventEnvelope,
+            ) -> Result<EventPortOutcome, ProviderFailure> {
+                Ok(EventPortOutcome::BestEffortForwarded)
+            }
+            fn forward_gap(
+                &mut self,
+                _binding: &AttachBinding,
+                _gap: &CoverageGap,
+            ) -> Result<(), ProviderFailure> {
+                Err(ProviderFailure::new("test-forwarder", "gap not exercised"))
+            }
+            fn reconcile_external(
+                &mut self,
+                _binding: &AttachBinding,
+            ) -> Result<ReconciliationPortOutcome, ProviderFailure> {
+                Err(ProviderFailure::new(
+                    "test-forwarder",
+                    "reconciliation not exercised",
+                ))
+            }
+        }
+
+        fn resource_runner(attached: bool) -> BridgeRunner {
+            let generation = Generation::new(3).expect("non-zero test generation");
+            let fence = FencingToken::new(test_epoch(2), generation, "fence-resource-3")
+                .expect("valid test fence");
+            let result = ActivationPortResult::authenticated(
+                PrincipalId::new("principal-resource-1").expect("valid principal"),
+                SessionId::new("session-resource-1").expect("valid session"),
+                generation,
+                fence,
+                TaskId::new("task-resource-1").expect("valid task"),
+                WorkUnitId::new("work-unit-resource-1").expect("valid work unit"),
+                "scope-resource-1",
+                "task-revision-1",
+                "plan-resource-1",
+                "plan-revision-1",
+            )
+            .expect("valid activation result");
+            let mut runner = BridgeRunner::new(
+                Profile::SpineFunctional,
+                ProviderReadiness::all_admitted(),
+                Some(Box::new(StubActivation { result })),
+                Some(Box::new(StubForwarder)),
+            )
+            .expect("runner composes");
+            if attached {
+                let attach = AttachRequest::managed(
+                    DemandId::new("demand-resource-1").expect("valid demand"),
+                    ConnectionId::new("conn-resource-1").expect("valid connection"),
+                );
+                runner.attach(attach).expect("managed attach admits");
+            }
+            runner
+        }
+
+        fn large_evidence_bytes() -> Vec<u8> {
+            let mut content = String::from("[");
+            while content.len() < 4 * 1024 + 64 {
+                content.push_str(r#"{"check":"evidence-item","detail":""#);
+                content.push_str(&"x".repeat(64));
+                content.push_str(r#""},"#);
+            }
+            content.push(']');
+            content.into_bytes()
+        }
+
+        #[test]
+        fn large_evidence_returns_preview_plus_handle_and_expands_immutable() {
+            use eliot_agent_bridge_core::{MAX_PREVIEW_BYTES, ResourceKind};
+
+            let mut runner = resource_runner(true);
+            assert_eq!(runner.resource_registry_len(), 0);
+            let content = large_evidence_bytes();
+            assert!(content.len() > MAX_PREVIEW_BYTES);
+            // Acceptance shape: bounded preview plus eliot://evidence handle.
+            let view = runner
+                .publish_evidence_resource(content.clone())
+                .expect("publish evidence binds the live attach");
+            assert_eq!(view.kind(), ResourceKind::Evidence);
+            assert!(
+                view.handle()
+                    .uri()
+                    .as_str()
+                    .starts_with("eliot://evidence/"),
+                "handle must name the evidence family"
+            );
+            assert!(view.preview().len() <= MAX_PREVIEW_BYTES);
+            assert!(view.is_truncated());
+            assert_eq!(view.total_bytes(), content.len());
+            assert_eq!(runner.resource_registry_len(), 1);
+            // Explicit expansion retrieves the immutable referenced content.
+            let expanded = runner
+                .expand_resource(view.handle())
+                .expect("expand resolves the issued handle");
+            assert_eq!(expanded, content);
+            // Republishing the same bytes rebinds the same handle, not a copy.
+            let again = runner
+                .publish_evidence_resource(content.clone())
+                .expect("idempotent republish");
+            assert_eq!(again.handle(), view.handle());
+            assert_eq!(runner.resource_registry_len(), 1);
+        }
+
+        #[test]
+        fn token_truncated_tool_result_is_receipted_and_rejected_as_evidence() {
+            let runner = resource_runner(true);
+            let source =
+                ResourceUri::parse("eliot://evidence/source-9").expect("valid source handle");
+            let result_bytes = vec![b'r'; 3000];
+            // tokens_rendered is measured by the projecting route owner with
+            // the actual tokenizer; the bridge never estimates it.
+            let receipt = runner
+                .project_tool_result_receipt(&result_bytes, source, 750, DeliveryStatus::Truncated)
+                .expect("project receipt");
+            assert_eq!(receipt.delivery(), DeliveryStatus::Truncated);
+            assert_eq!(receipt.bytes_rendered(), result_bytes.len());
+            assert_eq!(receipt.tokens_rendered(), 750);
+            assert_eq!(receipt.result_digest().len(), 64);
+            // A truncated result cannot satisfy complete evidence.
+            assert!(matches!(
+                receipt.check_complete_evidence(),
+                Err(BridgeError::IncompleteDelivery {
+                    delivery: DeliveryStatus::Truncated
+                })
+            ));
+            let full = runner
+                .project_tool_result_receipt(
+                    &result_bytes,
+                    ResourceUri::parse("eliot://evidence/source-9").expect("valid source"),
+                    750,
+                    DeliveryStatus::Full,
+                )
+                .expect("project full receipt");
+            assert!(full.check_complete_evidence().is_ok());
+        }
+
+        #[test]
+        fn detached_runner_publishes_nothing_and_counts_zero() {
+            let mut runner = resource_runner(false);
+            assert!(matches!(
+                runner.publish_evidence_resource(b"bytes".to_vec()),
+                Err(BridgeError::NotAttached)
+            ));
+            assert!(matches!(
+                runner.publish_canonical_resource(
+                    &ResourceUri::parse("eliot://report/r-1").expect("valid uri"),
+                    b"bytes".to_vec(),
+                ),
+                Err(BridgeError::NotAttached)
+            ));
+            assert_eq!(runner.resource_registry_len(), 0);
+        }
     }
 }

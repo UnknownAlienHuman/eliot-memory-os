@@ -663,6 +663,7 @@ dependencies = [
  "eliot-types",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror",
 ]
 
@@ -876,19 +877,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "eliot-campaign-executor"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "blake3",
- "clap",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "uuid",
-]
-
-[[package]]
 name = "eliot-canonical"
 version = "0.1.0"
 dependencies = [
@@ -1010,6 +998,7 @@ dependencies = [
  "eliot-context-contracts",
  "eliot-contracts",
  "eliot-evidence",
+ "eliot-observation-contracts",
  "eliot-receipts",
  "serde",
  "thiserror",
@@ -1039,6 +1028,7 @@ dependencies = [
  "eliot-agent-contracts",
  "eliot-contracts",
  "eliot-evidence",
+ "eliot-observation-contracts",
  "eliot-protocol",
  "eliot-receipts",
  "schemars",
@@ -1743,6 +1733,7 @@ dependencies = [
  "eliot-read",
  "eliot-receipts",
  "eliot-runtime-contracts",
+ "eliot-security-contracts",
  "eliot-session",
  "eliot-skill",
  "eliot-store-api",
@@ -1943,6 +1934,7 @@ dependencies = [
  "eliot-instrument-rustfmt",
  "eliot-instrument-scip",
  "eliot-process",
+ "eliot-process-executor",
  "serde_json",
  "thiserror",
 ]
@@ -2280,6 +2272,7 @@ dependencies = [
  "eliot-agent-opencode",
  "eliot-cli",
  "eliot-contracts",
+ "eliot-kernel",
  "eliot-native-worker-core",
  "eliot-process",
  "eliot-process-executor",
@@ -2715,6 +2708,7 @@ version = "0.1.0"
 dependencies = [
  "eliot-contracts",
  "eliot-protocol",
+ "eliot-rules",
  "eliot-skills",
  "eliot-store-api",
  "serde",

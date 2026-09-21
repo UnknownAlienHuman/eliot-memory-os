@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "issue": 816,
+  "mutations": [
+    {
+      "id": "duplicate_assignment_track",
+      "kind": "assignment_field",
+      "assignment_id": "A-19c",
+      "field": "track",
+      "value": "Context",
+      "expected": "assignment identity and track are unique"
+    },
+    {
+      "id": "wrong_wire_family",
+      "kind": "wire_field",
+      "wire_kind": "Classification",
+      "field": "family",
+      "value": "Relation",
+      "expected": "wire kind keeps its declared family"
+    },
+    {
+      "id": "structure_repair_wire_variant",
+      "kind": "wire_append",
+      "row": {
+        "kind": "StructureRepair",
+        "family": "StructureRepair",
+        "assignment_id": "A-27",
+        "issue": 665,
+        "wire_order": 12
+      },
+      "expected": "StructureRepair is a family, not a wire kind"
+    },
+    {
+      "id": "missing_assignment_owner",
+      "kind": "remove_assignment",
+      "assignment_id": "A-15",
+      "expected": "every topology row has a stable owner"
+    },
+    {
+      "id": "forbidden_validator_edge",
+      "kind": "compile_append",
+      "row": {
+        "from": "A-31",
+        "to": "A-05",
+        "contract": "validator implementation",
+        "relation": "contract_only"
+      },
+      "expected": "A-31 consumes inherited validation and does not import A-05"
+    },
+    {
+      "id": "compile_cycle",
+      "kind": "compile_append",
+      "row": {
+        "from": "A-15",
+        "to": "A-16a",
+        "contract": "cycle",
+        "relation": "contract_only"
+      },
+      "expected": "compile dependencies remain acyclic"
+    },
+    {
+      "id": "screen_not_terminal",
+      "kind": "policy_field",
+      "field": "curation_dispatchable_terminal",
+      "value": "Protected",
+      "expected": "only exact terminal Eligible evidence dispatches"
+    },
+    {
+      "id": "reactive_writer",
+      "kind": "runtime_field",
+      "runtime_id": "reactive-plan-to-brctx",
+      "field": "writes",
+      "value": true,
+      "expected": "A-19r only proposes an inert plan"
+    },
+    {
+      "id": "metadata_runtime_claim",
+      "kind": "topology_field",
+      "field": "runtime_completion",
+      "value": true,
+      "expected": "metadata proof cannot claim runtime completion"
+    }
+  ]
+}
