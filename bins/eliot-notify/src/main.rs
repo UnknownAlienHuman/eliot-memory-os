@@ -56,6 +56,7 @@ enum Response {
         service: &'static str,
         protocol: &'static str,
         receipt: Box<eliot_notify_core::UserAutomationPreflightReceipt>,
+        reason: eliot_notify_core::UserAutomationDeferReason,
     },
     PreflightBlocked {
         service: &'static str,
@@ -334,21 +335,25 @@ fn dispatch_user_automation(
     projection: eliot_notify_core::UserAutomationPreflightProjection,
     request: &NotificationRequest,
 ) -> Response {
-    let decision = match projection.preflight(&invocation, request) {
-        Ok(decision) => decision,
-        Err(error) => return preflight_error(error.to_string()),
-    };
+    let decision =
+        match eliot_notify_core::preflight_user_automation(&projection, &invocation, request) {
+            Ok(decision) => decision,
+            Err(error) => return preflight_error(error.to_string()),
+        };
     match decision {
         UserAutomationPreflightDecision::Admitted { receipt } => Response::PreflightAdmitted {
             service: SERVICE_NAME,
             protocol: PROTOCOL_VERSION,
             receipt: Box::new(receipt),
         },
-        UserAutomationPreflightDecision::Deferred { receipt } => Response::PreflightDeferred {
-            service: SERVICE_NAME,
-            protocol: PROTOCOL_VERSION,
-            receipt: Box::new(receipt),
-        },
+        UserAutomationPreflightDecision::Deferred { receipt, reason } => {
+            Response::PreflightDeferred {
+                service: SERVICE_NAME,
+                protocol: PROTOCOL_VERSION,
+                receipt: Box::new(receipt),
+                reason,
+            }
+        }
         UserAutomationPreflightDecision::BlockedConfig { receipt, failure } => {
             match composition.deliver_user_automation_failure(failure, request) {
                 Ok(observation) => Response::PreflightBlocked {

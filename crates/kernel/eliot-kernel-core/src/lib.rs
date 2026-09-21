@@ -35,6 +35,7 @@ mod authority_snapshot;
 pub mod error;
 pub mod grant_activation_port;
 pub mod module;
+pub mod user_automation;
 
 pub use authority::{
     AuthorityGrant, AuthorityGrantRequest, AuthorityReceipt, KernelAuthority, KernelAuthorityKey,
@@ -74,6 +75,24 @@ pub use module::process_health::{
     CapabilityReadiness, HealthDimensionKind, ProcessHealthStatus, ProcessHealthVector,
 };
 pub use module::recovery_state_view::{RecoveryViewBuilder, project_operational_state};
+pub use user_automation::{
+    AutomationCapabilityProfile, AutomationDeliveryTarget, AutomationExecutionReference,
+    AutomationFailureNotificationProjection, AutomationOccurrenceIdentity, AutomationRecipient,
+    AutomationRecipientRole, AutomationReconciliationReference, AutomationResourceCeiling,
+    AutomationTaskBinding, AutomationTaskKind, AutomationWorkClass, AutomationWorkScope,
+    DstFoldPolicy, DstGapPolicy, NormalizedSchedule, OverlapPolicy, ProviderFingerprint,
+    ProviderFingerprintPolicy, RecursionPolicy, RouteCostPolicy, ScheduleKind,
+    USER_AUTOMATION_CONTRACT_NAME, USER_AUTOMATION_CONTRACT_VERSION,
+    USER_AUTOMATION_PREFLIGHT_CONTRACT_REVISION, USER_AUTOMATION_PREFLIGHT_EFFECT_CEILING,
+    USER_AUTOMATION_PREFLIGHT_OPERATION, USER_AUTOMATION_PREFLIGHT_SELECTOR, USER_AUTOMATION_SCOPE,
+    UserAutomationConfigurationState, UserAutomationDeferReason, UserAutomationError,
+    UserAutomationExecutionMode, UserAutomationFailureProjection, UserAutomationFailureReason,
+    UserAutomationInvocation, UserAutomationOperation, UserAutomationOperatorIntent,
+    UserAutomationPreflightContext, UserAutomationPreflightDecision,
+    UserAutomationPreflightProjection, UserAutomationPreflightReceipt, UserAutomationQuery,
+    UserAutomationQueryKind, UserAutomationRevision, UserAutomationTrigger,
+    UserAutomationTriggerOrigin, user_automation_contract_identity,
+};
 
 /// Result of releasing a pre-effect process-start replay reservation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

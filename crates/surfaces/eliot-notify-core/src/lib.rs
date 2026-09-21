@@ -11,11 +11,11 @@
 mod user_automation;
 
 pub use user_automation::{
-    UserAutomationConfigurationState, UserAutomationExecutionMode,
+    UserAutomationConfigurationState, UserAutomationDeferReason, UserAutomationExecutionMode,
     UserAutomationFailureNotification, UserAutomationFailureRequest, UserAutomationInvocation,
     UserAutomationNotificationProjection, UserAutomationPreflightDecision,
     UserAutomationPreflightError, UserAutomationPreflightProjection,
-    UserAutomationPreflightReceipt, UserAutomationTrigger,
+    UserAutomationPreflightReceipt, UserAutomationTrigger, preflight_user_automation,
 };
 
 use std::fmt::Write as _;
