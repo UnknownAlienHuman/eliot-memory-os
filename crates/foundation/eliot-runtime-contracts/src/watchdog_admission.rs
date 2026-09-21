@@ -24,6 +24,23 @@ pub const WATCHDOG_PUBLICATION_FILE_NAME: &str = "watchdog-publication.json";
 /// Current bundle plus one predecessor retained for bounded audit/recovery.
 pub const WATCHDOG_PUBLICATION_RETAINED_LIMIT: usize = 2;
 
+/// Canonical Host-issued heartbeat rendezvous file below the approved Host
+/// state root (transport1750).
+pub const WATCHDOG_HEARTBEAT_TRANSPORT_FILE_NAME: &str = "watchdog-heartbeat-transport.json";
+/// Host-persisted heartbeat observation file below the approved Host state
+/// root (transport1750). Audit evidence only.
+pub const HOST_HEARTBEAT_OBSERVATION_FILE_NAME: &str = "watchdog-heartbeat-observation.json";
+/// Namespace prefix for the per-instance Host-owned heartbeat pipe.
+pub const WATCHDOG_HEARTBEAT_PIPE_PREFIX: &str = r"\\.\pipe\eliot-watchdog-heartbeat-";
+/// Schema marker for the Host-issued transport descriptor.
+pub const WATCHDOG_HEARTBEAT_TRANSPORT_SCHEMA: &str = "eliot.watchdog-heartbeat-transport.v1";
+/// Schema marker for the Host-persisted observation record.
+pub const HOST_HEARTBEAT_OBSERVATION_SCHEMA: &str = "eliot.host-watchdog-heartbeat-observation.v1";
+/// Service literal echoed in every heartbeat message.
+pub const WATCHDOG_HEARTBEAT_SERVICE: &str = "EliotWatchdog";
+/// Protocol literal echoed in every heartbeat message.
+pub const WATCHDOG_HEARTBEAT_PROTOCOL: &str = "eliot.watchdog.v1";
+
 /// Validation failure for public Watchdog admission/publication contracts.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum WatchdogPublicationError {

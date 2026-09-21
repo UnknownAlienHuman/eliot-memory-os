@@ -21,6 +21,7 @@ mod reactive_attention;
 mod reactive_coverage;
 mod reactive_input;
 mod reactive_session;
+mod readback;
 mod view;
 
 pub use admission::{
@@ -72,6 +73,10 @@ pub use reactive_input::{
 pub use reactive_session::{
     DeliveryEvidenceClosure, PriorDeliveryBinding, SessionDeliverySnapshot, SnapshotCompleteness,
     SnapshotDenominator,
+};
+pub use readback::{
+    IndexPreview, MAX_EXCERPT_BYTES, MAX_PREVIEW_BYTES, PreviewAuthority, ProjectedCitation,
+    ReadbackRefusal, ReadbackRefusalKind, ReadbackRequest,
 };
 pub use view::{ActiveUnderstandingView, RenderedAtom, SelectionIntegrityProof};
 

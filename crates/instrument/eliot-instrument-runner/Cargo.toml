@@ -16,6 +16,7 @@ eliot-instrument-rustc = { path = "../eliot-instrument-rustc", version = "0.1.0"
 eliot-instrument-rustfmt = { path = "../eliot-instrument-rustfmt", version = "0.1.0" }
 eliot-instrument-scip = { path = "../eliot-instrument-scip", version = "0.1.0" }
 eliot-process.workspace = true
+eliot-process-executor = { path = "../eliot-process-executor", version = "0.1.0" }
 serde_json = "1.0.150"
 thiserror = "2.0.18"
 

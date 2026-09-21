@@ -134,6 +134,12 @@ pub enum ParameterShape {
     /// mechanism that bounds the activated reads), so no separate string
     /// length constant exists here.
     Subject,
+    /// A closed canonical notification-state payload object (issue #1780):
+    /// the canonical record, receipt, delivery-state, or authorization JSON
+    /// for the `ApplyNotificationState` legs and the read selectors that
+    /// carry structured values. The value must be a JSON object; leg
+    /// completeness is enforced by the notification-state contract.
+    NotificationState,
 }
 
 impl ParameterShape {
@@ -144,6 +150,7 @@ impl ParameterShape {
             Self::EpistemicRevision => "eliot.storage.epistemic-revision.v1",
             Self::OperationId => "operation-id",
             Self::Subject => "subject-text",
+            Self::NotificationState => "eliot.notify.state.v1",
         }
     }
 }
@@ -466,6 +473,102 @@ static APPLY_ERASURE_PARAMETERS: [ParameterDeclaration; 5] = [
     },
 ];
 
+/// Owner-approved canonical notification-state fields (issue #1780): the leg
+/// discriminator plus the conditionally-required leg payloads. Leg
+/// completeness (which payload each leg requires) is enforced by the
+/// notification-state contract; every name here is optional at the
+/// declaration level so one closed table serves all four legs.
+static APPLY_NOTIFICATION_STATE_PARAMETERS: [ParameterDeclaration; 10] = [
+    ParameterDeclaration {
+        name: "mutation",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "dedup_key",
+        shape: ParameterShape::Subject,
+        required: false,
+    },
+    ParameterDeclaration {
+        name: "notification_id",
+        shape: ParameterShape::Subject,
+        required: false,
+    },
+    ParameterDeclaration {
+        name: "record_json",
+        shape: ParameterShape::NotificationState,
+        required: false,
+    },
+    ParameterDeclaration {
+        name: "source_receipt_json",
+        shape: ParameterShape::NotificationState,
+        required: false,
+    },
+    ParameterDeclaration {
+        name: "delivery_json",
+        shape: ParameterShape::NotificationState,
+        required: false,
+    },
+    ParameterDeclaration {
+        name: "channel",
+        shape: ParameterShape::Subject,
+        required: false,
+    },
+    ParameterDeclaration {
+        name: "principal",
+        shape: ParameterShape::Subject,
+        required: false,
+    },
+    ParameterDeclaration {
+        name: "disposition",
+        shape: ParameterShape::Subject,
+        required: false,
+    },
+    ParameterDeclaration {
+        name: "authorization_json",
+        shape: ParameterShape::NotificationState,
+        required: false,
+    },
+];
+
+/// Owner-approved notification-state read selectors (issue #1780): the
+/// optional record-scope filter, the optional exact dedup-key selector, the
+/// optional exact notification-identity selector, the required
+/// resolved-row inclusion flag, the required decimal page bound, and the
+/// optional opaque cursor.
+static GET_NOTIFICATION_STATE_PARAMETERS: [ParameterDeclaration; 6] = [
+    ParameterDeclaration {
+        name: "scope",
+        shape: ParameterShape::Subject,
+        required: false,
+    },
+    ParameterDeclaration {
+        name: "dedup_key",
+        shape: ParameterShape::Subject,
+        required: false,
+    },
+    ParameterDeclaration {
+        name: "notification_id",
+        shape: ParameterShape::Subject,
+        required: false,
+    },
+    ParameterDeclaration {
+        name: "include_resolved",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "page_limit",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "cursor",
+        shape: ParameterShape::Subject,
+        required: false,
+    },
+];
+
 /// Owner-approved task-control fields emitted by the Governor task lifecycle
 /// envelope (`crates/governor/eliot-governor/src/task_lifecycle.rs`,
 /// `task_envelope`): the transitioned `task_id`, the admitted `event_id`, the
@@ -515,6 +618,7 @@ static UPDATE_TASK_STATE_PARAMETERS: [ParameterDeclaration; 6] = [
 pub const fn named_read_operation_name(operation: NamedReadOperation) -> &'static str {
     match operation {
         NamedReadOperation::GetRevisionHeads => "GetRevisionHeads",
+        NamedReadOperation::GetNotificationState => "GetNotificationState",
         NamedReadOperation::GetScopeRevisionView => "GetScopeRevisionView",
         NamedReadOperation::GetOrderingHeads => "GetOrderingHeads",
         NamedReadOperation::GetTaskState => "GetTaskState",
@@ -555,6 +659,7 @@ pub const fn named_read_operation_by_name(name: &str) -> Option<NamedReadOperati
         b"GetAuditRange" => Some(NamedReadOperation::GetAuditRange),
         b"ResolveWriteReceipt" => Some(NamedReadOperation::ResolveWriteReceipt),
         b"GetAuthorityRevocationHistory" => Some(NamedReadOperation::GetAuthorityRevocationHistory),
+        b"GetNotificationState" => Some(NamedReadOperation::GetNotificationState),
         _ => None,
     }
 }
@@ -571,6 +676,7 @@ pub const fn named_mutation_operation_name(operation: NamedMutationOperation) ->
         NamedMutationOperation::AppendAuditEvent => "AppendAuditEvent",
         NamedMutationOperation::RecordAuthorityRevocation => "RecordAuthorityRevocation",
         NamedMutationOperation::ApplyErasure => "ApplyErasure",
+        NamedMutationOperation::ApplyNotificationState => "ApplyNotificationState",
     }
 }
 
@@ -586,6 +692,7 @@ pub const fn named_mutation_operation_by_name(name: &str) -> Option<NamedMutatio
         b"AppendAuditEvent" => Some(NamedMutationOperation::AppendAuditEvent),
         b"RecordAuthorityRevocation" => Some(NamedMutationOperation::RecordAuthorityRevocation),
         b"ApplyErasure" => Some(NamedMutationOperation::ApplyErasure),
+        b"ApplyNotificationState" => Some(NamedMutationOperation::ApplyNotificationState),
         _ => None,
     }
 }
@@ -604,9 +711,11 @@ pub const fn named_mutation_operation_by_name(name: &str) -> Option<NamedMutatio
 /// bound; `GetUnderstandingProjectionInputs` declares the required exact
 /// `selector` plus the required `max_records` bound; `GetCapabilityEvidenceState`
 /// declares the required exact `skill_id` plus the required `max_records`
-/// bound; every other variant declares none, so any supplied parameter
-/// fails closed. Variants without a catalogue entry never reach this table:
-/// they fail as [`StoreError::UnknownOperation`] first.
+/// bound; `GetNotificationState` declares the optional `scope` filter, the
+/// optional exact `dedup_key` selector, the required `include_resolved` flag,
+/// the required decimal `page_limit` bound, and the optional opaque `cursor`;
+/// every other variant declares none, so any supplied parameter fails closed. Variants without a catalogue entry never
+/// reach this table: they fail as [`StoreError::UnknownOperation`] first.
 #[must_use]
 pub const fn declared_read_parameters(
     operation: NamedReadOperation,
@@ -624,6 +733,7 @@ pub const fn declared_read_parameters(
             &GET_UNDERSTANDING_PROJECTION_INPUTS_PARAMETERS
         }
         NamedReadOperation::GetCapabilityEvidenceState => &GET_CAPABILITY_EVIDENCE_STATE_PARAMETERS,
+        NamedReadOperation::GetNotificationState => &GET_NOTIFICATION_STATE_PARAMETERS,
         NamedReadOperation::GetRevisionHeads
         | NamedReadOperation::GetScopeRevisionView
         | NamedReadOperation::GetOrderingHeads
@@ -656,6 +766,11 @@ pub const fn declared_read_parameters(
 /// the required `revision` epistemic-revision payload; `ApplyErasure`
 /// declares the five required canonical-erasure fields (`subject`,
 /// `surfaces`, `reason`, `requester`, `erasure_operation_id`);
+/// `ApplyNotificationState` declares the leg discriminator, the always-present
+/// `dedup_key`, and the conditionally-required leg payloads (`record_json`,
+/// `source_receipt_json`, `delivery_json`, `channel`, `notification_id`,
+/// `principal`, `disposition`, `authorization_json`; leg completeness is
+/// enforced by the notification-state contract);
 /// every other variant declares none,
 /// so any supplied parameter fails closed. Variants without a catalogue entry
 /// never reach this table: they fail as [`StoreError::UnknownOperation`] first.
@@ -674,6 +789,7 @@ pub const fn declared_mutation_parameters(
         }
         NamedMutationOperation::ApplyErasure => &APPLY_ERASURE_PARAMETERS,
         NamedMutationOperation::ApplyEpistemicRevision => &EPISTEMIC_REVISION_PARAMETERS,
+        NamedMutationOperation::ApplyNotificationState => &APPLY_NOTIFICATION_STATE_PARAMETERS,
     }
 }
 
@@ -841,6 +957,15 @@ fn check_declared_shape(
                 return Err(StoreError::InvalidField {
                     field: "operation.parameter",
                     reason: "subject must be a non-blank string",
+                });
+            }
+            Ok(())
+        }
+        ParameterShape::NotificationState => {
+            if !value.is_object() {
+                return Err(StoreError::InvalidField {
+                    field: "operation.parameter",
+                    reason: "notification-state payload must be a JSON object",
                 });
             }
             Ok(())

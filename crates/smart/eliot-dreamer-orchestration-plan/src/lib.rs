@@ -45,14 +45,8 @@
 //! pure bounded validation. There are no placeholder, mock, canned, or pseudo
 //! paths: every branch binds an explicit input field.
 //!
-//! Test coverage note: 8 of 22 `WORK_UNIT_CASE 681/*` cases execute here
-//! (681/1 valid decomposition with parallel groups, 681/2 path and alias
-//! overlap, 681/3 duplicate semantic owner, 681/4 unserialized shared write,
-//! 681/5 broken synthesis chain, 681/6 cycle and self edge, 681/7 unknown
-//! prerequisite, 681/8 permutation-invariant groups with truncated-coverage
-//! partial). The remaining 14 of 22 are deferred per START.md s1; #969
-//! admission is separate. Deferred: 681/9, 681/10, 681/11, 681/12, 681/13,
-//! 681/14, 681/15, 681/16, 681/17, 681/18, 681/19, 681/20, 681/21, 681/22.
+//! Test coverage note: all 22 `WORK_UNIT_CASE 681/*` cases execute here.
+//! #969 admission remains separate from this pure package proof.
 
 #![forbid(unsafe_code)]
 
@@ -103,6 +97,14 @@ pub const MAX_UNIT_CONTEXT_BYTES: u64 = 8_388_608;
 pub const MAX_UNIT_TOOL_CALLS: u32 = 10_000;
 /// Maximum output bytes admitted on any single unit budget.
 pub const MAX_UNIT_OUTPUT_BYTES: u64 = 8_388_608;
+/// Maximum independent cost units admitted on one work unit.
+pub const MAX_UNIT_COST_UNITS: u64 = 1_000_000;
+/// Maximum independent wall-time budget admitted on one work unit.
+pub const MAX_UNIT_TIME_MS: u64 = 86_400_000;
+/// Maximum independent work units admitted on one work unit.
+pub const MAX_UNIT_WORK_UNITS: u64 = 1_000_000;
+/// Maximum independent proof-evidence bytes admitted on one work unit.
+pub const MAX_UNIT_PROOF_BYTES: u64 = 8_388_608;
 /// Expected preservation dimensions attested on every emitted candidate.
 pub const EXPECTED_PRESERVATION_DIMENSIONS: usize = 7;
 
@@ -192,10 +194,20 @@ fn mentions_any(lowered_haystack: &str, markers: &[&str]) -> bool {
 pub const HIDDEN_AUTHORITY_MARKERS: &[&str] = &[
     "launch agent",
     "launch the agent",
+    "create agent",
+    "create job",
+    "create worktree",
     "acquire lease",
+    "reserve route",
+    "reserve resource",
     "schedule execution",
+    "schedule the agent",
     "read provider secret",
+    "use provider secret",
     "grant effect",
+    "execute effect",
+    "merge code",
+    "synthesize implementation",
     "emit finish",
     "authorize finish",
 ];
@@ -258,8 +270,11 @@ fn is_path_escape(path: &str) -> bool {
     if bytes.len() >= 2 && bytes[1] == b':' {
         return true;
     }
-    for segment in normalized.split('/') {
-        if segment == ".." || segment.is_empty() {
+    let segments: Vec<&str> = normalized.split('/').collect();
+    for (index, segment) in segments.iter().enumerate() {
+        let trailing_directory_separator =
+            index.saturating_add(1) == segments.len() && normalized.ends_with('/');
+        if *segment == ".." || (segment.is_empty() && !trailing_directory_separator) {
             return true;
         }
     }
@@ -360,6 +375,104 @@ impl SurfaceKind {
     }
 }
 
+/// Qualification state of an exact serialized context measurement.
+///
+/// `Unvalidated` and `Unknown` remain usable as planning evidence, but they
+/// cannot certify a complete launch group or force an arbitrary decomposition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ContextMeasurementStatus {
+    /// The selected profile was measured and qualified for this workset.
+    Qualified,
+    /// An estimate exists, but both dangerous measurement directions are not
+    /// qualified for the selected route/profile.
+    Unvalidated,
+    /// The required measurement or qualification evidence is unavailable.
+    Unknown,
+}
+
+impl ContextMeasurementStatus {
+    /// Returns the canonical spelling of this status.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Qualified => "qualified",
+            Self::Unvalidated => "unvalidated",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// The planner-facing projection of the canonical context-envelope receipt.
+///
+/// The receipt is supplied evidence, never a route selection or a tokenizer
+/// claim made by this pure cell. It separates the exact loaded workset from
+/// scan roots and preserves reasoning/review reserve independently.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContextEnvelopeSelectionReceipt {
+    /// Stable selected-profile identity.
+    pub profile_id: String,
+    /// Capacity of the selected serialized profile.
+    pub capacity_bytes: u64,
+    /// Exact serialized bytes required by the loaded workset.
+    pub workset_bytes: u64,
+    /// Bytes attributed to loaded source and focused tests.
+    pub source_bytes: u64,
+    /// Protected reasoning reserve.
+    pub reasoning_reserve_bytes: u64,
+    /// Protected review reserve.
+    pub review_reserve_bytes: u64,
+    /// Exact measurement identity.
+    pub measurement_id: String,
+    /// Qualification status of the measurement.
+    pub status: ContextMeasurementStatus,
+    /// Whether this is the smallest qualified profile for the workset.
+    pub smallest_qualified: bool,
+    /// Exact refs rendered into the measured workset.
+    pub loaded_context_refs: Vec<String>,
+    /// Scan roots retained as read-only universes but not loaded context.
+    pub scan_roots: Vec<String>,
+}
+
+/// Proof state supplied for a unit's declared package/edge boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ProofStatus {
+    /// No accepted package-local proof is available.
+    Unproven,
+    /// Package-local proof is accepted; real edges remain external.
+    PackageReady,
+    /// A supplied edge proof is accepted without granting runtime authority.
+    EdgeReady,
+}
+
+impl ProofStatus {
+    /// Returns the canonical spelling of this status.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unproven => "unproven",
+            Self::PackageReady => "package_ready",
+            Self::EdgeReady => "edge_ready",
+        }
+    }
+
+    /// Returns true when the unit may satisfy a proof-gate prerequisite.
+    #[must_use]
+    pub const fn satisfies_gate(self) -> bool {
+        matches!(self, Self::PackageReady | Self::EdgeReady)
+    }
+}
+
+/// Evidence for an intentionally omitted parent requirement.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RequirementExclusion {
+    /// Requirement identity retained in the parent denominator.
+    pub requirement_id: String,
+    /// Explicit reason the current plan cannot own the requirement.
+    pub reason: String,
+    /// Evidence handle that supports the exclusion.
+    pub evidence_ref: String,
+}
+
 /// Closed typed dependency relation between two work units.
 ///
 /// Only the readiness and write kinds constrain candidate launch groups.
@@ -456,6 +569,11 @@ pub enum DecompositionOutcome {
     Overlapped,
     /// The injected observation is at or beyond the frozen deadline.
     Stale,
+    /// The workset or ownership question needs a bounded replan/challenge;
+    /// no arbitrary file split or nominal-context dispatch is emitted.
+    Challenge,
+    /// Planning evidence is present but not qualified to certify readiness.
+    Provisional,
 }
 
 impl DecompositionOutcome {
@@ -470,6 +588,8 @@ impl DecompositionOutcome {
             Self::Unsupported => "unsupported",
             Self::Overlapped => "overlapped",
             Self::Stale => "stale",
+            Self::Challenge => "challenge",
+            Self::Provisional => "provisional",
         }
     }
 }
@@ -528,6 +648,8 @@ pub struct PlanSurface {
     pub requires_serialized_integration: bool,
     /// Owner-evidence note backing this surface entry.
     pub evidence_note: String,
+    /// Supplied physical identity/reparse-stability evidence for the path.
+    pub physical_identity_evidence: String,
 }
 
 /// Independent per-unit budget bounds. Unknown is neither zero nor unlimited:
@@ -540,6 +662,14 @@ pub struct WorkUnitBudget {
     pub tool_calls: u32,
     /// Maximum output bytes admitted for the unit.
     pub output_bytes: u64,
+    /// Independent bounded cost units for the unit.
+    pub cost_units: u64,
+    /// Independent bounded wall-time budget in milliseconds.
+    pub time_ms: u64,
+    /// Independent bounded work-item/tool workload units.
+    pub work_units: u64,
+    /// Independent bounded proof-evidence bytes.
+    pub proof_bytes: u64,
 }
 
 /// One bounded agent work-unit brief: stable identity, one primary cell and
@@ -563,14 +693,34 @@ pub struct AgentWorkUnitBrief {
     pub write_claims: Vec<String>,
     /// Exact read-only context refs required by this unit.
     pub read_refs: Vec<String>,
+    /// Required documentation handles that must be in the read set.
+    pub required_docs: Vec<String>,
+    /// Immutable input identities consumed by this unit.
+    pub immutable_inputs: Vec<String>,
+    /// Predecessor contract/source revisions that must remain frozen.
+    pub predecessor_revisions: Vec<String>,
     /// Forbidden paths this unit must never write.
     pub forbidden_paths: Vec<String>,
     /// Competence the assigned owner must already hold.
     pub capability_note: String,
     /// Declarative route class the unit may use.
     pub route_note: String,
+    /// Exact context qualification and reserve evidence for this unit.
+    pub context_receipt: ContextEnvelopeSelectionReceipt,
     /// Independent context, tool, and output bounds for this unit.
     pub budget: WorkUnitBudget,
+    /// Concrete expected result/API observation.
+    pub expected_result: String,
+    /// Discriminator that fails on the old path.
+    pub discriminator: String,
+    /// Declared proof ceiling for the unit.
+    pub proof_ceiling: String,
+    /// Supplied proof state for proof-gate edges.
+    pub proof_status: ProofStatus,
+    /// Stable produced artifact identity.
+    pub artifact_id: String,
+    /// Exact unit consuming the produced artifact, or this unit for a final artifact.
+    pub artifact_consumer: String,
     /// Concrete observable artifact this unit produces.
     pub artifact_note: String,
     /// Substantive acceptance oracle with negative cases.
@@ -621,6 +771,8 @@ pub struct DecompositionPolicy {
     pub deadline_ms: Option<u64>,
     /// Owner note naming who governs this decomposition.
     pub owner_note: String,
+    /// Evidence-backed exclusions for intentionally omitted requirements.
+    pub omission_evidence: Vec<RequirementExclusion>,
 }
 
 /// One emitted work-unit decomposition candidate with deterministic groups,
@@ -828,6 +980,116 @@ fn binding_err(field: &'static str, detail: &str) -> OrchestrationPlanError {
     }
 }
 
+/// Validates one exact context-envelope selection receipt without deciding
+/// route availability or reading ambient context.
+fn validate_context_receipt(
+    receipt: &ContextEnvelopeSelectionReceipt,
+    unit_id: &str,
+    read_refs: &[String],
+) -> Result<(), OrchestrationPlanError> {
+    check_id(&receipt.profile_id, "unit.context.profile_id")?;
+    check_id(&receipt.measurement_id, "unit.context.measurement_id")?;
+    for (field, value) in [
+        ("capacity_bytes", receipt.capacity_bytes),
+        ("workset_bytes", receipt.workset_bytes),
+        ("source_bytes", receipt.source_bytes),
+        ("reasoning_reserve_bytes", receipt.reasoning_reserve_bytes),
+        ("review_reserve_bytes", receipt.review_reserve_bytes),
+    ] {
+        if value == 0 {
+            return Err(OrchestrationPlanError::Bounds {
+                phase: format!("unit.context.{field}"),
+                detail: format!("unit {} has a zero context dimension", redact(unit_id)),
+            });
+        }
+    }
+    if receipt.source_bytes > receipt.workset_bytes {
+        return Err(OrchestrationPlanError::Bounds {
+            phase: "unit.context.source_bytes".to_owned(),
+            detail: format!("unit {} source exceeds measured workset", redact(unit_id)),
+        });
+    }
+    if receipt.loaded_context_refs.len() > MAX_READ_REFS || receipt.scan_roots.len() > MAX_READ_REFS
+    {
+        return Err(OrchestrationPlanError::Bounds {
+            phase: "unit.context.refs".to_owned(),
+            detail: format!(
+                "unit {} context refs exceed the independent bound",
+                redact(unit_id)
+            ),
+        });
+    }
+    let mut loaded = receipt.loaded_context_refs.clone();
+    loaded.sort();
+    if !has_no_duplicates(&loaded) {
+        return Err(OrchestrationPlanError::Denominator {
+            detail: format!("unit {} repeats a loaded context ref", redact(unit_id)),
+        });
+    }
+    let mut scans = receipt.scan_roots.clone();
+    scans.sort();
+    if !has_no_duplicates(&scans) {
+        return Err(OrchestrationPlanError::Denominator {
+            detail: format!("unit {} repeats a scan root", redact(unit_id)),
+        });
+    }
+    for path in &receipt.loaded_context_refs {
+        check_path(path, "unit.context.loaded_context_refs")?;
+        if path.ends_with('/') {
+            return Err(OrchestrationPlanError::Binding {
+                field: "unit.context.loaded_context_refs".to_owned(),
+                detail: format!("unit {} loaded a scan root as context", redact(unit_id)),
+            });
+        }
+        if !read_refs.contains(path) {
+            return Err(OrchestrationPlanError::Binding {
+                field: "unit.context.loaded_context_refs".to_owned(),
+                detail: format!(
+                    "unit {} measured a ref outside its read set",
+                    redact(unit_id)
+                ),
+            });
+        }
+    }
+    for path in &receipt.scan_roots {
+        check_path(path, "unit.context.scan_roots")?;
+        if !path.ends_with('/') || !read_refs.contains(path) {
+            return Err(OrchestrationPlanError::Binding {
+                field: "unit.context.scan_roots".to_owned(),
+                detail: format!(
+                    "unit {} scan root is not an explicit read ref",
+                    redact(unit_id)
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Validates an identity vector with one independent count bound.
+fn validate_id_vector(
+    values: &[String],
+    field: &'static str,
+    max: usize,
+    required: bool,
+) -> Result<(), OrchestrationPlanError> {
+    if (required && values.is_empty()) || values.len() > max {
+        return Err(OrchestrationPlanError::Bounds {
+            phase: field.to_owned(),
+            detail: "identity vector outside its admitted bound".to_owned(),
+        });
+    }
+    for value in values {
+        check_id(value, field)?;
+    }
+    if !has_no_duplicates(values) {
+        return Err(OrchestrationPlanError::Denominator {
+            detail: format!("duplicate identity in {field}"),
+        });
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Shape validators (fail closed before any semantic pass).
 // ---------------------------------------------------------------------------
@@ -860,6 +1122,34 @@ fn validate_policy_shapes(policy: &DecompositionPolicy) -> Result<(), Orchestrat
         });
     }
     check_note(&policy.owner_note, "policy.owner_note", MAX_TEXT_BYTES)?;
+    if policy.omission_evidence.len() > MAX_REQUIREMENTS {
+        return Err(OrchestrationPlanError::Bounds {
+            phase: "policy.omission_evidence".to_owned(),
+            detail: "omission evidence exceeds the requirement bound".to_owned(),
+        });
+    }
+    let mut excluded_ids = Vec::with_capacity(policy.omission_evidence.len());
+    for exclusion in &policy.omission_evidence {
+        check_id(
+            &exclusion.requirement_id,
+            "policy.omission_evidence.requirement_id",
+        )?;
+        check_note(
+            &exclusion.reason,
+            "policy.omission_evidence.reason",
+            MAX_TEXT_BYTES,
+        )?;
+        check_handle(
+            &exclusion.evidence_ref,
+            "policy.omission_evidence.evidence_ref",
+        )?;
+        excluded_ids.push(exclusion.requirement_id.clone());
+    }
+    if !has_no_duplicates(&excluded_ids) {
+        return Err(OrchestrationPlanError::Denominator {
+            detail: "duplicate omission evidence identity".to_owned(),
+        });
+    }
     Ok(())
 }
 
@@ -961,6 +1251,11 @@ fn validate_surface_shapes(surfaces: &[PlanSurface]) -> Result<(), Orchestration
             "surface.evidence_note",
             MAX_TEXT_BYTES,
         )?;
+        check_note(
+            &surface.physical_identity_evidence,
+            "surface.physical_identity_evidence",
+            MAX_TEXT_BYTES,
+        )?;
         ids.push(surface.surface_id.clone());
         index = index.saturating_add(1);
     }
@@ -1000,6 +1295,42 @@ fn validate_unit_budget(
             phase: "unit.budget".to_owned(),
             detail: format!(
                 "unit {} output bound outside 1..={MAX_UNIT_OUTPUT_BYTES}",
+                redact(unit_id)
+            ),
+        });
+    }
+    if budget.cost_units == 0 || budget.cost_units > MAX_UNIT_COST_UNITS {
+        return Err(OrchestrationPlanError::Bounds {
+            phase: "unit.budget.cost_units".to_owned(),
+            detail: format!(
+                "unit {} cost bound is outside its independent ceiling",
+                redact(unit_id)
+            ),
+        });
+    }
+    if budget.time_ms == 0 || budget.time_ms > MAX_UNIT_TIME_MS {
+        return Err(OrchestrationPlanError::Bounds {
+            phase: "unit.budget.time_ms".to_owned(),
+            detail: format!(
+                "unit {} time bound is outside its independent ceiling",
+                redact(unit_id)
+            ),
+        });
+    }
+    if budget.work_units == 0 || budget.work_units > MAX_UNIT_WORK_UNITS {
+        return Err(OrchestrationPlanError::Bounds {
+            phase: "unit.budget.work_units".to_owned(),
+            detail: format!(
+                "unit {} work bound is outside its independent ceiling",
+                redact(unit_id)
+            ),
+        });
+    }
+    if budget.proof_bytes == 0 || budget.proof_bytes > MAX_UNIT_PROOF_BYTES {
+        return Err(OrchestrationPlanError::Bounds {
+            phase: "unit.budget.proof_bytes".to_owned(),
+            detail: format!(
+                "unit {} proof bound is outside its independent ceiling",
                 redact(unit_id)
             ),
         });
@@ -1049,6 +1380,7 @@ fn validate_one_unit_identity(unit: &AgentWorkUnitBrief) -> Result<(), Orchestra
 
 /// Validates one unit brief shape: write claims, read refs, forbidden paths,
 /// and the self-forbidden binding.
+#[allow(clippy::too_many_lines)]
 fn validate_one_unit_claims(unit: &AgentWorkUnitBrief) -> Result<(), OrchestrationPlanError> {
     if unit.write_claims.is_empty() || unit.write_claims.len() > MAX_WRITE_CLAIMS {
         return Err(OrchestrationPlanError::Bounds {
@@ -1096,6 +1428,45 @@ fn validate_one_unit_claims(unit: &AgentWorkUnitBrief) -> Result<(), Orchestrati
         check_path(head, "unit.read_refs")?;
         read_index = read_index.saturating_add(1);
     }
+    if unit.required_docs.is_empty() {
+        return Err(OrchestrationPlanError::Bounds {
+            phase: "unit.required_docs".to_owned(),
+            detail: format!(
+                "unit {} has no required documentation set",
+                redact(&unit.unit_id)
+            ),
+        });
+    }
+    for path in &unit.required_docs {
+        check_path(path, "unit.required_docs")?;
+        if !unit.read_refs.contains(path) {
+            return Err(OrchestrationPlanError::Binding {
+                field: "unit.required_docs".to_owned(),
+                detail: format!(
+                    "unit {} requires a document outside its read set",
+                    redact(&unit.unit_id)
+                ),
+            });
+        }
+    }
+    if !has_no_duplicates(&unit.required_docs) {
+        return Err(OrchestrationPlanError::Denominator {
+            detail: format!("unit {} repeats a required document", redact(&unit.unit_id)),
+        });
+    }
+    validate_id_vector(
+        &unit.immutable_inputs,
+        "unit.immutable_inputs",
+        MAX_READ_REFS,
+        true,
+    )?;
+    validate_id_vector(
+        &unit.predecessor_revisions,
+        "unit.predecessor_revisions",
+        MAX_READ_REFS,
+        true,
+    )?;
+    validate_context_receipt(&unit.context_receipt, &unit.unit_id, &unit.read_refs)?;
     if unit.forbidden_paths.is_empty() || unit.forbidden_paths.len() > MAX_FORBIDDEN_PATHS {
         return Err(OrchestrationPlanError::Bounds {
             phase: "unit.forbidden_paths".to_owned(),
@@ -1153,6 +1524,39 @@ fn validate_one_unit_notes(unit: &AgentWorkUnitBrief) -> Result<(), Orchestratio
         MAX_TEXT_BYTES,
     )?;
     check_note(&unit.route_note, "unit.route_note", MAX_TEXT_BYTES)?;
+    check_note(
+        &unit.expected_result,
+        "unit.expected_result",
+        MAX_TEXT_BYTES,
+    )?;
+    check_note(&unit.discriminator, "unit.discriminator", MAX_TEXT_BYTES)?;
+    check_note(&unit.proof_ceiling, "unit.proof_ceiling", MAX_TEXT_BYTES)?;
+    check_id(&unit.artifact_id, "unit.artifact_id")?;
+    check_id(&unit.artifact_consumer, "unit.artifact_consumer")?;
+    let discriminator = lowered(&unit.discriminator);
+    if !mentions_any(&discriminator, &["old", "fail", "regression", "before"]) {
+        return Err(OrchestrationPlanError::Shape {
+            field: "unit.discriminator".to_owned(),
+            detail: "discriminator must distinguish the old behavior".to_owned(),
+        });
+    }
+    let oracle = lowered(&unit.oracle_note);
+    if !mentions_any(&oracle, &["negative", "reject", "failure", "oracle"]) {
+        return Err(OrchestrationPlanError::Shape {
+            field: "unit.oracle_note".to_owned(),
+            detail: "oracle must name a substantive negative case".to_owned(),
+        });
+    }
+    let artifact = lowered(&unit.artifact_note);
+    let handoff = lowered(&unit.handoff_note);
+    if !mentions_any(&artifact, &["artifact", "output", "api"])
+        || !mentions_any(&handoff, &["consumer", "handoff", "integration"])
+    {
+        return Err(OrchestrationPlanError::Shape {
+            field: "unit.artifact_note".to_owned(),
+            detail: "artifact and consumer handoff must be explicit".to_owned(),
+        });
+    }
     validate_unit_budget(&unit.budget, &unit.unit_id)?;
     check_note(&unit.artifact_note, "unit.artifact_note", MAX_TEXT_BYTES)?;
     check_note(&unit.oracle_note, "unit.oracle_note", MAX_TEXT_BYTES)?;
@@ -1259,11 +1663,34 @@ fn preflight_total_bytes(
                 .saturating_add(unit.causal_property.len())
                 .saturating_add(unit.capability_note.len())
                 .saturating_add(unit.route_note.len())
+                .saturating_add(unit.expected_result.len())
+                .saturating_add(unit.discriminator.len())
+                .saturating_add(unit.proof_ceiling.len())
+                .saturating_add(unit.artifact_id.len())
+                .saturating_add(unit.artifact_consumer.len())
                 .saturating_add(unit.artifact_note.len())
                 .saturating_add(unit.oracle_note.len())
                 .saturating_add(unit.handoff_note.len())
                 .saturating_add(unit.stop_note.len())
                 .saturating_add(unit.rollback_note.len());
+            for path in &unit.read_refs {
+                total = total.saturating_add(path.len());
+            }
+            for path in &unit.required_docs {
+                total = total.saturating_add(path.len());
+            }
+            for identity in &unit.immutable_inputs {
+                total = total.saturating_add(identity.len());
+            }
+            for revision in &unit.predecessor_revisions {
+                total = total.saturating_add(revision.len());
+            }
+            for path in &unit.context_receipt.loaded_context_refs {
+                total = total.saturating_add(path.len());
+            }
+            for path in &unit.context_receipt.scan_roots {
+                total = total.saturating_add(path.len());
+            }
         }
         unit_index = unit_index.saturating_add(1);
     }
@@ -1750,16 +2177,221 @@ fn detect_unknown_requirement_ref(
     None
 }
 
+/// Ensures every requirement is assigned to its supplied owner cell exactly
+/// once. Composite ownership is a contract wave, not an implicit duplicate.
+fn detect_requirement_owner_conflict(
+    requirements: &[PlanRequirement],
+    units: &[AgentWorkUnitBrief],
+) -> Option<String> {
+    for requirement in requirements {
+        let mut claimants: Vec<String> = Vec::new();
+        for unit in units {
+            if unit.requirement_ids.contains(&requirement.requirement_id) {
+                if unit.cell_id != requirement.owner_cell {
+                    return Some(format!(
+                        "requirement {} is claimed by cell {} instead of {}",
+                        requirement.requirement_id, unit.cell_id, requirement.owner_cell
+                    ));
+                }
+                claimants.push(unit.unit_id.clone());
+            }
+        }
+        if claimants.len() > 1 {
+            return Some(format!(
+                "requirement {} has duplicate accountable units {}",
+                requirement.requirement_id,
+                claimants.join(", ")
+            ));
+        }
+    }
+    None
+}
+
+/// Returns true when a write claim is contained by the supplied surface under
+/// the surface's declared file/directory semantics.
+fn write_claim_matches_surface(claim: &str, claim_is_dir: bool, surface: &PlanSurface) -> bool {
+    let claim = normalize_path(claim);
+    let surface_path = normalize_path(&surface.path);
+    if alias_key(&claim) == alias_key(&surface_path) {
+        return true;
+    }
+    match surface.kind {
+        SurfaceKind::File => false,
+        SurfaceKind::Directory => {
+            dir_covers(surface_path.as_str(), claim.as_str())
+                || (claim_is_dir && dir_covers(claim.as_str(), surface_path.as_str()))
+        }
+    }
+}
+
+/// Binds every mutable claim to supplied physical owner evidence. A lexical
+/// path alone cannot create a writer or prove reparse/symlink stability.
+fn detect_surface_binding(
+    units: &[AgentWorkUnitBrief],
+    surfaces: &[PlanSurface],
+) -> Option<String> {
+    for unit in units {
+        for claim in &unit.write_claims {
+            let claim_is_dir = claim.ends_with('/');
+            let mut matched = false;
+            for surface in surfaces {
+                if write_claim_matches_surface(claim, claim_is_dir, surface) {
+                    matched = true;
+                    if surface.owner_cell != unit.cell_id {
+                        return Some(format!(
+                            "unit {} writes surface {} owned by {}",
+                            unit.unit_id, surface.path, surface.owner_cell
+                        ));
+                    }
+                    let physical = lowered(&surface.physical_identity_evidence);
+                    if mentions_any(&physical, &["unknown", "unverified", "missing"]) {
+                        return Some(format!(
+                            "surface {} lacks stable physical identity evidence",
+                            surface.path
+                        ));
+                    }
+                }
+            }
+            if !matched {
+                return Some(format!(
+                    "unit {} writes an undeclared surface {}",
+                    unit.unit_id, claim
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// Ensures every produced artifact has one exact consumer and an explicit
+/// artifact/proof edge, while the synthesis unit may retain its final artifact.
+fn detect_artifact_handoff(
+    units: &[AgentWorkUnitBrief],
+    edges: &[ReadinessEdge],
+    synthesis_owner: &str,
+) -> Option<String> {
+    let mut artifact_ids: Vec<String> = Vec::with_capacity(units.len());
+    for unit in units {
+        if artifact_ids.contains(&unit.artifact_id) {
+            return Some(format!(
+                "artifact {} has duplicate producers",
+                unit.artifact_id
+            ));
+        }
+        artifact_ids.push(unit.artifact_id.clone());
+        if !unit.artifact_note.contains(&unit.artifact_id) {
+            return Some(format!(
+                "unit {} does not bind its artifact note to {}",
+                unit.unit_id, unit.artifact_id
+            ));
+        }
+        if unit.artifact_consumer == unit.unit_id {
+            if unit.unit_id != synthesis_owner {
+                return Some(format!(
+                    "non-synthesis unit {} retains an orphaned artifact",
+                    unit.unit_id
+                ));
+            }
+            continue;
+        }
+        if unit_index_of(units, &unit.artifact_consumer).is_none() {
+            return Some(format!(
+                "artifact {} names unknown consumer {}",
+                unit.artifact_id, unit.artifact_consumer
+            ));
+        }
+        let linked = edges.iter().any(|edge| {
+            edge.from_unit == unit.unit_id
+                && edge.to_unit == unit.artifact_consumer
+                && matches!(
+                    edge.kind,
+                    DependencyKind::ArtifactFlow | DependencyKind::ProofGate
+                )
+        });
+        if !linked {
+            return Some(format!(
+                "artifact {} has no typed producer-to-consumer edge",
+                unit.artifact_id
+            ));
+        }
+    }
+    None
+}
+
+/// A proof gate cannot be satisfied by a closed or merely declared unit.
+fn detect_unproven_gate(units: &[AgentWorkUnitBrief], edges: &[ReadinessEdge]) -> Option<String> {
+    for edge in edges {
+        if edge.kind != DependencyKind::ProofGate {
+            continue;
+        }
+        let Some(index) = unit_index_of(units, &edge.from_unit) else {
+            continue;
+        };
+        let Some(unit) = units.get(index) else {
+            continue;
+        };
+        if !unit.proof_status.satisfies_gate() {
+            return Some(format!(
+                "proof-gate producer {} is closed without package proof",
+                unit.unit_id
+            ));
+        }
+    }
+    None
+}
+
+/// Returns the first context disposition. Unqualified evidence remains
+/// provisional; a measured overflow requests bounded review rather than an
+/// arbitrary split or a nominal-capacity dispatch.
+fn context_disposition(units: &[AgentWorkUnitBrief]) -> Option<(DecompositionOutcome, String)> {
+    for unit in units {
+        let receipt = &unit.context_receipt;
+        let reserves = receipt
+            .reasoning_reserve_bytes
+            .saturating_add(receipt.review_reserve_bytes);
+        if receipt.status == ContextMeasurementStatus::Qualified
+            && receipt.workset_bytes.saturating_add(reserves) > receipt.capacity_bytes
+        {
+            return Some((
+                DecompositionOutcome::Challenge,
+                format!(
+                    "unit {} measured workset plus protected reserves exceeds profile capacity",
+                    unit.unit_id
+                ),
+            ));
+        }
+        let profile = lowered(&receipt.profile_id);
+        if receipt.status != ContextMeasurementStatus::Qualified
+            || !receipt.smallest_qualified
+            || (profile.contains("258k") && profile.contains("nominal"))
+        {
+            return Some((
+                DecompositionOutcome::Provisional,
+                format!(
+                    "unit {} has unqualified or non-minimal context evidence; route review is required",
+                    unit.unit_id
+                ),
+            ));
+        }
+    }
+    None
+}
+
 /// Finds hidden execution or authority claims inside candidate notes.
 fn detect_hidden_authority(units: &[AgentWorkUnitBrief]) -> Option<String> {
     for unit in units {
         let notes = [
             unit.capability_note.as_str(),
             unit.route_note.as_str(),
+            unit.expected_result.as_str(),
+            unit.discriminator.as_str(),
+            unit.proof_ceiling.as_str(),
+            unit.artifact_id.as_str(),
             unit.artifact_note.as_str(),
             unit.oracle_note.as_str(),
             unit.handoff_note.as_str(),
             unit.stop_note.as_str(),
+            unit.rollback_note.as_str(),
         ];
         let mut index = 0usize;
         while index < notes.len() {
@@ -1800,6 +2432,9 @@ pub fn outcome_rejection_hint(outcome: &DecompositionOutcome) -> Option<Curation
         DecompositionOutcome::Rejected => Some(CurationRejectionCode::IdentityMismatch),
         DecompositionOutcome::Unsupported => Some(CurationRejectionCode::UnsupportedPrecision),
         DecompositionOutcome::Stale => Some(CurationRejectionCode::DeadlineExceeded),
+        DecompositionOutcome::Challenge | DecompositionOutcome::Provisional => {
+            Some(CurationRejectionCode::UnsupportedPrecision)
+        }
     }
 }
 
@@ -1910,6 +2545,29 @@ pub fn compute_candidate_digest(
             "unit:{}|{}|{}|{}",
             unit.unit_id, unit.cell_id, unit.semantic_owner, unit.causal_property
         ));
+        parts.push(format!(
+            "result:{}|{}|{}|{}|{}",
+            unit.unit_id,
+            unit.expected_result,
+            unit.discriminator,
+            unit.proof_ceiling,
+            unit.proof_status.as_str()
+        ));
+        parts.push(format!(
+            "artifact:{}|{}|{}",
+            unit.artifact_id, unit.artifact_consumer, unit.artifact_note
+        ));
+        parts.push(format!(
+            "context:{}|{}|{}|{}|{}|{}|{}|{}",
+            unit.context_receipt.profile_id,
+            unit.context_receipt.capacity_bytes,
+            unit.context_receipt.workset_bytes,
+            unit.context_receipt.source_bytes,
+            unit.context_receipt.reasoning_reserve_bytes,
+            unit.context_receipt.review_reserve_bytes,
+            unit.context_receipt.measurement_id,
+            unit.context_receipt.status.as_str()
+        ));
         let mut owned: Vec<&String> = unit.requirement_ids.iter().collect();
         owned.sort();
         for head in owned {
@@ -1929,16 +2587,49 @@ pub fn compute_candidate_digest(
         for head in reads {
             parts.push(format!("reads:{}->{}", unit.unit_id, normalize_path(head)));
         }
+        for doc in &unit.required_docs {
+            parts.push(format!(
+                "required-doc:{}->{}",
+                unit.unit_id,
+                normalize_path(doc)
+            ));
+        }
+        for input in &unit.immutable_inputs {
+            parts.push(format!("input:{}->{}", unit.unit_id, input));
+        }
+        for revision in &unit.predecessor_revisions {
+            parts.push(format!("revision:{}->{}", unit.unit_id, revision));
+        }
+        for forbidden in &unit.forbidden_paths {
+            parts.push(format!(
+                "forbidden:{}->{}",
+                unit.unit_id,
+                normalize_path(forbidden)
+            ));
+        }
         parts.push(format!(
-            "budget:{}|{}|{}|{}",
+            "budget:{}|{}|{}|{}|{}|{}|{}|{}",
             unit.unit_id,
             unit.budget.context_bytes,
             unit.budget.tool_calls,
-            unit.budget.output_bytes
+            unit.budget.output_bytes,
+            unit.budget.cost_units,
+            unit.budget.time_ms,
+            unit.budget.work_units,
+            unit.budget.proof_bytes
         ));
         parts.push(format!(
             "handoff:{}->{}|{}",
             unit.unit_id, unit.integration_owner, unit.artifact_note
+        ));
+        parts.push(format!(
+            "notes:{}|{}|{}|{}|{}|{}",
+            unit.unit_id,
+            unit.capability_note,
+            unit.route_note,
+            unit.oracle_note,
+            unit.handoff_note,
+            unit.stop_note
         ));
     }
     let mut ordered_edges: Vec<&ReadinessEdge> = edges.iter().collect();
@@ -2045,13 +2736,14 @@ fn emit_candidate(
 
 /// Decomposes one admitted objective into bounded agent work-unit candidates.
 ///
-/// The nine algorithm passes run in order: policy, objective, requirement,
+/// The bounded algorithm runs in order: policy, objective, requirement,
 /// surface, unit, and edge shapes; aggregate byte preflight; intrinsic
 /// receipt and binding checks; cancellation and deadline; hidden-authority
 /// scan; unknown endpoints; self edges; readiness cycles over constraining
-/// edges only; the synthesis chain; serialized shared writes; write overlap;
-/// semantic ownership; unknown requirement refs; requirement coverage;
-/// fan-out and depth bounds; deterministic grouping and digest.
+/// edges only; synthesis/artifact/proof chains; serialized shared writes;
+/// write overlap; physical surface binding; semantic ownership; context
+/// qualification; unknown requirement refs; requirement coverage and explicit
+/// exclusions; fan-out and depth bounds; deterministic grouping and digest.
 ///
 /// # Errors
 ///
@@ -2222,9 +2914,61 @@ pub fn propose_work_unit_decomposition(
             &redact(&detail),
         );
     }
+    if let Some(detail) = detect_unproven_gate(units, edges) {
+        return emit_candidate(
+            DecompositionOutcome::Blocked,
+            objective,
+            units,
+            edges,
+            &[],
+            &[],
+            draft,
+            job,
+            &redact(&detail),
+        );
+    }
+    if let Some(detail) = detect_artifact_handoff(units, edges, &objective.synthesis_owner) {
+        return emit_candidate(
+            DecompositionOutcome::Blocked,
+            objective,
+            units,
+            edges,
+            &[],
+            &[],
+            draft,
+            job,
+            &redact(&detail),
+        );
+    }
+    if let Some(detail) = detect_surface_binding(units, surfaces) {
+        return emit_candidate(
+            DecompositionOutcome::Blocked,
+            objective,
+            units,
+            edges,
+            &[],
+            &[],
+            draft,
+            job,
+            &redact(&detail),
+        );
+    }
     if let Some(detail) = detect_semantic_owner_drift(units) {
         return emit_candidate(
             DecompositionOutcome::Rejected,
+            objective,
+            units,
+            edges,
+            &[],
+            &[],
+            draft,
+            job,
+            &redact(&detail),
+        );
+    }
+    if let Some((outcome, detail)) = context_disposition(units) {
+        return emit_candidate(
+            outcome,
             objective,
             units,
             edges,
@@ -2248,9 +2992,45 @@ pub fn propose_work_unit_decomposition(
             &redact(&detail),
         );
     }
+    if let Some(detail) = detect_requirement_owner_conflict(requirements, units) {
+        return emit_candidate(
+            DecompositionOutcome::Rejected,
+            objective,
+            units,
+            edges,
+            &[],
+            &[],
+            draft,
+            job,
+            &redact(&detail),
+        );
+    }
     let uncovered = uncovered_requirements(requirements, units);
     if !uncovered.is_empty() {
         if policy.allow_partial {
+            let missing_evidence: Vec<String> = uncovered
+                .iter()
+                .filter(|requirement_id| {
+                    !policy
+                        .omission_evidence
+                        .iter()
+                        .any(|evidence| &evidence.requirement_id == *requirement_id)
+                })
+                .cloned()
+                .collect();
+            if !missing_evidence.is_empty() {
+                return emit_candidate(
+                    DecompositionOutcome::Challenge,
+                    objective,
+                    units,
+                    edges,
+                    &[],
+                    &uncovered,
+                    draft,
+                    job,
+                    "omitted requirements lack explicit exclusion evidence; challenge the partition",
+                );
+            }
             let groups = topological_layers(units, edges);
             return emit_candidate(
                 DecompositionOutcome::Partial,
@@ -2311,19 +3091,24 @@ pub fn propose_work_unit_decomposition(
 }
 
 // ---------------------------------------------------------------------------
-// Tests: 8 of 22 WORK_UNIT_CASE 681/* execute here; 681/9..22 deferred.
+// Tests: all 22 WORK_UNIT_CASE 681/* execute here.
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::AgentWorkUnitBrief;
+    use super::ContextEnvelopeSelectionReceipt;
+    use super::ContextMeasurementStatus;
     use super::DecompositionOutcome;
     use super::DecompositionPolicy;
     use super::DependencyKind;
     use super::PlanObjective;
     use super::PlanRequirement;
     use super::PlanSurface;
+    use super::ProofStatus;
     use super::ReadinessEdge;
+    use super::RequirementExclusion;
     use super::SurfaceKind;
     use super::WorkUnitBudget;
     use super::WorkUnitDecomposition;
@@ -2479,6 +3264,8 @@ mod tests {
                 owner_cell: "cell-gamma".to_owned(),
                 requires_serialized_integration: true,
                 evidence_note: "owner evidence names the single serialized integrator".to_owned(),
+                physical_identity_evidence: "physical identity Cargo.lock; stable file owner"
+                    .to_owned(),
             },
             PlanSurface {
                 surface_id: "s-alpha".to_owned(),
@@ -2487,6 +3274,8 @@ mod tests {
                 owner_cell: "cell-alpha".to_owned(),
                 requires_serialized_integration: false,
                 evidence_note: "owner evidence binds the alpha subtree".to_owned(),
+                physical_identity_evidence:
+                    "physical identity alpha directory; stable reparse state".to_owned(),
             },
             PlanSurface {
                 surface_id: "s-beta".to_owned(),
@@ -2495,6 +3284,8 @@ mod tests {
                 owner_cell: "cell-beta".to_owned(),
                 requires_serialized_integration: false,
                 evidence_note: "owner evidence binds the beta subtree".to_owned(),
+                physical_identity_evidence:
+                    "physical identity beta directory; stable reparse state".to_owned(),
             },
         ]
         .to_vec()
@@ -2506,6 +3297,10 @@ mod tests {
             context_bytes: 10_000,
             tool_calls: 12,
             output_bytes: 4096,
+            cost_units: 100,
+            time_ms: 10_000,
+            work_units: 20,
+            proof_bytes: 2048,
         }
     }
 
@@ -2525,15 +3320,46 @@ mod tests {
             requirement_ids: [requirement.to_owned()].to_vec(),
             write_claims: [write.to_owned()].to_vec(),
             read_refs: ["docs/architecture/I17-14-note".to_owned()].to_vec(),
+            required_docs: ["docs/architecture/I17-14-note".to_owned()].to_vec(),
+            immutable_inputs: [["input-", identity].concat()].to_vec(),
+            predecessor_revisions: [["contract-rev-", identity].concat()].to_vec(),
             forbidden_paths: ["target".to_owned(), "vendor".to_owned()].to_vec(),
             capability_note: ["competence already held for ", identity].concat(),
-            route_note: ["declarative route class for ", identity].concat(),
+            route_note: [
+                "qualified profile=130k declarative route class for ",
+                identity,
+            ]
+            .concat(),
+            context_receipt: ContextEnvelopeSelectionReceipt {
+                profile_id: "profile-130k".to_owned(),
+                capacity_bytes: 130_000,
+                workset_bytes: 20_000,
+                source_bytes: 8_000,
+                reasoning_reserve_bytes: 30_000,
+                review_reserve_bytes: 20_000,
+                measurement_id: ["measurement-", identity].concat(),
+                status: ContextMeasurementStatus::Qualified,
+                smallest_qualified: true,
+                loaded_context_refs: ["docs/architecture/I17-14-note".to_owned()].to_vec(),
+                scan_roots: Vec::new(),
+            },
             budget: test_unit_budget(),
-            artifact_note: ["artifact produced by ", identity].concat(),
+            expected_result: ["artifact/API result for ", identity].concat(),
+            discriminator: ["old path fails when testing ", identity].concat(),
+            proof_ceiling: "package-local proof only; edge remains external".to_owned(),
+            proof_status: ProofStatus::PackageReady,
+            artifact_id: ["artifact-", identity].concat(),
+            artifact_consumer: "u3".to_owned(),
+            artifact_note: ["artifact-", identity, " produced by ", identity].concat(),
             oracle_note: ["oracle with negative cases for ", identity].concat(),
             integration_owner: "u3".to_owned(),
-            handoff_note: ["handoff from ", identity, " to u3"].concat(),
-            stop_note: ["stop and reopen for ", identity].concat(),
+            handoff_note: [
+                "handoff from ",
+                identity,
+                " to consumer u3 with integration proof",
+            ]
+            .concat(),
+            stop_note: ["discriminator stop and reopen for ", identity].concat(),
             rollback_note: ["rollback boundary for ", identity].concat(),
         }
     }
@@ -2589,7 +3415,28 @@ mod tests {
             observation_time_ms: Some(1_700_000_000_000),
             deadline_ms: Some(1_800_000_000_000),
             owner_note: "decomposition owned by the dreamer cell".to_owned(),
+            omission_evidence: Vec::new(),
         }
+    }
+
+    /// Runs the supplied fixture components through the production entrypoint.
+    fn propose_fixture(
+        requirements: &[PlanRequirement],
+        surfaces: &[PlanSurface],
+        units: &[AgentWorkUnitBrief],
+        edges: &[ReadinessEdge],
+        policy: &DecompositionPolicy,
+    ) -> Result<WorkUnitDecomposition, super::OrchestrationPlanError> {
+        propose_work_unit_decomposition(
+            &test_job(),
+            &test_draft(),
+            &test_objective(),
+            requirements,
+            surfaces,
+            units,
+            edges,
+            policy,
+        )
     }
 
     /// Runs the full valid fixture set through the entry point.
@@ -2942,6 +3789,12 @@ mod tests {
         partial_requirements.push(test_requirement("r9", "cell-omega"));
         let mut partial_policy = test_policy();
         partial_policy.allow_partial = true;
+        partial_policy.omission_evidence = [RequirementExclusion {
+            requirement_id: "r9".to_owned(),
+            reason: "owner evidence is not present in this frozen denominator".to_owned(),
+            evidence_ref: "ev-r9-unknown-owner".to_owned(),
+        }]
+        .to_vec();
         let Ok(partial) = propose_work_unit_decomposition(
             &job,
             &draft,
@@ -2960,5 +3813,355 @@ mod tests {
             Some(CurationRejectionCode::PreservationFailed)
         );
         assert_eq!(partial.omitted_requirements, ["r9".to_owned()].to_vec());
+    }
+
+    // WORK_UNIT_CASE: 681/9
+    #[test]
+    fn case_09_causal_result_discriminator_and_oracle_are_required() {
+        let requirements = test_requirements();
+        let surfaces = test_surfaces();
+        let edges = test_edges();
+        let policy = test_policy();
+
+        let mut units = test_units();
+        units[0].expected_result.clear();
+        assert!(propose_fixture(&requirements, &surfaces, &units, &edges, &policy).is_err());
+
+        let mut units = test_units();
+        units[0].discriminator = "generic task description".to_owned();
+        assert!(propose_fixture(&requirements, &surfaces, &units, &edges, &policy).is_err());
+
+        let mut units = test_units();
+        units[0].oracle_note = "positive result only".to_owned();
+        assert!(propose_fixture(&requirements, &surfaces, &units, &edges, &policy).is_err());
+    }
+
+    // WORK_UNIT_CASE: 681/10
+    #[test]
+    fn case_10_incomplete_workset_is_provisional_not_arbitrary_chunking() {
+        let requirements = test_requirements();
+        let surfaces = test_surfaces();
+        let edges = test_edges();
+        let policy = test_policy();
+        let mut units = test_units();
+        units[0].context_receipt.status = ContextMeasurementStatus::Unvalidated;
+        units[0].context_receipt.smallest_qualified = false;
+        let candidate = propose_fixture(&requirements, &surfaces, &units, &edges, &policy)
+            .expect("unqualified workset is an inert candidate");
+        assert_eq!(candidate.outcome, DecompositionOutcome::Provisional);
+        assert!(candidate.parallel_groups.is_empty());
+        assert!(candidate.outcome_note.contains("route review"));
+    }
+
+    // WORK_UNIT_CASE: 681/11
+    #[test]
+    fn case_11_smallest_qualified_profile_and_reserves_are_independent() {
+        let requirements = test_requirements();
+        let surfaces = test_surfaces();
+        let edges = test_edges();
+        let policy = test_policy();
+        let mut units = test_units();
+        units[0].context_receipt.workset_bytes = 100_000;
+        units[0].context_receipt.reasoning_reserve_bytes = 30_000;
+        units[0].context_receipt.review_reserve_bytes = 20_000;
+        let candidate = propose_fixture(&requirements, &surfaces, &units, &edges, &policy)
+            .expect("measured overflow is an inert challenge");
+        assert_eq!(candidate.outcome, DecompositionOutcome::Challenge);
+        assert!(candidate.parallel_groups.is_empty());
+
+        let mut units = test_units();
+        units[0].context_receipt.smallest_qualified = false;
+        let candidate = propose_fixture(&requirements, &surfaces, &units, &edges, &policy)
+            .expect("non-minimal profile remains provisional");
+        assert_eq!(candidate.outcome, DecompositionOutcome::Provisional);
+    }
+
+    // WORK_UNIT_CASE: 681/12
+    #[test]
+    fn case_12_complete_partial_and_exhausted_denominators_are_distinct() {
+        let mut requirements = test_requirements();
+        let surfaces = test_surfaces();
+        let units = test_units();
+        let edges = test_edges();
+        let mut policy = test_policy();
+        requirements[2].summary = "requirement remains unowned".to_owned();
+        let mut partial_units = units.clone();
+        partial_units[2].requirement_ids.clear();
+        let rejected = propose_fixture(&requirements, &surfaces, &partial_units, &edges, &policy)
+            .expect("closed denominator emits a non-complete candidate");
+        assert_eq!(rejected.outcome, DecompositionOutcome::Rejected);
+        assert_eq!(rejected.omitted_requirements, ["r3".to_owned()].to_vec());
+
+        policy.allow_partial = true;
+        policy.omission_evidence = [RequirementExclusion {
+            requirement_id: "r3".to_owned(),
+            reason: "owner supplied no implementation cell".to_owned(),
+            evidence_ref: "ev-r3-unowned".to_owned(),
+        }]
+        .to_vec();
+        let partial = propose_fixture(&requirements, &surfaces, &partial_units, &edges, &policy)
+            .expect("explicit exclusion emits partial candidate");
+        assert_eq!(partial.outcome, DecompositionOutcome::Partial);
+
+        policy.max_units = 2;
+        assert!(propose_fixture(&requirements, &surfaces, &units, &edges, &policy).is_err());
+    }
+
+    // WORK_UNIT_CASE: 681/13
+    #[test]
+    fn case_13_hidden_launch_lease_schedule_secret_effect_and_finish_are_rejected() {
+        let requirements = test_requirements();
+        let surfaces = test_surfaces();
+        let edges = test_edges();
+        let policy = test_policy();
+        let mut units = test_units();
+        units[0].route_note = "schedule execution and acquire lease".to_owned();
+        let candidate = propose_fixture(&requirements, &surfaces, &units, &edges, &policy)
+            .expect("hidden authority stays an inert rejection");
+        assert_eq!(candidate.outcome, DecompositionOutcome::Rejected);
+        assert!(
+            candidate
+                .outcome_note
+                .contains("hidden execution authority")
+        );
+    }
+
+    // WORK_UNIT_CASE: 681/14
+    #[test]
+    fn case_14_artifacts_bind_exact_producers_and_consumers() {
+        let valid = run_valid();
+        assert_eq!(valid.units[0].artifact_consumer, "u3");
+        let requirements = test_requirements();
+        let surfaces = test_surfaces();
+        let edges = test_edges();
+        let policy = test_policy();
+        let mut units = test_units();
+        units[0].artifact_consumer = "u9".to_owned();
+        let candidate = propose_fixture(&requirements, &surfaces, &units, &edges, &policy)
+            .expect("unknown artifact consumer stays blocked");
+        assert_eq!(candidate.outcome, DecompositionOutcome::Blocked);
+        assert!(candidate.outcome_note.contains("unknown consumer"));
+    }
+
+    // WORK_UNIT_CASE: 681/15
+    #[test]
+    fn case_15_orphaned_artifacts_and_duplicate_producers_are_blocked() {
+        let requirements = test_requirements();
+        let surfaces = test_surfaces();
+        let edges = test_edges();
+        let policy = test_policy();
+        let mut units = test_units();
+        units[1].artifact_id = units[0].artifact_id.clone();
+        units[1].artifact_note = units[1].artifact_id.clone();
+        let duplicate = propose_fixture(&requirements, &surfaces, &units, &edges, &policy)
+            .expect("duplicate artifact producer stays blocked");
+        assert_eq!(duplicate.outcome, DecompositionOutcome::Blocked);
+
+        let mut units = test_units();
+        units[0].artifact_consumer = "u1".to_owned();
+        let orphan = propose_fixture(&requirements, &surfaces, &units, &edges, &policy)
+            .expect("non-synthesis orphan stays blocked");
+        assert_eq!(orphan.outcome, DecompositionOutcome::Blocked);
+    }
+
+    // WORK_UNIT_CASE: 681/16
+    #[test]
+    fn case_16_unresolved_owner_is_explicitly_rejected() {
+        let mut requirements = test_requirements();
+        requirements[0].owner_cell = "unknown-owner".to_owned();
+        let candidate = propose_fixture(
+            &requirements,
+            &test_surfaces(),
+            &test_units(),
+            &test_edges(),
+            &test_policy(),
+        )
+        .expect("unresolved ownership stays an inert candidate");
+        assert_eq!(candidate.outcome, DecompositionOutcome::Rejected);
+        assert!(candidate.outcome_note.contains("claimed by cell"));
+    }
+
+    // WORK_UNIT_CASE: 681/17
+    #[test]
+    fn case_17_path_and_physical_identity_evidence_fail_closed() {
+        let invalid_path_units = {
+            let mut units = test_units();
+            units[0].write_claims = ["../outside.rs".to_owned()].to_vec();
+            units
+        };
+        assert!(
+            propose_fixture(
+                &test_requirements(),
+                &test_surfaces(),
+                &invalid_path_units,
+                &test_edges(),
+                &test_policy(),
+            )
+            .is_err()
+        );
+
+        let mut surfaces = test_surfaces();
+        surfaces[1].physical_identity_evidence = "unverified physical identity".to_owned();
+        let candidate = propose_fixture(
+            &test_requirements(),
+            &surfaces,
+            &test_units(),
+            &test_edges(),
+            &test_policy(),
+        )
+        .expect("unverified physical identity stays blocked");
+        assert_eq!(candidate.outcome, DecompositionOutcome::Blocked);
+    }
+
+    // WORK_UNIT_CASE: 681/18
+    #[test]
+    fn case_18_canonical_digest_is_exact_replay_and_changes_with_semantics() {
+        let first = run_valid();
+        let replay = run_valid();
+        assert_eq!(first.candidate_digest, replay.candidate_digest);
+
+        let mut units = test_units();
+        units[0].oracle_note = "oracle with negative regression case changed".to_owned();
+        let changed = propose_fixture(
+            &test_requirements(),
+            &test_surfaces(),
+            &units,
+            &test_edges(),
+            &test_policy(),
+        )
+        .expect("changed semantic evidence remains a candidate");
+        assert_ne!(first.candidate_digest, changed.candidate_digest);
+    }
+
+    // WORK_UNIT_CASE: 681/19
+    #[test]
+    fn case_19_unproved_exclusion_prevents_complete_partition() {
+        let mut requirements = test_requirements();
+        requirements.push(test_requirement("r9", "cell-omega"));
+        let mut policy = test_policy();
+        policy.allow_partial = true;
+        let candidate = propose_fixture(
+            &requirements,
+            &test_surfaces(),
+            &test_units(),
+            &test_edges(),
+            &policy,
+        )
+        .expect("unproved exclusion becomes a challenge");
+        assert_eq!(candidate.outcome, DecompositionOutcome::Challenge);
+        assert_eq!(candidate.omitted_requirements, ["r9".to_owned()].to_vec());
+    }
+
+    // WORK_UNIT_CASE: 681/20
+    #[test]
+    fn case_20_runtime_cycle_is_not_compile_cycle_but_write_cycle_is() {
+        let mut runtime_edges = test_edges();
+        runtime_edges.push(ReadinessEdge {
+            from_unit: "u3".to_owned(),
+            to_unit: "u1".to_owned(),
+            kind: DependencyKind::RuntimeProducer,
+            reason: "runtime feedback is not a compile prerequisite".to_owned(),
+        });
+        let candidate = propose_fixture(
+            &test_requirements(),
+            &test_surfaces(),
+            &test_units(),
+            &runtime_edges,
+            &test_policy(),
+        )
+        .expect("runtime cycle remains a candidate");
+        assert_eq!(candidate.outcome, DecompositionOutcome::Complete);
+
+        runtime_edges.push(ReadinessEdge {
+            from_unit: "u3".to_owned(),
+            to_unit: "u1".to_owned(),
+            kind: DependencyKind::WriteSerialization,
+            reason: "write serialization cannot cycle".to_owned(),
+        });
+        let rejected = propose_fixture(
+            &test_requirements(),
+            &test_surfaces(),
+            &test_units(),
+            &runtime_edges,
+            &test_policy(),
+        )
+        .expect("write cycle remains an inert rejection");
+        assert_eq!(rejected.outcome, DecompositionOutcome::Rejected);
+    }
+
+    // WORK_UNIT_CASE: 681/21
+    #[test]
+    fn case_21_package_proof_precedes_admission_without_deadlock() {
+        let mut units = test_units();
+        units[1].proof_status = ProofStatus::Unproven;
+        let blocked = propose_fixture(
+            &test_requirements(),
+            &test_surfaces(),
+            &units,
+            &test_edges(),
+            &test_policy(),
+        )
+        .expect("unproven proof gate stays blocked");
+        assert_eq!(blocked.outcome, DecompositionOutcome::Blocked);
+
+        let mut edges = test_edges();
+        edges.push(ReadinessEdge {
+            from_unit: "u1".to_owned(),
+            to_unit: "u2".to_owned(),
+            kind: DependencyKind::CompilePrerequisite,
+            reason: "dependency preparation precedes package proof".to_owned(),
+        });
+        let ordered = propose_fixture(
+            &test_requirements(),
+            &test_surfaces(),
+            &test_units(),
+            &edges,
+            &test_policy(),
+        )
+        .expect("package proof chain remains acyclic and candidate-only");
+        assert_eq!(ordered.outcome, DecompositionOutcome::Complete);
+        assert_eq!(ordered.parallel_groups.len(), 3);
+    }
+
+    // WORK_UNIT_CASE: 681/22
+    #[test]
+    fn case_22_context_measurement_separates_loaded_refs_and_scan_roots() {
+        let mut units = test_units();
+        units[0].read_refs.push("docs/architecture/".to_owned());
+        units[0].context_receipt.scan_roots = ["docs/architecture/".to_owned()].to_vec();
+        let candidate = propose_fixture(
+            &test_requirements(),
+            &test_surfaces(),
+            &units,
+            &test_edges(),
+            &test_policy(),
+        )
+        .expect("scan roots remain read-only context universes");
+        assert_eq!(candidate.outcome, DecompositionOutcome::Complete);
+
+        let mut invalid = test_units();
+        invalid[0].context_receipt.loaded_context_refs = ["docs/architecture/".to_owned()].to_vec();
+        assert!(
+            propose_fixture(
+                &test_requirements(),
+                &test_surfaces(),
+                &invalid,
+                &test_edges(),
+                &test_policy(),
+            )
+            .is_err()
+        );
+
+        let mut unqualified = test_units();
+        unqualified[0].context_receipt.status = ContextMeasurementStatus::Unknown;
+        let provisional = propose_fixture(
+            &test_requirements(),
+            &test_surfaces(),
+            &unqualified,
+            &test_edges(),
+            &test_policy(),
+        )
+        .expect("unknown measurement remains provisional");
+        assert_eq!(provisional.outcome, DecompositionOutcome::Provisional);
     }
 }

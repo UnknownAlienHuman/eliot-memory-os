@@ -15,7 +15,9 @@ use eliot_instrument_api::{
     InstrumentInvocation, RawEvidence, VerificationRun as CurrentVerificationRun,
 };
 use eliot_instrument_nextest::NEXTEST_INSTRUMENT;
-use eliot_instrument_runner::registry::{ProviderRegistry, RegistryFreshness};
+use eliot_instrument_runner::registry::{
+    ProviderRegistry, RegistryFreshness, ResolvedExecutableIdentity,
+};
 use eliot_types::VerificationPlan;
 
 use super::VerificationRunnerService;
@@ -28,19 +30,24 @@ impl VerificationRunnerService {
     /// tests, never from caller-supplied ids or from the instrument output.
     /// The invocation must resolve through the provided registry to the
     /// registered nextest provider with the registered parser and verifier
-    /// bindings. Raw evidence is checked by digest inside the evaluator; an
-    /// all-skipped or otherwise incomplete report never becomes `Pass`.
+    /// bindings. The machine-derived `executable` observation must satisfy
+    /// the resolved entry: a swapped, renamed, or missing executable is
+    /// rejected here, so it can never become `Pass`. Raw evidence is checked
+    /// by digest inside the evaluator; an all-skipped or otherwise incomplete
+    /// report never becomes `Pass`.
     ///
     /// # Errors
     ///
     /// Returns a typed [`crate::EngineError`] when the plan names unknown
     /// commands, the invocation does not resolve to the current nextest
-    /// binding, or the evaluator rejects the evidence.
+    /// binding, the executable identity does not satisfy the entry, or the
+    /// evaluator rejects the evidence.
     #[allow(clippy::too_many_arguments)]
     pub fn run_current(
         &self,
         plan: &VerificationPlan,
         invocation: &InstrumentInvocation,
+        executable: Option<&ResolvedExecutableIdentity>,
         raw: &[RawEvidence],
         started_at: ClockReading,
         finished_at: ClockReading,
@@ -82,6 +89,14 @@ impl VerificationRunnerService {
                 "registry verifier binding is not the current verifier",
             ));
         }
+        entry
+            .check_resolved_executable(executable)
+            .map_err(|error| {
+                rejected(
+                    "verification-runner",
+                    &format!("executable identity rejected for the current invocation: {error}"),
+                )
+            })?;
         let required: BTreeSet<String> = plan.selected_tests.iter().cloned().collect();
         eliot_verifier::evaluate_current(invocation, raw, &required, started_at, finished_at)
             .map_err(|error| {
@@ -104,7 +119,9 @@ mod current_tests {
         EvidenceCoverage, ExecutionStatus, RawEvidenceSource, VerificationOutcome,
     };
     use eliot_instrument_nextest::NextestCommand;
-    use eliot_instrument_runner::registry::{InvalidationSet, RegistryFreshness};
+    use eliot_instrument_runner::registry::{
+        InvalidationSet, RegistryFreshness, ResolvedExecutableIdentity,
+    };
     use eliot_types::VerificationRuntimeClass;
     use std::num::NonZeroU64;
     use std::path::{Path, PathBuf};
@@ -282,6 +299,19 @@ fn probe_passes() {
         )?)
     }
 
+    /// Machine-derived observation satisfying the registered nextest entry
+    /// (executable `cargo`): the identity `run_current` admits.
+    fn cargo_observation() -> TestResult<ResolvedExecutableIdentity> {
+        Ok(ResolvedExecutableIdentity::new(
+            NEXTEST_INSTRUMENT,
+            "/usr/local/cargo/bin/cargo".to_owned(),
+            "a".repeat(64),
+            Some("cargo 1.89.0".to_owned()),
+            "b".repeat(64),
+            vec!["-E".to_owned(), "test(probe)".to_owned()],
+        )?)
+    }
+
     fn scaffold_nextest_fixture(dir: &Path) -> TestResult<()> {
         std::fs::create_dir_all(dir.join("src"))?;
         std::fs::write(dir.join("Cargo.toml"), FIXTURE_MANIFEST)?;
@@ -367,9 +397,11 @@ fn probe_passes() {
         let raw = raw_for(&invocation, probe_output.stdout)?;
         let plan = admitted_plan(&[PROBE_ID]);
         let runner = VerificationRunnerService;
+        let executable = cargo_observation()?;
         let run = runner.run_current(
             &plan,
             &invocation,
+            Some(&executable),
             std::slice::from_ref(&raw),
             clock(100),
             clock(102),
@@ -391,6 +423,7 @@ fn probe_passes() {
         let run = runner.run_current(
             &partial_plan,
             &invocation,
+            Some(&executable),
             std::slice::from_ref(&raw),
             clock(100),
             clock(102),
@@ -399,6 +432,62 @@ fn probe_passes() {
         )?;
         assert_ne!(run.outcome, VerificationOutcome::Pass);
         assert_eq!(run.outcome, VerificationOutcome::Partial);
+        Ok(())
+    }
+
+    #[test]
+    fn current_run_rejects_swapped_executable_identity() -> TestResult {
+        let fingerprints = fingerprints();
+        let registry = ready_registry(&fingerprints)?;
+        let freshness = RegistryFreshness {
+            generation: GENERATION,
+            normative_pair_digest: NORMATIVE_DIGEST,
+            fingerprints: &fingerprints,
+        };
+        let invocation = invocation("engine-probe-worktree")?;
+        let raw = raw_for(&invocation, br#"{"type":"test"}"#.to_vec())?;
+        let runner = VerificationRunnerService;
+        let plan = admitted_plan(&[PROBE_ID]);
+
+        // A missing identity can never take PASS.
+        assert!(
+            runner
+                .run_current(
+                    &plan,
+                    &invocation,
+                    None,
+                    std::slice::from_ref(&raw),
+                    clock(100),
+                    clock(102),
+                    &registry,
+                    &freshness,
+                )
+                .is_err()
+        );
+
+        // A renamed executable (same bytes, different name) loses PASS.
+        let renamed = ResolvedExecutableIdentity::new(
+            NEXTEST_INSTRUMENT,
+            "/usr/local/bin/other-tool".to_owned(),
+            "a".repeat(64),
+            Some("other 1.0".to_owned()),
+            "b".repeat(64),
+            vec!["-E".to_owned(), "test(probe)".to_owned()],
+        )?;
+        assert!(
+            runner
+                .run_current(
+                    &plan,
+                    &invocation,
+                    Some(&renamed),
+                    std::slice::from_ref(&raw),
+                    clock(100),
+                    clock(102),
+                    &registry,
+                    &freshness,
+                )
+                .is_err()
+        );
         Ok(())
     }
 
@@ -421,6 +510,7 @@ fn probe_passes() {
         assert!(probe_output.status.success());
         let raw = raw_for(&invocation, probe_output.stdout)?;
         let runner = VerificationRunnerService;
+        let executable = cargo_observation()?;
 
         // Unknown commands in the admitted plan stay rejected.
         let mut hostile_plan = admitted_plan(&[PROBE_ID]);
@@ -430,6 +520,7 @@ fn probe_passes() {
                 .run_current(
                     &hostile_plan,
                     &invocation,
+                    Some(&executable),
                     std::slice::from_ref(&raw),
                     clock(100),
                     clock(102),
@@ -446,6 +537,7 @@ fn probe_passes() {
                 .run_current(
                     &empty_plan,
                     &invocation,
+                    Some(&executable),
                     std::slice::from_ref(&raw),
                     clock(100),
                     clock(102),
@@ -463,6 +555,7 @@ fn probe_passes() {
                 .run_current(
                     &admitted_plan(&[PROBE_ID]),
                     &invocation,
+                    Some(&executable),
                     std::slice::from_ref(&foreign),
                     clock(100),
                     clock(102),

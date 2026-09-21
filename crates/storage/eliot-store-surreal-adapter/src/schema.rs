@@ -28,8 +28,15 @@ pub(crate) mod table {
     /// upsert refuses when the same id already names a different intent.
     pub(crate) const ERASURE_INTENT: &str = "erasure_intent";
     /// Sealed per-surface erasure outcomes per operation. The single
-    /// completion marker for the intent row above — never a second ledger.
+    /// completion marker for the intent row above - never a second ledger.
     pub(crate) const ERASURE_OUTCOME: &str = "erasure_outcome";
+    /// Canonical notification record row per dedup key (issue #1780). One
+    /// row per `dedup_key` carrying the current record, the ordered admitted
+    /// leg history used for deterministic rehydration replay, the owner
+    /// revision, and the admission fence. Concurrent writers arbitrate
+    /// through the in-transaction revision compare-and-set; retries
+    /// recompute from fresh rows, never from stale reads.
+    pub(crate) const NOTIFICATION_RECORD: &str = "notification_record";
 }
 
 /// Record key of the single canonical fence/sequence row.
@@ -154,6 +161,22 @@ DEFINE INDEX eo_operation ON erasure_outcome FIELDS operation_id UNIQUE;
 /// body it is a delta: no `schema_meta` redefinition, no data statements.
 #[allow(dead_code)]
 pub(crate) const SCHEMA_MIGRATION_V2_TO_V3_DDL: &str = ERASURE_TABLES_DDL;
+
+/// Notification record table (issue #1780). Additive delta in the erasure
+/// migration style: one row per dedup key with the current record, the
+/// ordered admitted leg history, the owner revision, and the admission
+/// fence. Applied explicitly where the owning slice proves it; never
+/// executed implicitly by the adapter.
+#[allow(dead_code)]
+pub(crate) const NOTIFICATION_TABLES_DDL: &str = r"
+DEFINE TABLE notification_record SCHEMALESS;
+DEFINE FIELD dedup_key ON notification_record TYPE string;
+DEFINE FIELD record ON notification_record TYPE object;
+DEFINE FIELD history ON notification_record TYPE array;
+DEFINE FIELD revision ON notification_record TYPE int;
+DEFINE FIELD state_fence ON notification_record TYPE object;
+DEFINE INDEX notify_dedup ON notification_record FIELDS dedup_key UNIQUE;
+";
 
 pub(crate) const SCHEMA_DDL_V2: &str = r"
 DEFINE TABLE schema_meta SCHEMALESS;

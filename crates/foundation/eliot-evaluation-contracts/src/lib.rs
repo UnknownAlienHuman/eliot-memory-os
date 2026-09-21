@@ -19,6 +19,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod coverage_traces;
+pub use coverage_traces::*;
+
 /// Stable wire name for the C0-13 surface.
 pub const CONTRACT_NAME: &str = "eliot.foundation.evaluation-contracts";
 /// Current wire revision for the C0-13 surface.
@@ -68,7 +71,7 @@ pub enum EvaluationContractError {
 const MAX_REASON_LENGTH: usize = 512;
 const MAX_DIGEST_LENGTH: usize = 256;
 
-fn text(value: &str, field: &'static str) -> Result<(), EvaluationContractError> {
+pub(crate) fn text(value: &str, field: &'static str) -> Result<(), EvaluationContractError> {
     if value.trim().is_empty() || value.chars().any(char::is_control) {
         return Err(EvaluationContractError::InvalidText { field });
     }
@@ -1792,19 +1795,23 @@ pub mod surface_types {
     pub use super::{
         AttributedMemoryEvaluation, AttributedMemoryUseRecord, AttributedUseIdentity,
         AttributionCeiling, BudgetEquivalence, BudgetEquivalenceLedger, BudgetEvidence,
-        BudgetTimeEnvelope, CensoringRecord, ClaimKind, ComparisonBasis, CostEvidence,
-        CostValueStatus, CoverageState, DecisionOpportunityDenominator, DelayedOutcomeWindow,
-        DeliveryExposureDisposition, DeliveryExposureEvidence, EvaluationReportInput,
+        BudgetTimeEnvelope, CensoringRecord, ClaimKind, ComparisonBasis, ComplianceDisposition,
+        CostEvidence, CostValueStatus, CoverageBlindInterval, CoverageCompleteness, CoverageState,
+        DecisionOpportunityDenominator, DelayedOutcomeWindow, DeliveryExposureDisposition,
+        DeliveryExposureEvidence, DenominatorOrigin, EvaluationReportInput, EventCounts,
         EvidenceScope, ExpectedObservableSpec, GraphEvidenceRef, HarmDisposition,
-        InclusionDisposition, IneligibleSubjectRef, InstalledProductPulsePlan,
-        InstalledPulseDenominator, MemoryOutcome, MemoryOutcomeEconomicsRecord, ObjectiveStatus,
-        ObservableInfluence, ObservationWindowSpec, ObservationWindowStatus,
+        HostObservedComplianceTrace, ImmutableHostEvidence, InclusionDisposition,
+        IneligibleSubjectRef, InstalledProductPulsePlan, InstalledPulseDenominator,
+        MaterialActionCoverage, MemoryOutcome, MemoryOutcomeEconomicsRecord, ObjectiveStatus,
+        ObservableInfluence, ObservationCoverageManifest, ObservationWindowSpec,
+        ObservationWindowStatus, ObservedAccess, ObservedToolCall, ObservedWrite,
         OperationalSpineProofBrief, OutcomeObservation, PlannedPulseScenario, PlannedVerifierRef,
         ProductEvaluationPlan, ProductEvidenceStatus, ProductIdentityRef, ProtectedRole,
         PulseEvidenceDomain, PulseEvidenceRow, PulseRowDisposition, RecoveryAcceptanceProfile,
-        RecoveryGap, RecoveryProfileStatus, RegretDisposition, ReportInput,
-        TerminalVerifierBinding, Trial, TrialOutcome, TrialRecord, TrialStatus, UseDisposition,
-        UserOutcomeObjectiveState, VerifierEvidenceRef,
+        RecoveryGap, RecoveryProfileStatus, RegretDisposition, ReportInput, RunFingerprint,
+        SequenceFaults, StreamCursorRange, TerminalVerifierBinding, Trial, TrialOutcome,
+        TrialRecord, TrialStatus, UseDisposition, UserOutcomeObjectiveState, VerifierEvidenceRef,
+        absence_claim_admissible, coverage_percentage, derive_compliance_trace,
     };
 }
 
