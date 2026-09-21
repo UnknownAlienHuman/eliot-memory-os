@@ -16,9 +16,11 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 mod capability_cell_registry;
+mod cell_effective_manifest;
 mod epoch_identity;
 
 pub use capability_cell_registry::*;
+pub use cell_effective_manifest::*;
 pub use epoch_identity::*;
 
 /// The current wire revision of this foundation surface.

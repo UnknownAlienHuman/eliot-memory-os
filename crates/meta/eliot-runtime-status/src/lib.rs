@@ -68,6 +68,22 @@ pub use capability_cell_readback::{
     CellReadbackError, GenerationCellResolution, resolve_generation_via_registry,
 };
 
+mod controlboard_projection;
+pub use controlboard_projection::{
+    CONTROLBOARD_CONTOUR_CONTRACT, ControlBoardContour, ControlBoardEntryKind,
+    ControlBoardProjectionBindings, ControlBoardProjectionError, ControlBoardStatusRow,
+    ControlBoardSupport, project_controlboard_contour, read_controlboard_contour,
+};
+
+mod controlboard_consumer;
+pub use controlboard_consumer::{
+    CONTROLBOARD_CONSUMER_CONTRACT, ControlBoardConsumerError, ControlBoardExpectedSet,
+    ControlBoardInstallation, ControlBoardObservationContext, ControlBoardObservationTime,
+    ControlBoardRecoveryOwner, ControlBoardRowDisposition, ControlBoardSourceDigest,
+    RenderedControlBoard, RenderedControlBoardRow, read_controlboard_status,
+    render_controlboard_status,
+};
+
 const WATCHDOG_PUBLICATION_CHILD_LIMIT: u64 = 1024 * 1024;
 const HOST_JOURNAL_FILE_NAME: &str = "host-state-journal.redb";
 const WIN32_ERROR_FILE_NOT_FOUND: u32 = 2;
@@ -3109,10 +3125,7 @@ mod honest_tests {
             native_worker_artifact_digest: fixture_handle("6".repeat(64)),
             doctor_executable_path: fixture_path(&portable_root, "eliot-doctor.exe"),
             testd_executable_path: fixture_path(&portable_root, "eliot-testd.exe"),
-            native_worker_executable_path: fixture_path(
-                &portable_root,
-                "eliot-native-worker.exe",
-            ),
+            native_worker_executable_path: fixture_path(&portable_root, "eliot-native-worker.exe"),
             descriptor_digest: fixture_handle("f".repeat(64)),
         };
         runtime_launch = runtime_launch
@@ -3137,10 +3150,7 @@ mod honest_tests {
             host_executable_path: fixture_path(&portable_root, "eliot-host.exe"),
             doctor_executable_path: fixture_path(&portable_root, "eliot-doctor.exe"),
             testd_executable_path: fixture_path(&portable_root, "eliot-testd.exe"),
-            native_worker_executable_path: fixture_path(
-                &portable_root,
-                "eliot-native-worker.exe",
-            ),
+            native_worker_executable_path: fixture_path(&portable_root, "eliot-native-worker.exe"),
             config_path: fixture_path(&portable_root, "generation.json"),
             dependency_closure_refs: vec![fixture_handle("evidence:dependency-closure")],
             license_refs: vec![fixture_handle("evidence:licenses")],
@@ -3645,18 +3655,8 @@ mod store_currentness_production_tests {
             applied_operations: applied,
         }
     }
-    fn valid_manifest() -> eliot_installation::CandidateManifest {
-        let portable = if cfg!(windows) {
-            r"C:/tmp\portable"
-        } else {
-            "/tmp/portable"
-        };
-        let host_root = if cfg!(windows) {
-            r"C:/tmp\host"
-        } else {
-            "/tmp/host"
-        };
-        let roots = eliot_installation::RuntimeStateRoots {
+    fn manifest_roots(portable: &str, host_root: &str) -> eliot_installation::RuntimeStateRoots {
+        eliot_installation::RuntimeStateRoots {
             profile: eliot_installation::InstallationProfile::PortableDev,
             profile_anchor_root: h(portable),
             installation_root: h(portable),
@@ -3668,7 +3668,87 @@ mod store_currentness_production_tests {
             store_temp_root: h(&format!("{host_root}/tmp")),
             watchdog_state_root: h(&format!("{host_root}/watchdog")),
             roots_digest: h(&"d".repeat(64)),
+        }
+    }
+
+    fn manifest_runtime_launch(
+        portable: &str,
+        roots: &eliot_installation::RuntimeStateRoots,
+    ) -> eliot_installation::RuntimeLaunchDescriptor {
+        eliot_installation::RuntimeLaunchDescriptor {
+            profile: eliot_installation::InstallationProfile::PortableDev,
+            portable_root: Some(PlatformHandle::new(portable.to_owned()).expect("handle")),
+            installation_epoch: eliot_installation::InstallationEpoch {
+                installation: h("install-1"),
+                lineage_id: h("lineage-1"),
+                sequence: 1,
+            },
+            generation: h("gen-1"),
+            authority_generation: eliot_installation::ResourceGeneration::new(1).expect("gen"),
+            authority_state_fence: eliot_installation::StateFence::new(
+                eliot_contracts::EpochId::new(
+                    eliot_contracts::EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                        .expect("canonical test lineage-A"),
+                    std::num::NonZeroU64::new(1).expect("non-zero test sequence"),
+                )
+                .expect("valid test epoch"),
+                eliot_installation::ResourceGeneration::genesis(),
+            ),
+            supervision_authority: eliot_installation::SupervisionAuthorityBinding::Pending {
+                supervision_lease_scope_id: h("test-supervision-scope"),
+            },
+            authority_descriptor_path: h(&format!("{portable}/authority.json")),
+            authority_descriptor_digest: h(&"a".repeat(64)),
+            runtime_state_roots: roots.clone(),
+            kernel_work_root: roots.kernel_work_root.clone(),
+            kernel_artifact_digest: dh('k'),
+            eliotd_executable_path: h(&format!("{portable}/eliotd.exe")),
+            eliotd_artifact_digest: dh('e'),
+            eliotd_config_path: h(&format!("{portable}/eliotd.json")),
+            eliotd_config_digest: dh('e'),
+            protected_snapshot_digest: dh('a'),
+            eliotd_descriptor_path: h(&format!("{portable}/eliotd.json")),
+            eliotd_descriptor_digest: dh('9'),
+            eliotd_launch_nonce: h("nonce-eliotd"),
+            store_config_path: h(&format!("{portable}/generation.json")),
+            store_credential_target: h("eliot/store/v1/0123456789abcdef0123456789abcdef"),
+            store_bridge_executable_path: h(&format!("{portable}/store.exe")),
+            store_bridge_artifact_digest: dh('c'),
+            store_bootstrap_descriptor_path: h(&format!("{portable}\\store-bootstrap.json")),
+            store_bootstrap_descriptor_digest: h(
+                "516396afbc26eeb03b4630518f428b30e48eb17ba2e2b8002612d10cba1a9faa",
+            ),
+            canonical_store_executable_path: h(&format!("{portable}/surreal.exe")),
+            canonical_store_artifact_digest: dh('u'),
+            kernel_arguments: vec![],
+            store_bridge_arguments: vec![],
+            canonical_store_arguments: vec![],
+            host_executable_path: h(&format!("{portable}/host.exe")),
+            host_artifact_digest: dh('h'),
+            watchdog_executable_path: h(&format!("{portable}/watchdog.exe")),
+            watchdog_artifact_digest: dh('w'),
+            doctor_artifact_digest: dh('b'),
+            testd_artifact_digest: dh('6'),
+            native_worker_artifact_digest: dh('d'),
+            doctor_executable_path: h(&format!("{portable}/eliot-doctor.exe")),
+            testd_executable_path: h(&format!("{portable}/eliot-testd.exe")),
+            native_worker_executable_path: h(&format!("{portable}/eliot-native-worker.exe")),
+            descriptor_digest: dh('f'),
+        }
+    }
+
+    fn valid_manifest() -> eliot_installation::CandidateManifest {
+        let portable = if cfg!(windows) {
+            r"C:/tmp\portable"
+        } else {
+            "/tmp/portable"
         };
+        let host_root = if cfg!(windows) {
+            r"C:/tmp\host"
+        } else {
+            "/tmp/host"
+        };
+        let roots = manifest_roots(portable, host_root);
         eliot_installation::CandidateManifest {
             generation: h("gen-1"),
             components: vec![h("component:kernel")],
@@ -3694,68 +3774,7 @@ mod store_currentness_production_tests {
             supervision_key_slot: h("eliot-supervision-slot:v1:test-supervision-lease"),
             signature_ref: h("sig"),
             runtime_state_roots_digest: roots.roots_digest.clone(),
-            runtime_launch: eliot_installation::RuntimeLaunchDescriptor {
-                profile: eliot_installation::InstallationProfile::PortableDev,
-                portable_root: Some(PlatformHandle::new(portable.to_owned()).expect("handle")),
-                installation_epoch: eliot_installation::InstallationEpoch {
-                    installation: h("install-1"),
-                    lineage_id: h("lineage-1"),
-                    sequence: 1,
-                },
-                generation: h("gen-1"),
-                authority_generation: eliot_installation::ResourceGeneration::new(1).expect("gen"),
-                authority_state_fence: eliot_installation::StateFence::new(
-                    eliot_contracts::EpochId::new(
-                        eliot_contracts::EpochLineageId::new(
-                            "550e8400-e29b-41d4-a716-446655440000",
-                        )
-                        .expect("canonical test lineage-A"),
-                        std::num::NonZeroU64::new(1).expect("non-zero test sequence"),
-                    )
-                    .expect("valid test epoch"),
-                    eliot_installation::ResourceGeneration::genesis(),
-                ),
-                supervision_authority: eliot_installation::SupervisionAuthorityBinding::Pending {
-                    supervision_lease_scope_id: h("test-supervision-scope"),
-                },
-                authority_descriptor_path: h(&format!("{portable}/authority.json")),
-                authority_descriptor_digest: h(&"a".repeat(64)),
-                runtime_state_roots: roots.clone(),
-                kernel_work_root: roots.kernel_work_root.clone(),
-                kernel_artifact_digest: dh('k'),
-                eliotd_executable_path: h(&format!("{portable}/eliotd.exe")),
-                eliotd_artifact_digest: dh('e'),
-                eliotd_config_path: h(&format!("{portable}/eliotd.json")),
-                eliotd_config_digest: dh('e'),
-                protected_snapshot_digest: dh('a'),
-                eliotd_descriptor_path: h(&format!("{portable}/eliotd.json")),
-                eliotd_descriptor_digest: dh('9'),
-                eliotd_launch_nonce: h("nonce-eliotd"),
-                store_config_path: h(&format!("{portable}/generation.json")),
-                store_credential_target: h("eliot/store/v1/0123456789abcdef0123456789abcdef"),
-                store_bridge_executable_path: h(&format!("{portable}/store.exe")),
-                store_bridge_artifact_digest: dh('c'),
-                store_bootstrap_descriptor_path: h(&format!("{portable}\\store-bootstrap.json")),
-                store_bootstrap_descriptor_digest: h(
-                    "516396afbc26eeb03b4630518f428b30e48eb17ba2e2b8002612d10cba1a9faa",
-                ),
-                canonical_store_executable_path: h(&format!("{portable}/surreal.exe")),
-                canonical_store_artifact_digest: dh('u'),
-                kernel_arguments: vec![],
-                store_bridge_arguments: vec![],
-                canonical_store_arguments: vec![],
-                host_executable_path: h(&format!("{portable}/host.exe")),
-                host_artifact_digest: dh('h'),
-                watchdog_executable_path: h(&format!("{portable}/watchdog.exe")),
-                watchdog_artifact_digest: dh('w'),
-                doctor_artifact_digest: dh('b'),
-                testd_artifact_digest: dh('6'),
-                native_worker_artifact_digest: dh('d'),
-                doctor_executable_path: h(&format!("{portable}/eliot-doctor.exe")),
-                testd_executable_path: h(&format!("{portable}/eliot-testd.exe")),
-                native_worker_executable_path: h(&format!("{portable}/eliot-native-worker.exe")),
-                descriptor_digest: dh('f'),
-            },
+            runtime_launch: manifest_runtime_launch(portable, &roots),
         }
     }
     #[test]
@@ -4281,7 +4300,9 @@ mod live_production_observer_tests {
                     native_worker_artifact_digest: dh('d'),
                     doctor_executable_path: h(&format!("{portable}/eliot-doctor.exe")),
                     testd_executable_path: h(&format!("{portable}/eliot-testd.exe")),
-                    native_worker_executable_path: h(&format!("{portable}/eliot-native-worker.exe")),
+                    native_worker_executable_path: h(&format!(
+                        "{portable}/eliot-native-worker.exe"
+                    )),
                     descriptor_digest: dh('f'),
                 },
             }
@@ -5822,17 +5843,20 @@ mod production_call_path_negatives {
         (base.to_path_buf(), host_root, manifest, tx)
     }
 
-    fn create_receipt_with_generation(
+    fn receipt_request_parts(
         generation: Generation,
         image_path: &str,
-        job_name: &str,
-        resumed_at: u64,
-    ) -> eliot_process::ProcessStartReceipt {
+    ) -> (
+        eliot_process::FencingToken,
+        eliot_process::DispatchPermitAuthority,
+        eliot_process::ProcessIntent,
+        eliot_process::ProcessRequest,
+    ) {
         use eliot_process::{
             ActionLeaseRef, DispatchAuthorityId, DispatchPermitAuthority, EnvironmentInheritance,
             EnvironmentProjection, FencingToken, ImageId, JobId, KernelDispatchKey, OperationId,
-            PermitIssuance, ProcessId, ProcessIntent, ProcessRequest, ProcessTreeId,
-            ResourceLimits, SecretRef, SessionId,
+            PermitIssuance, ProcessIntent, ProcessRequest, ProcessTreeId, ResourceLimits,
+            SecretRef, SessionId,
         };
         let fence = FencingToken::new(
             eliot_contracts::EpochId::new(
@@ -5845,7 +5869,7 @@ mod production_call_path_negatives {
             "fence-1",
         )
         .expect("fence");
-        let mut authority = DispatchPermitAuthority::activate(
+        let authority = DispatchPermitAuthority::activate(
             DispatchAuthorityId::new("kernel-authority-7").expect("auth id"),
             KernelDispatchKey::from_secret_bytes([0x5a; 32]).expect("key"),
         );
@@ -5882,8 +5906,20 @@ mod production_call_path_negatives {
             "nonce-1",
         )
         .expect("issuance");
+        let mut authority = authority;
         let permit = authority.issue(&intent, issuance).expect("permit");
         let request = ProcessRequest::new(intent.clone(), permit).expect("request");
+        (fence, authority, intent, request)
+    }
+
+    fn create_receipt_with_generation(
+        generation: Generation,
+        image_path: &str,
+        job_name: &str,
+        resumed_at: u64,
+    ) -> eliot_process::ProcessStartReceipt {
+        use eliot_process::ProcessId;
+        let (fence, mut authority, intent, request) = receipt_request_parts(generation, image_path);
         let physical =
             PhysicalProcessBinding::new(4242, 11, image_path, job_name).expect("physical");
         let observed = eliot_process::SuspendedProcessIdentity::new(
