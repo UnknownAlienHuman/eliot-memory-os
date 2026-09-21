@@ -36,6 +36,8 @@ use std::sync::atomic::Ordering;
 mod activation_projection;
 pub mod agent_fabric;
 pub mod canonical_config_precedence;
+mod capability_admission;
+mod capability_evidence_wiring;
 pub mod capability_outcome;
 mod controlboard_adapters;
 mod daemon_config;
@@ -52,9 +54,11 @@ mod kernel_context_read_client;
 mod kernel_recovery_client;
 mod kernel_transition_client;
 mod observation_adapters;
+mod route_receipts;
 mod skill_lifecycle_adapters;
 mod skill_surface_adapters;
 pub mod staffing_policy;
+pub mod startup_evidence_producer;
 mod store_failure_projection;
 mod task_lifecycle_adapters;
 
@@ -83,6 +87,18 @@ pub use canonical_config_precedence::{
     ResolvedContribution, canonical_layer_json_schema, canonical_layer_json_schema_pretty,
     classify_policy_input, parse_canonical_layer_json, parse_canonical_layer_toml,
     resolve_canonical_chain,
+};
+pub use capability_admission::{
+    AdmissionDisposition, AdmissionOutcome, CapabilityEvidenceRecord, CapabilityEvidenceStatus,
+    DynamicCapabilityPulse, ProductionAdmissionRequest, ProductionEvidenceBundle,
+    RouteAdmissionDecision, StaticCapabilityAttestation, admit_production_route,
+    evaluate_production_admission,
+};
+pub use capability_evidence_wiring::{
+    GovernorCapabilityAdmission, GovernorCapabilityEvidenceRecord, GovernorCapabilityRegistry,
+    GovernorCapabilitySource, GovernorCapabilityStatus, GovernorRouteScopeFingerprint,
+    ImportedLegacyEvidence, LegacyCapabilityDeclaration, LegacyImportError, LegacyScopeFingerprint,
+    import_legacy_declaration,
 };
 pub use capability_outcome::{
     AttemptReceipt, CapabilityOutcome, CapabilityRegistryView, DegradationScope,
@@ -127,6 +143,15 @@ pub use governor_local_read::{
 };
 pub(crate) use kernel_authority_client::KernelAuthorityClient;
 pub use kernel_context_read_client::{KernelContextReadClient, ReconstructionReadComposition};
+pub use route_receipts::{
+    ActualRouteReceipt, GovernorRouteAttempt, RouteCapabilityIndex, RouteReceiptError,
+    RuntimeObservedFacts, UNKNOWN_ROUTE_FACT, effective_route_key,
+};
+pub use startup_evidence_producer::{
+    DAEMON_STARTUP_EVIDENCE_OPERATION, EliotdStartupEvidence, MAX_CAPABILITY_OUTCOMES,
+    MAX_EVIDENCE_REFS, MAX_REQUIRED_CAPABILITIES, MirrorObservation, StartupEvidenceError,
+    StartupEvidenceRequest, build_startup_evidence, publish_daemon_startup_evidence,
+};
 pub use store_failure_projection::{GovernorStoreFailureProjection, GovernorStoreProjectionError};
 
 /// Builds the production P-07 authority adapter over an already-connected
@@ -365,6 +390,15 @@ impl DaemonComposition {
     #[must_use]
     pub fn config_path(&self) -> &Path {
         &self.config_path
+    }
+
+    /// Returns the recovered Config projection digest admitted at Governor
+    /// construction (I1.11 step 8 input). Read-only over the retained owner:
+    /// the digest was bound to the protected launch digest by recovery and
+    /// never recomputed here.
+    #[must_use]
+    pub fn config_snapshot_digest(&self) -> &str {
+        self.governor.owners().config.snapshot_digest()
     }
 
     /// Returns the retained protected daemon state root.

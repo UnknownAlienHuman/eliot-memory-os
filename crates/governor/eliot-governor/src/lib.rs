@@ -34,6 +34,7 @@
 
 mod activation_outcome;
 mod canonical_projections;
+mod capability_evidence;
 mod composition;
 mod context_inputs;
 mod cue_composition;
@@ -65,6 +66,10 @@ pub use canonical_projections::{
     GovernorSafetyProjection, GovernorTaskProjection, ProjectionOmission,
     compose_canonical_projections,
 };
+pub use capability_evidence::{
+    CapabilityEvidenceRecord, CapabilityRegistry, CapabilitySource, CapabilityStatus,
+    RouteScopeFingerprint,
+};
 pub use composition::*;
 pub use controlboard_projection::{
     ControlBoardGovernorSnapshot, ControlBoardOwnerBinding, ControlBoardProjectionError,
@@ -73,6 +78,7 @@ pub use controlboard_projection::{
 /// the daemon composition root can name the exact envelope type without a
 /// second canonical dependency path.
 pub use eliot_canonical::CanonicalWriteEnvelope;
+pub use eliot_config::legacy_capability_import;
 pub use observation_reconciliation::{
     GovernorObservationReconciliation, WatchdogAdmittedEntry, WatchdogEntryAdmission,
     WatchdogEntryKind,

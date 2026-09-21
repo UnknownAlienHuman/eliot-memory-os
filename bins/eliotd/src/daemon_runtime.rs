@@ -269,6 +269,16 @@ pub(super) fn run() -> Result<(), String> {
     // thread, no transport, no start() contour or run-loop change.
     attach_agent_fabric(&composition)?;
     kernel.report_ready().map_err(|error| error.to_string())?;
+    // I1.11 steps 8/9 (issue #1967): publish Governor startup evidence on
+    // the authenticated daemon channel for the Kernel consumer. The producer
+    // evaluates live retained records only — transport binding, admitted and
+    // observed fences, and the Config mirror pair; values whose owners do
+    // not exist yet stay missing and yield explicit not-ready evidence
+    // instead of a ready claim. Publish failure never fails the daemon: the
+    // step-7 live-receipt path above is unchanged and the Kernel keeps steps
+    // 8/9 fenced until its consumer lands. No thread, no transport, no
+    // start() contour or run-loop change.
+    eliotd::startup_evidence_producer::publish_daemon_startup_evidence(&kernel, &composition);
     // #740: readiness record. Handshake (connect) and readiness (recovery +
     // attach gates passed, Kernel accepted ready) stay distinct events.
     let _startup_span = tracing::info_span!("eliotd.daemon_start").entered();
