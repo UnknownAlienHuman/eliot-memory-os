@@ -866,6 +866,70 @@ impl DaemonComposition {
             .run_install_to_receipt(act, &admitted)
     }
 
+    /// Runs the Hotset injector call end to end through the composed
+    /// delivery act (issue #1882).
+    ///
+    /// Production injector entry the Hotset transport lane calls with one
+    /// injector-carried [`SkillHotsetRequest`](skill_lifecycle_adapters::SkillHotsetRequest):
+    /// package, inputs, Governor-owned install context, provider readiness,
+    /// scope identities, Hotset identity, and injector approval — no
+    /// literals, no defaults. The composition observes the live terms
+    /// itself: the canonical tool source plus admitted definition version
+    /// from the Governor hook
+    /// ([`eliot_governor::canonical_skill_tool_source`]), the default-empty
+    /// Skill-owned alias table (the frozen H-A composition call site), and
+    /// the live admitted Governor fence. Returns the installed identity
+    /// plus the receipt the injector carries to the receiver; the receiver
+    /// ack re-enters through [`Self::skill_carry_receipt_to_display`].
+    pub fn skill_inject_hotset(
+        &self,
+        request: skill_lifecycle_adapters::SkillHotsetRequest<'_>,
+    ) -> Result<(String, eliot_skill::HotsetDeliveryReceipt), eliot_skill::SkillError> {
+        let (source, admitted_version) = eliot_governor::canonical_skill_tool_source()?;
+        let aliases = eliot_skill::ToolAliasTable::new();
+        let fence = self.governor.kernel_snapshot().state_fence().clone();
+        self.shared_skill_adapter().inject_hotset(
+            request,
+            source.as_ref(),
+            &aliases,
+            &admitted_version,
+            &fence,
+        )
+    }
+
+    /// Carries the receiver ack back to the display boundary under a fresh
+    /// tool-owner read (issue #1882).
+    ///
+    /// Receiver-ack transport wiring the Hotset lane calls once the receiver
+    /// returns its ack for an issued receipt: the composition rebuilds the
+    /// canonical tool source through the Governor hook (a FRESH registry
+    /// value, so the display-time drift gate always reads live tool-owner
+    /// state, never a stale source object) and binds the ack through
+    /// [`Self::skill_acknowledge_and_display_versioned`]. Receipt and ack
+    /// travel by value, mirroring the owned display boundary.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "receipt/ack cross by value like the owned display boundary"
+    )]
+    pub fn skill_carry_receipt_to_display(
+        &self,
+        skill_id: &str,
+        receipt: eliot_skill::HotsetDeliveryReceipt,
+        ack: eliot_skill::HotsetDeliveryAck,
+    ) -> Result<eliot_skill::ActivatedSkillDisplay, eliot_skill::SkillError> {
+        let (source, admitted_version) = eliot_governor::canonical_skill_tool_source()?;
+        let aliases = eliot_skill::ToolAliasTable::new();
+        self.shared_skill_adapter()
+            .acknowledge_and_display_versioned(
+                skill_id,
+                receipt,
+                ack,
+                source.as_ref(),
+                &aliases,
+                &admitted_version,
+            )
+    }
+
     /// Borrows the single Governor task lifecycle owner as a forwarding
     /// adapter over the closed [`TaskCommand`](eliot_governor::TaskCommand) path.
     ///

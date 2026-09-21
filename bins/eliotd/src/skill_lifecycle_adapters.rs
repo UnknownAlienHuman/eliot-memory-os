@@ -86,9 +86,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use eliot_contracts::StateFence;
 use eliot_skill::{
-    ActivatedSkillDisplay, CanonicalToolSource, HotsetDeliveryAck, HotsetDeliveryReceipt,
-    KnownTools, PromotionGate, SkillCandidate, SkillCatalogue, SkillError, SkillLifecycleApi,
-    SkillLifecycleView, ToolAliasTable, VersionBoundTools, activation::detect_dependency_staleness,
+    ActivatedSkillDisplay, CanonicalToolSource, CatalogueInstallContext, HotsetDeliveryAck,
+    HotsetDeliveryReceipt, KnownTools, MaterializationInputs, MaterializationScope, PromotionGate,
+    ReadinessClaims, SkillCandidate, SkillCatalogue, SkillError, SkillLifecycleApi,
+    SkillLifecycleView, SkillPackage, ToolAliasTable, VersionBoundTools,
+    activation::detect_dependency_staleness,
 };
 
 /// Shared handle to the composition-owned Governor Skill catalogue.
@@ -279,6 +281,50 @@ impl<T> ForwardingSkillLifecycle<T> {
         Ok((skill_id, receipt))
     }
 
+    /// Runs the injector call end to end: assembles the delivery act from
+    /// the injector request plus driver-observed terms, then drives it.
+    ///
+    /// Production injector entry the Hotset transport calls with one
+    /// [`SkillHotsetRequest`]: the request carries ONLY injector-owned
+    /// fields, while the live admitted fence, the Governor-built tool
+    /// source, the Skill-owned alias table, and the admitted definition
+    /// version arrive as separate driver-observed parameters — assembled
+    /// here into the act, never taken from a transport copy. Every gate
+    /// below runs in order (fence, admitted-version, readiness mirror,
+    /// sealed check, approval); the first refusal stops the drive with the
+    /// install standing or unwritten as each gate documents. Returns the
+    /// installed identity plus the receipt the injector carries to the
+    /// receiver. Synchronous: each step takes and drops the guard in a
+    /// closed scope.
+    ///
+    /// No in-tree Hotset transport calls this yet; the composition seam
+    /// ([`DaemonComposition::skill_inject_hotset`](super::DaemonComposition::skill_inject_hotset))
+    /// has landed for that lane. The allowance covers exactly that pending
+    /// adoption; it expires when the lane lands.
+    #[allow(dead_code)]
+    pub(crate) fn inject_hotset(
+        &self,
+        request: SkillHotsetRequest<'_>,
+        source: &dyn CanonicalToolSource,
+        aliases: &ToolAliasTable,
+        admitted_definition_version: &str,
+        admitted_fence: &StateFence,
+    ) -> Result<(String, HotsetDeliveryReceipt), SkillError> {
+        let act = VersionedDeliveryAct {
+            package: request.package,
+            inputs: request.inputs,
+            context: request.context,
+            readiness: request.readiness,
+            scope: request.scope,
+            source,
+            aliases,
+            admitted_definition_version,
+            hotset_id: request.hotset_id,
+            approval_ref: request.approval_ref,
+        };
+        self.run_install_to_receipt(act, admitted_fence)
+    }
+
     /// Issues the Hotset delivery receipt the runtime injector carries.
     ///
     /// Driven by the runtime Hotset injector caller with its own approval
@@ -367,6 +413,30 @@ impl<T> ForwardingSkillLifecycle<T> {
         let tools = VersionBoundTools::new(display_source, aliases);
         self.acknowledge_and_display(skill_id, receipt, ack, &tools)
     }
+}
+
+/// Injector-carried Hotset delivery request (issue #1882).
+///
+/// Everything the Hotset injector transport delivers: the canonical package
+/// source with its actual materialization inputs, the Governor-owned install
+/// context (eligibility, versions, budgets, measured costs, inventories),
+/// the provider-signed readiness claims, the scope identities, and the
+/// Hotset identity plus injector approval handle. No defaults, no
+/// test-only literals in production: every field arrives from the injector
+/// lane (transport owned elsewhere; see the module contract). Owner-observed
+/// terms — the live admitted fence, the Governor-built tool source plus
+/// alias table and admitted version — are NEVER fields here; the driver
+/// observes them at drive time so a stale transport copy cannot override
+/// live admission. Assembled into a [`VersionedDeliveryAct`] by
+/// [`ForwardingSkillLifecycle::inject_hotset`].
+pub struct SkillHotsetRequest<'a> {
+    pub package: &'a SkillPackage,
+    pub inputs: &'a MaterializationInputs,
+    pub context: &'a CatalogueInstallContext,
+    pub readiness: &'a ReadinessClaims,
+    pub scope: &'a MaterializationScope,
+    pub hotset_id: String,
+    pub approval_ref: String,
 }
 
 /// Inputs for one composed versioned delivery act
@@ -1429,6 +1499,81 @@ mod tests {
                 hotset_id: "hotset-versioned-5".to_owned(),
                 approval_ref: "approval-commit-1".to_owned(),
             },
+            &admitted,
+        );
+        assert!(matches!(refused, Err(SkillError::FenceMismatch)));
+        let catalogue = forwarding.catalogue.lock().expect("catalogue lock");
+        assert!(catalogue.is_empty());
+        assert_eq!(*calls.lock().expect("calls"), 0);
+    }
+
+    #[test]
+    fn injector_call_assembles_terms_and_drives_to_receipt() {
+        // The injector-call assembly the transport lane drives: request
+        // fields plus driver-observed terms (live source, aliases, admitted
+        // version and fence) run the full gate order to a provisional
+        // receipt, with the Governor owner untouched.
+        let (forwarding, calls) = versioned_forwarder();
+        let (package, inputs) = package_source();
+        let context = install_context();
+        let readiness = available_readiness();
+        let fence = fence();
+        let scope = delivery_scope(&fence);
+        let source = canonical_source("1.2.0");
+        let aliases = ToolAliasTable::new();
+        let (skill_id, receipt) = forwarding
+            .inject_hotset(
+                SkillHotsetRequest {
+                    package: &package,
+                    inputs: &inputs,
+                    context: &context,
+                    readiness: &readiness,
+                    scope: &scope,
+                    hotset_id: "hotset-inject-1".to_owned(),
+                    approval_ref: "approval-commit-1".to_owned(),
+                },
+                &source,
+                &aliases,
+                "1.2.0",
+                &fence,
+            )
+            .expect("injector call drives to receipt");
+        assert_eq!(skill_id, "skill-demo");
+        assert!(receipt.confirms_delivery("skill-demo"));
+        assert!(receipt.provisional);
+        assert_eq!(*calls.lock().expect("calls"), 0);
+    }
+
+    #[test]
+    fn injector_call_refuses_a_refreshed_fence_before_writing() {
+        // Assembly order: the fence gate fires before version, readiness,
+        // sealed, and approval gates, so a refreshed Governor inherits
+        // nothing — not even a catalogue entry.
+        let (forwarding, calls) = versioned_forwarder();
+        let (package, inputs) = package_source();
+        let context = install_context();
+        let readiness = available_readiness();
+        let claimed = fence();
+        let scope = delivery_scope(&claimed);
+        let source = canonical_source("1.2.0");
+        let aliases = ToolAliasTable::new();
+        let admitted = StateFence::new(
+            test_epoch(2),
+            ResourceGeneration::new(2).expect("test generation"),
+        );
+        let refused = forwarding.inject_hotset(
+            SkillHotsetRequest {
+                package: &package,
+                inputs: &inputs,
+                context: &context,
+                readiness: &readiness,
+                scope: &scope,
+                hotset_id: "hotset-inject-2".to_owned(),
+                approval_ref: "approval-commit-1".to_owned(),
+            },
+            &source,
+            &aliases,
+            "1.2.0",
             &admitted,
         );
         assert!(matches!(refused, Err(SkillError::FenceMismatch)));
