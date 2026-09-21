@@ -26,8 +26,9 @@ use super::{
     PROTOCOL_VERSION, PreparedAuthorityMaterial, ProcessAuthorityHandoffDescriptor,
     ProcessDispatchAuthorityController, ProcessExecutionAuthorityConfig, ProcessExecutionGateway,
     RedbRecoveryStore, RouteScope, Runtime, RuntimeConfig, SERVICE_NAME, ServerHandshakePolicy,
-    StateFence, UserOwnedPathLease, UserOwnedRootLease, WindowsDispatchSnapshotCodec,
-    WindowsPlatform, is_lower_sha256, sha256_hex, sha256_json, unix_ms,
+    StartupCoordinator, StateFence, UserOwnedPathLease, UserOwnedRootLease,
+    WindowsDispatchSnapshotCodec, WindowsPlatform, is_lower_sha256, sha256_hex, sha256_json,
+    unix_ms,
 };
 #[cfg(test)]
 use super::{CanonicalEvidenceProvider, DispatchValidationPort};
@@ -973,6 +974,7 @@ impl KernelComposition {
         )
         .map_err(KernelBuildError::Runtime)?;
         let generation_gateway = OrsGenerationCoordinator::new(ors.clone());
+        let mut startup_coordinator = StartupCoordinator::new();
         let mut service = service;
         service
             .synchronize_authority_epoch(canonical_epoch)
@@ -987,6 +989,18 @@ impl KernelComposition {
                 );
                 KernelBuildError::Ors(error)
             })?;
+        generation_gateway
+            .recover_cutover_ownership()
+            .map_err(|error| {
+                observe_entrypoint_with_detail(
+                    EntrypointStage::Composition,
+                    "kernel.composition.cutover_ownership_recovery_rejected",
+                );
+                KernelBuildError::Ors(error)
+            })?;
+        startup_coordinator
+            .record_live_evidence(3)
+            .map_err(KernelBuildError::Service)?;
         observe_entrypoint_with_detail(
             EntrypointStage::Composition,
             "kernel.composition.generation_recovered",
@@ -1023,6 +1037,16 @@ impl KernelComposition {
         let store_handoff_init = None;
         #[cfg(windows)]
         let agent_activation_results = Self::rehydrate_agent_activation_results(&ors)?;
+        // Implements #1967: start the ordered I1.11 coordinator at step zero.
+        // Composition construction alone does not prove Host-owned startup,
+        // Blob manifest, Store readiness, reconciliation, handshake, mirror,
+        // capability, front-door, or supervision evidence. Each later step is
+        // advanced only by its owning live probe/publication boundary.
+        observe_entrypoint_with_detail(
+            EntrypointStage::Composition,
+            "kernel.composition.startup_sequence_initiated:step=0",
+        );
+        let startup_coordinator = Mutex::new(startup_coordinator);
         // F-LOG-KERNEL-2 (#899): constructed composition is not ready. The
         // service starts Cold, the daemon is NotLaunched, and no Store
         // gateway is claimed; readiness requires separate Host handoffs.
@@ -1107,6 +1131,7 @@ impl KernelComposition {
                 // Zero is reserved as "no boot nonce"; remap without biasing.
                 if nonce == 0 { 1 } else { nonce }
             },
+            startup_coordinator,
         })
     }
 }

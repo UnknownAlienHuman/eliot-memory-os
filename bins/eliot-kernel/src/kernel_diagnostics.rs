@@ -61,10 +61,9 @@ impl fmt::Display for KernelDiagnosticsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::AlreadyOwned => write!(f, "kernel diagnostics subscriber already owned"),
-            Self::EventLogUnavailable => write!(
-                f,
-                "windows event log sink unavailable (see issue #984)"
-            ),
+            Self::EventLogUnavailable => {
+                write!(f, "windows event log sink unavailable (see issue #984)")
+            }
         }
     }
 }
@@ -107,8 +106,7 @@ pub fn install_kernel_diagnostics() -> Result<(), KernelDiagnosticsError> {
     if SUBSCRIBER_INSTALLED.set(()).is_err() {
         return Err(KernelDiagnosticsError::AlreadyOwned);
     }
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)

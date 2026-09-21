@@ -101,3 +101,294 @@ reason = "runtime composition supplies typed outcomes/registry; facade must rema
 from = "any Smart cognitive crate"
 to = "storage adapter, kernel/daemon implementation, provider SDK, scheduler or effect executor"
 reason = "Smart handlers are deterministic/stateless or rebuildable projections and have no operational authority"
+
+# Issue #816 uses consumer -> dependency notation for compile edges.  Runtime
+# value flow is recorded separately below so a producer does not become an
+# accidental Cargo prerequisite and later runtime stages do not become
+# circular package-proof dependencies.
+[topology_edge_map]
+issue = 816
+schema_version = 1
+authority_base = "9e3562df010fb0c0aa9bceebb7db2245cf181ca1"
+compile_relation = "contract_only_dependency"
+runtime_relation = "typed_runtime_value"
+physical_write_relation = "owner_only"
+proof_relation = "evidence_before_admission_or_dispatch"
+
+[[compile_edge]]
+from = "A-16a"
+to = "A-15"
+contract = "eliot-context-contracts::ContextAtom,ContextCandidateSet"
+relation = "contract_only"
+
+[[compile_edge]]
+from = "A-16a"
+to = "A-10"
+contract = "eliot-cue-contracts::ActivationResult"
+relation = "contract_only"
+
+[[compile_edge]]
+from = "A-16a"
+to = "A-06e"
+contract = "eliot-epistemic-contracts::CurrentEpistemicPosition"
+relation = "contract_only"
+
+[[compile_edge]]
+from = "A-16a"
+to = "neutral-projections"
+contract = "TaskFrame,CriticalAttention,Conflict,negative-memory,affordance handles"
+relation = "contract_only"
+
+[[compile_edge]]
+from = "A-17a"
+to = "A-15"
+contract = "eliot-context-contracts::ContextCandidateSet,ContextRecipe,AdmittedContextSet"
+relation = "contract_only"
+
+[[compile_edge]]
+from = "A-18"
+to = "A-15"
+contract = "eliot-context-contracts::AdmittedContextSet,SerializedContextMeasurement,ActiveUnderstandingView"
+relation = "contract_only"
+
+[[compile_edge]]
+from = "A-19r"
+to = "A-15"
+contract = "eliot-context-contracts::ContextPlanningView,ActiveUnderstandingView"
+relation = "contract_only"
+
+[[compile_edge]]
+from = "A-19r"
+to = "A-10"
+contract = "eliot-cue-contracts::ReactiveCueActivation"
+relation = "contract_only"
+
+[[compile_edge]]
+from = "A-19r"
+to = "neutral-session-attention"
+contract = "SessionDeliverySnapshot,CriticalAttentionProjection"
+relation = "contract_only"
+
+[[compile_edge]]
+from = "A-20"
+to = "A-19c"
+contract = "eliot-memory-curation-contracts::CurationScreenRequest,CurationScreenResult"
+relation = "contract_only"
+
+[[compile_edge]]
+from = "A-31"
+to = "A-03"
+contract = "eliot-dreamer-contracts::ValidatedDreamDraft,A03RegistryPort"
+relation = "contract_only"
+
+[[compile_edge]]
+from = "A-31"
+to = "A-19c"
+contract = "eliot-memory-curation-contracts::CurationScreenResult"
+relation = "contract_only"
+
+[[compile_edge]]
+from = "A-21..A-30"
+to = "A-03"
+contract = "eliot-dreamer-contracts::ValidatedDreamDraft"
+relation = "contract_only"
+
+[[forbidden_topology_compile_edge]]
+from = "A-16a"
+to = "A-14a"
+reason = "candidate projection consumes the activation contract; it never links the concrete activation algorithm"
+
+[[forbidden_topology_compile_edge]]
+from = "A-16a"
+to = "eliot-epistemic"
+reason = "candidate projection consumes CurrentEpistemicPosition from A-06e, not the legacy resolver algorithm"
+
+[[forbidden_topology_compile_edge]]
+from = "A-17a"
+to = "A-16a"
+reason = "admission consumes a ContextCandidateSet value and must not compile against candidate implementation"
+
+[[forbidden_topology_compile_edge]]
+from = "A-18"
+to = "A-17a"
+reason = "assembly consumes AdmittedContextSet and must not re-run or link admission"
+
+[[forbidden_topology_compile_edge]]
+from = "A-19r"
+to = "A-16a"
+reason = "reactive planning consumes the assembled planning view, not candidate construction"
+
+[[forbidden_topology_compile_edge]]
+from = "A-19r"
+to = "A-17a"
+reason = "reactive planning does not re-admit or refresh context"
+
+[[forbidden_topology_compile_edge]]
+from = "A-19r"
+to = "A-18"
+reason = "reactive planning uses the owner-neutral view contract, not the assembly implementation"
+
+[[forbidden_topology_compile_edge]]
+from = "A-31"
+to = "A-05"
+reason = "A-31 consumes the already validated A-03 value and never imports or calls the validator"
+
+[[forbidden_topology_compile_edge]]
+from = "A-31"
+to = "A-14b"
+reason = "A-31 does not import the grounding implementation"
+
+[[forbidden_topology_compile_edge]]
+from = "A-31"
+to = "concrete curation handlers"
+reason = "registry ports and runtime composition keep handler algorithms replaceable"
+
+[[forbidden_topology_compile_edge]]
+from = "any Smart assignment"
+to = "storage, kernel, daemon, provider SDK, scheduler or effect executor"
+reason = "metadata describes pure or rebuildable projections without operational authority"
+
+[[runtime_edge]]
+id = "context-projections-to-candidates"
+producer = "Context/Attention/Cue/epistemic projections"
+consumer = "A-16a"
+contract = "whole provider projections"
+relation = "runtime_value"
+selects_membership = false
+preserves_membership = false
+
+[[runtime_edge]]
+id = "candidates-to-admission"
+producer = "A-16a"
+consumer = "A-17a"
+contract = "ContextCandidateSet"
+relation = "runtime_value"
+selects_membership = false
+preserves_membership = false
+
+[[runtime_edge]]
+id = "admission-to-assembly"
+producer = "A-17a"
+consumer = "A-18"
+contract = "AdmittedContextSet"
+relation = "runtime_value"
+selects_membership = true
+preserves_membership = false
+
+[[runtime_edge]]
+id = "assembly-to-reactive-plan"
+producer = "A-18"
+consumer = "A-19r"
+contract = "ActiveUnderstandingView/ContextPlanningView"
+relation = "runtime_value"
+selects_membership = false
+preserves_membership = true
+
+[[runtime_edge]]
+id = "reactive-plan-to-brctx"
+producer = "A-19r"
+consumer = "B-RCTX"
+contract = "PendingContextInjectionPlan"
+relation = "runtime_event_candidate"
+selects_membership = false
+preserves_membership = true
+
+[[runtime_edge]]
+id = "brctx-to-host-transport"
+producer = "B-RCTX"
+consumer = "Host queue/service/transport"
+contract = "typed outbound reactive-Context event"
+relation = "runtime_delivery"
+selects_membership = false
+preserves_membership = true
+
+[[runtime_edge]]
+id = "screen-contract-to-screen"
+producer = "A-19c"
+consumer = "A-20"
+contract = "CurationScreenRequest/CurationScreenResult"
+relation = "runtime_value"
+selects_membership = false
+preserves_membership = false
+
+[[runtime_edge]]
+id = "screen-to-curation-dispatch"
+producer = "A-20"
+consumer = "A-31"
+contract = "exact terminal Eligible evidence plus explicit A-03 kind"
+relation = "runtime_gate"
+selects_membership = false
+preserves_membership = false
+
+[[runtime_edge]]
+id = "validated-values-to-curation-dispatch"
+producer = "A-03/A-05 pipeline"
+consumer = "A-31"
+contract = "ValidatedDreamDraft and inherited validation receipt"
+relation = "runtime_gate"
+selects_membership = false
+preserves_membership = false
+
+[[runtime_edge]]
+id = "a15-to-fstu-to-a18"
+producer = "A-15"
+consumer = "F-STU -> A-18"
+contract = "SerializedContextMeasurement and injected measurement port"
+relation = "measurement_owner_chain"
+selects_membership = false
+preserves_membership = true
+
+[[physical_write_edge]]
+owner = "A-19r"
+next_owner = "B-RCTX"
+contract = "PendingContextInjectionPlan"
+physical_write = false
+delivery = false
+reason = "A-19r proposes an inert plan and does not enqueue, write, deliver or infer use"
+
+[[physical_write_edge]]
+owner = "B-RCTX"
+next_owner = "Host queue/service/transport"
+contract = "typed outbound reactive-Context event"
+physical_write = true
+delivery = true
+reason = "host-side owners perform queue, transport and delivery effects"
+
+[[proof_edge]]
+id = "screen-eligibility-before-dispatch"
+from = "A-20"
+to = "A-31"
+evidence = "exact compatible terminal Eligible result with explicit A-03 kind"
+relation = "proof_before_dispatch"
+
+[[proof_edge]]
+id = "validated-draft-before-dispatch"
+from = "A-03/A-05"
+to = "A-31"
+evidence = "single inherited validated value and receipt"
+relation = "proof_before_dispatch"
+
+[[proof_edge]]
+id = "admitted-set-before-assembly"
+from = "A-17a"
+to = "A-18"
+evidence = "AdmittedContextSet with compatible A-15 measurement contract"
+relation = "proof_before_assembly"
+
+[[ownership_edge]]
+from = "A-15"
+to = "F-STU"
+contract = "serialized-context measurement schema/port"
+owner = "A-15"
+implementation_owner = "F-STU"
+consumer = "A-18"
+relation = "contract_implementation_port"
+
+[[ownership_edge]]
+from = "A-19r"
+to = "B-RCTX"
+contract = "B-RCTX outbound event"
+owner = "A-19r"
+implementation_owner = "B-RCTX"
+consumer = "Host queue/service/transport"
+relation = "plan_to_delivery_boundary"

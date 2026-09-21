@@ -36,13 +36,13 @@
 use std::io::{self, Write};
 use std::sync::Arc;
 
+use eliot_kernel::kernel_diagnostics::{
+    EntrypointStage, install_kernel_diagnostics, observe_entrypoint, observe_terminal_error,
+};
 use eliot_kernel::{
     EliotdReceiptRootBinding, KernelBuildError, KernelComposition, KernelConfig,
     KernelDoctorRecoveryLedger, compose_dispatch_contour, compose_production_doctor_front_door,
     compose_production_native_worker_front_door, compose_production_testd_front_door,
-};
-use eliot_kernel::kernel_diagnostics::{
-    EntrypointStage, install_kernel_diagnostics, observe_entrypoint, observe_terminal_error,
 };
 
 #[cfg(windows)]

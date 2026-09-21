@@ -107,9 +107,7 @@ impl DreamerJobStore for KernelStoreGateway {
 fn dreamer_envelope_from_payload(
     payload: &serde_json::Value,
 ) -> Result<DreamerJobEnvelope, TransportError> {
-    let object = payload
-        .as_object()
-        .ok_or(TransportError::SessionFenced)?;
+    let object = payload.as_object().ok_or(TransportError::SessionFenced)?;
     if object.len() != 3 {
         return Err(TransportError::SessionFenced);
     }
@@ -128,9 +126,10 @@ fn dreamer_envelope_from_payload(
         .get("request")
         .cloned()
         .ok_or(TransportError::SessionFenced)?;
-    let envelope: DreamerJobEnvelope =
-        serde_json::from_value(serde_json::json!({"context": context_value, "request": request_value}))
-            .map_err(|_| TransportError::SessionFenced)?;
+    let envelope: DreamerJobEnvelope = serde_json::from_value(
+        serde_json::json!({"context": context_value, "request": request_value}),
+    )
+    .map_err(|_| TransportError::SessionFenced)?;
     envelope
         .context
         .validate()
@@ -418,8 +417,7 @@ impl KernelComposition {
                     session,
                     FrameKind::Response,
                     MessageType::Result,
-                    serde_json::to_value(&response)
-                        .map_err(|_| TransportError::SessionFenced)?,
+                    serde_json::to_value(&response).map_err(|_| TransportError::SessionFenced)?,
                 )?;
                 reply.request_id = Some(request_id);
                 reply
@@ -692,8 +690,7 @@ mod dreamer_job_dispatch_tests {
     fn stale_fence() -> StateFence {
         StateFence::new(
             EpochId::new(
-                EpochLineageId::new("123e4567-e89b-12d3-a456-426614174000")
-                    .expect("stale lineage"),
+                EpochLineageId::new("123e4567-e89b-12d3-a456-426614174000").expect("stale lineage"),
                 NonZeroU64::new(9).expect("sequence"),
             )
             .expect("stale epoch"),
@@ -769,8 +766,7 @@ mod dreamer_job_dispatch_tests {
         transport_key: &str,
     ) -> K2Request {
         let fence_value = serde_json::to_value(fence).expect("fence json");
-        let epoch_value =
-            serde_json::to_value(&fence.authority_epoch).expect("epoch json");
+        let epoch_value = serde_json::to_value(&fence.authority_epoch).expect("epoch json");
         rebase_operation(
             operation_value,
             &fence_value,
@@ -783,8 +779,7 @@ mod dreamer_job_dispatch_tests {
             serde_json::from_str(CONTEXT_JSON).expect("context fixture");
         ctx_value["state_fence"] = fence_value.clone();
         ctx_value["request_id"] = serde_json::Value::String(ctx_request_id.to_owned());
-        let ctx: RequestMeta =
-            serde_json::from_value(ctx_value.clone()).expect("ctx decodes");
+        let ctx: RequestMeta = serde_json::from_value(ctx_value.clone()).expect("ctx decodes");
         let kind = operation.kind().as_str().to_owned();
         let identity_value = serde_json::json!({
             "request": {
@@ -870,8 +865,7 @@ mod dreamer_job_dispatch_tests {
         let mut operation_value: serde_json::Value =
             serde_json::from_str(LEASE_EXACT_OPERATION_JSON).expect("lease fixture");
         operation_value["job_id"] = serde_json::Value::String(job_id.to_owned());
-        operation_value["selector"]["scope_id"] =
-            serde_json::Value::String(scope_id.to_owned());
+        operation_value["selector"]["scope_id"] = serde_json::Value::String(scope_id.to_owned());
         operation_value["selector"]["expected_revision"] = serde_json::Value::from(revision);
         build_k2_request_from_value(
             &mut operation_value,
@@ -892,11 +886,7 @@ mod dreamer_job_dispatch_tests {
         })
     }
 
-    fn dreamer_frame(
-        session: &Session,
-        request_id: &str,
-        payload: serde_json::Value,
-    ) -> Frame {
+    fn dreamer_frame(session: &Session, request_id: &str, payload: serde_json::Value) -> Frame {
         let frame_request_id = RequestId::new(request_id).expect("frame request id");
         let fence = session.module_generation.state_fence.clone();
         let fence_value = serde_json::to_value(&fence).expect("fence json");
@@ -988,43 +978,37 @@ mod dreamer_job_dispatch_tests {
             _context: &RequestMeta,
             request: DurableJobRequest,
         ) -> Result<DurableJobResponse, String> {
-            self.calls
-                .lock()
-                .expect("calls lock")
-                .push(request.clone());
+            self.calls.lock().expect("calls lock").push(request.clone());
             if let Some(message) = self.refusal.lock().expect("refusal lock").clone() {
                 return Err(message);
             }
             match &request.operation {
                 JobOperation::Submit { submission } => {
-                    let job_value =
-                        serde_json::to_value(&submission.job_id).expect("job json");
+                    let job_value = serde_json::to_value(&submission.job_id).expect("job json");
                     let attempt_value =
                         serde_json::to_value(&submission.attempt_id).expect("attempt json");
                     let scope_value =
                         serde_json::to_value(&submission.work_scope).expect("scope json");
-                    let response: DurableJobResponse = serde_json::from_value(
-                        serde_json::json!({
-                            "request_identity": serde_json::to_value(&request.request_identity)
-                                .expect("identity json"),
-                            "job_id": job_value.clone(),
-                            "attempt_id": attempt_value.clone(),
-                            "scope": scope_value.clone(),
-                            "revision": 1,
-                            "state": "QUEUED",
-                            "disposition": "COMMITTED",
-                            "receipt_id": format!(
-                                "dreamer-receipt-{}",
-                                request.request_identity.operation.operation_id.as_str()
-                            ),
-                            "lease": null,
-                            "checkpoint": null,
-                            "result_under_verification": null,
-                            "outcome": null,
-                            "selection_coverage": [],
-                            "selection_frontier": null,
-                        }),
-                    )
+                    let response: DurableJobResponse = serde_json::from_value(serde_json::json!({
+                        "request_identity": serde_json::to_value(&request.request_identity)
+                            .expect("identity json"),
+                        "job_id": job_value.clone(),
+                        "attempt_id": attempt_value.clone(),
+                        "scope": scope_value.clone(),
+                        "revision": 1,
+                        "state": "QUEUED",
+                        "disposition": "COMMITTED",
+                        "receipt_id": format!(
+                            "dreamer-receipt-{}",
+                            request.request_identity.operation.operation_id.as_str()
+                        ),
+                        "lease": null,
+                        "checkpoint": null,
+                        "result_under_verification": null,
+                        "outcome": null,
+                        "selection_coverage": [],
+                        "selection_frontier": null,
+                    }))
                     .map_err(|error| error.to_string())?;
                     response
                         .validate_for(&request)
@@ -1046,9 +1030,7 @@ mod dreamer_job_dispatch_tests {
                     expected_revision,
                     ..
                 } => {
-                    let key = Self::job_key(
-                        &serde_json::to_value(job_id).expect("job json"),
-                    );
+                    let key = Self::job_key(&serde_json::to_value(job_id).expect("job json"));
                     let stored = self
                         .jobs
                         .lock()
@@ -1057,30 +1039,27 @@ mod dreamer_job_dispatch_tests {
                         .cloned()
                         .ok_or_else(|| "dreamer test ledger: unknown job".to_owned())?;
                     if stored.revision != *expected_revision
-                        || stored.attempt
-                            != serde_json::to_value(attempt_id).expect("attempt json")
+                        || stored.attempt != serde_json::to_value(attempt_id).expect("attempt json")
                     {
                         return Err("dreamer test ledger: revision conflict".to_owned());
                     }
-                    let response: DurableJobResponse = serde_json::from_value(
-                        serde_json::json!({
-                            "request_identity": serde_json::to_value(&request.request_identity)
-                                .expect("identity json"),
-                            "job_id": stored.job.clone(),
-                            "attempt_id": stored.attempt.clone(),
-                            "scope": stored.scope.clone(),
-                            "revision": stored.revision,
-                            "state": "QUEUED",
-                            "disposition": null,
-                            "receipt_id": null,
-                            "lease": null,
-                            "checkpoint": null,
-                            "result_under_verification": null,
-                            "outcome": null,
-                            "selection_coverage": [],
-                            "selection_frontier": null,
-                        }),
-                    )
+                    let response: DurableJobResponse = serde_json::from_value(serde_json::json!({
+                        "request_identity": serde_json::to_value(&request.request_identity)
+                            .expect("identity json"),
+                        "job_id": stored.job.clone(),
+                        "attempt_id": stored.attempt.clone(),
+                        "scope": stored.scope.clone(),
+                        "revision": stored.revision,
+                        "state": "QUEUED",
+                        "disposition": null,
+                        "receipt_id": null,
+                        "lease": null,
+                        "checkpoint": null,
+                        "result_under_verification": null,
+                        "outcome": null,
+                        "selection_coverage": [],
+                        "selection_frontier": null,
+                    }))
                     .map_err(|error| error.to_string())?;
                     response
                         .validate_for(&request)
@@ -1156,8 +1135,7 @@ mod dreamer_job_dispatch_tests {
                     Ok(response)
                 }
                 _ => Err(
-                    "dreamer test ledger: operation not admitted on the requester path"
-                        .to_owned(),
+                    "dreamer test ledger: operation not admitted on the requester path".to_owned(),
                 ),
             }
         }
@@ -1193,8 +1171,7 @@ mod dreamer_job_dispatch_tests {
                 assert_eq!(operation, DREAMER_JOB_WIRE_ID);
                 let envelope =
                     dreamer_envelope_from_payload(&payload).expect("dispatched envelope");
-                KernelComposition::project_dreamer_call(store, session, request_id, &envelope)
-                    .await
+                KernelComposition::project_dreamer_call(store, session, request_id, &envelope).await
             }
             Ok(_) => panic!("dreamer frame must dispatch to the Dreamer branch"),
             Err(error) => Err(error),
@@ -1215,9 +1192,7 @@ mod dreamer_job_dispatch_tests {
         assert!(dreamer_store_error_fences(
             "canonical-store gateway is fenced for rebind"
         ));
-        assert!(dreamer_store_error_fences(
-            "Kernel generation is fenced"
-        ));
+        assert!(dreamer_store_error_fences("Kernel generation is fenced"));
         assert!(dreamer_store_error_fences(
             "receipt envelope is missing; write outcome is unknown"
         ));
@@ -1531,7 +1506,10 @@ mod dreamer_job_dispatch_tests {
             "idem-k2-foreign-submit",
             "transport-k2-foreign-submit",
         );
-        submit.request.validate().expect("foreign envelope is K0-valid");
+        submit
+            .request
+            .validate()
+            .expect("foreign envelope is K0-valid");
         let frame = dreamer_frame(
             &foreign_session,
             "frame-k2-foreign-submit",
@@ -1663,7 +1641,10 @@ mod dreamer_job_dispatch_tests {
         submit.request.validate().expect("submit validates");
         let payload = dreamer_payload(&submit);
         let action = kernel
-            .dispatch_frame(&session, &dreamer_frame(&session, "frame-k2-nogw-1", payload.clone()))
+            .dispatch_frame(
+                &session,
+                &dreamer_frame(&session, "frame-k2-nogw-1", payload.clone()),
+            )
             .expect("submit dispatches");
         let KernelFrameAction::Dreamer {
             request_id,
@@ -1675,8 +1656,7 @@ mod dreamer_job_dispatch_tests {
         };
         assert!(
             matches!(
-                kernel
-                    .execute_dreamer_request(&session, request_id, &operation, payload)
+                Box::pin(kernel.execute_dreamer_request(&session, request_id, &operation, payload))
                     .await,
                 Err(TransportError::SessionFenced)
             ),
@@ -1686,10 +1666,8 @@ mod dreamer_job_dispatch_tests {
         // A deterministic store refusal projects as a typed reply carrying
         // the frame correlation.
         let refusing = FakeDreamerLedger::refusing("revision conflict");
-        let envelope = dreamer_envelope_from_payload(
-            &dreamer_payload(&submit),
-        )
-        .expect("envelope decodes");
+        let envelope =
+            dreamer_envelope_from_payload(&dreamer_payload(&submit)).expect("envelope decodes");
         let reply = KernelComposition::project_dreamer_call(
             &refusing,
             &session,
@@ -1724,7 +1702,7 @@ mod dreamer_job_dispatch_tests {
                         &envelope,
                     )
                     .await,
-                Err(TransportError::SessionFenced)
+                    Err(TransportError::SessionFenced)
                 ),
                 "marker must fence: {marker}"
             );

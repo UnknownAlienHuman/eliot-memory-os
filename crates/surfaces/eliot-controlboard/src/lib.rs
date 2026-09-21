@@ -38,7 +38,8 @@ use eliot_protocol::RequestIdentity;
 use eliot_receipts::ProofCeiling;
 pub use eliot_security_contracts::{EffectCeiling, PrivacyClass};
 use eliot_skill::{
-    DependencyVersion, LifecycleAction, SkillCandidate, SkillError, SkillLifecycleView, SkillScope,
+    ActivatedSkillDisplay, DependencyVersion, HotsetDeliveryAck, HotsetDeliveryReceipt, KnownTools,
+    LifecycleAction, SkillCandidate, SkillError, SkillLifecycleView, SkillScope,
 };
 use serde::{Deserialize, Deserializer, Serialize, de};
 use sha2::{Digest, Sha256};
@@ -1210,6 +1211,38 @@ pub trait SkillLifecyclePort {
         ctx: &'a RequestMetadata,
         request: ProposeSkillRequest,
     ) -> Pin<Box<dyn Future<Output = Result<SkillCandidate, SkillError>> + 'a>>;
+
+    /// Builds the activated Skill view for one delivered Skill behind its
+    /// Hotset delivery receipt and applied receiver ack.
+    ///
+    /// Issuing a receipt never counts as acknowledgement: only an applied
+    /// receiver ack for that exact receipt establishes delivery, and the
+    /// catalogue boundary rechecks entry usability, the exact
+    /// receipt/catalogue bind, delivery coverage, and the tool-owner
+    /// existence check. The tool view travels as `&dyn KnownTools` so the
+    /// object-safe port forwards the tool owner's implementation without
+    /// generics.
+    ///
+    /// The provided default fails closed: port implementations without
+    /// installed catalogue bodies keep this default until their owner wires
+    /// them. The Governor-backed forwarder overrides it and executes the
+    /// composition catalogue boundary.
+    fn skill_activation_display<'a>(
+        &'a mut self,
+        ctx: &'a RequestMetadata,
+        skill_id: String,
+        receipt: HotsetDeliveryReceipt,
+        ack: HotsetDeliveryAck,
+        tools: &'a dyn KnownTools,
+    ) -> Pin<Box<dyn Future<Output = Result<ActivatedSkillDisplay, SkillError>> + 'a>> {
+        let _ = (&ctx, &skill_id, &receipt, &ack, &tools);
+        Box::pin(async move {
+            Err(SkillError::Surface(
+                "activation display is not adopted at this SkillLifecyclePort implementation"
+                    .to_owned(),
+            ))
+        })
+    }
 }
 
 /// A-08 surface over sealed provider boundaries.

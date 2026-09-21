@@ -478,3 +478,242 @@ proof_entrypoint = "one strong agent better or over-budget fanout"
 first_consumer = "Dreamer surface"
 depends_on = ["eliot-dreamer-contracts", "eliot-dreamer-candidate-validation"]
 product_pulse = "D3A_ADVISORY_DIAGNOSIS_PLANNING_PULSE_01"
+
+# Issue #816 decision and dispatch vocabulary.  This is intentionally a
+# metadata proof surface: it does not promote a prototype, change Cargo
+# membership, or claim that any runtime/product gate has executed.
+[topology_policy]
+issue = 816
+schema_version = 1
+authority_base = "9e3562df010fb0c0aa9bceebb7db2245cf181ca1"
+proof_ceiling = "STATIC_TOPOLOGY_ONLY"
+runtime_authority = "NONE"
+metadata_only = true
+curation_dispatchable_terminal = "Eligible"
+screen_never_selects_kind = true
+dispatch_requires_explicit_a03_kind = true
+dispatch_requires_a05_validated_input = true
+dispatch_uses_contract_owned_registry_ports = true
+dispatch_imports_concrete_handlers = false
+repeat_common_validation = false
+admitted_set_owner = "A-17a"
+view_membership_owner = "A-18 preserves A-17a result"
+reactive_plan_delivery_owner = "B-RCTX/Host"
+
+[[wire_kind]]
+kind = "Classification"
+family = "Classification"
+assignment_id = "A-21"
+issue = 653
+wire_order = 1
+
+[[wire_kind]]
+kind = "Relation"
+family = "Relation"
+assignment_id = "A-22"
+issue = 655
+wire_order = 2
+
+[[wire_kind]]
+kind = "Episode"
+family = "Episode"
+assignment_id = "A-23"
+issue = 657
+wire_order = 3
+
+[[wire_kind]]
+kind = "Concept"
+family = "Concept"
+assignment_id = "A-24"
+issue = 659
+wire_order = 4
+
+[[wire_kind]]
+kind = "Procedure"
+family = "Procedure"
+assignment_id = "A-25"
+issue = 661
+wire_order = 5
+
+[[wire_kind]]
+kind = "Failure"
+family = "Failure"
+assignment_id = "A-26"
+issue = 663
+wire_order = 6
+
+[[wire_kind]]
+kind = "Merge"
+family = "StructureRepair"
+assignment_id = "A-27"
+issue = 665
+wire_order = 7
+
+[[wire_kind]]
+kind = "Split"
+family = "StructureRepair"
+assignment_id = "A-27"
+issue = 665
+wire_order = 8
+
+[[wire_kind]]
+kind = "Reconsolidation"
+family = "Reconsolidation"
+assignment_id = "A-28"
+issue = 667
+wire_order = 9
+
+[[wire_kind]]
+kind = "Accessibility"
+family = "Accessibility"
+assignment_id = "A-29"
+issue = 669
+wire_order = 10
+
+[[wire_kind]]
+kind = "Repair"
+family = "MemoryRepair"
+assignment_id = "A-30"
+issue = 671
+wire_order = 11
+
+[[excluded_job_class]]
+assignment_id = "A-39"
+issue = 673
+crate = "eliot-dreamer-conflict-analysis"
+job_class = "ConflictAnalysis"
+wire_kind = false
+curation_kind = false
+
+[[excluded_job_class]]
+assignment_id = "A-40"
+issue = 675
+crate = "eliot-dreamer-development-diagnosis"
+job_class = "DevelopmentDiagnosis"
+wire_kind = false
+curation_kind = false
+
+[[excluded_job_class]]
+assignment_id = "A-41"
+issue = 677
+crate = "eliot-dreamer-maintenance-plan"
+job_class = "MaintenancePlan"
+wire_kind = false
+curation_kind = false
+
+[[excluded_job_class]]
+assignment_id = "A-42"
+issue = 679
+crate = "eliot-dreamer-configuration-plan"
+job_class = "ConfigurationPlan"
+wire_kind = false
+curation_kind = false
+
+[[excluded_job_class]]
+assignment_id = "A-43"
+issue = 681
+crate = "eliot-dreamer-orchestration-plan"
+job_class = "OrchestrationPlan"
+wire_kind = false
+curation_kind = false
+
+[[registry_port]]
+id = "A-03-validated-values"
+owner_assignment = "A-03"
+contract = "ValidatedDreamDraft,A03RegistryPort"
+consumers = ["A-21", "A-22", "A-23", "A-24", "A-25", "A-26", "A-27", "A-28", "A-29", "A-30", "A-31"]
+algorithm_free = true
+
+[[registry_port]]
+id = "A-19c-screen"
+owner_assignment = "A-19c"
+contract = "CurationScreenRequest,CurationScreenResult"
+consumers = ["A-20", "A-31"]
+algorithm_free = true
+
+[[registry_port]]
+id = "A-20-terminal-evidence"
+owner_assignment = "A-20"
+contract = "exact terminal screen evidence"
+consumers = ["A-31"]
+algorithm_free = true
+
+[[registry_port]]
+id = "A-31-dispatch"
+owner_assignment = "A-31"
+contract = "typed handler registry port"
+consumers = ["Governor/runtime composition"]
+algorithm_free = true
+
+[[dispatch_rejection_state]]
+state = "Protected"
+dispatchable = false
+
+[[dispatch_rejection_state]]
+state = "ProtectionUnknown"
+dispatchable = false
+
+[[dispatch_rejection_state]]
+state = "Malformed"
+dispatchable = false
+
+[[dispatch_rejection_state]]
+state = "Stale"
+dispatchable = false
+
+[[dispatch_rejection_state]]
+state = "Unavailable"
+dispatchable = false
+
+[[dispatch_rejection_state]]
+state = "Partial"
+dispatchable = false
+
+[[dispatch_rejection_state]]
+state = "Truncated"
+dispatchable = false
+
+[[dispatch_rejection_state]]
+state = "Unprocessed"
+dispatchable = false
+
+[[context_stage]]
+assignment_id = "A-15"
+input_contract = "foundation/context vocabulary"
+output_contract = "ContextCandidateSet,ContextRecipe,AdmittedContextSet,ActiveUnderstandingView"
+membership_decision = false
+measurement_owner = true
+
+[[context_stage]]
+assignment_id = "A-16a"
+input_contract = "TaskFrame,CriticalAttention,Conflict,CurrentEpistemicPosition,ActivationResult and neutral projections"
+output_contract = "ContextCandidateSet"
+membership_decision = false
+measurement_owner = false
+
+[[context_stage]]
+assignment_id = "A-17a"
+input_contract = "ContextCandidateSet,ContextRecipe,route/headroom profile"
+output_contract = "AdmittedContextSet,AdmissionDecision,SelectionIntegrity"
+membership_decision = true
+measurement_owner = false
+
+[[context_stage]]
+assignment_id = "A-18"
+input_contract = "AdmittedContextSet,ContextRecipe,QualityScorecard,AssemblyPolicy,SerializedContextMeasurement"
+output_contract = "ActiveUnderstandingView"
+membership_decision = false
+measurement_owner = false
+
+[[context_stage]]
+assignment_id = "A-19r"
+input_contract = "ActiveUnderstandingView/ContextPlanningView,ReactiveCueActivation,SessionDeliverySnapshot,CriticalAttentionProjection"
+output_contract = "PendingContextInjectionPlan or NoInjectionDisposition"
+membership_decision = false
+measurement_owner = false
+refreshes_providers = false
+reruns_admission = false
+reassembles_view = false
+mutates_session = false
+delivers_bytes = false
+infers_use = false
