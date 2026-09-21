@@ -2,12 +2,14 @@
 //!
 //! This module owns the single Rust declaration table that generates one
 //! [`NamedOperationManifest`](crate::NamedOperationManifest) descriptor per
-//! activated operation. The table activates exactly the ten reads with
+//! activated operation. The table activates exactly the thirteen reads with
 //! proven adapter handlers, parameter shapes, and consumers on base
 //! (`GetRevisionHeads`, `GetOrderingHeads`, `GetScopeRevisionView`,
 //! `ResolveWriteReceipt`, `GetEvidencePack`, `GetCurrentEpistemicPosition`,
 //! plus T11.3 `GetTaskState`, `GetAttentionAndProblems`,
-//! `GetUnderstandingProjectionInputs`, `GetCapabilityEvidenceState`), the four `CaptureObservation` /
+//! `GetUnderstandingProjectionInputs`, `GetCapabilityEvidenceState`, plus
+//! issue #1780 `GetNotificationState`, plus issue #1941 C4
+//! `GetReactiveInjectionState` and `GetResourceSnapshot`), the four `CaptureObservation` /
 //! `AppendAuditEvent` / `ApplyLifecyclePolicy` mutations (AUD-C01:
 //! `CaptureObservation` and `AppendAuditEvent` persist
 //! `TransitionClass::CaptureCandidate` with the `EffectClass::Candidate`
@@ -29,6 +31,16 @@
 //! `TransitionClass::Erasure` with the `EffectClass::ReversibleMutation`
 //! ceiling and the owner-approved five-field canonical-erasure payload
 //! admitted only for explicit user requests),
+//! plus the `ApplyNotificationState` mutation (issue #1780: persists
+//! `TransitionClass::NotificationState` with the
+//! `EffectClass::ReversibleMutation` ceiling and the owner-approved
+//! leg-discriminated notification payload),
+//! plus the `ApplyReactiveInjectionState` and `ApplyResourceSnapshot`
+//! mutations (issue #1941 C4: persist `TransitionClass::ReactiveState`
+//! with the `EffectClass::ReversibleMutation` ceiling and the
+//! owner-approved reactive typed parameters),
+//! plus the `GetReactiveInjectionState` and `GetResourceSnapshot` reads
+//! (issue #1941 C4: exact `session_id` / `uri` selectors, no scope),
 //! plus the provider-independent genesis bootstrap entry sourced by
 //! [`genesis_manifest`](crate::genesis_manifest). Every other operation stays
 //! known-but-unsupported and unadvertised: no other mutation on base has a
@@ -150,6 +162,15 @@ pub const READ_MAX_OUTPUT_BYTES: u32 = 3_145_728;
 /// read timeout on base.
 pub const READ_TIMEOUT_MS: u32 = 30_000;
 
+/// Maximum canonical parameter bytes accepted for a reactive mutation.
+///
+/// Reactive mutations carry bounded bulk snapshots (a ≤1 MiB ledger JSON
+/// string or ≤1 MiB base64 snapshot content): 2 MiB covers the content
+/// plus JSON-string escape expansion and the remaining small params while
+/// staying fail-closed far below unbounded input. All other mutations
+/// keep [`READ_MAX_INPUT_BYTES`].
+pub const REACTIVE_MUTATION_MAX_INPUT_BYTES: u32 = 2_097_152;
+
 /// Maximum evidence records one `GetEvidencePack` read may return.
 ///
 /// The bound is explicit per request (`max_records` decimal-string selector)
@@ -202,8 +223,11 @@ struct ActivatedReadDescriptor {
 /// the receipt read addresses its receipt through the declared
 /// `operation_id` parameter; `GetNotificationState` addresses no scope and
 /// filters through the declared `scope`/`include_resolved`/`page_limit`/
-/// `cursor` parameters.
-const ACTIVATED_READS: [ActivatedReadDescriptor; 11] = [
+/// `cursor` parameters; `GetReactiveInjectionState` addresses no scope and
+/// selects through the declared exact `session_id` parameter;
+/// `GetResourceSnapshot` addresses no scope and selects through the
+/// declared exact `uri` parameter.
+const ACTIVATED_READS: [ActivatedReadDescriptor; 13] = [
     ActivatedReadDescriptor {
         operation: NamedReadOperation::GetCurrentEpistemicPosition,
         requires_scope_id: true,
@@ -259,11 +283,21 @@ const ACTIVATED_READS: [ActivatedReadDescriptor; 11] = [
         requires_scope_id: false,
         scope_kind: SCOPE_KIND_NONE,
     },
+    ActivatedReadDescriptor {
+        operation: NamedReadOperation::GetReactiveInjectionState,
+        requires_scope_id: false,
+        scope_kind: SCOPE_KIND_NONE,
+    },
+    ActivatedReadDescriptor {
+        operation: NamedReadOperation::GetResourceSnapshot,
+        requires_scope_id: false,
+        scope_kind: SCOPE_KIND_NONE,
+    },
 ];
 
 /// Returns the activated read operations in canonical declaration order.
 #[must_use]
-pub const fn activated_read_operations() -> [NamedReadOperation; 11] {
+pub const fn activated_read_operations() -> [NamedReadOperation; 13] {
     [
         ACTIVATED_READS[0].operation,
         ACTIVATED_READS[1].operation,
@@ -276,6 +310,8 @@ pub const fn activated_read_operations() -> [NamedReadOperation; 11] {
         ACTIVATED_READS[8].operation,
         ACTIVATED_READS[9].operation,
         ACTIVATED_READS[10].operation,
+        ACTIVATED_READS[11].operation,
+        ACTIVATED_READS[12].operation,
     ]
 }
 
@@ -284,6 +320,8 @@ struct ActivatedMutationDescriptor {
     operation: NamedMutationOperation,
     transition_classes: &'static [TransitionClass],
     maximum_effect: EffectClass,
+    /// Declared canonical-parameter input bound for this entry.
+    max_input_bytes: u32,
 }
 
 /// The single declaration table for activated mutations.
@@ -299,49 +337,73 @@ struct ActivatedMutationDescriptor {
 /// explicit user request ONLY, with the closed five-field erasure typed
 /// contract); `ApplyNotificationState` persists `ReversibleMutation` through
 /// the `NotificationState` family (issue #1780: Kernel-admitted notification
-/// lifecycle with the closed leg-discriminated typed contract). All
-/// eight address no scope, mirroring the scope-free read descriptors. Every
+/// lifecycle with the closed leg-discriminated typed contract);
+/// `ApplyReactiveInjectionState` and `ApplyResourceSnapshot` persist
+/// `ReversibleMutation` through the `ReactiveState` family (issue #1941 C4:
+/// Store-owned durable reactive delivery records and revisioned resource
+/// snapshots with the closed reactive typed contract). All
+/// ten address no scope, mirroring the scope-free read descriptors. Every
 /// other mutation stays known-but-unsupported.
-const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 8] = [
+const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 10] = [
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::ApplyEpistemicRevision,
         transition_classes: &[TransitionClass::Epistemic],
         maximum_effect: TransitionClass::Epistemic.maximum_effect(),
+        max_input_bytes: READ_MAX_INPUT_BYTES,
     },
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::CaptureObservation,
         transition_classes: &[TransitionClass::CaptureCandidate],
         maximum_effect: EffectClass::Candidate,
+        max_input_bytes: READ_MAX_INPUT_BYTES,
     },
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::AppendAuditEvent,
         transition_classes: &[TransitionClass::CaptureCandidate],
         maximum_effect: EffectClass::Candidate,
+        max_input_bytes: READ_MAX_INPUT_BYTES,
     },
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::ApplyLifecyclePolicy,
         transition_classes: &[TransitionClass::LifecyclePolicy],
         maximum_effect: EffectClass::ReversibleMutation,
+        max_input_bytes: READ_MAX_INPUT_BYTES,
     },
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::ReconcileRecovery,
         transition_classes: &[TransitionClass::RecoverySchema],
         maximum_effect: EffectClass::ReversibleMutation,
+        max_input_bytes: READ_MAX_INPUT_BYTES,
     },
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::UpdateTaskState,
         transition_classes: &[TransitionClass::TaskControl],
         maximum_effect: EffectClass::ReversibleMutation,
+        max_input_bytes: READ_MAX_INPUT_BYTES,
     },
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::ApplyErasure,
         transition_classes: &[TransitionClass::Erasure],
         maximum_effect: TransitionClass::Erasure.maximum_effect(),
+        max_input_bytes: READ_MAX_INPUT_BYTES,
     },
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::ApplyNotificationState,
         transition_classes: &[TransitionClass::NotificationState],
         maximum_effect: EffectClass::ReversibleMutation,
+        max_input_bytes: READ_MAX_INPUT_BYTES,
+    },
+    ActivatedMutationDescriptor {
+        operation: NamedMutationOperation::ApplyReactiveInjectionState,
+        transition_classes: &[TransitionClass::ReactiveState],
+        maximum_effect: EffectClass::ReversibleMutation,
+        max_input_bytes: REACTIVE_MUTATION_MAX_INPUT_BYTES,
+    },
+    ActivatedMutationDescriptor {
+        operation: NamedMutationOperation::ApplyResourceSnapshot,
+        transition_classes: &[TransitionClass::ReactiveState],
+        maximum_effect: EffectClass::ReversibleMutation,
+        max_input_bytes: REACTIVE_MUTATION_MAX_INPUT_BYTES,
     },
 ];
 
@@ -377,7 +439,7 @@ fn mutation_entry_spec(descriptor: &ActivatedMutationDescriptor) -> OperationMan
         minimum_compatible_version: MINIMUM_COMPATIBLE_VERSION,
         transition_classes: descriptor.transition_classes.to_vec(),
         maximum_effect: descriptor.maximum_effect,
-        max_input_bytes: READ_MAX_INPUT_BYTES,
+        max_input_bytes: descriptor.max_input_bytes,
         max_output_bytes: READ_MAX_OUTPUT_BYTES,
         timeout_ms: READ_TIMEOUT_MS,
     }
@@ -406,8 +468,8 @@ fn genesis_entry_spec() -> OperationManifestSpec {
 
 /// Generates the per-operation manifest descriptors from the declaration table.
 ///
-/// Declaration order is the canonical order: the eleven activated reads, the
-/// eight activated mutations, then the genesis bootstrap entry. Generation is
+/// Declaration order is the canonical order: the thirteen activated reads, the
+/// ten activated mutations, then the genesis bootstrap entry. Generation is
 /// pure over crate constants, so the same source always yields byte-identical
 /// entries.
 pub fn generated_operation_manifests() -> Result<Vec<NamedOperationManifest>, StoreError> {
@@ -565,8 +627,10 @@ pub fn validate_read_against_catalogue(
 /// to a mutation entry, stay within that entry's ceiling, carry only the
 /// owner-approved typed parameters for the approved command, and stay within
 /// the entry input bound. Only `CaptureObservation`, `AppendAuditEvent`,
-/// `ApplyLifecyclePolicy`, `ReconcileRecovery`, `UpdateTaskState`, `ApplyEpistemicRevision`,
-/// and `ApplyErasure` have activated mutation entries; any other named
+/// `ApplyLifecyclePolicy`, `ReconcileRecovery`, `UpdateTaskState`,
+/// `ApplyEpistemicRevision`, `ApplyErasure`, `ApplyNotificationState`,
+/// `ApplyReactiveInjectionState`, and `ApplyResourceSnapshot` have activated
+/// mutation entries; any other named
 /// command fails closed here until a later slice proves its handler, schema,
 /// and consumer triple. An `Erasure`-class plan additionally admits only the
 /// named `ApplyErasure` operation (`ERASURE_STATE_IRREVERSIBLE`, enforced
@@ -645,6 +709,11 @@ pub fn validate_transition_against_catalogue(
             NamedMutationOperation::ApplyNotificationState => {
                 validate_typed_mutation_parameters(command.operation, &command.parameters)?;
                 crate::validate_notification_mutation_params(&command.parameters)?;
+            }
+            NamedMutationOperation::ApplyReactiveInjectionState
+            | NamedMutationOperation::ApplyResourceSnapshot => {
+                validate_typed_mutation_parameters(command.operation, &command.parameters)?;
+                crate::validate_reactive_mutation_params(command.operation, &command.parameters)?;
             }
             NamedMutationOperation::RecordAuthorityRevocation => {
                 return Err(StoreError::UnknownOperation);

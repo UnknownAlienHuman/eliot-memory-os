@@ -2771,6 +2771,7 @@ dependencies = [
 name = "eliot-store-api"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "eliot-contracts",
  "eliot-epistemic-contracts",
  "eliot-evidence",

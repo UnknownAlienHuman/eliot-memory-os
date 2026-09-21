@@ -363,6 +363,12 @@ async fn named_read_payload(
         NamedReadOperation::GetNotificationState => {
             notification_state_payload(db, &adapter.config, query, state_fence).await
         }
+        NamedReadOperation::GetReactiveInjectionState => {
+            reactive_ledger_payload(db, &adapter.config, query, state_fence).await
+        }
+        NamedReadOperation::GetResourceSnapshot => {
+            resource_snapshot_payload(db, &adapter.config, query, state_fence).await
+        }
         other => Err(AdapterError::NamedOperationUnavailable {
             operation: format!("{other:?}"),
         }),
@@ -1624,6 +1630,87 @@ async fn notification_state_payload(
         },
         "state_fence": state_fence,
         "revision": revision,
+    }))
+}
+
+/// Reads one reactive-session row and projects the same-fence canonical
+/// ledger view (issue #1941 C4).
+///
+/// Row shape mirrors the writer (`session_id`, verbatim `ledger_json`,
+/// `revision`, `state_fence`). An absent session (or a row from another
+/// fence) projects explicit absence (`ledger_json: null`, revision 0) —
+/// never a fabricated snapshot. Parameters are re-validated here
+/// (membership and shape via the catalogue gate upstream; value rules
+/// here) so a misrouted query fails closed without touching state.
+async fn reactive_ledger_payload(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    query: &NamedReadRequest,
+    state_fence: &StateFence,
+) -> Result<Value, AdapterError> {
+    eliot_store_api::validate_typed_read_parameters(
+        NamedReadOperation::GetReactiveInjectionState,
+        &query.parameters,
+    )
+    .map_err(AdapterError::Store)?;
+    if query.state_fence != *state_fence {
+        return Err(AdapterError::Store(StoreError::FenceMismatch));
+    }
+    let session_id = eliot_store_api::validate_reactive_ledger_read_params(&query.parameters)
+        .map_err(AdapterError::Store)?;
+    let row = super::surreal_reactive::read_session_for_read(db, config, &session_id).await?;
+    let (ledger_json, revision) = match row {
+        Some(row) if row.state_fence == *state_fence => (json!(row.ledger_json), row.revision),
+        _ => (Value::Null, 0),
+    };
+    Ok(json!({
+        "session_id": session_id,
+        "ledger_json": ledger_json,
+        "revision": revision,
+        "state_fence": state_fence,
+    }))
+}
+
+/// Reads one resource-snapshot row and projects the same-fence canonical
+/// snapshot view (issue #1941 C4).
+///
+/// Row shape mirrors the writer (`uri`, `content_sha256`, verbatim
+/// `content_base64`, `revision`, `state_fence`). An absent URI (or a row
+/// from another fence) projects explicit absence (null content fields,
+/// revision 0) — never fabricated bytes. Digest agreement was proven at
+/// write time and is re-checked by the consumer against the returned
+/// bytes.
+async fn resource_snapshot_payload(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    query: &NamedReadRequest,
+    state_fence: &StateFence,
+) -> Result<Value, AdapterError> {
+    eliot_store_api::validate_typed_read_parameters(
+        NamedReadOperation::GetResourceSnapshot,
+        &query.parameters,
+    )
+    .map_err(AdapterError::Store)?;
+    if query.state_fence != *state_fence {
+        return Err(AdapterError::Store(StoreError::FenceMismatch));
+    }
+    let uri = eliot_store_api::validate_resource_snapshot_read_params(&query.parameters)
+        .map_err(AdapterError::Store)?;
+    let row = super::surreal_reactive::read_snapshot_for_read(db, config, &uri).await?;
+    let (content_sha256, content_base64, revision) = match row {
+        Some(row) if row.state_fence == *state_fence => (
+            json!(row.content_sha256),
+            json!(row.content_base64),
+            row.revision,
+        ),
+        _ => (Value::Null, Value::Null, 0),
+    };
+    Ok(json!({
+        "uri": uri,
+        "content_sha256": content_sha256,
+        "content_base64": content_base64,
+        "revision": revision,
+        "state_fence": state_fence,
     }))
 }
 
