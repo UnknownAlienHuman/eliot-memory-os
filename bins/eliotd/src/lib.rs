@@ -149,7 +149,7 @@ pub use governor_local_read::{
 pub(crate) use kernel_authority_client::KernelAuthorityClient;
 pub use kernel_context_read_client::{KernelContextReadClient, ReconstructionReadComposition};
 pub use process_origin::{
-    CapabilityEvidenceSource, CapabilityEvidenceStatus, Generation, OperationDisposition,
+    CapabilityEvidenceSource, Generation, OperationDisposition,
     OriginChallenge, OriginChallengeAuthority, OriginChallengeRequest, OriginControlGrant,
     OriginControlOperation, OriginControlPresentation, PROCESS_ORIGIN_CAPABILITY,
     PhysicalProcessBinding, ProcessCapabilityEvidence, ProcessControlOperation, ProcessOriginError,
