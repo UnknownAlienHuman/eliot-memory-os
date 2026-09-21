@@ -1,4 +1,4 @@
-//! Read-only ControlBoard status projection owned by `eliot-runtime-status`.
+//! Read-only `ControlBoard` status projection owned by `eliot-runtime-status`.
 //!
 //! Issue #1213 second half: this module is the one real read-only consumer
 //! that wires `eliot-controlboard` under the current runtime-status owner.
@@ -148,7 +148,7 @@ pub enum ControlBoardSupport {
     CurrentUnverified,
 }
 
-/// Read-only ControlBoard contour.
+/// Read-only `ControlBoard` contour.
 ///
 /// Liveness, readiness, support, evidence, and Product are independent fields.
 /// No method combines them; adding one would manufacture a claim no single
@@ -230,7 +230,11 @@ pub enum ControlBoardProjectionError {
     },
 }
 
-fn bound_text(value: &str, field: &'static str, max_chars: usize) -> Result<(), ControlBoardProjectionError> {
+fn bound_text(
+    value: &str,
+    field: &'static str,
+    max_chars: usize,
+) -> Result<(), ControlBoardProjectionError> {
     if value.trim().is_empty() || value.chars().any(char::is_control) {
         return Err(ControlBoardProjectionError::InvalidBinding { field });
     }
@@ -243,9 +247,17 @@ fn bound_text(value: &str, field: &'static str, max_chars: usize) -> Result<(), 
 fn validate_bindings(
     bindings: &ControlBoardProjectionBindings,
 ) -> Result<(), ControlBoardProjectionError> {
-    bound_text(&bindings.capability, "bindings.capability", MAX_BINDING_CHARS)?;
+    bound_text(
+        &bindings.capability,
+        "bindings.capability",
+        MAX_BINDING_CHARS,
+    )?;
     bound_text(&bindings.owner, "bindings.owner", MAX_BINDING_CHARS)?;
-    bound_text(&bindings.generation, "bindings.generation", MAX_BINDING_CHARS)?;
+    bound_text(
+        &bindings.generation,
+        "bindings.generation",
+        MAX_BINDING_CHARS,
+    )?;
     bound_text(&bindings.evidence, "bindings.evidence", MAX_BINDING_CHARS)?;
     bound_text(&bindings.expiry, "bindings.expiry", MAX_BINDING_CHARS)?;
     bound_text(
@@ -255,11 +267,9 @@ fn validate_bindings(
     )?;
     match (&bindings.product_pulse, &bindings.product_not_applicable) {
         (Some(pulse), None) => bound_text(pulse, "bindings.product_pulse", MAX_BINDING_CHARS)?,
-        (None, Some(reason)) => bound_text(
-            reason,
-            "bindings.product_not_applicable",
-            MAX_BINDING_CHARS,
-        )?,
+        (None, Some(reason)) => {
+            bound_text(reason, "bindings.product_not_applicable", MAX_BINDING_CHARS)?;
+        }
         _ => return Err(ControlBoardProjectionError::MissingPulseBinding),
     }
     Ok(())
@@ -540,7 +550,11 @@ mod tests {
             revision: revision(),
             fence: fence(),
             completeness: ProviderCompleteness {
-                g11_coordination: projection_binding(ProjectionProvider::G11, "G-11", "g11-binding"),
+                g11_coordination: projection_binding(
+                    ProjectionProvider::G11,
+                    "G-11",
+                    "g11-binding",
+                ),
                 i12_report_projection: projection_binding(
                     ProjectionProvider::I12,
                     "I-12",
@@ -644,10 +658,7 @@ mod tests {
         assert_ne!(first.contour_digest, second.contour_digest);
         assert_eq!(first.product_pulse, None);
         assert_eq!(second.product_pulse, Some("pulse-b".to_owned()));
-        assert_ne!(
-            first.product_not_applicable,
-            second.product_not_applicable
-        );
+        assert_ne!(first.product_not_applicable, second.product_not_applicable);
         for (first_row, second_row) in first.rows.iter().zip(&second.rows) {
             assert_eq!(first_row.entry_id, second_row.entry_id);
             assert_eq!(first_row.entry, second_row.entry);
@@ -682,7 +693,10 @@ mod tests {
             "private_key",
             "authorization",
         ] {
-            assert!(!json.contains(needle), "secret-like text in contour: {needle}");
+            assert!(
+                !json.contains(needle),
+                "secret-like text in contour: {needle}"
+            );
         }
     }
 
@@ -710,8 +724,7 @@ mod tests {
 
     #[test]
     fn denied_read_yields_no_contour() {
-        let mut board =
-            ControlBoard::new(Some(Box::new(DenyingAccess)), None, None);
+        let mut board = ControlBoard::new(Some(Box::new(DenyingAccess)), None, None);
         let error = read_controlboard_contour(&mut board, &read_request(), &bindings())
             .expect_err("denied read must fail");
         assert!(matches!(
