@@ -99,6 +99,17 @@ pub enum ToolRequest {
     /// Authenticated UserAutomation operator operation carried by Host/CLI.
     #[serde(rename = "eliot_user_automation")]
     UserAutomation(UserAutomationInput),
+    /// Hotset intake for Skill delivery (host-request skill leg only).
+    ///
+    /// Non-hot carrier: no semantic profile, never advertised on the MCP
+    /// surface, always rejected by profile-driven dispatch. Carries the
+    /// versioned Skill intake payload as opaque arguments validated at the
+    /// Skill boundary, never here.
+    #[serde(rename = "skill.inject")]
+    SkillInject(Value),
+    /// Display request for a delivered Skill (same non-hot status).
+    #[serde(rename = "skill.display")]
+    SkillDisplay(Value),
 }
 
 impl ToolRequest {
@@ -115,6 +126,8 @@ impl ToolRequest {
             Self::Coordinate(_) => "eliot.coordinate",
             Self::Finish(_) => "eliot.finish",
             Self::UserAutomation(_) => USER_AUTOMATION_ROUTE,
+            Self::SkillInject(_) => "skill.inject",
+            Self::SkillDisplay(_) => "skill.display",
         }
     }
 
@@ -129,6 +142,15 @@ impl ToolRequest {
             Self::Coordinate(value) => value.validate(),
             Self::Finish(value) => value.validate(),
             Self::UserAutomation(value) => value.validate(),
+            Self::SkillInject(value) | Self::SkillDisplay(value) => {
+                if !value.is_object() {
+                    return Err(ContractViolation::InvalidField {
+                        field: "tool.arguments",
+                        reason: "skill carrier arguments must be a JSON object",
+                    });
+                }
+                Ok(())
+            }
         }
     }
 }

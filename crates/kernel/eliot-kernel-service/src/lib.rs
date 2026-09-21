@@ -29,6 +29,9 @@ mod doctor;
 mod doctor_front_door;
 mod host_request_binding;
 mod lifecycle;
+mod lifecycle_persist;
+#[cfg(test)]
+mod lifecycle_persist_tests;
 mod notification_state;
 #[cfg(test)]
 mod notification_state_tests;
@@ -45,6 +48,10 @@ mod store_write_reservation;
 mod store_write_reservation_tests;
 mod testd_front_door;
 mod user_automation;
+mod user_automation_execution;
+mod user_automation_failure_history;
+#[cfg(test)]
+mod user_automation_failure_history_tests;
 mod user_automation_store;
 #[cfg(test)]
 mod user_automation_store_tests;
@@ -80,6 +87,12 @@ pub use eliot_protocol::{
 pub use host_request_binding::{AuthenticatedHostSession, KernelHostRequestBinder};
 pub use lifecycle::{
     AdmissionLease, KernelService, KernelServiceError, KernelServiceState, ServiceFailure,
+};
+pub use lifecycle_persist::{
+    AuthenticatedLifecycleSession, BuiltLeg, BuiltLegKind, HopMutation, HopMutationInput,
+    LifecyclePersistError, LifecyclePersistRequest, LifecyclePersistResponse,
+    LifecycleServiceContext, LinkAuditBinding, PersistedHop, PersistedMutation,
+    build_persist_transitions, handle_lifecycle_persist_request,
 };
 pub use notification_state::{
     AuthenticatedNotificationSession, NotificationMetrics, NotificationServiceContext,
@@ -167,6 +180,17 @@ pub use user_automation::{
     UserAutomationMutationResult, UserAutomationReadResult, UserAutomationService,
     UserAutomationServiceError, UserAutomationServiceRequest, UserAutomationStoreOutcome,
     UserAutomationStorePort, UserAutomationStoreRequest, UserAutomationStoreResponse,
+};
+pub use user_automation_execution::{
+    UserAutomationDurableJobPort, UserAutomationExecutionError, UserAutomationExecutionOutcome,
+    UserAutomationExecutionRequest, UserAutomationFailureHistory,
+    UserAutomationFailureHistoryPort, UserAutomationFailurePublication, UserAutomationFailureRecord,
+    UserAutomationNotificationDelivery, UserAutomationNotificationPort, UserAutomationRemovalResult,
+    UserAutomationRuntimeAdmission, UserAutomationRuntimeComposition, UserAutomationRuntimeError,
+    UserAutomationRuntimePort, UserAutomationWakeCancellation, UserAutomationWakePort,
+};
+pub use user_automation_failure_history::{
+    StoreUserAutomationFailureHistory, build_failure_transition,
 };
 pub use user_automation_store::CanonicalUserAutomationStore;
 pub use write_coordinator::{

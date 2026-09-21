@@ -5,8 +5,9 @@ use std::path::PathBuf;
 
 use eliot_notify::{NotificationComposition, PROTOCOL_VERSION, SERVICE_NAME};
 use eliot_notify_core::{
-    NotificationEnvelope, NotifyError, SignedWatchdogFallbackEnvelope,
-    UserAutomationFailureRequest, UserAutomationInvocation, UserAutomationPreflightDecision,
+    NotificationEnvelope, NotificationStateReadRequest, NotifyError,
+    SignedWatchdogFallbackEnvelope, UserAutomationFailureRequest, UserAutomationInvocation,
+    UserAutomationPreflightDecision,
 };
 use eliot_platform::NotificationRequest;
 use serde::{Deserialize, Serialize};
@@ -37,6 +38,10 @@ enum Request {
         invocation: UserAutomationInvocation,
         request: NotificationRequest,
     },
+    ReadInbox {
+        parent: NotificationRequest,
+        read: NotificationStateReadRequest,
+    },
 }
 
 #[derive(Serialize)]
@@ -63,6 +68,11 @@ enum Response {
         protocol: &'static str,
         receipt: Box<eliot_notify_core::UserAutomationPreflightReceipt>,
         observation: Box<eliot_notify_core::DeliveryObservation>,
+    },
+    Inbox {
+        service: &'static str,
+        protocol: &'static str,
+        read: Box<eliot_notify_core::NotificationStateReadResponse>,
     },
     WatchdogTaskRegistered {
         service: &'static str,
@@ -219,6 +229,12 @@ fn main() {
                 Err(error) => composition_error(error.to_string()),
             }
         }
+        Ok(Request::ReadInbox { parent, read }) => {
+            match NotificationComposition::from_kernel_with_quiet_hours(root, &parent) {
+                Ok(mut composition) => dispatch_read_inbox(&mut composition, &parent, &read),
+                Err(error) => composition_error(error.to_string()),
+            }
+        }
         Err(error) => Response::Error {
             code: "REQUEST_INVALID",
             detail: error.to_string(),
@@ -368,6 +384,26 @@ fn dispatch_user_automation(
     }
 }
 
+/// Queries the authenticated canonical notification inbox through the same
+/// Kernel exchange used by delivery. The response carries the owner records
+/// plus inbox metrics (unresolved / critical / failed-delivery /
+/// acknowledged counts); board projection of ack/critical/failure semantics
+/// is preserved end to end because the records travel unchanged.
+fn dispatch_read_inbox(
+    composition: &mut NotificationComposition,
+    parent: &NotificationRequest,
+    read: &NotificationStateReadRequest,
+) -> Response {
+    match composition.read_notification_state(parent, read) {
+        Ok(response) => Response::Inbox {
+            service: SERVICE_NAME,
+            protocol: PROTOCOL_VERSION,
+            read: Box::new(response),
+        },
+        Err(error) => notify_error(&error),
+    }
+}
+
 fn dispatch_fallback(
     composition: &mut NotificationComposition,
     envelope: &SignedWatchdogFallbackEnvelope,
@@ -473,5 +509,79 @@ mod tests {
             .is_err()
         );
         assert!(parse_launch_args(["--unknown"], &PathBuf::from("C:\\notify")).is_err());
+    }
+
+    #[test]
+    fn read_inbox_response_preserves_ack_critical_and_failure_for_the_board() {
+        let read: eliot_notify_core::NotificationStateReadResponse =
+            serde_json::from_value(serde_json::json!({
+                "records": [{
+                    "notification_id": "notification-1",
+                    "severity": "CRITICAL",
+                    "subject": "subject",
+                    "summary": "summary",
+                    "evidence_handles": ["evidence-1"],
+                    "affected_scope": "scope-1",
+                    "owner": "owner-1",
+                    "required_action": "review",
+                    "deadline_or_review": null,
+                    "dedup_key": "backup-failed",
+                    "delivery_channels": ["CONTROL_BOARD"],
+                    "occurrences": 2,
+                    "delivery": {"kind": "FAILED", "reason": "toast provider failed"},
+                    "acknowledgement": {"principal": "operator-1", "sequence": 1},
+                    "resolution_ref": null,
+                    "state_fence": {
+                        "authority_epoch": {
+                            "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+                            "sequence": 1
+                        },
+                        "resource_generation": 1,
+                        "task_revision": 1,
+                        "policy_revision": 1,
+                        "integration_revision": 1
+                    },
+                    "revision": 2
+                }],
+                "metrics": {
+                    "unresolved_total": 1,
+                    "critical_unresolved": 1,
+                    "action_required_unresolved": 0,
+                    "failed_delivery_unresolved": 1,
+                    "acknowledged_unresolved": 1,
+                    "resolved_total": 0
+                },
+                "state_fence": {
+                    "authority_epoch": {
+                        "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+                        "sequence": 1
+                    },
+                    "resource_generation": 1,
+                    "task_revision": 1,
+                    "policy_revision": 1,
+                    "integration_revision": 1
+                },
+                "revision": 2
+            }))
+            .expect("inbox read response decodes");
+        let response = Response::Inbox {
+            service: SERVICE_NAME,
+            protocol: PROTOCOL_VERSION,
+            read: Box::new(read),
+        };
+        let rendered = serde_json::to_value(&response).expect("inbox renders");
+        assert_eq!(rendered["status"], "inbox");
+        assert_eq!(rendered["read"]["records"][0]["dedup_key"], "backup-failed");
+        assert_eq!(
+            rendered["read"]["records"][0]["acknowledgement"]["principal"],
+            "operator-1"
+        );
+        assert_eq!(
+            rendered["read"]["records"][0]["delivery"]["reason"],
+            "toast provider failed"
+        );
+        assert_eq!(rendered["read"]["metrics"]["critical_unresolved"], 1);
+        assert_eq!(rendered["read"]["metrics"]["failed_delivery_unresolved"], 1);
+        assert_eq!(rendered["read"]["metrics"]["acknowledged_unresolved"], 1);
     }
 }

@@ -628,7 +628,7 @@ static GET_RESOURCE_SNAPSHOT_PARAMETERS: [ParameterDeclaration; 1] = [ParameterD
 /// each leg requires) is enforced by the automation-state contract; every
 /// name here is optional at the declaration level so one closed table
 /// serves all six legs.
-static APPLY_USER_AUTOMATION_PARAMETERS: [ParameterDeclaration; 8] = [
+static APPLY_USER_AUTOMATION_PARAMETERS: [ParameterDeclaration; 9] = [
     ParameterDeclaration {
         name: "operation",
         shape: ParameterShape::Subject,
@@ -666,6 +666,11 @@ static APPLY_USER_AUTOMATION_PARAMETERS: [ParameterDeclaration; 8] = [
     },
     ParameterDeclaration {
         name: "invocation_json",
+        shape: ParameterShape::Subject,
+        required: false,
+    },
+    ParameterDeclaration {
+        name: "failure_json",
         shape: ParameterShape::Subject,
         required: false,
     },

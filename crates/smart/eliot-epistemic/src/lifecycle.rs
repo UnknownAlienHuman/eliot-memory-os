@@ -692,9 +692,14 @@ pub struct LifecycleChainView {
 /// (so the original stays reconstructible), and every receipt must carry
 /// its `AppendAuditEvent` linkage.
 pub fn verify_chain(receipts: &[LifecycleReceipt]) -> Result<LifecycleChainView, LifecycleError> {
-    let [first, .., last] = receipts else {
-        return Err(LifecycleError::EmptyChain);
-    };
+    // A lone retained genesis is a complete chain (#1905: the raw
+    // observation remains an Observation Candidate). Binding first and
+    // last separately accepts the singleton; only the empty chain fails.
+    // (`let [first, .., last]` cannot bind a one-element slice, which
+    // wrongly rejected retained-candidate chains here while the admission
+    // layer above already accepted them.)
+    let first = receipts.first().ok_or(LifecycleError::EmptyChain)?;
+    let last = receipts.last().ok_or(LifecycleError::EmptyChain)?;
     for receipt in receipts {
         receipt.validate()?;
         if !receipt.is_audit_linked() {
