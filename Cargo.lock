@@ -577,6 +577,7 @@ dependencies = [
  "eliot-agent-api",
  "eliot-bootstrap",
  "eliot-cli",
+ "eliot-config",
  "eliot-contracts",
  "eliot-doctor",
  "eliot-governor",
@@ -1480,6 +1481,7 @@ dependencies = [
  "eliot-contracts",
  "eliot-dreamer-contracts",
  "eliot-evidence",
+ "eliot-security-contracts",
  "schemars",
  "serde",
 ]
@@ -3077,6 +3079,7 @@ dependencies = [
  "eliot-agent-contracts",
  "eliot-agent-coordinator",
  "eliot-authority",
+ "eliot-config",
  "eliot-contracts",
  "eliot-controlboard",
  "eliot-doctor-core",
