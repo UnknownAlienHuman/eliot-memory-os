@@ -35,6 +35,7 @@ use std::sync::atomic::Ordering;
 
 mod activation_projection;
 pub mod agent_fabric;
+mod capability_admission;
 pub mod capability_outcome;
 mod controlboard_adapters;
 mod daemon_config;
@@ -51,6 +52,7 @@ mod kernel_context_read_client;
 mod kernel_recovery_client;
 mod kernel_transition_client;
 mod observation_adapters;
+mod route_receipts;
 mod skill_lifecycle_adapters;
 mod skill_surface_adapters;
 pub mod staffing_policy;
@@ -80,6 +82,12 @@ use activation_projection::map_activation_snapshot;
 pub use capability_outcome::{
     AttemptReceipt, CapabilityOutcome, CapabilityRegistryView, DegradationScope,
     FallbackOutcomeRequest, OutcomeDisposition, OutcomeError, fallback_outcome,
+};
+pub use capability_admission::{
+    AdmissionDisposition, AdmissionOutcome, CapabilityEvidenceRecord, CapabilityEvidenceStatus,
+    DynamicCapabilityPulse, ProductionAdmissionRequest, ProductionEvidenceBundle,
+    RouteAdmissionDecision, StaticCapabilityAttestation, admit_production_route,
+    evaluate_production_admission,
 };
 pub use daemon_config::DaemonConfig;
 pub(crate) use daemon_kernel_client::kernel_port_error;
@@ -120,6 +128,10 @@ pub use governor_local_read::{
 };
 pub(crate) use kernel_authority_client::KernelAuthorityClient;
 pub use kernel_context_read_client::{KernelContextReadClient, ReconstructionReadComposition};
+pub use route_receipts::{
+    ActualRouteReceipt, GovernorRouteAttempt, RouteCapabilityIndex, RouteReceiptError,
+    RuntimeObservedFacts, UNKNOWN_ROUTE_FACT, effective_route_key,
+};
 pub use store_failure_projection::{GovernorStoreFailureProjection, GovernorStoreProjectionError};
 
 /// Builds the production P-07 authority adapter over an already-connected
