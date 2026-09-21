@@ -770,13 +770,19 @@ pub fn admit_context(subject: &RuntimeSubject) -> Result<AdmissionReceipt, Influ
 }
 
 /// Pending-injection boundary: stages an admitted subject for use. Requires
-/// the admission receipt for the same subject digest and re-runs the gate.
+/// the admission receipt for the same subject digest and state fence, and
+/// re-runs the gate.
 pub fn inject_pending(
     subject: &RuntimeSubject,
     admission: &AdmissionReceipt,
 ) -> Result<PendingReceipt, InfluenceRuntimeError> {
     let digest = subject.digest()?;
     if admission.subject_digest != digest || admission.subject_ref != subject.subject_ref {
+        return Err(InfluenceRuntimeError::BindingMismatch {
+            stage: RuntimeStage::PendingInjection,
+        });
+    }
+    if admission.state_fence != subject.state_fence {
         return Err(InfluenceRuntimeError::BindingMismatch {
             stage: RuntimeStage::PendingInjection,
         });
@@ -804,13 +810,71 @@ pub fn inject_pending(
     })
 }
 
+/// Validated admission digest for a subject.
+///
+/// Every later stage re-validates the admission receipt from the subject
+/// itself: same subject reference and digest, same state fence, and an allow
+/// verdict. A forged or stale admission (matching digest but arbitrary fence,
+/// or a digest from a previous subject revision) fails here.
+fn validated_admission_digest(
+    subject: &RuntimeSubject,
+    admission: &AdmissionReceipt,
+    stage: RuntimeStage,
+) -> Result<String, InfluenceRuntimeError> {
+    let digest = subject.digest()?;
+    if admission.subject_ref != subject.subject_ref || admission.subject_digest != digest {
+        return Err(InfluenceRuntimeError::BindingMismatch { stage });
+    }
+    if admission.state_fence != subject.state_fence {
+        return Err(InfluenceRuntimeError::BindingMismatch { stage });
+    }
+    if !matches!(admission.verdict_kind, RuntimeVerdictKind::Allow) {
+        return Err(InfluenceRuntimeError::BindingMismatch { stage });
+    }
+    admission
+        .digest()
+        .map_err(|_| InfluenceRuntimeError::Canonicalization)
+}
+
+/// Validated pending digest for a subject and its admission.
+///
+/// Checks the pending receipt against the subject (reference, digest, fence)
+/// and binds it to the validated admission via `admission_digest`. A forged
+/// pending receipt with a matching subject digest but an arbitrary fence or
+/// predecessor digest fails here, as does a stale pending from a previous
+/// subject revision.
+fn validated_pending_digest(
+    subject: &RuntimeSubject,
+    pending: &PendingReceipt,
+    admission: &AdmissionReceipt,
+    stage: RuntimeStage,
+) -> Result<String, InfluenceRuntimeError> {
+    let expected_admission = validated_admission_digest(subject, admission, stage)?;
+    let digest = subject.digest()?;
+    if pending.subject_ref != subject.subject_ref || pending.subject_digest != digest {
+        return Err(InfluenceRuntimeError::BindingMismatch { stage });
+    }
+    if pending.state_fence != subject.state_fence {
+        return Err(InfluenceRuntimeError::BindingMismatch { stage });
+    }
+    if pending.admission_digest != expected_admission {
+        return Err(InfluenceRuntimeError::BindingMismatch { stage });
+    }
+    pending
+        .digest()
+        .map_err(|_| InfluenceRuntimeError::Canonicalization)
+}
+
 /// Material-decision boundary: consumes a pending receipt as decision or
-/// verifier input. A retrievable-but-restricted record is denied here with a
+/// verifier input. The validated admission receipt must accompany the pending
+/// receipt so the pending fence and predecessor digest are bound to the same
+/// subject revision. A retrievable-but-restricted record is denied here with a
 /// stated reason. Degraded-use is reported as an error carrying the degraded
 /// verdict so the caller can only proceed at the stated fallback use.
 pub fn decide_material(
     subject: &RuntimeSubject,
     pending: &PendingReceipt,
+    admission: &AdmissionReceipt,
     requested: RuntimeUse,
 ) -> Result<DecisionReceipt, InfluenceRuntimeError> {
     if !matches!(
@@ -823,6 +887,8 @@ pub fn decide_material(
         });
     }
     let digest = subject.digest()?;
+    let expected_pending =
+        validated_pending_digest(subject, pending, admission, RuntimeStage::MaterialDecision)?;
     if pending.subject_digest != digest || pending.subject_ref != subject.subject_ref {
         return Err(InfluenceRuntimeError::BindingMismatch {
             stage: RuntimeStage::MaterialDecision,
@@ -833,7 +899,7 @@ pub fn decide_material(
         RuntimeVerdictKind::Allow => Ok(DecisionReceipt {
             subject_ref: subject.subject_ref.clone(),
             subject_digest: digest,
-            pending_digest: pending.digest()?,
+            pending_digest: expected_pending,
             requested,
             verdict_kind: verdict.kind,
             state_fence: subject.state_fence.clone(),
@@ -853,11 +919,17 @@ pub fn decide_material(
 }
 
 /// Result-binding boundary: binds a material decision as a verifier or
-/// confirmatory result. An exploratory-only record cannot satisfy verifier or
-/// confirmatory acceptance here without a qualifying transition.
+/// confirmatory result. The validated pending and admission receipts must
+/// accompany the decision so the decision fence and predecessor digest are
+/// bound to the same subject revision, and the binding use must not exceed
+/// the decision use (a `DECISION_INPUT` receipt cannot yield a
+/// `VERIFIER_INPUT` binding). An exploratory-only record cannot satisfy
+/// verifier or confirmatory acceptance here without a qualifying transition.
 pub fn bind_result(
     subject: &RuntimeSubject,
     decision: &DecisionReceipt,
+    pending: &PendingReceipt,
+    admission: &AdmissionReceipt,
     requested: RuntimeUse,
 ) -> Result<BindingReceipt, InfluenceRuntimeError> {
     if !matches!(
@@ -870,12 +942,31 @@ pub fn bind_result(
         });
     }
     let digest = subject.digest()?;
+    let expected_pending =
+        validated_pending_digest(subject, pending, admission, RuntimeStage::ResultBinding)?;
     if decision.subject_digest != digest || decision.subject_ref != subject.subject_ref {
         return Err(InfluenceRuntimeError::BindingMismatch {
             stage: RuntimeStage::ResultBinding,
         });
     }
+    if decision.state_fence != subject.state_fence {
+        return Err(InfluenceRuntimeError::BindingMismatch {
+            stage: RuntimeStage::ResultBinding,
+        });
+    }
+    if decision.pending_digest != expected_pending {
+        return Err(InfluenceRuntimeError::BindingMismatch {
+            stage: RuntimeStage::ResultBinding,
+        });
+    }
     if !matches!(decision.verdict_kind, RuntimeVerdictKind::Allow) {
+        return Err(InfluenceRuntimeError::BindingMismatch {
+            stage: RuntimeStage::ResultBinding,
+        });
+    }
+    if RuntimeUse::rank(requested.required_use())
+        > RuntimeUse::rank(decision.requested.required_use())
+    {
         return Err(InfluenceRuntimeError::BindingMismatch {
             stage: RuntimeStage::ResultBinding,
         });
@@ -1301,6 +1392,7 @@ mod tests {
         let reasons = deny_reasons(decide_material(
             &subject,
             &pending,
+            &admission,
             RuntimeUse::DecisionInput,
         ));
         assert!(
@@ -1389,11 +1481,18 @@ mod tests {
             Ok(pending) => pending,
             Err(error) => panic!("injection succeeds: {error:?}"),
         };
-        let decision = match decide_material(&verified, &pending, RuntimeUse::DecisionInput) {
-            Ok(decision) => decision,
-            Err(error) => panic!("material decision succeeds: {error:?}"),
-        };
-        match bind_result(&verified, &decision, RuntimeUse::ConfirmatoryAcceptance) {
+        let decision =
+            match decide_material(&verified, &pending, &admission, RuntimeUse::DecisionInput) {
+                Ok(decision) => decision,
+                Err(error) => panic!("material decision succeeds: {error:?}"),
+            };
+        match bind_result(
+            &verified,
+            &decision,
+            &pending,
+            &admission,
+            RuntimeUse::ConfirmatoryAcceptance,
+        ) {
             Ok(_) => {}
             Err(error) => panic!("result binding succeeds: {error:?}"),
         }
@@ -1421,11 +1520,18 @@ mod tests {
             Ok(pending) => pending,
             Err(error) => panic!("injection succeeds: {error:?}"),
         };
-        let decision = match decide_material(&subject, &pending, RuntimeUse::DecisionInput) {
-            Ok(decision) => decision,
-            Err(error) => panic!("decision succeeds: {error:?}"),
-        };
-        match bind_result(&subject, &decision, RuntimeUse::ConfirmatoryAcceptance) {
+        let decision =
+            match decide_material(&subject, &pending, &admission, RuntimeUse::DecisionInput) {
+                Ok(decision) => decision,
+                Err(error) => panic!("decision succeeds: {error:?}"),
+            };
+        match bind_result(
+            &subject,
+            &decision,
+            &pending,
+            &admission,
+            RuntimeUse::ConfirmatoryAcceptance,
+        ) {
             Ok(_) => {}
             Err(error) => panic!("binding succeeds: {error:?}"),
         }
@@ -1461,10 +1567,384 @@ mod tests {
             Ok(pending) => pending,
             Err(error) => panic!("injection succeeds: {error:?}"),
         };
-        match decide_material(&subject, &pending, RuntimeUse::ConfirmatoryAcceptance) {
+        match decide_material(
+            &subject,
+            &pending,
+            &admission,
+            RuntimeUse::ConfirmatoryAcceptance,
+        ) {
             Ok(_) => panic!("wrong-stage use must fail"),
             Err(InfluenceRuntimeError::InvalidUseForStage { .. }) => {}
             Err(other) => panic!("expected invalid stage use, got {other:?}"),
+        }
+    }
+
+    fn test_fence_with_generation(generation: u64) -> StateFence {
+        let lineage = match EpochLineageId::new(TEST_LINEAGE) {
+            Ok(lineage) => lineage,
+            Err(error) => panic!("valid test lineage: {error:?}"),
+        };
+        let Some(ordinal) = std::num::NonZeroU64::new(7) else {
+            panic!("nonzero test epoch ordinal")
+        };
+        let epoch = match EpochId::new(lineage, ordinal) {
+            Ok(epoch) => epoch,
+            Err(error) => panic!("valid test epoch: {error:?}"),
+        };
+        let generation = match ResourceGeneration::new(generation) {
+            Ok(generation) => generation,
+            Err(error) => panic!("valid test generation: {error:?}"),
+        };
+        StateFence::new(epoch, generation)
+    }
+
+    fn test_fence_alt() -> StateFence {
+        test_fence_with_generation(9)
+    }
+
+    fn runtime_subject_with_fence(
+        allowed: Vec<EpistemicUse>,
+        influence: InfluenceState,
+        retrievable: bool,
+        fence: StateFence,
+        support_revision: u64,
+    ) -> RuntimeSubject {
+        match RuntimeSubject::new(
+            "subject:runtime".to_string(),
+            "origin:runtime".to_string(),
+            allowed,
+            influence,
+            retrievable,
+            support_revision,
+            fence,
+        ) {
+            Ok(subject) => subject,
+            Err(error) => panic!("valid runtime subject: {error:?}"),
+        }
+    }
+
+    fn qualified_subject_with_fence(
+        allowed: Vec<EpistemicUse>,
+        fence: StateFence,
+    ) -> RuntimeSubject {
+        let base = runtime_subject_with_fence(allowed, InfluenceState::Active, true, fence, 11);
+        match qualify_transition(
+            &base,
+            EpistemicUse::CandidateEvidence,
+            "evidence:test-qualification",
+        ) {
+            Ok(subject) => subject,
+            Err(error) => panic!("test qualification succeeds: {error:?}"),
+        }
+    }
+
+    fn expect_binding_mismatch(result: Result<(), InfluenceRuntimeError>, case: &str) {
+        match result {
+            Ok(()) => panic!("{case} must fail"),
+            Err(InfluenceRuntimeError::BindingMismatch { .. }) => {}
+            Err(other) => panic!("{case}: expected binding mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inject_pending_rejects_forged_fence() {
+        let subject = qualified_subject(vec![EpistemicUse::CandidateEvidence]);
+        let admission = match admit_context(&subject) {
+            Ok(admission) => admission,
+            Err(error) => panic!("admission succeeds: {error:?}"),
+        };
+        let mut forged = admission.clone();
+        forged.state_fence = test_fence_alt();
+        expect_binding_mismatch(
+            inject_pending(&subject, &forged).map(|_| ()),
+            "forged admission fence",
+        );
+    }
+
+    #[test]
+    fn inject_pending_rejects_stale_admission() {
+        let old = qualified_subject_with_fence(vec![EpistemicUse::CandidateEvidence], test_fence());
+        let old_admission = match admit_context(&old) {
+            Ok(admission) => admission,
+            Err(error) => panic!("old admission succeeds: {error:?}"),
+        };
+        let new =
+            qualified_subject_with_fence(vec![EpistemicUse::CandidateEvidence], test_fence_alt());
+        expect_binding_mismatch(
+            inject_pending(&new, &old_admission).map(|_| ()),
+            "stale admission from previous fence",
+        );
+    }
+
+    #[test]
+    fn decide_material_rejects_forged_pending_fence() {
+        let subject = qualified_subject(vec![EpistemicUse::CandidateEvidence]);
+        let admission = match admit_context(&subject) {
+            Ok(admission) => admission,
+            Err(error) => panic!("admission succeeds: {error:?}"),
+        };
+        let pending = match inject_pending(&subject, &admission) {
+            Ok(pending) => pending,
+            Err(error) => panic!("injection succeeds: {error:?}"),
+        };
+        let mut forged = pending.clone();
+        forged.state_fence = test_fence_alt();
+        match decide_material(&subject, &forged, &admission, RuntimeUse::DecisionInput) {
+            Ok(_) => panic!("forged pending fence must fail"),
+            Err(InfluenceRuntimeError::BindingMismatch { .. }) => {}
+            Err(other) => panic!("expected binding mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decide_material_rejects_forged_admission_digest() {
+        let subject = qualified_subject(vec![EpistemicUse::CandidateEvidence]);
+        let admission = match admit_context(&subject) {
+            Ok(admission) => admission,
+            Err(error) => panic!("admission succeeds: {error:?}"),
+        };
+        let pending = match inject_pending(&subject, &admission) {
+            Ok(pending) => pending,
+            Err(error) => panic!("injection succeeds: {error:?}"),
+        };
+        let mut forged = pending.clone();
+        forged.admission_digest = "0".repeat(64);
+        match decide_material(&subject, &forged, &admission, RuntimeUse::DecisionInput) {
+            Ok(_) => panic!("forged admission digest must fail"),
+            Err(InfluenceRuntimeError::BindingMismatch { .. }) => {}
+            Err(other) => panic!("expected binding mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decide_material_rejects_stale_chain() {
+        let old = qualified_subject_with_fence(vec![EpistemicUse::CandidateEvidence], test_fence());
+        let old_admission = match admit_context(&old) {
+            Ok(admission) => admission,
+            Err(error) => panic!("old admission succeeds: {error:?}"),
+        };
+        let old_pending = match inject_pending(&old, &old_admission) {
+            Ok(pending) => pending,
+            Err(error) => panic!("old injection succeeds: {error:?}"),
+        };
+        let new =
+            qualified_subject_with_fence(vec![EpistemicUse::CandidateEvidence], test_fence_alt());
+        let new_admission = match admit_context(&new) {
+            Ok(admission) => admission,
+            Err(error) => panic!("new admission succeeds: {error:?}"),
+        };
+        match decide_material(
+            &new,
+            &old_pending,
+            &new_admission,
+            RuntimeUse::DecisionInput,
+        ) {
+            Ok(_) => panic!("stale pending must fail"),
+            Err(InfluenceRuntimeError::BindingMismatch { .. }) => {}
+            Err(other) => panic!("expected binding mismatch, got {other:?}"),
+        }
+        match decide_material(
+            &new,
+            &old_pending,
+            &old_admission,
+            RuntimeUse::DecisionInput,
+        ) {
+            Ok(_) => panic!("stale pending plus stale admission must fail"),
+            Err(InfluenceRuntimeError::BindingMismatch { .. }) => {}
+            Err(other) => panic!("expected binding mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bind_result_rejects_forged_decision_fence() {
+        let subject = qualified_subject(vec![EpistemicUse::CandidateEvidence]);
+        let admission = match admit_context(&subject) {
+            Ok(admission) => admission,
+            Err(error) => panic!("admission succeeds: {error:?}"),
+        };
+        let pending = match inject_pending(&subject, &admission) {
+            Ok(pending) => pending,
+            Err(error) => panic!("injection succeeds: {error:?}"),
+        };
+        let decision =
+            match decide_material(&subject, &pending, &admission, RuntimeUse::DecisionInput) {
+                Ok(decision) => decision,
+                Err(error) => panic!("decision succeeds: {error:?}"),
+            };
+        let mut forged = decision.clone();
+        forged.state_fence = test_fence_alt();
+        match bind_result(
+            &subject,
+            &forged,
+            &pending,
+            &admission,
+            RuntimeUse::ConfirmatoryAcceptance,
+        ) {
+            Ok(_) => panic!("forged decision fence must fail"),
+            Err(InfluenceRuntimeError::BindingMismatch { .. }) => {}
+            Err(other) => panic!("expected binding mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bind_result_rejects_forged_pending_digest() {
+        let subject = qualified_subject(vec![EpistemicUse::CandidateEvidence]);
+        let admission = match admit_context(&subject) {
+            Ok(admission) => admission,
+            Err(error) => panic!("admission succeeds: {error:?}"),
+        };
+        let pending = match inject_pending(&subject, &admission) {
+            Ok(pending) => pending,
+            Err(error) => panic!("injection succeeds: {error:?}"),
+        };
+        let decision =
+            match decide_material(&subject, &pending, &admission, RuntimeUse::DecisionInput) {
+                Ok(decision) => decision,
+                Err(error) => panic!("decision succeeds: {error:?}"),
+            };
+        let mut forged = decision.clone();
+        forged.pending_digest = "0".repeat(64);
+        match bind_result(
+            &subject,
+            &forged,
+            &pending,
+            &admission,
+            RuntimeUse::ConfirmatoryAcceptance,
+        ) {
+            Ok(_) => panic!("forged pending digest must fail"),
+            Err(InfluenceRuntimeError::BindingMismatch { .. }) => {}
+            Err(other) => panic!("expected binding mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bind_result_rejects_stale_chain() {
+        let old = qualified_subject_with_fence(vec![EpistemicUse::CandidateEvidence], test_fence());
+        let old_admission = match admit_context(&old) {
+            Ok(admission) => admission,
+            Err(error) => panic!("old admission succeeds: {error:?}"),
+        };
+        let old_pending = match inject_pending(&old, &old_admission) {
+            Ok(pending) => pending,
+            Err(error) => panic!("old injection succeeds: {error:?}"),
+        };
+        let old_decision = match decide_material(
+            &old,
+            &old_pending,
+            &old_admission,
+            RuntimeUse::DecisionInput,
+        ) {
+            Ok(decision) => decision,
+            Err(error) => panic!("old decision succeeds: {error:?}"),
+        };
+        let new =
+            qualified_subject_with_fence(vec![EpistemicUse::CandidateEvidence], test_fence_alt());
+        let new_admission = match admit_context(&new) {
+            Ok(admission) => admission,
+            Err(error) => panic!("new admission succeeds: {error:?}"),
+        };
+        let new_pending = match inject_pending(&new, &new_admission) {
+            Ok(pending) => pending,
+            Err(error) => panic!("new injection succeeds: {error:?}"),
+        };
+        match bind_result(
+            &new,
+            &old_decision,
+            &new_pending,
+            &new_admission,
+            RuntimeUse::ConfirmatoryAcceptance,
+        ) {
+            Ok(_) => panic!("stale decision must fail"),
+            Err(InfluenceRuntimeError::BindingMismatch { .. }) => {}
+            Err(other) => panic!("expected binding mismatch, got {other:?}"),
+        }
+        match bind_result(
+            &new,
+            &old_decision,
+            &old_pending,
+            &old_admission,
+            RuntimeUse::ConfirmatoryAcceptance,
+        ) {
+            Ok(_) => panic!("fully stale chain must fail"),
+            Err(InfluenceRuntimeError::BindingMismatch { .. }) => {}
+            Err(other) => panic!("expected binding mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bind_result_rejects_decision_input_for_verifier_binding() {
+        let base = runtime_subject_with_fence(
+            vec![EpistemicUse::CandidateEvidence],
+            InfluenceState::Active,
+            true,
+            test_fence(),
+            11,
+        );
+        let qualified = match qualify_transition(
+            &base,
+            EpistemicUse::CandidateEvidence,
+            "evidence:test-qualification",
+        ) {
+            Ok(subject) => subject,
+            Err(error) => panic!("test qualification succeeds: {error:?}"),
+        };
+        let verified = match qualify_transition(
+            &qualified,
+            EpistemicUse::VerificationInput,
+            "evidence:verifier-run-7",
+        ) {
+            Ok(subject) => subject,
+            Err(error) => panic!("verifier qualification succeeds: {error:?}"),
+        };
+        let admission = match admit_context(&verified) {
+            Ok(admission) => admission,
+            Err(error) => panic!("admission succeeds: {error:?}"),
+        };
+        let pending = match inject_pending(&verified, &admission) {
+            Ok(pending) => pending,
+            Err(error) => panic!("injection succeeds: {error:?}"),
+        };
+        let decision_input =
+            match decide_material(&verified, &pending, &admission, RuntimeUse::DecisionInput) {
+                Ok(decision) => decision,
+                Err(error) => panic!("decision input succeeds: {error:?}"),
+            };
+        assert_eq!(decision_input.requested, RuntimeUse::DecisionInput);
+        match bind_result(
+            &verified,
+            &decision_input,
+            &pending,
+            &admission,
+            RuntimeUse::VerifierInput,
+        ) {
+            Ok(_) => panic!("decision-input receipt must not yield verifier binding"),
+            Err(InfluenceRuntimeError::BindingMismatch { .. }) => {}
+            Err(other) => panic!("expected binding mismatch, got {other:?}"),
+        }
+        let verifier_decision =
+            match decide_material(&verified, &pending, &admission, RuntimeUse::VerifierInput) {
+                Ok(decision) => decision,
+                Err(error) => panic!("verifier decision succeeds: {error:?}"),
+            };
+        match bind_result(
+            &verified,
+            &verifier_decision,
+            &pending,
+            &admission,
+            RuntimeUse::VerifierInput,
+        ) {
+            Ok(_) => {}
+            Err(error) => panic!("verifier decision binds verifier use: {error:?}"),
+        }
+        match bind_result(
+            &verified,
+            &decision_input,
+            &pending,
+            &admission,
+            RuntimeUse::ConfirmatoryAcceptance,
+        ) {
+            Ok(_) => {}
+            Err(error) => panic!("decision input binds confirmatory use: {error:?}"),
         }
     }
 }
