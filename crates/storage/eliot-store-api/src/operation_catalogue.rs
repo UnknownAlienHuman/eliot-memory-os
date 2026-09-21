@@ -162,14 +162,15 @@ pub const READ_MAX_OUTPUT_BYTES: u32 = 3_145_728;
 /// read timeout on base.
 pub const READ_TIMEOUT_MS: u32 = 30_000;
 
-/// Maximum canonical parameter bytes accepted for a reactive mutation.
+/// Maximum canonical parameter bytes accepted for a bulk-JSON mutation.
 ///
-/// Reactive mutations carry bounded bulk snapshots (a ≤1 MiB ledger JSON
-/// string or ≤1 MiB base64 snapshot content): 2 MiB covers the content
-/// plus JSON-string escape expansion and the remaining small params while
+/// Bulk mutations carry bounded large JSON payloads (a ≤1 MiB ledger
+/// snapshot string, ≤1 MiB base64 snapshot content, or ≤256 KiB automation
+/// revision/invocation documents): 2 MiB covers the content plus
+/// JSON-string escape expansion and the remaining small params while
 /// staying fail-closed far below unbounded input. All other mutations
 /// keep [`READ_MAX_INPUT_BYTES`].
-pub const REACTIVE_MUTATION_MAX_INPUT_BYTES: u32 = 2_097_152;
+pub const BULK_MUTATION_MAX_INPUT_BYTES: u32 = 2_097_152;
 
 /// Maximum evidence records one `GetEvidencePack` read may return.
 ///
@@ -397,13 +398,13 @@ const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 10] = [
         operation: NamedMutationOperation::ApplyReactiveInjectionState,
         transition_classes: &[TransitionClass::ReactiveState],
         maximum_effect: EffectClass::ReversibleMutation,
-        max_input_bytes: REACTIVE_MUTATION_MAX_INPUT_BYTES,
+        max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
     },
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::ApplyResourceSnapshot,
         transition_classes: &[TransitionClass::ReactiveState],
         maximum_effect: EffectClass::ReversibleMutation,
-        max_input_bytes: REACTIVE_MUTATION_MAX_INPUT_BYTES,
+        max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
     },
 ];
 
