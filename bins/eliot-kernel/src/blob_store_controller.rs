@@ -9,7 +9,7 @@
 //! non-inline capture, recovery or GC demand; a failed probe degrades only
 //! large-payload capture and never fabricates a canonical `BlobRef`);
 //! I5.12 Blob Store (canonical `BlobRef`/`BlobReadyReceipt` only after durable
-//! acceptance); I1.2 §6 BlobStore capability (one data-root owner).
+//! acceptance); I1.2 §6 `BlobStore` capability (one data-root owner).
 //! Health reading: I1.10 (READY only for capabilities whose dimensions pass);
 //! failure containment: I14.24 (blob unavailable → limit large capture, small
 //! inline work may continue).
@@ -379,7 +379,7 @@ impl BlobStoreController {
                 match start_and_probe() {
                     Ok(success) => {
                         if let Err(error) = self.record_ready(success) {
-                            return self.record_degraded(error);
+                            return self.record_degraded(&error);
                         }
                         observe_entrypoint_with_detail(
                             EntrypointStage::StoreBootstrap,
@@ -387,7 +387,7 @@ impl BlobStoreController {
                         );
                     }
                     Err(reason) => {
-                        return self.record_degraded(sanitize_reason(&reason));
+                        return self.record_degraded(&sanitize_reason(&reason));
                     }
                 }
                 self.probe_status()
@@ -482,8 +482,8 @@ impl BlobStoreController {
         Ok(())
     }
 
-    fn record_degraded(&mut self, reason: String) -> BlobProbeStatus {
-        let reason = sanitize_reason(&reason);
+    fn record_degraded(&mut self, reason: &str) -> BlobProbeStatus {
+        let reason = sanitize_reason(reason);
         observe_entrypoint_with_detail(
             EntrypointStage::StoreBootstrap,
             "kernel.blob.probe_degraded:large_payload_only",
@@ -502,24 +502,18 @@ impl super::KernelComposition {
     /// Reports whether an approved blob manifest was validated at startup.
     #[must_use]
     pub fn blob_manifest_validated(&self) -> bool {
-        self.blob_store
-            .lock()
-            .map(|guard| guard.is_some())
-            .unwrap_or(false)
+        self.blob_store.lock().is_ok_and(|guard| guard.is_some())
     }
 
     /// Reports whether the blob generation process has been started.
     /// False until the first explicit non-inline/recovery/GC demand.
     #[must_use]
     pub fn blob_process_started(&self) -> bool {
-        self.blob_store
-            .lock()
-            .map(|guard| {
-                guard
-                    .as_ref()
-                    .is_some_and(|controller| controller.process_started())
-            })
-            .unwrap_or(false)
+        self.blob_store.lock().is_ok_and(|guard| {
+            guard
+                .as_ref()
+                .is_some_and(BlobStoreController::process_started)
+        })
     }
 
     /// Returns the current blob probe status, or `None` when no approved
@@ -529,7 +523,7 @@ impl super::KernelComposition {
         self.blob_store
             .lock()
             .ok()
-            .and_then(|guard| guard.as_ref().map(|controller| controller.probe_status()))
+            .and_then(|guard| guard.as_ref().map(BlobStoreController::probe_status))
     }
 
     /// Handles one explicit blob demand. On first demand runs the injected
