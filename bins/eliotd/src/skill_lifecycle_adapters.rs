@@ -385,6 +385,63 @@ impl<T> ForwardingSkillLifecycle<T> {
         })
     }
 
+    /// Reconciles installed entries against the live tool-owner view,
+    /// marking changed bases stale (issue #1882, `I7.13`).
+    ///
+    /// Production startup/refresh driver: every installed entry whose
+    /// `body.tool_refs` no longer resolve against `tools` is marked stale
+    /// with the missing names, so entries installed under an older registry
+    /// cannot stay generally deliverable without a display call ever
+    /// reaching them. Quarantined entries are left untouched; already-stale
+    /// entries report no change. Returns the count of newly staled entries.
+    /// Pure catalogue work under the caller's view — the caller supplies the
+    /// live view (hook-built projection in production) and, where provider
+    /// renames apply, the alias table behind it. Synchronous: the guard is
+    /// taken and dropped in a closed scope and never crosses an await.
+    #[allow(dead_code)]
+    pub(crate) fn reconcile_tool_basis(&self, tools: &dyn KnownTools) -> Result<usize, SkillError> {
+        let stale_ids: Vec<String> = {
+            let catalogue = self.lock_catalogue();
+            catalogue
+                .skill_ids()
+                .into_iter()
+                .filter(|skill_id| {
+                    catalogue.get(skill_id).is_some_and(|entry| {
+                        entry
+                            .body
+                            .tool_refs
+                            .iter()
+                            .any(|name| !tools.knows_tool(name))
+                    })
+                })
+                .collect()
+        };
+        let mut marked = 0_usize;
+        for skill_id in &stale_ids {
+            let missing: Vec<String> = {
+                let catalogue = self.lock_catalogue();
+                match catalogue.get(skill_id) {
+                    Some(entry) => entry
+                        .body
+                        .tool_refs
+                        .iter()
+                        .filter(|name| !tools.knows_tool(name))
+                        .cloned()
+                        .collect(),
+                    None => Vec::new(),
+                }
+            };
+            if missing.is_empty() {
+                continue;
+            }
+            let mut catalogue = self.lock_catalogue();
+            if catalogue.mark_tool_basis_stale(skill_id, &missing)? {
+                marked += 1;
+            }
+        }
+        Ok(marked)
+    }
+
     /// Binds the runtime receiver's ack to its exact receipt, then displays.
     ///
     /// The ack arrives from the real receiver (runtime Hotset injector), which
@@ -1185,6 +1242,45 @@ mod tests {
             redelivery,
             Err(SkillError::InvalidField { field, .. }) if field == "delivery.delivered_skill_ids"
         ));
+        assert_eq!(*calls.lock().expect("calls"), 0);
+        drop(forwarding);
+    }
+
+    #[test]
+    fn reconcile_marks_only_changed_bases_and_counts_them() {
+        // Startup/refresh driver: entries whose declared tools left the
+        // live view are marked stale with reasons while resolvable entries
+        // stay usable; the count reports newly staled entries only.
+        let (forwarding, calls, handle) = installing_forwarder();
+        let mut steady = catalogue_entry();
+        steady.index.skill_id = "skill-steady".to_owned();
+        steady.body.skill_id = "skill-steady".to_owned();
+        steady.body.tool_refs = vec!["finish-cap".to_owned()];
+        steady.body.body_digest = steady.body.expected_digest().expect("body digest");
+        steady.runtime.skill_id = "skill-steady".to_owned();
+        {
+            let mut catalogue = handle.lock().expect("catalogue lock");
+            catalogue
+                .insert(steady, &InstallTools)
+                .expect("steady entry");
+        }
+        let marked = forwarding
+            .reconcile_tool_basis(&FinishCapOnly)
+            .expect("reconcile runs");
+        assert_eq!(marked, 1);
+        {
+            let catalogue = handle.lock().expect("catalogue lock");
+            let stale = catalogue.get("skill-demo").expect("stored entry");
+            assert_eq!(stale.status, SkillStatus::Stale);
+            assert!(
+                stale
+                    .stale_reason
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("eliot.finish")
+            );
+            assert!(catalogue.is_usable("skill-steady"));
+        }
         assert_eq!(*calls.lock().expect("calls"), 0);
         drop(forwarding);
     }
