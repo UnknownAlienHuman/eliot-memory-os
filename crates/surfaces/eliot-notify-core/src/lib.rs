@@ -1077,9 +1077,10 @@ where
     /// Delivers after applying the canonical quiet-hours popup decision.
     ///
     /// The boolean is a caller-owned policy observation; it is never persisted
-    /// or treated as authority. The canonical record is upserted and read
-    /// before this predicate runs, so acknowledgement/resolution state cannot
-    /// be replaced by caller input.
+    /// or treated as authority. The canonical owner response is the exact
+    /// post-upsert record returned by `ApplyNotificationState`; the predicate
+    /// therefore never searches a bounded projection page or infers state from
+    /// another notification.
     pub fn deliver_with_quiet_hours(
         &mut self,
         envelope: &NotificationEnvelope,
@@ -1121,20 +1122,13 @@ where
         }
 
         let persisted = self.persist_canonical_upsert(&envelope.canonical, &verified, request)?;
-        let read_request = NotificationStateReadRequest {
-            context: request.context.clone(),
-            state_fence: request.context.state_fence.clone(),
-            scope: Some(envelope.canonical.affected_scope.clone()),
-            include_resolved: true,
-            page_limit: 128,
-            cursor: None,
-        };
-        let page = self.read_notification_state(request, &read_request)?;
-        let current = page
-            .records
-            .iter()
-            .find(|record| record.notification_id == persisted.record.notification_id)
-            .ok_or(NotifyError::CanonicalStateInvalid)?;
+        // A1780's authenticated mutation handler performs an exact target
+        // read-back (dedup key + notification id, page limit one) before it
+        // returns this response. The generic GetNotificationState port is a
+        // projection API with a 128-record page bound and is not a target
+        // lookup; using it here could reject or select the wrong notification
+        // once a scope spans multiple pages.
+        let current = &persisted.record;
         let popup = self.popup_selector.map_or_else(
             || current.should_popup(quiet_hours_active),
             |selector| {
@@ -2512,6 +2506,8 @@ mod tests {
     struct CanonicalStateFake {
         store: eliot_kernel_core::NotificationStore,
         mutation_log: Option<Arc<Mutex<Vec<NotificationStateMutation>>>>,
+        read_calls: Option<Arc<AtomicUsize>>,
+        read_override: Option<Vec<Notification>>,
     }
 
     impl NotificationStatePort for CanonicalStateFake {
@@ -2638,24 +2634,24 @@ mod tests {
             parent: &NotificationRequest,
             request: &NotificationStateReadRequest,
         ) -> PortOutcome<NotificationStateReadResponse> {
-            let mut records: Vec<Notification> = self
-                .store
-                .iter()
-                .filter(|record| {
-                    request
-                        .scope
-                        .as_ref()
-                        .is_none_or(|scope| &record.affected_scope == scope)
-                })
-                .filter(|record| request.include_resolved || record.is_unresolved())
-                .filter(|record| {
-                    request
+            if let Some(read_calls) = &self.read_calls {
+                read_calls.fetch_add(1, Ordering::SeqCst);
+            }
+            let mut records = self
+                .read_override
+                .clone()
+                .unwrap_or_else(|| self.store.iter().cloned().collect());
+            records.retain(|record| {
+                request
+                    .scope
+                    .as_ref()
+                    .is_none_or(|scope| &record.affected_scope == scope)
+                    && (request.include_resolved || record.is_unresolved())
+                    && request
                         .cursor
                         .as_ref()
                         .is_none_or(|cursor| record.dedup_key > *cursor)
-                })
-                .cloned()
-                .collect();
+            });
             records.sort_by(|left, right| left.dedup_key.cmp(&right.dedup_key));
             records.truncate(usize::from(request.page_limit));
 
@@ -2895,7 +2891,7 @@ mod tests {
     }
 
     #[test]
-    fn quiet_hours_uses_canonical_read_and_suppresses_only_popup() {
+    fn quiet_hours_uses_canonical_owner_state_and_suppresses_only_popup() {
         let (envelope, request) = normal_input("request-quiet-hours-read");
         let (platform, calls) = counting_platform(known_delivery());
         let mut core = NotifyCore::new(
@@ -2916,6 +2912,42 @@ mod tests {
             0,
             "quiet-hours suppression must happen before the P-01 effect"
         );
+    }
+
+    #[test]
+    fn quiet_hours_uses_exact_upsert_record_beyond_projection_page() {
+        let (envelope, request) = normal_input("request-quiet-hours-page-bound");
+        let (platform, calls) = counting_platform(known_delivery());
+        let read_calls = Arc::new(AtomicUsize::new(0));
+        let mut unrelated = eliot_kernel_core::NotificationStore::default()
+            .upsert(envelope.canonical.clone())
+            .unwrap()
+            .clone();
+        unrelated.notification_id = PlatformHandle::new("notification-before-target").unwrap();
+        unrelated.dedup_key = "notification-before-target".to_owned();
+        let mut verification = ports(
+            Some(DurableLedger::default()),
+            AdmissionMode::Good,
+            DeliveryReceiptMode::Good,
+        );
+        verification.notification_state = Some(Box::new(CanonicalStateFake {
+            store: eliot_kernel_core::NotificationStore::default(),
+            mutation_log: None,
+            read_calls: Some(Arc::clone(&read_calls)),
+            read_override: Some(vec![unrelated]),
+        }));
+        let mut core = NotifyCore::new(platform, verification);
+
+        assert_eq!(
+            core.deliver_with_quiet_hours(&envelope, &request, true),
+            Err(NotifyError::DeliverySuppressed)
+        );
+        assert_eq!(
+            read_calls.load(Ordering::SeqCst),
+            0,
+            "delivery must use the exact owner mutation response, not a bounded projection page"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -3164,6 +3196,8 @@ mod tests {
         verification.notification_state = Some(Box::new(CanonicalStateFake {
             store: eliot_kernel_core::NotificationStore::default(),
             mutation_log: Some(Arc::clone(&mutation_log)),
+            read_calls: None,
+            read_override: None,
         }));
         let mut core = NotifyCore::new(platform, verification);
 
