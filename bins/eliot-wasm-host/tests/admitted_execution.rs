@@ -31,11 +31,29 @@
 //! makes this guest emit the bare-input oracle image. The corpus digest
 //! honestly binds the executed vector either way.
 //!
-//! The positive proof retries whole real invocations (fresh invocation id,
-//! fresh permit, fresh child) until a genuinely `Succeeded` result lands or
-//! a deadline panics: the P03 reap races the child, so a transient
-//! `Unknown` must never become a pass — and any `Rejected` verdict aborts
-//! immediately, proving fail-closed holds under scheduling variance.
+//! The positive proof runs ONE invocation, ONE operation, ONE permit, ONE
+//! child (I14.21: preserve the operation, reconcile with evidence, never
+//! duplicate the effect): the P03 adapter's same-operation observed reap
+//! settles the handle inside the single `execute`, so any non-success
+//! verdict fails outright — no second invocation exists.
+//!
+//! Claim scope (what each edge proves, no cross-claims):
+//!
+//! - Wasmtime guest isolation — linear-memory/capability confinement under
+//!   the closed, import-free linker with no WASI — is proven by the engine
+//!   unit edge plus the closed manifest enforced here (empty imports, exact
+//!   `run` export, digest-bound artifact/interface/configuration). The P03
+//!   companion child does not and cannot prove guest isolation.
+//! - The NATIVE process boundary is proven here: the companion child is a
+//!   distinct Job-contained OS process with its own identity, and the
+//!   same-operation re-observation asserts exit plus complete, terminated
+//!   descendant proof (contained, no orphans) with recorded evidence.
+//! - The engine identity digest is fixture-scoped
+//!   ([`JOINED_ENGINE_FIXTURE_ID`]): it names the pinned implementation,
+//!   not a measured production engine artifact — production engine-artifact
+//!   provenance is explicitly not claimed. Measured and asserted instead:
+//!   the loaded component artifact bytes (usage accessed-digests/bytes),
+//!   the provider configuration digest, and the pinned version gate.
 //!
 //! Documentation route `sha256:066b9e92b6369661a70cefc73744b67fee06d5bb825983d55a00b5cdbd52c90f`,
 //! read receipt `sha256:02048eb89b5bead028e6b5d61cbe586b5451e258872b19d84a16df483720d9fc`,
@@ -47,7 +65,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use eliot_contracts::{ArtifactId, ContractId, EpochId, EpochLineageId, ResourceGeneration};
 use eliot_governor::{
@@ -60,8 +78,8 @@ use eliot_process::{
     ActionLeaseRef, DispatchAuthorityId, DispatchPermitAuthority, DispatchValidationContext,
     EnvironmentProjection, EvidenceSinkError, FencingToken, Generation, ImageId, JobId,
     KernelDispatchKey, OperationId, PermitIssuance, ProcessEvidence, ProcessEvidenceSink,
-    ProcessExecutionError, ProcessIntent, ProcessRequest, ProcessTreeId, ResourceLimits, SessionId,
-    SuspendedProcessIdentity, ValidatedDispatch,
+    ProcessExecutionError, ProcessIntent, ProcessLifecycle, ProcessRequest, ProcessTreeId,
+    ResourceLimits, SessionId, SuspendedProcessIdentity, ValidatedDispatch,
 };
 use eliot_process_executor::{
     DispatchValidationPort, WindowsProcessExecutor, wasm_p03_adapter::WasmP03ProcessAdapter,
@@ -82,8 +100,8 @@ use eliot_wasm_runtime::lifecycle::{DeterministicEchoCore, SemanticCore};
 use eliot_wasm_runtime::{
     ArtifactAccessLimits, CancellationPolicy, CapabilityId, ComponentManifest, EngineBinding,
     EpochPolicy, ExecutionContour, InvocationDisposition, InvocationId, InvocationLimits,
-    InvocationRequest, OwnerId, PortError, Revision, RuntimeError, RuntimePorts, Sha256Digest,
-    WasmRuntime, WorkScopeRef, WorkUnitId,
+    InvocationRequest, OwnerId, P03ProcessPort, PortError, ProcessBinding, Revision, RuntimeError,
+    RuntimePorts, Sha256Digest, WasmRuntime, WorkScopeRef, WorkUnitId,
 };
 
 /// Raw WIT world bytes the interface digest binds (same file the provider
@@ -96,11 +114,12 @@ const GUEST_WIT: &[u8] = include_bytes!("../wit/guest.wit");
 const JOINED_COMPONENT_CONFIGURATION: &[u8] =
     b"component=guest-conformance;world=eliot:wasm/guest;export=run;imports=closed;proof=join-1955";
 
-/// Engine identity string the engine artifact digest is derived from.
-/// Wasmtime links statically, so no engine artifact file exists to hash;
-/// the digest names the exact pinned implementation instead (recomputed,
-/// never pasted).
-const ENGINE_IDENTITY: &[u8] = b"wasmtime-component/47.0.4";
+/// Fixture-scoped engine identity string (NOT a measured production engine
+/// artifact: Wasmtime links statically, so no engine artifact file exists
+/// to hash — see the module docs on claim scope). The digest names the exact
+/// pinned implementation for this proof; it is recomputed, never pasted,
+/// and bound end to end via `manifest.engine == engine.binding()`.
+const JOINED_ENGINE_FIXTURE_ID: &[u8] = b"wasmtime-component/47.0.4";
 
 const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
 const COMPONENT: &str = "component-1956";
@@ -230,6 +249,15 @@ struct RecordingSink {
     evidence: Mutex<Vec<ProcessEvidence>>,
 }
 
+impl RecordingSink {
+    fn recorded_len(&self) -> usize {
+        match self.evidence.lock() {
+            Ok(guard) => guard.len(),
+            Err(_) => usize::MAX,
+        }
+    }
+}
+
 impl ProcessEvidenceSink for RecordingSink {
     fn record(&self, evidence: ProcessEvidence) -> Result<(), EvidenceSinkError> {
         match self.evidence.lock() {
@@ -302,7 +330,7 @@ fn joined_engine_binding() -> EngineBinding {
     EngineBinding {
         implementation_id: "wasmtime-component".to_owned(),
         exact_version: "47.0.4".to_owned(),
-        engine_artifact_digest: Sha256Digest::of_bytes(ENGINE_IDENTITY),
+        engine_artifact_digest: Sha256Digest::of_bytes(JOINED_ENGINE_FIXTURE_ID),
         engine_configuration_digest: provider_configuration_digest(),
         wit_interface_digest: Sha256Digest::of_bytes(GUEST_WIT),
     }
@@ -533,135 +561,156 @@ fn admitted_execution_succeeds_through_real_wasmtime() {
             .is_same_authority(&snapshot.authority_epoch)
     );
 
-    // Whole real invocations until a genuinely Succeeded result lands: the
-    // P03 reap races the child, so transient Unknown is retried while any
-    // Rejected verdict aborts immediately (fail-closed under scheduling
-    // variance). The deadline panics — a pass is never manufactured.
-    let deadline = Instant::now() + Duration::from_mins(2);
-    let mut attempts = 0_u32;
-    loop {
-        attempts += 1;
-        let operation_id = format!("join-1956-succeed-{attempts}");
-        let mut authority = test_authority();
-        let request_fence = must(FencingToken::new(
-            test_epoch(),
-            must(Generation::new(1)),
-            format!("fence-{operation_id}"),
-        ));
-        let staged = admitted_request(
-            &mut authority,
-            &operation_id,
-            request_fence.clone(),
-            &limits,
-        );
-        let executor = Arc::new(WindowsProcessExecutor::new(Arc::new(FakePort::new(
-            authority,
-            request_fence,
-        ))));
-        let sink = Arc::new(RecordingSink::default());
-        let sink_dyn: Arc<dyn ProcessEvidenceSink> = sink.clone();
-        let process_port = WasmP03ProcessAdapter::new(Arc::clone(&executor), Arc::clone(&sink_dyn));
-        must(process_port.stage_admitted_request(staged));
-        let verify_port = WasmP03ProcessAdapter::new(executor, sink_dyn);
-        let slotted_engine = must(
-            eliot_wasm_host::WasmtimeComponentEngine::new(
-                engine_binding.clone(),
-                component_digest.clone(),
-                &component,
-                JOINED_COMPONENT_CONFIGURATION,
-            )
-            .map_err(|error| format!("{error:?}")),
-        );
-        let ports = RuntimePorts::new(
-            Box::new(admission.clone()),
-            Box::new(admission.clone()),
-            Box::new(admission.clone()),
-            Box::new(admission.clone()),
-            Box::new(process_port),
-            Box::new(verify_port),
-            Box::new(slotted_engine),
-        );
-        let invoked_engine = must(
-            eliot_wasm_host::WasmtimeComponentEngine::new(
-                engine_binding.clone(),
-                component_digest.clone(),
-                &component,
-                JOINED_COMPONENT_CONFIGURATION,
-            )
-            .map_err(|error| format!("{error:?}")),
-        );
-        let mut runner = must(WasmHostRunner::with_wasmtime_engine(
-            test_profile(),
-            test_runtime(),
-            ports,
-            invoked_engine,
-        ));
-        let request = attempt_request(&operation_id, ExecutionContour::Conformance, framed.clone());
-        let result = match runner.execute_admitted(&admitted_gen, request) {
-            Ok(result) => result,
-            Err(error) => panic!("contour gate refused a WASM admission: {error}"),
-        };
-        match result.receipt.disposition {
-            InvocationDisposition::Succeeded => {
-                assert_eq!(result.receipt.error, None);
-                assert_eq!(result.output, Some(reference.result.clone()));
-                assert_eq!(
-                    Sha256Digest::of_bytes(must(
-                        result.output.as_deref().ok_or("output present on success")
-                    )),
-                    promotion.expected_result_digest,
-                    "guest output must equal the oracle image over the framed input",
-                );
-                assert_eq!(
-                    result.receipt.output_digest,
-                    Some(Sha256Digest::of_bytes(&reference.result)),
-                );
-                assert!(result.proposed_effects.is_empty());
-                assert_eq!(result.observed_state_delta, Some(Vec::new()));
-                let bound = must(
-                    result
-                        .receipt
-                        .engine_binding
-                        .as_ref()
-                        .ok_or("success binds the engine identity"),
-                );
-                assert_eq!(bound.implementation_id, "wasmtime-component");
-                assert_eq!(bound.exact_version, "47.0.4");
-                assert_eq!(
-                    bound.engine_artifact_digest,
-                    Sha256Digest::of_bytes(ENGINE_IDENTITY)
-                );
-                assert_eq!(
-                    bound.wit_interface_digest,
-                    Sha256Digest::of_bytes(GUEST_WIT)
-                );
-                assert_eq!(
-                    bound.engine_configuration_digest,
-                    provider_configuration_digest()
-                );
-                assert_eq!(bound, &engine_binding);
-                return;
-            }
-            InvocationDisposition::Unknown => {
-                assert_eq!(
-                    result.receipt.error,
-                    Some(RuntimeError::UnknownOutcome),
-                    "transient attempts may only be unknown, never rejected"
-                );
-            }
-            unexpected => {
-                panic!(
-                    "fail-closed violation on attempt {attempts}: {unexpected:?} {:?}",
-                    result.receipt.error
-                );
-            }
-        }
-        assert!(attempts < 200, "bounded attempts exhausted");
-        assert!(
-            Instant::now() <= deadline,
-            "no Succeeded joined execution within 2 minutes"
-        );
-    }
+    // ONE invocation, ONE operation, ONE permit, ONE child (I14.21): the
+    // adapter's same-operation observed reap settles this handle inside the
+    // single `execute`, so no second invocation exists and no retry of the
+    // effect occurs. Any non-success verdict fails the test outright.
+    let operation_id = "join-1956-succeed";
+    let mut authority = test_authority();
+    let request_fence = must(FencingToken::new(
+        test_epoch(),
+        must(Generation::new(1)),
+        format!("fence-{operation_id}"),
+    ));
+    let staged = admitted_request(&mut authority, operation_id, request_fence.clone(), &limits);
+    let binding = ProcessBinding::from_request(&staged);
+    let executor = Arc::new(WindowsProcessExecutor::new(Arc::new(FakePort::new(
+        authority,
+        request_fence,
+    ))));
+    let sink = Arc::new(RecordingSink::default());
+    let sink_dyn: Arc<dyn ProcessEvidenceSink> = sink.clone();
+    let process_port = WasmP03ProcessAdapter::new(Arc::clone(&executor), Arc::clone(&sink_dyn));
+    must(process_port.stage_admitted_request(staged));
+    let verify_port = WasmP03ProcessAdapter::new(Arc::clone(&executor), Arc::clone(&sink_dyn));
+    let slotted_engine = must(
+        WasmtimeComponentEngine::new(
+            engine_binding.clone(),
+            component_digest.clone(),
+            &component,
+            JOINED_COMPONENT_CONFIGURATION,
+        )
+        .map_err(|error| format!("{error:?}")),
+    );
+    let ports = RuntimePorts::new(
+        Box::new(admission.clone()),
+        Box::new(admission.clone()),
+        Box::new(admission.clone()),
+        Box::new(admission.clone()),
+        Box::new(process_port),
+        Box::new(verify_port),
+        Box::new(slotted_engine),
+    );
+    let invoked_engine = must(
+        WasmtimeComponentEngine::new(
+            engine_binding.clone(),
+            component_digest.clone(),
+            &component,
+            JOINED_COMPONENT_CONFIGURATION,
+        )
+        .map_err(|error| format!("{error:?}")),
+    );
+    let mut runner = must(WasmHostRunner::with_wasmtime_engine(
+        test_profile(),
+        test_runtime(),
+        ports,
+        invoked_engine,
+    ));
+    let request = attempt_request(operation_id, ExecutionContour::Conformance, framed.clone());
+    let result = match runner.execute_admitted(&admitted_gen, request) {
+        Ok(result) => result,
+        Err(error) => panic!("contour gate refused a WASM admission: {error}"),
+    };
+    assert_eq!(
+        result.receipt.disposition,
+        InvocationDisposition::Succeeded,
+        "single invocation must succeed, error: {:?}",
+        result.receipt.error
+    );
+    assert_eq!(result.receipt.error, None);
+    assert_eq!(result.output, Some(reference.result.clone()));
+    assert_eq!(
+        Sha256Digest::of_bytes(must(
+            result.output.as_deref().ok_or("output present on success")
+        )),
+        promotion.expected_result_digest,
+        "guest output must equal the oracle image over the framed input",
+    );
+    assert_eq!(
+        result.receipt.output_digest,
+        Some(Sha256Digest::of_bytes(&reference.result)),
+    );
+    assert!(result.proposed_effects.is_empty());
+    assert_eq!(result.observed_state_delta, Some(Vec::new()));
+    let bound = must(
+        result
+            .receipt
+            .engine_binding
+            .as_ref()
+            .ok_or("success binds the engine identity"),
+    );
+    assert_eq!(bound.implementation_id, "wasmtime-component");
+    assert_eq!(bound.exact_version, "47.0.4");
+    // Fixture-scoped engine identity (see JOINED_ENGINE_FIXTURE_ID): names
+    // the pinned implementation for this proof — not a measured production
+    // engine artifact. What IS measured: the loaded component artifact
+    // below, and the engine-enforced binding equality above.
+    assert_eq!(
+        bound.engine_artifact_digest,
+        Sha256Digest::of_bytes(JOINED_ENGINE_FIXTURE_ID)
+    );
+    assert_eq!(
+        bound.wit_interface_digest,
+        Sha256Digest::of_bytes(GUEST_WIT)
+    );
+    assert_eq!(
+        bound.engine_configuration_digest,
+        provider_configuration_digest()
+    );
+    assert_eq!(bound, &engine_binding);
+    // Real loaded-artifact binding from the engine's own usage report:
+    // exactly the component bytes compiled above were read and executed.
+    let usage = must(
+        result
+            .receipt
+            .usage
+            .as_ref()
+            .ok_or("success carries engine usage"),
+    );
+    assert_eq!(usage.accessed_artifact_digests, vec![component_digest]);
+    assert_eq!(usage.artifact_bytes, component.len() as u64);
+    assert_eq!(usage.artifact_reads, 1);
+    // Same-operation native process boundary for the companion child: a
+    // second adapter handle over the SAME executor re-observes the SAME
+    // operation — no new invocation, permit, or child. The tree exited,
+    // closure is proven (complete + terminated: contained, no orphans),
+    // and the evidence was really recorded.
+    // (Scope: this proves the NATIVE process boundary — Job-contained
+    // distinct process, identity, tree closure, cleanup. Wasmtime guest
+    // isolation — linear-memory/capability confinement under the closed,
+    // import-free linker — is proven by the engine unit edge plus the
+    // closed manifest enforced here, not by this child.)
+    let mut boundary_port =
+        WasmP03ProcessAdapter::new(Arc::clone(&executor), Arc::clone(&sink_dyn));
+    let boundary = must(
+        boundary_port
+            .reconcile(&binding)
+            .map_err(|error| format!("same-operation re-observation failed: {error:?}")),
+    );
+    assert_eq!(boundary.operation_id(), binding.operation_id());
+    assert_eq!(boundary.view().lifecycle(), ProcessLifecycle::Exited);
+    let descendants = must(
+        boundary
+            .view()
+            .descendants()
+            .cloned()
+            .ok_or("reaped evidence carries descendant proof"),
+    );
+    assert!(descendants.complete() && descendants.tree_terminated());
+    assert!(
+        sink.recorded_len() >= 2,
+        "start plus reaps must be recorded"
+    );
 }
 
 /// Composes one full runner for negative proofs: the admission (and optional

@@ -37,10 +37,10 @@
 //!
 //! `cargo test --offline -p eliot-process-executor wasm_p03` drives the
 //! adapter against the real [`WindowsProcessExecutor`] with real suspended
-//! Windows children. `reconcile` is poll-safe: while the child is still
-//! driving it reports [`PortError::UnknownOutcome`] via a non-destructive
-//! `inspect` guard (the executor's terminal-only reconcile would otherwise
-//! join live capture streams and quarantine the op), so callers retry; an
+//! Windows children. `reconcile` performs a same-operation observed reap
+//! (I14.21): while the child drives it bounded-polls the non-destructive
+//! `inspect` view of that handle, then runs the single terminal executor
+//! reconcile — no second invocation, permit, or child, no effect retry. An
 //! already-unknown op still passes through to the executor's
 //! quarantine-reconcile path. The Governor-side ports stay out of scope (see
 //! the `1955-owner-ports-handoff.md` lane handoff held by root).
@@ -51,6 +51,7 @@
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
+use std::time::{Duration, Instant};
 
 use eliot_process::{
     CancellationReceipt, ContractError, ProcessEvidence, ProcessEvidenceSink,
@@ -59,6 +60,15 @@ use eliot_process::{
 use eliot_wasm_runtime::{
     P03ProcessPort, P03ReceiptVerifierPort, PortError, ProcessBinding, ProcessLaunchEnvelope,
 };
+
+/// Bound for the same-operation observed reap in [`P03ProcessPort::reconcile`].
+/// Every admitted child is finite (its own wall deadline finalizes it), so a
+/// settled view always arrives; the bound only caps the wait. Matches the
+/// in-tree terminal-wait precedent — no new timing policy is invented.
+const RECONCILE_OBSERVE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Cadence for the observed-reap poll: the executor's own terminal-wait
+/// cadence, reused rather than introduced.
+const RECONCILE_OBSERVE_POLL: Duration = Duration::from_millis(25);
 
 use crate::WindowsProcessExecutor;
 
@@ -144,16 +154,19 @@ impl P03ProcessPort for WasmP03ProcessAdapter {
 
     fn reconcile(&mut self, binding: &ProcessBinding) -> Result<ProcessEvidence, PortError> {
         let operation_id = binding.operation_id().clone();
-        // Poll-safe guard (root cause of the `verifiers_reject_foreign_binding`
-        // `UnknownOutcome` abort): the executor's `reconcile` is terminal-only.
-        // It joins — cancelling — live capture streams and quarantines the
-        // operation on any join gap, so invoking it while the child is still
-        // driving both fails AND fences the op. `inspect` only refreshes the
-        // lifecycle view and never touches capture threads, so while the op is
-        // still driving we report the outcome as unknown and let the caller
-        // retry with nothing fenced. An already-unknown op passes through, so
-        // the executor's quarantine-reconcile path still runs unchanged.
-        let view = drive_blocking(self.executor.inspect(operation_id.clone()))
+        // Same-operation observed reap (I14.21: preserve the operation,
+        // reconcile with evidence, never duplicate the effect): the
+        // executor's `reconcile` is terminal-only — invoking it while the
+        // child still drives would join live capture streams and quarantine
+        // the op. Instead, bounded-poll the non-destructive `inspect` view
+        // for THIS operation until it settles, then perform the single
+        // terminal reconcile. No second invocation, permit, or child is
+        // ever created here, and no retry of the effect occurs: the wait
+        // only observes this handle. An already-unknown op passes straight
+        // through so the executor's quarantine-reconcile path still runs; a
+        // child still driving past the bound reports unknown with nothing
+        // fenced.
+        let mut view = drive_blocking(self.executor.inspect(operation_id.clone()))
             .map_err(|error| map_observe_error(&error))?;
         if matches!(
             view.lifecycle(),
@@ -162,7 +175,24 @@ impl P03ProcessPort for WasmP03ProcessAdapter {
                 | ProcessLifecycle::Running
                 | ProcessLifecycle::Cancelling
         ) {
-            return Err(PortError::UnknownOutcome);
+            let deadline = Instant::now() + RECONCILE_OBSERVE_TIMEOUT;
+            loop {
+                std::thread::sleep(RECONCILE_OBSERVE_POLL);
+                view = drive_blocking(self.executor.inspect(operation_id.clone()))
+                    .map_err(|error| map_observe_error(&error))?;
+                if !matches!(
+                    view.lifecycle(),
+                    ProcessLifecycle::Created
+                        | ProcessLifecycle::Starting
+                        | ProcessLifecycle::Running
+                        | ProcessLifecycle::Cancelling
+                ) {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    return Err(PortError::UnknownOutcome);
+                }
+            }
         }
         drive_blocking(self.executor.reconcile(operation_id))
             .map_err(|error| map_observe_error(&error))
@@ -638,6 +668,28 @@ mod tests {
         ]
     }
 
+    /// Mid-life child argv: guaranteed still driving when the first `inspect`
+    /// lands, so a single `reconcile` call must observe the reap itself.
+    /// Under the previous fast-unknown behavior this fails deterministically
+    /// with `UnknownOutcome`; with the same-operation observed reap it
+    /// blocks briefly and returns terminal evidence.
+    ///
+    /// A `cmd`-internal counting loop in a temp batch file: the spawn
+    /// environment carries no PATH, so external waits (`ping`) exit
+    /// instantly here and cannot hold the tree open. `cmd` internals need
+    /// no PATH.
+    fn mid_child() -> Vec<String> {
+        let bat_path = std::env::temp_dir().join("eliot-wasm-p03-observe-keepalive.bat");
+        match std::fs::write(
+            &bat_path,
+            "@echo off\r\nfor /L %%i in (1,1,1500000) do rem\r\n",
+        ) {
+            Ok(()) => {}
+            Err(error) => panic!("wasm-p03 keepalive fixture unwritable: {error}"),
+        }
+        vec!["/c".to_owned(), bat_path.to_string_lossy().into_owned()]
+    }
+
     /// Polls the adapter until the executor mints terminal evidence.
     ///
     /// Transient [`PortError::UnknownOutcome`] while the real child is still
@@ -753,6 +805,37 @@ mod tests {
         let receipt = adapter.start(prepared)?;
         let _ = receipt;
         let evidence = reconcile_terminal(&mut adapter, &binding)?;
+        adapter.verify_reconciliation(&binding, &evidence, &fixture)?;
+        Ok(())
+    }
+
+    #[test]
+    fn reconcile_observes_running_child_to_terminal_evidence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // One call, no retry loop: the mid-life child is still driving when
+        // `reconcile` lands, so the adapter must observe this same
+        // operation's reap itself and return terminal evidence. The
+        // previous fast-unknown behavior fails here with `UnknownOutcome`.
+        let fixture = envelope("observe");
+        let mut authority = test_authority();
+        let staged = admitted_request(&mut authority, &fixture, mid_child());
+        let (mut adapter, _) = adapter_with(authority, fence_for(&fixture));
+        adapter.stage_admitted_request(staged)?;
+        let prepared = adapter.prepare(&fixture)?;
+        let binding = ProcessBinding::from_request(&prepared);
+        let receipt = adapter.start(prepared)?;
+        let _ = receipt;
+        // The keepalive child is still driving here (spawn overhead plus
+        // the counting loop dwarf inspect latency), so this single call
+        // must block observing the reap: assert a floor on elapsed time to
+        // prove the wait path ran rather than an instant-terminal shortcut.
+        let started = Instant::now();
+        let evidence = adapter.reconcile(&binding)?;
+        assert!(
+            started.elapsed() >= Duration::from_millis(25),
+            "reconcile must observe the live child, not shortcut"
+        );
+        assert!(evidence.view().lifecycle().is_terminal());
         adapter.verify_reconciliation(&binding, &evidence, &fixture)?;
         Ok(())
     }
