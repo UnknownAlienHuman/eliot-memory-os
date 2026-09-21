@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+mod cutover_ownership;
 mod doctor;
 mod model;
 mod reservation_model;
@@ -18,6 +19,12 @@ mod store;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 
+pub use cutover_ownership::{
+    CapabilityRouteScope, CutoverAdmission, CutoverRouteEntry, CutoverRouteSnapshot,
+    CutoverRouteTable, GenerationCutoverOwnership, GenerationCutoverOwnershipReceipt,
+    InFlightDisposition, InFlightDispositionKind, MAX_CUTOVER_IN_FLIGHT,
+    MAX_CUTOVER_UNRESOLVED_SCOPES, ModuleArtifactIdentity, StateMigrationDecision,
+};
 pub use doctor::*;
 pub use model::ProviderCapabilityLookup;
 pub use model::*;

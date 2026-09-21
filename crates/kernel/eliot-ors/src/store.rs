@@ -25,6 +25,9 @@ use persistence_models::{
 
 mod recovery_projection;
 
+use crate::cutover_ownership::{
+    GenerationCutoverOwnership, GenerationCutoverOwnershipReceipt, StoredCutoverOwnership,
+};
 use crate::{
     AcceptedPending, ActivationResultRetentionRecord, ActiveSessionBinding, AdmissionReservation,
     AdmissionReservationActivation, AdmissionReservationReceipt, AdmissionReservationRelease,
@@ -95,6 +98,8 @@ const STORE_FAILURE_RETENTION: TableDefinition<&str, &str> =
     TableDefinition::new("ors_store_failure_retention_v1");
 const UNKNOWN_COMMIT_RECOVERY: TableDefinition<&str, &str> =
     TableDefinition::new("ors_unknown_commit_recovery_v1");
+const CUTOVER_OWNERSHIP: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_cutover_ownership_v1");
 const HOST_REQUESTS: TableDefinition<&str, &str> = TableDefinition::new("ors_host_requests_v1");
 const ACTIVATION_RESULT_RETENTION: TableDefinition<&str, &str> =
     TableDefinition::new("ors_agent_activation_results_v1");
@@ -5801,6 +5806,240 @@ impl RedbRecoveryStore {
         }
         write.commit().map_err(storage)?;
         Ok(snapshots)
+    }
+
+    /// Stages an enriched cutover candidate before the durable linearization
+    /// point (I14.14 step 7: classify every in-flight request and persist the
+    /// record). The staged candidate is durable but never an active route:
+    /// snapshots and recovery consult committed rows only.
+    pub fn stage_cutover_ownership(
+        &self,
+        record: GenerationCutoverOwnership,
+    ) -> Result<GenerationCutoverOwnership, OrsError> {
+        record.validate()?;
+        if record.state != GenerationCutoverState::Armed {
+            return Err(OrsError::InvalidTransition);
+        }
+        if record.linearization_record_id.is_some() {
+            return Err(OrsError::InvalidField {
+                field: "cutover_ownership_linearization",
+                reason: "a staged candidate has no linearization identity",
+            });
+        }
+        let write = self.database.begin_write().map_err(storage)?;
+        {
+            let current = write.open_table(CUTOVER_OWNERSHIP).map_err(storage)?;
+            if let Some(existing) = current.get(record.cutover_id.as_str()).map_err(storage)? {
+                let stored: StoredCutoverOwnership =
+                    decode_named(existing.value(), "cutover_ownership")?;
+                if stored.record == record {
+                    return Ok(stored.record);
+                }
+                return Err(OrsError::DuplicateConflict);
+            }
+        }
+        let stored = StoredCutoverOwnership {
+            operation_order: Self::next_operational_order(&write)?,
+            record: record.clone(),
+        };
+        {
+            let mut current = write.open_table(CUTOVER_OWNERSHIP).map_err(storage)?;
+            current
+                .insert(record.cutover_id.as_str(), encode(&stored)?.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(record)
+    }
+
+    /// Commits one staged enriched cutover in a single write transaction
+    /// (I14.14 step 8: persist the record, switch new-admission routing to
+    /// the candidate, issue a strictly newer epoch, fence old-generation
+    /// authority, and fix the old-operation allowlist). The single
+    /// `write.commit()` is the durable linearization point: crash before it
+    /// leaves the old route active, crash after it reconstructs the candidate
+    /// route from the committed record before accepting work.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the ownership commit validates lineage, epoch, receipt, and projection atomically"
+    )]
+    pub fn commit_cutover_ownership(
+        &self,
+        cutover_id: &str,
+    ) -> Result<
+        (
+            GenerationCutoverOwnership,
+            GenerationCutoverOwnershipReceipt,
+        ),
+        OrsError,
+    > {
+        let write = self.database.begin_write().map_err(storage)?;
+        let staged = {
+            let current = write.open_table(CUTOVER_OWNERSHIP).map_err(storage)?;
+            let Some(existing) = current.get(cutover_id).map_err(storage)? else {
+                return Err(OrsError::ReservationNotFound);
+            };
+            let stored: StoredCutoverOwnership =
+                decode_named(existing.value(), "cutover_ownership")?;
+            stored
+        };
+        if staged.record.state == GenerationCutoverState::Committed {
+            let receipt = GenerationCutoverOwnershipReceipt::from_committed(&staged.record)?;
+            return Ok((staged.record, receipt));
+        }
+        if staged.record.state != GenerationCutoverState::Armed {
+            return Err(OrsError::InvalidTransition);
+        }
+        let mut maximum_new_epoch = None;
+        let mut prior_for_scope = None;
+        {
+            let current = write.open_table(CUTOVER_OWNERSHIP).map_err(storage)?;
+            for row in current.iter().map_err(storage)? {
+                let (_, value) = row.map_err(storage)?;
+                let stored: StoredCutoverOwnership =
+                    decode_named(value.value(), "cutover_ownership")?;
+                if stored.record.state != GenerationCutoverState::Committed {
+                    continue;
+                }
+                let epoch = stored.record.new_epoch.value();
+                maximum_new_epoch =
+                    Some(maximum_new_epoch.map_or(epoch, |prior: u64| prior.max(epoch)));
+                if stored.record.scope.route_scope_hash == staged.record.scope.route_scope_hash {
+                    let advances = prior_for_scope.as_ref().is_none_or(
+                        |prior: &GenerationCutoverOwnership| {
+                            stored.record.new_epoch.value() > prior.new_epoch.value()
+                        },
+                    );
+                    if !advances {
+                        return Err(OrsError::IntegrityProblem {
+                            record_type: "cutover_ownership",
+                            reason: "committed cutover epoch does not advance its scope".to_owned(),
+                        });
+                    }
+                    prior_for_scope = Some(stored.record);
+                }
+            }
+        }
+        if let Some(prior) = prior_for_scope {
+            if Some(prior.new_generation) != staged.record.old_generation
+                || prior.new_epoch.value() != staged.record.old_epoch.value()
+            {
+                return Err(OrsError::InvalidEpochLineage);
+            }
+        } else if staged.record.old_generation.is_some() {
+            return Err(OrsError::InvalidEpochLineage);
+        }
+        if let Some(maximum) = maximum_new_epoch
+            && staged.record.new_epoch.value() <= maximum
+        {
+            return Err(OrsError::InvalidEpochLineage);
+        }
+        let order = Self::next_operational_order(&write)?;
+        let committed = GenerationCutoverOwnership {
+            state: GenerationCutoverState::Committed,
+            linearization_record_id: Some(format!("ors:cutover-ownership:{cutover_id}#{order}")),
+            ..staged.record.clone()
+        };
+        let stored = StoredCutoverOwnership {
+            operation_order: order,
+            record: committed.clone(),
+        };
+        {
+            let mut current = write.open_table(CUTOVER_OWNERSHIP).map_err(storage)?;
+            current
+                .insert(cutover_id, encode(&stored)?.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        let receipt = GenerationCutoverOwnershipReceipt::from_committed(&committed)?;
+        Ok((committed, receipt))
+    }
+
+    /// Loads one ownership record by cutover identity.
+    pub fn load_cutover_ownership(
+        &self,
+        cutover_id: &str,
+    ) -> Result<Option<GenerationCutoverOwnership>, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let current = read.open_table(CUTOVER_OWNERSHIP).map_err(storage)?;
+        let Some(existing) = current.get(cutover_id).map_err(storage)? else {
+            return Ok(None);
+        };
+        let stored: StoredCutoverOwnership = decode_named(existing.value(), "cutover_ownership")?;
+        Ok(Some(stored.record))
+    }
+
+    /// Returns the committed ownership rows ordered by their durable
+    /// operation order. Recovery rebuilds the active route snapshot from
+    /// exactly this set; staged candidates are excluded so a pre-commit
+    /// candidate can never become active.
+    pub fn latest_committed_cutover_ownership(
+        &self,
+        limit: u16,
+    ) -> Result<Vec<GenerationCutoverOwnership>, OrsError> {
+        if limit == 0 || limit > crate::MAX_RECOVERY_PAGE {
+            return Err(OrsError::InvalidCursorLimit);
+        }
+        let read = self.database.begin_read().map_err(storage)?;
+        let current = read.open_table(CUTOVER_OWNERSHIP).map_err(storage)?;
+        let mut ordered: Vec<(u64, GenerationCutoverOwnership)> = Vec::new();
+        for row in current.iter().map_err(storage)? {
+            let (_, value) = row.map_err(storage)?;
+            let stored: StoredCutoverOwnership = decode_named(value.value(), "cutover_ownership")?;
+            if stored.record.state != GenerationCutoverState::Committed {
+                continue;
+            }
+            if ordered.len() == usize::from(limit) {
+                return Err(OrsError::ProjectionLimitExceeded);
+            }
+            ordered.push((stored.operation_order, stored.record));
+        }
+        ordered.sort_by_key(|(order, _)| *order);
+        Ok(ordered.into_iter().map(|(_, record)| record).collect())
+    }
+
+    /// Fences staged candidates that never reached the linearization point.
+    /// The resulting rows remain fenced evidence and can never activate a
+    /// route: snapshot recovery consults committed rows only.
+    pub fn reconcile_staged_cutover_ownership(
+        &self,
+        limit: u16,
+    ) -> Result<Vec<GenerationCutoverOwnership>, OrsError> {
+        if limit == 0 || limit > crate::MAX_RECOVERY_PAGE {
+            return Err(OrsError::InvalidCursorLimit);
+        }
+        let pending = {
+            let read = self.database.begin_read().map_err(storage)?;
+            let current = read.open_table(CUTOVER_OWNERSHIP).map_err(storage)?;
+            let mut pending = Vec::new();
+            for row in current.iter().map_err(storage)? {
+                let (key, value) = row.map_err(storage)?;
+                let stored: StoredCutoverOwnership =
+                    decode_named(value.value(), "cutover_ownership")?;
+                if stored.record.state == GenerationCutoverState::Armed {
+                    if pending.len() == usize::from(limit) {
+                        return Err(OrsError::ProjectionLimitExceeded);
+                    }
+                    pending.push((key.value().to_owned(), stored));
+                }
+            }
+            pending
+        };
+        let write = self.database.begin_write().map_err(storage)?;
+        let mut fenced = Vec::with_capacity(pending.len());
+        for (key, mut stored) in pending {
+            stored.record.state = GenerationCutoverState::FailedRequiresForwardCutover;
+            stored.operation_order = Self::next_operational_order(&write)?;
+            {
+                let mut current = write.open_table(CUTOVER_OWNERSHIP).map_err(storage)?;
+                current
+                    .insert(key.as_str(), encode(&stored)?.as_str())
+                    .map_err(storage)?;
+            }
+            fenced.push(stored.record);
+        }
+        write.commit().map_err(storage)?;
+        Ok(fenced)
     }
 
     /// Commits one authority replay snapshot with a receipt-fenced compare
