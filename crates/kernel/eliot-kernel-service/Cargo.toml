@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 description = "Governed Kernel service lifecycle, Host handoff and readiness boundary"
 
+[features]
+test-support = []
+
 [package.metadata.eliot]
 work_id = "P-07"
 functional_cell = "kernel-service"
@@ -35,7 +38,11 @@ tokio.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-eliot-ors.workspace = true
+# Issue #2031: Kernel-route tests share the single `KernelRouteEvidence`
+# binding and the `KernelRouteStoreFixture` from `eliot-ors` instead of
+# vendoring their own, so the `test-support` feature is unified into test
+# builds here. Production builds never see it.
+eliot-ors = { workspace = true, features = ["test-support"] }
 eliot-platform-windows.workspace = true
 # T11.1-DAEMON live E2E (test-only): the real Surreal adapter on a temp root
 # (never the memory adapter) plus the Governor read facade under test. These
