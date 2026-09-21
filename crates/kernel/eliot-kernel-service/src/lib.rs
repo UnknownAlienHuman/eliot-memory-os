@@ -34,6 +34,9 @@ mod notification_state;
 mod notification_state_tests;
 mod process_execution_client;
 mod protocol;
+mod reactive_state;
+#[cfg(test)]
+mod reactive_state_tests;
 mod store_client;
 #[cfg(windows)]
 mod store_gateway;
@@ -42,6 +45,9 @@ mod store_write_reservation;
 mod store_write_reservation_tests;
 mod testd_front_door;
 mod user_automation;
+mod user_automation_store;
+#[cfg(test)]
+mod user_automation_store_tests;
 mod write_coordinator;
 
 pub use capacity_evidence::{
@@ -124,6 +130,13 @@ pub use protocol::{
     decode_control_response_frame,
     replay_stream_id, semantic_store_config_hash_from_json, verify_provider_capability,
 };
+pub use reactive_state::{
+    AuthenticatedReactiveSession, ReactiveLedgerReadRequest, ReactiveLedgerReadResponse,
+    ReactiveLedgerRequest, ReactiveLedgerResponse, ReactiveServiceContext, ReactiveServiceError,
+    ResourceSnapshotReadRequest, ResourceSnapshotReadResponse, ResourceSnapshotRequest,
+    ResourceSnapshotResponse, handle_reactive_ledger_read, handle_reactive_ledger_request,
+    handle_resource_snapshot_read, handle_resource_snapshot_request, reconcile_reactive_state,
+};
 pub use store_client::{
     EbpCanonicalStoreClient, EbpStoreTransport, StoreClientError, StoreClientFault,
     StoreClientFaultHarness,
@@ -155,6 +168,7 @@ pub use user_automation::{
     UserAutomationServiceError, UserAutomationServiceRequest, UserAutomationStoreOutcome,
     UserAutomationStorePort, UserAutomationStoreRequest, UserAutomationStoreResponse,
 };
+pub use user_automation_store::CanonicalUserAutomationStore;
 pub use write_coordinator::{
     CoordinatorError, ScopeExecutionGuard, WriteCoordinator, WriteCoordinatorConfig,
     default_executor_lanes,

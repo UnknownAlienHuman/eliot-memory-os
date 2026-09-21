@@ -369,6 +369,9 @@ async fn named_read_payload(
         NamedReadOperation::GetResourceSnapshot => {
             resource_snapshot_payload(db, &adapter.config, query, state_fence).await
         }
+        NamedReadOperation::GetUserAutomationState => {
+            automation_state_payload(db, &adapter.config, query, state_fence).await
+        }
         other => Err(AdapterError::NamedOperationUnavailable {
             operation: format!("{other:?}"),
         }),
@@ -1712,6 +1715,211 @@ async fn resource_snapshot_payload(
         "revision": revision,
         "state_fence": state_fence,
     }))
+}
+
+/// Reads automation rows and projects the same-fence canonical views
+/// (issue #1779).
+///
+/// Row shapes mirror the writer. `list` projects all same-fence current
+/// pointers in automation-id order (retired rows excluded unless
+/// requested); `current` projects one pointer or explicit absence;
+/// `history` projects the bounded revision set; `invocations` projects
+/// the bounded invocation set; `failure` projects explicit absence (no
+/// failure writer path exists yet — never a fabricated failure).
+/// Parameters are re-validated here (membership and shape via the
+/// catalogue gate upstream; value rules here) so a misrouted query fails
+/// closed without touching state.
+async fn automation_state_payload(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    query: &NamedReadRequest,
+    state_fence: &StateFence,
+) -> Result<Value, AdapterError> {
+    eliot_store_api::validate_typed_read_parameters(
+        NamedReadOperation::GetUserAutomationState,
+        &query.parameters,
+    )
+    .map_err(AdapterError::Store)?;
+    if query.state_fence != *state_fence {
+        return Err(AdapterError::Store(StoreError::FenceMismatch));
+    }
+    let decoded = eliot_store_api::validate_automation_read_params(&query.parameters)
+        .map_err(AdapterError::Store)?;
+    let limit = usize::from(decoded.max_records.max(1));
+    match decoded.query.as_str() {
+        eliot_store_api::AUTOMATION_QUERY_LIST => {
+            automation_list_payload(db, config, state_fence, &decoded, limit).await
+        }
+        eliot_store_api::AUTOMATION_QUERY_CURRENT => {
+            automation_current_payload(db, config, state_fence, &decoded).await
+        }
+        eliot_store_api::AUTOMATION_QUERY_HISTORY => {
+            automation_history_payload(db, config, state_fence, &decoded).await
+        }
+        eliot_store_api::AUTOMATION_QUERY_INVOCATIONS => {
+            automation_invocations_payload(db, config, state_fence, &decoded).await
+        }
+        eliot_store_api::AUTOMATION_QUERY_FAILURE => Ok(json!({
+            "failure": Value::Null,
+            "revision": 0,
+            "state_fence": state_fence,
+        })),
+        _ => Err(AdapterError::Store(StoreError::UnknownOperation)),
+    }
+}
+
+/// Projects the automation list from current pointers.
+async fn automation_list_payload(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    state_fence: &StateFence,
+    decoded: &eliot_store_api::DecodedAutomationRead,
+    limit: usize,
+) -> Result<Value, AdapterError> {
+    let rows = super::surreal_automation::read_currents_for_read(db, config, limit).await?;
+    let mut currents = Vec::new();
+    for row in rows {
+        if row.state_fence != *state_fence {
+            continue;
+        }
+        if !decoded.include_retired
+            && row.configuration_state == eliot_store_api::AUTOMATION_STATE_RETIRED
+        {
+            continue;
+        }
+        if currents.len() >= limit {
+            break;
+        }
+        currents.push(json!({
+            "automation_id": row.automation_id,
+            "revision": row.revision,
+            "configuration_state": row.configuration_state,
+        }));
+    }
+    let revision = projection_len(currents.len())?;
+    Ok(json!({
+        "currents": currents,
+        "revision": revision,
+        "state_fence": state_fence,
+    }))
+}
+
+/// Requires the exact automation selector carried by a decoded query.
+fn require_automation_id(
+    decoded: &eliot_store_api::DecodedAutomationRead,
+) -> Result<String, AdapterError> {
+    decoded
+        .automation_id
+        .clone()
+        .ok_or(AdapterError::Store(StoreError::InvalidField {
+            field: "automation.automation_id",
+            reason: "exact automation selector is required",
+        }))
+}
+
+/// Projects one automation current pointer or explicit absence.
+async fn automation_current_payload(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    state_fence: &StateFence,
+    decoded: &eliot_store_api::DecodedAutomationRead,
+) -> Result<Value, AdapterError> {
+    let automation_id = require_automation_id(decoded)?;
+    let row = super::surreal_automation::read_current_for_read(db, config, &automation_id).await?;
+    let (current, revision) = match row {
+        Some(row) if row.state_fence == *state_fence => (
+            json!({
+                "automation_id": row.automation_id,
+                "revision": row.revision,
+                "configuration_state": row.configuration_state,
+            }),
+            1,
+        ),
+        _ => (Value::Null, 0),
+    };
+    Ok(json!({
+        "current": current,
+        "revision": revision,
+        "state_fence": state_fence,
+    }))
+}
+
+/// Projects the bounded revision set for one automation.
+async fn automation_history_payload(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    state_fence: &StateFence,
+    decoded: &eliot_store_api::DecodedAutomationRead,
+) -> Result<Value, AdapterError> {
+    let automation_id = require_automation_id(decoded)?;
+    let limit = usize::from(decoded.max_records.max(1));
+    let rows =
+        super::surreal_automation::read_revisions_for_read(db, config, &automation_id, limit)
+            .await?;
+    let mut revisions = Vec::new();
+    for row in rows {
+        if row.state_fence != *state_fence {
+            continue;
+        }
+        if revisions.len() >= limit {
+            break;
+        }
+        revisions.push(json!({
+            "automation_id": row.automation_id,
+            "revision": row.revision,
+            "revision_json": row.revision_json,
+        }));
+    }
+    let revision = projection_len(revisions.len())?;
+    Ok(json!({
+        "revisions": revisions,
+        "revision": revision,
+        "state_fence": state_fence,
+    }))
+}
+
+/// Projects the bounded invocation set for one automation.
+async fn automation_invocations_payload(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    state_fence: &StateFence,
+    decoded: &eliot_store_api::DecodedAutomationRead,
+) -> Result<Value, AdapterError> {
+    let automation_id = require_automation_id(decoded)?;
+    let limit = usize::from(decoded.max_records.max(1));
+    let rows =
+        super::surreal_automation::read_invocations_for_read(db, config, &automation_id, limit)
+            .await?;
+    let mut invocations = Vec::new();
+    for row in rows {
+        if row.state_fence != *state_fence {
+            continue;
+        }
+        if invocations.len() >= limit {
+            break;
+        }
+        invocations.push(json!({
+            "occurrence_id": row.occurrence_id,
+            "automation_id": row.automation_id,
+            "invocation_json": row.invocation_json,
+        }));
+    }
+    let revision = projection_len(invocations.len())?;
+    Ok(json!({
+        "invocations": invocations,
+        "revision": revision,
+        "state_fence": state_fence,
+    }))
+}
+
+/// Converts a projected row count into the `revision` cardinality
+/// without a lossy cast.
+fn projection_len(len: usize) -> Result<u64, AdapterError> {
+    u64::try_from(len).map_err(|_| {
+        AdapterError::Store(StoreError::Serialization(
+            "automation projection count overflow".to_owned(),
+        ))
+    })
 }
 
 /// One notification row projected by the read SELECT.
