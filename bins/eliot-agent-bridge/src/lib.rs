@@ -25,6 +25,16 @@ use eliot_agent_bridge_core::{
 pub use eliot_agent_bridge_core::{
     AgentRecallProjection, MAX_AGENT_RECALL_HANDLES, project_recall_for_agent,
 };
+/// I7.18/I7.24 revisioned-resource read surface: canonical `eliot://`
+/// identities, bounded hot-response projections (preview plus handle), and
+/// tool-result delivery receipts. The bridge publishes only owner-supplied
+/// snapshots into its attach-scoped transport projection and never estimates
+/// tokens or delivery completeness: `tokens_rendered` and `delivery` arrive
+/// from the projecting route owner.
+pub use eliot_agent_bridge_core::{
+    DeliveryStatus, HotResourceView, MAX_CONTENT_BYTES, MAX_PREVIEW_BYTES, MAX_REGISTRY_ENTRIES,
+    MAX_URI_BYTES, ResourceHandle, ResourceKind, ResourceRegistry, ResourceUri, ToolResultReceipt,
+};
 use eliot_mcp::KernelHostRequestPort;
 use eliot_protocol::{
     AckPhase, AgentBridgeClientDeclaration, AgentBridgePeerAdmissionReceipt,
@@ -559,6 +569,67 @@ impl BridgeRunner {
         self.reactive_ledger = ReactiveInjectionLedger::from_json_bytes(bytes)
             .map_err(|error| reactive_ledger_error(&error))?;
         Ok(())
+    }
+    /// Publishes one owner-supplied evidence snapshot and returns its bounded
+    /// hot-response projection: a preview plus an immutable
+    /// `eliot://evidence/<id>` handle (I7.18 acceptance shape).
+    ///
+    /// Content bytes arrive from the owning provider (evidence, Store, task
+    /// owner); the bridge only snapshots them into its attach-scoped
+    /// transport projection. Requires the live attach, which is the scope
+    /// authorization on resolution: detached callers fail closed.
+    pub fn publish_evidence_resource(
+        &mut self,
+        content: Vec<u8>,
+    ) -> Result<HotResourceView, BridgeError> {
+        self.core.publish_evidence(content)
+    }
+    /// Publishes one owner-supplied canonical resource snapshot at its exact
+    /// I7.18 URI and returns its bounded hot-response projection.
+    ///
+    /// Fails closed on non-canonical URIs and on republishing an immutable
+    /// URI with different bytes, so a handle always resolves to the exact
+    /// bytes its digest names.
+    pub fn publish_canonical_resource(
+        &mut self,
+        uri: &ResourceUri,
+        content: Vec<u8>,
+    ) -> Result<HotResourceView, BridgeError> {
+        self.core.publish_resource(uri, content)
+    }
+    /// Explicitly expands one previously published handle to its immutable
+    /// referenced content.
+    ///
+    /// Full evidence, audit, and large-report content is available only
+    /// through this call, never inline in a hot response. Unknown handles
+    /// and digest mismatches fail closed.
+    pub fn expand_resource(&self, handle: &ResourceHandle) -> Result<Vec<u8>, BridgeError> {
+        self.core.expand_resource(handle)
+    }
+    /// Projects one tool result into its delivery receipt (I7.24): exact
+    /// result digest, admissible source handle, rendered bytes, tokens
+    /// rendered under the actual route tokenizer, and delivery completeness.
+    ///
+    /// The bridge never estimates tokens or completeness: `tokens_rendered`
+    /// is measured by the projecting route owner with the actual tokenizer,
+    /// and `delivery` is the owner's observed delivery state. Only a `FULL`
+    /// delivery satisfies a complete-evidence prerequisite (see
+    /// [`ToolResultReceipt::check_complete_evidence`]).
+    pub fn project_tool_result_receipt(
+        &self,
+        result_bytes: &[u8],
+        source_handle: ResourceUri,
+        tokens_rendered: u64,
+        delivery: DeliveryStatus,
+    ) -> Result<ToolResultReceipt, BridgeError> {
+        self.core
+            .project_tool_result(result_bytes, source_handle, tokens_rendered, delivery)
+    }
+    /// Number of immutable snapshots retained in the attach-scoped resource
+    /// projection. Zero while detached; cleared by the core on every attach.
+    #[must_use]
+    pub fn resource_registry_len(&self) -> usize {
+        self.core.resource_registry_len()
     }
     /// Notes the owner-supplied bootstrap context for this session.
     ///
@@ -1809,6 +1880,208 @@ mod tests {
             ));
             assert!(runner.reactive_attention().is_empty());
             assert_eq!(runner.reactive_pending_count(), 0);
+        }
+    }
+
+    /// I7.18/I7.24 caller proof through the production [`BridgeRunner`] path.
+    ///
+    /// The runner is the production caller of the core resource projection:
+    /// it publishes owner-supplied snapshots, expands handles, and projects
+    /// tool-result receipts with route-measured tokens and delivery. These
+    /// tests drive publish → preview/handle → expand → receipt → evidence
+    /// gate exactly as an owning producer would, plus detached fail-closed
+    /// behavior.
+    mod resource_runner_tests {
+        use super::super::{
+            AttachBinding, AttachRequest, BridgeError, BridgeRunner, ConnectionId, DeliveryStatus,
+            DemandId, EventEnvelope, HostActivationPort, HostEventEnvelope, McpForwardingPort,
+            Profile, ProviderFailure, ProviderReadiness, ResourceUri,
+        };
+        use super::test_epoch;
+        use eliot_agent_bridge_core::{
+            ActivationPortOutcome, ActivationPortResult, CoverageGap, EventPortOutcome,
+            FencingToken, Generation, PrincipalId, ReconciliationPortOutcome, SessionId, TaskId,
+            WorkUnitId,
+        };
+
+        struct StubActivation {
+            result: ActivationPortResult,
+        }
+
+        impl HostActivationPort for StubActivation {
+            fn activate(
+                &mut self,
+                _request: &AttachRequest,
+            ) -> Result<ActivationPortOutcome, ProviderFailure> {
+                Ok(ActivationPortOutcome::Authenticated(self.result.clone()))
+            }
+        }
+
+        struct StubForwarder;
+
+        impl McpForwardingPort for StubForwarder {
+            fn forward_hook(
+                &mut self,
+                _binding: &AttachBinding,
+                _event: &HostEventEnvelope,
+            ) -> Result<(), ProviderFailure> {
+                Ok(())
+            }
+            fn forward_event(
+                &mut self,
+                _binding: &AttachBinding,
+                _event: &EventEnvelope,
+            ) -> Result<EventPortOutcome, ProviderFailure> {
+                Ok(EventPortOutcome::BestEffortForwarded)
+            }
+            fn forward_gap(
+                &mut self,
+                _binding: &AttachBinding,
+                _gap: &CoverageGap,
+            ) -> Result<(), ProviderFailure> {
+                Err(ProviderFailure::new("test-forwarder", "gap not exercised"))
+            }
+            fn reconcile_external(
+                &mut self,
+                _binding: &AttachBinding,
+            ) -> Result<ReconciliationPortOutcome, ProviderFailure> {
+                Err(ProviderFailure::new(
+                    "test-forwarder",
+                    "reconciliation not exercised",
+                ))
+            }
+        }
+
+        fn resource_runner(attached: bool) -> BridgeRunner {
+            let generation = Generation::new(3).expect("non-zero test generation");
+            let fence = FencingToken::new(test_epoch(2), generation, "fence-resource-3")
+                .expect("valid test fence");
+            let result = ActivationPortResult::authenticated(
+                PrincipalId::new("principal-resource-1").expect("valid principal"),
+                SessionId::new("session-resource-1").expect("valid session"),
+                generation,
+                fence,
+                TaskId::new("task-resource-1").expect("valid task"),
+                WorkUnitId::new("work-unit-resource-1").expect("valid work unit"),
+                "scope-resource-1",
+                "task-revision-1",
+                "plan-resource-1",
+                "plan-revision-1",
+            )
+            .expect("valid activation result");
+            let mut runner = BridgeRunner::new(
+                Profile::SpineFunctional,
+                ProviderReadiness::all_admitted(),
+                Some(Box::new(StubActivation { result })),
+                Some(Box::new(StubForwarder)),
+            )
+            .expect("runner composes");
+            if attached {
+                let attach = AttachRequest::managed(
+                    DemandId::new("demand-resource-1").expect("valid demand"),
+                    ConnectionId::new("conn-resource-1").expect("valid connection"),
+                );
+                runner.attach(attach).expect("managed attach admits");
+            }
+            runner
+        }
+
+        fn large_evidence_bytes() -> Vec<u8> {
+            let mut content = String::from("[");
+            while content.len() < 4 * 1024 + 64 {
+                content.push_str(r#"{"check":"evidence-item","detail":""#);
+                content.push_str(&"x".repeat(64));
+                content.push_str(r#""},"#);
+            }
+            content.push(']');
+            content.into_bytes()
+        }
+
+        #[test]
+        fn large_evidence_returns_preview_plus_handle_and_expands_immutable() {
+            use eliot_agent_bridge_core::{MAX_PREVIEW_BYTES, ResourceKind};
+
+            let mut runner = resource_runner(true);
+            assert_eq!(runner.resource_registry_len(), 0);
+            let content = large_evidence_bytes();
+            assert!(content.len() > MAX_PREVIEW_BYTES);
+            // Acceptance shape: bounded preview plus eliot://evidence handle.
+            let view = runner
+                .publish_evidence_resource(content.clone())
+                .expect("publish evidence binds the live attach");
+            assert_eq!(view.kind(), ResourceKind::Evidence);
+            assert!(
+                view.handle()
+                    .uri()
+                    .as_str()
+                    .starts_with("eliot://evidence/"),
+                "handle must name the evidence family"
+            );
+            assert!(view.preview().len() <= MAX_PREVIEW_BYTES);
+            assert!(view.is_truncated());
+            assert_eq!(view.total_bytes(), content.len());
+            assert_eq!(runner.resource_registry_len(), 1);
+            // Explicit expansion retrieves the immutable referenced content.
+            let expanded = runner
+                .expand_resource(view.handle())
+                .expect("expand resolves the issued handle");
+            assert_eq!(expanded, content);
+            // Republishing the same bytes rebinds the same handle, not a copy.
+            let again = runner
+                .publish_evidence_resource(content.clone())
+                .expect("idempotent republish");
+            assert_eq!(again.handle(), view.handle());
+            assert_eq!(runner.resource_registry_len(), 1);
+        }
+
+        #[test]
+        fn token_truncated_tool_result_is_receipted_and_rejected_as_evidence() {
+            let runner = resource_runner(true);
+            let source =
+                ResourceUri::parse("eliot://evidence/source-9").expect("valid source handle");
+            let result_bytes = vec![b'r'; 3000];
+            // tokens_rendered is measured by the projecting route owner with
+            // the actual tokenizer; the bridge never estimates it.
+            let receipt = runner
+                .project_tool_result_receipt(&result_bytes, source, 750, DeliveryStatus::Truncated)
+                .expect("project receipt");
+            assert_eq!(receipt.delivery(), DeliveryStatus::Truncated);
+            assert_eq!(receipt.bytes_rendered(), result_bytes.len());
+            assert_eq!(receipt.tokens_rendered(), 750);
+            assert_eq!(receipt.result_digest().len(), 64);
+            // A truncated result cannot satisfy complete evidence.
+            assert!(matches!(
+                receipt.check_complete_evidence(),
+                Err(BridgeError::IncompleteDelivery {
+                    delivery: DeliveryStatus::Truncated
+                })
+            ));
+            let full = runner
+                .project_tool_result_receipt(
+                    &result_bytes,
+                    ResourceUri::parse("eliot://evidence/source-9").expect("valid source"),
+                    750,
+                    DeliveryStatus::Full,
+                )
+                .expect("project full receipt");
+            assert!(full.check_complete_evidence().is_ok());
+        }
+
+        #[test]
+        fn detached_runner_publishes_nothing_and_counts_zero() {
+            let mut runner = resource_runner(false);
+            assert!(matches!(
+                runner.publish_evidence_resource(b"bytes".to_vec()),
+                Err(BridgeError::NotAttached)
+            ));
+            assert!(matches!(
+                runner.publish_canonical_resource(
+                    &ResourceUri::parse("eliot://report/r-1").expect("valid uri"),
+                    b"bytes".to_vec(),
+                ),
+                Err(BridgeError::NotAttached)
+            ));
+            assert_eq!(runner.resource_registry_len(), 0);
         }
     }
 }

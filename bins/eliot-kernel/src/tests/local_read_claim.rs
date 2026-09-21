@@ -139,8 +139,8 @@ fn stage_admitted(
     kernel: &KernelComposition,
     envelope: &HostRequestEnvelope,
 ) -> eliot_ors::HostRequestRecord {
-    let requested = host_request_route::requested_host_request_record(envelope)
-        .expect("record must build");
+    let requested =
+        host_request_route::requested_host_request_record(envelope).expect("record must build");
     kernel
         .generation_gateway
         .ors
@@ -191,7 +191,12 @@ fn local_read_claim_submit_roundtrip_with_exact_replay_conflict_and_expiry() {
     );
 
     let tool = query_tool();
-    let envelope = query_envelope(&fence, unix_ms().saturating_add(60_000), "host-request-1", &tool_digest(&tool));
+    let envelope = query_envelope(
+        &fence,
+        unix_ms().saturating_add(60_000),
+        "host-request-1",
+        &tool_digest(&tool),
+    );
     assert!(
         host_request_route::check_local_read_admission(&envelope, &tool)
             .expect("admitted query must validate")
@@ -221,7 +226,9 @@ fn local_read_claim_submit_roundtrip_with_exact_replay_conflict_and_expiry() {
         attempt.fencing_generation, 1,
         "the first claim mints fencing generation 1"
     );
-    attempt.validate().expect("the minted capability must validate");
+    attempt
+        .validate()
+        .expect("the minted capability must validate");
     // A re-claim by the same owner session returns the identical current
     // capability: lost-answer retry without a new identity.
     let (_, _, reattempt) = kernel
@@ -264,7 +271,10 @@ fn local_read_claim_submit_roundtrip_with_exact_replay_conflict_and_expiry() {
         }
     };
     assert_eq!(persisted.state, HostRequestState::ResultReceived);
-    assert_eq!(persisted.result_digest.as_deref(), Some(body.result_digest.as_str()));
+    assert_eq!(
+        persisted.result_digest.as_deref(),
+        Some(body.result_digest.as_str())
+    );
     assert_eq!(persisted.result_response.as_ref(), Some(&body.response));
 
     // Read back the exact body through the durable record and the replay leg.
@@ -343,7 +353,12 @@ fn local_read_claim_submit_roundtrip_with_exact_replay_conflict_and_expiry() {
 
     // An elapsed deadline skips claim and times out on submit.
     let expired_tool = query_tool();
-    let expired = query_envelope(&fence, 1, "host-request-expired", &tool_digest(&expired_tool));
+    let expired = query_envelope(
+        &fence,
+        1,
+        "host-request-expired",
+        &tool_digest(&expired_tool),
+    );
     stage_admitted(&kernel, &expired);
     kernel
         .enqueue_local_read_pair(&expired, &expired_tool)
@@ -395,12 +410,167 @@ fn body_with_revision(
         "revision_heads": [{ "key": "scope:kernel-session-1", "revision": revision }],
     });
     body.result_digest = {
-        let bytes = eliot_contracts::canonical_json_bytes(&body.response)
-            .expect("body must canonicalize");
+        let bytes =
+            eliot_contracts::canonical_json_bytes(&body.response).expect("body must canonicalize");
         eliot_contracts::sha256_hex(&bytes)
     };
     body.validate().expect("body must validate");
     body
+}
+
+fn governed_claim_replacement(
+    kernel: &KernelComposition,
+    fence: &StateFence,
+    owner: &Session,
+    rival: &Session,
+) -> (HostRequestEnvelope, LocalReadAttempt, LocalReadAttempt) {
+    let tool = query_tool();
+    let envelope = query_envelope(
+        fence,
+        unix_ms().saturating_add(60_000),
+        "host-request-governed-1",
+        &tool_digest(&tool),
+    );
+    stage_admitted(kernel, &envelope);
+    kernel
+        .enqueue_local_read_pair(&envelope, &tool)
+        .expect("enqueue must succeed");
+    let (_, _, first) = kernel
+        .claim_local_read_pair(owner)
+        .expect("owner claim must not fail")
+        .expect("pair must claim");
+    assert_eq!(first.fencing_generation, 1);
+    let (_, _, second) = kernel
+        .claim_local_read_pair(rival)
+        .expect("rival claim must not fail")
+        .expect("pair must re-claim");
+    assert_eq!(
+        second.fencing_generation, 2,
+        "reassignment bumps the fencing generation"
+    );
+    assert_ne!(
+        second.attempt_id, first.attempt_id,
+        "reassignment mints a fresh attempt identity"
+    );
+    (envelope, first, second)
+}
+
+fn governed_stale_then_current(
+    kernel: &KernelComposition,
+    envelope: &HostRequestEnvelope,
+    first: LocalReadAttempt,
+    second: LocalReadAttempt,
+    owner: &Session,
+    rival: &Session,
+) -> HostRequestResultBody {
+    let stale_body = body_with_revision(envelope, first, 3);
+    match kernel
+        .submit_local_read_result(owner, &stale_body)
+        .expect("stale submit must not fail")
+    {
+        LocalReadSubmitDisposition::StaleAttempt(observation) => {
+            assert_eq!(
+                observation.reason,
+                StaleLocalReadReason::Superseded,
+                "replacement projects as superseded"
+            );
+            assert_eq!(observation.current_generation, Some(2));
+        }
+        LocalReadSubmitDisposition::Persisted(_) => {
+            panic!("a superseded attempt must never persist")
+        }
+    }
+    let waiter = waiter_record(kernel, envelope);
+    assert!(
+        waiter.result_digest.is_none() && waiter.result_response.is_none(),
+        "the waiter must observe no stale result"
+    );
+    let current_body = body_with_revision(envelope, second, 4);
+    match kernel
+        .submit_local_read_result(rival, &current_body)
+        .expect("current submit must not fail")
+    {
+        LocalReadSubmitDisposition::Persisted(record) => {
+            assert_eq!(record.state, HostRequestState::ResultReceived);
+            assert_eq!(
+                record.result_response.as_ref(),
+                Some(&current_body.response)
+            );
+        }
+        LocalReadSubmitDisposition::StaleAttempt(observation) => {
+            panic!("the current attempt must persist, got stale: {observation:?}")
+        }
+    }
+    assert!(
+        matches!(
+            kernel.submit_local_read_result(owner, &stale_body),
+            Ok(LocalReadSubmitDisposition::StaleAttempt(_))
+        ),
+        "a replaced attempt must stay stale after completion"
+    );
+    let waiter = waiter_record(kernel, envelope);
+    assert_eq!(
+        waiter.result_response.as_ref(),
+        Some(&current_body.response),
+        "the waiter keeps exactly the current completion"
+    );
+    current_body
+}
+
+fn governed_revocation_roundtrip(kernel: &KernelComposition, fence: &StateFence, owner: &Session) {
+    let revoked_tool = query_tool();
+    let revoked = query_envelope(
+        fence,
+        unix_ms().saturating_add(60_000),
+        "host-request-governed-2",
+        &tool_digest(&revoked_tool),
+    );
+    stage_admitted(kernel, &revoked);
+    kernel
+        .enqueue_local_read_pair(&revoked, &revoked_tool)
+        .expect("enqueue must succeed");
+    let (_, _, revoked_attempt) = kernel
+        .claim_local_read_pair(owner)
+        .expect("claim must not fail")
+        .expect("pair must claim");
+    kernel.fence_host_requests_for_connection("conn-test-1");
+    let revoked_body = body_with_revision(&revoked, revoked_attempt, 5);
+    match kernel
+        .submit_local_read_result(owner, &revoked_body)
+        .expect("revoked submit must not fail")
+    {
+        LocalReadSubmitDisposition::StaleAttempt(observation) => {
+            assert_eq!(
+                observation.reason,
+                StaleLocalReadReason::Unclaimed,
+                "revocation projects as unclaimed"
+            );
+            assert_eq!(observation.current_generation, None);
+        }
+        LocalReadSubmitDisposition::Persisted(_) => {
+            panic!("a revoked attempt must never persist")
+        }
+    }
+    let waiter = waiter_record(kernel, &revoked);
+    assert!(
+        waiter.result_digest.is_none() && waiter.result_response.is_none(),
+        "the waiter must observe no revoked result"
+    );
+    kernel
+        .enqueue_local_read_pair(&revoked, &revoked_tool)
+        .expect("re-enqueue after revoke must succeed");
+    let (_, _, fresh) = kernel
+        .claim_local_read_pair(owner)
+        .expect("fresh claim must not fail")
+        .expect("re-enqueued pair must claim");
+    let fresh_body = body_with_revision(&revoked, fresh, 6);
+    assert!(
+        matches!(
+            kernel.submit_local_read_result(owner, &fresh_body),
+            Ok(LocalReadSubmitDisposition::Persisted(_))
+        ),
+        "the current attempt completes after revocation"
+    );
 }
 
 /// Acceptance (#1808): exactly one completion per current fencing generation.
@@ -428,154 +598,9 @@ fn governed_attempt_replacement_and_revocation_quarantine_stale_and_current_comp
         "reconnected-launch-nonce".to_owned(),
         2,
     );
-
-    // Replacement: owner claims generation 1, rival reassigns to generation 2.
-    let tool = query_tool();
-    let envelope = query_envelope(
-        &fence,
-        unix_ms().saturating_add(60_000),
-        "host-request-governed-1",
-        &tool_digest(&tool),
-    );
-    stage_admitted(&kernel, &envelope);
-    kernel
-        .enqueue_local_read_pair(&envelope, &tool)
-        .expect("enqueue must succeed");
-    let (_, _, first) = kernel
-        .claim_local_read_pair(&owner)
-        .expect("owner claim must not fail")
-        .expect("pair must claim");
-    assert_eq!(first.fencing_generation, 1);
-    let (_, _, second) = kernel
-        .claim_local_read_pair(&rival)
-        .expect("rival claim must not fail")
-        .expect("pair must re-claim");
-    assert_eq!(
-        second.fencing_generation, 2,
-        "reassignment bumps the fencing generation"
-    );
-    assert_ne!(
-        second.attempt_id, first.attempt_id,
-        "reassignment mints a fresh attempt identity"
-    );
-
-    // The superseded submission quarantines as stale; the waiter stays clean.
-    let stale_body = body_with_revision(&envelope, first.clone(), 3);
-    match kernel
-        .submit_local_read_result(&owner, &stale_body)
-        .expect("stale submit must not fail")
-    {
-        LocalReadSubmitDisposition::StaleAttempt(observation) => {
-            assert_eq!(
-                observation.reason,
-                StaleLocalReadReason::Superseded,
-                "replacement projects as superseded"
-            );
-            assert_eq!(observation.current_generation, Some(2));
-        }
-        LocalReadSubmitDisposition::Persisted(_) => {
-            panic!("a superseded attempt must never persist")
-        }
-    }
-    let waiter = waiter_record(&kernel, &envelope);
-    assert!(
-        waiter.result_digest.is_none() && waiter.result_response.is_none(),
-        "the waiter must observe no stale result"
-    );
-
-    // The current attempt completes through its own bound capability.
-    let current_body = body_with_revision(&envelope, second, 4);
-    match kernel
-        .submit_local_read_result(&rival, &current_body)
-        .expect("current submit must not fail")
-    {
-        LocalReadSubmitDisposition::Persisted(record) => {
-            assert_eq!(record.state, HostRequestState::ResultReceived);
-            assert_eq!(
-                record.result_response.as_ref(),
-                Some(&current_body.response)
-            );
-        }
-        LocalReadSubmitDisposition::StaleAttempt(observation) => {
-            panic!("the current attempt must persist, got stale: {observation:?}")
-        }
-    }
-
-    // The superseded bytes stay stale after completion: different bytes, no
-    // live generation, waiter keeps the current result only.
-    assert!(
-        matches!(
-            kernel.submit_local_read_result(&owner, &stale_body),
-            Ok(LocalReadSubmitDisposition::StaleAttempt(_))
-        ),
-        "a replaced attempt must stay stale after completion"
-    );
-    let waiter = waiter_record(&kernel, &envelope);
-    assert_eq!(
-        waiter.result_response.as_ref(),
-        Some(&current_body.response),
-        "the waiter keeps exactly the current completion"
-    );
-
-    // Revocation: disconnect fencing drops the pair; the in-flight capability
-    // quarantines as unclaimed and the waiter stays clean.
-    let revoked_tool = query_tool();
-    let revoked = query_envelope(
-        &fence,
-        unix_ms().saturating_add(60_000),
-        "host-request-governed-2",
-        &tool_digest(&revoked_tool),
-    );
-    stage_admitted(&kernel, &revoked);
-    kernel
-        .enqueue_local_read_pair(&revoked, &revoked_tool)
-        .expect("enqueue must succeed");
-    let (_, _, revoked_attempt) = kernel
-        .claim_local_read_pair(&owner)
-        .expect("claim must not fail")
-        .expect("pair must claim");
-    kernel.fence_host_requests_for_connection("conn-test-1");
-    let revoked_body = body_with_revision(&revoked, revoked_attempt, 5);
-    match kernel
-        .submit_local_read_result(&owner, &revoked_body)
-        .expect("revoked submit must not fail")
-    {
-        LocalReadSubmitDisposition::StaleAttempt(observation) => {
-            assert_eq!(
-                observation.reason,
-                StaleLocalReadReason::Unclaimed,
-                "revocation projects as unclaimed"
-            );
-            assert_eq!(observation.current_generation, None);
-        }
-        LocalReadSubmitDisposition::Persisted(_) => {
-            panic!("a revoked attempt must never persist")
-        }
-    }
-    let waiter = waiter_record(&kernel, &revoked);
-    assert!(
-        waiter.result_digest.is_none() && waiter.result_response.is_none(),
-        "the waiter must observe no revoked result"
-    );
-
-    // The caller re-invokes after revocation; the fresh current attempt
-    // completes.
-    kernel
-        .enqueue_local_read_pair(&revoked, &revoked_tool)
-        .expect("re-enqueue after revoke must succeed");
-    let (_, _, fresh) = kernel
-        .claim_local_read_pair(&owner)
-        .expect("fresh claim must not fail")
-        .expect("re-enqueued pair must claim");
-    let fresh_body = body_with_revision(&revoked, fresh, 6);
-    assert!(
-        matches!(
-            kernel.submit_local_read_result(&owner, &fresh_body),
-            Ok(LocalReadSubmitDisposition::Persisted(_))
-        ),
-        "the current attempt completes after revocation"
-    );
-
+    let (envelope, first, second) = governed_claim_replacement(&kernel, &fence, &owner, &rival);
+    let _current = governed_stale_then_current(&kernel, &envelope, first, second, &owner, &rival);
+    governed_revocation_roundtrip(&kernel, &fence, &owner);
     drop(kernel);
     let _ = std::fs::remove_dir_all(root);
 }

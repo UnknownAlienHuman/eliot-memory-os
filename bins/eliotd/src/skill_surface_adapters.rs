@@ -17,6 +17,11 @@
 //!   accessor (`skill_lifecycle` -> `ForwardingSkillLifecycle` -> Governor
 //!   owner). A stale fence fails closed in the Governor owner, never as a
 //!   local default.
+//! - `skill_activation_display` forwards receipt, ack, and the caller-supplied
+//!   tool view to the inner lifecycle API, which executes the catalogue
+//!   boundary at the composition adapter. Port implementations without
+//!   installed catalogue bodies keep the trait's fail-closed default; only
+//!   this forwarder overrides it.
 //! - The boxed-future shape mirrors the surface trait: it keeps the
 //!   implementation object-safe without an async-trait dependency and imposes
 //!   no `Send` bound the Governor borrows cannot guarantee.
@@ -36,7 +41,10 @@ use std::pin::Pin;
 
 use eliot_contracts::RequestMetadata;
 use eliot_controlboard::{ProposeSkillRequest, SkillLifecyclePort};
-use eliot_skill::{SkillCandidate, SkillError, SkillLifecycleApi, SkillLifecycleView};
+use eliot_skill::{
+    ActivatedSkillDisplay, HotsetDeliveryAck, HotsetDeliveryReceipt, KnownTools, SkillCandidate,
+    SkillError, SkillLifecycleApi, SkillLifecycleView,
+};
 
 /// Forwards one [`SkillLifecyclePort`] to the single Governor skill owner.
 ///
@@ -85,6 +93,21 @@ impl<T: SkillLifecycleApi> SkillLifecyclePort for GovernorSkillForwarder<T> {
                 .await
         })
     }
+
+    fn skill_activation_display<'a>(
+        &'a mut self,
+        ctx: &'a RequestMetadata,
+        skill_id: String,
+        receipt: HotsetDeliveryReceipt,
+        ack: HotsetDeliveryAck,
+        tools: &'a dyn KnownTools,
+    ) -> Pin<Box<dyn Future<Output = Result<ActivatedSkillDisplay, SkillError>> + 'a>> {
+        Box::pin(async move {
+            self.inner
+                .activation_display(ctx, skill_id, receipt, ack, tools)
+                .await
+        })
+    }
 }
 
 #[cfg(test)]
@@ -98,8 +121,10 @@ mod tests {
         SourceId, StateFence,
     };
     use eliot_skill::{
-        LifecycleAction, LifecycleCounters, SkillInteractionView, SkillLifecycleView, SkillRef,
-        SkillScope, SkillStatus,
+        DependencyVersion, HotsetAckDisposition, HotsetDeliveryAck, HotsetDeliveryReceipt,
+        KnownTools, LifecycleAction, LifecycleCounters, SkillBody, SkillCatalogue,
+        SkillCatalogueEntry, SkillIndexEntry, SkillInteractionView, SkillLifecycleView, SkillRef,
+        SkillRuntimeMetadata, SkillScope, SkillStatus,
     };
     use std::num::NonZeroU64;
 
@@ -165,8 +190,66 @@ mod tests {
 
     /// Test owner that computes real candidates from the received fields, so
     /// the test proves exact field forwarding instead of replaying bytes.
+    /// Display executes against a real installed catalogue for the same
+    /// reason: the port-level test observes the catalogue boundary, not a
+    /// canned display.
     struct ComputingInner {
         base: SkillLifecycleView,
+        catalogue: SkillCatalogue,
+    }
+
+    struct ForwardTools;
+
+    impl KnownTools for ForwardTools {
+        fn knows_tool(&self, name: &str) -> bool {
+            name == "eliot.finish"
+        }
+    }
+
+    fn installed_catalogue() -> SkillCatalogue {
+        let mut body = SkillBody {
+            skill_id: "skill-demo".to_owned(),
+            body_version: "1.0.0".to_owned(),
+            body_digest: String::new(),
+            actions: vec!["Refresh the task view before a Material effect.".to_owned()],
+            where_not_apply: vec!["Do not use for credential handling.".to_owned()],
+            stop_escalation: "Stop and escalate on conflicting instructions.".to_owned(),
+            tool_refs: vec!["eliot.finish".to_owned()],
+        };
+        body.body_digest = body.expected_digest().expect("body digest");
+        let entry = SkillCatalogueEntry {
+            index: SkillIndexEntry {
+                skill_id: "skill-demo".to_owned(),
+                name: "demo skill".to_owned(),
+                trigger: "when demo work arrives load this skill".to_owned(),
+                eligible_routes: vec!["route-1".to_owned()],
+                eligible_profiles: vec!["profile-1".to_owned()],
+            },
+            body,
+            runtime: SkillRuntimeMetadata {
+                skill_id: "skill-demo".to_owned(),
+                body_version: "1.0.0".to_owned(),
+                references: vec!["references/playbook.md".to_owned()],
+                scripts: Vec::new(),
+                assets: Vec::new(),
+                index_budget_tokens: 200,
+                body_budget_tokens: 800,
+                runtime_budget_tokens: 2000,
+                index_tokens: 60,
+                body_tokens: 400,
+                runtime_tokens: 0,
+            },
+            dependencies: vec![DependencyVersion {
+                name: "tool-def-1".to_owned(),
+                version: "1.2.0".to_owned(),
+                contract_digest: "c".repeat(64),
+            }],
+            host_version: "host-4.1.0".to_owned(),
+            profile_version: "profile-2.0.0".to_owned(),
+            status: SkillStatus::Provisional,
+            stale_reason: None,
+        };
+        SkillCatalogue::from_snapshot([entry], &ForwardTools).expect("installed catalogue")
     }
 
     impl SkillLifecycleApi for ComputingInner {
@@ -209,6 +292,18 @@ mod tests {
         ) -> Result<eliot_store_api::WriteReceipt, SkillError> {
             Err(SkillError::NotFound)
         }
+
+        async fn activation_display(
+            &self,
+            _ctx: &RequestMetadata,
+            skill_id: String,
+            receipt: HotsetDeliveryReceipt,
+            ack: HotsetDeliveryAck,
+            tools: &dyn KnownTools,
+        ) -> Result<ActivatedSkillDisplay, SkillError> {
+            self.catalogue
+                .activation_display(&skill_id, &receipt, &ack, tools)
+        }
     }
 
     fn block_on<T>(future: impl Future<Output = T>) -> T {
@@ -227,7 +322,10 @@ mod tests {
     fn forwarder_passes_exact_fields_to_the_governor_owner() {
         let fence = fence();
         let base = base_view(&fence);
-        let mut forwarder = GovernorSkillForwarder::new(ComputingInner { base: base.clone() });
+        let mut forwarder = GovernorSkillForwarder::new(ComputingInner {
+            base: base.clone(),
+            catalogue: installed_catalogue(),
+        });
         let view = block_on(forwarder.skill_read(&metadata(&fence), "skill-demo".to_owned()))
             .expect("forwarded view");
         assert_eq!(view, Some(base.clone()));
@@ -254,5 +352,89 @@ mod tests {
         .expect("expected candidate");
         assert_eq!(candidate, expected);
         assert_eq!(candidate.candidate_digest, expected.candidate_digest);
+    }
+
+    #[test]
+    fn forwarder_delegates_display_receipt_and_ack_to_the_owner() {
+        let fence = fence();
+        let base = base_view(&fence);
+        let catalogue = installed_catalogue();
+        let receipt = HotsetDeliveryReceipt::issue(
+            "hotset-fwd-1".to_owned(),
+            &catalogue,
+            vec!["skill-demo".to_owned()],
+            &ForwardTools,
+            "approval-commit-1".to_owned(),
+        )
+        .expect("delivery receipt");
+        let ack = HotsetDeliveryAck {
+            hotset_id: receipt.hotset_id.clone(),
+            receipt_digest: receipt.receipt_digest.clone(),
+            receiver_id: "runtime-hotset-1".to_owned(),
+            disposition: HotsetAckDisposition::Applied,
+        };
+        let mut forwarder = GovernorSkillForwarder::new(ComputingInner { base, catalogue });
+        let display = block_on(forwarder.skill_activation_display(
+            &metadata(&fence),
+            "skill-demo".to_owned(),
+            receipt.clone(),
+            ack,
+            &ForwardTools,
+        ))
+        .expect("forwarded display");
+        assert_eq!(display.skill_id, "skill-demo");
+        assert_eq!(display.delivery_receipt_digest, receipt.receipt_digest);
+    }
+
+    /// Port implementation without installed catalogue bodies keeps the
+    /// trait's fail-closed default display instead of inventing one.
+    struct DefaultPort;
+
+    impl SkillLifecyclePort for DefaultPort {
+        fn skill_read<'a>(
+            &'a mut self,
+            _ctx: &'a RequestMetadata,
+            _skill_id: String,
+        ) -> Pin<Box<dyn Future<Output = Result<Option<SkillLifecycleView>, SkillError>> + 'a>>
+        {
+            Box::pin(async move { Err(SkillError::NotFound) })
+        }
+
+        fn propose_skill<'a>(
+            &'a mut self,
+            _ctx: &'a RequestMetadata,
+            _request: ProposeSkillRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<SkillCandidate, SkillError>> + 'a>> {
+            Box::pin(async move { Err(SkillError::NotFound) })
+        }
+    }
+
+    #[test]
+    fn port_default_display_fails_closed_without_catalogue_bodies() {
+        let fence = fence();
+        let catalogue = installed_catalogue();
+        let receipt = HotsetDeliveryReceipt::issue(
+            "hotset-fwd-1".to_owned(),
+            &catalogue,
+            vec!["skill-demo".to_owned()],
+            &ForwardTools,
+            "approval-commit-1".to_owned(),
+        )
+        .expect("delivery receipt");
+        let ack = HotsetDeliveryAck {
+            hotset_id: receipt.hotset_id.clone(),
+            receipt_digest: receipt.receipt_digest.clone(),
+            receiver_id: "runtime-hotset-1".to_owned(),
+            disposition: HotsetAckDisposition::Applied,
+        };
+        let mut port = DefaultPort;
+        let refused = block_on(port.skill_activation_display(
+            &metadata(&fence),
+            "skill-demo".to_owned(),
+            receipt,
+            ack,
+            &ForwardTools,
+        ));
+        assert!(matches!(refused, Err(SkillError::Surface(_))));
     }
 }

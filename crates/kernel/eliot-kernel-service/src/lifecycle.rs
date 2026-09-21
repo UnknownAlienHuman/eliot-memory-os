@@ -575,6 +575,16 @@ impl KernelService {
                 // observations and call `publish_ready` with its own receipt.
                 return Err(KernelServiceError::ReadinessNotProven);
             }
+            // Luna (startup consumer): replace this fail-closed placeholder
+            // with validate plus record_startup_evidence steps 1/2/4 wiring.
+            // It exists only so the shared carrier compiles before the
+            // consumer arms land; root integrates both jointly.
+            KernelControlCommand::ReportHostStartupEvidence(_) => {
+                return Err(KernelServiceError::InvalidField {
+                    field: "host_startup_evidence",
+                    reason: "Host startup evidence requires the authenticated Kernel composition boundary",
+                });
+            }
             KernelControlCommand::Degrade(reason) => {
                 validate_text(reason.as_str(), "degrade.reason")?;
                 self.transition(KernelServiceState::Degraded)?;

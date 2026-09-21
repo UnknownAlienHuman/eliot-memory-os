@@ -18,7 +18,7 @@ mod provider_owner;
 mod rpc_parse;
 mod session;
 pub(crate) mod session_pool;
-use provider_owner::ProviderOwner;
+pub(crate) use provider_owner::ProviderOwner;
 use session::RpcSession;
 use session_pool::{SessionPool, SessionRole};
 
@@ -29,6 +29,13 @@ pub(crate) struct RpcTransport {
     session: RpcSession,
     provider: Arc<ProviderOwner>,
     pool: SessionPool,
+}
+
+impl RpcTransport {
+    /// Provider owner holding the retained proved server version.
+    pub(crate) fn provider(&self) -> &Arc<ProviderOwner> {
+        &self.provider
+    }
 }
 impl fmt::Debug for RpcTransport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

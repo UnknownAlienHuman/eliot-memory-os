@@ -36,6 +36,8 @@ eliot-store-api.workspace = true
 eliot-task.workspace = true
 eliot-workscope.workspace = true
 eliot-runtime-contracts.workspace = true
+eliot-security-contracts.workspace = true
+eliot-wasm-runtime = { path = "../../modules/eliot-wasm-runtime" }
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
