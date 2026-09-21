@@ -37,6 +37,17 @@ pub(crate) mod table {
     /// through the in-transaction revision compare-and-set; retries
     /// recompute from fresh rows, never from stale reads.
     pub(crate) const NOTIFICATION_RECORD: &str = "notification_record";
+    /// Durable reactive-session row per session (issue #1941 C4). One row
+    /// per `session_id` carrying the verbatim bridge ledger snapshot, the
+    /// owner revision, the admission fence, and task-binding provenance.
+    /// Concurrent writers arbitrate through the in-transaction revision
+    /// compare-and-set; retries recompute from fresh rows.
+    pub(crate) const REACTIVE_SESSION: &str = "reactive_session";
+    /// Immutable resource-snapshot row per canonical URI (issue #1941 C4).
+    /// One row per `uri` carrying the content digest, the verbatim base64
+    /// bytes, the owner revision, and the admission fence. Rewrites with
+    /// different bytes fail closed; create races converge through retry.
+    pub(crate) const RESOURCE_SNAPSHOT: &str = "resource_snapshot";
 }
 
 /// Record key of the single canonical fence/sequence row.
@@ -176,6 +187,36 @@ DEFINE FIELD history ON notification_record TYPE array;
 DEFINE FIELD revision ON notification_record TYPE int;
 DEFINE FIELD state_fence ON notification_record TYPE object;
 DEFINE INDEX notify_dedup ON notification_record FIELDS dedup_key UNIQUE;
+";
+
+/// Reactive session + resource snapshot tables (issue #1941 C4). Additive
+/// delta in the notification style: `reactive_session` carries one row
+/// per session with the verbatim ledger snapshot, the owner revision,
+/// the admission fence, and task-binding provenance; `resource_snapshot`
+/// carries one row per canonical URI with the content digest, the
+/// verbatim base64 bytes, the owner revision, and the admission fence.
+/// Applied explicitly where the owning slice proves it; never executed
+/// implicitly by the adapter.
+#[allow(dead_code)]
+pub(crate) const REACTIVE_TABLES_DDL: &str = r"
+DEFINE TABLE reactive_session SCHEMALESS;
+DEFINE FIELD session_id ON reactive_session TYPE string;
+DEFINE FIELD ledger_json ON reactive_session TYPE string;
+DEFINE FIELD revision ON reactive_session TYPE int;
+DEFINE FIELD state_fence ON reactive_session TYPE object;
+DEFINE FIELD scope_id ON reactive_session TYPE string;
+DEFINE FIELD task_id ON reactive_session TYPE option<string>;
+DEFINE INDEX reactive_session_id ON reactive_session FIELDS session_id UNIQUE;
+
+DEFINE TABLE resource_snapshot SCHEMALESS;
+DEFINE FIELD uri ON resource_snapshot TYPE string;
+DEFINE FIELD content_sha256 ON resource_snapshot TYPE string;
+DEFINE FIELD content_base64 ON resource_snapshot TYPE string;
+DEFINE FIELD revision ON resource_snapshot TYPE int;
+DEFINE FIELD state_fence ON resource_snapshot TYPE object;
+DEFINE FIELD scope_id ON resource_snapshot TYPE string;
+DEFINE FIELD task_id ON resource_snapshot TYPE option<string>;
+DEFINE INDEX snapshot_uri ON resource_snapshot FIELDS uri UNIQUE;
 ";
 
 pub(crate) const SCHEMA_DDL_V2: &str = r"
