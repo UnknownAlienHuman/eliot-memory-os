@@ -1724,6 +1724,7 @@ dependencies = [
  "eliot-epistemic-contracts",
  "eliot-evidence",
  "eliot-finish",
+ "eliot-integration-coverage",
  "eliot-maintenance",
  "eliot-module-registry",
  "eliot-observation",
