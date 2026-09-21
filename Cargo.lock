@@ -1696,6 +1696,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-git-bridge"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-platform",
+ "eliot-process",
+ "eliot-process-executor",
+ "serde_json",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "eliot-governor"
 version = "0.1.0"
 dependencies = [

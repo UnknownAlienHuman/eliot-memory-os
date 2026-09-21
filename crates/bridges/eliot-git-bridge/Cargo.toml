@@ -1,19 +1,35 @@
 [package]
 name = "eliot-git-bridge"
-version = "0.1.0"
-edition = "2021"
-rust-version = "1.85"
-license = "MIT"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
 description = "Typed Git bridge without destructive worktree handling (issue 1830)"
-
-# Standalone workspace root on purpose: root integration owns admission into
-# the workspace `members` table, so this crate must build and test in
-# isolation via --manifest-path with an isolated --target-dir.
-[workspace]
 
 [lib]
 name = "eliot_git_bridge"
 path = "src/lib.rs"
 
-[lints.rust]
-unsafe_code = "forbid"
+# Documented classification (scripts/code_navigation.py check):
+# explicit prototype label plus admission state. Navigation closure through
+# the shared `crates/bridges/**` logical-block mapping in root-owned
+# docs/code-navigation/logical-blocks.toml and the #1811 gate (standalone
+# carveout removed at admission: this crate is a workspace member).
+[package.metadata.eliot]
+prototype = true
+source_status = "IMPLEMENTED"
+workspace_admission = "admitted via #1830 root workspace membership as the typed Git bridge (I10.9); executor binding proven package-local; prototype classification retained pending integration-owner review"
+
+[dependencies]
+eliot-process.workspace = true
+eliot-process-executor.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+eliot-contracts.workspace = true
+eliot-platform.workspace = true
+sha2.workspace = true
+
+[lints]
+workspace = true
