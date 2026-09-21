@@ -25,6 +25,7 @@ mod artifact_preflight;
 mod child_engine;
 mod cli_contract;
 mod contour;
+mod grant_client;
 mod guest_exec;
 mod shadow;
 mod typed_bindings;
@@ -44,6 +45,7 @@ pub use contour::{
     STANDARD_GUEST_TARGET, admit_generation, admit_generation_with_bytes, admit_prototype,
     authorize_host_call, check_activation_imports, check_admitted_request,
 };
+pub use grant_client::{GrantClientBundle, GrantClientError, build_grant_bundle, request_grant};
 pub use guest_exec::{
     ChildMetering, EXIT_COMPLETED, EXIT_DENIED, EXIT_ENGINE_FAILED, EXIT_NOT_COMPLETED,
     GuestExecRejection, GuestExecRequest, metering_line, parse_metering_line, run_guest_exec,
@@ -110,6 +112,12 @@ impl WasmHostRunner {
     /// slot with the provider-specific adapter: either the in-process
     /// Wasmtime provider or the isolated-child engine (never both — pairing
     /// them would execute the guest twice).
+    ///
+    /// Test-only callers, explicitly: every current caller is a proof
+    /// harness seating a composed engine. Production dispatch (the admitted
+    /// request loop over a future grant transport) will construct the child
+    /// engine here once the transport lands; until then this stays the
+    /// proof-composition entry, not a live dispatch path.
     pub fn with_wasmtime_engine(
         profile: Profile,
         runtime: Runtime,
