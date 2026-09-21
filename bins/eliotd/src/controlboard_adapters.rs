@@ -58,6 +58,7 @@ use eliot_controlboard::{
     SwarmProjectionPort, ViewRevision,
 };
 use eliot_governor::ControlBoardGovernorSnapshot;
+use eliot_kernel_core::Notification;
 use eliot_skill::{SkillCandidate, SkillError, SkillLifecycleView};
 
 use super::daemon_kernel_client::OwnerSessionFacts;
@@ -72,11 +73,16 @@ use super::daemon_kernel_client::OwnerSessionFacts;
 /// newly created board replays an already-admitted operation instead of
 /// admitting it twice. `admitted` carries owner-issued session bindings for
 /// the access resolver; production passes none (the session owner is
-/// deferred), which keeps the unadmitted typed gap.
+/// deferred), which keeps the unadmitted typed gap. `notifications` carries
+/// pre-fetched canonical notification records (issue #1780) from an
+/// authenticated `GetNotificationState` read at the snapshot fence;
+/// production passes none until the daemon wires that read, which keeps the
+/// inbox empty rather than fabricated.
 pub(crate) fn controlboard_over_snapshot(
     snapshot: ControlBoardGovernorSnapshot,
     shared: &SharedOperatorReplay,
     admitted: Vec<AdmittedSessionAccess>,
+    notifications: Vec<Notification>,
 ) -> ControlBoard {
     let snapshot = Arc::new(snapshot);
     // Production passes no sessions, which cannot fail. An invalid test
@@ -90,7 +96,10 @@ pub(crate) fn controlboard_over_snapshot(
     };
     ControlBoard::new(
         Some(Box::new(access)),
-        Some(Box::new(GovernorCanonicalState::new(Arc::clone(&snapshot)))),
+        Some(Box::new(GovernorCanonicalState::new(
+            Arc::clone(&snapshot),
+            notifications,
+        ))),
         Some(Box::new(GovernorOperatorCommand::with_shared_replay(
             Arc::clone(&snapshot),
             shared,
@@ -419,13 +428,22 @@ impl AccessResolverPort for GovernorAccessResolver {
 /// real G-11/I-12 bindings. Empty data and a missing provider stay distinct:
 /// this path succeeds with zero items while genuinely absent providers fail
 /// as typed gaps elsewhere.
+///
+/// Notification records are supplied pre-fetched by the board constructor
+/// (see [`controlboard_over_snapshot`]): this port performs no I/O and never
+/// synthesizes records. Records whose fence differs from the snapshot fence
+/// fail closed through `CanonicalState::validate` at read time.
 struct GovernorCanonicalState {
     snapshot: Arc<ControlBoardGovernorSnapshot>,
+    notifications: Vec<Notification>,
 }
 
 impl GovernorCanonicalState {
-    fn new(snapshot: Arc<ControlBoardGovernorSnapshot>) -> Self {
-        Self { snapshot }
+    fn new(snapshot: Arc<ControlBoardGovernorSnapshot>, notifications: Vec<Notification>) -> Self {
+        Self {
+            snapshot,
+            notifications,
+        }
     }
 }
 
@@ -473,12 +491,12 @@ impl CanonicalStatePort for GovernorCanonicalState {
             items: Vec::new(),
             reviews: Vec::new(),
             provenance: Vec::new(),
-            // #1780 inbox section: the daemon does not yet read canonical
-            // notification state (GetNotificationState) into this snapshot,
-            // so the section is empty rather than fabricated. Wiring the
-            // notification read is daemon-owner follow-up; the board
-            // contract accepts the empty section without failing.
-            notifications: Vec::new(),
+            // Canonical notification records supplied pre-fetched by the
+            // board constructor (issue #1780). The daemon does not yet read
+            // notification state into its snapshot composition, so production
+            // passes none here; an empty supply reads as an empty inbox,
+            // never as resolved or suppressed state.
+            notifications: self.notifications.clone(),
         };
         state
             .validate()
@@ -1031,7 +1049,10 @@ mod tests {
             .collect();
         ControlBoard::new(
             Some(Box::new(SessionKeyedAccess { bindings })),
-            Some(Box::new(GovernorCanonicalState::new(Arc::new(snapshot())))),
+            Some(Box::new(GovernorCanonicalState::new(
+                Arc::new(snapshot()),
+                Vec::new(),
+            ))),
             Some(Box::new(CountingCommand { calls })),
         )
     }
@@ -1058,7 +1079,10 @@ mod tests {
         )]);
         let mut board = ControlBoard::new(
             Some(Box::new(SessionKeyedAccess { bindings })),
-            Some(Box::new(GovernorCanonicalState::new(Arc::clone(&snapshot)))),
+            Some(Box::new(GovernorCanonicalState::new(
+                Arc::clone(&snapshot),
+                Vec::new(),
+            ))),
             Some(Box::new(GovernorOperatorCommand::new(snapshot))),
         );
         let view = board.view(&request_for("session-a")).expect("view");
@@ -1159,7 +1183,12 @@ mod tests {
     #[test]
     fn missing_providers_are_typed_gaps_not_empty_views() {
         let mut board =
-            controlboard_over_snapshot(snapshot(), &SharedOperatorReplay::new(), Vec::new());
+            controlboard_over_snapshot(
+                snapshot(),
+                &SharedOperatorReplay::new(),
+                Vec::new(),
+                Vec::new()
+            );
         assert_eq!(
             board.view(&request_for("session-a")),
             Err(ControlBoardError::PlanGap(RequiredProvider::AccessResolver))
@@ -1199,7 +1228,10 @@ mod tests {
         )]);
         let mut board = ControlBoard::new(
             Some(Box::new(SessionKeyedAccess { bindings })),
-            Some(Box::new(GovernorCanonicalState::new(Arc::clone(&churned)))),
+            Some(Box::new(GovernorCanonicalState::new(
+                Arc::clone(&churned),
+                Vec::new(),
+            ))),
             Some(Box::new(GovernorOperatorCommand::new(Arc::new(snapshot())))),
         );
         let churned_command = {
@@ -1247,7 +1279,10 @@ mod tests {
         )]);
         ControlBoard::new(
             Some(Box::new(SessionKeyedAccess { bindings })),
-            Some(Box::new(GovernorCanonicalState::new(Arc::clone(&snapshot)))),
+            Some(Box::new(GovernorCanonicalState::new(
+                Arc::clone(&snapshot),
+                Vec::new(),
+            ))),
             Some(Box::new(CountingOperator {
                 inner: GovernorOperatorCommand::new(snapshot),
                 calls,
@@ -1510,6 +1545,7 @@ mod tests {
             snapshot(),
             &shared,
             vec![admitted_start_session("session-a")],
+            Vec::new(),
         );
         let submitted = start_query_for("session-a");
         let first = board_a
@@ -1524,6 +1560,7 @@ mod tests {
             snapshot(),
             &shared,
             vec![admitted_start_session("session-a")],
+            Vec::new(),
         );
         let replayed = board_b
             .submit(&request_for("session-a"), submitted.clone())
@@ -1585,7 +1622,10 @@ mod tests {
                 )
                 .expect("admitted session"),
             )),
-            Some(Box::new(GovernorCanonicalState::new(snapshot))),
+            Some(Box::new(GovernorCanonicalState::new(
+                snapshot,
+                Vec::new(),
+            ))),
             None,
         )
     }
@@ -1609,7 +1649,8 @@ mod tests {
         assert_eq!(binding.access_revision.get(), 7);
         assert_eq!(binding.access_fence, fence());
         // The same binding reads the real G-11/I-12 bindings from canonical state.
-        let mut reader = GovernorCanonicalState::new(Arc::clone(&snapshot));
+        let mut reader =
+            GovernorCanonicalState::new(Arc::clone(&snapshot), Vec::new());
         let canonical = reader
             .read(&request_for("session-a"), &binding)
             .expect("canonical");
@@ -1646,13 +1687,87 @@ mod tests {
         // Empty admission map: production behaviour is unchanged (unavailable).
         let mut bare = ControlBoard::new(
             Some(Box::new(GovernorAccessResolver::new(Arc::clone(&snapshot)))),
-            Some(Box::new(GovernorCanonicalState::new(snapshot))),
+            Some(Box::new(GovernorCanonicalState::new(
+                snapshot,
+                Vec::new(),
+            ))),
             None,
         );
         assert_eq!(
             bare.view(&request_for("session-a")),
             Err(ControlBoardError::PlanGap(RequiredProvider::AccessResolver))
         );
+    }
+
+    fn daemon_notification(key: &str, fence: StateFence) -> Notification {
+        Notification {
+            notification_id: eliot_platform::PlatformHandle::new(format!("notification-{key}"))
+                .expect("notification id"),
+            severity: eliot_kernel_core::NotificationSeverity::Critical,
+            subject: "subject".to_owned(),
+            summary: "summary".to_owned(),
+            evidence_handles: vec!["evidence-1".to_owned()],
+            affected_scope: "scope-1".to_owned(),
+            owner: "owner-1".to_owned(),
+            required_action: "review".to_owned(),
+            deadline_or_review: None,
+            dedup_key: key.to_owned(),
+            delivery_channels: vec![eliot_kernel_core::DeliveryChannel::ControlBoard],
+            occurrences: 1,
+            delivery: eliot_kernel_core::DeliveryState::Pending,
+            acknowledgement: None,
+            resolution_ref: None,
+            state_fence: fence,
+            revision: 1,
+        }
+    }
+
+    #[test]
+    fn prefetched_notifications_project_and_foreign_fence_fails_closed() {
+        let snapshot = Arc::new(snapshot());
+        // Pre-fetched canonical records at the snapshot fence flow into the
+        // board inbox section with metrics.
+        let stored = daemon_notification("disk-critical", fence());
+        let mut reader =
+            GovernorCanonicalState::new(Arc::clone(&snapshot), vec![stored.clone()]);
+        let canonical = reader
+            .read(&request_for("session-a"), &access_for("session-a", &[]))
+            .expect("canonical");
+        assert_eq!(canonical.notifications, vec![stored]);
+        let admitted = admitted_session("session-a");
+        let mut board = ControlBoard::new(
+            Some(Box::new(
+                GovernorAccessResolver::with_admitted_sessions(
+                    Arc::clone(&snapshot),
+                    vec![admitted],
+                )
+                .expect("admit"),
+            )),
+            Some(Box::new(GovernorCanonicalState::new(
+                Arc::clone(&snapshot),
+                vec![daemon_notification("disk-critical", fence())],
+            ))),
+            None,
+        );
+        let view = board.view(&request_for("session-a")).expect("view");
+        assert_eq!(view.notifications.rows.len(), 1);
+        assert_eq!(view.notifications.rows[0].dedup_key, "disk-critical");
+        assert_eq!(view.notifications.metrics.total, 1);
+        assert_eq!(view.notifications.metrics.unresolved, 1);
+        assert_eq!(view.notifications.metrics.critical_unresolved, 1);
+        // A record from another fence never enters this snapshot's board.
+        let foreign = daemon_notification(
+            "disk-critical",
+            StateFence::new(
+                test_epoch(1),
+                ResourceGeneration::new(6).expect("generation"),
+            ),
+        );
+        let mut foreign_reader = GovernorCanonicalState::new(Arc::clone(&snapshot), vec![foreign]);
+        assert!(matches!(
+            foreign_reader.read(&request_for("session-a"), &access_for("session-a", &[])),
+            Err(PortError::Invalid(_))
+        ));
     }
 
     #[test]
@@ -1732,7 +1847,12 @@ mod tests {
         assert_eq!(admitted.principal_id, "S-1-5-18");
         assert_eq!(admitted.role, Role::HumanSystemOwner);
         let mut board =
-            controlboard_over_snapshot(snapshot(), &SharedOperatorReplay::new(), vec![admitted]);
+            controlboard_over_snapshot(
+                snapshot(),
+                &SharedOperatorReplay::new(),
+                vec![admitted],
+                Vec::new()
+            );
         let view = board
             .view(&request_for("0"))
             .expect("live pinned owner view");
@@ -1757,7 +1877,12 @@ mod tests {
         ))
         .expect("owner admission from Kernel facts");
         let mut board =
-            controlboard_over_snapshot(snapshot(), &SharedOperatorReplay::new(), vec![admitted]);
+            controlboard_over_snapshot(
+                snapshot(),
+                &SharedOperatorReplay::new(),
+                vec![admitted],
+                Vec::new()
+            );
         assert_eq!(
             board.view(&request_for("1")),
             Err(ControlBoardError::PlanGap(RequiredProvider::AccessResolver))

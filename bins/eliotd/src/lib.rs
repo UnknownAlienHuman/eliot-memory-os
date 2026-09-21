@@ -692,6 +692,10 @@ impl DaemonComposition {
             snapshot,
             &self.operator_replay,
             admitted,
+            // #1780: the daemon does not yet read canonical notification
+            // state into its snapshot composition; the inbox section stays
+            // empty rather than fabricated until that read is wired.
+            Vec::new(),
         ))
     }
 

@@ -31,6 +31,7 @@ eliot-dreamer-rival-model = { path = "../../crates/smart/eliot-dreamer-rival-mod
 eliot-evaluation-contracts.workspace = true
 eliot-governor.workspace = true
 eliot-ipc.workspace = true
+eliot-kernel-core.workspace = true
 eliot-maintenance.workspace = true
 eliot-observability = { path = "../../crates/instrument/eliot-observability" }
 eliot-observation.workspace = true
