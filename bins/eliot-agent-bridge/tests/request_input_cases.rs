@@ -16,7 +16,7 @@ use std::collections::BTreeSet;
 const PROFILE_ID: &str = "eliot.agent-bridge.request-input.v1";
 
 /// Exact bounded rows: (limit name, expected numeric value).
-const BOUNDED_LIMITS: [(&str, u64); 9] = [
+const BOUNDED_LIMITS: [(&str, u64); 13] = [
     ("max_record_bytes", 1_048_576),
     ("max_buffered_bytes", 2_097_152),
     ("max_json_string_bytes", 524_288),
@@ -26,6 +26,10 @@ const BOUNDED_LIMITS: [(&str, u64); 9] = [
     ("max_requests_per_process", 65_536),
     ("max_consecutive_invalid_records", 8),
     ("max_oversize_discard_bytes", 4_194_304),
+    ("max_output_frame_bytes", 524_288),
+    ("max_stop_drain_items", 32),
+    ("max_control_name_chars", 64),
+    ("stdout_write_timeout_ms", 5_000),
 ];
 
 fn corpus() -> Value {
