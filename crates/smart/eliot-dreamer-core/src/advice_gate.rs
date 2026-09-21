@@ -336,6 +336,7 @@ fn normalise_statement(statement: &str) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod advice_gate_1924 {
     //! Issue #1924 acceptance proof (minimal by owner order): one test that a
     //! Dreamer proposal routes through candidate -> owner decision ->
