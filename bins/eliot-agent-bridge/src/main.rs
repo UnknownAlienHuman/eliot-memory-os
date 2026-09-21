@@ -544,7 +544,9 @@ fn main() {
                 }
             },
             Ok(Request::Invoke { request }) => {
-                handle_invocation(&host_gateway, &mut *host_request_port, &request)
+                let response = handle_invocation(&host_gateway, &mut *host_request_port, &request);
+                record_invocation_delivery(&mut runner, &response);
+                response
             }
             Ok(Request::Cancel { request }) => {
                 handle_cancellation(&host_gateway, &mut *host_request_port, &request)
@@ -758,6 +760,19 @@ fn handle_invocation<P: KernelHostRequestPort + ?Sized>(
             bootstrap: None,
         },
         Err(error) => host_gateway_error(&error),
+    }
+}
+
+/// Records one supported tool-result delivery after gateway return.
+///
+/// Runs on the normal Invoke path with the exact authenticated outcome the gateway
+/// produced. Auxiliary only: a `None` (admission, rejection, gap, unsupported kind,
+/// small inline content, detached runner, or full registry) changes nothing about the
+/// already-built response, which is forwarded exactly as the gateway shaped it.
+/// See [`BridgeRunner::record_tool_result_delivery`].
+fn record_invocation_delivery(runner: &mut BridgeRunner, response: &Response) {
+    if let Response::Invocation { result, .. } = response {
+        let _ = runner.record_tool_result_delivery(result.outcome());
     }
 }
 
@@ -2284,5 +2299,236 @@ mod tests {
             .get_understanding_bootstrap(&empty_tasks(), CurrentAssessment::Ready)
             .expect("explicit retrieval stays available");
         assert_eq!(explicit.governance.profile_ref, "governance-profile-1");
+    }
+
+    /// C3 production-path proof: supported Kernel read-result bytes reaching the normal
+    /// Invoke path populate the attach-scoped evidence registry through the real caller
+    /// chain (gateway → authenticated outcome → runner record), and the snapshot expands
+    /// back to the exact bytes. No manual publisher feed: the only producer here is the
+    /// stubbed trusted port standing in for the Kernel boundary, exactly as the
+    /// `UnavailableKernelHostRequestPort` placeholder does for rejections.
+    mod tool_result_delivery_tests {
+        use super::super::{
+            BridgeRunner, Profile, record_invocation_delivery, status_response,
+        };
+        use super::{
+            HostCancellationPortOutcome, HostInvocationRequest, PortFailure, decode_bounded_request,
+            handle_invocation,
+        };
+        use eliot_agent_bridge_core::{
+            ActivationPortOutcome, ActivationPortResult, AttachRequest, DemandId, FencingToken,
+            Generation, HostActivationPort, PrincipalId, ProviderFailure, ProviderReadiness,
+            SessionId, TaskId, WorkUnitId,
+        };
+        use eliot_contracts::{EpochId, EpochLineageId};
+        use eliot_mcp::{
+            HostInvocationPortOutcome, HostOperationHandle, KernelHostRequestPort, McpResponse,
+            ResponseKind,
+        };
+        use eliot_receipts::ProofCeiling;
+        use std::num::NonZeroU64;
+
+        const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+        const DIGEST_A: &str =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+        struct StaticActivation {
+            result: ActivationPortResult,
+        }
+
+        impl HostActivationPort for StaticActivation {
+            fn activate(
+                &mut self,
+                _request: &AttachRequest,
+            ) -> Result<ActivationPortOutcome, ProviderFailure> {
+                Ok(ActivationPortOutcome::Authenticated(self.result.clone()))
+            }
+        }
+
+        fn attached_runner() -> BridgeRunner {
+            let generation = Generation::new(5).expect("non-zero test generation");
+            let fence = FencingToken::new(
+                EpochId::new(
+                    EpochLineageId::new(TEST_LINEAGE).expect("valid test lineage"),
+                    NonZeroU64::new(2).expect("nonzero test sequence"),
+                )
+                .expect("valid test epoch"),
+                generation,
+                "fence-delivery-5",
+            )
+            .expect("valid test fence");
+            let result = ActivationPortResult::authenticated(
+                PrincipalId::new("principal-delivery-1").expect("valid principal"),
+                SessionId::new("session-delivery-1").expect("valid session"),
+                generation,
+                fence,
+                TaskId::new("task-delivery-1").expect("valid task"),
+                WorkUnitId::new("work-unit-delivery-1").expect("valid work unit"),
+                "scope-delivery-1",
+                "task-revision-1",
+                "plan-delivery-1",
+                "plan-revision-1",
+            )
+            .expect("valid activation result");
+            let mut runner = BridgeRunner::new(
+                Profile::SpineFunctional,
+                ProviderReadiness::all_admitted(),
+                Some(Box::new(StaticActivation { result })),
+                None,
+            )
+            .expect("runner composes");
+            runner
+                .attach(AttachRequest::managed(
+                    DemandId::new("demand-delivery-1").expect("valid demand"),
+                    super::super::ConnectionId::new("conn-delivery-1").expect("valid connection"),
+                ))
+                .expect("managed attach admits");
+            runner
+        }
+
+        fn projection_response(kind: ResponseKind, content: serde_json::Value) -> McpResponse {
+            McpResponse {
+                request_id: "req-delivery-1".to_owned(),
+                idempotency_key: "idem-delivery-1".to_owned(),
+                canonical_request_sha256: DIGEST_A.to_owned(),
+                kind,
+                canonical_tool_name: "eliot.state".to_owned(),
+                content,
+                artifacts: Vec::new(),
+                proof_ceiling: ProofCeiling::Observation,
+                resource: None,
+                job: None,
+            }
+        }
+
+        struct RespondedPort {
+            response: McpResponse,
+        }
+
+        impl KernelHostRequestPort for RespondedPort {
+            fn invoke(
+                &mut self,
+                _request: &HostInvocationRequest,
+            ) -> Result<HostInvocationPortOutcome, PortFailure> {
+                Ok(HostInvocationPortOutcome::Responded {
+                    operation_handle: HostOperationHandle::new("kernel-operation-9")
+                        .expect("valid handle"),
+                    response: Box::new(self.response.clone()),
+                })
+            }
+
+            fn cancel(
+                &mut self,
+                _request: &super::super::HostCancellationRequest,
+            ) -> Result<super::HostCancellationPortOutcome, PortFailure> {
+                Err(PortFailure::PlanGap {
+                    missing_capability: "test.responded-port.cancel".to_owned(),
+                    reason: "cancel not exercised".to_owned(),
+                })
+            }
+        }
+
+        fn invoke_request() -> HostInvocationRequest {
+            let decoded = decode_bounded_request(super::INVOKE).expect("invoke must decode");
+            match decoded {
+                super::Request::Invoke { request } => request,
+                _ => panic!("expected invoke"),
+            }
+        }
+
+        fn large_content() -> serde_json::Value {
+            serde_json::json!({"evidence": "x".repeat(4096)})
+        }
+
+        #[test]
+        fn large_supported_tool_result_populates_registry_and_expands() {
+            use eliot_agent_bridge::MAX_PREVIEW_BYTES;
+
+            let mut runner = attached_runner();
+            assert_eq!(runner.resource_registry_len(), 0);
+            let request = invoke_request();
+            let mut port = RespondedPort {
+                response: projection_response(ResponseKind::Projection, large_content()),
+            };
+            // Exact production order: gateway dispatch, then delivery recording.
+            let response = handle_invocation(&super::HostRequestGateway, &mut port, &request);
+            let super::Response::Invocation { result, .. } = &response else {
+                panic!("invoke must answer an invocation envelope");
+            };
+            assert_eq!(result.correlation_id().as_str(), "host-request-1");
+            record_invocation_delivery(&mut runner, &response);
+            // The response itself is forwarded exactly as the gateway shaped it.
+            let value = serde_json::to_value(&response).expect("response must serialize");
+            assert_eq!(
+                value["status"],
+                serde_json::Value::String("invocation".to_owned())
+            );
+            // The real caller path populated the registry with one snapshot.
+            assert_eq!(runner.resource_registry_len(), 1);
+            let stored = serde_json::to_vec(&large_content()).expect("content serializes");
+            assert!(stored.len() > MAX_PREVIEW_BYTES);
+            // Recording the same delivered bytes again rebinds the same handle:
+            // content-addressing is idempotent, never a second entry.
+            let again = runner
+                .record_tool_result_delivery(result.outcome())
+                .expect("re-record rebinds");
+            assert_eq!(runner.resource_registry_len(), 1);
+            // Expansion retrieves the exact delivered bytes behind a bounded preview.
+            assert!(again.preview().len() <= MAX_PREVIEW_BYTES);
+            assert!(again.is_truncated());
+            let expanded = runner
+                .expand_resource(again.handle())
+                .expect("expand resolves the issued handle");
+            assert_eq!(expanded, stored);
+            // Status projects the populated registry.
+            let status = status_response(Profile::SpineFunctional, &runner);
+            let status_value = serde_json::to_value(&status).expect("status must serialize");
+            assert_eq!(
+                status_value["resources"]["entries"],
+                serde_json::Value::from(1)
+            );
+        }
+
+        #[test]
+        fn unsupported_small_and_failed_tool_results_record_nothing() {
+            let mut runner = attached_runner();
+            let request = invoke_request();
+            // Unsupported kind carries no result semantics: nothing snapshotted.
+            let mut unsupported = RespondedPort {
+                response: projection_response(ResponseKind::Unsupported, large_content()),
+            };
+            let response =
+                handle_invocation(&super::HostRequestGateway, &mut unsupported, &request);
+            record_invocation_delivery(&mut runner, &response);
+            assert_eq!(runner.resource_registry_len(), 0);
+            // Small inline content stays fully visible: nothing withheld, nothing stored.
+            let mut small = RespondedPort {
+                response: projection_response(
+                    ResponseKind::Projection,
+                    serde_json::json!({"ok": true}),
+                ),
+            };
+            let response = handle_invocation(&super::HostRequestGateway, &mut small, &request);
+            record_invocation_delivery(&mut runner, &response);
+            assert_eq!(runner.resource_registry_len(), 0);
+            // Rejected invocations carry no result: the error envelope records nothing.
+            let mut unavailable = super::UnavailableKernelHostRequestPort;
+            let response =
+                handle_invocation(&super::HostRequestGateway, &mut unavailable, &request);
+            record_invocation_delivery(&mut runner, &response);
+            assert_eq!(runner.resource_registry_len(), 0);
+        }
+
+        #[test]
+        fn detached_runner_records_nothing() {
+            let mut runner = super::fixture_runner();
+            let request = invoke_request();
+            let mut port = RespondedPort {
+                response: projection_response(ResponseKind::Projection, large_content()),
+            };
+            let response = handle_invocation(&super::HostRequestGateway, &mut port, &request);
+            record_invocation_delivery(&mut runner, &response);
+            assert_eq!(runner.resource_registry_len(), 0);
+        }
     }
 }
