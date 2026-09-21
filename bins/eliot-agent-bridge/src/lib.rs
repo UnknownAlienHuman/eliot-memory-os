@@ -46,6 +46,7 @@ mod cli_contract;
 mod kernel_activation_client;
 mod kernel_host_request_client;
 pub mod reactive_injection_receipts;
+pub mod settled_plan_transport;
 mod understanding_bootstrap;
 pub(crate) use cli_contract::validate_client_declaration_path;
 pub use cli_contract::{CliConfig, CliError, Profile, Transport, parse_args};
@@ -60,6 +61,10 @@ pub use reactive_injection_receipts::{
     AdmissionBasis, AttentionItem, CueKind, DeliveryPoint, FiringEvidence, InjectionReceipt,
     ItemDisposition, NormalizedCue, REACTIVE_INJECTION_CONTRACT, ReactiveInjectionError,
     ReactiveInjectionLedger, RiskTier, Severity, UseOutcome,
+};
+pub use settled_plan_transport::{
+    AdmittedPlanItem, MAX_TRANSPORT_REPLAY_KEYS, PlanAdmissionError, PlanAdmissionReport,
+    SettledPlanAdmission, render_admission_fence,
 };
 pub use understanding_bootstrap::{
     AuthoritativeSelection, BootstrapContext, BootstrapError, BootstrapSession,

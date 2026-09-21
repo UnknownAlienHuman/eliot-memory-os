@@ -4,8 +4,8 @@ mod request_input;
 
 use eliot_agent_bridge::{
     BootstrapContext, BootstrapTaskInputs, BridgeRunner, CliError, CurrentAssessment,
-    InjectionReceipt, Profile, ScopeLevel, UnderstandingBootstrap, kernel_ports_with_declaration,
-    parse_args,
+    HotResourceView, InjectionReceipt, Profile, ScopeLevel, UnderstandingBootstrap,
+    kernel_ports_with_declaration, parse_args,
 };
 use eliot_agent_bridge_core::{
     AttachRequest, BridgeError, ConnectionId, FencingToken, Generation, HostEventEnvelope,
@@ -189,6 +189,16 @@ enum Response {
         completion: HostCorrelationReceipt,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         bootstrap: Option<UnderstandingBootstrap>,
+        /// Bounded hot-resource projection recorded for this delivery.
+        ///
+        /// Present only when the delivered result was snapshotted into the
+        /// attach-scoped evidence projection (supported kind with content
+        /// beyond the hot preview bound): the handle URI plus digest names
+        /// the immutable bytes, the preview carries the hot-visible prefix,
+        /// and full bytes require explicit expansion through the owning
+        /// reader. Absent otherwise — never estimated, never invented.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        evidence: Option<HotResourceView>,
     },
     Cancellation {
         result: HostCancellationResult,
@@ -544,8 +554,9 @@ fn main() {
                 }
             },
             Ok(Request::Invoke { request }) => {
-                let response = handle_invocation(&host_gateway, &mut *host_request_port, &request);
-                record_invocation_delivery(&mut runner, &response);
+                let mut response =
+                    handle_invocation(&host_gateway, &mut *host_request_port, &request);
+                record_invocation_delivery(&mut runner, &mut response);
                 response
             }
             Ok(Request::Cancel { request }) => {
@@ -758,21 +769,33 @@ fn handle_invocation<P: KernelHostRequestPort + ?Sized>(
             result,
             completion,
             bootstrap: None,
+            evidence: None,
         },
         Err(error) => host_gateway_error(&error),
     }
 }
 
-/// Records one supported tool-result delivery after gateway return.
+/// Records one supported tool-result delivery after gateway return and
+/// projects its handle onto the outgoing Invocation response.
 ///
 /// Runs on the normal Invoke path with the exact authenticated outcome the gateway
-/// produced. Auxiliary only: a `None` (admission, rejection, gap, unsupported kind,
-/// small inline content, detached runner, or full registry) changes nothing about the
-/// already-built response, which is forwarded exactly as the gateway shaped it.
+/// produced. The gateway-shaped result and completion are never touched: only the
+/// additive `evidence` slot is filled, and only when recording yields a snapshot
+/// (supported kind with content beyond the hot preview bound). Auxiliary only: a
+/// `None` (admission, rejection, gap, unsupported kind, small inline content,
+/// detached runner, or full registry) leaves the response exactly as the gateway
+/// shaped it, with the key absent on the wire.
 /// See [`BridgeRunner::record_tool_result_delivery`].
-fn record_invocation_delivery(runner: &mut BridgeRunner, response: &Response) {
-    if let Response::Invocation { result, .. } = response {
-        let _ = runner.record_tool_result_delivery(result.outcome());
+fn record_invocation_delivery(runner: &mut BridgeRunner, response: &mut Response) {
+    if let Response::Invocation {
+        result, evidence, ..
+    } = response
+    {
+        if evidence.is_none()
+            && let Some(view) = runner.record_tool_result_delivery(result.outcome())
+        {
+            *evidence = Some(view);
+        }
     }
 }
 
@@ -2312,7 +2335,7 @@ mod tests {
             BridgeRunner, Profile, record_invocation_delivery, status_response,
         };
         use super::{
-            HostCancellationPortOutcome, HostInvocationRequest, PortFailure, decode_bounded_request,
+            HostInvocationRequest, PortFailure, decode_bounded_request,
             handle_invocation,
         };
         use eliot_agent_bridge_core::{
@@ -2451,17 +2474,46 @@ mod tests {
                 response: projection_response(ResponseKind::Projection, large_content()),
             };
             // Exact production order: gateway dispatch, then delivery recording.
-            let response = handle_invocation(&super::HostRequestGateway, &mut port, &request);
-            let super::Response::Invocation { result, .. } = &response else {
+            let mut response = handle_invocation(&super::HostRequestGateway, &mut port, &request);
+            record_invocation_delivery(&mut runner, &mut response);
+            let super::Response::Invocation {
+                result, evidence, ..
+            } = &response
+            else {
                 panic!("invoke must answer an invocation envelope");
             };
             assert_eq!(result.correlation_id().as_str(), "host-request-1");
-            record_invocation_delivery(&mut runner, &response);
+            assert!(
+                evidence.is_some(),
+                "large supported delivery must carry its recorded view"
+            );
             // The response itself is forwarded exactly as the gateway shaped it.
             let value = serde_json::to_value(&response).expect("response must serialize");
             assert_eq!(
                 value["status"],
                 serde_json::Value::String("invocation".to_owned())
+            );
+            // The recorded handle rides the response: host-discoverable with
+            // its immutable URI, digest, and bounded preview.
+            let evidence = value
+                .get("evidence")
+                .expect("large supported delivery must project its handle");
+            let uri = evidence["handle"]["uri"]
+                .as_str()
+                .expect("handle must carry its canonical URI");
+            assert!(
+                uri.starts_with("eliot://evidence/"),
+                "evidence handle must be content-addressed, got {uri}"
+            );
+            let digest = evidence["handle"]["digest"]
+                .as_str()
+                .expect("handle must carry its content digest");
+            assert_eq!(digest.len(), 64);
+            assert!(
+                digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+                "handle digest must stay lowercase SHA-256 hex"
             );
             // The real caller path populated the registry with one snapshot.
             assert_eq!(runner.resource_registry_len(), 1);
@@ -2497,10 +2549,15 @@ mod tests {
             let mut unsupported = RespondedPort {
                 response: projection_response(ResponseKind::Unsupported, large_content()),
             };
-            let response =
+            let mut response =
                 handle_invocation(&super::HostRequestGateway, &mut unsupported, &request);
-            record_invocation_delivery(&mut runner, &response);
+            record_invocation_delivery(&mut runner, &mut response);
             assert_eq!(runner.resource_registry_len(), 0);
+            let value = serde_json::to_value(&response).expect("response must serialize");
+            assert!(
+                value.get("evidence").is_none(),
+                "unsupported delivery must not project a handle"
+            );
             // Small inline content stays fully visible: nothing withheld, nothing stored.
             let mut small = RespondedPort {
                 response: projection_response(
@@ -2508,14 +2565,19 @@ mod tests {
                     serde_json::json!({"ok": true}),
                 ),
             };
-            let response = handle_invocation(&super::HostRequestGateway, &mut small, &request);
-            record_invocation_delivery(&mut runner, &response);
+            let mut response = handle_invocation(&super::HostRequestGateway, &mut small, &request);
+            record_invocation_delivery(&mut runner, &mut response);
             assert_eq!(runner.resource_registry_len(), 0);
+            let value = serde_json::to_value(&response).expect("response must serialize");
+            assert!(
+                value.get("evidence").is_none(),
+                "small inline delivery must not project a handle"
+            );
             // Rejected invocations carry no result: the error envelope records nothing.
             let mut unavailable = super::UnavailableKernelHostRequestPort;
-            let response =
+            let mut response =
                 handle_invocation(&super::HostRequestGateway, &mut unavailable, &request);
-            record_invocation_delivery(&mut runner, &response);
+            record_invocation_delivery(&mut runner, &mut response);
             assert_eq!(runner.resource_registry_len(), 0);
         }
 
@@ -2526,9 +2588,14 @@ mod tests {
             let mut port = RespondedPort {
                 response: projection_response(ResponseKind::Projection, large_content()),
             };
-            let response = handle_invocation(&super::HostRequestGateway, &mut port, &request);
-            record_invocation_delivery(&mut runner, &response);
+            let mut response = handle_invocation(&super::HostRequestGateway, &mut port, &request);
+            record_invocation_delivery(&mut runner, &mut response);
             assert_eq!(runner.resource_registry_len(), 0);
+            let value = serde_json::to_value(&response).expect("response must serialize");
+            assert!(
+                value.get("evidence").is_none(),
+                "detached recording must not project a handle"
+            );
         }
     }
 }

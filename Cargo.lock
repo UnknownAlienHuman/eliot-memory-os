@@ -642,6 +642,7 @@ dependencies = [
  "eliot-mcp",
  "eliot-platform-windows",
  "eliot-protocol",
+ "eliot-reactive-context-plan",
  "eliot-receipts",
  "eliot-runtime",
  "eliot-runtime-contracts",

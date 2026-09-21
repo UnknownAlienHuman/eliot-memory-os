@@ -25,6 +25,7 @@ eliot-ipc.workspace = true
 eliot-mcp.workspace = true
 eliot-platform-windows.workspace = true
 eliot-protocol.workspace = true
+eliot-reactive-context-plan = { path = "../../crates/smart/eliot-reactive-context-plan" }
 eliot-receipts.workspace = true
 eliot-runtime.workspace = true
 serde.workspace = true
