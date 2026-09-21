@@ -30,11 +30,12 @@ use eliot_protocol::{
     ProtocolVersion, ServerHello,
 };
 use eliot_store_api::{
-    CAPABILITIES, CanonicalStoreClient, CanonicalValidationSnapshot, EFFECTS, ExactJsonBytes,
-    NamedReadRequest, NamedReadResponse, OperationId, OrderingHead, OrderingHeadExpectation,
-    OrderingScopeId, PreparedTransition, RequestMeta, ReservedWriteRequest, RevisionHead,
-    RevisionHeadExpectation, RevisionKey, StoreError, StoreHealth, WriteReceipt,
-    decode_request_frame_with_authority, generated_operation_manifests, genesis_manifest,
+    CAPABILITIES, CanonicalRequestView, CanonicalStoreClient, CanonicalValidationSnapshot, EFFECTS,
+    ExactJsonBytes, NamedReadRequest, NamedReadResponse, OperationId, OrderingHead,
+    OrderingHeadExpectation, OrderingScopeId, PreparedTransition, RequestMeta,
+    ReservedWriteRequest, RevisionHead, RevisionHeadExpectation, RevisionKey, StoreError,
+    StoreHealth, WriteReceipt, decode_request_frame_with_authority, generated_operation_manifests,
+    genesis_manifest, verify_canonical_request_hash,
 };
 pub use eliot_store_api::{
     ReadinessReceipt, ReadinessStatus, StoreRequest as Request, StoreResponse as Response,
@@ -182,6 +183,52 @@ pub fn store_bootstrap_descriptor(
         approved_config_hash: handle(&config.approved_config_hash, "Store config digest")?,
         timeout_ms: config.connect_timeout_ms,
     })
+}
+
+/// Deterministic `PreparedTransition` admission before store execution (1927).
+///
+/// The store bridge executes only named operations and cannot invent or
+/// reinterpret semantic transitions: identity/shape validation, fence
+/// equality, canonical request-hash recompute over the exact executable
+/// bytes, and operation-manifest support against the currently admitted
+/// catalogue all run before any provider I/O. A plan whose contents, effect
+/// ceiling, named operation parameters, or admission digest changed after
+/// staging fails the hash recompute rather than executing. A plan whose
+/// recorded manifest is not in the current catalogue fails closed with the
+/// typed manifest refusal; the error surfaces as visible recovery work
+/// through the typed `StoreFailure` mapping and the plan is never widened,
+/// translated, or given extra commands. A staged transition therefore
+/// survives daemon replacement only when the replacement store bridge
+/// explicitly supports its recorded contract digest and operation manifest.
+fn admit_prepared_for_execution(
+    context: &RequestMeta,
+    transition: &PreparedTransition,
+    expected_revision_heads: &[RevisionHeadExpectation],
+    expected_ordering_heads: &[OrderingHeadExpectation],
+) -> Result<(), StoreCompositionError> {
+    context
+        .validate()
+        .map_err(StoreError::Foundation)
+        .map_err(StoreCompositionError::Store)?;
+    transition
+        .validate()
+        .map_err(StoreCompositionError::Store)?;
+    if context.state_fence != transition.state_fence {
+        return Err(StoreCompositionError::Store(StoreError::FenceMismatch));
+    }
+    let view = CanonicalRequestView::from_apply(
+        context,
+        transition,
+        expected_revision_heads,
+        expected_ordering_heads,
+    );
+    verify_canonical_request_hash(&view, &transition.identity.canonical_request_hash)
+        .map_err(StoreCompositionError::Store)?;
+    let entries = generated_operation_manifests().map_err(StoreCompositionError::Store)?;
+    transition
+        .validate_against_catalogue(&entries)
+        .map_err(StoreCompositionError::Store)?;
+    Ok(())
 }
 
 /// Canonical store composition. All provider authority is held by the one
@@ -426,20 +473,12 @@ impl StoreComposition {
         expected_ordering_heads: Vec<OrderingHeadExpectation>,
         authorities: &[Option<ExactJsonBytes>],
     ) -> Result<WriteReceipt, StoreCompositionError> {
-        context
-            .validate()
-            .map_err(StoreError::Foundation)
-            .map_err(StoreCompositionError::Store)?;
-        transition
-            .validate()
-            .map_err(StoreCompositionError::Store)?;
-        if context.state_fence != transition.state_fence {
-            return Err(StoreCompositionError::Store(StoreError::FenceMismatch));
-        }
-        let entries = generated_operation_manifests().map_err(StoreCompositionError::Store)?;
-        transition
-            .validate_against_catalogue(&entries)
-            .map_err(StoreCompositionError::Store)?;
+        admit_prepared_for_execution(
+            context,
+            &transition,
+            &expected_revision_heads,
+            &expected_ordering_heads,
+        )?;
         self.store
             .apply_prepared_with_authority(
                 context,
@@ -843,6 +882,108 @@ mod tests {
             state_fence,
             clock: ClockReading::default(),
         }
+    }
+
+    #[test]
+    fn prepared_admission_rejects_tampered_and_unsupported_plans_before_execution() {
+        // 1927 acceptance: changing the plan contents, effect ceiling, named
+        // operation parameters, or admission digest after staging causes
+        // rejection rather than execution; an unsupported recorded plan is
+        // refused as visible recovery work and is never reinterpreted,
+        // widened, or given extra commands.
+        use std::collections::BTreeMap;
+
+        use eliot_store_api::{
+            EffectClass, EventProjectionRelationIntents, NamedMutationOperation,
+            NamedMutationRequest, OperationIdentity, OperationManifestDigest, OrderingScopeId,
+            ScopeId, SecurityContext, TransitionClass, canonical_request_hash,
+            operation_manifest_set_digest,
+        };
+
+        let fence = StateFence::new(test_epoch(1), ResourceGeneration::genesis());
+        let context = request_meta(fence.clone());
+        let entries = generated_operation_manifests().expect("catalogue");
+        let set_digest = operation_manifest_set_digest(&entries).expect("set digest");
+        let mut transition = PreparedTransition {
+            identity: OperationIdentity {
+                operation_id: OperationId::new("op-1927-bridge-1").expect("operation id"),
+                idempotency_key: "idem-1927-bridge-1".to_owned(),
+                canonical_request_hash: "0".repeat(64),
+            },
+            state_fence: fence,
+            scope_id: ScopeId::new("scope-1927-b").expect("scope"),
+            task_id: None,
+            ordering_scopes: vec![OrderingScopeId::new("scope-1927-b").expect("ordering scope")],
+            transition_class: TransitionClass::CaptureCandidate,
+            requested_effect_ceiling: EffectClass::Candidate,
+            admission_contract_set_digest: "b".repeat(64),
+            operation_manifest_digest: set_digest,
+            named_operations: vec![NamedMutationRequest {
+                operation: NamedMutationOperation::CaptureObservation,
+                parameters: BTreeMap::from([(
+                    "subject".to_owned(),
+                    serde_json::json!("observation-1927-b"),
+                )]),
+            }],
+            event_projection_relation_intents: EventProjectionRelationIntents {
+                event_ids: Vec::new(),
+                projection_kinds: Vec::new(),
+                relation_kinds: Vec::new(),
+            },
+            security: SecurityContext::default(),
+            required_proof_and_approval_refs: Vec::new(),
+        };
+        transition.identity.canonical_request_hash = canonical_request_hash(
+            &CanonicalRequestView::from_apply(&context, &transition, &[], &[]),
+        )
+        .expect("admission hash");
+        admit_prepared_for_execution(&context, &transition, &[], &[]).expect("admitted plan");
+
+        let mut widened = transition.clone();
+        widened.requested_effect_ceiling = EffectClass::ReversibleMutation;
+        assert!(
+            admit_prepared_for_execution(&context, &widened, &[], &[]).is_err(),
+            "widened effect ceiling must not execute"
+        );
+
+        let mut reparam = transition.clone();
+        reparam.named_operations[0].parameters.insert(
+            "subject".to_owned(),
+            serde_json::json!("observation-substituted"),
+        );
+        assert!(
+            admit_prepared_for_execution(&context, &reparam, &[], &[]).is_err(),
+            "mutated named-operation parameters must not execute"
+        );
+
+        let mut redigest = transition.clone();
+        redigest.admission_contract_set_digest = "d".repeat(64);
+        assert!(
+            admit_prepared_for_execution(&context, &redigest, &[], &[]).is_err(),
+            "mutated admission digest must not execute"
+        );
+        let mut unsupported = transition.clone();
+        unsupported.operation_manifest_digest =
+            OperationManifestDigest::new("f".repeat(64)).expect("digest shape");
+        unsupported.identity.canonical_request_hash = canonical_request_hash(
+            &CanonicalRequestView::from_apply(&context, &unsupported, &[], &[]),
+        )
+        .expect("recomputed hash");
+        let error = match admit_prepared_for_execution(&context, &unsupported, &[], &[]) {
+            Err(error) => error,
+            Ok(()) => unreachable!("unsupported manifest must not execute"),
+        };
+        assert!(
+            matches!(
+                error,
+                StoreCompositionError::Store(
+                    eliot_store_api::StoreError::ManifestMismatch
+                        | eliot_store_api::StoreError::UnknownOperation
+                        | eliot_store_api::StoreError::TransitionClassExceeded
+                )
+            ),
+            "unsupported plan must fail with a typed manifest refusal, got: {error:?}"
+        );
     }
 
     fn runtime_state_roots() -> RuntimeStateRoots {

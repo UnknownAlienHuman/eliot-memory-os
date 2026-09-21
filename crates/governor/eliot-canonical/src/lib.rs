@@ -34,6 +34,7 @@ pub use contract_rejection::{
     collect_contract_errors, derive_rejection_id,
 };
 pub mod epistemic_revision;
+pub mod write_envelope;
 
 /// Stable identity of this Governor contract surface.
 pub const CONTRACT_NAME: &str = "eliot.governor.canonical";

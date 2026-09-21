@@ -82,6 +82,86 @@ impl SessionRole {
     }
 }
 
+/// Checked-out versus available sessions for one admission role.
+///
+/// Point observation for S-CONC-ACCEPT capacity and protected-progress
+/// evidence (issue #2030, 994/14): `total` is the role's fixed construction
+/// slot count (never a sum of two racing reads), so a saturated normal lane
+/// (`available == 0`) is distinguishable from a live protected lane
+/// without touching a socket.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RoleOccupancy {
+    /// Fixed slot count bound at pool construction.
+    pub total: usize,
+    /// Currently checked-out sessions.
+    pub checked_out: usize,
+    /// Free permits not held by any checkout.
+    pub available: usize,
+}
+
+impl RoleOccupancy {
+    /// Whether the role currently sheds non-blocking admission.
+    #[must_use]
+    pub const fn saturated(self) -> bool {
+        self.available == 0
+    }
+}
+
+/// Whole-pool occupancy snapshot across the three fixed roles.
+///
+/// Production admission evidence (issue #2030, 994/14): bounded capacity is
+/// observable without checking anything out, and the protected
+/// health/admin lane stays independently observable while normal lanes
+/// saturate, so recovery/reconciliation progress never hides behind
+/// workload exhaustion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PoolOccupancy {
+    /// Named-read lane occupancy.
+    pub read: RoleOccupancy,
+    /// Normal-write lane occupancy.
+    pub normal_write: RoleOccupancy,
+    /// Protected health/admin lane occupancy.
+    pub health_admin: RoleOccupancy,
+}
+
+impl PoolOccupancy {
+    /// Occupancy for one role.
+    #[must_use]
+    pub const fn for_role(self, role: SessionRole) -> RoleOccupancy {
+        match role {
+            SessionRole::Read => self.read,
+            SessionRole::NormalWrite => self.normal_write,
+            SessionRole::HealthAdmin => self.health_admin,
+        }
+    }
+}
+
+/// Non-blocking admission verdict for one role (issue #2030, 994/14).
+///
+/// Point observation, not a reservation: `Admitted` reports the permits
+/// free at observation time for callers that must shed load instead of
+/// queueing behind a lane. A saturated verdict never blocks and never
+/// borrows capacity from another role — in particular, normal-lane
+/// exhaustion never consumes the protected health/admin lane.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PoolAdmission {
+    /// The role has free permits at observation time.
+    Admitted {
+        /// Free permits observed.
+        available: usize,
+    },
+    /// The role is exhausted at observation time; shed instead of queueing.
+    ShedExhausted,
+}
+
+impl PoolAdmission {
+    /// Whether the role may be entered without queueing.
+    #[must_use]
+    pub const fn admitted(self) -> bool {
+        matches!(self, Self::Admitted { .. })
+    }
+}
+
 #[cfg(test)]
 impl fmt::Display for SessionRole {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -107,7 +187,10 @@ impl SessionSlot {
 /// Per-role bounded allocation state. The semaphore owns the bound (exactly
 /// one permit per slot); the free list owns slot identity; the counter owns
 /// exact checked-out evidence. All three move together under the permit.
+/// `slots` is the fixed construction bound and the only source of the
+/// occupancy total: the total is never a sum of two racing reads.
 struct RoleState {
+    slots: usize,
     semaphore: Arc<Semaphore>,
     free: Mutex<VecDeque<usize>>,
     checked_out: AtomicUsize,
@@ -116,9 +199,22 @@ struct RoleState {
 impl RoleState {
     fn new(slot_count: usize) -> Self {
         Self {
+            slots: slot_count,
             semaphore: Arc::new(Semaphore::new(slot_count)),
             free: Mutex::new((0..slot_count).collect()),
             checked_out: AtomicUsize::new(0),
+        }
+    }
+
+    /// Point occupancy snapshot (issue #2030 rework): the total is the fixed
+    /// construction bound, so concurrent checkout/release can never skew it
+    /// through two unsynchronized reads. `checked_out` and `available`
+    /// remain point observations.
+    fn occupancy(&self) -> RoleOccupancy {
+        RoleOccupancy {
+            total: self.slots,
+            checked_out: self.checked_out.load(Ordering::SeqCst),
+            available: self.semaphore.available_permits(),
         }
     }
 }
@@ -157,9 +253,31 @@ impl fmt::Debug for PoolInner {
 ///
 /// Clone shares the same generation, slots, and bounds: there is still one
 /// pool, never a second provider process.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct SessionPool {
     inner: Arc<PoolInner>,
+}
+
+impl fmt::Debug for SessionPool {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Redacted by construction: the snapshot carries counts only — no
+        // operation identity, scope name, credential, or payload.
+        let occupancy = self.occupancy();
+        formatter
+            .debug_struct("SessionPool")
+            .field("owner", &self.inner.owner)
+            .field("slots", &self.inner.slots.len())
+            .field("read", &occupancy.for_role(SessionRole::Read))
+            .field(
+                "normal_write",
+                &occupancy.for_role(SessionRole::NormalWrite),
+            )
+            .field(
+                "health_admin",
+                &occupancy.for_role(SessionRole::HealthAdmin),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl SessionPool {
@@ -196,13 +314,14 @@ impl SessionPool {
         }
     }
 
-    /// Fixed slot count for `role`: free permits plus checked-out sessions.
+    /// Fixed slot count for `role`: the construction bound, never a sum of
+    /// two racing reads (issue #2030 rework).
     /// Test/diagnostic evidence only; the scheduler child (#988) and runtime
     /// integration (#993) promote this to production use.
     #[cfg(test)]
     #[must_use]
     pub fn slot_count(&self, role: SessionRole) -> usize {
-        self.available(role) + self.checked_out(role)
+        self.inner.roles[role.index()].slots
     }
 
     /// Currently checked-out sessions for `role`. Exact counter evidence for
@@ -222,6 +341,49 @@ impl SessionPool {
     #[must_use]
     pub fn available(&self, role: SessionRole) -> usize {
         self.inner.roles[role.index()].semaphore.available_permits()
+    }
+
+    /// Whole-pool occupancy snapshot across the three fixed roles (issue
+    /// #2030, 994/14).
+    ///
+    /// Point observation for bounded-capacity and protected-progress
+    /// evidence: per-role `total` is the fixed construction-bound slot
+    /// count, and the protected health/admin lane is reported
+    /// independently of normal-lane saturation. Observing never checks
+    /// anything out and never waits.
+    #[must_use]
+    pub fn occupancy(&self) -> PoolOccupancy {
+        PoolOccupancy {
+            read: self.role_occupancy(SessionRole::Read),
+            normal_write: self.role_occupancy(SessionRole::NormalWrite),
+            health_admin: self.role_occupancy(SessionRole::HealthAdmin),
+        }
+    }
+
+    /// Non-blocking admission verdict for `role` (issue #2030, 994/14).
+    ///
+    /// Callers that must shed load instead of queueing behind a lane use
+    /// this entrypoint; [`SessionPool::try_checkout`] is the matching
+    /// non-blocking checkout. A saturated verdict never borrows capacity
+    /// from another role.
+    #[must_use]
+    pub fn admission(&self, role: SessionRole) -> PoolAdmission {
+        let lane = self.role_occupancy(role);
+        if lane.saturated() {
+            PoolAdmission::ShedExhausted
+        } else {
+            PoolAdmission::Admitted {
+                available: lane.available,
+            }
+        }
+    }
+
+    /// Occupancy for one role: the total is the fixed construction bound
+    /// (issue #2030 rework) under a shared snapshot — never
+    /// `checked_out + available`, which races across two unsynchronized
+    /// reads under concurrent checkout/release.
+    fn role_occupancy(&self, role: SessionRole) -> RoleOccupancy {
+        self.inner.roles[role.index()].occupancy()
     }
 
     /// Checks out one session of `role`, connecting its slot on first use.
@@ -309,8 +471,15 @@ impl SessionPool {
     /// name and bindings, never a provider client or query string.
     ///
     /// A non-blocking fast path reuses a free connected slot without
-    /// touching the semaphore queue; otherwise checkout waits for the next
-    /// free slot of the role.
+    /// touching the semaphore queue. A saturated lane sheds here with
+    /// backpressure instead of queueing (A13.5, issue #2030 rework):
+    /// `checkout` would wait for the next free slot, but `query` refuses
+    /// deterministically with `ProviderUnavailable` (boundary: `Unavailable`)
+    /// so saturated normal workload cannot pile up behind a lane. Only an
+    /// admitted-but-cold lane warms one slot through the blocking checkout.
+    /// A failed non-blocking attempt re-checks admission first (issue #2030
+    /// rework2030b): the entry verdict can lose the last permit to a racer,
+    /// so a now-saturated lane sheds instead of blocking behind it.
     pub async fn query(
         &self,
         role: SessionRole,
@@ -318,8 +487,23 @@ impl SessionPool {
         statement: &str,
         bindings: Map<String, Value>,
     ) -> Result<RpcResults, AdapterError> {
+        // A13.5 backpressure: a saturated lane sheds here instead of queueing
+        // behind it. Only admitted-but-cold slots fall through to the warming
+        // checkout below.
+        if !self.admission(role).admitted() {
+            return Err(AdapterError::ProviderUnavailable);
+        }
         if let Some(session) = self.try_checkout(role) {
             return session.query(operation, statement, bindings).await;
+        }
+        // Rework2030b: the entry admission verdict is a point observation,
+        // not a reservation — a racer can take the last permit before the
+        // non-blocking attempt runs. Re-check admission instead of falling
+        // through to the blocking checkout: a now-saturated lane sheds with
+        // backpressure, and only a still-admitted (cold) lane warms one slot
+        // through the blocking checkout below.
+        if !self.admission(role).admitted() {
+            return Err(AdapterError::ProviderUnavailable);
         }
         let session = self.checkout(role).await?;
         session.query(operation, statement, bindings).await
@@ -611,31 +795,67 @@ mod pool_behavior_tests {
             // open, which fails fixture deletion with a sharing violation.
             // Owned values drop at scope end (not at last use), so say the
             // drops explicitly at each call site.
+            self.cleanup_result()
+                .await
+                .expect("isolated fixture cleanup failed");
+        }
+
+        /// Non-panicking fixture cleanup (issue #2030, 994/18; rework: retain
+        /// every stage outcome).
+        ///
+        /// Stops and reaps the exact owned provider child, then removes
+        /// the isolated root, attempting every stage and returning the
+        /// combined failures instead of panicking, so callers retain both
+        /// their primary outcome and the complete cleanup outcome.
+        /// See [`remove_fixture_result`].
+        async fn cleanup_result(&mut self) -> Result<(), String> {
+            // Issue #2030 rework: every stage is attempted and every failure
+            // retained — kill, reap, and root removal each run even when an
+            // earlier stage fails, and the combined evidence is returned
+            // instead of dropping later outcomes at the first early return.
+            let mut failures: Vec<String> = Vec::new();
             if let Some(adapter) = self.adapter.take()
                 && let Some(Ok(transport)) = adapter.client.get()
             {
                 let mut child = transport.provider.provider_child.lock().await;
-                child.kill().await.expect("stop exact child");
-                child.wait().await.expect("reap exact child");
-            }
-            remove_fixture(&self.root).await;
-        }
-    }
-
-    async fn remove_fixture(root: &Path) {
-        // Windows can keep an exiting image mapped briefly after its process
-        // becomes unqueryable. A failed delete is not proof of resource release.
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            match std::fs::remove_dir_all(root) {
-                Ok(()) => return,
-                Err(error)
-                    if matches!(error.raw_os_error(), Some(5 | 32))
-                        && Instant::now() < deadline =>
-                {
-                    sleep(Duration::from_millis(20)).await;
+                if let Err(error) = child.kill().await {
+                    failures.push(format!("stop exact child: {error}"));
                 }
-                Err(error) => panic!("isolated fixture cleanup failed: {error}"),
+                if let Err(error) = child.wait().await {
+                    failures.push(format!("reap exact child: {error}"));
+                }
+            }
+            if let Err(error) = Self::remove_fixture_result(&self.root).await {
+                failures.push(error);
+            }
+            if failures.is_empty() {
+                Ok(())
+            } else {
+                Err(failures.join("; "))
+            }
+        }
+
+        /// Non-panicking isolated-root removal with bounded
+        /// sharing-violation retry: Windows can keep an exiting image
+        /// mapped briefly after its process becomes unqueryable, so a
+        /// failed delete retries instead of failing the cleanup.
+        async fn remove_fixture_result(root: &Path) -> Result<(), String> {
+            // Windows can keep an exiting image mapped briefly after its process
+            // becomes unqueryable. A failed delete is not proof of resource release.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                match std::fs::remove_dir_all(root) {
+                    Ok(()) => return Ok(()),
+                    Err(error)
+                        if matches!(error.raw_os_error(), Some(5 | 32))
+                            && Instant::now() < deadline =>
+                    {
+                        sleep(Duration::from_millis(20)).await;
+                    }
+                    Err(error) => {
+                        return Err(format!("isolated fixture cleanup failed: {error}"));
+                    }
+                }
             }
         }
     }
@@ -758,6 +978,116 @@ mod pool_behavior_tests {
         let after = pool.provider().provider_process_identity.clone();
         assert_eq!(before, after);
         // Release the owner before teardown (see `cleanup` discipline).
+        drop(pool);
+        h.cleanup().await;
+    }
+
+    // WORK_UNIT_CASE: 2030/rework — saturated query sheds instead of queueing
+    // (A13.5 backpressure): holding the only read slot saturates the lane, so
+    // query refuses fast with ProviderUnavailable rather than waiting behind
+    // it for the next free slot.
+    #[tokio::test]
+    async fn saturated_query_sheds_instead_of_queueing_behind_the_lane() {
+        let mut h = PoolHarness::provision().await;
+        h.start(ClientSetLimits::new(1, 1, 1).expect("valid limits"))
+            .await;
+        let pool = h.transport().session_pool().clone();
+        let held = pool
+            .checkout(SessionRole::Read)
+            .await
+            .expect("single read slot");
+        assert_eq!(
+            pool.admission(SessionRole::Read),
+            PoolAdmission::ShedExhausted,
+            "held single slot saturates the read lane"
+        );
+        let verdict = tokio::time::timeout(
+            Duration::from_secs(10),
+            pool.query(
+                SessionRole::Read,
+                "proof.2030.shed",
+                "RETURN 1;",
+                Map::new(),
+            ),
+        )
+        .await
+        .expect("saturated query must not block behind the lane");
+        assert!(
+            matches!(verdict, Err(AdapterError::ProviderUnavailable)),
+            "saturated query sheds with backpressure instead of queueing"
+        );
+        // Release the owner before teardown (see cleanup discipline).
+        drop(held);
+        drop(pool);
+        h.cleanup().await;
+    }
+
+    // WORK_UNIT_CASE: 2030b — an admitted observation can lose the last
+    // permit to a racer before try_checkout runs: the losers must shed fast
+    // with ProviderUnavailable instead of queueing behind the lane in the
+    // blocking checkout. Eight barrier-synced queries against one warm slot
+    // admit exactly one winner; every loser re-checks a still-held
+    // (saturated) lane and sheds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn admitted_query_losing_permit_race_sheds_without_blocking() {
+        const WORKERS: usize = 8;
+        let mut h = PoolHarness::provision().await;
+        h.start(ClientSetLimits::new(1, 1, 1).expect("valid limits"))
+            .await;
+        let pool = h.transport().session_pool().clone();
+        // Warm the single read slot so a failed try_checkout means "lost the
+        // permit race", never "cold slot".
+        let warmed = pool
+            .checkout(SessionRole::Read)
+            .await
+            .expect("warm single slot");
+        drop(warmed);
+        assert!(
+            pool.admission(SessionRole::Read).admitted(),
+            "warmed single slot idles admitted"
+        );
+        let barrier = Arc::new(tokio::sync::Barrier::new(WORKERS + 1));
+        let mut handles = Vec::new();
+        for _ in 0..WORKERS {
+            let task_pool = pool.clone();
+            let gate = barrier.clone();
+            handles.push(tokio::spawn(async move {
+                gate.wait().await;
+                task_pool
+                    .query(
+                        SessionRole::Read,
+                        "proof.2030b.race",
+                        "RETURN 1;",
+                        Map::new(),
+                    )
+                    .await
+            }));
+        }
+        barrier.wait().await;
+        let mut successes = 0usize;
+        let mut sheds = 0usize;
+        let mut unexpected = Vec::new();
+        for handle in handles {
+            let outcome = tokio::time::timeout(Duration::from_secs(30), handle)
+                .await
+                .expect("raced query must not block behind the lane")
+                .expect("query task joins");
+            match outcome {
+                Ok(_) => successes += 1,
+                Err(AdapterError::ProviderUnavailable) => sheds += 1,
+                Err(error) => unexpected.push(format!("{error:?}")),
+            }
+        }
+        assert!(
+            unexpected.is_empty(),
+            "raced queries failed unexpectedly: {unexpected:?}"
+        );
+        assert!(successes >= 1, "one racer wins the single slot");
+        assert!(
+            sheds >= 1,
+            "permit-race losers shed instead of queueing behind the lane"
+        );
+        // Release the owner before teardown (see cleanup discipline).
         drop(pool);
         h.cleanup().await;
     }
@@ -964,5 +1294,135 @@ mod pool_behavior_tests {
         assert_eq!(profile.write_sessions(), 1);
         assert_eq!(profile.admin_sessions(), 1);
         assert_eq!(profile.total_sessions(), 3);
+    }
+}
+
+#[cfg(test)]
+mod occupancy_contract_tests {
+    #![allow(clippy::expect_used)]
+
+    use super::*;
+
+    fn occupancy(
+        read: (usize, usize, usize),
+        write: (usize, usize, usize),
+        admin: (usize, usize, usize),
+    ) -> PoolOccupancy {
+        let role = |(total, checked_out, available)| RoleOccupancy {
+            total,
+            checked_out,
+            available,
+        };
+        PoolOccupancy {
+            read: role(read),
+            normal_write: role(write),
+            health_admin: role(admin),
+        }
+    }
+
+    // WORK_UNIT_CASE: 2030/3 — occupancy capacity admission (994/14).
+    #[test]
+    fn occupancy_snapshot_preserves_fixed_capacity_invariant() {
+        // `checked_out + available` is the fixed slot count per role: the
+        // snapshot distinguishes a saturated lane from a live one without
+        // touching a socket.
+        let snapshot = occupancy((2, 2, 0), (2, 1, 1), (1, 0, 1));
+        for role in SessionRole::ALL {
+            let lane = snapshot.for_role(role);
+            assert_eq!(
+                lane.total,
+                lane.checked_out + lane.available,
+                "role {role:?} must preserve its fixed capacity"
+            );
+        }
+        assert!(snapshot.for_role(SessionRole::Read).saturated());
+        assert!(!snapshot.for_role(SessionRole::NormalWrite).saturated());
+        assert!(!snapshot.for_role(SessionRole::HealthAdmin).saturated());
+        let drained = occupancy((1, 0, 1), (1, 0, 1), (1, 0, 1));
+        for role in SessionRole::ALL {
+            assert!(!drained.for_role(role).saturated());
+        }
+    }
+
+    // WORK_UNIT_CASE: 2030/4 — protected lane survives normal saturation (994/14).
+    #[test]
+    fn protected_lane_stays_admitted_while_normal_lanes_saturate() {
+        // Control Reserve: normal-workload exhaustion never consumes the
+        // protected health/admin lane, so recovery/reconciliation progress
+        // stays observable while normal admission sheds.
+        let snapshot = occupancy((2, 2, 0), (2, 2, 0), (1, 0, 1));
+        assert!(snapshot.for_role(SessionRole::Read).saturated());
+        assert!(snapshot.for_role(SessionRole::NormalWrite).saturated());
+        assert!(
+            !snapshot.for_role(SessionRole::HealthAdmin).saturated(),
+            "protected lane must stay admitted under normal saturation"
+        );
+    }
+
+    // WORK_UNIT_CASE: 2030/5 — admission verdicts shed without borrowing (994/14).
+    #[test]
+    fn admission_verdicts_shed_without_borrowing_across_roles() {
+        assert!(PoolAdmission::Admitted { available: 2 }.admitted());
+        assert!(!PoolAdmission::ShedExhausted.admitted());
+        // A saturated verdict carries no capacity from another role: the
+        // verdict is per-role and non-blocking by construction.
+        let shed = PoolAdmission::ShedExhausted;
+        assert_eq!(shed, PoolAdmission::ShedExhausted);
+    }
+    // WORK_UNIT_CASE: 2030/rework — occupancy total is the fixed slot count
+    // under concurrent checkout/release (994/14 rework): the total comes
+    // from the construction bound under a shared snapshot, never from two
+    // unsynchronized reads, so contention cannot skew it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn occupancy_total_stays_fixed_under_concurrent_checkout() {
+        const SLOTS: usize = 3;
+        const WORKERS: usize = 6;
+        const ROUNDS: usize = 25;
+        let state = Arc::new(RoleState::new(SLOTS));
+        let barrier = Arc::new(tokio::sync::Barrier::new(WORKERS + 1));
+        let mut handles = Vec::new();
+        for _ in 0..WORKERS {
+            let worker = state.clone();
+            let gate = barrier.clone();
+            handles.push(tokio::spawn(async move {
+                gate.wait().await;
+                for _ in 0..ROUNDS {
+                    // Checkout mimic: permit, slot identity, and the
+                    // checked-out counter move together, exactly as
+                    // checkout and release_slot pair them.
+                    let permit = worker
+                        .semaphore
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .expect("role permit");
+                    let index = worker.free.lock().await.pop_front().expect("role slot");
+                    worker.checked_out.fetch_add(1, Ordering::SeqCst);
+                    // The total must stay the fixed construction bound no
+                    // matter where the two racing reads land.
+                    let snapshot = worker.occupancy();
+                    assert_eq!(
+                        snapshot.total, SLOTS,
+                        "occupancy total is the fixed slot count under contention"
+                    );
+                    assert!(
+                        snapshot.checked_out <= SLOTS && snapshot.available <= SLOTS,
+                        "point counts stay within the fixed bound"
+                    );
+                    worker.free.lock().await.push_back(index);
+                    worker.checked_out.fetch_sub(1, Ordering::SeqCst);
+                    drop(permit);
+                    tokio::task::yield_now().await;
+                }
+            }));
+        }
+        barrier.wait().await;
+        for handle in handles {
+            handle.await.expect("worker joins");
+        }
+        let drained = state.occupancy();
+        assert_eq!(drained.total, SLOTS);
+        assert_eq!(drained.checked_out, 0);
+        assert_eq!(drained.available, SLOTS);
     }
 }
