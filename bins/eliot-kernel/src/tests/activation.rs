@@ -528,3 +528,272 @@ fn activation_host_request_wrong_connection_fails_closed() {
     drop(kernel);
     let _ = std::fs::remove_dir_all(root);
 }
+
+// ---------------------------------------------------------------------------
+// #203: kernel ticket pending-result ownership — the legacy raw P-04 leg
+// preserves every known negative result, replays exactly, and conflicts on
+// change. Tampered or wrong-ticket input is rejected with pending evidence
+// preserved.
+// ---------------------------------------------------------------------------
+
+#[cfg(windows)]
+fn activation_raw_failed(
+    ticket: &AgentActivationResolutionTicket,
+    resolved_at: u64,
+) -> eliot_protocol::AgentActivationResolutionResult {
+    use eliot_protocol::{AgentActivationResolutionDisposition, AgentActivationResolutionResult};
+    AgentActivationResolutionResult::new(
+        ticket,
+        resolved_at,
+        AgentActivationResolutionDisposition::FailedInternal {
+            failure_handle: "failure-raw-test".to_owned(),
+        },
+    )
+    .expect("raw failed result")
+}
+
+#[cfg(windows)]
+fn activation_projection_frame(connection_id: &str) -> eliot_protocol::Frame {
+    use eliot_protocol::{EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload};
+    Frame {
+        protocol_version: eliot_protocol::ProtocolVersion::CURRENT,
+        encoding_profile: EncodingProfile::JsonV1,
+        connection_id: connection_id.to_owned(),
+        request_id: None,
+        kind: FrameKind::Request,
+        message_type: MessageType::Execute,
+        request_identity: None,
+        payload: ProtocolPayload::Json(serde_json::Value::Null),
+        trace_context: std::collections::BTreeMap::new(),
+    }
+}
+
+#[cfg(windows)]
+fn activation_raw_kernel(
+    name: &str,
+    ticket: &AgentActivationResolutionTicket,
+) -> (std::path::PathBuf, KernelComposition) {
+    activation_kernel_with_ticket(name, ticket, None, None)
+}
+
+#[cfg(windows)]
+#[test]
+fn activation_raw_submit_replay_is_exact_and_conflicts_are_rejected() {
+    let ticket = activation_v2_ticket("activation-ticket-raw-203", 2_000);
+    let failed = activation_raw_failed(&ticket, 1_000);
+    let (root, kernel) = activation_raw_kernel("raw-replay-203", &ticket);
+    kernel
+        .submit_agent_activation_resolution_result(failed.clone())
+        .expect("first raw submit commits");
+    kernel
+        .submit_agent_activation_resolution_result(failed.clone())
+        .expect("exact duplicate bytes return the existing disposition");
+    let mut changed = failed.clone();
+    changed.resolved_at_unix_ms = 1_001;
+    changed.result_sha256 = changed
+        .compute_digest()
+        .expect("changed result digest");
+    let error = kernel
+        .submit_agent_activation_resolution_result(changed)
+        .expect_err("another digest for the same ticket is IDENTITY_CONFLICT");
+    assert!(
+        matches!(error, TransportError::IdentityConflict),
+        "unexpected error: {error:?}"
+    );
+    drop(kernel);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(windows)]
+#[test]
+fn activation_raw_tampered_result_is_rejected_with_evidence_preserved() {
+    let ticket = activation_v2_ticket("activation-ticket-raw-tamper", 2_000);
+    let failed = activation_raw_failed(&ticket, 1_000);
+    let (root, kernel) = activation_raw_kernel("raw-tamper-203", &ticket);
+    let mut tampered = failed.clone();
+    tampered.ticket_sha256 = "0".repeat(64);
+    let error = kernel
+        .submit_agent_activation_resolution_result(tampered)
+        .expect_err("tampered ticket digest must be rejected");
+    assert!(
+        matches!(error, TransportError::SessionFenced),
+        "unexpected error: {error:?}"
+    );
+    // Pending evidence is preserved: the exact ticket still accepts its valid
+    // result afterwards.
+    kernel
+        .submit_agent_activation_resolution_result(failed.clone())
+        .expect("pending entry survives a rejected tampered result");
+    kernel
+        .submit_agent_activation_resolution_result(failed)
+        .expect("exact replay stays idempotent after tamper rejection");
+    drop(kernel);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(windows)]
+#[test]
+fn activation_raw_negative_projection_preserves_result_and_denies_without_session() {
+    use eliot_protocol::{AgentBridgeActivationDenialCode, AgentBridgeActivationDisposition};
+    let ticket = activation_v2_ticket("activation-ticket-raw-negative", 2_000);
+    let failed = activation_raw_failed(&ticket, 1_000);
+    let (root, kernel) =
+        activation_kernel_with_ticket("raw-negative-203", &ticket, None, Some(failed.clone()));
+    let frame = activation_projection_frame(&ticket.connection_id);
+    let reply = kernel
+        .activation_result_response(&ticket.connection_id, &frame, &ticket.ticket_id, &failed)
+        .expect("negative projection answers with a typed denial");
+    let eliot_protocol::ProtocolPayload::Json(payload) = &reply.payload else {
+        panic!("denial reply must carry a JSON payload");
+    };
+    let response: eliot_protocol::AgentBridgeActivationResponse =
+        serde_json::from_value(payload.clone()).expect("denial response decodes");
+    assert_eq!(
+        response.disposition,
+        AgentBridgeActivationDisposition::Denied {
+            reason_code: AgentBridgeActivationDenialCode::FailedInternal,
+        },
+        "a known negative is returned immediately with its exact denial code"
+    );
+    // The pending entry is terminated, but the known negative stays retained
+    // for daemon replay/reconcile instead of being replaced by a generic
+    // outcome.
+    {
+        let pending = kernel
+            .agent_activation_pending
+            .lock()
+            .expect("pending lock");
+        assert!(
+            !pending.entries.contains_key(&ticket.ticket_id),
+            "projected ticket must leave the pending table"
+        );
+    }
+    {
+        let results = kernel
+            .agent_activation_results
+            .lock()
+            .expect("raw result lock");
+        let retained = results
+            .get(&ticket.ticket_id)
+            .expect("known negative must stay retained after projection");
+        assert_eq!(retained.result_sha256, failed.result_sha256);
+    }
+    // No Session is created on this path: the harness holds no bridge
+    // connections, and projection succeeds without one.
+    assert!(
+        kernel
+            .agent_activation_results
+            .lock()
+            .expect("raw result lock")
+            .contains_key(&ticket.ticket_id),
+        "retained negative must survive projection"
+    );
+    drop(kernel);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(windows)]
+#[test]
+fn activation_v2_replay_classifier_returns_existing_disposition_on_digest_match() {
+    let ticket = activation_v2_ticket("activation-ticket-classify-203", 2_000);
+    let first = activation_v2_failed(&ticket, 1_000);
+    assert_eq!(
+        classify_activation_result(None, &first),
+        ActivationResultDisposition::Commit
+    );
+    assert_eq!(
+        classify_activation_result(Some(&first), &first),
+        ActivationResultDisposition::ExactReplay
+    );
+    let mut changed = first.clone();
+    changed.resolved_at_unix_ms = 1_001;
+    changed.result_sha256 = changed
+        .compute_digest()
+        .expect("changed digest");
+    assert_eq!(
+        classify_activation_result(Some(&first), &changed),
+        ActivationResultDisposition::Conflict,
+        "another digest for the same ticket is IDENTITY_CONFLICT"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn activation_not_ready_supersede_gate_requires_due_time_and_changed_revision() {
+    use eliot_protocol::{
+        AgentActivationResolutionDisposition, AgentActivationResolutionResult,
+        AgentActivationRetryDirective,
+    };
+    let ticket = activation_v2_ticket("activation-ticket-notready-203", 10_000);
+    let retained_result = AgentActivationResolutionResult::new(
+        &ticket,
+        1_000,
+        AgentActivationResolutionDisposition::NotReady {
+            recovery_handle: "recovery-test".to_owned(),
+            retry: AgentActivationRetryDirective {
+                dependency_ref: "owner-dependency-1".to_owned(),
+                observed_dependency_revision: "revision-1".to_owned(),
+                not_before_unix_ms: 2_000,
+            },
+        },
+    )
+    .expect("not-ready result");
+    let retained = AgentActivationResultRecord {
+        result: retained_result,
+        phase: AgentActivationResultPhase::DeferredNotReady,
+    };
+    // Pre-due-time reconsideration is rejected even with a changed revision.
+    let early = AgentActivationResolutionResult::new(
+        &ticket,
+        1_500,
+        AgentActivationResolutionDisposition::NotReady {
+            recovery_handle: "recovery-test".to_owned(),
+            retry: AgentActivationRetryDirective {
+                dependency_ref: "owner-dependency-1".to_owned(),
+                observed_dependency_revision: "revision-2".to_owned(),
+                not_before_unix_ms: 3_000,
+            },
+        },
+    )
+    .expect("early result");
+    assert!(
+        !KernelComposition::not_ready_supersede_allowed_for_test(&retained, &early),
+        "retry before earliest retry time must not supersede"
+    );
+    // Due but unchanged dependency revision is rejected.
+    let unchanged = AgentActivationResolutionResult::new(
+        &ticket,
+        2_000,
+        AgentActivationResolutionDisposition::NotReady {
+            recovery_handle: "recovery-test".to_owned(),
+            retry: AgentActivationRetryDirective {
+                dependency_ref: "owner-dependency-1".to_owned(),
+                observed_dependency_revision: "revision-1".to_owned(),
+                not_before_unix_ms: 3_000,
+            },
+        },
+    )
+    .expect("unchanged result");
+    assert!(
+        !KernelComposition::not_ready_supersede_allowed_for_test(&retained, &unchanged),
+        "retry without proof of changed dependency revision must not supersede"
+    );
+    // Due with a changed revision supersedes the open deferral.
+    let changed = AgentActivationResolutionResult::new(
+        &ticket,
+        2_000,
+        AgentActivationResolutionDisposition::NotReady {
+            recovery_handle: "recovery-test".to_owned(),
+            retry: AgentActivationRetryDirective {
+                dependency_ref: "owner-dependency-1".to_owned(),
+                observed_dependency_revision: "revision-2".to_owned(),
+                not_before_unix_ms: 3_000,
+            },
+        },
+    )
+    .expect("changed result");
+    assert!(
+        KernelComposition::not_ready_supersede_allowed_for_test(&retained, &changed),
+        "due retry with changed dependency revision supersedes"
+    );
+}

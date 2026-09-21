@@ -1199,6 +1199,9 @@ impl KernelComposition {
 
     /// Completes one waiting bridge exchange from a full typed result.
     ///
+    /// The retained result is re-validated against its exact pending ticket
+    /// before anything is consumed, and it stays retained after projection
+    /// for daemon replay/reconcile; only the pending entry is consumed.
     /// A `Resolved` disposition builds the Authenticated transport binding by
     /// copying the Governor-owned resolved fields and the exact ticket fence;
     /// Kernel performs no semantic selection or retry interpretation. Any
@@ -1224,6 +1227,13 @@ impl KernelComposition {
                 .ok_or(TransportError::SessionFenced)?
                 .clone()
         };
+        // #203: reject a tampered, wrong-ticket, or wrong-fence retained
+        // result before mutating any ledger. The submit path validates before
+        // retaining, so this is defense-in-depth; a failure here preserves
+        // both the pending entry and the retained result verbatim.
+        result
+            .validate_against(&pending.ticket)
+            .map_err(|_| TransportError::SessionFenced)?;
         // Exhaustive per-disposition projection with no wildcard arm: a
         // future disposition breaks compilation here instead of silently
         // reusing another denial code. Only `Resolved` reaches the binding
@@ -1243,10 +1253,10 @@ impl KernelComposition {
                     .map_err(|_| TransportError::SessionFenced)?
                     .entries
                     .remove(ticket_id);
-                self.agent_activation_results
-                    .lock()
-                    .map_err(|_| TransportError::SessionFenced)?
-                    .remove(ticket_id);
+                // #203: the pending entry is consumed, but the retained raw
+                // result stays addressable for daemon replay/reconcile, like
+                // the v2 `pending.results` ledger. Deleting it here would
+                // replace a known negative with a generic outcome on retry.
                 Ok(reply)
             }
             AgentActivationResolutionDisposition::TaskSelectionRequired { .. }
@@ -1260,10 +1270,11 @@ impl KernelComposition {
                     .map_err(|_| TransportError::SessionFenced)?
                     .entries
                     .remove(ticket_id);
-                self.agent_activation_results
-                    .lock()
-                    .map_err(|_| TransportError::SessionFenced)?
-                    .remove(ticket_id);
+                // #203: preserve the retained raw result for daemon
+                // replay/reconcile. The pending entry is consumed and the
+                // bridge leg revoked, but the known typed negative stays
+                // retained; a later exact replay still answers from it and a
+                // changed same-ticket result still conflicts.
                 self.revoke_agent_bridge(connection_id);
                 let reason_code = Self::activation_denial_code_for_disposition(&result.disposition)
                     .ok_or(TransportError::SessionFenced)?;
