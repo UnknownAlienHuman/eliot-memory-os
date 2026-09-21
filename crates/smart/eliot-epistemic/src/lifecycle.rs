@@ -45,11 +45,14 @@ pub enum LifecycleError {
     /// A verified standing names no verifier run.
     #[error("verified standing requires a verifier run in the qualifying basis")]
     VerifiedRequiresVerifierRun,
+    /// A verifier-backed standing names no verifier run.
+    #[error("verifier-backed standing requires a verifier run in the qualifying basis")]
+    VerifierBackedRequiresVerifierRun,
     /// A correction names no superseded handle.
     #[error("correction requires a forward supersession link")]
     NotForwardRevision,
-    /// A refused promotion changes standing or mints a supersession.
-    #[error("refused promotion must hold prior role and status with no supersession")]
+    /// A refused promotion changes standing, mints a supersession, or forks a fresh output.
+    #[error("refused promotion must hold prior role, status, and output with no supersession")]
     RefusedPromotionMustHold,
     /// A superseded handle is not among the transition inputs.
     #[error("superseded handle is outside the transition inputs")]
@@ -620,7 +623,8 @@ impl LifecycleReceipt {
         if self.outcome == AdmissionOutcome::RefusedPromotion
             && (self.proposed_role != self.prior_role
                 || self.proposed_status != self.prior_status
-                || !self.supersedes.is_empty())
+                || !self.supersedes.is_empty()
+                || !self.input_record_ids.contains(&self.output_record_id))
         {
             return Err(LifecycleError::RefusedPromotionMustHold);
         }
@@ -629,7 +633,8 @@ impl LifecycleReceipt {
     }
 
     /// Rejects model paraphrases that claim elevated or verified standing
-    /// without an independent qualifying basis.
+    /// without an independent qualifying basis, and verifier-backed standing
+    /// that names no backing verifier run.
     fn check_paraphrase_guard(&self) -> Result<(), LifecycleError> {
         // A present verifier run is independent of the paraphrase by
         // construction (`QualifyingBasis::is_independent`), so verified
@@ -641,6 +646,17 @@ impl LifecycleReceipt {
                 .is_none_or(|basis| basis.verifier_run_id.is_none())
         {
             return Err(LifecycleError::VerifiedRequiresVerifierRun);
+        }
+        // `VerifierBacked` names its basis in the role itself, so every
+        // actor — not just a model paraphrase — must name the backing run.
+        // An authorizing policy alone never qualifies verifier standing.
+        if self.proposed_role == LifecycleRole::VerifierBacked
+            && self
+                .qualifying_basis
+                .as_ref()
+                .is_none_or(|basis| basis.verifier_run_id.is_none())
+        {
+            return Err(LifecycleError::VerifierBackedRequiresVerifierRun);
         }
         if self.proposed_role.is_elevated()
             && self.actor.kind.is_model()
@@ -956,6 +972,95 @@ mod tests {
         })
         .expect("independently qualified paraphrase is admitted");
         assert_eq!(qualified.proposed_role, LifecycleRole::Proof);
+    }
+
+    #[test]
+    fn verifier_backed_standing_requires_a_verifier_run_for_every_actor() {
+        let policy_only = LifecycleReceipt::new(LifecycleReceiptParams {
+            receipt_id: id("receipt:policy-only"),
+            input_record_ids: vec![id("obs:raw-1")],
+            source_anchor: anchor(),
+            prior_role: LifecycleRole::ObservationCandidate,
+            proposed_role: LifecycleRole::VerifierBacked,
+            prior_status: EpistemicStatus::Observed,
+            proposed_status: EpistemicStatus::Supported,
+            actor: actor(ActorKind::HumanOperator),
+            scope: "scope".to_owned(),
+            clock: clock(),
+            state_fence: fence(),
+            evidence_refs: vec![id("obs:raw-1")],
+            counterevidence_refs: Vec::new(),
+            outcome: AdmissionOutcome::Admitted,
+            qualifying_basis: Some(QualifyingBasis {
+                verifier_run_id: None,
+                independent_evidence: Vec::new(),
+                authorizing_policy: Some("policy:r1".to_owned()),
+            }),
+            supersedes: Vec::new(),
+            output_record_id: id("backed:1"),
+            audit_event_id: None,
+            proof_digest: digest_of("policy-only-proof"),
+        });
+        assert!(matches!(
+            policy_only,
+            Err(LifecycleError::VerifierBackedRequiresVerifierRun)
+        ));
+        let backed = LifecycleReceipt::new(LifecycleReceiptParams {
+            receipt_id: id("receipt:backed"),
+            input_record_ids: vec![id("obs:raw-1")],
+            source_anchor: anchor(),
+            prior_role: LifecycleRole::ObservationCandidate,
+            proposed_role: LifecycleRole::VerifierBacked,
+            prior_status: EpistemicStatus::Observed,
+            proposed_status: EpistemicStatus::Supported,
+            actor: actor(ActorKind::HumanOperator),
+            scope: "scope".to_owned(),
+            clock: clock(),
+            state_fence: fence(),
+            evidence_refs: vec![id("obs:raw-1")],
+            counterevidence_refs: Vec::new(),
+            outcome: AdmissionOutcome::Admitted,
+            qualifying_basis: Some(QualifyingBasis {
+                verifier_run_id: Some(id("run:verifier-1")),
+                independent_evidence: Vec::new(),
+                authorizing_policy: None,
+            }),
+            supersedes: Vec::new(),
+            output_record_id: id("backed:1"),
+            audit_event_id: None,
+            proof_digest: digest_of("backed-proof"),
+        })
+        .expect("verifier-backed standing with a backing run is admitted");
+        assert_eq!(backed.proposed_role, LifecycleRole::VerifierBacked);
+    }
+
+    #[test]
+    fn refused_promotion_cannot_fork_a_fresh_output() {
+        let forked = LifecycleReceipt::new(LifecycleReceiptParams {
+            receipt_id: id("receipt:forked"),
+            input_record_ids: vec![id("obs:raw-1")],
+            source_anchor: anchor(),
+            prior_role: LifecycleRole::ObservationCandidate,
+            proposed_role: LifecycleRole::ObservationCandidate,
+            prior_status: EpistemicStatus::Observed,
+            proposed_status: EpistemicStatus::Observed,
+            actor: actor(ActorKind::HumanOperator),
+            scope: "scope".to_owned(),
+            clock: clock(),
+            state_fence: fence(),
+            evidence_refs: vec![id("obs:raw-1")],
+            counterevidence_refs: Vec::new(),
+            outcome: AdmissionOutcome::RefusedPromotion,
+            qualifying_basis: None,
+            supersedes: Vec::new(),
+            output_record_id: id("obs:fork-1"),
+            audit_event_id: None,
+            proof_digest: digest_of("forked-proof"),
+        });
+        assert!(matches!(
+            forked,
+            Err(LifecycleError::RefusedPromotionMustHold)
+        ));
     }
 
     #[test]
