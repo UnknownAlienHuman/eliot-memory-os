@@ -44,6 +44,7 @@ use std::{
 use tracing_subscriber::EnvFilter;
 
 mod bootstrap_draft;
+mod controlboard_status;
 mod plugin_preview;
 mod source_bundle_materializer;
 
@@ -100,6 +101,12 @@ enum Command {
     Doctor {
         #[command(subcommand)]
         command: DoctorCommand,
+    },
+    /// Read the reconciled `ControlBoard` status projection (#1213).
+    #[command(name = "controlboard")]
+    ControlBoard {
+        #[command(subcommand)]
+        command: ControlBoardCommand,
     },
     Version,
     /// Start or reuse the authenticated User Broker and launch Operator.
@@ -368,6 +375,15 @@ enum DoctorCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum ControlBoardCommand {
+    /// Fetch one reconciled `ControlBoard` board over the authenticated
+    /// `controlboard.status` transact path and project its typed rows.
+    /// Read-only: owns no board handle, cache, or canonical state, and
+    /// synthesizes no health from the dispositions.
+    Status,
+}
+
+#[derive(Debug, Subcommand)]
 enum SystemCommand {
     /// Capture source/build/runtime/store/integration evidence.
     Snapshot {
@@ -422,6 +438,7 @@ fn run() -> Result<i32> {
         Command::Runtime { command } => run_runtime(command),
         Command::Plugin { command } => run_plugin(command),
         Command::Doctor { command } => run_doctor(command),
+        Command::ControlBoard { command } => run_controlboard(command),
         Command::Dispatch => run_dispatch(),
         Command::Ui => run_ui(),
     }
@@ -517,6 +534,86 @@ fn run_doctor(command: DoctorCommand) -> Result<i32> {
             }
         }
     }
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "single-variant command dispatch keeps the by-value shape reserved for future variants"
+)]
+fn run_controlboard(command: ControlBoardCommand) -> Result<i32> {
+    match command {
+        // Actual consumer over the authenticated EBP transact path: the
+        // serving runtime (Ramanujan/Kernel lane) reconciles the board and
+        // answers `controlboard.status`; this front door only decodes the
+        // served board with the owner's transport types and projects its
+        // typed rows. No board handle, cache, or canonical state is owned
+        // here, and no health is synthesized from the dispositions.
+        ControlBoardCommand::Status => {
+            #[cfg(windows)]
+            {
+                run_controlboard_status_windows()
+            }
+            #[cfg(not(windows))]
+            {
+                write_json_error(
+                    "KERNEL_APPLICATION_PORT_CLOSED",
+                    "Windows authenticated Kernel front door",
+                );
+                Ok(FRONT_DOOR_CLOSED_EXIT)
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn run_controlboard_status_windows() -> Result<i32> {
+    use eliot_cli::kernel_client::KernelClientError;
+
+    let mut port = match AuthenticatedKernelPort::load() {
+        Ok(port) => port,
+        Err(CommandPortError::FrontDoorClosed { contract }) => {
+            write_json_error("KERNEL_APPLICATION_PORT_CLOSED", contract);
+            return Ok(FRONT_DOOR_CLOSED_EXIT);
+        }
+        Err(error) => {
+            write_json_error("KERNEL_CLIENT_CONFIGURATION_REJECTED", &error.to_string());
+            return Ok(FRONT_DOOR_CLOSED_EXIT);
+        }
+    };
+    let served = match port.transact_controlboard_status() {
+        Ok(served) => served,
+        Err(KernelClientError::FrontDoorClosed(contract)) => {
+            write_json_error("KERNEL_APPLICATION_PORT_CLOSED", contract);
+            return Ok(FRONT_DOOR_CLOSED_EXIT);
+        }
+        Err(KernelClientError::UnknownOutcome(detail)) => {
+            write_json_error("CONTROLBOARD_STATUS_UNKNOWN", &detail);
+            return Ok(UNKNOWN_OUTCOME_EXIT);
+        }
+        Err(KernelClientError::MissingRequestIdentity) => {
+            write_json_error(
+                "CONTROLBOARD_STATUS_NOT_ADMITTED",
+                "no admitted EBP request identity is bound for an operator-initiated controlboard read; the identity must arrive through the admitted host request path and Ramanujan must serve controlboard.status; tracker #1213",
+            );
+            return Ok(INVALID_REQUEST_EXIT);
+        }
+        Err(error) => {
+            write_json_error("CONTROLBOARD_STATUS_REJECTED", &error.to_string());
+            return Ok(INVALID_REQUEST_EXIT);
+        }
+    };
+    let board = match controlboard_status::decode_status_response(served) {
+        Ok(board) => board,
+        Err(error) => {
+            write_json_error("CONTROLBOARD_STATUS_REFUSED", &error.to_string());
+            return Ok(UNKNOWN_OUTCOME_EXIT);
+        }
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&controlboard_status::render_status_json(&board)?)?
+    );
+    Ok(0)
 }
 
 fn run_bootstrap(command: BootstrapCommand) -> i32 {
@@ -3195,6 +3292,22 @@ impl AuthenticatedKernelPort {
     ) -> std::result::Result<serde_json::Value, eliot_cli::kernel_client::KernelClientError> {
         self.client.ensure_operator_launch()
     }
+
+    /// Sends the exact `controlboard.status` operation through the
+    /// authenticated EBP Execute seam and returns the served result payload.
+    ///
+    /// The EBP request identity must already be bound on the client by an
+    /// admitted flow; this front door never mints principal, session, fence,
+    /// or idempotency identity. Without one the call fails closed with
+    /// `MissingRequestIdentity` before any byte is sent.
+    fn transact_controlboard_status(
+        &mut self,
+    ) -> std::result::Result<serde_json::Value, eliot_cli::kernel_client::KernelClientError> {
+        self.client.transact_json(
+            controlboard_status::STATUS_OPERATION,
+            controlboard_status::status_request_payload(),
+        )
+    }
 }
 
 #[cfg(windows)]
@@ -3387,6 +3500,18 @@ mod tests {
             b"{\"bridge\":\"demo\"}"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn controlboard_status_parses() {
+        let parsed = Cli::try_parse_from(["eliot", "controlboard", "status"])
+            .expect("controlboard status parses");
+        assert!(matches!(
+            parsed.command,
+            Command::ControlBoard {
+                command: ControlBoardCommand::Status
+            }
+        ));
     }
 
     fn applied_outcome() -> InstallationStepOutcome {
