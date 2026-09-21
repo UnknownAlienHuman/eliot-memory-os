@@ -51,6 +51,7 @@ mod kernel_transition_client;
 mod observation_adapters;
 mod skill_lifecycle_adapters;
 mod skill_surface_adapters;
+pub mod staffing_policy;
 mod store_failure_projection;
 mod task_lifecycle_adapters;
 
