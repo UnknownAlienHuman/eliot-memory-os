@@ -368,15 +368,25 @@ enum SetupCommand {
         /// Explicit paid-route consent for Watchdog.
         #[arg(long, default_value = "false")]
         watchdog_explicit: bool,
+        /// Automation mode: `suggest_only`, `manual`, `idle_only`,
+        /// `scheduled`, `continuous_bounded`, or `off`. Omitted keeps the
+        /// visible `SUGGEST_ONLY` default.
+        #[arg(long)]
+        automation: Option<String>,
+        /// Human owner ref recorded on every persisted setting. Required:
+        /// no identity is invented by the CLI.
+        #[arg(long)]
+        owner_ref: String,
     },
     /// Inspect every default through the same typed path (reversible).
     Show,
-    /// Update one role through the same typed path used by `apply`.
+    /// Update one role and/or the automation mode through the same typed
+    /// path used by `apply`.
     Set {
         /// Role key: `main`, `worker`, `auditor`, `verifier`, `watchdog`,
-        /// `dreamer`, or `research`.
+        /// `dreamer`, or `research`. Required with `--route`.
         #[arg(long)]
-        role: String,
+        role: Option<String>,
         /// Route kind: `unassigned`, `local`, `economy`, or `paid`. Omitted
         /// clears the role back to `UNASSIGNED`.
         #[arg(long)]
@@ -387,6 +397,15 @@ enum SetupCommand {
         /// Explicit paid-route consent.
         #[arg(long, default_value = "false")]
         explicit_consent: bool,
+        /// Automation mode update: `suggest_only`, `manual`, `idle_only`,
+        /// `scheduled`, `continuous_bounded`, or `off`. At least one of
+        /// `--route` or `--automation` is required.
+        #[arg(long)]
+        automation: Option<String>,
+        /// Human owner ref recorded on every persisted setting. Required:
+        /// no identity is invented by the CLI.
+        #[arg(long)]
+        owner_ref: String,
     },
     /// With automation disabled, record one deduplicated Human-board
     /// recommendation for a needed action; no job starts.
@@ -440,7 +459,20 @@ fn run() -> Result<i32> {
     }
 }
 
+#[cfg(windows)]
+fn reject_present_legacy_governor_config() -> Result<()> {
+    observe_legacy_governor_config()
+}
+
+#[cfg(not(windows))]
+fn reject_present_legacy_governor_config() -> Result<()> {
+    Ok(())
+}
+
 fn run_setup(command: SetupCommand) -> Result<i32> {
+    // #1962: reject a present legacy Governor file before any setup
+    // decision; absent proceeds with no legacy config adopted.
+    reject_present_legacy_governor_config()?;
     match command {
         SetupCommand::Apply {
             dreamer_route,
@@ -449,6 +481,8 @@ fn run_setup(command: SetupCommand) -> Result<i32> {
             watchdog_displayed,
             dreamer_explicit,
             watchdog_explicit,
+            automation,
+            owner_ref,
         } => first_run_flow::run_setup_apply(&first_run_flow::SetupApplyArgs {
             dreamer_route,
             watchdog_route,
@@ -456,6 +490,8 @@ fn run_setup(command: SetupCommand) -> Result<i32> {
             watchdog_displayed,
             dreamer_explicit,
             watchdog_explicit,
+            automation,
+            owner_ref,
         }),
         SetupCommand::Show => first_run_flow::run_setup_show(),
         SetupCommand::Set {
@@ -463,11 +499,15 @@ fn run_setup(command: SetupCommand) -> Result<i32> {
             route,
             displayed,
             explicit_consent,
+            automation,
+            owner_ref,
         } => first_run_flow::run_setup_set(&first_run_flow::SetupSetArgs {
             role,
             route,
             displayed,
             explicit_consent,
+            automation,
+            owner_ref,
         }),
         SetupCommand::Recommend {
             automation,

@@ -2,19 +2,21 @@
 //!
 //! Issue #1962. This module is wiring only: it decodes CLI arguments,
 //! constructs the typed owner input in `eliot-config::first_run`, and
-//! projects a terminal receipt. All route-state, paid-route, default, and
-//! Human-board dedup semantics live in the owner crate. This flow reads no
-//! configuration files, so the legacy `governor.toml` file is never adopted
-//! as authority here; legacy-file gating lives on the canary/install paths
-//! in `main.rs` (#1687), not on the setup path.
+//! projects a terminal receipt carrying both the human-readable decision
+//! and the canonical `Setting` persistence payload. All route-state,
+//! paid-route, default, and Human-board dedup semantics live in the owner
+//! crate. This flow reads no configuration files, so the legacy
+//! `governor.toml` file is never adopted as authority here; `run_setup` in
+//! `main.rs` rejects a present legacy file before dispatch (canary/install
+//! paths gate independently).
 
 #![forbid(unsafe_code)]
 
 use anyhow::{Context, Result};
 use eliot_config::first_run::{
     FirstRunAutomation, FirstRunInput, FirstRunRole, RecommendationBoard, RouteSelection,
-    apply_update, decide_first_run, describe_defaults, parse_kind, parse_role,
-    recommend_when_automation_disabled,
+    apply_automation_update, apply_update, decide_first_run, describe_defaults, parse_kind,
+    parse_role, recommend_when_automation_disabled, to_settings,
 };
 use std::collections::BTreeMap;
 
@@ -31,15 +33,28 @@ pub struct SetupApplyArgs {
     pub watchdog_displayed: bool,
     pub dreamer_explicit: bool,
     pub watchdog_explicit: bool,
+    /// Automation mode (`suggest_only`, `manual`, `idle_only`, `scheduled`,
+    /// `continuous_bounded`, `off`). Omitted keeps the visible
+    /// `SUGGEST_ONLY` default.
+    pub automation: Option<String>,
+    /// Human owner ref recorded on every persisted setting. Required and
+    /// non-blank: no identity is invented here.
+    pub owner_ref: String,
 }
 
-/// Decoded `setup set` arguments: one role update through the same typed
-/// path used by `setup apply` and inspected by `setup show`.
+/// Decoded `setup set` arguments: one role and/or automation update through
+/// the same typed path used by `setup apply` and inspected by `setup show`.
 pub struct SetupSetArgs {
-    pub role: String,
+    pub role: Option<String>,
     pub route: Option<String>,
     pub displayed: bool,
     pub explicit_consent: bool,
+    /// Automation mode update. At least one of `route` or `automation` is
+    /// required; `role` is required with `route`.
+    pub automation: Option<String>,
+    /// Human owner ref recorded on every persisted setting. Required and
+    /// non-blank: no identity is invented here.
+    pub owner_ref: String,
 }
 
 /// Decoded `setup recommend` arguments for a needed maintenance action when
@@ -81,9 +96,13 @@ fn parse_automation(value: &str) -> Result<FirstRunAutomation> {
 }
 
 /// Runs `setup apply`: decides typed per-role route state and projects it as
-/// JSON. Omitted roles are `UNASSIGNED`; no paid route is selected without
-/// explicit consent.
+/// JSON with the canonical `Setting` persistence payload. Omitted roles are
+/// `UNASSIGNED`; no paid route is selected without explicit consent.
 pub fn run_setup_apply(args: &SetupApplyArgs) -> Result<i32> {
+    let owner_ref = args.owner_ref.trim();
+    if owner_ref.is_empty() {
+        anyhow::bail!("settings owner_ref must be non-blank");
+    }
     let mut selections = BTreeMap::new();
     if let Some(selection) = selection_for(
         args.dreamer_route.as_deref(),
@@ -99,9 +118,14 @@ pub fn run_setup_apply(args: &SetupApplyArgs) -> Result<i32> {
     )? {
         selections.insert(FirstRunRole::WatchdogAgent, selection);
     }
+    let automation = args
+        .automation
+        .as_deref()
+        .map(parse_automation)
+        .transpose()?;
     let decision = decide_first_run(&FirstRunInput {
         selections,
-        automation: None,
+        automation,
     })
     .map_err(|error| anyhow::anyhow!(error.to_string()))
     .context("decide first-run route state")?;
@@ -110,6 +134,7 @@ pub fn run_setup_apply(args: &SetupApplyArgs) -> Result<i32> {
         serde_json::json!({
             "routes": describe_defaults(&decision),
             "has_paid_route": decision.has_paid_route(),
+            "settings": to_settings(&decision, owner_ref),
         })
     );
     Ok(0)
@@ -133,19 +158,44 @@ pub fn run_setup_show() -> Result<i32> {
     Ok(0)
 }
 
-/// Runs `setup set`: reversibly updates one role through the same typed path.
+/// Runs `setup set`: reversibly updates one role and/or the automation mode
+/// through the same typed path, projecting the updated decision with its
+/// canonical `Setting` persistence payload.
 pub fn run_setup_set(args: &SetupSetArgs) -> Result<i32> {
-    let role = parse_role(&args.role).map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    let selection = selection_for(args.route.as_deref(), args.displayed, args.explicit_consent)?;
+    let owner_ref = args.owner_ref.trim();
+    if owner_ref.is_empty() {
+        anyhow::bail!("settings owner_ref must be non-blank");
+    }
+    if args.route.is_none() && args.automation.is_none() {
+        anyhow::bail!("setup set requires --route, --automation, or both");
+    }
     let defaults = eliot_config::first_run::FirstRunDecision::defaults();
-    let updated = apply_update(&defaults, role, selection)
-        .map_err(|error| anyhow::anyhow!(error.to_string()))
-        .context("apply first-run update")?;
+    let updated = match args.role.as_deref() {
+        None => {
+            if args.route.is_some() {
+                anyhow::bail!("setup set --route requires --role");
+            }
+            defaults
+        }
+        Some(role_text) => {
+            let role = parse_role(role_text).map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            let selection =
+                selection_for(args.route.as_deref(), args.displayed, args.explicit_consent)?;
+            apply_update(&defaults, role, selection)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))
+                .context("apply first-run update")?
+        }
+    };
+    let updated = match args.automation.as_deref() {
+        None => updated,
+        Some(mode) => apply_automation_update(&updated, parse_automation(mode)?),
+    };
     println!(
         "{}",
         serde_json::json!({
             "routes": describe_defaults(&updated),
             "has_paid_route": updated.has_paid_route(),
+            "settings": to_settings(&updated, owner_ref),
         })
     );
     Ok(0)
@@ -208,8 +258,79 @@ mod tests {
             watchdog_displayed: false,
             dreamer_explicit: false,
             watchdog_explicit: false,
+            automation: None,
+            owner_ref: "human-1".to_owned(),
         };
         assert_eq!(run_setup_apply(&args).expect("apply"), 0);
+    }
+
+    #[test]
+    fn setup_apply_records_automation_and_rejects_blank_owner() {
+        let args = SetupApplyArgs {
+            dreamer_route: None,
+            watchdog_route: None,
+            dreamer_displayed: false,
+            watchdog_displayed: false,
+            dreamer_explicit: false,
+            watchdog_explicit: false,
+            automation: Some("scheduled".to_owned()),
+            owner_ref: "human-1".to_owned(),
+        };
+        assert_eq!(run_setup_apply(&args).expect("apply with automation"), 0);
+
+        let blank_owner = SetupApplyArgs {
+            dreamer_route: None,
+            watchdog_route: None,
+            dreamer_displayed: false,
+            watchdog_displayed: false,
+            dreamer_explicit: false,
+            watchdog_explicit: false,
+            automation: None,
+            owner_ref: "   ".to_owned(),
+        };
+        assert!(
+            run_setup_apply(&blank_owner).is_err(),
+            "blank settings owner must fail closed"
+        );
+    }
+
+    #[test]
+    fn setup_set_updates_automation_without_role_and_rejects_empty_update() {
+        let args = SetupSetArgs {
+            role: None,
+            route: None,
+            displayed: false,
+            explicit_consent: false,
+            automation: Some("off".to_owned()),
+            owner_ref: "human-1".to_owned(),
+        };
+        assert_eq!(run_setup_set(&args).expect("automation-only set"), 0);
+
+        let missing_target = SetupSetArgs {
+            role: None,
+            route: None,
+            displayed: false,
+            explicit_consent: false,
+            automation: None,
+            owner_ref: "human-1".to_owned(),
+        };
+        assert!(
+            run_setup_set(&missing_target).is_err(),
+            "set without route or automation must fail closed"
+        );
+
+        let route_without_role = SetupSetArgs {
+            role: None,
+            route: Some("local".to_owned()),
+            displayed: true,
+            explicit_consent: false,
+            automation: None,
+            owner_ref: "human-1".to_owned(),
+        };
+        assert!(
+            run_setup_set(&route_without_role).is_err(),
+            "set --route without --role must fail closed"
+        );
     }
 
     #[test]

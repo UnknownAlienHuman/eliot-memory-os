@@ -316,8 +316,28 @@ pub fn apply_update(
     Ok(next)
 }
 
-/// Persists the typed decision through the canonical policy/config layer as
-/// deterministic `Setting` entries (`route.<role>` + automation mode).
+/// Reversibly updates the automation mode through the same typed path the
+/// setup CLI uses.
+///
+/// Any mode is admissible here as an explicit user choice, including modes
+/// that enable automatic jobs: the choice is recorded visibly
+/// ([`describe_defaults`]) and remains reversible through a later update.
+/// Admitting or starting governed jobs still belongs to the job path, never
+/// to this assignment.
+#[must_use]
+pub fn apply_automation_update(
+    decision: &FirstRunDecision,
+    automation: FirstRunAutomation,
+) -> FirstRunDecision {
+    let mut next = decision.clone();
+    next.automation = automation;
+    next
+}
+
+/// Projects the typed decision through the canonical policy/config layer as
+/// deterministic `Setting` entries (`route.<role>` + automation mode) for
+/// canonical admission. This builds the persistable payload; admission into
+/// a snapshot belongs to the config owner.
 /// `value_ref` carries an opaque `literal:<STATE>` payload (no consumer
 /// resolves prefixes today; `Setting::validate` requires non-blank key,
 /// value, and owner, so `owner_ref` must be non-blank for snapshot
@@ -534,5 +554,22 @@ mod tests {
             ),
             Err(FirstRunError::HiddenPaidRoute)
         );
+    }
+
+    #[test]
+    fn automation_mode_updates_visibly_and_reversibly() {
+        let defaults = FirstRunDecision::defaults();
+        assert_eq!(defaults.automation, FirstRunAutomation::SuggestOnly);
+        let updated = apply_automation_update(&defaults, FirstRunAutomation::Scheduled);
+        assert_eq!(updated.automation, FirstRunAutomation::Scheduled);
+        // Route state is untouched by an automation update.
+        assert_eq!(updated.routes, defaults.routes);
+        assert!(
+            describe_defaults(&updated)
+                .iter()
+                .any(|(key, value)| key == "automation.maintenance_mode" && value == "SCHEDULED")
+        );
+        let reverted = apply_automation_update(&updated, FirstRunAutomation::SuggestOnly);
+        assert_eq!(reverted, defaults);
     }
 }
