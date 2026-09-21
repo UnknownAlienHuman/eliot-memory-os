@@ -73,11 +73,9 @@ fn normalize(
     Ok(envelope)
 }
 
-#[test]
-fn durable_ingest_orders_raw_hash_envelope_disposition_before_cursor() -> TestResult {
-    let mut journal = DurableHostEventJournal::new();
-
-    // Allowed payload: benign transport bytes persist verbatim.
+fn stage_allowed_event(
+    journal: &mut DurableHostEventJournal,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let raw_allowed = b"acp-frame-1934-benign-session-start".to_vec();
     assert!(!contains_forbidden_content(&raw_allowed));
     let envelope_allowed = normalize(
@@ -101,7 +99,6 @@ fn durable_ingest_orders_raw_hash_envelope_disposition_before_cursor() -> TestRe
         transformation_version: eliot_agent_acp::DURABLE_INGEST_TRANSFORMATION_VERSION,
     })?;
     assert!(outcome.fresh);
-    // Staging alone never advances the cursor: the durable relation commits first.
     assert_eq!(journal.cursor(STREAM).last_durable_sequence, 0);
     journal.commit(&outcome.key)?;
     assert_eq!(journal.cursor(STREAM).last_durable_sequence, 1);
@@ -115,15 +112,19 @@ fn durable_ingest_orders_raw_hash_envelope_disposition_before_cursor() -> TestRe
     assert!(record.disposition.committed);
     assert_eq!(record.envelope.sequence, 1);
     journal.acknowledge(STREAM, 1)?;
+    Ok(raw_allowed)
+}
 
-    // Privacy is fail-closed: denied content cannot persist as admissible raw.
-    let raw_secret = b"acp-frame-1934-tool-result secret-value-hidden_reasoning".to_vec();
-    assert!(contains_forbidden_content(&raw_secret));
+fn check_privacy_denied(
+    journal: &mut DurableHostEventJournal,
+    raw_secret: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    assert!(contains_forbidden_content(raw_secret));
     let denied_envelope = normalize(
         "evt-1934-2",
         "cursor-1934-2",
         2,
-        &raw_secret,
+        raw_secret,
         "restricted-source:1934-2",
         SessionLifecycleTransition::Resumed,
         HostEventPrivacyClass::RedactedSummary,
@@ -132,7 +133,7 @@ fn durable_ingest_orders_raw_hash_envelope_disposition_before_cursor() -> TestRe
         journal.stage_allowed(StageAllowed {
             stream_id: STREAM,
             stream_sequence: 2,
-            transport_bytes: &raw_secret,
+            transport_bytes: raw_secret,
             envelope: denied_envelope,
             requested_route_digest: None,
             actual_route_digest: None,
@@ -142,10 +143,15 @@ fn durable_ingest_orders_raw_hash_envelope_disposition_before_cursor() -> TestRe
         }),
         Err(IngestError::PrivacyViolation)
     );
+    Ok(())
+}
 
-    // Redacted payload: only the deterministic projection plus receipt persist.
+fn stage_redacted_event(
+    journal: &mut DurableHostEventJournal,
+    raw_secret: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
     let classes = vec!["secret".to_owned(), "scope".to_owned()];
-    let projection = deterministic_redacted_bytes(&sha256_hex(&raw_secret), &["scope", "secret"]);
+    let projection = deterministic_redacted_bytes(&sha256_hex(raw_secret), &["scope", "secret"]);
     let envelope_redacted = normalize(
         "evt-1934-2",
         "cursor-1934-2",
@@ -158,7 +164,7 @@ fn durable_ingest_orders_raw_hash_envelope_disposition_before_cursor() -> TestRe
     let outcome = journal.stage_redacted(StageRedacted {
         stream_id: STREAM,
         stream_sequence: 2,
-        transport_bytes: &raw_secret,
+        transport_bytes: raw_secret,
         redacted_classes: classes,
         envelope: envelope_redacted,
         requested_route_digest: None,
@@ -173,7 +179,7 @@ fn durable_ingest_orders_raw_hash_envelope_disposition_before_cursor() -> TestRe
     let record = journal
         .get(&outcome.key)
         .ok_or("redacted record must be stored")?;
-    assert_eq!(record.transport_hash.as_str(), sha256_hex(&raw_secret));
+    assert_eq!(record.transport_hash.as_str(), sha256_hex(raw_secret));
     assert_eq!(record.stored.bytes(), projection.as_slice());
     assert!(
         !record
@@ -187,10 +193,14 @@ fn durable_ingest_orders_raw_hash_envelope_disposition_before_cursor() -> TestRe
         .redaction_receipt()
         .ok_or("redacted record must expose a receipt")?;
     assert_eq!(receipt.reason, RedactionReason::ForbiddenContentDetected);
-    assert_eq!(receipt.transport_hash.as_str(), sha256_hex(&raw_secret));
+    assert_eq!(receipt.transport_hash.as_str(), sha256_hex(raw_secret));
     assert_eq!(record.envelope_digest, record.envelope.compute_digest()?);
+    Ok(())
+}
 
-    // Interrupted ingest: staged but never committed; cursor stays behind.
+fn exercise_interrupted_and_reconnect(
+    journal: &mut DurableHostEventJournal,
+) -> Result<(), Box<dyn std::error::Error>> {
     let raw_pending = b"acp-frame-1934-benign-suspended".to_vec();
     let envelope_pending = normalize(
         "evt-1934-3",
@@ -214,8 +224,6 @@ fn durable_ingest_orders_raw_hash_envelope_disposition_before_cursor() -> TestRe
     })?;
     assert!(staged.fresh);
     assert_eq!(journal.cursor(STREAM).last_durable_sequence, 2);
-
-    // Reconnect replays the unacknowledged event (staged, uncommitted).
     let pending = journal.pending_for_reconnect(STREAM);
     assert_eq!(pending.len(), 2);
     assert_eq!(pending[0].sequence, 2);
@@ -223,8 +231,6 @@ fn durable_ingest_orders_raw_hash_envelope_disposition_before_cursor() -> TestRe
     assert_eq!(pending[1].sequence, 3);
     assert!(!pending[1].committed);
     journal.acknowledge(STREAM, 2)?;
-
-    // Commit recovery advances the cursor; application happens exactly once.
     journal.commit(&staged.key)?;
     assert_eq!(journal.cursor(STREAM).last_durable_sequence, 3);
     assert!(journal.record_application(&staged.key)?);
@@ -235,13 +241,18 @@ fn durable_ingest_orders_raw_hash_envelope_disposition_before_cursor() -> TestRe
     assert_eq!(record.disposition.applied_count, 1);
     journal.acknowledge(STREAM, 3)?;
     assert!(journal.pending_for_reconnect(STREAM).is_empty());
+    Ok(())
+}
 
-    // Duplicate replay of the first event: no second record, no second apply.
+fn check_duplicate_and_conflict(
+    journal: &mut DurableHostEventJournal,
+    raw_allowed: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
     let envelope_replay = normalize(
         "evt-1934-1",
         "cursor-1934-1",
         1,
-        &raw_allowed,
+        raw_allowed,
         "restricted-source:1934-1",
         SessionLifecycleTransition::Started,
         HostEventPrivacyClass::PublicSummary,
@@ -249,7 +260,7 @@ fn durable_ingest_orders_raw_hash_envelope_disposition_before_cursor() -> TestRe
     let replay = journal.stage_allowed(StageAllowed {
         stream_id: STREAM,
         stream_sequence: 1,
-        transport_bytes: &raw_allowed,
+        transport_bytes: raw_allowed,
         envelope: envelope_replay,
         requested_route_digest: None,
         actual_route_digest: None,
@@ -268,8 +279,6 @@ fn durable_ingest_orders_raw_hash_envelope_disposition_before_cursor() -> TestRe
     assert_eq!(journal.record_count(), 3);
     assert!(journal.record_application(&replay.key)?);
     assert!(!journal.record_application(&replay.key)?);
-
-    // Conflicting same-cursor delivery with different bytes is quarantined.
     let conflicting = normalize(
         "evt-1934-1",
         "cursor-1934-1",
@@ -294,5 +303,17 @@ fn durable_ingest_orders_raw_hash_envelope_disposition_before_cursor() -> TestRe
         Err(IngestError::ConflictingDuplicate)
     );
     assert_eq!(journal.record_count(), 3);
+    Ok(())
+}
+
+#[test]
+fn durable_ingest_orders_raw_hash_envelope_disposition_before_cursor() -> TestResult {
+    let mut journal = DurableHostEventJournal::new();
+    let raw_allowed = stage_allowed_event(&mut journal)?;
+    let raw_secret = b"acp-frame-1934-tool-result secret-value-hidden_reasoning".to_vec();
+    check_privacy_denied(&mut journal, &raw_secret)?;
+    stage_redacted_event(&mut journal, &raw_secret)?;
+    exercise_interrupted_and_reconnect(&mut journal)?;
+    check_duplicate_and_conflict(&mut journal, &raw_allowed)?;
     Ok(())
 }

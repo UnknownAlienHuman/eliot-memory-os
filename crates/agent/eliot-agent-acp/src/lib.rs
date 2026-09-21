@@ -973,6 +973,10 @@ impl AcpEvent {
     #[deprecated(
         note = "legacy quarantine boundary; use normalize_acp_event with explicit lineage plus admission for new code"
     )]
+    #[allow(
+        deprecated,
+        reason = "legacy quarantine shim populates the legacy attempt_id for the compatibility test; new code uses normalize_acp_event"
+    )]
     pub fn into_host_event(
         self,
         raw_payload_digest: String,
@@ -1078,9 +1082,7 @@ pub const ACP_NORMALIZER_IDENTITY: &str = "eliot-agent-acp";
 /// (`envelope.normalization == receipt`), both carry
 /// [`eliot_agent_api::ProofCeiling::Observation`] only, and no new store,
 /// durable sink, or Kernel authority is created here.
-pub fn normalize_acp_event(
-    input: AcpHostEventInput<'_>,
-) -> Result<(NormalizedHostEventEnvelope, HostEventNormalizationReceipt), AcpAdapterError> {
+fn validate_acp_event_input(input: &AcpHostEventInput<'_>) -> Result<(), AcpAdapterError> {
     if input.sequence == 0 {
         return Err(AcpAdapterError::InvalidInput("sequence"));
     }
@@ -1096,9 +1098,6 @@ pub fn normalize_acp_event(
     if input.warnings.len() > eliot_agent_api::MAX_HOST_EVENT_WARNINGS {
         return Err(AcpAdapterError::InvalidInput("warnings"));
     }
-    // Loss-manifest invariant, checked before sealing so a complete
-    // normalization with a stray omission (or vice versa) fails closed here
-    // rather than after minting a digest.
     let lossy_input = input.coverage != NormalizationCoverage::Complete;
     if lossy_input == input.omitted_source_fields.is_empty() {
         return Err(AcpAdapterError::InvalidInput("omitted_fields/coverage"));
@@ -1113,6 +1112,13 @@ pub fn normalize_acp_event(
     } else if input.admission.is_some() {
         return Err(AcpAdapterError::InvalidInput("admission/lineage"));
     }
+    Ok(())
+}
+
+pub fn normalize_acp_event(
+    input: AcpHostEventInput<'_>,
+) -> Result<(NormalizedHostEventEnvelope, HostEventNormalizationReceipt), AcpAdapterError> {
+    validate_acp_event_input(&input)?;
     let input_digest: LowercaseSha256 = serde_json::from_value(Value::String(
         eliot_contracts::sha256_hex(input.raw_source_bytes),
     ))
@@ -1246,19 +1252,17 @@ impl AcpResultEnvelope {
     /// admission/binding linkage are enforced via
     /// `validate_against(binding, admission)`; forged or mismatched linkage
     /// fails closed.
-    pub fn into_agent_result(
-        self,
-        route: RouteFingerprint,
+    fn check_acp_result_binding(
+        route: &RouteFingerprint,
         binding: &ProviderExecutionBinding,
-        admission: &AdmittedRouteReceipt,
-        outcome: AcpResultOutcome,
-    ) -> Result<AgentResult, AcpAdapterError> {
-        if route != binding.route {
+        session_id: Option<&String>,
+    ) -> Result<(), AcpAdapterError> {
+        if *route != binding.route {
             return Err(AcpAdapterError::ContractValidation(
                 eliot_agent_api::ContractError::BindingMismatch,
             ));
         }
-        if let Some(session) = &self.session_id
+        if let Some(session) = session_id
             && let Some(bound_session) = binding.session_id.as_ref()
             && session.as_str() != bound_session.as_str()
         {
@@ -1266,7 +1270,11 @@ impl AcpResultEnvelope {
                 eliot_agent_api::ContractError::BindingMismatch,
             ));
         }
-        let (disposition, unknown_reason) = match outcome {
+        Ok(())
+    }
+
+    fn acp_result_disposition(outcome: AcpResultOutcome) -> (ResultDisposition, Option<String>) {
+        match outcome {
             AcpResultOutcome::Completed => (ResultDisposition::DegradedNoProof, None),
             AcpResultOutcome::Cancelled => (ResultDisposition::CancelledObserved, None),
             AcpResultOutcome::Failed { reason } => {
@@ -1275,7 +1283,55 @@ impl AcpResultEnvelope {
             AcpResultOutcome::Unknown { reason } => {
                 (ResultDisposition::UnknownOutcome, Some(reason))
             }
-        };
+        }
+    }
+
+    fn acp_result_execution_parts(
+        disposition: ResultDisposition,
+        unknown_reason: Option<&String>,
+    ) -> (
+        ExecutionOutcome,
+        Option<CancellationState>,
+        Option<String>,
+        Option<String>,
+    ) {
+        match (disposition, unknown_reason) {
+            (ResultDisposition::CancelledObserved, _) => (
+                ExecutionOutcome::Observed,
+                Some(CancellationState::Acknowledged),
+                None,
+                None,
+            ),
+            (ResultDisposition::FailedVerification, Some(reason)) => (
+                ExecutionOutcome::UnknownOutcome,
+                None,
+                Some(format!("acp-failed:{reason}")),
+                Some((*reason).clone()),
+            ),
+            (ResultDisposition::UnknownOutcome, Some(reason)) => (
+                ExecutionOutcome::UnknownOutcome,
+                None,
+                Some((*reason).clone()),
+                None,
+            ),
+            _ => (
+                ExecutionOutcome::UnknownOutcome,
+                None,
+                Some("acp-outcome-requires-reconciliation".to_owned()),
+                unknown_reason.map(|reason| (*reason).clone()),
+            ),
+        }
+    }
+
+    pub fn into_agent_result(
+        self,
+        route: RouteFingerprint,
+        binding: &ProviderExecutionBinding,
+        admission: &AdmittedRouteReceipt,
+        outcome: AcpResultOutcome,
+    ) -> Result<AgentResult, AcpAdapterError> {
+        Self::check_acp_result_binding(&route, binding, self.session_id.as_ref())?;
+        let (disposition, unknown_reason) = Self::acp_result_disposition(outcome);
         let usage = UsageReceipt {
             input_tokens: None,
             output_tokens: None,
@@ -1293,32 +1349,7 @@ impl AcpResultEnvelope {
         // sanitized reason without claiming terminal time; all unknown
         // outcomes quarantine with a recovery handle.
         let (execution_outcome, cancellation, recovery_ref, safe_public_error) =
-            match (&disposition, &unknown_reason) {
-                (ResultDisposition::CancelledObserved, _) => (
-                    ExecutionOutcome::Observed,
-                    Some(CancellationState::Acknowledged),
-                    None,
-                    None,
-                ),
-                (ResultDisposition::FailedVerification, Some(reason)) => (
-                    ExecutionOutcome::UnknownOutcome,
-                    None,
-                    Some(format!("acp-failed:{reason}")),
-                    Some(reason.clone()),
-                ),
-                (ResultDisposition::UnknownOutcome, Some(reason)) => (
-                    ExecutionOutcome::UnknownOutcome,
-                    None,
-                    Some(reason.clone()),
-                    None,
-                ),
-                _ => (
-                    ExecutionOutcome::UnknownOutcome,
-                    None,
-                    Some("acp-outcome-requires-reconciliation".to_owned()),
-                    unknown_reason.clone(),
-                ),
-            };
+            Self::acp_result_execution_parts(disposition, unknown_reason.as_ref());
         let mut actual_route = PhysicalRouteObservationReceipt {
             schema_version: CONTRACT_VERSION.to_owned(),
             attempt_id: binding.attempt_id.clone(),
@@ -1717,11 +1748,16 @@ mod tests {
     const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
 
     fn test_epoch(lineage: &str, sequence: u64) -> EpochId {
-        EpochId::new(
-            EpochLineageId::new(lineage).expect("valid test lineage"),
-            std::num::NonZeroU64::new(sequence).expect("nonzero test sequence"),
-        )
-        .expect("valid test epoch")
+        let Ok(lineage_id) = EpochLineageId::new(lineage) else {
+            panic!("valid test lineage");
+        };
+        let Some(sequence) = std::num::NonZeroU64::new(sequence) else {
+            panic!("nonzero test sequence");
+        };
+        let Ok(epoch) = EpochId::new(lineage_id, sequence) else {
+            panic!("valid test epoch");
+        };
+        epoch
     }
 
     #[derive(Clone, Debug)]
@@ -1768,10 +1804,12 @@ mod tests {
     }
 
     fn fixture_digest(seed: &str) -> LowercaseSha256 {
-        serde_json::from_value(serde_json::json!(eliot_contracts::sha256_hex(
+        let Ok(digest) = serde_json::from_value(serde_json::json!(eliot_contracts::sha256_hex(
             format!("acp-fixture-{seed}").as_bytes()
-        )))
-        .expect("valid fixture digest")
+        ))) else {
+            panic!("valid fixture digest");
+        };
+        digest
     }
 
     fn route() -> RouteFingerprint {
@@ -2261,11 +2299,10 @@ mod tests {
         assert_eq!(envelope.producer_adapter_identity, ACP_NORMALIZER_IDENTITY);
         assert_eq!(envelope.adapter_contract_version, ACP_SCHEMA_VERSION);
         // Raw provider bytes never enter the public normalized payload.
-        assert_eq!(
-            serde_json::to_value(&envelope)?
+        assert!(
+            !serde_json::to_value(&envelope)?
                 .to_string()
-                .contains("session/update"),
-            false
+                .contains("session/update")
         );
         // Determinism: the same typed input reproduces the same digest.
         let cursor = EventCursor::new("cursor-acp-typed-1")?;
@@ -2536,7 +2573,12 @@ mod tests {
             .map(|index| EventCursor::new(format!("cursor-pred-{index}")))
             .collect::<Result<Vec<EventCursor>, _>>()?
             .into_iter()
-            .map(|_| EventId::new("evt-pred").expect("valid predecessor"))
+            .map(|_| {
+                let Ok(id) = EventId::new("evt-pred") else {
+                    panic!("valid predecessor");
+                };
+                id
+            })
             .collect();
         // Nine predecessors exceed MAX_HOST_EVENT_PREDECESSORS (8).
         assert!(matches!(
