@@ -22,8 +22,11 @@ use thiserror::Error;
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum NotificationSeverity {
+    /// Routine informational record.
     Information,
+    /// Degraded but non-terminal record.
     Warning,
+    /// Persistent record requiring authorized disposition.
     Critical,
 }
 
@@ -31,16 +34,24 @@ pub enum NotificationSeverity {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE", tag = "kind")]
 pub enum DeliveryState {
+    /// No delivery attempt recorded yet.
     Pending,
+    /// Latest attempt delivered without resolving the record.
     Delivered,
-    Failed { reason: String },
+    /// Latest attempt failed; carries the failure reason.
+    Failed {
+        /// Reason for the latest failed delivery attempt.
+        reason: String,
+    },
 }
 
 /// Toast-suppression acknowledgement. It never resolves the record.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Acknowledgement {
+    /// Principal that acknowledged the record.
     pub principal: String,
+    /// Kernel sequence at acknowledgement time.
     pub sequence: u64,
 }
 
@@ -48,8 +59,11 @@ pub struct Acknowledgement {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Resolution {
+    /// Principal that authorized the disposition.
     pub authorized_by: String,
+    /// Evidence references backing the disposition.
     pub evidence_refs: Vec<String>,
+    /// Recorded terminal disposition.
     pub disposition: String,
 }
 
@@ -57,12 +71,19 @@ pub struct Resolution {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Notification {
+    /// Stable dedup key owning exactly one record.
     pub dedup_key: String,
+    /// Canonical severity carried on the record.
     pub severity: NotificationSeverity,
+    /// Human-readable summary of the failure.
     pub summary: String,
+    /// Count of failures coalesced under the dedup key.
     pub occurrences: u64,
+    /// Latest delivery observation.
     pub delivery: DeliveryState,
+    /// Toast-suppression acknowledgement, if any.
     pub acknowledgement: Option<Acknowledgement>,
+    /// Terminal evidence-backed disposition, if any.
     pub resolution: Option<Resolution>,
 }
 
@@ -82,7 +103,7 @@ impl Notification {
     /// Pure popup predicate shared with the delivery selector.
     ///
     /// Acknowledgement stops toast repeats and resolution stops all popups,
-    /// but neither hides the record from the ControlBoard inbox. Quiet hours
+    /// but neither hides the record from the `ControlBoard` inbox. Quiet hours
     /// suppress only non-critical popups; critical records still pop up.
     #[must_use]
     pub fn should_popup(&self, quiet_hours_active: bool) -> bool {
@@ -99,14 +120,19 @@ impl Notification {
 /// Fail-closed errors for the notification lifecycle.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum NotificationError {
+    /// A validated field was malformed; carries the field name.
     #[error("invalid field: {0}")]
     InvalidField(&'static str),
+    /// No canonical record exists for the dedup key.
     #[error("unknown notification")]
     UnknownNotification,
+    /// Resolution requires non-empty valid evidence.
     #[error("resolution requires evidence")]
     ResolutionRequiresEvidence,
+    /// Resolution requires an authorized authorizer.
     #[error("resolution requires authorization")]
     ResolutionRequiresAuthorization,
+    /// The record already carries a terminal disposition.
     #[error("record is already resolved")]
     AlreadyResolved,
 }
@@ -198,10 +224,10 @@ impl NotificationStore {
         validate_dedup_key(dedup_key)?;
         text(summary, "summary")?;
         text(reason, "reason")?;
-        if let Some(existing) = self.records.get(dedup_key) {
-            if existing.resolution.is_some() {
-                return Err(NotificationError::AlreadyResolved);
-            }
+        if let Some(existing) = self.records.get(dedup_key)
+            && existing.resolution.is_some()
+        {
+            return Err(NotificationError::AlreadyResolved);
         }
         self.sequence = self.sequence.saturating_add(1);
         let occurrences = self
@@ -335,24 +361,32 @@ mod tests {
     #[test]
     fn repeat_failure_updates_one_record_via_dedup_key() {
         let mut store = NotificationStore::new();
-        store
-            .report_failure(
-                "disk-full",
-                NotificationSeverity::Warning,
-                "disk full",
-                "write failed",
-            )
-            .expect("first failure creates the record");
-        store
-            .report_failure(
-                "disk-full",
-                NotificationSeverity::Warning,
-                "disk still full",
-                "write failed again",
-            )
-            .expect("repeat failure updates the record");
+        assert!(
+            store
+                .report_failure(
+                    "disk-full",
+                    NotificationSeverity::Warning,
+                    "disk full",
+                    "write failed",
+                )
+                .is_ok(),
+            "first failure creates the record"
+        );
+        assert!(
+            store
+                .report_failure(
+                    "disk-full",
+                    NotificationSeverity::Warning,
+                    "disk still full",
+                    "write failed again",
+                )
+                .is_ok(),
+            "repeat failure updates the record"
+        );
         assert_eq!(store.len(), 1);
-        let record = store.get("disk-full").expect("record exists");
+        let Some(record) = store.get("disk-full") else {
+            panic!("record exists");
+        };
         assert_eq!(record.occurrences, 2);
         assert_eq!(record.summary, "disk still full");
         assert!(record.is_failed_delivery());
@@ -362,20 +396,29 @@ mod tests {
     #[test]
     fn ack_stops_toast_repeats_but_leaves_record_unresolved() {
         let mut store = NotificationStore::new();
-        store
-            .report_failure(
-                "backup-failed",
-                NotificationSeverity::Critical,
-                "backup failed",
-                "snapshot error",
-            )
-            .expect("create");
-        let before = store.get("backup-failed").expect("record exists").clone();
+        assert!(
+            store
+                .report_failure(
+                    "backup-failed",
+                    NotificationSeverity::Critical,
+                    "backup failed",
+                    "snapshot error",
+                )
+                .is_ok(),
+            "create"
+        );
+        let Some(before) = store.get("backup-failed") else {
+            panic!("record exists");
+        };
+        let before = before.clone();
         assert!(before.should_popup(false));
-        store
-            .acknowledge("backup-failed", "operator-1")
-            .expect("ack records");
-        let after = store.get("backup-failed").expect("record exists");
+        assert!(
+            store.acknowledge("backup-failed", "operator-1").is_ok(),
+            "ack records"
+        );
+        let Some(after) = store.get("backup-failed") else {
+            panic!("record exists");
+        };
         assert!(!after.should_popup(false));
         assert!(!after.should_popup(true));
         assert!(after.is_unresolved());
@@ -386,37 +429,52 @@ mod tests {
     #[test]
     fn critical_persists_until_authorized_evidence_backed_disposition() {
         let mut store = NotificationStore::new();
-        store
-            .report_failure(
-                "kernel-fence",
-                NotificationSeverity::Critical,
-                "fence lost",
-                "epoch mismatch",
-            )
-            .expect("create");
-        assert!(store
-            .resolve("kernel-fence", "owner", Vec::new(), "fixed", true)
-            .is_err());
-        assert!(store
-            .resolve(
-                "kernel-fence",
-                "owner",
-                vec!["evidence-1".to_owned()],
-                "fixed",
-                false
-            )
-            .is_err());
-        assert!(store.get("kernel-fence").expect("record").is_unresolved());
-        store
-            .resolve(
-                "kernel-fence",
-                "owner",
-                vec!["evidence-1".to_owned()],
-                "rotated and verified",
-                true,
-            )
-            .expect("authorized evidence-backed resolution");
-        let resolved = store.get("kernel-fence").expect("record");
+        assert!(
+            store
+                .report_failure(
+                    "kernel-fence",
+                    NotificationSeverity::Critical,
+                    "fence lost",
+                    "epoch mismatch",
+                )
+                .is_ok(),
+            "create"
+        );
+        assert!(
+            store
+                .resolve("kernel-fence", "owner", Vec::new(), "fixed", true)
+                .is_err()
+        );
+        assert!(
+            store
+                .resolve(
+                    "kernel-fence",
+                    "owner",
+                    vec!["evidence-1".to_owned()],
+                    "fixed",
+                    false
+                )
+                .is_err()
+        );
+        let Some(record) = store.get("kernel-fence") else {
+            panic!("record");
+        };
+        assert!(record.is_unresolved());
+        assert!(
+            store
+                .resolve(
+                    "kernel-fence",
+                    "owner",
+                    vec!["evidence-1".to_owned()],
+                    "rotated and verified",
+                    true,
+                )
+                .is_ok(),
+            "authorized evidence-backed resolution"
+        );
+        let Some(resolved) = store.get("kernel-fence") else {
+            panic!("record");
+        };
         assert!(!resolved.is_unresolved());
         assert!(!resolved.should_popup(false));
     }
@@ -424,24 +482,34 @@ mod tests {
     #[test]
     fn quiet_hours_suppress_only_noncritical_popups() {
         let mut store = NotificationStore::new();
-        store
-            .report_failure(
-                "routine-sync",
-                NotificationSeverity::Information,
-                "sync slow",
-                "retryable",
-            )
-            .expect("create info");
-        store
-            .report_failure(
-                "disk-critical",
-                NotificationSeverity::Critical,
-                "disk critical",
-                "write failed",
-            )
-            .expect("create critical");
-        let info = store.get("routine-sync").expect("info");
-        let critical = store.get("disk-critical").expect("critical");
+        assert!(
+            store
+                .report_failure(
+                    "routine-sync",
+                    NotificationSeverity::Information,
+                    "sync slow",
+                    "retryable",
+                )
+                .is_ok(),
+            "create info"
+        );
+        assert!(
+            store
+                .report_failure(
+                    "disk-critical",
+                    NotificationSeverity::Critical,
+                    "disk critical",
+                    "write failed",
+                )
+                .is_ok(),
+            "create critical"
+        );
+        let Some(info) = store.get("routine-sync") else {
+            panic!("info");
+        };
+        let Some(critical) = store.get("disk-critical") else {
+            panic!("critical");
+        };
         assert!(info.should_popup(false));
         assert!(!info.should_popup(true));
         assert!(critical.should_popup(false));

@@ -1,7 +1,7 @@
 //! Popup delivery selection with quiet-hours scoping (issue #1780).
 //!
 //! This composition helper decides only whether a popup/toast is emitted.
-//! Canonical creation and ControlBoard visibility are never suppressed:
+//! Canonical creation and `ControlBoard` visibility are never suppressed:
 //! [`DeliveryDecision::create_canonical`] and
 //! [`DeliveryDecision::board_visible`] are always true. Quiet hours suppress
 //! only non-critical popups; critical records always pop up unless they are
@@ -73,13 +73,8 @@ pub fn select_delivery(
     resolved: bool,
     quiet_hours_active: bool,
 ) -> DeliveryDecision {
-    let popup = if resolved || acknowledged {
-        false
-    } else if quiet_hours_active && severity != PopupSeverity::Critical {
-        false
-    } else {
-        true
-    };
+    let popup =
+        !resolved && !acknowledged && (!quiet_hours_active || severity == PopupSeverity::Critical);
     DeliveryDecision {
         create_canonical: true,
         board_visible: true,
@@ -93,7 +88,9 @@ mod tests {
 
     #[test]
     fn quiet_hours_suppress_only_noncritical_popups() {
-        let window = QuietHours::new(22, 7).expect("valid window");
+        let Some(window) = QuietHours::new(22, 7) else {
+            panic!("valid window");
+        };
         assert!(window.contains(23));
         assert!(window.contains(3));
         assert!(!window.contains(12));

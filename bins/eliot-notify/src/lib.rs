@@ -34,9 +34,7 @@ use eliot_platform_windows::{
     register_interactive_watchdog_task, run_registered_watchdog_task, validate_pinned_artifact,
 };
 use eliot_protocol::RequestIdentity;
-use eliot_receipts::{
-    EffectClass, ProofCeiling, ReceiptEnvelope, contract_identity,
-};
+use eliot_receipts::{EffectClass, ProofCeiling, ReceiptEnvelope, contract_identity};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -307,11 +305,9 @@ where
             }
         };
         let result = match self.exchange.lock() {
-            Ok(mut exchange) => exchange.transact_with_identity(
-                &issued.identity,
-                operation.selector(),
-                payload,
-            ),
+            Ok(mut exchange) => {
+                exchange.transact_with_identity(&issued.identity, operation.selector(), payload)
+            }
             Err(_) => {
                 return PortOutcome::Error(PortError::Provider(ProviderError {
                     code: ProviderErrorCode::Failed,
@@ -625,10 +621,7 @@ where
             },
         })),
         ledger: Some(Box::new(KernelLedger {
-            port: KernelPort {
-                exchange,
-                issuer,
-            },
+            port: KernelPort { exchange, issuer },
         })),
     }
 }
@@ -1673,11 +1666,10 @@ mod tests {
             operation: &str,
             payload: Value,
         ) -> Result<Value, KernelClientError> {
-            self.calls.lock().unwrap().push((
-                operation.to_owned(),
-                identity.clone(),
-                payload,
-            ));
+            self.calls
+                .lock()
+                .unwrap()
+                .push((operation.to_owned(), identity.clone(), payload));
             Ok(self.response.clone())
         }
     }
