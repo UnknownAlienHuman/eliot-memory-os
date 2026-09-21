@@ -1811,7 +1811,9 @@ dependencies = [
 name = "eliot-host-service"
 version = "0.1.0"
 dependencies = [
+ "eliot-agent-contracts",
  "eliot-contracts",
+ "eliot-host-state",
  "eliot-kernel-service",
  "eliot-platform",
  "eliot-platform-windows",
