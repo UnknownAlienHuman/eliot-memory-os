@@ -1,0 +1,19 @@
+[package]
+name = "eliot-git-bridge"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+description = "Typed Git bridge without destructive worktree handling (issue 1830)"
+
+# Standalone workspace root on purpose: root integration owns admission into
+# the workspace `members` table, so this crate must build and test in
+# isolation via --manifest-path with an isolated --target-dir.
+[workspace]
+
+[lib]
+name = "eliot_git_bridge"
+path = "src/lib.rs"
+
+[lints.rust]
+unsafe_code = "forbid"

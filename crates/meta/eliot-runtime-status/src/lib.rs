@@ -75,6 +75,15 @@ pub use controlboard_projection::{
     ControlBoardSupport, project_controlboard_contour, read_controlboard_contour,
 };
 
+mod controlboard_consumer;
+pub use controlboard_consumer::{
+    CONTROLBOARD_CONSUMER_CONTRACT, ControlBoardConsumerError, ControlBoardExpectedSet,
+    ControlBoardInstallation, ControlBoardObservationContext, ControlBoardObservationTime,
+    ControlBoardRecoveryOwner, ControlBoardRowDisposition, ControlBoardSourceDigest,
+    RenderedControlBoard, RenderedControlBoardRow, read_controlboard_status,
+    render_controlboard_status,
+};
+
 const WATCHDOG_PUBLICATION_CHILD_LIMIT: u64 = 1024 * 1024;
 const HOST_JOURNAL_FILE_NAME: &str = "host-state-journal.redb";
 const WIN32_ERROR_FILE_NOT_FOUND: u32 = 2;

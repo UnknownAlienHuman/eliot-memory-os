@@ -24,6 +24,7 @@ pub use commit_recovery::{
     paused_scopes_snapshot, receipt_evidence_digest, recover_commit,
 };
 mod capacity_evidence;
+mod contract_rejection_gate;
 mod doctor;
 mod doctor_front_door;
 mod host_request_binding;
@@ -43,6 +44,10 @@ pub use capacity_evidence::{
     BoundaryOptimizationProposal, CAPACITY_EVIDENCE_SCHEMA_VERSION, CanonicalWriteLatencyProfile,
     CapacityEnvelope, CapacityEvidenceError, CorpusScaleProfile, EvidenceClass,
     LatencyDistribution, MIN_PERCENTILE_SAMPLES, OptimizationQualification, UnqualifiedReason,
+};
+pub use contract_rejection_gate::{
+    PRE_STAGE_RETRY_RULE, PreStageDecision, PreStageIdentityCache, PreStageRejection,
+    PreStageState, derive_rejection_id, pre_stage_check,
 };
 pub use doctor::{
     ComposedDoctorFrontDoor, DOCTOR_CONFLICT_MAX_FIELDS, DOCTOR_MAX_ENVELOPE_BYTES,
