@@ -169,3 +169,28 @@ fn verifier_rejects_implementation_mutation_without_downgrade() {
     );
     assert!(verifier.authorize(op::IMPLEMENTATION_MUTATE, NOW).is_err());
 }
+
+#[test]
+fn lease_window_opening_is_enforced_fail_closed() {
+    let context = ok(CapabilityContext::admit(
+        "ctx-worker-window-1",
+        AgentRole::Worker,
+        binding(Some("work-item-9"), 1),
+        &open(),
+        &no_delegation(),
+    ));
+    // Before owner-observed issuance the token authorizes nothing.
+    assert!(
+        context
+            .active()
+            .authorize(op::WORK_ITEM_ACT, ISSUED - 1)
+            .is_err()
+    );
+    ok(context.active().authorize(op::WORK_ITEM_ACT, NOW));
+    assert!(
+        context
+            .active()
+            .authorize(op::WORK_ITEM_ACT, EXPIRES)
+            .is_err()
+    );
+}

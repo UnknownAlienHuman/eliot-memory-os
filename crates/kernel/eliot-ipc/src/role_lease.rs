@@ -396,10 +396,11 @@ impl CapabilityToken {
     /// Server-enforced authorization for one operation.
     ///
     /// `now_unix_ms` is owner-observed time; this function invents no clock.
-    /// Denies when the context is revoked, the lease expired, the operation
-    /// is unknown, or the operation is not in the compiled allow set. The
-    /// forbid set denies even if the allow set somehow names the operation:
-    /// a role label can never authorize a forbidden operation.
+    /// Denies when the context is revoked, the lease window has not opened,
+    /// the lease expired, the operation is unknown, or the operation is not
+    /// in the compiled allow set. The forbid set denies even if the allow
+    /// set somehow names the operation: a role label can never authorize a
+    /// forbidden operation.
     ///
     /// # Errors
     ///
@@ -407,6 +408,11 @@ impl CapabilityToken {
     pub fn authorize(&self, operation: &str, now_unix_ms: u64) -> Result<(), RoleLeaseError> {
         if self.revoked {
             return Err(RoleLeaseError::ContextRevoked {
+                context_id: self.context_id.clone(),
+            });
+        }
+        if now_unix_ms < self.binding.issued_at_unix_ms {
+            return Err(RoleLeaseError::LeaseNotYetValid {
                 context_id: self.context_id.clone(),
             });
         }
@@ -733,6 +739,12 @@ pub enum RoleLeaseError {
     #[error("capability context {context_id:?} revoked by role transition")]
     ContextRevoked {
         /// The closed context.
+        context_id: String,
+    },
+    /// Authorization before the owner-observed issuance time.
+    #[error("capability context {context_id:?} lease window has not opened")]
+    LeaseNotYetValid {
+        /// The prematurely presented context.
         context_id: String,
     },
     /// Authorization after lease expiry.
