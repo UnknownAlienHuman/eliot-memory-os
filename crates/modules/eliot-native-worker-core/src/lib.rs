@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+mod action_envelope;
 mod ports;
 mod protocol;
 
@@ -16,6 +17,10 @@ use std::sync::{Arc, Mutex};
 /// Constituent envelope types of the public claim protocol, re-exported so
 /// composition roots (which must not depend on the agent plane directly) can
 /// build and inspect claims through this crate's API.
+pub use action_envelope::{
+    ActionEnvelopeCarrier, ActionEnvelopeCarrierError, MAX_ACTION_ENVELOPE_BYTES,
+    MAX_ACTION_ENVELOPE_OP_LEN,
+};
 pub use eliot_agent_api::{
     AttemptId, AuthorityEnvelope, BudgetEnvelope, EffectCeiling, EffectKind,
 };

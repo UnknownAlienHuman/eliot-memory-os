@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use eliot_bootstrap::capture::{capture_snapshot, write_snapshot_artifact};
 use eliot_cli::{CommandCatalogue, CommandPort, CommandPortError, CommandRequest};
+use eliot_doctor::integration;
 use eliot_installation::{
     ActivationCommitFence, ApprovedGenerationRegistry, CandidateManifest,
     GenerationPackagePlanInput, GenerationPackagePlanner, InstallationEpoch, InstallationError,
@@ -29,6 +30,7 @@ use eliot_platform_windows::{
 };
 use eliot_runtime_contracts::RuntimeLiveStoreIdentity;
 use eliot_store_surreal::{StoreLaunchConfig, launch_config_digest};
+mod backup_entry;
 #[cfg(windows)]
 mod legacy_governor_config;
 use serde_json::json;
@@ -43,7 +45,11 @@ use std::{
 use tracing_subscriber::EnvFilter;
 
 mod bootstrap_draft;
+mod controlboard_status;
+mod first_run_flow;
+mod plugin_preview;
 mod source_bundle_materializer;
+mod update_installer;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const INVALID_REQUEST_EXIT: i32 = 2;
@@ -88,6 +94,34 @@ enum Command {
     Runtime {
         #[command(subcommand)]
         command: RuntimeCommand,
+    },
+    /// Governor-backed first-run setup: typed per-role routes, visible
+    /// defaults, and Human-board recommendations. Replaces the retired
+    /// legacy `governor.toml` path, which is never adopted as authority.
+    Setup {
+        #[command(subcommand)]
+        command: SetupCommand,
+    },
+    /// Preview or install a plugin/bridge with rollback (I3.7).
+    Plugin {
+        #[command(subcommand)]
+        command: PluginCommand,
+    },
+    /// Verify plugin/bridge integration coverage for one profile (I3.7).
+    Doctor {
+        #[command(subcommand)]
+        command: DoctorCommand,
+    },
+    /// Read the reconciled `ControlBoard` status projection (#1213).
+    #[command(name = "controlboard")]
+    ControlBoard {
+        #[command(subcommand)]
+        command: ControlBoardCommand,
+    },
+    /// Preview backup creation/restore plans and key coverage (#1873; preview-only, no execution).
+    Backup {
+        #[command(subcommand)]
+        command: backup_entry::BackupCommand,
     },
     Version,
     /// Start or reuse the authenticated User Broker and launch Operator.
@@ -278,6 +312,42 @@ enum InstallationCommand {
         #[arg(long)]
         installation_key: Option<String>,
     },
+    /// Stage one update package into a new versioned directory without
+    /// overwriting the running executable. `eliot-kernel` and `eliot-host`
+    /// are release-level and require `--release-approved`; optional modules
+    /// stage as generation updates with rollback metadata.
+    StageUpdate {
+        /// Absolute installation root; `<root>/<package>/<version>` is created new.
+        #[arg(long, value_parser = absolute_path)]
+        install_root: PathBuf,
+        /// Package (binary) name.
+        #[arg(long)]
+        package: String,
+        /// Version label; becomes the new versioned directory name.
+        #[arg(long)]
+        version: String,
+        /// Declared update channel (`stable`, `preview`, or `local-dev`).
+        #[arg(long, value_parser = parse_update_channel)]
+        channel: update_installer::UpdateChannel,
+        /// Lowercase hex SHA-256 of the payload file.
+        #[arg(long)]
+        artifact_sha256: String,
+        /// Absolute payload executable file staged into the versioned directory.
+        #[arg(long, value_parser = absolute_path)]
+        payload: PathBuf,
+        /// Optional running executable; staging fails closed on collision.
+        #[arg(long, value_parser = absolute_path)]
+        running_exe: Option<PathBuf>,
+        /// Optional previous versioned directory recorded for module rollback.
+        #[arg(long, value_parser = absolute_path)]
+        previous_version_dir: Option<PathBuf>,
+        /// Required for Kernel/Host release-level updates.
+        #[arg(long)]
+        release_approved: bool,
+        /// Absolute create-new update record JSON path.
+        #[arg(long, value_parser = absolute_path)]
+        output: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -314,6 +384,57 @@ enum RuntimeCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum PluginCommand {
+    /// Render the exact I3.7 preview fields without mutating anything.
+    Preview {
+        /// Absolute path to the plugin proposal manifest JSON.
+        #[arg(long, value_parser = absolute_path)]
+        manifest: PathBuf,
+        /// Absolute rollback directory bound into the preview.
+        #[arg(long, value_parser = absolute_path)]
+        rollback_dir: PathBuf,
+    },
+    /// Preserve the rollback artifact before mutation, then record an
+    /// install receipt scoped to the rollback directory. Never claims
+    /// runtime liveness.
+    Install {
+        /// Absolute path to the plugin proposal manifest JSON.
+        #[arg(long, value_parser = absolute_path)]
+        manifest: PathBuf,
+        /// Absolute rollback directory receiving the artifact and receipt.
+        #[arg(long, value_parser = absolute_path)]
+        rollback_dir: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum DoctorCommand {
+    /// Inspect expected file hashes, active registrations, observed hook
+    /// events, and the handshake result for one profile, reporting
+    /// installation separately from runtime liveness. Read-only: executes
+    /// no repair, mints no authority, mutates nothing.
+    Integration {
+        /// Integration profile name; must equal the expectation record profile.
+        profile: String,
+        /// Absolute path to the expected integration state JSON.
+        #[arg(long, value_parser = absolute_path)]
+        expectation: PathBuf,
+        /// Absolute path to the observed integration state JSON.
+        #[arg(long, value_parser = absolute_path)]
+        observation: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ControlBoardCommand {
+    /// Fetch one reconciled `ControlBoard` board over the authenticated
+    /// `controlboard.status` transact path and project its typed rows.
+    /// Read-only: owns no board handle, cache, or canonical state, and
+    /// synthesizes no health from the dispositions.
+    Status,
+}
+
+#[derive(Debug, Subcommand)]
 enum SystemCommand {
     /// Capture source/build/runtime/store/integration evidence.
     Snapshot {
@@ -334,6 +455,85 @@ enum CatalogueCommand {
     Help,
     Schema,
     Validate,
+}
+
+/// Governor-backed first-run setup commands (issue #1962).
+#[derive(Debug, Subcommand)]
+enum SetupCommand {
+    /// Decide typed per-role route state. Omitted roles stay `UNASSIGNED`;
+    /// paid routes require explicit consent flags.
+    Apply {
+        /// Dreamer route kind: `unassigned`, `local`, `economy`, or `paid`.
+        #[arg(long)]
+        dreamer_route: Option<String>,
+        /// Watchdog route kind: `unassigned`, `local`, `economy`, or `paid`.
+        #[arg(long)]
+        watchdog_route: Option<String>,
+        /// The setup screen displayed the Dreamer local/economy default.
+        #[arg(long, default_value = "false")]
+        dreamer_displayed: bool,
+        /// The setup screen displayed the Watchdog local/economy default.
+        #[arg(long, default_value = "false")]
+        watchdog_displayed: bool,
+        /// Explicit paid-route consent for Dreamer.
+        #[arg(long, default_value = "false")]
+        dreamer_explicit: bool,
+        /// Explicit paid-route consent for Watchdog.
+        #[arg(long, default_value = "false")]
+        watchdog_explicit: bool,
+        /// Automation mode: `suggest_only`, `manual`, `idle_only`,
+        /// `scheduled`, `continuous_bounded`, or `off`. Omitted keeps the
+        /// visible `SUGGEST_ONLY` default.
+        #[arg(long)]
+        automation: Option<String>,
+        /// Human owner ref recorded on every persisted setting. Required:
+        /// no identity is invented by the CLI.
+        #[arg(long)]
+        owner_ref: String,
+    },
+    /// Inspect every default through the same typed path (reversible).
+    Show,
+    /// Update one role and/or the automation mode through the same typed
+    /// path used by `apply`.
+    Set {
+        /// Role key: `main`, `worker`, `auditor`, `verifier`, `watchdog`,
+        /// `dreamer`, or `research`. Required with `--route`.
+        #[arg(long)]
+        role: Option<String>,
+        /// Route kind: `unassigned`, `local`, `economy`, or `paid`. Omitted
+        /// clears the role back to `UNASSIGNED`.
+        #[arg(long)]
+        route: Option<String>,
+        /// The setup screen displayed the local/economy default.
+        #[arg(long, default_value = "false")]
+        displayed: bool,
+        /// Explicit paid-route consent.
+        #[arg(long, default_value = "false")]
+        explicit_consent: bool,
+        /// Automation mode update: `suggest_only`, `manual`, `idle_only`,
+        /// `scheduled`, `continuous_bounded`, or `off`. At least one of
+        /// `--route` or `--automation` is required.
+        #[arg(long)]
+        automation: Option<String>,
+        /// Human owner ref recorded on every persisted setting. Required:
+        /// no identity is invented by the CLI.
+        #[arg(long)]
+        owner_ref: String,
+    },
+    /// With automation disabled, record one deduplicated Human-board
+    /// recommendation for a needed action; no job starts.
+    Recommend {
+        /// Automation mode: `suggest_only`, `manual`, `idle_only`,
+        /// `scheduled`, `continuous_bounded`, or `off`.
+        #[arg(long)]
+        automation: String,
+        /// Maintenance family, e.g. `RESEARCH_EXCHANGE_CLEANUP`.
+        #[arg(long)]
+        family: String,
+        /// Affected scope reference.
+        #[arg(long)]
+        scope: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -366,9 +566,248 @@ fn run() -> Result<i32> {
         Command::Bootstrap { command } => Ok(run_bootstrap(command)),
         Command::Installation { command } => run_installation(command),
         Command::Runtime { command } => run_runtime(command),
+        Command::Setup { command } => run_setup(command),
+        Command::Plugin { command } => run_plugin(command),
+        Command::Doctor { command } => run_doctor(command),
+        Command::ControlBoard { command } => run_controlboard(command),
+        Command::Backup { command } => backup_entry::run_backup(command),
         Command::Dispatch => run_dispatch(),
         Command::Ui => run_ui(),
     }
+}
+
+#[cfg(windows)]
+fn reject_present_legacy_governor_config() -> Result<()> {
+    observe_legacy_governor_config()
+}
+
+#[cfg(not(windows))]
+fn reject_present_legacy_governor_config() -> Result<()> {
+    Ok(())
+}
+
+fn run_setup(command: SetupCommand) -> Result<i32> {
+    // #1962: reject a present legacy Governor file before any setup
+    // decision; absent proceeds with no legacy config adopted.
+    reject_present_legacy_governor_config()?;
+    match command {
+        SetupCommand::Apply {
+            dreamer_route,
+            watchdog_route,
+            dreamer_displayed,
+            watchdog_displayed,
+            dreamer_explicit,
+            watchdog_explicit,
+            automation,
+            owner_ref,
+        } => first_run_flow::run_setup_apply(&first_run_flow::SetupApplyArgs {
+            dreamer_route,
+            watchdog_route,
+            dreamer_displayed,
+            watchdog_displayed,
+            dreamer_explicit,
+            watchdog_explicit,
+            automation,
+            owner_ref,
+        }),
+        SetupCommand::Show => first_run_flow::run_setup_show(),
+        SetupCommand::Set {
+            role,
+            route,
+            displayed,
+            explicit_consent,
+            automation,
+            owner_ref,
+        } => first_run_flow::run_setup_set(&first_run_flow::SetupSetArgs {
+            role,
+            route,
+            displayed,
+            explicit_consent,
+            automation,
+            owner_ref,
+        }),
+        SetupCommand::Recommend {
+            automation,
+            family,
+            scope,
+        } => first_run_flow::run_setup_recommend(&first_run_flow::SetupRecommendArgs {
+            automation,
+            family,
+            scope,
+        }),
+    }
+}
+
+fn run_plugin(command: PluginCommand) -> Result<i32> {
+    match command {
+        PluginCommand::Preview {
+            manifest,
+            rollback_dir,
+        } => {
+            let proposal = match plugin_preview::load_manifest(&manifest) {
+                Ok(proposal) => proposal,
+                Err(error) => {
+                    write_installation_error("PLUGIN_PREVIEW_INVALID", &error.to_string());
+                    return Ok(INVALID_REQUEST_EXIT);
+                }
+            };
+            let preview = plugin_preview::render_preview(&proposal, &rollback_dir);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&plugin_preview::preview_json(&preview))?
+            );
+            Ok(0)
+        }
+        PluginCommand::Install {
+            manifest,
+            rollback_dir,
+        } => {
+            let proposal = match plugin_preview::load_manifest(&manifest) {
+                Ok(proposal) => proposal,
+                Err(error) => {
+                    write_installation_error("PLUGIN_INSTALL_INVALID", &error.to_string());
+                    return Ok(INVALID_REQUEST_EXIT);
+                }
+            };
+            match plugin_preview::install_with_rollback(&proposal, &rollback_dir) {
+                // No admitted mutation port exists, so success is unreachable:
+                // a backup-only path cannot yield installed success. The
+                // defensive arm stays fail-closed if that ever changes.
+                Ok(_) => {
+                    write_installation_error(
+                        "PLUGIN_INSTALL_UNEXPECTED",
+                        "install reported success without an admitted mutation port; no installed claim is emitted",
+                    );
+                    Ok(INVALID_REQUEST_EXIT)
+                }
+                Err(plugin_preview::PluginPreviewError::InstallNotAttempted {
+                    detail,
+                    rollback_artifact,
+                    receipt_path,
+                }) => {
+                    write_installation_error(
+                        "PLUGIN_INSTALL_NOT_ATTEMPTED",
+                        &format!(
+                            "{detail} rollback={} receipt={}",
+                            rollback_artifact.display(),
+                            receipt_path.display()
+                        ),
+                    );
+                    Ok(INVALID_REQUEST_EXIT)
+                }
+                Err(error) => {
+                    write_installation_error("PLUGIN_INSTALL_FAILED", &error.to_string());
+                    Ok(INVALID_REQUEST_EXIT)
+                }
+            }
+        }
+    }
+}
+
+fn run_doctor(command: DoctorCommand) -> Result<i32> {
+    match command {
+        DoctorCommand::Integration {
+            profile,
+            expectation,
+            observation,
+        } => {
+            // Same shared gate as `eliot-doctor integration`: the evaluator
+            // and output contract live in `eliot_doctor::integration`; this
+            // front door only decodes arguments and projects the result.
+            // Verification mismatches are data inside the JSON report
+            // (exit 0); only input errors exit nonzero.
+            match integration::verify_profile(&profile, &expectation, &observation) {
+                Ok(report) => {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                    Ok(0)
+                }
+                Err(error) => {
+                    write_installation_error("DOCTOR_INTEGRATION_INVALID", &error.to_string());
+                    Ok(INVALID_REQUEST_EXIT)
+                }
+            }
+        }
+    }
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "single-variant command dispatch keeps the by-value shape reserved for future variants"
+)]
+fn run_controlboard(command: ControlBoardCommand) -> Result<i32> {
+    match command {
+        // Actual consumer over the authenticated EBP transact path: the
+        // serving runtime (Ramanujan/Kernel lane) reconciles the board and
+        // answers `controlboard.status`; this front door only decodes the
+        // served board with the owner's transport types and projects its
+        // typed rows. No board handle, cache, or canonical state is owned
+        // here, and no health is synthesized from the dispositions.
+        ControlBoardCommand::Status => {
+            #[cfg(windows)]
+            {
+                run_controlboard_status_windows()
+            }
+            #[cfg(not(windows))]
+            {
+                write_json_error(
+                    "KERNEL_APPLICATION_PORT_CLOSED",
+                    "Windows authenticated Kernel front door",
+                );
+                Ok(FRONT_DOOR_CLOSED_EXIT)
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn run_controlboard_status_windows() -> Result<i32> {
+    use eliot_cli::kernel_client::KernelClientError;
+
+    let mut port = match AuthenticatedKernelPort::load() {
+        Ok(port) => port,
+        Err(CommandPortError::FrontDoorClosed { contract }) => {
+            write_json_error("KERNEL_APPLICATION_PORT_CLOSED", contract);
+            return Ok(FRONT_DOOR_CLOSED_EXIT);
+        }
+        Err(error) => {
+            write_json_error("KERNEL_CLIENT_CONFIGURATION_REJECTED", &error.to_string());
+            return Ok(FRONT_DOOR_CLOSED_EXIT);
+        }
+    };
+    let served = match port.transact_controlboard_status() {
+        Ok(served) => served,
+        Err(KernelClientError::FrontDoorClosed(contract)) => {
+            write_json_error("KERNEL_APPLICATION_PORT_CLOSED", contract);
+            return Ok(FRONT_DOOR_CLOSED_EXIT);
+        }
+        Err(KernelClientError::UnknownOutcome(detail)) => {
+            write_json_error("CONTROLBOARD_STATUS_UNKNOWN", &detail);
+            return Ok(UNKNOWN_OUTCOME_EXIT);
+        }
+        Err(KernelClientError::MissingRequestIdentity) => {
+            write_json_error(
+                "CONTROLBOARD_STATUS_NOT_ADMITTED",
+                "no admitted EBP request identity is bound for an operator-initiated controlboard read; the identity must arrive through the admitted host request path and Ramanujan must serve controlboard.status; tracker #1213",
+            );
+            return Ok(INVALID_REQUEST_EXIT);
+        }
+        Err(error) => {
+            write_json_error("CONTROLBOARD_STATUS_REJECTED", &error.to_string());
+            return Ok(INVALID_REQUEST_EXIT);
+        }
+    };
+    let board = match controlboard_status::decode_status_response(served) {
+        Ok(board) => board,
+        Err(error) => {
+            write_json_error("CONTROLBOARD_STATUS_REFUSED", &error.to_string());
+            return Ok(UNKNOWN_OUTCOME_EXIT);
+        }
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&controlboard_status::render_status_json(&board)?)?
+    );
+    Ok(0)
 }
 
 fn run_bootstrap(command: BootstrapCommand) -> i32 {
@@ -1157,7 +1596,163 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
             agent_bridge_exe,
             agent_bridge_account,
         ),
+        InstallationCommand::StageUpdate {
+            install_root,
+            package,
+            version,
+            channel,
+            artifact_sha256,
+            payload,
+            running_exe,
+            previous_version_dir,
+            release_approved,
+            output,
+        } => run_installation_stage_update(
+            &install_root,
+            package,
+            version,
+            channel,
+            artifact_sha256,
+            &payload,
+            running_exe.as_deref(),
+            previous_version_dir.as_deref(),
+            release_approved,
+            &output,
+        ),
     }
+}
+
+fn parse_update_channel(
+    value: &str,
+) -> std::result::Result<update_installer::UpdateChannel, String> {
+    value
+        .parse::<update_installer::UpdateChannel>()
+        .map_err(|error| error.to_string())
+}
+
+fn update_installer_error_code(error: &update_installer::UpdateInstallerError) -> &'static str {
+    match error {
+        update_installer::UpdateInstallerError::UnknownChannel { .. }
+        | update_installer::UpdateInstallerError::InvalidPackage { .. } => {
+            "INSTALLATION_UPDATE_REJECTED"
+        }
+        update_installer::UpdateInstallerError::RunningBinaryWouldBeOverwritten { .. } => {
+            "INSTALLATION_UPDATE_RUNNING_GUARD"
+        }
+        update_installer::UpdateInstallerError::VersionedDirExists { .. } => {
+            "INSTALLATION_UPDATE_VERSION_EXISTS"
+        }
+        update_installer::UpdateInstallerError::ReleaseApprovalRequired => {
+            "INSTALLATION_UPDATE_RELEASE_APPROVAL_REQUIRED"
+        }
+        update_installer::UpdateInstallerError::StagingFailed { .. } => {
+            "INSTALLATION_UPDATE_STAGING_FAILED"
+        }
+    }
+}
+
+fn write_update_record_artifact(
+    path: &Path,
+    record: &update_installer::UpdateRecord,
+) -> Result<(), std::io::Error> {
+    if !path.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "update record output must be absolute",
+        ));
+    }
+    let mut bytes = serde_json::to_vec_pretty(record)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    bytes.push(b'\n');
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    drop(file);
+    let readback = fs::read(path)?;
+    if readback != bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "update record output readback differs from the exact written bytes",
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_installation_stage_update(
+    install_root: &Path,
+    package: String,
+    version: String,
+    channel: update_installer::UpdateChannel,
+    artifact_sha256: String,
+    payload: &Path,
+    running_exe: Option<&Path>,
+    previous_version_dir: Option<&Path>,
+    release_approved: bool,
+    output: &Path,
+) -> Result<i32> {
+    let payload_bytes = match load_input(payload) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            write_installation_error("INSTALLATION_UPDATE_PAYLOAD_REJECTED", &error.to_string());
+            return Ok(INVALID_REQUEST_EXIT);
+        }
+    };
+    let metadata = update_installer::PackageMetadata {
+        name: package,
+        version,
+        channel,
+        artifact_sha256,
+    };
+    let payload_digest = format!("{:x}", Sha256::digest(&payload_bytes));
+    if payload_digest != metadata.artifact_sha256 {
+        write_installation_error(
+            "INSTALLATION_UPDATE_DIGEST_MISMATCH",
+            "payload SHA-256 differs from the declared update package metadata",
+        );
+        return Ok(INVALID_REQUEST_EXIT);
+    }
+    let request = update_installer::InstallUpdateRequest {
+        install_root,
+        running_executable: running_exe,
+        package: &metadata,
+        payload: &payload_bytes,
+        previous_version_dir,
+        release_approved,
+    };
+    let record = match update_installer::install_update(&request) {
+        Ok(record) => record,
+        Err(error) => {
+            write_installation_error(update_installer_error_code(&error), &error.to_string());
+            return Ok(INVALID_REQUEST_EXIT);
+        }
+    };
+    if let Err(error) = write_update_record_artifact(output, &record) {
+        write_installation_error("INSTALLATION_UPDATE_OUTPUT_REJECTED", &error.to_string());
+        return Ok(INVALID_REQUEST_EXIT);
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "contract": "eliot.kernel.installation",
+            "contract_version": INSTALLATION_CONTRACT_VERSION,
+            "status": "STAGED",
+            "package": record.package_name,
+            "version": record.version,
+            "channel": record.channel.as_str(),
+            "kind": record.kind.as_str(),
+            "release_approval_required": record.kind.requires_release_approval(),
+            "installed_dir": record.installed_dir,
+            "executable": record.executable_path,
+            "generation": record.generation,
+            "rollback_from": record.rollback_from,
+            "scope": INSTALLATION_SCOPE,
+        }))?
+    );
+    Ok(0)
 }
 
 #[derive(Debug)]
@@ -2398,7 +2993,10 @@ fn open_existing_registry_for_terminal_reconcile(
             Err(error) if is_redb_exclusive_lock_contention(&error) => {
                 last_contention = Some(error);
                 if attempt + 1 < MAX_ATTEMPTS {
-                    std::thread::sleep(Duration::from_millis(BACKOFF_MS[attempt]));
+                    let Some(&backoff_ms) = BACKOFF_MS.get(attempt) else {
+                        panic!("backoff schedule covers all retries");
+                    };
+                    std::thread::sleep(Duration::from_millis(backoff_ms));
                     continue;
                 }
                 break;
@@ -2406,7 +3004,10 @@ fn open_existing_registry_for_terminal_reconcile(
             Err(error) => return Err(error),
         }
     }
-    Err(last_contention.expect("lock-contention loop must retain its cause"))
+    let Some(cause) = last_contention else {
+        panic!("lock-contention loop must retain its cause");
+    };
+    Err(cause)
 }
 
 fn reconcile_host_activation_terminal(
@@ -3041,6 +3642,22 @@ impl AuthenticatedKernelPort {
     ) -> std::result::Result<serde_json::Value, eliot_cli::kernel_client::KernelClientError> {
         self.client.ensure_operator_launch()
     }
+
+    /// Sends the exact `controlboard.status` operation through the
+    /// authenticated EBP Execute seam and returns the served result payload.
+    ///
+    /// The EBP request identity must already be bound on the client by an
+    /// admitted flow; this front door never mints principal, session, fence,
+    /// or idempotency identity. Without one the call fails closed with
+    /// `MissingRequestIdentity` before any byte is sent.
+    fn transact_controlboard_status(
+        &mut self,
+    ) -> std::result::Result<serde_json::Value, eliot_cli::kernel_client::KernelClientError> {
+        self.client.transact_json(
+            controlboard_status::STATUS_OPERATION,
+            controlboard_status::status_request_payload(),
+        )
+    }
 }
 
 #[cfg(windows)]
@@ -3121,6 +3738,130 @@ mod tests {
     #[test]
     fn committed_unknown_materialization_uses_reconciliation_exit() {
         assert_eq!(UNKNOWN_OUTCOME_EXIT, 75);
+    }
+
+    #[test]
+    fn plugin_preview_and_install_parse() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+        let parsed = Cli::try_parse_from([
+            "eliot",
+            "plugin",
+            "preview",
+            "--manifest",
+            "C:\\eliot\\manifest.json",
+            "--rollback-dir",
+            "C:\\eliot\\rollback",
+        ])
+        .expect("plugin preview parses");
+        assert!(matches!(
+            parsed.command,
+            Command::Plugin {
+                command: PluginCommand::Preview { .. }
+            }
+        ));
+        let parsed = Cli::try_parse_from([
+            "eliot",
+            "plugin",
+            "install",
+            "--manifest",
+            "C:\\eliot\\manifest.json",
+            "--rollback-dir",
+            "C:\\eliot\\rollback",
+        ])
+        .expect("plugin install parses");
+        assert!(matches!(
+            parsed.command,
+            Command::Plugin {
+                command: PluginCommand::Install { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn doctor_integration_parses() {
+        let parsed = Cli::try_parse_from([
+            "eliot",
+            "doctor",
+            "integration",
+            "demo",
+            "--expectation",
+            "C:\\eliot\\expectation.json",
+            "--observation",
+            "C:\\eliot\\observation.json",
+        ])
+        .expect("doctor integration parses");
+        assert!(matches!(
+            parsed.command,
+            Command::Doctor {
+                command: DoctorCommand::Integration { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn plugin_install_without_admitted_port_exits_nonsuccess() {
+        // End-to-end CLI honesty: a valid manifest still cannot produce an
+        // installed-success result without an admitted mutation port.
+        let root = std::env::temp_dir().join(format!("eliot-plugin-install-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("create temp root");
+        let target = root.join("config.json");
+        std::fs::write(&target, b"{\"bridge\":\"demo\"}").expect("write target");
+        let manifest_path = root.join("manifest.json");
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "plugin_id": "demo-bridge",
+                "profile": "demo",
+                "files_to_modify": [target.display().to_string()],
+                "config_block": "{\"bridge\":\"demo\"}",
+                "hooks": ["on_task"],
+                "mcp_server": "demo-mcp",
+                "tool_count": 3,
+                "skill_count": 2,
+                "expected_coverage": {
+                    "profile": "demo",
+                    "expected_file_hashes": {},
+                    "expected_registrations": ["demo-mcp"],
+                    "expected_hook_events": ["on_task"],
+                },
+            }))
+            .expect("serialize manifest"),
+        )
+        .expect("write manifest");
+        let rollback_dir = root.join("rollback");
+        let code = run_plugin(PluginCommand::Install {
+            manifest: manifest_path.clone(),
+            rollback_dir: rollback_dir.clone(),
+        })
+        .expect("install front door executes");
+        assert_eq!(code, INVALID_REQUEST_EXIT);
+        let receipt_path = rollback_dir.join("demo-bridge.installed.json");
+        let receipt: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&receipt_path).expect("read install receipt"),
+        )
+        .expect("parse install receipt");
+        assert_eq!(receipt["status"], "INSTALL_NOT_ATTEMPTED");
+        assert_eq!(receipt["code"], "PLAN_GAP");
+        assert_eq!(receipt["completed"], false);
+        // The target itself is untouched: no mutation occurred.
+        assert_eq!(
+            std::fs::read(&target).expect("read target"),
+            b"{\"bridge\":\"demo\"}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn controlboard_status_parses() {
+        let parsed = Cli::try_parse_from(["eliot", "controlboard", "status"])
+            .expect("controlboard status parses");
+        assert!(matches!(
+            parsed.command,
+            Command::ControlBoard {
+                command: ControlBoardCommand::Status
+            }
+        ));
     }
 
     fn applied_outcome() -> InstallationStepOutcome {

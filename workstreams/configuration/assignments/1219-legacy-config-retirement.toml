@@ -21,12 +21,12 @@ primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues
 
 [documentation]
 implementation = [
-  "docs/architecture/I01-02-mandatory-runtime-processes.md#i12-mandatory-runtime-processes",
+  "docs/architecture/I01-02-required-processes-of-the-first-complete-runtime.md#i12-required-processes-of-the-first-complete-runtime",
   "docs/architecture/I01-03-optional-and-on-demand-processes.md#i13-optional-and-on-demand-processes",
   "docs/architecture/I02-08-package-metadata-source-ownership-and-generated-registry.md#i28-package-metadata-source-ownership-and-generated-registry",
   "docs/architecture/I03-09-configuration-layers.md#i39-configuration-layers",
   "docs/architecture/I03-10-immutable-config-and-policy-snapshots.md#i310-immutable-config-and-policy-snapshots",
-  "docs/architecture/I05-01-store-boundary.md#i51-store-boundary",
+  "docs/architecture/I05-01-storage-boundary.md#i51-storage-boundary",
   "docs/architecture/I14-14-module-hot-replacement.md#i1414-module-hot-replacement",
   "docs/architecture/I15-04-secrets.md#i154-secrets",
 ]

@@ -33,6 +33,12 @@ thiserror.workspace = true
 
 [dev-dependencies]
 eliot-contracts.workspace = true
+# Issue #2031: the Kernel-route fixture proof (`tests/kernel_route_fixture.rs`
+# and the `test-support`-gated unit proofs) runs under the crate's declared
+# proof entrypoint `cargo test -p eliot-ors`. The self dev-dependency unifies
+# the off-by-default `test-support` feature into every test build without
+# linking it into production builds.
+eliot-ors = { path = ".", features = ["test-support"] }
 
 [lints]
 workspace = true

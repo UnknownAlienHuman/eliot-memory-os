@@ -25,13 +25,19 @@ use windows_sys::Win32::Foundation::{
     SetHandleInformation, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+    GetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT, SetNamedSecurityInfoW,
 };
 use windows_sys::Win32::Security::Credentials::{
     CRED_MAX_CREDENTIAL_BLOB_SIZE, CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC, CREDENTIALW,
     CredDeleteW, CredEnumerateW, CredFree, CredReadW, CredWriteW,
 };
-use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+use windows_sys::Win32::Security::{
+    ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, GetAce,
+    GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, GetTokenInformation,
+    OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+    PSID, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
+};
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
     FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_OVERLAPPED, FILE_NOTIFY_CHANGE_ATTRIBUTES,
@@ -61,7 +67,8 @@ use windows_sys::Win32::System::Pipes::{CreatePipe, GetNamedPipeClientProcessId}
 use windows_sys::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateEventW, CreateProcessW,
     DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess,
-    GetProcessTimes, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcess,
+    GetCurrentProcess,
+    GetProcessTimes, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcess, OpenProcessToken,
     PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
     PROCESS_SET_QUOTA, PROCESS_TERMINATE, QueryFullProcessImageNameW, ResumeThread,
     STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
@@ -405,6 +412,128 @@ pub fn named_pipe_client_process(pipe: &NamedPipeServer) -> io::Result<ProcessIm
         return Err(io::Error::last_os_error());
     }
     Ok(open_process_identity(pid)?.identity)
+}
+/// Resolves the current process token-user SID (`S-...` text) for pipe
+// (blank line kept by patch body below)
+/// DACL construction. A service and its sibling watchdog run under the
+/// same account in every supported contour, so granting this SID admits
+/// exactly the sibling peer class; per-connection peer binding still
+/// applies on top.
+///
+/// # Errors
+///
+/// Returns an error when the process token cannot be opened, queried, or
+/// converted to SID text.
+pub fn current_process_token_sid() -> io::Result<String> {
+    struct TokenGuard(HANDLE);
+    impl Drop for TokenGuard {
+        fn drop(&mut self) {
+            // SAFETY: the handle came from OpenProcessToken and closes once here.
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+    let mut token: HANDLE = ptr::null_mut();
+    // SAFETY: `token` is a valid out-pointer; the current-process
+    // pseudo-handle needs no close.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) } == 0
+        || token.is_null()
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let _guard = TokenGuard(token);
+    let mut needed: u32 = 0;
+    // SAFETY: probing the required size with a null buffer; the length
+    // out-pointer is live for the call.
+    unsafe {
+        GetTokenInformation(token, TokenUser, ptr::null_mut(), 0, &raw mut needed);
+    }
+    if needed == 0 || needed > 4096 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "process token size is invalid",
+        ));
+    }
+    // The query writes a TOKEN_USER (8-byte aligned), so the buffer is
+    // 8-byte aligned u64 storage sized up from the reported byte count.
+    let mut buffer = vec![0u64; (needed as usize).div_ceil(std::mem::size_of::<u64>())];
+    let capacity = u32::try_from(buffer.len() * std::mem::size_of::<u64>()).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidData, "process token size is invalid")
+    })?;
+    // SAFETY: the buffer is live for `capacity` bytes; the length
+    // out-pointer is live for the call.
+    if unsafe {
+        GetTokenInformation(
+            token,
+            TokenUser,
+            buffer.as_mut_ptr().cast(),
+            capacity,
+            &raw mut needed,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the successful query wrote a TOKEN_USER at the aligned
+    // buffer start.
+    let user = unsafe { &*(buffer.as_ptr().cast::<TOKEN_USER>()) };
+    sid_to_string(user.User.Sid)
+}
+
+/// Converts one live SID to canonical `S-...` text.
+///
+/// # Errors
+///
+/// Returns an error when the SID cannot be converted or the text is not a
+/// well-formed SID string.
+fn sid_to_string(sid: PSID) -> io::Result<String> {
+    let mut wide: *mut u16 = ptr::null_mut();
+    // SAFETY: `sid` is a live SID owned by the caller; `wide` receives a
+    // `LocalAlloc` string owned by this frame.
+    if unsafe { ConvertSidToStringSidW(sid, &raw mut wide) } == 0 || wide.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let mut len = 0usize;
+    while len < 512 {
+        // SAFETY: `wide` is a live NUL-terminated string; reads stop at
+        // the terminator or the bound.
+        if unsafe { *wide.add(len) } == 0 {
+            break;
+        }
+        len += 1;
+    }
+    if len == 0 || len >= 512 {
+        // SAFETY: `wide` is the live `LocalAlloc` string from the conversion.
+        unsafe {
+            LocalFree(wide.cast());
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "process SID text is invalid",
+        ));
+    }
+    // SAFETY: `wide` holds `len` live units; freed exactly once below.
+    let slice = unsafe { std::slice::from_raw_parts(wide, len) };
+    let sid = OsString::from_wide(slice).into_string().map_err(|_| {
+        // SAFETY: `wide` is the live `LocalAlloc` string from the conversion
+        // above; it must be freed on this early return exactly as below.
+        unsafe {
+            LocalFree(wide.cast());
+        }
+        io::Error::new(io::ErrorKind::InvalidData, "process SID is not UTF-8")
+    })?;
+    // SAFETY: `wide` is the live `LocalAlloc` string from the conversion above.
+    unsafe {
+        LocalFree(wide.cast());
+    }
+    if !sid.starts_with("S-") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "process SID text is invalid",
+        ));
+    }
+    Ok(sid)
 }
 
 /// Returns the full executable image path for `pid` using limited query access.
@@ -1916,6 +2045,345 @@ pub fn process_is_alive(pid: u32) -> io::Result<bool> {
     Ok(exit_code == still_active)
 }
 
+/// Returns the creation FILETIME ticks of the process named by the given PID.
+///
+/// PID equality alone cannot distinguish process reuse, so transport
+/// incarnation checks compare these ticks against the SCM-verified
+/// incarnation and fail closed on any mismatch or query failure.
+///
+/// # Errors
+///
+/// Returns an error for a zero PID, a zero creation time, or when Windows
+/// cannot open or query the process.
+pub fn process_creation_ticks(pid: u32) -> io::Result<u64> {
+    if pid == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "PID must be non-zero",
+        ));
+    }
+    // SAFETY: the PID is only used by Windows to resolve a process handle.
+    // The handle is owned here and closed exactly once below.
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process.is_null() || process == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    let ticks = process_start_ticks(process);
+    // SAFETY: the handle was returned by OpenProcess above and is closed
+    // exactly once here.
+    let closed = unsafe { CloseHandle(process) };
+    let ticks = ticks?;
+    if closed == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if ticks == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "process creation time is zero",
+        ));
+    }
+    Ok(ticks)
+}
+
+/// Returns the creation FILETIME ticks of the calling process.
+///
+/// The writer side binds its emitted sequence to the SCM-verified watchdog
+/// incarnation by comparing these ticks against the Host-issued descriptor.
+///
+/// # Errors
+///
+/// Returns an error for a zero creation time or when Windows cannot query
+/// the current process times.
+pub fn current_process_creation_ticks() -> io::Result<u64> {
+    // SAFETY: the current-process pseudo-handle needs no close and stays
+    // live for the synchronous query below.
+    let current = unsafe { GetCurrentProcess() };
+    let ticks = process_start_ticks(current)?;
+    if ticks == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "process creation time is zero",
+        ));
+    }
+    Ok(ticks)
+}
+
+/// `LocalSystem` SID text: the only account besides the current token user
+/// admitted to heartbeat transport files.
+const TRANSPORT_FILE_SYSTEM_SID: &str = "S-1-5-18";
+
+/// Builtin `Administrators` SID text. An elevated creator owns its files as
+/// `Administrators` by default, so transport files written from an elevated
+/// Host contour carry this owner without any attacker action. The `DACL`
+/// still admits only the token user plus `System`, so a non-administrator
+/// cannot write regardless of the owner value.
+const TRANSPORT_FILE_ADMINISTRATORS_SID: &str = "S-1-5-32-544";
+
+/// `Win32` `ACCESS_ALLOWED_ACE_TYPE` value. `windows-sys` exposes the `ACE` structs
+/// but no named constant, so the well-known value is pinned here with its
+/// meaning: any other `ACE` type (deny, audit, ...) fails the contour.
+const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+
+/// Converts one Win32 error status to an I/O error without narrowing casts.
+fn status_to_error(status: u32) -> io::Error {
+    match i32::try_from(status) {
+        Ok(code) => io::Error::from_raw_os_error(code),
+        Err(_) => io::Error::other("Windows security call failed"),
+    }
+}
+
+/// Restricts the given path to the heartbeat transport file contour: a
+/// protected `DACL` granting full control to exactly the current process token
+/// user and `LocalSystem`. Ownership is left untouched (the Host creator owns
+/// the file, which the verifier below checks). Callers verify after
+/// enforcing; a digest alone is never integrity.
+///
+/// # Errors
+///
+/// Returns an error when the token SID is unavailable or Windows cannot set
+/// the file DACL.
+pub fn restrict_file_to_current_user_and_system(path: &Path) -> io::Result<()> {
+    let sid = current_process_token_sid()?;
+    let descriptor = SecurityDescriptor::for_current_user(&sid)?;
+    // Extract the DACL from the SDDL-built descriptor: SetNamedSecurityInfoW
+    // takes the ACL itself, never the containing security descriptor.
+    let mut present: i32 = 0;
+    let mut acl: *mut ACL = ptr::null_mut();
+    let mut defaulted: i32 = 0;
+    // SAFETY: the descriptor is live for the extraction; the out-pointers
+    // are live stack slots; the returned ACL borrows the descriptor, which
+    // outlives the Set call below.
+    if unsafe {
+        GetSecurityDescriptorDacl(
+            descriptor.raw,
+            &raw mut present,
+            &raw mut acl,
+            &raw mut defaulted,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if present == 0 || acl.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "transport DACL template holds no DACL",
+        ));
+    }
+    let wide = nul_terminated_wide_file_path(path)?;
+    // SAFETY: the wide path is NUL-terminated and live for the call; the
+    // ACL borrows the live SDDL-built descriptor. Windows copies the DACL
+    // into the file object and retains nothing.
+    let status = unsafe {
+        SetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            acl,
+            ptr::null_mut(),
+        )
+    };
+    if status != 0 {
+        return Err(status_to_error(status));
+    }
+    Ok(())
+}
+
+/// Verifies the heartbeat transport file contour on the given path: the
+/// owner sits inside the trusted contour (token user, System, or the
+/// `Administrators` owner of elevated creation) and the `DACL` carries exactly
+/// two allow grants (the token user plus `LocalSystem`), with no other `ACE`.
+/// A NULL, absent, or broader `DACL` fails: inherited rights are never
+/// sufficient.
+///
+/// # Errors
+///
+/// Returns an error when the file cannot be queried or its owner/DACL is not
+/// exactly the transport contour.
+pub fn verify_file_owner_and_dacl(path: &Path) -> io::Result<()> {
+    let expected_owner = current_process_token_sid()?;
+    let wide = nul_terminated_wide_file_path(path)?;
+    let mut owner: PSID = ptr::null_mut();
+    let mut dacl: *mut ACL = ptr::null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    // SAFETY: the wide path is NUL-terminated and live for the call; the
+    // three out-pointers are live stack slots; the returned descriptor is
+    // owned by this frame and freed exactly once below.
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &raw mut owner,
+            ptr::null_mut(),
+            &raw mut dacl,
+            ptr::null_mut(),
+            &raw mut descriptor,
+        )
+    };
+    if status != 0 {
+        return Err(status_to_error(status));
+    }
+    let verdict = verify_transport_file_descriptor(descriptor, dacl, &expected_owner);
+    // SAFETY: the descriptor was allocated by GetNamedSecurityInfoW above
+    // and is freed exactly once here on every path past the status check.
+    unsafe {
+        LocalFree(descriptor.cast());
+    }
+    verdict
+}
+
+/// Checks one queried security descriptor against the transport contour.
+/// The owner `SID` must equal the current token user and the `DACL` must grant
+/// exactly the transport peer class (token user plus `LocalSystem`). When the
+/// token user IS `LocalSystem`, owner and `System` coincide: the `System`
+/// grant is checked first and proves both halves at once, keeping the
+/// contour satisfiable for a System service token.
+fn verify_transport_file_descriptor(
+    descriptor: PSECURITY_DESCRIPTOR,
+    dacl: *mut ACL,
+    expected_owner: &str,
+) -> io::Result<()> {
+    let mut owner_sid: PSID = ptr::null_mut();
+    let mut owner_defaulted: i32 = 0;
+    // SAFETY: the descriptor is the live caller-owned descriptor; the
+    // out-pointers are live stack slots; the returned SID borrows the
+    // descriptor and is consumed before it is freed.
+    if unsafe {
+        GetSecurityDescriptorOwner(descriptor, &raw mut owner_sid, &raw mut owner_defaulted)
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if owner_sid.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "transport file has no owner",
+        ));
+    }
+    let owner_text = sid_to_string(owner_sid)?;
+    // The owner must sit inside the trusted contour: the creating token
+    // user, LocalSystem, or the Administrators group that owns files
+    // created from an elevated contour. Anything else (another user,
+    // another group) proves the file was planted or re-owned outside the
+    // contour.
+    if owner_text != expected_owner
+        && owner_text != TRANSPORT_FILE_SYSTEM_SID
+        && owner_text != TRANSPORT_FILE_ADMINISTRATORS_SID
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "transport file owner is outside the transport contour",
+        ));
+    }
+    let mut dacl_present: i32 = 0;
+    let mut acl: *mut ACL = ptr::null_mut();
+    let mut dacl_defaulted: i32 = 0;
+    // SAFETY: same live-descriptor contract as the owner query above.
+    if unsafe {
+        GetSecurityDescriptorDacl(
+            descriptor,
+            &raw mut dacl_present,
+            &raw mut acl,
+            &raw mut dacl_defaulted,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    // A NULL DACL grants everything; an absent or substituted ACL cannot
+    // carry the transport contour.
+    if dacl_present == 0 || acl.is_null() || acl != dacl {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "transport file has no explicit DACL",
+        ));
+    }
+    // SAFETY: the ACL is the live non-null DACL inside the caller-owned
+    // descriptor (null and substitution rejected above).
+    let ace_count = unsafe { (*acl).AceCount };
+    if ace_count != 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "transport file DACL does not grant exactly the transport peer class",
+        ));
+    }
+    let mut seen_owner = false;
+    let mut seen_system = false;
+    for index in 0..u32::from(ace_count) {
+        let mut ace: *mut c_void = ptr::null_mut();
+        // SAFETY: the ACL is live and the ACE borrows the descriptor.
+        let fetched = unsafe { GetAce(acl, index, &raw mut ace) };
+        if fetched == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if ace.is_null() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "transport file DACL carries an empty ACE",
+            ));
+        }
+        // SAFETY: the ACE points at a live ACE header inside the descriptor.
+        let header = unsafe { &*ace.cast::<ACE_HEADER>() };
+        if header.AceType != ACCESS_ALLOWED_ACE_TYPE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "transport file DACL carries a non-allow ACE",
+            ));
+        }
+        // SAFETY: an ACCESS_ALLOWED ACE carries a mask plus SidStart.
+        let allowed = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
+        if allowed.Mask == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "transport file DACL carries an empty grant",
+            ));
+        }
+        let sid = sid_to_string(std::ptr::from_ref(&allowed.SidStart).cast_mut().cast())?;
+        note_contour_grant(&sid, expected_owner, &mut seen_owner, &mut seen_system)?;
+    }
+    if !seen_owner || !seen_system {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "transport file DACL does not grant the transport peer class",
+        ));
+    }
+    Ok(())
+}
+
+/// Credits one DACL ACE SID against the transport peer class. The `System`
+/// grant is checked before the owner grant so the contour stays satisfiable
+/// when the token user IS `LocalSystem`: owner and `System` coincide, so
+/// that one grant proves both peer halves at once.
+///
+/// # Errors
+///
+/// Returns an error when the ACE admits a principal outside the transport
+/// peer class.
+fn note_contour_grant(
+    sid: &str,
+    expected_owner: &str,
+    seen_owner: &mut bool,
+    seen_system: &mut bool,
+) -> io::Result<()> {
+    if sid == TRANSPORT_FILE_SYSTEM_SID {
+        *seen_system = true;
+        if sid == expected_owner {
+            *seen_owner = true;
+        }
+    } else if sid == expected_owner {
+        *seen_owner = true;
+    } else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "transport file DACL admits an unexpected principal",
+        ));
+    }
+    Ok(())
+}
+
 /// Atomically replaces a file with another file from the same volume and asks
 /// Windows to flush the move before returning.
 ///
@@ -3095,6 +3563,13 @@ mod tests {
         assert!(validate_sid("S-1-5-21-1234").is_ok());
         assert!(validate_sid("S-1-5-21)(A;;GA;;;WD").is_err());
     }
+    #[test]
+    fn current_process_token_sid_is_canonical() -> Result<(), Box<dyn std::error::Error>> {
+        let sid = super::current_process_token_sid()?;
+        assert!(sid.starts_with("S-"));
+        assert!(validate_sid(&sid).is_ok());
+        Ok(())
+    }
 
     #[test]
     fn image_buffer_truncation_bound_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
@@ -3511,5 +3986,84 @@ mod tests {
             .map_err(|_| std::io::Error::other("stderr reader panicked"))?;
         assert!(String::from_utf8(stdout_bytes)?.contains("root"));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod heartbeat_transport_file_tests {
+    use super::{
+        ACL, GetSecurityDescriptorDacl, SecurityDescriptor, TRANSPORT_FILE_SYSTEM_SID,
+        current_process_creation_ticks, process_creation_ticks,
+        restrict_file_to_current_user_and_system, verify_file_owner_and_dacl,
+        verify_transport_file_descriptor,
+    };
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+    fn test_file() -> std::path::PathBuf {
+        let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "eliot-transport-dacl-test-{}-{n}.json",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn creation_ticks_name_the_calling_process() {
+        let pid = std::process::id();
+        let by_pid = process_creation_ticks(pid)
+            .unwrap_or_else(|_| panic!("own creation ticks must query"));
+        let current = current_process_creation_ticks()
+            .unwrap_or_else(|_| panic!("current creation ticks must query"));
+        assert_eq!(by_pid, current);
+        assert!(process_creation_ticks(0).is_err());
+    }
+
+    #[test]
+    fn fresh_file_fails_verify_until_restricted() {
+        let path = test_file();
+        std::fs::write(&path, b"{}").unwrap_or_else(|_| panic!("fixture must write"));
+        // A fresh temp file inherits broader ACEs, so the transport contour
+        // check must fail before enforcement.
+        assert!(
+            verify_file_owner_and_dacl(&path).is_err(),
+            "inherited DACL must not pass the transport contour"
+        );
+        restrict_file_to_current_user_and_system(&path)
+            .unwrap_or_else(|_| panic!("restrict must succeed"));
+        verify_file_owner_and_dacl(&path)
+            .unwrap_or_else(|_| panic!("restricted file must verify"));
+        restrict_file_to_current_user_and_system(&path)
+            .unwrap_or_else(|_| panic!("restrict must be idempotent"));
+        verify_file_owner_and_dacl(&path)
+            .unwrap_or_else(|_| panic!("restricted file must still verify"));
+        std::fs::remove_file(&path).unwrap_or_else(|_| panic!("fixture must clean"));
+    }
+
+    #[test]
+    fn system_token_contour_is_satisfiable() {
+        // On-disk shape of a transport file restricted while running as
+        // LocalSystem: owner SY plus two SY allow ACEs (the SDDL template
+        // grants SY twice when the token user IS System). The verifier must
+        // accept it: the System grant proves both peer halves at once.
+        let descriptor =
+            SecurityDescriptor::from_sddl("O:SYD:P(A;;GA;;;SY)(A;;GA;;;SY)")
+                .unwrap_or_else(|_| panic!("system contour descriptor must build"));
+        let mut present = 0;
+        let mut acl: *mut ACL = std::ptr::null_mut();
+        let mut defaulted = 0;
+        // SAFETY: the descriptor is live; the out-pointers are live stack slots.
+        let fetched = unsafe {
+            GetSecurityDescriptorDacl(
+                descriptor.raw,
+                &raw mut present,
+                &raw mut acl,
+                &raw mut defaulted,
+            )
+        };
+        assert!(fetched != 0 && present != 0 && !acl.is_null());
+        verify_transport_file_descriptor(descriptor.raw, acl, TRANSPORT_FILE_SYSTEM_SID)
+            .unwrap_or_else(|_| panic!("system-token contour must verify"));
     }
 }

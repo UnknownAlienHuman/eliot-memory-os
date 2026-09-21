@@ -18,7 +18,9 @@ use eliot_notify_core::{
     A08AdmissionPort, AdmissionRequest, AdmissionResult, DeliveryObservation,
     DeliveryProviderEvidence, DeliveryReceiptEvidence, DeliveryReceiptPort, G08NotificationPort,
     LedgerCommitOutcome, LedgerIntent, LedgerReservation, LedgerReserveOutcome,
-    NotificationEnvelope, NotifyCore, OneShotLedgerPort, SignedWatchdogFallbackEnvelope,
+    NotificationEnvelope, NotificationSeverity, NotificationStatePort,
+    NotificationStateReadRequest, NotificationStateReadResponse, NotificationStateRequest,
+    NotificationStateResponse, NotifyCore, OneShotLedgerPort, SignedWatchdogFallbackEnvelope,
     VerificationPorts, WATCHDOG_PRODUCT_ID, WATCHDOG_SIGNATURE_ALGORITHM,
     WATCHDOG_SIGNATURE_DOMAIN, WATCHDOG_SOURCE_ID, WatchdogSignaturePort, watchdog_notification_id,
     watchdog_request_hash, watchdog_request_id, watchdog_signature_payload,
@@ -34,9 +36,7 @@ use eliot_platform_windows::{
     register_interactive_watchdog_task, run_registered_watchdog_task, validate_pinned_artifact,
 };
 use eliot_protocol::RequestIdentity;
-use eliot_receipts::{
-    EffectClass, ProofCeiling, ReceiptEnvelope, contract_identity,
-};
+use eliot_receipts::{EffectClass, ProofCeiling, ReceiptEnvelope, contract_identity};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -73,6 +73,7 @@ impl std::error::Error for NotifyBuildError {}
 /// adapter binding and the A-10 coordinator.
 pub struct NotificationComposition {
     core: NotifyCore<NotificationPlatform>,
+    quiet_hours: Option<quiet_hours::QuietHoursConfiguration>,
 }
 
 struct NotificationPlatform {
@@ -112,8 +113,25 @@ impl NotificationComposition {
         work_root: impl Into<PathBuf>,
         ports: VerificationPorts,
     ) -> Result<Self, NotifyBuildError> {
+        Self::new_with_quiet_hours(work_root, ports, None)
+    }
+
+    /// Binds notification delivery with an explicit quiet-hours policy.
+    ///
+    /// The policy is configuration supplied by the composition owner. It is
+    /// never treated as authority and never persisted in the canonical
+    /// notification record.
+    pub fn new_with_quiet_hours(
+        work_root: impl Into<PathBuf>,
+        ports: VerificationPorts,
+        quiet_hours: Option<quiet_hours::QuietHoursConfiguration>,
+    ) -> Result<Self, NotifyBuildError> {
         let platform = WindowsPlatform::new(work_root).map_err(NotifyBuildError::Platform)?;
-        Ok(Self::from_platform(platform, ports))
+        Ok(Self::from_platform_with_quiet_hours(
+            platform,
+            ports,
+            quiet_hours,
+        ))
     }
 
     /// Composes the production one-shot process from the protected Kernel
@@ -121,8 +139,16 @@ impl NotificationComposition {
     /// by an authenticated typed operation; absence of the protected client
     /// declaration fails before a notification request is read.
     pub fn from_kernel(work_root: impl Into<PathBuf>) -> Result<Self, NotifyBuildError> {
+        Self::from_kernel_with_quiet_hours(work_root, None)
+    }
+
+    /// Composes the protected Kernel route with explicit quiet-hours policy.
+    pub fn from_kernel_with_quiet_hours(
+        work_root: impl Into<PathBuf>,
+        quiet_hours: Option<quiet_hours::QuietHoursConfiguration>,
+    ) -> Result<Self, NotifyBuildError> {
         let ports = load_kernel_verification_ports()?;
-        Self::new(work_root, ports)
+        Self::new_with_quiet_hours(work_root, ports, quiet_hours)
     }
 
     /// Composes the separately registered Watchdog fallback path. It loads
@@ -134,14 +160,28 @@ impl NotificationComposition {
         let platform = WindowsPlatform::new(work_root).map_err(NotifyBuildError::Platform)?;
         Ok(Self {
             core: NotifyCore::new(NotificationPlatform::recovery_banner(platform), ports),
+            quiet_hours: None,
         })
     }
 
     /// Composes A-10 with an already-created platform adapter.
     #[must_use]
     pub fn from_platform(platform: WindowsPlatform, ports: VerificationPorts) -> Self {
+        Self::from_platform_with_quiet_hours(platform, ports, None)
+    }
+
+    /// Composes A-10 with an already-created platform adapter and explicit
+    /// quiet-hours policy.
+    #[must_use]
+    pub fn from_platform_with_quiet_hours(
+        platform: WindowsPlatform,
+        ports: VerificationPorts,
+        quiet_hours: Option<quiet_hours::QuietHoursConfiguration>,
+    ) -> Self {
         Self {
-            core: NotifyCore::new(NotificationPlatform::normal(platform), ports),
+            core: NotifyCore::new(NotificationPlatform::normal(platform), ports)
+                .with_popup_selector(select_popup),
+            quiet_hours,
         }
     }
 
@@ -151,7 +191,19 @@ impl NotificationComposition {
         envelope: &NotificationEnvelope,
         request: &NotificationRequest,
     ) -> Result<DeliveryObservation, eliot_notify_core::NotifyError> {
-        self.core.deliver(envelope, request)
+        let quiet_hours_active = self.quiet_hours_active(request)?;
+        self.core
+            .deliver_with_quiet_hours(envelope, request, quiet_hours_active)
+    }
+
+    /// Reads one authenticated canonical notification page through the same
+    /// Kernel exchange used by delivery and mutation.
+    pub fn read_notification_state(
+        &mut self,
+        parent: &NotificationRequest,
+        request: &NotificationStateReadRequest,
+    ) -> Result<NotificationStateReadResponse, eliot_notify_core::NotifyError> {
+        self.core.read_notification_state(parent, request)
     }
 
     /// Delivers the restricted signed Watchdog recovery notification.
@@ -162,6 +214,51 @@ impl NotificationComposition {
     ) -> Result<DeliveryObservation, eliot_notify_core::NotifyError> {
         self.core.deliver_watchdog_fallback(envelope, request)
     }
+
+    fn quiet_hours_active(
+        &self,
+        request: &NotificationRequest,
+    ) -> Result<bool, eliot_notify_core::NotifyError> {
+        let Some(configuration) = self.quiet_hours else {
+            return Ok(false);
+        };
+        let Some(policy_revision) = request.context.state_fence.policy_revision else {
+            return Err(eliot_notify_core::NotifyError::InvalidEnvelope(
+                "quiet_hours.policy_revision",
+            ));
+        };
+        if !configuration.binds_policy_revision(policy_revision) {
+            return Err(eliot_notify_core::NotifyError::InvalidEnvelope(
+                "quiet_hours.policy_revision",
+            ));
+        }
+        let Some(milliseconds) = request
+            .context
+            .clock
+            .known_time_ms
+            .or(request.context.clock.valid_time_ms)
+        else {
+            return Ok(false);
+        };
+        Ok(u64::try_from(milliseconds)
+            .ok()
+            .is_some_and(|value| configuration.window.contains_unix_ms(value)))
+    }
+}
+
+fn select_popup(
+    severity: NotificationSeverity,
+    acknowledged: bool,
+    resolved: bool,
+    quiet_hours_active: bool,
+) -> bool {
+    let severity = match severity {
+        NotificationSeverity::Information => quiet_hours::PopupSeverity::Information,
+        NotificationSeverity::ActionRequired => quiet_hours::PopupSeverity::ActionRequired,
+        NotificationSeverity::Warning => quiet_hours::PopupSeverity::Warning,
+        NotificationSeverity::Critical => quiet_hours::PopupSeverity::Critical,
+    };
+    quiet_hours::select_delivery(severity, acknowledged, resolved, quiet_hours_active).popup
 }
 
 /// Resolves the process `WorkScope` root from the protected `ProgramData` contour.
@@ -191,6 +288,15 @@ pub const KERNEL_VERIFICATION_OPERATIONS: &[&str] = &[
     DELIVERY_VERIFY_OPERATION,
     LEDGER_RESERVE_OPERATION,
     LEDGER_COMMIT_OPERATION,
+    eliot_notify_core::NOTIFICATION_STATE_SELECTOR,
+];
+
+/// Exact operation markers multiplexed by the versioned notification-state
+/// selector. The Kernel adapter must dispatch these to distinct service
+/// handlers and effect ceilings.
+pub const KERNEL_NOTIFICATION_STATE_OPERATIONS: &[&str] = &[
+    eliot_notify_core::NOTIFICATION_STATE_MUTATION_OPERATION,
+    eliot_notify_core::NOTIFICATION_STATE_READ_OPERATION,
 ];
 
 trait NotifyKernelExchange: Send {
@@ -286,6 +392,12 @@ where
                 operation_identity::NotifyOperation::LedgerCommit => {
                     issuer.issue_commit(parent, &payload, prior_receipt_digest, now)
                 }
+                operation_identity::NotifyOperation::NotificationState => {
+                    issuer.issue_notification_state(parent, &payload, prior_receipt_digest, now)
+                }
+                operation_identity::NotifyOperation::NotificationStateRead => {
+                    issuer.issue_notification_state_read(parent, &payload, now)
+                }
             },
             Err(_) => {
                 return PortOutcome::Error(PortError::Provider(ProviderError {
@@ -307,11 +419,9 @@ where
             }
         };
         let result = match self.exchange.lock() {
-            Ok(mut exchange) => exchange.transact_with_identity(
-                &issued.identity,
-                operation.selector(),
-                payload,
-            ),
+            Ok(mut exchange) => {
+                exchange.transact_with_identity(&issued.identity, operation.selector(), payload)
+            }
             Err(_) => {
                 return PortOutcome::Error(PortError::Provider(ProviderError {
                     code: ProviderErrorCode::Failed,
@@ -530,6 +640,54 @@ struct KernelLedger<E> {
     port: KernelPort<E>,
 }
 
+struct KernelNotificationState<E> {
+    port: KernelPort<E>,
+}
+
+impl<E> NotificationStatePort for KernelNotificationState<E>
+where
+    E: NotifyKernelExchange,
+{
+    fn mutate(
+        &mut self,
+        parent: &NotificationRequest,
+        request: &NotificationStateRequest,
+    ) -> PortOutcome<NotificationStateResponse> {
+        self.port.execute_for(
+            parent,
+            operation_identity::NotifyOperation::NotificationState,
+            json!({
+                "operation": eliot_notify_core::NOTIFICATION_STATE_MUTATION_OPERATION,
+                "context": &request.context,
+                "state_fence": &request.state_fence,
+                "mutation": &request.mutation,
+            }),
+            request.mutation.prior_receipt_digest(),
+        )
+    }
+
+    fn read(
+        &mut self,
+        parent: &NotificationRequest,
+        request: &NotificationStateReadRequest,
+    ) -> PortOutcome<NotificationStateReadResponse> {
+        self.port.execute_for(
+            parent,
+            operation_identity::NotifyOperation::NotificationStateRead,
+            json!({
+                "operation": eliot_notify_core::NOTIFICATION_STATE_READ_OPERATION,
+                "context": &request.context,
+                "state_fence": &request.state_fence,
+                "scope": &request.scope,
+                "include_resolved": request.include_resolved,
+                "page_limit": request.page_limit,
+                "cursor": &request.cursor,
+            }),
+            None,
+        )
+    }
+}
+
 impl<E> OneShotLedgerPort for KernelLedger<E>
 where
     E: NotifyKernelExchange,
@@ -626,8 +784,14 @@ where
         })),
         ledger: Some(Box::new(KernelLedger {
             port: KernelPort {
-                exchange,
-                issuer,
+                exchange: Arc::clone(&exchange),
+                issuer: Arc::clone(&issuer),
+            },
+        })),
+        notification_state: Some(Box::new(KernelNotificationState {
+            port: KernelPort {
+                exchange: Arc::clone(&exchange),
+                issuer: Arc::clone(&issuer),
             },
         })),
     }
@@ -654,6 +818,7 @@ const DELIVERY_OWNER: &str = "delivery-receipt-verifier";
 
 mod fallback_verification;
 pub mod operation_identity;
+pub mod quiet_hours;
 #[cfg(test)]
 use fallback_verification::sha256_hex;
 use fallback_verification::{
@@ -1620,6 +1785,7 @@ fn load_fallback_verification_ports(root: &Path) -> Result<VerificationPorts, No
         })),
         delivery_receipt: Some(Box::new(LocalFallbackReceipt { material })),
         ledger: Some(Box::new(ledger)),
+        notification_state: None,
     })
 }
 
@@ -1672,11 +1838,10 @@ mod tests {
             operation: &str,
             payload: Value,
         ) -> Result<Value, KernelClientError> {
-            self.calls.lock().unwrap().push((
-                operation.to_owned(),
-                identity.clone(),
-                payload,
-            ));
+            self.calls
+                .lock()
+                .unwrap()
+                .push((operation.to_owned(), identity.clone(), payload));
             Ok(self.response.clone())
         }
     }
@@ -1744,6 +1909,124 @@ mod tests {
         assert!(ports.watchdog.is_some());
         assert!(ports.delivery_receipt.is_some());
         assert!(ports.ledger.is_some());
+        assert!(ports.notification_state.is_some());
+        assert_eq!(
+            KERNEL_VERIFICATION_OPERATIONS.last(),
+            Some(&eliot_notify_core::NOTIFICATION_STATE_SELECTOR)
+        );
+    }
+
+    #[test]
+    fn notification_state_exchange_uses_versioned_selector_and_nested_mutation() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let exchange = RecordingExchange {
+            calls: Arc::clone(&calls),
+            response: serde_json::json!({
+                "kind": "UNKNOWN",
+                "reason": "INDETERMINATE"
+            }),
+        };
+        let shared = Arc::new(Mutex::new(exchange));
+        let issuer: operation_identity::IssuerHandle =
+            Arc::new(Mutex::new(operation_identity::NotifyIdentityIssuer::new()));
+        let mut state = KernelNotificationState {
+            port: KernelPort {
+                exchange: shared,
+                issuer,
+            },
+        };
+        let parent = request("request-notification-state");
+        let state_request: NotificationStateRequest = serde_json::from_value(serde_json::json!({
+            "context": parent.context.clone(),
+            "state_fence": parent.context.state_fence.clone(),
+            "mutation": {
+                "kind": "DELIVERY",
+                "notification_id": "notification-1",
+                "channel": "NATIVE_TOAST",
+                "delivery": { "kind": "DELIVERED" }
+            }
+        }))
+        .expect("valid notification-state delivery request");
+
+        let outcome = state.mutate(&parent, &state_request);
+        assert!(matches!(
+            outcome,
+            PortOutcome::Unknown(UnknownReason::Indeterminate)
+        ));
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, eliot_notify_core::NOTIFICATION_STATE_SELECTOR);
+        assert_eq!(calls[0].2["mutation"]["kind"], "DELIVERY");
+        assert_eq!(calls[0].2["mutation"]["notification_id"], "notification-1");
+        assert_eq!(calls[0].2["mutation"]["delivery"]["kind"], "DELIVERED");
+        assert_eq!(
+            calls[0].2["state_fence"],
+            serde_json::to_value(&state_request.state_fence).unwrap()
+        );
+        assert_eq!(
+            calls[0].2["operation"],
+            eliot_notify_core::NOTIFICATION_STATE_MUTATION_OPERATION
+        );
+    }
+
+    #[test]
+    fn notification_state_read_exchange_uses_read_marker_and_identity_ceiling() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let exchange = RecordingExchange {
+            calls: Arc::clone(&calls),
+            response: serde_json::json!({
+                "kind": "UNKNOWN",
+                "reason": "INDETERMINATE"
+            }),
+        };
+        let shared = Arc::new(Mutex::new(exchange));
+        let issuer: operation_identity::IssuerHandle =
+            Arc::new(Mutex::new(operation_identity::NotifyIdentityIssuer::new()));
+        let mut state = KernelNotificationState {
+            port: KernelPort {
+                exchange: shared,
+                issuer,
+            },
+        };
+        let parent = request("request-notification-state-read");
+        let state_request = NotificationStateReadRequest {
+            context: parent.context.clone(),
+            state_fence: parent.context.state_fence.clone(),
+            scope: Some("scope-1".to_owned()),
+            include_resolved: true,
+            page_limit: 16,
+            cursor: None,
+        };
+
+        let outcome = state.read(&parent, &state_request);
+        assert!(matches!(
+            outcome,
+            PortOutcome::Unknown(UnknownReason::Indeterminate)
+        ));
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, eliot_notify_core::NOTIFICATION_STATE_SELECTOR);
+        assert_eq!(
+            calls[0].2["operation"],
+            eliot_notify_core::NOTIFICATION_STATE_READ_OPERATION
+        );
+        assert_eq!(calls[0].2["page_limit"], 16);
+        assert_eq!(
+            calls[0]
+                .1
+                .idempotency_key
+                .strip_prefix("notify-v1-notification-state-read/")
+                .is_some(),
+            true
+        );
+        assert!(
+            calls[0]
+                .1
+                .cancellation_id
+                .contains("notification-state-read")
+        );
     }
 
     #[test]
@@ -2122,6 +2405,7 @@ mod tests {
             })),
             delivery_receipt: Some(Box::new(LocalFallbackReceipt { material })),
             ledger: Some(ledger),
+            notification_state: None,
         }
     }
 

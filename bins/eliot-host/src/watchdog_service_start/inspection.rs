@@ -10,13 +10,15 @@
 
 use std::path::Path;
 
+use eliot_platform_windows::ServiceBootstrapArguments;
+
 use super::super::{
     ApprovedGenerationRegistry, CandidateManifest, ELIOT_HOST_SERVICE_NAME,
     ELIOT_WATCHDOG_SERVICE_NAME, HostError, InstallationProfile,
     InstallerServiceRegistrationApproval, InstallerServiceRole, PlatformHandle, ProcessIdentity,
     RuntimeLaunchDescriptor, ServiceAccount, ServiceRegistrationRequest,
     ServiceRegistrationRuntimeInspection, ServiceStartMode, ServiceState, WindowsPlatform,
-    phase_b_scm_selector,
+    phase_b_scm_selector, windows_paths_equal,
 };
 
 #[cfg(windows)]
@@ -188,4 +190,87 @@ where
                 .to_owned(),
         )),
     }
+}
+
+#[cfg(windows)]
+/// SCM-liveness incarnation of the independently SCM-managed Watchdog
+/// sibling: the approval path bound the registration to the approved
+/// generation/image/bootstrap, and the readback path observed that same
+/// registration `Running` with a handle-bound, image-matched process.
+///
+/// This is SCM liveness only. It is NOT independent-supervision evidence:
+/// this layer never reads the Watchdog-owned heartbeat projection
+/// (authority state, coverage flag, admitted epoch pair) and never validates
+/// any admitted supervision epoch, because no Host-to-Watchdog heartbeat
+/// transport exists at SCM-start time and the watchdog may not have admitted
+/// any lease yet (pre-activation). Callers must never treat this value as
+/// supervised coverage; supervision is proven only by the Kernel `ProbeReady`
+/// watchdog-branch gate (exact admitted-epoch equality on the renewed ORS
+/// head) plus the exact-lease evidence ref, with governance held degraded
+/// until a proven-ready transition. No Host-side heartbeat validator exists:
+/// the admitted ORS snapshot carries lease currency (epoch pair, validity
+/// window) but no heartbeat recency (no authority state, coverage flag,
+/// tick interval, or last-beat timestamp). Heartbeat recency arrives only
+/// through the Host-to-Watchdog pipe transport: the Watchdog-owned
+/// `WatchdogReadiness` projection plus the Host-recorded receive time,
+/// consumed exclusively as the derived `HostObservedWatchdogHeartbeat`
+/// (see `watchdog_heartbeat`), with the admission failing closed without
+/// a fresh admitted beat. SCM `Running` therefore never implies a fresh
+/// heartbeat. `approved_plan_generation` is the
+/// approval binding only (the immutable transaction-plan generation that
+/// authorized this exact registration), never a supervision epoch. `None`
+/// only for bootstrap-less registrations, which the production approval path
+/// never produces.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedWatchdogScmRunning {
+    pub process: ProcessIdentity,
+    pub wait_hint_ms: u32,
+    pub approved_plan_generation: Option<u64>,
+}
+
+#[cfg(windows)]
+/// Verifies one already-observed SCM readback as a live, approved Watchdog
+/// SCM incarnation, returning the approval binding plus `Running`
+/// responsiveness evidence.
+///
+/// Read-only: performs no SCM inspection itself and owns no start/stop,
+/// registration, Job, or kill-handle capability — it only classifies the
+/// approval/readback pair the caller already holds. Any unverifiable branch
+/// (non-`Running` state, absent process identity, unusable PID/start handle,
+/// or substituted image) fails closed with the same typed vocabulary as
+/// [`require_running_watchdog`]. A successful return proves SCM liveness of
+/// the approved image only; it never proves independent supervision (no
+/// heartbeat is read, no admitted epoch is validated).
+pub fn verify_watchdog_scm_running(
+    registration: &ServiceRegistrationRequest,
+    state: ServiceState,
+    wait_hint_ms: u32,
+    process: Option<&ProcessIdentity>,
+) -> Result<VerifiedWatchdogScmRunning, HostError> {
+    if state != ServiceState::Running {
+        return Err(HostError::RecoveryRequired(format!(
+            "canonical EliotWatchdog service is not Running (observed {state:?})"
+        )));
+    }
+    let Some(observed) = process else {
+        return Err(HostError::RecoveryRequired(
+            "Watchdog reached Running without a handle-bound process identity".to_owned(),
+        ));
+    };
+    if observed.process_id == 0
+        || observed.start_time_100ns == 0
+        || !windows_paths_equal(Path::new(&observed.image_path), registration.binary_path())
+    {
+        return Err(HostError::RecoveryRequired(
+            "Watchdog process identity is unusable or its image is not the approved image"
+                .to_owned(),
+        ));
+    }
+    Ok(VerifiedWatchdogScmRunning {
+        process: observed.clone(),
+        wait_hint_ms,
+        approved_plan_generation: registration
+            .bootstrap()
+            .map(ServiceBootstrapArguments::transaction_plan_generation),
+    })
 }
