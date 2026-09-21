@@ -531,6 +531,13 @@ impl AdmittedGeneration {
 /// import observed before instantiation. Success binds the admitted
 /// contour, world, target, and digests into an [`AdmittedGeneration`] that
 /// dispatch sites match against before serving.
+///
+/// Digest claims are taken from the manifest here: strict callers that hold
+/// the artifact bytes must use [`admit_generation_with_bytes`], which
+/// recomputes both digests from bytes. A pasted-digest admission that
+/// disagrees with reality still dies downstream — Governor `from_owners`
+/// re-hashes independently and the engine refuses digest mismatch at
+/// build/invoke — but the bytes entry fails it here, before any of that.
 pub fn admit_generation(
     decision: Option<&PrototypeContourDecision>,
     manifest: &GenerationManifest,
