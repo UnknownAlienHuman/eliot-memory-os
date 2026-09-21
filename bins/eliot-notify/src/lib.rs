@@ -22,10 +22,10 @@ use eliot_notify_core::{
     NotificationEnvelope, NotificationSeverity, NotificationStatePort,
     NotificationStateReadRequest, NotificationStateReadResponse, NotificationStateRequest,
     NotificationStateResponse, NotifyCore, OneShotLedgerPort, SignedWatchdogFallbackEnvelope,
-    UserAutomationFailureRequest, VerificationPorts, WATCHDOG_PRODUCT_ID,
-    WATCHDOG_SIGNATURE_ALGORITHM, WATCHDOG_SIGNATURE_DOMAIN, WATCHDOG_SOURCE_ID,
-    WatchdogSignaturePort, watchdog_notification_id, watchdog_request_hash, watchdog_request_id,
-    watchdog_signature_payload,
+    UserAutomationFailureRequest, UserAutomationInvocation, UserAutomationPreflightProjection,
+    VerificationPorts, WATCHDOG_PRODUCT_ID, WATCHDOG_SIGNATURE_ALGORITHM,
+    WATCHDOG_SIGNATURE_DOMAIN, WATCHDOG_SOURCE_ID, WatchdogSignaturePort, watchdog_notification_id,
+    watchdog_request_hash, watchdog_request_id, watchdog_signature_payload,
 };
 use eliot_platform::{
     NotificationObservation, NotificationPort, NotificationRequest, PlatformHandle, PortError,
@@ -156,6 +156,28 @@ impl NotificationComposition {
         Self::new_with_quiet_hours(work_root, ports, quiet_hours)
     }
 
+    /// Composes the production UserAutomation preflight caller from the same
+    /// authenticated Kernel exchange used by normal notification delivery.
+    /// The invocation contains only immutable identity/trigger references;
+    /// canonical settings and the owner-issued source receipt arrive from the
+    /// typed Kernel projection.
+    pub fn from_kernel_with_user_automation(
+        work_root: impl Into<PathBuf>,
+        parent: &NotificationRequest,
+        invocation: &UserAutomationInvocation,
+    ) -> Result<(Self, UserAutomationPreflightProjection), NotifyBuildError> {
+        let mut client =
+            KernelClient::load().map_err(|error| NotifyBuildError::Kernel(error.to_string()))?;
+        let issuer: operation_identity::IssuerHandle =
+            Arc::new(Mutex::new(operation_identity::NotifyIdentityIssuer::new()));
+        let quiet_hours = read_authenticated_quiet_hours(&mut client, &issuer, parent)?;
+        let projection =
+            read_authenticated_user_automation_preflight(&mut client, &issuer, parent, invocation)?;
+        let ports = verification_ports_from_exchange_with_issuer(client, issuer);
+        let composition = Self::new_with_quiet_hours(work_root, ports, quiet_hours)?;
+        Ok((composition, projection))
+    }
+
     /// Composes the separately registered Watchdog fallback path. It loads
     /// only installer-pinned local verification material and the protected
     /// one-shot ledger; it never opens the Kernel front door or `UserBroker`.
@@ -212,8 +234,9 @@ impl NotificationComposition {
         failure: UserAutomationFailureRequest,
         request: &NotificationRequest,
     ) -> Result<DeliveryObservation, eliot_notify_core::NotifyError> {
+        let bound_request = failure.bind_notification_request(request)?;
         let envelope = failure.into_notification_envelope()?;
-        self.deliver(&envelope, request)
+        self.deliver(&envelope, &bound_request)
     }
 
     /// Reads one authenticated canonical notification page through the same
@@ -321,8 +344,10 @@ pub const KERNEL_NOTIFICATION_STATE_OPERATIONS: &[&str] = &[
 
 /// Exact authenticated configuration read consumed by the normal production
 /// caller. Kernel/Host owns registration and the canonical snapshot route.
-pub const KERNEL_CONFIGURATION_OPERATIONS: &[&str] =
-    &[operation_identity::QUIET_HOURS_PROJECTION_SELECTOR];
+pub const KERNEL_CONFIGURATION_OPERATIONS: &[&str] = &[
+    operation_identity::QUIET_HOURS_PROJECTION_SELECTOR,
+    operation_identity::USER_AUTOMATION_PREFLIGHT_SELECTOR,
+];
 
 trait NotifyKernelExchange: Send {
     fn transact_with_identity(
@@ -418,6 +443,65 @@ where
         }
     };
     quiet_hours_from_projection(projection, parent)
+}
+
+fn read_authenticated_user_automation_preflight<E>(
+    exchange: &mut E,
+    issuer: &operation_identity::IssuerHandle,
+    parent: &NotificationRequest,
+    invocation: &UserAutomationInvocation,
+) -> Result<UserAutomationPreflightProjection, NotifyBuildError>
+where
+    E: NotifyKernelExchange,
+{
+    let occurrence_id = invocation.occurrence_identity().map_err(|error| {
+        NotifyBuildError::Kernel(format!("UserAutomation invocation rejected: {error}"))
+    })?;
+    let payload = json!({
+        "operation": operation_identity::USER_AUTOMATION_PREFLIGHT_OPERATION,
+        "context": &parent.context,
+        "state_fence": &parent.context.state_fence,
+        "automation_id": &invocation.automation_id,
+        "automation_revision": &invocation.automation_revision,
+        "occurrence_id": occurrence_id,
+        "trigger": &invocation.trigger,
+        "mode": &invocation.mode,
+    });
+    let now = now_unix_ms().map_err(|error| {
+        NotifyBuildError::Kernel(format!(
+            "authenticated UserAutomation preflight read clock rejected: {error}"
+        ))
+    })?;
+    let issued = issuer
+        .lock()
+        .map_err(|_| {
+            NotifyBuildError::Kernel(
+                "authenticated UserAutomation preflight read identity mutex is poisoned".to_owned(),
+            )
+        })?
+        .issue_user_automation_preflight_read(parent, &payload, now)
+        .map_err(|error| {
+            NotifyBuildError::Kernel(format!(
+                "authenticated UserAutomation preflight read identity rejected: {error}"
+            ))
+        })?;
+    let result = exchange.transact_with_identity(
+        &issued.identity,
+        operation_identity::USER_AUTOMATION_PREFLIGHT_SELECTOR,
+        payload,
+    );
+    match decode_kernel_outcome::<UserAutomationPreflightProjection>(result) {
+        PortOutcome::Known(value) => Ok(value),
+        PortOutcome::Partial { .. } => Err(NotifyBuildError::Kernel(
+            "authenticated UserAutomation preflight projection was partial".to_owned(),
+        )),
+        PortOutcome::Unknown(_) => Err(NotifyBuildError::Kernel(
+            "authenticated UserAutomation preflight projection was unknown".to_owned(),
+        )),
+        PortOutcome::Error(_) => Err(NotifyBuildError::Kernel(
+            "authenticated UserAutomation preflight projection was rejected".to_owned(),
+        )),
+    }
 }
 
 fn quiet_hours_from_projection(
@@ -536,6 +620,9 @@ where
                 }
                 operation_identity::NotifyOperation::QuietHoursProjectionRead => {
                     issuer.issue_quiet_hours_projection_read(parent, &payload, now)
+                }
+                operation_identity::NotifyOperation::UserAutomationPreflightRead => {
+                    issuer.issue_user_automation_preflight_read(parent, &payload, now)
                 }
             },
             Err(_) => {

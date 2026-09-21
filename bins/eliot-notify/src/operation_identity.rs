@@ -63,6 +63,12 @@ const MAX_CLOCK_AGE_MS: u64 = 60_000;
 pub const QUIET_HOURS_PROJECTION_SELECTOR: &str = "eliot.config.quiet_hours.v1";
 /// Exact operation marker multiplexed by the quiet-hours selector.
 pub const QUIET_HOURS_PROJECTION_OPERATION: &str = "GetNotificationQuietHoursProjection";
+/// Authenticated Kernel selector for the canonical UserAutomation preflight
+/// projection. The configuration/Kernel owners supply the projection; notify
+/// only consumes and validates the typed result.
+pub const USER_AUTOMATION_PREFLIGHT_SELECTOR: &str = "eliot.config.user_automation.v1";
+/// Exact operation marker multiplexed by the UserAutomation selector.
+pub const USER_AUTOMATION_PREFLIGHT_OPERATION: &str = "GetUserAutomationPreflightProjection";
 
 /// Closed notify operation vocabulary for child identity issuance.
 ///
@@ -93,6 +99,9 @@ pub enum NotifyOperation {
     /// `eliot.config.quiet_hours.v1` /
     /// `GetNotificationQuietHoursProjection` — canonical configuration read.
     QuietHoursProjectionRead,
+    /// `eliot.config.user_automation.v1` /
+    /// `GetUserAutomationPreflightProjection` — canonical UserAutomation read.
+    UserAutomationPreflightRead,
 }
 
 impl NotifyOperation {
@@ -109,6 +118,7 @@ impl NotifyOperation {
             Self::NotificationState => eliot_notify_core::NOTIFICATION_STATE_SELECTOR,
             Self::NotificationStateRead => eliot_notify_core::NOTIFICATION_STATE_SELECTOR,
             Self::QuietHoursProjectionRead => QUIET_HOURS_PROJECTION_SELECTOR,
+            Self::UserAutomationPreflightRead => USER_AUTOMATION_PREFLIGHT_SELECTOR,
         }
     }
 
@@ -125,6 +135,7 @@ impl NotifyOperation {
             Self::NotificationState => "notification-state",
             Self::NotificationStateRead => "notification-state-read",
             Self::QuietHoursProjectionRead => "quiet-hours-projection-read",
+            Self::UserAutomationPreflightRead => "user-automation-preflight-read",
         }
     }
 
@@ -137,13 +148,15 @@ impl NotifyOperation {
                 "EXTERNAL_EFFECT"
             }
             Self::NotificationState => "REVERSIBLE_MUTATION",
-            Self::NotificationStateRead | Self::QuietHoursProjectionRead => "READ",
+            Self::NotificationStateRead
+            | Self::QuietHoursProjectionRead
+            | Self::UserAutomationPreflightRead => "READ",
         }
     }
 
-    /// All nine closed steps in pipeline order.
+    /// All ten closed steps in pipeline order.
     #[must_use]
-    pub const fn all() -> [Self; 9] {
+    pub const fn all() -> [Self; 10] {
         [
             Self::G08Verify,
             Self::A08Admit,
@@ -154,6 +167,7 @@ impl NotifyOperation {
             Self::NotificationState,
             Self::NotificationStateRead,
             Self::QuietHoursProjectionRead,
+            Self::UserAutomationPreflightRead,
         ]
     }
 }
@@ -443,6 +457,23 @@ impl NotifyIdentityIssuer {
         self.issue(
             parent,
             NotifyOperation::QuietHoursProjectionRead,
+            payload,
+            None,
+            now_unix_ms,
+        )
+    }
+
+    /// Issues (or exactly retries) the authenticated UserAutomation
+    /// preflight projection read.
+    pub fn issue_user_automation_preflight_read(
+        &mut self,
+        parent: &NotificationRequest,
+        payload: &Value,
+        now_unix_ms: u64,
+    ) -> Result<IssuedIdentity, OperationIdentityError> {
+        self.issue(
+            parent,
+            NotifyOperation::UserAutomationPreflightRead,
             payload,
             None,
             now_unix_ms,
@@ -931,6 +962,25 @@ mod tests {
         assert_ne!(
             read.identity.idempotency_key,
             mutation.identity.idempotency_key
+        );
+    }
+
+    #[test]
+    fn user_automation_preflight_read_has_its_own_authenticated_read_identity() {
+        let mut issuer = NotifyIdentityIssuer::new();
+        let p = parent("parent-user-automation");
+        let preflight = issuer
+            .issue_user_automation_preflight_read(&p, &payload("user-automation-preflight"), NOW)
+            .expect("UserAutomation preflight identity");
+
+        assert_eq!(
+            preflight.operation.selector(),
+            USER_AUTOMATION_PREFLIGHT_SELECTOR
+        );
+        assert_eq!(preflight.operation.effect_ceiling(), "READ");
+        assert_eq!(
+            preflight.operation.namespace(),
+            "user-automation-preflight-read"
         );
     }
 

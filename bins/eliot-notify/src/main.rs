@@ -5,7 +5,8 @@ use std::path::PathBuf;
 
 use eliot_notify::{NotificationComposition, PROTOCOL_VERSION, SERVICE_NAME};
 use eliot_notify_core::{
-    NotificationEnvelope, NotifyError, SignedWatchdogFallbackEnvelope, UserAutomationFailureRequest,
+    NotificationEnvelope, NotifyError, SignedWatchdogFallbackEnvelope,
+    UserAutomationFailureRequest, UserAutomationInvocation, UserAutomationPreflightDecision,
 };
 use eliot_platform::NotificationRequest;
 use serde::{Deserialize, Serialize};
@@ -32,6 +33,10 @@ enum Request {
         failure: UserAutomationFailureRequest,
         request: NotificationRequest,
     },
+    RunUserAutomation {
+        invocation: UserAutomationInvocation,
+        request: NotificationRequest,
+    },
 }
 
 #[derive(Serialize)]
@@ -40,6 +45,22 @@ enum Response {
     Delivered {
         service: &'static str,
         protocol: &'static str,
+        observation: Box<eliot_notify_core::DeliveryObservation>,
+    },
+    PreflightAdmitted {
+        service: &'static str,
+        protocol: &'static str,
+        receipt: Box<eliot_notify_core::UserAutomationPreflightReceipt>,
+    },
+    PreflightDeferred {
+        service: &'static str,
+        protocol: &'static str,
+        receipt: Box<eliot_notify_core::UserAutomationPreflightReceipt>,
+    },
+    PreflightBlocked {
+        service: &'static str,
+        protocol: &'static str,
+        receipt: Box<eliot_notify_core::UserAutomationPreflightReceipt>,
         observation: Box<eliot_notify_core::DeliveryObservation>,
     },
     WatchdogTaskRegistered {
@@ -175,9 +196,24 @@ fn main() {
             }
         }
         Ok(Request::DeliverUserAutomationFailure { failure, request }) => {
-            match NotificationComposition::from_kernel(root) {
+            match NotificationComposition::from_kernel_with_quiet_hours(root, &request) {
                 Ok(mut composition) => {
                     dispatch_user_automation_failure(&mut composition, failure, &request)
+                }
+                Err(error) => composition_error(error.to_string()),
+            }
+        }
+        Ok(Request::RunUserAutomation {
+            invocation,
+            request,
+        }) => {
+            match NotificationComposition::from_kernel_with_user_automation(
+                root,
+                &request,
+                &invocation,
+            ) {
+                Ok((mut composition, projection)) => {
+                    dispatch_user_automation(&mut composition, invocation, projection, &request)
                 }
                 Err(error) => composition_error(error.to_string()),
             }
@@ -292,6 +328,41 @@ fn dispatch_user_automation_failure(
     }
 }
 
+fn dispatch_user_automation(
+    composition: &mut NotificationComposition,
+    invocation: UserAutomationInvocation,
+    projection: eliot_notify_core::UserAutomationPreflightProjection,
+    request: &NotificationRequest,
+) -> Response {
+    let decision = match projection.preflight(&invocation, request) {
+        Ok(decision) => decision,
+        Err(error) => return preflight_error(error.to_string()),
+    };
+    match decision {
+        UserAutomationPreflightDecision::Admitted { receipt } => Response::PreflightAdmitted {
+            service: SERVICE_NAME,
+            protocol: PROTOCOL_VERSION,
+            receipt: Box::new(receipt),
+        },
+        UserAutomationPreflightDecision::Deferred { receipt } => Response::PreflightDeferred {
+            service: SERVICE_NAME,
+            protocol: PROTOCOL_VERSION,
+            receipt: Box::new(receipt),
+        },
+        UserAutomationPreflightDecision::BlockedConfig { receipt, failure } => {
+            match composition.deliver_user_automation_failure(failure, request) {
+                Ok(observation) => Response::PreflightBlocked {
+                    service: SERVICE_NAME,
+                    protocol: PROTOCOL_VERSION,
+                    receipt: Box::new(receipt),
+                    observation: Box::new(observation),
+                },
+                Err(error) => notify_error(&error),
+            }
+        }
+    }
+}
+
 fn dispatch_fallback(
     composition: &mut NotificationComposition,
     envelope: &SignedWatchdogFallbackEnvelope,
@@ -310,6 +381,13 @@ fn dispatch_fallback(
 fn composition_error(detail: String) -> Response {
     Response::Error {
         code: "NOTIFICATION_PROVIDER_REJECTED",
+        detail,
+    }
+}
+
+fn preflight_error(detail: String) -> Response {
+    Response::Error {
+        code: "NOTIFICATION_REQUEST_REJECTED",
         detail,
     }
 }
