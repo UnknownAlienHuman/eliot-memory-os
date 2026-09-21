@@ -5,9 +5,9 @@
 //! [`RivalModelSet`], a closed [`InquiryAffordanceSet`], and independent
 //! [`BudgetLimits`], and emits a frozen [`ProbePlan`] of ranked
 //! candidate-only [`ProbeProposal`] values plus explicit [`ProbeOmission`]
-//! gaps. It executes no tool, reserves no route or budget, decides no
-//! policy or authority, and grades no evidence: unauthorized, unfeasible, or
-//! over-budget inquiries remain proposals or gaps only, never actions.
+//! gaps. It executes no tool, reserves no route or budget, grants no policy or
+//! authority, and grades no evidence: unauthorized, unsafe, unfeasible, or
+//! over-budget inquiries remain inert gaps only, never actions.
 
 #![forbid(unsafe_code)]
 

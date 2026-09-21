@@ -92,6 +92,41 @@ impl BackupClass {
     pub const fn is_full_recovery(self) -> bool {
         matches!(self, Self::FullRecovery)
     }
+
+    /// Explicit class selection from the structural export shape (issue #1873).
+    ///
+    /// Selection is structural only: a declared scope with an installation ORS
+    /// snapshot refuses (a scope transfer never carries installation
+    /// recovery); a declared scope without one is `ScopeExport`; an
+    /// installation export with an ORS snapshot is `FullRecovery`; without one
+    /// it is `CanonicalOnlyDegraded`. Selection never upgrades or downgrades
+    /// silently: the full denominator (coherent ORS snapshot, bounded
+    /// Watchdog spool, config/policy/module/build manifests, gapless feature
+    /// list) is still enforced by `BackupBundle::validate`.
+    pub const fn select(
+        scope_declared: bool,
+        ors_snapshot_present: bool,
+    ) -> Result<Self, BackupError> {
+        match (scope_declared, ors_snapshot_present) {
+            (true, true) => Err(BackupError::UnexpectedRecoveryComponent("ors_snapshot")),
+            (true, false) => Ok(Self::ScopeExport),
+            (false, true) => Ok(Self::FullRecovery),
+            (false, false) => Ok(Self::CanonicalOnlyDegraded),
+        }
+    }
+
+    /// Class-specific restore proof ceiling for class-bound receipts.
+    #[must_use]
+    pub const fn evidence_level(self) -> RestoreEvidenceLevel {
+        RestoreEvidenceLevel::for_class(self)
+    }
+
+    /// Whether restores of this class stay canonical-only (never installation
+    /// operational recovery). Mirrors the receipt `canonical_only` binding.
+    #[must_use]
+    pub const fn is_canonical_only(self) -> bool {
+        !self.is_full_recovery()
+    }
 }
 
 /// Event interval captured by one consistent export fence.
@@ -1095,6 +1130,27 @@ pub struct RestoredFence {
 }
 
 impl RestoredFence {
+    /// Mints the fresh lineage for one isolated restored root (issue #1873).
+    ///
+    /// The new Authority Epoch plus Host Kernel resource generation must
+    /// advance the observed source lineage: same-lineage epochs must advance,
+    /// a new lineage must be genesis at sequence 1 with a newer generation.
+    /// No session, lease, broker registration, or route transfers: this fence
+    /// carries fences only, never historical authority.
+    pub fn mint(
+        source: &StateFence,
+        authority_epoch: EpochId,
+        resource_generation: ResourceGeneration,
+    ) -> Result<Self, BackupError> {
+        let fence = Self {
+            source_state_fence: source.clone(),
+            authority_epoch,
+            resource_generation,
+        };
+        fence.validate()?;
+        Ok(fence)
+    }
+
     pub fn validate(&self) -> Result<(), BackupError> {
         self.source_state_fence
             .validate()
@@ -2444,6 +2500,31 @@ pub enum RestoreHistoricalKind {
     AuthorityEpoch,
     OrsOperation,
     WatchdogSignal,
+}
+
+/// Imports pending ORS operations as suspended recovery evidence (issue #1873).
+///
+/// Every pending operation identity in a validated ORS snapshot becomes one
+/// suspended `OrsOperation` historical entry: restored work stays suspended
+/// and never resumes as active authority. Read-only over the ECXF ORS fence;
+/// reconciliation and cutover remain separate owner authorizations.
+pub fn suspended_recovery_entries(
+    snapshot: &OrsSnapshotFence,
+) -> Result<Vec<RestoreHistoricalAuthority>, BackupError> {
+    snapshot.validate()?;
+    let mut identities = snapshot.pending_operation_ids.clone();
+    identities.sort();
+    let mut entries = Vec::with_capacity(identities.len());
+    for historical_ref in identities {
+        let entry = RestoreHistoricalAuthority {
+            kind: RestoreHistoricalKind::OrsOperation,
+            historical_ref,
+            suspended: true,
+        };
+        entry.validate()?;
+        entries.push(entry);
+    }
+    Ok(entries)
 }
 
 /// Explicit compatibility/disposition for the source archive.
