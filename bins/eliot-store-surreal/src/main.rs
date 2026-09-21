@@ -141,6 +141,13 @@ async fn run() -> Result<(), String> {
     enforce_store_compatibility(&config)?;
     let composition = StoreComposition::new(&config)?;
     composition.connect().await?;
+    // Post-connect re-verification (issue #1932): the adapter has now proved
+    // spawned-artifact identity, listener ownership and server major over its
+    // ownership-verified channel. Reload the decision record and require the
+    // same admission before serving: a record swapped, revoked or drifted
+    // across the provider-startup window must fail closed here, never at the
+    // first canonical write.
+    enforce_store_compatibility(&config)?;
     let readiness = composition
         .readiness()
         .await

@@ -30,12 +30,25 @@
 //! exactly equals the recorded digest; the active version line exactly equals
 //! the qualified fallback line (so 3.1.4 is kept only while it is explicitly
 //! the latest locally qualified fallback, and 3.2.x is never promoted merely
-//! because it is the target); the transport is the admitted remote
-//! RPC/WebSocket path; the schema generation matches the bridge expectation;
-//! canonical writes are admitted; and at least one evidence snapshot is
-//! recorded. Anything else is an explicit maintenance (non-writer) verdict.
+//! because it is the target); both the active version and the fallback line
+//! name the adapter-pinned server major (a record for an unpinned major is
+//! malformed for this binary, not merely unevaluated); the transport is the
+//! admitted remote RPC/WebSocket path; the schema generation matches the
+//! bridge expectation; canonical writes are admitted; and at least one
+//! evidence snapshot is recorded. Anything else is an explicit maintenance
+//! (non-writer) verdict.
+//!
+//! Scope honesty: this gate binds the RECORD to config claims and to the
+//! compiled pin. It does not observe the live server version: the adapter
+//! proves spawned-artifact identity, listener ownership and server major
+//! over its ownership-verified channel at connect time, and only the startup
+//! order (gate → connect → re-verify → serve) plus the backend handoff carry
+//! that proof to the writer decision. Snapshot strings are audit trail, never
+//! qualification proof.
 
 use std::path::{Path, PathBuf};
+
+use eliot_store_surreal_adapter::PINNED_SURREALDB_MAJOR;
 
 /// File name of the installation-visible compatibility decision.
 pub const COMPATIBILITY_FILE_NAME: &str = "compatibility.toml";
@@ -221,11 +234,32 @@ fn startup_report(record: &SurrealCompatibility, decision: &str, detail: &str) -
 }
 
 /// Returns the maintenance reason when the record must not admit writers.
+///
+/// Scope honesty: this cell binds the record to CONFIG claims (observed
+/// descriptor digest, bridge schema expectation) and to the COMPILED adapter
+/// pin. It does not observe the live server: the adapter proves the spawned
+/// artifact identity, listener ownership and server major over its
+/// ownership-verified channel at connect time, but the full observed version
+/// is not re-surfaced to this gate (see the A1780 handoff). A record naming
+/// an unpinned major is therefore refused here rather than admitted on echo.
 fn evaluate_failure(
     record: &SurrealCompatibility,
     observed_artifact_digest: &str,
     expected_schema_generation: &str,
 ) -> Option<String> {
+    let pinned = pinned_major_text();
+    if record_major(&record.active_version) != Some(pinned.as_str()) {
+        return Some(format!(
+            "active_version {} does not name the adapter-pinned major {}",
+            record.active_version, PINNED_SURREALDB_MAJOR
+        ));
+    }
+    if record_major(&record.qualified_fallback_line) != Some(pinned.as_str()) {
+        return Some(format!(
+            "qualified_fallback_line {} does not name the adapter-pinned major {}",
+            record.qualified_fallback_line, PINNED_SURREALDB_MAJOR
+        ));
+    }
     if record.transport != ADMITTED_TRANSPORT {
         return Some(format!(
             "transport {} is not the admitted remote RPC/WebSocket path",
@@ -265,6 +299,22 @@ fn validate_record(record: &SurrealCompatibility) -> Result<(), String> {
     validate_text(&record.schema_generation, "schema_generation")?;
     validate_text(&record.migration_id, "migration_id")?;
     validate_fallback_line(&record.qualified_fallback_line)?;
+    // A record naming an unpinned major can never be served by this binary
+    // (the adapter refuses it at connect), so it is malformed here rather
+    // than admitted on echo and failed later.
+    let pinned = pinned_major_text();
+    if record_major(&record.active_version) != Some(pinned.as_str()) {
+        return Err(format!(
+            "active_version {} does not name the adapter-pinned major {}",
+            record.active_version, PINNED_SURREALDB_MAJOR
+        ));
+    }
+    if record_major(&record.qualified_fallback_line) != Some(pinned.as_str()) {
+        return Err(format!(
+            "qualified_fallback_line {} does not name the adapter-pinned major {}",
+            record.qualified_fallback_line, PINNED_SURREALDB_MAJOR
+        ));
+    }
     if record.evidence_snapshots.len() > MAX_EVIDENCE_SNAPSHOTS {
         return Err("evidence_snapshots exceeds the bounded count".to_owned());
     }
@@ -351,6 +401,18 @@ fn validate_digest(value: &str) -> Result<(), String> {
 
 fn normalize_digest(value: &str) -> String {
     value.trim().to_ascii_lowercase()
+}
+
+/// Major segment of a validated `major.minor.patch` or `major.minor.x`
+/// value. Compared as an exact string so oversized numeric segments can
+/// never overflow an integer parse on the way to a fail-closed refusal.
+fn record_major(value: &str) -> Option<&str> {
+    value.split('.').next()
+}
+
+/// Adapter-pinned server major, rendered for exact segment comparison.
+fn pinned_major_text() -> String {
+    PINNED_SURREALDB_MAJOR.to_string()
 }
 
 fn validate_text(value: &str, field: &str) -> Result<(), String> {
@@ -455,5 +517,40 @@ evidence_snapshots = ["snapshot-2026-09-12-r1"]
         let mut http = record.clone();
         http.transport = "http".to_owned();
         assert!(!evaluate_compatibility(&http, OBSERVED_DIGEST, "2.0.0").is_writer_admitted());
+    }
+
+    // PROOF (fails on 410813d6): a record naming an unpinned major is
+    // malformed at parse and refused at evaluation even with otherwise
+    // matching evidence — the adapter binary can never serve it, so echo
+    // admission would be self-attestation.
+    #[test]
+    fn record_naming_unpinned_major_is_refused() {
+        let forged_major = QUALIFIED_TOML
+            .replace(r#"active_version = "3.1.4""#, r#"active_version = "4.0.0""#)
+            .replace(
+                r#"qualified_fallback_line = "3.1.x""#,
+                r#"qualified_fallback_line = "4.0.x""#,
+            );
+        assert!(parse_compatibility_bytes(forged_major.as_bytes()).is_err());
+
+        let mut forged = qualified_record();
+        forged.active_version = "4.0.0".to_owned();
+        forged.qualified_fallback_line = "4.0.x".to_owned();
+        let verdict = evaluate_compatibility(&forged, OBSERVED_DIGEST, "2.0.0");
+        assert!(!verdict.is_writer_admitted());
+        assert!(verdict.report().contains("decision=maintenance"));
+        assert!(require_compatibility_for_writer(&forged, OBSERVED_DIGEST, "2.0.0").is_err());
+
+        // A stale-major fallback line is refused even when the active
+        // version itself is pinned.
+        let mut stale_line = qualified_record();
+        stale_line.qualified_fallback_line = "2.1.x".to_owned();
+        assert!(
+            !evaluate_compatibility(&stale_line, OBSERVED_DIGEST, "2.0.0").is_writer_admitted()
+        );
+
+        // The pinned line still admits with fresh matching evidence.
+        let record = qualified_record();
+        assert!(evaluate_compatibility(&record, OBSERVED_DIGEST, "2.0.0").is_writer_admitted());
     }
 }
