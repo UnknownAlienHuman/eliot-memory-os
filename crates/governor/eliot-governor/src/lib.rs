@@ -100,8 +100,8 @@ pub use swarm_plan_attachment_service::{
 };
 pub use task_lifecycle::{GovernorTaskLifecycle, TaskLifecycleError};
 pub use wasm_resolution::{
-    CONFORMANCE_COMPONENT, CONFORMANCE_INPUT, CONFORMANCE_SEED, GovernorWasmAdmission,
-    PromotionExpectations,
+    CONFORMANCE_COMPONENT, CONFORMANCE_INPUT, CONFORMANCE_SEED, ContourAdmission,
+    GovernorWasmAdmission, PromotionExpectations,
 };
 
 use std::collections::BTreeMap;

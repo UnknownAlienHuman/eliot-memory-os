@@ -48,6 +48,8 @@ use eliot_wasm_runtime::{
 };
 use serde::Serialize;
 
+use crate::KernelGenerationSnapshot;
+
 /// Documented conformance vector (single-component scope).
 ///
 /// Mirrors the in-tree lifecycle reference core: corpus expectations below
@@ -133,14 +135,40 @@ impl PromotionExpectations {
     }
 }
 
+/// Contour-admitted values bound by the host admission proof, threaded by
+/// the constructing owner.
+///
+/// The host lane constructs these from `AdmittedGeneration` accessors
+/// (contour, world, target, artifact/wit digests — field privacy there
+/// proves the admission sequence ran) plus the raw artifact bytes the
+/// digests bind. Byte blobs are re-hashed here, never trusted; blank
+/// world/target or empty bytes fail closed as meaningless admission.
+#[derive(Clone, Debug)]
+pub struct ContourAdmission {
+    /// Raw component artifact bytes the artifact digest binds.
+    pub artifact_bytes: Vec<u8>,
+    /// Raw WIT world bytes the interface digest binds.
+    pub wit_bytes: Vec<u8>,
+    /// Raw component configuration bytes the configuration digest binds.
+    pub configuration_bytes: Vec<u8>,
+    /// Admitted artifact digest (`AdmittedGeneration::artifact_digest`).
+    pub admitted_artifact: Sha256Digest,
+    /// Admitted WIT digest (`AdmittedGeneration::wit_digest`).
+    pub admitted_wit: Sha256Digest,
+    /// Admitted world name (`AdmittedGeneration::world`).
+    pub admitted_world: String,
+    /// Admitted guest target (`AdmittedGeneration::target`).
+    pub admitted_target: String,
+}
+
 /// Retained Governor admission observations for one admitted WASM component.
 ///
 /// Single-component scope: every observation below was admitted for the same
 /// component under one Governor fence. Multi-component work threads one
-/// instance per component; no registry is invented here. Construction
-/// enforces admission coherence (single snapshot, linked refs, bound
-/// digests); a foreign or stale observation fails closed instead of
-/// composing.
+/// instance per component; no registry is invented here. Prefer
+/// [`GovernorWasmAdmission::from_owners`], which reads the Governor fence
+/// and epoch from canonical recovery state and re-derives manifest digests
+/// from real bytes; direct construction is the test and edge-case path.
 #[derive(Clone, Debug)]
 pub struct GovernorWasmAdmission {
     governor_fence: StateFence,
@@ -249,6 +277,83 @@ impl GovernorWasmAdmission {
     #[must_use]
     pub const fn authority_epoch(&self) -> &EpochId {
         &self.governor_epoch
+    }
+
+    /// Builds admission from canonical Governor recovery state plus contour
+    /// observations (production factory).
+    ///
+    /// The Governor fence and epoch come from the admitted
+    /// [`KernelGenerationSnapshot`] (composition recovery state), never
+    /// from caller threading. Manifest identity digests are recomputed from
+    /// real bytes — artifact, WIT, and configuration — and must match both
+    /// the manifest claim and the host admission proof; tampered bytes or a
+    /// foreign admission fail closed. All remaining observations thread
+    /// through [`GovernorWasmAdmission::new`], which enforces the rest of
+    /// the admission coherence. A manifest whose non-derived digests
+    /// (source, state contract, engine) lack an owner stays threaded and
+    /// documented; the runtime validators admit or reject their content.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "factory threads one explicit observation bundle plus the snapshot and contour proof; grouping would duplicate the sealed envelope"
+    )]
+    pub fn from_owners(
+        snapshot: &KernelGenerationSnapshot,
+        manifest: ComponentManifest,
+        contour: &ContourAdmission,
+        generation: ModuleGeneration,
+        lease: RuntimeLease,
+        owner: OwnerId,
+        work_unit: WorkUnitId,
+        work_scope: ObservationScope,
+        assurance: SourceAssurance,
+        limits: InvocationLimits,
+        authority_revision: Revision,
+        lifecycle_revision: Revision,
+        verification_revision: Revision,
+        allowed_host_calls: BTreeSet<CapabilityId>,
+        allowed_effect_proposals: BTreeSet<CapabilityId>,
+        promotion: PromotionExpectations,
+    ) -> Result<Self, PortError> {
+        snapshot.validate().map_err(|_| PortError::Denied)?;
+        if contour.artifact_bytes.is_empty()
+            || contour.wit_bytes.is_empty()
+            || contour.configuration_bytes.is_empty()
+            || contour.admitted_world.trim().is_empty()
+            || contour.admitted_target.trim().is_empty()
+        {
+            return Err(PortError::Denied);
+        }
+        if Sha256Digest::of_bytes(&contour.artifact_bytes) != manifest.artifact_digest
+            || Sha256Digest::of_bytes(&contour.wit_bytes) != manifest.interface_digest
+            || Sha256Digest::of_bytes(&contour.configuration_bytes) != manifest.configuration_digest
+        {
+            return Err(PortError::Denied);
+        }
+        if manifest.artifact_digest != contour.admitted_artifact
+            || manifest.interface_digest != contour.admitted_wit
+            || manifest.world.as_str() != contour.admitted_world.as_str()
+            || manifest.guest_target != contour.admitted_target
+        {
+            return Err(PortError::Denied);
+        }
+        Self::new(
+            snapshot.state_fence(),
+            snapshot.authority_epoch.clone(),
+            manifest,
+            generation,
+            lease,
+            owner,
+            work_unit,
+            work_scope,
+            assurance,
+            limits,
+            authority_revision,
+            lifecycle_revision,
+            verification_revision,
+            allowed_host_calls,
+            allowed_effect_proposals,
+            promotion,
+        )
     }
 
     /// Recomputes the Governor resolution receipt digest from the retained
@@ -486,6 +591,14 @@ mod tests {
         )
     }
 
+    /// Proof configuration bytes: mirrors the provider-owned test
+    /// configuration (`COMPONENT_CONFIGURATION` in the Wasmtime provider
+    /// tests). The manifest digest below is recomputed from these bytes, so
+    /// the binding is derived, never pasted; the joined proof substitutes
+    /// the provider-read configuration.
+    const PROOF_CONFIGURATION: &[u8] =
+        b"component=guest;world=eliot:wasm/guest;export=run;imports=closed";
+
     fn manifest_fixture() -> ComponentManifest {
         use eliot_wasm_runtime::{EngineBinding, Sha256Digest as WasmDigest};
         ComponentManifest {
@@ -498,13 +611,10 @@ mod tests {
             // Single-file fixture: source and artifact are the same bytes,
             // stated not hidden.
             source_digest: WasmDigest::of_bytes(GUEST_WAT),
-            // Proof vector constant: the provider-owned configuration digest
-            // lives with the Wasmtime provider (`COMPONENT_CONFIGURATION`);
-            // the joined proof substitutes the provider-read value.
-            configuration_digest: WasmDigest::new(
-                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-            )
-            .expect("configuration digest"),
+            // Proof vector constant: recomputed from the proof
+            // configuration bytes above (not pasted); the joined proof
+            // substitutes the provider-read value.
+            configuration_digest: WasmDigest::of_bytes(PROOF_CONFIGURATION),
             // Proof vector constant: no state-contract owner exists in this
             // lane; the joined proof substitutes the admitted value.
             state_contract_digest: WasmDigest::new(
@@ -969,6 +1079,164 @@ mod tests {
         assert_ne!(
             first_receipt, second_receipt,
             "receipt must bind content: changed limits change the digest"
+        );
+    }
+
+    fn snapshot_fixture() -> crate::KernelGenerationSnapshot {
+        crate::KernelGenerationSnapshot {
+            service: "eliot-kernel".to_owned(),
+            protocol: "eliot.kernel.v1".to_owned(),
+            generation: ResourceGeneration::new(1).expect("generation"),
+            authority_epoch: test_epoch(),
+            artifact_digest: "a".repeat(64),
+            protected_snapshot_digest: "b".repeat(64),
+            principal: "S-1-5-18".to_owned(),
+        }
+    }
+
+    fn contour_fixture(manifest: &ComponentManifest) -> ContourAdmission {
+        ContourAdmission {
+            artifact_bytes: GUEST_WAT.to_vec(),
+            wit_bytes: GUEST_WIT.to_vec(),
+            configuration_bytes: PROOF_CONFIGURATION.to_vec(),
+            admitted_artifact: manifest.artifact_digest.clone(),
+            admitted_wit: manifest.interface_digest.clone(),
+            admitted_world: manifest.world.as_str().to_owned(),
+            admitted_target: manifest.guest_target.clone(),
+        }
+    }
+
+    fn admission_via_factory(
+        snapshot: &crate::KernelGenerationSnapshot,
+        manifest: ComponentManifest,
+        contour: &ContourAdmission,
+        generation: ModuleGeneration,
+        lease: RuntimeLease,
+        assurance: SourceAssurance,
+    ) -> Result<GovernorWasmAdmission, PortError> {
+        GovernorWasmAdmission::from_owners(
+            snapshot,
+            manifest,
+            contour,
+            generation,
+            lease,
+            OwnerId::new("owner-1956").expect("owner"),
+            WorkUnitId::new("work-1956").expect("work unit"),
+            scope_fixture(),
+            assurance,
+            limits_fixture(),
+            Revision::new(1).expect("revision"),
+            Revision::new(1).expect("revision"),
+            Revision::new(1).expect("revision"),
+            BTreeSet::from([CapabilityId::new("log").expect("host call")]),
+            BTreeSet::new(),
+            PromotionExpectations::conformance().expect("corpus"),
+        )
+    }
+
+    #[test]
+    fn factory_binds_snapshot_bytes_and_admission() {
+        let snapshot = snapshot_fixture();
+        let manifest = manifest_fixture();
+        let contour = contour_fixture(&manifest);
+        let fence = snapshot.state_fence();
+        let admission = admission_via_factory(
+            &snapshot,
+            manifest,
+            &contour,
+            generation_fixture(&fence),
+            lease_fixture(&fence),
+            assurance_fixture(&fence),
+        )
+        .expect("factory admits coherent observations");
+        // Fence and epoch come from recovery state, never threading.
+        assert_eq!(admission.admitted_fence(), &fence);
+        assert!(
+            admission
+                .authority_epoch()
+                .is_same_authority(&snapshot.authority_epoch)
+        );
+        // The factory product resolves like a directly built admission.
+        let mut admission = admission;
+        let request = request_fixture();
+        GovernorResolutionPort::resolve(&mut admission, &request).expect("resolves");
+    }
+
+    #[test]
+    fn factory_rejects_tampered_artifact_bytes() {
+        let snapshot = snapshot_fixture();
+        let manifest = manifest_fixture();
+        let mut contour = contour_fixture(&manifest);
+        contour.artifact_bytes[0] ^= 0xFF;
+        let fence = snapshot.state_fence();
+        assert_eq!(
+            admission_via_factory(
+                &snapshot,
+                manifest,
+                &contour,
+                generation_fixture(&fence),
+                lease_fixture(&fence),
+                assurance_fixture(&fence),
+            )
+            .map(|_| ()),
+            Err(PortError::Denied)
+        );
+    }
+
+    #[test]
+    fn factory_rejects_foreign_admission_proof() {
+        let snapshot = snapshot_fixture();
+        let manifest = manifest_fixture();
+        let mut contour = contour_fixture(&manifest);
+        contour.admitted_world = "eliot:wasm/foreign".to_owned();
+        let fence = snapshot.state_fence();
+        assert_eq!(
+            admission_via_factory(
+                &snapshot,
+                manifest,
+                &contour,
+                generation_fixture(&fence),
+                lease_fixture(&fence),
+                assurance_fixture(&fence),
+            )
+            .map(|_| ()),
+            Err(PortError::Denied)
+        );
+    }
+
+    #[test]
+    fn factory_rejects_empty_bytes_and_invalid_snapshot() {
+        let snapshot = snapshot_fixture();
+        let manifest = manifest_fixture();
+        let fence = snapshot.state_fence();
+        let mut contour = contour_fixture(&manifest);
+        contour.wit_bytes.clear();
+        assert_eq!(
+            admission_via_factory(
+                &snapshot,
+                manifest.clone(),
+                &contour,
+                generation_fixture(&fence),
+                lease_fixture(&fence),
+                assurance_fixture(&fence),
+            )
+            .map(|_| ()),
+            Err(PortError::Denied)
+        );
+        let mut bad_snapshot = snapshot_fixture();
+        bad_snapshot.service.clear();
+        let contour = contour_fixture(&manifest);
+        assert_eq!(
+            admission_via_factory(
+                &bad_snapshot,
+                manifest,
+                &contour,
+                generation_fixture(&fence),
+                lease_fixture(&fence),
+                assurance_fixture(&fence),
+            )
+            .map(|_| ()),
+            Err(PortError::Denied)
         );
     }
 }
