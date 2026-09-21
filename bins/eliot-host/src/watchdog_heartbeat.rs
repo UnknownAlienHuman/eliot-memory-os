@@ -1923,6 +1923,9 @@ pub fn observe_armed_heartbeat(
     Ok(admitted.evidence_refs)
 }
 #[cfg(test)]
+#[path = "watchdog_heartbeat_two_process_tests.rs"]
+mod two_process_tests;
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};

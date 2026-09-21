@@ -27,8 +27,10 @@ use std::sync::{Arc, RwLock};
 /// snapshot alone would conflate Kernel-renewal currency with a fresh
 /// Watchdog heartbeat, so no such check is claimed.
 ///
-/// Heartbeat-transport remainder (not implemented in this slice). When a
-/// Host-to-Watchdog heartbeat transport (transport1750, landed). The writer
+/// Heartbeat transport (transport1750, landed on this line via PR 2203;
+/// the earlier "not implemented in this slice" remainder is closed, not
+/// dropped: this cell stays Watchdog-local state and the Host still has
+/// no transport that reads it, only the pipe wire messages below). The writer
 /// side lives in `crate::heartbeat_transport`: the Watchdog process
 /// entrypoint loads the Host-issued rendezvous (per-instance pipe name plus
 /// 256-bit challenge, bound to the installer-approved bootstrap contour),
