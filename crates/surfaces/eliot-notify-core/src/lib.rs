@@ -8,6 +8,16 @@
 
 #![forbid(unsafe_code)]
 
+mod user_automation;
+
+pub use user_automation::{
+    UserAutomationConfigurationState, UserAutomationDeferReason, UserAutomationExecutionMode,
+    UserAutomationFailureNotification, UserAutomationFailureRequest, UserAutomationInvocation,
+    UserAutomationNotificationProjection, UserAutomationPreflightDecision,
+    UserAutomationPreflightError, UserAutomationPreflightProjection,
+    UserAutomationPreflightReceipt, UserAutomationTrigger, preflight_user_automation,
+};
+
 use std::fmt::Write as _;
 
 use eliot_contracts::{RequestMetadata, StateFence};
@@ -3678,6 +3688,61 @@ mod tests {
             envelope.validate_shape(),
             Err(NotifyError::InvalidEnvelope(
                 "user_automation_failure.identity"
+            ))
+        );
+    }
+
+    #[test]
+    fn user_automation_failure_request_binds_owner_identity_to_existing_envelope() {
+        let (mut notification, _) = normal_input("request-user-automation-producer");
+        notification.user_automation_failure = Some(
+            UserAutomationFailureIdentity::new(
+                "caller-supplied-automation",
+                "caller-supplied-revision",
+                "caller-supplied-fingerprint",
+            )
+            .expect("caller annotation fixture"),
+        );
+        let bound = UserAutomationFailureRequest {
+            automation_id: "automation-1".to_owned(),
+            automation_revision: "revision-7".to_owned(),
+            failure_fingerprint: "failure-fingerprint-a".to_owned(),
+            notification,
+        }
+        .into_notification_envelope()
+        .expect("owner identity binds");
+        let identity = bound
+            .user_automation_failure
+            .as_ref()
+            .expect("automation annotation");
+        assert_eq!(identity.automation_revision.automation_id, "automation-1");
+        assert_eq!(identity.automation_revision.revision, "revision-7");
+        assert_eq!(
+            identity.failure_fingerprint.fingerprint,
+            "failure-fingerprint-a"
+        );
+        assert_eq!(
+            bound.canonical.notification_id,
+            identity.notification_id().unwrap()
+        );
+        assert_eq!(bound.canonical.dedup_key, identity.dedup_key().unwrap());
+        assert_eq!(bound.validate_shape(), Ok(()));
+    }
+
+    #[test]
+    fn user_automation_failure_request_rejects_blank_owner_identity_reference() {
+        let (notification, _) = normal_input("request-user-automation-invalid");
+        let result = UserAutomationFailureRequest {
+            automation_id: " ".to_owned(),
+            automation_revision: "revision-7".to_owned(),
+            failure_fingerprint: "failure-fingerprint-a".to_owned(),
+            notification,
+        }
+        .into_notification_envelope();
+        assert_eq!(
+            result,
+            Err(NotifyError::InvalidEnvelope(
+                "user_automation_failure.automation_id"
             ))
         );
     }

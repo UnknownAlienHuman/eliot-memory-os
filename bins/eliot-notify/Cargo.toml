@@ -16,6 +16,7 @@ path = "src/main.rs"
 [dependencies]
 ed25519-dalek.workspace = true
 eliot-cli.workspace = true
+eliot-config.workspace = true
 eliot-contracts.workspace = true
 eliot-notify-core.workspace = true
 eliot-platform.workspace = true

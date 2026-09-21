@@ -37,6 +37,7 @@ mod notification_state;
 mod payload_authority;
 mod reactive_state;
 mod request_hash;
+mod user_automation_state;
 mod store_failure;
 mod wire;
 pub mod write_admission;
@@ -86,6 +87,28 @@ pub use reactive_state::{
     resource_snapshot_read_request, validate_ledger_json, validate_reactive_ledger_read_params,
     validate_reactive_mutation_params, validate_resource_snapshot_read_params,
     validate_resource_uri, validate_sha256_hex,
+};
+
+pub use user_automation_state::{
+    AUTOMATION_OPERATION_CREATE, AUTOMATION_OPERATION_EDIT, AUTOMATION_OPERATION_PAUSE,
+    AUTOMATION_OPERATION_REMOVE, AUTOMATION_OPERATION_RESUME, AUTOMATION_OPERATION_RUN_NOW,
+    AUTOMATION_PAGE_CURRENT, AUTOMATION_PAGE_CURRENTS, AUTOMATION_PAGE_FAILURE,
+    AUTOMATION_PAGE_INVOCATIONS, AUTOMATION_PAGE_REVISION, AUTOMATION_PAGE_REVISIONS,
+    AUTOMATION_PAGE_STATE_FENCE, AUTOMATION_PARAM_AUTOMATION_ID,
+    AUTOMATION_PARAM_CONFIGURATION_STATE, AUTOMATION_PARAM_INCLUDE_RETIRED,
+    AUTOMATION_PARAM_INVOCATION_JSON, AUTOMATION_PARAM_MAX_RECORDS, AUTOMATION_PARAM_OCCURRENCE_ID,
+    AUTOMATION_PARAM_OPERATION, AUTOMATION_PARAM_PREVIOUS_REVISION, AUTOMATION_PARAM_QUERY,
+    AUTOMATION_PARAM_REVISION, AUTOMATION_PARAM_REVISION_JSON, AUTOMATION_QUERY_CURRENT,
+    AUTOMATION_QUERY_FAILURE, AUTOMATION_QUERY_HISTORY, AUTOMATION_QUERY_INVOCATIONS,
+    AUTOMATION_QUERY_LIST, AUTOMATION_STATE_ACTIVE, AUTOMATION_STATE_BLOCKED_CONFIG,
+    AUTOMATION_STATE_PAUSED, AUTOMATION_STATE_RETIRED, AutomationContractError,
+    DecodedAutomationMutation, DecodedAutomationRead, MAX_AUTOMATION_DOC_BYTES,
+    MAX_AUTOMATION_ID_BYTES, MAX_AUTOMATION_PAGE_RECORDS, MAX_AUTOMATION_REVISION_ID_BYTES,
+    USER_AUTOMATION_MUTATION_NAME, USER_AUTOMATION_READ_NAME, USER_AUTOMATION_SCOPE,
+    USER_AUTOMATION_STATE_SCHEMA_V1, automation_create_params, automation_edit_params,
+    automation_mutation_request, automation_read_request, automation_run_now_params,
+    automation_state_transition_params, decode_automation_mutation, is_configuration_state_wire,
+    validate_automation_doc, validate_automation_mutation_params, validate_automation_read_params,
 };
 
 pub use request_hash::{
@@ -648,6 +671,20 @@ pub enum TransitionClass {
     /// closed reactive typed parameters. The ceiling is the maximum
     /// store-allowed reversible effect; existing class maxima are unchanged.
     ReactiveState,
+    /// Canonical user-automation revision + admission-state persistence
+    /// (issue #1779).
+    ///
+    /// Store-owned durable rows for operator automations: immutable
+    /// revision rows (opaque Kernel-owned documents, create-only),
+    /// a compare-and-set current pointer per automation carrying the
+    /// closed admission state, and create-only invocation rows keyed by
+    /// stable occurrence identity. Applied only through the named
+    /// automation transaction carrying the closed automation typed
+    /// parameters. Lineage validity stays Kernel-owned; the store
+    /// arbitrates keys, pointers, and immutability. The ceiling is the
+    /// maximum store-allowed reversible effect; existing class maxima are
+    /// unchanged.
+    UserAutomation,
 }
 
 impl TransitionClass {
@@ -660,7 +697,8 @@ impl TransitionClass {
             | Self::RecoverySchema
             | Self::Erasure
             | Self::NotificationState
-            | Self::ReactiveState => EffectClass::ReversibleMutation,
+            | Self::ReactiveState
+            | Self::UserAutomation => EffectClass::ReversibleMutation,
         }
     }
 }
@@ -719,6 +757,8 @@ pub enum NamedReadOperation {
     GetReactiveInjectionState,
     /// Canonical resource-snapshot read (issue #1941 C4).
     GetResourceSnapshot,
+    /// Canonical user-automation read (issue #1779).
+    GetUserAutomationState,
 }
 
 /// Closed mutation catalogue activated by the current contract catalogue.
@@ -774,6 +814,16 @@ pub enum NamedMutationOperation {
     /// digest over the decoded bytes and refuses URI rewrites; it never
     /// mints identity or resolves handles.
     ApplyResourceSnapshot,
+    /// Canonical user-automation transaction (issue #1779).
+    ///
+    /// Durable operator-automation persistence only: the prepared
+    /// transition must carry [`TransitionClass::UserAutomation`], the
+    /// declared automation effect ceiling, and the closed automation typed
+    /// parameters (operation discriminator, identities, opaque revision /
+    /// invocation documents, closed admission state). The store bridge
+    /// persists documents verbatim and arbitrates keys and pointers; it
+    /// never derives lineage, transitions, or invocation semantics.
+    ApplyUserAutomationState,
 }
 
 impl NamedMutationOperation {
@@ -792,6 +842,7 @@ impl NamedMutationOperation {
             Self::ApplyReactiveInjectionState | Self::ApplyResourceSnapshot => {
                 TransitionClass::ReactiveState
             }
+            Self::ApplyUserAutomationState => TransitionClass::UserAutomation,
         }
     }
 }
@@ -2122,6 +2173,7 @@ fn operation_kind(class: TransitionClass) -> &'static str {
         TransitionClass::Erasure => "store.apply.erasure",
         TransitionClass::NotificationState => "store.apply.notification_state",
         TransitionClass::ReactiveState => "store.apply.reactive_state",
+        TransitionClass::UserAutomation => "store.apply.user_automation",
     }
 }
 
