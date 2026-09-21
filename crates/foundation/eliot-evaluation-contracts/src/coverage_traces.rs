@@ -7,13 +7,15 @@
 //! disposition only from immutable host/runtime records joined to that
 //! denominator.
 //!
-//! A trace never upgrades incomplete observation to `PASS`: cursor gaps, blind
-//! intervals, undeclared shell/web/filesystem/repository access, hidden
-//! schema/output-file reads, out-of-namespace writes, and denominator gaps
-//! yield `TAINTED` or `UNKNOWN` and name the blind interval or access.
-//! Percentages and absence-of-event claims are admissible only against a
-//! declared complete denominator (see [`absence_claim_admissible`] and
-//! [`coverage_percentage`]).
+//! A trace never upgrades incomplete observation to `PASS`: cursor gaps,
+//! payload mutations, blind intervals, undeclared shell/web/filesystem/repository
+//! access, hidden schema/output-file reads, out-of-namespace writes, and
+//! denominator gaps yield `TAINTED` or `UNKNOWN` and name the blind interval,
+//! access, or incomplete denominator. Sequence gaps and payload mutations must
+//! be localized to blind intervals on the manifest; unlocalized faults are
+//! rejected fail-closed. Percentages and absence-of-event claims are admissible
+//! only against a declared complete denominator free of gaps and payload
+//! mutations (see [`absence_claim_admissible`] and [`coverage_percentage`]).
 
 use std::collections::BTreeSet;
 
@@ -216,7 +218,8 @@ pub struct ObservationCoverageManifest {
 impl ObservationCoverageManifest {
     /// Validates the denominator shape. A `COMPLETE` denominator carries no
     /// blind intervals; anything else stays `PARTIAL`, `UNKNOWN`, or
-    /// `NOT_APPLICABLE`.
+    /// `NOT_APPLICABLE`. Sequence gaps and payload mutations must be localized
+    /// to blind intervals so a derived trace can always name its blocker.
     pub fn validate(&self) -> Result<(), EvaluationContractError> {
         self.fingerprint.validate()?;
         if self.expected_event_sources_and_event_classes.is_empty() {
@@ -280,6 +283,14 @@ impl ObservationCoverageManifest {
         }
         if self.proof_ceiling > ProofCeiling::Observation {
             return Err(EvaluationContractError::ProofOverclaim);
+        }
+        if (self.sequence_faults.gaps > 0 || self.sequence_faults.payload_mutations > 0)
+            && self.blind_intervals_and_missing_source_reasons.is_empty()
+        {
+            return Err(EvaluationContractError::EvidenceState {
+                field: "manifest.blind_intervals_and_missing_source_reasons",
+                reason: "sequence gaps or payload mutations require localized blind intervals",
+            });
         }
         unique_texts(
             &self.invalidation_dependencies,
@@ -359,9 +370,11 @@ impl ImmutableHostEvidence {
 /// Compliance trace derived only from immutable host/runtime records.
 ///
 /// The trace always carries its explicit denominator (expected source count,
-/// cursor ranges, and count dispositions) plus its disposition. A `PASS`
-/// names no blind interval and no undeclared access; `TAINTED` and `UNKNOWN`
-/// always name the blind interval or access that blocks compliance.
+/// cursor ranges, count dispositions, and denominator completeness) plus its
+/// disposition. A `PASS` names no blind interval and no undeclared access and
+/// requires a complete denominator; `TAINTED` always names the blind interval
+/// or undeclared access that blocks compliance; `UNKNOWN` carries the
+/// incomplete denominator that blocks compliance plus any concrete blockers.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostObservedComplianceTrace {
@@ -376,14 +389,16 @@ pub struct HostObservedComplianceTrace {
     pub received_applied_rejected_and_unknown_counts: EventCounts,
     pub blind_intervals: Vec<CoverageBlindInterval>,
     pub undeclared_accesses: Vec<String>,
+    pub denominator_completeness: CoverageCompleteness,
     pub disposition: ComplianceDisposition,
     pub proof_ceiling: ProofCeiling,
 }
 
 impl HostObservedComplianceTrace {
     /// Validates denominator presence and disposition coherence: `PASS`
-    /// carries no blind interval and no undeclared access, while `TAINTED`
-    /// and `UNKNOWN` must name at least one.
+    /// carries no blind interval, no undeclared access, and a complete
+    /// denominator, while `TAINTED` must name at least one blind interval or
+    /// undeclared access and `UNKNOWN` must carry an incomplete denominator.
     pub fn validate(&self) -> Result<(), EvaluationContractError> {
         self.fingerprint.validate()?;
         text(
@@ -411,12 +426,26 @@ impl HostObservedComplianceTrace {
                         reason: "compliant PASS cannot carry blind intervals or undeclared accesses",
                     });
                 }
+                if self.denominator_completeness != CoverageCompleteness::Complete {
+                    return Err(EvaluationContractError::EvidenceState {
+                        field: "trace.denominator_completeness",
+                        reason: "compliant PASS requires a complete denominator",
+                    });
+                }
             }
-            ComplianceDisposition::Tainted | ComplianceDisposition::Unknown => {
+            ComplianceDisposition::Tainted => {
                 if self.blind_intervals.is_empty() && self.undeclared_accesses.is_empty() {
                     return Err(EvaluationContractError::EvidenceState {
                         field: "trace.disposition",
-                        reason: "tainted or unknown trace must name a blind interval or undeclared access",
+                        reason: "tainted trace must name a blind interval or undeclared access",
+                    });
+                }
+            }
+            ComplianceDisposition::Unknown => {
+                if self.denominator_completeness == CoverageCompleteness::Complete {
+                    return Err(EvaluationContractError::EvidenceState {
+                        field: "trace.denominator_completeness",
+                        reason: "unknown trace requires an incomplete denominator",
                     });
                 }
             }
@@ -434,10 +463,14 @@ impl HostObservedComplianceTrace {
 ///
 /// Classification, in order: forbidden tool action yields `FAIL`;
 /// undeclared or hidden access, out-of-namespace write, blind interval, or
-/// cursor gap yields `TAINTED`; a non-complete denominator without a concrete
-/// taint signal yields `UNKNOWN`; only a complete denominator with no taint
-/// signal yields `PASS`. The result always carries the explicit denominator
-/// and can never present a gapped or undeclared run as compliant `PASS`.
+/// cursor gap (sequence gaps and payload mutations) yields `TAINTED`; a
+/// non-complete denominator without a concrete taint signal yields `UNKNOWN`;
+/// only a complete denominator with no taint signal yields `PASS`. The result
+/// always carries the explicit denominator including its completeness and can
+/// never present a gapped or undeclared run as compliant `PASS`. Callers join
+/// a validated manifest: sequence faults without localized blind intervals are
+/// rejected by [`ObservationCoverageManifest::validate`], so a trace derived
+/// from a valid manifest always satisfies [`HostObservedComplianceTrace::validate`].
 #[must_use]
 pub fn derive_compliance_trace(
     manifest: &ObservationCoverageManifest,
@@ -522,6 +555,7 @@ pub fn derive_compliance_trace(
         received_applied_rejected_and_unknown_counts: manifest.counts,
         blind_intervals,
         undeclared_accesses,
+        denominator_completeness: manifest.completeness,
         disposition,
         proof_ceiling: ProofCeiling::Observation,
     }
@@ -529,7 +563,8 @@ pub fn derive_compliance_trace(
 
 /// Returns true only when an absence-of-event claim for `source_class` is
 /// admissible: the source/class is in the declared denominator, the
-/// denominator is complete, and no blind interval covers the claim.
+/// denominator is complete, no blind interval covers the claim, and no
+/// sequence gap or payload mutation breaks cursor continuity.
 #[must_use]
 pub fn absence_claim_admissible(
     manifest: &ObservationCoverageManifest,
@@ -541,11 +576,13 @@ pub fn absence_claim_admissible(
             .blind_intervals_and_missing_source_reasons
             .is_empty()
         && manifest.sequence_faults.gaps == 0
+        && manifest.sequence_faults.payload_mutations == 0
 }
 
 /// Returns a coverage percentage only against a declared complete
-/// denominator; otherwise returns `None` so percentages without an explicit
-/// denominator are rejected rather than rendered.
+/// denominator with continuous cursors; otherwise returns `None` so
+/// percentages without an explicit gap-free denominator are rejected rather
+/// than rendered.
 #[allow(clippy::cast_precision_loss)]
 #[must_use]
 pub fn coverage_percentage(
@@ -560,6 +597,9 @@ pub fn coverage_percentage(
         .blind_intervals_and_missing_source_reasons
         .is_empty()
     {
+        return None;
+    }
+    if manifest.sequence_faults.gaps > 0 || manifest.sequence_faults.payload_mutations > 0 {
         return None;
     }
     Some((covered as f64 / total as f64) * 100.0)
@@ -710,5 +750,86 @@ mod coverage_trace_tests_1936 {
                 .iter()
                 .any(|entry| entry.contains("hidden-output-file"))
         );
+    }
+
+    #[test]
+    fn payload_mutation_blocks_absence_and_percentage_naming_blind_interval() {
+        let mut manifest = complete_manifest();
+        manifest.completeness = CoverageCompleteness::Partial;
+        manifest.sequence_faults.payload_mutations = 1;
+        manifest
+            .blind_intervals_and_missing_source_reasons
+            .push(CoverageBlindInterval {
+                stream: "host-events".to_owned(),
+                first_missing_cursor: 2,
+                last_missing_cursor: 2,
+                reason: "payload-mismatch".to_owned(),
+            });
+        assert!(manifest.validate().is_ok());
+        let trace = derive_compliance_trace(&manifest, &clean_evidence());
+        assert!(trace.validate().is_ok());
+        assert_eq!(trace.disposition, ComplianceDisposition::Tainted);
+        assert!(
+            trace
+                .blind_intervals
+                .iter()
+                .any(|blind| blind.reason == "payload-mismatch")
+        );
+        assert!(!absence_claim_admissible(&manifest, "host.shell"));
+        assert!(coverage_percentage(&manifest, 3, 4).is_none());
+    }
+
+    #[test]
+    fn payload_mutation_alone_blocks_absence_and_percentage() {
+        let mut manifest = complete_manifest();
+        manifest.sequence_faults.payload_mutations = 1;
+        assert!(!absence_claim_admissible(&manifest, "host.shell"));
+        assert!(coverage_percentage(&manifest, 4, 4).is_none());
+    }
+
+    #[test]
+    fn cursor_gap_without_percentage_denominator_is_rejected() {
+        let manifest = complete_manifest();
+        assert!(coverage_percentage(&manifest, 4, 4).is_some());
+        let mut gapped = complete_manifest();
+        gapped.sequence_faults.gaps = 1;
+        assert!(coverage_percentage(&gapped, 4, 4).is_none());
+    }
+
+    #[test]
+    fn unlocalized_sequence_fault_is_rejected_fail_closed() {
+        let mut manifest = complete_manifest();
+        manifest.sequence_faults.gaps = 1;
+        assert!(manifest.validate().is_err());
+        let mut partial = complete_manifest();
+        partial.completeness = CoverageCompleteness::Partial;
+        partial.sequence_faults.payload_mutations = 1;
+        assert!(partial.validate().is_err());
+    }
+
+    #[test]
+    fn partial_denominator_clean_run_yields_unknown_with_explicit_completeness() {
+        let mut manifest = complete_manifest();
+        manifest.completeness = CoverageCompleteness::Partial;
+        assert!(manifest.validate().is_ok());
+        let trace = derive_compliance_trace(&manifest, &clean_evidence());
+        assert_eq!(trace.disposition, ComplianceDisposition::Unknown);
+        assert!(trace.validate().is_ok());
+        assert_eq!(
+            trace.denominator_completeness,
+            CoverageCompleteness::Partial
+        );
+        assert!(!absence_claim_admissible(&manifest, "host.shell"));
+        assert!(coverage_percentage(&manifest, 3, 4).is_none());
+    }
+
+    #[test]
+    fn pass_requires_complete_denominator() {
+        let manifest = complete_manifest();
+        let mut trace = derive_compliance_trace(&manifest, &clean_evidence());
+        assert_eq!(trace.disposition, ComplianceDisposition::Pass);
+        assert!(trace.validate().is_ok());
+        trace.denominator_completeness = CoverageCompleteness::Partial;
+        assert!(trace.validate().is_err());
     }
 }
