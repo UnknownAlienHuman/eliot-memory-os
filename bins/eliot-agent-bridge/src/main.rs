@@ -5,7 +5,7 @@ mod request_input;
 use eliot_agent_bridge::{
     BootstrapContext, BootstrapTaskInputs, BridgeRunner, CliError, CurrentAssessment,
     HotResourceView, InjectionReceipt, Profile, ScopeLevel, UnderstandingBootstrap,
-    kernel_ports_with_declaration, parse_args,
+    kernel_ports_with_declaration, parse_args, reactive_runtime_composition,
 };
 use eliot_agent_bridge_core::{
     AttachRequest, BridgeError, ConnectionId, FencingToken, Generation, HostEventEnvelope,
@@ -547,7 +547,20 @@ fn main() {
         total_records = next_total;
         let mut response = match decode_bounded_request(text) {
             Ok(Request::Attach { request }) => match runner.attach(request) {
-                Ok(_) => Response::Attached { bootstrap: None },
+                Ok(_) => {
+                    // Best-effort durable restore for the fresh attach: a
+                    // refused or absent restore keeps the current empty-ledger
+                    // behavior and is reported on stderr without failing the
+                    // attach that already succeeded.
+                    if let Err(error) = reactive_runtime_composition::restore_reactive_runtime(
+                        &mut runner,
+                        &mut *host_request_port,
+                        &[],
+                    ) {
+                        emit_error("REACTIVE_RESTORE_REFUSED", &error.to_string());
+                    }
+                    Response::Attached { bootstrap: None }
+                }
                 Err(error) => {
                     provider_failure |= matches!(error, BridgeError::PlanGap(_));
                     bridge_error(&error)

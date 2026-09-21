@@ -36,6 +36,24 @@ pub trait KernelHostRequestPort {
         &mut self,
         request: &HostCancellationRequest,
     ) -> Result<HostCancellationPortOutcome, PortFailure>;
+
+    /// Serves one validated reactive restore query against canonical Store
+    /// projections bound to the live attach session and fence.
+    ///
+    /// The default implementation fails closed as unsupported so existing
+    /// ports keep compiling; the production bridge client overrides it with
+    /// the envelope-bound front-door exchange. Callers treat the default as
+    /// store-unavailable, never as empty state.
+    fn restore_reactive_state(
+        &mut self,
+        query: &eliot_protocol::ReactiveRestoreQuery,
+    ) -> Result<eliot_protocol::ReactiveRestoreReply, PortFailure> {
+        let _ = query;
+        Err(PortFailure::Unsupported {
+            capability: "reactive-restore".to_owned(),
+            reason: "reactive restore is not implemented by this port".to_owned(),
+        })
+    }
 }
 
 /// Positive result returned by the trusted port for one invocation.
