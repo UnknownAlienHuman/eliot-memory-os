@@ -540,6 +540,30 @@ fn host_request_frame_for_envelope(
     Ok(frame)
 }
 
+/// Builds the cold/operator submit frame with the exact typed request body.
+///
+/// The envelope remains the authenticated binding for the connection, session,
+/// fence, capability, idempotency key, and canonical payload digest. The
+/// `tool` member is carried only for the UserAutomation Kernel selector to
+/// decode and re-canonicalize before it constructs the authenticated service
+/// request. Reconciliation deliberately carries only the parent envelope and
+/// digest; it never resubmits this body under a new identity.
+fn host_request_user_automation_frame(
+    request: &HostInvocationRequest,
+    envelope: &HostRequestEnvelope,
+    facts: &TransportFacts,
+) -> Result<Frame, PortFailure> {
+    let mut frame =
+        host_request_frame_for_envelope(AGENT_HOST_REQUEST_SUBMIT_OPERATION, envelope, facts)?;
+    let tool = serde_json::to_value(&request.tool).map_err(|_| request_failure())?;
+    let ProtocolPayload::Json(payload) = &mut frame.payload else {
+        return Err(request_failure());
+    };
+    payload["tool"] = tool;
+    frame.validate().map_err(|_| request_failure())?;
+    Ok(frame)
+}
+
 /// Returns whether one invocation is a local read served with its canonical
 /// tool bytes (Implements #18: local read result).
 ///
@@ -794,6 +818,8 @@ impl KernelHostRequestPort for KernelHostRequestClient {
         }
         let frame = if invokes_local_read(request) {
             host_request_invoke_read_frame(request, &envelope, &facts)?
+        } else if matches!(&request.tool, ToolRequest::UserAutomation(_)) {
+            host_request_user_automation_frame(request, &envelope, &facts)?
         } else {
             host_request_frame_for_envelope(AGENT_HOST_REQUEST_SUBMIT_OPERATION, &envelope, &facts)?
         };
@@ -1112,9 +1138,8 @@ mod tests {
         assert_eq!(envelope.identity.capability, "eliot_user_automation");
         assert_eq!(envelope.identity.payload_sha256, payload_digest);
 
-        let submit =
-            host_request_frame_for_envelope(AGENT_HOST_REQUEST_SUBMIT_OPERATION, &envelope, &facts)
-                .expect("UserAutomation submit frame must build");
+        let submit = host_request_user_automation_frame(&request, &envelope, &facts)
+            .expect("UserAutomation submit frame must build");
         let submit_payload = match &submit.payload {
             ProtocolPayload::Json(payload) => payload,
             _ => panic!("submit frame must carry JSON"),
@@ -1136,6 +1161,10 @@ mod tests {
                 .pointer("/envelope/identity/payload_sha256")
                 .and_then(|value| value.as_str()),
             Some(payload_digest.as_str())
+        );
+        assert_eq!(
+            submit_payload.get("tool"),
+            Some(&serde_json::to_value(&request.tool).expect("tool must serialize"))
         );
 
         let parent = ParentLink::of(&envelope);

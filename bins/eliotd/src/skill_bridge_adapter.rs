@@ -238,6 +238,7 @@ mod tests {
             }],
             host_version: "host-4.1.0".to_owned(),
             profile_version: "profile-2.0.0".to_owned(),
+            admitted_definition_version: "1.2.0".to_owned(),
             status: SkillStatus::Provisional,
             stale_reason: None,
         };

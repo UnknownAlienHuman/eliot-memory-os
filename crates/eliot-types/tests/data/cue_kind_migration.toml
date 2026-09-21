@@ -393,8 +393,8 @@ owner = "#706"
 migration = 706
 expiry = "frozen-seam-oracle; invalid-on-any-oracle-edit; alias removal tracked by #835"
 risk = "none"
-match_count = 67
-matched_digest = "beab00982b1362b02327a05a771235c982a881518cb4d0837958ad8f3e258402"
+match_count = 68
+matched_digest = "15ab24988d24b0469f63c62c0860950189932d4b7d1cd8711744b90ac7062191"
 variants = []
 
 [type_row."crates/smart/eliot-context/src/lib.rs"]
@@ -413,8 +413,8 @@ owner = "#833"
 migration = 833
 expiry = "facade-disposition-under-#833; invalid-on-definition-change"
 risk = "duplicate-definition"
-match_count = 31
-matched_digest = "0f68bf9376d910077de177ad6d54fc2a4ee803ba933c8135f288294ee7505b7e"
+match_count = 34
+matched_digest = "6434f2969478f134681902e318f4e2217af6df1830f9eb8a55b73ab3f8068826"
 variants = ["FilePath", "DirPath", "Symbol", "ErrorSignature", "CommandPattern", "Dependency", "ApiSurface", "TaskClass", "Subsystem", "Concept"]
 
 [type_row."crates/smart/eliot-cues/tests/integrity.rs"]
@@ -423,8 +423,8 @@ owner = "#833"
 migration = 833
 expiry = "facade-disposition-under-#833; invalid-on-definition-change"
 risk = "duplicate-definition"
-match_count = 13
-matched_digest = "b47b4bd650e62d5cf1798c436b423fc22e0aa1f3c3ec610a17b7ac5dcfd5932c"
+match_count = 44
+matched_digest = "cd735a997136a737d47a42e22e6854a6694d441f0fd7f882918281faf05d1416"
 variants = []
 
 [type_row."crates/smart/eliot-cue-contracts/src/normalization.rs"]
@@ -453,8 +453,8 @@ owner = "#929/#710"
 migration = 929
 expiry = "retain-both-current-and-legacy-rows-per-#929-and-#710; invalid-on-row-loss"
 risk = "inventory-drift"
-match_count = 12
-matched_digest = "ba7b8d98a987ad1978b6652abbea3eec95b9de90f4fdde4da62dc59a9b62816f"
+match_count = 18
+matched_digest = "072b9ce2791f73329b965e2ec816aa865d7de398776f58fa0ccd7b6f1d2efcce"
 variants = []
 
 [field_row."crates/eliot-types/src/ul/cue.rs"]
@@ -724,8 +724,8 @@ owner = "#929/#710"
 migration = 929
 expiry = "retain-both-current-and-legacy-rows-per-#929-and-#710; invalid-on-row-loss"
 risk = "inventory-drift"
-match_count = 3
-matched_digest = "9be7717a8eb1231ef3c5ba4fd17307a79ded1cf125abf844d9a3ab4fda84d128"
+match_count = 45
+matched_digest = "bd8084f55014a6f6f573c294b23906a692ababe686981d31c31c055dd9d6683e"
 
 [notes]
 memory_donor = "no memory-donor duplicate CueKind definition exists on base e80611de; #834 scope resolves at its own inventory, not as an unlisted row here"

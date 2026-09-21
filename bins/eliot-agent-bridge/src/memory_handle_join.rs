@@ -110,7 +110,7 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::super::{
-        AdmissionBasis, BridgeRunner, ConnectionId, CueKind, FiringEvidence, NormalizedCue,
+        AdmissionBasis, BridgeRunner, ConnectionId, CueOrigin, FiringEvidence, NormalizedCue,
         Profile, RiskTier, Severity, UseOutcome,
     };
     use super::{ResolvedMemoryHandle, parse_memory_handle};
@@ -187,7 +187,7 @@ mod tests {
             .admit_reactive_injection(
                 NormalizedCue {
                     cue_id: "cue-join-1".to_owned(),
-                    kind: CueKind::ToolObservation,
+                    kind: CueOrigin::ToolObservation,
                     source: "tool-surface-1".to_owned(),
                     source_revision: "rev-1".to_owned(),
                     cue_digest: TEST_DIGEST.to_owned(),
@@ -307,7 +307,7 @@ mod tests {
             .admit_reactive_injection(
                 NormalizedCue {
                     cue_id: "cue-join-2".to_owned(),
-                    kind: CueKind::ToolObservation,
+                    kind: CueOrigin::ToolObservation,
                     source: "tool-surface-2".to_owned(),
                     source_revision: "rev-1".to_owned(),
                     cue_digest: TEST_DIGEST.to_owned(),

@@ -22,6 +22,7 @@ use eliot_protocol::reactive_context::{
     ReactiveContextPayload, ReactiveContextRecipient, ReactiveContextValidity,
 };
 use eliot_protocol::{EventEnvelope, ReactiveContextStage};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Maximum reason bytes retained from an injected transport port.
@@ -77,7 +78,8 @@ pub struct HostDeliveryAdmission {
 }
 
 /// Request to admit one typed reactive Context payload.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReactiveContextDeliveryRequest {
     /// Fully typed, owner-produced payload.
     pub payload: ReactiveContextPayload,

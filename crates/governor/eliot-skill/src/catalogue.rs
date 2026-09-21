@@ -360,6 +360,11 @@ pub struct SkillCatalogueEntry {
     pub dependencies: Vec<DependencyVersion>,
     pub host_version: String,
     pub profile_version: String,
+    /// Tool Definition version this entry was admitted under. Bound at
+    /// install from the Governor-admitted version and rechecked against the
+    /// live canonical source on the versioned paths: a registry move past
+    /// this version marks the entry stale until reinstall.
+    pub admitted_definition_version: String,
     pub status: SkillStatus,
     pub stale_reason: Option<String>,
 }
@@ -389,6 +394,10 @@ impl SkillCatalogueEntry {
         }
         check_text(&self.host_version, "entry.host_version")?;
         check_text(&self.profile_version, "entry.profile_version")?;
+        check_text(
+            &self.admitted_definition_version,
+            "entry.admitted_definition_version",
+        )?;
         match self.status {
             SkillStatus::Stale | SkillStatus::Quarantined => {
                 let reason = self.stale_reason.as_deref().unwrap_or("");
@@ -492,6 +501,14 @@ impl SkillCatalogue {
     #[must_use]
     pub fn get(&self, skill_id: &str) -> Option<&SkillCatalogueEntry> {
         self.entries.get(skill_id)
+    }
+
+    /// Returns every installed Skill identity in stable order. The
+    /// reconciliation driver uses it to visit standing entries without
+    /// holding entry borrows across the marks that may follow.
+    #[must_use]
+    pub fn skill_ids(&self) -> Vec<String> {
+        self.entries.keys().cloned().collect()
     }
 
     #[must_use]
@@ -1152,6 +1169,7 @@ mod tests {
             dependencies: vec![dependency("tool-def-1")],
             host_version: "host-4.1.0".to_owned(),
             profile_version: "profile-2.0.0".to_owned(),
+            admitted_definition_version: "1.2.0".to_owned(),
             status: SkillStatus::Provisional,
             stale_reason: None,
         }

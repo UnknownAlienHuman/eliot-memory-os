@@ -46,6 +46,10 @@ use eliot_platform_windows::{
     cancel_capture_thread_io,
 };
 
+/// WASM P-03 process adapter: the owner-blessed A-12 port implementation.
+/// See [`wasm_p03_adapter`] for the authority stance and proof entrypoint.
+pub mod wasm_p03_adapter;
+
 const DEFAULT_CAPTURE_LIMIT: usize = 16 * 1024 * 1024;
 const EVIDENCE_PREVIEW_CEILING: usize = 16 * 1024 * 1024;
 const JOB_TERMINATION_CODE: u32 = 0xE1_04;

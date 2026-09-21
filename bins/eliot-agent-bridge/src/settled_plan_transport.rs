@@ -45,7 +45,7 @@ use eliot_reactive_context_plan::{
 };
 
 use super::{
-    AdmissionBasis, BridgeRunner, CueKind, FiringEvidence, NormalizedCue,
+    AdmissionBasis, BridgeRunner, CueOrigin, FiringEvidence, NormalizedCue,
     ReactiveInjectionError, RiskTier, Severity,
 };
 
@@ -348,7 +348,7 @@ impl SettledPlanAdmission {
             let outcome = runner.admit_reactive_injection(
                 NormalizedCue {
                     cue_id: item.cue_id.clone(),
-                    kind: CueKind::ToolObservation,
+                    kind: CueOrigin::ToolObservation,
                     source: item.cue_source.clone(),
                     source_revision: item.cue_source_revision.clone(),
                     cue_digest: item.cue_digest.clone(),

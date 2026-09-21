@@ -1230,7 +1230,11 @@ fn case_24_external_wire_consumers_and_admission_risks_visible() -> TestResult {
     let inventory = read_workspace(
         "crates/foundation/eliot-contracts/tests/data/shipped_serde_boundaries.toml",
     )?;
-    assert!(inventory.contains("eliot-types:crates/eliot-types/src/ul/cue.rs:CueKind"));
+    assert!(inventory.contains("eliot-types:crates/eliot-types/src/ul/cue.rs:LegacyCueKindV1"));
+    assert!(
+        !inventory.contains("eliot-types:crates/eliot-types/src/ul/cue.rs:CueKind\""),
+        "stale bare-name inventory row for the renamed V1 seam"
+    );
     Ok(())
 }
 
