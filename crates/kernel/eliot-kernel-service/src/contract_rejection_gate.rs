@@ -94,7 +94,24 @@ impl PreStageRejection {
                 reason: "must be non-blank",
             });
         }
-        if self.canonical_request_hash.len() != 64 {
+        if self.proposed_operation_id.trim().is_empty() {
+            return Err(PreStageGateError::InvalidField {
+                field: "rejection.proposed_operation_id",
+                reason: "must be non-blank",
+            });
+        }
+        if self.idempotency_key.trim().is_empty() {
+            return Err(PreStageGateError::InvalidField {
+                field: "rejection.idempotency_key",
+                reason: "must be non-blank",
+            });
+        }
+        if self.canonical_request_hash.len() != 64
+            || self
+                .canonical_request_hash
+                .bytes()
+                .any(|byte| !matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        {
             return Err(PreStageGateError::InvalidField {
                 field: "rejection.canonical_request_hash",
                 reason: "must be a lowercase SHA-256 digest",
@@ -125,6 +142,16 @@ impl PreStageRejection {
                 field: "rejection.defect_codes",
             });
         }
+        if self
+            .defect_codes
+            .iter()
+            .any(|code| code.trim().is_empty() || code.chars().any(char::is_control))
+        {
+            return Err(PreStageGateError::InvalidField {
+                field: "rejection.defect_codes",
+                reason: "every defect code must be non-blank bounded text",
+            });
+        }
         if self.write_mutation_status != "NOT_ATTEMPTED" {
             return Err(PreStageGateError::InvalidField {
                 field: "rejection.write_mutation_status",
@@ -135,6 +162,14 @@ impl PreStageRejection {
             return Err(PreStageGateError::InvalidField {
                 field: "rejection.write_intent_id",
                 reason: "pre-stage rejection must not consume a write intent",
+            });
+        }
+        if self.corrected_retry_identity_rule.trim().is_empty()
+            || self.next_allowed_action.trim().is_empty()
+        {
+            return Err(PreStageGateError::InvalidField {
+                field: "rejection.retry_rule",
+                reason: "must carry the corrected retry identity rule and next action",
             });
         }
         Ok(())

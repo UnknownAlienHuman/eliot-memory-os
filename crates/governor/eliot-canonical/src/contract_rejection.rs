@@ -239,7 +239,12 @@ impl AdmissionRejection {
                 reason: "must be non-blank",
             });
         }
-        if self.canonical_request_hash.len() != 64 {
+        if self.canonical_request_hash.len() != 64
+            || self
+                .canonical_request_hash
+                .bytes()
+                .any(|byte| !matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        {
             return Err(ContractRejectionError::InvalidField {
                 field: "rejection.canonical_request_hash",
                 reason: "must be a lowercase SHA-256 digest",
