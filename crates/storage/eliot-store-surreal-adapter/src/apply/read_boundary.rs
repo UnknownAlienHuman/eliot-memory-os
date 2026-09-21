@@ -360,6 +360,9 @@ async fn named_read_payload(
             let rows = read_authority_records(db, &adapter.config).await?;
             capability_evidence_payload(query, state_fence, &rows).map_err(AdapterError::Store)
         }
+        NamedReadOperation::GetNotificationState => {
+            notification_state_payload(db, &adapter.config, query, state_fence).await
+        }
         other => Err(AdapterError::NamedOperationUnavailable {
             operation: format!("{other:?}"),
         }),
@@ -1434,6 +1437,227 @@ fn capability_evidence_payload(
             "truncated": matched_total > returned,
         },
     }))
+}
+
+/// Closed selectors parsed from a notification-state read request.
+struct NotificationReadSelectors<'a> {
+    scope: Option<&'a str>,
+    dedup_key: Option<&'a str>,
+    notification_id: Option<&'a str>,
+    include_resolved: bool,
+    page_limit: u16,
+    cursor: Option<&'a str>,
+}
+
+/// Parses and bounds the closed read selectors.
+fn notification_read_selectors(
+    query: &NamedReadRequest,
+) -> Result<NotificationReadSelectors<'_>, AdapterError> {
+    let optional_text =
+        |name: &str| -> Option<&str> { query.parameters.get(name).and_then(Value::as_str) };
+    let include_resolved = match optional_text("include_resolved") {
+        Some("true") => true,
+        Some("false") => false,
+        _ => {
+            return Err(AdapterError::Store(StoreError::InvalidField {
+                field: "notification.include_resolved",
+                reason: "include_resolved must be \"true\" or \"false\"",
+            }));
+        }
+    };
+    let page_limit: u16 = optional_text("page_limit")
+        .and_then(|value| value.parse().ok())
+        .filter(|limit| *limit > 0 && *limit <= eliot_store_api::MAX_NOTIFICATION_PAGE_LIMIT)
+        .ok_or(AdapterError::Store(StoreError::InvalidField {
+            field: "notification.page_limit",
+            reason: "page limit is out of range",
+        }))?;
+    Ok(NotificationReadSelectors {
+        scope: optional_text("scope"),
+        dedup_key: optional_text("dedup_key"),
+        notification_id: optional_text("notification_id"),
+        include_resolved,
+        page_limit,
+        cursor: optional_text("cursor"),
+    })
+}
+
+/// Canonical inbox metrics folded over one projected set.
+#[derive(Default)]
+struct NotificationPageMetrics {
+    unresolved_total: u64,
+    critical_unresolved: u64,
+    action_required_unresolved: u64,
+    failed_delivery_unresolved: u64,
+    acknowledged_unresolved: u64,
+    resolved_total: u64,
+}
+
+impl NotificationPageMetrics {
+    /// Folds one projected record into the metrics.
+    fn observe(&mut self, record: &eliot_kernel_core::Notification) {
+        if record.resolution_ref.is_none() {
+            self.unresolved_total = self.unresolved_total.saturating_add(1);
+            match record.severity {
+                eliot_kernel_core::NotificationSeverity::Critical => {
+                    self.critical_unresolved = self.critical_unresolved.saturating_add(1);
+                }
+                eliot_kernel_core::NotificationSeverity::ActionRequired => {
+                    self.action_required_unresolved =
+                        self.action_required_unresolved.saturating_add(1);
+                }
+                _ => {}
+            }
+            if record.delivery.is_failed() {
+                self.failed_delivery_unresolved = self.failed_delivery_unresolved.saturating_add(1);
+            }
+            if record.acknowledgement.is_some() {
+                self.acknowledged_unresolved = self.acknowledged_unresolved.saturating_add(1);
+            }
+        } else {
+            self.resolved_total = self.resolved_total.saturating_add(1);
+        }
+    }
+}
+
+/// Projects rows to the same-fence canonical page with metrics.
+fn fold_notification_page(
+    rows: Vec<NotificationRow>,
+    selectors: &NotificationReadSelectors<'_>,
+    fence: &StateFence,
+) -> Result<
+    (
+        Vec<eliot_kernel_core::Notification>,
+        NotificationPageMetrics,
+    ),
+    AdapterError,
+> {
+    let limit = usize::from(selectors.page_limit.max(1));
+    let mut metrics = NotificationPageMetrics::default();
+    let mut selected = Vec::new();
+    let mut past_cursor = selectors.cursor.unwrap_or_default().is_empty();
+    for row in rows {
+        let record: eliot_kernel_core::Notification = serde_json::from_value(row.record)
+            .map_err(|error| AdapterError::Store(StoreError::Serialization(error.to_string())))?;
+        if record.state_fence != *fence {
+            continue;
+        }
+        if let Some(scope) = selectors.scope
+            && record.affected_scope != scope
+        {
+            continue;
+        }
+        if let Some(dedup_key) = selectors.dedup_key
+            && record.dedup_key != dedup_key
+        {
+            continue;
+        }
+        if let Some(notification_id) = selectors.notification_id
+            && record.notification_id.as_str() != notification_id
+        {
+            continue;
+        }
+        metrics.observe(&record);
+        if !selectors.include_resolved && record.resolution_ref.is_some() {
+            continue;
+        }
+        if !past_cursor {
+            if record.dedup_key.as_str() == selectors.cursor.unwrap_or_default() {
+                past_cursor = true;
+            }
+            continue;
+        }
+        if selected.len() >= limit {
+            break;
+        }
+        selected.push(record);
+    }
+    Ok((selected, metrics))
+}
+
+/// Reads notification rows and projects the same-fence canonical page
+/// (issue #1780).
+///
+/// Row shape mirrors the writer (`dedup_key`, `record`, `history`,
+/// `revision`, `state_fence`). Projection preserves unresolved acknowledged
+/// records, unresolved failed-delivery records, and unresolved
+/// critical/action-required records; quiet hours never filter this read.
+/// Parameters are re-validated here (membership and shape via the catalogue
+/// gate upstream; value ranges here) so a misrouted query fails closed
+/// without touching state.
+async fn notification_state_payload(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    query: &NamedReadRequest,
+    state_fence: &StateFence,
+) -> Result<Value, AdapterError> {
+    eliot_store_api::validate_typed_read_parameters(
+        NamedReadOperation::GetNotificationState,
+        &query.parameters,
+    )
+    .map_err(AdapterError::Store)?;
+    if query.state_fence != *state_fence {
+        return Err(AdapterError::Store(StoreError::FenceMismatch));
+    }
+    let selectors = notification_read_selectors(query)?;
+    let rows = read_notification_rows(db, config).await?;
+    let revision = rows
+        .iter()
+        .filter_map(|row| row.record.get("revision").and_then(Value::as_u64))
+        .max()
+        .unwrap_or(0);
+    let (selected, metrics) = fold_notification_page(rows, &selectors, state_fence)?;
+    let records = selected
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| AdapterError::Store(StoreError::Serialization(error.to_string())))?;
+    Ok(json!({
+        "records": records,
+        "metrics": {
+            "unresolved_total": metrics.unresolved_total,
+            "critical_unresolved": metrics.critical_unresolved,
+            "action_required_unresolved": metrics.action_required_unresolved,
+            "failed_delivery_unresolved": metrics.failed_delivery_unresolved,
+            "acknowledged_unresolved": metrics.acknowledged_unresolved,
+            "resolved_total": metrics.resolved_total,
+        },
+        "state_fence": state_fence,
+        "revision": revision,
+    }))
+}
+
+/// One notification row projected by the read SELECT.
+#[derive(Clone, Debug, serde::Deserialize)]
+struct NotificationRow {
+    record: Value,
+}
+
+/// Reads all notification rows in deterministic key order.
+async fn read_notification_rows(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+) -> Result<Vec<NotificationRow>, AdapterError> {
+    // Table names cannot travel as bindings in a FROM clause; the crate
+    // table constant is inlined here while row keys stay bound.
+    let sql = format!(
+        "BEGIN TRANSACTION; SELECT * FROM {} ORDER BY dedup_key; COMMIT TRANSACTION;",
+        schema::table::NOTIFICATION_RECORD
+    );
+    // SurrealDB 3 retains the BEGIN result at index 0 (null).
+    let mut response =
+        client::query(db, config, "read.notification_rows", &sql, Map::new()).await?;
+    let errors = response.take_errors();
+    if super::surreal_notification::missing_notification_table(&errors) {
+        return Ok(Vec::new());
+    }
+    if !errors.is_empty() {
+        return Err(AdapterError::Store(StoreError::Serialization(
+            "notification snapshot query failed".to_owned(),
+        )));
+    }
+    let rows = take_vec::<NotificationRow>(&mut response, 1)?;
+    Ok(rows)
 }
 
 async fn read_all_revision_heads(

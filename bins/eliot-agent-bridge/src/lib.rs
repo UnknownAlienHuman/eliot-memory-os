@@ -18,6 +18,13 @@ use eliot_agent_bridge_core::{
     ProviderReadiness, ReconciliationPortOutcome, ReconnectRequest, RecoveryDirective,
     TerminalReductionInputs, TransportEdge,
 };
+/// I7.17 recall response projection: bounded handles-first agent output with
+/// a server-derived disposition, binding receipt, and rank-trace handle.
+/// Full ranking/suppression traces require explicit debug expansion; the
+/// projection never accepts a disposition from bridge/model output.
+pub use eliot_agent_bridge_core::{
+    AgentRecallProjection, MAX_AGENT_RECALL_HANDLES, project_recall_for_agent,
+};
 use eliot_mcp::KernelHostRequestPort;
 use eliot_protocol::{
     AckPhase, AgentBridgeClientDeclaration, AgentBridgePeerAdmissionReceipt,
@@ -29,6 +36,7 @@ mod cli_contract;
 mod kernel_activation_client;
 mod kernel_host_request_client;
 pub mod reactive_injection_receipts;
+mod understanding_bootstrap;
 pub(crate) use cli_contract::validate_client_declaration_path;
 pub use cli_contract::{CliConfig, CliError, Profile, Transport, parse_args};
 use kernel_activation_client::KernelHostActivationPort;
@@ -42,6 +50,12 @@ pub use reactive_injection_receipts::{
     AdmissionBasis, AttentionItem, CueKind, DeliveryPoint, FiringEvidence, InjectionReceipt,
     ItemDisposition, NormalizedCue, REACTIVE_INJECTION_CONTRACT, ReactiveInjectionError,
     ReactiveInjectionLedger, RiskTier, Severity, UseOutcome,
+};
+pub use understanding_bootstrap::{
+    AuthoritativeSelection, BootstrapContext, BootstrapError, BootstrapSession,
+    BootstrapTaskInputs, CurrentAssessment, GovernanceEvidence, ReadinessDisposition, ScopeLevel,
+    SelectedTask, TaskCandidate, TaskSelectionDisposition, TaskSelectionView,
+    UnderstandingBootstrap, get_understanding_bootstrap,
 };
 
 fn decode_declaration_bytes(bytes: &[u8]) -> Result<AgentBridgeClientDeclaration, String> {
@@ -294,6 +308,8 @@ pub struct BridgeRunner {
     runtime: Runtime,
     core: AgentBridgeCore,
     reactive_ledger: ReactiveInjectionLedger,
+    bootstrap_session: BootstrapSession,
+    bootstrap_context: Option<BootstrapContext>,
 }
 
 impl BridgeRunner {
@@ -328,6 +344,8 @@ impl BridgeRunner {
             runtime,
             core: AgentBridgeCore::new(readiness, host_activation, mcp_forwarding, cursor_policy),
             reactive_ledger: ReactiveInjectionLedger::new(),
+            bootstrap_session: BootstrapSession::default(),
+            bootstrap_context: None,
         })
     }
     #[must_use]
@@ -541,6 +559,56 @@ impl BridgeRunner {
         self.reactive_ledger = ReactiveInjectionLedger::from_json_bytes(bytes)
             .map_err(|error| reactive_ledger_error(&error))?;
         Ok(())
+    }
+    /// Notes the owner-supplied bootstrap context for this session.
+    ///
+    /// Validates fail-closed without composing authority: an invalid context
+    /// is rejected and never stored. Noting context never delivers the
+    /// once-per-session auto-boot; delivery happens only through
+    /// [`Self::take_first_response_bootstrap`].
+    pub fn note_bootstrap_context(
+        &mut self,
+        context: BootstrapContext,
+    ) -> Result<(), BootstrapError> {
+        let empty_tasks = BootstrapTaskInputs {
+            scope_level: ScopeLevel::Session,
+            candidates: Vec::new(),
+            authoritative_selection: None,
+        };
+        get_understanding_bootstrap(&context, &empty_tasks, CurrentAssessment::NotOnboarded)?;
+        self.bootstrap_context = Some(context);
+        Ok(())
+    }
+    /// Bounded explicit retrieval of the canonical `UnderstandingBootstrap`.
+    ///
+    /// Always available, including after the once-per-session auto-boot was
+    /// delivered. Requires a noted context; fails closed otherwise.
+    pub fn get_understanding_bootstrap(
+        &self,
+        tasks: &BootstrapTaskInputs,
+        requested_assessment: CurrentAssessment,
+    ) -> Result<UnderstandingBootstrap, BootstrapError> {
+        let Some(context) = &self.bootstrap_context else {
+            return Err(BootstrapError {
+                code: "BOOTSTRAP_CONTEXT_MISSING",
+                detail: "no bootstrap context noted for this session".to_owned(),
+            });
+        };
+        get_understanding_bootstrap(context, tasks, requested_assessment)
+    }
+    /// Takes the once-per-session auto-boot for the first successful response.
+    ///
+    /// Returns `None` after the first delivery or when no valid context is
+    /// noted; composition failures also yield `None` without marking delivery
+    /// so a later response with complete inputs can still carry the bootstrap.
+    pub fn take_first_response_bootstrap(
+        &mut self,
+        tasks: &BootstrapTaskInputs,
+        requested_assessment: CurrentAssessment,
+    ) -> Option<UnderstandingBootstrap> {
+        let context = self.bootstrap_context.clone()?;
+        self.bootstrap_session
+            .take_auto_boot(&context, tasks, requested_assessment)
     }
     /// Read-only view of durable in-flight deliveries for bounded Stop accounting.
     ///

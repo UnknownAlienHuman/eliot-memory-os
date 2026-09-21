@@ -20,6 +20,7 @@ eliot-observation-contracts.workspace = true
 eliot-process.workspace = true
 eliot-protocol.workspace = true
 eliot-skill.workspace = true
+eliot-types.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 

@@ -241,6 +241,10 @@ CHILDREN: tuple[dict, ...] = (
 
 BRIDGE_PROFILE_REL = "bins/eliot-agent-bridge/src/request_input.rs"
 BRIDGE_PROFILE_ID = "eliot.agent-bridge.request-input.v1"
+BRIDGE_MAIN_REL = "bins/eliot-agent-bridge/src/main.rs"
+BRIDGE_CORPUS_REL = "bins/eliot-agent-bridge/tests/data/request_input_cases.json"
+BRIDGE_CORPUS_CASES = 32
+BRIDGE_ACCEPTANCE_REL = "scripts/testdata/serde-boundary-inventory/bridge_profile_acceptance.json"
 LEGACY_RECORD_REL = "crates/eliot-store/src/canonical_record.rs"
 MCP_SPECIFIC_OWNER_REL = "crates/eliot-types/src/mcp_contract.rs"
 
@@ -1020,6 +1024,139 @@ def _rule_digest() -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _read_json_doc(root: Path, rel: str) -> tuple[dict | None, str]:
+    """Parse a JSON durable input; never invent content on failure."""
+    path = root / rel
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None, ""
+    try:
+        doc = json.loads(text)
+    except ValueError:
+        return None, _sha256_text(text)
+    if not isinstance(doc, dict):
+        return None, _sha256_text(text)
+    return doc, _sha256_text(text)
+
+
+def _output_consts(root: Path) -> tuple[list[dict], str]:
+    """Parse Bridge output/diagnostic consts from live sources (read-only).
+
+    Returns the bound rows plus an evidence string. Missing consts yield an
+    empty row list with explicit evidence instead of invented values.
+    """
+    rows: list[dict] = []
+    notes: list[str] = []
+
+    def const_int(text: str, name: str) -> int | None:
+        m = re.search(r"const\s+%s\s*:\s*\w+\s*=\s*([0-9][0-9_]*)" % re.escape(name), text)
+        return int(m.group(1).replace("_", "")) if m else None
+
+    try:
+        main_text = (root / BRIDGE_MAIN_REL).read_text(encoding="utf-8")
+    except OSError:
+        return [], "unreadable-output-source: %s" % BRIDGE_MAIN_REL
+    try:
+        request_text = (root / BRIDGE_PROFILE_REL).read_text(encoding="utf-8")
+    except OSError:
+        return [], "unreadable-profile-source: %s" % BRIDGE_PROFILE_REL
+    frame = const_int(main_text, "MAX_OUTPUT_FRAME_BYTES")
+    drain = const_int(main_text, "MAX_STOP_DRAIN_ITEMS")
+    name_chars = const_int(request_text, "MAX_CONTROL_NAME_CHARS")
+    timeout_s = const_int(main_text, "STDOUT_WRITE_TIMEOUT_MS")
+    if timeout_s is None:
+        m = re.search(r"const\s+STDOUT_WRITE_TIMEOUT\s*:\s*Duration\s*=\s*Duration::from_secs\(\s*([0-9]+)\s*\)", main_text)
+        timeout_s = int(m.group(1)) if m else None
+    found = {
+        "max_output_frame_bytes": (frame, "bytes", "encoded-response-frame", "response-emission"),
+        "max_stop_drain_items": (drain, "items", "response-drain", "response-emission"),
+        "max_control_name_chars": (name_chars, "chars", "diagnostic-name", "diagnostics"),
+        "stdout_write_timeout_ms": (timeout_s * 1000 if timeout_s is not None else None, "ms", "wall-clock-explicit-timeout", "response-emission"),
+    }
+    for name, (value, unit, encoding, stage) in found.items():
+        if value is None:
+            notes.append("missing-output-const: %s" % name)
+            continue
+        rows.append(
+            {
+                "name": name,
+                "value": value,
+                "unit": unit,
+                "encoding": encoding,
+                "stage": stage,
+                "source": "bridge-local-decision",
+            }
+        )
+    rows.sort(key=lambda r: r["name"])
+    evidence = "output-consts:%d-bound" % len(rows) if not notes else "output-consts:partial:" + ",".join(notes)
+    return rows, evidence
+
+
+def _corpus_evidence(root: Path) -> dict:
+    """Parse the accepted corpus limits/framing table (read-only)."""
+    doc, digest = _read_json_doc(root, BRIDGE_CORPUS_REL)
+    if doc is None:
+        return {"status": "missing", "digest": digest, "limits": [],
+                "evidence": "missing-corpus: %s unreadable" % BRIDGE_CORPUS_REL}
+    limits = doc.get("limits", [])
+    if not isinstance(limits, list):
+        return {"status": "malformed", "digest": digest, "limits": [],
+                "evidence": "malformed-corpus: limits table is not a list"}
+    compat = doc.get("compatibility", {})
+    framing = "compatibility:%s" % ";".join(compat.get("supported", [])) if isinstance(compat, dict) else ""
+    return {
+        "status": "parsed",
+        "digest": digest,
+        "profile_id": doc.get("profile_id", ""),
+        "profile_revision": doc.get("profile_revision", ""),
+        "cases": doc.get("cases", []),
+        "limits": limits,
+        "framing": framing,
+        "notes": compat.get("notes", "") if isinstance(compat, dict) else "",
+        "evidence": "corpus:%d-cases:%d-limit-rows" % (
+            len(doc.get("cases", [])), len(limits)),
+    }
+
+
+def _acceptance_binding(root: Path, profile_id: str, source_digest: str) -> dict:
+    """Verify live sources against the accepted-profile fixture.
+
+    Returns acceptance identity on full match, else an explicit mismatch
+    reason. Absence of the fixture preserves the pre-acceptance states;
+    nothing is inferred from file presence alone.
+    """
+    fixture, fixture_digest = _read_json_doc(root, BRIDGE_ACCEPTANCE_REL)
+    if fixture is None:
+        return {"accepted": False, "reason": "no-acceptance-fixture"}
+    if fixture.get("profile_id", "") != profile_id or not profile_id:
+        return {"accepted": False, "reason": "acceptance-profile-id-mismatch"}
+    live: dict[str, str] = {}
+    for rel in sorted(fixture.get("sources", {})):
+        try:
+            live[rel] = _sha256_text((root / rel).read_text(encoding="utf-8"))
+        except OSError:
+            live[rel] = "unreadable"
+    mismatched = [rel for rel, want in sorted(fixture.get("sources", {}).items()) if live.get(rel) != want]
+    if mismatched:
+        return {"accepted": False,
+                "reason": "accepted-source-changed:" + ",".join(mismatched)}
+    corpus = fixture.get("corpus", {})
+    corpus_rel = corpus.get("path", BRIDGE_CORPUS_REL)
+    if live.get(corpus_rel, "") == "unreadable":
+        return {"accepted": False, "reason": "accepted-corpus-unreadable"}
+    return {
+        "accepted": True,
+        "reason": "",
+        "profile_revision": fixture.get("profile_revision", ""),
+        "acceptance_pr": fixture.get("acceptance", {}).get("pr", 0),
+        "acceptance_merge": fixture.get("acceptance", {}).get("merge", ""),
+        "acceptance_packet_digest": fixture.get("acceptance", {}).get("packet_sha256", ""),
+        "fixture_digest": fixture_digest,
+        "corpus_cases": corpus.get("cases", 0),
+    }
+
+
 def _profile_evidence(root: Path) -> dict:
     """Parse (never invent) the accepted Bridge input-profile limits."""
     path = root / BRIDGE_PROFILE_REL
@@ -1090,21 +1227,133 @@ def _profile_evidence(root: Path) -> dict:
                 }
             )
     limits.sort(key=lambda l: l["name"])
+    base_evidence = "parsed-from-%s; I7.2 frame defaults not reused as request limits" % BRIDGE_PROFILE_REL
+    if not limits:
+        return {
+            "profile_id": profile_id,
+            "status": "unrecognized",
+            "source": BRIDGE_PROFILE_REL,
+            "source_digest": source_digest,
+            "limits": [],
+            "digest": _sha256_text("unrecognized:" + source_digest),
+            "evidence": "unrecognized-profile: expected REQUEST_INPUT_PROFILE block not found",
+        }
+    corpus = _corpus_evidence(root)
+    output_rows, output_evidence = _output_consts(root)
+    struct_values = {l["name"]: l["value"] for l in limits}
+    corpus_rows = [r for r in corpus.get("limits", []) if isinstance(r, dict) and "name" in r]
+    corpus_values = {r["name"]: r["value"] for r in corpus_rows}
+    mismatched = sorted(
+        name for name, value in struct_values.items()
+        if name in corpus_values and corpus_values[name] != value
+    )
+    binding = _acceptance_binding(root, profile_id, source_digest)
+    output_values = {r["name"]: r["value"] for r in output_rows}
+    output_mismatched = sorted(
+        name for name, value in output_values.items()
+        if name in corpus_values and corpus_values[name] != value
+    )
+    carried: list[dict] = []
+    if corpus.get("status") == "parsed":
+        struct_names = set(struct_values) | set(output_values) | {"oversize_disposition"}
+        for row in corpus_rows:
+            if row["name"] in struct_names:
+                continue
+            stage = str(row.get("stage", ""))
+            encoding = {
+                "typed-contracts": "typed-contract",
+                "gateway-validation": "typed-preference",
+                "transport-only": "transport-frame",
+            }.get(stage, "stated-accepted")
+            carried.append(
+                {
+                    "name": str(row["name"]),
+                    "value": row["value"],
+                    "unit": str(row.get("unit", "")),
+                    "encoding": encoding,
+                    "stage": stage,
+                    "source": str(row.get("owner", row.get("origin", ""))),
+                }
+            )
+    carried.sort(key=lambda r: r["name"])
+    framing = ";".join(
+        part for part in [
+            "oversize-policy:discard-through-terminator",
+            "i72-not-reused",
+            corpus.get("framing", ""),
+            ("corpus-notes:" + corpus.get("notes", "")) if corpus.get("notes") else "",
+            output_evidence,
+        ] if part
+    )
+    full_limits = sorted(limits + output_rows + carried, key=lambda l: l["name"])
     digest = _sha256_text(
         json.dumps(
-            {"profile_id": profile_id, "source_digest": source_digest, "limits": limits},
+            {
+                "profile_id": profile_id,
+                "profile_revision": binding.get("profile_revision", ""),
+                "source_digest": source_digest,
+                "limits": full_limits,
+                "corpus_digest": corpus.get("digest", ""),
+                "framing": framing,
+            },
             sort_keys=True,
             separators=(",", ":"),
+            default=str,
         )
     )
+    accepted = (
+        binding.get("accepted", False)
+        and corpus.get("status") == "parsed"
+        and corpus.get("profile_id", "") == profile_id
+        and corpus.get("profile_revision", "") == binding.get("profile_revision", "")
+        and len(corpus.get("cases", [])) == binding.get("corpus_cases", 0) == BRIDGE_CORPUS_CASES
+        and not mismatched
+        and not output_mismatched
+        and len(output_rows) == 4
+    )
+    if not accepted:
+        reasons = []
+        if not binding.get("accepted", False):
+            reasons.append(binding.get("reason", "no-acceptance-fixture"))
+        fixture_loaded = binding.get("reason", "no-acceptance-fixture") != "no-acceptance-fixture"
+        if corpus.get("status") != "parsed":
+            reasons.append("corpus-%s" % corpus.get("status", "missing"))
+        elif fixture_loaded and corpus.get("profile_id", "") != profile_id:
+            reasons.append("corpus-profile-id-mismatch")
+        elif fixture_loaded and corpus.get("profile_revision", "") != binding.get("profile_revision", ""):
+            reasons.append("corpus-revision-mismatch")
+        elif fixture_loaded and len(corpus.get("cases", [])) != BRIDGE_CORPUS_CASES:
+            reasons.append("corpus-case-count-changed")
+        if mismatched:
+            reasons.append("profile-corpus-mismatch:" + ",".join(mismatched))
+        if output_mismatched:
+            reasons.append("output-corpus-mismatch:" + ",".join(output_mismatched))
+        if len(output_rows) != 4:
+            reasons.append("output-consts-incomplete")
+        return {
+            "profile_id": profile_id,
+            "status": "parsed",
+            "source": BRIDGE_PROFILE_REL,
+            "source_digest": source_digest,
+            "limits": limits,
+            "digest": digest,
+            "evidence": base_evidence + "; pending-acceptance:" + ",".join(reasons),
+        }
     return {
         "profile_id": profile_id,
-        "status": "parsed" if limits else "unrecognized",
+        "profile_revision": binding.get("profile_revision", ""),
+        "status": "accepted",
         "source": BRIDGE_PROFILE_REL,
         "source_digest": source_digest,
-        "limits": limits,
+        "limits": full_limits,
         "digest": digest,
-        "evidence": "parsed-from-%s; I7.2 frame defaults not reused as request limits" % BRIDGE_PROFILE_REL,
+        "acceptance_pr": binding.get("acceptance_pr", 0),
+        "acceptance_merge": binding.get("acceptance_merge", ""),
+        "acceptance_packet_digest": binding.get("acceptance_packet_digest", ""),
+        "corpus_digest": corpus.get("digest", ""),
+        "corpus_cases": len(corpus.get("cases", [])),
+        "framing": framing,
+        "evidence": base_evidence + "; accepted:PR%d:profile-bound" % binding.get("acceptance_pr", 0),
     }
 
 
@@ -1206,8 +1455,12 @@ def _classify(row: dict, profile: dict, legacy: dict) -> dict:
             "schema_class": "legacy",
         }
     if rel.startswith("bins/eliot-agent-bridge/src/") and row["type"] in ("Request", "request_input", "ReadOutcome", "RequestInputProfile"):
-        readiness = "BLOCKED" if profile.get("status") != "parsed" else "BLOCKED"
-        reason = "missing-profile: accepted Bridge profile pending" if profile.get("status") != "parsed" else "pending-profile-acceptance: parsed limits await independent review before parser dispatch"
+        if profile.get("status") == "accepted":
+            readiness = "READY_FOR_REPAIR"
+            reason = ""
+        else:
+            readiness = "BLOCKED"
+            reason = "missing-profile: accepted Bridge profile pending" if profile.get("status") != "parsed" else "pending-profile-acceptance: parsed limits await independent review before parser dispatch"
         return {
             "disposition": "needs-repair",
             "owner": "#977",
@@ -1222,8 +1475,12 @@ def _classify(row: dict, profile: dict, legacy: dict) -> dict:
             "schema_class": "current",
         }
     if rel.startswith("bins/eliot-agent-bridge/src/") and kind == "decoder-callsite":
-        readiness = "BLOCKED"
-        reason = "pending-profile-acceptance: Bridge acquisition needs the accepted input profile before parser dispatch"
+        if profile.get("status") == "accepted":
+            readiness = "READY_FOR_REPAIR"
+            reason = ""
+        else:
+            readiness = "BLOCKED"
+            reason = "pending-profile-acceptance: Bridge acquisition needs the accepted input profile before parser dispatch"
         return {
             "disposition": "needs-repair",
             "owner": "#977",
@@ -1427,6 +1684,7 @@ def build_inventory(root: Path, scan_rels: list[str] | None = None) -> dict:
         if is_acquisition:
             limit_detail = {
                 "profile_id": profile.get("profile_id", BRIDGE_PROFILE_ID),
+                "profile_revision": profile.get("profile_revision", ""),
                 "profile_source": profile.get("source", BRIDGE_PROFILE_REL),
                 "profile_source_digest": profile.get("source_digest", ""),
                 "profile_digest": profile.get("digest", ""),
@@ -1567,12 +1825,15 @@ def build_inventory(root: Path, scan_rels: list[str] | None = None) -> dict:
         caller_files = sorted({c for r in child_rows for c in r["callers"] if c})
         read_refs = sorted(set(REQUIRED_CONTRACT_REFS) | set(caller_files))
         stu = source_bytes + test_bytes + per_child_reading
-        if child["child"] == "#977" and profile.get("status") != "parsed":
+        if child["child"] == "#977" and profile.get("status") != "parsed" and profile.get("status") != "accepted":
             readiness = "BLOCKED"
             blocked = "missing-profile: accepted Bridge input profile not parsed"
-        elif child["child"] == "#977":
+        elif child["child"] == "#977" and profile.get("status") != "accepted":
             readiness = "BLOCKED"
             blocked = "pending-profile-acceptance: preparation precedes parser proof without a cycle; dispatch waits for accepted profile"
+        elif child["child"] == "#977":
+            readiness = "READY_FOR_REPAIR"
+            blocked = ""
         elif stu > STU_BUDGET:
             readiness = "BLOCKED"
             blocked = "oversized-allocation: %d STU exceeds %d budget; split while preserving requirement IDs" % (stu, STU_BUDGET)
@@ -1727,16 +1988,27 @@ def _render_toml(inventory: dict) -> bytes:
     lines.append("")
     lines.append("[profile]")
     lines.append("profile_id = %s" % _escape_toml_str(str(profile.get("profile_id", ""))))
+    lines.append("profile_revision = %s" % _escape_toml_str(str(profile.get("profile_revision", ""))))
     lines.append("status = %s" % _escape_toml_str(str(profile.get("status", ""))))
     lines.append("source = %s" % _escape_toml_str(str(profile.get("source", ""))))
     lines.append("source_digest = %s" % _escape_toml_str(str(profile.get("source_digest", ""))))
     lines.append("digest = %s" % _escape_toml_str(str(profile.get("digest", ""))))
+    lines.append("acceptance_pr = %d" % int(profile.get("acceptance_pr", 0)))
+    lines.append("acceptance_merge = %s" % _escape_toml_str(str(profile.get("acceptance_merge", ""))))
+    lines.append("acceptance_packet_digest = %s" % _escape_toml_str(str(profile.get("acceptance_packet_digest", ""))))
+    lines.append("corpus_digest = %s" % _escape_toml_str(str(profile.get("corpus_digest", ""))))
+    lines.append("corpus_cases = %d" % int(profile.get("corpus_cases", 0)))
+    lines.append("framing = %s" % _escape_toml_str(str(profile.get("framing", ""))))
     lines.append("evidence = %s" % _escape_toml_str(str(profile.get("evidence", ""))))
     for limit in profile.get("limits", []):
         lines.append("")
         lines.append("[[profile.limits]]")
         lines.append("name = %s" % _escape_toml_str(str(limit["name"])))
-        lines.append("value = %d" % int(limit["value"]))
+        value = limit["value"]
+        if isinstance(value, int) and not isinstance(value, bool):
+            lines.append("value = %d" % value)
+        else:
+            lines.append("value = %s" % _escape_toml_str(str(value)))
         lines.append("unit = %s" % _escape_toml_str(str(limit["unit"])))
         lines.append("encoding = %s" % _escape_toml_str(str(limit["encoding"])))
         lines.append("stage = %s" % _escape_toml_str(str(limit["stage"])))
@@ -2015,6 +2287,118 @@ def check_cli(root: Path) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def _self_test_accepted_profile_binding() -> None:
+    """Prove the accepted-profile binding end to end on a synthetic root.
+
+    Builds a synthetic Bridge profile (struct block + output consts + corpus
+    table) with a matching acceptance fixture computed from the bytes just
+    written, then asserts the accepted state, the bound limit map and
+    READY_FOR_REPAIR rows/allocation. A one-byte source tamper must fall back
+    to parsed/BLOCKED with an exact mismatch reason. Tmp paths never enter
+    digests (relative-path entries only), so the scenario is deterministic.
+    """
+    request_src = (
+        'pub const REQUEST_INPUT_PROFILE_ID: &str = "eliot.agent-bridge.request-input.v1";\n'
+        "use serde::Deserialize;\n"
+        "#[derive(Debug, Deserialize)]\n"
+        "pub struct Request { pub op: String }\n"
+        "pub struct RequestInputProfile { pub max_record_bytes: usize, pub max_buffered_bytes: usize }\n"
+        "pub const REQUEST_INPUT_PROFILE: RequestInputProfile = RequestInputProfile {\n"
+        "    max_record_bytes: 1048576, max_buffered_bytes: 2097152,\n};\n"
+        "pub const MAX_CONTROL_NAME_CHARS: usize = 64;\n"
+    )
+    main_src = (
+        "const MAX_OUTPUT_FRAME_BYTES: usize = 524288;\n"
+        "const MAX_STOP_DRAIN_ITEMS: usize = 32;\n"
+        "const STDOUT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);\n"
+        "pub fn main() {}\n"
+    )
+    corpus_limits = [
+        {"name": "max_record_bytes", "value": 1048576, "unit": "bytes", "origin": "new-bridge-local",
+         "owner": "#977", "stage": "acquisition", "rationale": "synthetic"},
+        {"name": "max_buffered_bytes", "value": 2097152, "unit": "bytes", "origin": "new-bridge-local",
+         "owner": "#977", "stage": "acquisition", "rationale": "synthetic"},
+        {"name": "max_output_frame_bytes", "value": 524288, "unit": "bytes", "origin": "new-bridge-local",
+         "owner": "#977", "stage": "response-emission", "rationale": "synthetic"},
+        {"name": "max_stop_drain_items", "value": 32, "unit": "items", "origin": "new-bridge-local",
+         "owner": "#977", "stage": "response-emission", "rationale": "synthetic"},
+        {"name": "max_control_name_chars", "value": 64, "unit": "chars", "origin": "new-bridge-local",
+         "owner": "#977", "stage": "diagnostics", "rationale": "synthetic"},
+    ]
+    corpus = {
+        "profile_id": BRIDGE_PROFILE_ID,
+        "profile_revision": "v9",
+        "limits": corpus_limits,
+        "compatibility": {"supported": ["synthetic-ok"], "notes": "synthetic"},
+        "cases": [{"id": "s%02d" % i} for i in range(BRIDGE_CORPUS_CASES)],
+    }
+    test_src = "synthetic request cases driver\n"
+    files = {
+        "Cargo.toml": '[workspace]\nmembers = ["bins/eliot-agent-bridge"]\ndefault-members = ["bins/eliot-agent-bridge"]\n',
+        "bins/eliot-agent-bridge/src/request_input.rs": request_src,
+        "bins/eliot-agent-bridge/src/main.rs": main_src,
+        "bins/eliot-agent-bridge/tests/data/request_input_cases.json": json.dumps(corpus, sort_keys=True),
+        "bins/eliot-agent-bridge/tests/request_input_cases.rs": test_src,
+        "bins/eliot-agent-bridge/Cargo.toml": '[package]\nname = "synthetic-bridge"\nversion = "0.1.0"\n',
+    }
+    tmp = Path(tempfile.mkdtemp(prefix="serde929-accept-")).resolve()
+    for rel, content in files.items():
+        path = tmp / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    sources = {
+        "bins/eliot-agent-bridge/src/main.rs": _sha256_text((tmp / "bins/eliot-agent-bridge/src/main.rs").read_text(encoding="utf-8")),
+        "bins/eliot-agent-bridge/src/request_input.rs": _sha256_text((tmp / "bins/eliot-agent-bridge/src/request_input.rs").read_text(encoding="utf-8")),
+        "bins/eliot-agent-bridge/tests/data/request_input_cases.json": _sha256_text((tmp / "bins/eliot-agent-bridge/tests/data/request_input_cases.json").read_text(encoding="utf-8")),
+        "bins/eliot-agent-bridge/tests/request_input_cases.rs": _sha256_text((tmp / "bins/eliot-agent-bridge/tests/request_input_cases.rs").read_text(encoding="utf-8")),
+    }
+    fixture = {
+        "schema": "eliot.bridge-profile-acceptance.v1",
+        "profile_id": BRIDGE_PROFILE_ID,
+        "profile_revision": "v9",
+        "owner": "#977",
+        "acceptance": {"pr": 0, "merge": "synthetic", "candidate": "synthetic", "packet_sha256": "synthetic"},
+        "sources": sources,
+        "corpus": {"path": BRIDGE_CORPUS_REL, "cases": BRIDGE_CORPUS_CASES},
+    }
+    fixture_path = tmp / BRIDGE_ACCEPTANCE_REL
+    fixture_path.parent.mkdir(parents=True, exist_ok=True)
+    fixture_path.write_text(json.dumps(fixture, sort_keys=True), encoding="utf-8")
+    scan = [
+        "bins/eliot-agent-bridge/src/request_input.rs",
+        "bins/eliot-agent-bridge/src/main.rs",
+    ]
+    first = build_inventory(tmp, scan)
+    second = build_inventory(tmp, list(reversed(scan)))
+    if first["profile"]["status"] != "accepted":
+        raise AssertionError("self-test accepted binding missing: %r" % first["profile"].get("evidence", ""))
+    if first["profile"]["digest"] != second["profile"]["digest"]:
+        raise AssertionError("self-test accepted digest depends on traversal order")
+    bound = {l["name"] for l in first["profile"]["limits"]}
+    for name in ("max_record_bytes", "max_buffered_bytes", "max_output_frame_bytes",
+                 "max_stop_drain_items", "max_control_name_chars"):
+        if name not in bound:
+            raise AssertionError("self-test limit map drops %s" % name)
+    bridge_rows = [r for r in first["rows"] if r["repair_child"] == "#977"]
+    if not bridge_rows:
+        raise AssertionError("self-test accepted binding has no Bridge rows")
+    for row in bridge_rows:
+        if row["repair_readiness"] != "READY_FOR_REPAIR" or row["blocked_reason"]:
+            raise AssertionError("self-test accepted row not ready: %r" % row["id"])
+    alloc = next(a for a in first["allocations"] if a["child"] == "#977")
+    if alloc["readiness"] != "READY_FOR_REPAIR" or alloc["blocked_reason"]:
+        raise AssertionError("self-test accepted allocation not ready")
+    tampered = request_src.replace("max_record_bytes: 1048576", "max_record_bytes: 1048575")
+    (tmp / BRIDGE_PROFILE_REL).write_text(tampered, encoding="utf-8")
+    stale = build_inventory(tmp, scan)
+    if stale["profile"]["status"] != "parsed":
+        raise AssertionError("self-test tamper did not fall back to parsed")
+    if "accepted-source-changed" not in stale["profile"].get("evidence", ""):
+        raise AssertionError("self-test tamper reason not exact: %r" % stale["profile"].get("evidence", ""))
+    if any(r["repair_readiness"] != "BLOCKED" for r in stale["rows"] if r["repair_child"] == "#977"):
+        raise AssertionError("self-test tamper left a Bridge row ready")
+
+
 def run_self_test() -> dict:
     here = Path(__file__).resolve()
     repo = here.parents[1]
@@ -2057,6 +2441,7 @@ def run_self_test() -> dict:
         raise AssertionError("self-test unsupported macro is not explicit unknown")
     if _sha256_text("a") == _sha256_text("b"):
         raise AssertionError("self-test digest is inert")
+    _self_test_accepted_profile_binding()
     print(
         "SERDE_BOUNDARY_INVENTORY_SELF_TEST: PASS "
         "(fixture rows %d; digest %s)"

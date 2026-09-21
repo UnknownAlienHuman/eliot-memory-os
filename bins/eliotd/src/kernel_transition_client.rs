@@ -13,8 +13,9 @@ use eliot_contracts::OperationId;
 use eliot_governor::{KernelPortError, KernelPortFuture, KernelTransitionPort};
 use eliot_protocol::RequestIdentity;
 use eliot_store_api::{
-    OrderingHeadExpectation, PreparedTransition, RevisionHeadExpectation, StoreHealth,
-    WriteReceipt, validate_store_receipt_envelope,
+    CanonicalRequestView, OrderingHeadExpectation, PreparedTransition, RevisionHeadExpectation,
+    StoreHealth, WriteReceipt, generated_operation_manifests, validate_store_receipt_envelope,
+    verify_canonical_request_hash,
 };
 use tracing::Instrument as _;
 
@@ -69,6 +70,32 @@ fn check_identity_binding(
             ));
         }
     }
+    // 1927: deterministic PreparedTransition admission before transport.
+    // Recompute the canonical request hash over the exact executable bytes
+    // about to be sent (context + transition + expected heads). A plan whose
+    // contents, effect ceiling, scope task binding, named operation
+    // parameters, or admission digest changed after staging fails here rather
+    // than reaching Kernel/store execution.
+    let view = CanonicalRequestView::from_apply(
+        &identity.request.metadata,
+        transition,
+        expected_revision_heads,
+        expected_ordering_heads,
+    );
+    verify_canonical_request_hash(&view, &transition.identity.canonical_request_hash)
+        .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+    // 1927: the transported plan must be supported by the currently admitted
+    // operation catalogue. An unsupported recorded plan is refused here as
+    // visible recovery work; it is never reinterpreted or widened for send.
+    let entries = generated_operation_manifests()
+        .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+    transition
+        .validate_against_catalogue(&entries)
+        .map_err(|error| {
+            KernelPortError::Contract(format!(
+                "unsupported prepared transition; preserve as recovery, do not reinterpret: {error}"
+            ))
+        })?;
     Ok(())
 }
 
@@ -206,9 +233,10 @@ mod tests {
     };
     use eliot_receipts::RequestBinding;
     use eliot_store_api::{
-        EffectClass, EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
-        OperationIdentity, OperationManifestDigest, OrderingScopeId, ScopeId, SecurityContext,
-        TransitionClass,
+        CanonicalRequestView, EffectClass, EventProjectionRelationIntents, NamedMutationOperation,
+        NamedMutationRequest, OperationIdentity, OperationManifestDigest, OrderingScopeId, ScopeId,
+        SecurityContext, TransitionClass, canonical_request_hash, generated_operation_manifests,
+        operation_manifest_set_digest,
     };
     use std::num::NonZeroU64;
 
@@ -251,6 +279,8 @@ mod tests {
     }
 
     fn transition(fence: &StateFence) -> PreparedTransition {
+        let entries = generated_operation_manifests().expect("catalogue");
+        let set_digest = operation_manifest_set_digest(&entries).expect("set digest");
         PreparedTransition {
             identity: OperationIdentity {
                 operation_id: OperationId::new("op-daemon-1").expect("operation id"),
@@ -261,14 +291,16 @@ mod tests {
             scope_id: ScopeId::new("governor").expect("scope"),
             task_id: None,
             ordering_scopes: vec![OrderingScopeId::new("scope:governor").expect("ordering scope")],
-            transition_class: TransitionClass::TaskControl,
-            requested_effect_ceiling: EffectClass::ReversibleMutation,
+            transition_class: TransitionClass::CaptureCandidate,
+            requested_effect_ceiling: EffectClass::Candidate,
             admission_contract_set_digest: "a".repeat(64),
-            operation_manifest_digest: OperationManifestDigest::new("manifest")
-                .expect("manifest digest"),
+            operation_manifest_digest: set_digest,
             named_operations: vec![NamedMutationRequest {
-                operation: NamedMutationOperation::UpdateTaskState,
-                parameters: BTreeMap::new(),
+                operation: NamedMutationOperation::CaptureObservation,
+                parameters: BTreeMap::from([(
+                    "subject".to_owned(),
+                    serde_json::json!("observation-daemon-1"),
+                )]),
             }],
             event_projection_relation_intents: EventProjectionRelationIntents {
                 event_ids: Vec::new(),
@@ -292,11 +324,18 @@ mod tests {
     fn transition_identity_binding_is_exact_before_transport() {
         let fence = test_fence(1);
         let identity = identity(&fence);
-        let transition = transition(&fence);
+        let mut transition = transition(&fence);
+        // Bind the deterministic admission digest over the exact executable
+        // bytes used below (1927): the transported hash must equal the
+        // recomputed canonical request hash, or admission fails closed.
+        let heads = vec![ordering_head(&fence)];
+        transition.identity.canonical_request_hash = canonical_request_hash(
+            &CanonicalRequestView::from_apply(&identity.request.metadata, &transition, &[], &heads),
+        )
+        .expect("admission hash");
         // Exact admitted terms pass with the initiating source preserved:
         // the adapter never rewrites it to the daemon transport peer.
-        check_identity_binding(&identity, &transition, &[], &[ordering_head(&fence)])
-            .expect("exact binding");
+        check_identity_binding(&identity, &transition, &[], &heads).expect("exact binding");
         assert_eq!(identity.request.metadata.source_id.as_str(), "agent-bridge");
         // A substituted fence binding fails closed before any transport,
         // even though the substituted identity is internally consistent.
@@ -320,5 +359,66 @@ mod tests {
             check_identity_binding(&identity, &transition, &[], &[ordering_head(&other)]),
             Err(KernelPortError::Contract(_))
         ));
+    }
+
+    #[test]
+    fn prepared_admission_rejects_tampered_and_unsupported_plans() {
+        // 1927 acceptance: changing the plan contents, effect ceiling, named
+        // operation parameters, or admission digest after staging causes
+        // rejection rather than execution; an unsupported recorded plan is
+        // visible as recovery work and is not reinterpreted.
+        let fence = test_fence(1);
+        let identity = identity(&fence);
+        let mut transition = transition(&fence);
+        let heads = vec![ordering_head(&fence)];
+        transition.identity.canonical_request_hash = canonical_request_hash(
+            &CanonicalRequestView::from_apply(&identity.request.metadata, &transition, &[], &heads),
+        )
+        .expect("admission hash");
+        check_identity_binding(&identity, &transition, &[], &heads).expect("admitted plan");
+        // Widened effect ceiling after staging is rejected.
+        let mut widened = transition.clone();
+        widened.requested_effect_ceiling = EffectClass::ReversibleMutation;
+        assert!(matches!(
+            check_identity_binding(&identity, &widened, &[], &heads),
+            Err(KernelPortError::Contract(_))
+        ));
+        // Mutated named-operation parameters after staging are rejected.
+        let mut reparam = transition.clone();
+        reparam.named_operations[0].parameters.insert(
+            "subject".to_owned(),
+            serde_json::json!("observation-substituted"),
+        );
+        assert!(matches!(
+            check_identity_binding(&identity, &reparam, &[], &heads),
+            Err(KernelPortError::Contract(_))
+        ));
+        // Mutated admission digest after staging is rejected.
+        let mut redigest = transition.clone();
+        redigest.admission_contract_set_digest = "d".repeat(64);
+        assert!(matches!(
+            check_identity_binding(&identity, &redigest, &[], &heads),
+            Err(KernelPortError::Contract(_))
+        ));
+        // Unsupported operation manifest is refused as visible recovery work.
+        let mut unsupported = transition.clone();
+        unsupported.operation_manifest_digest =
+            OperationManifestDigest::new("f".repeat(64)).expect("digest shape");
+        unsupported.identity.canonical_request_hash =
+            canonical_request_hash(&CanonicalRequestView::from_apply(
+                &identity.request.metadata,
+                &unsupported,
+                &[],
+                &heads,
+            ))
+            .expect("recomputed hash");
+        let error = match check_identity_binding(&identity, &unsupported, &[], &heads) {
+            Err(error) => error,
+            Ok(()) => unreachable!("unsupported manifest must fail"),
+        };
+        assert!(
+            matches!(error, KernelPortError::Contract(ref detail) if detail.contains("recovery")),
+            "unsupported plan must name recovery, got: {error:?}"
+        );
     }
 }
