@@ -118,10 +118,6 @@ pub use store_write_reservation::{
     project_reserved_write, reconcile_receipt, recovery_page, reserve_for_transition,
     unresolved_reservations, writer_epoch_for_fence, writer_epoch_for_fence_from_epoch,
 };
-pub use write_coordinator::{
-    CoordinatorError, ScopeExecutionGuard, WriteCoordinator, WriteCoordinatorConfig,
-    default_executor_lanes,
-};
 pub use testd_front_door::{
     AuthenticatedTestdSession, TESTD_ADMISSION_ADVERTISED, TESTD_ADMISSION_WIRE_ID,
     TESTD_ADMISSION_WIRE_VERSION, TESTD_CONFLICT_MAX_FIELDS, TESTD_MAX_ENVELOPE_BYTES,
@@ -130,6 +126,10 @@ pub use testd_front_door::{
     TestdAdmissionResponse, advertise_testd_admission, advertise_testd_admission_when_composed,
     handle_testd_admission_attempt, handle_testd_cancellation, is_testd_diagnosis_only_envelope,
     reconcile_testd_admission, reconcile_testd_delivery, route_testd_admission,
+};
+pub use write_coordinator::{
+    CoordinatorError, ScopeExecutionGuard, WriteCoordinator, WriteCoordinatorConfig,
+    default_executor_lanes,
 };
 
 /// Boxed future for provider-neutral Kernel process operations.
