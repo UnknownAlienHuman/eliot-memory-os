@@ -94,6 +94,110 @@ fn observed_lifecycle_without_enforcement_denies_enforcement_ops() {
 }
 
 #[test]
+fn invalid_coverage_is_rejected_fail_closed() {
+    // An omitted logical event is rejected, never treated as unavailable.
+    let mut missing = ALL_EVENTS
+        .iter()
+        .copied()
+        .map(observed_event)
+        .collect::<Vec<_>>();
+    missing.pop();
+    assert!(
+        IntegrationCoverageProfile::candidate(
+            "host:adapter:fingerprint-a",
+            missing,
+            EventCompleteness::Partial,
+            "observed-effect",
+            "host-event-envelope",
+            vec!["missing Stop/FinishAttempt axis".to_owned()],
+        )
+        .is_err()
+    );
+
+    // A COMPLETE profile with a partial event is contradictory.
+    let mut partial_event = ALL_EVENTS
+        .iter()
+        .copied()
+        .map(observed_event)
+        .collect::<Vec<_>>();
+    for event in &mut partial_event {
+        if event.event == LogicalEvent::PostToolUse {
+            event.completeness = EventCompleteness::Partial;
+            event.gaps.push("blind interval 12:00-12:07".to_owned());
+        }
+    }
+    assert!(
+        IntegrationCoverageProfile::candidate(
+            "host:adapter:fingerprint-a",
+            partial_event,
+            EventCompleteness::Complete,
+            "observed-effect",
+            "host-event-envelope",
+            Vec::new(),
+        )
+        .is_err()
+    );
+
+    // A PARTIAL event without named gap evidence is rejected.
+    let mut gapless = ALL_EVENTS
+        .iter()
+        .copied()
+        .map(observed_event)
+        .collect::<Vec<_>>();
+    for event in &mut gapless {
+        if event.event == LogicalEvent::PostToolUse {
+            event.completeness = EventCompleteness::Partial;
+        }
+    }
+    assert!(
+        IntegrationCoverageProfile::candidate(
+            "host:adapter:fingerprint-a",
+            gapless,
+            EventCompleteness::Partial,
+            "observed-effect",
+            "host-event-envelope",
+            vec!["blind interval 12:00-12:07".to_owned()],
+        )
+        .is_err()
+    );
+
+    // A COMPLETE event carrying gap evidence is rejected.
+    let mut gapped = ALL_EVENTS
+        .iter()
+        .copied()
+        .map(observed_event)
+        .collect::<Vec<_>>();
+    for event in &mut gapped {
+        if event.event == LogicalEvent::PostToolUse {
+            event.gaps.push("stale gap note".to_owned());
+        }
+    }
+    assert!(
+        IntegrationCoverageProfile::candidate(
+            "host:adapter:fingerprint-a",
+            gapped,
+            EventCompleteness::Complete,
+            "observed-effect",
+            "host-event-envelope",
+            Vec::new(),
+        )
+        .is_err()
+    );
+
+    // A candidate mutated after construction cannot be promoted.
+    let mut profile = must(IntegrationCoverageProfile::candidate(
+        "host:adapter:fingerprint-a",
+        ALL_EVENTS.iter().copied().map(observed_event).collect(),
+        EventCompleteness::Complete,
+        "observed-effect",
+        "discovery-scan",
+        Vec::new(),
+    ));
+    profile.events.pop();
+    assert!(profile.verify("host:adapter:fingerprint-a", true).is_err());
+}
+
+#[test]
 fn coverage_loss_emits_new_revision_and_rejects_prior_capability() {
     let mut events: Vec<EventCoverage> = ALL_EVENTS.iter().copied().map(observed_event).collect();
     for event in &mut events {

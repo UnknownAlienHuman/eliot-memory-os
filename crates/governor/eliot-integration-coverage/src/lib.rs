@@ -141,11 +141,28 @@ pub struct EventCoverage {
 
 impl EventCoverage {
     /// Validates source, proof ceiling and gap evidence text.
+    ///
+    /// Gap binding (I7.23): a `PARTIAL` event must name its blind
+    /// interval or missing source; a `COMPLETE` event must not carry gap
+    /// evidence, otherwise the completeness claim is contradictory.
     pub fn validate(&self) -> Result<(), CoverageError> {
         validate_text(&self.proof_ceiling, "event.proof_ceiling")?;
         validate_text(&self.source, "event.source")?;
         for gap in &self.gaps {
             validate_text(gap, "event.gaps.item")?;
+        }
+        match self.completeness {
+            EventCompleteness::Partial if self.gaps.is_empty() => {
+                return Err(CoverageError::InvalidField(
+                    "event.gaps.required_when_partial",
+                ));
+            }
+            EventCompleteness::Complete if !self.gaps.is_empty() => {
+                return Err(CoverageError::InvalidField(
+                    "event.gaps.unexpected_when_complete",
+                ));
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -193,11 +210,14 @@ impl IntegrationCoverageProfile {
 
     /// Promotes a candidate to verified after exact active-fingerprint
     /// production observation. Discovery output alone is never sufficient.
+    /// The candidate is re-validated so a mutated profile cannot be
+    /// promoted with contradictory or missing evidence.
     pub fn verify(
         mut self,
         active_fingerprint: &str,
         production_observed: bool,
     ) -> Result<Self, CoverageError> {
+        self.validate()?;
         if self.fingerprint != active_fingerprint {
             return Err(CoverageError::FingerprintMismatch);
         }
@@ -218,6 +238,13 @@ impl IntegrationCoverageProfile {
     }
 
     /// Validates identity, event evidence, gaps and completeness binding.
+    ///
+    /// Every profile declares all ten [`ALL_EVENTS`] logical events: an
+    /// omitted event is rejected rather than treated as unavailable, so a
+    /// missing observation/enforcement axis can never be silent (I7.16).
+    /// A `COMPLETE` profile additionally requires every event to be
+    /// `COMPLETE`; any partial event forces the profile to `PARTIAL` or
+    /// worse with gap evidence (I7.23 denominator binding).
     pub fn validate(&self) -> Result<(), CoverageError> {
         validate_text(&self.fingerprint, "coverage.fingerprint")?;
         validate_text(&self.proof_ceiling, "coverage.proof_ceiling")?;
@@ -232,12 +259,18 @@ impl IntegrationCoverageProfile {
                 return Err(CoverageError::InvalidField("coverage.events.duplicate"));
             }
         }
-        if self.completeness == EventCompleteness::Complete {
-            for required in ALL_EVENTS {
-                if !seen.contains(&required) {
-                    return Err(CoverageError::InvalidField("coverage.events.incomplete"));
-                }
+        for required in ALL_EVENTS {
+            if !seen.contains(&required) {
+                return Err(CoverageError::InvalidField("coverage.events.incomplete"));
             }
+        }
+        if self.completeness == EventCompleteness::Complete
+            && self
+                .events
+                .iter()
+                .any(|event| event.completeness != EventCompleteness::Complete)
+        {
+            return Err(CoverageError::InvalidField("coverage.events.completeness"));
         }
         if self.completeness != EventCompleteness::Complete && self.gaps.is_empty() {
             return Err(CoverageError::InvalidField(
