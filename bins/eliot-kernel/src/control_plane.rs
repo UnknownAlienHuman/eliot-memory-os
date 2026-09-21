@@ -636,6 +636,14 @@ impl KernelComposition {
         let state = self
             .service_state()
             .map_err(|_| TransportError::SessionFenced)?;
+        let runtime_health = if is_probe {
+            Some(self.runtime_health_evidence_for_control(
+                request.generation,
+                &request.candidate.kernel_epoch,
+            )?)
+        } else {
+            None
+        };
         KernelControlResponse {
             wire_id: eliot_kernel_service::KERNEL_CONTROL_WIRE_ID.to_owned(),
             wire_version: eliot_kernel_service::KERNEL_CONTROL_WIRE_VERSION,
@@ -643,6 +651,7 @@ impl KernelComposition {
             request_digest: request.payload_digest,
             state,
             receipt,
+            runtime_health,
             activation_receipt,
             store_rebind_receipt,
             supervision_lease,

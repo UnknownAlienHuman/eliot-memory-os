@@ -190,6 +190,7 @@ use eliot_installation::{
 };
 #[cfg(windows)]
 use eliot_kernel_core::AuthoritySnapshotBindingWire;
+use eliot_kernel_core::KernelRuntimeHealthEvidence;
 #[cfg(all(test, windows))]
 use eliot_kernel_service::KERNEL_CONTROL_PIPE;
 use eliot_kernel_service::{
@@ -509,7 +510,7 @@ fn validate_probe_response(
     request: &KernelControlRequest,
     activation: &KernelActivationReceipt,
     response: &KernelControlResponse,
-) -> Result<KernelReadyReceipt, HostError> {
+) -> Result<(KernelReadyReceipt, KernelRuntimeHealthEvidence), HostError> {
     request
         .validate()
         .map_err(|error| HostError::ProcessContour(error.to_string()))?;
@@ -530,6 +531,27 @@ fn validate_probe_response(
     let ready = response.receipt.clone().ok_or_else(|| {
         HostError::ProcessContour("Kernel did not return a ready receipt".to_owned())
     })?;
+    let runtime_health = response.runtime_health.clone().ok_or_else(|| {
+        HostError::ProcessContour(
+            "Kernel did not return the canonical runtime-health carrier".to_owned(),
+        )
+    })?;
+    runtime_health
+        .validate()
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    let process_health = runtime_health.process_health();
+    if !runtime_health
+        .authority_epoch()
+        .is_same_authority(&request.candidate.kernel_epoch)
+        || runtime_health.module_generation() != activation.generation
+        || process_health.process_id() != ready.process.process_id.as_str()
+        || process_health.process_state() != ready.process.state
+        || process_health.health().canonical != ready.health
+    {
+        return Err(HostError::ProcessContour(
+            "Kernel runtime-health carrier is foreign to the exact readiness contour".to_owned(),
+        ));
+    }
     let supervision = response.supervision_lease.as_ref().ok_or_else(|| {
         HostError::ProcessContour(
             "Kernel did not return the exact current supervision ORS snapshot".to_owned(),
@@ -556,7 +578,7 @@ fn validate_probe_response(
     ready
         .validate_for_probe(request, activation)
         .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-    Ok(ready)
+    Ok((ready, runtime_health))
 }
 
 #[cfg(windows)]
@@ -564,6 +586,7 @@ struct AuthenticatedKernelReadiness {
     request: KernelControlRequest,
     response: KernelControlResponse,
     ready: KernelReadyReceipt,
+    runtime_health: KernelRuntimeHealthEvidence,
     supervision_lease: eliot_ors::SupervisionLeaseSnapshot,
     store_fence: PlatformHandle,
     peer_evidence: PlatformHandle,
@@ -2745,7 +2768,7 @@ impl HostJobBranches {
                 .map_err(|error| HostError::ProcessContour(error.to_string()))?;
             let response = decode_control_response_frame(&frame)
                 .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-            let ready = validate_probe_response(&request, activation, &response)?;
+            let (ready, runtime_health) = validate_probe_response(&request, activation, &response)?;
             let supervision_lease = response.supervision_lease.clone().ok_or_else(|| {
                 HostError::ProcessContour(
                     "Kernel did not return the exact current supervision ORS snapshot".to_owned(),
@@ -2762,6 +2785,7 @@ impl HostJobBranches {
                 request,
                 response,
                 ready,
+                runtime_health,
                 supervision_lease,
                 store_fence,
                 peer_evidence,
