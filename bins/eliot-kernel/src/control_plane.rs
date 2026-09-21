@@ -99,6 +99,40 @@ fn observe_control_capacity(capacity: usize) {
     );
 }
 
+/// Verifies the independent-supervision (watchdog) branch backing one Windows
+/// `ProbeReady` admission: the candidate's supervision incarnation must carry
+/// a usable watchdog epoch, and the renewed ORS head behind this probe's
+/// supervision lease must carry that exact same epoch.
+///
+/// Fail-closed `SessionFenced` otherwise: on Windows the Kernel never authors
+/// a ready receipt — and never returns a supervision lease — as
+/// independently supervised when the watchdog branch is missing or foreign.
+/// Per I1.5, Material work requiring independent supervision is then paused
+/// (Host degrades the readiness contour into a human-visible coverage gap)
+/// instead of being admitted as supervised. Non-Windows builds have no
+/// equivalent gate yet (Linux supervision port, I1.7) and therefore emit no
+/// supervised readiness at all: `ProbeReady` fails closed below before any
+/// receipt or supervision lease is produced.
+#[cfg_attr(
+    not(windows),
+    allow(
+        dead_code,
+        reason = "the verified-watchdog ProbeReady gate has no non-Windows caller until the Linux supervision port lands (I1.7)"
+    )
+)]
+fn verify_probe_watchdog_branch(
+    incarnation_watchdog_sequence: u64,
+    binding_watchdog_sequence: u64,
+) -> Result<(), TransportError> {
+    if incarnation_watchdog_sequence == 0
+        || binding_watchdog_sequence == 0
+        || incarnation_watchdog_sequence != binding_watchdog_sequence
+    {
+        return Err(TransportError::SessionFenced);
+    }
+    Ok(())
+}
+
 impl KernelComposition {
     /// Applies one lifecycle command through the sole Kernel transition gateway.
     ///
@@ -450,6 +484,24 @@ impl KernelComposition {
             .map(|(snapshot, _)| snapshot.clone());
         #[cfg(not(windows))]
         let supervision_lease = None;
+        #[cfg(windows)]
+        if let Some((renewed_head, _)) = supervision_publication.as_ref() {
+            // I1.5 (#1750, Windows-only gate): the ProbeReady admission never
+            // proceeds as independently supervised without the verified
+            // watchdog branch. This runs before any ready receipt is authored,
+            // and the readbacks below confirm the gated head is still current,
+            // so a refusal surfaces as degraded readiness instead of
+            // supervised health. Non-Windows builds never reach a supervised
+            // admission: ProbeReady fails closed below (I1.7).
+            verify_probe_watchdog_branch(
+                request
+                    .candidate
+                    .supervision_incarnation
+                    .watchdog_epoch
+                    .sequence,
+                renewed_head.record.binding.watchdog_epoch.value(),
+            )?;
+        }
         let receipt = if is_probe {
             #[cfg(windows)]
             {
@@ -461,6 +513,10 @@ impl KernelComposition {
             }
             #[cfg(not(windows))]
             {
+                // Containment (I1.7): without the verified watchdog-branch gate
+                // there is no equivalent supervision proof on this platform, so
+                // no ready receipt — and no supervised-readiness claim of any
+                // kind — may be emitted here.
                 return Err(TransportError::SessionFenced);
             }
         } else {
@@ -632,6 +688,23 @@ mod control_plane_diagnostics_tests {
     //! digests, and peer material never reach the sink.
 
     use super::*;
+
+    #[test]
+    fn probe_watchdog_branch_requires_exact_nonzero_epoch() {
+        assert!(verify_probe_watchdog_branch(7, 7).is_ok());
+        assert_eq!(
+            verify_probe_watchdog_branch(7, 8),
+            Err(TransportError::SessionFenced)
+        );
+        assert_eq!(
+            verify_probe_watchdog_branch(0, 7),
+            Err(TransportError::SessionFenced)
+        );
+        assert_eq!(
+            verify_probe_watchdog_branch(7, 0),
+            Err(TransportError::SessionFenced)
+        );
+    }
 
     #[test]
     fn control_diagnostics_terminal_codes_are_stable() {

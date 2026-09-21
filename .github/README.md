@@ -43,22 +43,32 @@ Manual bounded integration-source check.
 
 Checks the selected checked-out source revision through:
 
-- normative identity and Cargo metadata;
-- formatting and workspace all-target check through `scripts/verify.ps1`;
-- Eliot.Operator Release build.
+- the closed Review profile owned by `scripts/verify.ps1`, invoked exactly
+  once (normative identity, Cargo metadata, formatting, workspace all-target
+  check, Clippy, nonzero workspace tests, dependency-policy offline gate);
+- hash-locked Python verification dependencies
+  (`scripts/requirements-verification.txt` with `--require-hashes`);
+- locked-mode NuGet restore of `Eliot.Operator` and `Eliot.Operator.Tests`
+  against their checked-in `packages.lock.json` files, then the
+  Eliot.Operator Release build and the explicit `Eliot.Operator.Tests`
+  harness execution.
 
-Proof ceiling: source/build integration candidate. It does not prove complete
-workspace tests, an installed Windows service tree, store recovery, or a Product
-Pulse.
+Proof ceiling: source-only review candidate (`REVIEW_SOURCE_ONLY`). It does not
+prove release packaging, an installed Windows service tree, store recovery, or
+a Product Pulse.
 
 ### `source-candidate.yml`
 
 Manual, explicit full source-candidate gate.
 
-Runs formatting, workspace all-target check, Clippy, nonzero workspace tests,
-workspace all-target build, and Eliot.Operator Release build on one exact source
-SHA. The optional live-scenario input intentionally fails until the live Windows
-harness exists; it cannot be used to manufacture runtime proof.
+Runs formatting, locked (`--locked`) workspace all-target check, Clippy, nonzero
+workspace tests, and workspace all-target build on one exact source SHA, with
+the toolchain identity shown from the pinned `rust-toolchain.toml` (no latest
+installer). Restores `Eliot.Operator` and `Eliot.Operator.Tests` in locked mode
+against their checked-in `packages.lock.json` files, builds Eliot.Operator
+Release, and explicitly executes the `Eliot.Operator.Tests` harness. The
+optional live-scenario input intentionally fails until the live Windows harness
+exists; it cannot be used to manufacture runtime proof.
 
 Proof ceiling: full source candidate only. Release packaging belongs to
 `scripts/` and `docs/release/`; live Windows acceptance belongs to issue #11.

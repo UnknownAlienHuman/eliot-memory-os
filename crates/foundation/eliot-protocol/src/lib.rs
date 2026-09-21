@@ -3249,13 +3249,14 @@ impl HostRequestInvokeReadPayload {
             field: "host_request_invoke_read.tool",
             reason: "tool bytes must be a JSON object",
         })?;
-        let name = object
-            .get("name")
-            .and_then(Value::as_str)
-            .ok_or(ProtocolError::InvalidField {
-                field: "host_request_invoke_read.tool.name",
-                reason: "tool bytes must carry the canonical tool name",
-            })?;
+        let name =
+            object
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or(ProtocolError::InvalidField {
+                    field: "host_request_invoke_read.tool.name",
+                    reason: "tool bytes must carry the canonical tool name",
+                })?;
         bounded_text(
             name,
             "host_request_invoke_read.tool.name",
@@ -3267,9 +3268,8 @@ impl HostRequestInvokeReadPayload {
                 reason: "presented tool does not match the admitted capability",
             });
         }
-        let bytes = canonical_json_bytes(&self.tool).map_err(|error| {
-            ProtocolError::Json(error.to_string())
-        })?;
+        let bytes = canonical_json_bytes(&self.tool)
+            .map_err(|error| ProtocolError::Json(error.to_string()))?;
         if eliot_contracts::sha256_hex(&bytes) != self.envelope.identity.payload_sha256 {
             return Err(ProtocolError::InvalidField {
                 field: "host_request_invoke_read.tool",
@@ -3366,8 +3366,8 @@ impl HostRequestResultBody {
                 reason: "result body must be a bounded JSON object",
             });
         }
-        let bytes =
-            canonical_json_bytes(&self.response).map_err(|error| ProtocolError::Json(error.to_string()))?;
+        let bytes = canonical_json_bytes(&self.response)
+            .map_err(|error| ProtocolError::Json(error.to_string()))?;
         if bytes.len() > HARD_STRUCTURED_RESPONSE_BYTES {
             return Err(ProtocolError::InvalidField {
                 field: "host_request_result_body.response",
@@ -3444,8 +3444,7 @@ impl LocalReadAttempt {
     /// live owner, live epoch) is owned by the Kernel claim record, never by
     /// shape validation alone.
     pub fn validate(&self) -> Result<(), ProtocolError> {
-        if self.wire_id != LOCAL_READ_ATTEMPT_WIRE_ID
-            || self.wire_version != Self::CONTRACT_VERSION
+        if self.wire_id != LOCAL_READ_ATTEMPT_WIRE_ID || self.wire_version != Self::CONTRACT_VERSION
         {
             return Err(ProtocolError::InvalidField {
                 field: "local_read_attempt.wire",
@@ -3494,11 +3493,12 @@ impl LocalReadAttempt {
             "local_read_attempt.session_id",
             MAX_HOST_REQUEST_TEXT_BYTES,
         )?;
-        eliot_contracts::epoch_identity_digest(&self.authority_epoch)
-            .map_err(|_| ProtocolError::InvalidField {
+        eliot_contracts::epoch_identity_digest(&self.authority_epoch).map_err(|_| {
+            ProtocolError::InvalidField {
                 field: "local_read_attempt.authority_epoch",
                 reason: "authority epoch is not a valid epoch",
-            })?;
+            }
+        })?;
         bounded_text(
             &self.scope_id,
             "local_read_attempt.scope_id",
@@ -3730,11 +3730,16 @@ mod tests {
     const TEST_LINEAGE_B: &str = "550e8400-e29b-41d4-a716-446655440001";
 
     fn test_epoch(lineage: &str, sequence: u64) -> EpochId {
-        EpochId::new(
-            EpochLineageId::new(lineage).expect("valid test lineage"),
-            NonZeroU64::new(sequence).expect("nonzero test sequence"),
-        )
-        .expect("valid test epoch")
+        let Ok(lineage_id) = EpochLineageId::new(lineage) else {
+            panic!("valid test lineage");
+        };
+        let Some(sequence) = NonZeroU64::new(sequence) else {
+            panic!("nonzero test sequence");
+        };
+        let Ok(epoch) = EpochId::new(lineage_id, sequence) else {
+            panic!("valid test epoch");
+        };
+        epoch
     }
 
     fn fence() -> StateFence {
@@ -4305,7 +4310,7 @@ mod tests {
         for (code, wire) in cases {
             assert_eq!(code.as_str(), wire);
             assert!(seen.insert(wire), "denial wire codes must be distinct");
-            let encoded = serde_json::to_value(&code)
+            let encoded = serde_json::to_value(code)
                 .map_err(|error| ProtocolError::Json(error.to_string()))?;
             assert_eq!(encoded, Value::String(wire.to_owned()));
             let decoded: AgentBridgeActivationDenialCode = serde_json::from_value(encoded)
@@ -4820,7 +4825,7 @@ mod tests {
     }
 
     #[test]
-    fn event_rejects_authority_epoch_mismatch() -> Result<(), ProtocolError> {
+    fn event_rejects_authority_epoch_mismatch() {
         let mut value = event();
         value.authority_epoch = test_epoch(TEST_LINEAGE_A, 2);
         assert!(matches!(
@@ -4830,7 +4835,6 @@ mod tests {
                 ..
             })
         ));
-        Ok(())
     }
 
     #[test]

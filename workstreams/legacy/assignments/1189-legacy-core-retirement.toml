@@ -22,14 +22,14 @@ primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues
 
 [documentation]
 implementation = [
-  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I00-05-current-system-evidence-and-source-support-model.md#i05-current-system-evidence-and-source-support-model",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I00-05-conformance-support-and-evidence-status.md#i05-conformance-support-and-evidence-status",
   "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I02-03-workspace-topology-and-dependency-direction.md#i23-workspace-topology-and-dependency-direction",
   "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I02-08-package-metadata-source-ownership-and-generated-registry.md#i28-package-metadata-source-ownership-and-generated-registry",
   "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I02-23-capability-family-topology-and-crate-extraction-decisions.md#i223-capability-family-topology-and-crate-extraction-decisions",
-  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I05-01-store-boundary.md#i51-store-boundary",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I05-01-storage-boundary.md#i51-storage-boundary",
   "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I05-20-read-model-consistency-and-cache.md#i520-read-model-consistency-and-cache",
-  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I06-04-kernel.md#i64-kernel",
-  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I06-05-governor.md#i65-governor",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I06-04-module-contract.md#i64-module-contract",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I06-05-bridge-contract.md#i65-bridge-contract",
 ]
 anchors = ["ARCH-MOD-01", "ARCH-MOD-02", "ARCH-MOD-03", "ARCH-AUTH-01", "ARCH-SEC-02", "ARCH-RES-03", "ARCH-OBS-01"]
 
