@@ -9,11 +9,18 @@
 //! Design rules enforced here:
 //!
 //! * Every operation runs through the injected [`ProcessRunner`] port. The
-//!   production binding of this port is the shared `ProcessExecutor`; this
-//!   crate never spawns private launch/retry semantics and never shells out
-//!   except through the port. [`StdProcessRunner`] is the local
-//!   `std::process`-backed port implementation used by tests and standalone
-//!   hosts.
+//!   production binding is [`ExecutorRunner`]: the shared governed executor
+//!   (`WindowsProcessExecutor`, the sole P-04 implementation of the
+//!   `ProcessExecutor` contract) behind per-call authorized requests minted
+//!   by the composition root through [`ExecutorRequestPort`]. This crate
+//!   never mints dispatch authority, never spawns private launch/retry
+//!   semantics, and never shells out except through the port.
+//!   [`StdProcessRunner`] is the local `std::process`-backed port
+//!   implementation used by tests, standalone hosts, and the stdin-fed patch
+//!   path (P-03 carries no stdin channel, so patch check/apply stay local).
+//!   Exact exit codes of completed bound runs are recovered through the
+//!   serialized exit observation, following the established `successful_exit`
+//!   precedent in `eliot-instrument-runner`.
 //! * Every request carries a declared execution identity ([`ExecutionIdentity`]
 //!   / SID) and a resource root ([`RepoRoot`]). User-owned roots are served
 //!   only through a broker-launched scoped [`Lease`] unless an explicit
@@ -40,10 +47,20 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::future::Future;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll, Waker};
+use std::time::{Duration, Instant};
+
+use eliot_process::{
+    ExitDisposition as KernelExitDisposition, ExitStatus, ProcessEvidenceSink, ProcessExecutor,
+    ProcessRequest,
+};
+use eliot_process_executor::{CapturedStream, WindowsProcessExecutor};
 
 // ---------------------------------------------------------------------------
 // Identity, ownership, leases
@@ -305,6 +322,234 @@ impl ProcessRunner for StdProcessRunner {
             stdout: output.stdout,
             stderr: output.stderr,
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Executor binding: shared ProcessExecutor behind the ProcessRunner port
+// ---------------------------------------------------------------------------
+
+/// Compile-time proof that the bound executor implements the shared
+/// [`ProcessExecutor`] contract: if P-04 ever stops implementing P-03, the
+/// binding fails to build instead of silently targeting a fork.
+const _: fn() = || {
+    fn requires_shared_contract<E: ProcessExecutor>() {}
+    requires_shared_contract::<WindowsProcessExecutor>();
+};
+
+/// Composition-root seam minting authorized [`ProcessRequest`] values.
+///
+/// Mirrors `InstrumentRequestPort` in `eliot-instrument-runner`: dispatch
+/// permits are Kernel-issued authority, so the bridge never mints requests
+/// itself. The production implementation belongs to the runtime composition
+/// root; tests play that role with test authority.
+pub trait ExecutorRequestPort: Send + Sync {
+    /// Binds one invocation to exactly one authorized process request.
+    ///
+    /// # Errors
+    /// Returns a message when the request cannot be minted for this call.
+    fn bind(&self, exe: &str, args: &[&str], cwd: &Path) -> Result<ProcessRequest, String>;
+}
+
+/// Default bound for the terminal-lifecycle wait (matches the `s04` executor
+/// test precedent of a 30-second horizon with 25 ms polls).
+pub const BOUND_RUN_DEADLINE: Duration = Duration::from_secs(30);
+/// Poll interval for the terminal-lifecycle wait.
+const BOUND_RUN_POLL: Duration = Duration::from_millis(25);
+
+/// [`ProcessRunner`] implemented by the shared governed executor.
+///
+/// The runner is deliberately concrete over [`WindowsProcessExecutor`], the
+/// sole physical P-04 implementation: the provider-neutral [`ProcessExecutor`]
+/// trait carries launch/inspect/cancel/reconcile but no output readback, so a
+/// generic binding could not preserve command-output handles without
+/// inventing a shadow seam. Construction mirrors
+/// `InstrumentRunner::new`: the composition root supplies the executor, the
+/// request-minting port, and the evidence sink; the runner owns no authority.
+///
+/// Boundaries (fail-closed, documented):
+///
+/// * P-03 carries no stdin channel, so stdin-fed invocations (patch check /
+///   apply) are refused here; those operations stay on the local port.
+/// * Truncated or incomplete stream captures are refused: typed parsing needs
+///   full streams, and a partial parse must never pose as complete.
+/// * Non-completed terminal dispositions, missing exit observations, and
+///   deadline overruns surface as runner errors naming the disposition;
+///   no synthetic exit code is ever fabricated.
+/// * Exact numeric codes of completed exits are recovered through the
+///   serialized `code` field, following the established `successful_exit`
+///   precedent in `eliot-instrument-runner`.
+pub struct ExecutorRunner {
+    executor: Arc<WindowsProcessExecutor>,
+    port: Arc<dyn ExecutorRequestPort>,
+    sink: Arc<dyn ProcessEvidenceSink>,
+    deadline: Duration,
+}
+
+impl ExecutorRunner {
+    /// Binds the runner to a shared executor, a request-minting port, and an
+    /// evidence sink.
+    pub fn new(
+        executor: Arc<WindowsProcessExecutor>,
+        port: Arc<dyn ExecutorRequestPort>,
+        sink: Arc<dyn ProcessEvidenceSink>,
+    ) -> Self {
+        Self {
+            executor,
+            port,
+            sink,
+            deadline: BOUND_RUN_DEADLINE,
+        }
+    }
+
+    /// Overrides the terminal-lifecycle wait bound.
+    pub fn with_deadline(mut self, deadline: Duration) -> Self {
+        self.deadline = deadline;
+        self
+    }
+
+    /// Returns the bound shared executor.
+    pub fn executor(&self) -> &Arc<WindowsProcessExecutor> {
+        &self.executor
+    }
+}
+
+impl std::fmt::Debug for ExecutorRunner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExecutorRunner")
+            .field("deadline", &self.deadline)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ExecutorRunner {
+    fn run_via_executor(
+        &self,
+        exe: &str,
+        args: &[&str],
+        cwd: &Path,
+    ) -> Result<ProcessOutcome, String> {
+        let request = self
+            .port
+            .bind(exe, args, cwd)
+            .map_err(|e| format!("executor request binding failed: {e}"))?;
+        request
+            .validate()
+            .map_err(|e| format!("bound request failed validation: {e}"))?;
+        let operation = request.operation_id().clone();
+        let digest = request.invocation_digest().to_owned();
+        let generation = request.generation().get();
+        let receipt = block_on(self.executor.start(request, self.sink.clone()))
+            .map_err(|e| format!("executor start failed: {e}"))?;
+        if receipt.operation_id() != &operation
+            || receipt.request_digest() != digest
+            || receipt.accepted_generation().get() != generation
+        {
+            return Err("executor start receipt does not preserve the bound request".to_owned());
+        }
+        let started = Instant::now();
+        let view = loop {
+            let view = block_on(self.executor.inspect(operation.clone()))
+                .map_err(|e| format!("executor inspect failed: {e}"))?;
+            if view.operation_id() != &operation || view.request_digest() != digest {
+                return Err("executor observation does not preserve the bound request".to_owned());
+            }
+            if view.lifecycle().is_terminal() {
+                break view;
+            }
+            if started.elapsed() >= self.deadline {
+                return Err(format!(
+                    "executor run timed out after {}s waiting for terminal lifecycle",
+                    self.deadline.as_secs()
+                ));
+            }
+            std::thread::sleep(BOUND_RUN_POLL);
+        };
+        let exit = view.exit().ok_or_else(|| {
+            "executor reported a terminal lifecycle without an exit observation".to_owned()
+        })?;
+        let code = exit_code_of(exit)?;
+        let (stdout, stderr) = self
+            .executor
+            .captured_output(&operation)
+            .map_err(|e| format!("executor stream readback failed: {e}"))?;
+        Ok(ProcessOutcome {
+            code,
+            stdout: captured_bytes(stdout, "stdout")?,
+            stderr: captured_bytes(stderr, "stderr")?,
+        })
+    }
+}
+
+impl ProcessRunner for ExecutorRunner {
+    fn run(
+        &self,
+        exe: &str,
+        args: &[&str],
+        cwd: &Path,
+        stdin: &[u8],
+    ) -> Result<ProcessOutcome, String> {
+        validate_invocation(exe, args).map_err(|e| e.to_string())?;
+        if !stdin.is_empty() {
+            return Err("executor binding refuses stdin-fed invocations: P-03 carries no stdin channel; patch operations stay on the local port"
+                .to_owned());
+        }
+        self.run_via_executor(exe, args, cwd)
+    }
+}
+
+/// Recovers the exact numeric exit code of a completed exit.
+///
+/// Follows the established `successful_exit` precedent in
+/// `eliot-instrument-runner`: the code is read from the serialized exit
+/// observation because the typed contract exposes only the coarse
+/// disposition. Anything but `Completed` has no meaningful git exit code
+/// and is refused fail-closed with the disposition named.
+fn exit_code_of(exit: &ExitStatus) -> Result<i32, String> {
+    if !matches!(exit.disposition(), KernelExitDisposition::Completed) {
+        return Err(format!(
+            "executor reports a non-completed exit disposition: {:?}",
+            exit.disposition()
+        ));
+    }
+    serde_json::to_value(exit)
+        .ok()
+        .and_then(|value| value.get("code").and_then(serde_json::Value::as_i64))
+        .and_then(|code| i32::try_from(code).ok())
+        .ok_or_else(|| "executor completed exit carries no numeric code".to_owned())
+}
+
+/// Extracts full stream bytes, refusing partial captures fail-closed.
+fn captured_bytes(stream: CapturedStream, name: &'static str) -> Result<Vec<u8>, String> {
+    if !stream.captured {
+        return Err(format!("executor captured no {name} handle"));
+    }
+    if !stream.complete {
+        return Err(format!("executor {name} capture ended before EOF"));
+    }
+    if stream.truncated {
+        return Err(format!(
+            "executor {name} output exceeded the capture ceiling"
+        ));
+    }
+    Ok(stream.bytes)
+}
+
+/// Drives one executor future to completion on the calling thread.
+///
+/// Established precedent: the production `block_on_sink` drain path and the
+/// `block_on` test driver in `eliot-process-executor` spin a noop waker with
+/// `yield_now`. P-04 futures complete without a reactor; this performs no
+/// sleeping, no retry, and no I/O of its own.
+fn block_on<F: Future>(future: F) -> F::Output {
+    let mut future = std::pin::pin!(future);
+    let waker = Waker::noop();
+    let mut context = Context::from_waker(waker);
+    loop {
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(output) => return output,
+            Poll::Pending => std::thread::yield_now(),
+        }
     }
 }
 
@@ -830,15 +1075,15 @@ impl<R: ProcessRunner> GitBridge<R> {
         } else {
             // A presented lease is receipt identity: it must belong to the
             // requesting SID even where no broker lease is required.
-            if let Some(lease) = lease {
-                if lease.sid() != identity.sid() {
-                    return Err(BridgeError::LeaseScopeMismatch(format!(
-                        "lease {} is issued to '{}', request runs as '{}'",
-                        lease.id(),
-                        lease.sid(),
-                        identity.sid()
-                    )));
-                }
+            if let Some(lease) = lease
+                && lease.sid() != identity.sid()
+            {
+                return Err(BridgeError::LeaseScopeMismatch(format!(
+                    "lease {} is issued to '{}', request runs as '{}'",
+                    lease.id(),
+                    lease.sid(),
+                    identity.sid()
+                )));
             }
             Ok((resolved, lease.cloned()))
         }
@@ -1629,11 +1874,7 @@ impl<R: ProcessRunner> GitBridge<R> {
             let s = String::from_utf8_lossy(&mb_outcome.stdout)
                 .trim()
                 .to_owned();
-            if s.is_empty() {
-                None
-            } else {
-                Some(s)
-            }
+            if s.is_empty() { None } else { Some(s) }
         } else {
             None
         };
@@ -2043,5 +2284,106 @@ mod unit_tests {
             assert!(lease_ids.insert(lease.id().to_owned()));
         }
         assert!(domains.insert(Broker::default().domain()));
+    }
+
+    #[test]
+    fn bound_exit_codes_follow_completed_disposition() {
+        let ok = ExitStatus::new(KernelExitDisposition::Completed, Some(0), None, 1).expect("exit");
+        assert_eq!(exit_code_of(&ok), Ok(0));
+        let diff =
+            ExitStatus::new(KernelExitDisposition::Completed, Some(1), None, 1).expect("exit");
+        assert_eq!(exit_code_of(&diff), Ok(1));
+        let failed =
+            ExitStatus::new(KernelExitDisposition::Completed, Some(128), None, 1).expect("exit");
+        assert_eq!(exit_code_of(&failed), Ok(128));
+        for disposition in [
+            KernelExitDisposition::Cancelled,
+            KernelExitDisposition::ResourceLimit,
+            KernelExitDisposition::Unknown,
+        ] {
+            let exit = ExitStatus::new(disposition, None, None, 1).expect("exit");
+            assert!(
+                exit_code_of(&exit).is_err(),
+                "non-completed exits have no git exit code"
+            );
+        }
+        let signalled =
+            ExitStatus::new(KernelExitDisposition::Signalled, None, Some(15), 1).expect("exit");
+        assert!(exit_code_of(&signalled).is_err());
+    }
+
+    /// Authority port that must never be contacted: every test below fails
+    /// before the executor is reached, so any call is a test failure.
+    struct UnreachedPort;
+
+    impl eliot_process_executor::DispatchValidationPort for UnreachedPort {
+        fn validate_and_consume(
+            &self,
+            _request: ProcessRequest,
+            _observed: eliot_process::SuspendedProcessIdentity,
+        ) -> Result<eliot_process::ValidatedDispatch, eliot_process::ProcessExecutionError>
+        {
+            panic!("bound refusal tests must not reach the executor");
+        }
+    }
+
+    /// Evidence sink that accepts and drops everything.
+    #[derive(Default)]
+    struct DropSink;
+
+    impl ProcessEvidenceSink for DropSink {
+        fn record(
+            &self,
+            _evidence: eliot_process::ProcessEvidence,
+        ) -> Result<(), eliot_process::EvidenceSinkError> {
+            Ok(())
+        }
+    }
+
+    /// Request port that refuses every binding.
+    struct RefusingPort(&'static str);
+
+    impl ExecutorRequestPort for RefusingPort {
+        fn bind(&self, _exe: &str, _args: &[&str], _cwd: &Path) -> Result<ProcessRequest, String> {
+            Err(self.0.to_owned())
+        }
+    }
+
+    fn unreached_runner(port: RefusingPort) -> ExecutorRunner {
+        let executor = Arc::new(WindowsProcessExecutor::new(Arc::new(UnreachedPort)));
+        ExecutorRunner::new(executor, Arc::new(port), Arc::new(DropSink))
+    }
+
+    #[test]
+    fn bound_runner_refuses_stdin_before_executor_contact() {
+        let tmp = std::env::temp_dir();
+        let runner = unreached_runner(RefusingPort("unused"));
+        let err = runner
+            .run("git", &["apply", "--check", "-v"], &tmp, b"patch")
+            .expect_err("stdin");
+        assert!(
+            err.contains("stdin"),
+            "refusal must name the stdin boundary: {err}"
+        );
+    }
+
+    #[test]
+    fn bound_runner_keeps_the_invocation_guard() {
+        let tmp = std::env::temp_dir();
+        let runner = unreached_runner(RefusingPort("unused"));
+        let err = runner
+            .run("git", &["reset", "--hard"], &tmp, &[])
+            .expect_err("reset");
+        assert!(err.contains("destructive operation rejected"));
+    }
+
+    #[test]
+    fn bound_runner_maps_bind_failures() {
+        let tmp = std::env::temp_dir();
+        let runner = unreached_runner(RefusingPort("no authority in unit scope"));
+        let err = runner
+            .run("git", &["status", "--porcelain=v1"], &tmp, &[])
+            .expect_err("bind");
+        assert!(err.contains("binding failed"));
     }
 }
