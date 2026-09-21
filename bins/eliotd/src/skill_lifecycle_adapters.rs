@@ -451,6 +451,18 @@ impl<T> ForwardingSkillLifecycle<T> {
     ) -> Result<ActivatedSkillDisplay, SkillError> {
         let live = display_source.definition_version();
         if live.trim().is_empty() || live != admitted_definition_version {
+            // Persistent invalidation: a version drift marks the entry stale
+            // so later issuance and display fail closed too. Only a present
+            // entry can be marked; absence and validation failures keep the
+            // drift refusal below as the fail-closed outcome.
+            if !live.trim().is_empty() {
+                let mut catalogue = self.lock_catalogue();
+                let _marked = catalogue.mark_definition_drift_stale(
+                    skill_id,
+                    live,
+                    admitted_definition_version,
+                );
+            }
             return Err(SkillError::InvalidField {
                 field: "tools.definition_version",
                 reason: "the live tool source no longer binds the admitted definition version",
@@ -1422,6 +1434,30 @@ mod tests {
         assert!(matches!(
             refused,
             Err(SkillError::InvalidField { field, .. }) if field == "tools.definition_version"
+        ));
+        // The drift mark persists: the entry is stale with both versions
+        // named, and redelivery fails closed too.
+        {
+            let catalogue = forwarding.catalogue.lock().expect("catalogue lock");
+            let stored = catalogue.get("skill-demo").expect("stored entry");
+            assert_eq!(stored.status, eliot_skill::SkillStatus::Stale);
+            assert!(
+                stored
+                    .stale_reason
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("admitted 1.2.0, live 9.9.9")
+            );
+        }
+        let redelivery = forwarding.deliver_hotset(
+            "hotset-versioned-5".to_owned(),
+            vec!["skill-demo".to_owned()],
+            "approval-commit-1".to_owned(),
+            &eliot_skill::VersionBoundTools::new(&canonical_source("1.2.0"), &aliases),
+        );
+        assert!(matches!(
+            redelivery,
+            Err(SkillError::InvalidField { field, .. }) if field == "delivery.delivered_skill_ids"
         ));
         assert_eq!(*calls.lock().expect("calls"), 0);
     }

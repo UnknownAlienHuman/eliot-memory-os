@@ -35,6 +35,10 @@ serde_json.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+eliot-agent-contracts.workspace = true
+eliot-context-contracts = { path = "../../crates/smart/eliot-context-contracts" }
+eliot-cue-contracts = { path = "../../crates/smart/eliot-cue-contracts" }
+eliot-evidence.workspace = true
 eliot-runtime-contracts.workspace = true
 
 [lints]
