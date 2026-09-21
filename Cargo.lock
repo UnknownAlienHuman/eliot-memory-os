@@ -876,19 +876,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "eliot-campaign-executor"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "blake3",
- "clap",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "uuid",
-]
-
-[[package]]
 name = "eliot-canonical"
 version = "0.1.0"
 dependencies = [
