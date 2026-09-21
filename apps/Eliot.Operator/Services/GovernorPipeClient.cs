@@ -47,6 +47,18 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
         return await CallToolAsync<JsonElement>("eliot_operator_command", envelope, cancellationToken);
     }
 
+    public Task<JsonElement> UserAutomationAsync(
+        UserAutomationOperation operation,
+        CancellationToken cancellationToken = default)
+    {
+        var request = UserAutomationOperatorRequest.Create(operation);
+        request.Validate();
+        // Kernel/Host authenticates this route and supplies RequestMetadata,
+        // principal, State Fence and OperationIdentity. Reusing the generic
+        // task-scoped operator-command envelope would discard that contract.
+        return CallToolAsync<JsonElement>(UserAutomationContract.Route, request, cancellationToken);
+    }
+
     public async Task<OperatorProjectionPage> QueryAsync(
         OperatorQueryRequest request,
         CancellationToken cancellationToken = default)
