@@ -49,7 +49,9 @@ pub use typed_execution::{
     ExecutionMode, TypedDescriptor, TypedExecutionError, TypedReceipt, default_experimental_limits,
     domain_handoff, execute_describe_experimental, execute_governed_refusal,
 };
-pub use wasmtime_provider::{WasmtimeBuildError, WasmtimeComponentEngine};
+pub use wasmtime_provider::{
+    WasmtimeBuildError, WasmtimeComponentEngine, provider_configuration_digest,
+};
 
 /// B-12's injected component-host runner.
 pub struct WasmHostRunner {
