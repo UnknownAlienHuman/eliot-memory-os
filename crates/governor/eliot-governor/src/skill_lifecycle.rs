@@ -31,7 +31,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_canonical::CanonicalWriteEnvelope;
 use eliot_skill::{
-    PromotionGate, SkillCandidate, SkillError, SkillLifecycleApi, SkillLifecycleView, SkillRegistry,
+    ActivatedSkillDisplay, HotsetDeliveryAck, HotsetDeliveryReceipt, KnownTools, PromotionGate,
+    SkillCandidate, SkillError, SkillLifecycleApi, SkillLifecycleView, SkillRegistry,
 };
 use eliot_store_api::{
     CONTRACT_VERSION, EffectClass, EventProjectionRelationIntents, NamedMutationOperation,
@@ -542,6 +543,24 @@ impl<P: KernelTransitionPort + ?Sized> SkillLifecycleApi for GovernorSkillLifecy
         }
         Ok(receipt)
     }
+
+    async fn activation_display(
+        &self,
+        _ctx: &eliot_contracts::RequestMetadata,
+        _skill_id: String,
+        _receipt: HotsetDeliveryReceipt,
+        _ack: HotsetDeliveryAck,
+        _tools: &dyn KnownTools,
+    ) -> Result<ActivatedSkillDisplay, SkillError> {
+        // The Governor registry carries lifecycle views and the canonical
+        // commit path, never installed catalogue bodies: activation display
+        // executes only at the composition adapter against its shared
+        // catalogue handle. Fail closed here rather than inventing a second
+        // body source.
+        Err(SkillError::Surface(
+            "activation display requires the composition Skill catalogue; the Governor registry carries no installed bodies".to_owned(),
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -845,6 +864,47 @@ mod tests {
         kernel: &'a TestKernel,
     ) -> GovernorSkillLifecycle<'a, TestKernel> {
         GovernorSkillLifecycle::new(skill, canonical, kernel)
+    }
+
+    struct DenyTools;
+
+    impl KnownTools for DenyTools {
+        fn knows_tool(&self, _name: &str) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn governor_display_fails_closed_without_catalogue_bodies() {
+        let fence = fence();
+        let base = base_view(&fence);
+        let skill = SkillRegistry::from_snapshot([base]).expect("registry");
+        let canonical = canonical_owner(&fence);
+        let kernel = TestKernel::new();
+        let owner = adapter(&skill, &canonical, &kernel);
+        let ctx = identity(&fence).request.metadata.clone();
+        let receipt = HotsetDeliveryReceipt {
+            hotset_id: "hotset-1".to_owned(),
+            catalogue_digest: "c".repeat(64),
+            delivered_skill_ids: vec!["skill-demo".to_owned()],
+            body_digests: BTreeMap::new(),
+            approval_ref: "approval-1".to_owned(),
+            receipt_digest: "d".repeat(64),
+        };
+        let ack = HotsetDeliveryAck {
+            hotset_id: "hotset-1".to_owned(),
+            receipt_digest: "d".repeat(64),
+            receiver_id: "runtime-hotset-1".to_owned(),
+            disposition: eliot_skill::HotsetAckDisposition::Applied,
+        };
+        let refused = block_on(owner.activation_display(
+            &ctx,
+            "skill-demo".to_owned(),
+            receipt,
+            ack,
+            &DenyTools,
+        ));
+        assert!(matches!(refused, Err(SkillError::Surface(_))));
     }
 
     #[test]

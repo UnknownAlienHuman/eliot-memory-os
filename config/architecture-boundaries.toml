@@ -267,13 +267,6 @@ remove_when = "Guardian consumers migrate to the shared Windows ProcessExecutor/
 
 [[tracked_debt]]
 kind = "direct_process_launch"
-path = "workspace/tools/eliot-campaign-executor/src/lib.rs"
-issue = 100
-reason = "The development campaign executor uses a private native-process implementation instead of the shared process contract."
-remove_when = "Campaign execution uses the admitted ProcessExecutor client contract or receives a separately justified development-only owner and proof."
-
-[[tracked_debt]]
-kind = "direct_process_launch"
 path = "workspace/tools/eliot-runtime-compiler/src/lib.rs"
 issue = 100
 reason = "The development runtime compiler uses a private native-process implementation instead of the shared process contract."

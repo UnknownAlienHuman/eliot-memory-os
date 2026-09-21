@@ -46,7 +46,7 @@
     "transition_class": "capture_candidate",
     "requested_effect_ceiling": "CANDIDATE",
     "admission_contract_set_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-    "operation_manifest_digest": "3f2db5dccb572900700af84cd46c3d99435f21f4e08825f0397ee404da113a9f",
+    "operation_manifest_digest": "8568ea8475cad24dc896711075297fcbf2f2df995097a4bb7eba358d28aa7c03",
     "named_operations": [
       {
         "operation": "CaptureObservation",
@@ -77,8 +77,8 @@
     "operation_id": "op-991-d1",
     "idempotency_key": "idem-991-d1",
     "canonical_request_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "prepared_transition_digest": "4689955f98f0818a2c8a961bdd52a18ee30a7e26f499444b474fb6a1f9deea44",
-    "reservation_token_digest": "d8c16540daa15ff22cd8fe8a8d86604e0b9c8b9c4f3a5d727ead0cc23f6a68fd",
+    "prepared_transition_digest": "893ff10eded8d571a6a294081147c42671b07b79472a8f01352d6b9acb2670da",
+    "reservation_token_digest": "7117d445c1266c915ee5df42fb70ad2ba1ad6df5f5b0845b7a2112574ad262e8",
     "scopes": [
       {
         "scope": "scope-991-d1",

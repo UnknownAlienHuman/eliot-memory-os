@@ -317,16 +317,19 @@ impl KernelContextReadClient {
 
     /// Checks one T11.3 task-bound reconstruction read before any transport.
     ///
-    /// This pre-transport gate currently admits only parameter-free plans and
-    /// rejects any supplied parameter here. The store catalogue (T11.3 store
-    /// activation) declares bounded exact selectors for these four operations
-    /// (`task_id`+`max_records`, optional `problem_id`+`max_records`,
-    /// `selector`+`max_records`, `skill_id`+`max_records`) and remains the
-    /// downstream authority, so neither shape executes end-to-end yet:
-    /// parameter-carrying requests fail at this gate, parameter-free requests
-    /// fail at the catalogue. Threading the closed selectors through this
-    /// gate is a follow-up; until then an unadmitted role reports
-    /// `Unsupported`, distinctly from an authoritative `KnownEmpty`.
+    /// Three operations (`GetTaskState`, `GetAttentionAndProblems`,
+    /// `GetUnderstandingProjectionInputs`) admit only parameter-free plans
+    /// and reject any supplied parameter here. `GetCapabilityEvidenceState`
+    /// additionally admits its closed catalogue selectors (`skill_id` +
+    /// `max_records`, issue #1957): the daemon evidence bridge plans exactly
+    /// that shape, so the follow-up threading the closed selectors lands
+    /// here first, for this one operation only. The store catalogue remains
+    /// the downstream authority, so neither shape executes end-to-end until
+    /// the Kernel admits the query route: a parameter-free evidence plan
+    /// still fails at the catalogue, and a selector-carrying plan still
+    /// fails closed here on any non-closed shape. Until then an unadmitted
+    /// role reports `Unsupported`, distinctly from an authoritative
+    /// `KnownEmpty`.
     /// `ExactFence` is required because a reconstruction closure binds one
     /// compatible read generation: a fence change must surface as a mismatch,
     /// never as a previous generation served as current.
@@ -343,13 +346,66 @@ impl KernelContextReadClient {
                 reason: "reconstruction read requires ExactFence",
             });
         }
-        if !request.parameters.is_empty() {
+        if request.operation == NamedReadOperation::GetCapabilityEvidenceState
+            && !request.parameters.is_empty()
+        {
+            Self::check_capability_evidence_selectors(request)?;
+        } else if !request.parameters.is_empty() {
             return Err(StoreError::InvalidField {
                 field: "operation.parameter",
                 reason: "reconstruction read declares no parameters",
             });
         }
         request.validate()?;
+        Ok(())
+    }
+
+    /// Checks the closed `GetCapabilityEvidenceState` selectors before any
+    /// transport: exactly `skill_id` (non-blank, no control characters) plus
+    /// `max_records` (positive decimal within `EVIDENCE_PACK_MAX_RECORDS`),
+    /// mirroring the store catalogue declaration and the memory/Surreal
+    /// handler bounds. Any other key, blank skill, or out-of-range bound
+    /// fails closed here before transport.
+    fn check_capability_evidence_selectors(request: &NamedReadRequest) -> Result<(), StoreError> {
+        const SELECTOR_ERROR: StoreError = StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "GetCapabilityEvidenceState declares exactly skill_id and max_records",
+        };
+        if request.parameters.len() != 2
+            || !request.parameters.contains_key("skill_id")
+            || !request.parameters.contains_key("max_records")
+        {
+            return Err(SELECTOR_ERROR);
+        }
+        let skill_id = request
+            .parameters
+            .get("skill_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(SELECTOR_ERROR)?;
+        if skill_id.trim().is_empty() || skill_id.chars().any(char::is_control) {
+            return Err(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "skill_id must be a non-blank string",
+            });
+        }
+        let bound_raw = request
+            .parameters
+            .get("max_records")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(SELECTOR_ERROR)?;
+        let bound: u32 = bound_raw.parse().map_err(|_| StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "max_records must be a positive decimal bound",
+        })?;
+        if bound == 0 {
+            return Err(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "max_records must be a positive decimal bound",
+            });
+        }
+        if bound > EVIDENCE_PACK_MAX_RECORDS {
+            return Err(StoreError::PayloadTooLarge);
+        }
         Ok(())
     }
 
@@ -793,6 +849,98 @@ mod tests {
             );
             assert!(matches!(
                 KernelContextReadClient::check_execute_capability(&with_params),
+                Err(StoreError::InvalidField {
+                    field: "operation.parameter",
+                    ..
+                })
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn capability_evidence_gate_admits_only_the_closed_selectors()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fence = test_fence(1)?;
+        // The closed skill_id + max_records plan passes the pre-transport
+        // gate; the store catalogue remains the downstream authority.
+        let mut closed =
+            reconstruction_request(NamedReadOperation::GetCapabilityEvidenceState, &fence)?;
+        closed.parameters.insert(
+            "skill_id".to_owned(),
+            serde_json::Value::String("skill-demo".to_owned()),
+        );
+        closed.parameters.insert(
+            "max_records".to_owned(),
+            serde_json::Value::String("8".to_owned()),
+        );
+        KernelContextReadClient::check_execute_capability(&closed)?;
+
+        // Wrong keys, blank skill, missing bound, and out-of-range bound
+        // all fail closed before transport.
+        for parameters in [
+            BTreeMap::from([(
+                "subject".to_owned(),
+                serde_json::Value::String("smuggled".to_owned()),
+            )]),
+            BTreeMap::from([
+                (
+                    "skill_id".to_owned(),
+                    serde_json::Value::String("   ".to_owned()),
+                ),
+                (
+                    "max_records".to_owned(),
+                    serde_json::Value::String("8".to_owned()),
+                ),
+            ]),
+            BTreeMap::from([(
+                "skill_id".to_owned(),
+                serde_json::Value::String("skill-demo".to_owned()),
+            )]),
+            BTreeMap::from([
+                (
+                    "skill_id".to_owned(),
+                    serde_json::Value::String("skill-demo".to_owned()),
+                ),
+                (
+                    "max_records".to_owned(),
+                    serde_json::Value::String("0".to_owned()),
+                ),
+            ]),
+        ] {
+            let mut request =
+                reconstruction_request(NamedReadOperation::GetCapabilityEvidenceState, &fence)?;
+            request.parameters = parameters;
+            assert!(
+                KernelContextReadClient::check_execute_capability(&request).is_err(),
+                "non-closed selectors must fail closed"
+            );
+        }
+        let mut oversized =
+            reconstruction_request(NamedReadOperation::GetCapabilityEvidenceState, &fence)?;
+        oversized.parameters.insert(
+            "skill_id".to_owned(),
+            serde_json::Value::String("skill-demo".to_owned()),
+        );
+        oversized.parameters.insert(
+            "max_records".to_owned(),
+            serde_json::Value::String((EVIDENCE_PACK_MAX_RECORDS + 1).to_string()),
+        );
+        assert!(matches!(
+            KernelContextReadClient::check_execute_capability(&oversized),
+            Err(StoreError::PayloadTooLarge)
+        ));
+
+        // The other three reconstruction reads still admit no parameters.
+        for operation in [
+            NamedReadOperation::GetTaskState,
+            NamedReadOperation::GetAttentionAndProblems,
+            NamedReadOperation::GetUnderstandingProjectionInputs,
+        ] {
+            let mut request = reconstruction_request(operation, &fence)?;
+            request.parameters = closed.parameters.clone();
+            assert!(matches!(
+                KernelContextReadClient::check_execute_capability(&request),
                 Err(StoreError::InvalidField {
                     field: "operation.parameter",
                     ..

@@ -359,6 +359,12 @@ fn genesis_payload(
             serde_json::to_value(eliot_change_monitor::ChangeMonitorSnapshot::default())
                 .map_err(|e| CompositionError::Recovery(e.to_string()))?
         }
+        RecoveryOwner::Policy => {
+            return Err(CompositionError::Recovery(
+                "policy has no all-absent genesis payload; it is served independently of genesis"
+                    .to_owned(),
+            ))
+        }
     };
     let bytes =
         canonical_json_bytes(&value).map_err(|e| CompositionError::Recovery(e.to_string()))?;

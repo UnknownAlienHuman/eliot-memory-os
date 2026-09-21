@@ -79,7 +79,10 @@ fn kernel_diagnostics_install_is_singly_owned_and_event_log_is_absent() {
     let oversized = "x".repeat(8 * MAX_DIAGNOSTIC_DETAIL_BYTES);
     let bounded = bound_detail(&oversized);
     assert_eq!(bounded.original_bytes(), oversized.len());
-    assert!(bounded.truncated(), "oversized input must report truncation");
+    assert!(
+        bounded.truncated(),
+        "oversized input must report truncation"
+    );
     assert!(
         bounded.text().len() <= MAX_DIAGNOSTIC_DETAIL_BYTES,
         "retained prefix must stay bounded, got {} bytes",
@@ -87,7 +90,10 @@ fn kernel_diagnostics_install_is_singly_owned_and_event_log_is_absent() {
     );
     let exact = "y".repeat(MAX_DIAGNOSTIC_DETAIL_BYTES);
     let kept = bound_detail(&exact);
-    assert!(!kept.truncated(), "in-bound input must not report truncation");
+    assert!(
+        !kept.truncated(),
+        "in-bound input must not report truncation"
+    );
     assert_eq!(kept.text(), exact);
 }
 
