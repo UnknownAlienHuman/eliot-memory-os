@@ -33,6 +33,10 @@ pub const WASM_GRANT_REQUEST_WIRE_VERSION: u16 = 1;
 pub const WASM_PORT_GRANT_WIRE_ID: &str = "eliot.wasm.port-grant";
 /// Wire version for issued port grants.
 pub const WASM_PORT_GRANT_WIRE_VERSION: u16 = 1;
+/// Closed private operation name the dispatch route registers for grant
+/// issuance. Beauvoir's registration span adds exactly this string to the
+/// operation map; no other spelling is admitted.
+pub const WASM_PORT_GRANT_OPERATION: &str = "wasm_port_grant_issue";
 
 /// Fail-closed grant errors. No reason strings cross trust boundaries
 /// beyond stable field names; denial taxonomy lives with the caller.
@@ -96,6 +100,11 @@ pub struct WasmGrantRequest {
     pub nonce: String,
     /// Absolute deadline (unix ms) the grant must not outlive.
     pub deadline_unix_ms: u64,
+    /// Caller-asserted installation-approved host binary path (see grant).
+    pub host_executable_path: String,
+    /// Caller-asserted SHA-256 hex of the host binary bytes (re-hashed at
+    /// resolution and launch, never trusted from this digest alone).
+    pub host_artifact_digest: String,
     /// Lowercase SHA-256 over every field except this one.
     pub request_sha256: String,
 }
@@ -144,6 +153,12 @@ pub struct WasmPortGrant {
     pub nonce: String,
     /// Deadline echoed from the request.
     pub deadline_unix_ms: u64,
+    /// Installation-approved host binary path echoed from the request.
+    pub host_executable_path: String,
+    /// SHA-256 hex of the host binary bytes, caller-asserted and bound
+    /// (verified at resolution and re-hashed at launch, never trusted
+    /// from this digest alone).
+    pub host_artifact_digest: String,
     /// Lowercase SHA-256 over every field except this one.
     pub grant_sha256: String,
 }
@@ -199,9 +214,15 @@ impl WasmGrantRequest {
         bounded(&self.caller_connection, "caller_connection")?;
         bounded(&self.component_id, "component_id")?;
         bounded(&self.nonce, "nonce")?;
+        bounded(&self.host_executable_path, "host_executable_path")?;
         if !is_hex64(&self.artifact_digest) {
             return Err(WasmGrantError::InvalidField {
                 field: "artifact_digest",
+            });
+        }
+        if !is_hex64(&self.host_artifact_digest) {
+            return Err(WasmGrantError::InvalidField {
+                field: "host_artifact_digest",
             });
         }
         if !is_hex64(&self.interface_digest) {
@@ -249,9 +270,11 @@ impl WasmPortGrant {
         bounded(&self.caller_connection, "caller_connection")?;
         bounded(&self.component_id, "component_id")?;
         bounded(&self.nonce, "nonce")?;
+        bounded(&self.host_executable_path, "host_executable_path")?;
         if !is_hex64(&self.artifact_digest)
             || !is_hex64(&self.interface_digest)
             || !is_hex64(&self.request_sha256)
+            || !is_hex64(&self.host_artifact_digest)
         {
             return Err(WasmGrantError::InvalidField { field: "digest" });
         }
@@ -314,10 +337,55 @@ pub fn issue_wasm_port_grant(
         authority_epoch: observed.authority_epoch.clone(),
         nonce: request.nonce.clone(),
         deadline_unix_ms: request.deadline_unix_ms,
+        host_executable_path: request.host_executable_path.clone(),
+        host_artifact_digest: request.host_artifact_digest.clone(),
         grant_sha256: String::new(),
     };
     grant.grant_sha256 = grant.compute_digest()?;
     Ok(grant)
+}
+
+/// Session facts threaded from the transport session guard by the
+/// composing caller (principal + connection the request arrived on).
+/// Registration owns how these are read; the handler only matches them.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HandlerSession {
+    /// Authenticated caller principal.
+    pub principal: String,
+    /// Transport connection identity.
+    pub connection_id: String,
+}
+
+/// Handles one grant request against session, Kernel, and request
+/// observations: the dedicated Kernel entry the dispatch route calls for
+/// [`WASM_PORT_GRANT_OPERATION`]. Composes only existing owners and this
+/// module's pure issue path — no permits minted, no Governor observations
+/// minted, no keys touched:
+///
+/// - request shape + self digest ([`WasmGrantRequest::validate`]);
+/// - session binding: principal and connection must match the request's
+///   caller claims (an authenticated stranger's request for another
+///   principal fails here);
+/// - Kernel attestation + digest-bound issuance
+///   ([`issue_wasm_port_grant`] over threaded [`KernelObservedGrantFacts`]).
+pub fn handle_wasm_port_grant(
+    session: &HandlerSession,
+    kernel: &KernelObservedGrantFacts,
+    request: &WasmGrantRequest,
+) -> Result<WasmPortGrant, WasmGrantError> {
+    bounded(&session.principal, "session.principal")?;
+    bounded(&session.connection_id, "session.connection")?;
+    if session.principal != request.caller_principal {
+        return Err(WasmGrantError::ObservationMismatch {
+            field: "caller_principal",
+        });
+    }
+    if session.connection_id != request.caller_connection {
+        return Err(WasmGrantError::ObservationMismatch {
+            field: "caller_connection",
+        });
+    }
+    issue_wasm_port_grant(request, kernel)
 }
 
 /// Expected caller binding for grant validation.
@@ -386,6 +454,8 @@ mod tests {
             authority_epoch: test_epoch(),
             nonce: "nonce-1956".to_owned(),
             deadline_unix_ms: 9_999_999_999_999,
+            host_executable_path: "C:\\Kernel\\eliot-wasm-host.exe".to_owned(),
+            host_artifact_digest: "e".repeat(64),
             request_sha256: String::new(),
         };
         request.request_sha256 = request.compute_digest().expect("seal");
@@ -435,6 +505,32 @@ mod tests {
             },
         )
         .is_err());
+    }
+
+    #[test]
+    fn handler_binds_session_before_issuing() {
+        let session = HandlerSession {
+            principal: "S-1-5-18".to_owned(),
+            connection_id: "conn-1956".to_owned(),
+        };
+        let grant = handle_wasm_port_grant(&session, &observed(), &sealed_request())
+            .expect("handler issues");
+        assert_eq!(grant.caller_principal, "S-1-5-18");
+        assert_eq!(
+            grant.host_executable_path,
+            "C:\\Kernel\\eliot-wasm-host.exe"
+        );
+        assert_eq!(grant.host_artifact_digest, "e".repeat(64));
+        let stranger = HandlerSession {
+            principal: "S-1-5-19".to_owned(),
+            connection_id: "conn-1956".to_owned(),
+        };
+        assert_eq!(
+            handle_wasm_port_grant(&stranger, &observed(), &sealed_request()),
+            Err(WasmGrantError::ObservationMismatch {
+                field: "caller_principal"
+            })
+        );
     }
 
     #[test]

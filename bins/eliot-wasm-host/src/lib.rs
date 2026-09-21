@@ -45,7 +45,10 @@ pub use contour::{
     STANDARD_GUEST_TARGET, admit_generation, admit_generation_with_bytes, admit_prototype,
     authorize_host_call, check_activation_imports, check_admitted_request,
 };
-pub use grant_client::{GrantClientBundle, GrantClientError, build_grant_bundle, request_grant};
+pub use grant_client::{
+    AcceptedGrant, GrantClientBundle, GrantClientError, accept_grant, build_grant_bundle,
+    request_grant,
+};
 pub use guest_exec::{
     ChildMetering, EXIT_COMPLETED, EXIT_DENIED, EXIT_ENGINE_FAILED, EXIT_NOT_COMPLETED,
     GuestExecRejection, GuestExecRequest, metering_line, parse_metering_line, run_guest_exec,
