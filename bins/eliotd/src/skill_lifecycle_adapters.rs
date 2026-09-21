@@ -22,6 +22,19 @@
 //!   insert under the tool-owner existence check. It runs on whichever handle
 //!   the adapter holds; the composition switches to the shared handle per the
 //!   reported central hunk so installs are visible to the promote gate.
+//! - `install_package_versioned` is the same population caller behind the
+//!   versioned canonical view: the tool source reports the definition version
+//!   it binds, the composition states the version it admits, and drift fails
+//!   closed before any entry is written. No version literal lives here.
+//! - `run_install_to_receipt` composes the temporal delivery act the runtime
+//!   injector drives: versioned install, then the sealed-observation mirror
+//!   over the provider's [`ReadinessClaims`](eliot_skill::ReadinessClaims)
+//!   (exact available `(name, version)` per required tool and capability),
+//!   then Hotset receipt issuance under the injector's approval handle. It
+//!   returns the installed identity plus the receipt the injector carries to
+//!   the receiver; the receiver's ack re-enters through
+//!   `acknowledge_and_display`, never minted here. A provider-unavailable
+//!   package stays installed but undelivered: installed is not delivered.
 //! - `deliver_hotset` issues the Hotset delivery receipt the runtime injector
 //!   carries, and `acknowledge_and_display` binds the runtime receiver's ack
 //!   to that exact receipt before displaying. The ack is supplied by the real
@@ -69,9 +82,9 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use eliot_skill::{
-    ActivatedSkillDisplay, HotsetDeliveryAck, HotsetDeliveryReceipt, KnownTools, PromotionGate,
-    SkillCandidate, SkillCatalogue, SkillError, SkillLifecycleApi, SkillLifecycleView,
-    activation::detect_dependency_staleness,
+    ActivatedSkillDisplay, CanonicalToolSource, HotsetDeliveryAck, HotsetDeliveryReceipt,
+    KnownTools, PromotionGate, SkillCandidate, SkillCatalogue, SkillError, SkillLifecycleApi,
+    SkillLifecycleView, ToolAliasTable, activation::detect_dependency_staleness,
 };
 
 /// Shared handle to the composition-owned Governor Skill catalogue.
@@ -150,6 +163,83 @@ impl<T> ForwardingSkillLifecycle<T> {
         eliot_skill::install_package(&mut catalogue, package, inputs, context, tools)
     }
 
+    /// Installs one canonical package source under the versioned canonical
+    /// tool view and returns the installed Skill identity.
+    ///
+    /// Production population caller the runtime composition drives once the
+    /// tool owner supplies its [`CanonicalToolSource`] registry view: the
+    /// source reports the definition version it binds, `admitted_version`
+    /// carries the version the Governor composition admits, and any drift
+    /// fails closed before the shared handle is touched. The Skill-owned
+    /// alias table resolves provider renames to canonical names first.
+    /// Synchronous: the guard is taken and dropped in a closed scope.
+    ///
+    /// No in-tree production caller drives the versioned population path yet
+    /// (reported central hunk carries the exact call). The allowance covers
+    /// exactly that pending adoption; it expires when the hunk lands.
+    #[allow(dead_code)]
+    pub(crate) fn install_package_versioned(
+        &self,
+        package: &eliot_skill::SkillPackage,
+        inputs: &eliot_skill::MaterializationInputs,
+        context: &eliot_skill::CatalogueInstallContext,
+        source: &dyn CanonicalToolSource,
+        aliases: &ToolAliasTable,
+        admitted_definition_version: &str,
+    ) -> Result<String, SkillError> {
+        let mut catalogue = self.lock_catalogue();
+        eliot_skill::install_package_versioned(
+            &mut catalogue,
+            package,
+            inputs,
+            context,
+            source,
+            aliases,
+            admitted_definition_version,
+        )
+    }
+
+    /// Runs versioned install, the provider-availability mirror, and Hotset
+    /// receipt issuance as one runtime delivery act.
+    ///
+    /// Driven by the runtime Hotset injector caller: after the versioned
+    /// install, the exact sealed-observation rule runs over the provider's
+    /// [`ReadinessClaims`](eliot_skill::ReadinessClaims) — a required tool or
+    /// capability the provider did not mark available at its exact version
+    /// refuses issuance while the install stands (installed is not
+    /// delivered). The injector's own approval handle authorizes the receipt.
+    /// Returns the installed identity plus the receipt the injector carries
+    /// to the receiver; the receiver's ack re-enters through
+    /// [`acknowledge_and_display`](Self::acknowledge_and_display).
+    /// Synchronous: each step takes and drops the guard in a closed scope.
+    ///
+    /// No in-tree production caller drives the composed delivery act yet
+    /// (reported central hunk carries the exact call). The allowance covers
+    /// exactly that pending adoption; it expires when the hunk lands.
+    #[allow(dead_code)]
+    pub(crate) fn run_install_to_receipt(
+        &self,
+        act: VersionedDeliveryAct<'_>,
+    ) -> Result<(String, HotsetDeliveryReceipt), SkillError> {
+        let skill_id = self.install_package_versioned(
+            act.package,
+            act.inputs,
+            act.context,
+            act.source,
+            act.aliases,
+            act.admitted_definition_version,
+        )?;
+        eliot_skill::readiness_available_for_package(act.package, act.readiness)?;
+        let tools = eliot_skill::VersionBoundTools::new(act.source, act.aliases);
+        let receipt = self.deliver_hotset(
+            act.hotset_id,
+            vec![skill_id.clone()],
+            act.approval_ref,
+            &tools,
+        )?;
+        Ok((skill_id, receipt))
+    }
+
     /// Issues the Hotset delivery receipt the runtime injector carries.
     ///
     /// Driven by the runtime Hotset injector caller with its own approval
@@ -194,6 +284,26 @@ impl<T> ForwardingSkillLifecycle<T> {
         let catalogue = self.lock_catalogue();
         catalogue.activation_display(skill_id, &receipt, &ack, tools)
     }
+}
+
+/// Inputs for one composed versioned delivery act
+/// ([`ForwardingSkillLifecycle::run_install_to_receipt`]).
+///
+/// Bundles the install boundary (canonical package source, actual inputs,
+/// Governor install context, versioned tool source plus alias table and the
+/// admitted definition version) with the temporal delivery boundary
+/// (provider readiness claims, Hotset identity, injector approval handle) so
+/// the composition drives the whole act in one call.
+pub(crate) struct VersionedDeliveryAct<'a> {
+    pub package: &'a eliot_skill::SkillPackage,
+    pub inputs: &'a eliot_skill::MaterializationInputs,
+    pub context: &'a eliot_skill::CatalogueInstallContext,
+    pub readiness: &'a eliot_skill::ReadinessClaims,
+    pub source: &'a dyn CanonicalToolSource,
+    pub aliases: &'a ToolAliasTable,
+    pub admitted_definition_version: &'a str,
+    pub hotset_id: String,
+    pub approval_ref: String,
 }
 
 /// Records post-commit promotion observations in the catalogue: when the
@@ -317,10 +427,11 @@ mod tests {
     use eliot_protocol::RequestIdentity;
     use eliot_receipts::RequestBinding;
     use eliot_skill::{
-        DependencyVersion, HotsetAckDisposition, HotsetDeliveryAck, HotsetDeliveryReceipt,
-        KnownTools, LifecycleAction, LifecycleCounters, PromotionGate, SkillBody, SkillCandidate,
-        SkillCatalogue, SkillCatalogueEntry, SkillIndexEntry, SkillInteractionView,
-        SkillLifecycleView, SkillRef, SkillRuntimeMetadata, SkillScope, SkillStatus,
+        Availability, AvailabilityField, DependencyVersion, HotsetAckDisposition,
+        HotsetDeliveryAck, HotsetDeliveryReceipt, KnownTools, LifecycleAction, LifecycleCounters,
+        PromotionGate, ReadinessClaims, SkillBody, SkillCandidate, SkillCatalogue,
+        SkillCatalogueEntry, SkillIndexEntry, SkillInteractionView, SkillLifecycleView, SkillRef,
+        SkillRuntimeMetadata, SkillScope, SkillStatus, VersionedObservation,
     };
     use eliot_store_api::{
         CommitId, OperationManifestDigest, Resubmission, TransitionClass, WriteReceipt,
@@ -804,6 +915,219 @@ mod tests {
             "   ".to_owned(),
             &InstallTools,
         );
+        assert!(matches!(
+            refused,
+            Err(SkillError::InvalidField { field, .. }) if field == "delivery.approval_ref"
+        ));
+    }
+
+    /// Boundary double implementing the OWNED versioned port. Test
+    /// scaffolding only: the drift proof below shows the runtime callers
+    /// refuse a double whose bound version the composition did not admit, so
+    /// a compiled factory is never mistaken for provider availability.
+    struct VersionedSource {
+        version: String,
+        known: Vec<String>,
+    }
+
+    impl CanonicalToolSource for VersionedSource {
+        fn definition_version(&self) -> &str {
+            &self.version
+        }
+
+        fn knows_canonical_tool(&self, canonical_name: &str) -> bool {
+            self.known.iter().any(|name| name == canonical_name)
+        }
+    }
+
+    fn canonical_source(version: &str) -> VersionedSource {
+        VersionedSource {
+            version: version.to_owned(),
+            known: vec!["eliot.finish".to_owned(), "finish-cap".to_owned()],
+        }
+    }
+
+    fn available_readiness() -> ReadinessClaims {
+        let available = |name: &str, version: &str| VersionedObservation {
+            name: name.to_owned(),
+            version: version.to_owned(),
+            availability: Availability::Available {
+                field: AvailabilityField::HostCapability,
+            },
+        };
+        ReadinessClaims {
+            host: "codex".to_owned(),
+            profile: "default".to_owned(),
+            provider: Availability::Available {
+                field: AvailabilityField::Provider,
+            },
+            g16: Availability::Available {
+                field: AvailabilityField::G16,
+            },
+            a06: Availability::Available {
+                field: AvailabilityField::A06,
+            },
+            evidence: Availability::Available {
+                field: AvailabilityField::Evidence,
+            },
+            tools: vec![available("eliot.finish", "1.0.0")],
+            capabilities: vec![available("finish-cap", "1")],
+        }
+    }
+
+    fn versioned_forwarder() -> (ForwardingSkillLifecycle<ClosedInner>, Arc<Mutex<u64>>) {
+        let calls = Arc::new(Mutex::new(0));
+        let inner = ClosedInner {
+            fence_mismatch: false,
+            succeed_promote: false,
+            calls: Arc::clone(&calls),
+        };
+        (ForwardingSkillLifecycle::new(inner), calls)
+    }
+
+    #[test]
+    fn versioned_delivery_path_installs_issues_acks_and_displays() {
+        let (forwarding, calls) = versioned_forwarder();
+        let (package, inputs) = package_source();
+        let context = install_context();
+        let readiness = available_readiness();
+        let source = canonical_source("1.2.0");
+        let aliases = ToolAliasTable::new();
+        let (skill_id, receipt) = forwarding
+            .run_install_to_receipt(VersionedDeliveryAct {
+                package: &package,
+                inputs: &inputs,
+                context: &context,
+                readiness: &readiness,
+                source: &source,
+                aliases: &aliases,
+                admitted_definition_version: "1.2.0",
+                hotset_id: "hotset-versioned-1".to_owned(),
+                approval_ref: "approval-commit-1".to_owned(),
+            })
+            .expect("versioned delivery act");
+        assert_eq!(skill_id, "skill-demo");
+        assert!(receipt.confirms_delivery("skill-demo"));
+        {
+            let catalogue = forwarding.catalogue.lock().expect("catalogue lock");
+            assert!(catalogue.is_usable("skill-demo"));
+        }
+        let ack = HotsetDeliveryAck {
+            hotset_id: receipt.hotset_id.clone(),
+            receipt_digest: receipt.receipt_digest.clone(),
+            receiver_id: "runtime-hotset-1".to_owned(),
+            disposition: HotsetAckDisposition::Applied,
+        };
+        let display = forwarding
+            .acknowledge_and_display(
+                "skill-demo",
+                receipt.clone(),
+                ack,
+                &eliot_skill::VersionBoundTools::new(&canonical_source("1.2.0"), &aliases),
+            )
+            .expect("acked display");
+        assert_eq!(display.skill_id, "skill-demo");
+        assert_eq!(display.delivery_receipt_digest, receipt.receipt_digest);
+        assert_eq!(*calls.lock().expect("calls"), 0);
+    }
+
+    #[test]
+    fn versioned_install_refuses_drifted_source_before_touching_catalogue() {
+        let (forwarding, calls) = versioned_forwarder();
+        let (package, inputs) = package_source();
+        let aliases = ToolAliasTable::new();
+        let refused = forwarding.install_package_versioned(
+            &package,
+            &inputs,
+            &install_context(),
+            &canonical_source("9.9.9"),
+            &aliases,
+            "1.2.0",
+        );
+        assert!(matches!(
+            refused,
+            Err(SkillError::InvalidField { field, .. }) if field == "tools.definition_version"
+        ));
+        let catalogue = forwarding.catalogue.lock().expect("catalogue lock");
+        assert!(catalogue.is_empty());
+        assert_eq!(*calls.lock().expect("calls"), 0);
+    }
+
+    #[test]
+    fn versioned_install_refuses_tools_absent_from_the_source() {
+        let (forwarding, _calls) = versioned_forwarder();
+        let (package, inputs) = package_source();
+        let aliases = ToolAliasTable::new();
+        let unknown = VersionedSource {
+            version: "1.2.0".to_owned(),
+            known: Vec::new(),
+        };
+        let refused = forwarding.install_package_versioned(
+            &package,
+            &inputs,
+            &install_context(),
+            &unknown,
+            &aliases,
+            "1.2.0",
+        );
+        assert!(matches!(
+            refused,
+            Err(SkillError::InvalidField { field, .. }) if field == "body.tool_refs"
+        ));
+        let catalogue = forwarding.catalogue.lock().expect("catalogue lock");
+        assert!(catalogue.is_empty());
+    }
+
+    #[test]
+    fn unavailable_readiness_blocks_receipt_but_keeps_the_install() {
+        let (forwarding, _calls) = versioned_forwarder();
+        let (package, inputs) = package_source();
+        let aliases = ToolAliasTable::new();
+        let mut readiness = available_readiness();
+        readiness.tools[0].availability = Availability::Unavailable {
+            field: AvailabilityField::HostCapability,
+            code: eliot_skill::UnavailableCode::HostCapabilityUnavailable,
+            reason: "provider revoked the tool".to_owned(),
+        };
+        let source = canonical_source("1.2.0");
+        let refused = forwarding.run_install_to_receipt(VersionedDeliveryAct {
+            package: &package,
+            inputs: &inputs,
+            context: &install_context(),
+            readiness: &readiness,
+            source: &source,
+            aliases: &aliases,
+            admitted_definition_version: "1.2.0",
+            hotset_id: "hotset-versioned-2".to_owned(),
+            approval_ref: "approval-commit-1".to_owned(),
+        });
+        assert!(matches!(
+            refused,
+            Err(SkillError::InvalidField { field, .. }) if field == "readiness.tools"
+        ));
+        // Installed is not delivered: the entry stands, but no receipt exists.
+        let catalogue = forwarding.catalogue.lock().expect("catalogue lock");
+        assert!(catalogue.is_usable("skill-demo"));
+    }
+
+    #[test]
+    fn composed_delivery_refuses_a_blank_approval_handle() {
+        let (forwarding, _calls) = versioned_forwarder();
+        let (package, inputs) = package_source();
+        let aliases = ToolAliasTable::new();
+        let readiness = available_readiness();
+        let source = canonical_source("1.2.0");
+        let refused = forwarding.run_install_to_receipt(VersionedDeliveryAct {
+            package: &package,
+            inputs: &inputs,
+            context: &install_context(),
+            readiness: &readiness,
+            source: &source,
+            aliases: &aliases,
+            admitted_definition_version: "1.2.0",
+            hotset_id: "hotset-versioned-3".to_owned(),
+            approval_ref: "   ".to_owned(),
+        });
         assert!(matches!(
             refused,
             Err(SkillError::InvalidField { field, .. }) if field == "delivery.approval_ref"
