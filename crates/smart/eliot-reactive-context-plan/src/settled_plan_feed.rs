@@ -49,6 +49,8 @@ use eliot_context_contracts::{
     ContextPlanningView, CriticalAttentionProjection, IntegrationCoverageProfile,
     SessionDeliverySnapshot,
 };
+use eliot_contracts::{ArtifactId, SessionId, StateFence, TaskId};
+use eliot_receipts::WorkScopeId;
 
 use crate::bridge_admission::{BridgeAdmissionBatch, BridgeAdmissionError, plan_bridge_admissions};
 use crate::input::{ReactiveCueActivation, ReactiveDeliveryPolicy};
@@ -118,6 +120,14 @@ pub enum SettledPlanFeedError {
     /// A settled plan item is sourceless, over-bound, or otherwise unusable
     /// as a bridge instruction: a plan defect, surfaced, never downgraded.
     Producer(BridgeAdmissionError),
+    /// Supplied projections disagree with the live activation bindings: the
+    /// set is internally consistent but stale (or foreign) for the current
+    /// activation, so the planner never runs. `projection` names the
+    /// disagreeing projection, `field` its exact binding field.
+    StaleActivation {
+        projection: &'static str,
+        field: &'static str,
+    },
 }
 
 impl std::fmt::Display for SettledPlanFeedError {
@@ -125,11 +135,87 @@ impl std::fmt::Display for SettledPlanFeedError {
         match self {
             Self::Planning(error) => write!(formatter, "settled-plan feed planning: {error:?}"),
             Self::Producer(error) => write!(formatter, "settled-plan feed producer: {error}"),
+            Self::StaleActivation { projection, field } => write!(
+                formatter,
+                "settled-plan feed stale: {projection}.{field} disagrees with the live activation"
+            ),
         }
     }
 }
 
 impl std::error::Error for SettledPlanFeedError {}
+
+/// Live activation bindings the supplied projections must be current for.
+///
+/// Projected by the daemon composition from the Governor's authenticated
+/// activation snapshot (`read_unique_agent_activation`: task, session,
+/// scope, fence, and plan identity cross-checked against the coordination,
+/// session, task, scope, and canonical owners). The daemon projects each
+/// field through its validated constructor; strings are never authority —
+/// only this typed value is. The remaining projection bindings (cue seeds,
+/// attention, coverage) reach liveness transitively: the planner already
+/// requires them to agree with the view binding, and this gate requires the
+/// view binding to agree with the live activation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiveActivationBindings {
+    /// Live task the projections must be planned under.
+    pub task_id: TaskId,
+    /// Live work scope the projections must be planned under.
+    pub scope_id: WorkScopeId,
+    /// Live session the delivery history must belong to.
+    pub session_id: SessionId,
+    /// Live canonical plan the delivery policy must name.
+    pub plan_id: ArtifactId,
+    /// Live fence every projection must be evaluated under.
+    pub state_fence: StateFence,
+}
+
+fn stale(projection: &'static str, field: &'static str) -> SettledPlanFeedError {
+    SettledPlanFeedError::StaleActivation { projection, field }
+}
+
+/// Drive one settled-plan feed evaluation gated on the live activation.
+///
+/// First verifies the supplied projections are current for `bindings` (view
+/// binding, session binding, and policy plan identity against the live
+/// task/session/scope/fence/plan), then runs
+/// [`produce_settled_plan_feed`]. Internally consistent but rotated or
+/// foreign projections fail closed here — the planner, which only checks
+/// the projections against each other, can never observe them. Holds no
+/// state; Governor risk derivation retention and transport replay retention
+/// stay with their owners (A3 derivation, A1 driver).
+pub fn drive_live_feed(
+    bindings: &LiveActivationBindings,
+    inputs: SettledPlanFeedInputs<'_>,
+) -> Result<SettledPlanFeedOutcome, SettledPlanFeedError> {
+    let view_binding = &inputs.view.view.binding;
+    if view_binding.task_id != bindings.task_id {
+        return Err(stale("view", "view.binding.task_id"));
+    }
+    if view_binding.scope_id != bindings.scope_id {
+        return Err(stale("view", "view.binding.scope_id"));
+    }
+    if view_binding.state_fence != bindings.state_fence {
+        return Err(stale("view", "view.binding.state_fence"));
+    }
+    let session = inputs.session_snapshot;
+    if session.session_id != bindings.session_id {
+        return Err(stale("session", "session.session_id"));
+    }
+    if session.task_id != bindings.task_id {
+        return Err(stale("session", "session.task_id"));
+    }
+    if session.scope_id != bindings.scope_id {
+        return Err(stale("session", "session.scope_id"));
+    }
+    if session.state_fence != bindings.state_fence {
+        return Err(stale("session", "session.state_fence"));
+    }
+    if inputs.policy.plan_id != bindings.plan_id {
+        return Err(stale("policy", "policy.plan_id"));
+    }
+    produce_settled_plan_feed(inputs)
+}
 
 /// Produce one settled-plan feed evaluation from live owner projections.
 ///
