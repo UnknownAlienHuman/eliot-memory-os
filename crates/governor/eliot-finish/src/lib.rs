@@ -870,4 +870,44 @@ mod tests {
         assert_eq!(gapped_receipt.decision.proof.task_id, "task-1");
         assert_eq!(gapped_receipt.decision.proof.task_revision, 1);
     }
+
+    #[test]
+    fn provider_claimed_but_unreconciled_effect_blocks_verified_complete() {
+        // A provider-success-shaped CompleteCandidate attempt meets rehydrated
+        // evidence whose acceptance is satisfied and verifiers executed, but
+        // the effect owner still reports one unreconciled effect ref: the
+        // provider claim must not clear it, so derivation blocks.
+        let effected_context = FinishContext {
+            evidence: FinishEvidence {
+                unresolved_effect_refs: vec!["effect-provider-claim-1".to_owned()],
+                ..evidence()
+            },
+            ..context()
+        };
+        let mut service = FinishService::default();
+        let admitted = service
+            .evaluate(attempt(), &effected_context)
+            .expect("effect-blocked evidence evaluates");
+        let receipt = match admitted {
+            FinishAdmission::Accepted { receipt } => receipt,
+            FinishAdmission::Replayed { .. } => panic!("first evaluation cannot replay"),
+        };
+        assert_eq!(
+            receipt.decision.outcome,
+            FinishDecisionOutcome::Blocked,
+            "an unreconciled effect ref must never support VERIFIED_COMPLETE"
+        );
+        assert_ne!(
+            receipt.decision.outcome,
+            FinishDecisionOutcome::VerifiedComplete
+        );
+        assert!(
+            receipt
+                .decision
+                .proof
+                .unresolved_effects_and_unknowns
+                .contains(&"effect-provider-claim-1".to_owned()),
+            "the blocking ref must stay visible in the derived proof"
+        );
+    }
 }

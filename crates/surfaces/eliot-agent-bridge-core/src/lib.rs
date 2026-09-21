@@ -24,7 +24,8 @@ pub use eliot_process::{FencingToken, Generation};
 pub use eliot_protocol::{AckPhase, DeliveryClass, EventDisposition, EventEnvelope};
 use eliot_protocol::{EventAckReceipt, EventIdentityKey, ReplayLedger};
 use eliot_skill::{
-    DependencyVersion, LifecycleAction, SkillCandidate, SkillError, SkillLifecycleView, SkillScope,
+    ActivatedSkillDisplay, DependencyVersion, HotsetDeliveryAck, HotsetDeliveryReceipt,
+    LifecycleAction, SkillCandidate, SkillError, SkillLifecycleView, SkillScope,
 };
 use serde::{Deserialize, Deserializer, Serialize, de};
 use thiserror::Error;
@@ -1698,6 +1699,19 @@ pub trait SkillLifecyclePort {
         ctx: &'a RequestMetadata,
         request: ProposeSkillRequest,
     ) -> Pin<Box<dyn Future<Output = Result<SkillCandidate, SkillError>> + 'a>>;
+
+    /// Binds one receiver ack to its exact Hotset receipt and displays the
+    /// activated Skill at the admitted fence. The bridge carries the inert
+    /// receipt/ack pair and returns only the typed display; tool-authority
+    /// checks (admitted version, tool basis, provisional ceiling) stay with
+    /// the Governor owner behind the port.
+    fn display_skill<'a>(
+        &'a mut self,
+        ctx: &'a RequestMetadata,
+        skill_id: String,
+        receipt: HotsetDeliveryReceipt,
+        ack: HotsetDeliveryAck,
+    ) -> Pin<Box<dyn Future<Output = Result<ActivatedSkillDisplay, SkillError>> + 'a>>;
 }
 
 impl AgentBridgeCore {
@@ -1743,6 +1757,30 @@ impl AgentBridgeCore {
             .validate()
             .map_err(|error| BridgeError::ProviderContract(error.to_string()))?;
         Ok(candidate)
+    }
+
+    /// Binds one receiver ack to its exact Hotset receipt and displays the
+    /// activated Skill at the exact attached fence.
+    pub async fn display_skill_activation(
+        &mut self,
+        ctx: &RequestMetadata,
+        skill_id: &str,
+        receipt: HotsetDeliveryReceipt,
+        ack: HotsetDeliveryAck,
+    ) -> Result<ActivatedSkillDisplay, BridgeError> {
+        receipt.validate()?;
+        ack.validate()?;
+        ctx.validate()
+            .map_err(|error| BridgeError::ProviderContract(error.to_string()))?;
+        self.skill_authority_matches(ctx)?;
+        let display = self
+            .skill_port()?
+            .display_skill(ctx, skill_id.to_owned(), receipt, ack)
+            .await?;
+        display
+            .validate()
+            .map_err(|error| BridgeError::ProviderContract(error.to_string()))?;
+        Ok(display)
     }
 
     /// Fails closed unless the caller fence covers the exact attached

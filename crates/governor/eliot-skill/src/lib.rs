@@ -18,6 +18,11 @@ use thiserror::Error;
 
 pub mod catalogue;
 pub use catalogue::*;
+pub mod canonical_tools;
+pub use canonical_tools::{
+    CanonicalToolSource, ToolAliasTable, VersionBoundTools, install_package_versioned,
+    readiness_available_for_package, sealed_materialization_check,
+};
 pub mod install;
 pub use install::{CatalogueInstallContext, install_package, project_package_to_entry};
 
@@ -27,11 +32,12 @@ pub use install::{CatalogueInstallContext, install_package, project_package_to_e
 /// [`install_package`] without taking a second surface dependency; the types
 /// stay canonical (no duplicates, no bridges).
 pub use eliot_skills::{
-    AdvisoryRuleClaim, CapabilityVersion, ConflictState, DeliveryProjection, DependencyMaterial,
-    DistractorState, FreshnessState, HostLimits, HostProfile, LifecycleProposal,
-    MaterializationInputs, PackageDigests, QuarantineState, RegistrationIdentity, SkillBehavior,
-    SkillCounters, SkillInteractionProjection, SkillPackage, SkillState, ToolDefinitionMaterial,
-    VersionedRequirement,
+    AdvisoryRuleClaim, Availability, AvailabilityField, CapabilityVersion, ConflictState,
+    DeliveryProjection, DependencyMaterial, DistractorState, FreshnessState, HostLimits,
+    HostProfile, LifecycleProposal, MaterializationInputs, MaterializationScope, PackageDigests,
+    QuarantineState, ReadinessClaims, RegistrationIdentity, SkillBehavior, SkillCounters,
+    SkillInteractionProjection, SkillPackage, SkillState, ToolDefinitionMaterial, UnavailableCode,
+    VersionedObservation, VersionedRequirement,
 };
 
 pub const CONTRACT_NAME: &str = "eliot.governor.skill";

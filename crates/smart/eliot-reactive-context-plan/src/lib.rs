@@ -8,9 +8,17 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::result_large_err, clippy::large_enum_variant)]
 
+mod bridge_admission;
 mod input;
 mod plan;
 mod result;
+mod settled_plan_feed;
+
+pub use bridge_admission::{
+    BridgeAdmissionBatch, BridgeAdmissionDelivery, BridgeAdmissionError,
+    BridgeAdmissionInstruction, BridgeAdmissionSeverity, MAX_BRIDGE_RELATIONS,
+    plan_bridge_admissions,
+};
 
 pub use input::{
     AttentionDisclosureRule, ReactiveCueActivation, ReactiveDeliveryPolicy, ReactiveTargetBinding,
@@ -21,4 +29,8 @@ pub use result::{
     PendingContextInjectionPlan, PlannedAttentionBinding, PlannedContextItem, PlannedItemKind,
     PlanningAccounting, PlanningErrorDisposition, PlanningErrorKind, ReactiveContextPlanResult,
     ReactiveContextPlanningError,
+};
+pub use settled_plan_feed::{
+    SettledPlanFeed, SettledPlanFeedError, SettledPlanFeedInputs, SettledPlanFeedOutcome,
+    produce_settled_plan_feed,
 };
