@@ -12,8 +12,9 @@
 //! Source parity: `ScopeReservationRequest`, `ReservationRequest` + `validate`,
 //! `ReservedScope`, `WriterReservationToken`, `ReservationState` + `is_terminal`,
 //! `ReservationRecord` moved verbatim (derives, `serde` attrs, variants, fields,
-//! `pub(crate)` seams unchanged); `serde` shape and public API preserved via
-//! `lib.rs` re-export.
+//! `pub(crate)` seams unchanged except `ReservationState::is_terminal`, widened
+//! to `pub` for Kernel-route fixture drain/retention assertions, issue #2031);
+//! `serde` shape and public API otherwise preserved via `lib.rs` re-export.
 
 use std::collections::BTreeSet;
 
@@ -114,7 +115,12 @@ pub enum ReservationState {
 }
 
 impl ReservationState {
-    pub(crate) const fn is_terminal(self) -> bool {
+    /// Reports whether the lifecycle state is terminal.
+    ///
+    /// Public so test-usable Kernel-route fixtures can assert drain/retention
+    /// without a second local definition of terminality. Terminal states never
+    /// become executable again.
+    pub const fn is_terminal(self) -> bool {
         matches!(self, Self::Finalized | Self::Released)
     }
 }
@@ -127,4 +133,19 @@ pub struct ReservationRecord {
     pub state: ReservationState,
     pub unknown_reason: Option<OpaqueLabel>,
     pub terminal_receipt_id: Option<OpaqueLabel>,
+}
+
+#[cfg(test)]
+mod reservation_terminal_tests {
+    use super::ReservationState;
+
+    #[test]
+    fn only_finalized_and_released_are_terminal() {
+        assert!(ReservationState::Finalized.is_terminal());
+        assert!(ReservationState::Released.is_terminal());
+        assert!(!ReservationState::Reserved.is_terminal());
+        assert!(!ReservationState::Eligible.is_terminal());
+        assert!(!ReservationState::Executing.is_terminal());
+        assert!(!ReservationState::Reconciling.is_terminal());
+    }
 }
