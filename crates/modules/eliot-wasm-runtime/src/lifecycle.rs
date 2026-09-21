@@ -92,12 +92,13 @@ pub fn project_lifecycle(inputs: &LifecycleProjectionInputs) -> WasmLifecycleSta
     ) {
         return WasmLifecycleState::Retired;
     }
-    if inputs.draining
-        || matches!(
-            inputs.generation,
-            ModuleGenerationState::Quiescing | ModuleGenerationState::Degraded
-        ) && inputs.canary_open
-    {
+    // Quiescing is drain in progress on the canonical machine
+    // (`Quiescing → Drained`), so it projects as draining without further
+    // evidence. A degraded generation only drains while its canary is open.
+    if inputs.draining || matches!(inputs.generation, ModuleGenerationState::Quiescing) {
+        return WasmLifecycleState::Draining;
+    }
+    if matches!(inputs.generation, ModuleGenerationState::Degraded) && inputs.canary_open {
         return WasmLifecycleState::Draining;
     }
     if matches!(inputs.generation, ModuleGenerationState::Active) && !inputs.draining {
@@ -376,7 +377,9 @@ pub struct ShadowResult {
 /// Runs one isolated no-effect shadow invocation against the reference
 /// outcome and persists the comparator legs. Shadow state is isolated by
 /// construction: the returned outcome carries no emitted effects and no
-/// scheduler decision is reachable from this call.
+/// scheduler decision is reachable from this call. Comparator measurements
+/// (latency, peak memory, host-call count) are stamped from the observed
+/// invocation, never synthesized.
 #[must_use]
 pub fn run_shadow(
     core: &dyn SemanticCore,
@@ -384,10 +387,16 @@ pub fn run_shadow(
     input: &[u8],
     seed: u64,
 ) -> ShadowResult {
+    let started = std::time::Instant::now();
     let outcome = core.invoke(input, seed);
+    let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let peak_memory_bytes = outcome.peak_memory_bytes;
+    let host_calls = u32::try_from(outcome.host_calls.len()).unwrap_or(u32::MAX);
+    // Effect proposals are compared, not forbidden: emission is what shadow
+    // drops (always zero below). Identical proposals on both contours match.
     let semantic_match =
         outcome.result == reference.result && outcome.error_class == reference.error_class;
-    let effect_proposal_match = outcome.effects == reference.effects && outcome.effects.is_empty();
+    let effect_proposal_match = outcome.effects == reference.effects;
     let nondeterminism_detected = core.invoke(input, seed).result != outcome.result;
     let mut divergences = Vec::new();
     if !semantic_match {
@@ -413,9 +422,9 @@ pub fn run_shadow(
             semantic_match,
             invariant_held: divergences.is_empty(),
             effect_proposal_match,
-            latency_ms: 0,
-            peak_memory_bytes: 1_024,
-            host_calls: 0,
+            latency_ms,
+            peak_memory_bytes,
+            host_calls,
             nondeterminism_detected,
             divergences,
         },
@@ -524,7 +533,10 @@ pub struct RollbackRoute {
 
 /// Routes rollback through a new generation cutover with a newer epoch.
 /// Every in-flight operation must carry an exact disposition and state must
-/// be compatible (prior snapshot) or forward-repaired.
+/// be compatible (prior snapshot) or forward-repaired. The sealing digest
+/// binds the cutover/route/generation/epoch identities together with the
+/// committed in-flight dispositions, snapshot strategy, and compatibility
+/// flag, so the sealed decision cannot silently change after commit.
 ///
 /// # Errors
 ///
@@ -571,6 +583,9 @@ pub fn route_rollback(request: &RollbackRouteRequest) -> Result<RollbackRoute, L
         request.to_generation,
         request.old_epoch,
         request.new_epoch,
+        &request.in_flight,
+        request.snapshot_strategy,
+        request.state_compatible,
     ))
     .map_err(|error| LifecycleError::Serialization {
         detail: error.to_string(),
@@ -653,6 +668,55 @@ mod lifecycle_proof_tests {
         }
     }
 
+    fn must_id(value: Result<CapabilityId, crate::RuntimeError>) -> CapabilityId {
+        match value {
+            Ok(id) => id,
+            Err(error) => panic!("capability id failed: {error:?}"),
+        }
+    }
+
+    /// Backend that disagrees with the reference core on result bytes.
+    struct DivergentCore;
+
+    impl SemanticCore for DivergentCore {
+        fn invoke(&self, input: &[u8], _seed: u64) -> CoreOutcome {
+            let mut result = input.to_vec();
+            result.push(0xFF);
+            CoreOutcome {
+                result,
+                error_class: ErrorClass::Ok,
+                effects: Vec::new(),
+                state_delta: Vec::new(),
+                host_calls: Vec::new(),
+                fuel_consumed: 0,
+                // Matches the reference envelope so the result leg alone
+                // diverges.
+                peak_memory_bytes: 1_024,
+            }
+        }
+    }
+
+    /// Backend proposing identical non-empty effects on every invocation.
+    struct ProposingCore;
+
+    impl SemanticCore for ProposingCore {
+        fn invoke(&self, input: &[u8], seed: u64) -> CoreOutcome {
+            let _ = (input, seed);
+            CoreOutcome {
+                result: vec![0xA5],
+                error_class: ErrorClass::Ok,
+                effects: vec![EffectProposal {
+                    effect_kind: must_id(CapabilityId::new("log")),
+                    payload_digest: Sha256Digest::of_bytes(b"proposal"),
+                }],
+                state_delta: vec![0x5A],
+                host_calls: Vec::new(),
+                fuel_consumed: 1,
+                peak_memory_bytes: 512,
+            }
+        }
+    }
+
     #[test]
     fn wasm_generation_lifecycle_conformance_shadow_rollback_proof() {
         let core = DeterministicEchoCore::new("component-1956");
@@ -724,5 +788,198 @@ mod lifecycle_proof_tests {
             state_compatible: true,
         });
         assert_eq!(stale_epoch, Err(LifecycleError::RollbackEpochNotNewer));
+    }
+
+    #[test]
+    fn divergent_backend_is_detected_not_adopted() {
+        let reference_core = DeterministicEchoCore::new("component-1956");
+        let reference = NativeCoreAdapter::new(&reference_core).invoke(b"eliot-wasm-1956", 0x1956);
+        let divergent = DivergentCore.invoke(b"eliot-wasm-1956", 0x1956);
+        let repeat = DivergentCore.invoke(b"eliot-wasm-1956", 0x1956);
+        let comparison = compare_conformance(&divergent, &reference, &repeat);
+        assert!(!comparison.result_match);
+        assert!(!comparison.identical);
+
+        let shadow = run_shadow(&DivergentCore, &reference, b"eliot-wasm-1956", 0x1956);
+        assert_eq!(shadow.external_effects_emitted, 0);
+        assert!(!shadow.scheduler_influenced);
+        assert!(!shadow.comparator.semantic_match);
+        assert!(!shadow.comparator.invariant_held);
+        assert_eq!(
+            shadow.comparator.divergences,
+            vec![DivergenceKind::Semantic]
+        );
+    }
+
+    #[test]
+    fn identical_effect_proposals_match_without_being_empty() {
+        let core = ProposingCore;
+        let wasm_outcome = WasmCoreAdapter::new(&core).invoke(b"input", 7);
+        let reference = NativeCoreAdapter::new(&core).invoke(b"input", 7);
+        let repeat = WasmCoreAdapter::new(&core).invoke(b"input", 7);
+        let comparison = compare_conformance(&wasm_outcome, &reference, &repeat);
+        assert!(comparison.effects_match);
+        assert!(comparison.identical);
+
+        let shadow = run_shadow(&core, &reference, b"input", 7);
+        assert!(shadow.comparator.effect_proposal_match);
+        assert!(
+            !shadow
+                .comparator
+                .divergences
+                .contains(&DivergenceKind::EffectProposal)
+        );
+        assert_eq!(shadow.comparator.peak_memory_bytes, 512);
+        assert_eq!(shadow.comparator.host_calls, 0);
+    }
+
+    #[test]
+    fn lifecycle_projection_branches_follow_canonical_machines() {
+        // Quiescing is drain in progress: no further evidence required.
+        let quiescing = project_lifecycle(&projection_inputs(
+            ModuleGenerationState::Quiescing,
+            false,
+            false,
+        ));
+        assert_eq!(quiescing, WasmLifecycleState::Draining);
+        // A degraded generation drains only while its canary is open.
+        let degraded_canary = project_lifecycle(&LifecycleProjectionInputs {
+            generation: ModuleGenerationState::Degraded,
+            canary_open: true,
+            ..projection_inputs(ModuleGenerationState::Degraded, false, false)
+        });
+        assert_eq!(degraded_canary, WasmLifecycleState::Draining);
+        let degraded_bare = project_lifecycle(&projection_inputs(
+            ModuleGenerationState::Degraded,
+            false,
+            false,
+        ));
+        assert_eq!(degraded_bare, WasmLifecycleState::Built);
+        // Terminal evidence wins in priority order.
+        let failed = project_lifecycle(&projection_inputs(
+            ModuleGenerationState::Failed,
+            true,
+            true,
+        ));
+        assert_eq!(failed, WasmLifecycleState::Rejected);
+        let drained = project_lifecycle(&projection_inputs(
+            ModuleGenerationState::Drained,
+            true,
+            true,
+        ));
+        assert_eq!(drained, WasmLifecycleState::Retired);
+        let rolled_back = project_lifecycle(&LifecycleProjectionInputs {
+            generation: ModuleGenerationState::Active,
+            rollback_cutover_committed: true,
+            ..projection_inputs(ModuleGenerationState::Active, true, true)
+        });
+        assert_eq!(rolled_back, WasmLifecycleState::RolledBack);
+        // Progress labels follow observed evidence.
+        let shadow = project_lifecycle(&LifecycleProjectionInputs {
+            generation: ModuleGenerationState::Ready,
+            shadow_open: true,
+            ..projection_inputs(ModuleGenerationState::Ready, true, true)
+        });
+        assert_eq!(shadow, WasmLifecycleState::Shadow);
+        let draft = project_lifecycle(&projection_inputs(
+            ModuleGenerationState::Discovered,
+            false,
+            false,
+        ));
+        assert_eq!(draft, WasmLifecycleState::Draft);
+        let built = project_lifecycle(&projection_inputs(
+            ModuleGenerationState::Ready,
+            false,
+            false,
+        ));
+        assert_eq!(built, WasmLifecycleState::Built);
+    }
+
+    #[test]
+    fn state_migration_contract_is_versioned_and_protected() {
+        let plan = StateMigrationPlan {
+            from_version: 1,
+            to_version: 2,
+            plan_digest: Sha256Digest::of_bytes(b"plan-1-2"),
+            reversible: true,
+            backup_digest: None,
+        };
+        let snapshot = StateSnapshot {
+            version: 1,
+            bytes: b"state".to_vec(),
+        };
+        let migrated = match migrate_state(&plan, &snapshot) {
+            Ok(next) => next,
+            Err(error) => panic!("migration failed: {error:?}"),
+        };
+        assert_eq!(migrated.version, 2);
+
+        let stateless = StateSnapshot {
+            version: 1,
+            bytes: Vec::new(),
+        };
+        let stateless_plan = StateMigrationPlan {
+            from_version: 1,
+            to_version: 1,
+            plan_digest: Sha256Digest::of_bytes(b"plan-1-1"),
+            reversible: true,
+            backup_digest: None,
+        };
+        assert!(migrate_state(&stateless_plan, &stateless).is_ok());
+
+        let wrong_version = StateSnapshot {
+            version: 9,
+            bytes: b"state".to_vec(),
+        };
+        assert_eq!(
+            migrate_state(&plan, &wrong_version),
+            Err(LifecycleError::MigrationVersionMismatch)
+        );
+        let unprotected = StateMigrationPlan {
+            reversible: false,
+            backup_digest: None,
+            ..plan.clone()
+        };
+        assert_eq!(
+            migrate_state(&unprotected, &snapshot),
+            Err(LifecycleError::MigrationNotReversible)
+        );
+        let backup_protected = StateMigrationPlan {
+            reversible: false,
+            backup_digest: Some(Sha256Digest::of_bytes(b"backup")),
+            ..plan.clone()
+        };
+        assert!(migrate_state(&backup_protected, &snapshot).is_ok());
+    }
+
+    #[test]
+    fn rollback_seal_covers_dispositions_and_strategy() {
+        let base = RollbackRouteRequest {
+            cutover_id: "cutover-seal".to_owned(),
+            route_scope: "component-seal".to_owned(),
+            from_generation: 3,
+            to_generation: 2,
+            old_epoch: 5,
+            new_epoch: 6,
+            in_flight: vec![("op-1".to_owned(), InFlightDisposition::DrainRead)],
+            snapshot_strategy: SnapshotStrategy::PriorCompatibleSnapshot,
+            state_compatible: true,
+        };
+        let sealed = must_route(route_rollback(&base));
+        let other_disposition = RollbackRouteRequest {
+            in_flight: vec![(
+                "op-1".to_owned(),
+                InFlightDisposition::BlockScopeUnknownOutcome,
+            )],
+            ..base.clone()
+        };
+        let resealed = must_route(route_rollback(&other_disposition));
+        assert_ne!(sealed.route_digest, resealed.route_digest);
+        let other_strategy = RollbackRouteRequest {
+            snapshot_strategy: SnapshotStrategy::ForwardRepair,
+            ..base.clone()
+        };
+        let restrategized = must_route(route_rollback(&other_strategy));
+        assert_ne!(sealed.route_digest, restrategized.route_digest);
     }
 }
