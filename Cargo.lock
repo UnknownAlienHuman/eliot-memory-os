@@ -575,6 +575,7 @@ dependencies = [
  "anyhow",
  "clap",
  "eliot-agent-api",
+ "eliot-backup",
  "eliot-bootstrap",
  "eliot-cli",
  "eliot-contracts",

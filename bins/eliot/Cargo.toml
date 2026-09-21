@@ -18,6 +18,7 @@ clap.workspace = true
 eliot-bootstrap.workspace = true
 eliot-cli.workspace = true
 eliot-doctor = { path = "../eliot-doctor", version = "0.1.0" }
+eliot-backup = { path = "../../crates/storage/eliot-backup", version = "0.1.0" }
 eliot-live-canary = { path = "../../workspace/tools/eliot-live-canary", version = "0.1.0" }
 eliot-governor.workspace = true
 eliot-kernel-service.workspace = true
