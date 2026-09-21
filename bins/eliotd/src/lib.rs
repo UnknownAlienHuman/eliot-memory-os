@@ -407,6 +407,16 @@ impl DaemonComposition {
         self.governor.owners().config.snapshot_digest()
     }
 
+    /// Returns the recovered Policy projection owner admitted at Governor
+    /// construction (I1.11 step 8 input), or `None` while the Kernel does
+    /// not serve the Policy named read. Read-only over the retained owner:
+    /// policy content is consumed from the actual canonical snapshot, never
+    /// defaulted and never a relabeled Config digest.
+    #[must_use]
+    pub fn policy_owner(&self) -> Option<&eliot_governor::PolicyOwner> {
+        self.governor.owners().policy.as_ref()
+    }
+
     /// Returns the retained protected daemon state root.
     #[must_use]
     pub fn state_root(&self) -> &Path {

@@ -55,10 +55,13 @@
 //!   never mints identities. A store-domain `OperationIdentity` has no
 //!   source at daemon startup, so the evidence binds the transport identity
 //!   the Kernel already authenticates instead of synthesizing one.
-//! - policy content is never sourced here. In particular the unaccepted 1966
-//!   precedence helper is not a canonical policy source: only digests bound
-//!   to caller-observed canonical rebuild outputs enter the payload, and no
-//!   Policy mirror owner exists yet (see below).
+//! - policy content comes only from the recovered Governor `PolicyOwner`
+//!   (actual canonical snapshot, fence/revision/digest correlated at
+//!   recovery). In particular the unaccepted 1966 precedence helper is not
+//!   a canonical policy source: only digests bound to caller-observed
+//!   canonical rebuild outputs enter the payload. While the Kernel does not
+//!   serve the Policy named read, the owner is absent and the mirror stays
+//!   an explicit marker (see below) — never a Config digest.
 //!
 //! Caller integration (exact owner handoff):
 //!
@@ -78,8 +81,8 @@
 //!   between recovery and the readiness site fails the build instead of
 //!   publishing skew.
 //! - absent owners (explicit markers, warn diagnostics, follow-up owners):
-//!   Policy mirror (no Policy snapshot owner exists in
-//!   `RecoveryOwner::ALL`; needs a canonical Policy source/owner),
+//!   Policy mirror while the Kernel does not serve the Policy named read
+//!   (owner absent; needs the Kernel-served read plus the live projection),
 //!   required set and outcomes (no retained registry or startup evaluation
 //!   in the daemon yet; B2280 capability-admission coordination point),
 //!   generation fingerprint (Generation Registry scheme is Kernel-owned).
@@ -186,8 +189,9 @@ pub struct StartupEvidenceRequest {
     pub observed_kernel_fence: StateFence,
     /// Observed Config mirror rebuild output. Acquirable: `None` blocks.
     pub config_mirror: Option<MirrorObservation>,
-    /// Observed Policy mirror rebuild output. No Policy snapshot owner
-    /// exists yet: `None` builds as an absence marker.
+    /// Observed Policy mirror rebuild output. `None` builds as an absence
+    /// marker while the Kernel does not serve the Policy named read
+    /// (owner absent); a served owner threads its canonical/rebuilt pair.
     pub policy_mirror: Option<MirrorObservation>,
     /// Required capability names from the capability model. `None` builds
     /// as an absence marker; an explicitly empty set is satisfied and
@@ -588,6 +592,30 @@ pub fn publish_daemon_startup_evidence(
             PlatformHandle::new(composition.config_snapshot_digest()).map_err(|error| {
                 StartupEvidenceError::Contract(format!("recovered config digest: {error}"))
             })?;
+        // Policy mirror (I1.11 step 8): the canonical half is the
+        // Kernel-observed payload digest retained at recovery; the rebuilt
+        // half is recomputed live from the retained canonical snapshot. Both
+        // halves come from the actual Policy owner — never a Config digest.
+        // Unconfigured (Kernel does not serve the Policy read yet) stays an
+        // explicit absence marker.
+        let policy_mirror = match composition.policy_owner() {
+            Some(owner) => {
+                let canonical = PlatformHandle::new(owner.canonical_digest()).map_err(|error| {
+                    StartupEvidenceError::Contract(format!("kernel policy digest: {error}"))
+                })?;
+                let rebuilt_digest = owner.rebuilt_envelope_digest().map_err(|error| {
+                    StartupEvidenceError::Contract(format!("rebuilt policy digest: {error}"))
+                })?;
+                let rebuilt = PlatformHandle::new(rebuilt_digest).map_err(|error| {
+                    StartupEvidenceError::Contract(format!("rebuilt policy digest: {error}"))
+                })?;
+                Some(MirrorObservation {
+                    canonical_source_digest: canonical,
+                    rebuilt_digest: rebuilt,
+                })
+            }
+            None => None,
+        };
         let request = StartupEvidenceRequest {
             transport_binding: Some(binding.clone()),
             operation_fence: Some(composition.kernel_snapshot().state_fence()),
@@ -596,7 +624,7 @@ pub fn publish_daemon_startup_evidence(
                 canonical_source_digest: canonical,
                 rebuilt_digest: rebuilt,
             }),
-            policy_mirror: None,
+            policy_mirror,
             required_capabilities: None,
             capability_outcomes: None,
             capability_registry_digest: None,

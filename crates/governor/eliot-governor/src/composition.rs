@@ -501,6 +501,11 @@ pub struct GovernorRecoverySnapshot {
     pub protected_snapshot_digest: String,
     /// Exactly one durable named read for each Governor owner.
     pub owner_reads: Vec<KernelNamedReadReply>,
+    /// Optional Policy named read, served independently of the required
+    /// owner set. `None` means the Kernel does not serve Policy yet:
+    /// policy-gated evidence stays explicitly absent (fail-closed) and the
+    /// required-set validation above is unaffected.
+    pub policy_read: Option<KernelNamedReadReply>,
     /// Canonical revision/order heads recovered by the Kernel.
     pub canonical_scope: ScopeRevisionView,
     /// Exact terminal receipts available for operation replay/reconciliation.
@@ -1227,6 +1232,35 @@ impl PolicyOwner {
         })?;
         Ok(sha256_hex(&bytes))
     }
+
+    /// Recomputes the canonical envelope digest from the retained parts.
+    ///
+    /// Rebuilds the exact [`PolicyOwnerSnapshot`] envelope admitted at
+    /// recovery and hashes its canonical bytes: the Policy mirror's rebuilt
+    /// half for startup evidence. Equality with [`Self::canonical_digest`]
+    /// proves the recovery channel carried the Kernel-served bytes intact;
+    /// live-projection rebuild (re-reading canonical state at publish time)
+    /// awaits the Kernel-served live projection and is requested in the
+    /// carrier hunk, never synthesized here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompositionError::Recovery`] when the envelope cannot be
+    /// canonicalized (fail-closed, never a default digest).
+    pub fn rebuilt_envelope_digest(&self) -> Result<String, CompositionError> {
+        let wire = PolicyOwnerSnapshot {
+            state_fence: self.state_fence.clone(),
+            revision: self.revision,
+            policy_digest: self.snapshot_digest.clone(),
+            snapshot: self.snapshot.clone(),
+        };
+        let bytes = canonical_json_bytes(&wire).map_err(|error| {
+            CompositionError::Recovery(format!(
+                "retained policy envelope could not be canonicalized: {error}"
+            ))
+        })?;
+        Ok(sha256_hex(&bytes))
+    }
 }
 
 /// Budget projection bound to the active authority fence.
@@ -1381,6 +1415,10 @@ pub struct GovernorOwners<P: ?Sized> {
     pub budget: BudgetOwner,
     /// Host-approved configuration projection owner.
     pub config: ConfigOwner,
+    /// Host-approved policy projection owner. `None` while the Kernel does
+    /// not serve the Policy named read; policy-gated evidence then stays
+    /// explicitly absent (fail-closed), never defaulted.
+    pub policy: Option<PolicyOwner>,
     /// Durable application coordination owner.
     pub coordination: CoordinationOwner,
     /// Finish candidate projection owner.
@@ -1452,6 +1490,10 @@ impl<P: KernelDurableJobPort + ?Sized> GovernorOwners<P> {
                 "config owner snapshot is not bound to the protected launch digest".to_owned(),
             ));
         }
+        let policy = match &recovery.policy_read {
+            Some(reply) => Some(PolicyOwner::recover(reply, state_fence)?),
+            None => None,
+        };
         let coordination_wire: CoordinationOwner =
             decode_owner_snapshot(recovery, RecoveryOwner::Coordination)?;
         let coordination = CoordinationOwner::from_snapshot_at(
@@ -1558,6 +1600,7 @@ impl<P: KernelDurableJobPort + ?Sized> GovernorOwners<P> {
                 state_fence: state_fence.clone(),
                 snapshot_digest: config_snapshot_digest,
             },
+            policy,
             coordination,
             finish,
             problem: ProblemOwner {
@@ -2760,10 +2803,22 @@ fn recover_from_kernel<P: KernelRecoveryPort + ?Sized>(
     let durable_jobs = kernel
         .durable_jobs(state_fence, protected_snapshot_digest)
         .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+    // The Policy read rides outside the required set: an unserved owner
+    // yields `None` (explicit absence) instead of failing recovery, while a
+    // transport failure still fails closed. Genesis seeding covers only the
+    // required owners; Policy is served independently afterwards.
+    let policy_read = kernel
+        .named_read(KernelNamedReadRequest {
+            owner: RecoveryOwner::Policy,
+            state_fence: state_fence.clone(),
+            protected_snapshot_digest: protected_snapshot_digest.to_owned(),
+        })
+        .map_err(|error| CompositionError::Recovery(error.to_string()))?;
     Ok(GovernorRecoverySnapshot {
         state_fence: state_fence.clone(),
         protected_snapshot_digest: protected_snapshot_digest.to_owned(),
         owner_reads,
+        policy_read,
         canonical_scope,
         receipts,
         durable_jobs,
@@ -3421,9 +3476,48 @@ mod tests {
             RecoveryOwner::ChangeMonitor => {
                 serde_json::to_value(eliot_change_monitor::ChangeMonitorSnapshot::default())
             }
+            RecoveryOwner::Policy => serde_json::to_value(policy_owner_snapshot(state_fence)),
         }
         .expect("owner payload");
         canonical_json_bytes(&value).expect("owner payload bytes")
+    }
+
+    /// Builds the valid Policy owner snapshot the fake serves by default.
+    ///
+    /// Test-only canonical source: a complete normative snapshot bound to
+    /// the request fence with revision 1. Tests for the absent path drop
+    /// the read through `missing`/`live_reads` instead.
+    fn policy_owner_snapshot(state_fence: &StateFence) -> PolicyOwnerSnapshot {
+        let snapshot = eliot_config::ConfigPolicySnapshot {
+            snapshot_id: "policy-snapshot-1".to_owned(),
+            machine_id: "policy-machine".to_owned(),
+            scope_id: "governor".to_owned(),
+            revision: eliot_contracts::PolicyRevision::new(1).expect("policy revision"),
+            source_completeness: eliot_config::SourceCompleteness::Complete,
+            settings: vec![eliot_config::Setting {
+                key: "mode".to_owned(),
+                value_ref: "ref:mode".to_owned(),
+                owner_ref: "human-1".to_owned(),
+            }],
+            policy_owner: eliot_config::HumanOwner {
+                owner_ref: "human-1".to_owned(),
+            },
+            policy_fence: eliot_security_contracts::PolicyFence {
+                policy_snapshot_id: "policy-snapshot-1".to_owned(),
+                state_fence: state_fence.clone(),
+            },
+            state_fence: state_fence.clone(),
+            parent_snapshot_id: None,
+            rollback_of: None,
+        };
+        let policy_digest =
+            sha256_hex(&canonical_json_bytes(&snapshot).expect("policy snapshot bytes"));
+        PolicyOwnerSnapshot {
+            state_fence: state_fence.clone(),
+            revision: 1,
+            policy_digest,
+            snapshot,
+        }
     }
 
     fn activation_canonical_snapshot(fence: &StateFence) -> CanonicalAdmissionSnapshot {
@@ -3675,6 +3769,70 @@ mod tests {
         let unique: BTreeSet<_> = ids.into_iter().collect();
         assert_eq!(ids.len(), 16);
         assert_eq!(unique.len(), ids.len());
+    }
+
+    #[test]
+    fn policy_owner_recovers_with_fence_revision_digest_correlation() {
+        let observed = snapshot();
+        let expected = KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
+        let composition =
+            GovernorComposition::new(Arc::new(fake_kernel(observed.clone())), None, &expected, QueueLimits::default())
+                .expect("composition");
+        let policy = composition.owners().policy.as_ref().expect("policy owner");
+        assert_eq!(policy.state_fence(), &observed.state_fence());
+        assert_eq!(policy.revision(), 1);
+        assert_eq!(
+            policy.snapshot().snapshot_id,
+            "policy-snapshot-1",
+            "policy content comes from the recovered canonical snapshot"
+        );
+        let rebuilt = policy.rebuilt_digest().expect("rebuilt digest");
+        assert_eq!(
+            rebuilt,
+            policy.snapshot_digest(),
+            "live recomputation reproduces the recovery-bound digest"
+        );
+        let reply = composition
+            .recovery()
+            .policy_read
+            .as_ref()
+            .expect("policy read");
+        assert_eq!(policy.canonical_digest(), reply.value_digest);
+        assert_ne!(
+            policy.canonical_digest(),
+            composition.owners().config.snapshot_digest(),
+            "policy evidence is never a relabeled config digest"
+        );
+    }
+
+    #[test]
+    fn absent_policy_read_leaves_explicit_unconfigured() {
+        let observed = snapshot();
+        let expected = KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
+        let mut fake = fake_kernel(observed);
+        fake.missing = Some(RecoveryOwner::Policy);
+        let composition =
+            GovernorComposition::new(Arc::new(fake), None, &expected, QueueLimits::default())
+                .expect("composition");
+        assert!(composition.owners().policy.is_none());
+        assert!(composition.recovery().policy_read.is_none());
+        assert_eq!(composition.readiness(), CompositionReadiness::Ready);
+    }
+
+    #[test]
+    fn tampered_policy_digest_fails_recovery() {
+        let observed = snapshot();
+        let expected = KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
+        let mut wire = policy_owner_snapshot(&observed.state_fence());
+        wire.policy_digest = "0".repeat(64);
+        let mut fake = fake_kernel(observed);
+        fake.payloads.insert(
+            RecoveryOwner::Policy,
+            canonical_json_bytes(&wire).expect("policy bytes"),
+        );
+        let result =
+            GovernorComposition::new(Arc::new(fake), None, &expected, QueueLimits::default());
+        assert!(matches!(result, Err(CompositionError::Recovery(_))));
     }
 
     #[test]

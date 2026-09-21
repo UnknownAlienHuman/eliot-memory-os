@@ -1735,6 +1735,7 @@ dependencies = [
  "eliot-read",
  "eliot-receipts",
  "eliot-runtime-contracts",
+ "eliot-security-contracts",
  "eliot-session",
  "eliot-skill",
  "eliot-store-api",
