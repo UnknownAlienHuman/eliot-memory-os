@@ -45,6 +45,7 @@ pub mod diagnostics;
 mod dreamer_admission;
 mod dreamer_materials;
 mod dreamer_model_adapter;
+mod first_run_wiring;
 mod freshness_admission;
 mod governor_local_read;
 mod kernel_authority_client;
@@ -113,6 +114,10 @@ pub use dreamer_materials::{
 };
 pub use dreamer_model_adapter::{
     DreamerModelExecution, GovernedDreamerModelAdapter, ModelInvokeInput,
+};
+pub use first_run_wiring::{
+    DisabledAutomationOutcome, FirstRunWiringError, inspect_first_run_defaults,
+    recommend_for_disabled_automation, resolve_first_run_routes,
 };
 pub use freshness_admission::{
     CANDIDATE_COMMITTED_PROJECTION_PENDING, CandidateFetchOutcome, CommittedCandidate,
