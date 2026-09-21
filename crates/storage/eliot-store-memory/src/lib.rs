@@ -9,6 +9,8 @@
 mod epistemic_tests;
 #[cfg(test)]
 mod notification_state_tests;
+#[cfg(test)]
+mod reactive_state_tests;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, MutexGuard, TryLockError};
@@ -21,20 +23,23 @@ use eliot_kernel_core::{
 use eliot_store_api::epistemic_revision::{EpistemicCommit, position_key};
 use eliot_store_api::{
     CanonicalRequestView, CanonicalStoreClient, CanonicalValidationSnapshot, CommitId,
-    DecodedNotificationMutation, ERASURE_PARAM_OPERATION_ID, ERASURE_PARAM_SUBJECT,
-    ERASURE_PARAM_SURFACES, EVIDENCE_PACK_MAX_RECORDS, EventId, EventProjectionRelationIntents,
-    NamedMutationOperation, NamedReadOperation, NamedReadRequest, NamedReadResponse, OperationId,
-    OperationManifestDigest, OrderingHead, OrderingHeadExpectation, OrderingScopeId, OutboxId,
-    OutboxIntent, OutboxState, PreparedTransition, ProjectionMode, ProjectionPublicationId,
-    ProjectionPublicationRecord, ProjectionStatus, RecoveryRecord, RecoveryRecordKey, RequestMeta,
-    Resubmission, RevisionDelta, RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId,
-    ScopeRevisionView, SplitView, StateFence, StoreError, StoreGenesisRequest, StoreHealth,
-    StoreHealthStatus, StoreRecoveryRequest, StoreRecoverySnapshot, TransitionClass, WriteReceipt,
-    WriteReceiptStatus, canonical_json_bytes, canonical_request_hash, decode_erasure_surfaces,
-    decode_notification_mutation, generated_operation_manifests, genesis_manifest,
-    is_genesis_fence, issue_genesis_receipt_envelope, issue_store_receipt_envelope,
-    named_mutation_operation_name, sha256_hex, validate_genesis_receipt_envelope,
-    validate_store_receipt_envelope, verify_canonical_request_hash,
+    DecodedNotificationMutation, DecodedReactiveMutation, ERASURE_PARAM_OPERATION_ID,
+    ERASURE_PARAM_SUBJECT, ERASURE_PARAM_SURFACES, EVIDENCE_PACK_MAX_RECORDS, EventId,
+    EventProjectionRelationIntents, NamedMutationOperation, NamedReadOperation, NamedReadRequest,
+    NamedReadResponse, OperationId, OperationManifestDigest, OrderingHead, OrderingHeadExpectation,
+    OrderingScopeId, OutboxId, OutboxIntent, OutboxState, PreparedTransition, ProjectionMode,
+    ProjectionPublicationId, ProjectionPublicationRecord, ProjectionStatus, RecoveryRecord,
+    RecoveryRecordKey, RequestMeta, Resubmission, RevisionDelta, RevisionHead,
+    RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, SplitView, StateFence,
+    StoreError, StoreGenesisRequest, StoreHealth, StoreHealthStatus, StoreRecoveryRequest,
+    StoreRecoverySnapshot, TransitionClass, WriteReceipt, WriteReceiptStatus, canonical_json_bytes,
+    canonical_request_hash, decode_erasure_surfaces, decode_notification_mutation,
+    decode_reactive_mutation, decode_resource_content, generated_operation_manifests,
+    genesis_manifest, is_genesis_fence, issue_genesis_receipt_envelope,
+    issue_store_receipt_envelope, named_mutation_operation_name, sha256_hex,
+    validate_genesis_receipt_envelope, validate_reactive_ledger_read_params,
+    validate_resource_snapshot_read_params, validate_store_receipt_envelope,
+    verify_canonical_request_hash,
 };
 use schemars::JsonSchema;
 use serde::de::Error as _;
@@ -317,6 +322,11 @@ impl MemoryStore {
         // the appended notification outbox intents. State, receipt, and
         // outbox still commit atomically below.
         dispatch_apply_notification_state(&mut state, &transition, &mut plan)?;
+        // Issue #1941 C4: admitted reactive legs execute here, beside the
+        // notification legs and before the receipt is built, so the
+        // receipt's outbox references include the appended reactive outbox
+        // intents. Rows, receipt, and outbox still commit atomically below.
+        dispatch_apply_reactive_state(&mut state, &transition, &mut plan)?;
         let receipt = transaction_receipt(ctx, &transition, idempotency_key, recomputed, &plan)?;
         if let (Some(commit), Some(key)) = (epistemic, epistemic_key) {
             commit.readback(&receipt)?;
@@ -614,6 +624,134 @@ fn dispatch_apply_notification_state(
     Ok(())
 }
 
+/// Executes admitted reactive-state legs on already-locked state
+/// (issue #1941 C4).
+///
+/// Runs beside [`dispatch_apply_notification_state`] under the same lock
+/// as the receipt commit: one identity, one receipt, recoverable replay
+/// without duplicate work. Ledger upserts replace the session snapshot
+/// verbatim with a bumped owner revision; snapshot creates persist the
+/// digest-verified bytes once and convergently re-apply identical bytes,
+/// while a rewrite with different bytes fails closed. Each command
+/// appends one outbox intent bound to the resulting row bytes, so rows
+/// and their outbox intents commit atomically via [`commit_transaction`].
+/// Non-reactive transitions are a no-op here.
+fn dispatch_apply_reactive_state(
+    state: &mut MemoryState,
+    transition: &PreparedTransition,
+    plan: &mut TransactionPlan,
+) -> Result<(), StoreError> {
+    let has_reactive_op = transition.named_operations.iter().any(|command| {
+        matches!(
+            command.operation,
+            NamedMutationOperation::ApplyReactiveInjectionState
+                | NamedMutationOperation::ApplyResourceSnapshot
+        )
+    });
+    if !has_reactive_op {
+        return Ok(());
+    }
+    if transition.transition_class != TransitionClass::ReactiveState {
+        return Err(StoreError::TransitionClassExceeded);
+    }
+    let operation_key = transition.identity.operation_id.to_string();
+    let mut reactive_index = 0_usize;
+    for command in &transition.named_operations {
+        let decoded = match command.operation {
+            NamedMutationOperation::ApplyReactiveInjectionState
+            | NamedMutationOperation::ApplyResourceSnapshot => {
+                decode_reactive_mutation(command.operation, &command.parameters)?
+            }
+            _ => continue,
+        };
+        let row_json = match decoded {
+            DecodedReactiveMutation::ApplyLedger {
+                session_id,
+                ledger_json,
+            } => {
+                let revision = state
+                    .reactive_sessions
+                    .get(&session_id)
+                    .map(|row| {
+                        if row.state_fence != transition.state_fence {
+                            return Err(StoreError::FenceMismatch);
+                        }
+                        row.revision.checked_add(1).ok_or(StoreError::InvalidField {
+                            field: "reactive.revision",
+                            reason: "owner revision overflow",
+                        })
+                    })
+                    .transpose()?
+                    .unwrap_or(1);
+                let row = ReactiveSessionRow {
+                    session_id: session_id.clone(),
+                    ledger_json: ledger_json.clone(),
+                    revision,
+                    state_fence: transition.state_fence.clone(),
+                    scope_id: transition.scope_id.to_string(),
+                    task_id: transition.task_id.clone(),
+                };
+                state.reactive_sessions.insert(session_id, row.clone());
+                serde_json::to_value(&row.ledger_json)
+                    .map_err(|error| StoreError::Serialization(error.to_string()))?
+            }
+            DecodedReactiveMutation::ApplySnapshot {
+                uri,
+                content_sha256,
+                content_base64,
+            } => {
+                // Re-verify digest agreement on the reference contour too:
+                // the row write never trusts a presented digest.
+                decode_resource_content(&content_base64, &content_sha256)?;
+                match state.resource_snapshots.get(&uri) {
+                    None => {
+                        let row = ResourceSnapshotRow {
+                            uri: uri.clone(),
+                            content_sha256: content_sha256.clone(),
+                            content_base64: content_base64.clone(),
+                            revision: 1,
+                            state_fence: transition.state_fence.clone(),
+                            scope_id: transition.scope_id.to_string(),
+                            task_id: transition.task_id.clone(),
+                        };
+                        state.resource_snapshots.insert(uri, row);
+                    }
+                    Some(existing) if existing.state_fence != transition.state_fence => {
+                        return Err(StoreError::FenceMismatch);
+                    }
+                    Some(existing) if existing.content_sha256 != content_sha256 => {
+                        return Err(StoreError::IdentityConflict);
+                    }
+                    Some(_) => {}
+                }
+                serde_json::to_value(&content_base64)
+                    .map_err(|error| StoreError::Serialization(error.to_string()))?
+            }
+        };
+        let payload_digest = sha256_hex(
+            &canonical_json_bytes(&row_json)
+                .map_err(|error| StoreError::Serialization(error.to_string()))?,
+        );
+        let sequence = plan.next_outbox_sequence;
+        plan.next_outbox_sequence =
+            checked_increment(sequence, "outbox.sequence", "sequence overflow")?;
+        let outbox = OutboxIntent {
+            outbox_id: OutboxId::new(format!("outbox-{operation_key}-reactive-{reactive_index}"))?,
+            operation_id: transition.identity.operation_id.clone(),
+            sequence,
+            payload_digest,
+            state_fence: transition.state_fence.clone(),
+            arrival_fence: format!("arrival-{operation_key}"),
+            claim_fence: None,
+            state: OutboxState::Arrived,
+        };
+        outbox.validate()?;
+        plan.outbox_records.push(outbox);
+        reactive_index = reactive_index.saturating_add(1);
+    }
+    Ok(())
+}
+
 /// Applies one decoded leg against the shared record model and returns the
 /// resulting canonical record JSON for outbox binding.
 ///
@@ -906,6 +1044,63 @@ fn notify_payload(
     }))
 }
 
+/// Builds the same-fence reactive-ledger read payload (issue #1941 C4).
+///
+/// Errors surface as serialization failures with the underlying message:
+/// parameters are pre-validated by the catalogue gate, so any failure here
+/// is defense in depth, never a distinct dispatch outcome. An absent
+/// session (or a row from another fence) projects explicit absence. The
+/// snapshot travels verbatim (a JSON string), identically to the Surreal
+/// contour, so a readback is byte-identical to the admitted write.
+fn reactive_ledger_payload(
+    state: &MemoryState,
+    query: &NamedReadRequest,
+    fence: &StateFence,
+) -> Result<Value, serde_json::Error> {
+    let session_id = validate_reactive_ledger_read_params(&query.parameters)
+        .map_err(|error| serde_json::Error::custom(error.to_string()))?;
+    let (ledger_json, revision) = match state.reactive_sessions.get(session_id.as_str()) {
+        Some(row) if row.state_fence == *fence => (json!(row.ledger_json), row.revision),
+        _ => (Value::Null, 0),
+    };
+    serde_json::to_value(json!({
+        "session_id": session_id,
+        "ledger_json": ledger_json,
+        "revision": revision,
+        "state_fence": fence,
+    }))
+}
+
+/// Builds the same-fence resource-snapshot read payload (issue #1941 C4).
+///
+/// Same error contract as [`reactive_ledger_payload`]: absent URIs (or
+/// rows from another fence) project explicit absence, never fabricated
+/// bytes.
+fn resource_snapshot_payload(
+    state: &MemoryState,
+    query: &NamedReadRequest,
+    fence: &StateFence,
+) -> Result<Value, serde_json::Error> {
+    let uri = validate_resource_snapshot_read_params(&query.parameters)
+        .map_err(|error| serde_json::Error::custom(error.to_string()))?;
+    let (content_sha256, content_base64, revision) =
+        match state.resource_snapshots.get(uri.as_str()) {
+            Some(row) if row.state_fence == *fence => (
+                json!(row.content_sha256),
+                json!(row.content_base64),
+                row.revision,
+            ),
+            _ => (Value::Null, Value::Null, 0),
+        };
+    serde_json::to_value(json!({
+        "uri": uri,
+        "content_sha256": content_sha256,
+        "content_base64": content_base64,
+        "revision": revision,
+        "state_fence": fence,
+    }))
+}
+
 fn validate_transaction(
     ctx: &RequestMeta,
     transition: &PreparedTransition,
@@ -975,6 +1170,14 @@ fn validate_transaction_state(
             .named_operations
             .iter()
             .any(|command| command.operation == NamedMutationOperation::ApplyNotificationState)
+        || transition
+            .named_operations
+            .iter()
+            .any(|command| command.operation == NamedMutationOperation::ApplyReactiveInjectionState)
+        || transition
+            .named_operations
+            .iter()
+            .any(|command| command.operation == NamedMutationOperation::ApplyResourceSnapshot)
     {
         return transition.validate_against_catalogue(&generated_operation_manifests()?);
     }
@@ -1367,7 +1570,9 @@ impl MemoryStore {
     /// with their bounded exact selectors. Issue #1780 adds
     /// `GetNotificationState` with its `scope` / `dedup_key` /
     /// `notification_id` / `include_resolved` / `page_limit` / `cursor`
-    /// selectors.
+    /// selectors. Issue #1941 C4 adds `GetReactiveInjectionState` with its
+    /// exact `session_id` selector and `GetResourceSnapshot` with its exact
+    /// `uri` selector.
     fn enforce_catalogue_gate(query: &NamedReadRequest) -> Result<(), StoreError> {
         if matches!(
             query.operation,
@@ -1378,6 +1583,8 @@ impl MemoryStore {
                 | NamedReadOperation::GetUnderstandingProjectionInputs
                 | NamedReadOperation::GetCapabilityEvidenceState
                 | NamedReadOperation::GetNotificationState
+                | NamedReadOperation::GetReactiveInjectionState
+                | NamedReadOperation::GetResourceSnapshot
         ) {
             let entries = generated_operation_manifests()?;
             query.validate_against_catalogue(&entries)?;
@@ -1482,6 +1689,12 @@ impl MemoryStore {
                 serde_json::to_value(&payload)
             }
             NamedReadOperation::GetNotificationState => notify_payload(&state, query, &fence),
+            NamedReadOperation::GetReactiveInjectionState => {
+                reactive_ledger_payload(&state, query, &fence)
+            }
+            NamedReadOperation::GetResourceSnapshot => {
+                resource_snapshot_payload(&state, query, &fence)
+            }
             _ => serde_json::to_value(json!({
                 "operation": format!("{:?}", query.operation),
                 "records": state.named_operations.iter().map(|record| &record.operation).collect::<Vec<_>>(),
@@ -2272,6 +2485,33 @@ struct ErasureRegistryEntry {
     dispatched: bool,
 }
 
+/// One durable reactive-session row: the verbatim bridge ledger snapshot
+/// for one session with its owner revision, admission fence, and
+/// task-binding provenance (issue #1941 C4).
+#[derive(Clone, Debug, PartialEq)]
+struct ReactiveSessionRow {
+    session_id: String,
+    ledger_json: String,
+    revision: u64,
+    state_fence: StateFence,
+    scope_id: String,
+    task_id: Option<String>,
+}
+
+/// One immutable resource-snapshot row: the verbatim snapshot bytes for
+/// one canonical URI with its content digest, owner revision, admission
+/// fence, and task-binding provenance (issue #1941 C4).
+#[derive(Clone, Debug, PartialEq)]
+struct ResourceSnapshotRow {
+    uri: String,
+    content_sha256: String,
+    content_base64: String,
+    revision: u64,
+    state_fence: StateFence,
+    scope_id: String,
+    task_id: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 struct MemoryState {
     epistemic_positions: BTreeMap<String, (EpistemicCommit, WriteReceipt)>,
@@ -2298,6 +2538,15 @@ struct MemoryState {
     /// transaction lock, using the shared kernel-core transition model; the
     /// outbox intent commits atomically with the receipt.
     notifications: NotificationStore,
+    /// Durable reactive-session rows keyed by session (issue #1941 C4).
+    /// Verbatim bridge ledger snapshots with owner revisions, driven only
+    /// through the closed reactive legs under the held transaction lock.
+    reactive_sessions: BTreeMap<String, ReactiveSessionRow>,
+    /// Immutable resource-snapshot rows keyed by canonical URI
+    /// (issue #1941 C4). Verbatim snapshot bytes with owner revisions,
+    /// driven only through the closed reactive legs under the held
+    /// transaction lock.
+    resource_snapshots: BTreeMap<String, ResourceSnapshotRow>,
     next_commit_sequence: u64,
     next_outbox_sequence: u64,
 }
@@ -2324,6 +2573,8 @@ impl PartialEq for MemoryState {
             && self.manifests == other.manifests
             && self.erasure_intents == other.erasure_intents
             && self.erased_subjects == other.erased_subjects
+            && self.reactive_sessions == other.reactive_sessions
+            && self.resource_snapshots == other.resource_snapshots
             && self.next_commit_sequence == other.next_commit_sequence
             && self.next_outbox_sequence == other.next_outbox_sequence
             && self.notifications.iter().collect::<Vec<_>>()
@@ -2350,6 +2601,8 @@ impl Default for MemoryState {
             erasure_intents: BTreeMap::new(),
             erased_subjects: BTreeSet::new(),
             notifications: NotificationStore::new(),
+            reactive_sessions: BTreeMap::new(),
+            resource_snapshots: BTreeMap::new(),
             next_commit_sequence: 1,
             next_outbox_sequence: 1,
         }
@@ -2371,6 +2624,8 @@ impl MemoryState {
             && self.erasure_intents.is_empty()
             && self.erased_subjects.is_empty()
             && self.notifications.len() == 0
+            && self.reactive_sessions.is_empty()
+            && self.resource_snapshots.is_empty()
     }
 
     fn snapshot(&self) -> MemorySnapshot {

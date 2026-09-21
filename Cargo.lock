@@ -2035,12 +2035,15 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "eliot-authority",
+ "eliot-config",
  "eliot-contracts",
  "eliot-ors",
  "eliot-platform",
  "eliot-process",
+ "eliot-protocol",
  "eliot-receipts",
  "eliot-runtime-contracts",
+ "eliot-security-contracts",
  "schemars",
  "serde",
  "serde_json",
@@ -2307,6 +2310,7 @@ version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
  "eliot-cli",
+ "eliot-config",
  "eliot-contracts",
  "eliot-notify-core",
  "eliot-platform",
@@ -2322,11 +2326,13 @@ dependencies = [
 name = "eliot-notify-core"
 version = "0.1.0"
 dependencies = [
+ "eliot-config",
  "eliot-contracts",
  "eliot-kernel-core",
  "eliot-observation-contracts",
  "eliot-platform",
  "eliot-receipts",
+ "eliot-security-contracts",
  "schemars",
  "serde",
  "serde_json",
@@ -2772,6 +2778,7 @@ dependencies = [
 name = "eliot-store-api"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "eliot-contracts",
  "eliot-epistemic-contracts",
  "eliot-evidence",
