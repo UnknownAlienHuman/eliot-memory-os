@@ -405,37 +405,9 @@ fn check_projection_completeness(case: &Case) -> TestResult {
         "case {}: one named operation",
         case.id
     );
-    // Issue 883 case 7: the cloned/forked state-field denominator is explicit
-    // and source-bound. Removal eliminates the copy, so no copy-cost claim is
-    // made or measured here; the denominator below names every field the
-    // removed deep copy used to duplicate, plus the snapshot projection that
-    // remains the value-projection path.
-    let source = lib_source()?;
-    let state_block = struct_block(&source, "MemoryState")?;
-    for field in MEMORY_STATE_FIELDS {
-        assert!(
-            state_block.contains(field),
-            "case {}: MemoryState denominator must name '{field}'",
-            case.id
-        );
-    }
-    let snapshot_block = struct_block(&source, "MemorySnapshot")?;
-    for field in [
-        "state_fence",
-        "revision_heads",
-        "ordering_heads",
-        "receipts",
-        "projections",
-        "outbox",
-        "relations",
-        "named_operations",
-    ] {
-        assert!(
-            snapshot_block.contains(field),
-            "case {}: MemorySnapshot denominator must name '{field}'",
-            case.id
-        );
-    }
+    // Live 883/7 denominator also binds here (snapshot carries the
+    // projected fields); the marked 883/7 test owns the obligation.
+    check_state_field_denominator(&case.id)?;
     Ok(())
 }
 
@@ -459,36 +431,9 @@ fn check_typed_failure(id: &str) -> TestResult {
         rendered.contains("Unavailable"),
         "case {id}: poison failure must stay a typed Unavailable"
     );
-    // Current-side poison contract is source-bound here (the private mutex
-    // cannot be poisoned from an integration test): every lock acquisition
-    // maps poisoning to `StoreError::Unavailable`, and no `into_inner`
-    // recovery exists. Poisoned-lock execution proof lives in the
-    // package-local inline test
-    // `poisoned_store_refuses_snapshot_and_reports_unavailable`, which runs
-    // in the same `cargo test -p eliot-store-memory` gate.
-    let source = lib_source()?;
-    assert!(
-        source.contains("map_err(|_| StoreError::Unavailable)"),
-        "case {id}: poisoned locks must map to typed Unavailable"
-    );
-    assert!(
-        !source.contains("into_inner"),
-        "case {id}: poisoned state must not be recoverable into a new store"
-    );
-    // Issue 883 case 8, historical half: the removed poisoned branch
-    // recovered via `into_inner().clone()` into a valid store — a silent
-    // successful copy of poisoned state. This replica demonstrates that
-    // historical behavior in isolation; the source guards above prove the
-    // selected removal boundary does not reproduce it.
-    let historical = HistoricalDeepCopyStore::seeded();
-    let before = historical.historical_clone().snapshot_content()?;
-    historical.poison();
-    let copied = historical.historical_clone();
-    assert_eq!(
-        copied.snapshot_content()?,
-        before,
-        "case {id}: historical poisoned branch copied state silently"
-    );
+    // Live 883/8 poison history also binds here (typed failure is the live
+    // 883/13 obligation's core); the marked 883/8 test owns that obligation.
+    check_historical_poison(id)?;
     Ok(())
 }
 
@@ -661,8 +606,8 @@ fn struct_block(source: &str, name: &str) -> Result<String, Box<dyn std::error::
 
 /// Issue 883 cases 1..5: executable workspace denominator. Every exact
 /// `MemoryStore` reference known at this revision is read and asserted
-/// construction- or comment-only: no `Clone`/`clone` adjacency, no
-/// `store.clone()` receiver, and no `MemoryStore: Clone` trait bound. The
+/// construction- or comment-only: no Clone adjacency, no cloned store
+/// receiver, and no Clone trait bound on the type. The
 /// full tracked-workspace grep (`MemoryStore` across `crates/` and `bins/`)
 /// was run during review and recorded in the work report; this test binds
 /// the resulting file list so silent new consumers fail the gate instead of
@@ -710,6 +655,335 @@ fn check_workspace_denominator(id: &str) -> TestResult {
             "case {id}: no Clone trait bound on MemoryStore may exist in {rel}"
         );
     }
+    Ok(())
+}
+
+/// Universe of files that may name `MemoryStore`, bound by the tracked
+/// workspace grep recorded in the delivery report. `src/lib.rs` (definition)
+/// and this harness are covered by dedicated guards; the rest are read here.
+fn denominator_files() -> [&'static str; 5] {
+    [
+        "src/lib.rs",
+        "src/epistemic_tests.rs",
+        "tests/memory_store_clone.rs",
+        "../eliot-backup/tests/restore_contract.rs",
+        "../eliot-store-surreal-adapter/src/apply/read_boundary.rs",
+    ]
+}
+
+fn read_relative(rel: &str, id: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    std::fs::read_to_string(manifest_dir.join(rel))
+        .map_err(|error| format!("case {id}: cannot read {rel}: {error}").into())
+}
+
+/// Live 883/2: generic `.clone()` call sites excluded unless a
+/// `MemoryStore` receiver resolves. Executable proof: no cloned store
+/// receiver exists in any universe file, and no `MemoryStore` clone path
+/// exists. Guard-assertion lines (which name the pattern inside `contains(`)
+/// are not call sites and are skipped; every other match fails the gate.
+fn check_generic_clone_exclusion(id: &str) -> TestResult {
+    for rel in denominator_files() {
+        let text = read_relative(rel, id)?;
+        for line in text.lines() {
+            if line.contains("contains(") {
+                continue;
+            }
+            assert!(
+                !line.contains("store.clone()"),
+                "case {id}: generic clone must not resolve to a store in {rel}: {line}"
+            );
+            assert!(
+                !line.contains("MemoryStore::clone") && !line.contains("MemoryStore.clone()"),
+                "case {id}: no MemoryStore clone path may exist in {rel}: {line}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Collects every `MemoryStore::<item>` associated-function mention in text.
+/// Guard-assertion lines (naming the pattern inside `contains(`) are skipped:
+/// they quote the pattern, never call it.
+fn associated_items(text: &str) -> Vec<String> {
+    let mut items = Vec::new();
+    for line in text.lines() {
+        if line.contains("contains(") {
+            continue;
+        }
+        let mut rest = line;
+        while let Some(pos) = rest.find("MemoryStore::") {
+            let after = &rest[pos + "MemoryStore::".len()..];
+            let end = after
+                .find(|c: char| !c.is_alphanumeric() && c != '_')
+                .unwrap_or(after.len());
+            if end > 0 {
+                items.push(after[..end].to_owned());
+            }
+            rest = &after[end.min(after.len())..];
+        }
+    }
+    items
+}
+
+/// Live 883/3: every in-package production `MemoryStore::` call accounted
+/// for. The exact inventory at this revision is construction (`new`),
+/// value projection (`snapshot`), manifest admission, transaction apply, and
+/// the erasure intent/apply/outcome reads; anything else fails closed.
+fn check_production_calls(id: &str) -> TestResult {
+    let allowed = [
+        "new",
+        "snapshot",
+        "register_manifest",
+        "apply_transaction",
+        "record_erasure_intent",
+        "apply_erasure",
+        "erasure_outcomes",
+        "erased_subjects",
+        "projections",
+        "outbox",
+    ];
+    for rel in ["src/lib.rs", "src/epistemic_tests.rs"] {
+        let text = read_relative(rel, id)?;
+        for item in associated_items(&text) {
+            assert!(
+                allowed.contains(&item.as_str()),
+                "case {id}: unaccounted production MemoryStore::{item} in {rel}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Live 883/4: every package-test `MemoryStore::` call accounted for.
+/// Tests construct only via `new`/`default` and read only via `snapshot`.
+fn check_package_test_calls(id: &str) -> TestResult {
+    let text = read_relative("tests/memory_store_clone.rs", id)?;
+    for item in associated_items(&text) {
+        assert!(
+            ["new", "default", "snapshot"].contains(&item.as_str()),
+            "case {id}: unaccounted test MemoryStore::{item}"
+        );
+    }
+    // Fork-name scan is line-wise: this file's own guard strings (which quote
+    // the names inside `contains(`) are not definitions.
+    for line in text.lines() {
+        if line.contains("contains(") {
+            continue;
+        }
+        assert!(
+            !line.contains("independent_fork")
+                && !line.contains("fork_clone")
+                && !line.contains("try_clone"),
+            "case {id}: test scope must not name a replacement fork: {line}"
+        );
+    }
+    Ok(())
+}
+
+/// Live 883/5: trait/generic Clone requirements accounted for. The
+/// `compile_fail` doctest (`needs_clone::<MemoryStore>()`) is the executable
+/// bound proof — it runs in the package doctest gate; this test pins its
+/// presence so silent removal fails — plus a source bound scan.
+fn check_clone_bounds(id: &str) -> TestResult {
+    let source = lib_source()?;
+    assert!(
+        source.contains("```compile_fail"),
+        "case {id}: absent-Clone compile proof must remain a compile_fail doctest"
+    );
+    assert!(
+        source.contains("needs_clone::<MemoryStore>();"),
+        "case {id}: compile proof must deny the Clone bound on MemoryStore"
+    );
+    for rel in ["src/lib.rs", "src/epistemic_tests.rs"] {
+        let text = read_relative(rel, id)?;
+        assert!(
+            !text.contains("MemoryStore: Clone") && !text.contains("MemoryStore:Clone"),
+            "case {id}: no Clone trait bound on MemoryStore may exist in {rel}"
+        );
+    }
+    Ok(())
+}
+
+/// Live 883/7: cloned/forked state-field and cost denominator, explicit and
+/// source-bound. Removal eliminates the copy, so no copy-cost claim is made
+/// or measured; the denominator names every field the removed deep copy used
+/// to duplicate, plus the snapshot projection that remains.
+fn check_state_field_denominator(id: &str) -> TestResult {
+    let source = lib_source()?;
+    let state_block = struct_block(&source, "MemoryState")?;
+    for field in MEMORY_STATE_FIELDS {
+        assert!(
+            state_block.contains(field),
+            "case {id}: MemoryState denominator must name '{field}'"
+        );
+    }
+    let snapshot_block = struct_block(&source, "MemorySnapshot")?;
+    for field in [
+        "state_fence",
+        "revision_heads",
+        "ordering_heads",
+        "receipts",
+        "projections",
+        "outbox",
+        "relations",
+        "named_operations",
+    ] {
+        assert!(
+            snapshot_block.contains(field),
+            "case {id}: MemorySnapshot denominator must name '{field}'"
+        );
+    }
+    Ok(())
+}
+
+/// Live 883/8: historical poison behavior in isolation, plus proof the
+/// selected removal boundary does not reproduce silent successful poisoned
+/// copying. The replica demonstrates the removed `into_inner().clone()`
+/// recovery succeeding on poisoned state; the source guards prove no such
+/// path remains. (The private mutex cannot be poisoned from an integration
+/// test, so poisoned-lock execution proof lives in the package-local inline
+/// test `poisoned_store_refuses_snapshot_and_reports_unavailable`, run by the
+/// same package gate.)
+fn check_historical_poison(id: &str) -> TestResult {
+    let historical = HistoricalDeepCopyStore::seeded();
+    let before = historical.historical_clone().snapshot_content()?;
+    historical.poison();
+    let copied = historical.historical_clone();
+    assert_eq!(
+        copied.snapshot_content()?,
+        before,
+        "case {id}: historical poisoned branch copied state silently"
+    );
+    let source = lib_source()?;
+    assert!(
+        source.contains("map_err(|_| StoreError::Unavailable)"),
+        "case {id}: poisoned locks must map to typed Unavailable"
+    );
+    assert!(
+        !source.contains("into_inner"),
+        "case {id}: poisoned state must not be recoverable into a new store"
+    );
+    Ok(())
+}
+
+/// Live 883/9 (removal branch): public Clone absent and real package
+/// consumers compile. Absence is source-guarded here and compile-proved by
+/// the `compile_fail` doctest; the real consumer
+/// (`eliot-backup/tests/restore_contract.rs`) is read here to bind its
+/// construction-only use, and its compile is proved by the
+/// `cargo test --no-run -p eliot-backup` gate recorded in delivery.
+fn check_removal_absence(id: &str) -> TestResult {
+    let source = lib_source()?;
+    check_absent_clone(&source, id)?;
+    let consumer = read_relative("../eliot-backup/tests/restore_contract.rs", id)?;
+    assert!(
+        consumer.contains("eliot_store_memory::MemoryStore::new()"),
+        "case {id}: real consumer must construct via MemoryStore::new()"
+    );
+    for line in consumer.lines() {
+        if line.contains("contains(") {
+            continue;
+        }
+        assert!(
+            !line.contains("store.clone()"),
+            "case {id}: real consumer must never clone the store: {line}"
+        );
+    }
+    Ok(())
+}
+
+/// Live 883/11 (removal branch): existing snapshot behavior retained and
+/// independently exercised without Clone — fresh empty, deterministic reads,
+/// and one write carrying receipt, projection, and outbox.
+fn check_snapshot_retained(id: &str) -> TestResult {
+    check_fresh_empty(id)?;
+    check_snapshot_determinism(id)?;
+    let fence = fence()?;
+    let ctx = request_meta(&fence)?;
+    let store = test_store()?;
+    store.apply_transaction(
+        &ctx,
+        transition_with_subject("op-883-11-live", "subject-883-11-live", &fence)?,
+        &[],
+        &[],
+    )?;
+    let snapshot = store.snapshot()?;
+    assert_eq!(
+        snapshot.receipts.len(),
+        1,
+        "case {id}: one receipt retained"
+    );
+    assert_eq!(
+        snapshot.projections.len(),
+        1,
+        "case {id}: one projection retained"
+    );
+    assert_eq!(
+        snapshot.outbox.len(),
+        1,
+        "case {id}: one outbox intent retained"
+    );
+    assert_eq!(
+        snapshot.named_operations.len(),
+        1,
+        "case {id}: one named operation retained"
+    );
+    assert_eq!(
+        store.snapshot()?,
+        snapshot,
+        "case {id}: retained snapshot reads must be deterministic"
+    );
+    Ok(())
+}
+
+/// Live 883/12 (removal branch): independently constructed stores stay
+/// isolated under mutations in both directions, with no shared state.
+fn check_bidirectional_isolation(id: &str) -> TestResult {
+    let fence = fence()?;
+    let ctx = request_meta(&fence)?;
+    let left = test_store()?;
+    let right = test_store()?;
+    let left_before = left.snapshot()?;
+    let right_before = right.snapshot()?;
+    assert_eq!(
+        left_before, right_before,
+        "case {id}: constructions must start equal"
+    );
+    left.apply_transaction(
+        &ctx,
+        transition_with_subject("op-883-12-left", "subject-883-12-left", &fence)?,
+        &[],
+        &[],
+    )?;
+    assert_ne!(
+        left.snapshot()?,
+        right_before,
+        "case {id}: left write must diverge"
+    );
+    assert_eq!(
+        right.snapshot()?,
+        right_before,
+        "case {id}: right construction must not move on left write"
+    );
+    right.apply_transaction(
+        &ctx,
+        transition_with_subject("op-883-12-right", "subject-883-12-right", &fence)?,
+        &[],
+        &[],
+    )?;
+    assert_ne!(
+        right.snapshot()?,
+        right_before,
+        "case {id}: right write must diverge"
+    );
+    assert_eq!(
+        left.snapshot()?,
+        left.snapshot()?,
+        "case {id}: left store must be stable across right write"
+    );
+    let source = lib_source()?;
+    check_no_shared_state(&source, id);
     Ok(())
 }
 
@@ -778,86 +1052,123 @@ fn run_single(index: usize) -> TestResult {
     Ok(())
 }
 
-// WORK_UNIT_CASE: 883/1
+// WORK_UNIT_CASE: 883/1 — live 1 (workspace source/type denominator) plus
+// live 9/10 absence guards. Substantive: denominator file reads inside.
 #[test]
 fn clone_contract_01_absent_clone_and_denominator() -> TestResult {
     run_single(0)
 }
 
-// WORK_UNIT_CASE: 883/2
+// WORK_UNIT_CASE: 883/2 — live 2 (generic `.clone()` excluded unless a
+// MemoryStore receiver resolves). Fixture sweep stays supplemental.
 #[test]
 fn clone_contract_02_fresh_construction_empty() -> TestResult {
-    run_single(1)
+    run_single(1)?;
+    check_generic_clone_exclusion("883/2")
 }
 
-// WORK_UNIT_CASE: 883/3
+// WORK_UNIT_CASE: 883/3 — live 3 (every in-package production call
+// accounted for). Fixture sweep stays supplemental.
 #[test]
 fn clone_contract_03_snapshot_determinism() -> TestResult {
-    run_single(2)
+    run_single(2)?;
+    check_production_calls("883/3")
 }
 
-// WORK_UNIT_CASE: 883/4
+// WORK_UNIT_CASE: 883/4 — live 4 (every package-test call accounted for).
+// Fixture sweep stays supplemental.
 #[test]
 fn clone_contract_04_snapshot_value_projection() -> TestResult {
-    run_single(3)
+    run_single(3)?;
+    check_package_test_calls("883/4")
 }
 
-// WORK_UNIT_CASE: 883/5
+// WORK_UNIT_CASE: 883/5 — live 5 (trait/generic Clone requirements
+// accounted for). Fixture sweep stays supplemental.
 #[test]
 fn clone_contract_05_construction_equality() -> TestResult {
-    run_single(4)
+    run_single(4)?;
+    check_clone_bounds("883/5")
 }
 
-// WORK_UNIT_CASE: 883/6
+// WORK_UNIT_CASE: 883/6 — live 6 (historical independent-copy fixture;
+// current construction-plus-snapshot preserves independence).
 #[test]
 fn clone_contract_06_isolation_and_historical_copy() -> TestResult {
     run_single(5)
 }
 
-// WORK_UNIT_CASE: 883/7
+// WORK_UNIT_CASE: 883/7 — live 7 (state-field and cost denominator,
+// explicit, no measured cost claims). Fixture sweep stays supplemental.
 #[test]
 fn clone_contract_07_isolation_right_to_left() -> TestResult {
-    run_single(6)
+    run_single(6)?;
+    check_state_field_denominator("883/7")
 }
 
-// WORK_UNIT_CASE: 883/8
+// WORK_UNIT_CASE: 883/8 — live 8 (historical poison fixture; removal
+// boundary has no silent poisoned copy). Fixture sweep stays supplemental.
 #[test]
 fn clone_contract_08_divergence_detection() -> TestResult {
-    run_single(7)
+    run_single(7)?;
+    check_historical_poison("883/8")
 }
 
-// WORK_UNIT_CASE: 883/9
+// WORK_UNIT_CASE: 883/9 — live 9 removal branch (public Clone absent; real
+// consumer construction-only and compiling via the recorded --no-run gate).
+// Fixture sweep stays supplemental.
 #[test]
 fn clone_contract_09_projection_and_field_denominator() -> TestResult {
-    run_single(8)
+    run_single(8)?;
+    check_removal_absence("883/9")
 }
 
-// WORK_UNIT_CASE: 883/10
+// WORK_UNIT_CASE: 883/10 — live 10 removal branch (neither Clone nor an
+// unjustified replacement fork, Arc, shared state, or global).
 #[test]
 fn clone_contract_10_default_ctor_equivalence() -> TestResult {
-    run_single(9)
+    run_single(9)?;
+    let source = lib_source()?;
+    check_absent_clone(&source, "883/10")?;
+    check_no_shared_state(&source, "883/10");
+    Ok(())
 }
 
-// WORK_UNIT_CASE: 883/11
+// WORK_UNIT_CASE: 883/11 — live 11 removal branch (snapshot behavior
+// retained and exercised without Clone). Typed-failure sweep stays
+// supplemental.
 #[test]
 fn clone_contract_11_poison_contract_and_history() -> TestResult {
-    run_single(10)
+    run_single(10)?;
+    check_snapshot_retained("883/11")
 }
 
-// WORK_UNIT_CASE: 883/12
+// WORK_UNIT_CASE: 883/12 — live 12 removal branch (bidirectional isolation
+// of independently constructed stores; no shared state introduced). Seeded
+// subject sweep stays supplemental.
 #[test]
 fn clone_contract_12_seeded_capture_subject() -> TestResult {
-    run_single(11)
+    run_single(11)?;
+    check_bidirectional_isolation("883/12")
 }
 
-// WORK_UNIT_CASE: 883/13
+// WORK_UNIT_CASE: 883/13 — live 13 removal branch (no clone/fork escape;
+// poison/error contract retained). Shared-state sweep stays supplemental.
 #[test]
 fn clone_contract_13_no_shared_state() -> TestResult {
-    run_single(12)
+    run_single(12)?;
+    let source = lib_source()?;
+    check_absent_clone(&source, "883/13")?;
+    check_typed_failure("883/13")
 }
 
-// WORK_UNIT_CASE: 883/14
+// WORK_UNIT_CASE: 883/14 — live 14 (diff guard: no Arc/shared global, no
+// fork, snapshot path named; file-scope binding recorded in delivery).
 #[test]
 fn clone_contract_14_doc_contract() -> TestResult {
-    run_single(13)
+    run_single(13)?;
+    let source = lib_source()?;
+    check_absent_clone(&source, "883/14")?;
+    check_no_shared_state(&source, "883/14");
+    Ok(())
 }
