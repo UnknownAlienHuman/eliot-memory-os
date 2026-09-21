@@ -2452,6 +2452,8 @@ dependencies = [
  "eliot-platform",
  "eliot-platform-windows",
  "eliot-process",
+ "eliot-wasm-runtime",
+ "serde_json",
  "sha2 0.10.9",
 ]
 
