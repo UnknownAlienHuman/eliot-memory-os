@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub mod first_run;
+pub mod quiet_hours;
 
 pub const CONTRACT_NAME: &str = "eliot.governor.config";
 pub const CONTRACT_VERSION: eliot_contracts::ContractVersion =
