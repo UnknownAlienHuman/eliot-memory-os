@@ -351,13 +351,18 @@ impl StartupCoordinator {
     /// First incomplete mandatory prerequisite in canonical order.
     #[must_use]
     pub const fn blocking_prerequisite(&self) -> Option<StartupPrerequisite> {
-        if !self.epoch_recovered {
+        // The named gates are only satisfied by the contiguous I1.11 cursor.
+        // A later owner observation may be retained in `observed_steps`, but it
+        // cannot make an earlier missing Host/kernel/blob/mirror/capability
+        // transition disappear. Checking the cursor before the gate flags is
+        // what keeps out-of-order evidence fail-closed.
+        if self.completed_step < 3 || !self.epoch_recovered {
             Some(StartupPrerequisite::EpochRecovery)
-        } else if !self.store_schema_probed {
+        } else if self.completed_step < 5 || !self.store_schema_probed {
             Some(StartupPrerequisite::StoreSchemaProbe)
-        } else if !self.ors_reconciled {
+        } else if self.completed_step < 6 || !self.ors_reconciled {
             Some(StartupPrerequisite::OrsReconciliation)
-        } else if !self.supervision_evidence_complete {
+        } else if self.completed_step < 11 || !self.supervision_evidence_complete {
             Some(StartupPrerequisite::SupervisionEvidence)
         } else {
             None
@@ -662,7 +667,7 @@ mod tests {
         assert_eq!(coordinator.completed_step(), 0);
         assert_eq!(
             coordinator.blocking_prerequisite(),
-            Some(StartupPrerequisite::StoreSchemaProbe)
+            Some(StartupPrerequisite::EpochRecovery)
         );
 
         coordinator
@@ -674,9 +679,46 @@ mod tests {
         assert_eq!(coordinator.completed_step(), 0);
         assert_eq!(
             coordinator.blocking_prerequisite(),
-            Some(StartupPrerequisite::OrsReconciliation)
+            Some(StartupPrerequisite::EpochRecovery)
         );
         assert!(!coordinator.admit_inspection());
+    }
+
+    #[test]
+    fn out_of_order_gate_evidence_cannot_bypass_the_contiguous_cursor() {
+        let mut coordinator = StartupCoordinator::new();
+        for step in [3, 5, 6, 8, 9, 10, 11] {
+            coordinator
+                .record_live_evidence(step)
+                .expect("in-range live evidence");
+        }
+
+        assert_eq!(coordinator.completed_step(), 0);
+        assert_eq!(
+            coordinator.blocking_prerequisite(),
+            Some(StartupPrerequisite::EpochRecovery)
+        );
+        assert!(coordinator.admit_normal_write().is_err());
+        assert!(!coordinator.admit_inspection());
+
+        coordinator
+            .record_live_evidence(1)
+            .expect("host validation evidence");
+        assert_eq!(coordinator.completed_step(), 1);
+        assert_eq!(
+            coordinator.blocking_prerequisite(),
+            Some(StartupPrerequisite::EpochRecovery)
+        );
+
+        coordinator
+            .record_live_evidence(2)
+            .expect("kernel start evidence");
+        assert_eq!(coordinator.completed_step(), 3);
+        assert_eq!(
+            coordinator.blocking_prerequisite(),
+            Some(StartupPrerequisite::StoreSchemaProbe)
+        );
+        assert!(coordinator.admit_normal_write().is_err());
     }
 
     #[test]

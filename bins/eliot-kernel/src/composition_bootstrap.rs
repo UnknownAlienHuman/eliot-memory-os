@@ -989,6 +989,15 @@ impl KernelComposition {
                 );
                 KernelBuildError::Ors(error)
             })?;
+        generation_gateway
+            .recover_cutover_ownership()
+            .map_err(|error| {
+                observe_entrypoint_with_detail(
+                    EntrypointStage::Composition,
+                    "kernel.composition.cutover_ownership_recovery_rejected",
+                );
+                KernelBuildError::Ors(error)
+            })?;
         startup_coordinator
             .record_live_evidence(3)
             .map_err(KernelBuildError::Service)?;
