@@ -120,43 +120,19 @@ fn validate_id(id: &str, field: &'static str) -> Result<(), ObservabilityError> 
     text(id, field)
 }
 
-fn validate_labels(labels: &BTreeMap<String, String>) -> Result<(), ObservabilityError> {
-    if labels.len() > 16 {
-        return Err(ObservabilityError::InvalidField {
-            field: "labels",
-            reason: "label cardinality exceeds the bounded limit",
-        });
-    }
-    for (key, value) in labels {
-        text(key, "label.key")?;
-        text(value, "label.value")?;
-        let normalized = key.to_ascii_lowercase();
-        if [
-            "secret",
-            "token",
-            "password",
-            "credential",
-            "prompt",
-            "content",
-            "stdout",
-            "stderr",
-            "arguments",
-            "args",
-            "raw",
-            "payload",
-        ]
-        .iter()
-        .any(|forbidden| normalized.contains(forbidden))
-        {
-            return Err(ObservabilityError::SensitiveLabel);
-        }
-        // Content and secrets are replaced with immutable redacted evidence
-        // handles before span labels or metrics; a raw value here is rejected.
-        if field_policy::requires_evidence_handle(value) {
-            return Err(ObservabilityError::SensitiveLabel);
-        }
-    }
-    Ok(())
+/// Validates labels for one telemetry family on the real emission path.
+///
+/// Operational events validate as [`field_policy::TelemetryFieldFamily::OperationalLog`]
+/// and metric samples as [`field_policy::TelemetryFieldFamily::MetricSample`],
+/// so the family [`field_policy::LabelDisposition`] is enforced wherever an
+/// event or metric is admitted. Content and secrets are replaced with
+/// immutable redacted evidence handles before span labels or metrics; a raw
+/// value here is rejected.
+fn validate_labels_for(
+    family: field_policy::TelemetryFieldFamily,
+    labels: &BTreeMap<String, String>,
+) -> Result<(), ObservabilityError> {
+    field_policy::validate_labels_for_family(family, labels)
 }
 
 /// Correlated lineage carried by every operational event and run telemetry.
@@ -352,7 +328,10 @@ impl OperationalEvent {
         validate_id(&self.event_id, "event.event_id")?;
         self.trace.validate()?;
         validate_clock(&self.observed_at, "event.observed_at")?;
-        validate_labels(&self.labels)?;
+        validate_labels_for(
+            field_policy::TelemetryFieldFamily::OperationalLog,
+            &self.labels,
+        )?;
         unique(self.raw_evidence_refs.iter(), "event.raw_evidence_refs")?;
         unique(
             self.normalized_evidence_refs.iter(),
@@ -424,7 +403,10 @@ impl MetricSample {
         if let Some(trace) = &self.trace {
             trace.validate()?;
         }
-        validate_labels(&self.labels)
+        validate_labels_for(
+            field_policy::TelemetryFieldFamily::MetricSample,
+            &self.labels,
+        )
     }
 
     /// Stable content hash used for idempotent metric admission.

@@ -8,9 +8,11 @@
 //!
 //! Content and secrets never reach span labels or metric labels: they are
 //! replaced with immutable redacted evidence handles by
-//! [`scrub_labels_for_emit`] before emission. [`kernel_emit_gate`] and
-//! [`daemon_emit_gate`] are the enforcement points called by `bins/eliot-kernel`
-//! and `bins/eliotd` respectively.
+//! [`scrub_labels_for_emit`] before emission. [`scrub_labels_for_emit`] is the
+//! single emission boundary; it enforces each family's [`LabelDisposition`]
+//! (Handle-only families emit handles only, Forbidden families emit nothing).
+//! [`validate_labels_for_family`] enforces the same disposition on the
+//! validation path used by operational events and metric samples.
 
 use std::collections::BTreeMap;
 
@@ -99,6 +101,37 @@ pub enum LabelDisposition {
     HandleOnly,
     /// Never emitted outside its owning store.
     Forbidden,
+}
+
+impl LabelDisposition {
+    /// Returns the disposition governing one telemetry family.
+    ///
+    /// This matches the `label_disposition` recorded in
+    /// [`field_policy_inventory`](crate::field_policy::field_policy_inventory);
+    /// the inventory test below pins the two together.
+    #[must_use]
+    pub const fn for_family(family: TelemetryFieldFamily) -> Self {
+        match family {
+            TelemetryFieldFamily::TaskId
+            | TelemetryFieldFamily::TraceId
+            | TelemetryFieldFamily::RouteFingerprint
+            | TelemetryFieldFamily::Lease
+            | TelemetryFieldFamily::OperationalLog
+            | TelemetryFieldFamily::MetricSample => Self::Allowed,
+            TelemetryFieldFamily::QueryMetadata
+            | TelemetryFieldFamily::Principal
+            | TelemetryFieldFamily::Session
+            | TelemetryFieldFamily::IoHandle
+            | TelemetryFieldFamily::CrashReport => Self::HandleOnly,
+            TelemetryFieldFamily::AuditReceipt => Self::Forbidden,
+        }
+    }
+}
+
+/// Returns the [`LabelDisposition`] governing one telemetry family.
+#[must_use]
+pub const fn disposition_for(family: TelemetryFieldFamily) -> LabelDisposition {
+    LabelDisposition::for_family(family)
 }
 
 /// Minimum collection scope and sampling for one family.
@@ -259,6 +292,7 @@ pub enum RedactionReason {
     Secret,
     Content,
     ForbiddenKey,
+    HandleOnly,
 }
 
 impl RedactionReason {
@@ -268,7 +302,19 @@ impl RedactionReason {
             Self::Secret => "redacted:secret",
             Self::Content => "redacted:content",
             Self::ForbiddenKey => "redacted:forbidden-key",
+            Self::HandleOnly => "redacted:handle-only",
         }
+    }
+
+    /// Every recorded redaction status.
+    #[must_use]
+    pub const fn all_statuses() -> [&'static str; 4] {
+        [
+            Self::Secret.as_str(),
+            Self::Content.as_str(),
+            Self::ForbiddenKey.as_str(),
+            Self::HandleOnly.as_str(),
+        ]
     }
 }
 
@@ -329,6 +375,36 @@ fn forbidden_key(key: &str) -> bool {
         .any(|fragment| normalized.contains(fragment))
 }
 
+/// Returns `true` when `value` is a structurally valid evidence handle bound
+/// to `family` (`evh:<family>:<64 lowercase hex>`).
+#[must_use]
+pub fn is_handle_value_for_family(value: &str, family: TelemetryFieldFamily) -> bool {
+    let Some(suffix) = value.strip_prefix(REDACTED_HANDLE_PREFIX) else {
+        return false;
+    };
+    let Some(suffix) = suffix.strip_prefix(':') else {
+        return false;
+    };
+    let Some(hex) = suffix.strip_prefix(family.as_str()) else {
+        return false;
+    };
+    let Some(hex) = hex.strip_prefix(':') else {
+        return false;
+    };
+    hex.len() == 64
+        && hex
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn redaction_status_valid(status: &str) -> bool {
+    RedactionReason::all_statuses().contains(&status)
+}
+
+fn label_text_ok(value: &str) -> bool {
+    !value.trim().is_empty() && !value.chars().any(char::is_control)
+}
+
 /// Labels safe for emission plus the recorded evidence handles.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -338,19 +414,127 @@ pub struct ScrubbedLabels {
 }
 
 impl ScrubbedLabels {
-    /// Returns `true` when no raw secret or content survived in a label value.
+    /// Returns `true` when the scrubbed output is safe to emit for `family`.
+    ///
+    /// This verifies every audit property: forbidden keys are gone from the
+    /// emitted key set, no secret or content value survived, Handle-only
+    /// families carry handles exclusively, Forbidden families emit nothing,
+    /// every handle is a structurally valid `evh` identity bound to `family`
+    /// and present among the emitted values, and every emitted key is safe.
     #[must_use]
-    pub fn is_clean(&self) -> bool {
-        self.labels
-            .values()
-            .all(|value| !requires_evidence_handle(value))
+    pub fn is_clean(&self, family: TelemetryFieldFamily) -> bool {
+        match disposition_for(family) {
+            LabelDisposition::Forbidden => self.labels.is_empty() && self.handles.is_empty(),
+            LabelDisposition::HandleOnly => {
+                if self.labels.len() != self.handles.len() || self.labels.len() > 16 {
+                    return false;
+                }
+                for (key, value) in &self.labels {
+                    if !label_text_ok(key)
+                        || !label_text_ok(value)
+                        || forbidden_key(key)
+                        || requires_evidence_handle(value)
+                        || !is_handle_value_for_family(value, family)
+                    {
+                        return false;
+                    }
+                }
+                self.handles_valid(family)
+            }
+            LabelDisposition::Allowed => {
+                if self.labels.len() > 16 {
+                    return false;
+                }
+                for (key, value) in &self.labels {
+                    if !label_text_ok(key)
+                        || !label_text_ok(value)
+                        || forbidden_key(key)
+                        || requires_evidence_handle(value)
+                    {
+                        return false;
+                    }
+                }
+                self.handles_valid(family)
+            }
+        }
     }
+
+    /// Checks every recorded handle is bound to `family` and emitted.
+    fn handles_valid(&self, family: TelemetryFieldFamily) -> bool {
+        for handle in &self.handles {
+            if handle.family != family
+                || !label_text_ok(&handle.source_key)
+                || !redaction_status_valid(&handle.redaction_status)
+                || !is_handle_value_for_family(&handle.handle, family)
+                || !self.labels.values().any(|value| value == &handle.handle)
+            {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Validates candidate labels for one family before emission.
+///
+/// This is the validation half of the emission boundary: it enforces the
+/// family's [`LabelDisposition`] in addition to the shared secret, content and
+/// forbidden-key screening. Handle-only families accept evidence handles bound
+/// to that family exclusively; Forbidden families accept no labels at all.
+pub fn validate_labels_for_family(
+    family: TelemetryFieldFamily,
+    labels: &BTreeMap<String, String>,
+) -> Result<(), ObservabilityError> {
+    if labels.len() > 16 {
+        return Err(ObservabilityError::InvalidField {
+            field: "labels",
+            reason: "label cardinality exceeds the bounded limit",
+        });
+    }
+    match disposition_for(family) {
+        LabelDisposition::Forbidden => {
+            if labels.is_empty() {
+                return Ok(());
+            }
+            return Err(ObservabilityError::SensitiveLabel);
+        }
+        LabelDisposition::HandleOnly => {
+            for (key, value) in labels {
+                policy_text(key, "label.key")?;
+                policy_text(value, "label.value")?;
+                if forbidden_key(key)
+                    || requires_evidence_handle(value)
+                    || !is_handle_value_for_family(value, family)
+                {
+                    return Err(ObservabilityError::SensitiveLabel);
+                }
+            }
+            return Ok(());
+        }
+        LabelDisposition::Allowed => {}
+    }
+    for (key, value) in labels {
+        policy_text(key, "label.key")?;
+        policy_text(value, "label.value")?;
+        if forbidden_key(key) {
+            return Err(ObservabilityError::SensitiveLabel);
+        }
+        if requires_evidence_handle(value) {
+            return Err(ObservabilityError::SensitiveLabel);
+        }
+    }
+    Ok(())
 }
 
 /// Replaces content and secrets with immutable handles before label emission.
 ///
-/// Forbidden keys are renamed to `redacted_evidence_<n>` so no sensitive shape
-/// survives in the emitted key set; the original key is recorded on the handle.
+/// This is the single emission boundary. It enforces each family's
+/// [`LabelDisposition`]: Forbidden families emit nothing, Handle-only
+/// families emit evidence handles exclusively (benign values included), and
+/// Allowed families emit opaque identifiers subject to secret/content
+/// screening. Forbidden keys are renamed to `redacted_evidence_<n>` so no
+/// sensitive shape survives in the emitted key set; the original key is
+/// recorded on the handle.
 #[must_use]
 pub fn scrub_labels_for_emit(
     family: TelemetryFieldFamily,
@@ -360,6 +544,10 @@ pub fn scrub_labels_for_emit(
         labels: BTreeMap::new(),
         handles: Vec::new(),
     };
+    if disposition_for(family) == LabelDisposition::Forbidden {
+        return scrubbed;
+    }
+    let handle_only = disposition_for(family) == LabelDisposition::HandleOnly;
     let mut redacted_count = 0_usize;
     for (key, value) in candidate {
         if forbidden_key(key) {
@@ -369,6 +557,10 @@ pub fn scrub_labels_for_emit(
                 handle.handle.clone(),
             );
             redacted_count += 1;
+            scrubbed.handles.push(handle);
+        } else if handle_only {
+            let handle = mint_handle(family, key, value, RedactionReason::HandleOnly);
+            scrubbed.labels.insert(key.clone(), handle.handle.clone());
             scrubbed.handles.push(handle);
         } else if looks_like_secret(value) {
             let handle = mint_handle(family, key, value, RedactionReason::Secret);
@@ -383,24 +575,6 @@ pub fn scrub_labels_for_emit(
         }
     }
     scrubbed
-}
-
-/// Enforcement point for span/metric emission in `bins/eliot-kernel`.
-#[must_use]
-pub fn kernel_emit_gate(
-    family: TelemetryFieldFamily,
-    candidate: &BTreeMap<String, String>,
-) -> ScrubbedLabels {
-    scrub_labels_for_emit(family, candidate)
-}
-
-/// Enforcement point for span/metric emission in `bins/eliotd`.
-#[must_use]
-pub fn daemon_emit_gate(
-    family: TelemetryFieldFamily,
-    candidate: &BTreeMap<String, String>,
-) -> ScrubbedLabels {
-    scrub_labels_for_emit(family, candidate)
 }
 
 fn base_scope(scope: &str, sampling: &str) -> ScopeSampling {
