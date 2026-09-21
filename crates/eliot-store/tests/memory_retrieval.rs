@@ -1,6 +1,6 @@
 use eliot_store::{BlobStore, CanonicalStore};
 use eliot_types::{
-    AgentId, BlobStoreConfig, ClaimCardInput, ClaimId, CueBinding, CueKind, CueMatchMode,
+    AgentId, BlobStoreConfig, ClaimCardInput, ClaimId, CueBinding, LegacyCueKindV1, CueMatchMode,
     CueStrength, EpistemicStatus, EvidenceAtomInput, EvidenceId, FailureFingerprintInput,
     FetchAtomsL2Request, GovernorConfig, IdempotencyOptions, LifecycleStatus,
     LifecycleWriteOptions, MemoryConfidence, MemoryWriteEnvelope, OperationId, ProjectId,
@@ -136,7 +136,7 @@ async fn canonical_capacity_parent_and_tail_segment_are_reachable_through_normal
         "text/plain; charset=utf-8",
         &payload,
         vec![CueBinding {
-            cue_kind: CueKind::Concept,
+            cue_kind: LegacyCueKindV1::Concept,
             cue_value: "capacity-l2-tail".to_owned(),
             match_mode: CueMatchMode::Exact,
             strength: CueStrength::Primary,

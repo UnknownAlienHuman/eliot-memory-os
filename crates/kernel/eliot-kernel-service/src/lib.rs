@@ -29,11 +29,17 @@ mod doctor;
 mod doctor_front_door;
 mod host_request_binding;
 mod lifecycle;
+mod lifecycle_persist;
+#[cfg(test)]
+mod lifecycle_persist_tests;
 mod notification_state;
 #[cfg(test)]
 mod notification_state_tests;
 mod process_execution_client;
 mod protocol;
+mod reactive_state;
+#[cfg(test)]
+mod reactive_state_tests;
 mod store_client;
 #[cfg(windows)]
 mod store_gateway;
@@ -41,6 +47,14 @@ mod store_write_reservation;
 #[cfg(test)]
 mod store_write_reservation_tests;
 mod testd_front_door;
+mod user_automation;
+mod user_automation_execution;
+mod user_automation_failure_history;
+#[cfg(test)]
+mod user_automation_failure_history_tests;
+mod user_automation_store;
+#[cfg(test)]
+mod user_automation_store_tests;
 mod write_coordinator;
 
 pub use capacity_evidence::{
@@ -73,6 +87,12 @@ pub use eliot_protocol::{
 pub use host_request_binding::{AuthenticatedHostSession, KernelHostRequestBinder};
 pub use lifecycle::{
     AdmissionLease, KernelService, KernelServiceError, KernelServiceState, ServiceFailure,
+};
+pub use lifecycle_persist::{
+    AuthenticatedLifecycleSession, BuiltLeg, BuiltLegKind, HopMutation, HopMutationInput,
+    LifecyclePersistError, LifecyclePersistRequest, LifecyclePersistResponse,
+    LifecycleServiceContext, LinkAuditBinding, PersistedHop, PersistedMutation,
+    build_persist_transitions, handle_lifecycle_persist_request,
 };
 pub use notification_state::{
     AuthenticatedNotificationSession, NotificationMetrics, NotificationServiceContext,
@@ -123,6 +143,13 @@ pub use protocol::{
     decode_control_response_frame,
     replay_stream_id, semantic_store_config_hash_from_json, verify_provider_capability,
 };
+pub use reactive_state::{
+    AuthenticatedReactiveSession, ReactiveLedgerReadRequest, ReactiveLedgerReadResponse,
+    ReactiveLedgerRequest, ReactiveLedgerResponse, ReactiveServiceContext, ReactiveServiceError,
+    ResourceSnapshotReadRequest, ResourceSnapshotReadResponse, ResourceSnapshotRequest,
+    ResourceSnapshotResponse, handle_reactive_ledger_read, handle_reactive_ledger_request,
+    handle_resource_snapshot_read, handle_resource_snapshot_request, reconcile_reactive_state,
+};
 pub use store_client::{
     EbpCanonicalStoreClient, EbpStoreTransport, StoreClientError, StoreClientFault,
     StoreClientFaultHarness,
@@ -148,6 +175,24 @@ pub use testd_front_door::{
     handle_testd_admission_attempt, handle_testd_cancellation, is_testd_diagnosis_only_envelope,
     reconcile_testd_admission, reconcile_testd_delivery, route_testd_admission,
 };
+pub use user_automation::{
+    USER_AUTOMATION_SERVICE_CONTRACT_NAME, USER_AUTOMATION_SERVICE_CONTRACT_VERSION,
+    UserAutomationMutationResult, UserAutomationReadResult, UserAutomationService,
+    UserAutomationServiceError, UserAutomationServiceRequest, UserAutomationStoreOutcome,
+    UserAutomationStorePort, UserAutomationStoreRequest, UserAutomationStoreResponse,
+};
+pub use user_automation_execution::{
+    UserAutomationDurableJobPort, UserAutomationExecutionError, UserAutomationExecutionOutcome,
+    UserAutomationExecutionRequest, UserAutomationFailureHistory,
+    UserAutomationFailureHistoryPort, UserAutomationFailurePublication, UserAutomationFailureRecord,
+    UserAutomationNotificationDelivery, UserAutomationNotificationPort, UserAutomationRemovalResult,
+    UserAutomationRuntimeAdmission, UserAutomationRuntimeComposition, UserAutomationRuntimeError,
+    UserAutomationRuntimePort, UserAutomationWakeCancellation, UserAutomationWakePort,
+};
+pub use user_automation_failure_history::{
+    StoreUserAutomationFailureHistory, build_failure_transition,
+};
+pub use user_automation_store::CanonicalUserAutomationStore;
 pub use write_coordinator::{
     CoordinatorError, ScopeExecutionGuard, WriteCoordinator, WriteCoordinatorConfig,
     default_executor_lanes,

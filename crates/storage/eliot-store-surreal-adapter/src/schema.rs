@@ -37,6 +37,39 @@ pub(crate) mod table {
     /// through the in-transaction revision compare-and-set; retries
     /// recompute from fresh rows, never from stale reads.
     pub(crate) const NOTIFICATION_RECORD: &str = "notification_record";
+    /// Durable reactive-session row per session (issue #1941 C4). One row
+    /// per `session_id` carrying the verbatim bridge ledger snapshot, the
+    /// owner revision, the admission fence, and task-binding provenance.
+    /// Concurrent writers arbitrate through the in-transaction revision
+    /// compare-and-set; retries recompute from fresh rows.
+    pub(crate) const REACTIVE_SESSION: &str = "reactive_session";
+    /// Immutable resource-snapshot row per canonical URI (issue #1941 C4).
+    /// One row per `uri` carrying the content digest, the verbatim base64
+    /// bytes, the owner revision, and the admission fence. Rewrites with
+    /// different bytes fail closed; create races converge through retry.
+    pub(crate) const RESOURCE_SNAPSHOT: &str = "resource_snapshot";
+    /// Immutable automation revision row per automation + revision
+    /// (issue #1779). One row per joined `(automation_id, revision)` key
+    /// carrying the verbatim Kernel-owned revision document. Create-only;
+    /// divergent rewrites fail closed.
+    pub(crate) const AUTOMATION_REVISION: &str = "automation_revision";
+    /// Current automation pointer per automation (issue #1779). One row
+    /// per `automation_id` carrying the current revision plus the closed
+    /// admission state. Compare-and-set on the observed revision.
+    pub(crate) const AUTOMATION_CURRENT: &str = "automation_current";
+    /// Automation invocation row per stable occurrence (issue #1779). One
+    /// row per `occurrence_id` carrying the verbatim invocation document.
+    /// Create-only; divergent rewrites fail closed.
+    pub(crate) const AUTOMATION_INVOCATION: &str = "automation_invocation";
+    /// Immutable automation failure row per automation + revision +
+    /// fingerprint (issue #1779). One row per canonical failure key
+    /// carrying the verbatim failure document with first-writer
+    /// provenance. Create-or-converge; divergent rewrites fail closed.
+    pub(crate) const AUTOMATION_FAILURE: &str = "automation_failure";
+    /// Last automation failure pointer per automation (issue #1779). One
+    /// row per `automation_id` naming the most recently committed
+    /// failure key. Last write wins; no compare-and-set.
+    pub(crate) const AUTOMATION_LAST_FAILURE: &str = "automation_last_failure";
 }
 
 /// Record key of the single canonical fence/sequence row.
@@ -176,6 +209,74 @@ DEFINE FIELD history ON notification_record TYPE array;
 DEFINE FIELD revision ON notification_record TYPE int;
 DEFINE FIELD state_fence ON notification_record TYPE object;
 DEFINE INDEX notify_dedup ON notification_record FIELDS dedup_key UNIQUE;
+";
+
+/// Reactive session + resource snapshot tables (issue #1941 C4). Additive
+/// delta in the notification style: `reactive_session` carries one row
+/// per session with the verbatim ledger snapshot, the owner revision,
+/// the admission fence, and task-binding provenance; `resource_snapshot`
+/// carries one row per canonical URI with the content digest, the
+/// verbatim base64 bytes, the owner revision, and the admission fence.
+/// Applied explicitly where the owning slice proves it; never executed
+/// implicitly by the adapter.
+#[allow(dead_code)]
+pub(crate) const REACTIVE_TABLES_DDL: &str = r"
+DEFINE TABLE reactive_session SCHEMALESS;
+DEFINE FIELD session_id ON reactive_session TYPE string;
+DEFINE FIELD ledger_json ON reactive_session TYPE string;
+DEFINE FIELD revision ON reactive_session TYPE int;
+DEFINE FIELD state_fence ON reactive_session TYPE object;
+DEFINE FIELD scope_id ON reactive_session TYPE string;
+DEFINE FIELD task_id ON reactive_session TYPE option<string>;
+DEFINE INDEX reactive_session_id ON reactive_session FIELDS session_id UNIQUE;
+
+DEFINE TABLE resource_snapshot SCHEMALESS;
+DEFINE FIELD uri ON resource_snapshot TYPE string;
+DEFINE FIELD content_sha256 ON resource_snapshot TYPE string;
+DEFINE FIELD content_base64 ON resource_snapshot TYPE string;
+DEFINE FIELD revision ON resource_snapshot TYPE int;
+DEFINE FIELD state_fence ON resource_snapshot TYPE object;
+DEFINE FIELD scope_id ON resource_snapshot TYPE string;
+DEFINE FIELD task_id ON resource_snapshot TYPE option<string>;
+DEFINE INDEX snapshot_uri ON resource_snapshot FIELDS uri UNIQUE;
+";
+
+/// Automation revision, pointer, and invocation tables (issue #1779).
+/// Additive delta in the notification style: `automation_revision`
+/// carries one immutable row per joined automation/revision key with the
+/// verbatim revision document; `automation_current` carries one
+/// compare-and-set pointer per automation with the current revision and
+/// the closed admission state; `automation_invocation` carries one
+/// create-only row per occurrence identity with the verbatim invocation
+/// document. Applied explicitly where the owning slice proves it; never
+/// executed implicitly by the adapter.
+#[allow(dead_code)]
+pub(crate) const AUTOMATION_TABLES_DDL: &str = r"
+DEFINE TABLE automation_revision SCHEMALESS;
+DEFINE FIELD automation_id ON automation_revision TYPE string;
+DEFINE FIELD revision ON automation_revision TYPE string;
+DEFINE FIELD revision_json ON automation_revision TYPE string;
+DEFINE FIELD state_fence ON automation_revision TYPE object;
+DEFINE FIELD scope_id ON automation_revision TYPE string;
+DEFINE FIELD task_id ON automation_revision TYPE option<string>;
+
+DEFINE TABLE automation_current SCHEMALESS;
+DEFINE FIELD automation_id ON automation_current TYPE string;
+DEFINE FIELD revision ON automation_current TYPE string;
+DEFINE FIELD configuration_state ON automation_current TYPE string;
+DEFINE FIELD state_fence ON automation_current TYPE object;
+DEFINE FIELD scope_id ON automation_current TYPE string;
+DEFINE FIELD task_id ON automation_current TYPE option<string>;
+DEFINE INDEX automation_pointer ON automation_current FIELDS automation_id UNIQUE;
+
+DEFINE TABLE automation_invocation SCHEMALESS;
+DEFINE FIELD occurrence_id ON automation_invocation TYPE string;
+DEFINE FIELD automation_id ON automation_invocation TYPE string;
+DEFINE FIELD invocation_json ON automation_invocation TYPE string;
+DEFINE FIELD state_fence ON automation_invocation TYPE object;
+DEFINE FIELD scope_id ON automation_invocation TYPE string;
+DEFINE FIELD task_id ON automation_invocation TYPE option<string>;
+DEFINE INDEX invocation_occurrence ON automation_invocation FIELDS occurrence_id UNIQUE;
 ";
 
 pub(crate) const SCHEMA_DDL_V2: &str = r"

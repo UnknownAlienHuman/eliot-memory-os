@@ -637,11 +637,18 @@ name = "eliot-agent-bridge"
 version = "0.1.0"
 dependencies = [
  "eliot-agent-bridge-core",
+ "eliot-agent-contracts",
+ "eliot-context-contracts",
  "eliot-contracts",
+ "eliot-cue-contracts",
+ "eliot-evidence",
+ "eliot-governor",
+ "eliot-integration-coverage",
  "eliot-ipc",
  "eliot-mcp",
  "eliot-platform-windows",
  "eliot-protocol",
+ "eliot-reactive-context-plan",
  "eliot-receipts",
  "eliot-runtime",
  "eliot-runtime-contracts",
@@ -659,6 +666,7 @@ dependencies = [
  "eliot-observation-contracts",
  "eliot-process",
  "eliot-protocol",
+ "eliot-receipts",
  "eliot-skill",
  "eliot-types",
  "serde",
@@ -908,6 +916,7 @@ dependencies = [
  "eliot-bootstrap",
  "eliot-contracts",
  "eliot-ipc",
+ "eliot-kernel-core",
  "eliot-mcp",
  "eliot-observation-contracts",
  "eliot-platform-windows",
@@ -1724,7 +1733,9 @@ dependencies = [
  "eliot-epistemic-contracts",
  "eliot-evidence",
  "eliot-finish",
+ "eliot-integration-coverage",
  "eliot-maintenance",
+ "eliot-mcp",
  "eliot-module-registry",
  "eliot-observation",
  "eliot-observation-contracts",
@@ -1806,7 +1817,9 @@ dependencies = [
 name = "eliot-host-service"
 version = "0.1.0"
 dependencies = [
+ "eliot-agent-contracts",
  "eliot-contracts",
+ "eliot-host-state",
  "eliot-kernel-service",
  "eliot-platform",
  "eliot-platform-windows",
@@ -2035,12 +2048,15 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "eliot-authority",
+ "eliot-config",
  "eliot-contracts",
  "eliot-ors",
  "eliot-platform",
  "eliot-process",
+ "eliot-protocol",
  "eliot-receipts",
  "eliot-runtime-contracts",
+ "eliot-security-contracts",
  "schemars",
  "serde",
  "serde_json",
@@ -2052,11 +2068,16 @@ dependencies = [
 name = "eliot-kernel-service"
 version = "0.1.0"
 dependencies = [
+ "eliot-canonical",
  "eliot-contracts",
  "eliot-doctor-core",
+ "eliot-epistemic",
+ "eliot-epistemic-contracts",
+ "eliot-evidence",
  "eliot-ipc",
  "eliot-kernel-core",
  "eliot-mcp",
+ "eliot-memory-curation",
  "eliot-ors",
  "eliot-platform",
  "eliot-platform-windows",
@@ -2067,6 +2088,7 @@ dependencies = [
  "eliot-runtime-contracts",
  "eliot-security-contracts",
  "eliot-store-api",
+ "eliot-store-memory",
  "eliot-store-surreal-adapter",
  "schemars",
  "secrecy",
@@ -2192,9 +2214,11 @@ dependencies = [
 name = "eliot-mcp"
 version = "0.1.0"
 dependencies = [
+ "eliot-kernel-core",
  "eliot-protocol",
  "eliot-receipts",
  "eliot-security-contracts",
+ "eliot-skill",
  "eliot-source-assurance",
  "schemars",
  "serde",
@@ -2277,9 +2301,11 @@ dependencies = [
  "eliot-cli",
  "eliot-contracts",
  "eliot-kernel",
+ "eliot-kernel-core",
  "eliot-native-worker-core",
  "eliot-process",
  "eliot-process-executor",
+ "eliot-runtime-contracts",
  "serde",
  "serde_json",
  "thiserror",
@@ -2307,7 +2333,9 @@ version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
  "eliot-cli",
+ "eliot-config",
  "eliot-contracts",
+ "eliot-kernel-service",
  "eliot-notify-core",
  "eliot-platform",
  "eliot-platform-windows",
@@ -2322,11 +2350,13 @@ dependencies = [
 name = "eliot-notify-core"
 version = "0.1.0"
 dependencies = [
+ "eliot-config",
  "eliot-contracts",
  "eliot-kernel-core",
  "eliot-observation-contracts",
  "eliot-platform",
  "eliot-receipts",
+ "eliot-security-contracts",
  "schemars",
  "serde",
  "serde_json",
@@ -2714,6 +2744,7 @@ version = "0.1.0"
 dependencies = [
  "eliot-contracts",
  "eliot-protocol",
+ "eliot-receipts",
  "eliot-rules",
  "eliot-skills",
  "eliot-store-api",
@@ -2774,6 +2805,7 @@ dependencies = [
 name = "eliot-store-api"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "eliot-contracts",
  "eliot-epistemic-contracts",
  "eliot-evidence",
@@ -3094,6 +3126,7 @@ name = "eliotd"
 version = "0.1.0"
 dependencies = [
  "eliot-agent-api",
+ "eliot-agent-bridge-core",
  "eliot-agent-contracts",
  "eliot-agent-coordinator",
  "eliot-authority",
@@ -3109,11 +3142,13 @@ dependencies = [
  "eliot-evaluation-contracts",
  "eliot-governor",
  "eliot-ipc",
+ "eliot-kernel-core",
  "eliot-maintenance",
  "eliot-observability",
  "eliot-observation",
  "eliot-platform",
  "eliot-platform-windows",
+ "eliot-process",
  "eliot-protocol",
  "eliot-read",
  "eliot-receipts",

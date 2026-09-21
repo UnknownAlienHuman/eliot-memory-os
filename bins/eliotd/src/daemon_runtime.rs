@@ -253,6 +253,30 @@ pub(super) fn run() -> Result<(), String> {
     if let Some(facts) = kernel.owner_session_facts() {
         composition.note_owner_session_binding(facts);
     }
+    // #1780: attach canonical notification records where the concrete
+    // client and the composition meet (same site as the owner-session
+    // facts above). A cold/unbound read degrades to the empty inbox with
+    // an error record exactly like the skill-tool-source path below: it
+    // emits diagnostics and the daemon continues, never failing readiness
+    // for an unreadable inbox.
+    match eliotd::notification_board_attach::attach_notification_snapshot(&kernel, &mut composition)
+    {
+        eliotd::notification_board_attach::NotificationBoardAttach::Ready(records) => {
+            tracing::info!(
+                target: "eliotd::diagnostics",
+                event = "eliotd.notification_snapshot_attached",
+                record_count = records.len(),
+            );
+        }
+        eliotd::notification_board_attach::NotificationBoardAttach::Unavailable { reason } => {
+            let _ = eliotd::diagnostics::ErrorRecord::of(
+                eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                "notification-snapshot",
+                &reason,
+            )
+            .emit();
+        }
+    }
     // T12-06: gated Dreamer intake registration at the same attach site. The
     // readiness-gated accessor plus the fence-bound route-context check prove
     // the intake wiring before readiness is reported; no thread, no transport,
@@ -268,7 +292,63 @@ pub(super) fn run() -> Result<(), String> {
     // durable swarm-control composition before readiness is reported; no
     // thread, no transport, no start() contour or run-loop change.
     attach_agent_fabric(&composition)?;
+    // #1882: non-gating skill tool-source proof at the same attach site. The
+    // Governor hook builds the production canonical registry and pins the
+    // admitted definition version with no skill inputs consumed and nothing
+    // delivered (I1.5 starts only admitted capabilities). A hook failure
+    // degrades only the skill path: it emits an error record and the daemon
+    // continues, never failing readiness for an optional Module (A2.3).
+    match attach_skill_tool_source() {
+        Ok(admitted) => {
+            tracing::info!(
+                target: "eliotd::diagnostics",
+                event = "eliotd.skill_tool_source_attached",
+                admitted_definition_version = %admitted,
+            );
+        }
+        Err(reason) => {
+            let _ = eliotd::diagnostics::ErrorRecord::of(
+                eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                "skill-tool-source",
+                &reason,
+            )
+            .emit();
+        }
+    }
+    // #1882: non-gating startup reconciliation of installed Skill entries
+    // against the live canonical tool view. A fresh startup catalogue is
+    // empty, so this marks nothing today; the call binds the reconciliation
+    // path into the startup sequence and proves the live hook edge
+    // executes in the production binary. Once installs land, entries
+    // installed under an older registry whose tools left the canonical set
+    // are marked stale here, so a restart never revives a
+    // generally-delivered display for a removed tool without any display
+    // call reaching it. Skill delivery stays optional (A2.3):
+    // reconciliation failure degrades only the skill path, never daemon
+    // readiness. No thread, no transport, no `start()` contour or run-loop
+    // change.
+    match composition.skill_reconcile_tool_basis() {
+        Ok(marked) => {
+            tracing::info!(
+                target: "eliotd::diagnostics",
+                event = "eliotd.skill_tool_basis_reconciled",
+                marked_stale = marked,
+            );
+        }
+        Err(reason) => {
+            let _ = eliotd::diagnostics::ErrorRecord::of(
+                eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                "skill-tool-basis",
+                &reason.to_string(),
+            )
+            .emit();
+        }
+    }
     kernel.report_ready().map_err(|error| error.to_string())?;
+    // The local-read poller below drives Skill pairs through the composition
+    // inside its flight future: share it here so the future owns its handle.
+    // All pre-loop exclusive uses are complete; shutdown unwraps below.
+    let composition = Arc::new(composition);
     // I1.11 steps 8/9 (issue #1967): publish Governor startup evidence on
     // the authenticated daemon channel for the Kernel consumer. The producer
     // evaluates live retained records only — transport binding, admitted and
@@ -297,8 +377,13 @@ pub(super) fn run() -> Result<(), String> {
         .enable_all()
         .build()
         .map_err(|error| error.to_string())?;
-    let loop_result = runtime.block_on(run_loop(Arc::clone(&kernel), &composition));
-    let shutdown_result = composition.shutdown().map_err(|error| error.to_string());
+    let loop_result = runtime.block_on(run_loop(Arc::clone(&kernel), Arc::clone(&composition)));
+    // The loop dropped its handle on return, so this unwrap is deterministic;
+    // the error arm documents the invariant instead of panicking on it.
+    let shutdown_result = Arc::try_unwrap(composition)
+        .map_err(|_| "daemon composition still shared at shutdown".to_owned())?
+        .shutdown()
+        .map_err(|error| error.to_string());
     // #740: shutdown disposition record. The terminal-failure reports below
     // keep their exact existing behavior; this only names the disposition.
     let final_result = match (loop_result, shutdown_result) {
@@ -423,6 +508,27 @@ fn attach_agent_fabric(composition: &DaemonComposition) -> Result<(), String> {
     Ok(())
 }
 
+/// Proves the live canonical tool-source path before readiness (issue #1882,
+/// no lifecycle change).
+///
+/// Post-`start` attach-style check needing no composition handle: builds the
+/// production canonical tool source through the Governor hook
+/// (`eliot_governor::canonical_skill_tool_source`) and pins the admitted
+/// definition version the Skill delivery driver runs under. I1.5 starts only
+/// capabilities an admitted request requires, so nothing is installed,
+/// issued, or displayed here — this only proves the real tools-owner edge
+/// executes in the production binary and records which definition version
+/// the skill path is bound to. Skill delivery stays an optional capability
+/// (A2.3): a hook failure emits an error record and degrades only the skill
+/// path, never daemon readiness. No thread, no transport, no `start()`
+/// contour or run-loop change.
+fn attach_skill_tool_source() -> Result<String, String> {
+    let _span = tracing::info_span!("eliotd.skill_tool_source_attach").entered();
+    eliot_governor::canonical_skill_tool_source()
+        .map(|(_, admitted)| admitted)
+        .map_err(|error| format!("skill tool source unavailable: {error}"))
+}
+
 fn report_terminal_failure(kernel: &DaemonKernelClient, reason: String) -> String {
     // #740: owning error record at the terminal-failure boundary. The
     // degraded/fatal/status writes below keep their exact existing behavior.
@@ -525,7 +631,7 @@ impl LoopCadence {
 
 async fn run_loop(
     kernel: Arc<DaemonKernelClient>,
-    composition: &DaemonComposition,
+    composition: Arc<DaemonComposition>,
 ) -> Result<RunLoopExit, String> {
     let mut cadence = LoopCadence::production();
     // Sole owner of activation state. No second owner and no second
@@ -549,7 +655,7 @@ async fn run_loop(
                 // The local-read poller rides the same tick under its own
                 // gate: it must start even while an activation is in flight,
                 // so its gate is checked before the activation early-continue.
-                maybe_start_local_read_poll(&kernel, &mut local_read_flight);
+                maybe_start_local_read_poll(&kernel, &composition, &mut local_read_flight);
                 if decide_activation_tick(&flight) == ActivationTickDecision::StartClaim {
                     flight = ActivationFlight::InFlight(ActivationFlightState {
                         future: start_activation_claim(&kernel),
@@ -593,7 +699,7 @@ async fn run_loop(
                             ActivationClaim::Valid(ticket) => *ticket,
                         };
                         let now = unix_ms(SystemTime::now())?;
-                        match start_valid_claim_step(&kernel, composition, ticket, now)? {
+                        match start_valid_claim_step(&kernel, composition.as_ref(), ticket, now)? {
                             Some(state) => {
                                 flight = ActivationFlight::InFlight(state);
                             }
@@ -743,18 +849,25 @@ async fn drain_activation_on_shutdown(
 /// per tick; a null claim backs off until the next tick.
 fn start_local_read_poll(
     kernel: &Arc<DaemonKernelClient>,
+    composition: Arc<DaemonComposition>,
 ) -> Pin<Box<dyn std::future::Future<Output = LocalReadCompletion>>> {
     let kernel_clone = Arc::clone(kernel);
-    Box::pin(async move { LocalReadCompletion::Settled(run_local_read_poll(&kernel_clone).await) })
+    Box::pin(async move {
+        LocalReadCompletion::Settled(run_local_read_poll(&kernel_clone, composition).await)
+    })
 }
 
 /// Starts the local-read poll step when its flight is idle. Checked before
 /// the activation gate on every tick so the poller stays live while an
 /// activation is in flight.
-fn maybe_start_local_read_poll(kernel: &Arc<DaemonKernelClient>, flight: &mut LocalReadFlight) {
+fn maybe_start_local_read_poll(
+    kernel: &Arc<DaemonKernelClient>,
+    composition: &Arc<DaemonComposition>,
+    flight: &mut LocalReadFlight,
+) {
     if decide_local_read_tick(flight) == LocalReadTickDecision::StartPoll {
         *flight = LocalReadFlight::InFlight(LocalReadFlightState {
-            future: start_local_read_poll(kernel),
+            future: start_local_read_poll(kernel, Arc::clone(composition)),
         });
     }
 }
@@ -795,7 +908,10 @@ fn settle_local_read_completion(
 /// the daemon closed — a claimed pair that cannot forward or submit is never
 /// silently discarded. A stale capability is never retried: the step settles
 /// and the next tick claims the current generation anew.
-async fn run_local_read_poll(kernel: &DaemonKernelClient) -> Result<LocalReadPollOutcome, String> {
+async fn run_local_read_poll(
+    kernel: &DaemonKernelClient,
+    composition: Arc<DaemonComposition>,
+) -> Result<LocalReadPollOutcome, String> {
     // #740: receipt span over the claim/forward/submit poll step. Pair
     // presence and submit outcome are named; payload bytes never are.
     let _span = tracing::info_span!("eliotd.local_read_poll").entered();
@@ -806,6 +922,22 @@ async fn run_local_read_poll(kernel: &DaemonKernelClient) -> Result<LocalReadPol
     let Some((envelope, tool, attempt)) = pair else {
         return Ok(LocalReadPollOutcome::IdleBackoff);
     };
+    // #1882: Skill pairs serve locally through the composition Skill driver
+    // instead of forwarding on the Kernel `local_read` leg (which serves
+    // store reads only). Recognition is the shared Skill tool predicate over
+    // the pair's tool name; anything else keeps the existing forward path
+    // byte-identical. The served result body submits through the same
+    // idempotent leg below, so claimed skill pairs settle exactly like
+    // forwarded ones.
+    if eliotd::skill_dispatch::is_skill_tool(&tool) {
+        let body =
+            eliotd::skill_dispatch::serve_skill_pair(&composition, &envelope, &tool, &attempt);
+        return match submit_local_read_result_idempotent(kernel, &body).await? {
+            LocalReadSubmitOutcome::Accepted => Ok(LocalReadPollOutcome::Accepted),
+            LocalReadSubmitOutcome::Expired => Ok(LocalReadPollOutcome::Expired),
+            LocalReadSubmitOutcome::StaleAttempt => Ok(LocalReadPollOutcome::StaleAttempt),
+        };
+    }
     let body = forward_admitted_local_read(kernel, envelope, tool, attempt)
         .await
         .map_err(|error| format!("daemon local-read forward: {error}"))?;
@@ -1784,6 +1916,16 @@ mod tests {
             .expect("one second before Unix epoch must be representable");
         let error = unix_ms(observed).expect_err("pre-epoch clock must fail closed");
         assert!(error.contains("precedes Unix epoch"));
+    }
+
+    #[test]
+    fn skill_tool_source_attach_proves_the_live_registry_edge() {
+        // Real tools owner through the Governor hook, executed in the
+        // production binary target: the attach pins a non-blank admitted
+        // definition version with no skill inputs consumed and nothing
+        // delivered.
+        let admitted = attach_skill_tool_source().expect("live canonical tool source must attach");
+        assert!(!admitted.trim().is_empty());
     }
 
     #[test]

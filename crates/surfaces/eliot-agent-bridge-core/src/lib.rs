@@ -24,7 +24,8 @@ pub use eliot_process::{FencingToken, Generation};
 pub use eliot_protocol::{AckPhase, DeliveryClass, EventDisposition, EventEnvelope};
 use eliot_protocol::{EventAckReceipt, EventIdentityKey, ReplayLedger};
 use eliot_skill::{
-    DependencyVersion, LifecycleAction, SkillCandidate, SkillError, SkillLifecycleView, SkillScope,
+    ActivatedSkillDisplay, DependencyVersion, HotsetDeliveryAck, HotsetDeliveryReceipt,
+    LifecycleAction, SkillCandidate, SkillError, SkillLifecycleView, SkillScope,
 };
 use serde::{Deserialize, Deserializer, Serialize, de};
 use thiserror::Error;
@@ -33,6 +34,19 @@ mod resources;
 pub use resources::{
     DeliveryStatus, HotResourceView, MAX_CONTENT_BYTES, MAX_PREVIEW_BYTES, MAX_REGISTRY_ENTRIES,
     MAX_URI_BYTES, ResourceHandle, ResourceKind, ResourceRegistry, ResourceUri, ToolResultReceipt,
+};
+mod skill_transport;
+pub use skill_transport::{
+    MAX_CARRY_BYTES, MAX_INTAKE_BYTES, SKILL_DISPLAY_TOOL, SKILL_INJECT_TOOL,
+    SKILL_TRANSPORT_CONTRACT_ID, SKILL_TRANSPORT_VERSION, SkillAckPayload, SkillDisplayPayload,
+    SkillIntakePayload, SkillResultEnvelope, SkillResultOutcome, SkillToolKind,
+    SkillTransportError, skill_tool_kind,
+};
+mod route_tokens;
+pub use route_tokens::{
+    MAX_MEASUREMENT_WIRE_BYTES, RouteTokenObservation, RouteTokenizer,
+    TOKEN_MEASUREMENT_CONTRACT_ID, TOKEN_MEASUREMENT_VERSION, TokenMeasurementPayload,
+    UnmeasuredReason, produce_route_token_observation,
 };
 mod terminal_inputs;
 pub use terminal_inputs::{
@@ -1698,6 +1712,19 @@ pub trait SkillLifecyclePort {
         ctx: &'a RequestMetadata,
         request: ProposeSkillRequest,
     ) -> Pin<Box<dyn Future<Output = Result<SkillCandidate, SkillError>> + 'a>>;
+
+    /// Binds one receiver ack to its exact Hotset receipt and displays the
+    /// activated Skill at the admitted fence. The bridge carries the inert
+    /// receipt/ack pair and returns only the typed display; tool-authority
+    /// checks (admitted version, tool basis, provisional ceiling) stay with
+    /// the Governor owner behind the port.
+    fn display_skill<'a>(
+        &'a mut self,
+        ctx: &'a RequestMetadata,
+        skill_id: String,
+        receipt: HotsetDeliveryReceipt,
+        ack: HotsetDeliveryAck,
+    ) -> Pin<Box<dyn Future<Output = Result<ActivatedSkillDisplay, SkillError>> + 'a>>;
 }
 
 impl AgentBridgeCore {
@@ -1743,6 +1770,30 @@ impl AgentBridgeCore {
             .validate()
             .map_err(|error| BridgeError::ProviderContract(error.to_string()))?;
         Ok(candidate)
+    }
+
+    /// Binds one receiver ack to its exact Hotset receipt and displays the
+    /// activated Skill at the exact attached fence.
+    pub async fn display_skill_activation(
+        &mut self,
+        ctx: &RequestMetadata,
+        skill_id: &str,
+        receipt: HotsetDeliveryReceipt,
+        ack: HotsetDeliveryAck,
+    ) -> Result<ActivatedSkillDisplay, BridgeError> {
+        receipt.validate()?;
+        ack.validate()?;
+        ctx.validate()
+            .map_err(|error| BridgeError::ProviderContract(error.to_string()))?;
+        self.skill_authority_matches(ctx)?;
+        let display = self
+            .skill_port()?
+            .display_skill(ctx, skill_id.to_owned(), receipt, ack)
+            .await?;
+        display
+            .validate()
+            .map_err(|error| BridgeError::ProviderContract(error.to_string()))?;
+        Ok(display)
     }
 
     /// Fails closed unless the caller fence covers the exact attached
@@ -1820,6 +1871,38 @@ impl AgentBridgeCore {
         ))
     }
 
+    /// Projects one tool result into its delivery receipt from a live
+    /// measurement wire payload: the adapter's attested count passes through
+    /// byte-bound verification by [`produce_route_token_observation`] —
+    /// versioned wire, admission-linked matched route, exact delivered
+    /// bytes — before it may enter the receipt, unaltered. A missing
+    /// payload means the route supports no measurement and withholds with
+    /// [`BridgeError::UnmeasuredTokens`], as do unlinked, diverged,
+    /// unobserved, or misbound payloads; the bridge never estimates the
+    /// count. Delivery completeness stays the owner's observed state, as
+    /// with [`Self::project_tool_result`].
+    pub fn project_produced_tool_result(
+        &self,
+        result_bytes: &[u8],
+        source_handle: ResourceUri,
+        payload: Option<&TokenMeasurementPayload>,
+        admission: &eliot_agent_api::AdmittedRouteReceipt,
+        binding: &eliot_agent_api::ProviderExecutionBinding,
+        delivery: DeliveryStatus,
+    ) -> Result<ToolResultReceipt, BridgeError> {
+        self.require_attached()?;
+        let payload = payload.ok_or(BridgeError::UnmeasuredTokens {
+            reason: UnmeasuredReason::NoObservation,
+        })?;
+        let produced = produce_route_token_observation(result_bytes, payload, admission, binding)?;
+        Ok(ToolResultReceipt::project(
+            result_bytes,
+            source_handle,
+            produced.tokens(),
+            delivery,
+        ))
+    }
+
     /// Number of immutable snapshots retained in the attach-scoped resource
     /// projection. The registry is cleared on every new attach, so this
     /// count describes only the live attach.
@@ -1892,6 +1975,8 @@ pub enum BridgeError {
     ResourceTooLarge { bytes: usize, capacity: usize },
     #[error("incomplete tool-result delivery {delivery:?} cannot satisfy complete evidence")]
     IncompleteDelivery { delivery: DeliveryStatus },
+    #[error("tool-result token cost is unmeasured: {reason}")]
+    UnmeasuredTokens { reason: UnmeasuredReason },
     #[error(transparent)]
     Skill(#[from] SkillError),
 }

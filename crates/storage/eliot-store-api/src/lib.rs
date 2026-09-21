@@ -35,7 +35,9 @@ pub mod epistemic_revision;
 pub mod erasure_admission;
 mod notification_state;
 mod payload_authority;
+mod reactive_state;
 mod request_hash;
+mod user_automation_state;
 mod store_failure;
 mod wire;
 pub mod write_admission;
@@ -68,6 +70,50 @@ pub use payload_authority::{
     CONTROL_FIELD_DENYLIST, CanonicalJson, ExactJsonBytes, MAX_EXACT_JSON_BYTES,
     PAYLOAD_AUTHORITY_VERSION, PayloadEncoding, PayloadSource, json_shape_name,
     number_token_would_narrow, reject_control_parameter_name,
+};
+
+pub use reactive_state::{
+    DecodedReactiveMutation, MAX_REACTIVE_LEDGER_BYTES, MAX_RESOURCE_CONTENT_BYTES,
+    MAX_RESOURCE_URI_BYTES, MAX_SESSION_ID_BYTES, REACTIVE_LEDGER_CONTRACT_V1,
+    REACTIVE_LEDGER_MUTATION_NAME, REACTIVE_LEDGER_READ_NAME, REACTIVE_PAGE_LEDGER_JSON,
+    REACTIVE_PAGE_REVISION, REACTIVE_PAGE_SESSION_ID, REACTIVE_PAGE_STATE_FENCE,
+    REACTIVE_PARAM_CONTENT_BASE64, REACTIVE_PARAM_CONTENT_SHA256, REACTIVE_PARAM_LEDGER_JSON,
+    REACTIVE_PARAM_SESSION_ID, REACTIVE_PARAM_URI, REACTIVE_STATE_SCHEMA_V1, REACTIVE_STATE_SCOPE,
+    RESOURCE_SNAPSHOT_MUTATION_NAME, RESOURCE_SNAPSHOT_READ_NAME, RESOURCE_URI_SCHEME,
+    ReactiveContractError, SNAPSHOT_PAGE_CONTENT_BASE64, SNAPSHOT_PAGE_CONTENT_SHA256,
+    SNAPSHOT_PAGE_REVISION, SNAPSHOT_PAGE_STATE_FENCE, SNAPSHOT_PAGE_URI, decode_reactive_mutation,
+    decode_resource_content, encode_resource_content, reactive_ledger_mutation_request,
+    reactive_ledger_read_request, resource_snapshot_mutation_request,
+    resource_snapshot_read_request, validate_ledger_json, validate_reactive_ledger_read_params,
+    validate_reactive_mutation_params, validate_resource_snapshot_read_params,
+    validate_resource_uri, validate_sha256_hex,
+};
+
+pub use user_automation_state::{
+    AUTOMATION_OPERATION_CREATE, AUTOMATION_OPERATION_EDIT, AUTOMATION_OPERATION_PAUSE,
+    AUTOMATION_OPERATION_REMOVE, AUTOMATION_OPERATION_RESUME, AUTOMATION_OPERATION_RUN_NOW,
+    AUTOMATION_PAGE_CURRENT, AUTOMATION_PAGE_CURRENTS, AUTOMATION_PAGE_FAILURE,
+    AUTOMATION_PAGE_INVOCATIONS, AUTOMATION_PAGE_REVISION, AUTOMATION_PAGE_REVISIONS,
+    AUTOMATION_PAGE_STATE_FENCE, AUTOMATION_PARAM_AUTOMATION_ID,
+    AUTOMATION_PARAM_CONFIGURATION_STATE, AUTOMATION_PARAM_FAILURE_JSON,
+    AUTOMATION_PARAM_INCLUDE_RETIRED,
+    AUTOMATION_PARAM_INVOCATION_JSON, AUTOMATION_PARAM_MAX_RECORDS, AUTOMATION_PARAM_OCCURRENCE_ID,
+    AUTOMATION_PARAM_OPERATION, AUTOMATION_PARAM_PREVIOUS_REVISION, AUTOMATION_PARAM_QUERY,
+    AUTOMATION_PARAM_REVISION, AUTOMATION_PARAM_REVISION_JSON, AUTOMATION_OPERATION_FAILURE,
+    AUTOMATION_QUERY_CURRENT,
+    AUTOMATION_QUERY_FAILURE, AUTOMATION_QUERY_HISTORY, AUTOMATION_QUERY_INVOCATIONS,
+    AUTOMATION_QUERY_LIST, AUTOMATION_STATE_ACTIVE, AUTOMATION_STATE_BLOCKED_CONFIG,
+    AUTOMATION_STATE_PAUSED, AUTOMATION_STATE_RETIRED, AutomationContractError,
+    AutomationFailureDocument,
+    DecodedAutomationMutation, DecodedAutomationRead, MAX_AUTOMATION_DOC_BYTES,
+    MAX_AUTOMATION_ID_BYTES, MAX_AUTOMATION_PAGE_RECORDS, MAX_AUTOMATION_REVISION_ID_BYTES,
+    USER_AUTOMATION_MUTATION_NAME, USER_AUTOMATION_READ_NAME, USER_AUTOMATION_SCOPE,
+    USER_AUTOMATION_STATE_SCHEMA_V1, automation_create_params, automation_edit_params,
+    automation_failure_history_ref, automation_failure_key, automation_failure_params,
+    automation_mutation_request, automation_read_request, automation_run_now_params,
+    automation_state_transition_params, decode_automation_mutation, is_configuration_state_wire,
+    parse_automation_failure_document, validate_automation_doc, validate_automation_failure_document,
+    validate_automation_mutation_params, validate_automation_read_params,
 };
 
 pub use request_hash::{
@@ -619,6 +665,31 @@ pub enum TransitionClass {
     /// closed notification typed parameters. The ceiling is the maximum
     /// store-allowed reversible effect; existing class maxima are unchanged.
     NotificationState,
+    /// Canonical reactive delivery-record + resource-snapshot persistence
+    /// (issue #1941 C4).
+    ///
+    /// Store-owned durable rows for the bridge's attach-scoped delivery
+    /// state: per-session ledger snapshots (opaque bridge bytes, upsert by
+    /// session, revision-guarded) and immutable revisioned resource
+    /// snapshots (upsert by URI, rewrite-with-different-bytes refused).
+    /// Applied only through the named reactive transactions carrying the
+    /// closed reactive typed parameters. The ceiling is the maximum
+    /// store-allowed reversible effect; existing class maxima are unchanged.
+    ReactiveState,
+    /// Canonical user-automation revision + admission-state persistence
+    /// (issue #1779).
+    ///
+    /// Store-owned durable rows for operator automations: immutable
+    /// revision rows (opaque Kernel-owned documents, create-only),
+    /// a compare-and-set current pointer per automation carrying the
+    /// closed admission state, and create-only invocation rows keyed by
+    /// stable occurrence identity. Applied only through the named
+    /// automation transaction carrying the closed automation typed
+    /// parameters. Lineage validity stays Kernel-owned; the store
+    /// arbitrates keys, pointers, and immutability. The ceiling is the
+    /// maximum store-allowed reversible effect; existing class maxima are
+    /// unchanged.
+    UserAutomation,
 }
 
 impl TransitionClass {
@@ -630,7 +701,9 @@ impl TransitionClass {
             | Self::LifecyclePolicy
             | Self::RecoverySchema
             | Self::Erasure
-            | Self::NotificationState => EffectClass::ReversibleMutation,
+            | Self::NotificationState
+            | Self::ReactiveState
+            | Self::UserAutomation => EffectClass::ReversibleMutation,
         }
     }
 }
@@ -685,6 +758,12 @@ pub enum NamedReadOperation {
     GetAuthorityRevocationHistory,
     /// Canonical notification-state read (issue #1780).
     GetNotificationState,
+    /// Canonical reactive-ledger read (issue #1941 C4).
+    GetReactiveInjectionState,
+    /// Canonical resource-snapshot read (issue #1941 C4).
+    GetResourceSnapshot,
+    /// Canonical user-automation read (issue #1779).
+    GetUserAutomationState,
 }
 
 /// Closed mutation catalogue activated by the current contract catalogue.
@@ -722,6 +801,34 @@ pub enum NamedMutationOperation {
     /// parameters. The store bridge applies only the recorded plan; it never
     /// derives delivery or resolution semantics.
     ApplyNotificationState,
+    /// Canonical reactive-ledger transaction (issue #1941 C4).
+    ///
+    /// Durable per-session delivery-record persistence only: the prepared
+    /// transition must carry [`TransitionClass::ReactiveState`], the
+    /// declared reactive effect ceiling, and the closed reactive typed
+    /// parameters (`session_id` plus the opaque bridge ledger snapshot).
+    /// The store bridge persists the bytes verbatim; it never interprets
+    /// delivery, dedup, or stickiness.
+    ApplyReactiveInjectionState,
+    /// Canonical resource-snapshot transaction (issue #1941 C4).
+    ///
+    /// Durable revisioned resource serving only: the prepared transition
+    /// must carry [`TransitionClass::ReactiveState`], the declared reactive
+    /// effect ceiling, and the closed snapshot typed parameters (canonical
+    /// URI, content digest, base64 bytes). The store bridge verifies the
+    /// digest over the decoded bytes and refuses URI rewrites; it never
+    /// mints identity or resolves handles.
+    ApplyResourceSnapshot,
+    /// Canonical user-automation transaction (issue #1779).
+    ///
+    /// Durable operator-automation persistence only: the prepared
+    /// transition must carry [`TransitionClass::UserAutomation`], the
+    /// declared automation effect ceiling, and the closed automation typed
+    /// parameters (operation discriminator, identities, opaque revision /
+    /// invocation documents, closed admission state). The store bridge
+    /// persists documents verbatim and arbitrates keys and pointers; it
+    /// never derives lineage, transitions, or invocation semantics.
+    ApplyUserAutomationState,
 }
 
 impl NamedMutationOperation {
@@ -737,6 +844,10 @@ impl NamedMutationOperation {
             }
             Self::ApplyErasure => TransitionClass::Erasure,
             Self::ApplyNotificationState => TransitionClass::NotificationState,
+            Self::ApplyReactiveInjectionState | Self::ApplyResourceSnapshot => {
+                TransitionClass::ReactiveState
+            }
+            Self::ApplyUserAutomationState => TransitionClass::UserAutomation,
         }
     }
 }
@@ -2066,6 +2177,8 @@ fn operation_kind(class: TransitionClass) -> &'static str {
         TransitionClass::RecoverySchema => "store.apply.recovery_schema",
         TransitionClass::Erasure => "store.apply.erasure",
         TransitionClass::NotificationState => "store.apply.notification_state",
+        TransitionClass::ReactiveState => "store.apply.reactive_state",
+        TransitionClass::UserAutomation => "store.apply.user_automation",
     }
 }
 

@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+mod canonical_tool_source;
 mod contract;
 mod core;
 mod host;

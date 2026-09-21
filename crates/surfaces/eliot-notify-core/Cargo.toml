@@ -7,6 +7,7 @@ license.workspace = true
 description = "A-10 role-filtered one-shot notification delivery core"
 
 [dependencies]
+eliot-config.workspace = true
 eliot-contracts.workspace = true
 eliot-kernel-core.workspace = true
 eliot-observation-contracts.workspace = true
@@ -20,3 +21,6 @@ thiserror.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+eliot-security-contracts.workspace = true

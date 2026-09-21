@@ -143,10 +143,16 @@ fn sha256_digest(value: &str, field: &'static str) -> Result<(), ReactiveInjecti
     Ok(())
 }
 
-/// Observed-event source that produced a cue.
+/// Origin channel of a reactive cue: which observed world produced it.
+///
+/// Bridge-local injection vocabulary (`bins/eliot-agent-bridge` reactive
+/// receipts only). This is a different vocabulary from both the frozen
+/// legacy V1 kind enum and the A-10 current kind enum, so it carries an
+/// owner-specific name that can never be read as either of them. Wire
+/// spellings of the variants are unchanged.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum CueKind {
+pub enum CueOrigin {
     HostEvent,
     ToolObservation,
     TaskTransition,
@@ -159,7 +165,7 @@ pub struct NormalizedCue {
     /// Stable cue identity minted by the cue owner.
     pub cue_id: String,
     /// Which observed world produced the cue.
-    pub kind: CueKind,
+    pub kind: CueOrigin,
     /// Owner source identity (feed, tool surface, or task owner).
     pub source: String,
     /// Owner revision of the source at observation time.
@@ -657,6 +663,19 @@ impl ReactiveInjectionLedger {
         self.receipts.get(receipt_id)
     }
 
+    /// Returns the ledger session bound to one item identity, if the item
+    /// exists.
+    ///
+    /// Read-only probe for the observer-handle join: resolution succeeds
+    /// only for exact ledger identities, never by pattern or inference.
+    /// Covers every retained item regardless of attention visibility.
+    #[must_use]
+    pub fn item_session(&self, item_id: &str) -> Option<&str> {
+        self.items
+            .get(item_id)
+            .map(|item| item.session_id.as_str())
+    }
+
     /// Bounded identities of pending (undelivered) injections for one
     /// session in ledger order.
     ///
@@ -726,7 +745,7 @@ mod tests {
     fn cue(source_revision: &str) -> NormalizedCue {
         NormalizedCue {
             cue_id: "cue-1".to_owned(),
-            kind: CueKind::ToolObservation,
+            kind: CueOrigin::ToolObservation,
             source: "tool-surface".to_owned(),
             source_revision: source_revision.to_owned(),
             cue_digest: CUE_DIGEST.to_owned(),

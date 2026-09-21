@@ -16,6 +16,7 @@ use eliot_governor::{
     CompositionError, CompositionReadiness, GovernorActivationOutcome, GovernorComposition,
     GovernorLaunchConfig, KernelGenerationPort, KernelGenerationSnapshotProvider, QueueLimits,
 };
+use eliot_kernel_core::Notification;
 use eliot_platform_windows::{ProtectedPathError, ProtectedRuntimePathLease};
 use eliot_protocol::{
     AgentActivationResolutionDecision, AgentActivationResolutionResult,
@@ -54,8 +55,12 @@ mod kernel_authority_client;
 mod kernel_context_read_client;
 mod kernel_recovery_client;
 mod kernel_transition_client;
+pub mod notification_board_attach;
 mod observation_adapters;
+mod process_origin;
 mod route_receipts;
+mod skill_bridge_adapter;
+pub mod skill_dispatch;
 mod skill_lifecycle_adapters;
 mod skill_surface_adapters;
 pub mod staffing_policy;
@@ -147,10 +152,19 @@ pub use governor_local_read::{
 };
 pub(crate) use kernel_authority_client::KernelAuthorityClient;
 pub use kernel_context_read_client::{KernelContextReadClient, ReconstructionReadComposition};
+pub use process_origin::{
+    CapabilityEvidenceSource, Generation, OperationDisposition,
+    OriginChallenge, OriginChallengeAuthority, OriginChallengeRequest, OriginControlGrant,
+    OriginControlOperation, OriginControlPresentation, PROCESS_ORIGIN_CAPABILITY,
+    PhysicalProcessBinding, ProcessCapabilityEvidence, ProcessControlOperation, ProcessOriginError,
+    ProcessOriginEvidence, ProcessStatusReceipt, canonical_origin_digest, gate_process_control,
+    request_origin_control,
+};
 pub use route_receipts::{
     ActualRouteReceipt, GovernorRouteAttempt, RouteCapabilityIndex, RouteReceiptError,
     RuntimeObservedFacts, UNKNOWN_ROUTE_FACT, effective_route_key,
 };
+pub(crate) use skill_lifecycle_adapters::SkillHotsetRequest;
 pub use startup_evidence_producer::{
     DAEMON_STARTUP_EVIDENCE_OPERATION, EliotdStartupEvidence, MAX_CAPABILITY_OUTCOMES,
     MAX_EVIDENCE_REFS, MAX_REQUIRED_CAPABILITIES, MirrorObservation, RetainedCapabilitySummary,
@@ -286,6 +300,16 @@ pub struct DaemonComposition {
     /// binding from them. `None` until the runtime notes a live session, so
     /// boards keep the empty (unadmitted) behaviour without one.
     owner_session: Option<OwnerSessionFacts>,
+    /// Canonical notification records hydrated from the closed
+    /// `GetNotificationState` read (issue #1780).
+    ///
+    /// Mirrors `capability_admission`: constructed empty at
+    /// [`DaemonComposition::start`], hydrated by the daemon runtime attach
+    /// where the concrete client and this composition meet (see
+    /// `notification_board_attach`), and consumed by
+    /// [`DaemonComposition::controlboard`]. An empty supply reads as an
+    /// empty inbox, never as resolved or suppressed state.
+    notification_snapshot: Vec<Notification>,
     /// Shared Governor Skill catalogue handle for catalogue-guarded skill
     /// promotion. Empty until catalogue installation wiring lands; absent
     /// entries forward open-world.
@@ -353,6 +377,7 @@ impl DaemonComposition {
             view_stale: false,
             operator_replay: SharedOperatorReplay::new(),
             owner_session: None,
+            notification_snapshot: Vec::new(),
             skill_catalogue: Arc::new(
                 std::sync::Mutex::new(eliot_skill::SkillCatalogue::default()),
             ),
@@ -647,6 +672,17 @@ impl DaemonComposition {
         self.owner_session = Some(facts);
     }
 
+    /// Notes verified canonical notification records into this composition.
+    ///
+    /// Called once by the daemon runtime attach holding both the concrete
+    /// [`DaemonKernelClient`] and this composition, mirroring
+    /// [`Self::note_owner_session_binding`]. Stores records only, never the
+    /// client; no new thread, no new handshake. Until noted, boards built by
+    /// [`Self::controlboard`] keep the empty inbox behaviour.
+    pub fn note_notification_snapshot(&mut self, records: Vec<Notification>) {
+        self.notification_snapshot = records;
+    }
+
     /// Builds one provider-neutral `ControlBoard` over the current Governor
     /// projection snapshot.
     ///
@@ -682,6 +718,9 @@ impl DaemonComposition {
             snapshot,
             &self.operator_replay,
             admitted,
+            // #1780: pre-fetched canonical records noted by the runtime
+            // attach; empty until that attach lands, never fabricated.
+            self.notification_snapshot.clone(),
         ))
     }
 
@@ -782,6 +821,200 @@ impl DaemonComposition {
             .acknowledge_and_display(skill_id, receipt, ack, tools)
     }
 
+    /// Binds the runtime receiver's ack to its exact receipt under the live
+    /// canonical tool view, then displays (issue #1882).
+    ///
+    /// Same seam discipline as [`Self::skill_install_package`]: the driver
+    /// supplies the receipt/ack pair the receiver acted on plus the LIVE
+    /// tool-owner source, alias table, and admitted version, and the shared
+    /// handle refuses the display when the live source drifted past the
+    /// admitted definition version. Receipt and ack travel by value,
+    /// mirroring the owned display boundary.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "receipt/ack cross by value like the owned display boundary"
+    )]
+    pub fn skill_acknowledge_and_display_versioned(
+        &self,
+        skill_id: &str,
+        receipt: eliot_skill::HotsetDeliveryReceipt,
+        ack: eliot_skill::HotsetDeliveryAck,
+        display_source: &dyn eliot_skill::CanonicalToolSource,
+        aliases: &eliot_skill::ToolAliasTable,
+        admitted_definition_version: &str,
+    ) -> Result<eliot_skill::ActivatedSkillDisplay, eliot_skill::SkillError> {
+        self.shared_skill_adapter()
+            .acknowledge_and_display_versioned(
+                skill_id,
+                receipt,
+                ack,
+                display_source,
+                aliases,
+                admitted_definition_version,
+            )
+    }
+
+    /// Installs one canonical package source under the versioned canonical
+    /// tool view (issue #1882).
+    ///
+    /// Same seam discipline as [`Self::skill_install_package`], plus the
+    /// admitted-definition-version gate: the source reports the version it
+    /// binds (MCP canonical registry via its `CanonicalToolSource` impl),
+    /// the driver states the Governor-admitted version, and drift fails
+    /// closed before the shared handle is touched. The Skill never hardcodes
+    /// the version; the composition never invents a registry. Drivers call
+    /// post-admission with the injector's real inputs.
+    pub fn skill_install_package_versioned(
+        &self,
+        package: &eliot_skill::SkillPackage,
+        inputs: &eliot_skill::MaterializationInputs,
+        context: &eliot_skill::CatalogueInstallContext,
+        source: &dyn eliot_skill::CanonicalToolSource,
+        aliases: &eliot_skill::ToolAliasTable,
+        admitted_definition_version: &str,
+    ) -> Result<String, eliot_skill::SkillError> {
+        self.shared_skill_adapter().install_package_versioned(
+            package,
+            inputs,
+            context,
+            source,
+            aliases,
+            admitted_definition_version,
+        )
+    }
+
+    /// Runs versioned install, availability and sealed gates, and Hotset
+    /// receipt issuance as one runtime delivery act (issue #1882).
+    ///
+    /// Same seam discipline as [`Self::skill_install_package`]: the driver
+    /// supplies the real package, inputs, context, provider readiness and
+    /// materialization scope, versioned tool source plus alias table and
+    /// admitted version, Hotset identity, and injector approval in one
+    /// [`VersionedDeliveryAct`](skill_lifecycle_adapters::VersionedDeliveryAct);
+    /// the shared handle records the act. The composition observes the live
+    /// admitted Governor fence itself and the act's scope fence must equal
+    /// it: a Governor refresh crossing the drive fails closed before any
+    /// catalogue write or receipt mint. The receipt carries the provisional
+    /// ceiling until evidence promotion; the receiver ack re-enters through
+    /// [`Self::skill_acknowledge_and_display`].
+    pub fn skill_run_install_to_receipt(
+        &self,
+        act: skill_lifecycle_adapters::VersionedDeliveryAct<'_>,
+    ) -> Result<(String, eliot_skill::HotsetDeliveryReceipt), eliot_skill::SkillError> {
+        let admitted = self.governor.kernel_snapshot().state_fence().clone();
+        self.shared_skill_adapter()
+            .run_install_to_receipt(act, &admitted)
+    }
+
+    /// Runs the Hotset injector call end to end through the composed
+    /// delivery act (issue #1882).
+    ///
+    /// Production injector entry the Hotset transport lane calls with one
+    /// injector-carried [`SkillHotsetRequest`](skill_lifecycle_adapters::SkillHotsetRequest):
+    /// package, inputs, Governor-owned install context, provider readiness,
+    /// scope identities, Hotset identity, and injector approval — no
+    /// literals, no defaults. The composition observes the live terms
+    /// itself: the canonical tool source plus admitted definition version
+    /// from the Governor hook
+    /// ([`eliot_governor::canonical_skill_tool_source`]), the default-empty
+    /// Skill-owned alias table (the frozen H-A composition call site), and
+    /// the live admitted Governor fence. Returns the installed identity
+    /// plus the receipt the injector carries to the receiver; the receiver
+    /// ack re-enters through [`Self::skill_carry_receipt_to_display`].
+    pub fn skill_inject_hotset(
+        &self,
+        request: skill_lifecycle_adapters::SkillHotsetRequest<'_>,
+    ) -> Result<(String, eliot_skill::HotsetDeliveryReceipt), eliot_skill::SkillError> {
+        let (source, admitted_version) = eliot_governor::canonical_skill_tool_source()?;
+        let aliases = eliot_skill::ToolAliasTable::new();
+        let fence = self.governor.kernel_snapshot().state_fence().clone();
+        self.shared_skill_adapter().inject_hotset(
+            request,
+            source.as_ref(),
+            &aliases,
+            &admitted_version,
+            &fence,
+        )
+    }
+
+    /// Drives one wire intake through the injector call end to end (issue
+    /// #1882).
+    ///
+    /// Daemon-side handler for Hotset intake bytes arriving over the
+    /// transport: decodes the
+    /// [`SkillIntakePayload`](eliot_agent_bridge_core::SkillIntakePayload)
+    /// (decode failures map to a surface contract error), observes the live
+    /// canonical source, default alias table, and admitted fence, and drives
+    /// the composed delivery act with the admitted version read from the
+    /// payload's install context. Every delivery gate below runs unchanged.
+    /// Returns the installed identity plus the receipt the injector carries
+    /// to the receiver.
+    pub fn skill_ingest_wire_intake(
+        &self,
+        bytes: &[u8],
+    ) -> Result<(String, eliot_skill::HotsetDeliveryReceipt), eliot_skill::SkillError> {
+        let payload = eliot_agent_bridge_core::SkillIntakePayload::decode(bytes)
+            .map_err(|error| eliot_skill::SkillError::Surface(error.to_string()))?;
+        let (source, _) = eliot_governor::canonical_skill_tool_source()?;
+        let aliases = eliot_skill::ToolAliasTable::new();
+        let fence = self.governor.kernel_snapshot().state_fence().clone();
+        self.shared_skill_adapter()
+            .ingest_wire_intake(payload, source.as_ref(), &aliases, &fence)
+    }
+
+    /// Carries the receiver ack back to the display boundary under a fresh
+    /// tool-owner read (issue #1882).
+    ///
+    /// Receiver-ack transport wiring the Hotset lane calls once the receiver
+    /// returns its ack for an issued receipt: the composition rebuilds the
+    /// canonical tool source through the Governor hook (a FRESH registry
+    /// value, so the display-time drift gate always reads live tool-owner
+    /// state, never a stale source object) and binds the ack through
+    /// [`Self::skill_acknowledge_and_display_versioned`]. Receipt and ack
+    /// travel by value, mirroring the owned display boundary.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "receipt/ack cross by value like the owned display boundary"
+    )]
+    pub fn skill_carry_receipt_to_display(
+        &self,
+        skill_id: &str,
+        receipt: eliot_skill::HotsetDeliveryReceipt,
+        ack: eliot_skill::HotsetDeliveryAck,
+    ) -> Result<eliot_skill::ActivatedSkillDisplay, eliot_skill::SkillError> {
+        let (source, admitted_version) = eliot_governor::canonical_skill_tool_source()?;
+        let aliases = eliot_skill::ToolAliasTable::new();
+        self.shared_skill_adapter()
+            .acknowledge_and_display_versioned(
+                skill_id,
+                receipt,
+                ack,
+                source.as_ref(),
+                &aliases,
+                &admitted_version,
+            )
+    }
+
+    /// Reconciles installed entries against the live canonical tool view,
+    /// marking changed bases stale (issue #1882).
+    ///
+    /// Production startup/refresh driver: builds the canonical tool source
+    /// through the Governor hook with the default-empty Skill-owned alias
+    /// table (frozen H-A call site) and marks every installed entry whose
+    /// declared tool references no longer resolve. Returns the count of
+    /// newly staled entries. Entries installed under provider renames need
+    /// their alias table at install time; this pass assumes the composed-act
+    /// invariant (canonical references, see `inject_hotset`). Definition-
+    /// version drift is NOT rechecked here: entries carry no admitted-version
+    /// record, so standing version comparison needs the entry-schema seam
+    /// (reported); version drift is caught at install and display time.
+    pub fn skill_reconcile_tool_basis(&self) -> Result<usize, eliot_skill::SkillError> {
+        let (source, _) = eliot_governor::canonical_skill_tool_source()?;
+        let aliases = eliot_skill::ToolAliasTable::new();
+        self.shared_skill_adapter()
+            .reconcile_tool_basis(source.as_ref(), &aliases)
+    }
+
     /// Borrows the single Governor task lifecycle owner as a forwarding
     /// adapter over the closed [`TaskCommand`](eliot_governor::TaskCommand) path.
     ///
@@ -833,6 +1066,32 @@ impl DaemonComposition {
         }
         Ok(skill_surface_adapters::GovernorSkillForwarder::new(
             self.skill_lifecycle()?,
+        ))
+    }
+
+    /// Borrows the single Governor Skill lifecycle owner as the agent-bridge
+    /// [`SkillLifecyclePort`](eliot_agent_bridge_core::SkillLifecyclePort).
+    ///
+    /// In-process binding for bridge cores running in the same process as
+    /// this composition: reads and proposals forward to the Governor
+    /// canonical path, and receiver-ack display resolves the live canonical
+    /// tool source per call through the Governor hook. No policy, admission,
+    /// or semantic rules live here; a stale fence fails closed in the
+    /// Governor owner, and tool-authority verdicts stay with the Skill owner.
+    /// A remote bridge process MUST NOT hold this forwarder — cross-process
+    /// Skill traffic crosses the authenticated transport as messages. Callers
+    /// take a fresh port per operation so a Governor refresh surfaces as an
+    /// exact-view mismatch instead of silent divergence.
+    pub fn skill_bridge_port(
+        &self,
+    ) -> Result<impl eliot_agent_bridge_core::SkillLifecyclePort + '_, DaemonError> {
+        if self.readiness() != eliot_governor::CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(
+                eliot_governor::CompositionError::NotReady,
+            ));
+        }
+        Ok(skill_bridge_adapter::BridgeSkillForwarder::new(
+            self.shared_skill_adapter(),
         ))
     }
 

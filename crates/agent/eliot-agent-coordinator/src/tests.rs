@@ -2199,6 +2199,60 @@ fn binding_duplicate_unit_reuse_conflicts_across_attempts() -> TestResult {
 }
 
 #[test]
+fn binding_distinct_unit_on_distinct_attempt_binds_independently() -> TestResult {
+    // Positive side of the #361 declared attempt rule: a new turn on a new
+    // attempt binds successfully while the first attempt keeps its own unit.
+    // (The negative side — same live unit on two attempts — is
+    // `binding_duplicate_unit_reuse_conflicts_across_attempts`.)
+    let proofs = [
+        "proof-admission-bind-e",
+        "proof-bind-bind-e-0",
+        "proof-bind-bind-e-1",
+    ];
+    let mut coordinator = coordinator(config(4, 4), &proofs)?;
+    let admitted = plan_and_admit(
+        &mut coordinator,
+        "bind-e",
+        &[
+            bind_lane_spec("work-bind-e-0", "reader-bind-e-0", "a"),
+            bind_lane_spec("work-bind-e-1", "reader-bind-e-1", "b"),
+        ],
+        None,
+    )?;
+    let first = admitted.admitted_lanes[0].clone();
+    let second = admitted.admitted_lanes[1].clone();
+    coordinator.start_attempt(ExecutionContext::from(&admitted), first.attempt_id.clone())?;
+    coordinator.start_attempt(ExecutionContext::from(&admitted), second.attempt_id.clone())?;
+    let events_before = coordinator.events().len();
+    let first_bound = coordinator.bind_provider_execution(
+        ExecutionContext::from(&admitted),
+        binding_submission("bind-e-0", &first, "unit-e0", "shared")?,
+    )?;
+    let second_bound = coordinator.bind_provider_execution(
+        ExecutionContext::from(&admitted),
+        binding_submission("bind-e-1", &second, "unit-e1", "shared")?,
+    )?;
+    assert_eq!(coordinator.events().len(), events_before + 2);
+    assert_eq!(first_bound.execution_unit.unit_id, "turn-unit-e0");
+    assert_eq!(second_bound.execution_unit.unit_id, "turn-unit-e1");
+    assert_eq!(
+        coordinator
+            .attempt(&first.attempt_id)
+            .unwrap_or_else(|| panic!("first attempt must exist"))
+            .provider_binding,
+        Some(first_bound)
+    );
+    assert_eq!(
+        coordinator
+            .attempt(&second.attempt_id)
+            .unwrap_or_else(|| panic!("second attempt must exist"))
+            .provider_binding,
+        Some(second_bound)
+    );
+    Ok(())
+}
+
+#[test]
 fn binding_snapshot_restore_preserves_binding_and_absent_stays_unresolved() -> TestResult {
     let proofs = ["proof-admission-bind-d", "proof-bind-bind-d"];
     let mut coordinator = coordinator(config(4, 4), &proofs)?;

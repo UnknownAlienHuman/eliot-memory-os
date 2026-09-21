@@ -360,6 +360,11 @@ pub struct SkillCatalogueEntry {
     pub dependencies: Vec<DependencyVersion>,
     pub host_version: String,
     pub profile_version: String,
+    /// Tool Definition version this entry was admitted under. Bound at
+    /// install from the Governor-admitted version and rechecked against the
+    /// live canonical source on the versioned paths: a registry move past
+    /// this version marks the entry stale until reinstall.
+    pub admitted_definition_version: String,
     pub status: SkillStatus,
     pub stale_reason: Option<String>,
 }
@@ -389,6 +394,10 @@ impl SkillCatalogueEntry {
         }
         check_text(&self.host_version, "entry.host_version")?;
         check_text(&self.profile_version, "entry.profile_version")?;
+        check_text(
+            &self.admitted_definition_version,
+            "entry.admitted_definition_version",
+        )?;
         match self.status {
             SkillStatus::Stale | SkillStatus::Quarantined => {
                 let reason = self.stale_reason.as_deref().unwrap_or("");
@@ -494,6 +503,14 @@ impl SkillCatalogue {
         self.entries.get(skill_id)
     }
 
+    /// Returns every installed Skill identity in stable order. The
+    /// reconciliation driver uses it to visit standing entries without
+    /// holding entry borrows across the marks that may follow.
+    #[must_use]
+    pub fn skill_ids(&self) -> Vec<String> {
+        self.entries.keys().cloned().collect()
+    }
+
     #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -552,6 +569,84 @@ impl SkillCatalogue {
         entry.dependencies = next;
         entry.status = SkillStatus::Stale;
         entry.stale_reason = Some(reason);
+        entry.validate()?;
+        Ok(true)
+    }
+
+    /// Marks the entry stale when the live Tool Definition version moved
+    /// past the version the entry was admitted under (`I7.13`).
+    ///
+    /// A changed Tool Definition version marks the Skill stale: the delivery
+    /// act admitted `admitted_version`, while the live canonical source now
+    /// binds `live_version`. The entry keeps its pinned state and gains a
+    /// `Stale` status with a reason naming both versions, blocking Material
+    /// use and redelivery until revalidated (reinstall under the new
+    /// version) or governed review. Quarantined and already-stale entries
+    /// report no change, as does agreement (no drift to mark). Returns `true`
+    /// when the entry became stale.
+    pub fn mark_definition_drift_stale(
+        &mut self,
+        skill_id: &str,
+        live_version: &str,
+        admitted_version: &str,
+    ) -> Result<bool, SkillError> {
+        check_text(live_version, "entry.definition_version")?;
+        check_text(admitted_version, "entry.admitted_version")?;
+        if live_version == admitted_version {
+            return Err(SkillError::InvalidField {
+                field: "entry.definition_version",
+                reason: "no version drift to mark",
+            });
+        }
+        let entry = self.entries.get_mut(skill_id).ok_or(SkillError::NotFound)?;
+        if entry.status == SkillStatus::Quarantined || entry.status == SkillStatus::Stale {
+            return Ok(false);
+        }
+        entry.validate()?;
+        entry.status = SkillStatus::Stale;
+        entry.stale_reason = Some(format!(
+            "tool definition drift: admitted {admitted_version}, live {live_version}"
+        ));
+        entry.validate()?;
+        Ok(true)
+    }
+
+    /// Marks the entry stale when its declared tool references no longer
+    /// resolve against the tool owner's view (`I7.13`).
+    ///
+    /// A changed host/tool/contract dependency marks the Skill stale: when
+    /// one or more `body.tool_refs` are unknown to the owner's `KnownTools`
+    /// view, the entry's tool basis changed out from under the installed
+    /// body. The entry keeps its pinned versions and gains a `Stale` status
+    /// with a reason naming every missing tool, blocking Material use and
+    /// redelivery until revalidated (reinstall) or governed review.
+    /// Quarantined entries are left untouched, mirroring
+    /// [`note_dependency_change`](Self::note_dependency_change); already-stale
+    /// entries report no change. Returns `true` when the entry became stale.
+    pub fn mark_tool_basis_stale(
+        &mut self,
+        skill_id: &str,
+        missing_tools: &[String],
+    ) -> Result<bool, SkillError> {
+        if missing_tools.is_empty() {
+            return Err(SkillError::InvalidField {
+                field: "entry.tool_basis",
+                reason: "at least one missing tool is required to mark the basis stale",
+            });
+        }
+        for tool in missing_tools {
+            check_text(tool, "entry.tool_basis")?;
+        }
+        let entry = self.entries.get_mut(skill_id).ok_or(SkillError::NotFound)?;
+        if entry.status == SkillStatus::Quarantined || entry.status == SkillStatus::Stale {
+            return Ok(false);
+        }
+        entry.validate()?;
+        entry.status = SkillStatus::Stale;
+        entry.stale_reason = Some(format!(
+            "tool basis changed: {} no longer known to the canonical tool view",
+            missing_tools.join(", ")
+        ));
         entry.validate()?;
         Ok(true)
     }
@@ -652,6 +747,7 @@ impl SkillCatalogue {
             trigger: entry.index.trigger.clone(),
             body_version: entry.body.body_version.clone(),
             body_digest: entry.body.body_digest.clone(),
+            status: entry.status,
             index_tokens: entry.runtime.index_tokens,
             body_tokens: entry.runtime.body_tokens,
             runtime_tokens: entry.runtime.runtime_tokens,
@@ -732,6 +828,14 @@ impl HotsetDeliveryAck {
 /// a different order yields the same receipt. Delivery never implies
 /// usefulness or causal credit; it proves only that the Hotset carried
 /// the Skill.
+///
+/// The receipt carries its delivery ceiling explicitly: `provisional` is
+/// `false` only when every delivered Skill was `Current` at issuance, and
+/// `true` whenever any delivered Skill is `Provisional`, so bounded
+/// provisional use (`I7.13`: scoped/provisional without independent transfer
+/// evidence) is never representable as current-grade delivery. The flag is
+/// bound into the receipt digest; the per-Skill truth stays with the
+/// catalogue entry status and is shown on the activation display.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HotsetDeliveryReceipt {
@@ -743,6 +847,8 @@ pub struct HotsetDeliveryReceipt {
     /// approval or canonical commit receipt, bound by the injector). A
     /// non-blank Hotset identity alone never authorizes issuance.
     pub approval_ref: String,
+    /// Delivery ceiling: `true` when any delivered Skill is `Provisional`.
+    pub provisional: bool,
     pub receipt_digest: String,
 }
 
@@ -755,6 +861,7 @@ impl HotsetDeliveryReceipt {
                 &self.delivered_skill_ids,
                 &self.body_digests,
                 &self.approval_ref,
+                &self.provisional,
             ),
             "delivery.receipt",
         )
@@ -784,6 +891,7 @@ impl HotsetDeliveryReceipt {
         check_unique(&delivered_skill_ids, "delivery.delivered_skill_ids")?;
         let catalogue_digest = catalogue.catalogue_digest()?;
         let mut body_digests = BTreeMap::new();
+        let mut provisional = false;
         let mut ordered_ids = delivered_skill_ids;
         ordered_ids.sort();
         for skill_id in &ordered_ids {
@@ -796,6 +904,9 @@ impl HotsetDeliveryReceipt {
                     reason: "stale or retired Skills cannot be delivered",
                 });
             }
+            if entry.status != SkillStatus::Current {
+                provisional = true;
+            }
             body_digests.insert(skill_id.clone(), entry.body.body_digest.clone());
         }
         let mut receipt = Self {
@@ -804,6 +915,7 @@ impl HotsetDeliveryReceipt {
             delivered_skill_ids: ordered_ids,
             body_digests,
             approval_ref,
+            provisional,
             receipt_digest: String::new(),
         };
         receipt.receipt_digest = receipt.identity_digest()?;
@@ -859,6 +971,10 @@ pub struct ActivatedSkillDisplay {
     pub trigger: String,
     pub body_version: String,
     pub body_digest: String,
+    /// Entry status at display time: only `Current` or `Provisional` can
+    /// display (usability gate above). The status is the visible delivery
+    /// ceiling — a provisional activation never renders as current-grade.
+    pub status: SkillStatus,
     pub index_tokens: u32,
     pub body_tokens: u32,
     pub runtime_tokens: u32,
@@ -879,6 +995,12 @@ impl ActivatedSkillDisplay {
         check_single_line(&self.trigger, "activation.trigger", MAX_TRIGGER_CHARS)?;
         check_text(&self.body_version, "activation.body_version")?;
         check_digest(&self.body_digest, "activation.body_digest")?;
+        if !matches!(self.status, SkillStatus::Current | SkillStatus::Provisional) {
+            return Err(SkillError::InvalidField {
+                field: "activation.status",
+                reason: "only current or provisional Skills display",
+            });
+        }
         check_digest(
             &self.delivery_receipt_digest,
             "activation.delivery_receipt_digest",
@@ -903,6 +1025,14 @@ impl ActivatedSkillDisplay {
     pub fn render(&self) -> String {
         let mut lines = Vec::new();
         lines.push(format!("skill {} | {}", self.skill_id, self.trigger));
+        lines.push(format!(
+            "status {}",
+            match self.status {
+                SkillStatus::Current => "current",
+                SkillStatus::Provisional => "provisional",
+                _ => "blocked",
+            }
+        ));
         lines.push(format!(
             "body {} digest {}",
             self.body_version, self.body_digest
@@ -1039,6 +1169,7 @@ mod tests {
             dependencies: vec![dependency("tool-def-1")],
             host_version: "host-4.1.0".to_owned(),
             profile_version: "profile-2.0.0".to_owned(),
+            admitted_definition_version: "1.2.0".to_owned(),
             status: SkillStatus::Provisional,
             stale_reason: None,
         }
@@ -1100,6 +1231,161 @@ mod tests {
         assert!(rendered.contains("route-1"));
         assert!(rendered.contains("profile-1"));
         assert!(rendered.contains(&receipt.receipt_digest));
+    }
+
+    #[test]
+    fn delivery_ceiling_is_provisional_until_evidence_promotion() {
+        // Provisional entry: the receipt and the display both carry the
+        // provisional ceiling — absence of verification never mints
+        // current-grade artifacts.
+        let mut catalogue = catalogue_two();
+        let provisional_receipt = HotsetDeliveryReceipt::issue(
+            "hotset-1".to_owned(),
+            &catalogue,
+            vec!["skill-alpha".to_owned()],
+            &tools(),
+            "approval-commit-1".to_owned(),
+        )
+        .expect("delivery receipt");
+        assert!(provisional_receipt.provisional);
+        let provisional_display = catalogue
+            .activation_display(
+                "skill-alpha",
+                &provisional_receipt,
+                &applied_ack(&provisional_receipt),
+                &tools(),
+            )
+            .expect("activation display");
+        assert_eq!(provisional_display.status, SkillStatus::Provisional);
+        assert!(provisional_display.render().contains("status provisional"));
+
+        // Evidence promotion to Current (I7.13 depth rule) lifts the ceiling
+        // on later receipts and displays — the only path past provisional.
+        promote_current(&mut catalogue, "skill-alpha");
+        let current_receipt = HotsetDeliveryReceipt::issue(
+            "hotset-2".to_owned(),
+            &catalogue,
+            vec!["skill-alpha".to_owned()],
+            &tools(),
+            "approval-commit-2".to_owned(),
+        )
+        .expect("delivery receipt");
+        assert!(!current_receipt.provisional);
+        let current_display = catalogue
+            .activation_display(
+                "skill-alpha",
+                &current_receipt,
+                &applied_ack(&current_receipt),
+                &tools(),
+            )
+            .expect("activation display");
+        assert_eq!(current_display.status, SkillStatus::Current);
+        assert!(current_display.render().contains("status current"));
+    }
+
+    #[test]
+    fn removed_tool_basis_marks_stale_until_revalidated() {
+        // #1882 acceptance: a changed tool dependency marks the Skill stale.
+        // The entry keeps its pinned versions and gains a Stale status naming
+        // the missing tool, blocking Material use and redelivery.
+        let mut catalogue = catalogue_two();
+        assert!(
+            catalogue
+                .mark_tool_basis_stale("skill-alpha", &["eliot.finish".to_owned()])
+                .expect("mark stale")
+        );
+        let stored = catalogue.get("skill-alpha").expect("stored entry");
+        assert_eq!(stored.status, SkillStatus::Stale);
+        assert!(
+            stored
+                .stale_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("eliot.finish")
+        );
+        assert_eq!(stored.dependencies, vec![dependency("tool-def-1")]);
+        assert!(!catalogue.is_usable("skill-alpha"));
+        // Repeat marking reports no change; the sibling entry is untouched.
+        assert!(
+            !catalogue
+                .mark_tool_basis_stale("skill-alpha", &["eliot.finish".to_owned()])
+                .expect("repeat mark")
+        );
+        assert!(catalogue.is_usable("skill-beta"));
+        // Empty basis and unknown skills fail closed; quarantine is governed.
+        assert!(matches!(
+            catalogue.mark_tool_basis_stale("skill-alpha", &[]),
+            Err(SkillError::InvalidField { field, .. }) if field == "entry.tool_basis"
+        ));
+        assert!(matches!(
+            catalogue.mark_tool_basis_stale("skill-missing", &["eliot.finish".to_owned()]),
+            Err(SkillError::NotFound)
+        ));
+        let mut quarantined = entry("skill-quarantined");
+        quarantined.status = SkillStatus::Quarantined;
+        quarantined.stale_reason = Some("governed review hold".to_owned());
+        let mut held =
+            SkillCatalogue::from_snapshot([quarantined], &tools()).expect("test catalogue");
+        assert!(
+            !held
+                .mark_tool_basis_stale("skill-quarantined", &["eliot.finish".to_owned()])
+                .expect("quarantine preserved")
+        );
+        let stored = held.get("skill-quarantined").expect("stored entry");
+        assert_eq!(stored.status, SkillStatus::Quarantined);
+        assert_eq!(stored.stale_reason.as_deref(), Some("governed review hold"));
+    }
+
+    #[test]
+    fn definition_drift_marks_stale_with_both_versions_named() {
+        // The live registry moved past the admitted definition version: the
+        // entry keeps its pinned state and gains a Stale status blocking
+        // Material use and redelivery until reinstall under the new version.
+        let mut catalogue = catalogue_two();
+        assert!(
+            catalogue
+                .mark_definition_drift_stale("skill-alpha", "9.9.9", "1.2.0")
+                .expect("mark drift")
+        );
+        let stored = catalogue.get("skill-alpha").expect("stored entry");
+        assert_eq!(stored.status, SkillStatus::Stale);
+        assert!(
+            stored
+                .stale_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("admitted 1.2.0, live 9.9.9")
+        );
+        assert!(!catalogue.is_usable("skill-alpha"));
+        assert!(catalogue.is_usable("skill-beta"));
+        // Agreement, repeat, quarantine, blanks, and unknown skills.
+        assert!(matches!(
+            catalogue.mark_definition_drift_stale("skill-alpha", "1.2.0", "1.2.0"),
+            Err(SkillError::InvalidField { field, .. }) if field == "entry.definition_version"
+        ));
+        assert!(
+            !catalogue
+                .mark_definition_drift_stale("skill-alpha", "9.9.9", "1.2.0")
+                .expect("repeat drift")
+        );
+        let mut quarantined = entry("skill-quarantined");
+        quarantined.status = SkillStatus::Quarantined;
+        quarantined.stale_reason = Some("governed review hold".to_owned());
+        let mut held =
+            SkillCatalogue::from_snapshot([quarantined], &tools()).expect("test catalogue");
+        assert!(
+            !held
+                .mark_definition_drift_stale("skill-quarantined", "9.9.9", "1.2.0")
+                .expect("quarantine preserved")
+        );
+        assert!(matches!(
+            catalogue.mark_definition_drift_stale("skill-alpha", "   ", "1.2.0"),
+            Err(SkillError::InvalidField { .. })
+        ));
+        assert!(matches!(
+            catalogue.mark_definition_drift_stale("skill-missing", "9.9.9", "1.2.0"),
+            Err(SkillError::NotFound)
+        ));
     }
 
     #[test]

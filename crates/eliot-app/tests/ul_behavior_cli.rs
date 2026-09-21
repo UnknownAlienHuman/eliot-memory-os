@@ -3,7 +3,7 @@ mod support;
 
 use eliot_engine::{GitMiningService, ModuleCardService};
 use eliot_types::{
-    AgentId, CoChangeEdge, CommandContext, CueBinding, CueKind, CueMatchMode, CueStrength,
+    AgentId, CoChangeEdge, CommandContext, CueBinding, LegacyCueKindV1, CueMatchMode, CueStrength,
     FailureRecordCommand, LifecycleStatus, ModuleCard, ProjectId, RelationInput, RelationType,
     SemanticCommand, TaintClass, UlArtifact, UlArtifactBatchRecordCommand, Visibility, WriteId,
     WriteStatus,
@@ -316,7 +316,7 @@ fn replay_card(project_id: ProjectId, index: usize) -> ModuleCard {
         failure_refs: Vec::new(),
         source_refs: vec![format!("file:src/module-{index:03}.rs")],
         cue_bindings: vec![CueBinding {
-            cue_kind: CueKind::FilePath,
+            cue_kind: LegacyCueKindV1::FilePath,
             cue_value: format!("src/module-{index:03}.rs"),
             match_mode: CueMatchMode::Exact,
             strength: CueStrength::Primary,
@@ -369,7 +369,7 @@ fn failure_command(project_id: ProjectId, path: &str, source_revision: u64) -> S
         payload: json!({
             "source_revision": source_revision,
             "cue_bindings": [CueBinding {
-                cue_kind: CueKind::FilePath,
+                cue_kind: LegacyCueKindV1::FilePath,
                 cue_value: path.to_owned(),
                 match_mode: CueMatchMode::Exact,
                 strength: CueStrength::Primary,

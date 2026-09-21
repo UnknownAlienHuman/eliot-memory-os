@@ -2,6 +2,7 @@
 
 use std::collections::BTreeSet;
 
+use eliot_kernel_core::UserAutomationOperation;
 use eliot_protocol::{HARD_STRUCTURED_RESPONSE_BYTES, RequestIdentity};
 use eliot_receipts::{ProofCeiling, SessionBinding};
 use eliot_security_contracts::{EffectCeiling, InstructionTaint, PrivacyClass};
@@ -58,7 +59,16 @@ pub struct ApplicationRequest {
     pub tool: ToolRequest,
 }
 
-/// Exact canonical tool requests.
+/// Authenticated Kernel selector for the UserAutomation operator route.
+pub const USER_AUTOMATION_ROUTE: &str = "eliot_user_automation";
+
+/// Closed typed requests used by the MCP hot surface and the authenticated
+/// Host/operator bridge.
+///
+/// `UserAutomation` is deliberately a cold/operator route. It remains typed
+/// here so the Host bridge and CLI share one payload contract, but it is not
+/// admitted by [`ADMITTED_TOOL_NAMES`], published by the canonical MCP schema,
+/// or assigned a semantic hot-tool profile.
 #[derive(Clone, Debug, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "name", content = "arguments", deny_unknown_fields)]
 pub enum ToolRequest {
@@ -86,6 +96,20 @@ pub enum ToolRequest {
     /// Candidate finish attempt.
     #[serde(rename = "eliot.finish")]
     Finish(FinishAttemptDraft),
+    /// Authenticated UserAutomation operator operation carried by Host/CLI.
+    #[serde(rename = "eliot_user_automation")]
+    UserAutomation(UserAutomationInput),
+    /// Hotset intake for Skill delivery (host-request skill leg only).
+    ///
+    /// Non-hot carrier: no semantic profile, never advertised on the MCP
+    /// surface, always rejected by profile-driven dispatch. Carries the
+    /// versioned Skill intake payload as opaque arguments validated at the
+    /// Skill boundary, never here.
+    #[serde(rename = "skill.inject")]
+    SkillInject(Value),
+    /// Display request for a delivered Skill (same non-hot status).
+    #[serde(rename = "skill.display")]
+    SkillDisplay(Value),
 }
 
 impl ToolRequest {
@@ -101,6 +125,9 @@ impl ToolRequest {
             Self::Verify(_) => "eliot.verify",
             Self::Coordinate(_) => "eliot.coordinate",
             Self::Finish(_) => "eliot.finish",
+            Self::UserAutomation(_) => USER_AUTOMATION_ROUTE,
+            Self::SkillInject(_) => "skill.inject",
+            Self::SkillDisplay(_) => "skill.display",
         }
     }
 
@@ -114,7 +141,44 @@ impl ToolRequest {
             Self::Verify(value) => value.validate(),
             Self::Coordinate(value) => value.validate(),
             Self::Finish(value) => value.validate(),
+            Self::UserAutomation(value) => value.validate(),
+            Self::SkillInject(value) | Self::SkillDisplay(value) => {
+                if !value.is_object() {
+                    return Err(ContractViolation::InvalidField {
+                        field: "tool.arguments",
+                        reason: "skill carrier arguments must be a JSON object",
+                    });
+                }
+                Ok(())
+            }
         }
+    }
+}
+
+/// Typed UserAutomation operator input for the authenticated Host/MCP route.
+///
+/// The surface carries only the closed Kernel-owned operation vocabulary and a
+/// retry-stable idempotency key. Principal, session, request metadata,
+/// StateFence, WorkScope authority, provider identity, scheduler state and
+/// Store receipts are authenticated and supplied by Kernel composition.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAutomationInput {
+    /// Existing Kernel-owned closed operator operation.
+    pub operation: UserAutomationOperation,
+    /// Retry-stable caller key; it is not an authority or Store identity.
+    pub idempotency_key: String,
+}
+
+impl UserAutomationInput {
+    fn validate(&self) -> Result<(), ContractViolation> {
+        self.operation
+            .validate()
+            .map_err(|_error| ContractViolation::InvalidField {
+                field: "user_automation.operation",
+                reason: "closed UserAutomation operation is invalid",
+            })?;
+        non_blank(&self.idempotency_key, "user_automation.idempotency_key")
     }
 }
 

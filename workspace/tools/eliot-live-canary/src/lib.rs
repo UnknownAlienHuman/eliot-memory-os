@@ -3139,6 +3139,7 @@ fn operation_name(operation: &HostRuntimeControlOperation) -> &'static str {
         HostRuntimeControlOperation::ReconcileKernelRestart => "ReconcileKernelRestart",
         HostRuntimeControlOperation::RecoverStore => "RecoverStore",
         HostRuntimeControlOperation::ReconcileStoreRecovery => "ReconcileStoreRecovery",
+        HostRuntimeControlOperation::DeliverReactiveContext => "DeliverReactiveContext",
     }
 }
 

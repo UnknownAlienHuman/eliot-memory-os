@@ -18,6 +18,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_contracts::{StateFence, sha256_hex};
 use eliot_kernel_service::AuthenticatedHostSession;
+use eliot_process::{
+    OperationId, OriginChallengeRequest, OriginControlOperation, OriginControlPresentation,
+    ProcessExecutionView, ProcessLifecycle,
+};
 use eliot_protocol::{
     HostRequestEnvelope, HostRequestResultBody, LocalReadAttempt, RequestIdentity,
     host_request_operation_id,
@@ -334,6 +338,8 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
     match operation {
         "snapshot" => "snapshot",
         "daemon_ready" => "daemon_ready",
+        "origin_challenge_issue" => "origin_challenge_issue",
+        "origin_control_decide" => "origin_control_decide",
         ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION => ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION,
         DAEMON_STARTUP_EVIDENCE_OPERATION => DAEMON_STARTUP_EVIDENCE_OPERATION,
         "health" => "health",
@@ -400,6 +406,21 @@ struct StoreApplyOperation {
     transition: PreparedTransition,
     expected_revision_heads: Vec<RevisionHeadExpectation>,
     expected_ordering_heads: Vec<OrderingHeadExpectation>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OriginChallengeIssueOperation {
+    operation_id: OperationId,
+    request: OriginChallengeRequest,
+    expires_at_unix_ms: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OriginControlDecideOperation {
+    operation_id: OperationId,
+    presentation: serde_json::Value,
 }
 
 impl KernelComposition {
@@ -523,6 +544,14 @@ impl KernelComposition {
                             .map_err(|_| TransportError::SessionFenced)?;
                         Ok(Self::accepted_daemon_response())
                     })
+            }
+            "origin_challenge_issue" => {
+                self.origin_challenge_issue_operation(session, payload.clone())
+                    .await
+            }
+            "origin_control_decide" => {
+                self.origin_control_decide_operation(session, payload.clone())
+                    .await
             }
             ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION => {
                 self.generation_registry_active_query_operation(session, payload.clone())
@@ -839,6 +868,86 @@ impl KernelComposition {
             "value": { "accepted": true },
             "recovery": null,
         })
+    }
+
+    async fn origin_challenge_issue_operation(
+        &self,
+        session: &Session,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        let operation: OriginChallengeIssueOperation =
+            serde_json::from_value(payload).map_err(|_| TransportError::SessionFenced)?;
+        validate_origin_session_fence(session, operation.request.state_fence())?;
+        let (owner, _) =
+            super::caller_binding(session).map_err(|_| TransportError::PeerIdentityUnavailable)?;
+        let gateway = self
+            .process_gateway
+            .as_ref()
+            .ok_or(TransportError::SessionFenced)?;
+        let view = gateway
+            .inspect(&owner, operation.operation_id.clone())
+            .await
+            .map_err(|_| TransportError::SessionFenced)?;
+        validate_origin_inspection(&view, &operation.operation_id, &operation.request)?;
+        let challenge = gateway
+            .issue_origin_challenge(&operation.request, operation.expires_at_unix_ms)
+            .map_err(|_| TransportError::SessionFenced)?;
+        let challenge_value: serde_json::Value = serde_json::from_slice(
+            &challenge
+                .to_json_bytes()
+                .map_err(|_| TransportError::SessionFenced)?,
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
+        Ok(serde_json::json!({
+            "status": "known",
+            "value": {
+                "kind": "origin_challenge",
+                "challenge": challenge_value,
+            },
+            "recovery": null,
+        }))
+    }
+
+    async fn origin_control_decide_operation(
+        &self,
+        session: &Session,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        let operation: OriginControlDecideOperation =
+            serde_json::from_value(payload).map_err(|_| TransportError::SessionFenced)?;
+        let presentation_bytes = serde_json::to_vec(&operation.presentation)
+            .map_err(|_| TransportError::SessionFenced)?;
+        let presentation = OriginControlPresentation::from_json_bytes(&presentation_bytes)
+            .map_err(|_| TransportError::SessionFenced)?;
+        validate_origin_session_fence(session, presentation.request().state_fence())?;
+        validate_origin_control_operation(presentation.request().operation())?;
+        let (owner, _) =
+            super::caller_binding(session).map_err(|_| TransportError::PeerIdentityUnavailable)?;
+        let gateway = self
+            .process_gateway
+            .as_ref()
+            .ok_or(TransportError::SessionFenced)?;
+        let view = gateway
+            .inspect(&owner, operation.operation_id.clone())
+            .await
+            .map_err(|_| TransportError::SessionFenced)?;
+        validate_origin_inspection(&view, &operation.operation_id, presentation.request())?;
+        let grant = gateway
+            .decide_origin_control(&presentation)
+            .map_err(|_| TransportError::SessionFenced)?;
+        let cancelled = gateway
+            .cancel_with_origin_grant(&owner, operation.operation_id, &grant)
+            .await
+            .map_err(|_| TransportError::SessionFenced)?;
+        Ok(serde_json::json!({
+            "status": "known",
+            "value": {
+                "kind": "origin_control_kill",
+                "grant": grant,
+                "cancelled": cancelled,
+            },
+            "recovery": null,
+        }))
     }
 
     fn generation_registry_active_query_operation(
@@ -1490,6 +1599,79 @@ mod tests {
         drop(kernel);
         let _ = std::fs::remove_dir_all(root);
     }
+
+    #[test]
+    fn origin_selectors_are_trusted_and_effect_route_is_kill_only() {
+        assert_eq!(
+            trusted_daemon_operation("origin_challenge_issue"),
+            "origin_challenge_issue"
+        );
+        assert_eq!(
+            trusted_daemon_operation("origin_control_decide"),
+            "origin_control_decide"
+        );
+        assert!(validate_origin_control_operation(OriginControlOperation::Kill).is_ok());
+        for operation in [
+            OriginControlOperation::Adopt,
+            OriginControlOperation::Mutate,
+            OriginControlOperation::AttachCredential,
+        ] {
+            assert!(
+                validate_origin_control_operation(operation).is_err(),
+                "unsupported origin effect must fail closed before executor entry"
+            );
+        }
+    }
+}
+
+fn validate_origin_control_operation(
+    operation: OriginControlOperation,
+) -> Result<(), TransportError> {
+    if operation == OriginControlOperation::Kill {
+        Ok(())
+    } else {
+        Err(TransportError::SessionFenced)
+    }
+}
+
+fn validate_origin_session_fence(
+    session: &Session,
+    fence: &StateFence,
+) -> Result<(), TransportError> {
+    fence
+        .validate()
+        .map_err(|_| TransportError::SessionFenced)?;
+    if session.module_generation.state_fence != *fence
+        || !session
+            .authority_epoch
+            .is_same_authority(&fence.authority_epoch)
+        || session.module_generation.generation.value() != fence.resource_generation.value()
+    {
+        return Err(TransportError::SessionFenced);
+    }
+    Ok(())
+}
+
+fn validate_origin_inspection(
+    view: &ProcessExecutionView,
+    operation_id: &OperationId,
+    request: &OriginChallengeRequest,
+) -> Result<(), TransportError> {
+    if view.operation_id() != operation_id
+        || view.lifecycle() != ProcessLifecycle::Running
+        || !view
+            .binding()
+            .authority_epoch()
+            .is_same_authority(&request.state_fence().authority_epoch)
+        || view.binding().state_fence().generation().get() != request.generation().get()
+    {
+        return Err(TransportError::SessionFenced);
+    }
+    let identity = view.identity().ok_or(TransportError::SessionFenced)?;
+    if identity.generation() != request.generation() || identity.physical() != request.physical() {
+        return Err(TransportError::SessionFenced);
+    }
+    Ok(())
 }
 
 fn validate_store_session_fence(

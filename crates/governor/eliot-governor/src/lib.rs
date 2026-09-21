@@ -53,6 +53,7 @@ mod controlboard_projection;
 mod observation_reconciliation;
 mod operator_reconciliation;
 mod owner_projection_refresh;
+mod reactive_admission;
 mod skill_lifecycle;
 mod swarm_plan_attachment_composition;
 mod swarm_plan_attachment_ownership;
@@ -89,7 +90,10 @@ pub use observation_reconciliation::{
     WatchdogEntryKind,
 };
 pub use operator_reconciliation::{GovernorOperatorReconciliation, operator_command_envelope};
-pub use skill_lifecycle::GovernorSkillLifecycle;
+pub use reactive_admission::{
+    ReactiveAdmissionError, ReactiveRiskAssessment, ReactiveRiskTier, assess_reactive_risk,
+};
+pub use skill_lifecycle::{GovernorSkillLifecycle, canonical_skill_tool_source};
 pub use swarm_plan_attachment_composition::SwarmAttachmentComposition;
 pub use swarm_plan_attachment_ownership::{
     AttachmentOwnershipDomain, AttachmentOwnershipScope, OwnershipOutcome,

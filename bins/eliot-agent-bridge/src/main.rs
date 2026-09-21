@@ -4,8 +4,8 @@ mod request_input;
 
 use eliot_agent_bridge::{
     BootstrapContext, BootstrapTaskInputs, BridgeRunner, CliError, CurrentAssessment,
-    InjectionReceipt, Profile, ScopeLevel, UnderstandingBootstrap, kernel_ports_with_declaration,
-    parse_args,
+    HotResourceView, InjectionReceipt, Profile, ScopeLevel, UnderstandingBootstrap,
+    kernel_ports_with_declaration, parse_args, reactive_runtime_composition,
 };
 use eliot_agent_bridge_core::{
     AttachRequest, BridgeError, ConnectionId, FencingToken, Generation, HostEventEnvelope,
@@ -189,6 +189,16 @@ enum Response {
         completion: HostCorrelationReceipt,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         bootstrap: Option<UnderstandingBootstrap>,
+        /// Bounded hot-resource projection recorded for this delivery.
+        ///
+        /// Present only when the delivered result was snapshotted into the
+        /// attach-scoped evidence projection (supported kind with content
+        /// beyond the hot preview bound): the handle URI plus digest names
+        /// the immutable bytes, the preview carries the hot-visible prefix,
+        /// and full bytes require explicit expansion through the owning
+        /// reader. Absent otherwise — never estimated, never invented.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        evidence: Option<HotResourceView>,
     },
     Cancellation {
         result: HostCancellationResult,
@@ -537,55 +547,46 @@ fn main() {
         total_records = next_total;
         let mut response = match decode_bounded_request(text) {
             Ok(Request::Attach { request }) => match runner.attach(request) {
-                Ok(_) => Response::Attached { bootstrap: None },
+                Ok(_) => {
+                    // Best-effort durable restore for the fresh attach: a
+                    // refused or absent restore keeps the current empty-ledger
+                    // behavior and is reported on stderr without failing the
+                    // attach that already succeeded.
+                    if let Err(error) = reactive_runtime_composition::restore_reactive_runtime(
+                        &mut runner,
+                        &mut *host_request_port,
+                        &[],
+                    ) {
+                        emit_error("REACTIVE_RESTORE_REFUSED", &error.to_string());
+                    }
+                    Response::Attached { bootstrap: None }
+                }
                 Err(error) => {
                     provider_failure |= matches!(error, BridgeError::PlanGap(_));
                     bridge_error(&error)
                 }
             },
             Ok(Request::Invoke { request }) => {
-                handle_invocation(&host_gateway, &mut *host_request_port, &request)
+                let mut response =
+                    handle_invocation(&host_gateway, &mut *host_request_port, &request);
+                record_invocation_delivery(&mut runner, &mut response);
+                response
             }
             Ok(Request::Cancel { request }) => {
                 handle_cancellation(&host_gateway, &mut *host_request_port, &request)
             }
             Ok(Request::DryRunInvoke { request }) => dry_run_invocation(&runner, &request),
             Ok(Request::DryRunCancel { request }) => dry_run_cancellation(&runner, &request),
-            Ok(Request::ForwardHook { event }) => match runner.forward_hook(&event) {
-                Ok(()) => match runner.deliver_reactive_pending_via_hook(event.event_id.as_str()) {
-                    Ok(receipts) => Response::Forwarded {
-                        bootstrap: None,
-                        reactive_receipts: receipts,
-                    },
-                    Err(error) => Response::Error {
-                        code: "REACTIVE_RECEIPT_REJECTED",
-                        detail: error.to_string(),
-                    },
-                },
-                Err(error) => {
-                    provider_failure |= is_provider_failure(&error);
-                    bridge_error(&error)
-                }
-            },
-            Ok(Request::ForwardEvent { event }) => match runner.forward_event(&event) {
-                Ok(_) => {
-                    let response_id = format!("forward-event:{}", event.event_id);
-                    match runner.deliver_reactive_pending_via_response(&response_id) {
-                        Ok(receipts) => Response::Forwarded {
-                            bootstrap: None,
-                            reactive_receipts: receipts,
-                        },
-                        Err(error) => Response::Error {
-                            code: "REACTIVE_RECEIPT_REJECTED",
-                            detail: error.to_string(),
-                        },
-                    }
-                }
-                Err(error) => {
-                    provider_failure |= is_provider_failure(&error);
-                    bridge_error(&error)
-                }
-            },
+            Ok(Request::ForwardHook { event }) => {
+                let (response, provider_failed) = handle_forward_hook(&mut runner, &event);
+                provider_failure |= provider_failed;
+                response
+            }
+            Ok(Request::ForwardEvent { event }) => {
+                let (response, provider_failed) = handle_forward_event(&mut runner, &event);
+                provider_failure |= provider_failed;
+                response
+            }
             Ok(Request::ReconcileExternal {}) => match runner.reconcile_external() {
                 Ok(_) => Response::Reconciled { bootstrap: None },
                 Err(error) => {
@@ -756,8 +757,99 @@ fn handle_invocation<P: KernelHostRequestPort + ?Sized>(
             result,
             completion,
             bootstrap: None,
+            evidence: None,
         },
         Err(error) => host_gateway_error(&error),
+    }
+}
+
+/// Records one supported tool-result delivery after gateway return and
+/// projects its handle onto the outgoing Invocation response.
+///
+/// Runs on the normal Invoke path with the exact authenticated outcome the gateway
+/// produced. The gateway-shaped result and completion are never touched: only the
+/// additive `evidence` slot is filled, and only when recording yields a snapshot
+/// (supported kind with content beyond the hot preview bound). Auxiliary only: a
+/// `None` (admission, rejection, gap, unsupported kind, small inline content,
+/// detached runner, or full registry) leaves the response exactly as the gateway
+/// shaped it, with the key absent on the wire.
+/// See [`BridgeRunner::record_tool_result_delivery`].
+fn record_invocation_delivery(runner: &mut BridgeRunner, response: &mut Response) {
+    if let Response::Invocation {
+        result, evidence, ..
+    } = response
+    {
+        if evidence.is_none()
+            && let Some(view) = runner.record_tool_result_delivery(result.outcome())
+        {
+            *evidence = Some(view);
+        }
+    }
+}
+
+/// Delivers hook-carried reactive injections through the live stdio consumer.
+///
+/// Runs the exact ForwardHook dispatch step: forwards the owner-observed
+/// hook event, then drains the live session's pending injections through
+/// that hook, issuing one Delivery/Injection Receipt per item on the
+/// Forwarded response. Pure wiring over [`BridgeRunner`]: no planning, no
+/// assessment, no minting — admitted items arrive through the transport and
+/// this consumer only carries them to the host. Returns the response with
+/// whether the failure (if any) was a provider failure for exit accounting.
+fn handle_forward_hook(
+    runner: &mut BridgeRunner,
+    event: &HostEventEnvelope,
+) -> (Response, bool) {
+    match runner.forward_hook(event) {
+        Ok(()) => match runner.deliver_reactive_pending_via_hook(event.event_id.as_str()) {
+            Ok(receipts) => (
+                Response::Forwarded {
+                    bootstrap: None,
+                    reactive_receipts: receipts,
+                },
+                false,
+            ),
+            Err(error) => (
+                Response::Error {
+                    code: "REACTIVE_RECEIPT_REJECTED",
+                    detail: error.to_string(),
+                },
+                false,
+            ),
+        },
+        Err(error) => (bridge_error(&error), is_provider_failure(&error)),
+    }
+}
+
+/// Delivers response-piggybacked reactive injections through the live stdio
+/// consumer.
+///
+/// Runs the exact ForwardEvent dispatch step: forwards the event, then
+/// drains the live session's pending injections inside the next bridge
+/// response named by that event. Same wiring contract as
+/// [`handle_forward_hook`]: no planning, no assessment, no minting.
+fn handle_forward_event(runner: &mut BridgeRunner, event: &EventEnvelope) -> (Response, bool) {
+    match runner.forward_event(event) {
+        Ok(_) => {
+            let response_id = format!("forward-event:{}", event.event_id);
+            match runner.deliver_reactive_pending_via_response(&response_id) {
+                Ok(receipts) => (
+                    Response::Forwarded {
+                        bootstrap: None,
+                        reactive_receipts: receipts,
+                    },
+                    false,
+                ),
+                Err(error) => (
+                    Response::Error {
+                        code: "REACTIVE_RECEIPT_REJECTED",
+                        detail: error.to_string(),
+                    },
+                    false,
+                ),
+            }
+        }
+        Err(error) => (bridge_error(&error), is_provider_failure(&error)),
     }
 }
 
@@ -823,7 +915,10 @@ fn dry_run_invoke_plan(tool: &ToolRequest) -> (&'static str, &'static str, &'sta
         | ToolRequest::Act(_)
         | ToolRequest::Verify(_)
         | ToolRequest::Coordinate(_)
-        | ToolRequest::Finish(_) => (
+        | ToolRequest::Finish(_)
+        | ToolRequest::UserAutomation(_)
+        | ToolRequest::SkillInject(_)
+        | ToolRequest::SkillDisplay(_) => (
             "effectful",
             DRY_RUN_ROUTE_WITHHELD,
             DRY_RUN_UNSUPPORTED_DISPOSITION,
@@ -1453,6 +1548,23 @@ mod tests {
         }
     }"#;
 
+    const DRY_RUN_SKILL: &str = r#"{
+        "op":"dry_run_invoke",
+        "request":{
+            "protocol_version":"2026-07-28",
+            "correlation_id":"host-dryrun-skill-1",
+            "client_capabilities":{"tasks":false},
+            "tool":{"name":"skill.inject","arguments":{"contract_version":1}},
+            "deadline_preference_ms":5000,
+            "observed_context":{
+                "host_session_hint":"host-turn-1",
+                "observed_resource_refs":[],
+                "event_cursors":[],
+                "trace_context":{}
+            }
+        }
+    }"#;
+
     fn dry_run_test_runner() -> BridgeRunner {
         BridgeRunner::new(
             Profile::SpineFunctional,
@@ -1614,6 +1726,36 @@ mod tests {
                 && !evidence.statement.contains("admitted"),
             "unsupported preview must not assert external validation occurred"
         );
+    }
+
+    #[test]
+    fn dry_run_skill_carrier_returns_unsupported_without_dispatch() {
+        // Skill carriers are effectful (install/issue) with no bridge-owned
+        // simulator: the dry run stays a static preview naming the skill
+        // route, dispatching nothing.
+        let Request::DryRunInvoke { request } =
+            serde_json::from_str::<Request>(DRY_RUN_SKILL).expect("dry-run must deserialize")
+        else {
+            panic!("expected dry-run invoke");
+        };
+        assert_eq!(request.tool.canonical_name(), "skill.inject");
+        let runner = dry_run_test_runner();
+        let response = dry_run_invocation(&runner, &request);
+        let Response::DryRun {
+            disposition,
+            preview,
+            evidence,
+            ..
+        } = response
+        else {
+            panic!("skill dry run must stay a dry-run envelope");
+        };
+        assert_eq!(disposition, "DRY_RUN_UNSUPPORTED");
+        assert_eq!(preview.canonical_tool_name.as_deref(), Some("skill.inject"));
+        assert_eq!(preview.effect_class, "effectful");
+        assert_eq!(preview.route, "withheld-no-simulator");
+        assert!(!preview.simulated);
+        assert!(evidence.statement.contains("DRY_RUN_UNSUPPORTED"));
     }
 
     #[test]
@@ -2284,5 +2426,611 @@ mod tests {
             .get_understanding_bootstrap(&empty_tasks(), CurrentAssessment::Ready)
             .expect("explicit retrieval stays available");
         assert_eq!(explicit.governance.profile_ref, "governance-profile-1");
+    }
+
+    /// C3 production-path proof: supported Kernel read-result bytes reaching the normal
+    /// Invoke path populate the attach-scoped evidence registry through the real caller
+    /// chain (gateway → authenticated outcome → runner record), and the snapshot expands
+    /// back to the exact bytes. No manual publisher feed: the only producer here is the
+    /// stubbed trusted port standing in for the Kernel boundary, exactly as the
+    /// `UnavailableKernelHostRequestPort` placeholder does for rejections.
+    mod tool_result_delivery_tests {
+        use super::super::{
+            BridgeRunner, Profile, record_invocation_delivery, status_response,
+        };
+        use super::{
+            HostInvocationRequest, PortFailure, decode_bounded_request,
+            handle_invocation,
+        };
+        use eliot_agent_bridge_core::{
+            ActivationPortOutcome, ActivationPortResult, AttachRequest, DemandId, FencingToken,
+            Generation, HostActivationPort, PrincipalId, ProviderFailure, ProviderReadiness,
+            SessionId, TaskId, WorkUnitId,
+        };
+        use eliot_contracts::{EpochId, EpochLineageId};
+        use eliot_mcp::{
+            HostInvocationPortOutcome, HostOperationHandle, KernelHostRequestPort, McpResponse,
+            ResponseKind,
+        };
+        use eliot_receipts::ProofCeiling;
+        use std::num::NonZeroU64;
+
+        const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+        const DIGEST_A: &str =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+        struct StaticActivation {
+            result: ActivationPortResult,
+        }
+
+        impl HostActivationPort for StaticActivation {
+            fn activate(
+                &mut self,
+                _request: &AttachRequest,
+            ) -> Result<ActivationPortOutcome, ProviderFailure> {
+                Ok(ActivationPortOutcome::Authenticated(self.result.clone()))
+            }
+        }
+
+        fn attached_runner() -> BridgeRunner {
+            let generation = Generation::new(5).expect("non-zero test generation");
+            let fence = FencingToken::new(
+                EpochId::new(
+                    EpochLineageId::new(TEST_LINEAGE).expect("valid test lineage"),
+                    NonZeroU64::new(2).expect("nonzero test sequence"),
+                )
+                .expect("valid test epoch"),
+                generation,
+                "fence-delivery-5",
+            )
+            .expect("valid test fence");
+            let result = ActivationPortResult::authenticated(
+                PrincipalId::new("principal-delivery-1").expect("valid principal"),
+                SessionId::new("session-delivery-1").expect("valid session"),
+                generation,
+                fence,
+                TaskId::new("task-delivery-1").expect("valid task"),
+                WorkUnitId::new("work-unit-delivery-1").expect("valid work unit"),
+                "scope-delivery-1",
+                "task-revision-1",
+                "plan-delivery-1",
+                "plan-revision-1",
+            )
+            .expect("valid activation result");
+            let mut runner = BridgeRunner::new(
+                Profile::SpineFunctional,
+                ProviderReadiness::all_admitted(),
+                Some(Box::new(StaticActivation { result })),
+                None,
+            )
+            .expect("runner composes");
+            runner
+                .attach(AttachRequest::managed(
+                    DemandId::new("demand-delivery-1").expect("valid demand"),
+                    super::super::ConnectionId::new("conn-delivery-1").expect("valid connection"),
+                ))
+                .expect("managed attach admits");
+            runner
+        }
+
+        fn projection_response(kind: ResponseKind, content: serde_json::Value) -> McpResponse {
+            McpResponse {
+                request_id: "req-delivery-1".to_owned(),
+                idempotency_key: "idem-delivery-1".to_owned(),
+                canonical_request_sha256: DIGEST_A.to_owned(),
+                kind,
+                canonical_tool_name: "eliot.state".to_owned(),
+                content,
+                artifacts: Vec::new(),
+                proof_ceiling: ProofCeiling::Observation,
+                resource: None,
+                job: None,
+            }
+        }
+
+        struct RespondedPort {
+            response: McpResponse,
+        }
+
+        impl KernelHostRequestPort for RespondedPort {
+            fn invoke(
+                &mut self,
+                _request: &HostInvocationRequest,
+            ) -> Result<HostInvocationPortOutcome, PortFailure> {
+                Ok(HostInvocationPortOutcome::Responded {
+                    operation_handle: HostOperationHandle::new("kernel-operation-9")
+                        .expect("valid handle"),
+                    response: Box::new(self.response.clone()),
+                })
+            }
+
+            fn cancel(
+                &mut self,
+                _request: &super::super::HostCancellationRequest,
+            ) -> Result<super::HostCancellationPortOutcome, PortFailure> {
+                Err(PortFailure::PlanGap {
+                    missing_capability: "test.responded-port.cancel".to_owned(),
+                    reason: "cancel not exercised".to_owned(),
+                })
+            }
+        }
+
+        fn invoke_request() -> HostInvocationRequest {
+            let decoded = decode_bounded_request(super::INVOKE).expect("invoke must decode");
+            match decoded {
+                super::Request::Invoke { request } => request,
+                _ => panic!("expected invoke"),
+            }
+        }
+
+        fn large_content() -> serde_json::Value {
+            serde_json::json!({"evidence": "x".repeat(4096)})
+        }
+
+        #[test]
+        fn large_supported_tool_result_populates_registry_and_expands() {
+            use eliot_agent_bridge::MAX_PREVIEW_BYTES;
+
+            let mut runner = attached_runner();
+            assert_eq!(runner.resource_registry_len(), 0);
+            let request = invoke_request();
+            let mut port = RespondedPort {
+                response: projection_response(ResponseKind::Projection, large_content()),
+            };
+            // Exact production order: gateway dispatch, then delivery recording.
+            let mut response = handle_invocation(&super::HostRequestGateway, &mut port, &request);
+            record_invocation_delivery(&mut runner, &mut response);
+            let super::Response::Invocation {
+                result, evidence, ..
+            } = &response
+            else {
+                panic!("invoke must answer an invocation envelope");
+            };
+            assert_eq!(result.correlation_id().as_str(), "host-request-1");
+            assert!(
+                evidence.is_some(),
+                "large supported delivery must carry its recorded view"
+            );
+            // The response itself is forwarded exactly as the gateway shaped it.
+            let value = serde_json::to_value(&response).expect("response must serialize");
+            assert_eq!(
+                value["status"],
+                serde_json::Value::String("invocation".to_owned())
+            );
+            // The recorded handle rides the response: host-discoverable with
+            // its immutable URI, digest, and bounded preview.
+            let evidence = value
+                .get("evidence")
+                .expect("large supported delivery must project its handle");
+            let uri = evidence["handle"]["uri"]
+                .as_str()
+                .expect("handle must carry its canonical URI");
+            assert!(
+                uri.starts_with("eliot://evidence/"),
+                "evidence handle must be content-addressed, got {uri}"
+            );
+            let digest = evidence["handle"]["digest"]
+                .as_str()
+                .expect("handle must carry its content digest");
+            assert_eq!(digest.len(), 64);
+            assert!(
+                digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+                "handle digest must stay lowercase SHA-256 hex"
+            );
+            // The real caller path populated the registry with one snapshot.
+            assert_eq!(runner.resource_registry_len(), 1);
+            let stored = serde_json::to_vec(&large_content()).expect("content serializes");
+            assert!(stored.len() > MAX_PREVIEW_BYTES);
+            // Recording the same delivered bytes again rebinds the same handle:
+            // content-addressing is idempotent, never a second entry.
+            let again = runner
+                .record_tool_result_delivery(result.outcome())
+                .expect("re-record rebinds");
+            assert_eq!(runner.resource_registry_len(), 1);
+            // Expansion retrieves the exact delivered bytes behind a bounded preview.
+            assert!(again.preview().len() <= MAX_PREVIEW_BYTES);
+            assert!(again.is_truncated());
+            let expanded = runner
+                .expand_resource(again.handle())
+                .expect("expand resolves the issued handle");
+            assert_eq!(expanded, stored);
+            // Status projects the populated registry.
+            let status = status_response(Profile::SpineFunctional, &runner);
+            let status_value = serde_json::to_value(&status).expect("status must serialize");
+            assert_eq!(
+                status_value["resources"]["entries"],
+                serde_json::Value::from(1)
+            );
+        }
+
+        #[test]
+        fn unsupported_small_and_failed_tool_results_record_nothing() {
+            let mut runner = attached_runner();
+            let request = invoke_request();
+            // Unsupported kind carries no result semantics: nothing snapshotted.
+            let mut unsupported = RespondedPort {
+                response: projection_response(ResponseKind::Unsupported, large_content()),
+            };
+            let mut response =
+                handle_invocation(&super::HostRequestGateway, &mut unsupported, &request);
+            record_invocation_delivery(&mut runner, &mut response);
+            assert_eq!(runner.resource_registry_len(), 0);
+            let value = serde_json::to_value(&response).expect("response must serialize");
+            assert!(
+                value.get("evidence").is_none(),
+                "unsupported delivery must not project a handle"
+            );
+            // Small inline content stays fully visible: nothing withheld, nothing stored.
+            let mut small = RespondedPort {
+                response: projection_response(
+                    ResponseKind::Projection,
+                    serde_json::json!({"ok": true}),
+                ),
+            };
+            let mut response = handle_invocation(&super::HostRequestGateway, &mut small, &request);
+            record_invocation_delivery(&mut runner, &mut response);
+            assert_eq!(runner.resource_registry_len(), 0);
+            let value = serde_json::to_value(&response).expect("response must serialize");
+            assert!(
+                value.get("evidence").is_none(),
+                "small inline delivery must not project a handle"
+            );
+            // Rejected invocations carry no result: the error envelope records nothing.
+            let mut unavailable = super::UnavailableKernelHostRequestPort;
+            let mut response =
+                handle_invocation(&super::HostRequestGateway, &mut unavailable, &request);
+            record_invocation_delivery(&mut runner, &mut response);
+            assert_eq!(runner.resource_registry_len(), 0);
+        }
+
+        #[test]
+        fn detached_runner_records_nothing() {
+            let mut runner = super::fixture_runner();
+            let request = invoke_request();
+            let mut port = RespondedPort {
+                response: projection_response(ResponseKind::Projection, large_content()),
+            };
+            let mut response = handle_invocation(&super::HostRequestGateway, &mut port, &request);
+            record_invocation_delivery(&mut runner, &mut response);
+            assert_eq!(runner.resource_registry_len(), 0);
+            let value = serde_json::to_value(&response).expect("response must serialize");
+            assert!(
+                value.get("evidence").is_none(),
+                "detached recording must not project a handle"
+            );
+        }
+    }
+
+    /// C1 live-consumer proof: items admitted through the REAL production
+    /// chain (hand batch → live Governor derivation → transport → ledger)
+    /// are consumed by the REAL stdio ForwardHook dispatch step, and the
+    /// issued receipts ride the Forwarded wire frame. Withheld items yield
+    /// an empty Forwarded frame with no receipt key. No stub assessor, no
+    /// stub ledger, no direct ledger calls: the only producer is the
+    /// transport, the only consumer the extracted dispatch step.
+    mod reactive_hook_consumer_tests {
+        #![allow(clippy::expect_used)]
+
+        use super::super::handle_forward_hook;
+        use eliot_agent_bridge::{
+            BridgeRunner, Profile, RiskTier, SettledPlanAdmission, governor_assess,
+        };
+        use eliot_agent_bridge_core::{
+            ActivationPortOutcome, ActivationPortResult, AttachBinding, AttachRequest,
+            CoverageGap, DemandId, EventEnvelope, EventPortOutcome, FencingToken, Generation,
+            HostActivationPort, HostEventEnvelope, McpForwardingPort, PrincipalId,
+            ProviderFailure, ProviderReadiness, ReconciliationPortOutcome, SessionId, TaskId,
+            WorkUnitId,
+        };
+        use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
+        use eliot_integration_coverage::{
+            ALL_EVENTS, DispatchOrdering, EventCompleteness, EventCoverage, EventDisposition,
+            GovernorCoverageDerivation, IntegrationCoverageProfile, LogicalEvent,
+            TraceFreshness, WatchdogEvidence,
+        };
+        use eliot_reactive_context_plan::{
+            BridgeAdmissionBatch, BridgeAdmissionDelivery, BridgeAdmissionInstruction,
+            BridgeAdmissionSeverity,
+        };
+        use std::num::NonZeroU64;
+
+        const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+        const TEST_SESSION: &str = "session-consumer-1";
+        const TEST_DIGEST: &str =
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        struct StaticActivation {
+            result: ActivationPortResult,
+        }
+
+        impl HostActivationPort for StaticActivation {
+            fn activate(
+                &mut self,
+                _request: &AttachRequest,
+            ) -> Result<ActivationPortOutcome, ProviderFailure> {
+                Ok(ActivationPortOutcome::Authenticated(self.result.clone()))
+            }
+        }
+
+        struct OkForwarder;
+
+        impl McpForwardingPort for OkForwarder {
+            fn forward_hook(
+                &mut self,
+                _binding: &AttachBinding,
+                _event: &HostEventEnvelope,
+            ) -> Result<(), ProviderFailure> {
+                Ok(())
+            }
+            fn forward_event(
+                &mut self,
+                _binding: &AttachBinding,
+                _event: &EventEnvelope,
+            ) -> Result<EventPortOutcome, ProviderFailure> {
+                Ok(EventPortOutcome::BestEffortForwarded)
+            }
+            fn forward_gap(
+                &mut self,
+                _binding: &AttachBinding,
+                _gap: &CoverageGap,
+            ) -> Result<(), ProviderFailure> {
+                Err(ProviderFailure::new("test-forwarder", "gap not exercised"))
+            }
+            fn reconcile_external(
+                &mut self,
+                _binding: &AttachBinding,
+            ) -> Result<ReconciliationPortOutcome, ProviderFailure> {
+                Err(ProviderFailure::new(
+                    "test-forwarder",
+                    "reconciliation not exercised",
+                ))
+            }
+        }
+
+        fn test_epoch(sequence: u64) -> EpochId {
+            EpochId::new(
+                EpochLineageId::new(TEST_LINEAGE).expect("valid test lineage"),
+                NonZeroU64::new(sequence).expect("nonzero test sequence"),
+            )
+            .expect("valid test epoch")
+        }
+
+        fn test_fence() -> StateFence {
+            StateFence::new(
+                test_epoch(3),
+                ResourceGeneration::new(7).expect("non-zero test generation"),
+            )
+        }
+
+        fn consumer_runner() -> BridgeRunner {
+            let generation = Generation::new(7).expect("non-zero test generation");
+            let fence = FencingToken::new(test_epoch(3), generation, "fence-consumer-7")
+                .expect("valid test fence");
+            let result = ActivationPortResult::authenticated(
+                PrincipalId::new("principal-consumer-1").expect("valid principal"),
+                SessionId::new(TEST_SESSION).expect("valid session"),
+                generation,
+                fence,
+                TaskId::new("task-consumer-1").expect("valid task"),
+                WorkUnitId::new("work-unit-consumer-1").expect("valid work unit"),
+                "scope-consumer-1",
+                "task-revision-1",
+                "plan-consumer-1",
+                "plan-revision-1",
+            )
+            .expect("valid activation result");
+            let mut runner = BridgeRunner::new(
+                Profile::SpineFunctional,
+                ProviderReadiness::all_admitted(),
+                Some(Box::new(StaticActivation { result })),
+                Some(Box::new(OkForwarder)),
+            )
+            .expect("runner composes");
+            runner
+                .attach(AttachRequest::managed(
+                    DemandId::new("demand-consumer-1").expect("valid demand"),
+                    super::super::ConnectionId::new("conn-consumer-1")
+                        .expect("valid connection"),
+                ))
+                .expect("managed attach admits");
+            runner
+        }
+
+        fn hook_event(hook_id: &str) -> HostEventEnvelope {
+            serde_json::from_value(serde_json::json!({
+                "event_id": hook_id,
+                "attempt_id": "attempt-consumer-1",
+                "sequence": 1,
+                "cursor": "cursor-consumer-1",
+                "kind": "tool_result",
+                "route": {
+                    "host_family": "test",
+                    "adapter": "test",
+                    "protocol_transport": "stdio",
+                    "runtime_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "adapter_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "provider": "provider",
+                    "model": "model",
+                    "auth_billing": "test",
+                    "serializer_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                    "tool_semantics_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                    "reasoning_mode": "test",
+                    "continuation_behavior": "fresh",
+                    "feature_flags_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                },
+                "raw_payload_digest": "digest-consumer-1",
+                "normalized_payload": {},
+                "parent_event_id": null,
+                "observed_at": "2026-09-21T00:00:00Z"
+            }))
+            .expect("valid hook fixture")
+        }
+
+        fn live_derivation() -> GovernorCoverageDerivation {
+            let events: Vec<EventCoverage> = ALL_EVENTS
+                .iter()
+                .map(|event| EventCoverage {
+                    event: *event,
+                    disposition: if matches!(
+                        event,
+                        LogicalEvent::PreToolUse | LogicalEvent::PermissionRequest
+                    ) {
+                        EventDisposition::Enforced
+                    } else {
+                        EventDisposition::Observed
+                    },
+                    ordering: DispatchOrdering::PreDispatch,
+                    completeness: EventCompleteness::Complete,
+                    proof_ceiling: "test-ceiling".to_owned(),
+                    source: "test-source".to_owned(),
+                    gaps: Vec::new(),
+                })
+                .collect();
+            let coverage = IntegrationCoverageProfile::candidate(
+                "fingerprint-1",
+                events,
+                EventCompleteness::Complete,
+                "test-ceiling",
+                "test-source",
+                Vec::new(),
+            )
+            .expect("candidate")
+            .verify("fingerprint-1", true)
+            .expect("verified");
+            let mut derivation = GovernorCoverageDerivation::new();
+            derivation
+                .derive(
+                    &coverage,
+                    &WatchdogEvidence {
+                        supervisor_id: "watchdog-1".to_owned(),
+                        fresh: true,
+                        summary: "test supervision".to_owned(),
+                    },
+                    TraceFreshness::Fresh,
+                )
+                .expect("derive");
+            derivation
+        }
+
+        fn instruction(item_id: &str) -> BridgeAdmissionInstruction {
+            BridgeAdmissionInstruction {
+                cue_id: item_id.to_owned(),
+                cue_source: "tool-surface-1".to_owned(),
+                cue_source_revision: "rev-1".to_owned(),
+                cue_digest: TEST_DIGEST.to_owned(),
+                rule_id: "reactive-activation:plan-digest-1".to_owned(),
+                relations: vec!["rel-a".to_owned()],
+                scope_id: "scope-consumer-1".to_owned(),
+                status: "EVENT_PLAN".to_owned(),
+                governance_profile_rev: "policy-digest-1".to_owned(),
+                fence: test_fence(),
+                severity: BridgeAdmissionSeverity::Critical,
+                delivery: BridgeAdmissionDelivery::HostHook,
+                dedup_key: format!("plan-digest-1:{item_id}"),
+                plan_item_id: item_id.to_owned(),
+                plan_result_digest: "plan-digest-1".to_owned(),
+                item_reason: "fixture reason".to_owned(),
+                attention: None,
+            }
+        }
+
+        fn batch(item_id: &str) -> BridgeAdmissionBatch {
+            BridgeAdmissionBatch {
+                session_id: eliot_contracts::SessionId::new(TEST_SESSION)
+                    .expect("valid session"),
+                scope_id: eliot_receipts::WorkScopeId::new("scope-consumer-1")
+                    .expect("valid scope"),
+                invalidations: Vec::new(),
+                items: vec![instruction(item_id)],
+                skipped_sticky: 0,
+                skipped_ineligible: 0,
+            }
+        }
+
+        #[test]
+        fn admitted_item_rides_the_live_hook_frame_with_governor_receipt() {
+            let mut runner = consumer_runner();
+            let mut driver = SettledPlanAdmission::new();
+            let derivation = live_derivation();
+            // Production chain only: batch → live Governor assessment →
+            // transport → ledger. No direct ledger calls.
+            let report = driver
+                .admit_batch(&mut runner, &batch("item-hook-1"), |item, critical| {
+                    governor_assess(&derivation, item, critical)
+                })
+                .expect("live assessment admits");
+            assert_eq!(report.admitted.len(), 1);
+            assert!(report.withheld.is_empty());
+            assert_eq!(runner.reactive_pending_count(), 1);
+            // Live stdio consumer: the extracted ForwardHook dispatch step
+            // drains the pending item through the real forwarded event.
+            let event = hook_event("hook-consumer-1");
+            let (response, provider_failed) = handle_forward_hook(&mut runner, &event);
+            assert!(!provider_failed);
+            let super::Response::Forwarded {
+                reactive_receipts, ..
+            } = &response
+            else {
+                panic!("hook consumer answers a forwarded envelope");
+            };
+            assert_eq!(reactive_receipts.len(), 1);
+            let receipt = &reactive_receipts[0];
+            assert_eq!(receipt.session_id, TEST_SESSION);
+            assert_eq!(receipt.admission.risk, RiskTier::Severe);
+            assert_eq!(
+                receipt.admission.fence_epoch,
+                format!("{TEST_LINEAGE}:3")
+            );
+            assert_eq!(receipt.admission.fence_generation, 7);
+            assert_eq!(runner.reactive_pending_count(), 0);
+            // The receipt rides the wire frame with the Governor tier.
+            let value = serde_json::to_value(&response).expect("response must serialize");
+            assert_eq!(
+                value["status"],
+                serde_json::Value::String("forwarded".to_owned())
+            );
+            let wire = value["reactive_receipts"]
+                .as_array()
+                .expect("receipts must list");
+            assert_eq!(wire.len(), 1);
+            assert_eq!(
+                wire[0]["admission"]["risk"],
+                serde_json::Value::String("SEVERE".to_owned())
+            );
+            assert_eq!(
+                wire[0]["delivery"]["hook_id"],
+                serde_json::Value::String("hook-consumer-1".to_owned())
+            );
+        }
+
+        #[test]
+        fn withheld_item_yields_an_empty_hook_frame() {
+            let mut runner = consumer_runner();
+            let mut driver = SettledPlanAdmission::new();
+            // Nothing derived: the real assessment withholds, the ledger
+            // stays empty, and the live consumer emits a receipt-less frame.
+            let bare = GovernorCoverageDerivation::new();
+            let report = driver
+                .admit_batch(&mut runner, &batch("item-hook-2"), |item, critical| {
+                    governor_assess(&bare, item, critical)
+                })
+                .expect("withhold is honest, not failure");
+            assert!(report.admitted.is_empty());
+            assert_eq!(report.withheld.len(), 1);
+            let event = hook_event("hook-consumer-2");
+            let (response, provider_failed) = handle_forward_hook(&mut runner, &event);
+            assert!(!provider_failed);
+            let value = serde_json::to_value(&response).expect("response must serialize");
+            assert_eq!(
+                value["status"],
+                serde_json::Value::String("forwarded".to_owned())
+            );
+            assert!(
+                value.get("reactive_receipts").is_none(),
+                "no delivery means no receipt key on the wire"
+            );
+        }
     }
 }

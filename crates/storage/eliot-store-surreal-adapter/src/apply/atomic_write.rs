@@ -9,6 +9,8 @@
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
+use super::surreal_automation::{AutomationWrites, automation_write_statements};
+use super::surreal_reactive::{ReactiveWrites, reactive_write_statements};
 use crate::client;
 use crate::config::SurrealAdapterConfig;
 use crate::error::AdapterError;
@@ -80,6 +82,11 @@ const ALLOCATION_CONFLICT_MARKERS: &[&str] = &[
     "canonical_fence_cas_conflict",
     "canonical_fence_create_conflict",
     "notification_revision_conflict",
+    "reactive_session_conflict",
+    "reactive_snapshot_conflict",
+    "automation_revision_conflict",
+    "automation_current_conflict",
+    "automation_invocation_conflict",
 ];
 
 /// Provider markers proving a deterministic semantic conflict: stale
@@ -193,6 +200,8 @@ pub(super) async fn write_transaction(
     current_orderings: &[OrderingHead],
     lane: TxLane,
     notifications: &[super::surreal_notification::SurrealNotificationWrite],
+    reactive: &ReactiveWrites,
+    automation: &AutomationWrites,
 ) -> Result<(), AdapterError> {
     let operation_id = transition.identity.operation_id.to_string();
     let (sql, bindings) = build_apply_statements(
@@ -205,6 +214,8 @@ pub(super) async fn write_transaction(
         current_revisions,
         current_orderings,
         notifications,
+        reactive,
+        automation,
     )?;
     // 688-B classifies provider replies after the atomic RPC: deterministic
     // fence/head markers are conflicts, while an unavailable or unclassified
@@ -263,6 +274,8 @@ fn build_apply_statements(
     current_revisions: &[RevisionHead],
     current_orderings: &[OrderingHead],
     notifications: &[super::surreal_notification::SurrealNotificationWrite],
+    reactive: &ReactiveWrites,
+    automation: &AutomationWrites,
 ) -> Result<(String, Map<String, Value>), AdapterError> {
     let operation_id = transition.identity.operation_id.to_string();
     let revision = plan.next_revision_heads.first().ok_or_else(|| {
@@ -475,6 +488,10 @@ fn build_apply_statements(
 
     append_notification_statements(&mut sql, &mut bindings, notifications)?;
 
+    append_reactive_statements(&mut sql, &mut bindings, reactive)?;
+
+    append_automation_statements(&mut sql, &mut bindings, automation)?;
+
     sql.push_str(schema::TX_CREATE_RECEIPT);
     bindings.insert(
         "receipt_table".to_owned(),
@@ -534,6 +551,52 @@ fn append_notification_statements(
         if bindings.insert(name.clone(), value).is_some() {
             return Err(AdapterError::Serialization(
                 "notification binding collided with a canonical binding".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Appends canonical automation row writes (issue #1779).
+///
+/// Same atomicity contract as the sibling fragments: revision
+/// create-or-converge, pointer compare-and-set, and invocation
+/// create-or-converge rows commit in the same transaction as the receipt
+/// and outbox rows. Binding collisions fail closed instead of silently
+/// overwriting a canonical binding.
+fn append_automation_statements(
+    sql: &mut String,
+    bindings: &mut Map<String, Value>,
+    automation: &AutomationWrites,
+) -> Result<(), AdapterError> {
+    let (fragment, fragment_bindings) = automation_write_statements(automation);
+    sql.push_str(&fragment);
+    for (name, value) in fragment_bindings {
+        if bindings.insert(name.clone(), value).is_some() {
+            return Err(AdapterError::Serialization(
+                "automation binding collided with a canonical binding".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+/// Appends canonical reactive row writes (issue #1941 C4).
+///
+/// Same atomicity contract as the notification fragment above: session
+/// compare-and-set plus snapshot create-or-converge rows commit in the
+/// same transaction as the receipt and outbox rows. Binding collisions
+/// fail closed instead of silently overwriting a canonical binding.
+fn append_reactive_statements(
+    sql: &mut String,
+    bindings: &mut Map<String, Value>,
+    reactive: &ReactiveWrites,
+) -> Result<(), AdapterError> {
+    let (fragment, fragment_bindings) = reactive_write_statements(reactive);
+    sql.push_str(&fragment);
+    for (name, value) in fragment_bindings {
+        if bindings.insert(name.clone(), value).is_some() {
+            return Err(AdapterError::Serialization(
+                "reactive binding collided with a canonical binding".to_owned(),
             ));
         }
     }
@@ -1480,6 +1543,8 @@ mod allocation_classification_tests {
             &current_revisions,
             &current_orderings,
             &[],
+            &ReactiveWrites::default(),
+            &AutomationWrites::default(),
         )
         .expect("statements assemble");
         assert!(sql.starts_with(schema::TX_BEGIN), "one transaction opens");
@@ -1516,9 +1581,20 @@ mod allocation_classification_tests {
         );
         // Absent heads select the create path instead of the CAS-update
         // path; the fence singleton still CAS-guards the steady state.
-        let (create_sql, _) =
-            build_apply_statements(&transition, &plan, &receipt, false, 1, 1, &[], &[], &[])
-                .expect("create path assembles");
+        let (create_sql, _) = build_apply_statements(
+            &transition,
+            &plan,
+            &receipt,
+            false,
+            1,
+            1,
+            &[],
+            &[],
+            &[],
+            &ReactiveWrites::default(),
+            &AutomationWrites::default(),
+        )
+        .expect("create path assembles");
         assert!(
             create_sql.contains("revision_head_create_conflict"),
             "absent revision head is created guarded"
@@ -1531,9 +1607,20 @@ mod allocation_classification_tests {
             create_sql.contains("canonical_fence_cas_conflict"),
             "steady-state fence still CAS-guards allocation"
         );
-        let (genesis_sql, _) =
-            build_apply_statements(&transition, &plan, &receipt, true, 1, 1, &[], &[], &[])
-                .expect("genesis assembles");
+        let (genesis_sql, _) = build_apply_statements(
+            &transition,
+            &plan,
+            &receipt,
+            true,
+            1,
+            1,
+            &[],
+            &[],
+            &[],
+            &ReactiveWrites::default(),
+            &AutomationWrites::default(),
+        )
+        .expect("genesis assembles");
         assert!(
             genesis_sql.contains("canonical_fence_create_conflict"),
             "initial state creates the fence singleton"
@@ -1550,9 +1637,20 @@ mod allocation_classification_tests {
         let transition = transition("op-contents");
         let plan = plan_apply(&transition, &[], &[], 3, 7).expect("plan applies");
         let receipt = build_receipt(&ctx, &transition, &plan).expect("receipt builds");
-        let (sql, bindings) =
-            build_apply_statements(&transition, &plan, &receipt, false, 3, 7, &[], &[], &[])
-                .expect("statements assemble");
+        let (sql, bindings) = build_apply_statements(
+            &transition,
+            &plan,
+            &receipt,
+            false,
+            3,
+            7,
+            &[],
+            &[],
+            &[],
+            &ReactiveWrites::default(),
+            &AutomationWrites::default(),
+        )
+        .expect("statements assemble");
         assert_eq!(
             sql.matches("CREATE type::record($event_table0").count(),
             1,

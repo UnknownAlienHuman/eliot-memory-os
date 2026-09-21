@@ -21,8 +21,9 @@
 //! [`NamedReadOperation::GetCurrentEpistemicPosition`],
 //! [`NamedReadOperation::GetTaskState`],
 //! [`NamedReadOperation::GetAttentionAndProblems`],
-//! [`NamedReadOperation::GetUnderstandingProjectionInputs`] and
-//! [`NamedReadOperation::GetCapabilityEvidenceState`] pass
+//! [`NamedReadOperation::GetUnderstandingProjectionInputs`],
+//! [`NamedReadOperation::GetCapabilityEvidenceState`] and
+//! [`NamedReadOperation::GetNotificationState`] pass
 //! [`CanonicalReadClient::execute_named`]; every other named operation fails
 //! closed as [`StoreError::UnknownOperation`] before any transport.
 //!
@@ -142,6 +143,7 @@ impl KernelContextReadClient {
             | NamedReadOperation::GetCapabilityEvidenceState => {
                 Self::check_reconstruction_capability(request)
             }
+            NamedReadOperation::GetNotificationState => Self::check_notification_selectors(request),
             NamedReadOperation::GetCurrentEpistemicPosition => {
                 if request.scope_id.is_none() {
                     return Err(StoreError::InvalidField {
@@ -174,6 +176,85 @@ impl KernelContextReadClient {
             }
             _ => Err(StoreError::UnknownOperation),
         }
+    }
+
+    /// Checks the closed notification-read selectors before any transport:
+    /// `ExactFence` consistency, a `page_limit` decimal string in `1..=128`,
+    /// an `include_resolved` `"true"`/`"false"` string, optional non-blank
+    /// `scope`/`dedup_key`/`notification_id`/`cursor` text, and no other
+    /// parameter keys. Mirrors the store contract's
+    /// `notification_read_request` bounds without reimplementing its
+    /// catalogue: anything outside the closed selector set fails closed
+    /// here, and the store catalogue re-validates on its leg.
+    fn check_notification_selectors(request: &NamedReadRequest) -> Result<(), StoreError> {
+        const ALLOWED: [&str; 6] = [
+            "scope",
+            "dedup_key",
+            "notification_id",
+            "include_resolved",
+            "page_limit",
+            "cursor",
+        ];
+        if request.consistency != ReadConsistency::ExactFence {
+            return Err(StoreError::InvalidField {
+                field: "operation.consistency",
+                reason: "GetNotificationState requires ExactFence",
+            });
+        }
+        for key in request.parameters.keys() {
+            if !ALLOWED.contains(&key.as_str()) {
+                return Err(StoreError::InvalidField {
+                    field: "operation.parameter",
+                    reason: "unknown notification read parameter",
+                });
+            }
+        }
+        let limit = request
+            .parameters
+            .get("page_limit")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(StoreError::InvalidField {
+                field: "notification.page_limit",
+                reason: "page limit is required",
+            })?;
+        match limit.parse::<u16>() {
+            Ok(value) if (1..=128).contains(&value) => {}
+            _ => {
+                return Err(StoreError::InvalidField {
+                    field: "notification.page_limit",
+                    reason: "page limit is out of range",
+                });
+            }
+        }
+        match request
+            .parameters
+            .get("include_resolved")
+            .and_then(serde_json::Value::as_str)
+        {
+            Some("true" | "false") => {}
+            _ => {
+                return Err(StoreError::InvalidField {
+                    field: "notification.include_resolved",
+                    reason: "include_resolved must be true or false",
+                });
+            }
+        }
+        for key in ["scope", "dedup_key", "notification_id", "cursor"] {
+            if let Some(value) = request.parameters.get(key) {
+                match value.as_str() {
+                    Some(text)
+                        if !text.trim().is_empty() && !text.chars().any(char::is_control) => {}
+                    _ => {
+                        return Err(StoreError::InvalidField {
+                            field: "operation.parameter",
+                            reason: "notification text selector must be non-blank text",
+                        });
+                    }
+                }
+            }
+        }
+        request.validate()?;
+        Ok(())
     }
 
     /// Checks the local-read execute capability before any read is served:
@@ -696,6 +777,15 @@ impl<'a, K: ?Sized, R: ?Sized> ReconstructionReadComposition<'a, K, R> {
             return Err(StoreError::FenceMismatch);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+impl KernelContextReadClient {
+    /// Test-only entry to the closed capability gate: proves the exact
+    /// notification selector set admitted above without touching transport.
+    pub(crate) fn check_board_read_for_test(request: &NamedReadRequest) -> Result<(), StoreError> {
+        Self::check_execute_capability(request)
     }
 }
 
