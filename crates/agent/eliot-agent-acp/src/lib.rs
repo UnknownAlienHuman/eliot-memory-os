@@ -17,6 +17,14 @@ pub use durable_host_event_ingest::{
     RedactionReceipt, ReplayItem, StageAllowed, StageOutcome, StageRedacted, StoredPayload,
     StreamCursorState, contains_forbidden_content, deterministic_redacted_bytes,
 };
+mod host_event_producer;
+pub use host_event_producer::{
+    ProduceOutcome, ProducerError, ProducerFrame, produce_allowed, produce_redacted,
+};
+mod persistence_owner;
+pub use persistence_owner::HostEventPersistenceOwner;
+mod reconnect_driver;
+pub use reconnect_driver::{ReconnectOutcome, drive_reconnect};
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 

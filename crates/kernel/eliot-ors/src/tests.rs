@@ -2749,6 +2749,199 @@ fn persisted_invalid_label_and_envelope_digest_fail_closed() -> TestResult {
     Ok(())
 }
 
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one acceptance proof exercises the complete stage, restart, reconcile, and Recovery Problem surface of issue #1925"
+)]
+fn accept_after_stage_stages_envelope_and_corruption_becomes_recovery_problem() -> TestResult {
+    // ACCEPTED_PENDING is observed only after atomic durable staging plus
+    // read-back, hash validation, and operation-identity indexing. After a
+    // restart the record enumerates, validates, and reconciles by operation
+    // identity into its canonical receipt.
+    let path = database_path("accept-after-stage");
+    cleanup(&path);
+    let writer_epoch = epoch(TEST_LINEAGE_A, 7)?;
+    let accepted = {
+        let coordinator = coordinator(&path)?;
+        let accepted = coordinator.accept_after_stage(request(
+            "reservation-accepted",
+            "operation-accepted",
+            writer_epoch.clone(),
+            &["scope-accepted"],
+        )?)?;
+        assert_eq!(AcceptedPending::outcome_label(), "ACCEPTED_PENDING");
+        assert!(accepted.reservation_order > 0);
+        assert_eq!(
+            accepted.prepared_transition_sha256,
+            "11".repeat(32),
+            "acceptance must stage the complete opaque prepared operation digest"
+        );
+        accepted
+    };
+    {
+        let coordinator = coordinator(&path)?;
+        let page = coordinator
+            .store()
+            .recover_page(RecoveryCursor::new(0, 8)?)?;
+        let staged = page
+            .records
+            .iter()
+            .find(|record| record.token.reservation_id == accepted.reservation_id)
+            .ok_or("staged reservation must enumerate after restart")?;
+        let envelope = coordinator
+            .store()
+            .verify_staged_envelope(&accepted.operation_id)?;
+        assert_eq!(envelope.operation_or_checkpoint_id, accepted.operation_id);
+        coordinator.eligible(&staged.token)?;
+        coordinator.execute(&staged.token, &writer_epoch.current)?;
+        let canonical_receipt = receipt(&staged.token, &success_disposition())?;
+        let exact = reconciliation(
+            &staged.token,
+            canonical_receipt,
+            CanonicalDisposition::Committed,
+        )?;
+        let finalized = coordinator.reconcile(&exact)?;
+        assert_eq!(finalized.state, ReservationState::Finalized);
+        assert!(
+            coordinator
+                .store()
+                .load_recovery_problem(&accepted.operation_id)?
+                .is_none(),
+            "a cleanly staged operation must not carry a Recovery Problem"
+        );
+    }
+    cleanup(&path);
+
+    // A deliberately corrupted staged payload produces a visible durable
+    // Recovery Problem and remains available for disposition across restarts
+    // instead of being silently dropped.
+    let corrupt_path = database_path("accept-after-stage-corrupt");
+    cleanup(&corrupt_path);
+    let operation_id = {
+        let coordinator = coordinator(&corrupt_path)?;
+        let accepted = coordinator.accept_after_stage(request(
+            "reservation-corrupt",
+            "operation-corrupt",
+            epoch(TEST_LINEAGE_A, 7)?,
+            &["scope-corrupt"],
+        )?)?;
+        accepted.operation_id
+    };
+    {
+        let database = redb::Database::create(&corrupt_path)?;
+        let write = database.begin_write()?;
+        {
+            let definition: redb::TableDefinition<&str, &str> =
+                redb::TableDefinition::new("ors_envelopes_v1");
+            let mut table = write.open_table(definition)?;
+            let value = table
+                .get(operation_id.as_str())?
+                .ok_or("missing staged envelope")?;
+            let mut invalid: Value = serde_json::from_str(value.value())?;
+            drop(value);
+            invalid["payload_sha256"] = json!("00".repeat(32));
+            let encoded = serde_json::to_string(&invalid)?;
+            table.insert(operation_id.as_str(), encoded.as_str())?;
+        }
+        write.commit()?;
+        drop(database);
+    }
+    {
+        let coordinator = coordinator(&corrupt_path)?;
+        assert!(matches!(
+            coordinator.store().verify_staged_envelope(&operation_id),
+            Err(OrsError::RecoveryProblemRetained { .. })
+        ));
+        let problem = coordinator
+            .store()
+            .load_recovery_problem(&operation_id)?
+            .ok_or("corrupted payload must retain a Recovery Problem")?;
+        assert_eq!(problem.kind, RecoveryProblemKind::HashMismatch);
+        assert!(!problem.is_resolved());
+        let serialized = serde_json::to_value(&problem)?;
+        assert!(serialized.get("ciphertext").is_none());
+        assert!(serialized.get("payload").is_none());
+    }
+    {
+        let coordinator = coordinator(&corrupt_path)?;
+        let retained = coordinator
+            .store()
+            .load_recovery_problem(&operation_id)?
+            .ok_or("Recovery Problem must survive restart")?;
+        let owner = retained.recovery_owner.clone();
+        assert!(matches!(
+            coordinator.store().resolve_recovery_problem(
+                &operation_id,
+                &label("receipt-terminal-1")?,
+                &label("other-recovery-owner")?
+            ),
+            Err(OrsError::RecoveryOwnerMismatch)
+        ));
+        let resolved = coordinator.store().resolve_recovery_problem(
+            &operation_id,
+            &label("receipt-terminal-1")?,
+            &owner,
+        )?;
+        assert!(resolved.is_resolved());
+        let replayed = coordinator.store().resolve_recovery_problem(
+            &operation_id,
+            &label("receipt-terminal-1")?,
+            &owner,
+        )?;
+        assert_eq!(replayed, resolved);
+        assert!(
+            coordinator
+                .store()
+                .load_recovery_problem(&operation_id)?
+                .is_some(),
+            "a disposed problem must remain loadable, never silently deleted"
+        );
+    }
+    cleanup(&corrupt_path);
+
+    // An undecryptable staged payload (missing key) is reported digest-only
+    // and retained until explicit disposition. Plaintext fallback is
+    // forbidden by construction: the report carries digests, never bytes.
+    let undecryptable_path = database_path("accept-after-stage-undecryptable");
+    cleanup(&undecryptable_path);
+    {
+        let coordinator = coordinator(&undecryptable_path)?;
+        let authority_epoch = epoch(TEST_LINEAGE_A, 7)?;
+        let problem = RecoveryProblem::new(
+            label("operation-undecryptable")?,
+            None,
+            RecoveryProblemKind::MissingKey,
+            label("installation key is unavailable")?,
+            Some("33".repeat(32)),
+            Some("22".repeat(32)),
+            authority_epoch.clone(),
+            fence(&authority_epoch)?,
+            label("kernel-recovery-owner")?,
+            10,
+        )?;
+        let reported = coordinator.store().report_recovery_problem(problem)?;
+        assert!(!reported.is_resolved());
+        assert_eq!(
+            coordinator
+                .store()
+                .report_recovery_problem(reported.clone())?,
+            reported,
+            "an exact replay must return the durable problem unchanged"
+        );
+        let listed = coordinator.store().list_recovery_problems(8)?;
+        assert_eq!(listed, vec![reported.clone()]);
+        let resolved = coordinator.store().resolve_recovery_problem(
+            &reported.operation_or_checkpoint_id,
+            &label("receipt-terminal-2")?,
+            &reported.recovery_owner,
+        )?;
+        assert!(resolved.is_resolved());
+    }
+    cleanup(&undecryptable_path);
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // T9-03 owner-backed durable replay stream (issue #22, M3).
 // ---------------------------------------------------------------------------

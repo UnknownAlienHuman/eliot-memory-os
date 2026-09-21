@@ -37,6 +37,7 @@ mod store_write_reservation;
 #[cfg(test)]
 mod store_write_reservation_tests;
 mod testd_front_door;
+mod write_coordinator;
 
 pub use capacity_evidence::{
     BoundaryOptimizationProposal, CAPACITY_EVIDENCE_SCHEMA_VERSION, CanonicalWriteLatencyProfile,
@@ -125,6 +126,10 @@ pub use testd_front_door::{
     TestdAdmissionResponse, advertise_testd_admission, advertise_testd_admission_when_composed,
     handle_testd_admission_attempt, handle_testd_cancellation, is_testd_diagnosis_only_envelope,
     reconcile_testd_admission, reconcile_testd_delivery, route_testd_admission,
+};
+pub use write_coordinator::{
+    CoordinatorError, ScopeExecutionGuard, WriteCoordinator, WriteCoordinatorConfig,
+    default_executor_lanes,
 };
 
 /// Boxed future for provider-neutral Kernel process operations.

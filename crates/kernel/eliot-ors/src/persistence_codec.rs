@@ -23,6 +23,7 @@ use crate::ProcessStartReplayRecord;
 use crate::RecoveryInboxDisposition;
 use crate::RecoveryPayload;
 use crate::RecoveryPayloadEnvelope;
+use crate::RecoveryProblem;
 use crate::ReservationRecord;
 use crate::ReservationState;
 use crate::ScopeTerminalReceipt;
@@ -44,6 +45,14 @@ pub(super) trait PersistedValue: DeserializeOwned {
 
 impl PersistedValue for RecoveryPayloadEnvelope {
     const RECORD_TYPE: &'static str = "recovery_envelope";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+impl PersistedValue for RecoveryProblem {
+    const RECORD_TYPE: &'static str = "recovery_problem";
 
     fn validate_persisted(&self) -> Result<(), OrsError> {
         self.validate()
