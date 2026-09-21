@@ -456,6 +456,7 @@ mod tests {
             eligible_profiles: vec!["profile-1".to_owned()],
             host_version: "host-4.1.0".to_owned(),
             profile_version: "profile-2.0.0".to_owned(),
+            admitted_definition_version: "1.2.0".to_owned(),
             index_budget_tokens: 200,
             body_budget_tokens: 800,
             runtime_budget_tokens: 2000,

@@ -38,7 +38,7 @@ pub use resources::{
 mod skill_transport;
 pub use skill_transport::{
     MAX_CARRY_BYTES, MAX_INTAKE_BYTES, SKILL_TRANSPORT_CONTRACT_ID, SKILL_TRANSPORT_VERSION,
-    SkillAckPayload, SkillDisplayPayload, SkillTransportError,
+    SkillAckPayload, SkillDisplayPayload, SkillIntakePayload, SkillTransportError,
 };
 mod terminal_inputs;
 pub use terminal_inputs::{

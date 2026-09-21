@@ -899,6 +899,31 @@ impl DaemonComposition {
         )
     }
 
+    /// Drives one wire intake through the injector call end to end (issue
+    /// #1882).
+    ///
+    /// Daemon-side handler for Hotset intake bytes arriving over the
+    /// transport: decodes the
+    /// [`SkillIntakePayload`](eliot_agent_bridge_core::SkillIntakePayload)
+    /// (decode failures map to a surface contract error), observes the live
+    /// canonical source, default alias table, and admitted fence, and drives
+    /// the composed delivery act with the admitted version read from the
+    /// payload's install context. Every delivery gate below runs unchanged.
+    /// Returns the installed identity plus the receipt the injector carries
+    /// to the receiver.
+    pub fn skill_ingest_wire_intake(
+        &self,
+        bytes: &[u8],
+    ) -> Result<(String, eliot_skill::HotsetDeliveryReceipt), eliot_skill::SkillError> {
+        let payload = eliot_agent_bridge_core::SkillIntakePayload::decode(bytes)
+            .map_err(|error| eliot_skill::SkillError::Surface(error.to_string()))?;
+        let (source, _) = eliot_governor::canonical_skill_tool_source()?;
+        let aliases = eliot_skill::ToolAliasTable::new();
+        let fence = self.governor.kernel_snapshot().state_fence().clone();
+        self.shared_skill_adapter()
+            .ingest_wire_intake(payload, source.as_ref(), &aliases, &fence)
+    }
+
     /// Carries the receiver ack back to the display boundary under a fresh
     /// tool-owner read (issue #1882).
     ///
@@ -948,8 +973,8 @@ impl DaemonComposition {
     pub fn skill_reconcile_tool_basis(&self) -> Result<usize, eliot_skill::SkillError> {
         let (source, _) = eliot_governor::canonical_skill_tool_source()?;
         let aliases = eliot_skill::ToolAliasTable::new();
-        let tools = eliot_skill::VersionBoundTools::new(source.as_ref(), &aliases);
-        self.shared_skill_adapter().reconcile_tool_basis(&tools)
+        self.shared_skill_adapter()
+            .reconcile_tool_basis(source.as_ref(), &aliases)
     }
 
     /// Borrows the single Governor task lifecycle owner as a forwarding
