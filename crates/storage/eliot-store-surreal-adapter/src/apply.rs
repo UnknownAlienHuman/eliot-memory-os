@@ -38,6 +38,7 @@ mod read_boundary;
 mod receipt_reconciliation;
 mod recovery;
 mod schema_contract;
+pub(crate) mod surreal_automation;
 pub(crate) mod surreal_notification;
 pub(crate) mod surreal_reactive;
 use atomic_write::{TxLane, to_value, write_transaction};
@@ -1076,6 +1077,10 @@ async fn apply_with_retry(
         // compare-and-set arbitration.
         let reactive_writes =
             surreal_reactive::prepare_reactive_writes(db, &adapter.config, &transition).await?;
+        // Issue #1779: admitted automation legs compute their row writes
+        // beside the reactive legs under the same discipline.
+        let automation_writes =
+            surreal_automation::prepare_automation_writes(db, &adapter.config, &transition).await?;
 
         let first_attempt = semantic_plan.is_none();
         let plan = if let Some(semantic) = &semantic_plan {
@@ -1116,6 +1121,7 @@ async fn apply_with_retry(
             lane,
             &notification_writes,
             &reactive_writes,
+            &automation_writes,
         )
         .await
         {
@@ -2216,7 +2222,8 @@ mod concurrent_allocation_tests {
 
         use super::super::{
             apply_prepared_with_authority, apply_prepared_without_write_guard, atomic_write,
-            build_receipt, client, read_fence, surreal_reactive, validate_receipt_identity,
+            build_receipt, client, read_fence, surreal_automation, surreal_reactive,
+            validate_receipt_identity,
         };
         use crate::client::session_pool::SessionRole;
         use crate::config::{ClientSetLimits, SurrealAdapterConfig};
@@ -2589,6 +2596,7 @@ mod concurrent_allocation_tests {
                 atomic_write::TxLane::PooledWrite,
                 &[],
                 &surreal_reactive::ReactiveWrites::default(),
+                &surreal_automation::AutomationWrites::default(),
             )
             .await
             .expect("first writer commits");
@@ -2610,6 +2618,7 @@ mod concurrent_allocation_tests {
                 atomic_write::TxLane::PooledWrite,
                 &[],
                 &surreal_reactive::ReactiveWrites::default(),
+                &surreal_automation::AutomationWrites::default(),
             )
             .await
             {
@@ -2654,6 +2663,7 @@ mod concurrent_allocation_tests {
                 atomic_write::TxLane::PooledWrite,
                 &[],
                 &surreal_reactive::ReactiveWrites::default(),
+                &surreal_automation::AutomationWrites::default(),
             )
             .await
             .expect("bounded retry commits");
