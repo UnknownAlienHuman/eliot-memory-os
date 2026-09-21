@@ -5,6 +5,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod legacy_capability_import;
+
 use eliot_contracts::{PolicyRevision, StateFence};
 use eliot_security_contracts::PolicyFence;
 use schemars::JsonSchema;
