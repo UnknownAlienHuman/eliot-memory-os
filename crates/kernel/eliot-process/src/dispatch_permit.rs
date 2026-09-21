@@ -45,6 +45,13 @@ impl KernelDispatchKey {
         }
         Ok(Self(bytes))
     }
+
+    /// Returns the raw key bytes for a sibling Kernel-owned authority cell in
+    /// this crate. Crate-confined: only neutral Kernel mechanics may use it.
+    /// Possession alone grants nothing without the owning authority instance.
+    pub(crate) fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
 }
 
 impl Drop for KernelDispatchKey {

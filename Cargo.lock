@@ -3106,6 +3106,7 @@ dependencies = [
  "eliot-observability",
  "eliot-platform",
  "eliot-platform-windows",
+ "eliot-process",
  "eliot-protocol",
  "eliot-read",
  "eliot-receipts",

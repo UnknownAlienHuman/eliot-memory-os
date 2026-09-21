@@ -2,67 +2,44 @@
 //!
 //! Issue #1960: a known path/port/process triple is **observable** but never
 //! **controllable** on the strength of observation alone. Observation answers
-//! what was seen; control authority is held and evaluated exclusively by the
-//! governed Kernel path ([`GovernedKernelAuthority`]).
+//! what was seen; control authority is owned and evaluated exclusively by the
+//! Kernel through [`OriginChallengeAuthority`].
 //!
-//! Rework notes (Opus audit of `b4e73def`, PR #2246, CHANGES x2):
-//!
-//! - Forgeable receipts: [`OwnershipChallengeReceipt`] used to be
-//!   caller-constructible (public fields plus an exported digest helper that
-//!   recomputed the exact receipt digest), so any caller could mint a
-//!   well-formed challenge. Challenges are now Governor/Kernel-issued
-//!   capabilities: the struct exposes no public fields, no public
-//!   constructor, and no `Deserialize` implementation, so callers can neither
-//!   write a struct literal nor rehydrate one from JSON. Minting happens only
-//!   through [`OwnershipChallengeIssuer::issue`], which binds a secret-held
-//!   issuer tag and records the mint in the issuer-owned store. Verification
-//!   ([`OwnershipChallengeIssuer::verify`]) requires that issuer-bound proof:
-//!   the tag recomputed with the issuer secret plus a live registry entry.
-//!   A reproduced digest alone authorizes nothing.
-//! - Parallel authority plane: the old gate decided `ForwardableToKernel`
-//!   inside `eliotd`, duplicating the control-authority decision outside the
-//!   governed Kernel path. This module is now an evidence view under the
-//!   Governor-owned `CapabilityEvidenceRecord` (I03-04, "Capability
-//!   evidence"): [`ProcessOriginEvidence::capability_view`] projects an
-//!   observation into a [`ProcessCapabilityEvidence`] record, and
-//!   [`gate_process_control`] only routes evidence:
-//!   [`OperationDisposition::Observed`],
-//!   [`OperationDisposition::NeedsKernelDecision`], or
-//!   [`OperationDisposition::Denied`]. It never authorizes. The single
-//!   authority evaluation lives in
-//!   [`GovernedKernelAuthority::decide_forward`] and
-//!   [`GovernedKernelAuthority::authorize_shutdown`], which return an opaque
-//!   [`KernelAuthorization`] proof token. The `eliotd` side only packages
-//!   evidence with [`prepare_kernel_forward`] and forwards it.
+//! Rework notes (prepared PR #2246: `b4e73def`, `076ae935`, `461106aa`):
+//! the prepared revision kept a daemon-minted challenge issuer
+//! (`KernelChallengeKey` / `OwnershipChallengeIssuer` /
+//! `GovernedKernelAuthority`) inside this crate with crate-private mint paths.
+//! That made the daemon its own authority: the actual Kernel could not own the
+//! issuer, so runtime control was self-granted. The parallel issuer is
+//! removed. The only minter and decision point is now the Kernel-owned
+//! [`OriginChallengeAuthority`] in the neutral `eliot-process` contract cell
+//! (`origin_challenge.rs`), authenticating with the shared [`KernelDispatchKey`]
+//! under a disjoint domain. This module keeps the Governor observation,
+//! capability projection, and policy gate, and adds the daemon consumer
+//! ([`request_origin_control`]) which central Governor code invokes to package
+//! a Kernel-bound challenge request.
 //!
 //! Daemon flow: [`gate_process_control`] (route evidence) ->
-//! [`prepare_kernel_forward`] (attach the challenge; completeness only) ->
-//! neutral authenticated Kernel port ->
-//! [`GovernedKernelAuthority::decide_forward`] (exclusive authority) ->
-//! [`KernelAuthorization`] (proof token for the port call).
+//! [`request_origin_control`] (bind observation + OS physical identity +
+//! installation into a neutral [`OriginChallengeRequest`]; completeness only)
+//! -> neutral authenticated Kernel port ->
+//! [`OriginChallengeAuthority::issue`] (Kernel mints) ->
+//! [`OriginControlPresentation::new`] (seal request + challenge) ->
+//! [`OriginChallengeAuthority::decide`] (exclusive authority, one-shot) ->
+//! [`OriginControlGrant`] (proof token for the effect call).
 //!
-//! Rework rework1960b (re-audit of 076ae935, CHANGES x3):
-//! (1) issuance is exclusive to Governor/Kernel authority in code via
-//! [`KernelChallengeKey`] (no public raw-secret constructor) plus the
-//! crate-confined [`OwnershipChallengeIssuer::kernel_minted`] mint path and
-//! the public [`GovernedKernelAuthority::bootstrap`] gate; there is no public
-//! constructor taking a caller-chosen secret. (2) the receipt is an
-//! in-memory bearer capability with no Serialize and a crate-confined tag
-//! accessor; it authorizes only through the governed path against the live
-//! protected registry. (3) the gate bodies (`gate_process_control`,
-//! `prepare_kernel_forward`, `decide_forward`, `authorize_shutdown`,
-//! [`KernelAuthorization`]) all live in this same file with the port
-//! boundary; no hidden authority logic exists elsewhere.
-//!
-//! This module performs no I/O and retains no threads. The issuer and the
-//! authority retain only the Governor/Kernel-owned challenge store; receipts
-//! themselves stay dumb capabilities validated field-for-field before use.
+//! This module performs no I/O, holds no key material, and retains no issuer
+//! state. [`ProcessStatusReceipt`] has no conversion into anything the
+//! authority accepts: type shape alone keeps a status receipt from
+//! authorizing control.
 
 #![forbid(unsafe_code)]
 
-use std::collections::HashMap;
-
-use eliot_contracts::{StateFence, fences_match_exact, sha256_hex};
+use eliot_contracts::{StateFence, sha256_hex};
+pub use eliot_process::{
+    Generation, OriginChallenge, OriginChallengeAuthority, OriginChallengeRequest,
+    OriginControlGrant, OriginControlOperation, OriginControlPresentation, PhysicalProcessBinding,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -71,48 +48,33 @@ use thiserror::Error;
 /// Names the evidence view, not a control right: observation only.
 pub const PROCESS_ORIGIN_CAPABILITY: &str = "process-origin-observation";
 
-/// Maximum lifetime of one ownership challenge: one hour in milliseconds.
-///
-/// Challenges stay short-lived on purpose; longer windows must be re-issued.
-const MAX_CHALLENGE_WINDOW_MS: u64 = 3_600_000;
-
-/// Maximum accepted issuer identity length.
-const MAX_ISSUER_ID_LEN: usize = 64;
-
-/// Errors raised by the process-origin evidence view and the governed authority.
+/// Errors raised by the process-origin evidence view and daemon consumer.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ProcessOriginError {
-    /// An evidence, challenge, or receipt field is malformed.
+    /// An evidence or request field is malformed, or the neutral contract
+    /// rejected packaging.
     #[error("process-origin contract: {0}")]
     Contract(String),
-    /// No challenge was attached for an operation that needs authority.
-    #[error("process-origin denied: control requires a current matching ownership challenge")]
-    ChallengeRequired,
-    /// The challenge was not issued by this issuer or does not bind the evidence.
-    #[error(
-        "process-origin denied: ownership challenge was not issued by this Governor/Kernel issuer or does not match the observed origin"
-    )]
-    ChallengeMismatch,
-    /// The challenge is not current at the presented time.
-    #[error("process-origin denied: ownership challenge is not current")]
-    ChallengeNotCurrent,
-    /// The challenge was revoked after issuance.
-    #[error("process-origin denied: ownership challenge was revoked")]
-    ChallengeRevoked,
     /// A status/read receipt was presented where control authority is required.
     #[error("process-origin denied: a read status receipt never authorizes shutdown or control")]
     StatusNeverAuthorizes,
-    /// The operation is observe-only and must never be forwarded to the Kernel.
+    /// The operation is observe-only and must never be packaged for the Kernel.
     #[error("process-origin denied: probes observe only and are never forwarded")]
     ObserveOnly,
+}
+
+impl From<eliot_process::ContractError> for ProcessOriginError {
+    fn from(error: eliot_process::ContractError) -> Self {
+        Self::Contract(error.to_string())
+    }
 }
 /// Governor-owned observation of one process origin.
 ///
 /// Observation only: the known path, port, and process label describe what
 /// was seen. They grant no stop, adopt, mutate, or credential-attach
 /// authority, and no ownership is inferred from them. The `origin_digest`
-/// binds the observed triple plus the admitted fence so an issued challenge
-/// can match exactly one observation.
+/// binds the observed triple plus the admitted fence so a Kernel-issued
+/// challenge can match exactly one observation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessOriginEvidence {
@@ -133,9 +95,9 @@ pub struct ProcessOriginEvidence {
 /// Control operation requested against an observed process origin.
 #[derive(Clone, Debug, Copy, PartialEq, Eq)]
 pub enum ProcessControlOperation {
-    /// Read-only status probe. Observe only, never forwarded.
+    /// Read-only status probe. Observe only, never packaged.
     ReadStatus,
-    /// General observation probe. Observe only, never forwarded.
+    /// General observation probe. Observe only, never packaged.
     ProbeObserve,
     /// Stop the observed process. Needs a Kernel authority decision.
     Kill,
@@ -149,7 +111,7 @@ pub enum ProcessControlOperation {
 
 impl ProcessControlOperation {
     /// Returns whether the operation needs a Kernel authority decision backed
-    /// by a current matching ownership challenge.
+    /// by a current Kernel-issued origin challenge.
     ///
     /// An operation-class fact consumed by the governed authority, not a
     /// decision: answering `true` authorizes nothing.
@@ -161,7 +123,7 @@ impl ProcessControlOperation {
         }
     }
 
-    /// Returns whether the operation may ever be forwarded to the Kernel.
+    /// Returns whether the operation may ever be packaged for the Kernel.
     /// Probes and status reads are observe-only.
     ///
     /// An operation-class fact, not a decision.
@@ -174,173 +136,30 @@ impl ProcessControlOperation {
     }
 }
 
-/// Governor/Kernel-issued ownership challenge receipt.
-///
-/// The single control capability in this module. It authorizes exactly one
-/// observed origin (`origin_digest`), under exactly one fence
-/// (`state_fence`), while current (`issued_at_unix_ms..=expires_at_unix_ms`
-/// contains `now`). Only [`OwnershipChallengeIssuer::issue`] can mint it:
-/// all fields are private, there is no public constructor, and there is no
-/// `Deserialize` implementation, so callers can neither write a struct
-/// literal nor rehydrate one from JSON. There is also no `Serialize`
-/// implementation: the receipt is an in-memory bearer capability and must
-/// never be serialized to JSON for storage or transport. The `issuer_tag`
-/// binds every field to the issuer secret, and the issuer store records
-/// every mint; both are checked by [`OwnershipChallengeIssuer::verify`].
-///
-/// The `receipt_digest` is a plain content binding (reproducible by design)
-/// and carries no authority on its own.
-///
-/// Bearer and transport boundary (explicit): possession of a receipt proves
-/// nothing on its own. A receipt authorizes only when presented through the
-/// in-process governed path and verified against the live protected issuer
-/// registry (exact origin and fence bind, secret-bound tag recomputed with the
-/// Kernel-held key, live window at now, no revocation). Replay outside that
-/// boundary is bounded by the one-hour window, the exact origin and fence
-/// bind, and Kernel-owned revocation; the tag itself is never publicly
-/// extractable (crate-confined accessor only) and the receipt is never
-/// serialized, logged, or rehydrated.
-#[derive(Clone, PartialEq, Eq)]
-pub struct OwnershipChallengeReceipt {
-    /// Issuer-assigned challenge identity (`issuer_id` plus sequence).
-    challenge_id: String,
-    /// Origin digest this challenge binds (must equal the evidence digest).
-    origin_digest: String,
-    /// Fence this challenge binds (must match the evidence fence exactly).
-    state_fence: StateFence,
-    /// Unix milliseconds at which the challenge was issued.
-    issued_at_unix_ms: u64,
-    /// Unix milliseconds at which the challenge expires (inclusive).
-    expires_at_unix_ms: u64,
-    /// Lowercase hex SHA-256 over the canonical challenge fields.
-    receipt_digest: String,
-    /// Secret-bound issuer tag over every field above. Authority lives here.
-    issuer_tag: String,
-}
-
-impl std::fmt::Debug for OwnershipChallengeReceipt {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-        formatter
-            .debug_struct("OwnershipChallengeReceipt")
-            .field("challenge_id", &self.challenge_id)
-            .field("origin_digest", &self.origin_digest)
-            .field("state_fence", &self.state_fence)
-            .field("issued_at_unix_ms", &self.issued_at_unix_ms)
-            .field("expires_at_unix_ms", &self.expires_at_unix_ms)
-            .field("receipt_digest", &self.receipt_digest)
-            .field("issuer_tag", &"REDACTED")
-            .finish()
+impl From<ProcessControlOperation> for OriginControlOperation {
+    fn from(operation: ProcessControlOperation) -> Self {
+        match operation {
+            ProcessControlOperation::Kill => Self::Kill,
+            ProcessControlOperation::Mutate => Self::Mutate,
+            ProcessControlOperation::Adopt => Self::Adopt,
+            ProcessControlOperation::AttachCredential => Self::AttachCredential,
+            ProcessControlOperation::ReadStatus | ProcessControlOperation::ProbeObserve => {
+                // Unreachable through `request_origin_control`, which rejects
+                // observe-only operations first; the mapping defaults
+                // fail-closed to the narrowest control class if misused.
+                Self::Kill
+            }
+        }
     }
 }
 
-impl OwnershipChallengeReceipt {
-    /// Returns the issuer-assigned challenge identity.
-    #[must_use]
-    pub fn challenge_id(&self) -> &str {
-        &self.challenge_id
-    }
-
-    /// Returns the bound origin digest.
-    #[must_use]
-    pub fn origin_digest(&self) -> &str {
-        &self.origin_digest
-    }
-
-    /// Returns the bound fence.
-    #[must_use]
-    pub fn state_fence(&self) -> &StateFence {
-        &self.state_fence
-    }
-
-    /// Returns the issuance time.
-    #[must_use]
-    pub const fn issued_at_unix_ms(&self) -> u64 {
-        self.issued_at_unix_ms
-    }
-
-    /// Returns the expiry time (inclusive).
-    #[must_use]
-    pub const fn expires_at_unix_ms(&self) -> u64 {
-        self.expires_at_unix_ms
-    }
-
-    /// Returns the content binding digest (no authority).
-    #[must_use]
-    pub fn receipt_digest(&self) -> &str {
-        &self.receipt_digest
-    }
-
-    /// Returns the secret-bound issuer tag (the authority proof).
-    ///
-    /// Crate-confined: only the governed Kernel authority path in this
-    /// crate may extract the tag (verification and decision mint). It is
-    /// never part of the public bearer surface and never serialized.
-    #[must_use]
-    pub(crate) fn issuer_tag(&self) -> &str {
-        &self.issuer_tag
-    }
-
-    /// Returns whether the challenge window contains `now_unix_ms`.
-    ///
-    /// Currency alone, without [`OwnershipChallengeIssuer::verify`], proves
-    /// nothing: only the issuer-bound check authorizes.
-    #[must_use]
-    pub const fn is_current(&self, now_unix_ms: u64) -> bool {
-        now_unix_ms >= self.issued_at_unix_ms && now_unix_ms <= self.expires_at_unix_ms
-    }
-
-    /// Validates field shapes and the content binding only.
-    ///
-    /// Completeness for packaging, never authority: no secret, no clock, no
-    /// registry. Anything this accepts must still pass
-    /// [`OwnershipChallengeIssuer::verify`] before any control effect.
-    pub fn validate_shape(&self) -> Result<(), ProcessOriginError> {
-        if self.challenge_id.trim().is_empty() || self.challenge_id.len() > 128 {
-            return Err(ProcessOriginError::Contract(
-                "challenge_id must be a bounded token".to_owned(),
-            ));
-        }
-        let id_ok = self.challenge_id.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || byte == 35 || byte == 45 || byte == 46 || byte == 95
-        });
-        if !id_ok {
-            return Err(ProcessOriginError::Contract(
-                "challenge_id must be a bounded token".to_owned(),
-            ));
-        }
-        validate_digest(&self.origin_digest, "origin_digest")?;
-        validate_digest(&self.receipt_digest, "receipt_digest")?;
-        validate_digest(&self.issuer_tag, "issuer_tag")?;
-        self.state_fence
-            .validate()
-            .map_err(|error| ProcessOriginError::Contract(format!("state_fence: {error}")))?;
-        if self.expires_at_unix_ms < self.issued_at_unix_ms {
-            return Err(ProcessOriginError::Contract(
-                "expires_at_unix_ms must not precede issued_at_unix_ms".to_owned(),
-            ));
-        }
-        let expected = canonical_challenge_digest(
-            &self.challenge_id,
-            &self.origin_digest,
-            &self.state_fence,
-            self.issued_at_unix_ms,
-            self.expires_at_unix_ms,
-        );
-        if self.receipt_digest != expected {
-            return Err(ProcessOriginError::Contract(
-                "receipt_digest does not bind the challenge fields".to_owned(),
-            ));
-        }
-        Ok(())
-    }
-}
 /// Read-only status receipt for an observed process origin.
 ///
 /// Observation answer only: it reports what a status probe saw. It carries
-/// no challenge, no issuer tag, and no control capability. There is
-/// deliberately **no** constructor or conversion from this type into anything
-/// [`prepare_kernel_forward`] or [`GovernedKernelAuthority`] accepts: type
-/// shape alone keeps a status receipt from authorizing shutdown or control.
+/// no challenge and no control capability. There is deliberately **no**
+/// constructor or conversion from this type into anything the Kernel
+/// authority accepts: type shape alone keeps a status receipt from
+/// authorizing shutdown or control.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessStatusReceipt {
@@ -402,7 +221,7 @@ pub enum CapabilityEvidenceSource {
 /// Governor-owned Capability Registry view, and this record never carries
 /// control authority. Staleness is derived there too: `expires_at_unix_ms`
 /// echoes the observation time (a point observation), it does not decide
-/// currency for control — only a current issuer-verified challenge does.
+/// currency for control — only a current Kernel-issued challenge does.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessCapabilityEvidence {
@@ -433,12 +252,12 @@ pub struct ProcessCapabilityEvidence {
 /// ([`OperationDisposition::NeedsKernelDecision`]), or the evidence itself is
 /// malformed ([`OperationDisposition::Denied`]). There is deliberately no
 /// forwardable/authorized outcome here: authorizing is the exclusive job of
-/// [`GovernedKernelAuthority::decide_forward`].
+/// [`OriginChallengeAuthority::decide`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OperationDisposition {
-    /// Observe-only outcome: answered from evidence, never forwarded.
+    /// Observe-only outcome: answered from evidence, never packaged.
     Observed,
-    /// Evidence is complete; forward it so the governed Kernel path decides.
+    /// Evidence is complete; package it so the governed Kernel path decides.
     /// Carries the evidence view, never an authorization.
     NeedsKernelDecision {
         /// Capability evidence view bound to the gated observation.
@@ -464,60 +283,6 @@ pub fn canonical_origin_digest(path: &str, port: u16, process: &str, fence: &Sta
     canonical.push(0);
     canonical.extend_from_slice(&fence_bytes);
     sha256_hex(&canonical)
-}
-
-/// Computes the canonical challenge content binding (no authority).
-///
-/// Private: the binding is reproducible by design and must never be mistaken
-/// for issuance proof. Authority comes only from the secret-bound issuer tag
-/// plus the issuer store (see [`OwnershipChallengeIssuer::verify`]).
-fn canonical_challenge_digest(
-    challenge_id: &str,
-    origin_digest: &str,
-    fence: &StateFence,
-    issued_at_unix_ms: u64,
-    expires_at_unix_ms: u64,
-) -> String {
-    let fence_bytes = serde_json::to_vec(fence).unwrap_or_default();
-    let mut canonical =
-        Vec::with_capacity(challenge_id.len() + origin_digest.len() + fence_bytes.len() + 32);
-    canonical.extend_from_slice(challenge_id.as_bytes());
-    canonical.push(0);
-    canonical.extend_from_slice(origin_digest.as_bytes());
-    canonical.push(0);
-    canonical.extend_from_slice(&fence_bytes);
-    canonical.push(0);
-    canonical.extend_from_slice(&issued_at_unix_ms.to_be_bytes());
-    canonical.push(0);
-    canonical.extend_from_slice(&expires_at_unix_ms.to_be_bytes());
-    sha256_hex(&canonical)
-}
-
-/// Computes the secret-bound issuer tag: the actual issuance proof.
-///
-/// Binds the issuer secret to the full canonical challenge content, so only
-/// the secret holder (the Governor/Kernel-owned issuer) can mint tags that
-/// [`OwnershipChallengeIssuer::verify`] accepts.
-fn issuer_tag_for(
-    secret: &[u8; 32],
-    challenge_id: &str,
-    origin_digest: &str,
-    fence: &StateFence,
-    issued_at_unix_ms: u64,
-    expires_at_unix_ms: u64,
-) -> String {
-    let content = canonical_challenge_digest(
-        challenge_id,
-        origin_digest,
-        fence,
-        issued_at_unix_ms,
-        expires_at_unix_ms,
-    );
-    let mut material = Vec::with_capacity(32 + 1 + content.len());
-    material.extend_from_slice(secret);
-    material.push(0);
-    material.extend_from_slice(content.as_bytes());
-    sha256_hex(&material)
 }
 
 fn validate_digest(value: &str, field: &str) -> Result<(), ProcessOriginError> {
@@ -605,300 +370,6 @@ impl ProcessOriginEvidence {
         })
     }
 }
-/// One issuer-recorded mint: the store-bound half of the issuance proof.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct IssuedChallenge {
-    /// Origin digest the challenge was bound to at mint time.
-    origin_digest: String,
-    /// Fence the challenge was bound to at mint time.
-    state_fence: StateFence,
-    /// Mint issuance time.
-    issued_at_unix_ms: u64,
-    /// Mint expiry time (inclusive).
-    expires_at_unix_ms: u64,
-    /// Set by revoke; revoked challenges never verify.
-    revoked: bool,
-}
-/// Governor/Kernel-owned ownership-challenge issuer and issuance store.
-///
-/// The only minter of challenge receipts: issue binds the exact observation,
-/// stamps a secret-held issuer tag, and records the mint. Verify re-checks
-/// the tag with the secret and requires a live, unrevoked registry entry,
-/// so verification needs issuer-bound proof: a reproduced digest alone fails.
-/// The secret never leaves this object (Debug redacts it) and the store
-/// never leaves Governor/Kernel ownership.
-///
-/// Issuance is exclusive to Governor/Kernel authority in code (not docs):
-/// there is no public constructor taking a caller-chosen secret. An issuer
-/// can only be minted from a [`KernelChallengeKey`], whose secret bytes are
-/// never publicly constructible outside this crate. External callers cannot
-/// mint an issuer, so they cannot mint challenges that verify.
-///
-/// Kernel-held challenge key: the sole authority to mint an issuer.
-///
-/// The secret bytes are private with no public raw-secret constructor, no
-/// Serialize, and no Deserialize, so only crate-internal Kernel wiring
-/// (which holds the provisioned secret) can produce a key. A key proves
-/// nothing on its own; it only authorizes [`OwnershipChallengeIssuer`]
-/// construction through the crate-confined mint path below.
-pub struct KernelChallengeKey {
-    secret: [u8; 32],
-}
-
-impl std::fmt::Debug for KernelChallengeKey {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-        formatter
-            .debug_struct("KernelChallengeKey")
-            .field("secret", &"REDACTED")
-            .finish()
-    }
-}
-
-impl KernelChallengeKey {
-    /// Wraps a Kernel-provisioned secret (crate-internal wiring only).
-    ///
-    /// Rejects the all-zero secret so a null-secret deployment fails
-    /// closed at key provisioning, before any issuer exists.
-    // Production Kernel front-door wiring entry point; exercised in tests
-    // until the grant route lands. Visibility stays crate-confined so no
-    // external caller can provision a key with a chosen secret.
-    #[allow(dead_code)]
-    pub(crate) fn from_secret(secret: [u8; 32]) -> Result<Self, ProcessOriginError> {
-        if secret == [0_u8; 32] {
-            return Err(ProcessOriginError::Contract(
-                "issuer secret must not be all zeros".to_owned(),
-            ));
-        }
-        Ok(Self { secret })
-    }
-
-    /// Test-only key with a fixed non-zero secret.
-    #[cfg(test)]
-    pub(crate) fn test_key() -> Self {
-        Self { secret: [9_u8; 32] }
-    }
-
-    /// Test-only key with a caller-chosen non-zero fill byte.
-    #[cfg(test)]
-    pub(crate) fn test_key_with(fill: u8) -> Result<Self, ProcessOriginError> {
-        let secret = [fill; 32];
-        Self::from_secret(secret)
-    }
-
-    fn secret(&self) -> &[u8; 32] {
-        &self.secret
-    }
-}
-#[derive(Clone)]
-pub struct OwnershipChallengeIssuer {
-    /// Stable issuer identity, stamped into every challenge identity.
-    issuer_id: String,
-    /// Issuer secret for the tag. Redacted from Debug, never serialized.
-    secret: [u8; 32],
-    /// Next mint sequence number.
-    next_sequence: u64,
-    /// Every mint, keyed by challenge identity.
-    issued: HashMap<String, IssuedChallenge>,
-}
-
-impl std::fmt::Debug for OwnershipChallengeIssuer {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-        formatter
-            .debug_struct("OwnershipChallengeIssuer")
-            .field("issuer_id", &self.issuer_id)
-            .field("next_sequence", &self.next_sequence)
-            .field("issued", &self.issued)
-            .field("secret", &"REDACTED")
-            .finish()
-    }
-}
-impl OwnershipChallengeIssuer {
-    /// Mints an issuer from a Kernel-held key (crate-internal authority only).
-    ///
-    /// There is deliberately no public constructor taking a caller-chosen
-    /// secret: only crate-internal Kernel wiring holding a
-    /// [`KernelChallengeKey`] can call this. Rejects blank or unbounded
-    /// identities so a malformed issuer identity fails closed at mint time.
-    /// Key validation (non-zero secret) already happened at
-    /// [`KernelChallengeKey::from_secret`].
-    pub(crate) fn kernel_minted(
-        issuer_id: String,
-        key: &KernelChallengeKey,
-    ) -> Result<Self, ProcessOriginError> {
-        let id_ok = !issuer_id.trim().is_empty()
-            && issuer_id.len() <= MAX_ISSUER_ID_LEN
-            && issuer_id
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == 45 || byte == 46 || byte == 95);
-        if !id_ok {
-            return Err(ProcessOriginError::Contract(
-                "issuer_id must be a bounded alphanumeric token".to_owned(),
-            ));
-        }
-        Ok(Self {
-            issuer_id,
-            secret: *key.secret(),
-            next_sequence: 1,
-            issued: HashMap::new(),
-        })
-    }
-
-    /// Returns the issuer identity stamped into minted challenges.
-    #[must_use]
-    pub fn issuer_id(&self) -> &str {
-        &self.issuer_id
-    }
-
-    /// Returns how many challenges this issuer has minted.
-    #[must_use]
-    pub fn issued_count(&self) -> usize {
-        self.issued.len()
-    }
-    /// Mints a challenge bound to exactly one observation.
-    ///
-    /// Validates the evidence, enforces a sane short-lived window, stamps a
-    /// fresh challenge identity with the secret-bound issuer tag, and records
-    /// the mint in the issuer store. The returned receipt verifies only
-    /// against this issuer: same secret plus a live registry entry.
-    pub fn issue(
-        &mut self,
-        evidence: &ProcessOriginEvidence,
-        issued_at_unix_ms: u64,
-        expires_at_unix_ms: u64,
-    ) -> Result<OwnershipChallengeReceipt, ProcessOriginError> {
-        evidence.validate()?;
-        if issued_at_unix_ms == 0 {
-            return Err(ProcessOriginError::Contract(
-                "issued_at_unix_ms must be nonzero".to_owned(),
-            ));
-        }
-        if expires_at_unix_ms < issued_at_unix_ms {
-            return Err(ProcessOriginError::Contract(
-                "expires_at_unix_ms must not precede issued_at_unix_ms".to_owned(),
-            ));
-        }
-        if expires_at_unix_ms - issued_at_unix_ms > MAX_CHALLENGE_WINDOW_MS {
-            return Err(ProcessOriginError::Contract(
-                "challenge window must not exceed one hour".to_owned(),
-            ));
-        }
-        let sequence = self.next_sequence;
-        self.next_sequence = sequence.checked_add(1).ok_or_else(|| {
-            ProcessOriginError::Contract("challenge sequence exhausted".to_owned())
-        })?;
-        let issuer_id = self.issuer_id.clone();
-        let challenge_id = format!("{issuer_id}#{sequence:08x}");
-        let origin_digest = evidence.origin_digest.clone();
-        let state_fence = evidence.state_fence.clone();
-        let receipt_digest = canonical_challenge_digest(
-            &challenge_id,
-            &origin_digest,
-            &state_fence,
-            issued_at_unix_ms,
-            expires_at_unix_ms,
-        );
-        let issuer_tag = issuer_tag_for(
-            &self.secret,
-            &challenge_id,
-            &origin_digest,
-            &state_fence,
-            issued_at_unix_ms,
-            expires_at_unix_ms,
-        );
-        self.issued.insert(
-            challenge_id.clone(),
-            IssuedChallenge {
-                origin_digest: origin_digest.clone(),
-                state_fence: state_fence.clone(),
-                issued_at_unix_ms,
-                expires_at_unix_ms,
-                revoked: false,
-            },
-        );
-        Ok(OwnershipChallengeReceipt {
-            challenge_id,
-            origin_digest,
-            state_fence,
-            issued_at_unix_ms,
-            expires_at_unix_ms,
-            receipt_digest,
-            issuer_tag,
-        })
-    }
-
-    /// Revokes a minted challenge: it verifies never again.
-    ///
-    /// Idempotent for already-revoked identities; unknown identities fail
-    /// closed so a typo cannot silently pass as a revocation.
-    pub fn revoke(&mut self, challenge_id: &str) -> Result<(), ProcessOriginError> {
-        match self.issued.get_mut(challenge_id) {
-            Some(entry) => {
-                entry.revoked = true;
-                Ok(())
-            }
-            None => Err(ProcessOriginError::Contract(
-                "unknown challenge_id".to_owned(),
-            )),
-        }
-    }
-    /// Verifies a receipt against issuer-bound proof and the observation.
-    ///
-    /// Requires all of: well-formed receipt and evidence, a registry entry
-    /// minted by this issuer whose recorded fields match the receipt
-    /// exactly, no revocation, a tag recomputed with the issuer secret, a
-    /// live window at now, and an exact digest plus exact fence bind to the
-    /// evidence. A reproduced digest with no mint and no tag fails with a
-    /// mismatch.
-    pub fn verify(
-        &self,
-        receipt: &OwnershipChallengeReceipt,
-        evidence: &ProcessOriginEvidence,
-        now_unix_ms: u64,
-    ) -> Result<(), ProcessOriginError> {
-        receipt.validate_shape()?;
-        evidence.validate()?;
-        if now_unix_ms == 0 {
-            return Err(ProcessOriginError::Contract(
-                "now_unix_ms must be nonzero".to_owned(),
-            ));
-        }
-        let entry = self
-            .issued
-            .get(receipt.challenge_id())
-            .ok_or(ProcessOriginError::ChallengeMismatch)?;
-        if entry.revoked {
-            return Err(ProcessOriginError::ChallengeRevoked);
-        }
-        if entry.origin_digest != receipt.origin_digest()
-            || !fences_match_exact(&entry.state_fence, receipt.state_fence())
-            || entry.issued_at_unix_ms != receipt.issued_at_unix_ms()
-            || entry.expires_at_unix_ms != receipt.expires_at_unix_ms()
-        {
-            return Err(ProcessOriginError::ChallengeMismatch);
-        }
-        let expected_tag = issuer_tag_for(
-            &self.secret,
-            receipt.challenge_id(),
-            receipt.origin_digest(),
-            receipt.state_fence(),
-            receipt.issued_at_unix_ms(),
-            receipt.expires_at_unix_ms(),
-        );
-        if receipt.issuer_tag() != expected_tag {
-            return Err(ProcessOriginError::ChallengeMismatch);
-        }
-        if !(receipt.issued_at_unix_ms()..=receipt.expires_at_unix_ms()).contains(&now_unix_ms) {
-            return Err(ProcessOriginError::ChallengeNotCurrent);
-        }
-        if receipt.origin_digest() != evidence.origin_digest {
-            return Err(ProcessOriginError::ChallengeMismatch);
-        }
-        if !fences_match_exact(receipt.state_fence(), &evidence.state_fence) {
-            return Err(ProcessOriginError::ChallengeMismatch);
-        }
-        Ok(())
-    }
-}
 /// Pure policy step: routes one operation against one observed origin.
 ///
 /// Takes evidence and the operation class only: there is deliberately no
@@ -930,271 +401,47 @@ pub fn gate_process_control(
     }
 }
 
-/// Evidence package the eliotd side forwards to the governed Kernel path.
+/// Packages one Kernel-bound origin-challenge request.
 ///
-/// Built by [`prepare_kernel_forward`] from well-formed evidence, a
-/// forwardable operation, and an attached challenge. Packaging checks
-/// completeness only; it never evaluates authority. Only
-/// [`GovernedKernelAuthority::decide_forward`] turns this into an
-/// authorization.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct KernelForwardRequest {
-    /// Observed origin the operation targets.
-    evidence: ProcessOriginEvidence,
-    /// Requested control operation.
-    operation: ProcessControlOperation,
-    /// Attached challenge, evaluated only by the governed authority.
-    challenge: OwnershipChallengeReceipt,
-}
-
-impl KernelForwardRequest {
-    /// Returns the observed origin.
-    #[must_use]
-    pub fn evidence(&self) -> &ProcessOriginEvidence {
-        &self.evidence
-    }
-
-    /// Returns the requested operation.
-    #[must_use]
-    pub const fn operation(&self) -> ProcessControlOperation {
-        self.operation
-    }
-
-    /// Returns the attached challenge.
-    #[must_use]
-    pub fn challenge(&self) -> &OwnershipChallengeReceipt {
-        &self.challenge
-    }
-}
-
-/// Packages one forward: evidence plus the attached challenge.
-///
-/// The eliotd-side constructor. Checks completeness only: the operation must
-/// be forwardable, the evidence well-formed, a challenge attached, and the
-/// challenge well-shaped. Match, currency, issuance, and revocation are NOT
-/// checked here; they are evaluated exclusively by
-/// [`GovernedKernelAuthority::decide_forward`].
-pub fn prepare_kernel_forward(
+/// The daemon-side consumer invoked by central Governor code. Binds the
+/// validated Governor observation to the exact OS physical identity
+/// ([`PhysicalProcessBinding`]: pid plus process start identity plus image)
+/// and the admitted installation identity under the evidence fence, for one
+/// control operation class. Checks completeness only: the operation must be
+/// forwardable, the evidence well-formed, and the physical identity,
+/// installation, fence generation, and nonce well-shaped. Issuance, match,
+/// currency, revocation, and the live epoch are NOT checked here; they are
+/// evaluated exclusively by the Kernel-owned
+/// [`OriginChallengeAuthority::issue`] and [`OriginChallengeAuthority::decide`].
+/// This function holds no key and mints nothing.
+pub fn request_origin_control(
     evidence: &ProcessOriginEvidence,
+    physical: &PhysicalProcessBinding,
+    installation_id: &str,
     operation: ProcessControlOperation,
-    challenge: Option<&OwnershipChallengeReceipt>,
-) -> Result<KernelForwardRequest, ProcessOriginError> {
+    request_nonce: &str,
+) -> Result<OriginChallengeRequest, ProcessOriginError> {
     if !operation.is_forwardable() {
         return Err(ProcessOriginError::ObserveOnly);
     }
     evidence.validate()?;
-    let Some(receipt) = challenge else {
-        return Err(ProcessOriginError::ChallengeRequired);
-    };
-    receipt.validate_shape()?;
-    Ok(KernelForwardRequest {
-        evidence: evidence.clone(),
-        operation,
-        challenge: receipt.clone(),
-    })
-}
-
-/// Operation-class label used inside authorization proof tokens.
-fn operation_name(operation: ProcessControlOperation) -> &'static str {
-    match operation {
-        ProcessControlOperation::ReadStatus => "read-status",
-        ProcessControlOperation::ProbeObserve => "probe-observe",
-        ProcessControlOperation::Kill => "kill",
-        ProcessControlOperation::Mutate => "mutate",
-        ProcessControlOperation::Adopt => "adopt",
-        ProcessControlOperation::AttachCredential => "attach-credential",
-    }
-}
-/// Proof token minted only by the governed Kernel authority decision.
-///
-/// Returned solely by [`GovernedKernelAuthority::decide_forward`] and
-/// [`GovernedKernelAuthority::authorize_shutdown`]. The daemon attaches it
-/// to the neutral authenticated Kernel port call as proof that the governed
-/// path evaluated authority. It is opaque: fields are private, there is no
-/// public constructor and no Deserialize, so only a live authority decision
-/// can produce one.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct KernelAuthorization {
-    /// Challenge identity the decision evaluated.
-    challenge_id: String,
-    /// Operation class the decision authorized.
-    operation: String,
-    /// Unix milliseconds at which the decision was taken.
-    decided_at_unix_ms: u64,
-    /// Secret-bound decision tag over challenge tag, operation, and time.
-    authorization_digest: String,
-}
-
-impl KernelAuthorization {
-    /// Returns the evaluated challenge identity.
-    #[must_use]
-    pub fn challenge_id(&self) -> &str {
-        &self.challenge_id
-    }
-
-    /// Returns the authorized operation class label.
-    #[must_use]
-    pub fn operation(&self) -> &str {
-        &self.operation
-    }
-
-    /// Returns the decision time.
-    #[must_use]
-    pub const fn decided_at_unix_ms(&self) -> u64 {
-        self.decided_at_unix_ms
-    }
-
-    /// Returns the secret-bound decision tag.
-    #[must_use]
-    pub fn authorization_digest(&self) -> &str {
-        &self.authorization_digest
-    }
-
-    /// Mints the token. Private: only the authority decision calls this.
-    fn mint(
-        secret: &[u8; 32],
-        challenge: &OwnershipChallengeReceipt,
-        operation: ProcessControlOperation,
-        now_unix_ms: u64,
-    ) -> Self {
-        let operation_label = operation_name(operation).to_owned();
-        let mut material = Vec::with_capacity(32 + 1 + 64 + 1 + 16 + 8);
-        material.extend_from_slice(secret);
-        material.push(0);
-        material.extend_from_slice(challenge.issuer_tag().as_bytes());
-        material.push(0);
-        material.extend_from_slice(operation_label.as_bytes());
-        material.push(0);
-        material.extend_from_slice(&now_unix_ms.to_be_bytes());
-        let authorization_digest = sha256_hex(&material);
-        Self {
-            challenge_id: challenge.challenge_id().to_owned(),
-            operation: operation_label,
-            decided_at_unix_ms: now_unix_ms,
-            authorization_digest,
-        }
-    }
-}
-
-/// Governed Kernel control-authority path: the exclusive authority evaluator.
-///
-/// Owns the challenge issuer (mint plus store) and is the ONLY place that
-/// evaluates control authority: [`decide_forward`](Self::decide_forward)
-/// for forwarded operations and [`authorize_shutdown`](Self::authorize_shutdown)
-/// for shutdown. Both re-validate the evidence, require the issuer-bound
-/// proof via the owned issuer, and mint a [`KernelAuthorization`] token on
-/// success. The eliotd gate and packager never authorize; they only route
-/// and package evidence.
-///
-/// A [`ProcessStatusReceipt`] has no overload here by design: read status
-/// can never become a control authorization, no matter how fresh.
-pub struct GovernedKernelAuthority {
-    /// Kernel-owned issuer: mint, store, and issuer-bound verification.
-    issuer: OwnershipChallengeIssuer,
-}
-
-impl GovernedKernelAuthority {
-    /// Bootstraps the exclusive control-authority path from a Kernel-held key.
-    ///
-    /// The only public authority constructor: callers must present a
-    /// [`KernelChallengeKey`], which has no public raw-secret constructor, so
-    /// only crate-internal Kernel wiring can bootstrap. The gate bodies
-    /// (`decide_forward`, `authorize_shutdown`) and the port proof token
-    /// ([`KernelAuthorization`]) live in this same file; no hidden authority
-    /// logic exists elsewhere.
-    pub fn bootstrap(
-        issuer_id: String,
-        key: &KernelChallengeKey,
-    ) -> Result<Self, ProcessOriginError> {
-        Ok(Self {
-            issuer: OwnershipChallengeIssuer::kernel_minted(issuer_id, key)?,
-        })
-    }
-
-    /// Wraps an already-minted issuer (crate-internal wiring and tests only).
-    // Test and wiring constructor; the public path is `bootstrap`, which
-    // requires the Kernel-held key.
-    #[allow(dead_code)]
-    pub(crate) const fn from_issuer(issuer: OwnershipChallengeIssuer) -> Self {
-        Self { issuer }
-    }
-
-    /// Returns the backing issuer identity.
-    #[must_use]
-    pub fn issuer_id(&self) -> &str {
-        self.issuer.issuer_id()
-    }
-
-    /// Issues a challenge bound to exactly one observation (Kernel-issued).
-    pub fn issue_challenge(
-        &mut self,
-        evidence: &ProcessOriginEvidence,
-        issued_at_unix_ms: u64,
-        expires_at_unix_ms: u64,
-    ) -> Result<OwnershipChallengeReceipt, ProcessOriginError> {
-        self.issuer
-            .issue(evidence, issued_at_unix_ms, expires_at_unix_ms)
-    }
-
-    /// Revokes a minted challenge (Kernel-owned invalidation set).
-    pub fn revoke_challenge(&mut self, challenge_id: &str) -> Result<(), ProcessOriginError> {
-        self.issuer.revoke(challenge_id)
-    }
-
-    /// The exclusive control-authority decision for a forwarded operation.
-    ///
-    /// Fails closed on observe-only operations, malformed evidence, and any
-    /// challenge that is missing issuance, revoked, mismatched, or not
-    /// current. On success mints the [`KernelAuthorization`] proof token.
-    pub fn decide_forward(
-        &self,
-        request: &KernelForwardRequest,
-        now_unix_ms: u64,
-    ) -> Result<KernelAuthorization, ProcessOriginError> {
-        if !request.operation.is_forwardable() {
-            return Err(ProcessOriginError::ObserveOnly);
-        }
-        request.evidence.validate()?;
-        if !request.operation.requires_challenge() {
-            return Err(ProcessOriginError::Contract(
-                "forwardable operation requires a challenge-backed decision".to_owned(),
-            ));
-        }
-        self.issuer
-            .verify(&request.challenge, &request.evidence, now_unix_ms)?;
-        Ok(KernelAuthorization::mint(
-            &self.issuer.secret,
-            &request.challenge,
-            request.operation,
-            now_unix_ms,
-        ))
-    }
-
-    /// Shutdown authorization: only a current issuer-verified challenge.
-    ///
-    /// Takes the challenge type only. A [`ProcessStatusReceipt`] cannot be
-    /// passed here, so a read receipt never authorizes shutdown no matter
-    /// how fresh or well-formed it is.
-    pub fn authorize_shutdown(
-        &self,
-        evidence: &ProcessOriginEvidence,
-        challenge: &OwnershipChallengeReceipt,
-        now_unix_ms: u64,
-    ) -> Result<KernelAuthorization, ProcessOriginError> {
-        evidence.validate()?;
-        self.issuer.verify(challenge, evidence, now_unix_ms)?;
-        Ok(KernelAuthorization::mint(
-            &self.issuer.secret,
-            challenge,
-            ProcessControlOperation::Kill,
-            now_unix_ms,
-        ))
-    }
+    let generation = Generation::new(evidence.state_fence.resource_generation.value())?;
+    OriginChallengeRequest::new(
+        physical.clone(),
+        installation_id.to_owned(),
+        evidence.origin_digest.clone(),
+        generation,
+        evidence.state_fence.clone(),
+        OriginControlOperation::from(operation),
+        request_nonce.to_owned(),
+    )
+    .map_err(ProcessOriginError::from)
 }
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use eliot_process::{DispatchAuthorityId, KernelDispatchKey, OriginChallengeAuthority};
     use std::num::NonZeroU64;
 
     use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
@@ -1215,6 +462,14 @@ mod tests {
         )
     }
 
+    fn test_epoch() -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(TEST_LINEAGE).expect("lineage"),
+            NonZeroU64::new(1).expect("sequence"),
+        )
+        .expect("epoch")
+    }
+
     fn evidence(fence: &StateFence) -> ProcessOriginEvidence {
         let origin_digest = canonical_origin_digest("/srv/eliot/worker", 4217, "worker-7", fence);
         ProcessOriginEvidence {
@@ -1227,12 +482,23 @@ mod tests {
         }
     }
 
-    fn test_issuer() -> OwnershipChallengeIssuer {
-        OwnershipChallengeIssuer::kernel_minted(
-            "governor-test".to_owned(),
-            &KernelChallengeKey::test_key(),
+    fn physical() -> PhysicalProcessBinding {
+        PhysicalProcessBinding::new(
+            4242,
+            133_081_756_927_500_000,
+            "C:\\srv\\eliot\\worker.exe",
+            "executor-job-1",
         )
-        .expect("test issuer")
+        .expect("physical identity")
+    }
+
+    /// Test-only Kernel authority: production instances live in the Kernel
+    /// service; the daemon never activates one outside tests.
+    fn test_authority() -> OriginChallengeAuthority {
+        OriginChallengeAuthority::activate(
+            DispatchAuthorityId::new("kernel-origin-test").expect("authority id"),
+            KernelDispatchKey::from_secret_bytes([7_u8; 32]).expect("kernel key"),
+        )
     }
 
     fn status_receipt(fence: &StateFence, origin_digest: &str) -> ProcessStatusReceipt {
@@ -1277,208 +543,199 @@ mod tests {
             if let OperationDisposition::NeedsKernelDecision { evidence: view } = disposition {
                 assert_eq!(view.scope_fingerprint, observed.origin_digest);
             }
-            // Packaging without an attached challenge fails on completeness.
-            assert!(matches!(
-                prepare_kernel_forward(&observed, operation, None),
-                Err(ProcessOriginError::ChallengeRequired)
-            ));
         }
     }
 
     #[test]
-    fn kernel_authority_alone_decides_control() {
-        let fence = test_fence(1);
+    fn request_packages_observation_with_physical_identity() {
+        let fence = test_fence(3);
         let observed = evidence(&fence);
-        let mut authority = GovernedKernelAuthority::from_issuer(test_issuer());
-        let receipt = authority
-            .issue_challenge(&observed, ISSUED_AT, EXPIRES_AT)
-            .expect("kernel issues the challenge");
-        assert_eq!(authority.issuer.issued_count(), 1);
-
-        let expected_label = [
-            (ProcessControlOperation::Kill, "kill"),
-            (ProcessControlOperation::Mutate, "mutate"),
-            (ProcessControlOperation::Adopt, "adopt"),
-            (
-                ProcessControlOperation::AttachCredential,
-                "attach-credential",
-            ),
-        ];
-        for (operation, label) in expected_label {
-            let request = prepare_kernel_forward(&observed, operation, Some(&receipt))
-                .expect("complete evidence packages");
-            let authorization = authority
-                .decide_forward(&request, NOW)
-                .expect("governed authority decides");
-            assert_eq!(authorization.challenge_id(), receipt.challenge_id());
-            assert_eq!(authorization.operation(), label);
-            assert_eq!(authorization.decided_at_unix_ms(), NOW);
-        }
-        authority
-            .authorize_shutdown(&observed, &receipt, NOW)
-            .expect("shutdown authorizes");
-    }
-    #[test]
-    fn reproduced_digest_without_issuance_never_authorizes() {
-        let fence = test_fence(1);
-        let observed = evidence(&fence);
-        let issuer = test_issuer();
-        assert_eq!(issuer.issued_count(), 0);
-        let authority = GovernedKernelAuthority::from_issuer(issuer);
-
-        // Attacker replays the exact reproducible content binding but cannot
-        // mint the secret-bound tag and has no registry entry. In-module
-        // struct literal stands in for any out-of-module forgery shape.
-        let plausible_id = "governor-test#00000001".to_owned();
-        let forged = OwnershipChallengeReceipt {
-            challenge_id: plausible_id.clone(),
-            origin_digest: observed.origin_digest.clone(),
-            state_fence: fence.clone(),
-            issued_at_unix_ms: ISSUED_AT,
-            expires_at_unix_ms: EXPIRES_AT,
-            receipt_digest: canonical_challenge_digest(
-                &plausible_id,
-                &observed.origin_digest,
-                &fence,
-                ISSUED_AT,
-                EXPIRES_AT,
-            ),
-            issuer_tag: "0".repeat(64),
-        };
-        // Shape and packaging pass: they are completeness, not authority.
-        forged.validate_shape().expect("forgery is well-shaped");
-        let request =
-            prepare_kernel_forward(&observed, ProcessControlOperation::Kill, Some(&forged))
-                .expect("packaging checks completeness only");
-        // Authority rejects: never issued here, tag not issuer-bound.
-        assert!(matches!(
-            authority.decide_forward(&request, NOW),
-            Err(ProcessOriginError::ChallengeMismatch)
-        ));
-        assert!(matches!(
-            authority.authorize_shutdown(&observed, &forged, NOW),
-            Err(ProcessOriginError::ChallengeMismatch)
-        ));
-    }
-
-    #[test]
-    fn cross_issuer_receipts_never_authorize() {
-        let fence = test_fence(1);
-        let observed = evidence(&fence);
-        let mut first = test_issuer();
-        let receipt = first
-            .issue(&observed, ISSUED_AT, EXPIRES_AT)
-            .expect("first issuer mints");
-        let other_issuer = OwnershipChallengeIssuer::kernel_minted(
-            "other-kernel".to_owned(),
-            &KernelChallengeKey::test_key_with(4).expect("second key"),
+        let request = request_origin_control(
+            &observed,
+            &physical(),
+            "installation-7",
+            ProcessControlOperation::Kill,
+            "nonce-0001",
         )
-        .expect("second issuer");
-        let other_authority = GovernedKernelAuthority::from_issuer(other_issuer);
-        // Same shape, different secret and store: must fail issuer binding.
+        .expect("complete evidence packages");
+        assert_eq!(request.origin_digest(), observed.origin_digest);
+        assert_eq!(request.installation_id(), "installation-7");
+        assert_eq!(request.operation(), OriginControlOperation::Kill);
+        assert_eq!(request.physical().process_id(), 4242);
+        // Observe-only operations are never packaged, even with valid input.
         assert!(matches!(
-            other_authority.issuer.verify(&receipt, &observed, NOW),
-            Err(ProcessOriginError::ChallengeMismatch)
-        ));
-        let request =
-            prepare_kernel_forward(&observed, ProcessControlOperation::Adopt, Some(&receipt))
-                .expect("packaging checks completeness only");
-        assert!(matches!(
-            other_authority.decide_forward(&request, NOW),
-            Err(ProcessOriginError::ChallengeMismatch)
-        ));
-    }
-
-    #[test]
-    fn stale_mismatched_or_revoked_challenges_never_authorize() {
-        let fence = test_fence(1);
-        let observed = evidence(&fence);
-        let mut authority = GovernedKernelAuthority::from_issuer(test_issuer());
-        let receipt = authority
-            .issue_challenge(&observed, ISSUED_AT, EXPIRES_AT)
-            .expect("kernel issues the challenge");
-        let request =
-            prepare_kernel_forward(&observed, ProcessControlOperation::Kill, Some(&receipt))
-                .expect("complete evidence packages");
-
-        assert!(matches!(
-            authority.decide_forward(&request, EXPIRES_AT + 1),
-            Err(ProcessOriginError::ChallengeNotCurrent)
-        ));
-
-        let other_fence = test_fence(2);
-        let other = evidence(&other_fence);
-        assert!(matches!(
-            authority.decide_forward(
-                &prepare_kernel_forward(&other, ProcessControlOperation::Mutate, Some(&receipt))
-                    .expect("packaging checks completeness only"),
-                NOW
+            request_origin_control(
+                &observed,
+                &physical(),
+                "installation-7",
+                ProcessControlOperation::ReadStatus,
+                "nonce-0002",
             ),
-            Err(ProcessOriginError::ChallengeMismatch)
+            Err(ProcessOriginError::ObserveOnly)
         ));
-        assert!(authority.authorize_shutdown(&other, &receipt, NOW).is_err());
-
-        let mut tampered = receipt.clone();
-        tampered.origin_digest = "0".repeat(64);
         assert!(matches!(
-            prepare_kernel_forward(&observed, ProcessControlOperation::Kill, Some(&tampered)),
+            request_origin_control(
+                &observed,
+                &physical(),
+                "installation-7",
+                ProcessControlOperation::ProbeObserve,
+                "nonce-0003",
+            ),
+            Err(ProcessOriginError::ObserveOnly)
+        ));
+        // Malformed evidence or installation never packages.
+        let mut bad = observed.clone();
+        bad.observed_port = 0;
+        assert!(matches!(
+            request_origin_control(
+                &bad,
+                &physical(),
+                "installation-7",
+                ProcessControlOperation::Kill,
+                "nonce-0004",
+            ),
             Err(ProcessOriginError::Contract(_))
         ));
-        assert!(authority.issuer.verify(&tampered, &observed, NOW).is_err());
-
-        let challenge_id = receipt.challenge_id().to_owned();
-        authority
-            .revoke_challenge(&challenge_id)
-            .expect("revocation records");
         assert!(matches!(
-            authority.decide_forward(&request, NOW),
-            Err(ProcessOriginError::ChallengeRevoked)
-        ));
-        assert!(matches!(
-            authority.authorize_shutdown(&observed, &receipt, NOW),
-            Err(ProcessOriginError::ChallengeRevoked)
+            request_origin_control(
+                &observed,
+                &physical(),
+                "",
+                ProcessControlOperation::Kill,
+                "nonce-0005",
+            ),
+            Err(ProcessOriginError::Contract(_))
         ));
     }
+
     #[test]
-    fn read_status_never_authorizes_and_probes_never_forward() {
+    fn kernel_decide_authorizes_packaged_control() {
+        let fence = test_fence(3);
+        let observed = evidence(&fence);
+        let mut authority = test_authority();
+        let request = request_origin_control(
+            &observed,
+            &physical(),
+            "installation-7",
+            ProcessControlOperation::Adopt,
+            "nonce-0010",
+        )
+        .expect("complete evidence packages");
+        let challenge = authority
+            .issue(&request, ISSUED_AT, EXPIRES_AT)
+            .expect("kernel issues the challenge");
+        let presentation =
+            OriginControlPresentation::new(request, challenge).expect("presentation seals");
+        let grant = authority
+            .decide(&presentation, &test_epoch(), NOW)
+            .expect("kernel decides");
+        assert_eq!(grant.operation(), OriginControlOperation::Adopt);
+        assert_eq!(grant.decided_at_unix_ms(), NOW);
+    }
+
+    #[test]
+    fn kill_challenge_never_authorizes_adopt() {
+        let fence = test_fence(3);
+        let observed = evidence(&fence);
+        let mut authority = test_authority();
+        let request = request_origin_control(
+            &observed,
+            &physical(),
+            "installation-7",
+            ProcessControlOperation::Kill,
+            "nonce-0020",
+        )
+        .expect("complete evidence packages");
+        let challenge = authority
+            .issue(&request, ISSUED_AT, EXPIRES_AT)
+            .expect("kernel issues kill");
+        // Resealing the kill challenge against an adopt request fails at
+        // packaging: one challenge allows exactly one operation class.
+        let adopt = request_origin_control(
+            &observed,
+            &physical(),
+            "installation-7",
+            ProcessControlOperation::Adopt,
+            "nonce-0021",
+        )
+        .expect("adopt packages separately");
+        let _ = adopt;
+        let mismatched = OriginChallengeRequest::new(
+            physical(),
+            "installation-7",
+            observed.origin_digest.clone(),
+            Generation::new(3).expect("generation"),
+            fence.clone(),
+            OriginControlOperation::Adopt,
+            "nonce-0020",
+        );
+        // Same nonce shape but different class cannot reseal the kill mint.
+        assert!(mismatched.is_ok());
+        assert!(matches!(
+            OriginControlPresentation::new(mismatched.expect("request"), challenge),
+            Err(_)
+        ));
+    }
+
+    #[test]
+    fn challenge_from_another_authority_never_decides() {
+        let fence = test_fence(3);
+        let observed = evidence(&fence);
+        let mut other = OriginChallengeAuthority::activate(
+            DispatchAuthorityId::new("other-kernel").expect("authority id"),
+            KernelDispatchKey::from_secret_bytes([9_u8; 32]).expect("kernel key"),
+        );
+        let request = request_origin_control(
+            &observed,
+            &physical(),
+            "installation-7",
+            ProcessControlOperation::Mutate,
+            "nonce-0030",
+        )
+        .expect("complete evidence packages");
+        let challenge = other
+            .issue(&request, ISSUED_AT, EXPIRES_AT)
+            .expect("other authority issues");
+        let presentation = OriginControlPresentation::new(request, challenge).expect("seals");
+        let mut authority = test_authority();
+        assert!(authority.decide(&presentation, &test_epoch(), NOW).is_err());
+    }
+
+    #[test]
+    fn read_status_never_authorizes_and_probes_never_package() {
         let fence = test_fence(1);
         let observed = evidence(&fence);
-        let mut authority = GovernedKernelAuthority::from_issuer(test_issuer());
-        let receipt = authority
-            .issue_challenge(&observed, ISSUED_AT, EXPIRES_AT)
-            .expect("kernel issues the challenge");
         let status = status_receipt(&fence, &observed.origin_digest);
         status.validate().expect("fixture status reads");
 
-        // Reads stay observe-only; even a valid challenge changes nothing.
+        // Reads stay observe-only; even a valid physical identity changes nothing.
         assert_eq!(
             gate_process_control(&observed, ProcessControlOperation::ReadStatus),
             OperationDisposition::Observed
         );
         assert!(matches!(
-            prepare_kernel_forward(
+            request_origin_control(
                 &observed,
+                &physical(),
+                "installation-7",
                 ProcessControlOperation::ReadStatus,
-                Some(&receipt)
+                "nonce-0040",
             ),
             Err(ProcessOriginError::ObserveOnly)
         ));
         assert!(matches!(
-            prepare_kernel_forward(
+            request_origin_control(
                 &observed,
+                &physical(),
+                "installation-7",
                 ProcessControlOperation::ProbeObserve,
-                Some(&receipt)
+                "nonce-0041",
             ),
             Err(ProcessOriginError::ObserveOnly)
         ));
-        // Shutdown takes the challenge type only: no overload accepts the
-        // status receipt, so a fresh well-formed status can never substitute
-        // for the challenge. The valid challenge itself still authorizes.
-        assert!(
-            authority
-                .authorize_shutdown(&observed, &receipt, NOW)
-                .is_ok()
-        );
+        // The status receipt type cannot enter the authority path: no
+        // constructor accepts it, so a fresh well-formed status can never
+        // substitute for a Kernel-issued challenge.
         let status_digest_replay = status.origin_digest.clone();
         assert_eq!(status_digest_replay, observed.origin_digest);
     }
@@ -1504,48 +761,5 @@ mod tests {
             gate_process_control(&bad, ProcessControlOperation::Kill),
             OperationDisposition::Denied { .. }
         ));
-    }
-
-    #[test]
-    fn issuer_rejects_weak_parameters() {
-        let fence = test_fence(1);
-        let observed = evidence(&fence);
-        let good_key = KernelChallengeKey::test_key();
-        assert!(OwnershipChallengeIssuer::kernel_minted(String::new(), &good_key).is_err());
-        assert!(OwnershipChallengeIssuer::kernel_minted("bad id!".to_owned(), &good_key).is_err());
-        assert!(OwnershipChallengeIssuer::kernel_minted("x".repeat(65), &good_key).is_err());
-        assert!(KernelChallengeKey::from_secret([0_u8; 32]).is_err());
-        assert!(GovernedKernelAuthority::bootstrap(String::new(), &good_key).is_err());
-        // Public bootstrap path mints a working authority from the Kernel key.
-        let mut bootstrapped =
-            GovernedKernelAuthority::bootstrap("governor-test".to_owned(), &good_key)
-                .expect("bootstrap from Kernel key");
-        bootstrapped
-            .issue_challenge(&observed, ISSUED_AT, EXPIRES_AT)
-            .expect("bootstrapped authority issues");
-
-        let mut issuer = test_issuer();
-        assert!(issuer.issue(&observed, ISSUED_AT, ISSUED_AT - 1).is_err());
-        assert!(issuer.issue(&observed, 0, EXPIRES_AT).is_err());
-        assert!(
-            issuer
-                .issue(
-                    &observed,
-                    ISSUED_AT,
-                    ISSUED_AT + MAX_CHALLENGE_WINDOW_MS + 1
-                )
-                .is_err()
-        );
-        assert!(issuer.revoke("governor-test#deadbeef").is_err());
-        let receipt = issuer
-            .issue(&observed, ISSUED_AT, EXPIRES_AT)
-            .expect("bounded window issues");
-        assert_eq!(issuer.issued_count(), 1);
-        issuer
-            .revoke(receipt.challenge_id())
-            .expect("known identity revokes");
-        issuer
-            .revoke(receipt.challenge_id())
-            .expect("revocation is idempotent");
     }
 }
