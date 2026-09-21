@@ -1,7 +1,7 @@
 //! Canonical user-automation wire contract (issue #1779, I5/I11).
 //!
 //! This module owns the serialization-only wire boundary for durable
-//! UserAutomation revisions, admission state, and invocations: versioned
+//! `UserAutomation` revisions, admission state, and invocations: versioned
 //! identity, closed parameter declarations support, per-leg completeness
 //! validation on raw parameter maps, and request builders. It contains no
 //! automation semantics, no lineage decisions, and no receipt validation:
@@ -85,7 +85,7 @@ pub const AUTOMATION_PARAM_INCLUDE_RETIRED: &str = "include_retired";
 pub const AUTOMATION_PARAM_MAX_RECORDS: &str = "max_records";
 
 /// Mutation leg discriminator values (mirror the domain operation
-/// snake_case kinds).
+/// `snake_case` kinds).
 pub const AUTOMATION_OPERATION_CREATE: &str = "create";
 /// Mutation leg discriminator values.
 pub const AUTOMATION_OPERATION_EDIT: &str = "edit";
@@ -112,7 +112,7 @@ pub const AUTOMATION_QUERY_INVOCATIONS: &str = "invocations";
 pub const AUTOMATION_QUERY_FAILURE: &str = "failure";
 
 /// Closed admission-state wire values (mirror the domain
-/// SCREAMING_SNAKE_CASE states).
+/// `SCREAMING_SNAKE_CASE` states).
 pub const AUTOMATION_STATE_ACTIVE: &str = "ACTIVE";
 /// Closed admission-state wire values.
 pub const AUTOMATION_STATE_PAUSED: &str = "PAUSED";
@@ -282,12 +282,8 @@ pub fn automation_edit_params(
     configuration_state: String,
     revision_json: String,
 ) -> BTreeMap<String, Value> {
-    let mut params = automation_create_params(
-        automation_id,
-        revision,
-        configuration_state,
-        revision_json,
-    );
+    let mut params =
+        automation_create_params(automation_id, revision, configuration_state, revision_json);
     params.insert(
         AUTOMATION_PARAM_OPERATION.to_owned(),
         Value::String(AUTOMATION_OPERATION_EDIT.to_owned()),
@@ -367,10 +363,7 @@ pub fn automation_read_request(
     state_fence: StateFence,
 ) -> Result<NamedReadRequest, StoreError> {
     let mut parameters = BTreeMap::new();
-    parameters.insert(
-        AUTOMATION_PARAM_QUERY.to_owned(),
-        Value::String(query),
-    );
+    parameters.insert(AUTOMATION_PARAM_QUERY.to_owned(), Value::String(query));
     if let Some(automation_id) = automation_id {
         parameters.insert(
             AUTOMATION_PARAM_AUTOMATION_ID.to_owned(),
@@ -544,13 +537,10 @@ pub fn validate_automation_read_params(
             field: "automation.max_records",
             reason: "page bound is required",
         })?;
-    let max_records: u16 =
-        max_records
-            .parse()
-            .map_err(|_| StoreError::InvalidField {
-                field: "automation.max_records",
-                reason: "page bound must be a decimal count",
-            })?;
+    let max_records: u16 = max_records.parse().map_err(|_| StoreError::InvalidField {
+        field: "automation.max_records",
+        reason: "page bound must be a decimal count",
+    })?;
     if max_records == 0 || max_records > MAX_AUTOMATION_PAGE_RECORDS {
         return Err(StoreError::InvalidField {
             field: "automation.max_records",
@@ -568,11 +558,10 @@ pub fn validate_automation_read_params(
         | AUTOMATION_QUERY_HISTORY
         | AUTOMATION_QUERY_INVOCATIONS
         | AUTOMATION_QUERY_FAILURE => {
-            let automation_id =
-                automation_id.ok_or(StoreError::InvalidField {
-                    field: "automation.automation_id",
-                    reason: "exact automation selector is required",
-                })?;
+            let automation_id = automation_id.ok_or(StoreError::InvalidField {
+                field: "automation.automation_id",
+                reason: "exact automation selector is required",
+            })?;
             Ok(DecodedAutomationRead {
                 query: query.to_owned(),
                 automation_id: Some(automation_id),
@@ -655,8 +644,8 @@ pub fn validate_automation_doc(document: &str, field: &'static str) -> Result<()
             reason: "automation document is outside the bounded length",
         });
     }
-    let value: Value =
-        serde_json::from_str(document).map_err(|error| StoreError::Serialization(error.to_string()))?;
+    let value: Value = serde_json::from_str(document)
+        .map_err(|error| StoreError::Serialization(error.to_string()))?;
     if !value.is_object() {
         return Err(StoreError::InvalidField {
             field,
@@ -667,7 +656,7 @@ pub fn validate_automation_doc(document: &str, field: &'static str) -> Result<()
 }
 
 /// Returns whether the value names a closed admission state (mirror of
-/// the domain SCREAMING_SNAKE_CASE states; membership only, transitions
+/// the domain `SCREAMING_SNAKE_CASE` states; membership only, transitions
 /// stay Kernel-owned).
 #[must_use]
 pub const fn is_configuration_state_wire(value: &str) -> bool {

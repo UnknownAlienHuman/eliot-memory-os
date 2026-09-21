@@ -2,14 +2,15 @@
 //!
 //! This module owns the single Rust declaration table that generates one
 //! [`NamedOperationManifest`](crate::NamedOperationManifest) descriptor per
-//! activated operation. The table activates exactly the thirteen reads with
+//! activated operation. The table activates exactly the fourteen reads with
 //! proven adapter handlers, parameter shapes, and consumers on base
 //! (`GetRevisionHeads`, `GetOrderingHeads`, `GetScopeRevisionView`,
 //! `ResolveWriteReceipt`, `GetEvidencePack`, `GetCurrentEpistemicPosition`,
 //! plus T11.3 `GetTaskState`, `GetAttentionAndProblems`,
 //! `GetUnderstandingProjectionInputs`, `GetCapabilityEvidenceState`, plus
 //! issue #1780 `GetNotificationState`, plus issue #1941 C4
-//! `GetReactiveInjectionState` and `GetResourceSnapshot`), the four `CaptureObservation` /
+//! `GetReactiveInjectionState` and `GetResourceSnapshot`, plus issue #1779
+//! `GetUserAutomationState`), the four `CaptureObservation` /
 //! `AppendAuditEvent` / `ApplyLifecyclePolicy` mutations (AUD-C01:
 //! `CaptureObservation` and `AppendAuditEvent` persist
 //! `TransitionClass::CaptureCandidate` with the `EffectClass::Candidate`
@@ -39,8 +40,14 @@
 //! mutations (issue #1941 C4: persist `TransitionClass::ReactiveState`
 //! with the `EffectClass::ReversibleMutation` ceiling and the
 //! owner-approved reactive typed parameters),
+//! plus the `ApplyUserAutomationState` mutation (issue #1779: persists
+//! `TransitionClass::UserAutomation` with the
+//! `EffectClass::ReversibleMutation` ceiling and the owner-approved
+//! automation typed parameters),
 //! plus the `GetReactiveInjectionState` and `GetResourceSnapshot` reads
 //! (issue #1941 C4: exact `session_id` / `uri` selectors, no scope),
+//! plus the `GetUserAutomationState` read
+//! (issue #1779: closed query discriminator with exact selectors, no scope),
 //! plus the provider-independent genesis bootstrap entry sourced by
 //! [`genesis_manifest`](crate::genesis_manifest). Every other operation stays
 //! known-but-unsupported and unadvertised: no other mutation on base has a
@@ -228,7 +235,7 @@ struct ActivatedReadDescriptor {
 /// selects through the declared exact `session_id` parameter;
 /// `GetResourceSnapshot` addresses no scope and selects through the
 /// declared exact `uri` parameter.
-const ACTIVATED_READS: [ActivatedReadDescriptor; 13] = [
+const ACTIVATED_READS: [ActivatedReadDescriptor; 14] = [
     ActivatedReadDescriptor {
         operation: NamedReadOperation::GetCurrentEpistemicPosition,
         requires_scope_id: true,
@@ -294,11 +301,16 @@ const ACTIVATED_READS: [ActivatedReadDescriptor; 13] = [
         requires_scope_id: false,
         scope_kind: SCOPE_KIND_NONE,
     },
+    ActivatedReadDescriptor {
+        operation: NamedReadOperation::GetUserAutomationState,
+        requires_scope_id: false,
+        scope_kind: SCOPE_KIND_NONE,
+    },
 ];
 
 /// Returns the activated read operations in canonical declaration order.
 #[must_use]
-pub const fn activated_read_operations() -> [NamedReadOperation; 13] {
+pub const fn activated_read_operations() -> [NamedReadOperation; 14] {
     [
         ACTIVATED_READS[0].operation,
         ACTIVATED_READS[1].operation,
@@ -313,6 +325,7 @@ pub const fn activated_read_operations() -> [NamedReadOperation; 13] {
         ACTIVATED_READS[10].operation,
         ACTIVATED_READS[11].operation,
         ACTIVATED_READS[12].operation,
+        ACTIVATED_READS[13].operation,
     ]
 }
 
@@ -345,7 +358,7 @@ struct ActivatedMutationDescriptor {
 /// snapshots with the closed reactive typed contract). All
 /// ten address no scope, mirroring the scope-free read descriptors. Every
 /// other mutation stays known-but-unsupported.
-const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 10] = [
+const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 11] = [
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::ApplyEpistemicRevision,
         transition_classes: &[TransitionClass::Epistemic],
@@ -403,6 +416,12 @@ const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 10] = [
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::ApplyResourceSnapshot,
         transition_classes: &[TransitionClass::ReactiveState],
+        maximum_effect: EffectClass::ReversibleMutation,
+        max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
+    },
+    ActivatedMutationDescriptor {
+        operation: NamedMutationOperation::ApplyUserAutomationState,
+        transition_classes: &[TransitionClass::UserAutomation],
         maximum_effect: EffectClass::ReversibleMutation,
         max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
     },
@@ -469,8 +488,8 @@ fn genesis_entry_spec() -> OperationManifestSpec {
 
 /// Generates the per-operation manifest descriptors from the declaration table.
 ///
-/// Declaration order is the canonical order: the thirteen activated reads, the
-/// ten activated mutations, then the genesis bootstrap entry. Generation is
+/// Declaration order is the canonical order: the fourteen activated reads, the
+/// eleven activated mutations, then the genesis bootstrap entry. Generation is
 /// pure over crate constants, so the same source always yields byte-identical
 /// entries.
 pub fn generated_operation_manifests() -> Result<Vec<NamedOperationManifest>, StoreError> {
@@ -715,6 +734,10 @@ pub fn validate_transition_against_catalogue(
             | NamedMutationOperation::ApplyResourceSnapshot => {
                 validate_typed_mutation_parameters(command.operation, &command.parameters)?;
                 crate::validate_reactive_mutation_params(command.operation, &command.parameters)?;
+            }
+            NamedMutationOperation::ApplyUserAutomationState => {
+                validate_typed_mutation_parameters(command.operation, &command.parameters)?;
+                crate::validate_automation_mutation_params(command.operation, &command.parameters)?;
             }
             NamedMutationOperation::RecordAuthorityRevocation => {
                 return Err(StoreError::UnknownOperation);
