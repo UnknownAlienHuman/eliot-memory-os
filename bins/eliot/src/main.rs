@@ -5,7 +5,10 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use eliot_bootstrap::capture::{capture_snapshot, write_snapshot_artifact};
-use eliot_cli::{CommandCatalogue, CommandPort, CommandPortError, CommandRequest};
+use eliot_cli::{
+    CommandCatalogue, CommandPort, CommandPortError, CommandRequest, USER_AUTOMATION_ROUTE,
+    user_automation_route_payload,
+};
 use eliot_doctor::integration;
 use eliot_installation::{
     ActivationCommitFence, ApprovedGenerationRegistry, CandidateManifest,
@@ -3667,6 +3670,35 @@ impl CommandPort for AuthenticatedKernelPort {
         request: &CommandRequest,
     ) -> Result<eliot_cli::CommandResponse, CommandPortError> {
         self.client.set_request_identity(request.request.clone());
+        if request.command == eliot_cli::CommandId::UserAutomation {
+            let payload = user_automation_route_payload(request)
+                .map_err(|error| CommandPortError::Rejected(error.to_string()))?;
+            let routed = self
+                .client
+                .transact_json(USER_AUTOMATION_ROUTE, payload)
+                .map_err(|error| match error {
+                    eliot_cli::kernel_client::KernelClientError::FrontDoorClosed(contract) => {
+                        CommandPortError::FrontDoorClosed { contract }
+                    }
+                    other => CommandPortError::Rejected(other.to_string()),
+                })?;
+            let spec = CommandCatalogue::current()
+                .commands()
+                .iter()
+                .find(|spec| spec.id == request.command)
+                .ok_or_else(|| {
+                    CommandPortError::Rejected(
+                        "UserAutomation command is not catalogued".to_owned(),
+                    )
+                })?;
+            return Ok(eliot_cli::CommandResponse {
+                request: request.request.clone(),
+                command: request.command,
+                effect: spec.effect,
+                proof_ceiling: spec.proof_ceiling,
+                result: eliot_cli::CommandResult::Forwarded { payload: routed },
+            });
+        }
         let payload = serde_json::to_value(request)
             .map_err(|error| CommandPortError::Rejected(error.to_string()))?;
         let response = self

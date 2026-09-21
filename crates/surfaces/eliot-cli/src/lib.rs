@@ -8,6 +8,7 @@
 
 use std::{collections::BTreeSet, fmt::Write as _, path::Path};
 
+use eliot_kernel_core::UserAutomationOperation;
 use eliot_protocol::RequestIdentity;
 use eliot_receipts::{EffectClass, ProofCeiling};
 use schemars::JsonSchema;
@@ -23,6 +24,8 @@ pub const CATALOGUE_REVISION: &str = "a11-plan-v2";
 pub const SCHEMA_VERSION: &str = "eliot-cli-schema-v1";
 /// MCP surface revision consumed by the CLI catalogue edge.
 pub const MCP_SURFACE_CONTRACT_REVISION: &str = eliot_mcp::CONTRACT_REVISION;
+/// Authenticated Kernel selector for the UserAutomation operator route.
+pub const USER_AUTOMATION_ROUTE: &str = eliot_mcp::USER_AUTOMATION_ROUTE;
 /// Stable A-08 `PLAN_GAP` marker for this catalogue edge while its admitted
 /// providers remain uninjected by composition.
 ///
@@ -66,6 +69,7 @@ pub enum CommandId {
     BackupVerify,
     BackupRestoreTest,
     MaintenanceRun,
+    UserAutomation,
 }
 
 impl CommandId {
@@ -97,9 +101,17 @@ impl CommandId {
             Self::BackupVerify => "backup-verify",
             Self::BackupRestoreTest => "backup-restore-test",
             Self::MaintenanceRun => "maintenance-run",
+            Self::UserAutomation => "user-automation",
         }
     }
 }
+
+/// Closed UserAutomation operator operation carried by the CLI surface.
+///
+/// The CLI serializes this existing Kernel-owned operation vocabulary. It
+/// does not add State Fence, WorkScope authority, provider credentials,
+/// scheduler state, Store receipts or local retry behavior.
+pub type UserAutomationCommand = UserAutomationOperation;
 
 /// Closed typed argument union for every catalogue command.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -164,6 +176,9 @@ pub enum CommandArguments {
     BackupVerify,
     BackupRestoreTest,
     MaintenanceRun,
+    UserAutomation {
+        operation: UserAutomationCommand,
+    },
 }
 
 impl CommandArguments {
@@ -194,6 +209,7 @@ impl CommandArguments {
             Self::BackupVerify => CommandId::BackupVerify,
             Self::BackupRestoreTest => CommandId::BackupRestoreTest,
             Self::MaintenanceRun => CommandId::MaintenanceRun,
+            Self::UserAutomation { .. } => CommandId::UserAutomation,
         }
     }
 
@@ -258,6 +274,9 @@ impl CommandArguments {
                 Self::validate_text(generation, "generation")
             }
             Self::DoctorIntegration { profile } => Self::validate_text(profile, "profile"),
+            Self::UserAutomation { operation } => operation
+                .validate()
+                .map_err(|error| CliError::UserAutomation(error.to_string())),
             Self::RecoveryStatus
             | Self::Ui
             | Self::Dashboard
@@ -338,6 +357,23 @@ impl CommandRequest {
         }
         Ok(())
     }
+}
+
+/// Builds the narrow authenticated UserAutomation route payload.
+///
+/// The Kernel front door supplies principal, session, RequestMetadata,
+/// StateFence and OperationIdentity. The CLI sends only the existing closed
+/// operation plus the request's retry-stable idempotency key.
+pub fn user_automation_route_payload(request: &CommandRequest) -> Result<Value, CliError> {
+    request.validate()?;
+    let CommandArguments::UserAutomation { operation } = &request.arguments else {
+        return Err(CliError::ArgumentCommandMismatch);
+    };
+    Ok(json!({
+        "operation": serde_json::to_value(operation)
+            .map_err(|error| CliError::UserAutomation(error.to_string()))?,
+        "idempotency_key": request.request.idempotency_key.clone(),
+    }))
 }
 
 /// Correlated response returned by a pure client operation.
@@ -1073,6 +1109,7 @@ pub enum ArgumentKind {
     Artifact,
     ModuleScope,
     ModuleGeneration,
+    UserAutomation,
 }
 
 /// Generated availability metadata; it is never inferred from a runtime probe.
@@ -1449,6 +1486,20 @@ static COMMANDS: &[CommandSpec] = &[
             dependency: "no admitted Kernel/Governor provider is injected",
         },
     },
+    CommandSpec {
+        id: CommandId::UserAutomation,
+        usage: "eliot user-automation <create|list|status|history|pause|resume|edit|run-now|remove|inspect-last-failure>",
+        summary: "submit one authenticated UserAutomation operator operation",
+        owner: "eliot-kernel-service",
+        required_work_id: "1779",
+        argument_kind: ArgumentKind::UserAutomation,
+        effect: EffectClass::ReversibleMutation,
+        proof_ceiling: ProofCeiling::CandidateArtifact,
+        availability: CommandAvailability::PlanGap {
+            missing_work_id: "1779",
+            dependency: "authenticated Kernel selector eliot_user_automation is not registered",
+        },
+    },
 ];
 
 /// Errors from catalogue generation or pure client validation.
@@ -1470,6 +1521,8 @@ pub enum CliError {
     CorrelationMismatch,
     #[error("result does not match the generated command availability")]
     ResultMismatch,
+    #[error("UserAutomation argument is invalid: {0}")]
+    UserAutomation(String),
 }
 
 /// Errors proving that generated catalogue data is not canonical.
@@ -1727,6 +1780,12 @@ fn validate_result_for(
                     },
             },
         ) if actual == missing_work_id && actual_dependency == dependency => {}
+        // The catalogue remains an honest PlanGap until the Kernel selector
+        // is registered, but an authenticated provider may already expose the
+        // exact typed route. Accept that provider projection only for the
+        // UserAutomation command; local `execute` still returns PlanGap.
+        (CommandAvailability::PlanGap { .. }, CommandResult::Forwarded { .. })
+            if command == CommandId::UserAutomation => {}
         (
             CommandAvailability::Unsupported { dependency, detail },
             CommandResult::Unavailable {

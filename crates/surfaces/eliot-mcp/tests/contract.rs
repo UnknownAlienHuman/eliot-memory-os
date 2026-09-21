@@ -12,8 +12,9 @@ use eliot_mcp::{
     CANONICAL_TOOL_NAMES, CoordinateInput, DurableJobHandle, FinishAttemptDraft, InitializeRequest,
     JobPresentation, KernelGovernorPort, LoopbackProfile, McpCore, NoProviderPort, ObserveInput,
     PacketInput, PortFailure, PortProjection, ProjectionKind, QueryInput, ResponseKind, StateInput,
-    ToolRequest, TransportProfile, TransportRequestContext, VerifyInput, canonical_known_tools,
-    canonical_schema, canonical_tool_schemas, known_tool_profile, routing_decision,
+    ToolRequest, TransportProfile, TransportRequestContext, UserAutomationInput, VerifyInput,
+    canonical_known_tools, canonical_schema, canonical_tool_schemas, known_tool_profile,
+    routing_decision,
 };
 use eliot_protocol::HARD_STRUCTURED_RESPONSE_BYTES;
 use eliot_receipts::{ProofCeiling, SessionBinding};
@@ -95,6 +96,16 @@ fn state_tool() -> Value {
     json!({
         "name": "eliot.state",
         "arguments": { "include": ["task", "scope"] }
+    })
+}
+
+fn user_automation_tool() -> Value {
+    json!({
+        "name": "eliot_user_automation",
+        "arguments": {
+            "operation": {"kind": "list", "include_retired": false},
+            "idempotency_key": "operator-retry-1"
+        }
     })
 }
 
@@ -793,10 +804,35 @@ fn catalogue_has_exact_names_and_schema_parity() -> Result<(), Box<dyn Error>> {
         catalogue[7].input_schema,
         canonical_schema::<FinishAttemptDraft>()?
     );
+    assert_eq!(
+        catalogue[8].input_schema,
+        canonical_schema::<UserAutomationInput>()?
+    );
     assert!(catalogue.windows(2).all(|pair| {
         pair[0].output_schema == pair[1].output_schema
             && pair[0].schema_sha256.len() == pair[1].schema_sha256.len()
     }));
+    Ok(())
+}
+
+#[test]
+fn user_automation_route_decodes_to_the_existing_closed_operation() -> Result<(), Box<dyn Error>> {
+    let request = parse_request(request_value(
+        "request-user-automation",
+        "idem-user-automation",
+        false,
+        user_automation_tool(),
+    ))?;
+    assert_eq!(request.tool.canonical_name(), "eliot_user_automation");
+    let ToolRequest::UserAutomation(UserAutomationInput {
+        operation: eliot_kernel_core::UserAutomationOperation::List { include_retired },
+        idempotency_key,
+    }) = request.tool
+    else {
+        panic!("expected typed UserAutomation list operation");
+    };
+    assert!(!include_retired);
+    assert_eq!(idempotency_key, "operator-retry-1");
     Ok(())
 }
 

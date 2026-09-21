@@ -34,6 +34,7 @@ public static class OperatorPageCatalog
         new("sleep_meta", "Sleep and Meta Lab", "Replay, holdout, baseline/candidate comparison and promotion evidence.", true),
         new("agents_routing", "Agents and Routing", "Hosts, capability envelopes, leases, contours and route decisions.", true),
         new("autonomy", "Autonomy Runs", "Bounded contracts, budgets, assignments, tripwires and completion proof.", true),
+        new("user_automation", "User Automation", "Authenticated create, inspect and lifecycle operations over canonical UserAutomation revisions.", false),
         new("approvals", "Approvals", "Exact action hash, risk, write set, verifier, rollback and decision receipts.", true),
         new("timeline_operations", "Timeline, Incidents and Operations", "Transitions, receipts, incidents, recovery, backups and logs.", true),
     ];
@@ -60,6 +61,13 @@ public sealed class MainViewModel : INotifyPropertyChanged
     private string _queryParametersText = "{}";
     private string _resultMode = "human";
     private string _candidateDisposition = "promote";
+    private string _userAutomationId = string.Empty;
+    private string _userAutomationRevision = string.Empty;
+    private string _userAutomationNonce = string.Empty;
+    private string _userAutomationRevisionJson = "{}";
+    private string _userAutomationPreviousRevisionJson = "{}";
+    private string _userAutomationOperation = "list";
+    private bool _includeRetired;
     private string? _graphSelectedRef;
     private int _graphDepth = 1;
     private string _resultPayloadText = string.Empty;
@@ -88,6 +96,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
         ["current_state", "recall_preview", "exact_evidence", "relationship_slice", "trace_replay", "health_report"];
     public IReadOnlyList<string> ResultModes { get; } = ["human", "json", "graph"];
     public IReadOnlyList<string> CandidateDispositions { get; } = ["promote", "reject", "demote", "archive"];
+    public IReadOnlyList<string> UserAutomationOperations => UserAutomationContract.OperationKinds;
 
     public OperatorPageDefinition CurrentPage
     {
@@ -100,6 +109,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
                 OnPropertyChanged(nameof(SectionDescription));
                 OnPropertyChanged(nameof(IsGraphPage));
                 OnPropertyChanged(nameof(IsQueryPage));
+                OnPropertyChanged(nameof(IsUserAutomationPage));
             }
         }
     }
@@ -108,6 +118,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
     public string SectionDescription => CurrentPage.Description;
     public bool IsQueryPage => CurrentPage.Tag == "query_lab";
     public bool IsGraphPage => CurrentPage.Tag == "causal_provenance" || (IsQueryPage && ResultMode == "graph");
+    public bool IsUserAutomationPage => CurrentPage.Tag == "user_automation";
     public bool IsBusy { get => _isBusy; private set => Set(ref _isBusy, value); }
     public string ProjectId { get => _projectId; set => Set(ref _projectId, value.Trim()); }
     public string TaskId { get => _taskId; set => Set(ref _taskId, value.Trim()); }
@@ -127,6 +138,13 @@ public sealed class MainViewModel : INotifyPropertyChanged
         }
     }
     public string CandidateDisposition { get => _candidateDisposition; set => Set(ref _candidateDisposition, value); }
+    public string UserAutomationId { get => _userAutomationId; set => Set(ref _userAutomationId, value.Trim()); }
+    public string UserAutomationRevision { get => _userAutomationRevision; set => Set(ref _userAutomationRevision, value.Trim()); }
+    public string UserAutomationNonce { get => _userAutomationNonce; set => Set(ref _userAutomationNonce, value.Trim()); }
+    public string UserAutomationRevisionJson { get => _userAutomationRevisionJson; set => Set(ref _userAutomationRevisionJson, value); }
+    public string UserAutomationPreviousRevisionJson { get => _userAutomationPreviousRevisionJson; set => Set(ref _userAutomationPreviousRevisionJson, value); }
+    public string UserAutomationOperation { get => _userAutomationOperation; set => Set(ref _userAutomationOperation, value); }
+    public bool IncludeRetired { get => _includeRetired; set => Set(ref _includeRetired, value); }
     public int GraphDepth { get => _graphDepth; set => Set(ref _graphDepth, Math.Clamp(value, 1, 3)); }
     public string ResultPayloadText { get => _resultPayloadText; private set => Set(ref _resultPayloadText, value); }
     public string ResultSummary { get => _resultSummary; private set => Set(ref _resultSummary, value); }
@@ -284,6 +302,77 @@ public sealed class MainViewModel : INotifyPropertyChanged
             _ => throw new InvalidOperationException($"Unsupported operator run command: {command}")
         };
         await ExecuteCommandAsync(payload, task, command);
+    }
+
+    /// Sends one closed UserAutomation operator operation through the existing
+    /// authenticated Governor client. The UI never supplies identity, fence,
+    /// schedule authority, provider credentials, or Store receipt fields.
+    public async Task RunUserAutomationAsync()
+    {
+        IsBusy = true;
+        NotifyCounts();
+        try
+        {
+            var operation = BuildUserAutomationOperation();
+            var result = await _client.UserAutomationAsync(
+                operation,
+                _requestCancellation?.Token ?? CancellationToken.None);
+            ResultPayloadText = result.GetRawText();
+            ResultSummary = $"UserAutomation {UserAutomationOperation} response received from the authenticated Governor route.";
+            SetBanner(
+                "UserAutomation response received",
+                $"The typed {UserAutomationOperation} operation was sent with one client idempotency key; the owner response is shown below.",
+                OperatorBannerSeverity.Success);
+        }
+        catch (Exception error)
+        {
+            SetBanner("UserAutomation command failed", error.Message, OperatorBannerSeverity.Error);
+        }
+        finally
+        {
+            IsBusy = false;
+            NotifyCounts();
+        }
+    }
+
+    private UserAutomationOperation BuildUserAutomationOperation() => UserAutomationOperation switch
+    {
+        "create" => new UserAutomationCreateOperation(ParseRevision(UserAutomationRevisionJson)),
+        "list" => new UserAutomationListOperation(IncludeRetired),
+        "status" => new UserAutomationStatusOperation(RequiredUserAutomationId()),
+        "history" => new UserAutomationHistoryOperation(RequiredUserAutomationId()),
+        "pause" => new UserAutomationPauseOperation(RequiredUserAutomationId(), RequiredUserAutomationRevision()),
+        "resume" => new UserAutomationResumeOperation(RequiredUserAutomationId(), RequiredUserAutomationRevision()),
+        "edit" => new UserAutomationEditOperation(
+            ParseRevision(UserAutomationPreviousRevisionJson),
+            ParseRevision(UserAutomationRevisionJson)),
+        "run_now" => new UserAutomationRunNowOperation(
+            RequiredUserAutomationId(),
+            RequiredUserAutomationRevision(),
+            UserAutomationNonce),
+        "remove" => new UserAutomationRemoveOperation(RequiredUserAutomationId(), RequiredUserAutomationRevision()),
+        "inspect_last_failure" => new UserAutomationInspectLastFailureOperation(RequiredUserAutomationId()),
+        _ => throw new InvalidOperationException("UserAutomation operation is not in the closed operation catalogue.")
+    };
+
+    private string RequiredUserAutomationId()
+    {
+        UserAutomationContract.RequireText(UserAutomationId, "automation_id");
+        return UserAutomationId;
+    }
+
+    private string RequiredUserAutomationRevision()
+    {
+        UserAutomationContract.RequireText(UserAutomationRevision, "automation_revision");
+        return UserAutomationRevision;
+    }
+
+    private static UserAutomationRevision ParseRevision(string value)
+    {
+        var revision = JsonSerializer.Deserialize<UserAutomationRevision>(value)
+            ?? throw new InvalidOperationException("owner-normalized UserAutomation revision JSON is required.");
+        revision.Validate();
+        return revision;
     }
 
     private async Task LoadPageAsync(bool append)

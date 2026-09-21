@@ -16,7 +16,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{SchemaError, ToolRequest, ToolSchema, canonical_tool_schemas};
+use crate::{SchemaError, ToolRequest, ToolSchema, USER_AUTOMATION_ROUTE, canonical_tool_schemas};
 
 /// Failure to register, resolve, or validate a semantic profile.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -504,9 +504,10 @@ pub fn validate_operational_projection(
 }
 
 /// Exact Tool Definition version governed by this registry revision.
-pub const CANONICAL_DEFINITION_VERSION: &str = "1.2.0";
+pub const CANONICAL_DEFINITION_VERSION: &str = "1.3.0";
 
-/// Builds the canonical registry owning the eight hot-surface methods.
+/// Builds the canonical registry owning the hot-surface methods, including
+/// the authenticated UserAutomation operator route.
 pub fn canonical_registry() -> Result<SemanticRegistry, SemanticProfileError> {
     let mut registry = SemanticRegistry::new();
     for profile in canonical_profiles() {
@@ -517,7 +518,7 @@ pub fn canonical_registry() -> Result<SemanticRegistry, SemanticProfileError> {
 
 /// Process-wide canonical registry: the single runtime semantic owner.
 ///
-/// Built on demand from [`canonical_profiles`] (eight validated inserts —
+/// Built on demand from [`canonical_profiles`] (nine validated inserts —
 /// negligible beside any kernel round-trip); every frozen lookup below
 /// resolves through a freshly built instance of this one source, so all
 /// callers share one owner per method identity with no cached fork.
@@ -580,7 +581,7 @@ pub fn published_mcp_tool_surface() -> Result<Vec<ToolSchema>, SchemaError> {
 
 #[allow(
     clippy::too_many_lines,
-    reason = "eight canonical profiles are declared once as literal data"
+    reason = "canonical profiles are declared once as literal data"
 )]
 fn canonical_profiles() -> Vec<ToolSemanticProfile> {
     vec![
@@ -813,6 +814,43 @@ fn canonical_profiles() -> Vec<ToolSemanticProfile> {
             timeout_resource_privacy: TimeoutResourcePrivacy {
                 timeout_ms: 15_000,
                 max_resource_bytes: 65_536,
+                privacy_class: "INTERNAL".to_owned(),
+            },
+            invalidation_set: InvalidationSet::full(),
+        },
+        ToolSemanticProfile {
+            method: ToolMethodIdentity {
+                canonical_name: USER_AUTOMATION_ROUTE.to_owned(),
+                definition_version: CANONICAL_DEFINITION_VERSION.to_owned(),
+            },
+            profile_version: "1.0.0".to_owned(),
+            operation_class: OperationClass::Progress,
+            effect_class: EffectClass::ScopedMutation,
+            authority_requirements: vec![
+                "authenticated-principal".to_owned(),
+                "explicit-session-binding".to_owned(),
+            ],
+            introduction_requirements: vec![
+                "closed-user-automation-operation".to_owned(),
+                "retry-stable-idempotency-key".to_owned(),
+            ],
+            idempotency_class: IdempotencyClass::IdempotentWithKey,
+            reversibility_class: ReversibilityClass::Compensatable,
+            compensation: Some("user-automation-reconcile".to_owned()),
+            expected_result:
+                "typed UserAutomation service outcome; unknown outcomes reconcile by operation identity"
+                    .to_owned(),
+            repetition: RepetitionSemantics {
+                retry_safe: false,
+                polling_admitted: true,
+                pagination_admitted: false,
+                terminal_completion: false,
+            },
+            evidence_ceiling: ProofCeiling::CandidateArtifact,
+            completion_ceiling: ProofCeiling::ScopedVerification,
+            timeout_resource_privacy: TimeoutResourcePrivacy {
+                timeout_ms: 60_000,
+                max_resource_bytes: 262_144,
                 privacy_class: "INTERNAL".to_owned(),
             },
             invalidation_set: InvalidationSet::full(),
