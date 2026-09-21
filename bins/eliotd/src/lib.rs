@@ -134,11 +134,12 @@ pub use governor_local_read::{
 pub(crate) use kernel_authority_client::KernelAuthorityClient;
 pub use kernel_context_read_client::{KernelContextReadClient, ReconstructionReadComposition};
 pub use process_origin::{
-    CapabilityEvidenceSource, CapabilityEvidenceStatus, GovernedKernelAuthority,
-    KernelAuthorization, KernelChallengeKey, KernelForwardRequest, OperationDisposition,
-    OwnershipChallengeIssuer, OwnershipChallengeReceipt, PROCESS_ORIGIN_CAPABILITY,
-    ProcessCapabilityEvidence, ProcessControlOperation, ProcessOriginError, ProcessOriginEvidence,
-    ProcessStatusReceipt, canonical_origin_digest, gate_process_control, prepare_kernel_forward,
+    CapabilityEvidenceSource, CapabilityEvidenceStatus, Generation, OperationDisposition,
+    OriginChallenge, OriginChallengeAuthority, OriginChallengeRequest, OriginControlGrant,
+    OriginControlOperation, OriginControlPresentation, PROCESS_ORIGIN_CAPABILITY,
+    PhysicalProcessBinding, ProcessCapabilityEvidence, ProcessControlOperation, ProcessOriginError,
+    ProcessOriginEvidence, ProcessStatusReceipt, canonical_origin_digest, gate_process_control,
+    request_origin_control,
 };
 pub use store_failure_projection::{GovernorStoreFailureProjection, GovernorStoreProjectionError};
 
