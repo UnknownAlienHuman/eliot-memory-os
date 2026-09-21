@@ -1219,6 +1219,24 @@ impl KernelControlRequest {
         if let KernelControlCommand::Activate(permit) = &self.command {
             permit.validate(&self.candidate, self.generation)?;
         }
+        if let KernelControlCommand::ReportHostStartupEvidence(evidence) = &self.command {
+            evidence.validate()?;
+            if evidence.candidate_digest != self.candidate.compute_digest()? {
+                return Err(KernelServiceError::HandshakeMismatch {
+                    field: "startup_evidence.candidate_binding",
+                });
+            }
+            if evidence.state_fence.resource_generation != self.generation
+                || !evidence
+                    .state_fence
+                    .authority_epoch
+                    .is_same_authority(&self.candidate.kernel_epoch)
+            {
+                return Err(KernelServiceError::HandshakeMismatch {
+                    field: "startup_evidence.fence",
+                });
+            }
+        }
         if self.payload_digest.len() != 64
             || !self
                 .payload_digest
@@ -2742,6 +2760,108 @@ impl KernelReadyReceipt {
     }
 }
 
+/// Closed Host-owned startup evidence for I1.11 steps 1, 2, and 4, bound to one
+/// exact candidate. Step 1 consumes the journal/registry/SCM digests, step 2
+/// the candidate digest plus generation/fence binding, step 4 the Blob digest.
+/// The Kernel records a step only after independently validating the
+/// corresponding field; a payload never marks a step whose probe is absent.
+/// A missing Blob probe is `None` (step 4 stays unmarked); it is never a
+/// fabricated digest.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostStartupEvidence {
+    /// Digest of the exact [`HostKernelCandidateBinding`] carried by the request.
+    pub candidate_digest: String,
+    /// Exact State Fence this evidence was probed under.
+    pub state_fence: StateFence,
+    /// Checksum of the current HostStateJournal head observed by Host.
+    pub host_record_checksum: PlatformHandle,
+    /// Digest of the registry-selected active candidate manifest.
+    pub artifact_registry_digest: PlatformHandle,
+    /// SCM-observed Watchdog incarnation, `host-scm-watchdog:{pid}:{start}:{image}`.
+    pub scm_watchdog_observation_digest: PlatformHandle,
+    /// Digest of validated Blob manifest bytes (`host-blob-manifest:{digest}`);
+    /// `None` when the Blob probe is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob_manifest_digest: Option<PlatformHandle>,
+    /// Supplementary per-probe evidence refs.
+    pub evidence_refs: Vec<PlatformHandle>,
+}
+
+impl HostStartupEvidence {
+    /// Validates every evidence field shape. Content truth (live probes,
+    /// generation binding) is checked by the request boundary and the Kernel
+    /// consumer; this rejects malformed carriers fail-closed.
+    pub fn validate(&self) -> Result<(), KernelServiceError> {
+        validate_digest(
+            &self.candidate_digest,
+            "startup_evidence.candidate_digest",
+        )?;
+        self.state_fence
+            .validate()
+            .map_err(|_| KernelServiceError::InvalidField {
+                field: "startup_evidence.state_fence",
+                reason: "authority fence must carry a non-zero resource generation",
+            })?;
+        handle(
+            &self.host_record_checksum,
+            "startup_evidence.host_record_checksum",
+        )?;
+        handle(
+            &self.artifact_registry_digest,
+            "startup_evidence.artifact_registry_digest",
+        )?;
+        Self::validate_scm_digest(self.scm_watchdog_observation_digest.as_str())?;
+        if let Some(blob) = &self.blob_manifest_digest {
+            Self::validate_blob_digest(blob.as_str())?;
+        }
+        for evidence in &self.evidence_refs {
+            handle(evidence, "startup_evidence.evidence_refs")?;
+        }
+        Ok(())
+    }
+
+    fn validate_scm_digest(value: &str) -> Result<(), KernelServiceError> {
+        let invalid = || KernelServiceError::InvalidField {
+            field: "startup_evidence.scm_watchdog_observation_digest",
+            reason: "must be host-scm-watchdog:{pid}:{start}:{image}",
+        };
+        let mut parts = value.split(':');
+        if parts.next() != Some("host-scm-watchdog") {
+            return Err(invalid());
+        }
+        let pid: u32 = parts
+            .next()
+            .ok_or_else(invalid)?
+            .parse()
+            .map_err(|_| invalid())?;
+        let start: u64 = parts
+            .next()
+            .ok_or_else(invalid)?
+            .parse()
+            .map_err(|_| invalid())?;
+        let image = parts.next().ok_or_else(invalid)?;
+        if parts.next().is_some() || pid == 0 || start == 0 {
+            return Err(invalid());
+        }
+        validate_digest(image, "startup_evidence.scm_watchdog_observation_digest")?;
+        Ok(())
+    }
+
+    fn validate_blob_digest(value: &str) -> Result<(), KernelServiceError> {
+        let invalid = || KernelServiceError::InvalidField {
+            field: "startup_evidence.blob_manifest_digest",
+            reason: "must be host-blob-manifest:{digest}",
+        };
+        let (prefix, digest) = value.split_once(':').ok_or_else(invalid)?;
+        if prefix != "host-blob-manifest" {
+            return Err(invalid());
+        }
+        validate_digest(digest, "startup_evidence.blob_manifest_digest")?;
+        Ok(())
+    }
+}
+
 /// Control messages accepted by the Kernel service boundary.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
@@ -2781,6 +2901,11 @@ pub enum KernelControlCommand {
     Stop,
     /// Record a bounded failure and its recovery reference.
     Fail(PlatformHandle),
+    /// Report closed Host-owned startup evidence (I1.11 steps 1, 2, 4) bound
+    /// to the request candidate. The Kernel records a step only after
+    /// independently validating the corresponding field; the consumer match
+    /// arms own that marking.
+    ReportHostStartupEvidence(HostStartupEvidence),
 }
 
 impl From<PortError> for KernelServiceError {
@@ -3672,6 +3797,128 @@ mod tests {
         }
         .with_computed_digest()
         .expect("probe digest")
+    }
+
+    fn startup_evidence(candidate: &HostKernelCandidateBinding) -> HostStartupEvidence {
+        HostStartupEvidence {
+            candidate_digest: candidate.compute_digest().expect("candidate digest"),
+            state_fence: StateFence::new(
+                candidate.kernel_epoch.clone(),
+                ResourceGeneration::new(3).expect("generation"),
+            ),
+            host_record_checksum: handle_value("journal-checksum-1"),
+            artifact_registry_digest: handle_value("registry-manifest-1"),
+            scm_watchdog_observation_digest: handle_value(&format!(
+                "host-scm-watchdog:4242:987654321:{}",
+                "ab".repeat(32)
+            )),
+            blob_manifest_digest: Some(handle_value(&format!(
+                "host-blob-manifest:{}",
+                "cd".repeat(32)
+            ))),
+            evidence_refs: vec![handle_value("host-startup-journal:journal-checksum-1")],
+        }
+    }
+
+    fn startup_evidence_request(
+        candidate: HostKernelCandidateBinding,
+        evidence: HostStartupEvidence,
+    ) -> KernelControlRequest {
+        KernelControlRequest {
+            wire_id: KERNEL_CONTROL_WIRE_ID.to_owned(),
+            wire_version: KERNEL_CONTROL_WIRE_VERSION,
+            message_id: handle_value("startup-evidence-message-1"),
+            sequence: 6,
+            peer_process_id: 7,
+            generation: ResourceGeneration::new(3).expect("generation"),
+            candidate,
+            command: KernelControlCommand::ReportHostStartupEvidence(evidence),
+            payload_digest: String::new(),
+        }
+        .with_computed_digest()
+        .expect("startup evidence digest")
+    }
+
+    #[test]
+    fn startup_evidence_validates_shaped_fields() {
+        let candidate = candidate_binding();
+        startup_evidence(&candidate)
+            .validate()
+            .expect("shaped evidence must validate");
+    }
+
+    #[test]
+    fn startup_evidence_rejects_malformed_fields() {
+        let candidate = candidate_binding();
+        let good = startup_evidence(&candidate);
+        let mut bad_digest = good.clone();
+        bad_digest.candidate_digest = "not-a-digest".to_owned();
+        assert!(bad_digest.validate().is_err());
+        for bad_scm in [
+            "host-heartbeat-peer:4242:987654321".to_owned(),
+            "host-scm-watchdog:0:987654321:".to_owned() + &"ab".repeat(32),
+            "host-scm-watchdog:4242:0:".to_owned() + &"ab".repeat(32),
+            "host-scm-watchdog:4242:987654321:xyz".to_owned(),
+            "host-scm-watchdog:4242".to_owned(),
+        ] {
+            let mut bad = good.clone();
+            bad.scm_watchdog_observation_digest =
+                handle_value(&bad_scm);
+            assert!(
+                bad.validate().is_err(),
+                "malformed SCM digest must fail: {bad_scm}"
+            );
+        }
+        let mut bad_blob = good.clone();
+        bad_blob.blob_manifest_digest = Some(handle_value("host-blob-manifest:short"));
+        assert!(bad_blob.validate().is_err());
+        // A zero resource generation is unconstructible by design
+        // (`ResourceGeneration::new(0)` is `Err`), so the fence validator's
+        // empty-generation arm is unreachable through public constructors;
+        // generation drift is proven at the request boundary below.
+    }
+
+    #[test]
+    fn startup_evidence_request_binds_candidate_and_fence() {
+        let candidate = candidate_binding();
+        let request = startup_evidence_request(candidate.clone(), startup_evidence(&candidate));
+        request.validate().expect("bound evidence must validate");
+        // A digest bound to another candidate is a replay across candidates.
+        let mut foreign = candidate_binding();
+        foreign.activation_id = handle_value("activation-2");
+        let replayed = startup_evidence_request(foreign, startup_evidence(&candidate));
+        assert!(replayed.validate().is_err());
+        // A fence naming another generation cannot ride this request.
+        let evidence = startup_evidence(&candidate);
+        let mut drifted = startup_evidence_request(candidate, evidence);
+        if let KernelControlCommand::ReportHostStartupEvidence(inner) = &mut drifted.command {
+            inner.state_fence = StateFence::new(
+                inner.state_fence.authority_epoch.clone(),
+                ResourceGeneration::new(9).expect("generation"),
+            );
+        }
+        drifted.payload_digest = drifted.compute_digest().expect("re-digest");
+        assert!(drifted.validate().is_err());
+    }
+
+    #[test]
+    fn startup_evidence_absent_blob_stays_well_formed() {
+        // A missing Blob probe is None, never a fabricated digest: the
+        // payload validates (steps 1 and 2 markable) while step 4 cannot mark.
+        let candidate = candidate_binding();
+        let mut evidence = startup_evidence(&candidate);
+        evidence.blob_manifest_digest = None;
+        evidence
+            .validate()
+            .expect("blob-absent evidence must validate");
+        startup_evidence_request(candidate, evidence)
+            .validate()
+            .expect("blob-absent request must validate");
+        // Unknown wire fields stay fail-closed on the new carrier.
+        let value = serde_json::to_value(startup_evidence(&candidate_binding())).expect("json");
+        let mut tampered = value;
+        tampered["unknown"] = serde_json::Value::Bool(true);
+        assert!(serde_json::from_value::<HostStartupEvidence>(tampered).is_err());
     }
 
     fn bound_ready_receipt(
