@@ -8,6 +8,7 @@
     reason = "provider-neutral runtime-control wire seam keeps explicit validation and frame plumbing"
 )]
 
+use crate::reactive_context_delivery::ReactiveContextDeliveryRequest;
 use eliot_contracts::{
     ClockReading, EpochId, EpochLineageId, ProductId, RequestId, RequestMetadata,
     ResourceGeneration, SourceId, StateFence,
@@ -53,6 +54,11 @@ const UNKNOWN_REF_REASONS: &[&str] = &[
     "store-recovery-reconcile-snapshot",
     "store-recovery-reconcile-unknown",
     "store-recovery-crash-fence-manual-new-lineage",
+    "reactive-context-validation",
+    "reactive-context-queue-lock",
+    "reactive-context-queue-full",
+    "reactive-context-queue-response",
+    "reactive-context",
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -62,6 +68,7 @@ pub enum HostRuntimeControlOperation {
     ReconcileKernelRestart,
     RecoverStore,
     ReconcileStoreRecovery,
+    DeliverReactiveContext,
 }
 
 fn canonical_operation_name(operation: &HostRuntimeControlOperation) -> &'static str {
@@ -70,6 +77,7 @@ fn canonical_operation_name(operation: &HostRuntimeControlOperation) -> &'static
         HostRuntimeControlOperation::ReconcileKernelRestart => "ReconcileKernelRestart",
         HostRuntimeControlOperation::RecoverStore => "RecoverStore",
         HostRuntimeControlOperation::ReconcileStoreRecovery => "ReconcileStoreRecovery",
+        HostRuntimeControlOperation::DeliverReactiveContext => "DeliverReactiveContext",
     }
 }
 
@@ -79,6 +87,7 @@ fn operation_unknown_prefix(operation: &HostRuntimeControlOperation) -> &'static
         | HostRuntimeControlOperation::ReconcileKernelRestart => "kernel-restart",
         HostRuntimeControlOperation::RecoverStore
         | HostRuntimeControlOperation::ReconcileStoreRecovery => "store-recovery",
+        HostRuntimeControlOperation::DeliverReactiveContext => "reactive-context",
     }
 }
 
@@ -137,6 +146,18 @@ fn request_digest_for(
     )
 }
 
+fn reactive_context_mutation_digest(
+    source: &HostReactiveContextRuntimeRequest,
+) -> Result<String, String> {
+    let encoded = serde_json::to_vec(source)
+        .map_err(|_| "reactive Context source could not be encoded".to_owned())?;
+    let mut material = Vec::with_capacity(WIRE.len() + encoded.len() + 20);
+    material.extend_from_slice(WIRE.as_bytes());
+    material.extend_from_slice(b":reactive-context:");
+    material.extend_from_slice(&encoded);
+    Ok(sha256_hex(&material))
+}
+
 pub fn runtime_control_unknown_ref(
     prefix: &str,
     request: &HostRuntimeControlRequest,
@@ -182,6 +203,7 @@ fn parse_runtime_control_unknown_ref(
         "ReconcileKernelRestart" => HostRuntimeControlOperation::ReconcileKernelRestart,
         "RecoverStore" => HostRuntimeControlOperation::RecoverStore,
         "ReconcileStoreRecovery" => HostRuntimeControlOperation::ReconcileStoreRecovery,
+        "DeliverReactiveContext" => HostRuntimeControlOperation::DeliverReactiveContext,
         _ => return None,
     };
     let request = HostRuntimeControlRequest {
@@ -190,8 +212,41 @@ fn parse_runtime_control_unknown_ref(
         request_id: PlatformHandle::new(request_id).ok()?,
         mutation_digest: PlatformHandle::new(mutation_digest).ok()?,
         request_digest: PlatformHandle::new(request_digest).ok()?,
+        reactive_context: None,
     };
-    request.validate().ok().map(|_| request)
+    request.validate_identity().ok().map(|_| request)
+}
+
+/// Complete owner-produced reactive Context input accepted by the
+/// authenticated Host runtime-control front door.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostReactiveContextRuntimeRequest {
+    /// Complete typed payload and owner enqueue evidence.
+    pub delivery: ReactiveContextDeliveryRequest,
+    /// Owner admission reference for this exact request.
+    pub admission_ref: PlatformHandle,
+}
+
+impl HostReactiveContextRuntimeRequest {
+    /// Validate the source handoff before it enters the Host queue.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.admission_ref.as_str().trim().is_empty() {
+            return Err("reactive Context admission_ref is blank".to_owned());
+        }
+        self.delivery
+            .payload
+            .validate()
+            .map_err(|error| format!("reactive Context payload is invalid: {error}"))?;
+        let owner_receipt = self
+            .delivery
+            .owner_receipt
+            .as_ref()
+            .ok_or_else(|| "reactive Context owner_receipt is required".to_owned())?;
+        owner_receipt
+            .validate()
+            .map_err(|error| format!("reactive Context owner_receipt is invalid: {error}"))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -202,6 +257,9 @@ pub struct HostRuntimeControlRequest {
     pub request_id: PlatformHandle,
     pub mutation_digest: PlatformHandle,
     pub request_digest: PlatformHandle,
+    /// Complete typed input for the authenticated reactive Context operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reactive_context: Option<HostReactiveContextRuntimeRequest>,
 }
 
 impl HostRuntimeControlRequest {
@@ -235,8 +293,44 @@ impl HostRuntimeControlRequest {
             request_id,
             mutation_digest,
             request_digest,
+            reactive_context: None,
         };
         value.validate().map_err(|e| e.to_string())?;
+        Ok(value)
+    }
+
+    /// Construct an authenticated reactive Context request whose mutation
+    /// digest covers the complete typed owner handoff.
+    pub fn new_reactive_context(
+        request_id: PlatformHandle,
+        delivery: ReactiveContextDeliveryRequest,
+        admission_ref: PlatformHandle,
+    ) -> Result<Self, String> {
+        let reactive_context = HostReactiveContextRuntimeRequest {
+            delivery,
+            admission_ref,
+        };
+        reactive_context.validate()?;
+        let wire = PlatformHandle::new(WIRE.to_owned()).map_err(|e| e.to_string())?;
+        let mutation_digest =
+            PlatformHandle::new(reactive_context_mutation_digest(&reactive_context)?)
+                .map_err(|e| e.to_string())?;
+        let request_digest = PlatformHandle::new(request_digest_for(
+            &wire,
+            &HostRuntimeControlOperation::DeliverReactiveContext,
+            &request_id,
+            &mutation_digest,
+        ))
+        .map_err(|e| e.to_string())?;
+        let value = Self {
+            wire,
+            operation: HostRuntimeControlOperation::DeliverReactiveContext,
+            request_id,
+            mutation_digest,
+            request_digest,
+            reactive_context: Some(reactive_context),
+        };
+        value.validate()?;
         Ok(value)
     }
 
@@ -263,6 +357,29 @@ impl HostRuntimeControlRequest {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        self.validate_identity()?;
+        match (&self.operation, &self.reactive_context) {
+            (HostRuntimeControlOperation::DeliverReactiveContext, Some(source)) => {
+                source.validate()?;
+                let expected = reactive_context_mutation_digest(source)?;
+                if self.mutation_digest.as_str() != expected {
+                    return Err("reactive Context mutation_digest mismatch".to_owned());
+                }
+            }
+            (HostRuntimeControlOperation::DeliverReactiveContext, None) => {
+                return Err("reactive Context input is required".to_owned());
+            }
+            (_, Some(_)) => {
+                return Err(
+                    "reactive Context input is reserved for DeliverReactiveContext".to_owned(),
+                );
+            }
+            (_, None) => {}
+        }
+        Ok(())
+    }
+
+    fn validate_identity(&self) -> Result<(), String> {
         if self.wire.as_str() != WIRE {
             return Err("unsupported wire".to_owned());
         }

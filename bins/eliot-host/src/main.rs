@@ -6,7 +6,10 @@ use std::io::{self, BufRead, Write};
 use std::sync::OnceLock;
 
 #[cfg(windows)]
-use eliot_host::{HostBranchDisposition, HostLivenessTick, HostRuntimeControlOperation};
+use eliot_host::{
+    HostBranchDisposition, HostLivenessTick, HostReactiveContextProducer,
+    HostRuntimeControlOperation, HostRuntimeControlResponse,
+};
 use eliot_host::{
     HostComposition, HostError, HostLaunchOptions, HostPhaseBRequestQueue, PROTOCOL_VERSION,
     SERVICE_NAME,
@@ -985,6 +988,7 @@ fn spawn_runtime_control(
 enum RuntimeControlDispatch {
     Kernel,
     Store,
+    ReactiveContext,
 }
 
 #[cfg(windows)]
@@ -994,7 +998,39 @@ fn runtime_control_dispatch(operation: &HostRuntimeControlOperation) -> RuntimeC
         | HostRuntimeControlOperation::ReconcileKernelRestart => RuntimeControlDispatch::Kernel,
         HostRuntimeControlOperation::RecoverStore
         | HostRuntimeControlOperation::ReconcileStoreRecovery => RuntimeControlDispatch::Store,
+        HostRuntimeControlOperation::DeliverReactiveContext => {
+            RuntimeControlDispatch::ReactiveContext
+        }
     }
+}
+
+#[cfg(windows)]
+fn process_reactive_context_request(
+    host: &HostComposition,
+    request: &eliot_host::HostRuntimeControlRequest,
+) -> HostRuntimeControlResponse {
+    // The named-pipe endpoint has already authenticated the peer.  The
+    // request still has to carry a complete owner receipt and typed payload;
+    // this handler never assembles a payload from plan text or accepts a
+    // caller endpoint as authority.  The retained Kernel contour is selected
+    // by HostComposition::current_reactive_context_contour.
+    if let Some(source) = request.reactive_context.as_ref() {
+        let _outcome = HostReactiveContextProducer::from_authenticated_source(
+            source.delivery.clone(),
+            source.admission_ref.clone(),
+        )
+        .map(|producer| host.deliver_reactive_context_from_producer(producer));
+    }
+    // The current authenticated Kernel wire has no application receipt or
+    // query/cancel seam.  Preserve that uncertainty on the existing control
+    // response contract even when the durable queue/transport call returned.
+    HostRuntimeControlResponse::unknown_for(
+        request,
+        eliot_host_service::runtime_control::runtime_control_unknown_ref(
+            "reactive-context",
+            request,
+        ),
+    )
 }
 
 #[cfg(windows)]
@@ -1013,6 +1049,9 @@ fn process_runtime_control_requests(
                 host.handle_kernel_restart_request(envelope.request())
             }
             RuntimeControlDispatch::Store => host.handle_store_recovery_request(envelope.request()),
+            RuntimeControlDispatch::ReactiveContext => {
+                process_reactive_context_request(host, envelope.request())
+            }
         };
         let _ = envelope.respond(response);
     }
@@ -1218,6 +1257,10 @@ mod tests {
         assert_eq!(
             runtime_control_dispatch(&HostRuntimeControlOperation::ReconcileStoreRecovery),
             RuntimeControlDispatch::Store
+        );
+        assert_eq!(
+            runtime_control_dispatch(&HostRuntimeControlOperation::DeliverReactiveContext),
+            RuntimeControlDispatch::ReactiveContext
         );
     }
 
