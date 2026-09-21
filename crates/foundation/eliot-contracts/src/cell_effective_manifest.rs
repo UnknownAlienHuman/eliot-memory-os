@@ -308,6 +308,43 @@ pub enum CellManifestError {
         /// Declaration that is absent.
         field: &'static str,
     },
+    /// Delegated execution names no runtime bundle. A cell whose contour or
+    /// runtime class places execution in a separately replaceable process,
+    /// service, or component pool must name that bundle explicitly; `None`
+    /// is rejected instead of defaulted.
+    MissingRuntimeBundle {
+        /// Cell with the delegated execution but no bundle.
+        cell: String,
+        /// Contour/class pair that requires a bundle.
+        detail: String,
+    },
+    /// The iteration lane is not evidenced by the referenced proof-latency
+    /// profile. The lane never stands without its explicit profile reference.
+    IncompatibleLaneProfile {
+        /// Cell with the inconsistent lane/profile pair.
+        cell: String,
+        /// Declared iteration lane.
+        lane: String,
+        /// Referenced proof-latency profile that does not evidence the lane.
+        profile: String,
+    },
+    /// The state class is incompatible with the replacement class under the
+    /// documented `I2.10` pairing constraints.
+    IncompatibleStateReplacement {
+        /// Cell with the incompatible state/replacement pair.
+        cell: String,
+        /// Declared state ownership class.
+        state: String,
+        /// Declared runtime replacement class.
+        replacement: String,
+    },
+    /// One multi-cell generation call mixes inputs from more than one source
+    /// crate. Generation is crate-scoped: one call describes the cells of
+    /// exactly one crate.
+    MixedSourceCrates {
+        /// Sorted distinct source crates observed in the call.
+        crates: Vec<String>,
+    },
     /// An owner repeats the hosting crate name instead of naming an
     /// explicitly declared owner. Crate names never confer authority.
     InferredAuthority {
@@ -350,6 +387,31 @@ impl fmt::Display for CellManifestError {
             Self::MissingField { cell, field } => write!(
                 formatter,
                 "cell '{cell}' is missing required declaration '{field}'"
+            ),
+            Self::MissingRuntimeBundle { cell, detail } => write!(
+                formatter,
+                "cell '{cell}' delegates execution ({detail}) but names no runtime_bundle"
+            ),
+            Self::IncompatibleLaneProfile {
+                cell,
+                lane,
+                profile,
+            } => write!(
+                formatter,
+                "cell '{cell}' iteration lane '{lane}' is not evidenced by proof latency profile '{profile}'"
+            ),
+            Self::IncompatibleStateReplacement {
+                cell,
+                state,
+                replacement,
+            } => write!(
+                formatter,
+                "cell '{cell}' state class '{state}' is incompatible with replacement class '{replacement}'"
+            ),
+            Self::MixedSourceCrates { crates } => write!(
+                formatter,
+                "multi-cell generation mixes source crates: {}",
+                crates.join(", ")
             ),
             Self::InferredAuthority {
                 cell,
@@ -425,6 +487,141 @@ fn owner_is_crate_derived(owner: &CellOwnerRef, source_crate: &SourceCrateRef) -
     authority_key(owner.as_str()) == authority_key(source_crate.as_str())
 }
 
+/// Returns whether the contour/class pair denotes delegated execution
+/// (`I2.10`): the cell runs in a separately replaceable process, service, or
+/// component pool, so it must name that bundle explicitly.
+///
+/// The `NativeProcess` contour always delegates (separate process/Job with a
+/// versioned protocol and rolling generation). The service-like runtime
+/// classes replace through an independent service, process, host, testd, or
+/// job generation and therefore delegate as well. `KernelInternal` is
+/// host-managed inline, `DerivedIndex` rebuilds from sources in place,
+/// `Surface` restarts host-inline, and `DevelopmentTool` never runs in
+/// production, so none of them requires a bundle by itself.
+fn requires_runtime_bundle(contour: ModuleExecutionContour, class: ModuleRuntimeClass) -> bool {
+    if contour == ModuleExecutionContour::NativeProcess {
+        return true;
+    }
+    matches!(
+        class,
+        ModuleRuntimeClass::DaemonService
+            | ModuleRuntimeClass::ProcessBridge
+            | ModuleRuntimeClass::ComponentHost
+            | ModuleRuntimeClass::TestExecutionPlane
+            | ModuleRuntimeClass::OperationalWorker
+            | ModuleRuntimeClass::CognitiveService
+            | ModuleRuntimeClass::SupervisorSecurity
+    )
+}
+
+/// Returns whether the referenced proof-latency profile evidences the
+/// declared iteration lane (`I2.10`).
+///
+/// Verifiable rule: the profile reference is split into lowercase
+/// alphanumeric tokens on every other character, and the lane token must be
+/// present exactly (`interactive`, `normal`, `slow`). `ManualRelease`
+/// requires both `manual` and `release` tokens. Token-exact matching keeps
+/// `abnormal` from evidencing `Normal`; the lane is never inferred from
+/// package size or crate name.
+fn lane_profile_consistent(lane: IterationLane, profile: &ProofLatencyProfileRef) -> bool {
+    let tokens: Vec<String> = profile
+        .as_str()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let has = |token: &str| tokens.iter().any(|candidate| candidate == token);
+    match lane {
+        IterationLane::Interactive => has("interactive"),
+        IterationLane::Normal => has("normal"),
+        IterationLane::Slow => has("slow"),
+        IterationLane::ManualRelease => has("manual") && has("release"),
+    }
+}
+
+/// Returns whether the state/replacement pair is admissible under the
+/// documented `I2.10` pairing constraints:
+///
+/// * `Stateless` cells have no state to migrate, so `OfflineRelease` ("no
+///   safe online cutover exists yet") is incoherent for them.
+/// * `CheckpointedOperational` state resumes from a versioned
+///   checkpoint/reconciliation, which one sandboxed `ComponentGeneration`
+///   cannot provide.
+/// * `ExternalCanonicalAdapter` owns no ELIOT semantics, so it must not be
+///   linked into the daemon (`DaemonGeneration`); it replaces through its
+///   declared external surface.
+///
+/// Every other combination is admitted; source decomposition and runtime
+/// replacement remain independent decisions.
+fn state_replacement_compatible(
+    state: ModuleStateClass,
+    replacement: ModuleReplacementClass,
+) -> bool {
+    !matches!(
+        (state, replacement),
+        (
+            ModuleStateClass::Stateless,
+            ModuleReplacementClass::OfflineRelease
+        ) | (
+            ModuleStateClass::CheckpointedOperational,
+            ModuleReplacementClass::ComponentGeneration,
+        ) | (
+            ModuleStateClass::ExternalCanonicalAdapter,
+            ModuleReplacementClass::DaemonGeneration,
+        )
+    )
+}
+
+/// Enforces the cross-field consistency rules shared by generation and
+/// validation: delegated execution names a bundle, the lane is evidenced by
+/// its profile, and the state/replacement pair is admissible.
+#[allow(clippy::too_many_arguments)]
+fn check_cross_field_consistency(
+    cell: &str,
+    contour: ModuleExecutionContour,
+    class: ModuleRuntimeClass,
+    bundle: Option<&RuntimeBundleId>,
+    lane: IterationLane,
+    profile: &ProofLatencyProfileRef,
+    state: ModuleStateClass,
+    replacement: ModuleReplacementClass,
+) -> Result<(), CellManifestError> {
+    if requires_runtime_bundle(contour, class) && bundle.is_none() {
+        return Err(CellManifestError::MissingRuntimeBundle {
+            cell: cell.to_owned(),
+            detail: format!("{contour:?}/{class:?} delegates execution to a named bundle"),
+        });
+    }
+    if !lane_profile_consistent(lane, profile) {
+        return Err(CellManifestError::IncompatibleLaneProfile {
+            cell: cell.to_owned(),
+            lane: format!("{lane:?}"),
+            profile: profile.as_str().to_owned(),
+        });
+    }
+    if !state_replacement_compatible(state, replacement) {
+        return Err(CellManifestError::IncompatibleStateReplacement {
+            cell: cell.to_owned(),
+            state: format!("{state:?}"),
+            replacement: format!("{replacement:?}"),
+        });
+    }
+    Ok(())
+}
+
+/// Returns the sorted distinct source crates named by one multi-cell call.
+fn distinct_source_crates(inputs: &[CellManifestInput]) -> Vec<String> {
+    let mut crates: Vec<String> = Vec::new();
+    for input in inputs {
+        let name = input.source_crate.as_str().to_owned();
+        if !crates.contains(&name) {
+            crates.push(name);
+        }
+    }
+    crates.sort();
+    crates
+}
+
 fn contract_digest_of(bytes: &[u8]) -> Result<ContractDigest, CellManifestError> {
     ContractDigest::new(sha256_hex(bytes)).map_err(|error| CellManifestError::DigestFailed {
         detail: error.to_string(),
@@ -480,8 +677,11 @@ impl EffectiveCellManifest {
     /// Validates identity binding, digest freshness, and explicit authority.
     ///
     /// Returns `Ok(())` only when the manifest id binds the cell revision,
-    /// the carried digest matches the recomputed canonical digest, and no
-    /// owner is derived from the hosting crate name.
+    /// the carried digest matches the recomputed canonical digest, no owner
+    /// is derived from the hosting crate name, delegated execution names a
+    /// runtime bundle, the iteration lane is evidenced by its referenced
+    /// proof-latency profile, and the state/replacement pair is admissible
+    /// under `I2.10`.
     pub fn validate(&self) -> Result<(), CellManifestError> {
         let expected_id = manifest_identity(&self.functional_cell_ref, self.cell_revision);
         if self.manifest_id.as_str() != expected_id {
@@ -504,6 +704,16 @@ impl EffectiveCellManifest {
                 source_crate: self.source_crate.as_str().to_owned(),
             });
         }
+        check_cross_field_consistency(
+            self.functional_cell_ref.as_str(),
+            self.execution_contour,
+            self.runtime_class,
+            self.runtime_bundle.as_ref(),
+            self.iteration_lane,
+            &self.proof_latency_profile,
+            self.state_class,
+            self.replacement_class,
+        )?;
         Ok(())
     }
 }
@@ -512,7 +722,10 @@ impl EffectiveCellManifest {
 ///
 /// Missing non-derivable declarations (`lifecycle_owner`, `proof_entrypoint`)
 /// are rejected; a crate-derived owner spelling is rejected as inferred
-/// authority instead of being accepted as a default.
+/// authority instead of being accepted as a default. Delegated execution
+/// without a named `runtime_bundle`, a lane unevidenced by its referenced
+/// proof-latency profile, and an inadmissible `I2.10` state/replacement pair
+/// are rejected fail-closed as well.
 pub fn generate_effective_manifest(
     input: CellManifestInput,
 ) -> Result<EffectiveCellManifest, CellManifestError> {
@@ -537,6 +750,16 @@ pub fn generate_effective_manifest(
                 cell: cell_name.clone(),
                 field: "proof_entrypoint",
             })?;
+    check_cross_field_consistency(
+        &cell_name,
+        input.execution_contour,
+        input.runtime_class,
+        input.runtime_bundle.as_ref(),
+        input.iteration_lane,
+        &input.proof_latency_profile,
+        input.state_class,
+        input.replacement_class,
+    )?;
     let manifest_id = ManifestId::new(manifest_identity(&input.cell, input.cell_revision))
         .map_err(|error| CellManifestError::DigestFailed {
             detail: error.to_string(),
@@ -577,13 +800,19 @@ pub fn generate_effective_manifest(
 
 /// Generates one effective manifest per declared cell of a crate.
 ///
-/// The output preserves input order with one manifest per input cell; a
-/// duplicate cell claim fails the whole crate generation. Use
-/// [`generate_single_crate_manifest`] only to prove that a single per-crate
-/// manifest is rejected for a multi-cell crate.
+/// The call is crate-scoped: every input must name the same `source_crate`,
+/// and mixed-crate inputs fail with [`CellManifestError::MixedSourceCrates`]
+/// instead of generating under the first crate. The output preserves input
+/// order with one manifest per input cell; a duplicate cell claim fails the
+/// whole crate generation. Use [`generate_single_crate_manifest`] only to
+/// prove that a single per-crate manifest is rejected for a multi-cell crate.
 pub fn generate_effective_manifests_for_crate(
     inputs: Vec<CellManifestInput>,
 ) -> Result<Vec<EffectiveCellManifest>, CellManifestError> {
+    let crates = distinct_source_crates(&inputs);
+    if crates.len() > 1 {
+        return Err(CellManifestError::MixedSourceCrates { crates });
+    }
     let mut seen: Vec<String> = Vec::new();
     for input in &inputs {
         let cell_name = input.cell.as_str().to_owned();
@@ -601,16 +830,30 @@ pub fn generate_effective_manifests_for_crate(
 
 /// Proves that a single per-crate manifest cannot represent a multi-cell
 /// crate: more than one declared cell is rejected instead of collapsed.
+///
+/// Mixed-crate inputs fail with [`CellManifestError::MixedSourceCrates`]
+/// listing every observed crate; the multi-cell rejection always reports the
+/// true shared crate rather than whichever input arrived first.
 pub fn generate_single_crate_manifest(
     inputs: Vec<CellManifestInput>,
 ) -> Result<EffectiveCellManifest, CellManifestError> {
+    if inputs.is_empty() {
+        return Err(CellManifestError::MissingField {
+            cell: "<unknown>".to_owned(),
+            field: "functional_cell_ref",
+        });
+    }
+    let crates = distinct_source_crates(&inputs);
+    if crates.len() > 1 {
+        return Err(CellManifestError::MixedSourceCrates { crates });
+    }
     if inputs.len() > 1 {
-        let first = inputs.first().map_or_else(
-            || "<unknown>".to_owned(),
-            |input| input.source_crate.as_str().to_owned(),
-        );
+        let shared = crates
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "<unknown>".to_owned());
         return Err(CellManifestError::SingleManifestForMultiCell {
-            source_crate: first,
+            source_crate: shared,
             cells: inputs.len(),
         });
     }
@@ -740,6 +983,245 @@ mod tests {
             generate_single_crate_manifest(collapsed),
             Err(CellManifestError::SingleManifestForMultiCell { cells: 2, .. })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn delegated_execution_requires_named_runtime_bundle() -> TestResult {
+        let mut native = valid_input("foundation.tool.native", "foundation-tool-owner")?;
+        native.execution_contour = ModuleExecutionContour::NativeProcess;
+        assert!(matches!(
+            generate_effective_manifest(native),
+            Err(CellManifestError::MissingRuntimeBundle { .. })
+        ));
+
+        let mut bundled = valid_input("foundation.tool.native", "foundation-tool-owner")?;
+        bundled.execution_contour = ModuleExecutionContour::NativeProcess;
+        bundled.runtime_bundle = Some(RuntimeBundleId::new("tool-native-bundle")?);
+        let bundled_manifest = generate_effective_manifest(bundled)?;
+        bundled_manifest
+            .validate()
+            .map_err(|error| error.to_string())?;
+
+        for class in [
+            ModuleRuntimeClass::DaemonService,
+            ModuleRuntimeClass::ProcessBridge,
+            ModuleRuntimeClass::ComponentHost,
+            ModuleRuntimeClass::TestExecutionPlane,
+            ModuleRuntimeClass::OperationalWorker,
+            ModuleRuntimeClass::CognitiveService,
+            ModuleRuntimeClass::SupervisorSecurity,
+        ] {
+            let mut input = valid_input("foundation.service.cell", "foundation-service-owner")?;
+            input.runtime_class = class;
+            assert!(
+                matches!(
+                    generate_effective_manifest(input),
+                    Err(CellManifestError::MissingRuntimeBundle { .. })
+                ),
+                "runtime class {class:?} must require a runtime bundle"
+            );
+        }
+
+        for class in [
+            ModuleRuntimeClass::KernelInternal,
+            ModuleRuntimeClass::DerivedIndex,
+            ModuleRuntimeClass::Surface,
+            ModuleRuntimeClass::DevelopmentTool,
+        ] {
+            let mut input = valid_input("foundation.host.cell", "foundation-host-owner")?;
+            input.runtime_class = class;
+            generate_effective_manifest(input).map_err(|error| error.to_string())?;
+        }
+
+        let mut manifest = generate_effective_manifest(valid_input(
+            "foundation.contracts.primitives",
+            "foundation-contract-owner",
+        )?)?;
+        manifest.execution_contour = ModuleExecutionContour::NativeProcess;
+        manifest.manifest_digest = manifest
+            .recomputed_digest()
+            .map_err(|error| error.to_string())?;
+        assert!(matches!(
+            manifest.validate(),
+            Err(CellManifestError::MissingRuntimeBundle { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn iteration_lane_requires_evidencing_profile() -> TestResult {
+        let mut mismatched = valid_input("foundation.contracts.primitives", "foundation-owner")?;
+        mismatched.iteration_lane = IterationLane::Interactive;
+        assert!(matches!(
+            generate_effective_manifest(mismatched),
+            Err(CellManifestError::IncompatibleLaneProfile { .. })
+        ));
+
+        let mut abnormal = valid_input("foundation.contracts.primitives", "foundation-owner")?;
+        abnormal.proof_latency_profile =
+            ProofLatencyProfileRef::new("eliot-contracts/profile/abnormal")?;
+        assert!(matches!(
+            generate_effective_manifest(abnormal),
+            Err(CellManifestError::IncompatibleLaneProfile { .. })
+        ));
+
+        for (lane, profile) in [
+            (
+                IterationLane::Interactive,
+                "eliot-contracts/profile/interactive",
+            ),
+            (IterationLane::Normal, "eliot-contracts/profile/normal"),
+            (IterationLane::Slow, "foundation/proof/slow-durable-job"),
+            (
+                IterationLane::ManualRelease,
+                "foundation/proof/manual-release-gate",
+            ),
+        ] {
+            let mut input = valid_input("foundation.contracts.primitives", "foundation-owner")?;
+            input.iteration_lane = lane;
+            input.proof_latency_profile = ProofLatencyProfileRef::new(profile)?;
+            generate_effective_manifest(input).map_err(|error| error.to_string())?;
+        }
+
+        let mut manifest = generate_effective_manifest(valid_input(
+            "foundation.contracts.primitives",
+            "foundation-contract-owner",
+        )?)?;
+        manifest.iteration_lane = IterationLane::Slow;
+        manifest.manifest_digest = manifest
+            .recomputed_digest()
+            .map_err(|error| error.to_string())?;
+        assert!(matches!(
+            manifest.validate(),
+            Err(CellManifestError::IncompatibleLaneProfile { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn state_replacement_pairings_are_constrained() -> TestResult {
+        for (state, replacement) in [
+            (
+                ModuleStateClass::Stateless,
+                ModuleReplacementClass::OfflineRelease,
+            ),
+            (
+                ModuleStateClass::CheckpointedOperational,
+                ModuleReplacementClass::ComponentGeneration,
+            ),
+            (
+                ModuleStateClass::ExternalCanonicalAdapter,
+                ModuleReplacementClass::DaemonGeneration,
+            ),
+        ] {
+            let mut input = valid_input("foundation.contracts.primitives", "foundation-owner")?;
+            input.state_class = state;
+            input.replacement_class = replacement;
+            assert!(
+                matches!(
+                    generate_effective_manifest(input),
+                    Err(CellManifestError::IncompatibleStateReplacement { .. })
+                ),
+                "state {state:?} with replacement {replacement:?} must be rejected"
+            );
+        }
+
+        for (state, replacement) in [
+            (
+                ModuleStateClass::Stateless,
+                ModuleReplacementClass::ComponentGeneration,
+            ),
+            (
+                ModuleStateClass::Stateless,
+                ModuleReplacementClass::HostGeneration,
+            ),
+            (
+                ModuleStateClass::HostStateExternalized,
+                ModuleReplacementClass::DaemonGeneration,
+            ),
+            (
+                ModuleStateClass::Rebuildable,
+                ModuleReplacementClass::ProcessGeneration,
+            ),
+            (
+                ModuleStateClass::CheckpointedOperational,
+                ModuleReplacementClass::ProcessGeneration,
+            ),
+            (
+                ModuleStateClass::ExternalCanonicalAdapter,
+                ModuleReplacementClass::ProcessGeneration,
+            ),
+            (
+                ModuleStateClass::ExternalCanonicalAdapter,
+                ModuleReplacementClass::OfflineRelease,
+            ),
+        ] {
+            let mut input = valid_input("foundation.contracts.primitives", "foundation-owner")?;
+            input.state_class = state;
+            input.replacement_class = replacement;
+            generate_effective_manifest(input).map_err(|error| error.to_string())?;
+        }
+
+        let mut manifest = generate_effective_manifest(valid_input(
+            "foundation.contracts.primitives",
+            "foundation-contract-owner",
+        )?)?;
+        manifest.replacement_class = ModuleReplacementClass::OfflineRelease;
+        manifest.manifest_digest = manifest
+            .recomputed_digest()
+            .map_err(|error| error.to_string())?;
+        assert!(matches!(
+            manifest.validate(),
+            Err(CellManifestError::IncompatibleStateReplacement { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn multi_cell_generation_is_crate_scoped() -> TestResult {
+        fn other_crate_input() -> Result<CellManifestInput, ContractError> {
+            let mut input = valid_input("foundation.other.cell", "foundation-other-owner")?;
+            input.source_crate = SourceCrateRef::new("eliot-other")?;
+            Ok(input)
+        }
+
+        let mixed = vec![
+            valid_input("foundation.contracts.primitives", "foundation-owner-a")?,
+            other_crate_input()?,
+        ];
+        let Err(CellManifestError::MixedSourceCrates { crates }) =
+            generate_effective_manifests_for_crate(mixed)
+        else {
+            panic!("mixed source crates must be rejected");
+        };
+        assert_eq!(
+            crates,
+            vec!["eliot-contracts".to_owned(), "eliot-other".to_owned()]
+        );
+
+        let mixed_single = vec![
+            valid_input("foundation.contracts.primitives", "foundation-owner-a")?,
+            other_crate_input()?,
+        ];
+        assert!(matches!(
+            generate_single_crate_manifest(mixed_single),
+            Err(CellManifestError::MixedSourceCrates { .. })
+        ));
+
+        let same_crate = vec![
+            valid_input("foundation.contracts.primitives", "foundation-owner-a")?,
+            valid_input("foundation.authority.epoch-identity", "foundation-owner-b")?,
+        ];
+        let Err(CellManifestError::SingleManifestForMultiCell {
+            source_crate,
+            cells,
+        }) = generate_single_crate_manifest(same_crate)
+        else {
+            panic!("single manifest for a multi-cell crate must be rejected");
+        };
+        assert_eq!(source_crate, "eliot-contracts");
+        assert_eq!(cells, 2);
         Ok(())
     }
 }
