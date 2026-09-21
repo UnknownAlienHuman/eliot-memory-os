@@ -16,6 +16,7 @@ use eliot_governor::{
     CompositionError, CompositionReadiness, GovernorActivationOutcome, GovernorComposition,
     GovernorLaunchConfig, KernelGenerationPort, KernelGenerationSnapshotProvider, QueueLimits,
 };
+use eliot_kernel_core::Notification;
 use eliot_platform_windows::{ProtectedPathError, ProtectedRuntimePathLease};
 use eliot_protocol::{
     AgentActivationResolutionDecision, AgentActivationResolutionResult,
@@ -54,6 +55,7 @@ mod kernel_authority_client;
 mod kernel_context_read_client;
 mod kernel_recovery_client;
 mod kernel_transition_client;
+pub mod notification_board_attach;
 mod observation_adapters;
 mod process_origin;
 mod route_receipts;
@@ -296,6 +298,16 @@ pub struct DaemonComposition {
     /// binding from them. `None` until the runtime notes a live session, so
     /// boards keep the empty (unadmitted) behaviour without one.
     owner_session: Option<OwnerSessionFacts>,
+    /// Canonical notification records hydrated from the closed
+    /// `GetNotificationState` read (issue #1780).
+    ///
+    /// Mirrors `capability_admission`: constructed empty at
+    /// [`DaemonComposition::start`], hydrated by the daemon runtime attach
+    /// where the concrete client and this composition meet (see
+    /// `notification_board_attach`), and consumed by
+    /// [`DaemonComposition::controlboard`]. An empty supply reads as an
+    /// empty inbox, never as resolved or suppressed state.
+    notification_snapshot: Vec<Notification>,
     /// Shared Governor Skill catalogue handle for catalogue-guarded skill
     /// promotion. Empty until catalogue installation wiring lands; absent
     /// entries forward open-world.
@@ -363,6 +375,7 @@ impl DaemonComposition {
             view_stale: false,
             operator_replay: SharedOperatorReplay::new(),
             owner_session: None,
+            notification_snapshot: Vec::new(),
             skill_catalogue: Arc::new(
                 std::sync::Mutex::new(eliot_skill::SkillCatalogue::default()),
             ),
@@ -657,6 +670,17 @@ impl DaemonComposition {
         self.owner_session = Some(facts);
     }
 
+    /// Notes verified canonical notification records into this composition.
+    ///
+    /// Called once by the daemon runtime attach holding both the concrete
+    /// [`DaemonKernelClient`] and this composition, mirroring
+    /// [`Self::note_owner_session_binding`]. Stores records only, never the
+    /// client; no new thread, no new handshake. Until noted, boards built by
+    /// [`Self::controlboard`] keep the empty inbox behaviour.
+    pub fn note_notification_snapshot(&mut self, records: Vec<Notification>) {
+        self.notification_snapshot = records;
+    }
+
     /// Builds one provider-neutral `ControlBoard` over the current Governor
     /// projection snapshot.
     ///
@@ -692,10 +716,9 @@ impl DaemonComposition {
             snapshot,
             &self.operator_replay,
             admitted,
-            // #1780: the daemon does not yet read canonical notification
-            // state into its snapshot composition; the inbox section stays
-            // empty rather than fabricated until that read is wired.
-            Vec::new(),
+            // #1780: pre-fetched canonical records noted by the runtime
+            // attach; empty until that attach lands, never fabricated.
+            self.notification_snapshot.clone(),
         ))
     }
 
