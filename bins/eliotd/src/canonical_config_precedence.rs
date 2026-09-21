@@ -104,8 +104,12 @@ impl ConfigLayer {
 ///
 /// `limit` is the layer's proposed value (`None` = layer abstains and the
 /// running value carries forward). `delegation_ceiling` is an explicit
-/// higher-layer delegation: lower layers may expand up to and including this
-/// ceiling. It never raises the granting layer's own value.
+/// higher-layer delegation naming the exact expansion lower layers may take.
+/// A grant never exceeds the granting layer's own inherited authority: the
+/// effective ceiling is `min(delegation_ceiling, inherited)`, so a layer
+/// cannot mint authority through its own ceiling (including
+/// delegation-only layers with `limit: None`). It never raises the granting
+/// layer's own value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LayerInput {
     pub layer: ConfigLayer,
@@ -198,13 +202,17 @@ pub enum PrecedenceError {
 ///
 /// The compiled-defaults layer must seed the chain. Each lower layer carrying
 /// `Some(limit)` narrows (`limit <= running`), repeats (`limit == running`),
-/// or expands (`limit > running`) only when some strictly higher layer's
-/// `delegation_ceiling` covers the exact requested value. Abstaining layers
-/// (`None`) contribute nothing and are omitted from the returned chain.
+/// or expands (`limit > running`) only when some strictly higher layer
+/// granted that exact expansion: a higher grant covers a request only when
+/// the grant, clamped to the granting layer's own inherited authority,
+/// equals the requested value exactly. Abstaining layers (`None`) contribute
+/// no value but may still grant within their inherited authority; neither
+/// abstention nor a ceiling mints authority beyond what the layer inherited.
 ///
 /// # Errors
 /// Returns [`PrecedenceError`] when the key is unsupported, defaults are
-/// missing, or an expansion lacks a covering higher-layer delegation.
+/// missing, layers repeat, or an expansion lacks an exactly covering
+/// higher-layer delegation.
 pub fn resolve_canonical_chain(
     key: &str,
     inputs: &[LayerInput],
@@ -233,10 +241,27 @@ pub fn resolve_canonical_chain(
         narrowed: false,
         delegated_expansion: false,
     }];
+    // Effective grants recorded per processed layer: (order, ceiling clamped
+    // to the granting layer's own inherited authority). A grant is usable
+    // only by strictly lower layers and only for its exact value, so neither
+    // self-minted ceilings nor stale broad ceilings can launder an expansion
+    // past the actual boundary it would cross.
+    let mut grants: Vec<(u8, u64)> = Vec::new();
+    if let Some(seed_input) = inputs
+        .iter()
+        .find(|input| input.layer == ConfigLayer::CompiledDefaults)
+        && let Some(ceiling) = seed_input.delegation_ceiling
+    {
+        grants.push((ConfigLayer::CompiledDefaults.order(), ceiling.min(seed)));
+    }
     for layer in ALL_LAYERS.iter().skip(1) {
+        let inherited = running;
         let Some(input) = inputs.iter().find(|input| input.layer == *layer) else {
             continue;
         };
+        if let Some(ceiling) = input.delegation_ceiling {
+            grants.push((layer.order(), ceiling.min(inherited)));
+        }
         let Some(requested) = input.limit else {
             continue;
         };
@@ -250,12 +275,10 @@ pub fn resolve_canonical_chain(
             });
             running = requested;
         } else {
-            let delegated = inputs
+            let covered = grants
                 .iter()
-                .filter(|higher| higher.layer.order() < layer.order())
-                .filter_map(|higher| higher.delegation_ceiling)
-                .any(|ceiling| ceiling >= requested);
-            if delegated {
+                .any(|(order, ceiling)| *order < layer.order() && *ceiling == requested);
+            if covered {
                 contributions.push(ResolvedContribution {
                     order: layer.order(),
                     layer: layer.name(),
@@ -637,6 +660,125 @@ mod tests {
             .expect_err("duplicate layer must fail closed");
         assert!(
             error.to_string().contains("duplicate configuration layer"),
+            "unexpected: {error}"
+        );
+    }
+
+    #[test]
+    fn self_granted_delegation_cannot_launder_expansion() {
+        // Task mints ceiling 1000 beyond its inherited 100 and the session
+        // spends it. The grant clamps to inherited authority, so the session
+        // expansion must fail closed.
+        let inputs = vec![
+            LayerInput {
+                layer: ConfigLayer::CompiledDefaults,
+                limit: Some(100),
+                delegation_ceiling: None,
+            },
+            LayerInput {
+                layer: ConfigLayer::TaskPolicy,
+                limit: Some(50),
+                delegation_ceiling: Some(1000),
+            },
+            LayerInput {
+                layer: ConfigLayer::SessionCapabilityToken,
+                limit: Some(1000),
+                delegation_ceiling: None,
+            },
+        ];
+        let error = resolve_canonical_chain(CANONICAL_SETTING_KEY, &inputs)
+            .expect_err("self-minted delegation must not authorize expansion");
+        assert!(
+            error
+                .to_string()
+                .contains("without an explicit higher-layer delegation"),
+            "unexpected: {error}"
+        );
+    }
+
+    #[test]
+    fn older_delegation_cannot_bypass_intervening_tighter_boundary() {
+        // Abstaining installation grants 1000, clamped to its inherited 100.
+        // System Owner then tightens to 50, so the task request for 1000 has
+        // no exact effective cover and must fail.
+        let inputs = vec![
+            LayerInput {
+                layer: ConfigLayer::CompiledDefaults,
+                limit: Some(100),
+                delegation_ceiling: None,
+            },
+            LayerInput {
+                layer: ConfigLayer::InstallationConfig,
+                limit: None,
+                delegation_ceiling: Some(1000),
+            },
+            LayerInput {
+                layer: ConfigLayer::SystemOwnerPolicy,
+                limit: Some(50),
+                delegation_ceiling: None,
+            },
+            LayerInput {
+                layer: ConfigLayer::TaskPolicy,
+                limit: Some(1000),
+                delegation_ceiling: None,
+            },
+        ];
+        let error = resolve_canonical_chain(CANONICAL_SETTING_KEY, &inputs)
+            .expect_err("stale broad delegation must not bypass the tighter boundary");
+        assert!(
+            error
+                .to_string()
+                .contains("without an explicit higher-layer delegation"),
+            "unexpected: {error}"
+        );
+    }
+
+    #[test]
+    fn exact_effective_delegation_from_higher_layer_resolves() {
+        // Abstaining installation grants exactly 95 within its inherited 100.
+        // System Owner narrows to 80; the task expansion to exactly 95 is
+        // explicitly covered and resolves as delegated.
+        let inputs = vec![
+            LayerInput {
+                layer: ConfigLayer::CompiledDefaults,
+                limit: Some(100),
+                delegation_ceiling: None,
+            },
+            LayerInput {
+                layer: ConfigLayer::InstallationConfig,
+                limit: None,
+                delegation_ceiling: Some(95),
+            },
+            LayerInput {
+                layer: ConfigLayer::SystemOwnerPolicy,
+                limit: Some(80),
+                delegation_ceiling: None,
+            },
+            LayerInput {
+                layer: ConfigLayer::TaskPolicy,
+                limit: Some(95),
+                delegation_ceiling: None,
+            },
+        ];
+        let chain = resolve_canonical_chain(CANONICAL_SETTING_KEY, &inputs)
+            .expect("exact effective delegation must resolve");
+        assert_eq!(chain.winning_value(), 95);
+        assert!(
+            chain
+                .contributions()
+                .last()
+                .is_some_and(|item| item.delegated_expansion),
+            "expansion must be marked delegated"
+        );
+    }
+
+    #[test]
+    fn repeated_json_fields_reject_as_ambiguous() {
+        let repeated =
+            br#"{"layer":"task_policy","key":"task.budget.per_job","limit":40,"limit":90}"#;
+        let error = parse_canonical_layer_json(repeated).expect_err("repeated field must fail");
+        assert!(
+            error.to_string().contains("duplicate"),
             "unexpected: {error}"
         );
     }
