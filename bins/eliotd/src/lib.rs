@@ -932,6 +932,26 @@ impl DaemonComposition {
             )
     }
 
+    /// Reconciles installed entries against the live canonical tool view,
+    /// marking changed bases stale (issue #1882).
+    ///
+    /// Production startup/refresh driver: builds the canonical tool source
+    /// through the Governor hook with the default-empty Skill-owned alias
+    /// table (frozen H-A call site) and marks every installed entry whose
+    /// declared tool references no longer resolve. Returns the count of
+    /// newly staled entries. Entries installed under provider renames need
+    /// their alias table at install time; this pass assumes the composed-act
+    /// invariant (canonical references, see `inject_hotset`). Definition-
+    /// version drift is NOT rechecked here: entries carry no admitted-version
+    /// record, so standing version comparison needs the entry-schema seam
+    /// (reported); version drift is caught at install and display time.
+    pub fn skill_reconcile_tool_basis(&self) -> Result<usize, eliot_skill::SkillError> {
+        let (source, _) = eliot_governor::canonical_skill_tool_source()?;
+        let aliases = eliot_skill::ToolAliasTable::new();
+        let tools = eliot_skill::VersionBoundTools::new(source.as_ref(), &aliases);
+        self.shared_skill_adapter().reconcile_tool_basis(&tools)
+    }
+
     /// Borrows the single Governor task lifecycle owner as a forwarding
     /// adapter over the closed [`TaskCommand`](eliot_governor::TaskCommand) path.
     ///

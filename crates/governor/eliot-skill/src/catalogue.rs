@@ -494,6 +494,14 @@ impl SkillCatalogue {
         self.entries.get(skill_id)
     }
 
+    /// Returns every installed Skill identity in stable order. The
+    /// reconciliation driver uses it to visit standing entries without
+    /// holding entry borrows across the marks that may follow.
+    #[must_use]
+    pub fn skill_ids(&self) -> Vec<String> {
+        self.entries.keys().cloned().collect()
+    }
+
     #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
