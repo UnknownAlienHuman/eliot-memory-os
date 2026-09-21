@@ -7,7 +7,8 @@ use eliot_ipc::NamedPipeServer;
 use eliot_ipc::TransportLimits;
 use eliot_protocol::MessageType;
 use eliot_store_surreal::{
-    SERVICE_NAME, StoreComposition, StoreHandshakeIdentity, admit_handshake, dispatch, load_config,
+    SERVICE_NAME, StoreComposition, StoreHandshakeIdentity, admit_handshake, dispatch,
+    load_compatibility_for_config, load_config, require_compatibility_for_writer,
     require_semantic_ready_for_pipe, store_bootstrap_descriptor, validate_request_frame,
 };
 
@@ -91,6 +92,32 @@ fn frame_rejection_defect(
     }
 }
 
+/// I5.9 compatibility gate (issue #1932).
+///
+/// Reports the exact active `SurrealDB` version and compatibility decision from
+/// the installation-visible `compatibility.toml` sibling of the Store config,
+/// then admits the canonical writer only on a recorded qualified decision. An
+/// unrecorded or unqualified server binary keeps the installation in visible
+/// maintenance instead of silently accepting writes.
+#[cfg(windows)]
+#[allow(clippy::print_stderr)]
+fn enforce_store_compatibility(
+    config: &eliot_store_surreal::StoreLaunchConfig,
+) -> Result<(), String> {
+    let config_path = std::path::Path::new(config.runtime_launch.store_config_path.as_str());
+    let file = load_compatibility_for_config(config_path)?;
+    let report = require_compatibility_for_writer(
+        &file.surrealdb,
+        config
+            .runtime_launch
+            .canonical_store_artifact_digest
+            .as_str(),
+        &config.schema_generation,
+    )?;
+    eprintln!("{SERVICE_NAME}: {report}");
+    Ok(())
+}
+
 #[cfg(windows)]
 #[allow(clippy::print_stdout)]
 async fn run() -> Result<(), String> {
@@ -111,8 +138,16 @@ async fn run() -> Result<(), String> {
     let Some(config) = prepare_launch(mode).await? else {
         return Ok(());
     };
+    enforce_store_compatibility(&config)?;
     let composition = StoreComposition::new(&config)?;
     composition.connect().await?;
+    // Post-connect re-verification (issue #1932): the adapter has now proved
+    // spawned-artifact identity, listener ownership and server major over its
+    // ownership-verified channel. Reload the decision record and require the
+    // same admission before serving: a record swapped, revoked or drifted
+    // across the provider-startup window must fail closed here, never at the
+    // first canonical write.
+    enforce_store_compatibility(&config)?;
     let readiness = composition
         .readiness()
         .await

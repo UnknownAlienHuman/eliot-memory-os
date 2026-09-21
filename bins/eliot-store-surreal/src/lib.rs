@@ -65,6 +65,12 @@ pub use launch_config::{
     StoreLaunchConfig, launch_config_digest, load_config, load_portable_dev_config,
 };
 pub(crate) use launch_config::{validate_digest, validate_launch_text};
+mod compatibility;
+pub use compatibility::{
+    ADMITTED_TRANSPORT, COMPATIBILITY_FILE_NAME, CompatibilityFile, CompatibilityVerdict,
+    SurrealCompatibility, compatibility_path_for_config, evaluate_compatibility,
+    load_compatibility_for_config, parse_compatibility_bytes, require_compatibility_for_writer,
+};
 mod schema_bootstrap_contract;
 use schema_bootstrap_contract::{
     StoreSchemaBootstrapBinding, StoreSchemaBootstrapCache, map_schema_bootstrap_error,
