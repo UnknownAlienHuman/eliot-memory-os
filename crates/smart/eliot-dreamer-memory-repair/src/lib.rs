@@ -35,6 +35,7 @@ use eliot_dreamer_contracts::{
     GroundedDreamDraft, NativeCurationHandler, PreservationReport, ProducedCurationContent,
     TargetDenominator, ValidatedCurationItem, ValidationReceipt, is_hex64_lower,
 };
+use eliot_security_contracts::{InfluenceDependencyClosure, InfluenceState};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -631,12 +632,21 @@ pub struct ProvenanceRepairSpec {
     pub verifier: String,
 }
 
-/// Complete public closure over every affected branch for contamination.
+/// Adapter metadata bound to the public B-SEC1 influence closure.
+///
+/// [`bsec1_closure`](Self::bsec1_closure) is the canonical owner evidence. The
+/// surrounding fields bind that evidence to this candidate's policy, scope,
+/// projected subject revision, completeness denominator, and owner-directed
+/// renewal path. Local notes are explanatory only and are never used as proof
+/// of graph membership or policy binding.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ContaminationClosure {
-    /// Closure identity.
+    /// Adapter copy of the canonical closure identity; it must equal the
+    /// owner-issued B-SEC1 closure identity.
     pub closure_id: String,
+    /// Typed public B-SEC1 closure/revocation evidence from its owner.
+    pub bsec1_closure: InfluenceDependencyClosure,
     /// Every affected dependent in sorted unique order.
     pub dependent_refs: Vec<String>,
     /// Expected dependent total; member count must equal it when complete.
@@ -2225,12 +2235,57 @@ fn evaluate_contamination(
     validate_sorted_refs(&spec.revocation_refs, "contamination.revocation")?;
     let closure = &spec.closure;
     check_handle(&closure.closure_id, "closure.id")?;
+    closure
+        .bsec1_closure
+        .validate()
+        .map_err(|error| RepairError::Member {
+            handle: redact(&closure.closure_id),
+            detail: format!(
+                "public B-SEC1 closure is invalid: {}",
+                redact(&error.to_string())
+            ),
+        })?;
     validate_sorted_refs(&closure.dependent_refs, "closure.dependents")?;
     validate_sorted_refs(&closure.unknown_gaps, "closure.gaps")?;
     check_text(&closure.review_owner, "closure.review-owner")?;
     check_text(&closure.renewal_owner, "closure.renewal-owner")?;
     check_text(&closure.verifier, "closure.verifier")?;
     check_text(&closure.closure_revision, "closure.revision")?;
+    if closure.closure_id != closure.bsec1_closure.closure_id {
+        return Ok(KindVerdict::Outcome {
+            outcome: RepairOutcome::Stale,
+            note: "local closure identity does not bind the public B-SEC1 closure".to_owned(),
+        });
+    }
+    if closure.bsec1_closure.root_ref != spec.source_handle {
+        return Ok(KindVerdict::Outcome {
+            outcome: RepairOutcome::Blocked,
+            note: "public B-SEC1 closure root does not bind the named taint source".to_owned(),
+        });
+    }
+    if closure.bsec1_closure.dependent_refs != closure.dependent_refs {
+        return Ok(KindVerdict::Outcome {
+            outcome: RepairOutcome::Partial,
+            note: "public B-SEC1 closure dependents do not match the adapter denominator"
+                .to_owned(),
+        });
+    }
+    if closure.bsec1_closure.state_fence != closure.state_fence {
+        return Ok(KindVerdict::Outcome {
+            outcome: RepairOutcome::Stale,
+            note: "public B-SEC1 closure fence does not bind the adapter closure".to_owned(),
+        });
+    }
+    if matches!(
+        closure.bsec1_closure.current_influence,
+        InfluenceState::Active | InfluenceState::Unknown
+    ) {
+        return Ok(KindVerdict::Outcome {
+            outcome: RepairOutcome::Blocked,
+            note: "active or unknown B-SEC1 influence cannot prove contained contamination"
+                .to_owned(),
+        });
+    }
     if spec.subject_handle != request.projection.subject_handle {
         return Ok(KindVerdict::Outcome {
             outcome: RepairOutcome::Rejected,
@@ -2259,14 +2314,6 @@ fn evaluate_contamination(
         return Ok(KindVerdict::Outcome {
             outcome: RepairOutcome::Stale,
             note: "taint or revocation lineage moved from the current threat projection".to_owned(),
-        });
-    }
-    if !spec.current_graph_note.contains(&closure.policy_id)
-        || !spec.derived_influence_note.contains(&spec.source_handle)
-    {
-        return Ok(KindVerdict::Outcome {
-            outcome: RepairOutcome::Blocked,
-            note: "influence and graph notes do not bind the named source and policy".to_owned(),
         });
     }
     if spec.agreement_offered_as_cleansing {
@@ -3174,14 +3221,18 @@ mod tests {
     };
     use std::num::NonZeroU64;
 
-    fn test_fence() -> StateFence {
+    fn test_fence_with_sequence(sequence: u64) -> StateFence {
         let epoch = EpochId::new(
             EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
                 .expect("canonical test lineage-A"),
-            NonZeroU64::new(1).expect("non-zero test sequence"),
+            NonZeroU64::new(sequence).expect("non-zero test sequence"),
         )
         .expect("valid test epoch");
         StateFence::new(epoch, ResourceGeneration::genesis())
+    }
+
+    fn test_fence() -> StateFence {
+        test_fence_with_sequence(1)
     }
 
     fn test_receipt() -> ValidationReceipt {
@@ -3482,6 +3533,15 @@ mod tests {
             action: ContaminationAction::QuarantineDependents,
             closure: ContaminationClosure {
                 closure_id: "closure-1".to_owned(),
+                bsec1_closure: InfluenceDependencyClosure {
+                    closure_id: "closure-1".to_owned(),
+                    root_ref: "src-taint".to_owned(),
+                    dependent_refs: vec!["dep-1".to_owned()],
+                    invalidation_reason: Some(eliot_security_contracts::RevocationReason::Poisoned),
+                    current_influence: InfluenceState::Revoked,
+                    state_fence: test_fence(),
+                    revision: 1,
+                },
                 dependent_refs: vec!["dep-1".to_owned()],
                 expected_dependents_total: 1,
                 complete: true,
@@ -4138,9 +4198,20 @@ mod tests {
             .contamination
             .as_mut()
             .expect("spec")
-            .derived_influence_note = "ranking cue has no bound source".to_owned();
+            .closure
+            .bsec1_closure
+            .root_ref = "different-source".to_owned();
         reseal(&mut source);
         assert_eq!(outcome(&source), RepairOutcome::Blocked);
+
+        let mut note_only = valid_contamination_request();
+        note_only
+            .contamination
+            .as_mut()
+            .expect("spec")
+            .derived_influence_note = "ranking cue has no textual source marker".to_owned();
+        reseal(&mut note_only);
+        assert_eq!(outcome(&note_only), RepairOutcome::Complete);
     }
 
     // WORK_UNIT_CASE: 671/18
@@ -4163,6 +4234,53 @@ mod tests {
         closure.unknown_gaps = vec!["branch-unknown".to_owned()];
         reseal(&mut unknown);
         assert_eq!(outcome(&unknown), RepairOutcome::Blocked);
+
+        let mut active = valid_contamination_request();
+        active
+            .contamination
+            .as_mut()
+            .expect("spec")
+            .closure
+            .bsec1_closure
+            .current_influence = InfluenceState::Active;
+        active
+            .contamination
+            .as_mut()
+            .expect("spec")
+            .closure
+            .bsec1_closure
+            .invalidation_reason = None;
+        reseal(&mut active);
+        assert_eq!(outcome(&active), RepairOutcome::Blocked);
+
+        let mut unknown_standing = valid_contamination_request();
+        unknown_standing
+            .contamination
+            .as_mut()
+            .expect("spec")
+            .closure
+            .bsec1_closure
+            .current_influence = InfluenceState::Unknown;
+        unknown_standing
+            .contamination
+            .as_mut()
+            .expect("spec")
+            .closure
+            .bsec1_closure
+            .invalidation_reason = None;
+        reseal(&mut unknown_standing);
+        assert_eq!(outcome(&unknown_standing), RepairOutcome::Blocked);
+
+        let mut stale_fence = valid_contamination_request();
+        stale_fence
+            .contamination
+            .as_mut()
+            .expect("spec")
+            .closure
+            .bsec1_closure
+            .state_fence = test_fence_with_sequence(2);
+        reseal(&mut stale_fence);
+        assert_eq!(outcome(&stale_fence), RepairOutcome::Stale);
     }
 
     // WORK_UNIT_CASE: 671/19
