@@ -8,6 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::num::NonZeroU64;
+use std::sync::Mutex;
 
 use eliot_contracts::{
     ClockReading, EpochId, EpochLineageId, ProductId, RequestId, ResourceGeneration, SourceId,
@@ -189,6 +190,10 @@ fn check_absent_clone(source: &str, id: &str) -> TestResult {
             && !source.contains("fn try_clone"),
         "case {id}: removal disposition keeps no explicitly-named fork"
     );
+    assert!(
+        !source.contains("into_inner"),
+        "case {id}: no poisoned-lock recovery via into_inner may remain"
+    );
     Ok(())
 }
 
@@ -287,6 +292,27 @@ fn check_isolation_left_to_right(case: &Case) -> TestResult {
         "case {}: untouched construction must not move",
         case.id
     );
+    // Issue 883 case 6, historical half: the inspected historical Clone was
+    // a deep copy (independent state, not shared handles). This non-production
+    // replica binds that semantic so the record shows what was removed; the
+    // current-result half above preserves independence via construction plus
+    // snapshot, with no Clone impl remaining (guarded by 883/1).
+    let historical = HistoricalDeepCopyStore::seeded();
+    let fork = historical.historical_clone();
+    fork.put("k", "forked")?;
+    assert_eq!(
+        historical.get("k")?,
+        Some("seed".to_owned()),
+        "case {}: historical deep copy must be independent, not shared",
+        case.id
+    );
+    historical.put("j", "origin")?;
+    assert_eq!(
+        fork.get("j")?,
+        None,
+        "case {}: historical independence must hold both ways",
+        case.id
+    );
     Ok(())
 }
 
@@ -379,6 +405,37 @@ fn check_projection_completeness(case: &Case) -> TestResult {
         "case {}: one named operation",
         case.id
     );
+    // Issue 883 case 7: the cloned/forked state-field denominator is explicit
+    // and source-bound. Removal eliminates the copy, so no copy-cost claim is
+    // made or measured here; the denominator below names every field the
+    // removed deep copy used to duplicate, plus the snapshot projection that
+    // remains the value-projection path.
+    let source = lib_source()?;
+    let state_block = struct_block(&source, "MemoryState")?;
+    for field in MEMORY_STATE_FIELDS {
+        assert!(
+            state_block.contains(field),
+            "case {}: MemoryState denominator must name '{field}'",
+            case.id
+        );
+    }
+    let snapshot_block = struct_block(&source, "MemorySnapshot")?;
+    for field in [
+        "state_fence",
+        "revision_heads",
+        "ordering_heads",
+        "receipts",
+        "projections",
+        "outbox",
+        "relations",
+        "named_operations",
+    ] {
+        assert!(
+            snapshot_block.contains(field),
+            "case {}: MemorySnapshot denominator must name '{field}'",
+            case.id
+        );
+    }
     Ok(())
 }
 
@@ -401,6 +458,36 @@ fn check_typed_failure(id: &str) -> TestResult {
     assert!(
         rendered.contains("Unavailable"),
         "case {id}: poison failure must stay a typed Unavailable"
+    );
+    // Current-side poison contract is source-bound here (the private mutex
+    // cannot be poisoned from an integration test): every lock acquisition
+    // maps poisoning to `StoreError::Unavailable`, and no `into_inner`
+    // recovery exists. Poisoned-lock execution proof lives in the
+    // package-local inline test
+    // `poisoned_store_refuses_snapshot_and_reports_unavailable`, which runs
+    // in the same `cargo test -p eliot-store-memory` gate.
+    let source = lib_source()?;
+    assert!(
+        source.contains("map_err(|_| StoreError::Unavailable)"),
+        "case {id}: poisoned locks must map to typed Unavailable"
+    );
+    assert!(
+        !source.contains("into_inner"),
+        "case {id}: poisoned state must not be recoverable into a new store"
+    );
+    // Issue 883 case 8, historical half: the removed poisoned branch
+    // recovered via `into_inner().clone()` into a valid store — a silent
+    // successful copy of poisoned state. This replica demonstrates that
+    // historical behavior in isolation; the source guards above prove the
+    // selected removal boundary does not reproduce it.
+    let historical = HistoricalDeepCopyStore::seeded();
+    let before = historical.historical_clone().snapshot_content()?;
+    historical.poison();
+    let copied = historical.historical_clone();
+    assert_eq!(
+        copied.snapshot_content()?,
+        before,
+        "case {id}: historical poisoned branch copied state silently"
     );
     Ok(())
 }
@@ -459,9 +546,179 @@ fn check_doc_contract(source: &str, id: &str) {
     );
 }
 
+/// Minimal non-production replica of the inspected historical `MemoryStore`
+/// Clone (issue 883, inspected base `aed215f...`): lock plus deep copy of the
+/// state into a new mutex, with the poisoned branch recovering through
+/// `into_inner().clone()` into a valid store. Test-only regression fixture;
+/// never a production API and never a substitute fork.
+#[derive(Debug, Default)]
+struct HistoricalDeepCopyStore {
+    state: Mutex<BTreeMap<String, String>>,
+}
+
+impl HistoricalDeepCopyStore {
+    fn seeded() -> Self {
+        Self {
+            state: Mutex::new(BTreeMap::from([(String::from("k"), String::from("seed"))])),
+        }
+    }
+
+    fn historical_clone(&self) -> Self {
+        match self.state.lock() {
+            Ok(guard) => Self {
+                state: Mutex::new(guard.clone()),
+            },
+            Err(poisoned) => Self {
+                state: Mutex::new(poisoned.into_inner().clone()),
+            },
+        }
+    }
+
+    fn lock(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, BTreeMap<String, String>>, Box<dyn std::error::Error>>
+    {
+        match self.state.lock() {
+            Ok(guard) => Ok(guard),
+            Err(error) => Err(format!("historical fixture lock poisoned: {error}").into()),
+        }
+    }
+
+    fn put(&self, key: &str, value: &str) -> TestResult {
+        self.lock()?.insert(key.to_owned(), value.to_owned());
+        Ok(())
+    }
+
+    fn get(&self, key: &str) -> Result<Option<String>, Box<dyn std::error::Error>> {
+        Ok(self.lock()?.get(key).cloned())
+    }
+
+    fn snapshot_content(&self) -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
+        Ok(self.lock()?.clone())
+    }
+
+    fn poison(&self) {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let Ok(_guard) = self.state.lock() else {
+                panic!("historical fixture must start healthy");
+            };
+            panic!("intentional historical-fixture poisoning");
+        }));
+        assert!(outcome.is_err(), "poisoning must unwind");
+        assert!(
+            self.state.is_poisoned(),
+            "fixture mutex must be poisoned after the unwind"
+        );
+    }
+}
+
+/// Exact `MemoryState` field denominator at the inspected revision: every
+/// field the removed deep copy duplicated. Sourced from `src/lib.rs`; the
+/// guard using it fails on any silent field addition or removal.
+const MEMORY_STATE_FIELDS: [&str; 17] = [
+    "epistemic_positions",
+    "fences",
+    "recovery_records",
+    "recovery_jobs",
+    "revision_heads",
+    "ordering_heads",
+    "receipts_by_operation",
+    "receipts_by_idempotency",
+    "projections",
+    "outbox",
+    "relations",
+    "named_operations",
+    "manifests",
+    "erasure_intents",
+    "erased_subjects",
+    "next_commit_sequence",
+    "next_outbox_sequence",
+];
+
+/// Extracts the brace-balanced body of `struct <name>` from Rust source.
+fn struct_block(source: &str, name: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let anchor = format!("struct {name}");
+    let start = source
+        .find(anchor.as_str())
+        .ok_or_else(|| format!("lib.rs must define `struct {name}`"))?;
+    let after = &source[start..];
+    let open = after
+        .find('{')
+        .ok_or_else(|| format!("`struct {name}` must have a body"))?;
+    let mut depth = 0usize;
+    for (offset, ch) in after.char_indices().skip(open) {
+        if ch == '{' {
+            depth += 1;
+        } else if ch == '}' {
+            depth -= 1;
+            if depth == 0 {
+                return Ok(after[open..=offset].to_owned());
+            }
+        }
+    }
+    Err(format!("`struct {name}` body is unbalanced").into())
+}
+
+/// Issue 883 cases 1..5: executable workspace denominator. Every exact
+/// `MemoryStore` reference known at this revision is read and asserted
+/// construction- or comment-only: no `Clone`/`clone` adjacency, no
+/// `store.clone()` receiver, and no `MemoryStore: Clone` trait bound. The
+/// full tracked-workspace grep (`MemoryStore` across `crates/` and `bins/`)
+/// was run during review and recorded in the work report; this test binds
+/// the resulting file list so silent new consumers fail the gate instead of
+/// passing unnoticed. Generic `.clone()` calls on other types (fences,
+/// digests, receipts, parameters) are excluded by receiver resolution: only
+/// lines naming `MemoryStore` are inspected.
+fn check_workspace_denominator(id: &str) -> TestResult {
+    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    // (relative path, MemoryStore lines allowed to mention): the memory
+    // package's own `src/lib.rs` and this harness are covered by dedicated
+    // source guards (`check_absent_clone` plus the `compile_fail` doctest),
+    // so they are not re-scanned line-wise here.
+    let files = [
+        "src/epistemic_tests.rs",
+        "../eliot-backup/tests/restore_contract.rs",
+        "../eliot-store-surreal-adapter/src/apply/read_boundary.rs",
+    ];
+    for rel in files {
+        let text = std::fs::read_to_string(manifest_dir.join(rel))
+            .map_err(|error| format!("case {id}: cannot read denominator file {rel}: {error}"))?;
+        for line in text.lines() {
+            if line.contains("MemoryStore") && (line.contains("Clone") || line.contains("clone")) {
+                return Err(format!(
+                    "case {id}: unexpected Clone-adjacent MemoryStore use in {rel}: {line}"
+                )
+                .into());
+            }
+        }
+        if text.contains("MemoryStore") {
+            assert!(
+                !text.contains("store.clone()"),
+                "case {id}: no MemoryStore receiver may be cloned in {rel}"
+            );
+        }
+    }
+    // Clone-trait-bound scan. This harness file itself is excluded: the
+    // guard literals below name the pattern (self-reference), and a foreign
+    // `impl Clone for MemoryStore` here would be a compile error (E0117),
+    // so the compile gate already proves its absence.
+    for rel in ["src/lib.rs", "src/epistemic_tests.rs"] {
+        let text = std::fs::read_to_string(manifest_dir.join(rel))
+            .map_err(|error| format!("case {id}: cannot read bound file {rel}: {error}"))?;
+        assert!(
+            !text.contains("MemoryStore: Clone") && !text.contains("MemoryStore:Clone"),
+            "case {id}: no Clone trait bound on MemoryStore may exist in {rel}"
+        );
+    }
+    Ok(())
+}
+
 fn run_case(case: &Case, source: &str) -> TestResult {
     match case.kind.as_str() {
-        "absent_clone_source_guard" => check_absent_clone(source, &case.id),
+        "absent_clone_source_guard" => {
+            check_absent_clone(source, &case.id)?;
+            check_workspace_denominator(&case.id)
+        }
         "fresh_construction_empty" => check_fresh_empty(&case.id),
         "snapshot_determinism" => check_snapshot_determinism(&case.id),
         "snapshot_value_projection" => check_value_projection(&case.id),
@@ -499,4 +756,108 @@ fn memory_store_clone_contract_883() -> TestResult {
         run_case(case, &source).map_err(|error| format!("case {} failed: {error}", case.id))?;
     }
     Ok(())
+}
+
+/// Runs exactly one `883/<n>` fixture case (1-based `index` + 1) with the
+/// same order and source guards as the full-matrix sweep above, so each
+/// `// WORK_UNIT_CASE` test below executes its case substantively.
+fn run_single(index: usize) -> TestResult {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/data/memory_store_clone_cases.json");
+    let text = std::fs::read_to_string(path)?;
+    let file: CaseFile = serde_json::from_str(&text)?;
+    assert_eq!(file.cases.len(), 14, "issue 883 requires exactly 14 cases");
+    let case = file
+        .cases
+        .get(index)
+        .ok_or_else(|| format!("missing clone-contract case at index {index}"))?;
+    let expected = format!("883/{}", index + 1);
+    assert_eq!(case.id, expected, "cases must run in 883/1..14 order");
+    let source = lib_source()?;
+    run_case(case, &source).map_err(|error| format!("case {} failed: {error}", case.id))?;
+    Ok(())
+}
+
+// WORK_UNIT_CASE: 883/1
+#[test]
+fn clone_contract_01_absent_clone_and_denominator() -> TestResult {
+    run_single(0)
+}
+
+// WORK_UNIT_CASE: 883/2
+#[test]
+fn clone_contract_02_fresh_construction_empty() -> TestResult {
+    run_single(1)
+}
+
+// WORK_UNIT_CASE: 883/3
+#[test]
+fn clone_contract_03_snapshot_determinism() -> TestResult {
+    run_single(2)
+}
+
+// WORK_UNIT_CASE: 883/4
+#[test]
+fn clone_contract_04_snapshot_value_projection() -> TestResult {
+    run_single(3)
+}
+
+// WORK_UNIT_CASE: 883/5
+#[test]
+fn clone_contract_05_construction_equality() -> TestResult {
+    run_single(4)
+}
+
+// WORK_UNIT_CASE: 883/6
+#[test]
+fn clone_contract_06_isolation_and_historical_copy() -> TestResult {
+    run_single(5)
+}
+
+// WORK_UNIT_CASE: 883/7
+#[test]
+fn clone_contract_07_isolation_right_to_left() -> TestResult {
+    run_single(6)
+}
+
+// WORK_UNIT_CASE: 883/8
+#[test]
+fn clone_contract_08_divergence_detection() -> TestResult {
+    run_single(7)
+}
+
+// WORK_UNIT_CASE: 883/9
+#[test]
+fn clone_contract_09_projection_and_field_denominator() -> TestResult {
+    run_single(8)
+}
+
+// WORK_UNIT_CASE: 883/10
+#[test]
+fn clone_contract_10_default_ctor_equivalence() -> TestResult {
+    run_single(9)
+}
+
+// WORK_UNIT_CASE: 883/11
+#[test]
+fn clone_contract_11_poison_contract_and_history() -> TestResult {
+    run_single(10)
+}
+
+// WORK_UNIT_CASE: 883/12
+#[test]
+fn clone_contract_12_seeded_capture_subject() -> TestResult {
+    run_single(11)
+}
+
+// WORK_UNIT_CASE: 883/13
+#[test]
+fn clone_contract_13_no_shared_state() -> TestResult {
+    run_single(12)
+}
+
+// WORK_UNIT_CASE: 883/14
+#[test]
+fn clone_contract_14_doc_contract() -> TestResult {
+    run_single(13)
 }
