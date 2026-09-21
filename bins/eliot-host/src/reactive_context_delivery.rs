@@ -32,7 +32,7 @@ use eliot_protocol::{EncodingProfile, Frame, FrameKind, MessageType, ProtocolPay
 use eliot_runtime_contracts::KernelActivationState;
 use thiserror::Error;
 
-use super::{record_fence, HostComposition, HostError};
+use super::{HostComposition, HostError, record_fence};
 
 /// Error returned by the Host-owned reactive Context composition edge.
 #[derive(Debug, Error)]
@@ -46,6 +46,65 @@ pub enum HostReactiveContextDeliveryError {
     /// The local synchronous bridge runtime could not be created.
     #[error("reactive Context transport runtime: {0}")]
     Runtime(String),
+    /// The producer handoff did not contain a complete owner-produced request.
+    #[error("reactive Context producer: {0}")]
+    Producer(#[from] HostReactiveContextProducerError),
+}
+
+/// Validation failure at the typed producer-to-Host handoff.
+#[derive(Debug, Error)]
+pub enum HostReactiveContextProducerError {
+    /// The source did not provide the complete closed protocol payload.
+    #[error("owner-produced payload is invalid: {0}")]
+    InvalidPayload(String),
+    /// Host admission evidence must be carried by the authenticated source.
+    #[error("authenticated Host admission reference is blank")]
+    BlankAdmissionReference,
+    /// An optional owner receipt was supplied but is not a valid immutable
+    /// content reference.
+    #[error("owner admission receipt is invalid: {0}")]
+    InvalidOwnerReceipt(String),
+}
+
+/// Typed handoff from the owner that produced a complete reactive Context
+/// payload into Host.
+///
+/// A4/A1 must supply the fully assembled [`ReactiveContextDeliveryRequest`]
+/// and the owner-issued Host admission reference. An inert planning request,
+/// bridge delivery receipt, or locally invented payload cannot be converted
+/// into this type. This constructor validates the closed payload and any
+/// supplied owner receipt; [`HostComposition`] performs the live Host epoch,
+/// recipient, process, image, and retained Kernel-pipe authentication before
+/// admitting it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HostReactiveContextProducer {
+    request: eliot_host_service::ReactiveContextDeliveryRequest,
+    admission_ref: PlatformHandle,
+}
+
+impl HostReactiveContextProducer {
+    /// Accept one complete request from the authenticated upstream producer.
+    pub fn from_authenticated_source(
+        request: eliot_host_service::ReactiveContextDeliveryRequest,
+        admission_ref: PlatformHandle,
+    ) -> Result<Self, HostReactiveContextProducerError> {
+        request
+            .payload
+            .validate()
+            .map_err(|error| HostReactiveContextProducerError::InvalidPayload(error.to_string()))?;
+        if admission_ref.as_str().trim().is_empty() {
+            return Err(HostReactiveContextProducerError::BlankAdmissionReference);
+        }
+        if let Some(receipt) = &request.owner_receipt {
+            receipt.validate().map_err(|error| {
+                HostReactiveContextProducerError::InvalidOwnerReceipt(error.to_string())
+            })?;
+        }
+        Ok(Self {
+            request,
+            admission_ref,
+        })
+    }
 }
 
 /// Borrowed view over the existing production journal.
@@ -364,6 +423,44 @@ impl ReactiveContextTransportPort for AuthenticatedKernelReactiveTransport {
 }
 
 impl HostComposition {
+    /// Runs the real owner-produced Host call site: derive the recipient from
+    /// the complete typed source, admit it against the current authenticated
+    /// Host/Kernel contour, then deliver through the durable queue service.
+    ///
+    /// The endpoint is intentionally taken from the retained candidate rather
+    /// than from caller text. A4/A1 remain responsible for supplying the
+    /// complete payload and admission reference; this method does not build a
+    /// payload from an inert plan or claim an application receipt.
+    pub fn deliver_reactive_context_from_producer(
+        &self,
+        producer: HostReactiveContextProducer,
+    ) -> Result<ReactiveContextDeliveryReceipt, HostReactiveContextDeliveryError> {
+        let HostReactiveContextProducer {
+            request,
+            admission_ref,
+        } = producer;
+        let recipient = request.payload.recipient.clone();
+        let contour = self.current_reactive_context_contour(false)?;
+        let admission = self.admit_reactive_context(
+            recipient,
+            contour.candidate.pipe_identity.clone(),
+            admission_ref,
+        )?;
+        self.deliver_reactive_context(admission, request)
+    }
+
+    /// Convenience entrypoint for a producer that has not yet wrapped its
+    /// request in the typed Host handoff.
+    pub fn deliver_reactive_context_from_authenticated_source(
+        &self,
+        request: eliot_host_service::ReactiveContextDeliveryRequest,
+        admission_ref: PlatformHandle,
+    ) -> Result<ReactiveContextDeliveryReceipt, HostReactiveContextDeliveryError> {
+        let producer =
+            HostReactiveContextProducer::from_authenticated_source(request, admission_ref)?;
+        self.deliver_reactive_context_from_producer(producer)
+    }
+
     /// Builds an admission from the current Host fence and the caller-owned
     /// recipient/session evidence. The endpoint and admission reference are
     /// supplied by that caller and must match the retained authenticated
