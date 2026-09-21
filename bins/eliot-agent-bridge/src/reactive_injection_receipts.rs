@@ -657,6 +657,24 @@ impl ReactiveInjectionLedger {
         self.receipts.get(receipt_id)
     }
 
+    /// Bounded identities of pending (undelivered) injections for one
+    /// session in ledger order.
+    ///
+    /// The delivery owner drains this list at a real delivery boundary (a
+    /// host hook invocation or the next bridge response) and issues one
+    /// [`InjectionReceipt`] per item via [`Self::deliver`]. At most
+    /// [`MAX_PENDING_INJECTIONS`] identities are ever returned.
+    #[must_use]
+    pub fn pending_item_ids(&self, session_id: &str) -> Vec<String> {
+        self.items
+            .values()
+            .filter(|item| {
+                item.session_id == session_id && matches!(item.state, ItemState::Pending)
+            })
+            .map(|item| item.item_id.clone())
+            .collect()
+    }
+
     /// Number of pending (undelivered) injections.
     #[must_use]
     pub fn pending_count(&self) -> usize {
@@ -887,5 +905,53 @@ mod tests {
         let bytes = ledger.to_json_bytes().expect("serialize ledger");
         let restored = ReactiveInjectionLedger::from_json_bytes(&bytes).expect("restore ledger");
         assert_eq!(restored, ledger);
+    }
+
+    #[test]
+    fn pending_item_ids_lists_only_undelivered_session_items() {
+        let mut ledger = ReactiveInjectionLedger::new();
+        let critical = ledger
+            .admit(
+                "session-1",
+                cue("rev-1"),
+                Some(firing()),
+                vec!["rel-a".to_owned()],
+                admission(Severity::Critical, RiskTier::Severe),
+            )
+            .expect("admit critical");
+        let normal = ledger
+            .admit(
+                "session-1",
+                cue("rev-1"),
+                Some(firing()),
+                Vec::new(),
+                admission(Severity::Normal, RiskTier::Low),
+            )
+            .expect("admit normal");
+        let other_session = ledger
+            .admit(
+                "session-2",
+                cue("rev-1"),
+                Some(firing()),
+                Vec::new(),
+                admission(Severity::Normal, RiskTier::Low),
+            )
+            .expect("admit other session");
+        assert_eq!(
+            ledger.pending_item_ids("session-1"),
+            vec![critical.clone(), normal.clone()]
+        );
+        assert_eq!(ledger.pending_item_ids("session-2"), vec![other_session]);
+        assert!(ledger.pending_item_ids("session-9").is_empty());
+        ledger
+            .deliver(
+                &normal,
+                DeliveryPoint::NextBridgeResponse {
+                    response_id: "resp-1".to_owned(),
+                },
+            )
+            .expect("deliver normal");
+        // Delivered items leave the pending drain; the critical item stays.
+        assert_eq!(ledger.pending_item_ids("session-1"), vec![critical]);
     }
 }

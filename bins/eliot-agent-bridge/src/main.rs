@@ -3,7 +3,7 @@
 mod request_input;
 
 use eliot_agent_bridge::{
-    BridgeRunner, CliError, Profile, kernel_ports_with_declaration, parse_args,
+    BridgeRunner, CliError, InjectionReceipt, Profile, kernel_ports_with_declaration, parse_args,
 };
 use eliot_agent_bridge_core::{
     AttachRequest, BridgeError, ConnectionId, FencingToken, Generation, HostEventEnvelope,
@@ -64,6 +64,13 @@ const STDOUT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// original order and the remainder is counted as truncated rather than
 /// dropped silently.
 const MAX_STOP_DRAIN_ITEMS: usize = 32;
+/// Maximum sticky attention identities projected inside one Status frame.
+///
+/// The attention projection itself is unbounded in ledger terms (up to
+/// `MAX_LEDGER_ITEMS` records); the status frame carries only the first
+/// identities in ledger order and counts the remainder as truncated rather
+/// than dropping them silently.
+const MAX_STATUS_ATTENTION_ITEMS: usize = 64;
 
 /// Closed kernel entry that rehydrates one exact operation from the durable record.
 ///
@@ -124,6 +131,8 @@ enum Response {
         host_request_port: &'static str,
         observation_forwarding_port: &'static str,
         recovery: &'static str,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reactive: Option<ReactiveStatusView>,
     },
     Attached,
     Reconnected {
@@ -140,7 +149,10 @@ enum Response {
     Cancellation {
         result: HostCancellationResult,
     },
-    Forwarded,
+    Forwarded {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        reactive_receipts: Vec<InjectionReceipt>,
+    },
     Reconciled,
     Stopped {
         outstanding: usize,
@@ -152,6 +164,21 @@ enum Response {
         code: &'static str,
         detail: String,
     },
+}
+
+/// Bounded sticky-attention projection for the Status frame.
+///
+/// `pending` counts undelivered injections for the live session;
+/// `attention_item_ids` carries the first sticky attention identities in
+/// ledger order with `attention_truncated` marking a remainder. Facts come
+/// from the runner's delivery-record ledger; nothing here admits, delivers,
+/// or resolves.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ReactiveStatusView {
+    pending: usize,
+    attention_item_ids: Vec<String>,
+    attention_truncated: bool,
 }
 
 /// Original identity of one durable in-flight delivery pending at Stop.
@@ -374,14 +401,33 @@ fn main() {
                 handle_cancellation(&host_gateway, &mut *host_request_port, &request)
             }
             Ok(Request::ForwardHook { event }) => match runner.forward_hook(&event) {
-                Ok(()) => Response::Forwarded,
+                Ok(()) => match runner.deliver_reactive_pending_via_hook(event.event_id.as_str()) {
+                    Ok(receipts) => Response::Forwarded {
+                        reactive_receipts: receipts,
+                    },
+                    Err(error) => Response::Error {
+                        code: "REACTIVE_RECEIPT_REJECTED",
+                        detail: error.to_string(),
+                    },
+                },
                 Err(error) => {
                     provider_failure |= is_provider_failure(&error);
                     bridge_error(&error)
                 }
             },
             Ok(Request::ForwardEvent { event }) => match runner.forward_event(&event) {
-                Ok(_) => Response::Forwarded,
+                Ok(_) => {
+                    let response_id = format!("forward-event:{}", event.event_id);
+                    match runner.deliver_reactive_pending_via_response(&response_id) {
+                        Ok(receipts) => Response::Forwarded {
+                            reactive_receipts: receipts,
+                        },
+                        Err(error) => Response::Error {
+                            code: "REACTIVE_RECEIPT_REJECTED",
+                            detail: error.to_string(),
+                        },
+                    }
+                }
                 Err(error) => {
                     provider_failure |= is_provider_failure(&error);
                     bridge_error(&error)
@@ -651,6 +697,7 @@ fn status_response(profile: Profile, runner: &BridgeRunner) -> Response {
             host_request_port: "no-session: attach and activate before host-request dispatch",
             observation_forwarding_port: "unavailable: Kernel observation route not admitted",
             recovery: "attach and activate before host requests; reconnect requires a live attach",
+            reactive: None,
         },
         Some(view) => Response::Status {
             profile: Profile::as_str(profile),
@@ -665,7 +712,27 @@ fn status_response(profile: Profile, runner: &BridgeRunner) -> Response {
             host_request_port: "session-bound: dispatch joins the admitted Kernel session",
             observation_forwarding_port: "unavailable: Kernel observation route not admitted",
             recovery: "reconnect with the live connection, session, generation, epoch, and fence nonce from this status; stale targets fail closed",
+            reactive: Some(reactive_status_view(runner)),
         },
+    }
+}
+
+/// Projects the bounded reactive delivery-record summary for Status.
+///
+/// Read-only: counts live-session pending injections and lists the first
+/// sticky attention identities. The caller selects absence for the detached
+/// arm. Never touches dispatch, activation, transport, or ledger state.
+fn reactive_status_view(runner: &BridgeRunner) -> ReactiveStatusView {
+    let attention = runner.reactive_attention();
+    let truncated = attention.len() > MAX_STATUS_ATTENTION_ITEMS;
+    ReactiveStatusView {
+        pending: runner.reactive_pending_count(),
+        attention_item_ids: attention
+            .iter()
+            .take(MAX_STATUS_ATTENTION_ITEMS)
+            .map(|item| item.item_id.clone())
+            .collect(),
+        attention_truncated: truncated,
     }
 }
 
@@ -1093,5 +1160,100 @@ mod tests {
         );
         let framed = frame_response(&response).expect("bounded drain report must fit");
         assert!(framed.len() <= MAX_OUTPUT_FRAME_BYTES);
+    }
+
+    /// I7.19 stdio-shape proof: issued Delivery/Injection Receipts ride the
+    /// `Forwarded` frame that carried them, the key stays absent when no
+    /// receipt was issued, and Status projects the bounded reactive summary.
+    #[test]
+    fn forwarded_response_carries_receipts_only_when_issued() {
+        use eliot_agent_bridge::{
+            AdmissionBasis, DeliveryPoint, FiringEvidence, RiskTier, Severity, UseOutcome,
+        };
+
+        const DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let receipt = InjectionReceipt {
+            receipt_id: "injection-receipt-1".to_owned(),
+            item_id: "reactive-item-1".to_owned(),
+            session_id: "session-reactive-1".to_owned(),
+            firing: FiringEvidence {
+                rule_id: "exact-rule-reactive-7".to_owned(),
+                cue_id: "cue-reactive-1".to_owned(),
+                cue_digest: DIGEST.to_owned(),
+            },
+            admission: AdmissionBasis {
+                scope_id: "scope-reactive-1".to_owned(),
+                status: "active".to_owned(),
+                risk: RiskTier::Severe,
+                governance_profile_rev: "gov-reactive-3".to_owned(),
+                fence_epoch: "epoch-reactive-1".to_owned(),
+                fence_generation: 2,
+                admitted_severity: Severity::Critical,
+            },
+            delivery: DeliveryPoint::HostHook {
+                hook_id: "hook-reactive-1".to_owned(),
+            },
+            use_status: UseOutcome::Unknown,
+        };
+        let empty = Response::Forwarded {
+            reactive_receipts: Vec::new(),
+        };
+        let empty_value = serde_json::to_value(&empty).expect("forwarded must serialize");
+        assert_eq!(empty_value["status"], Value::String("forwarded".to_owned()));
+        assert!(
+            empty_value.get("reactive_receipts").is_none(),
+            "no receipts means no key on the wire"
+        );
+        let carried = Response::Forwarded {
+            reactive_receipts: vec![receipt],
+        };
+        let value = serde_json::to_value(&carried).expect("carried must serialize");
+        let receipts = value["reactive_receipts"]
+            .as_array()
+            .expect("receipts must list");
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(
+            receipts[0]["receipt_id"],
+            Value::String("injection-receipt-1".to_owned())
+        );
+        assert_eq!(
+            receipts[0]["firing"]["rule_id"],
+            Value::String("exact-rule-reactive-7".to_owned())
+        );
+        assert_eq!(
+            receipts[0]["admission"]["scope_id"],
+            Value::String("scope-reactive-1".to_owned())
+        );
+        assert_eq!(
+            receipts[0]["delivery"]["kind"],
+            Value::String("HOST_HOOK".to_owned())
+        );
+        assert!(receipts[0].get("use_status").is_some());
+        let framed = frame_response(&carried).expect("receipt frame must fit");
+        assert!(framed.len() <= MAX_OUTPUT_FRAME_BYTES);
+    }
+
+    #[test]
+    fn detached_status_omits_reactive_summary_and_view_is_empty() {
+        use eliot_agent_bridge_core::ProviderReadiness;
+
+        let runner = BridgeRunner::new(
+            Profile::SpineFunctional,
+            ProviderReadiness::unprobed(),
+            None,
+            None,
+        )
+        .expect("detached runner composes");
+        let view = reactive_status_view(&runner);
+        assert_eq!(view.pending, 0);
+        assert!(view.attention_item_ids.is_empty());
+        assert!(!view.attention_truncated);
+        let response = status_response(Profile::SpineFunctional, &runner);
+        let value = serde_json::to_value(&response).expect("status must serialize");
+        assert_eq!(value["attached"], Value::Bool(false));
+        assert!(
+            value.get("reactive").is_none(),
+            "detached status carries no reactive key"
+        );
     }
 }
