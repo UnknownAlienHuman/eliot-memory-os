@@ -9,6 +9,7 @@ use std::time::Duration;
 use eliot_runtime::{ChildClass, Runtime, ShutdownOutcome, SupervisionStrategy, TaskFailure};
 
 use crate::CompositionError;
+use crate::heartbeat_transport::HeartbeatTransport;
 use crate::HostObservationSource;
 use crate::HostObservationState;
 use crate::KernelWatchdogPort;
@@ -34,6 +35,7 @@ pub struct WatchdogComposition {
     config: WatchdogConfig,
     task: eliot_runtime::SupervisedHandle,
     shutdown_requested: Arc<AtomicBool>,
+    heartbeat: Option<Arc<HeartbeatTransport>>,
 }
 
 impl WatchdogComposition {
@@ -100,6 +102,37 @@ impl WatchdogComposition {
         host: Arc<dyn HostObservationSource>,
         shutdown_requested: Arc<AtomicBool>,
     ) -> Result<Self, CompositionError> {
+        Self::start_with_shutdown_and_host_and_heartbeat(
+            config,
+            admission,
+            kernel,
+            host,
+            shutdown_requested,
+            None,
+        )
+    }
+
+    /// Starts the composition with an optional Host heartbeat sink. The
+    /// sink receives one admitted emission per Kernel-accepted heartbeat;
+    /// emission failures are traced inside the tick and never fail
+    /// supervision. `None` preserves the stdout-only contour.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error under the same conditions as
+    /// [`Self::start_with_shutdown_and_host`].
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the bounded supervision task keeps admission, observation, heartbeat emission, and gap reporting in one reviewable contour"
+    )]
+    pub fn start_with_shutdown_and_host_and_heartbeat(
+        config: WatchdogConfig,
+        admission: Arc<dyn WatchdogAdmissionSource>,
+        kernel: Arc<dyn KernelWatchdogPort>,
+        host: Arc<dyn HostObservationSource>,
+        shutdown_requested: Arc<AtomicBool>,
+        heartbeat: Option<Arc<HeartbeatTransport>>,
+    ) -> Result<Self, CompositionError> {
         let _span = tracing::debug_span!("watchdog.composition_start").entered();
         tracing::debug!(
             event = "watchdog.composition_requested",
@@ -112,6 +145,7 @@ impl WatchdogComposition {
         let task_host = host;
         let authority_state = WatchdogAuthorityStateCell::new();
         let task_authority_state = authority_state.clone();
+        let task_heartbeat = heartbeat.clone();
         let interval = config.tick_interval;
         let task = match runtime.supervisor(SupervisionStrategy::OneForOne).spawn(
             SERVICE_NAME,
@@ -121,6 +155,7 @@ impl WatchdogComposition {
                 let admission = task_admission.clone();
                 let host = task_host.clone();
                 let authority_state = task_authority_state.clone();
+                let heartbeat = task_heartbeat.clone();
                 async move {
                     loop {
                         tokio::select! {
@@ -189,10 +224,19 @@ impl WatchdogComposition {
                             continue;
                         }
                         match kernel.supervise(admission.lease()).await {
-                            Ok(()) => authority_state.publish_admitted(
-                                admission.lease().lease().kernel_epoch.sequence.get(),
-                                admission.watchdog_epoch().value(),
-                            ),
+                            Ok(()) => {
+                                let kernel_epoch =
+                                    admission.lease().lease().kernel_epoch.sequence.get();
+                                let watchdog_epoch = admission.watchdog_epoch().value();
+                                authority_state.publish_admitted(kernel_epoch, watchdog_epoch);
+                                emit_admitted_heartbeat_best_effort(
+                                    heartbeat.as_ref(),
+                                    kernel_epoch,
+                                    watchdog_epoch,
+                                    interval.as_millis(),
+                                )
+                                .await;
+                            }
                             Err(error) => {
                                 authority_state.publish_no_authority();
                                 report_gap_nonfatal(kernel.as_ref(), kernel_gap_reason(&error))
@@ -215,12 +259,25 @@ impl WatchdogComposition {
             config,
             task,
             shutdown_requested,
+            heartbeat,
         })
     }
 
     #[must_use]
     pub fn readiness(&self) -> WatchdogReadiness {
         let snapshot = self.authority_state.load();
+        let (service_instance_guid, host_challenge_nonce, watchdog_readiness_sequence) =
+            self.heartbeat.as_ref().map_or_else(
+                || (String::new(), String::new(), crate::heartbeat_transport::FENCE_SEQUENCE),
+                |transport| {
+                    let (service_instance_guid, host_challenge_nonce) = transport.echo_identity();
+                    (
+                        service_instance_guid,
+                        host_challenge_nonce,
+                        transport.last_sequence(),
+                    )
+                },
+            );
         WatchdogReadiness {
             service: SERVICE_NAME,
             protocol: PROTOCOL_VERSION,
@@ -229,6 +286,9 @@ impl WatchdogComposition {
             kernel_epoch: snapshot.kernel_epoch,
             watchdog_epoch: snapshot.watchdog_epoch,
             tick_interval_ms: self.config.tick_interval.as_millis(),
+            service_instance_guid,
+            host_challenge_nonce,
+            watchdog_readiness_sequence,
         }
     }
 
@@ -294,6 +354,30 @@ fn complete_requested_shutdown<T>(
     match result {
         Ok(_) | Err(TaskFailure::Cancelled) => Ok(shutdown),
         Err(error) => Err(error),
+    }
+}
+
+/// Emits one admitted heartbeat best-effort: emission failures are traced
+/// and never fail the supervision tick.
+async fn emit_admitted_heartbeat_best_effort(
+    heartbeat: Option<&Arc<HeartbeatTransport>>,
+    kernel_epoch: u64,
+    watchdog_epoch: u64,
+    tick_interval_ms: u128,
+) {
+    let Some(transport) = heartbeat else {
+        return;
+    };
+    if let Err(error) = transport
+        .emit_admitted(kernel_epoch, watchdog_epoch, tick_interval_ms)
+        .await
+    {
+        tracing::debug!(
+            event = "watchdog.heartbeat.emit_skipped",
+            observation = "attempted",
+            error = error.to_string().as_str(),
+            "heartbeat emission skipped; supervision continues"
+        );
     }
 }
 
