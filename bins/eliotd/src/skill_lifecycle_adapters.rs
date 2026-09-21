@@ -84,6 +84,7 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use eliot_contracts::StateFence;
 use eliot_skill::{
     ActivatedSkillDisplay, CanonicalToolSource, HotsetDeliveryAck, HotsetDeliveryReceipt,
     KnownTools, PromotionGate, SkillCandidate, SkillCatalogue, SkillError, SkillLifecycleApi,
@@ -102,6 +103,23 @@ pub(crate) type CatalogueHandle = Arc<Mutex<SkillCatalogue>>;
 pub(crate) struct ForwardingSkillLifecycle<T> {
     inner: T,
     catalogue: CatalogueHandle,
+}
+
+/// Refuses a delivery act whose claimed scope fence is not the live admitted
+/// fence (issue #1882).
+///
+/// The injector builds the act under one Governor fence; the driver observes
+/// the live admitted fence when driving it. Inequality means a Governor
+/// refresh — or a foreign-fence act — crossed the drive: the install stands
+/// unwritten and no receipt mints, so a refreshed Governor never inherits a
+/// catalogue write plus receipt bound to a fence it already fenced. Pure over
+/// its two inputs; the caller observes the live fence through the
+/// composition's admitted snapshot.
+fn check_delivery_fence(claimed: &StateFence, admitted: &StateFence) -> Result<(), SkillError> {
+    if claimed != admitted {
+        return Err(SkillError::FenceMismatch);
+    }
+    Ok(())
 }
 
 impl<T> ForwardingSkillLifecycle<T> {
@@ -218,6 +236,12 @@ impl<T> ForwardingSkillLifecycle<T> {
     /// [`acknowledge_and_display`](Self::acknowledge_and_display).
     /// Synchronous: each step takes and drops the guard in a closed scope.
     ///
+    /// The act's scope fence is checked FIRST against the driver-observed
+    /// live admitted fence: a Governor refresh (or a foreign-fence act)
+    /// crossing the drive fails closed before the shared handle is touched,
+    /// so a refreshed Governor never inherits a catalogue write plus receipt
+    /// bound to a fence it already fenced.
+    ///
     /// No in-tree Governor driver calls the composed delivery act yet; the
     /// composition seam
     /// ([`DaemonComposition::skill_run_install_to_receipt`](super::DaemonComposition::skill_run_install_to_receipt))
@@ -227,7 +251,9 @@ impl<T> ForwardingSkillLifecycle<T> {
     pub(crate) fn run_install_to_receipt(
         &self,
         act: VersionedDeliveryAct<'_>,
+        admitted_fence: &StateFence,
     ) -> Result<(String, HotsetDeliveryReceipt), SkillError> {
+        check_delivery_fence(&act.scope.work_scope.state_fence, admitted_fence)?;
         let skill_id = self.install_package_versioned(
             act.package,
             act.inputs,
@@ -1069,18 +1095,21 @@ mod tests {
         let source = canonical_source("1.2.0");
         let aliases = ToolAliasTable::new();
         let (skill_id, receipt) = forwarding
-            .run_install_to_receipt(VersionedDeliveryAct {
-                package: &package,
-                inputs: &inputs,
-                context: &context,
-                readiness: &readiness,
-                scope: &scope,
-                source: &source,
-                aliases: &aliases,
-                admitted_definition_version: "1.2.0",
-                hotset_id: "hotset-versioned-1".to_owned(),
-                approval_ref: "approval-commit-1".to_owned(),
-            })
+            .run_install_to_receipt(
+                VersionedDeliveryAct {
+                    package: &package,
+                    inputs: &inputs,
+                    context: &context,
+                    readiness: &readiness,
+                    scope: &scope,
+                    source: &source,
+                    aliases: &aliases,
+                    admitted_definition_version: "1.2.0",
+                    hotset_id: "hotset-versioned-1".to_owned(),
+                    approval_ref: "approval-commit-1".to_owned(),
+                },
+                &fence,
+            )
             .expect("versioned delivery act");
         assert_eq!(skill_id, "skill-demo");
         assert!(receipt.confirms_delivery("skill-demo"));
@@ -1123,18 +1152,21 @@ mod tests {
         let source = canonical_source("1.2.0");
         let aliases = ToolAliasTable::new();
         let (skill_id, receipt) = forwarding
-            .run_install_to_receipt(VersionedDeliveryAct {
-                package: &package,
-                inputs: &inputs,
-                context: &context,
-                readiness: &readiness,
-                scope: &scope,
-                source: &source,
-                aliases: &aliases,
-                admitted_definition_version: "1.2.0",
-                hotset_id: "hotset-display-live-1".to_owned(),
-                approval_ref: "approval-commit-1".to_owned(),
-            })
+            .run_install_to_receipt(
+                VersionedDeliveryAct {
+                    package: &package,
+                    inputs: &inputs,
+                    context: &context,
+                    readiness: &readiness,
+                    scope: &scope,
+                    source: &source,
+                    aliases: &aliases,
+                    admitted_definition_version: "1.2.0",
+                    hotset_id: "hotset-display-live-1".to_owned(),
+                    approval_ref: "approval-commit-1".to_owned(),
+                },
+                &fence,
+            )
             .expect("versioned delivery act");
         // The receiver returns its ack for the issued receipt; the driver
         // binds it under the live tool-owner source, which still binds the
@@ -1173,18 +1205,21 @@ mod tests {
         let source = canonical_source("1.2.0");
         let aliases = ToolAliasTable::new();
         let (skill_id, receipt) = forwarding
-            .run_install_to_receipt(VersionedDeliveryAct {
-                package: &package,
-                inputs: &inputs,
-                context: &context,
-                readiness: &readiness,
-                scope: &scope,
-                source: &source,
-                aliases: &aliases,
-                admitted_definition_version: "1.2.0",
-                hotset_id: "hotset-display-live-2".to_owned(),
-                approval_ref: "approval-commit-1".to_owned(),
-            })
+            .run_install_to_receipt(
+                VersionedDeliveryAct {
+                    package: &package,
+                    inputs: &inputs,
+                    context: &context,
+                    readiness: &readiness,
+                    scope: &scope,
+                    source: &source,
+                    aliases: &aliases,
+                    admitted_definition_version: "1.2.0",
+                    hotset_id: "hotset-display-live-2".to_owned(),
+                    approval_ref: "approval-commit-1".to_owned(),
+                },
+                &fence,
+            )
             .expect("versioned delivery act");
         let ack = HotsetDeliveryAck {
             hotset_id: receipt.hotset_id.clone(),
@@ -1265,18 +1300,22 @@ mod tests {
             reason: "provider revoked the tool".to_owned(),
         };
         let source = canonical_source("1.2.0");
-        let refused = forwarding.run_install_to_receipt(VersionedDeliveryAct {
-            package: &package,
-            inputs: &inputs,
-            context: &install_context(),
-            readiness: &readiness,
-            scope: &delivery_scope(&fence()),
-            source: &source,
-            aliases: &aliases,
-            admitted_definition_version: "1.2.0",
-            hotset_id: "hotset-versioned-2".to_owned(),
-            approval_ref: "approval-commit-1".to_owned(),
-        });
+        let scope_fence = fence();
+        let refused = forwarding.run_install_to_receipt(
+            VersionedDeliveryAct {
+                package: &package,
+                inputs: &inputs,
+                context: &install_context(),
+                readiness: &readiness,
+                scope: &delivery_scope(&scope_fence),
+                source: &source,
+                aliases: &aliases,
+                admitted_definition_version: "1.2.0",
+                hotset_id: "hotset-versioned-2".to_owned(),
+                approval_ref: "approval-commit-1".to_owned(),
+            },
+            &scope_fence,
+        );
         assert!(matches!(
             refused,
             Err(SkillError::InvalidField { field, .. }) if field == "readiness.tools"
@@ -1303,18 +1342,22 @@ mod tests {
             .expect("stale package still validates");
         let aliases = ToolAliasTable::new();
         let source = canonical_source("1.2.0");
-        let refused = forwarding.run_install_to_receipt(VersionedDeliveryAct {
-            package: &package,
-            inputs: &inputs,
-            context: &install_context(),
-            readiness: &available_readiness(),
-            scope: &delivery_scope(&fence()),
-            source: &source,
-            aliases: &aliases,
-            admitted_definition_version: "1.2.0",
-            hotset_id: "hotset-versioned-4".to_owned(),
-            approval_ref: "approval-commit-1".to_owned(),
-        });
+        let scope_fence = fence();
+        let refused = forwarding.run_install_to_receipt(
+            VersionedDeliveryAct {
+                package: &package,
+                inputs: &inputs,
+                context: &install_context(),
+                readiness: &available_readiness(),
+                scope: &delivery_scope(&scope_fence),
+                source: &source,
+                aliases: &aliases,
+                admitted_definition_version: "1.2.0",
+                hotset_id: "hotset-versioned-4".to_owned(),
+                approval_ref: "approval-commit-1".to_owned(),
+            },
+            &scope_fence,
+        );
         assert!(matches!(
             refused,
             Err(SkillError::InvalidField { field, .. }) if field == "sealed.materialization"
@@ -1334,22 +1377,64 @@ mod tests {
         let aliases = ToolAliasTable::new();
         let readiness = available_readiness();
         let source = canonical_source("1.2.0");
-        let refused = forwarding.run_install_to_receipt(VersionedDeliveryAct {
-            package: &package,
-            inputs: &inputs,
-            context: &install_context(),
-            readiness: &readiness,
-            scope: &delivery_scope(&fence()),
-            source: &source,
-            aliases: &aliases,
-            admitted_definition_version: "1.2.0",
-            hotset_id: "hotset-versioned-3".to_owned(),
-            approval_ref: "   ".to_owned(),
-        });
+        let scope_fence = fence();
+        let refused = forwarding.run_install_to_receipt(
+            VersionedDeliveryAct {
+                package: &package,
+                inputs: &inputs,
+                context: &install_context(),
+                readiness: &readiness,
+                scope: &delivery_scope(&scope_fence),
+                source: &source,
+                aliases: &aliases,
+                admitted_definition_version: "1.2.0",
+                hotset_id: "hotset-versioned-3".to_owned(),
+                approval_ref: "   ".to_owned(),
+            },
+            &scope_fence,
+        );
         assert!(matches!(
             refused,
             Err(SkillError::InvalidField { field, .. }) if field == "delivery.approval_ref"
         ));
+    }
+
+    #[test]
+    fn stale_scope_fence_refuses_issuance_before_touching_the_catalogue() {
+        let (forwarding, calls) = versioned_forwarder();
+        let (package, inputs) = package_source();
+        let context = install_context();
+        let readiness = available_readiness();
+        let claimed = fence();
+        let scope = delivery_scope(&claimed);
+        let source = canonical_source("1.2.0");
+        let aliases = ToolAliasTable::new();
+        // The Governor refreshed between the injector's build and the drive:
+        // the live admitted fence no longer equals the act's scope fence, so
+        // the install stands unwritten and no receipt mints.
+        let admitted = StateFence::new(
+            test_epoch(2),
+            ResourceGeneration::new(2).expect("test generation"),
+        );
+        let refused = forwarding.run_install_to_receipt(
+            VersionedDeliveryAct {
+                package: &package,
+                inputs: &inputs,
+                context: &context,
+                readiness: &readiness,
+                scope: &scope,
+                source: &source,
+                aliases: &aliases,
+                admitted_definition_version: "1.2.0",
+                hotset_id: "hotset-versioned-5".to_owned(),
+                approval_ref: "approval-commit-1".to_owned(),
+            },
+            &admitted,
+        );
+        assert!(matches!(refused, Err(SkillError::FenceMismatch)));
+        let catalogue = forwarding.catalogue.lock().expect("catalogue lock");
+        assert!(catalogue.is_empty());
+        assert_eq!(*calls.lock().expect("calls"), 0);
     }
 
     #[test]

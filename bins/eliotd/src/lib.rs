@@ -851,14 +851,19 @@ impl DaemonComposition {
     /// materialization scope, versioned tool source plus alias table and
     /// admitted version, Hotset identity, and injector approval in one
     /// [`VersionedDeliveryAct`](skill_lifecycle_adapters::VersionedDeliveryAct);
-    /// the shared handle records the act. The receipt carries the provisional
+    /// the shared handle records the act. The composition observes the live
+    /// admitted Governor fence itself and the act's scope fence must equal
+    /// it: a Governor refresh crossing the drive fails closed before any
+    /// catalogue write or receipt mint. The receipt carries the provisional
     /// ceiling until evidence promotion; the receiver ack re-enters through
     /// [`Self::skill_acknowledge_and_display`].
     pub fn skill_run_install_to_receipt(
         &self,
         act: skill_lifecycle_adapters::VersionedDeliveryAct<'_>,
     ) -> Result<(String, eliot_skill::HotsetDeliveryReceipt), eliot_skill::SkillError> {
-        self.shared_skill_adapter().run_install_to_receipt(act)
+        let admitted = self.governor.kernel_snapshot().state_fence().clone();
+        self.shared_skill_adapter()
+            .run_install_to_receipt(act, &admitted)
     }
 
     /// Borrows the single Governor task lifecycle owner as a forwarding
