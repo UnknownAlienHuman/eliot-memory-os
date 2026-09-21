@@ -443,8 +443,8 @@ pub use ul::cross_agent::{
 };
 pub use ul::cue::{
     CUE_BINDING_PAGE_SCHEMA_VERSION_V1, CUE_BINDING_PAGE_SCHEMA_VERSION_V2, CueBinding,
-    CueBindingError, CueBindingPage, CueIndexRow, CueKind, CueMatchMode, CueRecordSource,
-    CueStrength, MAX_CUE_BINDING_PAGE_BYTES, MAX_CUE_BINDINGS_PER_PAGE, cue_binding_page_id,
+    CueBindingError, CueBindingPage, CueIndexRow, CueMatchMode, CueRecordSource, CueStrength,
+    LegacyCueKindV1, MAX_CUE_BINDING_PAGE_BYTES, MAX_CUE_BINDINGS_PER_PAGE, cue_binding_page_id,
     cue_binding_page_set_hash, cue_row_id, normalize_binding, normalize_binding_pages,
     normalize_bindings, ul_token_estimate,
 };
