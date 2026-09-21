@@ -56,6 +56,7 @@ mod kernel_recovery_client;
 mod kernel_transition_client;
 mod observation_adapters;
 mod route_receipts;
+mod skill_bridge_adapter;
 mod skill_lifecycle_adapters;
 mod skill_surface_adapters;
 pub mod staffing_policy;
@@ -982,6 +983,32 @@ impl DaemonComposition {
         }
         Ok(skill_surface_adapters::GovernorSkillForwarder::new(
             self.skill_lifecycle()?,
+        ))
+    }
+
+    /// Borrows the single Governor Skill lifecycle owner as the agent-bridge
+    /// [`SkillLifecyclePort`](eliot_agent_bridge_core::SkillLifecyclePort).
+    ///
+    /// In-process binding for bridge cores running in the same process as
+    /// this composition: reads and proposals forward to the Governor
+    /// canonical path, and receiver-ack display resolves the live canonical
+    /// tool source per call through the Governor hook. No policy, admission,
+    /// or semantic rules live here; a stale fence fails closed in the
+    /// Governor owner, and tool-authority verdicts stay with the Skill owner.
+    /// A remote bridge process MUST NOT hold this forwarder — cross-process
+    /// Skill traffic crosses the authenticated transport as messages. Callers
+    /// take a fresh port per operation so a Governor refresh surfaces as an
+    /// exact-view mismatch instead of silent divergence.
+    pub fn skill_bridge_port(
+        &self,
+    ) -> Result<impl eliot_agent_bridge_core::SkillLifecyclePort + '_, DaemonError> {
+        if self.readiness() != eliot_governor::CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(
+                eliot_governor::CompositionError::NotReady,
+            ));
+        }
+        Ok(skill_bridge_adapter::BridgeSkillForwarder::new(
+            self.shared_skill_adapter(),
         ))
     }
 
