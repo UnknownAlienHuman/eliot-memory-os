@@ -2335,6 +2335,7 @@ dependencies = [
  "eliot-cli",
  "eliot-config",
  "eliot-contracts",
+ "eliot-kernel-service",
  "eliot-notify-core",
  "eliot-platform",
  "eliot-platform-windows",
