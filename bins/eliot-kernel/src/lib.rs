@@ -178,8 +178,8 @@ pub use dispatch_launch::{
     dispatch_contour, doctor_repair_advertised, launch_admitted_doctor_attempt,
     launch_admitted_native_worker_attempt, launch_admitted_testd_attempt,
     native_worker_dispatch_derivation, native_worker_dispatch_derivation_from_epoch_json,
-    native_worker_production_composed, prepare_doctor_launch, prepare_native_worker_launch,
-    prepare_testd_launch, reconcile_launched_doctor_attempt,
+    native_worker_material_bytes, native_worker_production_composed, prepare_doctor_launch,
+    prepare_native_worker_launch, prepare_testd_launch, reconcile_launched_doctor_attempt,
     reconcile_launched_native_worker_attempt, reconcile_launched_testd_attempt,
     release_launched_attempt, start_ready_doctor_launch, start_ready_native_worker_launch,
     start_ready_testd_launch, testd_admission_advertised, testd_production_composed,
@@ -342,6 +342,9 @@ use eliot_store_api::StoreHealth;
 use eliot_store_api::{
     CanonicalValidationSnapshot, StateFence as StoreStateFence, StoreHealthStatus,
 };
+/// Kernel-owned mechanical projection used to bind Governor R4 evidence to
+/// the live generation route and exact State Fence.
+pub use generation_control::ActiveGenerationRegistryProjection;
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
