@@ -9,7 +9,8 @@
 //! credential, provider, or effect semantics: it decodes one typed setting
 //! chain from TOML/JSON layer documents, resolves the winning value in
 //! canonical precedence order, and rejects lower-layer expansions unless a
-//! higher layer supplies an explicit delegation covering that exact expansion.
+//! live higher-layer delegation covers the requested value within a strict
+//! sub-envelope of the granting layer's own inherited authority.
 //! Arbitrary executable scripts are invalid policy input, never a fallback
 //! configuration source.
 //!
@@ -104,12 +105,14 @@ impl ConfigLayer {
 ///
 /// `limit` is the layer's proposed value (`None` = layer abstains and the
 /// running value carries forward). `delegation_ceiling` is an explicit
-/// higher-layer delegation naming the exact expansion lower layers may take.
-/// A grant never exceeds the granting layer's own inherited authority: the
-/// effective ceiling is `min(delegation_ceiling, inherited)`, so a layer
-/// cannot mint authority through its own ceiling (including
-/// delegation-only layers with `limit: None`). It never raises the granting
-/// layer's own value.
+/// higher-layer delegation: an interval cap naming how far lower layers may
+/// expand. A grant is live only when it dedicates a strict sub-envelope of
+/// the granting layer's own inherited authority (`ceiling < inherited`); a
+/// ceiling restating the full inherited envelope delegates nothing, so stale
+/// restatements cannot resurrect an envelope a later layer tightened. The
+/// ceiling never raises the granting layer's own value, and abstention
+/// (`limit: None`) mints no authority: a delegation-only layer still grants
+/// at most what it inherited.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LayerInput {
     pub layer: ConfigLayer,
@@ -202,16 +205,27 @@ pub enum PrecedenceError {
 ///
 /// The compiled-defaults layer must seed the chain. Each lower layer carrying
 /// `Some(limit)` narrows (`limit <= running`), repeats (`limit == running`),
-/// or expands (`limit > running`) only when some strictly higher layer
-/// granted that exact expansion: a higher grant covers a request only when
-/// the grant, clamped to the granting layer's own inherited authority,
-/// equals the requested value exactly. Abstaining layers (`None`) contribute
-/// no value but may still grant within their inherited authority; neither
+/// or expands (`limit > running`) only when a strictly higher layer's live
+/// delegation covers the requested value: the grant's ceiling, which is an
+/// interval cap, must reach the request, and the grant must dedicate a
+/// strict sub-envelope of the granting layer's own inherited authority. A
+/// ceiling merely restating the inherited envelope is void, so an old
+/// broad-or-exact grant can never override a later tighter nondelegating
+/// boundary: each crossed higher boundary authorizes expansion only through
+/// a live grant made under it. Abstaining layers (`None`) contribute no
+/// value but may still grant within their inherited authority; neither
 /// abstention nor a ceiling mints authority beyond what the layer inherited.
+///
+/// Rationale: representation and semantics agree — `delegation_ceiling`
+/// names the top of a permitted interval, not one exact value — while
+/// provenance (strict sub-envelope liveness) carries the fail-closed
+/// burden. Mandatory exact-equality would reject requests the grantor
+/// explicitly permitted; unbounded `>=` without liveness lets stale
+/// restatements launder expansions.
 ///
 /// # Errors
 /// Returns [`PrecedenceError`] when the key is unsupported, defaults are
-/// missing, layers repeat, or an expansion lacks an exactly covering
+/// missing, layers repeat, or an expansion lacks a live covering
 /// higher-layer delegation.
 pub fn resolve_canonical_chain(
     key: &str,
@@ -241,26 +255,31 @@ pub fn resolve_canonical_chain(
         narrowed: false,
         delegated_expansion: false,
     }];
-    // Effective grants recorded per processed layer: (order, ceiling clamped
-    // to the granting layer's own inherited authority). A grant is usable
-    // only by strictly lower layers and only for its exact value, so neither
-    // self-minted ceilings nor stale broad ceilings can launder an expansion
-    // past the actual boundary it would cross.
+    // Live grants recorded per processed layer: (order, ceiling). A grant is
+    // live only when its ceiling dedicates a strict sub-envelope of the
+    // granting layer's inherited authority; restatements of the full
+    // envelope are void. A live grant covers a later expansion only from a
+    // strictly higher layer and only up to its ceiling, so neither
+    // self-minted ceilings nor stale grants can launder an expansion past
+    // the actual boundary it would cross.
     let mut grants: Vec<(u8, u64)> = Vec::new();
     if let Some(seed_input) = inputs
         .iter()
         .find(|input| input.layer == ConfigLayer::CompiledDefaults)
         && let Some(ceiling) = seed_input.delegation_ceiling
+        && ceiling < seed
     {
-        grants.push((ConfigLayer::CompiledDefaults.order(), ceiling.min(seed)));
+        grants.push((ConfigLayer::CompiledDefaults.order(), ceiling));
     }
     for layer in ALL_LAYERS.iter().skip(1) {
         let inherited = running;
         let Some(input) = inputs.iter().find(|input| input.layer == *layer) else {
             continue;
         };
-        if let Some(ceiling) = input.delegation_ceiling {
-            grants.push((layer.order(), ceiling.min(inherited)));
+        if let Some(ceiling) = input.delegation_ceiling
+            && ceiling < inherited
+        {
+            grants.push((layer.order(), ceiling));
         }
         let Some(requested) = input.limit else {
             continue;
@@ -277,7 +296,7 @@ pub fn resolve_canonical_chain(
         } else {
             let covered = grants
                 .iter()
-                .any(|(order, ceiling)| *order < layer.order() && *ceiling == requested);
+                .any(|(order, ceiling)| *order < layer.order() && *ceiling >= requested);
             if covered {
                 contributions.push(ResolvedContribution {
                     order: layer.order(),
@@ -730,6 +749,114 @@ mod tests {
                 .to_string()
                 .contains("without an explicit higher-layer delegation"),
             "unexpected: {error}"
+        );
+    }
+
+    #[test]
+    fn stale_exact_grant_cannot_override_later_tighter_boundary() {
+        // Compiled restates its full inherited envelope (100 == 100): the
+        // grant is void. System Owner then tightens to 60, so the session
+        // request for the stale 100 must fail closed.
+        let inputs = vec![
+            LayerInput {
+                layer: ConfigLayer::CompiledDefaults,
+                limit: Some(100),
+                delegation_ceiling: Some(100),
+            },
+            LayerInput {
+                layer: ConfigLayer::SystemOwnerPolicy,
+                limit: Some(60),
+                delegation_ceiling: None,
+            },
+            LayerInput {
+                layer: ConfigLayer::SessionCapabilityToken,
+                limit: Some(100),
+                delegation_ceiling: None,
+            },
+        ];
+        let error = resolve_canonical_chain(CANONICAL_SETTING_KEY, &inputs)
+            .expect_err("stale restatement grant must not override the tighter boundary");
+        assert!(
+            error
+                .to_string()
+                .contains("without an explicit higher-layer delegation"),
+            "unexpected: {error}"
+        );
+    }
+
+    #[test]
+    fn abstaining_restatement_grants_nothing() {
+        // An abstaining layer restating the full inherited envelope
+        // (ceiling 100 on inherited 100) mints no authority: after the
+        // System Owner tightens to 60, the session request for 100 fails.
+        let inputs = vec![
+            LayerInput {
+                layer: ConfigLayer::CompiledDefaults,
+                limit: Some(100),
+                delegation_ceiling: None,
+            },
+            LayerInput {
+                layer: ConfigLayer::InstallationConfig,
+                limit: None,
+                delegation_ceiling: Some(100),
+            },
+            LayerInput {
+                layer: ConfigLayer::SystemOwnerPolicy,
+                limit: Some(60),
+                delegation_ceiling: None,
+            },
+            LayerInput {
+                layer: ConfigLayer::SessionCapabilityToken,
+                limit: Some(100),
+                delegation_ceiling: None,
+            },
+        ];
+        let error = resolve_canonical_chain(CANONICAL_SETTING_KEY, &inputs)
+            .expect_err("abstaining restatement must grant nothing");
+        assert!(
+            error
+                .to_string()
+                .contains("without an explicit higher-layer delegation"),
+            "unexpected: {error}"
+        );
+    }
+
+    #[test]
+    fn live_grant_covers_interval_up_to_its_ceiling() {
+        // Installation grants a strict sub-envelope (95 < inherited 100).
+        // System Owner narrows to 80; the task expansion to 90 stays inside
+        // the live grant interval and resolves as delegated.
+        let inputs = vec![
+            LayerInput {
+                layer: ConfigLayer::CompiledDefaults,
+                limit: Some(100),
+                delegation_ceiling: None,
+            },
+            LayerInput {
+                layer: ConfigLayer::InstallationConfig,
+                limit: None,
+                delegation_ceiling: Some(95),
+            },
+            LayerInput {
+                layer: ConfigLayer::SystemOwnerPolicy,
+                limit: Some(80),
+                delegation_ceiling: None,
+            },
+            LayerInput {
+                layer: ConfigLayer::TaskPolicy,
+                limit: Some(90),
+                delegation_ceiling: None,
+            },
+        ];
+        let chain = resolve_canonical_chain(CANONICAL_SETTING_KEY, &inputs)
+            .expect("request inside a live grant interval must resolve");
+        assert_eq!(chain.winning_value(), 90);
+        assert!(
+            chain
+                .contributions()
+                .last()
+                .is_some_and(|item| item.delegated_expansion),
+            "expansion must be marked delegated"
         );
     }
 
