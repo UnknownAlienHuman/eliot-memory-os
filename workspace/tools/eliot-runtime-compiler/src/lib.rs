@@ -3799,6 +3799,13 @@ fn collect_manifests(directory: &Path, repository: &Path, manifests: &mut Vec<St
     };
     for entry in entries.flatten() {
         let path = entry.path();
+        // Never traverse symlinks or reparse points: a link cycle would
+        // recurse without bound (stack overflow, not a typed FAIL), and a
+        // linked manifest is not a real source root. The query never
+        // follows the final component.
+        if is_symlink_or_reparse(&path) {
+            continue;
+        }
         if path.is_dir() {
             let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
                 continue;
@@ -3838,12 +3845,30 @@ fn read_capped<R: Read>(stream: R, program: &'static str) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// Join one pipe-drain thread.
+///
+/// `read_capped` has no panic branch, so a join failure is unexpected; it
+/// is still a typed error here, never a panic on the production path.
+fn join_drain(
+    handle: std::thread::JoinHandle<Result<Vec<u8>>>,
+    program: &'static str,
+) -> Result<Vec<u8>> {
+    handle
+        .join()
+        .map_err(|_| anyhow!("{program} output drain failed"))?
+}
+
 /// Run one allowlisted repository tool with output and wall-clock caps.
 ///
 /// Fixed read-only boundary (see [`RepositoryTool`]): only the exact
 /// allowlisted program-plus-argument shapes run — no shell, no network, no
-/// credentials. The process is bounded by [`bounds::MAX_PROCESS_TIMEOUT_SECS`]
-/// (killed and failed closed on expiry) and its captured output is capped by
+/// credentials. Both pipes drain on helper threads while the parent waits:
+/// a chatty child (workspace `cargo metadata` exceeds 600KB, far above any
+/// pipe buffer) would otherwise block forever on a full pipe while nothing
+/// reads until exit — a wait-then-drain deadlock that always decayed into
+/// [`CompilerError::ProcessTimeout`]. The process is bounded by
+/// [`bounds::MAX_PROCESS_TIMEOUT_SECS`] (killed and failed closed on expiry)
+/// and its captured output is capped by
 /// [`bounds::MAX_PROCESS_OUTPUT_BYTES`] before conversion or parsing.
 fn run_command(repository: &Path, tool: RepositoryTool) -> Result<String> {
     let program = tool.program();
@@ -3854,6 +3879,24 @@ fn run_command(repository: &Path, tool: RepositoryTool) -> Result<String> {
         .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("spawn {program}"))?;
+    // `Builder::spawn` (not `spawn`) keeps thread-creation failure a typed
+    // error, never a panic.
+    let stdout_source = child.stdout.take();
+    let stdout_thread = std::thread::Builder::new()
+        .name(format!("{program}-stdout"))
+        .spawn(move || match stdout_source {
+            Some(stream) => read_capped(stream, program),
+            None => Ok(Vec::new()),
+        })
+        .with_context(|| format!("spawn {program} stdout drain"))?;
+    let stderr_source = child.stderr.take();
+    let stderr_thread = std::thread::Builder::new()
+        .name(format!("{program}-stderr"))
+        .spawn(move || match stderr_source {
+            Some(stream) => read_capped(stream, program),
+            None => Ok(Vec::new()),
+        })
+        .with_context(|| format!("spawn {program} stderr drain"))?;
     let deadline = Instant::now() + Duration::from_secs(bounds::MAX_PROCESS_TIMEOUT_SECS);
     let status = loop {
         if let Some(status) = child
@@ -3865,6 +3908,10 @@ fn run_command(repository: &Path, tool: RepositoryTool) -> Result<String> {
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
+            // The pipes close on kill, so the drains finish; their output
+            // is discarded in favour of the timeout error.
+            let _ = stdout_thread.join();
+            let _ = stderr_thread.join();
             return Err(CompilerError::ProcessTimeout {
                 program,
                 secs: bounds::MAX_PROCESS_TIMEOUT_SECS,
@@ -3873,20 +3920,10 @@ fn run_command(repository: &Path, tool: RepositoryTool) -> Result<String> {
         }
         std::thread::sleep(Duration::from_millis(5));
     };
-    // The child has exited, so draining the pipes cannot block on output;
-    // each stream is still capped before it is trusted downstream.
-    let stdout = child
-        .stdout
-        .take()
-        .map(|stream| read_capped(stream, program))
-        .transpose()?
-        .unwrap_or_default();
-    let stderr = child
-        .stderr
-        .take()
-        .map(|stream| read_capped(stream, program))
-        .transpose()?
-        .unwrap_or_default();
+    // The child has exited, so the drains observe EOF and finish; output is
+    // still capped before it is trusted downstream.
+    let stdout = join_drain(stdout_thread, program)?;
+    let stderr = join_drain(stderr_thread, program)?;
     if !status.success() {
         return Err(anyhow!(
             "{program} failed with {}: {}",
@@ -5469,6 +5506,16 @@ mod tests {
         std::os::windows::fs::symlink_file(target, link).is_ok()
     }
 
+    #[cfg(unix)]
+    fn make_symlink_dir(target: &Path, link: &Path) -> bool {
+        std::os::unix::fs::symlink(target, link).is_ok()
+    }
+
+    #[cfg(windows)]
+    fn make_symlink_dir(target: &Path, link: &Path) -> bool {
+        std::os::windows::fs::symlink_dir(target, link).is_ok()
+    }
+
     #[test]
     fn legacy_d01_version_and_expiry_are_present_and_shaped() {
         assert!(!legacy_d01::LEGACY_D01_VERSION.is_empty());
@@ -5788,5 +5835,108 @@ mod tests {
         // Display must render the typed detail, never an empty or Ok path.
         let rendered = format!("{}", CompilerError::NoCurrentBundle { detail: "probe" });
         assert!(rendered.contains("no current sealed bundle"));
+    }
+
+    #[test]
+    fn manifest_walk_skips_symlink_cycles() {
+        let root = temp_dir("manifest-cycle");
+        let real_pkg = root.join("crates/a");
+        must(fs::create_dir_all(&real_pkg), "package dir");
+        must(
+            fs::write(
+                real_pkg.join("Cargo.toml"),
+                "[package]\nname = \"a\"\nversion = \"0.1.0\"\n",
+            ),
+            "manifest",
+        );
+        // A directory link back to the walk root: the old walk followed it
+        // via `is_dir` and recursed without bound (stack overflow, not a
+        // typed FAIL).
+        let link = root.join("cycle");
+        if make_symlink_dir(&root, &link) {
+            assert!(
+                is_symlink_or_reparse(&link),
+                "the cycle link must be observed, never traversed"
+            );
+        }
+        let mut manifests = Vec::new();
+        collect_manifests(&root, &root, &mut manifests);
+        // The walk terminates and reports only the real source root: linked
+        // manifests are never source identity.
+        assert_eq!(manifests, vec!["crates/a/Cargo.toml".to_owned()]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn chatty_cargo_metadata_does_not_deadlock_on_full_pipes() {
+        let root = temp_dir("chatty-metadata");
+        // Enough path-only members that `cargo metadata` output exceeds any
+        // anonymous-pipe buffer by several multiples: the old wait-then-drain
+        // order blocked the child on a full pipe until the 120s timeout.
+        // 174 workspace members emit ~640KB here, so 96 members clear 64KB
+        // with wide margin.
+        let mut members = Vec::new();
+        for index in 0..96 {
+            let dir = root.join(format!("crates/m{index:03}"));
+            must(fs::create_dir_all(&dir), "member dir");
+            must(
+                fs::write(
+                    dir.join("Cargo.toml"),
+                    format!(
+                        "[package]\nname = \"m{index:03}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
+                    ),
+                ),
+                "member manifest",
+            );
+            // Cargo metadata rejects targetless manifests, so each member
+            // carries one trivial source file (never compiled here).
+            let src = dir.join("src");
+            must(fs::create_dir_all(&src), "member src dir");
+            must(
+                fs::write(src.join("lib.rs"), "// fixture\n"),
+                "member source",
+            );
+            members.push(format!("\"crates/m{index:03}\""));
+        }
+        must(
+            fs::write(
+                root.join("Cargo.toml"),
+                format!("[workspace]\nmembers = [{}]\n", members.join(",")),
+            ),
+            "root manifest",
+        );
+        // The allowlisted shape passes `--locked`, so the fixture needs a
+        // lockfile; path-only members resolve offline with no network.
+        let lock = must(
+            Command::new("cargo")
+                .arg("generate-lockfile")
+                .arg("--offline")
+                .current_dir(&root)
+                .output(),
+            "generate lockfile",
+        );
+        assert!(
+            lock.status.success(),
+            "fixture lockfile must generate offline: {}",
+            String::from_utf8_lossy(&lock.stderr)
+        );
+        let started = Instant::now();
+        let raw = must(
+            run_command(&root, RepositoryTool::CargoMetadata),
+            "chatty metadata",
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            raw.len() > 64 * 1024,
+            "fixture must exceed the pipe buffer (got {} bytes)",
+            raw.len()
+        );
+        let metadata: Value = must(serde_json::from_str(&raw), "metadata parses");
+        must(check_json_bounds(&metadata), "metadata within JSON bounds");
+        assert!(
+            elapsed < Duration::from_mins(1),
+            "drained output must return well before the timeout (took {elapsed:?})"
+        );
+        let _ = fs::remove_dir_all(root);
     }
 }
