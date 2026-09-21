@@ -8,9 +8,9 @@
 //! application (`eliotd`, #18). It carries no Kernel, Store, session,
 //! credential, provider, or effect semantics: it decodes one typed setting
 //! chain from TOML/JSON layer documents, resolves the winning value in
-//! canonical precedence order, and rejects lower-layer expansions unless a
-//! live higher-layer delegation covers the requested value within a strict
-//! sub-envelope of the granting layer's own inherited authority.
+//! canonical precedence order, and rejects lower-layer expansions unless each
+//! tighter boundary crossed by the request has an explicit delegation within
+//! the authority inherited from all higher layers.
 //! Arbitrary executable scripts are invalid policy input, never a fallback
 //! configuration source.
 //!
@@ -106,13 +106,12 @@ impl ConfigLayer {
 /// `limit` is the layer's proposed value (`None` = layer abstains and the
 /// running value carries forward). `delegation_ceiling` is an explicit
 /// higher-layer delegation: an interval cap naming how far lower layers may
-/// expand. A grant is live only when it dedicates a strict sub-envelope of
-/// the granting layer's own inherited authority (`ceiling < inherited`); a
-/// ceiling restating the full inherited envelope delegates nothing, so stale
-/// restatements cannot resurrect an envelope a later layer tightened. The
-/// ceiling never raises the granting layer's own value, and abstention
-/// (`limit: None`) mints no authority: a delegation-only layer still grants
-/// at most what it inherited.
+/// expand. A delegation is usable only when its ceiling is within the
+/// authority currently inherited from all higher layers. A later narrowing
+/// layer without a delegation lowers the effective ceiling to its own limit;
+/// an older grant therefore cannot survive an undelegated boundary. The
+/// ceiling never raises the granting layer's own value, and a delegation-only
+/// layer may grant only what it inherited.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LayerInput {
     pub layer: ConfigLayer,
@@ -205,23 +204,15 @@ pub enum PrecedenceError {
 ///
 /// The compiled-defaults layer must seed the chain. Each lower layer carrying
 /// `Some(limit)` narrows (`limit <= running`), repeats (`limit == running`),
-/// or expands (`limit > running`) only when a strictly higher layer's live
-/// delegation covers the requested value: the grant's ceiling, which is an
-/// interval cap, must reach the request, and the grant must dedicate a
-/// strict sub-envelope of the granting layer's own inherited authority. A
-/// ceiling merely restating the inherited envelope is void, so an old
-/// broad-or-exact grant can never override a later tighter nondelegating
-/// boundary: each crossed higher boundary authorizes expansion only through
-/// a live grant made under it. Abstaining layers (`None`) contribute no
-/// value but may still grant within their inherited authority; neither
-/// abstention nor a ceiling mints authority beyond what the layer inherited.
-///
-/// Rationale: representation and semantics agree — `delegation_ceiling`
-/// names the top of a permitted interval, not one exact value — while
-/// provenance (strict sub-envelope liveness) carries the fail-closed
-/// burden. Mandatory exact-equality would reject requests the grantor
-/// explicitly permitted; unbounded `>=` without liveness lets stale
-/// restatements launder expansions.
+/// or expands (`limit > running`) only when the current effective delegation
+/// ceiling covers the requested value. A later narrowing layer with no
+/// explicit delegation replaces that ceiling with its own boundary, so an
+/// older grant cannot cross it. A layer can explicitly delegate an interval
+/// up to its `delegation_ceiling` only within the ceiling it inherited from
+/// higher layers; a full inherited ceiling is valid explicit delegation and
+/// is not a special strict-sub-envelope policy. Abstaining layers (`None`)
+/// contribute no value but may explicitly delegate within their inherited
+/// authority; an invalid over-ceiling claim mints nothing.
 ///
 /// # Errors
 /// Returns [`PrecedenceError`] when the key is unsupported, defaults are
@@ -255,33 +246,32 @@ pub fn resolve_canonical_chain(
         narrowed: false,
         delegated_expansion: false,
     }];
-    // Live grants recorded per processed layer: (order, ceiling). A grant is
-    // live only when its ceiling dedicates a strict sub-envelope of the
-    // granting layer's inherited authority; restatements of the full
-    // envelope are void. A live grant covers a later expansion only from a
-    // strictly higher layer and only up to its ceiling, so neither
-    // self-minted ceilings nor stale grants can launder an expansion past
-    // the actual boundary it would cross.
-    let mut grants: Vec<(u8, u64)> = Vec::new();
+    // Effective authority available to the next lower layer. A delegation
+    // replaces this ceiling only when it is within the ceiling inherited from
+    // above. A narrowing layer without a delegation replaces it with its own
+    // value, retiring older grants at the boundary that just arrived.
+    let mut lower_expansion_ceiling = seed;
     if let Some(seed_input) = inputs
         .iter()
         .find(|input| input.layer == ConfigLayer::CompiledDefaults)
         && let Some(ceiling) = seed_input.delegation_ceiling
-        && ceiling < seed
+        && ceiling <= lower_expansion_ceiling
     {
-        grants.push((ConfigLayer::CompiledDefaults.order(), ceiling));
+        lower_expansion_ceiling = ceiling;
     }
     for layer in ALL_LAYERS.iter().skip(1) {
-        let inherited = running;
         let Some(input) = inputs.iter().find(|input| input.layer == *layer) else {
             continue;
         };
-        if let Some(ceiling) = input.delegation_ceiling
-            && ceiling < inherited
-        {
-            grants.push((layer.order(), ceiling));
-        }
+        let inherited = lower_expansion_ceiling;
+        let previous = running;
+        let delegation = input
+            .delegation_ceiling
+            .filter(|ceiling| *ceiling <= inherited);
         let Some(requested) = input.limit else {
+            if let Some(ceiling) = delegation {
+                lower_expansion_ceiling = ceiling;
+            }
             continue;
         };
         if requested <= running {
@@ -293,27 +283,27 @@ pub fn resolve_canonical_chain(
                 delegated_expansion: false,
             });
             running = requested;
+        } else if requested <= lower_expansion_ceiling {
+            contributions.push(ResolvedContribution {
+                order: layer.order(),
+                layer: layer.name(),
+                applied_value: requested,
+                narrowed: false,
+                delegated_expansion: true,
+            });
+            running = requested;
         } else {
-            let covered = grants
-                .iter()
-                .any(|(order, ceiling)| *order < layer.order() && *ceiling >= requested);
-            if covered {
-                contributions.push(ResolvedContribution {
-                    order: layer.order(),
-                    layer: layer.name(),
-                    applied_value: requested,
-                    narrowed: false,
-                    delegated_expansion: true,
-                });
-                running = requested;
-            } else {
-                return Err(PrecedenceError::ExpansionWithoutDelegation {
-                    layer: layer.name(),
-                    key: key.to_owned(),
-                    current: running,
-                    requested,
-                });
-            }
+            return Err(PrecedenceError::ExpansionWithoutDelegation {
+                layer: layer.name(),
+                key: key.to_owned(),
+                current: running,
+                requested,
+            });
+        }
+        if let Some(ceiling) = delegation {
+            lower_expansion_ceiling = ceiling;
+        } else if requested < previous {
+            lower_expansion_ceiling = requested;
         }
     }
     Ok(ResolvedChain {
@@ -655,8 +645,13 @@ mod tests {
             limit: Some(80),
             delegation_ceiling: Some(90),
         };
+        inputs[4] = LayerInput {
+            layer: ConfigLayer::TaskPolicy,
+            limit: Some(60),
+            delegation_ceiling: Some(90),
+        };
         let chain = resolve_canonical_chain(CANONICAL_SETTING_KEY, &inputs)
-            .expect("delegated expansion must resolve");
+            .expect("every crossed boundary must explicitly delegate");
         assert_eq!(chain.winning_value(), 90);
         assert!(
             chain
@@ -754,9 +749,9 @@ mod tests {
 
     #[test]
     fn stale_exact_grant_cannot_override_later_tighter_boundary() {
-        // Compiled restates its full inherited envelope (100 == 100): the
-        // grant is void. System Owner then tightens to 60, so the session
-        // request for the stale 100 must fail closed.
+        // Compiled explicitly delegates its full 100 envelope. System Owner
+        // then tightens to 60 without delegating, so that later boundary
+        // retires the older grant before the session is evaluated.
         let inputs = vec![
             LayerInput {
                 layer: ConfigLayer::CompiledDefaults,
@@ -785,10 +780,10 @@ mod tests {
     }
 
     #[test]
-    fn abstaining_restatement_grants_nothing() {
-        // An abstaining layer restating the full inherited envelope
-        // (ceiling 100 on inherited 100) mints no authority: after the
-        // System Owner tightens to 60, the session request for 100 fails.
+    fn abstaining_grant_does_not_cross_later_undelegated_boundary() {
+        // An abstaining layer may explicitly delegate its inherited 100
+        // envelope, but System Owner's later 60 boundary has no delegation,
+        // so the session request for 100 fails.
         let inputs = vec![
             LayerInput {
                 layer: ConfigLayer::CompiledDefaults,
@@ -822,10 +817,42 @@ mod tests {
     }
 
     #[test]
+    fn later_undelegated_boundary_retires_older_interval_grant() {
+        // This is the production regression: compiled 100 delegates 90,
+        // System Owner narrows to 60 without delegating, and the session's
+        // stale request for 90 must not reuse the compiled grant.
+        let inputs = vec![
+            LayerInput {
+                layer: ConfigLayer::CompiledDefaults,
+                limit: Some(100),
+                delegation_ceiling: Some(90),
+            },
+            LayerInput {
+                layer: ConfigLayer::SystemOwnerPolicy,
+                limit: Some(60),
+                delegation_ceiling: None,
+            },
+            LayerInput {
+                layer: ConfigLayer::SessionCapabilityToken,
+                limit: Some(90),
+                delegation_ceiling: None,
+            },
+        ];
+        let error = resolve_canonical_chain(CANONICAL_SETTING_KEY, &inputs)
+            .expect_err("a later undelegated boundary must retire the older grant");
+        assert!(
+            error
+                .to_string()
+                .contains("without an explicit higher-layer delegation"),
+            "unexpected: {error}"
+        );
+    }
+
+    #[test]
     fn live_grant_covers_interval_up_to_its_ceiling() {
-        // Installation grants a strict sub-envelope (95 < inherited 100).
-        // System Owner narrows to 80; the task expansion to 90 stays inside
-        // the live grant interval and resolves as delegated.
+        // Installation grants 95, and System Owner explicitly carries that
+        // delegation across its 80 boundary. The task expansion to 90 then
+        // stays inside the current live grant interval.
         let inputs = vec![
             LayerInput {
                 layer: ConfigLayer::CompiledDefaults,
@@ -840,7 +867,7 @@ mod tests {
             LayerInput {
                 layer: ConfigLayer::SystemOwnerPolicy,
                 limit: Some(80),
-                delegation_ceiling: None,
+                delegation_ceiling: Some(95),
             },
             LayerInput {
                 layer: ConfigLayer::TaskPolicy,
@@ -863,8 +890,8 @@ mod tests {
     #[test]
     fn exact_effective_delegation_from_higher_layer_resolves() {
         // Abstaining installation grants exactly 95 within its inherited 100.
-        // System Owner narrows to 80; the task expansion to exactly 95 is
-        // explicitly covered and resolves as delegated.
+        // System Owner explicitly carries that delegation across its 80
+        // boundary, so the task expansion to exactly 95 resolves delegated.
         let inputs = vec![
             LayerInput {
                 layer: ConfigLayer::CompiledDefaults,
@@ -879,7 +906,7 @@ mod tests {
             LayerInput {
                 layer: ConfigLayer::SystemOwnerPolicy,
                 limit: Some(80),
-                delegation_ceiling: None,
+                delegation_ceiling: Some(95),
             },
             LayerInput {
                 layer: ConfigLayer::TaskPolicy,
