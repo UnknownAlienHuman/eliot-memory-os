@@ -1738,6 +1738,7 @@ dependencies = [
  "eliot-skill",
  "eliot-store-api",
  "eliot-task",
+ "eliot-wasm-runtime",
  "eliot-workscope",
  "schemars",
  "serde",
