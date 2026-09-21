@@ -580,9 +580,11 @@ pub fn absence_claim_admissible(
 }
 
 /// Returns a coverage percentage only against a declared complete
-/// denominator with continuous cursors; otherwise returns `None` so
-/// percentages without an explicit gap-free denominator are rejected rather
-/// than rendered.
+/// denominator with continuous cursors and a consistent numerator; otherwise
+/// returns `None` so percentages without an explicit gap-free denominator, or
+/// with more covered units than the denominator declares, are rejected rather
+/// than rendered. A numerator above the denominator is inconsistent evidence,
+/// never a valid claim above 100 %.
 #[allow(clippy::cast_precision_loss)]
 #[must_use]
 pub fn coverage_percentage(
@@ -591,6 +593,9 @@ pub fn coverage_percentage(
     total: u64,
 ) -> Option<f64> {
     if manifest.completeness != CoverageCompleteness::Complete || total == 0 {
+        return None;
+    }
+    if covered > total {
         return None;
     }
     if !manifest
@@ -794,6 +799,14 @@ mod coverage_trace_tests_1936 {
         let mut gapped = complete_manifest();
         gapped.sequence_faults.gaps = 1;
         assert!(coverage_percentage(&gapped, 4, 4).is_none());
+    }
+
+    #[test]
+    fn inconsistent_numerator_is_refused_never_over_one_hundred() {
+        let manifest = complete_manifest();
+        assert_eq!(coverage_percentage(&manifest, 4, 4), Some(100.0));
+        assert!(coverage_percentage(&manifest, 5, 4).is_none());
+        assert!(coverage_percentage(&manifest, 1, 0).is_none());
     }
 
     #[test]
