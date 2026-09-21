@@ -386,3 +386,49 @@ fn foreign_plan_fails_closed_before_planning() {
         Ok(SettledPlanFeedOutcome::Ready(_))
     ));
 }
+
+#[test]
+fn policy_seal_computes_digest_and_validates() {
+    let (_, _, _, _, _, policy) = feed_inputs(false, false);
+    let sealed = eliot_reactive_context_plan::ReactiveDeliveryPolicy::seal(policy)
+        .expect("seal computes the policy digest");
+    assert_eq!(sealed.policy_digest.len(), 64);
+    sealed.validate().expect("sealed policy validates");
+}
+
+#[test]
+fn mutated_policy_digest_rejected_after_seal() {
+    let (_, _, _, _, _, policy) = feed_inputs(false, false);
+    let mut sealed = eliot_reactive_context_plan::ReactiveDeliveryPolicy::seal(policy)
+        .expect("seal computes the policy digest");
+    let replacement = if sealed.policy_digest.starts_with('0') {
+        '1'
+    } else {
+        '0'
+    };
+    sealed
+        .policy_digest
+        .replace_range(0..1, &replacement.to_string());
+    assert!(matches!(
+        sealed.validate(),
+        Err(eliot_context_contracts::ReactiveInputError::DigestMismatch { .. })
+    ));
+}
+
+#[test]
+fn activation_pair_check_accepts_evaluated_pair() {
+    let (_, activation, _, _, _, _) = feed_inputs(false, false);
+    activation
+        .check_pair()
+        .expect("evaluated result belongs to its request");
+}
+
+#[test]
+fn activation_pair_check_rejects_mismatched_request() {
+    let (_, mut activation, _, _, _, _) = feed_inputs(false, false);
+    activation.request.cancelled = true;
+    assert!(matches!(
+        activation.check_pair(),
+        Err(eliot_context_contracts::ReactiveInputError::BindingMismatch { .. })
+    ));
+}
