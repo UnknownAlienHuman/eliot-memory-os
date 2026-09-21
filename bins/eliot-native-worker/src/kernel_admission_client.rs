@@ -22,9 +22,15 @@
 //! of process requests or permits. Transport errors stay transport errors:
 //! they are never mapped to readiness, admission, or success.
 
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
+use eliot_contracts::{EpochId, ResourceGeneration};
 use eliot_cli::kernel_client::{KernelClient, KernelClientError};
+use eliot_kernel_core::{
+    AcceptedCompatibilityEvidence, CapabilityReadiness, HANDSHAKE_ENVELOPE_VERSION,
+    ProcessHealthStatus, expected_seal_tag,
+};
 use eliot_native_worker_core::{
     CheckpointProviderOutcome, CheckpointReceiptFacts, ClaimAdmissionRequest,
     DurableCheckpointPort, DurableCheckpointRequest, DurableReplayPort, DurableRequestDecision,
@@ -108,9 +114,142 @@ pub const NATIVE_WORKER_REPLAY_ACKNOWLEDGE_OPERATION: &str = "native_worker.repl
 /// `transact_json` (which fails closed when no identity was bound).
 pub struct KernelNativeWorkerClient {
     client: KernelClient,
+    runtime_health: KernelRuntimeHealthEvidence,
     registration: Option<NativeWorkerRegistration>,
     claim: Option<NativeWorkerClaim>,
     ready: Option<NativeReadyReport>,
+}
+
+/// Owner-produced health evidence required before this worker can submit any
+/// lifecycle operation.
+///
+/// The authenticated Kernel health reply is a transport boundary, so the
+/// worker keeps the canonical `eliot-kernel-core` projections intact instead
+/// of copying their fields into a local lifecycle model. `module_generation`
+/// and `authority_epoch` are repeated at the reply boundary solely to bind the
+/// accepted evidence to the authenticated session that carried it. The
+/// worker never derives readiness from `status`: capability currency remains
+/// the canonical `ProcessHealthStatus`/`CapabilityReadiness` projection.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct KernelRuntimeHealthEvidence {
+    /// The authenticated front door status; only `OPEN` can continue.
+    status: String,
+    /// Current session authority returned by the Kernel owner.
+    authority_epoch: EpochId,
+    /// Current session generation returned by the Kernel owner.
+    module_generation: ResourceGeneration,
+    /// Persisted result of Kernel-owned compatibility admission.
+    compatibility_evidence: AcceptedCompatibilityEvidence,
+    /// Independent process/generation/cutover and seven-dimension health.
+    process_health: ProcessHealthStatus,
+    /// Capability-specific dimension requirements used for currency.
+    capability_readiness: Vec<CapabilityReadiness>,
+    /// Existing Doctor advertisement is retained as a separate transport
+    /// observation and never promotes the runtime health projection.
+    #[serde(default)]
+    doctor_repair_advertised: bool,
+}
+
+impl KernelRuntimeHealthEvidence {
+    /// Returns the canonical process-health projection retained at connect.
+    #[must_use]
+    pub(crate) const fn process_health(&self) -> &ProcessHealthStatus {
+        &self.process_health
+    }
+
+    /// Returns the canonical capability requirements retained at connect.
+    #[must_use]
+    pub(crate) fn capability_readiness(&self) -> &[CapabilityReadiness] {
+        &self.capability_readiness
+    }
+}
+
+/// Parses and validates the owner-produced runtime health reply.
+///
+/// This is deliberately stricter than JSON shape validation. Serde can
+/// deserialize the canonical projections without running their constructors,
+/// so this boundary rechecks the invariants that matter to a caller: the
+/// accepted seal, the exact session epoch/generation binding, non-empty
+/// capability requirements, and unique capability identities. A missing
+/// producer field is an admission failure before registration, never a
+/// degraded success or a locally synthesized substitute.
+fn validate_kernel_runtime_health(
+    value: &serde_json::Value,
+) -> Result<KernelRuntimeHealthEvidence, NativeWorkerError> {
+    let evidence: KernelRuntimeHealthEvidence = serde_json::from_value(value.clone()).map_err(|error| {
+        NativeWorkerError::KernelAdmissionRequired(format!(
+            "Kernel health response lacks the canonical runtime evidence: {error}"
+        ))
+    })?;
+    if evidence.status != "OPEN" {
+        return Err(NativeWorkerError::KernelAdmissionRequired(
+            "Kernel health handshake was not OPEN".to_owned(),
+        ));
+    }
+    if evidence.compatibility_evidence.envelope_version() != HANDSHAKE_ENVELOPE_VERSION {
+        return Err(NativeWorkerError::KernelAdmissionRequired(
+            "Kernel returned compatibility evidence from an unsupported envelope".to_owned(),
+        ));
+    }
+    if evidence.compatibility_evidence.protocol_version() == 0
+        || evidence.compatibility_evidence.canonical_format_version() == 0
+    {
+        return Err(NativeWorkerError::KernelAdmissionRequired(
+            "Kernel returned zero-valued accepted compatibility versions".to_owned(),
+        ));
+    }
+    if !is_lower_sha256(evidence.compatibility_evidence.contract_set_digest())
+        || !is_lower_sha256(evidence.compatibility_evidence.architecture_source_digest())
+        || !is_lower_sha256(evidence.compatibility_evidence.seal_tag())
+        || expected_seal_tag(evidence.compatibility_evidence.architecture_source_digest())
+            != evidence.compatibility_evidence.seal_tag()
+    {
+        return Err(NativeWorkerError::KernelAdmissionRequired(
+            "Kernel returned compatibility evidence with an invalid normative seal".to_owned(),
+        ));
+    }
+    if evidence.authority_epoch != *evidence.compatibility_evidence.authority_epoch() {
+        return Err(NativeWorkerError::KernelAdmissionRequired(
+            "Kernel compatibility evidence is bound to a foreign authority epoch".to_owned(),
+        ));
+    }
+    if evidence.module_generation != evidence.compatibility_evidence.module_generation() {
+        return Err(NativeWorkerError::KernelAdmissionRequired(
+            "Kernel compatibility evidence is bound to a foreign module generation".to_owned(),
+        ));
+    }
+    if evidence.process_health.process_id().trim().is_empty() {
+        return Err(NativeWorkerError::KernelAdmissionRequired(
+            "Kernel process-health evidence has no process identity".to_owned(),
+        ));
+    }
+    let mut capabilities = BTreeSet::new();
+    for readiness in &evidence.capability_readiness {
+        if readiness.capability().trim().is_empty() || readiness.required_dimensions().is_empty() {
+            return Err(NativeWorkerError::KernelAdmissionRequired(
+                "Kernel capability readiness is missing its required dimensions".to_owned(),
+            ));
+        }
+        if !capabilities.insert(readiness.capability()) {
+            return Err(NativeWorkerError::KernelAdmissionRequired(
+                "Kernel capability readiness repeats a capability identity".to_owned(),
+            ));
+        }
+    }
+    if evidence.capability_readiness.is_empty() {
+        return Err(NativeWorkerError::KernelAdmissionRequired(
+            "Kernel process-health evidence has no capability requirements".to_owned(),
+        ));
+    }
+    Ok(evidence)
+}
+
+fn is_lower_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 /// Builds the EBP request-identity JSON from the admitted handshake snapshot.
@@ -240,13 +379,10 @@ impl KernelNativeWorkerClient {
         let health = client
             .probe()
             .map_err(|error| kernel_admission_error(&error))?;
-        if health.get("status").and_then(serde_json::Value::as_str) != Some("OPEN") {
-            return Err(NativeWorkerError::KernelAdmissionRequired(
-                "Kernel health handshake was not OPEN".to_owned(),
-            ));
-        }
+        let runtime_health = validate_kernel_runtime_health(&health)?;
         Ok(Self {
             client,
+            runtime_health,
             registration: None,
             claim: None,
             ready: None,
@@ -259,6 +395,17 @@ impl KernelNativeWorkerClient {
         registration: &NativeWorkerRegistration,
     ) -> Result<serde_json::Value, NativeWorkerError> {
         registration.validate()?;
+        if registration.authority_epoch != self.runtime_health.authority_epoch
+            || registration.worker_generation != self.runtime_health.module_generation.value()
+            || registration.state_fence.authority_epoch != self.runtime_health.authority_epoch
+            || registration.state_fence.resource_generation
+                != self.runtime_health.module_generation
+        {
+            return Err(NativeWorkerError::KernelAdmissionRequired(
+                "worker registration is not bound to the authenticated Kernel runtime evidence"
+                    .to_owned(),
+            ));
+        }
         let fence_json = serde_json::to_value(&registration.state_fence)?;
         bind_request_identity(
             &mut self.client,
