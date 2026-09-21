@@ -700,6 +700,7 @@ fn check_operation_shape(operation: &str, keys: &[String]) -> Result<(), DecodeR
         "attach" | "invoke" | "cancel" => &["op", "request"],
         "forward_hook" | "forward_event" => &["op", "event"],
         "reconcile_external" | "status" | "stop" => &["op"],
+        "bootstrap" => &["op", "context", "tasks", "requested_assessment"],
         "reconnect" => &[
             "op",
             "expected_connection_id",
