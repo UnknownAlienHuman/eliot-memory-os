@@ -1411,7 +1411,7 @@ fn testd_material_bytes(
 /// `native_worker_lifecycle_route::NATIVE_WORKER_CLAIM_OPERATION`): the
 /// material carries the request/receipt projection, while the record stays
 /// the durable authority for reconcile.
-fn native_worker_material_bytes(
+pub fn native_worker_material_bytes(
     request: &NativeWorkerClaimRequest,
     receipt: &NativeWorkerClaimReceipt,
     epoch: &EpochId,

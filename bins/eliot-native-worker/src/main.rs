@@ -1689,87 +1689,11 @@ mod tests {
         sha256_hex(&bytes)
     }
 
-    /// Mirrors the five carriers emitted by Kernel K1 for the raw dispatch
-    /// fixture below. The carrier JSON is still opaque to the core reader;
-    /// the production worker gate decodes and validates it after the file is
-    /// admitted. The actual Kernel producer is covered by its own writer
-    /// regression; this helper keeps the cross-crate child proof independent
-    /// of a dependency cycle from Kernel back into the worker binary.
-    fn kernel_action_carriers(
-        claim: &NativeWorkerClaim,
-        receipt_digest: &str,
-        grant_digest: &str,
-    ) -> Vec<ActionEnvelopeCarrier> {
-        let fence = serde_json::to_value(&claim.state_fence)
-            .unwrap_or_else(|error| panic!("claim fence encodes: {error:?}"));
-        let epoch = serde_json::to_value(&claim.authority_epoch)
-            .unwrap_or_else(|error| panic!("claim epoch encodes: {error:?}"));
-        let launch_nonce = claim
-            .executable_binding
-            .as_ref()
-            .map(|join| join.launch_nonce.as_str())
-            .unwrap_or_else(|| panic!("kernel fixture claim must carry an executable join"));
-        let derivation_base = serde_json::to_string(&serde_json::json!([
-            "eliot-native-worker-dispatch/v1",
-            claim.claim_id,
-            claim.operation_id,
-            claim.worker_generation,
-            epoch,
-            launch_nonce,
-        ]))
-        .unwrap_or_else(|error| panic!("dispatch derivation encodes: {error:?}"));
-        let authority = format!(
-            "native-worker-dispatch-authority-{}",
-            sha256_hex(format!("authority:{derivation_base}").as_bytes())
-        );
-        ["register", "claim", "reconcile", "start_claimed", "serve_stdio"]
-            .into_iter()
-            .map(|operation| {
-                let envelope = ActionEnvelope {
-                    operation: operation.to_owned(),
-                    intent: format!(
-                        "present the admitted native-worker {operation} operation"
-                    ),
-                    scope_ref: claim.work_scope_id.clone(),
-                    preconditions: format!(
-                        "claim admission, executable join, exact fence, and dispatch grant {grant_digest} are live"
-                    ),
-                    expected_effect: format!(
-                        "one bounded {operation} presentation answered by receipt {receipt_digest}"
-                    ),
-                    invariants:
-                        "the claim fence and authority epoch remain exact; unknown outcomes reconcile by identity"
-                            .to_owned(),
-                    known_failures:
-                        "missing, stale, mismatched, expired, or owner-rejected admission"
-                            .to_owned(),
-                    rollback_or_compensation:
-                        "retain the exact claim and receipt for reconciliation; never replay an unknown effect"
-                            .to_owned(),
-                    verifier: "unknown:post-effect verifier is owned outside Kernel dispatch".to_owned(),
-                    stop_condition:
-                        "stop on any claim, fence, grant, or owner-verdict mismatch".to_owned(),
-                    state_fence: fence.clone(),
-                    authority_epoch: epoch.clone(),
-                    tool_profile: operation.to_owned(),
-                    affected_resources: vec![format!("native-worker-operation:{operation}")],
-                    applicable_authority: authority.clone(),
-                };
-                ActionEnvelopeCarrier {
-                    operation: operation.to_owned(),
-                    envelope_json: serde_json::to_string(&envelope)
-                        .unwrap_or_else(|error| panic!("kernel action envelope encodes: {error:?}")),
-                }
-            })
-            .collect()
-    }
-
-    /// Owner-side stand-in: authors one Kernel launch-grant file exactly as
-    /// the Kernel contour plus the owner publisher would — real digests, a
-    /// real permit over the canonical intent, and the owner-predicted
-    /// invocation digest embedded in the join. Clearly marked: a live Kernel
-    /// plus the Governor publisher own this computation in production; the
-    /// test mirrors it so the child half can prove closure. Returns the
+    /// Builds a deterministic admitted Kernel launch-grant input and writes
+    /// the bytes returned by the real Kernel `native_worker_material_bytes`
+    /// writer. The request, receipt, grant, and action carriers are therefore
+    /// encoded by the producer under test; this helper only supplies typed
+    /// admitted values and the owner-side intent inputs. Returns the
     /// request binding digest, the owner-predicted invocation digest, and
     /// the executable locator.
     #[allow(clippy::too_many_lines)]
@@ -1909,10 +1833,8 @@ mod tests {
         let worker_claim = load(worker_claim.with_computed_digest());
         let binding_digest = worker_claim.binding_digest.clone();
         let receipt_digest = sha256_hex(b"kernel-drive receipt identity stand-in");
-        let action_envelopes =
-            kernel_action_carriers(&worker_claim, &receipt_digest, &grant_digest);
 
-        let request = serde_json::json!({
+        let request_json = serde_json::json!({
             "wire_id": "eliot.kernel.native-worker-claim",
             "wire_version": NATIVE_WORKER_CLAIM_WIRE_VERSION,
             "claim_id": claim_id,
@@ -1949,7 +1871,9 @@ mod tests {
             "binding_digest": binding_digest.clone(),
             "request_digest": sha256_hex(b"kernel-drive request identity stand-in"),
         });
-        let receipt = serde_json::json!({
+        let request: eliot_kernel::NativeWorkerClaimRequest =
+            load(serde_json::from_value(request_json));
+        let receipt_json = serde_json::json!({
             "wire_id": "eliot.kernel.native-worker-claim",
             "wire_version": NATIVE_WORKER_CLAIM_WIRE_VERSION,
             "claim_id": claim_id,
@@ -1963,27 +1887,25 @@ mod tests {
             "admitted_at_unix_ms": now_ms,
             "receipt_digest": receipt_digest,
         });
-        let file = serde_json::json!({
-            "request": request,
-            "receipt": receipt,
-            "epoch": epoch_json,
-            "generation": worker_generation,
-            "nonce": kernel_nonce,
-            "grant": {
-                "grant_digest": grant_digest,
-                "authority_epoch": epoch_json,
-                "fence_generation": grant_fence_generation,
-                "fence_nonce": "native-worker-fence-kernel-drive-1",
-                "idempotency_key": "native-worker-lease-kernel-drive-1",
-                "expires_at": grant_expires_at,
-            },
-            "action_envelopes": action_envelopes,
-        });
-        std::fs::write(
-            staged,
-            serde_json::to_vec(&file).unwrap_or_else(|_| panic!("file json")),
-        )
-        .unwrap_or_else(|_| panic!("stage kernel file"));
+        let receipt: eliot_kernel::NativeWorkerClaimReceipt =
+            load(serde_json::from_value(receipt_json));
+        let grant = eliot_kernel::DispatchGrant {
+            grant_digest,
+            authority_epoch: epoch(),
+            fence_generation: grant_fence_generation,
+            fence_nonce: "native-worker-fence-kernel-drive-1".to_owned(),
+            idempotency_key: "native-worker-lease-kernel-drive-1".to_owned(),
+            expires_at: grant_expires_at,
+        };
+        let bytes = load(eliot_kernel::native_worker_material_bytes(
+            &request,
+            &receipt,
+            &epoch(),
+            worker_generation,
+            kernel_nonce,
+            &grant,
+        ));
+        std::fs::write(staged, bytes).unwrap_or_else(|_| panic!("stage kernel file"));
         (binding_digest, invocation_digest, executable)
     }
 
@@ -2258,6 +2180,98 @@ mod tests {
             Err(AdmittedMaterialError::Binding(_)) => {}
             other => panic!("rewired grant must refuse with Binding, got {other:?}"),
         }
+        let _ = std::fs::remove_file(&staged);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn kernel_produced_material_missing_register_refuses_before_lifecycle_submit() {
+        let now = fake_now_ms();
+        let staged = std::env::temp_dir().join("eliot-kernel-drive-missing-register.json");
+        let (binding, _, _) = write_kernel_grant_file(
+            &staged,
+            &"0".repeat(64),
+            now.saturating_add(120_000),
+            1,
+            now,
+            true,
+        );
+        write_kernel_grant_file(&staged, &binding, now.saturating_add(120_000), 1, now, true);
+
+        // Start with the exact bytes emitted by the Kernel writer, then make
+        // one causal delivery defect: remove only the register carrier. The
+        // remaining four carriers are untouched producer output.
+        let mut json: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&staged).expect("Kernel-produced material is readable"),
+        )
+        .expect("Kernel-produced material is JSON");
+        let carriers = json["action_envelopes"]
+            .as_array()
+            .expect("Kernel writer emitted action carriers");
+        assert_eq!(carriers.len(), 5);
+        let missing_register = carriers
+            .iter()
+            .filter(|carrier| carrier["operation"] != "register")
+            .cloned()
+            .collect::<Vec<_>>();
+        json["action_envelopes"] = serde_json::Value::Array(missing_register);
+        std::fs::write(
+            &staged,
+            serde_json::to_vec(&json).expect("missing-carrier material encodes"),
+        )
+        .expect("missing-carrier material stages");
+
+        let material = read_admitted_material_from(&staged)
+            .expect("missing carrier remains a valid material presentation")
+            .expect("missing-carrier material is present");
+        assert_eq!(material.action_envelopes.len(), 4);
+
+        let claim = material.admission.claim().clone();
+        let replay = load(KernelReplayPort::new(
+            FakeTransport::new(&claim),
+            claim.clone(),
+            material.admission.registration().clone(),
+        ));
+        let authority = load(NativeWorkerDispatchAuthority::new(
+            claim.claim_id.as_str(),
+            claim.operation_id.as_str(),
+            claim.worker_generation,
+            &serde_json::to_value(&claim.authority_epoch).expect("claim epoch JSON"),
+            &material.nonce,
+        ));
+        let core = WorkerCore::new(
+            Some(WindowsProcessExecutor::new(Arc::new(authority))),
+            Some(PresentationEchoAdmission::new()),
+            Some(replay),
+            Some(TestCheckpoint),
+            Some(Arc::new(BoundedEvidenceSink::new())),
+        );
+        let mut worker: KernelDriveWorker = NativeWorker::new(core);
+        let mut lifecycle = FakeLifecycle::new();
+        let (process, _) = build_process(
+            "operation-kernel-drive-missing-register",
+            "claim-kernel-drive-missing-register",
+            Vec::new(),
+            "nonce-kernel-drive-missing-register",
+        );
+        let detail = refusal_detail(
+            block_on(eliot_native_worker::drive_governed_material(
+                &mut lifecycle,
+                &mut worker,
+                &material,
+                process,
+            )),
+            "Kernel-produced material missing register carrier",
+        );
+        assert!(
+            detail.contains("register"),
+            "refusal names register: {detail}"
+        );
+        assert!(
+            lifecycle.registration.is_none() && lifecycle.claim.is_none(),
+            "missing Kernel carrier is refused before lifecycle submission"
+        );
+        assert_eq!(worker.lifecycle(), WorkerLifecycle::Created);
         let _ = std::fs::remove_file(&staged);
     }
 }

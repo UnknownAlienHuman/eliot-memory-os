@@ -2280,6 +2280,7 @@ dependencies = [
  "eliot-agent-opencode",
  "eliot-cli",
  "eliot-contracts",
+ "eliot-kernel",
  "eliot-native-worker-core",
  "eliot-process",
  "eliot-process-executor",
