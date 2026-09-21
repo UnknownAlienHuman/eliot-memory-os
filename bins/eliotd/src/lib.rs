@@ -35,6 +35,7 @@ use std::sync::atomic::Ordering;
 
 mod activation_projection;
 pub mod agent_fabric;
+pub mod canonical_config_precedence;
 pub mod capability_outcome;
 mod controlboard_adapters;
 mod daemon_config;
@@ -44,6 +45,7 @@ pub mod diagnostics;
 mod dreamer_admission;
 mod dreamer_materials;
 mod dreamer_model_adapter;
+mod first_run_wiring;
 mod freshness_admission;
 mod governor_local_read;
 mod kernel_authority_client;
@@ -77,6 +79,12 @@ use controlboard_adapters::SharedOperatorReplay;
 #[cfg(test)]
 use activation_projection::map_activation_snapshot;
 
+pub use canonical_config_precedence::{
+    ALL_LAYERS, CANONICAL_SETTING_KEY, ConfigLayer, LayerInput, PrecedenceError, ResolvedChain,
+    ResolvedContribution, canonical_layer_json_schema, canonical_layer_json_schema_pretty,
+    classify_policy_input, parse_canonical_layer_json, parse_canonical_layer_toml,
+    resolve_canonical_chain,
+};
 pub use capability_outcome::{
     AttemptReceipt, CapabilityOutcome, CapabilityRegistryView, DegradationScope,
     FallbackOutcomeRequest, OutcomeDisposition, OutcomeError, fallback_outcome,
@@ -106,6 +114,10 @@ pub use dreamer_materials::{
 };
 pub use dreamer_model_adapter::{
     DreamerModelExecution, GovernedDreamerModelAdapter, ModelInvokeInput,
+};
+pub use first_run_wiring::{
+    DisabledAutomationOutcome, FirstRunWiringError, inspect_first_run_defaults,
+    recommend_for_disabled_automation, resolve_first_run_routes,
 };
 pub use freshness_admission::{
     CANDIDATE_COMMITTED_PROJECTION_PENDING, CandidateFetchOutcome, CommittedCandidate,
