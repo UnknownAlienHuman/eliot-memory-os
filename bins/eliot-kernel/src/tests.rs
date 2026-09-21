@@ -1336,6 +1336,38 @@ fn bridge_client_first_identity_is_fenced_before_session_creation() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+#[test]
+fn ordinary_session_waits_for_published_front_door_readiness() {
+    let root = std::env::temp_dir().join(format!(
+        "eliot-kernel-front-door-readiness-{}-{}",
+        std::process::id(),
+        unix_ms()
+    ));
+    std::fs::create_dir_all(&root).expect("test work root");
+    let kernel = KernelComposition::new(KernelConfig::new(&root)).expect("kernel composition");
+    let policy = kernel
+        .front_door_policy
+        .lock()
+        .expect("front-door policy")
+        .clone();
+    let mut client = test_client(&policy);
+    client.module_bridge_identity = "ordinary-client".to_owned();
+
+    assert!(matches!(
+        kernel.bind_session(
+            "ordinary-before-ready",
+            PeerIdentity::Unavailable {
+                reason: eliot_ipc::PeerIdentityUnavailable::ProviderProofNotComposed,
+            },
+            &client,
+        ),
+        Err(TransportError::SessionFenced)
+    ));
+
+    drop(kernel);
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[cfg(windows)]
 fn test_daemon_launch(root: &Path) -> EliotdLaunchDescriptor {
     let executable =

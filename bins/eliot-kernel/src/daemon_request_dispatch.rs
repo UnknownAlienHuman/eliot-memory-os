@@ -260,7 +260,11 @@ impl KernelComposition {
                 }
                 self.mark_daemon_ready()
                     .map_err(|_| TransportError::SessionFenced)
-                    .map(|()| Self::accepted_daemon_response())
+                    .and_then(|()| {
+                        self.record_startup_evidence(7)
+                            .map_err(|_| TransportError::SessionFenced)?;
+                        Ok(Self::accepted_daemon_response())
+                    })
             }
             "health" => self
                 .daemon_health()
@@ -1027,6 +1031,7 @@ impl KernelComposition {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -1039,12 +1044,11 @@ mod tests {
         std::fs::create_dir_all(&root).expect("test work root");
         let kernel = KernelComposition::new(KernelConfig::new(&root)).expect("kernel composition");
         let mut backend_called = false;
-        let response = match kernel.normal_write_admission_response() {
-            Some(response) => response,
-            None => {
-                backend_called = true;
-                serde_json::Value::Null
-            }
+        let response = if let Some(response) = kernel.normal_write_admission_response() {
+            response
+        } else {
+            backend_called = true;
+            serde_json::Value::Null
         };
 
         assert!(
@@ -1057,7 +1061,7 @@ mod tests {
             kernel
                 .startup_status(GovernanceProfile::minimal())
                 .blocking_prerequisite,
-            Some("epoch-recovery")
+            Some("store-schema-probe")
         );
 
         drop(kernel);

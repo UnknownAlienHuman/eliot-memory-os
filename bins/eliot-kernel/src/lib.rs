@@ -2018,6 +2018,20 @@ impl KernelComposition {
             .map_err(KernelServiceError::Platform)
     }
 
+    /// Records one real owner-produced I1.11 evidence item. Out-of-order
+    /// evidence is retained without advancing the contiguous readiness cursor;
+    /// missing earlier steps therefore remain blocking and cannot be inferred
+    /// from a later successful probe.
+    pub(crate) fn record_startup_evidence(&self, step: u8) -> Result<(), KernelServiceError> {
+        let mut coordinator = self
+            .startup_coordinator
+            .lock()
+            .map_err(|_| KernelServiceError::Platform("startup gate lock poisoned".to_owned()))?;
+        coordinator
+            .record_live_evidence(step)
+            .map_err(KernelServiceError::Platform)
+    }
+
     /// Records blob large-payload degradation (I1.11 step 4). Never blocks
     /// Material by itself; it is reported in startup status.
     pub fn note_startup_blob_degraded(&self) -> Result<(), KernelServiceError> {

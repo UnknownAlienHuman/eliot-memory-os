@@ -305,6 +305,7 @@ pub struct StartupStatus {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StartupCoordinator {
     completed_step: u8,
+    observed_steps: u16,
     ors_reconciled: bool,
     store_schema_probed: bool,
     epoch_recovered: bool,
@@ -325,6 +326,7 @@ impl StartupCoordinator {
     pub const fn new() -> Self {
         Self {
             completed_step: 0,
+            observed_steps: 0,
             ors_reconciled: false,
             store_schema_probed: false,
             epoch_recovered: false,
@@ -481,13 +483,29 @@ impl StartupCoordinator {
         }
     }
 
-    fn complete_ordered(&mut self, step: u8) -> Result<(), String> {
-        self.require_next(step)?;
-        if step > STARTUP_FINAL_STEP {
+    fn record_step_evidence(&mut self, step: u8) -> Result<(), String> {
+        if !(STARTUP_FIRST_STEP..=STARTUP_FINAL_STEP).contains(&step) {
             return Err(format!("startup step {step} is outside I1.11 steps 1-11"));
         }
-        self.completed_step = step;
+        self.observed_steps |= 1_u16 << step;
+        match step {
+            3 => self.epoch_recovered = true,
+            5 => self.store_schema_probed = true,
+            6 => self.ors_reconciled = true,
+            11 => self.supervision_evidence_complete = true,
+            _ => {}
+        }
+        while self.completed_step < STARTUP_FINAL_STEP
+            && self.observed_steps & (1_u16 << (self.completed_step + 1)) != 0
+        {
+            self.completed_step += 1;
+        }
         Ok(())
+    }
+
+    fn complete_ordered(&mut self, step: u8) -> Result<(), String> {
+        self.require_next(step)?;
+        self.record_step_evidence(step)
     }
 
     /// Completes one I1.11 step in order, setting the mandatory gate that
@@ -523,6 +541,17 @@ impl StartupCoordinator {
             }
             _ => Err(format!("startup step {step} is outside I1.11 steps 1-11")),
         }
+    }
+
+    /// Records evidence produced by a live owner without claiming any missing
+    /// earlier step. The contiguous cursor advances only after every gap is
+    /// separately observed; repeated probe publication is idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Returns the fixed-shape range error when `step` lies outside I1.11.
+    pub(crate) fn record_live_evidence(&mut self, step: u8) -> Result<(), String> {
+        self.record_step_evidence(step)
     }
 
     /// Completes every mandatory gate in I1.11 order (1-11). Test and
@@ -622,6 +651,32 @@ mod tests {
         }
         assert!(full.admit_inspection());
         let _ = &mut full;
+    }
+
+    #[test]
+    fn live_evidence_keeps_unobserved_startup_gaps_blocking() {
+        let mut coordinator = StartupCoordinator::new();
+        coordinator
+            .record_live_evidence(3)
+            .expect("epoch recovery evidence");
+        assert_eq!(coordinator.completed_step(), 0);
+        assert_eq!(
+            coordinator.blocking_prerequisite(),
+            Some(StartupPrerequisite::StoreSchemaProbe)
+        );
+
+        coordinator
+            .record_live_evidence(5)
+            .expect("store schema evidence");
+        coordinator
+            .record_live_evidence(10)
+            .expect("front-door publication evidence");
+        assert_eq!(coordinator.completed_step(), 0);
+        assert_eq!(
+            coordinator.blocking_prerequisite(),
+            Some(StartupPrerequisite::OrsReconciliation)
+        );
+        assert!(!coordinator.admit_inspection());
     }
 
     #[test]

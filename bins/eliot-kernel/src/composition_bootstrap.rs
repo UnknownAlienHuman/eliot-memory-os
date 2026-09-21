@@ -974,6 +974,7 @@ impl KernelComposition {
         )
         .map_err(KernelBuildError::Runtime)?;
         let generation_gateway = OrsGenerationCoordinator::new(ors.clone());
+        let mut startup_coordinator = StartupCoordinator::new();
         let mut service = service;
         service
             .synchronize_authority_epoch(canonical_epoch)
@@ -988,6 +989,9 @@ impl KernelComposition {
                 );
                 KernelBuildError::Ors(error)
             })?;
+        startup_coordinator
+            .record_live_evidence(3)
+            .map_err(KernelBuildError::Service)?;
         observe_entrypoint_with_detail(
             EntrypointStage::Composition,
             "kernel.composition.generation_recovered",
@@ -1029,13 +1033,11 @@ impl KernelComposition {
         // Blob manifest, Store readiness, reconciliation, handshake, mirror,
         // capability, front-door, or supervision evidence. Each later step is
         // advanced only by its owning live probe/publication boundary.
-        let startup_coordinator = {
-            observe_entrypoint_with_detail(
-                EntrypointStage::Composition,
-                "kernel.composition.startup_sequence_initiated:step=0",
-            );
-            Mutex::new(StartupCoordinator::new())
-        };
+        observe_entrypoint_with_detail(
+            EntrypointStage::Composition,
+            "kernel.composition.startup_sequence_initiated:step=0",
+        );
+        let startup_coordinator = Mutex::new(startup_coordinator);
         // F-LOG-KERNEL-2 (#899): constructed composition is not ready. The
         // service starts Cold, the daemon is NotLaunched, and no Store
         // gateway is claimed; readiness requires separate Host handoffs.

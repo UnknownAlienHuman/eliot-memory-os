@@ -489,6 +489,8 @@ impl KernelComposition {
             if after_receipt_readback.as_ref() != Some(expected) {
                 return Err(TransportError::SessionFenced);
             }
+            self.record_startup_evidence(11)
+                .map_err(|_| TransportError::SessionFenced)?;
         }
         #[cfg(windows)]
         let prepared_bridge_profile = if matches!(
@@ -543,6 +545,8 @@ impl KernelComposition {
                 .lock()
                 .map_err(|_| TransportError::SessionFenced)?
                 .publish_ready(receipt.clone())
+                .map_err(|_| TransportError::SessionFenced)?;
+            self.record_startup_evidence(10)
                 .map_err(|_| TransportError::SessionFenced)?;
         } else {
             match &request.command {
