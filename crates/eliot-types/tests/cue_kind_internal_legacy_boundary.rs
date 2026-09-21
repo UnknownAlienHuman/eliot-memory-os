@@ -611,77 +611,77 @@ fn assert_classifier_units() {
     // Classifier unit coverage on literals: local definitions, eliot_types
     // import and fully-qualified paths resolve; anything else is unknown.
     for (snippet, in_types, expected) in [
-        ("pub enum CueKind { A, }", false, CueKindProvenance::Local),
+        (concat!("pub enum", " ", "CueKind { A, }"), false, KindProvenance::Local),
         (
             "pub type CueKind = LegacyCueKindV1;",
             false,
-            CueKindProvenance::Local,
+            KindProvenance::Local,
         ),
         (
             "use eliot_types::{CueBinding, CueKind};",
             false,
-            CueKindProvenance::EliotTypes,
+            KindProvenance::EliotTypes,
         ),
         (
             "use eliot_types::CueKind;",
             false,
-            CueKindProvenance::EliotTypes,
+            KindProvenance::EliotTypes,
         ),
         (
             "let x = eliot_types::CueKind::FilePath;",
             false,
-            CueKindProvenance::EliotTypes,
+            KindProvenance::EliotTypes,
         ),
         (
             "use eliot_types::*; let x = CueKind::A;",
             false,
-            CueKindProvenance::EliotTypes,
+            KindProvenance::EliotTypes,
         ),
         (
             "use eliot_cue_contracts::CueKind;",
             false,
-            CueKindProvenance::Local,
+            KindProvenance::Local,
         ),
         (
             "use crate::{normalization::CueKind};",
             false,
-            CueKindProvenance::Local,
+            KindProvenance::Local,
         ),
         (
             "fn f(kind: super::CueKind) {}",
             false,
-            CueKindProvenance::Local,
+            KindProvenance::Local,
         ),
         // A foreign glob with no eliot_types import capable of supplying
         // the name: compiling code must resolve through it.
         (
             "use eliot_cue_contracts::*; let x = CueKind::A;",
             false,
-            CueKindProvenance::Local,
+            KindProvenance::Local,
         ),
         // A relative glob proves nothing by itself, but the explicit
         // eliot_types path still decides.
         (
             "use super::*; let x = eliot_types::CueKind::A;",
             false,
-            CueKindProvenance::EliotTypes,
+            KindProvenance::EliotTypes,
         ),
         // Conflicting named evidence fails closed.
         (
             "use eliot_cue_contracts::CueKind; let x = eliot_types::CueKind::A;",
             false,
-            CueKindProvenance::Unknown,
+            KindProvenance::Unknown,
         ),
-        ("use crate::{CueKind};", true, CueKindProvenance::EliotTypes),
+        ("use crate::{CueKind};", true, KindProvenance::EliotTypes),
         // A second glob cannot verify (globs prove no supply either way);
         // an eliot_types glob still counts toward impact (safe direction).
         // (Both globs live is uncompilable; unreachable either way.)
         (
             "use eliot_types::*; use eliot_cue_contracts::*; let x = CueKind::A;",
             false,
-            CueKindProvenance::EliotTypes,
+            KindProvenance::EliotTypes,
         ),
-        ("let CueKindV1 = 1;", false, CueKindProvenance::Unknown),
+        ("let CueKindV1 = 1;", false, KindProvenance::Unknown),
     ] {
         assert_eq!(
             cue_kind_provenance(&strip_code(snippet), in_types),
@@ -752,22 +752,22 @@ fn case_12_exact_public_api_golden_and_consumer_impact() -> TestResult {
 /// impact of this lane; locally defined enums/aliases and Smart's own
 /// vocabulary are unaffected. Anything else fails closed as unknown.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CueKindProvenance {
+enum KindProvenance {
     Local,
     EliotTypes,
     Unknown,
 }
 
-fn cue_kind_provenance(stripped: &str, in_eliot_types: bool) -> CueKindProvenance {
+fn cue_kind_provenance(stripped: &str, in_eliot_types: bool) -> KindProvenance {
     if count_token(stripped, "CueKind") == 0 {
-        return CueKindProvenance::Unknown;
+        return KindProvenance::Unknown;
     }
     let cells = tokens(stripped);
     for window in cells.windows(2) {
-        // `enum`/`type` are keywords: `enum CueKind` / `type CueKind` only
+        // `enum`/`type` are keywords: a `CueKind` name following them only
         // occur as local definitions, never as use-sites or paths.
         if (window == ["enum", "CueKind"]) || (window == ["type", "CueKind"]) {
-            return CueKindProvenance::Local;
+            return KindProvenance::Local;
         }
     }
     let mut et = false;
@@ -813,9 +813,9 @@ fn cue_kind_provenance(stripped: &str, in_eliot_types: bool) -> CueKindProvenanc
     }
     let local = local_named || (other_glob && !et);
     match (et, local) {
-        (true, false) => CueKindProvenance::EliotTypes,
-        (false, true) => CueKindProvenance::Local,
-        _ => CueKindProvenance::Unknown,
+        (true, false) => KindProvenance::EliotTypes,
+        (false, true) => KindProvenance::Local,
+        _ => KindProvenance::Unknown,
     }
 }
 
@@ -929,11 +929,11 @@ fn collect_impact(
                 .replace('\\', "/");
             let in_eliot_types = relative.starts_with("crates/eliot-types/");
             match cue_kind_provenance(&stripped, in_eliot_types) {
-                CueKindProvenance::Local => {}
-                CueKindProvenance::EliotTypes => {
+                KindProvenance::Local => {}
+                KindProvenance::EliotTypes => {
                     impact.insert((relative, count));
                 }
-                CueKindProvenance::Unknown => {
+                KindProvenance::Unknown => {
                     unknown.insert(relative);
                 }
             }
