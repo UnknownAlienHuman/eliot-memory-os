@@ -22,6 +22,79 @@ use super::{
     TransportError, caller_binding, probe_ready_state_admitted, route_doctor_repair,
     route_testd_admission, status_frame, unix_ms,
 };
+use eliot_contracts::{canonical_json_bytes, sha256_hex};
+use eliot_kernel_core::{
+    CapabilityReadiness, CompatibilityEnvelope, DurableCompatibilityState, HealthDimensionKind,
+    KernelRuntimeHealthEvidence, NormativePairReceipt, ProcessHealthStatus, ProcessHealthVector,
+    StateMigrationClass, VersionRange, admit_handshake, expected_seal_tag,
+};
+use eliot_runtime_contracts::{GenerationCutoverState, HealthDimension};
+#[cfg(windows)]
+use eliot_runtime_contracts::{LeaseState, SupervisionLeaseVerifier};
+
+const RUNTIME_HEALTH_CAPABILITY: &str = "worker.execute";
+const RUNTIME_HEALTH_ROUTE_SCOPE: &str = "daemon";
+
+/// Computes the I1.12 contract-set digest from the live contract identities.
+///
+/// The tuple order is the wire order for this producer. It is deliberately
+/// made from contract shapes rather than artifact/configuration material, so a
+/// successful digest proves the same public surfaces were admitted on both
+/// sides of the carrier.
+fn runtime_contract_set_digest() -> Result<String, TransportError> {
+    let identities = (
+        eliot_kernel_core::contract_identity().map_err(|_| TransportError::SessionFenced)?,
+        eliot_kernel_service::contract_identity().map_err(|_| TransportError::SessionFenced)?,
+        eliot_protocol::protocol_contract_identity().map_err(|_| TransportError::SessionFenced)?,
+        eliot_runtime_contracts::contract_identity().map_err(|_| TransportError::SessionFenced)?,
+    );
+    let bytes = canonical_json_bytes(&identities).map_err(|_| TransportError::SessionFenced)?;
+    Ok(sha256_hex(&bytes))
+}
+
+/// Runs the Kernel-owned compatibility admission for one authenticated
+/// generation/epoch. The protocol and canonical-format revisions are the
+/// current I1.12 handshake revisions; the contract-set digest is derived
+/// above from the four public owners rather than from a binary or config hash.
+fn runtime_compatibility_evidence(
+    generation: eliot_contracts::ResourceGeneration,
+    authority_epoch: &eliot_contracts::EpochId,
+) -> Result<eliot_kernel_core::AcceptedCompatibilityEvidence, TransportError> {
+    let protocol_range = VersionRange::new(1, 1).map_err(|_| TransportError::SessionFenced)?;
+    let canonical_format_range =
+        VersionRange::new(1, 1).map_err(|_| TransportError::SessionFenced)?;
+    let contract_set_digest = runtime_contract_set_digest()?;
+    let architecture_source_digest = eliot_kernel_core::CURRENT_ARCHITECTURE_SOURCE_DIGEST;
+    let normative_receipt = NormativePairReceipt::new(
+        architecture_source_digest,
+        expected_seal_tag(architecture_source_digest),
+    )
+    .map_err(|_| TransportError::SessionFenced)?;
+    let candidate = CompatibilityEnvelope::new(
+        protocol_range,
+        contract_set_digest.clone(),
+        canonical_format_range,
+        architecture_source_digest,
+        normative_receipt,
+        generation,
+        authority_epoch.clone(),
+        vec![RUNTIME_HEALTH_CAPABILITY.to_owned()],
+        Vec::new(),
+        StateMigrationClass::NoMigration,
+    )
+    .map_err(|_| TransportError::SessionFenced)?;
+    let durable = DurableCompatibilityState::new(
+        protocol_range,
+        contract_set_digest,
+        canonical_format_range,
+        architecture_source_digest,
+        authority_epoch.clone(),
+        vec![RUNTIME_HEALTH_CAPABILITY.to_owned()],
+        StateMigrationClass::NoMigration,
+    )
+    .map_err(|_| TransportError::SessionFenced)?;
+    admit_handshake(&candidate, &durable).map_err(|_| TransportError::SessionFenced)
+}
 
 fn observe_frame(event: &'static str, outcome: &'static str) {
     use super::kernel_diagnostics::{KERNEL_DIAGNOSTICS_TARGET, bound_field};
@@ -56,6 +129,233 @@ fn frame_terminal_code(error: &TransportError) -> &'static str {
 }
 
 impl KernelComposition {
+    /// Projects one authenticated runtime-health carrier from the live Kernel
+    /// owners. Every receipt is read and validated before it reaches the
+    /// transport; the session is only used to bind the projection to the
+    /// server policy's current generation and exact authority epoch.
+    fn runtime_health_payload(
+        &self,
+        session: &Session,
+    ) -> Result<serde_json::Value, TransportError> {
+        let policy_generation = {
+            let policy = self
+                .front_door_policy
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            let generation = policy.module_generation.clone();
+            if session.module_generation.generation != generation.generation
+                || session.module_generation.artifact_id != generation.artifact_id
+                || session.module_generation.state_fence != generation.state_fence
+                || !session
+                    .authority_epoch
+                    .is_same_authority(&generation.state_fence.authority_epoch)
+            {
+                return Err(TransportError::SessionFenced);
+            }
+            generation
+        };
+        policy_generation
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+
+        let (candidate, activation, ready) = {
+            let service = self
+                .service
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            if service.state() != KernelServiceState::Ready {
+                return Err(TransportError::SessionFenced);
+            }
+            let candidate = service
+                .candidate_binding()
+                .cloned()
+                .ok_or(TransportError::SessionFenced)?;
+            let activation = service
+                .activation_receipt()
+                .cloned()
+                .ok_or(TransportError::SessionFenced)?;
+            let ready = service
+                .ready_receipt()
+                .cloned()
+                .ok_or(TransportError::SessionFenced)?;
+            (candidate, activation, ready)
+        };
+
+        candidate
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if !candidate
+            .kernel_epoch
+            .is_same_authority(&policy_generation.state_fence.authority_epoch)
+            || !activation
+                .authority_epoch
+                .is_same_authority(&policy_generation.state_fence.authority_epoch)
+            || activation.generation != policy_generation.generation
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        ready
+            .validate(&candidate, &activation)
+            .map_err(|_| TransportError::SessionFenced)?;
+        // The receipt carries both the process observation and Kernel health.
+        // They must agree before the producer collapses them into the one
+        // canonical six-dimensional health vector.
+        if ready.process.health != ready.health {
+            return Err(TransportError::SessionFenced);
+        }
+
+        let compatibility = runtime_compatibility_evidence(
+            policy_generation.generation,
+            &policy_generation.state_fence.authority_epoch,
+        )?;
+        let cutover_state = self.runtime_cutover_state(
+            policy_generation.generation,
+            &policy_generation.state_fence.authority_epoch,
+        );
+        let process_health = ProcessHealthStatus::new(
+            ready.process.process_id.as_str().to_owned(),
+            ready.process.state,
+            ProcessHealthVector::new(
+                ready.process.health,
+                self.runtime_supervision_coverage(&candidate, &policy_generation),
+            ),
+            policy_generation.state,
+            cutover_state,
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
+        let capability_readiness = CapabilityReadiness::new(
+            RUNTIME_HEALTH_CAPABILITY,
+            vec![
+                HealthDimensionKind::Liveness,
+                HealthDimensionKind::Readiness,
+                HealthDimensionKind::Compatibility,
+                HealthDimensionKind::Integrity,
+                HealthDimensionKind::Capacity,
+                HealthDimensionKind::SupervisionCoverage,
+            ],
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
+        let evidence = KernelRuntimeHealthEvidence::new(
+            "OPEN",
+            policy_generation.state_fence.authority_epoch,
+            policy_generation.generation,
+            compatibility,
+            eliot_kernel_core::CURRENT_NORMATIVE_PAIR_KEY,
+            eliot_kernel_core::CURRENT_IMPLEMENTATION_SOURCE_DIGEST,
+            process_health,
+            vec![capability_readiness],
+            super::dispatch_launch::doctor_repair_advertised(),
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
+        serde_json::to_value(evidence).map_err(|_| TransportError::SessionFenced)
+    }
+
+    /// Only an ORS record for this authenticated daemon generation and epoch
+    /// can complete the carrier's independent cutover state. An empty, stale,
+    /// unrelated, or unreadable projection remains explicitly Preparing.
+    fn runtime_cutover_state(
+        &self,
+        generation: eliot_contracts::ResourceGeneration,
+        authority_epoch: &eliot_contracts::EpochId,
+    ) -> GenerationCutoverState {
+        let Ok(cutovers) = self
+            .generation_gateway
+            .ors
+            .latest_generation_cutovers(eliot_ors::MAX_RECOVERY_PAGE)
+        else {
+            return GenerationCutoverState::Preparing;
+        };
+        if cutovers.iter().any(|snapshot| {
+            let record = snapshot.record();
+            record.route_scope == RUNTIME_HEALTH_ROUTE_SCOPE
+                && record.state == GenerationCutoverState::Committed
+                && record.new_generation == generation
+                && record.new_epoch.value() == authority_epoch.sequence.get()
+        }) {
+            GenerationCutoverState::Completed
+        } else {
+            GenerationCutoverState::Preparing
+        }
+    }
+
+    /// Reads the current signed supervision lease when the Windows authority
+    /// is composed. Missing or stale supervision is represented as Unknown;
+    /// the worker capability explicitly requires this dimension, so it cannot
+    /// turn an absent watchdog proof into admission.
+    fn runtime_supervision_coverage(
+        &self,
+        candidate: &eliot_kernel_service::HostKernelCandidateBinding,
+        generation: &eliot_runtime_contracts::ModuleGeneration,
+    ) -> HealthDimension {
+        #[cfg(not(windows))]
+        {
+            let _ = (candidate, generation);
+            return HealthDimension::Unknown;
+        }
+
+        #[cfg(windows)]
+        {
+            let Some(authority) = self.supervision_lease_authority.as_ref() else {
+                return HealthDimension::Unknown;
+            };
+            let lease_id = candidate
+                .supervision_incarnation
+                .supervision_lease_id
+                .as_str();
+            let Ok(Some(snapshot)) = authority.current_snapshot(lease_id) else {
+                return HealthDimension::Unknown;
+            };
+            if snapshot.validate().is_err()
+                || snapshot.record.lease_id.as_str() != lease_id
+                || snapshot.record.state != LeaseState::Active
+                || snapshot.record.projection != eliot_ors::SupervisionLeaseProjection::Active
+            {
+                return HealthDimension::Unknown;
+            }
+            let Ok(context) = snapshot.active_verification_context(
+                authority.trust_anchor().public_key_fingerprint(),
+                super::unix_ms(),
+            ) else {
+                return HealthDimension::Unknown;
+            };
+            if authority
+                .trust_anchor()
+                .verify(&snapshot.record.artifact, &context)
+                .is_err()
+            {
+                return HealthDimension::Unknown;
+            }
+            let binding = &snapshot.record.binding;
+            let Ok(expected_scope_ref) = candidate.supervision_incarnation.derived_scope_ref()
+            else {
+                return HealthDimension::Unknown;
+            };
+            if binding.scope_ref.as_str() != expected_scope_ref
+                || binding.observation_scope != candidate.supervision_incarnation.observation_scope
+                || binding.wake_policy != candidate.supervision_incarnation.wake_policy
+                || binding.installation_id.as_str() != candidate.installation_id.as_str()
+                || binding.host_epoch.value() != candidate.host_epoch.value()
+                || binding.activation_id.as_str() != candidate.activation_id.as_str()
+                || binding.activation_generation != generation.generation
+                || !binding
+                    .kernel_epoch
+                    .is_same_authority(&generation.state_fence.authority_epoch)
+                || binding.watchdog_epoch.value()
+                    != candidate.supervision_incarnation.watchdog_epoch.sequence
+                || binding.state_fence != generation.state_fence
+                || binding.generation_binding.target_id != generation.artifact_id.as_str()
+                || binding.generation_binding.target_generation != generation.generation
+                || binding.generation_binding.module_id != generation.module_id.as_str()
+                || binding.generation_binding.module_generation != generation.generation
+                || binding.generation_binding.process_generation != generation.generation
+                || binding.generation_binding.process_id.trim().is_empty()
+            {
+                return HealthDimension::Unknown;
+            }
+            HealthDimension::Healthy
+        }
+    }
+
     /// Runs the currently admitted, deliberately closed semantic gateway.
     ///
     /// Heartbeats are handled locally. Other validated frames, including
@@ -139,22 +439,12 @@ impl KernelComposition {
         }
 
         if frame.kind == FrameKind::Heartbeat && frame.message_type == MessageType::Health {
+            let payload = self.runtime_health_payload(session)?;
             return Ok(KernelFrameAction::Reply(status_frame(
                 session,
                 FrameKind::Heartbeat,
                 MessageType::Health,
-                serde_json::json!({
-                    "status": "OPEN",
-                    "authority_epoch": session.authority_epoch,
-                    // Doctor advertisement through the real composed
-                    // front-door owner (DISPATCH-CONTOUR-2 Slice B): true
-                    // exactly when the contour cell holds the production
-                    // ledger, a non-empty immutable registry, and the
-                    // principal owner. The one-shot Doctor's advertise
-                    // probe reads this key fail-closed.
-                    "doctor_repair_advertised":
-                        super::dispatch_launch::doctor_repair_advertised(),
-                }),
+                payload,
             )?));
         }
 
