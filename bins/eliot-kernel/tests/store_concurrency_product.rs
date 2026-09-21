@@ -26,27 +26,40 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use eliot_contracts::{
-    ClockReading, EpochId, EpochLineageId, OperationId, ProductId, RequestId, ResourceGeneration,
-    SourceId, StateFence,
+    AuthorityEpoch, ClockReading, EpochId, EpochLineageId, OperationId, ProductId, RequestId,
+    ResourceGeneration, SourceId, StateFence,
 };
-use eliot_ipc::{DeliveryOutcome, TransportLimits};
+use eliot_ipc::{NamedPipeServer, NamedPipeTransport, PeerIdentity, TransportLimits};
+use eliot_kernel_core::{GenerationRoute, RouteScope};
 use eliot_kernel_service::{
-    EbpCanonicalStoreClient, EbpStoreTransport, HostStoreBootstrapRequirement, StoreClientError,
+    CompositionReservation, EbpCanonicalStoreClient, HostFileIdentity, HostJobBinding,
+    HostJobIdentity, HostJobRoot, HostKernelCandidateBinding, HostProcessBinding,
+    HostStoreBootstrapRequirement, KernelActivationPermit, KernelControlCommand,
+    KernelReadyReceipt, KernelService, KernelServiceState, KernelStoreGateway, ObservedHead,
+    ProcessObservation, RESERVATION_KEY_NAME, RESERVATION_KEY_PROVIDER, RESERVATION_VISIBILITY,
+    ReservationSeed, RestartBudget,
 };
-use eliot_platform::PlatformHandle;
+use eliot_ors::test_support::KernelRouteStoreFixture;
+use eliot_platform::{KernelActivationNonce, PlatformHandle};
 use eliot_platform_windows::WindowsPlatform;
-use eliot_protocol::{Frame, FrameKind, ProtocolVersion, ServerHello};
+use eliot_protocol::{FrameKind, ProtocolVersion, ServerHello};
+use eliot_runtime_contracts::{
+    HealthVector, RegisteredActivityWakePolicy, ServiceProcessState, SupervisionJournalEpoch,
+    SupervisionLeaseIncarnationBinding, SupervisionObservationScope,
+};
 use eliot_store_api::{
     CONTRACT_VERSION, CanonicalRequestView, CanonicalStoreClient, EffectClass,
     EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
-    OperationId as ApiOperationId, OperationIdentity, OrderingScopeId, PreparedTransition,
-    RequestMeta, ScopeId, SecurityContext, StoreRecoveryRequest, TransitionClass, WriteReceipt,
-    WriteReceiptStatus, canonical_request_hash, generated_operation_manifests,
-    operation_manifest_set_digest, validate_store_receipt_envelope,
+    OperationId as ApiOperationId, OperationIdentity, OrderingHeadExpectation, OrderingScopeId,
+    PreparedTransition, RequestMeta, RevisionHeadExpectation, RevisionKey, ScopeId,
+    SecurityContext, StoreRecoveryRequest, TransitionClass, WriteReceipt, WriteReceiptStatus,
+    canonical_request_hash, generated_operation_manifests, operation_manifest_set_digest,
+    validate_store_receipt_envelope,
 };
 use eliot_store_memory::MemoryStore;
 use eliot_store_surreal_adapter::{
@@ -469,6 +482,442 @@ fn assert_committed(operation: &str, receipt: &WriteReceipt) {
         format!("event-{operation}"),
         "event identity derives from the admitted operation"
     );
+}
+
+/// Head digest per scope for ORS seed observations. The fixture evidence
+/// checks shape only (64 lowercase hex); the adapter matches by sequence,
+/// so these labels stay fixed while sequences come from live history.
+fn head_digest(scope: &str) -> String {
+    let byte = match scope {
+        "scope-994-a" | "scope-994-pulse-a" => b'a',
+        "scope-994-pulse-b" => b'b',
+        _ => b'c',
+    };
+    std::iter::repeat_n(byte as char, 64).collect()
+}
+
+/// Reserved-write inputs for the canonical Kernel route: the shared
+/// `admitted` transition re-sourced to the active daemon caller (the
+/// gateway admits only `eliotd`) and re-sealed over the exact expected
+/// heads, plus the ORS reservation seed covering the same scopes.
+/// Fresh scopes declare sequence 1 / revision 1, the only values a fresh
+/// store accepts (`check_expected_orderings`, `check_expected_revisions`).
+fn reserved_inputs(
+    operation: &str,
+    scope: &str,
+    subject: &str,
+    expected_sequence: u64,
+) -> (
+    RequestMeta,
+    PreparedTransition,
+    Vec<RevisionHeadExpectation>,
+    Vec<OrderingHeadExpectation>,
+    ReservationSeed,
+) {
+    let (mut ctx, mut transition) = admitted(operation, scope, subject);
+    ctx.source_id = SourceId::new("eliotd").expect("daemon caller");
+    let revision = vec![RevisionHeadExpectation {
+        key: RevisionKey::new(format!("rev-994-{operation}")).expect("revision key"),
+        expected_revision: 1,
+        state_fence: fence(),
+    }];
+    let ordering = vec![OrderingHeadExpectation {
+        scope: OrderingScopeId::new(scope).expect("ordering scope"),
+        expected_sequence,
+        state_fence: fence(),
+    }];
+    transition.identity.canonical_request_hash = canonical_request_hash(
+        &CanonicalRequestView::from_apply(&ctx, &transition, &revision, &ordering),
+    )
+    .expect("request hash");
+    let now_ms = i64::try_from(unix_ms_now()).expect("wall clock fits");
+    let seed = ReservationSeed {
+        reservation_id: format!("reservation-994-{operation}"),
+        operation_id: operation.to_owned(),
+        recovery_owner: "recovery-owner-994".to_owned(),
+        payload_bytes: format!("payload-994-{operation}").into_bytes(),
+        key_provider: RESERVATION_KEY_PROVIDER.to_owned(),
+        key_name: RESERVATION_KEY_NAME.to_owned(),
+        visibility: RESERVATION_VISIBILITY.to_owned(),
+        created_at_ms: now_ms,
+        known_at_ms: now_ms,
+        expires_at_ms: now_ms + 600_000,
+        heads: vec![ObservedHead {
+            scope: scope.to_owned(),
+            expected_sequence,
+            expected_head_digest: head_digest(scope),
+            revision_head: None,
+        }],
+    };
+    (ctx, transition, revision, ordering, seed)
+}
+
+fn supervision_incarnation() -> SupervisionLeaseIncarnationBinding {
+    SupervisionLeaseIncarnationBinding {
+        supervision_lease_scope_id: "eliot-supervision-scope:v1:994".to_owned(),
+        supervision_lease_id: String::new(),
+        scope_ref_digest: String::new(),
+        installation_id: "installation-994".to_owned(),
+        host_epoch: SupervisionJournalEpoch {
+            lineage_id: "host-lineage-994".to_owned(),
+            sequence: 1,
+        },
+        activation_id: "activation-994".to_owned(),
+        activation_generation: SupervisionJournalEpoch {
+            lineage_id: "activation-lineage-994".to_owned(),
+            sequence: 1,
+        },
+        kernel_generation: SupervisionJournalEpoch {
+            lineage_id: "kernel-lineage-994".to_owned(),
+            sequence: 1,
+        },
+        watchdog_epoch: SupervisionJournalEpoch {
+            lineage_id: "watchdog-lineage-994".to_owned(),
+            sequence: 1,
+        },
+        observation_scope: SupervisionObservationScope {
+            targets: vec!["eliot-kernel".to_owned()],
+            sensor_profile: "eliot-runtime-live-v3".to_owned(),
+            claimed_coverage: vec!["process".to_owned(), "job".to_owned()],
+            governance_axis: "runtime-live-v3".to_owned(),
+        },
+        wake_policy: RegisteredActivityWakePolicy::Disabled,
+        predecessor: None,
+    }
+    .with_derived_ids()
+    .expect("valid test incarnation")
+}
+
+fn candidate_binding() -> HostKernelCandidateBinding {
+    HostKernelCandidateBinding {
+        installation_id: PlatformHandle::new("installation-994").expect("installation"),
+        host_epoch: AuthorityEpoch::new(1).expect("host epoch"),
+        kernel_epoch: epoch(1),
+        activation_id: PlatformHandle::new("activation-994").expect("activation"),
+        artifact_hash: PlatformHandle::new("artifact-994").expect("artifact"),
+        config_hash: PlatformHandle::new("config-994").expect("config"),
+        job_object_id: PlatformHandle::new("Local\\Eliot-Host-Kernel-994").expect("job"),
+        pipe_identity: PlatformHandle::new("\\\\.\\pipe\\eliot-kernel-994").expect("pipe"),
+        host_process: HostProcessBinding {
+            process_id: 7,
+            start_time_100ns: 9,
+            image_path: "C:\\eliot\\host.exe".to_owned(),
+        },
+        job_binding: HostJobBinding {
+            job: HostJobIdentity {
+                name: "Local\\Eliot-Host-Kernel-994".to_owned(),
+            },
+            root: HostJobRoot {
+                process: HostProcessBinding {
+                    process_id: 42,
+                    start_time_100ns: 10,
+                    image_path: "C:\\eliot\\kernel.exe".to_owned(),
+                },
+                executable: HostFileIdentity {
+                    volume_serial_number: 1,
+                    file_index: 2,
+                },
+            },
+        },
+        supervision_incarnation: supervision_incarnation(),
+        restart_budget: RestartBudget::new(1, 1).expect("restart budget"),
+        agent_bridge_admission: None,
+        containment_action: None,
+    }
+}
+
+/// Drives a real `KernelService` to `Ready` so the gateway binds live
+/// authority. The widened front-door capacities mirror the 994 lanes
+/// profile: independent scopes need parallel bounded send windows.
+fn ready_service() -> KernelService {
+    let mut service = KernelService::new([9; 32], 8, 16).expect("kernel service");
+    let candidate = candidate_binding();
+    let permit = KernelActivationPermit {
+        operation_id: PlatformHandle::new("activation-operation-994").expect("operation"),
+        candidate_binding_digest: candidate.compute_digest().expect("candidate digest"),
+        prior_kernel_disposition_digest: "b".repeat(64),
+        journal_transaction_id: PlatformHandle::new("journal-transaction-994").expect("journal"),
+        journal_sequence: 7,
+        generation: ResourceGeneration::genesis(),
+        authority_epoch: candidate.kernel_epoch.clone(),
+        activation_nonce: KernelActivationNonce::new(
+            PlatformHandle::new(&"a".repeat(64)).expect("nonce handle"),
+        )
+        .expect("activation nonce"),
+    };
+    service.reconcile(candidate.clone()).expect("reconcile");
+    service.apply(KernelControlCommand::Shadow).expect("shadow");
+    service
+        .apply(KernelControlCommand::PrepareHandoff)
+        .expect("handoff");
+    let activation = service
+        .activate_permit(&permit, ResourceGeneration::genesis(), "c".repeat(64))
+        .expect("activation");
+    let ready = KernelReadyReceipt {
+        activation_id: candidate.activation_id.clone(),
+        activation_operation_id: activation.operation_id.clone(),
+        activation_nonce_digest: activation.activation_nonce_digest.clone(),
+        process: ProcessObservation {
+            process_id: PlatformHandle::new("pid:42:start:10").expect("process"),
+            job_object_id: candidate.job_object_id.clone(),
+            state: ServiceProcessState::Ready,
+            health: HealthVector::healthy(),
+            evidence_refs: vec![PlatformHandle::new("process-evidence-994").expect("evidence")],
+        },
+        health: HealthVector::healthy(),
+        evidence_refs: vec![PlatformHandle::new("ready-994").expect("evidence")],
+    };
+    service.publish_ready(ready).expect("ready");
+    assert_eq!(service.state(), KernelServiceState::Ready);
+    service
+}
+
+struct KernelRoute {
+    gateway: Arc<KernelStoreGateway>,
+    fixture: KernelRouteStoreFixture,
+    reserved_sends: Arc<AtomicUsize>,
+    server_task: tokio::task::JoinHandle<()>,
+    dir: PathBuf,
+}
+
+/// Frame pump from the real named-pipe EBP connection into the live
+/// Surreal adapter. Control/readiness follow the production handshake;
+/// `ReservedWrite` executes against the installed concurrent generation
+/// (the only path the adapter admits for reserved writes); `Receipt`
+/// reconciles by identity. `Apply` panics: the canonical route under test
+/// never falls back to unreserved writes.
+async fn serve_store_route(
+    mut server: NamedPipeServer,
+    connection_id: String,
+    artifact_hash: String,
+    config_hash: String,
+    adapter: Arc<SurrealStoreAdapter>,
+    reserved_sends: Arc<AtomicUsize>,
+) {
+    let limits = TransportLimits::default();
+    let frame = server
+        .receive_frame(limits)
+        .await
+        .expect("994 route hello arrives");
+    assert_eq!(
+        frame.kind,
+        FrameKind::Control,
+        "994 route expects EBP hello"
+    );
+    let hello = ServerHello {
+        selected_protocol: ProtocolVersion::CURRENT,
+        session_principal_binding: "sconc994-route-store-session".to_owned(),
+        allowed_capabilities: eliot_store_api::CAPABILITIES
+            .iter()
+            .map(|value| (*value).to_owned())
+            .collect(),
+        allowed_effects: eliot_store_api::EFFECTS
+            .iter()
+            .map(|value| (*value).to_owned())
+            .collect(),
+        config_snapshot: json!({
+            "config_hash": config_hash,
+            "artifact_hash": artifact_hash,
+        }),
+        heartbeat_ms: 1_000,
+        control_channel: "sconc994-route-control".to_owned(),
+        rejection_reason: None,
+        authority_epoch: epoch(1),
+    };
+    server
+        .send_frame(
+            &eliot_ipc::server_hello_frame(&connection_id, &hello)
+                .expect("994 route hello encodes"),
+            limits,
+        )
+        .await
+        .expect("994 route hello sends");
+    let frame = server
+        .receive_frame(limits)
+        .await
+        .expect("994 route readiness arrives");
+    let (request_id, _, store_request) =
+        eliot_store_api::decode_request_frame(&frame).expect("994 route readiness decodes");
+    assert!(
+        matches!(store_request, eliot_store_api::StoreRequest::Readiness),
+        "994 route expects readiness"
+    );
+    server
+        .send_frame(
+            &eliot_store_api::response_frame(
+                connection_id.clone(),
+                ProtocolVersion::CURRENT,
+                Some(request_id),
+                eliot_store_api::StoreResponse::Readiness {
+                    receipt: eliot_store_api::ReadinessReceipt::ready(
+                        "kernel-route-994".to_owned(),
+                    ),
+                },
+            )
+            .expect("994 route readiness encodes"),
+            limits,
+        )
+        .await
+        .expect("994 route readiness sends");
+    loop {
+        let next =
+            tokio::time::timeout(Duration::from_secs(30), server.receive_frame(limits)).await;
+        let Ok(Ok(frame)) = next else {
+            break;
+        };
+        let Ok((request_id, _, store_request)) = eliot_store_api::decode_request_frame(&frame)
+        else {
+            break;
+        };
+        let answer = match store_request {
+            eliot_store_api::StoreRequest::ReservedWrite { request } => {
+                reserved_sends.fetch_add(1, Ordering::SeqCst);
+                match CanonicalStoreClient::apply_reserved_write(adapter.as_ref(), request).await {
+                    Ok(receipt) => eliot_store_api::StoreResponse::Transaction { receipt },
+                    Err(error) => panic!("994 route reserved execution failed: {error:?}"),
+                }
+            }
+            eliot_store_api::StoreRequest::Receipt { operation_id } => {
+                let receipt = adapter
+                    .reconcile(operation_id)
+                    .await
+                    .unwrap_or_else(|error| panic!("994 route reconcile failed: {error:?}"));
+                eliot_store_api::StoreResponse::Receipt { receipt }
+            }
+            eliot_store_api::StoreRequest::Apply { .. } => {
+                panic!("994 route must never fall back to unreserved Apply");
+            }
+            _ => panic!("994 route received an unexpected request kind"),
+        };
+        let Ok(frame) = eliot_store_api::response_frame(
+            connection_id.clone(),
+            ProtocolVersion::CURRENT,
+            Some(request_id),
+            answer,
+        ) else {
+            break;
+        };
+        if server.send_frame(&frame, limits).await.is_err() {
+            break;
+        }
+    }
+}
+
+/// Composes the real Kernel to ORS to Store route for one case: a `Ready`
+/// KernelService, a real named-pipe EBP connection pumping frames into the
+/// live Surreal adapter, and the `KernelRouteStoreFixture` ORS bound into
+/// the gateway — the constructible runtime + gateway handle #2031 vended.
+async fn kernel_route(case: &str, adapter: Arc<SurrealStoreAdapter>) -> KernelRoute {
+    let nanos = unix_ms_now();
+    let serial = HARNESS_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("eliot-994-kr-{case}-{serial}-{nanos}"));
+    std::fs::create_dir_all(&dir).expect("994 route temp root");
+    let pipe = format!(r"\\.\pipe\eliot\store-994-kr-{case}-{serial}-{nanos}");
+    let expectation = eliot_platform_windows::current_process_named_pipe_expectation()
+        .expect("994 route loopback expectation");
+    let server = NamedPipeServer::create(&pipe, &expectation).expect("994 route server");
+    let client_pipe = pipe.clone();
+    let client_expectation = expectation.clone();
+    let client_task = tokio::spawn(async move {
+        NamedPipeTransport::connect_authenticated(
+            &client_pipe,
+            Duration::from_secs(10),
+            &client_expectation,
+        )
+        .await
+        .expect("994 route loopback connects")
+    });
+    let mut server = server;
+    server
+        .wait_for_authenticated_client(Duration::from_secs(10), &expectation)
+        .await
+        .expect("994 route loopback admits its own process");
+    let transport = client_task.await.expect("994 route client task");
+    let (peer_sid, peer_session) = match transport.peer_identity() {
+        PeerIdentity::Authenticated {
+            user_identity,
+            session_identity,
+            ..
+        } => (user_identity.clone(), session_identity.clone()),
+        PeerIdentity::Unavailable { .. } => {
+            panic!("994 route loopback peer is not authenticated")
+        }
+    };
+    let requirement = HostStoreBootstrapRequirement {
+        route_identity: PlatformHandle::new("store_bridge").expect("route"),
+        canonical_pipe_identity: PlatformHandle::new(&pipe).expect("pipe"),
+        store_generation: ResourceGeneration::genesis(),
+        state_fence: fence(),
+        launch_nonce: PlatformHandle::new(format!("launch-994-kr-{case}")).expect("nonce"),
+        connection_id: PlatformHandle::new(format!("conn-994-kr-{case}")).expect("conn"),
+        expected_peer_sid: PlatformHandle::new(&peer_sid).expect("sid"),
+        expected_peer_session_id: peer_session.parse().expect("session"),
+        approved_artifact_hash: PlatformHandle::new("a".repeat(64)).expect("artifact"),
+        approved_config_hash: PlatformHandle::new("b".repeat(64)).expect("config"),
+        timeout_ms: 30_000,
+    };
+    let artifact = requirement.approved_artifact_hash.as_str().to_owned();
+    let config = requirement.approved_config_hash.as_str().to_owned();
+    let connection_id = requirement.connection_id.as_str().to_owned();
+    let reserved_sends = Arc::new(AtomicUsize::new(0));
+    let server_task = tokio::spawn(serve_store_route(
+        server,
+        connection_id,
+        artifact,
+        config,
+        adapter,
+        Arc::clone(&reserved_sends),
+    ));
+    let client = EbpCanonicalStoreClient::connect(transport, requirement)
+        .await
+        .expect("994 route EBP handshake");
+    let fixture =
+        KernelRouteStoreFixture::open(&format!("994-kr-{case}")).expect("994 route fixture opens");
+    let service = Arc::new(Mutex::new(ready_service()));
+    let route = GenerationRoute::new(
+        RouteScope::new("store_bridge").expect("994 route scope"),
+        ResourceGeneration::genesis(),
+        AuthorityEpoch::new(1).expect("994 route epoch"),
+    )
+    .expect("994 route");
+    let gateway = Arc::new(KernelStoreGateway::new(
+        service,
+        Arc::new(client),
+        route,
+        Some(Arc::clone(fixture.store())),
+    ));
+    KernelRoute {
+        gateway,
+        fixture,
+        reserved_sends,
+        server_task,
+        dir,
+    }
+}
+
+async fn finish_route(route: KernelRoute) {
+    let KernelRoute {
+        gateway,
+        server_task,
+        dir,
+        ..
+    } = route;
+    drop(gateway);
+    if tokio::time::timeout(Duration::from_secs(15), server_task)
+        .await
+        .is_err()
+    {
+        panic!("994 route responder did not join");
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+fn owner_for(fixture: &KernelRouteStoreFixture, context: &RequestMeta) -> CompositionReservation {
+    CompositionReservation::bind(
+        Arc::clone(fixture.store()),
+        eliot_kernel_service::writer_epoch_for_fence(context).expect("994 writer epoch"),
+    )
+    .expect("994 owner binds")
 }
 
 // WORK_UNIT_CASE: 994/2
@@ -1066,12 +1515,9 @@ fn bounded_capacity_with_protected_recovery() {
 async fn migration_drain_accounts_every_operation() {
     case_entry(15);
     let harness = Harness::fresh("15").await;
-    // Live history first on the direct path.
-    let drained = harness
-        .commit("op-994-drain", "scope-994-a", "subject-994-15")
-        .await;
-    assert_committed("op-994-drain", &drained);
-    // Install the concurrent generation over live state.
+    // The concurrent generation owns admission before any write: reserved
+    // writes execute only under the concurrent profile, so the install
+    // leads and every write below proves its path explicitly.
     harness
         .adapter()
         .install_concurrent_execution(
@@ -1083,6 +1529,19 @@ async fn migration_drain_accounts_every_operation() {
         )
         .expect("concurrent install");
     assert!(harness.adapter().reserved_write_capability().is_some());
+    // Live history first on the real Kernel to ORS to Store route: the
+    // drain operation reserves in the fixture ORS, projects the reserved
+    // submission, and commits against the live concurrent generation.
+    let route = kernel_route("15", harness.adapter_shared()).await;
+    let (d_ctx, d_transition, d_revision, d_ordering, d_seed) =
+        reserved_inputs("op-994-drain", "scope-994-a", "subject-994-15", 1);
+    let drained = route
+        .gateway
+        .apply_reserved(&d_ctx, d_transition.clone(), d_revision, d_ordering, d_seed)
+        .await
+        .unwrap_or_else(|error| panic!("drain commit failed: {error}"));
+    validate_store_receipt_envelope(&d_ctx, &d_transition, &drained).expect("envelope");
+    assert_committed("op-994-drain", &drained);
     // Exclusion while the concurrent profile owns admission: ordinary
     // unreserved writes are refused with a typed error, never silently
     // queued or partially applied.
@@ -1136,12 +1595,29 @@ async fn migration_drain_accounts_every_operation() {
         .expect("reconcile")
         .expect("drained receipt retained");
     assert_eq!(retained, drained);
+    // The fixture ORS holds no pending work once the route finalized the
+    // drain reservation: the LoopbackTransport shape stages nothing, so an
+    // empty unresolved scan is the binding proof.
+    let owner = owner_for(&route.fixture, &d_ctx);
+    let unresolved =
+        eliot_kernel_service::unresolved_reservations(&owner, 64).expect("unresolved scans");
+    assert!(
+        unresolved.is_empty(),
+        "drain reservation finalized in the fixture ORS"
+    );
+    assert_eq!(
+        route.reserved_sends.load(Ordering::SeqCst),
+        1,
+        "exactly one reserved Store send"
+    );
     // Reopen is an explicit generation install, after which the direct path
-    // flows again on the drained state.
+    // flows again on the drained state. Reserved writes stay refused without
+    // the concurrent profile, so reopen commits direct.
     let reopened = harness
         .commit("op-994-reopen", "scope-994-a", "subject-994-15-r")
         .await;
     assert_committed("op-994-reopen", &reopened);
+    finish_route(route).await;
     harness.cleanup().await;
 }
 
@@ -1290,197 +1766,47 @@ async fn product_pulse_kernel_route_progress() {
         "product_pulse_kernel_route_progress"
     );
     let harness = Harness::fresh("19").await;
-    let adapter_shared = harness.adapter_shared();
-    // The admitted Kernel route: the production EBP store client speaks real
-    // EBP frames; only the OS pipe transport is looped back in-process to
-    // the live Surreal adapter. Handshake, readiness, admission, framing,
-    // reconciliation and receipt decoding are all production code.
-    struct LoopbackTransport {
-        requirement: HostStoreBootstrapRequirement,
-        adapter: Arc<SurrealStoreAdapter>,
-        pending: Option<Frame>,
-    }
-    impl LoopbackTransport {
-        fn answer(
-            connection: &str,
-            request_id: RequestId,
-            response: eliot_store_api::StoreResponse,
-        ) -> Frame {
-            eliot_store_api::response_frame(
-                connection.to_owned(),
-                ProtocolVersion::CURRENT,
-                Some(request_id),
-                response,
-            )
-            .expect("response frame")
-        }
-    }
-    impl EbpStoreTransport for LoopbackTransport {
-        fn ensure_authenticated(
-            &self,
-            _requirement: &HostStoreBootstrapRequirement,
-        ) -> Result<(), StoreClientError> {
-            Ok(())
-        }
-
-        async fn send_frame(
-            &mut self,
-            frame: &Frame,
-            _limits: TransportLimits,
-        ) -> Result<DeliveryOutcome, StoreClientError> {
-            let adapter = self.adapter.clone();
-            if frame.kind == FrameKind::Control {
-                let hello = ServerHello {
-                    selected_protocol: ProtocolVersion::CURRENT,
-                    session_principal_binding: "sconc994-19-store-session".to_owned(),
-                    allowed_capabilities: eliot_store_api::CAPABILITIES
-                        .iter()
-                        .map(|value| (*value).to_owned())
-                        .collect(),
-                    allowed_effects: eliot_store_api::EFFECTS
-                        .iter()
-                        .map(|value| (*value).to_owned())
-                        .collect(),
-                    config_snapshot: json!({
-                        "config_hash": self.requirement.approved_config_hash.as_str(),
-                        "artifact_hash": self.requirement.approved_artifact_hash.as_str(),
-                    }),
-                    heartbeat_ms: 1_000,
-                    control_channel: "sconc994-19-control".to_owned(),
-                    rejection_reason: None,
-                    authority_epoch: self.requirement.authority_epoch().clone(),
-                };
-                self.pending = Some(
-                    eliot_ipc::server_hello_frame(self.requirement.connection_id.as_str(), &hello)
-                        .expect("server hello"),
-                );
-                return Ok(DeliveryOutcome::Delivered);
-            }
-            let (request_id, _identity, request) =
-                eliot_store_api::decode_request_frame(frame).map_err(StoreClientError::from)?;
-            let connection = self.requirement.connection_id.as_str().to_owned();
-            match request {
-                eliot_store_api::StoreRequest::Readiness => {
-                    self.pending = Some(Self::answer(
-                        &connection,
-                        request_id,
-                        eliot_store_api::StoreResponse::Readiness {
-                            receipt: eliot_store_api::ReadinessReceipt::ready("1.0.0".to_owned()),
-                        },
-                    ));
-                }
-                eliot_store_api::StoreRequest::Apply {
-                    context,
-                    transition,
-                    expected_revision_heads,
-                    expected_ordering_heads,
-                } => {
-                    let outcome = CanonicalStoreClient::apply_prepared(
-                        adapter.as_ref(),
-                        &context,
-                        transition,
-                        expected_revision_heads,
-                        expected_ordering_heads,
-                    )
-                    .await;
-                    match outcome {
-                        Ok(receipt) => {
-                            self.pending = Some(Self::answer(
-                                &connection,
-                                request_id,
-                                eliot_store_api::StoreResponse::Transaction { receipt },
-                            ));
-                        }
-                        Err(error) => {
-                            return Err(StoreClientError::Store(error));
-                        }
-                    }
-                }
-                eliot_store_api::StoreRequest::Receipt { operation_id } => {
-                    let receipt = adapter
-                        .reconcile(operation_id)
-                        .await
-                        .map_err(|error| StoreClientError::Transport(error.to_string()))?;
-                    self.pending = Some(Self::answer(
-                        &connection,
-                        request_id,
-                        eliot_store_api::StoreResponse::Receipt { receipt },
-                    ));
-                }
-                _ => {
-                    return Err(StoreClientError::Contract(
-                        "loopback received unexpected request".to_owned(),
-                    ));
-                }
-            }
-            Ok(DeliveryOutcome::Delivered)
-        }
-
-        async fn receive_frame(
-            &mut self,
-            _limits: TransportLimits,
-        ) -> Result<Frame, StoreClientError> {
-            self.pending
-                .take()
-                .ok_or_else(|| StoreClientError::Transport("loopback response missing".to_owned()))
-        }
-    }
-    let requirement = HostStoreBootstrapRequirement {
-        route_identity: PlatformHandle::new("store_bridge").expect("route"),
-        canonical_pipe_identity: PlatformHandle::new(r"\\.\pipe\eliot\store-994-19").expect("pipe"),
-        store_generation: ResourceGeneration::genesis(),
-        state_fence: fence(),
-        launch_nonce: PlatformHandle::new("store-launch-994-19").expect("nonce"),
-        connection_id: PlatformHandle::new("store-conn-994-19").expect("conn"),
-        expected_peer_sid: PlatformHandle::new("S-1-5-18").expect("sid"),
-        expected_peer_session_id: 0,
-        approved_artifact_hash: PlatformHandle::new("a".repeat(64)).expect("artifact"),
-        approved_config_hash: PlatformHandle::new("b".repeat(64)).expect("config"),
-        timeout_ms: 30_000,
-    };
-    let client = EbpCanonicalStoreClient::connect(
-        LoopbackTransport {
-            requirement,
-            adapter: adapter_shared,
-            pending: None,
-        },
-        HostStoreBootstrapRequirement {
-            route_identity: PlatformHandle::new("store_bridge").expect("route"),
-            canonical_pipe_identity: PlatformHandle::new(r"\\.\pipe\eliot\store-994-19")
-                .expect("pipe"),
-            store_generation: ResourceGeneration::genesis(),
-            state_fence: fence(),
-            launch_nonce: PlatformHandle::new("store-launch-994-19").expect("nonce"),
-            connection_id: PlatformHandle::new("store-conn-994-19").expect("conn"),
-            expected_peer_sid: PlatformHandle::new("S-1-5-18").expect("sid"),
-            expected_peer_session_id: 0,
-            approved_artifact_hash: PlatformHandle::new("a".repeat(64)).expect("artifact"),
-            approved_config_hash: PlatformHandle::new("b".repeat(64)).expect("config"),
-            timeout_ms: 30_000,
-        },
-    )
-    .await
-    .expect("EBP connect over loopback");
+    // The concurrent generation owns admission before any write: reserved
+    // writes execute only under the concurrent profile (same setup case 15
+    // proves), so the admitted Kernel route below is the real reserved path.
+    harness
+        .adapter()
+        .install_concurrent_execution(
+            NonZeroUsize::new(profile_usize("lanes")).expect("lanes"),
+            NonZeroUsize::new(profile_usize("max_pending")).expect("pending"),
+            SchemaGeneration::v2(),
+            "kernel-994-test".to_owned(),
+            fence(),
+        )
+        .expect("concurrent install");
+    assert!(harness.adapter().reserved_write_capability().is_some());
+    // The admitted Kernel route: a Ready KernelService, a real named-pipe
+    // EBP connection pumping frames into the live Surreal adapter, and the
+    // fixture ORS bound into the gateway. Handshake, readiness, admission,
+    // reservation, framing, reconciliation and receipt decoding are all
+    // production code; the ORS reservation lifecycle replaces the
+    // hand-rolled loopback that staged nothing.
+    let route = kernel_route("19", harness.adapter_shared()).await;
     // Pulse progress: two independent pulse scopes advance concurrently with
     // valid committed receipts through the admitted route.
-    let (pulse_ctx_a, pulse_a) =
-        admitted("op-994-pulse-a", "scope-994-pulse-a", "subject-994-19-a");
-    let (pulse_ctx_b, pulse_b) =
-        admitted("op-994-pulse-b", "scope-994-pulse-b", "subject-994-19-b");
+    let (pulse_ctx_a, pulse_a, pulse_rev_a, pulse_ord_a, pulse_seed_a) =
+        reserved_inputs("op-994-pulse-a", "scope-994-pulse-a", "subject-994-19-a", 1);
+    let (pulse_ctx_b, pulse_b, pulse_rev_b, pulse_ord_b, pulse_seed_b) =
+        reserved_inputs("op-994-pulse-b", "scope-994-pulse-b", "subject-994-19-b", 1);
     let (receipt_a, receipt_b) = tokio::join!(
-        CanonicalStoreClient::apply_prepared(
-            &client,
+        route.gateway.apply_reserved(
             &pulse_ctx_a,
             pulse_a.clone(),
-            vec![],
-            vec![]
+            pulse_rev_a,
+            pulse_ord_a,
+            pulse_seed_a
         ),
-        CanonicalStoreClient::apply_prepared(
-            &client,
+        route.gateway.apply_reserved(
             &pulse_ctx_b,
             pulse_b.clone(),
-            vec![],
-            vec![]
+            pulse_rev_b,
+            pulse_ord_b,
+            pulse_seed_b
         ),
     );
     let receipt_a = receipt_a.expect("pulse A progresses");
@@ -1489,32 +1815,57 @@ async fn product_pulse_kernel_route_progress() {
     validate_store_receipt_envelope(&pulse_ctx_b, &pulse_b, &receipt_b).expect("envelope B");
     assert_committed("op-994-pulse-a", &receipt_a);
     assert_committed("op-994-pulse-b", &receipt_b);
+    // Both reservations finalized in the fixture ORS: the loopback shape
+    // leaves no ORS trace, so an empty unresolved scan is the binding proof.
+    let owner = owner_for(&route.fixture, &pulse_ctx_a);
+    let unresolved =
+        eliot_kernel_service::unresolved_reservations(&owner, 64).expect("unresolved scans");
+    assert!(
+        unresolved.is_empty(),
+        "pulse reservations finalized in the fixture ORS"
+    );
+    assert_eq!(
+        route.reserved_sends.load(Ordering::SeqCst),
+        2,
+        "exactly two reserved Store sends"
+    );
     // Pulse cancellation: the admitted cancel future is dropped before send,
     // then the route reconciles proven absence by exact operation identity.
-    let (cancel_ctx, cancel_transition) = admitted(
+    // The lazy gateway future never polls, so nothing stages in ORS and the
+    // live adapter never sees the operation.
+    let (cancel_ctx, cancel_transition, cancel_rev, cancel_ord, cancel_seed) = reserved_inputs(
         "op-994-pulse-cancel",
         "scope-994-pulse-a",
         "subject-994-19-c",
+        1,
     );
     let cancel_id = cancel_transition.identity.operation_id.clone();
-    let cancelled = CanonicalStoreClient::apply_prepared(
-        &client,
+    let cancelled = route.gateway.apply_reserved(
         &cancel_ctx,
         cancel_transition,
-        vec![],
-        vec![],
+        cancel_rev,
+        cancel_ord,
+        cancel_seed,
     );
     drop(cancelled);
-    let absence: Option<WriteReceipt> = client
-        .receipt(ApiOperationId::new(cancel_id.as_str()).expect("operation"))
+    let absence: Option<WriteReceipt> = route
+        .gateway
+        .receipt(&fence(), cancel_id)
         .await
         .expect("receipt query");
     assert!(absence.is_none(), "cancelled pulse has no provider effect");
+    let still_clean =
+        eliot_kernel_service::unresolved_reservations(&owner, 64).expect("cancelled scan");
+    assert!(
+        still_clean.is_empty(),
+        "dropped cancel staged nothing in the fixture ORS"
+    );
     // Pulse recovery: committed pulse operations reconcile to their exact
     // original receipts through the same route.
     for expected in [&receipt_a, &receipt_b] {
-        let recovered: Option<WriteReceipt> = client
-            .receipt(ApiOperationId::new(expected.operation_id.as_str()).expect("operation"))
+        let recovered: Option<WriteReceipt> = route
+            .gateway
+            .receipt(&fence(), expected.operation_id.clone())
             .await
             .expect("receipt query");
         assert_eq!(
@@ -1527,6 +1878,6 @@ async fn product_pulse_kernel_route_progress() {
         "SCONC-994 case=19 pulse ok sha={} port={}",
         harness.config.provider_artifact_digest, harness.config.provider_bind_address
     );
-    drop(client);
+    finish_route(route).await;
     harness.cleanup().await;
 }
