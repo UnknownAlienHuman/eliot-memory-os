@@ -30,9 +30,13 @@ use eliot_store_surreal::{
 const LINEAGE_1931: &str = "550e8400-e29b-41d4-a716-446655440193";
 
 fn fence() -> StateFence {
+    fence_at_epoch(1)
+}
+
+fn fence_at_epoch(counter: u64) -> StateFence {
     let epoch = EpochId::new(
         EpochLineageId::new(LINEAGE_1931).unwrap(),
-        NonZeroU64::new(1).unwrap(),
+        NonZeroU64::new(counter).unwrap(),
     )
     .unwrap();
     StateFence::new(epoch, ResourceGeneration::genesis())
@@ -234,5 +238,51 @@ fn projection_rebuild_initiates_only_from_doctor_path() {
     assert!(
         request_rebuild_from_semantic_write(&SemanticWritePath, "graph/concept").is_err(),
         "ordinary semantic write commands cannot initiate a rebuild"
+    );
+}
+
+#[test]
+fn atomic_bundle_rejects_phantom_or_missing_members() {
+    // Phantom outbox ref: the receipt names an outbox id with no committed intent.
+    let mut phantom_outbox = committed_bundle();
+    phantom_outbox
+        .receipt
+        .outbox_refs
+        .push(OutboxId::new("outbox-1931-ghost").unwrap());
+    assert!(phantom_outbox.validate_atomic().is_err());
+
+    // Missing intent: the receipt still references the intent, but it is absent.
+    let mut missing_intent = committed_bundle();
+    missing_intent.outbox.clear();
+    assert!(missing_intent.validate_atomic().is_err());
+
+    // Phantom ordering sequence: the receipt claims a scope the event never linked.
+    let mut phantom_scope = committed_bundle();
+    phantom_scope.receipt.ordering_sequences.push(OrderingHead {
+        scope: OrderingScopeId::new("scope-1931-ghost").unwrap(),
+        sequence: 1,
+        state_fence: fence(),
+    });
+    assert!(phantom_scope.validate_atomic().is_err());
+
+    // Phantom emitted event: the transition resolves to exactly one event ID.
+    let mut phantom_event = committed_bundle();
+    phantom_event
+        .receipt
+        .emitted_event_ids
+        .push(EventId::new("event-1931-ghost").unwrap());
+    assert!(phantom_event.validate_atomic().is_err());
+}
+
+#[test]
+fn projection_current_requires_same_fence_source_heads() {
+    let publication = fenced_publication();
+    // Same keys and revisions, but a foreign epoch fence: not current here.
+    let mut foreign = source_heads();
+    foreign[0].state_fence = fence_at_epoch(2);
+    assert!(
+        publication
+            .check_current(&foreign, 5, &"c".repeat(64))
+            .is_err()
     );
 }

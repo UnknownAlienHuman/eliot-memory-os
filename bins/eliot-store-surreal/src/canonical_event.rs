@@ -308,10 +308,11 @@ impl CommittedCanonicalTransition {
         if self.receipt.state_fence != self.event.state_fence {
             return Err(StoreError::FenceMismatch);
         }
-        if !self
-            .receipt
-            .emitted_event_ids
-            .contains(&self.event.event_id)
+        if self.receipt.emitted_event_ids.len() != 1
+            || !self
+                .receipt
+                .emitted_event_ids
+                .contains(&self.event.event_id)
         {
             return Err(StoreError::InvalidReceipt);
         }
@@ -335,6 +336,9 @@ impl CommittedCanonicalTransition {
                 _ => return Err(StoreError::InvalidReceipt),
             }
         }
+        if receipt_sequences.len() != self.event.ordering_links.len() {
+            return Err(StoreError::InvalidReceipt);
+        }
         let mut seen_outbox = BTreeSet::new();
         for intent in &self.outbox {
             intent.validate()?;
@@ -350,6 +354,11 @@ impl CommittedCanonicalTransition {
                 });
             }
             if !self.receipt.outbox_refs.contains(&intent.outbox_id) {
+                return Err(StoreError::InvalidOutbox);
+            }
+        }
+        for outbox_ref in &self.receipt.outbox_refs {
+            if !seen_outbox.contains(outbox_ref.as_str()) {
                 return Err(StoreError::InvalidOutbox);
             }
         }
@@ -393,7 +402,7 @@ impl FencedProjectionPublication {
 
     /// Requires readability as current: valid fence, `CURRENT` status, no
     /// split view, matching definition digest, matching source generation,
-    /// exact source-head match, and the atomic data/provenance receipt.
+    /// exact fence-pinned source-head match, and the atomic data/provenance receipt.
     pub fn check_current(
         &self,
         expected_source_heads: &[RevisionHead],
@@ -426,6 +435,9 @@ impl FencedProjectionPublication {
         }
         let mut expected = BTreeMap::new();
         for head in expected_source_heads {
+            if head.state_fence != self.record.state_fence {
+                return Err(StoreError::InvalidProjection);
+            }
             if expected.insert(head.key.clone(), head.revision).is_some() {
                 return Err(StoreError::Duplicate {
                     field: "expected_source_heads",
