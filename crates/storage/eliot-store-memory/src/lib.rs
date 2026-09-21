@@ -6,6 +6,8 @@
 #![forbid(unsafe_code)]
 
 #[cfg(test)]
+mod automation_state_tests;
+#[cfg(test)]
 mod epistemic_tests;
 #[cfg(test)]
 mod notification_state_tests;
@@ -22,24 +24,26 @@ use eliot_kernel_core::{
 };
 use eliot_store_api::epistemic_revision::{EpistemicCommit, position_key};
 use eliot_store_api::{
+    AUTOMATION_QUERY_CURRENT, AUTOMATION_QUERY_FAILURE, AUTOMATION_QUERY_HISTORY,
+    AUTOMATION_QUERY_INVOCATIONS, AUTOMATION_QUERY_LIST, AUTOMATION_STATE_RETIRED,
     CanonicalRequestView, CanonicalStoreClient, CanonicalValidationSnapshot, CommitId,
-    DecodedNotificationMutation, DecodedReactiveMutation, ERASURE_PARAM_OPERATION_ID,
-    ERASURE_PARAM_SUBJECT, ERASURE_PARAM_SURFACES, EVIDENCE_PACK_MAX_RECORDS, EventId,
-    EventProjectionRelationIntents, NamedMutationOperation, NamedReadOperation, NamedReadRequest,
-    NamedReadResponse, OperationId, OperationManifestDigest, OrderingHead, OrderingHeadExpectation,
-    OrderingScopeId, OutboxId, OutboxIntent, OutboxState, PreparedTransition, ProjectionMode,
-    ProjectionPublicationId, ProjectionPublicationRecord, ProjectionStatus, RecoveryRecord,
-    RecoveryRecordKey, RequestMeta, Resubmission, RevisionDelta, RevisionHead,
-    RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, SplitView, StateFence,
-    StoreError, StoreGenesisRequest, StoreHealth, StoreHealthStatus, StoreRecoveryRequest,
-    StoreRecoverySnapshot, TransitionClass, WriteReceipt, WriteReceiptStatus, canonical_json_bytes,
-    canonical_request_hash, decode_erasure_surfaces, decode_notification_mutation,
-    decode_reactive_mutation, decode_resource_content, generated_operation_manifests,
-    genesis_manifest, is_genesis_fence, issue_genesis_receipt_envelope,
-    issue_store_receipt_envelope, named_mutation_operation_name, sha256_hex,
-    validate_genesis_receipt_envelope, validate_reactive_ledger_read_params,
-    validate_resource_snapshot_read_params, validate_store_receipt_envelope,
-    verify_canonical_request_hash,
+    DecodedAutomationMutation, DecodedNotificationMutation, DecodedReactiveMutation,
+    ERASURE_PARAM_OPERATION_ID, ERASURE_PARAM_SUBJECT, ERASURE_PARAM_SURFACES,
+    EVIDENCE_PACK_MAX_RECORDS, EventId, EventProjectionRelationIntents, NamedMutationOperation,
+    NamedReadOperation, NamedReadRequest, NamedReadResponse, OperationId, OperationManifestDigest,
+    OrderingHead, OrderingHeadExpectation, OrderingScopeId, OutboxId, OutboxIntent, OutboxState,
+    PreparedTransition, ProjectionMode, ProjectionPublicationId, ProjectionPublicationRecord,
+    ProjectionStatus, RecoveryRecord, RecoveryRecordKey, RequestMeta, Resubmission, RevisionDelta,
+    RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, SplitView,
+    StateFence, StoreError, StoreGenesisRequest, StoreHealth, StoreHealthStatus,
+    StoreRecoveryRequest, StoreRecoverySnapshot, TransitionClass, WriteReceipt, WriteReceiptStatus,
+    canonical_json_bytes, canonical_request_hash, decode_automation_mutation,
+    decode_erasure_surfaces, decode_notification_mutation, decode_reactive_mutation,
+    decode_resource_content, generated_operation_manifests, genesis_manifest, is_genesis_fence,
+    issue_genesis_receipt_envelope, issue_store_receipt_envelope, named_mutation_operation_name,
+    sha256_hex, validate_automation_read_params, validate_genesis_receipt_envelope,
+    validate_reactive_ledger_read_params, validate_resource_snapshot_read_params,
+    validate_store_receipt_envelope, verify_canonical_request_hash,
 };
 use schemars::JsonSchema;
 use serde::de::Error as _;
@@ -327,6 +331,11 @@ impl MemoryStore {
         // receipt's outbox references include the appended reactive outbox
         // intents. Rows, receipt, and outbox still commit atomically below.
         dispatch_apply_reactive_state(&mut state, &transition, &mut plan)?;
+        // Issue #1779: admitted automation legs execute here, beside the
+        // reactive legs and before the receipt is built, so the receipt's
+        // outbox references include the appended automation outbox intents.
+        // Rows, receipt, and outbox still commit atomically below.
+        dispatch_apply_automation_state(&mut state, &transition, &mut plan)?;
         let receipt = transaction_receipt(ctx, &transition, idempotency_key, recomputed, &plan)?;
         if let (Some(commit), Some(key)) = (epistemic, epistemic_key) {
             commit.readback(&receipt)?;
@@ -752,6 +761,248 @@ fn dispatch_apply_reactive_state(
     Ok(())
 }
 
+/// Joins one revision-row address. Collision-free by the same
+/// control-character argument as the Surreal contour: neither half may
+/// contain `\x1f` per the wire contract.
+fn automation_revision_key(automation_id: &str, revision: &str) -> String {
+    format!("{automation_id}\x1f{revision}")
+}
+
+/// Executes admitted automation legs on already-locked state
+/// (issue #1779).
+///
+/// Runs beside [`dispatch_apply_reactive_state`] under the same lock as
+/// the receipt commit: one identity, one receipt, recoverable replay
+/// without duplicate work. Revision rows are immutable and create-only
+/// (divergent rewrites fail closed); the current pointer moves only
+/// through the observed revision; invocation rows are create-only by
+/// occurrence identity. Each command appends one outbox intent bound to
+/// the resulting row bytes, so rows and their outbox intents commit
+/// atomically via [`commit_transaction`]. Non-automation transitions are
+/// a no-op here.
+fn dispatch_apply_automation_state(
+    state: &mut MemoryState,
+    transition: &PreparedTransition,
+    plan: &mut TransactionPlan,
+) -> Result<(), StoreError> {
+    let has_automation_op = transition
+        .named_operations
+        .iter()
+        .any(|command| command.operation == NamedMutationOperation::ApplyUserAutomationState);
+    if !has_automation_op {
+        return Ok(());
+    }
+    if transition.transition_class != TransitionClass::UserAutomation {
+        return Err(StoreError::TransitionClassExceeded);
+    }
+    let operation_key = transition.identity.operation_id.to_string();
+    let mut automation_index = 0_usize;
+    for command in &transition.named_operations {
+        let decoded = match command.operation {
+            NamedMutationOperation::ApplyUserAutomationState => {
+                decode_automation_mutation(command.operation, &command.parameters)?
+            }
+            _ => continue,
+        };
+        let row_json = match decoded {
+            DecodedAutomationMutation::Create {
+                automation_id,
+                revision,
+                revision_json,
+                configuration_state,
+            } => {
+                let key = automation_revision_key(&automation_id, &revision);
+                match state.automation_revisions.get(&key) {
+                    Some(existing) if existing.revision_json != revision_json => {
+                        return Err(StoreError::IdentityConflict);
+                    }
+                    Some(_) => {}
+                    None => {
+                        state.automation_revisions.insert(
+                            key,
+                            AutomationRevisionRow {
+                                automation_id: automation_id.clone(),
+                                revision: revision.clone(),
+                                revision_json: revision_json.clone(),
+                                state_fence: transition.state_fence.clone(),
+                                scope_id: transition.scope_id.to_string(),
+                                task_id: transition.task_id.clone(),
+                            },
+                        );
+                    }
+                }
+                if state.automation_currents.contains_key(&automation_id) {
+                    return Err(StoreError::IdentityConflict);
+                }
+                state.automation_currents.insert(
+                    automation_id.clone(),
+                    AutomationCurrentRow {
+                        automation_id,
+                        revision,
+                        configuration_state,
+                        state_fence: transition.state_fence.clone(),
+                        scope_id: transition.scope_id.to_string(),
+                        task_id: transition.task_id.clone(),
+                    },
+                );
+                serde_json::to_value(&revision_json)
+                    .map_err(|error| StoreError::Serialization(error.to_string()))?
+            }
+            DecodedAutomationMutation::Edit {
+                automation_id,
+                previous_revision,
+                revision,
+                revision_json,
+                configuration_state,
+            } => {
+                let current = state.automation_currents.get(&automation_id).ok_or(
+                    StoreError::InvalidField {
+                        field: "automation.automation_id",
+                        reason: "unknown automation",
+                    },
+                )?;
+                if current.revision != previous_revision {
+                    return Err(StoreError::IdentityConflict);
+                }
+                if current.state_fence != transition.state_fence {
+                    return Err(StoreError::FenceMismatch);
+                }
+                let key = automation_revision_key(&automation_id, &revision);
+                match state.automation_revisions.get(&key) {
+                    Some(existing) if existing.revision_json != revision_json => {
+                        return Err(StoreError::IdentityConflict);
+                    }
+                    Some(_) => {}
+                    None => {
+                        state.automation_revisions.insert(
+                            key,
+                            AutomationRevisionRow {
+                                automation_id: automation_id.clone(),
+                                revision: revision.clone(),
+                                revision_json: revision_json.clone(),
+                                state_fence: transition.state_fence.clone(),
+                                scope_id: transition.scope_id.to_string(),
+                                task_id: transition.task_id.clone(),
+                            },
+                        );
+                    }
+                }
+                state.automation_currents.insert(
+                    automation_id.clone(),
+                    AutomationCurrentRow {
+                        automation_id,
+                        revision,
+                        configuration_state,
+                        state_fence: transition.state_fence.clone(),
+                        scope_id: transition.scope_id.to_string(),
+                        task_id: transition.task_id.clone(),
+                    },
+                );
+                serde_json::to_value(&revision_json)
+                    .map_err(|error| StoreError::Serialization(error.to_string()))?
+            }
+            DecodedAutomationMutation::StateTransition {
+                automation_id,
+                revision,
+                configuration_state,
+                ..
+            } => {
+                let key = automation_revision_key(&automation_id, &revision);
+                if !state.automation_revisions.contains_key(&key) {
+                    return Err(StoreError::InvalidField {
+                        field: "automation.revision",
+                        reason: "unknown automation revision",
+                    });
+                }
+                let current = state.automation_currents.get(&automation_id).ok_or(
+                    StoreError::InvalidField {
+                        field: "automation.automation_id",
+                        reason: "unknown automation",
+                    },
+                )?;
+                if current.revision != revision {
+                    return Err(StoreError::IdentityConflict);
+                }
+                if current.state_fence != transition.state_fence {
+                    return Err(StoreError::FenceMismatch);
+                }
+                let row_json = serde_json::to_value(&revision)
+                    .map_err(|error| StoreError::Serialization(error.to_string()))?;
+                state.automation_currents.insert(
+                    automation_id.clone(),
+                    AutomationCurrentRow {
+                        automation_id,
+                        revision,
+                        configuration_state,
+                        state_fence: transition.state_fence.clone(),
+                        scope_id: transition.scope_id.to_string(),
+                        task_id: transition.task_id.clone(),
+                    },
+                );
+                row_json
+            }
+            DecodedAutomationMutation::RunNow {
+                automation_id,
+                revision,
+                occurrence_id,
+                invocation_json,
+            } => {
+                let key = automation_revision_key(&automation_id, &revision);
+                if !state.automation_revisions.contains_key(&key) {
+                    return Err(StoreError::InvalidField {
+                        field: "automation.revision",
+                        reason: "unknown automation revision",
+                    });
+                }
+                match state.automation_invocations.get(&occurrence_id) {
+                    Some(existing) if existing.invocation_json != invocation_json => {
+                        return Err(StoreError::IdentityConflict);
+                    }
+                    Some(_) => {}
+                    None => {
+                        state.automation_invocations.insert(
+                            occurrence_id.clone(),
+                            AutomationInvocationRow {
+                                occurrence_id,
+                                automation_id: automation_id.clone(),
+                                invocation_json: invocation_json.clone(),
+                                state_fence: transition.state_fence.clone(),
+                                scope_id: transition.scope_id.to_string(),
+                                task_id: transition.task_id.clone(),
+                            },
+                        );
+                    }
+                }
+                serde_json::to_value(&invocation_json)
+                    .map_err(|error| StoreError::Serialization(error.to_string()))?
+            }
+        };
+        let payload_digest = sha256_hex(
+            &canonical_json_bytes(&row_json)
+                .map_err(|error| StoreError::Serialization(error.to_string()))?,
+        );
+        let sequence = plan.next_outbox_sequence;
+        plan.next_outbox_sequence =
+            checked_increment(sequence, "outbox.sequence", "sequence overflow")?;
+        let outbox = OutboxIntent {
+            outbox_id: OutboxId::new(format!(
+                "outbox-{operation_key}-automation-{automation_index}"
+            ))?,
+            operation_id: transition.identity.operation_id.clone(),
+            sequence,
+            payload_digest,
+            state_fence: transition.state_fence.clone(),
+            arrival_fence: format!("arrival-{operation_key}"),
+            claim_fence: None,
+            state: OutboxState::Arrived,
+        };
+        outbox.validate()?;
+        plan.outbox_records.push(outbox);
+        automation_index = automation_index.saturating_add(1);
+    }
+    Ok(())
+}
+
 /// Applies one decoded leg against the shared record model and returns the
 /// resulting canonical record JSON for outbox binding.
 ///
@@ -1101,6 +1352,127 @@ fn resource_snapshot_payload(
     }))
 }
 
+/// Builds the same-fence user-automation read payload (issue #1779).
+///
+/// Errors surface as serialization failures with the underlying message:
+/// parameters are pre-validated by the catalogue gate, so any failure here
+/// is defense in depth, never a distinct dispatch outcome. `list` projects
+/// same-fence current pointers in automation-id order (retired excluded
+/// unless requested); `current` projects one pointer or explicit absence;
+/// `history` projects the bounded verbatim revision set; `invocations`
+/// projects the bounded verbatim invocation set; `failure` projects
+/// explicit absence (no failure writer path exists yet).
+fn automation_state_payload(
+    state: &MemoryState,
+    query: &NamedReadRequest,
+    fence: &StateFence,
+) -> Result<Value, serde_json::Error> {
+    let decoded = validate_automation_read_params(&query.parameters)
+        .map_err(|error| serde_json::Error::custom(error.to_string()))?;
+    let limit = usize::from(decoded.max_records.max(1));
+    match decoded.query.as_str() {
+        AUTOMATION_QUERY_LIST => {
+            let mut currents = Vec::new();
+            for row in state.automation_currents.values() {
+                if row.state_fence != *fence {
+                    continue;
+                }
+                if !decoded.include_retired && row.configuration_state == AUTOMATION_STATE_RETIRED {
+                    continue;
+                }
+                if currents.len() >= limit {
+                    break;
+                }
+                currents.push(json!({
+                    "automation_id": row.automation_id,
+                    "revision": row.revision,
+                    "configuration_state": row.configuration_state,
+                }));
+            }
+            serde_json::to_value(json!({
+                "currents": currents,
+                "revision": currents.len(),
+                "state_fence": fence,
+            }))
+        }
+        AUTOMATION_QUERY_CURRENT => {
+            let id = decoded.automation_id.clone().ok_or_else(|| {
+                serde_json::Error::custom("exact automation selector is required")
+            })?;
+            let (current, revision) = match state.automation_currents.get(&id) {
+                Some(row) if row.state_fence == *fence => (
+                    json!({
+                        "automation_id": row.automation_id,
+                        "revision": row.revision,
+                        "configuration_state": row.configuration_state,
+                    }),
+                    1,
+                ),
+                _ => (Value::Null, 0),
+            };
+            serde_json::to_value(json!({
+                "current": current,
+                "revision": revision,
+                "state_fence": fence,
+            }))
+        }
+        AUTOMATION_QUERY_HISTORY => {
+            let id = decoded.automation_id.clone().ok_or_else(|| {
+                serde_json::Error::custom("exact automation selector is required")
+            })?;
+            let mut revisions = Vec::new();
+            for row in state.automation_revisions.values() {
+                if row.automation_id != id || row.state_fence != *fence {
+                    continue;
+                }
+                if revisions.len() >= limit {
+                    break;
+                }
+                revisions.push(json!({
+                    "automation_id": row.automation_id,
+                    "revision": row.revision,
+                    "revision_json": row.revision_json,
+                }));
+            }
+            serde_json::to_value(json!({
+                "revisions": revisions,
+                "revision": revisions.len(),
+                "state_fence": fence,
+            }))
+        }
+        AUTOMATION_QUERY_INVOCATIONS => {
+            let id = decoded.automation_id.clone().ok_or_else(|| {
+                serde_json::Error::custom("exact automation selector is required")
+            })?;
+            let mut invocations = Vec::new();
+            for row in state.automation_invocations.values() {
+                if row.automation_id != id || row.state_fence != *fence {
+                    continue;
+                }
+                if invocations.len() >= limit {
+                    break;
+                }
+                invocations.push(json!({
+                    "occurrence_id": row.occurrence_id,
+                    "automation_id": row.automation_id,
+                    "invocation_json": row.invocation_json,
+                }));
+            }
+            serde_json::to_value(json!({
+                "invocations": invocations,
+                "revision": invocations.len(),
+                "state_fence": fence,
+            }))
+        }
+        AUTOMATION_QUERY_FAILURE => serde_json::to_value(json!({
+            "failure": Value::Null,
+            "revision": 0,
+            "state_fence": fence,
+        })),
+        _ => Err(serde_json::Error::custom("unknown automation query")),
+    }
+}
+
 fn validate_transaction(
     ctx: &RequestMeta,
     transition: &PreparedTransition,
@@ -1178,6 +1550,10 @@ fn validate_transaction_state(
             .named_operations
             .iter()
             .any(|command| command.operation == NamedMutationOperation::ApplyResourceSnapshot)
+        || transition
+            .named_operations
+            .iter()
+            .any(|command| command.operation == NamedMutationOperation::ApplyUserAutomationState)
     {
         return transition.validate_against_catalogue(&generated_operation_manifests()?);
     }
@@ -1572,7 +1948,8 @@ impl MemoryStore {
     /// `notification_id` / `include_resolved` / `page_limit` / `cursor`
     /// selectors. Issue #1941 C4 adds `GetReactiveInjectionState` with its
     /// exact `session_id` selector and `GetResourceSnapshot` with its exact
-    /// `uri` selector.
+    /// `uri` selector. Issue #1779 adds `GetUserAutomationState` with its
+    /// closed query discriminator and exact selectors.
     fn enforce_catalogue_gate(query: &NamedReadRequest) -> Result<(), StoreError> {
         if matches!(
             query.operation,
@@ -1585,6 +1962,7 @@ impl MemoryStore {
                 | NamedReadOperation::GetNotificationState
                 | NamedReadOperation::GetReactiveInjectionState
                 | NamedReadOperation::GetResourceSnapshot
+                | NamedReadOperation::GetUserAutomationState
         ) {
             let entries = generated_operation_manifests()?;
             query.validate_against_catalogue(&entries)?;
@@ -1694,6 +2072,9 @@ impl MemoryStore {
             }
             NamedReadOperation::GetResourceSnapshot => {
                 resource_snapshot_payload(&state, query, &fence)
+            }
+            NamedReadOperation::GetUserAutomationState => {
+                automation_state_payload(&state, query, &fence)
             }
             _ => serde_json::to_value(json!({
                 "operation": format!("{:?}", query.operation),
@@ -2512,6 +2893,43 @@ struct ResourceSnapshotRow {
     task_id: Option<String>,
 }
 
+/// One immutable automation revision row: the verbatim Kernel-owned
+/// revision document for one automation + revision with its admission
+/// fence and task-binding provenance (issue #1779).
+#[derive(Clone, Debug, PartialEq)]
+struct AutomationRevisionRow {
+    automation_id: String,
+    revision: String,
+    revision_json: String,
+    state_fence: StateFence,
+    scope_id: String,
+    task_id: Option<String>,
+}
+
+/// One current automation pointer: the revision an automation names plus
+/// the closed admission state, fence, and provenance (issue #1779).
+#[derive(Clone, Debug, PartialEq)]
+struct AutomationCurrentRow {
+    automation_id: String,
+    revision: String,
+    configuration_state: String,
+    state_fence: StateFence,
+    scope_id: String,
+    task_id: Option<String>,
+}
+
+/// One automation invocation row: the verbatim invocation document for
+/// one stable occurrence identity (issue #1779).
+#[derive(Clone, Debug, PartialEq)]
+struct AutomationInvocationRow {
+    occurrence_id: String,
+    automation_id: String,
+    invocation_json: String,
+    state_fence: StateFence,
+    scope_id: String,
+    task_id: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 struct MemoryState {
     epistemic_positions: BTreeMap<String, (EpistemicCommit, WriteReceipt)>,
@@ -2547,6 +2965,19 @@ struct MemoryState {
     /// driven only through the closed reactive legs under the held
     /// transaction lock.
     resource_snapshots: BTreeMap<String, ResourceSnapshotRow>,
+    /// Immutable automation revision rows keyed by joined
+    /// `(automation_id, revision)` (issue #1779). Verbatim Kernel-owned
+    /// revision documents, driven only through the closed automation legs
+    /// under the held transaction lock.
+    automation_revisions: BTreeMap<String, AutomationRevisionRow>,
+    /// Current automation pointers keyed by automation (issue #1779).
+    /// Compare-and-set revision plus closed admission state, driven only
+    /// through the closed automation legs under the held transaction lock.
+    automation_currents: BTreeMap<String, AutomationCurrentRow>,
+    /// Automation invocation rows keyed by occurrence (issue #1779).
+    /// Verbatim invocation documents, driven only through the closed
+    /// automation legs under the held transaction lock.
+    automation_invocations: BTreeMap<String, AutomationInvocationRow>,
     next_commit_sequence: u64,
     next_outbox_sequence: u64,
 }
@@ -2575,6 +3006,9 @@ impl PartialEq for MemoryState {
             && self.erased_subjects == other.erased_subjects
             && self.reactive_sessions == other.reactive_sessions
             && self.resource_snapshots == other.resource_snapshots
+            && self.automation_revisions == other.automation_revisions
+            && self.automation_currents == other.automation_currents
+            && self.automation_invocations == other.automation_invocations
             && self.next_commit_sequence == other.next_commit_sequence
             && self.next_outbox_sequence == other.next_outbox_sequence
             && self.notifications.iter().collect::<Vec<_>>()
@@ -2603,6 +3037,9 @@ impl Default for MemoryState {
             notifications: NotificationStore::new(),
             reactive_sessions: BTreeMap::new(),
             resource_snapshots: BTreeMap::new(),
+            automation_revisions: BTreeMap::new(),
+            automation_currents: BTreeMap::new(),
+            automation_invocations: BTreeMap::new(),
             next_commit_sequence: 1,
             next_outbox_sequence: 1,
         }
@@ -2626,6 +3063,9 @@ impl MemoryState {
             && self.notifications.len() == 0
             && self.reactive_sessions.is_empty()
             && self.resource_snapshots.is_empty()
+            && self.automation_revisions.is_empty()
+            && self.automation_currents.is_empty()
+            && self.automation_invocations.is_empty()
     }
 
     fn snapshot(&self) -> MemorySnapshot {
