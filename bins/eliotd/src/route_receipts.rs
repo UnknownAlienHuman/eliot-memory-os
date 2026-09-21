@@ -18,8 +18,8 @@
 
 use std::collections::BTreeMap;
 
-use eliot_agent_api::{route_divergence_fields, AttemptId, RouteFingerprint};
-use eliot_contracts::{canonical_json_bytes, sha256_hex, LowercaseSha256};
+use eliot_agent_api::{AttemptId, RouteFingerprint, route_divergence_fields};
+use eliot_contracts::{LowercaseSha256, canonical_json_bytes, sha256_hex};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -65,10 +65,11 @@ fn validate_optional_fact(
 ) -> Result<(), RouteReceiptError> {
     if let Some(text) = value {
         validate_text(text, field)?;
-        // `unknown` is reserved for the unexposed case (`None`). Evidence
-        // must carry an actual observed value; an explicit runtime "unknown"
-        // is reported as `None` by the caller.
-        if text == UNKNOWN_ROUTE_FACT {
+        // `unknown` is reserved for the unexposed case (`None`), matched
+        // case-insensitively so no spelling variant can pose as observed
+        // evidence. Evidence must carry an actual observed value; an
+        // unexposed fact is reported as `None` by the caller.
+        if text.eq_ignore_ascii_case(UNKNOWN_ROUTE_FACT) {
             return Err(RouteReceiptError::UnknownAsEvidence(field));
         }
     }
@@ -384,53 +385,53 @@ impl GovernorRouteAttempt {
 mod tests {
     use super::*;
 
-    fn digest(hex_char: char) -> LowercaseSha256 {
+    fn digest(hex_char: char) -> Result<LowercaseSha256, serde_json::Error> {
         let hex: String = std::iter::repeat_n(hex_char, 64).collect();
-        serde_json::from_value(serde_json::Value::String(hex)).expect("test digest")
+        serde_json::from_value(serde_json::Value::String(hex))
     }
 
-    fn requested_route() -> RouteFingerprint {
-        RouteFingerprint {
+    fn requested_route() -> Result<RouteFingerprint, serde_json::Error> {
+        Ok(RouteFingerprint {
             host_family: "opencode".to_owned(),
             adapter: "eliot-opencode-adapter".to_owned(),
             protocol_transport: "HTTP+SSE".to_owned(),
-            runtime_hash: digest('a'),
-            adapter_hash: digest('b'),
+            runtime_hash: digest('a')?,
+            adapter_hash: digest('b')?,
             provider: "configured-provider".to_owned(),
             model: "configured-model".to_owned(),
             auth_billing: "configured-billing".to_owned(),
-            serializer_hash: digest('c'),
-            tool_semantics_hash: digest('d'),
+            serializer_hash: digest('c')?,
+            tool_semantics_hash: digest('d')?,
             reasoning_mode: "reasoning-visible".to_owned(),
             continuation_behavior: "native-resume".to_owned(),
-            feature_flags_hash: digest('e'),
-        }
+            feature_flags_hash: digest('e')?,
+        })
     }
 
-    fn unexposed_facts() -> RuntimeObservedFacts {
-        RuntimeObservedFacts {
+    fn unexposed_facts() -> Result<RuntimeObservedFacts, serde_json::Error> {
+        Ok(RuntimeObservedFacts {
             host_family: "opencode".to_owned(),
             adapter: "eliot-opencode-adapter".to_owned(),
             protocol_transport: "HTTP+SSE".to_owned(),
-            runtime_hash: digest('a'),
-            adapter_hash: digest('b'),
+            runtime_hash: digest('a')?,
+            adapter_hash: digest('b')?,
             provider: None,
             model: None,
             auth_billing: None,
-            serializer_hash: digest('c'),
-            tool_semantics_hash: digest('d'),
+            serializer_hash: digest('c')?,
+            tool_semantics_hash: digest('d')?,
             reasoning_mode: "reasoning-visible".to_owned(),
             continuation_behavior: "native-resume".to_owned(),
-            feature_flags_hash: digest('e'),
+            feature_flags_hash: digest('e')?,
             evidence_refs: vec!["handshake:session-1".to_owned()],
-        }
+        })
     }
 
     #[test]
-    fn requested_and_observed_are_recorded_separately_with_unknown_for_unexposed_facts(
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let requested = requested_route();
-        let facts = unexposed_facts();
+    fn requested_and_observed_are_recorded_separately_with_unknown_for_unexposed_facts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let requested = requested_route()?;
+        let facts = unexposed_facts()?;
         let receipt = ActualRouteReceipt::observe(requested.clone(), &facts)?;
         receipt.validate()?;
         // Requested policy selection is preserved verbatim.
@@ -460,10 +461,10 @@ mod tests {
     }
 
     #[test]
-    fn evidence_backed_observed_values_are_preserved_not_inferred(
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let requested = requested_route();
-        let mut facts = unexposed_facts();
+    fn evidence_backed_observed_values_are_preserved_not_inferred()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let requested = requested_route()?;
+        let mut facts = unexposed_facts()?;
         facts.provider = Some("observed-provider".to_owned());
         facts.model = Some("observed-model".to_owned());
         facts.auth_billing = Some("observed-billing".to_owned());
@@ -476,13 +477,13 @@ mod tests {
     }
 
     #[test]
-    fn serializer_or_tool_ordering_change_yields_distinct_fingerprint_and_no_capability_reuse(
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let base = requested_route();
+    fn serializer_or_tool_ordering_change_yields_distinct_fingerprint_and_no_capability_reuse()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let base = requested_route()?;
         let mut serializer_variant = base.clone();
-        serializer_variant.serializer_hash = digest('f');
+        serializer_variant.serializer_hash = digest('f')?;
         let mut tool_variant = base.clone();
-        tool_variant.tool_semantics_hash = digest('9');
+        tool_variant.tool_semantics_hash = digest('9')?;
 
         assert_ne!(
             effective_route_key(&base)?.as_str(),
@@ -493,19 +494,42 @@ mod tests {
             effective_route_key(&tool_variant)?.as_str()
         );
         assert!(!route_divergence_fields(&base, &serializer_variant).is_empty());
-        assert!(route_divergence_fields(&base, &serializer_variant)
-            .contains(&"serializer_hash".to_owned()));
-        assert!(route_divergence_fields(&base, &tool_variant)
-            .contains(&"tool_semantics_hash".to_owned()));
+        assert!(
+            route_divergence_fields(&base, &serializer_variant)
+                .contains(&"serializer_hash".to_owned())
+        );
+        assert!(
+            route_divergence_fields(&base, &tool_variant)
+                .contains(&"tool_semantics_hash".to_owned())
+        );
 
         let mut index = RouteCapabilityIndex::new();
-        index.insert(&base, digest('1'))?;
+        index.insert(&base, digest('1')?)?;
         assert_eq!(
             index.lookup(&base)?.map(LowercaseSha256::as_str),
-            Some(digest('1').as_str())
+            Some(digest('1')?.as_str())
         );
         assert_eq!(index.lookup(&serializer_variant)?, None);
         assert_eq!(index.lookup(&tool_variant)?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_marker_is_reserved_case_insensitively() -> Result<(), Box<dyn std::error::Error>> {
+        let requested = requested_route()?;
+        // No spelling variant of the reserved marker may pose as observed
+        // evidence; unexposed facts must be `None`.
+        for spelling in ["unknown", "Unknown", "UNKNOWN", "uNkNoWn"] {
+            let mut facts = unexposed_facts()?;
+            facts.provider = Some(spelling.to_owned());
+            let Err(error) = ActualRouteReceipt::observe(requested.clone(), &facts) else {
+                return Err(format!("reserved marker {spelling:?} was admitted").into());
+            };
+            assert!(
+                matches!(error, RouteReceiptError::UnknownAsEvidence("provider")),
+                "unexpected refusal for {spelling:?}: {error:?}"
+            );
+        }
         Ok(())
     }
 }
