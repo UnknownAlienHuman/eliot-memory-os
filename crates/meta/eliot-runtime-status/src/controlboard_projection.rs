@@ -404,9 +404,10 @@ mod tests {
     use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
     use eliot_controlboard::{
         AccessBinding, AccessResolverPort, AnchorResolution, AnchorTargetKind, BoardItem,
-        BoardItemKind, CanonicalState, CanonicalStatePort, ControlBoard, PortError,
-        ProjectionBinding, ProjectionProvider, ProviderCompleteness, ReadRequest, ReviewAnchor,
-        ReviewItem, ReviewLifecycle, Role, ViewRevision, Visibility,
+        BoardItemKind, CanonicalState, CanonicalStatePort, ControlBoard, NotificationInbox,
+        NotificationMetrics, PortError, ProjectionBinding, ProjectionProvider,
+        ProviderCompleteness, ReadRequest, ReviewAnchor, ReviewItem, ReviewLifecycle, Role,
+        ViewRevision, Visibility,
     };
     use eliot_evaluation_contracts::ObjectiveStatus;
     use eliot_evidence::{EpistemicStatus, EvidenceFreshness};
@@ -492,6 +493,10 @@ mod tests {
             ],
             reviews: vec![review("review-1")],
             provenance: Vec::new(),
+            notifications: NotificationInbox {
+                rows: Vec::new(),
+                metrics: NotificationMetrics::default(),
+            },
         }
     }
 
@@ -567,6 +572,7 @@ mod tests {
             ],
             reviews: vec![review("review-1")],
             provenance: Vec::new(),
+            notifications: Vec::new(),
         }
     }
 

@@ -168,6 +168,21 @@ pub fn project_read_page(
     })
 }
 
+/// Board-visible notification inbox section (issue #1780).
+///
+/// Rebuildable projection of the owner-supplied canonical records: every
+/// row the owner reports, with locally computed metrics. The board never
+/// filters this section by role, privacy, or quiet hours — canonical
+/// creation and board visibility are never suppressed. Consumers use
+/// [`inbox`], [`unresolved_critical`], and [`failed_delivery`] for the
+/// unresolved subsets.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotificationInbox {
+    pub rows: Vec<NotificationRow>,
+    pub metrics: NotificationMetrics,
+}
+
 /// Board metrics projected from canonical notification rows.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

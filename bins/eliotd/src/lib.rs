@@ -58,6 +58,7 @@ mod observation_adapters;
 mod process_origin;
 mod route_receipts;
 mod skill_bridge_adapter;
+pub mod skill_dispatch;
 mod skill_lifecycle_adapters;
 mod skill_surface_adapters;
 pub mod staffing_policy;
@@ -161,6 +162,7 @@ pub use route_receipts::{
     ActualRouteReceipt, GovernorRouteAttempt, RouteCapabilityIndex, RouteReceiptError,
     RuntimeObservedFacts, UNKNOWN_ROUTE_FACT, effective_route_key,
 };
+pub(crate) use skill_lifecycle_adapters::SkillHotsetRequest;
 pub use startup_evidence_producer::{
     DAEMON_STARTUP_EVIDENCE_OPERATION, EliotdStartupEvidence, MAX_CAPABILITY_OUTCOMES,
     MAX_EVIDENCE_REFS, MAX_REQUIRED_CAPABILITIES, MirrorObservation, RetainedCapabilitySummary,
@@ -692,6 +694,10 @@ impl DaemonComposition {
             snapshot,
             &self.operator_replay,
             admitted,
+            // #1780: the daemon does not yet read canonical notification
+            // state into its snapshot composition; the inbox section stays
+            // empty rather than fabricated until that read is wired.
+            Vec::new(),
         ))
     }
 

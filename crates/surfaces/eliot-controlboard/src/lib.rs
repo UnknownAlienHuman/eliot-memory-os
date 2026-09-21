@@ -33,6 +33,7 @@ use eliot_agent_coordinator::{HumanModelPreferencePolicy, ModelCatalogueSnapshot
 use eliot_contracts::{OperationId, RequestMetadata, SessionId};
 use eliot_evaluation_contracts::ObjectiveStatus;
 use eliot_evidence::{EpistemicStatus, EvidenceFreshness};
+use eliot_kernel_core::Notification;
 use eliot_observation_contracts::ObservationKind;
 use eliot_protocol::RequestIdentity;
 use eliot_receipts::ProofCeiling;
@@ -567,6 +568,10 @@ pub struct CanonicalState {
     pub items: Vec<BoardItem>,
     pub reviews: Vec<ReviewItem>,
     pub provenance: Vec<ProvenanceEdge>,
+    /// Canonical I11.5 notification records supplied by the notification
+    /// owner port. The board never mints these; an absent owner supply
+    /// reads as an empty inbox, never as resolved or suppressed state.
+    pub notifications: Vec<Notification>,
 }
 
 impl CanonicalState {
@@ -601,6 +606,20 @@ impl CanonicalState {
             edge.validate()?;
             if !edge_ids.insert(edge.edge_id.clone()) {
                 return Err(ControlBoardError::DuplicateId(edge.edge_id.clone()));
+            }
+        }
+        let mut dedup_keys = BTreeSet::new();
+        for notification in &self.notifications {
+            notification
+                .validate()
+                .map_err(|error| ControlBoardError::Provider(error.to_string()))?;
+            if notification.state_fence != self.fence {
+                return Err(ControlBoardError::FenceMismatch);
+            }
+            if !dedup_keys.insert(notification.dedup_key.clone()) {
+                return Err(ControlBoardError::DuplicateId(
+                    notification.dedup_key.clone(),
+                ));
             }
         }
         Ok(())
@@ -700,6 +719,10 @@ pub struct ControlBoardView {
     pub items: Vec<BoardItem>,
     pub reviews: Vec<ReviewItem>,
     pub provenance: Vec<ProvenanceEdge>,
+    /// Persistent notification inbox section (issue #1780, I11.2/I11.5).
+    /// Projected from the owner-supplied canonical records; never filtered
+    /// by role, privacy, or quiet hours at this layer.
+    pub notifications: NotificationInbox,
 }
 
 /// Typed operator actions; no action carries authority or process handles.
@@ -1649,12 +1672,21 @@ fn filter_view(state: CanonicalState, access: &AccessBinding) -> ControlBoardVie
                 && (visible_ids.contains(&edge.to_id) || visible_review_ids.contains(&edge.to_id))
         })
         .collect();
+    // Notification inbox: every owner-supplied canonical record projects
+    // without role/privacy/quiet-hours filtering. Canonical creation and
+    // board visibility are never suppressed at this layer.
+    let notification_rows = notification_projection::project(&state.notifications);
+    let notification_metrics = notification_projection::metrics(&notification_rows);
     ControlBoardView {
         revision: state.revision,
         fence: state.fence,
         items,
         reviews,
         provenance,
+        notifications: NotificationInbox {
+            rows: notification_rows,
+            metrics: notification_metrics,
+        },
     }
 }
 
@@ -1957,6 +1989,7 @@ mod tests {
                     receipt_ref: None,
                 },
             ],
+            notifications: Vec::new(),
         }
     }
 
@@ -2035,6 +2068,104 @@ mod tests {
             view.reviews[0].anchor.resolution,
             AnchorResolution::Ambiguous
         );
+    }
+
+    fn board_notification(
+        key: &str,
+        severity: eliot_kernel_core::NotificationSeverity,
+        failed: bool,
+        acknowledged: bool,
+        resolved: bool,
+    ) -> Notification {
+        Notification {
+            notification_id: serde_json::from_value(serde_json::json!(format!(
+                "notification-{key}"
+            )))
+            .expect("notification id"),
+            severity,
+            subject: "subject".to_owned(),
+            summary: "summary".to_owned(),
+            evidence_handles: vec!["evidence-1".to_owned()],
+            affected_scope: "scope-1".to_owned(),
+            owner: "owner-1".to_owned(),
+            required_action: "review".to_owned(),
+            deadline_or_review: None,
+            dedup_key: key.to_owned(),
+            delivery_channels: vec![eliot_kernel_core::DeliveryChannel::ControlBoard],
+            occurrences: 1,
+            delivery: if failed {
+                eliot_kernel_core::DeliveryState::Failed {
+                    reason: "toast provider failed".to_owned(),
+                }
+            } else {
+                eliot_kernel_core::DeliveryState::Delivered
+            },
+            acknowledgement: acknowledged.then(|| eliot_kernel_core::Acknowledgement {
+                principal: "operator-1".to_owned(),
+                sequence: 1,
+            }),
+            resolution_ref: resolved.then(|| eliot_kernel_core::ResolutionRef {
+                receipt_id: "receipt-1".to_owned(),
+                authority_id: "authority-1".to_owned(),
+                authority_owner: "owner-1".to_owned(),
+                evidence_handles: vec!["evidence-1".to_owned()],
+                disposition: "fixed".to_owned(),
+            }),
+            state_fence: fence(),
+            revision: 1,
+        }
+    }
+
+    #[test]
+    fn notification_inbox_section_keeps_ack_failed_and_resolved_visible() {
+        use eliot_kernel_core::NotificationSeverity::{Critical, Information};
+        let mut inbox_state = state();
+        inbox_state.notifications = vec![
+            board_notification("backup-failed", Critical, true, true, false),
+            board_notification("routine-sync", Information, false, false, false),
+            board_notification("old-news", Critical, false, false, true),
+        ];
+        let mut board = ControlBoard::new(
+            Some(Box::new(access(
+                Role::ReadOnlyApi,
+                &[],
+                &[PrivacyClass::Public],
+            ))),
+            Some(Box::new(FakeRead { state: inbox_state })),
+            None,
+        );
+        let view = board.view(&read_request(Role::ReadOnlyApi)).expect("view");
+        // Every owner-supplied record projects; nothing is filtered by role,
+        // privacy, or quiet hours at this layer.
+        assert_eq!(view.notifications.rows.len(), 3);
+        let acked = view
+            .notifications
+            .rows
+            .iter()
+            .find(|row| row.dedup_key == "backup-failed")
+            .expect("acked critical row");
+        assert!(acked.acknowledged);
+        assert!(acked.is_unresolved());
+        assert!(acked.delivery_failed);
+        assert_eq!(
+            acked.failure_reason.as_deref(),
+            Some("toast provider failed")
+        );
+        // Resolved records stay in the section with their disposition while
+        // leaving every unresolved subset.
+        let resolved = view
+            .notifications
+            .rows
+            .iter()
+            .find(|row| row.dedup_key == "old-news")
+            .expect("resolved row");
+        assert!(!resolved.is_unresolved());
+        let metrics = view.notifications.metrics;
+        assert_eq!(metrics.total, 3);
+        assert_eq!(metrics.unresolved, 2);
+        assert_eq!(metrics.critical_unresolved, 1);
+        assert_eq!(metrics.failed_delivery, 1);
+        assert_eq!(metrics.acknowledged_unresolved, 1);
     }
 
     #[test]
