@@ -23,14 +23,15 @@ use eliot_store_api::{
     CanonicalRequestView, CanonicalStoreClient, CanonicalValidationSnapshot, NamedReadRequest,
     NamedReadResponse, OrderingHeadExpectation, PreparedTransition, RequestMeta,
     ReservedWriteRequest, RevisionHeadExpectation, StoreError, StoreGenesisRequest, StoreHealth,
-    StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt, verify_canonical_request_hash,
+    StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt, generated_operation_manifests,
+    verify_canonical_request_hash,
 };
 
 use crate::commit_recovery::recover_commit;
 use crate::store_write_reservation::{
-    CompositionReservation, ReservationSeed, ResolvedSendOutcome, begin_execute_after_send,
-    cancel_before_send, ensure_eligible, finalize_reservation, mark_unknown_outcome,
-    project_reserved_write, reconcile_receipt, reserve_for_transition, writer_epoch_for_fence,
+    CompositionReservation, ReservationSeed, ReservedSubmission, ResolvedSendOutcome,
+    begin_execute_after_send, cancel_before_send, ensure_eligible, finalize_reservation,
+    mark_unknown_outcome, reconcile_receipt, reserve_for_transition, writer_epoch_for_fence,
     writer_epoch_for_fence_from_epoch,
 };
 use crate::{EbpCanonicalStoreClient, EbpStoreTransport, KernelService};
@@ -235,29 +236,17 @@ impl KernelStoreGateway {
         if self.is_fenced() {
             return Err("canonical-store gateway is fenced for rebind".to_owned());
         }
-        context.validate().map_err(|error| error.to_string())?;
-        transition.validate().map_err(|error| error.to_string())?;
+        // 1927: authenticate the caller before plan admission (I5.6 step 1),
+        // mirroring `apply_reserved_admission`.
         if context.source_id.as_str() != ACTIVE_DAEMON_CALLER {
             return Err("transition caller is not the active daemon".to_owned());
         }
-        if transition.state_fence != context.state_fence {
-            return Err("transition state fence does not match request metadata".to_owned());
-        }
-        // RECHECK-63 slice B: recompute the canonical request hash from the
-        // exact values about to be executed (context + transition + expected
-        // heads) and reject divergence before any store work. The view is
-        // built from these references — not re-forwarded copies — so a
-        // mutation after admission fails here with the typed mismatch.
-        {
-            let view = CanonicalRequestView::from_apply(
-                context,
-                &transition,
-                &expected_revision_heads,
-                &expected_ordering_heads,
-            );
-            verify_canonical_request_hash(&view, &transition.identity.canonical_request_hash)
-                .map_err(|error| error.to_string())?;
-        }
+        admit_prepared_transition(
+            context,
+            &transition,
+            &expected_revision_heads,
+            &expected_ordering_heads,
+        )?;
 
         let lease = {
             let service = self
@@ -439,7 +428,11 @@ impl KernelStoreGateway {
             return Err("canonical-store gateway is fenced for rebind".to_owned());
         }
         let operation_id = transition.identity.operation_id.as_str().to_owned();
-        let request = project_reserved_write(
+        // The single authenticated send goes through the Kernel-visible
+        // reserved submission (issue #2031): the exact `#990` projection plus
+        // the boundary validation, so the production path and the tested
+        // projection share one constructor and one serializer.
+        let submission = ReservedSubmission::from_sealed(
             &sealed,
             context,
             &transition,
@@ -447,7 +440,10 @@ impl KernelStoreGateway {
             expected_ordering_heads,
         )
         .map_err(|error| error.to_string())?;
-        let outcome = self.store.apply_reserved_write(request).await;
+        let outcome = self
+            .store
+            .apply_reserved_write(submission.into_request())
+            .await;
         match outcome {
             Ok(receipt) => {
                 // Execution starts only now that the single send resolved: a
@@ -624,6 +620,39 @@ impl KernelStoreGateway {
         receipt: &WriteReceipt,
     ) -> Result<ReservationRecord, String> {
         store_receipt_gateway::reconcile_reserved(self, token, request, receipt)
+    }
+
+    /// Projects one sealed reservation into a Kernel-visible reserved
+    /// submission carrying the reserved capability (issue #2031).
+    ///
+    /// Runs the exact `#990` projection shared with [`Self::apply_reserved`]
+    /// without sending: the returned submission is validated and ready for the
+    /// single authenticated send. A fenced gateway refuses the projection, so
+    /// no new submission is minted while migration exclusivity holds.
+    /// Synchronous: projection is bounded local validation only, never ORS or
+    /// network work.
+    pub fn project_reserved_submission(
+        &self,
+        sealed: &crate::SealedReservation,
+        context: &RequestMetadata,
+        transition: &PreparedTransition,
+        expected_revision_heads: Vec<RevisionHeadExpectation>,
+        expected_ordering_heads: Vec<OrderingHeadExpectation>,
+    ) -> Result<ReservedSubmission, String> {
+        if self.is_fenced() {
+            return Err(
+                "canonical-store gateway is fenced for rebind; refusing reserved projection"
+                    .to_owned(),
+            );
+        }
+        ReservedSubmission::from_sealed(
+            sealed,
+            context,
+            transition,
+            expected_revision_heads,
+            expected_ordering_heads,
+        )
+        .map_err(|error| error.to_string())
     }
 
     /// Drains reserved work before migration exclusivity (issue #992).
@@ -940,12 +969,64 @@ fn validate_route(
     Ok(())
 }
 
+/// Deterministic `PreparedTransition` admission before store execution (1927).
+///
+/// Guards the unreserved `apply` entry point: identity/shape validation, fence equality, canonical
+/// request-hash recompute over the exact executable bytes, and operation
+/// manifest support against the currently admitted catalogue. A plan whose
+/// contents, effect ceiling, named operation parameters, or admission digest
+/// changed after staging fails the hash recompute rather than executing. A
+/// plan whose recorded manifest is not in the current catalogue fails as
+/// visible recovery work: it is refused with an explicit unsupported error
+/// and is never reinterpreted, widened, or translated under new code. A
+/// staged transition therefore survives daemon replacement only when the
+/// replacement Kernel explicitly supports its recorded contract digest and
+/// operation manifest.
+fn admit_prepared_transition(
+    context: &RequestMetadata,
+    transition: &PreparedTransition,
+    expected_revision_heads: &[RevisionHeadExpectation],
+    expected_ordering_heads: &[OrderingHeadExpectation],
+) -> Result<(), String> {
+    context.validate().map_err(|error| error.to_string())?;
+    transition.validate().map_err(|error| error.to_string())?;
+    if transition.state_fence != context.state_fence {
+        return Err("transition state fence does not match request metadata".to_owned());
+    }
+    // RECHECK-63 slice B: recompute the canonical request hash from the
+    // exact values about to be executed (context + transition + expected
+    // heads) and reject divergence before any store work. The view is
+    // built from these references — not re-forwarded copies — so a
+    // mutation after admission fails here with the typed mismatch.
+    let view = CanonicalRequestView::from_apply(
+        context,
+        transition,
+        expected_revision_heads,
+        expected_ordering_heads,
+    );
+    verify_canonical_request_hash(&view, &transition.identity.canonical_request_hash)
+        .map_err(|error| error.to_string())?;
+    let entries = generated_operation_manifests().map_err(|error| error.to_string())?;
+    transition
+        .validate_against_catalogue(&entries)
+        .map_err(|error| {
+            format!(
+                "unsupported prepared transition; preserve as recovery, do not reinterpret: {error}"
+            )
+        })?;
+    Ok(())
+}
+
 /// Reserved-write admission gates shared by the gateway entry point.
 ///
 /// Mirrors the `apply` gates (context/transition validation, active daemon
 /// caller, fence equality): the caller rule lives at this boundary while the
-/// binding rules live in the reservation module. Staging step so the entry
-/// point stays a composition of audited gates.
+/// binding rules live in the reservation module. The canonical request-hash
+/// recompute runs in the entry body before reservation, and manifest support
+/// is enforced at store execution by the bridge catalogue gate, so a staged
+/// plan that the replacement store no longer supports stays staged as
+/// visible recovery work instead of being reinterpreted here. Staging step so
+/// the entry point stays a composition of audited gates.
 fn apply_reserved_admission(
     context: &RequestMetadata,
     transition: &PreparedTransition,
@@ -1032,6 +1113,113 @@ mod tests {
             assert!(flight.is_fenced());
             assert!(flight.enter().is_err());
         });
+    }
+
+    #[test]
+    fn prepared_admission_rejects_tampered_and_unsupported_plans() {
+        // 1927 acceptance: changing the plan contents, effect ceiling, named
+        // operation parameters, or admission digest after staging causes
+        // rejection rather than execution; an unsupported recorded plan is
+        // visible as recovery work and is not reinterpreted.
+        use std::collections::BTreeMap;
+        use std::num::NonZeroU64;
+
+        use eliot_contracts::{
+            ClockReading, EpochLineageId, ProductId, RequestId, ResourceGeneration, SourceId,
+        };
+        use eliot_store_api::{
+            EffectClass, EventProjectionRelationIntents, NamedMutationOperation,
+            NamedMutationRequest, OperationIdentity, OperationManifestDigest, OrderingScopeId,
+            ScopeId, SecurityContext, TransitionClass, canonical_request_hash,
+            operation_manifest_set_digest,
+        };
+
+        const LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+        let epoch = EpochId::new(
+            EpochLineageId::new(LINEAGE).unwrap_or_else(|_| unreachable!()),
+            NonZeroU64::new(1).unwrap_or_else(|| unreachable!()),
+        )
+        .unwrap_or_else(|_| unreachable!());
+        let fence = StateFence::new(epoch, ResourceGeneration::genesis());
+        let context = RequestMeta {
+            request_id: RequestId::new("req-1927-1").unwrap_or_else(|_| unreachable!()),
+            session_id: None,
+            task_id: None,
+            product_id: ProductId::new("product-1927").unwrap_or_else(|_| unreachable!()),
+            source_id: SourceId::new("eliotd").unwrap_or_else(|_| unreachable!()),
+            state_fence: fence.clone(),
+            clock: ClockReading::default(),
+        };
+        let entries = generated_operation_manifests().unwrap_or_else(|_| unreachable!());
+        let set_digest = operation_manifest_set_digest(&entries).unwrap_or_else(|_| unreachable!());
+        let mut transition = PreparedTransition {
+            identity: OperationIdentity {
+                operation_id: OperationId::new("op-1927-1").unwrap_or_else(|_| unreachable!()),
+                idempotency_key: "idem-1927-1".to_owned(),
+                canonical_request_hash: "0".repeat(64),
+            },
+            state_fence: fence,
+            scope_id: ScopeId::new("scope-1927").unwrap_or_else(|_| unreachable!()),
+            task_id: None,
+            ordering_scopes: vec![
+                OrderingScopeId::new("scope-1927").unwrap_or_else(|_| unreachable!()),
+            ],
+            transition_class: TransitionClass::CaptureCandidate,
+            requested_effect_ceiling: EffectClass::Candidate,
+            admission_contract_set_digest: "b".repeat(64),
+            operation_manifest_digest: set_digest,
+            named_operations: vec![NamedMutationRequest {
+                operation: NamedMutationOperation::CaptureObservation,
+                parameters: BTreeMap::from([(
+                    "subject".to_owned(),
+                    serde_json::json!("observation-1927-1"),
+                )]),
+            }],
+            event_projection_relation_intents: EventProjectionRelationIntents {
+                event_ids: Vec::new(),
+                projection_kinds: Vec::new(),
+                relation_kinds: Vec::new(),
+            },
+            security: SecurityContext::default(),
+            required_proof_and_approval_refs: Vec::new(),
+        };
+        transition.identity.canonical_request_hash = canonical_request_hash(
+            &CanonicalRequestView::from_apply(&context, &transition, &[], &[]),
+        )
+        .unwrap_or_else(|_| unreachable!());
+        admit_prepared_transition(&context, &transition, &[], &[])
+            .unwrap_or_else(|_| unreachable!());
+
+        let mut widened = transition.clone();
+        widened.requested_effect_ceiling = EffectClass::ReversibleMutation;
+        assert!(admit_prepared_transition(&context, &widened, &[], &[]).is_err());
+
+        let mut reparam = transition.clone();
+        reparam.named_operations[0].parameters.insert(
+            "subject".to_owned(),
+            serde_json::json!("observation-substituted"),
+        );
+        assert!(admit_prepared_transition(&context, &reparam, &[], &[]).is_err());
+
+        let mut redigest = transition.clone();
+        redigest.admission_contract_set_digest = "d".repeat(64);
+        assert!(admit_prepared_transition(&context, &redigest, &[], &[]).is_err());
+
+        let mut unsupported = transition.clone();
+        unsupported.operation_manifest_digest =
+            OperationManifestDigest::new("f".repeat(64)).unwrap_or_else(|_| unreachable!());
+        unsupported.identity.canonical_request_hash = canonical_request_hash(
+            &CanonicalRequestView::from_apply(&context, &unsupported, &[], &[]),
+        )
+        .unwrap_or_else(|_| unreachable!());
+        let error = match admit_prepared_transition(&context, &unsupported, &[], &[]) {
+            Err(error) => error,
+            Ok(()) => unreachable!("unsupported manifest must fail"),
+        };
+        assert!(
+            error.contains("recovery"),
+            "unsupported plan must name recovery, got: {error}"
+        );
     }
 }
 

@@ -22,6 +22,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod tool_exposure;
+
 /// Stable wire name for this C0-02 contract family.
 pub const CONTRACT_NAME: &str = "eliot.foundation.receipts";
 /// Current wire revision for this contract family.

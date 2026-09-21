@@ -577,7 +577,9 @@ dependencies = [
  "eliot-agent-api",
  "eliot-bootstrap",
  "eliot-cli",
+ "eliot-config",
  "eliot-contracts",
+ "eliot-doctor",
  "eliot-governor",
  "eliot-host-state",
  "eliot-installation",
@@ -1479,6 +1481,7 @@ dependencies = [
  "eliot-contracts",
  "eliot-dreamer-contracts",
  "eliot-evidence",
+ "eliot-security-contracts",
  "schemars",
  "serde",
 ]
@@ -1510,7 +1513,10 @@ dependencies = [
 name = "eliot-dreamer-probe-plan"
 version = "0.1.0"
 dependencies = [
+ "eliot-contracts",
  "eliot-dreamer-contracts",
+ "eliot-evaluation-contracts",
+ "eliot-receipts",
  "schemars",
  "serde",
 ]
@@ -1629,6 +1635,7 @@ dependencies = [
  "eliot-evidence",
  "schemars",
  "serde",
+ "serde_json",
  "thiserror",
 ]
 
@@ -1692,6 +1699,18 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "eliot-git-bridge"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-platform",
+ "eliot-process",
+ "eliot-process-executor",
+ "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]
@@ -1765,6 +1784,7 @@ dependencies = [
  "eliot-protocol",
  "eliot-receipts",
  "eliot-runtime-contracts",
+ "eliot-windows-ipc",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -1956,6 +1976,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-integration-coverage"
+version = "0.1.0"
+dependencies = [
+ "schemars",
+ "serde",
+ "thiserror",
+]
+
+[[package]]
 name = "eliot-ipc"
 version = "0.1.0"
 dependencies = [
@@ -2135,6 +2164,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-lsp-bridge"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-instrument-api",
+ "eliot-instrument-scip",
+ "eliot-platform",
+ "eliot-process",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror",
+]
+
+[[package]]
 name = "eliot-maintenance"
 version = "0.1.0"
 dependencies = [
@@ -2166,9 +2210,11 @@ name = "eliot-memory-curation"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "eliot-contracts",
+ "eliot-epistemic",
+ "eliot-evidence",
  "schemars",
  "serde",
- "serde_json",
  "thiserror",
 ]
 
@@ -2330,6 +2376,7 @@ name = "eliot-ors"
 version = "0.1.0"
 dependencies = [
  "eliot-contracts",
+ "eliot-ors",
  "eliot-platform",
  "eliot-process",
  "eliot-receipts",
@@ -2597,13 +2644,20 @@ name = "eliot-runtime-status"
 version = "0.1.0"
 dependencies = [
  "eliot-contracts",
+ "eliot-controlboard",
+ "eliot-evaluation-contracts",
+ "eliot-evidence",
  "eliot-host-state",
  "eliot-installation",
+ "eliot-ipc",
+ "eliot-observation-contracts",
  "eliot-ors",
  "eliot-platform",
  "eliot-platform-windows",
  "eliot-process",
+ "eliot-protocol",
  "eliot-runtime-contracts",
+ "eliot-security-contracts",
  "eliot-store-api",
  "redb",
  "serde",
@@ -2646,6 +2700,10 @@ dependencies = [
  "serde",
  "thiserror",
 ]
+
+[[package]]
+name = "eliot-sim-core"
+version = "0.1.0"
 
 [[package]]
 name = "eliot-skill"
@@ -2977,9 +3035,11 @@ dependencies = [
  "eliot-runtime",
  "eliot-runtime-contracts",
  "eliot-watchdog-core",
+ "eliot-windows-ipc",
  "redb",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror",
  "tokio",
  "tracing",
@@ -3020,6 +3080,7 @@ dependencies = [
  "eliot-agent-contracts",
  "eliot-agent-coordinator",
  "eliot-authority",
+ "eliot-config",
  "eliot-contracts",
  "eliot-controlboard",
  "eliot-doctor-core",
@@ -3032,6 +3093,7 @@ dependencies = [
  "eliot-governor",
  "eliot-ipc",
  "eliot-maintenance",
+ "eliot-observability",
  "eliot-platform",
  "eliot-platform-windows",
  "eliot-protocol",

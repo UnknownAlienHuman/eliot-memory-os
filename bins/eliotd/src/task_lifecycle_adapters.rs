@@ -32,8 +32,8 @@
 #![forbid(unsafe_code)]
 
 use eliot_governor::{
-    GovernorTaskLifecycle, KernelTransitionPort, TaskCommand, TaskCommandContext, TaskLifecycleError,
-    TaskProposal, TaskRecord,
+    GovernorTaskLifecycle, KernelTransitionPort, TaskCommand, TaskCommandContext,
+    TaskLifecycleError, TaskProposal, TaskRecord,
 };
 
 /// Forwards the task-command path to the single Governor task owner.

@@ -27,9 +27,11 @@ eliot-dreamer-claim-grounding = { path = "../../crates/smart/eliot-dreamer-claim
 eliot-dreamer-probe-plan = { path = "../../crates/smart/eliot-dreamer-probe-plan" }
 eliot-dreamer-rival-model = { path = "../../crates/smart/eliot-dreamer-rival-model" }
 eliot-evaluation-contracts.workspace = true
+eliot-config.workspace = true
 eliot-governor.workspace = true
 eliot-ipc.workspace = true
 eliot-maintenance.workspace = true
+eliot-observability = { path = "../../crates/instrument/eliot-observability" }
 eliot-platform.workspace = true
 eliot-platform-windows.workspace = true
 eliot-protocol.workspace = true
