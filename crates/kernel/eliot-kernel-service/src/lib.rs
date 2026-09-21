@@ -48,6 +48,7 @@ mod store_write_reservation;
 mod store_write_reservation_tests;
 mod testd_front_door;
 mod user_automation;
+mod user_automation_execution;
 mod user_automation_store;
 #[cfg(test)]
 mod user_automation_store_tests;
@@ -176,6 +177,14 @@ pub use user_automation::{
     UserAutomationMutationResult, UserAutomationReadResult, UserAutomationService,
     UserAutomationServiceError, UserAutomationServiceRequest, UserAutomationStoreOutcome,
     UserAutomationStorePort, UserAutomationStoreRequest, UserAutomationStoreResponse,
+};
+pub use user_automation_execution::{
+    UserAutomationDurableJobPort, UserAutomationExecutionError, UserAutomationExecutionOutcome,
+    UserAutomationExecutionRequest, UserAutomationFailureHistory,
+    UserAutomationFailureHistoryPort, UserAutomationFailurePublication, UserAutomationFailureRecord,
+    UserAutomationNotificationDelivery, UserAutomationNotificationPort, UserAutomationRemovalResult,
+    UserAutomationRuntimeAdmission, UserAutomationRuntimeComposition, UserAutomationRuntimeError,
+    UserAutomationRuntimePort, UserAutomationWakeCancellation, UserAutomationWakePort,
 };
 pub use user_automation_store::CanonicalUserAutomationStore;
 pub use write_coordinator::{
