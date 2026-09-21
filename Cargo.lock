@@ -2200,6 +2200,7 @@ dependencies = [
 name = "eliot-mcp"
 version = "0.1.0"
 dependencies = [
+ "eliot-kernel-core",
  "eliot-protocol",
  "eliot-receipts",
  "eliot-security-contracts",

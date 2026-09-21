@@ -4,10 +4,10 @@ use std::collections::BTreeMap;
 
 use eliot_mcp::{
     CANONICAL_DEFINITION_VERSION, CANONICAL_TOOL_NAMES, OperationalProjection, StateInput,
-    ToolMethodIdentity, ToolRequest, canonical_known_tools, canonical_registry,
-    invalidation_on_profile_change, known_tool_profile, profile_version_changed,
-    published_mcp_tool_surface, routing_decision, validate_operational_projection,
-    validate_tool_request_owner,
+    ToolMethodIdentity, ToolRequest, UserAutomationInput, canonical_known_tools,
+    canonical_registry, invalidation_on_profile_change, known_tool_profile,
+    profile_version_changed, published_mcp_tool_surface, routing_decision,
+    validate_operational_projection, validate_tool_request_owner,
 };
 
 fn identity(name: &str) -> ToolMethodIdentity {
@@ -142,6 +142,26 @@ fn canonical_registry_value_answers_version_bound_skill_membership() {
             .resolve("vendor.effect", CANONICAL_DEFINITION_VERSION)
             .is_err(),
         "unprofiled method must be absent, never synthesized"
+    );
+}
+
+#[test]
+fn user_automation_route_has_one_semantic_owner() {
+    let request = ToolRequest::UserAutomation(UserAutomationInput {
+        operation: eliot_kernel_core::UserAutomationOperation::List {
+            include_retired: false,
+        },
+        idempotency_key: "operator-retry-1".to_owned(),
+    });
+    let profile = validate_tool_request_owner(&request).expect("UserAutomation route is owned");
+    assert_eq!(profile.method.canonical_name, "eliot_user_automation");
+    assert!(!routing_decision(&profile).read_only);
+    assert!(!routing_decision(&profile).retry_safe);
+    let surface = published_mcp_tool_surface().expect("material surface builds");
+    assert!(
+        surface
+            .iter()
+            .any(|descriptor| descriptor.name == "eliot_user_automation")
     );
 }
 

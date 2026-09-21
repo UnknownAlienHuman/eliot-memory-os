@@ -2,6 +2,7 @@
 
 use std::collections::BTreeSet;
 
+use eliot_kernel_core::UserAutomationOperation;
 use eliot_protocol::{HARD_STRUCTURED_RESPONSE_BYTES, RequestIdentity};
 use eliot_receipts::{ProofCeiling, SessionBinding};
 use eliot_security_contracts::{EffectCeiling, InstructionTaint, PrivacyClass};
@@ -58,6 +59,9 @@ pub struct ApplicationRequest {
     pub tool: ToolRequest,
 }
 
+/// Authenticated Kernel selector for the UserAutomation operator route.
+pub const USER_AUTOMATION_ROUTE: &str = "eliot_user_automation";
+
 /// Exact canonical tool requests.
 #[derive(Clone, Debug, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "name", content = "arguments", deny_unknown_fields)]
@@ -86,6 +90,9 @@ pub enum ToolRequest {
     /// Candidate finish attempt.
     #[serde(rename = "eliot.finish")]
     Finish(FinishAttemptDraft),
+    /// Authenticated UserAutomation operator operation.
+    #[serde(rename = "eliot_user_automation")]
+    UserAutomation(UserAutomationInput),
 }
 
 impl ToolRequest {
@@ -101,6 +108,7 @@ impl ToolRequest {
             Self::Verify(_) => "eliot.verify",
             Self::Coordinate(_) => "eliot.coordinate",
             Self::Finish(_) => "eliot.finish",
+            Self::UserAutomation(_) => USER_AUTOMATION_ROUTE,
         }
     }
 
@@ -114,7 +122,35 @@ impl ToolRequest {
             Self::Verify(value) => value.validate(),
             Self::Coordinate(value) => value.validate(),
             Self::Finish(value) => value.validate(),
+            Self::UserAutomation(value) => value.validate(),
         }
+    }
+}
+
+/// Typed UserAutomation operator input for the authenticated Host/MCP route.
+///
+/// The surface carries only the closed Kernel-owned operation vocabulary and a
+/// retry-stable idempotency key. Principal, session, request metadata,
+/// StateFence, WorkScope authority, provider identity, scheduler state and
+/// Store receipts are authenticated and supplied by Kernel composition.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAutomationInput {
+    /// Existing Kernel-owned closed operator operation.
+    pub operation: UserAutomationOperation,
+    /// Retry-stable caller key; it is not an authority or Store identity.
+    pub idempotency_key: String,
+}
+
+impl UserAutomationInput {
+    fn validate(&self) -> Result<(), ContractViolation> {
+        self.operation
+            .validate()
+            .map_err(|_error| ContractViolation::InvalidField {
+                field: "user_automation.operation",
+                reason: "closed UserAutomation operation is invalid",
+            })?;
+        non_blank(&self.idempotency_key, "user_automation.idempotency_key")
     }
 }
 
@@ -786,7 +822,7 @@ pub const PROTECTED_ENVELOPE_KEYS: [&str; 6] = [
 
 /// Explicitly admitted tool variants.
 /// Unknown variants are rejected before collapse; no trial decoding is used.
-pub const ADMITTED_TOOL_NAMES: [&str; 8] = [
+pub const ADMITTED_TOOL_NAMES: [&str; 9] = [
     "eliot.state",
     "eliot.packet",
     "eliot.observe",
@@ -795,6 +831,7 @@ pub const ADMITTED_TOOL_NAMES: [&str; 8] = [
     "eliot.verify",
     "eliot.coordinate",
     "eliot.finish",
+    "eliot_user_automation",
 ];
 
 /// Maximum decoded control-name length echoed in diagnostics. Longer names
