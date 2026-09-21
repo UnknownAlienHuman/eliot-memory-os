@@ -391,27 +391,33 @@ impl DaemonKernelClient {
             .and_then(|guard| guard.clone())
     }
 
-    /// Returns the live Kernel fence (authority epoch plus resource
-    /// generation) from the retained connection snapshot for startup
-    /// evidence binding (I1.11 steps 8/9). Read-only over held fields; the
-    /// snapshot was validated at handshake and refreshed by the snapshot
-    /// request, never synthesized here.
+    /// Returns the live Kernel fence from the retained connection snapshot
+    /// for startup evidence binding (I1.11 steps 8/9). Read-only over held
+    /// fields via the snapshot owner's fence projection; never synthesized
+    /// here.
     pub fn kernel_fence(&self) -> eliot_contracts::StateFence {
-        eliot_contracts::StateFence::new(
-            self.snapshot.authority_epoch.clone(),
-            self.snapshot.generation,
-        )
+        self.snapshot.state_fence()
+    }
+
+    /// Mints the transport operation binding for one startup evidence
+    /// publish. The identity is minted by the authenticated channel owner
+    /// for this exact publish (same contour as `daemon_ready`) and
+    /// correlated by [`Self::send_startup_evidence`]; the producer never
+    /// mints identities.
+    pub fn mint_startup_evidence_identity(&self) -> Result<RequestIdentity, super::DaemonError> {
+        self.next_identity(super::startup_evidence_producer::DAEMON_STARTUP_EVIDENCE_OPERATION)
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))
     }
 
     /// Publishes one validated Governor startup evidence payload on the
-    /// authenticated daemon channel for the Kernel step 8/9 consumer
-    /// (`daemon_startup_evidence`, alongside the existing `daemon_ready`
-    /// live receipt). The payload is validated before transport; Kernel
-    /// rejection of the not-yet-served operation is fail-closed and
-    /// expected until the consumer lands.
-    pub fn report_startup_evidence(
+    /// authenticated daemon channel for the Kernel step 8/9 consumer,
+    /// correlated to the minted `identity`. The payload is validated before
+    /// transport; Kernel rejection of the not-yet-served operation is
+    /// fail-closed and expected until the consumer lands.
+    pub fn send_startup_evidence(
         &self,
         evidence: &super::startup_evidence_producer::EliotdStartupEvidence,
+        identity: RequestIdentity,
     ) -> Result<(), super::DaemonError> {
         evidence
             .validate()
@@ -425,16 +431,17 @@ impl DaemonKernelClient {
                 .build()
                 .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
             runtime
-                .block_on(self.transact_async(
+                .block_on(self.transact_async_with_identity(
                     super::startup_evidence_producer::DAEMON_STARTUP_EVIDENCE_OPERATION,
                     payload,
+                    identity,
                 ))
                 .map(|_| ())
                 .map_err(|error| super::DaemonError::Kernel(error.to_string()))
         }
         #[cfg(not(windows))]
         {
-            let _ = payload;
+            let _ = (payload, identity);
             Err(super::DaemonError::Kernel(
                 KernelClientError::Unsupported.to_string(),
             ))

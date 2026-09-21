@@ -5,27 +5,34 @@
 //! capability set is evaluated); I1.10 (service health) readiness meaning;
 //! A2.3 (contract → ports → adapters layering); A0.3 hard boundaries stay
 //! fail-closed. This cell is the Governor application evaluation owned by
-//! `eliotd`: it binds live canonical mirror rebuild outputs, the active
-//! operation identity and fence, and required capability outcomes into one
-//! authenticated [`EliotdStartupEvidence`] payload for the Kernel consumer
-//! (`bins/eliot-kernel` step 8/9 cursor; see `2241-owner-handoff.md`).
+//! `eliotd`: it binds the live transport operation binding, the admitted and
+//! observed fences, canonical mirror rebuild outputs, and required
+//! capability outcomes into one authenticated [`EliotdStartupEvidence`]
+//! payload for the Kernel consumer (`bins/eliot-kernel` step 8/9 cursor;
+//! see `2241-owner-handoff.md` and `1967-governor-protocol-handoff.md`).
 //!
-//! Fail-closed rules (no invented readiness):
+//! Evidence model (no completed flags, no ready synthesis):
 //!
+//! - the payload carries observed VALUES (present) and explicit ABSENCE
+//!   markers (`None`), never a step claim. The Kernel cursor records a step
+//!   only from satisfied values; absent markers leave the step absent. A
+//!   missing acquirable input (transport binding, fences, Config mirror)
+//!   blocks the build with [`StartupEvidenceError::Missing`]; inputs whose
+//!   owner does not exist yet in this tree (Policy mirror, required set,
+//!   outcomes, registry digest, generation fingerprint) build as absence
+//!   markers with warn diagnostics naming them.
 //! - ready is never set from a nonempty list, a caller flag, or a newly
-//!   instantiated default `Config`. Both mirror digests must be validated
+//!   instantiated default `Config`. Present mirror digests must be validated
 //!   [`PlatformHandle`] values and byte-equal between the canonical source
-//!   and the rebuilt mirror. A missing mirror is explicit not-ready evidence
-//!   ([`StartupEvidenceError::Missing`]), never a silent skip.
-//! - the operation fence must validate and be exactly compatible with the
-//!   independently observed Kernel fence (same authority tuple and
-//!   generation); a wrong generation or fence blocks the payload.
-//! - every required capability needs a validated, live outcome covering it;
-//!   an unvalidated broad outcome, an expired outcome, or a required
-//!   capability the registry view deems ineligible blocks the payload. The
-//!   capability registry digest is recomputed from the evaluated outcomes and
-//!   must match the threaded digest, so bare definition agreement without the
-//!   same dependencies cannot pass.
+//!   and the rebuilt mirror. The operation fence must equal the transport
+//!   binding fence exactly and be compatible with the independently observed
+//!   Kernel fence (same authority tuple and generation).
+//! - every observed required capability needs a validated, live outcome
+//!   covering it; an unvalidated broad outcome, an expired-only coverage, or
+//!   a route the registry view deems ineligible blocks the build. The
+//!   capability registry digest is recomputed from the evaluated outcomes
+//!   and must match the threaded digest, so bare definition agreement
+//!   without the same dependencies cannot pass.
 //! - `WriteReceipt.status=committed` and `DaemonStatus.ready` prove durable
 //!   transport and daemon liveness only. Neither satisfies a mirror digest,
 //!   an outcome, or eligibility here because none of those are inputs.
@@ -39,23 +46,43 @@
 //! - [`CapabilityOutcome`] validation, registry recording, and
 //!   [`CapabilityRegistryView::is_route_eligible`] stay owned by
 //!   `capability_outcome.rs`; this cell reuses them and never duplicates the
-//!   semantic `CapabilityOutcome` owner.
+//!   semantic `CapabilityOutcome` owner. Kernel-side agreement on the shared
+//!   wire form is recorded in `1967-governor-protocol-handoff.md`; the Kernel
+//!   lane must neither import this binary crate nor re-implement the owner.
+//! - the transport operation binding is minted by the authenticated channel
+//!   owner (`DaemonKernelClient::mint_startup_evidence_identity`) for this
+//!   exact publish and correlated by `send_startup_evidence`; the producer
+//!   never mints identities. A store-domain `OperationIdentity` has no
+//!   source at daemon startup, so the evidence binds the transport identity
+//!   the Kernel already authenticates instead of synthesizing one.
 //! - policy content is never sourced here. In particular the unaccepted 1966
 //!   precedence helper is not a canonical policy source: only digests bound
-//!   to caller-observed canonical rebuild outputs enter the payload.
+//!   to caller-observed canonical rebuild outputs enter the payload, and no
+//!   Policy mirror owner exists yet (see below).
 //!
-//! Caller integration (exact owner handoff; see also
-//! `1967-governor-protocol-handoff.md` for the Kernel consumer):
+//! Caller integration (exact owner handoff):
 //!
 //! - [`build_startup_evidence`] evaluates one [`StartupEvidenceRequest`]
 //!   into the wire payload. The owning daemon flow calls
 //!   [`publish_daemon_startup_evidence`] at the real readiness site (after
-//!   `DaemonKernelClient::report_ready`), threading the live Kernel fence;
-//!   mirror, registry, capability, and operation values not yet observable
-//!   stay missing and yield explicit not-ready evidence instead of a ready
-//!   claim. Publish transport failure never fails the daemon: the existing
-//!   step-7 live-receipt path is unchanged and the Kernel keeps steps 8/9
-//!   fenced until its consumer lands.
+//!   `report_ready`), threading the live Kernel fence, the admitted
+//!   composition fence, the Kernel-observed protected digest, and the
+//!   recovered Config projection digest; values not yet observable stay
+//!   missing and yield explicit diagnostics instead of a ready claim.
+//!   Publish transport failure never fails the daemon: the existing step-7
+//!   live-receipt path is unchanged and the Kernel keeps steps 8/9 fenced
+//!   until its consumer lands.
+//! - Config mirror sources (both live, same digest domain, independently
+//!   retained): canonical = the Kernel snapshot protected digest;
+//!   rebuilt = the recovered `ConfigOwner` projection digest. Rotation
+//!   between recovery and the readiness site fails the build instead of
+//!   publishing skew.
+//! - absent owners (explicit markers, warn diagnostics, follow-up owners):
+//!   Policy mirror (no Policy snapshot owner exists in
+//!   `RecoveryOwner::ALL`; needs a canonical Policy source/owner),
+//!   required set and outcomes (no retained registry or startup evaluation
+//!   in the daemon yet; B2280 capability-admission coordination point),
+//!   generation fingerprint (Generation Registry scheme is Kernel-owned).
 //!
 //! Like the neighboring admission joins, this helper never mints admission,
 //! identity, or fences: it evaluates presented values and returns evidence
@@ -63,7 +90,7 @@
 
 use eliot_contracts::{StateFence, sha256_hex};
 use eliot_platform::PlatformHandle;
-use eliot_store_api::OperationIdentity;
+use eliot_protocol::RequestIdentity;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -85,16 +112,18 @@ pub const MAX_EVIDENCE_REFS: usize = 64;
 /// Maximum bytes for one required capability name or fingerprint.
 pub const MAX_IDENTITY_LEN: usize = 256;
 
-/// Fail-closed startup evidence error: malformed input, missing prerequisite,
-/// or a value mismatch against canonical observations.
+/// Fail-closed startup evidence error: malformed input, missing acquirable
+/// prerequisite, or a value mismatch against canonical observations.
 ///
-/// Missing canonical sources are explicit not-ready evidence: the caller (and
-/// its diagnostics) receives the named prerequisite instead of a ready claim.
+/// Missing acquirable sources are explicit not-ready evidence: the caller
+/// (and its diagnostics) receives the named prerequisite instead of a ready
+/// claim. Markers for not-yet-existing owners are carried in the payload,
+/// not in this error.
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
 pub enum StartupEvidenceError {
-    /// A required prerequisite was not observed (no mirror rebuild, no
-    /// operation identity, no registry digest, no required set, no outcomes,
-    /// no generation fingerprint).
+    /// A required acquirable prerequisite was not observed (no transport
+    /// binding, no operation fence, no Config mirror, incomplete capability
+    /// evaluation inputs).
     #[error("startup evidence missing: {0}")]
     Missing(String),
     /// An observed value disagrees with its canonical counterpart (changed
@@ -122,9 +151,9 @@ fn check_name(field: &str, value: &str) -> Result<(), StartupEvidenceError> {
 /// One observed Config/Policy mirror rebuild output (I1.11 step 8).
 ///
 /// The canonical source digest comes from the canonical owner (e.g. the
-/// Host-approved protected snapshot for Config); the rebuilt digest is the
-/// live hot-mirror rebuild output. The producer compares values only and
-/// never reads the underlying stores.
+/// Kernel-observed protected digest for Config); the rebuilt digest is the
+/// live recovered projection. The producer compares values only and never
+/// reads the underlying stores.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MirrorObservation {
     /// Canonical source digest the mirror must reproduce.
@@ -135,35 +164,41 @@ pub struct MirrorObservation {
 
 /// Required-capability evaluation inputs threaded per evidence call.
 ///
-/// Every `Option` is load-bearing: `None` means the owner has not observed
-/// the value, which blocks the payload with an explicit missing prerequisite
-/// instead of a default. The durable store, the registry owner, and the
-/// capability model own truth; this shape is the exact observed value the
-/// caller presents for one evaluation.
+/// Every `Option` is load-bearing. `None` on an acquirable input blocks the
+/// build with an explicit missing prerequisite. `None` on a future-owner
+/// input (policy mirror, required set, outcomes, registry digest,
+/// generation fingerprint) builds as an explicit absence marker: the Kernel
+/// cursor leaves the corresponding step absent. The durable store, the
+/// registry owner, and the capability model own truth; this shape is the
+/// exact observed value the caller presents for one evaluation.
 #[derive(Clone, Debug)]
 pub struct StartupEvidenceRequest {
-    /// Active operation identity the evidence is bound to. The daemon never
-    /// mints this: `None` blocks the payload until the owning admission path
-    /// provides the live identity.
-    pub operation_id: Option<OperationIdentity>,
-    /// State fence the evidence is bound to.
+    /// Transport operation binding minted by the authenticated channel for
+    /// this exact publish. The daemon never synthesizes it: `None` blocks
+    /// the build until the channel owner provides the live binding.
+    pub transport_binding: Option<RequestIdentity>,
+    /// State fence the evidence is bound to (admitted composition fence).
+    /// Must equal the binding fence exactly and stay compatible with the
+    /// independently observed Kernel fence.
     pub operation_fence: Option<StateFence>,
     /// Independently observed Kernel fence (live snapshot). Always required:
     /// without the Kernel observation nothing can be evaluated.
     pub observed_kernel_fence: StateFence,
-    /// Observed Config mirror rebuild output.
+    /// Observed Config mirror rebuild output. Acquirable: `None` blocks.
     pub config_mirror: Option<MirrorObservation>,
-    /// Observed Policy mirror rebuild output.
+    /// Observed Policy mirror rebuild output. No Policy snapshot owner
+    /// exists yet: `None` builds as an absence marker.
     pub policy_mirror: Option<MirrorObservation>,
+    /// Required capability names from the capability model. `None` builds
+    /// as an absence marker; an explicitly empty set is satisfied and
+    /// documented as such.
+    pub required_capabilities: Option<Vec<String>>,
+    /// Evaluated capability outcomes covering the required set.
+    pub capability_outcomes: Option<Vec<CapabilityOutcome>>,
     /// Digest of the capability registry the outcomes were evaluated
     /// against. Recomputed from the outcomes and required to match, so the
     /// digest is bound to evidence instead of asserted alongside it.
     pub capability_registry_digest: Option<PlatformHandle>,
-    /// Required capability names from the capability model. `None` blocks;
-    /// an explicitly empty set is satisfied and documented as such.
-    pub required_capabilities: Option<Vec<String>>,
-    /// Evaluated capability outcomes covering the required set.
-    pub capability_outcomes: Option<Vec<CapabilityOutcome>>,
     /// Active generation fingerprint the eligibility check runs against. The
     /// fingerprint scheme belongs to the generation owner (Kernel Generation
     /// Registry); eliotd threads the observed value and never mints it.
@@ -182,56 +217,99 @@ pub struct StartupEvidenceRequest {
 /// Authenticated Governor startup evidence payload (I1.11 steps 8/9).
 ///
 /// Exact wire shape agreed with the Kernel consumer; see
-/// `1967-governor-protocol-handoff.md`. The Kernel records step 8 only after
-/// both mirror digests validate against the canonical rebuild outputs, and
-/// step 9 only after every required capability carries a validated outcome
-/// and the registry eligibility agrees for the active generation.
+/// `1967-governor-protocol-handoff.md`. `Option` fields carry explicit
+/// absence (`null` on the wire; fields must be present, not omitted): the
+/// Kernel records step 8 only with both mirror digests validated, and step 9
+/// only with a complete capability evaluation. Absent markers leave the
+/// corresponding step absent; they never satisfy it.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EliotdStartupEvidence {
-    /// Active operation identity this evidence is bound to.
-    pub operation_id: OperationIdentity,
-    /// State fence this evidence is bound to.
+    /// Transport operation binding this evidence is published under,
+    /// minted by the authenticated channel for this exact publish.
+    pub transport_binding: RequestIdentity,
+    /// State fence this evidence is bound to (equals the binding fence).
     pub state_fence: StateFence,
     /// Validated Config mirror digest.
     pub config_mirror_digest: PlatformHandle,
-    /// Validated Policy mirror digest.
-    pub policy_mirror_digest: PlatformHandle,
-    /// Capability registry digest bound to the evaluated outcomes.
-    pub capability_registry_digest: PlatformHandle,
-    /// Required capability names evaluated.
-    pub required_capabilities: Vec<String>,
-    /// Validated outcomes covering the required set.
-    pub capability_outcomes: Vec<CapabilityOutcome>,
+    /// Validated Policy mirror digest, or explicit absence.
+    pub policy_mirror_digest: Option<PlatformHandle>,
+    /// Capability registry digest bound to the evaluated outcomes, or
+    /// explicit absence.
+    pub capability_registry_digest: Option<PlatformHandle>,
+    /// Required capability names evaluated, or explicit absence.
+    pub required_capabilities: Option<Vec<String>>,
+    /// Validated outcomes covering the required set, or explicit absence.
+    pub capability_outcomes: Option<Vec<CapabilityOutcome>>,
     /// Auxiliary evidence references.
     pub evidence_refs: Vec<PlatformHandle>,
 }
 
 impl EliotdStartupEvidence {
-    /// Validates the payload through the owning validators. Malformed
-    /// payloads admit nothing and are never published.
+    /// Validates the payload through the owning validators and the
+    /// cross-field consistency rules. Malformed payloads admit nothing and
+    /// are never published. A payload with absence markers validates: the
+    /// markers are explicit, and only the Kernel cursor decides steps.
     ///
     /// # Errors
     ///
     /// Returns [`StartupEvidenceError::Contract`] when any owned validator
-    /// rejects the payload.
+    /// rejects the payload or the optional capability fields are
+    /// inconsistently populated (a partial capability evaluation is neither
+    /// evidence nor an honest marker).
     pub fn validate(&self) -> Result<(), StartupEvidenceError> {
-        self.operation_id.validate().map_err(|error| {
-            StartupEvidenceError::Contract(format!("operation identity: {error}"))
+        self.transport_binding.validate().map_err(|error| {
+            StartupEvidenceError::Contract(format!("transport binding: {error}"))
         })?;
         self.state_fence
             .validate()
             .map_err(|error| StartupEvidenceError::Contract(format!("state fence: {error}")))?;
-        for name in &self.required_capabilities {
-            check_name("required capability", name)?;
+        if self.state_fence != self.transport_binding.request.state_fence {
+            return Err(StartupEvidenceError::Contract(
+                "state fence must equal the transport binding fence".to_owned(),
+            ));
         }
-        for outcome in &self.capability_outcomes {
-            outcome.validate().map_err(|error| {
-                StartupEvidenceError::Contract(format!(
-                    "capability '{}': {error}",
-                    outcome.capability
-                ))
-            })?;
+        if self.evidence_refs.len() > MAX_EVIDENCE_REFS {
+            return Err(StartupEvidenceError::Contract(
+                "evidence reference set is unbounded".to_owned(),
+            ));
+        }
+        let capabilities_present = self.required_capabilities.is_some()
+            || self.capability_outcomes.is_some()
+            || self.capability_registry_digest.is_some();
+        if capabilities_present
+            && (self.required_capabilities.is_none()
+                || self.capability_outcomes.is_none()
+                || self.capability_registry_digest.is_none())
+        {
+            return Err(StartupEvidenceError::Contract(
+                "capability evaluation must be complete or entirely absent".to_owned(),
+            ));
+        }
+        if let Some(required) = &self.required_capabilities {
+            if required.len() > MAX_REQUIRED_CAPABILITIES {
+                return Err(StartupEvidenceError::Contract(
+                    "required capability set is unbounded".to_owned(),
+                ));
+            }
+            for name in required {
+                check_name("required capability", name)?;
+            }
+        }
+        if let Some(outcomes) = &self.capability_outcomes {
+            if outcomes.len() > MAX_CAPABILITY_OUTCOMES {
+                return Err(StartupEvidenceError::Contract(
+                    "capability outcome set is unbounded".to_owned(),
+                ));
+            }
+            for outcome in outcomes {
+                outcome.validate().map_err(|error| {
+                    StartupEvidenceError::Contract(format!(
+                        "capability '{}': {error}",
+                        outcome.capability
+                    ))
+                })?;
+            }
         }
         Ok(())
     }
@@ -292,36 +370,31 @@ fn registry_digest_for(
     })
 }
 
-/// Evaluates the required capability set (I1.11 step 9): every required
-/// capability carries a validated live outcome, the registry digest binds
-/// exactly those outcomes, and the registry eligibility agrees for the
-/// active generation.
+/// Evaluates a complete required capability set (I1.11 step 9): every
+/// required capability carries a validated live outcome, the registry
+/// digest binds exactly those outcomes, and the registry eligibility agrees
+/// for the active generation.
 ///
 /// # Errors
 ///
-/// Returns [`StartupEvidenceError::Missing`] for absent required set,
-/// outcomes, registry digest, or generation fingerprint; [`StartupEvidenceError::Contract`]
-/// for malformed names or unvalidated (e.g. unevidenced broad) outcomes;
+/// Returns [`StartupEvidenceError::Missing`] for an absent registry digest
+/// or generation fingerprint; [`StartupEvidenceError::Contract`] for
+/// malformed names or unvalidated (e.g. unevidenced broad) outcomes;
 /// [`StartupEvidenceError::Mismatch`] for expired-only coverage, an
 /// unbound registry digest, uncovered requirements, or a route the registry
 /// deems ineligible.
 #[allow(
     clippy::too_many_arguments,
-    reason = "one evaluation needs the full threaded observation; grouped struct would duplicate StartupEvidenceRequest"
+    reason = "one evaluation needs the full threaded observation; a grouped struct would duplicate StartupEvidenceRequest"
 )]
 fn evaluate_required_capabilities(
-    required: Option<&[String]>,
-    outcomes: Option<&[CapabilityOutcome]>,
+    required: &[String],
+    outcomes: &[CapabilityOutcome],
     registry_digest: Option<&PlatformHandle>,
     active_generation_fingerprint: Option<&str>,
     session_id: Option<&str>,
     now_unix_ms: u64,
 ) -> Result<PlatformHandle, StartupEvidenceError> {
-    let Some(required) = required else {
-        return Err(StartupEvidenceError::Missing(
-            "required capability set was not observed".to_owned(),
-        ));
-    };
     if required.len() > MAX_REQUIRED_CAPABILITIES {
         return Err(StartupEvidenceError::Contract(
             "required capability set is unbounded".to_owned(),
@@ -330,11 +403,6 @@ fn evaluate_required_capabilities(
     for name in required {
         check_name("required capability", name)?;
     }
-    let Some(outcomes) = outcomes else {
-        return Err(StartupEvidenceError::Missing(
-            "capability outcomes were not observed".to_owned(),
-        ));
-    };
     if outcomes.len() > MAX_CAPABILITY_OUTCOMES {
         return Err(StartupEvidenceError::Contract(
             "capability outcome set is unbounded".to_owned(),
@@ -395,17 +463,19 @@ fn evaluate_required_capabilities(
 /// Builds the authenticated startup evidence payload from one threaded
 /// observation (I1.11 steps 8 and 9).
 ///
-/// Fail-closed order: the observed Kernel fence validates first; the active
-/// operation identity and fence must be present, valid, and exactly
-/// compatible with the Kernel observation; both mirror digests must
-/// reproduce their canonical sources; every required capability must carry
-/// a validated live outcome with a bound registry digest and an agreeing
-/// eligibility verdict. The first blocker wins and names its prerequisite.
+/// Fail-closed order: the observed Kernel fence validates first; the
+/// transport binding and operation fence must be present, valid, exactly
+/// equal, and compatible with the Kernel observation; the Config mirror
+/// must reproduce its canonical source. Policy and capability inputs whose
+/// owners do not exist yet build as explicit absence markers (never
+/// satisfied, never blocking the acquirable evidence); a partially observed
+/// capability evaluation blocks. The first blocker wins and names its
+/// prerequisite.
 ///
 /// # Errors
 ///
 /// Returns [`StartupEvidenceError`] naming the blocking prerequisite. A
-/// missing canonical source is explicit not-ready evidence, never a ready
+/// missing acquirable source is explicit not-ready evidence, never a ready
 /// claim.
 pub fn build_startup_evidence(
     request: &StartupEvidenceRequest,
@@ -413,14 +483,14 @@ pub fn build_startup_evidence(
     request.observed_kernel_fence.validate().map_err(|error| {
         StartupEvidenceError::Contract(format!("observed kernel fence: {error}"))
     })?;
-    let Some(operation_id) = &request.operation_id else {
+    let Some(binding) = &request.transport_binding else {
         return Err(StartupEvidenceError::Missing(
-            "no active operation identity was observed".to_owned(),
+            "no transport operation binding was observed".to_owned(),
         ));
     };
-    operation_id
+    binding
         .validate()
-        .map_err(|error| StartupEvidenceError::Contract(format!("operation identity: {error}")))?;
+        .map_err(|error| StartupEvidenceError::Contract(format!("transport binding: {error}")))?;
     let Some(operation_fence) = &request.operation_fence else {
         return Err(StartupEvidenceError::Missing(
             "no operation fence was observed".to_owned(),
@@ -429,6 +499,11 @@ pub fn build_startup_evidence(
     operation_fence
         .validate()
         .map_err(|error| StartupEvidenceError::Contract(format!("operation fence: {error}")))?;
+    if *operation_fence != binding.request.state_fence {
+        return Err(StartupEvidenceError::Mismatch(
+            "operation fence must equal the transport binding fence".to_owned(),
+        ));
+    }
     if !operation_fence.is_compatible_with(&request.observed_kernel_fence) {
         return Err(StartupEvidenceError::Mismatch(
             "operation fence is not compatible with the observed kernel fence (wrong generation or epoch)"
@@ -436,28 +511,43 @@ pub fn build_startup_evidence(
         ));
     }
     let config_digest = evaluate_mirror("config", request.config_mirror.as_ref())?;
-    let policy_digest = evaluate_mirror("policy", request.policy_mirror.as_ref())?;
     if request.evidence_refs.len() > MAX_EVIDENCE_REFS {
         return Err(StartupEvidenceError::Contract(
             "evidence reference set is unbounded".to_owned(),
         ));
     }
-    let registry_digest = evaluate_required_capabilities(
-        request.required_capabilities.as_deref(),
-        request.capability_outcomes.as_deref(),
-        request.capability_registry_digest.as_ref(),
-        request.active_generation_fingerprint.as_deref(),
-        request.session_id.as_deref(),
-        request.now_unix_ms,
-    )?;
+    let policy_digest = match &request.policy_mirror {
+        Some(mirror) => Some(evaluate_mirror("policy", Some(mirror))?),
+        None => None,
+    };
+    let (required, outcomes, registry) =
+        match (&request.required_capabilities, &request.capability_outcomes) {
+            (None, None) => (None, None, None),
+            (Some(required), Some(outcomes)) => {
+                let digest = evaluate_required_capabilities(
+                    required,
+                    outcomes,
+                    request.capability_registry_digest.as_ref(),
+                    request.active_generation_fingerprint.as_deref(),
+                    request.session_id.as_deref(),
+                    request.now_unix_ms,
+                )?;
+                (Some(required.clone()), Some(outcomes.clone()), Some(digest))
+            }
+            _ => {
+                return Err(StartupEvidenceError::Missing(
+                    "capability evaluation inputs are partially observed".to_owned(),
+                ));
+            }
+        };
     let evidence = EliotdStartupEvidence {
-        operation_id: operation_id.clone(),
+        transport_binding: binding.clone(),
         state_fence: operation_fence.clone(),
         config_mirror_digest: config_digest,
         policy_mirror_digest: policy_digest,
-        capability_registry_digest: registry_digest,
-        required_capabilities: request.required_capabilities.clone().unwrap_or_default(),
-        capability_outcomes: request.capability_outcomes.clone().unwrap_or_default(),
+        capability_registry_digest: registry,
+        required_capabilities: required,
+        capability_outcomes: outcomes,
         evidence_refs: request.evidence_refs.clone(),
     };
     evidence.validate()?;
@@ -467,36 +557,64 @@ pub fn build_startup_evidence(
 /// Publishes Governor startup evidence from the live daemon flow.
 ///
 /// Called at the real readiness site after `report_ready`: threads the live
-/// Kernel fence and marks every not-yet-observable value missing, so the
-/// producer yields explicit not-ready evidence instead of a ready claim.
-/// A built payload is published on the authenticated daemon channel;
-/// publish transport failure never fails the daemon — the existing step-7
-/// live-receipt path is unchanged and the Kernel keeps steps 8/9 fenced
-/// until its consumer lands. Mirror, registry, capability, and operation
-/// owners extend this call with their retained observations when available.
-pub fn publish_daemon_startup_evidence(kernel: &super::DaemonKernelClient) {
-    let request = StartupEvidenceRequest {
-        operation_id: None,
-        operation_fence: None,
-        observed_kernel_fence: kernel.kernel_fence(),
-        config_mirror: None,
-        policy_mirror: None,
-        capability_registry_digest: None,
-        required_capabilities: None,
-        capability_outcomes: None,
-        active_generation_fingerprint: None,
-        session_id: None,
-        evidence_refs: Vec::new(),
-        now_unix_ms: super::unix_ms(),
-    };
-    match build_startup_evidence(&request) {
-        Ok(evidence) => {
-            if let Err(error) = kernel.report_startup_evidence(&evidence) {
-                tracing::warn!(
-                    "governor startup evidence publish failed (steps 8/9 stay fenced): {error}"
-                );
-            }
-        }
+/// transport binding, the admitted composition fence, the Kernel-observed
+/// protected digest, and the recovered Config projection digest. Values
+/// whose owners do not exist yet stay missing and yield explicit warn
+/// diagnostics naming them instead of a ready claim. A built payload is
+/// published on the authenticated daemon channel; publish transport failure
+/// never fails the daemon — the existing step-7 live-receipt path is
+/// unchanged and the Kernel keeps steps 8/9 fenced until its consumer
+/// lands. Mirror, registry, capability, and operation owners extend this
+/// call with their retained observations when available.
+pub fn publish_daemon_startup_evidence(
+    kernel: &super::DaemonKernelClient,
+    composition: &super::DaemonComposition,
+) {
+    let observed = kernel.kernel_fence();
+    let outcome = (|| -> Result<EliotdStartupEvidence, StartupEvidenceError> {
+        let binding = kernel.mint_startup_evidence_identity().map_err(|error| {
+            StartupEvidenceError::Contract(format!("transport binding mint: {error}"))
+        })?;
+        let canonical = PlatformHandle::new(
+            composition
+                .kernel_snapshot()
+                .protected_snapshot_digest
+                .clone(),
+        )
+        .map_err(|error| {
+            StartupEvidenceError::Contract(format!("kernel protected digest: {error}"))
+        })?;
+        let rebuilt =
+            PlatformHandle::new(composition.config_snapshot_digest()).map_err(|error| {
+                StartupEvidenceError::Contract(format!("recovered config digest: {error}"))
+            })?;
+        let request = StartupEvidenceRequest {
+            transport_binding: Some(binding.clone()),
+            operation_fence: Some(composition.kernel_snapshot().state_fence()),
+            observed_kernel_fence: observed,
+            config_mirror: Some(MirrorObservation {
+                canonical_source_digest: canonical,
+                rebuilt_digest: rebuilt,
+            }),
+            policy_mirror: None,
+            required_capabilities: None,
+            capability_outcomes: None,
+            capability_registry_digest: None,
+            active_generation_fingerprint: None,
+            session_id: None,
+            evidence_refs: Vec::new(),
+            now_unix_ms: super::unix_ms(),
+        };
+        let evidence = build_startup_evidence(&request)?;
+        kernel
+            .send_startup_evidence(&evidence, binding)
+            .map_err(|error| {
+                StartupEvidenceError::Contract(format!("evidence publish: {error}"))
+            })?;
+        Ok(evidence)
+    })();
+    match outcome {
+        Ok(_) => {}
         Err(error) => {
             tracing::warn!("governor startup evidence not ready (steps 8/9 stay fenced): {error}");
         }
@@ -506,8 +624,11 @@ pub fn publish_daemon_startup_evidence(kernel: &super::DaemonKernelClient) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eliot_contracts::{EpochId, EpochLineageId, OperationId, ResourceGeneration};
-    use eliot_store_api::OperationIdentity;
+    use eliot_contracts::{
+        ClockReading, EpochId, EpochLineageId, ProductId, RequestId, RequestMetadata,
+        ResourceGeneration, SourceId,
+    };
+    use eliot_receipts::RequestBinding;
     use std::num::NonZeroU64;
 
     use crate::capability_outcome::DegradationScope;
@@ -544,13 +665,28 @@ mod tests {
         })
     }
 
-    fn operation_id() -> Result<OperationIdentity, StartupEvidenceError> {
-        let operation = OperationId::new("op-startup-1")
-            .map_err(|error| contract(format!("test operation id: {error}")))?;
-        Ok(OperationIdentity {
-            operation_id: operation,
-            idempotency_key: "idem-startup-1".to_owned(),
-            canonical_request_hash: "c".repeat(64),
+    fn transport_binding(fence: &StateFence) -> Result<RequestIdentity, StartupEvidenceError> {
+        let request_id = RequestId::new("eliotd:daemon_startup_evidence:1")
+            .map_err(|error| contract(format!("test request id: {error}")))?;
+        let metadata = RequestMetadata {
+            request_id: request_id.clone(),
+            session_id: None,
+            task_id: None,
+            product_id: ProductId::new("eliotd")
+                .map_err(|error| contract(format!("test product: {error}")))?,
+            source_id: SourceId::new("eliotd")
+                .map_err(|error| contract(format!("test source: {error}")))?,
+            state_fence: fence.clone(),
+            clock: ClockReading::default(),
+        };
+        Ok(RequestIdentity {
+            request: RequestBinding {
+                metadata,
+                state_fence: fence.clone(),
+            },
+            idempotency_key: "eliotd:daemon_startup_evidence:1".to_owned(),
+            deadline_unix_ms: 1_800_000_000_000,
+            cancellation_id: "eliotd:daemon_startup_evidence:1:cancel".to_owned(),
         })
     }
 
@@ -572,23 +708,24 @@ mod tests {
     }
 
     fn request() -> Result<StartupEvidenceRequest, StartupEvidenceError> {
+        let fence = test_fence(7)?;
         let outcomes = vec![
             healthy_outcome("provider.dispatch"),
             healthy_outcome("store.read"),
         ];
         let registry_digest = registry_digest_for(&outcomes)?;
         Ok(StartupEvidenceRequest {
-            operation_id: Some(operation_id()?),
-            operation_fence: Some(test_fence(7)?),
-            observed_kernel_fence: test_fence(7)?,
+            transport_binding: Some(transport_binding(&fence)?),
+            operation_fence: Some(fence.clone()),
+            observed_kernel_fence: fence,
             config_mirror: Some(mirror()?),
             policy_mirror: Some(mirror()?),
-            capability_registry_digest: Some(registry_digest),
             required_capabilities: Some(vec![
                 "provider.dispatch".to_owned(),
                 "store.read".to_owned(),
             ]),
             capability_outcomes: Some(outcomes),
+            capability_registry_digest: Some(registry_digest),
             active_generation_fingerprint: Some("gen-7".to_owned()),
             session_id: None,
             evidence_refs: Vec::new(),
@@ -630,24 +767,66 @@ mod tests {
     -> Result<(), StartupEvidenceError> {
         let request = request()?;
         let evidence = build_startup_evidence(&request)?;
-        let operation = request
-            .operation_id
-            .ok_or_else(|| contract("test operation"))?;
-        assert_eq!(evidence.operation_id.operation_id, operation.operation_id);
+        let binding = request
+            .transport_binding
+            .ok_or_else(|| contract("test binding"))?;
+        assert_eq!(evidence.transport_binding, binding);
         assert_eq!(evidence.state_fence, test_fence(7)?);
         assert_eq!(evidence.config_mirror_digest, digest("a")?);
-        assert_eq!(evidence.policy_mirror_digest, digest("a")?);
+        assert_eq!(evidence.policy_mirror_digest, Some(digest("a")?));
         let registry = request
             .capability_registry_digest
             .ok_or_else(|| contract("test digest"))?;
-        assert_eq!(evidence.capability_registry_digest, registry);
-        assert_eq!(evidence.required_capabilities.len(), 2);
-        assert_eq!(evidence.capability_outcomes.len(), 2);
+        assert_eq!(evidence.capability_registry_digest, Some(registry));
+        assert_eq!(
+            evidence.required_capabilities,
+            Some(vec![
+                "provider.dispatch".to_owned(),
+                "store.read".to_owned()
+            ])
+        );
+        let outcomes = evidence
+            .capability_outcomes
+            .as_deref()
+            .ok_or_else(|| contract("test outcomes"))?;
+        assert_eq!(outcomes.len(), 2);
         let wire = serde_json::to_string(&evidence)
             .map_err(|error| StartupEvidenceError::Contract(error.to_string()))?;
+        assert!(wire.contains("\"policy_mirror_digest\""));
         let back: EliotdStartupEvidence = serde_json::from_str(&wire)
             .map_err(|error| StartupEvidenceError::Contract(error.to_string()))?;
         assert_eq!(back, evidence);
+        Ok(())
+    }
+
+    #[test]
+    fn production_partial_observation_builds_marked_evidence() -> Result<(), StartupEvidenceError> {
+        // Production shape today: real fences, binding, and Config mirror;
+        // Policy and capability owners do not exist yet, so their markers
+        // must be explicit absence — never satisfied, never blocking the
+        // acquirable evidence, and never readable as step satisfaction: the
+        // Kernel cursor leaves steps 8/9 absent on these markers.
+        let fence = test_fence(7)?;
+        let request = StartupEvidenceRequest {
+            transport_binding: Some(transport_binding(&fence)?),
+            operation_fence: Some(fence.clone()),
+            observed_kernel_fence: fence,
+            config_mirror: Some(mirror()?),
+            policy_mirror: None,
+            required_capabilities: None,
+            capability_outcomes: None,
+            capability_registry_digest: None,
+            active_generation_fingerprint: None,
+            session_id: None,
+            evidence_refs: Vec::new(),
+            now_unix_ms: 1_000,
+        };
+        let evidence = build_startup_evidence(&request)?;
+        assert_eq!(evidence.config_mirror_digest, digest("a")?);
+        assert_eq!(evidence.policy_mirror_digest, None);
+        assert_eq!(evidence.required_capabilities, None);
+        assert_eq!(evidence.capability_outcomes, None);
+        assert_eq!(evidence.capability_registry_digest, None);
         Ok(())
     }
 
@@ -691,6 +870,26 @@ mod tests {
         if !matches!(error, StartupEvidenceError::Mismatch(_)) {
             return Err(contract(format!(
                 "wrong generation must mismatch, got {error}"
+            )));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn skewed_transport_binding_fence_does_not_advance() -> Result<(), StartupEvidenceError> {
+        // The operation fence must equal the transport binding fence
+        // exactly: a binding minted for another fence cannot carry this
+        // evidence even when both fences are individually valid.
+        let error = blocked_with(|request| {
+            let other = test_fence(7)?;
+            request.transport_binding = Some(transport_binding(&other)?);
+            request.operation_fence = Some(test_fence(8)?);
+            request.observed_kernel_fence = test_fence(8)?;
+            Ok(())
+        })?;
+        if !matches!(error, StartupEvidenceError::Mismatch(_)) {
+            return Err(contract(format!(
+                "skewed binding fence must mismatch, got {error}"
             )));
         }
         Ok(())

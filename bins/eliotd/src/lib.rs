@@ -366,6 +366,15 @@ impl DaemonComposition {
         &self.config_path
     }
 
+    /// Returns the recovered Config projection digest admitted at Governor
+    /// construction (I1.11 step 8 input). Read-only over the retained owner:
+    /// the digest was bound to the protected launch digest by recovery and
+    /// never recomputed here.
+    #[must_use]
+    pub fn config_snapshot_digest(&self) -> &str {
+        self.governor.owners().config.snapshot_digest()
+    }
+
     /// Returns the retained protected daemon state root.
     #[must_use]
     pub fn state_root(&self) -> &Path {
