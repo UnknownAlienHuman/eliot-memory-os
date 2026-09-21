@@ -11,6 +11,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use crate::JournalError;
+use crate::reactive_context::{
+    ReactiveContextQueueState, ReactiveContextRecord, validate_record_for_journal,
+};
 
 fn deserialize_required_active_pipe<'de, D>(
     deserializer: D,
@@ -216,7 +219,7 @@ pub struct IdempotencyIdentity {
 }
 
 impl IdempotencyIdentity {
-    fn validate(&self) -> Result<(), JournalError> {
+    pub(crate) fn validate(&self) -> Result<(), JournalError> {
         handle(&self.operation_id, "operation_id")?;
         handle(&self.idempotency_key, "idempotency_key")
     }
@@ -235,7 +238,7 @@ pub struct RecordFence {
 }
 
 impl RecordFence {
-    fn validate(&self) -> Result<(), JournalError> {
+    pub(crate) fn validate(&self) -> Result<(), JournalError> {
         self.host.validate()?;
         handle(&self.activation_id, "fence.activation_id")?;
         validate_epoch_transition(&self.activation_generation)
@@ -1673,6 +1676,7 @@ pub enum HostStateRecord {
     CleanMarker(CleanMarker),
     EpochRetirement(EpochRetirementRecord),
     StoreRebind(StoreRebindRecord),
+    ReactiveContext(ReactiveContextRecord),
 }
 
 impl HostStateRecord {
@@ -1689,6 +1693,7 @@ impl HostStateRecord {
             Self::CleanMarker(value) => value.validate(),
             Self::EpochRetirement(value) => value.validate(),
             Self::StoreRebind(value) => value.validate(),
+            Self::ReactiveContext(value) => validate_record_for_journal(value),
         }
     }
 
@@ -1713,6 +1718,7 @@ impl HostStateRecord {
             Self::CleanMarker(value) => &value.fence,
             Self::EpochRetirement(value) => &value.fence,
             Self::StoreRebind(value) => &value.fence,
+            Self::ReactiveContext(value) => &value.fence,
         }
     }
 
@@ -1729,6 +1735,7 @@ impl HostStateRecord {
             Self::CleanMarker(value) => &value.operation,
             Self::EpochRetirement(value) => &value.operation,
             Self::StoreRebind(value) => &value.operation,
+            Self::ReactiveContext(value) => &value.operation,
         }
     }
 }
@@ -1775,6 +1782,9 @@ pub struct HostState {
     pub readiness_observations: Vec<KernelReadinessObservationRecord>,
     #[serde(default)]
     pub store_rebinds: Vec<StoreRebindRecord>,
+    /// Durable reactive-Context queue projection owned by this journal.
+    #[serde(default)]
+    pub reactive_context: Option<ReactiveContextQueueState>,
     pub clean_marker: Option<CleanMarker>,
     pub retained_epochs: Vec<EpochEvidence>,
     pub retired_epochs: Vec<HostInstallationEpoch>,
@@ -1799,6 +1809,7 @@ impl HostState {
             observations: Vec::new(),
             readiness_observations: Vec::new(),
             store_rebinds: Vec::new(),
+            reactive_context: Some(ReactiveContextQueueState::default()),
             clean_marker: None,
             retained_epochs,
             retired_epochs: Vec::new(),

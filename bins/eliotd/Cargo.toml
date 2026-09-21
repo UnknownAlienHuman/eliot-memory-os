@@ -32,6 +32,7 @@ eliot-governor.workspace = true
 eliot-ipc.workspace = true
 eliot-maintenance.workspace = true
 eliot-observability = { path = "../../crates/instrument/eliot-observability" }
+eliot-observation.workspace = true
 eliot-platform.workspace = true
 eliot-platform-windows.workspace = true
 eliot-protocol.workspace = true

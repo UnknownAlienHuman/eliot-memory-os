@@ -8,6 +8,9 @@
 //! remains below the `<10k LOC` split invariant; this is an implementation
 //! invariant for maintainability, not a claimed Architecture numeric rule.
 
+use super::kernel_unavailability::{
+    KernelAvailability, RecoveryDeferral, RecoveryView, semantic_task_recovery_deferral,
+};
 use super::*;
 
 /// F-LOG-KERNEL-4 (#903 slice B): health-view boundary observations.
@@ -137,5 +140,73 @@ impl KernelComposition {
         let state = service.state();
         observe_health("kernel.health.service_state_observed", "success");
         Ok(state)
+    }
+
+    /// Projects blob demand-controller state into the I1.10 health vocabulary
+    /// (#1969). View-only: fixed manifest/process/large-payload labels only;
+    /// carries no digests, generations, paths, or payloads. Consumed by the
+    /// health dispatch route; the dispatch wiring itself is owned there.
+    #[must_use]
+    pub fn blob_capability_projection(&self) -> serde_json::Value {
+        match self.blob_probe_status() {
+            None => {
+                observe_health("kernel.health.blob_projected", "absent");
+                serde_json::json!({
+                    "manifest": "absent",
+                    "process": "not_started",
+                    "large_payload": "degraded",
+                })
+            }
+            Some(BlobProbeStatus::ManifestValidated) => {
+                observe_health("kernel.health.blob_projected", "standby");
+                serde_json::json!({
+                    "manifest": "validated",
+                    "process": "not_started",
+                    "large_payload": "standby",
+                })
+            }
+            Some(BlobProbeStatus::Ready { .. }) => {
+                observe_health("kernel.health.blob_projected", "ready");
+                serde_json::json!({
+                    "manifest": "validated",
+                    "process": "started",
+                    "large_payload": "ready",
+                })
+            }
+            Some(BlobProbeStatus::Degraded { .. }) => {
+                observe_health("kernel.health.blob_projected", "degraded");
+                serde_json::json!({
+                    "manifest": "validated",
+                    "process": "started",
+                    "large_payload": "degraded",
+                })
+            }
+        }
+    }
+
+    /// Projects the restricted Recovery View for surviving Host/Watchdog
+    /// interactions while the Kernel is unavailable (I1.13).
+    ///
+    /// The projection carries only build, generation, ORS, and incident
+    /// state. Semantic task recovery is never projected here; callers use
+    /// [`Self::deferred_semantic_recovery`] instead, which waits for
+    /// canonical access.
+    pub fn recovery_view_response(view: &RecoveryView) -> serde_json::Value {
+        observe_health("kernel.health.recovery_view_projected", "known");
+        view.to_json()
+    }
+
+    /// Defers semantic task recovery pending canonical access (I1.13).
+    ///
+    /// Reachable from the Recovery View path so no route can imply that a
+    /// semantic action completed without canonical access. The Kernel
+    /// argument keeps the deferral tied to the shared availability guard:
+    /// while the Kernel is unavailable the deferral always applies, and the
+    /// observation records it.
+    pub fn deferred_semantic_recovery(kernel: KernelAvailability) -> RecoveryDeferral {
+        if kernel == KernelAvailability::Unavailable {
+            observe_health("kernel.health.semantic_recovery_deferred", "known");
+        }
+        semantic_task_recovery_deferral()
     }
 }
