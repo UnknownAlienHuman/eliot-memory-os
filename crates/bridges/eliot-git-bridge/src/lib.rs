@@ -44,7 +44,6 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 // ---------------------------------------------------------------------------
 // Identity, ownership, leases
@@ -155,36 +154,35 @@ impl Lease {
     }
 }
 
+/// Process-wide monotonic broker generation.
+///
+/// Minted once per [`Broker::new()`] call, so every broker instance holds a
+/// distinct generation for as long as leases are in memory. Wrapping on
+/// `u64::MAX` is the only reuse path and is practically unreachable
+/// (2^64 broker constructions in one process lifetime).
+static BROKER_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(1);
+
 /// Broker that launches scoped adapters by minting [`Lease`] values.
 ///
 /// Each broker owns a per-instance identity domain bound into every lease ID
 /// it mints, so leases from separate broker instances never collide even for
-/// the same SID and sequence position. The domain derives from established
-/// process identity (process ID, wall clock) and the stable heap address of
-/// the broker's own sequence cell — no shared registry, no cross-instance
-/// coordination.
+/// the same SID and sequence position. The domain is a process-local
+/// monotonic generation minted from [`BROKER_INSTANCE_COUNTER`]: an
+/// established owner-ID mechanism whose lifetime matches these in-memory
+/// leases exactly. Leases die with the process — no cross-process or
+/// persistence guarantee is claimed or needed.
 #[derive(Debug)]
 pub struct Broker {
-    sequence: Box<AtomicU64>,
+    sequence: AtomicU64,
     domain: u64,
 }
 
 impl Broker {
     /// Creates a broker with a fresh identity domain and lease sequence.
     pub fn new() -> Self {
-        let sequence = Box::new(AtomicU64::new(1));
-        // Heap address is stable for the broker's lifetime and distinct
-        // across live brokers; mixed with pid and wall-clock nanos so a
-        // recycled address still lands in a different domain in practice.
-        let addr = (&*sequence as *const AtomicU64) as usize as u64;
-        let pid = u64::from(std::process::id());
-        let nanos: u64 = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
         Self {
-            sequence,
-            domain: mix_broker_domain(addr, pid, nanos),
+            sequence: AtomicU64::new(1),
+            domain: BROKER_INSTANCE_COUNTER.fetch_add(1, Ordering::SeqCst),
         }
     }
 
@@ -1690,22 +1688,6 @@ fn best_effort_canonical(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned())
 }
 
-/// Mixes broker-domain entropy into one 64-bit domain tag.
-///
-/// splitmix64 finalizer (bijective): distinct inputs always yield distinct
-/// domains, so two live brokers — whose heap addresses differ — can never
-/// share a domain even when pid and clock readings coincide.
-fn mix_broker_domain(addr: u64, pid: u64, nanos: u64) -> u64 {
-    let mut z = addr
-        .wrapping_add(pid.wrapping_mul(0x9E3779B97F4A7C15))
-        .wrapping_add(nanos);
-    z ^= z >> 30;
-    z = z.wrapping_mul(0xBF58476D1CE4E5B9);
-    z ^= z >> 27;
-    z = z.wrapping_mul(0x94D049BB133111EB);
-    z ^ (z >> 31)
-}
-
 fn is_hex_prefix(line: &str) -> bool {
     let head = line.split_whitespace().next().unwrap_or("");
     head.len() >= 7 && head.chars().all(|c| c.is_ascii_hexdigit())
@@ -2049,5 +2031,17 @@ mod unit_tests {
         let e = third.issue_repo_lease(&id, &root);
         assert_ne!(e.id(), a.id());
         assert_ne!(e.id(), b.id());
+        // Many rapidly created instances (wall clock and PID effectively
+        // constant across the loop) still hold pairwise-distinct domains,
+        // proving the mechanism is monotonic generation, not time/PID-derived.
+        let mut domains = std::collections::BTreeSet::new();
+        let mut lease_ids = std::collections::BTreeSet::new();
+        for _ in 0..64 {
+            let broker = Broker::new();
+            assert!(domains.insert(broker.domain()));
+            let lease = broker.issue_repo_lease(&id, &root);
+            assert!(lease_ids.insert(lease.id().to_owned()));
+        }
+        assert!(domains.insert(Broker::default().domain()));
     }
 }
