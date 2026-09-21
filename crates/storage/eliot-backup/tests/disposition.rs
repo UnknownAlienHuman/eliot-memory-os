@@ -1,12 +1,13 @@
-//! Explicit-disposition proof for `eliot-backup` (issue #1716).
+//! Explicit-disposition proof for `eliot-backup` (issues #1716/#1873).
 //!
-//! The crate is currently reachable from no production binary and has no
-//! admitted contract surface or selected process owner. Until the owning
-//! decision (delete, or admit with a bounded non-runtime support role bound
-//! to the governed export path of #1871 and the recoverability evidence of
-//! #1873) lands, this test pins the explicit `[package.metadata.eliot]
-//! .workspace_admission` disposition plus the current no-production-binary
-//! consumer state, so the crate cannot become a silent production fallback.
+//! The crate is admitted with a bounded non-runtime product role: the
+//! operator CLI preview/coverage surface plus the isolated rehearsal runner,
+//! bound to the governed export path of #1871 and the recoverability evidence
+//! of #1873. Production execution and cutover stay with the #960/#961 owners,
+//! and the crate is not a selectable storage fallback. This test pins the
+//! exact `[package.metadata.eliot].workspace_admission` disposition plus the
+//! exact production-binary consumer allowlist (only `eliot`, for the preview
+//! surface), so no silent second consumer can appear.
 
 use std::error::Error;
 use std::path::PathBuf;
@@ -14,8 +15,11 @@ use std::path::PathBuf;
 type TestResult = Result<(), Box<dyn Error>>;
 
 const PACKAGE: &str = "eliot-backup";
-const EXPECTED_ADMISSION: &str =
-    "unreachable pending explicit owner disposition per #1716";
+const EXPECTED_ADMISSION: &str = "admitted bounded non-runtime product surface per #1873";
+/// Exact production-binary consumer allowlist for the admitted preview
+/// surface: `bins/eliot` selects the crate for CLI previews and coverage
+/// checks only. Any other (or additional) consumer fails this gate.
+const ADMITTED_CONSUMERS: [&str; 1] = ["eliot: dependencies.eliot-backup"];
 
 fn manifest_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -84,17 +88,16 @@ fn owner_disposition_is_recorded() -> TestResult {
     let text = std::fs::read_to_string(manifest_dir().join("Cargo.toml"))?;
     assert!(
         text.contains(EXPECTED_ADMISSION),
-        "workspace_admission must record the #1716 pending-disposition state"
+        "workspace_admission must record the #1873 admitted product-surface state"
     );
     Ok(())
 }
 
 #[test]
-fn no_production_binary_selects_the_crate() -> TestResult {
+fn only_the_admitted_preview_consumer_selects_the_crate() -> TestResult {
     let root = workspace_root()?;
     let mut offenders = Vec::new();
-    let mut entries: Vec<_> =
-        std::fs::read_dir(root.join("bins"))?.collect::<Result<_, _>>()?;
+    let mut entries: Vec<_> = std::fs::read_dir(root.join("bins"))?.collect::<Result<_, _>>()?;
     entries.sort_by_key(std::fs::DirEntry::file_name);
     for entry in entries {
         let manifest = entry.path().join("Cargo.toml");
@@ -108,9 +111,9 @@ fn no_production_binary_selects_the_crate() -> TestResult {
             ));
         }
     }
-    assert!(
-        offenders.is_empty(),
-        "production binary selects {PACKAGE} without an owner admission: {offenders:?}"
+    assert_eq!(
+        offenders, ADMITTED_CONSUMERS,
+        "production selection of {PACKAGE} must stay exactly the admitted preview consumer"
     );
     Ok(())
 }

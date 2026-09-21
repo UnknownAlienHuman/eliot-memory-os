@@ -601,6 +601,22 @@ function Assert-IsolatedSourceTree([string]$Repo, [string]$SourceCommit, [string
     }
 }
 
+function Test-ExcludedDispositions([string]$Repo) {
+    # Issue #1811: reject any build/release consumption of an excluded or
+    # standalone-workspace package without provenance, lock, toolchain,
+    # license, and SBOM evidence. The Python gate owns the denominator
+    # (tree discovery) and the disposition inventory; this seam only fails
+    # closed when the gate fails.
+    $gate = Join-Path $Repo 'scripts/verify-excluded-dispositions-1811.py'
+    if (-not (Test-Path -LiteralPath $gate -PathType Leaf)) {
+        throw 'release excluded-disposition gate is missing: scripts/verify-excluded-dispositions-1811.py'
+    }
+    & python $gate --root $Repo
+    if ($LASTEXITCODE -ne 0) {
+        throw "release excluded-disposition gate rejected undeclared excluded input (see EXCLUDED_DISPOSITIONS output above; required evidence: provenance, lock, toolchain, license, SBOM)"
+    }
+}
+
 function Copy-PinnedSourceFile([string]$Repo, [string]$SourceCommit, [string]$Source, [string]$Destination) {
     $relative = Assert-SafeRelativePath $Source 'tracked source file'
     $sourceFile = Get-Item -LiteralPath (Join-Path $Repo $relative) -ErrorAction Stop
@@ -1636,6 +1652,7 @@ if (-not $OperatorSource) {
 Push-Location $repo
 try {
     $preBuildIsolation = Assert-IsolatedSourceTree $repo $sourceCommit 'pre-build'
+    Test-ExcludedDispositions $repo
     $stageToolchain = Get-ToolchainBuildReceipt $repo $sourceCommit $cargoMetadata 'stage'
     if ($SkipBuild) {
         throw 'SkipBuild is not permitted for staged releases because it cannot prove Governor source provenance'

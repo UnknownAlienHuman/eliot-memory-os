@@ -9,11 +9,18 @@ use eliot_protocol::{
 const RESOLVED_AT_UNIX_MS: u64 = 9_000;
 
 fn test_epoch(sequence: u64) -> EpochId {
-    EpochId::new(
-        EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("lineage"),
-        std::num::NonZeroU64::new(sequence).expect("sequence"),
-    )
-    .expect("epoch")
+    {
+        let Ok(lineage) = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000") else {
+            panic!("lineage");
+        };
+        let Some(sequence) = std::num::NonZeroU64::new(sequence) else {
+            panic!("sequence");
+        };
+        let Ok(epoch) = EpochId::new(lineage, sequence) else {
+            panic!("epoch");
+        };
+        epoch
+    }
 }
 
 fn ticket() -> Result<AgentActivationResolutionTicket, ProtocolError> {

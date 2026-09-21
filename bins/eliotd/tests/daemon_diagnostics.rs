@@ -174,7 +174,8 @@ fn test_request(
             work_unit_id: WorkUnitId::new("work-1")
                 .map_err(|error| format!("lane work: {error}"))?,
             role_id: RoleProfileId::new("role-1").map_err(|error| format!("lane role: {error}"))?,
-            work_class: WorkClass::parse_wire("swarm").map_err(|error| format!("class: {error}"))?,
+            work_class: WorkClass::parse_wire("swarm")
+                .map_err(|error| format!("class: {error}"))?,
             route_candidates: vec![RouteCandidateEvidence {
                 route: route.clone(),
                 preference_rank: 0,
