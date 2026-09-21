@@ -24,7 +24,8 @@ pub use stream_evidence::{
 mod origin_challenge;
 pub use origin_challenge::{
     ORIGIN_CHALLENGE_SCHEMA_VERSION, OriginChallenge, OriginChallengeAuthority,
-    OriginChallengeRequest, OriginControlGrant, OriginControlOperation, OriginControlPresentation,
+    OriginChallengeReplayEntry, OriginChallengeReplaySnapshot, OriginChallengeRequest,
+    OriginControlGrant, OriginControlOperation, OriginControlPresentation,
 };
 
 mod stream_sink;

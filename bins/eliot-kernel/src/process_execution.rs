@@ -16,9 +16,9 @@ use super::{KernelComposition, KernelStoreGateway};
 use eliot_ipc::Session;
 use eliot_kernel_core::{
     AuthoritySnapshotBinding, AuthoritySnapshotBindingWire, DispatchSnapshotCodec,
-    ProcessDispatchAuthorityController, ProcessExecutionReplayAbort, ProcessExecutionReplayBegin,
-    ProcessExecutionReplayRecord, ProcessExecutionReplayState, ProcessExecutionReplayStore,
-    ProcessExecutionReplayStoreWithAbort, process_admission_digest,
+    KernelAuthorityReplaySnapshot, ProcessDispatchAuthorityController, ProcessExecutionReplayAbort,
+    ProcessExecutionReplayBegin, ProcessExecutionReplayRecord, ProcessExecutionReplayState,
+    ProcessExecutionReplayStore, ProcessExecutionReplayStoreWithAbort, process_admission_digest,
 };
 use eliot_kernel_service::{
     HostKernelCandidateBinding, KernelServiceError, ProcessExecutionRequest,
@@ -35,10 +35,12 @@ use eliot_platform_windows::{
 };
 use eliot_process::{
     DispatchAuthorityId, DispatchValidationContext, FencingToken, Generation, KernelDispatchKey,
-    PermitIssuance, ProcessEvidence, ProcessEvidenceSink, ProcessExecutionAdmissionRequest,
-    ProcessExecutionError, ProcessExecutor, ProcessLaunchAdmission, ProcessLifecycle,
-    ProcessOwnerBinding, ProcessRequest, ProcessSessionBinding, ProcessStartReceipt,
-    SuspendedLaunchEvidence, SuspendedProcessIdentity, ValidatedDispatch,
+    OriginChallenge, OriginChallengeRequest, OriginControlGrant, OriginControlOperation,
+    OriginControlPresentation, PermitIssuance, ProcessEvidence, ProcessEvidenceSink,
+    ProcessExecutionAdmissionRequest, ProcessExecutionError, ProcessExecutor,
+    ProcessLaunchAdmission, ProcessLifecycle, ProcessOwnerBinding, ProcessRequest,
+    ProcessSessionBinding, ProcessStartReceipt, SuspendedLaunchEvidence, SuspendedProcessIdentity,
+    ValidatedDispatch,
 };
 use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
 use eliot_store_api::{
@@ -115,7 +117,7 @@ impl ProcessEvidenceSink for OrsProcessEvidenceSink {
 struct ProtectedDispatchSnapshot {
     authority_id: DispatchAuthorityId,
     binding: AuthoritySnapshotBindingWire,
-    snapshot: eliot_process::DispatchPermitReplaySnapshot,
+    snapshot: KernelAuthorityReplaySnapshot,
 }
 
 pub struct WindowsDispatchSnapshotCodec {
@@ -138,7 +140,7 @@ impl WindowsDispatchSnapshotCodec {
 impl DispatchSnapshotCodec for WindowsDispatchSnapshotCodec {
     fn seal(
         &self,
-        snapshot: &eliot_process::DispatchPermitReplaySnapshot,
+        snapshot: &KernelAuthorityReplaySnapshot,
         binding: &AuthoritySnapshotBinding,
     ) -> Result<eliot_kernel_core::SealedAuthoritySnapshot, eliot_kernel_core::KernelError> {
         let envelope = ProtectedDispatchSnapshot {
@@ -162,7 +164,7 @@ impl DispatchSnapshotCodec for WindowsDispatchSnapshotCodec {
         &self,
         payload: &eliot_ors::RecoveryPayload,
         binding: &AuthoritySnapshotBinding,
-    ) -> Result<eliot_process::DispatchPermitReplaySnapshot, eliot_kernel_core::KernelError> {
+    ) -> Result<KernelAuthorityReplaySnapshot, eliot_kernel_core::KernelError> {
         let eliot_ors::RecoveryPayload::Encrypted { key, ciphertext } = payload else {
             return Err(eliot_kernel_core::KernelError::RecoveryUnavailable(
                 "authority snapshot is not encrypted".to_owned(),
@@ -190,9 +192,7 @@ impl DispatchSnapshotCodec for WindowsDispatchSnapshotCodec {
         if envelope.authority_id != *binding.authority_id() {
             return Err(eliot_kernel_core::KernelError::FenceMismatch);
         }
-        envelope.snapshot.validate().map_err(|error| {
-            eliot_kernel_core::KernelError::DependencyUnavailable(error.to_string())
-        })?;
+        envelope.snapshot.validate()?;
         Ok(envelope.snapshot)
     }
 }
@@ -838,6 +838,44 @@ impl ProcessExecutionGateway {
                 .is_ok_and(|controller| controller.authority_id() == &binding.authority_id)
     }
 
+    pub(crate) fn issue_origin_challenge(
+        &self,
+        request: &OriginChallengeRequest,
+        expires_at_unix_ms: u64,
+    ) -> Result<OriginChallenge, ProcessExecutionError> {
+        let issued_at_unix_ms = super::unix_ms();
+        if expires_at_unix_ms <= issued_at_unix_ms {
+            return Err(ProcessExecutionError::Contract(
+                eliot_process::ContractError::ExpiredDispatchPermit,
+            ));
+        }
+        self.controller
+            .lock()
+            .map_err(|_| {
+                ProcessExecutionError::Unavailable("process authority lock poisoned".to_owned())
+            })?
+            .issue_origin_challenge(
+                request,
+                issued_at_unix_ms,
+                expires_at_unix_ms,
+                &self.snapshot_binding,
+            )
+            .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))
+    }
+
+    pub(crate) fn decide_origin_control(
+        &self,
+        presentation: &OriginControlPresentation,
+    ) -> Result<OriginControlGrant, ProcessExecutionError> {
+        self.controller
+            .lock()
+            .map_err(|_| {
+                ProcessExecutionError::Unavailable("process authority lock poisoned".to_owned())
+            })?
+            .decide_origin_control(presentation, super::unix_ms(), &self.snapshot_binding)
+            .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))
+    }
+
     #[cfg(windows)]
     pub(crate) fn attach_canonical_store(
         &self,
@@ -1014,10 +1052,40 @@ impl ProcessExecutionGateway {
         owner: &ProcessOwnerBinding,
         operation_id: eliot_process::OperationId,
     ) -> Result<eliot_process::CancellationReceipt, ProcessExecutionError> {
+        self.cancel_with_origin_grant_inner(owner, operation_id, None)
+            .await
+    }
+
+    pub(crate) async fn cancel_with_origin_grant(
+        &self,
+        owner: &ProcessOwnerBinding,
+        operation_id: eliot_process::OperationId,
+        grant: &OriginControlGrant,
+    ) -> Result<eliot_process::CancellationReceipt, ProcessExecutionError> {
+        if grant.operation() != OriginControlOperation::Kill {
+            return Err(ProcessExecutionError::Contract(
+                eliot_process::ContractError::DispatchBindingMismatch,
+            ));
+        }
+        self.cancel_with_origin_grant_inner(owner, operation_id, Some(grant))
+            .await
+    }
+
+    async fn cancel_with_origin_grant_inner(
+        &self,
+        owner: &ProcessOwnerBinding,
+        operation_id: eliot_process::OperationId,
+        grant: Option<&OriginControlGrant>,
+    ) -> Result<eliot_process::CancellationReceipt, ProcessExecutionError> {
         // F-LOG-KERNEL-3 (#901): cancellation boundary. The returned receipt
         // is delivery acknowledgement, not terminal cancellation; exactly one
         // terminal is emitted per failed cancel.
         observe_process("kernel.process.cancel_requested", "attempt");
+        if grant.is_some_and(|value| value.operation() != OriginControlOperation::Kill) {
+            return Err(ProcessExecutionError::Contract(
+                eliot_process::ContractError::DispatchBindingMismatch,
+            ));
+        }
         if let Err(error) = self.authorize_operation(owner, &operation_id) {
             observe_process("kernel.process.cancel_rejected", "fenced");
             super::kernel_diagnostics::observe_terminal_error(process_terminal_code(&error));

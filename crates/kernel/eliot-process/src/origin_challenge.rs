@@ -35,6 +35,10 @@ const ORIGIN_CHALLENGE_DOMAIN: &str = "eliot-origin-challenge-v1";
 /// Maximum lifetime of one origin challenge: one hour in milliseconds.
 const MAX_CHALLENGE_WINDOW_MS: u64 = 3_600_000;
 
+/// Maximum number of origin replay entries retained in one encrypted Kernel
+/// authority snapshot.
+const MAX_ORIGIN_REPLAY_ENTRIES: usize = 4096;
+
 /// Maximum accepted installation identity length.
 const MAX_INSTALLATION_ID_LEN: usize = 128;
 
@@ -214,7 +218,71 @@ struct UnsignedChallenge<'a> {
     nonce: &'a str,
 }
 
+/// Private decode carrier for the opaque challenge wire.
+///
+/// `OriginChallenge` intentionally remains Serialize-only. The Kernel and
+/// transport boundary use this explicit carrier so decoding always passes
+/// through [`OriginChallenge::from_json_bytes`] and its shape checks.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OriginChallengeWire {
+    schema_version: String,
+    authority_id: DispatchAuthorityId,
+    challenge_id: String,
+    origin_digest: String,
+    physical_digest: String,
+    installation_id: String,
+    generation: Generation,
+    state_fence: StateFence,
+    operation: OriginControlOperation,
+    issued_at_unix_ms: u64,
+    expires_at_unix_ms: u64,
+    nonce: String,
+    authentication_tag: String,
+    challenge_digest: String,
+}
+
+impl OriginChallengeWire {
+    fn into_challenge(self) -> OriginChallenge {
+        OriginChallenge {
+            schema_version: self.schema_version,
+            authority_id: self.authority_id,
+            challenge_id: self.challenge_id,
+            origin_digest: self.origin_digest,
+            physical_digest: self.physical_digest,
+            installation_id: self.installation_id,
+            generation: self.generation,
+            state_fence: self.state_fence,
+            operation: self.operation,
+            issued_at_unix_ms: self.issued_at_unix_ms,
+            expires_at_unix_ms: self.expires_at_unix_ms,
+            nonce: self.nonce,
+            authentication_tag: self.authentication_tag,
+            challenge_digest: self.challenge_digest,
+        }
+    }
+}
+
 impl OriginChallenge {
+    /// Encodes the opaque Kernel challenge at an explicit JSON boundary.
+    pub fn to_json_bytes(&self) -> Result<Vec<u8>, ContractError> {
+        serde_json::to_vec(self).map_err(|error| ContractError::Serialization(error.to_string()))
+    }
+
+    /// Decodes an opaque Kernel challenge through its validating wire carrier.
+    ///
+    /// This is deliberately an explicit method instead of a public
+    /// `Deserialize` implementation. A decoded value is still only evidence
+    /// until the live Kernel authority verifies its key, issuance record,
+    /// fence, identity, currency, and nonce.
+    pub fn from_json_bytes(bytes: &[u8]) -> Result<Self, ContractError> {
+        let wire: OriginChallengeWire = serde_json::from_slice(bytes)
+            .map_err(|error| ContractError::Serialization(error.to_string()))?;
+        let challenge = wire.into_challenge();
+        challenge.validate_shape()?;
+        Ok(challenge)
+    }
+
     fn unsigned(&self) -> UnsignedChallenge<'_> {
         UnsignedChallenge {
             domain: ORIGIN_CHALLENGE_DOMAIN,
@@ -307,7 +375,40 @@ pub struct OriginControlPresentation {
     presentation_digest: String,
 }
 
+/// Private decode carrier for the sealed presentation wire.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OriginControlPresentationWire {
+    schema_version: String,
+    request: OriginChallengeRequest,
+    challenge: OriginChallengeWire,
+    presentation_digest: String,
+}
+
 impl OriginControlPresentation {
+    /// Encodes the sealed presentation at an explicit JSON boundary.
+    pub fn to_json_bytes(&self) -> Result<Vec<u8>, ContractError> {
+        serde_json::to_vec(self).map_err(|error| ContractError::Serialization(error.to_string()))
+    }
+
+    /// Decodes a sealed presentation through its validating wire carrier.
+    ///
+    /// The returned value remains unauthorised until the live Kernel authority
+    /// verifies its issuance record, key tag, fence, physical identity,
+    /// currency, and one-shot nonce.
+    pub fn from_json_bytes(bytes: &[u8]) -> Result<Self, ContractError> {
+        let wire: OriginControlPresentationWire = serde_json::from_slice(bytes)
+            .map_err(|error| ContractError::Serialization(error.to_string()))?;
+        let presentation = Self {
+            schema_version: wire.schema_version,
+            request: wire.request,
+            challenge: wire.challenge.into_challenge(),
+            presentation_digest: wire.presentation_digest,
+        };
+        presentation.validate()?;
+        Ok(presentation)
+    }
+
     /// Seals a request with its challenge after checking completeness binding.
     ///
     /// Packaging only: issuance, revocation, currency, and the live epoch are
@@ -459,6 +560,110 @@ struct IssuedOriginChallenge {
     revoked: bool,
 }
 
+/// One opaque issued-origin replay entry retained in the Kernel snapshot.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OriginChallengeReplayEntry {
+    nonce: String,
+    origin_digest: String,
+    physical_digest: String,
+    installation_id: String,
+    generation: Generation,
+    state_fence: StateFence,
+    operation: OriginControlOperation,
+    issued_at_unix_ms: u64,
+    expires_at_unix_ms: u64,
+    revoked: bool,
+}
+
+impl OriginChallengeReplayEntry {
+    fn validate(&self) -> Result<(), ContractError> {
+        validate_token("request_nonce", self.nonce.clone(), MAX_NONCE_LEN)?;
+        validate_origin_digest(self.origin_digest.clone())?;
+        validate_hex_digest(&self.physical_digest)?;
+        validate_token(
+            "installation_id",
+            self.installation_id.clone(),
+            MAX_INSTALLATION_ID_LEN,
+        )?;
+        self.state_fence
+            .validate()
+            .map_err(|_| ContractError::FenceMismatch)?;
+        if self.state_fence.resource_generation.value() != self.generation.get() {
+            return Err(ContractError::FenceMismatch);
+        }
+        if self.issued_at_unix_ms == 0
+            || self.expires_at_unix_ms < self.issued_at_unix_ms
+            || self.expires_at_unix_ms - self.issued_at_unix_ms > MAX_CHALLENGE_WINDOW_MS
+        {
+            return Err(ContractError::InvalidValue {
+                field: "origin_challenge_window",
+                reason: "replayed issue time and expiry are outside the bounded window",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Durable replay state for the Kernel-owned origin authority.
+///
+/// This is an encrypted payload component of the existing
+/// `KernelAuthoritySnapshot`; it is not a second ORS record or schema.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OriginChallengeReplaySnapshot {
+    authority_id: DispatchAuthorityId,
+    next_sequence: u64,
+    issued: Vec<OriginChallengeReplayEntry>,
+    consumed_nonces: Vec<String>,
+}
+
+impl OriginChallengeReplaySnapshot {
+    /// Validates replay state before it is admitted to live Kernel authority.
+    pub fn validate(&self) -> Result<(), ContractError> {
+        validate_authority_id(&self.authority_id)?;
+        if self.next_sequence == 0 {
+            return Err(ContractError::InvalidValue {
+                field: "origin_replay_snapshot.next_sequence",
+                reason: "must be non-zero",
+            });
+        }
+        if self.issued.len() > MAX_ORIGIN_REPLAY_ENTRIES
+            || self.consumed_nonces.len() > MAX_ORIGIN_REPLAY_ENTRIES
+        {
+            return Err(ContractError::LimitExceeded {
+                field: "origin_replay_snapshot.entries",
+                limit: MAX_ORIGIN_REPLAY_ENTRIES,
+            });
+        }
+        let mut issued_nonces = BTreeSet::new();
+        for entry in &self.issued {
+            entry.validate()?;
+            if !issued_nonces.insert(entry.nonce.as_str()) {
+                return Err(ContractError::DuplicateValue {
+                    field: "origin_replay_snapshot.issued_nonce",
+                });
+            }
+        }
+        let mut consumed_nonces = BTreeSet::new();
+        for nonce in &self.consumed_nonces {
+            validate_token("request_nonce", nonce.clone(), MAX_NONCE_LEN)?;
+            if !consumed_nonces.insert(nonce.as_str()) {
+                return Err(ContractError::DuplicateValue {
+                    field: "origin_replay_snapshot.consumed_nonce",
+                });
+            }
+            if !issued_nonces.contains(nonce.as_str()) {
+                return Err(ContractError::InvalidValue {
+                    field: "origin_replay_snapshot.consumed_nonce",
+                    reason: "consumed nonce must belong to an issued challenge",
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Kernel-owned issuer and decision point for origin challenges.
 ///
 /// The production instance lives in the Kernel service (P-07 owns the instance
@@ -483,6 +688,72 @@ impl OriginChallengeAuthority {
             next_sequence: 1,
             issued: BTreeMap::new(),
             consumed_nonces: BTreeSet::new(),
+        }
+    }
+
+    /// Restores one exact Kernel-owned origin replay fence around the active
+    /// secret key.
+    pub fn recover(
+        expected_authority_id: DispatchAuthorityId,
+        key: KernelDispatchKey,
+        snapshot: OriginChallengeReplaySnapshot,
+    ) -> Result<Self, ContractError> {
+        validate_authority_id(&expected_authority_id)?;
+        snapshot.validate()?;
+        if snapshot.authority_id != expected_authority_id {
+            return Err(ContractError::DispatchAuthorityMismatch);
+        }
+        let issued = snapshot
+            .issued
+            .into_iter()
+            .map(|entry| {
+                (
+                    entry.nonce.clone(),
+                    IssuedOriginChallenge {
+                        origin_digest: entry.origin_digest,
+                        physical_digest: entry.physical_digest,
+                        installation_id: entry.installation_id,
+                        generation: entry.generation,
+                        state_fence: entry.state_fence,
+                        operation: entry.operation,
+                        issued_at_unix_ms: entry.issued_at_unix_ms,
+                        expires_at_unix_ms: entry.expires_at_unix_ms,
+                        revoked: entry.revoked,
+                    },
+                )
+            })
+            .collect();
+        Ok(Self {
+            authority_id: expected_authority_id,
+            key,
+            next_sequence: snapshot.next_sequence,
+            issued,
+            consumed_nonces: snapshot.consumed_nonces.into_iter().collect(),
+        })
+    }
+
+    /// Returns the exact opaque replay state for encrypted Kernel recovery.
+    pub fn replay_snapshot(&self) -> OriginChallengeReplaySnapshot {
+        OriginChallengeReplaySnapshot {
+            authority_id: self.authority_id.clone(),
+            next_sequence: self.next_sequence,
+            issued: self
+                .issued
+                .iter()
+                .map(|(nonce, entry)| OriginChallengeReplayEntry {
+                    nonce: nonce.clone(),
+                    origin_digest: entry.origin_digest.clone(),
+                    physical_digest: entry.physical_digest.clone(),
+                    installation_id: entry.installation_id.clone(),
+                    generation: entry.generation,
+                    state_fence: entry.state_fence.clone(),
+                    operation: entry.operation,
+                    issued_at_unix_ms: entry.issued_at_unix_ms,
+                    expires_at_unix_ms: entry.expires_at_unix_ms,
+                    revoked: entry.revoked,
+                })
+                .collect(),
+            consumed_nonces: self.consumed_nonces.iter().cloned().collect(),
         }
     }
 
@@ -678,6 +949,10 @@ impl OriginChallengeAuthority {
     }
 }
 
+fn validate_authority_id(authority_id: &DispatchAuthorityId) -> Result<(), ContractError> {
+    DispatchAuthorityId::new(authority_id.as_str().to_owned()).map(|_| ())
+}
+
 fn validate_token(
     field: &'static str,
     value: String,
@@ -843,6 +1118,58 @@ mod tests {
         assert_eq!(grant.operation(), OriginControlOperation::Kill);
         assert_eq!(grant.decided_at_unix_ms(), NOW);
         assert_eq!(authority.consumed_count(), 1);
+    }
+
+    #[test]
+    fn opaque_wire_round_trip_and_tamper_rejection_are_explicit() {
+        let mut authority = test_authority();
+        let request = test_request();
+        let challenge = authority
+            .issue(&request, ISSUED_AT, EXPIRES_AT)
+            .expect("kernel issues the challenge");
+        let challenge_bytes = challenge.to_json_bytes().expect("challenge wire");
+        let decoded_challenge =
+            OriginChallenge::from_json_bytes(&challenge_bytes).expect("challenge decodes");
+        assert_eq!(decoded_challenge, challenge);
+
+        let presentation =
+            OriginControlPresentation::new(request, challenge).expect("presentation seals");
+        let presentation_bytes = presentation.to_json_bytes().expect("presentation wire");
+        let decoded_presentation = OriginControlPresentation::from_json_bytes(&presentation_bytes)
+            .expect("presentation decodes");
+        assert_eq!(decoded_presentation, presentation);
+
+        let mut tampered: serde_json::Value =
+            serde_json::from_slice(&presentation_bytes).expect("presentation JSON");
+        tampered["challenge"]["origin_digest"] = serde_json::Value::String("b".repeat(64));
+        let tampered_bytes = serde_json::to_vec(&tampered).expect("tampered JSON");
+        assert!(
+            OriginControlPresentation::from_json_bytes(&tampered_bytes).is_err(),
+            "tampered opaque wire must fail its digest-boundary validation"
+        );
+    }
+
+    #[test]
+    fn replay_snapshot_preserves_consumed_nonce_across_recovery() {
+        let mut authority = test_authority();
+        let presentation = present(&mut authority, test_request());
+        authority
+            .decide(&presentation, &test_epoch(), NOW)
+            .expect("first decision");
+        let snapshot = authority.replay_snapshot();
+        let mut recovered = OriginChallengeAuthority::recover(
+            DispatchAuthorityId::new("kernel-origin-test").expect("authority id"),
+            KernelDispatchKey::from_secret_bytes([7_u8; 32]).expect("kernel key"),
+            snapshot,
+        )
+        .expect("replay recovery");
+
+        assert_eq!(recovered.issued_count(), 1);
+        assert_eq!(recovered.consumed_count(), 1);
+        assert!(matches!(
+            recovered.decide(&presentation, &test_epoch(), NOW),
+            Err(ContractError::DispatchPermitConsumed)
+        ));
     }
 
     #[test]

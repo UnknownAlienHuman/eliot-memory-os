@@ -14,16 +14,19 @@
 //! boundary via `super::*`. It is an ordinary module kept under 10k LOC.
 use super::*;
 use eliot_contracts::ContractVersion;
-use eliot_kernel_core::{KernelError, KernelResult, SealedAuthoritySnapshot};
+use eliot_kernel_core::{
+    KernelAuthorityReplaySnapshot, KernelError, KernelResult, SealedAuthoritySnapshot,
+};
 use eliot_ors::{
     EpochIdentity, EpochLineage, OpaqueLabel, OperationIdentity, RecoveryPayload,
     StateFenceSnapshot,
 };
 use eliot_platform::{PlatformHandle, SecretReference};
 use eliot_process::{
-    ActionLeaseRef, DispatchPermitAuthority, DispatchPermitReplaySnapshot, EnvironmentInheritance,
-    EnvironmentProjection, FencingToken, ImageId, JobId, OperationId, PermitIssuance,
-    ProcessTreeId, ResourceLimits, SessionId,
+    ActionLeaseRef, DispatchPermitAuthority, EnvironmentInheritance, EnvironmentProjection,
+    FencingToken, ImageId, JobId, OperationId, OriginChallengeRequest, OriginControlOperation,
+    OriginControlPresentation, PermitIssuance, PhysicalProcessBinding, ProcessTreeId,
+    ResourceLimits, SessionId,
 };
 use eliot_runtime_contracts::{
     DAEMON_SUPERVISION_HEARTBEAT_CONTRACT_NAME, DAEMON_SUPERVISION_HEARTBEAT_CONTRACT_VERSION,
@@ -2231,7 +2234,7 @@ struct JsonSnapshotCodec;
 impl DispatchSnapshotCodec for JsonSnapshotCodec {
     fn seal(
         &self,
-        snapshot: &DispatchPermitReplaySnapshot,
+        snapshot: &KernelAuthorityReplaySnapshot,
         _binding: &AuthoritySnapshotBinding,
     ) -> KernelResult<SealedAuthoritySnapshot> {
         let ciphertext = serde_json::to_vec(snapshot)
@@ -2245,7 +2248,7 @@ impl DispatchSnapshotCodec for JsonSnapshotCodec {
         &self,
         payload: &RecoveryPayload,
         _binding: &AuthoritySnapshotBinding,
-    ) -> KernelResult<DispatchPermitReplaySnapshot> {
+    ) -> KernelResult<KernelAuthorityReplaySnapshot> {
         let RecoveryPayload::Encrypted { ciphertext, .. } = payload else {
             return Err(KernelError::RecoveryUnavailable(
                 "authority fixture payload is not encrypted".to_owned(),
@@ -2276,6 +2279,52 @@ fn authority_binding(authority_id: &DispatchAuthorityId) -> AuthoritySnapshotBin
         None,
     )
     .expect("authority binding")
+}
+
+fn origin_authority_binding(
+    authority_id: &DispatchAuthorityId,
+) -> (AuthoritySnapshotBinding, eliot_contracts::StateFence) {
+    let fence = eliot_contracts::StateFence::new(
+        test_epoch(1),
+        ResourceGeneration::new(3).expect("generation"),
+    );
+    let epoch = EpochLineage {
+        current: EpochIdentity {
+            lineage_id: OpaqueLabel::new("550e8400-e29b-41d4-a716-446655440000").expect("lineage"),
+            epoch: 1,
+        },
+        predecessor: None,
+    };
+    let state_fence = StateFenceSnapshot::capture(&fence, 1).expect("state fence");
+    let binding = AuthoritySnapshotBinding::new(
+        authority_id.clone(),
+        OperationIdentity::new(authority_id.as_str()).expect("record id"),
+        epoch,
+        state_fence,
+        1,
+        None,
+    )
+    .expect("origin authority binding");
+    (binding, fence)
+}
+
+fn origin_test_request(fence: eliot_contracts::StateFence) -> OriginChallengeRequest {
+    OriginChallengeRequest::new(
+        PhysicalProcessBinding::new(
+            4242,
+            133_081_756_927_500_000,
+            "C:\\svc\\worker.exe",
+            "executor-job-1",
+        )
+        .expect("physical identity"),
+        "installation-7",
+        "a".repeat(64),
+        Generation::new(3).expect("generation"),
+        fence,
+        OriginControlOperation::Kill,
+        "origin-recovery-nonce",
+    )
+    .expect("origin request")
 }
 
 fn seed_intent() -> ProcessIntent {
@@ -3197,6 +3246,63 @@ fn process_authority_first_issue_is_versioned_and_stale_controller_fails_closed(
     drop(restarted);
     drop(stale);
     drop(winner);
+    drop(store);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn process_authority_origin_replay_survives_ors_restart() {
+    let root = std::env::temp_dir().join(format!(
+        "eliot-kernel-origin-recovery-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).expect("test work root");
+    let ors_path = root.join("kernel-ors.redb");
+    let authority_id = DispatchAuthorityId::new("kernel-origin-recovery").expect("authority");
+    let (binding, fence) = origin_authority_binding(&authority_id);
+    let codec: Arc<dyn DispatchSnapshotCodec> = Arc::new(JsonSnapshotCodec);
+    let store = Arc::new(RedbRecoveryStore::open(&ors_path).expect("real ORS store"));
+    let authority_store: Arc<dyn OperationalRecoveryStore> = store.clone();
+    let key = || KernelDispatchKey::from_secret_bytes([0x5a; 32]).expect("dispatch key");
+
+    let mut controller = ProcessDispatchAuthorityController::activate_and_persist_initial(
+        authority_id.clone(),
+        key(),
+        Arc::clone(&authority_store),
+        Arc::clone(&codec),
+        &binding,
+    )
+    .expect("initial authority snapshot");
+    let request = origin_test_request(fence);
+    let challenge = controller
+        .issue_origin_challenge(&request, 1_700_000_000_000, 1_700_000_060_000, &binding)
+        .expect("origin challenge issue");
+    let presentation =
+        OriginControlPresentation::new(request, challenge).expect("origin presentation");
+    drop(controller);
+
+    let mut recovered = ProcessDispatchAuthorityController::restore(
+        authority_id,
+        key(),
+        authority_store,
+        codec,
+        &binding,
+    )
+    .expect("authority restart recovery");
+    let grant = recovered
+        .decide_origin_control(&presentation, 1_700_000_030_000, &binding)
+        .expect("recovered origin decision");
+    assert_eq!(grant.operation(), OriginControlOperation::Kill);
+    assert!(matches!(
+        recovered.decide_origin_control(&presentation, 1_700_000_030_000, &binding),
+        Err(KernelError::DependencyUnavailable(_))
+    ));
+
+    drop(recovered);
     drop(store);
     let _ = std::fs::remove_dir_all(root);
 }
