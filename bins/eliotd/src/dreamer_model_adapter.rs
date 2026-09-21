@@ -67,7 +67,7 @@
 //!     eliot_agent_api::PhysicalRouteObservationReceipt::validate_against
 
 use eliot_agent_api::{
-    AdmittedRouteReceipt, AgentResult, ExecutionOutcome, ProviderExecutionBinding,
+    AdmittedRouteReceipt, AgentResult, ExecutionOutcome, LowercaseSha256, ProviderExecutionBinding,
     ResultDisposition, RouteFingerprint, RouteObservationState,
 };
 use eliot_agent_coordinator::{
@@ -158,6 +158,28 @@ pub struct ModelInvokeInput {
     /// fence or the invoke fails closed on rotation instead of admitting
     /// on stale evidence.
     pub current_fence: StateFence,
+    /// Kernel-issued active-generation projection for this invoke (R4),
+    /// threaded per call once the authenticated generation query lands.
+    /// `None` while the query is unserved: cold and honest — outcomes carry
+    /// an empty (unknown) fingerprint, never an inferred or defaulted one.
+    pub kernel_generation: Option<KernelGenerationProjection>,
+}
+
+/// Kernel-issued active-generation projection observation (R4).
+///
+/// The fingerprint is the canonical SHA-256 scheme computed by the Kernel
+/// Generation Registry from live owned state (route scope, active
+/// generation, lineage-aware epoch, exact State Fence); the fence is the
+/// projection's exact admitted fence. Both arrive caller-observed per call
+/// and are validated here: the fingerprint must parse as lowercase SHA-256
+/// and the fence must equal the admitted fence exactly, or the invoke fails
+/// closed. Nothing here mints, aliases, or substitutes a Config digest.
+#[derive(Clone, Debug)]
+pub struct KernelGenerationProjection {
+    /// Canonical fingerprint in lowercase hexadecimal (64 chars).
+    pub fingerprint: String,
+    /// Exact State Fence the projection was issued under.
+    pub fence: StateFence,
 }
 
 /// Thin governed Dreamer model-call adapter over the retained daemon owners.
@@ -449,6 +471,11 @@ pub(crate) async fn invoke_admitted_model(
     // hold fresh admission on BOTH the adopted Governor registry side and the
     // funnel side before the execution port is touched.
     let required = gate_model_capability(admitted_fence, registry, input)?;
+    // R4 generation binding: the Kernel-issued projection (when served) is
+    // validated against the admitted fence before execution; the bound
+    // fingerprint rides the intake outcomes below.
+    let generation_fingerprint =
+        bind_kernel_generation_projection(admitted_fence, input.kernel_generation.as_ref())?;
     let result = execution
         .execute(&candidate, &input.admission, &input.binding)
         .await?;
@@ -459,7 +486,13 @@ pub(crate) async fn invoke_admitted_model(
             &input.request.launch.effect_ceiling,
         )
         .map_err(|error| owner_error(format!("dreamer model result: {error}")))?;
-    record_model_result_intake(&result, &input.binding, &required, intake)?;
+    record_model_result_intake(
+        &result,
+        &input.binding,
+        &required,
+        &generation_fingerprint,
+        intake,
+    )?;
     Ok(result)
 }
 
@@ -584,6 +617,36 @@ fn gate_model_capability(
     Ok(required)
 }
 
+/// Binds one Kernel-issued generation projection to the admitted fence (R4).
+///
+/// `None` (query unserved or unobserved) binds to the empty marker: outcomes
+/// carry an unknown fingerprint, never an inference. A served projection
+/// must carry the exact admitted fence and a lowercase SHA-256 fingerprint
+/// or the invoke fails closed — a foreign fence is rotation, a malformed
+/// digest is not a projection. Runs before the execution port is touched.
+fn bind_kernel_generation_projection(
+    admitted_fence: &StateFence,
+    projection: Option<&KernelGenerationProjection>,
+) -> Result<String, CompositionError> {
+    let Some(observed) = projection else {
+        return Ok(String::new());
+    };
+    if observed.fence != *admitted_fence {
+        return Err(owner_error(
+            "kernel generation projection fence does not match the admitted fence (rotation)",
+        ));
+    }
+    let digest: LowercaseSha256 = serde_json::from_value(serde_json::Value::String(
+        observed.fingerprint.clone(),
+    ))
+    .map_err(|error| {
+        owner_error(format!(
+            "kernel generation fingerprint is not a canonical digest: {error}"
+        ))
+    })?;
+    Ok(digest.as_str().to_owned())
+}
+
 /// Records the result-intake join for one verified invoke result (C1).
 ///
 /// The receipt must be opened by the caller for the executed attempt; a
@@ -593,7 +656,8 @@ fn gate_model_capability(
 ///   call-scoped outcome per required capability, attempt-visible only and
 ///   never global state. Route keys are the canonical digests of the
 ///   admitted requested route and (on divergence) the runtime-observed
-///   route.
+///   route. Each outcome carries the bound Kernel generation fingerprint
+///   (R4; empty while the projection query is unserved).
 /// - unobserved route, `UnknownOutcome` disposition, or unknown execution
 ///   outcome: no positive claim is recorded; the receipt stays empty.
 /// - matched successful execution: nothing to record.
@@ -605,6 +669,7 @@ fn record_model_result_intake(
     result: &AgentResult,
     binding: &ProviderExecutionBinding,
     required: &[String],
+    generation_fingerprint: &str,
     intake: &mut AttemptReceipt,
 ) -> Result<(), CompositionError> {
     if intake.attempt_id != binding.attempt_id.as_str() {
@@ -635,7 +700,7 @@ fn record_model_result_intake(
         "degraded execution without proof on the admitted route"
     };
     for capability in required {
-        let outcome = fallback_outcome(FallbackOutcomeRequest {
+        let mut outcome = fallback_outcome(FallbackOutcomeRequest {
             capability: capability.clone(),
             requested_mode: requested_key.as_str().to_owned(),
             effective_mode: effective_key.as_str().to_owned(),
@@ -646,6 +711,9 @@ fn record_model_result_intake(
             attempt_id: binding.attempt_id.as_str().to_owned(),
         })
         .map_err(|error| owner_error(format!("model result intake outcome: {error}")))?;
+        // R4: the Kernel-issued fingerprint bound pre-execution; empty while
+        // the projection query is unserved (unknown, never inferred).
+        generation_fingerprint.clone_into(&mut outcome.generation_fingerprint);
         intake
             .attach(outcome)
             .map_err(|error| owner_error(format!("model result intake attach: {error}")))?;
@@ -1089,6 +1157,7 @@ mod tests {
             pulse: None,
             evidence_scope: None,
             current_fence: fence.clone(),
+            kernel_generation: None,
         };
         let execution = RecordingExecution {
             calls: Mutex::new(0),
@@ -1256,6 +1325,7 @@ mod tests {
             pulse: None,
             evidence_scope: scope,
             current_fence: fixtures.fence.clone(),
+            kernel_generation: None,
         }
     }
 
@@ -1651,6 +1721,137 @@ mod tests {
                 "rotation must deny on the snapshot boundary, got: {error}"
             ),
             Ok(_) => panic!("rotated live fence must fail closed"),
+        }
+        assert_eq!(succeeding_calls(&execution)?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn served_generation_projection_binds_outcome_fingerprint() -> TestResult {
+        let fixtures = invoke_fixtures()?;
+        let scope = test_evidence_scope();
+        let registry = test_registry_admitted(&scope)?;
+        let generation = fixtures.fence.resource_generation.value();
+        let mut input = gate_input(
+            &fixtures,
+            vec![test_funnel_record(&fixtures.route, generation)],
+            Some(scope),
+        );
+        // Kernel-issued projection observed for this invoke: canonical digest
+        // under the exact admitted fence.
+        let fingerprint = test_digest("t12-07-generation")?;
+        input.kernel_generation = Some(KernelGenerationProjection {
+            fingerprint: fingerprint.as_str().to_owned(),
+            fence: fixtures.fence.clone(),
+        });
+        let mut observed = fixtures.route.clone();
+        observed.model = "model-diverged".to_owned();
+        let result = invoke_result(
+            &fixtures.admission,
+            &fixtures.binding,
+            &fixtures.route,
+            &fixtures.fence,
+            ResultDisposition::CandidateSucceeded,
+            |observation| {
+                observation.observed_route = Some(observed.clone());
+                observation.route_state = RouteObservationState::Diverged;
+                observation.diverged_fields =
+                    route_divergence_fields(&observation.requested_route, &observed);
+                observation.recovery_ref = Some("recovery-diverged-1".to_owned());
+                Ok(())
+            },
+        )?;
+        let execution = SucceedingExecution {
+            calls: Mutex::new(0),
+            result,
+        };
+        let mut intake = AttemptReceipt::new(fixtures.binding.attempt_id.as_str())
+            .map_err(|error| format!("intake: {error}"))?;
+        run_gate(&fixtures, &registry, &input, &mut intake, &execution).await?;
+        assert_eq!(succeeding_calls(&execution)?, 1);
+        assert_eq!(intake.capability_outcomes.len(), 1);
+        assert_eq!(
+            intake.capability_outcomes[0].generation_fingerprint,
+            fingerprint.as_str(),
+            "intake binds the Kernel-issued fingerprint, never a local mint"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn foreign_generation_projection_denies_before_execution() -> TestResult {
+        let fixtures = invoke_fixtures()?;
+        let scope = test_evidence_scope();
+        let registry = test_registry_admitted(&scope)?;
+        let generation = fixtures.fence.resource_generation.value();
+        let mut input = gate_input(
+            &fixtures,
+            vec![test_funnel_record(&fixtures.route, generation)],
+            Some(scope),
+        );
+        // Well-formed digest but issued under a rotated fence: stale foreign
+        // observation, never bound.
+        input.kernel_generation = Some(KernelGenerationProjection {
+            fingerprint: test_digest("t12-07-generation")?.as_str().to_owned(),
+            fence: drifted_fence()?,
+        });
+        let execution = SucceedingExecution {
+            calls: Mutex::new(0),
+            result: matched_success(
+                &fixtures.admission,
+                &fixtures.binding,
+                &fixtures.route,
+                &fixtures.fence,
+            )?,
+        };
+        let mut intake = AttemptReceipt::new(fixtures.binding.attempt_id.as_str())
+            .map_err(|error| format!("intake: {error}"))?;
+        let outcome = run_gate(&fixtures, &registry, &input, &mut intake, &execution).await;
+        match outcome {
+            Err(error) => assert!(
+                error.to_string().contains("rotation"),
+                "foreign projection must deny on rotation, got: {error}"
+            ),
+            Ok(_) => panic!("foreign projection must fail closed"),
+        }
+        assert_eq!(succeeding_calls(&execution)?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn malformed_generation_fingerprint_denies_before_execution() -> TestResult {
+        let fixtures = invoke_fixtures()?;
+        let scope = test_evidence_scope();
+        let registry = test_registry_admitted(&scope)?;
+        let generation = fixtures.fence.resource_generation.value();
+        let mut input = gate_input(
+            &fixtures,
+            vec![test_funnel_record(&fixtures.route, generation)],
+            Some(scope),
+        );
+        // Right fence, wrong shape: not a canonical digest, not a projection.
+        input.kernel_generation = Some(KernelGenerationProjection {
+            fingerprint: "NOT-A-DIGEST".to_owned(),
+            fence: fixtures.fence.clone(),
+        });
+        let execution = SucceedingExecution {
+            calls: Mutex::new(0),
+            result: matched_success(
+                &fixtures.admission,
+                &fixtures.binding,
+                &fixtures.route,
+                &fixtures.fence,
+            )?,
+        };
+        let mut intake = AttemptReceipt::new(fixtures.binding.attempt_id.as_str())
+            .map_err(|error| format!("intake: {error}"))?;
+        let outcome = run_gate(&fixtures, &registry, &input, &mut intake, &execution).await;
+        match outcome {
+            Err(error) => assert!(
+                error.to_string().contains("canonical digest"),
+                "malformed fingerprint must deny, got: {error}"
+            ),
+            Ok(_) => panic!("malformed fingerprint must fail closed"),
         }
         assert_eq!(succeeding_calls(&execution)?, 0);
         Ok(())

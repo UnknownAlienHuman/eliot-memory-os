@@ -126,7 +126,8 @@ pub use dreamer_materials::{
     verify_resolved_bytes,
 };
 pub use dreamer_model_adapter::{
-    DreamerModelExecution, GovernedDreamerModelAdapter, ModelInvokeInput,
+    DreamerModelExecution, GovernedDreamerModelAdapter, KernelGenerationProjection,
+    ModelInvokeInput,
 };
 pub use first_run_wiring::{
     DisabledAutomationOutcome, FirstRunWiringError, inspect_first_run_defaults,
@@ -284,6 +285,10 @@ pub struct DaemonComposition {
     /// binding from them. `None` until the runtime notes a live session, so
     /// boards keep the empty (unadmitted) behaviour without one.
     owner_session: Option<OwnerSessionFacts>,
+    /// Shared Governor Skill catalogue handle for catalogue-guarded skill
+    /// promotion. Empty until catalogue installation wiring lands; absent
+    /// entries forward open-world.
+    skill_catalogue: skill_lifecycle_adapters::CatalogueHandle,
     /// Daemon-held Governor capability admission view (issue #1957).
     ///
     /// Constructed empty at [`DaemonComposition::start`], hydrated from the
@@ -347,6 +352,9 @@ impl DaemonComposition {
             view_stale: false,
             operator_replay: SharedOperatorReplay::new(),
             owner_session: None,
+            skill_catalogue: Arc::new(
+                std::sync::Mutex::new(eliot_skill::SkillCatalogue::default()),
+            ),
             capability_admission: GovernorCapabilityAdmission::new(),
         })
     }
@@ -692,9 +700,12 @@ impl DaemonComposition {
                 eliot_governor::CompositionError::NotReady,
             ));
         }
-        Ok(skill_lifecycle_adapters::ForwardingSkillLifecycle::new(
-            self.governor.skill_lifecycle(),
-        ))
+        Ok(
+            skill_lifecycle_adapters::ForwardingSkillLifecycle::with_catalogue(
+                self.governor.skill_lifecycle(),
+                Arc::clone(&self.skill_catalogue),
+            ),
+        )
     }
 
     /// Borrows the single Governor task lifecycle owner as a forwarding

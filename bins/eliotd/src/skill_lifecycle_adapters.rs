@@ -94,12 +94,6 @@ impl<T> ForwardingSkillLifecycle<T> {
 
     /// Wraps the single Governor lifecycle owner plus the shared catalogue
     /// handle for guarded forwarding (see the module contract).
-    ///
-    /// No in-tree caller wires the shared handle yet: `DaemonComposition`
-    /// keeps calling [`new`](Self::new) until catalogue installation wiring
-    /// lands (reported central hunk). The dead-code allowance covers exactly
-    /// that pending adoption; it expires when the hunk lands.
-    #[allow(dead_code)]
     pub(crate) fn with_catalogue(inner: T, catalogue: CatalogueHandle) -> Self {
         Self { inner, catalogue }
     }
