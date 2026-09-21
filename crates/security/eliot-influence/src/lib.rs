@@ -1947,4 +1947,34 @@ mod tests {
             Err(error) => panic!("decision input binds confirmatory use: {error:?}"),
         }
     }
+    #[test]
+    fn bind_result_rejects_forged_decision_verdict() {
+        let subject = qualified_subject(vec![EpistemicUse::CandidateEvidence]);
+        let admission = match admit_context(&subject) {
+            Ok(admission) => admission,
+            Err(error) => panic!("admission succeeds: {error:?}"),
+        };
+        let pending = match inject_pending(&subject, &admission) {
+            Ok(pending) => pending,
+            Err(error) => panic!("injection succeeds: {error:?}"),
+        };
+        let decision =
+            match decide_material(&subject, &pending, &admission, RuntimeUse::DecisionInput) {
+                Ok(decision) => decision,
+                Err(error) => panic!("decision succeeds: {error:?}"),
+            };
+        let mut forged = decision.clone();
+        forged.verdict_kind = RuntimeVerdictKind::DegradedUse;
+        match bind_result(
+            &subject,
+            &forged,
+            &pending,
+            &admission,
+            RuntimeUse::ConfirmatoryAcceptance,
+        ) {
+            Ok(_) => panic!("forged decision verdict must fail"),
+            Err(InfluenceRuntimeError::BindingMismatch { .. }) => {}
+            Err(other) => panic!("expected binding mismatch, got {other:?}"),
+        }
+    }
 }
