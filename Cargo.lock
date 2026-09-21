@@ -2068,9 +2068,12 @@ version = "0.1.0"
 dependencies = [
  "eliot-contracts",
  "eliot-doctor-core",
+ "eliot-epistemic",
+ "eliot-evidence",
  "eliot-ipc",
  "eliot-kernel-core",
  "eliot-mcp",
+ "eliot-memory-curation",
  "eliot-ors",
  "eliot-platform",
  "eliot-platform-windows",
