@@ -84,6 +84,12 @@ pub use controlboard_consumer::{
     render_controlboard_status,
 };
 
+mod controlboard_transport;
+pub use controlboard_transport::{
+    CONTROLBOARD_STATUS_OPERATION, CONTROLBOARD_TRANSPORT_CONTRACT, ControlBoardTransportError,
+    ControlBoardTransportMessage, decode_controlboard_response, encode_controlboard_response,
+};
+
 const WATCHDOG_PUBLICATION_CHILD_LIMIT: u64 = 1024 * 1024;
 const HOST_JOURNAL_FILE_NAME: &str = "host-state-journal.redb";
 const WIN32_ERROR_FILE_NOT_FOUND: u32 = 2;
