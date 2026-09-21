@@ -13,12 +13,26 @@ use std::collections::{BTreeMap, BTreeSet};
 use eliot_contracts::{
     ContractVersion, RequestMetadata, StateFence, canonical_json_bytes, sha256_hex,
 };
-use eliot_skills::RegistrationIdentity;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub mod catalogue;
 pub use catalogue::*;
+pub mod install;
+pub use install::{CatalogueInstallContext, install_package, project_package_to_entry};
+
+/// Canonical package-source types consumed at the installation boundary.
+///
+/// Re-exported so the composition owner calls
+/// [`install_package`] without taking a second surface dependency; the types
+/// stay canonical (no duplicates, no bridges).
+pub use eliot_skills::{
+    AdvisoryRuleClaim, CapabilityVersion, ConflictState, DeliveryProjection, DependencyMaterial,
+    DistractorState, FreshnessState, HostLimits, HostProfile, LifecycleProposal,
+    MaterializationInputs, PackageDigests, QuarantineState, RegistrationIdentity, SkillBehavior,
+    SkillCounters, SkillInteractionProjection, SkillPackage, SkillState, ToolDefinitionMaterial,
+    VersionedRequirement,
+};
 
 pub const CONTRACT_NAME: &str = "eliot.governor.skill";
 pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);

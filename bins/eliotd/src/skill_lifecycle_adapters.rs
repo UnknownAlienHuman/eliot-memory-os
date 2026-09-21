@@ -17,6 +17,16 @@
 //!   feed runs after commit only: feeding before the usability gate would let
 //!   an in-flight intentional update mark itself stale and deadlock every
 //!   evolving Skill.
+//! - `install_package` populates the shared catalogue from a canonical
+//!   package source (production population caller): project, validate, and
+//!   insert under the tool-owner existence check. It runs on whichever handle
+//!   the adapter holds; the composition switches to the shared handle per the
+//!   reported central hunk so installs are visible to the promote gate.
+//! - `deliver_hotset` issues the Hotset delivery receipt the runtime injector
+//!   carries, and `acknowledge_and_display` binds the runtime receiver's ack
+//!   to that exact receipt before displaying. The ack is supplied by the real
+//!   receiver (runtime Hotset injector caller), never minted here: the model
+//!   validates the binding statelessly and keeps no second ledger.
 //! - `view` and `propose` forward unchanged: reads and proposals neither
 //!   consume the catalogue nor invent candidates.
 //! - `activation_display` executes against the shared catalogue handle: entry
@@ -106,6 +116,77 @@ impl<T> ForwardingSkillLifecycle<T> {
         self.catalogue
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Installs one canonical package source into the shared catalogue and
+    /// returns the installed Skill identity.
+    ///
+    /// This is the production population caller the runtime composition
+    /// drives: the Governor owner hands over a validated package claim, its
+    /// actual materialization inputs, and the explicit install context, and
+    /// the shared handle records the projected entry under the tool-owner
+    /// existence check. Synchronous: the guard is taken and dropped in a
+    /// closed scope and never crosses an await.
+    ///
+    /// No in-tree production caller drives the runtime population path yet:
+    /// the Governor owner wires it with the shared handle (reported central
+    /// hunk). The allowance covers exactly that pending adoption; it expires
+    /// when the hunk lands. Tests drive all three runtime callers.
+    #[allow(dead_code)]
+    pub(crate) fn install_package(
+        &self,
+        package: &eliot_skill::SkillPackage,
+        inputs: &eliot_skill::MaterializationInputs,
+        context: &eliot_skill::CatalogueInstallContext,
+        tools: &dyn KnownTools,
+    ) -> Result<String, SkillError> {
+        let mut catalogue = self.lock_catalogue();
+        eliot_skill::install_package(&mut catalogue, package, inputs, context, tools)
+    }
+
+    /// Issues the Hotset delivery receipt the runtime injector carries.
+    ///
+    /// Driven by the runtime Hotset injector caller with its own approval
+    /// handle: a non-blank approval never comes from a Hotset identity alone.
+    /// Synchronous: the guard is taken and dropped in a closed scope.
+    #[allow(dead_code)]
+    pub(crate) fn deliver_hotset(
+        &self,
+        hotset_id: String,
+        skill_ids: Vec<String>,
+        approval_ref: String,
+        tools: &dyn KnownTools,
+    ) -> Result<HotsetDeliveryReceipt, SkillError> {
+        let catalogue = self.lock_catalogue();
+        HotsetDeliveryReceipt::issue(hotset_id, &catalogue, skill_ids, tools, approval_ref)
+    }
+
+    /// Binds the runtime receiver's ack to its exact receipt, then displays.
+    ///
+    /// The ack arrives from the real receiver (runtime Hotset injector), which
+    /// validated the receipt, applied or rejected the bodies, and returned the
+    /// ack binding the exact receipt digest it acted on. Only an applied ack
+    /// for this exact receipt reaches the catalogue boundary; anything else
+    /// fails closed here without touching the catalogue. Synchronous: the
+    /// guard never crosses an await.
+    ///
+    /// Receipt and ack travel by value, mirroring the `SkillLifecycleApi`
+    /// display boundary: the injector caller relinquishes the pair it acted
+    /// on instead of retaining an alias into the guarded display.
+    #[allow(dead_code, clippy::needless_pass_by_value)]
+    pub(crate) fn acknowledge_and_display(
+        &self,
+        skill_id: &str,
+        receipt: HotsetDeliveryReceipt,
+        ack: HotsetDeliveryAck,
+        tools: &dyn KnownTools,
+    ) -> Result<ActivatedSkillDisplay, SkillError> {
+        if !ack.confirms_applied(&receipt) {
+            return Err(SkillError::IdentityMismatch);
+        }
+        ack.validate()?;
+        let catalogue = self.lock_catalogue();
+        catalogue.activation_display(skill_id, &receipt, &ack, tools)
     }
 }
 
@@ -626,6 +707,104 @@ mod tests {
     }
 
     #[test]
+    fn install_populates_the_shared_handle_for_the_promote_gate() {
+        let (forwarding, _calls, handle) = installing_forwarder();
+        let catalogue = handle.lock().expect("catalogue lock");
+        let stored = catalogue.get("skill-demo").expect("installed entry");
+        assert_eq!(stored.index.name, "demo skill");
+        assert!(catalogue.is_usable("skill-demo"));
+        drop(catalogue);
+        drop(forwarding);
+    }
+
+    #[test]
+    fn runtime_delivery_round_trip_installs_delivers_acks_and_displays() {
+        let (forwarding, calls, _handle) = installing_forwarder();
+        let receipt = forwarding
+            .deliver_hotset(
+                "hotset-runtime-1".to_owned(),
+                vec!["skill-demo".to_owned()],
+                "approval-commit-1".to_owned(),
+                &InstallTools,
+            )
+            .expect("runtime delivery");
+        assert!(receipt.confirms_delivery("skill-demo"));
+        let ack = HotsetDeliveryAck {
+            hotset_id: receipt.hotset_id.clone(),
+            receipt_digest: receipt.receipt_digest.clone(),
+            receiver_id: "runtime-hotset-1".to_owned(),
+            disposition: HotsetAckDisposition::Applied,
+        };
+        let display = forwarding
+            .acknowledge_and_display("skill-demo", receipt.clone(), ack, &InstallTools)
+            .expect("acked display");
+        assert_eq!(display.skill_id, "skill-demo");
+        assert_eq!(display.delivery_receipt_digest, receipt.receipt_digest);
+        assert!(
+            display
+                .render()
+                .contains("when demo work arrives load this skill")
+        );
+        assert_eq!(*calls.lock().expect("calls"), 0);
+    }
+
+    #[test]
+    fn acknowledge_rejects_unapplied_and_foreign_acks_before_display() {
+        let (forwarding, calls, _handle) = installing_forwarder();
+        let receipt = forwarding
+            .deliver_hotset(
+                "hotset-runtime-2".to_owned(),
+                vec!["skill-demo".to_owned()],
+                "approval-commit-1".to_owned(),
+                &InstallTools,
+            )
+            .expect("runtime delivery");
+        let rejected = HotsetDeliveryAck {
+            hotset_id: receipt.hotset_id.clone(),
+            receipt_digest: receipt.receipt_digest.clone(),
+            receiver_id: "runtime-hotset-1".to_owned(),
+            disposition: HotsetAckDisposition::Rejected {
+                reason: "receiver refused the bodies".to_owned(),
+            },
+        };
+        assert!(matches!(
+            forwarding.acknowledge_and_display(
+                "skill-demo",
+                receipt.clone(),
+                rejected,
+                &InstallTools
+            ),
+            Err(SkillError::IdentityMismatch)
+        ));
+        let foreign = HotsetDeliveryAck {
+            hotset_id: receipt.hotset_id.clone(),
+            receipt_digest: "e".repeat(64),
+            receiver_id: "runtime-hotset-1".to_owned(),
+            disposition: HotsetAckDisposition::Applied,
+        };
+        assert!(matches!(
+            forwarding.acknowledge_and_display("skill-demo", receipt, foreign, &InstallTools),
+            Err(SkillError::IdentityMismatch)
+        ));
+        assert_eq!(*calls.lock().expect("calls"), 0);
+    }
+
+    #[test]
+    fn delivery_requires_a_blank_rejected_approval_handle() {
+        let (forwarding, _calls, _handle) = installing_forwarder();
+        let refused = forwarding.deliver_hotset(
+            "hotset-runtime-3".to_owned(),
+            vec!["skill-demo".to_owned()],
+            "   ".to_owned(),
+            &InstallTools,
+        );
+        assert!(matches!(
+            refused,
+            Err(SkillError::InvalidField { field, .. }) if field == "delivery.approval_ref"
+        ));
+    }
+
+    #[test]
     fn forwarding_preserves_typed_rejection_without_invention() {
         let fence = fence();
         let calls = Arc::new(Mutex::new(0));
@@ -703,6 +882,142 @@ mod tests {
             .insert(catalogue_entry(), &TestTools)
             .expect("install entry");
         Arc::new(Mutex::new(catalogue))
+    }
+
+    struct InstallTools;
+
+    impl KnownTools for InstallTools {
+        fn knows_tool(&self, name: &str) -> bool {
+            name == "eliot.finish" || name == "finish-cap"
+        }
+    }
+
+    fn package_behavior() -> eliot_skill::SkillBehavior {
+        eliot_skill::SkillBehavior {
+            intent: "refresh the task view before a Material effect".to_owned(),
+            trigger: "when demo work arrives load this skill".to_owned(),
+            action: "Refresh the task view before a Material effect.".to_owned(),
+            applies_when: vec!["the task view is stale".to_owned()],
+            where_not_apply: vec!["Do not use for credential handling.".to_owned()],
+            required_outputs: vec!["refreshed view".to_owned()],
+            required_writebacks: vec!["NONE".to_owned()],
+            stop: "Stop and escalate on conflicting instructions.".to_owned(),
+            escalation: "escalate to the task owner".to_owned(),
+            challenge: "show exact conflicting identities".to_owned(),
+        }
+    }
+
+    fn package_inputs() -> eliot_skill::MaterializationInputs {
+        eliot_skill::MaterializationInputs {
+            canonical_source_bytes: b"canonical demo source\n".to_vec(),
+            contract_materialization: package_behavior(),
+            dependencies: vec![eliot_skill::DependencyMaterial {
+                name: "tool-def-1".to_owned(),
+                version: "1.2.0".to_owned(),
+                contract_digest: "c".repeat(64),
+            }],
+            tool_definitions: vec![eliot_skill::ToolDefinitionMaterial {
+                name: "eliot.finish".to_owned(),
+                version: "1.0.0".to_owned(),
+                description: "typed finish attempt".to_owned(),
+                capabilities: vec![eliot_skill::CapabilityVersion {
+                    name: "finish-cap".to_owned(),
+                    version: "1".to_owned(),
+                }],
+                actions: vec!["Refresh the task view before a Material effect.".to_owned()],
+            }],
+        }
+    }
+
+    fn package_source() -> (
+        eliot_skill::SkillPackage,
+        eliot_skill::MaterializationInputs,
+    ) {
+        let inputs = package_inputs();
+        let rule: eliot_skill::AdvisoryRuleClaim = serde_json::from_value(serde_json::json!({
+            "rule_ref": { "rule_id": "rule-demo-1", "revision": 1 }
+        }))
+        .expect("rule fixture");
+        let package = eliot_skill::SkillPackage {
+            registration: eliot_skill::RegistrationIdentity::new(
+                "skill-demo",
+                "1.0.0",
+                "demo skill",
+            )
+            .expect("valid test registration"),
+            digests: eliot_skill::PackageDigests::derive(&inputs).expect("valid test inputs"),
+            host: eliot_skill::HostProfile {
+                host: "codex".to_owned(),
+                profile: "default".to_owned(),
+                required_tools: vec![eliot_skill::VersionedRequirement {
+                    name: "eliot.finish".to_owned(),
+                    version: "1.0.0".to_owned(),
+                }],
+                required_capabilities: vec![eliot_skill::VersionedRequirement {
+                    name: "finish-cap".to_owned(),
+                    version: "1".to_owned(),
+                }],
+                limits: eliot_skill::HostLimits {
+                    max_description_chars: 500,
+                    max_actions: 1,
+                    max_expansion_handles: 2,
+                },
+            },
+            behavior: package_behavior(),
+            counters: eliot_skill::SkillCounters::default(),
+            state: eliot_skill::SkillState {
+                freshness: eliot_skill::FreshnessState::Current,
+                conflict: eliot_skill::ConflictState::None,
+                distractor: eliot_skill::DistractorState::None,
+                quarantine: eliot_skill::QuarantineState::Clear,
+            },
+            lifecycle_proposal: eliot_skill::LifecycleProposal::Keep,
+            delivery: eliot_skill::DeliveryProjection::default(),
+            interaction: eliot_skill::SkillInteractionProjection::default(),
+            rule,
+        };
+        package
+            .validate(&inputs)
+            .expect("fixture package validates");
+        (package, inputs)
+    }
+
+    fn install_context() -> eliot_skill::CatalogueInstallContext {
+        eliot_skill::CatalogueInstallContext {
+            eligible_routes: vec!["route-1".to_owned()],
+            eligible_profiles: vec!["profile-1".to_owned()],
+            host_version: "host-4.1.0".to_owned(),
+            profile_version: "profile-2.0.0".to_owned(),
+            index_budget_tokens: 200,
+            body_budget_tokens: 800,
+            runtime_budget_tokens: 2000,
+            index_tokens: 60,
+            body_tokens: 400,
+            runtime_tokens: 0,
+            references: vec!["references/playbook.md".to_owned()],
+            scripts: Vec::new(),
+            assets: Vec::new(),
+        }
+    }
+
+    fn installing_forwarder() -> (
+        ForwardingSkillLifecycle<ClosedInner>,
+        Arc<Mutex<u64>>,
+        CatalogueHandle,
+    ) {
+        let calls = Arc::new(Mutex::new(0));
+        let inner = ClosedInner {
+            fence_mismatch: false,
+            succeed_promote: false,
+            calls: Arc::clone(&calls),
+        };
+        let forwarding = ForwardingSkillLifecycle::new(inner);
+        let (package, inputs) = package_source();
+        let installed =
+            forwarding.install_package(&package, &inputs, &install_context(), &InstallTools);
+        assert_eq!(installed.expect("package install"), "skill-demo");
+        let handle = forwarding.catalogue.clone();
+        (forwarding, calls, handle)
     }
 
     fn base_view(fence: &StateFence) -> SkillLifecycleView {
