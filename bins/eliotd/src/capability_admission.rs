@@ -27,9 +27,10 @@
 //!
 //! Non-admission is an explicit [`AdmissionDisposition`]: absent evidence
 //! blocks, stale evidence defers, ambiguous evidence requires authority,
-//! degraded evidence caps at observe-only, and broken/unsupported evidence
-//! blocks. `broken`/`unsupported` on the exact fingerprint overrides declared
-//! proof, per I3.4.
+//! degraded evidence caps at observe-only, and fresh broken/unsupported
+//! evidence blocks. Stale broken/unsupported records are superseded by
+//! requalification instead of vetoing it. `broken`/`unsupported` on the exact
+//! fingerprint overrides declared proof, per I3.4.
 //!
 //! Delegation boundary (delegate, never copy):
 //!
@@ -193,7 +194,7 @@ impl AdmissionOutcome {
 /// Evaluates one production admission request against threaded evidence.
 ///
 /// Order is load-bearing: malformed requests block first, then absent scope
-/// evidence blocks, then `broken`/`unsupported` on the exact fingerprint
+/// evidence blocks, then fresh `broken`/`unsupported` on the exact fingerprint
 /// blocks (overriding declared proof), then fresh `probe_passed`/`observed`
 /// evidence admits toward the critical join, then conflicting fresh evidence
 /// requires authority, then fresh `degraded` caps at observe-only, then stale
@@ -253,11 +254,13 @@ fn is_fresh_at(record: &CapabilityEvidenceRecord, request: &ProductionAdmissionR
 
 /// Evaluates the evidence scope short of the critical join.
 ///
-/// `broken`/`unsupported` on the exact fingerprint blocks first (overriding
-/// declared proof); fresh `probe_passed`/`observed` evidence admits toward the
-/// critical join; conflicting fresh evidence requires authority; fresh
-/// `degraded` caps at observe-only; otherwise stale runtime evidence defers
-/// and declared/unknown intent alone requires authority.
+/// Fresh `broken`/`unsupported` on the exact fingerprint blocks first
+/// (overriding declared proof); stale broken/unsupported records are
+/// superseded fall-through for requalification, never a permanent veto.
+/// Fresh `probe_passed`/`observed` evidence admits toward the critical join;
+/// conflicting fresh evidence requires authority; fresh `degraded` caps at
+/// observe-only; otherwise stale runtime evidence defers and declared/unknown
+/// intent alone requires authority.
 fn check_scope(
     request: &ProductionAdmissionRequest,
     scope: &[&CapabilityEvidenceRecord],
@@ -266,7 +269,7 @@ fn check_scope(
         matches!(
             record.status,
             CapabilityEvidenceStatus::Broken | CapabilityEvidenceStatus::Unsupported
-        )
+        ) && is_fresh_at(record, request)
     }) {
         return AdmissionOutcome::new(
             AdmissionDisposition::Block,
@@ -597,6 +600,42 @@ mod tests {
         ];
         let outcome = evaluate_production_admission(&request, &records, None, None);
         assert_eq!(outcome.disposition, AdmissionDisposition::Block);
+        assert!(!outcome.admitted());
+        Ok(())
+    }
+
+    #[test]
+    fn stale_broken_evidence_does_not_veto_fresh_observation() -> TestResult {
+        let route = test_route()?;
+        let request = test_request(&route, false);
+        // Broken record from a previous generation: superseded once matching
+        // fresh evidence is recorded at the requested generation.
+        let mut superseded = test_record(&route, CapabilityEvidenceStatus::Broken);
+        superseded.generation = TEST_GENERATION - 1;
+        let records = [
+            test_record(&route, CapabilityEvidenceStatus::Observed),
+            superseded,
+        ];
+        let outcome = evaluate_production_admission(&request, &records, None, None);
+        assert_eq!(outcome.disposition, AdmissionDisposition::Admit);
+        assert!(outcome.admitted());
+        // Same for an expired broken record at the requested generation.
+        let mut expired = test_record(&route, CapabilityEvidenceStatus::Broken);
+        expired.expires_at_unix_ms = TEST_NOW;
+        let records = [
+            test_record(&route, CapabilityEvidenceStatus::Observed),
+            expired,
+        ];
+        let outcome = evaluate_production_admission(&request, &records, None, None);
+        assert_eq!(outcome.disposition, AdmissionDisposition::Admit);
+        assert!(outcome.admitted());
+        // A stale broken record alone needs requalification; it does not
+        // block outright.
+        let mut lone = test_record(&route, CapabilityEvidenceStatus::Broken);
+        lone.generation = TEST_GENERATION - 1;
+        let outcome =
+            evaluate_production_admission(&request, std::slice::from_ref(&lone), None, None);
+        assert_eq!(outcome.disposition, AdmissionDisposition::RequireAuthority);
         assert!(!outcome.admitted());
         Ok(())
     }
