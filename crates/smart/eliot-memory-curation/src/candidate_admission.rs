@@ -175,15 +175,35 @@ pub fn admit_forward_revision(
     verify_admission_chain(&chain)
 }
 
-/// Exact Store-persist projection of one admission.
+/// Binds Store-emitted audit event ids back onto an admission chain.
 ///
-/// The Store owner persists this through its existing mutation path with
-/// no new shapes: `operation` names the canonical `NamedMutationOperation`
-/// wire value (`PascalCase`, matching the closed catalogue) and `fields`
-/// carry the receipt identity the Store binds into its
-/// `NamedMutationRequest` parameters and `AppendAuditEvent` linkage. The
-/// Store mints `operation_id`, envelope, and audit event ids; curation
-/// never does.
+/// The Store consumer persists each admission through its named mutation,
+/// then returns the real emitted audit event per stable receipt id. This
+/// re-links every receipt via `link_audit` (digest recompute) and
+/// re-verifies the full chain, so only a completely audit-linked,
+/// original-preserving chain returns. A receipt with no emitted event
+/// fails with `AuditUnlinked`: curation never invents audit identity.
+pub fn bind_emitted_audit_events(
+    chain: &[CurationAdmission],
+    emitted: &[(ArtifactId, ArtifactId)],
+) -> Result<AdmissionChainView, crate::admission::AdmissionError> {
+    use crate::admission::AdmissionError;
+    let mut linked = Vec::with_capacity(chain.len());
+    for admission in chain {
+        let event = emitted
+            .iter()
+            .find(|(receipt_id, _)| *receipt_id == admission.receipt.receipt_id)
+            .map(|(_, event)| event.clone())
+            .ok_or(AdmissionError::AuditUnlinked)?;
+        linked.push(CurationAdmission {
+            operation: admission.operation,
+            receipt: admission.receipt.link_audit(event)?,
+        });
+    }
+    verify_admission_chain(&linked)
+}
+
+/// Exact Store-persist projection of one admission.
 ///
 /// Only `CaptureObservation` has a curation-fillable declared shape
 /// (`CAPTURE_OBSERVATION_PARAMETERS{subject}`): the persisted subject is
@@ -320,6 +340,9 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     #[test]
     fn raw_observation_to_stable_receipt_with_paraphrase_refusal() {
+        use crate::admission::AdmissionError;
+        use eliot_epistemic::lifecycle::LifecycleError;
+
         let genesis = admit_observation_genesis(ObservationGenesisParams {
             receipt_id: id("receipt:capture"),
             raw_handle: id("obs:raw-1"),
@@ -337,6 +360,35 @@ mod tests {
             LifecycleRole::ObservationCandidate
         );
         let genesis_projected = project_for_store(&genesis);
+
+        // Link-back round-trip: an unlinked genesis constructs but never
+        // verifies; only the Store-emitted event completes the chain, and
+        // a missing event fails instead of inventing audit identity.
+        let bare = admit_observation_genesis(ObservationGenesisParams {
+            receipt_id: id("receipt:bare"),
+            raw_handle: id("obs:raw-1"),
+            source_anchor: anchor(),
+            actor: actor(ActorKind::DeterministicTransformer),
+            scope: "scope".to_owned(),
+            clock: clock(),
+            state_fence: fence(),
+            proof_digest: sha256_hex(b"bare-proof"),
+            audit_event_id: None,
+        })
+        .expect("unlinked genesis constructs");
+        assert!(matches!(
+            verify_admission_chain(std::slice::from_ref(&bare)),
+            Err(AdmissionError::Lifecycle(LifecycleError::AuditUnlinked))
+        ));
+        assert!(matches!(
+            bind_emitted_audit_events(std::slice::from_ref(&bare), &[]),
+            Err(AdmissionError::AuditUnlinked)
+        ));
+        let bound = bind_emitted_audit_events(&[bare], &[(id("receipt:bare"), id("audit:bare"))])
+            .expect("emitted link-back verifies");
+        assert_eq!(bound.original_input, id("obs:raw-1"));
+        assert_eq!(bound.current_output, id("obs:raw-1"));
+        assert!(bound.ordered.iter().all(CurationAdmission::is_audit_linked));
         assert!(
             matches!(
                 &genesis_projected,
