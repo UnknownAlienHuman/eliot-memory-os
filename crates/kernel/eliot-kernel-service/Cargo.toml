@@ -22,6 +22,7 @@ eliot-doctor-core.workspace = true
 eliot-ipc.workspace = true
 eliot-kernel-core.workspace = true
 eliot-mcp.workspace = true
+eliot-memory-curation = { path = "../../smart/eliot-memory-curation", version = "0.1.0" }
 eliot-ors.workspace = true
 eliot-platform.workspace = true
 eliot-process.workspace = true
@@ -49,6 +50,16 @@ eliot-platform-windows.workspace = true
 # edges never enter the production dependency graph or the runtime boundary.
 eliot-store-surreal-adapter.workspace = true
 eliot-read = { path = "../../governor/eliot-read" }
+# Issue #1905: lifecycle persist tests admit real curation chains, so the
+# epistemic/evidence contract types behind the fixtures are test-only deps.
+# They never enter the production dependency graph or the runtime boundary.
+eliot-epistemic = { path = "../../smart/eliot-epistemic", version = "0.1.0" }
+eliot-evidence.workspace = true
+# Issue #1905 mutation legs: tests play the legitimate Governor caller via
+# the owned revision encoder, and build payloads from the exact contract
+# types. Test-only; production accepts caller-supplied typed payloads.
+eliot-canonical.workspace = true
+eliot-epistemic-contracts = { path = "../../smart/eliot-epistemic-contracts", version = "0.1.0" }
 secrecy.workspace = true
 
 [lints]

@@ -12,6 +12,8 @@
 //!   compatibility envelope and rollback admission;
 //! - [`process_health`] — the I1.10 seven-dimension process-health projection,
 //!   kept separate from the module-generation and cutover machines.
+//! - [`runtime_health`] — the authenticated compatibility and health carrier
+//!   consumed by Host and native-worker.
 
 pub mod compatibility_handshake;
 pub mod control_reserve_front_door;
@@ -20,3 +22,4 @@ pub mod generation_routing;
 pub mod notification_state;
 pub mod process_health;
 pub mod recovery_state_view;
+pub mod runtime_health;
