@@ -10,8 +10,10 @@
 //! Forbidden authority: must not fabricate execution success, must not accept peer-owned shutdown authority, must not bypass `ServerHandshakePolicy`, generation poison, or state-fence compatibility.
 //! Ordinary module: I2.23 Capability-family topology and crate extraction decisions — ordinary single-file extraction (<10k LOC) owning only `KernelComposition::dispatch_frame` plus inseparable dispatch-only helpers with zero external users.
 
+use super::daemon_request_dispatch::DAEMON_STARTUP_EVIDENCE_OPERATION;
 use super::dreamer_job_dispatch::is_dreamer_operation;
 use super::front_door_session::{DOCTOR_MODULE_ID, TESTD_MODULE_ID};
+use super::generation_control::ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION;
 use super::native_worker_lifecycle_route::is_native_worker_operation;
 use super::{
     ACTIVE_DAEMON_CALLER, DOCTOR_REPAIR_WIRE_ID, DoctorRepairAttemptRequest, Frame, FrameKind,
@@ -170,25 +172,7 @@ impl KernelComposition {
                 .and_then(serde_json::Value::as_str)
                 .ok_or(TransportError::SessionFenced)?;
             if session.module_generation.module_id.as_str() == ACTIVE_DAEMON_CALLER
-                && matches!(
-                    operation,
-                    "snapshot"
-                        | "daemon_ready"
-                        | "health"
-                        | "daemon_degraded"
-                        | "daemon_fatal"
-                        | "agent_activation_claim"
-                        | "agent_activation_submit"
-                        | "agent_activation_reconcile"
-                        | "store_recovery"
-                        | "store_initialize_genesis"
-                        | "apply_prepared"
-                        | "receipt"
-                        | "store_named"
-                        | "local_read"
-                        | "local_read_claim"
-                        | "local_read_result"
-                )
+                && is_daemon_operation(operation)
             {
                 if !probe_ready_state_admitted(
                     self.service_state()
@@ -524,6 +508,48 @@ impl KernelComposition {
                 "kernel semantic gateway is closed for this session",
             )?,
         ))
+    }
+}
+
+fn is_daemon_operation(operation: &str) -> bool {
+    matches!(
+        operation,
+        "snapshot"
+            | "daemon_ready"
+            | ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION
+            | DAEMON_STARTUP_EVIDENCE_OPERATION
+            | "health"
+            | "daemon_degraded"
+            | "daemon_fatal"
+            | "agent_activation_claim"
+            | "agent_activation_submit"
+            | "agent_activation_reconcile"
+            | "store_recovery"
+            | "store_initialize_genesis"
+            | "apply_prepared"
+            | "receipt"
+            | "store_named"
+            | "local_read"
+            | "local_read_claim"
+            | "local_read_result"
+    )
+}
+
+#[cfg(test)]
+mod daemon_operation_tests {
+    use super::{DAEMON_STARTUP_EVIDENCE_OPERATION, is_daemon_operation};
+    use crate::generation_control::ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION;
+
+    #[test]
+    fn generation_and_startup_routes_are_in_the_authenticated_daemon_matrix() {
+        assert!(is_daemon_operation(
+            ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION
+        ));
+        assert!(is_daemon_operation(DAEMON_STARTUP_EVIDENCE_OPERATION));
+        assert!(!is_daemon_operation(
+            "daemon_generation_registry_active_query"
+        ));
+        assert!(!is_daemon_operation("unowned-operation"));
     }
 }
 

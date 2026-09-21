@@ -698,6 +698,7 @@ pub(crate) fn check_request_envelope(
 fn check_operation_shape(operation: &str, keys: &[String]) -> Result<(), DecodeReject> {
     let expected: &[&str] = match operation {
         "attach" | "invoke" | "cancel" => &["op", "request"],
+        "dry_run_invoke" | "dry_run_cancel" => &["op", "request"],
         "forward_hook" | "forward_event" => &["op", "event"],
         "reconcile_external" | "status" | "stop" => &["op"],
         "bootstrap" => &["op", "context", "tasks", "requested_assessment"],

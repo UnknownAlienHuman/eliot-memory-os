@@ -17,17 +17,18 @@
 use super::{
     AgentActivationPendingState, ArtifactId, AuthorityDescriptorContour, AuthorityEpoch,
     AuthorityHandoffBegin, AuthorityHandoffRecord, AuthorityHandoffState,
-    AuthorityPreparationError, AuthoritySnapshotBinding, ContractId, DaemonRuntimeState,
-    DaemonRuntimeStatus, DispatchAuthorityId, DispatchSnapshotCodec, GenerationRoute,
-    GenerationRouter, HealthVector, IpcImplementation, KernelBuildError, KernelComposition,
-    KernelConfig, KernelDispatchKey, KernelError, KernelPathAdmission, KernelService,
-    KernelStoreRebindProductionBoundary, KernelSupervisionLeaseAuthority, ModuleGeneration,
-    ModuleGenerationState, OperationalRecoveryStore, OrsError, OrsGenerationCoordinator,
-    PROTOCOL_VERSION, PreparedAuthorityMaterial, ProcessAuthorityHandoffDescriptor,
-    ProcessDispatchAuthorityController, ProcessExecutionAuthorityConfig, ProcessExecutionGateway,
-    RedbRecoveryStore, RouteScope, Runtime, RuntimeConfig, SERVICE_NAME, ServerHandshakePolicy,
-    StateFence, UserOwnedPathLease, UserOwnedRootLease, WindowsDispatchSnapshotCodec,
-    WindowsPlatform, is_lower_sha256, sha256_hex, sha256_json, unix_ms,
+    AuthorityPreparationError, AuthoritySnapshotBinding, BlobStoreController, ContractId,
+    DaemonRuntimeState, DaemonRuntimeStatus, DispatchAuthorityId, DispatchSnapshotCodec,
+    GenerationRoute, GenerationRouter, HealthVector, IpcImplementation, KernelBuildError,
+    KernelComposition, KernelConfig, KernelDispatchKey, KernelError, KernelPathAdmission,
+    KernelService, KernelStoreRebindProductionBoundary, KernelSupervisionLeaseAuthority,
+    ModuleGeneration, ModuleGenerationState, OperationalRecoveryStore, OrsError,
+    OrsGenerationCoordinator, PROTOCOL_VERSION, PreparedAuthorityMaterial,
+    ProcessAuthorityHandoffDescriptor, ProcessDispatchAuthorityController,
+    ProcessExecutionAuthorityConfig, ProcessExecutionGateway, RedbRecoveryStore, RouteScope,
+    Runtime, RuntimeConfig, SERVICE_NAME, ServerHandshakePolicy, StartupCoordinator, StateFence,
+    UserOwnedPathLease, UserOwnedRootLease, WindowsDispatchSnapshotCodec, WindowsPlatform,
+    is_lower_sha256, sha256_hex, sha256_json, unix_ms,
 };
 #[cfg(test)]
 use super::{CanonicalEvidenceProvider, DispatchValidationPort};
@@ -973,6 +974,7 @@ impl KernelComposition {
         )
         .map_err(KernelBuildError::Runtime)?;
         let generation_gateway = OrsGenerationCoordinator::new(ors.clone());
+        let mut startup_coordinator = StartupCoordinator::new();
         let mut service = service;
         service
             .synchronize_authority_epoch(canonical_epoch)
@@ -987,6 +989,18 @@ impl KernelComposition {
                 );
                 KernelBuildError::Ors(error)
             })?;
+        generation_gateway
+            .recover_cutover_ownership()
+            .map_err(|error| {
+                observe_entrypoint_with_detail(
+                    EntrypointStage::Composition,
+                    "kernel.composition.cutover_ownership_recovery_rejected",
+                );
+                KernelBuildError::Ors(error)
+            })?;
+        startup_coordinator
+            .record_live_evidence(3)
+            .map_err(KernelBuildError::Service)?;
         observe_entrypoint_with_detail(
             EntrypointStage::Composition,
             "kernel.composition.generation_recovered",
@@ -1023,6 +1037,50 @@ impl KernelComposition {
         let store_handoff_init = None;
         #[cfg(windows)]
         let agent_activation_results = Self::rehydrate_agent_activation_results(&ors)?;
+        // Implements #1967: start the ordered I1.11 coordinator at step zero.
+        // Composition construction alone does not prove Host-owned startup,
+        // Blob manifest, Store readiness, reconciliation, handshake, mirror,
+        // capability, front-door, or supervision evidence. Each later step is
+        // advanced only by its owning live probe/publication boundary.
+        observe_entrypoint_with_detail(
+            EntrypointStage::Composition,
+            "kernel.composition.startup_sequence_initiated:step=0",
+        );
+        let startup_coordinator = Mutex::new(startup_coordinator);
+        // I1.11 step 4 (#1969): validate the approved Blob Store manifest at
+        // startup without starting the blob generation. First demand
+        // starts/probes it.
+        let blob_store = match config.blob_manifest.clone() {
+            None => {
+                observe_entrypoint_with_detail(
+                    EntrypointStage::StoreBootstrap,
+                    "kernel.blob.manifest_absent:large_payload_degraded",
+                );
+                None
+            }
+            Some(manifest) => match BlobStoreController::new(manifest) {
+                Ok(controller) => Some(controller),
+                Err(error) => {
+                    observe_entrypoint_with_detail(
+                        EntrypointStage::StoreBootstrap,
+                        "kernel.blob.manifest_rejected",
+                    );
+                    return Err(KernelBuildError::Service(error));
+                }
+            },
+        };
+        // I1.11 step 4 (#1969): an absent approved manifest degrades only
+        // large-payload capture. Record it in the startup coordinator so the
+        // step-9 status reports it; inline and unrelated canonical work are
+        // unaffected. A rejected manifest fails construction above instead.
+        if blob_store.is_none() {
+            startup_coordinator
+                .lock()
+                .map_err(|_| {
+                    KernelBuildError::Service("startup coordinator lock poisoned".to_owned())
+                })?
+                .note_blob_degraded();
+        }
         // F-LOG-KERNEL-2 (#899): constructed composition is not ready. The
         // service starts Cold, the daemon is NotLaunched, and no Store
         // gateway is claimed; readiness requires separate Host handoffs.
@@ -1069,6 +1127,7 @@ impl KernelComposition {
             store_rebind_gate: tokio::sync::Mutex::new(()),
             approved_config_hash,
             canonical_store_claimed: AtomicBool::new(false),
+            blob_store: Mutex::new(blob_store),
             #[cfg(windows)]
             canonical_store_gateway: Mutex::new(None),
             #[cfg(windows)]
@@ -1107,6 +1166,7 @@ impl KernelComposition {
                 // Zero is reserved as "no boot nonce"; remap without biasing.
                 if nonce == 0 { 1 } else { nonce }
             },
+            startup_coordinator,
         })
     }
 }
