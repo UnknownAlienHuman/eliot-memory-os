@@ -838,4 +838,16 @@ impl SessionDeliverySnapshot {
         }
         Ok(())
     }
+
+    /// Seal an owner-assembled snapshot for production issue.
+    ///
+    /// Computes the immutable snapshot digest from the retained delivery
+    /// history (overwriting any caller-supplied digest text, which is never
+    /// authority) and validates the sealed value. A digest mutated after
+    /// sealing fails `validate` with `DigestMismatch`.
+    pub fn seal(mut value: Self) -> Result<Self, ReactiveInputError> {
+        value.snapshot_digest = value.canonical_digest()?;
+        value.validate()?;
+        Ok(value)
+    }
 }

@@ -505,4 +505,16 @@ impl IntegrationCoverageProfile {
         }
         Ok(())
     }
+
+    /// Seal an owner-assembled profile for production issue.
+    ///
+    /// Computes the immutable profile digest from the retained events and
+    /// gaps (overwriting any caller-supplied digest text, which is never
+    /// authority) and validates the sealed value. A digest mutated after
+    /// sealing fails `validate` with `DigestMismatch`.
+    pub fn seal(mut value: Self) -> Result<Self, ReactiveInputError> {
+        value.profile_digest = value.canonical_digest()?;
+        value.validate()?;
+        Ok(value)
+    }
 }
