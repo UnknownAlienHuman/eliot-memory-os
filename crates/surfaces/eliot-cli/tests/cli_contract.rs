@@ -1,6 +1,6 @@
 use eliot_cli::{
     CommandArguments, CommandCatalogue, CommandId, CommandRequest, CommandResult,
-    UnavailableReason, validate_catalogue,
+    UnavailableReason, user_automation_route_payload, validate_catalogue,
 };
 use eliot_receipts::{EffectClass, ProofCeiling};
 use serde_json::{Value, json};
@@ -203,6 +203,24 @@ fn user_automation_operation_is_typed_and_remains_plan_gap_until_kernel_route() 
             reason: UnavailableReason::PlanGap { .. }
         }
     ));
+}
+
+#[test]
+fn user_automation_provider_payload_contains_only_operation_and_idempotency_key() {
+    let request = request("user-automation");
+    let payload = must(user_automation_route_payload(&request));
+    let object = payload.as_object().expect("route payload object");
+    assert_eq!(object.len(), 2);
+    assert_eq!(object.get("idempotency_key"), Some(&json!("idempotency-1")));
+    assert_eq!(
+        object
+            .get("operation")
+            .and_then(|operation| operation.get("kind"))
+            .and_then(Value::as_str),
+        Some("list")
+    );
+    assert!(object.get("state_fence").is_none());
+    assert!(object.get("principal_ref").is_none());
 }
 
 #[test]

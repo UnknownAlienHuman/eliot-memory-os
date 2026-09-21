@@ -24,6 +24,8 @@ pub const CATALOGUE_REVISION: &str = "a11-plan-v2";
 pub const SCHEMA_VERSION: &str = "eliot-cli-schema-v1";
 /// MCP surface revision consumed by the CLI catalogue edge.
 pub const MCP_SURFACE_CONTRACT_REVISION: &str = eliot_mcp::CONTRACT_REVISION;
+/// Authenticated Kernel selector for the UserAutomation operator route.
+pub const USER_AUTOMATION_ROUTE: &str = eliot_mcp::USER_AUTOMATION_ROUTE;
 /// Stable A-08 `PLAN_GAP` marker for this catalogue edge while its admitted
 /// providers remain uninjected by composition.
 ///
@@ -355,6 +357,23 @@ impl CommandRequest {
         }
         Ok(())
     }
+}
+
+/// Builds the narrow authenticated UserAutomation route payload.
+///
+/// The Kernel front door supplies principal, session, RequestMetadata,
+/// StateFence and OperationIdentity. The CLI sends only the existing closed
+/// operation plus the request's retry-stable idempotency key.
+pub fn user_automation_route_payload(request: &CommandRequest) -> Result<Value, CliError> {
+    request.validate()?;
+    let CommandArguments::UserAutomation { operation } = &request.arguments else {
+        return Err(CliError::ArgumentCommandMismatch);
+    };
+    Ok(json!({
+        "operation": serde_json::to_value(operation)
+            .map_err(|error| CliError::UserAutomation(error.to_string()))?,
+        "idempotency_key": request.request.idempotency_key.clone(),
+    }))
 }
 
 /// Correlated response returned by a pure client operation.
@@ -1478,7 +1497,7 @@ static COMMANDS: &[CommandSpec] = &[
         proof_ceiling: ProofCeiling::CandidateArtifact,
         availability: CommandAvailability::PlanGap {
             missing_work_id: "1779",
-            dependency: "no authenticated Kernel UserAutomation operator provider is injected",
+            dependency: "authenticated Kernel selector eliot_user_automation is not registered",
         },
     },
 ];
@@ -1761,6 +1780,12 @@ fn validate_result_for(
                     },
             },
         ) if actual == missing_work_id && actual_dependency == dependency => {}
+        // The catalogue remains an honest PlanGap until the Kernel selector
+        // is registered, but an authenticated provider may already expose the
+        // exact typed route. Accept that provider projection only for the
+        // UserAutomation command; local `execute` still returns PlanGap.
+        (CommandAvailability::PlanGap { .. }, CommandResult::Forwarded { .. })
+            if command == CommandId::UserAutomation => {}
         (
             CommandAvailability::Unsupported { dependency, detail },
             CommandResult::Unavailable {
