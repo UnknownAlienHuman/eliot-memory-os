@@ -1,4 +1,4 @@
-//! Canonical notification-state execution for the SurrealDB bridge
+//! Canonical notification-state execution for the `SurrealDB` bridge
 //! (issue #1780).
 //!
 //! Mirrors the reference contour's closed legs through the shared
@@ -22,8 +22,9 @@ use eliot_store_api::{
 };
 use serde_json::{Map, Value, json};
 
+use crate::SurrealAdapterConfig;
 use crate::client::{self, RpcTransport};
-use crate::error::AdapterError;use crate::SurrealAdapterConfig;
+use crate::error::AdapterError;
 use crate::schema;
 
 /// One computed notification row write for the canonical transaction.
@@ -72,14 +73,8 @@ async fn ensure_notification_table(
         "DEFINE TABLE IF NOT EXISTS {} SCHEMALESS;",
         crate::schema::table::NOTIFICATION_RECORD
     );
-    let mut response = client::query(
-        db,
-        config,
-        "notification.ensure_table",
-        &sql,
-        Map::new(),
-    )
-    .await?;
+    let mut response =
+        client::query(db, config, "notification.ensure_table", &sql, Map::new()).await?;
     if !response.take_errors().is_empty() {
         return Err(AdapterError::PartialOutcome);
     }
@@ -115,10 +110,14 @@ pub(crate) async fn prepare_notification_writes(
     // of reading empty. Ensuring it here (idempotent) keeps first use on a
     // fresh database exact without a schema-migration bump.
     ensure_notification_table(db, config).await?;
-    let mut writes = Vec::with_capacity(commands.len());    for command in commands {
-        let decoded = decode_notification_mutation(&command.parameters)
-            .map_err(AdapterError::Store)?;
-        writes.push(apply_notification_command(db, config, transition, &command.parameters, decoded).await?);
+    let mut writes = Vec::with_capacity(commands.len());
+    for command in commands {
+        let decoded =
+            decode_notification_mutation(&command.parameters).map_err(AdapterError::Store)?;
+        writes.push(
+            apply_notification_command(db, config, transition, &command.parameters, decoded)
+                .await?,
+        );
     }
     Ok(writes)
 }
@@ -130,30 +129,38 @@ async fn apply_notification_command(
     parameters: &std::collections::BTreeMap<String, Value>,
     decoded: DecodedNotificationMutation,
 ) -> Result<SurrealNotificationWrite, AdapterError> {
-    let history_entry = Value::Object(parameters.iter().map(|(k, v)| (k.clone(), v.clone())).collect());
+    let history_entry = Value::Object(
+        parameters
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+    );
     match decoded {
         DecodedNotificationMutation::Upsert {
             dedup_key,
             record_json,
             source_receipt_json,
         } => {
-            let draft: NotificationDraft = serde_json::from_value(record_json)
-                .map_err(|error| {
+            let draft: NotificationDraft =
+                serde_json::from_value(record_json).map_err(|error| {
                     AdapterError::Store(StoreError::Serialization(error.to_string()))
                 })?;
             if draft.state_fence != transition.state_fence {
                 return Err(AdapterError::Store(StoreError::FenceMismatch));
             }
-            let source_receipt: ReceiptEnvelope =
-                serde_json::from_value(source_receipt_json).map_err(|error| {
+            let source_receipt: ReceiptEnvelope = serde_json::from_value(source_receipt_json)
+                .map_err(|error| {
                     AdapterError::Store(StoreError::Serialization(error.to_string()))
                 })?;
             source_receipt
                 .validate()
                 .map_err(|_| AdapterError::Store(StoreError::InvalidReceipt))?;
             let current = read_notification_row(db, config, &dedup_key).await?;
-            let mut store = rehydrate(&current)?;
-            let record = store.upsert(draft).map_err(model_error)?.clone();
+            let mut store = rehydrate(current.as_ref())?;
+            let record = store
+                .upsert(draft)
+                .map_err(|error| model_error(&error))?
+                .clone();
             let mut history = current
                 .as_ref()
                 .map_or(Vec::new(), |row| row.history.clone());
@@ -171,29 +178,24 @@ async fn apply_notification_command(
             channel,
             delivery_json,
         } => {
-            let channel_typed: DeliveryChannel =
-                serde_json::from_value(Value::String(channel)).map_err(|error| {
+            let channel_typed: DeliveryChannel = serde_json::from_value(Value::String(channel))
+                .map_err(|error| {
                     AdapterError::Store(StoreError::Serialization(error.to_string()))
                 })?;
-            let delivery: DeliveryState = serde_json::from_value(delivery_json).map_err(|error| {
-                AdapterError::Store(StoreError::Serialization(error.to_string()))
-            })?;
-            let current = read_row_by_notification_id(db, config, &notification_id)
-                .await?
-                .ok_or(AdapterError::Store(StoreError::InvalidField {
-                    field: "notification.notification_id",
-                    reason: "unknown notification",
-                }))?;
-            let mut store = rehydrate(&Some(current.clone()))?;
-            let existing = store.get(&current.dedup_key).ok_or(AdapterError::Store(
-                StoreError::InvalidField {
-                    field: "notification.notification_id",
-                    reason: "unknown notification",
-                },
-            ))?;
-            if existing.state_fence != transition.state_fence {
-                return Err(AdapterError::Store(StoreError::FenceMismatch));
-            }
+            let delivery: DeliveryState =
+                serde_json::from_value(delivery_json).map_err(|error| {
+                    AdapterError::Store(StoreError::Serialization(error.to_string()))
+                })?;
+            let (dedup_key, mut store, current) =
+                resolve_current_for_leg(db, config, &transition.state_fence, &notification_id)
+                    .await?;
+            let existing =
+                store
+                    .get(&dedup_key)
+                    .ok_or(AdapterError::Store(StoreError::InvalidField {
+                        field: "notification.notification_id",
+                        reason: "unknown notification",
+                    }))?;
             if !existing.delivery_channels.contains(&channel_typed) {
                 return Err(AdapterError::Store(StoreError::InvalidField {
                     field: "notification.channel",
@@ -201,13 +203,13 @@ async fn apply_notification_command(
                 }));
             }
             let record = store
-                .record_delivery(&current.dedup_key, delivery)
-                .map_err(model_error)?
+                .record_delivery(&dedup_key, delivery)
+                .map_err(|error| model_error(&error))?
                 .clone();
             let mut history = current.history.clone();
             history.push(history_entry);
             Ok(write_for(
-                &current.dedup_key,
+                &dedup_key,
                 &record,
                 history,
                 &transition.state_fence,
@@ -218,30 +220,17 @@ async fn apply_notification_command(
             notification_id,
             principal,
         } => {
-            let current = read_row_by_notification_id(db, config, &notification_id)
-                .await?
-                .ok_or(AdapterError::Store(StoreError::InvalidField {
-                    field: "notification.notification_id",
-                    reason: "unknown notification",
-                }))?;
-            let mut store = rehydrate(&Some(current.clone()))?;
-            let existing = store.get(&current.dedup_key).ok_or(AdapterError::Store(
-                StoreError::InvalidField {
-                    field: "notification.notification_id",
-                    reason: "unknown notification",
-                },
-            ))?;
-            if existing.state_fence != transition.state_fence {
-                return Err(AdapterError::Store(StoreError::FenceMismatch));
-            }
+            let (dedup_key, mut store, current) =
+                resolve_current_for_leg(db, config, &transition.state_fence, &notification_id)
+                    .await?;
             let record = store
-                .acknowledge(&current.dedup_key, &principal)
-                .map_err(model_error)?
+                .acknowledge(&dedup_key, &principal)
+                .map_err(|error| model_error(&error))?
                 .clone();
             let mut history = current.history.clone();
             history.push(history_entry);
             Ok(write_for(
-                &current.dedup_key,
+                &dedup_key,
                 &record,
                 history,
                 &transition.state_fence,
@@ -253,34 +242,21 @@ async fn apply_notification_command(
             disposition,
             authorization_json,
         } => {
-            let current = read_row_by_notification_id(db, config, &notification_id)
-                .await?
-                .ok_or(AdapterError::Store(StoreError::InvalidField {
-                    field: "notification.notification_id",
-                    reason: "unknown notification",
-                }))?;
-            let mut store = rehydrate(&Some(current.clone()))?;
-            let existing = store.get(&current.dedup_key).ok_or(AdapterError::Store(
-                StoreError::InvalidField {
-                    field: "notification.notification_id",
-                    reason: "unknown notification",
-                },
-            ))?;
-            if existing.state_fence != transition.state_fence {
-                return Err(AdapterError::Store(StoreError::FenceMismatch));
-            }
-            let authorization: ResolutionAuthorization =
-                serde_json::from_value(authorization_json).map_err(|error| {
+            let (dedup_key, mut store, current) =
+                resolve_current_for_leg(db, config, &transition.state_fence, &notification_id)
+                    .await?;
+            let authorization: ResolutionAuthorization = serde_json::from_value(authorization_json)
+                .map_err(|error| {
                     AdapterError::Store(StoreError::Serialization(error.to_string()))
                 })?;
             let record = store
-                .resolve(&current.dedup_key, &disposition, &authorization)
-                .map_err(model_error)?
+                .resolve(&dedup_key, &disposition, &authorization)
+                .map_err(|error| model_error(&error))?
                 .clone();
             let mut history = current.history.clone();
             history.push(history_entry);
             Ok(write_for(
-                &current.dedup_key,
+                &dedup_key,
                 &record,
                 history,
                 &transition.state_fence,
@@ -288,6 +264,35 @@ async fn apply_notification_command(
             ))
         }
     }
+}
+
+/// Resolves the stored row for a lifecycle leg: identity lookup, model
+/// rehydration, and admission-fence agreement. Unknown identities and
+/// fenced-out rows fail closed here, never inside the model.
+async fn resolve_current_for_leg(
+    db: &RpcTransport,
+    config: &SurrealAdapterConfig,
+    fence: &StateFence,
+    notification_id: &str,
+) -> Result<(String, NotificationStore, StoredNotificationRow), AdapterError> {
+    let current = read_row_by_notification_id(db, config, notification_id)
+        .await?
+        .ok_or(AdapterError::Store(StoreError::InvalidField {
+            field: "notification.notification_id",
+            reason: "unknown notification",
+        }))?;
+    let store = rehydrate(Some(&current))?;
+    let existing =
+        store
+            .get(&current.dedup_key)
+            .ok_or(AdapterError::Store(StoreError::InvalidField {
+                field: "notification.notification_id",
+                reason: "unknown notification",
+            }))?;
+    if existing.state_fence != *fence {
+        return Err(AdapterError::Store(StoreError::FenceMismatch));
+    }
+    Ok((current.dedup_key.clone(), store, current))
 }
 
 /// Rehydrates the shared model by replaying the stored leg history.
@@ -298,7 +303,7 @@ async fn apply_notification_command(
 /// the reference contour and this bridge. Admission-time checks (fences,
 /// channels, receipt validity) are enforced by the admitting path and are
 /// not re-decided here; replay fails closed on any undecodable leg.
-fn rehydrate(current: &Option<StoredNotificationRow>) -> Result<NotificationStore, AdapterError> {
+fn rehydrate(current: Option<&StoredNotificationRow>) -> Result<NotificationStore, AdapterError> {
     use eliot_store_api::DecodedNotificationMutation as Leg;
 
     let mut store = NotificationStore::new();
@@ -322,18 +327,18 @@ fn rehydrate(current: &Option<StoredNotificationRow>) -> Result<NotificationStor
                 source_receipt_json,
                 ..
             } => {
-                let draft: NotificationDraft = serde_json::from_value(record_json)
+                let draft: NotificationDraft =
+                    serde_json::from_value(record_json).map_err(|error| {
+                        AdapterError::Store(StoreError::Serialization(error.to_string()))
+                    })?;
+                let source_receipt: ReceiptEnvelope = serde_json::from_value(source_receipt_json)
                     .map_err(|error| {
-                        AdapterError::Store(StoreError::Serialization(error.to_string()))
-                    })?;
-                let source_receipt: ReceiptEnvelope =
-                    serde_json::from_value(source_receipt_json).map_err(|error| {
-                        AdapterError::Store(StoreError::Serialization(error.to_string()))
-                    })?;
+                    AdapterError::Store(StoreError::Serialization(error.to_string()))
+                })?;
                 source_receipt
                     .validate()
                     .map_err(|_| AdapterError::Store(StoreError::InvalidReceipt))?;
-                store.upsert(draft).map_err(model_error)?;
+                store.upsert(draft).map_err(|error| model_error(&error))?;
             }
             Leg::Delivery {
                 notification_id,
@@ -347,7 +352,7 @@ fn rehydrate(current: &Option<StoredNotificationRow>) -> Result<NotificationStor
                     })?;
                 store
                     .record_delivery(&key, delivery)
-                    .map_err(model_error)?;
+                    .map_err(|error| model_error(&error))?;
             }
             Leg::Acknowledge {
                 notification_id,
@@ -356,7 +361,7 @@ fn rehydrate(current: &Option<StoredNotificationRow>) -> Result<NotificationStor
                 let key = notification_key_for(&store, &notification_id)?;
                 store
                     .acknowledge(&key, &principal)
-                    .map_err(model_error)?;
+                    .map_err(|error| model_error(&error))?;
             }
             Leg::Resolve {
                 notification_id,
@@ -370,7 +375,7 @@ fn rehydrate(current: &Option<StoredNotificationRow>) -> Result<NotificationStor
                     })?;
                 store
                     .resolve(&key, &disposition, &authorization)
-                    .map_err(model_error)?;
+                    .map_err(|error| model_error(&error))?;
             }
         }
     }
@@ -409,7 +414,7 @@ fn write_for(
     }
 }
 
-fn model_error(error: NotificationError) -> AdapterError {
+fn model_error(error: &NotificationError) -> AdapterError {
     use eliot_kernel_core::NotificationError;
     match error {
         NotificationError::InvalidField(field) => AdapterError::Store(StoreError::InvalidField {
@@ -444,7 +449,9 @@ fn model_error(error: NotificationError) -> AdapterError {
                 reason: "resolution evidence is not bound by the authority receipt",
             })
         }
-        NotificationError::ResolutionFenceMismatch => AdapterError::Store(StoreError::FenceMismatch),
+        NotificationError::ResolutionFenceMismatch => {
+            AdapterError::Store(StoreError::FenceMismatch)
+        }
     }
 }
 
@@ -460,7 +467,8 @@ async fn read_notification_row(
     );
     bindings.insert("notify_key".to_owned(), json!(dedup_key));
     let statement = "SELECT * FROM ONLY type::record($notify_table, $notify_key);";
-    let mut response = client::query(db, config, "notification.read_row", statement, bindings).await?;
+    let mut response =
+        client::query(db, config, "notification.read_row", statement, bindings).await?;
     let errors = response.take_errors();
     if missing_notification_table(&errors) {
         return Ok(None);
@@ -469,7 +477,7 @@ async fn read_notification_row(
         return Err(AdapterError::PartialOutcome);
     }
     let row: Option<Value> = response.take(0)?;
-    row.map(decode_notification_row).transpose()
+    row.as_ref().map(decode_notification_row).transpose()
 }
 
 /// Reports whether provider errors prove only that the notification table
@@ -478,9 +486,9 @@ async fn read_notification_row(
 /// other error stays a partial outcome.
 pub(crate) fn missing_notification_table(errors: &[String]) -> bool {
     !errors.is_empty()
-        && errors.iter().all(|error| {
-            error.contains("notification_record") && error.contains("does not exist")
-        })
+        && errors
+            .iter()
+            .all(|error| error.contains("notification_record") && error.contains("does not exist"))
 }
 
 async fn read_row_by_notification_id(
@@ -494,7 +502,8 @@ async fn read_row_by_notification_id(
         json!(crate::schema::table::NOTIFICATION_RECORD),
     );
     bindings.insert("notify_identity".to_owned(), json!(notification_id));
-    let statement = "SELECT * FROM notification_record WHERE record.notification_id = $notify_identity;";
+    let statement =
+        "SELECT * FROM notification_record WHERE record.notification_id = $notify_identity;";
     let mut response = client::query(
         db,
         config,
@@ -511,7 +520,7 @@ async fn read_row_by_notification_id(
         return Err(AdapterError::PartialOutcome);
     }
     let rows: Vec<Value> = response.take(0)?;
-    let mut rows = rows.into_iter();
+    let mut rows = rows.iter();
     let first = rows.next().map(decode_notification_row).transpose()?;
     if rows.next().is_some() {
         return Err(AdapterError::Store(StoreError::IdentityConflict));
@@ -519,11 +528,13 @@ async fn read_row_by_notification_id(
     Ok(first)
 }
 
-fn decode_notification_row(value: Value) -> Result<StoredNotificationRow, AdapterError> {
-    let object = value.as_object().ok_or(AdapterError::Store(StoreError::InvalidField {
-        field: "notification.row",
-        reason: "notification row must be an object",
-    }))?;
+fn decode_notification_row(value: &Value) -> Result<StoredNotificationRow, AdapterError> {
+    let object = value
+        .as_object()
+        .ok_or(AdapterError::Store(StoreError::InvalidField {
+            field: "notification.row",
+            reason: "notification row must be an object",
+        }))?;
     let text_field = |name: &str| -> Result<String, AdapterError> {
         object
             .get(name)
@@ -541,14 +552,10 @@ fn decode_notification_row(value: Value) -> Result<StoredNotificationRow, Adapte
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let revision = object
-        .get("revision")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let state_fence: StateFence = serde_json::from_value(
-        object.get("state_fence").cloned().unwrap_or(Value::Null),
-    )
-    .map_err(|error| AdapterError::Store(StoreError::Serialization(error.to_string())))?;
+    let revision = object.get("revision").and_then(Value::as_u64).unwrap_or(0);
+    let state_fence: StateFence =
+        serde_json::from_value(object.get("state_fence").cloned().unwrap_or(Value::Null))
+            .map_err(|error| AdapterError::Store(StoreError::Serialization(error.to_string())))?;
     Ok(StoredNotificationRow {
         dedup_key,
         record,
@@ -583,7 +590,10 @@ pub(crate) fn notification_write_statements(
                     .as_str(),
             );
         }
-        bindings.insert(format!("notify_table_{suffix}"), json!(schema::table::NOTIFICATION_RECORD));
+        bindings.insert(
+            format!("notify_table_{suffix}"),
+            json!(schema::table::NOTIFICATION_RECORD),
+        );
         bindings.insert(format!("notify_key_{suffix}"), json!(&write.dedup_key));
         bindings.insert(
             format!("notify_expected_{suffix}"),
@@ -633,10 +643,8 @@ mod template_tests {
 
     #[test]
     fn create_and_update_fragments_carry_cas_guards() {
-        let (sql, bindings) = notification_write_statements(&[
-            write("new-key", None),
-            write("old-key", Some(3)),
-        ]);
+        let (sql, bindings) =
+            notification_write_statements(&[write("new-key", None), write("old-key", Some(3))]);
         assert!(
             sql.contains("THROW 'notification_revision_conflict'"),
             "both legs guard revision drift"
