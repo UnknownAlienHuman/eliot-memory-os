@@ -27,6 +27,7 @@ mod cli_contract;
 mod contour;
 mod grant_client;
 mod guest_exec;
+mod installed_binary;
 mod shadow;
 mod typed_bindings;
 mod typed_execution;
@@ -53,6 +54,9 @@ pub use guest_exec::{
     ChildMetering, EXIT_COMPLETED, EXIT_DENIED, EXIT_ENGINE_FAILED, EXIT_NOT_COMPLETED,
     GuestExecRejection, GuestExecRequest, metering_line, parse_metering_line, run_guest_exec,
     validate_request,
+};
+pub use installed_binary::{
+    InstalledBinary, InstalledBinaryError, WasmHostBinaryBinding, resolve_installed_binary,
 };
 pub use shadow::{ShadowError, enforce_shadow_no_effect, shadow_port_error};
 pub use typed_bindings::{

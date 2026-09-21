@@ -722,9 +722,27 @@ fn admitted_execution_succeeds_through_real_wasmtime() {
             .map_err(|error| format!("guest input file unwritable: {error}")),
     );
     let host_binary = host_binary_path();
-    let host_binary_str = match host_binary.to_str() {
+    // Installed-binary verification through B2's owned resolver: the
+    // binding carries the derived path plus the observed digest, and
+    // resolution re-reads the file (fail-closed codes, never a pass on
+    // missing/mismatched bytes). The binding fields will come from the
+    // grant once Beauvoir's route lands; the resolution call itself is
+    // already the production API.
+    let host_digest = match std::fs::read(&host_binary) {
+        Ok(bytes) => Sha256Digest::of_bytes(&bytes),
+        Err(error) => panic!("joined proof host binary unreadable: {error}"),
+    };
+    let host_binding = must(
+        eliot_wasm_host::WasmHostBinaryBinding::new(host_binary, host_digest)
+            .map_err(|error| format!("host binary binding failed: {error}")),
+    );
+    let installed = must(
+        eliot_wasm_host::resolve_installed_binary(&host_binding)
+            .map_err(|error| format!("installed binary resolution failed: {}", error.code())),
+    );
+    let host_binary_str = match installed.path().to_str() {
         Some(path) => path.to_owned(),
-        None => panic!("joined proof host binary path is not valid unicode"),
+        None => panic!("installed binary path is not valid unicode"),
     };
     let mut authority = test_authority();
     let request_fence = must(FencingToken::new(
