@@ -138,4 +138,46 @@ impl KernelComposition {
         observe_health("kernel.health.service_state_observed", "success");
         Ok(state)
     }
+
+    /// Projects blob demand-controller state into the I1.10 health vocabulary
+    /// (#1969). View-only: fixed manifest/process/large-payload labels only;
+    /// carries no digests, generations, paths, or payloads. Consumed by the
+    /// health dispatch route; the dispatch wiring itself is owned there.
+    #[must_use]
+    pub fn blob_capability_projection(&self) -> serde_json::Value {
+        match self.blob_probe_status() {
+            None => {
+                observe_health("kernel.health.blob_projected", "absent");
+                serde_json::json!({
+                    "manifest": "absent",
+                    "process": "not_started",
+                    "large_payload": "degraded",
+                })
+            }
+            Some(BlobProbeStatus::ManifestValidated) => {
+                observe_health("kernel.health.blob_projected", "standby");
+                serde_json::json!({
+                    "manifest": "validated",
+                    "process": "not_started",
+                    "large_payload": "standby",
+                })
+            }
+            Some(BlobProbeStatus::Ready { .. }) => {
+                observe_health("kernel.health.blob_projected", "ready");
+                serde_json::json!({
+                    "manifest": "validated",
+                    "process": "started",
+                    "large_payload": "ready",
+                })
+            }
+            Some(BlobProbeStatus::Degraded { .. }) => {
+                observe_health("kernel.health.blob_projected", "degraded");
+                serde_json::json!({
+                    "manifest": "validated",
+                    "process": "started",
+                    "large_payload": "degraded",
+                })
+            }
+        }
+    }
 }

@@ -39,6 +39,7 @@
 
 #[cfg(windows)]
 mod agent_bridge;
+mod blob_store_controller;
 mod canonical_store_runtime;
 mod composition_bootstrap;
 mod control_plane;
@@ -52,6 +53,11 @@ mod process_execution;
 mod process_execution_client;
 mod supervision_lease_authority;
 
+pub use blob_store_controller::{
+    BLOB_INLINE_THRESHOLD_DEFAULT_BYTES, BLOB_INLINE_THRESHOLD_MAX_BYTES,
+    BLOB_MANIFEST_FORMAT_VERSION, BlobCaptureOutcome, BlobDemand, BlobProbeStatus,
+    BlobProbeSuccess, BlobReadyReceipt, BlobRef, BlobStoreController, BlobStoreManifest,
+};
 pub(crate) use kernel_build_contract::PreparedAuthorityMaterial;
 #[cfg(windows)]
 pub use kernel_build_contract::SupervisionLeaseAuthorityConfig;
@@ -461,6 +467,10 @@ pub struct KernelComposition {
     store_rebind_gate: tokio::sync::Mutex<()>,
     approved_config_hash: Option<String>,
     canonical_store_claimed: AtomicBool,
+    /// Kernel-owned Blob Store demand controller (I1.11 step 4). `None`
+    /// while no approved blob manifest was injected; `Some` validates the
+    /// manifest at startup without starting the generation.
+    blob_store: Mutex<Option<BlobStoreController>>,
     #[cfg(windows)]
     canonical_store_gateway: Mutex<Option<Arc<KernelStoreGateway>>>,
     #[cfg(windows)]
