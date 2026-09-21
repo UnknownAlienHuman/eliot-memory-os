@@ -21,7 +21,7 @@ implementation = [
   "docs/architecture/I05-21-transactional-outbox-and-notifications.md#i521-transactional-outbox-and-notifications",
   "docs/architecture/I05-27-canonical-operation-identity-and-effect-identity.md#i527-canonical-operation-identity-and-effect-identity",
   "docs/architecture/I07-02-frame.md#i72-frame",
-  "docs/architecture/I07-16-notifications.md#i716-notifications",
+  "docs/architecture/I07-16-host-integration-coverage-and-governance-profile.md#i716-host-integration-coverage-and-governance-profile",
   "docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
   "docs/architecture/I14-20-canonical-runtime-lifecycle-vocabulary.md#i1420-canonical-runtime-lifecycle-vocabulary",
 ]
