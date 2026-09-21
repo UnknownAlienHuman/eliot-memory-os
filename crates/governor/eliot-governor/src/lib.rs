@@ -59,6 +59,7 @@ mod swarm_plan_attachment_composition;
 mod swarm_plan_attachment_ownership;
 mod swarm_plan_attachment_service;
 mod task_lifecycle;
+mod wasm_resolution;
 
 pub use activation_outcome::*;
 pub use canonical_projections::{
@@ -102,6 +103,10 @@ pub use swarm_plan_attachment_service::{
     CanonicalSwarmPlanAttachmentStore, SwarmPlanAttachmentService,
 };
 pub use task_lifecycle::{GovernorTaskLifecycle, TaskLifecycleError};
+pub use wasm_resolution::{
+    CONFORMANCE_COMPONENT, CONFORMANCE_INPUT, CONFORMANCE_SEED, ContourAdmission,
+    GovernorWasmAdmission, PromotionExpectations,
+};
 
 use std::collections::BTreeMap;
 

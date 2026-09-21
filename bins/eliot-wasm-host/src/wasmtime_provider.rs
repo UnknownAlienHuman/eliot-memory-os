@@ -547,6 +547,18 @@ fn configuration_digest() -> Sha256Digest {
     Sha256Digest::of_bytes(canonical_configuration_descriptor())
 }
 
+/// Returns the canonical digest of the exact provider engine settings
+/// enforced by [`WasmtimeComponentEngine::new`].
+///
+/// Joined-proof callers thread this provider-read value into the admitted
+/// manifest's engine binding instead of pasting a hex constant; the digest
+/// names a fixed descriptor, mints nothing, and changes if and only if the
+/// provider settings change.
+#[must_use]
+pub fn provider_configuration_digest() -> Sha256Digest {
+    configuration_digest()
+}
+
 fn canonical_configuration_descriptor() -> &'static [u8] {
     b"wasmtime=47.0.4;component_model=true;typed_abi=guest.run;max_wasm_stack=8192;max_epoch_deadline_ticks=1024;epoch_only.consume_fuel=false;epoch_only.epoch_interruption=true;epoch_and_fuel.consume_fuel=true;epoch_and_fuel.epoch_interruption=true"
 }
