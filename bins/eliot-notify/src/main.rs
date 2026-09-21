@@ -163,7 +163,7 @@ fn main() {
     };
     let response = match serde_json::from_str::<Request>(&line) {
         Ok(Request::Deliver { envelope, request }) => {
-            match NotificationComposition::from_kernel(root) {
+            match NotificationComposition::from_kernel_with_quiet_hours(root, &request) {
                 Ok(mut composition) => dispatch_deliver(&mut composition, &envelope, &request),
                 Err(error) => composition_error(error.to_string()),
             }

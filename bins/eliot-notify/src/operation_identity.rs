@@ -57,9 +57,17 @@ const MAX_CLOCK_SKEW_MS: u64 = 5_000;
 /// Maximum parent clock age, in milliseconds.
 const MAX_CLOCK_AGE_MS: u64 = 60_000;
 
+/// Authenticated Kernel selector for the canonical notification quiet-hours
+/// projection. The configuration owner supplies the projection; notify only
+/// consumes the typed result.
+pub const QUIET_HOURS_PROJECTION_SELECTOR: &str = "eliot.config.quiet_hours.v1";
+/// Exact operation marker multiplexed by the quiet-hours selector.
+pub const QUIET_HOURS_PROJECTION_OPERATION: &str = "GetNotificationQuietHoursProjection";
+
 /// Closed notify operation vocabulary for child identity issuance.
 ///
-/// Selectors match the provider bundle in `super::KERNEL_VERIFICATION_OPERATIONS`.
+/// Selectors match the provider bundle in `super::KERNEL_VERIFICATION_OPERATIONS`
+/// plus the authenticated configuration projection read.
 /// Each step owns a fixed effect ceiling: verification steps observe (`READ`);
 /// admission, delivery verification and ledger steps decide durable or
 /// externally visible outcomes; canonical notification state is a reversible
@@ -82,6 +90,9 @@ pub enum NotifyOperation {
     NotificationState,
     /// `eliot.notify.state.v1` / `GetNotificationState` — canonical read.
     NotificationStateRead,
+    /// `eliot.config.quiet_hours.v1` /
+    /// `GetNotificationQuietHoursProjection` — canonical configuration read.
+    QuietHoursProjectionRead,
 }
 
 impl NotifyOperation {
@@ -97,6 +108,7 @@ impl NotifyOperation {
             Self::LedgerCommit => "eliot.notify.ledger.commit",
             Self::NotificationState => eliot_notify_core::NOTIFICATION_STATE_SELECTOR,
             Self::NotificationStateRead => eliot_notify_core::NOTIFICATION_STATE_SELECTOR,
+            Self::QuietHoursProjectionRead => QUIET_HOURS_PROJECTION_SELECTOR,
         }
     }
 
@@ -112,6 +124,7 @@ impl NotifyOperation {
             Self::LedgerCommit => "ledger-commit",
             Self::NotificationState => "notification-state",
             Self::NotificationStateRead => "notification-state-read",
+            Self::QuietHoursProjectionRead => "quiet-hours-projection-read",
         }
     }
 
@@ -124,13 +137,13 @@ impl NotifyOperation {
                 "EXTERNAL_EFFECT"
             }
             Self::NotificationState => "REVERSIBLE_MUTATION",
-            Self::NotificationStateRead => "READ",
+            Self::NotificationStateRead | Self::QuietHoursProjectionRead => "READ",
         }
     }
 
-    /// All eight closed steps in pipeline order.
+    /// All nine closed steps in pipeline order.
     #[must_use]
-    pub const fn all() -> [Self; 8] {
+    pub const fn all() -> [Self; 9] {
         [
             Self::G08Verify,
             Self::A08Admit,
@@ -140,6 +153,7 @@ impl NotifyOperation {
             Self::LedgerCommit,
             Self::NotificationState,
             Self::NotificationStateRead,
+            Self::QuietHoursProjectionRead,
         ]
     }
 }
@@ -411,6 +425,24 @@ impl NotifyIdentityIssuer {
         self.issue(
             parent,
             NotifyOperation::NotificationStateRead,
+            payload,
+            None,
+            now_unix_ms,
+        )
+    }
+
+    /// Issues (or exactly retries) the authenticated quiet-hours projection
+    /// read. The configuration selector has its own `READ` child identity so
+    /// it cannot be confused with notification-state reads or mutations.
+    pub fn issue_quiet_hours_projection_read(
+        &mut self,
+        parent: &NotificationRequest,
+        payload: &Value,
+        now_unix_ms: u64,
+    ) -> Result<IssuedIdentity, OperationIdentityError> {
+        self.issue(
+            parent,
+            NotifyOperation::QuietHoursProjectionRead,
             payload,
             None,
             now_unix_ms,
