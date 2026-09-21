@@ -4,6 +4,8 @@
 //! set-permutation stability, duplicate collapse, vector preservation,
 //! explicit gaps with no fallback, and fail-closed bounds/digest validation.
 
+mod support;
+
 use std::num::NonZeroU64;
 
 use eliot_dreamer_contracts::{
@@ -12,11 +14,11 @@ use eliot_dreamer_contracts::{
     EffectDimension, FeasibilityDimension, GapUpdateMeaning, HumanAttentionDimension,
     InformationDimension, InquiryAffordanceDescriptor, InquiryAffordanceDescriptorParams,
     InquiryAffordanceSet, InquiryAffordanceSetParams, LatencyDimension, MaterialClaimRef,
-    PossibleResultSchema, PossibleResultValue, PrivacyDimension, ProbeObjectiveRef, ProbeOwnerRef,
-    ResourceDimension, ResultBranch, ResultTarget, ResultUpdate, ReversibilityDimension,
-    RivalCoverageStatus, RivalCoverageSummary, RivalDeclarationSetRef, RivalModelRef,
-    RivalModelSet, RivalModelSetParams, RivalPredictionRef, RivalUpdateMeaning,
-    ValidatedDreamDraft, ValidationReceipt,
+    PossibleResultSchema, PossibleResultValue, PrivacyDimension, ProbeObjectiveRef,
+    ProbeOrderingPolicy, ProbeOwnerRef, ResourceDimension, ResultBranch, ResultTarget,
+    ResultUpdate, ReversibilityDimension, RivalCoverageStatus, RivalCoverageSummary,
+    RivalDeclarationSetRef, RivalModelRef, RivalModelSet, RivalModelSetParams, RivalPredictionRef,
+    RivalUpdateMeaning, ValidatedDreamDraft, ValidationReceipt,
     grounding::canonical::{
         ArtifactId, EpochId, EpochLineageId, Precision, PropositionId, ResourceGeneration,
         StateFence, TaskId, ValidityBounds, sha256_hex,
@@ -258,7 +260,7 @@ fn result_schema_for_target(id: &str, target: &AffordanceTarget) -> PossibleResu
             )
         }
     };
-    must(PossibleResultSchema::new(artifact(id), targets, branches))
+    support::schema_with_acceptance(id, targets, branches)
 }
 
 fn prediction(id: &str) -> RivalPredictionRef {
@@ -357,9 +359,22 @@ fn descriptor_params(id: &str, target: AffordanceTarget) -> InquiryAffordanceDes
 }
 
 fn descriptor(id: &str, target: AffordanceTarget) -> InquiryAffordanceDescriptor {
-    must(InquiryAffordanceDescriptor::new(descriptor_params(
-        id, target,
-    )))
+    descriptor_from_params(descriptor_params(id, target))
+}
+
+fn descriptor_from_params(
+    params: InquiryAffordanceDescriptorParams,
+) -> InquiryAffordanceDescriptor {
+    let target = params.target.clone();
+    let descriptor = must(InquiryAffordanceDescriptor::new(params));
+    let ready_target = matches!(
+        &target,
+        AffordanceTarget::RivalPredictions { .. } | AffordanceTarget::Objective { .. }
+    );
+    if ready_target && let Some(semantics) = support::ready_semantics(&target) {
+        return must(descriptor.with_planning_semantics(semantics));
+    }
+    descriptor
 }
 
 fn affordance_set(descriptors: Vec<InquiryAffordanceDescriptor>) -> InquiryAffordanceSet {
@@ -395,12 +410,17 @@ fn limits(candidates: Option<u64>) -> BudgetLimits {
     }
 }
 
+fn ordering_policy() -> ProbeOrderingPolicy {
+    must(ProbeOrderingPolicy::v1())
+}
+
 fn plan_for(descriptors: Vec<InquiryAffordanceDescriptor>, candidates: Option<u64>) -> ProbePlan {
     let bundle = bundle();
     let draft = draft();
     let rivals = rivals();
     let affordances = affordance_set(descriptors);
     let limits = limits(candidates);
+    let policy = ordering_policy();
     must(ProbePlan::new(ProbePlanParams {
         plan_id: artifact("plan-1"),
         bundle: &bundle,
@@ -408,6 +428,7 @@ fn plan_for(descriptors: Vec<InquiryAffordanceDescriptor>, candidates: Option<u6
         rivals: &rivals,
         affordances: &affordances,
         limits: &limits,
+        policy: &policy,
     }))
 }
 
@@ -486,12 +507,12 @@ fn ordering_is_deterministic_and_permutation_stable() {
     pricey_params.cost = CostDimension::High {
         detail: "wide retained scan".to_owned(),
     };
-    let pricey = must(InquiryAffordanceDescriptor::new(pricey_params));
+    let pricey = descriptor_from_params(pricey_params);
     let mut unknown_params = descriptor_params("aff-unknown", gap_target("claim-unknown"));
     unknown_params.information = InformationDimension::Unknown {
         reason: "gain not yet characterized".to_owned(),
     };
-    let unknown = must(InquiryAffordanceDescriptor::new(unknown_params));
+    let unknown = descriptor_from_params(unknown_params);
 
     let forward = plan_for(
         vec![cheap.clone(), pricey.clone(), unknown.clone()],
@@ -531,7 +552,7 @@ fn distinct_semantic_variants_stay_separate() {
     params.cost = CostDimension::Moderate {
         detail: "same channel, costlier read".to_owned(),
     };
-    let second = must(InquiryAffordanceDescriptor::new(params));
+    let second = descriptor_from_params(params);
 
     let plan = plan_for(vec![second, first], Some(16));
     must(plan.validate());
@@ -738,6 +759,7 @@ fn binding_mismatches_fail_the_planner_closed() {
         rivals: &rivals,
         affordances: &wrong_scope,
         limits: &limits,
+        policy: &ordering_policy(),
     });
     assert!(scoped.is_err());
 
@@ -751,6 +773,7 @@ fn binding_mismatches_fail_the_planner_closed() {
         rivals: &rivals,
         affordances: &affordances,
         limits: &limits,
+        policy: &ordering_policy(),
     });
     assert!(fenced.is_err());
 
@@ -763,6 +786,7 @@ fn binding_mismatches_fail_the_planner_closed() {
         rivals: &rivals,
         affordances: &affordances,
         limits: &limits,
+        policy: &ordering_policy(),
     });
     assert!(wrong_job.is_err());
 
@@ -775,6 +799,7 @@ fn binding_mismatches_fail_the_planner_closed() {
         rivals: &rivals,
         affordances: &affordances,
         limits: &limits,
+        policy: &ordering_policy(),
     });
     assert!(wrong_manifest.is_err());
 
@@ -787,6 +812,7 @@ fn binding_mismatches_fail_the_planner_closed() {
         rivals: &rivals,
         affordances: &affordances,
         limits: &over,
+        policy: &ordering_policy(),
     });
     assert!(budgeted.is_err());
 }

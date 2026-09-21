@@ -16,6 +16,11 @@ eliot-dreamer-contracts = { path = "../eliot-dreamer-contracts", version = "0.1.
 serde.workspace = true
 schemars = { version = "1.2.1", features = ["derive"] }
 
+[dev-dependencies]
+eliot-contracts = { path = "../../foundation/eliot-contracts", version = "0.1.0" }
+eliot-evaluation-contracts = { path = "../../foundation/eliot-evaluation-contracts", version = "0.1.0" }
+eliot-receipts = { path = "../../foundation/eliot-receipts", version = "0.1.0" }
+
 [package.metadata.eliot]
 prototype = false
 workspace_admission = "admitted via #836 (T8-A4) root workspace membership"
