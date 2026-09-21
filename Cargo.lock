@@ -638,6 +638,8 @@ version = "0.1.0"
 dependencies = [
  "eliot-agent-bridge-core",
  "eliot-contracts",
+ "eliot-governor",
+ "eliot-integration-coverage",
  "eliot-ipc",
  "eliot-mcp",
  "eliot-platform-windows",

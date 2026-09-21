@@ -36,6 +36,8 @@ use std::collections::VecDeque;
 
 use eliot_agent_bridge_core::BridgeError;
 use eliot_contracts::StateFence;
+use eliot_governor::{ReactiveRiskTier, assess_reactive_risk};
+use eliot_integration_coverage::GovernorCoverageDerivation;
 use eliot_reactive_context_plan::{
     BridgeAdmissionBatch, BridgeAdmissionError, BridgeAdmissionInstruction,
     BridgeAdmissionSeverity, PendingContextInjectionPlan, plan_bridge_admissions,
@@ -182,6 +184,34 @@ pub fn render_admission_fence(fence: &StateFence) -> (String, u64) {
         fence.authority_epoch.sequence
     );
     (epoch, fence.resource_generation.value())
+}
+
+/// Post-freeze production assessor: the live Governor profile threaded
+/// through the frozen Governor assessment, one view per item.
+///
+/// Reads nothing except the threaded derivation state: `critical` is the
+/// transport-derived owner-stickiness bit (forwarded unchanged so assessment
+/// and severity share it), and the fence echo comes from the attested
+/// assessment, never raw plan text. Withholds map to reason strings; the
+/// transport never admits them. Tier rendering is an explicit match owned by
+/// the transport (no `From` shim between the Governor and bridge vocabularies).
+pub fn governor_assess(
+    derivation: &GovernorCoverageDerivation,
+    item: &BridgeAdmissionInstruction,
+    critical: bool,
+) -> Result<GovernorAssessmentView, String> {
+    let assessment = assess_reactive_risk(derivation.current(), critical, &item.fence)
+        .map_err(|error| error.to_string())?;
+    Ok(GovernorAssessmentView {
+        risk: match assessment.tier {
+            ReactiveRiskTier::Low => RiskTier::Low,
+            ReactiveRiskTier::Elevated => RiskTier::Elevated,
+            ReactiveRiskTier::High => RiskTier::High,
+            ReactiveRiskTier::Severe => RiskTier::Severe,
+        },
+        fence_epoch: assessment.fence_epoch_text(),
+        fence_generation: assessment.fence_generation_value(),
+    })
 }
 
 /// Whether a bridge rejection is the expected normal-item duplicate
@@ -384,9 +414,12 @@ mod tests {
         SessionId, TaskId, WorkUnitId,
     };
     use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
-    use eliot_reactive_context_plan::{
-        BridgeAdmissionDelivery, MAX_BRIDGE_RELATIONS,
+    use eliot_integration_coverage::{
+        ALL_EVENTS, DispatchOrdering, EventCompleteness, EventCoverage, EventDisposition,
+        GovernorCoverageDerivation, IntegrationCoverageProfile, LogicalEvent, TraceFreshness,
+        WatchdogEvidence,
     };
+    use eliot_reactive_context_plan::{BridgeAdmissionDelivery, MAX_BRIDGE_RELATIONS};
     use eliot_receipts::WorkScopeId;
     use std::num::NonZeroU64;
 
@@ -522,28 +555,55 @@ mod tests {
         }
     }
 
-    /// Stand-in for the post-freeze Governor adapter: tiers by the SAME
-    /// critical bit the transport passes in and echoes the item fence
-    /// through the canonical rendering (mirroring the attested-echo
-    /// contract, where the assessment echoes its input fence). Pins the
-    /// transport contract — echo use, same-bit severity, withhold
-    /// semantics — never Governor tier logic, which the Governor lane owns.
-    fn stub_assess(
-        item: &BridgeAdmissionInstruction,
-        critical: bool,
-        risk: RiskTier,
-    ) -> Result<GovernorAssessmentView, String> {
-        assert_eq!(
-            critical,
-            item.severity == BridgeAdmissionSeverity::Critical,
-            "assessor must see the owner-stickiness bit"
-        );
-        let (fence_epoch, fence_generation) = render_admission_fence(&item.fence);
-        Ok(GovernorAssessmentView {
-            risk,
-            fence_epoch,
-            fence_generation,
-        })
+    /// Live Governor derivation through the REAL derivation owner: verified
+    /// coverage + fresh watchdog/trace, with both pre-action events
+    /// enforced, so critical items assess Severe and complete normal items
+    /// Low. Test scaffolding only around the edges — the tier rule itself
+    /// is Governor logic, exercised here, never reimplemented.
+    fn live_derivation() -> GovernorCoverageDerivation {
+        let events: Vec<EventCoverage> = ALL_EVENTS
+            .iter()
+            .map(|event| EventCoverage {
+                event: *event,
+                disposition: if matches!(
+                    event,
+                    LogicalEvent::PreToolUse | LogicalEvent::PermissionRequest
+                ) {
+                    EventDisposition::Enforced
+                } else {
+                    EventDisposition::Observed
+                },
+                ordering: DispatchOrdering::PreDispatch,
+                completeness: EventCompleteness::Complete,
+                proof_ceiling: "test-ceiling".to_owned(),
+                source: "test-source".to_owned(),
+                gaps: Vec::new(),
+            })
+            .collect();
+        let coverage = IntegrationCoverageProfile::candidate(
+            "fingerprint-1",
+            events,
+            EventCompleteness::Complete,
+            "test-ceiling",
+            "test-source",
+            Vec::new(),
+        )
+        .expect("candidate")
+        .verify("fingerprint-1", true)
+        .expect("verified");
+        let mut derivation = GovernorCoverageDerivation::new();
+        derivation
+            .derive(
+                &coverage,
+                &WatchdogEvidence {
+                    supervisor_id: "watchdog-1".to_owned(),
+                    fresh: true,
+                    summary: "test supervision".to_owned(),
+                },
+                TraceFreshness::Fresh,
+            )
+            .expect("derive");
+        derivation
     }
 
     #[test]
@@ -574,16 +634,12 @@ mod tests {
                 ),
             ],
         );
-        // Governor risk owner assesses per item over the same critical bit:
-        // no plan source, no default.
+        // The REAL Governor assessor over live derivation: no plan source,
+        // no default, no stub.
+        let derivation = live_derivation();
         let report = driver
             .admit_batch(&mut runner, &batch, |item, critical| {
-                let risk = if critical {
-                    RiskTier::Severe
-                } else {
-                    RiskTier::Low
-                };
-                stub_assess(item, critical, risk)
+                governor_assess(&derivation, item, critical)
             })
             .expect("matching session admits");
         assert_eq!(report.session_id, TEST_SESSION);
@@ -650,10 +706,11 @@ mod tests {
             )],
         );
         let calls = Cell::new(0);
+        let derivation = live_derivation();
         let error = driver
             .admit_batch(&mut runner, &batch, |item, critical| {
                 calls.set(calls.get() + 1);
-                stub_assess(item, critical, RiskTier::Low)
+                governor_assess(&derivation, item, critical)
             })
             .expect_err("mismatched session must fail closed");
         assert!(
@@ -681,10 +738,11 @@ mod tests {
             )],
         );
         let calls = Cell::new(0);
+        let derivation = live_derivation();
         let error = driver
             .admit_batch(&mut runner, &batch, |item, critical| {
                 calls.set(calls.get() + 1);
-                stub_assess(item, critical, RiskTier::Low)
+                governor_assess(&derivation, item, critical)
             })
             .expect_err("detached bridge must fail closed");
         assert_eq!(error, PlanAdmissionError::NotAttached);
@@ -705,9 +763,10 @@ mod tests {
                 BridgeAdmissionSeverity::Normal,
             )],
         );
+        let derivation = live_derivation();
         driver
             .admit_batch(&mut runner, &first, |item, critical| {
-                stub_assess(item, critical, RiskTier::Low)
+                governor_assess(&derivation, item, critical)
             })
             .expect("first admission");
         runner
@@ -725,7 +784,7 @@ mod tests {
         );
         let suppressed = driver
             .admit_batch(&mut runner, &replay_same_source, |item, critical| {
-                stub_assess(item, critical, RiskTier::Low)
+                governor_assess(&derivation, item, critical)
             })
             .expect("duplicate suppression is an honest outcome, not a failure");
         assert_eq!(suppressed.admitted.len(), 0);
@@ -744,7 +803,7 @@ mod tests {
         reopened.invalidations.push("tool-surface-9".to_owned());
         let report = driver
             .admit_batch(&mut runner, &reopened, |item, critical| {
-                stub_assess(item, critical, RiskTier::Low)
+                governor_assess(&derivation, item, critical)
             })
             .expect("invalidation must reopen the source");
         assert_eq!(report.invalidations_applied, 1);
@@ -754,6 +813,8 @@ mod tests {
 
     #[test]
     fn same_plan_replay_collapses_before_bridge_calls() {
+        use std::cell::Cell;
+
         let mut runner = attached_runner(TEST_SESSION);
         let mut driver = SettledPlanAdmission::new();
         let batch_value = batch(
@@ -765,20 +826,24 @@ mod tests {
                 BridgeAdmissionSeverity::Normal,
             )],
         );
+        let derivation = live_derivation();
+        let calls = Cell::new(0);
+        let assess = |item: &BridgeAdmissionInstruction, critical: bool| {
+            calls.set(calls.get() + 1);
+            governor_assess(&derivation, item, critical)
+        };
         let first = driver
-            .admit_batch(&mut runner, &batch_value, |item, critical| {
-                stub_assess(item, critical, RiskTier::Low)
-            })
+            .admit_batch(&mut runner, &batch_value, assess)
             .expect("first presentation admits");
         assert_eq!(first.admitted.len(), 1);
         assert_eq!(driver.replay_len(), 1);
+        assert_eq!(calls.get(), 1);
         let second = driver
-            .admit_batch(&mut runner, &batch_value, |item, critical| {
-                stub_assess(item, critical, RiskTier::Elevated)
-            })
+            .admit_batch(&mut runner, &batch_value, assess)
             .expect("replay collapses without calling");
         assert_eq!(second.admitted.len(), 0);
         assert_eq!(second.replay_suppressed, 1);
+        assert_eq!(calls.get(), 1, "replay never reaches assessment");
         // No second ledger item: the replay never reached the bridge.
         assert_eq!(runner.reactive_pending_count(), 1);
     }
@@ -797,63 +862,61 @@ mod tests {
                     BridgeAdmissionSeverity::Normal,
                 ),
                 instruction(
-                    "item-admitted-1",
+                    "item-withheld-2",
                     "tool-surface-2",
                     "rev-1",
                     BridgeAdmissionSeverity::Critical,
                 ),
             ],
         );
-        // Missing Governor evidence withholds the normal item; the critical
-        // item under live evidence still admits in the same batch.
+        // A derivation with nothing derived has no live profile: the REAL
+        // Governor assessment withholds every item, critical or not — never
+        // a guessed tier, never an admission.
+        let bare = GovernorCoverageDerivation::new();
+        assert!(bare.current().is_none());
         let report = driver
             .admit_batch(&mut runner, &batch_value, |item, critical| {
-                if item.cue_id == "item-withheld-1" {
-                    Err("no current GovernanceProfile derived: risk cannot be assessed".to_owned())
-                } else {
-                    stub_assess(item, critical, RiskTier::Severe)
-                }
+                governor_assess(&bare, item, critical)
             })
             .expect("withhold is an honest outcome, not a failure");
-        assert_eq!(report.admitted.len(), 1);
-        assert_eq!(
-            report.admitted[0].dedup_key,
-            "plan-digest-1:item-admitted-1"
-        );
-        assert_eq!(report.withheld.len(), 1);
+        assert!(report.admitted.is_empty());
+        assert_eq!(report.withheld.len(), 2);
         assert_eq!(
             report.withheld[0].dedup_key,
             "plan-digest-1:item-withheld-1"
         );
-        assert!(
-            report.withheld[0].reason.contains("GovernanceProfile"),
-            "withhold reason must name the evidence gap"
-        );
-        assert_eq!(runner.reactive_pending_count(), 1);
-        // A withheld key is NOT marked presented: once evidence arrives the
-        // same item admits instead of collapsing as a replay.
+        for withheld in &report.withheld {
+            assert!(
+                withheld.reason.contains("GovernanceProfile"),
+                "withhold reason must name the evidence gap, got {}",
+                withheld.reason
+            );
+        }
+        assert_eq!(runner.reactive_pending_count(), 0);
+        // Withheld keys are NOT marked presented: once evidence is derived
+        // the same items admit instead of collapsing as replays.
         assert!(!driver.replay_contains("plan-digest-1:item-withheld-1"));
-        let retry = batch(
-            TEST_SESSION,
-            vec![instruction(
-                "item-withheld-1",
-                "tool-surface-1",
-                "rev-1",
-                BridgeAdmissionSeverity::Normal,
-            )],
-        );
+        let live = live_derivation();
         let second = driver
-            .admit_batch(&mut runner, &retry, |item, critical| {
-                stub_assess(item, critical, RiskTier::Low)
+            .admit_batch(&mut runner, &batch_value, |item, critical| {
+                governor_assess(&live, item, critical)
             })
-            .expect("evidence arrival admits the withheld item");
-        assert_eq!(second.admitted.len(), 1);
+            .expect("derived evidence admits the withheld items");
+        assert_eq!(second.admitted.len(), 2);
         assert_eq!(second.replay_suppressed, 0);
         assert!(second.withheld.is_empty());
+        // The live rule shows through: critical Severe, normal Low.
+        let receipts = runner
+            .deliver_reactive_pending_via_response("resp-withhold-1")
+            .expect("pending drains");
+        let risks: Vec<RiskTier> =
+            receipts.iter().map(|receipt| receipt.admission.risk).collect();
+        assert!(risks.contains(&RiskTier::Severe));
+        assert!(risks.contains(&RiskTier::Low));
     }
 
     #[test]
-    fn assessor_echo_fence_is_used_verbatim() {
+    fn attested_echo_fence_is_used_verbatim() {
         let mut runner = attached_runner(TEST_SESSION);
         let mut driver = SettledPlanAdmission::new();
         let batch_value = batch(
@@ -865,30 +928,31 @@ mod tests {
                 BridgeAdmissionSeverity::Normal,
             )],
         );
-        // The echo deliberately differs from the plan-fence rendering: the
-        // receipt must carry the attested echo, never raw plan text.
+        // The REAL assessment echoes the evaluation fence it ran under; the
+        // receipt must carry that attested echo for the item fence.
+        let derivation = live_derivation();
         driver
-            .admit_batch(&mut runner, &batch_value, |_, _| {
-                Ok(GovernorAssessmentView {
-                    risk: RiskTier::Elevated,
-                    fence_epoch: "echo-lineage-9:9".to_owned(),
-                    fence_generation: 9,
-                })
+            .admit_batch(&mut runner, &batch_value, |item, critical| {
+                governor_assess(&derivation, item, critical)
             })
-            .expect("echo assessment admits");
+            .expect("live assessment admits");
         let receipts = runner
             .deliver_reactive_pending_via_response("resp-echo-1")
             .expect("pending drains");
         assert_eq!(receipts.len(), 1);
-        assert_eq!(receipts[0].admission.risk, RiskTier::Elevated);
-        assert_eq!(receipts[0].admission.fence_epoch, "echo-lineage-9:9");
-        assert_eq!(receipts[0].admission.fence_generation, 9);
+        assert_eq!(receipts[0].admission.risk, RiskTier::Low);
+        assert_eq!(
+            receipts[0].admission.fence_epoch,
+            format!("{TEST_LINEAGE}:3")
+        );
+        assert_eq!(receipts[0].admission.fence_generation, 7);
     }
 
     #[test]
     fn replay_window_stays_bounded_across_sessions() {
         let mut first_runner = attached_runner(TEST_SESSION);
         let mut driver = SettledPlanAdmission::new();
+        let derivation = live_derivation();
         for index in 0..300 {
             let item = format!("fill-a-{index}");
             let made = batch(
@@ -902,7 +966,7 @@ mod tests {
             );
             driver
                 .admit_batch(&mut first_runner, &made, |item, critical| {
-                    stub_assess(item, critical, RiskTier::Low)
+                    governor_assess(&derivation, item, critical)
                 })
                 .expect("distinct critical items admit");
             // Drain through the real delivery path so the ledger pending
@@ -933,7 +997,7 @@ mod tests {
             );
             driver
                 .admit_batch(&mut second_runner, &made, |item, critical| {
-                    stub_assess(item, critical, RiskTier::Low)
+                    governor_assess(&derivation, item, critical)
                 })
                 .expect("distinct critical items admit");
             second_runner
@@ -979,9 +1043,10 @@ mod tests {
                 over_bound,
             ],
         );
+        let derivation = live_derivation();
         let error = driver
             .admit_batch(&mut runner, &made, |item, critical| {
-                stub_assess(item, critical, RiskTier::Low)
+                governor_assess(&derivation, item, critical)
             })
             .expect_err("over-bound relations must fail closed");
         match error {
