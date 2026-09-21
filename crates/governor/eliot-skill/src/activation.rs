@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use eliot_contracts::StateFence;
 use serde::{Deserialize, Serialize};
 
-use super::{DependencyVersion, SkillError, SkillStatus, digest, text, unique};
+use super::{DependencyVersion, SkillError, SkillLifecycleView, SkillStatus, digest, text, unique};
 
 /// How retrieval of the Skill for one attempt was observed.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -178,6 +178,12 @@ impl SkillHarnessActivationReceipt {
     }
 
     fn validate_flow(&self) -> Result<(), SkillError> {
+        if self.eligible && self.retrieval == SkillRetrievalStatus::NotEligible {
+            return Err(SkillError::InvalidField {
+                field: "receipt.retrieval",
+                reason: "an eligible Skill cannot carry a not-eligible retrieval",
+            });
+        }
         if !self.eligible
             && !matches!(
                 self.retrieval,
@@ -406,6 +412,22 @@ pub fn record_instruction_conflict(
     Ok(conflict)
 }
 
+/// Indexes dependency versions by name for exact comparison.
+fn index_versions(versions: &[DependencyVersion]) -> BTreeMap<String, (String, String)> {
+    versions
+        .iter()
+        .map(|dependency| {
+            (
+                dependency.name.clone(),
+                (
+                    dependency.version.clone(),
+                    dependency.contract_digest.clone(),
+                ),
+            )
+        })
+        .collect()
+}
+
 /// Compares the dependency and Tool Definition versions pinned by a Skill
 /// against the currently registered versions. Returns a stale reason naming
 /// every added, removed or changed dependency, or `None` when the sets agree.
@@ -417,22 +439,8 @@ pub fn detect_dependency_staleness(
     pinned: &[DependencyVersion],
     current: &[DependencyVersion],
 ) -> Option<String> {
-    let indexed = |versions: &[DependencyVersion]| {
-        versions
-            .iter()
-            .map(|dependency| {
-                (
-                    dependency.name.clone(),
-                    (
-                        dependency.version.clone(),
-                        dependency.contract_digest.clone(),
-                    ),
-                )
-            })
-            .collect::<BTreeMap<_, _>>()
-    };
-    let pinned_map = indexed(pinned);
-    let current_map = indexed(current);
+    let pinned_map = index_versions(pinned);
+    let current_map = index_versions(current);
     let mut changes = Vec::new();
     for (name, pinned_entry) in &pinned_map {
         match current_map.get(name) {
@@ -474,22 +482,8 @@ pub fn changed_dependency_names(
     pinned: &[DependencyVersion],
     current: &[DependencyVersion],
 ) -> BTreeSet<String> {
-    let indexed = |versions: &[DependencyVersion]| {
-        versions
-            .iter()
-            .map(|dependency| {
-                (
-                    dependency.name.clone(),
-                    (
-                        dependency.version.clone(),
-                        dependency.contract_digest.clone(),
-                    ),
-                )
-            })
-            .collect::<BTreeMap<_, _>>()
-    };
-    let pinned_map = indexed(pinned);
-    let current_map = indexed(current);
+    let pinned_map = index_versions(pinned);
+    let current_map = index_versions(current);
     pinned_map
         .iter()
         .filter(|(name, pinned_entry)| current_map.get(*name) != Some(*pinned_entry))
@@ -503,9 +497,43 @@ pub fn changed_dependency_names(
         .collect()
 }
 
+/// Marks a Skill lifecycle view stale when its pinned dependency or Tool
+/// Definition versions disagree with the currently registered versions.
+///
+/// Returns `Ok(None)` when the sets agree, when the view already carries this
+/// exact stale reason, or when the view is quarantined: quarantine is governed
+/// state and its reason must only change through review, while the Material
+/// gate already blocks quarantined Skills. Otherwise returns the next-revision
+/// view with `Stale` status and the detection reason, leaving counters,
+/// evidence, curation advice and fence untouched.
+pub fn apply_dependency_staleness(
+    view: &SkillLifecycleView,
+    current: &[DependencyVersion],
+) -> Result<Option<SkillLifecycleView>, SkillError> {
+    view.validate()?;
+    if view.status == SkillStatus::Quarantined {
+        return Ok(None);
+    }
+    let Some(reason) = detect_dependency_staleness(&view.dependencies, current) else {
+        return Ok(None);
+    };
+    if view.status == SkillStatus::Stale
+        && view.stale_or_quarantine_reason.as_deref() == Some(reason.as_str())
+    {
+        return Ok(None);
+    }
+    let mut marked = view.clone();
+    marked.status = SkillStatus::Stale;
+    marked.stale_or_quarantine_reason = Some(reason);
+    marked.lifecycle_revision = view.lifecycle_revision.saturating_add(1);
+    marked.validate()?;
+    Ok(Some(marked))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{LifecycleAction, LifecycleCounters, SkillInteractionView, SkillRef, SkillScope};
     use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
     use std::num::NonZeroU64;
 
@@ -558,6 +586,38 @@ mod tests {
             version: version.to_owned(),
             contract_digest: std::iter::repeat_n(digest_char, 64).collect(),
         }
+    }
+
+    fn lifecycle_view(
+        fence: &StateFence,
+        dependencies: Vec<DependencyVersion>,
+    ) -> Result<SkillLifecycleView, SkillError> {
+        let skill_ref = SkillRef::new("skill-demo", "rev-1", "Demo Skill", "a".repeat(64))?;
+        let view = SkillLifecycleView {
+            skill_ref,
+            scope: SkillScope {
+                task_scope: "task-demo".to_owned(),
+                host: "host-demo".to_owned(),
+                route: "route-1".to_owned(),
+                governance_scope: "gov-demo".to_owned(),
+            },
+            applies_when: vec!["task scope matches".to_owned()],
+            does_not_apply_when: vec!["escalation requested".to_owned()],
+            dependencies,
+            counters: LifecycleCounters::default(),
+            execution_evidence: Vec::new(),
+            observed_decision_or_verifier_delta: None,
+            false_activation_refs: Vec::new(),
+            interactions: SkillInteractionView::default(),
+            status: SkillStatus::Current,
+            stale_or_quarantine_reason: None,
+            proposed_action: LifecycleAction::Keep,
+            review: None,
+            state_fence: fence.clone(),
+            lifecycle_revision: 1,
+        };
+        view.validate()?;
+        Ok(view)
     }
 
     #[test]
@@ -614,6 +674,78 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn eligible_skill_cannot_carry_not_eligible_retrieval() -> Result<(), SkillError> {
+        let fence = fence()?;
+        let mut receipt = packet_only_receipt(&fence);
+        receipt.retrieval = SkillRetrievalStatus::NotEligible;
+        assert!(
+            receipt.validate().is_err(),
+            "an eligible Skill cannot carry a not-eligible retrieval"
+        );
+        receipt.eligible = false;
+        receipt.validate()?;
+        Ok(())
+    }
+
+    #[test]
+    fn dependency_change_marks_view_stale_and_blocks_material_use() -> Result<(), SkillError> {
+        let fence = fence()?;
+        let pinned = vec![dependency("tool-search", "1.0.0", 'a')];
+        let view = lifecycle_view(&fence, pinned)?;
+        let unchanged = vec![dependency("tool-search", "1.0.0", 'a')];
+        assert!(
+            apply_dependency_staleness(&view, &unchanged)?.is_none(),
+            "identical versions stay fresh"
+        );
+        let current = vec![dependency("tool-search", "1.1.0", 'b')];
+        let Some(marked) = apply_dependency_staleness(&view, &current)? else {
+            return Err(SkillError::InvalidField {
+                field: "test.staleness",
+                reason: "a Tool Definition change must mark the Skill stale",
+            });
+        };
+        assert_eq!(marked.status, SkillStatus::Stale);
+        let Some(reason) = marked.stale_or_quarantine_reason.clone() else {
+            return Err(SkillError::InvalidField {
+                field: "test.staleness",
+                reason: "a stale Skill requires a reason",
+            });
+        };
+        assert!(
+            reason.contains("tool-search"),
+            "stale reason names the changed dependency: {reason}"
+        );
+        assert_eq!(marked.lifecycle_revision, view.lifecycle_revision + 1);
+        assert!(
+            !material_use_allowed(marked.status),
+            "stale Skills are blocked from Material use until reviewed or restored"
+        );
+        assert!(
+            apply_dependency_staleness(&marked, &current)?.is_none(),
+            "re-marking with the same reason is a no-op"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn quarantine_reason_survives_dependency_drift() -> Result<(), SkillError> {
+        let fence = fence()?;
+        let mut view = lifecycle_view(&fence, vec![dependency("tool-search", "1.0.0", 'a')])?;
+        view.status = SkillStatus::Quarantined;
+        view.stale_or_quarantine_reason = Some("governed quarantine: adverse outcome".to_owned());
+        view.validate()?;
+        let current = vec![dependency("tool-search", "1.1.0", 'b')];
+        assert!(
+            apply_dependency_staleness(&view, &current)?.is_none(),
+            "a quarantine reason changes only through governed review"
+        );
+        assert!(
+            !material_use_allowed(view.status),
+            "quarantined Skills stay blocked from Material use"
+        );
+        Ok(())
+    }
     #[test]
     fn conflicting_skills_produce_instruction_conflict() -> Result<(), SkillError> {
         // Packet order lists skill-a first, but the explicit instruction order

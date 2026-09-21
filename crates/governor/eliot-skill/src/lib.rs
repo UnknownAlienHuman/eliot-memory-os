@@ -25,9 +25,9 @@ pub mod activation;
 pub use activation::{
     AdherenceCheckpoints, AttemptLifecycleSummary, InstructionConflict, OrderingBasis,
     SkillActivationStatus, SkillAdherenceStatus, SkillDeliveryStatus,
-    SkillHarnessActivationReceipt, SkillRetrievalStatus, changed_dependency_names,
-    derive_attempt_summary, detect_dependency_staleness, material_use_allowed,
-    record_instruction_conflict,
+    SkillHarnessActivationReceipt, SkillRetrievalStatus, apply_dependency_staleness,
+    changed_dependency_names, derive_attempt_summary, detect_dependency_staleness,
+    material_use_allowed, record_instruction_conflict,
 };
 
 pub(crate) fn text(value: &str, field: &'static str) -> Result<(), SkillError> {
