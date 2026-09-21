@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use eliot_authority::{EffectAuthorizer, GrantGraph};
 use eliot_contracts::{
-    ClockReading, EpochId, EpochLineageId, ResourceGeneration, StateFence, TaskId,
+    ClockReading, EpochId, EpochLineageId, PolicyRevision, ResourceGeneration, StateFence, TaskId,
     canonical_json_bytes, sha256_hex,
 };
 use eliot_coordination::CoordinationOwner;
@@ -20,7 +20,7 @@ use eliot_governor::{
     KernelNamedReadRequest, KernelPortError, KernelPortFuture, KernelRecoveryPort,
     KernelServiceObservationPort, KernelServiceRecovery, KernelTransitionPort,
     NATIVE_WORKER_EXECUTABLE_BINDING_WIRE_ID, NativeWorkerExecutableBinding, OWNER_SNAPSHOT_SCHEMA,
-    ProblemOwnerSnapshot, QueueLimits, ReadOwnerSnapshot, RecoveryOwner,
+    PolicyOwnerSnapshot, ProblemOwnerSnapshot, QueueLimits, ReadOwnerSnapshot, RecoveryOwner,
 };
 use eliot_module_registry::ModuleCatalog;
 use eliot_observation::ObservationJournalEntry;
@@ -306,6 +306,44 @@ fn activation_canonical_snapshot(fence: &StateFence) -> CanonicalAdmissionSnapsh
     }
 }
 
+/// Valid Policy owner envelope the fake serves, mirroring the real
+/// [`PolicyOwner`](eliot_governor::PolicyOwner) recovery contract: a complete
+/// normative [`ConfigPolicySnapshot`](eliot_config::ConfigPolicySnapshot) bound
+/// to the request fence with envelope revision 1, carrying the digest of its
+/// own canonical snapshot bytes (never a relabeled Config digest).
+fn policy_owner_snapshot(fence: &StateFence) -> PolicyOwnerSnapshot {
+    let snapshot = eliot_config::ConfigPolicySnapshot {
+        snapshot_id: "policy-snapshot-1".to_owned(),
+        machine_id: "policy-machine".to_owned(),
+        scope_id: "governor".to_owned(),
+        revision: PolicyRevision::new(1).expect("policy revision"),
+        source_completeness: eliot_config::SourceCompleteness::Complete,
+        settings: vec![eliot_config::Setting {
+            key: "mode".to_owned(),
+            value_ref: "ref:mode".to_owned(),
+            owner_ref: "human-1".to_owned(),
+        }],
+        policy_owner: eliot_config::HumanOwner {
+            owner_ref: "human-1".to_owned(),
+        },
+        policy_fence: eliot_security_contracts::PolicyFence {
+            policy_snapshot_id: "policy-snapshot-1".to_owned(),
+            state_fence: fence.clone(),
+        },
+        state_fence: fence.clone(),
+        parent_snapshot_id: None,
+        rollback_of: None,
+    };
+    let policy_digest =
+        sha256_hex(&canonical_json_bytes(&snapshot).expect("policy snapshot bytes"));
+    PolicyOwnerSnapshot {
+        state_fence: fence.clone(),
+        revision: 1,
+        policy_digest,
+        snapshot,
+    }
+}
+
 fn build_payloads(fence: &StateFence, protected: &str) -> BTreeMap<RecoveryOwner, Vec<u8>> {
     let mut payloads = BTreeMap::new();
     let put = |map: &mut BTreeMap<RecoveryOwner, Vec<u8>>,
@@ -436,6 +474,11 @@ fn build_payloads(fence: &StateFence, protected: &str) -> BTreeMap<RecoveryOwner
             revision: 1,
         })
         .expect("maintenance"),
+    );
+    put(
+        &mut payloads,
+        RecoveryOwner::Policy,
+        serde_json::to_value(policy_owner_snapshot(fence)).expect("policy"),
     );
     payloads
 }
@@ -605,4 +648,33 @@ fn foreign_fence_binding_fails_validate() {
     let recomputed = foreign.compute_digest().expect("recompute foreign fence");
     foreign.binding_digest = recomputed;
     assert!(foreign.validate().is_err());
+}
+
+#[test]
+fn policy_owner_recovers_with_correlated_digest() {
+    let composition = build_composition();
+    let owners = composition.owners();
+    let policy = owners.policy.as_ref().expect("served policy owner");
+    assert_eq!(policy.revision(), 1);
+    assert_eq!(policy.snapshot().snapshot_id, "policy-snapshot-1");
+    let reply = composition
+        .recovery()
+        .policy_read
+        .as_ref()
+        .expect("served policy read");
+    assert_eq!(
+        policy.canonical_digest(),
+        reply.value_digest,
+        "retained canonical digest is the Kernel-observed payload digest"
+    );
+    assert_eq!(
+        policy.rebuilt_digest().expect("rebuilt digest"),
+        policy.snapshot_digest(),
+        "live recomputation reproduces the recovery-bound snapshot digest"
+    );
+    assert_ne!(
+        policy.snapshot_digest(),
+        owners.config.snapshot_digest(),
+        "policy evidence is never a relabeled config digest"
+    );
 }

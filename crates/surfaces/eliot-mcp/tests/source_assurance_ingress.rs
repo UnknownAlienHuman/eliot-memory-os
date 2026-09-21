@@ -27,16 +27,17 @@ fn digest(value: impl AsRef<[u8]>) -> String {
 }
 
 fn request() -> ApplicationRequest {
+    let epoch = json!({"lineage_id":"550e8400-e29b-41d4-a716-446655440000","sequence":1});
     serde_json::from_value(json!({
         "protocol_version": "2026-07-28",
-        "session": {"session_id":"session-1","authority_epoch":1,"state_fence": {
-            "authority_epoch":1,"resource_generation":1,"task_revision":7,"policy_revision":1,"integration_revision":1
+        "session": {"session_id":"session-1","authority_epoch":epoch,"state_fence": {
+            "authority_epoch":epoch,"resource_generation":1,"task_revision":7,"policy_revision":1,"integration_revision":1
         }},
         "identity": {"request": {"metadata": {
             "request_id":"request-1","session_id":"session-1","task_id":"task-1","product_id":"product-1","source_id":"source-1",
-            "state_fence":{"authority_epoch":1,"resource_generation":1,"task_revision":7,"policy_revision":1,"integration_revision":1},
+            "state_fence":{"authority_epoch":epoch,"resource_generation":1,"task_revision":7,"policy_revision":1,"integration_revision":1},
             "clock":{"valid_time_ms":1000,"known_time_ms":1001,"transaction_sequence":1,"monotonic_ns":500}
-        },"state_fence":{"authority_epoch":1,"resource_generation":1,"task_revision":7,"policy_revision":1,"integration_revision":1}},
+        },"state_fence":{"authority_epoch":epoch,"resource_generation":1,"task_revision":7,"policy_revision":1,"integration_revision":1}},
         "idempotency_key":"idempotency-1","deadline_unix_ms":5000,"cancellation_id":"cancel-1"},
         "security":{"privacy_class":"INTERNAL","instruction_taint":"DATA_ONLY","effect_ceiling":"CANDIDATE_ONLY"},
         "client_capabilities":{"tasks":false},

@@ -51,33 +51,11 @@
 //! validation. There are no placeholder, mock, canned, or pseudo paths:
 //! every branch binds an explicit input field.
 //!
-//! Test coverage note: 26 of 51 `WORK_UNIT_CASE 675/*` cases execute here
-//! (675/1 valid two-rival diagnosis with minimal experiment, 675/2 exact
-//! Objective/acceptance/recovery/identity binding, 675/3 wrong job/payload
-//! fails closed, 675/4 fence and receipt mismatch fails closed, 675/5
-//! wrong/stale source context fails closed, 675/6 product failure despite
-//! local green stays complete, 675/7 local/infrastructure failure without
-//! product delta stays insufficient, 675/8 proxy metric cannot prove
-//! Product delta, 675/9 missing instrumentation stays unknown, 675/10 exact
-//! currently failing discriminator grounds diagnosis, 675/11
-//! current-pass discriminator cannot prove failure, 675/12 nonreplayable
-//! discriminator proves nothing, 675/13 post-hoc evidence needs independent
-//! confirmation, 675/14 complete repair-history denominator, 675/15
-//! unchanged equivalent retry requires mechanism review, 675/16 cosmetic
-//! patch with the same mechanism remains equivalent, 675/17 controlled
-//! repetition with new evidence or justification, 675/18 unimplemented
-//! mechanism not falsified by repair failure, 675/19 proxy success does not
-//! confirm Product cause, 675/20 frozen conflict analysis consumed without
-//! algorithm call, 675/21 mandatory conflict analysis missing yields
-//! insufficiency, 675/22 every rival retains its support, counterevidence,
-//! assumptions, and predictions, 675/23 shared common-mode lineage is
-//! preserved verbatim, 675/24 evidence count cannot choose a winner, 675/32
-//! identical rival predictions are nondiscriminative, 675/45 exact replay is
-//! deterministic). The remaining 25 of 51 are deferred per START.md s1; #969
-//! admission is separate. Deferred: 675/25, 675/26, 675/27, 675/28, 675/29,
-//! 675/30, 675/31,
-//! 675/33, 675/34, 675/35, 675/36, 675/37, 675/38, 675/39, 675/40, 675/41,
-//! 675/42, 675/43, 675/44, 675/46, 675/47, 675/48, 675/49, 675/50, 675/51.
+//! Test coverage note: all 51 issue cases execute as substantive package-local
+//! tests. The case matrix is deliberately kept beside the implementation so
+//! discovery, selection, and execution remain inspectable without a report or
+//! an external runner. #969 admission and real Edge/Product Pulse evidence
+//! remain outside this candidate-only proof ceiling.
 
 #![forbid(unsafe_code)]
 
@@ -236,10 +214,16 @@ pub const SLICE6_REMAINDER_CASES: &[u8] = &[
 pub const SLICE7_IMPLEMENTED_CASES: &[u8] = &[22, 23, 24];
 
 /// Cases deliberately left for later slices after slice 7.
-pub const SLICE7_REMAINDER_CASES: &[u8] = &[
+pub const SLICE7_REMAINDER_CASES: &[u8] = &[];
+
+/// Cases covered by the final bounded implementation slice.
+pub const SLICE8_IMPLEMENTED_CASES: &[u8] = &[
     25, 26, 27, 28, 29, 30, 31, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 46, 47, 48, 49, 50,
     51,
 ];
+
+/// No issue cases remain deferred after the final implementation slice.
+pub const SLICE8_REMAINDER_CASES: &[u8] = &[];
 
 /// Canonical A03 evidence supplied to the first A40 package boundary.
 ///
@@ -433,6 +417,46 @@ pub const SCOPE_ESCAPE_MARKERS: &[&str] = &[
     "execute repair as truth",
 ];
 
+/// Substrings that attempt to turn a candidate into authority or an effect.
+pub const EFFECT_ESCALATION_MARKERS: &[&str] = &[
+    "grant authority",
+    "promote to production",
+    "promote product",
+    "status promotion",
+    "verified_complete",
+    "declare finish",
+    "create issue",
+    "create work unit",
+    "create agent",
+    "canonical write",
+    "mutate canonical",
+    "execute repair",
+    "change active configuration",
+    "call provider",
+    "call model",
+    "external effect",
+];
+
+/// Words that identify an explicit observation in a falsifier statement.
+const OBSERVATION_WORDS: &[&str] = &[
+    "observed", "absent", "present", "fails", "passes", "changes", "remains", "under", "when",
+    "within", "exceeds", "below", "equals", "differs",
+];
+
+/// Labels that name a mechanism but do not themselves state a falsifier.
+const UNFALSIFIABLE_LABELS: &[&str] = &[
+    "race",
+    "race condition",
+    "cache",
+    "flaky",
+    "timing",
+    "latency",
+    "root cause",
+    "unknown",
+    "investigate",
+    "more evidence",
+];
+
 /// Returns true when any marker occurs in the lowered haystack.
 fn mentions_any(lowered_haystack: &str, markers: &[&str]) -> bool {
     let mut index = 0usize;
@@ -445,6 +469,83 @@ fn mentions_any(lowered_haystack: &str, markers: &[&str]) -> bool {
         index = index.saturating_add(1);
     }
     false
+}
+
+/// Returns true when a value names an observation rather than a mechanism label.
+fn is_observable_statement(value: &str) -> bool {
+    let lowered_value = lowered(value);
+    if mentions_any(&lowered_value, UNFALSIFIABLE_LABELS) {
+        return false;
+    }
+    mentions_any(&lowered_value, OBSERVATION_WORDS)
+}
+
+/// Returns true when a falsification claim names compatible conditions.
+fn falsification_is_compatible(rival: &RivalMechanism) -> bool {
+    let text = [rival.falsifier.as_str(), " ", rival.status_reason.as_str()].concat();
+    let text = lowered(&text);
+    if mentions_any(
+        &text,
+        &[
+            "confounded",
+            "partial",
+            "unknown",
+            "censored",
+            "correlation",
+            "chronology",
+            "incompatible",
+            "different conditions",
+            "different load",
+        ],
+    ) {
+        return false;
+    }
+    mentions_any(
+        &text,
+        &[
+            "under",
+            "when",
+            "with the same",
+            "compatible",
+            "controlled",
+            "replay",
+            "same load",
+            "same conditions",
+        ],
+    )
+}
+
+/// Returns true when a rival text makes an unsupported causal leap.
+fn has_causal_overclaim(rival: &RivalMechanism) -> bool {
+    let joined = [
+        rival.status_reason.as_str(),
+        " ",
+        rival.prior_repair_relation.as_str(),
+        " ",
+        rival.falsifier.as_str(),
+    ]
+    .concat();
+    let text = lowered(&joined);
+    let causal_claim = mentions_any(
+        &text,
+        &[
+            "proves cause",
+            "caused by",
+            "therefore causes",
+            "is the cause",
+            "causal fact",
+        ],
+    );
+    causal_claim
+        && !mentions_any(
+            &text,
+            &[
+                "intervention",
+                "ablation",
+                "controlled comparison",
+                "counterfactual",
+            ],
+        )
 }
 
 // ---------------------------------------------------------------------------
@@ -901,6 +1002,20 @@ pub struct DevelopmentDiagnosisCandidate {
     pub objective_id: String,
     /// Canonical spelling of the established gap kind.
     pub gap_kind: String,
+    /// Complete immutable Product gap input retained for replay and review.
+    pub product_gap: ProductGap,
+    /// Complete immutable current discriminator input retained for replay.
+    pub current_discriminator: DiscriminatorEvidence,
+    /// Complete immutable repair history, including every event summary.
+    pub repair_history: RepairHistory,
+    /// Frozen conflict projection consumed without recomputation.
+    pub conflict_analysis: FrozenConflictAnalysis,
+    /// Full declared rival mechanism denominator in causal order.
+    pub rival_mechanisms: Vec<RivalMechanism>,
+    /// Full finite experiment denominator in declared order.
+    pub experiment_alternatives: Vec<DiscriminatingExperiment>,
+    /// Governing policy and independent ceilings used for this candidate.
+    pub policy: DiagnosisPolicy,
     /// One assessment per rival in supplied causal order.
     pub rivals: Vec<RivalAssessment>,
     /// Count of live rivals preserved.
@@ -1272,6 +1387,15 @@ fn validate_conflict_shapes(conflict: &FrozenConflictAnalysis) -> Result<(), Dia
     }
     check_bounded_text(&conflict.scope_note, "conflict.scope", MAX_NOTE_BYTES)?;
     check_bounded_text(&conflict.coverage_note, "conflict.coverage", MAX_NOTE_BYTES)?;
+    if conflict.present
+        && (conflict.scope_note.trim().is_empty() || conflict.coverage_note.trim().is_empty())
+    {
+        return Err(DiagnosisError::Shape {
+            field: "conflict.coverage",
+            detail: "present conflict projection requires bounded scope and coverage notes"
+                .to_owned(),
+        });
+    }
     Ok(())
 }
 
@@ -1459,6 +1583,40 @@ fn validate_experiment_shapes(
     Ok(())
 }
 
+/// Applies the caller's independent evidence ceiling to every evidence list.
+/// The policy cannot enlarge the package hard ceilings and no list borrows
+/// unused capacity from another list.
+fn validate_policy_dependent_bounds(
+    product: &ProductGap,
+    rivals: &[RivalMechanism],
+    policy: &DiagnosisPolicy,
+) -> Result<(), DiagnosisError> {
+    let evidence_ceiling = policy.max_evidence_items.min(MAX_EVIDENCE_ITEMS);
+    bound_list_length(
+        "product.evidence.policy",
+        product.evidence_refs.len(),
+        evidence_ceiling,
+    )?;
+    for rival in rivals {
+        bound_list_length(
+            "rival.support.policy",
+            rival.support_refs.len(),
+            evidence_ceiling,
+        )?;
+        bound_list_length(
+            "rival.unknowns.policy",
+            rival.unknown_refs.len(),
+            evidence_ceiling,
+        )?;
+        bound_list_length(
+            "rival.counterevidence.policy",
+            rival.counterevidence_refs.len(),
+            evidence_ceiling,
+        )?;
+    }
+    Ok(())
+}
+
 /// Validates policy intrinsic shapes and ceilings.
 fn validate_policy_shapes(policy: &DiagnosisPolicy) -> Result<(), DiagnosisError> {
     check_handle(&policy.policy_id, "policy.id")?;
@@ -1486,11 +1644,124 @@ fn validate_policy_shapes(policy: &DiagnosisPolicy) -> Result<(), DiagnosisError
     Ok(())
 }
 
+/// Rejects text that tries to turn an inert candidate into an effect,
+/// authority grant, promotion, or external work request.
+fn validate_no_effect_escalation(
+    product: &ProductGap,
+    discriminator: &DiscriminatorEvidence,
+    common_mode: &CommonModeDisclosure,
+    rivals: &[RivalMechanism],
+    experiments: &[DiscriminatingExperiment],
+    policy: &DiagnosisPolicy,
+) -> Result<(), DiagnosisError> {
+    let mut fields: Vec<(&str, &str)> = vec![
+        ("product.gap", product.gap_note.as_str()),
+        (
+            "discriminator.expected",
+            discriminator.expected_note.as_str(),
+        ),
+        (
+            "discriminator.observed",
+            discriminator.observed_note.as_str(),
+        ),
+        (
+            "discriminator.preconditions",
+            discriminator.precondition_note.as_str(),
+        ),
+        (
+            "discriminator.coverage",
+            discriminator.coverage_note.as_str(),
+        ),
+        ("common-mode.model", common_mode.shared_model_note.as_str()),
+        (
+            "common-mode.source",
+            common_mode.shared_source_note.as_str(),
+        ),
+        (
+            "common-mode.evaluator",
+            common_mode.shared_evaluator_note.as_str(),
+        ),
+        (
+            "common-mode.fixture",
+            common_mode.shared_fixture_note.as_str(),
+        ),
+        (
+            "common-mode.uncertainty",
+            common_mode.uncertainty_note.as_str(),
+        ),
+        ("policy.owner", policy.owner_note.as_str()),
+    ];
+    if let Some(mapping) = product.proxy_mapping_note.as_deref() {
+        fields.push(("product.proxy-mapping", mapping));
+    }
+    for rival in rivals {
+        fields.extend([
+            ("rival.owner", rival.owner.as_str()),
+            ("rival.boundary", rival.causal_boundary.as_str()),
+            ("rival.falsifier", rival.falsifier.as_str()),
+            ("rival.prior-repairs", rival.prior_repair_relation.as_str()),
+            ("rival.invariant", rival.affected_invariant.as_str()),
+            ("rival.status", rival.status_reason.as_str()),
+        ]);
+        fields.extend(
+            rival
+                .predicted_observations
+                .iter()
+                .map(|value| ("rival.prediction", value.as_str())),
+        );
+        fields.extend(
+            rival
+                .assumptions
+                .iter()
+                .map(|value| ("rival.assumption", value.as_str())),
+        );
+        fields.extend(
+            rival
+                .confounders
+                .iter()
+                .map(|value| ("rival.confounder", value.as_str())),
+        );
+    }
+    for experiment in experiments {
+        fields.extend([
+            ("experiment.owner", experiment.owner.as_str()),
+            ("experiment.verifier", experiment.verifier.as_str()),
+            ("experiment.cost", experiment.cost_note.as_str()),
+            ("experiment.risk", experiment.risk_note.as_str()),
+            ("experiment.effect", experiment.effect_note.as_str()),
+            ("experiment.time", experiment.time_note.as_str()),
+            ("experiment.cancel", experiment.cancel_note.as_str()),
+            ("experiment.cleanup", experiment.cleanup_note.as_str()),
+            ("experiment.rollback", experiment.rollback_note.as_str()),
+        ]);
+        fields.extend(
+            experiment
+                .outcome_matrix
+                .iter()
+                .map(|mapping| ("experiment.outcome", mapping.rival_effect.as_str())),
+        );
+    }
+    for (field, value) in fields {
+        let low = lowered(value);
+        if mentions_any(&low, ORACLE_MARKERS)
+            || mentions_any(&low, SCOPE_ESCAPE_MARKERS)
+            || mentions_any(&low, EFFECT_ESCALATION_MARKERS)
+        {
+            return Err(DiagnosisError::Denominator {
+                detail: [field, " attempts an effect or authority escalation"].concat(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Preflights aggregate text bytes across the whole diagnosis surface.
+#[allow(clippy::too_many_lines)]
 fn preflight_total_bytes(
     product: &ProductGap,
     discriminator: &DiscriminatorEvidence,
     history: &RepairHistory,
+    common_mode: &CommonModeDisclosure,
     rivals: &[RivalMechanism],
     experiments: &[DiscriminatingExperiment],
     policy: &DiagnosisPolicy,
@@ -1498,33 +1769,89 @@ fn preflight_total_bytes(
     let mut total = 0usize;
     total = total.saturating_add(count_text_bytes(&[
         &product.objective_id,
+        &product.acceptance_digest,
+        &product.recovery_digest,
         &product.product_id,
         &product.source_revision,
+        &product.feature_ref,
+        &product.workflow_ref,
+        &product.user_outcome_ref,
         &product.gap_note,
+        product.proxy_mapping_note.as_deref().unwrap_or(""),
+        &product.context_digest,
         &discriminator.owner,
         &discriminator.expected_note,
         &discriminator.observed_note,
+        &discriminator.precondition_note,
+        &discriminator.replay_id,
+        discriminator.replay_input_digest.as_deref().unwrap_or(""),
+        &discriminator.context_digest,
         &discriminator.coverage_note,
+        &history.lineage_id,
+        &history.lineage_digest,
+        &common_mode.shared_model_note,
+        &common_mode.shared_source_note,
+        &common_mode.shared_evaluator_note,
+        &common_mode.shared_fixture_note,
+        &common_mode.uncertainty_note,
         &policy.policy_id,
         &policy.owner_note,
     ]));
+    for evidence in &product.evidence_refs {
+        total = total.saturating_add(evidence.len());
+    }
+    for identity in &history.expected_attempt_ids {
+        total = total.saturating_add(identity.len());
+    }
     for attempt in &history.attempts {
         total = total.saturating_add(count_text_bytes(&[
             &attempt.attempt_id,
+            &attempt.equivalence_digest,
             &attempt.mechanism_id,
             &attempt.mechanism_note,
         ]));
+        if let Some(repeat) = &attempt.controlled_repeat {
+            total = total.saturating_add(count_text_bytes(&[
+                &repeat.prior_attempt_id,
+                &repeat.explanation,
+            ]));
+        }
     }
+    total = total.saturating_add(count_text_bytes(&[
+        &policy.policy_revision.to_string(),
+        &policy.max_rivals.to_string(),
+        &policy.max_experiments.to_string(),
+        &policy.max_evidence_items.to_string(),
+        &policy
+            .observation_time_ms
+            .map_or(String::new(), |value| value.to_string()),
+        &policy
+            .deadline_ms
+            .map_or(String::new(), |value| value.to_string()),
+    ]));
     for rival in rivals {
         total = total.saturating_add(count_text_bytes(&[
             &rival.rival_id,
             &rival.owner,
             &rival.causal_boundary,
             &rival.falsifier,
+            &rival.prior_repair_relation,
+            &rival.affected_invariant,
             &rival.status_reason,
         ]));
         for prediction in &rival.predicted_observations {
             total = total.saturating_add(prediction.len());
+        }
+        for evidence in rival
+            .support_refs
+            .iter()
+            .chain(rival.unknown_refs.iter())
+            .chain(rival.counterevidence_refs.iter())
+        {
+            total = total.saturating_add(evidence.len());
+        }
+        for assumption in rival.assumptions.iter().chain(rival.confounders.iter()) {
+            total = total.saturating_add(assumption.len());
         }
     }
     for experiment in experiments {
@@ -1532,9 +1859,23 @@ fn preflight_total_bytes(
             &experiment.experiment_id,
             &experiment.owner,
             &experiment.verifier,
+            &experiment.primary_rival,
+            &experiment.secondary_rival,
+            experiment.resolves_assumption.as_deref().unwrap_or(""),
             &experiment.cost_note,
+            &experiment.risk_note,
+            &experiment.effect_note,
+            &experiment.time_note,
+            &experiment.cancel_note,
+            &experiment.cleanup_note,
             &experiment.rollback_note,
         ]));
+        for variable in &experiment.controlled_variables {
+            total = total.saturating_add(variable.len());
+        }
+        for mapping in &experiment.outcome_matrix {
+            total = total.saturating_add(mapping.rival_effect.len());
+        }
     }
     if total > MAX_TOTAL_BYTES {
         return Err(DiagnosisError::Bounds {
@@ -1664,6 +2005,15 @@ fn intrinsic_repair_denominator(history: &RepairHistory) -> Result<(), Diagnosis
         });
     }
     Ok(())
+}
+
+/// A zero wall/output/report allowance means the candidate itself cannot be
+/// admitted under the supplied job budget. This remains an explicit
+/// insufficiency and is never conflated with cancellation or a stale fence.
+fn budget_is_exhausted(job: &DreamJobAdmission) -> bool {
+    job.budget.wall_ms == Some(0)
+        || job.budget.output_bytes == Some(0)
+        || job.budget.report_bytes == Some(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -1853,9 +2203,12 @@ fn validate_rival_semantics(rival: &RivalMechanism) -> Result<(), DiagnosisError
             detail: "every rival requires at least one falsifiable prediction".to_owned(),
         });
     }
-    if rival.falsifier.trim() == rival.rival_id.trim() {
+    if rival.falsifier.trim() == rival.rival_id.trim()
+        || rival.falsifier.trim() == rival.causal_boundary.trim()
+        || !is_observable_statement(&rival.falsifier)
+    {
         return Err(DiagnosisError::Denominator {
-            detail: "a rival label is not its own falsifier".to_owned(),
+            detail: "a rival requires an observable falsifier, not a mechanism label".to_owned(),
         });
     }
     if !has_support_or_unknown(rival) {
@@ -1868,12 +2221,36 @@ fn validate_rival_semantics(rival: &RivalMechanism) -> Result<(), DiagnosisError
             detail: "a falsified rival requires its falsifying counterevidence".to_owned(),
         });
     }
+    if has_causal_overclaim(rival) {
+        return Err(DiagnosisError::Denominator {
+            detail: "chronology or correlation cannot be promoted to causal evidence".to_owned(),
+        });
+    }
     if trips_oracle_markers(&rival.falsifier) || trips_oracle_markers(&rival.status_reason) {
         return Err(DiagnosisError::Denominator {
             detail: "rival reasoning must not weaken the oracle".to_owned(),
         });
     }
     Ok(())
+}
+
+/// Retains a supplied falsified rival as live when its counterevidence was
+/// partial, confounded, or gathered under incompatible conditions. The raw
+/// declaration is still copied to the candidate for provenance; this view is
+/// only the non-eliminating assessment used for experiment selection.
+fn effective_rivals(rivals: &[RivalMechanism]) -> Vec<RivalMechanism> {
+    let mut effective = rivals.to_vec();
+    for rival in &mut effective {
+        if matches!(rival.status, RivalStatus::Falsified) && !falsification_is_compatible(rival) {
+            rival.status = RivalStatus::Live;
+            rival.status_reason = [
+                "falsification retained as unresolved under incompatible, partial, or confounded conditions: ",
+                &rival.status_reason,
+            ]
+            .concat();
+        }
+    }
+    effective
 }
 
 /// Returns true when the experiment matrix covers all six kinds exactly once.
@@ -1902,6 +2279,22 @@ fn matrix_is_complete(experiment: &DiscriminatingExperiment) -> bool {
             return false;
         }
         index = index.saturating_add(1);
+    }
+    true
+}
+
+/// Returns true when each material outcome is explicitly mapped to both
+/// experiment rivals (or to an explicit all-rivals statement).
+fn matrix_maps_both_rivals(experiment: &DiscriminatingExperiment) -> bool {
+    for mapping in &experiment.outcome_matrix {
+        let low = lowered(&mapping.rival_effect);
+        let primary = lowered(&experiment.primary_rival);
+        let secondary = lowered(&experiment.secondary_rival);
+        let names_both = low.contains(&primary) && low.contains(&secondary);
+        let aggregate = mentions_any(&low, &["both rivals", "each rival", "all rivals"]);
+        if !names_both && !aggregate {
+            return false;
+        }
     }
     true
 }
@@ -2020,7 +2413,7 @@ fn experiment_is_qualified(
     if experiment.controlled_variables.is_empty() {
         return false;
     }
-    if !matrix_is_complete(experiment) {
+    if !matrix_is_complete(experiment) || !matrix_maps_both_rivals(experiment) {
         return false;
     }
     if experiment_trips_markers(experiment) {
@@ -2044,6 +2437,7 @@ fn select_experiment(
         if let Some(experiment) = experiments.get(index) {
             if experiment.controlled_variables.is_empty()
                 || !matrix_is_complete(experiment)
+                || !matrix_maps_both_rivals(experiment)
                 || experiment_trips_markers(experiment)
             {
                 index = index.saturating_add(1);
@@ -2185,10 +2579,11 @@ fn attempt_denominator_of(history: &RepairHistory) -> Vec<String> {
 
 /// Computes the deterministic digest binding the diagnosis inputs.
 ///
-/// Ten explicit bindings mirror the canonical typed equivalent of the
+/// Explicit bindings mirror the canonical typed equivalent of the
 /// development-diagnosis contract; bundling them would hide load-bearing
 /// distinctions at the digest boundary.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 fn compute_diagnosis_digest(
     handle: &str,
     outcome_spelling: &str,
@@ -2196,7 +2591,10 @@ fn compute_diagnosis_digest(
     discriminator: &DiscriminatorEvidence,
     history: &RepairHistory,
     conflict: &FrozenConflictAnalysis,
-    rivals: &[RivalMechanism],
+    declared_rivals: &[RivalMechanism],
+    effective_rivals: &[RivalMechanism],
+    common_mode: &CommonModeDisclosure,
+    experiments: &[DiscriminatingExperiment],
     selected: Option<&DiscriminatingExperiment>,
     policy: &DiagnosisPolicy,
     receipt_digest: &str,
@@ -2214,11 +2612,100 @@ fn compute_diagnosis_digest(
             observation_class(&discriminator.observation),
         ]
         .concat(),
+        [
+            "observation.typed:",
+            &format!("{:?}", discriminator.observation),
+        ]
+        .concat(),
         ["lineage:", &history.lineage_id].concat(),
         ["conflict:", &conflict.digest].concat(),
         ["policy:", &policy.policy_id].concat(),
         ["receipt:", receipt_digest].concat(),
     ];
+    parts.extend([
+        format!("product.objective_revision:{}", product.objective_revision),
+        ["product.acceptance:", &product.acceptance_digest].concat(),
+        ["product.recovery:", &product.recovery_digest].concat(),
+        ["product.feature:", &product.feature_ref].concat(),
+        ["product.workflow:", &product.workflow_ref].concat(),
+        ["product.outcome:", &product.user_outcome_ref].concat(),
+        ["product.gap_note:", &product.gap_note].concat(),
+        [
+            "product.proxy_mapping:",
+            product.proxy_mapping_note.as_deref().unwrap_or(""),
+        ]
+        .concat(),
+        ["product.context:", &product.context_digest].concat(),
+        ["discriminator.owner:", &discriminator.owner].concat(),
+        ["discriminator.expected:", &discriminator.expected_note].concat(),
+        ["discriminator.observed:", &discriminator.observed_note].concat(),
+        format!("discriminator.predeclared:{}", discriminator.predeclared),
+        format!(
+            "discriminator.independently_confirmed:{}",
+            discriminator.independently_confirmed
+        ),
+        format!(
+            "discriminator.preconditions_satisfied:{}",
+            discriminator.preconditions_satisfied
+        ),
+        [
+            "discriminator.precondition_note:",
+            &discriminator.precondition_note,
+        ]
+        .concat(),
+        format!("discriminator.replayable:{}", discriminator.replayable),
+        ["discriminator.replay:", &discriminator.replay_id].concat(),
+        [
+            "discriminator.replay_input:",
+            discriminator.replay_input_digest.as_deref().unwrap_or(""),
+        ]
+        .concat(),
+        ["discriminator.context:", &discriminator.context_digest].concat(),
+        ["discriminator.coverage:", &discriminator.coverage_note].concat(),
+        ["repair.presence:", &format!("{:?}", history.presence)].concat(),
+        ["repair.digest:", &history.lineage_digest].concat(),
+        ["conflict.required:", &conflict.required.to_string()].concat(),
+        ["conflict.present:", &conflict.present.to_string()].concat(),
+        ["conflict.scope:", &conflict.scope_note].concat(),
+        ["conflict.coverage:", &conflict.coverage_note].concat(),
+        ["common-mode.model:", &common_mode.shared_model_note].concat(),
+        ["common-mode.source:", &common_mode.shared_source_note].concat(),
+        ["common-mode.evaluator:", &common_mode.shared_evaluator_note].concat(),
+        ["common-mode.fixture:", &common_mode.shared_fixture_note].concat(),
+        ["common-mode.uncertainty:", &common_mode.uncertainty_note].concat(),
+        ["policy.revision:", &policy.policy_revision.to_string()].concat(),
+        ["policy.max_rivals:", &policy.max_rivals.to_string()].concat(),
+        [
+            "policy.max_experiments:",
+            &policy.max_experiments.to_string(),
+        ]
+        .concat(),
+        [
+            "policy.max_evidence:",
+            &policy.max_evidence_items.to_string(),
+        ]
+        .concat(),
+        ["policy.allow_partial:", &policy.allow_partial.to_string()].concat(),
+        ["policy.cancelled:", &policy.cancelled.to_string()].concat(),
+        [
+            "policy.observation_time:",
+            &policy
+                .observation_time_ms
+                .map_or_else(String::new, |value| value.to_string()),
+        ]
+        .concat(),
+        [
+            "policy.deadline:",
+            &policy
+                .deadline_ms
+                .map_or_else(String::new, |value| value.to_string()),
+        ]
+        .concat(),
+        ["policy.owner:", &policy.owner_note].concat(),
+    ]);
+    for evidence in &product.evidence_refs {
+        parts.push(["product.evidence:", evidence].concat());
+    }
     for attempt in &history.attempts {
         parts.push(
             [
@@ -2229,15 +2716,115 @@ fn compute_diagnosis_digest(
             ]
             .concat(),
         );
-    }
-    for rival in rivals {
-        parts.push(["rival:", &rival.rival_id, "|", rival.status.as_str()].concat());
-    }
-    match selected {
-        Some(experiment) => {
-            parts.push(["experiment:", &experiment.experiment_id].concat());
+        parts.push(["attempt.mechanism:", &attempt.mechanism_id].concat());
+        parts.push(["attempt.note:", &attempt.mechanism_note].concat());
+        parts.push(["attempt.exercise:", &format!("{:?}", attempt.exercise)].concat());
+        parts.push(["attempt.outcome:", &format!("{:?}", attempt.outcome)].concat());
+        if let Some(repeat) = &attempt.controlled_repeat {
+            parts.push(["attempt.repeat.prior:", &repeat.prior_attempt_id].concat());
+            parts.push(["attempt.repeat.explanation:", &repeat.explanation].concat());
+            parts.push(format!(
+                "attempt.repeat.new_information:{}",
+                repeat.new_information
+            ));
+            parts.push(format!(
+                "attempt.repeat.changed_conditions:{}",
+                repeat.changed_conditions
+            ));
+            parts.push(["attempt.repeat.reason:", &format!("{:?}", repeat.reason)].concat());
         }
-        None => parts.push("experiment:none".to_owned()),
+    }
+    for rival in declared_rivals {
+        parts.push(
+            [
+                "rival.declared:",
+                &rival.rival_id,
+                "|",
+                rival.status.as_str(),
+            ]
+            .concat(),
+        );
+        parts.extend([
+            ["rival.declared.owner:", &rival.owner].concat(),
+            ["rival.declared.boundary:", &rival.causal_boundary].concat(),
+            ["rival.declared.falsifier:", &rival.falsifier].concat(),
+            ["rival.declared.prior_repair:", &rival.prior_repair_relation].concat(),
+            ["rival.declared.invariant:", &rival.affected_invariant].concat(),
+            ["rival.declared.status_reason:", &rival.status_reason].concat(),
+        ]);
+        for prediction in &rival.predicted_observations {
+            parts.push(["rival.declared.prediction:", prediction].concat());
+        }
+        for evidence in &rival.support_refs {
+            parts.push(["rival.declared.support:", evidence].concat());
+        }
+        for evidence in &rival.unknown_refs {
+            parts.push(["rival.declared.unknown:", evidence].concat());
+        }
+        for evidence in &rival.counterevidence_refs {
+            parts.push(["rival.declared.counterevidence:", evidence].concat());
+        }
+        for assumption in &rival.assumptions {
+            parts.push(["rival.declared.assumption:", assumption].concat());
+        }
+        for confounder in &rival.confounders {
+            parts.push(["rival.declared.confounder:", confounder].concat());
+        }
+    }
+    for rival in effective_rivals {
+        parts.push(
+            [
+                "rival.effective:",
+                &rival.rival_id,
+                "|",
+                rival.status.as_str(),
+            ]
+            .concat(),
+        );
+        parts.extend([["rival.effective.status_reason:", &rival.status_reason].concat()]);
+        for evidence in &rival.counterevidence_refs {
+            parts.push(["rival.effective.counterevidence:", evidence].concat());
+        }
+    }
+    for experiment in experiments {
+        parts.extend([
+            ["experiment.id:", &experiment.experiment_id].concat(),
+            ["experiment.owner:", &experiment.owner].concat(),
+            ["experiment.verifier:", &experiment.verifier].concat(),
+            ["experiment.primary:", &experiment.primary_rival].concat(),
+            ["experiment.secondary:", &experiment.secondary_rival].concat(),
+            [
+                "experiment.assumption:",
+                experiment.resolves_assumption.as_deref().unwrap_or(""),
+            ]
+            .concat(),
+            ["experiment.cost:", &experiment.cost_note].concat(),
+            ["experiment.risk:", &experiment.risk_note].concat(),
+            ["experiment.effect:", &experiment.effect_note].concat(),
+            ["experiment.time:", &experiment.time_note].concat(),
+            ["experiment.cancel:", &experiment.cancel_note].concat(),
+            ["experiment.cleanup:", &experiment.cleanup_note].concat(),
+            ["experiment.rollback:", &experiment.rollback_note].concat(),
+        ]);
+        for variable in &experiment.controlled_variables {
+            parts.push(["experiment.variable:", variable].concat());
+        }
+        for mapping in &experiment.outcome_matrix {
+            parts.push(
+                [
+                    "experiment.outcome:",
+                    mapping.outcome.as_str(),
+                    "|",
+                    &mapping.rival_effect,
+                ]
+                .concat(),
+            );
+        }
+    }
+    if selected.is_none() {
+        parts.push("experiment:none".to_owned());
+    } else if let Some(experiment) = selected {
+        parts.push(["experiment:selected:", &experiment.experiment_id].concat());
     }
     canonical_json_bytes(&parts).map_or_else(
         |err| {
@@ -2284,10 +2871,12 @@ fn emit_candidate(
 ) -> Result<DevelopmentDiagnosisCandidate, DiagnosisError> {
     let handle = ["diag-", &discriminator.discriminator_id].concat();
     check_handle(&handle, "diagnosis.handle")?;
-    let (live, falsified) = count_rival_statuses(rivals);
+    let evaluated_rivals = effective_rivals(rivals);
+    let evaluated_rivals = evaluated_rivals.as_slice();
+    let (live, falsified) = count_rival_statuses(evaluated_rivals);
     let strongest = if live == 1 && falsified >= 1 {
         let mut found: Option<String> = None;
-        for rival in rivals {
+        for rival in evaluated_rivals {
             if matches!(rival.status, RivalStatus::Live) {
                 found = Some(rival.rival_id.clone());
                 break;
@@ -2305,7 +2894,7 @@ fn emit_candidate(
     .to_owned();
     let recommendation = match &selected {
         Some(experiment) => {
-            let scope = if separates_live_rivals(experiment, rivals) {
+            let scope = if separates_live_rivals(experiment, evaluated_rivals) {
                 [
                     "experiment ",
                     &experiment.experiment_id,
@@ -2387,6 +2976,9 @@ fn emit_candidate(
         history,
         conflict,
         rivals,
+        evaluated_rivals,
+        common_mode,
+        experiments,
         selected.as_ref(),
         policy,
         receipt_digest,
@@ -2398,7 +2990,14 @@ fn emit_candidate(
         source_revision: product.source_revision.clone(),
         objective_id: product.objective_id.clone(),
         gap_kind: product.kind.as_str().to_owned(),
-        rivals: build_rival_assessments(rivals),
+        product_gap: product.clone(),
+        current_discriminator: discriminator.clone(),
+        repair_history: history.clone(),
+        conflict_analysis: conflict.clone(),
+        rival_mechanisms: rivals.to_vec(),
+        experiment_alternatives: experiments.to_vec(),
+        policy: policy.clone(),
+        rivals: build_rival_assessments(evaluated_rivals),
         rivals_live: live,
         rivals_falsified: falsified,
         strongest_current: strongest,
@@ -2457,7 +3056,16 @@ pub fn diagnose_development_gap(
     validate_rival_shapes(rivals, policy)?;
     validate_common_mode_shapes(common_mode)?;
     validate_experiment_shapes(experiments, policy)?;
-    preflight_total_bytes(product, discriminator, repairs, rivals, experiments, policy)?;
+    validate_policy_dependent_bounds(product, rivals, policy)?;
+    preflight_total_bytes(
+        product,
+        discriminator,
+        repairs,
+        common_mode,
+        rivals,
+        experiments,
+        policy,
+    )?;
     intrinsic_receipt_checks(draft)?;
     intrinsic_binding_checks(job, draft, policy)?;
     intrinsic_repair_denominator(repairs)?;
@@ -2481,6 +3089,31 @@ pub fn diagnose_development_gap(
             );
         }
     }
+    if let Err(err) = validate_no_effect_escalation(
+        product,
+        discriminator,
+        common_mode,
+        rivals,
+        experiments,
+        policy,
+    ) {
+        return emit_candidate(
+            DiagnosisOutcome::Rejected,
+            product,
+            discriminator,
+            repairs,
+            conflict,
+            rivals,
+            common_mode,
+            None,
+            experiments,
+            policy,
+            &draft.receipt.output_digest,
+            &redact(&err.to_string()),
+        );
+    }
+    let evaluated_rivals = effective_rivals(rivals);
+    let evaluated_rivals = evaluated_rivals.as_slice();
     if discriminator.context_digest != product.context_digest {
         return Err(DiagnosisError::Binding {
             field: "discriminator.context",
@@ -2503,6 +3136,22 @@ pub fn diagnose_development_gap(
             "cancelled before emission; zero effects were produced",
         );
     }
+    if budget_is_exhausted(job) {
+        return emit_candidate(
+            DiagnosisOutcome::Insufficient,
+            product,
+            discriminator,
+            repairs,
+            conflict,
+            rivals,
+            common_mode,
+            None,
+            experiments,
+            policy,
+            &draft.receipt.output_digest,
+            "the admitted job budget is exhausted before candidate emission",
+        );
+    }
     if let (Some(observed), Some(deadline)) = (policy.observation_time_ms, policy.deadline_ms)
         && observed >= deadline
     {
@@ -2523,6 +3172,11 @@ pub fn diagnose_development_gap(
     }
     let gap = evaluate_gap(product)?;
     if matches!(gap, GapVerdict::ProxyOnly) {
+        let note = if product.proxy_mapping_note.is_some() {
+            "proxy mapping is retained, but proxy evidence cannot establish Product delta"
+        } else {
+            "proxy or activity signals lack an evidence-backed user-outcome mapping and cannot prove Product delta"
+        };
         return emit_candidate(
             DiagnosisOutcome::Rejected,
             product,
@@ -2535,7 +3189,7 @@ pub fn diagnose_development_gap(
             experiments,
             policy,
             &draft.receipt.output_digest,
-            "proxy or activity signals cannot prove product delta without an evidence-backed user-outcome mapping",
+            note,
         );
     }
     match evaluate_discriminator(discriminator) {
@@ -2669,7 +3323,23 @@ pub fn diagnose_development_gap(
             "unknown repair-history presence leaves the attempt denominator incomplete",
         );
     }
-    let (live, _) = count_rival_statuses(rivals);
+    if matches!(gap, GapVerdict::Partial) && !policy.allow_partial {
+        return emit_candidate(
+            DiagnosisOutcome::Insufficient,
+            product,
+            discriminator,
+            repairs,
+            conflict,
+            rivals,
+            common_mode,
+            None,
+            experiments,
+            policy,
+            &draft.receipt.output_digest,
+            "partial Product coverage is preserved but this policy does not permit partial emission",
+        );
+    }
+    let (live, _) = count_rival_statuses(evaluated_rivals);
     if live == 0 {
         return emit_candidate(
             DiagnosisOutcome::Insufficient,
@@ -2686,7 +3356,7 @@ pub fn diagnose_development_gap(
             "no live falsifiable rival remains in the declared set",
         );
     }
-    let selected_index = select_experiment(experiments, rivals);
+    let selected_index = select_experiment(experiments, evaluated_rivals);
     match selected_index {
         Some(index) => {
             let selected = match experiments.get(index) {
@@ -2740,10 +3410,12 @@ pub fn diagnose_development_gap(
 }
 
 // ---------------------------------------------------------------------------
-// Tests (proportionate: 26 of 51 cases; remainder deferred per START.md s1).
+// Tests: all 51 issue cases execute as package-local semantic cases.
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
+#[allow(clippy::too_many_arguments)]
 mod tests {
     use super::CommonModeDisclosure;
     use super::ControlledRepeat;
@@ -2775,6 +3447,8 @@ mod tests {
     use super::SLICE6_REMAINDER_CASES;
     use super::SLICE7_IMPLEMENTED_CASES;
     use super::SLICE7_REMAINDER_CASES;
+    use super::SLICE8_IMPLEMENTED_CASES;
+    use super::SLICE8_REMAINDER_CASES;
     use super::diagnose_development_gap;
     use super::is_hex64_lower;
     use super::outcome_rejection_hint;
@@ -3113,6 +3787,59 @@ mod tests {
             panic!("valid diagnosis must complete");
         };
         candidate
+    }
+
+    /// Runs a fixture with the default job and validated A-05 draft while
+    /// allowing one case to vary the semantic inputs.
+    fn run_fixture(
+        product: &ProductGap,
+        discriminator: &DiscriminatorEvidence,
+        repairs: &RepairHistory,
+        conflict: &FrozenConflictAnalysis,
+        rivals: &[RivalMechanism],
+        experiments: &[DiscriminatingExperiment],
+        policy: &DiagnosisPolicy,
+    ) -> Result<DevelopmentDiagnosisCandidate, super::DiagnosisError> {
+        let job = test_job();
+        let draft = test_draft();
+        diagnose_development_gap(
+            &job,
+            &draft,
+            product,
+            discriminator,
+            repairs,
+            conflict,
+            rivals,
+            &test_common_mode(),
+            experiments,
+            policy,
+        )
+    }
+
+    /// Runs a fixture with an explicitly varied job budget or identity.
+    fn run_fixture_with_job(
+        job: &DreamJobAdmission,
+        product: &ProductGap,
+        discriminator: &DiscriminatorEvidence,
+        repairs: &RepairHistory,
+        conflict: &FrozenConflictAnalysis,
+        rivals: &[RivalMechanism],
+        experiments: &[DiscriminatingExperiment],
+        policy: &DiagnosisPolicy,
+    ) -> Result<DevelopmentDiagnosisCandidate, super::DiagnosisError> {
+        let draft = test_draft();
+        diagnose_development_gap(
+            job,
+            &draft,
+            product,
+            discriminator,
+            repairs,
+            conflict,
+            rivals,
+            &test_common_mode(),
+            experiments,
+            policy,
+        )
     }
 
     #[test]
@@ -4546,6 +5273,29 @@ mod tests {
             .chain(SLICE6_IMPLEMENTED_CASES.iter())
             .chain(SLICE7_IMPLEMENTED_CASES.iter())
             .chain(SLICE7_REMAINDER_CASES.iter())
+            .chain(SLICE8_IMPLEMENTED_CASES.iter())
+            .chain(SLICE8_REMAINDER_CASES.iter())
+        {
+            assert!((1..=51).contains(case));
+            assert!(!seen[usize::from(*case)]);
+            seen[usize::from(*case)] = true;
+        }
+        assert!(seen[1..].iter().all(|present| *present));
+    }
+
+    #[test]
+    fn slice8_final_map_has_no_unimplemented_case() {
+        let mut seen = [false; 52];
+        for case in SLICE1_IMPLEMENTED_CASES
+            .iter()
+            .chain(SLICE2_IMPLEMENTED_CASES.iter())
+            .chain(SLICE3_IMPLEMENTED_CASES.iter())
+            .chain(SLICE4_IMPLEMENTED_CASES.iter())
+            .chain(SLICE5_IMPLEMENTED_CASES.iter())
+            .chain(SLICE6_IMPLEMENTED_CASES.iter())
+            .chain(SLICE7_IMPLEMENTED_CASES.iter())
+            .chain(SLICE8_IMPLEMENTED_CASES.iter())
+            .chain(SLICE8_REMAINDER_CASES.iter())
         {
             assert!((1..=51).contains(case));
             assert!(!seen[usize::from(*case)]);
@@ -4725,6 +5475,23 @@ mod tests {
         let rivals = test_rivals();
         let experiments = [test_experiment()].to_vec();
         let policy = test_policy();
+        let mut changed_common_mode = test_common_mode();
+        changed_common_mode.uncertainty_note =
+            "a different common-mode observation risk".to_owned();
+        let changed = diagnose_development_gap(
+            &job,
+            &draft,
+            &product,
+            &discriminator,
+            &repairs,
+            &conflict,
+            &rivals,
+            &changed_common_mode,
+            &experiments,
+            &policy,
+        )
+        .expect("changed common-mode input remains a valid candidate");
+        assert_ne!(candidate.candidate_digest, changed.candidate_digest);
 
         let mut blank = test_common_mode();
         blank.shared_evaluator_note = String::new();
@@ -4828,5 +5595,629 @@ mod tests {
         assert_eq!(candidate.strongest_current, Some("rival-a".to_owned()));
         assert!(!candidate.strongest_limits_note.trim().is_empty());
         assert!(candidate.recommended_experiment.is_some());
+    }
+
+    // WORK_UNIT_CASE: 675/25
+    #[test]
+    fn case_25_unfalsifiable_mechanism_label_is_rejected() {
+        let mut rival = test_rival("rival-a", "confirmation stays absent under load L");
+        rival.falsifier = "race condition".to_owned();
+        let result = run_fixture(
+            &test_product(),
+            &test_discriminator(),
+            &test_repairs(),
+            &test_conflict(),
+            &[rival],
+            &[test_experiment()],
+            &test_policy(),
+        );
+        let candidate = result.expect("unfalsifiable labels are inert candidates");
+        assert_eq!(candidate.outcome, DiagnosisOutcome::Rejected);
+        assert!(candidate.recommended_experiment.is_none());
+    }
+
+    // WORK_UNIT_CASE: 675/26
+    #[test]
+    fn case_26_chronology_or_correlation_is_not_causal_evidence() {
+        let mut rivals = test_rivals();
+        rivals[0].status_reason =
+            "the patch came first, therefore causes the product outcome".to_owned();
+        let candidate = run_fixture(
+            &test_product(),
+            &test_discriminator(),
+            &test_repairs(),
+            &test_conflict(),
+            &rivals,
+            &[test_experiment()],
+            &test_policy(),
+        )
+        .expect("causal overclaim is returned as a bounded candidate");
+        assert_eq!(candidate.outcome, DiagnosisOutcome::Rejected);
+        assert!(candidate.note.contains("causal"));
+    }
+
+    // WORK_UNIT_CASE: 675/27
+    #[test]
+    fn case_27_falsification_requires_compatible_conditions() {
+        let mut rivals = test_rivals();
+        rivals[0].status = RivalStatus::Falsified;
+        rivals[0].falsifier = "observed after an incompatible load".to_owned();
+        rivals[0].status_reason = "counterevidence came from different conditions".to_owned();
+        rivals[0].counterevidence_refs = ["ev-incompatible".to_owned()].to_vec();
+        let candidate = run_fixture(
+            &test_product(),
+            &test_discriminator(),
+            &test_repairs(),
+            &test_conflict(),
+            &rivals,
+            &[test_experiment()],
+            &test_policy(),
+        )
+        .expect("incompatible falsification stays unresolved");
+        assert_eq!(candidate.outcome, DiagnosisOutcome::Complete);
+        assert_eq!(candidate.rivals_live, 2);
+        assert_eq!(candidate.rivals_falsified, 0);
+        assert!(candidate.rivals[0].reason.contains("unresolved"));
+    }
+
+    // WORK_UNIT_CASE: 675/28
+    #[test]
+    fn case_28_confounded_or_partial_evidence_cannot_eliminate_a_rival() {
+        let mut rivals = test_rivals();
+        rivals[1].status = RivalStatus::Falsified;
+        rivals[1].status_reason = "partial confounded replay under load".to_owned();
+        rivals[1].counterevidence_refs = ["ev-partial".to_owned()].to_vec();
+        let candidate = run_fixture(
+            &test_product(),
+            &test_discriminator(),
+            &test_repairs(),
+            &test_conflict(),
+            &rivals,
+            &[test_experiment()],
+            &test_policy(),
+        )
+        .expect("confounded evidence stays an unresolved candidate");
+        assert_eq!(candidate.outcome, DiagnosisOutcome::Complete);
+        assert_eq!(candidate.rivals_live, 2);
+        assert_eq!(candidate.rivals_falsified, 0);
+        assert_eq!(candidate.rival_mechanisms[1].status, RivalStatus::Falsified);
+        assert_eq!(candidate.rivals[1].status, RivalStatus::Live);
+    }
+
+    // WORK_UNIT_CASE: 675/29
+    #[test]
+    fn case_29_live_rival_denominator_is_exact() {
+        let mut rivals = test_rivals();
+        rivals[1].status = RivalStatus::Falsified;
+        rivals[1].status_reason =
+            "prediction falsified under the same load in a controlled replay".to_owned();
+        rivals[1].counterevidence_refs = ["ev-compatible".to_owned()].to_vec();
+        let mut experiment = test_experiment();
+        experiment.resolves_assumption = Some("assumption-load-holds".to_owned());
+        let candidate = run_fixture(
+            &test_product(),
+            &test_discriminator(),
+            &test_repairs(),
+            &test_conflict(),
+            &rivals,
+            &[experiment],
+            &test_policy(),
+        )
+        .expect("the exact live-rival denominator remains usable");
+        assert_eq!(candidate.rivals_live, 1);
+        assert_eq!(candidate.rivals_falsified, 1);
+        assert_eq!(candidate.strongest_current, Some("rival-a".to_owned()));
+    }
+
+    // WORK_UNIT_CASE: 675/30
+    #[test]
+    fn case_30_experiment_must_separate_two_live_rivals() {
+        let candidate = run_valid();
+        let selected = candidate
+            .recommended_experiment
+            .expect("divergent predictions select an experiment");
+        assert_ne!(selected.primary_rival, selected.secondary_rival);
+        assert_eq!(candidate.rivals_live, 2);
+        assert_eq!(
+            selected.outcome_matrix.len(),
+            ExperimentOutcomeKind::ALL.len()
+        );
+        assert!(
+            selected
+                .outcome_matrix
+                .iter()
+                .all(|mapping| !mapping.rival_effect.trim().is_empty())
+        );
+    }
+
+    // WORK_UNIT_CASE: 675/31
+    #[test]
+    fn case_31_experiment_may_resolve_a_live_blocking_assumption() {
+        let rivals = [
+            test_rival("rival-a", "same observation under load L"),
+            test_rival("rival-b", "same observation under load L"),
+        ]
+        .to_vec();
+        let mut experiment = test_experiment();
+        experiment.resolves_assumption = Some("assumption-load-holds".to_owned());
+        let candidate = run_fixture(
+            &test_product(),
+            &test_discriminator(),
+            &test_repairs(),
+            &test_conflict(),
+            &rivals,
+            &[experiment],
+            &test_policy(),
+        )
+        .expect("a blocking assumption can be resolved without divergent predictions");
+        assert_eq!(candidate.outcome, DiagnosisOutcome::Complete);
+        assert_eq!(
+            candidate
+                .recommended_experiment
+                .as_ref()
+                .and_then(|item| item.resolves_assumption.as_deref()),
+            Some("assumption-load-holds")
+        );
+    }
+
+    // WORK_UNIT_CASE: 675/33
+    #[test]
+    fn case_33_preferred_fix_without_outcome_matrix_is_rejected() {
+        let mut experiment = test_experiment();
+        experiment.outcome_matrix.pop();
+        let candidate = run_fixture(
+            &test_product(),
+            &test_discriminator(),
+            &test_repairs(),
+            &test_conflict(),
+            &test_rivals(),
+            &[experiment],
+            &test_policy(),
+        )
+        .expect("an incomplete try-and-see experiment stays inert");
+        assert_eq!(candidate.outcome, DiagnosisOutcome::Insufficient);
+        assert!(candidate.recommended_experiment.is_none());
+    }
+
+    // WORK_UNIT_CASE: 675/34
+    #[test]
+    fn case_34_all_material_experiment_outcomes_are_mapped() {
+        let candidate = run_valid();
+        let matrix = &candidate
+            .recommended_experiment
+            .expect("valid experiment is retained")
+            .outcome_matrix;
+        assert_eq!(matrix.len(), ExperimentOutcomeKind::ALL.len());
+        for expected in ExperimentOutcomeKind::ALL {
+            assert!(matrix.iter().any(|mapping| mapping.outcome == expected));
+        }
+    }
+
+    // WORK_UNIT_CASE: 675/35
+    #[test]
+    fn case_35_experiment_resource_and_rollback_fields_are_bounded() {
+        let mut experiment = test_experiment();
+        experiment.risk_note = "x".repeat(super::MAX_NOTE_BYTES + 1);
+        let result = run_fixture(
+            &test_product(),
+            &test_discriminator(),
+            &test_repairs(),
+            &test_conflict(),
+            &test_rivals(),
+            &[experiment],
+            &test_policy(),
+        );
+        assert!(matches!(
+            result,
+            Err(super::DiagnosisError::Shape {
+                field: "experiment.risk",
+                ..
+            })
+        ));
+    }
+
+    // WORK_UNIT_CASE: 675/36
+    #[test]
+    fn case_36_no_safe_experiment_escalates_to_owner_insufficiency() {
+        let candidate = run_fixture(
+            &test_product(),
+            &test_discriminator(),
+            &test_repairs(),
+            &test_conflict(),
+            &test_rivals(),
+            &[],
+            &test_policy(),
+        )
+        .expect("no safe experiment is an inert insufficiency");
+        assert_eq!(candidate.outcome, DiagnosisOutcome::Insufficient);
+        assert_eq!(
+            candidate.recommendation.owner,
+            "human-or-architecture-owner"
+        );
+        assert!(
+            candidate
+                .recommendation
+                .minimal_scope
+                .contains("no safe discriminating experiment")
+        );
+    }
+
+    // WORK_UNIT_CASE: 675/37
+    #[test]
+    fn case_37_recommendation_binds_exact_owner_and_minimal_scope() {
+        let candidate = run_valid();
+        assert_eq!(candidate.recommendation.owner, "owner-9");
+        for required in [
+            "exp-1",
+            "rival-a",
+            "rival-b",
+            "disc-1",
+            "product-1",
+            "rev-9",
+        ] {
+            assert!(candidate.recommendation.minimal_scope.contains(required));
+        }
+        assert!(candidate.recommendation.forbidden_paths.len() >= 3);
+        assert!(
+            candidate
+                .recommendation
+                .rollback_note
+                .contains("no production change")
+        );
+    }
+
+    // WORK_UNIT_CASE: 675/38
+    #[test]
+    fn case_38_oracle_and_unrelated_scope_weakening_is_rejected() {
+        let mut experiment = test_experiment();
+        experiment.rollback_note = "weaken oracle to make the repair pass".to_owned();
+        let candidate = run_fixture(
+            &test_product(),
+            &test_discriminator(),
+            &test_repairs(),
+            &test_conflict(),
+            &test_rivals(),
+            &[experiment],
+            &test_policy(),
+        )
+        .expect("oracle weakening is a candidate rejection");
+        assert_eq!(candidate.outcome, DiagnosisOutcome::Rejected);
+        assert!(candidate.recommended_experiment.is_none());
+    }
+
+    // WORK_UNIT_CASE: 675/39
+    #[test]
+    fn case_39_edge_and_product_pulse_evidence_stays_external() {
+        let candidate = run_valid();
+        assert!(candidate.next_evidence_note.contains("external"));
+        assert!(
+            candidate
+                .next_evidence_note
+                .contains(super::NEXT_EVIDENCE_PULSE)
+        );
+        assert!(!candidate.next_evidence_note.contains("verified_complete"));
+    }
+
+    // WORK_UNIT_CASE: 675/40
+    #[test]
+    fn case_40_seven_preservation_dimensions_and_a05_receipt_are_retained() {
+        let candidate = run_valid();
+        assert_eq!(candidate.preservation.verdicts.len(), 7);
+        assert!(
+            candidate
+                .preservation
+                .verdicts
+                .iter()
+                .all(|item| item.passed)
+        );
+        assert_eq!(candidate.input_receipt_digest, "e".repeat(64));
+        assert_eq!(candidate.product_gap, test_product());
+        assert_eq!(candidate.current_discriminator, test_discriminator());
+        assert_eq!(candidate.repair_history, test_repairs());
+        assert_eq!(
+            candidate.experiment_alternatives,
+            [test_experiment()].to_vec()
+        );
+        let source = include_str!("lib.rs");
+        let conflict_call = ["run_conflict_analysis", "("].concat();
+        let validator_call = ["invoke_validator", "("].concat();
+        assert!(!source.contains(&conflict_call));
+        assert!(!source.contains(&validator_call));
+    }
+
+    // WORK_UNIT_CASE: 675/41
+    #[test]
+    fn case_41_partial_budget_deadline_and_cancellation_are_distinct() {
+        let mut partial_product = test_product();
+        partial_product.kind = ProductGapKind::ProductPartial;
+        let mut partial_policy = test_policy();
+        partial_policy.allow_partial = true;
+        let partial = run_fixture(
+            &partial_product,
+            &test_discriminator(),
+            &test_repairs(),
+            &test_conflict(),
+            &test_rivals(),
+            &[test_experiment()],
+            &partial_policy,
+        )
+        .expect("explicit partial policy stays distinct");
+        assert_eq!(partial.outcome, DiagnosisOutcome::Partial);
+
+        let mut exhausted_job = test_job();
+        exhausted_job.budget.wall_ms = Some(0);
+        let exhausted = run_fixture_with_job(
+            &exhausted_job,
+            &test_product(),
+            &test_discriminator(),
+            &test_repairs(),
+            &test_conflict(),
+            &test_rivals(),
+            &[test_experiment()],
+            &test_policy(),
+        )
+        .expect("budget exhaustion stays an insufficiency");
+        assert_eq!(exhausted.outcome, DiagnosisOutcome::Insufficient);
+        assert!(exhausted.note.contains("budget"));
+
+        let mut stale_policy = test_policy();
+        stale_policy.observation_time_ms = stale_policy.deadline_ms;
+        let stale = run_fixture(
+            &test_product(),
+            &test_discriminator(),
+            &test_repairs(),
+            &test_conflict(),
+            &test_rivals(),
+            &[test_experiment()],
+            &stale_policy,
+        )
+        .expect("deadline staleness stays distinct");
+        assert_eq!(stale.outcome, DiagnosisOutcome::Stale);
+
+        let mut cancelled_policy = test_policy();
+        cancelled_policy.cancelled = true;
+        let cancelled = run_fixture(
+            &test_product(),
+            &test_discriminator(),
+            &test_repairs(),
+            &test_conflict(),
+            &test_rivals(),
+            &[test_experiment()],
+            &cancelled_policy,
+        )
+        .expect("cancellation stays distinct");
+        assert_eq!(cancelled.outcome, DiagnosisOutcome::Rejected);
+    }
+
+    // WORK_UNIT_CASE: 675/42
+    #[test]
+    fn case_42_privacy_authority_effect_and_product_escalation_are_rejected() {
+        let mut experiment = test_experiment();
+        experiment.effect_note = "grant authority and execute repair as truth".to_owned();
+        let candidate = run_fixture(
+            &test_product(),
+            &test_discriminator(),
+            &test_repairs(),
+            &test_conflict(),
+            &test_rivals(),
+            &[experiment],
+            &test_policy(),
+        )
+        .expect("effect escalation is an inert rejection");
+        assert_eq!(candidate.outcome, DiagnosisOutcome::Rejected);
+        assert!(candidate.recommended_experiment.is_none());
+    }
+
+    // WORK_UNIT_CASE: 675/43
+    #[test]
+    fn case_43_independent_denominators_reject_one_over_bounds() {
+        let mut too_many_rivals = test_rivals();
+        while too_many_rivals.len() <= super::MAX_RIVALS {
+            let id = format!("rival-extra-{}", too_many_rivals.len());
+            too_many_rivals.push(test_rival(&id, "extra prediction remains observable"));
+        }
+        let result = run_fixture(
+            &test_product(),
+            &test_discriminator(),
+            &test_repairs(),
+            &test_conflict(),
+            &too_many_rivals,
+            &[test_experiment()],
+            &test_policy(),
+        );
+        assert!(matches!(result, Err(super::DiagnosisError::Bounds { .. })));
+
+        let candidate = run_valid();
+        assert_eq!(candidate.attempt_denominator.len(), 2);
+        assert_eq!(candidate.rival_mechanisms.len(), 2);
+        assert_eq!(candidate.experiment_alternatives.len(), 1);
+        assert_eq!(candidate.experiments_considered, 1);
+    }
+
+    // WORK_UNIT_CASE: 675/44
+    #[test]
+    fn case_44_canonical_sets_are_sorted_but_causal_sequences_are_preserved() {
+        let mut unsorted_product = test_product();
+        unsorted_product.evidence_refs = ["ev-2".to_owned(), "ev-1".to_owned()].to_vec();
+        let result = run_fixture(
+            &unsorted_product,
+            &test_discriminator(),
+            &test_repairs(),
+            &test_conflict(),
+            &test_rivals(),
+            &[test_experiment()],
+            &test_policy(),
+        );
+        assert!(matches!(result, Err(super::DiagnosisError::Order { .. })));
+
+        let mut second = test_experiment();
+        second.experiment_id = "exp-2".to_owned();
+        let ordered = run_fixture(
+            &test_product(),
+            &test_discriminator(),
+            &test_repairs(),
+            &test_conflict(),
+            &test_rivals(),
+            &[test_experiment(), second.clone()],
+            &test_policy(),
+        )
+        .expect("declared experiment order is retained");
+        let reversed = run_fixture(
+            &test_product(),
+            &test_discriminator(),
+            &test_repairs(),
+            &test_conflict(),
+            &test_rivals(),
+            &[second, test_experiment()],
+            &test_policy(),
+        )
+        .expect("reversed experiment order remains bounded");
+        assert_eq!(ordered.experiment_alternatives[0].experiment_id, "exp-1");
+        assert_eq!(reversed.experiment_alternatives[0].experiment_id, "exp-2");
+        assert_ne!(ordered.candidate_digest, reversed.candidate_digest);
+    }
+
+    // WORK_UNIT_CASE: 675/46
+    #[test]
+    fn case_46_malformed_bounded_input_is_panic_free() {
+        let result = std::panic::catch_unwind(|| {
+            let mut rivals = test_rivals();
+            rivals[0].predicted_observations =
+                vec!["bounded prediction".to_owned(); super::MAX_PREDICTIONS + 1];
+            run_fixture(
+                &test_product(),
+                &test_discriminator(),
+                &test_repairs(),
+                &test_conflict(),
+                &rivals,
+                &[test_experiment()],
+                &test_policy(),
+            )
+        });
+        assert!(result.is_ok());
+        assert!(result.expect("panic-free result").is_err());
+    }
+
+    // WORK_UNIT_CASE: 675/47
+    #[test]
+    fn case_47_live_rivals_need_prediction_and_support_or_unknown() {
+        let mut rival = test_rival("rival-a", "observable confirmation remains absent");
+        rival.support_refs.clear();
+        rival.unknown_refs.clear();
+        let candidate = run_fixture(
+            &test_product(),
+            &test_discriminator(),
+            &test_repairs(),
+            &test_conflict(),
+            &[rival],
+            &[test_experiment()],
+            &test_policy(),
+        )
+        .expect("unsupported rival becomes a rejection candidate");
+        assert_eq!(candidate.outcome, DiagnosisOutcome::Rejected);
+    }
+
+    // WORK_UNIT_CASE: 675/48
+    #[test]
+    fn case_48_every_recommended_experiment_has_a_discriminating_purpose() {
+        let candidate = run_valid();
+        let selected = candidate
+            .recommended_experiment
+            .as_ref()
+            .expect("valid fixture has a recommendation");
+        assert_ne!(selected.primary_rival, selected.secondary_rival);
+
+        let identical = [
+            test_rival("rival-a", "same prediction"),
+            test_rival("rival-b", "same prediction"),
+        ]
+        .to_vec();
+        let mut resolving = test_experiment();
+        resolving.resolves_assumption = Some("assumption-load-holds".to_owned());
+        let resolved = run_fixture(
+            &test_product(),
+            &test_discriminator(),
+            &test_repairs(),
+            &test_conflict(),
+            &identical,
+            &[resolving],
+            &test_policy(),
+        )
+        .expect("assumption-resolving recommendation remains qualified");
+        assert!(resolved.recommended_experiment.is_some());
+    }
+
+    // WORK_UNIT_CASE: 675/49
+    #[test]
+    fn case_49_removing_objective_or_discriminator_invalidates_diagnosis() {
+        let mut product = test_product();
+        product.objective_id.clear();
+        let result = run_fixture(
+            &product,
+            &test_discriminator(),
+            &test_repairs(),
+            &test_conflict(),
+            &test_rivals(),
+            &[test_experiment()],
+            &test_policy(),
+        );
+        assert!(matches!(result, Err(super::DiagnosisError::Shape { .. })));
+
+        let mut discriminator = test_discriminator();
+        discriminator.discriminator_id.clear();
+        let result = run_fixture(
+            &test_product(),
+            &discriminator,
+            &test_repairs(),
+            &test_conflict(),
+            &test_rivals(),
+            &[test_experiment()],
+            &test_policy(),
+        );
+        assert!(matches!(result, Err(super::DiagnosisError::Bounds { .. })));
+    }
+
+    // WORK_UNIT_CASE: 675/50
+    #[test]
+    fn case_50_equivalent_repair_cannot_be_recommended_without_new_information() {
+        let mut repairs = test_repairs();
+        repairs.expected_attempt_ids.push("att-3".to_owned());
+        repairs
+            .attempts
+            .push(test_attempt("att-3", &"a".repeat(64)));
+        let candidate = run_fixture(
+            &test_product(),
+            &test_discriminator(),
+            &repairs,
+            &test_conflict(),
+            &test_rivals(),
+            &[test_experiment()],
+            &test_policy(),
+        )
+        .expect("equivalent retry is a mechanism-review candidate");
+        assert_eq!(candidate.outcome, DiagnosisOutcome::MechanismReviewRequired);
+        assert!(candidate.recommended_experiment.is_none());
+    }
+
+    // WORK_UNIT_CASE: 675/51
+    #[test]
+    fn case_51_source_guard_excludes_runtime_and_concrete_peer_surfaces() {
+        let source = include_str!("lib.rs");
+        for forbidden in [
+            ["std", "::process"].concat(),
+            ["tokio", "::"].concat(),
+            ["reqwest", "::"].concat(),
+            ["Command", "::new"].concat(),
+            ["create", "_work_unit("].concat(),
+            ["promote", "_to_production"].concat(),
+        ] {
+            assert!(
+                !source.contains(&forbidden),
+                "forbidden surface: {forbidden}"
+            );
+        }
+        assert!(source.contains("#![forbid(unsafe_code)]"));
+        let manifest = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"));
+        assert!(!manifest.contains("eliot-dreamer-development-diagnosis ="));
     }
 }

@@ -23,14 +23,18 @@ use eliot_agent_coordinator::{
 };
 use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence, sha256_hex};
 use eliot_evaluation_contracts::BudgetEvidence;
+use eliot_governor::{
+    CapabilityEvidenceRecord, CapabilitySource, CapabilityStatus, RouteScopeFingerprint,
+};
 use eliot_security_contracts::PrivacyClass;
 use eliotd::{
     ActivationAuthorityPort, ActivationEvidence, AdmissionAuthorityPort, AgentFabric,
     AttemptLifecycle, AttemptResultRecord, COORDINATOR_CRATE, CancellationLifecycle, DispatchAck,
     DispatchEgressPort, DispatchIntent, FABRIC_CAPACITY_IDENTITY, FABRIC_CAPACITY_REVISION,
-    FabricAdmission, FabricError, FabricPorts, ModelRegistryPort, PeerChannelPort, PeerMessage,
-    PeerReceipt, Reservation, RouteRequirements, SwarmControlPort, SwarmDefinition,
-    SwarmEntryReceipt, WorkerAck, daemon_coordinator_config, plan_candidate, prereq_ports,
+    FabricAdmission, FabricError, FabricPorts, GovernorCapabilityAdmission, ModelRegistryPort,
+    PeerChannelPort, PeerMessage, PeerReceipt, Reservation, RouteRequirements, SwarmControlPort,
+    SwarmDefinition, SwarmEntryReceipt, WorkerAck, daemon_coordinator_config, plan_candidate,
+    prereq_ports,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -182,6 +186,37 @@ fn test_requirements() -> RouteRequirements {
         role: "role-1".to_owned(),
         competence: vec!["rust".to_owned()],
     }
+}
+
+// Issue #1957: the daemon route gate consults the held capability admission
+// on the observed scope. Helpers below mint that scope plus an admission
+// holding fresh probe evidence for the `rust` competence above.
+const EVIDENCE_NOW: u64 = 10;
+
+fn test_evidence_scope() -> RouteScopeFingerprint {
+    RouteScopeFingerprint {
+        runtime_hash: Some("fabric-runtime-1".to_owned()),
+        adapter_hash: Some("fabric-adapter-1".to_owned()),
+        os_architecture: Some("x86_64-windows".to_owned()),
+        auth_profile_class: Some("user-broker".to_owned()),
+        provider_model_route: Some("provider-fabric-a/model-fabric-a/fixture-account".to_owned()),
+        feature_flags_and_serializer: Some("fabric-serializer-1".to_owned()),
+    }
+}
+
+fn test_evidence_admitted() -> TestResult<GovernorCapabilityAdmission> {
+    let mut admission = GovernorCapabilityAdmission::new();
+    admission.insert(
+        CapabilityEvidenceRecord::verified(
+            "rust",
+            CapabilityStatus::ProbePassed,
+            CapabilitySource::ActiveProbe,
+            test_evidence_scope(),
+            1,
+        )
+        .map_err(|error| format!("probe evidence: {error}"))?,
+    );
+    Ok(admission)
 }
 
 fn manifest_source(relative: &str) -> TestResult<String> {
@@ -1025,7 +1060,12 @@ fn model_route_comes_from_integrated_registry() -> TestResult {
         EgressMode::Ack,
         false,
     )?;
-    let resolved = world.fabric.require_model_route(&test_requirements())?;
+    let resolved = world.fabric.require_model_route(
+        &test_requirements(),
+        &test_evidence_admitted()?,
+        &test_evidence_scope(),
+        EVIDENCE_NOW,
+    )?;
     assert_eq!(resolved, route);
     assert_eq!(counter_value(&world.registry.calls), 1);
     assert!(
@@ -1047,7 +1087,12 @@ fn no_eligible_route_yields_typed_outcome() -> TestResult {
         EgressMode::Ack,
         false,
     )?;
-    match world.fabric.require_model_route(&test_requirements()) {
+    match world.fabric.require_model_route(
+        &test_requirements(),
+        &GovernorCapabilityAdmission::new(),
+        &test_evidence_scope(),
+        EVIDENCE_NOW,
+    ) {
         Err(FabricError::NoRoute(_)) => {}
         other => return Err(format!("no route must be typed, got {other:?}").into()),
     }
@@ -1058,6 +1103,63 @@ fn no_eligible_route_yields_typed_outcome() -> TestResult {
             .ledger_events()
             .contains(&"dispatch_built".to_owned())
     );
+    Ok(())
+}
+
+// WORK_UNIT_CASE: 872/14b — issue #1957: a resolved route still requires
+// fresh capability evidence for every competence item before it may
+// execute. An empty admission and a declared-only (legacy) admission both
+// deny with the typed NoRoute outcome; resolution itself still ran first.
+#[test]
+fn resolved_route_without_capability_evidence_is_denied() -> TestResult {
+    use eliot_config::legacy_capability_import::{
+        LegacyCapabilityDeclaration, LegacyScopeFingerprint, import_legacy_declaration,
+    };
+    use eliot_governor::CapabilityRegistry;
+
+    let route = test_route()?;
+    let empty = GovernorCapabilityAdmission::new();
+    let mut declared_only = GovernorCapabilityAdmission::new();
+    let imported = import_legacy_declaration(&LegacyCapabilityDeclaration {
+        skill_id: "rust".to_owned(),
+        scope: LegacyScopeFingerprint::default(),
+    })
+    .map_err(|error| format!("legacy import: {error}"))?;
+    let mut declared_registry = CapabilityRegistry::new();
+    declared_registry.insert(CapabilityEvidenceRecord::from(&imported));
+    for record in declared_registry.records() {
+        declared_only.insert(record.clone());
+    }
+    assert!(!empty.admit_production_route("rust", &test_evidence_scope(), EVIDENCE_NOW));
+    assert!(!declared_only.admit_production_route("rust", &test_evidence_scope(), EVIDENCE_NOW));
+
+    for admission in [&empty, &declared_only] {
+        let mut world = test_world(
+            Some(route.clone()),
+            AdmitMode::Admit,
+            ActivateMode::Activate,
+            EgressMode::Ack,
+            false,
+        )?;
+        match world.fabric.require_model_route(
+            &test_requirements(),
+            admission,
+            &test_evidence_scope(),
+            EVIDENCE_NOW,
+        ) {
+            Err(FabricError::NoRoute(_)) => {}
+            other => return Err(format!("unevidenced route must be denied, got {other:?}").into()),
+        }
+        // Resolution ran (candidate-only); the evidence gate denied the
+        // requirement afterwards.
+        assert_eq!(counter_value(&world.registry.calls), 1);
+        assert!(
+            world
+                .fabric
+                .ledger_events()
+                .contains(&"model_route_resolved".to_owned())
+        );
+    }
     Ok(())
 }
 
@@ -1537,7 +1639,12 @@ fn full_request_to_dispatch_ledger_with_denial_loss_replay() -> TestResult {
     let fence = test_fence()?;
     let request = test_request(&fence, &route, "candidate-872-28")?;
     let (definition, candidate) = world.fabric.define_and_plan(request)?;
-    let resolved = world.fabric.require_model_route(&test_requirements())?;
+    let resolved = world.fabric.require_model_route(
+        &test_requirements(),
+        &test_evidence_admitted()?,
+        &test_evidence_scope(),
+        EVIDENCE_NOW,
+    )?;
     assert_eq!(resolved, route);
     let peer_receipt = world.fabric.deliver_peer(&PeerMessage {
         message_id: "msg-872-28".to_owned(),
@@ -1674,9 +1781,7 @@ fn work_class_threads_through_definition_reservation_admission_and_dispatch() ->
         let (definition, _candidate) = world.fabric.define_and_plan(request)?;
         assert_eq!(definition.work_class, expected);
         assert_eq!(definition.work_class.as_wire_str(), *class);
-        let reservation = world
-            .fabric
-            .stage_reservation(&definition.definition_id)?;
+        let reservation = world.fabric.stage_reservation(&definition.definition_id)?;
         assert_eq!(reservation.work_class, expected);
         let admission = world.fabric.commit_admission(&reservation.reservation_id)?;
         assert_eq!(admission.work_class, expected);
@@ -1717,10 +1822,14 @@ fn work_class_unknown_rejects_before_launch_without_capacity() -> TestResult {
         other => return Err(format!("unknown class must reject typed, got {other:?}").into()),
     }
     // The same rejection fires at serde ingress for a request-shaped payload.
-    let mut tampered = serde_json::to_value(&request).map_err(|error| format!("encode: {error}"))?;
+    let mut tampered =
+        serde_json::to_value(&request).map_err(|error| format!("encode: {error}"))?;
     tampered["work_class"] = serde_json::json!("proton");
     let decoded: Result<StaffingPlanRequest, _> = serde_json::from_value(tampered);
-    let message = decoded.err().map(|error| error.to_string()).unwrap_or_default();
+    let message = decoded
+        .err()
+        .map(|error| error.to_string())
+        .unwrap_or_default();
     assert!(
         message.contains("unknown work class: proton"),
         "decode must reject unknown class, got {message:?}"

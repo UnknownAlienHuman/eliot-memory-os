@@ -1411,7 +1411,7 @@ fn testd_material_bytes(
 /// `native_worker_lifecycle_route::NATIVE_WORKER_CLAIM_OPERATION`): the
 /// material carries the request/receipt projection, while the record stays
 /// the durable authority for reconcile.
-fn native_worker_material_bytes(
+pub fn native_worker_material_bytes(
     request: &NativeWorkerClaimRequest,
     receipt: &NativeWorkerClaimReceipt,
     epoch: &EpochId,
@@ -1419,6 +1419,17 @@ fn native_worker_material_bytes(
     nonce: &str,
     grant: &DispatchGrant,
 ) -> Result<Vec<u8>, DispatchLaunchError> {
+    // The child-side 1911 contract consumes these exact operation names. The
+    // Kernel is the only owner of the admitted claim/fence/grant projection;
+    // it does not import the worker binary or duplicate its validator.
+    const WORKER_ENVELOPE_OPS: [&str; 5] = [
+        "register",
+        "claim",
+        "reconcile",
+        "start_claimed",
+        "serve_stdio",
+    ];
+
     // Bind to the existing claim vocabulary without inventing a parallel
     // one: the lifecycle route owns `native_worker.claim`, and ORS owns the
     // record. Referencing the operation here keeps the dispatch seam on the
@@ -1428,6 +1439,66 @@ fn native_worker_material_bytes(
         crate::native_worker_lifecycle_route::NATIVE_WORKER_CLAIM_OPERATION,
         "native_worker.claim"
     );
+    if request.authority_epoch != epoch.clone()
+        || request.state_fence.authority_epoch != epoch.clone()
+        || receipt.authority_epoch != epoch.clone()
+    {
+        return Err(DispatchLaunchError::Inconsistent(
+            "native action envelope authority epoch is not the live admitted epoch".to_owned(),
+        ));
+    }
+    let derivation = native_worker_dispatch_derivation(
+        request.claim_id.as_str(),
+        request.operation_id.as_str(),
+        request.worker_generation,
+        epoch,
+        nonce,
+    )?;
+    let action_envelopes = WORKER_ENVELOPE_OPS
+        .into_iter()
+        .map(|operation| {
+            let envelope = serde_json::json!({
+                "operation": operation,
+                "intent": format!(
+                    "present the admitted native-worker {operation} operation"
+                ),
+                "scope_ref": request.work_scope_id,
+                "preconditions": format!(
+                    "claim admission, executable join, exact fence, and dispatch grant {} are live",
+                    grant.grant_digest
+                ),
+                "expected_effect": format!(
+                    "one bounded {operation} presentation answered by receipt {}",
+                    receipt.receipt_digest
+                ),
+                "invariants":
+                    "the claim fence and authority epoch remain exact; unknown outcomes reconcile by identity",
+                "known_failures":
+                    "missing, stale, mismatched, expired, or owner-rejected admission",
+                "rollback_or_compensation":
+                    "retain the exact claim and receipt for reconciliation; never replay an unknown effect",
+                "verifier": "unknown:post-effect verifier is owned outside Kernel dispatch",
+                "stop_condition":
+                    "stop on any claim, fence, grant, or owner-verdict mismatch",
+                "state_fence": request.state_fence,
+                "authority_epoch": epoch,
+                "tool_profile": operation,
+                "affected_resources": [format!("native-worker-operation:{operation}")],
+                "applicable_authority": derivation.authority_id,
+            });
+            let envelope_json = serde_json::to_string(&envelope)
+                .map_err(|error| DispatchLaunchError::Io(error.to_string()))?;
+            if envelope_json.is_empty() || envelope_json.len() > 16 * 1024 {
+                return Err(DispatchLaunchError::Io(
+                    "native action envelope exceeds the bounded carrier limit".to_owned(),
+                ));
+            }
+            Ok(serde_json::json!({
+                "operation": operation,
+                "envelope_json": envelope_json,
+            }))
+        })
+        .collect::<Result<Vec<_>, DispatchLaunchError>>()?;
     let body = serde_json::json!({
         "request": request,
         "receipt": receipt,
@@ -1435,6 +1506,7 @@ fn native_worker_material_bytes(
         "generation": generation,
         "nonce": nonce,
         "grant": grant,
+        "action_envelopes": action_envelopes,
     });
     let bytes =
         serde_json::to_vec(&body).map_err(|error| DispatchLaunchError::Io(error.to_string()))?;
@@ -4930,10 +5002,92 @@ mod tests {
             "generation",
             "nonce",
             "grant",
+            "action_envelopes",
         ] {
             assert!(
                 native_object.contains_key(key),
                 "native material carries {key}"
+            );
+        }
+        let action_envelopes = native_object["action_envelopes"]
+            .as_array()
+            .expect("native action-envelope carrier array");
+        assert_eq!(action_envelopes.len(), 5);
+        for operation in [
+            "register",
+            "claim",
+            "reconcile",
+            "start_claimed",
+            "serve_stdio",
+        ] {
+            let carrier = action_envelopes
+                .iter()
+                .find(|carrier| carrier["operation"] == operation)
+                .expect("operation carrier");
+            let envelope: serde_json::Value = serde_json::from_str(
+                carrier["envelope_json"]
+                    .as_str()
+                    .expect("carrier envelope JSON"),
+            )
+            .expect("action envelope JSON");
+            let expected_fields = [
+                "operation",
+                "intent",
+                "scope_ref",
+                "preconditions",
+                "expected_effect",
+                "invariants",
+                "known_failures",
+                "rollback_or_compensation",
+                "verifier",
+                "stop_condition",
+                "state_fence",
+                "authority_epoch",
+                "tool_profile",
+                "affected_resources",
+                "applicable_authority",
+            ];
+            let envelope_object = envelope
+                .as_object()
+                .expect("closed governed action envelope object");
+            assert_eq!(
+                envelope_object.len(),
+                expected_fields.len(),
+                "Kernel carrier must use the exact closed core envelope shape"
+            );
+            for field in expected_fields {
+                assert!(
+                    envelope_object.contains_key(field),
+                    "Kernel carrier envelope contains required field {field}"
+                );
+            }
+            assert_eq!(envelope["operation"], operation);
+            assert_eq!(envelope["scope_ref"], native_request.work_scope_id);
+            assert_eq!(
+                envelope["authority_epoch"],
+                serde_json::to_value(&epoch).expect("epoch JSON")
+            );
+            assert_eq!(
+                envelope["state_fence"],
+                serde_json::to_value(&native_request.state_fence).expect("fence JSON")
+            );
+            assert_eq!(
+                envelope["applicable_authority"],
+                native_worker_dispatch_derivation(
+                    &native_request.claim_id,
+                    &native_request.operation_id,
+                    native_request.worker_generation,
+                    &epoch,
+                    &native_ready.nonce,
+                )
+                .expect("authority derivation")
+                .authority_id
+            );
+            assert!(
+                envelope["verifier"]
+                    .as_str()
+                    .is_some_and(|value| value.starts_with("unknown:")),
+                "Kernel does not invent a post-effect verifier"
             );
         }
         let native_grant: DispatchGrant =

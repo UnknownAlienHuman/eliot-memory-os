@@ -1,0 +1,105 @@
+{
+  "issue": 883,
+  "disposition": "remove-unused-clone",
+  "disposition_note": "MemoryStore has no Clone impl; independent models reuse MemoryStore::new construction plus MemoryStore::snapshot value projection. Absent-Clone proof is source-guarded in the harness.",
+  "cases": [
+    {
+      "id": "883/1",
+      "title": "absent Clone impl is source-guarded",
+      "kind": "absent_clone_source_guard",
+      "params": {},
+      "expect": "no_impl_clone_for_memory_store"
+    },
+    {
+      "id": "883/2",
+      "title": "fresh construction yields canonically empty snapshot",
+      "kind": "fresh_construction_empty",
+      "params": {},
+      "expect": "empty_snapshot"
+    },
+    {
+      "id": "883/3",
+      "title": "snapshot reads are deterministic without intervening writes",
+      "kind": "snapshot_determinism",
+      "params": {},
+      "expect": "equal_snapshots"
+    },
+    {
+      "id": "883/4",
+      "title": "snapshot is a value projection detached from the store",
+      "kind": "snapshot_value_projection",
+      "params": {},
+      "expect": "mutating_projection_leaves_store_unchanged"
+    },
+    {
+      "id": "883/5",
+      "title": "two independently constructed stores start equal",
+      "kind": "construction_equality",
+      "params": {},
+      "expect": "equal_snapshots"
+    },
+    {
+      "id": "883/6",
+      "title": "isolation left-to-right via construction plus snapshot",
+      "kind": "isolation_left_to_right",
+      "params": { "operation": "op-883-6", "subject": "subject-883-6" },
+      "expect": "right_unchanged"
+    },
+    {
+      "id": "883/7",
+      "title": "isolation right-to-left via construction plus snapshot",
+      "kind": "isolation_right_to_left",
+      "params": { "operation": "op-883-7", "subject": "subject-883-7" },
+      "expect": "left_unchanged"
+    },
+    {
+      "id": "883/8",
+      "title": "snapshot comparison detects asymmetric divergence",
+      "kind": "divergence_detection",
+      "params": { "operation": "op-883-8", "subject": "subject-883-8" },
+      "expect": "snapshots_differ_after_one_write"
+    },
+    {
+      "id": "883/9",
+      "title": "snapshot carries receipt, projection, and outbox after a write",
+      "kind": "projection_completeness",
+      "params": { "operation": "op-883-9", "subject": "subject-883-9" },
+      "expect": "one_receipt_one_projection_one_outbox"
+    },
+    {
+      "id": "883/10",
+      "title": "Default construction matches new construction",
+      "kind": "default_ctor_equivalence",
+      "params": {},
+      "expect": "equal_snapshots"
+    },
+    {
+      "id": "883/11",
+      "title": "snapshot is fallible with a typed Unavailable failure",
+      "kind": "snapshot_typed_failure",
+      "params": {},
+      "expect": "typed_unavailable_variant"
+    },
+    {
+      "id": "883/12",
+      "title": "seeded capture subject lands in the named-operation projection",
+      "kind": "seeded_capture_subject",
+      "params": { "operation": "op-883-12", "subject": "subject-883-12" },
+      "expect": "named_operation_subject_matches"
+    },
+    {
+      "id": "883/13",
+      "title": "no Arc, shared-state, or global contour in the memory store",
+      "kind": "no_shared_state_source_guard",
+      "params": {},
+      "expect": "no_arc_no_global"
+    },
+    {
+      "id": "883/14",
+      "title": "doc contract names snapshot as the Clone replacement",
+      "kind": "doc_contract_guard",
+      "params": {},
+      "expect": "doc_names_snapshot_not_clone"
+    }
+  ]
+}

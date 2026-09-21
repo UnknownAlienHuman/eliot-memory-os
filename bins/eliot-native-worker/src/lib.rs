@@ -9,9 +9,10 @@
 use std::io::{self, Read, Write};
 
 use eliot_native_worker_core::{
-    CapabilityAdmissionPort, ClaimAdmissionRequest, DurableCheckpointPort, DurableReplayPort,
-    NativeWorkerClaim, NativeWorkerRegistration, ReadinessSubmission, WorkerCore, WorkerError,
-    WorkerEventEnvelope, WorkerFrame, WorkerHello, WorkerLifecycle, WorkerReady,
+    ActionEnvelopeCarrier, CapabilityAdmissionPort, ClaimAdmissionRequest, DurableCheckpointPort,
+    DurableReplayPort, NativeWorkerClaim, NativeWorkerRegistration, ReadinessSubmission,
+    WorkerCore, WorkerError, WorkerEventEnvelope, WorkerFrame, WorkerHello, WorkerLifecycle,
+    WorkerReady,
 };
 use eliot_process::{ProcessExecutor, ProcessRequest};
 use serde::{Deserialize, Serialize};
@@ -27,6 +28,11 @@ mod kernel_admission_client;
 /// the same module instead of compiling a second copy via `#[path]`, which
 /// would fork the types and void the proof.
 pub mod adapter_registry;
+
+/// Governed action envelope for declared external-adapter operations
+/// (issue #1911, A10.1/A10.2/A10.3/A10.8). Added here so the `tests/`
+/// contract proof addresses the identical gate the contour drives.
+pub mod governed_action;
 
 pub use dispatch_authority::{
     NativeWorkerDispatchAuthority, ValidatedDispatchGrant, now_unix_ms as dispatch_now_unix_ms,
@@ -246,6 +252,43 @@ where
         write_frame_to(&WorkerResponse { events }, writer)?;
         Ok(shutdown)
     }
+
+    /// Serves the stdio loop behind the governed gate (issue #1911).
+    ///
+    /// Admits the [`GOVERNED_SERVE_OP`] envelope before the reader thread
+    /// starts: a missing, malformed, mismatched, stale, or invalid envelope
+    /// refuses with no frame read and no response written. Returns the
+    /// validated action provenance; the loop receipt is loop termination.
+    pub async fn serve_stdio_governed(
+        &mut self,
+        carriers: &[ActionEnvelopeCarrier],
+        state_fence: &serde_json::Value,
+        authority_epoch: &serde_json::Value,
+    ) -> Result<Vec<governed_action::ValidatedAction>, NativeWorkerError> {
+        let actions =
+            admit_product_envelopes(&[GOVERNED_SERVE_OP], carriers, state_fence, authority_epoch)?;
+        self.serve_stdio().await?;
+        Ok(actions)
+    }
+
+    /// Serves exactly one frame behind the governed gate (issue #1911).
+    ///
+    /// Testable stdio dispatch boundary: admits the [`GOVERNED_SERVE_OP`]
+    /// envelope BEFORE reading, then delegates to [`Self::serve_one_frame`].
+    /// Refusal leaves the writer empty and the reader unconsumed.
+    pub async fn serve_one_frame_governed<Reader: Read, Writer: Write>(
+        &mut self,
+        reader: &mut Reader,
+        writer: &mut Writer,
+        carriers: &[ActionEnvelopeCarrier],
+        state_fence: &serde_json::Value,
+        authority_epoch: &serde_json::Value,
+    ) -> Result<(Vec<governed_action::ValidatedAction>, bool), NativeWorkerError> {
+        let actions =
+            admit_product_envelopes(&[GOVERNED_SERVE_OP], carriers, state_fence, authority_epoch)?;
+        let shutdown = self.serve_one_frame(reader, writer).await?;
+        Ok((actions, shutdown))
+    }
 }
 
 /// Thin lifecycle transport for the admitted driver.
@@ -387,6 +430,203 @@ where
         .await?;
     lifecycle.submit_readiness(readiness)?;
     Ok(ready)
+}
+
+/// Governed entry for one driven external-adapter operation sequence
+/// (issue #1911, A10.1/A10.2/A10.3/A10.8).
+///
+/// The proven gate ([`governed_action::require_governed_op`]) runs BEFORE the
+/// product drive: a missing envelope, an envelope bound to another operation,
+/// or an invalid envelope refuses with the standardized typed rejection
+/// (mapped to [`NativeWorkerError::KernelAdmissionRequired`]) without
+/// invoking the drive closure. An admitted envelope flows through as the
+/// validated action the drive binds, and the drive receipt propagates
+/// unchanged. Production supplies the [`drive_admitted_claimed`] sequence as
+/// the drive closure; the contour owner adopts this entry at the binary
+/// call site once the envelope source is plumbed (no wire source exists yet).
+// The typed refusal travels by value so the repair shape stays readable.
+#[allow(
+    clippy::result_large_err,
+    reason = "typed refusal surface is matched by value on purpose"
+)]
+pub async fn drive_governed_claimed<Drive, Fut>(
+    operation: &str,
+    envelope: Option<&governed_action::ActionEnvelope>,
+    drive: Drive,
+) -> Result<
+    (
+        governed_action::ValidatedAction,
+        eliot_native_worker_core::WorkerReady,
+    ),
+    NativeWorkerError,
+>
+where
+    Drive: FnOnce(governed_action::ValidatedAction) -> Fut,
+    Fut: std::future::Future<
+            Output = Result<eliot_native_worker_core::WorkerReady, NativeWorkerError>,
+        >,
+{
+    let validated = governed_action::require_governed_op(envelope, operation)?;
+    let receipt = drive(validated.clone()).await?;
+    Ok((validated, receipt))
+}
+
+/// Driven operations gated per step by the governed drive entry, in product
+/// execution order: register, claim, reconcile, then `start_claimed`.
+/// `serve_stdio` is gated separately at the stdio dispatch path.
+pub const GOVERNED_DRIVE_OPS: [&str; 4] = ["register", "claim", "reconcile", "start_claimed"];
+/// Operation gated at the stdio dispatch path.
+pub const GOVERNED_SERVE_OP: &str = "serve_stdio";
+
+/// Admits one driven operation set against carried envelopes (issue #1911).
+///
+/// For every required operation, in order: a carrier must be presented
+/// (missing), its bytes must decode to the closed envelope (malformed), the
+/// decoded operation must name the required operation (mismatched), and the
+/// decoded State Fence plus Authority Epoch must equal the admitted
+/// material's fence and epoch (stale). The full governed gate
+/// ([`governed_action::require_governed_op`]) then admits each envelope. The
+/// returned validated actions preserve the action/contract provenance the
+/// drive pairs with its receipt. Pure projection: no lifecycle submit, no
+/// process start, no durable state.
+pub fn admit_product_envelopes(
+    operations: &[&str],
+    carriers: &[ActionEnvelopeCarrier],
+    state_fence: &serde_json::Value,
+    authority_epoch: &serde_json::Value,
+) -> Result<Vec<governed_action::ValidatedAction>, NativeWorkerError> {
+    fn refuse(operation: &str, reason: String) -> NativeWorkerError {
+        NativeWorkerError::KernelAdmissionRequired(
+            governed_action::ActionRejection {
+                operation: operation.to_owned(),
+                reason,
+                preserved_state: format!(
+                    "no adapter invoked for '{operation}'; prior registration/claim state unchanged"
+                ),
+                retryable: true,
+                retry_status:
+                    "retryable: resubmit the drive with authority-bound envelopes".to_owned(),
+                required_authority: format!(
+                    "authority-bound action envelope for '{operation}' (WorkScope, State Fence, Authority Epoch, applicable authority)"
+                ),
+                required_repair:
+                    "attach a carrier per driven operation with matching fence/epoch".to_owned(),
+                allowed_next_action: format!(
+                    "submit the drive with a valid envelope for '{operation}'"
+                ),
+            }
+            .to_string(),
+        )
+    }
+    let mut admitted = Vec::with_capacity(operations.len());
+    for operation in operations {
+        let Some(carrier) = carriers.iter().find(|c| c.operation == *operation) else {
+            return Err(refuse(
+                operation,
+                format!(
+                    "driven op '{operation}' requires a presented action envelope; none was carried"
+                ),
+            ));
+        };
+        carrier.validate_shape().map_err(|error| {
+            refuse(
+                operation,
+                format!("carried envelope for '{operation}' is malformed: {error}"),
+            )
+        })?;
+        let envelope: governed_action::ActionEnvelope =
+            serde_json::from_str(&carrier.envelope_json).map_err(|error| {
+                refuse(
+                    operation,
+                    format!(
+                        "carried envelope for '{operation}' is not a closed envelope: {}",
+                        truncate_text(&error.to_string(), 128),
+                    ),
+                )
+            })?;
+        if envelope.operation != *operation {
+            return Err(refuse(
+                operation,
+                format!(
+                    "carried envelope binds '{}' but '{operation}' was required",
+                    envelope.operation
+                ),
+            ));
+        }
+        if envelope.state_fence != *state_fence || envelope.authority_epoch != *authority_epoch {
+            return Err(refuse(
+                operation,
+                format!(
+                    "carried envelope for '{operation}' is stale: State Fence/epoch does not match the admitted material"
+                ),
+            ));
+        }
+        let validated = governed_action::require_governed_op(Some(&envelope), operation)
+            .map_err(NativeWorkerError::from)?;
+        admitted.push(validated);
+    }
+    Ok(admitted)
+}
+
+/// Truncates diagnostic text to a bound; presenter bytes never flow raw into errors.
+fn truncate_text(value: &str, limit: usize) -> String {
+    value.chars().take(limit).collect()
+}
+
+/// Drives one admitted generation behind the governed gate (issue #1911).
+///
+/// Admits every [`GOVERNED_DRIVE_OPS`] envelope against the material's fence
+/// and epoch BEFORE the first lifecycle submit, then runs the exact
+/// [`drive_admitted_claimed`] sequence. A missing, malformed, mismatched,
+/// stale, or invalid envelope refuses with zero submits and zero starts.
+/// Returns the validated action provenance paired with the drive receipt.
+pub async fn drive_governed_material<E, A, R, C, L>(
+    lifecycle: &mut L,
+    worker: &mut NativeWorker<E, A, R, C>,
+    material: &admitted_material::ValidatedAdmittedMaterial,
+    process: ProcessRequest,
+) -> Result<
+    (
+        Vec<governed_action::ValidatedAction>,
+        eliot_native_worker_core::WorkerReady,
+    ),
+    NativeWorkerError,
+>
+where
+    E: ProcessExecutor,
+    A: CapabilityAdmissionPort,
+    R: DurableReplayPort,
+    C: DurableCheckpointPort,
+    L: AdmittedLifecycle,
+{
+    let fence = serde_json::to_value(&material.hello.state_fence).map_err(|_| {
+        NativeWorkerError::KernelAdmissionRequired(
+            "admitted fence is not projectable to the governed gate".to_owned(),
+        )
+    })?;
+    let epoch = serde_json::to_value(&material.hello.authority_epoch).map_err(|_| {
+        NativeWorkerError::KernelAdmissionRequired(
+            "admitted epoch is not projectable to the governed gate".to_owned(),
+        )
+    })?;
+    let actions = admit_product_envelopes(
+        &GOVERNED_DRIVE_OPS,
+        &material.action_envelopes,
+        &fence,
+        &epoch,
+    )?;
+    let ready = drive_admitted_claimed(
+        lifecycle,
+        worker,
+        material.admission.registration(),
+        &material.admission,
+        material.hello.clone(),
+        process,
+        &material.reconcile,
+        &material.readiness,
+    )
+    .await?;
+    Ok((actions, ready))
 }
 
 /// Admitted factory-resolution seam (T9-07, issue #874; supersedes PR #1125).
@@ -1028,7 +1268,8 @@ pub mod admitted_material {
     use std::path::{Path, PathBuf};
 
     use eliot_native_worker_core::{
-        ClaimAdmissionRequest, NativeWorkerClaim, ReadinessSubmission, WorkerHello,
+        ActionEnvelopeCarrier, ClaimAdmissionRequest, NativeWorkerClaim, ReadinessSubmission,
+        WorkerHello,
     };
     use serde::{Deserialize, Serialize};
 
@@ -1080,6 +1321,12 @@ pub mod admitted_material {
         /// I7.5 session nonce; must equal the presented hello launch nonce
         /// (and the v2 executable-join launch nonce when present).
         pub nonce: String,
+        /// Governed action envelope carriers, at most one per driven
+        /// operation (issue #1911). Absent on legacy files (`default` keeps
+        /// old bytes readable) — the governed drive then refuses with the
+        /// missing-envelope negative instead of driving.
+        #[serde(default)]
+        pub action_envelopes: Vec<ActionEnvelopeCarrier>,
     }
 
     /// Session-bound claim material validated against itself.
@@ -1117,6 +1364,10 @@ pub mod admitted_material {
         /// Feeds the canonical intent derivation; the executor re-hashes the
         /// file before any start.
         pub worker_artifact_digest: String,
+        /// Governed action envelope carriers validated at parse time
+        /// (shape only). The governed drive decodes and enforces them
+        /// before any lifecycle submit or process start.
+        pub action_envelopes: Vec<ActionEnvelopeCarrier>,
     }
 
     /// Typed failure for the dispatch-file read. Every variant is fail-closed:
@@ -1301,6 +1552,13 @@ pub mod admitted_material {
         envelope.reconcile.validate().map_err(|error| {
             AdmittedMaterialError::Contract(truncate_detail(&error.to_string()))
         })?;
+        for carrier in &envelope.action_envelopes {
+            carrier.validate_shape().map_err(|error| {
+                AdmittedMaterialError::Contract(format!(
+                    "admitted action envelope carrier is malformed: {error}"
+                ))
+            })?;
+        }
         require_same_claim("reconcile", envelope.reconcile.claim(), claim)?;
         let now = now_unix_ms()?;
         envelope.readiness.validate_binding(now).map_err(|error| {
@@ -1321,6 +1579,7 @@ pub mod admitted_material {
             grant: None,
             kernel_nonce: None,
             worker_artifact_digest,
+            action_envelopes: envelope.action_envelopes,
         })
     }
 
@@ -1413,6 +1672,11 @@ pub mod admitted_material {
         nonce: String,
         /// Shared launch grant funding the in-child one-shot permit.
         grant: KernelGrantFile,
+        /// Governed action envelope carriers (issue #1911). Absent on files
+        /// written before the Kernel dispatch population (default) — the
+        /// governed drive then refuses with the missing-envelope negative.
+        #[serde(default)]
+        action_envelopes: Vec<ActionEnvelopeCarrier>,
     }
 
     /// Closed mirror of the shared `DispatchGrant`.
@@ -1835,6 +2099,13 @@ pub mod admitted_material {
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default()
             .to_owned();
+        for carrier in &file.action_envelopes {
+            carrier.validate_shape().map_err(|error| {
+                AdmittedMaterialError::Contract(format!(
+                    "kernel file action envelope carrier is malformed: {error}"
+                ))
+            })?;
+        }
         Ok(ValidatedAdmittedMaterial {
             admission,
             hello,
@@ -1844,6 +2115,10 @@ pub mod admitted_material {
             grant: Some(validated_grant),
             kernel_nonce: Some(file.nonce),
             worker_artifact_digest,
+            // Kernel-path carriers arrive with the Kernel dispatch file
+            // population (see the 2251 kernel handoff); absent files keep
+            // the missing-envelope refusal at the governed drive.
+            action_envelopes: file.action_envelopes,
         })
     }
 
@@ -2173,6 +2448,207 @@ mod tests {
         assert_eq!(
             hex_bytes(&sha256_bytes(input)),
             eliot_contracts::sha256_hex(input)
+        );
+    }
+
+    fn action_fence() -> serde_json::Value {
+        serde_json::json!({
+            "epoch": {"lineage_id": "550e8400-e29b-41d4-a716-446655440000", "sequence": 1},
+            "generation": 1,
+        })
+    }
+
+    fn action_epoch() -> serde_json::Value {
+        serde_json::json!({
+            "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+            "sequence": 1,
+        })
+    }
+
+    fn action_carrier(
+        carrier_op: &str,
+        envelope_op: &str,
+        fence: &serde_json::Value,
+        epoch: &serde_json::Value,
+    ) -> ActionEnvelopeCarrier {
+        let envelope = serde_json::json!({
+            "operation": envelope_op,
+            "intent": format!("execute governed {envelope_op}"),
+            "scope_ref": "scope-1911",
+            "preconditions": "claim admitted; fence live",
+            "expected_effect": format!("bounded {envelope_op} effect"),
+            "invariants": "no ambient effects",
+            "known_failures": "stale fence",
+            "rollback_or_compensation": "reconcile retained receipt",
+            "verifier": "verifier-1911",
+            "stop_condition": "stop on fence mismatch",
+            "state_fence": fence,
+            "authority_epoch": epoch,
+            "tool_profile": envelope_op,
+            "affected_resources": ["external-adapter"],
+            "applicable_authority": format!("kernel-authority-for-{envelope_op}"),
+        });
+        ActionEnvelopeCarrier {
+            operation: carrier_op.to_owned(),
+            envelope_json: envelope.to_string(),
+        }
+    }
+
+    fn drive_carriers(
+        fence: &serde_json::Value,
+        epoch: &serde_json::Value,
+    ) -> Vec<ActionEnvelopeCarrier> {
+        GOVERNED_DRIVE_OPS
+            .iter()
+            .map(|operation| action_carrier(operation, operation, fence, epoch))
+            .collect()
+    }
+
+    fn denial_detail(error: NativeWorkerError) -> String {
+        match error {
+            NativeWorkerError::KernelAdmissionRequired(detail) => detail,
+            other => panic!("expected the contour denial, got {other:?}"),
+        }
+    }
+
+    fn expect_denial(
+        result: Result<Vec<governed_action::ValidatedAction>, NativeWorkerError>,
+        what: &str,
+    ) -> String {
+        match result {
+            Ok(_) => panic!("{what} must refuse"),
+            Err(error) => denial_detail(error),
+        }
+    }
+
+    #[test]
+    fn product_envelopes_admit_per_op_with_provenance() {
+        let fence = action_fence();
+        let epoch = action_epoch();
+        let actions = admit_product_envelopes(
+            &GOVERNED_DRIVE_OPS,
+            &drive_carriers(&fence, &epoch),
+            &fence,
+            &epoch,
+        )
+        .unwrap_or_else(|error| panic!("valid carriers must admit: {error:?}"));
+        assert_eq!(actions.len(), GOVERNED_DRIVE_OPS.len());
+        for (action, operation) in actions.iter().zip(GOVERNED_DRIVE_OPS.iter()) {
+            assert_eq!(&action.operation, operation);
+            assert_eq!(action.impact, governed_action::ImpactClass::Material);
+            assert_eq!(action.verifier, "verifier-1911");
+        }
+        let serve = admit_product_envelopes(
+            &[GOVERNED_SERVE_OP],
+            &[action_carrier(
+                GOVERNED_SERVE_OP,
+                GOVERNED_SERVE_OP,
+                &fence,
+                &epoch,
+            )],
+            &fence,
+            &epoch,
+        )
+        .unwrap_or_else(|error| panic!("serve carrier must admit: {error:?}"));
+        assert_eq!(serve.len(), 1);
+        assert_eq!(serve[0].operation, GOVERNED_SERVE_OP);
+    }
+
+    #[test]
+    fn product_envelopes_refuse_missing_mismatched_stale_or_malformed() {
+        let fence = action_fence();
+        let epoch = action_epoch();
+        // Missing: no carrier for the first driven op.
+        let detail = expect_denial(
+            admit_product_envelopes(&GOVERNED_DRIVE_OPS, &[], &fence, &epoch),
+            "empty carriers",
+        );
+        assert!(
+            detail.contains("requires a presented action envelope") && detail.contains("register"),
+            "missing envelope names the op, got {detail}"
+        );
+        // Mismatched: carrier operation and decoded operation disagree.
+        let detail = expect_denial(
+            admit_product_envelopes(
+                &GOVERNED_DRIVE_OPS,
+                &[action_carrier("register", "claim", &fence, &epoch)],
+                &fence,
+                &epoch,
+            ),
+            "operation disagreement",
+        );
+        assert!(
+            detail.contains("binds 'claim'"),
+            "mismatch names the bound op, got {detail}"
+        );
+        // Stale fence: envelope minted for another fence.
+        let stale_fence = serde_json::json!({"epoch": {"lineage_id": "550e8400-e29b-41d4-a716-446655440000", "sequence": 2}, "generation": 1});
+        let detail = expect_denial(
+            admit_product_envelopes(
+                &GOVERNED_DRIVE_OPS,
+                &[action_carrier("register", "register", &stale_fence, &epoch)],
+                &fence,
+                &epoch,
+            ),
+            "stale fence",
+        );
+        assert!(
+            detail.contains("stale"),
+            "stale fence is named, got {detail}"
+        );
+        // Stale epoch: envelope minted for another epoch.
+        let stale_epoch = serde_json::json!({
+            "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+            "sequence": 9,
+        });
+        let detail = expect_denial(
+            admit_product_envelopes(
+                &GOVERNED_DRIVE_OPS,
+                &[action_carrier("register", "register", &fence, &stale_epoch)],
+                &fence,
+                &epoch,
+            ),
+            "stale epoch",
+        );
+        assert!(
+            detail.contains("stale"),
+            "stale epoch is named, got {detail}"
+        );
+        // Malformed carrier shape: empty bytes never decode. (A blank
+        // operation name cannot match any driven op, so it refuses as
+        // missing before shape is even reached.)
+        let detail = expect_denial(
+            admit_product_envelopes(
+                &GOVERNED_DRIVE_OPS,
+                &[ActionEnvelopeCarrier {
+                    operation: "register".to_owned(),
+                    envelope_json: String::new(),
+                }],
+                &fence,
+                &epoch,
+            ),
+            "empty carrier bytes",
+        );
+        assert!(
+            detail.contains("malformed"),
+            "malformed carrier is named, got {detail}"
+        );
+        // Undecodable bytes: not a closed envelope.
+        let detail = expect_denial(
+            admit_product_envelopes(
+                &GOVERNED_DRIVE_OPS,
+                &[ActionEnvelopeCarrier {
+                    operation: "register".to_owned(),
+                    envelope_json: "not json".to_owned(),
+                }],
+                &fence,
+                &epoch,
+            ),
+            "undecodable bytes",
+        );
+        assert!(
+            detail.contains("not a closed envelope"),
+            "undecodable bytes are named, got {detail}"
         );
     }
 }

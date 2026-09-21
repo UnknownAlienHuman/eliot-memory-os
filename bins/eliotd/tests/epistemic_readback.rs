@@ -12,8 +12,8 @@
 //! `crates/storage/eliot-store-surreal-adapter/tests/epistemic_revision.rs::real_position_cas_exact_replay_and_receipt_readback`
 //! (re-run on this base as the real-Surreal proof) and against the reference
 //! handler by `crates/storage/eliot-store-memory/src/epistemic_tests.rs`.
-//! This file proves the daemon half with the same closed types: the 17-entry
-//! catalogue (10 reads + 6 mutations + genesis), the CEP `position` selector,
+//! This file proves the daemon half with the same closed types: the 20-entry
+//! catalogue (11 reads + 8 mutations + genesis), the CEP `position` selector,
 //! the `ApplyEpistemicRevision` closed payload requirement (admitted) versus
 //! `RecordAuthorityRevocation` (still unactivated), the `IdentityConflict`
 //! without-second-revision disposition, and the exact daemon wiring types
@@ -24,9 +24,9 @@
 use std::collections::BTreeMap;
 
 use eliot_store_api::{
-    NamedMutationOperation, NamedReadOperation, StoreError, StoreFailure,
-    StoreFailureDisposition, StoreFailureIdentityContext, StoreMutationDisposition,
-    generated_operation_manifests, operation_manifest_set_digest,
+    NamedMutationOperation, NamedReadOperation, StoreError, StoreFailure, StoreFailureDisposition,
+    StoreFailureIdentityContext, StoreMutationDisposition, generated_operation_manifests,
+    operation_manifest_set_digest,
 };
 use serde_json::{Value, json};
 
@@ -58,8 +58,7 @@ fn test_fence() -> TestResult<eliot_store_api::StateFence> {
     let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
         .map_err(|error| format!("test lineage: {error}"))?;
     let sequence = NonZeroU64::new(1).ok_or("nonzero test sequence")?;
-    let epoch =
-        EpochId::new(lineage, sequence).map_err(|error| format!("test epoch: {error}"))?;
+    let epoch = EpochId::new(lineage, sequence).map_err(|error| format!("test epoch: {error}"))?;
     Ok(eliot_store_api::StateFence::new(
         epoch,
         ResourceGeneration::genesis(),
@@ -69,19 +68,37 @@ fn test_fence() -> TestResult<eliot_store_api::StateFence> {
 #[test]
 fn catalogue_activates_position_read_and_revision_write() -> TestResult {
     let entries = generated_operation_manifests().map_err(|error| format!("catalogue: {error}"))?;
-    assert_eq!(entries.len(), 17, "10 reads + 6 mutations + genesis");
+    // Denominator bound to the producer declaration tables in
+    // `crates/storage/eliot-store-api/src/operation_catalogue.rs`: 11
+    // activated reads + 8 activated mutations (the eighth mutation is
+    // `ApplyNotificationState` and the eleventh read is
+    // `GetNotificationState`, both admitted by #1780 with handler, schema,
+    // and consumer triple; the seventh mutation remains `ApplyErasure`,
+    // admitted by #1712/PR #1987; the store owner's own count tests in
+    // `crates/storage/eliot-store-api/tests/operation_manifest_catalogue.rs`
+    // already assert 20) + the genesis bootstrap entry. Exact equality: a
+    // silent add or drop must fail here, never pass on a bound.
+    assert_eq!(entries.len(), 20, "11 reads + 8 mutations + genesis");
     let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
     assert!(names.contains(&"GetCurrentEpistemicPosition"));
     assert!(names.contains(&"ApplyEpistemicRevision"));
     assert!(names.contains(&"UpdateTaskState"));
     assert!(names.contains(&"GetEvidencePack"));
+    // The admitted catalogue growth since the 18-entry bound is exactly the
+    // #1780 notification pair — bound here so a different silent add still
+    // fails on the count above.
+    assert!(names.contains(&"GetNotificationState"));
+    assert!(names.contains(&"ApplyNotificationState"));
     let set_digest =
         operation_manifest_set_digest(&entries).map_err(|error| format!("digest: {error}"))?;
     let regenerated =
         generated_operation_manifests().map_err(|error| format!("regenerate: {error}"))?;
     let again =
         operation_manifest_set_digest(&regenerated).map_err(|error| format!("digest: {error}"))?;
-    assert_eq!(set_digest, again, "identical catalogue binds the same digest");
+    assert_eq!(
+        set_digest, again,
+        "identical catalogue binds the same digest"
+    );
     Ok(())
 }
 
@@ -130,7 +147,10 @@ fn position_read_requires_its_closed_selector() -> TestResult {
     )?;
     assert!(matches!(
         unscoped.validate_against_catalogue(&entries),
-        Err(StoreError::InvalidField { field: "scope_id", .. })
+        Err(StoreError::InvalidField {
+            field: "scope_id",
+            ..
+        })
     ));
     Ok(())
 }

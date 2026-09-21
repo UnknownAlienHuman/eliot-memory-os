@@ -27,9 +27,10 @@
 //!
 //! Non-admission is an explicit [`AdmissionDisposition`]: absent evidence
 //! blocks, stale evidence defers, ambiguous evidence requires authority,
-//! degraded evidence caps at observe-only, and broken/unsupported evidence
-//! blocks. `broken`/`unsupported` on the exact fingerprint overrides declared
-//! proof, per I3.4.
+//! degraded evidence caps at observe-only, and fresh broken/unsupported
+//! evidence blocks. Stale broken/unsupported records are superseded by
+//! requalification instead of vetoing it. `broken`/`unsupported` on the exact
+//! fingerprint overrides declared proof, per I3.4.
 //!
 //! Delegation boundary (delegate, never copy):
 //!
@@ -43,7 +44,54 @@
 //! Like the neighboring admission joins, this helper never mints admission: it
 //! evaluates presented evidence and returns a disposition.
 
+use std::collections::BTreeSet;
+
+use eliot_agent_api::AttemptId;
 use eliot_agent_api::RouteFingerprint;
+use eliot_agent_coordinator::{HumanModelPreferencePolicy, ModelRole};
+
+use crate::route_receipts::{
+    ActualRouteReceipt, GovernorRouteAttempt, RouteReceiptError, RuntimeObservedFacts,
+};
+
+/// Canonical required capability set for one model invoke (R2, I1.11 step 9).
+///
+/// Union of the Task Controller launch intent (`required_competence`,
+/// owner-enforced non-empty by the coordinator plan) and the explicit Human
+/// Dreamer-role preference (`required_capabilities`, owner-validated text),
+/// sorted for determinism. Both inputs arrive owner-shaped and
+/// caller-threaded per call; this function unites them without defaulting,
+/// inferring, or narrowing: an empty union — or any blank or
+/// control-bearing name, which would otherwise narrow the set and widen
+/// admission — fails closed as `None`, never an empty admit.
+#[must_use]
+pub fn canonical_required_set(
+    launch_competence: &[String],
+    policy: &HumanModelPreferencePolicy,
+) -> Option<Vec<String>> {
+    let mut required = BTreeSet::new();
+    for item in launch_competence {
+        required.insert(item.clone());
+    }
+    for preference in policy
+        .roles
+        .iter()
+        .filter(|preference| preference.role == ModelRole::Dreamer)
+    {
+        for capability in &preference.required_capabilities {
+            required.insert(capability.clone());
+        }
+    }
+    if required.is_empty() {
+        return None;
+    }
+    for name in &required {
+        if name.trim().is_empty() || name.chars().any(char::is_control) {
+            return None;
+        }
+    }
+    Some(required.into_iter().collect())
+}
 
 /// Capability evidence standing, mirroring the I3.4
 /// `CapabilityEvidenceRecord.status` vocabulary.
@@ -193,7 +241,7 @@ impl AdmissionOutcome {
 /// Evaluates one production admission request against threaded evidence.
 ///
 /// Order is load-bearing: malformed requests block first, then absent scope
-/// evidence blocks, then `broken`/`unsupported` on the exact fingerprint
+/// evidence blocks, then fresh `broken`/`unsupported` on the exact fingerprint
 /// blocks (overriding declared proof), then fresh `probe_passed`/`observed`
 /// evidence admits toward the critical join, then conflicting fresh evidence
 /// requires authority, then fresh `degraded` caps at observe-only, then stale
@@ -230,6 +278,65 @@ pub fn evaluate_production_admission(
     check_critical(request, static_attestation, pulse)
 }
 
+/// Evidence bundle threaded per admission call.
+///
+/// Durable reads stay with their owners; the caller threads already-observed
+/// records, one static attestation, and one pulse per call, so a refresh
+/// surfaces as an exact mismatch instead of silent divergence.
+#[derive(Clone, Debug)]
+pub struct ProductionEvidenceBundle<'a> {
+    /// Capability evidence records observed for the requested route.
+    pub records: &'a [CapabilityEvidenceRecord],
+    /// Static attestation bound to the exact fingerprint, if any.
+    pub static_attestation: Option<&'a StaticCapabilityAttestation>,
+    /// Dynamic pulse observed at the requested generation, if any.
+    pub pulse: Option<&'a DynamicCapabilityPulse>,
+}
+
+/// Production route admission decision: the funnel outcome plus the Governor
+/// attempt receipt recording requested versus observed routing.
+///
+/// The receipt is minted for admitted and denied attempts alike so blocked
+/// production work stays visible exactly where it happened. Visibility never
+/// implies admission: only [`AdmissionOutcome::admitted`] admits.
+#[derive(Clone, Debug)]
+pub struct RouteAdmissionDecision {
+    /// The funnel disposition for the requested operation.
+    pub outcome: AdmissionOutcome,
+    /// Attempt receipt binding the requested route to the observed route.
+    pub attempt: GovernorRouteAttempt,
+}
+
+/// Admits one production route and records its attempt receipt.
+///
+/// Composition entry point over the proven funnel and receipt flow: evaluates
+/// [`evaluate_production_admission`] from threaded evidence, then records
+/// [`ActualRouteReceipt::observe`] plus [`GovernorRouteAttempt::new`] for the
+/// same requested route. Malformed routes, observed facts, or attempt linkage
+/// fail closed with [`RouteReceiptError`] before any admission decision is
+/// produced.
+///
+/// # Errors
+///
+/// Returns [`RouteReceiptError`] when the requested route, the observed
+/// facts, or the attempt linkage is malformed.
+pub fn admit_production_route(
+    request: &ProductionAdmissionRequest,
+    evidence: &ProductionEvidenceBundle<'_>,
+    attempt_id: AttemptId,
+    observed_facts: &RuntimeObservedFacts,
+) -> Result<RouteAdmissionDecision, RouteReceiptError> {
+    let receipt = ActualRouteReceipt::observe(request.route.clone(), observed_facts)?;
+    let attempt = GovernorRouteAttempt::new(attempt_id, request.route.clone(), receipt)?;
+    let outcome = evaluate_production_admission(
+        request,
+        evidence.records,
+        evidence.static_attestation,
+        evidence.pulse,
+    );
+    Ok(RouteAdmissionDecision { outcome, attempt })
+}
+
 /// Collects the evidence records scoped to the exact requested capability and
 /// route fingerprint. Records for other capabilities or routes never qualify
 /// and are never generalized across.
@@ -253,11 +360,13 @@ fn is_fresh_at(record: &CapabilityEvidenceRecord, request: &ProductionAdmissionR
 
 /// Evaluates the evidence scope short of the critical join.
 ///
-/// `broken`/`unsupported` on the exact fingerprint blocks first (overriding
-/// declared proof); fresh `probe_passed`/`observed` evidence admits toward the
-/// critical join; conflicting fresh evidence requires authority; fresh
-/// `degraded` caps at observe-only; otherwise stale runtime evidence defers
-/// and declared/unknown intent alone requires authority.
+/// Fresh `broken`/`unsupported` on the exact fingerprint blocks first
+/// (overriding declared proof); stale broken/unsupported records are
+/// superseded fall-through for requalification, never a permanent veto.
+/// Fresh `probe_passed`/`observed` evidence admits toward the critical join;
+/// conflicting fresh evidence requires authority; fresh `degraded` caps at
+/// observe-only; otherwise stale runtime evidence defers and declared/unknown
+/// intent alone requires authority.
 fn check_scope(
     request: &ProductionAdmissionRequest,
     scope: &[&CapabilityEvidenceRecord],
@@ -266,7 +375,7 @@ fn check_scope(
         matches!(
             record.status,
             CapabilityEvidenceStatus::Broken | CapabilityEvidenceStatus::Unsupported
-        )
+        ) && is_fresh_at(record, request)
     }) {
         return AdmissionOutcome::new(
             AdmissionDisposition::Block,
@@ -602,6 +711,42 @@ mod tests {
     }
 
     #[test]
+    fn stale_broken_evidence_does_not_veto_fresh_observation() -> TestResult {
+        let route = test_route()?;
+        let request = test_request(&route, false);
+        // Broken record from a previous generation: superseded once matching
+        // fresh evidence is recorded at the requested generation.
+        let mut superseded = test_record(&route, CapabilityEvidenceStatus::Broken);
+        superseded.generation = TEST_GENERATION - 1;
+        let records = [
+            test_record(&route, CapabilityEvidenceStatus::Observed),
+            superseded,
+        ];
+        let outcome = evaluate_production_admission(&request, &records, None, None);
+        assert_eq!(outcome.disposition, AdmissionDisposition::Admit);
+        assert!(outcome.admitted());
+        // Same for an expired broken record at the requested generation.
+        let mut expired = test_record(&route, CapabilityEvidenceStatus::Broken);
+        expired.expires_at_unix_ms = TEST_NOW;
+        let records = [
+            test_record(&route, CapabilityEvidenceStatus::Observed),
+            expired,
+        ];
+        let outcome = evaluate_production_admission(&request, &records, None, None);
+        assert_eq!(outcome.disposition, AdmissionDisposition::Admit);
+        assert!(outcome.admitted());
+        // A stale broken record alone needs requalification; it does not
+        // block outright.
+        let mut lone = test_record(&route, CapabilityEvidenceStatus::Broken);
+        lone.generation = TEST_GENERATION - 1;
+        let outcome =
+            evaluate_production_admission(&request, std::slice::from_ref(&lone), None, None);
+        assert_eq!(outcome.disposition, AdmissionDisposition::RequireAuthority);
+        assert!(!outcome.admitted());
+        Ok(())
+    }
+
+    #[test]
     fn degraded_evidence_caps_at_observe_only() -> TestResult {
         let route = test_route()?;
         let request = test_request(&route, false);
@@ -626,5 +771,83 @@ mod tests {
         assert_eq!(outcome.disposition, AdmissionDisposition::Block);
         assert!(!outcome.admitted());
         Ok(())
+    }
+
+    fn test_policy_with(caps: &[&str]) -> HumanModelPreferencePolicy {
+        use eliot_agent_coordinator::{
+            BillingClass, MODEL_PREFERENCE_SCHEMA_VERSION, RoleModelPreference,
+        };
+        HumanModelPreferencePolicy {
+            schema_version: MODEL_PREFERENCE_SCHEMA_VERSION.to_owned(),
+            policy_id: "policy-required-set".to_owned(),
+            revision: "policy-rev-1".to_owned(),
+            account_scope: "account-required-set".to_owned(),
+            roles: vec![
+                RoleModelPreference {
+                    role: ModelRole::Dreamer,
+                    preferred: Vec::new(),
+                    denied: Vec::new(),
+                    allowed_billing: BTreeSet::from([BillingClass::Free]),
+                    allow_paid_fallback: false,
+                    allow_degraded_routes: false,
+                    minimum_context_window: 1,
+                    maximum_cost_class: 10,
+                    maximum_latency_class: 10,
+                    required_capabilities: caps.iter().map(|cap| (*cap).to_owned()).collect(),
+                },
+                RoleModelPreference {
+                    role: ModelRole::Worker,
+                    preferred: Vec::new(),
+                    denied: Vec::new(),
+                    allowed_billing: BTreeSet::from([BillingClass::Free]),
+                    allow_paid_fallback: false,
+                    allow_degraded_routes: false,
+                    minimum_context_window: 1,
+                    maximum_cost_class: 10,
+                    maximum_latency_class: 10,
+                    // Worker-role capabilities never leak into the Dreamer
+                    // invoke set.
+                    required_capabilities: BTreeSet::from(["worker-only".to_owned()]),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn canonical_required_set_unites_launch_and_dreamer_policy() {
+        let set = canonical_required_set(
+            &["rust".to_owned(), "route.execute".to_owned()],
+            &test_policy_with(&["telemetry", "rust"]),
+        )
+        .expect("union must produce");
+        assert_eq!(set, vec!["route.execute", "rust", "telemetry"]);
+        // Launch-only and policy-only both produce; duplicates collapse.
+        assert_eq!(
+            canonical_required_set(&["rust".to_owned()], &test_policy_with(&[])),
+            Some(vec!["rust".to_owned()])
+        );
+        assert_eq!(
+            canonical_required_set(&[], &test_policy_with(&["telemetry"])),
+            Some(vec!["telemetry".to_owned()])
+        );
+    }
+
+    #[test]
+    fn canonical_required_set_fails_closed_on_empty_or_malformed() {
+        assert_eq!(
+            canonical_required_set(&[], &test_policy_with(&[])),
+            None,
+            "an empty union never admits"
+        );
+        assert_eq!(
+            canonical_required_set(&["  ".to_owned()], &test_policy_with(&[])),
+            None,
+            "a blank launch item fails the whole set, never narrows it"
+        );
+        assert_eq!(
+            canonical_required_set(&["rust".to_owned()], &test_policy_with(&["ok\u{7}"])),
+            None,
+            "a control-bearing policy item fails the whole set"
+        );
     }
 }

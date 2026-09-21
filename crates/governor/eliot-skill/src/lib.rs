@@ -13,14 +13,41 @@ use std::collections::{BTreeMap, BTreeSet};
 use eliot_contracts::{
     ContractVersion, RequestMetadata, StateFence, canonical_json_bytes, sha256_hex,
 };
-use eliot_skills::RegistrationIdentity;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+pub mod catalogue;
+pub use catalogue::*;
+pub mod install;
+pub use install::{CatalogueInstallContext, install_package, project_package_to_entry};
+
+/// Canonical package-source types consumed at the installation boundary.
+///
+/// Re-exported so the composition owner calls
+/// [`install_package`] without taking a second surface dependency; the types
+/// stay canonical (no duplicates, no bridges).
+pub use eliot_skills::{
+    AdvisoryRuleClaim, CapabilityVersion, ConflictState, DeliveryProjection, DependencyMaterial,
+    DistractorState, FreshnessState, HostLimits, HostProfile, LifecycleProposal,
+    MaterializationInputs, PackageDigests, QuarantineState, RegistrationIdentity, SkillBehavior,
+    SkillCounters, SkillInteractionProjection, SkillPackage, SkillState, ToolDefinitionMaterial,
+    VersionedRequirement,
+};
 
 pub const CONTRACT_NAME: &str = "eliot.governor.skill";
 pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);
 
-fn text(value: &str, field: &'static str) -> Result<(), SkillError> {
+pub mod activation;
+
+pub use activation::{
+    AdherenceCheckpoints, AttemptLifecycleSummary, InstructionConflict, OrderingBasis,
+    SkillActivationStatus, SkillAdherenceStatus, SkillDeliveryStatus,
+    SkillHarnessActivationReceipt, SkillRetrievalStatus, apply_dependency_staleness,
+    changed_dependency_names, derive_attempt_summary, detect_dependency_staleness,
+    material_use_allowed, record_instruction_conflict,
+};
+
+pub(crate) fn text(value: &str, field: &'static str) -> Result<(), SkillError> {
     if value.trim().is_empty() || value.chars().any(char::is_control) {
         return Err(SkillError::InvalidField {
             field,
@@ -30,7 +57,7 @@ fn text(value: &str, field: &'static str) -> Result<(), SkillError> {
     Ok(())
 }
 
-fn digest(value: &str, field: &'static str) -> Result<(), SkillError> {
+pub(crate) fn digest(value: &str, field: &'static str) -> Result<(), SkillError> {
     if value.len() != 64
         || value
             .bytes()
@@ -52,7 +79,7 @@ fn value_digest<T: Serialize>(value: &T) -> Result<String, SkillError> {
     Ok(sha256_hex(&canonical(value)?))
 }
 
-fn unique<T: Ord>(
+pub(crate) fn unique<T: Ord>(
     values: impl IntoIterator<Item = T>,
     field: &'static str,
 ) -> Result<(), SkillError> {
@@ -854,4 +881,24 @@ pub trait SkillLifecycleApi: Send + Sync {
         gate: PromotionGate,
         promoted_view: SkillLifecycleView,
     ) -> Result<eliot_store_api::WriteReceipt, SkillError>;
+
+    /// Builds the activated Skill view for one delivered Skill behind its
+    /// Hotset delivery receipt and applied receiver ack.
+    ///
+    /// The composition adapter executes this against its shared catalogue
+    /// handle: entry usability, receipt self-consistency plus exact catalogue
+    /// bind, applied-ack binding to that exact receipt, delivery coverage,
+    /// and the tool-owner existence check all run inside the catalogue
+    /// boundary. The Governor lifecycle owner carries no installed bodies and
+    /// fails this call closed; the tool owner's production `KnownTools`
+    /// implementation arrives as `&dyn KnownTools` so the object-safe surface
+    /// port can forward it without generics.
+    async fn activation_display(
+        &self,
+        ctx: &RequestMetadata,
+        skill_id: String,
+        receipt: HotsetDeliveryReceipt,
+        ack: HotsetDeliveryAck,
+        tools: &dyn KnownTools,
+    ) -> Result<ActivatedSkillDisplay, SkillError>;
 }
