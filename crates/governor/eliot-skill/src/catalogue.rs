@@ -561,7 +561,10 @@ impl SkillCatalogue {
     /// Builds the activated Skill view. Activation displays the one-line
     /// trigger, the validated body version and digest, budget accounting,
     /// dependency versions, route/profile eligibility, and the binding
-    /// Hotset delivery receipt.
+    /// Hotset delivery receipt. The receipt must bind this exact catalogue
+    /// state: a receipt issued against an older revision is rejected with
+    /// [`SkillError::IdentityMismatch`] rather than displaying an
+    /// undelivered body beside a stale receipt.
     pub fn activation_display(
         &self,
         skill_id: &str,
@@ -576,6 +579,9 @@ impl SkillCatalogue {
             });
         }
         receipt.validate()?;
+        if receipt.catalogue_digest != self.catalogue_digest()? {
+            return Err(SkillError::IdentityMismatch);
+        }
         if !receipt.confirms_delivery(skill_id) {
             return Err(SkillError::InvalidField {
                 field: "delivery.receipt",
@@ -605,8 +611,11 @@ impl SkillCatalogue {
 
 /// Hotset injection delivery receipt (`I7.13`): installed is not delivered.
 /// Binds the exact catalogue digest, the delivered Skill set, and each
-/// delivered body digest. Delivery never implies usefulness or causal
-/// credit; it proves only that the Hotset carried the Skill.
+/// delivered body digest. Delivered ids are stored in sorted order so the
+/// receipt digest is canonical for the set: re-issuing the same delivery in
+/// a different order yields the same receipt. Delivery never implies
+/// usefulness or causal credit; it proves only that the Hotset carried
+/// the Skill.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HotsetDeliveryReceipt {
@@ -651,7 +660,9 @@ impl HotsetDeliveryReceipt {
         check_unique(&delivered_skill_ids, "delivery.delivered_skill_ids")?;
         let catalogue_digest = catalogue.catalogue_digest()?;
         let mut body_digests = BTreeMap::new();
-        for skill_id in &delivered_skill_ids {
+        let mut ordered_ids = delivered_skill_ids;
+        ordered_ids.sort();
+        for skill_id in &ordered_ids {
             let entry = catalogue.get(skill_id).ok_or(SkillError::NotFound)?;
             entry.validate()?;
             if !entry.is_usable() {
@@ -665,7 +676,7 @@ impl HotsetDeliveryReceipt {
         let mut receipt = Self {
             hotset_id,
             catalogue_digest,
-            delivered_skill_ids,
+            delivered_skill_ids: ordered_ids,
             body_digests,
             receipt_digest: String::new(),
         };
@@ -1039,6 +1050,61 @@ mod tests {
             catalogue.get("skill-shared").expect("entry").status,
             SkillStatus::Current
         );
+    }
+
+    #[test]
+    fn stale_receipt_rejected_after_body_revision() {
+        let mut catalogue = catalogue_two();
+        promote_current(&mut catalogue, "skill-alpha");
+        let stale = HotsetDeliveryReceipt::issue(
+            "hotset-old".to_owned(),
+            &catalogue,
+            vec!["skill-alpha".to_owned()],
+        )
+        .expect("old receipt");
+        catalogue
+            .activation_display("skill-alpha", &stale)
+            .expect("display with current receipt");
+        let mut revised = entry("skill-alpha");
+        revised.body = body("skill-alpha", "2.0.0");
+        revised.runtime = runtime("skill-alpha", "2.0.0");
+        catalogue.insert(revised).expect("revised entry");
+        assert!(matches!(
+            catalogue.activation_display("skill-alpha", &stale),
+            Err(SkillError::IdentityMismatch)
+        ));
+        let fresh = HotsetDeliveryReceipt::issue(
+            "hotset-new".to_owned(),
+            &catalogue,
+            vec!["skill-alpha".to_owned()],
+        )
+        .expect("fresh receipt");
+        let display = catalogue
+            .activation_display("skill-alpha", &fresh)
+            .expect("display with fresh receipt");
+        assert_eq!(display.body_version, "2.0.0");
+    }
+
+    #[test]
+    fn delivery_receipt_digest_canonical_for_id_order() {
+        let catalogue = catalogue_two();
+        let first = HotsetDeliveryReceipt::issue(
+            "hotset-order".to_owned(),
+            &catalogue,
+            vec!["skill-beta".to_owned(), "skill-alpha".to_owned()],
+        )
+        .expect("unordered delivery");
+        assert_eq!(
+            first.delivered_skill_ids,
+            vec!["skill-alpha".to_owned(), "skill-beta".to_owned()]
+        );
+        let second = HotsetDeliveryReceipt::issue(
+            "hotset-order".to_owned(),
+            &catalogue,
+            vec!["skill-alpha".to_owned(), "skill-beta".to_owned()],
+        )
+        .expect("ordered delivery");
+        assert_eq!(first.receipt_digest, second.receipt_digest);
     }
 
     #[test]
