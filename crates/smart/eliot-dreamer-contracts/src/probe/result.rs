@@ -13,6 +13,7 @@ use crate::{
     rival::{RivalModelRef, RivalPredictionRef},
 };
 
+use super::objective::{CausalProbeRequirements, ProbeOwnerRef};
 use super::{
     bounds::{
         MAX_PROBE_UPDATES_PER_BRANCH, PROBE_RESULT_SCHEMA_VERSION, check_branches, check_sequence,
@@ -173,6 +174,106 @@ impl ResultUpdate {
     }
 }
 
+/// Per-branch evidence acceptance declaration. It is not an acquired result
+/// or an evidence grade; it states what a later owner must verify.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+pub enum BranchEvidenceAcceptance {
+    Accepted {
+        owner: ProbeOwnerRef,
+        source_refs: BTreeSet<ArtifactId>,
+        coverage: Option<Box<CoverageDenominator>>,
+        verifier: Box<PlannedVerifierRef>,
+    },
+    Partial {
+        reason: String,
+    },
+    Unknown {
+        reason: String,
+    },
+    Rejected {
+        reason: String,
+    },
+}
+
+impl BranchEvidenceAcceptance {
+    pub fn validate(&self) -> Result<(), ContractViolation> {
+        validation::preflight(self)?;
+        match self {
+            Self::Accepted {
+                owner,
+                source_refs,
+                coverage,
+                verifier,
+            } => {
+                match owner {
+                    ProbeOwnerRef::Source { owner } => {
+                        validation::text(owner.as_str(), "probe.result.acceptance.owner")?;
+                    }
+                    ProbeOwnerRef::Verifier { verifier_id } => {
+                        validation::text(verifier_id.as_str(), "probe.result.acceptance.owner")?;
+                    }
+                    ProbeOwnerRef::Unavailable { reason } => {
+                        validation::text(reason, "probe.result.acceptance.owner")?;
+                    }
+                }
+                check_sequence(source_refs.len(), "probe.result.acceptance.source_refs")?;
+                if source_refs.is_empty() && coverage.is_none() {
+                    return Err(ContractViolation::MissingField(
+                        "probe.result.acceptance.source_refs",
+                    ));
+                }
+                for source in source_refs {
+                    validation::text(source.as_str(), "probe.result.acceptance.source_ref")?;
+                }
+                if let Some(coverage) = coverage {
+                    coverage
+                        .validate()
+                        .map_err(|error| ContractViolation::BindingMismatch {
+                            field: "probe.result.acceptance.coverage",
+                            reason: error.to_string(),
+                        })?;
+                }
+                verifier
+                    .validate()
+                    .map_err(|error| ContractViolation::BindingMismatch {
+                        field: "probe.result.acceptance.verifier",
+                        reason: error.to_string(),
+                    })?;
+                Ok(())
+            }
+            Self::Partial { reason } | Self::Unknown { reason } | Self::Rejected { reason } => {
+                validation::text(reason, "probe.result.acceptance.reason")
+            }
+        }
+    }
+
+    pub fn is_ready(&self) -> bool {
+        matches!(self, Self::Accepted { .. })
+    }
+}
+
+/// Acceptance and causal controls for one named result branch.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ResultBranchAcceptance {
+    pub result_id: ArtifactId,
+    pub evidence: BranchEvidenceAcceptance,
+    pub causal: Option<CausalProbeRequirements>,
+}
+
+impl ResultBranchAcceptance {
+    pub fn validate(&self) -> Result<(), ContractViolation> {
+        validation::preflight(self)?;
+        validation::text(self.result_id.as_str(), "probe.result.acceptance.result_id")?;
+        self.evidence.validate()?;
+        if let Some(causal) = &self.causal {
+            causal.validate()?;
+        }
+        Ok(())
+    }
+}
+
 /// One ordered result branch. Every branch must cover every target in the
 /// enclosing schema denominator exactly once.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -212,6 +313,8 @@ pub struct PossibleResultSchema {
     /// Exact target denominator shared by every ordered branch.
     pub targets: Vec<ResultTarget>,
     pub branches: Vec<ResultBranch>,
+    /// Exact acceptance and causal contract for each possible branch.
+    pub branch_acceptance: Vec<ResultBranchAcceptance>,
     pub digest: String,
 }
 
@@ -226,6 +329,30 @@ impl PossibleResultSchema {
             result_schema_id,
             targets,
             branches,
+            branch_acceptance: Vec::new(),
+            digest: String::new(),
+        };
+        validation::preflight(&schema)?;
+        schema.validate_shape()?;
+        schema.digest = schema.compute_digest()?;
+        Ok(schema)
+    }
+
+    /// Constructs a schema with one explicit acceptance row per branch. The
+    /// legacy constructor remains valid for compatibility, but the planner
+    /// will not mark a schema without these rows ready.
+    pub fn new_with_acceptance(
+        result_schema_id: ArtifactId,
+        targets: Vec<ResultTarget>,
+        branches: Vec<ResultBranch>,
+        branch_acceptance: Vec<ResultBranchAcceptance>,
+    ) -> Result<Self, ContractViolation> {
+        let mut schema = Self {
+            schema_version: PROBE_RESULT_SCHEMA_VERSION,
+            result_schema_id,
+            targets,
+            branches,
+            branch_acceptance,
             digest: String::new(),
         };
         validation::preflight(&schema)?;
@@ -255,6 +382,7 @@ impl PossibleResultSchema {
             &self.result_schema_id,
             &self.targets,
             &self.branches,
+            &self.branch_acceptance,
         ))
     }
 
@@ -369,6 +497,31 @@ impl PossibleResultSchema {
                     reason: "branch must cover every declared result target exactly once"
                         .to_owned(),
                 });
+            }
+        }
+        if !self.branch_acceptance.is_empty() {
+            if self.branch_acceptance.len() != self.branches.len() {
+                return Err(ContractViolation::BindingMismatch {
+                    field: "probe.result_schema.branch_acceptance",
+                    reason: "acceptance must cover every result branch exactly once".to_owned(),
+                });
+            }
+            let branch_ids: BTreeSet<_> = self
+                .branches
+                .iter()
+                .map(|branch| branch.result_id.clone())
+                .collect();
+            let mut acceptance_ids = BTreeSet::new();
+            for acceptance in &self.branch_acceptance {
+                acceptance.validate()?;
+                if !branch_ids.contains(&acceptance.result_id)
+                    || !acceptance_ids.insert(acceptance.result_id.clone())
+                {
+                    return Err(ContractViolation::BindingMismatch {
+                        field: "probe.result_schema.branch_acceptance",
+                        reason: "acceptance row does not map one-to-one to a branch".to_owned(),
+                    });
+                }
             }
         }
         Ok(())

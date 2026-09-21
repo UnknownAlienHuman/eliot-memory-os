@@ -16,6 +16,8 @@
 //! branch-update equivalence or causal/material relevance judgment exists
 //! here.
 
+mod support;
+
 use std::num::NonZeroU64;
 
 use eliot_dreamer_contracts::{
@@ -24,8 +26,8 @@ use eliot_dreamer_contracts::{
     FeasibilityDimension, GapUpdateMeaning, HumanAttentionDimension, InformationDimension,
     InquiryAffordanceDescriptor, InquiryAffordanceDescriptorParams, InquiryAffordanceSet,
     InquiryAffordanceSetParams, LatencyDimension, PossibleResultSchema, PossibleResultValue,
-    PrivacyDimension, ProbeObjectiveRef, ProbeOwnerRef, ResourceDimension, ResultBranch,
-    ResultTarget, ResultUpdate, ResultUpdateDiscriminability, ReversibilityDimension,
+    PrivacyDimension, ProbeObjectiveRef, ProbeOrderingPolicy, ProbeOwnerRef, ResourceDimension,
+    ResultBranch, ResultTarget, ResultUpdate, ResultUpdateDiscriminability, ReversibilityDimension,
     RivalCoverageStatus, RivalCoverageSummary, RivalDeclarationSetRef, RivalModelSet,
     RivalModelSetParams, ValidatedDreamDraft, ValidationReceipt,
     grounding::canonical::{
@@ -181,11 +183,11 @@ fn gap_schema(
             }],
         })
         .collect();
-    must(PossibleResultSchema::new(
-        artifact(schema_id),
+    support::schema_with_acceptance(
+        schema_id,
         vec![ResultTarget::Gap { objective: target }],
         branches,
-    ))
+    )
 }
 
 fn descriptor_params(id: &str, target: AffordanceTarget) -> InquiryAffordanceDescriptorParams {
@@ -248,7 +250,12 @@ fn descriptor_with_schema(
 ) -> InquiryAffordanceDescriptor {
     let mut params = descriptor_params(id, target);
     params.result_schema = schema;
-    must(InquiryAffordanceDescriptor::new(params))
+    let target = params.target.clone();
+    let descriptor = must(InquiryAffordanceDescriptor::new(params));
+    match support::ready_semantics(&target) {
+        Some(semantics) => must(descriptor.with_planning_semantics(semantics)),
+        None => descriptor,
+    }
 }
 
 fn affordance_set(descriptors: Vec<InquiryAffordanceDescriptor>) -> InquiryAffordanceSet {
@@ -277,12 +284,17 @@ fn limits(candidates: Option<u64>) -> BudgetLimits {
     }
 }
 
+fn ordering_policy() -> ProbeOrderingPolicy {
+    must(ProbeOrderingPolicy::v1())
+}
+
 fn plan_for(descriptors: Vec<InquiryAffordanceDescriptor>, candidates: Option<u64>) -> ProbePlan {
     let bundle = bundle();
     let draft = draft();
     let rivals = rivals();
     let affordances = affordance_set(descriptors);
     let limits = limits(candidates);
+    let policy = ordering_policy();
     must(ProbePlan::new(ProbePlanParams {
         plan_id: artifact("plan-1"),
         bundle: &bundle,
@@ -290,6 +302,7 @@ fn plan_for(descriptors: Vec<InquiryAffordanceDescriptor>, candidates: Option<u6
         rivals: &rivals,
         affordances: &affordances,
         limits: &limits,
+        policy: &policy,
     }))
 }
 
