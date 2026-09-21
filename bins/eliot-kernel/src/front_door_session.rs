@@ -403,6 +403,19 @@ impl KernelComposition {
             // policy inside; nothing client-asserted becomes authority.
             return self.bind_native_worker_session(connection_id, peer, client);
         }
+        if client.module_bridge_identity != ACTIVE_DAEMON_CALLER
+            && !self
+                .startup_coordinator
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?
+                .admit_inspection()
+        {
+            // Control requests are decoded before this session path and keep
+            // the bootstrap/probe route available. The daemon handshake and
+            // the one-shot worker routes likewise remain available because
+            // they establish the evidence needed to publish step 10.
+            return Err(TransportError::SessionFenced);
+        }
         let policy = self
             .front_door_policy
             .lock()

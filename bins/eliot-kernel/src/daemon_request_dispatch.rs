@@ -775,6 +775,9 @@ impl KernelComposition {
                 ));
             }
         }
+        if let Some(rejection) = self.normal_write_admission_response() {
+            return Ok(rejection);
+        }
         let gateway = self.retained_store_gateway()?;
         match gateway
             .apply(
@@ -999,6 +1002,16 @@ impl KernelComposition {
             .ok_or(TransportError::SessionFenced)
     }
 
+    /// Returns the existing store-error projection when startup has not
+    /// admitted normal canonical writes. This is deliberately kept directly
+    /// before the retained gateway call in `apply_prepared`, so a fenced
+    /// request cannot enter the Store backend.
+    fn normal_write_admission_response(&self) -> Option<serde_json::Value> {
+        self.admit_normal_write()
+            .err()
+            .map(|error| Self::store_error_response_text("write_receipt", &error.to_string()))
+    }
+
     fn store_error_response_text(kind: &str, error: &str) -> serde_json::Value {
         let status = if error == StoreError::MissingReceiptEnvelope.to_string() {
             "unknown"
@@ -1010,6 +1023,45 @@ impl KernelComposition {
             "value": { "kind": kind, "value": null },
             "recovery": null,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apply_prepared_admission_rejects_before_backend_entry() {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-kernel-apply-prepared-gate-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("test work root");
+        let kernel = KernelComposition::new(KernelConfig::new(&root)).expect("kernel composition");
+        let mut backend_called = false;
+        let response = match kernel.normal_write_admission_response() {
+            Some(response) => response,
+            None => {
+                backend_called = true;
+                serde_json::Value::Null
+            }
+        };
+
+        assert!(
+            !backend_called,
+            "startup gate must fence before Store entry"
+        );
+        assert_eq!(response["status"], "error");
+        assert_eq!(response["value"]["kind"], "write_receipt");
+        assert_eq!(
+            kernel
+                .startup_status(GovernanceProfile::minimal())
+                .blocking_prerequisite,
+            Some("epoch-recovery")
+        );
+
+        drop(kernel);
+        let _ = std::fs::remove_dir_all(root);
     }
 }
 

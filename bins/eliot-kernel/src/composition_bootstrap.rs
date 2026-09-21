@@ -1024,24 +1024,17 @@ impl KernelComposition {
         let store_handoff_init = None;
         #[cfg(windows)]
         let agent_activation_results = Self::rehydrate_agent_activation_results(&ors)?;
-        // Implements #1967: seed the ordered I1.11 startup coordinator.
-        // Composition construction proves steps 1-4 (Host binding validated,
-        // Kernel started, ORS opened with Generation Registry recovery, blob
-        // manifest validated). Steps 5-11 stay open until their live probes,
-        // reconciliations, handshakes, and supervision evidence complete, so
-        // normal writes and Material authority remain capped at low-impact.
+        // Implements #1967: start the ordered I1.11 coordinator at step zero.
+        // Composition construction alone does not prove Host-owned startup,
+        // Blob manifest, Store readiness, reconciliation, handshake, mirror,
+        // capability, front-door, or supervision evidence. Each later step is
+        // advanced only by its owning live probe/publication boundary.
         let startup_coordinator = {
-            let mut coordinator = StartupCoordinator::new();
-            for step in 1..=4_u8 {
-                coordinator
-                    .complete_step(step)
-                    .map_err(KernelBuildError::Service)?;
-            }
             observe_entrypoint_with_detail(
                 EntrypointStage::Composition,
-                "kernel.composition.startup_sequence_initiated:step=4",
+                "kernel.composition.startup_sequence_initiated:step=0",
             );
-            Mutex::new(coordinator)
+            Mutex::new(StartupCoordinator::new())
         };
         // F-LOG-KERNEL-2 (#899): constructed composition is not ready. The
         // service starts Cold, the daemon is NotLaunched, and no Store

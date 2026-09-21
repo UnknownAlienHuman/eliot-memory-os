@@ -349,12 +349,12 @@ impl StartupCoordinator {
     /// First incomplete mandatory prerequisite in canonical order.
     #[must_use]
     pub const fn blocking_prerequisite(&self) -> Option<StartupPrerequisite> {
-        if !self.ors_reconciled {
-            Some(StartupPrerequisite::OrsReconciliation)
+        if !self.epoch_recovered {
+            Some(StartupPrerequisite::EpochRecovery)
         } else if !self.store_schema_probed {
             Some(StartupPrerequisite::StoreSchemaProbe)
-        } else if !self.epoch_recovered {
-            Some(StartupPrerequisite::EpochRecovery)
+        } else if !self.ors_reconciled {
+            Some(StartupPrerequisite::OrsReconciliation)
         } else if !self.supervision_evidence_complete {
             Some(StartupPrerequisite::SupervisionEvidence)
         } else {
@@ -407,11 +407,12 @@ impl StartupCoordinator {
         }
     }
 
-    /// Inspection is always allowed where front-door policy allows it;
-    /// startup gates never fence inspection itself.
+    /// Inspection is admitted only after I1.11 step 10 publishes front-door
+    /// readiness; control-plane bootstrap and evidence-producing worker routes
+    /// are admitted by their dedicated boundaries.
     #[must_use]
     pub const fn admit_inspection(&self) -> bool {
-        true
+        self.is_front_door_ready()
     }
 
     /// Normal canonical-write admission. Rejects with the named unmet
@@ -556,26 +557,26 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_startup_rejects_write_and_material_but_allows_inspection() {
+    fn incomplete_startup_rejects_write_and_material_and_inspection() {
         let coordinator = coordinator_at_step(4);
-        assert!(coordinator.admit_inspection());
+        assert!(!coordinator.admit_inspection());
         let write = coordinator
             .admit_normal_write()
-            .expect_err("normal write must fail before step 6");
+            .expect_err("normal write must fail before step 5");
         assert_eq!(
             write.prerequisite_name(),
-            "ors-reconciliation",
+            "store-schema-probe",
             "rejection must name the unmet prerequisite, got: {write}",
         );
         let material = coordinator
             .admit_material_authority(GovernanceProfile::full())
-            .expect_err("material must fail before step 6");
-        assert_eq!(material.prerequisite_name(), "ors-reconciliation");
+            .expect_err("material must fail before step 5");
+        assert_eq!(material.prerequisite_name(), "store-schema-probe");
         let status = coordinator.startup_status(GovernanceProfile::full());
         assert_eq!(status.completed_step, 4);
         assert_eq!(
             status.blocking_prerequisite,
-            Some("ors-reconciliation"),
+            Some("store-schema-probe"),
             "status must report the blocking prerequisite",
         );
         assert_eq!(status.authority_ceiling, "low-impact");
@@ -587,9 +588,9 @@ mod tests {
         let mut full = coordinator_at_step(11);
         assert!(full.admit_normal_write().is_ok());
         for gate in [
-            StartupPrerequisite::OrsReconciliation,
-            StartupPrerequisite::StoreSchemaProbe,
             StartupPrerequisite::EpochRecovery,
+            StartupPrerequisite::StoreSchemaProbe,
+            StartupPrerequisite::OrsReconciliation,
             StartupPrerequisite::SupervisionEvidence,
         ] {
             let mut partial = full.clone();
@@ -619,6 +620,7 @@ mod tests {
             );
             assert!(partial.admit_inspection());
         }
+        assert!(full.admit_inspection());
         let _ = &mut full;
     }
 
