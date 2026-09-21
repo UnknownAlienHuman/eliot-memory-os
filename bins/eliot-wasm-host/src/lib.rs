@@ -22,6 +22,7 @@ use eliot_wasm_runtime::{
 mod admission;
 mod artifact_preflight;
 mod cli_contract;
+mod contour;
 mod shadow;
 mod typed_bindings;
 mod typed_execution;
@@ -32,6 +33,13 @@ pub use artifact_preflight::{
     MAX_ARTIFACT_BYTES, Preflight, PreflightError, preflight_bytes, read_bounded_artifact,
 };
 pub use cli_contract::{CliConfig, CliError, Profile, Transport, parse_args};
+pub use contour::{
+    AdmittedGeneration, AdmittedPrototype, AuthorizedHostCall, Contour, ContourGateError,
+    FS_CAPABILITY, GenerationManifest, GovernorGrant, HostCallProposal, NET_CAPABILITY,
+    PINNED_WASMTIME_VERSION, PrototypeContourDecision, SELF_CONTAINED_GUEST_TARGET,
+    STANDARD_GUEST_TARGET, admit_generation, admit_prototype, authorize_host_call,
+    check_activation_imports,
+};
 pub use shadow::{ShadowError, enforce_shadow_no_effect, shadow_port_error};
 pub use typed_bindings::{
     LEGACY_EXPORT, LEGACY_WORLD, TYPED_PACKAGE_ID, TYPED_WIT_VERSION, TypedWorld,
@@ -112,12 +120,34 @@ impl WasmHostRunner {
             .available_capacity(eliot_runtime::ExecutionClass::ProtectedControl)
     }
 
-    /// Executes one inert caller request through the injected A-12 surface.
+    /// Executes one caller request through the injected A-12 surface.
     ///
     /// A-12 returns the typed result, including generation, limit, fence,
     /// trap, unavailable, and unknown-outcome classifications.
     pub fn execute(&mut self, request: InvocationRequest) -> InvocationResult {
         self.wasm_runtime.execute(request)
+    }
+
+    /// Executes one request under a bound contour admission.
+    ///
+    /// This host serves only the WASM component contour: an admission for
+    /// any other contour is refused with
+    /// [`ContourGateError::ContourNotServedHere`] before touching A-12, so
+    /// native-process work can never execute on the WASM host by mistake.
+    /// An admitted WASM generation delegates to the injected A-12 surface
+    /// verbatim and returns exactly its verdict — this method adds routing,
+    /// never semantics.
+    pub fn execute_admitted(
+        &mut self,
+        admitted: &AdmittedGeneration,
+        request: InvocationRequest,
+    ) -> Result<InvocationResult, ContourGateError> {
+        if *admitted.contour() != Contour::WasmComponent {
+            return Err(ContourGateError::ContourNotServedHere(
+                admitted.contour().to_string(),
+            ));
+        }
+        Ok(self.wasm_runtime.execute(request))
     }
 
     /// Cancels an unknown A-12 invocation without changing its typed outcome.
@@ -328,5 +358,103 @@ mod tests {
         assert!(runner.request_shutdown());
         assert!(!runner.request_shutdown());
         assert!(runner.shutdown_handle().is_requested());
+    }
+
+    fn admitted_manifest() -> GenerationManifest {
+        use eliot_wasm_runtime::{ArtifactAccessLimits, CancellationPolicy, EpochPolicy};
+        use std::collections::BTreeSet;
+
+        GenerationManifest {
+            target: STANDARD_GUEST_TARGET.to_owned(),
+            artifact_digest: eliot_wasm_runtime::Sha256Digest::of_bytes(b"caller-fixture"),
+            wit_digest: eliot_wasm_runtime::Sha256Digest::of_bytes(b"caller-wit"),
+            world: "context-admission".to_owned(),
+            allowed_imports: Vec::new(),
+            allowed_exports: vec!["admission".to_owned()],
+            capability_grants: Vec::new(),
+            limits: eliot_wasm_runtime::InvocationLimits {
+                max_input_bytes: 64,
+                max_output_bytes: 1024,
+                max_host_calls: 2,
+                max_fuel: 10_000,
+                max_memory_bytes: 65_536,
+                max_table_elements: 8,
+                max_instances: 1,
+                max_stack_bytes: 8 * 1024,
+                wall_deadline_ms: 500,
+                epoch: EpochPolicy {
+                    deadline_ticks: 100,
+                    cancellation: CancellationPolicy::EpochAndFuel,
+                },
+                artifact_access: ArtifactAccessLimits {
+                    allowed_digests: BTreeSet::new(),
+                    max_reads: 1,
+                    max_bytes: 8 * 1024 * 1024,
+                },
+            },
+            state_class: "stateless".to_owned(),
+            migration_contract: "none".to_owned(),
+            privacy_policy: "project_code".to_owned(),
+            comparator: "shadow-exact".to_owned(),
+            rollback_generation: Some("gen-41".to_owned()),
+        }
+    }
+
+    fn test_runner() -> WasmHostRunner {
+        WasmHostRunner::new(
+            test_profile(),
+            Runtime::new(
+                RuntimeConfig {
+                    mailbox_capacity: 4,
+                    control_reserve: 1,
+                    concurrency: 1,
+                    control_concurrency_reserve: 1,
+                    fairness_quantum: 1,
+                    restart_budget: 0,
+                    restart_window: Duration::from_secs(1),
+                    restart_backoff: Duration::from_millis(1),
+                    shutdown_grace: Duration::from_millis(1),
+                },
+                None,
+            )
+            .expect("runtime"),
+            WasmRuntime::new(None),
+        )
+        .expect("runner")
+    }
+
+    #[test]
+    fn admitted_wasm_generation_delegates_verbatim_to_a12() {
+        let decision = PrototypeContourDecision::default();
+        let admitted = admit_generation(Some(&decision), &admitted_manifest(), &[])
+            .expect("admitted generation");
+        let mut admitted_runner = test_runner();
+        let mut direct_runner = test_runner();
+        // The admitted call returns exactly the injected A-12 verdict: the
+        // wrapper adds routing, never semantics.
+        assert_eq!(
+            admitted_runner.execute_admitted(&admitted, request(false)),
+            Ok(direct_runner.execute(request(false)))
+        );
+    }
+
+    #[test]
+    fn non_wasm_admission_is_refused_before_a12() {
+        let native = PrototypeContourDecision::select_native_process("needs raw USB scan")
+            .expect("native decision");
+        let admitted =
+            admit_generation(Some(&native), &admitted_manifest(), &[]).expect("native admission");
+        let mut runner = test_runner();
+        assert_eq!(
+            runner.execute_admitted(&admitted, request(false)),
+            Err(ContourGateError::ContourNotServedHere(
+                "ISOLATED_NATIVE_PROCESS".to_owned()
+            ))
+        );
+        assert_eq!(
+            ContourGateError::ContourNotServedHere("ISOLATED_NATIVE_PROCESS".to_owned())
+                .to_string(),
+            "CONTOUR_NOT_SERVED_HERE:ISOLATED_NATIVE_PROCESS"
+        );
     }
 }
