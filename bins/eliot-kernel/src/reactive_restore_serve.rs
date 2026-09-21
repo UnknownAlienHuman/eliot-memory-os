@@ -109,9 +109,14 @@ mod tests {
         SupervisionLeaseIncarnationBinding, SupervisionObservationScope,
     };
     use eliot_store_api::{
-        NamedReadOperation, NamedReadRequest, NamedReadResponse, OrderingHead, RevisionHead,
-        StoreHealth,
+        CanonicalRequestView, EffectClass, EventProjectionRelationIntents, NamedMutationOperation,
+        NamedMutationRequest, NamedReadOperation, NamedReadRequest, NamedReadResponse,
+        OperationIdentity, OrderingHead, OrderingScopeId, PreparedTransition, RevisionHead,
+        ScopeId, SecurityContext, StoreHealth, TransitionClass, canonical_request_hash,
+        generated_operation_manifests, operation_manifest_set_digest,
+        reactive_ledger_mutation_request, resource_snapshot_mutation_request,
     };
+    use std::collections::BTreeMap;
     use std::num::NonZeroU64;
     use std::sync::Mutex;
 
@@ -380,6 +385,118 @@ mod tests {
             state_fence: test_fence(),
             uris: vec!["eliot://evidence/source-9".to_owned()],
         }
+    }
+
+    /// Builds one committed reference-contour transition, mirroring the
+    /// memory backend's own seeding shape (generated manifest digest,
+    /// `ReactiveState` class, reversible ceiling, `reactive-state` scope,
+    /// canonical request hash). Task agreement is all-absent, exactly like
+    /// the serve query context: no task columns are minted here.
+    fn memory_transition(
+        tag: &str,
+        operation: NamedMutationOperation,
+        parameters: BTreeMap<String, serde_json::Value>,
+    ) -> (RequestMetadata, PreparedTransition) {
+        let ctx = RequestMetadata {
+            request_id: RequestId::new(format!("request-mem-{tag}")).expect("request"),
+            session_id: None,
+            task_id: None,
+            product_id: ProductId::new("product-mem").expect("product"),
+            source_id: SourceId::new("owner-mem").expect("source"),
+            state_fence: test_fence(),
+            clock: ClockReading::default(),
+        };
+        let manifest_digest =
+            operation_manifest_set_digest(&generated_operation_manifests().expect("manifests"))
+                .expect("digest");
+        let mut transition = PreparedTransition {
+            identity: OperationIdentity {
+                operation_id: OperationId::new(format!("op-mem-{tag}")).expect("operation"),
+                idempotency_key: format!("idem-mem-{tag}"),
+                canonical_request_hash: "0".repeat(64),
+            },
+            state_fence: test_fence(),
+            scope_id: ScopeId::new("reactive-state").expect("scope"),
+            task_id: None,
+            ordering_scopes: vec![OrderingScopeId::new("reactive-state").expect("ordering")],
+            transition_class: TransitionClass::ReactiveState,
+            requested_effect_ceiling: EffectClass::ReversibleMutation,
+            admission_contract_set_digest: "c".repeat(64),
+            operation_manifest_digest: manifest_digest,
+            named_operations: vec![NamedMutationRequest {
+                operation,
+                parameters,
+            }],
+            event_projection_relation_intents: EventProjectionRelationIntents {
+                event_ids: Vec::new(),
+                projection_kinds: Vec::new(),
+                relation_kinds: Vec::new(),
+            },
+            security: SecurityContext::default(),
+            required_proof_and_approval_refs: Vec::new(),
+        };
+        let view = CanonicalRequestView::from_apply(&ctx, &transition, &[], &[]);
+        transition.identity.canonical_request_hash =
+            canonical_request_hash(&view).expect("hash computes");
+        (ctx, transition)
+    }
+
+    #[tokio::test]
+    async fn store_round_tripped_bytes_serve_verbatim() {
+        // C4 byte seam, bridge-lane follow-up (§E/B): bytes admitted
+        // through the real Store mutation builders and committed to the
+        // reference contour serve back byte-identically through the
+        // production serve path. No hand-shaped payloads below this line:
+        // the ledger travels opaquely, the snapshot through base64 + digest
+        // exactly like production.
+        use eliot_store_memory::MemoryStore;
+
+        let store = MemoryStore::new();
+        let ledger_text = "{\"contract\":\"eliot.agent-bridge.reactive-injection-receipts/v1\",\"next_item_seq\":0,\"next_receipt_seq\":0,\"items\":{},\"receipts\":{}}".to_owned();
+        let mutation =
+            reactive_ledger_mutation_request("session-live-1".to_owned(), ledger_text.clone());
+        let (ctx, transition) =
+            memory_transition("seed-ledger-1", mutation.operation, mutation.parameters);
+        store
+            .apply_transaction(&ctx, transition, &[], &[])
+            .expect("ledger commits");
+        let snapshot_uri = "eliot://evidence/source-9".to_owned();
+        let snapshot_bytes = b"snapshot-bytes-9".to_vec();
+        let mutation =
+            resource_snapshot_mutation_request(snapshot_uri.clone(), &snapshot_bytes)
+                .expect("snapshot builds");
+        let (ctx, transition) =
+            memory_transition("seed-snap-1", mutation.operation, mutation.parameters);
+        store
+            .apply_transaction(&ctx, transition, &[], &[])
+            .expect("snapshot commits");
+
+        let service = ready_service();
+        let session = live_session(&service);
+        let reply = serve_reactive_restore(
+            &store,
+            &service,
+            &session,
+            "session-live-1",
+            &context(),
+            &query(),
+        )
+        .await
+        .expect("serve over the reference contour");
+        assert_eq!(reply.session_id, "session-live-1");
+        assert_eq!(reply.state_fence, test_fence());
+        assert_eq!(
+            reply.ledger_json.as_deref(),
+            Some(ledger_text.as_str()),
+            "ledger serves byte-identically to the admitted snapshot"
+        );
+        assert_eq!(reply.snapshots.len(), 1);
+        assert_eq!(reply.snapshots[0].uri, snapshot_uri);
+        assert_eq!(
+            reply.snapshots[0].content, snapshot_bytes,
+            "snapshot serves byte-identically to the admitted bytes"
+        );
+        assert_eq!(reply.revision, 1);
     }
 
     #[tokio::test]
