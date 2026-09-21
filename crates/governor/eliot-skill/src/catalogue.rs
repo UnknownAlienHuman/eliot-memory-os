@@ -556,6 +556,46 @@ impl SkillCatalogue {
         Ok(true)
     }
 
+    /// Marks the entry stale when its declared tool references no longer
+    /// resolve against the tool owner's view (`I7.13`).
+    ///
+    /// A changed host/tool/contract dependency marks the Skill stale: when
+    /// one or more `body.tool_refs` are unknown to the owner's `KnownTools`
+    /// view, the entry's tool basis changed out from under the installed
+    /// body. The entry keeps its pinned versions and gains a `Stale` status
+    /// with a reason naming every missing tool, blocking Material use and
+    /// redelivery until revalidated (reinstall) or governed review.
+    /// Quarantined entries are left untouched, mirroring
+    /// [`note_dependency_change`](Self::note_dependency_change); already-stale
+    /// entries report no change. Returns `true` when the entry became stale.
+    pub fn mark_tool_basis_stale(
+        &mut self,
+        skill_id: &str,
+        missing_tools: &[String],
+    ) -> Result<bool, SkillError> {
+        if missing_tools.is_empty() {
+            return Err(SkillError::InvalidField {
+                field: "entry.tool_basis",
+                reason: "at least one missing tool is required to mark the basis stale",
+            });
+        }
+        for tool in missing_tools {
+            check_text(tool, "entry.tool_basis")?;
+        }
+        let entry = self.entries.get_mut(skill_id).ok_or(SkillError::NotFound)?;
+        if entry.status == SkillStatus::Quarantined || entry.status == SkillStatus::Stale {
+            return Ok(false);
+        }
+        entry.validate()?;
+        entry.status = SkillStatus::Stale;
+        entry.stale_reason = Some(format!(
+            "tool basis changed: {} no longer known to the canonical tool view",
+            missing_tools.join(", ")
+        ));
+        entry.validate()?;
+        Ok(true)
+    }
+
     /// Promotes a provisional entry to current when the proportional depth
     /// rule holds (`I7.13`): one matching real route for host/task-specific
     /// Skills; two materially different routes plus approval for shared or
@@ -1185,6 +1225,59 @@ mod tests {
             .expect("activation display");
         assert_eq!(current_display.status, SkillStatus::Current);
         assert!(current_display.render().contains("status current"));
+    }
+
+    #[test]
+    fn removed_tool_basis_marks_stale_until_revalidated() {
+        // #1882 acceptance: a changed tool dependency marks the Skill stale.
+        // The entry keeps its pinned versions and gains a Stale status naming
+        // the missing tool, blocking Material use and redelivery.
+        let mut catalogue = catalogue_two();
+        assert!(
+            catalogue
+                .mark_tool_basis_stale("skill-alpha", &["eliot.finish".to_owned()])
+                .expect("mark stale")
+        );
+        let stored = catalogue.get("skill-alpha").expect("stored entry");
+        assert_eq!(stored.status, SkillStatus::Stale);
+        assert!(
+            stored
+                .stale_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("eliot.finish")
+        );
+        assert_eq!(stored.dependencies, vec![dependency("tool-def-1")]);
+        assert!(!catalogue.is_usable("skill-alpha"));
+        // Repeat marking reports no change; the sibling entry is untouched.
+        assert!(
+            !catalogue
+                .mark_tool_basis_stale("skill-alpha", &["eliot.finish".to_owned()])
+                .expect("repeat mark")
+        );
+        assert!(catalogue.is_usable("skill-beta"));
+        // Empty basis and unknown skills fail closed; quarantine is governed.
+        assert!(matches!(
+            catalogue.mark_tool_basis_stale("skill-alpha", &[]),
+            Err(SkillError::InvalidField { field, .. }) if field == "entry.tool_basis"
+        ));
+        assert!(matches!(
+            catalogue.mark_tool_basis_stale("skill-missing", &["eliot.finish".to_owned()]),
+            Err(SkillError::NotFound)
+        ));
+        let mut quarantined = entry("skill-quarantined");
+        quarantined.status = SkillStatus::Quarantined;
+        quarantined.stale_reason = Some("governed review hold".to_owned());
+        let mut held =
+            SkillCatalogue::from_snapshot([quarantined], &tools()).expect("test catalogue");
+        assert!(
+            !held
+                .mark_tool_basis_stale("skill-quarantined", &["eliot.finish".to_owned()])
+                .expect("quarantine preserved")
+        );
+        let stored = held.get("skill-quarantined").expect("stored entry");
+        assert_eq!(stored.status, SkillStatus::Quarantined);
+        assert_eq!(stored.stale_reason.as_deref(), Some("governed review hold"));
     }
 
     #[test]

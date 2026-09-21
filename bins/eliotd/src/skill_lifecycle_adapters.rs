@@ -342,13 +342,58 @@ impl<T> ForwardingSkillLifecycle<T> {
         HotsetDeliveryReceipt::issue(hotset_id, &catalogue, skill_ids, tools, approval_ref)
     }
 
+    /// Refuses display when the entry's declared tool basis changed under
+    /// it, marking the entry stale first (issue #1882, `I7.13`).
+    ///
+    /// Collects the entry's `body.tool_refs` unknown to the caller's
+    /// tool-owner view; any missing tool means a declared host/tool
+    /// dependency changed after install. The entry is marked stale naming
+    /// every missing tool — so future issuance and promotion also fail
+    /// closed — then display refuses with the stale status instead of
+    /// rendering a removed tool as generally delivered. Unknown skills pass
+    /// through untouched: the catalogue boundary below reports `NotFound`.
+    /// Synchronous: each guard is taken and dropped in a closed scope and
+    /// never crosses an await.
+    fn invalidate_unknown_tool_basis(
+        &self,
+        skill_id: &str,
+        tools: &dyn KnownTools,
+    ) -> Result<(), SkillError> {
+        let missing = {
+            let catalogue = self.lock_catalogue();
+            match catalogue.get(skill_id) {
+                Some(entry) => entry
+                    .body
+                    .tool_refs
+                    .iter()
+                    .filter(|name| !tools.knows_tool(name))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                None => return Ok(()),
+            }
+        };
+        if missing.is_empty() {
+            return Ok(());
+        }
+        {
+            let mut catalogue = self.lock_catalogue();
+            catalogue.mark_tool_basis_stale(skill_id, &missing)?;
+        }
+        Err(SkillError::InvalidField {
+            field: "entry.status",
+            reason: "declared tool basis changed; Skill marked stale until revalidated",
+        })
+    }
+
     /// Binds the runtime receiver's ack to its exact receipt, then displays.
     ///
     /// The ack arrives from the real receiver (runtime Hotset injector), which
     /// validated the receipt, applied or rejected the bodies, and returned the
     /// ack binding the exact receipt digest it acted on. Only an applied ack
     /// for this exact receipt reaches the catalogue boundary; anything else
-    /// fails closed here without touching the catalogue. Synchronous: the
+    /// fails closed here without touching the catalogue. Before the boundary,
+    /// a changed tool basis marks the entry stale and refuses: a removed tool
+    /// is never displayed as generally delivered. Synchronous: the
     /// guard never crosses an await.
     ///
     /// Receipt and ack travel by value, mirroring the `SkillLifecycleApi`
@@ -366,6 +411,7 @@ impl<T> ForwardingSkillLifecycle<T> {
             return Err(SkillError::IdentityMismatch);
         }
         ack.validate()?;
+        self.invalidate_unknown_tool_basis(skill_id, tools)?;
         let catalogue = self.lock_catalogue();
         catalogue.activation_display(skill_id, &receipt, &ack, tools)
     }
@@ -564,6 +610,9 @@ impl<T: SkillLifecycleApi> SkillLifecycleApi for ForwardingSkillLifecycle<T> {
         ack: HotsetDeliveryAck,
         tools: &dyn KnownTools,
     ) -> Result<ActivatedSkillDisplay, SkillError> {
+        // Same standing-display invalidation as the injector path: a changed
+        // tool basis marks the entry stale before the catalogue boundary.
+        self.invalidate_unknown_tool_basis(&skill_id, tools)?;
         let catalogue = self.lock_catalogue();
         catalogue.activation_display(&skill_id, &receipt, &ack, tools)
     }
@@ -1060,6 +1109,72 @@ mod tests {
             Err(SkillError::IdentityMismatch)
         ));
         assert_eq!(*calls.lock().expect("calls"), 0);
+    }
+
+    /// Boundary double missing one declared tool: "eliot.finish" left the
+    /// canonical view after delivery while "finish-cap" remains. Test
+    /// scaffolding only, proving the standing-display invalidation fires on
+    /// a partial basis change.
+    struct FinishCapOnly;
+
+    impl KnownTools for FinishCapOnly {
+        fn knows_tool(&self, name: &str) -> bool {
+            name == "finish-cap"
+        }
+    }
+
+    #[test]
+    fn display_marks_removed_tool_basis_stale_and_blocks_redelivery() {
+        // #1882 acceptance end to end: a declared tool removed from the
+        // canonical view after delivery marks the delivered Skill stale at
+        // display time, blocking both the display and any later delivery
+        // until revalidated.
+        let (forwarding, calls, handle) = installing_forwarder();
+        let receipt = forwarding
+            .deliver_hotset(
+                "hotset-basis-1".to_owned(),
+                vec!["skill-demo".to_owned()],
+                "approval-commit-1".to_owned(),
+                &InstallTools,
+            )
+            .expect("runtime delivery");
+        let ack = HotsetDeliveryAck {
+            hotset_id: receipt.hotset_id.clone(),
+            receipt_digest: receipt.receipt_digest.clone(),
+            receiver_id: "runtime-hotset-1".to_owned(),
+            disposition: HotsetAckDisposition::Applied,
+        };
+        let refused =
+            forwarding.acknowledge_and_display("skill-demo", receipt, ack, &FinishCapOnly);
+        assert!(matches!(
+            refused,
+            Err(SkillError::InvalidField { field, .. }) if field == "entry.status"
+        ));
+        {
+            let catalogue = handle.lock().expect("catalogue lock");
+            let stored = catalogue.get("skill-demo").expect("stored entry");
+            assert_eq!(stored.status, SkillStatus::Stale);
+            assert!(
+                stored
+                    .stale_reason
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("eliot.finish")
+            );
+        }
+        // The stale mark persists: redelivery fails closed too.
+        let redelivery = forwarding.deliver_hotset(
+            "hotset-basis-2".to_owned(),
+            vec!["skill-demo".to_owned()],
+            "approval-commit-1".to_owned(),
+            &InstallTools,
+        );
+        assert!(matches!(
+            redelivery,
+            Err(SkillError::InvalidField { field, .. }) if field == "delivery.delivered_skill_ids"
+        ));
+        assert_eq!(*calls.lock().expect("calls"), 0);
+        drop(forwarding);
     }
 
     #[test]
