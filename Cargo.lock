@@ -2191,6 +2191,7 @@ dependencies = [
  "eliot-protocol",
  "eliot-receipts",
  "eliot-security-contracts",
+ "eliot-skill",
  "eliot-source-assurance",
  "schemars",
  "serde",
