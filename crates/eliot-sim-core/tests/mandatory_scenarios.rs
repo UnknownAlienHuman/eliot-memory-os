@@ -173,17 +173,59 @@ fn unknown_store_outcome_never_completes() {
 #[test]
 fn cancel_complete_race_resolves_to_one_terminal() {
     let report = run(ScenarioId::CancelCompleteRace, 1916);
+    // Op 1 cancels while pending: cancellation wins and the loser resolves.
     assert!(
         report.terminal.ops.get(&1).is_some_and(|record| {
-            record.status == OpStatus::Cancelled || record.status == OpStatus::Completed
+            record.status == OpStatus::Cancelled && record.store.is_none()
         }),
-        "op 1 must reach exactly one terminal"
+        "op 1 must cancel pre-commit without a store record"
     );
     assert!(
+        report.trace.iter().any(|event| {
+            event.outcome
+                == SimOutcome::CancelCompleteResolved {
+                    op: eliot_sim_core::OpId(1),
+                    winner_is_complete: false,
+                }
+        }),
+        "op 1 must resolve with cancellation winning"
+    );
+    // Op 2's cancel is scripted late: it arrives after a durable commit, so
+    // the commit stands and completion wins.
+    assert!(
+        report.terminal.ops.get(&2).is_some_and(|record| {
+            record.status == OpStatus::Completed && record.store == Some(StoreOutcome::Committed)
+        }),
+        "op 2 must complete with its commit standing"
+    );
+    assert!(
+        report.trace.iter().any(|event| {
+            event.outcome
+                == SimOutcome::CancelCompleteResolved {
+                    op: eliot_sim_core::OpId(2),
+                    winner_is_complete: true,
+                }
+        }),
+        "op 2 must resolve with completion winning"
+    );
+}
+
+#[test]
+fn cancel_after_commit_keeps_the_commit() {
+    let report = run(ScenarioId::CancelCompleteRace, 1916);
+    for verdict in &report.invariants {
+        assert!(
+            verdict.passed,
+            "invariant {} failed: {}",
+            verdict.id, verdict.detail
+        );
+    }
+    assert!(
         report
-            .trace
+            .invariants
             .iter()
-            .any(|event| matches!(event.outcome, SimOutcome::CancelCompleteResolved { .. }))
+            .any(|verdict| verdict.id == "commit-survives-cancel" && verdict.passed),
+        "commit-survives-cancel must be enforced"
     );
 }
 
@@ -220,6 +262,42 @@ fn promotion_cutover_rollback_race_has_single_winner() {
     }
     assert_eq!(moves.len(), 3);
     assert_eq!(report.terminal.epoch, moves[moves.len() - 1]);
+    // The reorder path is scripted for real: reordered envelopes arrive out
+    // of submission order, and the delay applies exactly once.
+    let reordered: Vec<u64> = report
+        .schedule
+        .iter()
+        .filter(|record| record.fault == DeliveryFault::Reordered)
+        .map(|record| record.seq)
+        .collect();
+    assert_eq!(reordered.len(), 2, "two moves must travel reordered");
+    let delivered: Vec<u64> = report.schedule.iter().map(|record| record.seq).collect();
+    assert_ne!(
+        delivered,
+        [0, 1, 2],
+        "reorder must invert submission order, got {delivered:?}"
+    );
+}
+
+#[test]
+fn fail_closed_plan_is_reachable_via_fallible_entrypoint() {
+    use eliot_sim_core::{ScenarioDefinition, SimConfig, define, try_run_definition};
+    let mut definition: ScenarioDefinition = define(ScenarioId::DuplicateDelivery);
+    definition.plan.armed = vec![Failpoint::SubmitPath];
+    let error = try_run_definition(&definition, 1916, SimConfig::default_config());
+    assert!(
+        matches!(error, Err(SimError::InvalidPlan(_))),
+        "unarmed script must fail closed through the fallible entrypoint"
+    );
+    let result = eliot_sim_core::try_run(ScenarioId::DuplicateDelivery, 1916);
+    let Ok(report) = result else {
+        unreachable!("validated scenario must run");
+    };
+    assert!(
+        report.plan_error.is_none(),
+        "validated run carries no plan error"
+    );
+    assert!(report.artifact.accepted, "validated run must accept");
 }
 
 #[test]

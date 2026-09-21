@@ -16,7 +16,9 @@
 //! store Unknown ........................ Unknown status, never Completed
 //! torn commit reconciled .............. Unknown + Committed upgrades
 //! ack for committed ................... AckRecorded, idempotent afterwards
+//! cancel before commit .................. Cancelled, one terminal wins
 //! complete after cancel (or reverse) .. CancelCompleteResolved, one terminal wins
+//! cancel after a durable commit ........ commit stands, complete wins
 //! writer restart ...................... pending work Unknown, commits survive
 //! shed / overload ..................... bounded mailbox, counted sheds
 //! supervision loss .................... coverage downgraded, never silent success
@@ -265,14 +267,17 @@ impl SimState {
             return vec![SimOutcome::DuplicateIgnored { op }];
         };
         match record.status {
-            OpStatus::Completed => {
+            // A durable commit is never voided by a late cancel: the commit
+            // stands and completion wins. Only a pre-commit operation can be
+            // cancelled, which the `commit-survives-cancel` invariant enforces.
+            OpStatus::Completed | OpStatus::Committed => {
                 vec![SimOutcome::CancelCompleteResolved {
                     op,
                     winner_is_complete: true,
                 }]
             }
-            OpStatus::Pending | OpStatus::Committed | OpStatus::Unknown => {
-                if record.status == OpStatus::Pending || record.status == OpStatus::Committed {
+            OpStatus::Pending | OpStatus::Unknown => {
+                if record.status == OpStatus::Pending {
                     self.mailbox_depth = self.mailbox_depth.saturating_sub(1);
                 }
                 record.status = OpStatus::Cancelled;
@@ -292,14 +297,13 @@ impl SimState {
             return vec![SimOutcome::DuplicateIgnored { op }];
         };
         match record.status {
+            // A `Committed` record always carries a committed store outcome:
+            // `store_respond` is the only transition that mints it, and no
+            // later transition rewrites the store field of a committed op.
             OpStatus::Committed => {
-                if record.store == Some(StoreOutcome::Committed) {
-                    self.mailbox_depth = self.mailbox_depth.saturating_sub(1);
-                    record.status = OpStatus::Completed;
-                    vec![SimOutcome::Completed { op }]
-                } else {
-                    vec![SimOutcome::DuplicateIgnored { op }]
-                }
+                self.mailbox_depth = self.mailbox_depth.saturating_sub(1);
+                record.status = OpStatus::Completed;
+                vec![SimOutcome::Completed { op }]
             }
             OpStatus::Cancelled => vec![SimOutcome::CancelCompleteResolved {
                 op,

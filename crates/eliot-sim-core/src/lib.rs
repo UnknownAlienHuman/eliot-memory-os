@@ -32,8 +32,8 @@ pub mod seed;
 pub mod state;
 
 pub use adapters::{
-    ADAPTER_BOUNDARY_NOTE, EXCLUDED_FRAMEWORKS, IoPort, ModelCassette, ModelPort, ProcessPort,
-    StorePort, TimerPort, WasmPort,
+    ADAPTER_BOUNDARY_NOTE, EXCLUDED_FRAMEWORKS, IoPort, ModelCassette, ModelDecision, ModelPort,
+    ProcessPort, StorePort, TimerPort, WasmPort,
 };
 pub use command::{
     CommandKind, EffectClass, FencingToken, OpId, PromotionAction, SimCommand, StoreOutcome,
@@ -45,7 +45,7 @@ pub use fault::{Failpoint, FaultPlan, FaultPlanError, ScriptedFault};
 pub use rng::SimRng;
 pub use run::{
     InvariantVerdict, SimulationReport, acceptance, check_invariants, resolve_slug, run,
-    run_with_config,
+    run_with_config, try_run, try_run_definition, try_run_with_config,
 };
 pub use scenario::{
     MANDATORY_SCENARIOS, MandatoryScenario, ScenarioDefinition, ScenarioDisposition, ScenarioId,

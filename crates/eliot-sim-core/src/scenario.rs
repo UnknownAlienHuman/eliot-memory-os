@@ -131,6 +131,27 @@ pub enum ScenarioDisposition {
     },
 }
 
+impl Canonical for ScenarioDisposition {
+    fn feed(&self, digest: &mut SimDigest) {
+        digest.feed_tag("scenario-disposition");
+        match self {
+            Self::Modeled => digest.feed_str("modeled"),
+            Self::CoverageGap {
+                reason,
+                compensating_proof,
+            } => {
+                digest.feed_str("coverage-gap");
+                digest.feed_str(reason);
+                digest.feed_str(compensating_proof);
+            }
+            Self::Unsupported { reason } => {
+                digest.feed_str("unsupported");
+                digest.feed_str(reason);
+            }
+        }
+    }
+}
+
 /// One mandatory scenario with its disposition and remaining live proof.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MandatoryScenario {
@@ -440,15 +461,29 @@ pub fn define(id: ScenarioId) -> ScenarioDefinition {
         ScenarioId::CancelCompleteRace => ScenarioDefinition {
             id,
             mailbox_capacity: 8,
+            // Two opposed races in one deterministic run. Op 1 cancels while
+            // still pending, so cancellation wins; op 2's cancel is scripted
+            // two ticks late, so it arrives after a durable commit and
+            // completion, and completion wins with the commit standing.
             initial: vec![
                 submit(1, 1, 1, 1),
+                SimCommand::Cancel { op: OpId(1) },
                 SimCommand::StoreRespond {
                     op: OpId(1),
                     outcome: StoreOutcome::Committed,
                 },
-                SimCommand::Cancel { op: OpId(1) },
                 SimCommand::Complete {
                     op: OpId(1),
+                    generation: 1,
+                },
+                submit(2, 1, 2, 1),
+                SimCommand::StoreRespond {
+                    op: OpId(2),
+                    outcome: StoreOutcome::Committed,
+                },
+                SimCommand::Cancel { op: OpId(2) },
+                SimCommand::Complete {
+                    op: OpId(2),
                     generation: 1,
                 },
             ],
@@ -458,7 +493,7 @@ pub fn define(id: ScenarioId) -> ScenarioDefinition {
                     Failpoint::StoreResponsePath,
                     Failpoint::CommitPath,
                 ],
-                script: Vec::new(),
+                script: vec![scripted(CommandKind::Cancel, 1, DeliveryFault::Delayed, 2)],
                 background_jitter_max_ticks: 0,
             },
         },
@@ -481,9 +516,12 @@ pub fn define(id: ScenarioId) -> ScenarioDefinition {
             ],
             plan: FaultPlan {
                 armed: vec![Failpoint::EpochPath],
+                // Genuine reorder virtualization: the first and third moves
+                // are held past the second, so delivery order inverts
+                // submission order and the last delivered move still wins.
                 script: vec![
-                    scripted(CommandKind::EpochMove, 0, DeliveryFault::Delayed, 2),
-                    scripted(CommandKind::EpochMove, 2, DeliveryFault::Delayed, 1),
+                    scripted(CommandKind::EpochMove, 0, DeliveryFault::Reordered, 2),
+                    scripted(CommandKind::EpochMove, 2, DeliveryFault::Reordered, 1),
                 ],
                 background_jitter_max_ticks: 0,
             },

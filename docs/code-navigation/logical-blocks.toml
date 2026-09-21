@@ -67,7 +67,7 @@ path_globs = [
   "crates/eliot-sim-core/**",
   "bins/eliot-testd/**",
 ]
-documentation_handles = ["I10.8.17", "I18.18"]
+documentation_handles = ["I10.8.17", "I18.18", "I18.41"]
 
 [[block]]
 id = "smart-memory-context"

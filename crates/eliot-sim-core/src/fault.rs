@@ -132,7 +132,7 @@ impl FaultPlan {
     pub fn validate(&self) -> Result<(), FaultPlanError> {
         for entry in &self.script {
             let failpoint = Failpoint::for_kind(entry.kind);
-            if !self.armed.contains(&failpoint) {
+            if !self.armed_for(entry.kind) {
                 return Err(FaultPlanError::UnarmedFailpoint {
                     kind_tag: kind_tag(entry.kind),
                     failpoint_tag: failpoint.tag(),

@@ -113,6 +113,13 @@ impl Canonical for SimulationSeedArtifact {
         self.invariant_digest.feed(digest);
         self.failure_trace_digest.feed(digest);
         digest.feed_u64(self.trace_len);
+        self.disposition.feed(digest);
+        if let Some(capsule) = &self.failure_capsule {
+            digest.feed_tag("failure-capsule-present");
+            digest.feed_str(capsule);
+        } else {
+            digest.feed_tag("failure-capsule-absent");
+        }
         digest.feed_bool(self.accepted);
     }
 }

@@ -12,7 +12,8 @@
 use crate::command::{OpId, SimCommand};
 use crate::digest::{Canonical, SimDigest};
 use crate::event::{SimOutcome, TracedEvent};
-use crate::scenario::{ScenarioId, SimError, define};
+use crate::fault::FaultPlanError;
+use crate::scenario::{ScenarioDefinition, ScenarioId, SimError, define};
 use crate::scheduler::Scheduler;
 use crate::seed::{SimConfig, SimulationSeedArtifact};
 use crate::state::{OpStatus, SimState};
@@ -52,6 +53,10 @@ pub struct SimulationReport {
     pub trace: Vec<TracedEvent>,
     /// True when the run drained within its horizons.
     pub drained: bool,
+    /// Fail-closed plan diagnosis when the fault plan did not validate.
+    /// `None` for every validated run; `Some` exactly when the run skipped
+    /// its drain because validation refused the plan.
+    pub plan_error: Option<FaultPlanError>,
 }
 
 impl SimulationReport {
@@ -89,29 +94,89 @@ pub fn run(id: ScenarioId, seed: u64) -> SimulationReport {
 }
 
 /// Runs one scenario with one seed and an explicit deterministic config.
+///
+/// A scenario whose fault plan fails closed validation still returns a
+/// report, but the report carries the [`FaultPlanError`] in `plan_error`,
+/// never drains, and never accepts. Use [`try_run_with_config`] when the
+/// caller prefers the failure as a [`SimError`].
 #[must_use]
 pub fn run_with_config(id: ScenarioId, seed: u64, config: SimConfig) -> SimulationReport {
-    let definition = define(id);
-    let plan_valid = definition.plan.validate();
-    let mut scheduler = Scheduler::new(seed, definition.plan.clone());
-    for command in &definition.initial {
-        scheduler.submit(command.clone());
+    match try_run_with_config(id, seed, config) {
+        Ok(report) => report,
+        Err(SimError::InvalidPlan(error)) => degraded_report(id, seed, config, error),
+        Err(SimError::UnsupportedScenario { .. }) => {
+            unreachable!("mandatory scenario ids always resolve")
+        }
     }
+}
 
+/// Fallible run of one scenario: fails closed with [`SimError::InvalidPlan`]
+/// before submitting anything when the scenario's fault plan does not
+/// validate.
+pub fn try_run(id: ScenarioId, seed: u64) -> Result<SimulationReport, SimError> {
+    try_run_with_config(id, seed, SimConfig::default_config())
+}
+
+/// Fallible run of one scenario with an explicit deterministic config.
+pub fn try_run_with_config(
+    id: ScenarioId,
+    seed: u64,
+    config: SimConfig,
+) -> Result<SimulationReport, SimError> {
+    try_run_definition(&define(id), seed, config)
+}
+
+/// Fallible run of one executable definition. This is the entrypoint that
+/// makes fail-closed validation reachable: any definition whose fault plan
+/// does not validate returns [`SimError::InvalidPlan`] without submitting a
+/// single command.
+pub fn try_run_definition(
+    definition: &ScenarioDefinition,
+    seed: u64,
+    config: SimConfig,
+) -> Result<SimulationReport, SimError> {
+    definition.plan.validate().map_err(SimError::InvalidPlan)?;
+    Ok(run_validated(definition, seed, config, None))
+}
+
+/// Builds the degraded report for a refused plan: empty state, empty trace,
+/// no drain, no acceptance, and the diagnosis carried in `plan_error`.
+fn degraded_report(
+    id: ScenarioId,
+    seed: u64,
+    config: SimConfig,
+    error: FaultPlanError,
+) -> SimulationReport {
+    run_validated(&define(id), seed, config, Some(error))
+}
+
+fn run_validated(
+    definition: &ScenarioDefinition,
+    seed: u64,
+    config: SimConfig,
+    plan_error: Option<FaultPlanError>,
+) -> SimulationReport {
+    let mut scheduler = Scheduler::new(seed, definition.plan.clone());
     let mut state = SimState::new(definition.mailbox_capacity);
     let mut trace: Vec<TracedEvent> = Vec::new();
     let mut drained = false;
-    if plan_valid.is_ok() {
+    if plan_error.is_none() {
+        for command in &definition.initial {
+            scheduler.submit(command.clone());
+        }
         drained = drain(&mut scheduler, &mut state, &mut trace, config);
     }
     append_drops(&scheduler, &state, &mut trace);
     trace.sort_by_key(|event| (event.tick.0, event.seq));
 
     let invariants = check_invariants(&state, &trace);
-    let (predicate_holds, _) = acceptance(id, &state, &trace);
-    let accepted = drained && invariants.iter().all(|item| item.passed) && predicate_holds;
+    let (predicate_holds, _) = acceptance(definition.id, &state, &trace);
+    let accepted = plan_error.is_none()
+        && drained
+        && invariants.iter().all(|item| item.passed)
+        && predicate_holds;
     let artifact = fold_artifact(
-        &definition,
+        definition,
         &scheduler,
         &state,
         &invariants,
@@ -127,6 +192,7 @@ pub fn run_with_config(id: ScenarioId, seed: u64, config: SimConfig) -> Simulati
         invariants,
         trace,
         drained,
+        plan_error,
     }
 }
 
@@ -301,6 +367,7 @@ pub fn check_invariants(state: &SimState, trace: &[TracedEvent]) -> Vec<Invarian
         ack_loss_consistent(state, trace),
         unknown_never_completes(state),
         cancel_complete_exclusive(trace),
+        commit_survives_cancel(state),
         shed_bounded(state),
         old_generation_rejected(state),
         supervision_explicit(state, trace),
@@ -430,6 +497,30 @@ fn cancel_complete_exclusive(trace: &[TracedEvent]) -> InvariantVerdict {
             "cancel-complete-exclusive",
             true,
             format!("{} operations with single terminals", terminals.len()),
+        )
+    }
+}
+
+/// A durable commit is never voided by a late cancel: no cancelled
+/// operation may carry a committed store record. Cancellation wins only
+/// before the store commits; afterwards the commit stands and completion
+/// wins (see `SimState` cancel rules).
+fn commit_survives_cancel(state: &SimState) -> InvariantVerdict {
+    let violator = state.ops.iter().find(|(_, record)| {
+        record.status == OpStatus::Cancelled
+            && record.store == Some(crate::command::StoreOutcome::Committed)
+    });
+    if let Some((id, _)) = violator {
+        verdict(
+            "commit-survives-cancel",
+            false,
+            format!("cancelled op {id} voids a durable commit"),
+        )
+    } else {
+        verdict(
+            "commit-survives-cancel",
+            true,
+            "no cancellation voided a durable commit".to_owned(),
         )
     }
 }
@@ -631,21 +722,32 @@ fn accept_unknown(state: &SimState, trace: &[TracedEvent]) -> (bool, &'static st
 }
 
 fn accept_race(trace: &[TracedEvent]) -> (bool, &'static str) {
-    let completed = trace
-        .iter()
-        .any(|event| event.outcome == SimOutcome::Completed { op: OpId(1) });
+    // Both race directions are scripted in one run: op 1 cancels while
+    // pending so cancellation wins, op 2's cancel arrives after a durable
+    // commit so completion wins with the commit standing.
+    let cancel_wins = trace.iter().any(|event| {
+        event.outcome
+            == SimOutcome::CancelCompleteResolved {
+                op: OpId(1),
+                winner_is_complete: false,
+            }
+    });
+    let complete_wins = trace.iter().any(|event| {
+        event.outcome
+            == SimOutcome::CancelCompleteResolved {
+                op: OpId(2),
+                winner_is_complete: true,
+            }
+    });
     let cancelled = trace
         .iter()
         .any(|event| event.outcome == SimOutcome::Cancelled { op: OpId(1) });
-    let resolved = trace.iter().any(|event| {
-        matches!(
-            event.outcome,
-            SimOutcome::CancelCompleteResolved { op: OpId(1), .. }
-        )
-    });
+    let completed = trace
+        .iter()
+        .any(|event| event.outcome == SimOutcome::Completed { op: OpId(2) });
     (
-        (completed != cancelled) && resolved,
-        "one terminal wins, loser resolved",
+        cancel_wins && complete_wins && cancelled && completed,
+        "cancel wins pre-commit, complete wins post-commit",
     )
 }
 

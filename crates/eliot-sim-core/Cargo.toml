@@ -12,6 +12,7 @@ functional_cell = "sim-core"
 lifecycle_owner = "go39-1916"
 source_layer = "C1"
 proof_entrypoint = "cargo test -p eliot-sim-core"
+workspace_admission = "admitted via #1916 root workspace membership as the pure deterministic simulation boundary owner; dependency-minimal pure state-transition crate with no runtime, store, model, or process authority"
 
 [lib]
 path = "src/lib.rs"

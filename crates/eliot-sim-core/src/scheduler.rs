@@ -149,14 +149,23 @@ impl Scheduler {
             self.rng
                 .below(self.plan.background_jitter_max_ticks.saturating_add(1))
         };
-        let base = self.now.0.saturating_add(delay).saturating_add(jitter);
-        let deliver_at = match fault {
-            DeliveryFault::Reordered => Tick(base.saturating_add(delay.max(1))),
+        // A reordered envelope must actually arrive after a later envelope,
+        // so it needs at least one tick of delay; the scripted delay applies
+        // exactly once. (Previously the delay was applied twice: once into
+        // `base` and again here.)
+        let effective_delay = match fault {
+            DeliveryFault::Reordered => delay.max(1),
             DeliveryFault::Delayed
             | DeliveryFault::Clean
             | DeliveryFault::Duplicated
-            | DeliveryFault::Lost => Tick(base),
+            | DeliveryFault::Lost => delay,
         };
+        let base = self
+            .now
+            .0
+            .saturating_add(effective_delay)
+            .saturating_add(jitter);
+        let deliver_at = Tick(base);
         let envelope = Envelope {
             seq,
             nonce,
@@ -165,10 +174,13 @@ impl Scheduler {
         };
         let tag = kind_tag(kind);
         if fault == DeliveryFault::Lost {
+            // Record the drop at its would-be delivery tick so the schedule
+            // log stays in delivery order instead of mixing submit-time drop
+            // entries ahead of earlier deliveries.
             self.log.push(DeliveryRecord {
                 seq,
                 nonce,
-                tick: self.now,
+                tick: deliver_at,
                 fault,
                 command_tag: tag,
                 command,
@@ -307,6 +319,60 @@ mod tests {
             count = count.saturating_add(1);
         }
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn scripted_reorder_inverts_arrival_order_once() {
+        let plan = FaultPlan {
+            armed: vec![crate::fault::Failpoint::SubmitPath],
+            script: vec![ScriptedFault {
+                kind: CommandKind::Submit,
+                occurrence: 0,
+                fault: DeliveryFault::Reordered,
+                delay_ticks: 2,
+            }],
+            background_jitter_max_ticks: 0,
+        };
+        let mut scheduler = Scheduler::new(1, plan);
+        scheduler.submit(submit(1));
+        scheduler.submit(submit(2));
+        let mut order = Vec::new();
+        while let Some(delivery) = scheduler.pop() {
+            if let SimCommand::Submit { op, .. } = delivery.envelope.command {
+                order.push((op.0, delivery.fault));
+            }
+        }
+        // The reordered first envelope arrives after the clean second one,
+        // delayed exactly once by its scripted two ticks.
+        assert_eq!(
+            order,
+            vec![(2, DeliveryFault::Clean), (1, DeliveryFault::Reordered)]
+        );
+        assert_eq!(scheduler.log()[1].tick.0, 2);
+    }
+
+    #[test]
+    fn seed_drives_delivery_ticks_under_jitter() {
+        fn ticks(seed: u64) -> Vec<u64> {
+            let plan = FaultPlan {
+                armed: Vec::new(),
+                script: Vec::new(),
+                background_jitter_max_ticks: 7,
+            };
+            let mut scheduler = Scheduler::new(seed, plan);
+            for op in 0..6 {
+                scheduler.submit(submit(op));
+            }
+            let mut out = Vec::new();
+            while scheduler.pop().is_some() {
+                out.push(scheduler.now().0);
+            }
+            out
+        }
+        assert_eq!(ticks(1916), ticks(1916));
+        // With jitter enabled the seed moves actual delivery ticks, not just
+        // envelope nonces: different seeds build different schedules.
+        assert_ne!(ticks(1916), ticks(7));
     }
 
     #[test]
