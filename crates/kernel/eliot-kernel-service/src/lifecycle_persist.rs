@@ -17,26 +17,40 @@
 //!
 //! ```text
 //! T0 = [CaptureObservation { subject: genesis output handle }]
+//! per hop i with a caller-supplied typed mutation:
+//!   T_mut(i) = [ApplyEpistemicRevision { revision: <exact payload> }]
+//!            | [ApplyLifecyclePolicy { six declared fields }]
 //! Ti+1 = [AppendAuditEvent {
 //!     operation_id: own transition id (== receipt preset audit event),
 //!     idempotency_key: own key,
 //!     session_id: bound session,
 //!     access_digest: hop curation receipt digest,
-//!     action_digest: previous committed transition hash,
+//!     action_digest: sha256 of the previous commit-order identity,
 //!     expected_revision: 1-based hop position,
 //! }]
 //! ```
 //!
-//! Each transition carries `event_ids = [curation receipt id]`, so the
-//! committed `WriteReceipt.emitted_event_ids` bind back to the admission
-//! through the returned [`LinkAuditBinding`]; the curation side links
-//! with its own `link_audit` (digest already covers the preset event).
-//! Revision hops carry no mutation leg of their own: an
-//! `EpistemicRevisionPayload` cannot be constructed from curation data
-//! without fabricating epistemic standing, so revision content stays in
-//! the curation receipt while the store holds the immutable raw input
-//! plus the ordered audit linkage. Resuming an interrupted chain
-//! re-issues the same request: sealed hops replay without remutation.
+//! Mutation legs carry the complete persisted fields: the revision
+//! `revision` parameter holds the full [`EpistemicRevisionPayload`]
+//! (position, expected revision, candidate scope/fence/evidence,
+//! transition) and the policy leg the exact six-field package, so the
+//! chain stays reconstructible after reload through the owner readback
+//! (`EpistemicCommit::from_prepared`). Mutation legs emit no lifecycle
+//! events of their own (mirroring the Governor-owned policy legs);
+//! linkage flows through the adjacent audit legs only.
+//!
+//! Each audit transition carries `event_ids = [curation receipt id]`, so
+//! the committed `WriteReceipt.emitted_event_ids` bind back to the
+//! admission through the returned [`LinkAuditBinding`]; the curation
+//! side links with its own `link_audit` (digest already covers the
+//! preset event). Mutation legs are never fabricated from a receipt:
+//! the legitimate caller presents the exact typed canonical payload
+//! (Governor-admitted `EpistemicRevisionPayload`) or the owner-built
+//! policy command alongside the admitted transition, and the seam
+//! validates payload/transition identities, scope/fence lineage, and
+//! authority before applying the declared named mutations. Resuming an
+//! interrupted chain re-issues the same request: sealed legs replay
+//! without remutation.
 
 use eliot_contracts::ArtifactId;
 use eliot_contracts::SessionId;
@@ -48,6 +62,7 @@ use eliot_store_api::{
     EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
     OperationIdentity, OrderingScopeId, PreparedTransition, ReceiptEnvelope, RequestMetadata,
     ScopeId, SecurityContext, StateFence, StoreError, TransitionClass, canonical_json_bytes,
+    epistemic_revision::{EpistemicCommit, EpistemicRevisionPayload},
     generated_operation_manifests, operation_manifest_set_digest, sha256_hex,
     verify_canonical_request_hash,
 };
@@ -179,6 +194,49 @@ pub struct LifecyclePersistRequest {
     /// Caller-issued transition identities: exactly `chain.len() + 1`
     /// (capture plus one audit leg per hop, in order).
     pub hop_identities: Vec<OperationIdentity>,
+    /// Caller-supplied typed mutation legs, index-aligned to `chain`.
+    /// Exactly `chain.len()` entries; the genesis entry is always `None`
+    /// (its mutation is the capture itself). A revision/policy hop
+    /// carries its exact canonical payload or owner-built command;
+    /// hops without one persist linkage only.
+    pub hop_mutations: Vec<Option<HopMutationInput>>,
+}
+
+/// Caller-supplied typed mutation leg for one revision/policy hop.
+///
+/// The legitimate caller (Governor-owned admission path) presents the
+/// exact canonical payload or the owner-built command together with the
+/// admitted transition and the Governor request metadata for this leg.
+/// The seam validates every binding and never fabricates payload content.
+#[derive(Clone, Debug, Serialize)]
+pub struct HopMutationInput {
+    /// Caller-appointed transition identity. For revision legs this must
+    /// equal the payload candidate's own operation/idempotency binding.
+    pub identity: OperationIdentity,
+    /// Governor request metadata for this leg. For revision legs the
+    /// owner readback requires request/task/product/fence agreement
+    /// with the payload candidate.
+    pub context: RequestMetadata,
+    /// The exact typed mutation.
+    pub mutation: HopMutation,
+    /// Caller-supplied proof/approval refs carried on the transition.
+    /// The seam carries them verbatim and mints none.
+    pub proof_refs: Vec<String>,
+}
+
+/// Exact typed mutation for one hop.
+#[derive(Clone, Debug, Serialize)]
+pub enum HopMutation {
+    /// Governor-admitted epistemic position payload. The seam builds the
+    /// exact `ApplyEpistemicRevision{revision}` command through the
+    /// payload owner's constructor and binds it through the owner's
+    /// readback validation.
+    Revision(Box<EpistemicRevisionPayload>),
+    /// Owner-built `ApplyLifecyclePolicy` command carrying the exact
+    /// declared six-field package. Semantic policy content stays
+    /// skill-owner-admitted; the seam checks operation, declared shape,
+    /// fence, scope, and chain position only.
+    Policy(NamedMutationRequest),
 }
 
 /// One persisted hop: the committed audit leg plus its linkage.
@@ -226,6 +284,25 @@ pub struct LifecyclePersistResponse {
     pub hops: Vec<PersistedHop>,
     /// One linkage binding per hop, in chain order.
     pub links: Vec<LinkAuditBinding>,
+    /// One committed mutation leg per revision/policy hop, in chain order.
+    pub mutations: Vec<PersistedMutation>,
+}
+
+/// One persisted mutation leg: the committed revision/policy transition.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PersistedMutation {
+    /// Chain position of the hop this leg persists.
+    pub hop_index: usize,
+    /// Curation receipt identity this leg persists.
+    pub curation_receipt_id: String,
+    /// Committed mutation transition operation identity.
+    pub operation_id: OperationIdentity,
+    /// Exact store response receipt (never fabricated by the caller).
+    pub receipt: ReceiptEnvelope,
+    /// Emitted event ids of the mutation transition.
+    pub emitted_event_ids: Vec<String>,
+    /// True when the leg replayed an already-admitted identity.
+    pub replayed: bool,
 }
 
 /// Front-door errors for lifecycle persistence.
@@ -299,17 +376,24 @@ pub async fn handle_lifecycle_persist_request(
     }
     verify_admission_chain(&request.chain)
         .map_err(|error| LifecyclePersistError::ChainRejected(error.to_string()))?;
-    let transitions = build_persist_transitions(request)?;
-    for ((transition, _), identity) in transitions.iter().zip(request.hop_identities.iter()) {
-        let check = CanonicalRequestView::from_apply(&request.context, transition, &[], &[]);
-        verify_canonical_request_hash(&check, &identity.canonical_request_hash)
+    let legs = build_persist_transitions(request)?;
+    for leg in &legs {
+        let check = CanonicalRequestView::from_apply(&leg.context, &leg.transition, &[], &[]);
+        verify_canonical_request_hash(&check, &leg.appointed.canonical_request_hash)
             .map_err(|_| LifecyclePersistError::DigestMismatch)?;
     }
-    // Genesis capture commits first; each audit leg chains to its
-    // predecessor by appointed identity (exact, sealing-stable).
-    let (capture_transition, _) = &transitions[0];
+    // Genesis capture commits first; mutation and audit legs follow in
+    // commit order, each chained to its predecessor by appointed
+    // identity (exact, sealing-stable).
+    let mut legs_iter = legs.iter();
+    let capture_leg = legs_iter
+        .next()
+        .ok_or(LifecyclePersistError::InvalidField {
+            field: "lifecycle.persist.chain",
+            reason: "persist request failed closed validation",
+        })?;
     let (capture_receipt, capture_replayed) =
-        commit_transition(client, request, capture_transition).await?;
+        commit_transition(client, &capture_leg.context, &capture_leg.transition).await?;
     let capture_envelope = capture_receipt
         .require_reconciliation_envelope()
         .map_err(LifecyclePersistError::from_store)?
@@ -321,54 +405,107 @@ pub async fn handle_lifecycle_persist_request(
         .collect();
     let mut hops = Vec::with_capacity(request.chain.len());
     let mut links = Vec::with_capacity(request.chain.len());
-    for index in 0..request.chain.len() {
-        let transition = &transitions[index + 1].0;
-        let (receipt, replayed) = commit_transition(client, request, transition).await?;
+    let mut mutations = Vec::new();
+    for leg in legs_iter {
+        let (receipt, replayed) = commit_transition(client, &leg.context, &leg.transition).await?;
         let emitted: Vec<String> = receipt
             .emitted_event_ids
             .iter()
             .map(ToString::to_string)
             .collect();
-        let audit_operation_id = transition.identity.operation_id.clone();
-        hops.push(PersistedHop {
-            curation_receipt_id: request.chain[index].receipt.receipt_id.as_str().to_owned(),
-            operation_id: transition.identity.clone(),
-            receipt: receipt
-                .require_reconciliation_envelope()
-                .map_err(LifecyclePersistError::from_store)?
-                .clone(),
-            emitted_event_ids: emitted.clone(),
-            replayed,
-        });
-        links.push(LinkAuditBinding {
-            curation_receipt_id: request.chain[index].receipt.receipt_id.as_str().to_owned(),
-            audit_operation_id: audit_operation_id.to_string(),
-            emitted_event_ids: emitted,
-        });
+        let operation_id = leg.transition.identity.clone();
+        let envelope = receipt
+            .require_reconciliation_envelope()
+            .map_err(LifecyclePersistError::from_store)?
+            .clone();
+        match leg.kind {
+            BuiltLegKind::Mutation { hop } => mutations.push(PersistedMutation {
+                hop_index: hop,
+                curation_receipt_id: request.chain[hop].receipt.receipt_id.as_str().to_owned(),
+                operation_id: operation_id.clone(),
+                receipt: envelope,
+                emitted_event_ids: emitted,
+                replayed,
+            }),
+            BuiltLegKind::Audit { hop } => {
+                hops.push(PersistedHop {
+                    curation_receipt_id: request.chain[hop].receipt.receipt_id.as_str().to_owned(),
+                    operation_id: operation_id.clone(),
+                    receipt: envelope,
+                    emitted_event_ids: emitted.clone(),
+                    replayed,
+                });
+                links.push(LinkAuditBinding {
+                    curation_receipt_id: request.chain[hop].receipt.receipt_id.as_str().to_owned(),
+                    audit_operation_id: operation_id.operation_id.to_string(),
+                    emitted_event_ids: emitted,
+                });
+            }
+            BuiltLegKind::Capture => {
+                return Err(LifecyclePersistError::InvalidField {
+                    field: "lifecycle.persist.chain",
+                    reason: "capture leg must open the commit order exactly once",
+                });
+            }
+        }
     }
     Ok(LifecyclePersistResponse {
-        capture_operation_id: capture_transition.identity.clone(),
+        capture_operation_id: capture_leg.transition.identity.clone(),
         capture_receipt: capture_envelope,
         capture_emitted_event_ids: capture_emitted,
         capture_replayed,
         hops,
         links,
+        mutations,
     })
 }
 
-/// Builds every transition for a persist request without committing.
+/// One sealed leg in commit order with the exact context it commits
+/// under.
 ///
 /// Public so the route owner seals each identity hash before dispatch:
 /// the builder is deterministic over the request, so dispatch rebuilds
-/// byte-identical transitions. Returns one capture transition plus one
-/// audit transition per hop, each paired with the active manifest
-/// digest.
+/// byte-identical legs. Each leg verifies against its own context
+/// (lifecycle context for capture/audit legs, Governor leg metadata
+/// for mutation legs).
+#[derive(Clone, Debug)]
+pub struct BuiltLeg {
+    /// The exact transition to commit.
+    pub transition: PreparedTransition,
+    /// The caller-appointed identity carrying the sealed hash.
+    pub appointed: OperationIdentity,
+    /// The exact request metadata the leg commits under.
+    pub context: RequestMetadata,
+    /// Position of this leg in the persist layout.
+    pub kind: BuiltLegKind,
+}
+
+/// Position of one built leg in the persist layout.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BuiltLegKind {
+    /// Genesis capture, opens the commit order exactly once.
+    Capture,
+    /// Revision/policy mutation leg for one hop.
+    Mutation {
+        /// Chain position of the hop this leg persists.
+        hop: usize,
+    },
+    /// Audit linkage leg for one hop.
+    Audit {
+        /// Chain position of the hop this leg links.
+        hop: usize,
+    },
+}
+
+/// Builds every leg for a persist request without committing.
+///
+/// Returns the capture leg plus, per hop in chain order, the optional
+/// mutation leg followed by the audit leg. Audit legs chain to the
+/// previous commit-order identity (the hop's mutation leg when one
+/// exists), so sealing stays stable across rebuilds.
 pub fn build_persist_transitions(
     request: &LifecyclePersistRequest,
-) -> Result<
-    Vec<(PreparedTransition, eliot_store_api::OperationManifestDigest)>,
-    LifecyclePersistError,
-> {
+) -> Result<Vec<BuiltLeg>, LifecyclePersistError> {
     validate_persist_request(request)?;
     verify_admission_chain(&request.chain)
         .map_err(|error| LifecyclePersistError::ChainRejected(error.to_string()))?;
@@ -402,11 +539,20 @@ pub fn build_persist_transitions(
     for identity in &mut admission_view.hop_identities {
         identity.canonical_request_hash = String::new();
     }
+    for input in admission_view
+        .hop_mutations
+        .iter_mut()
+        .filter_map(|slot| slot.as_mut())
+    {
+        input.identity.canonical_request_hash = String::new();
+    }
     let admission_digest = sha256_hex(
         &canonical_json_bytes(&admission_view)
             .map_err(|_| LifecyclePersistError::DigestMismatch)?,
     );
-    let mut built = Vec::with_capacity(request.hop_identities.len());
+    let mut built = Vec::with_capacity(
+        request.hop_identities.len() + request.hop_mutations.iter().flatten().count(),
+    );
     let genesis = &request.chain[0];
     if genesis.operation != CurationMutationOperation::CaptureObservation {
         return Err(LifecyclePersistError::ChainRejected(
@@ -421,45 +567,41 @@ pub fn build_persist_transitions(
         manifest_digest,
         admission_digest,
     };
-    built.push((
-        transition_for(
-            &request.hop_identities[0],
-            &bindings,
-            vec![capture_command(genesis)?],
-            vec![event_id_for(&genesis.receipt.receipt_id)?],
-        )?,
-        bindings.manifest_digest.clone(),
-    ));
+    let capture_identity = request.hop_identities[0].clone();
+    let capture_transition = transition_for(
+        &capture_identity,
+        &bindings,
+        TransitionSpec {
+            class: TransitionClass::CaptureCandidate,
+            ceiling: EffectClass::Candidate,
+            task_id: bindings.task_id.clone(),
+            commands: vec![capture_command(genesis)?],
+            events: vec![event_id_for(&genesis.receipt.receipt_id)?],
+            proof_refs: Vec::new(),
+        },
+    )?;
+    built.push(BuiltLeg {
+        transition: capture_transition,
+        appointed: capture_identity,
+        context: request.context.clone(),
+        kind: BuiltLegKind::Capture,
+    });
+    // Previous commit-order identity, for audit chain continuity: the
+    // hop's mutation leg when one exists, else the previous audit leg.
+    let mut previous_operation_id = request.hop_identities[0].operation_id.to_string();
     for (index, admission) in request.chain.iter().enumerate() {
-        let expected_audit = request.hop_identities[index + 1].operation_id.to_string();
-        let preset = admission.receipt.audit_event_id.clone().ok_or(
-            LifecyclePersistError::InvalidField {
-                field: "lifecycle.persist.audit_event",
-                reason: "every admission must preset its audit event",
-            },
-        )?;
-        if preset.as_str() != expected_audit {
-            return Err(LifecyclePersistError::InvalidField {
-                field: "lifecycle.persist.audit_event",
-                reason: "preset audit event must equal the appointed audit identity",
-            });
-        }
-        let previous_operation_id = request.hop_identities[index].operation_id.to_string();
-        built.push((
-            transition_for(
-                &request.hop_identities[index + 1],
-                &bindings,
-                vec![audit_command(
-                    admission,
-                    &request.hop_identities[index + 1],
-                    &session_id,
-                    &previous_operation_id,
-                    index + 1,
-                )],
-                vec![event_id_for(&admission.receipt.receipt_id)?],
-            )?,
-            bindings.manifest_digest.clone(),
-        ));
+        let (mut legs, next) = hop_legs_for(&HopLegParams {
+            index,
+            admission,
+            audit_identity: &request.hop_identities[index + 1],
+            mutation: request.hop_mutations[index].as_ref(),
+            session_id: &session_id,
+            previous_operation_id: &previous_operation_id,
+            bindings: &bindings,
+            lifecycle_context: &request.context,
+        })?;
+        previous_operation_id = next;
+        built.append(&mut legs);
     }
     Ok(built)
 }
@@ -470,7 +612,7 @@ pub fn build_persist_transitions(
 /// commits exactly once.
 async fn commit_transition(
     client: &impl CanonicalStoreClient,
-    request: &LifecyclePersistRequest,
+    context: &RequestMetadata,
     transition: &PreparedTransition,
 ) -> Result<(eliot_store_api::WriteReceipt, bool), LifecyclePersistError> {
     if let Some(existing) = client
@@ -486,7 +628,7 @@ async fn commit_transition(
         return Ok((existing, true));
     }
     let receipt = client
-        .apply_prepared(&request.context, transition.clone(), Vec::new(), Vec::new())
+        .apply_prepared(context, transition.clone(), Vec::new(), Vec::new())
         .await
         .map_err(LifecyclePersistError::from_store)?;
     if receipt.status != eliot_store_api::WriteReceiptStatus::Committed {
@@ -495,7 +637,7 @@ async fn commit_transition(
     receipt
         .validate()
         .map_err(LifecyclePersistError::from_store)?;
-    if receipt.state_fence != request.state_fence {
+    if receipt.state_fence != transition.state_fence {
         return Err(LifecyclePersistError::FenceMismatch);
     }
     if receipt.operation_manifest_digest != transition.operation_manifest_digest {
@@ -521,6 +663,14 @@ fn validate_persist_request(
     if request.hop_identities.len() != request.chain.len() + 1 {
         return Err(invalid("lifecycle.persist.hop_identities"));
     }
+    if request.hop_mutations.len() != request.chain.len() {
+        return Err(invalid("lifecycle.persist.hop_mutations"));
+    }
+    // The genesis mutation is the capture itself; a mutation leg for hop
+    // zero would double-persist the raw input.
+    if request.hop_mutations[0].is_some() {
+        return Err(invalid("lifecycle.persist.hop_mutations"));
+    }
     for identity in &request.hop_identities {
         identity
             .validate()
@@ -533,6 +683,81 @@ fn validate_persist_request(
         }
         if admission.receipt.state_fence != request.state_fence {
             return Err(LifecyclePersistError::FenceMismatch);
+        }
+    }
+    for (index, slot) in request.hop_mutations.iter().enumerate() {
+        if let Some(input) = slot {
+            validate_mutation_input(input, &request.chain[index], request)?;
+        }
+    }
+    Ok(())
+}
+
+/// Validates one caller-supplied mutation leg against its admitted
+/// transition: payload/transition identities, scope/fence lineage, and
+/// authority. Revision legs additionally bind through the payload
+/// owner's transition check; policy legs through the declared shape
+/// table. Lineage note: the lifecycle `supersedes` record handles and
+/// the epistemic position `predecessor` live in different namespaces
+/// (record lineage vs position-revision lineage), so no equation
+/// between them is enforced — scope, fence, identity, and audit
+/// appointment are the cross-owner bindings.
+fn validate_mutation_input(
+    input: &HopMutationInput,
+    admission: &CurationAdmission,
+    request: &LifecyclePersistRequest,
+) -> Result<(), LifecyclePersistError> {
+    let invalid = |field: &'static str| LifecyclePersistError::InvalidField {
+        field,
+        reason: "mutation leg failed closed validation",
+    };
+    input
+        .identity
+        .validate()
+        .map_err(|_| invalid("lifecycle.persist.mutation.identity"))?;
+    input
+        .context
+        .validate()
+        .map_err(|_| invalid("lifecycle.persist.mutation.context"))?;
+    if input.context.state_fence != request.state_fence {
+        return Err(LifecyclePersistError::FenceMismatch);
+    }
+    match &input.mutation {
+        HopMutation::Revision(payload) => {
+            payload
+                .validate()
+                .map_err(LifecyclePersistError::from_store)?;
+            if admission.operation != CurationMutationOperation::ApplyEpistemicRevision {
+                return Err(invalid("lifecycle.persist.mutation"));
+            }
+            if payload.candidate.scope != admission.receipt.scope.as_str() {
+                return Err(invalid("lifecycle.persist.mutation.scope"));
+            }
+            if payload.candidate.fence != admission.receipt.state_fence {
+                return Err(LifecyclePersistError::FenceMismatch);
+            }
+            if input.identity.operation_id != payload.candidate.operation_id
+                || input.identity.idempotency_key != payload.candidate.idempotency_key
+            {
+                return Err(invalid("lifecycle.persist.mutation.identity"));
+            }
+            if input.context.request_id != payload.candidate.request_id
+                || input.context.task_id.as_ref() != Some(&payload.candidate.task_id)
+                || input.context.product_id != payload.candidate.work_scope.product_id
+            {
+                return Err(invalid("lifecycle.persist.mutation.context"));
+            }
+        }
+        HopMutation::Policy(command) => {
+            if command.operation != NamedMutationOperation::ApplyLifecyclePolicy {
+                return Err(invalid("lifecycle.persist.mutation"));
+            }
+            // Declared six-field shape is enforced by the owner
+            // catalogue gate at build; semantic policy content stays
+            // skill-owner-admitted.
+            if admission.operation != CurationMutationOperation::ApplyLifecyclePolicy {
+                return Err(invalid("lifecycle.persist.mutation"));
+            }
         }
     }
     Ok(())
@@ -642,33 +867,208 @@ struct TransitionBindings {
     admission_digest: String,
 }
 
+/// Builds one revision/policy mutation leg from caller-supplied exact
+/// input. The revision command is built through the payload owner's
+/// constructor and the finished transition is bound through the owner's
+/// readback validation; the policy command arrives owner-built. Every
+/// mutation leg additionally passes the owner catalogue gate (declared
+/// membership, class/ceiling, exact typed parameters) before it may
+/// seal.
+fn mutation_transition_for(
+    input: &HopMutationInput,
+    admission: &CurationAdmission,
+    bindings: &TransitionBindings,
+) -> Result<PreparedTransition, LifecyclePersistError> {
+    let transition = match &input.mutation {
+        HopMutation::Revision(payload) => {
+            let command = payload
+                .command()
+                .map_err(LifecyclePersistError::from_store)?;
+            let transition = PreparedTransition {
+                identity: input.identity.clone(),
+                state_fence: bindings.fence.clone(),
+                scope_id: ScopeId::new(payload.candidate.scope.as_str()).map_err(|_| {
+                    LifecyclePersistError::InvalidField {
+                        field: "lifecycle.persist.mutation.scope",
+                        reason: "payload scope identity is invalid",
+                    }
+                })?,
+                task_id: Some(payload.candidate.task_id.to_string()),
+                ordering_scopes: vec![bindings.ordering.clone()],
+                transition_class: TransitionClass::Epistemic,
+                requested_effect_ceiling: TransitionClass::Epistemic.maximum_effect(),
+                admission_contract_set_digest: bindings.admission_digest.clone(),
+                operation_manifest_digest: bindings.manifest_digest.clone(),
+                named_operations: vec![command],
+                event_projection_relation_intents: EventProjectionRelationIntents {
+                    event_ids: Vec::new(),
+                    projection_kinds: Vec::new(),
+                    relation_kinds: Vec::new(),
+                },
+                security: SecurityContext::default(),
+                required_proof_and_approval_refs: input.proof_refs.clone(),
+            };
+            transition
+                .validate()
+                .map_err(LifecyclePersistError::from_store)?;
+            // Owner bind: payload, prepared transition, and Governor leg
+            // metadata must agree exactly; a missing revision command
+            // here is an internal construction fault, never caller data.
+            let commit = EpistemicCommit::from_prepared(&input.context, &transition)
+                .map_err(LifecyclePersistError::from_store)?
+                .ok_or(LifecyclePersistError::InvalidField {
+                    field: "lifecycle.persist.mutation",
+                    reason: "revision leg carries no revision command",
+                })?;
+            if commit.payload != **payload {
+                return Err(LifecyclePersistError::InvalidField {
+                    field: "lifecycle.persist.mutation",
+                    reason: "revision readback disagrees with the presented payload",
+                });
+            }
+            transition
+        }
+        HopMutation::Policy(command) => transition_for(
+            &input.identity,
+            bindings,
+            TransitionSpec {
+                class: TransitionClass::LifecyclePolicy,
+                ceiling: EffectClass::ReversibleMutation,
+                task_id: bindings.task_id.clone(),
+                commands: vec![command.clone()],
+                events: Vec::new(),
+                proof_refs: input.proof_refs.clone(),
+            },
+        )?,
+    };
+    transition
+        .validate_against_catalogue(
+            &generated_operation_manifests().map_err(LifecyclePersistError::from_store)?,
+        )
+        .map_err(LifecyclePersistError::from_store)?;
+    let _ = admission;
+    Ok(transition)
+}
+
 fn transition_for(
     identity: &OperationIdentity,
     bindings: &TransitionBindings,
-    commands: Vec<NamedMutationRequest>,
-    events: Vec<EventId>,
+    spec: TransitionSpec,
 ) -> Result<PreparedTransition, LifecyclePersistError> {
     let transition = PreparedTransition {
         identity: identity.clone(),
         state_fence: bindings.fence.clone(),
         scope_id: bindings.scope.clone(),
-        task_id: bindings.task_id.clone(),
+        task_id: spec.task_id,
         ordering_scopes: vec![bindings.ordering.clone()],
-        transition_class: TransitionClass::CaptureCandidate,
-        requested_effect_ceiling: EffectClass::Candidate,
+        transition_class: spec.class,
+        requested_effect_ceiling: spec.ceiling,
         admission_contract_set_digest: bindings.admission_digest.clone(),
         operation_manifest_digest: bindings.manifest_digest.clone(),
-        named_operations: commands,
+        named_operations: spec.commands,
         event_projection_relation_intents: EventProjectionRelationIntents {
-            event_ids: events,
+            event_ids: spec.events,
             projection_kinds: Vec::new(),
             relation_kinds: Vec::new(),
         },
         security: SecurityContext::default(),
-        required_proof_and_approval_refs: Vec::new(),
+        required_proof_and_approval_refs: spec.proof_refs,
     };
     transition
         .validate()
         .map_err(LifecyclePersistError::from_store)?;
     Ok(transition)
+}
+
+/// Per-leg transition shape: class, ceiling, task, commands, events, refs.
+struct TransitionSpec {
+    class: TransitionClass,
+    ceiling: EffectClass,
+    task_id: Option<String>,
+    commands: Vec<NamedMutationRequest>,
+    events: Vec<EventId>,
+    proof_refs: Vec<String>,
+}
+
+/// One hop's leg inputs for [`hop_legs_for`].
+struct HopLegParams<'a> {
+    index: usize,
+    admission: &'a CurationAdmission,
+    audit_identity: &'a OperationIdentity,
+    mutation: Option<&'a HopMutationInput>,
+    session_id: &'a SessionId,
+    previous_operation_id: &'a str,
+    bindings: &'a TransitionBindings,
+    lifecycle_context: &'a RequestMetadata,
+}
+
+/// Builds one hop's legs in commit order — the optional mutation leg
+/// followed by the audit leg — and returns them with the next previous
+/// commit-order identity for chain continuity.
+fn hop_legs_for(
+    params: &HopLegParams<'_>,
+) -> Result<(Vec<BuiltLeg>, String), LifecyclePersistError> {
+    let HopLegParams {
+        index,
+        admission,
+        audit_identity,
+        mutation,
+        session_id,
+        previous_operation_id,
+        bindings,
+        lifecycle_context,
+    } = params;
+    let preset =
+        admission
+            .receipt
+            .audit_event_id
+            .clone()
+            .ok_or(LifecyclePersistError::InvalidField {
+                field: "lifecycle.persist.audit_event",
+                reason: "every admission must preset its audit event",
+            })?;
+    if preset.as_str() != audit_identity.operation_id.to_string() {
+        return Err(LifecyclePersistError::InvalidField {
+            field: "lifecycle.persist.audit_event",
+            reason: "preset audit event must equal the appointed audit identity",
+        });
+    }
+    let mut legs = Vec::with_capacity(2);
+    let mut previous: String = (*previous_operation_id).to_owned();
+    if let Some(input) = mutation {
+        let mutation_transition = mutation_transition_for(input, admission, bindings)?;
+        previous = input.identity.operation_id.to_string();
+        legs.push(BuiltLeg {
+            transition: mutation_transition,
+            appointed: input.identity.clone(),
+            context: input.context.clone(),
+            kind: BuiltLegKind::Mutation { hop: *index },
+        });
+    }
+    let audit_transition = transition_for(
+        audit_identity,
+        bindings,
+        TransitionSpec {
+            class: TransitionClass::CaptureCandidate,
+            ceiling: EffectClass::Candidate,
+            task_id: bindings.task_id.clone(),
+            commands: vec![audit_command(
+                admission,
+                audit_identity,
+                session_id,
+                &previous,
+                index + 1,
+            )],
+            events: vec![event_id_for(&admission.receipt.receipt_id)?],
+            proof_refs: Vec::new(),
+        },
+    )?;
+    previous = audit_identity.operation_id.to_string();
+    legs.push(BuiltLeg {
+        transition: audit_transition,
+        appointed: (*audit_identity).clone(),
+        context: (*lifecycle_context).clone(),
+        kind: BuiltLegKind::Audit { hop: *index },
+    });
+    Ok((legs, previous))
 }

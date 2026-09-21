@@ -85,8 +85,9 @@ pub use lifecycle::{
     AdmissionLease, KernelService, KernelServiceError, KernelServiceState, ServiceFailure,
 };
 pub use lifecycle_persist::{
-    AuthenticatedLifecycleSession, LifecyclePersistError, LifecyclePersistRequest,
-    LifecyclePersistResponse, LifecycleServiceContext, LinkAuditBinding, PersistedHop,
+    AuthenticatedLifecycleSession, BuiltLeg, BuiltLegKind, HopMutation, HopMutationInput,
+    LifecyclePersistError, LifecyclePersistRequest, LifecyclePersistResponse,
+    LifecycleServiceContext, LinkAuditBinding, PersistedHop, PersistedMutation,
     build_persist_transitions, handle_lifecycle_persist_request,
 };
 pub use notification_state::{

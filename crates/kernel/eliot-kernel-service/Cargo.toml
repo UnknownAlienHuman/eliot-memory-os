@@ -55,6 +55,11 @@ eliot-read = { path = "../../governor/eliot-read" }
 # They never enter the production dependency graph or the runtime boundary.
 eliot-epistemic = { path = "../../smart/eliot-epistemic", version = "0.1.0" }
 eliot-evidence.workspace = true
+# Issue #1905 mutation legs: tests play the legitimate Governor caller via
+# the owned revision encoder, and build payloads from the exact contract
+# types. Test-only; production accepts caller-supplied typed payloads.
+eliot-canonical.workspace = true
+eliot-epistemic-contracts = { path = "../../smart/eliot-epistemic-contracts", version = "0.1.0" }
 secrecy.workspace = true
 
 [lints]

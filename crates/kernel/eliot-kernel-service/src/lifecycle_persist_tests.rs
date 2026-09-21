@@ -20,8 +20,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use serde_json::Value;
 
 use super::lifecycle_persist::{
-    AuthenticatedLifecycleSession, LifecyclePersistError, LifecyclePersistRequest,
-    build_persist_transitions, handle_lifecycle_persist_request,
+    AuthenticatedLifecycleSession, HopMutation, HopMutationInput, LifecyclePersistError,
+    LifecyclePersistRequest, build_persist_transitions, handle_lifecycle_persist_request,
 };
 use super::{KernelService, KernelServiceState};
 use crate::{
@@ -39,8 +39,8 @@ use eliot_epistemic::lifecycle::{
 use eliot_evidence::EpistemicStatus;
 use eliot_memory_curation::admission::CurationAdmission;
 use eliot_memory_curation::candidate_admission::{
-    ForwardRevisionParams, ObservationGenesisParams, admit_forward_revision,
-    admit_observation_genesis,
+    EmittedAuditLink, ForwardRevisionParams, ObservationGenesisParams, admit_forward_revision,
+    admit_observation_genesis, bind_emitted_audit_events,
 };
 use eliot_platform::{KernelActivationNonce, PlatformHandle};
 use eliot_receipts::{
@@ -52,12 +52,13 @@ use eliot_runtime_contracts::{
     HealthVector, RegisteredActivityWakePolicy, ServiceProcessState, SupervisionJournalEpoch,
     SupervisionLeaseIncarnationBinding, SupervisionObservationScope,
 };
+use eliot_store_api::epistemic_revision::{EpistemicCommit, EpistemicRevisionPayload};
 use eliot_store_api::{
-    CanonicalStoreClient, CanonicalValidationSnapshot, CommitId, NamedReadRequest,
-    NamedReadResponse, OperationIdentity, OrderingHead, OrderingScopeId, RequestMeta, Resubmission,
-    RevisionHead, RevisionKey, ScopeId, ScopeRevisionView, StoreError, StoreHealth,
-    TransitionClass, WriteReceipt, WriteReceiptStatus, generated_operation_manifests,
-    operation_manifest_set_digest,
+    CanonicalStoreClient, CanonicalValidationSnapshot, CommitId, NamedMutationOperation,
+    NamedMutationRequest, NamedReadRequest, NamedReadResponse, OperationIdentity, OrderingHead,
+    OrderingScopeId, RequestMeta, Resubmission, RevisionHead, RevisionKey, ScopeId,
+    ScopeRevisionView, StoreError, StoreHealth, TransitionClass, WriteReceipt, WriteReceiptStatus,
+    generated_operation_manifests, operation_manifest_set_digest,
 };
 
 const LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
@@ -314,21 +315,46 @@ fn persist_request(tag: &str) -> LifecyclePersistRequest {
                 canonical_request_hash: "0".repeat(64),
             },
         ],
+        hop_mutations: vec![None, None],
     }
 }
 
-/// Seals every hop identity hash against the exact admitted bytes.
+/// Seals every appointed identity hash against the exact admitted bytes,
+/// each leg under its own commit context.
 fn seal_request(request: &mut LifecyclePersistRequest) {
     let built = build_persist_transitions(request).expect("transitions build");
-    for ((transition, _), identity) in built.iter().zip(request.hop_identities.iter_mut()) {
+    let mut sealed = Vec::with_capacity(built.len());
+    for leg in &built {
         let view = eliot_store_api::CanonicalRequestView::from_apply(
-            &request.context,
-            transition,
+            &leg.context,
+            &leg.transition,
             &[],
             &[],
         );
-        identity.canonical_request_hash =
-            eliot_store_api::canonical_request_hash(&view).expect("hash computes");
+        sealed.push((
+            leg.appointed.operation_id.to_string(),
+            eliot_store_api::canonical_request_hash(&view).expect("hash computes"),
+        ));
+    }
+    let mut stamp = |operation: &str| -> String {
+        sealed
+            .iter()
+            .find(|(appointed, _)| appointed == operation)
+            .expect("appointed identity sealed")
+            .1
+            .clone()
+    };
+    for identity in request.hop_identities.iter_mut() {
+        let operation = identity.operation_id.to_string();
+        identity.canonical_request_hash = stamp(&operation);
+    }
+    for slot in request
+        .hop_mutations
+        .iter_mut()
+        .filter_map(|slot| slot.as_mut())
+    {
+        let operation = slot.identity.operation_id.to_string();
+        slot.identity.canonical_request_hash = stamp(&operation);
     }
 }
 
@@ -744,5 +770,594 @@ async fn foreign_fence_fails_before_any_dispatch() {
     let fake = FakeStore::new();
     let outcome = handle_lifecycle_persist_request(&fake, &service, &session, &request).await;
     assert!(matches!(outcome, Err(LifecyclePersistError::FenceMismatch)));
+    assert_eq!(fake.apply_calls.load(Ordering::SeqCst), 0);
+}
+
+/// Governor-admitted epistemic payload built through the legitimate
+/// caller path: the exact owner fixture shape
+/// (`store-api/tests/support/epistemic_envelope.rs`) re-admitted under
+/// the live fence, encoded by the Governor-owned
+/// `epistemic_revision_command`, and decoded back to the typed payload
+/// the seam accepts. Scope is caller-chosen; fence is always live.
+fn epistemic_payload(
+    operation: &str,
+    scope: &str,
+    expected: Option<eliot_epistemic_contracts::PositionRevision>,
+    predecessor: Option<&str>,
+) -> EpistemicRevisionPayload {
+    use eliot_canonical::epistemic_revision::epistemic_revision_command;
+    use eliot_epistemic_contracts::{
+        ClaimAuditOutcome, ClaimEntry, ClaimEntryParams, ClaimId, ClaimMap, ClaimVerdict,
+        DisclosureClass, EpistemicPositionCandidate, EpistemicPositionCandidateParams,
+        EpistemicTransition, EpistemicTransitionParams, EvidenceGrade, GradeAssignment, ManifestId,
+        PositionAssertability, PositionId, Precision, PredecessorId, PrivacyHandling,
+        PropositionId, SupportDelta, SupportRecord, SupportRecordParams, SupportResult,
+        TransitionTrigger, ValidityBounds,
+    };
+    use eliot_evidence::EvidenceAuthority;
+    use eliot_receipts::{WorkScope, WorkScopeId};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let fence = live_fence();
+    let task_id = eliot_contracts::TaskId::new("task").expect("task");
+    let request_id = eliot_contracts::RequestId::new(operation).expect("request");
+    let operation_id = eliot_contracts::OperationId::new(operation).expect("operation");
+    let work_scope = WorkScope {
+        scope_id: WorkScopeId::new(scope).expect("work scope"),
+        product_id: eliot_contracts::ProductId::new("product").expect("product"),
+        resource_generation: eliot_contracts::ResourceGeneration::genesis(),
+        state_fence: fence.clone(),
+    };
+    let handles = BTreeSet::from([id("observed-source")]);
+    let bounds = ValidityBounds::new(scope, None, None, "v1", Precision("record".to_owned()))
+        .expect("bounds");
+    let grade =
+        GradeAssignment::unknown("observation retained without truth promotion").expect("grade");
+    let proof = eliot_contracts::sha256_hex(b"captured exact source bytes");
+    let coverage_digest = eliot_contracts::sha256_hex(b"bounded coverage fixture");
+    let claim = ClaimEntry::new(ClaimEntryParams {
+        claim: ClaimId::new("claim").expect("claim"),
+        statement_digest: eliot_contracts::sha256_hex(b"observed proposition"),
+        verdict: ClaimVerdict::Withheld,
+        audit: ClaimAuditOutcome::NotVerifiableInScope,
+        counterevidence: BTreeSet::new(),
+        conflict: None,
+        authority: EvidenceAuthority::SourceIdentity,
+        grade: grade.clone(),
+        dependencies: BTreeSet::new(),
+        bounds: bounds.clone(),
+        temporal: None,
+        coverage_digest: coverage_digest.clone(),
+        support: handles.clone(),
+        components: BTreeMap::new(),
+        unresolved_support: BTreeSet::from(["verification".to_owned()]),
+        ceiling: EvidenceGrade::Orienting,
+        assumptions: BTreeSet::new(),
+        discriminators: BTreeSet::new(),
+    })
+    .expect("claim");
+    let map = ClaimMap::new(
+        ManifestId::new("claims").expect("manifest"),
+        BTreeSet::from([claim.claim.clone()]),
+        vec![claim.clone()],
+        Vec::new(),
+        BTreeSet::new(),
+    )
+    .expect("claim map");
+    let support = SupportRecord::new(SupportRecordParams {
+        proposition: PropositionId::new("proposition").expect("proposition"),
+        result: SupportResult::Unknown,
+        handles: handles.clone(),
+        validity: bounds,
+        grade: grade.clone(),
+        task_id: task_id.clone(),
+        fence: fence.clone(),
+        temporal: None,
+        assurance: None,
+        reopen_reason: None,
+        proof_digest: proof.clone(),
+    })
+    .expect("support");
+    let candidate = EpistemicPositionCandidate::new(EpistemicPositionCandidateParams {
+        proposition: support.proposition.clone(),
+        revision: eliot_contracts::TaskRevision::genesis(),
+        request_id: request_id.clone(),
+        operation_id: operation_id.clone(),
+        idempotency_key: operation.to_owned(),
+        work_scope: work_scope.clone(),
+        predecessor: predecessor
+            .map(PredecessorId::new)
+            .transpose()
+            .expect("predecessor"),
+        task_id: task_id.clone(),
+        attempt_id: operation.to_owned(),
+        scope: scope.to_owned(),
+        window_start_ms: None,
+        window_end_ms: None,
+        version: "v1".to_owned(),
+        precision: "record".to_owned(),
+        fence: fence.clone(),
+        manifest: map.manifest.clone(),
+        claims: vec![claim],
+        claim_map: Some(map),
+        coverage_digest,
+        conflict_digests: BTreeSet::new(),
+        support: vec![support],
+        unknowns: BTreeSet::from(["verification".to_owned()]),
+        grade,
+        authority: EvidenceAuthority::SourceIdentity,
+        disclosure: DisclosureClass::Open,
+        privacy: PrivacyHandling::Unrestricted,
+        temporal_digests: BTreeSet::new(),
+        verifier: None,
+        proof_digest: proof.clone(),
+        rivals: BTreeSet::new(),
+        proposed_assertability: PositionAssertability::UnknownWithheldQuarantined,
+        invalidation: None,
+    })
+    .expect("candidate");
+    let transition = EpistemicTransition::new(EpistemicTransitionParams {
+        position: candidate.proposition.clone(),
+        task_id: task_id.clone(),
+        attempt_id: operation.to_owned(),
+        request_id: request_id.clone(),
+        idempotency_key: operation.to_owned(),
+        work_scope,
+        candidate_digest: candidate.digest.clone(),
+        expected_revision: eliot_contracts::TaskRevision::genesis(),
+        expected_fence: fence,
+        trigger: TransitionTrigger::NewEvidence,
+        evidence_refs: handles.clone(),
+        operation: operation_id,
+        before_support: SupportResult::Unknown,
+        after_support: SupportResult::Unknown,
+        before_assertability: PositionAssertability::UnknownWithheldQuarantined,
+        after_assertability: candidate.proposed_assertability,
+        delta: SupportDelta::new(
+            handles,
+            BTreeSet::new(),
+            BTreeSet::new(),
+            BTreeSet::from(["source change".to_owned()]),
+        )
+        .expect("delta"),
+        coverage_delta_digest: candidate.coverage_digest.clone(),
+        conflict_delta_digest: eliot_contracts::sha256_hex(b"no conflicts"),
+        temporal: None,
+        rollback: "restore prior withheld view".to_owned(),
+        repair: None,
+        invalidation: None,
+        proof_digest: proof,
+    })
+    .expect("transition");
+    let command = epistemic_revision_command(
+        PositionId::new("position").expect("position"),
+        expected,
+        &transition,
+        &candidate,
+    )
+    .expect("owner encodes the admitted payload");
+    EpistemicRevisionPayload::from_parameters(&command.parameters).expect("typed payload")
+}
+
+/// Governor leg metadata derived from the payload candidate itself:
+/// request/task/product/fence agreement is the owner readback binding.
+fn leg_context(payload: &EpistemicRevisionPayload) -> RequestMeta {
+    RequestMeta {
+        request_id: payload.candidate.request_id.clone(),
+        session_id: None,
+        task_id: Some(payload.candidate.task_id.clone()),
+        product_id: payload.candidate.work_scope.product_id.clone(),
+        source_id: SourceId::new("governor").expect("source"),
+        state_fence: payload.candidate.fence.clone(),
+        clock: ClockReading::default(),
+    }
+}
+
+/// Caller-appointed revision leg: identity equals the payload
+/// candidate's own operation/idempotency binding.
+fn revision_input(payload: &EpistemicRevisionPayload) -> HopMutationInput {
+    HopMutationInput {
+        identity: OperationIdentity {
+            operation_id: payload.candidate.operation_id.clone(),
+            idempotency_key: payload.candidate.idempotency_key.clone(),
+            canonical_request_hash: "0".repeat(64),
+        },
+        context: leg_context(payload),
+        mutation: HopMutation::Revision(Box::new(payload.clone())),
+        proof_refs: Vec::new(),
+    }
+}
+
+/// Owner-built `ApplyLifecyclePolicy` command with the exact declared
+/// six-field package (mirrors the Governor skill-lifecycle shape).
+fn policy_command() -> NamedMutationRequest {
+    let mut parameters = BTreeMap::new();
+    parameters.insert("action".to_owned(), Value::String("keep".to_owned()));
+    parameters.insert(
+        "base_view_digest".to_owned(),
+        Value::String(eliot_contracts::sha256_hex(b"1905 base view")),
+    );
+    parameters.insert(
+        "candidate_digest".to_owned(),
+        Value::String(eliot_contracts::sha256_hex(b"1905 candidate")),
+    );
+    parameters.insert(
+        "candidate_package_digest".to_owned(),
+        Value::String(eliot_contracts::sha256_hex(b"1905 candidate package")),
+    );
+    parameters.insert(
+        "skill_id".to_owned(),
+        Value::String("skill:test".to_owned()),
+    );
+    parameters.insert(
+        "verifier_ref".to_owned(),
+        Value::String("verifier:test".to_owned()),
+    );
+    NamedMutationRequest {
+        operation: NamedMutationOperation::ApplyLifecyclePolicy,
+        parameters,
+    }
+}
+
+/// Four-hop chain with typed mutation legs, mirroring the B4 acceptance
+/// shapes: genesis capture, forward correction, claim revision, then a
+/// governed policy decision. Returns the request plus the two revision
+/// payloads in hop order.
+fn revision_policy_request() -> (LifecyclePersistRequest, Vec<EpistemicRevisionPayload>) {
+    let genesis = admit_observation_genesis(ObservationGenesisParams {
+        receipt_id: id("receipt:capture"),
+        raw_handle: id("obs:raw-1"),
+        source_anchor: anchor(),
+        actor: actor(ActorKind::DeterministicTransformer),
+        scope: "scope".to_owned(),
+        clock: clock(),
+        state_fence: live_fence(),
+        proof_digest: eliot_contracts::sha256_hex(b"capture-proof"),
+        audit_event_id: Some(id("op-1905-rp-audit-0")),
+    })
+    .expect("genesis admission");
+    let correction = admit_forward_revision(
+        &[genesis],
+        ForwardRevisionParams {
+            receipt_id: id("receipt:correction"),
+            input_record_ids: vec![id("obs:raw-1")],
+            source_anchor: anchor(),
+            prior_role: LifecycleRole::ObservationCandidate,
+            proposed_role: LifecycleRole::ObservationCandidate,
+            prior_status: EpistemicStatus::Observed,
+            proposed_status: EpistemicStatus::Observed,
+            actor: actor(ActorKind::HumanOperator),
+            scope: "scope".to_owned(),
+            clock: clock(),
+            state_fence: live_fence(),
+            evidence_refs: vec![id("obs:raw-1")],
+            counterevidence_refs: Vec::new(),
+            outcome: AdmissionOutcome::CorrectedForward,
+            qualifying_basis: None,
+            supersedes: vec![id("obs:raw-1")],
+            output_record_id: id("obs:raw-2"),
+            proof_digest: eliot_contracts::sha256_hex(b"correction-proof"),
+            audit_event_id: Some(id("op-1905-rp-audit-1")),
+        },
+    )
+    .expect("correction admission");
+    let claim = admit_forward_revision(
+        &correction.ordered,
+        ForwardRevisionParams {
+            receipt_id: id("receipt:claim"),
+            input_record_ids: vec![id("obs:raw-2")],
+            source_anchor: anchor(),
+            prior_role: LifecycleRole::ObservationCandidate,
+            proposed_role: LifecycleRole::Claim,
+            prior_status: EpistemicStatus::Observed,
+            proposed_status: EpistemicStatus::Supported,
+            actor: actor(ActorKind::HumanOperator),
+            scope: "scope".to_owned(),
+            clock: clock(),
+            state_fence: live_fence(),
+            evidence_refs: vec![id("obs:raw-2")],
+            counterevidence_refs: Vec::new(),
+            outcome: AdmissionOutcome::Admitted,
+            qualifying_basis: None,
+            supersedes: Vec::new(),
+            output_record_id: id("claim:1"),
+            proof_digest: eliot_contracts::sha256_hex(b"claim-proof"),
+            audit_event_id: Some(id("op-1905-rp-audit-2")),
+        },
+    )
+    .expect("claim admission");
+    let policy_receipt = eliot_epistemic::lifecycle::LifecycleReceipt::new(
+        eliot_epistemic::lifecycle::LifecycleReceiptParams {
+            receipt_id: id("receipt:active"),
+            input_record_ids: vec![id("claim:1")],
+            source_anchor: anchor(),
+            prior_role: LifecycleRole::Claim,
+            proposed_role: LifecycleRole::Claim,
+            prior_status: EpistemicStatus::Supported,
+            proposed_status: EpistemicStatus::Supported,
+            actor: actor(ActorKind::GovernancePolicy),
+            scope: "scope".to_owned(),
+            clock: clock(),
+            state_fence: live_fence(),
+            evidence_refs: vec![id("claim:1")],
+            counterevidence_refs: Vec::new(),
+            outcome: AdmissionOutcome::Admitted,
+            qualifying_basis: None,
+            supersedes: Vec::new(),
+            output_record_id: id("claim:1"),
+            audit_event_id: Some(id("op-1905-rp-audit-3")),
+            proof_digest: eliot_contracts::sha256_hex(b"policy-proof"),
+        },
+    )
+    .expect("policy receipt");
+    let policy = eliot_memory_curation::admission::CurationAdmission::new(
+        eliot_memory_curation::admission::CurationMutationOperation::ApplyLifecyclePolicy,
+        policy_receipt
+            .link_audit(id("op-1905-rp-audit-3"))
+            .expect("audit linkage"),
+    )
+    .expect("policy admission");
+    let mut chain = claim.ordered;
+    chain.push(policy);
+    let payload0 = epistemic_payload("op-1905-rev-0", "scope", None, None);
+    let rev1 = payload0
+        .next_revision()
+        .expect("first payload advances the position revision");
+    let payload1 = epistemic_payload(
+        "op-1905-rev-1",
+        "scope",
+        Some(rev1),
+        Some(&payload0.candidate.digest),
+    );
+    let payloads = vec![payload0, payload1];
+    let mut hop_identities = vec![OperationIdentity {
+        operation_id: eliot_contracts::OperationId::new("op-1905-rp-capture").expect("operation"),
+        idempotency_key: "idem-1905-rp-capture".to_owned(),
+        canonical_request_hash: "0".repeat(64),
+    }];
+    for index in 0..4 {
+        hop_identities.push(OperationIdentity {
+            operation_id: eliot_contracts::OperationId::new(format!("op-1905-rp-audit-{index}"))
+                .expect("operation"),
+            idempotency_key: format!("idem-1905-rp-audit-{index}"),
+            canonical_request_hash: "0".repeat(64),
+        });
+    }
+    let policy_input = HopMutationInput {
+        identity: OperationIdentity {
+            operation_id: eliot_contracts::OperationId::new("op-1905-pol-0").expect("operation"),
+            idempotency_key: "idem-1905-pol-0".to_owned(),
+            canonical_request_hash: "0".repeat(64),
+        },
+        context: RequestMeta {
+            request_id: eliot_contracts::RequestId::new("op-1905-pol-0").expect("request"),
+            session_id: None,
+            task_id: None,
+            product_id: ProductId::new("product-lifecycle").expect("product"),
+            source_id: SourceId::new("owner-1").expect("source"),
+            state_fence: live_fence(),
+            clock: ClockReading::default(),
+        },
+        mutation: HopMutation::Policy(policy_command()),
+        proof_refs: Vec::new(),
+    };
+    let hop_mutations = vec![
+        None,
+        Some(revision_input(&payloads[0])),
+        Some(revision_input(&payloads[1])),
+        Some(policy_input),
+    ];
+    (
+        LifecyclePersistRequest {
+            context: context(),
+            state_fence: live_fence(),
+            chain,
+            hop_identities,
+            hop_mutations,
+        },
+        payloads,
+    )
+}
+
+#[tokio::test]
+async fn revision_and_policy_hops_persist_typed_payloads_with_owner_reload() {
+    let service = ready_service();
+    let session = session(&service);
+    let (mut request, payloads) = revision_policy_request();
+    seal_request(&mut request);
+    let fake = FakeStore::new();
+    let response = handle_lifecycle_persist_request(&fake, &service, &session, &request)
+        .await
+        .expect("chain persists");
+    assert!(!response.capture_replayed);
+    assert_eq!(response.hops.len(), 4);
+    assert_eq!(response.links.len(), 4);
+    assert_eq!(response.mutations.len(), 3);
+    assert_eq!(response.mutations[0].hop_index, 1);
+    assert_eq!(response.mutations[1].hop_index, 2);
+    assert_eq!(response.mutations[2].hop_index, 3);
+    assert!(response.mutations.iter().all(|leg| !leg.replayed));
+    // Commit order: capture, genesis audit, then per hop the mutation
+    // leg followed by its audit leg.
+    let order = [
+        "op-1905-rp-capture",
+        "op-1905-rp-audit-0",
+        "op-1905-rev-0",
+        "op-1905-rp-audit-1",
+        "op-1905-rev-1",
+        "op-1905-rp-audit-2",
+        "op-1905-pol-0",
+        "op-1905-rp-audit-3",
+    ];
+    let applied = fake.transitions();
+    assert_eq!(applied.len(), order.len());
+    for (transition, expected) in applied.iter().zip(order) {
+        assert_eq!(
+            transition.identity.operation_id.to_string(),
+            *expected,
+            "commit order is exact"
+        );
+    }
+    assert_eq!(fake.apply_calls.load(Ordering::SeqCst), order.len());
+    // Revision legs persist the complete payload bytes, byte-exact.
+    for (recorded, payload) in [(&applied[2], &payloads[0]), (&applied[4], &payloads[1])] {
+        assert_eq!(recorded.transition_class, TransitionClass::Epistemic);
+        let parameters = &recorded.named_operations[0].parameters;
+        let stored: EpistemicRevisionPayload =
+            serde_json::from_value(parameters.get("revision").expect("revision").clone())
+                .expect("payload decodes");
+        assert_eq!(&stored, payload);
+        assert_eq!(stored.position_key().expect("position key").len(), 64);
+    }
+    // Policy leg persists the exact six-field package.
+    assert_eq!(
+        applied[6].named_operations[0].operation,
+        NamedMutationOperation::ApplyLifecyclePolicy
+    );
+    assert_eq!(
+        applied[6].transition_class,
+        TransitionClass::LifecyclePolicy
+    );
+    assert_eq!(applied[6].named_operations[0].parameters.len(), 6);
+    // Owner reload: recorded legs re-derive the identical admitted
+    // commits through the payload owner's readback binding.
+    for (recorded, payload) in [(&applied[2], &payloads[0]), (&applied[4], &payloads[1])] {
+        let context = leg_context(payload);
+        let commit = EpistemicCommit::from_prepared(&context, recorded)
+            .expect("owner binds")
+            .expect("revision commit reloads");
+        assert_eq!(&commit.payload, payload);
+        assert_eq!(&commit.prepared, recorded);
+    }
+    // Audit legs chain through mutation legs with exact positions.
+    for (hop, position) in [(1usize, "1"), (3, "2"), (5, "3"), (7, "4")] {
+        let parameters = &applied[hop].named_operations[0].parameters;
+        assert_eq!(
+            parameters.get("expected_revision").and_then(Value::as_str),
+            Some(position),
+            "hop audit carries its chain position"
+        );
+        assert_eq!(
+            parameters.get("action_digest").and_then(Value::as_str),
+            Some(eliot_store_api::sha256_hex(order[hop - 1].as_bytes()).as_str()),
+            "hop audit chains the previous commit-order identity"
+        );
+    }
+    // Emitted link-back through the exact latest B4 interface: preset
+    // equals appointment, emissions non-empty, original reconstructible.
+    let links: Vec<EmittedAuditLink> = response
+        .links
+        .iter()
+        .map(|link| EmittedAuditLink {
+            curation_receipt_id: link.curation_receipt_id.clone(),
+            audit_operation_id: link.audit_operation_id.clone(),
+            emitted_event_ids: link.emitted_event_ids.clone(),
+        })
+        .collect();
+    let bound = bind_emitted_audit_events(&request.chain, &links).expect("link-back verifies");
+    assert_eq!(bound.original_input, id("obs:raw-1"));
+    assert_eq!(bound.current_output, id("claim:1"));
+    // Mutation legs emit no lifecycle events of their own; linkage
+    // flows through the adjacent audit legs only.
+    assert_eq!(
+        response.capture_emitted_event_ids,
+        vec!["receipt:capture".to_owned()]
+    );
+    for leg in &response.mutations {
+        assert!(leg.emitted_event_ids.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn mutation_mismatch_and_paraphrase_refusal_fail_before_dispatch() {
+    use eliot_epistemic::lifecycle::LifecycleError;
+    use eliot_memory_curation::admission::AdmissionError;
+
+    let service = ready_service();
+    let session = session(&service);
+    let fake = FakeStore::new();
+    // A mutation leg on the genesis hop would double-persist the raw input.
+    let mut request = persist_request("chain-7");
+    let payload = epistemic_payload("op-1905-rev-x", "scope", None, None);
+    request.hop_mutations[0] = Some(revision_input(&payload));
+    let outcome = handle_lifecycle_persist_request(&fake, &service, &session, &request).await;
+    assert!(matches!(
+        outcome,
+        Err(LifecyclePersistError::InvalidField { .. })
+    ));
+    assert_eq!(fake.apply_calls.load(Ordering::SeqCst), 0);
+    // A foreign payload scope never binds the admission.
+    let mut request = persist_request("chain-8");
+    let foreign = epistemic_payload("op-1905-rev-y", "foreign-scope", None, None);
+    request.hop_mutations[1] = Some(revision_input(&foreign));
+    let outcome = handle_lifecycle_persist_request(&fake, &service, &session, &request).await;
+    assert!(matches!(
+        outcome,
+        Err(LifecyclePersistError::InvalidField { .. })
+    ));
+    assert_eq!(fake.apply_calls.load(Ordering::SeqCst), 0);
+    // A policy command on a revision hop refuses: operation and
+    // admission disagree.
+    let mut request = persist_request("chain-9");
+    request.hop_mutations[1] = Some(HopMutationInput {
+        identity: OperationIdentity {
+            operation_id: eliot_contracts::OperationId::new("op-1905-pol-x").expect("operation"),
+            idempotency_key: "idem-1905-pol-x".to_owned(),
+            canonical_request_hash: "0".repeat(64),
+        },
+        context: RequestMeta {
+            request_id: eliot_contracts::RequestId::new("op-1905-pol-x").expect("request"),
+            session_id: None,
+            task_id: None,
+            product_id: ProductId::new("product-lifecycle").expect("product"),
+            source_id: SourceId::new("owner-1").expect("source"),
+            state_fence: live_fence(),
+            clock: ClockReading::default(),
+        },
+        mutation: HopMutation::Policy(policy_command()),
+        proof_refs: Vec::new(),
+    });
+    let outcome = handle_lifecycle_persist_request(&fake, &service, &session, &request).await;
+    assert!(matches!(
+        outcome,
+        Err(LifecyclePersistError::InvalidField { .. })
+    ));
+    assert_eq!(fake.apply_calls.load(Ordering::SeqCst), 0);
+    // A model paraphrase claiming proof standing without an independent
+    // basis is refused by the curation owner before any persist request
+    // exists — never promoted, never dispatched.
+    let refused = admit_forward_revision(
+        &request.chain[..1],
+        ForwardRevisionParams {
+            receipt_id: id("receipt:paraphrase"),
+            input_record_ids: vec![id("obs:raw-1")],
+            source_anchor: anchor(),
+            prior_role: LifecycleRole::ObservationCandidate,
+            proposed_role: LifecycleRole::Proof,
+            prior_status: EpistemicStatus::Observed,
+            proposed_status: EpistemicStatus::Supported,
+            actor: actor(ActorKind::ModelTransformer),
+            scope: "scope".to_owned(),
+            clock: clock(),
+            state_fence: live_fence(),
+            evidence_refs: vec![id("obs:raw-1")],
+            counterevidence_refs: Vec::new(),
+            outcome: AdmissionOutcome::Admitted,
+            qualifying_basis: None,
+            supersedes: Vec::new(),
+            output_record_id: id("proof:1"),
+            proof_digest: eliot_contracts::sha256_hex(b"paraphrase-proof"),
+            audit_event_id: Some(id("op-1905-audit-P")),
+        },
+    );
+    assert!(
+        matches!(
+            refused,
+            Err(AdmissionError::Lifecycle(
+                LifecycleError::ForbiddenElevation { .. }
+            ))
+        ),
+        "model paraphrase must be refused elevated standing"
+    );
     assert_eq!(fake.apply_calls.load(Ordering::SeqCst), 0);
 }
