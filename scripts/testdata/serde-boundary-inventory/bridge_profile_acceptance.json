@@ -1,0 +1,24 @@
+{
+  "schema": "eliot.bridge-profile-acceptance.v1",
+  "profile_id": "eliot.agent-bridge.request-input.v1",
+  "profile_revision": "v1",
+  "owner": "#977",
+  "note": "Accepted-profile identity for #929 allocation binding. Parsed by scripts/serde_boundary_inventory.py and compared against live source bytes; limit values are never copied from here. Source of truth: control-20260921/977-profile-acceptance.md as controller-accepted.",
+  "acceptance": {
+    "packet": "control-20260921/977-profile-acceptance.md",
+    "packet_sha256": "84bcaacb9770136cd2975ffb893675acc2b9be6474470dda13891d35a484f231",
+    "pr": 2314,
+    "merge": "52941612f53450da3b0cd5f06f82067b6421b02a",
+    "candidate": "0fee67d9b783ed4211c59a7591e8fbbccd27832b"
+  },
+  "sources": {
+    "bins/eliot-agent-bridge/src/main.rs": "575598592da95e3d8b54fa26c38eb377713893aad3c20677c08fd4b3cf37e577",
+    "bins/eliot-agent-bridge/src/request_input.rs": "f294444a54be8ab037ffc291e458d1fcae63797444d0f731cd6c37dfe5bbddc2",
+    "bins/eliot-agent-bridge/tests/data/request_input_cases.json": "350fa7dd446468794af35067554c02ecf15f4e224314ddfcbcd8a7847c6233ad",
+    "bins/eliot-agent-bridge/tests/request_input_cases.rs": "b17b66ccfda43ba6054e5b54e3569f8cfbd1c69b664de4e2e3842f256f1acb03"
+  },
+  "corpus": {
+    "path": "bins/eliot-agent-bridge/tests/data/request_input_cases.json",
+    "cases": 32
+  }
+}

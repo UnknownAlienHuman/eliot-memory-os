@@ -57,6 +57,7 @@ const KERNEL_ORS_FILE_NAME: &str = "kernel-ors.redb";
 const HOST_JOURNAL_FILE_NAME: &str = "host-state-journal.redb";
 
 mod diagnostics;
+mod heartbeat_transport;
 mod host_identity_observation;
 mod runtime_manifest_selection;
 mod scm_launch;
@@ -142,6 +143,9 @@ use watchdog_admission::validate_runtime_binding;
 pub use watchdog_admission::{FileWatchdogAdmission, WatchdogRuntimeBinding};
 pub use watchdog_composition::{WatchdogAuthorityState, WatchdogComposition, WatchdogReadiness};
 pub use watchdog_config::WatchdogConfig;
+pub use heartbeat_transport::{
+    FENCE_SEQUENCE, HeartbeatTransport, HeartbeatTransportDescriptor, HeartbeatTransportError,
+};
 
 /// Canonical public admission template shared with Host/runtime-status.
 pub type WatchdogAdmissionConfig = WatchdogAdmissionTemplate;

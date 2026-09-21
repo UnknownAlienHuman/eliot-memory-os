@@ -25,9 +25,9 @@ use eliot_platform_windows::ServiceBootstrapArguments;
 #[cfg(windows)]
 use eliot_platform_windows::WindowsPlatform;
 use eliot_watchdog::{
-    FileWatchdogAdmission, INSTALLATION_REGISTRY_FILE_NAME, IndependentKernelSensor,
-    LiveHostObservationSource, SERVICE_NAME, WatchdogAdmissionSource, WatchdogComposition,
-    WatchdogConfig, WatchdogReadiness, inspect_approved_host_registration,
+    FileWatchdogAdmission, HeartbeatTransport, INSTALLATION_REGISTRY_FILE_NAME,
+    IndependentKernelSensor, LiveHostObservationSource, SERVICE_NAME, WatchdogAdmissionSource,
+    WatchdogComposition, WatchdogConfig, WatchdogReadiness, inspect_approved_host_registration,
 };
 
 #[cfg(windows)]
@@ -53,13 +53,29 @@ pub(super) fn run_watchdog(
         .host_state_root()
         .ok_or_else(|| "SCM bootstrap omitted the installer-approved Host state root".to_owned())?;
     let registry_path = host_state_root.join(INSTALLATION_REGISTRY_FILE_NAME);
+    // The heartbeat transport binds this exact bootstrap contour and arms
+    // lazily from the Host-issued descriptor file, so a descriptor issued
+    // after Watchdog start (pre-Phase-B fence, then Host start) is picked
+    // up without a restart. Absent or invalid files degrade to
+    // stdout-only; supervision never fails for transport state.
+    let heartbeat = Arc::new(HeartbeatTransport::for_bootstrap(
+        &host_state_root,
+        bootstrap.installation_id(),
+        bootstrap.transaction_plan_generation(),
+        WatchdogConfig::default().tick_interval,
+    ));
     // The lease is issued by the Host/Kernel contour.  There is deliberately
     // no genesis/default lease in this process.  A stale or missing lease
     // starts a gap-only sensor so the Watchdog can remain alive and record a
     // bounded observation; the sensor gains heartbeat authority only after a
     // later, freshly verified lease.  The source is retained by the
     // composition and reloaded before every observation.
-    let admission_source = match wait_for_durable_admission(registry_path, bootstrap, &stop_signal)?
+    let admission_source = match wait_for_durable_admission(
+        registry_path,
+        bootstrap,
+        &stop_signal,
+        heartbeat.clone(),
+    )?
     {
         Some(admission) => {
             tracing::info!(
@@ -91,12 +107,13 @@ pub(super) fn run_watchdog(
         }
         .map_err(|error| error.to_string())?,
     );
-    let composition = WatchdogComposition::start_with_shutdown_and_host(
+    let composition = WatchdogComposition::start_with_shutdown_and_host_and_heartbeat(
         WatchdogConfig::default(),
         admission_source,
         sensor,
         Arc::new(LiveHostObservationSource::from_binding(&binding)),
         stop_signal,
+        Some(heartbeat),
     )
     .map_err(|error| error.to_string())?;
     #[cfg(windows)]
@@ -234,7 +251,10 @@ fn report_transient_registry_lock(detail: &str) {
 /// with no coverage claimed. Only a successful
 /// `pending_phase_b_fence_readiness` probe reaches this; a transient lock is
 /// never announced as fenced.
-fn announce_fence_readiness(fence: &WatchdogReadiness) -> Result<(), String> {
+fn announce_fence_readiness(
+    fence: &WatchdogReadiness,
+    heartbeat: &HeartbeatTransport,
+) -> Result<(), String> {
     tracing::info!(
         event = "watchdog.fence_readiness",
         observation = "admitted",
@@ -242,6 +262,16 @@ fn announce_fence_readiness(fence: &WatchdogReadiness) -> Result<(), String> {
     );
     serde_json::to_writer(&mut io::stdout().lock(), fence).map_err(|error| format!("{error:?}"))?;
     writeln!(io::stdout().lock()).map_err(|error| error.to_string())?;
+    // Transport1750: the same fence projection rides the Host-owned pipe at
+    // sequence zero when the Host already issued this contour a descriptor.
+    // Best-effort on a throwaway runtime: a missing listener only costs one
+    // failed open, and stdout above remains the durable announce.
+    if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        runtime.block_on(heartbeat.emit_fence(fence));
+    }
     #[cfg(windows)]
     set_service_status_running();
     Ok(())
@@ -264,6 +294,7 @@ fn wait_for_durable_admission(
     registry_path: PathBuf,
     bootstrap: ServiceBootstrapArguments,
     stop_signal: &AtomicBool,
+    heartbeat: Arc<HeartbeatTransport>,
 ) -> Result<Option<FileWatchdogAdmission>, String> {
     let _admission_span = tracing::info_span!("watchdog.durable_admission").entered();
     match FileWatchdogAdmission::from_registry(registry_path.clone(), bootstrap.clone()) {
@@ -280,7 +311,7 @@ fn wait_for_durable_admission(
                 bootstrap.clone(),
             ) {
                 Ok(fence) => {
-                    announce_fence_readiness(&fence)?;
+                    announce_fence_readiness(&fence, &heartbeat)?;
                     fence_announced = true;
                 }
                 Err(fence_error) => {
@@ -314,7 +345,7 @@ fn wait_for_durable_admission(
                             Ok(fence) => {
                                 transient_streak = 0;
                                 if !fence_announced {
-                                    announce_fence_readiness(&fence)?;
+                                    announce_fence_readiness(&fence, &heartbeat)?;
                                     fence_announced = true;
                                 }
                                 std::thread::sleep(PENDING_PHASE_B_FENCE_POLL);

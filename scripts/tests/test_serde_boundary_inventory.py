@@ -38,6 +38,7 @@ FROZEN_FIXTURES = [
     "unsupported.rs",
     "test_scope.rs",
     "profile_bridge.json",
+    "bridge_profile_acceptance.json",
 ]
 
 FIXTURE_RS = [n for n in FROZEN_FIXTURES if n.endswith(".rs")]
