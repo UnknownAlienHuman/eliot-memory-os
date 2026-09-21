@@ -569,6 +569,59 @@ static GET_NOTIFICATION_STATE_PARAMETERS: [ParameterDeclaration; 6] = [
     },
 ];
 
+/// Owner-approved reactive-ledger upsert fields (issue #1941 C4): the exact
+/// session selector plus the opaque bridge ledger snapshot. Snapshot
+/// contract/bounds are enforced by the reactive-state contract.
+static APPLY_REACTIVE_LEDGER_PARAMETERS: [ParameterDeclaration; 2] = [
+    ParameterDeclaration {
+        name: "session_id",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "ledger_json",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+];
+
+/// Owner-approved reactive-ledger read selector (issue #1941 C4): the exact
+/// session identity.
+static GET_REACTIVE_LEDGER_PARAMETERS: [ParameterDeclaration; 1] = [ParameterDeclaration {
+    name: "session_id",
+    shape: ParameterShape::Subject,
+    required: true,
+}];
+
+/// Owner-approved resource-snapshot upsert fields (issue #1941 C4): the
+/// canonical URI, the content digest, and the base64 bytes. Digest/bytes
+/// agreement and URI grammar are enforced by the reactive-state contract.
+static APPLY_RESOURCE_SNAPSHOT_PARAMETERS: [ParameterDeclaration; 3] = [
+    ParameterDeclaration {
+        name: "uri",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "content_sha256",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "content_base64",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+];
+
+/// Owner-approved resource-snapshot read selector (issue #1941 C4): the
+/// exact canonical URI.
+static GET_RESOURCE_SNAPSHOT_PARAMETERS: [ParameterDeclaration; 1] = [ParameterDeclaration {
+    name: "uri",
+    shape: ParameterShape::Subject,
+    required: true,
+}];
+
 /// Owner-approved task-control fields emitted by the Governor task lifecycle
 /// envelope (`crates/governor/eliot-governor/src/task_lifecycle.rs`,
 /// `task_envelope`): the transitioned `task_id`, the admitted `event_id`, the
@@ -619,6 +672,8 @@ pub const fn named_read_operation_name(operation: NamedReadOperation) -> &'stati
     match operation {
         NamedReadOperation::GetRevisionHeads => "GetRevisionHeads",
         NamedReadOperation::GetNotificationState => "GetNotificationState",
+        NamedReadOperation::GetReactiveInjectionState => "GetReactiveInjectionState",
+        NamedReadOperation::GetResourceSnapshot => "GetResourceSnapshot",
         NamedReadOperation::GetScopeRevisionView => "GetScopeRevisionView",
         NamedReadOperation::GetOrderingHeads => "GetOrderingHeads",
         NamedReadOperation::GetTaskState => "GetTaskState",
@@ -660,6 +715,8 @@ pub const fn named_read_operation_by_name(name: &str) -> Option<NamedReadOperati
         b"ResolveWriteReceipt" => Some(NamedReadOperation::ResolveWriteReceipt),
         b"GetAuthorityRevocationHistory" => Some(NamedReadOperation::GetAuthorityRevocationHistory),
         b"GetNotificationState" => Some(NamedReadOperation::GetNotificationState),
+        b"GetReactiveInjectionState" => Some(NamedReadOperation::GetReactiveInjectionState),
+        b"GetResourceSnapshot" => Some(NamedReadOperation::GetResourceSnapshot),
         _ => None,
     }
 }
@@ -677,6 +734,8 @@ pub const fn named_mutation_operation_name(operation: NamedMutationOperation) ->
         NamedMutationOperation::RecordAuthorityRevocation => "RecordAuthorityRevocation",
         NamedMutationOperation::ApplyErasure => "ApplyErasure",
         NamedMutationOperation::ApplyNotificationState => "ApplyNotificationState",
+        NamedMutationOperation::ApplyReactiveInjectionState => "ApplyReactiveInjectionState",
+        NamedMutationOperation::ApplyResourceSnapshot => "ApplyResourceSnapshot",
     }
 }
 
@@ -693,6 +752,8 @@ pub const fn named_mutation_operation_by_name(name: &str) -> Option<NamedMutatio
         b"RecordAuthorityRevocation" => Some(NamedMutationOperation::RecordAuthorityRevocation),
         b"ApplyErasure" => Some(NamedMutationOperation::ApplyErasure),
         b"ApplyNotificationState" => Some(NamedMutationOperation::ApplyNotificationState),
+        b"ApplyReactiveInjectionState" => Some(NamedMutationOperation::ApplyReactiveInjectionState),
+        b"ApplyResourceSnapshot" => Some(NamedMutationOperation::ApplyResourceSnapshot),
         _ => None,
     }
 }
@@ -714,6 +775,9 @@ pub const fn named_mutation_operation_by_name(name: &str) -> Option<NamedMutatio
 /// bound; `GetNotificationState` declares the optional `scope` filter, the
 /// optional exact `dedup_key` selector, the required `include_resolved` flag,
 /// the required decimal `page_limit` bound, and the optional opaque `cursor`;
+/// `GetReactiveInjectionState` declares the required exact `session_id`
+/// selector; `GetResourceSnapshot` declares the required exact `uri`
+/// selector;
 /// every other variant declares none, so any supplied parameter fails closed. Variants without a catalogue entry never
 /// reach this table: they fail as [`StoreError::UnknownOperation`] first.
 #[must_use]
@@ -734,6 +798,8 @@ pub const fn declared_read_parameters(
         }
         NamedReadOperation::GetCapabilityEvidenceState => &GET_CAPABILITY_EVIDENCE_STATE_PARAMETERS,
         NamedReadOperation::GetNotificationState => &GET_NOTIFICATION_STATE_PARAMETERS,
+        NamedReadOperation::GetReactiveInjectionState => &GET_REACTIVE_LEDGER_PARAMETERS,
+        NamedReadOperation::GetResourceSnapshot => &GET_RESOURCE_SNAPSHOT_PARAMETERS,
         NamedReadOperation::GetRevisionHeads
         | NamedReadOperation::GetScopeRevisionView
         | NamedReadOperation::GetOrderingHeads
@@ -771,6 +837,11 @@ pub const fn declared_read_parameters(
 /// `source_receipt_json`, `delivery_json`, `channel`, `notification_id`,
 /// `principal`, `disposition`, `authorization_json`; leg completeness is
 /// enforced by the notification-state contract);
+/// `ApplyReactiveInjectionState` declares the required `session_id` plus the
+/// opaque `ledger_json` snapshot (contract/bounds enforced by the
+/// reactive-state contract); `ApplyResourceSnapshot` declares the required
+/// `uri`, `content_sha256`, and `content_base64` (grammar/digest agreement
+/// enforced by the reactive-state contract);
 /// every other variant declares none,
 /// so any supplied parameter fails closed. Variants without a catalogue entry
 /// never reach this table: they fail as [`StoreError::UnknownOperation`] first.
@@ -790,6 +861,8 @@ pub const fn declared_mutation_parameters(
         NamedMutationOperation::ApplyErasure => &APPLY_ERASURE_PARAMETERS,
         NamedMutationOperation::ApplyEpistemicRevision => &EPISTEMIC_REVISION_PARAMETERS,
         NamedMutationOperation::ApplyNotificationState => &APPLY_NOTIFICATION_STATE_PARAMETERS,
+        NamedMutationOperation::ApplyReactiveInjectionState => &APPLY_REACTIVE_LEDGER_PARAMETERS,
+        NamedMutationOperation::ApplyResourceSnapshot => &APPLY_RESOURCE_SNAPSHOT_PARAMETERS,
     }
 }
 

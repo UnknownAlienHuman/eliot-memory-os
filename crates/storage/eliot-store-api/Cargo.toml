@@ -7,6 +7,7 @@ license.workspace = true
 description = "Store-neutral ELIOT canonical storage contracts"
 
 [dependencies]
+base64.workspace = true
 eliot-contracts = { workspace = true }
 eliot-evidence = { workspace = true }
 eliot-epistemic-contracts = { path = "../../smart/eliot-epistemic-contracts" }

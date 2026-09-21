@@ -35,6 +35,7 @@ pub mod epistemic_revision;
 pub mod erasure_admission;
 mod notification_state;
 mod payload_authority;
+mod reactive_state;
 mod request_hash;
 mod store_failure;
 mod wire;
@@ -68,6 +69,23 @@ pub use payload_authority::{
     CONTROL_FIELD_DENYLIST, CanonicalJson, ExactJsonBytes, MAX_EXACT_JSON_BYTES,
     PAYLOAD_AUTHORITY_VERSION, PayloadEncoding, PayloadSource, json_shape_name,
     number_token_would_narrow, reject_control_parameter_name,
+};
+
+pub use reactive_state::{
+    DecodedReactiveMutation, MAX_REACTIVE_LEDGER_BYTES, MAX_RESOURCE_CONTENT_BYTES,
+    MAX_RESOURCE_URI_BYTES, MAX_SESSION_ID_BYTES, REACTIVE_LEDGER_CONTRACT_V1,
+    REACTIVE_LEDGER_MUTATION_NAME, REACTIVE_LEDGER_READ_NAME, REACTIVE_PAGE_LEDGER_JSON,
+    REACTIVE_PAGE_REVISION, REACTIVE_PAGE_SESSION_ID, REACTIVE_PAGE_STATE_FENCE,
+    REACTIVE_PARAM_CONTENT_BASE64, REACTIVE_PARAM_CONTENT_SHA256, REACTIVE_PARAM_LEDGER_JSON,
+    REACTIVE_PARAM_SESSION_ID, REACTIVE_PARAM_URI, REACTIVE_STATE_SCHEMA_V1, REACTIVE_STATE_SCOPE,
+    RESOURCE_SNAPSHOT_MUTATION_NAME, RESOURCE_SNAPSHOT_READ_NAME, RESOURCE_URI_SCHEME,
+    ReactiveContractError, SNAPSHOT_PAGE_CONTENT_BASE64, SNAPSHOT_PAGE_CONTENT_SHA256,
+    SNAPSHOT_PAGE_REVISION, SNAPSHOT_PAGE_STATE_FENCE, SNAPSHOT_PAGE_URI, decode_reactive_mutation,
+    decode_resource_content, encode_resource_content, reactive_ledger_mutation_request,
+    reactive_ledger_read_request, resource_snapshot_mutation_request,
+    resource_snapshot_read_request, validate_ledger_json, validate_reactive_ledger_read_params,
+    validate_reactive_mutation_params, validate_resource_snapshot_read_params,
+    validate_resource_uri, validate_sha256_hex,
 };
 
 pub use request_hash::{
@@ -619,6 +637,17 @@ pub enum TransitionClass {
     /// closed notification typed parameters. The ceiling is the maximum
     /// store-allowed reversible effect; existing class maxima are unchanged.
     NotificationState,
+    /// Canonical reactive delivery-record + resource-snapshot persistence
+    /// (issue #1941 C4).
+    ///
+    /// Store-owned durable rows for the bridge's attach-scoped delivery
+    /// state: per-session ledger snapshots (opaque bridge bytes, upsert by
+    /// session, revision-guarded) and immutable revisioned resource
+    /// snapshots (upsert by URI, rewrite-with-different-bytes refused).
+    /// Applied only through the named reactive transactions carrying the
+    /// closed reactive typed parameters. The ceiling is the maximum
+    /// store-allowed reversible effect; existing class maxima are unchanged.
+    ReactiveState,
 }
 
 impl TransitionClass {
@@ -630,7 +659,8 @@ impl TransitionClass {
             | Self::LifecyclePolicy
             | Self::RecoverySchema
             | Self::Erasure
-            | Self::NotificationState => EffectClass::ReversibleMutation,
+            | Self::NotificationState
+            | Self::ReactiveState => EffectClass::ReversibleMutation,
         }
     }
 }
@@ -685,6 +715,10 @@ pub enum NamedReadOperation {
     GetAuthorityRevocationHistory,
     /// Canonical notification-state read (issue #1780).
     GetNotificationState,
+    /// Canonical reactive-ledger read (issue #1941 C4).
+    GetReactiveInjectionState,
+    /// Canonical resource-snapshot read (issue #1941 C4).
+    GetResourceSnapshot,
 }
 
 /// Closed mutation catalogue activated by the current contract catalogue.
@@ -722,6 +756,24 @@ pub enum NamedMutationOperation {
     /// parameters. The store bridge applies only the recorded plan; it never
     /// derives delivery or resolution semantics.
     ApplyNotificationState,
+    /// Canonical reactive-ledger transaction (issue #1941 C4).
+    ///
+    /// Durable per-session delivery-record persistence only: the prepared
+    /// transition must carry [`TransitionClass::ReactiveState`], the
+    /// declared reactive effect ceiling, and the closed reactive typed
+    /// parameters (`session_id` plus the opaque bridge ledger snapshot).
+    /// The store bridge persists the bytes verbatim; it never interprets
+    /// delivery, dedup, or stickiness.
+    ApplyReactiveInjectionState,
+    /// Canonical resource-snapshot transaction (issue #1941 C4).
+    ///
+    /// Durable revisioned resource serving only: the prepared transition
+    /// must carry [`TransitionClass::ReactiveState`], the declared reactive
+    /// effect ceiling, and the closed snapshot typed parameters (canonical
+    /// URI, content digest, base64 bytes). The store bridge verifies the
+    /// digest over the decoded bytes and refuses URI rewrites; it never
+    /// mints identity or resolves handles.
+    ApplyResourceSnapshot,
 }
 
 impl NamedMutationOperation {
@@ -737,6 +789,9 @@ impl NamedMutationOperation {
             }
             Self::ApplyErasure => TransitionClass::Erasure,
             Self::ApplyNotificationState => TransitionClass::NotificationState,
+            Self::ApplyReactiveInjectionState | Self::ApplyResourceSnapshot => {
+                TransitionClass::ReactiveState
+            }
         }
     }
 }
@@ -2066,6 +2121,7 @@ fn operation_kind(class: TransitionClass) -> &'static str {
         TransitionClass::RecoverySchema => "store.apply.recovery_schema",
         TransitionClass::Erasure => "store.apply.erasure",
         TransitionClass::NotificationState => "store.apply.notification_state",
+        TransitionClass::ReactiveState => "store.apply.reactive_state",
     }
 }
 
