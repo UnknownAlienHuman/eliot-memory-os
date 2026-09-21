@@ -63,8 +63,11 @@ pub const CONFORMANCE_SEED: u64 = 0x1956;
 /// Promotion corpus expectations computed via the real conformance oracle.
 ///
 /// `corpus_digest` binds the covered input; the expected digests bind the
-/// oracle's deterministic output over it. Empty effects/delta digest honestly
-/// (the pure core reports none) — no digest convention is manufactured.
+/// oracle's deterministic output over it. Digest schemes match the neutral
+/// `derive_execution` exactly (result and state delta hash raw bytes;
+/// effects hash canonical JSON) so expectations compare equal with
+/// runtime-derived evidence. Empty effects/delta digest honestly (the pure
+/// core reports none) — no digest convention is manufactured.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PromotionExpectations {
     /// Digest of the covered corpus input bytes.
@@ -73,15 +76,17 @@ pub struct PromotionExpectations {
     pub expected_result_digest: Sha256Digest,
     /// Digest of the oracle effect proposals (canonically encoded).
     pub expected_effect_digest: Sha256Digest,
-    /// Digest of the oracle state delta (canonically encoded).
+    /// Digest of the oracle state delta (raw bytes, matching the neutral
+    /// execution-evidence scheme).
     pub expected_state_delta_digest: Sha256Digest,
 }
 
 impl PromotionExpectations {
     /// Computes expectations by invoking the real deterministic core over
     /// the given input and seed. Pure computation: no reads, no clock, no
-    /// randomness, no hardcoded digests. Effect and state-delta digests use
-    /// the same canonical JSON scheme as the neutral digest helper.
+    /// randomness, no hardcoded digests. Result and state-delta digests hash
+    /// raw bytes; effect digests use the canonical JSON scheme — exactly the
+    /// neutral `derive_execution` scheme.
     ///
     /// # Errors
     ///
@@ -115,22 +120,16 @@ impl PromotionExpectations {
         seed: u64,
     ) -> Result<Self, PortError> {
         let outcome = DeterministicEchoCore::new(component).invoke(input, seed);
-        let canonical = |bytes: &[u8]| Sha256Digest::of_bytes(bytes);
-        let canonical_json = |value: &Vec<u8>| {
-            canonical_json_bytes(value)
-                .map(|bytes| Sha256Digest::of_bytes(&bytes))
-                .map_err(|_| PortError::Denied)
-        };
         let canonical_effects = |effects: &Vec<EffectProposal>| {
             canonical_json_bytes(effects)
                 .map(|bytes| Sha256Digest::of_bytes(&bytes))
                 .map_err(|_| PortError::Denied)
         };
         Ok(Self {
-            corpus_digest: canonical(input),
-            expected_result_digest: canonical(&outcome.result),
+            corpus_digest: Sha256Digest::of_bytes(input),
+            expected_result_digest: Sha256Digest::of_bytes(&outcome.result),
             expected_effect_digest: canonical_effects(&outcome.effects)?,
-            expected_state_delta_digest: canonical_json(&outcome.state_delta)?,
+            expected_state_delta_digest: Sha256Digest::of_bytes(&outcome.state_delta),
         })
     }
 }
@@ -542,11 +541,7 @@ impl PromotionVerificationPort for GovernorWasmAdmission {
                     &canonical_json_bytes(&report.proposed_effects)
                         .map_err(|_| PortError::Denied)?,
                 )
-            && derived.state_delta_digest
-                == Sha256Digest::of_bytes(
-                    &canonical_json_bytes(&report.observed_state_delta)
-                        .map_err(|_| PortError::Denied)?,
-                );
+            && derived.state_delta_digest == Sha256Digest::of_bytes(&report.observed_state_delta);
         if exact {
             Ok(())
         } else {
