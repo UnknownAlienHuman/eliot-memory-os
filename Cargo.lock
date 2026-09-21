@@ -3031,6 +3031,7 @@ dependencies = [
  "eliot-governor",
  "eliot-ipc",
  "eliot-maintenance",
+ "eliot-observability",
  "eliot-platform",
  "eliot-platform-windows",
  "eliot-protocol",
