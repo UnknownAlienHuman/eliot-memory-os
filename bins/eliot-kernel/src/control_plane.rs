@@ -198,10 +198,7 @@ impl KernelComposition {
         expected_sequence: u64,
     ) -> Result<KernelControlResponse, TransportError> {
         observe_control("kernel.control.request_received", "attempt");
-        match self
-            .apply_control_request_inner(request, peer, expected_sequence)
-            .await
-        {
+        match Box::pin(self.apply_control_request_inner(request, peer, expected_sequence)).await {
             Ok(response) => {
                 observe_control("kernel.control.request_admitted", "success");
                 Ok(response)
@@ -276,16 +273,10 @@ impl KernelComposition {
             let policy_epoch = policy.module_generation.state_fence.authority_epoch.clone();
             let epoch_mismatch = {
                 let candidate = &request.candidate.kernel_epoch;
-                if candidate.is_same_authority(&policy_epoch) {
-                    false
-                } else if reconcile
-                    && candidate.lineage_id == policy_epoch.lineage_id
-                    && candidate.sequence.get() > policy_epoch.sequence.get()
-                {
-                    false
-                } else {
-                    true
-                }
+                !(candidate.is_same_authority(&policy_epoch)
+                    || (reconcile
+                        && candidate.lineage_id == policy_epoch.lineage_id
+                        && candidate.sequence.get() > policy_epoch.sequence.get()))
             };
             if request.generation != policy.module_generation.generation
                 || epoch_mismatch
@@ -313,6 +304,9 @@ impl KernelComposition {
                 policy.module_generation.state_fence =
                     StateFence::new(request.candidate.kernel_epoch.clone(), request.generation);
             }
+        }
+        if let KernelControlCommand::ReportHostStartupEvidence(evidence) = &request.command {
+            self.consume_host_startup_evidence(evidence)?;
         }
         if let Some(handoff) = bootstrap {
             self.install_store_bootstrap(handoff.clone())
@@ -554,6 +548,8 @@ impl KernelComposition {
             if after_receipt_readback.as_ref() != Some(expected) {
                 return Err(TransportError::SessionFenced);
             }
+            self.record_startup_evidence(11)
+                .map_err(|_| TransportError::SessionFenced)?;
         }
         #[cfg(windows)]
         let prepared_bridge_profile = if matches!(
@@ -609,6 +605,8 @@ impl KernelComposition {
                 .map_err(|_| TransportError::SessionFenced)?
                 .publish_ready(receipt.clone())
                 .map_err(|_| TransportError::SessionFenced)?;
+            self.record_startup_evidence(10)
+                .map_err(|_| TransportError::SessionFenced)?;
         } else {
             match &request.command {
                 KernelControlCommand::Reconcile => self
@@ -621,7 +619,8 @@ impl KernelComposition {
                 | KernelControlCommand::Activate(_)
                 | KernelControlCommand::ReconcileActivation(_)
                 | KernelControlCommand::RebindStore(_)
-                | KernelControlCommand::ReconcileRebindStore(_) => {}
+                | KernelControlCommand::ReconcileRebindStore(_)
+                | KernelControlCommand::ReportHostStartupEvidence(_) => {}
                 command => {
                     self.apply_control(command.clone())
                         .map_err(|_| TransportError::SessionFenced)?;
@@ -652,6 +651,31 @@ impl KernelComposition {
         }
         .with_computed_digest()
         .map_err(|_| TransportError::SessionFenced)
+    }
+
+    /// Consumes one authenticated Host startup-evidence carrier. Host owns
+    /// probe truth; Kernel owns only the I1.11 cursor. The request boundary
+    /// validates candidate/fence binding before this method is reached.
+    fn consume_host_startup_evidence(
+        &self,
+        evidence: &HostStartupEvidence,
+    ) -> Result<(), TransportError> {
+        // Keep the consumer boundary explicit if another authenticated
+        // composition path reuses this helper without `KernelControlRequest`.
+        evidence
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        // Record each observed probe independently: an absent Blob manifest
+        // never becomes a fabricated step-4 success.
+        self.record_startup_evidence(1)
+            .map_err(|_| TransportError::SessionFenced)?;
+        self.record_startup_evidence(2)
+            .map_err(|_| TransportError::SessionFenced)?;
+        if evidence.blob_manifest_digest.is_some() {
+            self.record_startup_evidence(4)
+                .map_err(|_| TransportError::SessionFenced)?;
+        }
+        Ok(())
     }
 
     /// Returns the runtime's protected-control capacity.
@@ -688,6 +712,82 @@ mod control_plane_diagnostics_tests {
     //! digests, and peer material never reach the sink.
 
     use super::*;
+
+    fn host_startup_evidence(blob_manifest_digest: Option<&str>) -> HostStartupEvidence {
+        let epoch = eliot_contracts::EpochId::new(
+            eliot_contracts::EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                .expect("test lineage"),
+            std::num::NonZeroU64::new(1).expect("test epoch"),
+        )
+        .expect("test epoch");
+        HostStartupEvidence {
+            candidate_digest: "ab".repeat(32),
+            state_fence: StateFence::new(
+                epoch,
+                eliot_contracts::ResourceGeneration::new(1).expect("test generation"),
+            ),
+            host_record_checksum: eliot_platform::PlatformHandle::new("journal-checksum-1")
+                .expect("journal handle"),
+            artifact_registry_digest: eliot_platform::PlatformHandle::new("registry-manifest-1")
+                .expect("registry handle"),
+            scm_watchdog_observation_digest: eliot_platform::PlatformHandle::new(format!(
+                "host-scm-watchdog:4242:987654321:{}",
+                "cd".repeat(32)
+            ))
+            .expect("SCM handle"),
+            blob_manifest_digest: blob_manifest_digest
+                .map(|digest| eliot_platform::PlatformHandle::new(digest).expect("Blob handle")),
+            evidence_refs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn host_evidence_records_only_observed_probe_steps() {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-kernel-host-startup-consumer-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("test work root");
+        let kernel = KernelComposition::new(KernelConfig::new(&root)).expect("kernel composition");
+
+        kernel
+            .consume_host_startup_evidence(&host_startup_evidence(None))
+            .expect("Host steps 1 and 2 should be recorded");
+        kernel
+            .record_startup_evidence(3)
+            .expect("step 3 test evidence");
+        assert_eq!(
+            kernel
+                .startup_status(GovernanceProfile::minimal())
+                .completed_step,
+            3,
+            "absent Blob probe must leave step 4 unobserved"
+        );
+
+        let second_root = root.join("with-blob");
+        std::fs::create_dir_all(&second_root).expect("second test work root");
+        let second = KernelComposition::new(KernelConfig::new(&second_root))
+            .expect("second kernel composition");
+        second
+            .consume_host_startup_evidence(&host_startup_evidence(Some(
+                "host-blob-manifest:efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef",
+            )))
+            .expect("Host steps including Blob should be recorded");
+        second
+            .record_startup_evidence(3)
+            .expect("step 3 test evidence");
+        assert_eq!(
+            second
+                .startup_status(GovernanceProfile::minimal())
+                .completed_step,
+            4,
+            "present Blob probe should advance step 4 after its predecessor"
+        );
+
+        drop(second);
+        drop(kernel);
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn probe_watchdog_branch_requires_exact_nonzero_epoch() {
