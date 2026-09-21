@@ -31,6 +31,6 @@ pub use result::{
     ReactiveContextPlanningError,
 };
 pub use settled_plan_feed::{
-    SettledPlanFeed, SettledPlanFeedError, SettledPlanFeedInputs, SettledPlanFeedOutcome,
-    produce_settled_plan_feed,
+    LiveActivationBindings, SettledPlanFeed, SettledPlanFeedError, SettledPlanFeedInputs,
+    SettledPlanFeedOutcome, drive_live_feed, produce_settled_plan_feed,
 };

@@ -15,9 +15,9 @@
 mod support;
 
 use eliot_reactive_context_plan::{
-    BridgeAdmissionDelivery, BridgeAdmissionSeverity, PlanningErrorKind, ReactiveContextPlanResult,
-    SettledPlanFeedError, SettledPlanFeedInputs, SettledPlanFeedOutcome,
-    plan_pending_context_injection, produce_settled_plan_feed,
+    BridgeAdmissionDelivery, BridgeAdmissionSeverity, LiveActivationBindings, PlanningErrorKind,
+    ReactiveContextPlanResult, SettledPlanFeedError, SettledPlanFeedInputs, SettledPlanFeedOutcome,
+    drive_live_feed, plan_pending_context_injection, produce_settled_plan_feed,
 };
 
 fn feed_inputs(
@@ -181,6 +181,9 @@ fn forged_cue_digest_text_never_drives_feed() {
         Err(SettledPlanFeedError::Producer(error)) => {
             panic!("forged cue text must fail in planning, not production: {error}")
         }
+        Err(SettledPlanFeedError::StaleActivation { .. }) => {
+            panic!("forged cue text must fail in planning, not on liveness")
+        }
         Ok(_) => panic!("forged cue digest text must never yield a feed outcome"),
     }
 }
@@ -203,6 +206,9 @@ fn forged_policy_digest_text_never_drives_feed() {
         Err(SettledPlanFeedError::Planning(_)) => {}
         Err(SettledPlanFeedError::Producer(error)) => {
             panic!("forged policy text must fail in planning, not production: {error}")
+        }
+        Err(SettledPlanFeedError::StaleActivation { .. }) => {
+            panic!("forged policy text must fail in planning, not on liveness")
         }
         Ok(_) => panic!("forged policy digest text must never yield a feed outcome"),
     }
@@ -237,4 +243,146 @@ fn settled_no_injection_emits_zero_instructions() {
             feed.batch.items.len()
         ),
     }
+}
+
+fn live_bindings(
+    view: &eliot_context_contracts::ContextPlanningView,
+    session: &eliot_context_contracts::SessionDeliverySnapshot,
+    policy: &eliot_reactive_context_plan::ReactiveDeliveryPolicy,
+) -> LiveActivationBindings {
+    LiveActivationBindings {
+        task_id: view.view.binding.task_id.clone(),
+        scope_id: view.view.binding.scope_id.clone(),
+        session_id: session.session_id.clone(),
+        plan_id: policy.plan_id.clone(),
+        state_fence: view.view.binding.state_fence.clone(),
+    }
+}
+
+fn rotated_fence() -> eliot_contracts::StateFence {
+    eliot_contracts::StateFence::new(
+        eliot_contracts::EpochId::new(
+            eliot_contracts::EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").unwrap(),
+            std::num::NonZeroU64::new(2).unwrap(),
+        )
+        .unwrap(),
+        eliot_contracts::ResourceGeneration::new(1).unwrap(),
+    )
+}
+
+fn drive_inputs<'a>(
+    view: &'a eliot_context_contracts::ContextPlanningView,
+    activation: &'a eliot_reactive_context_plan::ReactiveCueActivation,
+    session: &'a eliot_context_contracts::SessionDeliverySnapshot,
+    attention: &'a eliot_context_contracts::CriticalAttentionProjection,
+    coverage: &'a eliot_context_contracts::IntegrationCoverageProfile,
+    policy: &'a eliot_reactive_context_plan::ReactiveDeliveryPolicy,
+) -> SettledPlanFeedInputs<'a> {
+    SettledPlanFeedInputs {
+        view,
+        cue_activation: activation,
+        session_snapshot: session,
+        critical_attention: attention,
+        integration_coverage: coverage,
+        policy,
+    }
+}
+
+#[test]
+fn live_drive_with_matching_activation_settles_ready_batch() {
+    let (view, activation, session, attention, coverage, policy) = feed_inputs(false, false);
+    let inputs = drive_inputs(&view, &activation, &session, &attention, &coverage, &policy);
+    let bindings = live_bindings(&view, &session, &policy);
+    let driven = drive_live_feed(&bindings, inputs).expect("matching activation must drive");
+    let direct = produce_settled_plan_feed(inputs).expect("direct feed must settle");
+    match (driven, direct) {
+        (
+            SettledPlanFeedOutcome::Ready(driven_feed),
+            SettledPlanFeedOutcome::Ready(direct_feed),
+        ) => assert_eq!(
+            driven_feed, direct_feed,
+            "the liveness gate adds currency only, never content"
+        ),
+        (driven, direct) => {
+            panic!("both drives must settle Ready, got {driven:?} vs {direct:?}")
+        }
+    }
+}
+
+#[test]
+fn rotated_fence_fails_closed_before_planning() {
+    let (view, activation, session, attention, coverage, policy) = feed_inputs(false, false);
+    let inputs = drive_inputs(&view, &activation, &session, &attention, &coverage, &policy);
+    let mut bindings = live_bindings(&view, &session, &policy);
+    bindings.state_fence = rotated_fence();
+    match drive_live_feed(&bindings, inputs) {
+        Err(SettledPlanFeedError::StaleActivation { projection, field }) => {
+            assert_eq!(projection, "view");
+            assert_eq!(field, "view.binding.state_fence");
+        }
+        other => panic!("rotated fence must fail closed as a stale view, got {other:?}"),
+    }
+    // Control: the same projections through the ungated feed still settle —
+    // the gate (not the planner) fired.
+    assert!(matches!(
+        produce_settled_plan_feed(inputs),
+        Ok(SettledPlanFeedOutcome::Ready(_))
+    ));
+}
+
+#[test]
+fn foreign_session_fails_closed_before_planning() {
+    let (view, activation, session, attention, coverage, policy) = feed_inputs(false, false);
+    let inputs = drive_inputs(&view, &activation, &session, &attention, &coverage, &policy);
+    let mut bindings = live_bindings(&view, &session, &policy);
+    bindings.session_id = eliot_contracts::SessionId::new("foreign-session").unwrap();
+    match drive_live_feed(&bindings, inputs) {
+        Err(SettledPlanFeedError::StaleActivation { projection, field }) => {
+            assert_eq!(projection, "session");
+            assert_eq!(field, "session.session_id");
+        }
+        other => panic!("foreign session must fail closed, got {other:?}"),
+    }
+    assert!(matches!(
+        produce_settled_plan_feed(inputs),
+        Ok(SettledPlanFeedOutcome::Ready(_))
+    ));
+}
+
+#[test]
+fn foreign_scope_fails_closed_before_planning() {
+    let (view, activation, session, attention, coverage, policy) = feed_inputs(false, false);
+    let inputs = drive_inputs(&view, &activation, &session, &attention, &coverage, &policy);
+    let mut bindings = live_bindings(&view, &session, &policy);
+    bindings.scope_id = eliot_receipts::WorkScopeId::new("foreign-scope").unwrap();
+    match drive_live_feed(&bindings, inputs) {
+        Err(SettledPlanFeedError::StaleActivation { projection, field }) => {
+            assert_eq!(projection, "view");
+            assert_eq!(field, "view.binding.scope_id");
+        }
+        other => panic!("foreign scope must fail closed, got {other:?}"),
+    }
+    assert!(matches!(
+        produce_settled_plan_feed(inputs),
+        Ok(SettledPlanFeedOutcome::Ready(_))
+    ));
+}
+
+#[test]
+fn foreign_plan_fails_closed_before_planning() {
+    let (view, activation, session, attention, coverage, policy) = feed_inputs(false, false);
+    let inputs = drive_inputs(&view, &activation, &session, &attention, &coverage, &policy);
+    let mut bindings = live_bindings(&view, &session, &policy);
+    bindings.plan_id = eliot_contracts::ArtifactId::new("foreign-plan").unwrap();
+    match drive_live_feed(&bindings, inputs) {
+        Err(SettledPlanFeedError::StaleActivation { projection, field }) => {
+            assert_eq!(projection, "policy");
+            assert_eq!(field, "policy.plan_id");
+        }
+        other => panic!("foreign plan must fail closed, got {other:?}"),
+    }
+    assert!(matches!(
+        produce_settled_plan_feed(inputs),
+        Ok(SettledPlanFeedOutcome::Ready(_))
+    ));
 }
