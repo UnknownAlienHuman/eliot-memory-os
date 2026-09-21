@@ -49,6 +49,12 @@ pub use grant_activation_port::{
     IntentDisposition, IntroductionActivationIntent, IntroductionRevocationIntent,
     ROOT_GRANT_HYDRATION_FIELDS, RootGrantHydration, RootGrantHydrationSource,
 };
+pub use module::compatibility_handshake::{
+    AcceptedCompatibilityEvidence, CompatibilityEnvelope, CompatibilityMismatch,
+    DurableCompatibilityState, HANDSHAKE_ENVELOPE_VERSION, MismatchField, NORMATIVE_SEAL_DOMAIN,
+    NormativePairReceipt, StateMigrationClass, VersionRange, admit_handshake, admit_rollback,
+    expected_seal_tag,
+};
 pub use module::control_reserve_front_door::{
     AuthorityDecision, CapacityBottleneck, CapacityClass, ControlOperationClass, ControlPermit,
     ControlReserve, DecisionDenialReason, EMERGENCY_PREALLOCATED_SLOTS, EmergencyOperationClass,
