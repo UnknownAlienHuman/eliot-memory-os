@@ -3,9 +3,10 @@
 //! Issue #1962. This module is wiring only: it decodes CLI arguments,
 //! constructs the typed owner input in `eliot-config::first_run`, and
 //! projects a terminal receipt. All route-state, paid-route, default, and
-//! Human-board dedup semantics live in the owner crate. The legacy
-//! `governor.toml` file is never adopted as authority; when the legacy gate
-//! reports a present file this flow fails closed before deciding anything.
+//! Human-board dedup semantics live in the owner crate. This flow reads no
+//! configuration files, so the legacy `governor.toml` file is never adopted
+//! as authority here; legacy-file gating lives on the canary/install paths
+//! in `main.rs` (#1687), not on the setup path.
 
 #![forbid(unsafe_code)]
 
@@ -154,6 +155,9 @@ pub fn run_setup_set(args: &SetupSetArgs) -> Result<i32> {
 /// Human-board recommendation and starts no job.
 pub fn run_setup_recommend(args: &SetupRecommendArgs) -> Result<i32> {
     let automation = parse_automation(&args.automation)?;
+    if args.family.trim().is_empty() || args.scope.trim().is_empty() {
+        anyhow::bail!("recommendation family and scope must be non-blank");
+    }
     let Some((recommendation, admits_job)) = recommend_when_automation_disabled(
         automation,
         false,
@@ -166,11 +170,14 @@ pub fn run_setup_recommend(args: &SetupRecommendArgs) -> Result<i32> {
     let is_new = board
         .insert_dedup(&recommendation)
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    // A second insert of the same trigger must not duplicate.
+    // A second insert of the same trigger must not duplicate; a failure here
+    // is a typed CLI error, never a panic.
     let is_new_again = board
         .insert_dedup(&recommendation)
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    assert!(!is_new_again, "deduplicated board holds one entry");
+    if is_new_again {
+        anyhow::bail!("deduplicated board admitted a duplicate entry");
+    }
     println!(
         "{}",
         serde_json::json!({
@@ -213,5 +220,23 @@ mod tests {
             scope: "scope-1".to_owned(),
         };
         assert_eq!(run_setup_recommend(&args).expect("recommend"), 0);
+    }
+
+    #[test]
+    fn setup_recommend_rejects_blank_family_or_scope_before_deciding() {
+        for (family, scope) in [
+            ("   ".to_owned(), "scope-1".to_owned()),
+            ("RESEARCH_EXCHANGE_CLEANUP".to_owned(), "  ".to_owned()),
+        ] {
+            let args = SetupRecommendArgs {
+                automation: "off".to_owned(),
+                family,
+                scope,
+            };
+            assert!(
+                run_setup_recommend(&args).is_err(),
+                "blank recommendation input must fail closed"
+            );
+        }
     }
 }

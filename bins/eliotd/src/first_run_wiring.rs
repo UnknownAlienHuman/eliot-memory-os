@@ -49,7 +49,8 @@ pub struct DisabledAutomationOutcome {
 
 /// Records one needed maintenance/requalification action as a deduplicated
 /// Human-board recommendation when automation is disabled. Returns an error
-/// when automation is enabled (the governed job path owns that case).
+/// when automation is enabled (the governed job path owns that case) or when
+/// the family/scope input is blank.
 pub fn recommend_for_disabled_automation(
     board: &mut RecommendationBoard,
     mode: FirstRunAutomation,
@@ -57,6 +58,11 @@ pub fn recommend_for_disabled_automation(
     family: &str,
     scope_ref: &str,
 ) -> Result<DisabledAutomationOutcome, FirstRunWiringError> {
+    if family.trim().is_empty() || scope_ref.trim().is_empty() {
+        return Err(FirstRunWiringError::Board(
+            "recommendation family and scope must be non-blank".to_owned(),
+        ));
+    }
     let Some((recommendation, admits_job)) =
         recommend_when_automation_disabled(mode, explicit_request, family, scope_ref)
     else {
@@ -131,5 +137,24 @@ mod tests {
         .expect("daemon deduplicates");
         assert!(!second.is_new);
         assert_eq!(second.board_entries, 1);
+    }
+
+    #[test]
+    fn daemon_disabled_automation_rejects_blank_family_or_scope() {
+        let mut board = RecommendationBoard::new();
+        for (family, scope) in [("   ", "scope-1"), ("RESEARCH_EXCHANGE_CLEANUP", "  ")] {
+            assert!(
+                recommend_for_disabled_automation(
+                    &mut board,
+                    FirstRunAutomation::Off,
+                    false,
+                    family,
+                    scope,
+                )
+                .is_err(),
+                "blank recommendation input must fail closed"
+            );
+        }
+        assert!(board.is_empty());
     }
 }

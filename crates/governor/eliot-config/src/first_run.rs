@@ -220,9 +220,9 @@ fn resolve_selection(
                 }
                 return Err(FirstRunError::PaidWithoutConsent);
             }
-            // Explicit consent is recorded, but Dreamer/Watchdog paid routes
-            // are still only admitted when that consent flag is set, which the
-            // caller above guarantees. No hidden path exists.
+            // Consent was just verified above, so Dreamer/Watchdog paid
+            // routes are admitted only with explicit consent. No hidden
+            // path exists.
             Ok(RouteState::PaidExplicit)
         }
     }
@@ -318,6 +318,10 @@ pub fn apply_update(
 
 /// Persists the typed decision through the canonical policy/config layer as
 /// deterministic `Setting` entries (`route.<role>` + automation mode).
+/// `value_ref` carries an opaque `literal:<STATE>` payload (no consumer
+/// resolves prefixes today; `Setting::validate` requires non-blank key,
+/// value, and owner, so `owner_ref` must be non-blank for snapshot
+/// admission).
 #[must_use]
 pub fn to_settings(decision: &FirstRunDecision, owner_ref: &str) -> Vec<crate::Setting> {
     let mut settings = Vec::with_capacity(8);
