@@ -30,6 +30,8 @@ use serde::{Deserialize, Serialize};
 
 /// Maximum parent propositions admitted in one request.
 pub const MAX_PARENT_PROPOSITIONS: usize = 64;
+/// Maximum semantic field paths carried by one request.
+pub const MAX_FIELDS: usize = 128;
 /// Maximum new evidence items admitted in one request.
 pub const MAX_NEW_ITEMS: usize = 64;
 /// Maximum affected dependents admitted in one request.
@@ -44,6 +46,12 @@ pub const MAX_TEXT_BYTES: usize = 1024;
 pub const MAX_HANDLE_BYTES: usize = 128;
 /// Maximum aggregate input bytes across all text fields.
 pub const MAX_TOTAL_BYTES: usize = 1_048_576;
+/// Maximum output bytes for one inert child-allocation request.
+pub const MAX_OUTPUT_BYTES: usize = 256 * 1024;
+/// Maximum independent STU usage admitted by this leaf.
+pub const MAX_STU: u64 = 65_536;
+/// Maximum bounded work units admitted by this leaf.
+pub const MAX_WORK_UNITS: u64 = 65_536;
 /// Redaction ceiling for values echoed into errors and notes.
 pub const MAX_REDACTED_CHARS: usize = 128;
 
@@ -409,6 +417,7 @@ pub struct ReconsolidationPolicy {
     pub allow_partial: bool,
     /// Independent cardinality and output ceilings.
     pub max_parent_propositions: usize,
+    pub max_fields: usize,
     pub max_new_items: usize,
     pub max_dependents: usize,
     pub max_predecessors: usize,
@@ -416,6 +425,9 @@ pub struct ReconsolidationPolicy {
     pub max_total_bytes: usize,
     pub max_output_bytes: usize,
     pub max_work_units: u64,
+    pub max_stu: u64,
+    /// Explicit caller-supplied STU usage; never inferred from wall-clock or bytes.
+    pub observed_stu: u64,
     /// Ceilings carried by the candidate and preserved verbatim.
     pub source_assurance_ceiling: String,
     pub authority_ceiling: String,
@@ -468,6 +480,21 @@ pub enum EvidenceSourceKind {
     RetrievalDuplicate,
     /// Availability or index signal without content.
     AvailabilitySignal,
+}
+
+/// Whether an external dependent effect has an observable terminal state.
+///
+/// An unknown effect is never treated as a failed write or as a safe rollback
+/// opportunity. This leaf can only propose before effects are attempted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub enum EffectObservation {
+    /// No dependent or external effect has been attempted.
+    NotAttempted,
+    /// An effect was observed as applied; this candidate cannot disposition it.
+    Applied,
+    /// The effect outcome is unknown and requires reconciliation before retry.
+    Unknown,
 }
 
 /// Disposition of one parent proposition in the proposed child view.
@@ -580,10 +607,16 @@ pub struct NewEvidenceItem {
     pub lineage: String,
     /// Owner of the observed source record.
     pub owner: String,
+    /// Frozen source manifest that produced the observation.
+    pub source_manifest_digest: String,
     /// Source revision that produced the evidence bytes.
     pub source_revision: String,
     /// Scope in which the evidence was observed.
     pub scope: String,
+    /// Authority ceiling under which the source was observed.
+    pub authority: String,
+    /// Privacy ceiling under which the source was observed.
+    pub privacy: String,
     /// Independence classification; shared or unknown material is not new.
     pub independence: EvidenceIndependence,
     /// Sorted parent/addition/dependent identities covered by this item.
@@ -596,6 +629,8 @@ pub struct NewEvidenceItem {
     pub source_kind: EvidenceSourceKind,
     /// Explicit observation time; unknown time is never filled in.
     pub observed_at_ms: Option<u64>,
+    /// Source freshness cursor; it must bind exactly to `observed_at_ms`.
+    pub freshness_ms: Option<u64>,
 }
 
 /// Policy-qualified externally observed reactivation at an exact checkpoint.
@@ -664,6 +699,8 @@ pub struct DependentOutcome {
     pub inverse_note: String,
     /// Forward correction required if the later write or verification fails.
     pub forward_correction: String,
+    /// Observed effect state; unknown/applied states cannot be retried blindly.
+    pub effect_status: EffectObservation,
 }
 
 /// Independent owner references preserved unchanged by content revision.
@@ -688,6 +725,18 @@ pub struct AxisOwnerRefs {
     pub source_assurance_owner: String,
 }
 
+/// Source contract bindings retained with the inert child request.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PreservedSourceBinding {
+    pub handle: String,
+    pub manifest_digest: String,
+    pub scope: String,
+    pub authority: String,
+    pub privacy: String,
+    pub freshness_ms: Option<u64>,
+}
+
 #[derive(Serialize)]
 struct ChildDigestPreimage<'a> {
     identity_digest: &'a str,
@@ -699,6 +748,8 @@ struct ChildDigestPreimage<'a> {
     preserved_revision_history: &'a [String],
     preserved_source_refs: &'a [String],
     preserved_source_identities: &'a [String],
+    preserved_source_bindings: &'a [PreservedSourceBinding],
+    field_paths: &'a [String],
     axis_owners: &'a AxisOwnerRefs,
     source_assurance_ceiling: &'a str,
     authority_ceiling: &'a str,
@@ -739,6 +790,10 @@ pub struct ChildAllocationRequest {
     pub preserved_source_refs: Vec<String>,
     /// Canonical source identities retained without rewriting or deletion.
     pub preserved_source_identities: Vec<String>,
+    /// Manifest/scope/authority/privacy/freshness bindings retained verbatim.
+    pub preserved_source_bindings: Vec<PreservedSourceBinding>,
+    /// Exact semantic field paths covered by the candidate.
+    pub field_paths: Vec<String>,
     /// Independent axis owners copied verbatim from the request.
     pub axis_owners: AxisOwnerRefs,
     /// Support/authority/privacy/influence/proof ceilings copied verbatim.
@@ -869,6 +924,8 @@ pub struct ReconsolidationRequest {
     pub parent_propositions: Vec<ParentProposition>,
     /// One delta per parent proposition (sorted by proposition id).
     pub deltas: Vec<PropositionDelta>,
+    /// Exact semantic field paths covered by the candidate, sorted and unique.
+    pub field_paths: Vec<String>,
     /// Candidate new evidence items (sorted by handle, unique).
     pub new_items: Vec<NewEvidenceItem>,
     /// New propositions are accounted independently from parent deltas.
@@ -998,6 +1055,7 @@ fn validate_policy_shape(request: &ReconsolidationRequest) -> Result<(), Reconso
             "policy.max_parent_propositions",
             request.policy.max_parent_propositions,
         ),
+        ("policy.max_fields", request.policy.max_fields),
         ("policy.max_new_items", request.policy.max_new_items),
         ("policy.max_dependents", request.policy.max_dependents),
         ("policy.max_predecessors", request.policy.max_predecessors),
@@ -1016,6 +1074,12 @@ fn validate_policy_shape(request: &ReconsolidationRequest) -> Result<(), Reconso
         return Err(ReconsolidationError::Bounds {
             phase: "policy.max_work_units".to_owned(),
             detail: "policy work ceiling must be positive".to_owned(),
+        });
+    }
+    if request.policy.max_stu == 0 {
+        return Err(ReconsolidationError::Bounds {
+            phase: "policy.max_stu".to_owned(),
+            detail: "policy STU ceiling must be positive".to_owned(),
         });
     }
     Ok(())
@@ -1144,13 +1208,19 @@ fn total_bytes(request: &ReconsolidationRequest) -> usize {
         add(n.digest.len());
         add(n.lineage.len());
         add(n.owner.len());
+        add(n.source_manifest_digest.len());
         add(n.source_revision.len());
         add(n.scope.len());
+        add(n.authority.len());
+        add(n.privacy.len());
         add(n.assurance.len());
         add(n.statement.len());
         for coverage in &n.coverage {
             add(coverage.len());
         }
+    }
+    for field_path in &request.field_paths {
+        add(field_path.len());
     }
     for proposition in &request.added_propositions {
         add(proposition.id.len());
@@ -1233,6 +1303,7 @@ fn total_bytes(request: &ReconsolidationRequest) -> usize {
     total
 }
 
+#[allow(clippy::too_many_lines)]
 fn preflight_bounds(request: &ReconsolidationRequest) -> Result<(), ReconsolidationError> {
     validate_policy_shape(request)?;
     validate_identity_shape(&request.identity)?;
@@ -1242,10 +1313,14 @@ fn preflight_bounds(request: &ReconsolidationRequest) -> Result<(), Reconsolidat
         .policy
         .max_parent_propositions
         .min(MAX_PARENT_PROPOSITIONS);
+    let max_fields = request.policy.max_fields.min(MAX_FIELDS);
     let max_new = request.policy.max_new_items.min(MAX_NEW_ITEMS);
     let max_dependents = request.policy.max_dependents.min(MAX_DEPENDENTS);
     let max_predecessors = request.policy.max_predecessors.min(MAX_PREDECESSORS);
     let max_baselines = request.policy.max_baseline_refs.min(MAX_BASELINE_REFS);
+    let max_output_bytes = request.policy.max_output_bytes.min(MAX_OUTPUT_BYTES);
+    let max_work_units = request.policy.max_work_units.min(MAX_WORK_UNITS);
+    let max_stu = request.policy.max_stu.min(MAX_STU);
     let bound = |phase: &str, got: usize, max: usize| -> Result<(), ReconsolidationError> {
         if got > max {
             return Err(ReconsolidationError::Bounds {
@@ -1261,6 +1336,7 @@ fn preflight_bounds(request: &ReconsolidationRequest) -> Result<(), Reconsolidat
         max_parent,
     )?;
     bound("deltas", request.deltas.len(), max_parent)?;
+    bound("fields", request.field_paths.len(), max_fields)?;
     bound("sources", request.new_items.len(), max_new)?;
     bound(
         "added_propositions",
@@ -1315,11 +1391,24 @@ fn preflight_bounds(request: &ReconsolidationRequest) -> Result<(), Reconsolidat
         .len()
         .saturating_add(request.new_items.len())
         .saturating_add(request.added_propositions.len())
-        .saturating_add(request.dependents.len());
-    if u64::try_from(work).map_or(u64::MAX, |value| value) > request.policy.max_work_units {
+        .saturating_add(request.dependents.len())
+        .saturating_add(request.field_paths.len());
+    if u64::try_from(work).map_or(u64::MAX, |value| value) > max_work_units {
         return Err(ReconsolidationError::Bounds {
             phase: "work".to_owned(),
             detail: "bounded work ceiling exceeded".to_owned(),
+        });
+    }
+    if request.policy.observed_stu > max_stu {
+        return Err(ReconsolidationError::Bounds {
+            phase: "stu".to_owned(),
+            detail: "STU usage exceeds its independent policy ceiling".to_owned(),
+        });
+    }
+    if max_output_bytes == 0 {
+        return Err(ReconsolidationError::Bounds {
+            phase: "output".to_owned(),
+            detail: "output ceiling must be positive".to_owned(),
         });
     }
     Ok(())
@@ -1447,8 +1536,11 @@ fn validate_shapes(request: &ReconsolidationRequest) -> Result<(), Reconsolidati
         }
         check_bounded_text(&n.lineage, "source.lineage", MAX_HANDLE_BYTES)?;
         check_handle(&n.owner, "source.owner")?;
+        check_digest(&n.source_manifest_digest, "source.manifest_digest")?;
         check_bounded_text(&n.source_revision, "source.revision", MAX_HANDLE_BYTES)?;
         check_handle(&n.scope, "source.scope")?;
+        check_handle(&n.authority, "source.authority")?;
+        check_handle(&n.privacy, "source.privacy")?;
         check_bounded_text(&n.assurance, "source.assurance", MAX_TEXT_BYTES)?;
         if n.coverage.is_empty() {
             return Err(ReconsolidationError::Source {
@@ -1485,6 +1577,15 @@ fn validate_shapes(request: &ReconsolidationRequest) -> Result<(), Reconsolidati
         return Err(ReconsolidationError::Order {
             phase: "sources".to_owned(),
             detail: "new handles must be sorted and unique".to_owned(),
+        });
+    }
+    for field_path in &request.field_paths {
+        check_bounded_text(field_path, "field.path", MAX_HANDLE_BYTES)?;
+    }
+    if !is_sorted_unique(&request.field_paths) {
+        return Err(ReconsolidationError::Order {
+            phase: "fields".to_owned(),
+            detail: "field paths must be sorted and unique".to_owned(),
         });
     }
     for proposition in &request.added_propositions {
@@ -1718,6 +1819,18 @@ fn build_child(
     ));
     preserved_source_identities.sort();
     preserved_source_identities.dedup();
+    let preserved_source_bindings: Vec<PreservedSourceBinding> = request
+        .new_items
+        .iter()
+        .map(|item| PreservedSourceBinding {
+            handle: item.handle.clone(),
+            manifest_digest: item.source_manifest_digest.clone(),
+            scope: item.scope.clone(),
+            authority: item.authority.clone(),
+            privacy: item.privacy.clone(),
+            freshness_ms: item.freshness_ms,
+        })
+        .collect();
     let preimage = ChildDigestPreimage {
         identity_digest: &request.identity.canonical_request_digest,
         parent_handle: &request.parent.handle,
@@ -1728,6 +1841,8 @@ fn build_child(
         preserved_revision_history: &preserved_revision_history,
         preserved_source_refs: &preserved_source_refs,
         preserved_source_identities: &preserved_source_identities,
+        preserved_source_bindings: &preserved_source_bindings,
+        field_paths: &request.field_paths,
         axis_owners: &request.axis_owners,
         source_assurance_ceiling: &request.policy.source_assurance_ceiling,
         authority_ceiling: &request.policy.authority_ceiling,
@@ -1756,6 +1871,8 @@ fn build_child(
         preserved_revision_history,
         preserved_source_refs,
         preserved_source_identities,
+        preserved_source_bindings,
+        field_paths: request.field_paths.clone(),
         axis_owners: request.axis_owners.clone(),
         source_assurance_ceiling: request.policy.source_assurance_ceiling.clone(),
         authority_ceiling: request.policy.authority_ceiling.clone(),
@@ -1781,8 +1898,13 @@ fn child_projection_issue(
         || child.parent_schema != request.parent.schema
         || child.parent_revision != request.parent.revision
         || child.parent_digest != request.parent.digest
+        || child.verifier != request.child_verifier
+        || child.reopen_condition != request.child_reopen_condition
     {
-        return Some("child projection moved from the exact current parent");
+        return Some("child projection lost its parent or admission verifier binding");
+    }
+    if child.field_paths != request.field_paths {
+        return Some("child projection lost the exact semantic field paths");
     }
     if child.axis_owners != request.axis_owners
         || child.source_assurance_ceiling != request.policy.source_assurance_ceiling
@@ -1838,6 +1960,21 @@ fn child_projection_issue(
         })
     {
         return Some("child projection lost a canonical source identity");
+    }
+    let expected_source_bindings: Vec<PreservedSourceBinding> = request
+        .new_items
+        .iter()
+        .map(|item| PreservedSourceBinding {
+            handle: item.handle.clone(),
+            manifest_digest: item.source_manifest_digest.clone(),
+            scope: item.scope.clone(),
+            authority: item.authority.clone(),
+            privacy: item.privacy.clone(),
+            freshness_ms: item.freshness_ms,
+        })
+        .collect();
+    if child.preserved_source_bindings != expected_source_bindings {
+        return Some("child projection lost a source manifest or freshness binding");
     }
     let mut ids = Vec::new();
     for proposition in &child.propositions {
@@ -2054,18 +2191,25 @@ pub fn propose_reconsolidation(
             "caller cancelled the reconsolidation request",
         );
     }
-    if let (Some(observed), Some(deadline)) = (
-        request.policy.observation_time_ms,
-        request.policy.deadline_ms,
-    ) && observed >= deadline
-    {
-        return ok_result(
-            ReconsolidationOutcome::Stale,
-            None,
-            request.parent_propositions.len(),
-            0,
-            "frozen policy deadline has elapsed",
-        );
+    if let Some(deadline) = request.policy.deadline_ms {
+        let Some(observed) = request.policy.observation_time_ms else {
+            return ok_result(
+                ReconsolidationOutcome::Stale,
+                None,
+                request.parent_propositions.len(),
+                0,
+                "frozen policy deadline cannot be evaluated without an observation time",
+            );
+        };
+        if observed >= deadline {
+            return ok_result(
+                ReconsolidationOutcome::Stale,
+                None,
+                request.parent_propositions.len(),
+                0,
+                "frozen policy deadline has elapsed",
+            );
+        }
     }
 
     request
@@ -2265,25 +2409,28 @@ pub fn propose_reconsolidation(
     let mut unknown_independence = 0usize;
     let mut stale_temporal = 0usize;
     let mut baseline_identity_conflict = false;
+    let mut source_contract_conflict = false;
+    let parent_lineages: Vec<&str> = request
+        .parent_propositions
+        .iter()
+        .map(|proposition| proposition.lineage.as_str())
+        .collect();
     for item in &request.new_items {
         if item.source_kind != EvidenceSourceKind::ExternalObservation {
             continue;
         }
         if item.scope != request.identity.scope_id
             || item.assurance != request.policy.source_assurance_ceiling
+            || item.source_manifest_digest != request.frozen_manifest_digest
+            || item.authority != request.policy.authority_ceiling
+            || item.privacy != request.policy.privacy_ceiling
+            || item.freshness_ms != item.observed_at_ms
         {
-            baseline_identity_conflict = true;
+            source_contract_conflict = true;
             continue;
         }
         if item.independence != EvidenceIndependence::Independent {
             unknown_independence = unknown_independence.saturating_add(1);
-            continue;
-        }
-        if request
-            .parent_baseline_digests
-            .iter()
-            .any(|digest| digest == &item.digest)
-        {
             continue;
         }
         if contains_handle(&request.parent_baseline_handles, &item.handle)
@@ -2315,6 +2462,21 @@ pub fn propose_reconsolidation(
             baseline_identity_conflict = true;
             continue;
         }
+        if request
+            .parent_baseline_digests
+            .iter()
+            .any(|digest| digest == &item.digest)
+        {
+            continue;
+        }
+        if parent_lineages.contains(&item.lineage.as_str())
+            || request.parent_baseline_lineages.contains(&item.lineage)
+            || genuine
+                .iter()
+                .any(|existing| existing.lineage == item.lineage)
+        {
+            continue;
+        }
         let normalized = normalize_statement(&item.statement);
         if parent_statements.contains(&normalized) {
             continue;
@@ -2331,6 +2493,15 @@ pub fn propose_reconsolidation(
         genuine.push(item);
     }
     // Unknown temporal order abstains first; stale material then outranks every other result.
+    if source_contract_conflict {
+        return ok_result(
+            ReconsolidationOutcome::Blocked,
+            None,
+            request.parent_propositions.len(),
+            0,
+            "new evidence source manifest, scope, authority, privacy, or freshness does not bind",
+        );
+    }
     if unknown_temporal > 0 {
         return ok_result(
             ReconsolidationOutcome::Abstention,
@@ -2753,6 +2924,27 @@ pub fn propose_reconsolidation(
                 "dependent disposition identities or owner do not bind the proposed child",
             );
         }
+        match outcome.effect_status {
+            EffectObservation::NotAttempted => {}
+            EffectObservation::Applied => {
+                return ok_result(
+                    ReconsolidationOutcome::Blocked,
+                    None,
+                    request.parent_propositions.len(),
+                    genuine.len(),
+                    "an applied dependent effect is outside this candidate-only leaf",
+                );
+            }
+            EffectObservation::Unknown => {
+                return ok_result(
+                    ReconsolidationOutcome::Blocked,
+                    None,
+                    request.parent_propositions.len(),
+                    genuine.len(),
+                    "unknown external effect blocks blind rollback or retry",
+                );
+            }
+        }
         if outcome.disposition == DependentDisposition::Blocked {
             return ok_result(
                 ReconsolidationOutcome::Blocked,
@@ -2802,7 +2994,7 @@ pub fn propose_reconsolidation(
             phase: "child_output".to_owned(),
             detail: redact(&err.to_string()),
         })?;
-    if child_bytes.len() > request.policy.max_output_bytes {
+    if child_bytes.len() > request.policy.max_output_bytes.min(MAX_OUTPUT_BYTES) {
         return ok_result(
             ReconsolidationOutcome::Blocked,
             None,
@@ -3121,13 +3313,16 @@ mod tests {
             minimum_reactivation_stage: ReactivationStage::QualifyingPublicUse,
             allow_partial: true,
             max_parent_propositions: MAX_PARENT_PROPOSITIONS,
+            max_fields: MAX_FIELDS,
             max_new_items: MAX_NEW_ITEMS,
             max_dependents: MAX_DEPENDENTS,
             max_predecessors: MAX_PREDECESSORS,
             max_baseline_refs: MAX_BASELINE_REFS,
             max_total_bytes: MAX_TOTAL_BYTES,
-            max_output_bytes: 256 * 1024,
+            max_output_bytes: MAX_OUTPUT_BYTES,
             max_work_units: 1_000,
+            max_stu: MAX_STU,
+            observed_stu: 0,
             source_assurance_ceiling: "assurance-7".to_owned(),
             authority_ceiling: "candidate-only".to_owned(),
             privacy_ceiling: "scope-7".to_owned(),
@@ -3244,14 +3439,18 @@ mod tests {
             digest: "0".repeat(64),
             lineage: "lineage-default".to_owned(),
             owner: "owner-observation".to_owned(),
+            source_manifest_digest: "c".repeat(64),
             source_revision: "source-rev-1".to_owned(),
             scope: "scope-1".to_owned(),
+            authority: "candidate-only".to_owned(),
+            privacy: "scope-7".to_owned(),
             independence: EvidenceIndependence::Independent,
             coverage: vec!["p2".to_owned()],
             assurance: "assurance-7".to_owned(),
             statement: "default evidence".to_owned(),
             source_kind: EvidenceSourceKind::ExternalObservation,
             observed_at_ms: Some(1_700_000_000_002),
+            freshness_ms: Some(1_700_000_000_002),
         }
     }
 
@@ -3279,6 +3478,7 @@ mod tests {
             verifier: "dependent-verifier".to_owned(),
             inverse_note: "set dependent aside before external effects".to_owned(),
             forward_correction: "reconcile dependent forward if verification fails".to_owned(),
+            effect_status: EffectObservation::NotAttempted,
         }
     }
 
@@ -3340,19 +3540,24 @@ mod tests {
                     evidence_refs: vec!["obs-1".to_owned()],
                 },
             ],
+            field_paths: vec!["p2.statement".to_owned()],
             new_items: vec![NewEvidenceItem {
                 handle: "obs-1".to_owned(),
                 digest: "1".repeat(64),
                 lineage: "lineage-new-1".to_owned(),
                 owner: "owner-observation".to_owned(),
+                source_manifest_digest: "c".repeat(64),
                 source_revision: "obs-rev-1".to_owned(),
                 scope: "scope-1".to_owned(),
+                authority: "candidate-only".to_owned(),
+                privacy: "scope-7".to_owned(),
                 independence: EvidenceIndependence::Independent,
                 coverage: vec!["p2".to_owned()],
                 assurance: "assurance-7".to_owned(),
                 statement: "Warm-up run 7 shortened the next cold start.".to_owned(),
                 source_kind: EvidenceSourceKind::ExternalObservation,
                 observed_at_ms: Some(1_700_000_000_002),
+                freshness_ms: Some(1_700_000_000_002),
             }],
             added_propositions: Vec::new(),
             added_member_denominator: TargetDenominator {
@@ -3394,6 +3599,7 @@ mod tests {
                 verifier: "dependent-verifier".to_owned(),
                 inverse_note: "set summary aside before external effects".to_owned(),
                 forward_correction: "reconcile summary forward if verification fails".to_owned(),
+                effect_status: EffectObservation::NotAttempted,
             }],
             axis_owners: test_owners(),
             preservation: test_preservation(),
@@ -3663,6 +3869,7 @@ mod tests {
     fn case_16_material_evidence_must_follow_reactivation() {
         let mut request = valid_request();
         request.new_items[0].observed_at_ms = Some(1_700_000_000_000);
+        request.new_items[0].freshness_ms = Some(1_700_000_000_000);
         let result = propose_reconsolidation(&request).expect("stale ordering is semantic");
         assert_eq!(result.outcome, ReconsolidationOutcome::Stale);
         assert!(result.child.is_none());
@@ -3670,35 +3877,135 @@ mod tests {
 
     // WORK_UNIT_CASE: 667/17
     #[test]
-    fn case_17_duplicate_evidence_digest_is_rejected() {
-        let mut request = valid_request();
-        request.new_items.push(NewEvidenceItem {
+    fn case_17_duplicate_restatement_shared_lineage_and_model_only_are_not_new() {
+        let mut duplicate = valid_request();
+        duplicate.new_items.push(NewEvidenceItem {
             handle: "obs-2".to_owned(),
-            digest: request.new_items[0].digest.clone(),
+            digest: duplicate.new_items[0].digest.clone(),
             lineage: "lineage-new-2".to_owned(),
             statement: "A distinct handle repeats the same bytes.".to_owned(),
             source_kind: EvidenceSourceKind::ExternalObservation,
             observed_at_ms: Some(1_700_000_000_003),
+            freshness_ms: Some(1_700_000_000_003),
             ..test_evidence_defaults()
         });
-        request
+        duplicate
             .new_items
             .sort_by(|left, right| left.handle.cmp(&right.handle));
-        let error = propose_reconsolidation(&request).expect_err("same digest is not new");
+        let error = propose_reconsolidation(&duplicate).expect_err("same digest is not new");
         assert!(matches!(error, ReconsolidationError::Source { .. }));
+
+        let mut restated = valid_request();
+        restated.new_items[0].handle = "obs-restated".to_owned();
+        restated.new_items[0].digest = "2".repeat(64);
+        restated.new_items[0].lineage = "lineage-restated".to_owned();
+        restated.new_items[0].statement = "Cold starts stay slow.".to_owned();
+        restated.new_member_denominator.members = vec!["obs-restated".to_owned()];
+        let result =
+            propose_reconsolidation(&restated).expect("restatement is a semantic shortfall");
+        assert_eq!(
+            result.outcome,
+            ReconsolidationOutcome::NoMaterialNewEvidence
+        );
+        assert!(result.child.is_none());
+
+        let mut shared_lineage = valid_request();
+        shared_lineage.new_items[0].lineage = "lineage-b".to_owned();
+        let result = propose_reconsolidation(&shared_lineage)
+            .expect("shared parent lineage is not independent new material");
+        assert_eq!(
+            result.outcome,
+            ReconsolidationOutcome::NoMaterialNewEvidence
+        );
+        assert!(result.child.is_none());
+
+        let mut model_only = valid_request();
+        model_only.new_items[0].source_kind = EvidenceSourceKind::ModelMention;
+        let result = propose_reconsolidation(&model_only)
+            .expect("model-only mention cannot be material external evidence");
+        assert_eq!(
+            result.outcome,
+            ReconsolidationOutcome::NoMaterialNewEvidence
+        );
+        assert!(result.child.is_none());
     }
 
     // WORK_UNIT_CASE: 667/18
     #[test]
-    fn case_18_distinct_evidence_under_one_lineage_is_admitted() {
+    fn case_18_source_manifest_scope_authority_privacy_and_freshness_must_bind() {
+        let mut manifest = valid_request();
+        manifest.new_items[0].source_manifest_digest = "d".repeat(64);
+
+        let mut scope = valid_request();
+        scope.new_items[0].scope = "scope-other".to_owned();
+
+        let mut authority = valid_request();
+        authority.new_items[0].authority = "authority-other".to_owned();
+
+        let mut privacy = valid_request();
+        privacy.new_items[0].privacy = "privacy-other".to_owned();
+
+        let mut freshness = valid_request();
+        freshness.new_items[0].freshness_ms = Some(1_700_000_000_003);
+
+        for (label, request) in vec![
+            ("manifest", manifest),
+            ("scope", scope),
+            ("authority", authority),
+            ("privacy", privacy),
+            ("freshness", freshness),
+        ]
+        .into_boxed_slice()
+        {
+            let result = propose_reconsolidation(&request)
+                .expect("source contract violations are bounded semantic blocks");
+            assert_eq!(result.outcome, ReconsolidationOutcome::Blocked, "{label}");
+            assert!(result.child.is_none(), "{label} must not produce a child");
+        }
+    }
+
+    // WORK_UNIT_CASE: 667/19
+    #[test]
+    fn case_19_retained_proposition_is_byte_exact_in_the_child() {
+        let request = valid_request();
+        let parent = request
+            .parent_propositions
+            .iter()
+            .find(|proposition| proposition.id == "p1")
+            .expect("fixture has the retained proposition");
+        let result = propose_reconsolidation(&request).expect("valid request succeeds");
+        let child = result
+            .child
+            .expect("complete result carries a child projection");
+        let retained = child
+            .propositions
+            .iter()
+            .find(|proposition| proposition.id == parent.id)
+            .expect("retained proposition remains in the child");
+
+        assert_eq!(retained.statement, parent.statement);
+        assert_eq!(retained.support_handle, parent.support_handle);
+        assert_eq!(retained.support_revision, parent.support_revision);
+        assert_eq!(retained.support_digest, parent.support_digest);
+        assert_eq!(retained.lineage, parent.lineage);
+        assert_eq!(retained.evidence_refs, Vec::<String>::new());
+        assert_eq!(
+            retained.parent_proposition_id.as_deref(),
+            Some(parent.id.as_str())
+        );
+    }
+
+    #[test]
+    fn supplemental_distinct_evidence_under_a_fresh_lineage_is_admitted() {
         let mut request = valid_request();
         request.new_items.push(NewEvidenceItem {
             handle: "obs-2".to_owned(),
             digest: "2".repeat(64),
-            lineage: request.new_items[0].lineage.clone(),
+            lineage: "lineage-new-2".to_owned(),
             statement: "Warm-up run 8 shortened another cold start.".to_owned(),
             source_kind: EvidenceSourceKind::ExternalObservation,
             observed_at_ms: Some(1_700_000_000_003),
+            freshness_ms: Some(1_700_000_000_003),
             ..test_evidence_defaults()
         });
         request
@@ -3726,9 +4033,8 @@ mod tests {
         assert_eq!(result.outcome, ReconsolidationOutcome::Blocked);
     }
 
-    // WORK_UNIT_CASE: 667/19
     #[test]
-    fn case_19_stale_material_precedes_surviving_material() {
+    fn supplemental_stale_material_precedes_surviving_material() {
         let mut request = valid_request();
         request.new_items.push(NewEvidenceItem {
             handle: "obs-0".to_owned(),
@@ -3737,6 +4043,7 @@ mod tests {
             statement: "Stale warm-up observation.".to_owned(),
             source_kind: EvidenceSourceKind::ExternalObservation,
             observed_at_ms: Some(1_700_000_000_001),
+            freshness_ms: Some(1_700_000_000_001),
             ..test_evidence_defaults()
         });
         request
@@ -3747,9 +4054,8 @@ mod tests {
         assert!(result.child.is_none());
     }
 
-    // WORK_UNIT_CASE: 667/43
     #[test]
-    fn case_43_unknown_temporal_precedes_stale_material() {
+    fn supplemental_unknown_temporal_precedes_stale_material() {
         let mut request = valid_request();
         request.new_items.extend([
             NewEvidenceItem {
@@ -3759,6 +4065,7 @@ mod tests {
                 statement: "Stale warm-up observation.".to_owned(),
                 source_kind: EvidenceSourceKind::ExternalObservation,
                 observed_at_ms: Some(1_700_000_000_001),
+                freshness_ms: Some(1_700_000_000_001),
                 ..test_evidence_defaults()
             },
             NewEvidenceItem {
@@ -3768,6 +4075,7 @@ mod tests {
                 statement: "Unknown-time warm-up observation.".to_owned(),
                 source_kind: EvidenceSourceKind::ExternalObservation,
                 observed_at_ms: None,
+                freshness_ms: None,
                 ..test_evidence_defaults()
             },
         ]);
@@ -4200,6 +4508,44 @@ mod tests {
                 ..test_dependent_outcome_defaults()
             },
         ];
+
+        let expected_categories = [
+            ("relation", DependentDisposition::Retain),
+            ("view", DependentDisposition::UnaffectedWithEvidence),
+            ("procedure", DependentDisposition::Revalidate),
+            ("cue", DependentDisposition::Rebuild),
+            ("index", DependentDisposition::Invalidate),
+            ("decision", DependentDisposition::Retarget),
+            ("claim", DependentDisposition::Reconcile),
+            ("axis", DependentDisposition::Retain),
+            (
+                "negative-memory",
+                DependentDisposition::UnaffectedWithEvidence,
+            ),
+        ];
+        assert_eq!(request.dependents.len(), expected_categories.len());
+        for (kind, expected_disposition) in expected_categories {
+            let dependent = request
+                .dependents
+                .iter()
+                .find(|dependent| dependent.kind == kind)
+                .expect("every required dependent category is represented");
+            assert!(dependent.required, "{kind} is required for completeness");
+            let outcome = request
+                .dependent_outcomes
+                .iter()
+                .find(|outcome| outcome.handle == dependent.handle)
+                .expect("every required dependent category has one outcome");
+            assert_eq!(outcome.disposition, expected_disposition, "{kind}");
+            assert_eq!(outcome.old_identity, dependent.old_identity, "{kind}");
+            assert_eq!(outcome.source_identity, dependent.source_identity, "{kind}");
+            assert_eq!(outcome.owner, dependent.owner, "{kind}");
+            assert_eq!(outcome.verifier, dependent.verifier, "{kind}");
+            assert_eq!(
+                outcome.new_candidate_identity, request.proposed_child_handle,
+                "{kind}"
+            );
+        }
         let frozen = request.clone();
 
         let result = propose_reconsolidation(&request).expect("complete dependency closure passes");
@@ -4343,12 +4689,45 @@ mod tests {
 
     // WORK_UNIT_CASE: 667/42
     #[test]
-    fn case_42_unknown_reactivation_order_abstains() {
+    fn case_42_unknown_effect_blocks_blind_rollback_or_retry() {
         let mut request = valid_request();
-        request.reactivation.observed_at_ms = None;
-        let result = propose_reconsolidation(&request).expect("unknown order abstains");
-        assert_eq!(result.outcome, ReconsolidationOutcome::Abstention);
+        request.dependent_outcomes[0].effect_status = EffectObservation::Unknown;
+        let result =
+            propose_reconsolidation(&request).expect("unknown effects are semantic blocks");
+        assert_eq!(result.outcome, ReconsolidationOutcome::Blocked);
         assert!(result.child.is_none());
+        assert!(result.note.contains("unknown external effect"));
+    }
+
+    // WORK_UNIT_CASE: 667/43
+    #[test]
+    fn case_43_missing_parent_verifier_or_reopen_is_rejected() {
+        let mut missing_parent = valid_request();
+        missing_parent.parent.handle.clear();
+        let error = propose_reconsolidation(&missing_parent)
+            .expect_err("a missing parent handle cannot produce a candidate");
+        assert!(matches!(
+            error,
+            ReconsolidationError::Bounds { phase, .. } if phase == "parent.handle"
+        ));
+
+        let mut missing_verifier = valid_request();
+        missing_verifier.child_verifier.clear();
+        let error = propose_reconsolidation(&missing_verifier)
+            .expect_err("a missing child verifier cannot produce a candidate");
+        assert!(matches!(
+            error,
+            ReconsolidationError::Bounds { phase, .. } if phase == "child.verifier"
+        ));
+
+        let mut missing_reopen = valid_request();
+        missing_reopen.child_reopen_condition.clear();
+        let error = propose_reconsolidation(&missing_reopen)
+            .expect_err("a missing reopen condition cannot produce a candidate");
+        assert!(matches!(
+            error,
+            ReconsolidationError::Bounds { phase, .. } if phase == "child.reopen"
+        ));
     }
 
     // WORK_UNIT_CASE: 667/44
@@ -4458,6 +4837,7 @@ mod tests {
 
         let mut stale_request = valid_request();
         stale_request.new_items[0].observed_at_ms = Some(1_700_000_000_001);
+        stale_request.new_items[0].freshness_ms = Some(1_700_000_000_001);
         let stale = propose_reconsolidation(&stale_request)
             .expect("pre-reactivation evidence is stale")
             .outcome;
@@ -4493,6 +4873,7 @@ mod tests {
             statement: "Warm-up run 8 shortened the next cold start further.".to_owned(),
             source_kind: EvidenceSourceKind::ExternalObservation,
             observed_at_ms: Some(1_700_000_000_003),
+            freshness_ms: Some(1_700_000_000_003),
             ..test_evidence_defaults()
         });
         canonical.new_member_denominator.members = vec!["obs-1".to_owned(), "obs-2".to_owned()];
@@ -4514,12 +4895,86 @@ mod tests {
 
     // WORK_UNIT_CASE: 667/49
     #[test]
-    fn case_49_parent_baseline_must_cover_each_proposition() {
-        let mut request = valid_request();
-        request.parent_baseline_lineages.pop();
-        let result = propose_reconsolidation(&request).expect("baseline gap is semantic");
+    fn case_49_every_independent_bound_rejects_one_over() {
+        let assert_bound_error = |request: ReconsolidationRequest, phase: &str| {
+            let error = propose_reconsolidation(&request)
+                .expect_err("one-over input must fail at its independent bound");
+            assert!(
+                matches!(error, ReconsolidationError::Bounds { phase: ref actual, .. } if actual == phase),
+                "expected {phase} bound error, got {error:?}"
+            );
+        };
+
+        let mut propositions = valid_request();
+        propositions.policy.max_parent_propositions = 1;
+        assert_bound_error(propositions, "propositions");
+
+        let mut fields = valid_request();
+        fields.field_paths.push("p1.statement".to_owned());
+        fields.field_paths.sort();
+        fields.policy.max_fields = 1;
+        assert_bound_error(fields, "fields");
+
+        let mut sources = valid_request();
+        sources.new_items.push(NewEvidenceItem {
+            handle: "obs-2".to_owned(),
+            digest: "2".repeat(64),
+            lineage: "lineage-new-2".to_owned(),
+            source_revision: "obs-rev-2".to_owned(),
+            statement: "A second independent warm-up observation.".to_owned(),
+            observed_at_ms: Some(1_700_000_000_003),
+            freshness_ms: Some(1_700_000_000_003),
+            ..test_evidence_defaults()
+        });
+        sources
+            .new_items
+            .sort_by(|left, right| left.handle.cmp(&right.handle));
+        sources.new_member_denominator.members = vec!["obs-1".to_owned(), "obs-2".to_owned()];
+        sources.new_member_denominator.expected_total = 2;
+        sources.policy.max_new_items = 1;
+        assert_bound_error(sources, "sources");
+
+        let mut revisions = valid_request();
+        revisions.parent.predecessor_chain = vec!["rev-0".to_owned(), "rev-1".to_owned()];
+        revisions.policy.max_predecessors = 1;
+        assert_bound_error(revisions, "revisions");
+
+        let mut dependents = valid_request();
+        dependents.dependents.push(DependentRecord {
+            handle: "dep-2".to_owned(),
+            ..test_dependent_record_defaults()
+        });
+        dependents.policy.max_dependents = 1;
+        assert_bound_error(dependents, "dependents");
+
+        let mut bytes = valid_request();
+        let baseline_bytes = total_bytes(&bytes);
+        bytes.policy.max_total_bytes = baseline_bytes;
+        bytes.child_forward_correction.push('x');
+        assert_bound_error(bytes, "bytes");
+
+        let mut stu = valid_request();
+        stu.policy.max_stu = 1;
+        stu.policy.observed_stu = 2;
+        assert_bound_error(stu, "stu");
+
+        let mut output = valid_request();
+        let child = build_child(&output).expect("valid request has a bounded child projection");
+        let child_bytes = canonical_json_bytes(&child).expect("child projection is serializable");
+        assert!(child_bytes.len() > 1);
+        output.policy.max_output_bytes = child_bytes.len() - 1;
+        let result = propose_reconsolidation(&output).expect("output overflow is semantic");
         assert_eq!(result.outcome, ReconsolidationOutcome::Blocked);
         assert!(result.child.is_none());
+
+        let mut work = valid_request();
+        let work_units = (work.parent_propositions.len()
+            + work.new_items.len()
+            + work.added_propositions.len()
+            + work.dependents.len()
+            + work.field_paths.len()) as u64;
+        work.policy.max_work_units = work_units - 1;
+        assert_bound_error(work, "work");
     }
 
     #[test]
@@ -4677,6 +5132,26 @@ mod tests {
         let result = propose_reconsolidation(&expired).expect("deadline drift is semantic");
         assert_eq!(result.outcome, ReconsolidationOutcome::Stale);
         assert!(result.child.is_none());
+
+        let mut missing_observation = valid_request();
+        missing_observation.policy.observation_time_ms = None;
+        let result = propose_reconsolidation(&missing_observation)
+            .expect("deadline without a frozen observation time is stale");
+        assert_eq!(result.outcome, ReconsolidationOutcome::Stale);
+        assert!(result.child.is_none());
+
+        let mut before_deadline = valid_request();
+        before_deadline.policy.observation_time_ms = Some(
+            before_deadline
+                .policy
+                .deadline_ms
+                .expect("fixture has a frozen deadline")
+                - 1,
+        );
+        let result = propose_reconsolidation(&before_deadline)
+            .expect("an observation immediately before the deadline remains eligible");
+        assert_eq!(result.outcome, ReconsolidationOutcome::Complete);
+        assert!(result.child.is_some());
     }
 
     // WORK_UNIT_CASE: 667/51
