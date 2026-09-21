@@ -1,0 +1,125 @@
+{
+  "schema": "eliot.internal-legacy-cue.v1",
+  "issue": 831,
+  "note": "Internal/root legacy goldens for issue #831. Public-symbol goldens, legacy wire goldens, malformed inputs, and the frozen downstream bare-CueKind impact denominator (mechanical CueKind -> LegacyCueKindV1 renames owned by downstream lanes; wire-identical).",
+  "root_cue_exports": [
+    "CUE_BINDING_PAGE_SCHEMA_VERSION_V1",
+    "CUE_BINDING_PAGE_SCHEMA_VERSION_V2",
+    "CueBinding",
+    "CueBindingError",
+    "CueBindingPage",
+    "CueIndexRow",
+    "CueMatchMode",
+    "CueRecordSource",
+    "CueStrength",
+    "LegacyCueKindV1",
+    "MAX_CUE_BINDINGS_PER_PAGE",
+    "MAX_CUE_BINDING_PAGE_BYTES",
+    "cue_binding_page_id",
+    "cue_binding_page_set_hash",
+    "cue_row_id",
+    "normalize_binding",
+    "normalize_binding_pages",
+    "normalize_bindings",
+    "ul_token_estimate"
+  ],
+  "injection_exports": [
+    "InjectionReceipt",
+    "MemoryInfluenceAckInput",
+    "ObservedCue",
+    "PendingInjectionItem",
+    "UlFiredBlock",
+    "UlFiredItem"
+  ],
+  "wire_spellings": [
+    "file_path",
+    "dir_path",
+    "symbol",
+    "error_signature",
+    "command_pattern",
+    "dependency",
+    "api_surface",
+    "task_class",
+    "subsystem",
+    "concept"
+  ],
+  "observed_cue_golden": {
+    "kind": "file_path",
+    "value": "src/net/session.rs"
+  },
+  "observed_cue_canonical": "{\"kind\":\"file_path\",\"value\":\"src/net/session.rs\"}",
+  "injection_receipt_canonical": "{\"injection_id\":\"inj-831-001\",\"session_id\":\"550e8400-e29b-41d4-a716-446655440001\",\"task_id\":\"550e8400-e29b-41d4-a716-446655440002\",\"surface\":\"test-surface\",\"item_ref\":\"item-831-001\",\"render_form\":\"full\",\"fired_cues\":[{\"kind\":\"file_path\",\"value\":\"src/net/session.rs\"}],\"token_cost\":42,\"source_fingerprint\":\"fp-831-001\",\"outcome\":\"delivered\",\"policy_reason\":null}",
+  "injection_receipt_golden": {
+    "injection_id": "inj-831-001",
+    "session_id": "550e8400-e29b-41d4-a716-446655440001",
+    "task_id": "550e8400-e29b-41d4-a716-446655440002",
+    "surface": "test-surface",
+    "item_ref": "item-831-001",
+    "render_form": "full",
+    "fired_cues": [
+      {
+        "kind": "file_path",
+        "value": "src/net/session.rs"
+      }
+    ],
+    "token_cost": 42,
+    "source_fingerprint": "fp-831-001",
+    "outcome": "delivered",
+    "policy_reason": null
+  },
+  "malformed_observed_cues": [
+    {
+      "tag": "unknown-kind",
+      "json": {
+        "kind": "relation_edge",
+        "value": "x"
+      }
+    },
+    {
+      "tag": "missing-kind",
+      "json": {
+        "value": "x"
+      }
+    },
+    {
+      "tag": "empty-kind",
+      "json": {
+        "kind": "",
+        "value": "x"
+      }
+    },
+    {
+      "tag": "null-kind",
+      "json": {
+        "kind": null,
+        "value": "x"
+      }
+    },
+    {
+      "tag": "int-kind",
+      "json": {
+        "kind": 7,
+        "value": "x"
+      }
+    },
+    {
+      "tag": "capitalized-kind",
+      "json": {
+        "kind": "FilePath",
+        "value": "x"
+      }
+    },
+    {
+      "tag": "control-char-kind",
+      "json": {
+        "kind": "file_path\u0000",
+        "value": "x"
+      }
+    },
+    {
+      "tag": "truncated-bytes",
+      "raw": "{\"kind\": \"file_pa"
+    }
+  ],
+  "downstream_impact": []
+}

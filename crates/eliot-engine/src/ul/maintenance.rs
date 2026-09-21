@@ -5,7 +5,7 @@ use super::{
 use crate::{EngineError, WriteAdmissionService, WriterHandle};
 use eliot_store::{CanonicalRecord, CanonicalStore};
 use eliot_types::{
-    CoChangeEdge, ConceptNode, CueKind, HotspotScore, MiningRun, ModuleCard, ProjectId,
+    CoChangeEdge, ConceptNode, LegacyCueKindV1, HotspotScore, MiningRun, ModuleCard, ProjectId,
     PyramidTargetKind, UlArtifact, UlArtifactDirtyState, UlMaintenanceReport,
 };
 use std::collections::BTreeMap;
@@ -197,7 +197,7 @@ impl UlMaintenanceService {
         };
         for source in sources {
             let in_concept = source.cue_bindings.iter().any(|binding| {
-                binding.cue_kind == CueKind::FilePath
+                binding.cue_kind == LegacyCueKindV1::FilePath
                     && path_in_concept(&binding.cue_value, concept)
             });
             if !in_concept {
