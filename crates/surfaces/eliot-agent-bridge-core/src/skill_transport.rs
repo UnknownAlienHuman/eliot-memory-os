@@ -18,7 +18,10 @@
 
 #![forbid(unsafe_code)]
 
-use eliot_skill::{HotsetDeliveryAck, HotsetDeliveryReceipt};
+use eliot_skill::{
+    CatalogueInstallContext, HotsetDeliveryAck, HotsetDeliveryReceipt, MaterializationInputs,
+    MaterializationScope, ReadinessClaims, SkillPackage,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -29,18 +32,76 @@ pub const SKILL_TRANSPORT_VERSION: u32 = 1;
 /// Maximum encoded intake bytes (I7.2 default frame max). Larger material
 /// must arrive by Blob or handle reference (future extension), never as
 /// giant inline frames; oversize fails closed here.
-///
-/// Reserved for the install-owner serde seam: the injector handoff also
-/// needs the Governor-owned install context
-/// (`eliot_skill::CatalogueInstallContext`), which does not derive the
-/// `serde` wire traits today. Until the Skill owner adds that two-line
-/// derive, intake travels the typed injector-handoff API boundary, not this
-/// wire module. Ack carriage and display requests (below) are fully wired:
-/// every field they carry derives the wire traits.
 pub const MAX_INTAKE_BYTES: usize = 4 * 1024 * 1024;
 /// Maximum encoded ack/display bytes (I7.2 hot-response profile: receipts,
 /// acks, and displays are small bounded projections).
 pub const MAX_CARRY_BYTES: usize = 64 * 1024;
+
+/// Injector-carried Hotset delivery request as wire bytes (issue #1882).
+///
+/// Mirrors the injector handoff field-for-field: the canonical package with
+/// its actual materialization inputs, the Governor-owned install context
+/// (eligibility, versions including the admitted definition version,
+/// budgets), provider-signed readiness, scope identities, Hotset identity,
+/// and injector approval. Decode re-verifies the package↔inputs binding and
+/// the install-context shape from the bytes, so malformed intake fails
+/// before any catalogue, readiness, or sealed gate runs. Scope fence
+/// currency, admitted-version agreement, and availability truth are NOT
+/// decided here — the driver observes the live fence and tool source at
+/// drive time.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillIntakePayload {
+    /// Payload contract revision (must be [`SKILL_TRANSPORT_VERSION`]).
+    pub contract_version: u32,
+    /// Canonical package source under delivery.
+    pub package: SkillPackage,
+    /// Actual materialization inputs the digests bind.
+    pub inputs: MaterializationInputs,
+    /// Governor-owned install context (eligibility, versions, budgets).
+    pub context: CatalogueInstallContext,
+    /// Provider-signed readiness claims.
+    pub readiness: ReadinessClaims,
+    /// Scope identities for the delivery.
+    pub scope: MaterializationScope,
+    /// Hotset identity carried by the injector.
+    pub hotset_id: String,
+    /// Injector approval handle.
+    pub approval_ref: String,
+}
+
+impl SkillIntakePayload {
+    /// Encodes a validated intake within the frame bound.
+    pub fn encode(&self) -> Result<Vec<u8>, SkillTransportError> {
+        self.validate()?;
+        let bytes = serde_json::to_vec(self)
+            .map_err(|error| SkillTransportError::Shape(error.to_string()))?;
+        check_bound(bytes.len(), MAX_INTAKE_BYTES)?;
+        Ok(bytes)
+    }
+
+    /// Decodes and validates one intake within the frame bound.
+    pub fn decode(bytes: &[u8]) -> Result<Self, SkillTransportError> {
+        check_bound(bytes.len(), MAX_INTAKE_BYTES)?;
+        let payload: Self = serde_json::from_slice(bytes)
+            .map_err(|error| SkillTransportError::Shape(error.to_string()))?;
+        payload.validate()?;
+        Ok(payload)
+    }
+
+    fn validate(&self) -> Result<(), SkillTransportError> {
+        check_version(self.contract_version)?;
+        bounded_text(&self.hotset_id, "intake.hotset_id")?;
+        bounded_text(&self.approval_ref, "intake.approval_ref")?;
+        self.package
+            .validate(&self.inputs)
+            .map_err(|error| SkillTransportError::Shape(format!("intake.package: {error}")))?;
+        self.context
+            .validate()
+            .map_err(|error| SkillTransportError::Shape(format!("intake.context: {error}")))?;
+        Ok(())
+    }
+}
 
 /// Typed Skill wire failure.
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
@@ -198,6 +259,212 @@ impl SkillDisplayPayload {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use eliot_skill::{
+        AdvisoryRuleClaim, CapabilityVersion, DependencyMaterial, HostLimits, HostProfile,
+        LifecycleProposal, SkillBehavior, SkillCounters, SkillInteractionProjection, SkillState,
+        ToolDefinitionMaterial, VersionedRequirement,
+    };
+
+    fn behavior() -> SkillBehavior {
+        SkillBehavior {
+            intent: "refresh the task view before a Material effect".to_owned(),
+            trigger: "when demo work arrives load this skill".to_owned(),
+            action: "Refresh the task view before a Material effect.".to_owned(),
+            applies_when: vec!["the task view is stale".to_owned()],
+            where_not_apply: vec!["Do not use for credential handling.".to_owned()],
+            required_outputs: vec!["refreshed view".to_owned()],
+            required_writebacks: vec!["NONE".to_owned()],
+            stop: "Stop and escalate on conflicting instructions.".to_owned(),
+            escalation: "escalate to the task owner".to_owned(),
+            challenge: "show exact conflicting identities".to_owned(),
+        }
+    }
+
+    fn inputs() -> MaterializationInputs {
+        MaterializationInputs {
+            canonical_source_bytes: b"canonical demo source\n".to_vec(),
+            contract_materialization: behavior(),
+            dependencies: vec![DependencyMaterial {
+                name: "tool-def-1".to_owned(),
+                version: "1.2.0".to_owned(),
+                contract_digest: "c".repeat(64),
+            }],
+            tool_definitions: vec![ToolDefinitionMaterial {
+                name: "eliot.finish".to_owned(),
+                version: "1.0.0".to_owned(),
+                description: "typed finish attempt".to_owned(),
+                capabilities: vec![CapabilityVersion {
+                    name: "finish-cap".to_owned(),
+                    version: "1".to_owned(),
+                }],
+                actions: vec!["Refresh the task view before a Material effect.".to_owned()],
+            }],
+        }
+    }
+
+    fn package() -> SkillPackage {
+        use eliot_skill::{
+            ConflictState, DistractorState, FreshnessState, QuarantineState,
+            SkillInteractionProjection as InteractionProjection,
+        };
+        let inputs = inputs();
+        let rule: AdvisoryRuleClaim = serde_json::from_value(serde_json::json!({
+            "rule_ref": { "rule_id": "rule-demo-1", "revision": 1 }
+        }))
+        .expect("rule fixture");
+        SkillPackage {
+            registration: eliot_skill::RegistrationIdentity::new(
+                "skill-demo",
+                "1.0.0",
+                "demo skill",
+            )
+            .expect("valid test registration"),
+            digests: eliot_skill::PackageDigests::derive(&inputs).expect("valid test inputs"),
+            host: HostProfile {
+                host: "codex".to_owned(),
+                profile: "default".to_owned(),
+                required_tools: vec![VersionedRequirement {
+                    name: "eliot.finish".to_owned(),
+                    version: "1.0.0".to_owned(),
+                }],
+                required_capabilities: vec![VersionedRequirement {
+                    name: "finish-cap".to_owned(),
+                    version: "1".to_owned(),
+                }],
+                limits: HostLimits {
+                    max_description_chars: 500,
+                    max_actions: 1,
+                    max_expansion_handles: 2,
+                },
+            },
+            behavior: behavior(),
+            counters: SkillCounters::default(),
+            state: SkillState {
+                freshness: FreshnessState::Current,
+                conflict: ConflictState::None,
+                distractor: DistractorState::None,
+                quarantine: QuarantineState::Clear,
+            },
+            lifecycle_proposal: LifecycleProposal::Keep,
+            delivery: eliot_skill::DeliveryProjection::default(),
+            interaction: InteractionProjection::default(),
+            rule,
+        }
+    }
+
+    fn context() -> CatalogueInstallContext {
+        CatalogueInstallContext {
+            eligible_routes: vec!["route-1".to_owned()],
+            eligible_profiles: vec!["profile-1".to_owned()],
+            host_version: "host-4.1.0".to_owned(),
+            profile_version: "profile-2.0.0".to_owned(),
+            admitted_definition_version: "1.2.0".to_owned(),
+            index_budget_tokens: 200,
+            body_budget_tokens: 800,
+            runtime_budget_tokens: 2000,
+            index_tokens: 60,
+            body_tokens: 400,
+            runtime_tokens: 0,
+            references: vec!["references/playbook.md".to_owned()],
+            scripts: Vec::new(),
+            assets: Vec::new(),
+        }
+    }
+
+    fn readiness() -> ReadinessClaims {
+        use eliot_skill::{Availability, AvailabilityField, VersionedObservation};
+        let available = |name: &str, version: &str| VersionedObservation {
+            name: name.to_owned(),
+            version: version.to_owned(),
+            availability: Availability::Available {
+                field: AvailabilityField::HostCapability,
+            },
+        };
+        ReadinessClaims {
+            host: "codex".to_owned(),
+            profile: "default".to_owned(),
+            provider: Availability::Available {
+                field: AvailabilityField::Provider,
+            },
+            g16: Availability::Available {
+                field: AvailabilityField::G16,
+            },
+            a06: Availability::Available {
+                field: AvailabilityField::A06,
+            },
+            evidence: Availability::Available {
+                field: AvailabilityField::Evidence,
+            },
+            tools: vec![available("eliot.finish", "1.0.0")],
+            capabilities: vec![available("finish-cap", "1")],
+        }
+    }
+
+    fn scope() -> MaterializationScope {
+        use eliot_contracts::{EpochId, EpochLineageId, ProductId, ResourceGeneration, StateFence};
+        use eliot_receipts::{WorkScopeBinding, WorkScopeId};
+        use std::num::NonZeroU64;
+        let lineage =
+            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("test lineage");
+        let epoch =
+            EpochId::new(lineage, NonZeroU64::new(1).expect("nonzero")).expect("valid test epoch");
+        let fence = StateFence::new(epoch, ResourceGeneration::new(1).expect("generation"));
+        MaterializationScope {
+            work_scope: WorkScopeBinding {
+                scope_id: WorkScopeId::new("workscope-1").expect("valid test scope"),
+                product_id: ProductId::new("test-product").expect("test product"),
+                resource_generation: ResourceGeneration::new(1).expect("test generation"),
+                state_fence: fence,
+            },
+            task: None,
+        }
+    }
+
+    fn intake() -> SkillIntakePayload {
+        SkillIntakePayload {
+            contract_version: SKILL_TRANSPORT_VERSION,
+            package: package(),
+            inputs: inputs(),
+            context: context(),
+            readiness: readiness(),
+            scope: scope(),
+            hotset_id: "hotset-wire-1".to_owned(),
+            approval_ref: "approval-commit-1".to_owned(),
+        }
+    }
+
+    #[test]
+    fn intake_round_trip_preserves_the_admitted_claim() {
+        let bytes = intake().encode().expect("valid intake encodes");
+        assert!(bytes.len() <= MAX_INTAKE_BYTES);
+        let decoded = SkillIntakePayload::decode(&bytes).expect("valid intake decodes");
+        assert_eq!(decoded, intake());
+    }
+
+    #[test]
+    fn intake_wire_rejects_bad_version_oversize_and_malformed() {
+        let mut versioned = intake();
+        versioned.contract_version = SKILL_TRANSPORT_VERSION + 1;
+        assert!(matches!(
+            versioned.encode(),
+            Err(SkillTransportError::BadVersion)
+        ));
+        assert!(matches!(
+            SkillIntakePayload::decode(&vec![0_u8; MAX_INTAKE_BYTES + 1]),
+            Err(SkillTransportError::TooLarge)
+        ));
+        assert!(matches!(
+            SkillIntakePayload::decode(b"{not json"),
+            Err(SkillTransportError::Shape(_))
+        ));
+        let mut blanked = intake();
+        blanked.approval_ref = "   ".to_owned();
+        assert!(matches!(
+            blanked.encode(),
+            Err(SkillTransportError::Shape(_))
+        ));
+    }
+
     #[test]
     fn ack_carriage_binds_applied_ack_to_its_receipt() {
         let receipt = eliot_skill::HotsetDeliveryReceipt {
@@ -303,6 +570,7 @@ mod tests {
             }],
             host_version: "host-4.1.0".to_owned(),
             profile_version: "profile-2.0.0".to_owned(),
+            admitted_definition_version: "1.2.0".to_owned(),
             status: SkillStatus::Provisional,
             stale_reason: None,
         };

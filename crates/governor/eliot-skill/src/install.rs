@@ -100,15 +100,20 @@ use super::{
     SkillRuntimeMetadata, SkillStatus,
 };
 use crate::KnownTools;
+use serde::{Deserialize, Serialize};
 
 /// Governor-owned installation parameters the sealed package does not carry.
 ///
 /// The package binds identity, instruction, exact tools, dependencies, and
 /// state. Everything else an entry requires — route/profile admission scope,
-/// visible host/profile versions, and the runtime inventory plus the I7.12
-/// index/body/runtime token budgets — is explicit Governor-owned install
-/// context, never inferred from names or defaulted to empty success.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// visible host/profile versions, the Governor-admitted Tool Definition
+/// version, and the runtime inventory plus the I7.12 index/body/runtime token
+/// budgets — is explicit Governor-owned install context, never inferred from
+/// names or defaulted to empty success. The context crosses the Skill wire
+/// as JSON, so field shapes stay wire-stable: new install parameters get new
+/// optional fields, never silent repurposing.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CatalogueInstallContext {
     /// Routes this installation admits the Skill for (at least one route or
     /// profile is required by entry validation).
@@ -119,6 +124,11 @@ pub struct CatalogueInstallContext {
     pub host_version: String,
     /// Visible profile version pinned at install (I7.13).
     pub profile_version: String,
+    /// Tool Definition version the Governor admits for this installation.
+    /// Recorded verbatim onto the catalogue entry so standing version
+    /// checks compare the live canonical source against the version bound
+    /// at install, never a re-stated claim.
+    pub admitted_definition_version: String,
     /// Token budget for the index row (paid every session).
     pub index_budget_tokens: u32,
     /// Token budget for the activation body (paid on activation).
@@ -145,6 +155,10 @@ impl CatalogueInstallContext {
     pub fn validate(&self) -> Result<(), SkillError> {
         crate::text(&self.host_version, "context.host_version")?;
         crate::text(&self.profile_version, "context.profile_version")?;
+        crate::text(
+            &self.admitted_definition_version,
+            "context.admitted_definition_version",
+        )?;
         if self.eligible_routes.is_empty() && self.eligible_profiles.is_empty() {
             return Err(SkillError::InvalidField {
                 field: "context.eligibility",
@@ -275,6 +289,7 @@ pub fn project_package_to_entry(
         dependencies,
         host_version: context.host_version.clone(),
         profile_version: context.profile_version.clone(),
+        admitted_definition_version: context.admitted_definition_version.clone(),
         status,
         stale_reason,
     };
@@ -458,6 +473,7 @@ mod tests {
             eligible_profiles: vec!["profile-1".to_owned()],
             host_version: "host-4.1.0".to_owned(),
             profile_version: "profile-2.0.0".to_owned(),
+            admitted_definition_version: "1.2.0".to_owned(),
             index_budget_tokens: 200,
             body_budget_tokens: 800,
             runtime_budget_tokens: 2000,

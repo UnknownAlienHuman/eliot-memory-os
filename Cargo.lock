@@ -666,6 +666,7 @@ dependencies = [
  "eliot-observation-contracts",
  "eliot-process",
  "eliot-protocol",
+ "eliot-receipts",
  "eliot-skill",
  "eliot-types",
  "serde",
