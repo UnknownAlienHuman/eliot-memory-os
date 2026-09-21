@@ -14,22 +14,21 @@ type TestResult = Result<(), Box<dyn Error>>;
 
 const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
 
-fn test_epoch(sequence: u64) -> EpochId {
-    EpochId::new(
-        EpochLineageId::new(TEST_LINEAGE_A).expect("valid test lineage"),
-        NonZeroU64::new(sequence).expect("nonzero test sequence"),
-    )
-    .expect("valid test epoch")
+fn test_epoch(sequence: u64) -> Result<EpochId, Box<dyn Error>> {
+    Ok(EpochId::new(
+        EpochLineageId::new(TEST_LINEAGE_A)?,
+        NonZeroU64::new(sequence).ok_or("nonzero test sequence")?,
+    )?)
 }
 
 fn revision(value: u64) -> Result<TaskRevision, Box<dyn Error>> {
     Ok(TaskRevision::new(value)?)
 }
 
-fn fence(task_revision: TaskRevision) -> StateFence {
-    let mut fence = StateFence::new(test_epoch(1), ResourceGeneration::genesis());
+fn fence(task_revision: TaskRevision) -> Result<StateFence, Box<dyn Error>> {
+    let mut fence = StateFence::new(test_epoch(1)?, ResourceGeneration::genesis());
     fence.task_revision = Some(task_revision);
-    fence
+    Ok(fence)
 }
 
 fn atom(
@@ -45,7 +44,7 @@ fn atom(
         status: EpistemicStatus::Observed,
         assertability: Assertability::NonAssertableUnverified,
         freshness: EvidenceFreshness::ExactCommit,
-        state_fence: fence(task_revision),
+        state_fence: fence(task_revision)?,
         required: true,
         protected: true,
         cost: 1,
@@ -60,7 +59,7 @@ fn input(task_revision: TaskRevision) -> Result<ContextInput, Box<dyn Error>> {
         scope: "scope:test".to_owned(),
         task_id: None,
         task_revision,
-        state_fence: fence(task_revision),
+        state_fence: fence(task_revision)?,
         atoms: vec![atom("atom:goal", ContextRole::Goal, task_revision)?],
         unknowns: Vec::new(),
     })
