@@ -65,6 +65,13 @@ pub use launch_config::{
     StoreLaunchConfig, launch_config_digest, load_config, load_portable_dev_config,
 };
 pub(crate) use launch_config::{validate_digest, validate_launch_text};
+mod compatibility;
+pub use compatibility::{
+    ADMITTED_TRANSPORT, COMPATIBILITY_FILE_NAME, CompatibilityFile, CompatibilityVerdict,
+    SurrealCompatibility, compatibility_path_for_config, evaluate_compatibility,
+    load_compatibility_for_config, parse_compatibility_bytes, require_compatibility_for_writer,
+    require_observed_identity_match,
+};
 mod schema_bootstrap_contract;
 use schema_bootstrap_contract::{
     StoreSchemaBootstrapBinding, StoreSchemaBootstrapCache, map_schema_bootstrap_error,
@@ -75,6 +82,7 @@ pub use schema_bootstrap_contract::{
 mod request_dispatch;
 pub use request_dispatch::StoreDispatchBackend;
 pub use request_dispatch::dispatch;
+pub mod task_binding_gate;
 #[cfg(test)]
 use request_dispatch::map_recovery_dispatch_result;
 #[cfg(test)]
@@ -84,6 +92,13 @@ pub use canonical_event::{
     CanonicalEvent, CommittedCanonicalTransition, DoctorRebuildAuthority, FencedProjectionPublication,
     OrderingLink, ProjectionRebuildPlan, SemanticWritePath, ordering_link_hash,
     request_projection_rebuild, request_rebuild_from_semantic_write,
+};
+mod connection_manager;
+pub use connection_manager::{
+    ClientClass, ClientLease, ClientSetPolicy, ConnectionPolicies, DEFAULT_HEALTH_CLIENTS,
+    DEFAULT_READ_CLIENTS, HealthAdminAdmission, LeaseAccess, ReplayVerdict, ResolvedWriteOutcome,
+    StoreConnectionManager, UnknownWriteGate, classify_receipt_lookup, decide_replay,
+    default_store_transaction_limit, default_store_transaction_limit_usize,
 };
 mod adapter_materialization;
 pub use adapter_materialization::materialize_adapter_config;
@@ -246,6 +261,8 @@ pub struct StoreComposition {
     state_fence: StateFence,
     schema_bootstrap_binding: StoreSchemaBootstrapBinding,
     schema_bootstrap_cache: tokio::sync::Mutex<Option<StoreSchemaBootstrapCache>>,
+    connections: StoreConnectionManager,
+    health_admission: HealthAdminAdmission,
     _runtime_root_leases: ValidatedRuntimeRootLeases<WindowsRuntimeRootLease>,
 }
 
@@ -256,6 +273,8 @@ impl std::fmt::Debug for StoreComposition {
             .field("store", &self.store)
             .field("blob_owner", &self.blob)
             .field("state_fence", &self.state_fence)
+            .field("connections", &self.connections)
+            .field("health_admission", &self.health_admission)
             .finish_non_exhaustive()
     }
 }
@@ -309,12 +328,30 @@ impl StoreComposition {
             provider_process_lease,
         )
         .map_err(|error| format!("compose canonical provider adapter: {error}"))?;
+        // I5.9/I5.7 (issue #1933): fixed bounded read, write, and
+        // health/admin client sets. Write concurrency is bound to the
+        // Kernel's configured store transaction limit; read/health bounds
+        // and every per-class deadline follow the validated launch
+        // timeouts. No connection is created per request, and no `expect`
+        // remains on this path: both bounds fail closed on zero.
+        let write_limit = config
+            .store_transaction_limit
+            .unwrap_or_else(default_store_transaction_limit_usize);
+        let connections = StoreConnectionManager::from_configured_limits(
+            DEFAULT_READ_CLIENTS,
+            write_limit,
+            config.connect_timeout_ms,
+            config.query_timeout_ms,
+        )
+        .map_err(|error| format!("compose bounded bridge client sets: {error}"))?;
         Ok(Self {
             store,
             blob,
             state_fence,
             schema_bootstrap_binding,
             schema_bootstrap_cache: tokio::sync::Mutex::new(None),
+            connections,
+            health_admission: HealthAdminAdmission::bridge_default(),
             _runtime_root_leases: runtime_root_leases,
         })
     }
@@ -332,8 +369,21 @@ impl StoreComposition {
     }
 
     /// Bounded adapter/provider health observation.
+    ///
+    /// Runs on the isolated health/admin client path after exact-operation
+    /// admission: health traffic never consumes a canonical write slot. A
+    /// transport failure marks the health generation broken until it is
+    /// explicitly replaced.
     pub async fn health(&self) -> Result<StoreHealth, StoreError> {
-        self.store.health().await
+        self.health_admission.require_admitted("store.health")?;
+        let lease = self.connections.try_acquire(ClientClass::Health)?;
+        let _access = self.connections.validate_lease(&lease)?;
+        let outcome = self.store.health().await;
+        if matches!(outcome, Err(StoreError::Unavailable)) {
+            self.connections.mark_broken(ClientClass::Health);
+            self.store.note_connection_loss();
+        }
+        outcome
     }
 
     /// Starts the one retained canonical provider child and proves authenticated
@@ -347,7 +397,22 @@ impl StoreComposition {
 
     /// Semantic schema readiness observation.  This is not a write authority
     /// verdict and is returned as its own receipt/status surface.
+    ///
+    /// Like [`Self::health`], readiness runs on the isolated health/admin
+    /// path under exact-operation admission, never on a write slot.
     pub async fn readiness(&self) -> Result<ReadinessReceipt, StoreError> {
+        self.health_admission.require_admitted("store.readiness")?;
+        let lease = self.connections.try_acquire(ClientClass::Health)?;
+        let _access = self.connections.validate_lease(&lease)?;
+        let outcome = self.readiness_inner().await;
+        if matches!(outcome, Err(StoreError::Unavailable)) {
+            self.connections.mark_broken(ClientClass::Health);
+            self.store.note_connection_loss();
+        }
+        outcome
+    }
+
+    async fn readiness_inner(&self) -> Result<ReadinessReceipt, StoreError> {
         let readiness = self
             .store
             .probe_readiness()
@@ -435,11 +500,24 @@ impl StoreComposition {
     }
 
     /// Executes one closed named read from the store API catalogue.
+    ///
+    /// Reads are restricted to the activated named Q0–Q4 catalogue and run
+    /// under the bounded read set: repeated concurrent reads reuse read
+    /// slots instead of growing connections per request. A transport failure
+    /// marks the read generation broken until explicitly replaced.
     pub async fn named(
         &self,
         request: NamedReadRequest,
     ) -> Result<NamedReadResponse, eliot_store_api::StoreError> {
-        self.store.execute_named(request).await
+        StoreConnectionManager::admit_named_read(request.operation)?;
+        let lease = self.connections.try_acquire(ClientClass::Read)?;
+        let _access = self.connections.validate_lease(&lease)?;
+        let outcome = self.store.execute_named(request).await;
+        if matches!(outcome, Err(StoreError::Unavailable)) {
+            self.connections.mark_broken(ClientClass::Read);
+            self.store.note_connection_loss();
+        }
+        outcome
     }
 
     /// Applies one fully prepared transition through the sole canonical write
@@ -485,7 +563,28 @@ impl StoreComposition {
             &expected_revision_heads,
             &expected_ordering_heads,
         )?;
-        self.store
+        // I5.7/I5.9 (issue #1933): the canonical write runs under the
+        // bounded write set limited by the Kernel's configured store
+        // transaction limit. Exhaustion sheds with `Unavailable`; a
+        // transport failure marks the write generation broken until it is
+        // explicitly replaced. An unknown outcome is not a broken
+        // connection: it resolves through `ResolveWriteReceipt` first.
+        let lease = self
+            .connections
+            .try_acquire(ClientClass::Write)
+            .map_err(StoreCompositionError::Store)?;
+        let _access = self.connections.validate_lease(&lease)?;
+        // Issue #1929: task-binding gate before any provider I/O. Cold unbound
+        // capture passes through; missing/incompatible task binding fails
+        // closed with the stable TASK_SELECTION_REQUIRED /
+        // TASK_SCOPE_INCOMPATIBLE code preserved in the typed reason.
+        if let Err(rejection) = crate::task_binding_gate::gate_apply(context, &transition) {
+            return Err(StoreCompositionError::Store(
+                crate::task_binding_gate::map_rejection(&rejection),
+            ));
+        }
+        let outcome = self
+            .store
             .apply_prepared_with_authority(
                 context,
                 transition,
@@ -494,7 +593,15 @@ impl StoreComposition {
                 authorities,
             )
             .await
-            .map_err(map_adapter_error)
+            .map_err(map_adapter_error);
+        if matches!(
+            outcome,
+            Err(StoreCompositionError::Store(StoreError::Unavailable))
+        ) {
+            self.connections.mark_broken(ClientClass::Write);
+            self.store.note_connection_loss();
+        }
+        outcome
     }
 
     /// Applies one sealed reserved-write request through the sole canonical
@@ -514,9 +621,22 @@ impl StoreComposition {
         if request.context.state_fence != self.state_fence {
             return Err(StoreCompositionError::Store(StoreError::FenceMismatch));
         }
-        CanonicalStoreClient::apply_reserved_write(&self.store, request)
+        let lease = self
+            .connections
+            .try_acquire(ClientClass::Write)
+            .map_err(StoreCompositionError::Store)?;
+        let _access = self.connections.validate_lease(&lease)?;
+        let outcome = CanonicalStoreClient::apply_reserved_write(&self.store, request)
             .await
-            .map_err(StoreCompositionError::Store)
+            .map_err(StoreCompositionError::Store);
+        if matches!(
+            outcome,
+            Err(StoreCompositionError::Store(StoreError::Unavailable))
+        ) {
+            self.connections.mark_broken(ClientClass::Write);
+            self.store.note_connection_loss();
+        }
+        outcome
     }
 
     /// Reconciles a possibly ambiguous write by exact operation identity.
@@ -528,6 +648,71 @@ impl StoreComposition {
             .reconcile(operation_id)
             .await
             .map_err(AdapterError::into_store_error)
+    }
+
+    /// Resolves an unknown write outcome by the original operation identity
+    /// before any new transaction attempt (I5.19, issue #1933).
+    ///
+    /// This is the identity-bound receipt-first gate: the
+    /// `ResolveWriteReceipt` lookup is classified against the gate's own
+    /// operation identity through [`UnknownWriteGate`]. A missing, foreign,
+    /// invalid, or envelope-less answer keeps the outcome unknown and forbids
+    /// replay; a committed receipt reuses the existing receipt; a proven
+    /// non-application opens only a newly admitted operation when the
+    /// receipt's resubmission rule allows it, and routes to canonical gap
+    /// disposition otherwise — never a blind replay.
+    pub async fn resolve_unknown_write(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<ReplayVerdict, StoreError> {
+        let mut gate = UnknownWriteGate::unknown(operation_id.clone());
+        let receipt = self.receipt(operation_id.clone()).await?;
+        gate.resolve_lookup(receipt.as_ref());
+        match gate.verdict() {
+            ReplayVerdict::UseExistingReceipt => Ok(ReplayVerdict::UseExistingReceipt),
+            ReplayVerdict::MustReconcile => Ok(ReplayVerdict::MustReconcile),
+            ReplayVerdict::NewIdentityOnly => {
+                // Enforce the receipt's resubmission rule before any new
+                // admission; gate.resubmission() is Some here by construction.
+                Ok(ReplayVerdict::NewIdentityOnly)
+            }
+            ReplayVerdict::RequiresGapDisposition => {
+                // Route to canonical SequenceDisposition; do NOT re-admit
+                // the same work under any identity.
+                Ok(ReplayVerdict::RequiresGapDisposition)
+            }
+        }
+    }
+
+    /// Returns the bounded bridge client sets: generations, bounds,
+    /// deadlines, and reconnect policy (I5.9, issue #1933).
+    #[must_use]
+    pub const fn connections(&self) -> &StoreConnectionManager {
+        &self.connections
+    }
+
+    /// Explicitly replaces a broken client generation after its transport
+    /// failure has been reconciled. Fails closed when the set is not broken.
+    ///
+    /// Runs the real reconnect path: records the attempt (which returns
+    /// the policy backoff the caller waits before dialing the transport),
+    /// dials exactly once, then cuts over. Attempts past the policy budget
+    /// refuse with escalation instead of a silent replace. The proved
+    /// provider identity is forgotten on cutover: the next ownership-verified
+    /// authentication re-proves it before any gate may claim it again.
+    pub async fn replace_client_generation(
+        &self,
+        class: ClientClass,
+        dial: impl AsyncFnOnce() -> Result<(), StoreError>,
+    ) -> Result<u64, String> {
+        let backoff_ms = self.connections.note_reconnect_attempt(class)?;
+        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+        dial()
+            .await
+            .map_err(|error| format!("reconnect dial failed: {error:?}"))?;
+        let generation = self.connections.replace_generation(class)?;
+        self.store.note_connection_loss();
+        Ok(generation)
     }
 
     /// Reads revision heads through the neutral store boundary.
@@ -555,6 +740,39 @@ impl StoreComposition {
     /// response; no provider-specific data is exposed.
     pub fn operation_manifest_digest(&self) -> &str {
         self.store.operation_manifest().digest.as_str()
+    }
+}
+
+/// Observed provider identity proved over the ownership-verified channel
+/// during `connect()` (issue #1932).
+///
+/// Populated from the live `provider.version` RPC (`ProviderVersion`) and
+/// the digest-pinned spawn validation. `None` before a successful connect;
+/// never constructed from record/config echo.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ObservedProviderIdentity {
+    /// Live server major from the `provider.version` RPC.
+    pub version_major: u16,
+    /// Live server minor from the `provider.version` RPC.
+    pub version_minor: u16,
+    /// Live server patch from the `provider.version` RPC.
+    pub version_patch: u16,
+    /// Lowercase hex SHA-256 of the spawned provider executable as validated
+    /// at spawn (`provider_artifact_digest` after `validate_child_process`).
+    pub artifact_digest: String,
+}
+
+impl StoreComposition {
+    /// Returns the proved provider identity after `connect()` succeeds.
+    /// Returns `None` when no authenticated provider session exists.
+    pub fn observed_provider_identity(&self) -> Option<ObservedProviderIdentity> {
+        let proved = self.store.authenticated_provider_identity()?;
+        Some(ObservedProviderIdentity {
+            version_major: proved.version_major,
+            version_minor: proved.version_minor,
+            version_patch: proved.version_patch,
+            artifact_digest: proved.artifact_digest,
+        })
     }
 }
 
@@ -1162,6 +1380,7 @@ mod tests {
             username: "store".to_owned(),
             connect_timeout_ms: 1_000,
             query_timeout_ms: 1_000,
+            store_transaction_limit: None,
             schema_generation: "1.0.0".to_owned(),
             blob_root: r"C:\ProgramData\Eliot\blob".to_owned(),
             instance_id: "store-test".to_owned(),

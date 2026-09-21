@@ -88,8 +88,7 @@ pub(crate) const AGENT_HOST_REQUEST_REHYDRATE_OPERATION: &str = "agent_host_requ
 /// from the durable record without re-dispatch. The envelope stays
 /// digest-only in spirit; the tool bytes only prove the presented operation
 /// is the admitted one.
-pub(crate) const AGENT_HOST_REQUEST_INVOKE_READ_OPERATION: &str =
-    "agent_host_request_invoke_read";
+pub(crate) const AGENT_HOST_REQUEST_INVOKE_READ_OPERATION: &str = "agent_host_request_invoke_read";
 
 /// Bound on queued local-read pairs for the outbound-only eliotd poller.
 ///
@@ -413,10 +412,7 @@ impl KernelComposition {
         // poller (`local_read_claim`, Implements #18). Packet admissions and
         // malformed selectors never queue; enqueue is best-effort and never
         // fails admission (the ORS record is already staged above).
-        if matches!(
-            check_local_read_admission(envelope, tool),
-            Ok(Some(_))
-        ) {
+        if matches!(check_local_read_admission(envelope, tool), Ok(Some(_))) {
             let _ = self.enqueue_local_read_pair(envelope, tool);
         }
         // Coherence gate before serving: a resulted record must carry a
@@ -899,8 +895,7 @@ impl KernelComposition {
 /// no earlier lifecycle can collide with, even when the fencing generation
 /// restarts at 1 after retire or fence. Strictly increasing within a boot;
 /// across restarts the composition boot nonce disambiguates.
-static LOCAL_READ_ENQUEUE_SALT: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(1);
+static LOCAL_READ_ENQUEUE_SALT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl KernelComposition {
     /// Queues one admitted local-read pair for the daemon poller.
@@ -961,10 +956,8 @@ impl KernelComposition {
                 // identities unique even if the pair is re-enqueued later. No
                 // time lease is involved.
                 local_read_attempt: LocalReadAttemptState {
-                    enqueue_salt: LOCAL_READ_ENQUEUE_SALT.fetch_add(
-                        1,
-                        std::sync::atomic::Ordering::SeqCst,
-                    ),
+                    enqueue_salt: LOCAL_READ_ENQUEUE_SALT
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst),
                     ..LocalReadAttemptState::default()
                 },
             });
@@ -1201,8 +1194,7 @@ impl KernelComposition {
         session: &Session,
         body: &HostRequestResultBody,
     ) -> Result<LocalReadSubmitDisposition, TransportError> {
-        body.validate()
-            .map_err(|_| TransportError::SessionFenced)?;
+        body.validate().map_err(|_| TransportError::SessionFenced)?;
         let operation_id = OperationIdentity::new(body.operation_id.clone())
             .map_err(|_| TransportError::SessionFenced)?;
         let stored = self
@@ -1899,6 +1891,7 @@ pub(crate) fn host_request_rehydrated_response(record: &HostRequestRecord) -> se
 /// `watchdog-spool-batch-v1` is deferred (protocol file out of scope; see PR
 /// residual). Until it lands, this closed route string is the mechanical
 /// route check below; no new payload type is created here.
+#[cfg(test)]
 pub(crate) const WATCHDOG_SPOOL_BATCH_ROUTE: &str = "watchdog-spool-batch-v1";
 
 /// Validates one Watchdog spool batch envelope mechanically.
@@ -1917,6 +1910,7 @@ pub(crate) const WATCHDOG_SPOOL_BATCH_ROUTE: &str = "watchdog-spool-batch-v1";
 /// `SessionFenced`; a changed predecessor binding under the same identity is
 /// `IdentityConflict`; an elapsed acknowledgement deadline is `Timeout`. No
 /// error prose drives routing.
+#[cfg(test)]
 #[allow(
     clippy::too_many_arguments,
     reason = "the mechanical envelope joins stay explicit until the EBP payload_type lands"

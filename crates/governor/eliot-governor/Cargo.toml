@@ -22,6 +22,7 @@ eliot-epistemic = { path = "../../smart/eliot-epistemic" }
 eliot-epistemic-contracts = { path = "../../smart/eliot-epistemic-contracts" }
 eliot-evidence.workspace = true
 eliot-finish.workspace = true
+eliot-integration-coverage.workspace = true
 eliot-maintenance.workspace = true
 eliot-module-registry.workspace = true
 eliot-observation.workspace = true

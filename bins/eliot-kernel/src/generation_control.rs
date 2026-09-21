@@ -11,8 +11,176 @@
 //! Forbidden authority: must not perform semantic planning, must not allow an alternate epoch owner, must not resurrect stale routes; publishes only the ORS-committed candidate via `OrsGenerationCoordinator` and fences on failure.
 
 use super::KernelComposition;
-use eliot_kernel_core::{CutoverDecision, GenerationRouter};
+use eliot_contracts::{EpochId, ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex};
+use eliot_kernel_core::{CutoverDecision, GenerationRoute, GenerationRouter, RouteScope};
 use eliot_kernel_service::KernelServiceError;
+use serde::{Deserialize, Serialize};
+
+/// Authenticated daemon operation used by Governor to obtain the mechanical
+/// active-generation projection for one startup window.
+///
+/// The operation is served by the existing authenticated daemon dispatch
+/// channel. This is a selector, not a second transport or an authority.
+pub const ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION: &str = "daemon_generation_projection";
+
+/// Exact request payload for [`ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION`].
+///
+/// Governor must present the fence it is using for the startup evidence
+/// observation. The authenticated session boundary supplies the peer and
+/// process binding; this payload only narrows the requested route and fence.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ActiveGenerationRegistryQuery {
+    /// Version of the authenticated projection request.
+    pub version: u8,
+    /// Exact State Fence carried by the admitted daemon session.
+    pub state_fence: StateFence,
+}
+
+impl ActiveGenerationRegistryQuery {
+    /// Validates the closed query shape before it reaches the route table.
+    pub fn validate(&self) -> Result<(), KernelServiceError> {
+        if self.version != 1 {
+            return Err(KernelServiceError::InvalidField {
+                field: "generation_registry.query.version",
+                reason: "unsupported projection request version",
+            });
+        }
+        self.state_fence
+            .validate()
+            .map_err(|_| KernelServiceError::InvalidField {
+                field: "generation_registry.query.state_fence",
+                reason: "state fence is invalid",
+            })?;
+        Ok(())
+    }
+}
+
+/// Kernel-owned read projection of one active generation route.
+///
+/// This is a mechanical query result, not a new authority. The route comes
+/// from the canonical [`GenerationRouter`], while the fence comes from the
+/// live Kernel service epoch. The fingerprint therefore changes whenever the
+/// route, lineage-aware epoch, or exact fence changes.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ActiveGenerationRegistryProjection {
+    route_scope: String,
+    active_generation: ResourceGeneration,
+    authority_epoch: EpochId,
+    state_fence: StateFence,
+    generation_fingerprint: String,
+}
+
+/// Closed response value returned by the authenticated Governor projection
+/// query. Generation and epoch remain inside the exact `StateFence`; the
+/// fingerprint is the only derived scalar crossing this wire.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ActiveGenerationRegistryResponse {
+    /// Version of the authenticated projection response.
+    pub version: u8,
+    /// Kernel-owned canonical projection fingerprint.
+    pub fingerprint: String,
+    /// Exact `StateFence` used to compute the fingerprint.
+    pub state_fence: StateFence,
+}
+
+#[derive(Serialize)]
+struct ActiveGenerationFingerprintPreimage<'a> {
+    route_scope: &'a str,
+    active_generation: ResourceGeneration,
+    authority_epoch: &'a EpochId,
+    state_fence: &'a StateFence,
+}
+
+impl ActiveGenerationRegistryProjection {
+    fn from_route(
+        route: &GenerationRoute,
+        state_fence: StateFence,
+    ) -> Result<Self, KernelServiceError> {
+        if state_fence.resource_generation != route.active_generation()
+            || state_fence.authority_epoch.sequence.get() != route.authority_epoch().value()
+        {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "generation_registry.state_fence",
+            });
+        }
+
+        let route_scope = route.route_scope().as_str().to_owned();
+        let preimage = ActiveGenerationFingerprintPreimage {
+            route_scope: &route_scope,
+            active_generation: route.active_generation(),
+            authority_epoch: &state_fence.authority_epoch,
+            state_fence: &state_fence,
+        };
+        let bytes = canonical_json_bytes(&preimage).map_err(|_| {
+            KernelServiceError::Platform(
+                "generation registry fingerprint encoding failed".to_owned(),
+            )
+        })?;
+        let generation_fingerprint = sha256_hex(&bytes);
+
+        Ok(Self {
+            route_scope,
+            active_generation: route.active_generation(),
+            authority_epoch: state_fence.authority_epoch.clone(),
+            state_fence,
+            generation_fingerprint,
+        })
+    }
+
+    /// Returns the canonical route scope represented by this projection.
+    #[must_use]
+    pub fn route_scope(&self) -> &str {
+        &self.route_scope
+    }
+
+    /// Returns the active resource generation from the Kernel route table.
+    #[must_use]
+    pub const fn active_generation(&self) -> ResourceGeneration {
+        self.active_generation
+    }
+
+    /// Returns the lineage-aware epoch bound to the projection.
+    #[must_use]
+    pub fn authority_epoch(&self) -> &EpochId {
+        &self.authority_epoch
+    }
+
+    /// Returns the exact fence that was used to build the projection.
+    #[must_use]
+    pub const fn state_fence(&self) -> &StateFence {
+        &self.state_fence
+    }
+
+    /// Returns the lowercase SHA-256 fingerprint for the exact projection.
+    #[must_use]
+    pub fn generation_fingerprint(&self) -> &str {
+        &self.generation_fingerprint
+    }
+
+    /// Projects the internal route calculation onto the closed Governor wire.
+    #[must_use]
+    pub fn response(&self) -> ActiveGenerationRegistryResponse {
+        ActiveGenerationRegistryResponse {
+            version: 1,
+            fingerprint: self.generation_fingerprint.clone(),
+            state_fence: self.state_fence.clone(),
+        }
+    }
+}
+
+fn validate_active_generation_query(
+    query: &ActiveGenerationRegistryQuery,
+    authenticated_session_fence: &StateFence,
+) -> Result<(), KernelServiceError> {
+    query.validate()?;
+    if &query.state_fence != authenticated_session_fence {
+        return Err(KernelServiceError::HandshakeMismatch {
+            field: "generation_registry.query.session_fence",
+        });
+    }
+    Ok(())
+}
 
 /// F-LOG-KERNEL-4 (#903): generation-gateway boundary observations.
 ///
@@ -93,6 +261,86 @@ fn fence_service_after_generation_failure(
 }
 
 impl KernelComposition {
+    /// Executes the authenticated R4 query against the live Kernel fence and
+    /// canonical `GenerationRouter`. The caller's session fence must match the
+    /// query fence exactly; a compatible-but-different fence is still stale
+    /// for this startup observation.
+    pub fn active_generation_registry_query(
+        &self,
+        query: &ActiveGenerationRegistryQuery,
+        authenticated_session_fence: &StateFence,
+    ) -> Result<ActiveGenerationRegistryProjection, KernelServiceError> {
+        validate_active_generation_query(query, authenticated_session_fence)?;
+        let projection = self.active_generation_registry_projection("daemon")?;
+        if projection.state_fence() != authenticated_session_fence {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "generation_registry.query.live_fence",
+            });
+        }
+        Ok(projection)
+    }
+
+    /// Reads the active generation projection from the canonical Kernel route.
+    ///
+    /// The route's scalar epoch must agree with the live service epoch before
+    /// a lineage-aware fence or fingerprint is returned. A missing route,
+    /// epoch disagreement, or poisoned boundary fails closed.
+    pub fn active_generation_registry_projection(
+        &self,
+        route_scope: &str,
+    ) -> Result<ActiveGenerationRegistryProjection, KernelServiceError> {
+        let router = self.generation_route_snapshot()?;
+        let route_scope = RouteScope::new(route_scope.to_owned()).map_err(|_| {
+            KernelServiceError::InvalidField {
+                field: "generation_registry.route_scope",
+                reason: "route scope is invalid",
+            }
+        })?;
+        let route =
+            router
+                .route(&route_scope)
+                .map_err(|_| KernelServiceError::HandshakeMismatch {
+                    field: "generation_registry.route",
+                })?;
+        let live_epoch = self
+            .service
+            .lock()
+            .map_err(|_| KernelServiceError::Platform("service lock poisoned".to_owned()))?
+            .authority_epoch();
+        if route.authority_epoch().value() != live_epoch.sequence.get() {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "generation_registry.authority_epoch",
+            });
+        }
+        let state_fence = StateFence::new(live_epoch, route.active_generation());
+        ActiveGenerationRegistryProjection::from_route(route, state_fence)
+    }
+
+    /// Checks one authenticated Governor fingerprint against the live Kernel
+    /// generation projection and its exact admitted fence.
+    ///
+    /// This comparison is mechanical. It does not mark startup readiness or
+    /// interpret Governor capability semantics.
+    pub fn verify_active_generation_registry_fingerprint(
+        &self,
+        route_scope: &str,
+        admitted_fence: &StateFence,
+        presented_fingerprint: &str,
+    ) -> Result<(), KernelServiceError> {
+        let projection = self.active_generation_registry_projection(route_scope)?;
+        if projection.state_fence() != admitted_fence {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "generation_registry.admitted_fence",
+            });
+        }
+        if projection.generation_fingerprint() != presented_fingerprint {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "generation_registry.fingerprint",
+            });
+        }
+        Ok(())
+    }
+
     /// Returns a cloned, read-only route projection.  Callers cannot obtain a
     /// mutable router guard or bypass the ORS transition gateway.
     ///
@@ -362,5 +610,137 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .generation_fenced()
         );
+    }
+
+    fn test_epoch(sequence: u64) -> EpochId {
+        EpochId::new(
+            eliot_contracts::EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                .expect("test lineage"),
+            std::num::NonZeroU64::new(sequence).expect("test sequence"),
+        )
+        .expect("test epoch")
+    }
+
+    fn test_route(generation: u64) -> GenerationRoute {
+        GenerationRoute::new(
+            RouteScope::new("daemon").expect("test route scope"),
+            ResourceGeneration::new(generation).expect("test generation"),
+            eliot_contracts::AuthorityEpoch::new(4).expect("test route epoch"),
+        )
+        .expect("test route")
+    }
+
+    #[test]
+    fn active_generation_projection_is_fenced_and_fingerprint_is_stable() {
+        let epoch = test_epoch(4);
+        let route = test_route(7);
+        let fence = StateFence::new(epoch.clone(), route.active_generation());
+        let projection = ActiveGenerationRegistryProjection::from_route(&route, fence.clone())
+            .expect("matching route and fence");
+
+        assert_eq!(projection.route_scope(), "daemon");
+        assert_eq!(projection.active_generation().value(), 7);
+        assert_eq!(projection.authority_epoch(), &epoch);
+        assert_eq!(projection.state_fence(), &fence);
+        assert_eq!(projection.generation_fingerprint().len(), 64);
+        assert!(
+            projection
+                .generation_fingerprint()
+                .chars()
+                .all(|character| character.is_ascii_hexdigit() && !character.is_ascii_uppercase())
+        );
+        let response = serde_json::to_value(projection.response()).expect("wire response");
+        let response_object = response.as_object().expect("closed response object");
+        assert_eq!(response_object.len(), 3);
+        assert!(response_object.contains_key("version"));
+        assert!(response_object.contains_key("fingerprint"));
+        assert!(response_object.contains_key("state_fence"));
+
+        let repeat = ActiveGenerationRegistryProjection::from_route(&route, fence)
+            .expect("same canonical state");
+        assert_eq!(projection, repeat);
+
+        let changed_route = test_route(8);
+        let changed_fence = StateFence::new(test_epoch(4), changed_route.active_generation());
+        let changed = ActiveGenerationRegistryProjection::from_route(&changed_route, changed_fence)
+            .expect("changed active generation");
+        assert_ne!(
+            projection.generation_fingerprint(),
+            changed.generation_fingerprint()
+        );
+    }
+
+    #[test]
+    fn active_generation_projection_rejects_cross_generation_fence() {
+        let route = test_route(7);
+        let foreign_fence = StateFence::new(
+            test_epoch(4),
+            ResourceGeneration::new(8).expect("foreign generation"),
+        );
+
+        assert!(matches!(
+            ActiveGenerationRegistryProjection::from_route(&route, foreign_fence),
+            Err(KernelServiceError::HandshakeMismatch {
+                field: "generation_registry.state_fence"
+            })
+        ));
+    }
+
+    #[test]
+    fn active_generation_query_accepts_exact_authenticated_fence() {
+        let fence = StateFence::new(
+            test_epoch(4),
+            ResourceGeneration::new(7).expect("generation"),
+        );
+        let query = ActiveGenerationRegistryQuery {
+            version: 1,
+            state_fence: fence.clone(),
+        };
+
+        validate_active_generation_query(&query, &fence)
+            .expect("exact authenticated fence is accepted");
+    }
+
+    #[test]
+    fn active_generation_query_rejects_foreign_fence() {
+        let query_fence = StateFence::new(
+            test_epoch(4),
+            ResourceGeneration::new(7).expect("query generation"),
+        );
+        let session_fence = StateFence::new(
+            test_epoch(4),
+            ResourceGeneration::new(8).expect("session generation"),
+        );
+        let query = ActiveGenerationRegistryQuery {
+            version: 1,
+            state_fence: query_fence,
+        };
+
+        assert!(matches!(
+            validate_active_generation_query(&query, &session_fence),
+            Err(KernelServiceError::HandshakeMismatch {
+                field: "generation_registry.query.session_fence"
+            })
+        ));
+    }
+
+    #[test]
+    fn active_generation_query_rejects_unsupported_version() {
+        let fence = StateFence::new(
+            test_epoch(4),
+            ResourceGeneration::new(7).expect("generation"),
+        );
+        let query = ActiveGenerationRegistryQuery {
+            version: 2,
+            state_fence: fence.clone(),
+        };
+
+        assert!(matches!(
+            validate_active_generation_query(&query, &fence),
+            Err(KernelServiceError::InvalidField {
+                field: "generation_registry.query.version",
+                ..
+            })
+        ));
     }
 }

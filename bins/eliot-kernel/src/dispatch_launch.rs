@@ -5257,17 +5257,19 @@ mod tests {
                 .material_file_name()
                 .expect("doctor material file"),
         );
-        let trigger_shape_request = |attempt_id: &str| DoctorRepairAttemptRequest {
-            wire_id: eliot_kernel_service::DOCTOR_REPAIR_WIRE_ID.to_owned(),
-            wire_version: eliot_kernel_service::DOCTOR_REPAIR_WIRE_VERSION,
-            attempt_id: attempt_id.to_owned(),
-            effect_seq: 0,
-            closed_request_json: "{}".to_owned(),
-            target_resource_digest: "1".repeat(64),
-            request_digest: String::new(),
-        }
-        .with_computed_digest()
-        .expect("trigger request digest");
+        let trigger_shape_request = |attempt_id: &str| {
+            DoctorRepairAttemptRequest {
+                wire_id: eliot_kernel_service::DOCTOR_REPAIR_WIRE_ID.to_owned(),
+                wire_version: eliot_kernel_service::DOCTOR_REPAIR_WIRE_VERSION,
+                attempt_id: attempt_id.to_owned(),
+                effect_seq: 0,
+                closed_request_json: "{}".to_owned(),
+                target_resource_digest: "1".repeat(64),
+                request_digest: String::new(),
+            }
+            .with_computed_digest()
+            .expect("trigger request digest")
+        };
         assert!(
             matches!(
                 trigger_admitted_doctor_launch(
@@ -5293,7 +5295,8 @@ mod tests {
             .expect("forged request digest");
         assert!(
             matches!(
-                trigger_admitted_doctor_launch(&kernel, &forged, &trigger_binding, now_nanos,).await,
+                trigger_admitted_doctor_launch(&kernel, &forged, &trigger_binding, now_nanos,)
+                    .await,
                 Ok(DoctorLaunchOutcome::Refused(_))
             ),
             "well-formed wire forgery refuses typed"
@@ -5350,13 +5353,17 @@ mod tests {
             effect_digest: Some("cd".repeat(32)),
             recipe_digest: "ef".repeat(32),
             manifest_digest: composed_registry.manifest_digest().to_owned(),
-            operation_id: composed_registry.manifest().operations[0].operation_id.clone(),
+            operation_id: composed_registry.manifest().operations[0]
+                .operation_id
+                .clone(),
             lease_id: "lease-trigger-1".to_owned(),
             lease_owner: "kernel.doctor-recovery".to_owned(),
             lease_expires_unix_nanos: now_nanos + 60_000_000_000,
-            allowed_effects: [composed_registry.manifest().operations[0].operation_id.clone()]
-                .into_iter()
-                .collect(),
+            allowed_effects: [composed_registry.manifest().operations[0]
+                .operation_id
+                .clone()]
+            .into_iter()
+            .collect(),
             budget_units: 1,
             deadline_unix_nanos: now_nanos + 60_000_000_000,
             approval_present: false,
@@ -6555,7 +6562,9 @@ mod tests {
             mutated_join.process_invocation_digest, join.process_invocation_digest,
             "mutated invocation must derive a different digest"
         );
-        mutated_join.validate().expect("mutated join stays well-formed");
+        mutated_join
+            .validate()
+            .expect("mutated join stays well-formed");
         mutated.binding_digest = mutated
             .compute_binding_digest()
             .expect("rebind mutated binding");
