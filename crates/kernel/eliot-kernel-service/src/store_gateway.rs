@@ -236,15 +236,17 @@ impl KernelStoreGateway {
         if self.is_fenced() {
             return Err("canonical-store gateway is fenced for rebind".to_owned());
         }
+        // 1927: authenticate the caller before plan admission (I5.6 step 1),
+        // mirroring `apply_reserved_admission`.
+        if context.source_id.as_str() != ACTIVE_DAEMON_CALLER {
+            return Err("transition caller is not the active daemon".to_owned());
+        }
         admit_prepared_transition(
             context,
             &transition,
             &expected_revision_heads,
             &expected_ordering_heads,
         )?;
-        if context.source_id.as_str() != ACTIVE_DAEMON_CALLER {
-            return Err("transition caller is not the active daemon".to_owned());
-        }
 
         let lease = {
             let service = self
