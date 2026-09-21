@@ -6,7 +6,10 @@
 //! by the exact operation identity carried by the prepared transition.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, atomic::AtomicU64};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU8, AtomicU64, Ordering},
+};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eliot_contracts::{ArtifactId, ContractId, ContractVersion, StateFence};
@@ -83,6 +86,89 @@ impl From<StoreWireError> for StoreClientError {
     }
 }
 
+/// Production fault-injection hook for the S-CONC-ACCEPT crash and
+/// response-loss phases (issue #2030; S-CONC-ACCEPT #994 cases 11-12).
+///
+/// The hook is one-shot and explicit: the 994 harness arms exactly one fault
+/// before one admitted write, and the client consumes it on that write.
+/// Disarmed production traffic never observes it.
+///
+/// Contract:
+/// - [`StoreClientFault::PreCommitCrash`] (994/11) fires before any provider
+///   effect: the write returns [`StoreError::MissingReceiptEnvelope`]
+///   (unknown — never success, never `Unavailable`, which would invite a
+///   same-identity retry) with zero transport sends, so the caller
+///   reconciles the exact admitted identity and proves absence before any
+///   resubmission.
+/// - [`StoreClientFault::PostCommitResponseLoss`] (994/12) fires after the
+///   provider durably committed: the observed receipt is discarded and the
+///   write returns [`StoreError::MissingReceiptEnvelope`] instead of
+///   success, so the caller reconciles the exact admitted identity and
+///   recovers the original receipt without a replay under any identity.
+/// - Validation failures still precede the hook: an inadmissible request
+///   fails with its typed error and leaves the armed fault in place.
+/// - Arming is capability-gated: [`StoreClientFaultHarness`] is required by `arm_fault`,
+///   and only the test/harness path can construct it, so production builds
+///   cannot arm faults. Constructing a `StoreClientFault` value alone arms nothing.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum StoreClientFault {
+    /// No fault armed: production behavior.
+    #[default]
+    None,
+    /// Drop the response after a durable provider commit (994/12).
+    PostCommitResponseLoss,
+    /// Crash precisely before any durable commit (994/11).
+    PreCommitCrash,
+}
+
+impl StoreClientFault {
+    const NONE: u8 = 0;
+    const POST_COMMIT_RESPONSE_LOSS: u8 = 1;
+    const PRE_COMMIT_CRASH: u8 = 2;
+
+    const fn encode(self) -> u8 {
+        match self {
+            Self::None => Self::NONE,
+            Self::PostCommitResponseLoss => Self::POST_COMMIT_RESPONSE_LOSS,
+            Self::PreCommitCrash => Self::PRE_COMMIT_CRASH,
+        }
+    }
+
+    const fn decode(value: u8) -> Self {
+        match value {
+            Self::POST_COMMIT_RESPONSE_LOSS => Self::PostCommitResponseLoss,
+            Self::PRE_COMMIT_CRASH => Self::PreCommitCrash,
+            _ => Self::None,
+        }
+    }
+}
+
+/// Capability token authorizing fault-hook arming (issue #2030 rework).
+///
+/// Arming the one-shot production fault hook requires this token, and the
+/// only constructor is gated on `test` or the `test-support` cargo feature
+/// (repo precedent: `eliot-ors --features test-support`): production builds
+/// (neither) cannot construct it, so production code cannot arm faults.
+/// Constructing a `StoreClientFault` value alone arms nothing; only
+/// [`EbpCanonicalStoreClient::arm_fault`] with this token arms the hook, and
+/// only the 994 test/harness path holds it.
+#[derive(Clone, Copy, Debug)]
+pub struct StoreClientFaultHarness {
+    _private: (),
+}
+
+impl StoreClientFaultHarness {
+    /// Test/harness-only constructor, available to in-crate unit tests and
+    /// to downstream integration-test or external harness builds compiled
+    /// with `--features test-support`. Unavailable in production builds, so
+    /// production code has no value to present to `arm_fault`.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn test_harness() -> Self {
+        Self { _private: () }
+    }
+}
+
 /// Authenticated neutral S-03 EBP client implementing the canonical store API.
 pub struct EbpCanonicalStoreClient<T> {
     transport: Arc<Mutex<T>>,
@@ -90,6 +176,11 @@ pub struct EbpCanonicalStoreClient<T> {
     protocol_version: ProtocolVersion,
     limits: TransportLimits,
     request_counter: AtomicU64,
+    /// One-shot production fault hook (issue #2030). The harness-gated
+    /// `arm_fault` arms it, observation reads it, and the write paths consume
+    /// it through this atomic; the transport path never invents faults on
+    /// its own.
+    fault: AtomicU8,
 }
 
 impl<T> std::fmt::Debug for EbpCanonicalStoreClient<T> {
@@ -132,9 +223,34 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
             protocol_version: server.selected_protocol,
             limits,
             request_counter: AtomicU64::new(1),
+            fault: AtomicU8::new(StoreClientFault::NONE),
         };
         client.verify_readiness().await?;
         Ok(client)
+    }
+
+    /// Arms the one-shot production fault hook (issue #2030).
+    ///
+    /// Capability-gated by [`StoreClientFaultHarness`]: only `test` or
+    /// `--features test-support` builds can construct the token, so
+    /// production builds cannot arm faults. The next admitted apply consumes
+    /// the hook; `StoreClientFault`
+    /// None disarms. Validation failures leave the armed fault in place
+    /// for the next admissible attempt.
+    pub fn arm_fault(&self, _harness: &StoreClientFaultHarness, fault: StoreClientFault) {
+        self.fault.store(fault.encode(), Ordering::SeqCst);
+    }
+
+    /// Currently armed production fault, if any. Observation only: reading
+    /// never consumes the hook.
+    #[must_use]
+    pub fn armed_fault(&self) -> StoreClientFault {
+        StoreClientFault::decode(self.fault.load(Ordering::SeqCst))
+    }
+
+    /// Consumes the armed production fault, returning the disarmed state.
+    fn take_fault(&self) -> StoreClientFault {
+        StoreClientFault::decode(self.fault.swap(StoreClientFault::NONE, Ordering::SeqCst))
     }
 
     /// Returns the exact Host-approved bootstrap binding.
@@ -351,6 +467,14 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
             );
             verify_canonical_request_hash(&view, &transition.identity.canonical_request_hash)?;
         }
+        // Production fault hook (issue #2030): consumed only after the
+        // request validated, so inadmissible input keeps its typed error
+        // and the armed fault. A pre-commit crash returns unknown with
+        // zero provider effects; a post-commit loss is applied below.
+        let fault = self.take_fault();
+        if fault == StoreClientFault::PreCommitCrash {
+            return Err(StoreError::MissingReceiptEnvelope);
+        }
         let operation_id = transition.identity.operation_id.clone();
         let idempotency_key = transition.identity.idempotency_key.clone();
         let canonical_request_hash = transition.identity.canonical_request_hash.clone();
@@ -368,6 +492,14 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
             .await;
         match result {
             Ok(StoreResponse::Transaction { receipt }) if receipt.operation_id == operation_id => {
+                // Post-commit response loss (issue #2030, 994/12): the
+                // provider durably committed, but the response is dropped
+                // here. Unknown — never success — so the caller reconciles
+                // the exact admitted identity and recovers this same
+                // receipt without a replay.
+                if fault == StoreClientFault::PostCommitResponseLoss {
+                    return Err(StoreError::MissingReceiptEnvelope);
+                }
                 Ok(receipt)
             }
             // Once Apply has crossed the transport boundary, a valid response
@@ -425,6 +557,14 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
         self.validate_requirement_fence(&request.context.state_fence)?;
         self.validate_requirement_fence(&request.transition.state_fence)?;
         self.validate_requirement_fence(&request.admission.state_fence)?;
+        // Production fault hook (issue #2030): same contract as
+        // `apply_prepared` — validation first, pre-commit crash with zero
+        // provider effects, post-commit loss discarding the observed
+        // receipt into unknown.
+        let fault = self.take_fault();
+        if fault == StoreClientFault::PreCommitCrash {
+            return Err(StoreError::MissingReceiptEnvelope);
+        }
         let idempotency_key = request.transition.identity.idempotency_key.clone();
         let result = self
             .execute_raw(
@@ -437,6 +577,18 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
             .await;
         match result {
             Ok(StoreResponse::Transaction { receipt }) => {
+                // Post-commit response loss (issue #2030, 994/12) is
+                // evaluated immediately after the canonical commit, before
+                // receipt validation: the commit is durable but the
+                // observed answer is dropped into unknown so the caller
+                // reconciles the exact admitted identity instead of
+                // observing success. A committed-but-unusable (misbound or
+                // malformed) receipt therefore takes the
+                // unknown/reconciliation path rather than surfacing a
+                // typed validation failure for a write that committed.
+                if fault == StoreClientFault::PostCommitResponseLoss {
+                    return Err(StoreError::MissingReceiptEnvelope);
+                }
                 // A misbound or malformed receipt observed after the single
                 // send is a typed receipt-validation failure for the caller
                 // to reconcile — never success, never an adopted peer
@@ -758,8 +910,9 @@ mod tests {
     use eliot_store_api::StoreResponse;
     use eliot_store_api::{
         CommitId, EffectClass, EventProjectionRelationIntents, NamedMutationOperation,
-        NamedMutationRequest, OperationIdentity, OperationManifestDigest, Resubmission,
-        StoreFailure, StoreFailureIdentityContext, TransitionClass, WriteReceiptStatus,
+        NamedMutationRequest, OperationIdentity, OperationManifestDigest, ReservedScopeBinding,
+        Resubmission, StoreFailure, StoreFailureIdentityContext, TransitionClass,
+        WriteAdmissionParams, WriteAdmissionProjection, WriteReceiptStatus, WriterEpochBinding,
         canonical_request_hash,
     };
     use serde_json::json;
@@ -799,10 +952,12 @@ mod tests {
         recovery_response: Option<Box<StoreResponse>>,
         genesis_response: Option<Box<StoreResponse>>,
         apply_response: Option<Box<StoreResponse>>,
+        reserved_apply_response: Option<Box<StoreResponse>>,
         reconciliation_receipt: Option<Box<WriteReceipt>>,
         recovery_calls: usize,
         genesis_calls: usize,
         apply_calls: usize,
+        reserved_apply_calls: usize,
         receipt_requests: Vec<OperationId>,
     }
 
@@ -816,10 +971,12 @@ mod tests {
                 recovery_response: None,
                 genesis_response: None,
                 apply_response: None,
+                reserved_apply_response: None,
                 reconciliation_receipt: None,
                 recovery_calls: 0,
                 genesis_calls: 0,
                 apply_calls: 0,
+                reserved_apply_calls: 0,
                 receipt_requests: Vec::new(),
             }
         }
@@ -836,6 +993,11 @@ mod tests {
 
         fn with_apply_response(mut self, response: StoreResponse) -> Self {
             self.apply_response = Some(Box::new(response));
+            self
+        }
+
+        fn with_reserved_apply_response(mut self, response: StoreResponse) -> Self {
+            self.reserved_apply_response = Some(Box::new(response));
             self
         }
 
@@ -1046,6 +1208,19 @@ mod tests {
                     self.apply_calls += 1;
                     let response = *self.apply_response.take().ok_or_else(|| {
                         StoreClientError::Contract("fake apply response missing".to_owned())
+                    })?;
+                    self.pending = Some(Self::response(
+                        self.requirement.connection_id.as_str().to_owned(),
+                        request_id,
+                        response,
+                    ));
+                }
+                StoreRequest::ReservedWrite { .. } => {
+                    self.reserved_apply_calls += 1;
+                    let response = *self.reserved_apply_response.take().ok_or_else(|| {
+                        StoreClientError::Contract(
+                            "fake reserved apply response missing".to_owned(),
+                        )
                     })?;
                     self.pending = Some(Self::response(
                         self.requirement.connection_id.as_str().to_owned(),
@@ -1753,6 +1928,358 @@ mod tests {
         assert!(snapshot.revision_heads.is_empty());
         let transport = client.transport.lock().await;
         assert_eq!(transport.validation_calls, 1);
+    }
+
+    // WORK_UNIT_CASE: 2030/1 — production pre-commit crash (994/11).
+    #[tokio::test]
+    async fn production_fault_pre_commit_crash_has_no_provider_effect_and_stays_unknown() {
+        let requirement = requirement();
+        let (context, transition, revision_heads, ordering_heads) =
+            apply_parts(&requirement.state_fence);
+        let receipt = apply_receipt(&context, &transition);
+        let client = EbpCanonicalStoreClient::connect(
+            FakeEbpStoreTransport::new(requirement.clone(), SnapshotFault::Valid)
+                .with_apply_response(StoreResponse::Transaction {
+                    receipt: receipt.clone(),
+                }),
+            requirement.clone(),
+        )
+        .await
+        .expect("fake handshake and readiness");
+        let harness = StoreClientFaultHarness::test_harness();
+        client.arm_fault(&harness, StoreClientFault::PreCommitCrash);
+        assert_eq!(
+            client.armed_fault(),
+            StoreClientFault::PreCommitCrash,
+            "hook observes without consuming"
+        );
+        let error = client
+            .apply_prepared(&context, transition, revision_heads, ordering_heads)
+            .await
+            .expect_err("pre-commit crash stays unknown");
+        assert_eq!(
+            error,
+            StoreError::MissingReceiptEnvelope,
+            "crash before commit is unknown — never success, never retryable Unavailable"
+        );
+        let transport = client.transport.lock().await;
+        assert_eq!(
+            transport.apply_calls, 0,
+            "pre-commit crash crosses no provider effect boundary"
+        );
+        assert!(
+            transport.receipt_requests.is_empty(),
+            "no reconciliation identity is adopted by the crash itself"
+        );
+        drop(transport);
+        assert_eq!(
+            client.armed_fault(),
+            StoreClientFault::None,
+            "one-shot hook is consumed by the crashed write"
+        );
+
+        // Validation still precedes the hook: an inadmissible request keeps
+        // its typed error and leaves the armed fault for the next attempt.
+        let (context, transition, mut revision_heads, ordering_heads) =
+            apply_parts(&requirement.state_fence);
+        revision_heads[0].expected_revision = 2;
+        client.arm_fault(&harness, StoreClientFault::PreCommitCrash);
+        match client
+            .apply_prepared(&context, transition, revision_heads, ordering_heads)
+            .await
+        {
+            Err(StoreError::TransitionDigestMismatch { .. }) => {}
+            other => panic!("tampered apply must keep its typed mismatch: {other:?}"),
+        }
+        assert_eq!(client.transport.lock().await.apply_calls, 0);
+        assert_eq!(
+            client.armed_fault(),
+            StoreClientFault::PreCommitCrash,
+            "validation failure must not consume the hook"
+        );
+    }
+
+    // WORK_UNIT_CASE: 2030/2 — production post-commit response loss (994/12).
+    #[tokio::test]
+    async fn production_fault_post_commit_response_loss_recovers_original_receipt_without_replay() {
+        let requirement = requirement();
+        let (context, transition, revision_heads, ordering_heads) =
+            apply_parts(&requirement.state_fence);
+        let receipt = apply_receipt(&context, &transition);
+        let operation_id = transition.identity.operation_id.clone();
+        let admitted_hash = transition.identity.canonical_request_hash.clone();
+        let client = EbpCanonicalStoreClient::connect(
+            FakeEbpStoreTransport::new(requirement.clone(), SnapshotFault::Valid)
+                .with_apply_response(StoreResponse::Transaction {
+                    receipt: receipt.clone(),
+                })
+                .with_reconciliation_receipt(receipt.clone()),
+            requirement,
+        )
+        .await
+        .expect("fake handshake and readiness");
+        let harness = StoreClientFaultHarness::test_harness();
+        client.arm_fault(&harness, StoreClientFault::PostCommitResponseLoss);
+        let error = client
+            .apply_prepared(&context, transition, revision_heads, ordering_heads)
+            .await
+            .expect_err("dropped response stays unknown");
+        assert_eq!(
+            error,
+            StoreError::MissingReceiptEnvelope,
+            "committed-but-unobserved is unknown — never success"
+        );
+        assert_eq!(
+            client.transport.lock().await.apply_calls,
+            1,
+            "the commit reached the provider exactly once"
+        );
+        // Exact-identity reconciliation recovers the original receipt: no
+        // replay under any identity, no adopted peer identity.
+        let recovered = client
+            .receipt_exact(operation_id.clone(), &admitted_hash)
+            .await
+            .expect("exact reconciliation recovers the committed receipt");
+        assert_eq!(
+            recovered, receipt,
+            "response loss recovers the original receipt"
+        );
+        let transport = client.transport.lock().await;
+        assert_eq!(
+            transport.receipt_requests,
+            vec![operation_id],
+            "reconciliation binds the admitted operation only"
+        );
+        assert_eq!(
+            transport.apply_calls, 1,
+            "reconciliation issues no second Apply"
+        );
+    }
+
+    fn reserved_request(fence: &StateFence) -> ReservedWriteRequest {
+        let context = context_for(fence, "reserved-request-1", "source-991-k");
+        let transition = PreparedTransition {
+            identity: OperationIdentity {
+                operation_id: OperationId::new("op-991-k1").expect("operation id"),
+                idempotency_key: "idem-991-k1".to_owned(),
+                canonical_request_hash: "a".repeat(64),
+            },
+            state_fence: fence.clone(),
+            scope_id: ScopeId::new("scope-991-k1").expect("scope"),
+            task_id: None,
+            ordering_scopes: vec![OrderingScopeId::new("scope-991-k1").expect("ordering")],
+            transition_class: TransitionClass::CaptureCandidate,
+            requested_effect_ceiling: EffectClass::Candidate,
+            admission_contract_set_digest: "b".repeat(64),
+            operation_manifest_digest: OperationManifestDigest::new("manifest-991-k1")
+                .expect("manifest digest"),
+            named_operations: vec![NamedMutationRequest {
+                operation: NamedMutationOperation::CaptureObservation,
+                parameters: BTreeMap::from([("subject".to_owned(), json!("observation-991-k1"))]),
+            }],
+            event_projection_relation_intents: EventProjectionRelationIntents {
+                event_ids: Vec::new(),
+                projection_kinds: Vec::new(),
+                relation_kinds: Vec::new(),
+            },
+            security: eliot_store_api::SecurityContext::default(),
+            required_proof_and_approval_refs: Vec::new(),
+        };
+        let admission = WriteAdmissionProjection::bind(
+            &transition,
+            WriteAdmissionParams {
+                reservation_id: "reservation-991-k1".to_owned(),
+                reservation_order: 42,
+                operation_id: transition.identity.operation_id.clone(),
+                idempotency_key: transition.identity.idempotency_key.clone(),
+                canonical_request_hash: transition.identity.canonical_request_hash.clone(),
+                scopes: vec![ReservedScopeBinding {
+                    scope: OrderingScopeId::new("scope-991-k1").expect("ordering"),
+                    reserved_sequence: 7,
+                    expected_sequence: 6,
+                    expected_head_digest: "c".repeat(64),
+                }],
+                writer_epoch: WriterEpochBinding {
+                    lineage_id: "epoch-lineage-991-k".to_owned(),
+                    epoch: 5,
+                    predecessor_lineage_id: None,
+                    predecessor_epoch: None,
+                },
+                state_fence: fence.clone(),
+                source_id: "source-991-k".to_owned(),
+                created_at_ms: 1_700_000_000_000,
+                expires_at_ms: 1_700_000_060_000,
+                recovery_owner: "recovery-owner-991-k".to_owned(),
+            },
+        )
+        .expect("admission binds");
+        let request = ReservedWriteRequest {
+            context,
+            transition,
+            admission,
+            expected_revision_heads: vec![RevisionHeadExpectation {
+                key: RevisionKey::new("rev-991-k1").expect("key"),
+                expected_revision: 3,
+                state_fence: fence.clone(),
+            }],
+            expected_ordering_heads: vec![OrderingHeadExpectation {
+                scope: OrderingScopeId::new("scope-991-k1").expect("ordering"),
+                expected_sequence: 6,
+                state_fence: fence.clone(),
+            }],
+        };
+        request.validate().expect("reserved request validates");
+        request
+    }
+
+    fn reserved_receipt(request: &ReservedWriteRequest) -> WriteReceipt {
+        let transition = &request.transition;
+        let scope = request.admission.scopes[0].clone();
+        let mut receipt = WriteReceipt {
+            operation_id: transition.identity.operation_id.clone(),
+            idempotency_key: transition.identity.idempotency_key.clone(),
+            canonical_request_hash: transition.identity.canonical_request_hash.clone(),
+            transition_class: transition.transition_class,
+            status: WriteReceiptStatus::Committed,
+            commit_id: Some(CommitId::new("commit-991-k1").expect("commit")),
+            state_fence: request.context.state_fence.clone(),
+            ordering_sequences: vec![OrderingHead {
+                scope: scope.scope,
+                sequence: scope.reserved_sequence,
+                state_fence: request.context.state_fence.clone(),
+            }],
+            revision_before_after: Vec::new(),
+            applied_command_ids: vec!["capture-observation".to_owned()],
+            emitted_event_ids: Vec::new(),
+            projection_refs: Vec::new(),
+            outbox_refs: Vec::new(),
+            operation_manifest_digest: transition.operation_manifest_digest.clone(),
+            error_code: None,
+            resubmission: Resubmission::None,
+            committed_at: Some("commit-sequence-0000000000000001".to_owned()),
+            envelope: None,
+        };
+        receipt.envelope = Some(
+            eliot_store_api::issue_store_receipt_envelope(
+                &request.context,
+                transition,
+                &receipt,
+                1,
+            )
+            .expect("reserved receipt envelope"),
+        );
+        receipt.validate().expect("reserved receipt");
+        receipt
+    }
+
+    async fn reserved_client(
+        requirement: HostStoreBootstrapRequirement,
+        response: StoreResponse,
+    ) -> EbpCanonicalStoreClient<FakeEbpStoreTransport> {
+        EbpCanonicalStoreClient::connect(
+            FakeEbpStoreTransport::new(requirement.clone(), SnapshotFault::Valid)
+                .with_reserved_apply_response(response),
+            requirement,
+        )
+        .await
+        .expect("fake handshake and readiness")
+    }
+
+    // WORK_UNIT_CASE: 2030/rework — reserved post-commit loss precedes receipt
+    // validation (994/12): a committed-but-unusable receipt hits the
+    // unknown/reconciliation path, not a typed validation failure.
+    #[tokio::test]
+    async fn reserved_post_commit_loss_before_validation_treats_malformed_receipt_as_unknown() {
+        let requirement = requirement();
+        let request = reserved_request(&requirement.state_fence);
+        let receipt = reserved_receipt(&request);
+
+        // Sanity: the well-formed receipt commits through the single send.
+        let valid_client = reserved_client(
+            requirement.clone(),
+            StoreResponse::Transaction {
+                receipt: receipt.clone(),
+            },
+        )
+        .await;
+        assert_eq!(
+            valid_client
+                .apply_reserved_write(request.clone())
+                .await
+                .expect("valid reserved receipt commits"),
+            receipt
+        );
+        assert_eq!(
+            valid_client.transport.lock().await.reserved_apply_calls,
+            1,
+            "valid reserved write crosses exactly one send"
+        );
+
+        // A misbound receipt (canonical hash the request never admitted) keeps
+        // its shape and its store-issued envelope binding, but fails the exact
+        // receipt binding ...
+        let mut mismatched = receipt.clone();
+        mismatched.canonical_request_hash = "f".repeat(64);
+        mismatched
+            .validate()
+            .expect("mismatched receipt keeps its shape");
+        assert!(matches!(
+            valid_client.check_reserved_write_receipt(&request, &mismatched),
+            Err(StoreError::IdentityConflict)
+        ));
+
+        // ... so without the fault it surfaces the typed validation failure,
+        // never unknown and never a second wire operation.
+        let typed_client = reserved_client(
+            requirement.clone(),
+            StoreResponse::Transaction {
+                receipt: mismatched.clone(),
+            },
+        )
+        .await;
+        assert_eq!(
+            typed_client
+                .apply_reserved_write(request.clone())
+                .await
+                .expect_err("misbound receipt keeps its typed failure"),
+            StoreError::IdentityConflict,
+            "unfaulted committed-but-unusable answer is a typed validation failure"
+        );
+        assert_eq!(
+            typed_client.transport.lock().await.reserved_apply_calls,
+            1,
+            "typed failure issues no second send"
+        );
+
+        // With post-commit loss armed, the same committed-but-unusable answer
+        // is evaluated before validation and drops into unknown.
+        let harness = StoreClientFaultHarness::test_harness();
+        let faulted_client = reserved_client(
+            requirement.clone(),
+            StoreResponse::Transaction {
+                receipt: mismatched.clone(),
+            },
+        )
+        .await;
+        faulted_client.arm_fault(&harness, StoreClientFault::PostCommitResponseLoss);
+        assert_eq!(
+            faulted_client
+                .apply_reserved_write(request.clone())
+                .await
+                .expect_err("faulted misbound receipt stays unknown"),
+            StoreError::MissingReceiptEnvelope,
+            "post-commit loss precedes receipt validation into unknown"
+        );
+        assert_eq!(
+            faulted_client.transport.lock().await.reserved_apply_calls,
+            1,
+            "unknown outcome issues no second send"
+        );
+        assert_eq!(
+            faulted_client.armed_fault(),
+            StoreClientFault::None,
+            "one-shot hook is consumed by the faulted write"
+        );
     }
 }
 

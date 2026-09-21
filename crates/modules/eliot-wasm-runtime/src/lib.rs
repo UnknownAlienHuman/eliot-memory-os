@@ -13,6 +13,7 @@ mod types;
 
 pub mod capsule;
 pub mod component_contract;
+pub mod lifecycle;
 pub mod replacement;
 
 pub use ports::*;

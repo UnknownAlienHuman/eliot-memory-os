@@ -28,6 +28,100 @@ pub enum ProbeObjectiveOrigin {
     MissingVerifier,
 }
 
+/// Materiality of an objective supplied by its owning contract.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+pub enum ProbeObjectiveMateriality {
+    Material { rationale: String },
+    NonMaterial { reason: String },
+    Unknown { reason: String },
+}
+
+impl ProbeObjectiveMateriality {
+    pub fn validate(&self) -> Result<(), ContractViolation> {
+        validation::preflight(self)?;
+        match self {
+            Self::Material { rationale } => {
+                validation::text(rationale, "probe.objective.materiality")
+            }
+            Self::NonMaterial { reason } | Self::Unknown { reason } => {
+                validation::text(reason, "probe.objective.materiality")
+            }
+        }
+    }
+
+    pub fn is_material(&self) -> bool {
+        matches!(self, Self::Material { .. })
+    }
+}
+
+/// Resolution state of an objective before a probe is planned.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+pub enum ProbeObjectiveResolution {
+    Open,
+    Resolved { basis: String },
+    Invalidated { reason: String },
+    Unknown { reason: String },
+}
+
+impl ProbeObjectiveResolution {
+    pub fn validate(&self) -> Result<(), ContractViolation> {
+        validation::preflight(self)?;
+        match self {
+            Self::Open => Ok(()),
+            Self::Resolved { basis } => validation::text(basis, "probe.objective.resolution"),
+            Self::Invalidated { reason } | Self::Unknown { reason } => {
+                validation::text(reason, "probe.objective.resolution")
+            }
+        }
+    }
+
+    pub fn is_open(&self) -> bool {
+        matches!(self, Self::Open)
+    }
+}
+
+/// Exact causal controls, confounders, and rival endpoints required by a
+/// causal probe. These are references only; no intervention is performed.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CausalProbeRequirements {
+    pub controls: BTreeSet<ArtifactId>,
+    pub confounders: BTreeSet<ArtifactId>,
+    pub rival_predictions: BTreeSet<RivalPredictionRef>,
+}
+
+impl CausalProbeRequirements {
+    pub fn validate(&self) -> Result<(), ContractViolation> {
+        validation::preflight(self)?;
+        check_sequence(self.controls.len(), "probe.objective.causal.controls")?;
+        check_sequence(self.confounders.len(), "probe.objective.causal.confounders")?;
+        check_sequence(
+            self.rival_predictions.len(),
+            "probe.objective.causal.rival_predictions",
+        )?;
+        for control in &self.controls {
+            validation::text(control.as_str(), "probe.objective.causal.control")?;
+        }
+        for confounder in &self.confounders {
+            validation::text(confounder.as_str(), "probe.objective.causal.confounder")?;
+        }
+        for prediction in &self.rival_predictions {
+            prediction.validate()?;
+        }
+        if self.controls.is_empty()
+            && self.confounders.is_empty()
+            && self.rival_predictions.is_empty()
+        {
+            return Err(ContractViolation::MissingField(
+                "probe.objective.causal.requirements",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Typed owner reference for a required follow-up, never an authority claim.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
@@ -92,6 +186,54 @@ impl ProbeObjectiveRef {
             &self.objective_digest,
             "probe.objective_ref.objective_digest",
         )
+    }
+}
+
+/// Exact objective semantics attached to an affordance or result matrix.
+///
+/// The claim/assumption fields prevent a gap proxy from being treated as the
+/// objective it happens to mention. This binding grants no authority and
+/// performs no resolution.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProbeObjectiveBinding {
+    pub objective: ProbeObjectiveRef,
+    pub claim: Option<MaterialClaimRef>,
+    pub assumption: Option<ConditionAssumptionRef>,
+    pub materiality: ProbeObjectiveMateriality,
+    pub resolution: ProbeObjectiveResolution,
+    pub denominator: Option<Box<CoverageDenominator>>,
+    pub causal_requirements: Option<CausalProbeRequirements>,
+}
+
+impl ProbeObjectiveBinding {
+    pub fn validate(&self) -> Result<(), ContractViolation> {
+        validation::preflight(self)?;
+        self.objective.validate()?;
+        if let Some(claim) = &self.claim {
+            claim.validate()?;
+        }
+        if let Some(assumption) = &self.assumption {
+            assumption.validate()?;
+        }
+        self.materiality.validate()?;
+        self.resolution.validate()?;
+        if let Some(denominator) = &self.denominator {
+            denominator
+                .validate()
+                .map_err(|error| ContractViolation::BindingMismatch {
+                    field: "probe.objective.binding.denominator",
+                    reason: error.to_string(),
+                })?;
+        }
+        if let Some(causal) = &self.causal_requirements {
+            causal.validate()?;
+        }
+        Ok(())
+    }
+
+    pub fn ready_for_planning(&self) -> bool {
+        self.materiality.is_material() && self.resolution.is_open()
     }
 }
 
@@ -178,6 +320,10 @@ pub struct ProbeObjective {
     pub target: ProbeObjectiveTarget,
     pub applicability: ValidityBounds,
     pub materiality_rationale: String,
+    pub materiality: ProbeObjectiveMateriality,
+    pub resolution: ProbeObjectiveResolution,
+    pub denominator: Option<Box<CoverageDenominator>>,
+    pub causal_requirements: Option<CausalProbeRequirements>,
     pub source_refs: BTreeSet<ArtifactId>,
     pub invalidation_conditions: Vec<ConditionAssumptionRef>,
     pub required_owner: ProbeOwnerRef,
@@ -199,6 +345,10 @@ impl ProbeObjective {
         invalidation_conditions: Vec<ConditionAssumptionRef>,
         required_owner: ProbeOwnerRef,
     ) -> Result<Self, ContractViolation> {
+        let denominator = match &target {
+            ProbeObjectiveTarget::EvidenceGap { denominator, .. } => denominator.clone(),
+            _ => None,
+        };
         let mut objective = Self {
             schema_version: PROBE_OBJECTIVE_SCHEMA_VERSION,
             objective_id,
@@ -206,6 +356,12 @@ impl ProbeObjective {
             target,
             applicability,
             materiality_rationale,
+            materiality: ProbeObjectiveMateriality::Material {
+                rationale: "declared by objective owner".to_owned(),
+            },
+            resolution: ProbeObjectiveResolution::Open,
+            denominator,
+            causal_requirements: None,
             source_refs,
             invalidation_conditions,
             required_owner,
@@ -215,6 +371,49 @@ impl ProbeObjective {
         objective.validate_shape()?;
         objective.digest = objective.compute_digest()?;
         Ok(objective)
+    }
+
+    /// Replaces owner-supplied readiness semantics and reseals the objective.
+    pub fn with_semantics(
+        mut self,
+        materiality: ProbeObjectiveMateriality,
+        resolution: ProbeObjectiveResolution,
+        denominator: Option<Box<CoverageDenominator>>,
+        causal_requirements: Option<CausalProbeRequirements>,
+    ) -> Result<Self, ContractViolation> {
+        self.materiality = materiality;
+        self.resolution = resolution;
+        self.denominator = denominator;
+        self.causal_requirements = causal_requirements;
+        self.validate_shape()?;
+        self.digest = self.compute_digest()?;
+        Ok(self)
+    }
+
+    /// Produces the exact binding carried into a planner affordance.
+    pub fn binding(&self) -> Result<ProbeObjectiveBinding, ContractViolation> {
+        self.validate()?;
+        let (claim, assumption) = match &self.target {
+            ProbeObjectiveTarget::EvidenceGap { claim, .. } => (Some(claim.clone()), None),
+            ProbeObjectiveTarget::Assumption { assumption, claim } => {
+                (claim.clone(), Some(assumption.clone()))
+            }
+            _ => (None, None),
+        };
+        let binding = ProbeObjectiveBinding {
+            objective: ProbeObjectiveRef {
+                objective_id: self.objective_id.clone(),
+                objective_digest: self.digest.clone(),
+            },
+            claim,
+            assumption,
+            materiality: self.materiality.clone(),
+            resolution: self.resolution.clone(),
+            denominator: self.denominator.clone(),
+            causal_requirements: self.causal_requirements.clone(),
+        };
+        binding.validate()?;
+        Ok(binding)
     }
 
     pub fn validate(&self) -> Result<(), ContractViolation> {
@@ -241,6 +440,10 @@ impl ProbeObjective {
             &self.target,
             &self.applicability,
             &self.materiality_rationale,
+            &self.materiality,
+            &self.resolution,
+            &self.denominator,
+            &self.causal_requirements,
             &self.source_refs,
             &self.invalidation_conditions,
             &self.required_owner,
@@ -259,6 +462,19 @@ impl ProbeObjective {
             &self.materiality_rationale,
             "probe.objective.materiality_rationale",
         )?;
+        self.materiality.validate()?;
+        self.resolution.validate()?;
+        if let Some(denominator) = &self.denominator {
+            denominator
+                .validate()
+                .map_err(|error| ContractViolation::BindingMismatch {
+                    field: "probe.objective.denominator",
+                    reason: error.to_string(),
+                })?;
+        }
+        if let Some(causal) = &self.causal_requirements {
+            causal.validate()?;
+        }
         self.required_owner.validate()?;
         self.applicability
             .validate()

@@ -6,9 +6,11 @@
 //! - [`generation_routing`] — runtime generation routes and cutover decisions;
 //! - [`control_reserve_front_door`] — the bounded control reserve and the
 //!   synchronous front-door admission core;
-//! - [`recovery_state_view`] — the role-filtered, non-semantic recovery view.
+//! - [`recovery_state_view`] — the role-filtered, non-semantic recovery view;
+//! - [`notification_state`] — canonical persistent notification records.
 
 pub mod control_reserve_front_door;
 pub mod epoch_and_fence;
 pub mod generation_routing;
+pub mod notification_state;
 pub mod recovery_state_view;

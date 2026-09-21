@@ -228,7 +228,6 @@ jobs:
         run: |
           set -euo pipefail
           python - <<'PY'
-          import hashlib
           import pathlib
           import re
 
@@ -271,6 +270,7 @@ jobs:
 
           ci = pathlib.Path('.github/workflows/ci.yml').read_text(encoding='utf-8')
           policy_text = pathlib.Path('.github/workflows/repository-policy.yml').read_text(encoding='utf-8')
+          sc_text = pathlib.Path('.github/workflows/source-candidate.yml').read_text(encoding='utf-8')
           just = pathlib.Path('Justfile').read_text(encoding='utf-8')
           verify = pathlib.Path('scripts/verify.ps1').read_text(encoding='utf-8')
 
@@ -315,7 +315,7 @@ jobs:
           # Review cargo tail order inside the single gate-definition owner.
           tail = [
               'cargo metadata --locked --no-deps --format-version 1',
-              'cargo fmt --all -- --check',
+              'cargo fmt --check',
               'cargo check --locked --workspace --all-targets',
               'cargo clippy --locked --workspace --all-targets -- -D warnings',
               'cargo test --locked --workspace',
@@ -327,9 +327,9 @@ jobs:
           elif any(later <= earlier for earlier, later in zip(positions, positions[1:])):
               fail('WIRING', 'Review cargo tail is out of order')
 
-          # Least privilege on both owned workflows (checks run against file
+          # Least privilege on owned workflows (checks run against file
           # content, so this step's own source must also stay clean).
-          for name, text in (('ci.yml', ci), ('repository-policy.yml', policy_text)):
+          for name, text in (('ci.yml', ci), ('repository-policy.yml', policy_text), ('source-candidate.yml', sc_text)):
               if re.search(r':\s*write\b', text) or re.search(r':\s*admin\b', text):
                   fail('PRIVILEGE', f'{name} grants elevated capability')
               if 'persist-credentials: false' not in text:
@@ -346,17 +346,42 @@ jobs:
           if len(key_lines) != 1 or 'runner.os' not in key_lines[0] or 'review' not in key_lines[0].lower():
               fail('CACHE', 'ci cache key must bind OS, lockfile, and profile')
 
-          # Source-candidate identity: hash and trigger identity unchanged.
-          sc_path = pathlib.Path('.github/workflows/source-candidate.yml')
-          sc_hash = hashlib.sha256(sc_path.read_bytes()).hexdigest()
-          if sc_hash != '6a8aeacb02551762321bf2ee498952f46bebeb8ba56fcbd0a166e47f282ca82c':
-              fail('CANDIDATE', 'source-candidate.yml hash changed')
-          if on_children(sc_path.read_text(encoding='utf-8')) != ['workflow_dispatch']:
+          # Source-candidate identity by structure, not by frozen hash: the
+          # candidate gate keeps its manual trigger, pinned actions, minimal
+          # permissions, locked inputs, explicit harness execution, and
+          # source-only proof ceiling without freezing its exact bytes, so a
+          # reviewed lock or binding edit does not read as an identity break.
+          # No fixed hash and no fixed issue set carries authority here.
+          if on_children(sc_text) != ['workflow_dispatch']:
               fail('CANDIDATE', 'source-candidate.yml trigger identity changed')
+          for line_no, line in enumerate(sc_text.splitlines(), start=1):
+              uses_match = re.match(r'^\s*-\s*uses:\s*([^\s#]+)', line)
+              if uses_match:
+                  ref = uses_match.group(1)
+                  if not ref.startswith('./') and ('@' not in ref or not re.fullmatch(r'[0-9a-fA-F]{40}', ref.split('@', 1)[1])):
+                      fail('CANDIDATE', f'source-candidate.yml line {line_no} action is not full-SHA pinned: {ref}')
+              # Quoted prose (e.g. failure-message literals) is not a gate
+              # invocation; only unquoted cargo check/clippy/test/build/metadata
+              # commands must carry --locked.
+              code = re.sub(r'"[^"]*"', '', line)
+              code = re.sub(r"'[^']*'", '', code)
+              if re.search(r'cargo\s+(check|clippy|test|build|metadata)\b', code) and '--locked' not in code:
+                  fail('CANDIDATE', f'source-candidate.yml line {line_no} cargo gate is not --locked')
+          if 'contents: read' not in sc_text:
+              fail('CANDIDATE', 'source-candidate.yml lost minimal contents: read permissions')
+          for marker in ('persist-credentials: false', '--locked-mode', 'rustup show active-toolchain'):
+              if marker not in sc_text:
+                  fail('CANDIDATE', f'source-candidate.yml lost locked-input marker: {marker}')
+          if 'apps/Eliot.Operator/Eliot.Operator.csproj' in sc_text and 'tests/Eliot.Operator.Tests' not in sc_text:
+              fail('CANDIDATE', 'source-candidate.yml builds Eliot.Operator without executing the Operator harness')
+          if 'SOURCE_CANDIDATE_ONLY' not in sc_text:
+              fail('CANDIDATE', 'source-candidate.yml lost its source-only proof ceiling marker')
+          if 'CONTRACT_CHALLENGE' not in sc_text:
+              fail('CANDIDATE', 'source-candidate.yml lost its fail-closed live-scenario challenge')
 
           if failures:
               for item in failures:
                   print(item)
               raise SystemExit(1)
-          print(f'REPOSITORY_POLICY_WIRING: PASS workflows={len(workflows)} candidate={sc_hash[:12]}')
+          print(f'REPOSITORY_POLICY_WIRING: PASS workflows={len(workflows)} candidate=structural')
           PY

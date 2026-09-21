@@ -15,6 +15,8 @@
 
 use super::super::HostError;
 #[cfg(windows)]
+use super::super::watchdog_publication::supervision_publication_identity;
+#[cfg(windows)]
 use super::super::{
     AuthenticatedKernelReadiness, PublishedSupervisionIdentity, fresh_identity, operation,
 };
@@ -28,8 +30,8 @@ use eliot_host_state::{HostStateRecord, NonceState, record_checksum};
 use eliot_platform::PlatformHandle;
 #[cfg(windows)]
 use eliot_runtime_contracts::{
-    KernelActivationState, ServiceProcessRecord, ServiceProcessState,
-    SupervisionLeasePredecessorIdentity,
+    KernelActivationState, LeaseState, ServiceProcessRecord, ServiceProcessState,
+    SupervisionLeasePredecessorIdentity, WatchdogAdmissionTemplate,
 };
 
 // F-LOG-HOST-6 (#981) readiness-append observation helpers.
@@ -90,14 +92,100 @@ fn append_reconciled_readiness<B: JournalBackend>(
     }
 }
 
+/// Binds the exact admitted watchdog supervision branch behind one readiness
+/// proof into the persisted observation evidence: the content-addressed
+/// `Watchdog` publication digest joined to the admitted lease identity, the
+/// canonical `ORS` receipt digest, and the admitted watchdog epoch.
+///
+/// Single-snapshot boundary: the ONLY lease input is the Kernel-renewed
+/// supervision snapshot (production passes `proof.supervision_lease`). The
+/// publication identity is derived from that same snapshot via
+/// `supervision_publication_identity` — there is no independent
+/// caller-supplied identity alongside, so a foreign or stale branch cannot be
+/// mixed into the ref. The provisioned admission template is durable Phase-B
+/// authority, not identity, and its scope (installation plus lease scope) is
+/// cross-checked against the snapshot payload scope; any mismatch fails
+/// closed. The snapshot itself is authenticated (`validate`), must be
+/// `Active`/`Active`, and must carry a nonzero watchdog epoch; anything else
+/// fails closed instead of persisting a readiness observation that would
+/// read as independently supervised (I1.5, Windows-only path).
+///
+/// Publication exactness against the `ORS` head is verified at publish time by
+/// `verify_exact_current_watchdog_publication`, head currency by
+/// `require_exact_supervision_head`, and epoch equality by the Kernel
+/// `ProbeReady` watchdog-branch gate.
+#[cfg(windows)]
+pub(crate) fn watchdog_branch_evidence_ref(
+    template: &WatchdogAdmissionTemplate,
+    admitted_lease: &eliot_ors::SupervisionLeaseSnapshot,
+) -> Result<(PlatformHandle, PublishedSupervisionIdentity), HostError> {
+    admitted_lease
+        .validate()
+        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+    if admitted_lease.record.state != LeaseState::Active
+        || admitted_lease.record.projection != eliot_ors::SupervisionLeaseProjection::Active
+    {
+        return Err(HostError::RecoveryRequired(
+            "Kernel supervision snapshot is not an admitted Active watchdog branch".to_owned(),
+        ));
+    }
+    if template.installation_id != admitted_lease.record.artifact.payload.installation_id
+        || template.supervision_lease_scope_id != admitted_lease.record.artifact.payload.scope_ref
+    {
+        return Err(HostError::RecoveryRequired(
+            "provisioned Watchdog admission scope does not match the admitted supervision lease"
+                .to_owned(),
+        ));
+    }
+    let watchdog_epoch = admitted_lease.record.binding.watchdog_epoch.value();
+    if watchdog_epoch == 0 {
+        return Err(HostError::RecoveryRequired(
+            "Kernel supervision snapshot carries no admitted watchdog epoch".to_owned(),
+        ));
+    }
+    let supervision = supervision_publication_identity(template, admitted_lease)?;
+    PlatformHandle::new(format!(
+        "watchdog-branch:{}:lease:{}:receipt:{}:epoch:{watchdog_epoch}",
+        supervision.publication_digest.as_str(),
+        admitted_lease.record.lease_id.as_str(),
+        admitted_lease.receipt.receipt_sha256,
+    ))
+    .map_err(|error| HostError::Platform(error.to_string()))
+    .map(|evidence_ref| (evidence_ref, supervision))
+}
+
 #[cfg(windows)]
 pub(crate) fn append_authenticated_kernel_readiness<B: JournalBackend>(
     journal: &HostStateJournalService<B>,
     proof: &AuthenticatedKernelReadiness,
     approved_kernel_artifact: &PlatformHandle,
     approved_config: &PlatformHandle,
-    supervision: &PublishedSupervisionIdentity,
-) -> Result<AppendReceipt, HostError> {
+    watchdog_template: &WatchdogAdmissionTemplate,
+) -> Result<(AppendReceipt, PublishedSupervisionIdentity), HostError> {
+    append_authenticated_kernel_readiness_with_heartbeat(
+        journal,
+        proof,
+        approved_kernel_artifact,
+        approved_config,
+        watchdog_template,
+        &[],
+    )
+}
+
+/// Appends the authenticated kernel readiness observation with the Host
+/// heartbeat evidence refs stored alongside kernel readiness and the
+/// watchdog-branch ref (transport1750 step 8). Empty refs preserve the
+/// pre-transport record exactly; callers pass refs admitted from a fresh
+/// derived Host observation, never raw pipe material.
+#[cfg(windows)]
+pub(crate) fn append_authenticated_kernel_readiness_with_heartbeat<B: JournalBackend>(
+    journal: &HostStateJournalService<B>,
+    proof: &AuthenticatedKernelReadiness,
+    approved_kernel_artifact: &PlatformHandle,
+    approved_config: &PlatformHandle,
+    watchdog_template: &WatchdogAdmissionTemplate,
+    heartbeat_refs: &[PlatformHandle],
+) -> Result<(AppendReceipt, PublishedSupervisionIdentity), HostError> {
     host_readiness_append_observe("host.readiness authenticated requested");
     let snapshot = journal.snapshot()?;
     let active = snapshot.kernel.as_ref().ok_or_else(|| {
@@ -143,7 +231,16 @@ pub(crate) fn append_authenticated_kernel_readiness<B: JournalBackend>(
         PlatformHandle::new(format!("kernel-response:{}", response_digest.as_str()))
             .map_err(|error| HostError::Platform(error.to_string()))?,
     );
+    // Single-snapshot boundary: the supervision identity below is derived
+    // from the same Kernel-renewed snapshot (proof.supervision_lease) that the
+    // ProbeReady gate admitted — never a caller-supplied identity.
+    let (watchdog_branch_ref, supervision) =
+        watchdog_branch_evidence_ref(watchdog_template, &proof.supervision_lease)?;
     evidence_refs.extend(supervision.evidence_refs()?);
+    evidence_refs.push(watchdog_branch_ref);
+    // Transport1750 step 8: Host observation digest, coverage, and receive
+    // time admitted from a fresh derived heartbeat ride the same record.
+    evidence_refs.extend(heartbeat_refs.iter().cloned());
     let expected = ReadinessApprovedContour {
         config_digest: approved_config.clone(),
         store_fence: proof.store_fence.clone(),
@@ -182,5 +279,5 @@ pub(crate) fn append_authenticated_kernel_readiness<B: JournalBackend>(
         &expected,
     )?;
     host_readiness_append_observe("host.readiness evidence appended");
-    Ok(receipt)
+    Ok((receipt, supervision))
 }
