@@ -2,7 +2,7 @@
 //!
 //! Architecture: A12.3 One governed write path, A13.6 recovery, A13.9
 //! concurrency, ARCH-RES-01 bounded closed dispatch.
-//! Implementation: I5.7 WriteCoordinator and store transaction limit, I5.9
+//! Implementation: I5.7 `WriteCoordinator` and store transaction limit, I5.9
 //! bounded store-client generations, I5.19 unknown-outcome receipt
 //! reconciliation, I5.20 Q0–Q4 named reads.
 //!
@@ -36,7 +36,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 pub enum ClientClass {
     /// Named Q0–Q4 reads under the read semaphore.
     Read,
-    /// Canonical transactions under the WriteCoordinator limit.
+    /// Canonical transactions under the `WriteCoordinator` limit.
     Write,
     /// Isolated version/schema/backup/health operations.
     Health,
@@ -147,11 +147,13 @@ struct ManagerState {
 #[must_use]
 pub fn default_store_transaction_limit() -> NonZeroUsize {
     const DESKTOP_EXECUTOR_CEILING: usize = 4;
-    let logical = std::thread::available_parallelism()
-        .map(NonZeroUsize::get)
-        .unwrap_or(1);
-    NonZeroUsize::new(logical.min(DESKTOP_EXECUTOR_CEILING).max(1))
-        .expect("transaction limit is non-zero")
+    let logical = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
+    match NonZeroUsize::new(logical.clamp(1, DESKTOP_EXECUTOR_CEILING)) {
+        Some(limit) => limit,
+        // Unreachable by construction: the clamp floor is 1. The fallback
+        // keeps the loosest safe lane instead of panicking.
+        None => NonZeroUsize::MIN,
+    }
 }
 
 /// Fixed bounded read pool for named Q0–Q4 reads.
@@ -197,6 +199,8 @@ impl StoreConnectionManager {
         connect_timeout_ms: u64,
         query_timeout_ms: u64,
     ) -> Result<Self, String> {
+        let health_bound = NonZeroUsize::new(DEFAULT_HEALTH_CLIENTS)
+            .ok_or_else(|| "health client bound must be non-zero".to_owned())?;
         Self::new(ConnectionPolicies {
             read: ClientSetPolicy {
                 bound: read_bound,
@@ -213,7 +217,7 @@ impl StoreConnectionManager {
                 max_backoff_ms: 5_000,
             },
             health: ClientSetPolicy {
-                bound: NonZeroUsize::new(DEFAULT_HEALTH_CLIENTS).expect("health bound is non-zero"),
+                bound: health_bound,
                 deadline_ms: connect_timeout_ms,
                 max_reconnect_attempts: 3,
                 base_backoff_ms: 100,
@@ -234,13 +238,19 @@ impl StoreConnectionManager {
 
     /// Current explicit generation of one client set. Starts at 1 and only
     /// advances through [`Self::replace_generation`].
+    ///
+    /// A poisoned set reports generation 0, which is never issued: every
+    /// lease compares stale and the set drains instead of serving new work
+    /// under a suspect lineage.
     #[must_use]
     pub fn generation(&self, class: ClientClass) -> u64 {
-        let state = self.state.lock().expect("connection state is poisoned");
-        match class {
-            ClientClass::Read => state.read_generation,
-            ClientClass::Write => state.write_generation,
-            ClientClass::Health => state.health_generation,
+        match self.state.lock() {
+            Ok(state) => match class {
+                ClientClass::Read => state.read_generation,
+                ClientClass::Write => state.write_generation,
+                ClientClass::Health => state.health_generation,
+            },
+            Err(_) => 0,
         }
     }
 
@@ -255,13 +265,18 @@ impl StoreConnectionManager {
 
     /// Whether the set's current generation is marked broken. A broken set
     /// refuses new acquisitions until it is explicitly replaced.
+    ///
+    /// A poisoned set reports broken: acquisitions refuse until the
+    /// composition is rebuilt, instead of serving under suspect state.
     #[must_use]
     pub fn is_broken(&self, class: ClientClass) -> bool {
-        let state = self.state.lock().expect("connection state is poisoned");
-        match class {
-            ClientClass::Read => state.read_broken,
-            ClientClass::Write => state.write_broken,
-            ClientClass::Health => state.health_broken,
+        match self.state.lock() {
+            Ok(state) => match class {
+                ClientClass::Read => state.read_broken,
+                ClientClass::Write => state.write_broken,
+                ClientClass::Health => state.health_broken,
+            },
+            Err(_) => true,
         }
     }
 
@@ -291,12 +306,17 @@ impl StoreConnectionManager {
     /// Marks the current generation broken after a transport failure.
     /// New acquisitions refuse until [`Self::replace_generation`] runs;
     /// in-flight leases of the old generation drain.
+    ///
+    /// Best-effort when the set is already inconsistent from a prior panic:
+    /// [`Self::is_broken`] reports broken regardless, so a lost mark cannot
+    /// reopen acquisitions.
     pub fn mark_broken(&self, class: ClientClass) {
-        let mut state = self.state.lock().expect("connection state is poisoned");
-        match class {
-            ClientClass::Read => state.read_broken = true,
-            ClientClass::Write => state.write_broken = true,
-            ClientClass::Health => state.health_broken = true,
+        if let Ok(mut state) = self.state.lock() {
+            match class {
+                ClientClass::Read => state.read_broken = true,
+                ClientClass::Write => state.write_broken = true,
+                ClientClass::Health => state.health_broken = true,
+            }
         }
     }
 
@@ -501,10 +521,23 @@ impl UnknownWriteGate {
         &self.operation_id
     }
 
-    /// Records the receipt-lookup classification. A lookup for another
-    /// identity cannot resolve this gate: it records as foreign.
+    /// Records the receipt-lookup classification for this gate's identity.
+    ///
+    /// Prefer [`Self::resolve_lookup`]: it classifies the raw receipt
+    /// against the gate's own operation identity, so a receipt for another
+    /// identity records as foreign and can never resolve this gate.
     pub fn resolve(&mut self, outcome: ResolvedWriteOutcome) {
         self.outcome = Some(outcome);
+    }
+
+    /// Classifies one `ResolveWriteReceipt` answer against this gate's own
+    /// operation identity and records it.
+    ///
+    /// A lookup that answered for another identity, or an invalid or
+    /// envelope-less receipt, records as foreign and keeps the gate
+    /// unknown: [`Self::verdict`] stays [`ReplayVerdict::MustReconcile`].
+    pub fn resolve_lookup(&mut self, receipt: Option<&WriteReceipt>) {
+        self.outcome = Some(classify_receipt_lookup(&self.operation_id, receipt));
     }
 
     /// Current verdict: [`ReplayVerdict::MustReconcile`] until a proven

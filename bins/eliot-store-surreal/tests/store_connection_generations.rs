@@ -100,6 +100,41 @@ fn bounded_class_sets_reuse_without_per_request_growth() {
     drop(second);
 }
 
+// WORK_UNIT_CASE: 1933/1b — concurrent threads share the fixed sets.
+#[test]
+fn concurrent_threads_share_fixed_sets_without_growth() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let manager = manager();
+    let peak = Arc::new(AtomicUsize::new(0));
+    let mut threads = Vec::new();
+    for _ in 0..16 {
+        let manager = manager.clone();
+        let peak = Arc::clone(&peak);
+        threads.push(std::thread::spawn(move || {
+            for _ in 0..25 {
+                let read = manager.try_acquire(ClientClass::Read).unwrap();
+                let write = manager.try_acquire(ClientClass::Write).unwrap();
+                let _ = peak.fetch_max(manager.in_use(ClientClass::Read), Ordering::Relaxed);
+                assert!(read.is_current(&manager));
+                assert!(write.is_current(&manager));
+                drop((read, write));
+            }
+        }));
+    }
+    for thread in threads {
+        thread.join().expect("worker thread joins");
+    }
+    // Sixteen threads ran four hundred acquire/release cycles against fixed
+    // sets: the read peak never exceeded its bound and everything drained.
+    assert!(peak.load(Ordering::Relaxed) <= 4);
+    assert_eq!(manager.in_use(ClientClass::Read), 0);
+    assert_eq!(manager.in_use(ClientClass::Write), 0);
+    assert_eq!(manager.generation(ClientClass::Read), 1);
+    assert_eq!(manager.generation(ClientClass::Write), 1);
+}
+
 // WORK_UNIT_CASE: 1933/2 — unknown write resolves by operation id before replay.
 #[test]
 fn unknown_write_resolves_by_operation_id_before_any_new_attempt() {
@@ -128,6 +163,15 @@ fn unknown_write_resolves_by_operation_id_before_any_new_attempt() {
         classify_receipt_lookup(&operation, Some(&foreign)),
         ResolvedWriteOutcome::ForeignOrInvalid
     );
+    // Identity-bound resolution: the gate classifies against its own
+    // operation id, so a foreign receipt keeps it unknown.
+    let mut bound = UnknownWriteGate::unknown(operation.clone());
+    bound.resolve_lookup(Some(&foreign));
+    assert_eq!(bound.verdict(), ReplayVerdict::MustReconcile);
+    assert!(!bound.is_resolved());
+    bound.resolve_lookup(Some(&ambiguous));
+    assert_eq!(bound.verdict(), ReplayVerdict::MustReconcile);
+    assert!(!bound.is_resolved());
     // The terminal decision matrix never permits a blind same-identity
     // replay: committed reuses its receipt, proven non-application admits
     // only a new identity, and every unknown arm reconciles.
