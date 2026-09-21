@@ -6,10 +6,14 @@ Enforces that:
 2. Every third-party Action reference is pinned to a full 40-character commit SHA.
 3. Top-level permissions remain minimal (contents: read); broad write-all is rejected.
 4. Python verification dependencies are fully version- and hash-locked with --hash=sha256.
-5. NuGet dependencies for Eliot.Operator are locked with RestorePackagesWithLockFile and packages.lock.json.
+5. NuGet dependencies for Eliot.Operator and the Eliot.Operator.Tests harness
+   are locked with RestorePackagesWithLockFile and checked-in
+   packages.lock.json files, so locked-mode restore fails on drift.
 6. Operator workflows execute the test harness (tests/Eliot.Operator.Tests) with nonzero execution.
 7. Workflow names indicate manual invocation and state bounded proof ceilings.
 8. Referenced local scripts exist on disk.
+9. Workflow pip installs consume only the hash-locked
+   scripts/requirements-verification.txt with --require-hashes.
 """
 
 from __future__ import annotations
@@ -269,11 +273,18 @@ def check_python_requirements(root: Path) -> list[Finding]:
     return findings
 
 
+NUGET_LOCKED_PROJECTS = (
+    ("apps/Eliot.Operator/Eliot.Operator.csproj", "apps/Eliot.Operator/packages.lock.json"),
+    ("tests/Eliot.Operator.Tests/Eliot.Operator.Tests.csproj", "tests/Eliot.Operator.Tests/packages.lock.json"),
+)
+
+
 def check_nuget_lock(root: Path) -> list[Finding]:
     findings: list[Finding] = []
-    csproj_path = root / "apps" / "Eliot.Operator" / "Eliot.Operator.csproj"
-    rel_csproj = "apps/Eliot.Operator/Eliot.Operator.csproj"
-    if csproj_path.is_file():
+    for rel_csproj, rel_lock in NUGET_LOCKED_PROJECTS:
+        csproj_path = root.joinpath(*rel_csproj.split("/"))
+        if not csproj_path.is_file():
+            continue
         content = csproj_path.read_text(encoding="utf-8")
         if "<RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>" not in content:
             findings.append(
@@ -281,17 +292,17 @@ def check_nuget_lock(root: Path) -> list[Finding]:
                     "GWF-005",
                     rel_csproj,
                     1,
-                    "missing <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile> in Eliot.Operator.csproj",
+                    f"missing <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile> in {rel_csproj}",
                 )
             )
-        lock_file = root / "apps" / "Eliot.Operator" / "packages.lock.json"
+        lock_file = root.joinpath(*rel_lock.split("/"))
         if not lock_file.is_file():
             findings.append(
                 Finding(
                     "GWF-005",
-                    "apps/Eliot.Operator/packages.lock.json",
+                    rel_lock,
                     0,
-                    "checked-in NuGet packages.lock.json is missing for locked restore",
+                    f"checked-in NuGet {rel_lock} is missing for locked restore",
                 )
             )
         else:
@@ -301,12 +312,39 @@ def check_nuget_lock(root: Path) -> list[Finding]:
                 findings.append(
                     Finding(
                         "GWF-005",
-                        "apps/Eliot.Operator/packages.lock.json",
+                        rel_lock,
                         1,
-                        f"corrupted packages.lock.json: {exc}",
+                        f"corrupted {rel_lock}: {exc}",
                     )
                 )
 
+    return findings
+
+
+def check_pip_install_lock(root: Path) -> list[Finding]:
+    """Every workflow pip install must consume the hash-locked closure."""
+    findings: list[Finding] = []
+    workflows_dir = root / ".github" / "workflows"
+    if not workflows_dir.is_dir():
+        return findings
+    for wf_path in sorted([*workflows_dir.glob("*.yml"), *workflows_dir.glob("*.yaml")]):
+        rel_path = str(wf_path.relative_to(root)).replace("\\", "/")
+        try:
+            lines = wf_path.read_text(encoding="utf-8").splitlines()
+        except Exception:
+            continue
+        for line_no, line in enumerate(lines, start=1):
+            if "pip install" not in line:
+                continue
+            if "--require-hashes" not in line or "scripts/requirements-verification.txt" not in line:
+                findings.append(
+                    Finding(
+                        "GWF-009",
+                        rel_path,
+                        line_no,
+                        "pip install must use --require-hashes -r scripts/requirements-verification.txt",
+                    )
+                )
     return findings
 
 
@@ -315,6 +353,7 @@ def verify_all(root: Path) -> list[Finding]:
     findings.extend(check_workflows(root))
     findings.extend(check_python_requirements(root))
     findings.extend(check_nuget_lock(root))
+    findings.extend(check_pip_install_lock(root))
     return findings
 
 
@@ -378,7 +417,72 @@ def run_self_tests() -> int:
             print("SELF_TEST_FAILURE: expected GWF-005 for missing RestorePackagesWithLockFile", file=sys.stderr)
             return 1
 
-    print("GITHUB_WORKFLOW_VERIFIER_SELF_TEST: PASS (7/7 cases verified)")
+    # Test harness project without lock flag or lock file
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_root = Path(tmpdir)
+        harness_dir = tmp_root / "tests" / "Eliot.Operator.Tests"
+        harness_dir.mkdir(parents=True)
+        (harness_dir / "Eliot.Operator.Tests.csproj").write_text(
+            "<Project><PropertyGroup></PropertyGroup></Project>", encoding="utf-8"
+        )
+        findings = check_nuget_lock(tmp_root)
+        if not any(
+            f.code == "GWF-005" and "Eliot.Operator.Tests" in f.path for f in findings
+        ):
+            print("SELF_TEST_FAILURE: expected GWF-005 for unlocked Operator harness", file=sys.stderr)
+            return 1
+
+    # Test locked harness project accepted
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_root = Path(tmpdir)
+        harness_dir = tmp_root / "tests" / "Eliot.Operator.Tests"
+        harness_dir.mkdir(parents=True)
+        (harness_dir / "Eliot.Operator.Tests.csproj").write_text(
+            "<Project><PropertyGroup><RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>"
+            "</PropertyGroup></Project>",
+            encoding="utf-8",
+        )
+        (harness_dir / "packages.lock.json").write_text(
+            '{"version": 1, "dependencies": {"net10.0": {}}}', encoding="utf-8"
+        )
+        findings = check_nuget_lock(tmp_root)
+        if findings:
+            print(f"SELF_TEST_FAILURE: locked harness produced unexpected findings: {findings}", file=sys.stderr)
+            return 1
+
+    # Test pip install without hash lock rejected
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_root = Path(tmpdir)
+        wf_dir = tmp_root / ".github" / "workflows"
+        wf_dir.mkdir(parents=True)
+        (wf_dir / "test.yml").write_text(
+            "name: Manual Gate\non:\n  workflow_dispatch:\npermissions:\n  contents: read\njobs:\n  t:\n"
+            "    runs-on: windows-latest\n    steps:\n"
+            "      - run: python -m pip install -r scripts/requirements.txt\n",
+            encoding="utf-8",
+        )
+        findings = check_pip_install_lock(tmp_root)
+        if not any(f.code == "GWF-009" for f in findings):
+            print("SELF_TEST_FAILURE: expected GWF-009 for unhashed pip install", file=sys.stderr)
+            return 1
+
+    # Test hash-locked pip install accepted
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_root = Path(tmpdir)
+        wf_dir = tmp_root / ".github" / "workflows"
+        wf_dir.mkdir(parents=True)
+        (wf_dir / "test.yml").write_text(
+            "name: Manual Gate\non:\n  workflow_dispatch:\npermissions:\n  contents: read\njobs:\n  t:\n"
+            "    runs-on: windows-latest\n    steps:\n"
+            "      - run: python -m pip install --require-hashes -r scripts/requirements-verification.txt\n",
+            encoding="utf-8",
+        )
+        findings = check_pip_install_lock(tmp_root)
+        if findings:
+            print(f"SELF_TEST_FAILURE: hash-locked pip install produced unexpected findings: {findings}", file=sys.stderr)
+            return 1
+
+    print("GITHUB_WORKFLOW_VERIFIER_SELF_TEST: PASS (12/12 cases verified)")
     return 0
 
 
