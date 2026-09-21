@@ -281,3 +281,53 @@ fn no_hidden_destructive_reset_path_exists() {
         Err(BridgeError::DestructiveOpRejected(_))
     ));
 }
+
+#[test]
+fn option_like_inputs_are_refused_or_safely_separated_on_real_repo() {
+    let dir = unique_dir("optlike");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    git(&dir, &["init"]);
+    git(&dir, &["config", "user.name", "t"]);
+    git(&dir, &["config", "user.email", "t@t"]);
+    git(&dir, &["config", "commit.gpgsign", "false"]);
+    // Witness file plus a legitimately option-like tracked path.
+    std::fs::write(dir.join("witness.txt"), "witness\n").expect("write");
+    std::fs::write(dir.join("--tricky.txt"), "tricky\n").expect("write");
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-m", "init"]);
+
+    let bridge = GitBridge::new(StdProcessRunner);
+    let id = ExecutionIdentity::new("sid-1830-opt").expect("sid");
+    let root = user_root(&dir);
+    let admission = Some(AclAdmission {
+        admits_service_identity: true,
+    });
+
+    // Revision-position input is refused before any process launches.
+    let err = bridge
+        .inspect_commit(&id, &root, "--all", admission, None)
+        .expect_err("rev");
+    assert!(matches!(err, BridgeError::InvalidArgument(_)));
+
+    // Path-position input travels after `--`: the option-like path is read
+    // as a pathspec, never parsed as a flag.
+    let blamed = bridge
+        .blame(&id, &root, "--tricky.txt", None, admission, None)
+        .expect("blame");
+    assert_eq!(blamed.lines.len(), 1);
+    assert_eq!(blamed.lines[0].content, "tricky");
+
+    // Nothing was created, removed, or rewritten.
+    assert_eq!(
+        std::fs::read(dir.join("witness.txt")).expect("read"),
+        b"witness\n"
+    );
+    assert_eq!(
+        std::fs::read(dir.join("--tricky.txt")).expect("read"),
+        b"tricky\n"
+    );
+    let status = bridge.status(&id, &root, admission, None).expect("status");
+    assert!(!status.dirty);
+
+    std::fs::remove_dir_all(&dir).ok();
+}

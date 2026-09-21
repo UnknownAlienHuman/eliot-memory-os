@@ -44,6 +44,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 // ---------------------------------------------------------------------------
 // Identity, ownership, leases
@@ -155,17 +156,41 @@ impl Lease {
 }
 
 /// Broker that launches scoped adapters by minting [`Lease`] values.
-#[derive(Debug, Default)]
+///
+/// Each broker owns a per-instance identity domain bound into every lease ID
+/// it mints, so leases from separate broker instances never collide even for
+/// the same SID and sequence position. The domain derives from established
+/// process identity (process ID, wall clock) and the stable heap address of
+/// the broker's own sequence cell — no shared registry, no cross-instance
+/// coordination.
+#[derive(Debug)]
 pub struct Broker {
-    sequence: AtomicU64,
+    sequence: Box<AtomicU64>,
+    domain: u64,
 }
 
 impl Broker {
-    /// Creates a broker with a zeroed lease sequence.
+    /// Creates a broker with a fresh identity domain and lease sequence.
     pub fn new() -> Self {
+        let sequence = Box::new(AtomicU64::new(1));
+        // Heap address is stable for the broker's lifetime and distinct
+        // across live brokers; mixed with pid and wall-clock nanos so a
+        // recycled address still lands in a different domain in practice.
+        let addr = (&*sequence as *const AtomicU64) as usize as u64;
+        let pid = u64::from(std::process::id());
+        let nanos: u64 = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
         Self {
-            sequence: AtomicU64::new(1),
+            sequence,
+            domain: mix_broker_domain(addr, pid, nanos),
         }
+    }
+
+    /// Returns this broker's identity domain (bound into minted lease IDs).
+    pub fn domain(&self) -> u64 {
+        self.domain
     }
 
     /// Issues a scoped worktree lease for one SID on one root.
@@ -177,7 +202,7 @@ impl Broker {
     ) -> Lease {
         let n = self.sequence.fetch_add(1, Ordering::SeqCst);
         Lease {
-            id: format!("wt-lease-{n}-{}", identity.sid()),
+            id: format!("wt-lease-{:016x}-{n}-{}", self.domain, identity.sid()),
             sid: identity.sid().to_owned(),
             scope_root: root.path.clone(),
             worktree: Some(worktree.into()),
@@ -189,12 +214,19 @@ impl Broker {
     pub fn issue_repo_lease(&self, identity: &ExecutionIdentity, root: &RepoRoot) -> Lease {
         let n = self.sequence.fetch_add(1, Ordering::SeqCst);
         Lease {
-            id: format!("repo-lease-{n}-{}", identity.sid()),
+            id: format!("repo-lease-{:016x}-{n}-{}", self.domain, identity.sid()),
             sid: identity.sid().to_owned(),
             scope_root: root.path.clone(),
             worktree: None,
             issued_by: "broker".to_owned(),
         }
+    }
+}
+
+impl Default for Broker {
+    /// Creates a broker exactly as [`Broker::new`] does (fresh domain).
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -359,6 +391,9 @@ pub enum BridgeError {
         code: i32,
         stderr: String,
     },
+    /// A caller-supplied revision or range is option-like and refused before
+    /// any process is launched (flag-injection guard).
+    InvalidArgument(String),
     /// A destructive invocation was requested or constructed.
     DestructiveOpRejected(&'static str),
     /// The process port failed.
@@ -384,6 +419,7 @@ impl fmt::Display for BridgeError {
             }
             Self::DirtyWorktree(detail) => write!(f, "dirty worktree guard: {detail}"),
             Self::PatchCheckFailed(detail) => write!(f, "patch check failed: {detail}"),
+            Self::InvalidArgument(detail) => write!(f, "invalid argument: {detail}"),
             Self::GitFailed {
                 invocation,
                 code,
@@ -1028,6 +1064,7 @@ impl<R: ProcessRunner> GitBridge<R> {
         admission: Option<AclAdmission>,
         lease: Option<&Lease>,
     ) -> Result<CommitReceipt, BridgeError> {
+        reject_option_like(rev, "rev")?;
         let (resolved, lease) = self.admit(identity, root, admission, lease, None)?;
         let dirty = self.is_dirty(&resolved)?;
         let args = vec![
@@ -1071,6 +1108,9 @@ impl<R: ProcessRunner> GitBridge<R> {
         admission: Option<AclAdmission>,
         lease: Option<&Lease>,
     ) -> Result<DiffReceipt, BridgeError> {
+        if let Some(range) = rev_range {
+            reject_option_like(range, "rev_range")?;
+        }
         let (resolved, lease) = self.admit(identity, root, admission, lease, None)?;
         let dirty = self.is_dirty(&resolved)?;
         let mut args = vec![
@@ -1132,6 +1172,7 @@ impl<R: ProcessRunner> GitBridge<R> {
         if !worktree_path.is_absolute() {
             return Err(BridgeError::RootNotAbsolute(worktree_path.to_owned()));
         }
+        reject_option_like(rev, "rev")?;
         let (resolved, lease) =
             self.admit(identity, root, admission, lease, Some(worktree_path))?;
         let dirty = self.is_dirty(&resolved)?;
@@ -1330,6 +1371,9 @@ impl<R: ProcessRunner> GitBridge<R> {
         admission: Option<AclAdmission>,
         lease: Option<&Lease>,
     ) -> Result<BlameReceipt, BridgeError> {
+        if let Some(rev) = rev {
+            reject_option_like(rev, "rev")?;
+        }
         let (resolved, lease) = self.admit(identity, root, admission, lease, None)?;
         let dirty = self.is_dirty(&resolved)?;
         let mut args = vec!["blame".to_owned(), "--line-porcelain".to_owned()];
@@ -1577,6 +1621,8 @@ impl<R: ProcessRunner> GitBridge<R> {
         admission: Option<AclAdmission>,
         lease: Option<&Lease>,
     ) -> Result<BaseDriftReceipt, BridgeError> {
+        reject_option_like(base, "base")?;
+        reject_option_like(head, "head")?;
         let (resolved, lease) = self.admit(identity, root, admission, lease, None)?;
         let dirty = self.is_dirty(&resolved)?;
         let mb_args = vec!["merge-base".to_owned(), base.to_owned(), head.to_owned()];
@@ -1623,8 +1669,41 @@ impl<R: ProcessRunner> GitBridge<R> {
 // Small helpers (dependency-free)
 // ---------------------------------------------------------------------------
 
+/// Rejects option-like caller input before it can reach git argv.
+///
+/// Revision-position values (`rev`, ranges, `base`/`head`) cannot be fenced
+/// with end-of-options `--` (git would read them as paths), so any value
+/// starting with `-` is refused fail-closed here. Path-position values are
+/// instead safely separated: every operation places caller paths after an
+/// explicit `--`, so git always reads them as pathspecs. [`validate_invocation`]
+/// remains the backstop for anything constructed downstream.
+fn reject_option_like(value: &str, what: &'static str) -> Result<(), BridgeError> {
+    if value.starts_with('-') {
+        return Err(BridgeError::InvalidArgument(format!(
+            "{what} must not be option-like: {value:?}"
+        )));
+    }
+    Ok(())
+}
+
 fn best_effort_canonical(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned())
+}
+
+/// Mixes broker-domain entropy into one 64-bit domain tag.
+///
+/// splitmix64 finalizer (bijective): distinct inputs always yield distinct
+/// domains, so two live brokers — whose heap addresses differ — can never
+/// share a domain even when pid and clock readings coincide.
+fn mix_broker_domain(addr: u64, pid: u64, nanos: u64) -> u64 {
+    let mut z = addr
+        .wrapping_add(pid.wrapping_mul(0x9E3779B97F4A7C15))
+        .wrapping_add(nanos);
+    z ^= z >> 30;
+    z = z.wrapping_mul(0xBF58476D1CE4E5B9);
+    z ^= z >> 27;
+    z = z.wrapping_mul(0x94D049BB133111EB);
+    z ^ (z >> 31)
 }
 
 fn is_hex_prefix(line: &str) -> bool {
@@ -1914,5 +1993,61 @@ mod unit_tests {
             .status(&id, &root, None, Some(&lease))
             .expect_err("cross-SID lease");
         assert!(matches!(err, BridgeError::LeaseScopeMismatch(_)));
+    }
+
+    #[test]
+    fn option_like_revisions_are_refused_before_exec() {
+        let tmp = std::env::temp_dir();
+        let bridge = GitBridge::new(FakeRunner::new(""));
+        let id = ExecutionIdentity::new("sid-svc").expect("sid");
+        let root = RepoRoot::new(tmp.clone(), OwnerKind::Service).expect("root");
+        let err = bridge
+            .inspect_commit(&id, &root, "--all", None, None)
+            .expect_err("rev");
+        assert!(matches!(err, BridgeError::InvalidArgument(_)));
+        let err = bridge
+            .diff(&id, &root, Some("--no-index"), &[], None, None)
+            .expect_err("range");
+        assert!(matches!(err, BridgeError::InvalidArgument(_)));
+        let err = bridge
+            .blame(&id, &root, "a.txt", Some("--all"), None, None)
+            .expect_err("blame rev");
+        assert!(matches!(err, BridgeError::InvalidArgument(_)));
+        let err = bridge
+            .base_drift(&id, &root, "--all", "HEAD", None, None)
+            .expect_err("base");
+        assert!(matches!(err, BridgeError::InvalidArgument(_)));
+        let err = bridge
+            .base_drift(&id, &root, "HEAD", "--all", None, None)
+            .expect_err("head");
+        assert!(matches!(err, BridgeError::InvalidArgument(_)));
+        let err = bridge
+            .worktree_create(&id, &root, &tmp.join("wt"), "--force", false, None, None)
+            .expect_err("worktree rev");
+        assert!(matches!(err, BridgeError::InvalidArgument(_)));
+        // Refusal happens before admission and launch: no git invocation ran.
+        assert!(bridge.runner().invocations.lock().expect("lock").is_empty());
+    }
+
+    #[test]
+    fn broker_instances_never_collide_on_lease_identity() {
+        let tmp = std::env::temp_dir();
+        let id = ExecutionIdentity::new("sid-shared").expect("sid");
+        let root = RepoRoot::new(tmp, OwnerKind::Service).expect("root");
+        let first = Broker::new();
+        let second = Broker::new();
+        assert_ne!(first.domain(), second.domain());
+        // Same SID, same sequence position, different brokers: IDs differ.
+        let a = first.issue_repo_lease(&id, &root);
+        let b = second.issue_repo_lease(&id, &root);
+        assert_ne!(a.id(), b.id());
+        let c = first.issue_worktree_lease(&id, &root, "C:/wt-a");
+        let d = second.issue_worktree_lease(&id, &root, "C:/wt-b");
+        assert_ne!(c.id(), d.id());
+        // A default-constructed broker gets a fresh domain, not a constant.
+        let third = Broker::default();
+        let e = third.issue_repo_lease(&id, &root);
+        assert_ne!(e.id(), a.id());
+        assert_ne!(e.id(), b.id());
     }
 }
