@@ -12,14 +12,17 @@ use eliot_agent_api::{BudgetEnvelope, RouteFingerprint};
 use eliot_contracts::sha256_hex;
 use eliot_security_contracts::PrivacyClass;
 use eliotd::staffing_policy::{
-    PolicyAuthorizedDegradation, RouteCandidate, RouteClassEvidence, StaffingConstraints,
-    StaffingPolicyError, UnavailableDispositionKind, check_attempt_route_continuity, plan_staffing,
+    PolicyAuthorizedDegradation, RouteCandidate, RouteClassEvidence, RouteEligibility,
+    StaffingConstraints, StaffingPolicyError, UnavailableDispositionKind,
+    check_attempt_route_continuity, plan_staffing,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
-fn digest(seed: &str) -> eliot_agent_api::LowercaseSha256 {
-    serde_json::from_value(serde_json::json!(sha256_hex(seed.as_bytes()))).expect("test digest")
+fn digest(seed: &str) -> TestResult<eliot_agent_api::LowercaseSha256> {
+    Ok(serde_json::from_value(serde_json::json!(sha256_hex(
+        seed.as_bytes()
+    )))?)
 }
 
 fn test_route(seed: &str, provider: &str, model: &str) -> TestResult<RouteFingerprint> {
@@ -27,16 +30,16 @@ fn test_route(seed: &str, provider: &str, model: &str) -> TestResult<RouteFinger
         host_family: format!("host-{seed}"),
         adapter: format!("adapter-{seed}"),
         protocol_transport: "test-transport".to_owned(),
-        runtime_hash: digest(&format!("runtime-{seed}")),
-        adapter_hash: digest(&format!("adapter-hash-{seed}")),
+        runtime_hash: digest(&format!("runtime-{seed}"))?,
+        adapter_hash: digest(&format!("adapter-hash-{seed}"))?,
         provider: provider.to_owned(),
         model: model.to_owned(),
         auth_billing: format!("billing-{seed}"),
-        serializer_hash: digest(&format!("serializer-{seed}")),
-        tool_semantics_hash: digest(&format!("tools-{seed}")),
+        serializer_hash: digest(&format!("serializer-{seed}"))?,
+        tool_semantics_hash: digest(&format!("tools-{seed}"))?,
         reasoning_mode: "bounded".to_owned(),
         continuation_behavior: "fresh".to_owned(),
-        feature_flags_hash: digest(&format!("features-{seed}")),
+        feature_flags_hash: digest(&format!("features-{seed}"))?,
     })
 }
 
@@ -70,9 +73,11 @@ fn candidate(
         route,
         family: family.to_owned(),
         paid,
-        quota_admits: admits,
-        capacity_admits: admits,
-        privacy_admits: admits,
+        eligibility: RouteEligibility {
+            quota_admits: admits,
+            capacity_admits: admits,
+            privacy_admits: admits,
+        },
         evidence_ref: evidence.to_owned(),
     }
 }
@@ -214,5 +219,46 @@ fn provider_switch_denied_without_receipted_degradation() -> TestResult {
         policy_revision: "assurance-rev-1".to_owned(),
     };
     assert!(check_attempt_route_continuity(&before, &after, Some(&approval), "attempt-1").is_ok());
+    Ok(())
+}
+
+#[test]
+fn blank_evidence_identity_rejects_fail_closed() -> TestResult {
+    let policy = eliotd::staffing_policy::ModelRolePolicy::assurance(test_budget())?;
+    let writer_route = test_route("writer", "provider-a", "model-a")?;
+    let audit_route = test_route("audit", "provider-b", "model-b")?;
+    // A blank auditor family must fail closed: unknown lineage can never
+    // prove cross-family independence.
+    let evidence = vec![
+        RouteClassEvidence {
+            route_class: "bulk_implementation".to_owned(),
+            candidates: vec![candidate(
+                writer_route,
+                "family-a",
+                false,
+                true,
+                "capability-writer-1",
+            )],
+            evidence_refs: vec!["capability-writer-1".to_owned()],
+        },
+        RouteClassEvidence {
+            route_class: "independent_blind_audit".to_owned(),
+            candidates: vec![candidate(
+                audit_route,
+                "   ",
+                false,
+                true,
+                "capability-audit-1",
+            )],
+            evidence_refs: vec!["capability-audit-1".to_owned()],
+        },
+    ];
+    assert!(
+        matches!(
+            plan_staffing(&policy, "assurance-task", true, &evidence, &constraints()),
+            Err(StaffingPolicyError::Contract(_))
+        ),
+        "blank auditor lineage must reject before any lane is staffed"
+    );
     Ok(())
 }

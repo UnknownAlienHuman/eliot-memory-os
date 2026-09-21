@@ -119,23 +119,38 @@ pub struct RouteClassEvidence {
     pub evidence_refs: Vec<String>,
 }
 
+/// Quota/capacity/privacy admission for one candidate route. The three
+/// dimensions are checked together before any ranking; grouping them keeps
+/// the economic `paid` property of [`RouteCandidate`] distinct from current
+/// admission.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteEligibility {
+    /// Current quota-window admission for this route.
+    pub quota_admits: bool,
+    /// Current machine-capacity admission for this route.
+    pub capacity_admits: bool,
+    /// Whether this route admits the task privacy class.
+    pub privacy_admits: bool,
+}
+
 /// One candidate route plus the orthogonal eligibility dimensions the policy
 /// checks before any ranking.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RouteCandidate {
     pub route: RouteFingerprint,
-    /// Family/lineage used only for the independence check.
+    /// Family/lineage used only for the independence check. Must be
+    /// non-blank: an auditor candidate with unknown lineage can never prove
+    /// cross-family independence.
     pub family: String,
     /// Paid route flag: a paid fallback never silently satisfies an
     /// unavailable independent-audit requirement.
     pub paid: bool,
-    /// Current quota/capacity admission for this route.
-    pub quota_admits: bool,
-    pub capacity_admits: bool,
-    /// Whether this route admits the task privacy class.
-    pub privacy_admits: bool,
-    /// Capability evidence handle for this candidate.
+    /// Current quota/capacity/privacy admission for this route.
+    pub eligibility: RouteEligibility,
+    /// Capability evidence handle for this candidate. Must be non-blank so
+    /// the receipt binds real evidence inputs.
     pub evidence_ref: String,
 }
 
@@ -416,6 +431,7 @@ pub fn plan_staffing(
 ) -> Result<StaffingPlanReceipt, StaffingPolicyError> {
     validate_text(task_class, "task_class")?;
     policy.validate()?;
+    validate_evidence(evidence)?;
     constraints
         .budget
         .validate()
@@ -480,8 +496,21 @@ pub fn plan_staffing(
     Ok(receipt)
 }
 
+fn validate_evidence(evidence: &[RouteClassEvidence]) -> Result<(), StaffingPolicyError> {
+    for record in evidence {
+        validate_route_class(&record.route_class)?;
+        for candidate in &record.candidates {
+            validate_text(&candidate.family, "candidate family")?;
+            validate_text(&candidate.evidence_ref, "candidate evidence_ref")?;
+        }
+    }
+    Ok(())
+}
+
 fn eligible_candidate(candidate: &RouteCandidate) -> bool {
-    candidate.quota_admits && candidate.capacity_admits && candidate.privacy_admits
+    candidate.eligibility.quota_admits
+        && candidate.eligibility.capacity_admits
+        && candidate.eligibility.privacy_admits
 }
 
 fn select_writer(
@@ -516,6 +545,7 @@ fn select_independent_auditor(
     writer: &StaffedLane,
 ) -> Result<StaffedLane, String> {
     let writer_family = writer_family(evidence, writer);
+    let mut specific_reason: Option<String> = None;
     for class in &policy.auditor_route_classes {
         let Some(record) = evidence.iter().find(|item| &item.route_class == class) else {
             continue;
@@ -549,14 +579,17 @@ fn select_independent_auditor(
                 evidence_refs: vec![candidate.evidence_ref.clone()],
             });
         }
-        if saw_same_family || saw_paid_fallback {
-            return Err(
+        if (saw_same_family || saw_paid_fallback) && specific_reason.is_none() {
+            specific_reason = Some(
                 "independent audit unavailable: only same-family or paid routes offered; escalating instead of substituting"
                     .to_owned(),
             );
         }
     }
-    Err("independent audit unavailable under current capability evidence; escalating instead of substituting".to_owned())
+    Err(specific_reason.unwrap_or_else(|| {
+        "independent audit unavailable under current capability evidence; escalating instead of substituting"
+            .to_owned()
+    }))
 }
 
 fn writer_family(evidence: &[RouteClassEvidence], writer: &StaffedLane) -> String {
