@@ -8,6 +8,7 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="../../apps/Eliot.Operator/Protocol/OperatorContracts.cs" Link="Protocol/OperatorContracts.cs" />
+    <Compile Include="../../apps/Eliot.Operator/Protocol/UserAutomationContracts.cs" Link="Protocol/UserAutomationContracts.cs" />
     <Compile Include="../../apps/Eliot.Operator/Services/IGovernorClient.cs" Link="Services/IGovernorClient.cs" />
     <Compile Include="../../apps/Eliot.Operator/Services/GovernorPipeClient.cs" Link="Services/GovernorPipeClient.cs" />
     <Compile Include="../../apps/Eliot.Operator/Services/RuntimeDiscoveryService.cs" Link="Services/RuntimeDiscoveryService.cs" />

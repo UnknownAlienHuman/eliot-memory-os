@@ -17,4 +17,8 @@ public interface IGovernorClient
     Task<JsonElement> CommandAsync(
         object commandEnvelope,
         CancellationToken cancellationToken = default);
+
+    Task<JsonElement> UserAutomationAsync(
+        UserAutomationOperation operation,
+        CancellationToken cancellationToken = default);
 }

@@ -42,10 +42,11 @@ if (args.Contains("--live", StringComparer.Ordinal))
         $"LIVE_OPERATOR_OK runtime={liveSnapshot.RuntimeId} auth_generation={liveSnapshot.AuthGeneration} overview_records={livePage.Returned}");
 }
 
-Equal(13, OperatorPageCatalog.All.Count, "required page count");
-Equal(13, OperatorPageCatalog.All.Select(page => page.Tag).Distinct(StringComparer.Ordinal).Count(), "unique page tags");
+Equal(14, OperatorPageCatalog.All.Count, "required page count");
+Equal(14, OperatorPageCatalog.All.Select(page => page.Tag).Distinct(StringComparer.Ordinal).Count(), "unique page tags");
 True(OperatorPageCatalog.All.Any(page => page.Tag == "causal_provenance"), "native graph page");
 True(OperatorPageCatalog.All.Any(page => page.Tag == "query_lab"), "semantic query lab page");
+True(OperatorPageCatalog.All.Any(page => page.Tag == "user_automation"), "typed UserAutomation page");
 Equal(6, manifest.RootElement.GetProperty("schema_families").GetArrayLength(), "live schema families");
 Equal(6, manifest.RootElement.GetProperty("query_operations").GetArrayLength(), "closed query operations");
 
@@ -55,6 +56,14 @@ var viewModel = new MainViewModel(client)
     ProjectId = "00000000-0000-0000-0000-000000000001",
     TaskId = "00000000-0000-0000-0000-000000000002"
 };
+var userAutomationWire = JsonSerializer.Serialize(
+    UserAutomationOperatorRequest.Create(new UserAutomationListOperation(false)));
+True(!userAutomationWire.Contains("\"command\"", StringComparison.Ordinal), "UserAutomation has no generic command envelope");
+True(userAutomationWire.Contains("\"kind\":\"list\"", StringComparison.Ordinal), "closed UserAutomation operation kind");
+True(userAutomationWire.Contains("\"idempotency_key\"", StringComparison.Ordinal), "retry-stable UserAutomation identity");
+await viewModel.RunUserAutomationAsync();
+Equal(1, client.UserAutomationCount, "typed UserAutomation caller submitted once");
+True(client.LastUserAutomation is UserAutomationListOperation, "UserAutomation caller preserved typed operation");
 await viewModel.SelectSectionAsync("autonomy");
 Equal("autonomy", client.LastQuery?.Projection, "typed projection selection");
 Equal(1, viewModel.ItemCount, "first bounded page");
@@ -149,6 +158,8 @@ sealed class FakeGovernorClient : IGovernorClient
 
     public OperatorQueryRequest? LastQuery { get; private set; }
     public int CommandCount { get; private set; }
+    public int UserAutomationCount { get; private set; }
+    public UserAutomationOperation? LastUserAutomation { get; private set; }
     public string? LastIdempotencyKey { get; private set; }
     public bool DelayQueries { get; set; }
     public bool OmitCanonicalReceipt { get; set; }
@@ -262,5 +273,20 @@ sealed class FakeGovernorClient : IGovernorClient
             ? """{"accepted":true,"executed":true,"outcome":"canonical_mutation_committed"}"""
             : """{"accepted":true,"executed":true,"outcome":"canonical_mutation_committed","canonical_receipt":{"receipt_id":"receipt-1","write_id":"write-1"}}""");
         return Task.FromResult(document.RootElement.Clone());
+    }
+
+    public Task<JsonElement> UserAutomationAsync(
+        UserAutomationOperation operation,
+        CancellationToken cancellationToken = default)
+    {
+        operation.Validate();
+        UserAutomationCount++;
+        LastUserAutomation = operation;
+        return Task.FromResult(JsonSerializer.SerializeToElement(new
+        {
+            accepted = true,
+            executed = false,
+            outcome = "typed_user_automation_operation_admitted"
+        }));
     }
 }
