@@ -36,8 +36,9 @@ pub use resources::{
 };
 mod route_tokens;
 pub use route_tokens::{
-    MeasuredTokens, RouteTokenObservation, RouteTokenizer, UnmeasuredReason,
-    measure_tool_result_tokens, produce_route_token_observation,
+    MAX_MEASUREMENT_WIRE_BYTES, RouteTokenObservation, RouteTokenizer,
+    TOKEN_MEASUREMENT_CONTRACT_ID, TOKEN_MEASUREMENT_VERSION, TokenMeasurementPayload,
+    UnmeasuredReason, produce_route_token_observation,
 };
 mod terminal_inputs;
 pub use terminal_inputs::{
@@ -1825,57 +1826,30 @@ impl AgentBridgeCore {
         ))
     }
 
-    /// Projects one tool result into its delivery receipt with a C6
-    /// route-aware token measurement: the route-owner observation is bound to
-    /// the exact delivered bytes by [`measure_tool_result_tokens`] before the
-    /// count may enter the receipt. A missing observation, a digest mismatch,
-    /// or a malformed observation withholds projection with
-    /// [`BridgeError::UnmeasuredTokens`] or [`BridgeError::InvalidContract`];
-    /// the bridge never estimates the count. Delivery completeness stays the
-    /// owner's observed state, as with [`Self::project_tool_result`].
-    pub fn project_measured_tool_result(
-        &self,
-        result_bytes: &[u8],
-        source_handle: ResourceUri,
-        observation: Option<&RouteTokenObservation>,
-        delivery: DeliveryStatus,
-    ) -> Result<ToolResultReceipt, BridgeError> {
-        self.require_attached()?;
-        let measured = measure_tool_result_tokens(result_bytes, observation)?;
-        Ok(ToolResultReceipt::project(
-            result_bytes,
-            source_handle,
-            measured.tokens(),
-            delivery,
-        ))
-    }
-
-    /// Projects one tool result into its delivery receipt from live route
-    /// evidence: the route observation is produced into a digest-bound
-    /// measurement by [`produce_route_token_observation`] — verified against
-    /// the supplied current admission and execution binding, the exact
-    /// delivered bytes, and the matched observed route — before the count
-    /// may enter the receipt. No caller count ever enters: a route that
-    /// reports no output count withholds with
+    /// Projects one tool result into its delivery receipt from a live
+    /// measurement wire payload: the adapter's attested count passes through
+    /// byte-bound verification by [`produce_route_token_observation`] —
+    /// versioned wire, admission-linked matched route, exact delivered
+    /// bytes — before it may enter the receipt, unaltered. A missing
+    /// payload means the route supports no measurement and withholds with
     /// [`BridgeError::UnmeasuredTokens`], as do unlinked, diverged,
-    /// unobserved, or misbound observations. Delivery completeness stays
-    /// the owner's observed state, as with [`Self::project_tool_result`].
+    /// unobserved, or misbound payloads; the bridge never estimates the
+    /// count. Delivery completeness stays the owner's observed state, as
+    /// with [`Self::project_tool_result`].
     pub fn project_produced_tool_result(
         &self,
         result_bytes: &[u8],
         source_handle: ResourceUri,
-        route_observation: &eliot_agent_api::PhysicalRouteObservationReceipt,
+        payload: Option<&TokenMeasurementPayload>,
         admission: &eliot_agent_api::AdmittedRouteReceipt,
         binding: &eliot_agent_api::ProviderExecutionBinding,
         delivery: DeliveryStatus,
     ) -> Result<ToolResultReceipt, BridgeError> {
         self.require_attached()?;
-        let produced = produce_route_token_observation(
-            result_bytes,
-            route_observation,
-            admission,
-            binding,
-        )?;
+        let payload = payload.ok_or(BridgeError::UnmeasuredTokens {
+            reason: UnmeasuredReason::NoObservation,
+        })?;
+        let produced = produce_route_token_observation(result_bytes, payload, admission, binding)?;
         Ok(ToolResultReceipt::project(
             result_bytes,
             source_handle,

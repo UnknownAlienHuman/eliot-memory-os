@@ -1,23 +1,33 @@
-//! C6 route-aware token measurement for I7.24 tool-result receipts.
+//! C6 admitted-route byte-bound token measurement for I7.24 tool-result
+//! receipts (issue #1941).
 //!
 //! The bridge runs no tokenizer: no tokenizer implementation exists on the
-//! delivery path, the invocation response carries correlation and disposition
-//! only (no usage source), and I0.4 forbids assuming STU equivalence while
-//! I10.15 states that missing usage is `unknown`, never zero. Token evidence
-//! therefore arrives only through the documented route-observation channel:
-//! a [`PhysicalRouteObservationReceipt`] built by the route adapter carrying
-//! the route's own [`UsageReceipt`], admission-linked and self-digest-bound
-//! by the canonical contract.
+//! delivery path, invocation responses carry correlation and disposition
+//! only, provider turn-level usage never measures exact rendered bytes, and
+//! I0.4 forbids assuming any equivalence while I10.15 states that missing
+//! usage is `unknown`, never zero. A route-tokenizer count for exact bytes
+//! can therefore only be attested by the route owner at render time.
 //!
-//! [`produce_route_token_observation`] is the live route-owner observation
-//! producer. It verifies the observation end to end — shape plus recomputed
-//! self digest, linkage against the explicitly supplied current admission
-//! and execution binding (never trusted from the receipt alone), a matched
-//! observed route, digest-bound evidence bytes, and a reported output count
-//! — and only then yields a digest-bound [`RouteTokenObservation`]. Anything
-//! else withholds with [`UnmeasuredReason`]; the bridge never estimates,
-//! substitutes byte/STU heuristics or input/cost/quota figures, sums usage
-//! fields, or defaults a count.
+//! This module owns the versioned adapter-to-bridge measurement wire that
+//! carries such an attestation, following the bridge-core wire discipline:
+//! a contract identity plus frozen revision, I7.2 byte bounds, serde wire
+//! traits on every carried field, and admission checks re-verifiable from
+//! the bytes. [`TokenMeasurementPayload`] binds the counted bytes
+//! (`result_digest`), the attested count (`tokens`), and the canonical
+//! route observation that names the admitted route. [`decode`] verifies
+//! version, bounds, shape, and the observation's recomputed self digest;
+//! [`produce_route_token_observation`] additionally verifies the observation
+//! against the explicitly supplied current admission and execution binding
+//! (never trusted from the payload alone), a matched observed route, and
+//! digest equality with the exact bytes being receipted. Only then does the
+//! attested count pass through — unaltered, never estimated, summed, or
+//! substituted — into a digest-bound [`RouteTokenObservation`].
+//!
+//! Anything else withholds with [`UnmeasuredReason`]: no payload (the route
+//! supports no measurement), unlinked, diverged, unobserved, or misbound
+//! evidence. In particular the observation's turn-level [`UsageReceipt`]
+//! is never read as a result cost — relabelling provider usage as measured
+//! bytes would fabricate measurement the tree cannot verify.
 //!
 //! Route identity reuses the shared [`crate::RouteFingerprint`] contract.
 //! Tokenizer provenance is the validated observed route itself: the tree
@@ -27,6 +37,8 @@
 //! installed material stays with the Skill transport feed (B2 owner); this
 //! module claims no versions. There are no conversions to or from any other
 //! crate's measurement type.
+//!
+//! [`UsageReceipt`]: eliot_agent_api::UsageReceipt
 
 use eliot_agent_api::{
     AdmittedRouteReceipt, PhysicalRouteObservationReceipt, ProviderExecutionBinding,
@@ -36,6 +48,16 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{BridgeError, RouteFingerprint};
+
+/// Versioned C6 measurement wire contract identity.
+pub const TOKEN_MEASUREMENT_CONTRACT_ID: &str = "eliot.route.token-measurement/v1";
+/// Wire payload contract revision. Decode rejects any other revision; a new
+/// shape gets a NEW revision, v1 is never silently changed.
+pub const TOKEN_MEASUREMENT_VERSION: u32 = 1;
+/// Maximum encoded wire bytes (I7.2 hot-response profile: measurement
+/// attestations are small bounded projections carrying digests, never raw
+/// result bytes).
+pub const MAX_MEASUREMENT_WIRE_BYTES: usize = 64 * 1024;
 
 fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
@@ -50,6 +72,26 @@ fn validate_digest(value: &str, field: &'static str) -> Result<(), BridgeError> 
         return Err(BridgeError::InvalidContract {
             field,
             reason: "must be a lowercase SHA-256 hex digest",
+        });
+    }
+    Ok(())
+}
+
+fn check_version(version: u32) -> Result<(), BridgeError> {
+    if version != TOKEN_MEASUREMENT_VERSION {
+        return Err(BridgeError::InvalidContract {
+            field: "route_tokens.contract_version",
+            reason: "contract version mismatch",
+        });
+    }
+    Ok(())
+}
+
+fn check_bound(len: usize) -> Result<(), BridgeError> {
+    if len > MAX_MEASUREMENT_WIRE_BYTES {
+        return Err(BridgeError::InvalidContract {
+            field: "route_tokens.wire",
+            reason: "wire payload exceeds bound",
         });
     }
     Ok(())
@@ -109,11 +151,10 @@ impl RouteTokenizer {
 ///
 /// `result_digest` is the lowercase SHA-256 hex over the exact delivered
 /// bytes the count was reported for; `tokens` is the count the route's
-/// actual tokenizer reported. Values produced by
-/// [`produce_route_token_observation`] carry a fully verified provenance
-/// (admission-linked matched route plus digest-bound bytes); directly
-/// constructed values carry their constructor's attestation and must only
-/// enter the receipt path with the same verified evidence behind them.
+/// actual tokenizer reported. Values exist only via
+/// [`produce_route_token_observation`] over a verified measurement wire
+/// payload, so a receipt citing them repeats wire-bound owner evidence
+/// instead of a bridge estimate.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RouteTokenObservation {
@@ -123,28 +164,6 @@ pub struct RouteTokenObservation {
 }
 
 impl RouteTokenObservation {
-    /// Validates the tokenizer identity and digest shape.
-    ///
-    /// Digest-to-bytes binding happens in [`measure_tool_result_tokens`],
-    /// not here: an observation is only evidence for the bytes it names.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BridgeError::InvalidContract`] on the first invalid field.
-    pub fn new(
-        tokenizer: RouteTokenizer,
-        result_digest: String,
-        tokens: u64,
-    ) -> Result<Self, BridgeError> {
-        let observation = Self {
-            tokenizer,
-            result_digest,
-            tokens,
-        };
-        observation.validate()?;
-        Ok(observation)
-    }
-
     /// Validates the tokenizer identity and digest shape.
     ///
     /// # Errors
@@ -176,16 +195,94 @@ impl RouteTokenObservation {
     }
 }
 
+/// Adapter-to-bridge token measurement attestation as wire bytes.
+///
+/// Carries the route's canonical observation (which names the admitted
+/// route and stays re-verifiable from these bytes), the digest of the exact
+/// bytes the route counted, and the attested count for those bytes. The
+/// attested count is scoped to the evidenced bytes by the measurer setting
+/// `result_digest` when it counts; the bridge enforces the binding at
+/// intake and performs no arithmetic on any usage figure.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TokenMeasurementPayload {
+    /// Wire contract revision (must be [`TOKEN_MEASUREMENT_VERSION`]).
+    pub contract_version: u32,
+    /// Canonical route observation naming the admitted route.
+    pub observation: PhysicalRouteObservationReceipt,
+    /// Lowercase SHA-256 hex of the exact bytes the count was reported for.
+    pub result_digest: String,
+    /// Token count the route's actual tokenizer reported for those bytes.
+    pub tokens: u64,
+}
+
+impl TokenMeasurementPayload {
+    /// Validates version, observation shape plus recomputed self digest, and
+    /// digest shape. Admission linkage needs the live admission and binding
+    /// and runs at intake ([`produce_route_token_observation`]), not here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BridgeError::InvalidContract`] on the first invalid field.
+    pub fn validate(&self) -> Result<(), BridgeError> {
+        check_version(self.contract_version)?;
+        self.observation
+            .validate()
+            .map_err(|_| BridgeError::InvalidContract {
+                field: "route_tokens.observation",
+                reason: "route observation invalid",
+            })?;
+        validate_digest(&self.result_digest, "route_tokens.result_digest")?;
+        Ok(())
+    }
+
+    /// Encodes a validated attestation within the wire bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BridgeError::InvalidContract`] when validation fails, the
+    /// shape does not serialize, or the encoding exceeds the bound.
+    pub fn encode(&self) -> Result<Vec<u8>, BridgeError> {
+        self.validate()?;
+        let bytes = serde_json::to_vec(self).map_err(|_| BridgeError::InvalidContract {
+            field: "route_tokens.wire",
+            reason: "wire payload shape invalid",
+        })?;
+        check_bound(bytes.len())?;
+        Ok(bytes)
+    }
+
+    /// Decodes and validates one attestation within the wire bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BridgeError::InvalidContract`] when the bound, shape,
+    /// version, observation, or digest checks fail.
+    pub fn decode(bytes: &[u8]) -> Result<Self, BridgeError> {
+        check_bound(bytes.len())?;
+        let payload: Self =
+            serde_json::from_slice(bytes).map_err(|_| BridgeError::InvalidContract {
+                field: "route_tokens.wire",
+                reason: "wire payload shape invalid",
+            })?;
+        payload.validate()?;
+        Ok(payload)
+    }
+}
+
 /// Why a tool result carries no measured token cost.
 ///
 /// Every variant withholds receipt projection: missing or inapplicable
-/// evidence denies the receipt instead of estimating a count.
+/// evidence denies the receipt instead of estimating a count. A route that
+/// emits no measurement payload reports nothing, and nothing is its honest
+/// state — absence is never a zero.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UnmeasuredReason {
-    /// The route owner supplied no token observation for the result.
+    /// The route owner emitted no measurement payload: the route supports
+    /// no measurement on this delivery.
     NoObservation,
-    /// The observation names different bytes, so its count must not be
-    /// attributed to this result. A missing evidence binding withholds the
+    /// The attested evidence names different bytes, so its count must not
+    /// be attributed to this result. Missing evidence binding withholds the
     /// same way: unattributed counts never enter a receipt.
     DigestMismatch,
     /// The observation is not linked to the supplied current admission and
@@ -197,132 +294,55 @@ pub enum UnmeasuredReason {
     /// The route was not observed (or no observed route is recorded), so
     /// there is no route to attribute a count to.
     RouteUnobserved,
-    /// The route observation reports no output count: the route supports no
-    /// measurement on this delivery. Unknown stays unknown — input, cost,
-    /// and quota figures are never substituted.
-    UsageUnknown,
 }
 
 impl std::fmt::Display for UnmeasuredReason {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let reason = match self {
-            Self::NoObservation => "no route-owner token observation supplied",
-            Self::DigestMismatch => "token observation evidence does not match delivered bytes",
-            Self::AdmissionMismatch => "token observation is not linked to the current admission",
+            Self::NoObservation => "no route-owner measurement payload emitted",
+            Self::DigestMismatch => "measurement evidence does not match delivered bytes",
+            Self::AdmissionMismatch => "measurement is not linked to the current admission",
             Self::RouteDiverged => "observed route diverged from the admitted route",
             Self::RouteUnobserved => "route was not observed",
-            Self::UsageUnknown => "route observation reports no output count",
         };
         formatter.write_str(reason)
     }
 }
 
-/// Digest-bound token cost measured under the route's actual tokenizer.
+/// Produces a digest-bound token observation from a measurement wire payload.
 ///
-/// Values exist only when [`measure_tool_result_tokens`] or
-/// [`produce_route_token_observation`] verified the observation against the
-/// exact delivered bytes, so a receipt citing them repeats owner-observed
-/// evidence instead of a bridge estimate.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MeasuredTokens {
-    tokens: u64,
-    route: RouteFingerprint,
-    result_digest: String,
-}
-
-impl MeasuredTokens {
-    /// Token count the route's actual tokenizer reported for the receipted bytes.
-    #[must_use]
-    pub const fn tokens(&self) -> u64 {
-        self.tokens
-    }
-
-    /// Validated observed route whose tokenizer ran the count.
-    #[must_use]
-    pub const fn route(&self) -> &RouteFingerprint {
-        &self.route
-    }
-
-    /// Lowercase SHA-256 hex of the exact delivered bytes that were measured.
-    #[must_use]
-    pub fn result_digest(&self) -> &str {
-        &self.result_digest
-    }
-}
-
-/// Binds a route-owner token observation to the exact delivered bytes.
-///
-/// A `None` observation withholds with [`UnmeasuredReason::NoObservation`];
-/// an observation whose digest does not equal the SHA-256 of `result_bytes`
-/// withholds with [`UnmeasuredReason::DigestMismatch`]. Only a validated
-/// observation naming exactly these bytes yields [`MeasuredTokens`].
-///
-/// # Errors
-///
-/// Returns [`BridgeError::UnmeasuredTokens`] when no usable observation
-/// exists, or [`BridgeError::InvalidContract`] when the supplied observation
-/// itself is malformed.
-pub fn measure_tool_result_tokens(
-    result_bytes: &[u8],
-    observation: Option<&RouteTokenObservation>,
-) -> Result<MeasuredTokens, BridgeError> {
-    let observation = observation.ok_or(BridgeError::UnmeasuredTokens {
-        reason: UnmeasuredReason::NoObservation,
-    })?;
-    observation.validate()?;
-    let actual_digest = sha256_hex(result_bytes);
-    if actual_digest != observation.result_digest {
-        return Err(BridgeError::UnmeasuredTokens {
-            reason: UnmeasuredReason::DigestMismatch,
-        });
-    }
-    Ok(MeasuredTokens {
-        tokens: observation.tokens(),
-        route: observation.tokenizer().route().clone(),
-        result_digest: actual_digest,
-    })
-}
-
-/// Produces a digest-bound token observation from a live route observation.
-///
-/// The live route-owner observation producer: every field of the yielded
-/// observation is sourced from verified route evidence, never from caller
-/// counts or invented tokenizer names —
-/// * the observation receipt must be well-formed with a recomputed self
-///   digest, else [`BridgeError::InvalidContract`];
-/// * the receipt must link against the explicitly supplied current
-///   admission and execution binding via the canonical
+/// The live route-owner observation producer: the yielded count passes
+/// through byte-bound verification unaltered —
+/// * the payload must be well-formed (version, bounds, observation shape
+///   plus recomputed self digest, digest shape), else
+///   [`BridgeError::InvalidContract`];
+/// * the embedded observation must link against the explicitly supplied
+///   current admission and execution binding via the canonical
 ///   `validate_against`, else [`UnmeasuredReason::AdmissionMismatch`]
-///   (the receipt's embedded digest is never trusted alone);
+///   (the payload's embedded digest is never trusted alone);
 /// * the route must be matched with a recorded observed route, else
 ///   [`UnmeasuredReason::RouteDiverged`] or
 ///   [`UnmeasuredReason::RouteUnobserved`];
-/// * the receipt's digest-bound evidence must name exactly `result_bytes`,
-///   else [`UnmeasuredReason::DigestMismatch`];
-/// * the receipt must report an output count, else
-///   [`UnmeasuredReason::UsageUnknown`]. The output count is the route's
-///   rendered-output quantity under its own tokenizer (route-completion
-///   semantics); input, cost, and quota figures are never substituted,
-///   summed, or overridden.
+/// * the attested evidence digest must equal the SHA-256 of `result_bytes`
+///   — and the embedded observation's own evidence digest, when present,
+///   must agree — else [`UnmeasuredReason::DigestMismatch`].
+///
+/// The observation's turn-level usage is never read: provider usage does not
+/// measure exact rendered bytes, and relabelling it would fabricate
+/// measurement.
 ///
 /// # Errors
 ///
-/// Returns [`BridgeError::InvalidContract`] for malformed observation,
+/// Returns [`BridgeError::InvalidContract`] for malformed payload,
 /// admission, or binding inputs, or [`BridgeError::UnmeasuredTokens`] when
 /// the evidence does not support a measurement.
 pub fn produce_route_token_observation(
     result_bytes: &[u8],
-    route_observation: &PhysicalRouteObservationReceipt,
+    payload: &TokenMeasurementPayload,
     admission: &AdmittedRouteReceipt,
     binding: &ProviderExecutionBinding,
 ) -> Result<RouteTokenObservation, BridgeError> {
-    route_observation
-        .validate()
-        .map_err(|_| BridgeError::InvalidContract {
-            field: "route_tokens.route_observation",
-            reason: "route observation invalid",
-        })?;
+    payload.validate()?;
     admission
         .validate()
         .map_err(|_| BridgeError::InvalidContract {
@@ -335,12 +355,13 @@ pub fn produce_route_token_observation(
             field: "route_tokens.binding",
             reason: "execution binding invalid",
         })?;
-    route_observation
+    let observation = &payload.observation;
+    observation
         .validate_against(binding, admission)
         .map_err(|_| BridgeError::UnmeasuredTokens {
             reason: UnmeasuredReason::AdmissionMismatch,
         })?;
-    match route_observation.route_state {
+    match observation.route_state {
         RouteObservationState::Matched => {}
         RouteObservationState::Diverged => {
             return Err(BridgeError::UnmeasuredTokens {
@@ -353,34 +374,32 @@ pub fn produce_route_token_observation(
             });
         }
     }
-    let observed =
-        route_observation
-            .observed_route
-            .as_ref()
-            .ok_or(BridgeError::UnmeasuredTokens {
-                reason: UnmeasuredReason::RouteUnobserved,
-            })?;
-    let actual_digest = sha256_hex(result_bytes);
-    let evidence_matches = route_observation
-        .raw_evidence_digest
+    let observed = observation
+        .observed_route
         .as_ref()
-        .is_some_and(|digest| digest.as_str() == actual_digest);
-    if !evidence_matches {
+        .ok_or(BridgeError::UnmeasuredTokens {
+            reason: UnmeasuredReason::RouteUnobserved,
+        })?;
+    let actual_digest = sha256_hex(result_bytes);
+    if payload.result_digest != actual_digest {
         return Err(BridgeError::UnmeasuredTokens {
             reason: UnmeasuredReason::DigestMismatch,
         });
     }
-    let tokens = route_observation
-        .usage
-        .output_tokens
-        .ok_or(BridgeError::UnmeasuredTokens {
-            reason: UnmeasuredReason::UsageUnknown,
-        })?;
-    RouteTokenObservation::new(
-        RouteTokenizer {
+    if let Some(bound) = observation.raw_evidence_digest.as_ref()
+        && bound.as_str() != actual_digest
+    {
+        return Err(BridgeError::UnmeasuredTokens {
+            reason: UnmeasuredReason::DigestMismatch,
+        });
+    }
+    let produced = RouteTokenObservation {
+        tokenizer: RouteTokenizer {
             route: observed.clone(),
         },
-        actual_digest,
-        tokens,
-    )
+        result_digest: actual_digest,
+        tokens: payload.tokens,
+    };
+    produced.validate()?;
+    Ok(produced)
 }

@@ -1,7 +1,8 @@
-//! C6 route-aware token measurement proof: a live route observation
-//! receipt — self-digest-bound, admission-linked, evidence-bound — produces
-//! exact costs into tool-result receipts, while unlinked, diverged,
-//! unobserved, misbound, or count-less evidence withholds honestly.
+//! C6 admitted-route byte-bound token measurement proof: an attested
+//! count passes through the versioned measurement wire unaltered only under
+//! full verification (version, bounds, self digest, admission linkage,
+//! matched route, exact evidence bytes); every missing axis withholds
+//! honestly, and a route that emits nothing stays unavailable.
 
 use eliot_agent_api::{
     AdmittedRouteReceipt, CONTRACT_VERSION, CandidateSelectionDisposition, ClockReading,
@@ -13,8 +14,9 @@ use eliot_agent_api::{
 use eliot_agent_bridge_core::{
     ActivationPortOutcome, ActivationPortResult, AgentBridgeCore, AttachRequest, BridgeError,
     ConnectionId, CursorPolicy, DeliveryStatus, DemandId, Generation, HostActivationPort,
-    PrincipalId, ProviderFailure, ProviderReadiness, ResourceUri, RouteFingerprint, SessionId,
-    TaskId, UnmeasuredReason, WorkUnitId,
+    MAX_MEASUREMENT_WIRE_BYTES, PrincipalId, ProviderFailure, ProviderReadiness, ResourceUri,
+    RouteFingerprint, SessionId, TOKEN_MEASUREMENT_VERSION, TaskId, TokenMeasurementPayload,
+    UnmeasuredReason, WorkUnitId,
 };
 use eliot_contracts::{EpochId, EpochLineageId};
 use serde_json::json;
@@ -198,8 +200,6 @@ fn observation(
     state: RouteObservationState,
     observed: Option<RouteFingerprint>,
     evidence_digest: Option<String>,
-    output_tokens: Option<u64>,
-    input_tokens: Option<u64>,
 ) -> Result<PhysicalRouteObservationReceipt, Box<dyn std::error::Error>> {
     let (diverged_fields, unobserved_reason, recovery_ref) = match state {
         RouteObservationState::Matched => (Vec::new(), None, None),
@@ -244,9 +244,11 @@ fn observation(
         translation_digest: None,
         raw_evidence_digest,
         raw_evidence_ref,
+        // Turn-level usage is the adapter's own record and is never read as
+        // a result cost: the wire attestation below carries the count.
         usage: UsageReceipt {
-            input_tokens,
-            output_tokens,
+            input_tokens: Some(10),
+            output_tokens: Some(99),
             cost_microunits: None,
             quota: eliot_agent_api::QuotaKnowledge::Unknown,
         },
@@ -281,6 +283,28 @@ fn observation(
     Ok(receipt)
 }
 
+fn payload(
+    route: &RouteFingerprint,
+    binding: &ProviderExecutionBinding,
+    admission: &AdmittedRouteReceipt,
+    state: RouteObservationState,
+    observed: Option<RouteFingerprint>,
+    evidence_digest: Option<String>,
+    tokens: u64,
+) -> Result<TokenMeasurementPayload, Box<dyn std::error::Error>> {
+    let seen = observation(route, binding, admission, state, observed, evidence_digest)?;
+    let result_digest = seen.raw_evidence_digest.as_ref().map_or_else(
+        || sha256_hex(b"no-evidence-bound"),
+        |bound| bound.as_str().to_owned(),
+    );
+    Ok(TokenMeasurementPayload {
+        contract_version: TOKEN_MEASUREMENT_VERSION,
+        observation: seen,
+        result_digest,
+        tokens,
+    })
+}
+
 fn live_set() -> Result<
     (
         RouteFingerprint,
@@ -298,30 +322,35 @@ fn live_set() -> Result<
 }
 
 #[test]
-fn produced_full_tool_result_projects_route_observed_output_count() -> TestResult {
+fn wire_round_trip_projects_attested_count_unaltered() -> TestResult {
     let bridge = bridge(true)?;
     let (route, _fence, bound, admitted) = live_set()?;
     let result_bytes = b"exact delivered tool result bytes";
-    let seen = observation(
+    let seen = payload(
         &route,
         &bound,
         &admitted,
         RouteObservationState::Matched,
         Some(route.clone()),
         Some(sha256_hex(result_bytes)),
-        Some(20),
-        Some(10),
+        20,
     )?;
+    assert_eq!(seen.observation.usage.output_tokens, Some(99));
+    let wire = seen.encode()?;
+    assert!(wire.len() <= MAX_MEASUREMENT_WIRE_BYTES);
+    let decoded = TokenMeasurementPayload::decode(&wire)?;
 
     let receipt = bridge.project_produced_tool_result(
         result_bytes,
         ResourceUri::parse("eliot://evidence/source")?,
-        &seen,
+        Some(&decoded),
         &admitted,
         &bound,
         DeliveryStatus::Full,
     )?;
 
+    // The attested count (20) passes through unaltered: the receipt's
+    // turn-level usage (99) is never substituted, summed, or read.
     assert_eq!(receipt.tokens_rendered(), 20);
     assert_eq!(receipt.result_digest(), sha256_hex(result_bytes));
     assert_eq!(receipt.bytes_rendered(), result_bytes.len());
@@ -334,21 +363,20 @@ fn produced_truncated_tool_result_keeps_cost_but_fails_evidence_gate() -> TestRe
     let bridge = bridge(true)?;
     let (route, _fence, bound, admitted) = live_set()?;
     let result_bytes = b"truncated delivered tool result bytes";
-    let seen = observation(
+    let seen = payload(
         &route,
         &bound,
         &admitted,
         RouteObservationState::Matched,
         Some(route.clone()),
         Some(sha256_hex(result_bytes)),
-        Some(17),
-        None,
+        17,
     )?;
 
     let receipt = bridge.project_produced_tool_result(
         result_bytes,
         ResourceUri::parse("eliot://evidence/source")?,
-        &seen,
+        Some(&seen),
         &admitted,
         &bound,
         DeliveryStatus::Truncated,
@@ -365,59 +393,25 @@ fn produced_truncated_tool_result_keeps_cost_but_fails_evidence_gate() -> TestRe
 }
 
 #[test]
-fn count_less_observation_withholds_despite_reported_input() -> TestResult {
+fn tampered_evidence_digest_withholds_without_misattribution() -> TestResult {
     let bridge = bridge(true)?;
     let (route, _fence, bound, admitted) = live_set()?;
-    let result_bytes = b"result bytes the route never counted";
-    let seen = observation(
+    let result_bytes = b"these exact bytes were delivered";
+    let mut seen = payload(
         &route,
         &bound,
         &admitted,
         RouteObservationState::Matched,
         Some(route.clone()),
         Some(sha256_hex(result_bytes)),
-        None,
-        Some(10),
+        99,
     )?;
+    seen.result_digest = sha256_hex(b"different bytes were evidenced");
 
     let withheld = bridge.project_produced_tool_result(
         result_bytes,
         ResourceUri::parse("eliot://evidence/source")?,
-        &seen,
-        &admitted,
-        &bound,
-        DeliveryStatus::Full,
-    );
-
-    assert!(matches!(
-        withheld,
-        Err(BridgeError::UnmeasuredTokens {
-            reason: UnmeasuredReason::UsageUnknown
-        })
-    ));
-    Ok(())
-}
-
-#[test]
-fn evidence_for_other_bytes_withholds_without_misattribution() -> TestResult {
-    let bridge = bridge(true)?;
-    let (route, _fence, bound, admitted) = live_set()?;
-    let result_bytes = b"these exact bytes were delivered";
-    let seen = observation(
-        &route,
-        &bound,
-        &admitted,
-        RouteObservationState::Matched,
-        Some(route.clone()),
-        Some(sha256_hex(b"different bytes were evidenced")),
-        Some(99),
-        None,
-    )?;
-
-    let withheld = bridge.project_produced_tool_result(
-        result_bytes,
-        ResourceUri::parse("eliot://evidence/source")?,
-        &seen,
+        Some(&seen),
         &admitted,
         &bound,
         DeliveryStatus::Full,
@@ -433,25 +427,88 @@ fn evidence_for_other_bytes_withholds_without_misattribution() -> TestResult {
 }
 
 #[test]
-fn unobserved_route_withholds_despite_reported_count() -> TestResult {
+fn other_bytes_withhold_against_honest_evidence() -> TestResult {
+    let bridge = bridge(true)?;
+    let (route, _fence, bound, admitted) = live_set()?;
+    let seen = payload(
+        &route,
+        &bound,
+        &admitted,
+        RouteObservationState::Matched,
+        Some(route.clone()),
+        Some(sha256_hex(b"evidenced bytes")),
+        99,
+    )?;
+
+    let withheld = bridge.project_produced_tool_result(
+        b"different delivered bytes",
+        ResourceUri::parse("eliot://evidence/source")?,
+        Some(&seen),
+        &admitted,
+        &bound,
+        DeliveryStatus::Full,
+    );
+
+    assert!(matches!(
+        withheld,
+        Err(BridgeError::UnmeasuredTokens {
+            reason: UnmeasuredReason::DigestMismatch
+        })
+    ));
+    Ok(())
+}
+
+#[test]
+fn wrong_wire_version_is_rejected_at_decode() -> TestResult {
+    let (route, _fence, bound, admitted) = live_set()?;
+    let result_bytes = b"exact delivered tool result bytes";
+    let mut seen = payload(
+        &route,
+        &bound,
+        &admitted,
+        RouteObservationState::Matched,
+        Some(route.clone()),
+        Some(sha256_hex(result_bytes)),
+        20,
+    )?;
+    seen.contract_version = TOKEN_MEASUREMENT_VERSION + 1;
+    let wire = serde_json::to_vec(&seen)?;
+
+    let rejected = TokenMeasurementPayload::decode(&wire);
+
+    assert!(matches!(rejected, Err(BridgeError::InvalidContract { .. })));
+    Ok(())
+}
+
+#[test]
+fn oversize_wire_is_rejected_before_parsing() -> TestResult {
+    let big = vec![0u8; MAX_MEASUREMENT_WIRE_BYTES + 1];
+
+    let rejected = TokenMeasurementPayload::decode(&big);
+
+    assert!(matches!(rejected, Err(BridgeError::InvalidContract { .. })));
+    Ok(())
+}
+
+#[test]
+fn unobserved_route_withholds_despite_attested_count() -> TestResult {
     let bridge = bridge(true)?;
     let (route, _fence, bound, admitted) = live_set()?;
     let result_bytes = b"result bytes with no observed route";
-    let seen = observation(
+    let seen = payload(
         &route,
         &bound,
         &admitted,
         RouteObservationState::Unobserved,
         None,
         Some(sha256_hex(result_bytes)),
-        Some(30),
-        None,
+        30,
     )?;
 
     let withheld = bridge.project_produced_tool_result(
         result_bytes,
         ResourceUri::parse("eliot://evidence/source")?,
-        &seen,
+        Some(&seen),
         &admitted,
         &bound,
         DeliveryStatus::Full,
@@ -467,27 +524,26 @@ fn unobserved_route_withholds_despite_reported_count() -> TestResult {
 }
 
 #[test]
-fn diverged_route_withholds_despite_reported_count() -> TestResult {
+fn diverged_route_withholds_despite_attested_count() -> TestResult {
     let bridge = bridge(true)?;
     let (route, _fence, bound, admitted) = live_set()?;
     let mut other = route.clone();
     other.model = "other-model".to_owned();
     let result_bytes = b"result bytes from a diverged route";
-    let seen = observation(
+    let seen = payload(
         &route,
         &bound,
         &admitted,
         RouteObservationState::Diverged,
         Some(other),
         Some(sha256_hex(result_bytes)),
-        Some(30),
-        None,
+        30,
     )?;
 
     let withheld = bridge.project_produced_tool_result(
         result_bytes,
         ResourceUri::parse("eliot://evidence/source")?,
-        &seen,
+        Some(&seen),
         &admitted,
         &bound,
         DeliveryStatus::Full,
@@ -512,21 +568,20 @@ fn observation_for_another_admission_withholds() -> TestResult {
         other_admission.self_digest.as_str()
     );
     let result_bytes = b"result bytes bound to the first admission";
-    let seen = observation(
+    let seen = payload(
         &route,
         &bound,
         &admitted,
         RouteObservationState::Matched,
         Some(route.clone()),
         Some(sha256_hex(result_bytes)),
-        Some(20),
-        None,
+        20,
     )?;
 
     let withheld = bridge.project_produced_tool_result(
         result_bytes,
         ResourceUri::parse("eliot://evidence/source")?,
-        &seen,
+        Some(&seen),
         &other_admission,
         &bound,
         DeliveryStatus::Full,
@@ -542,25 +597,48 @@ fn observation_for_another_admission_withholds() -> TestResult {
 }
 
 #[test]
-fn detached_core_denies_even_admission_linked_production() -> TestResult {
+fn missing_payload_is_honest_unavailable_not_zero() -> TestResult {
+    let bridge = bridge(true)?;
+    let (_route, _fence, bound, admitted) = live_set()?;
+    let result_bytes = b"result bytes the route never measured";
+
+    let withheld = bridge.project_produced_tool_result(
+        result_bytes,
+        ResourceUri::parse("eliot://evidence/source")?,
+        None,
+        &admitted,
+        &bound,
+        DeliveryStatus::Full,
+    );
+
+    assert!(matches!(
+        withheld,
+        Err(BridgeError::UnmeasuredTokens {
+            reason: UnmeasuredReason::NoObservation
+        })
+    ));
+    Ok(())
+}
+
+#[test]
+fn detached_core_denies_even_wire_bound_production() -> TestResult {
     let bridge = bridge(false)?;
     let (route, _fence, bound, admitted) = live_set()?;
     let result_bytes = b"exact delivered tool result bytes";
-    let seen = observation(
+    let seen = payload(
         &route,
         &bound,
         &admitted,
         RouteObservationState::Matched,
         Some(route.clone()),
         Some(sha256_hex(result_bytes)),
-        Some(20),
-        None,
+        20,
     )?;
 
     let denied = bridge.project_produced_tool_result(
         result_bytes,
         ResourceUri::parse("eliot://evidence/source")?,
-        &seen,
+        Some(&seen),
         &admitted,
         &bound,
         DeliveryStatus::Full,
@@ -571,28 +649,7 @@ fn detached_core_denies_even_admission_linked_production() -> TestResult {
 }
 
 #[test]
-fn retained_caller_still_projects_digest_bound_owner_observation() -> TestResult {
-    use eliot_agent_bridge_core::{RouteTokenObservation, RouteTokenizer};
-    let bridge = bridge(true)?;
-    let route = test_route()?;
-    let result_bytes = b"owner-attested result bytes";
-    let observation =
-        RouteTokenObservation::new(RouteTokenizer::new(route)?, sha256_hex(result_bytes), 7)?;
-
-    let receipt = bridge.project_measured_tool_result(
-        result_bytes,
-        ResourceUri::parse("eliot://evidence/source")?,
-        Some(&observation),
-        DeliveryStatus::Full,
-    )?;
-
-    assert_eq!(receipt.tokens_rendered(), 7);
-    assert!(receipt.check_complete_evidence().is_ok());
-    Ok(())
-}
-
-#[test]
-fn invalid_route_identity_is_rejected_before_observation() -> TestResult {
+fn invalid_route_identity_is_rejected_before_attestation() -> TestResult {
     use eliot_agent_bridge_core::RouteTokenizer;
     let mut route = test_route()?;
     route.provider = "   ".to_owned();
