@@ -256,10 +256,14 @@ pub fn help_text() -> String {
          argv, stdin, or environment; admission arrives only via the authenticated Kernel\n\
          channel. Diagnose-only admissions never execute. Crash after intent but before\n\
          receipt stays UNKNOWN_EFFECT_OUTCOME; blind retry is forbidden.\n\
-         integration <profile> is a read-only coverage check (expected file hashes,\n\
-         active registrations, observed hook events, handshake); verification\n\
-         mismatches report inside the JSON document with exit 0, installed and live\n\
-         kept separate, while malformed input exits 2.\n\
+         integration <profile> is a read-only limited check: it re-hashes the\n\
+         named target files and compares caller-supplied records without\n\
+         granting them authority. Registrations, hook events, and the\n\
+         handshake have no observation port (PLAN_GAP pending A-06 provider\n\
+         injection): the report carries file-hash evidence plus explicit\n\
+         unverified gaps and never claims installed or live. Verification\n\
+         mismatches report inside the JSON document with exit 0; malformed\n\
+         input exits 2.\n\
          exit 0: diagnosed/cancelled/escalated without effect (never a repair claim)\n\
          exit 10: effect completed, pending independent verification\n\
          exit 11: effect failed; 12: partial; 13: unknown effect outcome; 14: reconciling\n\

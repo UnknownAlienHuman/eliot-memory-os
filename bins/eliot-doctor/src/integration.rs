@@ -32,18 +32,27 @@ pub struct IntegrationExpectation {
 }
 
 /// Observed integration state supplied by the caller for verification.
+///
+/// Every field below is a caller claim, not evidence. The verification gate
+/// re-hashes the named target files itself and never trusts these values for
+/// any verdict; there is no observation port for registrations, hook events,
+/// or the handshake in this front door.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct IntegrationObservation {
-    /// Actual lowercase SHA-256 hex per file path.
+    /// Claimed lowercase SHA-256 hex per file path. Superseded by real
+    /// readback inside [`verify_profile`]; never authority.
     #[serde(default)]
     pub actual_file_hashes: BTreeMap<String, String>,
-    /// Registrations currently active.
+    /// Claimed active registrations. No observation port exists; never
+    /// authority.
     #[serde(default)]
     pub active_registrations: Vec<String>,
-    /// Hook events observed so far.
+    /// Claimed observed hook events. No observation port exists; never
+    /// authority.
     #[serde(default)]
     pub observed_hook_events: Vec<String>,
-    /// Whether the runtime handshake was observed.
+    /// Claimed handshake result. No handshake runner exists in this front
+    /// door; never authority and never sufficient for a live claim.
     #[serde(default)]
     pub handshake_ok: bool,
 }
@@ -76,7 +85,13 @@ pub struct IntegrationReport {
     pub installed: bool,
     /// Install surface plus live handshake.
     pub live: bool,
-    /// `LIVE`, `INSTALLED_NOT_LIVE`, or `NOT_INSTALLED`.
+    /// `UNVERIFIED_PLAN_GAP`, or `NOT_INSTALLED`.
+    ///
+    /// `LIVE` and `INSTALLED_NOT_LIVE` are computed by the explicitly
+    /// limited [`evaluate`] comparison only; the authoritative
+    /// [`verify_profile`] gate never emits them because the registration,
+    /// hook-event, and handshake observation ports are absent (PLAN_GAP
+    /// pending A-06 provider injection).
     pub disposition: String,
 }
 
@@ -167,6 +182,11 @@ fn missing_subset(expected: &[String], actual: &[String]) -> Vec<String> {
 
 /// Evaluates one profile: static install checks first, then the liveness
 /// handshake. Installed without handshake is not live.
+///
+/// Explicitly limited, non-authoritative pure comparison: both inputs are
+/// caller-supplied records, so this function establishes no installation or
+/// liveness fact. Only [`verify_profile`] issues verdicts, and only from
+/// real file readback plus explicit unverified gaps.
 #[must_use]
 pub fn evaluate(
     profile: &str,
@@ -222,6 +242,15 @@ pub fn evaluate(
 /// machine-readable contract JSON. Verification mismatches are data inside
 /// the returned JSON; only input errors (including a cross-profile
 /// expectation record) are `Err`.
+///
+/// Authority rule: file hashes come from real readback — every named target
+/// is re-hashed here and the caller-supplied `actual_file_hashes` map never
+/// enters the verdict. There is no observation port for registrations, hook
+/// events, or the handshake in this front door (PLAN_GAP pending A-06
+/// provider injection), so caller-supplied lists and booleans are capped to
+/// unverified and `installed`/`live` stay `false`:
+/// `UNVERIFIED_PLAN_GAP` when the read-back hashes match, `NOT_INSTALLED`
+/// otherwise. A forged `handshake_ok: true` can never yield a live verdict.
 pub fn verify_profile(
     profile: &str,
     expectation_path: &Path,
@@ -237,8 +266,40 @@ pub fn verify_profile(
             carried: expected.profile,
         });
     }
-    let observed = load_observation(observation_path)?;
-    Ok(report_json(&evaluate(profile, &expected, &observed)))
+    // Loaded for shape validation only; none of its claims are authority.
+    let _supplied = load_observation(observation_path)?;
+    // Real readback. Non-absolute targets cannot be observed without
+    // inferring from the current directory, and unreadable targets have no
+    // evidence: both stay absent from the map, which records them as gaps.
+    let mut observed_actuals: BTreeMap<String, String> = BTreeMap::new();
+    for path in expected.expected_file_hashes.keys() {
+        let target = Path::new(path);
+        if !target.is_absolute() {
+            continue;
+        }
+        if let Ok(digest) = hash_file(target) {
+            observed_actuals.insert(path.clone(), digest);
+        }
+    }
+    let capped = IntegrationObservation {
+        actual_file_hashes: observed_actuals,
+        active_registrations: Vec::new(),
+        observed_hook_events: Vec::new(),
+        handshake_ok: false,
+    };
+    let mut report = evaluate(profile, &expected, &capped);
+    // Authority cap: this front door observes file bytes only. Registration,
+    // hook-event, and handshake ports are absent, so no verdict here may
+    // claim installed or live, whatever the caller supplied.
+    report.installed = false;
+    report.live = false;
+    report.disposition = if report.file_hash_ok {
+        "UNVERIFIED_PLAN_GAP"
+    } else {
+        "NOT_INSTALLED"
+    }
+    .to_owned();
+    Ok(report_json(&report))
 }
 
 /// Projects the report to the machine-readable contract JSON, keeping
@@ -267,7 +328,7 @@ pub fn report_json(report: &IntegrationReport) -> serde_json::Value {
         "installed": report.installed,
         "live": report.live,
         "disposition": report.disposition,
-        "note": "installed without handshake is not live",
+        "note": "file hashes re-read from the named targets; registrations, hook events, and the handshake have no observation port (PLAN_GAP pending A-06): installed and live are never granted here",
     })
 }
 
@@ -279,6 +340,7 @@ pub fn report_json(report: &IntegrationReport) -> serde_json::Value {
 )]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn expectation() -> IntegrationExpectation {
         IntegrationExpectation {
@@ -332,8 +394,135 @@ mod tests {
         assert_eq!(report.disposition, "NOT_INSTALLED");
     }
 
+    fn profile_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("eliot-go19-1964-{tag}"));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    fn write_profile_docs(
+        dir: &Path,
+        expected_hashes: &BTreeMap<String, String>,
+        supplied_actuals: &BTreeMap<String, String>,
+        handshake_ok: bool,
+    ) -> (PathBuf, PathBuf) {
+        let expectation = IntegrationExpectation {
+            profile: "demo".to_owned(),
+            expected_file_hashes: expected_hashes.clone(),
+            expected_registrations: vec!["demo-mcp".to_owned()],
+            expected_hook_events: vec!["on_task".to_owned()],
+        };
+        let observation = IntegrationObservation {
+            actual_file_hashes: supplied_actuals.clone(),
+            active_registrations: vec!["demo-mcp".to_owned()],
+            observed_hook_events: vec!["on_task".to_owned()],
+            handshake_ok,
+        };
+        let expectation_path = dir.join("expectation.json");
+        let observation_path = dir.join("observation.json");
+        std::fs::write(
+            &expectation_path,
+            serde_json::to_vec(&expectation).expect("write expectation"),
+        )
+        .expect("write expectation file");
+        std::fs::write(
+            &observation_path,
+            serde_json::to_vec(&observation).expect("write observation"),
+        )
+        .expect("write observation file");
+        (expectation_path, observation_path)
+    }
+
     #[test]
-    fn cross_profile_expectation_is_rejected_not_live() {
+    fn cross_profile_expectation_is_rejected() {
+        let dir = profile_dir("profile-mismatch");
+        let (expectation_path, observation_path) =
+            write_profile_docs(&dir, &BTreeMap::new(), &BTreeMap::new(), true);
+        let error = verify_profile("other", &expectation_path, &observation_path)
+            .expect_err("cross-profile expectation must not verify");
+        assert!(matches!(error, IntegrationError::ProfileMismatch { .. }));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn forged_supplied_observation_cannot_yield_live() {
+        // Real target exists; every supplied record agrees, including a
+        // forged handshake. Readback confirms the bytes, but no authority
+        // exists for registrations, hook events, or liveness.
+        let dir = profile_dir("forged-live");
+        let target = dir.join("config.json");
+        std::fs::write(&target, b"{\"bridge\":\"demo\"}").expect("write target");
+        let digest = eliot_contracts::sha256_hex(b"{\"bridge\":\"demo\"}");
+        let expected = BTreeMap::from([(target.display().to_string(), digest.clone())]);
+        let supplied = BTreeMap::from([(target.display().to_string(), digest)]);
+        let (expectation_path, observation_path) =
+            write_profile_docs(&dir, &expected, &supplied, true);
+        let value = verify_profile("demo", &expectation_path, &observation_path)
+            .expect("gate runs on well-formed inputs");
+        assert_eq!(value["file_hash"]["ok"], true);
+        assert_eq!(value["handshake"]["ok"], false);
+        assert_eq!(value["installed"], false);
+        assert_eq!(value["live"], false);
+        assert_eq!(value["disposition"], "UNVERIFIED_PLAN_GAP");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn readback_overrides_supplied_hash_claims() {
+        // Supplied actuals disagree with reality in both directions: a forged
+        // mismatch must not fail a matching file, and an agreeing forgery
+        // must not pass a differing file.
+        let dir = profile_dir("readback-wins");
+        let target = dir.join("config.json");
+        std::fs::write(&target, b"real-bytes").expect("write target");
+        let real = eliot_contracts::sha256_hex(b"real-bytes");
+        let forged = eliot_contracts::sha256_hex(b"forged-bytes");
+        let expected = BTreeMap::from([(target.display().to_string(), real)]);
+        let supplied = BTreeMap::from([(target.display().to_string(), forged.clone())]);
+        let (expectation_path, observation_path) =
+            write_profile_docs(&dir, &expected, &supplied, false);
+        let value =
+            verify_profile("demo", &expectation_path, &observation_path).expect("gate runs");
+        assert_eq!(value["file_hash"]["ok"], true);
+
+        let expected_wrong = BTreeMap::from([(target.display().to_string(), forged)]);
+        let supplied_agreeing = expected_wrong.clone();
+        let (expectation_path, observation_path) =
+            write_profile_docs(&dir, &expected_wrong, &supplied_agreeing, true);
+        let value =
+            verify_profile("demo", &expectation_path, &observation_path).expect("gate runs");
+        assert_eq!(value["file_hash"]["ok"], false);
+        assert_eq!(value["live"], false);
+        assert_eq!(value["disposition"], "NOT_INSTALLED");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unreadable_expected_target_is_a_gap() {
+        let dir = profile_dir("unreadable-target");
+        let missing = dir.join("absent.json").display().to_string();
+        let expected = BTreeMap::from([(missing.clone(), "ab".repeat(32))]);
+        let (expectation_path, observation_path) =
+            write_profile_docs(&dir, &expected, &BTreeMap::new(), false);
+        let value =
+            verify_profile("demo", &expectation_path, &observation_path).expect("gate runs");
+        assert_eq!(value["file_hash"]["ok"], false);
+        assert!(value["file_hash"]["gaps"]
+            .as_array()
+            .expect("gaps array")
+            .iter()
+            .any(|gap| gap == &missing));
+        assert_eq!(value["installed"], false);
+        assert_eq!(value["live"], false);
+        assert_eq!(value["disposition"], "NOT_INSTALLED");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn relative_expected_target_cannot_verify() {
+        // Same legacy fixture, honest verdict: "config.json" is not absolute,
+        // so no readback is possible without inferring from the working
+        // directory. It is a gap, and no installed/live claim follows.
         let dir = std::env::temp_dir().join("eliot-go19-1964-cross-profile");
         std::fs::create_dir_all(&dir).expect("create temp dir");
         let expectation_path = dir.join("expectation.json");
@@ -352,8 +541,11 @@ mod tests {
             .expect_err("cross-profile expectation must not verify");
         assert!(matches!(error, IntegrationError::ProfileMismatch { .. }));
         let value = verify_profile("demo", &expectation_path, &observation_path)
-            .expect("same-profile expectation verifies");
-        assert_eq!(value["live"], true);
+            .expect("gate runs on well-formed inputs");
+        assert_eq!(value["file_hash"]["ok"], false);
+        assert_eq!(value["installed"], false);
+        assert_eq!(value["live"], false);
+        assert_eq!(value["disposition"], "NOT_INSTALLED");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

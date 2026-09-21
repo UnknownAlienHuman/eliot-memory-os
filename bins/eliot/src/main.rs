@@ -459,24 +459,30 @@ fn run_plugin(command: PluginCommand) -> Result<i32> {
                 }
             };
             match plugin_preview::install_with_rollback(&proposal, &rollback_dir) {
-                Ok((preview, outcome)) => {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&json!({
-                            "contract": "eliot.plugin.install",
-                            "contract_version": "1.0.0",
-                            "status": "INSTALLED_NOT_LIVE",
-                            "completed": true,
-                            "plugin_id": preview.plugin_id,
-                            "profile": preview.profile,
-                            "preview": plugin_preview::preview_json(&preview),
-                            "rollback_copy": outcome.rollback_artifact.display().to_string(),
-                            "receipt": outcome.receipt_path.display().to_string(),
-                            "scope": INSTALLATION_SCOPE,
-                            "note": "installation recorded; runtime liveness requires eliot doctor integration <profile> handshake",
-                        }))?
+                // No admitted mutation port exists, so success is unreachable:
+                // a backup-only path cannot yield installed success. The
+                // defensive arm stays fail-closed if that ever changes.
+                Ok(_) => {
+                    write_installation_error(
+                        "PLUGIN_INSTALL_UNEXPECTED",
+                        "install reported success without an admitted mutation port; no installed claim is emitted",
                     );
-                    Ok(0)
+                    Ok(INVALID_REQUEST_EXIT)
+                }
+                Err(plugin_preview::PluginPreviewError::InstallNotAttempted {
+                    detail,
+                    rollback_artifact,
+                    receipt_path,
+                }) => {
+                    write_installation_error(
+                        "PLUGIN_INSTALL_NOT_ATTEMPTED",
+                        &format!(
+                            "{detail} rollback={} receipt={}",
+                            rollback_artifact.display(),
+                            receipt_path.display()
+                        ),
+                    );
+                    Ok(INVALID_REQUEST_EXIT)
                 }
                 Err(error) => {
                     write_installation_error("PLUGIN_INSTALL_FAILED", &error.to_string());
@@ -3328,6 +3334,59 @@ mod tests {
                 command: DoctorCommand::Integration { .. }
             }
         ));
+    }
+
+    #[test]
+    fn plugin_install_without_admitted_port_exits_nonsuccess() {
+        // End-to-end CLI honesty: a valid manifest still cannot produce an
+        // installed-success result without an admitted mutation port.
+        let root = std::env::temp_dir().join(format!("eliot-plugin-install-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("create temp root");
+        let target = root.join("config.json");
+        std::fs::write(&target, b"{\"bridge\":\"demo\"}").expect("write target");
+        let manifest_path = root.join("manifest.json");
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "plugin_id": "demo-bridge",
+                "profile": "demo",
+                "files_to_modify": [target.display().to_string()],
+                "config_block": "{\"bridge\":\"demo\"}",
+                "hooks": ["on_task"],
+                "mcp_server": "demo-mcp",
+                "tool_count": 3,
+                "skill_count": 2,
+                "expected_coverage": {
+                    "profile": "demo",
+                    "expected_file_hashes": {},
+                    "expected_registrations": ["demo-mcp"],
+                    "expected_hook_events": ["on_task"],
+                },
+            }))
+            .expect("serialize manifest"),
+        )
+        .expect("write manifest");
+        let rollback_dir = root.join("rollback");
+        let code = run_plugin(PluginCommand::Install {
+            manifest: manifest_path.clone(),
+            rollback_dir: rollback_dir.clone(),
+        })
+        .expect("install front door executes");
+        assert_eq!(code, INVALID_REQUEST_EXIT);
+        let receipt_path = rollback_dir.join("demo-bridge.installed.json");
+        let receipt: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&receipt_path).expect("read install receipt"),
+        )
+        .expect("parse install receipt");
+        assert_eq!(receipt["status"], "INSTALL_NOT_ATTEMPTED");
+        assert_eq!(receipt["code"], "PLAN_GAP");
+        assert_eq!(receipt["completed"], false);
+        // The target itself is untouched: no mutation occurred.
+        assert_eq!(
+            std::fs::read(&target).expect("read target"),
+            b"{\"bridge\":\"demo\"}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn applied_outcome() -> InstallationStepOutcome {

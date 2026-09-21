@@ -3,8 +3,11 @@
 //! Plugin/bridge install preview and rollback front door (I3.7).
 //!
 //! Bins-local composition helper for the `eliot` operator CLI: before any
-//! installation mutation it renders the exact required preview fields and
-//! preserves a rollback artifact. The Governor integration-record shape is
+//! installation attempt it renders the exact required preview fields and
+//! preserves a rollback artifact. No admitted target-mutation port exists in
+//! this front door (`PLAN_GAP` pending A-06), so the attempt stops after
+//! rollback preservation with an honest `NOT_ATTEMPTED` receipt: the targets
+//! are left unmodified and no installed success is ever claimed. The Governor integration-record shape is
 //! consumed as-is (read-only projection into the preview); this module mints
 //! no Governor authority and mutates nothing outside the caller-selected
 //! rollback directory plus a single install receipt written there.
@@ -112,6 +115,20 @@ pub enum PluginPreviewError {
     /// The install receipt could not be recorded.
     #[error("record install receipt: {0}")]
     Receipt(String),
+    /// The install mutation was not attempted: rollback was preserved, but
+    /// no admitted target-mutation port exists in this front door (`PLAN_GAP`
+    /// pending A-06 provider injection). Carries the preserved artifact
+    /// paths as evidence. Never an installed-success claim: a backup-only
+    /// path cannot yield one.
+    #[error("install not attempted (PLAN_GAP): {detail}")]
+    InstallNotAttempted {
+        /// Why no mutation port exists and which owner must admit one.
+        detail: String,
+        /// Rollback artifact preserved before the refused mutation.
+        rollback_artifact: PathBuf,
+        /// Honest `NOT_ATTEMPTED` receipt written beside the artifact.
+        receipt_path: PathBuf,
+    },
 }
 
 /// Loads and validates a manifest. The path must be absolute.
@@ -293,24 +310,26 @@ pub fn ensure_rollback_artifact(
     Ok(artifact_path)
 }
 
-/// Install outcome: the rollback path plus the install receipt path. The
-/// receipt records installation only; runtime liveness is never claimed here
-/// (see `eliot doctor integration <profile>`).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PluginInstallOutcome {
-    /// Rollback artifact preserved before mutation.
-    pub rollback_artifact: PathBuf,
-    /// Install receipt written inside the rollback directory.
-    pub receipt_path: PathBuf,
-}
+/// Why the install mutation is refused: the exact missing port and the owner
+/// that must admit it. Mirrors the admitted `eliot-cli` catalogue, where the
+/// install/verify family is `PLAN_GAP` pending A-06 provider injection.
+const INSTALL_GAP_DETAIL: &str = "no admitted plugin target-mutation port in this front door (PLAN_GAP pending A-06 provider injection); targets left unmodified. Handoff: plugin install mutation requires a Governor-admitted install effect (owner: Governor application, eliotd #18); registration, hook-event, and handshake observers are likewise absent (see eliot doctor integration UNVERIFIED_PLAN_GAP). Tracker: #1964";
 
-/// Performs the governed install: renders the preview, preserves the
-/// rollback artifact first, then records an install receipt scoped to the
+/// Attempts the governed install: renders the preview, preserves the
+/// rollback artifact first, then records an honest receipt scoped to the
 /// rollback directory. Never modifies the target files themselves.
+///
+/// No admitted target-mutation port exists in this front door, so the
+/// mutation is refused after rollback preservation: this function records an
+/// `INSTALL_NOT_ATTEMPTED` receipt and returns
+/// [`PluginPreviewError::InstallNotAttempted`]. A backup-only path cannot
+/// yield installed success. The `Ok` receipt path is reserved for a future
+/// admitted-port mutation, which will hash-read back every target before
+/// claiming anything installed.
 pub fn install_with_rollback(
     manifest: &PluginManifest,
     rollback_dir: &Path,
-) -> Result<(PluginPreview, PluginInstallOutcome), PluginPreviewError> {
+) -> Result<PathBuf, PluginPreviewError> {
     let preview = render_preview(manifest, rollback_dir);
     let rollback_artifact = ensure_rollback_artifact(manifest, &preview, rollback_dir)?;
     let receipt_path = rollback_dir.join(format!("{}.installed.json", manifest.plugin_id));
@@ -319,23 +338,23 @@ pub fn install_with_rollback(
         "contract_version": "1.0.0",
         "plugin_id": manifest.plugin_id,
         "profile": manifest.profile,
-        "status": "INSTALLED_NOT_LIVE",
-        "completed": true,
+        "status": "INSTALL_NOT_ATTEMPTED",
+        "code": "PLAN_GAP",
+        "completed": false,
         "rollback_copy": preview.rollback_copy,
         "preview": preview_json(&preview),
-        "note": "installation recorded; runtime liveness requires eliot doctor integration <profile> handshake",
+        "detail": INSTALL_GAP_DETAIL,
+        "note": "targets unmodified; rollback preserved; no installation occurred",
     });
     let bytes = serde_json::to_vec_pretty(&receipt)
         .map_err(|error| PluginPreviewError::Receipt(error.to_string()))?;
     std::fs::write(&receipt_path, &bytes)
         .map_err(|error| PluginPreviewError::Receipt(error.to_string()))?;
-    Ok((
-        preview,
-        PluginInstallOutcome {
-            rollback_artifact,
-            receipt_path,
-        },
-    ))
+    Err(PluginPreviewError::InstallNotAttempted {
+        detail: INSTALL_GAP_DETAIL.to_owned(),
+        rollback_artifact,
+        receipt_path,
+    })
 }
 
 #[cfg(test)]
@@ -400,22 +419,51 @@ mod tests {
     }
 
     #[test]
-    fn install_preserves_rollback_before_mutation() {
+    fn install_preserves_rollback_then_refuses_success() {
+        // No admitted mutation port: rollback must exist, but the result is
+        // an honest NOT_ATTEMPTED refusal, never installed success.
         let manifest = fixture_manifest();
         let rollback_dir = temp_dir("install");
-        let (preview, outcome) =
-            install_with_rollback(&manifest, &rollback_dir).expect("install with rollback");
-        assert!(outcome.rollback_artifact.exists());
-        assert!(outcome.receipt_path.exists());
-        assert_eq!(
-            outcome.rollback_artifact.display().to_string(),
-            preview.rollback_copy
-        );
+        let error = install_with_rollback(&manifest, &rollback_dir)
+            .expect_err("backup-only path cannot yield installed success");
+        let PluginPreviewError::InstallNotAttempted {
+            detail,
+            rollback_artifact,
+            receipt_path,
+        } = error
+        else {
+            panic!("expected InstallNotAttempted, refusal with rollback evidence");
+        };
+        assert!(detail.contains("PLAN_GAP"));
+        assert!(rollback_artifact.exists());
+        assert!(receipt_path.exists());
         let receipt: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&outcome.receipt_path).expect("read receipt"))
+            serde_json::from_slice(&std::fs::read(&receipt_path).expect("read receipt"))
                 .expect("parse receipt");
-        assert_eq!(receipt["status"], "INSTALLED_NOT_LIVE");
+        assert_eq!(receipt["status"], "INSTALL_NOT_ATTEMPTED");
+        assert_eq!(receipt["code"], "PLAN_GAP");
+        assert_eq!(receipt["completed"], false);
         assert!(receipt.get("preview").is_some());
+        assert!(receipt
+            .get("rollback_copy")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|copy| copy == rollback_artifact.display().to_string()));
+        let _ = std::fs::remove_dir_all(&rollback_dir);
+    }
+
+    #[test]
+    fn backup_only_path_yields_no_installed_success() {
+        // Regression: whatever the manifest claims, a rollback-only run must
+        // never produce an installed-success marker.
+        let manifest = fixture_manifest();
+        let rollback_dir = temp_dir("install-no-success");
+        let error = install_with_rollback(&manifest, &rollback_dir)
+            .expect_err("install without an admitted port cannot succeed");
+        assert!(matches!(
+            error,
+            PluginPreviewError::InstallNotAttempted { .. }
+        ));
+        assert!(!error.to_string().contains("INSTALLED"));
         let _ = std::fs::remove_dir_all(&rollback_dir);
     }
 
@@ -433,11 +481,17 @@ mod tests {
         let mut manifest = fixture_manifest();
         manifest.files_to_modify = vec![first.display().to_string(), second.display().to_string()];
         let rollback_dir = root.join("rollback");
-        let (_, outcome) =
-            install_with_rollback(&manifest, &rollback_dir).expect("install with rollback");
-        assert!(outcome.rollback_artifact.exists());
+        let error = install_with_rollback(&manifest, &rollback_dir)
+            .expect_err("no admitted port: refusal carries the rollback paths");
+        let PluginPreviewError::InstallNotAttempted {
+            rollback_artifact, ..
+        } = error
+        else {
+            panic!("expected InstallNotAttempted with rollback evidence");
+        };
+        assert!(rollback_artifact.exists());
         let artifact: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(&outcome.rollback_artifact).expect("read rollback artifact"),
+            &std::fs::read(&rollback_artifact).expect("read rollback artifact"),
         )
         .expect("parse rollback artifact");
         let per_file = artifact.get("per_file").expect("rollback carries per_file");

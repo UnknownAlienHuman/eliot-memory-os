@@ -71,13 +71,17 @@ const INTEGRATION_INPUT_EXIT: i32 = 2;
 /// Read-only integration coverage check (I3.7):
 /// `eliot-doctor integration <profile> --expectation <abs> --observation <abs>`.
 ///
-/// Front-door argument decoding only; the profile gate, evaluation, and
-/// contract JSON live in the shared [`integration::verify_profile`]
-/// entrypoint, also driven by `eliot doctor integration`.
+/// Front-door argument decoding only; the profile gate, real file-hash
+/// readback, and contract JSON live in the shared
+/// [`integration::verify_profile`] entrypoint, also driven by
+/// `eliot doctor integration`.
 ///
-/// Inspects expected file hashes, active registrations, observed hook
-/// events, and the handshake result, then reports installed separately from
-/// live. Executes no repair, mints no authority, and mutates nothing.
+/// Re-hashes the named target files and compares explicitly limited
+/// caller-supplied records without granting them authority. Registration,
+/// hook-event, and handshake ports are absent (PLAN_GAP pending A-06), so
+/// the report carries file-hash evidence plus explicit unverified gaps and
+/// never claims installed or live. Executes no repair, mints no authority,
+/// and mutates nothing.
 fn run_integration(argv: &[String]) -> i32 {
     let Some(profile) = argv.get(2).cloned() else {
         let _ = writeln!(
