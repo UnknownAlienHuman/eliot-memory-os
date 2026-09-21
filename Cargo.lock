@@ -1823,10 +1823,13 @@ dependencies = [
 name = "eliot-host-state"
 version = "0.1.0"
 dependencies = [
+ "eliot-agent-contracts",
  "eliot-contracts",
  "eliot-observation-contracts",
  "eliot-platform",
  "eliot-platform-windows",
+ "eliot-protocol",
+ "eliot-receipts",
  "eliot-runtime-contracts",
  "redb",
  "serde",
@@ -3094,6 +3097,7 @@ dependencies = [
  "eliot-ipc",
  "eliot-maintenance",
  "eliot-observability",
+ "eliot-observation",
  "eliot-platform",
  "eliot-platform-windows",
  "eliot-process",

@@ -4,7 +4,12 @@ use eliot_platform::PlatformHandle;
 
 use crate::{
     AppendReceipt, HostInstallationEpoch, HostState, HostStateJournal, HostStateRecord,
-    JournalBackend, JournalError, PreparedAppend, ReconcileOutcome, RedbJournalBackend,
+    JournalBackend, JournalError, PreparedAppend, ReactiveContextEnqueueReceipt,
+    ReactiveContextOperationQuery, ReactiveContextPrepareRequest, ReactiveContextPrepareResult,
+    ReactiveContextPreparedEnqueue, ReactiveContextQueueError, ReactiveContextQueuePort,
+    ReactiveContextQueueQuery, ReactiveContextQueueSnapshot, ReactiveContextReconcileOutcome,
+    ReactiveContextReconcileRequest, ReactiveContextTransition, ReactiveContextTransitionReceipt,
+    ReconcileOutcome, RedbJournalBackend,
 };
 
 /// Production-facing service boundary for the Host operational journal.
@@ -51,8 +56,94 @@ impl<B: JournalBackend> HostStateJournalService<B> {
         self.journal.reconcile(transaction_id)
     }
 
+    pub fn prepare_reactive_context(
+        &self,
+        request: ReactiveContextPrepareRequest,
+    ) -> Result<ReactiveContextPrepareResult, ReactiveContextQueueError> {
+        self.journal.prepare_reactive_context(request)
+    }
+
+    pub fn commit_reactive_context(
+        &self,
+        prepared: ReactiveContextPreparedEnqueue,
+    ) -> Result<ReactiveContextEnqueueReceipt, ReactiveContextQueueError> {
+        self.journal.commit_reactive_context(prepared)
+    }
+
+    pub fn compare_and_transition(
+        &self,
+        transition: ReactiveContextTransition,
+    ) -> Result<ReactiveContextTransitionReceipt, ReactiveContextQueueError> {
+        self.journal.compare_and_transition(transition)
+    }
+
+    pub fn load_reactive_context_queue(
+        &self,
+        query: ReactiveContextQueueQuery,
+    ) -> Result<ReactiveContextQueueSnapshot, ReactiveContextQueueError> {
+        self.journal.load_reactive_context_queue(query)
+    }
+
+    pub fn query_reactive_context_operation(
+        &self,
+        query: ReactiveContextOperationQuery,
+    ) -> Result<crate::ReactiveContextQueueEntry, ReactiveContextQueueError> {
+        self.journal.query_reactive_context_operation(query)
+    }
+
+    pub fn reconcile_reactive_context(
+        &self,
+        request: ReactiveContextReconcileRequest,
+    ) -> Result<ReactiveContextReconcileOutcome, ReactiveContextQueueError> {
+        self.journal.reconcile_reactive_context(request)
+    }
+
     pub fn into_backend(self) -> Result<B, JournalError> {
         self.journal.into_backend()
+    }
+}
+
+impl<B: JournalBackend> ReactiveContextQueuePort for HostStateJournalService<B> {
+    fn prepare_or_replay(
+        &self,
+        request: ReactiveContextPrepareRequest,
+    ) -> Result<ReactiveContextPrepareResult, ReactiveContextQueueError> {
+        self.prepare_reactive_context(request)
+    }
+
+    fn commit_enqueued(
+        &self,
+        prepared: ReactiveContextPreparedEnqueue,
+    ) -> Result<ReactiveContextEnqueueReceipt, ReactiveContextQueueError> {
+        self.commit_reactive_context(prepared)
+    }
+
+    fn compare_and_transition(
+        &self,
+        transition: ReactiveContextTransition,
+    ) -> Result<ReactiveContextTransitionReceipt, ReactiveContextQueueError> {
+        self.compare_and_transition(transition)
+    }
+
+    fn load_attempt_queue(
+        &self,
+        query: ReactiveContextQueueQuery,
+    ) -> Result<ReactiveContextQueueSnapshot, ReactiveContextQueueError> {
+        self.load_reactive_context_queue(query)
+    }
+
+    fn query_operation(
+        &self,
+        query: ReactiveContextOperationQuery,
+    ) -> Result<crate::ReactiveContextQueueEntry, ReactiveContextQueueError> {
+        self.query_reactive_context_operation(query)
+    }
+
+    fn reconcile_operation(
+        &self,
+        request: ReactiveContextReconcileRequest,
+    ) -> Result<ReactiveContextReconcileOutcome, ReactiveContextQueueError> {
+        self.reconcile_reactive_context(request)
     }
 }
 
