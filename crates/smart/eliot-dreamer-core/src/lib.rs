@@ -137,6 +137,12 @@
 
 #![forbid(unsafe_code)]
 
+pub mod advice_gate;
+pub use advice_gate::{
+    AdviceCandidate, AdviceClass, AdviceGate, AdviceProposal, AdviceRejected, AdviceState,
+    NegativeMemoryEntry, OwnerDecision,
+};
+
 use std::collections::BTreeSet;
 
 use blake3::Hasher;

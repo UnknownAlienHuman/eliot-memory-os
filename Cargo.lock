@@ -578,6 +578,7 @@ dependencies = [
  "eliot-bootstrap",
  "eliot-cli",
  "eliot-contracts",
+ "eliot-doctor",
  "eliot-governor",
  "eliot-host-state",
  "eliot-installation",
@@ -1628,6 +1629,7 @@ dependencies = [
  "eliot-evidence",
  "schemars",
  "serde",
+ "serde_json",
  "thiserror",
 ]
 
@@ -1764,6 +1766,7 @@ dependencies = [
  "eliot-protocol",
  "eliot-receipts",
  "eliot-runtime-contracts",
+ "eliot-windows-ipc",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -1955,6 +1958,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-integration-coverage"
+version = "0.1.0"
+dependencies = [
+ "schemars",
+ "serde",
+ "thiserror",
+]
+
+[[package]]
 name = "eliot-ipc"
 version = "0.1.0"
 dependencies = [
@@ -2134,6 +2146,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-lsp-bridge"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-instrument-api",
+ "eliot-instrument-scip",
+ "eliot-platform",
+ "eliot-process",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror",
+]
+
+[[package]]
 name = "eliot-maintenance"
 version = "0.1.0"
 dependencies = [
@@ -2165,9 +2192,11 @@ name = "eliot-memory-curation"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "eliot-contracts",
+ "eliot-epistemic",
+ "eliot-evidence",
  "schemars",
  "serde",
- "serde_json",
  "thiserror",
 ]
 
@@ -2329,6 +2358,7 @@ name = "eliot-ors"
 version = "0.1.0"
 dependencies = [
  "eliot-contracts",
+ "eliot-ors",
  "eliot-platform",
  "eliot-process",
  "eliot-receipts",
@@ -2596,13 +2626,20 @@ name = "eliot-runtime-status"
 version = "0.1.0"
 dependencies = [
  "eliot-contracts",
+ "eliot-controlboard",
+ "eliot-evaluation-contracts",
+ "eliot-evidence",
  "eliot-host-state",
  "eliot-installation",
+ "eliot-ipc",
+ "eliot-observation-contracts",
  "eliot-ors",
  "eliot-platform",
  "eliot-platform-windows",
  "eliot-process",
+ "eliot-protocol",
  "eliot-runtime-contracts",
+ "eliot-security-contracts",
  "eliot-store-api",
  "redb",
  "serde",
@@ -2645,6 +2682,10 @@ dependencies = [
  "serde",
  "thiserror",
 ]
+
+[[package]]
+name = "eliot-sim-core"
+version = "0.1.0"
 
 [[package]]
 name = "eliot-skill"
@@ -2976,9 +3017,11 @@ dependencies = [
  "eliot-runtime",
  "eliot-runtime-contracts",
  "eliot-watchdog-core",
+ "eliot-windows-ipc",
  "redb",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror",
  "tokio",
  "tracing",
@@ -3031,6 +3074,7 @@ dependencies = [
  "eliot-governor",
  "eliot-ipc",
  "eliot-maintenance",
+ "eliot-observability",
  "eliot-platform",
  "eliot-platform-windows",
  "eliot-protocol",
