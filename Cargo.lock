@@ -1077,6 +1077,7 @@ dependencies = [
  "eliot-contracts",
  "eliot-evaluation-contracts",
  "eliot-evidence",
+ "eliot-kernel-core",
  "eliot-observation-contracts",
  "eliot-protocol",
  "eliot-receipts",
@@ -2323,6 +2324,8 @@ dependencies = [
 name = "eliot-notify-core"
 version = "0.1.0"
 dependencies = [
+ "eliot-contracts",
+ "eliot-kernel-core",
  "eliot-observation-contracts",
  "eliot-platform",
  "eliot-receipts",
