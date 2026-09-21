@@ -55,6 +55,12 @@ impl VersionedArtifact {
     }
 
     /// Validates generation addressing and the immutable hash/path binding.
+    ///
+    /// The path must equal the canonical generation-addressed layout
+    /// exactly: substring matching would admit a generation `1` artifact at
+    /// a generation `10` path, or a suffixed copy (`module.exe.bak`) of the
+    /// addressed bytes, silently breaking the on-disk identity the
+    /// generation/hash record names.
     pub fn validate(&self) -> Result<(), OrsError> {
         validate_text(&self.module_id, "versioned_artifact_module_id")?;
         if self.generation == 0 {
@@ -65,13 +71,12 @@ impl VersionedArtifact {
         }
         validate_digest(&self.artifact_hash, "versioned_artifact_hash")?;
         validate_text(&self.artifact_path, "versioned_artifact_path")?;
-        let generation_segment = self.generation.to_string();
-        let addressed = self.artifact_path.contains(&generation_segment)
-            && self.artifact_path.contains(self.artifact_hash.as_str());
-        if !addressed {
+        if self.artifact_path
+            != Self::canonical_path(&self.module_id, self.generation, &self.artifact_hash)
+        {
             return Err(OrsError::InvalidField {
                 field: "versioned_artifact_path",
-                reason: "path must be generation-addressed and bind the artifact hash",
+                reason: "path must be exactly the canonical generation-addressed layout",
             });
         }
         Ok(())
@@ -282,6 +287,11 @@ impl VersionedArtifactRegistry {
     }
 
     /// Stages an immutable candidate without touching the active executable.
+    ///
+    /// Re-staging a retained identical artifact is an idempotent staging for
+    /// rollback: the bytes stay where they are and the candidate becomes
+    /// activatable again. Anything else that collides with retained or staged
+    /// state fails closed.
     pub fn install_candidate(&mut self, artifact: VersionedArtifact) -> Result<(), OrsError> {
         artifact.validate()?;
         let key = (artifact.module_id.clone(), artifact.generation);
@@ -295,6 +305,7 @@ impl VersionedArtifactRegistry {
             if existing.artifact != artifact {
                 return Err(OrsError::VersionedArtifactConflict);
             }
+            self.staged.insert(key, artifact);
             return Ok(());
         }
         // I1.6 guard: no staged path may collide with a retained executable
@@ -581,5 +592,130 @@ mod tests {
             ),
             Err(OrsError::IncompatibleArtifact)
         ));
+    }
+
+    #[test]
+    fn non_canonical_generation_paths_are_rejected() {
+        // Generation substring: generation 1 must not validate at a
+        // generation 10 path even though "1" is a substring of "10".
+        let hash = "aa".repeat(32);
+        assert!(
+            VersionedArtifact::new(
+                "mod-echo",
+                1,
+                hash.clone(),
+                format!("modules/mod-echo/10/{hash}/module.exe")
+            )
+            .is_err()
+        );
+        // Suffix copy: the addressed bytes plus extra material are not the
+        // canonical identity the record names.
+        assert!(
+            VersionedArtifact::new(
+                "mod-echo",
+                1,
+                hash.clone(),
+                format!("modules/mod-echo/1/{hash}/module.exe.bak"),
+            )
+            .is_err()
+        );
+        // Wrong module directory with matching generation and hash.
+        assert!(
+            VersionedArtifact::new(
+                "mod-echo",
+                1,
+                hash.clone(),
+                format!("modules/mod-other/1/{hash}/module.exe"),
+            )
+            .is_err()
+        );
+        // A different hash at the addressed path is not the named artifact.
+        assert!(
+            VersionedArtifact::new(
+                "mod-echo",
+                1,
+                hash.clone(),
+                VersionedArtifact::canonical_path("mod-echo", 1, &"bb".repeat(32)),
+            )
+            .is_err()
+        );
+        // The exact canonical layout still validates.
+        artifact("mod-echo", 1, &hash)
+            .validate()
+            .expect("canonical path must validate");
+    }
+
+    #[test]
+    fn rollback_to_drained_prior_reactivates_with_compatibility() {
+        let hash_gen1 = "aa".repeat(32);
+        let hash_gen2 = "bb".repeat(32);
+        let mut registry = VersionedArtifactRegistry::new();
+        registry
+            .install_candidate(artifact("mod-engine", 1, &hash_gen1))
+            .expect("stage gen1");
+        registry
+            .activate("mod-engine", 1, &hash_gen1, &COMPATIBLE)
+            .expect("activate gen1");
+        registry
+            .install_candidate(artifact("mod-engine", 2, &hash_gen2))
+            .expect("stage gen2");
+        registry
+            .activate("mod-engine", 2, &hash_gen2, &COMPATIBLE)
+            .expect("activate gen2");
+        assert_eq!(
+            registry
+                .active_status("mod-engine")
+                .expect("active status present")
+                .generation,
+            2
+        );
+        // Rollback re-stages the retained identical prior and reactivates it:
+        // the prior generation was never overwritten, only demoted.
+        registry
+            .install_candidate(artifact("mod-engine", 1, &hash_gen1))
+            .expect("re-stage drained gen1");
+        let rollback = registry
+            .activate("mod-engine", 1, &hash_gen1, &COMPATIBLE)
+            .expect("rollback to gen1");
+        rollback.validate().expect("rollback evidence validates");
+        assert_eq!(rollback.new_generation, 1);
+        assert_eq!(rollback.old_generation, Some(2));
+        assert_eq!(rollback.new_artifact_hash, hash_gen1);
+        assert_eq!(
+            rollback.old_artifact_hash.as_deref(),
+            Some(hash_gen2.as_str())
+        );
+        assert_eq!(
+            registry
+                .active_status("mod-engine")
+                .expect("active status present")
+                .generation,
+            1
+        );
+        let (_, state, _) = registry
+            .retained_state("mod-engine", 2)
+            .expect("gen2 retained");
+        assert_eq!(state, ArtifactGenerationState::Draining);
+        // An incompatible rollback attempt refuses and preserves the active
+        // generation exactly: no partial state change.
+        assert!(matches!(
+            registry.activate(
+                "mod-engine",
+                2,
+                &hash_gen2,
+                &CompatibilityEvidence {
+                    durable_format_compatible: true,
+                    epoch_lineage_compatible: false,
+                },
+            ),
+            Err(OrsError::IncompatibleArtifact)
+        ));
+        assert_eq!(
+            registry
+                .active_status("mod-engine")
+                .expect("active status present")
+                .generation,
+            1
+        );
     }
 }
