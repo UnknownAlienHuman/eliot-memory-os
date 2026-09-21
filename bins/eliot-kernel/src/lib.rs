@@ -22,7 +22,9 @@
 //! cell 6 daemon/store-rebind dispatch — `daemon_request_dispatch` (+7),
 //!   `store_receipt_dispatch`, `control_plane` (+4), `frame_dispatch` (+1),
 //!   `host_request_route` (+1);
-//! cell 7 health/readiness view — `health_view`, `daemon_request_dispatch` (+6);
+//! cell 7 health/readiness view — `health_view`, `daemon_request_dispatch` (+6),
+//!   plus the I1.13 Kernel-unavailability admission guard and restricted
+//!   Recovery View (`kernel_unavailability`);
 //! cell 8 process/daemon/store runtime — `process_execution`,
 //!   `process_execution_client`, `daemon_runtime`, `daemon_process_launch`,
 //!   `daemon_live_receipt`, `daemon_supervision` (+2), `runtime_identity` (+1),
@@ -39,6 +41,7 @@
 
 #[cfg(windows)]
 mod agent_bridge;
+mod blob_store_controller;
 mod canonical_store_runtime;
 mod composition_bootstrap;
 mod control_plane;
@@ -52,6 +55,11 @@ mod process_execution;
 mod process_execution_client;
 mod supervision_lease_authority;
 
+pub use blob_store_controller::{
+    BLOB_INLINE_THRESHOLD_DEFAULT_BYTES, BLOB_INLINE_THRESHOLD_MAX_BYTES,
+    BLOB_MANIFEST_FORMAT_VERSION, BlobCaptureOutcome, BlobDemand, BlobProbeStatus,
+    BlobProbeSuccess, BlobReadyReceipt, BlobRef, BlobStoreController, BlobStoreManifest,
+};
 pub(crate) use kernel_build_contract::PreparedAuthorityMaterial;
 #[cfg(windows)]
 pub use kernel_build_contract::SupervisionLeaseAuthorityConfig;
@@ -122,6 +130,7 @@ mod generation_recovery;
 mod health_view;
 #[cfg(windows)]
 mod host_request_route;
+pub mod kernel_unavailability;
 mod native_worker_lifecycle_route;
 mod native_worker_reconcile_route;
 mod native_worker_replay_route;
@@ -461,6 +470,10 @@ pub struct KernelComposition {
     store_rebind_gate: tokio::sync::Mutex<()>,
     approved_config_hash: Option<String>,
     canonical_store_claimed: AtomicBool,
+    /// Kernel-owned Blob Store demand controller (I1.11 step 4). `None`
+    /// while no approved blob manifest was injected; `Some` validates the
+    /// manifest at startup without starting the generation.
+    blob_store: Mutex<Option<BlobStoreController>>,
     #[cfg(windows)]
     canonical_store_gateway: Mutex<Option<Arc<KernelStoreGateway>>>,
     #[cfg(windows)]
