@@ -10,6 +10,8 @@
 //!   and epoch activation ([`EpochActivation`]);
 //! - the runtime generation route table and cutover decisions
 //!   ([`GenerationRouter`], [`CutoverDecision`]);
+//! - the I1.10 process-health projection kept separate from generation and
+//!   cutover state ([`ProcessHealthStatus`], [`CapabilityReadiness`]);
 //! - the bounded control reserve and synchronous front door
 //!   ([`ControlReserve`], [`FrontDoor`]);
 //! - the role-filtered recovery view ([`RecoveryViewBuilder`]).
@@ -67,6 +69,9 @@ pub use module::notification_state::{
     Acknowledgement, DeadlineOrReview, DeliveryChannel, DeliveryState, Notification,
     NotificationDraft, NotificationError, NotificationSeverity, NotificationStore, Resolution,
     ResolutionAuthorization, ResolutionRef,
+};
+pub use module::process_health::{
+    CapabilityReadiness, HealthDimensionKind, ProcessHealthStatus, ProcessHealthVector,
 };
 pub use module::recovery_state_view::{RecoveryViewBuilder, project_operational_state};
 
