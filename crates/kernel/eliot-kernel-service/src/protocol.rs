@@ -11,7 +11,7 @@ use eliot_process::{
 pub use eliot_protocol::AGENT_BRIDGE_MODULE_ID;
 use eliot_protocol::{
     AgentBridgeClientDeclaration, AgentBridgeProcessBinding, EncodingProfile, Frame, FrameKind,
-    HostRequestEnvelope, MessageType, ProtocolPayload, ProtocolVersion,
+    HostRequestEnvelope, MessageType, ProtocolPayload, ProtocolVersion, RequestIdentity,
 };
 use eliot_runtime_contracts::{
     HealthVector, ServiceProcessState, SupervisionLeaseIncarnationBinding,
@@ -1029,6 +1029,125 @@ impl HostProcessBinding {
         }
         Ok(())
     }
+}
+
+/// Stable operation selector for daemon startup evidence on the authenticated
+/// daemon channel (I1.11 steps 8/9). The daemon publishes under this selector
+/// after `daemon_ready` is accepted, before the daemon run loop.
+pub const DAEMON_STARTUP_EVIDENCE_OPERATION: &str = "daemon_startup_evidence";
+
+/// Shared closed carrier for daemon startup evidence (I1.11 steps 8/9).
+///
+/// Agreed Governor↔Kernel contract: the eliotd producer publishes this exact
+/// shape; the Kernel consumer validates it mechanically and records steps only
+/// through the contiguous cursor. `Option` fields are explicit absence markers
+/// and are always serialized (`null` when unevaluated, never omitted): an
+/// absence never satisfies its step. Capability fields are all-or-nothing —
+/// `required_capabilities`, `capability_outcomes`, and
+/// `capability_registry_digest` are either all present or all `null`.
+///
+/// Trust split: the Kernel mechanical layer correlates the transport binding,
+/// checks the fence, validates mirrors against canonical owner reads, and
+/// recomputes the registry digest with [`daemon_capability_registry_digest`].
+/// Capability outcomes cross as canonical JSON only; the Kernel lane never
+/// imports the bin-owned `CapabilityOutcome` type and never re-implements its
+/// scoping rules. Semantic attestation stays eliotd-side, integrity-bound by
+/// the registry digest.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DaemonStartupEvidence {
+    /// Transport binding minted by the channel owner for this exact publish.
+    pub transport_binding: RequestIdentity,
+    /// Exact State Fence this evidence was evaluated under; must equal the
+    /// transport binding fence.
+    pub state_fence: StateFence,
+    /// Digest of the rebuilt Config mirror.
+    pub config_mirror_digest: PlatformHandle,
+    /// Digest of the rebuilt Policy mirror; `None` when unevaluated.
+    pub policy_mirror_digest: Option<PlatformHandle>,
+    /// Registry digest over the canonical outcome set; `None` when unevaluated.
+    pub capability_registry_digest: Option<String>,
+    /// Required capability names; `None` when unevaluated.
+    pub required_capabilities: Option<Vec<String>>,
+    /// Canonical-JSON capability outcomes; `None` when unevaluated.
+    pub capability_outcomes: Option<Vec<serde_json::Value>>,
+    /// Supplementary evidence refs.
+    pub evidence_refs: Vec<PlatformHandle>,
+}
+
+impl DaemonStartupEvidence {
+    /// Validates the carrier shape and the fence/consistency bindings.
+    /// Mirror truth (config/policy rebuild outputs) and registry recompute
+    /// belong to the consumer; this rejects malformed carriers fail-closed.
+    pub fn validate(&self) -> Result<(), KernelServiceError> {
+        self.transport_binding
+            .validate()
+            .map_err(|error| KernelServiceError::Platform(error.to_string()))?;
+        self.state_fence
+            .validate()
+            .map_err(|_| KernelServiceError::InvalidField {
+                field: "daemon_evidence.state_fence",
+                reason: "authority fence must carry a non-zero resource generation",
+            })?;
+        if self.state_fence != self.transport_binding.request.state_fence {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "daemon_evidence.fence",
+            });
+        }
+        handle(&self.config_mirror_digest, "daemon_evidence.config_mirror_digest")?;
+        if let Some(policy) = &self.policy_mirror_digest {
+            handle(policy, "daemon_evidence.policy_mirror_digest")?;
+        }
+        if let Some(registry) = &self.capability_registry_digest {
+            validate_digest(registry, "daemon_evidence.capability_registry_digest")?;
+        }
+        let capabilities_present = self.required_capabilities.is_some()
+            && self.capability_outcomes.is_some()
+            && self.capability_registry_digest.is_some();
+        let capabilities_absent = self.required_capabilities.is_none()
+            && self.capability_outcomes.is_none()
+            && self.capability_registry_digest.is_none();
+        if !capabilities_present && !capabilities_absent {
+            return Err(KernelServiceError::InvalidField {
+                field: "daemon_evidence.capability_set",
+                reason: "capability fields must be all present or all absent",
+            });
+        }
+        if let Some(required) = &self.required_capabilities {
+            for name in required {
+                validate_text(name, "daemon_evidence.required_capabilities")?;
+            }
+        }
+        if let Some(outcomes) = &self.capability_outcomes {
+            for outcome in outcomes {
+                if !outcome.is_object() {
+                    return Err(KernelServiceError::InvalidField {
+                        field: "daemon_evidence.capability_outcomes",
+                        reason: "capability outcomes must be JSON objects",
+                    });
+                }
+            }
+        }
+        for evidence in &self.evidence_refs {
+            handle(evidence, "daemon_evidence.evidence_refs")?;
+        }
+        Ok(())
+    }
+}
+
+/// Recomputes the capability registry digest with the normative scheme:
+/// `serde_json::to_string` of each outcome, sorted byte-wise, concatenated,
+/// SHA-256 hex (lowercase). Order-independent; any substitution changes the
+/// digest. Both producer and consumer must compute byte-identically; the
+/// eliotd-side `registry_digest_for` must be verified equal to this function.
+pub fn daemon_capability_registry_digest(outcomes: &[serde_json::Value]) -> String {
+    let mut rendered: Vec<String> = outcomes
+        .iter()
+        .map(|outcome| serde_json::to_string(outcome).unwrap_or_default())
+        .collect();
+    rendered.sort();
+    let concatenated = rendered.concat();
+    sha256_hex(concatenated.as_bytes())
 }
 
 /// Inert projection of the Host-created Kernel Job binding.
@@ -3964,5 +4083,162 @@ mod tests {
         let mut missing_file = candidate_binding();
         missing_file.job_binding.root.executable.file_index = 0;
         assert!(missing_file.validate().is_err());
+    }
+
+    fn daemon_evidence_fence() -> StateFence {
+        StateFence::new(
+            test_epoch(3),
+            ResourceGeneration::new(5).expect("generation"),
+        )
+    }
+
+    fn daemon_transport_binding(fence: &StateFence) -> RequestIdentity {
+        use eliot_contracts::{ClockReading, ProductId, RequestId, SourceId};
+        use eliot_receipts::RequestBinding;
+        RequestIdentity {
+            request: RequestBinding {
+                metadata: eliot_contracts::RequestMetadata {
+                    request_id: RequestId::new("daemon-evidence-request-1").expect("request id"),
+                    session_id: None,
+                    task_id: None,
+                    product_id: ProductId::new("eliotd").expect("product"),
+                    source_id: SourceId::new("daemon-startup-evidence").expect("source"),
+                    state_fence: fence.clone(),
+                    clock: ClockReading::default(),
+                },
+                state_fence: fence.clone(),
+            },
+            idempotency_key: "eliotd:daemon_startup_evidence:1".to_owned(),
+            deadline_unix_ms: 1_000_000,
+            cancellation_id: "daemon-evidence-cancel-1".to_owned(),
+        }
+    }
+
+    fn daemon_evidence() -> DaemonStartupEvidence {
+        let fence = daemon_evidence_fence();
+        DaemonStartupEvidence {
+            transport_binding: daemon_transport_binding(&fence),
+            state_fence: fence,
+            config_mirror_digest: handle_value("config-mirror-1"),
+            policy_mirror_digest: None,
+            capability_registry_digest: None,
+            required_capabilities: None,
+            capability_outcomes: None,
+            evidence_refs: vec![handle_value("daemon-evidence-ref-1")],
+        }
+    }
+
+    fn daemon_evidence_full() -> DaemonStartupEvidence {
+        let fence = daemon_evidence_fence();
+        let outcomes = vec![
+            serde_json::json!({"capability": "blob.read", "effective_mode": "full"}),
+            serde_json::json!({"capability": "config.read", "effective_mode": "full"}),
+        ];
+        let registry = daemon_capability_registry_digest(&outcomes);
+        DaemonStartupEvidence {
+            transport_binding: daemon_transport_binding(&fence),
+            state_fence: fence,
+            config_mirror_digest: handle_value("config-mirror-1"),
+            policy_mirror_digest: Some(handle_value("policy-mirror-1")),
+            capability_registry_digest: Some(registry),
+            required_capabilities: Some(vec![
+                "blob.read".to_owned(),
+                "config.read".to_owned(),
+            ]),
+            capability_outcomes: Some(outcomes),
+            evidence_refs: vec![handle_value("daemon-evidence-ref-1")],
+        }
+    }
+
+    #[test]
+    fn daemon_startup_evidence_validates_shaped_fields() {
+        assert_eq!(
+            DAEMON_STARTUP_EVIDENCE_OPERATION,
+            "daemon_startup_evidence"
+        );
+        daemon_evidence()
+            .validate()
+            .expect("absence-marked evidence must validate");
+        daemon_evidence_full()
+            .validate()
+            .expect("complete evidence must validate");
+    }
+
+    #[test]
+    fn daemon_startup_evidence_serializes_absence_as_explicit_null() {
+        // Agreed wire rule: unevaluated `Option` fields must be PRESENT as
+        // explicit `null`, never omitted. An omitted key would let a skewed
+        // producer/consumer pair disagree about absence; `deny_unknown_fields`
+        // plus explicit nulls keeps absence fail-closed on both sides.
+        let value = serde_json::to_value(daemon_evidence()).expect("json");
+        let object = value.as_object().expect("evidence object");
+        for field in [
+            "policy_mirror_digest",
+            "capability_registry_digest",
+            "required_capabilities",
+            "capability_outcomes",
+        ] {
+            assert_eq!(
+                object.get(field),
+                Some(&serde_json::Value::Null),
+                "{field} must serialize as explicit null, never omitted"
+            );
+        }
+        // The explicit-null form round-trips back to absence and still
+        // validates: absence never satisfies its step.
+        let back: DaemonStartupEvidence = serde_json::from_value(value).expect("round trip");
+        back.validate().expect("round-tripped absence validates");
+        assert!(back.policy_mirror_digest.is_none());
+        assert!(back.capability_registry_digest.is_none());
+        assert!(back.required_capabilities.is_none());
+        assert!(back.capability_outcomes.is_none());
+    }
+
+    #[test]
+    fn daemon_startup_evidence_rejects_malformed_fields() {
+        let good = daemon_evidence();
+        // Fence mismatch between payload and transport binding.
+        let mut drifted = good.clone();
+        drifted.state_fence = StateFence::new(
+            test_epoch(9),
+            ResourceGeneration::new(5).expect("generation"),
+        );
+        assert!(drifted.validate().is_err());
+        // Partial capability set: registry present without outcomes.
+        let mut partial = good.clone();
+        partial.capability_registry_digest = Some("ab".repeat(32));
+        assert!(partial.validate().is_err());
+        // Non-hex registry digest.
+        let mut bad_registry = daemon_evidence_full();
+        bad_registry.capability_registry_digest = Some("not-a-digest".to_owned());
+        assert!(bad_registry.validate().is_err());
+        // Non-object outcome is not canonical evidence.
+        let mut bad_outcome = daemon_evidence_full();
+        bad_outcome.capability_outcomes = Some(vec![serde_json::json!("ready")]);
+        assert!(bad_outcome.validate().is_err());
+        // Unknown wire fields stay fail-closed on the new carrier.
+        let value = serde_json::to_value(good).expect("json");
+        let mut tampered = value;
+        tampered["unknown"] = serde_json::Value::Bool(true);
+        assert!(serde_json::from_value::<DaemonStartupEvidence>(tampered).is_err());
+    }
+
+    #[test]
+    fn daemon_capability_registry_digest_is_order_independent() {
+        let first = serde_json::json!({"capability": "a", "effective_mode": "full"});
+        let second = serde_json::json!({"capability": "b", "effective_mode": "degraded"});
+        let forward = daemon_capability_registry_digest(&[first.clone(), second.clone()]);
+        let reversed = daemon_capability_registry_digest(&[second, first]);
+        assert_eq!(forward, reversed, "digest must not depend on outcome order");
+        assert_eq!(forward.len(), 64, "digest must be SHA-256 hex");
+        assert!(
+            forward.bytes().all(|byte| byte.is_ascii_hexdigit()
+                && !byte.is_ascii_uppercase()),
+            "digest must be lowercase hex"
+        );
+        let altered = daemon_capability_registry_digest(&[
+            serde_json::json!({"capability": "a", "effective_mode": "degraded"}),
+        ]);
+        assert_ne!(forward, altered, "substitution must change the digest");
     }
 }

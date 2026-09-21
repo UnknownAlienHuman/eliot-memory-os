@@ -663,6 +663,7 @@ dependencies = [
  "eliot-types",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror",
 ]
 
@@ -873,19 +874,6 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "thiserror",
-]
-
-[[package]]
-name = "eliot-campaign-executor"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "blake3",
- "clap",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "uuid",
 ]
 
 [[package]]
@@ -1745,6 +1733,7 @@ dependencies = [
  "eliot-read",
  "eliot-receipts",
  "eliot-runtime-contracts",
+ "eliot-security-contracts",
  "eliot-session",
  "eliot-skill",
  "eliot-store-api",
@@ -2725,6 +2714,7 @@ version = "0.1.0"
 dependencies = [
  "eliot-contracts",
  "eliot-protocol",
+ "eliot-rules",
  "eliot-skills",
  "eliot-store-api",
  "serde",

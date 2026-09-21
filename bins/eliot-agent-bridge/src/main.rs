@@ -17,6 +17,7 @@ use eliot_mcp::{HostCancellationPortOutcome, HostInvocationPortOutcome, PortFail
 use eliot_mcp::{
     HostCancellationRequest, HostCancellationResult, HostCorrelationReceipt, HostGatewayError,
     HostInvocationRequest, HostInvocationResult, HostRequestGateway, KernelHostRequestPort,
+    ToolRequest,
 };
 use eliot_protocol::EventEnvelope;
 use request_input::{
@@ -103,6 +104,26 @@ enum Request {
     Cancel {
         request: HostCancellationRequest,
     },
+    /// Dry-run preview of one invocation (I7.17).
+    ///
+    /// Validates the inert request exactly like [`Request::Invoke`] and then
+    /// answers with a typed static preview instead of dispatching: the
+    /// gateway, the trusted port, the runner, and the admitted transport are
+    /// never touched, so no envelope is built, no replay entry is recorded,
+    /// and no external effect can occur. Read-only tools receive a validated
+    /// preview; effectful tools receive `DRY_RUN_UNSUPPORTED`.
+    DryRunInvoke {
+        request: HostInvocationRequest,
+    },
+    /// Dry-run preview of one cancellation (I7.17).
+    ///
+    /// The bridge owns no safe cancellation simulator, so this always answers
+    /// `DRY_RUN_UNSUPPORTED` with the best static preview after inert
+    /// validation. The exact target handle is echoed without interpretation
+    /// and no probe, cancel, or reconcile envelope is ever sent.
+    DryRunCancel {
+        request: HostCancellationRequest,
+    },
     ForwardHook {
         event: HostEventEnvelope,
     },
@@ -147,6 +168,8 @@ enum Response {
         reactive: Option<ReactiveStatusView>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         bootstrap: Option<UnderstandingBootstrap>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resources: Option<ResourceRegistryView>,
     },
     Attached {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -185,6 +208,23 @@ enum Response {
     Bootstrap {
         bootstrap: UnderstandingBootstrap,
     },
+    /// Typed dry-run envelope (I7.17).
+    ///
+    /// Deliberately distinct from [`Response::Invocation`] and
+    /// [`Response::Cancellation`]: reusing the admitted/responded shape would
+    /// let a preview be mistaken for kernel admission, which the bridge must
+    /// never imply. The envelope stays normalized stdio framing carrying the
+    /// caller correlation, the dry-run disposition, the static effect preview
+    /// with its evidence/source, and the owner-derived attach binding the
+    /// preview is valid under.
+    DryRun {
+        correlation_id: String,
+        operation: &'static str,
+        disposition: &'static str,
+        preview: DryRunPreview,
+        evidence: DryRunEvidence,
+        binding: DryRunBinding,
+    },
     Stopped {
         outstanding: usize,
         drained: usize,
@@ -214,6 +254,17 @@ struct ReactiveStatusView {
     attention_truncated: bool,
 }
 
+/// Attach-scoped resource projection summary for the Status frame.
+///
+/// `entries` counts the immutable snapshots retained for the live attach;
+/// content bytes are never carried here — previews ride hot responses and
+/// full bytes require explicit expansion through the owning reader.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ResourceRegistryView {
+    entries: usize,
+}
+
 /// Original identity of one durable in-flight delivery pending at Stop.
 ///
 /// Carries only the exact stream, event, and sequence facts from the core
@@ -226,6 +277,68 @@ struct StopPendingIdentity {
     stream_id: String,
     event_id: String,
     sequence: u64,
+}
+
+/// Stable identity of the bridge-local static dry-run preview contract.
+const DRY_RUN_PREVIEW_SOURCE: &str = "bridge-static-preview.v1";
+/// Disposition of a dry run over a read-only tool with real inert validation.
+const DRY_RUN_PREVIEW_DISPOSITION: &str = "DRY_RUN_PREVIEW";
+/// Honest disposition where the bridge owns no safe simulator (I7.17).
+const DRY_RUN_UNSUPPORTED_DISPOSITION: &str = "DRY_RUN_UNSUPPORTED";
+/// Route label used when no entry may be named as a would-be dispatch.
+const DRY_RUN_ROUTE_WITHHELD: &str = "withheld-no-simulator";
+
+/// Closed kernel entries that serve real dispatch, owned by
+/// `bins/eliot-kernel/src/host_request_route.rs`. Repeated here for dry-run
+/// route labeling only: a dry run never sends them, it only names which entry
+/// a validated read-only request would have ridden.
+const DRY_RUN_SUBMIT_OPERATION: &str = "agent_host_request_submit";
+const DRY_RUN_INVOKE_READ_OPERATION: &str = "agent_host_request_invoke_read";
+
+/// Static effect preview for one dry run: what the validated request names,
+/// without any claim that the target accepted, staged, or simulated it.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct DryRunPreview {
+    /// Canonical tool the request names (`None` for cancellation previews).
+    canonical_tool_name: Option<String>,
+    /// Exact opaque cancellation target (`None` for invocation previews).
+    operation_handle: Option<String>,
+    /// `read-only`, `effectful`, or `cancellation-probe`.
+    effect_class: &'static str,
+    /// Would-be kernel entry, or `withheld-no-simulator`.
+    route: &'static str,
+    /// Caller deadline preference echoed verbatim; the kernel would own it.
+    deadline_preference_ms: Option<u64>,
+    /// Always false: the bridge owns no simulator, so nothing was simulated.
+    simulated: bool,
+}
+
+/// Evidence and source for one dry-run preview (I7.17).
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct DryRunEvidence {
+    /// Static preview contract identity.
+    source: &'static str,
+    /// Outcome of bridge-local inert request validation.
+    inert_validation: &'static str,
+    /// Honest statement of what ran and what explicitly did not.
+    statement: String,
+}
+
+/// Owner-derived attach binding a dry-run preview is valid under.
+///
+/// Every fact is echoed from the live activation-sealed binding; nothing is
+/// minted here. When unattached the preview says so instead of binding stale
+/// facts, so callers cannot treat it as current.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct DryRunBinding {
+    attached: bool,
+    connection_id: Option<String>,
+    session_id: Option<String>,
+    activation_generation: Option<u64>,
+    authority_epoch: Option<EpochId>,
 }
 
 /// Fail-closed placeholder retained for unit tests only.
@@ -436,6 +549,8 @@ fn main() {
             Ok(Request::Cancel { request }) => {
                 handle_cancellation(&host_gateway, &mut *host_request_port, &request)
             }
+            Ok(Request::DryRunInvoke { request }) => dry_run_invocation(&runner, &request),
+            Ok(Request::DryRunCancel { request }) => dry_run_cancellation(&runner, &request),
             Ok(Request::ForwardHook { event }) => match runner.forward_hook(&event) {
                 Ok(()) => match runner.deliver_reactive_pending_via_hook(event.event_id.as_str()) {
                     Ok(receipts) => Response::Forwarded {
@@ -582,7 +697,9 @@ fn handle_bootstrap(
 
 /// Injects the once-per-session auto-boot into the first successful response.
 ///
-/// Error responses never carry a bootstrap. When no valid context is noted
+/// Error and dry-run responses never carry a bootstrap: a dry run is a
+/// zero-side-effect preview, not a successful ELIOT response, and its
+/// envelope has no bootstrap slot. When no valid context is noted
 /// the response is left untouched rather than carrying invented authority.
 fn attach_auto_bootstrap(runner: &mut BridgeRunner, response: &mut Response) {
     let slot = match response {
@@ -594,7 +711,9 @@ fn attach_auto_bootstrap(runner: &mut BridgeRunner, response: &mut Response) {
         | Response::Forwarded { bootstrap, .. }
         | Response::Reconciled { bootstrap }
         | Response::Stopped { bootstrap, .. } => bootstrap,
-        Response::Bootstrap { .. } | Response::Error { .. } => return,
+        Response::Bootstrap { .. } | Response::Error { .. } | Response::DryRun { .. } => {
+            return;
+        }
     };
     if slot.is_none() {
         let tasks = BootstrapTaskInputs {
@@ -653,6 +772,142 @@ fn handle_cancellation<P: KernelHostRequestPort + ?Sized>(
             bootstrap: None,
         },
         Err(error) => host_gateway_error(&error),
+    }
+}
+
+/// Reads the live activation-sealed binding for one dry-run preview.
+///
+/// Read-only: echoes kernel-issued connection/session/generation/epoch facts
+/// from the runner attach view without dispatching, probing, or minting
+/// anything, so the preview stays bound to the revision it was computed under.
+fn dry_run_binding(runner: &BridgeRunner) -> DryRunBinding {
+    match runner.attach_view() {
+        None => DryRunBinding {
+            attached: false,
+            connection_id: None,
+            session_id: None,
+            activation_generation: None,
+            authority_epoch: None,
+        },
+        Some(view) => DryRunBinding {
+            attached: true,
+            connection_id: Some(view.binding().connection_id().as_str().to_owned()),
+            session_id: Some(view.binding().session_id().as_str().to_owned()),
+            activation_generation: Some(view.binding().activation_generation().get()),
+            authority_epoch: Some(view.binding().state_fence().authority_epoch().clone()),
+        },
+    }
+}
+
+/// Classifies one invocation tool for dry-run preview (I7.17).
+///
+/// Read-only projections (`eliot.state`, `eliot.packet`, `eliot.query`) carry
+/// no external effects, so the bridge answers them with a validated static
+/// preview naming the entry they would have ridden. Every other tool is
+/// effectful and the bridge owns no safe simulator for it, so the honest
+/// answer is `DRY_RUN_UNSUPPORTED`. Returns the effect class, the route
+/// label, and the disposition in that order.
+fn dry_run_invoke_plan(tool: &ToolRequest) -> (&'static str, &'static str, &'static str) {
+    match tool {
+        ToolRequest::State(_) => (
+            "read-only",
+            DRY_RUN_SUBMIT_OPERATION,
+            DRY_RUN_PREVIEW_DISPOSITION,
+        ),
+        ToolRequest::Packet(_) | ToolRequest::Query(_) => (
+            "read-only",
+            DRY_RUN_INVOKE_READ_OPERATION,
+            DRY_RUN_PREVIEW_DISPOSITION,
+        ),
+        ToolRequest::Observe(_)
+        | ToolRequest::Act(_)
+        | ToolRequest::Verify(_)
+        | ToolRequest::Coordinate(_)
+        | ToolRequest::Finish(_) => (
+            "effectful",
+            DRY_RUN_ROUTE_WITHHELD,
+            DRY_RUN_UNSUPPORTED_DISPOSITION,
+        ),
+    }
+}
+
+/// Answers one invocation dry run with zero side effects (I7.17).
+///
+/// Runs the same bridge-local inert validation as a real invoke so malformed
+/// input fails closed with the identical `HOST_REQUEST_INVALID` shape, then
+/// returns the normalized dry-run envelope with the static preview and its
+/// evidence/source. The gateway, the trusted port, and the admitted transport
+/// are never called: no envelope is built, no replay entry is recorded, and
+/// the target state plus the external-effect ledger stay exactly unchanged.
+/// No kernel simulation or external validation runs on this path.
+fn dry_run_invocation(runner: &BridgeRunner, request: &HostInvocationRequest) -> Response {
+    if let Err(error) = request.validate() {
+        return host_gateway_error(&HostGatewayError::from(error));
+    }
+    let (effect_class, route, disposition) = dry_run_invoke_plan(&request.tool);
+    let statement = if disposition == DRY_RUN_UNSUPPORTED_DISPOSITION {
+        "DRY_RUN_UNSUPPORTED: no validation/simulation ran against the target operation; \
+         only bridge-local request-shape validation passed; no effects were issued and \
+         no transport bytes were sent"
+    } else {
+        "bridge-local inert validation passed; no kernel simulation or external validation \
+         ran; no effects were issued and no transport bytes were sent"
+    };
+    Response::DryRun {
+        correlation_id: request.correlation_id.as_str().to_owned(),
+        operation: "invoke",
+        disposition,
+        preview: DryRunPreview {
+            canonical_tool_name: Some(request.tool.canonical_name().to_owned()),
+            operation_handle: None,
+            effect_class,
+            route,
+            deadline_preference_ms: request.deadline_preference_ms,
+            simulated: false,
+        },
+        evidence: DryRunEvidence {
+            source: DRY_RUN_PREVIEW_SOURCE,
+            inert_validation: "passed",
+            statement: statement.to_owned(),
+        },
+        binding: dry_run_binding(runner),
+    }
+}
+
+/// Answers one cancellation dry run with zero side effects (I7.17).
+///
+/// The bridge owns no safe cancellation simulator, so after the same
+/// bridge-local inert validation as a real cancel this always answers
+/// `DRY_RUN_UNSUPPORTED` with the best static preview: the exact opaque
+/// target echoed without interpretation plus the live attach binding. No
+/// probe, cancel, or reconcile envelope is ever sent and the target operation
+/// is untouched. No validation/simulation ran against the target operation.
+fn dry_run_cancellation(runner: &BridgeRunner, request: &HostCancellationRequest) -> Response {
+    if let Err(error) = request.validate() {
+        return host_gateway_error(&HostGatewayError::from(error));
+    }
+    Response::DryRun {
+        correlation_id: request.correlation_id.as_str().to_owned(),
+        operation: "cancel",
+        disposition: DRY_RUN_UNSUPPORTED_DISPOSITION,
+        preview: DryRunPreview {
+            canonical_tool_name: None,
+            operation_handle: Some(request.operation_handle.as_str().to_owned()),
+            effect_class: "cancellation-probe",
+            route: DRY_RUN_ROUTE_WITHHELD,
+            deadline_preference_ms: request.deadline_preference_ms,
+            simulated: false,
+        },
+        evidence: DryRunEvidence {
+            source: DRY_RUN_PREVIEW_SOURCE,
+            inert_validation: "passed",
+            statement:
+                "DRY_RUN_UNSUPPORTED: no validation/simulation ran against the target operation; \
+                only bridge-local request-shape validation passed; the exact target was echoed \
+                without interpretation and no cancellation was issued"
+                    .to_owned(),
+        },
+        binding: dry_run_binding(runner),
     }
 }
 
@@ -834,6 +1089,7 @@ fn status_response(profile: Profile, runner: &BridgeRunner) -> Response {
             recovery: "attach and activate before host requests; reconnect requires a live attach",
             reactive: None,
             bootstrap: None,
+            resources: None,
         },
         Some(view) => Response::Status {
             profile: Profile::as_str(profile),
@@ -850,6 +1106,7 @@ fn status_response(profile: Profile, runner: &BridgeRunner) -> Response {
             recovery: "reconnect with the live connection, session, generation, epoch, and fence nonce from this status; stale targets fail closed",
             reactive: Some(reactive_status_view(runner)),
             bootstrap: None,
+            resources: Some(resource_status_view(runner)),
         },
     }
 }
@@ -870,6 +1127,16 @@ fn reactive_status_view(runner: &BridgeRunner) -> ReactiveStatusView {
             .map(|item| item.item_id.clone())
             .collect(),
         attention_truncated: truncated,
+    }
+}
+
+/// Projects the attach-scoped resource projection summary for Status.
+///
+/// Read-only: counts retained immutable snapshots. Never touches dispatch,
+/// activation, transport, or registry state.
+fn resource_status_view(runner: &BridgeRunner) -> ResourceRegistryView {
+    ResourceRegistryView {
+        entries: runner.resource_registry_len(),
     }
 }
 
@@ -1135,6 +1402,67 @@ mod tests {
         }
     }"#;
 
+    const DRY_RUN_INVOKE: &str = r#"{
+        "op":"dry_run_invoke",
+        "request":{
+            "protocol_version":"2026-07-28",
+            "correlation_id":"host-request-1",
+            "client_capabilities":{"tasks":false},
+            "tool":{"name":"eliot.state","arguments":{"include":["task"]}},
+            "deadline_preference_ms":5000,
+            "observed_context":{
+                "host_session_hint":"host-turn-1",
+                "observed_resource_refs":[],
+                "event_cursors":[],
+                "trace_context":{}
+            }
+        }
+    }"#;
+
+    const DRY_RUN_CANCEL: &str = r#"{
+        "op":"dry_run_cancel",
+        "request":{
+            "protocol_version":"2026-07-28",
+            "correlation_id":"host-cancel-1",
+            "operation_handle":"kernel-operation-1",
+            "reason":null,
+            "deadline_preference_ms":2000,
+            "observed_context":{
+                "host_session_hint":null,
+                "observed_resource_refs":[],
+                "event_cursors":[],
+                "trace_context":{}
+            }
+        }
+    }"#;
+
+    const DRY_RUN_SEND: &str = r#"{
+        "op":"dry_run_invoke",
+        "request":{
+            "protocol_version":"2026-07-28",
+            "correlation_id":"host-dryrun-send-1",
+            "client_capabilities":{"tasks":false},
+            "tool":{"name":"eliot.coordinate","arguments":{"operation":"send","recipient_ref":"peer-1","message":{"text":"hello"}}},
+            "deadline_preference_ms":5000,
+            "observed_context":{
+                "host_session_hint":"host-turn-1",
+                "observed_resource_refs":[],
+                "event_cursors":[],
+                "trace_context":{}
+            }
+        }
+    }"#;
+
+    fn dry_run_test_runner() -> BridgeRunner {
+        BridgeRunner::new(
+            Profile::SpineFunctional,
+            eliot_agent_bridge_core::ProviderReadiness::all_admitted(),
+            None,
+            None,
+        )
+        .expect("test runner must compose without a kernel port")
+    }
+
     // WORK_UNIT_CASE: 977/11
     #[test]
     fn raw_forward_frame_is_not_a_public_operation() {
@@ -1144,6 +1472,205 @@ mod tests {
     }
 
     // WORK_UNIT_CASE: 977/2
+    #[test]
+    fn dry_run_ops_deserialize_and_real_ops_take_no_dry_run_flag() {
+        assert!(matches!(
+            serde_json::from_str::<Request>(DRY_RUN_INVOKE)
+                .expect("dry-run invoke must deserialize"),
+            Request::DryRunInvoke { .. }
+        ));
+        assert!(matches!(
+            serde_json::from_str::<Request>(DRY_RUN_CANCEL)
+                .expect("dry-run cancel must deserialize"),
+            Request::DryRunCancel { .. }
+        ));
+        // The live Invoke/Cancel shapes are unchanged: a dry_run flag on them
+        // is rejected instead of silently altering dispatch semantics.
+        let flagged = INVOKE.replace("\"op\":\"invoke\",", "\"op\":\"invoke\",\"dry_run\":true,");
+        let error = serde_json::from_str::<Request>(&flagged)
+            .expect_err("live invoke must not accept a dry_run flag");
+        assert!(error.to_string().contains("unknown field"));
+        let bogus = DRY_RUN_INVOKE.replace(
+            "\"op\":\"dry_run_invoke\",",
+            "\"op\":\"dry_run_invoke\",\"bogus\":1,",
+        );
+        let error = serde_json::from_str::<Request>(&bogus)
+            .expect_err("dry-run invoke must reject unknown fields");
+        assert!(error.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn dry_run_ops_pass_production_decode_gate_to_dispatch() {
+        // The production stdio loop decodes through decode_bounded_request
+        // (pre-scan + envelope shape + typed Request), not raw serde: dry-run
+        // wire ingress must survive that exact pipeline to reach the
+        // implementation, and foreign members must fail closed there.
+        assert!(matches!(
+            decode_bounded_request(DRY_RUN_INVOKE).expect("dry-run invoke must pass the gate"),
+            Request::DryRunInvoke { .. }
+        ));
+        assert!(matches!(
+            decode_bounded_request(DRY_RUN_CANCEL).expect("dry-run cancel must pass the gate"),
+            Request::DryRunCancel { .. }
+        ));
+        let bogus = DRY_RUN_INVOKE.replace(
+            "\"op\":\"dry_run_invoke\",",
+            "\"op\":\"dry_run_invoke\",\"bogus\":1,",
+        );
+        let detail = decode_bounded_request(&bogus).expect_err("gate must reject foreign members");
+        assert!(
+            detail.contains(REQUEST_INPUT_PROFILE_ID),
+            "gate rejection must cite the profile, got: {detail}"
+        );
+    }
+
+    #[test]
+    fn dry_run_read_only_invoke_returns_preview_without_dispatch() {
+        // Zero side effects hold by construction: dry_run_invocation takes
+        // only a read-only runner view and the inert request. No gateway, no
+        // trusted port, and no mutable runner cross this call, so no envelope
+        // is built, no replay entry is recorded, and no transport byte moves.
+        let Request::DryRunInvoke { request } =
+            serde_json::from_str::<Request>(DRY_RUN_INVOKE).expect("dry-run must deserialize")
+        else {
+            panic!("expected dry-run invoke");
+        };
+        let runner = dry_run_test_runner();
+        let response = dry_run_invocation(&runner, &request);
+        let Response::DryRun {
+            correlation_id,
+            operation,
+            disposition,
+            preview,
+            evidence,
+            binding,
+        } = response
+        else {
+            panic!("dry run must answer its own envelope, never an admission");
+        };
+        assert_eq!(correlation_id, "host-request-1");
+        assert_eq!(operation, "invoke");
+        assert_eq!(disposition, "DRY_RUN_PREVIEW");
+        assert_eq!(preview.canonical_tool_name.as_deref(), Some("eliot.state"));
+        assert_eq!(preview.effect_class, "read-only");
+        assert_eq!(preview.route, "agent_host_request_submit");
+        assert_eq!(preview.deadline_preference_ms, Some(5000));
+        assert!(!preview.simulated);
+        assert_eq!(evidence.source, "bridge-static-preview.v1");
+        assert_eq!(evidence.inert_validation, "passed");
+        assert!(evidence.statement.contains("no kernel simulation"));
+        assert!(!binding.attached, "unattached preview must say so");
+        assert!(binding.connection_id.is_none());
+        let value = serde_json::to_value(&Response::DryRun {
+            correlation_id: correlation_id.clone(),
+            operation,
+            disposition,
+            preview: preview.clone(),
+            evidence: evidence.clone(),
+            binding: binding.clone(),
+        })
+        .expect("dry-run envelope must serialize");
+        assert_eq!(value["status"], Value::String("dry_run".to_owned()));
+        assert_eq!(
+            value["disposition"],
+            Value::String("DRY_RUN_PREVIEW".to_owned())
+        );
+    }
+
+    #[test]
+    fn dry_run_effectful_invoke_returns_unsupported_with_static_preview() {
+        let Request::DryRunInvoke { request } =
+            serde_json::from_str::<Request>(DRY_RUN_SEND).expect("dry-run must deserialize")
+        else {
+            panic!("expected dry-run invoke");
+        };
+        let runner = dry_run_test_runner();
+        let response = dry_run_invocation(&runner, &request);
+        let Response::DryRun {
+            disposition,
+            preview,
+            evidence,
+            ..
+        } = response
+        else {
+            panic!("effectful dry run must stay a dry-run envelope");
+        };
+        assert_eq!(disposition, "DRY_RUN_UNSUPPORTED");
+        assert_eq!(
+            preview.canonical_tool_name.as_deref(),
+            Some("eliot.coordinate")
+        );
+        assert_eq!(preview.effect_class, "effectful");
+        assert_eq!(preview.route, "withheld-no-simulator");
+        assert!(!preview.simulated);
+        assert!(evidence.statement.contains("DRY_RUN_UNSUPPORTED"));
+        assert!(
+            evidence.statement.contains("no validation/simulation ran"),
+            "unsupported preview must state plainly that no validation/simulation ran"
+        );
+        assert!(
+            !evidence.statement.contains("simulation succeeded")
+                && !evidence.statement.contains("validation succeeded")
+                && !evidence.statement.contains("admitted"),
+            "unsupported preview must not assert external validation occurred"
+        );
+    }
+
+    #[test]
+    fn dry_run_cancel_returns_unsupported_with_exact_target_echo() {
+        let Request::DryRunCancel { request } =
+            serde_json::from_str::<Request>(DRY_RUN_CANCEL).expect("dry-run must deserialize")
+        else {
+            panic!("expected dry-run cancel");
+        };
+        let runner = dry_run_test_runner();
+        let response = dry_run_cancellation(&runner, &request);
+        let Response::DryRun {
+            correlation_id,
+            operation,
+            disposition,
+            preview,
+            evidence,
+            ..
+        } = response
+        else {
+            panic!("cancel dry run must stay a dry-run envelope");
+        };
+        assert_eq!(correlation_id, "host-cancel-1");
+        assert_eq!(operation, "cancel");
+        assert_eq!(disposition, "DRY_RUN_UNSUPPORTED");
+        assert_eq!(
+            preview.operation_handle.as_deref(),
+            Some("kernel-operation-1")
+        );
+        assert_eq!(preview.effect_class, "cancellation-probe");
+        assert!(!preview.simulated);
+        assert!(evidence.statement.contains("no validation/simulation ran"));
+    }
+
+    #[test]
+    fn dry_run_malformed_input_fails_closed_like_live_dispatch() {
+        let Request::DryRunInvoke { mut request } =
+            serde_json::from_str::<Request>(DRY_RUN_INVOKE).expect("dry-run must deserialize")
+        else {
+            panic!("expected dry-run invoke");
+        };
+        request.deadline_preference_ms = Some(0);
+        let runner = dry_run_test_runner();
+        let response = dry_run_invocation(&runner, &request);
+        let value = serde_json::to_value(&response).expect("error must serialize");
+        assert_eq!(
+            value["status"],
+            Value::String("error".to_owned()),
+            "malformed dry run must fail closed, never preview"
+        );
+        assert_eq!(
+            value["code"],
+            Value::String("HOST_REQUEST_INVALID".to_owned()),
+            "malformed dry run must reuse the live-dispatch rejection shape"
+        );
+    }
+
     #[test]
     fn typed_invoke_and_cancel_deserialize() {
         assert!(matches!(
@@ -1388,12 +1915,18 @@ mod tests {
         assert_eq!(view.pending, 0);
         assert!(view.attention_item_ids.is_empty());
         assert!(!view.attention_truncated);
+        let resources = resource_status_view(&runner);
+        assert_eq!(resources.entries, 0);
         let response = status_response(Profile::SpineFunctional, &runner);
         let value = serde_json::to_value(&response).expect("status must serialize");
         assert_eq!(value["attached"], Value::Bool(false));
         assert!(
             value.get("reactive").is_none(),
             "detached status carries no reactive key"
+        );
+        assert!(
+            value.get("resources").is_none(),
+            "detached status carries no resources key"
         );
     }
 
@@ -1513,6 +2046,8 @@ mod tests {
                         Request::Attach { .. } => "attach",
                         Request::Invoke { .. } => "invoke",
                         Request::Cancel { .. } => "cancel",
+                        Request::DryRunInvoke { .. } => "dry_run_invoke",
+                        Request::DryRunCancel { .. } => "dry_run_cancel",
                         Request::ForwardHook { .. } => "forward_hook",
                         Request::ForwardEvent { .. } => "forward_event",
                         Request::ReconcileExternal {} => "reconcile_external",

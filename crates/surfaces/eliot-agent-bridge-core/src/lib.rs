@@ -29,6 +29,11 @@ use eliot_skill::{
 use serde::{Deserialize, Deserializer, Serialize, de};
 use thiserror::Error;
 
+mod resources;
+pub use resources::{
+    DeliveryStatus, HotResourceView, MAX_CONTENT_BYTES, MAX_PREVIEW_BYTES, MAX_REGISTRY_ENTRIES,
+    MAX_URI_BYTES, ResourceHandle, ResourceKind, ResourceRegistry, ResourceUri, ToolResultReceipt,
+};
 mod terminal_inputs;
 pub use terminal_inputs::{
     AttemptTransition, CanonicalWriteRefs, CoverageFlags, RecoveryDirective, RecoveryDirectiveKind,
@@ -865,6 +870,7 @@ pub struct AgentBridgeCore {
     terminal_coverage: CoverageFlags,
     stale_ui_disposition: Option<String>,
     error_event_refs: Vec<String>,
+    resources: ResourceRegistry,
 }
 
 impl AgentBridgeCore {
@@ -893,6 +899,7 @@ impl AgentBridgeCore {
             terminal_coverage: CoverageFlags::default(),
             stale_ui_disposition: None,
             error_event_refs: Vec::new(),
+            resources: ResourceRegistry::new(),
         }
     }
 
@@ -959,6 +966,7 @@ impl AgentBridgeCore {
         self.terminal_coverage = CoverageFlags::default();
         self.stale_ui_disposition = None;
         self.error_event_refs.clear();
+        self.resources.clear();
         self.attach_view().ok_or(BridgeError::NotAttached)
     }
 
@@ -1761,6 +1769,64 @@ impl AgentBridgeCore {
             BridgeError::PlanGap(PlanGap::missing(RequiredProvider::SkillLifecyclePort))
         })
     }
+
+    /// Publishes one large evidence snapshot and returns its bounded
+    /// hot-response projection: a preview plus an immutable
+    /// `eliot://evidence/<id>` handle. Requires the attached authority, which
+    /// is the scope authorization on resolution: no attach, no projection.
+    pub fn publish_evidence(&mut self, content: Vec<u8>) -> Result<HotResourceView, BridgeError> {
+        self.require_attached()?;
+        self.resources.publish_evidence(content)
+    }
+
+    /// Publishes one canonical resource snapshot at its exact I7.18 URI and
+    /// returns its bounded hot-response projection. Fails closed on
+    /// non-canonical URIs and on republishing an immutable URI with different
+    /// bytes.
+    pub fn publish_resource(
+        &mut self,
+        uri: &ResourceUri,
+        content: Vec<u8>,
+    ) -> Result<HotResourceView, BridgeError> {
+        self.require_attached()?;
+        self.resources.publish(uri, content)
+    }
+
+    /// Explicitly expands one previously published handle to its immutable
+    /// referenced content. Full evidence, audit, and large-report content is
+    /// available only through this call, never inline in a hot response.
+    pub fn expand_resource(&self, handle: &ResourceHandle) -> Result<Vec<u8>, BridgeError> {
+        self.require_attached()?;
+        self.resources.expand(handle)
+    }
+
+    /// Projects one tool result into its delivery receipt carrying the exact
+    /// result digest, the admissible source handle, the rendered
+    /// bytes/tokens measured under the actual route tokenizer, and the
+    /// delivery completeness.
+    pub fn project_tool_result(
+        &self,
+        result_bytes: &[u8],
+        source_handle: ResourceUri,
+        tokens_rendered: u64,
+        delivery: DeliveryStatus,
+    ) -> Result<ToolResultReceipt, BridgeError> {
+        self.require_attached()?;
+        Ok(ToolResultReceipt::project(
+            result_bytes,
+            source_handle,
+            tokens_rendered,
+            delivery,
+        ))
+    }
+
+    /// Number of immutable snapshots retained in the attach-scoped resource
+    /// projection. The registry is cleared on every new attach, so this
+    /// count describes only the live attach.
+    #[must_use]
+    pub fn resource_registry_len(&self) -> usize {
+        self.resources.len()
+    }
 }
 
 /// Sanitized injected-provider failure. It must not contain credentials or raw
@@ -1812,6 +1878,20 @@ pub enum BridgeError {
     AckIdentityMismatch,
     #[error("provider returned invalid event disposition {0:?}")]
     InvalidEventDisposition(EventDisposition),
+    #[error("invalid eliot:// resource identity: {reason}")]
+    InvalidResourceUri { reason: &'static str },
+    #[error("unknown resource handle: {uri}")]
+    UnknownResource { uri: String },
+    #[error("resource handle digest does not match stored content")]
+    ResourceDigestMismatch,
+    #[error("immutable resource URI republished with different content")]
+    ResourceImmutableConflict,
+    #[error("attach-scoped resource projection is full (capacity {capacity})")]
+    ResourceRegistryFull { capacity: usize },
+    #[error("resource content of {bytes} bytes exceeds projection capacity {capacity}")]
+    ResourceTooLarge { bytes: usize, capacity: usize },
+    #[error("incomplete tool-result delivery {delivery:?} cannot satisfy complete evidence")]
+    IncompleteDelivery { delivery: DeliveryStatus },
     #[error(transparent)]
     Skill(#[from] SkillError),
 }
