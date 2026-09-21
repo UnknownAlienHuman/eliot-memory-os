@@ -65,6 +65,7 @@ route_topic = "instrument verifier code graph code intelligence impact test sele
 path_globs = [
   "crates/instrument/**",
   "crates/eliot-sim-core/**",
+  "crates/bridges/**",
   "bins/eliot-testd/**",
 ]
 documentation_handles = ["I10.8.17", "I18.18", "I18.41"]

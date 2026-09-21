@@ -1769,8 +1769,7 @@ impl RedbRecoveryStore {
             // matching digest proves the same result, so binding the missing
             // body is monotonic completion, not an overwrite. Anything else
             // under the same identity stays a conflict.
-            let completes_legacy =
-                same_digest && existing.result_response.is_none();
+            let completes_legacy = same_digest && existing.result_response.is_none();
             if !completes_legacy {
                 return Err(OrsError::HostRequestIdentityConflict {
                     operation_id: operation_id.as_str().to_owned(),
@@ -2176,8 +2175,7 @@ impl RedbRecoveryStore {
                 // unchanged, so an at-least-once retry of an applied
                 // non-admission advance stays idempotent. Conflicting
                 // evidence below still fails without overwriting.
-                (Some(..), Some(..), None) => true,
-                (None, None, None) => true,
+                (Some(..), Some(..), None) | (None, None, None) => true,
                 _ => false,
             };
             if !replayed {
@@ -4528,6 +4526,19 @@ impl RedbRecoveryStore {
         store.initialize()?;
         store.recover_interrupted_execution()?;
         Ok(store)
+    }
+
+    /// Opens a Kernel-route test store with the structural Kernel-route evidence.
+    ///
+    /// Test-only composition seam (issue #2031): binds
+    /// [`crate::test_support::KernelRouteEvidence`] so Kernel-route tests share
+    /// one evidence binding instead of vendoring their own. Production
+    /// composition keeps binding its own provider through
+    /// [`Self::open_with_evidence`]. Compiled only with the `test-support`
+    /// feature and never linked into production builds.
+    #[cfg(feature = "test-support")]
+    pub fn open_kernel_route_for_test(path: impl AsRef<Path>) -> Result<Self, OrsError> {
+        Self::open_with_evidence(path, Arc::new(crate::test_support::KernelRouteEvidence))
     }
 
     fn initialize(&self) -> Result<(), OrsError> {
@@ -7736,8 +7747,7 @@ mod host_request_result_tests {
         let early_digest = "e".repeat(64);
         let early_op =
             OperationIdentity::new(format!("hostreq:{early_digest}")).expect("valid operation");
-        early_store
-            .stage_host_request(&requested_fixture(early_op.as_str(), &early_digest))?;
+        early_store.stage_host_request(&requested_fixture(early_op.as_str(), &early_digest))?;
         assert!(matches!(
             early_store.persist_host_request_result(
                 &early_op,
@@ -7759,9 +7769,8 @@ mod host_request_result_tests {
                 "revision_heads": [{"key": "scope:scope-1", "revision": 3}],
             },
         });
-        let result_digest = crate::model::sha256_hex(
-            &serde_json::to_vec(&body).expect("test body must serialize"),
-        );
+        let result_digest =
+            crate::model::sha256_hex(&serde_json::to_vec(&body).expect("test body must serialize"));
         let received = store
             .persist_host_request_result(&operation, &digest, &result_digest, &body)?
             .expect("resulted record must load");
@@ -7854,7 +7863,10 @@ mod host_request_result_tests {
         let completed = store
             .persist_host_request_result(&operation, &digest, &result_digest, &body)?
             .expect("exact-digest completion must store");
-        assert_eq!(completed.result_digest.as_deref(), Some(result_digest.as_str()));
+        assert_eq!(
+            completed.result_digest.as_deref(),
+            Some(result_digest.as_str())
+        );
         assert_eq!(completed.result_response.as_ref(), Some(&body));
         assert!(matches!(
             store.persist_host_request_result(&operation, &digest, &"0".repeat(64), &body,),
