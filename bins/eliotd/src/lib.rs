@@ -126,8 +126,8 @@ pub use dreamer_materials::{
     verify_resolved_bytes,
 };
 pub use dreamer_model_adapter::{
-    DreamerModelExecution, GovernedDreamerModelAdapter, KernelGenerationProjection,
-    ModelInvokeInput,
+    DAEMON_GENERATION_PROJECTION_OPERATION, DreamerModelExecution, GovernedDreamerModelAdapter,
+    KernelGenerationProjection, ModelInvokeInput, query_kernel_generation,
 };
 pub use first_run_wiring::{
     DisabledAutomationOutcome, FirstRunWiringError, inspect_first_run_defaults,
@@ -700,12 +700,85 @@ impl DaemonComposition {
                 eliot_governor::CompositionError::NotReady,
             ));
         }
-        Ok(
-            skill_lifecycle_adapters::ForwardingSkillLifecycle::with_catalogue(
-                self.governor.skill_lifecycle(),
-                Arc::clone(&self.skill_catalogue),
-            ),
+        Ok(self.shared_skill_adapter())
+    }
+
+    /// Builds the shared-catalogue skill adapter driven by the runtime
+    /// population callers below.
+    ///
+    /// Single construction site for every composition-held adapter: the
+    /// shared handle (not a fresh catalogue per call) is what makes
+    /// installation visible to later promotion/delivery/display through any
+    /// accessor. `skill_lifecycle()` above shares it.
+    fn shared_skill_adapter(
+        &self,
+    ) -> skill_lifecycle_adapters::ForwardingSkillLifecycle<
+        eliot_governor::GovernorSkillLifecycle<'_, dyn eliot_governor::KernelGenerationPort>,
+    > {
+        skill_lifecycle_adapters::ForwardingSkillLifecycle::with_catalogue(
+            self.governor.skill_lifecycle(),
+            Arc::clone(&self.skill_catalogue),
         )
+    }
+
+    /// Installs one canonical package source into the shared Governor Skill
+    /// catalogue (population caller, issue #1882).
+    ///
+    /// Composition seam for the runtime population driver: the Governor
+    /// owner hands over a validated package claim, its actual materialization
+    /// inputs, the explicit install context, and the tool-owner view; the
+    /// shared handle records the projected entry. No readiness gate: this
+    /// operates purely on daemon-held catalogue state (validated insert),
+    /// never on Governor recovery owners; promotion keeps the Governor
+    /// canonical gates, and drivers call post-admission. Returns the
+    /// installed Skill identity.
+    pub fn skill_install_package(
+        &self,
+        package: &eliot_skill::SkillPackage,
+        inputs: &eliot_skill::MaterializationInputs,
+        context: &eliot_skill::CatalogueInstallContext,
+        tools: &dyn eliot_skill::KnownTools,
+    ) -> Result<String, eliot_skill::SkillError> {
+        self.shared_skill_adapter()
+            .install_package(package, inputs, context, tools)
+    }
+
+    /// Issues the Hotset delivery receipt the runtime injector carries
+    /// (issue #1882).
+    ///
+    /// Same seam discipline as [`Self::skill_install_package`]: driven by the
+    /// runtime Hotset injector caller with its own approval handle; operates
+    /// on the shared catalogue only.
+    pub fn skill_deliver_hotset(
+        &self,
+        hotset_id: String,
+        skill_ids: Vec<String>,
+        approval_ref: String,
+        tools: &dyn eliot_skill::KnownTools,
+    ) -> Result<eliot_skill::HotsetDeliveryReceipt, eliot_skill::SkillError> {
+        self.shared_skill_adapter()
+            .deliver_hotset(hotset_id, skill_ids, approval_ref, tools)
+    }
+
+    /// Binds the runtime receiver's ack to its exact receipt, then displays
+    /// (issue #1882).
+    ///
+    /// Same seam discipline as [`Self::skill_install_package`]: only an
+    /// applied ack for the exact receipt reaches the catalogue boundary.
+    /// Receipt and ack travel by value, mirroring the owned display boundary.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "receipt/ack cross by value like the owned display boundary"
+    )]
+    pub fn skill_acknowledge_and_display(
+        &self,
+        skill_id: &str,
+        receipt: eliot_skill::HotsetDeliveryReceipt,
+        ack: eliot_skill::HotsetDeliveryAck,
+        tools: &dyn eliot_skill::KnownTools,
+    ) -> Result<eliot_skill::ActivatedSkillDisplay, eliot_skill::SkillError> {
+        self.shared_skill_adapter()
+            .acknowledge_and_display(skill_id, receipt, ack, tools)
     }
 
     /// Borrows the single Governor task lifecycle owner as a forwarding

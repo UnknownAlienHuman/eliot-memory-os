@@ -76,6 +76,7 @@ use eliot_agent_coordinator::{
 };
 use eliot_contracts::{ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence};
 use eliot_governor::{CompositionError, CompositionReadiness, RouteScopeFingerprint};
+use serde::Deserialize;
 
 use super::capability_admission::{
     CapabilityEvidenceRecord, DynamicCapabilityPulse, ProductionAdmissionRequest,
@@ -85,7 +86,7 @@ use super::capability_admission::{
 use super::capability_evidence_wiring::GovernorCapabilityAdmission;
 use super::capability_outcome::{AttemptReceipt, FallbackOutcomeRequest, fallback_outcome};
 use super::route_receipts::effective_route_key;
-use super::{DaemonComposition, SERVICE_NAME};
+use super::{DaemonComposition, DaemonKernelClient, SERVICE_NAME, kernel_port_error};
 
 /// Closed model-execution port behind the governed invoke.
 ///
@@ -645,6 +646,90 @@ fn bind_kernel_generation_projection(
         ))
     })?;
     Ok(digest.as_str().to_owned())
+}
+
+/// Authenticated daemon operation selector for the Kernel-owned active
+/// generation projection (R4 route contract). The Kernel serves
+/// `daemon_generation_projection`; this lane never mints the selector.
+pub const DAEMON_GENERATION_PROJECTION_OPERATION: &str = "daemon_generation_projection";
+
+/// Kernel-issued generation projection response value (R4 route contract).
+///
+/// Closed shape inside the authenticated `status: known` envelope:
+/// `{version: 1, fingerprint, state_fence}`. Generation and epoch travel
+/// only inside the fence; no route scope or scalar is accepted.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GenerationProjectionResponse {
+    version: u64,
+    fingerprint: String,
+    state_fence: StateFence,
+}
+
+/// Decodes one authenticated generation-projection response value against
+/// the admitted fence.
+///
+/// Pure transport-boundary validation: the shape must be closed, the version
+/// must be 1, the fingerprint must parse as lowercase SHA-256, and the
+/// returned fence must equal the admitted fence exactly (rotation between
+/// request and response fails closed). Transport failures never reach here.
+fn decode_generation_projection(
+    value: serde_json::Value,
+    admitted_fence: &StateFence,
+) -> Result<KernelGenerationProjection, CompositionError> {
+    let response: GenerationProjectionResponse = serde_json::from_value(value)
+        .map_err(|error| owner_error(format!("generation projection shape: {error}")))?;
+    if response.version != 1 {
+        return Err(owner_error(
+            "generation projection version must be 1".to_owned(),
+        ));
+    }
+    let digest: LowercaseSha256 = serde_json::from_value(serde_json::Value::String(
+        response.fingerprint,
+    ))
+    .map_err(|error| {
+        owner_error(format!(
+            "generation projection fingerprint is not a canonical digest: {error}"
+        ))
+    })?;
+    if response.state_fence != *admitted_fence {
+        return Err(owner_error(
+            "generation projection fence does not match the admitted fence (rotation)".to_owned(),
+        ));
+    }
+    Ok(KernelGenerationProjection {
+        fingerprint: digest.as_str().to_owned(),
+        fence: response.state_fence,
+    })
+}
+
+/// Fetches the Kernel-owned active generation projection over the
+/// authenticated daemon channel (R4).
+///
+/// Mirrors the `dreamer_admission` transport template: the admitted fence
+/// validates before any transport is touched, the call travels under a
+/// fresh operation-bound identity minted by the channel owner, and the
+/// typed response decodes through [`decode_generation_projection`] with
+/// exact admitted-fence binding. Transport, fenced, and contract failures
+/// surface as [`CompositionError::Kernel`]; absence or rotation is never
+/// converted into a default projection — callers propagate it as unknown.
+pub async fn query_kernel_generation(
+    kernel: &DaemonKernelClient,
+    admitted_fence: &StateFence,
+) -> Result<KernelGenerationProjection, CompositionError> {
+    admitted_fence
+        .validate()
+        .map_err(|error| owner_error(format!("generation query fence: {error}")))?;
+    let payload = serde_json::json!({
+        "version": 1,
+        "state_fence": admitted_fence,
+    });
+    let value = kernel
+        .transact_async(DAEMON_GENERATION_PROJECTION_OPERATION, payload)
+        .await
+        .map_err(kernel_port_error)
+        .map_err(CompositionError::Kernel)?;
+    decode_generation_projection(value, admitted_fence)
 }
 
 /// Records the result-intake join for one verified invoke result (C1).
@@ -2003,6 +2088,98 @@ mod tests {
             Some(INTAKE_PROOF_CEILING),
             "the intake marker must spell the owner ceiling exactly"
         );
+        Ok(())
+    }
+
+    fn projection_value(fingerprint: &str, fence: &StateFence) -> serde_json::Value {
+        serde_json::json!({
+            "version": 1,
+            "fingerprint": fingerprint,
+            "state_fence": fence,
+        })
+    }
+
+    #[test]
+    fn projection_response_binds_fingerprint_to_returned_fence() -> TestResult {
+        let fence = test_fence()?;
+        let hex = test_digest("t12-07-projection")?;
+        let projection =
+            decode_generation_projection(projection_value(hex.as_str(), &fence), &fence)?;
+        assert_eq!(projection.fingerprint, hex.as_str());
+        assert_eq!(projection.fence, fence);
+        Ok(())
+    }
+
+    #[test]
+    fn projection_response_rejects_wrong_version() -> TestResult {
+        let fence = test_fence()?;
+        let mut value = projection_value(test_digest("t12-07-projection")?.as_str(), &fence);
+        value["version"] = serde_json::json!(2);
+        match decode_generation_projection(value, &fence) {
+            Err(error) => assert!(
+                error.to_string().contains("version"),
+                "unexpected refusal: {error}"
+            ),
+            Ok(_) => panic!("version 2 must fail closed"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn projection_response_rejects_malformed_digest() -> TestResult {
+        let fence = test_fence()?;
+        match decode_generation_projection(projection_value("NOT-A-DIGEST", &fence), &fence) {
+            Err(error) => assert!(
+                error.to_string().contains("canonical digest"),
+                "unexpected refusal: {error}"
+            ),
+            Ok(_) => panic!("malformed digest must fail closed"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn projection_response_rejects_foreign_fence() -> TestResult {
+        let fence = test_fence()?;
+        let foreign = drifted_fence()?;
+        match decode_generation_projection(
+            projection_value(test_digest("t12-07-projection")?.as_str(), &foreign),
+            &fence,
+        ) {
+            Err(error) => assert!(
+                error.to_string().contains("rotation"),
+                "unexpected refusal: {error}"
+            ),
+            Ok(_) => panic!("foreign fence must fail closed"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn projection_response_rejects_unknown_fields() -> TestResult {
+        let fence = test_fence()?;
+        let mut value = projection_value(test_digest("t12-07-projection")?.as_str(), &fence);
+        value["route_scope"] = serde_json::json!("daemon");
+        match decode_generation_projection(value, &fence) {
+            Err(error) => assert!(
+                error.to_string().contains("shape"),
+                "unexpected refusal: {error}"
+            ),
+            Ok(_) => panic!("unknown fields must fail closed"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn projection_response_rejects_non_object() -> TestResult {
+        let fence = test_fence()?;
+        match decode_generation_projection(serde_json::json!("known"), &fence) {
+            Err(error) => assert!(
+                error.to_string().contains("shape"),
+                "unexpected refusal: {error}"
+            ),
+            Ok(_) => panic!("non-object must fail closed"),
+        }
         Ok(())
     }
 }
