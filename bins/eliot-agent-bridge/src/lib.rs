@@ -45,6 +45,7 @@ use eliot_runtime::{Runtime, RuntimeConfig};
 mod cli_contract;
 mod kernel_activation_client;
 mod kernel_host_request_client;
+pub mod memory_handle_join;
 pub mod reactive_injection_receipts;
 pub mod settled_plan_transport;
 mod understanding_bootstrap;
@@ -57,6 +58,7 @@ use kernel_activation_client::{
     denial_reason_code,
 };
 use kernel_host_request_client::{KernelHostRequestClient, ReplayCacheEntry};
+pub use memory_handle_join::{ResolvedMemoryHandle, parse_memory_handle};
 pub use reactive_injection_receipts::{
     AdmissionBasis, AttentionItem, CueKind, DeliveryPoint, FiringEvidence, InjectionReceipt,
     ItemDisposition, NormalizedCue, REACTIVE_INJECTION_CONTRACT, ReactiveInjectionError,
@@ -1897,6 +1899,49 @@ mod tests {
                     .is_err()
             );
             assert!(restored.restore_reactive_ledger(&[]).is_err());
+        }
+
+        #[test]
+        fn ledger_snapshot_pins_the_store_facing_byte_contract() {
+            // The C4 durable seam (Store owner persists these bytes verbatim):
+            // contract stamp, canonical JSON shape, and the 1 MiB bound,
+            // straight through the production export entry. Delivery
+            // semantics stay with the bridge ledger; the Store never
+            // interprets beyond the structural stamp.
+            let mut runner = reactive_runner(true);
+            runner
+                .admit_reactive_injection(
+                    reactive_cue("rev-1"),
+                    Some(reactive_firing()),
+                    vec!["rel-reactive-a".to_owned()],
+                    reactive_admission(Severity::Normal, RiskTier::Low),
+                )
+                .expect("admit");
+            let bytes = runner.reactive_ledger_snapshot().expect("snapshot");
+            assert!(
+                bytes.len()
+                    <= super::reactive_injection_receipts::MAX_LEDGER_JSON_BYTES,
+                "snapshot must fit the bounded Store write"
+            );
+            let value: serde_json::Value =
+                serde_json::from_slice(&bytes).expect("snapshot is JSON");
+            assert_eq!(
+                value.get("contract").and_then(|contract| contract.as_str()),
+                Some(super::REACTIVE_INJECTION_CONTRACT),
+                "snapshot carries the delivery-record contract stamp"
+            );
+            for key in [
+                "contract",
+                "next_item_seq",
+                "next_receipt_seq",
+                "items",
+                "receipts",
+            ] {
+                assert!(
+                    value.get(key).is_some(),
+                    "snapshot shape must carry {key} for the Store reader"
+                );
+            }
         }
 
         #[test]
