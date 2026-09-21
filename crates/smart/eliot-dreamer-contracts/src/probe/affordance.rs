@@ -22,13 +22,15 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    budget::BudgetDemand,
     error::ContractViolation,
     rival::{ConditionAssumptionRef, MaterialClaimRef, RivalPredictionRef},
 };
 
 use super::{
     bounds::check_sequence,
-    objective::{ProbeObjectiveRef, ProbeOwnerRef},
+    input::{ProbeCapabilityAvailability, ProbeExternalOwners, ProbeLifecycle},
+    objective::{ProbeObjectiveBinding, ProbeObjectiveRef, ProbeOwnerRef},
     result::PossibleResultSchema,
     validation,
 };
@@ -574,6 +576,42 @@ pub enum AffordanceTarget {
     },
 }
 
+/// Canonical planning semantics that must accompany a planner-ready
+/// affordance. Each member is optional on the legacy constructor so old
+/// callers can still deserialize/inspect declarations; the planner treats a
+/// missing member as an explicit non-ready gap.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProbeAffordanceSemantics {
+    pub objective_binding: Option<ProbeObjectiveBinding>,
+    pub budget_demand: Option<BudgetDemand>,
+    pub lifecycle: Option<ProbeLifecycle>,
+    pub external_owners: Option<ProbeExternalOwners>,
+    pub capability: Option<ProbeCapabilityAvailability>,
+}
+
+impl ProbeAffordanceSemantics {
+    pub fn validate(&self) -> Result<(), ContractViolation> {
+        validation::preflight(self)?;
+        if let Some(binding) = &self.objective_binding {
+            binding.validate()?;
+        }
+        if let Some(demand) = &self.budget_demand {
+            demand.validate()?;
+        }
+        if let Some(lifecycle) = &self.lifecycle {
+            lifecycle.validate()?;
+        }
+        if let Some(external_owners) = &self.external_owners {
+            external_owners.validate()?;
+        }
+        if let Some(capability) = &self.capability {
+            capability.validate()?;
+        }
+        Ok(())
+    }
+}
+
 impl AffordanceTarget {
     /// Validates digest-pinned target identity without resolving payloads.
     pub fn validate(&self) -> Result<(), ContractViolation> {
@@ -604,6 +642,59 @@ impl AffordanceTarget {
         }
         Ok(())
     }
+}
+
+fn validate_objective_binding(
+    target: &AffordanceTarget,
+    binding: &ProbeObjectiveBinding,
+) -> Result<(), ContractViolation> {
+    match target {
+        AffordanceTarget::RivalPredictions { .. } => {
+            if binding.claim.is_some() || binding.assumption.is_some() {
+                return Err(ContractViolation::BindingMismatch {
+                    field: "probe.affordance.objective_binding",
+                    reason: "rival target cannot carry claim or assumption binding".to_owned(),
+                });
+            }
+        }
+        AffordanceTarget::EvidenceGap { claim } => {
+            if binding.claim.as_ref() != Some(claim) || binding.assumption.is_some() {
+                return Err(ContractViolation::BindingMismatch {
+                    field: "probe.affordance.objective_binding.claim",
+                    reason: "evidence target is not bound to the exact claim".to_owned(),
+                });
+            }
+            if binding.denominator.is_none() {
+                return Err(ContractViolation::MissingField(
+                    "probe.affordance.objective_binding.denominator",
+                ));
+            }
+        }
+        AffordanceTarget::Assumption { assumption, claim } => {
+            if binding.assumption.as_ref() != Some(assumption)
+                || binding.claim.as_ref() != claim.as_ref()
+            {
+                return Err(ContractViolation::BindingMismatch {
+                    field: "probe.affordance.objective_binding.assumption",
+                    reason: "assumption target is not bound to the exact assumption/claim"
+                        .to_owned(),
+                });
+            }
+        }
+        AffordanceTarget::Objective { objective } => {
+            if binding.objective != *objective
+                || binding.claim.is_some()
+                || binding.assumption.is_some()
+            {
+                return Err(ContractViolation::BindingMismatch {
+                    field: "probe.affordance.objective_binding.objective",
+                    reason: "objective target is not bound to its exact objective identity"
+                        .to_owned(),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_owner(owner: &ProbeOwnerRef) -> Result<(), ContractViolation> {
@@ -668,6 +759,16 @@ pub struct InquiryAffordanceDescriptor {
     pub feasibility: FeasibilityDimension,
     /// Descriptive Human-attention dimension.
     pub attention: HumanAttentionDimension,
+    /// Exact objective/claim/assumption materiality and resolution binding.
+    pub objective_binding: Option<ProbeObjectiveBinding>,
+    /// Independent demand vector for this candidate.
+    pub budget_demand: Option<BudgetDemand>,
+    /// Cancellation, cleanup, rollback and unknown-outcome requirements.
+    pub lifecycle: Option<ProbeLifecycle>,
+    /// Exact external admission, execution, evidence, and verifier owners.
+    pub external_owners: Option<ProbeExternalOwners>,
+    /// Descriptive capability availability; never an execution permit.
+    pub capability: Option<ProbeCapabilityAvailability>,
     /// Frozen canonical digest of the preimage above, excluding itself.
     pub digest: String,
 }
@@ -737,6 +838,11 @@ impl InquiryAffordanceDescriptor {
             reversibility: params.reversibility,
             feasibility: params.feasibility,
             attention: params.attention,
+            objective_binding: None,
+            budget_demand: None,
+            lifecycle: None,
+            external_owners: None,
+            capability: None,
             digest: String::new(),
         };
         validation::preflight(&descriptor)?;
@@ -744,6 +850,23 @@ impl InquiryAffordanceDescriptor {
         descriptor.digest = descriptor.compute_digest_unchecked()?;
         validation::preflight(&descriptor)?;
         Ok(descriptor)
+    }
+
+    /// Attaches the complete planner-ready semantic declaration and reseals
+    /// the descriptor digest.
+    pub fn with_planning_semantics(
+        mut self,
+        semantics: ProbeAffordanceSemantics,
+    ) -> Result<Self, ContractViolation> {
+        semantics.validate()?;
+        self.objective_binding = semantics.objective_binding;
+        self.budget_demand = semantics.budget_demand;
+        self.lifecycle = semantics.lifecycle;
+        self.external_owners = semantics.external_owners;
+        self.capability = semantics.capability;
+        self.validate_shape()?;
+        self.digest = self.compute_digest_unchecked()?;
+        Ok(self)
     }
 
     /// Validates the descriptor shape and its frozen digest.
@@ -790,6 +913,11 @@ impl InquiryAffordanceDescriptor {
             reversibility: &'a ReversibilityDimension,
             feasibility: &'a FeasibilityDimension,
             attention: &'a HumanAttentionDimension,
+            objective_binding: &'a Option<ProbeObjectiveBinding>,
+            budget_demand: &'a Option<BudgetDemand>,
+            lifecycle: &'a Option<ProbeLifecycle>,
+            external_owners: &'a Option<ProbeExternalOwners>,
+            capability: &'a Option<ProbeCapabilityAvailability>,
         }
         validation::canonical_digest(&Preimage {
             schema_version: self.schema_version,
@@ -811,6 +939,11 @@ impl InquiryAffordanceDescriptor {
             reversibility: &self.reversibility,
             feasibility: &self.feasibility,
             attention: &self.attention,
+            objective_binding: &self.objective_binding,
+            budget_demand: &self.budget_demand,
+            lifecycle: &self.lifecycle,
+            external_owners: &self.external_owners,
+            capability: &self.capability,
         })
     }
 
@@ -846,6 +979,22 @@ impl InquiryAffordanceDescriptor {
         self.reversibility.validate()?;
         self.feasibility.validate()?;
         self.attention.validate()?;
+        if let Some(binding) = &self.objective_binding {
+            binding.validate()?;
+            validate_objective_binding(&self.target, binding)?;
+        }
+        if let Some(demand) = &self.budget_demand {
+            demand.validate()?;
+        }
+        if let Some(lifecycle) = &self.lifecycle {
+            lifecycle.validate()?;
+        }
+        if let Some(external_owners) = &self.external_owners {
+            external_owners.validate()?;
+        }
+        if let Some(capability) = &self.capability {
+            capability.validate()?;
+        }
         Ok(())
     }
 }
