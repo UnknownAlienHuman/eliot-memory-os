@@ -877,7 +877,7 @@ pub struct ExpectedDelta {
 }
 
 /// One semantic verifier with distinct success, partial, no-change,
-/// regression, failure, and unknown readings.
+/// regression, failure, unavailable, and unknown readings.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SemanticVerifier {
     /// Stable verifier identity.
@@ -895,6 +895,8 @@ pub struct SemanticVerifier {
     pub regression_note: String,
     /// Bounded failure reading.
     pub failure_note: String,
+    /// Bounded unavailable/capacity reading.
+    pub unavailable_note: String,
     /// Bounded unknown reading.
     pub unknown_note: String,
     /// Bounded observation window and denominator note.
@@ -1625,6 +1627,11 @@ fn validate_boundary_shapes(boundary: &MaintenanceBoundary) -> Result<(), Mainte
         MAX_NOTE_BYTES,
     )?;
     check_bounded_text(
+        &boundary.verifier.unavailable_note,
+        "boundary.unavailable",
+        MAX_NOTE_BYTES,
+    )?;
+    check_bounded_text(
         &boundary.verifier.unknown_note,
         "boundary.unknown",
         MAX_NOTE_BYTES,
@@ -2342,7 +2349,7 @@ fn verifier_is_process_only(verifier: &SemanticVerifier) -> bool {
     )
 }
 
-/// Checks that the six verifier outcomes remain independently observable.
+/// Checks that the seven verifier outcomes remain independently observable.
 fn verifier_semantics_are_distinct(verifier: &SemanticVerifier) -> bool {
     let notes = [
         verifier.success_note.as_str(),
@@ -2350,6 +2357,7 @@ fn verifier_semantics_are_distinct(verifier: &SemanticVerifier) -> bool {
         verifier.no_change_note.as_str(),
         verifier.regression_note.as_str(),
         verifier.failure_note.as_str(),
+        verifier.unavailable_note.as_str(),
         verifier.unknown_note.as_str(),
     ];
     let mut index = 0usize;
@@ -2564,6 +2572,7 @@ fn planned_text_bytes(
         boundary.verifier.no_change_note.as_str(),
         boundary.verifier.regression_note.as_str(),
         boundary.verifier.failure_note.as_str(),
+        boundary.verifier.unavailable_note.as_str(),
         boundary.verifier.unknown_note.as_str(),
         boundary.verifier.observation_window_note.as_str(),
         boundary.verifier.denominator_note.as_str(),
@@ -2872,6 +2881,33 @@ fn attempt_denominator_of(history: &PriorHistory) -> Vec<String> {
     history.expected_attempt_ids.clone()
 }
 
+/// Canonical identity material carried by every candidate digest.
+///
+/// The receipt output digest alone does not cover the admitted operation's
+/// requester, idempotency key, or state fence. Hashing the validated job as a
+/// canonical JSON value keeps those fields in the replay boundary without
+/// duplicating the shared admission contract in this leaf.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PlanIdentity {
+    receipt_digest: String,
+    job_binding_digest: String,
+}
+
+impl PlanIdentity {
+    fn from_job(
+        job: &DreamJobAdmission,
+        receipt_digest: String,
+    ) -> Result<Self, MaintenancePlanError> {
+        let bytes = canonical_json_bytes(job).map_err(|err| MaintenancePlanError::Digest {
+            detail: redact(&err.to_string()),
+        })?;
+        Ok(Self {
+            receipt_digest,
+            job_binding_digest: sha256_hex(&bytes),
+        })
+    }
+}
+
 /// Computes the deterministic digest binding the plan inputs.
 ///
 /// Ten explicit bindings mirror the canonical typed equivalent of the
@@ -2888,7 +2924,7 @@ fn compute_plan_digest(
     boundary: &MaintenanceBoundary,
     history: &PriorHistory,
     policy: &MaintenancePolicy,
-    receipt_digest: &str,
+    identity: &PlanIdentity,
 ) -> Result<String, MaintenancePlanError> {
     let mut parts: Vec<String> = vec![
         ["handle:", handle].concat(),
@@ -2930,7 +2966,8 @@ fn compute_plan_digest(
         ["policy-revision:", &policy.policy_revision.to_string()].concat(),
         ["policy-vocabulary:", &policy.allowed_op_kinds.join(",")].concat(),
         ["policy-partial:", &policy.allow_partial.to_string()].concat(),
-        ["receipt:", receipt_digest].concat(),
+        ["job-binding:", &identity.job_binding_digest].concat(),
+        ["receipt:", &identity.receipt_digest].concat(),
     ];
     for owner in &objective.decomposition_owners {
         parts.push(["decomposition-owner:", owner].concat());
@@ -3040,6 +3077,7 @@ fn compute_plan_digest(
         boundary.verifier.no_change_note.as_str(),
         boundary.verifier.regression_note.as_str(),
         boundary.verifier.failure_note.as_str(),
+        boundary.verifier.unavailable_note.as_str(),
         boundary.verifier.unknown_note.as_str(),
         boundary.verifier.observation_window_note.as_str(),
         boundary.verifier.denominator_note.as_str(),
@@ -3141,7 +3179,7 @@ fn emit_candidate(
     boundary: &MaintenanceBoundary,
     history: &PriorHistory,
     policy: &MaintenancePolicy,
-    receipt_digest: &str,
+    identity: &PlanIdentity,
     note: &str,
 ) -> Result<MaintenancePlanCandidate, MaintenancePlanError> {
     let handle = ["plan-", &objective.objective_id].concat();
@@ -3157,7 +3195,7 @@ fn emit_candidate(
         boundary,
         history,
         policy,
-        receipt_digest,
+        identity,
     )?;
     let mut stop_parts: Vec<String> = Vec::new();
     for operation in operations {
@@ -3186,7 +3224,7 @@ fn emit_candidate(
         required_decisions: boundary.required_decisions.clone(),
         stop_summary,
         preservation,
-        input_receipt_digest: receipt_digest.to_owned(),
+        input_receipt_digest: identity.receipt_digest.clone(),
         attempt_denominator: attempt_denominator_of(history),
         candidate_digest: digest,
         note: note.to_owned(),
@@ -3276,7 +3314,7 @@ pub fn propose_maintenance_plan(
             detail: "a plan binds exactly one explicit owner".to_owned(),
         });
     }
-    let receipt_digest = draft.receipt.output_digest.clone();
+    let identity = PlanIdentity::from_job(job, draft.receipt.output_digest.clone())?;
     if policy.cancelled {
         return emit_candidate(
             MaintenanceOutcome::Rejected,
@@ -3287,7 +3325,7 @@ pub fn propose_maintenance_plan(
             boundary,
             history,
             policy,
-            &receipt_digest,
+            &identity,
             "cancelled before emission; zero effects were produced",
         );
     }
@@ -3303,7 +3341,7 @@ pub fn propose_maintenance_plan(
             boundary,
             history,
             policy,
-            &receipt_digest,
+            &identity,
             "observation is at or beyond the frozen deadline; replay against the new revision",
         );
     }
@@ -3321,7 +3359,7 @@ pub fn propose_maintenance_plan(
                 boundary,
                 history,
                 policy,
-                &receipt_digest,
+                &identity,
                 "an unknown independent admitted budget cannot authorize a complete plan",
             );
         }
@@ -3335,7 +3373,7 @@ pub fn propose_maintenance_plan(
                 boundary,
                 history,
                 policy,
-                &receipt_digest,
+                &identity,
                 &[
                     "the independent admitted budget is exceeded for ",
                     dimension,
@@ -3355,7 +3393,7 @@ pub fn propose_maintenance_plan(
             boundary,
             history,
             policy,
-            &receipt_digest,
+            &identity,
             "unknown operation vocabulary names no admitted maintenance shape",
         );
     }
@@ -3369,7 +3407,7 @@ pub fn propose_maintenance_plan(
             boundary,
             history,
             policy,
-            &receipt_digest,
+            &identity,
             "unknown delta vocabulary names no admitted expectation shape",
         );
     }
@@ -3383,7 +3421,7 @@ pub fn propose_maintenance_plan(
             boundary,
             history,
             policy,
-            &receipt_digest,
+            &identity,
             "raw commands, secrets, live permits, and provider payloads are rejected",
         );
     }
@@ -3397,7 +3435,7 @@ pub fn propose_maintenance_plan(
             boundary,
             history,
             policy,
-            &receipt_digest,
+            &identity,
             "scheduling, recurrence, reservation, and execution language is rejected; plans stay candidate-only",
         );
     }
@@ -3411,7 +3449,7 @@ pub fn propose_maintenance_plan(
             boundary,
             history,
             policy,
-            &receipt_digest,
+            &identity,
             "privacy, cost, remote-access, model, and policy widening is rejected, not warned",
         );
     }
@@ -3425,7 +3463,7 @@ pub fn propose_maintenance_plan(
             boundary,
             history,
             policy,
-            &receipt_digest,
+            &identity,
             "generic optimization prose is not a plan; only exact observed conditions with owners and verifiers are admitted",
         );
     }
@@ -3439,7 +3477,7 @@ pub fn propose_maintenance_plan(
             boundary,
             history,
             policy,
-            &receipt_digest,
+            &identity,
             "incident and recovery conditions retain their operational owner outside Maintenance",
         );
     }
@@ -3453,7 +3491,7 @@ pub fn propose_maintenance_plan(
             boundary,
             history,
             policy,
-            &receipt_digest,
+            &identity,
             "external cadence references cannot create, schedule, launch, or execute work",
         );
     }
@@ -3469,7 +3507,7 @@ pub fn propose_maintenance_plan(
             boundary,
             history,
             policy,
-            &receipt_digest,
+            &identity,
             "an external cadence must be referenced by its owning automation contract",
         );
     }
@@ -3483,7 +3521,7 @@ pub fn propose_maintenance_plan(
             boundary,
             history,
             policy,
-            &receipt_digest,
+            &identity,
             "a trigger without evidence refs cannot ground a plan",
         );
     }
@@ -3503,7 +3541,7 @@ pub fn propose_maintenance_plan(
             boundary,
             history,
             policy,
-            &receipt_digest,
+            &identity,
             "signals without an evidence-backed user-outcome mapping prove no maintenance delta",
         );
     }
@@ -3521,7 +3559,7 @@ pub fn propose_maintenance_plan(
             boundary,
             history,
             policy,
-            &receipt_digest,
+            &identity,
             "the trigger mapping does not identify the exact supported product outcome",
         );
     }
@@ -3535,7 +3573,7 @@ pub fn propose_maintenance_plan(
             boundary,
             history,
             policy,
-            &receipt_digest,
+            &identity,
             "a one-shot denominator needs an explicit severity justification",
         );
     }
@@ -3550,7 +3588,7 @@ pub fn propose_maintenance_plan(
                 boundary,
                 history,
                 policy,
-                &receipt_digest,
+                &identity,
                 "partial observation coverage with named omitted denominator",
             );
         }
@@ -3563,7 +3601,7 @@ pub fn propose_maintenance_plan(
             boundary,
             history,
             policy,
-            &receipt_digest,
+            &identity,
             "incomplete observation denominator blocks a complete plan",
         );
     }
@@ -3578,7 +3616,7 @@ pub fn propose_maintenance_plan(
             boundary,
             history,
             policy,
-            &receipt_digest,
+            &identity,
             "independent multi-owner objectives require explicit decomposition, not one hidden generic job",
         );
     }
@@ -3592,7 +3630,7 @@ pub fn propose_maintenance_plan(
             boundary,
             history,
             policy,
-            &receipt_digest,
+            &identity,
             "operation ownership drifts from the single plan owner",
         );
     }
@@ -3606,7 +3644,7 @@ pub fn propose_maintenance_plan(
             boundary,
             history,
             policy,
-            &receipt_digest,
+            &identity,
             "dangling or self-referential dependencies name no finite graph",
         );
     }
@@ -3620,7 +3658,7 @@ pub fn propose_maintenance_plan(
             boundary,
             history,
             policy,
-            &receipt_digest,
+            &identity,
             "cyclic dependencies hide unbounded recurrence; only finite acyclic graphs are admitted",
         );
     }
@@ -3634,7 +3672,7 @@ pub fn propose_maintenance_plan(
             boundary,
             history,
             policy,
-            &receipt_digest,
+            &identity,
             "operation orders must be contiguous and every dependency must precede its consumer",
         );
     }
@@ -3651,7 +3689,7 @@ pub fn propose_maintenance_plan(
             boundary,
             history,
             policy,
-            &receipt_digest,
+            &identity,
             "an operation lacks typed cancellation, recovery, deadline, or no-progress boundaries",
         );
     }
@@ -3665,7 +3703,7 @@ pub fn propose_maintenance_plan(
             boundary,
             history,
             policy,
-            &receipt_digest,
+            &identity,
             "operation retry envelopes exceed the semantic verifier attempt ceiling",
         );
     }
@@ -3681,7 +3719,7 @@ pub fn propose_maintenance_plan(
             boundary,
             history,
             policy,
-            &receipt_digest,
+            &identity,
             "a semantic verifier must distinguish outcomes and observe the condition or effect, not process activity alone",
         );
     }
@@ -3695,7 +3733,7 @@ pub fn propose_maintenance_plan(
             boundary,
             history,
             policy,
-            &receipt_digest,
+            &identity,
             "every operation binds the single independent semantic verifier",
         );
     }
@@ -3709,7 +3747,7 @@ pub fn propose_maintenance_plan(
             boundary,
             history,
             policy,
-            &receipt_digest,
+            &identity,
             "every expected delta binds the single independent semantic verifier",
         );
     }
@@ -3723,7 +3761,7 @@ pub fn propose_maintenance_plan(
             boundary,
             history,
             policy,
-            &receipt_digest,
+            &identity,
             "every independent correctness, recovery, quality, resource, evidence, security, Human and user-outcome dimension needs a delta",
         );
     }
@@ -3737,7 +3775,7 @@ pub fn propose_maintenance_plan(
             boundary,
             history,
             policy,
-            &receipt_digest,
+            &identity,
             "cost improvement cannot compensate a safety or correctness shortfall",
         );
     }
@@ -3751,7 +3789,7 @@ pub fn propose_maintenance_plan(
             boundary,
             history,
             policy,
-            &receipt_digest,
+            &identity,
             "failed, stalled, hung, or unknown prior effects require reconciliation or changed evidence before repetition",
         );
     }
@@ -3764,7 +3802,7 @@ pub fn propose_maintenance_plan(
         boundary,
         history,
         policy,
-        &receipt_digest,
+        &identity,
         MAINTENANCE_PROOF_NOTE,
     )?;
     let mut identity_history = history.clone();
@@ -3780,7 +3818,7 @@ pub fn propose_maintenance_plan(
         boundary,
         &identity_history,
         policy,
-        &receipt_digest,
+        &identity,
     )?;
     for attempt in &history.attempts {
         if attempt.attempt_id.as_str() == job.operation_id.as_str() {
@@ -3797,7 +3835,7 @@ pub fn propose_maintenance_plan(
                 boundary,
                 &empty_history,
                 policy,
-                &receipt_digest,
+                &identity,
             )?;
             if let Some(previous_policy_revision) = attempt.policy_revision
                 && previous_policy_revision != policy.policy_revision
@@ -3811,7 +3849,7 @@ pub fn propose_maintenance_plan(
                     boundary,
                     history,
                     policy,
-                    &receipt_digest,
+                    &identity,
                     "same operation identity carries a changed policy revision; replay is stale",
                 );
             }
@@ -3827,7 +3865,7 @@ pub fn propose_maintenance_plan(
                     boundary,
                     history,
                     policy,
-                    &receipt_digest,
+                    &identity,
                     "same operation identity carries a different canonical request; identity conflict blocks transition",
                 );
             }
@@ -3845,7 +3883,7 @@ pub fn propose_maintenance_plan(
                 boundary,
                 history,
                 policy,
-                &receipt_digest,
+                &identity,
                 "equivalent plan without new evidence repeats no work",
             );
         }
@@ -4162,6 +4200,7 @@ mod tests {
                 no_change_note: "hit rate unchanged within measurement noise".to_owned(),
                 regression_note: "hit rate falls further on the same denominator".to_owned(),
                 failure_note: "surface unreachable during the window".to_owned(),
+                unavailable_note: "maintenance route is unavailable during the window".to_owned(),
                 unknown_note: "telemetry gap leaves the reading unknown".to_owned(),
                 observation_window_note: "one full window over e-1 e-2 e-3".to_owned(),
                 denominator_note: "denominator e-1 e-2 e-3 with three probes".to_owned(),
@@ -4320,6 +4359,11 @@ mod tests {
                 &self.boundary,
                 &self.policy,
             )
+        }
+
+        fn identity(&self) -> super::PlanIdentity {
+            super::PlanIdentity::from_job(&self.job, self.draft.receipt.output_digest.clone())
+                .expect("fixture job identity must be canonical")
         }
     }
 
@@ -4673,6 +4717,7 @@ mod tests {
         let mut identity_history = fixture.history.clone();
         identity_history.expected_attempt_ids.clear();
         identity_history.attempts.clear();
+        let identity = fixture.identity();
         let identity_digest = super::compute_plan_digest(
             &first.plan_handle,
             super::MaintenanceOutcome::Complete.as_str(),
@@ -4683,7 +4728,7 @@ mod tests {
             &fixture.boundary,
             &identity_history,
             &fixture.policy,
-            &fixture.draft.receipt.output_digest,
+            &identity,
         )
         .expect("identity digest must be deterministic");
         fixture.history.expected_attempt_ids = vec!["att-replay".to_owned()];
@@ -4708,6 +4753,7 @@ mod tests {
         fixture.history.expected_attempt_ids.clear();
         fixture.history.attempts.clear();
         let first = fixture.propose().expect("identity fixture must be valid");
+        let identity = fixture.identity();
         let identity_digest = super::compute_plan_digest(
             &first.plan_handle,
             super::MaintenanceOutcome::Complete.as_str(),
@@ -4718,7 +4764,7 @@ mod tests {
             &fixture.boundary,
             &fixture.history,
             &fixture.policy,
-            &fixture.draft.receipt.output_digest,
+            &identity,
         )
         .expect("identity digest must be deterministic");
         fixture.history.expected_attempt_ids = vec!["att-repeat".to_owned()];
@@ -4920,6 +4966,12 @@ mod tests {
         let mut fixture = Fixture::fresh();
         fixture.boundary.verifier.partial_note = fixture.boundary.verifier.success_note.clone();
         let candidate = inert_outcome(&fixture, super::MaintenanceOutcome::Insufficient);
+        assert!(candidate.note.contains("distinguish outcomes"));
+
+        let mut unavailable = Fixture::fresh();
+        unavailable.boundary.verifier.unavailable_note =
+            unavailable.boundary.verifier.success_note.clone();
+        let candidate = inert_outcome(&unavailable, super::MaintenanceOutcome::Insufficient);
         assert!(candidate.note.contains("distinguish outcomes"));
     }
 
@@ -5133,6 +5185,7 @@ mod tests {
         replay.history.expected_attempt_ids.clear();
         replay.history.attempts.clear();
         let first = replay.propose().expect("replay seed must be valid");
+        let identity = replay.identity();
         let identity_digest = super::compute_plan_digest(
             &first.plan_handle,
             super::MaintenanceOutcome::Complete.as_str(),
@@ -5143,7 +5196,7 @@ mod tests {
             &replay.boundary,
             &replay.history,
             &replay.policy,
-            &replay.draft.receipt.output_digest,
+            &identity,
         )
         .expect("replay identity must be deterministic");
         replay.history.expected_attempt_ids = vec!["op-1".to_owned()];
@@ -5170,6 +5223,18 @@ mod tests {
             changed_request
                 .propose()
                 .expect("identity conflict must remain a candidate")
+                .outcome,
+            super::MaintenanceOutcome::Rejected
+        );
+        let mut changed_job = Fixture::fresh();
+        changed_job.history.expected_attempt_ids =
+            changed_request.history.expected_attempt_ids.clone();
+        changed_job.history.attempts = changed_request.history.attempts.clone();
+        changed_job.job.idempotency_key = "idem-changed".to_owned();
+        assert_eq!(
+            changed_job
+                .propose()
+                .expect("changed job identity must remain a candidate")
                 .outcome,
             super::MaintenanceOutcome::Rejected
         );
