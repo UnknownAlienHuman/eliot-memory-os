@@ -3131,6 +3131,7 @@ dependencies = [
  "eliot-evaluation-contracts",
  "eliot-governor",
  "eliot-ipc",
+ "eliot-kernel-core",
  "eliot-maintenance",
  "eliot-observability",
  "eliot-observation",
