@@ -213,6 +213,11 @@ pub fn preview_json(preview: &PluginPreview) -> serde_json::Value {
 /// directory, copies any already-existing target files beside the artifact
 /// (recording per-file `copied`/`absent`/`error`), and writes the
 /// `<plugin_id>.rollback.json` artifact. Returns the artifact path.
+///
+/// Backup copies are numbered by manifest position
+/// (`<plugin_id>.<index>.<file_name>.bak`) so two targets sharing a file
+/// name never overwrite each other; the artifact's `per_file` map binds
+/// every target path to its exact backup.
 pub fn ensure_rollback_artifact(
     manifest: &PluginManifest,
     preview: &PluginPreview,
@@ -226,7 +231,7 @@ pub fn ensure_rollback_artifact(
     std::fs::create_dir_all(rollback_dir)
         .map_err(|error| PluginPreviewError::Rollback(error.to_string()))?;
     let mut per_file: BTreeMap<String, String> = BTreeMap::new();
-    for target in &manifest.files_to_modify {
+    for (index, target) in manifest.files_to_modify.iter().enumerate() {
         let target_path = PathBuf::from(target);
         if !target_path.is_absolute() {
             per_file.insert(target.clone(), "skipped_non_absolute".to_owned());
@@ -247,7 +252,10 @@ pub fn ensure_rollback_artifact(
             || "file".to_owned(),
             |name| name.to_string_lossy().into_owned(),
         );
-        let backup_path = rollback_dir.join(format!("{}.{}.bak", manifest.plugin_id, file_name));
+        let backup_path = rollback_dir.join(format!(
+            "{}.{}.{}.bak",
+            manifest.plugin_id, index, file_name
+        ));
         match std::fs::write(&backup_path, &bytes) {
             Ok(()) => {
                 per_file.insert(target.clone(), backup_path.display().to_string());
@@ -398,6 +406,48 @@ mod tests {
         assert_eq!(receipt["status"], "INSTALLED_NOT_LIVE");
         assert!(receipt.get("preview").is_some());
         let _ = std::fs::remove_dir_all(&rollback_dir);
+    }
+
+    #[test]
+    fn rollback_keeps_same_named_targets_distinct() {
+        let root = temp_dir("same-name");
+        let first_dir = root.join("a");
+        let second_dir = root.join("b");
+        std::fs::create_dir_all(&first_dir).expect("create first dir");
+        std::fs::create_dir_all(&second_dir).expect("create second dir");
+        let first = first_dir.join("config.json");
+        let second = second_dir.join("config.json");
+        std::fs::write(&first, b"{\"side\":\"a\"}").expect("write first target");
+        std::fs::write(&second, b"{\"side\":\"b\"}").expect("write second target");
+        let mut manifest = fixture_manifest();
+        manifest.files_to_modify = vec![first.display().to_string(), second.display().to_string()];
+        let rollback_dir = root.join("rollback");
+        let (_, outcome) =
+            install_with_rollback(&manifest, &rollback_dir).expect("install with rollback");
+        assert!(outcome.rollback_artifact.exists());
+        let artifact: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&outcome.rollback_artifact).expect("read rollback artifact"),
+        )
+        .expect("parse rollback artifact");
+        let per_file = artifact.get("per_file").expect("rollback carries per_file");
+        let first_backup = per_file
+            .get(first.display().to_string())
+            .and_then(serde_json::Value::as_str)
+            .expect("first target has a backup path");
+        let second_backup = per_file
+            .get(second.display().to_string())
+            .and_then(serde_json::Value::as_str)
+            .expect("second target has a backup path");
+        assert_ne!(first_backup, second_backup);
+        assert_eq!(
+            std::fs::read(first_backup).expect("read first backup"),
+            b"{\"side\":\"a\"}"
+        );
+        assert_eq!(
+            std::fs::read(second_backup).expect("read second backup"),
+            b"{\"side\":\"b\"}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
