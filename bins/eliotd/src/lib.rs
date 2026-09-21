@@ -54,6 +54,7 @@ mod observation_adapters;
 mod skill_lifecycle_adapters;
 mod skill_surface_adapters;
 pub mod staffing_policy;
+pub mod startup_evidence_producer;
 mod store_failure_projection;
 mod task_lifecycle_adapters;
 
@@ -120,6 +121,11 @@ pub use governor_local_read::{
 };
 pub(crate) use kernel_authority_client::KernelAuthorityClient;
 pub use kernel_context_read_client::{KernelContextReadClient, ReconstructionReadComposition};
+pub use startup_evidence_producer::{
+    DAEMON_STARTUP_EVIDENCE_OPERATION, EliotdStartupEvidence, MAX_CAPABILITY_OUTCOMES,
+    MAX_EVIDENCE_REFS, MAX_REQUIRED_CAPABILITIES, MirrorObservation, StartupEvidenceError,
+    StartupEvidenceRequest, build_startup_evidence, publish_daemon_startup_evidence,
+};
 pub use store_failure_projection::{GovernorStoreFailureProjection, GovernorStoreProjectionError};
 
 /// Builds the production P-07 authority adapter over an already-connected
