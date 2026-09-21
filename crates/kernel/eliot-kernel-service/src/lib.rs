@@ -170,10 +170,12 @@ pub use user_automation::{
     UserAutomationStorePort, UserAutomationStoreRequest, UserAutomationStoreResponse,
 };
 pub use user_automation_execution::{
-    UserAutomationExecutionError, UserAutomationExecutionOutcome, UserAutomationExecutionRequest,
-    UserAutomationFailurePublication, UserAutomationFailureRecord, UserAutomationRemovalResult,
-    UserAutomationRuntimeAdmission, UserAutomationRuntimeError, UserAutomationRuntimePort,
-    UserAutomationWakeCancellation,
+    UserAutomationDurableJobPort, UserAutomationExecutionError, UserAutomationExecutionOutcome,
+    UserAutomationExecutionRequest, UserAutomationFailureHistory,
+    UserAutomationFailureHistoryPort, UserAutomationFailurePublication, UserAutomationFailureRecord,
+    UserAutomationNotificationDelivery, UserAutomationNotificationPort, UserAutomationRemovalResult,
+    UserAutomationRuntimeAdmission, UserAutomationRuntimeComposition, UserAutomationRuntimeError,
+    UserAutomationRuntimePort, UserAutomationWakeCancellation, UserAutomationWakePort,
 };
 pub use user_automation_store::CanonicalUserAutomationStore;
 pub use write_coordinator::{

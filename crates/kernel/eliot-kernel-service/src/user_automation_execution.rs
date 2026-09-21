@@ -480,6 +480,253 @@ pub trait UserAutomationRuntimePort: Send + Sync {
     ) -> Result<UserAutomationFailurePublication, UserAutomationRuntimeError>;
 }
 
+/// Canonical failure-history result returned by the existing Store owner.
+///
+/// The Store owner must echo the complete immutable failure identity. The
+/// service uses this response to prevent a history row for another operation,
+/// revision, occurrence, or State Fence from being presented as success.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAutomationFailureHistory {
+    /// Exact parent operation answered by the Store owner.
+    pub operation_id: OperationId,
+    /// Parent idempotency key echoed by the Store owner.
+    pub idempotency_key: String,
+    /// Parent canonical request digest echoed by the Store owner.
+    pub canonical_request_hash: String,
+    /// Fence under which the history row was observed.
+    pub state_fence: StateFence,
+    /// Immutable automation identity.
+    pub automation_id: String,
+    /// Immutable revision identity.
+    pub automation_revision: String,
+    /// Stable failure class fingerprint.
+    pub failure_fingerprint: String,
+    /// Stable occurrence retained by failure history.
+    pub occurrence_id: String,
+    /// Canonical failure-history record reference.
+    pub history_ref: String,
+    /// Store-side deduplication key for this failure class.
+    pub dedup_key: String,
+    /// Whether the Store converged to an existing failure row.
+    pub deduplicated: bool,
+}
+
+impl UserAutomationFailureHistory {
+    /// Validates the Store response against the exact failure record sent.
+    pub fn validate_for(
+        &self,
+        request: &UserAutomationFailureRecord,
+    ) -> Result<(), UserAutomationExecutionError> {
+        validate_text(&self.idempotency_key, "failure.history.idempotency_key")?;
+        validate_text(
+            &self.canonical_request_hash,
+            "failure.history.canonical_request_hash",
+        )?;
+        validate_text(&self.history_ref, "failure.history.history_ref")?;
+        validate_text(&self.dedup_key, "failure.history.dedup_key")?;
+        let occurrence_id = request.invocation.occurrence_identity()?;
+        if self.operation_id != request.identity.operation_id
+            || self.idempotency_key != request.identity.idempotency_key
+            || self.canonical_request_hash != request.identity.canonical_request_hash
+            || self.state_fence != request.context.state_fence
+            || self.automation_id != request.revision.automation_id
+            || self.automation_revision != request.revision.revision
+            || self.failure_fingerprint != request.failure.failure_fingerprint
+            || self.occurrence_id != occurrence_id
+            || self.dedup_key != request.failure.notification.canonical.dedup_key
+        {
+            return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                "failure history identity",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Authenticated notification result returned by the B3 notification owner.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAutomationNotificationDelivery {
+    /// State Fence observed by the notification owner.
+    pub state_fence: StateFence,
+    /// Notification deduplication key echoed by the owner.
+    pub dedup_key: String,
+    /// Whether notification delivery converged to an existing notification.
+    pub deduplicated: bool,
+    /// Existing authenticated notification receipt, when delivery is known.
+    pub notification_receipt_ref: Option<String>,
+}
+
+impl UserAutomationNotificationDelivery {
+    /// Validates the notification response against the exact failure record.
+    pub fn validate_for(
+        &self,
+        request: &UserAutomationFailureRecord,
+    ) -> Result<(), UserAutomationExecutionError> {
+        validate_text(&self.dedup_key, "notification.delivery.dedup_key")?;
+        if let Some(receipt) = &self.notification_receipt_ref {
+            validate_text(receipt, "notification.delivery.receipt_ref")?;
+        }
+        if self.state_fence != request.context.state_fence
+            || self.dedup_key != request.failure.notification.canonical.dedup_key
+        {
+            return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                "notification delivery identity",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Existing Durable Job owner used by the production runtime composition.
+#[allow(async_fn_in_trait)]
+pub trait UserAutomationDurableJobPort: Send + Sync {
+    /// Admits one preflight-approved occurrence to the existing job lifecycle.
+    async fn admit_occurrence(
+        &self,
+        request: UserAutomationRuntimeAdmission,
+    ) -> Result<AutomationExecutionReference, UserAutomationRuntimeError>;
+}
+
+/// Existing WakeIntent/Task Scheduler owner used by the production runtime
+/// composition.
+#[allow(async_fn_in_trait)]
+pub trait UserAutomationWakePort: Send + Sync {
+    /// Cancels only unadmitted wakes for a retired revision.
+    async fn cancel_pending_wakes(
+        &self,
+        request: UserAutomationWakeCancellation,
+    ) -> Result<Vec<String>, UserAutomationRuntimeError>;
+}
+
+/// Existing canonical Store owner used to persist immutable failure history.
+#[allow(async_fn_in_trait)]
+pub trait UserAutomationFailureHistoryPort: Send + Sync {
+    /// Records or replays one revision-bound failure-history row.
+    async fn record_failure(
+        &self,
+        request: UserAutomationFailureRecord,
+    ) -> Result<UserAutomationFailureHistory, UserAutomationRuntimeError>;
+}
+
+/// Existing authenticated B3 notification owner.
+#[allow(async_fn_in_trait)]
+pub trait UserAutomationNotificationPort: Send + Sync {
+    /// Delivers or reconciles one already-recorded automation failure.
+    async fn deliver_user_automation_failure(
+        &self,
+        request: UserAutomationFailureRecord,
+    ) -> Result<UserAutomationNotificationDelivery, UserAutomationRuntimeError>;
+}
+
+/// Production composition of the existing UserAutomation runtime owners.
+///
+/// This adapter owns no mutable state. It only sequences the already-owned
+/// ports: Durable Job admission, WakeIntent cancellation, canonical failure
+/// history, and the authenticated B3 notification route. The failure path
+/// records history before notification so a notification retry can reconcile
+/// against one immutable history identity.
+pub struct UserAutomationRuntimeComposition<'a, D: ?Sized, W: ?Sized, H: ?Sized, N: ?Sized> {
+    durable_job: &'a D,
+    wake: &'a W,
+    failure_history: &'a H,
+    notification: &'a N,
+}
+
+impl<'a, D: ?Sized, W: ?Sized, H: ?Sized, N: ?Sized>
+    UserAutomationRuntimeComposition<'a, D, W, H, N>
+{
+    /// Borrows the already-composed owner ports without creating a lifecycle.
+    #[must_use]
+    pub const fn new(
+        durable_job: &'a D,
+        wake: &'a W,
+        failure_history: &'a H,
+        notification: &'a N,
+    ) -> Self {
+        Self {
+            durable_job,
+            wake,
+            failure_history,
+            notification,
+        }
+    }
+}
+
+impl<'a, D: ?Sized, W: ?Sized, H: ?Sized, N: ?Sized> UserAutomationRuntimePort
+    for UserAutomationRuntimeComposition<'a, D, W, H, N>
+where
+    D: UserAutomationDurableJobPort,
+    W: UserAutomationWakePort,
+    H: UserAutomationFailureHistoryPort,
+    N: UserAutomationNotificationPort,
+{
+    async fn admit_occurrence(
+        &self,
+        request: UserAutomationRuntimeAdmission,
+    ) -> Result<AutomationExecutionReference, UserAutomationRuntimeError> {
+        request
+            .validate()
+            .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?;
+        let execution = self.durable_job.admit_occurrence(request).await?;
+        execution
+            .validate()
+            .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?;
+        Ok(execution)
+    }
+
+    async fn cancel_pending_wakes(
+        &self,
+        request: UserAutomationWakeCancellation,
+    ) -> Result<Vec<String>, UserAutomationRuntimeError> {
+        request
+            .validate()
+            .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?;
+        let cancelled = self.wake.cancel_pending_wakes(request).await?;
+        validate_unique_text_list(&cancelled, "cancelled_wake_ids")
+            .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?;
+        Ok(cancelled)
+    }
+
+    async fn deliver_user_automation_failure(
+        &self,
+        request: UserAutomationFailureRecord,
+    ) -> Result<UserAutomationFailurePublication, UserAutomationRuntimeError> {
+        request
+            .validate()
+            .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?;
+        let history = self.failure_history.record_failure(request.clone()).await?;
+        history
+            .validate_for(&request)
+            .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?;
+        let delivery = self
+            .notification
+            .deliver_user_automation_failure(request.clone())
+            .await?;
+        delivery
+            .validate_for(&request)
+            .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?;
+        Ok(UserAutomationFailurePublication {
+            operation_id: request.identity.operation_id,
+            idempotency_key: request.identity.idempotency_key,
+            canonical_request_hash: request.identity.canonical_request_hash,
+            state_fence: request.context.state_fence,
+            automation_id: request.revision.automation_id,
+            automation_revision: request.revision.revision,
+            failure_fingerprint: request.failure.failure_fingerprint,
+            occurrence_id: request
+                .invocation
+                .occurrence_identity()
+                .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?,
+            history_ref: history.history_ref,
+            dedup_key: history.dedup_key,
+            deduplicated: history.deduplicated || delivery.deduplicated,
+            notification_receipt_ref: delivery.notification_receipt_ref,
+        })
+    }
+}
+
 impl<'a, P: UserAutomationStorePort + ?Sized> UserAutomationService<'a, P> {
     /// Runs deterministic preflight and then joins one occurrence to the
     /// existing Durable Job/WakeIntent composition.
@@ -1000,10 +1247,11 @@ mod tests {
     struct RecordingRuntime {
         admissions: Arc<Mutex<Vec<UserAutomationRuntimeAdmission>>>,
         failures: Arc<Mutex<Vec<UserAutomationFailureRecord>>>,
+        events: Arc<Mutex<Vec<&'static str>>>,
     }
 
     #[allow(async_fn_in_trait)]
-    impl UserAutomationRuntimePort for RecordingRuntime {
+    impl UserAutomationDurableJobPort for RecordingRuntime {
         async fn admit_occurrence(
             &self,
             request: UserAutomationRuntimeAdmission,
@@ -1016,29 +1264,38 @@ mod tests {
                 .lock()
                 .expect("admissions lock")
                 .push(request);
+            self.events.lock().expect("events lock").push("admission");
             Ok(AutomationExecutionReference {
                 occurrence_id,
                 durable_job_ref: "job-automation-1".to_owned(),
                 state: JobState::Queued,
             })
         }
+    }
 
+    #[allow(async_fn_in_trait)]
+    impl UserAutomationWakePort for RecordingRuntime {
         async fn cancel_pending_wakes(
             &self,
             _request: UserAutomationWakeCancellation,
         ) -> Result<Vec<String>, UserAutomationRuntimeError> {
+            self.events.lock().expect("events lock").push("cancel");
             Ok(vec!["wake-automation-1".to_owned()])
         }
+    }
 
-        async fn deliver_user_automation_failure(
+    #[allow(async_fn_in_trait)]
+    impl UserAutomationFailureHistoryPort for RecordingRuntime {
+        async fn record_failure(
             &self,
             request: UserAutomationFailureRecord,
-        ) -> Result<UserAutomationFailurePublication, UserAutomationRuntimeError> {
+        ) -> Result<UserAutomationFailureHistory, UserAutomationRuntimeError> {
             let occurrence_id = request
                 .invocation
                 .occurrence_identity()
                 .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?;
-            let publication = UserAutomationFailurePublication {
+            self.events.lock().expect("events lock").push("history");
+            Ok(UserAutomationFailureHistory {
                 operation_id: request.identity.operation_id.clone(),
                 idempotency_key: request.identity.idempotency_key.clone(),
                 canonical_request_hash: request.identity.canonical_request_hash.clone(),
@@ -1050,10 +1307,34 @@ mod tests {
                 history_ref: "history-failure-1".to_owned(),
                 dedup_key: request.failure.notification.canonical.dedup_key.clone(),
                 deduplicated: false,
-                notification_receipt_ref: Some("notification-receipt-1".to_owned()),
-            };
+            })
+        }
+    }
+
+    #[allow(async_fn_in_trait)]
+    impl UserAutomationNotificationPort for RecordingRuntime {
+        async fn deliver_user_automation_failure(
+            &self,
+            request: UserAutomationFailureRecord,
+        ) -> Result<UserAutomationNotificationDelivery, UserAutomationRuntimeError> {
+            self.events
+                .lock()
+                .expect("events lock")
+                .push("notification");
             self.failures.lock().expect("failures lock").push(request);
-            Ok(publication)
+            let failure = self
+                .failures
+                .lock()
+                .expect("failures lock")
+                .last()
+                .expect("failure recorded")
+                .clone();
+            Ok(UserAutomationNotificationDelivery {
+                state_fence: failure.context.state_fence,
+                dedup_key: failure.failure.notification.canonical.dedup_key,
+                deduplicated: false,
+                notification_receipt_ref: Some("notification-receipt-1".to_owned()),
+            })
         }
     }
 
@@ -1066,6 +1347,12 @@ mod tests {
         let (active_invocation, active_projection, active_wake) =
             projection(&active_context, UserAutomationConfigurationState::Active);
         let active_runtime = RecordingRuntime::default();
+        let active_composition = UserAutomationRuntimeComposition::new(
+            &active_runtime,
+            &active_runtime,
+            &active_runtime,
+            &active_runtime,
+        );
         let admitted = service
             .execute_occurrence(
                 execution_request(
@@ -1074,7 +1361,7 @@ mod tests {
                     active_projection,
                     active_wake,
                 ),
-                &active_runtime,
+                &active_composition,
             )
             .await
             .expect("active occurrence joins existing runtime");
@@ -1084,6 +1371,34 @@ mod tests {
         ));
         assert_eq!(active_runtime.admissions.lock().expect("lock").len(), 1);
         assert!(active_runtime.failures.lock().expect("lock").is_empty());
+        assert_eq!(
+            active_runtime.events.lock().expect("lock").as_slice(),
+            ["admission"]
+        );
+
+        let cancellation_context = metadata();
+        let cancellation = UserAutomationWakeCancellation {
+            state_fence: cancellation_context.state_fence.clone(),
+            context: cancellation_context,
+            authenticated_principal: "human-1".to_owned(),
+            identity: OperationIdentity {
+                operation_id: OperationId::new("automation-remove").expect("operation"),
+                idempotency_key: "automation-remove-key".to_owned(),
+                canonical_request_hash: "b".repeat(64),
+            },
+            automation_id: "automation-1".to_owned(),
+            automation_revision: "revision-7".to_owned(),
+            only_unadmitted: true,
+        };
+        let cancelled = active_composition
+            .cancel_pending_wakes(cancellation)
+            .await
+            .expect("retired revision cancels only unadmitted wakes");
+        assert_eq!(cancelled, ["wake-automation-1"]);
+        assert_eq!(
+            active_runtime.events.lock().expect("lock").as_slice(),
+            ["admission", "cancel"]
+        );
 
         let blocked_context = metadata();
         let (blocked_invocation, blocked_projection, blocked_wake) = projection(
@@ -1091,6 +1406,12 @@ mod tests {
             UserAutomationConfigurationState::BlockedConfig,
         );
         let blocked_runtime = RecordingRuntime::default();
+        let blocked_composition = UserAutomationRuntimeComposition::new(
+            &blocked_runtime,
+            &blocked_runtime,
+            &blocked_runtime,
+            &blocked_runtime,
+        );
         let blocked = service
             .execute_occurrence(
                 execution_request(
@@ -1099,7 +1420,7 @@ mod tests {
                     blocked_projection,
                     blocked_wake,
                 ),
-                &blocked_runtime,
+                &blocked_composition,
             )
             .await
             .expect("blocked occurrence publishes failure");
@@ -1109,5 +1430,9 @@ mod tests {
         ));
         assert!(blocked_runtime.admissions.lock().expect("lock").is_empty());
         assert_eq!(blocked_runtime.failures.lock().expect("lock").len(), 1);
+        assert_eq!(
+            blocked_runtime.events.lock().expect("lock").as_slice(),
+            ["history", "notification"]
+        );
     }
 }
