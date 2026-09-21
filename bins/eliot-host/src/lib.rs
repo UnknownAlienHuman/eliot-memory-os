@@ -141,7 +141,7 @@ use launch_descriptor_validation::{
 pub use launch_options::HostLaunchOptions;
 use launch_options::valid_sha256_text;
 #[cfg(windows)]
-pub use reactive_context_delivery::HostReactiveContextDeliveryError;
+pub use reactive_context_delivery::{HostReactiveContextDeliveryError, HostReactiveContextProducer, HostReactiveContextProducerError};
 pub use scm_launch::{
     HOST_SCM_CAUSE_MAX_CHARS, HostScmRegistrationCause, ValidatedHostScmLaunch,
     classify_host_scm_inspection, validate_host_scm_bootstrap,
