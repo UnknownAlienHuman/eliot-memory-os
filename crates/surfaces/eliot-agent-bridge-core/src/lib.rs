@@ -34,6 +34,11 @@ pub use resources::{
     DeliveryStatus, HotResourceView, MAX_CONTENT_BYTES, MAX_PREVIEW_BYTES, MAX_REGISTRY_ENTRIES,
     MAX_URI_BYTES, ResourceHandle, ResourceKind, ResourceRegistry, ResourceUri, ToolResultReceipt,
 };
+mod route_tokens;
+pub use route_tokens::{
+    MeasuredTokens, RouteTokenObservation, RouteTokenizer, UnmeasuredReason,
+    measure_tool_result_tokens,
+};
 mod terminal_inputs;
 pub use terminal_inputs::{
     AttemptTransition, CanonicalWriteRefs, CoverageFlags, RecoveryDirective, RecoveryDirectiveKind,
@@ -1820,6 +1825,31 @@ impl AgentBridgeCore {
         ))
     }
 
+    /// Projects one tool result into its delivery receipt with a C6
+    /// route-aware token measurement: the route-owner observation is bound to
+    /// the exact delivered bytes by [`measure_tool_result_tokens`] before the
+    /// count may enter the receipt. A missing observation, a digest mismatch,
+    /// or a malformed observation withholds projection with
+    /// [`BridgeError::UnmeasuredTokens`] or [`BridgeError::InvalidContract`];
+    /// the bridge never estimates the count. Delivery completeness stays the
+    /// owner's observed state, as with [`Self::project_tool_result`].
+    pub fn project_measured_tool_result(
+        &self,
+        result_bytes: &[u8],
+        source_handle: ResourceUri,
+        observation: Option<&RouteTokenObservation>,
+        delivery: DeliveryStatus,
+    ) -> Result<ToolResultReceipt, BridgeError> {
+        self.require_attached()?;
+        let measured = measure_tool_result_tokens(result_bytes, observation)?;
+        Ok(ToolResultReceipt::project(
+            result_bytes,
+            source_handle,
+            measured.tokens(),
+            delivery,
+        ))
+    }
+
     /// Number of immutable snapshots retained in the attach-scoped resource
     /// projection. The registry is cleared on every new attach, so this
     /// count describes only the live attach.
@@ -1892,6 +1922,8 @@ pub enum BridgeError {
     ResourceTooLarge { bytes: usize, capacity: usize },
     #[error("incomplete tool-result delivery {delivery:?} cannot satisfy complete evidence")]
     IncompleteDelivery { delivery: DeliveryStatus },
+    #[error("tool-result token cost is unmeasured: {reason}")]
+    UnmeasuredTokens { reason: UnmeasuredReason },
     #[error(transparent)]
     Skill(#[from] SkillError),
 }
