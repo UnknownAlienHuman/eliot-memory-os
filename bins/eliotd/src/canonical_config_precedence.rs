@@ -170,6 +170,11 @@ pub enum PrecedenceError {
     /// The document names a layer outside the seven canonical layers.
     #[error("unknown configuration layer: {0}")]
     UnknownLayer(String),
+    /// Two contributions name the same canonical layer. Layer authority
+    /// must be unambiguous: the first contribution must not silently win
+    /// over a conflicting same-layer document.
+    #[error("duplicate configuration layer: {0}")]
+    DuplicateLayer(&'static str),
     /// Typed TOML/JSON decoding or schema validation failed.
     #[error("layer document schema rejected: {0}")]
     SchemaRejected(String),
@@ -206,6 +211,14 @@ pub fn resolve_canonical_chain(
 ) -> Result<ResolvedChain, PrecedenceError> {
     if key.trim().is_empty() || key != CANONICAL_SETTING_KEY {
         return Err(PrecedenceError::InvalidKey(key.to_owned()));
+    }
+    let mut claimed = [false; ALL_LAYERS.len()];
+    for input in inputs {
+        let slot = input.layer.order() as usize;
+        if claimed[slot] {
+            return Err(PrecedenceError::DuplicateLayer(input.layer.name()));
+        }
+        claimed[slot] = true;
     }
     let seed = inputs
         .iter()
@@ -609,6 +622,22 @@ mod tests {
                 .last()
                 .is_some_and(|item| item.delegated_expansion),
             "expansion must be marked delegated"
+        );
+    }
+
+    #[test]
+    fn duplicate_layer_documents_reject_before_resolution() {
+        let mut inputs = narrowing_chain();
+        inputs.push(LayerInput {
+            layer: ConfigLayer::TaskPolicy,
+            limit: Some(10),
+            delegation_ceiling: None,
+        });
+        let error = resolve_canonical_chain(CANONICAL_SETTING_KEY, &inputs)
+            .expect_err("duplicate layer must fail closed");
+        assert!(
+            error.to_string().contains("duplicate configuration layer"),
+            "unexpected: {error}"
         );
     }
 
