@@ -657,6 +657,19 @@ impl ReactiveInjectionLedger {
         self.receipts.get(receipt_id)
     }
 
+    /// Returns the ledger session bound to one item identity, if the item
+    /// exists.
+    ///
+    /// Read-only probe for the observer-handle join: resolution succeeds
+    /// only for exact ledger identities, never by pattern or inference.
+    /// Covers every retained item regardless of attention visibility.
+    #[must_use]
+    pub fn item_session(&self, item_id: &str) -> Option<&str> {
+        self.items
+            .get(item_id)
+            .map(|item| item.session_id.as_str())
+    }
+
     /// Bounded identities of pending (undelivered) injections for one
     /// session in ledger order.
     ///

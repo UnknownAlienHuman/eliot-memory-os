@@ -13,7 +13,9 @@
 
 use eliot_ors::{EpochLineage, OperationIdentity, RecoveryPayload, StateFenceSnapshot};
 use eliot_platform::SecretReference;
-use eliot_process::{DispatchAuthorityId, DispatchPermitReplaySnapshot};
+use eliot_process::{
+    DispatchAuthorityId, DispatchPermitReplaySnapshot, OriginChallengeReplaySnapshot,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -236,6 +238,32 @@ impl SealedAuthoritySnapshot {
     }
 }
 
+/// Composite replay payload sealed inside the existing Kernel authority
+/// snapshot. The dispatch-permit and process-origin ledgers share one ORS
+/// record and one provider encryption boundary, while retaining independent
+/// authority domains and nonce sets.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KernelAuthorityReplaySnapshot {
+    /// Existing process-dispatch replay state.
+    pub dispatch: DispatchPermitReplaySnapshot,
+    /// Kernel-owned process-origin challenge replay state.
+    pub origin: OriginChallengeReplaySnapshot,
+}
+
+impl KernelAuthorityReplaySnapshot {
+    /// Validates both opaque replay ledgers before live recovery.
+    pub fn validate(&self) -> KernelResult<()> {
+        self.dispatch
+            .validate()
+            .map_err(|error| KernelError::DependencyUnavailable(error.to_string()))?;
+        self.origin
+            .validate()
+            .map_err(|error| KernelError::DependencyUnavailable(error.to_string()))?;
+        Ok(())
+    }
+}
+
 /// Object-safe P-01/platform port for authority-snapshot encryption and
 /// decryption.
 ///
@@ -247,7 +275,7 @@ pub trait DispatchSnapshotCodec: Send + Sync {
     /// Seals a replay snapshot for durable ORS storage.
     fn seal(
         &self,
-        snapshot: &DispatchPermitReplaySnapshot,
+        snapshot: &KernelAuthorityReplaySnapshot,
         binding: &AuthoritySnapshotBinding,
     ) -> KernelResult<SealedAuthoritySnapshot>;
 
@@ -256,5 +284,5 @@ pub trait DispatchSnapshotCodec: Send + Sync {
         &self,
         payload: &RecoveryPayload,
         binding: &AuthoritySnapshotBinding,
-    ) -> KernelResult<DispatchPermitReplaySnapshot>;
+    ) -> KernelResult<KernelAuthorityReplaySnapshot>;
 }

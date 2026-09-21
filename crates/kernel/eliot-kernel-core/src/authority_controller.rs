@@ -14,20 +14,23 @@ use std::sync::Arc;
 
 use eliot_ors::{
     AuthoritySnapshotReceipt, KernelAuthoritySnapshot, OperationIdentity, OperationalRecordContext,
-    OperationalRecordInput, OperationalRecoveryStore,
+    OperationalRecordInput, OperationalRecoveryStore, StateFenceSnapshot,
 };
 use eliot_process::{
     DispatchAuthorityId, DispatchPermit, DispatchPermitAuthority, DispatchValidationContext,
-    KernelDispatchKey, PermitIssuance, ProcessExecutionAdmissionRequest, ProcessIntent,
-    ProcessOwnerBinding, ProcessRequest, ProcessStartReceipt, RecoveryCapability,
-    SuspendedProcessIdentity, ValidatedDispatch,
+    KernelDispatchKey, OriginChallenge, OriginChallengeAuthority, OriginChallengeRequest,
+    OriginControlGrant, OriginControlPresentation, PermitIssuance,
+    ProcessExecutionAdmissionRequest, ProcessIntent, ProcessOwnerBinding, ProcessRequest,
+    ProcessStartReceipt, RecoveryCapability, SuspendedProcessIdentity, ValidatedDispatch,
 };
 
 pub use crate::authority_snapshot::{
     AuthoritySnapshotBinding, AuthoritySnapshotBindingWire, DispatchSnapshotCodec,
-    SealedAuthoritySnapshot,
+    KernelAuthorityReplaySnapshot, SealedAuthoritySnapshot,
 };
 use crate::error::{KernelError, KernelResult};
+
+const ORIGIN_AUTHORITY_ID: &str = "kernel-origin-authority";
 
 /// Durable replay projection for one admitted process start.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -107,6 +110,7 @@ pub fn process_admission_digest(
 pub struct ProcessDispatchAuthorityController {
     authority_id: DispatchAuthorityId,
     authority: DispatchPermitAuthority,
+    origin_authority: OriginChallengeAuthority,
     store: Arc<dyn OperationalRecoveryStore>,
     codec: Arc<dyn DispatchSnapshotCodec>,
     snapshot_receipt: Option<AuthoritySnapshotReceipt>,
@@ -124,10 +128,14 @@ impl ProcessDispatchAuthorityController {
         store: Arc<dyn OperationalRecoveryStore>,
         codec: Arc<dyn DispatchSnapshotCodec>,
     ) -> Self {
+        let origin_key = key.clone_for_sibling_authority();
         let authority = DispatchPermitAuthority::activate(authority_id.clone(), key);
+        let origin_authority =
+            OriginChallengeAuthority::activate(origin_authority_id(), origin_key);
         Self {
             authority_id,
             authority,
+            origin_authority,
             store,
             codec,
             snapshot_receipt: None,
@@ -212,10 +220,15 @@ impl ProcessDispatchAuthorityController {
             return Err(KernelError::FenceMismatch);
         }
         let replay = codec.open(&record.payload, binding)?;
-        let authority = DispatchPermitAuthority::recover(authority_id.clone(), key, replay)?;
+        let origin_key = key.clone_for_sibling_authority();
+        let authority =
+            DispatchPermitAuthority::recover(authority_id.clone(), key, replay.dispatch)?;
+        let origin_authority =
+            OriginChallengeAuthority::recover(origin_authority_id(), origin_key, replay.origin)?;
         Ok(Self {
             authority_id,
             authority,
+            origin_authority,
             store,
             codec,
             snapshot_receipt: Some(recovered.receipt().clone()),
@@ -227,6 +240,44 @@ impl ProcessDispatchAuthorityController {
     #[must_use]
     pub fn authority_id(&self) -> &DispatchAuthorityId {
         &self.authority_id
+    }
+
+    /// Issues one Kernel-owned process-origin challenge and durably records
+    /// its nonce before exposing it to the daemon transport.
+    pub fn issue_origin_challenge(
+        &mut self,
+        request: &OriginChallengeRequest,
+        issued_at_unix_ms: u64,
+        expires_at_unix_ms: u64,
+        binding: &AuthoritySnapshotBinding,
+    ) -> KernelResult<OriginChallenge> {
+        self.ensure_operational(binding)?;
+        self.ensure_origin_request_binding(request, binding)?;
+        let challenge = self
+            .origin_authority
+            .issue(request, issued_at_unix_ms, expires_at_unix_ms)
+            .map_err(|error| KernelError::DependencyUnavailable(error.to_string()))?;
+        self.persist_snapshot(binding)?;
+        Ok(challenge)
+    }
+
+    /// Consumes one Kernel-owned process-origin presentation and durably
+    /// records its one-shot nonce before returning the grant proof.
+    pub fn decide_origin_control(
+        &mut self,
+        presentation: &OriginControlPresentation,
+        now_unix_ms: u64,
+        binding: &AuthoritySnapshotBinding,
+    ) -> KernelResult<OriginControlGrant> {
+        self.ensure_operational(binding)?;
+        self.ensure_origin_request_binding(presentation.request(), binding)?;
+        let active_epoch = binding_current_epoch(binding)?;
+        let grant = self
+            .origin_authority
+            .decide(presentation, &active_epoch, now_unix_ms)
+            .map_err(|error| KernelError::DependencyUnavailable(error.to_string()))?;
+        self.persist_snapshot(binding)?;
+        Ok(grant)
     }
 
     /// Issues one permit and durably journals its replay state.
@@ -291,7 +342,10 @@ impl ProcessDispatchAuthorityController {
         &mut self,
         binding: &AuthoritySnapshotBinding,
     ) -> KernelResult<AuthoritySnapshotReceipt> {
-        let snapshot = self.authority.replay_snapshot();
+        let snapshot = KernelAuthorityReplaySnapshot {
+            dispatch: self.authority.replay_snapshot(),
+            origin: self.origin_authority.replay_snapshot(),
+        };
         let sealed = match self.codec.seal(&snapshot, binding) {
             Ok(value) => value,
             Err(error) => {
@@ -336,6 +390,50 @@ impl ProcessDispatchAuthorityController {
             }
         }
     }
+
+    fn ensure_origin_request_binding(
+        &self,
+        request: &OriginChallengeRequest,
+        binding: &AuthoritySnapshotBinding,
+    ) -> KernelResult<()> {
+        request
+            .validate()
+            .map_err(|error| KernelError::DependencyUnavailable(error.to_string()))?;
+        binding
+            .state_fence()
+            .validate_against_epoch(&request.state_fence().authority_epoch)
+            .map_err(|_| KernelError::FenceMismatch)?;
+        let captured = StateFenceSnapshot::capture(
+            request.state_fence(),
+            request.state_fence().authority_epoch.sequence.get(),
+        )
+        .map_err(|_| KernelError::FenceMismatch)?;
+        if captured != *binding.state_fence() {
+            return Err(KernelError::FenceMismatch);
+        }
+        Ok(())
+    }
+}
+
+fn origin_authority_id() -> DispatchAuthorityId {
+    match DispatchAuthorityId::new(ORIGIN_AUTHORITY_ID) {
+        Ok(value) => value,
+        Err(_) => unreachable!("the fixed origin authority identity is valid"),
+    }
+}
+
+fn binding_current_epoch(
+    binding: &AuthoritySnapshotBinding,
+) -> KernelResult<eliot_contracts::EpochId> {
+    let fence: eliot_contracts::StateFence =
+        serde_json::from_str(&binding.state_fence().canonical_json)
+            .map_err(|_| KernelError::FenceMismatch)?;
+    fence.validate().map_err(|_| KernelError::FenceMismatch)?;
+    binding
+        .state_fence()
+        .validate_against_epoch(&fence.authority_epoch)
+        .map_err(|_| KernelError::FenceMismatch)?;
+    Ok(fence.authority_epoch)
 }
 
 fn subject_id(authority_id: &DispatchAuthorityId) -> KernelResult<OperationIdentity> {

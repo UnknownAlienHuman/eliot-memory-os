@@ -35,6 +35,7 @@ eliot-observability = { path = "../../crates/instrument/eliot-observability" }
 eliot-observation.workspace = true
 eliot-platform.workspace = true
 eliot-platform-windows.workspace = true
+eliot-process.workspace = true
 eliot-protocol.workspace = true
 eliot-read = { path = "../../crates/governor/eliot-read" }
 eliot-receipts.workspace = true

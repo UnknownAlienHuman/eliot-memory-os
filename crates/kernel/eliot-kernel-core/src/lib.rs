@@ -42,9 +42,9 @@ pub use authority::{
 };
 pub use authority_controller::{
     AuthoritySnapshotBinding, AuthoritySnapshotBindingWire, DispatchSnapshotCodec,
-    ProcessDispatchAuthorityController, ProcessExecutionReplayBegin, ProcessExecutionReplayRecord,
-    ProcessExecutionReplayState, ProcessExecutionReplayStore, SealedAuthoritySnapshot,
-    process_admission_digest,
+    KernelAuthorityReplaySnapshot, ProcessDispatchAuthorityController, ProcessExecutionReplayBegin,
+    ProcessExecutionReplayRecord, ProcessExecutionReplayState, ProcessExecutionReplayStore,
+    SealedAuthoritySnapshot, process_admission_digest,
 };
 pub use error::{KernelError, KernelResult};
 pub use grant_activation_port::{

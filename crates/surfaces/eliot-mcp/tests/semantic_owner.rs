@@ -120,6 +120,31 @@ fn contract_request_and_transport_surface_join_to_the_owner() {
     assert_eq!(names, CANONICAL_TOOL_NAMES);
 }
 
+/// H-A adapter predicate: the production canonical registry value answers
+/// exactly what the Skill-owned `CanonicalToolSource` port will delegate to
+/// (`definition_version` binding + `resolve(...).is_ok()` membership at the
+/// bound version). Proves the impl body against the real registry; the trait
+/// `impl` itself applies verbatim once the Skill owner's trait merges.
+#[test]
+fn canonical_registry_value_answers_version_bound_skill_membership() {
+    let registry = canonical_registry().expect("canonical registry builds");
+    // The bound version the port reports is the frozen pinned version.
+    assert_eq!(CANONICAL_DEFINITION_VERSION, "1.2.0");
+    // Membership is exactly the registry's answer at the bound version.
+    for name in CANONICAL_TOOL_NAMES {
+        assert!(
+            registry.resolve(name, CANONICAL_DEFINITION_VERSION).is_ok(),
+            "profiled method must be known: {name}"
+        );
+    }
+    assert!(
+        registry
+            .resolve("vendor.effect", CANONICAL_DEFINITION_VERSION)
+            .is_err(),
+        "unprofiled method must be absent, never synthesized"
+    );
+}
+
 /// Single owner: one disagreeing MCP/WIT/EBP view fails against the profile.
 #[test]
 fn operational_projection_must_agree_with_single_owner() {

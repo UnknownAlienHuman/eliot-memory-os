@@ -35,7 +35,7 @@ pub use eliot_agent_bridge_core::{
     DeliveryStatus, HotResourceView, MAX_CONTENT_BYTES, MAX_PREVIEW_BYTES, MAX_REGISTRY_ENTRIES,
     MAX_URI_BYTES, ResourceHandle, ResourceKind, ResourceRegistry, ResourceUri, ToolResultReceipt,
 };
-use eliot_mcp::KernelHostRequestPort;
+use eliot_mcp::{HostInvocationOutcome, KernelHostRequestPort, ResponseKind};
 use eliot_protocol::{
     AckPhase, AgentBridgeClientDeclaration, AgentBridgePeerAdmissionReceipt,
     AgentBridgePeerChallenge, EventEnvelope,
@@ -45,7 +45,9 @@ use eliot_runtime::{Runtime, RuntimeConfig};
 mod cli_contract;
 mod kernel_activation_client;
 mod kernel_host_request_client;
+pub mod memory_handle_join;
 pub mod reactive_injection_receipts;
+pub mod settled_plan_transport;
 mod understanding_bootstrap;
 pub(crate) use cli_contract::validate_client_declaration_path;
 pub use cli_contract::{CliConfig, CliError, Profile, Transport, parse_args};
@@ -56,10 +58,16 @@ use kernel_activation_client::{
     denial_reason_code,
 };
 use kernel_host_request_client::{KernelHostRequestClient, ReplayCacheEntry};
+pub use memory_handle_join::{ResolvedMemoryHandle, parse_memory_handle};
 pub use reactive_injection_receipts::{
     AdmissionBasis, AttentionItem, CueKind, DeliveryPoint, FiringEvidence, InjectionReceipt,
     ItemDisposition, NormalizedCue, REACTIVE_INJECTION_CONTRACT, ReactiveInjectionError,
     ReactiveInjectionLedger, RiskTier, Severity, UseOutcome,
+};
+pub use settled_plan_transport::{
+    AdmittedPlanItem, GovernorAssessmentView, MAX_TRANSPORT_REPLAY_KEYS, PlanAdmissionError,
+    PlanAdmissionReport, SettledPlanAdmission, WithheldPlanItem, governor_assess,
+    render_admission_fence,
 };
 pub use understanding_bootstrap::{
     AuthoritativeSelection, BootstrapContext, BootstrapError, BootstrapSession,
@@ -630,6 +638,41 @@ impl BridgeRunner {
     #[must_use]
     pub fn resource_registry_len(&self) -> usize {
         self.core.resource_registry_len()
+    }
+    /// Records one supported tool-result delivery into the attach-scoped
+    /// evidence projection, at the normal Invoke callsite after the gateway
+    /// returns with the exact authenticated outcome.
+    ///
+    /// Only `Responded` outcomes carrying a supported typed result
+    /// (`Candidate` or `Projection` — never `PlanGap`/`Unsupported` gaps, admissions,
+    /// or rejections) whose canonical content bytes exceed the hot preview bound are
+    /// snapshotted, content-addressed, into the registry; everything else yields `None`.
+    /// Snapshot failures (full registry, oversize, unserializable) also yield `None`
+    /// WITHOUT affecting forwarding: the emitted response stays authoritative and this
+    /// substrate is purely auxiliary delivery-record augmentation.
+    ///
+    /// Evidence content-addressing is NOT admission authority: the URI is a pure function
+    /// of the exact delivered bytes, grants nothing, admits nothing, and resolves nothing.
+    /// The bytes were already delivered inline to the host in the same response, so no new
+    /// disclosure occurs here. Tokens rendered and route delivery stay unknowable at the
+    /// bridge and are never estimated — completing a `ToolResultReceipt` remains the
+    /// route owner's job (`project_tool_result_receipt`).
+    pub fn record_tool_result_delivery(
+        &mut self,
+        outcome: &HostInvocationOutcome,
+    ) -> Option<HotResourceView> {
+        let HostInvocationOutcome::Responded { response, .. } = outcome else {
+            return None;
+        };
+        match response.kind {
+            ResponseKind::Candidate | ResponseKind::Projection => {}
+            ResponseKind::PlanGap | ResponseKind::Unsupported => return None,
+        }
+        let bytes = serde_json::to_vec(&response.content).ok()?;
+        if bytes.len() <= MAX_PREVIEW_BYTES {
+            return None;
+        }
+        self.core.publish_evidence(bytes).ok()
     }
     /// Notes the owner-supplied bootstrap context for this session.
     ///
@@ -1856,6 +1899,49 @@ mod tests {
                     .is_err()
             );
             assert!(restored.restore_reactive_ledger(&[]).is_err());
+        }
+
+        #[test]
+        fn ledger_snapshot_pins_the_store_facing_byte_contract() {
+            // The C4 durable seam (Store owner persists these bytes verbatim):
+            // contract stamp, canonical JSON shape, and the 1 MiB bound,
+            // straight through the production export entry. Delivery
+            // semantics stay with the bridge ledger; the Store never
+            // interprets beyond the structural stamp.
+            let mut runner = reactive_runner(true);
+            runner
+                .admit_reactive_injection(
+                    reactive_cue("rev-1"),
+                    Some(reactive_firing()),
+                    vec!["rel-reactive-a".to_owned()],
+                    reactive_admission(Severity::Normal, RiskTier::Low),
+                )
+                .expect("admit");
+            let bytes = runner.reactive_ledger_snapshot().expect("snapshot");
+            assert!(
+                bytes.len()
+                    <= super::reactive_injection_receipts::MAX_LEDGER_JSON_BYTES,
+                "snapshot must fit the bounded Store write"
+            );
+            let value: serde_json::Value =
+                serde_json::from_slice(&bytes).expect("snapshot is JSON");
+            assert_eq!(
+                value.get("contract").and_then(|contract| contract.as_str()),
+                Some(super::REACTIVE_INJECTION_CONTRACT),
+                "snapshot carries the delivery-record contract stamp"
+            );
+            for key in [
+                "contract",
+                "next_item_seq",
+                "next_receipt_seq",
+                "items",
+                "receipts",
+            ] {
+                assert!(
+                    value.get(key).is_some(),
+                    "snapshot shape must carry {key} for the Store reader"
+                );
+            }
         }
 
         #[test]
