@@ -39,7 +39,6 @@ mod composition;
 mod context_inputs;
 mod cue_composition;
 mod epistemic_composition;
-pub use epistemic_composition::{GovernorEpistemicComposition, ObservedEpistemicProposal};
 pub use context_inputs::{
     ContextInputsError, ContextReconstructionRequest, GovernorContextInputs, ROLE_AFFORDANCES,
     ROLE_ATTENTION_CONFLICT, ROLE_CUE_ACTIVATION, ROLE_EPISTEMIC_POSITION, ROLE_EVIDENCE_ASSURANCE,
@@ -49,6 +48,7 @@ pub use cue_composition::{
     CueCacheKey, CueCompositionError, CueReconstruction, CueReconstructionCache,
     MAX_CACHED_CUE_RECONSTRUCTIONS, evidence_projection_payload, reconstruct_cue_snapshot,
 };
+pub use epistemic_composition::{GovernorEpistemicComposition, ObservedEpistemicProposal};
 mod controlboard_projection;
 mod observation_reconciliation;
 mod operator_reconciliation;
@@ -68,7 +68,8 @@ pub use canonical_projections::{
 };
 pub use capability_evidence::{
     CapabilityEvidenceRecord, CapabilityRegistry, CapabilitySource, CapabilityStatus,
-    RouteScopeFingerprint,
+    EvidenceRelationError, MAX_CAPABILITY_EVIDENCE_RECORDS, RouteScopeFingerprint,
+    ScopeDependencySelector,
 };
 pub use composition::*;
 pub use controlboard_projection::{
@@ -78,7 +79,10 @@ pub use controlboard_projection::{
 /// the daemon composition root can name the exact envelope type without a
 /// second canonical dependency path.
 pub use eliot_canonical::CanonicalWriteEnvelope;
-pub use eliot_config::legacy_capability_import;
+/// Task lifecycle domain types re-exported so the daemon composition root
+/// can name the exact task-command types without a second task dependency
+/// path (same reason as the [`CanonicalWriteEnvelope`] re-export below).
+pub use eliot_task::{TaskCommand, TaskCommandContext, TaskProposal, TaskRecord};
 pub use observation_reconciliation::{
     GovernorObservationReconciliation, WatchdogAdmittedEntry, WatchdogEntryAdmission,
     WatchdogEntryKind,
@@ -93,10 +97,6 @@ pub use swarm_plan_attachment_service::{
     ATTACHMENT_ORDERING_SCOPE, ATTACHMENT_REVISION_KEY, CanonicalAttachmentStoreError,
     CanonicalSwarmPlanAttachmentStore, SwarmPlanAttachmentService,
 };
-/// Task lifecycle domain types re-exported so the daemon composition root
-/// can name the exact task-command types without a second task dependency
-/// path (same reason as the [`CanonicalWriteEnvelope`] re-export below).
-pub use eliot_task::{TaskCommand, TaskCommandContext, TaskProposal, TaskRecord};
 pub use task_lifecycle::{GovernorTaskLifecycle, TaskLifecycleError};
 
 use std::collections::BTreeMap;

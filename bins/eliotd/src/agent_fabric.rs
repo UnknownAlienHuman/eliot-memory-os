@@ -746,17 +746,42 @@ impl AgentFabric {
         Ok(route)
     }
 
-    /// Requires one resolved route through the injected B-MOD registry.
+    /// Requires one resolved route through the injected B-MOD registry,
+    /// gated on Governor capability evidence (#1957).
+    ///
+    /// Resolution stays candidate-only through the injected port; the route
+    /// is required only when every competence item holds fresh
+    /// exact-fingerprint production admission in the daemon-held
+    /// [`GovernorCapabilityAdmission`](super::capability_evidence_wiring::GovernorCapabilityAdmission)
+    /// on the caller-supplied observed scope at `now`. The scope fingerprint
+    /// is an observation the caller threads in (requested and observed
+    /// routes stay separate objects); it is never derived here from the
+    /// resolved route.
     ///
     /// # Errors
     ///
-    /// Returns [`FabricError::NoRoute`] when no route is eligible.
+    /// Returns [`FabricError::NoRoute`] when the registry resolves no route
+    /// or any competence item lacks fresh evidence. Never falls back
+    /// locally.
     pub fn require_model_route(
         &mut self,
         requirements: &RouteRequirements,
+        evidence: &super::capability_evidence_wiring::GovernorCapabilityAdmission,
+        scope: &eliot_governor::RouteScopeFingerprint,
+        now: u64,
     ) -> Result<RouteFingerprint, FabricError> {
         match self.resolve_model_route(requirements)? {
-            Some(route) => Ok(route),
+            Some(route) => {
+                for competence in &requirements.competence {
+                    if !evidence.admit_production_route(competence, scope, now) {
+                        let role = requirements.role.clone();
+                        return Err(FabricError::NoRoute(format!(
+                            "no admitted capability evidence for role {role} competence {competence}"
+                        )));
+                    }
+                }
+                Ok(route)
+            }
             None => Err(FabricError::NoRoute(format!(
                 "no eligible route for role {}",
                 requirements.role

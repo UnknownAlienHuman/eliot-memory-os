@@ -66,14 +66,26 @@
 //! [`PhysicalRouteObservationReceipt::validate_against`]:
 //!     eliot_agent_api::PhysicalRouteObservationReceipt::validate_against
 
-use eliot_agent_api::{AdmittedRouteReceipt, AgentResult, ProviderExecutionBinding};
+use std::collections::BTreeSet;
+
+use eliot_agent_api::{
+    AdmittedRouteReceipt, AgentResult, ExecutionOutcome, ProviderExecutionBinding,
+    ResultDisposition, RouteFingerprint, RouteObservationState,
+};
 use eliot_agent_coordinator::{
     AgentCoordinator, CoordinatorConfig, HumanModelPreferencePolicy, ModelCatalogueSnapshot,
     ModelRole, PlanGap, StaffingPlanCandidate, StaffingPlanRequest,
 };
 use eliot_contracts::{ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence};
-use eliot_governor::{CompositionError, CompositionReadiness};
+use eliot_governor::{CompositionError, CompositionReadiness, RouteScopeFingerprint};
 
+use super::capability_admission::{
+    CapabilityEvidenceRecord, DynamicCapabilityPulse, ProductionAdmissionRequest,
+    ProductionEvidenceBundle, StaticCapabilityAttestation, evaluate_production_admission,
+};
+use super::capability_evidence_wiring::GovernorCapabilityAdmission;
+use super::capability_outcome::{AttemptReceipt, FallbackOutcomeRequest, fallback_outcome};
+use super::route_receipts::effective_route_key;
 use super::{DaemonComposition, SERVICE_NAME};
 
 /// Closed model-execution port behind the governed invoke.
@@ -123,6 +135,23 @@ pub struct ModelInvokeInput {
     pub admission: AdmittedRouteReceipt,
     /// Exact provider-execution binding the attempt runs under.
     pub binding: ProviderExecutionBinding,
+    /// Caller-observed capability evidence records for the funnel side of
+    /// the capability gate (issue #1959). Threaded per call from the
+    /// retained Governor registry snapshots plus probe/handshake observers;
+    /// windows are owner-set, never minted here.
+    pub evidence_records: Vec<CapabilityEvidenceRecord>,
+    /// Static attestation for critical capabilities, if the capability is
+    /// critical. `None` for non-critical capabilities.
+    pub static_attestation: Option<StaticCapabilityAttestation>,
+    /// Fresh pulse for critical capabilities, if the capability is critical.
+    /// `None` for non-critical capabilities.
+    pub pulse: Option<DynamicCapabilityPulse>,
+    /// Caller-observed route scope for the adopted registry side of the
+    /// capability gate (issue #1957). Threaded per call from handshake or
+    /// transport observations; never derived here from the bound route.
+    /// `None` leaves the registry side unevaluable and fails the gate
+    /// closed.
+    pub evidence_scope: Option<RouteScopeFingerprint>,
 }
 
 /// Thin governed Dreamer model-call adapter over the retained daemon owners.
@@ -131,8 +160,10 @@ pub struct ModelInvokeInput {
 /// no lifecycle: callers take a fresh adapter per operation through
 /// [`DaemonComposition::dreamer_model`], so a Governor refresh surfaces as an exact fence
 /// mismatch instead of silent divergence. Unlike the T12-06 intake adapter this slice
-/// performs no Kernel reads — catalogue, policy, admission, and binding arrive threaded
-/// by the caller and execution leaves through the [`DreamerModelExecution`] port — so no
+/// performs no Kernel reads — catalogue, policy, admission, binding, and the
+/// caller-opened attempt receipt arrive threaded per call, the Governor
+/// capability admission view is borrowed from the retained composition, and
+/// execution leaves through the [`DreamerModelExecution`] port — so no
 /// Kernel client is retained here.
 pub struct GovernedDreamerModelAdapter<'a> {
     composition: &'a DaemonComposition,
@@ -161,14 +192,19 @@ impl<'a> GovernedDreamerModelAdapter<'a> {
     /// Invokes one governed model call and returns its verified candidate result.
     ///
     /// Order is load-bearing: Governor readiness, catalogue plus Human-policy admission,
-    /// fence join, candidate planning, attempt/route linkage, exactly one port execution,
-    /// then the sealed-intake result binding. Any earlier failure returns before the port
-    /// is touched, so no provider budget is spent on a wrong or stale receipt; usage,
-    /// cancellation, and unknown outcomes in the returned result cross unchanged.
+    /// fence join, candidate planning, attempt/route linkage, the C1 capability
+    /// join over the daemon-held Governor admission view (registry plus funnel
+    /// over the canonical required set at the admitted generation), exactly
+    /// one port execution, then the sealed-intake result binding plus the
+    /// call-scoped result-intake join on the caller-threaded receipt. Any
+    /// earlier failure returns before the port is touched, so no provider
+    /// budget is spent on a wrong or stale receipt; usage, cancellation, and
+    /// unknown outcomes in the returned result cross unchanged.
     pub async fn invoke(
         &self,
         coordinator_config: &CoordinatorConfig,
         input: &ModelInvokeInput,
+        intake: &mut AttemptReceipt,
         execution: &impl DreamerModelExecution,
     ) -> Result<AgentResult, CompositionError> {
         let admitted = self.composition.kernel_snapshot().state_fence();
@@ -179,7 +215,20 @@ impl<'a> GovernedDreamerModelAdapter<'a> {
                 "dreamer model route context does not match the admitted snapshot",
             ));
         }
-        invoke_admitted_model(readiness, &admitted, coordinator_config, input, execution).await
+        let registry = self
+            .composition
+            .capability_admission()
+            .map_err(|_| CompositionError::NotReady)?;
+        invoke_admitted_model(
+            readiness,
+            &admitted,
+            coordinator_config,
+            registry,
+            input,
+            intake,
+            execution,
+        )
+        .await
     }
 }
 
@@ -325,20 +374,42 @@ pub(crate) fn verify_model_attempt_linkage(
     Ok(())
 }
 
+/// Proof ceiling recorded on call-scoped result-intake outcomes.
+///
+/// Always the weakest candidate ceiling: a degraded or diverged execution
+/// proves at most one bounded candidate artifact for its exact execution
+/// unit, never task completion. The spelling matches the owner
+/// [`ProofCeiling::CandidateArtifact`](eliot_agent_api::ProofCeiling)
+/// vocabulary; a unit test below asserts the sync so the intake marker
+/// cannot drift from the contract enum.
+const INTAKE_PROOF_CEILING: &str = "CANDIDATE_ARTIFACT";
+
+/// Recovery marker recorded on call-scoped result-intake outcomes.
+///
+/// Names the only defined recovery path: requalification of the exact
+/// fingerprint on fresh evidence (the `Defer` disposition contract). A
+/// static marker, never a schedule: no freshness window is minted here.
+const INTAKE_RECOVERY: &str = "requalify-exact-fingerprint-on-fresh-evidence";
+
 /// Core model-call flow over explicit authority values.
 ///
 /// `readiness`, `admitted_fence`, and `coordinator_config` must come from the live
 /// composition and the daemon-threaded capacity view (see
-/// [`GovernedDreamerModelAdapter::invoke`]); tests supply exact values directly. The
-/// execution port is touched only after every read-only gate passes, and the returned
-/// result is the port's candidate bound by [`AgentResult::validate_for_binding`] —
+/// [`GovernedDreamerModelAdapter::invoke`]); `registry` is the daemon-held
+/// Governor capability admission view; `intake` is the caller-opened attempt
+/// receipt for the bound attempt, carrying the call-scoped outcomes of this
+/// invoke. Tests supply exact values directly. The execution port is touched
+/// only after every read-only gate passes, and the returned result is the
+/// port's candidate bound by [`AgentResult::validate_for_binding`] —
 /// requested, logical, and observed identities plus usage, cancellation, and unknown
 /// outcomes cross unchanged and are never rewritten here.
 pub(crate) async fn invoke_admitted_model(
     readiness: CompositionReadiness,
     admitted_fence: &StateFence,
     coordinator_config: &CoordinatorConfig,
+    registry: &GovernorCapabilityAdmission,
     input: &ModelInvokeInput,
+    intake: &mut AttemptReceipt,
     execution: &impl DreamerModelExecution,
 ) -> Result<AgentResult, CompositionError> {
     if readiness != CompositionReadiness::Ready {
@@ -368,6 +439,10 @@ pub(crate) async fn invoke_admitted_model(
         &input.admission,
         &input.binding,
     )?;
+    // C1 capability join (issues #1957/#1959): every required capability must
+    // hold fresh admission on BOTH the adopted Governor registry side and the
+    // funnel side before the execution port is touched.
+    let required = gate_model_capability(admitted_fence, registry, input)?;
     let result = execution
         .execute(&candidate, &input.admission, &input.binding)
         .await?;
@@ -378,7 +453,206 @@ pub(crate) async fn invoke_admitted_model(
             &input.request.launch.effect_ceiling,
         )
         .map_err(|error| owner_error(format!("dreamer model result: {error}")))?;
+    record_model_result_intake(&result, &input.binding, &required, intake)?;
     Ok(result)
+}
+
+/// Resolves the canonical required capability set for one invoke (R2).
+///
+/// Union of the Task Controller launch intent
+/// (`request.launch.required_competence`, owner-validated non-empty by the
+/// coordinator plan above) and the explicit Human Dreamer-role preference
+/// (`policy.required_capabilities`, owner-validated text). Both arrive
+/// threaded per call; no set is defaulted and no capability is inferred.
+/// An empty union fails closed: an empty required set never admits.
+fn required_capabilities(input: &ModelInvokeInput) -> Result<Vec<String>, CompositionError> {
+    let mut required = BTreeSet::new();
+    for item in &input.request.launch.required_competence {
+        required.insert(item.clone());
+    }
+    for preference in input
+        .policy
+        .roles
+        .iter()
+        .filter(|preference| preference.role == ModelRole::Dreamer)
+    {
+        for capability in &preference.required_capabilities {
+            required.insert(capability.clone());
+        }
+    }
+    if required.is_empty() {
+        return Err(owner_error(
+            "dreamer model invoke has no required capabilities; refusing an empty required set",
+        ));
+    }
+    Ok(required.into_iter().collect())
+}
+
+/// Returns true when the caller threads critical evidence for one capability.
+///
+/// Criticality has no separate owner: the caller asserts it by threading a
+/// static attestation or a dynamic pulse bound to the exact capability,
+/// route, and admitted generation. Either assertion alone evaluates the
+/// critical join, so partial critical evidence fails closed instead of
+/// admitting through the base join.
+fn is_critical_capability(
+    capability: &str,
+    route: &RouteFingerprint,
+    generation: u64,
+    input: &ModelInvokeInput,
+) -> bool {
+    input
+        .static_attestation
+        .as_ref()
+        .is_some_and(|attestation| {
+            attestation.capability == capability && attestation.route == *route
+        })
+        || input.pulse.as_ref().is_some_and(|pulse| {
+            pulse.capability == capability
+                && pulse.route == *route
+                && pulse.generation == generation
+        })
+}
+
+/// Runs the C1 capability join for one invoke: registry side plus funnel side.
+///
+/// Order is load-bearing and every failure returns before the execution port
+/// is touched:
+/// - R2: the canonical required set (launch intent plus Human Dreamer-role
+///   preference) is resolved per call; empty fails closed.
+/// - R4: the generation under evaluation is the Kernel-owned admitted
+///   fence's resource generation, and the execution binding must agree with
+///   it exactly. No caller-supplied generation is trusted.
+/// - R3: freshness is evaluated at the caller-threaded observation time
+///   against owner-set windows (`observed_at`/`expires_at` on funnel
+///   records, `observed_at`/`expires_at` plus derived scope invalidation on
+///   registry records). No window is minted here and no TTL constant exists.
+/// - the registry side requires fresh exact-scope positive evidence with no
+///   fresh restriction; a missing observed scope fails closed.
+/// - the funnel side requires an `Admit` disposition over the threaded
+///   records plus the critical join exactly when the caller threaded
+///   critical evidence.
+///
+/// Returns the evaluated required set for the result-intake join below.
+fn gate_model_capability(
+    admitted_fence: &StateFence,
+    registry: &GovernorCapabilityAdmission,
+    input: &ModelInvokeInput,
+) -> Result<Vec<String>, CompositionError> {
+    let required = required_capabilities(input)?;
+    let generation = admitted_fence.resource_generation.value();
+    if input.binding.runtime_generation != admitted_fence.resource_generation {
+        return Err(owner_error(
+            "dreamer model binding generation does not match the admitted Kernel generation",
+        ));
+    }
+    let scope = input.evidence_scope.as_ref().ok_or_else(|| {
+        owner_error(
+            "dreamer model invoke threads no observed route scope; capability evidence is unevaluable",
+        )
+    })?;
+    let now = input.now_unix_ms;
+    for capability in &required {
+        if !registry.admit_production_route(capability, scope, now) {
+            return Err(owner_error(format!(
+                "no fresh Governor capability evidence admits {capability} on the observed scope"
+            )));
+        }
+        let request = ProductionAdmissionRequest {
+            capability: capability.clone(),
+            route: input.binding.route.clone(),
+            generation,
+            now_unix_ms: now,
+            critical: is_critical_capability(capability, &input.binding.route, generation, input),
+        };
+        let bundle = ProductionEvidenceBundle {
+            records: &input.evidence_records,
+            static_attestation: input.static_attestation.as_ref(),
+            pulse: input.pulse.as_ref(),
+        };
+        let outcome = evaluate_production_admission(
+            &request,
+            bundle.records,
+            bundle.static_attestation,
+            bundle.pulse,
+        );
+        if !outcome.admitted() {
+            return Err(owner_error(format!(
+                "production admission does not admit {capability} for the bound route: {}",
+                outcome.reason
+            )));
+        }
+    }
+    Ok(required)
+}
+
+/// Records the result-intake join for one verified invoke result (C1).
+///
+/// The receipt must be opened by the caller for the executed attempt; a
+/// foreign receipt fails closed. Classification is derived only from the
+/// verified result, never synthesized:
+/// - diverged route observation or `DegradedNoProof` disposition: one
+///   call-scoped outcome per required capability, attempt-visible only and
+///   never global state. Route keys are the canonical digests of the
+///   admitted requested route and (on divergence) the runtime-observed
+///   route.
+/// - unobserved route, `UnknownOutcome` disposition, or unknown execution
+///   outcome: no positive claim is recorded; the receipt stays empty.
+/// - matched successful execution: nothing to record.
+///
+/// Broad degradation scopes are never emitted here: broader invalidation
+/// requires evidence tied to the broader owner plus its named recovery,
+/// which the invoke site does not hold.
+fn record_model_result_intake(
+    result: &AgentResult,
+    binding: &ProviderExecutionBinding,
+    required: &[String],
+    intake: &mut AttemptReceipt,
+) -> Result<(), CompositionError> {
+    if intake.attempt_id != binding.attempt_id.as_str() {
+        return Err(owner_error(
+            "model result intake receipt does not belong to the executed attempt",
+        ));
+    }
+    let diverged = result.actual_route.route_state == RouteObservationState::Diverged;
+    let degraded = result.disposition == ResultDisposition::DegradedNoProof;
+    let unknown = result.disposition == ResultDisposition::UnknownOutcome
+        || result.actual_route.route_state == RouteObservationState::Unobserved
+        || result.actual_route.execution_outcome == ExecutionOutcome::UnknownOutcome;
+    if unknown || (!diverged && !degraded) {
+        return Ok(());
+    }
+    let requested_key = effective_route_key(&binding.route).map_err(|error| {
+        owner_error(format!("model result intake requested route key: {error}"))
+    })?;
+    let effective_key = match (&result.actual_route.observed_route, diverged) {
+        (Some(observed), true) => effective_route_key(observed).map_err(|error| {
+            owner_error(format!("model result intake observed route key: {error}"))
+        })?,
+        _ => requested_key.clone(),
+    };
+    let reason = if diverged {
+        "executed route diverged from the admitted requested route"
+    } else {
+        "degraded execution without proof on the admitted route"
+    };
+    for capability in required {
+        let outcome = fallback_outcome(FallbackOutcomeRequest {
+            capability: capability.clone(),
+            requested_mode: requested_key.as_str().to_owned(),
+            effective_mode: effective_key.as_str().to_owned(),
+            reason: reason.to_owned(),
+            affected_outputs_or_operations: Vec::new(),
+            proof_ceiling: INTAKE_PROOF_CEILING.to_owned(),
+            recovery_requalification_or_expiry: INTAKE_RECOVERY.to_owned(),
+            attempt_id: binding.attempt_id.as_str().to_owned(),
+        })
+        .map_err(|error| owner_error(format!("model result intake outcome: {error}")))?;
+        intake
+            .attach(outcome)
+            .map_err(|error| owner_error(format!("model result intake attach: {error}")))?;
+    }
+    Ok(())
 }
 
 fn owner_error(reason: impl Into<String>) -> CompositionError {
@@ -398,14 +672,22 @@ mod tests {
     use std::num::NonZeroU64;
     use std::sync::Mutex;
 
+    use crate::capability_admission::CapabilityEvidenceStatus;
+    use crate::capability_outcome::DegradationScope;
     use eliot_agent_api::{
         AgentLaunchRequest, AgentWorkUnitBrief, AttemptId, BudgetEnvelope, CONTRACT_VERSION,
-        DecisionId, EffectCeiling, EffectKind, LaunchRequestId, LowercaseSha256, NativeSession,
-        RouteFingerprint, TaskId, WorkUnitId, candidate_digest_for,
+        DecisionId, EffectCeiling, EffectKind, EventCursor, ExecutionOutcome, LaunchRequestId,
+        LowercaseSha256, NativeSession, PhysicalRouteObservationReceipt, ProofCeiling,
+        QuotaKnowledge, ResultDisposition, RouteFingerprint, RouteObservationState,
+        RouteSelectionCandidate, TaskId, UsageReceipt, WorkUnitId, candidate_digest_for,
+        route_divergence_fields,
     };
     use eliot_agent_contracts::RevisionId;
-    use eliot_contracts::{EpochLineageId, sha256_hex};
+    use eliot_contracts::{EpochLineageId, ResourceGeneration, sha256_hex};
     use eliot_evaluation_contracts::BudgetEvidence;
+    use eliot_governor::{
+        CapabilityEvidenceRecord as GovernorEvidenceRecord, CapabilitySource, CapabilityStatus,
+    };
     use eliot_security_contracts::PrivacyClass;
 
     const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
@@ -740,6 +1022,28 @@ mod tests {
         }
     }
 
+    /// Test-only execution port answering one prebuilt verified result. The
+    /// result is built from the same admission/binding fixtures the invoke
+    /// runs under, so the sealed-intake linkage holds exactly.
+    struct SucceedingExecution {
+        calls: Mutex<u32>,
+        result: AgentResult,
+    }
+
+    impl DreamerModelExecution for SucceedingExecution {
+        async fn execute(
+            &self,
+            _candidate: &StaffingPlanCandidate,
+            _admission: &AdmittedRouteReceipt,
+            _binding: &ProviderExecutionBinding,
+        ) -> Result<AgentResult, CompositionError> {
+            if let Ok(mut calls) = self.calls.lock() {
+                *calls += 1;
+            }
+            Ok(self.result.clone())
+        }
+    }
+
     fn execution_calls(execution: &RecordingExecution) -> TestResult<u32> {
         execution
             .calls
@@ -782,15 +1086,23 @@ mod tests {
             now_unix_ms: TEST_NOW,
             admission,
             binding,
+            evidence_records: Vec::new(),
+            static_attestation: None,
+            pulse: None,
+            evidence_scope: None,
         };
         let execution = RecordingExecution {
             calls: Mutex::new(0),
         };
+        let mut intake =
+            AttemptReceipt::new("attempt-t12-07-b").map_err(|error| format!("intake: {error}"))?;
         let outcome = invoke_admitted_model(
             CompositionReadiness::Ready,
             &fence,
             &config,
+            &GovernorCapabilityAdmission::new(),
             &input,
+            &mut intake,
             &execution,
         )
         .await;
@@ -808,6 +1120,645 @@ mod tests {
             execution_calls(&execution)?,
             0,
             "wrong receipt must be rejected before execution"
+        );
+        Ok(())
+    }
+
+    fn succeeding_calls(execution: &SucceedingExecution) -> TestResult<u32> {
+        execution
+            .calls
+            .lock()
+            .map(|calls| *calls)
+            .map_err(|_| "test execution lock".into())
+    }
+
+    /// Shared invoke fixtures: one planned candidate plus the admission and
+    /// binding the invoke runs under, all on the genesis generation.
+    struct InvokeFixtures {
+        fence: StateFence,
+        config: CoordinatorConfig,
+        route: RouteFingerprint,
+        request: StaffingPlanRequest,
+        catalogue: ModelCatalogueSnapshot,
+        policy: HumanModelPreferencePolicy,
+        admission: AdmittedRouteReceipt,
+        binding: ProviderExecutionBinding,
+    }
+
+    fn invoke_fixtures_with(fence: &StateFence) -> TestResult<InvokeFixtures> {
+        let config = test_config()?;
+        let route = test_route()?;
+        let request = test_request(fence, &route)?;
+        let mut planner = AgentCoordinator::new(
+            config.clone(),
+            PlanGap::G11Unavailable {
+                reason: "t12-07 test plans under the explicit gap".to_owned(),
+            },
+        )?;
+        let candidate = planner.plan(request.clone())?;
+        let routing: RouteSelectionCandidate = candidate
+            .lanes
+            .first()
+            .ok_or("planned candidate must carry one lane")?
+            .routing
+            .clone();
+        let catalogue = test_catalogue(&route)?;
+        let policy = test_policy()?;
+        let admission = test_admission(&routing, "attempt-t12-07", fence)?;
+        let binding = test_binding("attempt-t12-07", &route, fence)?;
+        Ok(InvokeFixtures {
+            fence: fence.clone(),
+            config,
+            route,
+            request,
+            catalogue,
+            policy,
+            admission,
+            binding,
+        })
+    }
+
+    fn invoke_fixtures() -> TestResult<InvokeFixtures> {
+        invoke_fixtures_with(&test_fence()?)
+    }
+
+    fn drifted_fence() -> TestResult<StateFence> {
+        Ok(StateFence::new(
+            eliot_agent_api::EpochId::new(
+                EpochLineageId::new(TEST_LINEAGE)?,
+                NonZeroU64::new(1).ok_or("nonzero test sequence")?,
+            )?,
+            ResourceGeneration::new(2).map_err(|error| format!("generation: {error}"))?,
+        ))
+    }
+
+    /// Caller-observed route scope for the adopted registry side, threaded
+    /// per call from handshake observations (never derived from the bound
+    /// route here).
+    fn test_evidence_scope() -> RouteScopeFingerprint {
+        RouteScopeFingerprint {
+            runtime_hash: Some("t12-07-runtime-1".to_owned()),
+            adapter_hash: Some("t12-07-adapter-1".to_owned()),
+            os_architecture: Some("x86_64-windows".to_owned()),
+            auth_profile_class: Some("user-broker".to_owned()),
+            provider_model_route: Some("provider-model-a/model-a/fixture-account".to_owned()),
+            feature_flags_and_serializer: Some("t12-07-serializer-1".to_owned()),
+        }
+    }
+
+    /// Daemon-held registry view holding fresh probe evidence for the
+    /// `rust` competence on the observed scope.
+    fn test_registry_admitted(
+        scope: &RouteScopeFingerprint,
+    ) -> TestResult<GovernorCapabilityAdmission> {
+        let mut registry = GovernorCapabilityAdmission::new();
+        registry.insert(
+            GovernorEvidenceRecord::verified(
+                "rust",
+                CapabilityStatus::ProbePassed,
+                CapabilitySource::ActiveProbe,
+                scope.clone(),
+                1_000,
+            )
+            .map_err(|error| format!("probe evidence: {error}"))?
+            .expires_at(2_000),
+        );
+        Ok(registry)
+    }
+
+    /// Caller-observed funnel record for the `rust` competence on the exact
+    /// bound route and generation. Windows are owner-set inputs, never
+    /// minted by the gate.
+    fn test_funnel_record(route: &RouteFingerprint, generation: u64) -> CapabilityEvidenceRecord {
+        CapabilityEvidenceRecord {
+            capability: "rust".to_owned(),
+            route: route.clone(),
+            generation,
+            status: CapabilityEvidenceStatus::Observed,
+            observed_at_unix_ms: 1_000,
+            expires_at_unix_ms: 2_000,
+        }
+    }
+
+    fn gate_input(
+        fixtures: &InvokeFixtures,
+        records: Vec<CapabilityEvidenceRecord>,
+        scope: Option<RouteScopeFingerprint>,
+    ) -> ModelInvokeInput {
+        ModelInvokeInput {
+            request: fixtures.request.clone(),
+            catalogue: fixtures.catalogue.clone(),
+            policy: fixtures.policy.clone(),
+            now_unix_ms: TEST_NOW,
+            admission: fixtures.admission.clone(),
+            binding: fixtures.binding.clone(),
+            evidence_records: records,
+            static_attestation: None,
+            pulse: None,
+            evidence_scope: scope,
+        }
+    }
+
+    fn test_usage() -> UsageReceipt {
+        UsageReceipt {
+            input_tokens: None,
+            output_tokens: None,
+            cost_microunits: None,
+            quota: QuotaKnowledge::Unknown,
+        }
+    }
+
+    fn test_clock(valid_ms: i64, known_ms: i64) -> ClockReading {
+        ClockReading {
+            valid_time_ms: Some(valid_ms),
+            known_time_ms: Some(known_ms),
+            transaction_sequence: None,
+            monotonic_ns: None,
+        }
+    }
+
+    fn matched_observation(
+        admission: &AdmittedRouteReceipt,
+        binding: &ProviderExecutionBinding,
+        route: &RouteFingerprint,
+        fence: &StateFence,
+    ) -> TestResult<PhysicalRouteObservationReceipt> {
+        let mut observation = PhysicalRouteObservationReceipt {
+            schema_version: CONTRACT_VERSION.to_owned(),
+            attempt_id: binding.attempt_id.clone(),
+            state_fence: fence.clone(),
+            runtime_generation: ResourceGeneration::genesis(),
+            admitted_route_digest: admission.self_digest.clone(),
+            binding: binding.clone(),
+            requested_route: route.clone(),
+            observed_route: Some(route.clone()),
+            route_state: RouteObservationState::Matched,
+            diverged_fields: Vec::new(),
+            execution_outcome: ExecutionOutcome::Observed,
+            request_digest: test_digest("t12-07-request")?,
+            translation_digest: None,
+            raw_evidence_digest: None,
+            raw_evidence_ref: None,
+            usage: test_usage(),
+            started: test_clock(1_000, 1_001),
+            first_byte: ClockReading::default(),
+            first_semantic: ClockReading::default(),
+            terminal: test_clock(2_000, 2_001),
+            event_cursor: EventCursor::new("cursor-t12-07")
+                .map_err(|error| format!("cursor: {error}"))?,
+            event_sequence: 1,
+            cancellation: None,
+            unobserved_reason: None,
+            recovery_ref: None,
+            safe_public_error: None,
+            restricted_raw_error_ref: None,
+            self_digest: test_digest("t12-07-placeholder")?,
+        };
+        observation.self_digest = observation
+            .compute_digest()
+            .map_err(|error| format!("observation digest: {error}"))?;
+        observation
+            .validate()
+            .map_err(|error| format!("observation fixture must validate: {error}"))?;
+        Ok(observation)
+    }
+
+    fn invoke_result(
+        admission: &AdmittedRouteReceipt,
+        binding: &ProviderExecutionBinding,
+        route: &RouteFingerprint,
+        fence: &StateFence,
+        disposition: ResultDisposition,
+        mutate: impl FnOnce(&mut PhysicalRouteObservationReceipt) -> TestResult,
+    ) -> TestResult<AgentResult> {
+        let mut actual_route = matched_observation(admission, binding, route, fence)?;
+        mutate(&mut actual_route)?;
+        actual_route.self_digest = actual_route
+            .compute_digest()
+            .map_err(|error| format!("observation digest: {error}"))?;
+        actual_route
+            .validate()
+            .map_err(|error| format!("mutated observation must validate: {error}"))?;
+        let unknown_reason = (disposition == ResultDisposition::UnknownOutcome)
+            .then(|| "provider did not report an outcome".to_owned());
+        Ok(AgentResult {
+            attempt_id: binding.attempt_id.clone(),
+            disposition,
+            artifacts: Vec::new(),
+            evidence_refs: Vec::new(),
+            proposed_effects: Vec::new(),
+            unresolved_questions: Vec::new(),
+            usage: test_usage(),
+            actual_route,
+            unknown_reason,
+        })
+    }
+
+    fn matched_success(
+        admission: &AdmittedRouteReceipt,
+        binding: &ProviderExecutionBinding,
+        route: &RouteFingerprint,
+        fence: &StateFence,
+    ) -> TestResult<AgentResult> {
+        invoke_result(
+            admission,
+            binding,
+            route,
+            fence,
+            ResultDisposition::CandidateSucceeded,
+            |_| Ok(()),
+        )
+    }
+
+    async fn run_gate(
+        fixtures: &InvokeFixtures,
+        registry: &GovernorCapabilityAdmission,
+        input: &ModelInvokeInput,
+        intake: &mut AttemptReceipt,
+        execution: &SucceedingExecution,
+    ) -> Result<AgentResult, CompositionError> {
+        invoke_admitted_model(
+            CompositionReadiness::Ready,
+            &fixtures.fence,
+            &fixtures.config,
+            registry,
+            input,
+            intake,
+            execution,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn capability_gate_admits_with_fresh_evidence_on_both_sides() -> TestResult {
+        let fixtures = invoke_fixtures()?;
+        let scope = test_evidence_scope();
+        let registry = test_registry_admitted(&scope)?;
+        let generation = fixtures.fence.resource_generation.value();
+        let input = gate_input(
+            &fixtures,
+            vec![test_funnel_record(&fixtures.route, generation)],
+            Some(scope),
+        );
+        let result = matched_success(
+            &fixtures.admission,
+            &fixtures.binding,
+            &fixtures.route,
+            &fixtures.fence,
+        )?;
+        let execution = SucceedingExecution {
+            calls: Mutex::new(0),
+            result,
+        };
+        let mut intake = AttemptReceipt::new(fixtures.binding.attempt_id.as_str())
+            .map_err(|error| format!("intake: {error}"))?;
+        let outcome = run_gate(&fixtures, &registry, &input, &mut intake, &execution).await?;
+        assert_eq!(outcome.attempt_id, fixtures.binding.attempt_id);
+        assert_eq!(succeeding_calls(&execution)?, 1);
+        assert!(
+            intake.capability_outcomes.is_empty(),
+            "matched success records no intake outcome"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn missing_capability_evidence_denies_before_execution() -> TestResult {
+        let fixtures = invoke_fixtures()?;
+        let input = gate_input(&fixtures, Vec::new(), Some(test_evidence_scope()));
+        let execution = SucceedingExecution {
+            calls: Mutex::new(0),
+            result: matched_success(
+                &fixtures.admission,
+                &fixtures.binding,
+                &fixtures.route,
+                &fixtures.fence,
+            )?,
+        };
+        let mut intake = AttemptReceipt::new(fixtures.binding.attempt_id.as_str())
+            .map_err(|error| format!("intake: {error}"))?;
+        let outcome = run_gate(
+            &fixtures,
+            &GovernorCapabilityAdmission::new(),
+            &input,
+            &mut intake,
+            &execution,
+        )
+        .await;
+        match outcome {
+            Err(error) => assert!(
+                error.to_string().contains("capability"),
+                "denial must name the capability gap, got: {error}"
+            ),
+            Ok(_) => panic!("unevidenced invoke must fail closed"),
+        }
+        assert_eq!(succeeding_calls(&execution)?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_funnel_evidence_denies_before_execution() -> TestResult {
+        let fixtures = invoke_fixtures()?;
+        let scope = test_evidence_scope();
+        // Registry side stays fresh so the funnel staleness decides: an
+        // expired record defers instead of admitting.
+        let registry = test_registry_admitted(&scope)?;
+        let generation = fixtures.fence.resource_generation.value();
+        let mut stale = test_funnel_record(&fixtures.route, generation);
+        stale.observed_at_unix_ms = 100;
+        stale.expires_at_unix_ms = 200;
+        let input = gate_input(&fixtures, vec![stale], Some(scope));
+        let execution = SucceedingExecution {
+            calls: Mutex::new(0),
+            result: matched_success(
+                &fixtures.admission,
+                &fixtures.binding,
+                &fixtures.route,
+                &fixtures.fence,
+            )?,
+        };
+        let mut intake = AttemptReceipt::new(fixtures.binding.attempt_id.as_str())
+            .map_err(|error| format!("intake: {error}"))?;
+        let outcome = run_gate(&fixtures, &registry, &input, &mut intake, &execution).await;
+        match outcome {
+            Err(error) => assert!(
+                error.to_string().contains("production admission"),
+                "staleness must deny at the funnel join, got: {error}"
+            ),
+            Ok(_) => panic!("stale evidence must fail closed"),
+        }
+        assert_eq!(succeeding_calls(&execution)?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn policy_required_capability_without_evidence_denies() -> TestResult {
+        let fixtures = invoke_fixtures()?;
+        let scope = test_evidence_scope();
+        let registry = test_registry_admitted(&scope)?;
+        let generation = fixtures.fence.resource_generation.value();
+        let mut input = gate_input(
+            &fixtures,
+            vec![test_funnel_record(&fixtures.route, generation)],
+            Some(scope),
+        );
+        // The Human Dreamer-role preference requires a second capability no
+        // evidence covers: the R2 union admits nothing by default.
+        input
+            .policy
+            .roles
+            .iter_mut()
+            .find(|preference| preference.role == ModelRole::Dreamer)
+            .ok_or("dreamer role preference")?
+            .required_capabilities
+            .insert("telemetry".to_owned());
+        let execution = SucceedingExecution {
+            calls: Mutex::new(0),
+            result: matched_success(
+                &fixtures.admission,
+                &fixtures.binding,
+                &fixtures.route,
+                &fixtures.fence,
+            )?,
+        };
+        let mut intake = AttemptReceipt::new(fixtures.binding.attempt_id.as_str())
+            .map_err(|error| format!("intake: {error}"))?;
+        let outcome = run_gate(&fixtures, &registry, &input, &mut intake, &execution).await;
+        match outcome {
+            Err(error) => assert!(
+                error.to_string().contains("telemetry"),
+                "denial must name the uncovered required capability, got: {error}"
+            ),
+            Ok(_) => panic!("uncovered policy capability must fail closed"),
+        }
+        assert_eq!(succeeding_calls(&execution)?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn binding_generation_drift_denies_before_execution() -> TestResult {
+        // Admission and binding agree with each other at the genesis
+        // generation, but the admitted Kernel fence has since advanced: the
+        // R4 exact-generation match against the Kernel-owned fence decides.
+        let fence = drifted_fence()?;
+        let fixtures = invoke_fixtures_with(&fence)?;
+        let scope = test_evidence_scope();
+        let registry = test_registry_admitted(&scope)?;
+        let generation = fence.resource_generation.value();
+        let input = gate_input(
+            &fixtures,
+            vec![test_funnel_record(&fixtures.route, generation)],
+            Some(scope),
+        );
+        let execution = SucceedingExecution {
+            calls: Mutex::new(0),
+            result: matched_success(
+                &fixtures.admission,
+                &fixtures.binding,
+                &fixtures.route,
+                &fixtures.fence,
+            )?,
+        };
+        let mut intake = AttemptReceipt::new(fixtures.binding.attempt_id.as_str())
+            .map_err(|error| format!("intake: {error}"))?;
+        let outcome = run_gate(&fixtures, &registry, &input, &mut intake, &execution).await;
+        match outcome {
+            Err(error) => assert!(
+                error.to_string().contains("generation"),
+                "drift must deny on the generation join, got: {error}"
+            ),
+            Ok(_) => panic!("generation drift must fail closed"),
+        }
+        assert_eq!(succeeding_calls(&execution)?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn partial_critical_evidence_denies_before_execution() -> TestResult {
+        let fixtures = invoke_fixtures()?;
+        let scope = test_evidence_scope();
+        let registry = test_registry_admitted(&scope)?;
+        let generation = fixtures.fence.resource_generation.value();
+        let mut input = gate_input(
+            &fixtures,
+            vec![test_funnel_record(&fixtures.route, generation)],
+            Some(scope),
+        );
+        // Threading a static attestation asserts criticality; without the
+        // matching fresh pulse the critical join must fail closed.
+        input.static_attestation = Some(StaticCapabilityAttestation {
+            capability: "rust".to_owned(),
+            route: fixtures.route.clone(),
+            invalidated: false,
+        });
+        let execution = SucceedingExecution {
+            calls: Mutex::new(0),
+            result: matched_success(
+                &fixtures.admission,
+                &fixtures.binding,
+                &fixtures.route,
+                &fixtures.fence,
+            )?,
+        };
+        let mut intake = AttemptReceipt::new(fixtures.binding.attempt_id.as_str())
+            .map_err(|error| format!("intake: {error}"))?;
+        let outcome = run_gate(&fixtures, &registry, &input, &mut intake, &execution).await;
+        match outcome {
+            Err(error) => assert!(
+                error.to_string().contains("rust"),
+                "partial critical evidence must deny for the capability, got: {error}"
+            ),
+            Ok(_) => panic!("partial critical evidence must fail closed"),
+        }
+        assert_eq!(succeeding_calls(&execution)?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn diverged_execution_records_call_scoped_intake() -> TestResult {
+        let fixtures = invoke_fixtures()?;
+        let scope = test_evidence_scope();
+        let registry = test_registry_admitted(&scope)?;
+        let generation = fixtures.fence.resource_generation.value();
+        let input = gate_input(
+            &fixtures,
+            vec![test_funnel_record(&fixtures.route, generation)],
+            Some(scope),
+        );
+        let mut observed = fixtures.route.clone();
+        observed.model = "model-diverged".to_owned();
+        let result = invoke_result(
+            &fixtures.admission,
+            &fixtures.binding,
+            &fixtures.route,
+            &fixtures.fence,
+            ResultDisposition::CandidateSucceeded,
+            |observation| {
+                observation.observed_route = Some(observed.clone());
+                observation.route_state = RouteObservationState::Diverged;
+                observation.diverged_fields =
+                    route_divergence_fields(&observation.requested_route, &observed);
+                observation.recovery_ref = Some("recovery-diverged-1".to_owned());
+                Ok(())
+            },
+        )?;
+        let execution = SucceedingExecution {
+            calls: Mutex::new(0),
+            result,
+        };
+        let mut intake = AttemptReceipt::new(fixtures.binding.attempt_id.as_str())
+            .map_err(|error| format!("intake: {error}"))?;
+        let outcome = run_gate(&fixtures, &registry, &input, &mut intake, &execution).await?;
+        assert_eq!(outcome.attempt_id, fixtures.binding.attempt_id);
+        assert_eq!(succeeding_calls(&execution)?, 1);
+        assert_eq!(
+            intake.capability_outcomes.len(),
+            1,
+            "diverged execution records exactly one outcome per required capability"
+        );
+        let recorded = &intake.capability_outcomes[0];
+        assert_eq!(recorded.capability, "rust");
+        assert_eq!(recorded.degradation_scope, DegradationScope::Call);
+        assert_eq!(
+            recorded.scope_owner,
+            fixtures.binding.attempt_id.as_str(),
+            "call-scoped outcomes stay on the attempt receipt"
+        );
+        assert_ne!(
+            recorded.requested_mode, recorded.effective_mode,
+            "divergence must separate the admitted and observed route keys"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn degraded_execution_records_call_scoped_intake() -> TestResult {
+        let fixtures = invoke_fixtures()?;
+        let scope = test_evidence_scope();
+        let registry = test_registry_admitted(&scope)?;
+        let generation = fixtures.fence.resource_generation.value();
+        let input = gate_input(
+            &fixtures,
+            vec![test_funnel_record(&fixtures.route, generation)],
+            Some(scope),
+        );
+        let result = invoke_result(
+            &fixtures.admission,
+            &fixtures.binding,
+            &fixtures.route,
+            &fixtures.fence,
+            ResultDisposition::DegradedNoProof,
+            |_| Ok(()),
+        )?;
+        let execution = SucceedingExecution {
+            calls: Mutex::new(0),
+            result,
+        };
+        let mut intake = AttemptReceipt::new(fixtures.binding.attempt_id.as_str())
+            .map_err(|error| format!("intake: {error}"))?;
+        run_gate(&fixtures, &registry, &input, &mut intake, &execution).await?;
+        assert_eq!(intake.capability_outcomes.len(), 1);
+        let recorded = &intake.capability_outcomes[0];
+        assert_eq!(recorded.degradation_scope, DegradationScope::Call);
+        assert_eq!(
+            recorded.requested_mode, recorded.effective_mode,
+            "degraded execution on the admitted route keys both modes alike"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unobserved_unknown_result_records_no_positive_claim() -> TestResult {
+        let fixtures = invoke_fixtures()?;
+        let scope = test_evidence_scope();
+        let registry = test_registry_admitted(&scope)?;
+        let generation = fixtures.fence.resource_generation.value();
+        let input = gate_input(
+            &fixtures,
+            vec![test_funnel_record(&fixtures.route, generation)],
+            Some(scope),
+        );
+        let result = invoke_result(
+            &fixtures.admission,
+            &fixtures.binding,
+            &fixtures.route,
+            &fixtures.fence,
+            ResultDisposition::UnknownOutcome,
+            |observation| {
+                observation.observed_route = None;
+                observation.route_state = RouteObservationState::Unobserved;
+                observation.diverged_fields = Vec::new();
+                observation.unobserved_reason =
+                    Some("provider did not expose route evidence".to_owned());
+                observation.execution_outcome = ExecutionOutcome::UnknownOutcome;
+                observation.terminal = ClockReading::default();
+                observation.recovery_ref = Some("recovery-unknown-1".to_owned());
+                Ok(())
+            },
+        )?;
+        let execution = SucceedingExecution {
+            calls: Mutex::new(0),
+            result,
+        };
+        let mut intake = AttemptReceipt::new(fixtures.binding.attempt_id.as_str())
+            .map_err(|error| format!("intake: {error}"))?;
+        let outcome = run_gate(&fixtures, &registry, &input, &mut intake, &execution).await?;
+        assert_eq!(outcome.disposition, ResultDisposition::UnknownOutcome);
+        assert!(
+            intake.capability_outcomes.is_empty(),
+            "unobserved unknown execution records no positive claim"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn intake_proof_ceiling_matches_owner_vocabulary() -> TestResult {
+        let value = serde_json::to_value(ProofCeiling::CandidateArtifact)
+            .map_err(|error| format!("ceiling wire: {error}"))?;
+        assert_eq!(
+            value.as_str(),
+            Some(INTAKE_PROOF_CEILING),
+            "the intake marker must spell the owner ceiling exactly"
         );
         Ok(())
     }
