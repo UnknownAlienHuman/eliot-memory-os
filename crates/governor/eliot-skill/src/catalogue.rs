@@ -735,6 +735,10 @@ pub struct HotsetDeliveryReceipt {
     pub catalogue_digest: String,
     pub delivered_skill_ids: Vec<String>,
     pub body_digests: BTreeMap<String, String>,
+    /// Exact approval handle authorizing this Hotset injection (promotion
+    /// approval or canonical commit receipt, bound by the injector). A
+    /// non-blank Hotset identity alone never authorizes issuance.
+    pub approval_ref: String,
     pub receipt_digest: String,
 }
 
@@ -746,6 +750,7 @@ impl HotsetDeliveryReceipt {
                 &self.catalogue_digest,
                 &self.delivered_skill_ids,
                 &self.body_digests,
+                &self.approval_ref,
             ),
             "delivery.receipt",
         )
@@ -756,8 +761,10 @@ impl HotsetDeliveryReceipt {
         catalogue: &SkillCatalogue,
         delivered_skill_ids: Vec<String>,
         tools: &impl KnownTools,
+        approval_ref: String,
     ) -> Result<Self, SkillError> {
         check_text(&hotset_id, "delivery.hotset_id")?;
+        check_text(&approval_ref, "delivery.approval_ref")?;
         if delivered_skill_ids.is_empty() {
             return Err(SkillError::InvalidField {
                 field: "delivery.delivered_skill_ids",
@@ -792,6 +799,7 @@ impl HotsetDeliveryReceipt {
             catalogue_digest,
             delivered_skill_ids: ordered_ids,
             body_digests,
+            approval_ref,
             receipt_digest: String::new(),
         };
         receipt.receipt_digest = receipt.identity_digest()?;
@@ -802,6 +810,7 @@ impl HotsetDeliveryReceipt {
     pub fn validate(&self) -> Result<(), SkillError> {
         check_text(&self.hotset_id, "delivery.hotset_id")?;
         check_digest(&self.catalogue_digest, "delivery.catalogue_digest")?;
+        check_text(&self.approval_ref, "delivery.approval_ref")?;
         if self.delivered_skill_ids.is_empty()
             || self.delivered_skill_ids.len() > MAX_DELIVERY_ENTRIES
         {
@@ -1069,6 +1078,7 @@ mod tests {
             &catalogue,
             vec!["skill-alpha".to_owned()],
             &tools(),
+            "approval-commit-1".to_owned(),
         )
         .expect("delivery receipt");
         let ack = applied_ack(&receipt);
@@ -1146,6 +1156,7 @@ mod tests {
             &catalogue,
             vec!["skill-alpha".to_owned()],
             &tools(),
+            "approval-commit-1".to_owned(),
         );
         assert!(matches!(
             receipt,
@@ -1157,6 +1168,7 @@ mod tests {
             &catalogue,
             vec!["skill-alpha".to_owned()],
             &tools(),
+            "approval-commit-1".to_owned(),
         );
         assert!(fresh.is_err());
     }
@@ -1209,6 +1221,7 @@ mod tests {
             &catalogue,
             vec!["skill-alpha".to_owned()],
             &tools(),
+            "approval-commit-1".to_owned(),
         )
         .expect("old receipt");
         catalogue
@@ -1227,6 +1240,7 @@ mod tests {
             &catalogue,
             vec!["skill-alpha".to_owned()],
             &tools(),
+            "approval-commit-1".to_owned(),
         )
         .expect("fresh receipt");
         let display = catalogue
@@ -1243,6 +1257,7 @@ mod tests {
             &catalogue,
             vec!["skill-beta".to_owned(), "skill-alpha".to_owned()],
             &tools(),
+            "approval-commit-1".to_owned(),
         )
         .expect("unordered delivery");
         assert_eq!(
@@ -1254,6 +1269,7 @@ mod tests {
             &catalogue,
             vec!["skill-alpha".to_owned(), "skill-beta".to_owned()],
             &tools(),
+            "approval-commit-1".to_owned(),
         )
         .expect("ordered delivery");
         assert_eq!(first.receipt_digest, second.receipt_digest);
@@ -1277,6 +1293,7 @@ mod tests {
             &catalogue,
             vec!["skill-alpha".to_owned()],
             &tools(),
+            "approval-commit-1".to_owned(),
         )
         .expect("delivery receipt");
         assert!(matches!(
@@ -1299,6 +1316,7 @@ mod tests {
             &catalogue,
             vec!["skill-alpha".to_owned()],
             &tools(),
+            "approval-commit-1".to_owned(),
         )
         .expect("delivery receipt");
         let missing_ack = HotsetDeliveryAck {
@@ -1367,6 +1385,22 @@ mod tests {
     }
 
     #[test]
+    fn issuance_without_approval_handle_fails_closed() {
+        let catalogue = catalogue_two();
+        let denied = HotsetDeliveryReceipt::issue(
+            "hotset-no-approval".to_owned(),
+            &catalogue,
+            vec!["skill-alpha".to_owned()],
+            &tools(),
+            "   ".to_owned(),
+        );
+        assert!(matches!(
+            denied,
+            Err(SkillError::InvalidField { field, .. }) if field == "delivery.approval_ref"
+        ));
+    }
+
+    #[test]
     fn hotset_receipt_distinguishes_installed_from_delivered() {
         let mut catalogue = catalogue_two();
         promote_current(&mut catalogue, "skill-alpha");
@@ -1376,6 +1410,7 @@ mod tests {
             &catalogue,
             vec!["skill-alpha".to_owned()],
             &tools(),
+            "approval-commit-1".to_owned(),
         )
         .expect("delivery receipt");
         receipt.validate().expect("receipt validates");
