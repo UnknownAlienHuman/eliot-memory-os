@@ -79,15 +79,15 @@ use controlboard_adapters::SharedOperatorReplay;
 #[cfg(test)]
 use activation_projection::map_activation_snapshot;
 
-pub use capability_outcome::{
-    AttemptReceipt, CapabilityOutcome, CapabilityRegistryView, DegradationScope,
-    FallbackOutcomeRequest, OutcomeDisposition, OutcomeError, fallback_outcome,
-};
 pub use capability_admission::{
     AdmissionDisposition, AdmissionOutcome, CapabilityEvidenceRecord, CapabilityEvidenceStatus,
     DynamicCapabilityPulse, ProductionAdmissionRequest, ProductionEvidenceBundle,
     RouteAdmissionDecision, StaticCapabilityAttestation, admit_production_route,
     evaluate_production_admission,
+};
+pub use capability_outcome::{
+    AttemptReceipt, CapabilityOutcome, CapabilityRegistryView, DegradationScope,
+    FallbackOutcomeRequest, OutcomeDisposition, OutcomeError, fallback_outcome,
 };
 pub use daemon_config::DaemonConfig;
 pub(crate) use daemon_kernel_client::kernel_port_error;
