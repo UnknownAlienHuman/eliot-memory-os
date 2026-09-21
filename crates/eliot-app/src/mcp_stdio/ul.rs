@@ -167,7 +167,7 @@ impl UlRuntime {
         }
         let changed_paths = observed_cues
             .iter()
-            .filter(|cue| cue.kind == eliot_types::CueKind::FilePath)
+            .filter(|cue| cue.kind == eliot_types::ul::cue::LegacyCueKindV1::FilePath)
             .map(|cue| cue.value.clone())
             .collect::<Vec<_>>();
         let event_ref = format!("tool:{tool_name}:{session_id}");

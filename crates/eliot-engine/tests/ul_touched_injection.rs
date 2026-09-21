@@ -1,5 +1,5 @@
 use eliot_engine::TouchedSetRegistry;
-use eliot_types::{CueKind, ProjectId, SessionId};
+use eliot_types::{ProjectId, SessionId, ul::cue::LegacyCueKindV1};
 use serde_json::json;
 
 #[test]
@@ -26,22 +26,22 @@ fn t04_touched_set_extracts_expected_cues() {
     assert!(
         observed
             .iter()
-            .any(|cue| { cue.kind == CueKind::FilePath && cue.value == "src/net/session.rs" })
+            .any(|cue| { cue.kind == LegacyCueKindV1::FilePath && cue.value == "src/net/session.rs" })
     );
     assert!(
         observed
             .iter()
-            .any(|cue| { cue.kind == CueKind::Symbol && cue.value == "net::session::connect" })
+            .any(|cue| { cue.kind == LegacyCueKindV1::Symbol && cue.value == "net::session::connect" })
     );
     assert!(
         observed
             .iter()
-            .any(|cue| { cue.kind == CueKind::CommandPattern && cue.value == "cargo test" })
+            .any(|cue| { cue.kind == LegacyCueKindV1::CommandPattern && cue.value == "cargo test" })
     );
     assert!(
         observed
             .iter()
-            .any(|cue| { cue.kind == CueKind::ErrorSignature && cue.value.starts_with("sig:") })
+            .any(|cue| { cue.kind == LegacyCueKindV1::ErrorSignature && cue.value.starts_with("sig:") })
     );
 
     for index in 0..140 {
