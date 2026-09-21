@@ -10,6 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::{Signature, VerifyingKey};
 use eliot_cli::kernel_client::{KernelClient, KernelClientError};
+use eliot_config::quiet_hours::NotificationQuietHoursProjection;
 use eliot_contracts::{
     ClockReading, EpochId, EpochLineageId, ProductId, RequestId, RequestMetadata,
     ResourceGeneration, SessionId, SourceId, StateFence,
@@ -136,19 +137,22 @@ impl NotificationComposition {
     }
 
     /// Composes the production one-shot process from the protected Kernel
-    /// application front door. Every verification and replay port is backed
-    /// by an authenticated typed operation; absence of the protected client
-    /// declaration fails before a notification request is read.
-    pub fn from_kernel(work_root: impl Into<PathBuf>) -> Result<Self, NotifyBuildError> {
-        Self::from_kernel_with_quiet_hours(work_root, None)
-    }
-
-    /// Composes the protected Kernel route with explicit quiet-hours policy.
+    /// application front door and the request's authenticated canonical
+    /// quiet-hours projection. The normal notification request is not a
+    /// configuration source: it only supplies the parent identity, context
+    /// and fence used for the separate `READ` projection route. `None` reaches
+    /// the existing surface policy only after an explicit `enabled: false`
+    /// projection.
     pub fn from_kernel_with_quiet_hours(
         work_root: impl Into<PathBuf>,
-        quiet_hours: Option<quiet_hours::QuietHoursConfiguration>,
+        parent: &NotificationRequest,
     ) -> Result<Self, NotifyBuildError> {
-        let ports = load_kernel_verification_ports()?;
+        let mut client =
+            KernelClient::load().map_err(|error| NotifyBuildError::Kernel(error.to_string()))?;
+        let issuer: operation_identity::IssuerHandle =
+            Arc::new(Mutex::new(operation_identity::NotifyIdentityIssuer::new()));
+        let quiet_hours = read_authenticated_quiet_hours(&mut client, &issuer, parent)?;
+        let ports = verification_ports_from_exchange_with_issuer(client, issuer);
         Self::new_with_quiet_hours(work_root, ports, quiet_hours)
     }
 
@@ -315,6 +319,11 @@ pub const KERNEL_NOTIFICATION_STATE_OPERATIONS: &[&str] = &[
     eliot_notify_core::NOTIFICATION_STATE_READ_OPERATION,
 ];
 
+/// Exact authenticated configuration read consumed by the normal production
+/// caller. Kernel/Host owns registration and the canonical snapshot route.
+pub const KERNEL_CONFIGURATION_OPERATIONS: &[&str] =
+    &[operation_identity::QUIET_HOURS_PROJECTION_SELECTOR];
+
 trait NotifyKernelExchange: Send {
     fn transact_with_identity(
         &mut self,
@@ -349,6 +358,117 @@ fn now_unix_ms() -> Result<u64, KernelClientError> {
     u64::try_from(now).map_err(|_| {
         KernelClientError::Configuration("host clock exceeds request deadline range".to_owned())
     })
+}
+
+const QUIET_HOURS_SCOPE: &str = "notification";
+
+fn read_authenticated_quiet_hours<E>(
+    exchange: &mut E,
+    issuer: &operation_identity::IssuerHandle,
+    parent: &NotificationRequest,
+) -> Result<Option<quiet_hours::QuietHoursConfiguration>, NotifyBuildError>
+where
+    E: NotifyKernelExchange,
+{
+    let payload = json!({
+        "operation": operation_identity::QUIET_HOURS_PROJECTION_OPERATION,
+        "context": &parent.context,
+        "state_fence": &parent.context.state_fence,
+        "scope": QUIET_HOURS_SCOPE,
+    });
+    let now = now_unix_ms().map_err(|error| {
+        NotifyBuildError::Kernel(format!(
+            "authenticated quiet-hours read clock rejected: {error}"
+        ))
+    })?;
+    let issued = issuer
+        .lock()
+        .map_err(|_| {
+            NotifyBuildError::Kernel(
+                "authenticated quiet-hours read identity mutex is poisoned".to_owned(),
+            )
+        })?
+        .issue_quiet_hours_projection_read(parent, &payload, now)
+        .map_err(|error| {
+            NotifyBuildError::Kernel(format!(
+                "authenticated quiet-hours read identity rejected: {error}"
+            ))
+        })?;
+    let result = exchange.transact_with_identity(
+        &issued.identity,
+        operation_identity::QUIET_HOURS_PROJECTION_SELECTOR,
+        payload,
+    );
+    let projection = match decode_kernel_outcome::<NotificationQuietHoursProjection>(result) {
+        PortOutcome::Known(value) => value,
+        PortOutcome::Partial { .. } => {
+            return Err(NotifyBuildError::Kernel(
+                "authenticated quiet-hours projection was partial".to_owned(),
+            ));
+        }
+        PortOutcome::Unknown(_) => {
+            return Err(NotifyBuildError::Kernel(
+                "authenticated quiet-hours projection was unknown".to_owned(),
+            ));
+        }
+        PortOutcome::Error(_) => {
+            return Err(NotifyBuildError::Kernel(
+                "authenticated quiet-hours projection was rejected".to_owned(),
+            ));
+        }
+    };
+    quiet_hours_from_projection(projection, parent)
+}
+
+fn quiet_hours_from_projection(
+    projection: NotificationQuietHoursProjection,
+    parent: &NotificationRequest,
+) -> Result<Option<quiet_hours::QuietHoursConfiguration>, NotifyBuildError> {
+    let reject = |detail: &str| {
+        NotifyBuildError::Kernel(format!(
+            "authenticated quiet-hours projection rejected: {detail}"
+        ))
+    };
+    if projection.snapshot_id.trim().is_empty()
+        || projection.snapshot_id.chars().any(char::is_control)
+    {
+        return Err(reject(
+            "snapshot_id is blank or contains control characters",
+        ));
+    }
+    projection
+        .state_fence
+        .validate()
+        .map_err(|error| reject(&format!("state fence invalid: {error}")))?;
+    let Some(parent_revision) = parent.context.state_fence.policy_revision else {
+        return Err(reject("parent request has no policy revision"));
+    };
+    if projection.state_fence != parent.context.state_fence {
+        return Err(reject(
+            "projection state fence does not match parent request",
+        ));
+    }
+    if projection.policy_revision != parent_revision {
+        return Err(reject(
+            "projection policy revision does not match parent request",
+        ));
+    }
+    if projection.state_fence.policy_revision != Some(projection.policy_revision) {
+        return Err(reject("projection fence does not bind its policy revision"));
+    }
+    if !projection.enabled {
+        if projection.start_hour_utc != 0 || projection.end_hour_utc != 0 {
+            return Err(reject("disabled projection carries a nonzero window"));
+        }
+        return Ok(None);
+    }
+    quiet_hours::QuietHoursConfiguration::new(
+        projection.start_hour_utc,
+        projection.end_hour_utc,
+        projection.policy_revision,
+    )
+    .map(Some)
+    .ok_or_else(|| reject("enabled projection carries an invalid UTC window"))
 }
 
 fn identity_conflict_outcome<T>(detail: &str) -> PortOutcome<T> {
@@ -413,6 +533,9 @@ where
                 }
                 operation_identity::NotifyOperation::NotificationStateRead => {
                     issuer.issue_notification_state_read(parent, &payload, now)
+                }
+                operation_identity::NotifyOperation::QuietHoursProjectionRead => {
+                    issuer.issue_quiet_hours_projection_read(parent, &payload, now)
                 }
             },
             Err(_) => {
@@ -770,9 +893,19 @@ fn verification_ports_from_exchange<E>(exchange: E) -> VerificationPorts
 where
     E: NotifyKernelExchange + 'static,
 {
-    let exchange = Arc::new(Mutex::new(exchange));
     let issuer: operation_identity::IssuerHandle =
         Arc::new(Mutex::new(operation_identity::NotifyIdentityIssuer::new()));
+    verification_ports_from_exchange_with_issuer(exchange, issuer)
+}
+
+fn verification_ports_from_exchange_with_issuer<E>(
+    exchange: E,
+    issuer: operation_identity::IssuerHandle,
+) -> VerificationPorts
+where
+    E: NotifyKernelExchange + 'static,
+{
+    let exchange = Arc::new(Mutex::new(exchange));
     VerificationPorts {
         a08: Some(Box::new(KernelA08 {
             port: KernelPort {
@@ -1818,8 +1951,8 @@ mod tests {
 
     use ed25519_dalek::{Signer, SigningKey};
     use eliot_contracts::{
-        ClockReading, EpochId, EpochLineageId, ProductId, RequestId, RequestMetadata,
-        ResourceGeneration, SessionId, SourceId, StateFence,
+        ClockReading, EpochId, EpochLineageId, PolicyRevision, ProductId, RequestId,
+        RequestMetadata, ResourceGeneration, SessionId, SourceId, StateFence,
     };
     use eliot_notify_core::{
         DeliveryObservation, LedgerCommitOutcome, LedgerIntent, LedgerReservation,
@@ -1901,6 +2034,26 @@ mod tests {
         }
     }
 
+    fn policy_request(id: &str) -> NotificationRequest {
+        let mut request = request(id);
+        request.context.state_fence.policy_revision = Some(PolicyRevision::genesis());
+        request
+    }
+
+    fn quiet_hours_projection(
+        parent: &NotificationRequest,
+        enabled: bool,
+    ) -> NotificationQuietHoursProjection {
+        NotificationQuietHoursProjection {
+            enabled,
+            start_hour_utc: if enabled { 22 } else { 0 },
+            end_hour_utc: if enabled { 6 } else { 0 },
+            policy_revision: PolicyRevision::genesis(),
+            state_fence: parent.context.state_fence.clone(),
+            snapshot_id: "quiet-hours-snapshot-1".to_owned(),
+        }
+    }
+
     fn intent() -> LedgerIntent {
         LedgerIntent {
             one_shot_key: serde_json::from_value::<OneShotKey>(serde_json::json!("one-shot-1"))
@@ -1929,6 +2082,88 @@ mod tests {
         assert_eq!(
             KERNEL_VERIFICATION_OPERATIONS.last(),
             Some(&eliot_notify_core::NOTIFICATION_STATE_SELECTOR)
+        );
+    }
+
+    #[test]
+    fn authenticated_quiet_hours_read_maps_explicit_disabled_to_none() {
+        let parent = policy_request("request-quiet-hours-disabled");
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut exchange = RecordingExchange {
+            calls: Arc::clone(&calls),
+            response: serde_json::json!({
+                "kind": "KNOWN",
+                "value": quiet_hours_projection(&parent, false),
+            }),
+        };
+        let issuer: operation_identity::IssuerHandle =
+            Arc::new(Mutex::new(operation_identity::NotifyIdentityIssuer::new()));
+        let result = read_authenticated_quiet_hours(&mut exchange, &issuer, &parent);
+
+        assert!(matches!(result, Ok(None)));
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].0,
+            operation_identity::QUIET_HOURS_PROJECTION_SELECTOR
+        );
+        assert_eq!(
+            calls[0].2["operation"],
+            operation_identity::QUIET_HOURS_PROJECTION_OPERATION
+        );
+        assert_eq!(calls[0].2["scope"], QUIET_HOURS_SCOPE);
+        assert!(
+            calls[0]
+                .1
+                .idempotency_key
+                .contains("quiet-hours-projection-read")
+        );
+    }
+
+    #[test]
+    fn authenticated_quiet_hours_read_maps_enabled_window() {
+        let parent = policy_request("request-quiet-hours-enabled");
+        let mut exchange = RecordingExchange {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            response: serde_json::json!({
+                "kind": "KNOWN",
+                "value": quiet_hours_projection(&parent, true),
+            }),
+        };
+        let issuer: operation_identity::IssuerHandle =
+            Arc::new(Mutex::new(operation_identity::NotifyIdentityIssuer::new()));
+        let result = read_authenticated_quiet_hours(&mut exchange, &issuer, &parent)
+            .expect("enabled projection is accepted");
+
+        assert_eq!(
+            result,
+            Some(
+                quiet_hours::QuietHoursConfiguration::new(22, 6, PolicyRevision::genesis(),)
+                    .expect("valid quiet-hours window")
+            )
+        );
+    }
+
+    #[test]
+    fn authenticated_quiet_hours_read_rejects_foreign_fence() {
+        let parent = policy_request("request-quiet-hours-foreign");
+        let mut projection = quiet_hours_projection(&parent, true);
+        projection.state_fence = StateFence::new(test_epoch(2), ResourceGeneration::genesis());
+        projection.state_fence.policy_revision = Some(PolicyRevision::genesis());
+        let mut exchange = RecordingExchange {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            response: serde_json::json!({
+                "kind": "KNOWN",
+                "value": projection,
+            }),
+        };
+        let issuer: operation_identity::IssuerHandle =
+            Arc::new(Mutex::new(operation_identity::NotifyIdentityIssuer::new()));
+
+        let result = read_authenticated_quiet_hours(&mut exchange, &issuer, &parent);
+
+        assert!(
+            matches!(result, Err(NotifyBuildError::Kernel(detail)) if detail.contains("state fence"))
         );
     }
 

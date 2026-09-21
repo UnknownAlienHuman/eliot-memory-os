@@ -2313,6 +2313,7 @@ version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
  "eliot-cli",
+ "eliot-config",
  "eliot-contracts",
  "eliot-notify-core",
  "eliot-platform",
