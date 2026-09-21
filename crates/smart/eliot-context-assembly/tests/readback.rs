@@ -3,8 +3,8 @@
 //! Issue 1948 acceptance: governed source readback before citation.
 
 use eliot_context_assembly::{
-    IndexPreview, PreviewAuthority, ReadbackRefusalKind, ReadbackRequest, ReopenedSource,
-    gate_citation,
+    IndexPreview, PreviewAuthority, ProjectedCitation, ReadbackRefusalKind, ReadbackRequest,
+    ReopenedSource, gate_citation, project_citation,
 };
 use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence, sha256_hex};
 
@@ -139,6 +139,73 @@ fn matching_revision_with_valid_anchor_exposes_exact_handles() {
     let served = reopened(admitted_bytes);
     let citation = gate_citation(&req, &served).expect("valid readback cites");
     citation.validate().expect("citation validates");
+    assert_eq!(citation.source_revision, req.admitted);
+    assert_eq!(citation.anchor, req.anchor);
+    assert_eq!(citation.view, req.view);
+    assert_eq!(citation.workspace_revision, req.workspace_revision);
+    assert_eq!(citation.excerpt_bytes, admitted_bytes[0..8].to_vec());
+    assert_eq!(citation.excerpt_digest, req.anchor.excerpt_sha256);
+}
+
+// WORK_UNIT_CASE: 1948/3
+#[test]
+fn caller_never_projects_when_preview_diverges_from_admitted_revision() {
+    let admitted_bytes = b"admitted revision bytes v1";
+    let current_bytes = b"convenient current bytes v2";
+    assert_ne!(sha256_hex(admitted_bytes), sha256_hex(current_bytes));
+    let req = request(admitted_bytes, current_bytes, 0, 8);
+    assert!(!req.preview.is_citable());
+    // Governed owner serves the convenient current bytes instead of the
+    // admitted revision: the caller must refuse without projecting.
+    let served = ReopenedSource {
+        revision: admitted(current_bytes),
+        view: view(),
+        workspace_revision: workspace_revision(),
+        fence: fence(),
+        bytes: current_bytes.to_vec(),
+    };
+    let projected = std::cell::Cell::new(false);
+    let result = project_citation(&req, &served, |_| {
+        projected.set(true);
+    });
+    match result {
+        Ok(citation) => panic!("preview bytes must never be cited, got {citation:?}"),
+        Err(refusal) => {
+            refusal.validate().expect("typed refusal");
+            assert!(
+                matches!(
+                    refusal.kind,
+                    ReadbackRefusalKind::Unsupported
+                        | ReadbackRefusalKind::Replan
+                        | ReadbackRefusalKind::Gap
+                ),
+                "typed unsupported/replan/gap, got {:?}",
+                refusal.kind
+            );
+            let rendered = format!("{refusal:?}");
+            assert!(
+                !rendered.contains("convenient current bytes"),
+                "refusal must not emit current bytes, got {rendered}"
+            );
+        }
+    }
+    assert!(!projected.get(), "projection must not run on refusal");
+}
+
+// WORK_UNIT_CASE: 1948/4
+#[test]
+fn caller_projects_exact_handles_on_valid_readback() {
+    let admitted_bytes = b"admitted revision bytes v1";
+    let req = request(admitted_bytes, b"stale preview", 0, 8);
+    let served = reopened(admitted_bytes);
+    let seen = std::cell::RefCell::<Option<ProjectedCitation>>::new(None);
+    let citation = project_citation(&req, &served, |cited| {
+        seen.replace(Some(cited.clone()));
+    })
+    .expect("valid readback cites");
+    citation.validate().expect("citation validates");
+    let seen = seen.borrow().clone().expect("projection ran once");
+    assert_eq!(seen, citation);
     assert_eq!(citation.source_revision, req.admitted);
     assert_eq!(citation.anchor, req.anchor);
     assert_eq!(citation.view, req.view);

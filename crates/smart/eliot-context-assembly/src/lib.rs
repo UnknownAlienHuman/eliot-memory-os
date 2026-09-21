@@ -8,6 +8,7 @@
 
 mod assemble;
 mod bounds;
+mod cite;
 mod error;
 mod measurement;
 mod readback;
@@ -16,6 +17,7 @@ mod render;
 pub use assemble::{
     ASSEMBLY_ORDERING_REVISION, ActiveUnderstandingViewResult, AssemblyPolicy, assemble_active_view,
 };
+pub use cite::project_citation;
 pub use error::AssemblyError;
 pub use readback::{ReopenedSource, gate_citation};
 
