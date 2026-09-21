@@ -134,12 +134,12 @@ impl P03ProcessPort for WasmP03ProcessAdapter {
 
     fn start(&mut self, request: ProcessRequest) -> Result<ProcessStartReceipt, PortError> {
         let sink = Arc::clone(&self.sink);
-        drive_blocking(self.executor.start(request, sink)).map_err(map_start_error)
+        drive_blocking(self.executor.start(request, sink)).map_err(|error| map_start_error(&error))
     }
 
     fn cancel(&mut self, binding: &ProcessBinding) -> Result<CancellationReceipt, PortError> {
         drive_blocking(self.executor.cancel(binding.operation_id().clone()))
-            .map_err(map_observe_error)
+            .map_err(|error| map_observe_error(&error))
     }
 
     fn reconcile(&mut self, binding: &ProcessBinding) -> Result<ProcessEvidence, PortError> {
@@ -154,7 +154,7 @@ impl P03ProcessPort for WasmP03ProcessAdapter {
         // retry with nothing fenced. An already-unknown op passes through, so
         // the executor's quarantine-reconcile path still runs unchanged.
         let view = drive_blocking(self.executor.inspect(operation_id.clone()))
-            .map_err(map_observe_error)?;
+            .map_err(|error| map_observe_error(&error))?;
         if matches!(
             view.lifecycle(),
             ProcessLifecycle::Created
@@ -164,7 +164,8 @@ impl P03ProcessPort for WasmP03ProcessAdapter {
         ) {
             return Err(PortError::UnknownOutcome);
         }
-        drive_blocking(self.executor.reconcile(operation_id)).map_err(map_observe_error)
+        drive_blocking(self.executor.reconcile(operation_id))
+            .map_err(|error| map_observe_error(&error))
     }
 }
 
@@ -264,7 +265,7 @@ fn same_lease_authority(binding: &ProcessBinding, envelope: &ProcessLaunchEnvelo
 /// authority; unavailability means the physical executor is absent; every
 /// other outcome (including a sink rejection) leaves the outcome unknown
 /// rather than manufacturing a denial or an acceptance.
-fn map_start_error(error: ProcessExecutionError) -> PortError {
+fn map_start_error(error: &ProcessExecutionError) -> PortError {
     match error {
         ProcessExecutionError::Contract(_) => PortError::Denied,
         ProcessExecutionError::Unavailable(_) => PortError::Unavailable,
@@ -278,7 +279,7 @@ fn map_start_error(error: ProcessExecutionError) -> PortError {
 ///
 /// Observation failures leave the outcome unknown; only a missing physical
 /// executor surfaces as unavailable.
-fn map_observe_error(error: ProcessExecutionError) -> PortError {
+fn map_observe_error(error: &ProcessExecutionError) -> PortError {
     match error {
         ProcessExecutionError::Unavailable(_) => PortError::Unavailable,
         _ => PortError::UnknownOutcome,
