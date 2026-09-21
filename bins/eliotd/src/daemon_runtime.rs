@@ -253,6 +253,30 @@ pub(super) fn run() -> Result<(), String> {
     if let Some(facts) = kernel.owner_session_facts() {
         composition.note_owner_session_binding(facts);
     }
+    // #1780: attach canonical notification records where the concrete
+    // client and the composition meet (same site as the owner-session
+    // facts above). A cold/unbound read degrades to the empty inbox with
+    // an error record exactly like the skill-tool-source path below: it
+    // emits diagnostics and the daemon continues, never failing readiness
+    // for an unreadable inbox.
+    match eliotd::notification_board_attach::attach_notification_snapshot(&kernel, &mut composition)
+    {
+        eliotd::notification_board_attach::NotificationBoardAttach::Ready(records) => {
+            tracing::info!(
+                target: "eliotd::diagnostics",
+                event = "eliotd.notification_snapshot_attached",
+                record_count = records.len(),
+            );
+        }
+        eliotd::notification_board_attach::NotificationBoardAttach::Unavailable { reason } => {
+            let _ = eliotd::diagnostics::ErrorRecord::of(
+                eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                "notification-snapshot",
+                &reason,
+            )
+            .emit();
+        }
+    }
     // T12-06: gated Dreamer intake registration at the same attach site. The
     // readiness-gated accessor plus the fence-bound route-context check prove
     // the intake wiring before readiness is reported; no thread, no transport,
