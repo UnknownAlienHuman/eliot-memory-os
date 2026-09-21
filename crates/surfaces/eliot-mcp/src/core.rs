@@ -352,10 +352,7 @@ pub fn plan_evidence_pack_query(
         ));
     }
     let bound: u32 = max_records.trim().parse().map_err(|_| {
-        BridgeError::invalid(
-            "query.max_records",
-            "must be a positive decimal bound",
-        )
+        BridgeError::invalid("query.max_records", "must be a positive decimal bound")
     })?;
     if bound == 0 {
         return Err(BridgeError::invalid(
@@ -1782,10 +1779,7 @@ mod evidence_pack_query_plan_tests {
         assert_eq!(plan.subject, "evidence-alpha");
         assert_eq!(plan.max_records, "10");
         assert_eq!(plan.scope_id, "scope-evidence");
-        assert_eq!(
-            EvidencePackQueryPlan::operation_name(),
-            "GetEvidencePack"
-        );
+        assert_eq!(EvidencePackQueryPlan::operation_name(), "GetEvidencePack");
     }
 
     #[test]
@@ -1798,8 +1792,12 @@ mod evidence_pack_query_plan_tests {
             QueryMode::ChangeImpact,
             QueryMode::ContextReconstruction,
         ] {
-            plan_evidence_pack_query(&input(mode, "subject:evidence-alpha"), "scope-evidence", "8")
-                .expect("verification family admits GetEvidencePack");
+            plan_evidence_pack_query(
+                &input(mode, "subject:evidence-alpha"),
+                "scope-evidence",
+                "8",
+            )
+            .expect("verification family admits GetEvidencePack");
         }
         match plan_evidence_pack_query(
             &input(QueryMode::CurrentPosition, "subject:evidence-alpha"),
@@ -1866,7 +1864,11 @@ mod evidence_pack_query_plan_tests {
         let projection = project_evidence_pack_projection(&plan, payload.clone());
         assert_eq!(projection.kind, ProjectionKind::Projection);
         assert_eq!(projection.proof_ceiling, ProofCeiling::ScopedVerification);
-        assert!(projection.proof_ceiling.is_at_most(ProofCeiling::ScopedVerification));
+        assert!(
+            projection
+                .proof_ceiling
+                .is_at_most(ProofCeiling::ScopedVerification)
+        );
         assert_eq!(projection.content["operation"], "GetEvidencePack");
         assert_eq!(projection.content["subject"], "evidence-alpha");
         assert_eq!(projection.content["scope_id"], "scope-evidence");
@@ -2051,7 +2053,11 @@ mod context_reconstruction_query_plan_tests {
         let projection = project_context_reconstruction_projection(&plan, payload.clone());
         assert_eq!(projection.kind, ProjectionKind::Projection);
         assert_eq!(projection.proof_ceiling, ProofCeiling::ScopedVerification);
-        assert!(projection.proof_ceiling.is_at_most(ProofCeiling::ScopedVerification));
+        assert!(
+            projection
+                .proof_ceiling
+                .is_at_most(ProofCeiling::ScopedVerification)
+        );
         assert_eq!(projection.content["operation"], "ContextReconstruction");
         assert_eq!(projection.content["task_id"], "task-7");
         assert_eq!(projection.content["scope_id"], "scope-task");

@@ -3,9 +3,11 @@
 use std::collections::BTreeMap;
 
 use eliot_mcp::{
-    CANONICAL_DEFINITION_VERSION, OperationalProjection, ToolMethodIdentity, canonical_registry,
-    invalidation_on_profile_change, profile_version_changed, routing_decision,
-    validate_operational_projection,
+    CANONICAL_DEFINITION_VERSION, CANONICAL_TOOL_NAMES, OperationalProjection, StateInput,
+    ToolMethodIdentity, ToolRequest, canonical_known_tools, canonical_registry,
+    invalidation_on_profile_change, known_tool_profile, profile_version_changed,
+    published_mcp_tool_surface, routing_decision, validate_operational_projection,
+    validate_tool_request_owner,
 };
 
 fn identity(name: &str) -> ToolMethodIdentity {
@@ -66,6 +68,56 @@ fn profile_version_change_invalidates_dependents() {
     assert!(invalidation.packets);
     assert!(invalidation.competence_evidence);
     assert!(invalidation.projections);
+}
+
+/// Frozen v1 Skill lookup: one owner per canonical name at the pinned
+/// definition version; unknown names have no owner and must not be invented.
+#[test]
+fn frozen_known_tool_lookup_serves_one_owner_per_method() {
+    let registry = canonical_registry().expect("canonical registry builds");
+    let tools = canonical_known_tools().expect("frozen enumeration builds");
+    assert_eq!(tools.len(), CANONICAL_TOOL_NAMES.len());
+    let mut names: Vec<&str> = tools
+        .iter()
+        .map(|profile| profile.method.canonical_name.as_str())
+        .collect();
+    names.sort_unstable();
+    let mut expected: Vec<&str> = CANONICAL_TOOL_NAMES.to_vec();
+    expected.sort_unstable();
+    assert_eq!(names, expected);
+    for profile in &tools {
+        assert_eq!(
+            profile.method.definition_version,
+            CANONICAL_DEFINITION_VERSION
+        );
+        let resolved = registry
+            .resolve(&profile.method.canonical_name, CANONICAL_DEFINITION_VERSION)
+            .expect("enumerated tool resolves in the registry");
+        assert_eq!(
+            known_tool_profile(&profile.method.canonical_name).expect("frozen lookup resolves"),
+            resolved.clone()
+        );
+    }
+    assert!(known_tool_profile("vendor.effect").is_err());
+}
+
+/// Production join: a real contract request resolves to its owner, and the
+/// published Material MCP surface is exactly the profiled catalogue.
+#[test]
+fn contract_request_and_transport_surface_join_to_the_owner() {
+    let request = ToolRequest::State(StateInput {
+        include: Vec::new(),
+    });
+    let profile = validate_tool_request_owner(&request).expect("state request has an owner");
+    assert_eq!(profile.method.canonical_name, "eliot.state");
+    assert!(routing_decision(&profile).read_only);
+
+    let surface = published_mcp_tool_surface().expect("material surface builds");
+    let names: Vec<&str> = surface
+        .iter()
+        .map(|descriptor| descriptor.name.as_str())
+        .collect();
+    assert_eq!(names, CANONICAL_TOOL_NAMES);
 }
 
 /// Single owner: one disagreeing MCP/WIT/EBP view fails against the profile.

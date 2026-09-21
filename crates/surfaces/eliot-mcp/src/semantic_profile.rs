@@ -16,6 +16,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::{SchemaError, ToolRequest, ToolSchema, canonical_tool_schemas};
+
 /// Failure to register, resolve, or validate a semantic profile.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum SemanticProfileError {
@@ -410,6 +412,11 @@ impl SemanticRegistry {
         }
         names.into_iter().collect()
     }
+
+    /// Registered profiles in stable registry (key) order.
+    pub fn profiles(&self) -> impl Iterator<Item = &ToolSemanticProfile> {
+        self.profiles.values()
+    }
 }
 
 /// Returns true when a semantic-profile version change invalidates dependent
@@ -506,6 +513,69 @@ pub fn canonical_registry() -> Result<SemanticRegistry, SemanticProfileError> {
         registry.register(profile)?;
     }
     Ok(registry)
+}
+
+/// Process-wide canonical registry: the single runtime semantic owner.
+///
+/// Built on demand from [`canonical_profiles`] (eight validated inserts —
+/// negligible beside any kernel round-trip); every frozen lookup below
+/// resolves through a freshly built instance of this one source, so all
+/// callers share one owner per method identity with no cached fork.
+fn canonical_shared() -> Result<SemanticRegistry, SemanticProfileError> {
+    canonical_registry()
+}
+
+/// FROZEN v1 Skill `KnownTools` lookup (`1944-skill-handoff.md`).
+///
+/// Resolves exactly one versioned semantic owner by canonical method name,
+/// binding the definition version to [`CANONICAL_DEFINITION_VERSION`].
+/// A missing profile is [`SemanticProfileError::MissingProfile`]: the caller
+/// must treat the method as absent, never synthesize semantics from prose.
+pub fn known_tool_profile(
+    canonical_name: &str,
+) -> Result<ToolSemanticProfile, SemanticProfileError> {
+    canonical_shared()?
+        .resolve(canonical_name, CANONICAL_DEFINITION_VERSION)
+        .cloned()
+}
+
+/// FROZEN v1 Skill `KnownTools` enumeration (`1944-skill-handoff.md`).
+///
+/// Every `KnownTool` is a profile owned by the canonical registry — the set is
+/// never constructed from ad-hoc strings, so one versioned method identity
+/// keeps one operational semantics owner. Order is stable registry (key)
+/// order; consumers look up by name and must not rely on positions.
+pub fn canonical_known_tools() -> Result<Vec<ToolSemanticProfile>, SemanticProfileError> {
+    Ok(canonical_shared()?.profiles().cloned().collect())
+}
+
+/// Resolves the single semantic owner for one real contract tool request.
+///
+/// Production join between the contract surface ([`ToolRequest`]) and the
+/// semantic owner: the request's canonical name resolves to exactly one
+/// versioned profile, or the request has no owner and must not be routed.
+pub fn validate_tool_request_owner(
+    request: &ToolRequest,
+) -> Result<ToolSemanticProfile, SemanticProfileError> {
+    known_tool_profile(request.canonical_name())
+}
+
+/// Publishes the Material MCP tool surface: the generated transport catalogue
+/// joined against the single semantic owner.
+///
+/// Calls the real production schema generator ([`canonical_tool_schemas`])
+/// and publishes only descriptors whose name resolves to exactly one
+/// versioned profile. A generated descriptor without a registered profile is
+/// omitted from the Material surface (fail-closed); narrowing to an
+/// observable capability, where safe, is a bridge/Skill decision downstream.
+pub fn published_mcp_tool_surface() -> Result<Vec<ToolSchema>, SchemaError> {
+    let mut surface = Vec::new();
+    for descriptor in canonical_tool_schemas()? {
+        if known_tool_profile(&descriptor.name).is_ok() {
+            surface.push(descriptor);
+        }
+    }
+    Ok(surface)
 }
 
 #[allow(
