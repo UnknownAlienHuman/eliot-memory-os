@@ -45,6 +45,18 @@ pub struct StoreLaunchConfig {
     pub username: String,
     pub connect_timeout_ms: u64,
     pub query_timeout_ms: u64,
+    /// Kernel-configured store transaction limit bounding canonical-write
+    /// concurrency (I5.7, issue #1933). `None` keeps the I5.7 desktop default;
+    /// an explicit value must be non-zero. Absent on the wire means default.
+    /// Shape-validated here; digest binding is deliberately deferred (see
+    /// `launch_config_digest`): the approved digest must stay identical to
+    /// the installer-duplicated projection, and binding a knob no producer
+    /// sets yet would force reissue of every existing config for zero
+    /// current benefit. The first producer that issues an explicit limit
+    /// MUST bind it in `launch_config_digest` jointly with the installer
+    /// projection (`PlannerOperationalConfig`), or installations split.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_transaction_limit: Option<usize>,
     pub schema_generation: String,
     pub blob_root: String,
     pub instance_id: String,
@@ -128,6 +140,9 @@ impl StoreLaunchConfig {
         validate_launch_text(&self.credential_ref, "credential_ref")?;
         if self.connect_timeout_ms == 0 || self.query_timeout_ms == 0 {
             return Err("connect_timeout_ms and query_timeout_ms must be non-zero".to_owned());
+        }
+        if self.store_transaction_limit == Some(0) {
+            return Err("store_transaction_limit must be non-zero".to_owned());
         }
         SchemaGeneration::new(self.schema_generation.as_str())
             .map_err(|error| format!("invalid schema_generation: {error}"))?;

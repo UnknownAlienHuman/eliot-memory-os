@@ -1,6 +1,7 @@
 //! Single retained provider-process and data-root owner. No socket or RPC state.
 //! The accepted kill-on-drop fallback is unchanged; drop is not clean-exit proof.
 use super::millis;
+use super::rpc_parse::ProviderVersion;
 use crate::config::{StoreDataRootLease, SurrealAdapterConfig};
 use crate::error::AdapterError;
 use eliot_platform_windows::{
@@ -26,6 +27,11 @@ pub(crate) struct ProviderOwner {
     pub(super) provider_process_id: u32,
     pub(super) provider_process_identity: ProcessIdentity,
     data_root_lease: StoreDataRootLease,
+    /// Server version proved by the last ownership-verified authentication
+    /// on this provider child (issue #1932). Set only after the full
+    /// spawn/owner/version/auth chain succeeds; cleared when the bridge
+    /// observes connection loss so no stale session is ever claimed live.
+    authenticated_version: std::sync::Mutex<Option<ProviderVersion>>,
 }
 impl fmt::Debug for ProviderOwner {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -102,9 +108,34 @@ impl ProviderOwner {
                 provider_process_id,
                 provider_process_identity: identity_before_listener,
                 data_root_lease,
+                authenticated_version: std::sync::Mutex::new(None),
             }),
             deadline,
         ))
+    }
+    /// Records the server version proved by one ownership-verified
+    /// authentication on this provider child. Called only after the full
+    /// spawn/owner/version/auth/identity chain succeeds.
+    pub(super) fn record_authenticated_version(&self, version: ProviderVersion) {
+        if let Ok(mut slot) = self.authenticated_version.lock() {
+            *slot = Some(version);
+        }
+    }
+    /// Returns the last proved server version, or `None` when no
+    /// ownership-verified authentication is currently claimed live.
+    pub(crate) fn authenticated_version(&self) -> Option<ProviderVersion> {
+        self.authenticated_version
+            .lock()
+            .ok()
+            .and_then(|slot| *slot)
+    }
+    /// Forgets the proved server version after observed connection loss, so
+    /// the bridge stops claiming a live authenticated session until the next
+    /// ownership-verified authentication re-proves it.
+    pub(crate) fn clear_authenticated_version(&self) {
+        if let Ok(mut slot) = self.authenticated_version.lock() {
+            *slot = None;
+        }
     }
     pub(super) async fn validate_owned(&self) -> Result<(), AdapterError> {
         self.validate_liveness(&self.config, &self.process_lease)
