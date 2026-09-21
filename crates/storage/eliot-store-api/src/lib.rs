@@ -33,6 +33,7 @@ use thiserror::Error;
 mod dreamer_job;
 pub mod epistemic_revision;
 pub mod erasure_admission;
+mod notification_state;
 mod payload_authority;
 mod request_hash;
 mod store_failure;
@@ -44,6 +45,27 @@ pub use dreamer_job::{
     DreamerJobLedgerRecord, DreamerJobMutationIdentity, MAX_DREAMER_JOB_HISTORY,
     MAX_DREAMER_JOB_QUEUE_KEY_BYTES, MAX_DREAMER_JOB_TEXT_BYTES, dreamer_job_queue_key,
     map_durable_error, validate_ledger_bundle,
+};
+
+pub use notification_state::{
+    DecodedNotificationMutation, DeliveryAttempt, DeliveryChannel, DeliveryState,
+    DeadlineOrReview, MAX_DEDUP_KEY_BYTES, MAX_NOTIFICATION_PAGE_LIMIT,
+    NOTIFICATION_STATE_MUTATION_NAME, NOTIFICATION_STATE_READ_NAME,
+    NOTIFICATION_STATE_SCHEMA_V1, NOTIFICATION_STATE_SCOPE, NOTIFY_MUTATION_ACKNOWLEDGE,
+    NOTIFY_MUTATION_DELIVERY, NOTIFY_MUTATION_RESOLVE, NOTIFY_MUTATION_UPSERT,
+    NOTIFY_PARAM_AUTHORIZATION_JSON, NOTIFY_PARAM_CHANNEL, NOTIFY_PARAM_CURSOR,
+    NOTIFY_PARAM_DEDUP_KEY, NOTIFY_PARAM_DELIVERY_JSON, NOTIFY_PARAM_DISPOSITION,
+    NOTIFY_PARAM_INCLUDE_RESOLVED, NOTIFY_PARAM_MUTATION, NOTIFY_PARAM_NOTIFICATION_ID,
+    NOTIFY_PARAM_PAGE_LIMIT, NOTIFY_PARAM_PRINCIPAL, NOTIFY_PARAM_RECORD_JSON,
+    NOTIFY_PARAM_SCOPE, NOTIFY_PARAM_SOURCE_RECEIPT_JSON, NotificationContractError,
+    NotificationMetrics, NotificationRecord, NotificationRecordInput,
+    NotificationRecordStore, NotificationSeverity, NotificationStateMutation,
+    NotificationStateReadRequest, NotificationStateReadResponse, NotificationStateRequest,
+    NotificationStateResponse, ResolutionAuthorization, ResolutionRef, Acknowledgement,
+    decode_notification_mutation, decode_notification_page, decode_notification_page_records,
+    encode_notification_page,
+    notification_mutation_request, notification_read_request, project_notification_read,
+    validate_notification_mutation_params, validate_resolution,
 };
 
 pub use payload_authority::{
@@ -593,6 +615,14 @@ pub enum TransitionClass {
     /// recoverable and no restore path may rehydrate them from the receipt
     /// (see [`WriteReceipt::refuse_rehydration_from_erasure`]).
     Erasure,
+    /// Canonical notification record lifecycle (issue #1780).
+    ///
+    /// Kernel-admitted notification create/update/delivery/acknowledge/
+    /// receipt-bound-resolve transitions inside the canonical store, applied
+    /// only through the named notification-state transaction carrying the
+    /// closed notification typed parameters. The ceiling is the maximum
+    /// store-allowed reversible effect; existing class maxima are unchanged.
+    NotificationState,
 }
 
 impl TransitionClass {
@@ -600,9 +630,11 @@ impl TransitionClass {
     pub const fn maximum_effect(self) -> EffectClass {
         match self {
             Self::CaptureCandidate | Self::Epistemic => EffectClass::Candidate,
-            Self::TaskControl | Self::LifecyclePolicy | Self::RecoverySchema | Self::Erasure => {
-                EffectClass::ReversibleMutation
-            }
+            Self::TaskControl
+            | Self::LifecyclePolicy
+            | Self::RecoverySchema
+            | Self::Erasure
+            | Self::NotificationState => EffectClass::ReversibleMutation,
         }
     }
 }
@@ -655,6 +687,8 @@ pub enum NamedReadOperation {
     /// with proven handlers; the typed parameters and payload contract
     /// (`revocation_history`) are already closed.
     GetAuthorityRevocationHistory,
+    /// Canonical notification-state read (issue #1780).
+    GetNotificationState,
 }
 
 /// Closed mutation catalogue activated by the current contract catalogue.
@@ -683,6 +717,15 @@ pub enum NamedMutationOperation {
     /// The store bridge applies only the recorded plan; it never derives
     /// deletion semantics.
     ApplyErasure,
+    /// Canonical notification-state transaction (issue #1780).
+    ///
+    /// Kernel-admitted notification lifecycle only (upsert, delivery,
+    /// acknowledge, receipt-bound resolve): the prepared transition must
+    /// carry [`TransitionClass::NotificationState`], the declared
+    /// notification effect ceiling, and the closed notification typed
+    /// parameters. The store bridge applies only the recorded plan; it never
+    /// derives delivery or resolution semantics.
+    ApplyNotificationState,
 }
 
 impl NamedMutationOperation {
@@ -697,6 +740,7 @@ impl NamedMutationOperation {
                 TransitionClass::RecoverySchema
             }
             Self::ApplyErasure => TransitionClass::Erasure,
+            Self::ApplyNotificationState => TransitionClass::NotificationState,
         }
     }
 }
@@ -2025,6 +2069,7 @@ fn operation_kind(class: TransitionClass) -> &'static str {
         TransitionClass::LifecyclePolicy => "store.apply.lifecycle_policy",
         TransitionClass::RecoverySchema => "store.apply.recovery_schema",
         TransitionClass::Erasure => "store.apply.erasure",
+        TransitionClass::NotificationState => "store.apply.notification_state",
     }
 }
 

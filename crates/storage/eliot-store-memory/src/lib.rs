@@ -15,9 +15,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use eliot_store_api::epistemic_revision::{EpistemicCommit, position_key};
 use eliot_store_api::{
     CanonicalRequestView, CanonicalStoreClient, CanonicalValidationSnapshot, CommitId,
+    DecodedNotificationMutation,
     ERASURE_PARAM_OPERATION_ID, ERASURE_PARAM_SUBJECT, ERASURE_PARAM_SURFACES,
     EVIDENCE_PACK_MAX_RECORDS, EventId, EventProjectionRelationIntents, NamedMutationOperation,
-    NamedReadOperation, NamedReadRequest, NamedReadResponse, OperationId, OperationManifestDigest,
+    NamedReadOperation, NamedReadRequest, NamedReadResponse, NotificationRecordStore,
+    OperationId, OperationManifestDigest,
     OrderingHead, OrderingHeadExpectation, OrderingScopeId, OutboxId, OutboxIntent, OutboxState,
     PreparedTransition, ProjectionMode, ProjectionPublicationId, ProjectionPublicationRecord,
     ProjectionStatus, RecoveryRecord, RecoveryRecordKey, RequestMeta, Resubmission, RevisionDelta,
@@ -25,9 +27,11 @@ use eliot_store_api::{
     StateFence, StoreError, StoreGenesisRequest, StoreHealth, StoreHealthStatus,
     StoreRecoveryRequest, StoreRecoverySnapshot, TransitionClass, WriteReceipt, WriteReceiptStatus,
     canonical_json_bytes, canonical_request_hash, decode_erasure_surfaces,
+    decode_notification_mutation, encode_notification_page,
     generated_operation_manifests, genesis_manifest,
     is_genesis_fence, issue_genesis_receipt_envelope, issue_store_receipt_envelope,
-    named_mutation_operation_name, sha256_hex, validate_genesis_receipt_envelope,
+    named_mutation_operation_name, project_notification_read, sha256_hex,
+    validate_genesis_receipt_envelope,
     validate_store_receipt_envelope, verify_canonical_request_hash,
 };
 use schemars::JsonSchema;
@@ -300,7 +304,7 @@ impl MemoryStore {
                 return Err(StoreError::RevisionConflict);
             }
         }
-        let plan = transaction_plan(&state, &transition, &operation_key)?;
+        let mut plan = transaction_plan(&state, &transition, &operation_key)?;
         let receipt = transaction_receipt(ctx, &transition, idempotency_key, recomputed, &plan)?;
         if let (Some(commit), Some(key)) = (epistemic, epistemic_key) {
             commit.readback(&receipt)?;
@@ -313,6 +317,10 @@ impl MemoryStore {
         // one receipt, recoverable replay without duplicate work. Any other
         // class is a no-op in this hook.
         dispatch_apply_erasure(&mut state, &transition)?;
+        // Issue #1780: admitted notification-state legs execute here, under
+        // the same lock as the receipt commit, with one outbox intent per
+        // mutation appended to the plan before the atomic commit below.
+        dispatch_apply_notification_state(&mut state, &transition, &mut plan)?;
         Ok(commit_transaction(
             &mut state,
             transition,
@@ -541,6 +549,198 @@ fn dispatch_apply_erasure(
     record_erasure_intent_state(state, intent)?;
     apply_erasure_state(state, operation_id)?;
     Ok(())
+}
+
+/// Executes admitted notification-state legs on already-locked state
+/// (issue #1780).
+///
+/// Runs beside [`dispatch_apply_erasure`] under the same lock as the receipt
+/// commit: one identity, one receipt, recoverable replay without duplicate
+/// work. Each mutation drives the closed [`NotificationRecordStore`]
+/// transition model (upsert/dedup/occurrences, delivery, acknowledge,
+/// receipt-bound resolve with all seven authority checks) and appends one
+/// I5.21 outbox intent bound to the resulting record bytes, so the record
+/// and its outbox intent commit atomically via [`commit_transaction`].
+/// Non-notification transitions are a no-op here.
+fn dispatch_apply_notification_state(
+    state: &mut MemoryState,
+    transition: &PreparedTransition,
+    plan: &mut TransactionPlan,
+) -> Result<(), StoreError> {
+    let has_notification_op = transition
+        .named_operations
+        .iter()
+        .any(|command| command.operation == NamedMutationOperation::ApplyNotificationState);
+    if !has_notification_op {
+        return Ok(());
+    }
+    transition.validate_against_catalogue(&generated_operation_manifests()?)?;
+    let operation_key = transition.identity.operation_id.to_string();
+    let mut notify_index = 0_usize;
+    for command in &transition.named_operations {
+        if command.operation != NamedMutationOperation::ApplyNotificationState {
+            continue;
+        }
+        let decoded = decode_notification_mutation(&command.parameters)?;
+        let record_json = apply_notification_leg(&mut state.notifications, decoded, transition)?;
+        let payload_digest = sha256_hex(&canonical_json_bytes(&record_json).map_err(|error| {
+            StoreError::Serialization(error.to_string())
+        })?);
+        let sequence = plan.next_outbox_sequence;
+        plan.next_outbox_sequence =
+            checked_increment(sequence, "outbox.sequence", "sequence overflow")?;
+        let outbox = OutboxIntent {
+            outbox_id: OutboxId::new(format!("outbox-{operation_key}-notify-{notify_index}"))?,
+            operation_id: transition.identity.operation_id.clone(),
+            sequence,
+            payload_digest,
+            state_fence: transition.state_fence.clone(),
+            arrival_fence: format!("arrival-{operation_key}"),
+            claim_fence: None,
+            state: OutboxState::Arrived,
+        };
+        outbox.validate()?;
+        plan.outbox_records.push(outbox);
+        notify_index = notify_index.saturating_add(1);
+    }
+    Ok(())
+}
+
+/// Applies one decoded leg against the record model and returns the
+/// resulting canonical record JSON for outbox binding.
+fn apply_notification_leg(
+    store: &mut NotificationRecordStore,
+    decoded: DecodedNotificationMutation,
+    transition: &PreparedTransition,
+) -> Result<Value, StoreError> {
+    let record = match decoded {
+        DecodedNotificationMutation::Upsert {
+            record: draft,
+            source_receipt,
+        } => {
+            if draft.state_fence != transition.state_fence {
+                return Err(StoreError::FenceMismatch);
+            }
+            source_receipt
+                .validate()
+                .map_err(|_| StoreError::InvalidReceipt)?;
+            store.upsert(draft)?.clone()
+        }
+        DecodedNotificationMutation::Delivery {
+            notification_id,
+            channel,
+            attempt,
+        } => {
+            let key = notification_key_for(store, &notification_id)?;
+            let existing = store.get(&key).ok_or(StoreError::InvalidField {
+                field: "notification.notification_id",
+                reason: "unknown notification",
+            })?;
+            if existing.state_fence != transition.state_fence {
+                return Err(StoreError::FenceMismatch);
+            }
+            if !existing.delivery_channels.contains(&channel) {
+                return Err(StoreError::InvalidField {
+                    field: "notification.channel",
+                    reason: "channel is not declared on the record",
+                });
+            }
+            store.record_delivery(&key, attempt.state)?.clone()
+        }
+        DecodedNotificationMutation::Acknowledge {
+            notification_id,
+            principal,
+        } => {
+            let key = notification_key_for(store, &notification_id)?;
+            let existing = store.get(&key).ok_or(StoreError::InvalidField {
+                field: "notification.notification_id",
+                reason: "unknown notification",
+            })?;
+            if existing.state_fence != transition.state_fence {
+                return Err(StoreError::FenceMismatch);
+            }
+            store.acknowledge(&key, &principal)?.clone()
+        }
+        DecodedNotificationMutation::Resolve {
+            notification_id,
+            disposition,
+            authorization,
+        } => {
+            let key = notification_key_for(store, &notification_id)?;
+            let existing = store.get(&key).ok_or(StoreError::InvalidField {
+                field: "notification.notification_id",
+                reason: "unknown notification",
+            })?;
+            if existing.state_fence != transition.state_fence {
+                return Err(StoreError::FenceMismatch);
+            }
+            store
+                .resolve(&key, &disposition, &authorization)?
+                .clone()
+        }
+    };
+    record
+        .validate()
+        .map_err(eliot_store_api::NotificationContractError::into_store_error)?;
+    serde_json::to_value(&record).map_err(|error| StoreError::Serialization(error.to_string()))
+}
+
+/// Resolves the dedup index key for a lifecycle leg identity.
+fn notification_key_for(
+    store: &NotificationRecordStore,
+    notification_id: &str,
+) -> Result<String, StoreError> {
+    store
+        .key_for_notification_id(notification_id)
+        .ok_or(StoreError::InvalidField {
+            field: "notification.notification_id",
+            reason: "unknown notification",
+        })
+}
+
+/// Builds the same-fence notification-state read payload.
+fn notification_state_payload(
+    state: &MemoryState,
+    query: &NamedReadRequest,
+    fence: &StateFence,
+) -> Result<Value, StoreError> {
+    let optional_text = |name: &str| -> Option<&str> {
+        query.parameters.get(name).and_then(Value::as_str)
+    };
+    let include_resolved = match optional_text("include_resolved") {
+        Some("true") => true,
+        Some("false") => false,
+        _ => {
+            return Err(StoreError::InvalidField {
+                field: "notification.include_resolved",
+                reason: "include_resolved must be \"true\" or \"false\"",
+            });
+        }
+    };
+    let page_limit: u16 = optional_text("page_limit")
+        .and_then(|value| value.parse().ok())
+        .filter(|limit| *limit > 0 && *limit <= eliot_store_api::MAX_NOTIFICATION_PAGE_LIMIT)
+        .ok_or(StoreError::InvalidField {
+            field: "notification.page_limit",
+            reason: "page limit is out of range",
+        })?;
+    let records = state
+        .notifications
+        .iter()
+        .filter(|record| record.state_fence == *fence)
+        .cloned();
+    let (selected, metrics) = project_notification_read(
+        records,
+        optional_text("scope"),
+        optional_text("dedup_key"),
+        optional_text("notification_id"),
+        include_resolved,
+        page_limit,
+        optional_text("cursor"),
+    );
+    let revision = state.notifications.sequence();
+    let payload = eliot_store_api::encode_notification_page(&selected, &metrics, fence, revision)?;
+    serde_json::to_value(&payload)
 }
 
 fn validate_transaction(
@@ -997,7 +1197,10 @@ impl MemoryStore {
     /// its `position` selector; T11.3 adds the four cognitive reads
     /// (`GetTaskState`, `GetAttentionAndProblems`,
     /// `GetUnderstandingProjectionInputs`, `GetCapabilityEvidenceState`)
-    /// with their bounded exact selectors.
+    /// with their bounded exact selectors. Issue #1780 adds
+    /// `GetNotificationState` with its `scope` / `dedup_key` /
+    /// `notification_id` / `include_resolved` / `page_limit` / `cursor`
+    /// selectors.
     fn enforce_catalogue_gate(query: &NamedReadRequest) -> Result<(), StoreError> {
         if matches!(
             query.operation,
@@ -1007,6 +1210,7 @@ impl MemoryStore {
                 | NamedReadOperation::GetAttentionAndProblems
                 | NamedReadOperation::GetUnderstandingProjectionInputs
                 | NamedReadOperation::GetCapabilityEvidenceState
+                | NamedReadOperation::GetNotificationState
         ) {
             let entries = generated_operation_manifests()?;
             query.validate_against_catalogue(&entries)?;
@@ -1108,6 +1312,10 @@ impl MemoryStore {
             }
             NamedReadOperation::GetCapabilityEvidenceState => {
                 let payload = Self::capability_evidence_payload(&state, query, &fence)?;
+                serde_json::to_value(&payload)
+            }
+            NamedReadOperation::GetNotificationState => {
+                let payload = notification_state_payload(&state, query, &fence)?;
                 serde_json::to_value(&payload)
             }
             _ => serde_json::to_value(json!({
@@ -1919,6 +2127,10 @@ struct MemoryState {
     /// erased under a recorded intent with dispatched removal. The pack hides
     /// only suppressed pairs, even if rows remain; never a guess.
     erased_subjects: BTreeSet<(String, String)>,
+    /// Canonical notification records keyed by dedup index (issue #1780).
+    /// Driven only through the closed notification-state legs under the held
+    /// transaction lock; the outbox intent commits atomically with the receipt.
+    notifications: NotificationRecordStore,
     next_commit_sequence: u64,
     next_outbox_sequence: u64,
 }
@@ -1941,6 +2153,7 @@ impl Default for MemoryState {
             manifests: BTreeMap::new(),
             erasure_intents: BTreeMap::new(),
             erased_subjects: BTreeSet::new(),
+            notifications: NotificationRecordStore::new(),
             next_commit_sequence: 1,
             next_outbox_sequence: 1,
         }
@@ -1961,6 +2174,7 @@ impl MemoryState {
             && self.named_operations.is_empty()
             && self.erasure_intents.is_empty()
             && self.erased_subjects.is_empty()
+            && self.notifications.is_empty()
     }
 
     fn snapshot(&self) -> MemorySnapshot {

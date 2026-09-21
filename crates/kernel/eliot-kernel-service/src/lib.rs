@@ -28,6 +28,7 @@ mod doctor;
 mod doctor_front_door;
 mod host_request_binding;
 mod lifecycle;
+mod notification_state;
 mod process_execution_client;
 mod protocol;
 mod store_client;
@@ -65,6 +66,11 @@ pub use eliot_protocol::{
 pub use host_request_binding::{AuthenticatedHostSession, KernelHostRequestBinder};
 pub use lifecycle::{
     AdmissionLease, KernelService, KernelServiceError, KernelServiceState, ServiceFailure,
+};
+pub use notification_state::{
+    AuthenticatedNotificationSession, NotificationServiceContext, NotificationServiceError,
+    handle_notification_state_read, handle_notification_state_request,
+    reconcile_notification_state,
 };
 pub use process_execution_client::{
     KernelProcessExecutionClient, ProcessOperationFuture, ProcessOperationPort, ProcessStarter,
