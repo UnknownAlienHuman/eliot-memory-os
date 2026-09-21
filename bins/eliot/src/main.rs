@@ -2489,7 +2489,10 @@ fn open_existing_registry_for_terminal_reconcile(
             Err(error) if is_redb_exclusive_lock_contention(&error) => {
                 last_contention = Some(error);
                 if attempt + 1 < MAX_ATTEMPTS {
-                    std::thread::sleep(Duration::from_millis(BACKOFF_MS[attempt]));
+                    let Some(&backoff_ms) = BACKOFF_MS.get(attempt) else {
+                        panic!("backoff schedule covers all retries");
+                    };
+                    std::thread::sleep(Duration::from_millis(backoff_ms));
                     continue;
                 }
                 break;
@@ -2497,7 +2500,10 @@ fn open_existing_registry_for_terminal_reconcile(
             Err(error) => return Err(error),
         }
     }
-    Err(last_contention.expect("lock-contention loop must retain its cause"))
+    let Some(cause) = last_contention else {
+        panic!("lock-contention loop must retain its cause");
+    };
+    Err(cause)
 }
 
 fn reconcile_host_activation_terminal(

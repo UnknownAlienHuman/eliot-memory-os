@@ -243,10 +243,10 @@ pub fn ensure_rollback_artifact(
                 continue;
             }
         };
-        let file_name = target_path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "file".to_owned());
+        let file_name = target_path.file_name().map_or_else(
+            || "file".to_owned(),
+            |name| name.to_string_lossy().into_owned(),
+        );
         let backup_path = rollback_dir.join(format!("{}.{}.bak", manifest.plugin_id, file_name));
         match std::fs::write(&backup_path, &bytes) {
             Ok(()) => {
