@@ -405,6 +405,18 @@ fn label_text_ok(value: &str) -> bool {
     !value.trim().is_empty() && !value.chars().any(char::is_control)
 }
 
+/// Returns `true` when `value` claims the immutable evidence-handle shape.
+///
+/// Any `evh:`-prefixed emitted value is treated as an emitted handle, whether
+/// or not it is structurally valid for the emitting family: a handle-shaped
+/// value without a matching recorded handle is an accounting loss or a spoof,
+/// so the caller must demand a recorded handle fail-closed.
+fn claims_handle_shape(value: &str) -> bool {
+    value
+        .strip_prefix(REDACTED_HANDLE_PREFIX)
+        .is_some_and(|rest| rest.starts_with(':'))
+}
+
 /// Labels safe for emission plus the recorded evidence handles.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -420,7 +432,8 @@ impl ScrubbedLabels {
     /// emitted key set, no secret or content value survived, Handle-only
     /// families carry handles exclusively, Forbidden families emit nothing,
     /// every handle is a structurally valid `evh` identity bound to `family`
-    /// and present among the emitted values, and every emitted key is safe.
+    /// and present among the emitted values, every emitted `evh:`-shaped value
+    /// names a recorded handle bound to `family`, and every emitted key is safe.
     #[must_use]
     pub fn is_clean(&self, family: TelemetryFieldFamily) -> bool {
         match disposition_for(family) {
@@ -439,7 +452,7 @@ impl ScrubbedLabels {
                         return false;
                     }
                 }
-                self.handles_valid(family)
+                self.handles_valid(family) && self.emitted_handles_accounted(family)
             }
             LabelDisposition::Allowed => {
                 if self.labels.len() > 16 {
@@ -454,7 +467,7 @@ impl ScrubbedLabels {
                         return false;
                     }
                 }
-                self.handles_valid(family)
+                self.handles_valid(family) && self.emitted_handles_accounted(family)
             }
         }
     }
@@ -467,6 +480,29 @@ impl ScrubbedLabels {
                 || !redaction_status_valid(&handle.redaction_status)
                 || !is_handle_value_for_family(&handle.handle, family)
                 || !self.labels.values().any(|value| value == &handle.handle)
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Checks every emitted handle-shaped value is backed by a recorded handle.
+    ///
+    /// This is the reverse of [`handles_valid`](Self::handles_valid): that
+    /// method proves every record is emitted, while this proves every emitted
+    /// `evh:` value names a recorded handle bound to `family`. Together they
+    /// give bidirectional handle accounting, so an Allowed-family label set
+    /// cannot smuggle an unrecorded handle past `is_clean`, and duplicate
+    /// records cannot mask an unrecorded Handle-only emission either. A
+    /// matched record is itself validated by `handles_valid`, so the pair is
+    /// jointly sufficient.
+    fn emitted_handles_accounted(&self, family: TelemetryFieldFamily) -> bool {
+        for value in self.labels.values() {
+            if claims_handle_shape(value)
+                && !self.handles.iter().any(|handle| {
+                    handle.family == family && handle.handle.as_str() == value.as_str()
+                })
             {
                 return false;
             }

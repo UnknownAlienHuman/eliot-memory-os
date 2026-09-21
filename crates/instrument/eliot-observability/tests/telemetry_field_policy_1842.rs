@@ -6,7 +6,8 @@
 //! [`LabelDisposition`](eliot_observability::field_policy::LabelDisposition)
 //! is enforced both when scrubbing and when validating labels, and
 //! [`ScrubbedLabels`](eliot_observability::field_policy::ScrubbedLabels)`::is_clean`
-//! verifies every audit property for the emitting family.
+//! verifies every audit property for the emitting family in both directions:
+//! every recorded handle is emitted, and every emitted `evh` handle is recorded.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::collections::BTreeMap;
@@ -406,6 +407,97 @@ fn is_clean_requires_safe_emitted_keys() {
         }
         .is_clean(TelemetryFieldFamily::MetricSample),
         "blank keys are unsafe"
+    );
+}
+
+#[test]
+fn is_clean_accounts_every_emitted_handle_for_allowed_families() {
+    // Residual gap (PR #2260 re-audit): an Allowed-family label set carrying
+    // an emitted `evh` handle with no matching RedactedHandle record passed
+    // `is_clean`, because only the record-to-emission direction was checked.
+    let orphan = format!("evh:metric_sample:{}", "3".repeat(64));
+    let mut labels = BTreeMap::new();
+    labels.insert("task_ref".to_owned(), "task-1842".to_owned());
+    labels.insert("evidence".to_owned(), orphan.clone());
+    let orphaned = ScrubbedLabels {
+        labels,
+        handles: Vec::new(),
+    };
+    assert!(
+        !orphaned.is_clean(TelemetryFieldFamily::MetricSample),
+        "emitted handle without a recorded handle must fail is_clean"
+    );
+
+    // A malformed `evh:`-shaped value is still a handle claim: without a
+    // (necessarily valid) matching record it must fail fail-closed.
+    let mut spoofed = BTreeMap::new();
+    spoofed.insert("task_ref".to_owned(), "task-1842".to_owned());
+    spoofed.insert("evidence".to_owned(), "evh:not-a-handle".to_owned());
+    assert!(
+        !ScrubbedLabels {
+            labels: spoofed,
+            handles: Vec::new(),
+        }
+        .is_clean(TelemetryFieldFamily::MetricSample),
+        "spoof-shaped evh value without a record must fail is_clean"
+    );
+
+    // A foreign-family handle emitted under an Allowed family is unaccounted.
+    let mut foreign = BTreeMap::new();
+    foreign.insert("task_ref".to_owned(), "task-1842".to_owned());
+    foreign.insert(
+        "evidence".to_owned(),
+        format!("evh:query_metadata:{}", "5".repeat(64)),
+    );
+    assert!(
+        !ScrubbedLabels {
+            labels: foreign,
+            handles: Vec::new(),
+        }
+        .is_clean(TelemetryFieldFamily::MetricSample),
+        "foreign-family handle without a record must fail is_clean"
+    );
+
+    // Positive control with removal: genuine scrub output is clean, but
+    // dropping its handle record orphans the emitted handle.
+    let mut candidate = BTreeMap::new();
+    candidate.insert("task_ref".to_owned(), "task-1842".to_owned());
+    candidate.insert("authorization".to_owned(), format!("Bearer {SECRET}"));
+    let scrubbed = scrub_labels_for_emit(TelemetryFieldFamily::MetricSample, &candidate);
+    assert!(
+        scrubbed.is_clean(TelemetryFieldFamily::MetricSample),
+        "recorded scrub output stays clean"
+    );
+    let mut dropped = scrubbed.clone();
+    dropped.handles.clear();
+    assert!(
+        !dropped.is_clean(TelemetryFieldFamily::MetricSample),
+        "dropping the handle record orphans the emitted handle"
+    );
+}
+
+#[test]
+fn is_clean_accounts_every_emitted_handle_for_handle_only_families() {
+    // Duplicate records for one handle must not mask a second emitted handle
+    // with no record of its own, even though the label/handle counts match.
+    let first = format!("evh:query_metadata:{}", "6".repeat(64));
+    let second = format!("evh:query_metadata:{}", "7".repeat(64));
+    let record = |handle: String, source: &str| RedactedHandle {
+        handle,
+        family: TelemetryFieldFamily::QueryMetadata,
+        source_key: source.to_owned(),
+        redaction_status: "redacted:handle-only".to_owned(),
+    };
+    let mut labels = BTreeMap::new();
+    labels.insert("a".to_owned(), first.clone());
+    labels.insert("b".to_owned(), second.clone());
+    let masked = ScrubbedLabels {
+        labels,
+        handles: vec![record(first.clone(), "a"), record(first, "b")],
+    };
+    assert!(
+        !masked.is_clean(TelemetryFieldFamily::QueryMetadata),
+        "masked unrecorded handle must fail is_clean despite matching counts"
     );
 }
 
