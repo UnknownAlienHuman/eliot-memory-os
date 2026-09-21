@@ -89,3 +89,85 @@ disposition = "SUPERSEDE_DO_NOT_ASSIGN"
 targets = []
 rationale = "The branch is stale against current main and contains hundreds of noun-level or empty manifest prototypes. Reuse only individually revalidated boundary hypotheses."
 rejected_overgeneralization = "Effective indexes, old READY labels or empty crates treated as current implementation assignments."
+
+# Issue #816 makes the legacy split explicit without changing or deleting any
+# donor.  `observed_disposition` describes the current map; it is not runtime
+# completion evidence and does not turn a donor into an implementation owner.
+[topology_donor_authority]
+issue = 816
+schema_version = 1
+authority_base = "9e3562df010fb0c0aa9bceebb7db2245cf181ca1"
+proof_ceiling = "DONOR_AND_OWNER_RECONCILIATION_ONLY"
+runtime_completion = false
+
+[[topology_donor]]
+path = "crates/smart/eliot-context"
+observed_disposition = "SPLIT_AND_RETAIN_AS_TEMPORARY_FACADE"
+current_owner = "A-15/A-16a/A-17a/A-18"
+targets = ["A-15", "A-16a", "A-17a", "A-18"]
+owner_issue_refs = [584, 604, 608, 626]
+evidence = "existing donor row plus current module manifests"
+uncertainty = "facade remains compatibility material until each consumer migration is independently proved"
+
+[[topology_donor]]
+path = "crates/smart/eliot-understanding"
+observed_disposition = "RETIRED_DUPLICATE_UNDERSTANDING_FACADE"
+current_owner = "none"
+targets = ["A-18"]
+owner_issue_refs = [251, 626]
+evidence = "existing donor row records zero-consumer proof and assembly extraction"
+uncertainty = "retirement evidence does not claim every historical consumer has been migrated beyond the recorded base"
+
+[[topology_donor]]
+path = "crates/smart/eliot-cues"
+observed_disposition = "SPLIT_AND_RETAIN_AS_TEMPORARY_FACADE"
+current_owner = "A-10/A-11/A-12/A-13/A-14a; B-RCTX for delivery"
+targets = ["A-10", "A-14a"]
+owner_issue_refs = [804, 598, 622, 624, 600, 796, 798, 800]
+evidence = "existing donor row; cue contracts and activation are separate typed seams"
+uncertainty = "snapshot and compatibility facade boundaries remain explicit until their consumers are migrated"
+
+[[topology_donor]]
+path = "crates/smart/eliot-memory-curation"
+observed_disposition = "PARTIAL_REUSE_THEN_RETIRE_FACADE"
+current_owner = "A-19c/A-20/A-31"
+targets = ["A-19c", "A-20", "A-31"]
+owner_issue_refs = [586, 588, 684]
+evidence = "existing donor row; screen contracts, screen algorithm and fan-in are separated"
+uncertainty = "legacy DTOs remain donor material and are not current screen ownership"
+
+[[topology_donor]]
+path = "crates/smart/eliot-context-contracts/src/measurement.rs"
+observed_disposition = "RETAIN_AS_A15_MEASUREMENT_CONTRACT"
+current_owner = "A-15"
+targets = ["A-15", "A-18"]
+owner_issue_refs = [584, 626]
+evidence = "current source path and assembly measurement references"
+uncertainty = "F-STU implementation proof is separate from this metadata map"
+
+[[topology_donor]]
+path = "crates/smart/eliot-context-measurement"
+observed_disposition = "RETAIN_AS_F_STU_IMPLEMENTATION"
+current_owner = "F-STU"
+targets = ["A-15", "A-18"]
+owner_issue_refs = [704, 626]
+evidence = "current module manifest and exact measurement implementation references"
+uncertainty = "this issue records the ownership port only; it does not claim a new measurement run"
+
+[[topology_donor]]
+path = "crates/smart/eliot-dreamer-contracts"
+observed_disposition = "RETAIN_A03_CONTRACT_OWNER"
+current_owner = "A-03"
+targets = ["A-03", "A-21", "A-22", "A-23", "A-24", "A-25", "A-26", "A-27", "A-28", "A-29", "A-30", "A-31"]
+owner_issue_refs = [578, 1292]
+evidence = "current contract hub and typed registry exports"
+uncertainty = "A-31 handler execution remains runtime composition evidence outside metadata proof"
+
+[[topology_donor]]
+path = "crates/smart/eliot-dreamer-candidate-validation"
+observed_disposition = "RETAIN_A05_SINGLE_GATE"
+current_owner = "A-05"
+targets = ["A-05", "A-21", "A-22", "A-23", "A-24", "A-25", "A-26", "A-27", "A-28", "A-29", "A-30", "A-31"]
+owner_issue_refs = [595]
+evidence = "current module manifest and A-31 contract boundary"
+uncertainty = "metadata records inherited validation only; it does not certify a new handler result"
