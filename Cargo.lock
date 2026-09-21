@@ -1729,6 +1729,7 @@ dependencies = [
  "eliot-finish",
  "eliot-integration-coverage",
  "eliot-maintenance",
+ "eliot-mcp",
  "eliot-module-registry",
  "eliot-observation",
  "eliot-observation-contracts",
@@ -2198,6 +2199,7 @@ dependencies = [
  "eliot-protocol",
  "eliot-receipts",
  "eliot-security-contracts",
+ "eliot-skill",
  "eliot-source-assurance",
  "schemars",
  "serde",
@@ -2715,6 +2717,7 @@ version = "0.1.0"
 dependencies = [
  "eliot-contracts",
  "eliot-protocol",
+ "eliot-receipts",
  "eliot-rules",
  "eliot-skills",
  "eliot-store-api",
