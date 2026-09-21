@@ -27,6 +27,7 @@ use thiserror::Error;
 mod isolated_restore;
 mod portable_recovery;
 mod product_command;
+mod restore_runner;
 
 pub use isolated_restore::{
     CutoverAuthorization, CutoverReceipt, IsolatedRestorePlan, IsolatedRoot, authorize_cutover,
@@ -39,6 +40,9 @@ pub use portable_recovery::{
 pub use product_command::{
     BackupCreateArgs, BackupCreatePreview, RestorePreview, parse_backup_class,
     preview_backup_create, preview_restore,
+};
+pub use restore_runner::{
+    FileRestoreJournal, FileRestoreTarget, RunnerOutcome, execute_isolated_restore,
 };
 
 /// Stable identity of the exchange-format contract.
