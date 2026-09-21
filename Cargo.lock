@@ -637,7 +637,11 @@ name = "eliot-agent-bridge"
 version = "0.1.0"
 dependencies = [
  "eliot-agent-bridge-core",
+ "eliot-agent-contracts",
+ "eliot-context-contracts",
  "eliot-contracts",
+ "eliot-cue-contracts",
+ "eliot-evidence",
  "eliot-governor",
  "eliot-integration-coverage",
  "eliot-ipc",
