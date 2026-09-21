@@ -38,7 +38,7 @@ pub use contour::{
     FS_CAPABILITY, GenerationManifest, GovernorGrant, HostCallProposal, NET_CAPABILITY,
     PINNED_WASMTIME_VERSION, PrototypeContourDecision, SELF_CONTAINED_GUEST_TARGET,
     STANDARD_GUEST_TARGET, admit_generation, admit_prototype, authorize_host_call,
-    check_activation_imports,
+    check_activation_imports, experimental_manifest,
 };
 pub use shadow::{ShadowError, enforce_shadow_no_effect, shadow_port_error};
 pub use typed_bindings::{
