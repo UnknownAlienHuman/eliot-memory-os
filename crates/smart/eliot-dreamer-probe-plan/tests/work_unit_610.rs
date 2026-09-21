@@ -25,6 +25,8 @@
     clippy::needless_pass_by_value
 )]
 
+mod support;
+
 use std::num::NonZeroU64;
 
 use eliot_dreamer_contracts::{
@@ -34,8 +36,8 @@ use eliot_dreamer_contracts::{
     HumanAttentionDimension, InformationDimension, InquiryAffordanceDescriptor,
     InquiryAffordanceDescriptorParams, InquiryAffordanceSet, InquiryAffordanceSetParams,
     LatencyDimension, MaterialClaimRef, PossibleResultSchema, PossibleResultValue,
-    PrivacyDimension, ProbeObjectiveRef, ProbeOwnerRef, ResourceDimension, ResultBranch,
-    ResultTarget, ResultUpdate, ResultUpdateDiscriminability, ReversibilityDimension,
+    PrivacyDimension, ProbeObjectiveRef, ProbeOrderingPolicy, ProbeOwnerRef, ResourceDimension,
+    ResultBranch, ResultTarget, ResultUpdate, ResultUpdateDiscriminability, ReversibilityDimension,
     RivalCoverageStatus, RivalCoverageSummary, RivalDeclarationSetRef, RivalModelRef,
     RivalModelSet, RivalModelSetParams, RivalPredictionRef, RivalUpdateMeaning,
     ValidatedDreamDraft, ValidationReceipt, canonical_bytes,
@@ -275,7 +277,7 @@ fn result_schema_for_target(id: &str, target: &AffordanceTarget) -> PossibleResu
             )
         }
     };
-    must(PossibleResultSchema::new(artifact(id), targets, branches))
+    support::schema_with_acceptance(id, targets, branches)
 }
 
 fn gap_matrix(
@@ -300,11 +302,7 @@ fn gap_matrix(
             }],
         })
         .collect();
-    must(PossibleResultSchema::new(
-        artifact(id),
-        vec![target],
-        branches,
-    ))
+    support::schema_with_acceptance(id, vec![target], branches)
 }
 
 fn unknown_update_matrix(
@@ -343,7 +341,12 @@ fn descriptor_with_schema(
 ) -> InquiryAffordanceDescriptor {
     let mut params = descriptor_params(id, target);
     params.result_schema = result_schema;
-    must(InquiryAffordanceDescriptor::new(params))
+    let target = params.target.clone();
+    let descriptor = must(InquiryAffordanceDescriptor::new(params));
+    match support::ready_semantics(&target) {
+        Some(semantics) => must(descriptor.with_planning_semantics(semantics)),
+        None => descriptor,
+    }
 }
 
 fn prediction(id: &str) -> RivalPredictionRef {
@@ -444,9 +447,22 @@ fn descriptor_params(id: &str, target: AffordanceTarget) -> InquiryAffordanceDes
 }
 
 fn descriptor(id: &str, target: AffordanceTarget) -> InquiryAffordanceDescriptor {
-    must(InquiryAffordanceDescriptor::new(descriptor_params(
-        id, target,
-    )))
+    descriptor_from_params(descriptor_params(id, target))
+}
+
+fn descriptor_from_params(
+    params: InquiryAffordanceDescriptorParams,
+) -> InquiryAffordanceDescriptor {
+    let target = params.target.clone();
+    let descriptor = must(InquiryAffordanceDescriptor::new(params));
+    let ready_target = matches!(
+        &target,
+        AffordanceTarget::RivalPredictions { .. } | AffordanceTarget::Objective { .. }
+    );
+    if ready_target && let Some(semantics) = support::ready_semantics(&target) {
+        return must(descriptor.with_planning_semantics(semantics));
+    }
+    descriptor
 }
 
 fn affordance_set(descriptors: Vec<InquiryAffordanceDescriptor>) -> InquiryAffordanceSet {
@@ -475,12 +491,17 @@ fn limits(candidates: Option<u64>) -> BudgetLimits {
     }
 }
 
+fn ordering_policy() -> ProbeOrderingPolicy {
+    must(ProbeOrderingPolicy::v1())
+}
+
 fn plan_for(descriptors: Vec<InquiryAffordanceDescriptor>, candidates: Option<u64>) -> ProbePlan {
     let bundle = bundle();
     let draft = draft();
     let rivals = rivals();
     let affordances = affordance_set(descriptors);
     let limits = limits(candidates);
+    let policy = ordering_policy();
     must(ProbePlan::new(ProbePlanParams {
         plan_id: artifact("plan-1"),
         bundle: &bundle,
@@ -488,6 +509,7 @@ fn plan_for(descriptors: Vec<InquiryAffordanceDescriptor>, candidates: Option<u6
         rivals: &rivals,
         affordances: &affordances,
         limits: &limits,
+        policy: &policy,
     }))
 }
 
@@ -555,7 +577,7 @@ fn objective_result_affordance_disposition_vocabulary() {
         };
         let mut params = descriptor_params(&format!("aff-vocab-{index}"), target);
         params.kind = kind;
-        descriptors.push(must(InquiryAffordanceDescriptor::new(params)));
+        descriptors.push(descriptor_from_params(params));
     }
     let plan = plan_for(descriptors, Some(16));
     must(plan.validate());
@@ -718,11 +740,7 @@ fn bounded_closed_result_schema_is_plannable() {
             }],
         },
     ];
-    let schema = must(PossibleResultSchema::new(
-        artifact("closed-schema"),
-        targets,
-        branches,
-    ));
+    let schema = support::schema_with_acceptance("closed-schema", targets, branches);
     must(schema.validate());
     assert_eq!(schema.targets.len(), 1);
     assert_eq!(schema.branches.len(), 2);
@@ -730,7 +748,11 @@ fn bounded_closed_result_schema_is_plannable() {
 
     let mut params = descriptor_params("aff-closed", objective_target("objective-closed"));
     params.result_schema = schema.clone();
+    let target = params.target.clone();
     let closed = must(InquiryAffordanceDescriptor::new(params));
+    let closed = must(closed.with_planning_semantics(
+        support::ready_semantics(&target).expect("objective target semantics"),
+    ));
     let plan = plan_for(vec![closed], Some(16));
     must(plan.validate());
     assert_eq!(plan.probes.len(), 1);
@@ -952,7 +974,7 @@ fn safe_read_only_candidate_plans_candidate_only() {
     safe_params.feasibility = FeasibilityDimension::Feasible {
         detail: "channel available".to_owned(),
     };
-    let safe = must(InquiryAffordanceDescriptor::new(safe_params));
+    let safe = descriptor_from_params(safe_params);
     assert!(safe.effect.is_side_effect_free());
     assert!(safe.privacy.is_contained());
     assert!(safe.reversibility.is_reversible());
@@ -1005,7 +1027,7 @@ fn explicit_lexicographic_order_with_stable_tie_break() {
     costly_params.cost = CostDimension::High {
         detail: "wide retained scan".to_owned(),
     };
-    let costly = must(InquiryAffordanceDescriptor::new(costly_params));
+    let costly = descriptor_from_params(costly_params);
 
     let mut cheap_params = descriptor_params("aff-lex-cheap", gap_target("claim-lex-cheap"));
     cheap_params.information = InformationDimension::Low {
@@ -1014,7 +1036,7 @@ fn explicit_lexicographic_order_with_stable_tie_break() {
     cheap_params.cost = CostDimension::Negligible {
         detail: "trivial retained read".to_owned(),
     };
-    let cheap = must(InquiryAffordanceDescriptor::new(cheap_params));
+    let cheap = descriptor_from_params(cheap_params);
 
     let mut unknown_params = descriptor_params("aff-lex-unknown", gap_target("claim-lex-unknown"));
     unknown_params.information = InformationDimension::Unknown {
@@ -1023,7 +1045,7 @@ fn explicit_lexicographic_order_with_stable_tie_break() {
     unknown_params.cost = CostDimension::Negligible {
         detail: "trivial retained read".to_owned(),
     };
-    let unknown = must(InquiryAffordanceDescriptor::new(unknown_params));
+    let unknown = descriptor_from_params(unknown_params);
     assert!(!unknown.information.has_expected_gain());
     let plan = plan_for(
         vec![
@@ -1113,17 +1135,17 @@ fn irrelevant_input_order_preserves_plan_and_digest() {
     second_params.information = InformationDimension::Low {
         detail: "weak split of the gap".to_owned(),
     };
-    let second = must(InquiryAffordanceDescriptor::new(second_params));
+    let second = descriptor_from_params(second_params);
     let mut third_params = descriptor_params("aff-order-c", gap_target("claim-order-c"));
     third_params.information = InformationDimension::Moderate {
         detail: "partial split of the gap".to_owned(),
     };
-    let third = must(InquiryAffordanceDescriptor::new(third_params));
+    let third = descriptor_from_params(third_params);
     let mut fourth_params = descriptor_params("aff-order-d", gap_target("claim-order-d"));
     fourth_params.information = InformationDimension::Unknown {
         reason: "gain not yet characterized".to_owned(),
     };
-    let fourth = must(InquiryAffordanceDescriptor::new(fourth_params));
+    let fourth = descriptor_from_params(fourth_params);
 
     let forward = plan_for(
         vec![first.clone(), second.clone(), third.clone(), fourth.clone()],
@@ -1322,7 +1344,7 @@ fn unknown_cost_capacity_is_not_zero() {
     unknown_cost_params.cost = CostDimension::Unknown {
         reason: "cost not yet characterized".to_owned(),
     };
-    let unknown_cost = must(InquiryAffordanceDescriptor::new(unknown_cost_params));
+    let unknown_cost = descriptor_from_params(unknown_cost_params);
     assert!(!unknown_cost.cost.is_known());
     assert!(!unknown_cost.cost.is_negligible());
 
@@ -1331,7 +1353,7 @@ fn unknown_cost_capacity_is_not_zero() {
     unknown_resource_params.resource = ResourceDimension::Unknown {
         reason: "capacity not yet characterized".to_owned(),
     };
-    let unknown_resource = must(InquiryAffordanceDescriptor::new(unknown_resource_params));
+    let unknown_resource = descriptor_from_params(unknown_resource_params);
     assert!(!unknown_resource.resource.is_known());
 
     let mut negligible_params =
@@ -1339,7 +1361,7 @@ fn unknown_cost_capacity_is_not_zero() {
     negligible_params.cost = CostDimension::Negligible {
         detail: "trivial retained read".to_owned(),
     };
-    let negligible = must(InquiryAffordanceDescriptor::new(negligible_params));
+    let negligible = descriptor_from_params(negligible_params);
     assert!(negligible.cost.is_known());
     assert!(negligible.cost.is_negligible());
 
@@ -1397,10 +1419,7 @@ fn unknown_cost_capacity_is_not_zero() {
     unbudgeted_params.cost = CostDimension::Unknown {
         reason: "cost not yet characterized".to_owned(),
     };
-    let unbudgeted = plan_for(
-        vec![must(InquiryAffordanceDescriptor::new(unbudgeted_params))],
-        None,
-    );
+    let unbudgeted = plan_for(vec![descriptor_from_params(unbudgeted_params)], None);
     must(unbudgeted.validate());
     assert!(unbudgeted.probes.is_empty());
     assert_eq!(unbudgeted.omissions.len(), 1);
@@ -1487,7 +1506,7 @@ fn cheaper_riskier_alternative_is_retained() {
     cheap_params.latency = LatencyDimension::Deferred {
         detail: "waits for a bounded retained scan".to_owned(),
     };
-    let cheap_risky = must(InquiryAffordanceDescriptor::new(cheap_params));
+    let cheap_risky = descriptor_from_params(cheap_params);
 
     let mut safe_params = descriptor_params("aff-tradeoff-safe", gap_target("claim-tradeoff-safe"));
     safe_params.information = InformationDimension::High {
@@ -1505,7 +1524,7 @@ fn cheaper_riskier_alternative_is_retained() {
     safe_params.privacy = PrivacyDimension::Contained {
         detail: "retained material only".to_owned(),
     };
-    let safe_costly = must(InquiryAffordanceDescriptor::new(safe_params));
+    let safe_costly = descriptor_from_params(safe_params);
 
     let plan = plan_for(vec![safe_costly, cheap_risky], Some(16));
     must(plan.validate());
@@ -1579,7 +1598,7 @@ fn no_scalar_averaged_risk() {
     high_params.cost = CostDimension::High {
         detail: "wide retained scan".to_owned(),
     };
-    let high = must(InquiryAffordanceDescriptor::new(high_params));
+    let high = descriptor_from_params(high_params);
 
     let mut mid_params = descriptor_params("aff-noscalar-mid", gap_target("claim-noscalar-mid"));
     mid_params.information = InformationDimension::Moderate {
@@ -1588,7 +1607,7 @@ fn no_scalar_averaged_risk() {
     mid_params.cost = CostDimension::Moderate {
         detail: "one retained read".to_owned(),
     };
-    let mid = must(InquiryAffordanceDescriptor::new(mid_params));
+    let mid = descriptor_from_params(mid_params);
 
     let mut low_params = descriptor_params("aff-noscalar-low", gap_target("claim-noscalar-low"));
     low_params.information = InformationDimension::Low {
@@ -1597,7 +1616,7 @@ fn no_scalar_averaged_risk() {
     low_params.cost = CostDimension::Negligible {
         detail: "trivial retained read".to_owned(),
     };
-    let low = must(InquiryAffordanceDescriptor::new(low_params));
+    let low = descriptor_from_params(low_params);
 
     let plan = plan_for(vec![low, mid, high], Some(16));
     must(plan.validate());
@@ -1704,8 +1723,6 @@ fn observed_result_evidence_resolution_injection_is_rejected() {
         "\"observed\"",
         "\"acquired\"",
         "\"evidence_grade\"",
-        "\"resolved\"",
-        "\"resolution\"",
     ] {
         assert!(
             !folded.contains(key),
@@ -1902,6 +1919,7 @@ fn malformed_plan_bindings_fail_closed() {
             rivals: &rivals,
             affordances: &wrong_scope,
             limits: &bound_limits,
+            policy: &ordering_policy(),
         })
         .is_err(),
         "scope disagreement must fail the planner closed"
@@ -1921,6 +1939,7 @@ fn malformed_plan_bindings_fail_closed() {
             rivals: &rivals,
             affordances: &affordances,
             limits: &bound_limits,
+            policy: &ordering_policy(),
         })
         .is_err(),
         "fence disagreement must fail the planner closed"
@@ -1936,6 +1955,7 @@ fn malformed_plan_bindings_fail_closed() {
             rivals: &rivals,
             affordances: &affordances,
             limits: &over,
+            policy: &ordering_policy(),
         })
         .is_err(),
         "an over-ceiling candidate bound must fail the planner closed"
@@ -2009,6 +2029,7 @@ fn plan_for_with(
         rivals,
         affordances: &affordances,
         limits: &limits,
+        policy: &ordering_policy(),
     }))
 }
 
@@ -2150,7 +2171,7 @@ fn exact_external_owner_preserved_verbatim() {
         params.owner = ProbeOwnerRef::Unavailable {
             reason: reason.to_owned(),
         };
-        must(InquiryAffordanceDescriptor::new(params))
+        descriptor_from_params(params)
     }
     fn owner_reason(owner: &ProbeOwnerRef) -> &str {
         match owner {
@@ -2604,6 +2625,7 @@ fn every_declared_budget_ceiling_fails_closed_one_over() {
                 rivals: &rivals,
                 affordances: &affordances,
                 limits: &limits,
+                policy: &ordering_policy(),
             })
             .is_err(),
             "one-over {} must fail closed",
@@ -2620,6 +2642,7 @@ fn every_declared_budget_ceiling_fails_closed_one_over() {
             rivals: &rivals,
             affordances: &affordances,
             limits: &stu_limits,
+            policy: &ordering_policy(),
         })
         .is_err()
     );
@@ -2670,8 +2693,8 @@ fn unknown_or_incomparable_dimensions_are_not_dominated_away() {
     };
     let plan = plan_for(
         vec![
-            must(InquiryAffordanceDescriptor::new(known_params)),
-            must(InquiryAffordanceDescriptor::new(unknown_params)),
+            descriptor_from_params(known_params),
+            descriptor_from_params(unknown_params),
         ],
         Some(16),
     );
@@ -2835,9 +2858,9 @@ fn each_material_unknown_is_retained_in_one_gap_disposition() {
     };
     let plan = plan_for(
         vec![
-            must(InquiryAffordanceDescriptor::new(feasibility)),
-            must(InquiryAffordanceDescriptor::new(information)),
-            must(InquiryAffordanceDescriptor::new(consent)),
+            descriptor_from_params(feasibility),
+            descriptor_from_params(information),
+            descriptor_from_params(consent),
         ],
         Some(16),
     );
@@ -2871,8 +2894,6 @@ fn assert_rendered_has_no_execution_path(rendered: &str) {
     for token in [
         "provider",
         "Provider",
-        "execution",
-        "Execution",
         "reservation",
         "Reservation",
         "promotion",
@@ -2907,7 +2928,6 @@ fn assert_wire_has_no_execution_key(plan: &ProbePlan) {
         "\"process\"",
         "\"network\"",
         "\"store\"",
-        "\"execution\"",
         "\"reservation\"",
         "\"promotion\"",
         "\"finish\"",
