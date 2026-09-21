@@ -177,12 +177,12 @@ impl ProbeDimensions {
         Ok(())
     }
 
-    /// Lexicographic per-dimension rank: information first, then cost,
-    /// latency, resource, attention, effect, reversibility, privacy, context,
-    /// and consent. Unknown and unavailable sort after every known
-    /// determination inside their own dimension only; ranks never combine
-    /// into a scalar.
-    pub(crate) fn order_key(&self) -> [u8; 10] {
+    /// Lexicographic per-dimension rank in the versioned planner order:
+    /// information, cost, latency, context, resource, privacy, consent,
+    /// authority, effect, reversibility, feasibility, and Human attention.
+    /// Unknown and unavailable sort after every known determination inside
+    /// their own dimension only; ranks never combine into a scalar.
+    pub(crate) fn order_key(&self) -> [u8; 12] {
         [
             match &self.information {
                 InformationDimension::High { .. } => 0,
@@ -205,6 +205,13 @@ impl ProbeDimensions {
                 LatencyDimension::Deferred { .. } => 2,
                 LatencyDimension::Unknown { .. } | LatencyDimension::Unavailable { .. } => 3,
             },
+            match &self.context {
+                ContextDimension::SelfContained { .. } => 0,
+                ContextDimension::Narrow { .. } => 1,
+                ContextDimension::Broad { .. } => 2,
+                ContextDimension::NotApplicable { .. } => 3,
+                ContextDimension::Unknown { .. } | ContextDimension::Unavailable { .. } => 4,
+            },
             match &self.resource {
                 ResourceDimension::Trivial { .. } => 0,
                 ResourceDimension::NotApplicable { .. } => 1,
@@ -212,13 +219,23 @@ impl ProbeDimensions {
                 ResourceDimension::Heavy { .. } => 3,
                 ResourceDimension::Unknown { .. } | ResourceDimension::Unavailable { .. } => 4,
             },
-            match &self.attention {
-                HumanAttentionDimension::Unneeded { .. } => 0,
-                HumanAttentionDimension::NotApplicable { .. } => 1,
-                HumanAttentionDimension::Brief { .. } => 2,
-                HumanAttentionDimension::Sustained { .. } => 3,
-                HumanAttentionDimension::Unknown { .. }
-                | HumanAttentionDimension::Unavailable { .. } => 4,
+            match &self.privacy {
+                PrivacyDimension::Contained { .. } => 0,
+                PrivacyDimension::NotApplicable { .. } => 1,
+                PrivacyDimension::Elevated { .. } => 2,
+                PrivacyDimension::Unknown { .. } | PrivacyDimension::Unavailable { .. } => 3,
+            },
+            match &self.consent {
+                ConsentDimension::Granted { .. } => 0,
+                ConsentDimension::RequiresGrant { .. } => 1,
+                ConsentDimension::Denied { .. } => 2,
+                ConsentDimension::Unknown { .. } | ConsentDimension::Unavailable { .. } => 3,
+            },
+            match &self.authority {
+                AuthorityDimension::Permitted { .. } => 0,
+                AuthorityDimension::RequiresApproval { .. } => 1,
+                AuthorityDimension::Denied { .. } => 2,
+                AuthorityDimension::Unknown { .. } | AuthorityDimension::Unavailable { .. } => 3,
             },
             match &self.effect {
                 EffectDimension::SideEffectFree { .. } => 0,
@@ -232,24 +249,20 @@ impl ProbeDimensions {
                 ReversibilityDimension::Unknown { .. }
                 | ReversibilityDimension::Unavailable { .. } => 2,
             },
-            match &self.privacy {
-                PrivacyDimension::Contained { .. } => 0,
-                PrivacyDimension::NotApplicable { .. } => 1,
-                PrivacyDimension::Elevated { .. } => 2,
-                PrivacyDimension::Unknown { .. } | PrivacyDimension::Unavailable { .. } => 3,
+            match &self.feasibility {
+                FeasibilityDimension::Feasible { .. } => 0,
+                FeasibilityDimension::Infeasible { .. } => 1,
+                FeasibilityDimension::Unknown { .. } | FeasibilityDimension::Unavailable { .. } => {
+                    2
+                }
             },
-            match &self.context {
-                ContextDimension::SelfContained { .. } => 0,
-                ContextDimension::Narrow { .. } => 1,
-                ContextDimension::Broad { .. } => 2,
-                ContextDimension::NotApplicable { .. } => 3,
-                ContextDimension::Unknown { .. } | ContextDimension::Unavailable { .. } => 4,
-            },
-            match &self.consent {
-                ConsentDimension::Granted { .. } => 0,
-                ConsentDimension::RequiresGrant { .. } => 1,
-                ConsentDimension::Denied { .. } => 2,
-                ConsentDimension::Unknown { .. } | ConsentDimension::Unavailable { .. } => 3,
+            match &self.attention {
+                HumanAttentionDimension::Unneeded { .. } => 0,
+                HumanAttentionDimension::NotApplicable { .. } => 1,
+                HumanAttentionDimension::Brief { .. } => 2,
+                HumanAttentionDimension::Sustained { .. } => 3,
+                HumanAttentionDimension::Unknown { .. }
+                | HumanAttentionDimension::Unavailable { .. } => 4,
             },
         ]
     }
@@ -325,7 +338,7 @@ impl ProbeProposal {
 
 /// Total plan order key for one probe: the preserved-dimension rank with the
 /// probe identity as the final tiebreak.
-pub(crate) fn probe_order_key(probe: &ProbeProposal) -> ([u8; 10], &str) {
+pub(crate) fn probe_order_key(probe: &ProbeProposal) -> ([u8; 12], &str) {
     (probe.dimensions.order_key(), probe.probe_id.as_str())
 }
 
@@ -337,7 +350,8 @@ pub enum OmissionKind {
     Unprobeable,
     /// A ranked proposal does not fit the admitted candidate bound.
     OverBudget,
-    /// Standing is not permitted or consent is denied for the target.
+    /// Standing, consent, privacy, effect, reversibility, or mandatory
+    /// Human-attention safety is not admitted for the target.
     AuthorityBlocked,
 }
 
@@ -545,6 +559,7 @@ impl ProbePlan {
     fn validate_probe_table(&self) -> Result<(), ContractViolation> {
         for (index, probe) in self.probes.iter().enumerate() {
             probe.validate()?;
+            crate::plan::validate_ready_probe(probe)?;
             let rank = u32::try_from(index).map_err(|_| ContractViolation::OutOfBounds {
                 field: "probe_plan.probes",
                 min: 0,

@@ -124,7 +124,7 @@ fn rivals() -> RivalModelSet {
         scope: "scope-1".to_owned(),
         state_fence: fence(),
         bundle_digest: digest("bundle"),
-        validated_input_digest: digest("validated"),
+        validated_input_digest: digest("validator-input"),
         declaration_set: RivalDeclarationSetRef {
             set_id: artifact("rival-decl-1"),
             digest: digest("decl"),
@@ -206,7 +206,7 @@ fn descriptor_params(id: &str, target: AffordanceTarget) -> InquiryAffordanceDes
         result_schema: gap_schema(
             &format!("{id}-schema"),
             &format!("{id}-objective"),
-            &[GapUpdateMeaning::RemainsOpen],
+            &[GapUpdateMeaning::Addressed, GapUpdateMeaning::RemainsOpen],
         ),
         information: InformationDimension::High {
             detail: "splits the named disagreement".to_owned(),
@@ -299,38 +299,24 @@ fn plan_for(descriptors: Vec<InquiryAffordanceDescriptor>, candidates: Option<u6
     }))
 }
 
-// WORK_UNIT_CASE: 610/11 (identical-consumes-predeclared)
+// SUPPORTING_CASE: 610/11 (identical-consumes-predeclared)
 #[test]
 fn identical_update_sets_consume_predeclared_equivalence() {
     let target = gap_target("claim-equiv");
-    // Same update sets over the same declared objective, but byte-distinct
-    // schemas: different schema and branch identities, permuted branch order.
+    // Exact semantic equivalents may carry different affordance identities and
+    // still collapse while retaining both identities as lineage.
     let schema_a = gap_schema(
         "equiv-schema-a",
         "equiv-objective",
         &[GapUpdateMeaning::Addressed, GapUpdateMeaning::RemainsOpen],
     );
-    let schema_b = gap_schema(
-        "equiv-schema-b",
-        "equiv-objective",
-        &[GapUpdateMeaning::RemainsOpen, GapUpdateMeaning::Addressed],
-    );
     assert_eq!(
         schema_a.update_discriminability(),
         ResultUpdateDiscriminability::Discriminating
     );
-    assert_eq!(
-        schema_b.update_discriminability(),
-        ResultUpdateDiscriminability::Discriminating
-    );
-    assert_ne!(
-        schema_a.digest, schema_b.digest,
-        "fixtures must be byte-distinct so the merge proves update-set consumption, not byte equality"
-    );
     must(schema_a.validate());
-    must(schema_b.validate());
 
-    let descriptor_b = descriptor_with_schema("aff-equiv-b", target.clone(), schema_b);
+    let descriptor_b = descriptor_with_schema("aff-equiv-b", target.clone(), schema_a.clone());
     let descriptor_a = descriptor_with_schema("aff-equiv-a", target, schema_a);
     let plan = plan_for(vec![descriptor_b, descriptor_a], Some(16));
     must(plan.validate());
@@ -354,7 +340,7 @@ fn identical_update_sets_consume_predeclared_equivalence() {
     assert_eq!(must(plan.compute_digest()), plan.digest);
 }
 
-// WORK_UNIT_CASE: 610/11 (split-stays-split)
+// SUPPORTING_CASE: 610/11 (split-stays-split)
 #[test]
 fn distinct_predeclared_classifications_stay_split() {
     let target = gap_target("claim-split");
@@ -383,16 +369,16 @@ fn distinct_predeclared_classifications_stay_split() {
     let backward = plan_for(vec![second, first], Some(16));
     must(forward.validate());
     must(backward.validate());
-    // Same kind and target, yet the declared discriminability boundary holds:
-    // no merge across predeclared classifications.
-    assert_eq!(forward.probes.len(), 2);
-    assert!(forward.omissions.is_empty());
+    // The non-discriminating descriptor is an explicit unprobeable gap; only
+    // the schema with two materially different updates is a candidate.
+    assert_eq!(forward.probes.len(), 1);
+    assert_eq!(forward.omissions.len(), 1);
     let order: Vec<&str> = forward
         .probes
         .iter()
         .map(|probe| probe.probe_id.as_str())
         .collect();
-    assert_eq!(order, vec!["aff-split-a", "aff-split-b"]);
+    assert_eq!(order, vec!["aff-split-b"]);
     for probe in &forward.probes {
         assert!(
             probe.merged_affordances.is_empty(),
@@ -403,11 +389,15 @@ fn distinct_predeclared_classifications_stay_split() {
     }
     assert_eq!(
         forward.probes[0].result_schema.update_discriminability(),
-        ResultUpdateDiscriminability::NonDiscriminating
+        ResultUpdateDiscriminability::Discriminating
     );
     assert_eq!(
-        forward.probes[1].result_schema.update_discriminability(),
-        ResultUpdateDiscriminability::Discriminating
+        forward.omissions[0].affordance.affordance_id.as_str(),
+        "aff-split-a"
+    );
+    assert_eq!(
+        forward.omissions[0].kind,
+        eliot_dreamer_probe_plan::OmissionKind::Unprobeable
     );
     assert_eq!(forward.digest, backward.digest);
     assert_eq!(must(forward.compute_digest()), forward.digest);

@@ -10,13 +10,16 @@
 //!   unknown feasibility never reads as feasible;
 //! * information with no expected gain (`NO_GAIN`, `UNAVAILABLE`) is
 //!   unprobeable; unknown gain stays plannable but ranks after known gain;
-//! * authority other than `PERMITTED` — including unknown — and denied
-//!   consent are authority-blocked; permission is described, never granted;
+//! * authority other than `PERMITTED` — including unknown — and consent other
+//!   than `GRANTED` are authority-blocked; permission is described, never
+//!   granted;
+//! * privacy other than contained/not-applicable, effect other than
+//!   side-effect-free/observable-only, reversibility other than reversible,
+//!   and unknown Human-attention requirements are authority-blocked;
 //! * a descriptor whose applicability scope differs from the plan scope is
 //!   unprobeable for this plan;
-//! * consent, privacy, effect, reversibility, cost, latency, resource,
-//!   context, and attention stay visible in the preserved vector and never
-//!   block: this planner decides no policy.
+//! * cost, latency, context, and resource remain visible advisory vectors;
+//!   they do not cross-subsidize one another or scalarize the order.
 //!
 //! Budget admission counts ranked proposals against the exact `candidates`
 //! limit. An unknown (`None`) candidate limit admits nothing: every ranked
@@ -27,8 +30,10 @@ use std::collections::BTreeMap;
 
 use eliot_dreamer_contracts::{
     AuthorityDimension, BudgetLimits, ConsentDimension, ContractViolation, DreamInputBundle,
-    FeasibilityDimension, InformationDimension, InquiryAffordanceDescriptor, InquiryAffordanceSet,
-    ProbeAffordanceRef, ResultUpdateDiscriminability, RivalModelSet, ValidatedDreamDraft,
+    EffectDimension, FeasibilityDimension, GapUpdateMeaning, HumanAttentionDimension,
+    InformationDimension, InquiryAffordanceDescriptor, InquiryAffordanceSet, PossibleResultSchema,
+    PrivacyDimension, ProbeAffordanceRef, ResultTarget, ResultUpdate, ResultUpdateDiscriminability,
+    ReversibilityDimension, RivalModelSet, RivalUpdateMeaning, ValidatedDreamDraft,
     error::len_i64,
     grounding::canonical::{ArtifactId, TaskId},
 };
@@ -128,6 +133,35 @@ fn bound_context(
             });
         }
     }
+    for (got, want, field) in [
+        (
+            receipt.job_id.as_str(),
+            bundle.job_id.as_str(),
+            "probe_plan.job_id",
+        ),
+        (
+            receipt.manifest_digest.as_str(),
+            bundle.manifest_digest.as_str(),
+            "probe_plan.manifest_digest",
+        ),
+        (
+            rivals.bundle_digest.as_str(),
+            receipt.bundle_digest.as_str(),
+            "probe_plan.rivals.bundle_digest",
+        ),
+        (
+            rivals.validated_input_digest.as_str(),
+            receipt.input_digest.as_str(),
+            "probe_plan.rivals.validated_input_digest",
+        ),
+    ] {
+        if got != want {
+            return Err(ContractViolation::BindingMismatch {
+                field,
+                reason: "bound source identity does not match the validated draft".to_owned(),
+            });
+        }
+    }
     for (fence, field) in [
         (&bundle.state_fence, "probe_plan.bundle.state_fence"),
         (&draft.state_fence, "probe_plan.draft.state_fence"),
@@ -176,14 +210,12 @@ struct DescriptorGroup {
 
 /// Classifies every descriptor and collapses duplicates deterministically.
 ///
-/// Duplicate collapse consumes only the A-03 predeclared update-set
-/// classification (issue 610/11): two descriptors collapse onto one group
-/// only when they share the planner-owned `(kind, target)` collapse key,
-/// the planner-owned admission class, and the A-03 predeclared
-/// [`ResultUpdateDiscriminability`] of their result schemas. Descriptors
-/// whose schemas the A-03 vocabulary classifies differently stay split, so
-/// the planner never merges across a declared discriminability boundary and
-/// performs zero update, meaning, or materiality inference of its own.
+/// Duplicate collapse consumes the A-03 predeclared update-set
+/// classification (issue 610/11) and a complete semantic equivalence key:
+/// kind, target, applicability, owner, result schema, and every planning
+/// dimension must agree. Descriptor identities and their digest-pinned
+/// lineage are the only fields allowed to differ. The planner performs no
+/// update, meaning, or materiality inference of its own.
 fn classify_descriptors(
     affordances: &InquiryAffordanceSet,
     scope: &BoundContext,
@@ -227,14 +259,30 @@ fn classify_one(
         feasibility: descriptor.feasibility.clone(),
         attention: descriptor.attention.clone(),
     };
-    let class = classify_dimensions(&dimensions, &descriptor.applicability.scope, scope);
+    let class = classify_dimensions(
+        &dimensions,
+        &descriptor.applicability.scope,
+        scope,
+        &target,
+        &descriptor.result_schema,
+    );
     let order = match &class {
         DescriptorClass::Plannable => 0,
         DescriptorClass::Gap(OmissionKind::Unprobeable, _) => 1,
         DescriptorClass::Gap(OmissionKind::OverBudget, _) => 2,
         DescriptorClass::Gap(OmissionKind::AuthorityBlocked, _) => 3,
     };
-    let collapse = bounds::canonical_digest(&(&descriptor.kind, &target))?;
+    // The collapse key excludes only the descriptor's own identity and digest.
+    // Every semantic field remains part of equivalence, so a cheaper/riskier
+    // or differently declared result is never erased by a coarse label.
+    let collapse = bounds::canonical_digest(&(
+        &descriptor.kind,
+        &target,
+        &descriptor.applicability,
+        &descriptor.owner,
+        &descriptor.result_schema,
+        &dimensions,
+    ))?;
     Ok(DescriptorGroup {
         order,
         kind: descriptor.kind,
@@ -282,12 +330,20 @@ fn merge_group(
     Ok(())
 }
 
-/// Closed gating policy over feasibility, information, authority, consent,
-/// and applicability scope. Every other dimension stays advisory.
+/// Closed gating policy over applicability, feasibility, information,
+/// authority, consent, privacy, effect, reversibility, Human attention, and
+/// result-matrix discrimination. Cost, latency, context, and resource remain
+/// advisory vectors because this package has no per-candidate usage contract.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the closed readiness gates must preserve each independent dimension"
+)]
 fn classify_dimensions(
     dimensions: &ProbeDimensions,
     applicability_scope: &str,
     scope: &str,
+    target: &ProbeTarget,
+    result_schema: &PossibleResultSchema,
 ) -> DescriptorClass {
     if applicability_scope != scope {
         return DescriptorClass::Gap(
@@ -315,6 +371,9 @@ fn classify_dimensions(
                 format!("feasibility declares UNAVAILABLE: {reason}"),
             );
         }
+    }
+    if let Some(reason) = result_matrix_block_reason(target, result_schema) {
+        return DescriptorClass::Gap(OmissionKind::Unprobeable, reason);
     }
     match &dimensions.information {
         InformationDimension::High { .. }
@@ -362,18 +421,289 @@ fn classify_dimensions(
         }
     }
     match &dimensions.consent {
+        ConsentDimension::Granted { .. } => {}
+        ConsentDimension::RequiresGrant { reason } => {
+            return DescriptorClass::Gap(
+                OmissionKind::AuthorityBlocked,
+                format!("consent declares REQUIRES_GRANT: {reason}"),
+            );
+        }
         ConsentDimension::Denied { reason } => {
             return DescriptorClass::Gap(
                 OmissionKind::AuthorityBlocked,
                 format!("consent declares DENIED: {reason}"),
             );
         }
-        ConsentDimension::Granted { .. }
-        | ConsentDimension::RequiresGrant { .. }
-        | ConsentDimension::Unknown { .. }
-        | ConsentDimension::Unavailable { .. } => {}
+        ConsentDimension::Unknown { reason } => {
+            return DescriptorClass::Gap(
+                OmissionKind::AuthorityBlocked,
+                format!("consent declares UNKNOWN: {reason}"),
+            );
+        }
+        ConsentDimension::Unavailable { reason } => {
+            return DescriptorClass::Gap(
+                OmissionKind::AuthorityBlocked,
+                format!("consent declares UNAVAILABLE: {reason}"),
+            );
+        }
+    }
+    match &dimensions.privacy {
+        PrivacyDimension::Contained { .. } | PrivacyDimension::NotApplicable { .. } => {}
+        PrivacyDimension::Elevated { reason } => {
+            return DescriptorClass::Gap(
+                OmissionKind::AuthorityBlocked,
+                format!("privacy declares ELEVATED: {reason}"),
+            );
+        }
+        PrivacyDimension::Unknown { reason } => {
+            return DescriptorClass::Gap(
+                OmissionKind::AuthorityBlocked,
+                format!("privacy declares UNKNOWN: {reason}"),
+            );
+        }
+        PrivacyDimension::Unavailable { reason } => {
+            return DescriptorClass::Gap(
+                OmissionKind::AuthorityBlocked,
+                format!("privacy declares UNAVAILABLE: {reason}"),
+            );
+        }
+    }
+    match &dimensions.effect {
+        EffectDimension::SideEffectFree { .. } | EffectDimension::ObservableOnly { .. } => {}
+        EffectDimension::StateChanging { detail } => {
+            return DescriptorClass::Gap(
+                OmissionKind::AuthorityBlocked,
+                format!("effect declares STATE_CHANGING and requires external admission: {detail}"),
+            );
+        }
+        EffectDimension::Unknown { reason } | EffectDimension::Unavailable { reason } => {
+            return DescriptorClass::Gap(
+                OmissionKind::AuthorityBlocked,
+                format!(
+                    "effect declares UNKNOWN_OR_UNAVAILABLE and needs reconciliation: {reason}"
+                ),
+            );
+        }
+    }
+    match &dimensions.reversibility {
+        ReversibilityDimension::Reversible { .. } => {}
+        ReversibilityDimension::Irreversible { reason }
+        | ReversibilityDimension::Unknown { reason }
+        | ReversibilityDimension::Unavailable { reason } => {
+            return DescriptorClass::Gap(
+                OmissionKind::AuthorityBlocked,
+                format!(
+                    "reversibility is not admitted and needs external rollback authority: {reason}"
+                ),
+            );
+        }
+    }
+    match &dimensions.attention {
+        HumanAttentionDimension::Unknown { reason }
+        | HumanAttentionDimension::Unavailable { reason } => {
+            return DescriptorClass::Gap(
+                OmissionKind::AuthorityBlocked,
+                format!("Human-attention requirement is unknown: {reason}"),
+            );
+        }
+        HumanAttentionDimension::Unneeded { .. }
+        | HumanAttentionDimension::Brief { .. }
+        | HumanAttentionDimension::Sustained { .. }
+        | HumanAttentionDimension::NotApplicable { .. } => {}
     }
     DescriptorClass::Plannable
+}
+
+/// Returns a bounded reason when the supplied result matrix cannot establish
+/// a discriminative candidate for the declared target. The A-03 contract owns
+/// update-set equality; this layer only checks that the predeclared difference
+/// is relevant to the target and contains a meaningful falsifying branch.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the bounded matrix proof keeps every rejection reason explicit"
+)]
+fn result_matrix_block_reason(
+    target: &ProbeTarget,
+    schema: &PossibleResultSchema,
+) -> Option<String> {
+    if schema.branches.len() < 2 {
+        return Some("result matrix needs at least two possible outcomes".to_owned());
+    }
+    if schema.update_discriminability() != ResultUpdateDiscriminability::Discriminating {
+        return Some("result matrix updates are identical for every outcome".to_owned());
+    }
+
+    let relevant_targets = schema
+        .targets
+        .iter()
+        .filter(|result_target| result_target_is_relevant(target, result_target))
+        .count();
+    if matches!(target, ProbeTarget::RivalDisagreement { .. }) && relevant_targets < 2 {
+        return Some(
+            "result matrix must name both rival endpoints or a rival and an unknown frontier"
+                .to_owned(),
+        );
+    }
+    if relevant_targets == 0 {
+        return Some("result matrix does not update the declared target".to_owned());
+    }
+
+    let branch_updates: Vec<Vec<&ResultUpdate>> = schema
+        .branches
+        .iter()
+        .map(|branch| {
+            branch
+                .updates
+                .iter()
+                .filter(|update| {
+                    result_update_is_relevant(target, update) && meaningful_update(update)
+                })
+                .collect()
+        })
+        .collect();
+    if branch_updates.iter().all(Vec::is_empty) {
+        return Some("result matrix has no meaningful rival or gap update".to_owned());
+    }
+    let differs = branch_updates.iter().enumerate().any(|(index, left)| {
+        branch_updates[index + 1..]
+            .iter()
+            .any(|right| left != right)
+    });
+    if !differs {
+        return Some("result matrix has no relevant outcome difference".to_owned());
+    }
+
+    match target {
+        ProbeTarget::RivalDisagreement { .. } => {
+            let has_strengthened = branch_updates.iter().flatten().any(|update| {
+                matches!(
+                    update,
+                    ResultUpdate::Rival {
+                        meaning: RivalUpdateMeaning::Strengthened,
+                        ..
+                    }
+                )
+            });
+            let has_weakened = branch_updates.iter().flatten().any(|update| {
+                matches!(
+                    update,
+                    ResultUpdate::Rival {
+                        meaning: RivalUpdateMeaning::Weakened,
+                        ..
+                    }
+                )
+            });
+            if !has_strengthened || !has_weakened {
+                return Some(
+                    "rival result matrix is confirmation-only; it needs a falsifying branch"
+                        .to_owned(),
+                );
+            }
+        }
+        ProbeTarget::EvidenceUnknown { .. }
+        | ProbeTarget::AssumptionUnknown { .. }
+        | ProbeTarget::ObjectiveUnknown { .. } => {
+            let has_open = branch_updates.iter().flatten().any(|update| {
+                matches!(
+                    update,
+                    ResultUpdate::Gap {
+                        meaning: GapUpdateMeaning::RemainsOpen,
+                        ..
+                    }
+                )
+            });
+            let has_progress = branch_updates.iter().flatten().any(|update| {
+                matches!(
+                    update,
+                    ResultUpdate::Gap {
+                        meaning: GapUpdateMeaning::Addressed | GapUpdateMeaning::PartiallyAddressed,
+                        ..
+                    }
+                )
+            });
+            if !has_open || !has_progress {
+                return Some(
+                    "gap result matrix is confirmation-only; it needs an open and a progress branch"
+                        .to_owned(),
+                );
+            }
+        }
+    }
+    None
+}
+
+fn result_target_is_relevant(target: &ProbeTarget, result_target: &ResultTarget) -> bool {
+    match (target, result_target) {
+        (
+            ProbeTarget::RivalDisagreement { left, right },
+            ResultTarget::Rival { prediction, .. },
+        ) => prediction
+            .as_ref()
+            .is_none_or(|prediction| prediction == left || prediction == right),
+        (
+            ProbeTarget::EvidenceUnknown { .. } | ProbeTarget::AssumptionUnknown { .. },
+            ResultTarget::Gap { .. },
+        ) => true,
+        (ProbeTarget::ObjectiveUnknown { objective }, ResultTarget::Gap { objective: result }) => {
+            objective == result
+        }
+        _ => false,
+    }
+}
+
+fn result_update_is_relevant(target: &ProbeTarget, update: &ResultUpdate) -> bool {
+    match update {
+        ResultUpdate::Rival {
+            model,
+            prediction,
+            meaning: _,
+        } => result_target_is_relevant(
+            target,
+            &ResultTarget::Rival {
+                model: model.clone(),
+                prediction: prediction.clone(),
+            },
+        ),
+        ResultUpdate::Gap { objective, .. } => result_target_is_relevant(
+            target,
+            &ResultTarget::Gap {
+                objective: objective.clone(),
+            },
+        ),
+        ResultUpdate::Unknown {
+            target: update_target,
+            ..
+        } => result_target_is_relevant(target, update_target),
+    }
+}
+
+fn meaningful_update(update: &ResultUpdate) -> bool {
+    match update {
+        // `Unchanged` and `RemainsOpen` are meaningful negative outcomes:
+        // they are the falsifying side of a confirmation/progress split.
+        ResultUpdate::Rival { .. } | ResultUpdate::Gap { .. } => true,
+        ResultUpdate::Unknown { .. } => false,
+    }
+}
+
+/// Reapplies the ready-candidate gates when a plan is validated after
+/// deserialization or caller-side construction. The source applicability
+/// scope is not carried by a proposal, so shape validation uses an equal
+/// synthetic scope and checks the remaining closed gates here.
+pub(crate) fn validate_ready_probe(probe: &ProbeProposal) -> Result<(), ContractViolation> {
+    match classify_dimensions(
+        &probe.dimensions,
+        "",
+        "",
+        &probe.target,
+        &probe.result_schema,
+    ) {
+        DescriptorClass::Plannable => Ok(()),
+        DescriptorClass::Gap(kind, reason) => Err(ContractViolation::BindingMismatch {
+            field: "probe_plan.probe",
+            reason: format!("candidate is not ready ({kind:?}): {reason}"),
+        }),
+    }
 }
 
 /// Sorts plannable groups by the vector-preserving order and assigns ranks.
