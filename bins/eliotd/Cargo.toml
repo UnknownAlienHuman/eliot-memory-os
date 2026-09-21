@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 eliot-agent-api.workspace = true
+eliot-agent-bridge-core.workspace = true
 eliot-agent-contracts.workspace = true
 eliot-agent-coordinator.workspace = true
 eliot-authority.workspace = true

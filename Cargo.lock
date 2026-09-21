@@ -637,7 +637,11 @@ name = "eliot-agent-bridge"
 version = "0.1.0"
 dependencies = [
  "eliot-agent-bridge-core",
+ "eliot-agent-contracts",
+ "eliot-context-contracts",
  "eliot-contracts",
+ "eliot-cue-contracts",
+ "eliot-evidence",
  "eliot-governor",
  "eliot-integration-coverage",
  "eliot-ipc",
@@ -1811,7 +1815,9 @@ dependencies = [
 name = "eliot-host-service"
 version = "0.1.0"
 dependencies = [
+ "eliot-agent-contracts",
  "eliot-contracts",
+ "eliot-host-state",
  "eliot-kernel-service",
  "eliot-platform",
  "eliot-platform-windows",
@@ -3095,6 +3101,7 @@ name = "eliotd"
 version = "0.1.0"
 dependencies = [
  "eliot-agent-api",
+ "eliot-agent-bridge-core",
  "eliot-agent-contracts",
  "eliot-agent-coordinator",
  "eliot-authority",

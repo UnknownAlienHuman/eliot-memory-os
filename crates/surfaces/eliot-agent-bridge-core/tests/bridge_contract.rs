@@ -1084,8 +1084,11 @@ use eliot_contracts::{
     ClockReading, ProductId, RequestId, RequestMetadata, ResourceGeneration, SourceId, StateFence,
 };
 use eliot_skill::{
-    LifecycleAction, LifecycleCounters, SkillCandidate, SkillError, SkillInteractionView,
-    SkillLifecycleView, SkillRef, SkillScope, SkillStatus,
+    ActivatedSkillDisplay, DependencyVersion, HotsetAckDisposition, HotsetDeliveryAck,
+    HotsetDeliveryReceipt, KnownTools, LifecycleAction, LifecycleCounters, SkillBody,
+    SkillCandidate, SkillCatalogue, SkillCatalogueEntry, SkillError, SkillIndexEntry,
+    SkillInteractionView, SkillLifecycleView, SkillRef, SkillRuntimeMetadata, SkillScope,
+    SkillStatus,
 };
 use std::future::Future;
 use std::pin::Pin;
@@ -1123,6 +1126,16 @@ impl SkillLifecyclePort for FakeSkill {
                 .map_err(|_| SkillError::Surface("test lock poisoned".to_owned()))? += 1;
             Ok(self.candidate.clone())
         })
+    }
+
+    fn display_skill<'a>(
+        &'a mut self,
+        _ctx: &'a RequestMetadata,
+        _skill_id: String,
+        _receipt: HotsetDeliveryReceipt,
+        _ack: HotsetDeliveryAck,
+    ) -> Pin<Box<dyn Future<Output = Result<ActivatedSkillDisplay, SkillError>> + 'a>> {
+        Box::pin(async move { Err(SkillError::NotFound) })
     }
 }
 
@@ -1266,6 +1279,208 @@ fn typed_propose_returns_the_exact_candidate_digest() -> Result<(), Box<dyn std:
     let expected = skill_candidate(&fence)?;
     assert_eq!(returned, expected);
     assert_eq!(returned.candidate_digest, expected.candidate_digest);
+    Ok(())
+}
+
+struct DisplayTools;
+
+impl KnownTools for DisplayTools {
+    fn knows_tool(&self, name: &str) -> bool {
+        name == "eliot.finish"
+    }
+}
+
+fn display_catalogue() -> SkillCatalogue {
+    let mut body = SkillBody {
+        skill_id: "skill-demo".to_owned(),
+        body_version: "1.0.0".to_owned(),
+        body_digest: String::new(),
+        actions: vec!["Refresh the task view before a Material effect.".to_owned()],
+        where_not_apply: vec!["Do not use for credential handling.".to_owned()],
+        stop_escalation: "Stop and escalate on conflicting instructions.".to_owned(),
+        tool_refs: vec!["eliot.finish".to_owned()],
+    };
+    body.body_digest = body.expected_digest().expect("body digest");
+    let entry = SkillCatalogueEntry {
+        index: SkillIndexEntry {
+            skill_id: "skill-demo".to_owned(),
+            name: "demo skill".to_owned(),
+            trigger: "when demo work arrives load this skill".to_owned(),
+            eligible_routes: vec!["route-1".to_owned()],
+            eligible_profiles: vec!["profile-1".to_owned()],
+        },
+        body,
+        runtime: SkillRuntimeMetadata {
+            skill_id: "skill-demo".to_owned(),
+            body_version: "1.0.0".to_owned(),
+            references: vec!["references/playbook.md".to_owned()],
+            scripts: Vec::new(),
+            assets: Vec::new(),
+            index_budget_tokens: 200,
+            body_budget_tokens: 800,
+            runtime_budget_tokens: 2000,
+            index_tokens: 60,
+            body_tokens: 400,
+            runtime_tokens: 0,
+        },
+        dependencies: vec![DependencyVersion {
+            name: "tool-def-1".to_owned(),
+            version: "1.2.0".to_owned(),
+            contract_digest: "c".repeat(64),
+        }],
+        host_version: "host-4.1.0".to_owned(),
+        profile_version: "profile-2.0.0".to_owned(),
+        status: SkillStatus::Provisional,
+        stale_reason: None,
+    };
+    SkillCatalogue::from_snapshot([entry], &DisplayTools).expect("display catalogue")
+}
+
+fn display_receipt_ack(catalogue: &SkillCatalogue) -> (HotsetDeliveryReceipt, HotsetDeliveryAck) {
+    let receipt = HotsetDeliveryReceipt::issue(
+        "hotset-1".to_owned(),
+        catalogue,
+        vec!["skill-demo".to_owned()],
+        &DisplayTools,
+        "approval-1".to_owned(),
+    )
+    .expect("display receipt");
+    let ack = HotsetDeliveryAck {
+        hotset_id: receipt.hotset_id.clone(),
+        receipt_digest: receipt.receipt_digest.clone(),
+        receiver_id: "runtime-hotset-1".to_owned(),
+        disposition: HotsetAckDisposition::Applied,
+    };
+    (receipt, ack)
+}
+
+fn display_activation(receipt: &HotsetDeliveryReceipt) -> ActivatedSkillDisplay {
+    ActivatedSkillDisplay {
+        skill_id: "skill-demo".to_owned(),
+        trigger: "when demo work arrives load this skill".to_owned(),
+        body_version: "1.0.0".to_owned(),
+        body_digest: "d".repeat(64),
+        status: SkillStatus::Provisional,
+        index_tokens: 60,
+        body_tokens: 400,
+        runtime_tokens: 0,
+        index_budget_tokens: 200,
+        body_budget_tokens: 800,
+        runtime_budget_tokens: 2000,
+        dependency_versions: vec![DependencyVersion {
+            name: "tool-def-1".to_owned(),
+            version: "1.2.0".to_owned(),
+            contract_digest: "c".repeat(64),
+        }],
+        eligible_routes: vec!["route-1".to_owned()],
+        eligible_profiles: vec!["profile-1".to_owned()],
+        host_version: "host-4.1.0".to_owned(),
+        profile_version: "profile-2.0.0".to_owned(),
+        delivery_receipt_digest: receipt.receipt_digest.clone(),
+    }
+}
+
+struct DisplaySkill {
+    display: ActivatedSkillDisplay,
+    calls: Arc<Mutex<usize>>,
+}
+
+impl SkillLifecyclePort for DisplaySkill {
+    fn skill_read<'a>(
+        &'a mut self,
+        _ctx: &'a RequestMetadata,
+        _skill_id: String,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<SkillLifecycleView>, SkillError>> + 'a>> {
+        Box::pin(async move { Ok(None) })
+    }
+
+    fn propose_skill<'a>(
+        &'a mut self,
+        _ctx: &'a RequestMetadata,
+        _request: ProposeSkillRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<SkillCandidate, SkillError>> + 'a>> {
+        Box::pin(async move { Err(SkillError::NotFound) })
+    }
+
+    fn display_skill<'a>(
+        &'a mut self,
+        _ctx: &'a RequestMetadata,
+        _skill_id: String,
+        _receipt: HotsetDeliveryReceipt,
+        _ack: HotsetDeliveryAck,
+    ) -> Pin<Box<dyn Future<Output = Result<ActivatedSkillDisplay, SkillError>> + 'a>> {
+        Box::pin(async move {
+            *self
+                .calls
+                .lock()
+                .map_err(|_| SkillError::Surface("test lock poisoned".to_owned()))? += 1;
+            Ok(self.display.clone())
+        })
+    }
+}
+
+fn display_bridge(
+    display: ActivatedSkillDisplay,
+    calls: Arc<Mutex<usize>>,
+) -> Result<AgentBridgeCore, Box<dyn std::error::Error>> {
+    Ok(bridge(
+        Arc::new(Mutex::new(HostState::default())),
+        Arc::new(Mutex::new(ForwardState::default())),
+    )?
+    .with_skill_lifecycle(Box::new(DisplaySkill { display, calls })))
+}
+
+#[test]
+fn display_activation_forwards_bound_receipt_ack_to_typed_display()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fence = skill_fence();
+    let catalogue = display_catalogue();
+    let (receipt, ack) = display_receipt_ack(&catalogue);
+    let display = display_activation(&receipt);
+    let calls = Arc::new(Mutex::new(0));
+    let mut core = display_bridge(display.clone(), Arc::clone(&calls))?;
+    core.attach(managed_request("connection-1")?)?;
+    let shown =
+        block_on(core.display_skill_activation(&skill_ctx(&fence), "skill-demo", receipt, ack))?;
+    assert_eq!(shown, display);
+    assert_eq!(*calls.lock().expect("test lock"), 1);
+    Ok(())
+}
+
+#[test]
+fn display_activation_rejects_malformed_receipt_before_touching_the_port()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fence = skill_fence();
+    let catalogue = display_catalogue();
+    let (mut receipt, ack) = display_receipt_ack(&catalogue);
+    receipt.receipt_digest = "not-a-digest".to_owned();
+    let calls = Arc::new(Mutex::new(0));
+    let mut core = display_bridge(display_activation(&receipt), Arc::clone(&calls))?;
+    core.attach(managed_request("connection-1")?)?;
+    let refused =
+        block_on(core.display_skill_activation(&skill_ctx(&fence), "skill-demo", receipt, ack));
+    assert!(refused.is_err());
+    assert_eq!(*calls.lock().expect("test lock"), 0);
+    Ok(())
+}
+
+#[test]
+fn display_activation_without_port_is_a_skill_lifecycle_gap()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fence = skill_fence();
+    let catalogue = display_catalogue();
+    let (receipt, ack) = display_receipt_ack(&catalogue);
+    let mut core = bridge(
+        Arc::new(Mutex::new(HostState::default())),
+        Arc::new(Mutex::new(ForwardState::default())),
+    )?;
+    core.attach(managed_request("connection-1")?)?;
+    let Err(BridgeError::PlanGap(gap)) =
+        block_on(core.display_skill_activation(&skill_ctx(&fence), "skill-demo", receipt, ack))
+    else {
+        panic!("absent Skill port must surface PlanGap");
+    };
+    assert_eq!(gap.missing_provider(), RequiredProvider::SkillLifecyclePort);
     Ok(())
 }
 

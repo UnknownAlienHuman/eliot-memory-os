@@ -556,6 +556,44 @@ impl SkillCatalogue {
         Ok(true)
     }
 
+    /// Marks the entry stale when the live Tool Definition version moved
+    /// past the version the entry was admitted under (`I7.13`).
+    ///
+    /// A changed Tool Definition version marks the Skill stale: the delivery
+    /// act admitted `admitted_version`, while the live canonical source now
+    /// binds `live_version`. The entry keeps its pinned state and gains a
+    /// `Stale` status with a reason naming both versions, blocking Material
+    /// use and redelivery until revalidated (reinstall under the new
+    /// version) or governed review. Quarantined and already-stale entries
+    /// report no change, as does agreement (no drift to mark). Returns `true`
+    /// when the entry became stale.
+    pub fn mark_definition_drift_stale(
+        &mut self,
+        skill_id: &str,
+        live_version: &str,
+        admitted_version: &str,
+    ) -> Result<bool, SkillError> {
+        check_text(live_version, "entry.definition_version")?;
+        check_text(admitted_version, "entry.admitted_version")?;
+        if live_version == admitted_version {
+            return Err(SkillError::InvalidField {
+                field: "entry.definition_version",
+                reason: "no version drift to mark",
+            });
+        }
+        let entry = self.entries.get_mut(skill_id).ok_or(SkillError::NotFound)?;
+        if entry.status == SkillStatus::Quarantined || entry.status == SkillStatus::Stale {
+            return Ok(false);
+        }
+        entry.validate()?;
+        entry.status = SkillStatus::Stale;
+        entry.stale_reason = Some(format!(
+            "tool definition drift: admitted {admitted_version}, live {live_version}"
+        ));
+        entry.validate()?;
+        Ok(true)
+    }
+
     /// Marks the entry stale when its declared tool references no longer
     /// resolve against the tool owner's view (`I7.13`).
     ///
@@ -1278,6 +1316,58 @@ mod tests {
         let stored = held.get("skill-quarantined").expect("stored entry");
         assert_eq!(stored.status, SkillStatus::Quarantined);
         assert_eq!(stored.stale_reason.as_deref(), Some("governed review hold"));
+    }
+
+    #[test]
+    fn definition_drift_marks_stale_with_both_versions_named() {
+        // The live registry moved past the admitted definition version: the
+        // entry keeps its pinned state and gains a Stale status blocking
+        // Material use and redelivery until reinstall under the new version.
+        let mut catalogue = catalogue_two();
+        assert!(
+            catalogue
+                .mark_definition_drift_stale("skill-alpha", "9.9.9", "1.2.0")
+                .expect("mark drift")
+        );
+        let stored = catalogue.get("skill-alpha").expect("stored entry");
+        assert_eq!(stored.status, SkillStatus::Stale);
+        assert!(
+            stored
+                .stale_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("admitted 1.2.0, live 9.9.9")
+        );
+        assert!(!catalogue.is_usable("skill-alpha"));
+        assert!(catalogue.is_usable("skill-beta"));
+        // Agreement, repeat, quarantine, blanks, and unknown skills.
+        assert!(matches!(
+            catalogue.mark_definition_drift_stale("skill-alpha", "1.2.0", "1.2.0"),
+            Err(SkillError::InvalidField { field, .. }) if field == "entry.definition_version"
+        ));
+        assert!(
+            !catalogue
+                .mark_definition_drift_stale("skill-alpha", "9.9.9", "1.2.0")
+                .expect("repeat drift")
+        );
+        let mut quarantined = entry("skill-quarantined");
+        quarantined.status = SkillStatus::Quarantined;
+        quarantined.stale_reason = Some("governed review hold".to_owned());
+        let mut held =
+            SkillCatalogue::from_snapshot([quarantined], &tools()).expect("test catalogue");
+        assert!(
+            !held
+                .mark_definition_drift_stale("skill-quarantined", "9.9.9", "1.2.0")
+                .expect("quarantine preserved")
+        );
+        assert!(matches!(
+            catalogue.mark_definition_drift_stale("skill-alpha", "   ", "1.2.0"),
+            Err(SkillError::InvalidField { .. })
+        ));
+        assert!(matches!(
+            catalogue.mark_definition_drift_stale("skill-missing", "9.9.9", "1.2.0"),
+            Err(SkillError::NotFound)
+        ));
     }
 
     #[test]

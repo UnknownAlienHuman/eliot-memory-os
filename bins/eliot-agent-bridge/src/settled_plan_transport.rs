@@ -40,7 +40,8 @@ use eliot_governor::{ReactiveRiskTier, assess_reactive_risk};
 use eliot_integration_coverage::GovernorCoverageDerivation;
 use eliot_reactive_context_plan::{
     BridgeAdmissionBatch, BridgeAdmissionError, BridgeAdmissionInstruction,
-    BridgeAdmissionSeverity, PendingContextInjectionPlan, plan_bridge_admissions,
+    BridgeAdmissionSeverity, PendingContextInjectionPlan, SettledPlanFeedOutcome,
+    plan_bridge_admissions,
 };
 
 use super::{
@@ -400,6 +401,41 @@ impl SettledPlanAdmission {
 impl Default for SettledPlanAdmission {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Outcome of driving one producer-feed evaluation into the ledger.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FeedAdmissionOutcome {
+    /// Settled batch admitted through the governed path; full report.
+    Admitted(PlanAdmissionReport),
+    /// Planner settled no injection: zero bridge calls made.
+    NoPlan,
+}
+
+/// Drives one A4 producer-feed outcome into the live ledger (production
+/// caller).
+///
+/// The feed outcome arrives from `produce_settled_plan_feed` over owner
+/// projections (A4 producer module); the derivation is the live Governor
+/// threading; the driver is retained by the integrator across batches.
+/// `Ready` admits the feed batch with `governor_assess` over the same
+/// critical bit; `NoSettledPlan` makes zero calls (buffer bounded
+/// owner-side or drop WITH a receipt per the transport contract — that
+/// receipting is the integrator's, never synthesized here).
+pub fn admit_producer_feed(
+    admission: &mut SettledPlanAdmission,
+    runner: &mut BridgeRunner,
+    derivation: &GovernorCoverageDerivation,
+    outcome: SettledPlanFeedOutcome,
+) -> Result<FeedAdmissionOutcome, PlanAdmissionError> {
+    match outcome {
+        SettledPlanFeedOutcome::Ready(feed) => admission
+            .admit_batch(runner, &feed.batch, |item, critical| {
+                governor_assess(derivation, item, critical)
+            })
+            .map(FeedAdmissionOutcome::Admitted),
+        SettledPlanFeedOutcome::NoSettledPlan(_) => Ok(FeedAdmissionOutcome::NoPlan),
     }
 }
 
