@@ -18,9 +18,15 @@
 //!   an in-flight intentional update mark itself stale and deadlock every
 //!   evolving Skill.
 //! - `view` and `propose` forward unchanged: reads and proposals neither
-//!   consume the catalogue nor invent candidates. Tool-existence and
-//!   activation-display boundaries live in the catalogue API for the tool
-//!   owner and surface port to call; this adapter never invents them.
+//!   consume the catalogue nor invent candidates.
+//! - `activation_display` executes against the shared catalogue handle: entry
+//!   usability, receipt self-consistency plus exact catalogue bind,
+//!   applied-ack binding to that exact receipt, delivery coverage, and the
+//!   tool-owner existence check all run inside the catalogue boundary. The
+//!   display binds receipt, ack, and catalogue — not the state fence — so the
+//!   guard is taken and dropped in a closed scope and never crosses an await.
+//!   Tool-existence production wiring belongs to the tool owner: the caller
+//!   supplies its `KnownTools` view, and this adapter never invents one.
 //! - No other policy, admission, or semantic rules live here. Base digest/revision,
 //!   exact evidence, fence, approval and reversibility stay with the Governor
 //!   skill owner; this adapter never invents a candidate, gate, or promotion.
@@ -53,8 +59,9 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use eliot_skill::{
-    PromotionGate, SkillCandidate, SkillCatalogue, SkillError, SkillLifecycleApi,
-    SkillLifecycleView, activation::detect_dependency_staleness,
+    ActivatedSkillDisplay, HotsetDeliveryAck, HotsetDeliveryReceipt, KnownTools, PromotionGate,
+    SkillCandidate, SkillCatalogue, SkillError, SkillLifecycleApi, SkillLifecycleView,
+    activation::detect_dependency_staleness,
 };
 
 /// Shared handle to the composition-owned Governor Skill catalogue.
@@ -202,6 +209,18 @@ impl<T: SkillLifecycleApi> SkillLifecycleApi for ForwardingSkillLifecycle<T> {
         }
         Ok(receipt)
     }
+
+    async fn activation_display(
+        &self,
+        _ctx: &eliot_contracts::RequestMetadata,
+        skill_id: String,
+        receipt: HotsetDeliveryReceipt,
+        ack: HotsetDeliveryAck,
+        tools: &dyn KnownTools,
+    ) -> Result<ActivatedSkillDisplay, SkillError> {
+        let catalogue = self.lock_catalogue();
+        catalogue.activation_display(&skill_id, &receipt, &ack, tools)
+    }
 }
 
 #[cfg(test)]
@@ -217,10 +236,10 @@ mod tests {
     use eliot_protocol::RequestIdentity;
     use eliot_receipts::RequestBinding;
     use eliot_skill::{
-        DependencyVersion, KnownTools, LifecycleAction, LifecycleCounters, PromotionGate,
-        SkillBody, SkillCandidate, SkillCatalogue, SkillCatalogueEntry, SkillIndexEntry,
-        SkillInteractionView, SkillLifecycleView, SkillRef, SkillRuntimeMetadata, SkillScope,
-        SkillStatus,
+        DependencyVersion, HotsetAckDisposition, HotsetDeliveryAck, HotsetDeliveryReceipt,
+        KnownTools, LifecycleAction, LifecycleCounters, PromotionGate, SkillBody, SkillCandidate,
+        SkillCatalogue, SkillCatalogueEntry, SkillIndexEntry, SkillInteractionView,
+        SkillLifecycleView, SkillRef, SkillRuntimeMetadata, SkillScope, SkillStatus,
     };
     use eliot_store_api::{
         CommitId, OperationManifestDigest, Resubmission, TransitionClass, WriteReceipt,
@@ -313,6 +332,18 @@ mod tests {
                 );
                 return Ok(success_receipt(&fence, operation_id));
             }
+            Err(SkillError::NotFound)
+        }
+
+        async fn activation_display(
+            &self,
+            _ctx: &RequestMetadata,
+            _skill_id: String,
+            _receipt: HotsetDeliveryReceipt,
+            _ack: HotsetDeliveryAck,
+            _tools: &dyn KnownTools,
+        ) -> Result<ActivatedSkillDisplay, SkillError> {
+            *self.calls.lock().expect("calls") += 1;
             Err(SkillError::NotFound)
         }
     }
@@ -466,6 +497,138 @@ mod tests {
             catalogue.get("skill-demo").expect("entry").status,
             SkillStatus::Stale
         );
+    }
+
+    fn issued_display_inputs(
+        handle: &CatalogueHandle,
+    ) -> (HotsetDeliveryReceipt, HotsetDeliveryAck) {
+        let catalogue = handle.lock().expect("catalogue lock");
+        let receipt = HotsetDeliveryReceipt::issue(
+            "hotset-display-1".to_owned(),
+            &catalogue,
+            vec!["skill-demo".to_owned()],
+            &TestTools,
+            "approval-commit-1".to_owned(),
+        )
+        .expect("delivery receipt");
+        let ack = HotsetDeliveryAck {
+            hotset_id: receipt.hotset_id.clone(),
+            receipt_digest: receipt.receipt_digest.clone(),
+            receiver_id: "runtime-hotset-1".to_owned(),
+            disposition: HotsetAckDisposition::Applied,
+        };
+        (receipt, ack)
+    }
+
+    #[test]
+    fn display_executes_real_boundary_without_touching_inner() {
+        let fence = fence();
+        let handle = installed_catalogue();
+        let (receipt, ack) = issued_display_inputs(&handle);
+        let calls = Arc::new(Mutex::new(0));
+        let inner = ClosedInner {
+            fence_mismatch: false,
+            succeed_promote: false,
+            calls: Arc::clone(&calls),
+        };
+        let forwarding = ForwardingSkillLifecycle::with_catalogue(inner, handle);
+        let display = blocking_view(forwarding.activation_display(
+            &metadata(&fence),
+            "skill-demo".to_owned(),
+            receipt.clone(),
+            ack,
+            &TestTools,
+        ))
+        .expect("applied display");
+        assert_eq!(display.skill_id, "skill-demo");
+        assert_eq!(display.delivery_receipt_digest, receipt.receipt_digest);
+        assert_eq!(*calls.lock().expect("calls"), 0);
+    }
+
+    #[test]
+    fn display_blocks_stale_entries_before_ack_checks() {
+        let fence = fence();
+        let handle = installed_catalogue();
+        let (receipt, ack) = issued_display_inputs(&handle);
+        {
+            let mut catalogue = handle.lock().expect("catalogue lock");
+            catalogue
+                .note_dependency_change(
+                    "skill-demo",
+                    vec![dependency("9.9.9")],
+                    "tool-def-1 moved to 9.9.9".to_owned(),
+                )
+                .expect("mark stale");
+        }
+        let calls = Arc::new(Mutex::new(0));
+        let inner = ClosedInner {
+            fence_mismatch: false,
+            succeed_promote: false,
+            calls: Arc::clone(&calls),
+        };
+        let forwarding = ForwardingSkillLifecycle::with_catalogue(inner, handle);
+        let blocked = blocking_view(forwarding.activation_display(
+            &metadata(&fence),
+            "skill-demo".to_owned(),
+            receipt,
+            ack,
+            &TestTools,
+        ));
+        assert!(matches!(
+            blocked,
+            Err(SkillError::InvalidField { field, .. }) if field == "entry.status"
+        ));
+        assert_eq!(*calls.lock().expect("calls"), 0);
+    }
+
+    #[test]
+    fn display_rejects_ack_bound_to_another_receipt() {
+        let fence = fence();
+        let handle = installed_catalogue();
+        let (receipt, _) = issued_display_inputs(&handle);
+        let foreign_ack = HotsetDeliveryAck {
+            hotset_id: receipt.hotset_id.clone(),
+            receipt_digest: "e".repeat(64),
+            receiver_id: "runtime-hotset-1".to_owned(),
+            disposition: HotsetAckDisposition::Applied,
+        };
+        let calls = Arc::new(Mutex::new(0));
+        let inner = ClosedInner {
+            fence_mismatch: false,
+            succeed_promote: false,
+            calls: Arc::clone(&calls),
+        };
+        let forwarding = ForwardingSkillLifecycle::with_catalogue(inner, handle);
+        let rejected = blocking_view(forwarding.activation_display(
+            &metadata(&fence),
+            "skill-demo".to_owned(),
+            receipt,
+            foreign_ack,
+            &TestTools,
+        ));
+        assert!(matches!(rejected, Err(SkillError::IdentityMismatch)));
+    }
+
+    #[test]
+    fn display_rejects_unknown_skill_without_catalogue_entry() {
+        let fence = fence();
+        let handle = installed_catalogue();
+        let (receipt, ack) = issued_display_inputs(&handle);
+        let calls = Arc::new(Mutex::new(0));
+        let inner = ClosedInner {
+            fence_mismatch: false,
+            succeed_promote: false,
+            calls: Arc::clone(&calls),
+        };
+        let forwarding = ForwardingSkillLifecycle::with_catalogue(inner, handle);
+        let missing = blocking_view(forwarding.activation_display(
+            &metadata(&fence),
+            "skill-missing".to_owned(),
+            receipt,
+            ack,
+            &TestTools,
+        ));
+        assert!(matches!(missing, Err(SkillError::NotFound)));
     }
 
     #[test]

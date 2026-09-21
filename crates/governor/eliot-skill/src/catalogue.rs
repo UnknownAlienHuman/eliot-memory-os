@@ -128,6 +128,10 @@ fn canonical_digest<T: Serialize>(value: &T, field: &'static str) -> Result<Stri
 /// here, so absent tools or capabilities cannot pass via nonempty strings.
 pub trait KnownTools {
     /// Returns `true` only for an exact known tool or capability name.
+    ///
+    /// The trait stays object-safe (no generics, no `Self` returns) so the
+    /// tool owner's production implementation can travel as `&dyn KnownTools`
+    /// through the object-safe surface port into the catalogue boundary.
     fn knows_tool(&self, name: &str) -> bool;
 }
 
@@ -193,7 +197,7 @@ impl SkillBody {
     /// [`validate`](Self::validate) stays total; this boundary check runs at
     /// installation and activation, where a caller-supplied [`KnownTools`]
     /// view is available.
-    pub fn validate_tools(&self, tools: &impl KnownTools) -> Result<(), SkillError> {
+    pub fn validate_tools(&self, tools: &dyn KnownTools) -> Result<(), SkillError> {
         for tool in &self.tool_refs {
             if !tools.knows_tool(tool) {
                 return Err(SkillError::InvalidField {
@@ -462,7 +466,7 @@ pub struct SkillCatalogue {
 impl SkillCatalogue {
     pub fn from_snapshot(
         entries: impl IntoIterator<Item = SkillCatalogueEntry>,
-        tools: &impl KnownTools,
+        tools: &dyn KnownTools,
     ) -> Result<Self, SkillError> {
         let mut catalogue = Self::default();
         for entry in entries {
@@ -477,7 +481,7 @@ impl SkillCatalogue {
     pub fn insert(
         &mut self,
         entry: SkillCatalogueEntry,
-        tools: &impl KnownTools,
+        tools: &dyn KnownTools,
     ) -> Result<(), SkillError> {
         entry.validate()?;
         entry.body.validate_tools(tools)?;
@@ -612,7 +616,7 @@ impl SkillCatalogue {
         skill_id: &str,
         receipt: &HotsetDeliveryReceipt,
         ack: &HotsetDeliveryAck,
-        tools: &impl KnownTools,
+        tools: &dyn KnownTools,
     ) -> Result<ActivatedSkillDisplay, SkillError> {
         let entry = self.entries.get(skill_id).ok_or(SkillError::NotFound)?;
         entry.validate()?;
@@ -760,7 +764,7 @@ impl HotsetDeliveryReceipt {
         hotset_id: String,
         catalogue: &SkillCatalogue,
         delivered_skill_ids: Vec<String>,
-        tools: &impl KnownTools,
+        tools: &dyn KnownTools,
         approval_ref: String,
     ) -> Result<Self, SkillError> {
         check_text(&hotset_id, "delivery.hotset_id")?;
