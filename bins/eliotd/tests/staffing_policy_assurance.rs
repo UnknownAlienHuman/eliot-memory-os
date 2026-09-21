@@ -14,7 +14,7 @@ use eliot_security_contracts::PrivacyClass;
 use eliotd::staffing_policy::{
     PolicyAuthorizedDegradation, RouteCandidate, RouteClassEvidence, RouteEligibility,
     StaffingConstraints, StaffingPolicyError, UnavailableDispositionKind,
-    check_attempt_route_continuity, plan_staffing,
+    check_attempt_route_continuity, plan_staffing, verify_receipt_digest,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -219,6 +219,88 @@ fn provider_switch_denied_without_receipted_degradation() -> TestResult {
         policy_revision: "assurance-rev-1".to_owned(),
     };
     assert!(check_attempt_route_continuity(&before, &after, Some(&approval), "attempt-1").is_ok());
+    Ok(())
+}
+
+#[test]
+fn widened_budget_rejects_instead_of_staffing() -> TestResult {
+    let policy = eliotd::staffing_policy::ModelRolePolicy::assurance(test_budget())?;
+    let writer_route = test_route("writer", "provider-a", "model-a")?;
+    let evidence = vec![RouteClassEvidence {
+        route_class: "bulk_implementation".to_owned(),
+        candidates: vec![candidate(
+            writer_route,
+            "family-a",
+            false,
+            true,
+            "capability-writer-1",
+        )],
+        evidence_refs: vec!["capability-writer-1".to_owned()],
+    }];
+    let mut wide = constraints();
+    wide.budget.cost_microunits = test_budget().cost_microunits + 1;
+    assert!(
+        matches!(
+            plan_staffing(&policy, "assurance-task", false, &evidence, &wide),
+            Err(StaffingPolicyError::Contract(_))
+        ),
+        "supplied constraints must not widen the policy per-job budget"
+    );
+    Ok(())
+}
+
+#[test]
+fn local_only_ceiling_closes_external_lanes_fail_closed() -> TestResult {
+    let policy = eliotd::staffing_policy::ModelRolePolicy::assurance(test_budget())?;
+    let writer_route = test_route("writer", "provider-a", "model-a")?;
+    let evidence = vec![RouteClassEvidence {
+        route_class: "bulk_implementation".to_owned(),
+        candidates: vec![candidate(
+            writer_route,
+            "family-a",
+            false,
+            true,
+            "capability-writer-1",
+        )],
+        evidence_refs: vec!["capability-writer-1".to_owned()],
+    }];
+    let mut secret = constraints();
+    secret.privacy_ceiling = PrivacyClass::Secret;
+    assert!(
+        matches!(
+            plan_staffing(&policy, "secret-task", false, &evidence, &secret),
+            Err(StaffingPolicyError::NoWriterRoute(_))
+        ),
+        "a local-only ceiling must staff no external lane, not substitute one"
+    );
+    Ok(())
+}
+
+#[test]
+fn receipt_digest_rebinds_at_the_persistence_boundary() -> TestResult {
+    let policy = eliotd::staffing_policy::ModelRolePolicy::assurance(test_budget())?;
+    let writer_route = test_route("writer", "provider-a", "model-a")?;
+    let evidence = vec![RouteClassEvidence {
+        route_class: "bulk_implementation".to_owned(),
+        candidates: vec![candidate(
+            writer_route,
+            "family-a",
+            false,
+            true,
+            "capability-writer-1",
+        )],
+        evidence_refs: vec!["capability-writer-1".to_owned()],
+    }];
+    let mut receipt = plan_staffing(&policy, "assurance-task", false, &evidence, &constraints())?;
+    assert!(verify_receipt_digest(&receipt).is_ok());
+    receipt.task_class = "tampered-task".to_owned();
+    assert!(
+        matches!(
+            verify_receipt_digest(&receipt),
+            Err(StaffingPolicyError::Contract(_))
+        ),
+        "a tampered candidate must fail the persistence-boundary check"
+    );
     Ok(())
 }
 

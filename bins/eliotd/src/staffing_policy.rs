@@ -10,10 +10,18 @@
 //! in this type: the struct has no provider field by construction.
 //!
 //! Pure and deterministic: no threads, no store, no provider execution, no
-//! credential handling. Unavailable route classes yield explicit persisted
-//! defer/degrade/escalate dispositions; provider switching mid-attempt is
-//! denied unless an explicit receipted policy-authorized degradation binds
-//! the continuation before it proceeds.
+//! credential handling. The planner returns a candidate receipt plus explicit
+//! dispositions; it persists nothing itself. A required-but-unstaffed audit
+//! class yields an escalate disposition, policy-declared non-executing
+//! Dreamer classes yield defer dispositions, and a missing writer is a typed
+//! [`StaffingPolicyError::NoWriterRoute`] rather than a silent substitution.
+//! A caller cannot widen the selected policy through supplied constraints:
+//! the constraints budget must sit within the policy per-job budget and a
+//! local-only privacy ceiling closes external lanes fail-closed. Provider
+//! switching mid-attempt is denied unless an explicit receipted
+//! policy-authorized degradation binds the continuation before it proceeds.
+//! The Governor caller persists the returned candidate; [`verify_receipt_digest`]
+//! rebinds the digest at that boundary.
 
 use eliot_agent_api::{BudgetEnvelope, RouteFingerprint};
 use eliot_security_contracts::PrivacyClass;
@@ -414,14 +422,27 @@ impl ModelRolePolicy {
 
 /// Plans task-class staffing from current evidence under the given policy.
 ///
+/// Returns a candidate receipt: selected lanes plus explicit dispositions
+/// for the classes this plan requires but cannot staff. This function
+/// persists nothing; the Governor caller persists the returned candidate and
+/// rebinds its integrity with [`verify_receipt_digest`] at that boundary.
+///
 /// The writer is selected from worker route classes; the auditor (when the
 /// preset or task requires independent review) is selected only from
 /// auditor route classes with cross-family independence, quota/capacity, and
-/// privacy admission. An unavailable audit class yields an explicit
-/// escalate disposition: same-family and paid fallbacks are rejected, never
-/// silently substituted. Every unavailable policy route class (including the
-/// non-executing Dreamer classes) yields a persisted defer/degrade/escalate
-/// disposition.
+/// privacy admission. A required-but-unstaffed audit class yields an
+/// explicit escalate disposition: same-family and paid fallbacks are
+/// rejected, never silently substituted. Policy-declared non-executing
+/// Dreamer classes always yield defer dispositions. A missing writer is a
+/// typed [`StaffingPolicyError::NoWriterRoute`], never a disposition.
+/// Role classes this task plan does not require (main-agent, verifier,
+/// watchdog) carry no disposition: they are not unavailable, they are
+/// simply not staffed by this plan.
+///
+/// The supplied constraints cannot widen the selected policy: the
+/// constraints budget must sit within the policy per-job budget, and a
+/// privacy ceiling naming a policy local-only class closes external lanes
+/// fail-closed instead of exporting the class.
 pub fn plan_staffing(
     policy: &ModelRolePolicy,
     task_class: &str,
@@ -439,13 +460,23 @@ pub fn plan_staffing(
 
     let audit_required =
         policy.independent_review_requirements.required || requires_independent_review;
+    // The caller selects intent, never a wider envelope: the supplied budget
+    // must sit within the policy per-job budget, and a local-only ceiling
+    // closes external lanes before any candidate is considered.
+    constraints
+        .budget
+        .is_within(&policy.per_job_budget)
+        .map_err(|error| {
+            StaffingPolicyError::Contract(format!("constraints budget exceeds policy: {error}"))
+        })?;
+    let lanes_open = external_lanes_open(policy, constraints.privacy_ceiling);
 
-    let writer = select_writer(policy, evidence)?;
+    let writer = select_writer(policy, evidence, lanes_open)?;
     let mut lanes = vec![writer.clone()];
     let mut unavailable = Vec::new();
 
     if audit_required {
-        match select_independent_auditor(policy, evidence, &writer) {
+        match select_independent_auditor(policy, evidence, &writer, lanes_open) {
             Ok(auditor) => lanes.push(auditor),
             Err(reason) => unavailable.push(UnavailableClassDisposition {
                 route_class: ROUTE_CLASS_INDEPENDENT_BLIND_AUDIT.to_owned(),
@@ -496,6 +527,30 @@ pub fn plan_staffing(
     Ok(receipt)
 }
 
+/// Rebinds a candidate receipt's integrity at the persistence boundary.
+///
+/// Recomputes the canonical-JSON digest over the receipt body (all fields
+/// except `receipt_digest`) and accepts the receipt only when it matches.
+/// The Governor caller runs this check when persisting the candidate
+/// returned by [`plan_staffing`]; a mismatch fails closed instead of
+/// persisting a tampered or mis-bound plan.
+pub fn verify_receipt_digest(receipt: &StaffingPlanReceipt) -> Result<(), StaffingPolicyError> {
+    let body = serde_json::to_value(receipt)
+        .map_err(|error| StaffingPolicyError::Contract(format!("receipt body: {error}")))?;
+    let mut body_map = body
+        .as_object()
+        .cloned()
+        .ok_or_else(|| StaffingPolicyError::Contract("receipt body shape".to_owned()))?;
+    body_map.remove("receipt_digest");
+    let expected = digest_receipt_body(&serde_json::Value::Object(body_map))?;
+    if receipt.receipt_digest != expected {
+        return Err(StaffingPolicyError::Contract(
+            "plan receipt digest does not bind the receipt body".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_evidence(evidence: &[RouteClassEvidence]) -> Result<(), StaffingPolicyError> {
     for record in evidence {
         validate_route_class(&record.route_class)?;
@@ -513,10 +568,39 @@ fn eligible_candidate(candidate: &RouteCandidate) -> bool {
         && candidate.eligibility.privacy_admits
 }
 
+/// Wire name of a privacy ceiling in policy data-class terms.
+fn privacy_data_class(ceiling: PrivacyClass) -> &'static str {
+    match ceiling {
+        PrivacyClass::Public => "public",
+        PrivacyClass::Internal => "internal",
+        PrivacyClass::Private => "private",
+        PrivacyClass::Secret => "secret",
+        PrivacyClass::Licensed => "licensed",
+    }
+}
+
+/// Whether lanes may be staffed on external candidate routes under the task
+/// ceiling. A ceiling naming a policy local-only class closes external lanes
+/// fail-closed: without route-locality evidence the planner cannot prove a
+/// lane would keep the class local, so no lane is staffed instead of risking
+/// a higher privacy class exported externally (I3.6).
+fn external_lanes_open(policy: &ModelRolePolicy, ceiling: PrivacyClass) -> bool {
+    !policy
+        .local_only_data_classes
+        .iter()
+        .any(|class| class == privacy_data_class(ceiling))
+}
+
 fn select_writer(
     policy: &ModelRolePolicy,
     evidence: &[RouteClassEvidence],
+    lanes_open: bool,
 ) -> Result<StaffedLane, StaffingPolicyError> {
+    if !lanes_open {
+        return Err(StaffingPolicyError::NoWriterRoute(
+            "local-only privacy ceiling closes external lanes; no writer staffed".to_owned(),
+        ));
+    }
     for class in &policy.worker_route_classes {
         if let Some(record) = evidence.iter().find(|item| &item.route_class == class) {
             for candidate in &record.candidates {
@@ -543,7 +627,14 @@ fn select_independent_auditor(
     policy: &ModelRolePolicy,
     evidence: &[RouteClassEvidence],
     writer: &StaffedLane,
+    lanes_open: bool,
 ) -> Result<StaffedLane, String> {
+    if !lanes_open {
+        return Err(
+            "local-only privacy ceiling closes external lanes; escalating instead of substituting"
+                .to_owned(),
+        );
+    }
     let writer_family = writer_family(evidence, writer);
     let mut specific_reason: Option<String> = None;
     for class in &policy.auditor_route_classes {
