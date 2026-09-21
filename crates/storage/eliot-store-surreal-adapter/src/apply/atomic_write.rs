@@ -79,6 +79,7 @@ pub(super) enum TxLane {
 const ALLOCATION_CONFLICT_MARKERS: &[&str] = &[
     "canonical_fence_cas_conflict",
     "canonical_fence_create_conflict",
+    "notification_revision_conflict",
 ];
 
 /// Provider markers proving a deterministic semantic conflict: stale
@@ -191,6 +192,7 @@ pub(super) async fn write_transaction(
     current_revisions: &[RevisionHead],
     current_orderings: &[OrderingHead],
     lane: TxLane,
+    notifications: &[super::surreal_notification::SurrealNotificationWrite],
 ) -> Result<(), AdapterError> {
     let operation_id = transition.identity.operation_id.to_string();
     let (sql, bindings) = build_apply_statements(
@@ -202,6 +204,7 @@ pub(super) async fn write_transaction(
         expected_outbox_sequence,
         current_revisions,
         current_orderings,
+        notifications,
     )?;
     // 688-B classifies provider replies after the atomic RPC: deterministic
     // fence/head markers are conflicts, while an unavailable or unclassified
@@ -259,6 +262,7 @@ fn build_apply_statements(
     expected_outbox_sequence: u64,
     current_revisions: &[RevisionHead],
     current_orderings: &[OrderingHead],
+    notifications: &[super::surreal_notification::SurrealNotificationWrite],
 ) -> Result<(String, Map<String, Value>), AdapterError> {
     let operation_id = transition.identity.operation_id.to_string();
     let revision = plan.next_revision_heads.first().ok_or_else(|| {
@@ -469,6 +473,8 @@ fn build_apply_statements(
         );
     }
 
+    append_notification_statements(&mut sql, &mut bindings, notifications)?;
+
     sql.push_str(schema::TX_CREATE_RECEIPT);
     bindings.insert(
         "receipt_table".to_owned(),
@@ -506,6 +512,32 @@ fn build_apply_statements(
 
     sql.push_str(schema::TX_COMMIT);
     Ok((sql, bindings))
+}
+
+/// Appends canonical notification record writes (issue #1780).
+///
+/// One compare-and-set per computed write, assembled from the pre-transaction
+/// model computation: creates refuse when a row already exists, updates
+/// refuse on missing rows or revision drift. Drift surfaces the
+/// `notification_revision_conflict` marker so the apply loop retries with
+/// fresh rows. Record rows commit in the same transaction as the receipt and
+/// outbox rows below, so record, receipt, and outbox stay atomic.
+fn append_notification_statements(
+    sql: &mut String,
+    bindings: &mut Map<String, Value>,
+    notifications: &[super::surreal_notification::SurrealNotificationWrite],
+) -> Result<(), AdapterError> {
+    let (fragment, fragment_bindings) =
+        super::surreal_notification::notification_write_statements(notifications);
+    sql.push_str(&fragment);
+    for (name, value) in fragment_bindings {
+        if bindings.insert(name.clone(), value).is_some() {
+            return Err(AdapterError::Serialization(
+                "notification binding collided with a canonical binding".to_owned(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn to_value<T: Serialize>(value: &T) -> Result<Value, AdapterError> {
@@ -1447,6 +1479,7 @@ mod allocation_classification_tests {
             1,
             &current_revisions,
             &current_orderings,
+            &[],
         )
         .expect("statements assemble");
         assert!(sql.starts_with(schema::TX_BEGIN), "one transaction opens");
@@ -1484,7 +1517,7 @@ mod allocation_classification_tests {
         // Absent heads select the create path instead of the CAS-update
         // path; the fence singleton still CAS-guards the steady state.
         let (create_sql, _) =
-            build_apply_statements(&transition, &plan, &receipt, false, 1, 1, &[], &[])
+            build_apply_statements(&transition, &plan, &receipt, false, 1, 1, &[], &[], &[])
                 .expect("create path assembles");
         assert!(
             create_sql.contains("revision_head_create_conflict"),
@@ -1499,7 +1532,7 @@ mod allocation_classification_tests {
             "steady-state fence still CAS-guards allocation"
         );
         let (genesis_sql, _) =
-            build_apply_statements(&transition, &plan, &receipt, true, 1, 1, &[], &[])
+            build_apply_statements(&transition, &plan, &receipt, true, 1, 1, &[], &[], &[])
                 .expect("genesis assembles");
         assert!(
             genesis_sql.contains("canonical_fence_create_conflict"),
@@ -1518,7 +1551,7 @@ mod allocation_classification_tests {
         let plan = plan_apply(&transition, &[], &[], 3, 7).expect("plan applies");
         let receipt = build_receipt(&ctx, &transition, &plan).expect("receipt builds");
         let (sql, bindings) =
-            build_apply_statements(&transition, &plan, &receipt, false, 3, 7, &[], &[])
+            build_apply_statements(&transition, &plan, &receipt, false, 3, 7, &[], &[], &[])
                 .expect("statements assemble");
         assert_eq!(
             sql.matches("CREATE type::record($event_table0").count(),

@@ -867,4 +867,24 @@ pub trait SkillLifecycleApi: Send + Sync {
         gate: PromotionGate,
         promoted_view: SkillLifecycleView,
     ) -> Result<eliot_store_api::WriteReceipt, SkillError>;
+
+    /// Builds the activated Skill view for one delivered Skill behind its
+    /// Hotset delivery receipt and applied receiver ack.
+    ///
+    /// The composition adapter executes this against its shared catalogue
+    /// handle: entry usability, receipt self-consistency plus exact catalogue
+    /// bind, applied-ack binding to that exact receipt, delivery coverage,
+    /// and the tool-owner existence check all run inside the catalogue
+    /// boundary. The Governor lifecycle owner carries no installed bodies and
+    /// fails this call closed; the tool owner's production `KnownTools`
+    /// implementation arrives as `&dyn KnownTools` so the object-safe surface
+    /// port can forward it without generics.
+    async fn activation_display(
+        &self,
+        ctx: &RequestMetadata,
+        skill_id: String,
+        receipt: HotsetDeliveryReceipt,
+        ack: HotsetDeliveryAck,
+        tools: &dyn KnownTools,
+    ) -> Result<ActivatedSkillDisplay, SkillError>;
 }

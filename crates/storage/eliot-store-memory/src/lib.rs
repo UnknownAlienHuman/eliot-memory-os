@@ -7,30 +7,37 @@
 
 #[cfg(test)]
 mod epistemic_tests;
+#[cfg(test)]
+mod notification_state_tests;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, MutexGuard, TryLockError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use eliot_kernel_core::{
+    DeliveryChannel, DeliveryState, NotificationDraft, NotificationError, NotificationSeverity,
+    NotificationStore, ResolutionAuthorization,
+};
 use eliot_store_api::epistemic_revision::{EpistemicCommit, position_key};
 use eliot_store_api::{
     CanonicalRequestView, CanonicalStoreClient, CanonicalValidationSnapshot, CommitId,
-    ERASURE_PARAM_OPERATION_ID, ERASURE_PARAM_SUBJECT, ERASURE_PARAM_SURFACES,
-    EVIDENCE_PACK_MAX_RECORDS, EventId, EventProjectionRelationIntents, NamedMutationOperation,
-    NamedReadOperation, NamedReadRequest, NamedReadResponse, OperationId, OperationManifestDigest,
-    OrderingHead, OrderingHeadExpectation, OrderingScopeId, OutboxId, OutboxIntent, OutboxState,
-    PreparedTransition, ProjectionMode, ProjectionPublicationId, ProjectionPublicationRecord,
-    ProjectionStatus, RecoveryRecord, RecoveryRecordKey, RequestMeta, Resubmission, RevisionDelta,
-    RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, SplitView,
-    StateFence, StoreError, StoreGenesisRequest, StoreHealth, StoreHealthStatus,
-    StoreRecoveryRequest, StoreRecoverySnapshot, TransitionClass, WriteReceipt, WriteReceiptStatus,
-    canonical_json_bytes, canonical_request_hash, decode_erasure_surfaces,
-    generated_operation_manifests, genesis_manifest,
+    DecodedNotificationMutation, ERASURE_PARAM_OPERATION_ID, ERASURE_PARAM_SUBJECT,
+    ERASURE_PARAM_SURFACES, EVIDENCE_PACK_MAX_RECORDS, EventId, EventProjectionRelationIntents,
+    NamedMutationOperation, NamedReadOperation, NamedReadRequest, NamedReadResponse, OperationId,
+    OperationManifestDigest, OrderingHead, OrderingHeadExpectation, OrderingScopeId, OutboxId,
+    OutboxIntent, OutboxState, PreparedTransition, ProjectionMode, ProjectionPublicationId,
+    ProjectionPublicationRecord, ProjectionStatus, RecoveryRecord, RecoveryRecordKey, RequestMeta,
+    Resubmission, RevisionDelta, RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId,
+    ScopeRevisionView, SplitView, StateFence, StoreError, StoreGenesisRequest, StoreHealth,
+    StoreHealthStatus, StoreRecoveryRequest, StoreRecoverySnapshot, TransitionClass, WriteReceipt,
+    WriteReceiptStatus, canonical_json_bytes, canonical_request_hash, decode_erasure_surfaces,
+    decode_notification_mutation, generated_operation_manifests, genesis_manifest,
     is_genesis_fence, issue_genesis_receipt_envelope, issue_store_receipt_envelope,
     named_mutation_operation_name, sha256_hex, validate_genesis_receipt_envelope,
     validate_store_receipt_envelope, verify_canonical_request_hash,
 };
 use schemars::JsonSchema;
+use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -304,7 +311,12 @@ impl MemoryStore {
                 return Err(StoreError::RevisionConflict);
             }
         }
-        let plan = transaction_plan(&state, &transition, &operation_key)?;
+        let mut plan = transaction_plan(&state, &transition, &operation_key)?;
+        // Issue #1780: admitted notification-state legs execute here, before
+        // the receipt is built, so the receipt's outbox references include
+        // the appended notification outbox intents. State, receipt, and
+        // outbox still commit atomically below.
+        dispatch_apply_notification_state(&mut state, &transition, &mut plan)?;
         let receipt = transaction_receipt(ctx, &transition, idempotency_key, recomputed, &plan)?;
         if let (Some(commit), Some(key)) = (epistemic, epistemic_key) {
             commit.readback(&receipt)?;
@@ -547,6 +559,353 @@ fn dispatch_apply_erasure(
     Ok(())
 }
 
+/// Executes admitted notification-state legs on already-locked state
+/// (issue #1780).
+///
+/// Runs beside [`dispatch_apply_erasure`] under the same lock as the receipt
+/// commit: one identity, one receipt, recoverable replay without duplicate
+/// work. Each mutation drives the shared kernel-core [`NotificationStore`]
+/// transition model (upsert/dedup/occurrences, delivery, acknowledge,
+/// receipt-bound resolve with all seven authority checks) and appends one
+/// I5.21 outbox intent bound to the resulting record bytes, so the record
+/// and its outbox intent commit atomically via [`commit_transaction`].
+/// Non-notification transitions are a no-op here.
+fn dispatch_apply_notification_state(
+    state: &mut MemoryState,
+    transition: &PreparedTransition,
+    plan: &mut TransactionPlan,
+) -> Result<(), StoreError> {
+    let has_notification_op = transition
+        .named_operations
+        .iter()
+        .any(|command| command.operation == NamedMutationOperation::ApplyNotificationState);
+    if !has_notification_op {
+        return Ok(());
+    }
+    let operation_key = transition.identity.operation_id.to_string();
+    let mut notify_index = 0_usize;
+    for command in &transition.named_operations {
+        if command.operation != NamedMutationOperation::ApplyNotificationState {
+            continue;
+        }
+        let decoded = decode_notification_mutation(&command.parameters)?;
+        let record_json = apply_notification_leg(&mut state.notifications, decoded, transition)?;
+        let payload_digest = sha256_hex(
+            &canonical_json_bytes(&record_json)
+                .map_err(|error| StoreError::Serialization(error.to_string()))?,
+        );
+        let sequence = plan.next_outbox_sequence;
+        plan.next_outbox_sequence =
+            checked_increment(sequence, "outbox.sequence", "sequence overflow")?;
+        let outbox = OutboxIntent {
+            outbox_id: OutboxId::new(format!("outbox-{operation_key}-notify-{notify_index}"))?,
+            operation_id: transition.identity.operation_id.clone(),
+            sequence,
+            payload_digest,
+            state_fence: transition.state_fence.clone(),
+            arrival_fence: format!("arrival-{operation_key}"),
+            claim_fence: None,
+            state: OutboxState::Arrived,
+        };
+        outbox.validate()?;
+        plan.outbox_records.push(outbox);
+        notify_index = notify_index.saturating_add(1);
+    }
+    Ok(())
+}
+
+/// Applies one decoded leg against the shared record model and returns the
+/// resulting canonical record JSON for outbox binding.
+///
+/// Raw wire payloads deserialize into the shared kernel-core model types;
+/// every transition runs inside that model, so delivery, acknowledgement,
+/// and resolution semantics have exactly one implementation.
+fn apply_notification_leg(
+    store: &mut NotificationStore,
+    decoded: DecodedNotificationMutation,
+    transition: &PreparedTransition,
+) -> Result<Value, StoreError> {
+    let record = match decoded {
+        DecodedNotificationMutation::Upsert {
+            record_json,
+            source_receipt_json,
+            ..
+        } => {
+            let draft: NotificationDraft = serde_json::from_value(record_json)
+                .map_err(|error| StoreError::Serialization(error.to_string()))?;
+            if draft.state_fence != transition.state_fence {
+                return Err(StoreError::FenceMismatch);
+            }
+            let source_receipt: eliot_store_api::ReceiptEnvelope =
+                serde_json::from_value(source_receipt_json)
+                    .map_err(|error| StoreError::Serialization(error.to_string()))?;
+            source_receipt
+                .validate()
+                .map_err(|_| StoreError::InvalidReceipt)?;
+            store
+                .upsert(draft)
+                .map_err(|error| model_error(&error))?
+                .clone()
+        }
+        DecodedNotificationMutation::Delivery {
+            notification_id,
+            channel,
+            delivery_json,
+        } => {
+            let key = notification_key_for(store, &notification_id)?;
+            let channel: DeliveryChannel = serde_json::from_value(Value::String(channel))
+                .map_err(|error| StoreError::Serialization(error.to_string()))?;
+            let existing = store.get(&key).ok_or(StoreError::InvalidField {
+                field: "notification.notification_id",
+                reason: "unknown notification",
+            })?;
+            if existing.state_fence != transition.state_fence {
+                return Err(StoreError::FenceMismatch);
+            }
+            if !existing.delivery_channels.contains(&channel) {
+                return Err(StoreError::InvalidField {
+                    field: "notification.channel",
+                    reason: "channel is not declared on the record",
+                });
+            }
+            let delivery: DeliveryState = serde_json::from_value(delivery_json)
+                .map_err(|error| StoreError::Serialization(error.to_string()))?;
+            store
+                .record_delivery(&key, delivery)
+                .map_err(|error| model_error(&error))?
+                .clone()
+        }
+        DecodedNotificationMutation::Acknowledge {
+            notification_id,
+            principal,
+        } => {
+            let key = notification_key_for(store, &notification_id)?;
+            let existing = store.get(&key).ok_or(StoreError::InvalidField {
+                field: "notification.notification_id",
+                reason: "unknown notification",
+            })?;
+            if existing.state_fence != transition.state_fence {
+                return Err(StoreError::FenceMismatch);
+            }
+            store
+                .acknowledge(&key, &principal)
+                .map_err(|error| model_error(&error))?
+                .clone()
+        }
+        DecodedNotificationMutation::Resolve {
+            notification_id,
+            disposition,
+            authorization_json,
+        } => {
+            let key = notification_key_for(store, &notification_id)?;
+            let existing = store.get(&key).ok_or(StoreError::InvalidField {
+                field: "notification.notification_id",
+                reason: "unknown notification",
+            })?;
+            if existing.state_fence != transition.state_fence {
+                return Err(StoreError::FenceMismatch);
+            }
+            let authorization: ResolutionAuthorization = serde_json::from_value(authorization_json)
+                .map_err(|error| StoreError::Serialization(error.to_string()))?;
+            store
+                .resolve(&key, &disposition, &authorization)
+                .map_err(|error| model_error(&error))?
+                .clone()
+        }
+    };
+    serde_json::to_value(&record).map_err(|error| StoreError::Serialization(error.to_string()))
+}
+
+/// Maps a shared-model failure onto the closed store error set.
+fn model_error(error: &NotificationError) -> StoreError {
+    match error {
+        NotificationError::InvalidField(field) => StoreError::InvalidField {
+            field,
+            reason: "shared model rejected the notification",
+        },
+        NotificationError::UnknownNotification => StoreError::InvalidField {
+            field: "notification.dedup_key",
+            reason: "unknown notification",
+        },
+        NotificationError::IdentityConflict => StoreError::IdentityConflict,
+        NotificationError::AlreadyResolved => StoreError::InvalidField {
+            field: "notification.resolution",
+            reason: "record is already resolved",
+        },
+        NotificationError::ResolutionRequiresEvidence => StoreError::InvalidField {
+            field: "notification.evidence_handles",
+            reason: "resolution requires evidence",
+        },
+        NotificationError::ResolutionRequiresAuthorization
+        | NotificationError::InvalidResolutionReceipt => StoreError::InvalidReceipt,
+        NotificationError::ResolutionAuthorityInsufficient => StoreError::EffectCeilingExceeded,
+        NotificationError::ResolutionEvidenceUnbound => StoreError::InvalidField {
+            field: "notification.evidence_handles",
+            reason: "resolution evidence is not bound by the authority receipt",
+        },
+        NotificationError::ResolutionFenceMismatch => StoreError::FenceMismatch,
+    }
+}
+
+/// Resolves the dedup index key for a lifecycle leg identity.
+fn notification_key_for(
+    store: &NotificationStore,
+    notification_id: &str,
+) -> Result<String, StoreError> {
+    // Notification identities are unique across dedup keys (enforced by the
+    // shared model at upsert), so lifecycle legs resolve deterministically.
+    store
+        .iter()
+        .find(|record| record.notification_id.as_str() == notification_id)
+        .map(|record| record.dedup_key.clone())
+        .ok_or(StoreError::InvalidField {
+            field: "notification.notification_id",
+            reason: "unknown notification",
+        })
+}
+
+/// Closed selectors parsed from a notification-state read request.
+struct NotificationReadSelectors<'a> {
+    scope: Option<&'a str>,
+    dedup_key: Option<&'a str>,
+    notification_id: Option<&'a str>,
+    include_resolved: bool,
+    page_limit: u16,
+    cursor: Option<&'a str>,
+}
+
+/// Parses and bounds the closed read selectors.
+fn notification_read_selectors(
+    query: &NamedReadRequest,
+) -> Result<NotificationReadSelectors<'_>, StoreError> {
+    let optional_text =
+        |name: &str| -> Option<&str> { query.parameters.get(name).and_then(Value::as_str) };
+    let include_resolved = match optional_text("include_resolved") {
+        Some("true") => true,
+        Some("false") => false,
+        _ => {
+            return Err(StoreError::InvalidField {
+                field: "notification.include_resolved",
+                reason: "include_resolved must be \"true\" or \"false\"",
+            });
+        }
+    };
+    let page_limit: u16 = optional_text("page_limit")
+        .and_then(|value| value.parse().ok())
+        .filter(|limit| *limit > 0 && *limit <= eliot_store_api::MAX_NOTIFICATION_PAGE_LIMIT)
+        .ok_or(StoreError::InvalidField {
+            field: "notification.page_limit",
+            reason: "page limit is out of range",
+        })?;
+    Ok(NotificationReadSelectors {
+        scope: optional_text("scope"),
+        dedup_key: optional_text("dedup_key"),
+        notification_id: optional_text("notification_id"),
+        include_resolved,
+        page_limit,
+        cursor: optional_text("cursor"),
+    })
+}
+
+/// Builds the same-fence notification-state read payload.
+///
+/// Errors surface as serialization failures with the underlying message:
+/// parameters are pre-validated by the catalogue gate, so any failure here
+/// is defense in depth, never a distinct dispatch outcome.
+fn notify_payload(
+    state: &MemoryState,
+    query: &NamedReadRequest,
+    fence: &StateFence,
+) -> Result<Value, serde_json::Error> {
+    let selectors = notification_read_selectors(query)
+        .map_err(|error| serde_json::Error::custom(error.to_string()))?;
+    let limit = usize::from(selectors.page_limit.max(1));
+    let mut unresolved_total = 0_u64;
+    let mut critical_unresolved = 0_u64;
+    let mut action_required_unresolved = 0_u64;
+    let mut failed_delivery_unresolved = 0_u64;
+    let mut acknowledged_unresolved = 0_u64;
+    let mut resolved_total = 0_u64;
+    let mut selected = Vec::new();
+    let mut past_cursor = selectors.cursor.unwrap_or_default().is_empty();
+    for record in state.notifications.iter() {
+        if record.state_fence != *fence {
+            continue;
+        }
+        if let Some(scope) = selectors.scope
+            && record.affected_scope != scope
+        {
+            continue;
+        }
+        if let Some(dedup_key) = selectors.dedup_key
+            && record.dedup_key != dedup_key
+        {
+            continue;
+        }
+        if let Some(notification_id) = selectors.notification_id
+            && record.notification_id.as_str() != notification_id
+        {
+            continue;
+        }
+        if record.resolution_ref.is_none() {
+            unresolved_total = unresolved_total.saturating_add(1);
+            match record.severity {
+                NotificationSeverity::Critical => {
+                    critical_unresolved = critical_unresolved.saturating_add(1);
+                }
+                NotificationSeverity::ActionRequired => {
+                    action_required_unresolved = action_required_unresolved.saturating_add(1);
+                }
+                _ => {}
+            }
+            if record.delivery.is_failed() {
+                failed_delivery_unresolved = failed_delivery_unresolved.saturating_add(1);
+            }
+            if record.acknowledgement.is_some() {
+                acknowledged_unresolved = acknowledged_unresolved.saturating_add(1);
+            }
+        } else {
+            resolved_total = resolved_total.saturating_add(1);
+        }
+        if !selectors.include_resolved && record.resolution_ref.is_some() {
+            continue;
+        }
+        if !past_cursor {
+            if record.dedup_key.as_str() == selectors.cursor.unwrap_or_default() {
+                past_cursor = true;
+            }
+            continue;
+        }
+        if selected.len() >= limit {
+            break;
+        }
+        selected.push(record.clone());
+    }
+    let revision = state
+        .notifications
+        .iter()
+        .map(|record| record.revision)
+        .max()
+        .unwrap_or(0);
+    let records = selected
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<Result<Vec<_>, _>>()?;
+    serde_json::to_value(json!({
+        "records": records,
+        "metrics": {
+            "unresolved_total": unresolved_total,
+            "critical_unresolved": critical_unresolved,
+            "action_required_unresolved": action_required_unresolved,
+            "failed_delivery_unresolved": failed_delivery_unresolved,
+            "acknowledged_unresolved": acknowledged_unresolved,
+            "resolved_total": resolved_total,
+        },
+        "state_fence": fence,
+        "revision": revision,
+    }))
+}
+
 fn validate_transaction(
     ctx: &RequestMeta,
     transition: &PreparedTransition,
@@ -612,6 +971,10 @@ fn validate_transaction_state(
             .named_operations
             .iter()
             .any(|command| command.operation == NamedMutationOperation::ApplyErasure)
+        || transition
+            .named_operations
+            .iter()
+            .any(|command| command.operation == NamedMutationOperation::ApplyNotificationState)
     {
         return transition.validate_against_catalogue(&generated_operation_manifests()?);
     }
@@ -1001,7 +1364,10 @@ impl MemoryStore {
     /// its `position` selector; T11.3 adds the four cognitive reads
     /// (`GetTaskState`, `GetAttentionAndProblems`,
     /// `GetUnderstandingProjectionInputs`, `GetCapabilityEvidenceState`)
-    /// with their bounded exact selectors.
+    /// with their bounded exact selectors. Issue #1780 adds
+    /// `GetNotificationState` with its `scope` / `dedup_key` /
+    /// `notification_id` / `include_resolved` / `page_limit` / `cursor`
+    /// selectors.
     fn enforce_catalogue_gate(query: &NamedReadRequest) -> Result<(), StoreError> {
         if matches!(
             query.operation,
@@ -1011,6 +1377,7 @@ impl MemoryStore {
                 | NamedReadOperation::GetAttentionAndProblems
                 | NamedReadOperation::GetUnderstandingProjectionInputs
                 | NamedReadOperation::GetCapabilityEvidenceState
+                | NamedReadOperation::GetNotificationState
         ) {
             let entries = generated_operation_manifests()?;
             query.validate_against_catalogue(&entries)?;
@@ -1114,6 +1481,7 @@ impl MemoryStore {
                 let payload = Self::capability_evidence_payload(&state, query, &fence)?;
                 serde_json::to_value(&payload)
             }
+            NamedReadOperation::GetNotificationState => notify_payload(&state, query, &fence),
             _ => serde_json::to_value(json!({
                 "operation": format!("{:?}", query.operation),
                 "records": state.named_operations.iter().map(|record| &record.operation).collect::<Vec<_>>(),
@@ -1324,7 +1692,9 @@ impl MemoryStore {
             .map(|(index, record)| (index, &record.operation))
             .collect();
         let matched_total = matched.len();
-        let current = matched.last().map(|(_, operation)| operation.parameters.clone());
+        let current = matched
+            .last()
+            .map(|(_, operation)| operation.parameters.clone());
         let records: Vec<Value> = matched
             .into_iter()
             .take(limit)
@@ -1902,7 +2272,7 @@ struct ErasureRegistryEntry {
     dispatched: bool,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 struct MemoryState {
     epistemic_positions: BTreeMap<String, (EpistemicCommit, WriteReceipt)>,
     fences: Option<StateFence>,
@@ -1923,8 +2293,42 @@ struct MemoryState {
     /// erased under a recorded intent with dispatched removal. The pack hides
     /// only suppressed pairs, even if rows remain; never a guess.
     erased_subjects: BTreeSet<(String, String)>,
+    /// Canonical notification records keyed by dedup index (issue #1780).
+    /// Driven only through the closed notification-state legs under the held
+    /// transaction lock, using the shared kernel-core transition model; the
+    /// outbox intent commits atomically with the receipt.
+    notifications: NotificationStore,
     next_commit_sequence: u64,
     next_outbox_sequence: u64,
+}
+
+impl PartialEq for MemoryState {
+    /// Field-wise equality including notification records.
+    ///
+    /// [`NotificationStore`] carries no `PartialEq` itself, so records
+    /// compare by value in deterministic dedup-key order; every other field
+    /// compares directly. Replay-identity tests depend on this equality.
+    fn eq(&self, other: &Self) -> bool {
+        self.epistemic_positions == other.epistemic_positions
+            && self.fences == other.fences
+            && self.recovery_records == other.recovery_records
+            && self.recovery_jobs == other.recovery_jobs
+            && self.revision_heads == other.revision_heads
+            && self.ordering_heads == other.ordering_heads
+            && self.receipts_by_operation == other.receipts_by_operation
+            && self.receipts_by_idempotency == other.receipts_by_idempotency
+            && self.projections == other.projections
+            && self.outbox == other.outbox
+            && self.relations == other.relations
+            && self.named_operations == other.named_operations
+            && self.manifests == other.manifests
+            && self.erasure_intents == other.erasure_intents
+            && self.erased_subjects == other.erased_subjects
+            && self.next_commit_sequence == other.next_commit_sequence
+            && self.next_outbox_sequence == other.next_outbox_sequence
+            && self.notifications.iter().collect::<Vec<_>>()
+                == other.notifications.iter().collect::<Vec<_>>()
+    }
 }
 
 impl Default for MemoryState {
@@ -1945,6 +2349,7 @@ impl Default for MemoryState {
             manifests: BTreeMap::new(),
             erasure_intents: BTreeMap::new(),
             erased_subjects: BTreeSet::new(),
+            notifications: NotificationStore::new(),
             next_commit_sequence: 1,
             next_outbox_sequence: 1,
         }
@@ -1965,6 +2370,7 @@ impl MemoryState {
             && self.named_operations.is_empty()
             && self.erasure_intents.is_empty()
             && self.erased_subjects.is_empty()
+            && self.notifications.len() == 0
     }
 
     fn snapshot(&self) -> MemorySnapshot {
