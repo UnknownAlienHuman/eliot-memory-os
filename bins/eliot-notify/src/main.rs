@@ -4,7 +4,9 @@ use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
 use eliot_notify::{NotificationComposition, PROTOCOL_VERSION, SERVICE_NAME};
-use eliot_notify_core::{NotificationEnvelope, NotifyError, SignedWatchdogFallbackEnvelope};
+use eliot_notify_core::{
+    NotificationEnvelope, NotifyError, SignedWatchdogFallbackEnvelope, UserAutomationFailureRequest,
+};
 use eliot_platform::NotificationRequest;
 use serde::{Deserialize, Serialize};
 
@@ -24,6 +26,10 @@ enum LaunchMode {
 enum Request {
     Deliver {
         envelope: NotificationEnvelope,
+        request: NotificationRequest,
+    },
+    DeliverUserAutomationFailure {
+        failure: UserAutomationFailureRequest,
         request: NotificationRequest,
     },
 }
@@ -168,6 +174,14 @@ fn main() {
                 Err(error) => composition_error(error.to_string()),
             }
         }
+        Ok(Request::DeliverUserAutomationFailure { failure, request }) => {
+            match NotificationComposition::from_kernel(root) {
+                Ok(mut composition) => {
+                    dispatch_user_automation_failure(&mut composition, failure, &request)
+                }
+                Err(error) => composition_error(error.to_string()),
+            }
+        }
         Err(error) => Response::Error {
             code: "REQUEST_INVALID",
             detail: error.to_string(),
@@ -254,6 +268,21 @@ fn dispatch_deliver(
     request: &NotificationRequest,
 ) -> Response {
     match composition.deliver(envelope, request) {
+        Ok(observation) => Response::Delivered {
+            service: SERVICE_NAME,
+            protocol: PROTOCOL_VERSION,
+            observation: Box::new(observation),
+        },
+        Err(error) => notify_error(&error),
+    }
+}
+
+fn dispatch_user_automation_failure(
+    composition: &mut NotificationComposition,
+    failure: UserAutomationFailureRequest,
+    request: &NotificationRequest,
+) -> Response {
+    match composition.deliver_user_automation_failure(failure, request) {
         Ok(observation) => Response::Delivered {
             service: SERVICE_NAME,
             protocol: PROTOCOL_VERSION,

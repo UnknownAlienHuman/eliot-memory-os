@@ -21,9 +21,10 @@ use eliot_notify_core::{
     NotificationEnvelope, NotificationSeverity, NotificationStatePort,
     NotificationStateReadRequest, NotificationStateReadResponse, NotificationStateRequest,
     NotificationStateResponse, NotifyCore, OneShotLedgerPort, SignedWatchdogFallbackEnvelope,
-    VerificationPorts, WATCHDOG_PRODUCT_ID, WATCHDOG_SIGNATURE_ALGORITHM,
-    WATCHDOG_SIGNATURE_DOMAIN, WATCHDOG_SOURCE_ID, WatchdogSignaturePort, watchdog_notification_id,
-    watchdog_request_hash, watchdog_request_id, watchdog_signature_payload,
+    UserAutomationFailureRequest, VerificationPorts, WATCHDOG_PRODUCT_ID,
+    WATCHDOG_SIGNATURE_ALGORITHM, WATCHDOG_SIGNATURE_DOMAIN, WATCHDOG_SOURCE_ID,
+    WatchdogSignaturePort, watchdog_notification_id, watchdog_request_hash, watchdog_request_id,
+    watchdog_signature_payload,
 };
 use eliot_platform::{
     NotificationObservation, NotificationPort, NotificationRequest, PlatformHandle, PortError,
@@ -194,6 +195,21 @@ impl NotificationComposition {
         let quiet_hours_active = self.quiet_hours_active(request)?;
         self.core
             .deliver_with_quiet_hours(envelope, request, quiet_hours_active)
+    }
+
+    /// Delivers one deterministic UserAutomation failure through the existing
+    /// authenticated notification route.
+    ///
+    /// The failure producer binds the owner-supplied automation identity to
+    /// the existing envelope; this composition then reuses the same G-08,
+    /// A-08, canonical-state, and delivery path as every other notification.
+    pub fn deliver_user_automation_failure(
+        &mut self,
+        failure: UserAutomationFailureRequest,
+        request: &NotificationRequest,
+    ) -> Result<DeliveryObservation, eliot_notify_core::NotifyError> {
+        let envelope = failure.into_notification_envelope()?;
+        self.deliver(&envelope, request)
     }
 
     /// Reads one authenticated canonical notification page through the same
