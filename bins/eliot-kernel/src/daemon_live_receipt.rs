@@ -718,6 +718,7 @@ impl KernelComposition {
                 field: "store_state_fence",
             });
         }
+        self.record_startup_evidence(5)?;
         let daemon_evidence = if self.active_daemon_launch()?.is_some() {
             let daemon_receipt = self.ensure_daemon_ready_for_probe().await?;
             let launch = self

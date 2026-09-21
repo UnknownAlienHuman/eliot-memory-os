@@ -22,7 +22,9 @@
 //! cell 6 daemon/store-rebind dispatch — `daemon_request_dispatch` (+7),
 //!   `store_receipt_dispatch`, `control_plane` (+4), `frame_dispatch` (+1),
 //!   `host_request_route` (+1);
-//! cell 7 health/readiness view — `health_view`, `daemon_request_dispatch` (+6);
+//! cell 7 health/readiness view — `health_view`, `daemon_request_dispatch` (+6),
+//!   plus the I1.13 Kernel-unavailability admission guard and restricted
+//!   Recovery View (`kernel_unavailability`);
 //! cell 8 process/daemon/store runtime — `process_execution`,
 //!   `process_execution_client`, `daemon_runtime`, `daemon_process_launch`,
 //!   `daemon_live_receipt`, `daemon_supervision` (+2), `runtime_identity` (+1),
@@ -39,6 +41,7 @@
 
 #[cfg(windows)]
 mod agent_bridge;
+mod blob_store_controller;
 mod canonical_store_runtime;
 mod composition_bootstrap;
 mod control_plane;
@@ -52,6 +55,11 @@ mod process_execution;
 mod process_execution_client;
 mod supervision_lease_authority;
 
+pub use blob_store_controller::{
+    BLOB_INLINE_THRESHOLD_DEFAULT_BYTES, BLOB_INLINE_THRESHOLD_MAX_BYTES,
+    BLOB_MANIFEST_FORMAT_VERSION, BlobCaptureOutcome, BlobDemand, BlobProbeStatus,
+    BlobProbeSuccess, BlobReadyReceipt, BlobRef, BlobStoreController, BlobStoreManifest,
+};
 pub(crate) use kernel_build_contract::PreparedAuthorityMaterial;
 #[cfg(windows)]
 pub use kernel_build_contract::SupervisionLeaseAuthorityConfig;
@@ -75,6 +83,11 @@ pub(crate) use shutdown_drain::{
     DRAIN_RECEIPT_DEADLINE, DrainCommitDecision, DrainHalt, DrainWakeDisposition,
     ShutdownDrainCoordinator, ShutdownPhase, ShutdownTerminal, coordinator_for,
     reverse_quiescence_order,
+};
+pub use startup_coordinator::{
+    AuthorityCeiling, GovernanceEnforcement, GovernanceObservation, GovernanceProfile,
+    GovernanceSupervision, STARTUP_FINAL_STEP, STARTUP_FIRST_STEP, StartupCoordinator,
+    StartupPrerequisite, StartupRejection, StartupStatus, startup_step_name,
 };
 #[cfg(windows)]
 pub use supervision_lease_authority::{
@@ -117,6 +130,7 @@ mod generation_recovery;
 mod health_view;
 #[cfg(windows)]
 mod host_request_route;
+pub mod kernel_unavailability;
 mod native_worker_lifecycle_route;
 mod native_worker_reconcile_route;
 mod native_worker_replay_route;
@@ -124,6 +138,7 @@ pub mod notify_operation_identity;
 mod provider_capability_route;
 mod runtime_identity;
 mod shutdown_drain;
+mod startup_coordinator;
 use daemon_session_guard::caller_binding;
 #[cfg(all(windows, test))]
 use daemon_supervision::EliotdSupervisionSuccessorEvidence;
@@ -209,11 +224,11 @@ pub use eliot_kernel_service::KernelStoreGateway;
 use eliot_kernel_service::StoreRebindQuery;
 use eliot_kernel_service::{
     AgentBridgeAdmissionDescriptor, EliotdLaunchDescriptor, HostKernelCandidateBinding,
-    HostStoreBootstrapRequirement, KERNEL_CONTROL_PIPE, KernelActivationPermit,
-    KernelActivationReceipt, KernelControlCommand, KernelControlRequest, KernelControlResponse,
-    KernelReadyReceipt, KernelService, KernelServiceError, KernelServiceState,
-    ProcessAuthorityHandoffDescriptor, ProcessExecutionRequest, ProcessExecutionResponse,
-    ProcessObservation, StoreBootstrapHandoff,
+    HostStartupEvidence, HostStoreBootstrapRequirement, KERNEL_CONTROL_PIPE,
+    KernelActivationPermit, KernelActivationReceipt, KernelControlCommand, KernelControlRequest,
+    KernelControlResponse, KernelReadyReceipt, KernelService, KernelServiceError,
+    KernelServiceState, ProcessAuthorityHandoffDescriptor, ProcessExecutionRequest,
+    ProcessExecutionResponse, ProcessObservation, StoreBootstrapHandoff,
 };
 /// P-07 Doctor wire seam for the front-door dispatch/driver arms (T6-D2 Slice B).
 ///
@@ -336,6 +351,9 @@ use eliot_store_api::StoreHealth;
 use eliot_store_api::{
     CanonicalValidationSnapshot, StateFence as StoreStateFence, StoreHealthStatus,
 };
+/// Kernel-owned mechanical projection used to bind Governor R4 evidence to
+/// the live generation route and exact State Fence.
+pub use generation_control::ActiveGenerationRegistryProjection;
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
@@ -452,6 +470,10 @@ pub struct KernelComposition {
     store_rebind_gate: tokio::sync::Mutex<()>,
     approved_config_hash: Option<String>,
     canonical_store_claimed: AtomicBool,
+    /// Kernel-owned Blob Store demand controller (I1.11 step 4). `None`
+    /// while no approved blob manifest was injected; `Some` validates the
+    /// manifest at startup without starting the generation.
+    blob_store: Mutex<Option<BlobStoreController>>,
     #[cfg(windows)]
     canonical_store_gateway: Mutex<Option<Arc<KernelStoreGateway>>>,
     #[cfg(windows)]
@@ -499,6 +521,11 @@ pub struct KernelComposition {
     /// it, even when the fencing generation restarts at 1.
     #[cfg(windows)]
     local_read_claim_boot_nonce: u64,
+    /// Canonical startup sequence coordinator (I1.11 steps 1-11). The single
+    /// ordered readiness/authority-ceiling gate consulted by normal-write and
+    /// Material/Critical admission paths instead of inferring readiness from
+    /// process liveness or pipe availability.
+    startup_coordinator: Mutex<StartupCoordinator>,
 }
 
 #[cfg(windows)]
@@ -1093,6 +1120,17 @@ impl KernelComposition {
         permit: &KernelActivationPermit,
         expected_config_snapshot_sha256: &str,
     ) -> Result<KernelActivationReceipt, String> {
+        // Implements #1967: Material authority issuance consults the startup
+        // coordinator. The rejection names the unmet I1.11 prerequisite.
+        {
+            let coordinator = self
+                .startup_coordinator
+                .lock()
+                .map_err(|_| "startup gate lock poisoned".to_owned())?;
+            coordinator
+                .admit_normal_write()
+                .map_err(|rejection| rejection.to_string())?;
+        }
         let mut service = self
             .service
             .lock()
@@ -1213,6 +1251,13 @@ impl KernelComposition {
         handoff: eliot_kernel_service::StoreRebindHandoff,
         request_digest: String,
     ) -> Result<eliot_kernel_service::StoreRebindReceipt, KernelBuildError> {
+        // Implements #1967: normal canonical writes consult the startup
+        // coordinator rather than inferring readiness from liveness. The
+        // rejection names the unmet I1.11 prerequisite; inspection paths
+        // never consult this gate.
+        if let Err(error) = self.admit_normal_write() {
+            return Err(KernelBuildError::Service(error.to_string()));
+        }
         handoff
             .validate()
             .map_err(|e| KernelBuildError::Service(e.to_string()))?;
@@ -1907,6 +1952,122 @@ impl KernelComposition {
     #[must_use]
     pub fn platform(&self) -> &WindowsPlatform {
         &self.platform
+    }
+
+    /// Structured startup status for one Governance Profile (Implements
+    /// #1967). Reports the completed I1.11 step, the blocking prerequisite,
+    /// degraded optional capabilities, and the current authority ceiling.
+    /// Inspection views use this; they never gate on it.
+    #[must_use]
+    pub fn startup_status(&self, profile: GovernanceProfile) -> StartupStatus {
+        self.startup_coordinator.lock().map_or_else(
+            |poison| poison.into_inner().startup_status(profile),
+            |coordinator| coordinator.startup_status(profile),
+        )
+    }
+
+    /// Current authority ceiling for one Governance Profile. Incomplete ORS
+    /// reconciliation, store schema probe, epoch recovery, or supervision
+    /// evidence caps the ceiling at low-impact regardless of profile.
+    #[must_use]
+    pub fn startup_authority_ceiling(&self, profile: GovernanceProfile) -> AuthorityCeiling {
+        self.startup_coordinator
+            .lock()
+            .map_or(AuthorityCeiling::LowImpact, |coordinator| {
+                coordinator.authority_ceiling(profile)
+            })
+    }
+
+    /// Normal canonical-write admission through the startup coordinator.
+    /// Inspection remains allowed; a blocked write fails with the named
+    /// unmet startup prerequisite.
+    ///
+    /// # Errors
+    ///
+    /// Returns the blocking [`StartupRejection`] naming the unmet
+    /// prerequisite, or a lock-poison platform error.
+    pub fn admit_normal_write(&self) -> Result<(), KernelServiceError> {
+        let coordinator = self
+            .startup_coordinator
+            .lock()
+            .map_err(|_| KernelServiceError::Platform("startup gate lock poisoned".to_owned()))?;
+        coordinator
+            .admit_normal_write()
+            .map_err(|rejection| KernelServiceError::Platform(rejection.to_string()))
+    }
+
+    /// Material/Critical authority admission for one Governance Profile.
+    /// Startup completeness is checked first with its named prerequisite;
+    /// the profile ceiling alone decides once startup is complete.
+    ///
+    /// # Errors
+    ///
+    /// Returns the blocking [`StartupRejection`] or the profile-ceiling
+    /// rejection as a platform error carrying the named prerequisite.
+    pub fn admit_material_authority(
+        &self,
+        profile: GovernanceProfile,
+    ) -> Result<(), KernelServiceError> {
+        let coordinator = self
+            .startup_coordinator
+            .lock()
+            .map_err(|_| KernelServiceError::Platform("startup gate lock poisoned".to_owned()))?;
+        coordinator
+            .admit_material_authority(profile)
+            .map_err(|rejection| KernelServiceError::Platform(rejection.to_string()))
+    }
+
+    /// Advances one I1.11 startup step in order. Production calls this as
+    /// each probe/handshake actually completes; out-of-order steps fail.
+    ///
+    /// # Errors
+    ///
+    /// Returns the ordering error when `step` is not the next expected step
+    /// or lies outside 1-11, or a lock-poison platform error.
+    pub fn complete_startup_step(&self, step: u8) -> Result<(), KernelServiceError> {
+        let mut coordinator = self
+            .startup_coordinator
+            .lock()
+            .map_err(|_| KernelServiceError::Platform("startup gate lock poisoned".to_owned()))?;
+        coordinator
+            .complete_step(step)
+            .map_err(KernelServiceError::Platform)
+    }
+
+    /// Records one real owner-produced I1.11 evidence item. Out-of-order
+    /// evidence is retained without advancing the contiguous readiness cursor;
+    /// missing earlier steps therefore remain blocking and cannot be inferred
+    /// from a later successful probe.
+    pub(crate) fn record_startup_evidence(&self, step: u8) -> Result<(), KernelServiceError> {
+        let mut coordinator = self
+            .startup_coordinator
+            .lock()
+            .map_err(|_| KernelServiceError::Platform("startup gate lock poisoned".to_owned()))?;
+        coordinator
+            .record_live_evidence(step)
+            .map_err(KernelServiceError::Platform)
+    }
+
+    /// Records blob large-payload degradation (I1.11 step 4). Never blocks
+    /// Material by itself; it is reported in startup status.
+    pub fn note_startup_blob_degraded(&self) -> Result<(), KernelServiceError> {
+        let mut coordinator = self
+            .startup_coordinator
+            .lock()
+            .map_err(|_| KernelServiceError::Platform("startup gate lock poisoned".to_owned()))?;
+        coordinator.note_blob_degraded();
+        Ok(())
+    }
+
+    /// Records optional-capability degradation (I1.11 step 9). Never blocks
+    /// Material by itself; it is reported in startup status.
+    pub fn note_startup_capability_degraded(&self) -> Result<(), KernelServiceError> {
+        let mut coordinator = self
+            .startup_coordinator
+            .lock()
+            .map_err(|_| KernelServiceError::Platform("startup gate lock poisoned".to_owned()))?;
+        coordinator.note_capability_degraded();
+        Ok(())
     }
 
     #[cfg(test)]
