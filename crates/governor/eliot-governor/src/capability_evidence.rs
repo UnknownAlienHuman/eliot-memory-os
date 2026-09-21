@@ -27,6 +27,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeSet;
 use std::collections::HashSet;
 
 use eliot_config::legacy_capability_import::ImportedLegacyEvidence;
@@ -378,6 +379,26 @@ impl From<&ImportedLegacyEvidence> for CapabilityEvidenceRecord {
     }
 }
 
+/// Standing of one skill in the retained registry at an observation time.
+///
+/// Aggregation of the verified admission predicates across the skill's
+/// retained scopes: a fresh restriction on any retained scope restricts the
+/// skill (mirroring [`CapabilityRegistry::admit_production_route` denying on
+/// any fresh restriction); otherwise a fresh positive on any retained scope
+/// holds it; anything else (declared-only, stale, expired, future-dated, or
+/// invalidated evidence, or no records at all) leaves it unevaluated. No new
+/// semantics: this names the per-skill outcome of the existing predicates.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SkillStanding {
+    /// At least one fresh exact-scope positive with no fresh restriction.
+    Holding,
+    /// At least one fresh exact-scope restriction (broken, unsupported, or
+    /// degraded evidence).
+    Restricted,
+    /// No fresh positive and no fresh restriction.
+    Unevaluated,
+}
+
 /// Governor-owned canonical registry of scoped capability evidence.
 #[derive(Clone, Debug, Default)]
 pub struct CapabilityRegistry {
@@ -430,6 +451,55 @@ impl CapabilityRegistry {
     #[must_use]
     pub fn len(&self) -> usize {
         self.records.len()
+    }
+
+    /// Returns the canonical required capability set: distinct skill
+    /// identities with retained evidence records, sorted.
+    ///
+    /// This is the daemon's observed capability model: the installation
+    /// capabilities with any retained evidence (positive, restrictive, or
+    /// declared). Empty means cold: no model retained yet, never an
+    /// evaluated empty requirement.
+    #[must_use]
+    pub fn required_set(&self) -> Vec<String> {
+        self.records
+            .iter()
+            .map(|record| record.skill_id.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    /// Returns the standing of one skill at `now` across its retained scopes.
+    #[must_use]
+    pub fn skill_standing(&self, skill_id: &str, now: u64) -> SkillStanding {
+        let mut positive = false;
+        for record in &self.records {
+            if record.skill_id != skill_id {
+                continue;
+            }
+            if record.is_fresh_restriction_for(
+                skill_id,
+                &record.scope_fingerprint,
+                now,
+                &self.invalidated_scopes,
+            ) {
+                return SkillStanding::Restricted;
+            }
+            if record.is_fresh_positive_for(
+                skill_id,
+                &record.scope_fingerprint,
+                now,
+                &self.invalidated_scopes,
+            ) {
+                positive = true;
+            }
+        }
+        if positive {
+            SkillStanding::Holding
+        } else {
+            SkillStanding::Unevaluated
+        }
     }
 
     /// Returns true when no records are retained.
@@ -796,5 +866,89 @@ mod tests {
         registry.insert(probe("skill-a", scope(), 3));
         assert!(!registry.is_scope_invalidated(&scope()));
         assert!(registry.admit_production_route("skill-a", &scope(), 10));
+    }
+
+    #[test]
+    fn required_set_is_the_sorted_retained_skill_model() {
+        let mut registry = CapabilityRegistry::new();
+        assert!(registry.required_set().is_empty());
+        registry.insert(probe("skill-b", scope(), 1));
+        let mut other = scope();
+        other.adapter_hash = Some("adapter-hash-2".into());
+        registry.insert(probe("skill-a", other, 1));
+        // Superseding insert on the same skill/scope keeps one entry.
+        registry.insert(probe("skill-b", scope(), 2));
+        assert_eq!(registry.required_set(), vec!["skill-a", "skill-b"]);
+    }
+
+    #[test]
+    fn skill_standing_aggregates_verified_predicates() {
+        let mut registry = CapabilityRegistry::new();
+        assert_eq!(
+            registry.skill_standing("skill-a", 10),
+            SkillStanding::Unevaluated
+        );
+        registry.insert(probe("skill-a", scope(), 1));
+        assert_eq!(
+            registry.skill_standing("skill-a", 10),
+            SkillStanding::Holding
+        );
+        // Future-dated observation is not fresh.
+        assert_eq!(
+            registry.skill_standing("skill-a", 0),
+            SkillStanding::Unevaluated
+        );
+        // A fresh restriction on the same skill overrides the positive.
+        registry.insert(
+            CapabilityEvidenceRecord::verified(
+                "skill-a",
+                CapabilityStatus::Broken,
+                CapabilitySource::ReproducedFailure,
+                scope(),
+                2,
+            )
+            .expect("valid failure evidence verifies"),
+        );
+        assert_eq!(
+            registry.skill_standing("skill-a", 10),
+            SkillStanding::Restricted
+        );
+        // Other skills are unaffected.
+        assert_eq!(
+            registry.skill_standing("skill-b", 10),
+            SkillStanding::Unevaluated
+        );
+    }
+
+    #[test]
+    fn skill_standing_without_fresh_evidence_is_unevaluated() {
+        let mut registry = CapabilityRegistry::new();
+        // Declared-only legacy evidence never holds nor restricts.
+        let imported = import_legacy_declaration(&LegacyCapabilityDeclaration {
+            skill_id: "skill-a".into(),
+            scope: LegacyScopeFingerprint::default(),
+        })
+        .expect("legacy declaration imports");
+        registry.insert(CapabilityEvidenceRecord::from(&imported));
+        assert_eq!(
+            registry.skill_standing("skill-a", 10),
+            SkillStanding::Unevaluated
+        );
+        // Expired positive evidence is stale, not holding.
+        registry.insert(probe("skill-a", scope(), 1).expires_at(10));
+        assert_eq!(
+            registry.skill_standing("skill-a", 10),
+            SkillStanding::Unevaluated
+        );
+        // An invalidated scope no longer holds until requalified.
+        let mut holding = CapabilityRegistry::new();
+        holding.insert(probe("skill-a", scope(), 1));
+        let mut changed = scope();
+        changed.adapter_hash = Some("adapter-hash-2".into());
+        assert!(holding.apply_scope_change(&changed, ScopeDependencySelector::all()) >= 1);
+        assert_eq!(
+            holding.skill_standing("skill-a", 10),
+            SkillStanding::Unevaluated
+        );
     }
 }

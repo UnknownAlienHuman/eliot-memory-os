@@ -69,7 +69,7 @@ pub use canonical_projections::{
 pub use capability_evidence::{
     CapabilityEvidenceRecord, CapabilityRegistry, CapabilitySource, CapabilityStatus,
     EvidenceRelationError, MAX_CAPABILITY_EVIDENCE_RECORDS, RouteScopeFingerprint,
-    ScopeDependencySelector,
+    ScopeDependencySelector, SkillStanding,
 };
 pub use composition::*;
 pub use controlboard_projection::{

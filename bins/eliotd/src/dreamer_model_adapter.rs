@@ -66,8 +66,6 @@
 //! [`PhysicalRouteObservationReceipt::validate_against`]:
 //!     eliot_agent_api::PhysicalRouteObservationReceipt::validate_against
 
-use std::collections::BTreeSet;
-
 use eliot_agent_api::{
     AdmittedRouteReceipt, AgentResult, ExecutionOutcome, ProviderExecutionBinding,
     ResultDisposition, RouteFingerprint, RouteObservationState,
@@ -81,7 +79,8 @@ use eliot_governor::{CompositionError, CompositionReadiness, RouteScopeFingerpri
 
 use super::capability_admission::{
     CapabilityEvidenceRecord, DynamicCapabilityPulse, ProductionAdmissionRequest,
-    ProductionEvidenceBundle, StaticCapabilityAttestation, evaluate_production_admission,
+    ProductionEvidenceBundle, StaticCapabilityAttestation, canonical_required_set,
+    evaluate_production_admission,
 };
 use super::capability_evidence_wiring::GovernorCapabilityAdmission;
 use super::capability_outcome::{AttemptReceipt, FallbackOutcomeRequest, fallback_outcome};
@@ -152,6 +151,13 @@ pub struct ModelInvokeInput {
     /// `None` leaves the registry side unevaluable and fails the gate
     /// closed.
     pub evidence_scope: Option<RouteScopeFingerprint>,
+    /// Caller-observed live Kernel fence at invoke time (the current
+    /// snapshot boundary). The admitted fence is the startup boundary;
+    /// `eliotd` and Kernel may not evaluate different semantic snapshots
+    /// (I1.8), so the admitted fence must stay compatible with the live
+    /// fence or the invoke fails closed on rotation instead of admitting
+    /// on stale evidence.
+    pub current_fence: StateFence,
 }
 
 /// Thin governed Dreamer model-call adapter over the retained daemon owners.
@@ -457,37 +463,6 @@ pub(crate) async fn invoke_admitted_model(
     Ok(result)
 }
 
-/// Resolves the canonical required capability set for one invoke (R2).
-///
-/// Union of the Task Controller launch intent
-/// (`request.launch.required_competence`, owner-validated non-empty by the
-/// coordinator plan above) and the explicit Human Dreamer-role preference
-/// (`policy.required_capabilities`, owner-validated text). Both arrive
-/// threaded per call; no set is defaulted and no capability is inferred.
-/// An empty union fails closed: an empty required set never admits.
-fn required_capabilities(input: &ModelInvokeInput) -> Result<Vec<String>, CompositionError> {
-    let mut required = BTreeSet::new();
-    for item in &input.request.launch.required_competence {
-        required.insert(item.clone());
-    }
-    for preference in input
-        .policy
-        .roles
-        .iter()
-        .filter(|preference| preference.role == ModelRole::Dreamer)
-    {
-        for capability in &preference.required_capabilities {
-            required.insert(capability.clone());
-        }
-    }
-    if required.is_empty() {
-        return Err(owner_error(
-            "dreamer model invoke has no required capabilities; refusing an empty required set",
-        ));
-    }
-    Ok(required.into_iter().collect())
-}
-
 /// Returns true when the caller threads critical evidence for one capability.
 ///
 /// Criticality has no separate owner: the caller asserts it by threading a
@@ -518,8 +493,14 @@ fn is_critical_capability(
 ///
 /// Order is load-bearing and every failure returns before the execution port
 /// is touched:
+/// - snapshot boundaries (I1.8): the caller-observed live fence must validate
+///   and the admitted (startup-boundary) fence must stay compatible with it,
+///   using the same owner check as the startup evidence build. Rotation fails
+///   closed instead of admitting on stale evidence; compatibility carries the
+///   exact generation agreement, so the evaluated generation below is current.
 /// - R2: the canonical required set (launch intent plus Human Dreamer-role
-///   preference) is resolved per call; empty fails closed.
+///   preference, via [`canonical_required_set`]) is resolved per call; empty
+///   or malformed fails closed.
 /// - R4: the generation under evaluation is the Kernel-owned admitted
 ///   fence's resource generation, and the execution binding must agree with
 ///   it exactly. No caller-supplied generation is trusted.
@@ -539,7 +520,24 @@ fn gate_model_capability(
     registry: &GovernorCapabilityAdmission,
     input: &ModelInvokeInput,
 ) -> Result<Vec<String>, CompositionError> {
-    let required = required_capabilities(input)?;
+    input
+        .current_fence
+        .validate()
+        .map_err(|error| owner_error(format!("dreamer model live fence: {error}")))?;
+    if !admitted_fence.is_compatible_with(&input.current_fence) {
+        return Err(owner_error(
+            "dreamer model admitted fence is not compatible with the live kernel fence (rotation)",
+        ));
+    }
+    let required = canonical_required_set(
+        &input.request.launch.required_competence,
+        &input.policy,
+    )
+    .ok_or_else(|| {
+        owner_error(
+            "dreamer model invoke has no valid required capabilities; refusing an empty required set",
+        )
+    })?;
     let generation = admitted_fence.resource_generation.value();
     if input.binding.runtime_generation != admitted_fence.resource_generation {
         return Err(owner_error(
@@ -1090,6 +1088,7 @@ mod tests {
             static_attestation: None,
             pulse: None,
             evidence_scope: None,
+            current_fence: fence.clone(),
         };
         let execution = RecordingExecution {
             calls: Mutex::new(0),
@@ -1256,6 +1255,7 @@ mod tests {
             static_attestation: None,
             pulse: None,
             evidence_scope: scope,
+            current_fence: fixtures.fence.clone(),
         }
     }
 
@@ -1609,6 +1609,48 @@ mod tests {
                 "partial critical evidence must deny for the capability, got: {error}"
             ),
             Ok(_) => panic!("partial critical evidence must fail closed"),
+        }
+        assert_eq!(succeeding_calls(&execution)?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rotated_live_fence_denies_before_execution() -> TestResult {
+        // The admitted (startup-boundary) fence is genesis, but the live
+        // kernel fence has since advanced: eliotd and Kernel may not
+        // evaluate different semantic snapshots (I1.8), so the invoke fails
+        // closed on rotation even with fresh evidence on both sides.
+        let fixtures = invoke_fixtures()?;
+        let scope = test_evidence_scope();
+        let registry = test_registry_admitted(&scope)?;
+        let generation = fixtures.fence.resource_generation.value();
+        let base = gate_input(
+            &fixtures,
+            vec![test_funnel_record(&fixtures.route, generation)],
+            Some(scope),
+        );
+        let input = ModelInvokeInput {
+            current_fence: drifted_fence()?,
+            ..base
+        };
+        let execution = SucceedingExecution {
+            calls: Mutex::new(0),
+            result: matched_success(
+                &fixtures.admission,
+                &fixtures.binding,
+                &fixtures.route,
+                &fixtures.fence,
+            )?,
+        };
+        let mut intake = AttemptReceipt::new(fixtures.binding.attempt_id.as_str())
+            .map_err(|error| format!("intake: {error}"))?;
+        let outcome = run_gate(&fixtures, &registry, &input, &mut intake, &execution).await;
+        match outcome {
+            Err(error) => assert!(
+                error.to_string().contains("rotation") || error.to_string().contains("compatible"),
+                "rotation must deny on the snapshot boundary, got: {error}"
+            ),
+            Ok(_) => panic!("rotated live fence must fail closed"),
         }
         assert_eq!(succeeding_calls(&execution)?, 0);
         Ok(())

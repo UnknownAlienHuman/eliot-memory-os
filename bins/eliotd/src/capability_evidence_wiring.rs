@@ -28,6 +28,7 @@ use eliot_config::legacy_capability_import::{
 };
 use eliot_governor::{
     CapabilityEvidenceRecord, CapabilityRegistry, RouteScopeFingerprint, ScopeDependencySelector,
+    SkillStanding,
 };
 use eliot_store_api::{
     EVIDENCE_PACK_MAX_RECORDS, NamedReadOperation, NamedReadRequest, NamedReadResponse,
@@ -112,6 +113,22 @@ impl GovernorCapabilityAdmission {
         self.registry
             .insert(CapabilityEvidenceRecord::from(&imported));
         Ok(())
+    }
+
+    /// Returns the canonical required capability set: distinct skill
+    /// identities with retained evidence records, sorted. No semantic rule
+    /// lives here; this is the Governor registry's observed model.
+    #[must_use]
+    pub fn required_set(&self) -> Vec<String> {
+        self.registry.required_set()
+    }
+
+    /// Returns the standing of one skill at `now` across its retained
+    /// scopes. No semantic rule lives here; this is the Governor
+    /// registry's aggregation of its verified predicates.
+    #[must_use]
+    pub fn skill_standing(&self, skill_id: &str, now: u64) -> SkillStanding {
+        self.registry.skill_standing(skill_id, now)
     }
 
     /// Production admission for one skill on one exact route scope at `now`.
@@ -366,6 +383,22 @@ mod tests {
         };
         assert_eq!(admission.apply_scope_change(&changed, selector), 1);
         assert!(!admission.admit_production_route("skill-demo", &changed, 10));
+    }
+
+    #[test]
+    fn required_set_and_standing_read_through_the_held_view() {
+        let mut admission = GovernorCapabilityAdmission::new();
+        assert!(admission.required_set().is_empty());
+        admission.insert(probe("skill-demo", 1));
+        assert_eq!(admission.required_set(), vec!["skill-demo".to_owned()]);
+        assert_eq!(
+            admission.skill_standing("skill-demo", 10),
+            SkillStanding::Holding
+        );
+        assert_eq!(
+            admission.skill_standing("skill-unknown", 10),
+            SkillStanding::Unevaluated
+        );
     }
 
     #[test]

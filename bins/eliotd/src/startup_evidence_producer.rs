@@ -18,9 +18,13 @@
 //!   only from satisfied values; absent markers leave the step absent. A
 //!   missing acquirable input (transport binding, fences, Config mirror)
 //!   blocks the build with [`StartupEvidenceError::Missing`]; inputs whose
-//!   owner does not exist yet in this tree (Policy mirror, required set,
-//!   outcomes, registry digest, generation fingerprint) build as absence
-//!   markers with warn diagnostics naming them.
+//!   owner does not exist yet in this tree (Policy mirror while unserved,
+//!   capability outcomes, registry digest, generation fingerprint) build as
+//!   absence markers with warn diagnostics naming them. The retained
+//!   capability model IS evaluated at the startup boundary (see
+//!   [`summarize_retained_capabilities`]): holding/restricted/unevaluated
+//!   partitions surface as visible degradation, while the wire triple stays
+//!   explicitly absent — evaluated absence, never ignorance.
 //! - ready is never set from a nonempty list, a caller flag, or a newly
 //!   instantiated default `Config`. Present mirror digests must be validated
 //!   [`PlatformHandle`] values and byte-equal between the canonical source
@@ -83,20 +87,28 @@
 //! - absent owners (explicit markers, warn diagnostics, follow-up owners):
 //!   Policy mirror while the Kernel does not serve the Policy named read
 //!   (owner absent; needs the Kernel-served read plus the live projection),
-//!   required set and outcomes (no retained registry or startup evaluation
-//!   in the daemon yet; B2280 capability-admission coordination point),
-//!   generation fingerprint (Generation Registry scheme is Kernel-owned).
+//!   capability outcomes (need execution observations from the execution
+//!   owner; retained evidence alone mints none) plus the registry digest
+//!   bound to them, generation fingerprint (Generation Registry scheme is
+//!   Kernel-owned). The required set itself IS derived from the retained
+//!   Governor registry at the startup boundary (see
+//!   [`summarize_retained_capabilities`]) and surfaces as visible
+//!   degradation; the wire triple stays absent until outcomes and the
+//!   fingerprint exist — a partial evaluation would block step 8, and an
+//!   empty set from ignorance is forbidden.
 //!
 //! Like the neighboring admission joins, this helper never mints admission,
 //! identity, or fences: it evaluates presented values and returns evidence
 //! or a named blocker.
 
 use eliot_contracts::{StateFence, sha256_hex};
+use eliot_governor::SkillStanding;
 use eliot_platform::PlatformHandle;
 use eliot_protocol::RequestIdentity;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use super::capability_evidence_wiring::GovernorCapabilityAdmission;
 use super::capability_outcome::{CapabilityOutcome, CapabilityRegistryView};
 
 /// Authenticated daemon readiness exchange operation carrying the startup
@@ -558,6 +570,69 @@ pub fn build_startup_evidence(
     Ok(evidence)
 }
 
+/// Retained capability-model evaluation at the startup boundary (I1.11 step 9).
+///
+/// Partitions the daemon-held Governor registry's required set (distinct
+/// retained skill identities) by standing at the observation time. The
+/// partition is authentic retained-state evaluation: holding skills carry
+/// fresh positive evidence, restricted skills carry fresh restrictions, and
+/// the rest are unevaluated (declared-only, stale, or invalidated). It feeds
+/// visible degradation (warn diagnostics plus the daemon readiness record),
+/// never the wire triple: outcomes need execution observations and the
+/// fingerprint needs the Kernel-owned scheme, so the triple stays explicitly
+/// absent until those owners serve.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetainedCapabilitySummary {
+    /// Canonical required set: distinct retained skill identities, sorted.
+    /// Empty means cold (no model retained), never an evaluated empty
+    /// requirement.
+    pub required: Vec<String>,
+    /// Required skills holding fresh positive evidence with no restriction.
+    pub holding: Vec<String>,
+    /// Required skills under a fresh restriction (visible degradation).
+    pub restricted: Vec<String>,
+    /// Required skills with no fresh evidence either way.
+    pub unevaluated: Vec<String>,
+}
+
+impl RetainedCapabilitySummary {
+    /// Returns true when at least one required skill is restricted.
+    #[must_use]
+    pub const fn has_restrictions(&self) -> bool {
+        !self.restricted.is_empty()
+    }
+}
+
+/// Evaluates the retained Governor capability model at one observation time.
+///
+/// Pure over the daemon-held view: no reads, no minting, no clock. The
+/// caller threads the observation time (the publish site uses its live
+/// clock reading); staleness derives from owner-set windows exactly as in
+/// the admission predicates.
+#[must_use]
+pub fn summarize_retained_capabilities(
+    view: &GovernorCapabilityAdmission,
+    now_unix_ms: u64,
+) -> RetainedCapabilitySummary {
+    let mut holding = Vec::new();
+    let mut restricted = Vec::new();
+    let mut unevaluated = Vec::new();
+    let required = view.required_set();
+    for skill in &required {
+        match view.skill_standing(skill, now_unix_ms) {
+            SkillStanding::Holding => holding.push(skill.clone()),
+            SkillStanding::Restricted => restricted.push(skill.clone()),
+            SkillStanding::Unevaluated => unevaluated.push(skill.clone()),
+        }
+    }
+    RetainedCapabilitySummary {
+        required,
+        holding,
+        restricted,
+        unevaluated,
+    }
+}
+
 /// Publishes Governor startup evidence from the live daemon flow.
 ///
 /// Called at the real readiness site after `report_ready`: threads the live
@@ -570,10 +645,33 @@ pub fn build_startup_evidence(
 /// unchanged and the Kernel keeps steps 8/9 fenced until its consumer
 /// lands. Mirror, registry, capability, and operation owners extend this
 /// call with their retained observations when available.
+///
+/// Returns the retained capability-model evaluation at the publish
+/// observation time (see [`summarize_retained_capabilities`]): the runtime
+/// feeds it into the daemon readiness record so restricted skills become
+/// visible degradation. The evaluation runs even when the evidence build
+/// itself fails, and an unreadable view (composition not ready) evaluates
+/// as cold with an explicit warn — never blocking the acquirable mirrors.
 pub fn publish_daemon_startup_evidence(
     kernel: &super::DaemonKernelClient,
     composition: &super::DaemonComposition,
-) {
+) -> RetainedCapabilitySummary {
+    let now_unix_ms = super::unix_ms();
+    let summary = match composition.capability_admission() {
+        Ok(view) => summarize_retained_capabilities(view, now_unix_ms),
+        Err(error) => {
+            tracing::warn!(
+                "governor capability model unevaluated at startup (step 9 absent): {error}"
+            );
+            summarize_retained_capabilities(&GovernorCapabilityAdmission::new(), now_unix_ms)
+        }
+    };
+    if summary.has_restrictions() {
+        tracing::warn!(
+            "governor startup capability evaluation: restricted skills observed (visible degradation, step 9 absent): {}",
+            summary.restricted.join(", ")
+        );
+    }
     let observed = kernel.kernel_fence();
     let outcome = (|| -> Result<EliotdStartupEvidence, StartupEvidenceError> {
         let binding = kernel.mint_startup_evidence_identity().map_err(|error| {
@@ -625,13 +723,23 @@ pub fn publish_daemon_startup_evidence(
                 rebuilt_digest: rebuilt,
             }),
             policy_mirror,
+            // Step-9 capability triple: evaluated absence, never ignorance.
+            // The required set above is genuinely derived from the retained
+            // Governor registry, but outcomes need execution observations
+            // (none exist at boot: no admitted request has executed) and the
+            // fingerprint needs the Kernel-owned Generation Registry scheme
+            // (no canonical scheme exists). A partial triple would fail the
+            // build and regress step 8; an empty set from ignorance is
+            // forbidden. So the triple stays explicitly absent until those
+            // owners serve — the evaluation above names exactly what is
+            // missing and restricted skills already surface as degradation.
             required_capabilities: None,
             capability_outcomes: None,
             capability_registry_digest: None,
             active_generation_fingerprint: None,
             session_id: None,
             evidence_refs: Vec::new(),
-            now_unix_ms: super::unix_ms(),
+            now_unix_ms,
         };
         let evidence = build_startup_evidence(&request)?;
         kernel
@@ -647,6 +755,7 @@ pub fn publish_daemon_startup_evidence(
             tracing::warn!("governor startup evidence not ready (steps 8/9 stay fenced): {error}");
         }
     }
+    summary
 }
 
 #[cfg(test)]
@@ -988,6 +1097,75 @@ mod tests {
                 "ineligible capability must mismatch, got {error}"
             )));
         }
+        Ok(())
+    }
+
+    fn summary_scope() -> eliot_governor::RouteScopeFingerprint {
+        eliot_governor::RouteScopeFingerprint {
+            runtime_hash: Some("startup-runtime-1".to_owned()),
+            adapter_hash: Some("startup-adapter-1".to_owned()),
+            os_architecture: Some("x86_64-windows".to_owned()),
+            auth_profile_class: Some("user-broker".to_owned()),
+            provider_model_route: Some("provider/model/auth".to_owned()),
+            feature_flags_and_serializer: Some("serializer-1".to_owned()),
+        }
+    }
+
+    fn summary_probe(
+        skill: &str,
+        observed_at: u64,
+    ) -> Result<eliot_governor::CapabilityEvidenceRecord, String> {
+        eliot_governor::CapabilityEvidenceRecord::verified(
+            skill,
+            eliot_governor::CapabilityStatus::ProbePassed,
+            eliot_governor::CapabilitySource::ActiveProbe,
+            summary_scope(),
+            observed_at,
+        )
+        .map_err(|error| format!("probe evidence: {error}"))
+    }
+
+    #[test]
+    fn retained_summary_partitions_holding_restricted_unevaluated()
+    -> Result<(), StartupEvidenceError> {
+        use eliot_config::legacy_capability_import::{
+            LegacyCapabilityDeclaration, LegacyScopeFingerprint,
+        };
+        // Cold registry: empty required set, nothing restricted.
+        let cold = summarize_retained_capabilities(&GovernorCapabilityAdmission::new(), 1_500);
+        assert!(cold.required.is_empty());
+        assert!(!cold.has_restrictions());
+        // Retained model: one holding probe, one fresh restriction, one
+        // declared-only legacy import.
+        let mut view = GovernorCapabilityAdmission::new();
+        view.insert(summary_probe("skill-holding", 1_000).map_err(contract)?);
+        view.insert(
+            eliot_governor::CapabilityEvidenceRecord::verified(
+                "skill-restricted",
+                eliot_governor::CapabilityStatus::Broken,
+                eliot_governor::CapabilitySource::ReproducedFailure,
+                summary_scope(),
+                1_200,
+            )
+            .map_err(|error| contract(format!("failure evidence: {error}")))?,
+        );
+        view.import_legacy(&LegacyCapabilityDeclaration {
+            skill_id: "skill-declared".to_owned(),
+            scope: LegacyScopeFingerprint::default(),
+        })
+        .map_err(|error| contract(format!("legacy import: {error}")))?;
+        let summary = summarize_retained_capabilities(&view, 1_500);
+        assert_eq!(
+            summary.required,
+            vec!["skill-declared", "skill-holding", "skill-restricted"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(summary.holding, vec!["skill-holding".to_owned()]);
+        assert_eq!(summary.restricted, vec!["skill-restricted".to_owned()]);
+        assert_eq!(summary.unevaluated, vec!["skill-declared".to_owned()]);
+        assert!(summary.has_restrictions());
         Ok(())
     }
 }

@@ -93,7 +93,7 @@ pub use capability_admission::{
     AdmissionDisposition, AdmissionOutcome, CapabilityEvidenceRecord, CapabilityEvidenceStatus,
     DynamicCapabilityPulse, ProductionAdmissionRequest, ProductionEvidenceBundle,
     RouteAdmissionDecision, StaticCapabilityAttestation, admit_production_route,
-    evaluate_production_admission,
+    canonical_required_set, evaluate_production_admission,
 };
 pub use capability_evidence_wiring::{
     EvidenceBridgeError, GovernorCapabilityAdmission, ObservedLifecycleSummary,
@@ -151,8 +151,9 @@ pub use route_receipts::{
 };
 pub use startup_evidence_producer::{
     DAEMON_STARTUP_EVIDENCE_OPERATION, EliotdStartupEvidence, MAX_CAPABILITY_OUTCOMES,
-    MAX_EVIDENCE_REFS, MAX_REQUIRED_CAPABILITIES, MirrorObservation, StartupEvidenceError,
-    StartupEvidenceRequest, build_startup_evidence, publish_daemon_startup_evidence,
+    MAX_EVIDENCE_REFS, MAX_REQUIRED_CAPABILITIES, MirrorObservation, RetainedCapabilitySummary,
+    StartupEvidenceError, StartupEvidenceRequest, build_startup_evidence,
+    publish_daemon_startup_evidence, summarize_retained_capabilities,
 };
 pub use store_failure_projection::{GovernorStoreFailureProjection, GovernorStoreProjectionError};
 

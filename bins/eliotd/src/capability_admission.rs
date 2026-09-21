@@ -44,12 +44,54 @@
 //! Like the neighboring admission joins, this helper never mints admission: it
 //! evaluates presented evidence and returns a disposition.
 
+use std::collections::BTreeSet;
+
 use eliot_agent_api::AttemptId;
 use eliot_agent_api::RouteFingerprint;
+use eliot_agent_coordinator::{HumanModelPreferencePolicy, ModelRole};
 
 use crate::route_receipts::{
     ActualRouteReceipt, GovernorRouteAttempt, RouteReceiptError, RuntimeObservedFacts,
 };
+
+/// Canonical required capability set for one model invoke (R2, I1.11 step 9).
+///
+/// Union of the Task Controller launch intent (`required_competence`,
+/// owner-enforced non-empty by the coordinator plan) and the explicit Human
+/// Dreamer-role preference (`required_capabilities`, owner-validated text),
+/// sorted for determinism. Both inputs arrive owner-shaped and
+/// caller-threaded per call; this function unites them without defaulting,
+/// inferring, or narrowing: an empty union — or any blank or
+/// control-bearing name, which would otherwise narrow the set and widen
+/// admission — fails closed as `None`, never an empty admit.
+#[must_use]
+pub fn canonical_required_set(
+    launch_competence: &[String],
+    policy: &HumanModelPreferencePolicy,
+) -> Option<Vec<String>> {
+    let mut required = BTreeSet::new();
+    for item in launch_competence {
+        required.insert(item.clone());
+    }
+    for preference in policy
+        .roles
+        .iter()
+        .filter(|preference| preference.role == ModelRole::Dreamer)
+    {
+        for capability in &preference.required_capabilities {
+            required.insert(capability.clone());
+        }
+    }
+    if required.is_empty() {
+        return None;
+    }
+    for name in &required {
+        if name.trim().is_empty() || name.chars().any(char::is_control) {
+            return None;
+        }
+    }
+    Some(required.into_iter().collect())
+}
 
 /// Capability evidence standing, mirroring the I3.4
 /// `CapabilityEvidenceRecord.status` vocabulary.
@@ -729,5 +771,83 @@ mod tests {
         assert_eq!(outcome.disposition, AdmissionDisposition::Block);
         assert!(!outcome.admitted());
         Ok(())
+    }
+
+    fn test_policy_with(caps: &[&str]) -> HumanModelPreferencePolicy {
+        use eliot_agent_coordinator::{
+            BillingClass, MODEL_PREFERENCE_SCHEMA_VERSION, RoleModelPreference,
+        };
+        HumanModelPreferencePolicy {
+            schema_version: MODEL_PREFERENCE_SCHEMA_VERSION.to_owned(),
+            policy_id: "policy-required-set".to_owned(),
+            revision: "policy-rev-1".to_owned(),
+            account_scope: "account-required-set".to_owned(),
+            roles: vec![
+                RoleModelPreference {
+                    role: ModelRole::Dreamer,
+                    preferred: Vec::new(),
+                    denied: Vec::new(),
+                    allowed_billing: BTreeSet::from([BillingClass::Free]),
+                    allow_paid_fallback: false,
+                    allow_degraded_routes: false,
+                    minimum_context_window: 1,
+                    maximum_cost_class: 10,
+                    maximum_latency_class: 10,
+                    required_capabilities: caps.iter().map(|cap| (*cap).to_owned()).collect(),
+                },
+                RoleModelPreference {
+                    role: ModelRole::Worker,
+                    preferred: Vec::new(),
+                    denied: Vec::new(),
+                    allowed_billing: BTreeSet::from([BillingClass::Free]),
+                    allow_paid_fallback: false,
+                    allow_degraded_routes: false,
+                    minimum_context_window: 1,
+                    maximum_cost_class: 10,
+                    maximum_latency_class: 10,
+                    // Worker-role capabilities never leak into the Dreamer
+                    // invoke set.
+                    required_capabilities: BTreeSet::from(["worker-only".to_owned()]),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn canonical_required_set_unites_launch_and_dreamer_policy() {
+        let set = canonical_required_set(
+            &["rust".to_owned(), "route.execute".to_owned()],
+            &test_policy_with(&["telemetry", "rust"]),
+        )
+        .expect("union must produce");
+        assert_eq!(set, vec!["route.execute", "rust", "telemetry"]);
+        // Launch-only and policy-only both produce; duplicates collapse.
+        assert_eq!(
+            canonical_required_set(&["rust".to_owned()], &test_policy_with(&[])),
+            Some(vec!["rust".to_owned()])
+        );
+        assert_eq!(
+            canonical_required_set(&[], &test_policy_with(&["telemetry"])),
+            Some(vec!["telemetry".to_owned()])
+        );
+    }
+
+    #[test]
+    fn canonical_required_set_fails_closed_on_empty_or_malformed() {
+        assert_eq!(
+            canonical_required_set(&[], &test_policy_with(&[])),
+            None,
+            "an empty union never admits"
+        );
+        assert_eq!(
+            canonical_required_set(&["  ".to_owned()], &test_policy_with(&[])),
+            None,
+            "a blank launch item fails the whole set, never narrows it"
+        );
+        assert_eq!(
+            canonical_required_set(&["rust".to_owned()], &test_policy_with(&["ok\u{7}"])),
+            None,
+            "a control-bearing policy item fails the whole set"
+        );
     }
 }
