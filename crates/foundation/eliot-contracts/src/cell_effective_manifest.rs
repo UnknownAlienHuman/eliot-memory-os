@@ -1224,4 +1224,16 @@ mod tests {
         assert_eq!(cells, 2);
         Ok(())
     }
+    #[test]
+    fn duplicate_cell_ref_is_rejected() -> TestResult {
+        let inputs = vec![
+            valid_input("foundation.contracts.primitives", "foundation-owner-a")?,
+            valid_input("foundation.contracts.primitives", "foundation-owner-b")?,
+        ];
+        assert!(matches!(
+            generate_effective_manifests_for_crate(inputs),
+            Err(CellManifestError::DuplicateCell { .. })
+        ));
+        Ok(())
+    }
 }
