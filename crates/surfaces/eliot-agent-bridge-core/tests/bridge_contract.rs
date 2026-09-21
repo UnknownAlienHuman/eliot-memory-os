@@ -1446,3 +1446,92 @@ fn recall_projection_rejects_forged_disposition_and_hides_suppressed_content()
     assert!(project_recall_for_agent(&response, &forged, false).is_err());
     Ok(())
 }
+
+#[test]
+fn recall_projection_reports_stale_projection_and_empty_corpus_with_bound_receipts()
+-> Result<(), Box<dyn std::error::Error>> {
+    use eliot_agent_bridge_core::project_recall_for_agent;
+    use eliot_types::{
+        CognitiveProjectionReadState, L0RankTrace, MemoryConfidence, MemoryRevision, ProjectId,
+        RecallDisposition, RecallL0Response, ServerRecallVerdict, TruncationInfo,
+    };
+    let stale = RecallL0Response {
+        project_id: ProjectId::new_v7(),
+        at_revision: MemoryRevision::new(7),
+        projection_revision: Some(MemoryRevision::new(6)),
+        projection_state: CognitiveProjectionReadState::Stale,
+        handles: Vec::new(),
+        memory_confidence: MemoryConfidence::None,
+        query_mode: "test".to_owned(),
+        rank_trace: L0RankTrace {
+            query: "recall".to_owned(),
+            normalized_query: "recall".to_owned(),
+            candidates_considered: 3,
+            candidates_returned: 0,
+            ..Default::default()
+        },
+        truncation: TruncationInfo {
+            truncated: false,
+            limit: 12,
+            returned: 0,
+        },
+    };
+    let stale_verdict = ServerRecallVerdict::issue_for_l0_response(
+        &stale,
+        "project/a",
+        "fence-7",
+        false,
+        true,
+        false,
+    )?;
+    assert_eq!(
+        stale_verdict.disposition,
+        RecallDisposition::StaleProjection
+    );
+    let projected = project_recall_for_agent(&stale, &stale_verdict, false)?;
+    assert!(projected.handles.is_empty());
+    assert!(projected.debug_rank_trace.is_none());
+    assert!(!projected.rank_trace_handle.is_empty());
+    assert_eq!(projected.receipt.scope, "project/a");
+    assert_eq!(projected.receipt.state_fence, "fence-7");
+    assert_eq!(
+        projected.receipt.freshness,
+        CognitiveProjectionReadState::Stale
+    );
+    let empty = RecallL0Response {
+        project_id: ProjectId::new_v7(),
+        at_revision: MemoryRevision::new(1),
+        projection_revision: Some(MemoryRevision::new(1)),
+        projection_state: CognitiveProjectionReadState::Published,
+        handles: Vec::new(),
+        memory_confidence: MemoryConfidence::None,
+        query_mode: "test".to_owned(),
+        rank_trace: L0RankTrace {
+            query: "recall".to_owned(),
+            normalized_query: "recall".to_owned(),
+            ..Default::default()
+        },
+        truncation: TruncationInfo {
+            truncated: false,
+            limit: 12,
+            returned: 0,
+        },
+    };
+    let empty_verdict = ServerRecallVerdict::issue_for_l0_response(
+        &empty,
+        "project/a",
+        "fence-1",
+        true,
+        true,
+        false,
+    )?;
+    assert_eq!(empty_verdict.disposition, RecallDisposition::EmptyCorpus);
+    let projected = project_recall_for_agent(&empty, &empty_verdict, false)?;
+    assert!(projected.handles.is_empty());
+    assert!(projected.debug_rank_trace.is_none());
+    assert!(!projected.rank_trace_handle.is_empty());
+    assert_eq!(projected.receipt.scope, "project/a");
+    assert_eq!(projected.receipt.visible_count, 0);
+    assert_eq!(projected.receipt.suppressed_count, 0);
+    Ok(())
+}
