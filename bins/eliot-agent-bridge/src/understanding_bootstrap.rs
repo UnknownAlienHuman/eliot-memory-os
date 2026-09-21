@@ -368,55 +368,69 @@ pub const fn cap_assessment(
     }
 }
 
-fn compose_selection(tasks: &BootstrapTaskInputs) -> Result<TaskSelectionView, BootstrapError> {
-    let contaminated = tasks.candidates.iter().any(is_crossover);
-    let mut contamination_flags = Vec::new();
-    if contaminated {
-        contamination_flags.push(CROSSOVER_CONTAMINATED.to_owned());
-    }
-    let handles = tasks
+fn selection_handles(tasks: &BootstrapTaskInputs) -> Vec<String> {
+    tasks
         .candidates
         .iter()
         .map(|candidate| candidate.handle.clone())
-        .collect::<Vec<_>>();
+        .collect()
+}
 
-    if let Some(selection) = &tasks.authoritative_selection {
-        let Some(matched) = tasks
-            .candidates
-            .iter()
-            .find(|candidate| candidate.handle == selection.selected_handle)
-        else {
-            return Err(BootstrapError::new(
-                "SELECTION_UNKNOWN_HANDLE",
-                "authoritative selection names no listed candidate; refusing to choose",
-            ));
-        };
-        if is_crossover(matched) {
-            return Err(BootstrapError::new(
-                "SELECTION_CONTAMINATED",
-                "authoritative selection names a crossover-contaminated candidate without an independent binding record; refusing to bind",
-            ));
-        }
-        let Some(revision) = matched.task_revision else {
-            return Err(BootstrapError::new(
-                "SELECTION_REVISION_MISSING",
-                "authoritative selection target carries no exact task revision; refusing to bind",
-            ));
-        };
-        return Ok(TaskSelectionView {
-            disposition: TaskSelectionDisposition::Bound,
-            scope_level: tasks.scope_level,
-            candidate_task_handles: handles,
-            selected_task_and_revision: Some(SelectedTask {
-                task_ref: matched.handle.clone(),
-                task_revision: revision,
-            }),
-            acceptance_digest: matched.acceptance_digest.clone(),
-            selection_source_and_reason: format!("{}: {}", selection.source, selection.reason),
-            contamination_flags,
-        });
+fn selection_contamination_flags(tasks: &BootstrapTaskInputs) -> Vec<String> {
+    if tasks.candidates.iter().any(is_crossover) {
+        vec![CROSSOVER_CONTAMINATED.to_owned()]
+    } else {
+        Vec::new()
     }
+}
 
+fn bind_authoritative(
+    tasks: &BootstrapTaskInputs,
+    selection: &AuthoritativeSelection,
+    handles: Vec<String>,
+    contamination_flags: Vec<String>,
+) -> Result<TaskSelectionView, BootstrapError> {
+    let Some(matched) = tasks
+        .candidates
+        .iter()
+        .find(|candidate| candidate.handle == selection.selected_handle)
+    else {
+        return Err(BootstrapError::new(
+            "SELECTION_UNKNOWN_HANDLE",
+            "authoritative selection names no listed candidate; refusing to choose",
+        ));
+    };
+    if is_crossover(matched) {
+        return Err(BootstrapError::new(
+            "SELECTION_CONTAMINATED",
+            "authoritative selection names a crossover-contaminated candidate without an independent binding record; refusing to bind",
+        ));
+    }
+    let Some(revision) = matched.task_revision else {
+        return Err(BootstrapError::new(
+            "SELECTION_REVISION_MISSING",
+            "authoritative selection target carries no exact task revision; refusing to bind",
+        ));
+    };
+    Ok(TaskSelectionView {
+        disposition: TaskSelectionDisposition::Bound,
+        scope_level: tasks.scope_level,
+        candidate_task_handles: handles,
+        selected_task_and_revision: Some(SelectedTask {
+            task_ref: matched.handle.clone(),
+            task_revision: revision,
+        }),
+        acceptance_digest: matched.acceptance_digest.clone(),
+        selection_source_and_reason: format!("{}: {}", selection.source, selection.reason),
+        contamination_flags,
+    })
+}
+
+fn bind_uncontended(
+    tasks: &BootstrapTaskInputs,
+    handles: Vec<String>,
+    contamination_flags: Vec<String>,
+) -> Result<TaskSelectionView, BootstrapError> {
     if tasks.candidates.is_empty() {
         return Ok(TaskSelectionView {
             disposition: TaskSelectionDisposition::None,
@@ -428,39 +442,48 @@ fn compose_selection(tasks: &BootstrapTaskInputs) -> Result<TaskSelectionView, B
             contamination_flags,
         });
     }
-    if tasks.candidates.len() == 1 {
-        let only = &tasks.candidates[0];
-        if is_crossover(only) {
-            return Ok(TaskSelectionView {
-                disposition: TaskSelectionDisposition::None,
-                scope_level: tasks.scope_level,
-                candidate_task_handles: handles,
-                selected_task_and_revision: None,
-                acceptance_digest: None,
-                selection_source_and_reason:
-                    "sole candidate is crossover-contaminated; independent rebinding required"
-                        .to_owned(),
-                contamination_flags,
-            });
-        }
-        let Some(revision) = only.task_revision else {
-            return Err(BootstrapError::new(
-                "SELECTION_REVISION_MISSING",
-                "sole candidate carries no exact task revision; refusing to bind",
-            ));
-        };
+    let only = &tasks.candidates[0];
+    if is_crossover(only) {
         return Ok(TaskSelectionView {
-            disposition: TaskSelectionDisposition::Unique,
+            disposition: TaskSelectionDisposition::None,
             scope_level: tasks.scope_level,
             candidate_task_handles: handles,
-            selected_task_and_revision: Some(SelectedTask {
-                task_ref: only.handle.clone(),
-                task_revision: revision,
-            }),
-            acceptance_digest: only.acceptance_digest.clone(),
-            selection_source_and_reason: "single eligible candidate; no choice made".to_owned(),
+            selected_task_and_revision: None,
+            acceptance_digest: None,
+            selection_source_and_reason:
+                "sole candidate is crossover-contaminated; independent rebinding required"
+                    .to_owned(),
             contamination_flags,
         });
+    }
+    let Some(revision) = only.task_revision else {
+        return Err(BootstrapError::new(
+            "SELECTION_REVISION_MISSING",
+            "sole candidate carries no exact task revision; refusing to bind",
+        ));
+    };
+    Ok(TaskSelectionView {
+        disposition: TaskSelectionDisposition::Unique,
+        scope_level: tasks.scope_level,
+        candidate_task_handles: handles,
+        selected_task_and_revision: Some(SelectedTask {
+            task_ref: only.handle.clone(),
+            task_revision: revision,
+        }),
+        acceptance_digest: only.acceptance_digest.clone(),
+        selection_source_and_reason: "single eligible candidate; no choice made".to_owned(),
+        contamination_flags,
+    })
+}
+
+fn compose_selection(tasks: &BootstrapTaskInputs) -> Result<TaskSelectionView, BootstrapError> {
+    let handles = selection_handles(tasks);
+    let contamination_flags = selection_contamination_flags(tasks);
+    if let Some(selection) = &tasks.authoritative_selection {
+        return bind_authoritative(tasks, selection, handles, contamination_flags);
+    }
+    if tasks.candidates.len() <= 1 {
+        return bind_uncontended(tasks, handles, contamination_flags);
     }
     Ok(TaskSelectionView {
         disposition: TaskSelectionDisposition::Ambiguous,
@@ -710,6 +733,92 @@ mod tests {
             .selected_task_and_revision
             .expect("rebound task must be selected");
         assert_eq!(selected.task_ref, "task-eval-1");
+    }
+
+    #[test]
+    fn authoritative_selection_binds_exactly_the_named_candidate() {
+        let context = fixture_context(ReadinessDisposition::ReadyMaterial);
+        let mut candidates: Vec<TaskCandidate> = (0..3).map(eligible_task).collect();
+        candidates.push(TaskCandidate {
+            handle: "task-eval-9".to_owned(),
+            task_revision: Some(9),
+            acceptance_digest: Some("c".repeat(64)),
+            prior_evaluation_candidate_only: true,
+            independent_binding_supplied: false,
+        });
+        let tasks = BootstrapTaskInputs {
+            scope_level: ScopeLevel::Project,
+            candidates,
+            authoritative_selection: Some(AuthoritativeSelection {
+                selected_handle: "task-1".to_owned(),
+                reason: "governor work assignment".to_owned(),
+                source: "governor-ledger-4".to_owned(),
+            }),
+        };
+        let bootstrap = get_understanding_bootstrap(&context, &tasks, CurrentAssessment::Ready)
+            .expect("composition must succeed");
+        assert_eq!(
+            bootstrap.task_selection.disposition,
+            TaskSelectionDisposition::Bound
+        );
+        let selected = bootstrap
+            .task_selection
+            .selected_task_and_revision
+            .expect("bound selection names a task");
+        assert_eq!(selected.task_ref, "task-1");
+        assert_eq!(selected.task_revision, 2);
+        assert_eq!(
+            bootstrap.task_selection.acceptance_digest,
+            Some("a".repeat(64))
+        );
+        assert_eq!(
+            bootstrap.task_selection.selection_source_and_reason,
+            "governor-ledger-4: governor work assignment"
+        );
+        // The untouched crossover candidate still flags the row, but the
+        // bound task itself is the clean authoritative pick.
+        assert!(
+            bootstrap
+                .task_selection
+                .contamination_flags
+                .contains(&CROSSOVER_CONTAMINATED.to_owned())
+        );
+    }
+
+    #[test]
+    fn authoritative_selection_refuses_unknown_and_contaminated_handles() {
+        let context = fixture_context(ReadinessDisposition::ReadyMaterial);
+        let tasks = BootstrapTaskInputs {
+            scope_level: ScopeLevel::Project,
+            candidates: (0..2).map(eligible_task).collect(),
+            authoritative_selection: Some(AuthoritativeSelection {
+                selected_handle: "task-ghost".to_owned(),
+                reason: "stale ledger pointer".to_owned(),
+                source: "governor-ledger-4".to_owned(),
+            }),
+        };
+        let error = get_understanding_bootstrap(&context, &tasks, CurrentAssessment::Ready)
+            .expect_err("selection of an unlisted handle must fail closed");
+        assert_eq!(error.code, "SELECTION_UNKNOWN_HANDLE");
+        let contaminated_tasks = BootstrapTaskInputs {
+            scope_level: ScopeLevel::Project,
+            candidates: vec![TaskCandidate {
+                handle: "task-eval-1".to_owned(),
+                task_revision: Some(2),
+                acceptance_digest: Some("b".repeat(64)),
+                prior_evaluation_candidate_only: true,
+                independent_binding_supplied: false,
+            }],
+            authoritative_selection: Some(AuthoritativeSelection {
+                selected_handle: "task-eval-1".to_owned(),
+                reason: "evaluation trace".to_owned(),
+                source: "dreamer-candidate-7".to_owned(),
+            }),
+        };
+        let error =
+            get_understanding_bootstrap(&context, &contaminated_tasks, CurrentAssessment::Ready)
+                .expect_err("selection of a contaminated handle must fail closed");
+        assert_eq!(error.code, "SELECTION_CONTAMINATED");
     }
 
     #[test]
