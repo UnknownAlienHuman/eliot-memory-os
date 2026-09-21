@@ -473,6 +473,12 @@ impl CanonicalStatePort for GovernorCanonicalState {
             items: Vec::new(),
             reviews: Vec::new(),
             provenance: Vec::new(),
+            // #1780 inbox section: the daemon does not yet read canonical
+            // notification state (GetNotificationState) into this snapshot,
+            // so the section is empty rather than fabricated. Wiring the
+            // notification read is daemon-owner follow-up; the board
+            // contract accepts the empty section without failing.
+            notifications: Vec::new(),
         };
         state
             .validate()
