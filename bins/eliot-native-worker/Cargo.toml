@@ -27,6 +27,7 @@ thiserror.workspace = true
 
 [dev-dependencies]
 eliot-contracts.workspace = true
+eliot-kernel = { path = "../eliot-kernel" }
 
 [lints]
 workspace = true

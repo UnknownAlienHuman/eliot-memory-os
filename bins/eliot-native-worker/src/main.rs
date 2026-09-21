@@ -8,8 +8,7 @@ use eliot_native_worker::{
     KernelNativeWorkerClient, NativeWorker, NativeWorkerDispatchAuthority, NativeWorkerError,
     PresentationEchoAdmission, SharedKernelTransport,
     admitted_material::{ValidatedAdmittedMaterial, read_admitted_material},
-    derive_admitted_intent, dispatch_now_unix_ms, drive_admitted_claimed,
-    select_factory_for_admitted,
+    derive_admitted_intent, dispatch_now_unix_ms, select_factory_for_admitted,
 };
 use eliot_native_worker_core::{
     CapabilityAdmissionPort, DurableCheckpointPort, DurableReplayPort, WorkerCore, WorkerError,
@@ -52,10 +51,11 @@ fn main() {
 /// factory, derive the canonical intent and issue the one-shot permit
 /// in-process from the validated grant (the documented broker pattern),
 /// compose the real provider ports, then drive the exact
-/// registration/claim/hello/process presentation through
-/// `drive_admitted_claimed` (register, claim, reconcile, checked
-/// `start_claimed` through `WorkerCore::demand_start_claimed`, readiness),
-/// and on `Ready` serve the bounded frame loop.
+/// registration/claim/hello/process presentation through the governed
+/// `drive_governed_material` entry (per-operation action envelopes admitted
+/// before register, claim, reconcile, checked `start_claimed` through
+/// `WorkerCore::demand_start_claimed`, readiness), and on `Ready` serve the
+/// bounded frame loop behind the governed `serve_stdio` gate.
 ///
 /// Gate table:
 /// - transport closed → 78 `KERNEL_ADMISSION_REQUIRED`;
@@ -173,7 +173,7 @@ fn run() -> i32 {
         Some(checkpoint),
         Some(Arc::new(BoundedEvidenceSink::new())),
     ));
-    drive_admitted_material(&mut lifecycle, &mut worker, material, process)
+    drive_admitted_material(&mut lifecycle, &mut worker, &material, process)
 }
 
 /// Drives one validated admitted presentation to `Ready` and serves.
@@ -188,7 +188,7 @@ fn run() -> i32 {
 fn drive_admitted_material<E, A, R, C, L>(
     lifecycle: &mut L,
     worker: &mut NativeWorker<E, A, R, C>,
-    material: ValidatedAdmittedMaterial,
+    material: &ValidatedAdmittedMaterial,
     process: ProcessRequest,
 ) -> i32
 where
@@ -198,26 +198,61 @@ where
     C: DurableCheckpointPort,
     L: AdmittedLifecycle,
 {
-    match block_on(drive_admitted_claimed(
-        lifecycle,
-        worker,
-        material.admission.registration(),
-        &material.admission,
-        material.hello,
-        process,
-        &material.reconcile,
-        &material.readiness,
+    // Issue #1911: the governed gate admits every driven operation before
+    // the first lifecycle submit; the validated action/contract provenance
+    // is retained with the drive receipt below. No unchecked bypass route
+    // remains: this entry is the only production caller of the drive.
+    match block_on(eliot_native_worker::drive_governed_material(
+        lifecycle, worker, material, process,
     )) {
-        Ok(_ready) => {}
+        Ok((actions, _ready)) => emit_governed_provenance(&actions),
         Err(error) => return fail_drive(&error),
     }
-    match block_on(worker.serve_stdio()) {
-        Ok(()) => 0,
+    let fence = match serde_json::to_value(&material.hello.state_fence) {
+        Ok(fence) => fence,
+        Err(error) => {
+            return deny_invalid_material(&format!("admitted fence is not projectable: {error}"));
+        }
+    };
+    let epoch = match serde_json::to_value(&material.hello.authority_epoch) {
+        Ok(epoch) => epoch,
+        Err(error) => {
+            return deny_invalid_material(&format!("admitted epoch is not projectable: {error}"));
+        }
+    };
+    match block_on(worker.serve_stdio_governed(&material.action_envelopes, &fence, &epoch)) {
+        Ok(_) => 0,
         Err(error) => {
             emit(ADMITTED_DRIVE_FAILED, &error.to_string());
             ADMITTED_DRIVE_FAILED_EXIT
         }
     }
+}
+
+/// Retains the validated action/contract provenance with the drive receipt.
+///
+/// Emits one compact stderr receipt line (never a stdout frame) pairing each
+/// driven operation with its derived impact class, scope, authority, and
+/// verifier, so supervision observes what the gate admitted end to end.
+fn emit_governed_provenance(actions: &[eliot_native_worker::governed_action::ValidatedAction]) {
+    let items: Vec<serde_json::Value> = actions
+        .iter()
+        .map(|action| {
+            serde_json::json!({
+                "operation": action.operation,
+                "impact": action.impact.as_str(),
+                "scope_ref": action.scope_ref,
+                "applicable_authority": action.applicable_authority,
+                "verifier": action.verifier,
+            })
+        })
+        .collect();
+    let mut stderr = io::stderr().lock();
+    let _ = writeln!(
+        stderr,
+        "{{\"receipt\":\"GOVERNED_ACTION_PROVENANCE\",\"actions\":{}}}",
+        serde_json::Value::Array(items)
+    );
 }
 
 /// Emits one typed drive failure and projects its exit.
@@ -345,22 +380,23 @@ mod tests {
         StateFence, TaskId, WorkLeaseId, sha256_hex,
     };
     use eliot_native_worker::admitted_material::{
-        AdmittedClaimEnvelope, AdmittedMaterialError, read_admitted_material_from,
+        AdmittedClaimEnvelope, AdmittedMaterialError, ValidatedAdmittedMaterial,
+        read_admitted_material_from,
     };
     use eliot_native_worker::{
         AdmittedLifecycle, BoundedEvidenceSink, KernelReplayPort, KernelReplayTransport,
         NativeWorker, NativeWorkerDispatchAuthority, NativeWorkerError, PresentationEchoAdmission,
         ValidatedDispatchGrant, derive_admitted_intent, drive_admitted_claimed,
-        require_launch_grant, select_factory_for_admitted,
+        governed_action::ActionEnvelope, require_launch_grant, select_factory_for_admitted,
     };
     use eliot_native_worker_core::{
-        AdmissionLivenessFacts, AdmissionLivenessOutcome, AuthorityEnvelope, BudgetEnvelope,
-        CapabilityAdmissionFacts, CapabilityAdmissionOutcome, CapabilityAdmissionPort,
-        CapabilityAdmissionRequest, CapabilityLivenessRequest, CheckpointProviderOutcome,
-        CheckpointReceiptFacts, ClaimAdmissionRequest, DurableCheckpointPort,
-        DurableCheckpointRequest, DurableRequestDecision, EXECUTION_UNIT_SCHEMA_VERSION,
-        EffectAdmissionOutcome, EffectAdmissionRequest, EffectCeiling, EffectKind,
-        JSON_ENCODING_PROFILE, NATIVE_WORKER_CLAIM_WIRE_VERSION,
+        ActionEnvelopeCarrier, AdmissionLivenessFacts, AdmissionLivenessOutcome, AuthorityEnvelope,
+        BudgetEnvelope, CapabilityAdmissionFacts, CapabilityAdmissionOutcome,
+        CapabilityAdmissionPort, CapabilityAdmissionRequest, CapabilityLivenessRequest,
+        CheckpointProviderOutcome, CheckpointReceiptFacts, ClaimAdmissionRequest,
+        DurableCheckpointPort, DurableCheckpointRequest, DurableRequestDecision,
+        EXECUTION_UNIT_SCHEMA_VERSION, EffectAdmissionOutcome, EffectAdmissionRequest,
+        EffectCeiling, EffectKind, JSON_ENCODING_PROFILE, NATIVE_WORKER_CLAIM_WIRE_VERSION,
         NATIVE_WORKER_EXECUTABLE_BINDING_EXPECTED_WIRE_VERSION, NativeClaimId,
         NativeRegistrationId, NativeRenewalId, NativeWorkerClaim, NativeWorkerExecutableBinding,
         NativeWorkerExecutableExpectation, NativeWorkerRegistration, PROTOCOL_VERSION,
@@ -1130,6 +1166,7 @@ mod tests {
             reconcile: reconcile.clone(),
             readiness: readiness.clone(),
             nonce: hello_value.launch_nonce.clone(),
+            action_envelopes: Vec::new(),
         };
         let staged = std::env::temp_dir().join("eliot-slice-d-admitted-claim.json");
         std::fs::write(
@@ -1324,6 +1361,318 @@ mod tests {
         remove_bat("drive");
     }
 
+    fn governed_carrier(
+        carrier_op: &str,
+        envelope_op: &str,
+        fence_json: &serde_json::Value,
+        epoch_json: &serde_json::Value,
+    ) -> ActionEnvelopeCarrier {
+        let envelope = ActionEnvelope {
+            operation: envelope_op.to_owned(),
+            intent: format!("execute governed {envelope_op}"),
+            scope_ref: "scope-1911".to_owned(),
+            preconditions: "claim admitted; fence live".to_owned(),
+            expected_effect: format!("bounded {envelope_op} effect"),
+            invariants: "no ambient effects".to_owned(),
+            known_failures: "stale fence".to_owned(),
+            rollback_or_compensation: "reconcile retained receipt".to_owned(),
+            verifier: "verifier-1911".to_owned(),
+            stop_condition: "stop on fence mismatch".to_owned(),
+            state_fence: fence_json.clone(),
+            authority_epoch: epoch_json.clone(),
+            tool_profile: envelope_op.to_owned(),
+            affected_resources: vec!["external-adapter".to_owned()],
+            applicable_authority: format!("kernel-authority-for-{envelope_op}"),
+        };
+        ActionEnvelopeCarrier {
+            operation: carrier_op.to_owned(),
+            envelope_json: serde_json::to_string(&envelope)
+                .unwrap_or_else(|error| panic!("envelope encodes: {error:?}")),
+        }
+    }
+
+    fn drive_carriers(
+        fence_json: &serde_json::Value,
+        epoch_json: &serde_json::Value,
+    ) -> Vec<ActionEnvelopeCarrier> {
+        ["register", "claim", "reconcile", "start_claimed"]
+            .iter()
+            .map(|operation| governed_carrier(operation, operation, fence_json, epoch_json))
+            .collect()
+    }
+
+    /// Builds a fully-wired governed drive: real executor over a fixture
+    /// script, kernel-echo ports, and staged dispatch bytes carrying the
+    /// given envelope carriers. Returns the worker, lifecycle, validated
+    /// material, process, and cleanup handles.
+    #[allow(clippy::too_many_lines)]
+    fn governed_drive_parts(
+        tag: &str,
+        carriers: Vec<ActionEnvelopeCarrier>,
+    ) -> (
+        SliceDWorker,
+        FakeLifecycle,
+        ValidatedAdmittedMaterial,
+        ProcessRequest,
+        String,
+        std::path::PathBuf,
+    ) {
+        let bat = write_bat(tag, SUCCESS_BAT);
+        let argv = vec!["/c".to_owned(), bat.clone()];
+        let (process, authority) = build_process(
+            &format!("operation-{tag}"),
+            &format!("tree-{tag}"),
+            argv,
+            &format!("nonce-{tag}"),
+        );
+        let hello_value = hello();
+        let registration = registration();
+        let claim_value = claim_for(&registration, &hello_value, &process);
+        let envelope = AdmittedClaimEnvelope {
+            admission: claim_request(&registration, &claim_value),
+            hello: hello_value,
+            reconcile: reconcile_for(&claim_value),
+            readiness: readiness_for(&claim_value),
+            nonce: "launch-nonce-slice-d-1".to_owned(),
+            action_envelopes: carriers,
+        };
+        let staged = std::env::temp_dir().join(format!("eliot-{tag}-admitted-claim.json"));
+        std::fs::write(
+            &staged,
+            serde_json::to_vec(&envelope)
+                .unwrap_or_else(|error| panic!("envelope bytes: {error:?}")),
+        )
+        .unwrap_or_else(|error| panic!("stage envelope: {error:?}"));
+        let material = read_admitted_material_from(&staged)
+            .unwrap_or_else(|error| panic!("governed envelope reads: {error:?}"))
+            .unwrap_or_else(|| panic!("governed envelope must be present"));
+        let port = authority_port(authority, process.fence().clone());
+        let executor = WindowsProcessExecutor::new(port);
+        let test_admission = TestAdmission {
+            admissions: Arc::new(Mutex::new(0_usize)),
+        };
+        let transport = FakeTransport::new(&claim_value);
+        let replay = KernelReplayPort::new(transport, claim_value, registration)
+            .unwrap_or_else(|_| panic!("replay port binds"));
+        let sink: Arc<dyn ProcessEvidenceSink> = Arc::new(RecordingSink {
+            evidence: Arc::new(Mutex::new(Vec::new())),
+        });
+        let core = WorkerCore::new(
+            Some(executor),
+            Some(test_admission),
+            Some(replay),
+            Some(TestCheckpoint),
+            Some(sink),
+        );
+        (
+            NativeWorker::new(core),
+            FakeLifecycle::new(),
+            material,
+            process,
+            bat,
+            staged,
+        )
+    }
+
+    fn refusal_detail<T>(result: Result<T, NativeWorkerError>, what: &str) -> String {
+        match result {
+            Ok(_) => panic!("{what} must refuse"),
+            Err(error) => match error {
+                NativeWorkerError::KernelAdmissionRequired(detail) => detail,
+                other => panic!("expected the contour denial, got {other:?}"),
+            },
+        }
+    }
+
+    fn action_currency() -> (serde_json::Value, serde_json::Value) {
+        (
+            serde_json::to_value(fence())
+                .unwrap_or_else(|error| panic!("fence projects: {error:?}")),
+            serde_json::to_value(epoch())
+                .unwrap_or_else(|error| panic!("epoch projects: {error:?}")),
+        )
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn governed_drive_admits_enveloped_material_to_ready_with_provenance() {
+        let (fence_json, epoch_json) = action_currency();
+        let (mut worker, mut lifecycle, material, process, _bat, _staged) =
+            governed_drive_parts("governed-drive", drive_carriers(&fence_json, &epoch_json));
+        let (actions, ready) = block_on(eliot_native_worker::drive_governed_material(
+            &mut lifecycle,
+            &mut worker,
+            &material,
+            process,
+        ))
+        .unwrap_or_else(|error| panic!("governed drive must reach Ready, got {error:?}"));
+        assert_eq!(worker.lifecycle(), WorkerLifecycle::Ready);
+        assert_eq!(ready.request_id, "start-claim-1");
+        assert_eq!(ready.stream_id, "claim-1/gen-1");
+        assert_eq!(actions.len(), 4);
+        for (action, operation) in actions
+            .iter()
+            .zip(["register", "claim", "reconcile", "start_claimed"].iter())
+        {
+            assert_eq!(&action.operation, operation);
+            assert_eq!(
+                action.impact,
+                eliot_native_worker::governed_action::ImpactClass::Material
+            );
+            assert_eq!(action.verifier, "verifier-1911");
+        }
+        assert!(lifecycle.registration.is_some());
+        assert!(lifecycle.claim.is_some());
+        remove_bat("governed-drive");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn governed_drive_refuses_missing_mismatched_or_stale_envelopes_with_zero_submits() {
+        let (fence_json, epoch_json) = action_currency();
+        // Missing: legacy bytes carry no carriers; nothing is submitted.
+        let (mut worker, mut lifecycle, material, process, _bat, _staged) =
+            governed_drive_parts("governed-missing", Vec::new());
+        let detail = refusal_detail(
+            block_on(eliot_native_worker::drive_governed_material(
+                &mut lifecycle,
+                &mut worker,
+                &material,
+                process,
+            )),
+            "missing envelopes",
+        );
+        assert!(
+            detail.contains("requires a presented action envelope") && detail.contains("register"),
+            "missing envelope names the op, got {detail}"
+        );
+        assert!(lifecycle.registration.is_none() && lifecycle.claim.is_none());
+        remove_bat("governed-missing");
+        // Mismatched: the register carrier binds another operation.
+        let (mut worker, mut lifecycle, material, process, _bat, _staged) = governed_drive_parts(
+            "governed-mismatch",
+            vec![governed_carrier(
+                "register",
+                "claim",
+                &fence_json,
+                &epoch_json,
+            )],
+        );
+        let detail = refusal_detail(
+            block_on(eliot_native_worker::drive_governed_material(
+                &mut lifecycle,
+                &mut worker,
+                &material,
+                process,
+            )),
+            "mismatched envelope",
+        );
+        assert!(
+            detail.contains("binds 'claim'"),
+            "mismatch names the bound op, got {detail}"
+        );
+        assert!(lifecycle.registration.is_none() && lifecycle.claim.is_none());
+        remove_bat("governed-mismatch");
+        // Stale: the envelope fence belongs to another generation.
+        let stale_fence = serde_json::json!({
+            "epoch": {"lineage_id": "550e8400-e29b-41d4-a716-446655440000", "sequence": 7},
+            "generation": 1,
+        });
+        let (mut worker, mut lifecycle, material, process, _bat, _staged) = governed_drive_parts(
+            "governed-stale",
+            vec![governed_carrier(
+                "register",
+                "register",
+                &stale_fence,
+                &epoch_json,
+            )],
+        );
+        let detail = refusal_detail(
+            block_on(eliot_native_worker::drive_governed_material(
+                &mut lifecycle,
+                &mut worker,
+                &material,
+                process,
+            )),
+            "stale envelope",
+        );
+        assert!(
+            detail.contains("stale"),
+            "stale fence is named, got {detail}"
+        );
+        assert!(lifecycle.registration.is_none() && lifecycle.claim.is_none());
+        remove_bat("governed-stale");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn governed_stdio_serves_only_with_valid_envelope() {
+        let (fence_json, epoch_json) = action_currency();
+        let (mut worker, mut lifecycle, material, process, _bat, _staged) =
+            governed_drive_parts("governed-stdio", drive_carriers(&fence_json, &epoch_json));
+        // Refusal leaves the writer empty and the reader unconsumed: no
+        // frame is read and no response is written without an envelope.
+        let frame_bytes = encode_frame(&health_frame());
+        let mut reader = Cursor::new(frame_bytes.clone());
+        let mut writer = Vec::new();
+        let detail = refusal_detail(
+            block_on(worker.serve_one_frame_governed(
+                &mut reader,
+                &mut writer,
+                &[],
+                &fence_json,
+                &epoch_json,
+            )),
+            "stdio without an envelope",
+        );
+        assert!(
+            detail.contains("requires a presented action envelope")
+                && detail.contains("serve_stdio"),
+            "stdio refusal names the op, got {detail}"
+        );
+        assert!(writer.is_empty());
+        assert_eq!(reader.position(), 0);
+        // Admission drives to Ready, then the governed stdio path serves a
+        // real bounded frame with durable events.
+        let (actions, ready) = block_on(eliot_native_worker::drive_governed_material(
+            &mut lifecycle,
+            &mut worker,
+            &material,
+            process,
+        ))
+        .unwrap_or_else(|error| panic!("governed drive must reach Ready, got {error:?}"));
+        assert_eq!(actions.len(), 4);
+        assert_eq!(ready.stream_id, "claim-1/gen-1");
+        let serve = vec![governed_carrier(
+            "serve_stdio",
+            "serve_stdio",
+            &fence_json,
+            &epoch_json,
+        )];
+        let mut reader = Cursor::new(frame_bytes);
+        let mut writer = Vec::new();
+        let (serve_actions, shutdown) = block_on(worker.serve_one_frame_governed(
+            &mut reader,
+            &mut writer,
+            &serve,
+            &fence_json,
+            &epoch_json,
+        ))
+        .unwrap_or_else(|error| panic!("governed stdio must serve, got {error:?}"));
+        assert!(!shutdown);
+        assert_eq!(serve_actions.len(), 1);
+        assert_eq!(serve_actions[0].operation, "serve_stdio");
+        let response = decode_response(&writer);
+        assert!(!response.events.is_empty());
+        assert!(
+            response
+                .events
+                .iter()
+                .all(|event| event.stream_id == "claim-1/gen-1")
+        );
+        remove_bat("governed-stdio");
+    }
+
     /// Finite Windows inbox executable for the kernel-drive intent: it starts
     /// promptly with no arguments and exits on its own, so the real executor
     /// can launch it under the canonical arg-less rule without a lingering
@@ -1340,12 +1689,11 @@ mod tests {
         sha256_hex(&bytes)
     }
 
-    /// Owner-side stand-in: authors one Kernel launch-grant file exactly as
-    /// the Kernel contour plus the owner publisher would — real digests, a
-    /// real permit over the canonical intent, and the owner-predicted
-    /// invocation digest embedded in the join. Clearly marked: a live Kernel
-    /// plus the Governor publisher own this computation in production; the
-    /// test mirrors it so the child half can prove closure. Returns the
+    /// Builds a deterministic admitted Kernel launch-grant input and writes
+    /// the bytes returned by the real Kernel `native_worker_material_bytes`
+    /// writer. The request, receipt, grant, and action carriers are therefore
+    /// encoded by the producer under test; this helper only supplies typed
+    /// admitted values and the owner-side intent inputs. Returns the
     /// request binding digest, the owner-predicted invocation digest, and
     /// the executable locator.
     #[allow(clippy::too_many_lines)]
@@ -1484,8 +1832,9 @@ mod tests {
         let worker_claim: NativeWorkerClaim = load(serde_json::from_value(claim_json));
         let worker_claim = load(worker_claim.with_computed_digest());
         let binding_digest = worker_claim.binding_digest.clone();
+        let receipt_digest = sha256_hex(b"kernel-drive receipt identity stand-in");
 
-        let request = serde_json::json!({
+        let request_json = serde_json::json!({
             "wire_id": "eliot.kernel.native-worker-claim",
             "wire_version": NATIVE_WORKER_CLAIM_WIRE_VERSION,
             "claim_id": claim_id,
@@ -1522,7 +1871,9 @@ mod tests {
             "binding_digest": binding_digest.clone(),
             "request_digest": sha256_hex(b"kernel-drive request identity stand-in"),
         });
-        let receipt = serde_json::json!({
+        let request: eliot_kernel::NativeWorkerClaimRequest =
+            load(serde_json::from_value(request_json));
+        let receipt_json = serde_json::json!({
             "wire_id": "eliot.kernel.native-worker-claim",
             "wire_version": NATIVE_WORKER_CLAIM_WIRE_VERSION,
             "claim_id": claim_id,
@@ -1534,28 +1885,27 @@ mod tests {
             "state_fence": fence_json,
             "binding_digest": receipt_binding_digest.to_owned(),
             "admitted_at_unix_ms": now_ms,
-            "receipt_digest": sha256_hex(b"kernel-drive receipt identity stand-in"),
+            "receipt_digest": receipt_digest,
         });
-        let file = serde_json::json!({
-            "request": request,
-            "receipt": receipt,
-            "epoch": epoch_json,
-            "generation": worker_generation,
-            "nonce": kernel_nonce,
-            "grant": {
-                "grant_digest": grant_digest,
-                "authority_epoch": epoch_json,
-                "fence_generation": grant_fence_generation,
-                "fence_nonce": "native-worker-fence-kernel-drive-1",
-                "idempotency_key": "native-worker-lease-kernel-drive-1",
-                "expires_at": grant_expires_at,
-            },
-        });
-        std::fs::write(
-            staged,
-            serde_json::to_vec(&file).unwrap_or_else(|_| panic!("file json")),
-        )
-        .unwrap_or_else(|_| panic!("stage kernel file"));
+        let receipt: eliot_kernel::NativeWorkerClaimReceipt =
+            load(serde_json::from_value(receipt_json));
+        let grant = eliot_kernel::DispatchGrant {
+            grant_digest,
+            authority_epoch: epoch(),
+            fence_generation: grant_fence_generation,
+            fence_nonce: "native-worker-fence-kernel-drive-1".to_owned(),
+            idempotency_key: "native-worker-lease-kernel-drive-1".to_owned(),
+            expires_at: grant_expires_at,
+        };
+        let bytes = load(eliot_kernel::native_worker_material_bytes(
+            &request,
+            &receipt,
+            &epoch(),
+            worker_generation,
+            kernel_nonce,
+            &grant,
+        ));
+        std::fs::write(staged, bytes).unwrap_or_else(|_| panic!("stage kernel file"));
         (binding_digest, invocation_digest, executable)
     }
 
@@ -1601,6 +1951,21 @@ mod tests {
             .unwrap_or_else(|error| panic!("kernel file must read: {error:?}"))
             .unwrap_or_else(|| panic!("kernel file must be present"));
         assert!(!staged.exists(), "validated material must be consumed once");
+        assert_eq!(material.action_envelopes.len(), 5);
+        for operation in [
+            "register",
+            "claim",
+            "reconcile",
+            "start_claimed",
+            "serve_stdio",
+        ] {
+            assert!(
+                material
+                    .action_envelopes
+                    .iter()
+                    .any(|carrier| carrier.operation == operation)
+            );
+        }
         assert_eq!(material.nonce, "launch-nonce-kernel-drive-0001");
         assert_eq!(
             material.kernel_nonce.as_deref(),
@@ -1684,17 +2049,27 @@ mod tests {
         let mut worker: KernelDriveWorker = NativeWorker::new(core);
         let mut lifecycle = FakeLifecycle::new();
         let hello_connection = material.hello.connection_id.clone();
-        let ready = block_on(drive_admitted_claimed(
+        let (actions, ready) = block_on(eliot_native_worker::drive_governed_material(
             &mut lifecycle,
             &mut worker,
-            material.admission.registration(),
-            &material.admission,
-            material.hello,
+            &material,
             process,
-            &material.reconcile,
-            &material.readiness,
         ))
-        .unwrap_or_else(|error| panic!("kernel drive must reach Ready, got {error:?}"));
+        .unwrap_or_else(|error| panic!("kernel governed drive must reach Ready, got {error:?}"));
+        assert_eq!(actions.len(), 4);
+        for (action, operation) in
+            actions
+                .iter()
+                .zip(["register", "claim", "reconcile", "start_claimed"])
+        {
+            assert_eq!(action.operation, operation);
+            assert_eq!(action.scope_ref, "scope-kernel-drive-1");
+            assert!(action.verifier.starts_with("unknown:"));
+            assert_eq!(
+                eliot_native_worker::governed_action::finish_for_verdict(action, true, true),
+                eliot_native_worker::governed_action::FinishState::DegradedNoProof
+            );
+        }
         assert_eq!(worker.lifecycle(), WorkerLifecycle::Ready);
         assert_eq!(
             ready.request_id,
@@ -1728,9 +2103,22 @@ mod tests {
         };
         let mut reader = Cursor::new(encode_frame(&frame));
         let mut writer = Vec::new();
-        let shutdown = block_on(worker.serve_one_frame(&mut reader, &mut writer))
-            .unwrap_or_else(|error| panic!("bounded frame must serve, got {error:?}"));
+        let fence_json = serde_json::to_value(&material.hello.state_fence)
+            .unwrap_or_else(|error| panic!("fence projects: {error:?}"));
+        let epoch_json = serde_json::to_value(&material.hello.authority_epoch)
+            .unwrap_or_else(|error| panic!("epoch projects: {error:?}"));
+        let (serve_actions, shutdown) = block_on(worker.serve_one_frame_governed(
+            &mut reader,
+            &mut writer,
+            &material.action_envelopes,
+            &fence_json,
+            &epoch_json,
+        ))
+        .unwrap_or_else(|error| panic!("governed bounded frame must serve, got {error:?}"));
         assert!(!shutdown);
+        assert_eq!(serve_actions.len(), 1);
+        assert_eq!(serve_actions[0].operation, "serve_stdio");
+        assert!(serve_actions[0].verifier.starts_with("unknown:"));
         let response = decode_response(&writer);
         assert!(!response.events.is_empty());
         assert!(
@@ -1792,6 +2180,98 @@ mod tests {
             Err(AdmittedMaterialError::Binding(_)) => {}
             other => panic!("rewired grant must refuse with Binding, got {other:?}"),
         }
+        let _ = std::fs::remove_file(&staged);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn kernel_produced_material_missing_register_refuses_before_lifecycle_submit() {
+        let now = fake_now_ms();
+        let staged = std::env::temp_dir().join("eliot-kernel-drive-missing-register.json");
+        let (binding, _, _) = write_kernel_grant_file(
+            &staged,
+            &"0".repeat(64),
+            now.saturating_add(120_000),
+            1,
+            now,
+            true,
+        );
+        write_kernel_grant_file(&staged, &binding, now.saturating_add(120_000), 1, now, true);
+
+        // Start with the exact bytes emitted by the Kernel writer, then make
+        // one causal delivery defect: remove only the register carrier. The
+        // remaining four carriers are untouched producer output.
+        let mut json: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&staged).expect("Kernel-produced material is readable"),
+        )
+        .expect("Kernel-produced material is JSON");
+        let carriers = json["action_envelopes"]
+            .as_array()
+            .expect("Kernel writer emitted action carriers");
+        assert_eq!(carriers.len(), 5);
+        let missing_register = carriers
+            .iter()
+            .filter(|carrier| carrier["operation"] != "register")
+            .cloned()
+            .collect::<Vec<_>>();
+        json["action_envelopes"] = serde_json::Value::Array(missing_register);
+        std::fs::write(
+            &staged,
+            serde_json::to_vec(&json).expect("missing-carrier material encodes"),
+        )
+        .expect("missing-carrier material stages");
+
+        let material = read_admitted_material_from(&staged)
+            .expect("missing carrier remains a valid material presentation")
+            .expect("missing-carrier material is present");
+        assert_eq!(material.action_envelopes.len(), 4);
+
+        let claim = material.admission.claim().clone();
+        let replay = load(KernelReplayPort::new(
+            FakeTransport::new(&claim),
+            claim.clone(),
+            material.admission.registration().clone(),
+        ));
+        let authority = load(NativeWorkerDispatchAuthority::new(
+            claim.claim_id.as_str(),
+            claim.operation_id.as_str(),
+            claim.worker_generation,
+            &serde_json::to_value(&claim.authority_epoch).expect("claim epoch JSON"),
+            &material.nonce,
+        ));
+        let core = WorkerCore::new(
+            Some(WindowsProcessExecutor::new(Arc::new(authority))),
+            Some(PresentationEchoAdmission::new()),
+            Some(replay),
+            Some(TestCheckpoint),
+            Some(Arc::new(BoundedEvidenceSink::new())),
+        );
+        let mut worker: KernelDriveWorker = NativeWorker::new(core);
+        let mut lifecycle = FakeLifecycle::new();
+        let (process, _) = build_process(
+            "operation-kernel-drive-missing-register",
+            "claim-kernel-drive-missing-register",
+            Vec::new(),
+            "nonce-kernel-drive-missing-register",
+        );
+        let detail = refusal_detail(
+            block_on(eliot_native_worker::drive_governed_material(
+                &mut lifecycle,
+                &mut worker,
+                &material,
+                process,
+            )),
+            "Kernel-produced material missing register carrier",
+        );
+        assert!(
+            detail.contains("register"),
+            "refusal names register: {detail}"
+        );
+        assert!(
+            lifecycle.registration.is_none() && lifecycle.claim.is_none(),
+            "missing Kernel carrier is refused before lifecycle submission"
+        );
+        assert_eq!(worker.lifecycle(), WorkerLifecycle::Created);
         let _ = std::fs::remove_file(&staged);
     }
 }
