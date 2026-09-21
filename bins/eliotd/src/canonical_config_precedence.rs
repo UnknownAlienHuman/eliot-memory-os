@@ -107,11 +107,13 @@ impl ConfigLayer {
 /// running value carries forward). `delegation_ceiling` is an explicit
 /// higher-layer delegation: an interval cap naming how far lower layers may
 /// expand. A delegation is usable only when its ceiling is within the
-/// authority currently inherited from all higher layers. A later narrowing
-/// layer without a delegation lowers the effective ceiling to its own limit;
-/// an older grant therefore cannot survive an undelegated boundary. The
-/// ceiling never raises the granting layer's own value, and a delegation-only
-/// layer may grant only what it inherited.
+/// authority currently inherited from all higher layers. Every explicit
+/// lower-layer limit without a delegation is itself the next boundary,
+/// including a repeat or an expansion permitted by an older grant; the next
+/// effective ceiling is then the minimum of inherited authority and that
+/// limit. An older grant therefore cannot survive an undelegated boundary.
+/// The ceiling never raises the granting layer's own value, and a
+/// delegation-only layer may grant only what it inherited.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LayerInput {
     pub layer: ConfigLayer,
@@ -205,14 +207,16 @@ pub enum PrecedenceError {
 /// The compiled-defaults layer must seed the chain. Each lower layer carrying
 /// `Some(limit)` narrows (`limit <= running`), repeats (`limit == running`),
 /// or expands (`limit > running`) only when the current effective delegation
-/// ceiling covers the requested value. A later narrowing layer with no
-/// explicit delegation replaces that ceiling with its own boundary, so an
-/// older grant cannot cross it. A layer can explicitly delegate an interval
-/// up to its `delegation_ceiling` only within the ceiling it inherited from
-/// higher layers; a full inherited ceiling is valid explicit delegation and
-/// is not a special strict-sub-envelope policy. Abstaining layers (`None`)
-/// contribute no value but may explicitly delegate within their inherited
-/// authority; an invalid over-ceiling claim mints nothing.
+/// ceiling covers the requested value. Every explicit lower-layer limit with
+/// no valid delegation then becomes the next boundary, so repeats and
+/// permitted expansions also replace the next ceiling with
+/// `min(inherited_ceiling, limit)`; an older grant cannot cross it. A layer
+/// can explicitly delegate an interval up to its `delegation_ceiling` only
+/// within the ceiling it inherited from higher layers; a full inherited
+/// ceiling is valid explicit delegation and is not a special strict-
+/// sub-envelope policy. Abstaining layers (`None`) contribute no value but
+/// may explicitly delegate within their inherited authority; an invalid
+/// over-ceiling claim mints nothing.
 ///
 /// # Errors
 /// Returns [`PrecedenceError`] when the key is unsupported, defaults are
@@ -264,7 +268,6 @@ pub fn resolve_canonical_chain(
             continue;
         };
         let inherited = lower_expansion_ceiling;
-        let previous = running;
         let delegation = input
             .delegation_ceiling
             .filter(|ceiling| *ceiling <= inherited);
@@ -302,8 +305,8 @@ pub fn resolve_canonical_chain(
         }
         if let Some(ceiling) = delegation {
             lower_expansion_ceiling = ceiling;
-        } else if requested < previous {
-            lower_expansion_ceiling = requested;
+        } else {
+            lower_expansion_ceiling = inherited.min(requested);
         }
     }
     Ok(ResolvedChain {
@@ -845,6 +848,113 @@ mod tests {
                 .to_string()
                 .contains("without an explicit higher-layer delegation"),
             "unexpected: {error}"
+        );
+    }
+
+    #[test]
+    fn repeated_explicit_limit_establishes_a_new_boundary() {
+        // Installation narrows to 60 while delegating 90. System Owner
+        // repeats that 60 limit without delegating, so the repeated limit is
+        // itself the boundary that retires the older 90 grant.
+        let inputs = vec![
+            LayerInput {
+                layer: ConfigLayer::CompiledDefaults,
+                limit: Some(100),
+                delegation_ceiling: None,
+            },
+            LayerInput {
+                layer: ConfigLayer::InstallationConfig,
+                limit: Some(60),
+                delegation_ceiling: Some(90),
+            },
+            LayerInput {
+                layer: ConfigLayer::SystemOwnerPolicy,
+                limit: Some(60),
+                delegation_ceiling: None,
+            },
+            LayerInput {
+                layer: ConfigLayer::SessionCapabilityToken,
+                limit: Some(80),
+                delegation_ceiling: None,
+            },
+        ];
+        let error = resolve_canonical_chain(CANONICAL_SETTING_KEY, &inputs)
+            .expect_err("a repeated undelegated limit must retire the older grant");
+        assert!(
+            error
+                .to_string()
+                .contains("without an explicit higher-layer delegation"),
+            "unexpected: {error}"
+        );
+    }
+
+    #[test]
+    fn undelegated_expansion_establishes_a_new_boundary() {
+        // System Owner delegates 90 across its 60 limit. Task may therefore
+        // expand to 80, but without its own delegation that 80 becomes the
+        // next boundary and Session cannot expand to 85.
+        let inputs = vec![
+            LayerInput {
+                layer: ConfigLayer::CompiledDefaults,
+                limit: Some(100),
+                delegation_ceiling: None,
+            },
+            LayerInput {
+                layer: ConfigLayer::SystemOwnerPolicy,
+                limit: Some(60),
+                delegation_ceiling: Some(90),
+            },
+            LayerInput {
+                layer: ConfigLayer::TaskPolicy,
+                limit: Some(80),
+                delegation_ceiling: None,
+            },
+            LayerInput {
+                layer: ConfigLayer::SessionCapabilityToken,
+                limit: Some(85),
+                delegation_ceiling: None,
+            },
+        ];
+        let error = resolve_canonical_chain(CANONICAL_SETTING_KEY, &inputs)
+            .expect_err("an undelegated expansion must establish its own boundary");
+        assert!(
+            error
+                .to_string()
+                .contains("without an explicit higher-layer delegation"),
+            "unexpected: {error}"
+        );
+    }
+
+    #[test]
+    fn delegated_system_owner_boundary_allows_session_expansion() {
+        // A System Owner limit of 60 may explicitly delegate 90. The session
+        // may then expand directly to 80 within that inherited authority.
+        let inputs = vec![
+            LayerInput {
+                layer: ConfigLayer::CompiledDefaults,
+                limit: Some(100),
+                delegation_ceiling: None,
+            },
+            LayerInput {
+                layer: ConfigLayer::SystemOwnerPolicy,
+                limit: Some(60),
+                delegation_ceiling: Some(90),
+            },
+            LayerInput {
+                layer: ConfigLayer::SessionCapabilityToken,
+                limit: Some(80),
+                delegation_ceiling: None,
+            },
+        ];
+        let chain = resolve_canonical_chain(CANONICAL_SETTING_KEY, &inputs)
+            .expect("a session expansion inside explicit delegation must resolve");
+        assert_eq!(chain.winning_value(), 80);
+        assert!(
+            chain
+                .contributions()
+                .last()
+                .is_some_and(|item| item.delegated_expansion),
+            "session expansion must be marked delegated"
         );
     }
 
