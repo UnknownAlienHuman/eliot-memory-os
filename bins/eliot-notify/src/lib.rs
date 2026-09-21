@@ -73,7 +73,7 @@ impl std::error::Error for NotifyBuildError {}
 /// adapter binding and the A-10 coordinator.
 pub struct NotificationComposition {
     core: NotifyCore<NotificationPlatform>,
-    quiet_hours: Option<quiet_hours::QuietHours>,
+    quiet_hours: Option<quiet_hours::QuietHoursConfiguration>,
 }
 
 struct NotificationPlatform {
@@ -124,7 +124,7 @@ impl NotificationComposition {
     pub fn new_with_quiet_hours(
         work_root: impl Into<PathBuf>,
         ports: VerificationPorts,
-        quiet_hours: Option<quiet_hours::QuietHours>,
+        quiet_hours: Option<quiet_hours::QuietHoursConfiguration>,
     ) -> Result<Self, NotifyBuildError> {
         let platform = WindowsPlatform::new(work_root).map_err(NotifyBuildError::Platform)?;
         Ok(Self::from_platform_with_quiet_hours(
@@ -145,7 +145,7 @@ impl NotificationComposition {
     /// Composes the protected Kernel route with explicit quiet-hours policy.
     pub fn from_kernel_with_quiet_hours(
         work_root: impl Into<PathBuf>,
-        quiet_hours: Option<quiet_hours::QuietHours>,
+        quiet_hours: Option<quiet_hours::QuietHoursConfiguration>,
     ) -> Result<Self, NotifyBuildError> {
         let ports = load_kernel_verification_ports()?;
         Self::new_with_quiet_hours(work_root, ports, quiet_hours)
@@ -176,7 +176,7 @@ impl NotificationComposition {
     pub fn from_platform_with_quiet_hours(
         platform: WindowsPlatform,
         ports: VerificationPorts,
-        quiet_hours: Option<quiet_hours::QuietHours>,
+        quiet_hours: Option<quiet_hours::QuietHoursConfiguration>,
     ) -> Self {
         Self {
             core: NotifyCore::new(NotificationPlatform::normal(platform), ports)
@@ -191,8 +191,9 @@ impl NotificationComposition {
         envelope: &NotificationEnvelope,
         request: &NotificationRequest,
     ) -> Result<DeliveryObservation, eliot_notify_core::NotifyError> {
+        let quiet_hours_active = self.quiet_hours_active(request)?;
         self.core
-            .deliver_with_quiet_hours(envelope, request, self.quiet_hours_active(request))
+            .deliver_with_quiet_hours(envelope, request, quiet_hours_active)
     }
 
     /// Reads one authenticated canonical notification page through the same
@@ -214,21 +215,34 @@ impl NotificationComposition {
         self.core.deliver_watchdog_fallback(envelope, request)
     }
 
-    fn quiet_hours_active(&self, request: &NotificationRequest) -> bool {
-        let Some(window) = self.quiet_hours else {
-            return false;
+    fn quiet_hours_active(
+        &self,
+        request: &NotificationRequest,
+    ) -> Result<bool, eliot_notify_core::NotifyError> {
+        let Some(configuration) = self.quiet_hours else {
+            return Ok(false);
         };
+        let Some(policy_revision) = request.context.state_fence.policy_revision else {
+            return Err(eliot_notify_core::NotifyError::InvalidEnvelope(
+                "quiet_hours.policy_revision",
+            ));
+        };
+        if !configuration.binds_policy_revision(policy_revision) {
+            return Err(eliot_notify_core::NotifyError::InvalidEnvelope(
+                "quiet_hours.policy_revision",
+            ));
+        }
         let Some(milliseconds) = request
             .context
             .clock
             .known_time_ms
             .or(request.context.clock.valid_time_ms)
         else {
-            return false;
+            return Ok(false);
         };
-        u64::try_from(milliseconds)
+        Ok(u64::try_from(milliseconds)
             .ok()
-            .is_some_and(|value| window.contains_unix_ms(value))
+            .is_some_and(|value| configuration.window.contains_unix_ms(value)))
     }
 }
 

@@ -51,6 +51,11 @@ pub const WATCHDOG_SIGNATURE_DOMAIN: &str = "ELIOT/X-01/WATCHDOG-FALLBACK/V1";
 pub const WATCHDOG_PRODUCT_ID: &str = "eliot-notify-watchdog";
 pub const WATCHDOG_SOURCE_ID: &str = "eliot-watchdog";
 
+/// Domain separator for the I11.12 failure-notification identity.
+pub const USER_AUTOMATION_FAILURE_IDENTITY_DOMAIN: &str = "ELIOT/I11.12/USER-AUTOMATION-FAILURE/V1";
+const USER_AUTOMATION_FAILURE_DEDUP_PREFIX: &str = "user-automation-failure";
+const USER_AUTOMATION_FAILURE_NOTIFICATION_PREFIX: &str = "user-automation-failure-notification";
+
 /// Provider identities used by typed `PLAN_GAP` and provider-failure results.
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -88,6 +93,111 @@ pub struct Recipient {
     pub role: RecipientRole,
 }
 
+/// Opaque immutable identity of one UserAutomation revision.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAutomationRevisionRef {
+    pub automation_id: String,
+    pub revision: String,
+}
+
+/// Opaque reference to the canonical failure-class fingerprint.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FailureFingerprintRef {
+    pub fingerprint: String,
+}
+
+/// I11.12 identity binding used to coalesce repeated automation failures.
+///
+/// This is a reference-only surface contract. It does not store automation
+/// configuration or memory, mint authority, or decide whether a failure is
+/// actionable. The canonical notification owner persists the resulting draft
+/// through the existing `NotificationStatePort`.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAutomationFailureIdentity {
+    pub automation_revision: UserAutomationRevisionRef,
+    pub failure_fingerprint: FailureFingerprintRef,
+}
+
+impl UserAutomationFailureIdentity {
+    /// Creates a validated reference-only identity.
+    pub fn new(
+        automation_id: impl Into<String>,
+        revision: impl Into<String>,
+        fingerprint: impl Into<String>,
+    ) -> Result<Self, NotifyError> {
+        let identity = Self {
+            automation_revision: UserAutomationRevisionRef {
+                automation_id: automation_id.into(),
+                revision: revision.into(),
+            },
+            failure_fingerprint: FailureFingerprintRef {
+                fingerprint: fingerprint.into(),
+            },
+        };
+        identity.validate()?;
+        Ok(identity)
+    }
+
+    fn validate(&self) -> Result<(), NotifyError> {
+        validate_identity_text(
+            &self.automation_revision.automation_id,
+            "user_automation_failure.automation_id",
+        )?;
+        validate_identity_text(
+            &self.automation_revision.revision,
+            "user_automation_failure.revision",
+        )?;
+        validate_identity_text(
+            &self.failure_fingerprint.fingerprint,
+            "user_automation_failure.fingerprint",
+        )
+    }
+
+    /// Computes the stable digest of `(automation revision, fingerprint)`.
+    pub fn identity_digest(&self) -> Result<String, NotifyError> {
+        self.validate()?;
+        sha256_serialized(&(
+            USER_AUTOMATION_FAILURE_IDENTITY_DOMAIN,
+            &self.automation_revision,
+            &self.failure_fingerprint,
+        ))
+    }
+
+    /// Returns the one canonical deduplication key for this failure class.
+    pub fn dedup_key(&self) -> Result<String, NotifyError> {
+        Ok(format!(
+            "{USER_AUTOMATION_FAILURE_DEDUP_PREFIX}:{}",
+            self.identity_digest()?
+        ))
+    }
+
+    /// Returns the deterministic notification identity paired with the key.
+    pub fn notification_id(&self) -> Result<PlatformHandle, NotifyError> {
+        PlatformHandle::new(format!(
+            "{USER_AUTOMATION_FAILURE_NOTIFICATION_PREFIX}:{}",
+            self.identity_digest()?
+        ))
+        .map_err(NotifyError::Port)
+    }
+
+    /// Binds the derived identity to an existing canonical draft.
+    ///
+    /// The existing draft fields remain owner-supplied; this helper only sets
+    /// the two identity fields consumed by the canonical notification owner.
+    pub fn bind_draft(
+        &self,
+        mut draft: NotificationDraft,
+    ) -> Result<NotificationDraft, NotifyError> {
+        draft.notification_id = self.notification_id()?;
+        draft.dedup_key = self.dedup_key()?;
+        draft.validate().map_err(notification_schema_error)?;
+        Ok(draft)
+    }
+}
+
 /// Inert normal-path content. Trust is established only when G-08 returns the
 /// exact canonical source receipt and A-08 returns an admission receipt.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -99,6 +209,10 @@ pub struct NotificationEnvelope {
     pub summary: String,
     pub recipients: Vec<Recipient>,
     pub source_receipt: ReceiptEnvelope,
+    /// Optional I11.12 identity annotation. When present, the canonical
+    /// notification ID and dedup key must be derived from these references.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_automation_failure: Option<UserAutomationFailureIdentity>,
 }
 
 impl NotificationEnvelope {
@@ -113,6 +227,15 @@ impl NotificationEnvelope {
         validate_text(&self.summary, "summary")?;
         if self.canonical.subject != self.subject || self.canonical.summary != self.summary {
             return Err(NotifyError::RequestEnvelopeMismatch);
+        }
+        if let Some(identity) = &self.user_automation_failure {
+            if self.canonical.notification_id != identity.notification_id()?
+                || self.canonical.dedup_key != identity.dedup_key()?
+            {
+                return Err(NotifyError::InvalidEnvelope(
+                    "user_automation_failure.identity",
+                ));
+            }
         }
         if self.recipients.is_empty() {
             return Err(NotifyError::InvalidEnvelope("recipients"));
@@ -2025,6 +2148,15 @@ fn validate_text(value: &str, field: &'static str) -> Result<(), NotifyError> {
     }
 }
 
+fn validate_identity_text(value: &str, field: &'static str) -> Result<(), NotifyError> {
+    validate_text(value, field)?;
+    if value.len() > 256 {
+        Err(NotifyError::InvalidEnvelope(field))
+    } else {
+        Ok(())
+    }
+}
+
 fn validate_sha256(value: &str, field: &'static str) -> Result<(), NotifyError> {
     if value.len() != SHA256_HEX_LENGTH
         || value
@@ -2322,6 +2454,7 @@ mod tests {
                     role: RecipientRole::AuthorizedRole,
                 }],
                 source_receipt: receipt,
+                user_automation_failure: None,
             },
             request,
         )
@@ -3167,6 +3300,7 @@ mod tests {
             summary: "Inspect canonical evidence".to_owned(),
             recipients: envelope.recipients.clone(),
             source_receipt: changed_receipt,
+            user_automation_failure: envelope.user_automation_failure.clone(),
         };
         let platform = CountingPort {
             calls: Arc::clone(&calls),
@@ -3455,6 +3589,96 @@ mod tests {
         assert_eq!(
             core.deliver(&envelope, &request),
             Err(NotifyError::InvalidReceiptBinding)
+        );
+    }
+
+    #[test]
+    fn user_automation_failure_identity_is_stable_and_revision_bound() {
+        let first = UserAutomationFailureIdentity::new(
+            "automation-1",
+            "revision-7",
+            "failure-fingerprint-a",
+        )
+        .expect("identity");
+        let replay = UserAutomationFailureIdentity::new(
+            "automation-1",
+            "revision-7",
+            "failure-fingerprint-a",
+        )
+        .expect("replay identity");
+        let changed_fingerprint = UserAutomationFailureIdentity::new(
+            "automation-1",
+            "revision-7",
+            "failure-fingerprint-b",
+        )
+        .expect("changed fingerprint");
+        let changed_revision = UserAutomationFailureIdentity::new(
+            "automation-1",
+            "revision-8",
+            "failure-fingerprint-a",
+        )
+        .expect("changed revision");
+
+        assert_eq!(first.identity_digest(), replay.identity_digest());
+        assert_eq!(first.dedup_key(), replay.dedup_key());
+        assert_eq!(first.notification_id(), replay.notification_id());
+        assert_ne!(first.dedup_key(), changed_fingerprint.dedup_key());
+        assert_ne!(first.dedup_key(), changed_revision.dedup_key());
+        assert_ne!(
+            first.notification_id(),
+            changed_fingerprint.notification_id()
+        );
+        assert_ne!(first.notification_id(), changed_revision.notification_id());
+    }
+
+    #[test]
+    fn user_automation_failure_identity_binds_the_existing_draft_shape() {
+        let identity = UserAutomationFailureIdentity::new(
+            "automation-1",
+            "revision-7",
+            "failure-fingerprint-a",
+        )
+        .expect("identity");
+        let (_, request) = normal_input("request-user-automation-draft");
+        let draft = identity
+            .bind_draft(NotificationDraft {
+                notification_id: PlatformHandle::new("caller-id").unwrap(),
+                severity: NotificationSeverity::Warning,
+                subject: "automation failed".to_owned(),
+                summary: "retry requires review".to_owned(),
+                evidence_handles: vec!["failure-evidence".to_owned()],
+                affected_scope: "scope-1".to_owned(),
+                owner: "automation-owner".to_owned(),
+                required_action: "review failure".to_owned(),
+                deadline_or_review: None,
+                dedup_key: "caller-key".to_owned(),
+                delivery_channels: vec![
+                    DeliveryChannel::ControlBoard,
+                    DeliveryChannel::NativeToast,
+                ],
+                state_fence: request.context.state_fence,
+            })
+            .expect("bound draft");
+        assert_eq!(draft.notification_id, identity.notification_id().unwrap());
+        assert_eq!(draft.dedup_key, identity.dedup_key().unwrap());
+    }
+
+    #[test]
+    fn annotated_user_automation_failure_rejects_forged_draft_identity() {
+        let (mut envelope, _) = normal_input("request-user-automation-identity");
+        envelope.user_automation_failure = Some(
+            UserAutomationFailureIdentity::new(
+                "automation-1",
+                "revision-7",
+                "failure-fingerprint-a",
+            )
+            .expect("identity"),
+        );
+        assert_eq!(
+            envelope.validate_shape(),
+            Err(NotifyError::InvalidEnvelope(
+                "user_automation_failure.identity"
+            ))
         );
     }
 }

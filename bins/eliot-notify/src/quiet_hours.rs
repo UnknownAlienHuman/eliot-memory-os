@@ -8,6 +8,9 @@
 //! acknowledged or resolved. Acknowledgement stops toast repeats while the
 //! record stays unresolved at the Kernel owner.
 
+use eliot_contracts::PolicyRevision;
+use serde::{Deserialize, Serialize};
+
 /// Severity used for popup selection. It mirrors the Kernel-owned
 /// canonical severity without taking ownership of notification state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -19,7 +22,8 @@ pub enum PopupSeverity {
 }
 
 /// Half-open quiet-hours window expressed in whole hours (`0..24`).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QuietHours {
     start_hour: u8,
     end_hour: u8,
@@ -62,6 +66,40 @@ impl QuietHours {
         const MILLIS_PER_DAY: u64 = 24 * MILLIS_PER_HOUR;
         let hour = ((unix_ms % MILLIS_PER_DAY) / MILLIS_PER_HOUR) as u8;
         self.contains(hour)
+    }
+}
+
+/// Human-owned quiet-hours configuration bound to one immutable policy
+/// revision. The window is already normalized to UTC by the configuration
+/// owner; this surface never resolves a timezone, DST rule, or ambient clock.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuietHoursConfiguration {
+    pub window: QuietHours,
+    pub policy_revision: PolicyRevision,
+}
+
+impl QuietHoursConfiguration {
+    /// Creates a validated UTC window for one owner-supplied policy revision.
+    #[must_use]
+    pub const fn new(
+        start_hour: u8,
+        end_hour: u8,
+        policy_revision: PolicyRevision,
+    ) -> Option<Self> {
+        let Some(window) = QuietHours::new(start_hour, end_hour) else {
+            return None;
+        };
+        Some(Self {
+            window,
+            policy_revision,
+        })
+    }
+
+    /// Returns true when the configuration is bound to the request revision.
+    #[must_use]
+    pub const fn binds_policy_revision(self, policy_revision: PolicyRevision) -> bool {
+        self.policy_revision.value() == policy_revision.value()
     }
 }
 
@@ -144,5 +182,17 @@ mod tests {
     fn invalid_windows_are_rejected() {
         assert!(QuietHours::new(24, 7).is_none());
         assert!(QuietHours::new(22, 22).is_none());
+    }
+
+    #[test]
+    fn configured_window_requires_an_explicit_policy_revision() {
+        let configuration = QuietHoursConfiguration::new(22, 7, PolicyRevision::genesis())
+            .expect("valid configured window");
+        assert!(configuration.binds_policy_revision(PolicyRevision::genesis()));
+        assert!(
+            !configuration
+                .binds_policy_revision(PolicyRevision::new(2).expect("nonzero policy revision"))
+        );
+        assert!(QuietHoursConfiguration::new(24, 7, PolicyRevision::genesis()).is_none());
     }
 }
