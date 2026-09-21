@@ -35,6 +35,7 @@ use std::sync::atomic::Ordering;
 
 mod activation_projection;
 pub mod agent_fabric;
+pub mod capability_outcome;
 mod controlboard_adapters;
 mod daemon_config;
 mod daemon_kernel_client;
@@ -51,6 +52,7 @@ mod kernel_transition_client;
 mod observation_adapters;
 mod skill_lifecycle_adapters;
 mod skill_surface_adapters;
+pub mod staffing_policy;
 mod store_failure_projection;
 mod task_lifecycle_adapters;
 
@@ -74,6 +76,10 @@ use controlboard_adapters::SharedOperatorReplay;
 #[cfg(test)]
 use activation_projection::map_activation_snapshot;
 
+pub use capability_outcome::{
+    AttemptReceipt, CapabilityOutcome, CapabilityRegistryView, DegradationScope,
+    FallbackOutcomeRequest, OutcomeDisposition, OutcomeError, fallback_outcome,
+};
 pub use daemon_config::DaemonConfig;
 pub(crate) use daemon_kernel_client::kernel_port_error;
 pub use daemon_kernel_client::{DaemonKernelClient, LocalReadSubmitOutcome, OwnerSessionFacts};
