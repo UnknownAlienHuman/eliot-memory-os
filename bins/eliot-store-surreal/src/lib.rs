@@ -79,6 +79,12 @@ pub use request_dispatch::dispatch;
 use request_dispatch::map_recovery_dispatch_result;
 #[cfg(test)]
 use request_dispatch::{map_composition_error, map_genesis_dispatch_result};
+mod canonical_event;
+pub use canonical_event::{
+    CanonicalEvent, CommittedCanonicalTransition, DoctorRebuildAuthority, FencedProjectionPublication,
+    OrderingLink, ProjectionRebuildPlan, SemanticWritePath, ordering_link_hash,
+    request_projection_rebuild, request_rebuild_from_semantic_write,
+};
 mod adapter_materialization;
 pub use adapter_materialization::materialize_adapter_config;
 use adapter_materialization::resolve_credential;
