@@ -18,6 +18,13 @@ use eliot_agent_bridge_core::{
     ProviderReadiness, ReconciliationPortOutcome, ReconnectRequest, RecoveryDirective,
     TerminalReductionInputs, TransportEdge,
 };
+/// I7.17 recall response projection: bounded handles-first agent output with
+/// a server-derived disposition, binding receipt, and rank-trace handle.
+/// Full ranking/suppression traces require explicit debug expansion; the
+/// projection never accepts a disposition from bridge/model output.
+pub use eliot_agent_bridge_core::{
+    AgentRecallProjection, MAX_AGENT_RECALL_HANDLES, project_recall_for_agent,
+};
 use eliot_mcp::KernelHostRequestPort;
 use eliot_protocol::{
     AckPhase, AgentBridgeClientDeclaration, AgentBridgePeerAdmissionReceipt,
