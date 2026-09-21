@@ -6,14 +6,33 @@
 //! reason, preserved state, retry status, required authority/repair, and
 //! allowed next action; a valid envelope records an effect linked to the
 //! State Fence and verifier, and an unmet verifier never completes.
+//! The governed drive entry ([`eliot_native_worker::drive_governed_claimed`])
+//! is proven at its caller boundary: refusal invokes the drive zero times,
+//! admission invokes it exactly once with the validated binding and
+//! propagates the drive outcome unchanged.
 
 use std::sync::Mutex;
 
 use eliot_native_worker::governed_action::{
-    ActionEnvelope, EXTERNAL_ADAPTER_OPS, FinishState, ImpactClass, derive_impact,
+    ActionEnvelope, EXTERNAL_ADAPTER_OPS, FinishState, ImpactClass, ValidatedAction, derive_impact,
     finish_for_verdict, is_external_adapter_op, record_effect, require_governed_op,
     run_governed_external_op,
 };
+use eliot_native_worker::{KERNEL_ADMISSION_REQUIRED, NativeWorkerError, drive_governed_claimed};
+use eliot_native_worker_core::WorkerReady;
+
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    use std::task::{Context, Poll, Waker};
+    let mut future = std::pin::pin!(future);
+    let waker = Waker::noop();
+    let mut context = Context::from_waker(waker);
+    loop {
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(output) => return output,
+            Poll::Pending => std::thread::yield_now(),
+        }
+    }
+}
 
 fn fence() -> serde_json::Value {
     serde_json::json!({
@@ -123,4 +142,95 @@ fn valid_envelope_records_fence_bound_effect_and_unmet_verifier_never_completes(
     let complete = finish_for_verdict(&validated, true, true);
     assert_eq!(complete, FinishState::VerifiedComplete);
     assert!(complete.is_complete());
+}
+
+#[test]
+fn governed_drive_refuses_before_drive_invokes() {
+    for operation in ["claim", "undeclared-op"] {
+        let invokes = Mutex::new(0_usize);
+        let outcome: Result<_, NativeWorkerError> = block_on(drive_governed_claimed(
+            operation,
+            None,
+            |_validated| async {
+                *invokes.lock().unwrap_or_else(|error| {
+                    panic!("1911 fixture lock failed: {error:?}");
+                }) += 1;
+                Err::<WorkerReady, NativeWorkerError>(NativeWorkerError::KernelAdmissionRequired(
+                    "fake downstream unreachable".to_owned(),
+                ))
+            },
+        ));
+        let Err(error) = outcome else {
+            panic!("{operation} without an envelope must be refused before the drive");
+        };
+        assert_eq!(
+            *invokes.lock().unwrap_or_else(|error| {
+                panic!("1911 fixture lock failed: {error:?}");
+            }),
+            0,
+            "{operation} must not invoke the drive on refusal"
+        );
+        let detail = error.to_string();
+        assert!(
+            detail.starts_with(KERNEL_ADMISSION_REQUIRED),
+            "refusal keeps the contour denial shape, got {detail}"
+        );
+    }
+}
+
+#[test]
+fn governed_drive_admits_declared_op_and_propagates_drive_outcome() {
+    let envelope = valid_envelope("claim");
+    let invokes = Mutex::new(0_usize);
+    let bound = Mutex::new(None::<ValidatedAction>);
+    let outcome: Result<_, NativeWorkerError> = block_on(drive_governed_claimed(
+        "claim",
+        Some(&envelope),
+        |validated| async {
+            *invokes.lock().unwrap_or_else(|error| {
+                panic!("1911 fixture lock failed: {error:?}");
+            }) += 1;
+            *bound.lock().unwrap_or_else(|error| {
+                panic!("1911 fixture lock failed: {error:?}");
+            }) = Some(validated);
+            // A live process receipt (WorkerReady) needs a real drive; the
+            // canned downstream denial proves the drive ran and its outcome
+            // propagates unchanged. The Ok-receipt leg composes with the
+            // admitted-drive Ready proof in driver_admitted.rs.
+            Err::<WorkerReady, NativeWorkerError>(NativeWorkerError::KernelAdmissionRequired(
+                "fake downstream".to_owned(),
+            ))
+        },
+    ));
+    assert_eq!(
+        *invokes.lock().unwrap_or_else(|error| {
+            panic!("1911 fixture lock failed: {error:?}");
+        }),
+        1,
+        "admitted op must invoke the drive exactly once"
+    );
+    let bound = bound
+        .lock()
+        .unwrap_or_else(|error| {
+            panic!("1911 fixture lock failed: {error:?}");
+        })
+        .take()
+        .unwrap_or_else(|| {
+            panic!("drive receives the validated binding");
+        });
+    assert_eq!(bound.operation, "claim");
+    assert_eq!(bound.impact, ImpactClass::Material);
+    assert_eq!(bound.verifier, "verifier-1911");
+    let Err(error) = outcome else {
+        panic!("fake downstream outcome must propagate");
+    };
+    let detail = error.to_string();
+    assert!(
+        detail.contains("fake downstream"),
+        "drive outcome propagates unchanged, got {detail}"
+    );
+    assert!(
+        !detail.contains("governed action rejected"),
+        "admitted op carries no gate refusal, got {detail}"
+    );
 }

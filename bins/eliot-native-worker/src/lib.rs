@@ -394,6 +394,45 @@ where
     Ok(ready)
 }
 
+/// Governed entry for one driven external-adapter operation sequence
+/// (issue #1911, A10.1/A10.2/A10.3/A10.8).
+///
+/// The proven gate ([`governed_action::require_governed_op`]) runs BEFORE the
+/// product drive: a missing envelope, an envelope bound to another operation,
+/// or an invalid envelope refuses with the standardized typed rejection
+/// (mapped to [`NativeWorkerError::KernelAdmissionRequired`]) without
+/// invoking the drive closure. An admitted envelope flows through as the
+/// validated action the drive binds, and the drive receipt propagates
+/// unchanged. Production supplies the [`drive_admitted_claimed`] sequence as
+/// the drive closure; the contour owner adopts this entry at the binary
+/// call site once the envelope source is plumbed (no wire source exists yet).
+// The typed refusal travels by value so the repair shape stays readable.
+#[allow(
+    clippy::result_large_err,
+    reason = "typed refusal surface is matched by value on purpose"
+)]
+pub async fn drive_governed_claimed<Drive, Fut>(
+    operation: &str,
+    envelope: Option<&governed_action::ActionEnvelope>,
+    drive: Drive,
+) -> Result<
+    (
+        governed_action::ValidatedAction,
+        eliot_native_worker_core::WorkerReady,
+    ),
+    NativeWorkerError,
+>
+where
+    Drive: FnOnce(governed_action::ValidatedAction) -> Fut,
+    Fut: std::future::Future<
+            Output = Result<eliot_native_worker_core::WorkerReady, NativeWorkerError>,
+        >,
+{
+    let validated = governed_action::require_governed_op(envelope, operation)?;
+    let receipt = drive(validated.clone()).await?;
+    Ok((validated, receipt))
+}
+
 /// Admitted factory-resolution seam (T9-07, issue #874; supersedes PR #1125).
 /// BOUND by INTEGRATOR-T9-07: this is the single resolution function. It
 /// projects the owner-produced v2 executable join (`adapter_id`,
