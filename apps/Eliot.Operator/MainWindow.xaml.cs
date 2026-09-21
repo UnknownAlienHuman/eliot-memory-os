@@ -91,6 +91,11 @@ public sealed partial class MainWindow : Window
         await RefreshProjectionAsync();
     }
 
+    private async void ExecuteUserAutomation_OnClick(object sender, RoutedEventArgs e)
+    {
+        await ViewModel.RunUserAutomationAsync();
+    }
+
     private void ProjectionList_OnSelectionChanged(object sender, SelectionChangedEventArgs e) => RenderGraph();
     private void Action_OnSelectionChanged(object sender, SelectionChangedEventArgs e) => RenderGraph();
     private async void Start_OnClick(object sender, RoutedEventArgs e) => await ViewModel.RunCommandAsync("start_run");
@@ -114,6 +119,7 @@ public sealed partial class MainWindow : Window
     private void RenderGraph()
     {
         QueryLabPanel.Visibility = ViewModel.IsQueryPage ? Visibility.Visible : Visibility.Collapsed;
+        UserAutomationPanel.Visibility = ViewModel.IsUserAutomationPage ? Visibility.Visible : Visibility.Collapsed;
         RunControls.Visibility = ViewModel.CurrentPage.Tag == "autonomy"
             ? Visibility.Visible
             : Visibility.Collapsed;
