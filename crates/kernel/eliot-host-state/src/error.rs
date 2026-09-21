@@ -57,6 +57,8 @@ pub enum JournalError {
     },
     #[error("idempotency identity conflicts with a different record")]
     IdempotencyConflict,
+    #[error("reactive Context queue: {0}")]
+    ReactiveContext(String),
     #[error("durable outcome is unknown for transaction {transaction_id}")]
     OutcomeUnknown { transaction_id: PlatformHandle },
     #[error("journal writer synchronization failed")]
