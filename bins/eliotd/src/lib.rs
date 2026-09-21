@@ -35,6 +35,8 @@ use std::sync::atomic::Ordering;
 
 mod activation_projection;
 pub mod agent_fabric;
+pub mod canonical_config_precedence;
+pub mod capability_outcome;
 mod controlboard_adapters;
 mod daemon_config;
 mod daemon_kernel_client;
@@ -44,6 +46,7 @@ mod dreamer_admission;
 mod dreamer_materials;
 mod dreamer_model_adapter;
 mod first_run_wiring;
+mod freshness_admission;
 mod governor_local_read;
 mod kernel_authority_client;
 mod kernel_context_read_client;
@@ -52,6 +55,7 @@ mod kernel_transition_client;
 mod observation_adapters;
 mod skill_lifecycle_adapters;
 mod skill_surface_adapters;
+pub mod staffing_policy;
 mod store_failure_projection;
 mod task_lifecycle_adapters;
 
@@ -75,6 +79,16 @@ use controlboard_adapters::SharedOperatorReplay;
 #[cfg(test)]
 use activation_projection::map_activation_snapshot;
 
+pub use canonical_config_precedence::{
+    ALL_LAYERS, CANONICAL_SETTING_KEY, ConfigLayer, LayerInput, PrecedenceError, ResolvedChain,
+    ResolvedContribution, canonical_layer_json_schema, canonical_layer_json_schema_pretty,
+    classify_policy_input, parse_canonical_layer_json, parse_canonical_layer_toml,
+    resolve_canonical_chain,
+};
+pub use capability_outcome::{
+    AttemptReceipt, CapabilityOutcome, CapabilityRegistryView, DegradationScope,
+    FallbackOutcomeRequest, OutcomeDisposition, OutcomeError, fallback_outcome,
+};
 pub use daemon_config::DaemonConfig;
 pub(crate) use daemon_kernel_client::kernel_port_error;
 pub use daemon_kernel_client::{DaemonKernelClient, LocalReadSubmitOutcome, OwnerSessionFacts};
@@ -104,6 +118,13 @@ pub use dreamer_model_adapter::{
 pub use first_run_wiring::{
     DisabledAutomationOutcome, FirstRunWiringError, inspect_first_run_defaults,
     recommend_for_disabled_automation, resolve_first_run_routes,
+};
+pub use freshness_admission::{
+    CANDIDATE_COMMITTED_PROJECTION_PENDING, CandidateFetchOutcome, CommittedCandidate,
+    FreshnessAdmission, FreshnessDisposition, FreshnessError, FreshnessEvaluation,
+    ProjectionPublicationRecord, ProjectionPublicationStatus, ProvenanceStanding, PublicationMode,
+    RequestedEffect, ReusableCandidateView, RevisionHead, TaskCompatibility,
+    evaluate_freshness_admission, fetch_committed_candidate, normalize_heads,
 };
 pub use governor_local_read::{
     answer_evidence_query, answer_projection_inputs, forward_admitted_local_read,

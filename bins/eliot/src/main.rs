@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use eliot_bootstrap::capture::{capture_snapshot, write_snapshot_artifact};
 use eliot_cli::{CommandCatalogue, CommandPort, CommandPortError, CommandRequest};
+use eliot_doctor::integration;
 use eliot_installation::{
     ActivationCommitFence, ApprovedGenerationRegistry, CandidateManifest,
     GenerationPackagePlanInput, GenerationPackagePlanner, InstallationEpoch, InstallationError,
@@ -43,7 +44,9 @@ use std::{
 use tracing_subscriber::EnvFilter;
 
 mod bootstrap_draft;
+mod controlboard_status;
 mod first_run_flow;
+mod plugin_preview;
 mod source_bundle_materializer;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -96,6 +99,22 @@ enum Command {
     Setup {
         #[command(subcommand)]
         command: SetupCommand,
+    },
+    /// Preview or install a plugin/bridge with rollback (I3.7).
+    Plugin {
+        #[command(subcommand)]
+        command: PluginCommand,
+    },
+    /// Verify plugin/bridge integration coverage for one profile (I3.7).
+    Doctor {
+        #[command(subcommand)]
+        command: DoctorCommand,
+    },
+    /// Read the reconciled `ControlBoard` status projection (#1213).
+    #[command(name = "controlboard")]
+    ControlBoard {
+        #[command(subcommand)]
+        command: ControlBoardCommand,
     },
     Version,
     /// Start or reuse the authenticated User Broker and launch Operator.
@@ -322,6 +341,57 @@ enum RuntimeCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum PluginCommand {
+    /// Render the exact I3.7 preview fields without mutating anything.
+    Preview {
+        /// Absolute path to the plugin proposal manifest JSON.
+        #[arg(long, value_parser = absolute_path)]
+        manifest: PathBuf,
+        /// Absolute rollback directory bound into the preview.
+        #[arg(long, value_parser = absolute_path)]
+        rollback_dir: PathBuf,
+    },
+    /// Preserve the rollback artifact before mutation, then record an
+    /// install receipt scoped to the rollback directory. Never claims
+    /// runtime liveness.
+    Install {
+        /// Absolute path to the plugin proposal manifest JSON.
+        #[arg(long, value_parser = absolute_path)]
+        manifest: PathBuf,
+        /// Absolute rollback directory receiving the artifact and receipt.
+        #[arg(long, value_parser = absolute_path)]
+        rollback_dir: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum DoctorCommand {
+    /// Inspect expected file hashes, active registrations, observed hook
+    /// events, and the handshake result for one profile, reporting
+    /// installation separately from runtime liveness. Read-only: executes
+    /// no repair, mints no authority, mutates nothing.
+    Integration {
+        /// Integration profile name; must equal the expectation record profile.
+        profile: String,
+        /// Absolute path to the expected integration state JSON.
+        #[arg(long, value_parser = absolute_path)]
+        expectation: PathBuf,
+        /// Absolute path to the observed integration state JSON.
+        #[arg(long, value_parser = absolute_path)]
+        observation: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ControlBoardCommand {
+    /// Fetch one reconciled `ControlBoard` board over the authenticated
+    /// `controlboard.status` transact path and project its typed rows.
+    /// Read-only: owns no board handle, cache, or canonical state, and
+    /// synthesizes no health from the dispositions.
+    Status,
+}
+
+#[derive(Debug, Subcommand)]
 enum SystemCommand {
     /// Capture source/build/runtime/store/integration evidence.
     Snapshot {
@@ -454,6 +524,9 @@ fn run() -> Result<i32> {
         Command::Installation { command } => run_installation(command),
         Command::Runtime { command } => run_runtime(command),
         Command::Setup { command } => run_setup(command),
+        Command::Plugin { command } => run_plugin(command),
+        Command::Doctor { command } => run_doctor(command),
+        Command::ControlBoard { command } => run_controlboard(command),
         Command::Dispatch => run_dispatch(),
         Command::Ui => run_ui(),
     }
@@ -519,6 +592,178 @@ fn run_setup(command: SetupCommand) -> Result<i32> {
             scope,
         }),
     }
+}
+
+fn run_plugin(command: PluginCommand) -> Result<i32> {
+    match command {
+        PluginCommand::Preview {
+            manifest,
+            rollback_dir,
+        } => {
+            let proposal = match plugin_preview::load_manifest(&manifest) {
+                Ok(proposal) => proposal,
+                Err(error) => {
+                    write_installation_error("PLUGIN_PREVIEW_INVALID", &error.to_string());
+                    return Ok(INVALID_REQUEST_EXIT);
+                }
+            };
+            let preview = plugin_preview::render_preview(&proposal, &rollback_dir);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&plugin_preview::preview_json(&preview))?
+            );
+            Ok(0)
+        }
+        PluginCommand::Install {
+            manifest,
+            rollback_dir,
+        } => {
+            let proposal = match plugin_preview::load_manifest(&manifest) {
+                Ok(proposal) => proposal,
+                Err(error) => {
+                    write_installation_error("PLUGIN_INSTALL_INVALID", &error.to_string());
+                    return Ok(INVALID_REQUEST_EXIT);
+                }
+            };
+            match plugin_preview::install_with_rollback(&proposal, &rollback_dir) {
+                // No admitted mutation port exists, so success is unreachable:
+                // a backup-only path cannot yield installed success. The
+                // defensive arm stays fail-closed if that ever changes.
+                Ok(_) => {
+                    write_installation_error(
+                        "PLUGIN_INSTALL_UNEXPECTED",
+                        "install reported success without an admitted mutation port; no installed claim is emitted",
+                    );
+                    Ok(INVALID_REQUEST_EXIT)
+                }
+                Err(plugin_preview::PluginPreviewError::InstallNotAttempted {
+                    detail,
+                    rollback_artifact,
+                    receipt_path,
+                }) => {
+                    write_installation_error(
+                        "PLUGIN_INSTALL_NOT_ATTEMPTED",
+                        &format!(
+                            "{detail} rollback={} receipt={}",
+                            rollback_artifact.display(),
+                            receipt_path.display()
+                        ),
+                    );
+                    Ok(INVALID_REQUEST_EXIT)
+                }
+                Err(error) => {
+                    write_installation_error("PLUGIN_INSTALL_FAILED", &error.to_string());
+                    Ok(INVALID_REQUEST_EXIT)
+                }
+            }
+        }
+    }
+}
+
+fn run_doctor(command: DoctorCommand) -> Result<i32> {
+    match command {
+        DoctorCommand::Integration {
+            profile,
+            expectation,
+            observation,
+        } => {
+            // Same shared gate as `eliot-doctor integration`: the evaluator
+            // and output contract live in `eliot_doctor::integration`; this
+            // front door only decodes arguments and projects the result.
+            // Verification mismatches are data inside the JSON report
+            // (exit 0); only input errors exit nonzero.
+            match integration::verify_profile(&profile, &expectation, &observation) {
+                Ok(report) => {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                    Ok(0)
+                }
+                Err(error) => {
+                    write_installation_error("DOCTOR_INTEGRATION_INVALID", &error.to_string());
+                    Ok(INVALID_REQUEST_EXIT)
+                }
+            }
+        }
+    }
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "single-variant command dispatch keeps the by-value shape reserved for future variants"
+)]
+fn run_controlboard(command: ControlBoardCommand) -> Result<i32> {
+    match command {
+        // Actual consumer over the authenticated EBP transact path: the
+        // serving runtime (Ramanujan/Kernel lane) reconciles the board and
+        // answers `controlboard.status`; this front door only decodes the
+        // served board with the owner's transport types and projects its
+        // typed rows. No board handle, cache, or canonical state is owned
+        // here, and no health is synthesized from the dispositions.
+        ControlBoardCommand::Status => {
+            #[cfg(windows)]
+            {
+                run_controlboard_status_windows()
+            }
+            #[cfg(not(windows))]
+            {
+                write_json_error(
+                    "KERNEL_APPLICATION_PORT_CLOSED",
+                    "Windows authenticated Kernel front door",
+                );
+                Ok(FRONT_DOOR_CLOSED_EXIT)
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn run_controlboard_status_windows() -> Result<i32> {
+    use eliot_cli::kernel_client::KernelClientError;
+
+    let mut port = match AuthenticatedKernelPort::load() {
+        Ok(port) => port,
+        Err(CommandPortError::FrontDoorClosed { contract }) => {
+            write_json_error("KERNEL_APPLICATION_PORT_CLOSED", contract);
+            return Ok(FRONT_DOOR_CLOSED_EXIT);
+        }
+        Err(error) => {
+            write_json_error("KERNEL_CLIENT_CONFIGURATION_REJECTED", &error.to_string());
+            return Ok(FRONT_DOOR_CLOSED_EXIT);
+        }
+    };
+    let served = match port.transact_controlboard_status() {
+        Ok(served) => served,
+        Err(KernelClientError::FrontDoorClosed(contract)) => {
+            write_json_error("KERNEL_APPLICATION_PORT_CLOSED", contract);
+            return Ok(FRONT_DOOR_CLOSED_EXIT);
+        }
+        Err(KernelClientError::UnknownOutcome(detail)) => {
+            write_json_error("CONTROLBOARD_STATUS_UNKNOWN", &detail);
+            return Ok(UNKNOWN_OUTCOME_EXIT);
+        }
+        Err(KernelClientError::MissingRequestIdentity) => {
+            write_json_error(
+                "CONTROLBOARD_STATUS_NOT_ADMITTED",
+                "no admitted EBP request identity is bound for an operator-initiated controlboard read; the identity must arrive through the admitted host request path and Ramanujan must serve controlboard.status; tracker #1213",
+            );
+            return Ok(INVALID_REQUEST_EXIT);
+        }
+        Err(error) => {
+            write_json_error("CONTROLBOARD_STATUS_REJECTED", &error.to_string());
+            return Ok(INVALID_REQUEST_EXIT);
+        }
+    };
+    let board = match controlboard_status::decode_status_response(served) {
+        Ok(board) => board,
+        Err(error) => {
+            write_json_error("CONTROLBOARD_STATUS_REFUSED", &error.to_string());
+            return Ok(UNKNOWN_OUTCOME_EXIT);
+        }
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&controlboard_status::render_status_json(&board)?)?
+    );
+    Ok(0)
 }
 
 fn run_bootstrap(command: BootstrapCommand) -> i32 {
@@ -2548,7 +2793,10 @@ fn open_existing_registry_for_terminal_reconcile(
             Err(error) if is_redb_exclusive_lock_contention(&error) => {
                 last_contention = Some(error);
                 if attempt + 1 < MAX_ATTEMPTS {
-                    std::thread::sleep(Duration::from_millis(BACKOFF_MS[attempt]));
+                    let Some(&backoff_ms) = BACKOFF_MS.get(attempt) else {
+                        panic!("backoff schedule covers all retries");
+                    };
+                    std::thread::sleep(Duration::from_millis(backoff_ms));
                     continue;
                 }
                 break;
@@ -2556,7 +2804,10 @@ fn open_existing_registry_for_terminal_reconcile(
             Err(error) => return Err(error),
         }
     }
-    Err(last_contention.expect("lock-contention loop must retain its cause"))
+    let Some(cause) = last_contention else {
+        panic!("lock-contention loop must retain its cause");
+    };
+    Err(cause)
 }
 
 fn reconcile_host_activation_terminal(
@@ -3191,6 +3442,22 @@ impl AuthenticatedKernelPort {
     ) -> std::result::Result<serde_json::Value, eliot_cli::kernel_client::KernelClientError> {
         self.client.ensure_operator_launch()
     }
+
+    /// Sends the exact `controlboard.status` operation through the
+    /// authenticated EBP Execute seam and returns the served result payload.
+    ///
+    /// The EBP request identity must already be bound on the client by an
+    /// admitted flow; this front door never mints principal, session, fence,
+    /// or idempotency identity. Without one the call fails closed with
+    /// `MissingRequestIdentity` before any byte is sent.
+    fn transact_controlboard_status(
+        &mut self,
+    ) -> std::result::Result<serde_json::Value, eliot_cli::kernel_client::KernelClientError> {
+        self.client.transact_json(
+            controlboard_status::STATUS_OPERATION,
+            controlboard_status::status_request_payload(),
+        )
+    }
 }
 
 #[cfg(windows)]
@@ -3271,6 +3538,130 @@ mod tests {
     #[test]
     fn committed_unknown_materialization_uses_reconciliation_exit() {
         assert_eq!(UNKNOWN_OUTCOME_EXIT, 75);
+    }
+
+    #[test]
+    fn plugin_preview_and_install_parse() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+        let parsed = Cli::try_parse_from([
+            "eliot",
+            "plugin",
+            "preview",
+            "--manifest",
+            "C:\\eliot\\manifest.json",
+            "--rollback-dir",
+            "C:\\eliot\\rollback",
+        ])
+        .expect("plugin preview parses");
+        assert!(matches!(
+            parsed.command,
+            Command::Plugin {
+                command: PluginCommand::Preview { .. }
+            }
+        ));
+        let parsed = Cli::try_parse_from([
+            "eliot",
+            "plugin",
+            "install",
+            "--manifest",
+            "C:\\eliot\\manifest.json",
+            "--rollback-dir",
+            "C:\\eliot\\rollback",
+        ])
+        .expect("plugin install parses");
+        assert!(matches!(
+            parsed.command,
+            Command::Plugin {
+                command: PluginCommand::Install { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn doctor_integration_parses() {
+        let parsed = Cli::try_parse_from([
+            "eliot",
+            "doctor",
+            "integration",
+            "demo",
+            "--expectation",
+            "C:\\eliot\\expectation.json",
+            "--observation",
+            "C:\\eliot\\observation.json",
+        ])
+        .expect("doctor integration parses");
+        assert!(matches!(
+            parsed.command,
+            Command::Doctor {
+                command: DoctorCommand::Integration { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn plugin_install_without_admitted_port_exits_nonsuccess() {
+        // End-to-end CLI honesty: a valid manifest still cannot produce an
+        // installed-success result without an admitted mutation port.
+        let root = std::env::temp_dir().join(format!("eliot-plugin-install-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("create temp root");
+        let target = root.join("config.json");
+        std::fs::write(&target, b"{\"bridge\":\"demo\"}").expect("write target");
+        let manifest_path = root.join("manifest.json");
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "plugin_id": "demo-bridge",
+                "profile": "demo",
+                "files_to_modify": [target.display().to_string()],
+                "config_block": "{\"bridge\":\"demo\"}",
+                "hooks": ["on_task"],
+                "mcp_server": "demo-mcp",
+                "tool_count": 3,
+                "skill_count": 2,
+                "expected_coverage": {
+                    "profile": "demo",
+                    "expected_file_hashes": {},
+                    "expected_registrations": ["demo-mcp"],
+                    "expected_hook_events": ["on_task"],
+                },
+            }))
+            .expect("serialize manifest"),
+        )
+        .expect("write manifest");
+        let rollback_dir = root.join("rollback");
+        let code = run_plugin(PluginCommand::Install {
+            manifest: manifest_path.clone(),
+            rollback_dir: rollback_dir.clone(),
+        })
+        .expect("install front door executes");
+        assert_eq!(code, INVALID_REQUEST_EXIT);
+        let receipt_path = rollback_dir.join("demo-bridge.installed.json");
+        let receipt: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&receipt_path).expect("read install receipt"),
+        )
+        .expect("parse install receipt");
+        assert_eq!(receipt["status"], "INSTALL_NOT_ATTEMPTED");
+        assert_eq!(receipt["code"], "PLAN_GAP");
+        assert_eq!(receipt["completed"], false);
+        // The target itself is untouched: no mutation occurred.
+        assert_eq!(
+            std::fs::read(&target).expect("read target"),
+            b"{\"bridge\":\"demo\"}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn controlboard_status_parses() {
+        let parsed = Cli::try_parse_from(["eliot", "controlboard", "status"])
+            .expect("controlboard status parses");
+        assert!(matches!(
+            parsed.command,
+            Command::ControlBoard {
+                command: ControlBoardCommand::Status
+            }
+        ));
     }
 
     fn applied_outcome() -> InstallationStepOutcome {

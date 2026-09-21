@@ -1674,9 +1674,7 @@ fn work_class_threads_through_definition_reservation_admission_and_dispatch() ->
         let (definition, _candidate) = world.fabric.define_and_plan(request)?;
         assert_eq!(definition.work_class, expected);
         assert_eq!(definition.work_class.as_wire_str(), *class);
-        let reservation = world
-            .fabric
-            .stage_reservation(&definition.definition_id)?;
+        let reservation = world.fabric.stage_reservation(&definition.definition_id)?;
         assert_eq!(reservation.work_class, expected);
         let admission = world.fabric.commit_admission(&reservation.reservation_id)?;
         assert_eq!(admission.work_class, expected);
@@ -1717,10 +1715,14 @@ fn work_class_unknown_rejects_before_launch_without_capacity() -> TestResult {
         other => return Err(format!("unknown class must reject typed, got {other:?}").into()),
     }
     // The same rejection fires at serde ingress for a request-shaped payload.
-    let mut tampered = serde_json::to_value(&request).map_err(|error| format!("encode: {error}"))?;
+    let mut tampered =
+        serde_json::to_value(&request).map_err(|error| format!("encode: {error}"))?;
     tampered["work_class"] = serde_json::json!("proton");
     let decoded: Result<StaffingPlanRequest, _> = serde_json::from_value(tampered);
-    let message = decoded.err().map(|error| error.to_string()).unwrap_or_default();
+    let message = decoded
+        .err()
+        .map(|error| error.to_string())
+        .unwrap_or_default();
     assert!(
         message.contains("unknown work class: proton"),
         "decode must reject unknown class, got {message:?}"
