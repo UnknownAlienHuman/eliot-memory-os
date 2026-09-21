@@ -487,7 +487,7 @@ static APPLY_NOTIFICATION_STATE_PARAMETERS: [ParameterDeclaration; 10] = [
     ParameterDeclaration {
         name: "dedup_key",
         shape: ParameterShape::Subject,
-        required: true,
+        required: false,
     },
     ParameterDeclaration {
         name: "notification_id",

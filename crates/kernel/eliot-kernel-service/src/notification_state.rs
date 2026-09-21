@@ -10,33 +10,34 @@
 //! outcomes without claiming success. Semantic record state lives in the
 //! canonical store; this service never invents delivery or resolution.
 //!
-//! Non-upsert legs address the canonical `notification_id`; the backend
-//! resolves it against the store-owned dedup index. The front door never
-//! accepts a caller-supplied dedup key on those legs, so identity
-//! substitution is impossible here by construction.
+//! Record, transition, and resolution-authority types are the shared
+//! kernel-core model (`eliot_kernel_core::notification_state`), consumed
+//! directly — never redefined. Non-upsert legs address the canonical
+//! `notification_id`; the backend resolves it against the store-owned dedup
+//! index. The front door never accepts a caller-supplied dedup key on those
+//! legs, so identity substitution is impossible here by construction.
 
 use std::collections::BTreeMap;
 
 use eliot_contracts::{EpochId, ResourceGeneration, StateFence};
+use eliot_kernel_core::{
+    DeliveryChannel, DeliveryState, Notification, NotificationDraft, ResolutionAuthorization,
+};
 use eliot_store_api::{
     CanonicalRequestView, CanonicalStoreClient, EffectClass, EventProjectionRelationIntents,
-    NamedMutationRequest, NotificationRecord, NotificationStateMutation,
-    NotificationStateReadRequest, NotificationStateReadResponse, NotificationStateRequest,
-    NotificationStateResponse, OperationId, OperationManifestDigest, OrderingScopeId,
-    PreparedTransition, ReceiptEnvelope, ScopeId, SecurityContext, StoreError, TransitionClass,
-    WriteReceiptStatus, canonical_json_bytes, canonical_request_hash,
-    decode_notification_page, generated_operation_manifests, notification_mutation_request,
-    notification_read_request, operation_manifest_set_digest, sha256_hex,
-    verify_canonical_request_hash,
+    NOTIFICATION_STATE_SCOPE, NOTIFY_MUTATION_ACKNOWLEDGE, NOTIFY_MUTATION_DELIVERY,
+    NOTIFY_MUTATION_RESOLVE, NOTIFY_MUTATION_UPSERT, NOTIFY_PARAM_AUTHORIZATION_JSON,
+    NOTIFY_PARAM_CHANNEL, NOTIFY_PARAM_DEDUP_KEY, NOTIFY_PARAM_DELIVERY_JSON,
+    NOTIFY_PARAM_DISPOSITION, NOTIFY_PARAM_MUTATION, NOTIFY_PARAM_NOTIFICATION_ID,
+    NOTIFY_PARAM_PRINCIPAL, NOTIFY_PARAM_RECORD_JSON, NOTIFY_PARAM_SOURCE_RECEIPT_JSON,
+    OperationId, OperationIdentity, OperationManifestDigest, OrderingScopeId, PreparedTransition,
+    ReceiptEnvelope, RequestMetadata, ScopeId, SecurityContext, StoreError, TransitionClass,
+    WriteReceiptStatus, canonical_json_bytes, generated_operation_manifests,
+    notification_mutation_request, notification_read_request, operation_manifest_set_digest,
+    sha256_hex, verify_canonical_request_hash,
 };
-use eliot_store_api::{
-    NOTIFY_MUTATION_ACKNOWLEDGE, NOTIFY_MUTATION_DELIVERY, NOTIFY_MUTATION_RESOLVE,
-    NOTIFY_MUTATION_UPSERT, NOTIFY_PARAM_AUTHORIZATION_JSON, NOTIFY_PARAM_CHANNEL,
-    NOTIFY_PARAM_DEDUP_KEY, NOTIFY_PARAM_DELIVERY_JSON, NOTIFY_PARAM_DISPOSITION,
-    NOTIFY_PARAM_MUTATION, NOTIFY_PARAM_NOTIFICATION_ID, NOTIFY_PARAM_PRINCIPAL,
-    NOTIFY_PARAM_RECORD_JSON, NOTIFY_PARAM_SOURCE_RECEIPT_JSON, NOTIFICATION_STATE_SCOPE,
-    NotificationContractError,
-};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -57,10 +58,7 @@ impl AuthenticatedNotificationSession {
     /// `Ready`, no candidate lineage or consumed activation receipt exists,
     /// the activation no longer agrees with the live epoch (revoked/stale
     /// activation), or the principal reference is not bounded wire text.
-    pub fn bind(
-        service: &KernelService,
-        principal_ref: &str,
-    ) -> Result<Self, KernelServiceError> {
+    pub fn bind(service: &KernelService, principal_ref: &str) -> Result<Self, KernelServiceError> {
         validate_text(principal_ref, "notification.principal")?;
         if service.generation_fenced() {
             return Err(KernelServiceError::GenerationFenced);
@@ -182,8 +180,121 @@ pub struct NotificationServiceContext {
     pub generation: u64,
 }
 
+/// Closed notification-state mutation legs on shared model types.
+///
+/// The upsert leg boxes its two large payloads (`NotificationDraft`,
+/// `ReceiptEnvelope`) so the enum stays flat across legs; all other legs
+/// carry small identity/disposition values.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum NotificationStateMutation {
+    /// Create or coalesce exactly one record before any delivery attempt.
+    Upsert {
+        /// Caller canonical fields.
+        record: Box<NotificationDraft>,
+        /// Admission/provenance receipt for the upsert.
+        source_receipt: Box<ReceiptEnvelope>,
+    },
+    /// Record the verified latest delivery state without resolving the item.
+    Delivery {
+        /// Canonical notification identity.
+        notification_id: String,
+        /// Channel the attempt used.
+        channel: DeliveryChannel,
+        /// Verified delivery outcome.
+        delivery: DeliveryState,
+    },
+    /// Suppress repeated toast selection; never resolves the record.
+    Acknowledge {
+        /// Canonical notification identity.
+        notification_id: String,
+        /// Acknowledging principal.
+        principal: String,
+    },
+    /// Resolve only with a protected, evidence-bound authority receipt.
+    Resolve {
+        /// Canonical notification identity.
+        notification_id: String,
+        /// Human disposition recorded by the owner.
+        disposition: String,
+        /// Protected receipt/evidence authorization.
+        authorization: Box<ResolutionAuthorization>,
+    },
+}
+
+/// Authenticated notification-state write request.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NotificationStateRequest {
+    /// Exact operation identity (idempotency + canonical request hash).
+    pub operation: OperationIdentity,
+    /// Caller request metadata bound by the Kernel route.
+    pub context: RequestMetadata,
+    /// Fence the mutation is admitted under.
+    pub state_fence: StateFence,
+    /// Closed mutation leg.
+    pub mutation: NotificationStateMutation,
+}
+
+/// Notification-state write response.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NotificationStateResponse {
+    /// Current canonical record after the mutation.
+    pub record: Notification,
+    /// Exact store response receipt (never fabricated by the caller).
+    pub receipt: ReceiptEnvelope,
+    /// True when the response replays an already-admitted operation identity.
+    pub replayed: bool,
+}
+
+/// Same-fence canonical read request for the `ControlBoard` projection.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NotificationStateReadRequest {
+    /// Caller request metadata bound by the Kernel route.
+    pub context: RequestMetadata,
+    /// Fence the projection is admitted under.
+    pub state_fence: StateFence,
+    /// Optional record-scope filter (never a quiet-hours filter).
+    pub scope: Option<String>,
+    /// Whether resolved rows are included.
+    pub include_resolved: bool,
+    /// Page-size bound.
+    pub page_limit: u16,
+    /// Opaque dedup-key cursor for paging.
+    pub cursor: Option<String>,
+}
+
+/// Canonical inbox metrics preserved by the read projection.
+#[derive(Clone, Debug, Default, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotificationMetrics {
+    /// Unresolved records in the projected set.
+    pub unresolved_total: u64,
+    /// Unresolved critical records.
+    pub critical_unresolved: u64,
+    /// Unresolved action-required records.
+    pub action_required_unresolved: u64,
+    /// Unresolved records with failed/uncertain delivery.
+    pub failed_delivery_unresolved: u64,
+    /// Unresolved acknowledged records (still visible).
+    pub acknowledged_unresolved: u64,
+    /// Resolved records in the projected set.
+    pub resolved_total: u64,
+}
+
+/// Same-fence canonical read response.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NotificationStateReadResponse {
+    /// Projected records in deterministic dedup-key order.
+    pub records: Vec<Notification>,
+    /// Inbox metrics over the projected set.
+    pub metrics: NotificationMetrics,
+    /// Fence the projection was admitted under.
+    pub state_fence: StateFence,
+    /// Owner revision the projection was read at.
+    pub revision: u64,
+}
+
 /// Front-door errors for notification-state admission.
-#[derive(Clone, Debug, Error, PartialEq)]
+#[derive(Debug, Error)]
 pub enum NotificationServiceError {
     /// A field failed bounded identity validation.
     #[error("{field} is invalid: {reason}")]
@@ -217,6 +328,9 @@ pub enum NotificationServiceError {
     /// The store committed no response receipt; the outcome is unknown.
     #[error("notification response receipt is missing; outcome is unknown")]
     MissingReceiptEnvelope,
+    /// The backend rejected the mutation.
+    #[error("notification rejected: {0}")]
+    Rejected(String),
     /// A closed store error.
     #[error("notification store: {0}")]
     Store(#[from] StoreError),
@@ -234,14 +348,7 @@ impl NotificationServiceError {
             StoreError::FenceMismatch => Self::FenceMismatch,
             StoreError::IdentityConflict => Self::IdentityConflict,
             StoreError::InvalidField { field, reason }
-                if field == "notification.dedup_key"
-                    && reason == "unknown notification" =>
-            {
-                Self::UnknownNotification
-            }
-            StoreError::InvalidField { field, reason }
-                if field == "notification.notification_id"
-                    && reason == "unknown notification" =>
+                if field == "notification.notification_id" && reason == "unknown notification" =>
             {
                 Self::UnknownNotification
             }
@@ -272,7 +379,7 @@ pub async fn handle_notification_state_request(
     let context = session
         .service_context(service)
         .map_err(NotificationServiceError::Service)?;
-    request.validate().map_err(contract_field_error)?;
+    validate_notification_request(request)?;
     require_live_fence(&context, &request.state_fence)?;
     if request.context.state_fence != request.state_fence {
         return Err(NotificationServiceError::FenceMismatch);
@@ -294,9 +401,9 @@ pub async fn handle_notification_state_request(
         }
         let record = read_back_notification(client, request, &request.state_fence).await?;
         let receipt = existing
-            .envelope
-            .clone()
-            .ok_or(NotificationServiceError::MissingReceiptEnvelope)?;
+            .require_reconciliation_envelope()
+            .map_err(NotificationServiceError::from_store)?
+            .clone();
         return Ok(NotificationStateResponse {
             record,
             receipt,
@@ -320,9 +427,9 @@ pub async fn handle_notification_state_request(
         return Err(NotificationServiceError::ManifestMismatch);
     }
     let envelope = receipt
-        .envelope
-        .clone()
-        .ok_or(NotificationServiceError::MissingReceiptEnvelope)?;
+        .require_reconciliation_envelope()
+        .map_err(NotificationServiceError::from_store)?
+        .clone();
     envelope
         .validate()
         .map_err(|_| NotificationServiceError::MissingReceiptEnvelope)?;
@@ -349,12 +456,7 @@ pub async fn handle_notification_state_read(
     let context = session
         .service_context(service)
         .map_err(NotificationServiceError::Service)?;
-    request
-        .validate()
-        .map_err(|_| NotificationServiceError::InvalidField {
-            field: "notification.read",
-            reason: "notification read request failed closed validation",
-        })?;
+    validate_notification_read_request(request)?;
     require_live_fence(&context, &request.state_fence)?;
     if request.context.state_fence != request.state_fence {
         return Err(NotificationServiceError::FenceMismatch);
@@ -373,12 +475,7 @@ pub async fn handle_notification_state_read(
         .execute_named(query)
         .await
         .map_err(NotificationServiceError::from_store)?;
-    let page =
-        eliot_store_api::decode_notification_page(&payload).map_err(NotificationServiceError::from_store)?;
-    if page.state_fence != request.state_fence {
-        return Err(NotificationServiceError::FenceMismatch);
-    }
-    Ok(page)
+    decode_notification_read_response(&payload.payload, &request.state_fence)
 }
 
 /// Reconciles one exact admitted operation identity after transport loss.
@@ -411,36 +508,85 @@ pub async fn reconcile_notification_state(
             if receipt.idempotency_key == idempotency_key
                 && receipt.canonical_request_hash == canonical_request_hash =>
         {
-            receipt
-                .envelope
-                .clone()
-                .ok_or(NotificationServiceError::MissingReceiptEnvelope)
-                .map(Some)
+            let envelope = receipt
+                .require_reconciliation_envelope()
+                .map_err(NotificationServiceError::from_store)?
+                .clone();
+            Ok(Some(envelope))
         }
         Some(_) => Err(NotificationServiceError::IdentityConflict),
         None => Ok(None),
     }
 }
 
-fn contract_field_error(error: NotificationContractError) -> NotificationServiceError {
-    match error {
-        NotificationContractError::InvalidField { field, .. } => {
-            NotificationServiceError::InvalidField {
-                field,
-                reason: "notification request failed closed validation",
+fn validate_notification_request(
+    request: &NotificationStateRequest,
+) -> Result<(), NotificationServiceError> {
+    let invalid = |field: &'static str| NotificationServiceError::InvalidField {
+        field,
+        reason: "notification request failed closed validation",
+    };
+    request
+        .operation
+        .validate()
+        .map_err(|_| invalid("notification.operation"))?;
+    match &request.mutation {
+        NotificationStateMutation::Upsert {
+            record,
+            source_receipt,
+        } => {
+            record
+                .validate()
+                .map_err(|_| invalid("notification.record"))?;
+            if record.state_fence != request.state_fence {
+                return Err(invalid("notification.state_fence"));
             }
+            source_receipt
+                .validate()
+                .map_err(|_| invalid("notification.source_receipt"))?;
         }
-        NotificationContractError::UnknownMutation => NotificationServiceError::InvalidField {
-            field: "notification.mutation",
-            reason: "unknown notification mutation leg",
-        },
-        NotificationContractError::MissingParameter(name) => {
-            NotificationServiceError::InvalidField {
-                field: name,
-                reason: "missing required notification parameter",
+        NotificationStateMutation::Delivery { delivery, .. } => {
+            delivery
+                .validate()
+                .map_err(|_| invalid("notification.delivery"))?;
+        }
+        NotificationStateMutation::Acknowledge { principal, .. } => {
+            validate_text(principal, "notification.principal")
+                .map_err(|_| invalid("notification.principal"))?;
+        }
+        NotificationStateMutation::Resolve {
+            disposition,
+            authorization,
+            ..
+        } => {
+            validate_text(disposition, "notification.disposition")
+                .map_err(|_| invalid("notification.disposition"))?;
+            if authorization.evidence_handles.is_empty() {
+                return Err(invalid("notification.evidence_handles"));
             }
         }
     }
+    Ok(())
+}
+
+fn validate_notification_read_request(
+    request: &NotificationStateReadRequest,
+) -> Result<(), NotificationServiceError> {
+    let invalid = |field: &'static str| NotificationServiceError::InvalidField {
+        field,
+        reason: "notification read request failed closed validation",
+    };
+    if let Some(scope) = &request.scope {
+        validate_text(scope, "notification.scope")?;
+    }
+    if request.page_limit == 0 || request.page_limit > eliot_store_api::MAX_NOTIFICATION_PAGE_LIMIT
+    {
+        return Err(invalid("notification.page_limit"));
+    }
+    if let Some(cursor) = &request.cursor {
+        validate_text(cursor, "notification.cursor")?;
+    }
+    Ok(())
 }
 
 fn require_live_fence(
@@ -470,24 +616,28 @@ fn require_live_fence(
 
 fn build_notification_transition(
     request: &NotificationStateRequest,
-) -> Result<(PreparedTransition, eliot_store_api::OperationManifestDigest), NotificationServiceError>
-{
+) -> Result<(PreparedTransition, OperationManifestDigest), NotificationServiceError> {
     let parameters = notification_parameters(request)?;
-    let manifest_digest =
-        operation_manifest_set_digest(&generated_operation_manifests()?).map_err(|_| {
-            NotificationServiceError::ManifestMismatch
-        })?;
+    let manifest_digest = operation_manifest_set_digest(&generated_operation_manifests()?)
+        .map_err(|_| NotificationServiceError::ManifestMismatch)?;
+    // The admission digest binds the admitted request with the identity-hash
+    // field cleared: the hash itself is bound separately by the transition
+    // view, so clearing keeps admission deterministic across sealing (which
+    // fills the hash after building) and dispatch (which rebuilds from the
+    // sealed request). A caller-supplied admission digest is never trusted.
+    let mut admission_view = request.clone();
+    admission_view.operation.canonical_request_hash = String::new();
     let admission_digest = sha256_hex(
-        &canonical_json_bytes(request)
+        &canonical_json_bytes(&admission_view)
             .map_err(|_| NotificationServiceError::DigestMismatch)?,
     );
-    let scope = ScopeId::new(eliot_store_api::NOTIFICATION_STATE_SCOPE).map_err(|_| {
+    let scope = ScopeId::new(NOTIFICATION_STATE_SCOPE).map_err(|_| {
         NotificationServiceError::InvalidField {
             field: "notification.scope",
             reason: "notification scope identity is invalid",
         }
     })?;
-    let ordering = OrderingScopeId::new(eliot_store_api::NOTIFICATION_STATE_SCOPE).map_err(|_| {
+    let ordering = OrderingScopeId::new(NOTIFICATION_STATE_SCOPE).map_err(|_| {
         NotificationServiceError::InvalidField {
             field: "notification.scope",
             reason: "notification ordering scope identity is invalid",
@@ -497,11 +647,7 @@ fn build_notification_transition(
         identity: request.operation.clone(),
         state_fence: request.state_fence.clone(),
         scope_id: scope,
-        task_id: request
-            .context
-            .task_id
-            .clone()
-            .map(|task| task.to_string()),
+        task_id: request.context.task_id.clone().map(|task| task.to_string()),
         ordering_scopes: vec![ordering],
         transition_class: TransitionClass::NotificationState,
         requested_effect_ceiling: EffectClass::ReversibleMutation,
@@ -522,11 +668,22 @@ fn build_notification_transition(
     Ok((transition, manifest_digest))
 }
 
+/// Builds the admitted transition for a request (test-support only).
+///
+/// Exposes the exact transition the front door hashes and dispatches so
+/// integration tests can seal the canonical request hash against the
+/// admitted bytes without duplicating admission logic. Unavailable in
+/// production builds.
+#[cfg(any(test, feature = "test-support"))]
+pub fn build_notification_transition_for_test(
+    request: &NotificationStateRequest,
+) -> Result<(PreparedTransition, OperationManifestDigest), NotificationServiceError> {
+    build_notification_transition(request)
+}
+
 fn notification_parameters(
     request: &NotificationStateRequest,
 ) -> Result<BTreeMap<String, Value>, NotificationServiceError> {
-    use eliot_store_api::NotificationStateMutation;
-
     let invalid = |field: &'static str| NotificationServiceError::InvalidField {
         field,
         reason: "notification mutation failed closed validation",
@@ -558,7 +715,7 @@ fn notification_parameters(
         NotificationStateMutation::Delivery {
             notification_id,
             channel,
-            attempt,
+            delivery,
         } => {
             parameters.insert(
                 NOTIFY_PARAM_MUTATION.to_owned(),
@@ -570,11 +727,11 @@ fn notification_parameters(
             );
             parameters.insert(
                 NOTIFY_PARAM_CHANNEL.to_owned(),
-                Value::String(channel_wire(channel).to_owned()),
+                Value::String(channel_wire(*channel).to_owned()),
             );
             parameters.insert(
                 NOTIFY_PARAM_DELIVERY_JSON.to_owned(),
-                serde_json::to_value(&attempt.state)
+                serde_json::to_value(delivery)
                     .map_err(|_| invalid("notification.delivery_json"))?,
             );
         }
@@ -626,13 +783,9 @@ async fn read_back_notification(
     client: &impl CanonicalStoreClient,
     request: &NotificationStateRequest,
     fence: &StateFence,
-) -> Result<NotificationRecord, NotificationServiceError> {
-    use eliot_store_api::NotificationStateMutation;
-
+) -> Result<Notification, NotificationServiceError> {
     let (dedup_key, notification_id) = match &request.mutation {
-        NotificationStateMutation::Upsert { record, .. } => {
-            (Some(record.dedup_key.clone()), None)
-        }
+        NotificationStateMutation::Upsert { record, .. } => (Some(record.dedup_key.clone()), None),
         NotificationStateMutation::Delivery {
             notification_id, ..
         }
@@ -657,24 +810,81 @@ async fn read_back_notification(
         .execute_named(query)
         .await
         .map_err(NotificationServiceError::from_store)?;
-    let page =
-        decode_notification_page(&payload).map_err(NotificationServiceError::from_store)?;
-    if page.state_fence != *fence {
-        return Err(NotificationServiceError::FenceMismatch);
-    }
-    page
-        .records
+    let page = decode_notification_read_response(&payload.payload, fence)?;
+    page.records
         .into_iter()
         .next()
         .ok_or(NotificationServiceError::UnknownNotification)
 }
 
+/// Decodes a backend read payload into the typed read response.
+///
+/// The backend emits exactly the `records` / `metrics` / `state_fence` /
+/// `revision` shape; unknown or misfenced payloads fail closed here.
+fn decode_notification_read_response(
+    payload: &Value,
+    fence: &StateFence,
+) -> Result<NotificationStateReadResponse, NotificationServiceError> {
+    let records = payload.get("records").and_then(Value::as_array).ok_or(
+        NotificationServiceError::InvalidField {
+            field: "notification.records",
+            reason: "read payload must carry records",
+        },
+    )?;
+    let mut decoded = Vec::with_capacity(records.len());
+    for value in records {
+        let record: Notification = serde_json::from_value(value.clone()).map_err(|_| {
+            NotificationServiceError::InvalidField {
+                field: "notification.records",
+                reason: "record payload is not a canonical notification",
+            }
+        })?;
+        if record.state_fence != *fence {
+            return Err(NotificationServiceError::FenceMismatch);
+        }
+        decoded.push(record);
+    }
+    let metrics: NotificationMetrics =
+        serde_json::from_value(payload.get("metrics").cloned().ok_or(
+            NotificationServiceError::InvalidField {
+                field: "notification.metrics",
+                reason: "read payload must carry metrics",
+            },
+        )?)
+        .map_err(|_| NotificationServiceError::InvalidField {
+            field: "notification.metrics",
+            reason: "metrics payload is not canonical",
+        })?;
+    let state_fence: StateFence = serde_json::from_value(
+        payload
+            .get("state_fence")
+            .cloned()
+            .ok_or(NotificationServiceError::FenceMismatch)?,
+    )
+    .map_err(|_| NotificationServiceError::FenceMismatch)?;
+    if state_fence != *fence {
+        return Err(NotificationServiceError::FenceMismatch);
+    }
+    let revision: u64 = payload.get("revision").and_then(Value::as_u64).ok_or(
+        NotificationServiceError::InvalidField {
+            field: "notification.revision",
+            reason: "read payload must carry revision",
+        },
+    )?;
+    Ok(NotificationStateReadResponse {
+        records: decoded,
+        metrics,
+        state_fence,
+        revision,
+    })
+}
+
 /// Closed channel wire spelling shared with the store contract validator.
-fn channel_wire(channel: &eliot_store_api::DeliveryChannel) -> &'static str {
+fn channel_wire(channel: DeliveryChannel) -> &'static str {
     match channel {
-        eliot_store_api::DeliveryChannel::ControlBoard => "CONTROL_BOARD",
-        eliot_store_api::DeliveryChannel::NativeToast => "NATIVE_TOAST",
-        eliot_store_api::DeliveryChannel::WindowsEventLog => "WINDOWS_EVENT_LOG",
-        eliot_store_api::DeliveryChannel::RecoveryFallback => "RECOVERY_FALLBACK",
+        DeliveryChannel::ControlBoard => "CONTROL_BOARD",
+        DeliveryChannel::NativeToast => "NATIVE_TOAST",
+        DeliveryChannel::WindowsEventLog => "WINDOWS_EVENT_LOG",
+        DeliveryChannel::RecoveryFallback => "RECOVERY_FALLBACK",
     }
 }
