@@ -17,6 +17,7 @@ members = [
   "crates/agent/eliot-agent-opencode",
   "crates/agent/eliot-swarm",
   "crates/bridges/eliot-lsp-bridge",
+  "crates/bridges/eliot-git-bridge",
   "crates/foundation/eliot-bootstrap",
   "crates/foundation/eliot-conformance-contracts",
   "crates/foundation/eliot-contracts",
@@ -284,6 +285,7 @@ eliot-coordination = { path = "crates/governor/eliot-coordination", version = "0
 eliot-finish = { path = "crates/governor/eliot-finish", version = "0.1.0" }
 eliot-governor = { path = "crates/governor/eliot-governor", version = "0.1.0" }
 eliot-integration-coverage = { path = "crates/governor/eliot-integration-coverage", version = "0.1.0" }
+eliot-git-bridge = { path = "crates/bridges/eliot-git-bridge", version = "0.1.0" }
 eliot-maintenance = { path = "crates/governor/eliot-maintenance", version = "0.1.0" }
 eliot-module-registry = { path = "crates/governor/eliot-module-registry", version = "0.1.0" }
 eliot-observation = { path = "crates/governor/eliot-observation", version = "0.1.0" }
