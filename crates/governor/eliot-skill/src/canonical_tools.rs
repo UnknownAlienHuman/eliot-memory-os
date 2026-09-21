@@ -49,7 +49,10 @@
 
 use std::collections::BTreeMap;
 
-use eliot_skills::{ReadinessClaims, SkillPackage};
+use eliot_skills::{
+    MaterializationPorts, MaterializationScope, MissingVerificationProvider, ReadinessClaims,
+    SkillPackage,
+};
 
 use super::{SkillError, install_package};
 use crate::{CatalogueInstallContext, KnownTools, MaterializationInputs, SkillCatalogue};
@@ -210,6 +213,75 @@ pub fn readiness_available_for_package(
     Ok(())
 }
 
+/// Runs the sealed materialization entry truthfully at the delivery boundary.
+///
+/// Calls the documented
+/// [`materialize`](eliot_skills::SkillPackage::materialize) entry with the
+/// real package, inputs, readiness, and scope, using the public
+/// [`MissingVerificationProvider`](eliot_skills::MissingVerificationProvider)
+/// for both sealed ports (no external crate can implement them: `mod sealed`
+/// is private). The mapping keeps every sealed verdict honest:
+///
+/// - sealed-positive (`materialized_skill().is_some()`) → `Ok`. Unreachable
+///   until the G-16 owner injects real ports, and honored when it happens: a
+///   sealed positive remains the only path that can ever lift a Skill past
+///   `Provisional`.
+/// - sealed omission → `Err(InvalidField{field: "sealed.materialization"})`
+///   with the owner's own reason code. The sealed owner's host/profile,
+///   lifecycle-state, availability, observation, and receipt-binding verdicts
+///   refuse delivery here with their own voice; nothing is reworded into a
+///   local default.
+/// - `Err(PlanGap)` from the ports (sealed verifier not injected) → `Ok`.
+///   Verifier absence is integration state, not a package verdict: delivery
+///   proceeds WITHOUT sealed verification on the validated-claim wire and the
+///   entry stays `Provisional` (fresh installation never promotes past
+///   provisional). Sealed-positive stays required for anything past
+///   provisional.
+/// - any other sealed error (binding/structural failure) → `Err(Surface)`
+///   with the sealed message, like every other package-wire mismatch.
+///
+/// This never mints verification: with the missing-ports provider the only
+/// `Ok` outcomes are a future sealed positive or the documented
+/// verifier-absent provisional path.
+pub fn sealed_materialization_check(
+    package: &SkillPackage,
+    inputs: &MaterializationInputs,
+    readiness: &ReadinessClaims,
+    scope: &MaterializationScope,
+) -> Result<(), SkillError> {
+    use eliot_skills::OmissionReason;
+
+    let missing = MissingVerificationProvider;
+    let ports = MaterializationPorts {
+        readiness: &missing,
+        g16: &missing,
+    };
+    match package.materialize(inputs, readiness, scope, &ports) {
+        Ok(outcome) => match outcome.omission_reason() {
+            None => Ok(()),
+            Some(reason) => Err(SkillError::InvalidField {
+                field: "sealed.materialization",
+                reason: match reason {
+                    OmissionReason::Conflict { .. } => "sealed owner omitted a conflicted package",
+                    OmissionReason::Stale { .. } => "sealed owner omitted a stale package",
+                    OmissionReason::Distractor { .. } => {
+                        "sealed owner omitted a distractor package"
+                    }
+                    OmissionReason::Quarantined { .. } => {
+                        "sealed owner omitted a quarantined package"
+                    }
+                    OmissionReason::PlanGap { .. } => "sealed owner reports a plan gap",
+                    OmissionReason::UnsupportedHostProfile { .. } => {
+                        "sealed owner reports an unsupported host/profile"
+                    }
+                },
+            }),
+        },
+        Err(eliot_skills::SkillContractError::PlanGap { .. }) => Ok(()),
+        Err(error) => Err(SkillError::Surface(error.to_string())),
+    }
+}
+///
 /// Installs one canonical package source under the versioned canonical view.
 ///
 /// Fails closed unless the source binds exactly the definition version the
@@ -577,6 +649,68 @@ mod tests {
             readiness_available_for_package(&package, &unavailable),
             Err(SkillError::InvalidField { field, .. })
                 if field == "readiness.capabilities"
+        ));
+    }
+
+    fn scope() -> MaterializationScope {
+        use eliot_contracts::{EpochId, EpochLineageId, ProductId, ResourceGeneration, StateFence};
+        use std::num::NonZeroU64;
+
+        let fence = StateFence::new(
+            EpochId::new(
+                EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                    .expect("valid test lineage"),
+                NonZeroU64::new(1).expect("nonzero test sequence"),
+            )
+            .expect("valid test epoch"),
+            ResourceGeneration::new(1).expect("test generation"),
+        );
+        MaterializationScope {
+            work_scope: eliot_receipts::WorkScopeBinding {
+                scope_id: eliot_receipts::WorkScopeId::new("workscope-1")
+                    .expect("valid test scope"),
+                product_id: ProductId::new("test-product").expect("test product"),
+                resource_generation: ResourceGeneration::new(1).expect("test generation"),
+                state_fence: fence,
+            },
+            task: None,
+        }
+    }
+
+    #[test]
+    fn sealed_check_passes_provisional_when_the_verifier_is_absent() {
+        // Current package, fully available readiness: the sealed entry runs
+        // every owner gate, then the missing-ports provider reports PLAN_GAP.
+        // Verifier absence is integration state, so the check passes WITHOUT
+        // sealed verification; the entry stays provisional by construction.
+        let (package, material) = fixture_package();
+        sealed_materialization_check(&package, &material, &available_readiness(), &scope())
+            .expect("verifier-absent provisional path");
+    }
+
+    #[test]
+    fn sealed_check_refuses_sealed_omissions_with_the_owner_voice() {
+        let (mut package, material) = fixture_package();
+        package.state.freshness = FreshnessState::Stale {
+            reason: "tool-def-2 moved".to_owned(),
+        };
+        package
+            .validate(&material)
+            .expect("stale package still validates");
+        let refused =
+            sealed_materialization_check(&package, &material, &available_readiness(), &scope());
+        assert!(matches!(
+            refused,
+            Err(SkillError::InvalidField { field, .. }) if field == "sealed.materialization"
+        ));
+
+        let (package, material) = fixture_package();
+        let mut foreign = available_readiness();
+        foreign.host = "other-host".to_owned();
+        let refused = sealed_materialization_check(&package, &material, &foreign, &scope());
+        assert!(matches!(
+            refused,
+            Err(SkillError::InvalidField { field, .. }) if field == "sealed.materialization"
         ));
     }
 }

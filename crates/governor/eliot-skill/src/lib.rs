@@ -21,7 +21,7 @@ pub use catalogue::*;
 pub mod canonical_tools;
 pub use canonical_tools::{
     CanonicalToolSource, ToolAliasTable, VersionBoundTools, install_package_versioned,
-    readiness_available_for_package,
+    readiness_available_for_package, sealed_materialization_check,
 };
 pub mod install;
 pub use install::{CatalogueInstallContext, install_package, project_package_to_entry};
@@ -34,8 +34,8 @@ pub use install::{CatalogueInstallContext, install_package, project_package_to_e
 pub use eliot_skills::{
     AdvisoryRuleClaim, Availability, AvailabilityField, CapabilityVersion, ConflictState,
     DeliveryProjection, DependencyMaterial, DistractorState, FreshnessState, HostLimits,
-    HostProfile, LifecycleProposal, MaterializationInputs, PackageDigests, QuarantineState,
-    ReadinessClaims, RegistrationIdentity, SkillBehavior, SkillCounters,
+    HostProfile, LifecycleProposal, MaterializationInputs, MaterializationScope, PackageDigests,
+    QuarantineState, ReadinessClaims, RegistrationIdentity, SkillBehavior, SkillCounters,
     SkillInteractionProjection, SkillPackage, SkillState, ToolDefinitionMaterial, UnavailableCode,
     VersionedObservation, VersionedRequirement,
 };

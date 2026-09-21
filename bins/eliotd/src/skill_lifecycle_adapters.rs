@@ -31,9 +31,11 @@
 //!   injector drives: versioned install, then the sealed-observation mirror
 //!   over the provider's [`ReadinessClaims`](eliot_skill::ReadinessClaims)
 //!   (exact available `(name, version)` per required tool and capability),
-//!   then Hotset receipt issuance under the injector's approval handle. It
-//!   returns the installed identity plus the receipt the injector carries to
-//!   the receiver; the receiver's ack re-enters through
+//!   then the truthful sealed materialization check (sealed omissions refuse
+//!   with the owner's voice; verifier absence proceeds provisional, never
+//!   verified), then Hotset receipt issuance under the injector's approval
+//!   handle. It returns the installed identity plus the receipt the injector
+//!   carries to the receiver; the receiver's ack re-enters through
 //!   `acknowledge_and_display`, never minted here. A provider-unavailable
 //!   package stays installed but undelivered: installed is not delivered.
 //! - `deliver_hotset` issues the Hotset delivery receipt the runtime injector
@@ -197,7 +199,7 @@ impl<T> ForwardingSkillLifecycle<T> {
         )
     }
 
-    /// Runs versioned install, the provider-availability mirror, and Hotset
+    /// Runs versioned install, availability and sealed gates, and Hotset
     /// receipt issuance as one runtime delivery act.
     ///
     /// Driven by the runtime Hotset injector caller: after the versioned
@@ -205,7 +207,11 @@ impl<T> ForwardingSkillLifecycle<T> {
     /// [`ReadinessClaims`](eliot_skill::ReadinessClaims) — a required tool or
     /// capability the provider did not mark available at its exact version
     /// refuses issuance while the install stands (installed is not
-    /// delivered). The injector's own approval handle authorizes the receipt.
+    /// delivered). The sealed materialization entry then runs truthfully with
+    /// the public missing-ports provider: sealed omissions and binding
+    /// failures refuse with the owner's own voice, while verifier absence
+    /// proceeds WITHOUT sealed verification as `Provisional` (never
+    /// `Current`). The injector's own approval handle authorizes the receipt.
     /// Returns the installed identity plus the receipt the injector carries
     /// to the receiver; the receiver's ack re-enters through
     /// [`acknowledge_and_display`](Self::acknowledge_and_display).
@@ -229,6 +235,12 @@ impl<T> ForwardingSkillLifecycle<T> {
             act.admitted_definition_version,
         )?;
         eliot_skill::readiness_available_for_package(act.package, act.readiness)?;
+        eliot_skill::sealed_materialization_check(
+            act.package,
+            act.inputs,
+            act.readiness,
+            act.scope,
+        )?;
         let tools = eliot_skill::VersionBoundTools::new(act.source, act.aliases);
         let receipt = self.deliver_hotset(
             act.hotset_id,
@@ -291,13 +303,15 @@ impl<T> ForwardingSkillLifecycle<T> {
 /// Bundles the install boundary (canonical package source, actual inputs,
 /// Governor install context, versioned tool source plus alias table and the
 /// admitted definition version) with the temporal delivery boundary
-/// (provider readiness claims, Hotset identity, injector approval handle) so
-/// the composition drives the whole act in one call.
+/// (provider readiness claims, materialization scope, Hotset identity,
+/// injector approval handle) so the composition drives the whole act in one
+/// call.
 pub(crate) struct VersionedDeliveryAct<'a> {
     pub package: &'a eliot_skill::SkillPackage,
     pub inputs: &'a eliot_skill::MaterializationInputs,
     pub context: &'a eliot_skill::CatalogueInstallContext,
     pub readiness: &'a eliot_skill::ReadinessClaims,
+    pub scope: &'a eliot_skill::MaterializationScope,
     pub source: &'a dyn CanonicalToolSource,
     pub aliases: &'a ToolAliasTable,
     pub admitted_definition_version: &'a str,
@@ -428,9 +442,10 @@ mod tests {
     use eliot_skill::{
         Availability, AvailabilityField, DependencyVersion, HotsetAckDisposition,
         HotsetDeliveryAck, HotsetDeliveryReceipt, KnownTools, LifecycleAction, LifecycleCounters,
-        PromotionGate, ReadinessClaims, SkillBody, SkillCandidate, SkillCatalogue,
-        SkillCatalogueEntry, SkillIndexEntry, SkillInteractionView, SkillLifecycleView, SkillRef,
-        SkillRuntimeMetadata, SkillScope, SkillStatus, VersionedObservation,
+        MaterializationScope, PromotionGate, ReadinessClaims, SkillBody, SkillCandidate,
+        SkillCatalogue, SkillCatalogueEntry, SkillIndexEntry, SkillInteractionView,
+        SkillLifecycleView, SkillRef, SkillRuntimeMetadata, SkillScope, SkillStatus,
+        VersionedObservation,
     };
     use eliot_store_api::{
         CommitId, OperationManifestDigest, Resubmission, TransitionClass, WriteReceipt,
@@ -984,12 +999,27 @@ mod tests {
         (ForwardingSkillLifecycle::new(inner), calls)
     }
 
+    fn delivery_scope(fence: &StateFence) -> MaterializationScope {
+        MaterializationScope {
+            work_scope: eliot_receipts::WorkScopeBinding {
+                scope_id: eliot_receipts::WorkScopeId::new("workscope-1")
+                    .expect("valid test scope"),
+                product_id: ProductId::new("test-product").expect("test product"),
+                resource_generation: ResourceGeneration::new(1).expect("test generation"),
+                state_fence: fence.clone(),
+            },
+            task: None,
+        }
+    }
+
     #[test]
     fn versioned_delivery_path_installs_issues_acks_and_displays() {
         let (forwarding, calls) = versioned_forwarder();
         let (package, inputs) = package_source();
         let context = install_context();
         let readiness = available_readiness();
+        let fence = fence();
+        let scope = delivery_scope(&fence);
         let source = canonical_source("1.2.0");
         let aliases = ToolAliasTable::new();
         let (skill_id, receipt) = forwarding
@@ -998,6 +1028,7 @@ mod tests {
                 inputs: &inputs,
                 context: &context,
                 readiness: &readiness,
+                scope: &scope,
                 source: &source,
                 aliases: &aliases,
                 admitted_definition_version: "1.2.0",
@@ -1094,6 +1125,7 @@ mod tests {
             inputs: &inputs,
             context: &install_context(),
             readiness: &readiness,
+            scope: &delivery_scope(&fence()),
             source: &source,
             aliases: &aliases,
             admitted_definition_version: "1.2.0",
@@ -1110,6 +1142,47 @@ mod tests {
     }
 
     #[test]
+    fn sealed_omission_blocks_receipt_but_keeps_the_install() {
+        let (forwarding, _calls) = versioned_forwarder();
+        let (mut package, inputs) = package_source();
+        package.state = eliot_skill::SkillState {
+            freshness: eliot_skill::FreshnessState::Stale {
+                reason: "tool-def-1 moved".to_owned(),
+            },
+            conflict: eliot_skill::ConflictState::None,
+            distractor: eliot_skill::DistractorState::None,
+            quarantine: eliot_skill::QuarantineState::Clear,
+        };
+        package
+            .validate(&inputs)
+            .expect("stale package still validates");
+        let aliases = ToolAliasTable::new();
+        let source = canonical_source("1.2.0");
+        let refused = forwarding.run_install_to_receipt(VersionedDeliveryAct {
+            package: &package,
+            inputs: &inputs,
+            context: &install_context(),
+            readiness: &available_readiness(),
+            scope: &delivery_scope(&fence()),
+            source: &source,
+            aliases: &aliases,
+            admitted_definition_version: "1.2.0",
+            hotset_id: "hotset-versioned-4".to_owned(),
+            approval_ref: "approval-commit-1".to_owned(),
+        });
+        assert!(matches!(
+            refused,
+            Err(SkillError::InvalidField { field, .. }) if field == "sealed.materialization"
+        ));
+        // The governed stale install stands; only the receipt is refused.
+        let catalogue = forwarding.catalogue.lock().expect("catalogue lock");
+        assert_eq!(
+            catalogue.get("skill-demo").expect("entry").status,
+            eliot_skill::SkillStatus::Stale
+        );
+    }
+
+    #[test]
     fn composed_delivery_refuses_a_blank_approval_handle() {
         let (forwarding, _calls) = versioned_forwarder();
         let (package, inputs) = package_source();
@@ -1121,6 +1194,7 @@ mod tests {
             inputs: &inputs,
             context: &install_context(),
             readiness: &readiness,
+            scope: &delivery_scope(&fence()),
             source: &source,
             aliases: &aliases,
             admitted_definition_version: "1.2.0",
