@@ -278,25 +278,37 @@ pub enum WaitForCommitResolution {
 
 /// Resolves a `wait_for_commit` wait against durable staging state.
 ///
-/// Waits only to the caller deadline: when `durably_staged` is true and
-/// `deadline_expired` is true the result becomes `ACCEPTED_PENDING` with the
+/// `Committed` is returned only on explicit commit evidence (`commit_evidence`
+/// with durable staging); it is never inferred from staging or deadline
+/// state. When durable staging succeeded, no commit evidence exists, and the
+/// caller deadline expired, the result becomes `ACCEPTED_PENDING` with the
 /// same operation identity. Request mode and observed result remain distinct
-/// fields.
+/// fields. Non-staged states and staged-but-uncommitted states fail closed
+/// with distinct [`CanonicalError`]s instead of resolving to `Committed`.
 pub fn resolve_wait_for_commit(
     operation_id: &OperationId,
     durably_staged: bool,
     deadline_expired: bool,
-) -> WaitForCommitResolution {
-    if durably_staged && deadline_expired {
-        WaitForCommitResolution::AcceptedPending {
+    commit_evidence: bool,
+) -> Result<WaitForCommitResolution, CanonicalError> {
+    if commit_evidence && durably_staged {
+        return Ok(WaitForCommitResolution::Committed {
+            operation_id: operation_id.clone(),
+        });
+    }
+    if durably_staged && deadline_expired && !commit_evidence {
+        return Ok(WaitForCommitResolution::AcceptedPending {
             operation_id: operation_id.clone(),
             status: ACCEPTED_PENDING_STATUS,
-        }
-    } else {
-        WaitForCommitResolution::Committed {
-            operation_id: operation_id.clone(),
-        }
+        });
     }
+    if !durably_staged {
+        return Err(CanonicalError::InvalidField {
+            field: "durably_staged",
+            reason: "wait_for_commit has no commit evidence without durable staging",
+        });
+    }
+    Err(CanonicalError::InsufficientFinishEvidence)
 }
 
 /// Pollable handle published for an `accept_after_stage` submission.
@@ -524,7 +536,8 @@ mod tests {
         // with the same operation identity.
         let staged = ledger.staged_operation("idem-1928").is_some();
         assert!(staged, "operation must be durably staged");
-        let resolution = resolve_wait_for_commit(&operation_id, staged, true);
+        let resolution =
+            resolve_wait_for_commit(&operation_id, staged, true, false).expect("staged timeout");
         let WaitForCommitResolution::AcceptedPending {
             operation_id: pending_id,
             status,
@@ -539,6 +552,75 @@ mod tests {
             .staged_operation("idem-1928")
             .expect("staged identity for receipt");
         assert_eq!(receipt_id, &pending_id);
+    }
+
+    #[test]
+    fn wait_for_commit_committed_requires_explicit_commit_evidence() {
+        let operation = OperationId::new("op-1928-a").expect("operation id");
+        // Durable staging without commit evidence never reports Committed,
+        // even before the caller deadline expires.
+        let pending = resolve_wait_for_commit(&operation, true, false, false);
+        assert!(
+            matches!(pending, Err(CanonicalError::InsufficientFinishEvidence)),
+            "staged-but-uncommitted must fail closed, got {pending:?}"
+        );
+        // Explicit commit evidence with durable staging is the only
+        // Committed path.
+        let committed = resolve_wait_for_commit(&operation, true, false, true)
+            .expect("explicit commit evidence resolves");
+        let WaitForCommitResolution::Committed { operation_id } = committed else {
+            panic!("explicit commit evidence must resolve to Committed");
+        };
+        assert_eq!(operation_id.as_str(), "op-1928-a");
+    }
+
+    #[test]
+    fn wait_for_commit_non_staged_never_resolves_to_committed() {
+        let operation = OperationId::new("op-1928-a").expect("operation id");
+        for deadline_expired in [false, true] {
+            let resolution = resolve_wait_for_commit(&operation, false, deadline_expired, false);
+            assert!(
+                !matches!(resolution, Ok(WaitForCommitResolution::Committed { .. })),
+                "non-staged state must never resolve to Committed"
+            );
+            assert!(
+                matches!(
+                    resolution,
+                    Err(CanonicalError::InvalidField {
+                        field: "durably_staged",
+                        ..
+                    })
+                ),
+                "non-staged state must fail closed, got {resolution:?}"
+            );
+        }
+        // Commit evidence without durable staging is inconsistent and must
+        // still fail closed rather than report Committed.
+        let inconsistent = resolve_wait_for_commit(&operation, false, false, true);
+        assert!(
+            !matches!(inconsistent, Ok(WaitForCommitResolution::Committed { .. })),
+            "commit evidence without staging must never resolve to Committed"
+        );
+        assert!(
+            inconsistent.is_err(),
+            "inconsistent evidence must fail closed"
+        );
+    }
+
+    #[test]
+    fn wait_for_commit_staged_but_uncommitted_never_resolves_to_committed() {
+        let operation = OperationId::new("op-1928-a").expect("operation id");
+        // Staged, deadline open, no commit evidence: still waiting, fail
+        // closed instead of fabricating Committed.
+        let resolution = resolve_wait_for_commit(&operation, true, false, false);
+        assert!(
+            !matches!(resolution, Ok(WaitForCommitResolution::Committed { .. })),
+            "staged-but-uncommitted state must never resolve to Committed"
+        );
+        assert!(
+            matches!(resolution, Err(CanonicalError::InsufficientFinishEvidence)),
+            "staged-but-uncommitted state must fail closed, got {resolution:?}"
+        );
     }
 
     #[test]
