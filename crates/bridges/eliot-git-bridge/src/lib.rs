@@ -707,12 +707,16 @@ pub struct BaseDriftReceipt {
 #[derive(Debug)]
 pub struct GitBridge<R> {
     runner: R,
+    sequence: AtomicU64,
 }
 
 impl<R: ProcessRunner> GitBridge<R> {
     /// Binds the bridge to a process-runner port.
     pub fn new(runner: R) -> Self {
-        Self { runner }
+        Self {
+            runner,
+            sequence: AtomicU64::new(1),
+        }
     }
 
     /// Returns the bound runner port.
@@ -790,6 +794,18 @@ impl<R: ProcessRunner> GitBridge<R> {
             }
             Ok((resolved, Some(lease.clone())))
         } else {
+            // A presented lease is receipt identity: it must belong to the
+            // requesting SID even where no broker lease is required.
+            if let Some(lease) = lease {
+                if lease.sid() != identity.sid() {
+                    return Err(BridgeError::LeaseScopeMismatch(format!(
+                        "lease {} is issued to '{}', request runs as '{}'",
+                        lease.id(),
+                        lease.sid(),
+                        identity.sid()
+                    )));
+                }
+            }
             Ok((resolved, lease.cloned()))
         }
     }
@@ -1137,9 +1153,11 @@ impl<R: ProcessRunner> GitBridge<R> {
         let Some(lease) = lease else {
             // Service-owned roots without a presented lease still receive a
             // receipt-bound scope record minted locally (never broker-forged:
-            // the issuer label names the bridge, not the broker).
+            // the issuer label names the bridge, not the broker). The bridge
+            // sequence keeps each minted record unique per bridge instance.
+            let n = self.sequence.fetch_add(1, Ordering::SeqCst);
             let local = Lease {
-                id: format!("local-{}-worktree", identity.sid()),
+                id: format!("local-{n}-{}-worktree", identity.sid()),
                 sid: identity.sid().to_owned(),
                 scope_root: resolved.clone(),
                 worktree: Some(worktree_path.to_owned()),
@@ -1485,12 +1503,16 @@ impl<R: ProcessRunner> GitBridge<R> {
         lease: Option<&Lease>,
     ) -> Result<ChangeManifestReceipt, BridgeError> {
         let (resolved, lease) = self.admit(identity, root, admission, lease, None)?;
+        // Single status probe serves both parsing and the receipt invocation,
+        // so the receipt cannot disagree with the parsed entries. A failed
+        // probe is a git failure like every other typed operation.
         let status_args = vec![
             "status".to_owned(),
             "--porcelain=v1".to_owned(),
             "--untracked-files=normal".to_owned(),
         ];
-        let (status_outcome, _, _) = self.exec(status_args, &resolved)?;
+        let (outcome, invocation, exit) = self.exec(status_args, &resolved)?;
+        self.check_success(&outcome, &invocation)?;
         let numstat_args = vec![
             "diff".to_owned(),
             "--no-color".to_owned(),
@@ -1516,7 +1538,7 @@ impl<R: ProcessRunner> GitBridge<R> {
             };
             stats.insert(path.to_owned(), (added.parse().ok(), removed.parse().ok()));
         }
-        let status_text = String::from_utf8_lossy(&status_outcome.stdout);
+        let status_text = String::from_utf8_lossy(&outcome.stdout);
         let mut entries = Vec::new();
         for line in status_text.lines() {
             if line.len() < 4 {
@@ -1532,13 +1554,6 @@ impl<R: ProcessRunner> GitBridge<R> {
             });
         }
         let dirty = !entries.is_empty();
-        // The receipt invocation is the status probe (numstat is auxiliary).
-        let args = vec![
-            "status".to_owned(),
-            "--porcelain=v1".to_owned(),
-            "--untracked-files=normal".to_owned(),
-        ];
-        let (outcome, invocation, exit) = self.exec(args, &resolved)?;
         let common = self.common(
             identity, resolved, None, lease, invocation, exit, &outcome, dirty,
         );
@@ -1707,6 +1722,7 @@ mod unit_tests {
         pub invocations: Mutex<Vec<Vec<String>>>,
         pub status_porcelain: String,
         pub fail_check: bool,
+        pub fail_status: bool,
     }
 
     impl FakeRunner {
@@ -1715,6 +1731,7 @@ mod unit_tests {
                 invocations: Mutex::new(Vec::new()),
                 status_porcelain: status_porcelain.to_owned(),
                 fail_check: false,
+                fail_status: false,
             }
         }
 
@@ -1735,6 +1752,13 @@ mod unit_tests {
         ) -> Result<ProcessOutcome, String> {
             self.record(exe, args);
             let stdout = if args.first() == Some(&"status") {
+                if self.fail_status {
+                    return Ok(ProcessOutcome {
+                        code: 128,
+                        stdout: Vec::new(),
+                        stderr: b"fatal: not a git repository\n".to_vec(),
+                    });
+                }
                 self.status_porcelain.clone().into_bytes()
             } else if args == ["apply", "--check", "-v"] {
                 if self.fail_check {
@@ -1834,5 +1858,61 @@ mod unit_tests {
             .patch_apply(&id, &root, b"bogus", false, None, None)
             .expect_err("check");
         assert!(matches!(err, BridgeError::PatchCheckFailed(_)));
+    }
+
+    #[test]
+    fn change_manifest_reports_git_failure() {
+        let tmp = std::env::temp_dir();
+        let mut runner = FakeRunner::new("");
+        runner.fail_status = true;
+        let bridge = GitBridge::new(runner);
+        let id = ExecutionIdentity::new("sid-svc").expect("sid");
+        let root = RepoRoot::new(tmp, OwnerKind::Service).expect("root");
+        let err = bridge
+            .change_manifest(&id, &root, None, None)
+            .expect_err("status failure must error");
+        assert!(matches!(err, BridgeError::GitFailed { .. }));
+    }
+
+    #[test]
+    fn local_worktree_leases_are_unique_per_create() {
+        let tmp = std::env::temp_dir();
+        let bridge = GitBridge::new(FakeRunner::new(""));
+        let id = ExecutionIdentity::new("sid-svc").expect("sid");
+        let root = RepoRoot::new(tmp.clone(), OwnerKind::Service).expect("root");
+        let first_path = tmp.join("eliot-1830-local-a");
+        let second_path = tmp.join("eliot-1830-local-b");
+        let first = bridge
+            .worktree_create(&id, &root, &first_path, "HEAD", false, None, None)
+            .expect("first create");
+        let second = bridge
+            .worktree_create(&id, &root, &second_path, "HEAD", false, None, None)
+            .expect("second create");
+        assert_ne!(
+            first.lease.id(),
+            second.lease.id(),
+            "each minted scope record must be unique"
+        );
+        assert_eq!(first.lease.worktree(), Some(first_path.as_path()));
+        assert_eq!(second.lease.worktree(), Some(second_path.as_path()));
+        assert_eq!(
+            first.common.lease.as_ref().map(Lease::id),
+            Some(first.lease.id())
+        );
+    }
+
+    #[test]
+    fn service_root_rejects_cross_sid_lease() {
+        let tmp = std::env::temp_dir();
+        let bridge = GitBridge::new(FakeRunner::new(""));
+        let id = ExecutionIdentity::new("sid-a").expect("sid");
+        let root = RepoRoot::new(tmp.clone(), OwnerKind::Service).expect("root");
+        let other = ExecutionIdentity::new("sid-b").expect("sid");
+        let broker = Broker::new();
+        let lease = broker.issue_repo_lease(&other, &root);
+        let err = bridge
+            .status(&id, &root, None, Some(&lease))
+            .expect_err("cross-SID lease");
+        assert!(matches!(err, BridgeError::LeaseScopeMismatch(_)));
     }
 }
