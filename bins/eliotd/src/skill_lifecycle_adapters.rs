@@ -87,7 +87,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use eliot_skill::{
     ActivatedSkillDisplay, CanonicalToolSource, HotsetDeliveryAck, HotsetDeliveryReceipt,
     KnownTools, PromotionGate, SkillCandidate, SkillCatalogue, SkillError, SkillLifecycleApi,
-    SkillLifecycleView, ToolAliasTable, activation::detect_dependency_staleness,
+    SkillLifecycleView, ToolAliasTable, VersionBoundTools, activation::detect_dependency_staleness,
 };
 
 /// Shared handle to the composition-owned Governor Skill catalogue.
@@ -296,6 +296,50 @@ impl<T> ForwardingSkillLifecycle<T> {
         ack.validate()?;
         let catalogue = self.lock_catalogue();
         catalogue.activation_display(skill_id, &receipt, &ack, tools)
+    }
+
+    /// Binds the runtime receiver's ack to its exact receipt under the live
+    /// canonical tool view, then displays.
+    ///
+    /// Receiver-side driver the injector caller runs once the receiver
+    /// returns its ack for an issued receipt: the display-time
+    /// definition-drift gate runs FIRST over the LIVE tool-owner source
+    /// (`display_source`, normally the same registry value the Governor hook
+    /// built, re-read at display time rather than reused from install), and
+    /// requires the version it binds to equal the admitted version the
+    /// install ran under. A Tool Definition change between install and
+    /// display refuses the display instead of rendering installed bodies
+    /// under drifted authority; a blank live version refuses the same way.
+    /// On agreement the ack binds exactly as in
+    /// [`acknowledge_and_display`](Self::acknowledge_and_display) through the
+    /// versioned projection. The ack still arrives from the real receiver and
+    /// is never synthesized here. Synchronous: the guard never crosses an
+    /// await.
+    ///
+    /// No in-tree Governor driver calls the drift-gated display yet; the
+    /// composition seam
+    /// ([`DaemonComposition::skill_acknowledge_and_display_versioned`](super::DaemonComposition::skill_acknowledge_and_display_versioned))
+    /// has landed for that driver. The allowance covers exactly that pending
+    /// adoption; it expires when the driver lands.
+    #[allow(dead_code, clippy::needless_pass_by_value)]
+    pub(crate) fn acknowledge_and_display_versioned(
+        &self,
+        skill_id: &str,
+        receipt: HotsetDeliveryReceipt,
+        ack: HotsetDeliveryAck,
+        display_source: &dyn CanonicalToolSource,
+        aliases: &ToolAliasTable,
+        admitted_definition_version: &str,
+    ) -> Result<ActivatedSkillDisplay, SkillError> {
+        let live = display_source.definition_version();
+        if live.trim().is_empty() || live != admitted_definition_version {
+            return Err(SkillError::InvalidField {
+                field: "tools.definition_version",
+                reason: "the live tool source no longer binds the admitted definition version",
+            });
+        }
+        let tools = VersionBoundTools::new(display_source, aliases);
+        self.acknowledge_and_display(skill_id, receipt, ack, &tools)
     }
 }
 
@@ -1065,6 +1109,100 @@ mod tests {
         assert_eq!(display.skill_id, "skill-demo");
         assert_eq!(display.delivery_receipt_digest, receipt.receipt_digest);
         assert_eq!(display.status, eliot_skill::SkillStatus::Provisional);
+        assert_eq!(*calls.lock().expect("calls"), 0);
+    }
+
+    #[test]
+    fn versioned_display_driver_acks_under_the_live_source() {
+        let (forwarding, calls) = versioned_forwarder();
+        let (package, inputs) = package_source();
+        let context = install_context();
+        let readiness = available_readiness();
+        let fence = fence();
+        let scope = delivery_scope(&fence);
+        let source = canonical_source("1.2.0");
+        let aliases = ToolAliasTable::new();
+        let (skill_id, receipt) = forwarding
+            .run_install_to_receipt(VersionedDeliveryAct {
+                package: &package,
+                inputs: &inputs,
+                context: &context,
+                readiness: &readiness,
+                scope: &scope,
+                source: &source,
+                aliases: &aliases,
+                admitted_definition_version: "1.2.0",
+                hotset_id: "hotset-display-live-1".to_owned(),
+                approval_ref: "approval-commit-1".to_owned(),
+            })
+            .expect("versioned delivery act");
+        // The receiver returns its ack for the issued receipt; the driver
+        // binds it under the live tool-owner source, which still binds the
+        // admitted version — no drift, so the provisional display issues.
+        let ack = HotsetDeliveryAck {
+            hotset_id: receipt.hotset_id.clone(),
+            receipt_digest: receipt.receipt_digest.clone(),
+            receiver_id: "runtime-hotset-1".to_owned(),
+            disposition: HotsetAckDisposition::Applied,
+        };
+        let display = forwarding
+            .acknowledge_and_display_versioned(
+                &skill_id,
+                receipt.clone(),
+                ack,
+                &source,
+                &aliases,
+                "1.2.0",
+            )
+            .expect("drift-gated display");
+        assert_eq!(display.skill_id, "skill-demo");
+        assert_eq!(display.delivery_receipt_digest, receipt.receipt_digest);
+        assert_eq!(display.status, eliot_skill::SkillStatus::Provisional);
+        assert!(display.render().contains("status provisional"));
+        assert_eq!(*calls.lock().expect("calls"), 0);
+    }
+
+    #[test]
+    fn versioned_display_refuses_definition_drift_before_display() {
+        let (forwarding, calls) = versioned_forwarder();
+        let (package, inputs) = package_source();
+        let context = install_context();
+        let readiness = available_readiness();
+        let fence = fence();
+        let scope = delivery_scope(&fence);
+        let source = canonical_source("1.2.0");
+        let aliases = ToolAliasTable::new();
+        let (skill_id, receipt) = forwarding
+            .run_install_to_receipt(VersionedDeliveryAct {
+                package: &package,
+                inputs: &inputs,
+                context: &context,
+                readiness: &readiness,
+                scope: &scope,
+                source: &source,
+                aliases: &aliases,
+                admitted_definition_version: "1.2.0",
+                hotset_id: "hotset-display-live-2".to_owned(),
+                approval_ref: "approval-commit-1".to_owned(),
+            })
+            .expect("versioned delivery act");
+        let ack = HotsetDeliveryAck {
+            hotset_id: receipt.hotset_id.clone(),
+            receipt_digest: receipt.receipt_digest.clone(),
+            receiver_id: "runtime-hotset-1".to_owned(),
+            disposition: HotsetAckDisposition::Applied,
+        };
+        // The Tool Definition moved between install and display: the live
+        // tool-owner source no longer binds the admitted version, so the
+        // display refuses instead of rendering under drifted authority.
+        let drifted = canonical_source("9.9.9");
+        let refused = forwarding.acknowledge_and_display_versioned(
+            &skill_id, receipt, ack, &drifted, &aliases, "1.2.0",
+        );
+        assert!(matches!(
+            refused,
+            Err(SkillError::InvalidField { field, .. }) if field == "tools.definition_version"
+        ));
         assert_eq!(*calls.lock().expect("calls"), 0);
     }
 

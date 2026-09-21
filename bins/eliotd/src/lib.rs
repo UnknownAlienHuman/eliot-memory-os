@@ -781,6 +781,39 @@ impl DaemonComposition {
             .acknowledge_and_display(skill_id, receipt, ack, tools)
     }
 
+    /// Binds the runtime receiver's ack to its exact receipt under the live
+    /// canonical tool view, then displays (issue #1882).
+    ///
+    /// Same seam discipline as [`Self::skill_install_package`]: the driver
+    /// supplies the receipt/ack pair the receiver acted on plus the LIVE
+    /// tool-owner source, alias table, and admitted version, and the shared
+    /// handle refuses the display when the live source drifted past the
+    /// admitted definition version. Receipt and ack travel by value,
+    /// mirroring the owned display boundary.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "receipt/ack cross by value like the owned display boundary"
+    )]
+    pub fn skill_acknowledge_and_display_versioned(
+        &self,
+        skill_id: &str,
+        receipt: eliot_skill::HotsetDeliveryReceipt,
+        ack: eliot_skill::HotsetDeliveryAck,
+        display_source: &dyn eliot_skill::CanonicalToolSource,
+        aliases: &eliot_skill::ToolAliasTable,
+        admitted_definition_version: &str,
+    ) -> Result<eliot_skill::ActivatedSkillDisplay, eliot_skill::SkillError> {
+        self.shared_skill_adapter()
+            .acknowledge_and_display_versioned(
+                skill_id,
+                receipt,
+                ack,
+                display_source,
+                aliases,
+                admitted_definition_version,
+            )
+    }
+
     /// Installs one canonical package source under the versioned canonical
     /// tool view (issue #1882).
     ///

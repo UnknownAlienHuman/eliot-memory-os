@@ -1725,6 +1725,7 @@ dependencies = [
  "eliot-evidence",
  "eliot-finish",
  "eliot-maintenance",
+ "eliot-mcp",
  "eliot-module-registry",
  "eliot-observation",
  "eliot-observation-contracts",
