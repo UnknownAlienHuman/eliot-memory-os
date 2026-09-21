@@ -256,6 +256,9 @@ impl FileWatchdogAdmission {
             kernel_epoch: 0,
             watchdog_epoch: 0,
             tick_interval_ms: WatchdogConfig::default().tick_interval.as_millis(),
+            service_instance_guid: String::new(),
+            host_challenge_nonce: String::new(),
+            watchdog_readiness_sequence: 0,
         })
     }
 

@@ -1,0 +1,147 @@
+{
+  "description": "One manual verification entrypoint for all agent host surfaces (issue #250). Exact ordered commands executed by scripts/verify-agent-host-surfaces.py. Every command is provider-free: no provider execution, credentials, user-profile installation, route admission, task authority, or support promotion. Missing Node or a missing script is an explicit FAIL, never PASS-on-skip. Any nonzero exit or timeout fails the aggregate and stops the run.",
+  "issue": 250,
+  "proof_ceiling": "MANUAL_SOURCE_FAKE_RUNTIME_ONLY",
+  "schema_version": "eliot.agent-host-surface-verify.v1",
+  "commands": [
+    {
+      "argv": ["python", "scripts/verify-agent-host-bundles.py", "--self-test"],
+      "id": "host-bundles-self-test",
+      "surface": "host-bundle",
+      "timeout_s": 600
+    },
+    {
+      "argv": ["python", "scripts/verify-agent-route-bundles.py", "--self-test"],
+      "id": "route-bundles-self-test",
+      "surface": "codex/opencode/claude/antigravity-routes",
+      "timeout_s": 300
+    },
+    {
+      "argv": ["python", "scripts/verify-agent-bridge-protocol.py", "--self-test"],
+      "id": "bridge-protocol-self-test",
+      "surface": "agent-bridge",
+      "timeout_s": 300
+    },
+    {
+      "argv": ["python", "scripts/select-agent-models.py", "--self-test"],
+      "id": "model-selector-self-test",
+      "surface": "model-selector",
+      "timeout_s": 300
+    },
+    {
+      "argv": ["python", "scripts/verify-antigravity-runtime-preflight.py", "--self-test"],
+      "id": "antigravity-preflight-self-test",
+      "surface": "antigravity",
+      "timeout_s": 300
+    },
+    {
+      "argv": ["python", "scripts/verify-swarm-product-pulse.py", "--self-test"],
+      "id": "swarm-pulse-self-test",
+      "surface": "swarm",
+      "timeout_s": 300
+    },
+    {
+      "argv": ["python", "scripts/verify-github-workflows.py", "--self-test"],
+      "id": "github-workflows-self-test",
+      "surface": "workflow-triggers",
+      "timeout_s": 300
+    },
+    {
+      "argv": ["python", "scripts/verify-agent-host-bundles.py", "--root", "."],
+      "id": "host-bundles-verify",
+      "surface": "host-bundle",
+      "timeout_s": 600
+    },
+    {
+      "argv": ["python", "scripts/verify-agent-route-bundles.py", "--root", "."],
+      "id": "route-bundles-verify",
+      "surface": "codex/opencode/claude/antigravity-routes",
+      "timeout_s": 300
+    },
+    {
+      "argv": ["python", "scripts/verify-agent-bridge-protocol.py", "--root", "."],
+      "id": "bridge-protocol-verify",
+      "surface": "agent-bridge",
+      "timeout_s": 300
+    },
+    {
+      "argv": [
+        "python",
+        "scripts/select-agent-models.py",
+        "--policy",
+        "integrations/agent-runtimes/model-selection.policy.json",
+        "--input",
+        "integrations/agent-runtimes/model-selection.fixture.json"
+      ],
+      "id": "model-selector-current",
+      "surface": "model-selector",
+      "timeout_s": 120
+    },
+    {
+      "argv": ["python", "scripts/verify-antigravity-runtime-preflight.py", "--root", "."],
+      "id": "antigravity-preflight-verify",
+      "surface": "antigravity",
+      "timeout_s": 300
+    },
+    {
+      "argv": ["python", "scripts/verify-swarm-product-pulse.py", "--root", "."],
+      "id": "swarm-pulse-verify",
+      "surface": "swarm",
+      "timeout_s": 300
+    },
+    {
+      "argv": ["python", "scripts/verify-github-workflows.py", "--root", "."],
+      "id": "github-workflows-verify",
+      "surface": "workflow-triggers",
+      "timeout_s": 300
+    },
+    {
+      "argv": ["node", "--check", "integrations/opencode/plugins/eliot.js"],
+      "id": "opencode-plugin-syntax",
+      "surface": "opencode-dynamic",
+      "timeout_s": 120
+    },
+    {
+      "argv": ["node", "--test", "integrations/opencode/tests/eliot-plugin.test.mjs"],
+      "id": "opencode-plugin-test",
+      "surface": "opencode-dynamic",
+      "timeout_s": 300
+    },
+    {
+      "argv": ["node", "--test", "integrations/opencode/tests/eliot-plugin-reason-isolation.test.mjs"],
+      "id": "opencode-reason-isolation-test",
+      "surface": "opencode-dynamic",
+      "timeout_s": 300
+    },
+    {
+      "argv": ["python", "-m", "json.tool", "integrations/claude/canonical/connector.json"],
+      "id": "claude-connector-json",
+      "surface": "claude-dynamic",
+      "timeout_s": 60
+    },
+    {
+      "argv": ["python", "-m", "json.tool", "integrations/claude/claude-desktop/mcpb/manifest.json"],
+      "id": "claude-mcpb-manifest-json",
+      "surface": "claude-dynamic",
+      "timeout_s": 60
+    },
+    {
+      "argv": ["python", "-m", "json.tool", "integrations/claude/eliot/.claude-plugin/plugin.json"],
+      "id": "claude-plugin-json",
+      "surface": "claude-dynamic",
+      "timeout_s": 60
+    },
+    {
+      "argv": ["python", "-m", "json.tool", "integrations/claude/eliot/hooks/hooks.json"],
+      "id": "claude-hooks-json",
+      "surface": "claude-dynamic",
+      "timeout_s": 60
+    },
+    {
+      "argv": ["python", "-m", "json.tool", "integrations/opencode/plugin-bridge-contract.json"],
+      "id": "opencode-bridge-contract-json",
+      "surface": "opencode-dynamic",
+      "timeout_s": 60
+    }
+  ]
+}

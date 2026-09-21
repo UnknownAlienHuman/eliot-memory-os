@@ -7,6 +7,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod admission;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use blake3::Hasher;
