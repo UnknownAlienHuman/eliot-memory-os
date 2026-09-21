@@ -87,8 +87,10 @@ pub use process_execution_client::{
 };
 pub use protocol::{
     AGENT_BRIDGE_ADMISSION_DESCRIPTOR_WIRE_ID, AGENT_BRIDGE_ADMISSION_DESCRIPTOR_WIRE_VERSION,
-    AGENT_BRIDGE_MODULE_ID, AgentBridgeAdmissionDescriptor, AgentBridgeCallerSessionPolicy,
-    AgentBridgeProcessPolicy, ContainmentAction, EliotdLaunchDescriptor, HostFileIdentity,
+    AGENT_BRIDGE_MODULE_ID, DAEMON_STARTUP_EVIDENCE_OPERATION,
+    AgentBridgeAdmissionDescriptor, AgentBridgeCallerSessionPolicy,
+    AgentBridgeProcessPolicy, ContainmentAction, DaemonStartupEvidence, EliotdLaunchDescriptor,
+    HostFileIdentity,
     HostJobBinding, HostJobIdentity, HostJobRoot, HostKernelCandidateBinding, HostProcessBinding,
     HostStoreBootstrapRequirement, KERNEL_CONTROL_PIPE, KERNEL_CONTROL_WIRE_ID,
     KERNEL_CONTROL_WIRE_VERSION, KernelActivationPermit, KernelActivationQuery,
@@ -116,7 +118,8 @@ pub use protocol::{
     ProviderCapabilityExpectation, ProviderCapabilityRequest, ProviderProofKind, RestartBudget,
     StoreBootstrapDescriptor, StoreBootstrapHandoff, StoreProcessBinding, StoreRebindHandoff,
     StoreRebindQuery, StoreRebindReceipt, admit_replay_request, control_request_frame,
-    control_response_frame, decode_control_request_frame, decode_control_response_frame,
+    control_response_frame, daemon_capability_registry_digest, decode_control_request_frame,
+    decode_control_response_frame,
     replay_stream_id, semantic_store_config_hash_from_json, verify_provider_capability,
 };
 pub use store_client::{

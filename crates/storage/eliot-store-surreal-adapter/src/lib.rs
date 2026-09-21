@@ -47,6 +47,24 @@ use eliot_store_api::{
 };
 pub use error::AdapterError;
 pub use health::{AdapterAvailability, AdapterHealth, ProviderHealth};
+
+/// Server identity proved by the last ownership-verified authentication on
+/// the live provider transport (issue #1932).
+///
+/// Populated only from the live `provider.version` RPC plus the
+/// digest-pinned spawn validation. Carries no authority and performs no I/O.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthenticatedProviderIdentity {
+    /// Live server major from the `provider.version` RPC.
+    pub version_major: u16,
+    /// Live server minor from the `provider.version` RPC.
+    pub version_minor: u16,
+    /// Live server patch from the `provider.version` RPC.
+    pub version_patch: u16,
+    /// Lowercase hex SHA-256 of the spawned provider executable as validated
+    /// at spawn.
+    pub artifact_digest: String,
+}
 pub use readiness::{CompiledMigration, MigrationReceipt, SemanticReadiness};
 pub use write_execution::{
     AttemptOutcome, CleanupError, ConcurrentEvidence, DrainReport, DurableOpOutcome,
@@ -367,6 +385,39 @@ impl SurrealStoreAdapter {
     pub async fn connect(&self) -> Result<(), AdapterError> {
         let _ = apply::client(self).await?;
         Ok(())
+    }
+
+    /// Returns the server identity proved by the last ownership-verified
+    /// authentication on the live transport (issue #1932).
+    ///
+    /// The version comes only from the live `provider.version` RPC answered
+    /// over the ownership-verified channel; the digest is the
+    /// spawn-validated provider artifact digest. Returns `None` when no
+    /// authenticated provider session is currently claimed live: never
+    /// connected, or cleared after observed connection loss. Never
+    /// constructed from record/config echo or CLI output.
+    #[must_use]
+    pub fn authenticated_provider_identity(&self) -> Option<AuthenticatedProviderIdentity> {
+        let transport = self.client.get()?.as_ref().ok()?;
+        let version = transport.provider().authenticated_version()?;
+        Some(AuthenticatedProviderIdentity {
+            version_major: version.major,
+            version_minor: version.minor,
+            version_patch: version.patch,
+            artifact_digest: self.config.provider_artifact_digest.clone(),
+        })
+    }
+
+    /// Forgets the proved server identity after observed connection loss.
+    ///
+    /// The bridge calls this wherever it marks client generations broken on
+    /// provider-I/O failure and after generation replacement, so a stale
+    /// session is never claimed live. The next ownership-verified
+    /// authentication (initial or pool session establishment) re-proves it.
+    pub fn note_connection_loss(&self) {
+        if let Some(Ok(transport)) = self.client.get() {
+            transport.provider().clear_authenticated_version();
+        }
     }
 
     /// Observes the database's semantic readiness against the configured

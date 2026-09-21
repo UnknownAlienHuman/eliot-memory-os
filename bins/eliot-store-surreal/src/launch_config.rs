@@ -45,6 +45,13 @@ pub struct StoreLaunchConfig {
     pub username: String,
     pub connect_timeout_ms: u64,
     pub query_timeout_ms: u64,
+    /// Kernel-configured store transaction limit bounding canonical-write
+    /// concurrency (I5.7, issue #1933). `None` keeps the I5.7 desktop default;
+    /// an explicit value must be non-zero and is digest-bound below. Absent
+    /// on the wire means default; both approved-digest projections omit an
+    /// unset knob identically, so legacy approvals stay byte-stable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_transaction_limit: Option<usize>,
     pub schema_generation: String,
     pub blob_root: String,
     pub instance_id: String,
@@ -128,6 +135,9 @@ impl StoreLaunchConfig {
         validate_launch_text(&self.credential_ref, "credential_ref")?;
         if self.connect_timeout_ms == 0 || self.query_timeout_ms == 0 {
             return Err("connect_timeout_ms and query_timeout_ms must be non-zero".to_owned());
+        }
+        if self.store_transaction_limit == Some(0) {
+            return Err("store_transaction_limit must be non-zero".to_owned());
         }
         SchemaGeneration::new(self.schema_generation.as_str())
             .map_err(|error| format!("invalid schema_generation: {error}"))?;
@@ -228,6 +238,11 @@ pub fn launch_config_digest(config: &StoreLaunchConfig) -> Result<String, String
         username: &'a str,
         connect_timeout_ms: u64,
         query_timeout_ms: u64,
+        // Omitted when unset so legacy approved bytes stay unchanged; an
+        // explicit limit is encoded identically here and in the installer
+        // projection (`PlannerOperationalConfig`).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        store_transaction_limit: Option<usize>,
         schema_generation: &'a str,
         blob_root: &'a str,
         instance_id: &'a str,
@@ -247,6 +262,7 @@ pub fn launch_config_digest(config: &StoreLaunchConfig) -> Result<String, String
         username: &config.username,
         connect_timeout_ms: config.connect_timeout_ms,
         query_timeout_ms: config.query_timeout_ms,
+        store_transaction_limit: config.store_transaction_limit,
         schema_generation: &config.schema_generation,
         blob_root: &config.blob_root,
         instance_id: &config.instance_id,

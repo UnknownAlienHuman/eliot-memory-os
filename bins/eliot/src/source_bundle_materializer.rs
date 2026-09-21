@@ -980,6 +980,9 @@ fn build_typed_bundle(
         username: "store".to_owned(),
         connect_timeout_ms: 10_000,
         query_timeout_ms: 10_000,
+        // Cross-scope mechanical line (installer lane file): new optional
+        // bridge knob defaults to the I5.7 desktop default; behavior unchanged.
+        store_transaction_limit: None,
         schema_generation: "1.0.0".to_owned(),
         blob_root: Path::new(roots.store_data_root.as_str())
             .join("blob")
