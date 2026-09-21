@@ -85,6 +85,13 @@ pub use canonical_event::{
     OrderingLink, ProjectionRebuildPlan, SemanticWritePath, ordering_link_hash,
     request_projection_rebuild, request_rebuild_from_semantic_write,
 };
+mod connection_manager;
+pub use connection_manager::{
+    ClientClass, ClientLease, ClientSetPolicy, ConnectionPolicies, DEFAULT_HEALTH_CLIENTS,
+    DEFAULT_READ_CLIENTS, HealthAdminAdmission, ReplayVerdict, ResolvedWriteOutcome,
+    StoreConnectionManager, UnknownWriteGate, classify_receipt_lookup, decide_replay,
+    default_store_transaction_limit,
+};
 mod adapter_materialization;
 pub use adapter_materialization::materialize_adapter_config;
 use adapter_materialization::resolve_credential;
@@ -246,6 +253,8 @@ pub struct StoreComposition {
     state_fence: StateFence,
     schema_bootstrap_binding: StoreSchemaBootstrapBinding,
     schema_bootstrap_cache: tokio::sync::Mutex<Option<StoreSchemaBootstrapCache>>,
+    connections: StoreConnectionManager,
+    health_admission: HealthAdminAdmission,
     _runtime_root_leases: ValidatedRuntimeRootLeases<WindowsRuntimeRootLease>,
 }
 
@@ -256,6 +265,8 @@ impl std::fmt::Debug for StoreComposition {
             .field("store", &self.store)
             .field("blob_owner", &self.blob)
             .field("state_fence", &self.state_fence)
+            .field("connections", &self.connections)
+            .field("health_admission", &self.health_admission)
             .finish_non_exhaustive()
     }
 }
@@ -309,12 +320,27 @@ impl StoreComposition {
             provider_process_lease,
         )
         .map_err(|error| format!("compose canonical provider adapter: {error}"))?;
+        // I5.9/I5.7 (issue #1933): fixed bounded read, write, and
+        // health/admin client sets. Write concurrency is bound to the
+        // Kernel's configured store transaction limit; read/health bounds
+        // and every per-class deadline follow the validated launch
+        // timeouts. No connection is created per request.
+        let connections = StoreConnectionManager::from_timeouts(
+            std::num::NonZeroUsize::new(DEFAULT_READ_CLIENTS)
+                .expect("read client bound is non-zero"),
+            default_store_transaction_limit(),
+            config.connect_timeout_ms,
+            config.query_timeout_ms,
+        )
+        .map_err(|error| format!("compose bounded bridge client sets: {error}"))?;
         Ok(Self {
             store,
             blob,
             state_fence,
             schema_bootstrap_binding,
             schema_bootstrap_cache: tokio::sync::Mutex::new(None),
+            connections,
+            health_admission: HealthAdminAdmission::bridge_default(),
             _runtime_root_leases: runtime_root_leases,
         })
     }
@@ -332,8 +358,19 @@ impl StoreComposition {
     }
 
     /// Bounded adapter/provider health observation.
+    ///
+    /// Runs on the isolated health/admin client path after exact-operation
+    /// admission: health traffic never consumes a canonical write slot. A
+    /// transport failure marks the health generation broken until it is
+    /// explicitly replaced.
     pub async fn health(&self) -> Result<StoreHealth, StoreError> {
-        self.store.health().await
+        self.health_admission.require_admitted("store.health")?;
+        let _lease = self.connections.try_acquire(ClientClass::Health)?;
+        let outcome = self.store.health().await;
+        if matches!(outcome, Err(StoreError::Unavailable)) {
+            self.connections.mark_broken(ClientClass::Health);
+        }
+        outcome
     }
 
     /// Starts the one retained canonical provider child and proves authenticated
@@ -347,7 +384,20 @@ impl StoreComposition {
 
     /// Semantic schema readiness observation.  This is not a write authority
     /// verdict and is returned as its own receipt/status surface.
+    ///
+    /// Like [`Self::health`], readiness runs on the isolated health/admin
+    /// path under exact-operation admission, never on a write slot.
     pub async fn readiness(&self) -> Result<ReadinessReceipt, StoreError> {
+        self.health_admission.require_admitted("store.readiness")?;
+        let _lease = self.connections.try_acquire(ClientClass::Health)?;
+        let outcome = self.readiness_inner().await;
+        if matches!(outcome, Err(StoreError::Unavailable)) {
+            self.connections.mark_broken(ClientClass::Health);
+        }
+        outcome
+    }
+
+    async fn readiness_inner(&self) -> Result<ReadinessReceipt, StoreError> {
         let readiness = self
             .store
             .probe_readiness()
@@ -435,11 +485,22 @@ impl StoreComposition {
     }
 
     /// Executes one closed named read from the store API catalogue.
+    ///
+    /// Reads are restricted to the activated named Q0–Q4 catalogue and run
+    /// under the bounded read set: repeated concurrent reads reuse read
+    /// slots instead of growing connections per request. A transport failure
+    /// marks the read generation broken until explicitly replaced.
     pub async fn named(
         &self,
         request: NamedReadRequest,
     ) -> Result<NamedReadResponse, eliot_store_api::StoreError> {
-        self.store.execute_named(request).await
+        StoreConnectionManager::admit_named_read(request.operation)?;
+        let _lease = self.connections.try_acquire(ClientClass::Read)?;
+        let outcome = self.store.execute_named(request).await;
+        if matches!(outcome, Err(StoreError::Unavailable)) {
+            self.connections.mark_broken(ClientClass::Read);
+        }
+        outcome
     }
 
     /// Applies one fully prepared transition through the sole canonical write
@@ -485,7 +546,18 @@ impl StoreComposition {
             &expected_revision_heads,
             &expected_ordering_heads,
         )?;
-        self.store
+        // I5.7/I5.9 (issue #1933): the canonical write runs under the
+        // bounded write set limited by the Kernel's configured store
+        // transaction limit. Exhaustion sheds with `Unavailable`; a
+        // transport failure marks the write generation broken until it is
+        // explicitly replaced. An unknown outcome is not a broken
+        // connection: it resolves through `ResolveWriteReceipt` first.
+        let _lease = self
+            .connections
+            .try_acquire(ClientClass::Write)
+            .map_err(StoreCompositionError::Store)?;
+        let outcome = self
+            .store
             .apply_prepared_with_authority(
                 context,
                 transition,
@@ -494,7 +566,14 @@ impl StoreComposition {
                 authorities,
             )
             .await
-            .map_err(map_adapter_error)
+            .map_err(map_adapter_error);
+        if matches!(
+            outcome,
+            Err(StoreCompositionError::Store(StoreError::Unavailable))
+        ) {
+            self.connections.mark_broken(ClientClass::Write);
+        }
+        outcome
     }
 
     /// Applies one sealed reserved-write request through the sole canonical
@@ -514,9 +593,20 @@ impl StoreComposition {
         if request.context.state_fence != self.state_fence {
             return Err(StoreCompositionError::Store(StoreError::FenceMismatch));
         }
-        CanonicalStoreClient::apply_reserved_write(&self.store, request)
+        let _lease = self
+            .connections
+            .try_acquire(ClientClass::Write)
+            .map_err(StoreCompositionError::Store)?;
+        let outcome = CanonicalStoreClient::apply_reserved_write(&self.store, request)
             .await
-            .map_err(StoreCompositionError::Store)
+            .map_err(StoreCompositionError::Store);
+        if matches!(
+            outcome,
+            Err(StoreCompositionError::Store(StoreError::Unavailable))
+        ) {
+            self.connections.mark_broken(ClientClass::Write);
+        }
+        outcome
     }
 
     /// Reconciles a possibly ambiguous write by exact operation identity.
@@ -528,6 +618,36 @@ impl StoreComposition {
             .reconcile(operation_id)
             .await
             .map_err(AdapterError::into_store_error)
+    }
+
+    /// Resolves an unknown write outcome by the original operation identity
+    /// before any new transaction attempt (I5.19, issue #1933).
+    ///
+    /// This is the receipt-first gate: the caller classifies the
+    /// `ResolveWriteReceipt` lookup through [`classify_receipt_lookup`] and
+    /// decides through [`decide_replay`]. A missing, foreign, invalid, or
+    /// envelope-less answer keeps the outcome unknown and forbids replay; a
+    /// committed receipt reuses the existing receipt; only a proven
+    /// non-application opens a newly admitted operation.
+    pub async fn resolve_unknown_write(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<ResolvedWriteOutcome, StoreError> {
+        let receipt = self.receipt(operation_id.clone()).await?;
+        Ok(classify_receipt_lookup(operation_id, receipt.as_ref()))
+    }
+
+    /// Returns the bounded bridge client sets: generations, bounds,
+    /// deadlines, and reconnect policy (I5.9, issue #1933).
+    #[must_use]
+    pub const fn connections(&self) -> &StoreConnectionManager {
+        &self.connections
+    }
+
+    /// Explicitly replaces a broken client generation after its transport
+    /// failure has been reconciled. Fails closed when the set is not broken.
+    pub fn replace_client_generation(&self, class: ClientClass) -> Result<u64, String> {
+        self.connections.replace_generation(class)
     }
 
     /// Reads revision heads through the neutral store boundary.
