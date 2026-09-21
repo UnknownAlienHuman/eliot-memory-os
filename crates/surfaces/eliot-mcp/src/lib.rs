@@ -24,4 +24,4 @@ pub use semantic_profile::*;
 /// Stable package contract name.
 pub const CONTRACT_NAME: &str = "eliot.surface.mcp";
 /// Current package contract revision.
-pub const CONTRACT_REVISION: &str = "1.3.0";
+pub const CONTRACT_REVISION: &str = "1.2.0";

@@ -804,10 +804,6 @@ fn catalogue_has_exact_names_and_schema_parity() -> Result<(), Box<dyn Error>> {
         catalogue[7].input_schema,
         canonical_schema::<FinishAttemptDraft>()?
     );
-    assert_eq!(
-        catalogue[8].input_schema,
-        canonical_schema::<UserAutomationInput>()?
-    );
     assert!(catalogue.windows(2).all(|pair| {
         pair[0].output_schema == pair[1].output_schema
             && pair[0].schema_sha256.len() == pair[1].schema_sha256.len()
@@ -817,22 +813,28 @@ fn catalogue_has_exact_names_and_schema_parity() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn user_automation_route_decodes_to_the_existing_closed_operation() -> Result<(), Box<dyn Error>> {
-    let request = parse_request(request_value(
-        "request-user-automation",
-        "idem-user-automation",
-        false,
-        user_automation_tool(),
-    ))?;
-    assert_eq!(request.tool.canonical_name(), "eliot_user_automation");
+    let tool: ToolRequest = serde_json::from_value(user_automation_tool())?;
+    assert_eq!(tool.canonical_name(), "eliot_user_automation");
     let ToolRequest::UserAutomation(UserAutomationInput {
         operation: eliot_kernel_core::UserAutomationOperation::List { include_retired },
         idempotency_key,
-    }) = request.tool
+    }) = tool
     else {
         panic!("expected typed UserAutomation list operation");
     };
     assert!(!include_retired);
     assert_eq!(idempotency_key, "operator-retry-1");
+
+    let mcp_request = request_value(
+        "request-user-automation",
+        "idem-user-automation",
+        false,
+        user_automation_tool(),
+    );
+    assert!(
+        eliot_mcp::decode_protected_request_bytes(&serde_json::to_vec(&mcp_request)?).is_err(),
+        "the typed operator payload must not become a ninth MCP hot tool"
+    );
     Ok(())
 }
 

@@ -8,11 +8,11 @@ use thiserror::Error;
 
 use crate::{
     ActInput, CoordinateInput, FinishAttemptDraft, McpResponse, ObserveInput, PacketInput,
-    QueryInput, StateInput, USER_AUTOMATION_ROUTE, UserAutomationInput, VerifyInput,
+    QueryInput, StateInput, VerifyInput,
 };
 
 /// Exact canonical hot-tool names. The compatibility alias is intentionally absent.
-pub const CANONICAL_TOOL_NAMES: [&str; 9] = [
+pub const CANONICAL_TOOL_NAMES: [&str; 8] = [
     "eliot.state",
     "eliot.packet",
     "eliot.observe",
@@ -21,7 +21,6 @@ pub const CANONICAL_TOOL_NAMES: [&str; 9] = [
     "eliot.verify",
     "eliot.coordinate",
     "eliot.finish",
-    USER_AUTOMATION_ROUTE,
 ];
 
 /// Generated schema descriptor for one canonical tool.
@@ -59,10 +58,6 @@ pub fn canonical_tool_schemas() -> Result<Vec<ToolSchema>, SchemaError> {
         descriptor::<VerifyInput>("eliot.verify", "Run a typed verification intent")?,
         descriptor::<CoordinateInput>("eliot.coordinate", "Use the execution fabric")?,
         descriptor::<FinishAttemptDraft>("eliot.finish", "Submit a candidate finish attempt")?,
-        descriptor::<UserAutomationInput>(
-            USER_AUTOMATION_ROUTE,
-            "Submit one authenticated UserAutomation operator operation",
-        )?,
     ])
 }
 
