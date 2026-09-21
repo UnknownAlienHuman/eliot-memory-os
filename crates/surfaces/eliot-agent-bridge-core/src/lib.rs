@@ -1819,6 +1819,14 @@ impl AgentBridgeCore {
             delivery,
         ))
     }
+
+    /// Number of immutable snapshots retained in the attach-scoped resource
+    /// projection. The registry is cleared on every new attach, so this
+    /// count describes only the live attach.
+    #[must_use]
+    pub fn resource_registry_len(&self) -> usize {
+        self.resources.len()
+    }
 }
 
 /// Sanitized injected-provider failure. It must not contain credentials or raw
