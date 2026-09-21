@@ -9,7 +9,7 @@ use crate::codecortex::run_process;
 use crate::{EngineError, WriteAdmissionService, WriterHandle};
 use eliot_store::CanonicalStore;
 use eliot_types::{
-    CoChangeEdge, ConceptKind, ConceptNode, CueBinding, CueKind, CueMatchMode, CueRecordSource,
+    CoChangeEdge, ConceptKind, ConceptNode, CueBinding, LegacyCueKindV1, CueMatchMode, CueRecordSource,
     CueStrength, HotspotScore, ManifestPackage, MiningRun, ModuleCard, OnboardingCheckpoint,
     OnboardingReport, OnboardingStage, OnboardingTestHook, ProjectId, UlArtifact,
     normalize_bindings, path_matches_boundary,
@@ -779,7 +779,7 @@ fn concept_cues<'a>(
     hotspots: impl Iterator<Item = &'a str>,
 ) -> Result<Vec<CueBinding>, EngineError> {
     let mut bindings = vec![CueBinding {
-        cue_kind: CueKind::Subsystem,
+        cue_kind: LegacyCueKindV1::Subsystem,
         cue_value: name.to_owned(),
         match_mode: CueMatchMode::Exact,
         strength: CueStrength::Primary,
@@ -791,7 +791,7 @@ fn concept_cues<'a>(
             .filter(|boundary| boundary.as_str() != ".")
             .take(3)
             .map(|boundary| CueBinding {
-                cue_kind: CueKind::DirPath,
+                cue_kind: LegacyCueKindV1::DirPath,
                 cue_value: boundary.clone(),
                 match_mode: CueMatchMode::Prefix,
                 strength: CueStrength::Primary,
@@ -799,7 +799,7 @@ fn concept_cues<'a>(
             }),
     );
     bindings.extend(hotspots.take(3).map(|path| CueBinding {
-        cue_kind: CueKind::FilePath,
+        cue_kind: LegacyCueKindV1::FilePath,
         cue_value: path.to_owned(),
         match_mode: CueMatchMode::Exact,
         strength: CueStrength::Secondary,
@@ -855,7 +855,7 @@ fn bind_invariants(
         .filter(|source| source.record_kind == "invariant")
     {
         for binding in &source.cue_bindings {
-            if binding.cue_kind == CueKind::FilePath
+            if binding.cue_kind == LegacyCueKindV1::FilePath
                 && let Some(concept_id) = assignments.get(&binding.cue_value)
             {
                 by_concept
@@ -909,7 +909,7 @@ async fn onboarding_evidence(
         let matching = source
             .cue_bindings
             .iter()
-            .filter(|binding| binding.cue_kind == CueKind::FilePath)
+            .filter(|binding| binding.cue_kind == LegacyCueKindV1::FilePath)
             .filter_map(|binding| seed.assignments.get(&binding.cue_value))
             .cloned()
             .collect::<BTreeSet<_>>();

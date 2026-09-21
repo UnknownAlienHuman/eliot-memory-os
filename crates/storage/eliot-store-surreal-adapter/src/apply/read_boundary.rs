@@ -1724,8 +1724,8 @@ async fn resource_snapshot_payload(
 /// pointers in automation-id order (retired rows excluded unless
 /// requested); `current` projects one pointer or explicit absence;
 /// `history` projects the bounded revision set; `invocations` projects
-/// the bounded invocation set; `failure` projects explicit absence (no
-/// failure writer path exists yet — never a fabricated failure).
+/// the bounded invocation set; `failure` projects the last same-fence
+/// failure row or explicit absence.
 /// Parameters are re-validated here (membership and shape via the
 /// catalogue gate upstream; value rules here) so a misrouted query fails
 /// closed without touching state.
@@ -1759,11 +1759,9 @@ async fn automation_state_payload(
         eliot_store_api::AUTOMATION_QUERY_INVOCATIONS => {
             automation_invocations_payload(db, config, state_fence, &decoded).await
         }
-        eliot_store_api::AUTOMATION_QUERY_FAILURE => Ok(json!({
-            "failure": Value::Null,
-            "revision": 0,
-            "state_fence": state_fence,
-        })),
+        eliot_store_api::AUTOMATION_QUERY_FAILURE => {
+            automation_failure_payload(db, config, state_fence, &decoded).await
+        }
         _ => Err(AdapterError::Store(StoreError::UnknownOperation)),
     }
 }
@@ -1907,6 +1905,38 @@ async fn automation_invocations_payload(
     let revision = projection_len(invocations.len())?;
     Ok(json!({
         "invocations": invocations,
+        "revision": revision,
+        "state_fence": state_fence,
+    }))
+}
+
+async fn automation_failure_payload(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    state_fence: &StateFence,
+    decoded: &eliot_store_api::DecodedAutomationRead,
+) -> Result<Value, AdapterError> {
+    let automation_id = require_automation_id(decoded)?;
+    let row = super::surreal_automation::read_failure_for_read(db, config, &automation_id).await?;
+    let failure = match row {
+        Some(row) if row.state_fence == *state_fence => json!({
+            "automation_id": row.automation_id,
+            "revision": row.revision,
+            "occurrence_id": row.occurrence_id,
+            "fingerprint": row.fingerprint,
+            "failure_json": row.failure_json,
+            "history_ref": eliot_store_api::automation_failure_history_ref(
+                &row.automation_id,
+                &row.revision,
+                &row.fingerprint,
+            ),
+            "source_operation_id": row.source_operation_id,
+        }),
+        _ => Value::Null,
+    };
+    let revision = projection_len(usize::from(!failure.is_null()))?;
+    Ok(json!({
+        "failure": failure,
         "revision": revision,
         "state_fence": state_fence,
     }))

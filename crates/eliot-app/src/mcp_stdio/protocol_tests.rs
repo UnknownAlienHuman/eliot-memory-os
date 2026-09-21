@@ -250,7 +250,7 @@ fn cold_observe_candidate_is_fetchable_but_not_cue_indexed() {
         "candidate_disposition": "task_bound"
     });
     let binding = eliot_types::CueBinding {
-        cue_kind: eliot_types::CueKind::FilePath,
+        cue_kind: eliot_types::ul::cue::LegacyCueKindV1::FilePath,
         cue_value: "crates/eliot-app/src/lib.rs".to_owned(),
         match_mode: eliot_types::CueMatchMode::Exact,
         strength: eliot_types::CueStrength::Primary,
@@ -268,7 +268,7 @@ fn cold_observe_candidate_is_fetchable_but_not_cue_indexed() {
 fn automatic_observe_binding_is_bounded_and_invalid_cues_fall_back_to_cold() {
     let unusable = (0..32)
         .map(|index| eliot_types::CueBinding {
-            cue_kind: eliot_types::CueKind::ErrorSignature,
+            cue_kind: eliot_types::ul::cue::LegacyCueKindV1::ErrorSignature,
             cue_value: format!("not-a-signature-{index}"),
             match_mode: eliot_types::CueMatchMode::Signature,
             strength: eliot_types::CueStrength::Primary,
@@ -290,7 +290,7 @@ fn automatic_observe_binding_is_bounded_and_invalid_cues_fall_back_to_cold() {
 
     let too_many_valid = (0..32)
         .map(|index| eliot_types::CueBinding {
-            cue_kind: eliot_types::CueKind::FilePath,
+            cue_kind: eliot_types::ul::cue::LegacyCueKindV1::FilePath,
             cue_value: format!("crates/eliot-app/src/file-{index}.rs"),
             match_mode: eliot_types::CueMatchMode::Exact,
             strength: eliot_types::CueStrength::Primary,
