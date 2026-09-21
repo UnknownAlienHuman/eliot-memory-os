@@ -181,7 +181,10 @@ pub trait SemanticCore {
 
 /// One registered deterministic component used as the conformance reference:
 /// a seed-mixed wrapping-add transform over the input bytes. Deterministic
-/// across contours by construction.
+/// across contours by construction. Pure stateless logic observes no state
+/// change, so the state delta is explicitly empty: no guest through the
+/// current provider can report one either, and a digest convention here
+/// would manufacture a mismatch against real execution.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DeterministicEchoCore {
     component_id: &'static str,
@@ -208,15 +211,15 @@ impl SemanticCore for DeterministicEchoCore {
         for (index, byte) in input.iter().enumerate() {
             result.push(byte.wrapping_add(seed_bytes[index % seed_bytes.len()]));
         }
-        let state_delta = Sha256Digest::of_bytes(&result).as_str().as_bytes().to_vec();
-        // Pure logic observes no resources: fuel, memory, elapsed time, and
-        // host calls stay explicitly unknown. Analytical bounds, if any,
-        // belong to the invocation limits, not to this outcome.
+        // Pure logic observes no resources and touches no state: fuel,
+        // memory, elapsed time, and host calls stay explicitly unknown,
+        // and the state delta is empty. Analytical bounds, if any, belong
+        // to the invocation limits, not to this outcome.
         CoreOutcome {
             result,
             error_class: ErrorClass::Ok,
             effects: Vec::new(),
-            state_delta,
+            state_delta: Vec::new(),
             host_calls: None,
             fuel_consumed: None,
             peak_memory_bytes: None,
