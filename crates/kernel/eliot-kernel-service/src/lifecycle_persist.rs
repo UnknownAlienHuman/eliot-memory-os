@@ -257,10 +257,8 @@ pub enum LifecyclePersistError {
     /// The store manifest digest does not match the admitted catalogue.
     #[error("lifecycle persist operation manifest mismatch")]
     ManifestMismatch,
-    /// The store committed no response receipt; the outcome is unknown.
-    #[error("lifecycle persist response receipt is missing; outcome is unknown")]
-    MissingReceiptEnvelope,
-    /// A closed store error.
+    /// A closed store error (including the store's own missing-envelope
+    /// case from `require_reconciliation_envelope`; never duplicated here).
     #[error("lifecycle persist store: {0}")]
     Store(#[from] StoreError),
     /// A Kernel service error.
