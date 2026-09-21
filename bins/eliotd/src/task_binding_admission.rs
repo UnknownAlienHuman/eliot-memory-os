@@ -3,100 +3,35 @@
 //! Implements I5.5 capture/promotion split at the `eliotd` admission edge:
 //! `eliot.observe` may retain a safe raw cold [`ObservationCandidate`] when
 //! task selection is absent or ambiguous, while reusable task memory,
-//! Claim/Failure/Procedure promotion, and task-control writes require current
-//! exact [`TaskSelectionEvidence`] plus `TaskContract` revision, acceptance
-//! digest, `WorkScope`, State Fence, and compatibility disposition.
+//! Claim/Failure/Procedure promotion, and task-control writes require the
+//! canonical Governor [`TaskSelectionEvidence`] plus a valid current fence
+//! and a `Compatible` disposition.
+//!
+//! The selection evidence is the canonical Governor-owned contract
+//! (`eliot-observation`); this module defines no parallel shape and parses
+//! no invented marker syntax. Field names, types, and validation rules come
+//! from that contract: exact task handle, non-zero `TaskContract` revision,
+//! lowercase acceptance digest, `WorkScope` identity, selection source and
+//! evidence handles. The fence is bound by the authenticated caller context
+//! (the `state_fence`/`expected_fence` parameters), matching the canonical
+//! consumer where the submission envelope carries the single fence.
 //!
 //! This module is a pure validator. It owns no journal, store, task lifecycle,
 //! or promotion state machine; it only classifies one admission attempt so the
 //! Governor/store owners keep semantic ownership. It never selects the most
 //! recent or open task and never guesses from resolver output: ambiguous input
-//! stays cold.
+//! stays cold. A contaminated selection (canonical crossover marker) never
+//! promotes: captures stay cold and task-bound promotion rejects.
 
 #![forbid(unsafe_code)]
 
 use eliot_contracts::StateFence;
+use eliot_observation::TaskSelectionEvidence;
 
 /// Stable rejection code when task-bound promotion lacks current evidence.
 pub const TASK_SELECTION_REQUIRED: &str = "TASK_SELECTION_REQUIRED";
 /// Stable rejection code when evidence names another/incompatible `WorkScope`.
 pub const TASK_SCOPE_INCOMPATIBLE: &str = "TASK_SCOPE_INCOMPATIBLE";
-
-/// Exact immutable evidence for one authenticated task selection.
-///
-/// Mirrors the Governor observation contract shape without depending on it:
-/// exact task handle, current `TaskContract` revision, acceptance digest,
-/// `WorkScope` identity, selection source/evidence handles, and the State Fence
-/// the selection was authenticated under.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TaskSelectionEvidence {
-    /// Exact task identity selected by the owner.
-    pub task_ref: String,
-    /// Current `TaskContract` revision (decimal string, non-blank).
-    pub task_contract_revision: String,
-    /// Acceptance digest bound by the selection (lowercase SHA-256 hex).
-    pub acceptance_digest: String,
-    /// `WorkScope` identity used by the selection.
-    pub work_scope_ref: String,
-    /// Source/route that established the selection.
-    pub selection_source_ref: String,
-    /// Exact evidence handle supporting the selection.
-    pub evidence_ref: String,
-    /// Fence the selection was authenticated under.
-    pub state_fence: StateFence,
-}
-
-impl TaskSelectionEvidence {
-    /// Validates shape without issuing task authority.
-    pub fn validate(&self) -> Result<(), TaskBindingError> {
-        fn text(value: &str) -> bool {
-            !value.trim().is_empty() && !value.chars().any(char::is_control)
-        }
-        if !text(&self.task_ref) {
-            return Err(TaskBindingError::selection_required(
-                "task_selection.task_ref is blank",
-            ));
-        }
-        if !text(&self.task_contract_revision) {
-            return Err(TaskBindingError::selection_required(
-                "task_selection.task_contract_revision is blank",
-            ));
-        }
-        if !is_lower_hex64(&self.acceptance_digest) {
-            return Err(TaskBindingError::selection_required(
-                "task_selection.acceptance_digest must be lowercase SHA-256",
-            ));
-        }
-        if !text(&self.work_scope_ref) {
-            return Err(TaskBindingError::selection_required(
-                "task_selection.work_scope_ref is blank",
-            ));
-        }
-        if !text(&self.selection_source_ref) {
-            return Err(TaskBindingError::selection_required(
-                "task_selection.selection_source_ref is blank",
-            ));
-        }
-        if !text(&self.evidence_ref) {
-            return Err(TaskBindingError::selection_required(
-                "task_selection.evidence_ref is blank",
-            ));
-        }
-        if self.state_fence.validate().is_err() {
-            return Err(TaskBindingError::selection_required(
-                "task_selection.state_fence is invalid",
-            ));
-        }
-        Ok(())
-    }
-}
-
-fn is_lower_hex64(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-}
 
 /// Compatibility disposition computed by the owning selector.
 ///
@@ -198,9 +133,11 @@ pub enum CaptureAdmission {
 /// - `selection = None` or `candidate_count != 1` (absent/ambiguous) admits
 ///   only [`CaptureAdmission::ColdUnbound`]: no activation, promotion, or
 ///   finish relevance.
-/// - Exactly one valid, compatible selection admits
+/// - Exactly one canonical, valid, compatible, uncontaminated selection admits
 ///   [`CaptureAdmission::TaskBound`] for a later governed binding transition;
-///   this function still performs no promotion itself.
+///   this function still performs no promotion itself. A contaminated
+///   selection (canonical crossover marker) stays cold, mirroring the
+///   Governor `Quarantined` disposition.
 /// - There is deliberately no `latest_task`, `open_task`, or resolver-guess
 ///   input: ambiguity stays cold.
 pub fn admit_capture(
@@ -230,10 +167,14 @@ pub fn admit_capture(
                     ObservationCandidate::cold_unbound(candidate_id, state_fence),
                 ));
             }
-            evidence.validate()?;
-            if evidence.state_fence != state_fence {
-                return Err(TaskBindingError::selection_required(
-                    "task_selection.state_fence does not match capture fence",
+            evidence.validate().map_err(|error| {
+                TaskBindingError::selection_required(format!(
+                    "task selection evidence invalid: {error}"
+                ))
+            })?;
+            if evidence.is_contaminated() {
+                return Ok(CaptureAdmission::ColdUnbound(
+                    ObservationCandidate::cold_unbound(candidate_id, state_fence),
                 ));
             }
             match compatibility {
@@ -252,11 +193,13 @@ pub fn admit_capture(
 
 /// Admits one task-relative reusable/control transition.
 ///
-/// Requires the exact immutable evidence handle, `TaskContract` revision,
-/// acceptance digest, `WorkScope`, State Fence, and a `Compatible` disposition.
-/// Missing evidence rejects with `TASK_SELECTION_REQUIRED`; a `WorkScope` or
-/// compatibility mismatch rejects with `TASK_SCOPE_INCOMPATIBLE` without
-/// changing either task (this function mutates nothing).
+/// Requires the canonical selection evidence, the expected task and
+/// `WorkScope` handles, a valid current fence that scopes this admission,
+/// and a `Compatible` disposition. Missing evidence rejects with
+/// `TASK_SELECTION_REQUIRED`; a `WorkScope`/task mismatch or an incompatible
+/// disposition rejects with `TASK_SCOPE_INCOMPATIBLE` without changing either
+/// task (this function mutates nothing). A contaminated selection never
+/// promotes: it rejects as non-current evidence.
 pub fn admit_task_bound(
     selection: Option<&TaskSelectionEvidence>,
     expected_task_ref: &str,
@@ -269,7 +212,14 @@ pub fn admit_task_bound(
             "task-bound promotion requires current TaskSelectionEvidence",
         ));
     };
-    evidence.validate()?;
+    evidence.validate().map_err(|error| {
+        TaskBindingError::selection_required(format!("task selection evidence invalid: {error}"))
+    })?;
+    if evidence.is_contaminated() {
+        return Err(TaskBindingError::selection_required(
+            "task selection is contaminated",
+        ));
+    }
     if evidence.task_ref != expected_task_ref {
         return Err(TaskBindingError::scope_incompatible(
             "task selection names a different task",
@@ -280,9 +230,9 @@ pub fn admit_task_bound(
             "task selection names a different WorkScope",
         ));
     }
-    if evidence.state_fence != *expected_fence {
+    if expected_fence.validate().is_err() {
         return Err(TaskBindingError::selection_required(
-            "task_selection.state_fence is not the current fence",
+            "task-bound promotion requires a valid current fence",
         ));
     }
     match compatibility {
