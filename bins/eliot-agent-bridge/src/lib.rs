@@ -60,7 +60,7 @@ use kernel_activation_client::{
 use kernel_host_request_client::{KernelHostRequestClient, ReplayCacheEntry};
 pub use memory_handle_join::{ResolvedMemoryHandle, parse_memory_handle};
 pub use reactive_injection_receipts::{
-    AdmissionBasis, AttentionItem, CueKind, DeliveryPoint, FiringEvidence, InjectionReceipt,
+    AdmissionBasis, AttentionItem, CueOrigin, DeliveryPoint, FiringEvidence, InjectionReceipt,
     ItemDisposition, NormalizedCue, REACTIVE_INJECTION_CONTRACT, ReactiveInjectionError,
     ReactiveInjectionLedger, RiskTier, Severity, UseOutcome,
 };
@@ -1575,7 +1575,7 @@ mod tests {
     mod reactive_runner_tests {
         use super::super::{
             AdmissionBasis, AttachBinding, AttachRequest, BridgeError, BridgeRunner, ConnectionId,
-            CueKind, DeliveryPoint, DemandId, FiringEvidence, HostActivationPort,
+            CueOrigin, DeliveryPoint, DemandId, FiringEvidence, HostActivationPort,
             HostEventEnvelope, ItemDisposition, McpForwardingPort, NormalizedCue, Profile,
             ProviderFailure, ProviderReadiness, ReactiveInjectionLedger, RiskTier, Severity,
             UseOutcome,
@@ -1675,7 +1675,7 @@ mod tests {
         fn reactive_cue(revision: &str) -> NormalizedCue {
             NormalizedCue {
                 cue_id: "cue-reactive-1".to_owned(),
-                kind: CueKind::ToolObservation,
+                kind: CueOrigin::ToolObservation,
                 source: "tool-surface-1".to_owned(),
                 source_revision: revision.to_owned(),
                 cue_digest: REACTIVE_DIGEST.to_owned(),
