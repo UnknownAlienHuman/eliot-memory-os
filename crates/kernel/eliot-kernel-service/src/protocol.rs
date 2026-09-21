@@ -2774,7 +2774,7 @@ pub struct HostStartupEvidence {
     pub candidate_digest: String,
     /// Exact State Fence this evidence was probed under.
     pub state_fence: StateFence,
-    /// Checksum of the current HostStateJournal head observed by Host.
+    /// Checksum of the current `HostStateJournal` head observed by Host.
     pub host_record_checksum: PlatformHandle,
     /// Digest of the registry-selected active candidate manifest.
     pub artifact_registry_digest: PlatformHandle,
