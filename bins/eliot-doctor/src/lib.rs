@@ -12,6 +12,7 @@
 pub mod admitted_effect;
 pub mod dispatch_authority;
 pub mod dispatched_material;
+pub mod integration;
 pub mod kernel_client;
 
 pub use eliot_doctor_core::*;

@@ -28,6 +28,7 @@ follow_up = "full delete with eliotd lane"
 [dependencies]
 eliot-agent-coordinator.workspace = true
 eliot-contracts.workspace = true
+eliot-kernel-core.workspace = true
 eliot-evaluation-contracts.workspace = true
 eliot-evidence.workspace = true
 eliot-observation-contracts.workspace = true
