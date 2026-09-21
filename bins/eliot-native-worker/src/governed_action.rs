@@ -561,7 +561,7 @@ pub fn require_governed_op(
         return Err(generic_rejection(
             operation,
             &format!(
-                "material external-adapter op '{operation}' requires a valid authority-bound action envelope; none was presented"
+                "declared external-adapter op '{operation}' requires a valid authority-bound action envelope; none was presented"
             ),
         ));
     };
@@ -637,7 +637,7 @@ pub fn finish_for_verdict(
 /// Runs one declared external-adapter invoke behind the governed gate.
 ///
 /// The adapter closure runs if and only if the envelope validates; every
-/// refusal returns before the closure is constructed, so a missing or invalid
+/// refusal returns without invoking the closure, so a missing or invalid
 /// envelope records no adapter effect. Returns the validated action plus the
 /// adapter output on success.
 // The typed refusal carries the full A10.1 repair shape by value so the
